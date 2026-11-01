@@ -113,6 +113,24 @@ pub enum X86ExceptionVector {
     SimdFloatingPoint = 19,
 }
 
+impl X86ExceptionVector {
+    /// Intel SDM Vol. 3A §6.13 / Table 6-1: whether hardware delivery of this
+    /// exception vector pushes an error code onto the target stack.
+    #[must_use]
+    pub const fn has_error_code(self) -> bool {
+        matches!(
+            self,
+            Self::DoubleFault
+                | Self::InvalidTss
+                | Self::SegmentNotPresent
+                | Self::StackSegmentFault
+                | Self::GeneralProtection
+                | Self::PageFault
+                | Self::AlignmentCheck
+        )
+    }
+}
+
 /// Typed architectural exception raised by guest execution without host signals.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct X86Exception {
@@ -146,8 +164,20 @@ impl X86Exception {
         Self::new(X86ExceptionVector::Debug, rip, None, None)
     }
     #[must_use]
+    pub const fn breakpoint(rip: u64) -> Self {
+        Self::new(X86ExceptionVector::Breakpoint, rip, None, None)
+    }
+    #[must_use]
+    pub const fn overflow(rip: u64) -> Self {
+        Self::new(X86ExceptionVector::Overflow, rip, None, None)
+    }
+    #[must_use]
     pub const fn invalid_opcode(rip: u64) -> Self {
         Self::new(X86ExceptionVector::InvalidOpcode, rip, None, None)
+    }
+    #[must_use]
+    pub const fn device_not_available(rip: u64) -> Self {
+        Self::new(X86ExceptionVector::DeviceNotAvailable, rip, None, None)
     }
     #[must_use]
     pub const fn double_fault(rip: u64) -> Self {
@@ -173,23 +203,11 @@ impl X86Exception {
     pub const fn page_fault(rip: u64, code: u32, cr2: u64) -> Self {
         Self::new(X86ExceptionVector::PageFault, rip, Some(code), Some(cr2))
     }
-}
-
-/// Refusal returned when injecting an architectural exception vector (`0..=31`) as an external interrupt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct InvalidInterruptVector(pub u8);
-
-impl std::fmt::Display for InvalidInterruptVector {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "external interrupt vector {} lies in reserved exception range 0..32",
-            self.0
-        )
+    #[must_use]
+    pub const fn alignment_check(rip: u64) -> Self {
+        Self::new(X86ExceptionVector::AlignmentCheck, rip, Some(0), None)
     }
 }
-
-impl std::error::Error for InvalidInterruptVector {}
 
 /// Architectural `GDTR`/`IDTR` 10-byte pseudo-descriptor (`u16` byte limit + 64-bit linear base).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -225,6 +243,19 @@ impl SoftSegment {
             base: 0,
             limit: 0,
             ar: Self::UNUSABLE_BIT,
+        }
+    }
+
+    /// IA-32e NULL stack segment loaded on an inter-privilege or `IST` IDT stack switch
+    /// (SDM Vol. 3A §6.14.2), preserving `RPL == DPL == cpl` for VMX guest-state checks.
+    #[must_use]
+    pub fn null_stack(cpl: u8) -> Self {
+        let rpl = u16::from(cpl & 3);
+        Self {
+            selector: rpl,
+            base: 0,
+            limit: 0,
+            ar: Self::UNUSABLE_BIT | (u32::from(cpl & 3) << 5),
         }
     }
 
@@ -411,6 +442,7 @@ pub struct SoftCpuContext {
     pub ldtr: SoftSegment,
     pub tr: SoftSegment,
     pub halted: bool,
+    pub(crate) icebp_trap: bool,
 }
 
 const _: () = {
@@ -552,6 +584,7 @@ impl SoftCpuContext {
                 ar: 0x008b,
             },
             halted: false,
+            icebp_trap: false,
         };
         ctx.walker
             .set_nxe((ctx.msrs.efer() & crate::msr::EFER_NXE) != 0);
@@ -576,21 +609,6 @@ impl SoftCpuContext {
 
     pub fn reset_tlb_stats(&mut self) {
         self.tlb.reset_stats();
-    }
-
-    /// Queue an external maskable interrupt vector (`32..=255`).
-    pub fn inject_interrupt(&mut self, _vector: u8) -> Result<(), InvalidInterruptVector> {
-        Ok(())
-    }
-
-    #[must_use]
-    pub const fn is_interrupt_pending(&self, _vector: u8) -> bool {
-        false
-    }
-
-    #[must_use]
-    pub const fn deliverable_interrupt(&self) -> Option<u8> {
-        None
     }
 
     /// Borrow the single architectural MSR authority for this vCPU.
@@ -812,11 +830,7 @@ impl SoftCpuContext {
     #[inline]
     #[must_use]
     pub const fn access_mode(&self) -> CpuAccessMode {
-        let cpl = if self.cpl == 0 {
-            Cpl::Ring0
-        } else {
-            Cpl::Ring3
-        };
+        let cpl = if self.cpl < 3 { Cpl::Ring0 } else { Cpl::Ring3 };
         CpuAccessMode {
             cpl,
             ac: self.ac(),
@@ -835,6 +849,27 @@ impl SoftCpuContext {
     pub const fn system_access_mode(&self) -> CpuAccessMode {
         CpuAccessMode {
             cpl: Cpl::Ring0,
+            ac: false,
+            cr0_wp: (self.cr0 & (1 << 16)) != 0,
+            cr4_smep: (self.cr4 & (1 << 20)) != 0,
+            cr4_smap: (self.cr4 & (1 << 21)) != 0,
+            efer_nxe: (self.efer() & (1 << 11)) != 0,
+            stack_access: true,
+        }
+    }
+
+    /// Access rights for an IA-32e IDT stack-frame push at `target_cpl`
+    /// (SDM Vol. 3A §4.6.1 / §6.14.2: implicit supervisor stack access for `target_cpl < 3`,
+    /// user-mode stack access for `target_cpl == 3`).
+    #[inline]
+    #[must_use]
+    pub const fn stack_push_access_mode(&self, target_cpl: u8) -> CpuAccessMode {
+        CpuAccessMode {
+            cpl: if target_cpl < 3 {
+                Cpl::Ring0
+            } else {
+                Cpl::Ring3
+            },
             ac: false,
             cr0_wp: (self.cr0 & (1 << 16)) != 0,
             cr4_smep: (self.cr4 & (1 << 20)) != 0,
@@ -877,12 +912,7 @@ impl SoftCpuContext {
             && alignment > 1
             && !va.is_multiple_of(alignment as u64)
         {
-            return Err(X86Exception::new(
-                X86ExceptionVector::AlignmentCheck,
-                rip,
-                Some(0),
-                None,
-            ));
+            return Err(X86Exception::alignment_check(rip));
         }
         Ok(())
     }
@@ -979,7 +1009,10 @@ extern "sysv64" fn softcpu_mem_slow_path(
         return 0;
     }
 
-    if let Err(exc) = ctx.check_alignment(guest_va, size.min(8), insn_va) {
+    // SDM Vol. 3A §6.15 (Vector 17): 128-bit legacy unaligned SIMD transfers (`MOVUPS`/`MOVUPD`/`MOVDQU`)
+    // never generate `#AC`; aligned 128-bit transfers already faulted with `#GP(0)` above.
+    let ac_align = if size > 8 && !align16 { 1 } else { size.min(8) };
+    if let Err(exc) = ctx.check_alignment(guest_va, ac_align, insn_va) {
         let kind = if access_code == 0 {
             SoftAccessKind::Read
         } else {

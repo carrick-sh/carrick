@@ -214,6 +214,15 @@ pub(crate) fn emulate_sensitive_op<M: SoftMmuMemory>(
         SensitiveOp::Cpuid => emulate_cpuid(ctx, cpuid, resume),
         SensitiveOp::Cli => emulate_cli_sti(ctx, va, resume, false),
         SensitiveOp::Sti => emulate_cli_sti(ctx, va, resume, true),
+        SensitiveOp::Clts => {
+            if ctx.cpl != 0 {
+                Err(X86Exception::general_protection(va, 0))
+            } else {
+                ctx.cr0 &= !(1 << 3);
+                ctx.rip = resume;
+                Ok(resume)
+            }
+        }
         SensitiveOp::Clac => emulate_clac_stac(ctx, cpuid, va, resume, raw, false),
         SensitiveOp::Stac => emulate_clac_stac(ctx, cpuid, va, resume, raw, true),
         SensitiveOp::Xgetbv => emulate_xgetbv(ctx, va, resume),
@@ -893,7 +902,7 @@ fn emulate_iret<M: SoftMmuMemory>(
                 selector: ss_sel,
                 base: 0,
                 limit: 0,
-                ar: SoftSegment::UNUSABLE_BIT,
+                ar: SoftSegment::UNUSABLE_BIT | (u32::from(rpl & 3) << 5),
             },
             None,
         )

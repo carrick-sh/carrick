@@ -139,8 +139,12 @@ pub fn plan_block_from_memory<M: SoftMmuMemory>(
     ctx: &mut SoftCpuContext,
     mem: &mut M,
 ) -> Result<PlannedBlock, BlockFetchFault> {
-    // Intel SDM Vol. 3, single-step: TF is sampled before the instruction.
-    let max_insns = if ctx.rflags & (1 << 8) != 0 {
+    // Intel SDM Vol. 3A §17.3 / §18.2 / §2.5: step single instructions when TF, RF,
+    // hardware instruction breakpoints (DR7[7:0]), or CR0.EM/TS lazy-FPU traps are armed.
+    let max_insns = if (ctx.rflags & ((1 << 8) | (1 << 16))) != 0
+        || (ctx.dr[7] & 0xff) != 0
+        || (ctx.cr0 & 0xc) != 0
+    {
         1
     } else {
         max_insns.max(1)

@@ -1038,21 +1038,12 @@ dependencies = [
 name = "carrick-softcpu-x86"
 version = "0.1.0"
 dependencies = [
- "carrick-core",
- "carrick-core-abi",
- "carrick-el1",
- "carrick-el1-abi",
- "carrick-guest-arch",
  "carrick-hal",
- "carrick-mem",
- "carrick-mmu-core",
- "carrick-sched-core",
  "carrick-softmmu",
  "carrick-x86",
  "goblin",
  "iced-x86",
  "libc",
- "toml",
 ]
 
 [[package]]

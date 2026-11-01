@@ -1,32 +1,26 @@
-//! VM-free 64-bit IDT exception/interrupt delivery and CPL0 fixture fault-handling tests (`#669`).
+//! VM-free 64-bit IDT exception delivery tests (`#669`, slice 1).
 
 #![cfg(target_arch = "x86_64")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use carrick_hal::guest_arch::GuestArch as _;
-use carrick_hal::x8664_arch::X8664GuestArch;
 use carrick_softcpu_x86::{
-    Cpl0CpuidView, DescriptorTablePtr, ExtentRecord, ExtentTable, FrameGpa, InvalidInterruptVector,
-    LinearPlacement, MSR_IA32_EFER, MSR_IA32_FMASK, MSR_IA32_KERNEL_GS_BASE, MSR_IA32_LSTAR,
-    MSR_IA32_STAR, MmioHoles, MsrCapabilities, OwnerGeneration, PF_ERR_INSTR, PF_ERR_PRESENT,
-    PF_ERR_USER, PF_ERR_WRITE, RootGpa, SOFT_TLB_OFFSET_MASK, SOFT_TLB_PAGE_MASK,
-    SOFT_TLB_PAGE_SIZE, SoftCpuContext, SoftMachine, SoftMachineExit, SoftMmuMemory, SoftSegment,
-    X86ExceptionVector, reg,
+    Cpl0CpuidView, DescriptorTablePtr, ExtentRecord, ExtentTable, FrameGpa, LinearPlacement,
+    MmioHoles, OwnerGeneration, PF_ERR_INSTR, PF_ERR_PRESENT, PF_ERR_RSVD, PF_ERR_USER,
+    PF_ERR_WRITE, RootGpa, SOFT_TLB_OFFSET_MASK, SOFT_TLB_PAGE_MASK, SOFT_TLB_PAGE_SIZE,
+    SoftAccessKind, SoftCpuContext, SoftMachine, SoftMachineExit, SoftMmuMemory, SoftSegment,
+    X86Exception, X86ExceptionVector, reg, translate_va,
 };
-use carrick_x86::{
-    BringupLayout, FAULT_DOORBELL_PORT, FaultDoorbellRecord, GuestSegment, LongModeSegments,
-    X86_FAULT_RECORD_U32_WORDS, check_vmx_guest_segments, fault_idt_base, fault_slot_gpa,
-    fault_stack_base, fault_tss_base, write_fault_tables_with,
-};
+use carrick_x86::{GuestSegment, LongModeSegments, check_vmx_guest_segments};
 
 const PTE_PRESENT: u64 = 1 << 0;
 const PTE_WRITABLE: u64 = 1 << 1;
 const PTE_USER: u64 = 1 << 2;
+const PTE_RSVD_BIT51: u64 = 1 << 51;
 const PTE_NX: u64 = 1 << 63;
 const PTE_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
-const NON_CANON: u64 = 0x0000_8000_0000_0000;
+const NON_CANON: u64 = 0x0001_0000_0000_1000;
 
 const CODE_VA: u64 = 0xffff_8000_0010_0000;
 const HANDLER_BASE_VA: u64 = 0xffff_8000_0014_0000;
@@ -36,18 +30,21 @@ const USER_STACK_VA: u64 = 0x0000_0000_0060_0000;
 const DATA_VA: u64 = 0xffff_8000_0020_0000;
 const STACK_VA: u64 = 0xffff_8000_0030_0000;
 const RSP0_VA: u64 = 0xffff_8000_0032_0000;
+const RSP1_VA: u64 = 0xffff_8000_0033_0000;
 const IST1_VA: u64 = 0xffff_8000_0034_0000;
 const IST2_VA: u64 = 0xffff_8000_0036_0000;
+const IST7_VA: u64 = 0xffff_8000_0038_0000;
 const GDT_VA: u64 = 0xffff_8000_0040_0000;
 const IDT_VA: u64 = 0xffff_8000_0041_0000;
 const TSS_VA: u64 = 0xffff_8000_0042_0000;
 
 const RFLAGS_TF: u64 = 1 << 8;
 const RFLAGS_IF: u64 = 1 << 9;
+const RFLAGS_NT: u64 = 1 << 14;
 const RFLAGS_RF: u64 = 1 << 16;
 const RFLAGS_AC: u64 = 1 << 18;
+const CR0_TS: u64 = 1 << 3;
 const CR0_AM: u64 = 1 << 18;
-const CR4_SMAP: u64 = 1 << 21;
 
 #[derive(Clone, Copy)]
 struct Perms(u8);
@@ -67,10 +64,12 @@ struct IdtTestRig {
     gdt_frame: FrameGpa,
     idt_frame: FrameGpa,
     tss_frame: FrameGpa,
-    data_frame: FrameGpa,
+    stack_frame: FrameGpa,
     rsp0_frame: FrameGpa,
+    rsp1_frame: FrameGpa,
     ist1_frame: FrameGpa,
     ist2_frame: FrameGpa,
+    ist7_frame: FrameGpa,
 }
 
 struct TestMemory {
@@ -81,7 +80,7 @@ struct TestMemory {
 }
 
 impl TestMemory {
-    const POOL_BYTES: u64 = 32 * 1024 * 1024;
+    const POOL_BYTES: u64 = 16 * 1024 * 1024;
     const GEN: OwnerGeneration = OwnerGeneration::FIRST;
     const ROOT_GPA: u64 = 0;
 
@@ -154,18 +153,27 @@ impl TestMemory {
         child
     }
 
-    fn map_frame(&mut self, va: u64, frame: FrameGpa, p: Perms) {
+    fn leaf_slot_gpa(&mut self, va: u64) -> u64 {
         let va_page = va & SOFT_TLB_PAGE_MASK;
         let mut tbl = Self::ROOT_GPA;
         for shift in [39, 30, 21] {
             tbl = self.ensure_child(tbl, ((va_page >> shift) & 0x1ff) as usize);
         }
+        tbl + ((va_page >> 12) & 0x1ff) * 8
+    }
+
+    fn map_frame(&mut self, va: u64, frame: FrameGpa, p: Perms) {
         let w = if (p.0 & 2) != 0 { PTE_WRITABLE } else { 0 };
         let u = if (p.0 & 8) != 0 { PTE_USER } else { 0 };
         let nx = if (p.0 & 4) == 0 { PTE_NX } else { 0 };
         let pte = (frame.raw() & PTE_ADDR_MASK) | PTE_PRESENT | w | u | nx;
-        self.word_ref(tbl + ((va_page >> 12) & 0x1ff) * 8)
-            .store(pte, Ordering::Relaxed);
+        let slot = self.leaf_slot_gpa(va);
+        self.word_ref(slot).store(pte, Ordering::Relaxed);
+    }
+
+    fn write_raw_pte(&mut self, va: u64, pte: u64) {
+        let slot = self.leaf_slot_gpa(va);
+        self.word_ref(slot).store(pte, Ordering::Relaxed);
     }
 
     fn map_page(&mut self, va: u64, p: Perms) -> FrameGpa {
@@ -175,13 +183,8 @@ impl TestMemory {
     }
 
     fn unmap_page(&mut self, va: u64) {
-        let va_page = va & SOFT_TLB_PAGE_MASK;
-        let mut tbl = Self::ROOT_GPA;
-        for shift in [39, 30, 21] {
-            tbl = self.ensure_child(tbl, ((va_page >> shift) & 0x1ff) as usize);
-        }
-        self.word_ref(tbl + ((va_page >> 12) & 0x1ff) * 8)
-            .store(0, Ordering::Relaxed);
+        let slot = self.leaf_slot_gpa(va);
+        self.word_ref(slot).store(0, Ordering::Relaxed);
     }
 }
 
@@ -198,7 +201,14 @@ unsafe impl SoftMmuMemory for TestMemory {
     }
 }
 
-fn encode_idt_gate(handler_va: u64, cs_sel: u16, ist: u8, gate_type: u8, dpl: u8, p: bool) -> [u8; 16] {
+fn encode_idt_gate(
+    handler_va: u64,
+    cs_sel: u16,
+    ist: u8,
+    gate_type: u8,
+    dpl: u8,
+    p: bool,
+) -> [u8; 16] {
     let mut g = [0u8; 16];
     g[0..2].copy_from_slice(&(handler_va as u16).to_le_bytes());
     g[2..4].copy_from_slice(&cs_sel.to_le_bytes());
@@ -236,6 +246,25 @@ fn assert_vmx_valid(ctx: &SoftCpuContext) {
     assert_eq!(check_vmx_guest_segments(&segs, false), Ok(()));
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Frame40 {
+    rip: u64,
+    cs: u64,
+    rflags: u64,
+    rsp: u64,
+    ss: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Frame48 {
+    error_code: u64,
+    rip: u64,
+    cs: u64,
+    rflags: u64,
+    rsp: u64,
+    ss: u64,
+}
+
 impl IdtTestRig {
     fn new() -> Self {
         let mut mem = TestMemory::new();
@@ -244,16 +273,18 @@ impl IdtTestRig {
         let _user_code = mem.map_page(USER_CODE_VA, Perms::USER_RX);
         let _user_data = mem.map_page(USER_DATA_VA, Perms::USER_RW);
         let _user_stack = mem.map_page(USER_STACK_VA, Perms::USER_RW);
-        let data_frame = mem.map_page(DATA_VA, Perms::KERNEL_RW);
-        let _stack = mem.map_page(STACK_VA, Perms::KERNEL_RW);
+        let _data_frame = mem.map_page(DATA_VA, Perms::KERNEL_RW);
+        let stack_frame = mem.map_page(STACK_VA, Perms::KERNEL_RW);
         let rsp0_frame = mem.map_page(RSP0_VA, Perms::KERNEL_RW);
+        let rsp1_frame = mem.map_page(RSP1_VA, Perms::KERNEL_RW);
         let ist1_frame = mem.map_page(IST1_VA, Perms::KERNEL_RW);
         let ist2_frame = mem.map_page(IST2_VA, Perms::KERNEL_RW);
+        let ist7_frame = mem.map_page(IST7_VA, Perms::KERNEL_RW);
         let gdt_frame = mem.map_page(GDT_VA, Perms::KERNEL_RW);
         let idt_frame = mem.map_page(IDT_VA, Perms::KERNEL_RW);
         let tss_frame = mem.map_page(TSS_VA, Perms::KERNEL_RW);
 
-        // Give `rsp0_frame` its own extent so physical-retirement test 4d can retire it cleanly.
+        // Give `rsp0_frame` its own extent so physical-retirement tests can retire it cleanly.
         let pool = mem
             .extents_mut()
             .remove(FrameGpa::new(0), None)
@@ -304,13 +335,23 @@ impl IdtTestRig {
         mem.write_gpa(gdt_frame.raw() + 0x30, &tss_low.to_le_bytes());
         mem.write_gpa(gdt_frame.raw() + 0x38, &tss_high.to_le_bytes());
 
-        // TSS64: RSP0 at +4 (deliberately +0xff8 so 16-byte alignment down to +0xff0 is tested),
-        // IST1 at +36, IST2 at +44.
+        // TSS64:
+        // +4:  RSP0 = RSP0_VA + 0xff8 (unaligned -> aligned down to +0xff0)
+        // +12: RSP1 = RSP1_VA + 0xff8 (unaligned -> aligned down to +0xff0)
+        // +36: IST1 = IST1_VA + 0xff8 (unaligned -> aligned down to +0xff0)
+        // +44: IST2 = IST2_VA + 0xff0
+        // +84: IST7 = IST7_VA + 0xff8 (unaligned -> aligned down to +0xff0)
         mem.write_gpa(tss_frame.raw() + 4, &(RSP0_VA + 0xff8).to_le_bytes());
-        mem.write_gpa(tss_frame.raw() + 36, &(IST1_VA + 0xff0).to_le_bytes());
+        mem.write_gpa(tss_frame.raw() + 12, &(RSP1_VA + 0xff8).to_le_bytes());
+        mem.write_gpa(tss_frame.raw() + 36, &(IST1_VA + 0xff8).to_le_bytes());
         mem.write_gpa(tss_frame.raw() + 44, &(IST2_VA + 0xff0).to_le_bytes());
+        mem.write_gpa(tss_frame.raw() + 84, &(IST7_VA + 0xff8).to_le_bytes());
 
-        let mut machine = SoftMachine::new(mem, Box::new(Cpl0CpuidView::default())).unwrap();
+        let cpuid = Cpl0CpuidView {
+            max_phy_addr: 48,
+            ..Default::default()
+        };
+        let mut machine = SoftMachine::new(mem, Box::new(cpuid)).unwrap();
         {
             let ctx = machine.context_mut();
             ctx.gdtr = DescriptorTablePtr::new(0x3f, GDT_VA);
@@ -327,10 +368,12 @@ impl IdtTestRig {
             gdt_frame,
             idt_frame,
             tss_frame,
-            data_frame,
+            stack_frame,
             rsp0_frame,
+            rsp1_frame,
             ist1_frame,
             ist2_frame,
+            ist7_frame,
         };
         // Default: every vector 0..256 writes its vector to port 0xe0 and halts:
         // mov al, <vec>; out 0xe0, al; hlt (5 bytes per stub inside HANDLER_BASE_VA).
@@ -343,6 +386,10 @@ impl IdtTestRig {
             rig.set_gate(vec, stub_va, 0x08, 0, 0x0e, 0, true);
         }
         rig
+    }
+
+    fn stub_va(vec: u8) -> u64 {
+        HANDLER_BASE_VA + u64::from(vec) * 16
     }
 
     fn translate_kernel_page_gpa(&self, page_va: u64) -> u64 {
@@ -358,11 +405,18 @@ impl IdtTestRig {
         leaf & PTE_ADDR_MASK
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn set_gate(&mut self, vec: u8, handler_va: u64, cs: u16, ist: u8, typ: u8, dpl: u8, p: bool) {
         let gate = encode_idt_gate(handler_va, cs, ist, typ, dpl, p);
         self.machine
             .mem_mut()
             .write_gpa(self.idt_frame.raw() + u64::from(vec) * 16, &gate);
+    }
+
+    fn write_raw_gate(&mut self, vec: u8, raw: &[u8; 16]) {
+        self.machine
+            .mem_mut()
+            .write_gpa(self.idt_frame.raw() + u64::from(vec) * 16, raw);
     }
 
     fn write_user_code(&mut self, bytes: &[u8]) {
@@ -378,7 +432,7 @@ impl IdtTestRig {
     }
 
     fn write_handler(&mut self, vec: u8, bytes: &[u8]) -> u64 {
-        let stub_va = HANDLER_BASE_VA + u64::from(vec) * 16;
+        let stub_va = Self::stub_va(vec);
         assert!(bytes.len() <= 16);
         let stub_gpa = self.translate_kernel_page_gpa(HANDLER_BASE_VA) + u64::from(vec) * 16;
         self.machine.mem_mut().write_gpa(stub_gpa, bytes);
@@ -386,26 +440,34 @@ impl IdtTestRig {
         stub_va
     }
 
-    fn enter_cpl3(&mut self, rip: u64, rflags: u64) {
+    fn enter_cpl3_rsp(&mut self, rip: u64, rsp: u64, rflags: u64) {
         let ctx = self.machine.context_mut();
         ctx.set_cpl(3);
         ctx.cs = SoftSegment::user_code64(0x2b);
         ctx.ss = SoftSegment::user_data(0x23);
-        ctx.gpr[reg::RSP] = USER_STACK_VA + 0xff0;
+        ctx.gpr[reg::RSP] = rsp;
+        ctx.rflags = rflags | 0x2;
+        ctx.halted = false;
+        ctx.rip = rip;
+    }
+
+    fn enter_cpl3(&mut self, rip: u64, rflags: u64) {
+        self.enter_cpl3_rsp(rip, USER_STACK_VA + 0xff0, rflags);
+    }
+
+    fn enter_cpl0_rsp(&mut self, rip: u64, rsp: u64, rflags: u64) {
+        let ctx = self.machine.context_mut();
+        ctx.set_cpl(0);
+        ctx.cs = SoftSegment::kernel_code64(0x08);
+        ctx.ss = SoftSegment::kernel_data(0x10);
+        ctx.gpr[reg::RSP] = rsp;
         ctx.rflags = rflags | 0x2;
         ctx.halted = false;
         ctx.rip = rip;
     }
 
     fn enter_cpl0(&mut self, rip: u64, rflags: u64) {
-        let ctx = self.machine.context_mut();
-        ctx.set_cpl(0);
-        ctx.cs = SoftSegment::kernel_code64(0x08);
-        ctx.ss = SoftSegment::kernel_data(0x10);
-        ctx.gpr[reg::RSP] = STACK_VA + 0xff0;
-        ctx.rflags = rflags | 0x2;
-        ctx.halted = false;
-        ctx.rip = rip;
+        self.enter_cpl0_rsp(rip, STACK_VA + 0xff0, rflags);
     }
 
     fn run_to_vec_port(&mut self) -> u8 {
@@ -419,1327 +481,1024 @@ impl IdtTestRig {
             other => panic!("expected vector port 0xe0 exit, got {other:?}"),
         }
     }
+
+    fn read_frame40(&self, frame_gpa: FrameGpa, offset: u64) -> Frame40 {
+        let base = frame_gpa.raw() + offset;
+        Frame40 {
+            rip: self.machine.mem().read_u64(base),
+            cs: self.machine.mem().read_u64(base + 8),
+            rflags: self.machine.mem().read_u64(base + 16),
+            rsp: self.machine.mem().read_u64(base + 24),
+            ss: self.machine.mem().read_u64(base + 32),
+        }
+    }
+
+    fn read_frame48(&self, frame_gpa: FrameGpa, offset: u64) -> Frame48 {
+        let base = frame_gpa.raw() + offset;
+        Frame48 {
+            error_code: self.machine.mem().read_u64(base),
+            rip: self.machine.mem().read_u64(base + 8),
+            cs: self.machine.mem().read_u64(base + 16),
+            rflags: self.machine.mem().read_u64(base + 24),
+            rsp: self.machine.mem().read_u64(base + 32),
+            ss: self.machine.mem().read_u64(base + 40),
+        }
+    }
 }
 
 #[test]
-fn idt_vectors_de_db_ud_gp_pf_ac_match_sdm_frames_error_codes_cr2_and_stack_switch() {
+fn idt_gate_types_present_and_dpl_checks_match_sdm() {
     let mut rig = IdtTestRig::new();
 
-    // 1. #DE (vector 0): CPL3 `xor edx, edx; xor ecx, ecx; mov eax, 1; div ecx` -> 40-byte frame on aligned RSP0.
-    // 31 d2 31 c9 b8 01 00 00 00 f7 f1 (div ecx is at +9, 2 bytes).
-    rig.write_user_code(&[0x31, 0xd2, 0x31, 0xc9, 0xb8, 1, 0, 0, 0, 0xf7, 0xf1]);
+    // 1. 64-bit Interrupt Gate (0x0e) clears RFLAGS.IF; 64-bit Trap Gate (0x0f) preserves RFLAGS.IF.
+    rig.set_gate(0x80, IdtTestRig::stub_va(0x80), 0x08, 0, 0x0e, 3, true);
+    rig.set_gate(0x81, IdtTestRig::stub_va(0x81), 0x08, 0, 0x0f, 3, true);
+
+    rig.write_user_code(&[0xcd, 0x80]); // int 0x80
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF | RFLAGS_NT);
+    assert_eq!(rig.run_to_vec_port(), 0x80);
+    assert_eq!(rig.machine.context().rflags & (RFLAGS_IF | RFLAGS_NT), 0);
+    let intr_frame = rig.read_frame40(rig.rsp0_frame, 0xfc8);
+    assert_eq!(intr_frame.rip, USER_CODE_VA + 2);
+    assert_eq!(
+        intr_frame.rflags & (RFLAGS_IF | RFLAGS_NT),
+        RFLAGS_IF | RFLAGS_NT
+    );
+
+    rig.write_user_code(&[0xcd, 0x81]); // int 0x81
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF | RFLAGS_NT);
+    assert_eq!(rig.run_to_vec_port(), 0x81);
+    assert_eq!(
+        rig.machine.context().rflags & (RFLAGS_IF | RFLAGS_NT),
+        RFLAGS_IF
+    );
+    let trap_frame = rig.read_frame40(rig.rsp0_frame, 0xfc8);
+    assert_eq!(trap_frame.rip, USER_CODE_VA + 2);
+    assert_eq!(
+        trap_frame.rflags & (RFLAGS_IF | RFLAGS_NT),
+        RFLAGS_IF | RFLAGS_NT
+    );
+
+    // Trap gate with IF=0 on entry keeps IF=0 (never sets IF).
+    rig.enter_cpl0(CODE_VA, 0);
+    rig.write_kernel_code(&[0xcd, 0x81]);
+    assert_eq!(rig.run_to_vec_port(), 0x81);
+    assert_eq!(rig.machine.context().rflags & RFLAGS_IF, 0);
+
+    // 2. Invalid gate types (0x0c call gate, 0x05 task gate, S=1 0x1e) and non-zero upper bits [12:8] -> #GP.
+    for bad_type in [0x0cu8, 0x05u8, 0x1eu8] {
+        rig.set_gate(0x82, IdtTestRig::stub_va(0x82), 0x08, 0, bad_type, 3, true);
+        rig.write_user_code(&[0xcd, 0x82]);
+        rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+        assert_eq!(rig.run_to_vec_port(), 13);
+        let f = rig.read_frame48(rig.rsp0_frame, 0xfc0);
+        // Software INT -> EXT=0, IDT=1 -> (0x82 << 3) | 0x2.
+        assert_eq!(f.error_code, (0x82u64 << 3) | 0x2);
+        assert_eq!(f.rip, USER_CODE_VA);
+    }
+
+    let mut bad_upper = encode_idt_gate(IdtTestRig::stub_va(0x82), 0x08, 0, 0x0e, 3, true);
+    bad_upper[13] = 0x01; // reserved bit 8 in upper dword [12:8]
+    rig.write_raw_gate(0x82, &bad_upper);
+    rig.write_user_code(&[0xcd, 0x82]);
     rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
-    assert_eq!(rig.run_to_vec_port(), 0);
+    assert_eq!(rig.run_to_vec_port(), 13);
+    assert_eq!(
+        rig.read_frame48(rig.rsp0_frame, 0xfc0).error_code,
+        (0x82u64 << 3) | 0x2
+    );
+
+    // Restore valid 0x82 gate.
+    rig.set_gate(0x82, IdtTestRig::stub_va(0x82), 0x08, 0, 0x0e, 3, true);
+
+    // 3. IDTR limit refusal -> #GP((vec << 3) | 0x2 | ext).
+    rig.machine.context_mut().idtr.limit = 0x80 * 16 - 1;
+    rig.write_user_code(&[0xcd, 0x80]);
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    assert_eq!(rig.run_to_vec_port(), 13);
+    assert_eq!(
+        rig.read_frame48(rig.rsp0_frame, 0xfc0).error_code,
+        (0x80u64 << 3) | 0x2
+    );
+    rig.machine.context_mut().idtr.limit = 0xfff;
+
+    // 4. DPL checks for software INT n / INT3 vs hardware exceptions / ICEBP, and P=0 (#NP) ordering:
+    // 4a. Software INT 0x83 at CPL3 with DPL=0 AND P=0 -> DPL check fires FIRST (#GP, EXT=0), NOT #NP!
+    rig.set_gate(0x83, IdtTestRig::stub_va(0x83), 0x08, 0, 0x0e, 0, false);
+    rig.write_user_code(&[0xcd, 0x83]);
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    assert_eq!(rig.run_to_vec_port(), 13);
+    let dpl_gp = rig.read_frame48(rig.rsp0_frame, 0xfc0);
+    assert_eq!(dpl_gp.error_code, (0x83u64 << 3) | 0x2);
+    assert_eq!(dpl_gp.rip, USER_CODE_VA);
+
+    // 4b. Software INT 0x83 at CPL3 with DPL=3 AND P=0 -> passes DPL, raises #NP with EXT=0.
+    rig.set_gate(0x83, IdtTestRig::stub_va(0x83), 0x08, 0, 0x0e, 3, false);
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    assert_eq!(rig.run_to_vec_port(), 11);
+    let sw_np = rig.read_frame48(rig.rsp0_frame, 0xfc0);
+    assert_eq!(sw_np.error_code, (0x83u64 << 3) | 0x2);
+    assert_eq!(sw_np.rip, USER_CODE_VA);
+
+    // 4c. INT3 (0xCC, vector 3) at CPL3: DPL=0 -> #GP((3 << 3) | 2), DPL=3 -> #BP with RIP = va + 1.
+    rig.set_gate(3, IdtTestRig::stub_va(3), 0x08, 0, 0x0f, 0, true);
+    rig.write_user_code(&[0xcc]);
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    assert_eq!(rig.run_to_vec_port(), 13);
+    let int3_gp = rig.read_frame48(rig.rsp0_frame, 0xfc0);
+    assert_eq!(int3_gp.error_code, (3u64 << 3) | 0x2);
+    assert_eq!(int3_gp.rip, USER_CODE_VA);
+
+    rig.set_gate(3, IdtTestRig::stub_va(3), 0x08, 0, 0x0f, 3, true);
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    assert_eq!(rig.run_to_vec_port(), 3);
+    assert_eq!(
+        rig.read_frame40(rig.rsp0_frame, 0xfc8).rip,
+        USER_CODE_VA + 1
+    );
+
+    // 4d. Hardware exception (#UD at CPL3) bypasses DPL=0; if gate has P=0, raises #NP with EXT=1!
+    rig.set_gate(6, IdtTestRig::stub_va(6), 0x08, 0, 0x0e, 0, false);
+    rig.write_user_code(&[0x0f, 0x0b]); // ud2
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    assert_eq!(rig.run_to_vec_port(), 11);
+    let hw_np = rig.read_frame48(rig.rsp0_frame, 0xfc0);
+    assert_eq!(hw_np.error_code, (6u64 << 3) | 0x2 | 0x1);
+    assert_eq!(hw_np.rip, USER_CODE_VA);
+    rig.set_gate(6, IdtTestRig::stub_va(6), 0x08, 0, 0x0e, 0, true);
+
+    // 4e. Software `INT 13` / `INT 14` with DPL=3 pushes NO error code (40-byte frame), unlike hardware #GP/#PF!
+    rig.set_gate(13, IdtTestRig::stub_va(13), 0x08, 0, 0x0e, 3, true);
+    rig.write_user_code(&[0xcd, 13]);
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    assert_eq!(rig.run_to_vec_port(), 13);
+    assert_eq!(rig.machine.context().gpr[reg::RSP], RSP0_VA + 0xfc8); // 0xff0 - 40
+    assert_eq!(
+        rig.read_frame40(rig.rsp0_frame, 0xfc8).rip,
+        USER_CODE_VA + 2
+    );
+    rig.set_gate(13, IdtTestRig::stub_va(13), 0x08, 0, 0x0e, 0, true);
+}
+
+#[test]
+fn idt_ist_rsp0_stack_switch_alignment_and_frame_layout_match_sdm() {
+    let mut rig = IdtTestRig::new();
+
+    // 1. CPL3 -> CPL0 (IST=0): switches to TSS.RSP0 (+0xff8 -> aligned to +0xff0), pushes SS:RSP,
+    // loads VMX-valid NULL SS (selector=0, DPL=0), and IRETQ restores unaligned user RSP (+0xff8).
+    rig.write_handler(0x80, &[0xb0, 0x80, 0xe6, 0xe0, 0x48, 0xcf]); // mov al, 0x80; out 0xe0, al; iretq
+    rig.set_gate(0x80, IdtTestRig::stub_va(0x80), 0x08, 0, 0x0e, 3, true);
+    rig.write_user_code(&[0xcd, 0x80, 0xb0, 0x55, 0xe6, 0xe0]); // int 0x80; mov al, 0x55; out 0xe0, al (CPL3 OUT -> #GP)
+    rig.enter_cpl3_rsp(USER_CODE_VA, USER_STACK_VA + 0xff8, RFLAGS_IF);
+    rig.machine.context_mut().reset_tlb_stats();
+    assert_eq!(rig.run_to_vec_port(), 0x80);
+    // Zero implicit SoftTlb flushes across IDT gate entry (`page_table_invalidations <= 1` contract).
+    assert_eq!(rig.machine.context().tlb_stats().full_flushes, 0);
     {
         let ctx = rig.machine.context();
         assert_eq!(ctx.cpl, 0);
-        // TSS.RSP0 was RSP0_VA + 0xff8 -> aligned down to +0xff0, minus 40 bytes = +0xfc8.
         assert_eq!(ctx.gpr[reg::RSP], RSP0_VA + 0xfc8);
         assert!(ctx.ss.is_unusable());
         assert_eq!(ctx.ss.selector, 0);
         assert_vmx_valid(ctx);
     }
-    let rsp0_gpa = rig.rsp0_frame.raw();
-    assert_eq!(rig.machine.mem().read_u64(rsp0_gpa + 0xfc8), USER_CODE_VA + 9); // RIP = faulting DIV
-    assert_eq!(rig.machine.mem().read_u64(rsp0_gpa + 0xfd0), 0x2b); // CS
-    assert_eq!(rig.machine.mem().read_u64(rsp0_gpa + 0xfd8) & RFLAGS_IF, RFLAGS_IF);
-    assert_eq!(rig.machine.mem().read_u64(rsp0_gpa + 0xfe0), USER_STACK_VA + 0xff0);
-    assert_eq!(rig.machine.mem().read_u64(rsp0_gpa + 0xfe8), 0x23); // SS
-
-    // 2a. #DB (vector 1) single-step TF=1: sets DR6.BS (bit 14), clears DR7.GD (bit 13), clears TF in handler.
-    rig.write_user_code(&[0x90, 0x90]);
-    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF | RFLAGS_TF);
-    rig.machine.context_mut().dr[6] = 0xffff_0ff3; // pre-existing B0|B1 should be cleared
-    rig.machine.context_mut().dr[7] = 0x0000_2400; // GD bit set
-    assert_eq!(rig.run_to_vec_port(), 1);
-    assert_eq!(rig.machine.context().dr[6], 0xffff_0ff0 | (1 << 14));
-    assert_eq!(rig.machine.context().dr[7] & (1 << 13), 0);
-    assert_eq!(rig.machine.context().rflags & RFLAGS_TF, 0);
-    assert_eq!(rig.machine.mem().read_u64(rsp0_gpa + 0xfc8), USER_CODE_VA + 1);
-    assert_ne!(rig.machine.mem().read_u64(rsp0_gpa + 0xfd8) & RFLAGS_TF, 0);
-
-    // 2b. POPFQ clearing TF (1 -> 0) must NOT fire a trailing single-step #DB!
-    // User stack has new RFLAGS = 0x202 (TF=0); code: `popfq (9d); mov eax, 0x77 (b8 77 00 00 00); ud2 (0f 0b)`
-    let user_stack_gpa = rig.translate_kernel_page_gpa(USER_STACK_VA);
-    rig.machine
-        .mem_mut()
-        .write_gpa(user_stack_gpa + 0xff0, &0x202u64.to_le_bytes());
-    rig.write_user_code(&[0x9d, 0xb8, 0x77, 0, 0, 0, 0x0f, 0x0b]);
-    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF | RFLAGS_TF);
-    // Must hit #UD (6) at +6 with EAX=0x77, NEVER #DB (1)!
-    assert_eq!(rig.run_to_vec_port(), 6);
-    assert_eq!(rig.machine.context().gpr[reg::RAX], 0x77);
-
-    // 2c. POPFQ setting TF (0 -> 1) delays #DB until AFTER the NEXT instruction retires!
-    rig.machine
-        .mem_mut()
-        .write_gpa(user_stack_gpa + 0xff0, &(0x202u64 | RFLAGS_TF).to_le_bytes());
-    // `popfq (9d); mov eax, 0x42 (b8 42 00 00 00); mov ebx, 0x99 (bb 99 00 00 00)`
-    rig.write_user_code(&[0x9d, 0xb8, 0x42, 0, 0, 0, 0xbb, 0x99, 0, 0, 0]);
-    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
-    assert_eq!(rig.run_to_vec_port(), 1);
-    assert_eq!(rig.machine.context().gpr[reg::RAX], 0x42);
-    assert_eq!(rig.machine.context().gpr[reg::RBX], 0);
-    assert_eq!(rig.machine.mem().read_u64(rsp0_gpa + 0xfc8), USER_CODE_VA + 6);
-
-    // 2d. REP MOVSB with TF=1 traps after a single iteration (`RCX` decrements 3 -> 2).
-    let user_data_gpa = rig.translate_kernel_page_gpa(USER_DATA_VA);
-    rig.machine
-        .mem_mut()
-        .write_gpa(user_data_gpa, &[0xaa, 0xbb, 0xcc]);
-    rig.write_user_code(&[0xf3, 0xa4, 0x90]); // rep movsb; nop
-    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF | RFLAGS_TF);
-    rig.machine.context_mut().gpr[reg::RSI] = USER_DATA_VA;
-    rig.machine.context_mut().gpr[reg::RDI] = USER_DATA_VA + 0x100;
-    rig.machine.context_mut().gpr[reg::RCX] = 3;
-    assert_eq!(rig.run_to_vec_port(), 1);
-    assert_eq!(rig.machine.context().gpr[reg::RCX], 2);
-    assert_eq!(rig.machine.mem().read_u64(rsp0_gpa + 0xfc8), USER_CODE_VA);
-
-    // 2e. DR0 hardware execution breakpoint + IRETQ with RFLAGS.RF=1 resuming past DR0 once!
-    // Handler 1 sets RF (bit 16) in `[rsp + 16]` and executes `iretq`:
-    // `or qword ptr [rsp + 16], 0x10000` (48 81 4c 24 10 00 00 01 00); `inc r12` (49 ff c4); `iretq` (48 cf) = 14 bytes!
-    rig.write_handler(
-        1,
-        &[
-            0x48, 0x81, 0x4c, 0x24, 0x10, 0x00, 0x00, 0x01, 0x00, 0x49, 0xff, 0xc4, 0x48, 0xcf,
-        ],
-    );
-    // User code: `mov eax, 0x55` (b8 55 00 00 00, at +0); `ud2` (0f 0b, at +5).
-    rig.write_user_code(&[0xb8, 0x55, 0, 0, 0, 0x0f, 0x0b]);
-    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
-    rig.machine.context_mut().gpr[reg::RAX] = 0;
-    rig.machine.context_mut().gpr[reg::R12] = 0;
-    rig.machine.context_mut().dr[0] = USER_CODE_VA;
-    rig.machine.context_mut().dr[6] = 0xffff_0ff0;
-    rig.machine.context_mut().dr[7] = 0x0000_0401; // L0=1, R/W0=00 (execute), LEN0=00
-    assert_eq!(rig.run_to_vec_port(), 6);
     assert_eq!(
-        rig.machine.context().gpr[reg::R12],
-        1,
-        "DR0 fired once, then RF=1 suppressed re-fire on resume"
+        rig.read_frame40(rig.rsp0_frame, 0xfc8),
+        Frame40 {
+            rip: USER_CODE_VA + 2,
+            cs: 0x2b,
+            rflags: RFLAGS_IF | 0x2,
+            rsp: USER_STACK_VA + 0xff8,
+            ss: 0x23,
+        }
     );
-    assert_eq!(rig.machine.context().gpr[reg::RAX], 0x55);
-    assert_eq!(rig.machine.context().dr[6] & 0xf, 1);
-    assert_eq!(rig.machine.context().rflags & RFLAGS_RF, 0, "RF cleared after 1 retired insn");
-    rig.machine.context_mut().dr[7] = 0x0000_0400;
-    rig.write_handler(1, &[0xb0, 1, 0xe6, 0xe0, 0xf4]);
-
-    // 2f. ICEBP / INT1 (`0xf1`) at CPL3 bypasses DPL=0 on gate 1 and uses EXT=0 on gate faults.
-    rig.write_user_code(&[0xf1, 0x90]);
-    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
-    assert_eq!(rig.run_to_vec_port(), 1);
-    assert_eq!(rig.machine.mem().read_u64(rsp0_gpa + 0xfc8), USER_CODE_VA + 1);
-    // Mark gate 1 not-present: ICEBP must raise #NP (11) with EXT=0 -> (1 << 3) | 2 = 0x0a and fault_va = USER_CODE_VA.
-    rig.set_gate(1, HANDLER_BASE_VA + 16, 0x08, 0, 0x0e, 0, false);
-    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
-    assert_eq!(rig.run_to_vec_port(), 11);
-    assert_eq!(rig.machine.mem().read_u64(rsp0_gpa + 0xfc0), 0x0a); // EXT=0!
-    assert_eq!(rig.machine.mem().read_u64(rsp0_gpa + 0xfc8), USER_CODE_VA);
-    rig.set_gate(1, HANDLER_BASE_VA + 16, 0x08, 0, 0x0e, 0, true);
-
-    // 3. #GP (vector 13): privileged CLI at CPL3 (error_code = 0), INT 0x80 at DPL=0 (IDT=1, EXT=0),
-    // and exception gate referencing out-of-limit CS=0x48 (EXT=1 -> 0x49).
-    rig.write_user_code(&[0xfa]); // cli
-    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    // Step IRETQ -> returns to CPL3 with unaligned RSP = USER_STACK_VA + 0xff8, then faults on `out` (#GP).
     assert_eq!(rig.run_to_vec_port(), 13);
-    assert_eq!(rig.machine.mem().read_u64(rsp0_gpa + 0xfc0), 0);
-    assert_eq!(rig.machine.mem().read_u64(rsp0_gpa + 0xfc8), USER_CODE_VA);
-
-    rig.write_user_code(&[0xcd, 0x80]); // int 0x80 (gate 0x80 has DPL=0)
-    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
-    assert_eq!(rig.run_to_vec_port(), 13);
-    assert_eq!(rig.machine.mem().read_u64(rsp0_gpa + 0xfc0), (0x80 << 3) | 0x2);
-
-    rig.set_gate(6, HANDLER_BASE_VA + 6 * 16, 0x48, 0, 0x0e, 0, true);
-    rig.write_user_code(&[0x0f, 0x0b]); // ud2 -> benign #UD -> CS selector 0x48 out of GDT limit -> #GP(0x49)
-    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
-    assert_eq!(rig.run_to_vec_port(), 13);
-    assert_eq!(rig.machine.mem().read_u64(rsp0_gpa + 0xfc0), 0x48 | 1);
-    rig.set_gate(6, HANDLER_BASE_VA + 6 * 16, 0x08, 0, 0x0e, 0, true);
-
-    // 4a. #PF (vector 14): write to read-only user page & execute on NX user page.
-    let ro_va = 0x0000_0000_0070_0000;
-    rig.machine.mem_mut().map_page(ro_va, Perms::USER_RO);
-    // `mov byte ptr [rax], 1` (c6 00 01)
-    rig.write_user_code(&[0xc6, 0x00, 0x01]);
-    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
-    rig.machine.context_mut().gpr[reg::RAX] = ro_va + 0x34;
-    assert_eq!(rig.run_to_vec_port(), 14);
-    assert_eq!(rig.machine.context().cr2, ro_va + 0x34);
     assert_eq!(
-        rig.machine.mem().read_u64(rsp0_gpa + 0xfc0) as u32,
-        PF_ERR_PRESENT | PF_ERR_WRITE | PF_ERR_USER
+        rig.read_frame48(rig.rsp0_frame, 0xfc0).rsp,
+        USER_STACK_VA + 0xff8
     );
 
-    rig.enter_cpl3(USER_DATA_VA + 0x10, RFLAGS_IF);
-    assert_eq!(rig.run_to_vec_port(), 14);
-    assert_eq!(rig.machine.context().cr2, USER_DATA_VA + 0x10);
+    // 2. CPL0 -> CPL0 same-privilege (IST=0): aligns current RSP (+0xff8 -> +0xff0) and STILL pushes SS:RSP!
+    rig.write_handler(0x81, &[0xb0, 0x81, 0xe6, 0xe0, 0x48, 0xcf]); // mov al, 0x81; out 0xe0, al; iretq
+    rig.set_gate(0x81, IdtTestRig::stub_va(0x81), 0x08, 0, 0x0e, 0, true);
+    rig.write_kernel_code(&[0xcd, 0x81, 0xf4]); // int 0x81; hlt
+    rig.enter_cpl0_rsp(CODE_VA, STACK_VA + 0xff8, RFLAGS_IF);
+    assert_eq!(rig.run_to_vec_port(), 0x81);
+    {
+        let ctx = rig.machine.context();
+        assert_eq!(ctx.cpl, 0);
+        assert_eq!(ctx.gpr[reg::RSP], STACK_VA + 0xfc8);
+        // Same-privilege IST=0 preserves kernel SS selector 0x10.
+        assert_eq!(ctx.ss.selector, 0x10);
+        assert!(!ctx.ss.is_unusable());
+        assert_vmx_valid(ctx);
+    }
     assert_eq!(
-        rig.machine.mem().read_u64(rsp0_gpa + 0xfc0) as u32,
-        PF_ERR_PRESENT | PF_ERR_USER | PF_ERR_INSTR
+        rig.read_frame40(rig.stack_frame, 0xfc8),
+        Frame40 {
+            rip: CODE_VA + 2,
+            cs: 0x08,
+            rflags: RFLAGS_IF | 0x2,
+            rsp: STACK_VA + 0xff8,
+            ss: 0x10,
+        }
     );
-
-    // 4b. #PF during CPL0 STAC with CR4.SMAP=1 MUST clear RFLAGS.AC on IDT entry while saving AC=1 on stack!
-    rig.machine.context_mut().cr4 |= CR4_SMAP;
-    rig.machine.context_mut().sync_tlb_tag_bits();
-    // `stac (0f 01 cb); mov rax, [rdi] (48 8b 07)` at CODE_VA, with RDI = unmapped user VA 0x7_0000.
-    rig.write_kernel_code(&[0x0f, 0x01, 0xcb, 0x48, 0x8b, 0x07]);
-    rig.enter_cpl0(CODE_VA, RFLAGS_IF);
-    rig.machine.context_mut().gpr[reg::RDI] = 0x7_0000;
-    assert_eq!(rig.run_to_vec_port(), 14);
-    assert_eq!(rig.machine.context().cr2, 0x7_0000);
+    // Continue across IRETQ -> HLT at CODE_VA + 2 with unaligned RSP restored!
     assert_eq!(
-        rig.machine.context().rflags & RFLAGS_AC,
-        0,
-        "IDT gate entry must clear RFLAGS.AC so CPL0 handler runs with SMAP protection engaged"
+        rig.machine.run(16).unwrap(),
+        SoftMachineExit::Hlt {
+            rip: CODE_VA + 2,
+            next_rip: CODE_VA + 3,
+        }
     );
-    let stack_gpa = rig.translate_kernel_page_gpa(STACK_VA);
-    // Same-privilege CPL0 stack: STACK_VA + 0xff0 - 48 = +0xfc0; saved RFLAGS is at +0xfd8.
-    assert_ne!(
-        rig.machine.mem().read_u64(stack_gpa + 0xfd8) & RFLAGS_AC,
-        0,
-        "pushed RFLAGS on stack must preserve caller AC=1 for IRETQ"
-    );
-    rig.machine.context_mut().cr4 &= !CR4_SMAP;
-    rig.machine.context_mut().sync_tlb_tag_bits();
+    assert_eq!(rig.machine.context().gpr[reg::RSP], STACK_VA + 0xff8);
+    assert_eq!(rig.machine.context().rflags & RFLAGS_IF, RFLAGS_IF);
 
-    // 4c. Same-privilege CPL3 -> CPL3 trap gate (`target_cs = 0x2b`, `DPL = 3`) on a supervisor-only stack
-    // must push with `Cpl::Ring3` and fault with `PF_ERR_USER | PF_ERR_WRITE | PF_ERR_PRESENT`!
-    rig.set_gate(0x81, USER_CODE_VA + 0x100, 0x2b, 0, 0x0f, 3, true);
-    rig.write_user_code(&[0xcd, 0x81]);
+    // 3. IST selection from TSS:
+    // 3a. CPL0 -> CPL0 with IST=7 switches to TSS.IST7 (+0xff8 -> +0xff0) and loads NULL SS!
+    rig.write_handler(0x82, &[0xb0, 0x82, 0xe6, 0xe0, 0x48, 0xcf]);
+    rig.set_gate(0x82, IdtTestRig::stub_va(0x82), 0x08, 7, 0x0e, 0, true);
+    rig.write_kernel_code(&[0xcd, 0x82, 0xf4]);
+    rig.enter_cpl0_rsp(CODE_VA, STACK_VA + 0xf08, RFLAGS_IF);
+    assert_eq!(rig.run_to_vec_port(), 0x82);
+    {
+        let ctx = rig.machine.context();
+        assert_eq!(ctx.gpr[reg::RSP], IST7_VA + 0xfc8);
+        assert!(ctx.ss.is_unusable());
+        assert_eq!(ctx.ss.selector, 0);
+        assert_vmx_valid(ctx);
+    }
+    assert_eq!(
+        rig.read_frame40(rig.ist7_frame, 0xfc8).rsp,
+        STACK_VA + 0xf08
+    );
+    assert_eq!(rig.read_frame40(rig.ist7_frame, 0xfc8).ss, 0x10);
+    assert_eq!(
+        rig.machine.run(16).unwrap(),
+        SoftMachineExit::Hlt {
+            rip: CODE_VA + 2,
+            next_rip: CODE_VA + 3,
+        }
+    );
+    assert_eq!(rig.machine.context().gpr[reg::RSP], STACK_VA + 0xf08);
+
+    // 3b. CPL3 -> CPL0 with IST=2 overrides TSS.RSP0 and uses TSS.IST2!
+    rig.set_gate(0x83, IdtTestRig::stub_va(0x83), 0x08, 2, 0x0e, 3, true);
+    rig.write_user_code(&[0xcd, 0x83]);
     rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
-    rig.machine.context_mut().gpr[reg::RSP] = DATA_VA + 0x800; // supervisor-only page!
-    assert_eq!(rig.run_to_vec_port(), 14);
+    assert_eq!(rig.run_to_vec_port(), 0x83);
+    assert_eq!(rig.machine.context().gpr[reg::RSP], IST2_VA + 0xfc8);
     assert_eq!(
-        rig.machine.mem().read_u64(rsp0_gpa + 0xfc0) as u32,
-        PF_ERR_PRESENT | PF_ERR_WRITE | PF_ERR_USER
+        rig.read_frame40(rig.ist2_frame, 0xfc8).rsp,
+        USER_STACK_VA + 0xff0
     );
 
-    // 4d. Physical-retirement witness (`softmmu.x86.physical-retirement`):
-    // Warm RSP0_VA in SoftTlb, retire/remap RSP0_VA to a fresh frame while parked (without manual flush_tlb!),
-    // then trigger CPL3 #UD -> IDT frame push must land in the new frame and never the retired frame!
-    rig.write_user_code(&[0x0f, 0x0b]); // ud2 at USER_CODE_VA
-    rig.write_kernel_code(&[0x48, 0xc7, 0x07, 0x11, 0, 0, 0, 0xf4]); // mov qword ptr [rdi], 0x11; hlt
-    rig.enter_cpl0(CODE_VA, RFLAGS_IF);
-    rig.machine.context_mut().gpr[reg::RDI] = RSP0_VA + 0xfc8;
-    assert!(matches!(
-        rig.machine.run(8).unwrap(),
-        SoftMachineExit::Hlt { .. }
-    ));
-    let new_rsp0_frame = rig.machine.mem_mut().alloc_frame();
+    // 3c. CPL3 -> Ring 1 (target CS = 0x18, DPL=1, IST=0): selects TSS.RSP1 (+12) and loads NULL SS with RPL=DPL=1!
+    let ring1_va = 0x0000_0000_0070_0000u64;
+    let ring1_frame = rig.machine.mem_mut().map_page(ring1_va, Perms::KERNEL_RX);
+    // Ring 1 handler executes `iretq` back to CPL3, where `ud2` fires to CPL0!
     rig.machine
         .mem_mut()
-        .map_frame(RSP0_VA, new_rsp0_frame, Perms::KERNEL_RW);
-    let retirement = rig
-        .machine
-        .mem_mut()
-        .extents_mut()
-        .remove(rig.rsp0_frame, None)
-        .unwrap()
-        .unwrap();
-    let completion = retirement.pending.try_complete().unwrap();
-    rig.machine.mem_mut().extents_mut().reclaim(&completion);
+        .write_gpa(ring1_frame.raw(), &[0x48, 0xcf]);
+    rig.set_gate(0x84, ring1_va, 0x18, 0, 0x0e, 3, true);
+    rig.write_user_code(&[0xcd, 0x84, 0x0f, 0x0b]);
     rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
-    assert_eq!(rig.run_to_vec_port(), 6);
-    assert_eq!(rig.machine.mem().read_u64(rsp0_gpa + 0xfc8), 0x11);
+    assert_eq!(rig.machine.step().unwrap(), None); // enters Ring 1 handler
+    {
+        let ctx = rig.machine.context();
+        assert_eq!(ctx.cpl, 1);
+        assert_eq!(ctx.cs.selector, 0x19);
+        assert_eq!(ctx.ss.selector, 1);
+        assert!(ctx.ss.is_unusable());
+        assert_vmx_valid(ctx);
+        assert_eq!(ctx.gpr[reg::RSP], RSP1_VA + 0xfc8);
+    }
     assert_eq!(
-        rig.machine.mem().read_u64(new_rsp0_frame.raw() + 0xfc8),
-        USER_CODE_VA
+        rig.read_frame40(rig.rsp1_frame, 0xfc8).rip,
+        USER_CODE_VA + 2
     );
-    rig.rsp0_frame = new_rsp0_frame;
-    let rsp0_gpa = rig.rsp0_frame.raw();
+    assert_eq!(rig.run_to_vec_port(), 6); // IRETQ -> CPL3 -> ud2 -> Ring 0 #UD!
 
-    // 5. #AC (vector 17): CPL3 + CR0.AM=1 + RFLAGS.AC=1 unaligned GPR load -> #AC(0);
-    // unmapped page -> #PF takes priority; CPL0 -> no #AC; 16-byte legacy MOVUPS/MOVDQU -> NO #AC!
-    rig.machine.context_mut().cr0 |= CR0_AM;
-    // `mov rax, [rdi]` (48 8b 07)
-    rig.write_user_code(&[0x48, 0x8b, 0x07]);
-    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF | RFLAGS_AC);
-    rig.machine.context_mut().gpr[reg::RDI] = USER_DATA_VA + 3;
-    assert_eq!(rig.run_to_vec_port(), 17);
-    assert_eq!(rig.machine.mem().read_u64(rsp0_gpa + 0xfc0), 0);
-
-    // Unmapped unaligned VA -> #PF (14) wins over #AC (17)!
-    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF | RFLAGS_AC);
-    rig.machine.context_mut().gpr[reg::RDI] = 0x7_0003;
-    assert_eq!(rig.run_to_vec_port(), 14);
-    assert_eq!(rig.machine.context().cr2, 0x7_0003);
-
-    // CPL0 with CR0.AM=1 + RFLAGS.AC=1 -> NO #AC!
-    rig.write_kernel_code(&[0x48, 0x8b, 0x07, 0xf4]);
-    rig.enter_cpl0(CODE_VA, RFLAGS_IF | RFLAGS_AC);
-    rig.machine.context_mut().gpr[reg::RDI] = DATA_VA + 3;
-    assert!(matches!(
-        rig.machine.run(8).unwrap(),
-        SoftMachineExit::Hlt { .. }
-    ));
-
-    // Legacy 128-bit unaligned SIMD (`movups xmm0, [rdi + 1]`; `movdqu [rdi + 19], xmm0`; `ud2`) at CPL3
-    // with CR0.AM=1 + RFLAGS.AC=1 must NOT raise #AC (must reach #UD 6)!
-    rig.write_user_code(&[
-        0x0f, 0x10, 0x47, 0x01, // movups xmm0, [rdi + 1]
-        0xf3, 0x0f, 0x7f, 0x47, 0x13, // movdqu [rdi + 19], xmm0
-        0x0f, 0x0b, // ud2
-    ]);
-    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF | RFLAGS_AC);
-    rig.machine.context_mut().gpr[reg::RDI] = USER_DATA_VA;
-    assert_eq!(rig.run_to_vec_port(), 6);
-}
-
-#[test]
-fn idt_double_fault_escalation_ist_and_triple_fault_match_sdm_table_6_5() {
-    let mut rig = IdtTestRig::new();
-    // Route #DF (vector 8) through IST1.
-    rig.set_gate(8, HANDLER_BASE_VA + 8 * 16, 0x08, 1, 0x0e, 0, true);
-
-    // 1. Contributory (#DE, 0) + Contributory (#NP on gate 0) -> escalates to #DF(0) on IST1!
-    rig.set_gate(0, HANDLER_BASE_VA, 0x08, 0, 0x0e, 0, false);
-    rig.write_user_code(&[0x31, 0xd2, 0x31, 0xc9, 0xf7, 0xf1]); // div ecx
-    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
-    assert_eq!(rig.run_to_vec_port(), 8);
-    assert_eq!(rig.machine.context().gpr[reg::RSP], IST1_VA + 0xff0 - 48);
-    assert_eq!(rig.machine.mem().read_u64(rig.ist1_frame.raw() + 0xfc0), 0);
-    rig.set_gate(0, HANDLER_BASE_VA, 0x08, 0, 0x0e, 0, true);
-
-    // 2. PageFault (#PF, 14) + Contributory (#NP on gate 14) -> escalates to #DF(0), preserving CR2!
-    rig.set_gate(14, HANDLER_BASE_VA + 14 * 16, 0x08, 0, 0x0e, 0, false);
-    rig.write_user_code(&[0x48, 0x8b, 0x07]);
-    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
-    rig.machine.context_mut().gpr[reg::RDI] = 0x9_9000;
-    assert_eq!(rig.run_to_vec_port(), 8);
-    assert_eq!(rig.machine.context().cr2, 0x9_9000);
-    rig.set_gate(14, HANDLER_BASE_VA + 14 * 16, 0x08, 0, 0x0e, 0, true);
-
-    // 3. PageFault (#PF, 14) + PageFault (unmapped RSP0) -> escalates to #DF(0) on IST1!
-    rig.machine.mem_mut().unmap_page(RSP0_VA);
-    rig.machine.context_mut().flush_tlb();
-    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
-    rig.machine.context_mut().gpr[reg::RDI] = 0x9_a000;
-    assert_eq!(rig.run_to_vec_port(), 8);
-    assert_eq!(rig.machine.context().cr2, RSP0_VA + 0xfc0);
-
-    // 4. Contributory (#GP, 13) + PageFault (unmapped RSP0) -> delivered SERIALLY to #PF (on IST2), NOT #DF!
-    rig.set_gate(14, HANDLER_BASE_VA + 14 * 16, 0x08, 2, 0x0e, 0, true);
-    rig.write_user_code(&[0xfa]); // cli -> #GP
-    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
-    assert_eq!(rig.run_to_vec_port(), 14);
-    assert_eq!(rig.machine.context().gpr[reg::RSP], IST2_VA + 0xff0 - 48);
+    // 4. Target-CPL stack push rights: CPL3 -> CPL3 gate (target CS = 0x28, DPL=3) with user RSP on a
+    // supervisor-only page raises #PF with U/S = 1 (`PF_ERR_PRESENT | PF_ERR_WRITE | PF_ERR_USER`)!
+    let sup_only_stack = 0x0000_0000_0071_0000u64;
     rig.machine
         .mem_mut()
-        .map_frame(RSP0_VA, rig.rsp0_frame, Perms::KERNEL_RW);
-    rig.set_gate(14, HANDLER_BASE_VA + 14 * 16, 0x08, 0, 0x0e, 0, true);
-
-    // 5. Benign (#UD, 6) + Contributory (#NP on gate 6) -> delivered SERIALLY to #NP (11), NOT #DF!
-    rig.set_gate(6, HANDLER_BASE_VA + 6 * 16, 0x08, 0, 0x0e, 0, false);
-    rig.write_user_code(&[0x0f, 0x0b]);
-    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
-    assert_eq!(rig.run_to_vec_port(), 11);
-    rig.set_gate(6, HANDLER_BASE_VA + 6 * 16, 0x08, 0, 0x0e, 0, true);
-
-    // 6. ExternalInterrupt (0x40) + Contributory (#NP on gate 0x40) -> delivered SERIALLY to #NP(0x203), NOT #DF!
-    rig.set_gate(0x40, HANDLER_BASE_VA + 0x40 * 16, 0x08, 0, 0x0e, 0, false);
-    rig.write_user_code(&[0x90]);
-    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
-    rig.machine.inject_interrupt(0x40).unwrap();
-    assert_eq!(rig.run_to_vec_port(), 11);
+        .map_page(sup_only_stack, Perms::KERNEL_RW);
+    rig.set_gate(0x85, USER_CODE_VA + 0x40, 0x2b, 0, 0x0f, 3, true);
+    rig.write_user_code(&[0xcd, 0x85]);
+    rig.enter_cpl3_rsp(USER_CODE_VA, sup_only_stack + 0xff0, RFLAGS_IF);
+    assert_eq!(rig.run_to_vec_port(), 14);
+    assert_eq!(rig.machine.context().cr2, sup_only_stack + 0xfc8);
     assert_eq!(
-        rig.machine.mem().read_u64(rig.rsp0_frame.raw() + 0xfc0),
-        (0x40 << 3) | 0x2 | 1
+        rig.read_frame48(rig.rsp0_frame, 0xfc0).error_code,
+        u64::from(PF_ERR_PRESENT | PF_ERR_WRITE | PF_ERR_USER)
     );
 
-    // 7. Same-privilege CPL0 -> CPL0 via IST2 AND CPL3 -> Ring1 (`CS = 0x18`) via IST2:
-    // Both MUST load NULL SS with `selector = new_cpl` and `SS.DPL = new_cpl` (`check_vmx_guest_segments` passes)!
-    rig.set_gate(6, HANDLER_BASE_VA + 6 * 16, 0x08, 2, 0x0e, 0, true);
+    // 5. Invalid/short TSS -> #TS(tr_sel | ext); non-canonical RSP0 -> #SS(ext).
+    rig.machine.context_mut().tr.limit = 4; // too small for RSP0 (+4..+11)
+    rig.write_user_code(&[0x0f, 0x0b]); // ud2 -> CPL3->0 tries RSP0 -> #TS -> #TS needs IST!
+    // Put #TS (vector 10) on same-privilege? No, from CPL3 any CPL0 handler needs TSS!
+    // Test from CPL0 with IST=1 where TR.limit < 43 -> #TS(0x30 | 1) delivered on IST=0 CPL0 stack!
+    rig.set_gate(6, IdtTestRig::stub_va(6), 0x08, 1, 0x0e, 0, true);
+    rig.machine.context_mut().tr.limit = 0x20; // < 36 + 7, so IST1 fails with #TS!
     rig.write_kernel_code(&[0x0f, 0x0b]);
     rig.enter_cpl0(CODE_VA, RFLAGS_IF);
-    assert_eq!(rig.run_to_vec_port(), 6);
-    assert_eq!(rig.machine.context().gpr[reg::RSP], IST2_VA + 0xff0 - 40);
-    assert!(rig.machine.context().ss.is_unusable());
-    assert_eq!(rig.machine.context().ss.selector, 0);
-    assert_vmx_valid(rig.machine.context());
-    // Saved SS on IST2 stack was old CPL0 SS (0x10):
-    assert_eq!(rig.machine.mem().read_u64(rig.ist2_frame.raw() + 0xfe8), 0x10);
+    assert_eq!(rig.run_to_vec_port(), 10);
+    let ts_frame = rig.read_frame48(rig.stack_frame, 0xfc0);
+    assert_eq!(ts_frame.error_code, 0x30 | 1);
+    assert_eq!(ts_frame.rip, CODE_VA);
+    rig.machine.context_mut().tr.limit = 0x67;
 
-    // Inter-privilege CPL3 -> Ring1 (`CS = 0x19` / `0x18`, DPL = 1): NULL SS must have selector=1, DPL=1!
-    rig.set_gate(6, HANDLER_BASE_VA + 6 * 16, 0x18, 2, 0x0e, 0, true);
-    rig.write_user_code(&[0x0f, 0x0b]);
-    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
-    // At Ring 1, `out` raises #GP(0), so put `nop` at handler 6 and step once to inspect Ring 1 segment state!
-    rig.write_handler(6, &[0x90]);
-    assert_eq!(rig.machine.step().unwrap(), None); // executes UD2 and delivers gate 6 -> Ring 1!
-    assert_eq!(rig.machine.context().cpl, 1);
-    assert_eq!(rig.machine.context().ss.selector, 1);
-    assert_eq!(rig.machine.context().ss.dpl(), 1);
-    assert_vmx_valid(rig.machine.context());
-    rig.write_handler(6, &[0xb0, 6, 0xe6, 0xe0, 0xf4]);
-    rig.set_gate(6, HANDLER_BASE_VA + 6 * 16, 0x08, 0, 0x0e, 0, true);
-
-    // 8. #DF + secondary fault (non-canonical IST1 in TSS) -> TripleFault!
+    // Non-canonical IST1 -> #SS(1) delivered on IST=0 CPL0 stack.
     rig.machine
         .mem_mut()
         .write_gpa(rig.tss_frame.raw() + 36, &NON_CANON.to_le_bytes());
-    rig.set_gate(0, HANDLER_BASE_VA, 0x08, 0, 0x0e, 0, false);
-    rig.write_user_code(&[0x31, 0xd2, 0x31, 0xc9, 0xf7, 0xf1]);
-    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
-    match rig.machine.run(8).unwrap() {
-        SoftMachineExit::TripleFault { last_exception } => {
-            assert_eq!(last_exception.vector, X86ExceptionVector::StackSegmentFault);
-            assert_eq!(last_exception.error_code, Some(1));
-        }
-        other => panic!("expected TripleFault, got {other:?}"),
-    }
-}
-
-#[test]
-fn external_interrupt_delivery_enforces_if_cr8_priority_sti_shadow_trap_vs_intr_gate_and_hlt_wake() {
-    let mut rig = IdtTestRig::new();
-
-    // 1. Vectors 0..31 are architectural exceptions and must be rejected.
-    for bad in [0u8, 1, 14, 31] {
-        assert_eq!(
-            rig.machine.inject_interrupt(bad),
-            Err(InvalidInterruptVector(bad))
-        );
-    }
-
-    // 2. Simultaneous pending interrupts deliver highest vector first: 0xe1 > 0x80 > 0x30.
-    // Handlers 0xe1, 0x80, 0x30 record their vector into `[DATA_VA + r13]` and `inc r13; iretq`:
-    for vec in [0x30u8, 0x80, 0xe1] {
-        // mov byte ptr [r14 + r13], <vec> (43 c6 04 2e <vec>); inc r13 (49 ff c5); iretq (48 cf) = 11 bytes!
-        rig.write_handler(
-            vec,
-            &[0x43, 0xc6, 0x04, 0x2e, vec, 0x49, 0xff, 0xc5, 0x48, 0xcf],
-        );
-    }
-    rig.write_user_code(&[0x90, 0x0f, 0x0b]); // nop; ud2
-    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
-    rig.machine.context_mut().gpr[reg::R14] = DATA_VA;
-    rig.machine.context_mut().gpr[reg::R13] = 0;
-    // Allow CPL0 handler access to DATA_VA (supervisor RW, already mapped).
-    rig.machine.inject_interrupt(0x30).unwrap();
-    rig.machine.inject_interrupt(0xe1).unwrap();
-    rig.machine.inject_interrupt(0x80).unwrap();
-    assert!(rig.machine.is_interrupt_pending(0x30));
-    assert!(rig.machine.is_interrupt_pending(0x80));
-    assert!(rig.machine.is_interrupt_pending(0xe1));
-    assert_eq!(rig.machine.deliverable_interrupt(), Some(0xe1));
-    assert_eq!(rig.run_to_vec_port(), 6); // runs all 3 IRQs in priority order, then NOP, then UD2!
-    assert_eq!(
-        rig.machine.mem().read_gpa(rig.data_frame.raw(), 3),
-        vec![0xe1, 0x80, 0x30]
-    );
-
-    // 3. CR8 (TPR) masking: CR8 = 8 masks 0x80 (class 8 <= 8) and 0x30 (class 3 <= 8), admits 0x90 (class 9 > 8).
-    rig.write_handler(
-        0x90,
-        &[0x43, 0xc6, 0x04, 0x2e, 0x90, 0x49, 0xff, 0xc5, 0x48, 0xcf],
-    );
-    // CPL0 code: `nop (90); mov eax, 2 (b8 02 00 00 00); mov cr8, rax (44 0f 22 c0); nop (90); hlt (f4)`
-    rig.write_kernel_code(&[0x90, 0xb8, 2, 0, 0, 0, 0x44, 0x0f, 0x22, 0xc0, 0x90, 0xf4]);
     rig.enter_cpl0(CODE_VA, RFLAGS_IF);
-    rig.machine.context_mut().cr8 = 8;
-    rig.machine.context_mut().gpr[reg::R14] = DATA_VA + 0x10;
-    rig.machine.context_mut().gpr[reg::R13] = 0;
-    rig.machine.inject_interrupt(0x30).unwrap();
-    rig.machine.inject_interrupt(0x80).unwrap();
-    rig.machine.inject_interrupt(0x90).unwrap();
-    // Step 1 delivers 0x90 immediately before `nop`!
-    assert_eq!(rig.machine.step().unwrap(), None);
-    assert_eq!(rig.machine.context().rip, HANDLER_BASE_VA + 0x90 * 16);
-    assert!(rig.machine.is_interrupt_pending(0x80));
-    assert!(rig.machine.is_interrupt_pending(0x30));
-    assert_eq!(rig.machine.deliverable_interrupt(), None);
-    // Run to HLT: `mov cr8, 2` unmasks 0x80 then 0x30!
-    assert!(matches!(
-        rig.machine.run(32).unwrap(),
-        SoftMachineExit::Hlt { .. }
-    ));
-    assert_eq!(
-        rig.machine.mem().read_gpa(rig.data_frame.raw() + 0x10, 3),
-        vec![0x90, 0x80, 0x30]
-    );
-    rig.machine.context_mut().cr8 = 0;
+    assert_eq!(rig.run_to_vec_port(), 12);
+    let ss_frame = rig.read_frame48(rig.stack_frame, 0xfc0);
+    assert_eq!(ss_frame.error_code, 1);
+    assert_eq!(ss_frame.rip, CODE_VA);
+    rig.machine
+        .mem_mut()
+        .write_gpa(rig.tss_frame.raw() + 36, &(IST1_VA + 0xff8).to_le_bytes());
+    rig.set_gate(6, IdtTestRig::stub_va(6), 0x08, 0, 0x0e, 0, true);
 
-    // 4. STI 1-instruction interrupt shadow:
-    // 4a. `sti (fb); cli (fa); hlt (f4)` with IF=0 and pending 0x30 -> STI shadows 1 insn (`cli`),
-    // `cli` clears IF=0 before IRQ can fire, and `hlt` stays halted with 0x30 still pending!
-    rig.write_kernel_code(&[0xfb, 0xfa, 0xf4, 0xb8, 0x99, 0, 0, 0]);
-    rig.enter_cpl0(CODE_VA, 0); // IF=0
-    rig.machine.context_mut().gpr[reg::RAX] = 0;
-    rig.machine.context_mut().gpr[reg::R13] = 0;
-    rig.machine.inject_interrupt(0x30).unwrap();
-    assert!(matches!(
-        rig.machine.run(16).unwrap(),
-        SoftMachineExit::Hlt { .. }
-    ));
-    assert!(
-        rig.machine.is_interrupt_pending(0x30),
-        "STI; CLI must keep pending interrupt masked across the 1-instruction STI shadow"
-    );
-    // Stepping a halted CPU with IF=0 MUST remain halted and NEVER execute `mov eax, 0x99` past HLT!
-    assert!(matches!(
-        rig.machine.step().unwrap(),
-        Some(SoftMachineExit::Hlt { .. })
-    ));
-    assert_eq!(rig.machine.context().gpr[reg::RAX], 0);
-    // Clear pending 0x30 by enabling IF and letting it deliver:
-    rig.enter_cpl0(CODE_VA + 2, RFLAGS_IF); // `hlt` with IF=1 wakes immediately on pending 0x30!
-    rig.machine.context_mut().gpr[reg::R14] = DATA_VA + 0x20;
-    assert_eq!(rig.machine.step().unwrap(), None);
-    assert!(!rig.machine.is_interrupt_pending(0x30));
-
-    // 4b. `sti (fb); add eax, 1 (83 c0 01); add eax, 10 (83 c0 0a); hlt (f4)` with IF=0:
-    // Pending 0x50 (handler outputs 0x50 to port 0xe0) must fire AFTER `add eax, 1` (`RAX == 1`), NOT before!
-    rig.write_kernel_code(&[0xfb, 0x83, 0xc0, 0x01, 0x83, 0xc0, 0x0a, 0xf4]);
-    rig.enter_cpl0(CODE_VA, 0);
-    rig.machine.context_mut().gpr[reg::RAX] = 0;
-    rig.machine.inject_interrupt(0x50).unwrap();
-    assert_eq!(rig.run_to_vec_port(), 0x50);
-    assert_eq!(
-        rig.machine.context().gpr[reg::RAX],
-        1,
-        "STI shadow must retire exactly one instruction before delivering IRQ"
-    );
-
-    // 4c. `sti` when IF is ALREADY 1 creates NO shadow: pending 0x50 after `sti` delivers before `add eax, 1`!
-    rig.enter_cpl0(CODE_VA, RFLAGS_IF);
-    rig.machine.context_mut().gpr[reg::RAX] = 0;
-    assert_eq!(rig.machine.step().unwrap(), None); // executes `sti` (IF was already 1 -> no shadow!)
-    rig.machine.inject_interrupt(0x50).unwrap();
-    assert_eq!(rig.run_to_vec_port(), 0x50);
-    assert_eq!(rig.machine.context().gpr[reg::RAX], 0);
-
-    // 4d. `sti (fb); hlt (f4); mov eax, 0x77 (b8 77 00 00 00); cli (fa); hlt (f4)` with IF=0 and ALREADY-pending 0x30
-    // (`park_until_interrupt` pattern): `hlt` clears the STI shadow and wakes atomically without spurious halt!
-    rig.write_kernel_code(&[0xfb, 0xf4, 0xb8, 0x77, 0, 0, 0, 0xfa, 0xf4]);
-    rig.enter_cpl0(CODE_VA, 0);
-    rig.machine.context_mut().gpr[reg::RAX] = 0;
-    rig.machine.context_mut().gpr[reg::R14] = DATA_VA + 0x30;
-    rig.machine.context_mut().gpr[reg::R13] = 0;
-    rig.machine.inject_interrupt(0x30).unwrap();
-    assert!(matches!(
-        rig.machine.run(16).unwrap(),
-        SoftMachineExit::Hlt { .. }
-    ));
-    assert_eq!(rig.machine.context().gpr[reg::RAX], 0x77);
-    assert_eq!(rig.machine.context().gpr[reg::R13], 1);
-
-    // 5. Trap Gate (`0x0f`) vs Interrupt Gate (`0x0e`):
-    // Gate 0x60 = Trap Gate (`0x0f`, keeps IF=1); Gate 0x61 = Interrupt Gate (`0x0e`, clears IF=0).
-    rig.set_gate(0x60, HANDLER_BASE_VA + 0x60 * 16, 0x08, 0, 0x0f, 0, true);
-    rig.write_handler(0x60, &[0x90, 0x48, 0xcf]); // nop; iretq
-    rig.write_kernel_code(&[0x90, 0xf4]);
-    rig.enter_cpl0(CODE_VA, RFLAGS_IF);
-    rig.machine.inject_interrupt(0x60).unwrap();
-    assert_eq!(rig.machine.step().unwrap(), None); // enters trap gate 0x60 with IF still 1!
-    assert_ne!(rig.machine.context().rflags & RFLAGS_IF, 0);
-    // Injecting 0x50 while inside Trap Gate 0x60 preempts 0x60 immediately!
-    rig.machine.inject_interrupt(0x50).unwrap();
-    assert_eq!(rig.run_to_vec_port(), 0x50);
-}
-
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-#[test]
-fn cpl0_fixture_image_fault_handling_and_native_irqs_match_kvm() {
-    use std::num::NonZeroU64;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    use carrick_core::terminal::ThreadBirthIdentity;
-    use carrick_core_abi::{BirthSerial, EntryTaskKey, EntryThreadGeneration, X86_CPL0_RESERVATIONS_OFFSET, X86_CPL0_ZONE_OFFSET};
-    use carrick_el1::memory::reservations::{X86Cpl0Reservations, X86Cpl0Zone};
-    use carrick_el1_abi::{
-        BlockedMask, Counters, CurrentTask, EL1_BOOTSTRAP_METADATA_SIZE,
-        EL1_FRAME_GRANT_RESIDENCY_OFFSET, EL1_MM_PORTAL_OFFSET, EL1_REGION_SIZE,
-        EL1_SIGNAL_INGRESS_OFFSET, El1TaskId, FileRegionBinding, FileRegionId,
-        FrameGrantResidencyTable, MmPortalSlots, SharedSignalIngressQueue, SnapshotGeneration,
-        ThreadControlSlot, ThreadLifecyclePage, X86_CPL0_BOOTSTRAP_METADATA_BASE,
-        X86_CPL0_DIRECT_VA, X86_CPL0_DYNAMIC_METADATA_BASE, X86_CPL0_KERNEL_STACK_TOP_RESERVE,
-        X86_CPL0_REGION_BASE, X86_CPL0_SUPERVISOR_IMAGE_BASE, X86_CPL0_SUPERVISOR_IMAGE_GPA,
-        X86_CPL0_SUPERVISOR_IMAGE_SIZE, x86_cpl0_kernel_stack_end_gpa, x86_cpl0_kernel_stack_guards,
-    };
-    use carrick_guest_arch::{GuestLen, KernelVa};
-    use carrick_mem::pml4::{Pml4MapSpec, pml4_tables, punch_holes};
-    use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
-    use carrick_mmu_core::x86::copy_window::{COW_COPY_TABLE_PAGES, provision_cow_copy_window};
-    use carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords;
-    use carrick_sched_core::process::TaskSerial;
-    use carrick_x86::cpl0_entry::{
-        CONTROL_PORT, CpuBinding, DIRECT_VA, FATAL_PORT, NativeFrame, OBSERVE_NATIVE,
-        OBSERVE_SHARED_COW_FAULT, OBSERVE_SHARED_PREPARED_FAULT, PublishedApicIds, ShootdownTable,
-    };
-    use carrick_x86::interrupts::{
-        IRQ_HEADER_GPA, IRQ_HEADER_MAGIC, KICK_VECTOR, LAPIC_BASE, LAPIC_VA, PAGE_FAULT_VECTOR,
-        RESCHED_VECTOR, SHOOTDOWN_VECTOR, TIMER_VECTOR, interrupt_gate,
-    };
-    use goblin::elf::{Elf, program_header::PT_LOAD};
-
-    // Verify both embedded CPL0 images built cleanly from current workspace sources.
-    let prod_bytes = std::fs::read(env!("CARRICK_X86_CPL0_IMAGE")).unwrap();
-    let prod_elf = Elf::parse(&prod_bytes).unwrap();
-    assert!(prod_elf.entry >= X86_CPL0_SUPERVISOR_IMAGE_BASE);
-
-    let fixture_bytes = std::fs::read(env!("CARRICK_X86_CPL0_FIXTURE_IMAGE")).unwrap();
-    let fixture_elf = Elf::parse(&fixture_bytes).unwrap();
-
-    const META_GPA: u64 = 0xc0_0000;
-    const META_LEN: u64 = 0x10_0000;
-    const ALLOCATOR_GPA: u64 = 0x200_0000;
-    const KERNEL_REGION_GPA: u64 = 0x1_0000_0000;
-    const PLACEMENT_SIZE: u64 = KERNEL_REGION_GPA + EL1_REGION_SIZE;
-    const GDT_BASE: u64 = 0x50_0000;
-    const PML4_BASE: u64 = 0x60_0000;
-    const IST_STACK_BASE: u64 = 0xf0_0000;
-    const USER_CODE: u64 = 0x1_0000;
-    const COUNTERS_OFFSET: u64 = 0x1_0000;
-    const BINDING_OFFSET: u64 = 0x8000;
-    const TASK_OFFSET: u64 = 0x9000;
-    const CONTROL_OFFSET: u64 = 0xa000;
-    const ROUTES_OFFSET: u64 = 0xd000;
-    const SHOOTDOWN_OFFSET: u64 = 0xe000;
-
-    const LAYOUT: BringupLayout = BringupLayout {
-        trampoline_base: X86_CPL0_SUPERVISOR_IMAGE_GPA,
-        gdt_base: GDT_BASE,
-        pml4_base: PML4_BASE,
-    };
-
-    struct FixtureArena {
-        ptr: *mut u8,
-        len: usize,
-        placement: LinearPlacement,
-        extents: ExtentTable,
-    }
-
-    impl Drop for FixtureArena {
-        fn drop(&mut self) {
-            // SAFETY: `self.ptr` and `self.len` came from `libc::mmap` in `FixtureArena::new`.
-            unsafe {
-                let _ = libc::munmap(self.ptr.cast(), self.len);
-            }
-        }
-    }
-
-    impl FixtureArena {
-        fn new() -> Self {
-            let len = PLACEMENT_SIZE as usize;
-            // SAFETY: anonymous private MAP_NORESERVE reservation backs only touched pages.
-            let raw = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    len,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-                    -1,
-                    0,
-                )
-            };
-            assert_ne!(raw, libc::MAP_FAILED, "fixture mmap reservation");
-            let ptr = raw.cast::<u8>();
-            // SAFETY: `[ptr, ptr + PLACEMENT_SIZE)` is page-aligned and owned until `Drop`.
-            let placement =
-                unsafe { LinearPlacement::new(ptr as usize, PLACEMENT_SIZE, MmioHoles::empty()) }
-                    .unwrap();
-            let mut extents = ExtentTable::new().unwrap();
-            let g = OwnerGeneration::FIRST;
-            assert!(extents.install(ExtentRecord::new(FrameGpa::new(0), 0x200_0000, g)));
-            assert!(extents.install(ExtentRecord::new(
-                FrameGpa::new(ALLOCATOR_GPA),
-                EL1_BOOTSTRAP_METADATA_SIZE,
-                g
-            )));
-            assert!(extents.install(ExtentRecord::new(FrameGpa::new(LAPIC_BASE), 4096, g)));
-            assert!(extents.install(ExtentRecord::new(
-                FrameGpa::new(KERNEL_REGION_GPA),
-                EL1_REGION_SIZE,
-                g
-            )));
-            extents.set_root_generation(
-                RootGpa::page_aligned(FrameGpa::new(PML4_BASE)).unwrap(),
-                g,
-            );
-            Self {
-                ptr,
-                len,
-                placement,
-                extents,
-            }
-        }
-
-        fn host_ptr(&self, gpa: u64, size: usize) -> *mut u8 {
-            assert!((gpa as usize).checked_add(size).unwrap() <= self.len);
-            // SAFETY: bounds checked within `[0, self.len)`.
-            unsafe { self.ptr.add(gpa as usize) }
-        }
-
-        fn write_gpa(&mut self, gpa: u64, src: &[u8]) {
-            let dst = self.host_ptr(gpa, src.len());
-            // SAFETY: non-overlapping slice -> arena copy within bounds.
-            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) };
-        }
-
-        fn read_gpa(&self, gpa: u64, len: usize) -> Vec<u8> {
-            let src = self.host_ptr(gpa, len) as *const u8;
-            let mut out = vec![0u8; len];
-            // SAFETY: non-overlapping arena -> Vec copy within bounds.
-            unsafe { std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), len) };
-            out
-        }
-
-        fn read_u64(&self, gpa: u64) -> u64 {
-            u64::from_le_bytes(self.read_gpa(gpa, 8).try_into().unwrap())
-        }
-
-        fn read_u32(&self, gpa: u64) -> u32 {
-            u32::from_le_bytes(self.read_gpa(gpa, 4).try_into().unwrap())
-        }
-    }
-
-    // SAFETY: `FixtureArena` pairs `placement` with its single private `extents` domain.
-    unsafe impl SoftMmuMemory for FixtureArena {
-        fn placement(&self) -> &LinearPlacement {
-            &self.placement
-        }
-        fn extents(&self) -> &ExtentTable {
-            &self.extents
-        }
-        fn extents_mut(&mut self) -> &mut ExtentTable {
-            &mut self.extents
-        }
-    }
-
-    struct ArenaWords<'a>(&'a FixtureArena);
-    impl LiveDescriptorWords for ArenaWords<'_> {
-        fn load(&self, pa: u64) -> Result<u64, DescriptorRefusal> {
-            if (pa & 7) != 0 || pa + 8 > PLACEMENT_SIZE {
-                return Err(DescriptorRefusal::WrongBacking);
-            }
-            // SAFETY: 8-byte aligned within `FixtureArena`.
-            let atom = unsafe { &*(self.0.host_ptr(pa, 8) as *const AtomicU64) };
-            Ok(atom.load(Ordering::Acquire))
-        }
-        fn compare_exchange(
-            &self,
-            pa: u64,
-            current: u64,
-            new: u64,
-        ) -> Result<bool, DescriptorRefusal> {
-            if (pa & 7) != 0 || pa + 8 > PLACEMENT_SIZE {
-                return Err(DescriptorRefusal::WrongBacking);
-            }
-            // SAFETY: 8-byte aligned within `FixtureArena`.
-            let atom = unsafe { &*(self.0.host_ptr(pa, 8) as *const AtomicU64) };
-            Ok(atom
-                .compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok())
-        }
-        fn store_unlinked(&self, pa: u64, value: u64) -> Result<(), DescriptorRefusal> {
-            if (pa & 7) != 0 || pa + 8 > PLACEMENT_SIZE {
-                return Err(DescriptorRefusal::WrongBacking);
-            }
-            // SAFETY: 8-byte aligned within `FixtureArena`.
-            let atom = unsafe { &*(self.0.host_ptr(pa, 8) as *const AtomicU64) };
-            atom.store(value, Ordering::Release);
-            Ok(())
-        }
-        fn publish_barrier(&self) {
-            std::sync::atomic::fence(Ordering::SeqCst);
-        }
-        fn invalidate_range(&self, _va: u64, _len: u64) {}
-    }
-
-    let boot_fixture = |program: &[u8], hardware_interrupts: bool, smap: bool| -> SoftMachine<FixtureArena> {
-        let mut ram = FixtureArena::new();
-        let mut maps = Vec::new();
-        for ph in fixture_elf.program_headers.iter().filter(|ph| ph.p_type == PT_LOAD && ph.p_memsz > 0) {
-            let va_start = ph.p_vaddr;
-            let file_off = ph.p_offset as usize;
-            let filesz = ph.p_filesz as usize;
-            let gpa_off = X86_CPL0_SUPERVISOR_IMAGE_GPA + (va_start - X86_CPL0_SUPERVISOR_IMAGE_BASE);
-            if filesz > 0 {
-                ram.write_gpa(gpa_off, &fixture_bytes[file_off..file_off + filesz]);
-            }
-            let va = va_start & !0xfff;
-            let end = va_start + ph.p_memsz;
-            maps.push(Pml4MapSpec {
-                va,
-                gpa: X86_CPL0_SUPERVISOR_IMAGE_GPA + (va - X86_CPL0_SUPERVISOR_IMAGE_BASE),
-                len: ((end + 0xfff) & !0xfff) - va,
-                user: false,
-                write: (ph.p_flags & 0x2) != 0,
-                exec: (ph.p_flags & 0x1) != 0,
-            });
-        }
-
-        let stub_start = carrick_x86::fault_stub_base(LAYOUT);
-        let stub_end = fault_tss_base(LAYOUT);
-        for (start, end, write, exec) in [
-            (
-                X86_CPL0_SUPERVISOR_IMAGE_GPA + X86_CPL0_SUPERVISOR_IMAGE_SIZE,
-                stub_start,
-                true,
-                false,
-            ),
-            (stub_start, stub_end, false, true),
-            (stub_end, META_GPA, true, false),
-        ] {
-            maps.push(Pml4MapSpec {
-                va: DIRECT_VA + start,
-                gpa: start,
-                len: end - start,
-                user: false,
-                write,
-                exec,
-            });
-        }
-        maps.push(Pml4MapSpec {
-            va: DIRECT_VA + META_GPA,
-            gpa: META_GPA,
-            len: if hardware_interrupts { 0x140_0000 } else { 0x40_0000 },
-            user: false,
-            write: true,
-            exec: false,
-        });
-        maps.push(Pml4MapSpec {
-            va: X86_CPL0_DYNAMIC_METADATA_BASE,
-            gpa: META_GPA,
-            len: META_LEN,
-            user: false,
-            write: true,
-            exec: false,
-        });
-        maps.push(Pml4MapSpec {
-            va: X86_CPL0_BOOTSTRAP_METADATA_BASE,
-            gpa: ALLOCATOR_GPA,
-            len: EL1_BOOTSTRAP_METADATA_SIZE,
-            user: false,
-            write: true,
-            exec: false,
-        });
-        maps.push(Pml4MapSpec {
-            va: X86_CPL0_REGION_BASE,
-            gpa: KERNEL_REGION_GPA,
-            len: EL1_REGION_SIZE,
-            user: false,
-            write: true,
-            exec: false,
-        });
-        ram.write_gpa(USER_CODE, program);
-        maps.push(Pml4MapSpec {
-            va: USER_CODE,
-            gpa: USER_CODE,
-            len: 4096,
-            user: true,
-            write: false,
-            exec: true,
-        });
-        maps.push(Pml4MapSpec {
-            va: 0x3_0000,
-            gpa: 0x3_0000,
-            len: 8192,
-            user: true,
-            write: true,
-            exec: false,
-        });
-        if hardware_interrupts {
-            maps.push(Pml4MapSpec {
-                va: carrick_x86::cpl0_lifecycle::LIFECYCLE_ZONE,
-                gpa: 0x100_0000,
-                len: 0x100_0000,
-                user: false,
-                write: true,
-                exec: false,
-            });
-            maps.push(Pml4MapSpec {
-                va: LAPIC_VA,
-                gpa: LAPIC_BASE,
-                len: 4096,
-                user: false,
-                write: true,
-                exec: false,
-            });
-        }
-
-        let table_capacity =
-            (carrick_x86::X86_PML4_CAPACITY as usize) - COW_COPY_TABLE_PAGES * 4096;
-        let guards: Vec<(u64, u64)> = x86_cpl0_kernel_stack_guards().collect();
-        let tables =
-            pml4_tables(&punch_holes(&maps, &guards), PML4_BASE, table_capacity).unwrap();
-        ram.write_gpa(PML4_BASE, &tables);
-
-        let boot = X8664GuestArch::bootstrap_sysregs();
-        let gdt: Vec<u8> = boot.gdt.iter().flat_map(|w| w.to_le_bytes()).collect();
-        ram.write_gpa(GDT_BASE, &gdt);
-        write_fault_tables_with(LAYOUT, |gpa, bytes| {
-            ram.write_gpa(gpa, bytes);
-            Ok(())
-        })
-        .unwrap();
-
-        let tss = fault_slot_gpa(fault_tss_base(LAYOUT), 0).unwrap();
-        let fault_stack = fault_slot_gpa(fault_stack_base(LAYOUT), 0).unwrap();
-        ram.write_gpa(tss + 4, &(DIRECT_VA + fault_stack + 4096).to_le_bytes());
-        ram.write_gpa(tss + 36, &(DIRECT_VA + IST_STACK_BASE + 4096).to_le_bytes());
-        let idt = fault_slot_gpa(fault_idt_base(LAYOUT), 0).unwrap();
-        ram.write_gpa(idt + 8 * 16 + 4, &[1]); // #DF uses IST1
-        for vector in 0..256_u64 {
-            let gate_gpa = idt + vector * 16;
-            let gate = ram.read_gpa(gate_gpa, 16);
-            if gate[5] & 0x80 == 0 {
-                continue;
-            }
-            let low = u16::from_le_bytes([gate[0], gate[1]]) as u64;
-            let mid = u16::from_le_bytes([gate[6], gate[7]]) as u64;
-            let high = u32::from_le_bytes([gate[8], gate[9], gate[10], gate[11]]) as u64;
-            let entry = DIRECT_VA + low + (mid << 16) + (high << 32);
-            ram.write_gpa(gate_gpa, &(entry as u16).to_le_bytes());
-            ram.write_gpa(gate_gpa + 6, &((entry >> 16) as u16).to_le_bytes());
-            ram.write_gpa(gate_gpa + 8, &((entry >> 32) as u32).to_le_bytes());
-        }
-
-        if hardware_interrupts {
-            let header = ram.read_gpa(IRQ_HEADER_GPA, 48);
-            let mut words = [0_u64; 6];
-            for (word, bytes) in words.iter_mut().zip(header.chunks_exact(8)) {
-                *word = u64::from_le_bytes(bytes.try_into().unwrap());
-            }
-            assert_eq!(words[0], IRQ_HEADER_MAGIC);
-            for (vector, entry) in [
-                TIMER_VECTOR,
-                KICK_VECTOR,
-                RESCHED_VECTOR,
-                SHOOTDOWN_VECTOR,
-                PAGE_FAULT_VECTOR,
-            ]
-            .into_iter()
-            .zip(words[1..].iter().copied())
-            {
-                ram.write_gpa(idt + u64::from(vector) * 16, &interrupt_gate(entry));
-            }
-        }
-
-        let file_binding = FileRegionBinding::new(
-            FileRegionId::from_carrier(NonZeroU64::MIN),
-            KernelVa::new(X86_CPL0_REGION_BASE),
-            FrameGpa::new(KERNEL_REGION_GPA),
-            GuestLen::new(EL1_REGION_SIZE),
+    // 6. Physical-retirement witness (`softmmu.x86.physical-retirement`):
+    // Warm SoftTlb on `rsp0_frame`, retire `rsp0_frame` and install `rsp0_frame_b` while parked,
+    // then trigger CPL3 #UD -> IDT stack push must retire debt and write only to `rsp0_frame_b`.
+    {
+        let (cpu, mem) = rig.machine.into_parts();
+        let mut cpu = cpu;
+        let mut mem = mem;
+        cpu.context_mut().set_cpl(0);
+        let _ = translate_va(
+            cpu.context_mut(),
+            &mut mem,
+            RSP0_VA + 0xfc8,
+            SoftAccessKind::Write,
         )
         .unwrap();
+        mem.write_gpa(rig.rsp0_frame.raw() + 0xfc8, &[0xaa; 40]);
 
-        // SAFETY: exclusive zeroed `FixtureArena` before SoftMachine runs.
-        unsafe {
-            let page = ram
-                .host_ptr(META_GPA, size_of::<ThreadLifecyclePage>())
-                .cast::<ThreadLifecyclePage>();
-            page.write(ThreadLifecyclePage::new());
-            ram.host_ptr(META_GPA + COUNTERS_OFFSET, size_of::<Counters>())
-                .cast::<Counters>()
-                .write(Counters::new());
-            ram.host_ptr(META_GPA + ROUTES_OFFSET, size_of::<PublishedApicIds>())
-                .cast::<PublishedApicIds>()
-                .write(PublishedApicIds::new());
-            let shootdown = ram
-                .host_ptr(META_GPA + SHOOTDOWN_OFFSET, size_of::<ShootdownTable>())
-                .cast::<ShootdownTable>();
-            shootdown.write(ShootdownTable::new());
-
-            let slot = ram
-                .host_ptr(META_GPA + CONTROL_OFFSET, size_of::<ThreadControlSlot>())
-                .cast::<ThreadControlSlot>();
-            slot.write(ThreadControlSlot::new());
-            (*slot).reset_for_host_birth(BlockedMask(0)).unwrap();
-            assert!((*slot).publish_visible_tid(41));
-            let birth = ThreadBirthIdentity::from_parts(
-                EntryTaskKey::from_raw(41),
-                BirthSerial::of_task(TaskSerial::from_raw_u64(11).unwrap()),
-                EntryThreadGeneration::from_raw(101),
-            )
+        let rsp0_frame_b = mem.alloc_frame();
+        mem.map_frame(RSP0_VA, rsp0_frame_b, Perms::KERNEL_RW);
+        let removed = mem
+            .extents_mut()
+            .remove(rig.rsp0_frame, None)
+            .unwrap()
             .unwrap();
-            (*slot).publish_host_birth_identity(birth);
+        let completion = removed.pending.try_complete().unwrap();
+        mem.extents_mut().reclaim(&completion);
 
-            let task = ram
-                .host_ptr(META_GPA + TASK_OFFSET, size_of::<CurrentTask>())
-                .cast::<CurrentTask>();
-            task.write(CurrentTask::new());
-            (*task).set(El1TaskId::from_linux_tid(41), SnapshotGeneration::from_raw(11), 5);
-            (*task).mm.thread_generation.store(101, Ordering::Release);
-            (*task).mm.key.store(201, Ordering::Release);
-            (*shootdown).members[0].publish(PML4_BASE, 201, 1);
-            (*task).publish_lifecycle(
-                X86_CPL0_DYNAMIC_METADATA_BASE,
-                X86_CPL0_DYNAMIC_METADATA_BASE + CONTROL_OFFSET,
-            );
-
-            ram.host_ptr(META_GPA + BINDING_OFFSET, size_of::<CpuBinding>())
-                .cast::<CpuBinding>()
-                .write(CpuBinding {
-                    kernel_stack: DIRECT_VA + x86_cpl0_kernel_stack_end_gpa(0)
-                        - X86_CPL0_KERNEL_STACK_TOP_RESERVE,
-                    user_stack: 0,
-                    self_address: X86_CPL0_DYNAMIC_METADATA_BASE + BINDING_OFFSET,
-                    task_address: X86_CPL0_DYNAMIC_METADATA_BASE + TASK_OFFSET,
-                    counters_address: X86_CPL0_DYNAMIC_METADATA_BASE + COUNTERS_OFFSET,
-                    entry_kick: AtomicU32::new(0),
-                    return_kick: AtomicU32::new(0),
-                    entries: AtomicU64::new(0),
-                    publications: AtomicU64::new(0),
-                    completions: AtomicU64::new(0),
-                    captured_stack: AtomicU64::new(0),
-                    scheduler_witness: AtomicU64::new(0),
-                    cpu_slot: 0,
-                    tsc_hz: AtomicU64::new(0),
-                    wake_routes_address: X86_CPL0_DYNAMIC_METADATA_BASE + ROUTES_OFFSET,
-                    apic_timer_hz: AtomicU64::new(0),
-                    pending_irqs: AtomicU32::new(0),
-                    shootdown_table_address: X86_CPL0_DYNAMIC_METADATA_BASE + SHOOTDOWN_OFFSET,
-                    fault_active: AtomicU64::new(0),
-                    fault_frame: AtomicU64::new(0),
-                    fault_address: AtomicU64::new(0),
-                    fault_reason: AtomicU64::new(0),
-                    mm_owner_generation: AtomicU64::new(1),
-                    last_seen_generation: AtomicU64::new(0),
-                    stdio_table_admitted: AtomicU64::new(0),
-                    file_region: file_binding,
-                });
-
-            // `X86Cpl0Reservations` and `X86Cpl0Zone` are zero-valid ABI records in `FixtureArena`.
-            let _ = ram
-                .host_ptr(
-                    META_GPA + X86_CPL0_RESERVATIONS_OFFSET,
-                    size_of::<X86Cpl0Reservations>(),
-                )
-                .cast::<X86Cpl0Reservations>();
-            let _ = ram
-                .host_ptr(META_GPA + X86_CPL0_ZONE_OFFSET, size_of::<X86Cpl0Zone>())
-                .cast::<X86Cpl0Zone>();
-
-            if hardware_interrupts {
-                let lifecycle_zone = &*(ram
-                    .host_ptr(0x100_0000, size_of::<carrick_sched_core::ZoneTables>())
-                    .cast::<carrick_sched_core::ZoneTables>());
-                let space = lifecycle_zone
-                    .spaces
-                    .publish_closed(201, PML4_BASE, 0)
-                    .unwrap();
-                lifecycle_zone.spaces.open(space);
-                let slot0 = carrick_sched_core::SlotId::new(0);
-                lifecycle_zone.drive(slot0, 1);
-                lifecycle_zone.publish_slot_with_affinity(
-                    slot0,
-                    201,
-                    Some(0),
-                    carrick_sched_core::AffinitySource::UNBOUND,
-                );
-                lifecycle_zone.enter_guest(slot0);
-                lifecycle_zone.install_space(slot0, 201).unwrap();
-            }
-
-            FrameGrantResidencyTable::init_in_place(
-                ram.host_ptr(
-                    KERNEL_REGION_GPA + EL1_FRAME_GRANT_RESIDENCY_OFFSET,
-                    size_of::<FrameGrantResidencyTable>(),
-                )
-                .cast::<FrameGrantResidencyTable>(),
-            );
-            SharedSignalIngressQueue::initialize_at(
-                ram.host_ptr(
-                    KERNEL_REGION_GPA + EL1_SIGNAL_INGRESS_OFFSET,
-                    size_of::<SharedSignalIngressQueue>(),
-                )
-                .cast::<SharedSignalIngressQueue>(),
-            );
-            ram.host_ptr(
-                KERNEL_REGION_GPA + EL1_MM_PORTAL_OFFSET,
-                size_of::<MmPortalSlots>(),
-            )
-            .cast::<MmPortalSlots>()
-            .write(MmPortalSlots::new());
-        }
-
-        let root = RootGpa::page_aligned(FrameGpa::new(PML4_BASE)).unwrap();
-        let mut grants = [root; COW_COPY_TABLE_PAGES];
-        for (i, g) in grants.iter_mut().enumerate() {
-            let pa = PML4_BASE + (table_capacity as u64) + (i as u64) * 4096;
-            *g = RootGpa::page_aligned(FrameGpa::new(pa)).unwrap();
-        }
-        provision_cow_copy_window(&ArenaWords(&ram), root, grants).unwrap();
-
-        let mut machine = SoftMachine::new(ram, Box::new(Cpl0CpuidView::default())).unwrap();
-        {
-            let ctx = machine.context_mut();
-            let caps = MsrCapabilities::default();
-            ctx.cr0 = boot.cr0;
-            ctx.cr3 = PML4_BASE;
-            ctx.cr4 = boot.cr4 | (1 << 18) | (1 << 20) | if smap { CR4_SMAP } else { 0 };
-            ctx.write_msr(MSR_IA32_EFER, boot.efer, caps).unwrap();
-            ctx.write_msr(MSR_IA32_STAR, boot.star, caps).unwrap();
-            ctx.write_msr(MSR_IA32_LSTAR, fixture_elf.entry, caps).unwrap();
-            ctx.write_msr(
-                MSR_IA32_FMASK,
-                boot.sfmask | (1 << 10) | (1 << 8) | (1 << 18),
-                caps,
-            )
-            .unwrap();
-            ctx.write_msr(
-                MSR_IA32_KERNEL_GS_BASE,
-                X86_CPL0_DYNAMIC_METADATA_BASE + BINDING_OFFSET,
-                caps,
-            )
-            .unwrap();
-            ctx.gdtr = DescriptorTablePtr::new(
-                (boot.gdt.len() * 8 - 1) as u16,
-                X86_CPL0_DIRECT_VA + GDT_BASE,
-            );
-            ctx.idtr = DescriptorTablePtr::new(0xfff, X86_CPL0_DIRECT_VA + idt);
-            ctx.tr = SoftSegment::tss64_busy(0x30, X86_CPL0_DIRECT_VA + tss, 0x67);
-            ctx.set_cpl(3);
-            ctx.cs = SoftSegment::user_code64(0x2b);
-            ctx.ss = SoftSegment::user_data(0x23);
-            ctx.rip = USER_CODE;
-            ctx.gpr[reg::RSP] = 0x3_1ff0;
-            ctx.rflags = boot.rflags | if hardware_interrupts { RFLAGS_IF } else { 0 };
-            ctx.sync_tlb_tag_bits();
-        }
-        machine
-    };
-
-    let observe = |machine: &mut SoftMachine<FixtureArena>| -> i64 {
-        match machine.run(200_000).unwrap() {
-            SoftMachineExit::IoOut { port, .. } if port == CONTROL_PORT => {
-                let frame_va = machine.context().gpr[reg::RAX];
-                let frame_gpa = frame_va - DIRECT_VA;
-                let raw = machine.mem().read_gpa(frame_gpa, size_of::<NativeFrame>());
-                // SAFETY: `NativeFrame` is `#[repr(C)] Copy` and `raw` has exact size.
-                let frame: NativeFrame =
-                    unsafe { std::ptr::read_unaligned(raw.as_ptr().cast::<NativeFrame>()) };
-                frame.rdi as i64
-            }
-            SoftMachineExit::IoOut { port, value, .. } if port == FATAL_PORT => {
-                panic!("CPL0 fixture hit FATAL_PORT with value {value:#x}")
-            }
-            other => panic!("expected CONTROL_PORT observation, got {other:?}"),
-        }
-    };
-
-    let read_fault_doorbell = |machine: &mut SoftMachine<FixtureArena>| -> FaultDoorbellRecord {
-        let mut words = [0u32; X86_FAULT_RECORD_U32_WORDS];
-        for word in &mut words {
-            match machine.run(100_000).unwrap() {
-                SoftMachineExit::IoOut {
-                    port: FAULT_DOORBELL_PORT,
-                    size: 4,
-                    value,
-                    ..
-                } => *word = value,
-                other => panic!("expected FAULT_DOORBELL_PORT outl, got {other:?}"),
-            }
-        }
-        FaultDoorbellRecord::from_u32_words(&words).unwrap()
-    };
-
-    let read_user_leaf = |machine: &SoftMachine<FixtureArena>, va: u64| -> u64 {
-        let mut tbl = PML4_BASE;
-        for shift in [39, 30, 21] {
-            tbl = machine.mem().read_u64(tbl + (((va >> shift) & 0x1ff) * 8)) & PTE_ADDR_MASK;
-        }
-        machine.mem().read_u64(tbl + (((va >> 12) & 0x1ff) * 8))
-    };
-
-    // --- Sub-case A: KVM `user_access_program(0)` across all 35 rounds with SMAP=false AND SMAP=true ---
-    // Modes 6 & 7 bypass preflight and trigger live CPL0 STAC #PF -> `carrick_x86_page_fault_fixup`!
-    let mapped = 0x3_1000_u64;
-    let unmapped_edge = mapped + 0xff8;
-    let calls: &[(u64, u64, i64)] = &[
-        (mapped, 2, 0),
-        (mapped, 0, 0x51ab_cdef_1234_5678),
-        (mapped, 1, 0x51ab_cdef_1234_5678),
-        (mapped, 8, 0x51ab_cdef_1234_5678),
-        (mapped, 9, 0),
-        (mapped, 0, 0x6ace_b00c_1234_5678),
-        (mapped, 10, 0),
-        (mapped, 14, 0),
-        (mapped, 12, 0),
-        (mapped, 13, 0),
-        (mapped, 3, 0x1234_5678),
-        (mapped, 4, 16),
-        (mapped, 5, 16),
-        (USER_CODE, 4, 16),
-        (USER_CODE, 5, 0),
-        (0xffff_ffff_8000_0000, 4, 0),
-        (0xffff_ffff_8000_0000, 0, -14),
-        (0xffff_ffff_8000_0000, 1, -14),
-        (0xffff_ffff_8000_0000, 2, -14),
-        (0x0000_7fff_ffff_fffc, 0, -14),
-        (0x0000_7fff_ffff_fffc, 4, 0),
-        (u64::MAX - 3, 1, -14),
-        (u64::MAX - 3, 8, -14),
-        (unmapped_edge, 4, 8),
-        (unmapped_edge, 5, 8),
-        (unmapped_edge + 4, 1, -14),
-        (unmapped_edge + 4, 2, -14),
-        (0x7_0000, 0, -14),
-        (0x7_0000, 11, 0),
-        (0x7_0000, 1, -14),
-        (0x7_0000, 2, -14),
-        (0x7_0000, 6, -14),
-        (0x7_0000, 7, -14),
-        (0x7_0000, 4, 0),
-        (0x7_0000, 5, 0),
-    ];
-    let mut uaccess_prog = Vec::new();
-    for &(address, mode, _) in calls {
-        uaccess_prog.extend_from_slice(&[0x48, 0xbf]);
-        uaccess_prog.extend_from_slice(&address.to_le_bytes());
-        uaccess_prog.extend_from_slice(&[0x48, 0xbe]);
-        uaccess_prog.extend_from_slice(&mode.to_le_bytes());
-        uaccess_prog.extend_from_slice(&[0x48, 0xb8]);
-        uaccess_prog.extend_from_slice(&0xffff_ffff_ffff_ff10_u64.to_le_bytes());
-        uaccess_prog.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
-        uaccess_prog.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
-        uaccess_prog.extend_from_slice(&[0x0f, 0x05]);
-    }
-    uaccess_prog.extend_from_slice(&[0x0f, 0x0b]);
-
-    for smap in [false, true] {
-        let mut machine = boot_fixture(&uaccess_prog, false, smap);
-        for (round, &(_, mode, expected)) in calls.iter().enumerate() {
-            assert_eq!(
-                observe(&mut machine),
-                expected,
-                "user_access_program smap={smap} round={round} mode={mode}"
-            );
-        }
-    }
-
-    // --- Sub-case B: In-guest prepared page fault & COW fault (`OBSERVE_SHARED_PREPARED_FAULT` & `OBSERVE_SHARED_COW_FAULT`) ---
-    for (syscall_no, fault_va, expected_gpa, check_cow_cleared) in [
-        (OBSERVE_SHARED_PREPARED_FAULT, 0x3_3000_u64, 0x9_1000_u64, false),
-        (OBSERVE_SHARED_COW_FAULT, 0x3_4000_u64, 0xd1_5000_u64, true),
-    ] {
-        let mut prog = vec![0x48, 0xb8];
-        prog.extend_from_slice(&syscall_no.to_le_bytes());
-        prog.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
-        prog.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
-        prog.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
-        let mut machine = boot_fixture(&prog, true, true);
-        assert_eq!(observe(&mut machine), 1);
-        let leaf = read_user_leaf(&machine, fault_va);
-        assert_ne!(leaf & 1, 0);
-        assert_ne!(leaf & 4, 0);
-        if check_cow_cleared {
-            assert_ne!(leaf & 2, 0);
-            assert_eq!(leaf & (1 << 10), 0);
-        } else {
-            assert_eq!(leaf & (1 << 9), 0);
-        }
-        assert_eq!(leaf & PTE_ADDR_MASK, expected_gpa);
-    }
-
-    // --- Sub-case C: Live CPL3 hardware faults (#PF via `carrick_x86_user_page_fault`, #DE, #DB, #UD, #GP, #AC, and CPL0 #DF) ---
-    // C1: Unresolved CPL3 #PF at 0x7_0000 routed through `carrick_x86_user_page_fault` (from IRQ_HEADER_GPA) ->
-    // records `fault_address = 0x7_0000`, `fault_reason != 0`, and emits `FaultDoorbellRecord`!
-    {
-        let mut machine = boot_fixture(&[0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x07, 0x00], true, true);
-        let rec = read_fault_doorbell(&mut machine);
-        assert_eq!(rec.vector, 14);
-        assert_eq!(rec.cr2, 0x7_0000);
-        assert_eq!(rec.error_code, u64::from(PF_ERR_USER));
-        assert_eq!(rec.cs, 0x2b);
-        assert_eq!(rec.rsp, 0x3_1ff0);
-        let binding_gpa = META_GPA + BINDING_OFFSET;
-        // `fault_address` and `fault_reason` were published by `carrick_x86_unresolved_user_page_fault`:
-        // SAFETY: stopped machine, aligned `CpuBinding` in `FixtureArena`.
-        let binding = unsafe { &*(machine.mem().host_ptr(binding_gpa, size_of::<CpuBinding>()) as *const CpuBinding) };
-        assert_eq!(binding.fault_address.load(Ordering::Acquire), 0x7_0000);
-        assert_ne!(binding.fault_reason.load(Ordering::Acquire), 0);
-    }
-
-    // C2: CPL3 #DE (0), #DB (1), #UD (6), #GP (13), #AC (17) through `write_fault_tables_with` stubs!
-    for (expected_vec, extra_rflags, set_am, prog) in [
-        (0u8, 0u64, false, &[0x31, 0xd2, 0x31, 0xc9, 0xf7, 0xf1][..]), // #DE: div ecx
-        (1, RFLAGS_TF, false, &[0x90][..]),                            // #DB: single-step nop
-        (6, 0, false, &[0x0f, 0x0b][..]),                              // #UD: ud2
-        (13, 0, false, &[0xfa][..]),                                   // #GP: cli at CPL3
-        (17, RFLAGS_AC, true, &[0x48, 0x8b, 0x04, 0x25, 0x03, 0x00, 0x03, 0x00][..]), // #AC: unaligned [0x3_0003]
-    ] {
-        let mut machine = boot_fixture(prog, true, true);
-        machine.context_mut().rflags |= extra_rflags;
-        if set_am {
-            machine.context_mut().cr0 |= CR0_AM;
-        }
-        let rec = read_fault_doorbell(&mut machine);
-        assert_eq!(rec.vector, expected_vec, "CPL3 fault doorbell vector");
-        assert_eq!(rec.cs, 0x2b);
-        assert_eq!(rec.rsp, 0x3_1ff0);
-    }
-
-    // C3: CPL0 #DF (8) switches onto TSS.IST1 (`DIRECT_VA + IST_STACK_BASE + 4096`)!
-    {
-        let mut machine = boot_fixture(&[0x31, 0xd2, 0x31, 0xc9, 0xf7, 0xf1], false, true);
-        let idt_gpa = fault_slot_gpa(fault_idt_base(LAYOUT), 0).unwrap();
-        // Clear P bit on gate 0 (#DE) -> Contributory (#DE) + Contributory (#NP) -> #DF (8) on IST1!
-        let mut gate0 = machine.mem().read_gpa(idt_gpa, 16);
-        gate0[5] &= !0x80;
-        machine.mem_mut().write_gpa(idt_gpa, &gate0);
-        let rec = read_fault_doorbell(&mut machine);
-        assert_eq!(rec.vector, 8);
-        assert_eq!(rec.error_code, 0);
+        rig.machine = SoftMachine::from_parts(cpu, mem);
+        rig.write_user_code(&[0x0f, 0x0b]);
+        rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+        assert_eq!(rig.run_to_vec_port(), 6);
         assert_eq!(
-            machine.context().gpr[reg::RSP],
-            DIRECT_VA + IST_STACK_BASE + 4096 - 48
+            rig.machine.mem().read_gpa(rig.rsp0_frame.raw() + 0xfc8, 40),
+            vec![0xaa; 40]
+        );
+        assert_eq!(rig.read_frame40(rsp0_frame_b, 0xfc8).rip, USER_CODE_VA);
+    }
+}
+
+#[test]
+fn idt_error_code_presence_and_pf_cr2_bits_match_sdm() {
+    // 1. Static SDM Table 6-1 classification check across all named vectors in Item 3:
+    for v in [
+        X86ExceptionVector::DoubleFault,
+        X86ExceptionVector::InvalidTss,
+        X86ExceptionVector::SegmentNotPresent,
+        X86ExceptionVector::StackSegmentFault,
+        X86ExceptionVector::GeneralProtection,
+        X86ExceptionVector::PageFault,
+        X86ExceptionVector::AlignmentCheck,
+    ] {
+        assert!(v.has_error_code(), "{v:?} must push an error code");
+    }
+    for v in [
+        X86ExceptionVector::DivideError,
+        X86ExceptionVector::Debug,
+        X86ExceptionVector::Breakpoint,
+        X86ExceptionVector::Overflow,
+        X86ExceptionVector::InvalidOpcode,
+        X86ExceptionVector::DeviceNotAvailable,
+    ] {
+        assert!(!v.has_error_code(), "{v:?} must not push an error code");
+    }
+    assert_eq!(X86Exception::overflow(CODE_VA).error_code, None);
+
+    let mut rig = IdtTestRig::new();
+
+    // 2. #NM (vector 7, no error code, 40-byte frame) via CR0.TS = 1 + FXSAVE64 / MOVAPS + CLTS recovery:
+    // Handler 7: `clts; mov byte ptr [rip+...], 1; iretq` -> use port 0xe0 first to inspect 40-byte frame!
+    rig.machine.context_mut().cr0 |= CR0_TS;
+    // CPL3 `movaps xmm0, xmm1` (`0f 28 c1`) with CR0.TS=1 -> #NM (vector 7), 40-byte frame!
+    rig.write_user_code(&[0x0f, 0x28, 0xc1]);
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    assert_eq!(rig.run_to_vec_port(), 7);
+    assert_eq!(rig.machine.context().gpr[reg::RSP], RSP0_VA + 0xfc8); // 40-byte frame (no error code)
+    assert_eq!(rig.read_frame40(rig.rsp0_frame, 0xfc8).rip, USER_CODE_VA);
+
+    // Install lazy-FPU #NM handler (`clts; iretq` = `0f 06 48 cf`) and verify `fxsave64` + `movaps` complete!
+    rig.write_handler(7, &[0x0f, 0x06, 0x48, 0xcf]);
+    rig.machine.context_mut().cr0 |= CR0_TS;
+    rig.machine
+        .context_mut()
+        .write_xmm(1, 0xdead_beef_cafe_babe_u128);
+    // CPL0: `fxsave64 [rax]; movaps xmm0, xmm1; hlt`
+    rig.write_kernel_code(&[0x48, 0x0f, 0xae, 0x00, 0x0f, 0x28, 0xc1, 0xf4]);
+    rig.enter_cpl0(CODE_VA, RFLAGS_IF);
+    rig.machine.context_mut().gpr[reg::RAX] = DATA_VA;
+    assert_eq!(
+        rig.machine.run(16).unwrap(),
+        SoftMachineExit::Hlt {
+            rip: CODE_VA + 7,
+            next_rip: CODE_VA + 8,
+        }
+    );
+    assert_eq!(rig.machine.context().cr0 & CR0_TS, 0);
+    assert_eq!(
+        rig.machine.context().read_xmm(0),
+        0xdead_beef_cafe_babe_u128
+    );
+    // Restore default stub for vector 7.
+    rig.write_handler(7, &[0xb0, 7, 0xe6, 0xe0, 0xf4]);
+
+    // 3. #BP (vector 3, INT3) and #OF (vector 4, INT 4; 0xCE INTO is #UD in 64-bit mode) -> 40-byte frame (no error code):
+    rig.set_gate(3, IdtTestRig::stub_va(3), 0x08, 0, 0x0e, 3, true);
+    rig.set_gate(4, IdtTestRig::stub_va(4), 0x08, 0, 0x0e, 3, true);
+    rig.write_user_code(&[0xcc]);
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    assert_eq!(rig.run_to_vec_port(), 3);
+    assert_eq!(rig.machine.context().gpr[reg::RSP], RSP0_VA + 0xfc8);
+
+    rig.write_user_code(&[0xcd, 0x04]); // int 4
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    assert_eq!(rig.run_to_vec_port(), 4);
+    assert_eq!(rig.machine.context().gpr[reg::RSP], RSP0_VA + 0xfc8);
+
+    rig.write_user_code(&[0xce]); // legacy INTO -> #UD (vector 6, 40-byte frame) in 64-bit mode
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    assert_eq!(rig.run_to_vec_port(), 6);
+    assert_eq!(rig.machine.context().gpr[reg::RSP], RSP0_VA + 0xfc8);
+
+    // 4. #SS (vector 12, 48-byte frame with selector error code) via IRETQ loading not-present SS:
+    // GDT entry at 0x20: mark not-present (clear bit 47).
+    let np_user_ss = 0x00cf_7300_0000_ffffu64;
+    rig.machine
+        .mem_mut()
+        .write_gpa(rig.gdt_frame.raw() + 0x20, &np_user_ss.to_le_bytes());
+    let iret_frame_off = 0xe00u64;
+    for (i, w) in [
+        USER_CODE_VA,
+        0x2b,
+        RFLAGS_IF | 0x2,
+        USER_STACK_VA + 0xff0,
+        0x23,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        rig.machine.mem_mut().write_gpa(
+            rig.stack_frame.raw() + iret_frame_off + (i as u64) * 8,
+            &w.to_le_bytes(),
         );
     }
+    rig.write_kernel_code(&[0x48, 0xcf]); // iretq
+    rig.enter_cpl0_rsp(CODE_VA, STACK_VA + iret_frame_off, RFLAGS_IF);
+    assert_eq!(rig.run_to_vec_port(), 12);
+    let ss_f = rig.read_frame48(rig.stack_frame, iret_frame_off - 48);
+    assert_eq!(ss_f.error_code, 0x20);
+    assert_eq!(ss_f.rip, CODE_VA);
+    // Restore GDT 0x20.
+    rig.machine.mem_mut().write_gpa(
+        rig.gdt_frame.raw() + 0x20,
+        &0x00cf_f300_0000_ffffu64.to_le_bytes(),
+    );
 
-    // --- Sub-case D: All 4 native CPL0 external IRQ vectors (`0xe0..=0xe3`) delivered from CPL3 ---
-    {
-        // CPL3 loop: `inc r15 (49 ff c7); jmp -3 (eb fb)`
-        let mut machine = boot_fixture(&[0x49, 0xff, 0xc7, 0xeb, 0xfb], true, true);
-        let binding_gpa = META_GPA + BINDING_OFFSET;
-        for (vec, expected_bit) in [
-            (TIMER_VECTOR, 1u32),
-            (KICK_VECTOR, 2u32),
-            (RESCHED_VECTOR, 4u32),
-            (SHOOTDOWN_VECTOR, 8u32),
-        ] {
-            // Set LAPIC ISR bit for `vec` (`LAPIC_BASE + 0x100 + (vec / 32) * 0x10`) and non-zero EOI sentinel:
-            let isr_off = LAPIC_BASE + 0x100 + u64::from(vec / 32) * 0x10;
-            let isr_bit = 1u32 << (vec % 32);
-            machine.mem_mut().write_gpa(isr_off, &isr_bit.to_le_bytes());
-            machine
-                .mem_mut()
-                .write_gpa(LAPIC_BASE + 0xb0, &0xffff_ffff_u32.to_le_bytes());
+    // 5. #PF CR2 and all five error-code bits: P (0x1), W/R (0x2), U/S (0x4), RSVD (0x8), I/D (0x10):
+    let pf_va = 0x0000_0000_0090_0000u64;
 
-            machine.inject_interrupt(vec).unwrap();
-            // Step until the CPL0 IRQ handler executes XSAVE64 -> capture_irq -> EOI -> XRSTOR64 -> IRETQ back to CPL3!
-            let mut returned_to_cpl3 = false;
-            for _ in 0..512 {
-                assert_eq!(machine.step().unwrap(), None);
-                if machine.context().cpl == 3 {
-                    returned_to_cpl3 = true;
-                    break;
-                }
-            }
-            assert!(returned_to_cpl3, "IRQ {vec:#x} must return to CPL3 via IRETQ");
-            assert_eq!(
-                machine.mem().read_u32(LAPIC_BASE + 0xb0),
-                0,
-                "CPL0 IRQ handler must write 0 to LAPIC EOI"
-            );
-            machine.mem_mut().write_gpa(isr_off, &0u32.to_le_bytes());
+    // 5a. Not-present supervisor read -> ec == 0, CR2 == pf_va + 0x34.
+    rig.write_kernel_code(&[0x48, 0x8b, 0x00]); // mov rax, [rax]
+    rig.enter_cpl0(CODE_VA, RFLAGS_IF);
+    rig.machine.context_mut().gpr[reg::RAX] = pf_va + 0x34;
+    assert_eq!(rig.run_to_vec_port(), 14);
+    assert_eq!(rig.machine.context().cr2, pf_va + 0x34);
+    assert_eq!(rig.read_frame48(rig.stack_frame, 0xfc0).error_code, 0);
 
-            // SAFETY: stopped machine, aligned `CpuBinding` in `FixtureArena`.
-            let binding = unsafe {
-                &*(machine.mem().host_ptr(binding_gpa, size_of::<CpuBinding>()) as *const CpuBinding)
-            };
-            assert_ne!(
-                binding.pending_irqs.load(Ordering::Acquire) & expected_bit,
-                0,
-                "CPL0 IRQ {vec:#x} must record bit {expected_bit:#x} in CpuBinding.pending_irqs"
-            );
+    // 5b. Not-present user write -> ec == W/R | U/S (0x6), CR2 == pf_va + 0x78.
+    rig.write_user_code(&[0x48, 0x89, 0x08]); // mov [rax], rcx
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    rig.machine.context_mut().gpr[reg::RAX] = pf_va + 0x78;
+    assert_eq!(rig.run_to_vec_port(), 14);
+    assert_eq!(rig.machine.context().cr2, pf_va + 0x78);
+    assert_eq!(
+        rig.read_frame48(rig.rsp0_frame, 0xfc0).error_code,
+        u64::from(PF_ERR_WRITE | PF_ERR_USER)
+    );
+
+    // 5c. Present read-only user write -> ec == P | W/R | U/S (0x7).
+    let pf_frame = rig.machine.mem_mut().map_page(pf_va, Perms::USER_RO);
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    rig.machine.context_mut().gpr[reg::RAX] = pf_va + 0x10;
+    assert_eq!(rig.run_to_vec_port(), 14);
+    assert_eq!(rig.machine.context().cr2, pf_va + 0x10);
+    assert_eq!(
+        rig.read_frame48(rig.rsp0_frame, 0xfc0).error_code,
+        u64::from(PF_ERR_PRESENT | PF_ERR_WRITE | PF_ERR_USER)
+    );
+
+    // 5d. Reserved PTE bit set (bit 51 with max_phy_addr=48) -> ec == P | U/S | RSVD (0xd).
+    rig.machine.mem_mut().write_raw_pte(
+        pf_va,
+        (pf_frame.raw() & PTE_ADDR_MASK) | PTE_PRESENT | PTE_USER | PTE_RSVD_BIT51,
+    );
+    rig.machine.context_mut().flush_tlb();
+    rig.write_user_code(&[0x48, 0x8b, 0x00]); // mov rax, [rax]
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    rig.machine.context_mut().gpr[reg::RAX] = pf_va + 0x20;
+    assert_eq!(rig.run_to_vec_port(), 14);
+    assert_eq!(rig.machine.context().cr2, pf_va + 0x20);
+    assert_eq!(
+        rig.read_frame48(rig.rsp0_frame, 0xfc0).error_code,
+        u64::from(PF_ERR_PRESENT | PF_ERR_USER | PF_ERR_RSVD)
+    );
+
+    // 5e. NX instruction fetch at CPL3 -> ec == P | U/S | I/D (0x15), CR2 == pf_va.
+    rig.machine
+        .mem_mut()
+        .map_frame(pf_va, pf_frame, Perms::USER_RW); // NX = 1
+    rig.machine.context_mut().flush_tlb();
+    rig.enter_cpl3(pf_va, RFLAGS_IF);
+    assert_eq!(rig.run_to_vec_port(), 14);
+    assert_eq!(rig.machine.context().cr2, pf_va);
+    let nx_f = rig.read_frame48(rig.rsp0_frame, 0xfc0);
+    assert_eq!(
+        nx_f.error_code,
+        u64::from(PF_ERR_PRESENT | PF_ERR_USER | PF_ERR_INSTR)
+    );
+    assert_eq!(nx_f.rip, pf_va);
+}
+
+#[test]
+fn idt_vector_de_delivers_frame_rsp0_ist_and_iretq_resume() {
+    let mut rig = IdtTestRig::new();
+
+    // 1. CPL3 `DIV ECX` by zero -> RSP0 (aligned from +0xff8 to +0xff0), 40-byte frame, no error code.
+    rig.write_user_code(&[0x31, 0xd2, 0x31, 0xc9, 0xb8, 1, 0, 0, 0, 0xf7, 0xf1]);
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    assert_eq!(rig.run_to_vec_port(), 0);
+    assert_eq!(rig.machine.context().gpr[reg::RSP], RSP0_VA + 0xfc8);
+    assert_eq!(
+        rig.read_frame40(rig.rsp0_frame, 0xfc8),
+        Frame40 {
+            rip: USER_CODE_VA + 9,
+            cs: 0x2b,
+            rflags: RFLAGS_IF | (1 << 6) | (1 << 2) | 0x2,
+            rsp: USER_STACK_VA + 0xff0,
+            ss: 0x23,
         }
-        // Verify CPL3 loop continues advancing `r15` cleanly after all 4 IRQs!
-        let before = machine.context().gpr[reg::R15];
-        assert_eq!(machine.step().unwrap(), None);
-        assert!(machine.context().gpr[reg::R15] > before);
+    );
+
+    // 2. CPL0 `IDIV` overflow (`i64::MIN / -1`) with IST=1 -> IST1 stack, handler sets RCX=1 and IRETQs!
+    // Handler 0: `mov ecx, 1; iretq` (`b9 01 00 00 00 48 cf`) -> re-executes `idiv rcx` cleanly (`i64::MIN / 1`)!
+    rig.write_handler(0, &[0xb9, 1, 0, 0, 0, 0x48, 0xcf]);
+    rig.set_gate(0, IdtTestRig::stub_va(0), 0x08, 1, 0x0e, 0, true);
+    // `cqo; idiv rcx; hlt` = `48 99 48 f7 f9 f4`
+    rig.write_kernel_code(&[0x48, 0x99, 0x48, 0xf7, 0xf9, 0xf4]);
+    rig.enter_cpl0(CODE_VA, RFLAGS_IF);
+    rig.machine.context_mut().gpr[reg::RAX] = i64::MIN as u64;
+    rig.machine.context_mut().gpr[reg::RCX] = (-1i64) as u64;
+    // Step 1: `cqo; idiv rcx` faults on `idiv rcx` (at CODE_VA + 2) -> enters IST1 handler.
+    assert_eq!(rig.machine.step().unwrap(), None);
+    assert_eq!(rig.machine.context().rip, IdtTestRig::stub_va(0));
+    assert_eq!(rig.machine.context().gpr[reg::RSP], IST1_VA + 0xfc8);
+    assert_eq!(rig.read_frame40(rig.ist1_frame, 0xfc8).rip, CODE_VA + 2);
+    // Resume through handler IRETQ -> `idiv rcx` succeeds -> HLT!
+    assert_eq!(
+        rig.machine.run(16).unwrap(),
+        SoftMachineExit::Hlt {
+            rip: CODE_VA + 5,
+            next_rip: CODE_VA + 6,
+        }
+    );
+    assert_eq!(rig.machine.context().gpr[reg::RAX], i64::MIN as u64);
+    assert_eq!(rig.machine.context().gpr[reg::RDX], 0);
+}
+
+#[test]
+fn idt_vector_db_delivers_tf_dr0_rf_and_icebp_through_idt() {
+    let mut rig = IdtTestRig::new();
+
+    // 1. TF=1 single-step at CPL3: retires `inc ebx` (`ff c3`) then delivers #DB (vector 1, 40-byte frame on RSP0)
+    // with DR6.BS=1, DR7.GD=0, live TF=0, and stacked TF=1.
+    rig.machine.context_mut().dr[7] = 0x0000_2400; // GD=1
+    rig.write_user_code(&[0xff, 0xc3, 0x90]);
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF | RFLAGS_TF);
+    rig.machine.context_mut().gpr[reg::RBX] = 41;
+    assert_eq!(rig.run_to_vec_port(), 1);
+    {
+        let ctx = rig.machine.context();
+        assert_eq!(ctx.gpr[reg::RBX], 42);
+        assert_eq!(ctx.gpr[reg::RSP], RSP0_VA + 0xfc8);
+        assert_eq!(ctx.dr[6] & (1 << 14), 1 << 14);
+        assert_eq!(ctx.dr[7] & (1 << 13), 0);
+        assert_eq!(ctx.rflags & RFLAGS_TF, 0);
     }
+    let tf_frame = rig.read_frame40(rig.rsp0_frame, 0xfc8);
+    assert_eq!(tf_frame.rip, USER_CODE_VA + 2);
+    assert_eq!(tf_frame.rflags & RFLAGS_TF, RFLAGS_TF);
+
+    // 2. SDM Vol. 3A §18.3.1.4: POPFQ clearing TF (1 -> 0) is itself single-stepped (since TF was 1 at
+    // instruction start), pushing TF=0 in stacked RFLAGS, and subsequent instructions do NOT trap!
+    // Handler 1: `inc r12; iretq` (`49 ff c4 48 cf`) on IST=1.
+    rig.write_handler(1, &[0x49, 0xff, 0xc4, 0x48, 0xcf]);
+    rig.set_gate(1, IdtTestRig::stub_va(1), 0x08, 1, 0x0e, 0, true);
+    // Kernel stack holds 0x202 (TF=0, IF=1); code: `popfq; nop; hlt` (`9d 90 f4`).
+    rig.machine
+        .mem_mut()
+        .write_gpa(rig.stack_frame.raw() + 0xff0, &0x202u64.to_le_bytes());
+    rig.write_kernel_code(&[0x9d, 0x90, 0xf4]);
+    rig.enter_cpl0_rsp(CODE_VA, STACK_VA + 0xff0, RFLAGS_IF | RFLAGS_TF);
+    rig.machine.context_mut().gpr[reg::R12] = 0;
+    assert_eq!(
+        rig.machine.run(16).unwrap(),
+        SoftMachineExit::Hlt {
+            rip: CODE_VA + 2,
+            next_rip: CODE_VA + 3,
+        }
+    );
+    // Fired once after POPFQ (`CODE_VA + 1`), and zero times on `nop`!
+    assert_eq!(rig.machine.context().gpr[reg::R12], 1);
+    assert_eq!(rig.read_frame40(rig.ist1_frame, 0xfc8).rip, CODE_VA + 1);
+    assert_eq!(
+        rig.read_frame40(rig.ist1_frame, 0xfc8).rflags & RFLAGS_TF,
+        0
+    );
+
+    // 3. DR0 hardware execution breakpoint (pre-fetch fault) + RFLAGS.RF suppression on IRETQ:
+    // Handler 1 sets `RF=1` (`1 << 16`) in stacked RFLAGS (`[rsp + 16]`), increments R12, and IRETQs:
+    // `49 ff c4` (`inc r12`), `48 81 4c 24 10 00 00 01 00` (`or qword ptr [rsp+16], 0x10000`), `48 cf` (`iretq`) = 14 bytes!
+    rig.write_handler(
+        1,
+        &[
+            0x49, 0xff, 0xc4, 0x48, 0x81, 0x4c, 0x24, 0x10, 0x00, 0x00, 0x01, 0x00, 0x48, 0xcf,
+        ],
+    );
+    // Code: `inc eax; hlt` (`ff c0 f4`) with DR0 = CODE_VA, DR7 = G0 (0x2).
+    rig.write_kernel_code(&[0xff, 0xc0, 0xf4]);
+    rig.enter_cpl0(CODE_VA, RFLAGS_IF);
+    rig.machine.context_mut().gpr[reg::RAX] = 10;
+    rig.machine.context_mut().gpr[reg::R12] = 0;
+    rig.machine.context_mut().dr[0] = CODE_VA;
+    rig.machine.context_mut().dr[6] = 0xffff_0ff0;
+    rig.machine.context_mut().dr[7] = 0x0000_0402;
+    assert_eq!(
+        rig.machine.run(16).unwrap(),
+        SoftMachineExit::Hlt {
+            rip: CODE_VA + 2,
+            next_rip: CODE_VA + 3,
+        }
+    );
+    // DR0 fired once before `inc eax` (DR6.B0=1), handler set RF=1 & IRETQ'd, `inc eax` ran once and cleared RF!
+    assert_eq!(rig.machine.context().gpr[reg::R12], 1);
+    assert_eq!(rig.machine.context().gpr[reg::RAX], 11);
+    assert_eq!(rig.machine.context().dr[6] & 0xf, 0x1);
+    assert_eq!(rig.machine.context().rflags & RFLAGS_RF, 0);
+    rig.machine.context_mut().dr[7] = 0x0000_0400;
+
+    // 4. ICEBP / INT1 (`0xF1`) at CPL3: bypasses gate DPL=0, sets DR6.BS=1, saves RIP = va + 1,
+    // and sets EXT=0 if gate is not present!
+    rig.write_handler(1, &[0xb0, 1, 0xe6, 0xe0, 0xf4]);
+    rig.set_gate(1, IdtTestRig::stub_va(1), 0x08, 0, 0x0e, 0, true);
+    rig.write_user_code(&[0xf1]);
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    assert_eq!(rig.run_to_vec_port(), 1);
+    assert_eq!(
+        rig.read_frame40(rig.rsp0_frame, 0xfc8).rip,
+        USER_CODE_VA + 1
+    );
+    assert_eq!(rig.machine.context().dr[6] & (1 << 14), 1 << 14);
+
+    // With gate 1 P=0, ICEBP raises #NP with EXT=0 (`(1 << 3) | 0x2`, NOT `| 0x1`) and RIP = USER_CODE_VA!
+    rig.set_gate(1, IdtTestRig::stub_va(1), 0x08, 0, 0x0e, 0, false);
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    assert_eq!(rig.run_to_vec_port(), 11);
+    let icebp_np = rig.read_frame48(rig.rsp0_frame, 0xfc0);
+    assert_eq!(icebp_np.error_code, (1u64 << 3) | 0x2);
+    assert_eq!(icebp_np.rip, USER_CODE_VA);
+}
+
+#[test]
+fn idt_vector_ud_delivers_frame_rsp0_ist_and_iretq_resume() {
+    let mut rig = IdtTestRig::new();
+
+    // 1. CPL3 `UD2` (`0f 0b`) -> RSP0 40-byte frame (no error code), RIP = USER_CODE_VA.
+    rig.write_user_code(&[0x0f, 0x0b]);
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    assert_eq!(rig.run_to_vec_port(), 6);
+    assert_eq!(rig.machine.context().gpr[reg::RSP], RSP0_VA + 0xfc8);
+    assert_eq!(
+        rig.read_frame40(rig.rsp0_frame, 0xfc8),
+        Frame40 {
+            rip: USER_CODE_VA,
+            cs: 0x2b,
+            rflags: RFLAGS_IF | 0x2,
+            rsp: USER_STACK_VA + 0xff0,
+            ss: 0x23,
+        }
+    );
+
+    // 2. CPL0 `LOCK NOP` (`f0 90`) on IST=2 -> handler advances stacked RIP by 2 (`add qword ptr [rsp], 2; iretq`) and resumes!
+    rig.write_handler(6, &[0x48, 0x83, 0x04, 0x24, 0x02, 0x48, 0xcf]);
+    rig.set_gate(6, IdtTestRig::stub_va(6), 0x08, 2, 0x0e, 0, true);
+    rig.write_kernel_code(&[0xf0, 0x90, 0xb8, 0x77, 0, 0, 0, 0xf4]); // lock nop; mov eax, 0x77; hlt
+    rig.enter_cpl0(CODE_VA, RFLAGS_IF);
+    assert_eq!(rig.machine.step().unwrap(), None);
+    assert_eq!(rig.machine.context().gpr[reg::RSP], IST2_VA + 0xfc8);
+    assert_eq!(rig.read_frame40(rig.ist2_frame, 0xfc8).rip, CODE_VA);
+    assert_eq!(
+        rig.machine.run(16).unwrap(),
+        SoftMachineExit::Hlt {
+            rip: CODE_VA + 7,
+            next_rip: CODE_VA + 8,
+        }
+    );
+    assert_eq!(rig.machine.context().gpr[reg::RAX], 0x77);
+}
+
+#[test]
+fn idt_vector_gp_delivers_zero_and_selector_error_codes_rsp0_and_ist() {
+    let mut rig = IdtTestRig::new();
+
+    // 1. CPL3 privileged instruction (`cli`, `fa`) -> RSP0 48-byte frame with error_code == 0.
+    rig.write_user_code(&[0xfa]);
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    assert_eq!(rig.run_to_vec_port(), 13);
+    assert_eq!(rig.machine.context().gpr[reg::RSP], RSP0_VA + 0xfc0);
+    assert_eq!(
+        rig.read_frame48(rig.rsp0_frame, 0xfc0),
+        Frame48 {
+            error_code: 0,
+            rip: USER_CODE_VA,
+            cs: 0x2b,
+            rflags: RFLAGS_IF | 0x2,
+            rsp: USER_STACK_VA + 0xff0,
+            ss: 0x23,
+        }
+    );
+
+    // 2. CPL3 unaligned 128-bit `movaps xmm0, [rax]` (`0f 28 00`) -> #GP(0) on RSP0.
+    rig.write_user_code(&[0x0f, 0x28, 0x00]);
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    rig.machine.context_mut().gpr[reg::RAX] = USER_DATA_VA + 8;
+    assert_eq!(rig.run_to_vec_port(), 13);
+    assert_eq!(rig.read_frame48(rig.rsp0_frame, 0xfc0).error_code, 0);
+
+    // 3. CPL0 `ltr ax` (`0f 00 d8`) with code-segment selector 0x08 on IST=1 -> #GP(0x08) 48-byte frame on IST1!
+    rig.set_gate(13, IdtTestRig::stub_va(13), 0x08, 1, 0x0e, 0, true);
+    rig.write_kernel_code(&[0x0f, 0x00, 0xd8]);
+    rig.enter_cpl0(CODE_VA, RFLAGS_IF);
+    rig.machine.context_mut().gpr[reg::RAX] = 0x08;
+    assert_eq!(rig.run_to_vec_port(), 13);
+    assert_eq!(rig.machine.context().gpr[reg::RSP], IST1_VA + 0xfc0);
+    let ltr_gp = rig.read_frame48(rig.ist1_frame, 0xfc0);
+    assert_eq!(ltr_gp.error_code, 0x08);
+    assert_eq!(ltr_gp.rip, CODE_VA);
+}
+
+#[test]
+fn idt_vector_pf_delivers_cr2_all_five_error_bits_rsp0_ist_and_pte_fixup() {
+    let mut rig = IdtTestRig::new();
+    let fault_page = 0x0000_0000_00a0_0000u64;
+    let backing = rig.machine.mem_mut().map_page(fault_page, Perms::USER_RO);
+    rig.machine.mem_mut().write_gpa(
+        backing.raw() + 0x28,
+        &0x1122_3344_5566_7788u64.to_le_bytes(),
+    );
+
+    // 1. CPL3 write to read-only user page -> #PF on RSP0 (48-byte frame), then IST=1 check:
+    rig.write_user_code(&[0x48, 0xc7, 0x00, 0xaa, 0xbb, 0x00, 0x00]); // mov qword ptr [rax], 0xbbaa
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    rig.machine.context_mut().gpr[reg::RAX] = fault_page + 0x28;
+    assert_eq!(rig.run_to_vec_port(), 14);
+    assert_eq!(rig.machine.context().cr2, fault_page + 0x28);
+    assert_eq!(rig.machine.context().gpr[reg::RSP], RSP0_VA + 0xfc0);
+    assert_eq!(
+        rig.read_frame48(rig.rsp0_frame, 0xfc0),
+        Frame48 {
+            error_code: u64::from(PF_ERR_PRESENT | PF_ERR_WRITE | PF_ERR_USER),
+            rip: USER_CODE_VA,
+            cs: 0x2b,
+            rflags: RFLAGS_IF | 0x2,
+            rsp: USER_STACK_VA + 0xff0,
+            ss: 0x23,
+        }
+    );
+
+    // 2. Real in-guest CPL0 #PF recovery on IST=1:
+    // Map `pte_alias_va` in kernel space pointing at the PT page holding `fault_page`'s leaf PTE!
+    let pte_slot_gpa = rig.machine.mem_mut().leaf_slot_gpa(fault_page);
+    let pt_frame = FrameGpa::new(pte_slot_gpa & PTE_ADDR_MASK);
+    let pte_alias_va = 0xffff_8000_0050_0000u64;
+    rig.machine
+        .mem_mut()
+        .map_frame(pte_alias_va, pt_frame, Perms::KERNEL_RW);
+    let pte_va = pte_alias_va + (pte_slot_gpa & SOFT_TLB_OFFSET_MASK);
+
+    // Write #PF handler at CODE_VA + 0x200:
+    // `or qword ptr [r13 + 0], 2` -> `49 83 4d 00 02` (sets PTE_WRITABLE)
+    // `mov r14, cr2`              -> `49 0f 20 d6`
+    // `invlpg [r14]`              -> `41 0f 01 3e`
+    // `add rsp, 8`                -> `48 83 c4 08` (pop #PF error code!)
+    // `iretq`                     -> `48 cf`
+    let fixup_handler = [
+        0x49, 0x83, 0x4d, 0x00, 0x02, 0x49, 0x0f, 0x20, 0xd6, 0x41, 0x0f, 0x01, 0x3e, 0x48, 0x83,
+        0xc4, 0x08, 0x48, 0xcf,
+    ];
+    let handler_va = CODE_VA + 0x200;
+    let code_gpa = rig.translate_kernel_page_gpa(CODE_VA);
+    rig.machine
+        .mem_mut()
+        .write_gpa(code_gpa + 0x200, &fixup_handler);
+    rig.set_gate(14, handler_va, 0x08, 1, 0x0e, 0, true);
+
+    // User code: `mov qword ptr [rax], 0x5a5a; int 0x80` (with 0x80 DPL=3 halting stub).
+    rig.set_gate(0x80, IdtTestRig::stub_va(0x80), 0x08, 0, 0x0e, 3, true);
+    rig.write_user_code(&[0x48, 0xc7, 0x00, 0x5a, 0x5a, 0x00, 0x00, 0xcd, 0x80]);
+    // Warm read TLB first so `invlpg` must evict the stale RO entry!
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    {
+        let (mut cpu, mut mem) = rig.machine.into_parts();
+        let _ = translate_va(
+            cpu.context_mut(),
+            &mut mem,
+            fault_page + 0x28,
+            SoftAccessKind::Read,
+        )
+        .unwrap();
+        rig.machine = SoftMachine::from_parts(cpu, mem);
+    }
+    rig.machine.context_mut().reset_tlb_stats();
+    rig.machine.context_mut().gpr[reg::RAX] = fault_page + 0x28;
+    rig.machine.context_mut().gpr[reg::R13] = pte_va;
+
+    assert_eq!(rig.run_to_vec_port(), 0x80);
+    // Structural budget witness: zero full flushes, exactly 1 targeted `invlpg` eviction!
+    let stats = rig.machine.context().tlb_stats();
+    assert_eq!(stats.full_flushes, 0);
+    assert_eq!(stats.va_evictions, 1);
+    assert_eq!(rig.machine.mem().read_u64(backing.raw() + 0x28), 0x5a5a);
+    assert_eq!(rig.machine.context().gpr[reg::R14], fault_page + 0x28);
+}
+
+#[test]
+fn idt_vector_ac_delivers_zero_error_code_clears_ac_and_exempts_movups() {
+    let mut rig = IdtTestRig::new();
+    rig.machine.context_mut().cr0 |= CR0_AM;
+    rig.machine.context_mut().set_smap_enabled(true);
+
+    // 1. Legacy 128-bit unaligned `movups xmm0, [rax]` (`0f 10 00`) at CPL3 with CR0.AM=1, RFLAGS.AC=1
+    // does NOT raise #AC; subsequent unaligned 8-byte `mov rcx, [rax]` (`48 8b 08`) DOES raise #AC(0)!
+    rig.write_user_code(&[0x0f, 0x10, 0x00, 0x48, 0x8b, 0x08]);
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF | RFLAGS_AC);
+    rig.machine.context_mut().gpr[reg::RAX] = USER_DATA_VA + 3;
+    assert_eq!(rig.run_to_vec_port(), 17);
+    {
+        let ctx = rig.machine.context();
+        // Gate entry clears live RFLAGS.AC (preventing leaked SMAP bypass in CPL0)!
+        assert_eq!(ctx.rflags & RFLAGS_AC, 0);
+        assert!(!ctx.ac());
+        assert_eq!(ctx.gpr[reg::RSP], RSP0_VA + 0xfc0);
+    }
+    let ac_rsp0 = rig.read_frame48(rig.rsp0_frame, 0xfc0);
+    assert_eq!(ac_rsp0.error_code, 0);
+    assert_eq!(ac_rsp0.rip, USER_CODE_VA + 3); // faulted on `mov rcx, [rax]`, NOT `movups`!
+    assert_eq!(ac_rsp0.rflags & RFLAGS_AC, RFLAGS_AC); // stacked RFLAGS preserves user AC=1
+
+    // 2. #AC with IST=2 selects IST2 stack and pushes 48-byte frame with error_code == 0.
+    rig.set_gate(17, IdtTestRig::stub_va(17), 0x08, 2, 0x0e, 0, true);
+    rig.enter_cpl3(USER_CODE_VA + 3, RFLAGS_IF | RFLAGS_AC);
+    rig.machine.context_mut().gpr[reg::RAX] = USER_DATA_VA + 1;
+    assert_eq!(rig.run_to_vec_port(), 17);
+    assert_eq!(rig.machine.context().gpr[reg::RSP], IST2_VA + 0xfc0);
+    assert_eq!(rig.read_frame48(rig.ist2_frame, 0xfc0).error_code, 0);
+}
+
+#[test]
+fn idt_pf_then_pf_escalates_to_double_fault_and_table_6_5_classes() {
+    let mut rig = IdtTestRig::new();
+    // Put #DF (vector 8) on IST=1 so it always has a valid dedicated stack!
+    rig.set_gate(8, IdtTestRig::stub_va(8), 0x08, 1, 0x0e, 0, true);
+
+    let fault_va1 = 0x0000_0000_00b0_0000u64;
+
+    // 1a. #PF-then-#PF -> #DF(0) via unmapped #PF handler stack (`RSP0` unmapped when CPL3 #PF occurs):
+    rig.machine.mem_mut().unmap_page(RSP0_VA);
+    rig.machine.context_mut().flush_tlb();
+    rig.write_user_code(&[0x48, 0x8b, 0x00]); // mov rax, [rax]
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    rig.machine.context_mut().gpr[reg::RAX] = fault_va1 + 0x44;
+    assert_eq!(rig.run_to_vec_port(), 8);
+    {
+        let ctx = rig.machine.context();
+        assert_eq!(ctx.gpr[reg::RSP], IST1_VA + 0xfc0); // 48-byte #DF frame on IST1
+        // Secondary #PF occurred while pushing the 48-byte #PF frame onto RSP0_VA + 0xfc0 -> CR2 updated!
+        assert_eq!(ctx.cr2, RSP0_VA + 0xfc0);
+    }
+    assert_eq!(
+        rig.read_frame48(rig.ist1_frame, 0xfc0),
+        Frame48 {
+            error_code: 0, // #DF always pushes error code 0
+            rip: USER_CODE_VA,
+            cs: 0x2b,
+            rflags: RFLAGS_IF | 0x2,
+            rsp: USER_STACK_VA + 0xff0,
+            ss: 0x23,
+        }
+    );
+    // Restore RSP0 mapping.
+    rig.machine
+        .mem_mut()
+        .map_frame(RSP0_VA, rig.rsp0_frame, Perms::KERNEL_RW);
+    rig.machine.context_mut().flush_tlb();
+
+    // 1b. #PF-then-#PF -> #DF(0) via second page of IDT unmapped for vector 14:
+    // Place IDTR.base at `IDT_SPLIT_VA - 14 * 16` where `IDT_SPLIT_VA - 0x1000` is mapped (holds vector 8 #DF!)
+    // and `IDT_SPLIT_VA` is unmapped (holds vector 14 #PF!).
+    let idt_low_va = 0xffff_8000_0045_0000u64;
+    let idt_high_va = idt_low_va + SOFT_TLB_PAGE_SIZE;
+    let idt_low_frame = rig.machine.mem_mut().map_page(idt_low_va, Perms::KERNEL_RW);
+    rig.machine.mem_mut().unmap_page(idt_high_va);
+    let split_idtr_base = idt_high_va - 14 * 16;
+    let df_gate = encode_idt_gate(IdtTestRig::stub_va(8), 0x08, 1, 0x0e, 0, true);
+    rig.machine.mem_mut().write_gpa(
+        idt_low_frame.raw() + (split_idtr_base + 8 * 16 - idt_low_va),
+        &df_gate,
+    );
+    rig.machine.context_mut().idtr = DescriptorTablePtr::new(0xfff, split_idtr_base);
+    rig.machine.context_mut().flush_tlb();
+
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    rig.machine.context_mut().gpr[reg::RAX] = fault_va1;
+    assert_eq!(rig.run_to_vec_port(), 8);
+    assert_eq!(rig.machine.context().cr2, idt_high_va);
+    assert_eq!(rig.read_frame48(rig.ist1_frame, 0xfc0).error_code, 0);
+
+    // Restore standard IDT.
+    rig.machine.context_mut().idtr = DescriptorTablePtr::new(0xfff, IDT_VA);
+    rig.machine.context_mut().flush_tlb();
+
+    // 2. #PF + Contributory (#NP on vector 14 gate) -> #DF(0), preserving first #PF's CR2!
+    rig.set_gate(14, IdtTestRig::stub_va(14), 0x08, 0, 0x0e, 0, false);
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    rig.machine.context_mut().gpr[reg::RAX] = fault_va1 + 0x99;
+    assert_eq!(rig.run_to_vec_port(), 8);
+    assert_eq!(rig.machine.context().cr2, fault_va1 + 0x99);
+    assert_eq!(rig.read_frame48(rig.ist1_frame, 0xfc0).error_code, 0);
+    rig.set_gate(14, IdtTestRig::stub_va(14), 0x08, 0, 0x0e, 0, true);
+
+    // 3. Contributory (#DE) + Contributory (#NP on vector 0 gate) -> #DF(0).
+    rig.set_gate(0, IdtTestRig::stub_va(0), 0x08, 0, 0x0e, 0, false);
+    rig.write_user_code(&[0x31, 0xd2, 0x31, 0xc9, 0xf7, 0xf1]);
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    assert_eq!(rig.run_to_vec_port(), 8);
+    assert_eq!(rig.read_frame48(rig.ist1_frame, 0xfc0).error_code, 0);
+    rig.set_gate(0, IdtTestRig::stub_va(0), 0x08, 0, 0x0e, 0, true);
+
+    // 4. Contributory (#DE on unmapped IST2) + #PF -> Table 6-5 delivers #PF serially (NOT #DF)!
+    rig.machine.mem_mut().unmap_page(IST2_VA);
+    rig.machine.context_mut().flush_tlb();
+    rig.set_gate(0, IdtTestRig::stub_va(0), 0x08, 2, 0x0e, 0, true);
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    assert_eq!(rig.run_to_vec_port(), 14);
+    assert_eq!(rig.machine.context().cr2, IST2_VA + 0xfc8);
+    rig.machine
+        .mem_mut()
+        .map_frame(IST2_VA, rig.ist2_frame, Perms::KERNEL_RW);
+    rig.set_gate(0, IdtTestRig::stub_va(0), 0x08, 0, 0x0e, 0, true);
+
+    // 5. Benign (#UD) + Contributory (#NP on vector 6 gate) -> delivers #NP serially (NOT #DF)!
+    rig.set_gate(6, IdtTestRig::stub_va(6), 0x08, 0, 0x0e, 0, false);
+    rig.write_user_code(&[0x0f, 0x0b]);
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    assert_eq!(rig.run_to_vec_port(), 11);
+    rig.set_gate(6, IdtTestRig::stub_va(6), 0x08, 0, 0x0e, 0, true);
+
+    // 6. #DF + any secondary fault (#NP on vector 8 gate) -> SoftMachineExit::TripleFault!
+    rig.set_gate(14, IdtTestRig::stub_va(14), 0x08, 0, 0x0e, 0, false); // #PF -> #NP -> #DF
+    rig.set_gate(8, IdtTestRig::stub_va(8), 0x08, 1, 0x0e, 0, false); // #DF -> #NP -> TripleFault
+    rig.write_user_code(&[0x48, 0x8b, 0x00]);
+    rig.enter_cpl3(USER_CODE_VA, RFLAGS_IF);
+    rig.machine.context_mut().gpr[reg::RAX] = fault_va1;
+    assert_eq!(
+        rig.machine.run(16).unwrap(),
+        SoftMachineExit::TripleFault {
+            last_exception: X86Exception::segment_not_present(USER_CODE_VA, (8 << 3) | 0x2 | 0x1),
+        }
+    );
 }

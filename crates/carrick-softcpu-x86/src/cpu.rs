@@ -397,6 +397,7 @@ impl SoftCpu {
         mem: &mut M,
     ) -> Result<SoftCpuExit, EmitError> {
         self.ctx.pending_exception = None;
+        self.ctx.icebp_trap = false;
         self.ctx.halted = false;
         crate::context::prepare_gateway(self.ctx.rip)?;
         if !mem.extents().is_member(&self.ctx.seat) {
@@ -409,17 +410,48 @@ impl SoftCpu {
         self.ctx.sync_tlb_tag_bits();
 
         let (rip, max_i, max_s) = (self.ctx.rip, self.max_block_insns, self.max_block_span);
+        // SDM Vol. 3A §17.3.1.1 / §18.2.4: instruction-execution breakpoints (DR0..DR3 with
+        // R/W_i == 0b00 and LEN_i == 0b00) fire as pre-fetch faults when RFLAGS.RF == 0.
+        if (self.ctx.rflags & (1 << 16)) == 0 && (self.ctx.dr[7] & 0xff) != 0 {
+            let dr7 = self.ctx.dr[7];
+            let mut matched = 0u64;
+            for i in 0..4 {
+                let enabled = (dr7 & (0x3 << (i * 2))) != 0;
+                let rw = (dr7 >> (16 + i * 4)) & 0x3;
+                let len = (dr7 >> (18 + i * 4)) & 0x3;
+                if enabled && rw == 0 && len == 0 && self.ctx.dr[i] == rip {
+                    matched |= 1 << i;
+                }
+            }
+            if matched != 0 {
+                self.ctx.dr[6] = (self.ctx.dr[6] & !0xf) | matched | 0xffff_0ff0;
+                self.ctx.dr[7] &= !(1 << 13);
+                return self.raise(X86Exception::debug(rip));
+            }
+        }
+
         match plan_block_from_memory(rip, max_i, max_s, &mut self.ctx, mem) {
             Ok(b) => {
                 let single_step = self.ctx.rflags & (1 << 8) != 0;
+                let block_exit = &b.exit;
+                let is_iret = matches!(
+                    block_exit,
+                    BlockExit::Sensitive {
+                        op: SensitiveOp::Iretq,
+                        ..
+                    }
+                );
                 let result = self.execute_planned_block(&b, mem)?;
+                if !is_iret && !matches!(result, SoftCpuExit::Exception(_)) {
+                    // SDM Vol. 3A §2.3 / §17.3.1.1: RF is cleared after any non-IRET instruction
+                    // completes without faulting; IRET loads RF from stacked RFLAGS so RF=1 can
+                    // suppress an instruction breakpoint on the returned-to instruction.
+                    self.ctx.rflags &= !(1 << 16);
+                }
                 if single_step && matches!(result, SoftCpuExit::Continue { .. }) {
-                    return self.raise(X86Exception::new(
-                        X86ExceptionVector::Debug,
-                        self.ctx.rip,
-                        None,
-                        None,
-                    ));
+                    self.ctx.dr[6] = (self.ctx.dr[6] & !0xf) | (1 << 14) | 0xffff_0ff0;
+                    self.ctx.dr[7] &= !(1 << 13);
+                    return self.raise(X86Exception::debug(self.ctx.rip));
                 }
                 Ok(result)
             }
@@ -438,6 +470,20 @@ impl SoftCpu {
         planned: &PlannedBlock,
         mem: &mut M,
     ) -> Result<SoftCpuExit, EmitError> {
+        if (self.ctx.cr0 & 0xc) != 0
+            && let Some(first) = planned.insns.first()
+            && (0..first.raw.op_count()).any(|i| {
+                first.raw.op_kind(i) == iced_x86::OpKind::Register
+                    && first.raw.op_register(i).is_xmm()
+            })
+        {
+            if (self.ctx.cr0 & (1 << 2)) != 0 {
+                return self.raise(X86Exception::invalid_opcode(first.va));
+            }
+            if (self.ctx.cr0 & (1 << 3)) != 0 {
+                return self.raise(X86Exception::device_not_available(first.va));
+            }
+        }
         // Secure all host executable resources before any guest instruction runs.
         crate::context::prepare_gateway(planned.start)?;
         self.ctx.prepare_block(planned)?;
@@ -539,21 +585,17 @@ impl SoftCpu {
                 }
 
                 match op {
-                    SensitiveOp::Icebp => self.raise(X86Exception::new(
-                        X86ExceptionVector::Debug,
-                        resume,
-                        None,
-                        None,
-                    )),
+                    SensitiveOp::Icebp => {
+                        self.ctx.icebp_trap = true;
+                        self.ctx.dr[6] = (self.ctx.dr[6] & !0xf) | (1 << 14) | 0xffff_0ff0;
+                        self.ctx.dr[7] &= !(1 << 13);
+                        self.ctx.rflags &= !(1 << 16);
+                        self.raise(X86Exception::debug(resume))
+                    }
                     SensitiveOp::Interrupt { vector } => {
                         self.ctx.rip = resume;
                         if raw.mnemonic() == iced_x86::Mnemonic::Int3 {
-                            return self.raise(X86Exception::new(
-                                X86ExceptionVector::Breakpoint,
-                                resume,
-                                None,
-                                None,
-                            ));
+                            return self.raise(X86Exception::breakpoint(resume));
                         }
                         Ok(SoftCpuExit::SoftwareInterrupt {
                             vector,
@@ -562,6 +604,12 @@ impl SoftCpu {
                         })
                     }
                     SensitiveOp::Ldmxcsr | SensitiveOp::Stmxcsr => {
+                        if (self.ctx.cr0 & (1 << 2)) != 0 {
+                            return self.raise(X86Exception::invalid_opcode(va));
+                        }
+                        if (self.ctx.cr0 & (1 << 3)) != 0 {
+                            return self.raise(X86Exception::device_not_available(va));
+                        }
                         let ea = compute_effective_va(raw, &self.ctx);
                         if !is_canonical_va(ea) || !is_canonical_va(ea.wrapping_add(3)) {
                             return self.raise(X86Exception::general_protection(va, 0));
@@ -672,6 +720,9 @@ fn emulate_xstate<M: SoftMmuMemory>(
     let ext = !matches!(op, SensitiveOp::Fxsave | SensitiveOp::Fxrstor);
     if ext && (ctx.cr4 & (1 << 18)) == 0 {
         return Err(X86Exception::invalid_opcode(ip));
+    }
+    if (ctx.cr0 & (1 << 3)) != 0 || (!ext && (ctx.cr0 & (1 << 2)) != 0) {
+        return Err(X86Exception::device_not_available(ip));
     }
     let save = !matches!(op, SensitiveOp::Fxrstor | SensitiveOp::Xrstor);
     let compact = op == SensitiveOp::Xsavec;
@@ -855,6 +906,9 @@ fn emulate_legacy_x87<M: SoftMmuMemory>(
     ip: u64,
 ) -> Result<(), X86Exception> {
     if op == SensitiveOp::Fwait {
+        if (ctx.cr0 & 0xa) == 0xa {
+            return Err(X86Exception::device_not_available(ip));
+        }
         let cw = u16::from_le_bytes([ctx.fxsave.0[0], ctx.fxsave.0[1]]);
         let sw = u16::from_le_bytes([ctx.fxsave.0[2], ctx.fxsave.0[3]]);
         return if sw & !cw & 0x3f != 0 {
@@ -867,6 +921,9 @@ fn emulate_legacy_x87<M: SoftMmuMemory>(
         } else {
             Ok(())
         };
+    }
+    if (ctx.cr0 & 0xc) != 0 {
+        return Err(X86Exception::device_not_available(ip));
     }
     let size = insn.memory_size().size();
     let full = matches!(op, SensitiveOp::Fnsave | SensitiveOp::Frstor);
