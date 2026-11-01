@@ -1553,3 +1553,22 @@ fn non_canonical_gate_rip_raises_gp_with_ext() {
     assert_eq!(rig.run_to_vec_port(), 13);
     assert_eq!(rig.read_frame48(rig.stack_frame, 0xfc0).error_code, 0);
 }
+
+#[test]
+fn non_canonical_ist_rsp_raises_ss_with_ext() {
+    // SDM Vol. 2A `INT n` (IA-32e): a non-canonical new RSP from the TSS raises #SS(EXT),
+    // delivered (benign #UD then contributory #SS) serially on the current stack. The frame
+    // below `0x0000_8000_0000_0010` straddles the canonical boundary.
+    let mut rig = IdtTestRig::new();
+    let tss = rig.tss_frame.raw();
+    rig.machine
+        .mem_mut()
+        .write_gpa(tss + 52, &0x0000_8000_0000_0010u64.to_le_bytes());
+    rig.set_gate(6, IdtTestRig::stub_va(6), 0x08, 3, 0x0e, 0, true);
+    rig.write_kernel_code(&[0x0f, 0x0b]); // ud2
+    rig.enter_cpl0(CODE_VA, RFLAGS_IF);
+    assert_eq!(rig.run_to_vec_port(), 12);
+    let ss = rig.read_frame48(rig.stack_frame, 0xfc0);
+    assert_eq!(ss.error_code, 1);
+    assert_eq!(ss.rip, CODE_VA);
+}
