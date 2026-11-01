@@ -11,8 +11,10 @@ beyond the initial four identities, over three rounds. Every worker enters
 through the native owner and exits through raw exit. Namespace claims return
 to the standing-stock baseline each round; final child exit returns the loaned
 lifecycle and page-table extents through their existing physical owner.
-`native_fork_child_capacity_refusal_is_eagain` fills the fixed lifecycle page
-and requires errno 11 only at its active capacity. The final-pin witness
+The fixed eight-entry lifecycle page is a carrick ceiling, not Linux
+behaviour: it is recorded on the `clone` row of the syscall map and its
+growth is #1142, whose red-first witness is eight or more live workers, so
+no witness here asserts the ceiling's EAGAIN. The final-pin witness
 retains real signal projections after all workers exit, parks the next clone,
 and releases one final pin: its notification resumes the preserved syscall,
 which succeeds without a timer, retry limit or host fallback.
@@ -64,3 +66,7 @@ notify, resume the preserved clone and create its thread. An empty runnable
 population reaches the fixture's immediate WFI refusal, bounding a missing wake
 without a timer or polling. This extends `kernel.el1.thread-lifecycle` with the
 ordinary sibling-exit interleaving; signed execution remains director-owned.
+
+These witnesses map their lifecycle metadata in the EL1 dynamic metadata
+window, which macOS hosts cannot reserve, so like main's other window
+fixtures they are compiled out on macOS and run on Linux (el1-native).

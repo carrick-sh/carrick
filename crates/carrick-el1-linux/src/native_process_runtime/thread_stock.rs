@@ -504,13 +504,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "macos")))]
 pub(crate) fn claim_counts<M: Clone, C: ProcessContext>(
     runtime: &NativeProcessRuntime<'_, M, C>,
 ) -> carrick_sched_core::process::identity_allocator::IdRegistryCounts {
     runtime.graph.lock().namespace.lock().counts()
 }
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "macos")))]
 pub(crate) fn retain_signal_snapshot<'a, M: Clone, C: ProcessContext>(
     runtime: &NativeProcessRuntime<'a, M, C>,
     record: carrick_el1_abi::RecordRef,
@@ -530,7 +530,7 @@ pub(crate) fn retain_signal_snapshot<'a, M: Clone, C: ProcessContext>(
         .and_then(|member| member.signal_projection.clone())
         .expect("registered signal projection")
 }
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "macos")))]
 pub(crate) fn retain_transient_control_pin<'a, M: Clone, C: ProcessContext>(
     runtime: &NativeProcessRuntime<'a, M, C>,
     record: carrick_el1_abi::RecordRef,
@@ -547,7 +547,7 @@ pub(crate) fn retain_transient_control_pin<'a, M: Clone, C: ProcessContext>(
     carrick_core::lifecycle::MemberControlCustody::retain(control).expect("transient control pin")
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "macos")))]
 pub(crate) fn claim_sibling_births<M: Clone, C: ProcessContext>(
     runtime: &NativeProcessRuntime<'_, M, C>,
     record: RecordRef,

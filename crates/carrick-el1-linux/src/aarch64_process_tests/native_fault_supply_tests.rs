@@ -206,21 +206,19 @@ impl CowResolver for FaultResolver<'_> {
 
 /// #1100: retain the parent while exercising a real native fork child's
 /// first heap growth, anonymous stack reservation and thread admission.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn native_fork_child_first_allocation_and_thread_admission() {
     child_thread_admission(1, 1, ChildStockCase::FirstBirth);
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn native_fork_child_refills_retires_and_reuses_thread_stock() {
     child_thread_admission(6, 3, ChildStockCase::Reuse);
 }
 
-#[test]
-fn native_fork_child_capacity_refusal_is_eagain() {
-    child_thread_admission(7, 1, ChildStockCase::Capacity);
-}
-
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn native_fork_child_waits_for_final_retired_control_pin() {
     child_thread_admission(7, 1, ChildStockCase::Pinned);
@@ -229,31 +227,35 @@ fn native_fork_child_waits_for_final_retired_control_pin() {
 /// Keep the parent live while 256 births cycle every retired control. Each
 /// round leaves a release-less final pin after dropping signal projections;
 /// the fixture's WFI trap bounds a missing notification immediately.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn native_fork_child_clone_storm_recycles_exited_pinned_controls() {
     child_thread_admission(7, 32, ChildStockCase::Pinned);
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn native_fork_child_claimed_sibling_birth_parks_until_settlement() {
     child_thread_admission(6, 1, ChildStockCase::Claimed);
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn native_fork_child_exiting_sibling_wakes_parked_clone() {
     child_thread_admission(7, 1, ChildStockCase::Exiting);
 }
 
+#[cfg(not(target_os = "macos"))]
 #[derive(Clone, Copy, PartialEq)]
 enum ChildStockCase {
     FirstBirth,
     Reuse,
-    Capacity,
     Pinned,
     Claimed,
     Exiting,
 }
 
+#[cfg(not(target_os = "macos"))]
 fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     fixture.zone.spaces.set_idle_ttbr(0x30000);
@@ -518,19 +520,6 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
             );
             assert!((frame.x[0] as i64) > 0);
             assert_eq!(page.live(), 8);
-        }
-        if case == ChildStockCase::Capacity {
-            frame.x[8] = 220;
-            frame.x[..6].copy_from_slice(&[0x50f00, VA + 0x12000, 0, 0, 0, 0]);
-            assert!(matches!(
-                loan_call(fixture, &mut frame, &mut cpu, &mut service, &counters),
-                carrick_personality_linux::dispatch::CompletionRoute::Served
-                    | carrick_personality_linux::dispatch::CompletionRoute::WithWork
-            ));
-            assert_eq!(
-                frame.x[0] as i64, -11,
-                "all active controls are a real capacity limit"
-            );
         }
         let mut pins = Vec::new();
         let mut transient_pins = Vec::new();
@@ -866,7 +855,9 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
     physical.shutdown();
 }
 
+#[cfg(not(target_os = "macos"))]
 struct LoanLifecycle;
+#[cfg(not(target_os = "macos"))]
 impl crate::thread_setup::LifecycleVenue for LoanLifecycle {
     fn thread<'a>(
         &'a self,
@@ -886,6 +877,7 @@ impl crate::thread_setup::LifecycleVenue for LoanLifecycle {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn loan_call(
     fixture: &'static Fixture,
     frame: &mut carrick_el1_abi::TrapFrame,
@@ -896,6 +888,7 @@ fn loan_call(
     loan_call_for_task(fixture, &fixture.task, frame, cpu, service, counters)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn loan_call_for_task(
     fixture: &'static Fixture,
     task: &'static CurrentTask,
