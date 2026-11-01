@@ -1058,6 +1058,7 @@ fn local_compiler_cache_start_replaces_only_a_stale_socket() {
             .env("CARRICK_SCCACHE_BIN", &fake)
             .env("SCCACHE_SERVER_UDS", &socket)
             .env("FAKE_LIVE", &live)
+            .env("CARRICK_XTASK_BIN", env!("CARGO_BIN_EXE_carrick-xtask"))
             .output()
             .unwrap();
         assert!(
@@ -1069,16 +1070,98 @@ fn local_compiler_cache_start_replaces_only_a_stale_socket() {
     };
     // A server answers: left running, not restarted.
     std::fs::write(&live, "").unwrap();
-    std::fs::write(&socket, "").unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     start("--show-stats\n");
+    drop(listener);
     assert!(socket.exists());
     // A socket no server answers is stale: removed, then a server starts.
     std::fs::remove_file(&live).unwrap();
-    start("--show-stats\n--start-server\n");
+    std::fs::remove_file(&socket).unwrap();
+    drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+    start("--start-server\n");
     assert!(
         !socket.exists(),
         "the fake doesn't create one; the stale one is gone"
     );
     // No socket: a server starts.
-    start("--show-stats\n--start-server\n");
+    start("--start-server\n");
+}
+
+/// Two callers must share one server even when the first start is still binding.
+#[test]
+fn concurrent_local_cache_starts_share_one_server() {
+    use std::io::Write;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let dir = tempfile::tempdir().unwrap();
+    let fake = dir.path().join("sccache");
+    let source = dir.path().join("fake.rs");
+    std::fs::write(
+        &source,
+        r#"
+use std::io::{BufRead, Write};
+use std::os::unix::net::UnixListener;
+use std::process::{Command, Stdio};
+fn main() {
+    let socket = std::env::var("SCCACHE_SERVER_UDS").unwrap();
+    match std::env::args().nth(1).unwrap().as_str() {
+        "--show-stats" => (), // Like sccache 0.18, succeeds even without a server.
+        "--start-server" => {
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .arg("serve").stdout(Stdio::piped()).spawn().unwrap();
+            let mut ready = String::new();
+            std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut ready).unwrap();
+            assert_eq!(ready, "ready\n");
+        }
+        "serve" => {
+            // Bound fixture lifetime even if the parent test panics.
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                std::process::exit(1);
+            });
+            std::fs::create_dir(format!("{socket}.starting")).unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let listener = UnixListener::bind(&socket).unwrap();
+            println!("ready");
+            std::io::stdout().flush().unwrap();
+            for conn in listener.incoming() {
+                let mut conn = conn.unwrap();
+                conn.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(&mut conn).read_line(&mut line).unwrap();
+                if line == "stop\n" { break; }
+            }
+        }
+        _ => panic!("unexpected command"),
+    }
+}
+"#,
+    )
+    .unwrap();
+    assert!(
+        std::process::Command::new("rustc")
+            .arg(&source)
+            .arg("-o")
+            .arg(&fake)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let socket = dir.path().join("job.sock");
+    let spawn = || {
+        std::process::Command::new(root.join("scripts/ci/compiler-cache-start-local.sh"))
+            .env("CARRICK_XTASK_BIN", env!("CARGO_BIN_EXE_carrick-xtask"))
+            .env("CARRICK_SCCACHE_BIN", &fake)
+            .env("SCCACHE_SERVER_UDS", &socket)
+            .spawn()
+            .unwrap()
+    };
+    let mut first = spawn();
+    let mut second = spawn();
+    assert!(first.wait().unwrap().success());
+    assert!(second.wait().unwrap().success());
+    assert!(socket.exists());
+    std::os::unix::net::UnixStream::connect(&socket)
+        .unwrap()
+        .write_all(b"stop\n")
+        .unwrap();
 }
