@@ -9761,6 +9761,30 @@ cat "$file"
     /// and clone phases) over the real `gh` transport: the chain rule admits
     /// an authentic chain and refuses each broken rule, and the run shape
     /// must be the chain job's dispatch.
+    /// The child's verdict line. libtest may already have written the
+    /// `test <name> ... ` prefix when the child prints, so the marker can
+    /// start mid-line (#1311); it always runs to the end of its line.
+    fn chain_verdict(text: &str) -> Option<&str> {
+        text.lines().find_map(|line| {
+            line.split_once("CHAIN-VERDICT: ")
+                .map(|(_, verdict)| verdict)
+        })
+    }
+    #[test]
+    fn chain_verdict_is_found_after_a_libtest_prefix_on_the_same_line() {
+        assert_eq!(chain_verdict("CHAIN-VERDICT: admitted\n"), Some("admitted"));
+        assert_eq!(
+            chain_verdict(
+                "running 1 test\ntest dispatch_worker::tests::guard_admits_only_an_authentic_chain ... CHAIN-VERDICT: admitted\nok\n"
+            ),
+            Some("admitted")
+        );
+        assert_eq!(
+            chain_verdict("test x ... CHAIN-VERDICT: refused: stale head\n"),
+            Some("refused: stale head")
+        );
+        assert_eq!(chain_verdict("test x ... ok\n"), None);
+    }
     #[test]
     fn guard_admits_only_an_authentic_chain() {
         const CHILD: &str = "CARRICK_TEST_CHAIN_GUARD";
@@ -9838,11 +9862,7 @@ cat "$file"
                     String::from_utf8_lossy(&output.stdout),
                     String::from_utf8_lossy(&output.stderr)
                 );
-                let verdict = text
-                    .lines()
-                    .find_map(|l| l.strip_prefix("CHAIN-VERDICT: "))
-                    .unwrap_or("no verdict")
-                    .to_owned();
+                let verdict = chain_verdict(&text).unwrap_or("no verdict").to_owned();
                 let right = match refused {
                     None => verdict == "admitted",
                     Some(reason) => verdict.starts_with("refused") && verdict.contains(reason),
