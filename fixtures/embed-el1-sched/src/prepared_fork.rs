@@ -1,5 +1,5 @@
 //! Inherited prepared backing and two-live-process isolation.
-use crate::pipe_count::{poll_read_count, write_count};
+use crate::pipe_count::{poll_read_count, read_count, write_count};
 
 /// Keep both processes alive while publishing inherited prepared backing,
 /// restoring PROT_NONE data and writing both inherited pages independently.
@@ -104,8 +104,10 @@ pub(crate) fn run() -> i32 {
             data.add(page).write_volatile(0x33);
         }
         // The parent checks its bytes before permitting this child to exit.
+        // This native child waits with a blocking read, not ppoll (#894),
+        // bounded by its alarm and by EOF if the parent exits early.
         let ok = write_count(c2p_write.as_raw_fd(), 1)
-            && poll_read_count(p2c_read.as_raw_fd(), 5_000) == Some(1)
+            && read_count(p2c_read.as_raw_fd()) == Some(1)
             && unsafe {
                 data.read_volatile() == 0x11
                     && data.add(page).read_volatile() == 0x33

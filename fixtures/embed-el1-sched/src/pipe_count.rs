@@ -28,3 +28,20 @@ pub(crate) fn poll_read_count(fd: libc::c_int, timeout_ms: libc::c_int) -> Optio
     }
     Some(u64::from_le_bytes(bytes))
 }
+
+/// Receive a count written by `write_count` with blocking reads only. A
+/// native fork child cannot `ppoll` yet (#894: refused crossing, ENOSYS), so
+/// its waits use this. The caller bounds it: an armed `alarm`, and EOF once
+/// the peer's write end closes.
+pub(crate) fn read_count(fd: libc::c_int) -> Option<u64> {
+    let mut bytes = [0u8; 8];
+    let mut have = 0;
+    while have < bytes.len() {
+        let n = unsafe { libc::read(fd, bytes[have..].as_mut_ptr().cast(), bytes.len() - have) };
+        if n <= 0 {
+            return None;
+        }
+        have += n as usize;
+    }
+    Some(u64::from_le_bytes(bytes))
+}
