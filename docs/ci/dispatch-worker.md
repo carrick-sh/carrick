@@ -899,11 +899,18 @@ controller change: announce it before and after under AGENTS.md's “Multiple di
 sessions” rules.
 
 The owner applies the source ACL to both the user and its privilege-separated
-token; both grants are needed:
+token; both grants are needed. `<active VMID>` is the slot the site row
+selects (9000 or 9001):
 
 ```sh
-pveum acl modify /vms/9001 --roles PVETemplateUser --users ci-scaler@pve
-pveum acl modify /vms/9001 --roles PVETemplateUser --tokens 'ci-scaler@pve!elastic'
+pveum acl modify /vms/<active VMID> --roles PVETemplateUser --users ci-scaler@pve
+pveum acl modify /vms/<active VMID> --roles PVETemplateUser --tokens 'ci-scaler@pve!elastic'
+```
+
+Verify that the token holds exactly `VM.Audit` and `VM.Clone` there:
+
+```sh
+pvesh get /access/permissions --path /vms/<active VMID> --userid 'ci-scaler@pve!elastic'
 ```
 
 With agent clones enabled, startup requires exactly `VM.Audit=1` and
@@ -913,6 +920,24 @@ active source configuration directly because its pool inventory excludes
 agent templates. The root-run builder
 uses `qm` to start and stop the agent template during provisioning; the
 controller token retains only its inspection and clone rights.
+
+When an old source is retired, its grants go with it. Only after
+`carrick-xtask ci-scaler check-template-retirement --template <old VMID>`
+passes under the installed active controller, either destroy it with
+`--purge`, which also removes its ACL and pool references:
+
+```sh
+qm destroy <old VMID> --purge
+```
+
+or delete both grants explicitly:
+
+```sh
+pveum acl delete /vms/<old VMID> --roles PVETemplateUser --users ci-scaler@pve
+pveum acl delete /vms/<old VMID> --roles PVETemplateUser --tokens 'ci-scaler@pve!elastic'
+```
+
+Then confirm with `pveum acl list` that no `/vms/<old VMID>` entry remains.
 
 ### Codex SDK
 
@@ -986,3 +1011,15 @@ It refuses active or referenced templates. Only then attempt `qm destroy`;
 Proxmox's own linked-base refusal remains the backstop. Keep the old ACLs
 and firewall until destruction succeeds. The director records rollout
 announcements and live worker KVM/lease evidence on #231.
+
+### Rollback
+
+Back up the serving controller before cutover with
+`cp -p /root/carrick-ci/bin/carrick-xtask /root/carrick-ci/bin/carrick-xtask.pre-<pr>`.
+Rollback is restore-and-restart:
+`install -m 755 /root/carrick-ci/bin/carrick-xtask.pre-<pr> /root/carrick-ci/bin/carrick-xtask && systemctl restart carrick-ci-standing`.
+It is valid only while the old template still exists with its ACL grants
+and `.fw` file. After retirement, rolling back means rebuilding a template,
+and since `main` still selects the new slot, a fix-forward PR must change
+the site row first. Details are in the
+[beside rebuild procedure](contabo-kvm.md#rollback).
