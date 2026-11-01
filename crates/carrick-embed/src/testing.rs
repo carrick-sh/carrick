@@ -1142,8 +1142,9 @@ fi
             path
         };
 
-        // 1. With the per-binary deadline disabled (`=0` hatch), the forever-blocking
-        //    binary hangs indefinitely.
+        // 1. With both deadlines disabled (`=0`), the forever-blocking test hangs
+        //    indefinitely. test-signed runs each test in its own process (#1114),
+        //    so binary 1's only test runs under `<run-id>-b1-t1`.
         let disabled_run_id = format!("{run_id}-disabled");
         let disabled_block_marker = make_fifo("block_started_disabled.fifo");
         let disabled_marker = dir.path().join("normal_completed_disabled.txt");
@@ -1155,6 +1156,7 @@ fi
                 .env("CARRICK_HOST_LEASE_SOCKET", "dummy-lease-socket")
                 .env("CARRICK_RUN_ID", &disabled_run_id)
                 .env("CARRICK_TEST_SIGNED_DEADLINE_SECS", "0")
+                .env("CARRICK_TEST_SIGNED_TEST_DEADLINE_SECS", "0")
                 .env("DUMMY_KILL_SH", &kill_sh)
                 .env("DUMMY_BLOCK_MARKER", &disabled_block_marker)
                 .env("DUMMY_NORMAL_MARKER", &disabled_marker)
@@ -1173,22 +1175,23 @@ fi
             .is_none();
         let _ = disabled_child.kill();
         let _ = disabled_child.wait();
-        for suffix in ["-b1", ""] {
+        for suffix in ["-b1-t1", ""] {
             let _ = std::process::Command::new(&kill_sh)
                 .arg(format!("{disabled_run_id}{suffix}"))
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status();
         }
-        assert_eq!(disabled_started.trim(), format!("{disabled_run_id}-b1"));
+        assert_eq!(disabled_started.trim(), format!("{disabled_run_id}-b1-t1"));
         assert!(
             still_running,
-            "forever-blocking binary must remain blocked when CARRICK_TEST_SIGNED_DEADLINE_SECS=0"
+            "forever-blocking test must remain blocked when both deadlines are 0"
         );
 
-        // 2. With a short per-binary deadline override, the forever-blocking binary
-        //    has its diagnostics captured, is reaped via kill.sh, is reported as
-        //    DEADLINE and FAIL, and subsequent binaries still execute cleanly.
+        // 2. With a short per-test deadline, the forever-blocking test has its
+        //    diagnostics captured, is reaped via kill.sh, is reported as DEADLINE
+        //    and itemized FAILED, and the tests after it still execute cleanly.
+        //    The per-binary budget is off so the 2s per-test timer is exact.
         let deadline_fifo = make_fifo("deadline.fifo");
         let normal_started_fifo = make_fifo("normal-started.fifo");
         let reap_done_fifo = make_fifo("reap-done.fifo");
@@ -1201,7 +1204,8 @@ fi
             .env("PATH", &path_env)
             .env("CARRICK_HOST_LEASE_SOCKET", "dummy-lease-socket")
             .env("CARRICK_RUN_ID", &run_id)
-            .env("CARRICK_TEST_SIGNED_DEADLINE_SECS", "2")
+            .env("CARRICK_TEST_SIGNED_DEADLINE_SECS", "0")
+            .env("CARRICK_TEST_SIGNED_TEST_DEADLINE_SECS", "2")
             .env("DUMMY_DEADLINE_FIFO", &deadline_fifo)
             .env("DUMMY_NORMAL_STARTED_FIFO", &normal_started_fifo)
             .env("DUMMY_REAP_DONE_FIFO", &reap_done_fifo)
@@ -1231,8 +1235,8 @@ fi
             std::fs::read_to_string(&block_marker)
                 .unwrap_or_default()
                 .trim(),
-            format!("{run_id}-b1"),
-            "blocking binary must run under -b1 CARRICK_RUN_ID (stdout={stdout} stderr={stderr})"
+            format!("{run_id}-b1-t1"),
+            "blocking test must run under its -b1-t1 CARRICK_RUN_ID (stdout={stdout} stderr={stderr})"
         );
         let bt_invocations = std::fs::read_to_string(&bt_marker).unwrap_or_default();
         assert!(
@@ -1247,17 +1251,23 @@ fi
             stderr.contains(&format!("test-signed: DEADLINE {}", exe_block.display())),
             "forever-blocking binary must be reported with a clear DEADLINE line; stderr={stderr}"
         );
+        // Failures are itemized per test, never a bare per-binary FAIL line
+        // (accept reads that as an unitemized crash).
         assert!(
-            stderr.contains(&format!("test-signed: FAIL {}", exe_block.display())),
-            "forever-blocking binary must be reported failed; stderr={stderr}"
+            stdout.contains("test el1_dummy_block_forever ... FAILED"),
+            "forever-blocking test must be itemized failed; stdout={stdout}"
         );
         assert!(
-            stderr.contains(&format!("test-signed: FAIL {}", exe_hang.display())),
-            "watchdog-hanging binary must be reported failed; stderr={stderr}"
+            stdout.contains("test el1_dummy_hang ... FAILED"),
+            "watchdog-hanging test must be itemized failed; stdout={stdout}"
         );
         assert!(
-            !stderr.contains(&format!("test-signed: FAIL {}", exe_normal.display())),
-            "normal binary must not be killed by previous binaries' reaps; stdout={stdout} stderr={stderr}"
+            !stdout.contains("test el1_dummy_normal ... FAILED"),
+            "normal test must not be killed by previous tests' reaps; stdout={stdout} stderr={stderr}"
+        );
+        assert!(
+            !stderr.contains("test-signed: FAIL "),
+            "per-test mode reports failures itemized, not as a per-binary FAIL; stderr={stderr}"
         );
         let normal_section = stdout
             .split(&format!("test-signed: running {}", exe_normal.display()))
@@ -1271,8 +1281,8 @@ fi
         let recorded_run_id = std::fs::read_to_string(&marker).unwrap_or_default();
         assert_eq!(
             recorded_run_id.trim(),
-            format!("{run_id}-b3"),
-            "normal binary must run under its distinct -b3 CARRICK_RUN_ID (stdout={stdout} stderr={stderr})"
+            format!("{run_id}-b3-t1"),
+            "normal test must run under its distinct -b3-t1 CARRICK_RUN_ID (stdout={stdout} stderr={stderr})"
         );
 
         // 3. When the diagnostic command itself (`lldb`) blocks (e.g. unprivileged
@@ -1292,7 +1302,8 @@ fi
             .env("PATH", &path_env)
             .env("CARRICK_HOST_LEASE_SOCKET", "dummy-lease-socket")
             .env("CARRICK_RUN_ID", &hang_diag_run_id)
-            .env("CARRICK_TEST_SIGNED_DEADLINE_SECS", "2")
+            .env("CARRICK_TEST_SIGNED_DEADLINE_SECS", "0")
+            .env("CARRICK_TEST_SIGNED_TEST_DEADLINE_SECS", "2")
             .env("CARRICK_TEST_SIGNED_DIAG_TIMEOUT_SECS", "1")
             .env("DUMMY_DEADLINE_FIFO", &hang_diag_deadline_fifo)
             .env("DUMMY_DIAG_DEADLINE_FIFO", &diag_deadline_fifo)
@@ -1329,14 +1340,14 @@ fi
             "forever-blocking binary must still be reported with DEADLINE when lldb stalls; stderr={hang_diag_stderr}"
         );
         assert!(
-            hang_diag_stderr.contains(&format!("test-signed: FAIL {}", exe_block.display())),
-            "forever-blocking binary must still be reported with FAIL when lldb stalls; stderr={hang_diag_stderr}"
+            hang_diag_stdout.contains("test el1_dummy_block_forever ... FAILED"),
+            "forever-blocking test must still be itemized failed when lldb stalls; stdout={hang_diag_stdout}"
         );
         assert_eq!(
             std::fs::read_to_string(&hang_diag_normal_marker)
                 .unwrap_or_default()
                 .trim(),
-            format!("{hang_diag_run_id}-b3"),
+            format!("{hang_diag_run_id}-b3-t1"),
             "subsequent normal binary must still run after a stalled diagnostic is bounded; stdout={hang_diag_stdout} stderr={hang_diag_stderr}"
         );
         let lldb_child_pid = std::fs::read_to_string(&hang_diag_child_pid_file)

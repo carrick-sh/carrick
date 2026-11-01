@@ -232,25 +232,29 @@ fn parse_cargo_duration(text: &str) -> Option<f64> {
     Some(total)
 }
 
-/// libtest's `finished in <t>s` for the smoke binary's run.
+/// libtest's `finished in <t>s` for the smoke binary's run, summed over its
+/// `test result:` lines: test-signed runs each test in its own process
+/// (#1114), so a binary reports one result per test.
 fn libtest_s(log: &str) -> Option<f64> {
     let mut in_smoke = false;
+    let mut total: Option<f64> = None;
     for line in log.lines() {
         if let Some(rest) = line.split_once("test-signed: running ") {
             in_smoke = rest.1.contains(&format!("/{TARGET}-"));
         } else if line.contains("test-signed: negative control on ") {
             in_smoke = false;
         } else if in_smoke && line.trim_start().starts_with("test result:") {
-            return line
+            let secs: f64 = line
                 .rsplit_once("finished in ")?
                 .1
                 .trim()
                 .strip_suffix('s')?
                 .parse()
-                .ok();
+                .ok()?;
+            total = Some(total.unwrap_or(0.0) + secs);
         }
     }
-    None
+    total
 }
 
 fn fixture_input_identity(log: &str) -> Option<String> {
