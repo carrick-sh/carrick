@@ -1,0 +1,42 @@
+schema_version = 1
+id = "x86.cpuid.v3"
+title = "Guest x86-64 CPUID and XCR0 view is pinned to x86-64-v3 with zero non-v3 leakage"
+guest_surfaces = ["vmm:kvm", "arch:x86-cpuid", "exec:x86-long-mode"]
+semantic_authority = [
+  "System V Application Binary Interface AMD64 Architecture Processor Supplement, section 3.1.2 (x86-64-v3 microarchitecture level); Intel SDM volume 2A CPUID specification (order 325383); clean-room architectural rules without Linux, KVM or QEMU implementation source",
+]
+fixture = "carrick-x86::cpuid::tests; carrick-vmm-kvm::kvm::x86_tests::x86_vcpu_exposes_pinned_x86_64_v3_cpuid_and_no_non_v3_features; carrick-vmm-kvm::tests::cpuid_v3_kvm"
+scale_points = [11]
+structural_budgets = []
+rationale = """
+Every x86 guest vCPU exposes one deterministic 11-entry CPUID table (`GuestCpuidView`)
+pinned to the System V psABI x86-64-v3 baseline plus the IA-32e / CPL0 supervisor
+capabilities Carrick programs (`SMEP`, `SMAP`, `SYSCALL`, `NX`, `PAT`, `PGE`, `APIC`,
+`INVTSC`), with `XCR0` initialized fail-closed to `0x7` (`x87 | SSE | AVX`, 832-byte
+standard XSAVE frame). Host qualification (`GuestCpuidView::qualify_supported`)
+verifies every required hardware capability once at VM creation in bounded O(entries)
+time, clamps `MAXPHYADDR` to `min(host_max_phy_addr, 48)` (refusing `< 36`), stamps
+per-vCPU `APIC ID` and calibrated `CPUID.15H` TSC ratio, caps basic leaves with a
+zero leaf `0x16` so Intel SDM / KVM out-of-range fallback returns zeroes, and strips
+every feature outside `x86-64-v3` (including `AVX-512`, `AMX`, `SHA`, `AES`,
+`PCLMULQDQ`, `RDRAND`, `RDSEED`, `ADX`, `FSGSBASE`, `PKU`, `LA57`, `UMIP`,
+`XSAVEOPT`/`XSAVEC`/`XSAVES`, `TSC_DEADLINE`, `HYPERVISOR`, `0x4000_0000` leaves,
+`RDTSCP`, `PDPE1GB`, and AMD SEV leaves). Red-first witnesses prove raw host
+`KVM_GET_SUPPORTED_CPUID` pass-through fails the strict v3 isolation audit and
+verify host qualification refusal and scrubbing before live KVM ring-3 execution.
+"""
+
+[bindings]
+vm_free = [
+  "carrick-x86::cpuid::tests::x86_64_v3_table_advertises_exact_psabi_v3_and_no_feature_outside_v3",
+  "carrick-x86::cpuid::tests::raw_unscrubbed_host_cpuid_fails_v3_isolation_audit",
+  "carrick-x86::cpuid::tests::qualify_supported_scrubs_v4_amd_and_intel_hosts_and_clamps_max_phy_addr",
+  "carrick-x86::cpuid::tests::qualify_supported_refuses_hosts_missing_any_required_v3_or_cpl0_capability",
+  "carrick-x86::cpuid::tests::per_vcpu_apic_id_and_high_frequency_tsc_calibration_round_trip",
+]
+
+[bindings.unresolved]
+embed_structural = "KVM vCPU CPUID and XGETBV execution bindings live in carrick-vmm-kvm::kvm::x86_tests and carrick-vmm-kvm/tests/cpuid_v3_kvm.rs (`test-kvm` lane); this ephemeral worker runner lacks /dev/kvm read/write access."
+kvm = "Merge-queue `kvm-tests` / `kvm-gate` must execute `carrick-vmm-kvm --lib` and `--test cpuid_v3_kvm` on real `/dev/kvm` with `NEW=[]`."
+signed = "macOS HVF AArch64 lane does not execute x86 CPUID; soft-lane x86 CPUID consumption is tracked as the sibling slice under #578."
+docker = "Architectural x86-64-v3 CPUID isolation contract uses System V AMD64 psABI and Intel SDM authority; Docker passes host CPUID unfiltered and this runner has no Docker."
