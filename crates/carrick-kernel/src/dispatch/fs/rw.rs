@@ -722,6 +722,19 @@ pub(in crate::dispatch) enum CarrierWritten {
 /// `read(2)`/`pread64(2)` of `length` bytes from a synthetic device:
 /// `/dev/null` is at end of file, `/dev/zero` and `/dev/full` read zeros,
 /// the random devices read random bytes.
+/// Copy a `read_description` result to the reader and report its length:
+/// the one user-memory write both the task and carrier halves share.
+fn deliver_read<M: CurrentMmMemory>(
+    memory: &mut M,
+    address: u64,
+    read_len: usize,
+    bytes: &[u8],
+) -> Result<DispatchOutcome, DispatchError> {
+    let outcome = DispatchOutcome::returned_len_or_errno(read_len);
+    memory.write_bytes(address, bytes)?;
+    Ok(outcome)
+}
+
 fn synthetic_device_read(kind: &carrick_vfs::SyntheticDeviceKind, length: usize) -> Vec<u8> {
     match kind {
         carrick_vfs::SyntheticDeviceKind::Null => Vec::new(),
@@ -1420,8 +1433,7 @@ impl<'a> FsView<'a> {
             return match &mut *open {
                 OpenDescription::SyntheticDevice { kind, .. } => {
                     let bytes = synthetic_device_read(kind, length);
-                    memory.write_bytes(address, &bytes)?;
-                    Ok(DispatchOutcome::returned_len_or_errno(bytes.len()))
+                    deliver_read(memory, address, bytes.len(), &bytes)
                 }
                 OpenDescription::HostFile { .. } => read_host_file_sequential(
                     &mut open,
@@ -1809,10 +1821,8 @@ impl<'a> FsView<'a> {
                 );
             }
         };
-        let outcome = DispatchOutcome::returned_len_or_errno(read_len);
         drop(open);
-        memory.write_bytes(address, &bytes)?;
-        Ok(outcome)
+        deliver_read(memory, address, read_len, &bytes)
     }
 
     /// `pread64(2)` on one open description, shared by the syscall handler
