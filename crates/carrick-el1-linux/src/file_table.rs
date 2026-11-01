@@ -684,17 +684,48 @@ pub fn retire_fd_map(fd_map: &[FdMapSlot], open_table: &[DelegatedOpenFile], fil
     }
 }
 
+/// The caller's soft `RLIMIT_NOFILE` that bounds a poll set's `nfds`: the
+/// ring descriptor table's soft limit when this file table has one, else the
+/// delegated fd map's fixed descriptor ceiling. `None` when the ring table
+/// cannot be read now; the caller leaves the call unrouted before any effect.
+pub fn poll_descriptor_limit(
+    ipc: Option<&crate::ipc::IpcVenue<'_>>,
+    file_table: u64,
+) -> Option<usize> {
+    let Some((venue, table)) = ipc.and_then(|venue| {
+        venue
+            .tables
+            .table_for_file_table(file_table)
+            .map(|table| (venue, table))
+    }) else {
+        return Some(GUEST_FD_LIMIT as usize);
+    };
+    venue
+        .region
+        .fd(carrick_sched_core::ShortLockSpin)
+        .limit(carrick_el1_abi::ipc::fd::TableId::from_raw(table))
+        .ok()
+}
+
+/// Most host-bound entries one poll may hand the carrier readiness
+/// crossing. The carrier samples them with one host `poll`, whose own
+/// descriptor limit this must not exceed; it is independent of the guest's
+/// soft RLIMIT_NOFILE, which bounds `nfds`.
+pub const HOST_READINESS_CROSSING_LIMIT: usize = GUEST_FD_LIMIT as usize;
+
 /// Whether every live poll entry names a host-bound open description.
 /// Negative entries do not participate. Absent descriptors can travel with
 /// host-bound entries: the shared dispatcher reports their POLLNVAL result.
-/// In-zone descriptions stay with the guest owner.
+/// In-zone descriptions stay with the guest owner. The entry array is sized
+/// by the guest's set, so it is reserved fallibly: `Err` means the ring heap
+/// cannot hold it, before any effect.
 pub fn host_readiness_entries(
     fd_map: &[FdMapSlot],
     open_table: &[DelegatedOpenFile],
     file_table: u64,
     pollfds: &[PollFd],
     ipc: Option<&crate::ipc::IpcVenue<'_>>,
-) -> Option<Vec<HostReadinessEntry>> {
+) -> Result<Option<Vec<HostReadinessEntry>>, alloc::collections::TryReserveError> {
     let _guard = lock_fd_map(fd_map);
     let namespace = ipc.and_then(|venue| {
         venue
@@ -724,7 +755,7 @@ pub fn host_readiness_entries(
                     ) => {}
                 Err(Error::BadFd) => continue,
                 // A host selector cannot wait for this guest-owned producer.
-                _ => return None,
+                _ => return Ok(None),
             }
         }
         let Some((handle, _)) = fd_map_lookup(fd_map, file_table, entry.fd) else {
@@ -743,6 +774,11 @@ pub fn host_readiness_entries(
         else {
             continue;
         };
+        if host_entries.capacity() == 0 {
+            // Reserve once for every entry that can still follow, so no
+            // push below reallocates.
+            host_entries.try_reserve_exact(pollfds.len() - index)?;
+        }
         host_entries.push(HostReadinessEntry {
             binding,
             events: entry.events,
@@ -752,7 +788,10 @@ pub fn host_readiness_entries(
     }
     // An all-negative set still carries a timer wait through the host
     // readiness crossing, even though it enrolls no host descriptor.
-    (!host_entries.is_empty() || pollfds.iter().all(|entry| entry.fd < 0)).then_some(host_entries)
+    Ok(
+        (!host_entries.is_empty() || pollfds.iter().all(|entry| entry.fd < 0))
+            .then_some(host_entries),
+    )
 }
 
 /// Resolves pollfd entries against the zone tables and IPC venue.
@@ -901,6 +940,7 @@ mod tests {
         pollfds: &mut [PollFd],
     ) -> i32 {
         let mut entries = host_readiness_entries(fd_map, open_table, file_table, pollfds, None)
+            .expect("the fixture set fits")
             .expect("host-bound fixture entries");
         for entry in &mut entries {
             let fd = entry
@@ -1641,7 +1681,9 @@ mod tests {
                 revents: 0,
             },
         ];
-        let mut entries = host_readiness_entries(&fd_map, &open_table, 10, &fds, None).unwrap();
+        let mut entries = host_readiness_entries(&fd_map, &open_table, 10, &fds, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].binding.host_fd().map(HostBoundFd::raw), Some(0));
         assert_eq!(entries[0].poll_index, 0);
@@ -1663,7 +1705,11 @@ mod tests {
         );
         assert_eq!(fds[1].revents, 0);
         assert_eq!(fds[3].revents, LINUX_POLLNVAL);
-        assert!(host_readiness_entries(&fd_map, &open_table, 10, &fds[3..], None).is_none());
+        assert!(
+            host_readiness_entries(&fd_map, &open_table, 10, &fds[3..], None)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1697,6 +1743,7 @@ mod tests {
             },
         ];
         let entries = host_readiness_entries(&fd_map, &open_table, 10, &fds, None)
+            .unwrap()
             .expect("host descriptor remains in the batch");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].poll_index, 1);

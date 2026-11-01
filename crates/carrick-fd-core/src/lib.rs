@@ -1624,6 +1624,13 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         }
     }
 
+    /// O(1) read-only snapshot of the table's soft descriptor limit
+    /// (`RLIMIT_NOFILE`), taking no lock. `Contended` as for [`Self::get`].
+    pub fn limit(&self, table: TableId) -> Result<usize, Error> {
+        self.read_table_in_states(table, &[TABLE_LIVE])
+            .map(|(_, _, _, limit)| limit)
+    }
+
     /// O(1) read-only snapshot of the host work retained for this numeric
     /// close. Kept separate from [`Description`] so the hot by-value backing
     /// snapshot does not grow with close-only metadata.
