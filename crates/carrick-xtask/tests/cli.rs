@@ -379,3 +379,66 @@ fn impact_is_an_explicit_feature_while_ci_changes_is_always_available() {
         cfg!(feature = "impact")
     );
 }
+
+#[test]
+fn lease_socket_rejoins_gate_after_tool_runner_closes_descriptors() {
+    use std::time::{Duration, Instant};
+    let lock = tempfile::NamedTempFile::new().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .args(["host-lease", "--mode", "gate", "--"])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "lease_closed_descriptors_fixture",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("CARRICK_HOST_LEASE_PATH", lock.path())
+        .env_remove("CARRICK_HOST_LEASE_SOCKET")
+        .env_remove("CARRICK_HOST_LEASE_FD")
+        .env_remove("CARRICK_HOST_LEASE_SCOPE_FD")
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(
+                status.success(),
+                "nested CLI lease or scope cleanup failed: {status}"
+            );
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("nested CLI lease exceeded its bounded witness");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+#[ignore = "isolated tool-runner fixture invoked under a real supervised gate"]
+fn lease_closed_descriptors_fixture() {
+    use std::os::unix::process::CommandExt;
+    for mode in ["carrick", "gate"] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"));
+        command.args(["host-lease", "--mode", mode, "--", "/usr/bin/true"]);
+        // SAFETY: close is async-signal-safe; this models the tool runner's
+        // descriptor stripping, including fd 3, before the nested CLI exec.
+        unsafe {
+            command.pre_exec(|| {
+                for fd in 3..1024 {
+                    libc::close(fd);
+                }
+                Ok(())
+            });
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("host-lease: acquired"),
+            "nested command reacquired the lock"
+        );
+    }
+}
