@@ -23,10 +23,6 @@ use std::process::Command;
 
 use carrick_vmm_kvm::cpl0_boot::Cpl0Carrier;
 use carrick_x86::cpl0_entry::OBSERVE_NATIVE;
-use carrick_x86::cpuid::{
-    CPUID_1_ECX_HYPERVISOR, CPUID_1_ECX_X86_64_V3, CPUID_1_EDX_X86_64_V3, CPUID_7_0_EBX_PINNED,
-    CPUID_8000_0001_ECX_X86_64_V3, CPUID_8000_0001_EDX_X86_64_V3, CPUID_8000_0007_EDX_INVTSC,
-};
 use carrick_x86::{CpuidRegs, GuestCpuidView, XCR0_X86_64_V3_MASK};
 use physical_inventory::physical_inventory;
 
@@ -173,21 +169,13 @@ fn assert_observed_leaves_are_strictly_v3(
             .expect("probed leaf present")
     };
 
+    // Independent architectural bit positions: comparing only with the shared
+    // production masks would let an accidental feature addition bless itself.
     let l1 = find(1, 0);
-    assert_eq!(
-        l1.ecx & !CPUID_1_ECX_X86_64_V3,
-        0,
-        "non-v3 1.ECX bits leaked"
-    );
-    assert_eq!(l1.ecx & CPUID_1_ECX_HYPERVISOR, 0, "hypervisor bit leaked");
-    assert_eq!(
-        l1.edx & !CPUID_1_EDX_X86_64_V3,
-        0,
-        "non-v3 1.EDX bits leaked"
-    );
-
-    let l7_0 = find(7, 0);
-    assert_eq!(l7_0, CpuidRegs::new(0, CPUID_7_0_EBX_PINNED, 0, 0));
+    assert_eq!(l1.eax, 0x0003_06d4, "pinned CPU signature");
+    assert_eq!(l1.ecx, 0x3cd8_3201, "exact v3 1.ECX features");
+    assert_eq!(l1.edx, 0x0789_a37d, "exact baseline 1.EDX features");
+    assert_eq!(find(7, 0), CpuidRegs::new(0, 0x0010_01a8, 0, 0));
     assert_eq!(find(7, 1), CpuidRegs::ZERO);
     assert_eq!(find(7, 2), CpuidRegs::ZERO);
     assert_eq!(find(0x0d, 1), CpuidRegs::ZERO);
@@ -196,17 +184,9 @@ fn assert_observed_leaves_are_strictly_v3(
     assert_eq!(find(0x4000_0001, 0), CpuidRegs::ZERO);
     assert_eq!(
         find(0x8000_0001, 0),
-        CpuidRegs::new(
-            0,
-            0,
-            CPUID_8000_0001_ECX_X86_64_V3,
-            CPUID_8000_0001_EDX_X86_64_V3,
-        )
+        CpuidRegs::new(0, 0, 0x21, 0x2010_0800)
     );
-    assert_eq!(
-        find(0x8000_0007, 0),
-        CpuidRegs::new(0, 0, 0, CPUID_8000_0007_EDX_INVTSC)
-    );
+    assert_eq!(find(0x8000_0007, 0), CpuidRegs::new(0, 0, 0, 1 << 8));
     assert_eq!(find(0x8000_001f, 0), CpuidRegs::ZERO);
 }
 
