@@ -154,14 +154,13 @@ fn a_crashed_step_probe_diff_leak_or_dirty_tree_is_a_failure_identity() {
         vec![
             "dirty-checkout",
             "leak:build",
-            "not-run:build:step skipped or failed before reporting",
             "not-run:probe-cases:zero tests selected",
             "probe:probe-cases:case_pipe",
             "step:build"
         ]
     );
     let result = diff(&receipt(vec![]), &next).unwrap();
-    assert_eq!(result.new.len(), 6);
+    assert_eq!(result.new.len(), 5);
 }
 
 #[test]
@@ -635,7 +634,7 @@ error: could not compile `carrick-embed` (test \"x\") due to 1 previous error
         result.new,
         vec![
             "cleanup-unknown:probe-cases",
-            "not-run:el1-embed:binary killed before reporting: ",
+            "not-run:el1-embed:binary killed before reporting:  (exit Some(101); crash:embed)",
             "step:el1-embed",
             "unitemized:el1-embed:crash:embed"
         ]
@@ -784,7 +783,7 @@ fn replay_pr338_excerpt_against_main_excerpt_yields_new_keys_for_failures_missin
         result.new,
         vec![
             "missing:el1_kick_served_loop::el1_served_loop_surfaces_kicks",
-            "not-run:el1-embed:binary killed before reporting: el1_kick_served_loop",
+            "not-run:el1-embed:binary killed before reporting: el1_kick_served_loop (exit Some(101); crash:el1_kick_served_loop)",
             "step:el1-embed",
             "test:el1-embed:el1_inotify::el1_inotify_recall_on_dir_watch",
             "unfinished:el1_kick_served_loop",
@@ -1041,7 +1040,7 @@ test-signed: FAIL /w/target/release/deps/el1_kick_served_loop-4bc14b20aecdb3a9
         result.new,
         vec![
             "missing:el1_kick_served_loop::el1_served_loop_surfaces_kicks",
-            "not-run:el1-embed:binary killed before reporting: el1_kick_served_loop",
+            "not-run:el1-embed:binary killed before reporting: el1_kick_served_loop (exit Some(101); crash:el1_kick_served_loop)",
             "step:el1-embed",
             "unfinished:el1_kick_served_loop",
             "unitemized:el1-embed:crash:el1_kick_served_loop",
@@ -2820,4 +2819,223 @@ fn candidate_cannot_claim_passed_for_a_build_failure() {
     s.outcome = Some(StepOutcome::Passed);
     s.passed = true;
     assert!(matches!(s.execution_outcome(), StepOutcome::NotRun { .. }));
+}
+
+fn assert_cli_self_diff(r: &AcceptReceipt, success: bool, reason: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("receipt.json");
+    std::fs::write(&path, serde_json::to_vec(r).unwrap()).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .args(["ci-receipt", "diff", "--baseline"])
+        .arg(&path)
+        .arg("--candidate")
+        .arg(&path)
+        .arg("--fail-on-new")
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.success(),
+        success,
+        "{reason}: {} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if !success {
+        assert!(String::from_utf8_lossy(&out.stdout).contains(reason));
+    }
+}
+
+#[test]
+fn review_non_test_failures_remain_baseline_comparable() {
+    for (name, log) in [
+        ("clippy", "error: could not compile `example` (lib)\n"),
+        ("fmt-check", "Diff in src/lib.rs\n"),
+        ("lint-domains", "policy violation\n"),
+    ] {
+        let mut s = step(name, false, &[]);
+        populate_step_from_log(&mut s, log, &mut vec![]);
+        assert_cli_self_diff(&receipt(vec![s]), true, name);
+    }
+}
+
+#[test]
+fn review_passing_non_cargo_tests_execute() {
+    for (name, log) in [
+        ("inotify09-el1", "inotify09.c:100: TPASS: watch succeeded\n"),
+        (
+            "ltp",
+            "{\"name\":\"ltp-read01\",\"carrick\":{\"result\":\"pass\",\"totals\":{\"passed\":1,\"failed\":0}}}\n",
+        ),
+    ] {
+        let mut s = step(name, true, &[]);
+        populate_step_from_log(&mut s, log, &mut vec![]);
+        assert!(matches!(
+            s.execution_outcome(),
+            carrick_xtask::accept::StepOutcome::Passed
+        ));
+        assert_cli_self_diff(&receipt(vec![s]), true, name);
+    }
+}
+
+#[test]
+fn review_link_failure_has_build_reason() {
+    let mut s = step("generic-probe-shards", false, &[]);
+    populate_step_from_log(
+        &mut s,
+        "error: linking with `cc` failed: exit status: 1\n  = note: libpython-map\n",
+        &mut vec![],
+    );
+    assert_cli_self_diff(&receipt(vec![s]), false, "build failure");
+}
+
+#[test]
+fn review_lib_only_does_not_satisfy_signed_lane_in_all_phase() {
+    let tree = tempfile::tempdir().unwrap();
+    let dir = tree.path().join("crates/guest");
+    std::fs::create_dir_all(dir.join("tests")).unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = 'guest'\n[package.metadata.carrick.test-lanes]\n'*' = 'signed-hvf'\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("tests/probe.rs"), "#[test] fn live() {}\n").unwrap();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "#[test] fn live() {}\n").unwrap();
+    let mut s = step("unit", true, &[]);
+    s.started_tests = vec!["guest::live".into()];
+    let mut r = receipt(vec![s]);
+    r.phase = "all".into();
+    let fixture = tree.path().join("receipt.json");
+    std::fs::write(&fixture, serde_json::to_vec(&r).unwrap()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .args(["ci-receipt", "diff", "--baseline"])
+        .arg(&fixture)
+        .arg("--candidate")
+        .arg(&fixture)
+        .arg("--base-tree")
+        .arg(tree.path())
+        .arg("--candidate-tree")
+        .arg(tree.path())
+        .arg("--fail-on-new")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("not-run:lane:signed-hvf:zero executed tests")
+    );
+    r.phase = "signed".into();
+    let result = diff_trees(&r, &r, tree.path(), tree.path()).unwrap();
+    assert!(
+        result
+            .new
+            .contains(&"not-run:lane:signed-hvf:zero executed tests".into()),
+        "{result:?}"
+    );
+    std::fs::remove_file(dir.join("tests/probe.rs")).unwrap();
+    let counts = carrick_xtask::ci_receipt::lane_census(&r, tree.path()).unwrap();
+    assert_eq!(
+        counts["signed-hvf"], 0,
+        "a wildcard declaration with no integration targets still needs execution"
+    );
+}
+
+#[test]
+fn review_signed_build_diagnostics_reach_receipt() {
+    // Exercise the signed runner's Cargo output mode with a real link failure.
+    // This needs no VM, signing entitlement, network, or platform SDK.
+    let script = include_str!("../../../scripts/lib/test-signed-body.sh");
+    let build = script
+        .lines()
+        .find(|line| line.starts_with("cargo test -p \"$pkg\""))
+        .unwrap();
+    let format = build
+        .split_whitespace()
+        .find(|arg| arg.starts_with("--message-format="))
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname='libpython-map'\nversion='0.0.0'\nedition='2024'\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("src/lib.rs"), "#[test] fn missing_link() { unsafe extern \"C\" { fn carrick_receipt_missing_symbol(); } unsafe { carrick_receipt_missing_symbol(); } }\n").unwrap();
+    let output = Command::new("cargo")
+        .current_dir(dir.path())
+        .args(["test", "--offline", "--no-run", format])
+        .env_remove("CARGO_TARGET_DIR")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert!(log.contains("error: linking with"), "{log}");
+    let mut s = step("generic-probe-shards", false, &[]);
+    populate_step_from_log(&mut s, &log, &mut vec![]);
+    assert_cli_self_diff(&receipt(vec![s]), false, "build failure");
+}
+
+#[test]
+fn review_killed_without_a_binary_name_explains_its_exit() {
+    let mut s = step("probe-cases", false, &[]);
+    s.exit_code = Some(137);
+    populate_step_from_log(&mut s, "", &mut vec![]);
+    assert_cli_self_diff(&receipt(vec![s]), false, "exit Some(137)");
+}
+
+#[test]
+fn review_duplicate_binary_cannot_satisfy_two_lanes() {
+    let tree = tempfile::tempdir().unwrap();
+    for (package, lane) in [("first", "signed-hvf"), ("second", "host")] {
+        let dir = tree.path().join("crates").join(package);
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname='{package}'\n[package.metadata.carrick.test-lanes]\n'*'='{lane}'\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("tests/shared.rs"), "#[test] fn live() {}\n").unwrap();
+    }
+    let mut s = step("unit", true, &[]);
+    s.started_tests = vec!["shared::live".into()];
+    let mut r = receipt(vec![s]);
+    r.phase = "all".into();
+    let counts = carrick_xtask::ci_receipt::lane_census(&r, tree.path()).unwrap();
+    assert_eq!(counts["signed-hvf"], 0);
+    assert_eq!(counts["host"], 0);
+}
+
+#[test]
+fn review_inotify_population_ignores_diagnostic_preamble() {
+    let mut first = step("inotify09-el1", true, &[]);
+    let mut second = first.clone();
+    populate_step_from_log(
+        &mut first,
+        "inotify09.c:100: TPASS: watch succeeded\n",
+        &mut vec![],
+    );
+    populate_step_from_log(
+        &mut second,
+        "additional diagnostic\ninotify09.c:100: TPASS: watch succeeded\n",
+        &mut vec![],
+    );
+    assert!(
+        diff(&receipt(vec![first]), &receipt(vec![second]))
+            .unwrap()
+            .new
+            .is_empty()
+    );
+}
+
+#[test]
+fn review_partial_ltp_row_does_not_finish_a_killed_suite() {
+    let mut s = step("ltp", true, &[]);
+    populate_step_from_log(
+        &mut s,
+        "{\"name\":\"ltp-read01\",\"verdict\":\"timeout\",\"carrick\":{\"result\":\"truncated\",\"totals\":{\"passed\":1}}}\n",
+        &mut vec![],
+    );
+    assert_cli_self_diff(&receipt(vec![s]), false, "binary killed before reporting");
 }

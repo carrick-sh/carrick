@@ -483,7 +483,9 @@ if [ -n "${CARRICK_TEST_TARGET:-}" ]; then
         *) cargo_target_flags+=(--test entitlement_negative) ;;
     esac
 fi
-cargo test -p "$pkg" ${cargo_target_flags[@]+"${cargo_target_flags[@]}"} ${cargo_feature_flags[@]+"${cargo_feature_flags[@]}"} --release --no-run --message-format=json >"$json_log"
+# Render compiler diagnostics to stderr so build failures reach the gate log;
+# compiler-artifact records still go to the JSON executable inventory.
+cargo test -p "$pkg" ${cargo_target_flags[@]+"${cargo_target_flags[@]}"} ${cargo_feature_flags[@]+"${cargo_feature_flags[@]}"} --release --no-run --message-format=json-render-diagnostics >"$json_log"
 exes=()
 while IFS= read -r exe; do
     [ -n "$exe" ] && exes+=("$exe")

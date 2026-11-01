@@ -145,6 +145,19 @@ impl StepResult {
     /// Recompute from evidence, including old receipts, rather than trusting
     /// a candidate's declared outcome.
     pub fn execution_outcome(&self) -> StepOutcome {
+        if !self.requires_tests() {
+            return if self.passed
+                && self.failed_tests.is_empty()
+                && self.unitemized_failures.is_empty()
+                && self.unfinished_binaries.is_empty()
+            {
+                StepOutcome::Passed
+            } else {
+                StepOutcome::Failed {
+                    tests: self.failed_tests.clone(),
+                }
+            };
+        }
         let reason = if self
             .unitemized_failures
             .iter()
@@ -166,8 +179,10 @@ impl StepResult {
                         .is_some_and(|code| code == 124 || code >= 128)))
         {
             Some(format!(
-                "binary killed before reporting: {}",
-                self.unfinished_binaries.join(", ")
+                "binary killed before reporting: {} (exit {:?}; {})",
+                self.unfinished_binaries.join(", "),
+                self.exit_code,
+                self.unitemized_failures.join(", ")
             ))
         } else if self.requires_tests() && self.started_tests.is_empty() {
             Some("zero tests selected".into())
@@ -732,6 +747,8 @@ pub fn parse_test_log(log: &str) -> ParsedTestLog {
                 let binary = binary_stem_from_path(program);
                 unitemized_failures.insert(format!("crash:{binary}"));
             }
+        } else if trimmed.starts_with("error: linking with ") {
+            unitemized_failures.insert(format!("compile:{trimmed}"));
         } else if let Some(rest) = trimmed.strip_prefix("error: could not compile `") {
             let krate = rest.split('`').next().unwrap_or(rest);
             unitemized_failures.insert(format!("compile:{krate}"));
@@ -1000,6 +1017,14 @@ pub fn evaluate_el1_step(
     }
 }
 
+/// Steps intentionally outside the no-Docker profile's scope.
+pub const NO_DOCKER_EXCLUSIONS: &[&str] = &[
+    "conformance-probes-retained",
+    "ltp",
+    "inotify09-el1",
+    "inotify09-el0",
+];
+
 /// Populate `step` from its log and fail closed if the log contains
 /// `test result: FAILED` with empty itemization or unitemized/unfinished
 /// binary failures.
@@ -1010,6 +1035,57 @@ pub fn populate_step_from_log(step: &mut StepResult, log: &str, failures: &mut V
     step.started_tests = parsed.started_tests;
     step.finished_binaries = parsed.finished_binaries;
     step.unfinished_binaries = parsed.unfinished_binaries;
+    if step.name == "ltp" {
+        for line in log.lines() {
+            let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let Some(name) = row["name"].as_str() else {
+                continue;
+            };
+            if matches!(
+                row["carrick"]["result"].as_str(),
+                Some("none" | "truncated")
+            ) || matches!(
+                row["verdict"].as_str(),
+                Some("carrick_crash" | "timeout" | "budget_kill")
+            ) {
+                step.unfinished_binaries.push(format!("ltp::{name}"));
+                continue;
+            }
+            let totals = &row["carrick"]["totals"];
+            let executed: u64 = ["passed", "failed", "broken"]
+                .iter()
+                .filter_map(|key| totals[*key].as_u64())
+                .sum();
+            if executed > 0 {
+                step.started_tests.push(format!("ltp::{name}"));
+                step.finished_binaries.push(format!("ltp::{name}"));
+                // A differential MATCH may contain failures on both sides.
+                // Keep the conformance runner's gating decision authoritative.
+                if row["gating"].as_bool() == Some(true) {
+                    step.failed_tests.push(format!("ltp::{name}"));
+                }
+            }
+        }
+    } else if matches!(step.name.as_str(), "inotify09-el1" | "inotify09-el0") {
+        for (index, line) in log
+            .lines()
+            .filter(|line| {
+                line.contains("TPASS") || line.contains("TFAIL") || line.contains("TBROK")
+            })
+            .enumerate()
+        {
+            let test = format!("{}::result-{index}", step.name);
+            step.started_tests.push(test.clone());
+            if !line.contains("TPASS") {
+                step.failed_tests.push(test);
+            }
+        }
+        if !step.started_tests.is_empty() && step.exit_code == Some(0) {
+            step.finished_binaries.push(step.name.clone());
+        }
+    }
     if !step.passed
         && step.exit_code.is_none()
         && !step.unitemized_failures.iter().any(|u| u == "signal")
@@ -2178,10 +2254,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                 });
             }
         } else {
-            skipped_steps.push("conformance-probes-retained".to_string());
-            skipped_steps.push("ltp".to_string());
-            skipped_steps.push("inotify09-el1".to_string());
-            skipped_steps.push("inotify09-el0".to_string());
+            skipped_steps.extend(NO_DOCKER_EXCLUSIONS.iter().map(|s| (*s).to_owned()));
         }
 
         // Final check: Binary unchanged
@@ -2206,7 +2279,13 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
     // before computing `overall` so parse errors and unitemized failures flip
     // the gate verdict to FAIL.
     for step in &mut step_results {
-        let log = fs::read_to_string(&step.log_path).unwrap_or_default();
+        let mut log = fs::read_to_string(&step.log_path).unwrap_or_default();
+        if step.name == "ltp" {
+            log.push('\n');
+            log.push_str(
+                &fs::read_to_string(step.log_path.with_extension("jsonl")).unwrap_or_default(),
+            );
+        }
         populate_step_from_log(step, &log, &mut failures);
     }
     let overall = if failures.is_empty() { "PASS" } else { "FAIL" };
