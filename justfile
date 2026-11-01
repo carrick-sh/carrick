@@ -1450,9 +1450,49 @@ ci-changes:
 
 # Fail closed: GitHub considers skipped required jobs successful on their own.
 # ci-ok depends on every job; only the filter, draft-PR, or lower-layer gating can license skips.
+# Whether this Hosted CI run was superseded (#1283): a pull_request run
+# whose jobs all succeeded, were skipped or were cancelled (at least one
+# cancelled, none failed), while another pull_request run of this workflow
+# for the same head SHA, not itself cancelled or held for approval, began
+# its latest attempt after this attempt began. Newer means started later,
+# not a higher run id: re-running an older run rejoins the concurrency
+# group and cancels a run with a higher id (#1260's case).
+# Workflow concurrency cancels an older run when a newer one starts (a
+# draft PR marked ready while its CI runs), and that cancelled run's
+# `ci-ok` must not read as a failure of the head. Any other cancel, such
+# as a manual one or one on the newest run, is not superseded. Writes
+# `superseded=true|false` to $GITHUB_OUTPUT.
+ci-superseded:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${CI_NEEDS:?}" "${CI_RUN_ID:?}" "${CI_HEAD_SHA:?}" "${CI_REPOSITORY:?}" "${CI_EVENT:?}"
+    [[ "$CI_RUN_ID" =~ ^[0-9]+$ && "$CI_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+    superseded=false
+    # A failed job is never excused by supersession: only a run that was
+    # cancelled without failing anything can defer to a newer one.
+    if [[ "$CI_EVENT" == pull_request ]] && jq -e '
+        any(.[]; .result == "cancelled") and
+        all(.[]; .result == "success" or .result == "skipped" or .result == "cancelled")
+      ' <<< "$CI_NEEDS" > /dev/null; then
+        started=$(gh api "repos/$CI_REPOSITORY/actions/runs/$CI_RUN_ID" --jq .run_started_at)
+        [[ "$started" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
+        newer=$(gh api "repos/$CI_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$CI_HEAD_SHA&event=pull_request&per_page=100" \
+            --jq "[.workflow_runs[] | select(.id != $CI_RUN_ID and .event == \"pull_request\" and (.run_started_at // \"\") > \"$started\" and ((.conclusion // \"\") | IN(\"cancelled\", \"action_required\") | not))] | length")
+        if [[ "${newer:-0}" -gt 0 ]]; then
+            superseded=true
+            echo "::notice::This run was cancelled and superseded by a newer run on $CI_HEAD_SHA; that run's ci-ok decides the head."
+        fi
+    fi
+    echo "superseded=$superseded" >> "${GITHUB_OUTPUT:-/dev/null}"
+    echo "superseded=$superseded"
+
 ci-results:
     #!/usr/bin/env bash
     set -euo pipefail
+    if [[ "${CI_SUPERSEDED:-false}" == true ]]; then
+        echo "superseded by a newer run on the same head (#1283)"
+        exit 0
+    fi
     jq -e --arg event "${CI_EVENT:?}" --arg draft "${CI_DRAFT:-false}" --arg lower "${CI_LOWER_LAYER:-false}" '
       has("lint-clippy") and has("lint-gates") and has("xtask-tests-build") and has("loom") and
       .changes.result == "success" and

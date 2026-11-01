@@ -1810,6 +1810,10 @@ jobs:
       - cross-check-macos
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Reads this workflow's runs to recognize supersession (#1283).
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -1817,8 +1821,19 @@ jobs:
       - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: just
+      - name: Detect a run superseded on the same head
+        id: superseded
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_NEEDS: ${{ toJSON(needs) }}
+          CI_RUN_ID: ${{ github.run_id }}
+          CI_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          CI_REPOSITORY: ${{ github.repository }}
+          CI_EVENT: ${{ github.event_name }}
+        run: just ci-superseded
       - name: Require every applicable job to succeed
         env:
+          CI_SUPERSEDED: ${{ steps.superseded.outputs.superseded }}
           CI_EVENT: ${{ github.event_name }}
           CI_DRAFT: ${{ github.event.pull_request.draft }}
           CI_LOWER_LAYER: ${{ needs.changes.outputs.lower_layer }}
