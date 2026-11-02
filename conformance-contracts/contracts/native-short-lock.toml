@@ -22,6 +22,7 @@ rationale = "A short-lock holder can be host-descheduled. Its elapsed descheduli
 [bindings]
 vm_free = [
   "carrick-el1-linux::native_process_runtime::tests::bucket_contention_msgrcv",
+  "carrick-el1::substrate::sched::VacatedSlot compile-fail doctest (scheduler idle exits require the sealed leave-space proof; module move preserves the existing leave transition)",
 ]
 # Supplemental bindings in the same gated lib target:
 # bucket_contention_semtimedop

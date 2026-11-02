@@ -1068,50 +1068,14 @@ pub struct FakeRegs {
     pub fpcr: u64,
 }
 
-/// Leave a process's translations before releasing its installed occupancy.
-/// Service handoffs, scheduler idling and every idle exit to the host
-/// ([`El1Exit::Idle`]) use the same ordered transition. The result is the
-/// only constructor of [`VacatedSlot`].
-pub fn leave_space(zone: &ZoneTables, slot: SlotId, cpu: &mut impl ThreadCpu) -> VacatedSlot {
-    if zone.installed_space(slot) == 0 {
-        return VacatedSlot { slot };
-    }
-    let idle = zone.spaces.idle_ttbr();
-    if idle == 0 {
-        // No maintenance root is published, so EL1 never installed a space
-        // here (`enter_space` refuses without one): the word is a host
-        // installer's, released by its own occupancy.
-        return VacatedSlot { slot };
-    }
-    cpu.set_translation(idle, idle);
-    zone.release_space(slot);
-    VacatedSlot { slot }
-}
-
-/// Proof that `slot`'s vCPU holds no address space EL1 installed: its
-/// occupancy word is vacant and its live root is the maintenance root (or
-/// no maintenance root exists, so EL1 installed nothing). Only
-/// [`leave_space`] builds one; neither `Clone` nor `Copy`.
-///
-/// #1100: an idle exit that kept the word let the host's idle entry rewrite
-/// the vCPU's root to the maintenance root under a word still naming the
-/// space, and the next switch-in trusted the word and ran on the wrong root.
-#[must_use]
-#[derive(Debug, Eq, PartialEq)]
-pub struct VacatedSlot {
-    slot: SlotId,
-}
-
-impl VacatedSlot {
-    pub fn slot(&self) -> SlotId {
-        self.slot
-    }
-}
+#[path = "sched/vacate.rs"]
+mod vacate;
+pub use vacate::{VacatedSlot, leave_space};
 
 /// The one way an EL1 entry leaves for the vector. An idle exit (`hvc #5`:
-/// the vCPU leaves for the host with no thread on it) carries the proof that
-/// its slot was vacated, so no producer of an idle exit can leave an
-/// address space installed on a vCPU the host is about to re-root.
+/// the vCPU leaves for the host with no thread on it) carries proof that EL1
+/// relinquished its installed space. See [`VacatedSlot`] for the host-owned
+/// initialization cases; this does not attest an unconditional hardware read.
 #[must_use]
 #[derive(Debug, Eq, PartialEq)]
 pub enum El1Exit {

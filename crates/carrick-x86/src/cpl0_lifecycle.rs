@@ -225,6 +225,8 @@ impl ChildExitRecord {
 
 /// This CPU's executing CPL0 root: the lane's one reader of the live CR3,
 /// for the fork parent's root and the switch-in check (#1100, #1405).
+/// These reads authenticate execution roots; neither decides retirement or
+/// terminal custody. Keeping them here does not add a terminal-custody owner.
 #[cfg(target_os = "none")]
 fn lane_live_root() -> Option<RootGpa> {
     carrick_el1::isa::x86::hardware_live_root().ok()

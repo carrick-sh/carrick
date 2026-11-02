@@ -275,3 +275,30 @@ charges its retained entry and callback, refusal fold, scheduler yield and
 adapter retirement tails, including endpoint release and notification work.
 The existing 11,311-byte backing-reply ceiling and all other limits remain
 unchanged. Cumulative-overflow controls reject both new cold-path branches.
+
+### S1 review follow-up (#1426)
+
+The S1 review measured native backing reply at 11,134 / 11,311 bytes,
+leaving only 177 bytes. The ordinary Linux worker image reproduces that
+number. This is compiled stack evidence, not a performance measurement.
+Do not grow that chain on the assumption that its broad 12,288-byte limit
+provides room: its stricter retained-chain limit still applies.
+
+Before adding work on this chain, recover at least 1 KiB in the retained
+service/application prefix. Inventory the actual disassembly for both the
+ordinary image and the Linux and macOS clippy feature closures. First remove
+by-value copies of already owned service state: borrow the pending request
+and reply, and keep large owned payloads in their existing boxes. If a large
+local must move to the heap, initialize it in place rather than constructing
+an equally large stack temporary for `Box::new`. Keep descriptor application
+and physical settlement sequential; the aligned settlement wire buffer must
+not remain live beneath descriptor traversal. Charge any allocation descent
+in the same frame checker before claiming savings.
+
+Acceptance for that headroom work is an unchanged 11,311-byte ceiling with
+at least 1,024 bytes recovered in each supported feature closure, green
+native fault-reply application/cancellation/settlement tests, and the signed
+fault/COW witnesses on the exact rebuilt image. No headroom is claimed by
+this follow-up, which seals the idle proof and authenticates switch-in only.
+The paired `spawn_slope`/`fork_cow` performance experiment remains separate:
+the incomplete heavy-run population only suggests no measurable cost.
