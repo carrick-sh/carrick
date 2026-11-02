@@ -5,6 +5,7 @@
 #![cfg(target_arch = "x86_64")]
 
 pub mod apic;
+mod avx;
 pub mod block;
 pub mod cflow;
 pub mod context;

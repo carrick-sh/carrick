@@ -295,8 +295,8 @@ fn classify_insn(insn: &Instruction, next_va: u64) -> InsnClass {
             vector: insn.immediate8(),
         }),
         Mnemonic::Rdpmc => Some(SensitiveOp::Rdpmc),
-        Mnemonic::Ldmxcsr => Some(SensitiveOp::Ldmxcsr),
-        Mnemonic::Stmxcsr => Some(SensitiveOp::Stmxcsr),
+        Mnemonic::Ldmxcsr | Mnemonic::Vldmxcsr => Some(SensitiveOp::Ldmxcsr),
+        Mnemonic::Stmxcsr | Mnemonic::Vstmxcsr => Some(SensitiveOp::Stmxcsr),
         Mnemonic::Ud0 | Mnemonic::Ud1 | Mnemonic::Ud2 => return InsnClass::InvalidOpcode,
         Mnemonic::Iretq | Mnemonic::Iretd | Mnemonic::Iret => Some(SensitiveOp::Iretq),
         Mnemonic::Sysretq | Mnemonic::Sysret => Some(SensitiveOp::Sysret),
@@ -476,11 +476,13 @@ pub const fn is_memory_kind(kind: OpKind) -> bool {
 }
 
 /// Body admission is explicit. Checked helpers serve FP and implicit memory
-/// before native copying. No VEX/EVEX/XOP, x87 arithmetic, host state, unknown
+/// before native copying. AVX/AVX2 VEX uses the checked vector helper.
+/// No EVEX/XOP, x87 arithmetic, host state, unknown
 /// memory images, VSIB, or unchecked FP operations reach native execution.
 /// Unsupported Level 0 instructions produce guest #UD, never a native fault.
 #[rustfmt::skip]
 pub(crate) fn supported_body(insn: &Instruction) -> bool {
+    if crate::avx::supported(insn) { return true; }
     if insn.encoding() != iced_x86::EncodingKind::Legacy || insn.is_vsib() {
         return false;
     }
