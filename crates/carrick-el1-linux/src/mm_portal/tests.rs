@@ -5219,7 +5219,7 @@ fn grant_resume_reselects_exact_mapping_after_owner_edits_while_parked() {
         let access = portal.space_access(1).unwrap();
         access.raise(index);
         assert!(matches!(
-            grant_target(&portal, window, 0),
+            grant_target(&portal, &window, 0),
             Err(MmError::Wait(_))
         ));
         let source = carrick_el1_abi::HostBackingIdentity::new(

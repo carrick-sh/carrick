@@ -302,3 +302,54 @@ fault/COW witnesses on the exact rebuilt image. No headroom is claimed by
 this follow-up, which seals the idle proof and authenticates switch-in only.
 The paired `spawn_slope`/`fork_cow` performance experiment remains separate:
 the incomplete heavy-run population only suggests no measurable cost.
+
+### Native backing reply headroom recovery (#1426)
+
+The admission and completion phases now retain the existing boxed pending
+owner without keeping unrelated preparation locals beneath descriptor work.
+`prepare_service_inner` publishes that owner and returns the request before
+parking. `finish_service_result` handles exec and host-file results only after
+fault application returns. A fault that must wait reserves a boxed request
+snapshot before publishing its replacement wait; `prepare_fault_repark` fills
+it and returns before parking. The caller borrows that snapshot, rather than
+retaining a by-value `ServiceRequest` on its application frame. Grant targets
+also borrow the caller's authenticated immutable window on both ISAs.
+
+No descriptor/application/settlement ordering, cancellation identity, editor
+custody or four-level traversal bound changes. No allocation is added to the
+ordinary successful fault reply. The extra snapshot allocation is confined to
+reparking a reply on an MM owner wait, before queue acquisition or replacement
+publication. The checker charges allocation in that separate preparation
+phase as well as descriptor descent, and keeps the result-only phase charged
+in the service continuation envelope. Synthetic controls reject oversized
+admission, result and repark compositions independently.
+
+The ordinary image on the Linux x86 worker used 11,134 bytes before this
+change (177 bytes free). It now uses 10,206 bytes, leaving 1,105 bytes below
+the unchanged 11,311-byte retained ceiling. The checker reserves at least
+1,024 bytes beneath that ceiling, so later growth cannot silently spend the
+recovered reserve. The red baseline fails this reserve check; the final image
+passes it. These are compiled envelopes, not observed runtime stacks or
+performance measurements. Signed fault/COW execution remains a director gate.
+
+The largest baseline service/application frames were `begin_service_inner`
+(1,407 bytes including alignment slack), `apply_grant` (1,296),
+`apply_fault_reply` (960) and `finish_service` (831). The corresponding
+retained frames are now 320, 1,296, 688 and 319 bytes. Descriptor execution
+itself remains 592 bytes, with the same four-level recursive charge. The
+scheduler-resume prefix becomes the maximum after admission is separated;
+therefore the envelope reduction is 928 bytes, rather than the sum of all
+individual frame reductions.
+
+The allocator-control image also uses 10,206 bytes. Both Linux and macOS
+Clippy feature closures use 9,678 bytes (1,633 bytes free); the macOS ordinary
+cross-check uses 10,206. All pass the same reserve check.
+
+The complete Linux native suite exposed three L3 fixture assumptions missed
+by the earlier focused suites: concurrent exit-group retirement, unadopted
+thread exit wakeup and signal setup followed by a timed futex. All three
+passed on admitted main and failed before this recovery patch. Each fixture
+published an open MM but left the maintenance root zero while its fake CPU
+reported no live root. They now supply the same maintenance root as the other
+native wake fixtures, allowing the required reinstall through the real gate.
+Their original scheduling, retirement and deadline assertions are unchanged.

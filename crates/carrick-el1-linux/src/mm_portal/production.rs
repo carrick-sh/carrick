@@ -404,7 +404,7 @@ pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         nodes: None,
         zone: Some(zone),
     };
-    let target = match grant_target(&portal, window, u32::from(executor_slot.raw())) {
+    let target = match grant_target(&portal, &window, u32::from(executor_slot.raw())) {
         Ok(target) => target,
         Err(MmError::Wait(wait)) => {
             frame.x[0] = 11;

@@ -4535,6 +4535,9 @@ fn arm_call_with_cpu<X: ForkStockCrossing>(
 #[test]
 fn arm_signal_setup_then_timed_futex_keeps_its_deadline() {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    // The fake CPU starts without an observed live root. L3 must reinstall
+    // through the real space gate, which requires a maintenance root.
+    fixture.zone.spaces.set_idle_ttbr(0x30000);
     let mut service = fixture.process_service();
     let mut setup = carrick_el1_abi::TrapFrame::default();
     setup.x[8] = 134;
@@ -6984,6 +6987,9 @@ fn arm_closing_during_raw_exit_admission_settles_after_commit() {
 fn arm_unadopted_exit_wakes_closing_owner_without_process_venue() {
     use carrick_el1_abi::Lifecycle;
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    // The fake CPU starts without an observed live root. L3 must reinstall
+    // through the real space gate, which requires a maintenance root.
+    fixture.zone.spaces.set_idle_ttbr(0x30000);
     let (control, record) =
         imported_thread_with_identity(fixture, |identity| identity.generation = 0);
     let mut worker_service = fixture.process_service();
@@ -8164,6 +8170,9 @@ fn arm_concurrent_exit_group_loser_retires_and_wakes_owner() {
     use carrick_el1_abi::Lifecycle;
 
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    // The fake CPU starts without an observed live root. L3 must reinstall
+    // through the real space gate, which requires a maintenance root.
+    fixture.zone.spaces.set_idle_ttbr(0x30000);
     let slot2 = SlotId::new(1);
     fixture.zone.drive(slot2, 2);
     fixture.zone.publish_slot(slot2, 1, Some(1), 1);

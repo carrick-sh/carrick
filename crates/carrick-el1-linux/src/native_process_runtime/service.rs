@@ -730,6 +730,32 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         payload: ServicePayload,
         retry_syscall_after_supply: bool,
     ) -> Result<NativeResume, NativeProcessError> {
+        // Publish into the existing boxed pending owner before descending into
+        // completion. Admission's payload/manifests and rollback locals must
+        // unwind before a ready reply walks four descriptor-table levels.
+        let (request, adapter) = self.prepare_service_inner(
+            operation,
+            fault_sequence,
+            owner_wait,
+            payload,
+            retry_syscall_after_supply,
+        )?;
+        if let Some(wait) = owner_wait {
+            self.park_owner_wait(&request, wait)
+        } else {
+            self.park_service(&request, adapter)
+        }
+    }
+
+    #[inline(never)]
+    fn prepare_service_inner(
+        &mut self,
+        operation: ServiceOperation,
+        fault_sequence: Option<core::num::NonZeroU64>,
+        owner_wait: Option<carrick_core_abi::PortalOwnerWait>,
+        payload: ServicePayload,
+        retry_syscall_after_supply: bool,
+    ) -> Result<(ServiceRequest, bool), NativeProcessError> {
         self.service_phase = NativeServicePhase::Payload;
         let (payload, copyout, adapter) = match payload {
             ServicePayload::Copyout(output) => {
@@ -919,8 +945,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             })),
         );
         drop(owner_queue);
-        if let Some(wait) = owner_wait {
-            return self.park_owner_wait(&request, wait);
+        if owner_wait.is_some() {
+            return Ok((request, adapter));
         }
         self.service_phase = NativeServicePhase::Notice;
         if let Err(error) = self
@@ -956,7 +982,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 return Err(error);
             }
         }
-        self.park_service(&request, adapter)
+        Ok((request, adapter))
     }
 
     fn has_adapter_operation(&self) -> bool {
@@ -1944,7 +1970,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         request: &ServiceRequest,
         mut result: ServiceResult,
-        mut pending: Box<PendingService<'a>>,
+        pending: Box<PendingService<'a>>,
     ) -> Result<NativeResume, NativeProcessError> {
         self.service_phase = NativeServicePhase::Completion;
         if pending.request != *request {
@@ -1998,35 +2024,61 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             {
                 Ok(()) => {}
                 Err(carrick_core::mm::transaction::MmError::Wait(wait)) => {
-                    let key = ObjectWaitKey::native_service(self.record)
-                        .ok_or(NativeProcessError::Stale)?;
-                    let queue = self
-                        .source
-                        .zone
-                        .object_wait(key, &carrick_sched_core::ShortLockSpin)
-                        .map_err(|_| NativeProcessError::Stale)?;
-                    let next = self
-                        .control
-                        .service
-                        .begin_owner_wait(
-                            request.identity.birth,
-                            self.binding.generation,
-                            request.operation,
-                            wait,
-                        )
-                        .map_err(service_error)?;
-                    pending.request = next;
-                    pending.wait = Some(wait);
-                    self.runtime
-                        .graph
-                        .lock()
-                        .insert_member_wait(self.record, MemberWait::Service(pending));
-                    drop(queue);
+                    let next = self.prepare_fault_repark(request, pending, wait)?;
                     return self.park_owner_wait(&next, wait);
                 }
                 Err(_) => result = ServiceResult::Refused,
             }
         }
+        self.finish_service_result(request, result, pending, retry_syscall_after_supply)
+    }
+
+    #[inline(never)]
+    fn prepare_fault_repark(
+        &mut self,
+        request: &ServiceRequest,
+        mut pending: Box<PendingService<'a>>,
+        wait: carrick_core_abi::PortalOwnerWait,
+    ) -> Result<Box<ServiceRequest>, NativeProcessError> {
+        // Keep the retry snapshot off the caller's retained application frame.
+        // Reserve before publishing a replacement request or taking its queue.
+        let snapshot = FallibleBox::<ServiceRequest>::try_reserve()?;
+        let key = ObjectWaitKey::native_service(self.record).ok_or(NativeProcessError::Stale)?;
+        let queue = self
+            .source
+            .zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .map_err(|_| NativeProcessError::Stale)?;
+        let next = self
+            .control
+            .service
+            .begin_owner_wait(
+                request.identity.birth,
+                self.binding.generation,
+                request.operation,
+                wait,
+            )
+            .map_err(service_error)?;
+        pending.request = next;
+        pending.wait = Some(wait);
+        self.runtime
+            .graph
+            .lock()
+            .insert_member_wait(self.record, MemberWait::Service(pending));
+        drop(queue);
+        Ok(snapshot.put(next))
+    }
+
+    // Fault application above must not retain exec-close or host-file result
+    // locals. Pending payloads stay in their existing box across this boundary.
+    #[inline(never)]
+    fn finish_service_result(
+        &mut self,
+        request: &ServiceRequest,
+        result: ServiceResult,
+        mut pending: Box<PendingService<'a>>,
+        retry_syscall_after_supply: bool,
+    ) -> Result<NativeResume, NativeProcessError> {
         if let (ServiceOperation::Exec { .. }, ServiceResult::ExecPrepared(receipt)) =
             (request.operation, result)
         {

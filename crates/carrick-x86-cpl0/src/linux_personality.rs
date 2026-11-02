@@ -758,7 +758,7 @@ pub fn handle_user_page_fault_prepared(
                     Some(carrier) => carrier,
                     None => return 9,
                 },
-                window,
+                &window,
                 spaces,
                 binding.cpu_slot,
                 &mut root,
