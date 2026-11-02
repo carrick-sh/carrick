@@ -24,6 +24,7 @@ vm_free = [
   "carrick-x86-cpl0::file_region:: layout_alignment_capacity_and_extent, stdio_parity_and_closed_descriptor_stays_closed, record_beyond_fifteen_uses_shared_capacity, foreign_retired_and_two_carriers, fork_dup_lookup_and_retire_preserve_live_parent, unpublished_is_distinct_from_retired (all prefixed file_region_)",
   "carrick-el1-abi::tests::fd_map_waiter_does_no_rmw_while_lock_is_observed_held",
   "carrick-el1-abi::tests::an_image_built_against_another_layout_is_refused (shared ABI identity and EL1_NAME_CACHE_SIZE/alignment asserts include seqlock-backed InotifyNameCache; carrick-x86-cpl0::file_region::file_region_layout_alignment_capacity_and_extent re-verified; no new file-region custody or KVM claim)",
+  "carrick-x86-cpl0-host::cpl0_boot::birth_source_tests::bootstrap_metadata_records_are_disjoint_before_root_binding (bootstrap control-layout precondition for the existing KVM file-region fixtures; file-region storage and descriptor semantics unchanged)",
 ]
 
 [bindings.unresolved]

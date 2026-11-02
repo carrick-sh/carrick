@@ -58,11 +58,21 @@ pub const TASK_OFFSET: u64 = 0x9000;
 pub const CONTROL_OFFSET: u64 = 0xa000;
 pub const ROUTES_OFFSET: u64 = 0xd000;
 pub const SHOOTDOWN_OFFSET: u64 = 0xe000;
-pub const STRIDE: u64 = 0x100;
+// All three per-CPU record arrays use this stride. Derive it from the
+// control ABI: growing a member record must never overlap its live peer.
+pub const STRIDE: u64 = size_of::<ThreadControlSlot>().next_power_of_two() as u64;
 const _: () = {
     assert!(INITIAL_ARENA_ALIGNMENT.is_power_of_two());
     assert!(INITIAL_ARENA_ALIGNMENT.is_multiple_of(4096));
     assert!(size_of::<CpuBinding>() <= STRIDE as usize);
+    assert!(size_of::<CurrentTask>() <= STRIDE as usize);
+    assert!(size_of::<ThreadControlSlot>() <= STRIDE as usize);
+    assert!(STRIDE.is_multiple_of(align_of::<CpuBinding>() as u64));
+    assert!(STRIDE.is_multiple_of(align_of::<CurrentTask>() as u64));
+    assert!(STRIDE.is_multiple_of(align_of::<ThreadControlSlot>() as u64));
+    assert!(BINDING_OFFSET + 2 * STRIDE <= TASK_OFFSET);
+    assert!(TASK_OFFSET + 2 * STRIDE <= CONTROL_OFFSET);
+    assert!(CONTROL_OFFSET + 2 * STRIDE <= 0xb000);
     assert!(ROUTES_OFFSET >= 0xc000 + 9 * size_of::<ThreadControlSlot>() as u64);
     assert!(ROUTES_OFFSET + size_of::<PublishedApicIds>() as u64 <= SHOOTDOWN_OFFSET);
     assert!(SHOOTDOWN_OFFSET + size_of::<ShootdownTable>() as u64 <= COUNTERS_OFFSET);
@@ -3989,6 +3999,75 @@ mod birth_source_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use carrick_hal::birth_serial::{BirthSerialSource, BirthSourceError, BirthSourceIdentity};
+
+    #[test]
+    fn bootstrap_metadata_records_are_disjoint_before_root_binding() {
+        // The stopped carrier initializes both CPUs before rebinding CPU 0.
+        // Every record must fit its stride or CPU 1 corrupts CPU 0 custody.
+        for (offset, size, next) in [
+            (BINDING_OFFSET, size_of::<CpuBinding>() as u64, TASK_OFFSET),
+            (TASK_OFFSET, size_of::<CurrentTask>() as u64, CONTROL_OFFSET),
+            (
+                CONTROL_OFFSET,
+                size_of::<ThreadControlSlot>() as u64,
+                0xb000,
+            ),
+        ] {
+            assert!(
+                size <= STRIDE,
+                "record at {offset:#x}: {size} bytes exceed stride {STRIDE}"
+            );
+            assert!(offset + STRIDE + size <= next);
+        }
+        let mut ram = GuestRam::new();
+        ram.add_window(
+            META_GPA,
+            META_LEN as usize,
+            crate::guest_ram::WindowKind::Shared,
+        )
+        .unwrap();
+        for index in 0..2 {
+            let ptr = ram
+                .host_ptr(
+                    META_GPA + CONTROL_OFFSET + index * STRIDE,
+                    size_of::<ThreadControlSlot>(),
+                )
+                .unwrap()
+                .cast::<ThreadControlSlot>();
+            // SAFETY: private stopped backing, aligned and disjoint by the
+            // layout assertions above, exactly as in carrier bootstrap.
+            unsafe { ptr.write(ThreadControlSlot::new()) };
+            // SAFETY: initialized above, retained by ram until the test ends.
+            let control = unsafe { &*ptr };
+            control
+                .reset_for_host_birth(carrick_el1_abi::BlockedMask(0))
+                .unwrap();
+            assert!(control.publish_visible_tid(41 + index as u32));
+        }
+        let control = |index| {
+            let ptr = ram
+                .host_ptr(
+                    META_GPA + CONTROL_OFFSET + index * STRIDE,
+                    size_of::<ThreadControlSlot>(),
+                )
+                .unwrap()
+                .cast::<ThreadControlSlot>();
+            // SAFETY: initialized, aligned disjoint records retained by ram.
+            unsafe { &*ptr }
+        };
+        // Root admission resets CPU 0 after both provisional controls exist.
+        control(0)
+            .reset_for_host_birth(carrick_el1_abi::BlockedMask(0))
+            .unwrap();
+        assert!(control(0).publish_visible_tid(7));
+        assert_eq!(control(0).visible_tid(), Some(7));
+        assert_eq!(control(1).visible_tid(), Some(42));
+        control(1)
+            .reset_for_host_birth(carrick_el1_abi::BlockedMask(0))
+            .unwrap();
+        assert_eq!(control(0).visible_tid(), Some(7));
+    }
+
     fn source() -> (BirthSourceRevocation, PhysicalBirthSource) {
         let mut ram = GuestRam::new();
         ram.add_window(
