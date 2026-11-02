@@ -1961,83 +1961,158 @@ fn retire_agent_with(command: &mut Command, user: &str) -> Result<(), ScalerErro
     )))
 }
 
+/// `PF_EXITING` from the kernel's task flags (`/proc/<pid>/stat` field 9,
+/// a stable ABI bit since Linux 2.x): the task is inside `do_exit` and
+/// never returns to user space.
+const PF_EXITING: u64 = 0x4;
 /// One process the retirement census found (#1286), read from
-/// `/proc/<pid>/stat`.
+/// `/proc/<pid>/stat` and `/proc/<pid>/task/*/stat`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CensusEntry {
     pid: libc::pid_t,
     state: char,
     parent: libc::pid_t,
     command: String,
-    /// A thread of this process is in a live state: a zombie thread-group
-    /// leader whose other threads still run is not dead.
-    live_thread: bool,
+    /// Kernel task flags of the thread-group leader.
+    flags: u64,
+    /// Threads of this process that can still return to user space, as
+    /// `"<tid> <state>"` (plus `kill-pending` when SIGKILL is queued for
+    /// them). Empty means the process can never run agent code again.
+    live_threads: Vec<String>,
 }
 impl CensusEntry {
     fn describe(&self) -> String {
-        format!(
+        let mut text = format!(
             "pid {} `{}` state {} parent {}",
             self.pid, self.command, self.state, self.parent
-        )
+        );
+        if !self.live_threads.is_empty() {
+            text.push_str(&format!(
+                " (live threads: {})",
+                self.live_threads.join(", ")
+            ));
+        }
+        text
     }
 }
-/// The census entry for `pid`, or `None` only once the process is gone
-/// (`/proc/<pid>` not found). Anything unreadable or unparseable is a
-/// survivor: the census fails closed (#1286 review).
+/// The census entry for `pid`, or `None` only once the process is gone.
 fn census_entry(pid: libc::pid_t) -> Option<CensusEntry> {
+    census_entry_in(Path::new("/proc"), pid)
+}
+/// [`census_entry`] against a procfs root. Only "not found" (or `ESRCH`,
+/// what procfs returns for a task released between listing and reading)
+/// means gone; anything else unreadable or unparseable is a live survivor,
+/// so the census fails closed (#1286 review).
+///
+/// A process is live while any of its threads can return to user space:
+/// a thread in a live state that isn't already inside `do_exit`. A zombie
+/// leader whose remaining threads are all exiting (#1443: `codex` left
+/// `state Z` after SIGKILL while a thread finished its exit) holds no code
+/// that can write anything new; its parent reaps it once the exit ends.
+fn census_entry_in(proc: &Path, pid: libc::pid_t) -> Option<CensusEntry> {
+    let gone = |error: &std::io::Error| {
+        error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+    };
     let unverified = |why: &str| CensusEntry {
         pid,
         state: '?',
         parent: 0,
         command: format!("<{why}>"),
-        live_thread: true,
+        flags: 0,
+        live_threads: vec![format!("{pid} <{why}>")],
     };
-    let stat = match std::fs::read(format!("/proc/{pid}/stat")) {
+    let root = proc.join(pid.to_string());
+    let stat = match std::fs::read(root.join("stat")) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) if gone(&error) => return None,
         Err(_) => return Some(unverified("stat unreadable")),
     };
     let Some(mut entry) = parse_stat(pid, &String::from_utf8_lossy(&stat)) else {
         return Some(unverified("stat unparseable"));
     };
-    if entry.state == 'Z' {
-        entry.live_thread = match std::fs::read_dir(format!("/proc/{pid}/task")) {
-            Ok(tasks) => tasks.flatten().any(|task| {
-                std::fs::read(task.path().join("stat")).map_or(true, |bytes| {
-                    parse_stat(pid, &String::from_utf8_lossy(&bytes))
-                        .is_none_or(|thread| !matches!(thread.state, 'Z' | 'X' | 'x'))
-                })
-            }),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(_) => true,
+    let tasks = match std::fs::read_dir(root.join("task")) {
+        Ok(tasks) => tasks,
+        Err(error) if gone(&error) => return None,
+        Err(_) => {
+            entry.live_threads = vec![format!("{pid} <tasks unreadable>")];
+            return Some(entry);
+        }
+    };
+    for task in tasks {
+        let Ok(task) = task else {
+            entry
+                .live_threads
+                .push(format!("{pid} <task list unreadable>"));
+            continue;
         };
+        let tid = task.file_name().to_string_lossy().into_owned();
+        let thread = match std::fs::read(task.path().join("stat")) {
+            Ok(bytes) => parse_stat(pid, &String::from_utf8_lossy(&bytes)),
+            Err(error) if gone(&error) => continue,
+            Err(_) => {
+                entry.live_threads.push(format!("{tid} <stat unreadable>"));
+                continue;
+            }
+        };
+        let Some(thread) = thread else {
+            entry.live_threads.push(format!("{tid} <stat unparseable>"));
+            continue;
+        };
+        if matches!(thread.state, 'Z' | 'X' | 'x') || thread.flags & PF_EXITING != 0 {
+            continue;
+        }
+        let pending = std::fs::read_to_string(task.path().join("status"))
+            .ok()
+            .is_some_and(|status| kill_pending(&status));
+        entry.live_threads.push(format!(
+            "{tid} {}{}",
+            thread.state,
+            if pending { " kill-pending" } else { "" }
+        ));
     }
     Some(entry)
 }
-/// `/proc/<pid>/stat`: `pid (comm) state ppid ...`; `comm` may hold spaces
-/// and parentheses, so it ends at the last `)`.
+/// SIGKILL is queued for the thread (`SigPnd`) or its group (`ShdPnd`):
+/// diagnostic only, it says a live thread is stuck in an uninterruptible
+/// call rather than never signalled.
+fn kill_pending(status: &str) -> bool {
+    const SIGKILL_BIT: u64 = 1 << (libc::SIGKILL - 1);
+    status.lines().any(|line| {
+        ["SigPnd:", "ShdPnd:"].iter().any(|key| {
+            line.strip_prefix(key)
+                .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+                .is_some_and(|mask| mask & SIGKILL_BIT != 0)
+        })
+    })
+}
+/// `/proc/<pid>/stat`: `pid (comm) state ppid pgrp session tty_nr tpgid
+/// flags ...`; `comm` may hold spaces and parentheses, so it ends at the
+/// last `)`.
 fn parse_stat(pid: libc::pid_t, stat: &str) -> Option<CensusEntry> {
     let open = stat.find('(')?;
     let close = stat.rfind(')')?;
     let mut rest = stat.get(close + 1..)?.split_whitespace();
     let state = rest.next()?.chars().next()?;
     let parent = rest.next()?.parse().ok()?;
+    let flags = rest.nth(4)?.parse().ok()?;
     Some(CensusEntry {
         pid,
         state,
         parent,
         command: stat.get(open + 1..close)?.to_owned(),
-        live_thread: false,
+        flags,
+        live_threads: Vec::new(),
     })
 }
-/// The census entries that can still run (#1286). After the helper's
-/// SIGKILL the agent uid can't run anything; a zombie (`Z`) or a fully
-/// dead (`X`) entry holds no code that could write the worktree, only a
-/// pid its parent has yet to reap, so it doesn't block packaging.
+/// The census entries that can still run (#1286, #1443). After the
+/// helper's SIGKILL the agent uid can't start anything new; a process all
+/// of whose threads are dead (`Z`, `X`) or already inside `do_exit` holds
+/// no code that could write the worktree, only a pid its parent has yet
+/// to reap, so it doesn't block packaging.
 fn live_survivors(entries: Vec<CensusEntry>) -> Vec<CensusEntry> {
     let mut live: Vec<CensusEntry> = entries
         .into_iter()
-        .filter(|entry| entry.live_thread || !matches!(entry.state, 'Z' | 'X' | 'x'))
+        .filter(|entry| !entry.live_threads.is_empty())
         .collect();
     live.sort_by_key(|entry| entry.pid);
     live.dedup_by_key(|entry| entry.pid);
@@ -6084,11 +6159,31 @@ pub(crate) mod chain_fixture {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    /// A fixture procfs: `(tid, stat, status)` per thread of `pid`.
+    fn fake_proc(root: &Path, pid: i32, leader: &str, threads: &[(i32, &str, &str)]) {
+        let dir = root.join(pid.to_string());
+        std::fs::create_dir_all(dir.join("task")).unwrap();
+        std::fs::write(dir.join("stat"), leader).unwrap();
+        for (tid, stat, status) in threads {
+            let task = dir.join("task").join(tid.to_string());
+            std::fs::create_dir(&task).unwrap();
+            std::fs::write(task.join("stat"), stat).unwrap();
+            std::fs::write(task.join("status"), status).unwrap();
+        }
+    }
     /// #1286: only a process that can still run blocks packaging; a zombie
     /// left for another parent to reap does not. Survivors are named.
     #[test]
     fn retirement_census_ignores_zombies_and_names_live_survivors() {
-        let zombie = parse_stat(41, "41 (cargo) Z 1 41 41 0 -1").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let proc = temp.path();
+        fake_proc(
+            proc,
+            41,
+            "41 (cargo) Z 1 41 41 0 -1 4194692",
+            &[(41, "41 (cargo) Z 1 41 41 0 -1 4194692", "")],
+        );
+        let zombie = census_entry_in(proc, 41).unwrap();
         assert_eq!(
             zombie,
             CensusEntry {
@@ -6096,11 +6191,19 @@ mod tests {
                 state: 'Z',
                 parent: 1,
                 command: "cargo".into(),
-                live_thread: false,
+                flags: 4194692,
+                live_threads: Vec::new(),
             }
         );
         // A command name can hold spaces and parentheses.
-        let odd = parse_stat(42, "42 (rustc (worker) 2) D 40 42 42 0 -1").unwrap();
+        let odd_stat = "42 (rustc (worker) 2) D 40 42 42 0 -1 4194560";
+        fake_proc(
+            proc,
+            42,
+            odd_stat,
+            &[(42, odd_stat, "SigPnd:\t0000000000000000\n")],
+        );
+        let odd = census_entry_in(proc, 42).unwrap();
         assert_eq!(
             (odd.command.as_str(), odd.state, odd.parent),
             ("rustc (worker) 2", 'D', 40)
@@ -6110,17 +6213,146 @@ mod tests {
         assert_eq!(live.len(), 1);
         assert_eq!(
             live[0].describe(),
-            "pid 42 `rustc (worker) 2` state D parent 40"
+            "pid 42 `rustc (worker) 2` state D parent 40 (live threads: 42 D)"
         );
         assert!(parse_stat(43, "garbage").is_none());
-        // A zombie leader whose other threads still run is a survivor.
-        let leader = CensusEntry {
-            live_thread: true,
-            ..parse_stat(44, "44 (worker) Z 1 44 44 0 -1").unwrap()
-        };
-        assert_eq!(live_survivors(vec![leader]).len(), 1);
+        // A stat without the flags field is unparseable: a survivor.
+        std::fs::create_dir_all(proc.join("43")).unwrap();
+        std::fs::write(proc.join("43/stat"), "43 (short) Z 1 43 43 0 -1").unwrap();
+        assert_eq!(
+            live_survivors(vec![census_entry_in(proc, 43).unwrap()]).len(),
+            1
+        );
+        // A zombie leader whose other thread can still run is a survivor.
+        fake_proc(
+            proc,
+            44,
+            "44 (worker) Z 1 44 44 0 -1 4194692",
+            &[
+                (44, "44 (worker) Z 1 44 44 0 -1 4194692", ""),
+                (
+                    45,
+                    "45 (tokio-rt) S 1 44 44 0 -1 4194368",
+                    "SigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\n",
+                ),
+            ],
+        );
+        let leader = live_survivors(vec![census_entry_in(proc, 44).unwrap()]);
+        assert_eq!(
+            leader[0].describe(),
+            "pid 44 `worker` state Z parent 1 (live threads: 45 S)"
+        );
         // Gone means only "not found": a pid that can't exist is gone.
         assert!(census_entry(libc::pid_t::MAX).is_none());
+        assert!(census_entry_in(proc, 99).is_none());
+    }
+    /// #1443: run 41473585654 refused #1420's round on `pid 5777 codex
+    /// state Z parent 3855`, a zombie leader the census kept because a
+    /// thread was still finishing its exit after SIGKILL. A thread inside
+    /// `do_exit` (`PF_EXITING`) never returns to user space, so it no
+    /// longer blocks packaging; a thread that hasn't entered its exit
+    /// still does, and is named with whether SIGKILL is pending for it.
+    #[test]
+    fn retirement_census_retires_threads_already_inside_their_exit() {
+        let temp = tempfile::tempdir().unwrap();
+        let proc = temp.path();
+        // Leader reaped into Z, one thread still in `do_exit` (flags has
+        // PF_EXITING, 0x4): retired.
+        fake_proc(
+            proc,
+            5777,
+            "5777 (codex) Z 3855 5777 5777 0 -1 4194828",
+            &[
+                (5777, "5777 (codex) Z 3855 5777 5777 0 -1 4194828", ""),
+                (
+                    5790,
+                    "5790 (tokio-runtime-w) D 3855 5777 5777 0 -1 4194372",
+                    "SigPnd:\t0000000000000000\n",
+                ),
+            ],
+        );
+        let exiting = census_entry_in(proc, 5777).unwrap();
+        assert!(live_survivors(vec![exiting]).is_empty());
+        // A process that is not a zombie but whose every thread is inside
+        // its exit is retired too.
+        fake_proc(
+            proc,
+            5800,
+            "5800 (codex) D 3855 5800 5800 0 -1 4194372",
+            &[(5800, "5800 (codex) D 3855 5800 5800 0 -1 4194372", "")],
+        );
+        assert!(live_survivors(vec![census_entry_in(proc, 5800).unwrap()]).is_empty());
+        // A thread blocked uninterruptibly before its exit can still finish
+        // the call it is in: it stays a survivor, named as kill-pending.
+        fake_proc(
+            proc,
+            5900,
+            "5900 (codex) Z 3855 5900 5900 0 -1 4194828",
+            &[
+                (5900, "5900 (codex) Z 3855 5900 5900 0 -1 4194828", ""),
+                (
+                    5901,
+                    "5901 (sqlite) D 3855 5900 5900 0 -1 4194368",
+                    "SigPnd:\t0000000000000100\n",
+                ),
+            ],
+        );
+        let stuck = live_survivors(vec![census_entry_in(proc, 5900).unwrap()]);
+        assert_eq!(
+            stuck[0].describe(),
+            "pid 5900 `codex` state Z parent 3855 (live threads: 5901 D kill-pending)"
+        );
+        // A thread released between listing and reading is gone, not live.
+        fake_proc(
+            proc,
+            6000,
+            "6000 (codex) Z 3855 6000 6000 0 -1 4194828",
+            &[(6000, "6000 (codex) Z 3855 6000 6000 0 -1 4194828", "")],
+        );
+        std::fs::create_dir(proc.join("6000/task/6001")).unwrap();
+        assert!(live_survivors(vec![census_entry_in(proc, 6000).unwrap()]).is_empty());
+    }
+    /// #1443 brief: a probe-like leader starts a grandchild in its own
+    /// session, the leader is killed and the grandchild exits; the zombie
+    /// left for this subreaper is retired by the production census.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn serial_host_census_retires_an_orphaned_probe_zombie() {
+        // SAFETY: serial_host fixture; it reaps only the pids it creates.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+        let mut leader = Command::new("/bin/sh")
+            .args(["-c", "setsid /bin/sh -c 'sleep 0.3' & echo $!; sleep 30"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(leader.stdout.take().unwrap()),
+            &mut line,
+        )
+        .unwrap();
+        let grandchild: libc::pid_t = line.trim().parse().unwrap();
+        leader.kill().unwrap();
+        leader.wait().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while census_entry(grandchild).is_some_and(|entry| entry.state != 'Z') {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grandchild did not exit"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let entry = census_entry(grandchild).expect("orphaned zombie is listed until reaped");
+        assert_eq!(
+            (entry.state, entry.parent),
+            ('Z', std::process::id() as libc::pid_t)
+        );
+        assert!(live_survivors(vec![entry]).is_empty());
+        // SAFETY: this fixture adopted the grandchild; reap only it.
+        assert_eq!(
+            unsafe { libc::waitpid(grandchild, std::ptr::null_mut(), 0) },
+            grandchild
+        );
     }
     /// #1229: a running agent's output reaches the step log while it runs,
     /// through the production serve loop, masked, line by line, with a
