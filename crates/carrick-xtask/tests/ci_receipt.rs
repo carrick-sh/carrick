@@ -1460,6 +1460,46 @@ fn retirement_refuses_macro_generated_tests_anywhere_in_candidate_crate() {
 }
 
 #[test]
+fn retirement_accepts_global_asm_items_which_cannot_generate_tests() {
+    // `global_asm!` emits assembly only; it can't define a Rust test. A crate
+    // with a `global_asm!` item (carrick-el1-linux's entry stub) must still be
+    // able to retire a renamed test (#1409).
+    for item in [
+        "core::arch::global_asm!(\".text\");",
+        "std::arch::global_asm!(\".text\");",
+        "global_asm!(\".text\");",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let cand = dir.path().join("cand");
+        write_source(&base, "crates/example/tests/foo.rs", "#[test] fn gone() {}");
+        write_source(&cand, "crates/example/tests/foo.rs", "");
+        write_source(&cand, "crates/example/src/lib.rs", item);
+        let diff = diff_with_retired(
+            &cpl0_receipt(&["foo::gone"], &[]),
+            &cpl0_receipt(&[], &[]),
+            &[retirement("foo::gone", None)],
+            &base,
+            &cand,
+        )
+        .unwrap_or_else(|error| panic!("{item}: {error}"));
+        assert!(
+            !format!("{diff:?}").contains("missing:foo::gone"),
+            "{item}: retirement not applied: {diff:?}"
+        );
+    }
+}
+
+#[test]
+fn retirement_still_refuses_other_item_macros_named_like_asm() {
+    assert_candidate_scan_refuses(
+        "crates/example/src/lib.rs",
+        "my_crate::global_asm_tests!(gone);",
+        None,
+    );
+}
+
+#[test]
 fn retirement_refuses_path_modules_anywhere_in_candidate_crate() {
     assert_candidate_scan_refuses(
         "crates/example/src/lib.rs",
