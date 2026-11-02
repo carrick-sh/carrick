@@ -52,16 +52,20 @@ pub fn capture(suite: &Suite, run_id: &str, platform: DockerPlatform) -> anyhow:
     let original = argv::docker_argv(suite, run_id, platform);
     let image = original
         .iter()
-        .rposition(|arg| arg == &suite.image)
+        .rposition(|arg| arg == suite.image.as_str())
         .ok_or_else(|| anyhow::anyhow!("Docker argv lacks image"))?;
-    anyhow::ensure!(image + 1 < original.len(), "shape requires an explicit suite command");
+    anyhow::ensure!(
+        image + 1 < original.len(),
+        "shape requires an explicit suite command"
+    );
     let mut command = Vec::new();
     if let Some(entrypoint) = suite
         .entrypoint
         .as_ref()
         .and_then(|entry| entry.for_docker())
+        .filter(|entrypoint| !entrypoint.is_empty())
     {
-        if !entrypoint.is_empty() { command.push(entrypoint); }
+        command.push(entrypoint);
     }
     if suite
         .entrypoint
