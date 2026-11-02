@@ -7,6 +7,9 @@ use std::time::{Duration, Instant};
 
 // JSON can encode each byte of an admitted 8 KiB string as six bytes.
 const REQUEST_BYTES: u64 = 64 * 1024;
+/// Live capacity probes per `capacity()` call: the first, and one retry
+/// after a failure (#1456).
+const CAPACITY_PROBE_ATTEMPTS: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -738,7 +741,15 @@ fn capacity_command(actor: &Path, args: &[&str]) -> Command {
         );
     account_command(&command, AGENT_USER, actor, None)
 }
-fn capacity_output(actor: &Path, args: &[&str], deadline: Instant) -> Result<String, ScalerError> {
+/// Runs one launcher subcommand as the agent account. The outer error is a
+/// refusal of the probe machinery itself (oversized output, an agent account
+/// that will not retire) and always propagates; the inner error is the
+/// subcommand's own failure, which a caller may confine to one backend.
+fn capacity_output(
+    actor: &Path,
+    args: &[&str],
+    deadline: Instant,
+) -> Result<Result<String, String>, ScalerError> {
     let logs = tempfile::tempdir()?;
     let stdout = logs.path().join("out");
     let stderr = logs.path().join("err");
@@ -750,7 +761,7 @@ fn capacity_output(actor: &Path, args: &[&str], deadline: Instant) -> Result<Str
         &mut command,
         deadline
             .saturating_duration_since(Instant::now())
-            .min(Duration::from_secs(120)),
+            .min(CAPACITY_COMMAND_LIMIT),
         AGENT_USER,
         || {
             for path in [&stdout, &stderr] {
@@ -762,10 +773,47 @@ fn capacity_output(actor: &Path, args: &[&str], deadline: Instant) -> Result<Str
         },
     );
     cleanup_agent_user()?;
-    if result? != 0 {
-        return Err(ScalerError::Guard("live capacity query failed"));
+    let status = result?;
+    if status != 0 {
+        // The launcher's stderr names the provider failure; it goes to the
+        // run's loop log (redacted), never to the coordinator (#1456).
+        let diagnostics = crate::safe_copy::text(&stderr, REQUEST_BYTES).unwrap_or_default();
+        let (refusal, event) = capacity_failure(args, status, &diagnostics);
+        let _ = loop_log(event);
+        return Ok(Err(refusal));
     }
-    Ok(crate::safe_copy::text(&stdout, REQUEST_BYTES)?)
+    Ok(Ok(crate::safe_copy::text(&stdout, REQUEST_BYTES)?))
+}
+/// One probe subprocess's whole budget. It must exceed the launcher's own
+/// worst case so the launcher's graceful degradation runs first: agy-director
+/// 3.3.1's `capacity --json` waits up to 30 s for codex rate limits and 60 s
+/// for agy `/usage`, each plus up to 15 s to kill the timed-out group, and
+/// then reports that quota as unknown. A 120 s cap killed that slow but
+/// healthy probe and read it as a failure (#1456).
+const CAPACITY_COMMAND_LIMIT: Duration = Duration::from_secs(180);
+/// Bytes of the launcher's stderr kept in the loop log for a failed probe.
+const CAPACITY_STDERR_TAIL: usize = 2048;
+/// The coordinator's refusal for a failed probe subprocess, and the loop-log
+/// event that keeps its diagnostics. The refusal names only the subcommand and
+/// how it ended: provider output stays out of the coordinator's context.
+fn capacity_failure(args: &[&str], status: i32, stderr: &str) -> (String, Value) {
+    let command = args.join(" ");
+    let ended = if status == 124 {
+        format!("timed out after {} s", CAPACITY_COMMAND_LIMIT.as_secs())
+    } else {
+        format!("exited with status {status}")
+    };
+    let mut start = stderr.len().saturating_sub(CAPACITY_STDERR_TAIL);
+    while !stderr.is_char_boundary(start) {
+        start += 1;
+    }
+    (
+        format!(
+            "live capacity query failed: `{command}` {ended}; this is a probe failure, not a capacity reading"
+        ),
+        json!({"phase":"capacity-command","command":command,"status":status,
+            "outcome":ended,"stderr_tail":&stderr[start..]}),
+    )
 }
 fn roster(text: &str) -> Vec<Value> {
     text.lines()
@@ -800,8 +848,9 @@ fn read_capacity(deadline: Instant) -> Result<Value, ScalerError> {
         )?;
     }
     hand_over(&actor)?;
-    let raw: Value =
-        serde_json::from_str(&capacity_output(&actor, &["capacity", "--json"], deadline)?)?;
+    let raw: Value = serde_json::from_str(
+        &capacity_output(&actor, &["capacity", "--json"], deadline)?.map_err(ScalerError::Usage)?,
+    )?;
     let backends = raw["backends"]
         .as_object()
         .ok_or(ScalerError::Guard("invalid capacity_report"))?;
@@ -816,25 +865,29 @@ fn read_capacity(deadline: Instant) -> Result<Value, ScalerError> {
             "home/.gemini/antigravity-cli/antigravity-oauth-token"
         };
         let installed = entry["installed"] == true && state.join(credential).is_file();
-        let models = if installed {
-            roster(&capacity_output(
-                &actor,
-                &["models", "--backend", backend],
-                deadline,
-            )?)
-            .into_iter()
-            .filter(|id| {
-                id.as_str().is_some_and(|id| {
-                    if backend == "codex" {
-                        id.starts_with("gpt-")
-                    } else {
-                        id.starts_with("gemini-")
-                            || id.starts_with("claude-")
-                            || id.starts_with("gpt-oss")
-                    }
+        // One backend's roster failure must not hide the other backend's
+        // capacity (#1456): a backend without a live roster lists no
+        // models, so `available_worker` refuses only that backend.
+        let listed = if installed {
+            capacity_output(&actor, &["models", "--backend", backend], deadline)?.ok()
+        } else {
+            None
+        };
+        let models = if let Some(listed) = &listed {
+            roster(listed)
+                .into_iter()
+                .filter(|id| {
+                    id.as_str().is_some_and(|id| {
+                        if backend == "codex" {
+                            id.starts_with("gpt-")
+                        } else {
+                            id.starts_with("gemini-")
+                                || id.starts_with("claude-")
+                                || id.starts_with("gpt-oss")
+                        }
+                    })
                 })
-            })
-            .collect::<Vec<_>>()
+                .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
@@ -860,7 +913,8 @@ fn read_capacity(deadline: Instant) -> Result<Value, ScalerError> {
             .collect::<serde_json::Map<_, _>>();
         report.insert(backend.to_owned(), json!({"installed":installed,"free_slots":entry["free_slots"].as_u64(),
             "quota_free":entry["quota_free"].as_f64(),"score":entry["score"].as_f64(),"quota":{"groups":groups},
-            "group_scores":group_scores,"models":models}));
+            "group_scores":group_scores,"models":models,
+            "roster":if installed && listed.is_none() { "unavailable" } else { "live" }}));
     }
     let report = json!({"backends":report});
     if serde_json::to_vec(&report)?.len() > REQUEST_BYTES as usize {
@@ -2406,17 +2460,33 @@ impl Server<'_> {
             return Ok(report.clone());
         }
         self.capacity = None;
-        if self.used.capacity_probes
-            >= self
-                .policy
-                .workers
-                .saturating_add(self.policy.refused_workers)
-        {
+        let budget = self
+            .policy
+            .workers
+            .saturating_add(self.policy.refused_workers);
+        if self.used.capacity_probes >= budget {
             return Err(ScalerError::Guard("capacity probe budget exhausted"));
         }
-        self.used.capacity_probes += 1;
-        let report = timed_phase("capacity", || self.launcher.capacity(self.deadline))
-            .map_err(|error| ScalerError::Usage(masked(&error.to_string(), &self.token)))?;
+        // A failed probe is not a capacity reading (#1456): a slow provider
+        // or a killed probe subprocess says nothing about free slots or
+        // quota. Probe once more before the coordinator sees a refusal.
+        // Every attempt counts against the probe budget, so retries stay
+        // bounded, and a second failure is final for this call.
+        let mut report = Err(ScalerError::Guard(
+            "no capacity probe ran before the deadline",
+        ));
+        for _ in 0..CAPACITY_PROBE_ATTEMPTS {
+            if self.used.capacity_probes >= budget || Instant::now() >= self.deadline {
+                break;
+            }
+            self.used.capacity_probes += 1;
+            report = timed_phase("capacity", || self.launcher.capacity(self.deadline));
+            if report.is_ok() {
+                break;
+            }
+        }
+        let report =
+            report.map_err(|error| ScalerError::Usage(masked(&error.to_string(), &self.token)))?;
         self.capacity = Some((self.launcher.now(), report.clone()));
         if !self.tier.available(&report) {
             self.tier_unavailable = true;
@@ -6523,18 +6593,82 @@ fi
             server.launcher = Box::new(FixtureLauncher {
                 reports: std::collections::VecDeque::from([
                     Err("temporary capacity outage"),
+                    Err("temporary capacity outage"),
                     Ok(live_capacity()),
                 ]),
                 record: record.clone(),
             });
+            // Both attempts of the first call fail; the failure is not cached.
             assert!(server.execute(worker_request()).is_err());
             assert!(
                 server.execute(worker_request()).is_ok(),
                 "cached transient probe failure prevented recovery"
             );
             assert_eq!((server.used.workers, server.used.refused_workers), (1, 1));
-            assert_eq!(record.borrow().queries, 2);
+            assert_eq!(record.borrow().queries, 3);
         });
+    }
+    /// #1456: one failed live probe (a slow provider, a killed
+    /// subprocess) is not a capacity reading. A strong round whose first
+    /// probe fails still launches its Codex worker when a second probe
+    /// shows Codex available, and is not recorded as tier-blocked.
+    #[test]
+    fn a_failed_capacity_probe_is_retried_and_the_strong_round_still_launches() {
+        shared_fixture(|temporary| {
+            let root = temporary.join("base");
+            std::fs::create_dir(&root).unwrap();
+            git(&root, &["init", "-b", "main"]).unwrap();
+            git(&root, &["commit", "--allow-empty", "-m", "base"]).unwrap();
+            let mut server = server(&root);
+            server.dispatch.base = git(&root, &["rev-parse", "HEAD"]).unwrap().trim().into();
+            server.dispatch.resume = false;
+            server.dispatch.review = false;
+            server.tier = super::super::worker_tier::decide("x", "", "", &["shared-kernel".into()]);
+            let record = std::rc::Rc::new(std::cell::RefCell::new(LaunchRecord::default()));
+            server.launcher = Box::new(FixtureLauncher {
+                reports: std::collections::VecDeque::from([
+                    Err("live capacity query failed"),
+                    Ok(live_capacity()),
+                ]),
+                record: record.clone(),
+            });
+            let read = server
+                .execute(Request::ReadCapacity(Empty {}))
+                .expect("one failed probe ended the round's capacity reading");
+            assert!(
+                read["capacity"]["backends"]["codex"]["installed"] == true,
+                "{read}"
+            );
+            server
+                .execute(worker_request())
+                .expect("codex was available but the strong round did not launch");
+            assert_eq!((server.used.workers, server.used.refused_workers), (1, 0));
+            assert_eq!(record.borrow().queries, 2);
+            assert!(!server.tier_unavailable);
+        });
+    }
+    /// #1456: a failed probe subprocess tells the coordinator which
+    /// subcommand failed and how, but never the provider's stderr; the
+    /// loop log keeps a bounded tail of it.
+    #[test]
+    fn a_failed_probe_subprocess_is_named_without_provider_output() {
+        let stderr = format!("{}é{}", "x".repeat(4000), "codex SDK model/list failed\n");
+        let (refusal, event) = capacity_failure(&["models", "--backend", "codex"], 1, &stderr);
+        assert!(
+            refusal.contains("`models --backend codex` exited with status 1"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("not a capacity reading"), "{refusal}");
+        assert!(!refusal.contains("model/list"), "{refusal}");
+        let tail = event["stderr_tail"].as_str().unwrap();
+        assert!(tail.len() <= CAPACITY_STDERR_TAIL, "{}", tail.len());
+        assert!(tail.ends_with("codex SDK model/list failed\n"), "{tail}");
+        let (refusal, event) = capacity_failure(&["capacity", "--json"], 124, "");
+        assert!(
+            refusal.contains("`capacity --json` timed out after 180 s"),
+            "{refusal}"
+        );
+        assert_eq!(event["status"], 124);
     }
     #[test]
     fn failed_capacity_probes_are_bounded_even_through_read_capacity() {
