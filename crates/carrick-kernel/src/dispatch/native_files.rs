@@ -1903,6 +1903,53 @@ mod tests {
         assert_eq!(authority(None).fsuid, carrick_abi::NsUid::new(1000));
     }
 
+    /// Review #1409 (3): `O_NOATIME` is the owner's or `CAP_FOWNER`'s, which
+    /// the carrier models from the fsuid (`dac_identity`), never the euid.
+    /// A split identity tells them apart.
+    #[test]
+    fn native_noatime_open_is_keyed_on_the_fsuid() {
+        // A host upper reports the file's real owner (the test's host uid).
+        let fixture = writable_fixture(Upper::Host);
+        let root = authority_of(&fixture.dispatcher).in_cwd("/");
+        assert!(fixture.venue_open(&root, b"/tmp/noatime", CREATE, 0o644) >= 0);
+        let split = |euid: u32, fsuid: u32| {
+            let mut access = root.clone();
+            access.credentials = Arc::new(crate::kernel::Credentials::from_values(
+                crate::kernel::CredentialsValues {
+                    id: fixture
+                        .dispatcher
+                        .kernel_binding
+                        .read()
+                        .kernel()
+                        .object_ids()
+                        .credentials_id()
+                        .unwrap(),
+                    ruid: carrick_abi::NsUid::new(euid),
+                    euid: carrick_abi::NsUid::new(euid),
+                    suid: carrick_abi::NsUid::new(euid),
+                    rgid: carrick_abi::NsGid::ROOT,
+                    egid: carrick_abi::NsGid::ROOT,
+                    sgid: carrick_abi::NsGid::ROOT,
+                    fsuid: carrick_abi::NsUid::new(fsuid),
+                    fsgid: carrick_abi::NsGid::ROOT,
+                    umask: 0o022,
+                },
+            ));
+            fixture.venue_open(
+                &access,
+                b"/tmp/noatime",
+                carrick_abi::LINUX_O_RDONLY | LinuxOpenFlags::NOATIME.bits(),
+                0,
+            )
+        };
+        assert_eq!(
+            split(0, 4321),
+            carrick_abi::LINUX_EPERM.guest_retval(),
+            "a non-owner fsuid has no CAP_FOWNER, whatever the euid"
+        );
+        assert!(split(4321, 0) >= 0, "fsuid 0 holds CAP_FOWNER");
+    }
+
     /// #1392: the chdir lookup (a `Newfstatat` with a name area) answers the
     /// directory's canonical spelling, ENOTDIR for a file and ENOENT for a
     /// missing name.

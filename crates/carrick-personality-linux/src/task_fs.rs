@@ -98,25 +98,30 @@ pub fn visible_cwd(cwd: &[u8], root: Option<&[u8]>) -> Result<Vec<u8>, LinuxErrn
     Ok(cwd.to_vec())
 }
 
-/// The file-access capabilities the carrier's access checks model. The
-/// carrier grants them exactly when `fsuid` is 0 and never otherwise, so it
-/// serves a caller only when its effective set agrees.
-const CARRIER_FILE_CAPS: u64 = (1 << carrick_syscall_abi::CAP_DAC_OVERRIDE)
-    | (1 << carrick_syscall_abi::CAP_DAC_READ_SEARCH)
-    | (1 << carrick_syscall_abi::CAP_FOWNER);
+/// The file-access capabilities the carrier grants exactly when `fsuid` is 0
+/// and never otherwise: `CAP_DAC_OVERRIDE` (read, write and search bypass,
+/// capabilities(7)) and `CAP_FOWNER` (owner checks).
+const CARRIER_FSUID0_CAPS: u64 =
+    (1 << carrick_syscall_abi::CAP_DAC_OVERRIDE) | (1 << carrick_syscall_abi::CAP_FOWNER);
+/// Every file capability the carrier's id-based checks could imply.
+/// `CAP_DAC_READ_SEARCH` adds nothing over `CAP_DAC_OVERRIDE` for any
+/// operation that crosses (its extra reach, `open_by_handle_at` and
+/// `linkat(AT_EMPTY_PATH)`, never does), so with fsuid 0 it is don't-care;
+/// Docker's default set (`0xa80425fb`) omits it.
+const CARRIER_FILE_CAPS: u64 =
+    CARRIER_FSUID0_CAPS | (1 << carrick_syscall_abi::CAP_DAC_READ_SEARCH);
 
 /// Whether the carrier's "fsuid 0 overrides DAC" model is exactly this
-/// caller's authority: fsuid 0 with all of `CAP_DAC_OVERRIDE`,
-/// `CAP_DAC_READ_SEARCH` and `CAP_FOWNER` effective, or a nonzero fsuid
-/// with none of them. Any other caller (a root that dropped a file
-/// capability, a non-root that holds one) is left unrouted rather than
-/// checked with the wrong privileges.
+/// caller's authority: fsuid 0 with `CAP_DAC_OVERRIDE` and `CAP_FOWNER`
+/// effective, or a nonzero fsuid with none of the file capabilities. Any
+/// other caller (a root that dropped one of them, a non-root that holds
+/// one) is left unrouted rather than checked with the wrong privileges.
 pub fn carrier_models_file_caps(credentials: &TaskCredentials) -> bool {
-    let held = credentials.cap_effective.bits() & CARRIER_FILE_CAPS;
+    let held = credentials.cap_effective.bits();
     if credentials.fsuid.is_root() {
-        held == CARRIER_FILE_CAPS
+        held & CARRIER_FSUID0_CAPS == CARRIER_FSUID0_CAPS
     } else {
-        held == 0
+        held & CARRIER_FILE_CAPS == 0
     }
 }
 
@@ -243,6 +248,28 @@ mod tests {
             Err(carrick_syscall_abi::LINUX_ENOSYS)
         );
         assert!(out.is_empty(), "nothing was encoded for a refused caller");
+        // Docker's default capability set (no CAP_DAC_READ_SEARCH) crosses
+        // as root; so does a root missing only CAP_DAC_READ_SEARCH.
+        let mut docker = TaskCredentials::ROOT;
+        docker.cap_effective =
+            carrick_syscall_abi::LinuxCapabilitySet::from_bits_retain(0xa804_25fb);
+        assert!(fs.encode_access(&docker, 0o022, &mut out).is_ok());
+        let mut no_fowner = TaskCredentials::ROOT;
+        no_fowner
+            .cap_effective
+            .remove(carrick_syscall_abi::LinuxCapabilitySet::CAP_FOWNER);
+        assert_eq!(
+            fs.encode_access(&no_fowner, 0o022, &mut Vec::new()),
+            Err(carrick_syscall_abi::LINUX_ENOSYS)
+        );
+        let mut read_search = TaskCredentials::ROOT;
+        read_search.fsuid = crate::identity::TaskUid::new(1000);
+        read_search.cap_effective = carrick_syscall_abi::LinuxCapabilitySet::CAP_DAC_READ_SEARCH;
+        assert_eq!(
+            fs.encode_access(&read_search, 0o022, &mut Vec::new()),
+            Err(carrick_syscall_abi::LINUX_ENOSYS),
+            "a non-root holding any file capability is not modelled"
+        );
         // Root with every file capability, and a non-root with none, cross.
         assert!(
             fs.encode_access(&TaskCredentials::ROOT, 0o022, &mut out)
