@@ -46,16 +46,16 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Read the environment once; later calls are one relaxed load.
 pub fn init_from_env() {
-    let directory = DIRECTORY.get_or_init(|| {
-        std::env::var_os("CARRICK_EL1_CENSUS")
+    DIRECTORY.get_or_init(|| {
+        let setting = std::env::var_os("CARRICK_EL1_CENSUS");
+        ENABLED.store(
+            setting.as_deref() != Some(std::ffi::OsStr::new("0")),
+            Ordering::Relaxed,
+        );
+        setting
             .filter(|value| !value.is_empty() && value != "0")
             .map(std::path::PathBuf::from)
     });
-    let _ = directory;
-    ENABLED.store(
-        std::env::var_os("CARRICK_EL1_CENSUS").as_deref() != Some(std::ffi::OsStr::new("0")),
-        Ordering::Relaxed,
-    );
     let _ = STARTED.get_or_init(std::time::Instant::now);
 }
 
