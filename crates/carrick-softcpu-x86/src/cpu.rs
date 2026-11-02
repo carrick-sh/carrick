@@ -508,6 +508,7 @@ impl SoftCpu {
     ) -> Result<SoftCpuExit, EmitError> {
         if (self.ctx.cr0 & 0xc) != 0
             && let Some(first) = planned.insns.first()
+            && first.raw.encoding() != iced_x86::EncodingKind::VEX
             && (0..first.raw.op_count()).any(|i| {
                 first.raw.op_kind(i) == iced_x86::OpKind::Register
                     && first.raw.op_register(i).is_xmm()
@@ -640,7 +641,14 @@ impl SoftCpu {
                         })
                     }
                     SensitiveOp::Ldmxcsr | SensitiveOp::Stmxcsr => {
-                        if (self.ctx.cr0 & (1 << 2)) != 0 {
+                        if raw.encoding() == iced_x86::EncodingKind::VEX
+                            && (self.ctx.cr4 & (1 << 18) == 0 || self.ctx.xcr0 & 6 != 6)
+                        {
+                            return self.raise(X86Exception::invalid_opcode(va));
+                        }
+                        if raw.encoding() != iced_x86::EncodingKind::VEX
+                            && (self.ctx.cr0 & (1 << 2)) != 0
+                        {
                             return self.raise(X86Exception::invalid_opcode(va));
                         }
                         if (self.ctx.cr0 & (1 << 3)) != 0 {
@@ -772,11 +780,11 @@ fn emulate_xstate<M: SoftMmuMemory>(
     let request = if ext {
         ((ctx.gpr[reg::RAX] as u32 as u64) | ((ctx.gpr[reg::RDX] as u32 as u64) << 32))
             & ctx.xcr0
-            & 3
+            & u64::from(carrick_x86::XCR0_X86_64_V3_MASK)
     } else {
         3
     };
-    let mut area = [0u8; 576];
+    let mut area = [0u8; carrick_x86::cpuid::XSAVE_V3_TOTAL_BYTES as usize];
     let mut ranges = Vec::new();
     let fault = |fault: crate::mmu::SoftMemoryFault| fault.exception(ip);
     let mut state = request;
@@ -808,10 +816,10 @@ fn emulate_xstate<M: SoftMmuMemory>(
                 .map_err(|_| X86Exception::invalid_opcode(ip))?,
         );
         if !save {
-            if header & !3 != 0
+            if header & !ctx.xcr0 != 0
                 || (xcomp != 0
                     && (xcomp & (1 << 63) == 0
-                        || xcomp & !((1 << 63) | 3) != 0
+                        || xcomp & !((1 << 63) | ctx.xcr0) != 0
                         || header & !xcomp != 0))
                 // SDM Vol. 1 13.8.1 checks header bytes 8..24 for the
                 // standard form; 13.8.2 checks bytes 16..64 when compacted.
@@ -841,17 +849,21 @@ fn emulate_xstate<M: SoftMmuMemory>(
         if request & 1 != 0 && (save || state & 1 != 0) {
             ranges.extend_from_slice(&[(0, 24), (32, 160)]);
         }
-        if request & 2 != 0 {
-            // Standard XRSTOR loads MXCSR even when SSE is in initial state.
-            if save || xcomp == 0 || state & 2 != 0 {
-                ranges.push((24, 32));
-            }
-            if save || state & 2 != 0 {
-                ranges.push((160, 416));
-            }
+        // MXCSR belongs to both SSE and AVX save/restore requests.
+        if (save || xcomp == 0) && request & 6 != 0
+            || !save && xcomp != 0 && request & 2 != 0 && state & 2 != 0
+        {
+            ranges.push((24, 32));
+        }
+        if request & 2 != 0 && (save || state & 2 != 0) {
+            ranges.push((160, 416));
         }
     }
+    if ext && request & 4 != 0 && (save || state & 4 != 0) {
+        ranges.push((carrick_x86::cpuid::XSAVE_LEGACY_BYTES as usize, area.len()));
+    }
     if save {
+        area[576..].copy_from_slice(&ctx.ymm_hi128);
         let mut legacy = ctx.fxsave.clone();
         if !format64 {
             legacy.0[12..16].fill(0);
@@ -872,13 +884,18 @@ fn emulate_xstate<M: SoftMmuMemory>(
                 area[start..end].copy_from_slice(&legacy.0[start..end]);
             }
             // Validate every touched page before publishing any component.
-            for off in [start, end - 1] {
+            if !is_canonical_va(ea.wrapping_add((end - 1) as u64)) {
+                return Err(X86Exception::general_protection(ip, 0));
+            }
+            let mut off = start;
+            while off < end {
                 let va = ea.wrapping_add(off as u64);
                 if !is_canonical_va(va) {
                     return Err(X86Exception::general_protection(ip, 0));
                 }
                 crate::mmu::translate_va(ctx, mem, va, SoftAccessKind::Write)
                     .map_err(|pf| X86Exception::page_fault(ip, pf.error_code, pf.cr2))?;
+                off += (4096 - (va as usize & 4095)).min(end - off);
             }
         }
         for (start, end) in ranges {
@@ -894,7 +911,7 @@ fn emulate_xstate<M: SoftMmuMemory>(
             read_guest_bytes(ctx, mem, va, &mut area[start..end], SoftAccessKind::Read)
                 .map_err(fault)?;
         }
-        if request & 2 != 0
+        if request & 6 != 0
             && u32::from_le_bytes([area[24], area[25], area[26], area[27]]) & !GUEST_MXCSR_MASK != 0
         {
             return Err(X86Exception::general_protection(ip, 0));
@@ -908,13 +925,15 @@ fn emulate_xstate<M: SoftMmuMemory>(
             }
             if request & 2 != 0 && state & 2 == 0 {
                 restored.0[160..416].fill(0);
-                if xcomp != 0 {
-                    restored.0[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
-                }
+            }
+            if request & 2 != 0 && state & 2 == 0 && xcomp != 0 {
+                restored.0[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
             }
         }
         for (start, end) in ranges {
-            restored.0[start..end].copy_from_slice(&area[start..end]);
+            if start < 512 {
+                restored.0[start..end].copy_from_slice(&area[start..end]);
+            }
         }
         if request & 1 != 0 {
             if ext && state & 1 == 0 {
@@ -929,6 +948,13 @@ fn emulate_xstate<M: SoftMmuMemory>(
         }
         restored.0[28..32].copy_from_slice(&GUEST_MXCSR_MASK.to_le_bytes());
         ctx.fxsave = restored;
+        if ext && request & 4 != 0 {
+            if state & 4 != 0 {
+                ctx.ymm_hi128.copy_from_slice(&area[576..]);
+            } else {
+                ctx.ymm_hi128.fill(0);
+            }
+        }
     }
     Ok(())
 }

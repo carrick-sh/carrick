@@ -404,6 +404,8 @@ pub struct SoftCpuContext {
     bounce_active: u64,
     bounce_buf: [u8; 64],
     pub fxsave: FxsaveArea,
+    /// XSAVE component 2, in architectural YMM0..YMM15 order.
+    pub ymm_hi128: [u8; 256],
     /// This CPU's translation cache. Private so it is only ever served
     /// through `seat` (one cache per member of the inventory's domain).
     pub(crate) tlb: SoftTlb,
@@ -420,8 +422,14 @@ pub struct SoftCpuContext {
     bounce_writeback: BounceWriteback,
     active_mem_ptr: Option<NonNull<()>>,
     active_translate_fn: Option<ActiveTranslateFn>,
-    active_block_insns: Vec<(u64, Instruction, Option<FpLeafFn>)>,
+    active_block_insns: Vec<(
+        u64,
+        Instruction,
+        Option<FpLeafFn>,
+        Option<crate::avx::LeafFn>,
+    )>,
     fp_leaves: HashMap<Vec<u8>, FpLeaf>,
+    avx_leaves: HashMap<Vec<u8>, crate::avx::Leaf>,
     host_fxsave: FxsaveArea,
     helper_resume: u64,
     virt_rsp_spill: u64,
@@ -553,6 +561,7 @@ impl SoftCpuContext {
             bounce_active: 0,
             bounce_buf: [0; 64],
             fxsave: FxsaveArea::default(),
+            ymm_hi128: [0; 256],
             tlb,
             walker: SoftWalker::new(),
             cpl: 3,
@@ -571,6 +580,7 @@ impl SoftCpuContext {
             active_translate_fn: None,
             active_block_insns: Vec::new(),
             fp_leaves: HashMap::new(),
+            avx_leaves: HashMap::new(),
             host_fxsave: FxsaveArea::default(),
             helper_resume: 0,
             virt_rsp_spill: 0,
@@ -899,7 +909,43 @@ impl SoftCpuContext {
             } else {
                 None
             };
-            self.active_block_insns.push((d.va, d.raw, leaf));
+            let avx = if crate::avx::needs_leaf(&d.raw)
+                && self.cr4 & (1 << 18) != 0
+                && self.xcr0 & 6 == 6
+                && self.cr0 & 8 == 0
+            {
+                let key = crate::avx::key(&d.raw)
+                    .map_err(|detail| EmitError::EncodeFailed { va: d.va, detail })?;
+                let leaf = match self.avx_leaves.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let image = crate::avx::image(&d.raw)
+                            .map_err(|detail| EmitError::EncodeFailed { va: d.va, detail })?;
+                        let mut buffer = crate::cpu::JitCodeBuffer::new(image.len()).ok_or(
+                            EmitError::HostJit {
+                                va: d.va,
+                                stage: JitStage::Allocate,
+                            },
+                        )?;
+                        let addr = buffer.publish(&image).ok_or(EmitError::HostJit {
+                            va: d.va,
+                            stage: JitStage::Publish,
+                        })?;
+                        // SAFETY: avx::image emits the Run ABI; the cache owns the RX allocation.
+                        let execute = unsafe {
+                            std::mem::transmute::<usize, crate::avx::LeafFn>(addr as usize)
+                        };
+                        entry.insert(crate::avx::Leaf {
+                            _buffer: buffer,
+                            execute,
+                        })
+                    }
+                };
+                Some(leaf.execute)
+            } else {
+                None
+            };
+            self.active_block_insns.push((d.va, d.raw, leaf, avx));
         }
         Ok(())
     }
@@ -1291,13 +1337,18 @@ fn record_exception(ctx: &mut SoftCpuContext, exc: X86Exception) {
 /// Execute a complex body instruction (`div`/`idiv`, string ops, `push`/`pop`, etc.).
 #[unsafe(no_mangle)]
 extern "sysv64" fn softcpu_step_complex(ctx: &mut SoftCpuContext, insn_idx: u64) -> u64 {
-    let Some(&(insn_va, insn, fp_leaf)) = ctx.active_block_insns.get(insn_idx as usize) else {
+    let Some(&(insn_va, insn, fp_leaf, avx_leaf)) = ctx.active_block_insns.get(insn_idx as usize)
+    else {
         record_exception(ctx, X86Exception::invalid_opcode(ctx.rip));
         return 0;
     };
     ctx.fxsave.0[28..32].copy_from_slice(&GUEST_MXCSR_MASK.to_le_bytes());
     let entry_flags = ctx.rflags;
-    match step_complex_inner(ctx, &insn, insn_va, fp_leaf) {
+    match if crate::avx::supported(&insn) {
+        crate::avx::step(ctx, &insn, insn_va, avx_leaf)
+    } else {
+        step_complex_inner(ctx, &insn, insn_va, fp_leaf)
+    } {
         Ok(()) => u64::from(ctx.exit_reason != EXIT_REASON_RESTART),
         Err(exc) => {
             // REP comparison faults restore the pre-instruction flags (SDM
@@ -1561,7 +1612,11 @@ fn tiny_arithmetic_result(insn: &Instruction, state: &FxsaveArea) -> bool {
         })
 }
 
-fn step_maskmov(ctx: &mut SoftCpuContext, insn: &Instruction, ip: u64) -> Result<(), X86Exception> {
+pub(crate) fn step_maskmov(
+    ctx: &mut SoftCpuContext,
+    insn: &Instruction,
+    ip: u64,
+) -> Result<(), X86Exception> {
     let regs: Vec<_> = (0..insn.op_count())
         .filter(|&i| insn.op_kind(i) == OpKind::Register)
         .map(|i| insn.op_register(i))
@@ -1616,12 +1671,24 @@ fn step_maskmov(ctx: &mut SoftCpuContext, insn: &Instruction, ip: u64) -> Result
     Ok(())
 }
 
-fn walk_active_span(
+pub(crate) fn walk_active_span(
     ctx: &mut SoftCpuContext,
     va: u64,
     len: usize,
     kind: SoftAccessKind,
     insn_va: u64,
+    commit: impl FnMut(&mut SoftCpuContext, usize, TranslatedTarget, usize),
+) -> Result<(), X86Exception> {
+    walk_active_span_aligned(ctx, va, len, kind, insn_va, true, commit)
+}
+
+pub(crate) fn walk_active_span_aligned(
+    ctx: &mut SoftCpuContext,
+    va: u64,
+    len: usize,
+    kind: SoftAccessKind,
+    insn_va: u64,
+    alignment_check: bool,
     mut commit: impl FnMut(&mut SoftCpuContext, usize, TranslatedTarget, usize),
 ) -> Result<(), X86Exception> {
     if len == 0 {
@@ -1635,7 +1702,7 @@ fn walk_active_span(
         return Err(X86Exception::general_protection(insn_va, 0));
     }
     for pass in [false, true] {
-        if pass {
+        if pass && alignment_check {
             ctx.check_alignment(va, len.min(8), insn_va)?;
         }
         let (mut cur, mut off) = (va, 0usize);
@@ -2536,6 +2603,23 @@ mod tests {
             cpu.execute_planned_block(&planned, &mut NoMemory).unwrap();
         }
         crate::cpu::JIT_ALLOCATIONS.with(|count| assert_eq!(count.get(), 1));
+    }
+
+    #[test]
+    fn avx_leaf_allocation_is_once_across_repeated_blocks() {
+        let mut cpu = crate::SoftCpu::new(&test_extents()).unwrap();
+        cpu.context_mut().xcr0 = 7;
+        let mut planned = fp_block();
+        planned.insn_bytes[0][..4].copy_from_slice(&[0xc5, 0xf5, 0xfe, 0xc2]);
+        planned.insns[0] =
+            crate::decode::classify(&planned.insn_bytes[0][..4], planned.start).unwrap();
+        crate::cpu::JIT_ALLOCATIONS.with(|count| count.set(0));
+        for scale in [1, 4, 16] {
+            for _ in 0..scale {
+                cpu.execute_planned_block(&planned, &mut NoMemory).unwrap();
+            }
+            crate::cpu::JIT_ALLOCATIONS.with(|count| assert_eq!(count.get(), 1));
+        }
     }
 
     fn fp_host_failure(publish: bool) {

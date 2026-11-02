@@ -133,7 +133,8 @@ pub fn emit_block(block: &PlannedBlock) -> Result<EmittedBlock, EmitError> {
 }
 
 fn is_routed_to_complex_helper(insn: &Instruction) -> bool {
-    is_fp_arithmetic(insn)
+    crate::avx::supported(insn)
+        || is_fp_arithmetic(insn)
         || insn.is_string_instruction()
         || matches!(
             insn.mnemonic(),

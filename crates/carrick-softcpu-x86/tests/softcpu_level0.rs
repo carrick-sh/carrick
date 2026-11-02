@@ -1436,22 +1436,19 @@ fn oversized_and_unknown_memory_images_never_enter_native_memory_path() {
 fn native_admission_denies_unimplemented_host_features() {
     use carrick_softcpu_x86::{InsnClass, classify};
     let cases: &[&[u8]] = &[
-        &[0x0f, 0xc7, 0x2f],                   // xsaves
-        &[0x0f, 0xc7, 0x1f],                   // xrstors
-        &[0x0f, 0x01, 0xc8],                   // monitor
-        &[0x0f, 0x01, 0xc9],                   // mwait
-        &[0x66, 0x0f, 0x38, 0x82, 0x07],       // invpcid
-        &[0x0f, 0x01, 0xc1],                   // vmcall
-        &[0xf3, 0x0f, 0xc7, 0xf8],             // rdpid
-        &[0xc5, 0xf9, 0xf7, 0xc1],             // vmaskmovdqu
-        &[0x0f, 0x01, 0xfc],                   // clzero
-        &[0x66, 0x0f, 0x38, 0xf8, 0x07],       // movdir64b
-        &[0xf2, 0x0f, 0x38, 0xf8, 0x07],       // enqcmd
-        &[0xf3, 0x0f, 0x38, 0xf8, 0x07],       // enqcmds
-        &[0xf3, 0x0f, 0xae, 0xf0],             // umonitor
-        &[0xc4, 0xe2, 0x7d, 0x92, 0x04, 0x87], // vgatherdps
-        &[0xc5, 0xf8, 0x28, 0x07],             // vmovaps
-        &[0x48, 0x0f, 0xc7, 0x0f],             // cmpxchg16b (CX16 is not exposed)
+        &[0x0f, 0xc7, 0x2f],             // xsaves
+        &[0x0f, 0xc7, 0x1f],             // xrstors
+        &[0x0f, 0x01, 0xc8],             // monitor
+        &[0x0f, 0x01, 0xc9],             // mwait
+        &[0x66, 0x0f, 0x38, 0x82, 0x07], // invpcid
+        &[0x0f, 0x01, 0xc1],             // vmcall
+        &[0xf3, 0x0f, 0xc7, 0xf8],       // rdpid
+        &[0x0f, 0x01, 0xfc],             // clzero
+        &[0x66, 0x0f, 0x38, 0xf8, 0x07], // movdir64b
+        &[0xf2, 0x0f, 0x38, 0xf8, 0x07], // enqcmd
+        &[0xf3, 0x0f, 0x38, 0xf8, 0x07], // enqcmds
+        &[0xf3, 0x0f, 0xae, 0xf0],       // umonitor
+        &[0x48, 0x0f, 0xc7, 0x0f],       // cmpxchg16b (CX16 is not exposed)
     ];
     for bytes in cases {
         assert_eq!(
@@ -2641,4 +2638,885 @@ fn alignment_check_applies_to_checked_image_and_string_helpers() {
         assert_eq!(mem.read_direct(data, 128).unwrap(), [0; 128]);
         assert_eq!(cpu.context().gpr[reg::RCX], 1);
     }
+}
+
+#[test]
+fn avx_xstate_component_round_trip_and_initial_state() {
+    // SDM Vol. 1 chapter 13: standard YMM_Hi128 is 256 bytes at 576.
+    let (mut cpu, mut mem, va) = setup_snippet(&[0x0f, 0xae, 0x2f]); // xrstor [rdi]
+    let addr = 0x2000_0000;
+    mem.map_range(addr, 4096, PagePerms::USER_RW);
+    let mut image = [0u8; 832];
+    image[..512].copy_from_slice(&carrick_softcpu_x86::FxsaveArea::default().0);
+    image[512..520].copy_from_slice(&7u64.to_le_bytes());
+    for (i, byte) in image[576..].iter_mut().enumerate() {
+        *byte = (i as u8).wrapping_mul(17).wrapping_add(3);
+    }
+    mem.write_direct(addr, &image);
+    cpu.context_mut().xcr0 = 7;
+    cpu.context_mut().gpr[reg::RDI] = addr;
+    cpu.context_mut().gpr[reg::RAX] = 7;
+    assert!(matches!(
+        cpu.step_block(&mut mem).unwrap(),
+        SoftCpuExit::Continue { .. }
+    ));
+    for opcode in [&[0x0f, 0xae, 0x27][..], &[0x0f, 0xae, 0x37]] {
+        // xsave, xsaveopt
+        mem.write_direct(addr + 576, &[0; 256]);
+        mem.write_direct(va, opcode);
+        cpu.context_mut().rip = va;
+        assert!(matches!(
+            cpu.step_block(&mut mem).unwrap(),
+            SoftCpuExit::Continue { .. }
+        ));
+        assert_eq!(mem.read_direct(addr + 576, 256).unwrap(), image[576..]);
+    }
+    assert!(matches!(
+        avx_run(&mut cpu, &mut mem, va, &[0xc5, 0xfc, 0x77]),
+        SoftCpuExit::Continue { .. }
+    )); // clobber all YMM
+    assert_eq!(&cpu.context().ymm_hi128, &[0; 256]);
+    assert!(matches!(
+        avx_run(&mut cpu, &mut mem, va, &[0x0f, 0xae, 0x2f]),
+        SoftCpuExit::Continue { .. }
+    ));
+    assert_eq!(&cpu.context().ymm_hi128, &image[576..]);
+    // A requested component absent from XSTATE_BV is initialized, not retained.
+    mem.write_direct(addr + 512, &3u64.to_le_bytes());
+    mem.write_direct(va, &[0x0f, 0xae, 0x2f]);
+    cpu.context_mut().rip = va;
+    cpu.step_block(&mut mem).unwrap();
+    mem.write_direct(va, &[0x0f, 0xae, 0x27]);
+    cpu.context_mut().rip = va;
+    cpu.step_block(&mut mem).unwrap();
+    assert_eq!(mem.read_direct(addr + 576, 256).unwrap(), [0; 256]);
+}
+
+#[test]
+fn avx_vex_two_and_three_byte_three_operand_execution() {
+    // VEX.256 VPADDD ymm0,ymm1,ymm2: distinct source1 (vvvv) and destination.
+    for code in [
+        &[0xc5, 0xf5, 0xfe, 0xc2][..],
+        &[0xc4, 0xe1, 0x75, 0xfe, 0xc2],
+    ] {
+        let (mut cpu, mut mem, va) = setup_snippet(&[code, &[0xeb, 0]].concat());
+        cpu.context_mut().xcr0 = 7;
+        cpu.context_mut().write_xmm(1, u128::from_le_bytes([1; 16]));
+        cpu.context_mut().write_xmm(2, u128::from_le_bytes([2; 16]));
+        assert!(
+            matches!(
+                cpu.step_block(&mut mem).unwrap(),
+                SoftCpuExit::Continue { .. }
+            ),
+            "VEX at {va:x}"
+        );
+        assert_eq!(cpu.context().read_xmm(0), u128::from_le_bytes([3; 16]));
+        assert_eq!(cpu.context().read_xmm(1), u128::from_le_bytes([1; 16]));
+    }
+}
+
+#[repr(C, align(64))]
+struct AvxOracle {
+    guest: [u8; 832],
+    host: [u8; 832],
+    gprs: [u64; 3],
+    flags: u64,
+    padding: [u8; 32],
+    operand: [u8; 32],
+}
+
+fn native_avx_oracle(bytes: &[u8], image: [u8; 832], memory: bool) -> AvxOracle {
+    let mut run = AvxOracle {
+        guest: image,
+        host: [0; 832],
+        gprs: [0; 3],
+        flags: 0,
+        padding: [0; 32],
+        operand: [0x3f; 32],
+    };
+    let mut code = Vec::new();
+    let mask = [0xb8, 7, 0, 0, 0, 0xba, 0, 0, 0, 0]; // eax=7,edx=0
+    code.extend_from_slice(&mask);
+    code.extend_from_slice(&[0x48, 0x0f, 0xae, 0xa7]); // xsave64 [rdi+832]
+    code.extend_from_slice(&832u32.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0x0f, 0xae, 0x2f]); // xrstor64 [rdi]
+    code.extend_from_slice(&[
+        0xb8, 0x78, 0x56, 0x34, 0x12, 0xb9, 3, 0, 0, 0, 0xba, 7, 0, 0, 0,
+    ]);
+    if memory {
+        let mut native = iced_x86::Decoder::new(64, bytes, iced_x86::DecoderOptions::NONE).decode();
+        native.set_memory_base(iced_x86::Register::RDI);
+        native.set_memory_index(iced_x86::Register::None);
+        native.set_memory_displacement64(std::mem::offset_of!(AvxOracle, operand) as u64);
+        native.set_memory_displ_size(8);
+        code.extend_from_slice(&avx_encode(native));
+    } else {
+        code.extend_from_slice(bytes);
+    }
+    code.extend_from_slice(&[0x0f, 0xae, 0xf8]); // sfence: drain non-temporal operand stores
+    for (modrm, offset) in [(0x87, 1664u32), (0x8f, 1672), (0x97, 1680)] {
+        code.extend_from_slice(&[0x48, 0x89, modrm]);
+        code.extend_from_slice(&offset.to_le_bytes());
+    }
+    code.extend_from_slice(&[0x9c, 0x8f, 0x87]); // pushfq; pop [rdi+1688]
+    code.extend_from_slice(&1688u32.to_le_bytes());
+    code.extend_from_slice(&mask);
+    code.extend_from_slice(&[0x48, 0x0f, 0xae, 0x27]); // xsave64 [rdi]
+    code.extend_from_slice(&[0x48, 0x0f, 0xae, 0xaf]); // xrstor64 [rdi+832]
+    code.extend_from_slice(&832u32.to_le_bytes());
+    code.push(0xc3);
+    let mut buffer = JitCodeBuffer::new(code.len()).unwrap();
+    let address = buffer.publish(&code).unwrap();
+    // SAFETY: the caller selects register-only AVX encodings touching only
+    // XMM/YMM and RAX/RCX/RDX. The thunk owns aligned xstate buffers, masks
+    // native exceptions, and restores host xstate before returning to Rust.
+    let execute: unsafe extern "sysv64" fn(*mut AvxOracle) =
+        unsafe { std::mem::transmute(address as usize) };
+    unsafe {
+        execute(&mut run);
+    }
+    run
+}
+
+#[test]
+fn avx_each_register_encoding_matches_independent_xsave_native_oracle() {
+    use iced_x86::{
+        CpuidFeature, Decoder, DecoderOptions, EncodingKind, InstructionInfoFactory, OpKind,
+    };
+    use std::collections::BTreeMap;
+    assert!(
+        std::is_x86_feature_detected!("avx2"),
+        "AVX oracle requires AVX2 host"
+    );
+    let mut encodings = BTreeMap::new();
+    // Intel SDM Vol. 2 VEX maps 0F,0F38,0F3A; both L and W, mandatory
+    // prefixes and explicit/unused vvvv. Deduplicate by decoded Code so every
+    // admitted register form has a witness, including 128/256-bit variants.
+    for map in 1..=3u8 {
+        for w in [0, 0x80] {
+            for l in [0, 4] {
+                for pp in 0..4 {
+                    for vvvv in [0x70, 0x78] {
+                        for opcode in 0..=255u8 {
+                            let bytes = [0xc4, 0xe0 | map, w | l | pp | vvvv, opcode, 0xc2, 0x31];
+                            let insn = Decoder::new(64, &bytes, DecoderOptions::NONE).decode();
+                            if insn.is_invalid()
+                                || insn.encoding() != EncodingKind::VEX
+                                || !insn
+                                    .cpuid_features()
+                                    .iter()
+                                    .all(|f| matches!(f, CpuidFeature::AVX | CpuidFeature::AVX2))
+                                || insn
+                                    .op_kinds()
+                                    .any(|k| k != OpKind::Register && k != OpKind::Immediate8)
+                                || !InstructionInfoFactory::new()
+                                    .info(&insn)
+                                    .used_memory()
+                                    .is_empty()
+                            {
+                                continue;
+                            }
+                            encodings
+                                .entry(insn.code())
+                                .or_insert((insn, bytes[..insn.len()].to_vec()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        encodings.len() >= 300,
+        "unexpectedly small instruction population: {}",
+        encodings.len()
+    );
+    let (mut cpu, mut mem, va) = setup_snippet(&[]);
+    let mut mnemonics = std::collections::BTreeSet::new();
+    for (insn, bytes) in encodings.values() {
+        mnemonics.insert(insn.mnemonic());
+        for salt in [0u8, 0x53, 0xff] {
+            let mut initial = [0u8; 832];
+            initial[..512].copy_from_slice(&carrick_softcpu_x86::FxsaveArea::default().0);
+            initial[512..520].copy_from_slice(&7u64.to_le_bytes());
+            for i in 0..16 {
+                let data: [u8; 32] = std::array::from_fn(|b| {
+                    (i as u8)
+                        .wrapping_mul(23)
+                        .wrapping_add(b as u8)
+                        .wrapping_add(salt)
+                });
+                initial[160 + i * 16..176 + i * 16].copy_from_slice(&data[..16]);
+                initial[576 + i * 16..592 + i * 16].copy_from_slice(&data[16..]);
+                cpu.context_mut()
+                    .write_xmm(i, u128::from_le_bytes(data[..16].try_into().unwrap()));
+                cpu.context_mut().ymm_hi128[i * 16..i * 16 + 16].copy_from_slice(&data[16..]);
+            }
+            let oracle = native_avx_oracle(bytes, initial, false);
+            mem.write_direct(va, &[bytes.as_slice(), &[0xeb, 0]].concat());
+            cpu.context_mut().rip = va;
+            cpu.context_mut().xcr0 = 7;
+            cpu.context_mut().rflags = 0x202;
+            cpu.context_mut().fxsave.0[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+            for (r, value) in [reg::RAX, reg::RCX, reg::RDX]
+                .into_iter()
+                .zip([0x12345678, 3, 7])
+            {
+                cpu.context_mut().gpr[r] = value;
+            }
+            assert!(
+                matches!(
+                    cpu.step_block(&mut mem).unwrap(),
+                    SoftCpuExit::Continue { .. }
+                ),
+                "{:?} {bytes:x?}",
+                insn.code()
+            );
+            assert_eq!(
+                &cpu.context().fxsave.0[160..416],
+                &oracle.guest[160..416],
+                "XMM {:?} salt {salt}",
+                insn.code()
+            );
+            assert_eq!(
+                &cpu.context().ymm_hi128,
+                &oracle.guest[576..],
+                "YMM {:?} salt {salt}",
+                insn.code()
+            );
+            assert_eq!(
+                &cpu.context().fxsave.0[24..28],
+                &oracle.guest[24..28],
+                "MXCSR {:?}",
+                insn.code()
+            );
+            for (r, value) in [reg::RAX, reg::RCX, reg::RDX].into_iter().zip(oracle.gprs) {
+                assert_eq!(cpu.context().gpr[r], value, "GPR {:?}", insn.code());
+            }
+            if insn.rflags_modified() != 0 {
+                assert_eq!(
+                    cpu.context().rflags & 0x8d5,
+                    oracle.flags & 0x8d5,
+                    "flags {:?}",
+                    insn.code()
+                );
+            }
+        }
+    }
+    println!(
+        "AVX oracle: {} instruction forms, {} mnemonics, three input populations",
+        encodings.len(),
+        mnemonics.len()
+    );
+}
+
+fn avx_encode(insn: iced_x86::Instruction) -> Vec<u8> {
+    let mut encoder = iced_x86::Encoder::new(64);
+    encoder.encode(&insn, 0).unwrap();
+    encoder.take_buffer()
+}
+
+fn avx_run(cpu: &mut SoftCpu, mem: &mut TestSoftMmuMemory, va: u64, bytes: &[u8]) -> SoftCpuExit {
+    mem.write_direct(va, &[bytes, &[0xeb, 0]].concat());
+    cpu.context_mut().rip = va;
+    cpu.step_block(mem).unwrap()
+}
+
+#[test]
+fn avx_memory_widths_high_registers_and_fault_atomicity() {
+    use iced_x86::{Code, Instruction, MemoryOperand, Register};
+    let (mut cpu, mut mem, va) = setup_snippet(&[]);
+    let addr = 0x2000_0ff0;
+    mem.map_range(0x2000_0000, 8192, PagePerms::USER_RW);
+    cpu.context_mut().xcr0 = 7;
+    cpu.context_mut().gpr[reg::R14] = addr;
+    let pattern: [u8; 32] = std::array::from_fn(|i| i as u8 + 1);
+    mem.write_direct(addr, &pattern);
+    let load = avx_encode(
+        Instruction::with2(
+            Code::VEX_Vmovdqu_ymm_ymmm256,
+            Register::YMM15,
+            MemoryOperand::with_base(Register::R14),
+        )
+        .unwrap(),
+    );
+    assert!(matches!(
+        avx_run(&mut cpu, &mut mem, va, &load),
+        SoftCpuExit::Continue { .. }
+    ));
+    assert_eq!(cpu.context().read_xmm(15).to_le_bytes(), pattern[..16]);
+    assert_eq!(&cpu.context().ymm_hi128[240..], &pattern[16..]);
+    let store = avx_encode(
+        Instruction::with2(
+            Code::VEX_Vmovdqu_ymmm256_ymm,
+            MemoryOperand::with_base(Register::R14),
+            Register::YMM15,
+        )
+        .unwrap(),
+    );
+    mem.write_direct(addr, &[0; 32]);
+    mem.set_page_perms(0x2000_1000, PagePerms::USER_RO);
+    cpu.context_mut().flush_tlb();
+    assert_eq!(
+        avx_run(&mut cpu, &mut mem, va, &store),
+        pf(va, PF_ERR_PRESENT | PF_ERR_USER | PF_ERR_WRITE, 0x2000_1000)
+    );
+    assert_eq!(mem.read_direct(addr, 32).unwrap(), [0; 32]);
+    mem.set_page_perms(0x2000_1000, PagePerms::USER_RW);
+    cpu.context_mut().flush_tlb();
+    assert!(matches!(
+        avx_run(&mut cpu, &mut mem, va, &store),
+        SoftCpuExit::Continue { .. }
+    ));
+    assert_eq!(mem.read_direct(addr, 32).unwrap(), pattern);
+    // Legacy SSE preserves YMM_Hi128; VEX.128 clears exactly its destination.
+    assert!(matches!(
+        avx_run(&mut cpu, &mut mem, va, &[0x66, 0x45, 0x0f, 0xef, 0xff]),
+        SoftCpuExit::Continue { .. }
+    ));
+    assert_eq!(&cpu.context().ymm_hi128[240..], &pattern[16..]);
+    let load128 = avx_encode(
+        Instruction::with2(
+            Code::VEX_Vmovdqu_xmm_xmmm128,
+            Register::XMM15,
+            MemoryOperand::with_base(Register::R14),
+        )
+        .unwrap(),
+    );
+    assert!(matches!(
+        avx_run(&mut cpu, &mut mem, va, &load128),
+        SoftCpuExit::Continue { .. }
+    ));
+    assert_eq!(&cpu.context().ymm_hi128[240..], &[0; 16]);
+    // Aligned move faults before translating the noncanonical operand.
+    let aligned = avx_encode(
+        Instruction::with2(
+            Code::VEX_Vmovaps_ymm_ymmm256,
+            Register::YMM15,
+            MemoryOperand::with_base(Register::R14),
+        )
+        .unwrap(),
+    );
+    assert_eq!(avx_run(&mut cpu, &mut mem, va, &aligned), gp(va));
+}
+
+#[test]
+fn avx_masked_memory_does_not_touch_inactive_page() {
+    use iced_x86::{Code, Instruction, MemoryOperand, Register};
+    let (mut cpu, mut mem, va) = setup_snippet(&[]);
+    mem.map_range(0x2000_0000, 4096, PagePerms::USER_RW);
+    let addr = 0x2000_0ff0;
+    mem.write_direct(addr, &[0x39; 16]);
+    cpu.context_mut().xcr0 = 7;
+    cpu.context_mut().gpr[reg::RDI] = addr;
+    cpu.context_mut().write_xmm(1, u128::MAX);
+    cpu.context_mut().ymm_hi128[16..32].fill(0);
+    let load = avx_encode(
+        Instruction::with3(
+            Code::VEX_Vmaskmovps_ymm_ymm_m256,
+            Register::YMM0,
+            Register::YMM1,
+            MemoryOperand::with_base(Register::RDI),
+        )
+        .unwrap(),
+    );
+    assert!(matches!(
+        avx_run(&mut cpu, &mut mem, va, &load),
+        SoftCpuExit::Continue { .. }
+    ));
+    assert_eq!(cpu.context().read_xmm(0), u128::from_le_bytes([0x39; 16]));
+    assert_eq!(&cpu.context().ymm_hi128[..16], &[0; 16]);
+    cpu.context_mut()
+        .write_xmm(0, u128::from_le_bytes([0x27; 16]));
+    let store = avx_encode(
+        Instruction::with3(
+            Code::VEX_Vmaskmovps_m256_ymm_ymm,
+            MemoryOperand::with_base(Register::RDI),
+            Register::YMM1,
+            Register::YMM0,
+        )
+        .unwrap(),
+    );
+    assert!(matches!(
+        avx_run(&mut cpu, &mut mem, va, &store),
+        SoftCpuExit::Continue { .. }
+    ));
+    assert_eq!(mem.read_direct(addr, 16).unwrap(), [0x27; 16]);
+    cpu.context_mut().ymm_hi128[19] = 0x80; // enable lane 4 on absent page
+    let before = cpu.context().read_xmm(0);
+    assert_eq!(
+        avx_run(&mut cpu, &mut mem, va, &load),
+        pf(va, PF_ERR_USER, addr + 16)
+    );
+    assert_eq!(cpu.context().read_xmm(0), before);
+    cpu.context_mut().write_xmm(0, 0);
+    assert_eq!(
+        avx_run(&mut cpu, &mut mem, va, &store),
+        pf(va, PF_ERR_USER | PF_ERR_WRITE, addr + 16)
+    );
+    assert_eq!(mem.read_direct(addr, 16).unwrap(), [0x27; 16]);
+    // VEX MASKMOVDQU's implicit RDI must never become a native host pointer.
+    cpu.context_mut().write_xmm(1, u128::MAX);
+    assert!(matches!(
+        avx_run(&mut cpu, &mut mem, va, &[0xc5, 0xf9, 0xf7, 0xc1]),
+        SoftCpuExit::Continue { .. }
+    ));
+    assert_eq!(mem.read_direct(addr, 16).unwrap(), [0; 16]);
+}
+
+#[test]
+fn avx_gather_retains_completed_lanes_on_page_fault() {
+    use iced_x86::{Code, Instruction, MemoryOperand, Register};
+    let (mut cpu, mut mem, va) = setup_snippet(&[]);
+    let addr = 0x2000_0000;
+    mem.map_range(addr, 4096, PagePerms::USER_RW);
+    mem.write_direct(addr, &[17, 0, 0, 0, 29, 0, 0, 0]);
+    cpu.context_mut().xcr0 = 7;
+    cpu.context_mut().gpr[reg::RDI] = addr;
+    cpu.context_mut().write_xmm(0, u128::MAX);
+    cpu.context_mut().ymm_hi128[..16].fill(0xff);
+    let indices: Vec<u8> = [0u32, 1, 1024, 2]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    cpu.context_mut()
+        .write_xmm(1, u128::from_le_bytes(indices.try_into().unwrap()));
+    cpu.context_mut().write_xmm(2, u128::MAX);
+    cpu.context_mut().ymm_hi128[32..48].fill(0);
+    let gather = avx_encode(
+        Instruction::with3(
+            Code::VEX_Vpgatherdd_ymm_vm32y_ymm,
+            Register::YMM0,
+            MemoryOperand::new(
+                Register::RDI,
+                Register::YMM1,
+                4,
+                0,
+                0,
+                false,
+                Register::None,
+            ),
+            Register::YMM2,
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        avx_run(&mut cpu, &mut mem, va, &gather),
+        pf(va, PF_ERR_USER, addr + 4096)
+    );
+    let data = cpu.context().read_xmm(0).to_le_bytes();
+    assert_eq!(&data[..8], &[17, 0, 0, 0, 29, 0, 0, 0]);
+    assert_eq!(&data[8..], &[0xff; 8]);
+    assert_eq!(cpu.context().read_xmm(2) as u64, 0);
+    mem.map_range(addr + 4096, 4096, PagePerms::USER_RW);
+    mem.write_direct(addr + 4096, &43u32.to_le_bytes());
+    cpu.context_mut().flush_tlb();
+    assert!(matches!(
+        avx_run(&mut cpu, &mut mem, va, &gather),
+        SoftCpuExit::Continue { .. }
+    ));
+    let data = cpu.context().read_xmm(0).to_le_bytes();
+    assert_eq!(&data[..12], &[17, 0, 0, 0, 29, 0, 0, 0, 43, 0, 0, 0]);
+    assert_eq!(cpu.context().read_xmm(2), 0);
+    assert_eq!(&cpu.context().ymm_hi128[32..48], &[0; 16]);
+}
+
+#[test]
+fn avx_controls_and_vzero_obey_architectural_fault_order() {
+    let (mut cpu, mut mem, va) = setup_snippet(&[]);
+    let code = [0xc5, 0xfc, 0x77]; // vzeroall, no explicit register operands
+    cpu.context_mut().ymm_hi128.fill(0x71);
+    cpu.context_mut().cr0 |= 8;
+    assert_eq!(avx_run(&mut cpu, &mut mem, va, &code), ud(va)); // XCR0.AVX disabled before TS
+    cpu.context_mut().xcr0 = 7;
+    assert_eq!(
+        avx_run(&mut cpu, &mut mem, va, &code),
+        SoftCpuExit::Exception(X86Exception::device_not_available(va))
+    );
+    cpu.context_mut().cr0 &= !8;
+    cpu.context_mut().cr4 &= !(1 << 18);
+    assert_eq!(avx_run(&mut cpu, &mut mem, va, &code), ud(va));
+    assert_eq!(&cpu.context().ymm_hi128, &[0x71; 256]);
+    cpu.context_mut().cr4 |= 1 << 18;
+    assert!(matches!(
+        avx_run(&mut cpu, &mut mem, va, &code),
+        SoftCpuExit::Continue { .. }
+    ));
+    assert_eq!(&cpu.context().ymm_hi128, &[0; 256]);
+    assert_eq!(&cpu.context().fxsave.0[160..416], &[0; 256]);
+}
+
+#[test]
+fn avx_each_memory_encoding_matches_native_operand_and_register_results() {
+    use iced_x86::{CpuidFeature, Decoder, DecoderOptions, EncodingKind, Mnemonic, OpKind};
+    let mut encodings = BTreeMap::new();
+    for map in 1..=3u8 {
+        for w in [0, 0x80] {
+            for l in [0, 4] {
+                for pp in 0..4 {
+                    for vvvv in [0x70, 0x78] {
+                        for opcode in 0..=255u8 {
+                            let bytes = [0xc4, 0xe0 | map, w | l | pp | vvvv, opcode, 0x07, 0x31]; // [rdi]
+                            let insn = Decoder::new(64, &bytes, DecoderOptions::NONE).decode();
+                            if insn.is_invalid()
+                                || insn.encoding() != EncodingKind::VEX
+                                || insn.is_vsib()
+                                || !insn
+                                    .cpuid_features()
+                                    .iter()
+                                    .all(|f| matches!(f, CpuidFeature::AVX | CpuidFeature::AVX2))
+                                || !insn.op_kinds().any(|k| k == OpKind::Memory)
+                                || matches!(
+                                    insn.mnemonic(),
+                                    Mnemonic::Vldmxcsr
+                                        | Mnemonic::Vstmxcsr
+                                        | Mnemonic::Vmaskmovps
+                                        | Mnemonic::Vmaskmovpd
+                                        | Mnemonic::Vpmaskmovd
+                                        | Mnemonic::Vpmaskmovq
+                                )
+                            {
+                                continue;
+                            }
+                            encodings
+                                .entry(insn.code())
+                                .or_insert((insn, bytes[..insn.len()].to_vec()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(encodings.len() >= 400, "memory forms: {}", encodings.len());
+    let (mut cpu, mut mem, va) = setup_snippet(&[]);
+    let addr = 0x2000_0000;
+    mem.map_range(addr, 4096, PagePerms::USER_RW);
+    for (insn, bytes) in encodings.values() {
+        let mut initial = [0u8; 832];
+        initial[..512].copy_from_slice(&carrick_softcpu_x86::FxsaveArea::default().0);
+        initial[512..520].copy_from_slice(&7u64.to_le_bytes());
+        for i in 0..16 {
+            let data: [u8; 32] =
+                std::array::from_fn(|b| (i as u8).wrapping_mul(23).wrapping_add(b as u8));
+            initial[160 + i * 16..176 + i * 16].copy_from_slice(&data[..16]);
+            initial[576 + i * 16..592 + i * 16].copy_from_slice(&data[16..]);
+            cpu.context_mut()
+                .write_xmm(i, u128::from_le_bytes(data[..16].try_into().unwrap()));
+            cpu.context_mut().ymm_hi128[i * 16..i * 16 + 16].copy_from_slice(&data[16..]);
+        }
+        let oracle = native_avx_oracle(bytes, initial, true);
+        mem.write_direct(addr, &[0x3f; 32]);
+        cpu.context_mut().xcr0 = 7;
+        cpu.context_mut().rflags = 0x202;
+        cpu.context_mut().fxsave.0[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+        for (r, value) in [reg::RAX, reg::RCX, reg::RDX, reg::RDI]
+            .into_iter()
+            .zip([0x12345678, 3, 7, addr])
+        {
+            cpu.context_mut().gpr[r] = value;
+        }
+        assert!(
+            matches!(
+                avx_run(&mut cpu, &mut mem, va, bytes),
+                SoftCpuExit::Continue { .. }
+            ),
+            "{:?}",
+            insn.code()
+        );
+        assert_eq!(
+            &cpu.context().fxsave.0[160..416],
+            &oracle.guest[160..416],
+            "XMM {:?}",
+            insn.code()
+        );
+        assert_eq!(
+            &cpu.context().ymm_hi128,
+            &oracle.guest[576..],
+            "YMM {:?}",
+            insn.code()
+        );
+        assert_eq!(
+            &cpu.context().fxsave.0[24..28],
+            &oracle.guest[24..28],
+            "MXCSR {:?}",
+            insn.code()
+        );
+        assert_eq!(
+            mem.read_direct(addr, 32).unwrap(),
+            oracle.operand,
+            "memory {:?}",
+            insn.code()
+        );
+        for (r, value) in [reg::RAX, reg::RCX, reg::RDX].into_iter().zip(oracle.gprs) {
+            assert_eq!(cpu.context().gpr[r], value, "GPR {:?}", insn.code());
+        }
+        if insn.rflags_modified() != 0 {
+            assert_eq!(
+                cpu.context().rflags & 0x8d5,
+                oracle.flags & 0x8d5,
+                "flags {:?}",
+                insn.code()
+            );
+        }
+    }
+    println!("AVX oracle: {} memory instruction forms", encodings.len());
+}
+
+#[test]
+fn avx_unmasked_exact_underflow_preserves_destination() {
+    let (mut cpu, mut mem, va) = setup_snippet(&[]);
+    cpu.context_mut().xcr0 = 7;
+    cpu.context_mut().write_xmm(0, 0x1234);
+    cpu.context_mut().write_xmm(1, 0x0080_0000); // smallest normal f32
+    cpu.context_mut().write_xmm(2, 0x3f00_0000); // 0.5
+    cpu.context_mut().fxsave.0[24..28].copy_from_slice(&0x1780u32.to_le_bytes());
+    let result = avx_run(&mut cpu, &mut mem, va, &[0xc5, 0xf2, 0x59, 0xc2]); // vmulss xmm0,xmm1,xmm2
+    assert_eq!(
+        result,
+        SoftCpuExit::Exception(X86Exception::new(
+            X86ExceptionVector::SimdFloatingPoint,
+            va,
+            None,
+            None
+        ))
+    );
+    assert_eq!(cpu.context().read_xmm(0), 0x1234);
+    assert_ne!(cpu.context().fxsave.0[24] & 0x10, 0);
+}
+
+#[test]
+fn avx_dot_product_reports_intermediate_underflow_even_when_sum_is_zero() {
+    for bytes in [
+        &[0xc4, 0xe3, 0x71, 0x40, 0xc2, 0x3f][..], // vdpps xmm0,xmm1,xmm2,0x3f
+        &[0xc4, 0xe3, 0x71, 0x41, 0xc2, 0x3f],     // vdppd xmm0,xmm1,xmm2,0x3f
+    ] {
+        let (mut cpu, mut mem, va) = setup_snippet(&[]);
+        cpu.context_mut().xcr0 = 7;
+        cpu.context_mut().write_xmm(0, 0x1234);
+        if bytes[3] == 0x40 {
+            cpu.context_mut().write_xmm(1, 0x8080_0000_0080_0000);
+            cpu.context_mut().write_xmm(2, 0x3f00_0000_3f00_0000);
+        } else {
+            cpu.context_mut()
+                .write_xmm(1, (0x8010_0000_0000_0000u128 << 64) | 0x0010_0000_0000_0000);
+            cpu.context_mut()
+                .write_xmm(2, (0x3fe0_0000_0000_0000u128 << 64) | 0x3fe0_0000_0000_0000);
+        }
+        cpu.context_mut().fxsave.0[24..28].copy_from_slice(&0x1780u32.to_le_bytes());
+        assert_eq!(
+            avx_run(&mut cpu, &mut mem, va, bytes),
+            SoftCpuExit::Exception(X86Exception::new(
+                X86ExceptionVector::SimdFloatingPoint,
+                va,
+                None,
+                None
+            ))
+        );
+        assert_eq!(cpu.context().read_xmm(0), 0x1234);
+        assert_ne!(cpu.context().fxsave.0[24] & 0x10, 0);
+    }
+}
+
+#[test]
+fn avx_gather_normalizes_mask_and_suppresses_alignment_checks() {
+    use iced_x86::{Code, Instruction, MemoryOperand, Register};
+    let (mut cpu, mut mem, va) = setup_snippet(&[]);
+    let addr = 0x2000_0000;
+    mem.map_range(addr, 4096, PagePerms::USER_RW);
+    mem.write_direct(addr + 1, &0x11223344u32.to_le_bytes());
+    cpu.context_mut().xcr0 = 7;
+    cpu.context_mut().gpr[reg::RDI] = addr;
+    cpu.context_mut().cr0 |= 1 << 18;
+    cpu.context_mut().rflags |= 1 << 18;
+    cpu.context_mut().write_xmm(1, 1 | (4096u128 << 32));
+    cpu.context_mut()
+        .write_xmm(2, 0x80000001 | (0x80000001u128 << 32) | (1u128 << 64));
+    let gather = avx_encode(
+        Instruction::with3(
+            Code::VEX_Vpgatherdd_xmm_vm32x_xmm,
+            Register::XMM0,
+            MemoryOperand::new(
+                Register::RDI,
+                Register::XMM1,
+                1,
+                0,
+                0,
+                false,
+                Register::None,
+            ),
+            Register::XMM2,
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        avx_run(&mut cpu, &mut mem, va, &gather),
+        pf(va, PF_ERR_USER, addr + 4096)
+    );
+    assert_eq!(cpu.context().read_xmm(0) as u32, 0x11223344);
+    assert_eq!(cpu.context().read_xmm(2), 0xffff_ffff_0000_0000);
+}
+
+#[test]
+fn avx_packed_memory_and_masked_lanes_suppress_ac_and_ignore_em() {
+    let (mut cpu, mut mem, va) = setup_snippet(&[]);
+    let addr = 0x2000_0001;
+    mem.map_range(0x2000_0000, 4096, PagePerms::USER_RW);
+    mem.write_direct(addr, &[1; 32]);
+    cpu.context_mut().xcr0 = 7;
+    cpu.context_mut().gpr[reg::RDI] = addr;
+    cpu.context_mut().cr0 |= (1 << 18) | 4; // AM and EM
+    cpu.context_mut().rflags |= 1 << 18; // AC
+    cpu.context_mut().write_xmm(1, 0);
+    assert!(matches!(
+        avx_run(&mut cpu, &mut mem, va, &[0xc5, 0xf5, 0xfe, 0x07]),
+        SoftCpuExit::Continue { .. }
+    )); // vpaddd ymm0,ymm1,[rdi]
+    assert_eq!(cpu.context().read_xmm(0).to_le_bytes(), [1; 16]);
+    cpu.context_mut().write_xmm(1, u128::MAX);
+    assert!(matches!(
+        avx_run(&mut cpu, &mut mem, va, &[0xc4, 0xe2, 0x75, 0x2c, 0x07]),
+        SoftCpuExit::Continue { .. }
+    )); // vmaskmovps
+    // MXCSR VEX aliases obey the same EM rule; use aligned memory to isolate it.
+    cpu.context_mut().gpr[reg::RDI] = addr + 3;
+    mem.write_direct(addr + 3, &0x3f80u32.to_le_bytes());
+    assert!(matches!(
+        avx_run(&mut cpu, &mut mem, va, &[0xc5, 0xf8, 0xae, 0x17]),
+        SoftCpuExit::Continue { .. }
+    )); // vldmxcsr
+    assert_eq!(&cpu.context().fxsave.0[24..28], &0x3f80u32.to_le_bytes());
+}
+
+#[test]
+fn avx_xsetbv_and_component_masks_preserve_unrequested_state() {
+    let (_, mut mem, va) = setup_snippet(&[]);
+    let mut cpu = SoftCpu::with_cpuid_view(
+        mem.extents(),
+        Box::new(carrick_x86::GuestCpuidView::x86_64_v3()),
+    )
+    .unwrap();
+    cpu.context_mut().cpl = 0;
+    cpu.context_mut().cr4 &= !((1 << 20) | (1 << 21)); // supervisor fixture executes user-mapped code
+    cpu.context_mut().gpr[reg::RAX] = 7;
+    assert!(matches!(
+        avx_run(&mut cpu, &mut mem, va, &[0x0f, 0x01, 0xd1]),
+        SoftCpuExit::Continue { .. }
+    ));
+    assert_eq!(cpu.context().xcr0, 7);
+    assert!(matches!(
+        avx_run(&mut cpu, &mut mem, va, &[0x0f, 0x01, 0xd0]),
+        SoftCpuExit::Continue { .. }
+    ));
+    assert_eq!(cpu.context().gpr[reg::RAX], 7);
+    cpu.context_mut().gpr[reg::RAX] = 5;
+    assert_eq!(avx_run(&mut cpu, &mut mem, va, &[0x0f, 0x01, 0xd1]), gp(va));
+    assert_eq!(cpu.context().xcr0, 7);
+    cpu.context_mut().cpl = 3;
+    let addr = 0x2000_0000;
+    mem.map_range(addr, 4096, PagePerms::USER_RW);
+    let mut image = [0u8; 832];
+    image[24..28].copy_from_slice(&0x3f80u32.to_le_bytes());
+    image[512..520].copy_from_slice(&4u64.to_le_bytes());
+    image[576..].fill(0x71);
+    cpu.context_mut().gpr[reg::RDI] = addr;
+    cpu.context_mut().gpr[reg::RAX] = 4;
+    cpu.context_mut().write_xmm(0, 0x1234);
+    mem.write_direct(addr, &image);
+    assert!(matches!(
+        avx_run(&mut cpu, &mut mem, va, &[0x0f, 0xae, 0x2f]),
+        SoftCpuExit::Continue { .. }
+    ));
+    assert_eq!(cpu.context().read_xmm(0), 0x1234);
+    assert_eq!(&cpu.context().ymm_hi128, &[0x71; 256]);
+    assert_eq!(&cpu.context().fxsave.0[24..28], &0x3f80u32.to_le_bytes());
+    // Compacted AVX-only restores ignore MXCSR, unlike the standard form.
+    image[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
+    image[520..528].copy_from_slice(&((1u64 << 63) | 4).to_le_bytes());
+    image[576..].fill(0x25);
+    mem.write_direct(addr, &image);
+    assert!(matches!(
+        avx_run(&mut cpu, &mut mem, va, &[0x0f, 0xae, 0x2f]),
+        SoftCpuExit::Continue { .. }
+    ));
+    assert_eq!(&cpu.context().ymm_hi128, &[0x25; 256]);
+    assert_eq!(&cpu.context().fxsave.0[24..28], &0x3f80u32.to_le_bytes());
+    cpu.context_mut().gpr[reg::RAX] = 2;
+    image[512..520].fill(0); // initialize requested SSE, preserve AVX
+    mem.write_direct(addr, &image);
+    assert!(matches!(
+        avx_run(&mut cpu, &mut mem, va, &[0x0f, 0xae, 0x2f]),
+        SoftCpuExit::Continue { .. }
+    ));
+    assert_eq!(cpu.context().read_xmm(0), 0);
+    assert_eq!(&cpu.context().ymm_hi128, &[0x25; 256]);
+}
+
+#[test]
+fn avx_rounding_and_unmasked_invalid_operation_are_guest_state() {
+    use iced_x86::{Code, Instruction, Register};
+    let (mut cpu, mut mem, va) = setup_snippet(&[]);
+    cpu.context_mut().xcr0 = 7;
+    let convert = avx_encode(
+        Instruction::with2(
+            Code::VEX_Vcvtss2si_r32_xmmm32,
+            Register::R15D,
+            Register::XMM1,
+        )
+        .unwrap(),
+    );
+    for (mode, positive, negative) in [(0, 2u32, -2i32), (1, 1, -2), (2, 2, -1), (3, 1, -1)] {
+        for (input, expected) in [(1.5f32, positive), (-1.5, negative as u32)] {
+            cpu.context_mut().write_xmm(1, u128::from(input.to_bits()));
+            cpu.context_mut().gpr[reg::R15] = u64::MAX;
+            cpu.context_mut().fxsave.0[24..28]
+                .copy_from_slice(&(0x1f80u32 | (mode << 13)).to_le_bytes());
+            assert!(matches!(
+                avx_run(&mut cpu, &mut mem, va, &convert),
+                SoftCpuExit::Continue { .. }
+            ));
+            assert_eq!(cpu.context().gpr[reg::R15], u64::from(expected));
+        }
+    }
+    cpu.context_mut().write_xmm(0, 0x1122);
+    cpu.context_mut().write_xmm(1, 0);
+    cpu.context_mut().write_xmm(2, 0);
+    cpu.context_mut().fxsave.0[24..28].copy_from_slice(&0x1f00u32.to_le_bytes());
+    assert_eq!(
+        avx_run(&mut cpu, &mut mem, va, &[0xc5, 0xf2, 0x5e, 0xc2]),
+        SoftCpuExit::Exception(X86Exception::new(
+            X86ExceptionVector::SimdFloatingPoint,
+            va,
+            None,
+            None
+        ))
+    );
+    assert_eq!(cpu.context().read_xmm(0), 0x1122);
+    assert_ne!(cpu.context().fxsave.0[24] & 1, 0);
+}
+
+#[test]
+fn avx_xstate_second_page_fault_publishes_no_partial_component() {
+    let (mut cpu, mut mem, va) = setup_snippet(&[]);
+    let addr = 0x2000_0d00;
+    mem.map_range(0x2000_0000, 4096, PagePerms::USER_RW);
+    let mut image = [0x55u8; 768];
+    image[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+    image[512..576].fill(0);
+    image[512] = 7;
+    mem.write_direct(addr, &image);
+    cpu.context_mut().xcr0 = 7;
+    cpu.context_mut().gpr[reg::RAX] = 7;
+    cpu.context_mut().gpr[reg::RDI] = addr;
+    cpu.context_mut().write_xmm(0, 0x1234);
+    cpu.context_mut().ymm_hi128.fill(0x71);
+    assert_eq!(
+        avx_run(&mut cpu, &mut mem, va, &[0x0f, 0xae, 0x27]),
+        pf(va, PF_ERR_USER | PF_ERR_WRITE, addr + 768)
+    );
+    assert_eq!(mem.read_direct(addr, 768).unwrap(), image);
+    assert_eq!(
+        avx_run(&mut cpu, &mut mem, va, &[0x0f, 0xae, 0x2f]),
+        pf(va, PF_ERR_USER, addr + 768)
+    );
+    assert_eq!(cpu.context().read_xmm(0), 0x1234);
+    assert_eq!(&cpu.context().ymm_hi128, &[0x71; 256]);
 }
