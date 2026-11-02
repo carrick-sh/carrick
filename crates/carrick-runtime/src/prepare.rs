@@ -327,6 +327,7 @@ fn run_prepared_kvm_pool_with_debug(
         physical_debug.attach(&physical);
     }
     let _debug_server = debug_server;
+    let census_scope = dispatcher.container().launch().carrier_scope_id.clone();
     let dispatcher = Arc::new(std::sync::Mutex::new(dispatcher));
     root_context
         .thread()
@@ -401,8 +402,18 @@ fn run_prepared_kvm_pool_with_debug(
     )?;
     dormant.activate(&scheduler, Arc::clone(root_context.thread()), proof)?;
     drop(factory);
+    crate::el1_census::init_from_env();
     let completion = completed_rx.recv();
     let shutdown = pool.shutdown();
+    // Pool workers have joined; retain the exact carrier mapping for the
+    // snapshot even when guest execution returned a failure.
+    if let Ok(counters) = physical.syscall_counters() {
+        crate::el1_census::write_counters_at_teardown(
+            Some(&census_scope),
+            &counters,
+            carrick_spec::syscall_census::CensusIsa::X86_64,
+        );
+    }
     let authority_refusals = stats.authority_refusals().unwrap_or_default();
     let outcome = completion
         .map_err(|error| PreparedKvmPoolFailure {

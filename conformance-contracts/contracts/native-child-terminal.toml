@@ -1,3 +1,6 @@
+# #1394: additional ABI bookkeeping witness only; existing semantic and
+# work-budget bindings remain authoritative. Census publication reads counters
+# after executor join and does not alter this contract's guest operation.
 # #1153: InotifyNameCache seqlock rebuild and EL1_ABI_LAYOUT_HASH update in
 # shared crates/carrick-el1-abi/src/lib.rs (bound under kernel.el1.inotify and
 # kernel.x86.file-region). Terminal child retirement semantics are unchanged.
@@ -45,6 +48,7 @@ vm_free = [
   "carrick-runtime::vcpu_loop::signal_ingress_producer::tests::full_ingress_merges_two_exact_thread_sigpipes_without_aborting",
   "carrick-runtime::vcpu_loop::zone::ipc_tests::native_ipc_epipe_admits_sigpipe_before_returning_errno_32",
   "carrick-sched-core::tests::unplaceable_parent_host_handback_consumes_one_park",
+  "carrick-el1-abi::refusal_census_tests::refusal_snapshot_preserves_caller_populations_without_changing_service_counts",
 ]
 
 [bindings.unresolved]

@@ -1,0 +1,30 @@
+/*
+ * Which native syscall ordinals did Linux serve for this exact workload?
+ * Based on oracle-syscall-mix.bt's live-qualified raw_syscalls ABI and TID
+ * descendant tracking. The workload keeps its own PID/security namespaces;
+ * only this separate observer has --privileged --pid=host. Resume the root
+ * through its FIFO after CARRICK_ORACLE_SHAPE_READY. Count-only instrumentation
+ * changes timing; no timing from this pass qualifies as speed evidence.
+ * ENOSYS returns are not served. Interrupted calls and terminal calls count
+ * only after a matching sys_enter. Natural root exit and an empty tracked
+ * population are required. Automatic map dumping avoids print/clear races.
+ */
+BEGIN { @tracked[$1] = 1; @started = nsecs; printf("CARRICK_ORACLE_SHAPE_READY\n"); }
+tracepoint:sched:sched_process_fork /@tracked[args->parent_pid]/ { @tracked[args->child_pid] = 1; }
+tracepoint:raw_syscalls:sys_enter /@tracked[tid]/ { @nr[tid] = args->id; @active[tid] = 1; }
+tracepoint:raw_syscalls:sys_exit /@tracked[tid] && @active[tid]/ {
+    if (args->ret != -38) { @served[@nr[tid]] = count(); }
+    delete(@nr[tid]); delete(@active[tid]);
+}
+tracepoint:sched:sched_process_exit /@tracked[tid]/ {
+    if (@active[tid]) {
+        if (@nr[tid] == $3 || @nr[tid] == $4) { @served[@nr[tid]] = count(); }
+        else { @incomplete = count(); }
+    }
+    delete(@nr[tid]); delete(@active[tid]); delete(@tracked[tid]);
+    if (tid == $1) { printf("CARRICK_ORACLE_SHAPE_DONE\n"); exit(); }
+}
+interval:s:1 /nsecs - @started > (uint64)$2 * 1000000000/ {
+    printf("CARRICK_ORACLE_SHAPE_ERROR_BOUND\n"); exit();
+}
+END { delete(@started); }

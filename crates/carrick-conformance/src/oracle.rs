@@ -188,6 +188,10 @@ pub fn oracle_key_with_identity(
 /// One cached docker oracle, one JSONL line.
 #[derive(Debug, Clone, ::serde::Serialize, ::serde::Deserialize)]
 pub struct OracleRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_ordinals: Option<Vec<u64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape_source: Option<String>,
     /// The suite name at cache time — purely for `git diff` legibility; matching
     /// is by `key`, never by name.
     pub name: String,
@@ -491,6 +495,8 @@ impl OracleCache {
         self.by_key.insert(
             key.clone(),
             OracleRecord {
+                served_ordinals: None,
+                shape_source: None,
                 name: suite.name.clone(),
                 key,
                 result,
@@ -499,6 +505,37 @@ impl OracleCache {
         );
         self.verdict_dirty = true;
         true
+    }
+
+    pub fn served_ordinals(
+        &self,
+        suite: &Suite,
+        platform: crate::lane::DockerPlatform,
+        profile: ParserProfile,
+    ) -> Option<Vec<u64>> {
+        self.by_key
+            .get(&self.determinant(suite, platform, profile))
+            .filter(|record| {
+                record.shape_source.as_deref()
+                    == Some(crate::oracle_shape::source_fingerprint().as_str())
+            })
+            .and_then(|record| record.served_ordinals.clone())
+    }
+
+    pub fn set_served_ordinals(
+        &mut self,
+        suite: &Suite,
+        platform: crate::lane::DockerPlatform,
+        served: Vec<u64>,
+    ) {
+        for profile in [ParserProfile::Regression, ParserProfile::ClosureV3] {
+            let key = self.determinant(suite, platform, profile);
+            if let Some(record) = self.by_key.get_mut(&key) {
+                record.served_ordinals = Some(served.clone());
+                record.shape_source = Some(crate::oracle_shape::source_fingerprint());
+                self.verdict_dirty = true;
+            }
+        }
     }
 
     fn has_image_identity(&self, suite: &Suite) -> bool {
@@ -1135,6 +1172,8 @@ mod tests {
         let platform = crate::lane::DockerPlatform::LinuxArm64;
         let key = oracle_key_for_profile(&suite, platform, ParserProfile::ClosureV3);
         let record = OracleRecord {
+            served_ordinals: None,
+            shape_source: None,
             name: suite.name.clone(),
             key: key.clone(),
             result: result(&[("t", Outcome::Conf)], SuiteOutcome::Success),
@@ -1172,6 +1211,8 @@ mod tests {
         let suite = base_suite();
         let platform = crate::lane::DockerPlatform::LinuxArm64;
         let record = OracleRecord {
+            served_ordinals: None,
+            shape_source: None,
             name: suite.name.clone(),
             key: oracle_key(&suite, platform),
             result: result(&[("t", Outcome::Ok)], SuiteOutcome::Success),
@@ -1295,6 +1336,8 @@ mod tests {
         let platform = crate::lane::DockerPlatform::LinuxArm64;
         let profile = ParserProfile::ClosureV3;
         let record = OracleRecord {
+            served_ordinals: None,
+            shape_source: None,
             name: suite.name.clone(),
             key: oracle_key_for_profile(&suite, platform, profile),
             result: result(&[("t", Outcome::Ok)], SuiteOutcome::Success),
@@ -1339,6 +1382,8 @@ mod tests {
         // outright junk) -> kept=1, skipped=2. The skip count is what load()
         // turns into the operator-facing re-bless warning.
         let valid = serde_json::to_string(&OracleRecord {
+            served_ordinals: None,
+            shape_source: None,
             name: "s".into(),
             key: "k1".into(),
             result: result(&[("t", Outcome::Ok)], SuiteOutcome::Success),
@@ -1353,6 +1398,33 @@ mod tests {
             skipped, 2,
             "two non-empty unparseable lines counted (blank lines ignored)"
         );
+    }
+
+    #[test]
+    fn shape_cache_requires_current_source_and_exact_workload_key() {
+        let path = tempfile::tempdir().unwrap();
+        let mut cache = OracleCache::load(&path.path().join("oracle.jsonl"));
+        let suite = base_suite();
+        let platform = crate::lane::DockerPlatform::LinuxArm64;
+        let profile = ParserProfile::Regression;
+        assert!(cache.insert(
+            &suite,
+            platform,
+            result(&[("t1", Outcome::Ok)], SuiteOutcome::Success),
+            None
+        ));
+        assert!(cache.served_ordinals(&suite, platform, profile).is_none());
+        cache.set_served_ordinals(&suite, platform, vec![34, 56]);
+        assert_eq!(
+            cache.served_ordinals(&suite, platform, profile),
+            Some(vec![34, 56])
+        );
+        let mut changed = suite.clone();
+        changed.cmd.push("other".into());
+        assert!(cache.served_ordinals(&changed, platform, profile).is_none());
+        let key = cache.determinant(&suite, platform, profile);
+        cache.by_key.get_mut(&key).unwrap().shape_source = Some("stale".into());
+        assert!(cache.served_ordinals(&suite, platform, profile).is_none());
     }
 
     #[test]

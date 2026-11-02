@@ -8,3 +8,5 @@ pub mod oracle;
 pub mod parsers;
 pub mod shard;
 pub mod verdict;
+
+pub mod oracle_shape;

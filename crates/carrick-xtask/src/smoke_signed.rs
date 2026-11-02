@@ -530,6 +530,9 @@ pub fn run(root: &Path, args: SmokeSignedArgs) -> Result<SmokeReceipt, SmokeSign
         tree_unchanged: head_after == head && after == before,
     });
     let mut failures = verdict.failures;
+    if let Err(error) = carrick_spec::syscall_census::check_log(&log, None) {
+        failures.push(format!("syscall census: {error}"));
+    }
     let artifact = match verdict.executable.as_deref().map(inspect_executable) {
         Some(Ok(identity)) => {
             if !identity.hypervisor_entitlement || !identity.dof_present {

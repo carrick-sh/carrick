@@ -1,3 +1,6 @@
+# #1394: additional ABI bookkeeping witness only; existing semantic and
+# work-budget bindings remain authoritative. Census publication reads counters
+# after executor join and does not alter this contract's guest operation.
 # #1101: fork lifecycle backing uses retained metadata custody.
 # Task entry receipts, identity, and admission transitions are unchanged; lifecycle storage keeps its existing address geometry and carrier lifetime.
 # The component ownership/counter witnesses are registered under
@@ -27,6 +30,7 @@ rationale = "Admission creates one native process owner for the retained root an
 [bindings]
 vm_free = [
   "carrick-el1-linux::aarch64_process_tests::arm_root_setup_enters_production_process_venue",
+  "carrick-el1-abi::refusal_census_tests::refusal_snapshot_preserves_caller_populations_without_changing_service_counts",
 ]
 # The shared dispatch trait change defaults to no continuation-work exemption
 # for ARM. dispatch::ring_first_tests::strict_arm_preserves_family_declines_

@@ -2060,6 +2060,16 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
         ))
     }
 
+    /// Snapshot while this factory still retains the carrier metadata mapping.
+    pub fn syscall_counters(&self) -> Result<Counters, TrapError> {
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        let counters: &Counters = custody.metadata(COUNTERS_OFFSET);
+        Ok(counters.copy_snapshot())
+    }
+
     pub fn refusal_count(&self, nr: carrick_abi::NativeNr) -> Result<u64, TrapError> {
         let custody = self
             .custody

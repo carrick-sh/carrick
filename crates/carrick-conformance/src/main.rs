@@ -951,6 +951,7 @@ fn run() -> anyhow::Result<ExitCode> {
             // only by the final authoritative write.
             if let Some(res) = cached.get(i).and_then(|c| c.as_ref()) {
                 let docker = DockerSide {
+                    served_ordinals: cache.served_ordinals(s, docker_platform, oracle_profile),
                     result: res.clone(),
                     run_id: "<cached>".to_string(),
                     argv: oracle_context.argv(s, "<cached>", docker_platform)?,
@@ -1180,7 +1181,6 @@ fn run() -> anyhow::Result<ExitCode> {
         eprintln!("  [oracle {:?}] {}", args.oracle, s.name);
         out
     });
-    drop(phase2_lease);
 
     // Parse fresh docker runs, fold comparable ones into the cache, key them back
     // by suite index for phase 3.
@@ -1218,7 +1218,23 @@ fn run() -> anyhow::Result<ExitCode> {
                     Some(o.elapsed_ms),
                     timed_out,
                 );
+                let served_ordinals = if oracle_context.backend == lane::OracleBackend::Docker {
+                    match carrick_conformance::oracle_shape::capture(s, &o.run_id, docker_platform)
+                    {
+                        Ok(served) => {
+                            cache.set_served_ordinals(s, docker_platform, served.clone());
+                            Some(served)
+                        }
+                        Err(error) => {
+                            eprintln!("oracle syscall shape {}: {error}", s.name);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 DockerSide {
+                    served_ordinals,
                     result: res,
                     run_id: o.run_id,
                     argv: o.argv,
@@ -1227,6 +1243,7 @@ fn run() -> anyhow::Result<ExitCode> {
                 }
             }
             None => DockerSide {
+                served_ordinals: None,
                 result: parsers::SuiteResult::empty(),
                 run_id: String::new(),
                 argv: oracle_context.argv(s, "spawn-failed", docker_platform)?,
@@ -1236,6 +1253,9 @@ fn run() -> anyhow::Result<ExitCode> {
         };
         fresh.insert(i, side);
     }
+    // Instrumented syscall-shape passes are Docker work too. Retain the
+    // same phase custody until every observer/workload pair has finished.
+    drop(phase2_lease);
     if cache.dirty() {
         cache.save()?;
         eprintln!(
@@ -1253,6 +1273,7 @@ fn run() -> anyhow::Result<ExitCode> {
     for (i, s) in selected.iter().enumerate() {
         let docker = match &cached[i] {
             Some(res) => DockerSide {
+                served_ordinals: cache.served_ordinals(s, docker_platform, oracle_profile),
                 result: res.clone(),
                 run_id: "<cached>".to_string(),
                 argv: oracle_context.argv(s, "<cached>", docker_platform)?,
@@ -1441,6 +1462,7 @@ fn binary_identity(path: &Path) -> anyhow::Result<String> {
 /// fresh `docker run` or the committed oracle cache (so phase 3 is agnostic to
 /// which).
 struct DockerSide {
+    served_ordinals: Option<Vec<u64>>,
     result: parsers::SuiteResult,
     run_id: String,
     argv: Vec<String>,
@@ -1506,10 +1528,18 @@ fn build_report(
         deadline,
         result: &c_res,
     };
-    let cl = match policy {
+    let mut cl = match policy {
         ClassificationPolicy::Closure => classify_closure(s, facts(), d_res, docker.timed_out),
         ClassificationPolicy::Baseline(baseline) => classify(s, facts(), d_res, baseline),
     };
+
+    if let Err(error) =
+        carrick_spec::syscall_census::check_log(&c_raw.stderr, docker.served_ordinals.as_deref())
+    {
+        cl.gating = true;
+        cl.verdict = Verdict::Incomplete;
+        cl.new_diffs.push(format!("syscall census: {error}"));
+    }
 
     SuiteReport {
         name: s.name.clone(),
@@ -2945,7 +2975,15 @@ mod tests {
         let stdout_path = temp.join("stdout");
         let stderr_path = temp.join("stderr");
         std::fs::write(&stdout_path, output).expect("write stdout fixture");
-        std::fs::write(&stderr_path, "").expect("write stderr fixture");
+        std::fs::write(
+            &stderr_path,
+            concat!(
+                "CARRICK_SYSCALL_CENSUS ",
+                r#"{"refusal_evidence":{"schema":1,"isa":"aarch64","complete":true,"rows":[]}}"#,
+                "\n",
+            ),
+        )
+        .expect("write stderr fixture");
         let run = engine::RunOutput {
             stdout_path,
             stderr_path,
@@ -2968,6 +3006,7 @@ mod tests {
             timed_out: false,
         };
         let docker = DockerSide {
+            served_ordinals: None,
             result: parsers::parse_for_mode(
                 crate::manifest::VerdictKind::Tap,
                 &raw,
@@ -2982,6 +3021,22 @@ mod tests {
         let report = build_report(&suite, Some(&run), &docker, ClassificationPolicy::Closure);
         assert_eq!(report.verdict, Verdict::Match);
         assert!(!report.gating);
+
+        // A successful guest and identical assertion output must still be
+        // rejected when a native child refused allowlisted mkdirat.
+        std::fs::write(&run.stderr_path, concat!(
+            "CARRICK_SYSCALL_CENSUS ",
+            r#"{"refusal_evidence":{"schema":1,"isa":"aarch64","complete":true,"rows":[{"nr":34,"caller":"native_child","refused":1,"venue_refused":0,"allowlisted":true}]}}"#,
+            "\n",
+        )).expect("write refused-child evidence");
+        let report = build_report(&suite, Some(&run), &docker, ClassificationPolicy::Closure);
+        assert!(report.gating);
+        assert!(
+            report
+                .new_diffs
+                .iter()
+                .any(|diff| diff.contains("allowlisted syscall refused"))
+        );
 
         std::fs::remove_dir_all(temp).expect("remove parser test directory");
     }

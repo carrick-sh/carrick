@@ -1,3 +1,6 @@
+# #1394: additional ABI bookkeeping witness only; existing semantic and
+# work-budget bindings remain authoritative. Census publication reads counters
+# after executor join and does not alter this contract's guest operation.
 # #1044 diagnostic follow-up: preserve native-service admission/dispatch
 # error codes in the existing fatal record.
 # No service refusal or retry policy changes; signed attribution is pending.
@@ -97,6 +100,7 @@ vm_free = [
   "carrick-runtime::vcpu_loop::memory::tests::arm_entry_binding_diagnostic_reaches_the_fatal_record_without_truncation (diagnostic payload/formatter only: reason round trip, caller coordinates, every retained field within the fixed fatal record; existing semantic/work bindings remain required)",
   "carrick-sched-core::aarch64_context::tests::aarch64_context_set_user_stack_updates_only_sp_el0 (ProcessContext::set_user_stack updates only native.sp_el0 and preserves every other saved register, TLS and address binding)",
   "carrick-el1-linux::aarch64_process_tests::{arm_unregistered_host_cancel_commits_terminal_intent_before_record_release,arm_unregistered_cancel_requeues_adapter_operation_without_retirement,arm_unregistered_cancel_without_lifecycle_retains_record_for_host,arm_unregistered_pool_cancel_reaps_entry_before_host_cleanup} (unregistered host cancellation uses ZoneRetirement before Free, consumes one live unit, preserves an in-flight host owner and final member through host handback, retains adapter tokens and missing-lifecycle records, and reaps a closing pool entry with a distinct live leader lane; no signed acceptance claim)",
+  "carrick-el1-abi::refusal_census_tests::refusal_snapshot_preserves_caller_populations_without_changing_service_counts",
 ]
 
 [bindings.unresolved]

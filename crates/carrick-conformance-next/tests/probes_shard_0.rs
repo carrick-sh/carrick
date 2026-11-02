@@ -470,7 +470,11 @@ fn generic_probe_shard_0() {
 
             let outcome = common::timed_probe_run(
                 &format!("generic probe shard 0 {target}:{probe_name}"),
-                || common::with_empty_stdin_pipe(|| container.run(["/tmp/carrick-init"])),
+                || {
+                    common::with_empty_stdin_pipe(|| {
+                        common::run_probe_differential(probe_name, &container)
+                    })
+                },
             );
             let result = common::run_named_or_fail(
                 &format!("generic probe shard 0 {target}:{probe_name}"),

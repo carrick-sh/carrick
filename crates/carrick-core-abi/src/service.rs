@@ -138,16 +138,32 @@ pub enum ServiceOperation {
 pub struct HostFilePayloadDescriptor {
     address: GuestVa,
     length: GuestLen,
+    ordinal: NativeOrdinal,
 }
 impl HostFilePayloadDescriptor {
-    pub const fn checked(address: GuestVa, length: GuestLen) -> Option<Self> {
+    pub const fn checked(
+        address: GuestVa,
+        length: GuestLen,
+        ordinal: NativeOrdinal,
+    ) -> Option<Self> {
         if length.raw() < crate::host_file::HOST_FILE_HEADER_BYTES as u64
             || length.raw() > crate::host_file::MAX_HOST_FILE_RECORD_BYTES
             || address.raw().checked_add(length.raw()).is_none()
         {
             return None;
         }
-        Some(Self { address, length })
+        Some(Self {
+            address,
+            length,
+            ordinal: NativeOrdinal::new(if ordinal.raw() < 512 {
+                ordinal.raw()
+            } else {
+                512
+            }),
+        })
+    }
+    pub const fn ordinal(self) -> NativeOrdinal {
+        self.ordinal
     }
     pub const fn address(self) -> GuestVa {
         self.address
@@ -162,6 +178,7 @@ impl HostFilePayloadDescriptor {
 pub struct ExecPayloadDescriptor {
     address: GuestVa,
     length: GuestLen,
+    ordinal: NativeOrdinal,
 }
 /// Linux's aggregate argv/envp accounting ceiling. String bytes include their
 /// terminating NUL and each vector entry consumes one 64-bit pointer slot.
@@ -186,6 +203,12 @@ pub const MAX_EXEC_ACCESS_BYTES: usize = 12 * 4
 /// ([`crate::host_file::HostFileHeader::table`]); all zero when the ring
 /// sealed no table. An `execveat` that names a descriptor resolves it here.
 pub const EXEC_TABLE_BYTES: usize = 3 * 8;
+
+// Payload lengths occupy the low half of one existing service-cell word;
+// the bounded diagnostic ordinal occupies its high half. Refuse future size
+// growth at compile time rather than truncating a guest payload.
+const _: () = assert!(MAX_EXEC_PAYLOAD_BYTES <= u32::MAX as u64);
+const _: () = assert!(crate::host_file::MAX_HOST_FILE_RECORD_BYTES <= u32::MAX as u64);
 
 const EXEC_PAYLOAD_MAGIC: u32 = u32::from_le_bytes(*b"CEXE");
 const EXEC_PAYLOAD_VERSION: u16 = 3;
@@ -457,14 +480,29 @@ impl<'a> Iterator for ExecPayloadStrings<'a> {
     }
 }
 impl ExecPayloadDescriptor {
-    pub const fn checked(address: GuestVa, length: GuestLen) -> Option<Self> {
+    pub const fn checked(
+        address: GuestVa,
+        length: GuestLen,
+        ordinal: NativeOrdinal,
+    ) -> Option<Self> {
         if length.raw() == 0
             || length.raw() > MAX_EXEC_PAYLOAD_BYTES
             || address.raw().checked_add(length.raw()).is_none()
         {
             return None;
         }
-        Some(Self { address, length })
+        Some(Self {
+            address,
+            length,
+            ordinal: NativeOrdinal::new(if ordinal.raw() < 512 {
+                ordinal.raw()
+            } else {
+                512
+            }),
+        })
+    }
+    pub const fn ordinal(self) -> NativeOrdinal {
+        self.ordinal
     }
     pub const fn address(self) -> GuestVa {
         self.address
@@ -1152,11 +1190,19 @@ impl ServiceCell {
             ServiceOperation::Exec {
                 capability: _,
                 payload,
-            } => (5, payload.address().raw(), payload.length().raw()),
+            } => (
+                5,
+                payload.address().raw(),
+                payload.length().raw() | (payload.ordinal().raw() << 32),
+            ),
             ServiceOperation::HostFile {
                 capability: _,
                 payload,
-            } => (6, payload.address().raw(), payload.length().raw()),
+            } => (
+                6,
+                payload.address().raw(),
+                payload.length().raw() | (payload.ordinal().raw() << 32),
+            ),
         };
         for (index, value) in [(8, execution.raw()), (9, kind), (10, first), (11, second)] {
             self.words[index].store(value, Ordering::Relaxed);
@@ -1298,7 +1344,8 @@ impl ServiceCell {
                     ),
                     payload: ExecPayloadDescriptor::checked(
                         GuestVa::new(first),
-                        GuestLen::new(cell.words[11].load(Ordering::Relaxed)),
+                        GuestLen::new(cell.words[11].load(Ordering::Relaxed) & u64::from(u32::MAX)),
+                        NativeOrdinal::new(cell.words[11].load(Ordering::Relaxed) >> 32),
                     )
                     .ok_or(ServiceError::Stale)?,
                 },
@@ -1309,7 +1356,8 @@ impl ServiceCell {
                     ),
                     payload: HostFilePayloadDescriptor::checked(
                         GuestVa::new(first),
-                        GuestLen::new(cell.words[11].load(Ordering::Relaxed)),
+                        GuestLen::new(cell.words[11].load(Ordering::Relaxed) & u64::from(u32::MAX)),
+                        NativeOrdinal::new(cell.words[11].load(Ordering::Relaxed) >> 32),
                     )
                     .ok_or(ServiceError::Stale)?,
                 },
@@ -1398,7 +1446,8 @@ impl ServiceCell {
             } => {
                 cell.words[9].load(Ordering::Relaxed) == 5
                     && cell.words[10].load(Ordering::Relaxed) == payload.address().raw()
-                    && cell.words[11].load(Ordering::Relaxed) == payload.length().raw()
+                    && cell.words[11].load(Ordering::Relaxed)
+                        == (payload.length().raw() | (payload.ordinal().raw() << 32))
                     && cell.result.load(Ordering::Relaxed) == capability.raw().get()
             }
             ServiceOperation::HostFile {
@@ -1407,7 +1456,8 @@ impl ServiceCell {
             } => {
                 cell.words[9].load(Ordering::Relaxed) == 6
                     && cell.words[10].load(Ordering::Relaxed) == payload.address().raw()
-                    && cell.words[11].load(Ordering::Relaxed) == payload.length().raw()
+                    && cell.words[11].load(Ordering::Relaxed)
+                        == (payload.length().raw() | (payload.ordinal().raw() << 32))
                     && cell.result.load(Ordering::Relaxed) == capability.raw().get()
             }
         };
@@ -1850,6 +1900,7 @@ mod tests {
         ExecPayloadDescriptor::checked(
             carrick_guest_arch::GuestVa::new(address),
             carrick_guest_arch::GuestLen::new(bytes),
+            NativeOrdinal::new(221),
         )
         .unwrap()
     }
@@ -2017,11 +2068,29 @@ mod tests {
     fn exec_payload_rejects_zero_overflow_and_arg_max_excess() {
         use carrick_guest_arch::{GuestLen, GuestVa};
         let max = GuestLen::new(MAX_EXEC_PAYLOAD_BYTES);
-        assert!(ExecPayloadDescriptor::checked(GuestVa::new(0x1000), GuestLen::new(0)).is_none());
-        assert!(ExecPayloadDescriptor::checked(GuestVa::new(u64::MAX), GuestLen::new(2)).is_none());
         assert!(
-            ExecPayloadDescriptor::checked(GuestVa::new(0x1000), GuestLen::new(max.raw() + 1),)
-                .is_none()
+            ExecPayloadDescriptor::checked(
+                GuestVa::new(0x1000),
+                GuestLen::new(0),
+                NativeOrdinal::new(221)
+            )
+            .is_none()
+        );
+        assert!(
+            ExecPayloadDescriptor::checked(
+                GuestVa::new(u64::MAX),
+                GuestLen::new(2),
+                NativeOrdinal::new(221)
+            )
+            .is_none()
+        );
+        assert!(
+            ExecPayloadDescriptor::checked(
+                GuestVa::new(0x1000),
+                GuestLen::new(max.raw() + 1),
+                NativeOrdinal::new(221)
+            )
+            .is_none()
         );
     }
 

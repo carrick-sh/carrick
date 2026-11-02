@@ -1,3 +1,6 @@
+# #1394: additional ABI bookkeeping witness only; existing semantic and
+# work-budget bindings remain authoritative. Census publication reads counters
+# after executor join and does not alter this contract's guest operation.
 schema_version = 1
 id = "process.exec.backing"
 title = "Uninstalled exec backing retains isolated physical image extents"
@@ -17,6 +20,7 @@ vm_free = [
   "carrick-vmm-hvf::trap::execve_rebuild::backing_preparation_tests::exec_backing_partial_preparation_releases_leases_and_preserves_peer",
   "carrick-vmm-hvf::metadata_grant::native_service::intake_tests::native_exec_payload_authenticates_a_live_metadata_block (three descriptor loads for an L2 block, no L3 access)",
   "carrick-vmm-hvf::trap::frame_inventory::tests::native_exec_successor_arena_has_no_terminal (a ring-owned successor arena carries no terminal; the host successor keeps its PROT_NONE identity outputs)",
+  "carrick-el1-abi::refusal_census_tests::refusal_snapshot_preserves_caller_populations_without_changing_service_counts",
 ]
 
 [bindings.unresolved]

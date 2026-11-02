@@ -1,0 +1,25 @@
+schema_version = 1
+id = "diagnostics.syscall-refusal"
+title = "Every carrier publishes exact syscall refusal evidence"
+guest_surfaces = ["entry:aarch64", "entry:x86", "syscall:mkdirat"]
+semantic_authority = ["docs/conformance-contracts/syscall-refusal-census.md", "scripts/bpftrace/oracle-served.bt"]
+fixture = "crates/carrick-el1-abi/src/refusal_census_tests.rs"
+scale_points = [1]
+structural_budgets = []
+rationale = "Ring refusal and carrier venue refusal are separate exact counters. The child population is a subset of its carrier total. Refusal hooks perform bounded atomic work; no clock reads are added to the default path. Publication scans 513 native ordinals once after executor join. Overflow, missing evidence and an unavailable oracle shape are incomplete measurements, never semantic passes."
+
+[bindings]
+vm_free = [
+  "carrick-el1-abi::refusal_census_tests::refusal_snapshot_preserves_caller_populations_without_changing_service_counts",
+  "carrick-runtime::el1_census::tests::mapped_refused_child_mkdirat_reaches_the_shared_gate",
+  "carrick-spec::syscall_census::tests::refused_child_mkdirat_fails_even_without_oracle_shape",
+]
+embed = [
+  "carrick-conformance-next::generic_probe_shard_0",
+]
+docker = [
+  "scripts/bpftrace/oracle-served.bt",
+]
+
+[bindings.unresolved]
+live = "The worker requires a signed HVF host or an accessible KVM device and a Docker oracle for live child mkdirat and cd/exec evidence. Unit evidence alone does not qualify those witnesses."

@@ -118,6 +118,115 @@ pub fn generic_probe_container(
     container
 }
 
+/// Exercise the same probe as namespace init and behind a live shell. The
+/// shell must wait after the subshell: a final `(probe)` alone can be
+/// optimized into exec, erasing the two-process witness. `cd` also traverses
+/// the inherited filesystem-context seam before child exec (#1392).
+pub fn run_probe_differential(
+    probe: &str,
+    container: &TestContainer,
+) -> Result<carrick_conformance_next::ContainerResult, EmbedError> {
+    let root = container.run(["/tmp/p"])?;
+    let child = container.run([
+        "/bin/sh",
+        "-c",
+        "cd /tmp && cd / && ( /tmp/p ); status=$?; exit \"$status\"",
+    ])?;
+    assert_eq!(
+        root.exit_code, child.exit_code,
+        "PID 1 / child exit differs"
+    );
+    assert_eq!(root.signal, child.signal, "PID 1 / child signal differs");
+    assert!(
+        !root.trap_limit_hit && !child.trap_limit_hit,
+        "differential probe hit trap limit"
+    );
+    let normalize = |result: &carrick_conformance_next::ContainerResult| {
+        let mut output = result.stdout_utf8();
+        output.push_str(&String::from_utf8_lossy(&result.stderr));
+        output
+            .lines()
+            .filter(|line| {
+                !line.contains("case-insensitive; defaulting") && !line.contains("Pass `--fs host`")
+            })
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim_end()
+            .to_owned()
+    };
+    assert_probe_topologies(probe, &normalize(&root), &normalize(&child));
+    Ok(child)
+}
+
+/// `pidnsroot` deliberately observes the launch topology: Linux's namespace
+/// init has no parent in that namespace, while its immediate child has PPID 1.
+/// Check both exact assertions before comparing the remaining invariants.
+fn assert_probe_topologies(probe: &str, root: &str, child: &str) {
+    let expected: &[(&str, &str)] = match probe {
+        "pidnsroot" => &[("parent_is_init=false", "parent_is_init=true")],
+        "pidnsorphanreap" => &[
+            ("reaped_two=true", "reaped_two=false"),
+            (
+                "reaped_orphan_grandchild=true",
+                "reaped_orphan_grandchild=false",
+            ),
+        ],
+        "proclife" => &[(
+            "pgroup setpgid=ERR:1",
+            "pgroup pgrp_pos=true leads_own_group=true",
+        )],
+        _ => &[],
+    };
+    for (root_line, child_line) in expected {
+        assert_eq!(
+            root.lines().filter(|line| line == root_line).count(),
+            1,
+            "{probe}: PID1 topology assertion"
+        );
+        assert_eq!(
+            child.lines().filter(|line| line == child_line).count(),
+            1,
+            "{probe}: child topology assertion"
+        );
+    }
+    let remaining = |text: &str, is_root: bool| {
+        text.lines()
+            .filter(|line| {
+                !expected
+                    .iter()
+                    .any(|(root, child)| line == if is_root { root } else { child })
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(
+        remaining(root, true),
+        remaining(child, false),
+        "{probe}: PID1 / forked-child invariant output differs"
+    );
+}
+
+#[test]
+fn namespace_parent_observation_is_the_only_admitted_topology_difference() {
+    assert_probe_topologies(
+        "pidnsroot",
+        "parent_is_init=false\nchild_parent_is_me=true",
+        "parent_is_init=true\nchild_parent_is_me=true",
+    );
+    assert!(
+        std::panic::catch_unwind(|| assert_probe_topologies(
+            "pidnsroot",
+            "parent_is_init=false\nchild_parent_is_me=false",
+            "parent_is_init=true\nchild_parent_is_me=true"
+        ))
+        .is_err()
+    );
+    assert!(
+        std::panic::catch_unwind(|| assert_probe_topologies("other", "a=false", "a=true")).is_err()
+    );
+}
+
 /// Generic probes whose Docker result is deliberately not committed as a
 /// static oracle. The old gate quarantines these for timing sensitivity or
 /// excludes them from its routine regression lane; they remain live-oracle

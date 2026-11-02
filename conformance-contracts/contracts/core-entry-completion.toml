@@ -1,3 +1,6 @@
+# #1394: additional ABI bookkeeping witness only; existing semantic and
+# work-budget bindings remain authoritative. Census publication reads counters
+# after executor join and does not alter this contract's guest operation.
 # #1044 diagnostic follow-up: preserve native-service admission/dispatch
 # error codes in the existing fatal record.
 # No service refusal or retry policy changes; signed attribution is pending.
@@ -73,6 +76,7 @@ vm_free = [
   "carrick-personality-linux::dispatch::ring_first_tests::{x86_signal_return_restores_frame_with_owned_wait_work_pending,x86_owned_wait4_survives_pending_host_work,strict_arm_preserves_family_declines_handback_and_owed_work}",
   "carrick-el1-abi::entry_binding_fatal::tests::{fatal_detail_round_trip_and_formatter,entry_binding_fatal_maximum_width_fits_the_terminal_record}",
   "carrick-runtime::vcpu_loop::memory::tests::arm_entry_binding_diagnostic_reaches_the_fatal_record_without_truncation (diagnostic payload/formatter only: reason round trip, caller coordinates, every retained field within the fixed fatal record; existing semantic/work bindings remain required)",
+  "carrick-el1-abi::refusal_census_tests::refusal_snapshot_preserves_caller_populations_without_changing_service_counts",
 ]
 
 [bindings.unresolved]

@@ -1,3 +1,6 @@
+# #1394: additional ABI bookkeeping witness only; existing semantic and
+# work-budget bindings remain authoritative. Census publication reads counters
+# after executor join and does not alter this contract's guest operation.
 # #898 diagnostic-only: entry_binding fatals now retain their invariant
 # reason and caller coordinates. Existing bindings remain the semantic
 # and work-budget evidence. Rerun the existing control:
@@ -20,6 +23,7 @@ rationale = "Forwarded mailbox syscalls deliver arguments, PC, and return values
 [bindings]
 vm_free = [
   "carrick-vmm-hvf::trap::transport_test::transport_exit_overhead_contract",
+  "carrick-el1-abi::refusal_census_tests::refusal_snapshot_preserves_caller_populations_without_changing_service_counts",
 ]
 
 [bindings.unresolved]
