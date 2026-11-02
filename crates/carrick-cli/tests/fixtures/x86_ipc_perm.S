@@ -4,11 +4,16 @@
 .text
 _start:
     mov $-1, %r12
-    # 1. Drop/ensure uid 1000: setresuid(1000, 1000, 1000)
-    # (On native Linux running as uid 1000, this succeeds; inside Carrick starting as root, this succeeds).
-    mov $1000, %rdi
-    mov $1000, %rsi
-    mov $1000, %rdx
+    # 1. Keep the native runner's uid, or drop guest/root privilege to 1000.
+    # An unprivileged oracle cannot switch to an unrelated hard-coded uid.
+    mov $102, %eax              # SYS_getuid
+    syscall
+    test %eax, %eax
+    jnz 1f
+    mov $1000, %eax
+1:  mov %eax, %edi
+    mov %eax, %esi
+    mov %eax, %edx
     mov $117, %rax              # SYS_setresuid
     syscall
     test %rax, %rax

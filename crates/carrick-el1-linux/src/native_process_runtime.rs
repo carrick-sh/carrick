@@ -5753,12 +5753,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         signal: carrick_signal_core::policy::Signal,
     ) -> Result<LifecycleOutcome, NativeProcessError> {
-        let carrick_signal_core::policy::Delivery::Terminate { core_dump } =
+        let carrick_signal_core::policy::Delivery::Terminate { .. } =
             carrick_signal_core::policy::default_delivery(signal)
         else {
             return Err(NativeProcessError::Invalid);
         };
-        let wait_status = LinuxWaitStatus::signaled(signal.number() as u8, core_dump);
+        // Default delivery describes whether the signal is core-class, not
+        // whether a core was published. This native owner writes no core file;
+        // Linux WCOREDUMP/CLD_DUMPED must not claim one on either ISA.
+        let wait_status = LinuxWaitStatus::signaled(signal.number() as u8, false);
         self.exit_with_status(wait_status, OwnerEntry::Exception)
     }
     #[inline(never)]
