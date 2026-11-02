@@ -342,7 +342,7 @@ pub fn switch_in_root(
             (KeptAuthority::Open(grant), Some(live)) if live != grant.root => {
                 return SwitchInRoot::StaleWord;
             }
-            (KeptAuthority::Open(grant), _) if !grant.invalidation_owed => {
+            (KeptAuthority::Open(grant), Some(_)) if !grant.invalidation_owed => {
                 return SwitchInRoot::Keep;
             }
             (KeptAuthority::Unpublished, _) => return SwitchInRoot::Keep,
@@ -395,8 +395,8 @@ mod tests {
         assert_eq!(plan(7, Some(ROOT_Y)), SwitchInRoot::Keep);
         assert_eq!(plan(7, Some(MAINTENANCE)), SwitchInRoot::StaleWord);
         assert_eq!(plan(7, Some(ROOT_Z)), SwitchInRoot::StaleWord);
-        // A CPU that cannot report its root keeps on an open grant.
-        assert_eq!(plan(7, None), SwitchInRoot::Keep);
+        // An unreadable root cannot authenticate an open grant.
+        assert_eq!(plan(7, None), reinstall(true));
         // Regated, closed or re-keyed: through the gate again.
         let refused = KeptAuthority::Refused;
         assert_eq!(
