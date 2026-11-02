@@ -820,6 +820,213 @@ fn serial_host_persistent_carrier_authority_outlives_terminal_task_cleanup_and_d
     }));
 }
 
+/// One fixture carrier: its six control mappings extracted into the owning
+/// authority, plus each backing's drop observation.
+fn fixture_persistent_carrier() -> (
+    std::sync::Arc<PersistentCarrierMappings>,
+    Vec<(usize, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
+) {
+    let mut task_mappings = TaskMappingIndex::new();
+    let mut drop_observations = Vec::new();
+    for (start, size) in [
+        (
+            crate::memory::LINUX_EL0_TRAMPOLINE_BASE,
+            crate::memory::LINUX_EL0_TRAMPOLINE_SIZE,
+        ),
+        (
+            crate::memory::LINUX_EL1_VECTORS_BASE,
+            crate::memory::LINUX_EL1_VECTORS_SIZE,
+        ),
+        (
+            crate::memory::LINUX_EL1_MAINT_BASE,
+            crate::memory::LINUX_EL1_MAINT_SIZE,
+        ),
+        (
+            crate::memory::LINUX_SYSCALL_MAILBOX_BASE,
+            crate::memory::LINUX_SYSCALL_MAILBOX_ARENA_SIZE,
+        ),
+        (
+            crate::memory::LINUX_CARRIER_MAINT_ROOT_BASE,
+            crate::memory::LINUX_CARRIER_MAINT_ROOT_SIZE,
+        ),
+        (
+            crate::memory::LINUX_FD_CEILING_CONTROL_BASE,
+            crate::memory::LINUX_FD_CEILING_CONTROL_SIZE,
+        ),
+    ] {
+        let size = usize::try_from(size).unwrap();
+        let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            size,
+            crate::host_mapping::HostMappingKind::PrivateAnon,
+        )
+        .unwrap();
+        let host_addr = host.as_ptr();
+        let observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut lease = GlobalFrameStage2Lease::fixed(start, size as u64);
+        lease.drop_backing_audit = Some((host_addr as usize, std::sync::Arc::clone(&observed)));
+        let mut region = mapped_region(start, start + size as u64, start);
+        region.host_addr = host_addr;
+        region.host_mapping = Some(host.into());
+        region.stage2_lease = Some(lease);
+        if start == crate::memory::LINUX_FD_CEILING_CONTROL_BASE {
+            region.perms = applevisor::memory::MemPerms::ReadWrite;
+            region.guest_writable = true;
+        }
+        task_mappings.insert(region);
+        drop_observations.push((host_addr as usize, observed));
+    }
+    let authority = PersistentCarrierMappings::extract(
+        &mut task_mappings,
+        std::sync::Arc::new(CarrierVmCustody::new_live_fixture()),
+    )
+    .expect("extract exact carrier mapping authority");
+    (std::sync::Arc::new(authority), drop_observations)
+}
+
+fn fixture_carrier_ceiling_word(carrier: &PersistentCarrierMappings) -> (u32, u32) {
+    let word = |offset| {
+        let pointer = carrier
+            .host_pointer(
+                crate::memory::LINUX_FD_CEILING_CONTROL_BASE + offset,
+                std::mem::size_of::<u32>(),
+            )
+            .expect("carrier control word");
+        // SAFETY: the carrier owns the control page; read atomically.
+        unsafe { pointer.cast::<std::sync::atomic::AtomicU32>().as_ref() }
+            .load(std::sync::atomic::Ordering::Acquire)
+    };
+    (
+        word(crate::memory::LINUX_FD_CEILING_OFF_CEILING),
+        word(crate::memory::LINUX_FD_CEILING_OFF_GATE),
+    )
+}
+
+/// #1446: two sequential containers in one process, each on its own carrier.
+/// A kernel's ceiling authority keeps its registered publisher, and the
+/// process-wide IPC window statics keep that kernel's `HostIpc` (and so its
+/// authority) until the next container replaces them. The publisher must not
+/// keep the first carrier's mappings alive past its retirement: the late
+/// drop then ran during the second container's launch and cleared that
+/// carrier's EL1 counters. The second carrier publishes its own ceiling.
+#[test]
+fn serial_host_retained_ceiling_publisher_does_not_outlive_its_carrier() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+
+    // Container 1: its kernel's authority registers the carrier publisher
+    // and raises it for the descriptors it installs.
+    let (first_carrier, first_backings) = fixture_persistent_carrier();
+    let first_publisher = first_carrier
+        .fd_ceiling_publisher()
+        .expect("carrier control page has a publisher");
+    first_publisher.raise(9);
+    assert_eq!(
+        fixture_carrier_ceiling_word(&first_carrier),
+        (9, crate::memory::FD_CEILING_GATE_ENABLED)
+    );
+
+    // Container 1 exits and its carrier retires; its kernel's authority is
+    // still retained (the IPC window statics hold its HostIpc).
+    let retained_authority = first_publisher;
+    drop(first_carrier);
+    assert!(
+        first_backings.iter().all(|(host, observed)| {
+            observed.load(std::sync::atomic::Ordering::SeqCst) && !alias_backing_is_live(*host)
+        }),
+        "a retained ceiling publisher kept the retired carrier's mappings alive"
+    );
+    // A raise through the retired carrier's publisher has no reader.
+    retained_authority.raise(40);
+    retained_authority.disable();
+
+    // Container 2 on a new carrier: its own publisher and its own word.
+    let (second_carrier, second_backings) = fixture_persistent_carrier();
+    let second_publisher = second_carrier
+        .fd_ceiling_publisher()
+        .expect("second carrier has a publisher");
+    assert!(!std::sync::Arc::ptr_eq(
+        &retained_authority,
+        &second_publisher
+    ));
+    second_publisher.raise(4);
+    assert_eq!(
+        fixture_carrier_ceiling_word(&second_carrier),
+        (4, crate::memory::FD_CEILING_GATE_ENABLED),
+        "the second carrier's ceiling is its own, enabled"
+    );
+
+    // The next launch replaces the IPC window statics: container 1's
+    // authority drops now, and nothing of the live carrier goes with it.
+    drop(retained_authority);
+    assert!(
+        second_backings
+            .iter()
+            .all(|(host, _)| alias_backing_is_live(*host))
+    );
+    assert_eq!(
+        fixture_carrier_ceiling_word(&second_carrier),
+        (4, crate::memory::FD_CEILING_GATE_ENABLED)
+    );
+
+    drop(second_publisher);
+    drop(second_carrier);
+    assert!(second_backings.iter().all(|(host, observed)| {
+        observed.load(std::sync::atomic::Ordering::SeqCst) && !alias_backing_is_live(*host)
+    }));
+}
+
+/// #1446: a carrier that retires after the next carrier published its EL1
+/// counters must not clear or snapshot the live carrier's counters.
+#[test]
+fn serial_host_late_carrier_retirement_keeps_the_live_carriers_el1_counters() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let words = (carrick_el1_abi::EL1_COUNTERS_OFFSET as usize
+        + std::mem::size_of::<carrick_el1_abi::Counters>())
+    .div_ceil(8);
+    let first = vec![0_u64; words];
+    let second = vec![0_u64; words];
+    let region = |backing: &Vec<u64>| backing.as_ptr() as usize;
+    let counters = |backing: &Vec<u64>| {
+        // SAFETY: the fixture region covers the counters at their ABI offset,
+        // 8-byte aligned, and outlives every reference taken here.
+        unsafe {
+            &*((region(backing) + carrick_el1_abi::EL1_COUNTERS_OFFSET as usize)
+                as *const carrick_el1_abi::Counters)
+        }
+    };
+
+    crate::trap::stage2_backend::reset_el1_counters();
+    // The second carrier is live and has published its counters.
+    crate::trap::stage2_backend::record_el1_counters_host_ptr(
+        region(&second) + carrick_el1_abi::EL1_COUNTERS_OFFSET as usize,
+    );
+    counters(&second).served[64].store(1000, std::sync::atomic::Ordering::Relaxed);
+
+    // The first carrier retires late.
+    crate::trap::stage2_backend::snapshot_and_clear_el1_counters_if(region(&first));
+    let live = crate::trap::stage2_backend::read_el1_counters().expect("live counters");
+    assert_eq!(
+        live.served[64].load(std::sync::atomic::Ordering::Relaxed),
+        1000
+    );
+    counters(&second).served[64].store(1001, std::sync::atomic::Ordering::Relaxed);
+    let live = crate::trap::stage2_backend::read_el1_counters().expect("still live");
+    assert_eq!(
+        live.served[64].load(std::sync::atomic::Ordering::Relaxed),
+        1001,
+        "the live carrier's counters are still the published ones"
+    );
+
+    // The second carrier's own retirement keeps its final values.
+    crate::trap::stage2_backend::snapshot_and_clear_el1_counters_if(region(&second));
+    counters(&second).served[64].store(0, std::sync::atomic::Ordering::Relaxed);
+    let last = crate::trap::stage2_backend::read_el1_counters().expect("last counters");
+    assert_eq!(
+        last.served[64].load(std::sync::atomic::Ordering::Relaxed),
+        1001
+    );
+    crate::trap::stage2_backend::reset_el1_counters();
+}
+
 #[test]
 fn persistent_carrier_mapping_drop_after_exact_custody_destroy_skips_live_unmap() {
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();

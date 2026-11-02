@@ -968,9 +968,22 @@ pub fn read_el1_region_host_ptr() -> usize {
     EL1_REGION_HOST_PTR.load(std::sync::atomic::Ordering::Acquire)
 }
 
-pub(crate) fn snapshot_and_clear_el1_counters() {
-    let ptr = EL1_COUNTERS_HOST_PTR.swap(0, std::sync::atomic::Ordering::AcqRel);
-    if ptr != 0 {
+/// Retire the published EL1 counters if they are the ones in the EL1 region
+/// mapped at `el1_region` (a retiring carrier's own), keeping their last
+/// values for `read_el1_counters`. Another carrier's published counters are
+/// left alone: a late retirement never clears a live carrier's (#1446).
+pub(crate) fn snapshot_and_clear_el1_counters_if(el1_region: usize) {
+    let ptr = el1_region + carrick_el1_abi::EL1_COUNTERS_OFFSET as usize;
+    if EL1_COUNTERS_HOST_PTR
+        .compare_exchange(
+            ptr,
+            0,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        // SAFETY: the retiring carrier still maps its EL1 region.
         let counters_ref = unsafe { &*(ptr as *const carrick_el1_abi::Counters) };
         *LAST_EL1_COUNTERS.lock() = Some(counters_ref.copy_snapshot());
     }
