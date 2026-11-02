@@ -252,9 +252,11 @@ preserve the existing host-call size and Linux consumption semantics. Error
 outputs such as an interrupted sleep remainder are explicitly selected even on
 error results.
 
-The proposed rule is owned completion with Linux-prescribed publication units,
-including partial fixed outputs as above. Independent review must confirm it
-against the owner's atomic-completion requirement before code. Whole-call
+The rule is owned completion with Linux-prescribed publication units,
+including partial fixed outputs as above. The owner ruled this on #231
+(2026-11-02): atomic completion means one owned completion decision, never
+replayed, with outputs settled before success, published in the units Linux
+itself allows; it does not mean all-or-nothing staging. Whole-call
 transactional visibility would require a new cross-page memory protocol and would conflict with existing partial-copy
 contracts; this design does not claim that protocol already exists.
 
