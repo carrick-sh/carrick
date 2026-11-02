@@ -1528,6 +1528,105 @@ fn a_raised_gate_sends_the_thread_to_its_executor() {
     assert_eq!(zone.counters.el1_space_refusals.load(Ordering::Relaxed), 1);
 }
 
+/// #1100 occupancy hypothesis, through the production scheduler entries.
+/// A's futex wait leaves the vCPU with `Action::Idle` (B's space is
+/// paused) and keeps A's space 7 on the slot's occupancy word. The host's
+/// idle entry then rewrites TTBR0/TTBR1 to the maintenance root and leaves
+/// the word. A, woken onto its home slot, switches in: `enter_space` sees
+/// the word already naming 7. Before the root check it returned early and A
+/// ran on the maintenance root; now the switch-in fails as
+/// `SwitchInStaleRoot`, carrying the slot's trace (idle exit, host idle
+/// entry) so one fatal shows the whole sequence.
+#[test]
+fn a_switch_in_that_trusts_a_kept_word_over_the_idle_root_is_a_stale_root_fatal() {
+    // A slot no other test in this binary uses: the trace is per slot and
+    // process-global.
+    const TRACED: SlotId = SlotId::new(47);
+    let zone = zone();
+    publish_space(&zone, MM, TTBR_MM);
+    let other = publish_space(&zone, OTHER_MM, TTBR_OTHER);
+    host_publish(&zone, TRACED, MM, None, 0);
+    zone.enter_guest(TRACED);
+    let a_word = AtomicU32::new(0);
+    let b_word = AtomicU32::new(0);
+    let (a_addr, b_addr) = (a_word.as_ptr() as u64, b_word.as_ptr() as u64);
+    let b = queue_foreign(&zone, 202, OTHER_MM, b_addr, thread_ctx(0xB, b_addr));
+    assert!(matches!(
+        zone.record(b).claim(),
+        Claim::Queued { slot, .. } if slot == TRACED
+    ));
+    zone.spaces.raise(other);
+    let task = task_for(101);
+    let (mut frame, mut cpu) = live(0xA, a_addr, FUTEX_WAIT_PRIVATE, 0);
+    frame.slot = u64::from(TRACED.raw());
+    cpu.ttbr = (TTBR_MM, TTBR_MM);
+    let counters = counters();
+    assert_eq!(
+        serve_on(TRACED, &mut frame, &task, &zone, &mut cpu, counters),
+        Some(Served::Idle)
+    );
+    // The entry boundary records the idle exit, as `carrick_el1_syscall`
+    // does through `trace_entry_exit`.
+    slot_trace::record_exit(&zone, TRACED, true, cpu.live_ttbr0());
+    assert_eq!(zone.installed_space(TRACED), MM, "the idle exit kept 7");
+    assert_eq!(zone.take_service_head(TRACED).map(|r| r.id), Some(b));
+    {
+        let guard = zone
+            .lock(ZoneTables::bucket_of_with_context(MM, a_addr), &HostWait)
+            .unwrap();
+        let woken = zone.wake_host(
+            &guard,
+            MM,
+            a_addr,
+            u32::MAX,
+            1,
+            true,
+            &mut |_| panic!("A's home slot is in the guest"),
+            &mut |_| {},
+        );
+        assert_eq!(woken, 1);
+    }
+    // `run_idle_entry_on_vcpu`: both roots to the maintenance root, the
+    // occupancy word untouched.
+    cpu.set_translation(IDLE_TTBR, IDLE_TTBR);
+    assert_eq!(zone.installed_space(TRACED), MM);
+    let mut idle_frame = TrapFrame {
+        slot: u64::from(TRACED.raw()),
+        ..TrapFrame::default()
+    };
+    let fatal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Sched {
+            handoff: None,
+            zone: &zone,
+            slot: TRACED,
+            task: &task,
+            cpu: &mut cpu,
+            user: &HardwareUserWord,
+            counters,
+        }
+        .serve_idle_entry(&mut idle_frame)
+    }))
+    .expect_err("A must not run on the maintenance root");
+    let text = fatal
+        .downcast_ref::<std::string::String>()
+        .map(std::string::String::as_str)
+        .unwrap_or_default();
+    assert!(
+        text.contains(&std::format!(
+            "stale_root mm=7 live={IDLE_TTBR:#x} expected={TTBR_MM:#x} idle={IDLE_TTBR:#x} \
+             last=exit:RunReadyHeadNeedsHost:mm7:{:#x}",
+            TTBR_MM & 0xffff_ffff_f000
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "trace=[exit:RunReadyHeadNeedsHost:mm7:0x70000000,entry:mm7:idle,kept:mm7:idle]"
+        ),
+        "{text}"
+    );
+}
+
 #[test]
 fn left_checkpoint_skips_selected_frame_and_runs_next_record() {
     let zone = zone();

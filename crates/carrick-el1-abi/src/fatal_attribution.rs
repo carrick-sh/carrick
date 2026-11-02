@@ -566,12 +566,14 @@ pub enum FatalAttribution {
     None,
     Admission(AdmissionAttribution),
     Retire(RetireAttribution),
+    StaleRoot(StaleRootAttribution),
     /// A tag this host does not know; raw words stay visible.
     Unknown([u64; FATAL_ATTRIBUTION_WORDS]),
 }
 
 const TAG_ADMISSION: u64 = 1;
 const TAG_RETIRE: u64 = 2;
+const TAG_STALE_ROOT: u64 = 3;
 const FLAG_CLAIM_AT_CHECK: u64 = 1;
 const FLAG_CANCELLED: u64 = 2;
 const FLAG_UNADOPTED: u64 = 4;
@@ -663,6 +665,17 @@ impl FatalAttribution {
                     0,
                 ]
             }
+            Self::StaleRoot(r) => [
+                (TAG_STALE_ROOT << 56) | ((r.slot as u64) << 48) | (r.space & 0xffff_ffff),
+                r.live_ttbr0,
+                r.expected_ttbr0,
+                r.idle_ttbr0,
+                r.last_idle_exit.0,
+                r.recent[0].0,
+                r.recent[1].0,
+                r.recent[2].0,
+                0,
+            ],
         }
     }
 
@@ -720,6 +733,19 @@ impl FatalAttribution {
                     cancel: (words[4] >> 63 != 0).then(|| CancelTally::unpack(words[4])),
                 })
             }
+            TAG_STALE_ROOT => Self::StaleRoot(StaleRootAttribution {
+                slot: (w0 >> 48) as u8,
+                space: w0 & 0xffff_ffff,
+                live_ttbr0: words[1],
+                expected_ttbr0: words[2],
+                idle_ttbr0: words[3],
+                last_idle_exit: SlotEvent(words[4]),
+                recent: [
+                    SlotEvent(words[5]),
+                    SlotEvent(words[6]),
+                    SlotEvent(words[7]),
+                ],
+            }),
             _ => unknown,
         }
     }
@@ -803,8 +829,240 @@ impl fmt::Display for FatalAttribution {
                     None => f.write_str(" cancel=unrecorded"),
                 }
             }
+            Self::StaleRoot(r) => write!(
+                f,
+                // The slot is the header's `cpu=`; the sink is 1024 bytes.
+                " stale_root mm={} live={:#x} expected={:#x} idle={:#x} last={} \
+                 trace=[{},{},{}]",
+                r.space,
+                r.live_ttbr0,
+                r.expected_ttbr0,
+                r.idle_ttbr0,
+                r.last_idle_exit,
+                r.recent[0],
+                r.recent[1],
+                r.recent[2]
+            ),
         }
     }
+}
+
+/// The scheduler or dispatch arm that ended an EL1 entry with
+/// `Action::Idle` (the `hvc #5` exit), recorded in the slot's trace (#1100
+/// occupancy). Values are transport ABI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum IdleProducer {
+    /// No producer named itself on this entry.
+    Unattributed = 0,
+    /// `Sched::idle` saw host work (or an excluding affinity) while polling.
+    IdleHostWork = 1,
+    /// `Sched::idle` switched a thread in whose space could not install.
+    IdleLoadNeedsHost = 2,
+    /// `Sched::idle`: the run-queue head needs its executor.
+    IdleHeadNeedsHost = 3,
+    /// `run_ready` switched a thread in whose space could not install.
+    RunReadyLoadNeedsHost = 4,
+    /// `run_ready`: the run-queue head needs its executor.
+    RunReadyHeadNeedsHost = 5,
+    /// `enforce_affinity` parked the current thread off this CPU.
+    EnforceAffinity = 6,
+    /// `yield_queued` handed off and nothing loaded.
+    YieldQueued = 7,
+    /// IRQ slice end: the running thread parked, the head needs the host.
+    InterruptParkPreempted = 8,
+    /// IRQ slice end: the preempt's head could not install its space.
+    InterruptPreemptFailed = 9,
+    /// The host's idle entry found host work before polling.
+    IdleEntryHostWork = 10,
+    /// `leave_after_object_park`: host work after an object park.
+    ObjectParkHostWork = 11,
+    /// `native_service_idle`: the native service park (leaves the space).
+    NativeServiceIdle = 12,
+}
+
+impl IdleProducer {
+    pub const fn from_raw(raw: u8) -> Self {
+        match raw {
+            1 => Self::IdleHostWork,
+            2 => Self::IdleLoadNeedsHost,
+            3 => Self::IdleHeadNeedsHost,
+            4 => Self::RunReadyLoadNeedsHost,
+            5 => Self::RunReadyHeadNeedsHost,
+            6 => Self::EnforceAffinity,
+            7 => Self::YieldQueued,
+            8 => Self::InterruptParkPreempted,
+            9 => Self::InterruptPreemptFailed,
+            10 => Self::IdleEntryHostWork,
+            11 => Self::ObjectParkHostWork,
+            12 => Self::NativeServiceIdle,
+            _ => Self::Unattributed,
+        }
+    }
+}
+
+/// The dispatch route that turned a completion into `Action::Idle`, when
+/// it was not the scheduler alone. Values are transport ABI (4 bits).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum IdleRoute {
+    None = 0,
+    /// `resolve_arm_process_route`: `CompletionRoute::Suspended`.
+    CompletionSuspended = 1,
+    /// `arm_signal_user_return`: `CompletionRoute::Suspended`.
+    UserReturnSuspended = 2,
+    /// Reserved (the generic process-call route; not recorded on ARM).
+    ProcessRouteSuspended = 3,
+    /// Declined-fault signal delivery: `CompletionRoute::Suspended`.
+    DeclinedFaultSuspended = 4,
+    /// The COW resolver's object park.
+    CowObjectPark = 5,
+}
+
+impl IdleRoute {
+    pub const fn from_raw(raw: u8) -> Self {
+        match raw {
+            1 => Self::CompletionSuspended,
+            2 => Self::UserReturnSuspended,
+            3 => Self::ProcessRouteSuspended,
+            4 => Self::DeclinedFaultSuspended,
+            5 => Self::CowObjectPark,
+            _ => Self::None,
+        }
+    }
+}
+
+/// What one slot-trace event records (4 bits).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum SlotEventKind {
+    Empty = 0,
+    /// EL1 left for the host with `Action::Idle`.
+    IdleExit = 1,
+    /// The host started this vCPU's idle entry.
+    IdleEntry = 2,
+    /// Switch-in found the word already naming the space (no install).
+    SwitchInKept = 3,
+    /// Switch-in installed the space's roots.
+    SwitchInInstalled = 4,
+    /// `leave_space` moved the vCPU to the maintenance root.
+    Left = 5,
+}
+
+impl SlotEventKind {
+    pub const fn from_raw(raw: u8) -> Self {
+        match raw {
+            1 => Self::IdleExit,
+            2 => Self::IdleEntry,
+            3 => Self::SwitchInKept,
+            4 => Self::SwitchInInstalled,
+            5 => Self::Left,
+            _ => Self::Empty,
+        }
+    }
+}
+
+/// One packed slot-trace event: what happened, the occupancy word's space
+/// and the live TTBR0 at that moment. Diagnostics only (#1100).
+///
+/// Layout: kind 63..60, producer 59..52, route 51..48, `idle_root` 47,
+/// space (low 15 bits) 46..32, live TTBR0 page number (`BADDR >> 12`,
+/// low 32 bits) 31..0.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SlotEvent(pub u64);
+
+impl SlotEvent {
+    pub const EMPTY: Self = Self(0);
+
+    /// `live_root` is the TTBR0 value; `idle_root` whether it was the
+    /// maintenance root.
+    pub const fn new(
+        kind: SlotEventKind,
+        producer: IdleProducer,
+        route: IdleRoute,
+        space: u64,
+        live_root: u64,
+        idle_root: bool,
+    ) -> Self {
+        Self(
+            ((kind as u64 & 0xf) << 60)
+                | ((producer as u64 & 0xff) << 52)
+                | ((route as u64 & 0xf) << 48)
+                | (if idle_root { 1 << 47 } else { 0 })
+                | ((space & 0x7fff) << 32)
+                | ((ttbr_baddr(live_root) >> 12) & 0xffff_ffff),
+        )
+    }
+    pub const fn kind(self) -> SlotEventKind {
+        SlotEventKind::from_raw((self.0 >> 60) as u8)
+    }
+    pub const fn producer(self) -> IdleProducer {
+        IdleProducer::from_raw((self.0 >> 52) as u8)
+    }
+    pub const fn route(self) -> IdleRoute {
+        IdleRoute::from_raw(((self.0 >> 48) & 0xf) as u8)
+    }
+    pub const fn idle_root(self) -> bool {
+        self.0 & (1 << 47) != 0
+    }
+    pub const fn space(self) -> u64 {
+        (self.0 >> 32) & 0x7fff
+    }
+    /// The live TTBR0's table address, page-aligned.
+    pub const fn root_page(self) -> u64 {
+        (self.0 & 0xffff_ffff) << 12
+    }
+}
+
+/// The translation-table base address of a TTBR value: the ASID (63..48)
+/// and CnP (bit 0) do not name a different table.
+pub const fn ttbr_baddr(ttbr: u64) -> u64 {
+    ttbr & 0x0000_ffff_ffff_fffe
+}
+
+/// Compact (the fatal sink is 1024 bytes): `exit:<producer>[/<route>]`,
+/// `entry`, `kept`, `inst` or `left`, then `:mm<space>:` and the live root
+/// page, or `idle` when it was the maintenance root.
+impl fmt::Display for SlotEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.kind() {
+            SlotEventKind::Empty => return f.write_str("-"),
+            SlotEventKind::IdleExit => {
+                write!(f, "exit:{:?}", self.producer())?;
+                if !matches!(self.route(), IdleRoute::None) {
+                    write!(f, "/{:?}", self.route())?;
+                }
+            }
+            SlotEventKind::IdleEntry => f.write_str("entry")?,
+            SlotEventKind::SwitchInKept => f.write_str("kept")?,
+            SlotEventKind::SwitchInInstalled => f.write_str("inst")?,
+            SlotEventKind::Left => f.write_str("left")?,
+        }
+        write!(f, ":mm{}:", self.space())?;
+        if self.idle_root() {
+            f.write_str("idle")
+        } else {
+            write!(f, "{:#x}", self.root_page())
+        }
+    }
+}
+
+/// A switch-in trusted the slot's occupancy word, which named the thread's
+/// address space, while the vCPU's live TTBR0 was another table (#1100).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StaleRootAttribution {
+    pub slot: u8,
+    /// The space the occupancy word named (and the thread's); low 32 bits.
+    pub space: u64,
+    pub live_ttbr0: u64,
+    /// The space's published TTBR0.
+    pub expected_ttbr0: u64,
+    /// The carrier's maintenance root, as EL1 reads it.
+    pub idle_ttbr0: u64,
+    /// The slot's most recent `IdleExit`, if still in its trace.
+    pub last_idle_exit: SlotEvent,
+    /// The slot's last trace events, oldest first.
+    pub recent: [SlotEvent; 3],
 }
 
 #[cfg(test)]
@@ -876,6 +1134,62 @@ mod tests {
         assert!(matches!(
             FatalAttribution::decode([9 << 56, 0, 0, 0, 0, 0, 0, 0, 0]),
             FatalAttribution::Unknown(_)
+        ));
+    }
+
+    #[test]
+    fn stale_root_attribution_names_the_idle_producer_and_the_trace() {
+        let idle = 0x2d_0010_0000;
+        let attribution = FatalAttribution::StaleRoot(StaleRootAttribution {
+            slot: 3,
+            space: 2,
+            live_ttbr0: idle,
+            expected_ttbr0: (5 << 48) | 0x9a_0020_0000,
+            idle_ttbr0: idle,
+            last_idle_exit: SlotEvent::new(
+                SlotEventKind::IdleExit,
+                IdleProducer::IdleHeadNeedsHost,
+                IdleRoute::CompletionSuspended,
+                2,
+                (5 << 48) | 0x9a_0020_0000,
+                false,
+            ),
+            recent: [
+                SlotEvent::new(
+                    SlotEventKind::IdleExit,
+                    IdleProducer::IdleHeadNeedsHost,
+                    IdleRoute::CompletionSuspended,
+                    2,
+                    (5 << 48) | 0x9a_0020_0000,
+                    false,
+                ),
+                SlotEvent::new(
+                    SlotEventKind::IdleEntry,
+                    IdleProducer::Unattributed,
+                    IdleRoute::None,
+                    2,
+                    idle,
+                    true,
+                ),
+                SlotEvent::new(
+                    SlotEventKind::SwitchInKept,
+                    IdleProducer::Unattributed,
+                    IdleRoute::None,
+                    2,
+                    idle,
+                    true,
+                ),
+            ],
+        });
+        assert_eq!(FatalAttribution::decode(attribution.encode()), attribution);
+        let text = alloc_free_render(&attribution);
+        assert!(text.contains(
+            "stale_root mm=2 live=0x2d00100000 expected=0x5009a00200000 \
+             idle=0x2d00100000 last=exit:IdleHeadNeedsHost/CompletionSuspended:mm2:0x9a00200000"
+        ));
+        assert!(text.contains(
+            "trace=[exit:IdleHeadNeedsHost/CompletionSuspended:mm2:0x9a00200000,\
+             entry:mm2:idle,kept:mm2:idle]"
         ));
     }
 

@@ -744,6 +744,15 @@ impl AddressSpaces {
         self.try_begin_edit_mode(index, key, owner, venue, true)
     }
 
+    /// The TTBR0 `key`'s published entry holds, whatever its gate. A
+    /// diagnostic observation (#1100: does a live root match the space the
+    /// occupancy word names?), never admission to install or run anything.
+    pub fn root_identity(&self, index: SpaceIndex, key: u64) -> Option<u64> {
+        let entry = self.entry(index);
+        let root = entry.ttbr0.load(Ordering::Acquire);
+        (key != 0 && root != 0 && entry.key.load(Ordering::SeqCst) == key).then_some(root)
+    }
+
     /// Identity observation only, never admission to run guest user code.
     pub fn paused_root_identity(&self, index: SpaceIndex, key: u64) -> Option<u64> {
         let entry = self.entry(index);

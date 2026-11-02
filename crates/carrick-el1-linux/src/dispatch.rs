@@ -539,7 +539,10 @@ pub(super) fn resolve_arm_process_route(
         carrick_personality_linux::dispatch::CompletionRoute::NativeService => Action::Forward,
         carrick_personality_linux::dispatch::CompletionRoute::Served => Action::Served,
         carrick_personality_linux::dispatch::CompletionRoute::WithWork => Action::ServedWithWork,
-        carrick_personality_linux::dispatch::CompletionRoute::Suspended => Action::Idle,
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended => {
+            note_idle_route(frame, carrick_el1_abi::IdleRoute::CompletionSuspended);
+            Action::Idle
+        }
         carrick_personality_linux::dispatch::CompletionRoute::Forward => {
             if refuse_forward() {
                 refuse_owner_process_call(frame, counters, current_tasks)
@@ -699,6 +702,25 @@ pub fn capture_native_service_exit(
         return owned;
     }
     action
+}
+
+/// The entry's final boundary in the slot's occupancy trace (#1100): an
+/// `Action::Idle` exit is recorded with the producer that named itself, the
+/// space the occupancy word still names and the live TTBR0. Diagnostics.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[inline(never)]
+pub fn trace_entry_exit(frame: &TrapFrame, action: Action) {
+    let Some(slot) = SlotId::from_index(frame.slot as usize) else {
+        return;
+    };
+    // SAFETY: the EL1 zone tables are fixed image-lifetime ABI storage.
+    let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
+    sched::slot_trace::record_exit(
+        zone,
+        slot,
+        action == Action::Idle,
+        sched::ThreadCpu::live_ttbr0(&sched::HardwareCpu),
+    );
 }
 
 /// Interpret the final entry boundary without granting custody. Only the
@@ -1275,8 +1297,18 @@ pub(super) fn native_service_idle(
     slot: SlotId,
     cpu: &mut impl sched::ThreadCpu,
 ) -> Action {
+    sched::slot_trace::note_producer(slot, carrick_el1_abi::IdleProducer::NativeServiceIdle);
     sched::leave_space(zone, slot, cpu);
     Action::Idle
+}
+
+/// Name the dispatch route that ends this entry with `Action::Idle`, in the
+/// slot's occupancy trace (#1100). Diagnostics only.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+fn note_idle_route(frame: &TrapFrame, route: carrick_el1_abi::IdleRoute) {
+    if let Some(slot) = SlotId::from_index(frame.slot as usize) {
+        sched::slot_trace::note_route(slot, route);
+    }
 }
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
@@ -1615,7 +1647,10 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
     });
     match delivered {
         None | Some(carrick_personality_linux::dispatch::CompletionRoute::Served) => Action::Served,
-        Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended) => Action::Idle,
+        Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended) => {
+            note_idle_route(frame, carrick_el1_abi::IdleRoute::UserReturnSuspended);
+            Action::Idle
+        }
         Some(_) => invalid_completion(NativeInvariant::EntryBinding),
     }
 }

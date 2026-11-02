@@ -281,6 +281,10 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
         self.record_handoff(parked.take_receipt());
         self.counters.exit_reasons[carrick_el1_abi::El1ExitReason::IdleHostWork as usize]
             .fetch_add(1, Ordering::Relaxed);
+        super::slot_trace::note_producer(
+            self.slot,
+            carrick_el1_abi::IdleProducer::ObjectParkHostWork,
+        );
         Some(Served::Idle)
     }
 

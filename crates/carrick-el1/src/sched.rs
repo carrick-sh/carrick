@@ -13,6 +13,9 @@ const TIMER_RETRY_NS: u64 = 50_000;
 
 #[path = "sched/object_wait.rs"]
 pub mod object_wait;
+#[path = "sched/slot_trace.rs"]
+pub mod slot_trace;
+use carrick_el1_abi::IdleProducer;
 
 /// The execution venue that owns an EL1 exit for the loaded slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -142,6 +145,11 @@ pub trait ThreadCpu {
     /// Install translation roots (`TTBR0_EL1`, `TTBR1_EL1`), effective for
     /// everything after the call.
     fn set_translation(&mut self, ttbr0: u64, ttbr1: u64);
+    /// The live `TTBR0_EL1`, for the switch-in root check (#1100). `None`:
+    /// this CPU cannot report it (a test stand-in that never installed a
+    /// root, or an ISA whose switch does not run this path); the check is
+    /// then skipped, never failed.
+    fn live_ttbr0(&self) -> Option<u64>;
     /// Invalidate, on every PE, the stage-1 translations of the ASID in
     /// `ttbr0` (`TLBI ASIDE1IS`), complete before the call returns.
     fn invalidate_asid(&mut self, ttbr0: u64);
@@ -462,14 +470,16 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             if let Some(switched) = self.zone.switch_in_full(self.slot) {
                 match self.load(frame, switched) {
                     LoadResult::Running => return Some(Served::Returned { switched: true }),
-                    LoadResult::NeedsHost => return Some(self.service_exit()),
+                    LoadResult::NeedsHost => {
+                        return Some(self.service_exit(IdleProducer::RunReadyLoadNeedsHost));
+                    }
                     LoadResult::Left => continue,
                 }
             }
             break;
         }
         if self.zone.head_needs_host(self.slot) {
-            return Some(self.service_exit());
+            return Some(self.service_exit(IdleProducer::RunReadyHeadNeedsHost));
         }
         None
     }
@@ -484,7 +494,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         let mut effects = WakeEffects::default();
         self.zone.migrate_queued(self.slot, &mut effects);
         self.send_sgis(&effects);
-        Some(self.service_exit())
+        Some(self.service_exit(IdleProducer::EnforceAffinity))
     }
 
     /// A thread EL1 just created (`clone`), unpublished and with the context
@@ -550,13 +560,14 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             self.program_timer(true);
             Some(Served::Returned { switched: true })
         } else {
-            Some(self.service_exit())
+            Some(self.service_exit(IdleProducer::YieldQueued))
         }
     }
 
     /// The next thread on this vCPU needs its executor: leave for the host
     /// with no thread on the vCPU; the executor takes it from the run queue.
-    fn service_exit(&mut self) -> Served {
+    fn service_exit(&mut self, producer: IdleProducer) -> Served {
+        slot_trace::note_producer(self.slot, producer);
         self.counters.exit_reasons[El1ExitReason::Service as usize].fetch_add(1, Ordering::Relaxed);
         self.zone
             .counters
@@ -639,6 +650,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     fn enter_space(&mut self, mm: u64, native_owned: bool) -> bool {
         let (zone, slot) = (self.zone, self.slot);
         if mm != 0 && zone.installed_space(slot) == mm {
+            confirm_kept_root(zone, slot, mm, self.cpu.live_ttbr0());
             return true;
         }
         // A native owner has no host thread for the idle executor to load;
@@ -668,6 +680,14 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
                 .fetch_add(1, Ordering::Relaxed);
         }
         self.cpu.set_translation(grant.ttbr0, grant.ttbr1);
+        slot_trace::record(
+            zone,
+            slot,
+            carrick_el1_abi::SlotEventKind::SwitchInInstalled,
+            IdleProducer::Unattributed,
+            carrick_el1_abi::IdleRoute::None,
+            self.cpu.live_ttbr0(),
+        );
         true
     }
 
@@ -697,6 +717,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
                     .fetch_add(1, Ordering::Relaxed);
                 zone.leave_idle(slot);
                 zone.counters.el1_idle_exits.fetch_add(1, Ordering::Relaxed);
+                slot_trace::note_producer(slot, IdleProducer::IdleHostWork);
                 return Served::Idle;
             }
             let now = self.cpu.now();
@@ -705,7 +726,9 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
                 zone.leave_idle(slot);
                 match self.load(frame, switched) {
                     LoadResult::Running => return Served::Returned { switched: true },
-                    LoadResult::NeedsHost => return self.service_exit(),
+                    LoadResult::NeedsHost => {
+                        return self.service_exit(IdleProducer::IdleLoadNeedsHost);
+                    }
                     LoadResult::Left => {
                         zone.enter_idle(slot, false);
                         continue;
@@ -714,7 +737,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             }
             if zone.head_needs_host(slot) {
                 zone.leave_idle(slot);
-                return self.service_exit();
+                return self.service_exit(IdleProducer::IdleHeadNeedsHost);
             }
             if now < spin_until {
                 self.cpu.spin();
@@ -875,7 +898,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
                     // goes to the tail of the run queue with its registers,
                     // and the vCPU leaves for the host with no thread on it.
                     if self.park_preempted(frame) {
-                        self.service_exit();
+                        self.service_exit(IdleProducer::InterruptParkPreempted);
                         return carrick_el1_abi::Action::Idle;
                     }
                 } else if zone.slot(slot).queued() != 0 {
@@ -883,7 +906,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
                         // The head's address space could not be installed:
                         // the preempted thread is queued behind it and the
                         // vCPU leaves for the executor, which loads the head.
-                        self.service_exit();
+                        self.service_exit(IdleProducer::InterruptPreemptFailed);
                         return carrick_el1_abi::Action::Idle;
                     }
                 } else {
@@ -922,12 +945,23 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         frame: &mut TrapFrame,
         timeout_result: u64,
     ) -> carrick_el1_abi::Action {
+        // #1100: the host started this entry; record the word it left and
+        // the root it wrote.
+        slot_trace::record(
+            self.zone,
+            self.slot,
+            carrick_el1_abi::SlotEventKind::IdleEntry,
+            IdleProducer::Unattributed,
+            carrick_el1_abi::IdleRoute::None,
+            self.cpu.live_ttbr0(),
+        );
         self.take_irqs();
         if self.task.linux.has_pending_host_work()
             || self.zone.slot(self.slot).affinity_excludes_cpu()
         {
             self.counters.exit_reasons[El1ExitReason::IdleEntryHostWork as usize]
                 .fetch_add(1, Ordering::Relaxed);
+            slot_trace::note_producer(self.slot, IdleProducer::IdleEntryHostWork);
             return carrick_el1_abi::Action::Idle;
         }
         match self.idle(frame, timeout_result) {
@@ -1091,7 +1125,66 @@ pub fn leave_space(zone: &ZoneTables, slot: SlotId, cpu: &mut impl ThreadCpu) {
         return;
     }
     cpu.set_translation(idle, idle);
+    slot_trace::record(
+        zone,
+        slot,
+        carrick_el1_abi::SlotEventKind::Left,
+        IdleProducer::Unattributed,
+        carrick_el1_abi::IdleRoute::None,
+        cpu.live_ttbr0(),
+    );
     zone.release_space(slot);
+}
+
+/// `enter_space`'s early return trusts the occupancy word naming `mm`. The
+/// word is only half of "this vCPU runs `mm`": the live TTBR0 must be
+/// `mm`'s published root too (#1100). Record the switch-in; a different
+/// table is [`stale_root`]. Diagnostics: a match changes nothing.
+#[inline(never)]
+fn confirm_kept_root(zone: &ZoneTables, slot: SlotId, mm: u64, live: Option<u64>) {
+    slot_trace::record(
+        zone,
+        slot,
+        carrick_el1_abi::SlotEventKind::SwitchInKept,
+        IdleProducer::Unattributed,
+        carrick_el1_abi::IdleRoute::None,
+        live,
+    );
+    let expected = zone
+        .spaces
+        .find(mm)
+        .and_then(|index| zone.spaces.root_identity(index, mm));
+    if let (Some(live), Some(expected)) = (live, expected)
+        && carrick_el1_abi::ttbr_baddr(live) != carrick_el1_abi::ttbr_baddr(expected)
+    {
+        stale_root(zone, slot, mm, live, expected);
+    }
+}
+
+/// A switch-in would run `mm`'s thread on another table: fail with the
+/// slot's trace (its last idle exit, the host's idle entry, the switch-in).
+#[cold]
+#[inline(never)]
+#[track_caller]
+fn stale_root(zone: &ZoneTables, slot: SlotId, mm: u64, live: u64, expected: u64) -> ! {
+    let (last_idle_exit, recent) = slot_trace::snapshot::<3>(slot);
+    let attribution =
+        carrick_el1_abi::FatalAttribution::StaleRoot(carrick_el1_abi::StaleRootAttribution {
+            slot: slot.raw(),
+            space: mm,
+            live_ttbr0: live,
+            expected_ttbr0: expected,
+            idle_ttbr0: zone.spaces.idle_ttbr(),
+            last_idle_exit,
+            recent,
+        });
+    #[cfg(target_os = "none")]
+    hw::fatal_entry_binding_attributed(
+        carrick_el1_abi::EntryBindingFatalReason::SwitchInStaleRoot,
+        attribution,
+    );
+    #[cfg(not(target_os = "none"))]
+    panic!("switch-in on a stale root:{attribution}")
 }
 
 /// A host-test stand-in for the CPU: the registers a switch moves, plus a
@@ -1226,6 +1319,11 @@ impl ThreadCpu for FakeCpu {
     fn set_translation(&mut self, ttbr0: u64, ttbr1: u64) {
         self.ttbr = (ttbr0, ttbr1);
         self.translations.push((ttbr0, ttbr1));
+    }
+
+    /// A stand-in that never installed a root reports none.
+    fn live_ttbr0(&self) -> Option<u64> {
+        (self.ttbr.0 != 0).then_some(self.ttbr.0)
     }
 
     fn invalidate_asid(&mut self, ttbr0: u64) {

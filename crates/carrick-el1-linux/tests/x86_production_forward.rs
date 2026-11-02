@@ -85,6 +85,9 @@ impl sched::ThreadCpu for NoCpu {
     fn set_translation(&mut self, _: u64, _: u64) {
         panic!("no CPU venue");
     }
+    fn live_ttbr0(&self) -> Option<u64> {
+        None
+    }
     fn invalidate_asid(&mut self, _: u64) {
         panic!("no CPU venue");
     }

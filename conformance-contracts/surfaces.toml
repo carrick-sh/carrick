@@ -311,6 +311,8 @@ surfaces = [
   { path = "crates/carrick-el1/src/sched/hw.rs", contract = "kernel.el1.futex-handoff" },
   { path = "crates/carrick-el1/src/sched/hw.rs", contract = "kernel.el1.guest-scheduler" },
   { path = "crates/carrick-el1/src/sched/object_wait.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-el1/src/sched/slot_trace.rs", contract = "kernel.el1.address-space-switch" },
+  { path = "crates/carrick-el1/src/sched/slot_trace.rs", contract = "kernel.el1.guest-scheduler" },
   { path = "crates/carrick-el1/src/substrate/mod.rs", contract = "core.personality.files" },
   { path = "crates/carrick-el1/src/substrate/zone_file_service.rs", contract = "core.personality.files" },
   { path = "crates/carrick-el1/src/substrate/zone_file_service.rs", contract = "kernel.el1.open-lifetime" },

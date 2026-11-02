@@ -881,6 +881,10 @@ where
             Ok(carrick_el1_abi::Action::Served)
         }
         Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended) => {
+            crate::sched::slot_trace::note_route(
+                source.slot,
+                carrick_el1_abi::IdleRoute::DeclinedFaultSuspended,
+            );
             Ok(carrick_el1_abi::Action::Idle)
         }
         Some(_) => Err(NativeProcessError::Quarantined),

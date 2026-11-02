@@ -271,7 +271,13 @@ pub(crate) fn park_fault_owner_wait<C: crate::sched::ThreadCpu, U: crate::sched:
             };
             Some(match served {
                 Some(carrick_el1::substrate::sched::Served::Returned { .. }) => Action::Served,
-                Some(carrick_el1::substrate::sched::Served::Idle) | None => Action::Idle,
+                Some(carrick_el1::substrate::sched::Served::Idle) | None => {
+                    carrick_el1::substrate::sched::slot_trace::note_route(
+                        slot,
+                        carrick_el1_abi::IdleRoute::CowObjectPark,
+                    );
+                    Action::Idle
+                }
             })
         }
         Err((ObjectWaitError::Changed, _)) => None,

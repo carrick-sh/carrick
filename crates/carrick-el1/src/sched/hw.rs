@@ -150,6 +150,10 @@ impl ThreadCpu for HardwareCpu {
         }
     }
 
+    fn live_ttbr0(&self) -> Option<u64> {
+        Some(crate::isa::aarch64::hardware_live_ttbr())
+    }
+
     fn invalidate_asid(&mut self, ttbr0: u64) {
         // SAFETY: TLBI ASIDE1IS takes the ASID in bits 63:48, as TTBR0_EL1
         // holds it; the prior table stores are made visible first, and the
@@ -270,6 +274,10 @@ impl ThreadCpu for HardwareCpu {
     }
     fn invalidate_asid(&mut self, _ttbr0: u64) {
         crate::isa::x86::fatal_entry_binding()
+    }
+    /// CPL0 authenticates CR3 in its own switch; this ARM path never runs.
+    fn live_ttbr0(&self) -> Option<u64> {
+        None
     }
     fn now(&self) -> u64 {
         let (lo, hi): (u32, u32);

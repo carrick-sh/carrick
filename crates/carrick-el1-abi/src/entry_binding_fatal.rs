@@ -92,6 +92,10 @@ pub enum EntryBindingFatalReason {
     /// `retire_mm` refused a child address-space retirement (#1100); the
     /// attribution words name the EL1 step and the host's denial arm.
     ChildRetireRefused = 59,
+    /// A switch-in trusted the slot's occupancy word, which named the
+    /// thread's address space, while the live TTBR0 was another table
+    /// (#1100 occupancy); the attribution carries the slot's trace.
+    SwitchInStaleRoot = 60,
 }
 impl EntryBindingFatalReason {
     pub const fn from_raw(raw: u64) -> Option<Self> {
@@ -155,6 +159,7 @@ impl EntryBindingFatalReason {
             57 => Some(Self::UserReturnAdmission),
             58 => Some(Self::NativeServiceAdmission),
             59 => Some(Self::ChildRetireRefused),
+            60 => Some(Self::SwitchInStaleRoot),
 
             _ => None,
         }
@@ -849,6 +854,14 @@ mod tests {
             observed.claim = claim;
             observed.claim_after = claim;
             // The widest attribution of each tag, plus raw unknown words.
+            let widest_event = crate::SlotEvent::new(
+                crate::SlotEventKind::IdleExit,
+                crate::IdleProducer::InterruptParkPreempted,
+                crate::IdleRoute::DeclinedFaultSuspended,
+                u64::MAX,
+                u64::MAX,
+                true,
+            );
             let widest = [
                 crate::FatalAttribution::Admission(crate::AdmissionAttribution {
                     check: crate::AdmissionCheck::RegisterAuthorizeGroup,
@@ -890,11 +903,21 @@ mod tests {
                     cancel: Some(crate::CancelTally::unpack(u64::MAX)),
                 })
                 .encode(),
+                crate::FatalAttribution::StaleRoot(crate::StaleRootAttribution {
+                    slot: u8::MAX,
+                    space: u64::from(u32::MAX),
+                    live_ttbr0: u64::MAX,
+                    expected_ttbr0: u64::MAX,
+                    idle_ttbr0: u64::MAX,
+                    last_idle_exit: widest_event,
+                    recent: [widest_event; 3],
+                })
+                .encode(),
                 [u64::MAX; crate::FATAL_ATTRIBUTION_WORDS],
             ];
             for words in widest {
                 capture.registers.attribution = words.map(Some);
-                for reason in (1..=59).chain(core::iter::once(u64::MAX)) {
+                for reason in (1..=60).chain(core::iter::once(u64::MAX)) {
                     capture.registers.reason = Some(reason);
                     let text = format!("{capture}");
                     assert!(
