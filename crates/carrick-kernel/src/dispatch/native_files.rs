@@ -232,11 +232,11 @@ impl SyscallDispatcher {
                 fsgid: carrick_abi::NsGid::new(id.fsgid),
                 umask: context.umask & 0o777,
             });
-        // An empty ring list is the launch identity, whose groups the host
-        // derives from `/etc/group` exactly as for the root task.
-        if context.groups().len() != 0 {
-            credentials
-                .set_supplementary_groups(context.groups().map(carrick_abi::NsGid::new).collect());
+        // Without `setgroups` the caller has the launch identity's groups,
+        // which the host derives from `/etc/group` exactly as for the root
+        // task. An installed list, even an empty one, is the complete set.
+        if let Some(groups) = context.groups() {
+            credentials.set_supplementary_groups(groups.map(carrick_abi::NsGid::new).collect());
         }
         let fs_context = crate::kernel::FsContext::new(ids.fs_context_id().ok()?);
         fs_context.set_cwd(cwd);
@@ -742,12 +742,9 @@ mod tests {
             }
             let c = &self.credentials;
             let mut staged = Vec::new();
-            let groups: Vec<u32> = c
+            let groups: Option<Vec<u32>> = c
                 .supplementary_groups_override()
-                .unwrap_or(&[])
-                .iter()
-                .map(|group| group.0)
-                .collect();
+                .map(|groups| groups.iter().map(|group| group.0).collect());
             AccessContext::encode_into(
                 &mut staged,
                 carrick_core_abi::host_file::AccessIds {
@@ -761,7 +758,7 @@ mod tests {
                     fsgid: c.fsgid.0,
                 },
                 c.umask,
-                &groups,
+                groups.as_deref(),
                 self.cwd.as_bytes(),
                 self.root.as_deref().map(str::as_bytes),
             )
@@ -1856,6 +1853,51 @@ mod tests {
         // A path record without its caller's access context is refused.
         let mut bare = record(fixture.table, HostFileOp::Openat, FDCWD, [0; 4], b"/tmp", 0);
         assert_eq!(fixture.serve(None, &mut bare), Err(NativeHostFileRefusal));
+    }
+
+    /// #1392: a caller's installed group list, even an empty one
+    /// (`setgroups(0, NULL)`), is its complete set; only a caller that never
+    /// ran `setgroups` gets the launch identity's `/etc/group` groups.
+    #[test]
+    fn native_access_keeps_an_installed_empty_group_list() {
+        let fixture = rootfs_fixture();
+        let authority = |groups: Option<&[u32]>| {
+            let mut bytes = Vec::new();
+            AccessContext::encode_into(
+                &mut bytes,
+                carrick_core_abi::host_file::AccessIds {
+                    ruid: 1000,
+                    euid: 1000,
+                    suid: 1000,
+                    fsuid: 1000,
+                    rgid: 1000,
+                    egid: 1000,
+                    sgid: 1000,
+                    fsgid: 1000,
+                },
+                0o022,
+                groups,
+                b"/",
+                None,
+            )
+            .unwrap();
+            let (context, _) = AccessContext::decode(&bytes).unwrap();
+            fixture
+                .dispatcher
+                .native_access_authority(&context)
+                .unwrap()
+                .credentials
+        };
+        assert_eq!(
+            authority(Some(&[])).supplementary_groups_override(),
+            Some(&[][..])
+        );
+        assert_eq!(
+            authority(Some(&[7])).supplementary_groups_override(),
+            Some(&[carrick_abi::NsGid::new(7)][..])
+        );
+        assert_eq!(authority(None).supplementary_groups_override(), None);
+        assert_eq!(authority(None).fsuid, carrick_abi::NsUid::new(1000));
     }
 
     /// #1392: the chdir lookup (a `Newfstatat` with a name area) answers the

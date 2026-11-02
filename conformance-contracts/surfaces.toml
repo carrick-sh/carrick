@@ -697,6 +697,7 @@ surfaces = [
   { path = "crates/carrick-personality-linux/src/signal.rs", contract = "kernel.el1.signal-delivery-owner" },
   { path = "crates/carrick-personality-linux/src/signal/arm.rs", contract = "kernel.el1.signal-delivery-owner" },
   { path = "crates/carrick-personality-linux/src/sysinfo.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-personality-linux/src/task_fs.rs", contract = "kernel.native.host-file-venue" },
   { path = "crates/carrick-personality-linux/tests/futex_policy.rs", contract = "core.entry.completion" },
   { path = "crates/carrick-personality-linux/tests/futex_policy.rs", contract = "kernel.el1.futex-handoff" },
   { path = "crates/carrick-personality-linux/tests/signal_policy_contract.rs", contract = "kernel.el1.signal-delivery-owner" },

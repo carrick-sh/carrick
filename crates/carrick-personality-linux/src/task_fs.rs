@@ -139,11 +139,13 @@ impl TaskFs {
             out,
             ids,
             umask & 0o777,
-            &groups,
+            credentials.groups_installed.then_some(groups.as_slice()),
             self.cwd.as_bytes(),
             self.root.as_ref().map(TaskPath::as_bytes),
         )
-        .map_err(|_| carrick_syscall_abi::LINUX_ENOMEM)
+        // A context past one record's bounds (more than
+        // `ACCESS_MAX_GROUPS` groups) is left unrouted, never guessed.
+        .map_err(|_| carrick_syscall_abi::LINUX_ENOSYS)
     }
 }
 
@@ -196,6 +198,7 @@ mod tests {
         let mut credentials = TaskCredentials::ROOT;
         credentials.fsuid = crate::identity::TaskUid::new(1000);
         credentials.groups = alloc::vec![crate::identity::TaskGid::new(7)];
+        credentials.groups_installed = true;
         let fs = TaskFs {
             cwd: TaskPath::new(b"/tmp/sub").unwrap(),
             root: None,
@@ -206,7 +209,18 @@ mod tests {
         assert_eq!(context.ids.fsuid, 1000);
         assert_eq!(context.umask, 0o077);
         assert_eq!(context.cwd, b"/tmp/sub");
-        assert_eq!(context.groups().collect::<Vec<_>>(), [7]);
+        assert_eq!(context.groups().unwrap().collect::<Vec<_>>(), [7]);
         assert!(rest.is_empty());
+        // `setgroups(0, NULL)`: an installed empty list, not launch groups.
+        credentials.groups.clear();
+        let mut bytes = Vec::new();
+        fs.encode_access(&credentials, 0o022, &mut bytes).unwrap();
+        let (context, _) = AccessContext::decode(&bytes).unwrap();
+        assert_eq!(context.groups().map(|groups| groups.len()), Some(0));
+        let mut bytes = Vec::new();
+        fs.encode_access(&TaskCredentials::ROOT, 0o022, &mut bytes)
+            .unwrap();
+        let (context, _) = AccessContext::decode(&bytes).unwrap();
+        assert!(context.groups().is_none(), "the launch identity's groups");
     }
 }

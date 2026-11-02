@@ -123,6 +123,12 @@ fn prepare_native_exec_image(
             if flags & !VALID != 0 {
                 return Err(crate::linux_abi::LINUX_EINVAL);
             }
+            // The capability's lookup always follows a final symlink; a
+            // no-follow exec (ELOOP on a final symlink) is left unrouted
+            // until the lookup can refuse one, never served as a follow.
+            if flags & carrick_abi::LINUX_AT_SYMLINK_NOFOLLOW as u32 != 0 {
+                return Err(crate::linux_abi::LINUX_ENOSYS);
+            }
             if path.is_empty() && flags & carrick_abi::LINUX_AT_EMPTY_PATH as u32 != 0 {
                 format!("/proc/self/fd/{dirfd}")
             } else if path.starts_with('/') || dirfd == -100 {
@@ -885,7 +891,7 @@ mod tests {
                 sgid: fsuid,
             },
             0o022,
-            &[],
+            None,
             cwd.as_bytes(),
             None,
         )
@@ -967,6 +973,19 @@ mod tests {
                     flags: carrick_abi::LINUX_AT_EMPTY_PATH as u32
                 },
                 "",
+                0,
+                "/"
+            ),
+            enosys
+        );
+        // A no-follow execveat is never served as a following lookup.
+        assert_eq!(
+            exec(
+                ExecCall::Execveat {
+                    dirfd: -100,
+                    flags: carrick_abi::LINUX_AT_SYMLINK_NOFOLLOW as u32
+                },
+                &absolute,
                 0,
                 "/"
             ),

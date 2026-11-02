@@ -429,14 +429,13 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
         child: MmGeneration,
     ) -> Result<Self::PreparedMm, NativeProcessError>;
     /// The live cwd and root of the host-served root, read once for a child
-    /// the root is forking (the #1393(a) `RootOnly` seed). `None` for a
-    /// venue without a host-served root, whose ring row is the authority.
+    /// the root is forking (the #1393(a) `RootOnly` seed).
     fn root_fork_seed(
         &mut self,
         capability: carrick_core_abi::service::ExecCapabilityId,
-    ) -> Result<Option<carrick_personality_linux::task_fs::TaskFs>, NativeProcessError> {
+    ) -> Result<RootFsSeed, NativeProcessError> {
         let _ = capability;
-        Ok(None)
+        Ok(RootFsSeed::NoHostRoot)
     }
     fn prepared_mm(&self, prepared: &Self::PreparedMm) -> Self::Mm;
     fn prepared_context(&self, prepared: &Self::PreparedMm) -> AddressContext<RootGpa>;
@@ -3771,13 +3770,25 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
     pub(crate) fn task_fs_for_test(
         &self,
         visible: Option<u32>,
-    ) -> Option<carrick_personality_linux::task_fs::TaskFs> {
+    ) -> Option<Option<carrick_personality_linux::task_fs::TaskFs>> {
         let root = self.graph.lock().root_key;
         let key = match visible {
             Some(pid) => self.namespace_child_key(root, pid)?,
             None => root,
         };
         Some(self.graph.lock().owner.task(key).ok()?.fs.clone())
+    }
+    /// The leader credentials and umask of the root's child `visible`.
+    #[cfg(test)]
+    pub(crate) fn task_identity_for_test(
+        &self,
+        visible: u32,
+    ) -> Option<(carrick_personality_linux::identity::TaskCredentials, u32)> {
+        let root = self.graph.lock().root_key;
+        let key = self.namespace_child_key(root, visible)?;
+        let graph = self.graph.lock();
+        let task = graph.owner.task(key).ok()?;
+        Some((task.leader_credentials().ok()?.clone(), task.umask))
     }
     pub fn namespace_child_key(&self, caller: TaskKey, visible: u32) -> Option<TaskKey> {
         self.graph
@@ -3863,6 +3874,19 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         Arc::downgrade(&self.exec_capability)
     }
 }
+/// The outcome of the root fork seed crossing (#1392).
+pub enum RootFsSeed {
+    /// This venue has no host-served root: the ring row is the authority.
+    NoHostRoot,
+    /// The host-served root's live cwd and root at this fork.
+    Seeded(carrick_personality_linux::task_fs::TaskFs),
+    /// The carrier did not serve the seed (for example the root's file
+    /// capability retired with a host exec, #936). The child's cwd is then
+    /// unknown, and its path and exec crossings are left unrouted (counted
+    /// ENOSYS), never resolved against a guessed cwd.
+    Refused,
+}
+
 /// What a fork reserves and captures from its parent before preparing the
 /// child MM. Boxed so the frame live across `prepare_mm` holds one pointer.
 struct ForkReservation<'a, M> {
@@ -3884,7 +3908,7 @@ struct ForkReservation<'a, M> {
     parent_creds: carrick_personality_linux::identity::TaskCredentials,
     parent_rlimits: carrick_sched_core::process::RlimitSet,
     parent_umask: u32,
-    parent_fs: carrick_personality_linux::task_fs::TaskFs,
+    parent_fs: Option<carrick_personality_linux::task_fs::TaskFs>,
     parent_personality: u64,
     parent_dumpable: u32,
     parent_no_new_privs: bool,
@@ -6558,7 +6582,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .ok_or(NativeProcessError::Stale)?;
             self.service.root_fork_seed(capability)?
         } else {
-            None
+            RootFsSeed::NoHostRoot
         };
         let (
             snapshot,
@@ -6616,9 +6640,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .clone();
             let parent_rlimits = row.rlimits;
             let parent_umask = row.umask;
-            let parent_fs = match root_seed.take() {
-                Some(seed) => seed,
-                None => row.fs.clone(),
+            let parent_fs = match core::mem::replace(&mut root_seed, RootFsSeed::NoHostRoot) {
+                RootFsSeed::Seeded(seed) => Some(seed),
+                RootFsSeed::Refused => None,
+                RootFsSeed::NoHostRoot => row.fs.clone(),
             };
             let parent_personality = row.personality;
             let parent_dumpable = row.dumpable;
@@ -8027,6 +8052,7 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             }
             if let Some(p) = parsed.take() {
                 creds.groups = p;
+                creds.groups_installed = true;
             }
             Ok(())
         })
@@ -8550,6 +8576,7 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         }
         let task = graph.owner.task(self.key).ok()?;
         task.fs
+            .as_ref()?
             .getcwd()
             .map(|visible| visible.map_err(|errno| errno.guest_retval()))
     }

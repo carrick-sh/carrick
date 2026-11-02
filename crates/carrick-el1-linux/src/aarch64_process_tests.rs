@@ -196,6 +196,9 @@ struct TestStockCrossing {
     /// reads it, and how many seeds were served.
     root_cwd: std::sync::Mutex<Vec<u8>>,
     root_seeds: AtomicUsize,
+    /// Refuse the seed, as the carrier does once the root's capability
+    /// retired with a host exec.
+    refuse_root_seed: core::sync::atomic::AtomicBool,
 }
 
 impl TestStockCrossing {
@@ -251,6 +254,7 @@ impl TestStockCrossing {
             require_stack_commit: false,
             root_cwd: std::sync::Mutex::new(b"/".to_vec()),
             root_seeds: AtomicUsize::new(0),
+            refuse_root_seed: core::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -259,6 +263,9 @@ impl ForkStockCrossing for TestStockCrossing {
     fn cross_root_fork_seed(&self, record_va: u64, _cpu: u64) -> Result<(), NativeProcessError> {
         // SAFETY: the synchronous crossing retains the ring's boxed record.
         let record = unsafe { &mut *(record_va as *mut carrick_core_abi::service::RootForkSeed) };
+        if self.refuse_root_seed.load(Ordering::Acquire) {
+            return Err(NativeProcessError::Stale);
+        }
         let cwd = self.root_cwd.lock().unwrap().clone();
         if !record.serve(&cwd, None) {
             return Err(NativeProcessError::Stale);

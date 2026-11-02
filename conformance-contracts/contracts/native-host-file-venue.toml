@@ -1,7 +1,7 @@
 schema_version = 1
 id = "kernel.native.host-file-venue"
 title = "Native processes cross to the host only for host files, through the dispatcher's own path"
-guest_surfaces = ["syscall:read", "syscall:pread64", "syscall:lseek", "syscall:getdents64", "syscall:fstat", "syscall:newfstatat", "syscall:statx", "syscall:openat", "syscall:faccessat", "syscall:write", "syscall:writev"]
+guest_surfaces = ["syscall:read", "syscall:pread64", "syscall:lseek", "syscall:getdents64", "syscall:fstat", "syscall:newfstatat", "syscall:statx", "syscall:openat", "syscall:faccessat", "syscall:write", "syscall:writev", "syscall:chdir", "syscall:getcwd", "syscall:execve"]
 semantic_authority = ["man 2 read", "man 2 pread", "man 2 lseek", "man 2 getdents64", "man 2 fstat", "man 2 statx", "man 2 openat", "man 2 pipe", "owner decision on #231, #894 and #937"]
 fixture = "unit:native_reads_equal_the_dispatchers_own_syscalls"
 scale_points = [1]
@@ -15,7 +15,10 @@ to the carrier, which runs the dispatcher's own description cores (read,
 pread64, lseek, getdents64, stat) against the caller's pinned description, so
 a native process sees exactly what the dispatcher's own syscalls return.
 Paths resolve with the caller's own credentials and filesystem context, never
-the serving task's. The VM-free witnesses compare venue results with the
+the serving task's: every path record and exec payload carries the caller's
+access context (ids, umask, groups, cwd, root) from its ring task row, which
+fork copies and a host-served root's fork seeds once with the root's live cwd
+(#1392). A ring chdir is one lookup crossing; getcwd is answered in ring. The VM-free witnesses compare venue results with the
 dispatcher's syscalls byte for byte and prove the in-zone routing.
 """
 
@@ -30,6 +33,13 @@ vm_free = [
   "carrick-kernel::dispatch::native_files::tests::native_relative_open_resolves_with_the_callers_cwd",
   "carrick-personality-linux::native_host_file::tests::in_zone_fstat_is_answered_in_ring_with_the_shared_record",
   "carrick-personality-linux::native_host_file::tests::in_zone_objects_never_build_a_host_request",
+  "carrick-el1-linux::aarch64_process_tests::native_child_handoff_tests::arm_root_fork_seeds_each_childs_row_with_the_roots_live_cwd",
+  "carrick-kernel::dispatch::native_files::tests::native_paths_resolve_under_each_callers_own_cwd",
+  "carrick-kernel::dispatch::native_files::tests::native_chdir_lookup_names_the_canonical_directory",
+  "carrick-kernel::dispatch::native_files::tests::native_access_keeps_an_installed_empty_group_list",
+  "carrick-runtime::runtime::exec::tests::native_child_exec_resolves_with_the_callers_own_access",
+  "carrick-personality-linux::native_host_file::tests::chdir_stages_one_lookup_and_reads_the_directory_from_its_reply",
+  "carrick-personality-linux::task_fs::tests::visible_cwd_reports_the_global_cwd_except_above_the_root",
 ]
 
 [bindings.unresolved]
