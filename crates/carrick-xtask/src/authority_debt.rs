@@ -622,7 +622,11 @@ pub(crate) fn comparison_base(
     }
     Ok(Some(base))
 }
-fn base_policy(root: &Path, base: &str) -> Result<AuthorityDebtCeilings, DebtError> {
+fn base_policy(
+    root: &Path,
+    base: &str,
+    introducing_contention: bool,
+) -> Result<AuthorityDebtCeilings, DebtError> {
     let path = format!("{base}:{CEILINGS_PATH}");
     // Only a genuinely absent new schema uses legacy migration. Corrupt policy
     // is an error; it cannot fall back to a more permissive baseline.
@@ -630,10 +634,11 @@ fn base_policy(root: &Path, base: &str) -> Result<AuthorityDebtCeilings, DebtErr
     if !exists.stdout.trim().is_empty() {
         let output = command::run_checked("git", ["show", &path], Some(root))?;
         let mut policy: AuthorityDebtCeilings = serde_json::from_str(&output.stdout)?;
-        if !policy
-            .counters
-            .iter()
-            .any(|counter| counter.family == Family::ContentionVariant)
+        if introducing_contention
+            && !policy
+                .counters
+                .iter()
+                .any(|counter| counter.family == Family::ContentionVariant)
         {
             // Bootstrap a newly introduced census from the immutable PR base,
             // never from candidate source or a hand-authored head ceiling.
@@ -746,7 +751,11 @@ pub fn run(root: &Path, args: &AuthorityDebtArgs) -> Result<(), DebtError> {
         let moves = DebtMoves::load(&root)
             .and_then(|moves| moves.authority_debt(&DebtMoves::load_at(&root, base)?))
             .map_err(DebtError::Policy)?;
-        policy.ratchet(&base_policy(&root, base)?, &moves)?;
+        let introducing_contention = policy
+            .counters
+            .iter()
+            .any(|counter| counter.family == Family::ContentionVariant);
+        policy.ratchet(&base_policy(&root, base, introducing_contention)?, &moves)?;
     } else {
         println!(
             "authority debt delta: no change range (no base provided); delta ratchet not applicable"
