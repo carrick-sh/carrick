@@ -65,6 +65,12 @@ pub struct Worker {
     pub model: String,
     pub effort: Option<String>,
     pub coauthor: String,
+    /// The live model roster the admitting capacity report listed for this
+    /// backend. A codex worker's launcher receives it as `CODEX_MODELS`, so
+    /// it never starts a second app-server on the worker's `CODEX_HOME` to
+    /// list models before the turn (#1381). Runtime-only, never in receipts.
+    #[serde(skip)]
+    pub roster: Vec<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1017,12 +1023,57 @@ fn worker_prompt(dispatch: &Dispatch) -> String {
     )
 }
 
+/// The worker launcher's environment inside its actor `state`.
+///
+/// One Codex app-server owns a worker's `CODEX_HOME` (#1381). Without a
+/// roster the launcher resolves the model by starting a second app-server
+/// on the same home for `model/list`, with a 60 s limit that kills only its
+/// Python wrapper. An app-server still alive on that home makes the turn's
+/// app-server fail SQLite initialization ("failed to initialize sqlite state
+/// runtime"). The capacity report that admitted this worker already listed
+/// the live roster, so the launcher gets it as `CODEX_MODELS` and resolves
+/// the model without starting Codex.
+fn worker_environment(
+    command: &mut Command,
+    state: &Path,
+    worker: &Worker,
+) -> Result<(), ScalerError> {
+    let home = state.join("home");
+    command
+        .env_remove("GITHUB_OUTPUT")
+        .env_remove("GITHUB_ENV")
+        .env_remove("GITHUB_PATH")
+        .env_remove("GITHUB_STEP_SUMMARY")
+        .env("HOME", &home)
+        .env("CODEX_HOME", home.join(".codex"))
+        .env("AGY_CLI_DISABLE_AUTO_UPDATE", "1")
+        .env("AGY_BIN", state.join("bin/agy"))
+        // The template's read-only, hash-locked SDK (#773) carries the whole
+        // codex package (codex, codex-code-mode-host, rg, bwrap); a lone
+        // codex binary override cannot run tools.
+        .env("AGY_DIRECTOR_CODEX_VENV", CODEX_SDK_VENV)
+        .env(
+            "AGY_MODELS_SEED",
+            state
+                .join("director")
+                .join(crate::agent_runner::MODELS_SEED),
+        );
+    if worker.backend == "codex" {
+        if !worker.roster.contains(&worker.model) {
+            return Err(ScalerError::Guard(
+                "codex worker admitted without the live roster that lists its model",
+            ));
+        }
+        command.env("CODEX_MODELS", worker.roster.join(" "));
+    }
+    Ok(())
+}
+
 fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
     let state = root
         .parent()
         .ok_or(ScalerError::Guard("missing agent home"))?
         .to_owned();
-    let home = state.join("home");
     let schema_path = state.join("schema.json");
     let prompt_file = state.join("prompt.md");
     std::fs::write(&schema_path, serde_json::to_vec_pretty(&schema())?)?;
@@ -1059,26 +1110,8 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
             state.join("rust/cargo/bin").display()
         ),
     );
-    command
-        .env_remove("GITHUB_OUTPUT")
-        .env_remove("GITHUB_ENV")
-        .env_remove("GITHUB_PATH")
-        .env_remove("GITHUB_STEP_SUMMARY")
-        .env("HOME", &home)
-        .env("CODEX_HOME", home.join(".codex"))
-        .env("AGY_CLI_DISABLE_AUTO_UPDATE", "1")
-        .env("AGY_BIN", state.join("bin/agy"))
-        // The template's read-only, hash-locked SDK (#773) carries the whole
-        // codex package (codex, codex-code-mode-host, rg, bwrap); a lone
-        // codex binary override cannot run tools.
-        .env("AGY_DIRECTOR_CODEX_VENV", CODEX_SDK_VENV)
-        .env(
-            "AGY_MODELS_SEED",
-            state
-                .join("director")
-                .join(crate::agent_runner::MODELS_SEED),
-        )
-        .current_dir(root);
+    worker_environment(&mut command, &state, &dispatch.worker)?;
+    command.current_dir(root);
     // Held until the agent retires; the agent only validates and joins it.
     let (_lease, handoff) = agent_lease()?.unzip();
     let mut isolated = account_command(&command, AGENT_USER, root, handoff);
@@ -1494,6 +1527,20 @@ fn output(command: &mut Command) -> Result<Vec<u8>, ScalerError> {
     }
     crate::ci_scaler::execute(command, &[], limit)
 }
+/// Like `output`, bounded only by the active command window (120 s without
+/// one), for a step whose size scales with the worker's tree.
+fn window_output(command: &mut Command) -> Result<Vec<u8>, ScalerError> {
+    let limit = COMMAND_DEADLINE
+        .with(|slot| {
+            slot.get()
+                .map(|d| d.saturating_duration_since(std::time::Instant::now()))
+        })
+        .unwrap_or(std::time::Duration::from_secs(120));
+    if limit.is_zero() {
+        return Err(ScalerError::Guard("loop wall budget exhausted"));
+    }
+    crate::ci_scaler::execute(command, &[], limit)
+}
 pub(crate) fn git_invocation(root: &Path, args: &[&str]) -> Command {
     // Worktree .gitattributes is honored; it has no driver without config.
     let mut command = crate::safe_copy::git_command(root, args);
@@ -1808,19 +1855,23 @@ fn hand_over_to(path: &Path, user: &str) -> Result<(), ScalerError> {
         output(Command::new(program).args(args).arg(parent))?;
     }
     let owned = parent.join("owned");
-    sudo_as(
-        user,
-        &[
-            "/usr/bin/cp",
-            "-a",
-            "--no-preserve=ownership",
-            "--",
-            path.to_str().ok_or(ScalerError::Guard("agent path"))?,
-            owned
-                .to_str()
-                .ok_or(ScalerError::Guard("agent staging path"))?,
-        ],
-    )?;
+    // The copy holds the whole actor (checkout and private Rust homes, GBs).
+    // It is part of the worker's allotted time, so the active command window
+    // bounds it rather than the 120 s per-command cap that a loaded clone
+    // exceeded in run 41353051433 (#1381).
+    let mut copy = Command::new("/usr/bin/sudo");
+    private_environment(&mut copy);
+    copy.args(["-n", "-u", user, "--"]).args([
+        "/usr/bin/cp",
+        "-a",
+        "--no-preserve=ownership",
+        "--",
+        path.to_str().ok_or(ScalerError::Guard("agent path"))?,
+        owned
+            .to_str()
+            .ok_or(ScalerError::Guard("agent staging path"))?,
+    ]);
+    window_output(&mut copy)?;
     let old = parent.join("runner-staging");
     std::fs::rename(path, &old)?;
     std::fs::rename(owned, path)?;
@@ -3568,11 +3619,45 @@ impl WorkerHost for NativeWorkerHost {
         cleanup_agent_user()
     }
     fn hand_back(&mut self, actor: &Path) -> Result<(), ScalerError> {
-        let actor_path = actor.to_str().ok_or(ScalerError::Guard("agent state"))?;
-        sudo(&["/usr/bin/chgrp", "-hR", AGENT_USER, actor_path])?;
-        sudo(&["/usr/bin/chmod", "-R", "ug+rwX,o-rwx", actor_path])?;
-        Ok(())
+        let identity = output(Command::new("/usr/bin/id").args(["-u", AGENT_USER]))?;
+        let agent_uid = String::from_utf8_lossy(&identity)
+            .trim()
+            .parse::<libc::uid_t>()
+            .map_err(|_| ScalerError::Guard("invalid agent uid"))?;
+        hand_back_tree(actor, agent_uid, sudo)
     }
+}
+
+/// Return an agent tree to the runner group, but only a tree the agent owns.
+///
+/// `hand_over` is a transaction whose commit is the rename that puts the
+/// agent's own copy at `actor`, so the root's owner says whether it
+/// committed. A hand-over that failed first (its agent-side copy timed out
+/// after 120 s in run 41353051433) leaves the runner's tree in place; the
+/// runner can already read it, and the agent's `chgrp` on runner-owned files
+/// fails with `Operation not permitted` (#1381). That tree is harvested as
+/// it stands, so the worker's named failure survives instead of a hand-back
+/// error.
+fn hand_back_tree(
+    actor: &Path,
+    agent_uid: libc::uid_t,
+    mut run_as_agent: impl FnMut(&[&str]) -> Result<(), ScalerError>,
+) -> Result<(), ScalerError> {
+    use std::os::unix::fs::MetadataExt;
+    let owner = std::fs::symlink_metadata(actor)?.uid();
+    // SAFETY: geteuid has no preconditions.
+    let runner = unsafe { libc::geteuid() };
+    if owner == runner && owner != agent_uid {
+        return Ok(());
+    }
+    if owner != agent_uid {
+        return Err(ScalerError::Guard(
+            "agent tree is owned by neither the runner nor the agent",
+        ));
+    }
+    let actor_path = actor.to_str().ok_or(ScalerError::Guard("agent state"))?;
+    run_as_agent(&["/usr/bin/chgrp", "-hR", AGENT_USER, actor_path])?;
+    run_as_agent(&["/usr/bin/chmod", "-R", "ug+rwX,o-rwx", actor_path])
 }
 fn produce(
     root: &Path,
@@ -9044,6 +9129,38 @@ fi
         }
     }
 
+    /// #1381 (run 41353051433): a hand-over whose agent-side copy failed
+    /// leaves the runner's tree, including `home/.codex/auth.json` and
+    /// `config.toml`. Hand-back must not ask the agent to `chgrp` it.
+    #[test]
+    fn hand_back_leaves_a_tree_the_hand_over_never_committed() {
+        let temp = tempfile::tempdir().unwrap();
+        let actor = temp.path().join("agent");
+        std::fs::create_dir_all(actor.join("home/.codex")).unwrap();
+        std::fs::create_dir_all(actor.join("work")).unwrap();
+        for name in ["auth.json", "config.toml"] {
+            std::fs::write(actor.join("home/.codex").join(name), "x").unwrap();
+        }
+        // SAFETY: geteuid has no preconditions.
+        let runner = unsafe { libc::geteuid() };
+        let mut commands = Vec::new();
+        hand_back_tree(&actor, runner.wrapping_add(1), |args| {
+            commands.push(args.join(" "));
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            commands.is_empty(),
+            "agent asked to chgrp runner-owned files: {commands:?}"
+        );
+        // A committed tree (owned by the agent uid) is handed back in full.
+        hand_back_tree(&actor, runner, |args| {
+            commands.push(args[0].to_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(commands, ["/usr/bin/chgrp", "/usr/bin/chmod"]);
+    }
     #[test]
     fn worker_actor_receives_only_selected_backend_credentials() {
         let temp = tempfile::tempdir().unwrap();

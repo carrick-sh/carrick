@@ -912,6 +912,13 @@ fn available_worker(capacity: &Value, backend: &str, model: &str) -> Result<Work
         model: model.into(),
         effort: None,
         coauthor: vendor.into(),
+        // The same live roster the model was just checked against (#1381).
+        roster: entry["models"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|id| id.as_str().map(str::to_owned))
+            .collect(),
     })
 }
 
@@ -3817,6 +3824,7 @@ mod tests {
                     model: "opus".into(),
                     effort: None,
                     coauthor: "fixture".into(),
+                    roster: Vec::new(),
                 },
                 base: "a".repeat(40),
                 review: true,
@@ -8204,6 +8212,57 @@ exec /usr/bin/git "$@"
         for claim in ["prior summary", "prior test", "prior risk"] {
             assert!(handoff.contains(claim), "missing handoff {claim}");
         }
+    }
+    /// #1381: the launcher of an admitted codex worker resolves its model
+    /// from the admitting capacity report, so no `model/list` app-server
+    /// shares the worker's `CODEX_HOME` with the turn's app-server.
+    #[test]
+    fn admitted_codex_worker_launcher_gets_the_live_roster() {
+        let root = tempfile::tempdir().unwrap();
+        let mut server = server(root.path());
+        let mut capacity = live_capacity();
+        capacity["backends"]["codex"]["models"] = json!(["gpt-6.1-sol", "gpt-6.1-luna"]);
+        server
+            .admit_worker(
+                &Notes {
+                    notes: "Sol has free capacity".into(),
+                    backend: "codex".into(),
+                    model: "gpt-6.1-sol".into(),
+                },
+                &capacity,
+            )
+            .unwrap();
+        let state = root.path().join("agent");
+        let mut command = Command::new("python3");
+        worker_environment(&mut command, &state, &server.dispatch.worker).unwrap();
+        let env = |key: &str| {
+            command
+                .get_envs()
+                .find(|(name, _)| *name == key)
+                .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+        };
+        assert_eq!(
+            env("CODEX_MODELS").as_deref(),
+            Some("gpt-6.1-sol gpt-6.1-luna"),
+            "the launcher would start a model/list app-server on the worker's CODEX_HOME"
+        );
+        assert_eq!(
+            env("CODEX_HOME").as_deref(),
+            state.join("home/.codex").to_str()
+        );
+        // A codex worker without the roster that lists its model is refused
+        // rather than launched into the two-app-server shape.
+        let mut stale = server.dispatch.worker.clone();
+        stale.roster.clear();
+        assert!(worker_environment(&mut Command::new("python3"), &state, &stale).is_err());
+        // An agy worker has no codex roster to carry.
+        let mut agy = Command::new("python3");
+        let worker = Worker {
+            backend: "agy".into(),
+            ..Worker::default()
+        };
+        worker_environment(&mut agy, &state, &worker).unwrap();
+        assert!(agy.get_envs().all(|(name, _)| name != "CODEX_MODELS"));
     }
     #[test]
     fn unavailable_or_exhausted_capacity_is_refused_without_any_charge() {
