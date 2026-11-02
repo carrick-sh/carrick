@@ -1973,7 +1973,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 }
                 let owner = self.portal().map_err(|_| MmError::Stale)?;
                 let target =
-                    match carrick_core::mm::frames::grant_target(&owner, window, self.worker()) {
+                    match carrick_core::mm::frames::grant_target(&owner, &window, self.worker()) {
                         Ok(target) => target,
                         Err(MmError::Stale) => break 'apply None,
                         Err(error) => return Err(error),

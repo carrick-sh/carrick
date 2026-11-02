@@ -85,11 +85,13 @@ fn grant_page_available<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
 }
 
 /// An editor retained from target admission through descriptor completion.
+/// The caller owns the immutable window snapshot; authentication and execution
+/// borrow that same snapshot instead of copying it onto each nested frame.
 pub struct GrantTarget<
     'a,
     C: Copy + Send + Sync + zerocopy::FromZeros = carrick_sched_core::ThreadCtx,
 > {
-    window: carrick_core_abi::PortalGrantWindow,
+    window: &'a carrick_core_abi::PortalGrantWindow,
     grant: carrick_sched_core::SpaceGrant,
     _editor: SpaceEditor<'a, C>,
     authenticated: bool,
@@ -102,7 +104,7 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> GrantTarget<'a, C> {
     fn into_parts(
         self,
     ) -> (
-        PortalGrantWindow,
+        &'a PortalGrantWindow,
         carrick_sched_core::SpaceGrant,
         SpaceEditor<'a, C>,
         bool,
@@ -121,7 +123,7 @@ pub fn grant_target<
     Context: Copy + Send + Sync + zerocopy::FromZeros,
 >(
     portal: &'a MmPortal<'_, P, Policy, Geometry, Venue, B, Context>,
-    window: carrick_core_abi::PortalGrantWindow,
+    window: &'a carrick_core_abi::PortalGrantWindow,
     worker: u32,
 ) -> Result<GrantTarget<'a, Context>, MmError> {
     if window.operation.carrier != portal.carrier {
@@ -163,7 +165,7 @@ pub fn grant_target_in<
     C: Copy + Send + Sync + zerocopy::FromZeros,
 >(
     carrier: core::num::NonZeroU64,
-    window: PortalGrantWindow,
+    window: &'a PortalGrantWindow,
     spaces: carrick_sched_core::spaces::notification::SpaceAccess<'a, C>,
     worker: u32,
     root: &mut crate::mm::reservation::Reservations<'_, Policy, Geometry, C>,
@@ -190,7 +192,7 @@ fn authenticate_target<
     Geometry: ReservationGeometry,
     C: Copy + Send + Sync + zerocopy::FromZeros,
 >(
-    window: PortalGrantWindow,
+    window: &'a PortalGrantWindow,
     grant: carrick_sched_core::SpaceGrant,
     editor: SpaceEditor<'a, C>,
     root: &mut crate::mm::reservation::Reservations<'_, Policy, Geometry, C>,
@@ -241,7 +243,7 @@ pub fn serve_grant<
     let Some(window) = slot.window() else {
         return Ok(None);
     };
-    let target = grant_target(portal, window, worker)?;
+    let target = grant_target(portal, &window, worker)?;
     Ok(apply_grant::<B, _>(
         slot, words, residency, target, invalidate,
     ))

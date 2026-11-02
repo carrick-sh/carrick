@@ -270,11 +270,14 @@ impl Frames {
                 "::drain_owned_preparation::",
                 "::begin_adapter_service::",
                 "::begin_service_inner::",
-                "::park_service::",
             ])
-            + self
-                .maximum("::yield_service_checkpoint::")
-                .max(self.maximum("::take_preparation_operation::"))
+            + self.required("::prepare_service_inner::")?.max(
+                self.maximum("::park_service::")
+                    + self
+                        .maximum("::yield_service_checkpoint::")
+                        .max(self.maximum("::take_preparation_operation::")),
+            )
+            + self.maximum("::release_service_claim::")
             + allocation;
         // FD inheritance is distinct from the page-table descriptor executor.
         // Optional helpers can inline into their caller in one feature closure
@@ -422,9 +425,27 @@ impl Frames {
                     + self.required("::settle_mm::")?
                     + allocation,
             ),
+            // Admission publishes into boxed pending storage and returns before
+            // parking can consume a ready reply. Charge its allocation/release
+            // descent separately, never erase it from the checked population.
+            (
+                "native service admission",
+                entry
+                    + self.required("::dispatch::arm_native_service_exit::")?
+                    + self.required("::aarch64_process::with_process_entry::")?
+                    + self.maximum("::begin_service::")
+                    + self.required("::begin_service_inner::")?
+                    + self.required("::prepare_service_inner::")?
+                    + self.maximum("::release_service_claim::")
+                    + allocation,
+            ),
             (
                 "native service continuation",
-                service + self.maximum("::release_service_claim::") + allocation,
+                service
+                    + self.required("::finish_service_result::")?
+                        .max(self.required("::prepare_fault_repark::")?)
+                    + self.maximum("::release_service_claim::")
+                    + allocation,
             ),
             // Refusal folding runs after service preparation has returned.
             // It can yield or retire an adapter, but never nests a backing
@@ -611,8 +632,15 @@ impl Frames {
             let line = format!(
                 "EL1 stack {name}: {bytes} / {chain_limit} bytes (stack {stack_size}, vector included)"
             );
-            if bytes > chain_limit {
-                failures.push(line.clone());
+            // #1426 recovers a KiB beneath the existing retained ceiling.
+            // Preserve that reserve across every compiled feature closure.
+            let reserve = if name == "native backing reply" {
+                1024
+            } else {
+                0
+            };
+            if bytes > chain_limit.saturating_sub(reserve) {
+                failures.push(format!("{line}; required headroom {reserve} bytes"));
             }
             report.push(line);
         }
@@ -733,6 +761,9 @@ mod tests {
             "x::dispatch::arm_native_service_exit::h0",
             "x::park_service::h0",
             "x::begin_service_inner::h0",
+            "x::prepare_service_inner::h0",
+            "x::finish_service_result::h0",
+            "x::prepare_fault_repark::h0",
             "x::settle_service_exit::h0",
             "x::park_owner_wait::h0",
             "x::apply_fault_reply::h0",
@@ -746,6 +777,35 @@ mod tests {
             values.insert(name.to_owned(), 128);
         }
         Frames(values)
+    }
+
+    #[test]
+    fn backing_reply_rejects_consuming_the_recovered_reserve() {
+        let mut frames = small_frames();
+        // Each frame is legal, and their sum fits the old 11,311 ceiling,
+        // but it consumes the KiB reserved by #1426.
+        for method in ["apply_fault_reply", "apply_grant", "execute_descriptor_txn"] {
+            frames.0.insert(format!("x::{method}::h0"), 2950);
+        }
+        frames.0.insert("x::visit_live_table::h0".to_owned(), 100);
+        let error = frames.check(16384, 288).unwrap_err();
+        assert!(error.contains("native backing reply"), "{error}");
+        assert!(error.contains("required headroom 1024 bytes"), "{error}");
+        assert!(!error.contains("individual frame"), "{error}");
+    }
+
+    #[test]
+    fn native_admission_and_completion_locals_remain_charged() {
+        for (symbol, chain) in [
+            ("prepare_service_inner", "native service admission"),
+            ("finish_service_result", "native service continuation"),
+            ("prepare_fault_repark", "native service continuation"),
+        ] {
+            let mut frames = small_frames();
+            frames.0.insert(format!("x::{symbol}::h0"), 12000);
+            let error = frames.check(16384, 288).unwrap_err();
+            assert!(error.contains(chain), "{symbol}: {error}");
+        }
     }
 
     #[test]

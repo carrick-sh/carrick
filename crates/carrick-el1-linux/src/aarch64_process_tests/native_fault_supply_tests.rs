@@ -1968,7 +1968,7 @@ fn composed_native_supply_with_prepared(
             fixture.region.table(),
             fixture.zone,
         );
-        let target = carrick_core::mm::frames::grant_target(&mm, competing_window, 0).unwrap();
+        let target = carrick_core::mm::frames::grant_target(&mm, &competing_window, 0).unwrap();
         let receipt = carrick_core::mm::frames::apply_grant::<Aarch64Mmu, _>(
             &competing,
             words,
@@ -1997,7 +1997,7 @@ fn composed_native_supply_with_prepared(
             fixture.region.table(),
             fixture.zone,
         );
-        let target = carrick_core::mm::frames::grant_target(&portal, window, 0).unwrap();
+        let target = carrick_core::mm::frames::grant_target(&portal, &window, 0).unwrap();
         let receipt = carrick_core::mm::frames::apply_grant::<Aarch64Mmu, _>(
             reply_slot,
             words,
