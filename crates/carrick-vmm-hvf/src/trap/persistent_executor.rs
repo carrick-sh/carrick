@@ -436,9 +436,8 @@ impl PersistentCarrierMappings {
         if let Some(publisher) = cached.as_ref().and_then(std::sync::Weak::upgrade) {
             return Some(publisher);
         }
-        let publisher =
-            std::sync::Arc::new(CarrierFdCeilingPublisher::new(std::sync::Arc::clone(self))?)
-                as std::sync::Arc<dyn carrick_hal::FdCeilingPublisher>;
+        let publisher = std::sync::Arc::new(CarrierFdCeilingPublisher::new(self)?)
+            as std::sync::Arc<dyn carrick_hal::FdCeilingPublisher>;
         *cached = Some(std::sync::Arc::downgrade(&publisher));
         Some(publisher)
     }
@@ -465,14 +464,25 @@ pub(super) fn disable_fd_ceiling_word(gate: &std::sync::atomic::AtomicU32) {
     );
 }
 
+/// One carrier's descriptor-ceiling words, as a kernel authority publishes
+/// them.
+///
+/// The publisher describes the carrier; it never extends the carrier's life.
+/// A kernel's `FdCeilingAuthority` retains its publishers, and that authority
+/// is reachable from the kernel's `HostIpc`, which the process-wide IPC
+/// window statics retain until the next container replaces them. A strong
+/// carrier reference here kept a retired carrier's mappings alive into the
+/// next container, whose launch then dropped them: the late drop snapshotted
+/// and cleared the new carrier's EL1 counters (#1446). A raise or disable
+/// after the carrier retired has no reader, so it does nothing.
 struct CarrierFdCeilingPublisher {
-    _carrier: std::sync::Arc<PersistentCarrierMappings>,
+    carrier: std::sync::Weak<PersistentCarrierMappings>,
     ceiling: std::ptr::NonNull<std::sync::atomic::AtomicU32>,
     gate: std::ptr::NonNull<std::sync::atomic::AtomicU32>,
 }
 
 impl CarrierFdCeilingPublisher {
-    fn new(carrier: std::sync::Arc<PersistentCarrierMappings>) -> Option<Self> {
+    fn new(carrier: &std::sync::Arc<PersistentCarrierMappings>) -> Option<Self> {
         let ceiling = carrier
             .host_pointer(
                 carrick_mem::memory::LINUX_FD_CEILING_CONTROL_BASE
@@ -488,7 +498,7 @@ impl CarrierFdCeilingPublisher {
             )?
             .cast();
         let publisher = Self {
-            _carrier: carrier,
+            carrier: std::sync::Arc::downgrade(carrier),
             ceiling,
             gate,
         };
@@ -498,15 +508,24 @@ impl CarrierFdCeilingPublisher {
         Some(publisher)
     }
 
-    fn ceiling(&self) -> &std::sync::atomic::AtomicU32 {
-        // SAFETY: `_carrier` owns the complete stable mapping and both offsets
-        // are naturally aligned within that page for its entire lifetime.
-        unsafe { self.ceiling.as_ref() }
-    }
-
-    fn gate(&self) -> &std::sync::atomic::AtomicU32 {
-        // SAFETY: same owned-mapping proof as `ceiling`.
-        unsafe { self.gate.as_ref() }
+    /// Run `publish` on the ceiling and gate words while the carrier that
+    /// maps them is live; nothing when it has retired.
+    fn with_words(
+        &self,
+        publish: impl FnOnce(&std::sync::atomic::AtomicU32, &std::sync::atomic::AtomicU32),
+    ) {
+        // If the carrier retires during this call, this reference is the
+        // last one and the carrier's terminal drop runs here, after the
+        // write, exactly as it would have run in its last other holder.
+        let Some(carrier) = self.carrier.upgrade() else {
+            return;
+        };
+        // SAFETY: `carrier` owns the complete stable mapping while this
+        // upgraded reference lives, and both offsets are naturally aligned
+        // within that page.
+        let (ceiling, gate) = unsafe { (self.ceiling.as_ref(), self.gate.as_ref()) };
+        publish(ceiling, gate);
+        drop(carrier);
     }
 }
 
@@ -520,18 +539,19 @@ impl std::fmt::Debug for CarrierFdCeilingPublisher {
     }
 }
 
-// SAFETY: the raw pointers name naturally aligned atomics within `_carrier`'s
-// stable MAP_SHARED backing. The Arc owns that backing across every callback.
+// SAFETY: the raw pointers name naturally aligned atomics within `carrier`'s
+// stable MAP_SHARED backing, dereferenced only while an upgraded reference
+// owns that backing.
 unsafe impl Send for CarrierFdCeilingPublisher {}
 unsafe impl Sync for CarrierFdCeilingPublisher {}
 
 impl carrick_hal::FdCeilingPublisher for CarrierFdCeilingPublisher {
     fn raise(&self, maximum: u32) {
-        publish_fd_ceiling_words(self.ceiling(), self.gate(), maximum);
+        self.with_words(|ceiling, gate| publish_fd_ceiling_words(ceiling, gate, maximum));
     }
 
     fn disable(&self) {
-        disable_fd_ceiling_word(self.gate());
+        self.with_words(|_, gate| disable_fd_ceiling_word(gate));
     }
 }
 
@@ -546,7 +566,13 @@ unsafe impl Sync for PersistentCarrierMappings {}
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl Drop for PersistentCarrierMappings {
     fn drop(&mut self) {
-        crate::trap::stage2_backend::snapshot_and_clear_el1_counters();
+        if let Some(el1) = self
+            .mappings
+            .iter()
+            .find(|mapping| mapping.start == carrick_mem::memory::LINUX_EL1_KERNEL_BASE)
+        {
+            crate::trap::stage2_backend::snapshot_and_clear_el1_counters_if(el1.host_addr as usize);
+        }
         let vm_destroyed = self
             .vm_destroyed_after_custody_commit
             .load(std::sync::atomic::Ordering::Acquire);
