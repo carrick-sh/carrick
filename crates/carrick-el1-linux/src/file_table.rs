@@ -242,6 +242,8 @@ pub fn dup2_host_binding(
             }
         }
     };
+    // An in-ring number no host FileTable published (#1398).
+    carrick_el1_abi::cover_guest_descriptor(new_fd as usize);
     slot.set_with_flags(
         file_table,
         new_fd as u32,
@@ -432,6 +434,8 @@ pub fn dup_host_binding(
         return None;
     }
     let slot = candidate;
+    // An in-ring number no host FileTable published (#1398).
+    carrick_el1_abi::cover_guest_descriptor(new_fd as usize);
     slot.set_with_flags(
         file_table,
         new_fd as u32,

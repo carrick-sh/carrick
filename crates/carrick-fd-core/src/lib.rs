@@ -363,9 +363,21 @@ impl Extent {
 /// resolves record `index` for every index below the core's published
 /// count ([`Core::ofd_count`], grown by [`Authority::publish_ofds`]). The
 /// core never asks for an unpublished index; `None` fails closed.
+///
+/// A venue may answer "no such descriptor" without consulting any table from
+/// a conservative, monotone ceiling over every descriptor number it ever
+/// made live (the ARM EL1 vector's close/fstat fast return does). Every
+/// number this core makes live is therefore offered to
+/// [`SlotBacking::cover_descriptor`] before its slot is published, whichever
+/// venue publishes it; a slot can only be installed through the
+/// [`Covered`] proof that call produces.
 pub trait SlotBacking {
     fn resolve(&self, extent: Extent) -> Option<(&[DescriptorSlot], &[AtomicU64])>;
     fn ofd(&self, index: usize) -> Option<&OfdRecord>;
+    /// Raise the venue's descriptor ceiling, if it keeps one, to at least
+    /// `fd` before `fd` becomes visible in any table. Infallible, lock-free
+    /// and idempotent; it must not reenter this authority.
+    fn cover_descriptor(&self, fd: usize);
     fn object(&self, _index: usize) -> Option<&handle::ObjectRecord> {
         None
     }
@@ -434,6 +446,20 @@ impl<'a> TableStorage<'a> {
             .0
             .store(encode_entry(entry) | reserved, Ordering::Relaxed);
         self.mark_free(fd, entry.is_none() && reserved == 0);
+    }
+    /// Make a covered descriptor number live with `entry`.
+    fn install(&self, fd: Covered, entry: Entry) {
+        self.set(fd.0, Some(entry));
+    }
+    /// Remove a descriptor number's entry.
+    fn vacate(&self, fd: usize) {
+        self.set(fd, None);
+    }
+    /// Rewrite the flags of a descriptor that is already live; its number
+    /// was covered when it was installed.
+    fn update(&self, fd: usize, entry: Entry) {
+        debug_assert!(self.get(fd).is_some(), "update of a vacant descriptor");
+        self.set(fd, Some(entry));
     }
     fn reserved(&self, fd: usize) -> bool {
         self.entries
@@ -518,6 +544,12 @@ impl<'a> TableStorage<'a> {
         )
     }
 }
+/// A descriptor number the venue's ceiling already covers
+/// ([`SlotBacking::cover_descriptor`]). Only [`Authority::cover`] makes one,
+/// so no slot can become live without first raising the ceiling.
+#[derive(Clone, Copy, Debug)]
+struct Covered(usize);
+
 struct Table<'a> {
     storage: TableStorage<'a>,
     limit: usize,
@@ -1132,12 +1164,12 @@ impl<B: SlotBacking, W: LockWait, const T: usize> SlotTableTransaction<'_, '_, B
         }
         self.guard.record.begin_write();
         for (fd, pin) in [(first, pins[0]), (second, pins[1])] {
-            self.table.storage.set(
-                fd,
-                Some(Entry {
+            self.table.storage.install(
+                c.cover(fd),
+                Entry {
                     ofd: pin.key.index,
                     cloexec,
-                }),
+                },
             );
             #[cfg(test)]
             if fd == first
@@ -1161,6 +1193,13 @@ impl Drop for Locked<'_> {
 }
 
 impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
+    /// Offer `fd` to the venue's descriptor ceiling before it can be
+    /// installed: the only constructor of [`Covered`].
+    fn cover(&self, fd: usize) -> Covered {
+        self.backing.cover_descriptor(fd);
+        Covered(fd)
+    }
+
     /// Authenticate and lock one table for a typed mutation transaction.
     /// CLONE_FILES clients use the same TableId; no second table is created.
     pub fn transaction(
@@ -1426,7 +1465,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
 
     fn close_locked(&self, table: &Table<'a>, fd: Fd) -> Result<Option<Description>, Error> {
         let entry = table.entry(fd)?;
-        table.storage.set(fd.0 as usize, None);
+        table.storage.vacate(fd.0 as usize);
         self.drop_hold(entry.ofd, REF)
     }
 
@@ -1477,7 +1516,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         release_here: impl FnOnce(Description) -> bool,
     ) -> Result<DeferredRelease, Error> {
         let entry = table.entry(fd)?;
-        table.storage.set(fd.0 as usize, None);
+        table.storage.vacate(fd.0 as usize);
         self.drop_hold_filtered(entry.ofd, REF, release_here)
     }
 
@@ -1563,7 +1602,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         let (_guard, t) = self.lock(table)?;
         let fd = t.allocate(min.0 as usize)?;
         let ofd = self.alloc_ofd(description)?;
-        t.storage.set(fd, Some(Entry { ofd, cloexec }));
+        t.storage.install(self.cover(fd), Entry { ofd, cloexec });
         Ok(Fd(fd as i32))
     }
     /// O(1) read-only snapshot, taking no lock (see [`TableRecord`]); it
@@ -1679,7 +1718,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         let (_guard, t) = self.lock(table)?;
         let mut entry = t.entry(fd)?;
         entry.cloexec = cloexec;
-        t.storage.set(fd.0 as usize, Some(entry));
+        t.storage.update(fd.0 as usize, entry);
         Ok(())
     }
     pub fn getfl(&self, table: TableId, fd: Fd) -> Result<(AccessMode, StatusFlags), Error> {
@@ -1736,12 +1775,12 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         let entry = t.entry(old)?;
         let fd = t.allocate(min)?;
         self.retain(entry.ofd, REF)?;
-        t.storage.set(
-            fd,
-            Some(Entry {
+        t.storage.install(
+            self.cover(fd),
+            Entry {
                 ofd: entry.ofd,
                 cloexec,
-            }),
+            },
         );
         Ok(Fd(fd as i32))
     }
@@ -1805,7 +1844,8 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
             Err(Error::BadFd) => None,
             Err(e) => return Err(e),
         };
-        t.storage.set(new.0 as usize, Some(Entry { ofd, cloexec }));
+        t.storage
+            .install(self.cover(new.0 as usize), Entry { ofd, cloexec });
         Ok(released)
     }
     /// Remove `fd`. Returns the description exactly when this removed its
@@ -1842,7 +1882,8 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
             Err(Error::BadFd) => DeferredRelease::None,
             Err(e) => return Err(e),
         };
-        t.storage.set(new.0 as usize, Some(Entry { ofd, cloexec }));
+        t.storage
+            .install(self.cover(new.0 as usize), Entry { ofd, cloexec });
         Ok(released)
     }
 
@@ -1935,7 +1976,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
             };
             if cloexec {
                 entry.cloexec = true;
-                t.storage.set(fd, Some(entry));
+                t.storage.update(fd, entry);
             } else if let Some(d) = self.close_locked(&t, Fd(fd as i32))? {
                 release(d);
             }
@@ -2315,12 +2356,12 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
             return Err(Error::TooManyFiles);
         }
         self.retain(pin.key.index, REF)?;
-        t.storage.set(
-            target.0 as usize,
-            Some(Entry {
+        t.storage.install(
+            self.cover(target.0 as usize),
+            Entry {
                 ofd: pin.key.index,
                 cloexec,
-            }),
+            },
         );
         Ok(())
     }

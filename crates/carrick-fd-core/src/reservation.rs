@@ -131,12 +131,12 @@ impl<B: SlotBacking, W: LockWait, const T: usize> Authority<'_, B, W, T> {
             // old description and the numeric claim unchanged.
             self.retain(pin.key.index, REF)?;
             let old = t.storage.get(fd);
-            t.storage.set(
-                fd,
-                Some(Entry {
+            t.storage.install(
+                self.cover(fd),
+                Entry {
                     ofd: pin.key.index,
                     cloexec,
-                }),
+                },
             );
             t.storage.unreserve(fd);
             match old {
@@ -165,12 +165,12 @@ impl<B: SlotBacking, W: LockWait, const T: usize> Authority<'_, B, W, T> {
             }
             self.retain(pin.key.index, REF)?;
             let old = t.storage.get(fd);
-            t.storage.set(
-                fd,
-                Some(Entry {
+            t.storage.install(
+                self.cover(fd),
+                Entry {
                     ofd: pin.key.index,
                     cloexec,
-                }),
+                },
             );
             t.storage.unreserve(fd);
             match old {

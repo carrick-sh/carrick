@@ -657,9 +657,19 @@ pub(crate) fn audit_persistent_executor_carrier_mappings(
                         "persistent executor carrier fd ceiling geometry is invalid".to_owned(),
                     )
                 })?;
-            if mapping.perms != applevisor::memory::MemPerms::Read || mapping.guest_writable {
+            // EL1 raises the ceiling word for descriptors a ring-owned table
+            // makes live (#1398); a read-only projection would fault there.
+            // EL0 cannot reach the kernel-only block, and EL1 never writes
+            // the host-owned gate word.
+            // `hvf_perms` escalates every writable boot region to RWX.
+            let writable = matches!(
+                mapping.perms,
+                applevisor::memory::MemPerms::ReadWrite
+                    | applevisor::memory::MemPerms::ReadWriteExec
+            );
+            if !writable || !mapping.guest_writable {
                 return Err(TrapError::Hypervisor(
-                    "persistent executor carrier fd ceiling mapping must be guest read-only"
+                    "persistent executor carrier fd ceiling mapping must be EL1 writable"
                         .to_owned(),
                 ));
             }

@@ -401,15 +401,20 @@ const _: () = assert!(
     "carrier maintenance root escapes the kernel-only first 2 MiB block",
 );
 
-/// Carrier-global descriptor-ceiling control page. EL1 may read this page,
-/// while EL0 cannot reach the kernel-only block and stage-2 denies guest
-/// writes. The host updates both words atomically through the owned carrier
-/// backing.
-pub const LINUX_FD_CEILING_CONTROL_BASE: u64 =
-    LINUX_CARRIER_MAINT_ROOT_BASE + LINUX_CARRIER_MAINT_ROOT_SIZE;
-pub const LINUX_FD_CEILING_CONTROL_SIZE: u64 = 0x4000;
-pub const LINUX_FD_CEILING_OFF_CEILING: u64 = 0;
-pub const LINUX_FD_CEILING_OFF_GATE: u64 = 4;
+/// Carrier-global descriptor-ceiling control page. EL0 cannot reach the
+/// kernel-only block. The host raises the ceiling word for host `FileTable`
+/// installs and owns the gate word through the owned carrier backing; EL1
+/// raises the same ceiling word, only by `fetch_max`, for descriptors a
+/// ring-owned table makes live (`carrick_el1_abi::cover_guest_descriptor`,
+/// #1398). EL1 never writes the gate.
+pub const LINUX_FD_CEILING_CONTROL_BASE: u64 = carrick_el1_abi::EL1_FD_CEILING_CONTROL_BASE;
+pub const LINUX_FD_CEILING_CONTROL_SIZE: u64 = carrick_el1_abi::EL1_FD_CEILING_CONTROL_SIZE;
+pub const LINUX_FD_CEILING_OFF_CEILING: u64 = carrick_el1_abi::EL1_FD_CEILING_OFF_CEILING;
+pub const LINUX_FD_CEILING_OFF_GATE: u64 = carrick_el1_abi::EL1_FD_CEILING_OFF_GATE;
+const _: () = assert!(
+    LINUX_FD_CEILING_CONTROL_BASE == LINUX_CARRIER_MAINT_ROOT_BASE + LINUX_CARRIER_MAINT_ROOT_SIZE,
+    "the EL1 ceiling publisher and the image must name one control page",
+);
 pub const FD_CEILING_GATE_UNINITIALIZED: u32 = 0;
 pub const FD_CEILING_GATE_ENABLED: u32 = 1;
 pub const FD_CEILING_GATE_PERMANENTLY_DISABLED: u32 = 2;
@@ -2453,9 +2458,10 @@ impl AddressSpace {
         let region = MemoryRegion {
             start,
             end,
+            // EL1 raises the ceiling word for ring-owned tables (#1398).
             perms: SegmentPerms {
                 read: true,
-                write: false,
+                write: true,
                 execute: false,
             },
             shared: false,
@@ -8380,7 +8386,8 @@ mod stage1_tests {
             .find(|region| region.start == LINUX_FD_CEILING_CONTROL_BASE)
             .expect("fd ceiling control region");
         assert_eq!(region.len(), LINUX_FD_CEILING_CONTROL_SIZE);
-        assert!(region.perms.read && !region.perms.write && !region.perms.execute);
+        // EL1 raises the ceiling word for ring-owned tables (#1398).
+        assert!(region.perms.read && region.perms.write && !region.perms.execute);
         assert!(!region.shared);
         assert_eq!(
             &region.bytes()

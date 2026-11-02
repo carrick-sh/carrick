@@ -220,6 +220,8 @@ fn arena() -> &'static Mutex<Vec<Backing>> {
 pub(crate) struct TestArena {
     ofds: &'static [OfdRecord],
     objects: &'static [ObjectRecord],
+    /// The venue's monotone descriptor ceiling, as the ARM vector reads it.
+    ceiling: AtomicU64,
 }
 impl TestArena {
     /// A leaked venue holding `ofds` zeroed OFD records.
@@ -243,6 +245,7 @@ impl TestArena {
         Box::leak(Box::new(Self {
             ofds: records,
             objects: obj_records,
+            ceiling: AtomicU64::new(0),
         }))
     }
 }
@@ -253,9 +256,18 @@ fn resolve_extent(extent: Extent) -> Option<Backing> {
         .get(extent.token.checked_sub(1)? as usize)?;
     (slots.len() as u64 == extent.capacity).then_some((slots, bitmap))
 }
+impl TestArena {
+    /// Highest descriptor number this venue was asked to cover.
+    pub(crate) fn ceiling(&self) -> u64 {
+        self.ceiling.load(Ordering::Acquire)
+    }
+}
 impl SlotBacking for TestArena {
     fn resolve(&self, extent: Extent) -> Option<(&[DescriptorSlot], &[AtomicU64])> {
         resolve_extent(extent)
+    }
+    fn cover_descriptor(&self, fd: usize) {
+        self.ceiling.fetch_max(fd as u64, Ordering::AcqRel);
     }
     fn ofd(&self, index: usize) -> Option<&OfdRecord> {
         self.ofds.get(index)
@@ -313,6 +325,63 @@ pub(crate) fn core_with_objects<const T: usize>(
 pub(crate) fn authority<const T: usize, const O: usize>() -> View<T> {
     let (core, arena) = core_with::<T>(O);
     core.bind(arena, Spin)
+}
+
+/// #1398: a venue answering "no such descriptor" from a monotone ceiling is
+/// exact only if every number any table makes live is covered first. Each
+/// install path of the one authority (open, dup, dupfd, dup2/dup3, exact pin
+/// install, reservation commit and the pipe-pair transaction), in a table and
+/// its fork, raises the venue's ceiling to cover the number it returns.
+#[test]
+fn every_installed_descriptor_is_covered_by_the_venue_ceiling() {
+    let (core, arena) = core_with::<3>(16);
+    let c = core.bind(arena, Spin);
+    let covered = |fd: Fd| {
+        assert!(
+            arena.ceiling() >= fd.0 as u64,
+            "fd {} live above the venue ceiling {}",
+            fd.0,
+            arena.ceiling()
+        );
+    };
+    let t = c.create_table(64, &mut storage(16)).unwrap();
+    let source = c.open(t, Fd(0), description(1), false).unwrap();
+    covered(source);
+    let child = c.fork(t, &mut storage(16)).unwrap();
+    for table in [t, child] {
+        let dup = c.dup(table, source).unwrap();
+        covered(dup);
+        let dupfd = c.dupfd(table, source, Fd(9), false).unwrap();
+        assert_eq!(dupfd, Fd(9));
+        covered(dupfd);
+    }
+    // Growth is the ring's ensure_table_capacity: no new number by itself.
+    c.grow_table(child, &mut storage(32)).unwrap();
+    assert_eq!(c.dup2(child, source, Fd(17)), Ok(None));
+    covered(Fd(17));
+    assert_eq!(c.dup3(child, source, Fd(18), true), Ok(None));
+    covered(Fd(18));
+    let (pin, _) = c.pin(child, source).unwrap();
+    c.install_pin(child, Fd(21), &pin, false).unwrap();
+    covered(Fd(21));
+    let exact = c.reserve_exact(child, Fd(23)).unwrap();
+    assert!(
+        arena.ceiling() < 23,
+        "a reservation alone makes nothing live"
+    );
+    assert_eq!(c.commit_reservation(exact, &pin, false).unwrap(), None);
+    covered(Fd(23));
+    let pair = c
+        .transaction(child)
+        .unwrap()
+        .install_pair(Fd(24), [&pin, &pin], false)
+        .unwrap();
+    covered(pair[0]);
+    covered(pair[1]);
+    assert_eq!(c.unpin(pin), Ok(None));
+    for table in [t, child] {
+        c.destroy_table(table, |_| {}).unwrap();
+    }
 }
 
 #[test]
@@ -2479,6 +2548,9 @@ struct FailResolveOnce {
     fail_at: AtomicU64,
 }
 impl SlotBacking for FailResolveOnce {
+    fn cover_descriptor(&self, fd: usize) {
+        self.arena.cover_descriptor(fd);
+    }
     fn resolve(&self, extent: Extent) -> Option<(&[DescriptorSlot], &[AtomicU64])> {
         let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
         if call == self.fail_at.load(Ordering::Relaxed) {

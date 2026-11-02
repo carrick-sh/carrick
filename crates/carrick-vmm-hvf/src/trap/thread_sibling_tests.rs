@@ -601,8 +601,8 @@ fn neutral_persistent_worker_resolves_slot_zero_only_from_carrier_mappings() {
         let mut region = mapped_region(start, start + size, start);
         region.host_addr = host as *mut u8;
         if start == crate::memory::LINUX_FD_CEILING_CONTROL_BASE {
-            region.perms = applevisor::memory::MemPerms::Read;
-            region.guest_writable = false;
+            region.perms = applevisor::memory::MemPerms::ReadWrite;
+            region.guest_writable = true;
         }
         region
     };
@@ -678,11 +678,11 @@ fn neutral_persistent_worker_resolves_slot_zero_only_from_carrier_mappings() {
         .iter_mut()
         .find(|mapping| mapping.start == crate::memory::LINUX_FD_CEILING_CONTROL_BASE)
         .expect("fd ceiling control descriptor");
-    control.perms = applevisor::memory::MemPerms::ReadWrite;
-    control.guest_writable = true;
+    control.perms = applevisor::memory::MemPerms::Read;
+    control.guest_writable = false;
     assert!(
         audit_persistent_executor_carrier_mappings(&carrier).is_err(),
-        "writable guest projection must fail closed"
+        "a read-only projection must fail closed: EL1 raises the ceiling word (#1398)"
     );
 }
 
@@ -757,8 +757,8 @@ fn serial_host_persistent_carrier_authority_outlives_terminal_task_cleanup_and_d
         region.host_mapping = Some(host.into());
         region.stage2_lease = Some(lease);
         if start == crate::memory::LINUX_FD_CEILING_CONTROL_BASE {
-            region.perms = applevisor::memory::MemPerms::Read;
-            region.guest_writable = false;
+            region.perms = applevisor::memory::MemPerms::ReadWrite;
+            region.guest_writable = true;
         }
         task_mappings.insert(region);
         drop_observations.push((host_addr as usize, observed));

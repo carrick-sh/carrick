@@ -1853,6 +1853,10 @@ impl<'a> IpcRegion<'a> {
 }
 
 impl SlotBacking for IpcRegion<'_> {
+    fn cover_descriptor(&self, fd: usize) {
+        crate::cover_guest_descriptor(fd);
+    }
+
     fn ofd(&self, index: usize) -> Option<&OfdRecord> {
         (index < IPC_MAX_OFDS).then(|| {
             // SAFETY: in bounds of the OFD reservation of the mapping; the
