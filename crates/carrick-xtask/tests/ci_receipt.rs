@@ -1467,9 +1467,7 @@ fn retirement_accepts_item_macros_which_cannot_generate_tests() {
     for item in [
         "core::arch::global_asm!(\".text\");",
         "std::arch::global_asm!(\".text\");",
-        "global_asm!(\".text\");",
         "std::thread_local! { static CELL: core::cell::Cell<u32> = const { core::cell::Cell::new(0) }; }",
-        "thread_local! { static CELL: core::cell::Cell<u32> = const { core::cell::Cell::new(0) }; }",
     ] {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base");
@@ -1508,6 +1506,26 @@ fn retirement_refuses_path_modules_anywhere_in_candidate_crate() {
     assert_candidate_scan_refuses(
         "crates/example/src/lib.rs",
         "#[path = \"../../outside/kept.rs\"] mod kept;",
+        None,
+    );
+}
+
+#[test]
+fn retirement_refuses_bare_item_macro_names_that_could_be_rebound() {
+    // `use gen as thread_local` would make a bare `thread_local!` a generator.
+    assert_candidate_scan_refuses(
+        "crates/example/src/lib.rs",
+        "thread_local! { static CELL: u8 = 0; }",
+        None,
+    );
+}
+
+#[test]
+fn retirement_refuses_path_modules_inside_inline_modules() {
+    // rustc resolves this against `src/outer/`, not `src/`.
+    assert_candidate_scan_refuses(
+        "crates/example/src/lib.rs",
+        "mod outer { #[path = \"../kept.rs\"] mod kept; }",
         None,
     );
 }
