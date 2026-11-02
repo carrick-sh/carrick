@@ -568,7 +568,13 @@ impl<'scope, 'zone, C: Copy + Send + Sync + zerocopy::FromZeros>
 
 /// An observation authenticated by the object's admission protocol. This
 /// explicit boundary is for existing protocols that cannot yet issue a ticket.
-#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub struct ObjectStateSnapshot(ObjectWaitSnapshot);
 impl ObjectStateSnapshot {
     /// # Safety
@@ -649,15 +655,35 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectNotificationTicket<'
     /// to an admission handback owned by the queue's real unlock producer.
     /// Success owns the record in Parked or Transferring state; no caller may
     /// reclaim it until normal completion/cancellation returns its token.
+    ///
+    /// Late post-probe observations cannot be enrolled from safe code.
+    /// ```compile_fail,E0308
+    /// #![forbid(unsafe_code)]
+    /// use carrick_sched_core::object_wait::{
+    ///     ObjectNotificationTicket, OperationToken, OwnedObjectWakeEffects,
+    /// };
+    /// use carrick_sched_core::spaces::notification::{SpaceNotificationLease, SpaceWaitCause};
+    /// use carrick_sched_core::RecordId;
+    /// fn lost_wake<'a>(
+    ///     lease: &SpaceNotificationLease<'a>,
+    ///     ticket: ObjectNotificationTicket<'a>,
+    ///     record: RecordId,
+    ///     op: OperationToken,
+    ///     complete: &dyn Fn(OwnedObjectWakeEffects<'_>),
+    /// ) {
+    ///     let late = lease.observe(SpaceWaitCause::Editor);
+    ///     let _ = ticket.park_host_rechecked(late, record, op, complete, || true);
+    /// }
+    /// ```
     pub fn park_host_rechecked(
         self,
-        snapshot: ObjectWaitSnapshot,
+        snapshot: ObjectStateSnapshot,
         record: RecordId,
         operation: OperationToken,
         completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
         still_blocked: impl FnOnce() -> bool,
     ) -> Result<(), (ObjectWaitError, OperationToken)> {
-        if snapshot.key != self.key {
+        if snapshot.observed().key != self.key {
             return Err((ObjectWaitError::Stale, operation));
         }
         match self
@@ -1209,6 +1235,28 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'a, C> {
     /// Enroll and publish one owned record atomically with respect to object
     /// notifications. On refusal ownership of `operation` stays with caller.
     /// Caller owns the record/context and has released every object lock.
+    ///
+    /// Late post-probe observations cannot be enrolled from safe code.
+    /// ```compile_fail,E0308
+    /// #![forbid(unsafe_code)]
+    /// use carrick_sched_core::object_wait::{ObjectWaitGuard, OperationToken};
+    /// use carrick_sched_core::RecordId;
+    /// fn lost_wake(guard: &ObjectWaitGuard<'_>, record: RecordId, op: OperationToken) {
+    ///     let late = guard.snapshot();
+    ///     let _ = guard.park(late, record, op);
+    /// }
+    /// ```
+    /// Rechecked queue-guard enrollment is crate-private; external callers use
+    /// the ticket front doors.
+    /// ```compile_fail,E0624
+    /// #![forbid(unsafe_code)]
+    /// use carrick_sched_core::object_wait::{ObjectWaitGuard, OperationToken};
+    /// use carrick_sched_core::RecordId;
+    /// fn bypass_ticket(guard: &ObjectWaitGuard<'_>, record: RecordId, op: OperationToken) {
+    ///     let late = guard.snapshot();
+    ///     let _ = guard.park_rechecked(late, record, op, || true);
+    /// }
+    /// ```
     pub fn park(
         &self,
         snapshot: ObjectWaitSnapshot,

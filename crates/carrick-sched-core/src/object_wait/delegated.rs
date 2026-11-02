@@ -266,7 +266,12 @@ mod tests {
             })
             .unwrap();
         queue
-            .park(queue.snapshot(), record, OperationToken::new(7, 9).unwrap())
+            .park(
+                // SAFETY: the fixture holds the inode lock across snapshot and park.
+                unsafe { ObjectStateSnapshot::taken_under_object_lock(queue.snapshot()) },
+                record,
+                OperationToken::new(7, 9).unwrap(),
+            )
             .unwrap();
         drop(source); // retiring base pin under the exact still-held inode lock
         release.release_with(|| {

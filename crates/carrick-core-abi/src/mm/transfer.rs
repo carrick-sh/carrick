@@ -89,6 +89,26 @@ impl PortalWaitCause {
 }
 /// Exact admitted owner and producer revision sampled before a failed probe.
 /// Contains no resource guard or prepared semantic permit.
+///
+/// Decoding consumes the wait receipt so safe callers cannot copy or clone one
+/// observation into multiple enrollments.
+/// ```compile_fail,E0382
+/// #![forbid(unsafe_code)]
+/// use carrick_core_abi::{PortalOwnerWait, wait::PortalWaitEnrollment};
+/// use carrick_sched_core::ZoneTables;
+/// fn duplicate_decode(zone: &ZoneTables, wait: PortalOwnerWait) {
+///     let owner = wait.handle();
+///     let _ = PortalWaitEnrollment::for_owner(zone, owner, wait);
+///     let _ = PortalWaitEnrollment::for_owner(zone, owner, wait);
+/// }
+/// ```
+/// ```compile_fail,E0599
+/// #![forbid(unsafe_code)]
+/// use carrick_core_abi::PortalOwnerWait;
+/// fn clone_receipt(wait: &PortalOwnerWait) -> PortalOwnerWait {
+///     wait.clone()
+/// }
+/// ```
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PortalOwnerWait {
     handle: El1MmHandle,

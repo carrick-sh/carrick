@@ -510,7 +510,14 @@ mod queue_witnesses {
                 |operation, enrollment| {
                     zone.object_wait_with_completion(enrollment.key(), &ShortLockSpin, &complete)
                         .unwrap()
-                        .park_host_rechecked(enrollment.observed(), record, operation, || true)
+                        .park_host_rechecked(
+                            crate::object_wait::ObjectStateSnapshot::before_object_probe(
+                                enrollment.observed(),
+                            ),
+                            record,
+                            operation,
+                            || true,
+                        )
                         .unwrap();
                 },
             )

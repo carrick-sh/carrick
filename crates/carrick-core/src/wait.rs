@@ -302,3 +302,242 @@ where
         }
     }
 }
+
+/// Failure while enrolling a contention [`carrick_sched_core::refusal::ReleaseTicket`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TicketParkError {
+    /// The ticket's zone or owner invariant was violated.
+    Invariant(carrick_sched_core::refusal::InvariantKind),
+    /// Record reservation or scheduler queue enrollment refused the park.
+    Wait(ObjectWaitError),
+}
+
+/// Safe ticket entry adapter over the save/park path.
+pub fn park_and_rerun<'a, S, C: carrick_core_abi::EntryContext>(
+    zone: &'a ZoneTables<C>,
+    slot: SlotId,
+    operation: OperationToken,
+    ticket: crate::refusal::ReleaseTicket<'a, C>,
+    completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
+    save_context: S,
+) -> Result<
+    crate::refusal::Rerun<ObjectParked<'a, C>, OperationToken>,
+    (TicketParkError, OperationToken),
+>
+where
+    S: FnOnce() -> Result<(RecordId, bool), ObjectWaitError>,
+{
+    park_and_rerun_inner(zone, slot, operation, ticket, completion, save_context, || {})
+}
+
+fn park_and_rerun_inner<'a, S, H, C: carrick_core_abi::EntryContext>(
+    zone: &'a ZoneTables<C>,
+    slot: SlotId,
+    operation: OperationToken,
+    ticket: crate::refusal::ReleaseTicket<'a, C>,
+    completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
+    save_context: S,
+    after_auth: H,
+) -> Result<
+    crate::refusal::Rerun<ObjectParked<'a, C>, OperationToken>,
+    (TicketParkError, OperationToken),
+>
+where
+    S: FnOnce() -> Result<(RecordId, bool), ObjectWaitError>,
+    H: FnOnce(),
+{
+    use crate::refusal::Rerun;
+    // Pre-fix order (red-first baseline): authenticates before save_context and
+    // fails with Stale when queue generation rebinds after ticket discharge.
+    let request = match unsafe { ObjectParkRequest::from_ticket(zone, operation, ticket) } {
+        Ok(Rerun::Now(operation)) => return Ok(Rerun::Now(operation)),
+        Ok(Rerun::Park(request)) => request,
+        Err((invariant, operation)) => {
+            return Err((TicketParkError::Invariant(invariant), operation));
+        }
+    };
+    after_auth();
+    match park_object_record(zone, slot, request, completion, save_context) {
+        Ok(parked) => Ok(Rerun::Park(parked)),
+        Err((err, operation)) => Err((TicketParkError::Wait(err), operation)),
+    }
+}
+
+#[cfg(test)]
+mod ticket_park_tests {
+    use super::*;
+    use carrick_sched_core::refusal::{
+        Attempt, CancelReason, ContentionSource, Refusal, ReleaseCause, Rerun,
+    };
+    use carrick_sched_core::{AffinitySource, ShortLockSpin, ThreadIdentity};
+    use std::boxed::Box;
+
+    fn zone() -> Box<ZoneTables> {
+        // SAFETY: ZoneTables is valid at all-zero initial state; allocate off-stack.
+        unsafe {
+            let ptr = std::alloc::alloc_zeroed(std::alloc::Layout::new::<ZoneTables>());
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr.cast())
+        }
+    }
+
+    fn identity(tid: u64) -> ThreadIdentity {
+        ThreadIdentity {
+            tid,
+            serial: 1,
+            mm: 77,
+            file_table: 1,
+            generation: 1,
+            affinity_source: AffinitySource::UNBOUND,
+            affinity: 0,
+            lifecycle_page: 0,
+            control_slot: 0,
+        }
+    }
+
+    fn complete(effects: OwnedObjectWakeEffects<'_>) {
+        let _ = effects.deliver_handbacks(&mut |_| {});
+    }
+
+    #[test]
+    fn park_and_rerun_reserves_record_before_authenticating_ticket() {
+        let zone = zone();
+        let slot = SlotId::new(0);
+        let key = ObjectWaitKey::new(1, 7).unwrap();
+        zone.bind_object_wait_with_completion(key, &ShortLockSpin, &complete)
+            .unwrap();
+        let source = zone
+            .admit_object_notification(key, &ShortLockSpin, &complete)
+            .unwrap()
+            .into_source();
+        let Err(Refusal::Contended(ticket)) = source
+            .borrow()
+            .contend(|| Err::<(), _>(Attempt::<()>::Contended(ReleaseCause::Object)))
+        else {
+            panic!("expected contention ticket");
+        };
+        let op = OperationToken::new(41, 3).unwrap();
+        let err = park_and_rerun(&zone, slot, op, ticket, &complete, || {
+            Err(ObjectWaitError::Stale)
+        });
+        let Some((TicketParkError::Wait(ObjectWaitError::Stale), returned)) = err.err() else {
+            panic!("expected Wait(Stale) error");
+        };
+        assert_eq!((returned.index(), returned.generation()), (41, 3));
+        assert_eq!(
+            zone.counters.contention_tickets_cancelled[CancelReason::OperationCancelled as usize]
+                .load(Ordering::Relaxed),
+            1,
+            "failed record reservation must cancel the ticket before authentication"
+        );
+        assert_eq!(
+            zone.counters
+                .contention_tickets_dropped
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn stale_ticket_reruns_now_and_discards_fresh_record() {
+        let zone = zone();
+        let slot = SlotId::new(0);
+        let key = ObjectWaitKey::new(1, 7).unwrap();
+        let next_key = ObjectWaitKey::new(1, 8).unwrap();
+        zone.bind_object_wait_with_completion(key, &ShortLockSpin, &complete)
+            .unwrap();
+        let Err(Refusal::Contended(ticket)) = ({
+            let source = zone
+                .admit_object_notification(key, &ShortLockSpin, &complete)
+                .unwrap()
+                .into_source();
+            let res = source
+                .borrow()
+                .contend(|| Err::<(), _>(Attempt::<()>::Contended(ReleaseCause::Object)));
+            drop(source);
+            res
+        }) else {
+            panic!("expected contention ticket");
+        };
+        let op = OperationToken::new(42, 5).unwrap();
+        let mut reserved = false;
+        let outcome = park_and_rerun_inner(
+            &zone,
+            slot,
+            op,
+            ticket,
+            &complete,
+            || {
+                reserved = true;
+                let record = zone
+                    .current_or_new(slot, identity(78))
+                    .map_err(|_| ObjectWaitError::Exhausted)?;
+                Ok((record, true))
+            },
+            || {
+                zone.bind_object_wait_with_completion(next_key, &ShortLockSpin, &complete)
+                    .unwrap();
+            },
+        )
+        .unwrap();
+        assert!(
+            reserved,
+            "park record must be reserved before ticket authentication"
+        );
+        let Rerun::Now(returned) = outcome else {
+            panic!("stale ticket must return Rerun::Now");
+        };
+        assert_eq!((returned.index(), returned.generation()), (42, 5));
+        assert!(
+            zone.slot(slot).current().is_none(),
+            "unpublished fresh record must be discarded on stale-ticket rerun"
+        );
+    }
+
+    #[test]
+    fn foreign_zone_ticket_discards_reserved_fresh_record_as_invariant() {
+        let zone = self::zone();
+        let other = self::zone();
+        let slot = SlotId::new(0);
+        let key = ObjectWaitKey::new(1, 7).unwrap();
+        zone.bind_object_wait_with_completion(key, &ShortLockSpin, &complete)
+            .unwrap();
+        let source = zone
+            .admit_object_notification(key, &ShortLockSpin, &complete)
+            .unwrap()
+            .into_source();
+        let Err(Refusal::Contended(ticket)) = source
+            .borrow()
+            .contend(|| Err::<(), _>(Attempt::<()>::Contended(ReleaseCause::Object)))
+        else {
+            panic!("expected contention ticket");
+        };
+        let op = OperationToken::new(43, 9).unwrap();
+        let mut reserved = false;
+        let err = park_and_rerun(&other, slot, op, ticket, &complete, || {
+            reserved = true;
+            let record = other
+                .current_or_new(slot, identity(79))
+                .map_err(|_| ObjectWaitError::Exhausted)?;
+            Ok((record, true))
+        });
+        assert!(
+            reserved,
+            "park record must be reserved before ticket authentication"
+        );
+        assert!(matches!(
+            err,
+            Err((
+                TicketParkError::Invariant(carrick_sched_core::refusal::InvariantKind {
+                    domain: "object_ticket_zone",
+                    ..
+                }),
+                returned,
+            )) if (returned.index(), returned.generation()) == (43, 9)
+        ));
+        assert!(
+            other.slot(slot).current().is_none(),
+            "unpublished fresh record must be discarded when authentication fails"
+        );
+    }
+}
