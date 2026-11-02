@@ -568,7 +568,7 @@ impl<'scope, 'zone, C: Copy + Send + Sync + zerocopy::FromZeros>
 
 /// An observation authenticated by the object's admission protocol. This
 /// explicit boundary is for existing protocols that cannot yet issue a ticket.
-#[derive(core::clone::Clone, core::marker::Copy, core::fmt::Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub struct ObjectStateSnapshot(ObjectWaitSnapshot);
 impl ObjectStateSnapshot {
     /// # Safety
