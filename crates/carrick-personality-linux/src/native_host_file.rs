@@ -155,6 +155,11 @@ pub enum HostFileCall {
     },
     /// A private file mapping (`mmap` without `MAP_ANONYMOUS`/`MAP_SHARED`).
     MapPrivate(NativeMapKey),
+    /// `chdir(2)`: one chdir lookup crossing, then the ring updates the
+    /// caller's task row (#1392).
+    Chdir {
+        path: u64,
+    },
 }
 
 /// The exact arguments of a private file `mmap`. The carrier retains the
@@ -268,6 +273,7 @@ impl HostFileCall {
                 fd,
                 request: args[1],
             },
+            c if c == nr::CHDIR => Self::Chdir { path: args[0] },
             c if c == LINUX_NR_MMAP
                 && args[3] & (LINUX_MAP_ANONYMOUS | LINUX_MAP_SHARED | LINUX_MAP_PRIVATE)
                     == LINUX_MAP_PRIVATE =>
@@ -326,6 +332,9 @@ pub enum HostFileStage {
         /// A private file mapping: the reply is a byte source the ring maps
         /// on the exact retried call, not a syscall result.
         map: Option<NativeMapKey>,
+        /// A chdir lookup: on success the ring stores the reply's directory
+        /// spelling as the caller's cwd ([`chdir_target`]).
+        chdir: bool,
     },
 }
 
@@ -445,6 +454,7 @@ impl Staging<'_, '_> {
             output,
             resolves_path: op.resolves_path(),
             map: None,
+            chdir: false,
         }
     }
 
@@ -887,12 +897,87 @@ fn stage_call(
                         output,
                         resolves_path,
                         map: Some(key),
+                        chdir: false,
                     },
                     other => other,
                 }
             }
         },
+        HostFileCall::Chdir { path } => {
+            let path = match copy_path(user, path) {
+                Path::Bytes(path) => path,
+                Path::Stage(stage) => return Some(stage),
+            };
+            if path.is_empty() {
+                return Some(errno(carrick_syscall_abi::LINUX_ENOENT));
+            }
+            // The reply area holds the directory's `struct stat` and then
+            // its cwd spelling: the carrier's chdir lookup.
+            match staging.request_with_reply(
+                HostFileOp::Newfstatat,
+                LINUX_AT_FDCWD,
+                0,
+                [0; 4],
+                &path,
+                None,
+                CHDIR_REPLY_BYTES,
+            ) {
+                HostFileStage::Request {
+                    record,
+                    resolves_path,
+                    ..
+                } => HostFileStage::Request {
+                    record,
+                    output: None,
+                    resolves_path,
+                    map: None,
+                    chdir: true,
+                },
+                other => other,
+            }
+        }
     })
+}
+
+/// A chdir lookup's reply area: `struct stat`, then at most `PATH_MAX` bytes
+/// of the directory's spelling.
+pub const CHDIR_REPLY_BYTES: usize = LINUX_STAT_BYTES + LINUX_PATH_MAX;
+
+/// The directory a served chdir lookup names, or the syscall result that
+/// replaces the change (the carrier's errno, or EIO for a reply that is not
+/// a directory spelling).
+pub fn chdir_target(record: &[u8]) -> Result<crate::task_fs::TaskPath, SyscallResult> {
+    let eio = SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO);
+    let reply = host_file::reply(record).ok_or(eio)?;
+    if reply.result < 0 {
+        return Err(SyscallResult::new(reply.result));
+    }
+    let (stat, name) = reply.output.split_at_checked(LINUX_STAT_BYTES).ok_or(eio)?;
+    let stat = <carrick_syscall_abi::LinuxStat as zerocopy::FromBytes>::read_from_bytes(stat)
+        .map_err(|_| eio)?;
+    if stat.st_mode & carrick_syscall_abi::LINUX_S_IFMT != carrick_syscall_abi::LINUX_S_IFDIR {
+        return Err(eio);
+    }
+    crate::task_fs::TaskPath::new(name).ok_or(eio)
+}
+
+/// Re-stage a path record with its caller's encoded access context leading
+/// the input (the ring task row's values, which only the ring owner holds).
+/// Any other record is returned as staged. `None` when the record is not a
+/// well-formed unserved request or the context does not fit one record.
+pub fn stamp_access_context(record: &[u8], access: &[u8]) -> Option<Box<[u8]>> {
+    let (header, input, output_cap) = host_file::request_parts(record)?;
+    if !header.op.resolves_path() {
+        return Some(record.into());
+    }
+    let mut staged = Vec::new();
+    staged.try_reserve_exact(access.len() + input.len()).ok()?;
+    staged.extend_from_slice(access);
+    staged.extend_from_slice(input);
+    let len = record_len(staged.len(), output_cap)?;
+    let mut restaged = vec![0u8; len].into_boxed_slice();
+    host_file::encode(&mut restaged, header, &staged, output_cap).ok()?;
+    Some(restaged)
 }
 
 /// The byte source a private-mapping reply carries, or the syscall result

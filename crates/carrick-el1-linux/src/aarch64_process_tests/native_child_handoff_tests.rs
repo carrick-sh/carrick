@@ -205,6 +205,7 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool) {
                     output,
                     resolves_path,
                     map,
+                    chdir,
                 }) = super::super::dispatch::native_host_file_stage(
                     &stage_frame,
                     task,
@@ -221,7 +222,8 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool) {
                 else {
                     panic!("the fork child's stdout must stage a host request");
                 };
-                let result = entry.begin_host_file_service(record, output, resolves_path, map);
+                let result =
+                    entry.begin_host_file_service(record, output, resolves_path, map, chdir);
                 entry.settle_service_exit(
                     result,
                     super::super::native_process_runtime::NativeServiceExit::Bridge,
@@ -1503,4 +1505,78 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
             carrick_sched_core::CurrentRelease::Released
         ));
     }
+}
+
+/// #1392: a child the host-served root forks gets the root's live cwd,
+/// read once by the root fork seed crossing at that fork, in its own ring
+/// task row. A later change of the root's host cwd reaches only children
+/// forked after it: each child keeps the value it was born with.
+#[test]
+fn arm_root_fork_seeds_each_childs_row_with_the_roots_live_cwd() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    fixture.zone.spaces.set_idle_ttbr(0x30000);
+    let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        TestStockCrossing::new(&[
+            0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000, 0x28000,
+            0x29000, 0x2a000, 0x2b000, 0x2c000, 0x2d000, 0x2e000, 0x2f000,
+        ]),
+    )
+    .with_words(words);
+    let mut cpu = crate::sched::FakeCpu::default();
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[8] = 220;
+    frame.x[0] = 17;
+    *service.crossing.root_cwd.lock().unwrap() = b"/tmp".to_vec();
+    let mut first_frame = frame;
+    arm_call_with_cpu(
+        fixture,
+        fixture.control,
+        &mut service,
+        &mut first_frame,
+        &mut cpu,
+    )
+    .unwrap();
+    let first = first_frame.x[0] as u32;
+    let first_record = fixture.zone.runnable_head(fixture.slot).unwrap();
+    // The root's host cwd moves after the first fork.
+    *service.crossing.root_cwd.lock().unwrap() = b"/srv/work".to_vec();
+    let mut second_frame = frame;
+    arm_call_with_cpu(
+        fixture,
+        fixture.control,
+        &mut service,
+        &mut second_frame,
+        &mut cpu,
+    )
+    .unwrap();
+    let second = second_frame.x[0] as u32;
+    assert_eq!(service.crossing.root_seeds.load(Ordering::Acquire), 2);
+    let runtime = registry()
+        .for_record(fixture.zone, fixture.zone.record_ref(first_record))
+        .expect("the fork child is registered with the tree's process owner");
+    let cwd = |pid: u32| {
+        runtime
+            .task_fs_for_test(Some(pid))
+            .unwrap()
+            .cwd
+            .as_bytes()
+            .to_vec()
+    };
+    assert_eq!(
+        cwd(first),
+        b"/tmp",
+        "the first child keeps its fork-time cwd"
+    );
+    assert_eq!(cwd(second), b"/srv/work");
+    assert_eq!(
+        runtime.task_fs_for_test(None).unwrap(),
+        carrick_personality_linux::task_fs::TaskFs::default(),
+        "the host-served root's own row never mirrors its host cwd"
+    );
 }

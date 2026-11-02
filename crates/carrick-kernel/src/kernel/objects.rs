@@ -32,7 +32,7 @@ pub use thread_control::{
     ThreadControlLease, ThreadLedgerActivityLease, ThreadLifecycleLease, host_birth_identity,
 };
 
-pub use self::credentials::Credentials;
+pub use self::credentials::{Credentials, CredentialsValues};
 
 pub use self::process::{
     LinuxWaitStatus, Mm, PidfdTarget, TaskRusage, TaskShared, TaskSharedCloneError, Zombie,

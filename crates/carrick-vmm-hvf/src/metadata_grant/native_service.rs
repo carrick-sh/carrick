@@ -36,6 +36,11 @@ pub trait NativeExecHostService: core::fmt::Debug + Send + Sync + 'static {
         request: ServiceRequest,
         record: &mut [u8],
     ) -> Result<Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>, NativeHostFileRefused>;
+
+    /// Serve the root fork seed crossing: write the host-served root's live
+    /// cwd and root into `record` once ([`carrick_core_abi::service::RootForkSeed::serve`]).
+    /// `false` refuses it; the fork then fails without a child.
+    fn root_fork_seed(&self, record: &mut carrick_core_abi::service::RootForkSeed) -> bool;
 }
 
 /// The retained service does not serve this exact host-file request.
@@ -188,6 +193,10 @@ mod native_exec_service_registration_tests {
             NativeHostFileRefused,
         > {
             Err(NativeHostFileRefused)
+        }
+
+        fn root_fork_seed(&self, _record: &mut carrick_core_abi::service::RootForkSeed) -> bool {
+            false
         }
     }
 

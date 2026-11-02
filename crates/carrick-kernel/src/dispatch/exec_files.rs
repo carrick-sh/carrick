@@ -65,23 +65,10 @@ struct ExecFileContext {
     pub fsgid: NsGid,
     pub executable: Option<ExecSource>,
     pub descriptors: Arc<dyn ExecFdSources>,
-    origin: Option<ExecOrigin>,
     /// A ring-owned native child is not the origin task: `/proc/self`,
     /// `/proc/thread-self` and `/dev/fd` must never select the origin's
     /// executable or descriptors for it, including through a symlink.
     deny_caller_views: bool,
-}
-
-/// The live task this capability was captured from, and the exact
-/// credential and filesystem-context objects it observed then.
-#[derive(Clone)]
-struct ExecOrigin {
-    binding: crate::kernel::WeakKernelTaskBinding,
-    tid: crate::kernel::LinuxTid,
-    credentials: Arc<crate::kernel::Credentials>,
-    fs_context: Arc<crate::kernel::FsContext>,
-    /// chdir and chroot edit the context in place and publish a revision.
-    fs_revision: u64,
 }
 
 #[derive(Clone)]
@@ -108,76 +95,18 @@ impl ExecFiles {
         self.context.caller
     }
 
-    /// Rebind inherited physical capabilities to an exact ring-owned caller.
-    /// Cwd, executable identity and descriptor-source custody remain retained
-    /// from the forked capability; credentials come from the live ring task.
-    pub fn for_native_caller(
-        &self,
-        birth: carrick_core_abi::service::ServiceBirth,
-        execution: carrick_core_abi::SnapshotGeneration,
-        fsuid: NsUid,
-        fsgid: NsGid,
-    ) -> Self {
-        let mut inherited = self.clone();
-        inherited.context.caller = ExecCaller::Native { birth, execution };
-        inherited.context.proc_caller = None;
-        inherited.context.fsuid = fsuid;
-        inherited.context.fsgid = fsgid;
-        inherited
-    }
-
-    /// Whether the captured credentials and filesystem context are still the
-    /// origin task's live objects. Any set*id, chdir or chroot replaces them,
-    /// so `true` means a descendant that cannot change them itself (a
-    /// ring-owned native child) still holds exactly this authority.
-    pub fn origin_authority_unchanged(&self) -> bool {
-        let Some(origin) = &self.context.origin else {
-            return false;
-        };
-        let Some(binding) = origin.binding.upgrade() else {
-            return false;
-        };
-        binding.capture(origin.tid).is_ok_and(|live| {
-            let fs_context = live.resources().fs_context();
-            Arc::ptr_eq(&live.resources().credentials(), &origin.credentials)
-                && Arc::ptr_eq(&fs_context, &origin.fs_context)
-                && fs_context.revision() == origin.fs_revision
-        })
-    }
-
-    /// Whether every origin credential is the ring's admitted superuser
-    /// identity (all ids 0). A native child's ring credentials start there
-    /// and the native owner refuses exec once they differ, so this pairs the
-    /// host access view with the caller's ring identity exactly.
-    pub fn origin_is_superuser(&self) -> bool {
-        self.context.origin.as_ref().is_some_and(|origin| {
-            let c = &origin.credentials;
-            [c.ruid, c.euid, c.suid, c.fsuid].iter().all(|id| id.0 == 0)
-                && [c.rgid, c.egid, c.sgid, c.fsgid].iter().all(|id| id.0 == 0)
-        })
-    }
-
-    /// The filesystem authority a ring-owned native process of this tree
-    /// resolves host paths with: the origin's exact credentials and
-    /// filesystem context, offered only while both are unchanged and the
-    /// credentials are the admitted superuser identity (the ring serves a
-    /// path crossing only while the caller's ring credentials are that same
-    /// identity). Otherwise `None`, and the venue refuses path calls.
-    pub fn native_fs_authority(&self) -> Option<super::resources::NativeFsAuthority> {
-        if !self.origin_authority_unchanged() || !self.origin_is_superuser() {
-            return None;
-        }
-        let origin = self.context.origin.as_ref()?;
-        Some(super::resources::NativeFsAuthority::new(
-            Arc::clone(&origin.credentials),
-            Arc::clone(&origin.fs_context),
-        ))
-    }
-
-    /// The access view for a ring-owned native child of the origin task:
-    /// identical filesystem authority, but no caller-relative magic views.
-    pub fn for_native_child(&self) -> Self {
+    /// The access view for a ring-owned native process of this tree: the
+    /// same physical filesystem, resolved under the caller's own cwd and
+    /// filesystem ids, which its ring task row owns and its exec payload
+    /// carries. It has no caller-relative magic views (`/proc/self`,
+    /// `/proc/thread-self`, `/dev/fd`): those name the caller's own
+    /// executable and descriptors, which this capability does not hold.
+    pub fn for_native_access(&self, cwd: String, fsuid: NsUid, fsgid: NsGid) -> Self {
         let mut child = self.clone();
+        child.context.proc_caller = None;
+        child.context.cwd = cwd;
+        child.context.fsuid = fsuid;
+        child.context.fsgid = fsgid;
         child.context.deny_caller_views = true;
         child
     }
@@ -449,13 +378,6 @@ impl SyscallDispatcher {
                     .map(|current| current.source().clone()),
                 descriptors: Arc::new(HostExecFdSources(context.resources().files())),
                 deny_caller_views: false,
-                origin: Some(ExecOrigin {
-                    binding: binding.downgrade(),
-                    tid: context.thread().key().tid,
-                    credentials: Arc::clone(&credentials),
-                    fs_revision: context.resources().fs_context().revision(),
-                    fs_context: context.resources().fs_context(),
-                }),
             },
         ))
     }

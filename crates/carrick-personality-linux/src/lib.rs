@@ -24,6 +24,7 @@ pub mod thread;
 pub mod identity;
 pub mod ipc;
 pub mod sysinfo;
+pub mod task_fs;
 
 use carrick_core::Personality;
 use carrick_guest_arch::ThreadPointerRegister;

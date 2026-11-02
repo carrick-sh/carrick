@@ -7,6 +7,7 @@ pub const EPERM: i64 = -1;
 pub const ESRCH: i64 = -3;
 pub const EFAULT: i64 = -14;
 pub const EINVAL: i64 = -22;
+pub const ERANGE: i64 = -34;
 
 pub const LINUX_UTSNAME_FIELD_SIZE: usize = 65;
 
@@ -240,6 +241,8 @@ pub enum SysinfoCall {
     Umask,
     GetRusage,
     Sysinfo,
+    /// `getcwd(2)` from the caller's task row (#1392).
+    Getcwd,
 }
 
 pub trait ProcessSysinfoVenue {
@@ -259,6 +262,13 @@ pub trait ProcessSysinfoVenue {
     fn umask(&mut self, mask: u32) -> u32;
     fn sysinfo(&self) -> LinuxSysinfo;
     fn getrusage(&self, who: i32) -> Result<LinuxRusage, i64>;
+    /// The caller's visible cwd ([`crate::task_fs::TaskFs::getcwd`]), or
+    /// `None` when this venue does not own the caller's cwd: a host-served
+    /// root keeps its host cwd (a #1393(a) `RootOnly` row), and an escaped
+    /// spelling is left unrouted.
+    fn getcwd(&self) -> Option<Result<alloc::vec::Vec<u8>, i64>> {
+        None
+    }
 }
 
 pub trait SysinfoNative<'a>: UserCopy {
@@ -426,6 +436,24 @@ pub fn invoke<'a>(call: SysinfoCall, native: &mut dyn SysinfoNative<'a>) -> Opti
                 return Some(SyscallResult::new(EFAULT));
             }
             Some(SyscallResult::new(0))
+        }
+        SysinfoCall::Getcwd => {
+            let ptr = UserVa::new(args[0]);
+            let size = args[1];
+            let mut visible = match native.process_sysinfo()?.getcwd()? {
+                Ok(visible) => visible,
+                Err(errno) => return Some(SyscallResult::new(errno)),
+            };
+            visible.push(0);
+            // Linux returns the length filled, NUL included; ERANGE before
+            // any copy when the buffer is too small.
+            if visible.len() as u64 > size {
+                return Some(SyscallResult::new(ERANGE));
+            }
+            if !native.copy_out(ptr, &visible) {
+                return Some(SyscallResult::new(EFAULT));
+            }
+            Some(SyscallResult::new(visible.len() as i64))
         }
         SysinfoCall::Sysinfo => {
             let ptr = UserVa::new(args[0]);

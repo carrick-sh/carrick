@@ -171,11 +171,16 @@ pub const MAX_EXEC_PATH_BYTES: usize = 4096;
 pub const EXEC_PAYLOAD_HEADER_BYTES: usize = 32;
 /// The wire record includes the path and a small header in addition to bytes
 /// charged to Linux argv/envp accounting.
-pub const MAX_EXEC_PAYLOAD_BYTES: u64 =
-    (EXEC_ARGUMENT_BYTES_MAX + MAX_EXEC_PATH_BYTES + EXEC_PAYLOAD_HEADER_BYTES) as u64;
+pub const MAX_EXEC_PAYLOAD_BYTES: u64 = (EXEC_ARGUMENT_BYTES_MAX
+    + MAX_EXEC_PATH_BYTES
+    + EXEC_PAYLOAD_HEADER_BYTES
+    + MAX_EXEC_ACCESS_BYTES) as u64;
+/// The caller's [`crate::host_file::AccessContext`] trails the strings.
+pub const MAX_EXEC_ACCESS_BYTES: usize =
+    12 * 4 + crate::host_file::ACCESS_MAX_GROUPS * 4 + 2 * crate::host_file::ACCESS_MAX_PATH_BYTES;
 
 const EXEC_PAYLOAD_MAGIC: u32 = u32::from_le_bytes(*b"CEXE");
-const EXEC_PAYLOAD_VERSION: u16 = 1;
+const EXEC_PAYLOAD_VERSION: u16 = 2;
 
 /// Which Linux exec entry produced the staged request. All raw user pointers
 /// have already been consumed by the ring before this value crosses the ABI.
@@ -249,6 +254,7 @@ pub struct ExecPayloadView<'a> {
     path_len: usize,
     argc: usize,
     envc: usize,
+    access: Option<crate::host_file::AccessContext<'a>>,
 }
 
 impl<'a> ExecPayloadView<'a> {
@@ -314,15 +320,22 @@ impl<'a> ExecPayloadView<'a> {
                 return Err(ExecPayloadError::TooLarge);
             }
         }
-        if cursor != bytes.len() {
-            return Err(ExecPayloadError::Invalid);
-        }
+        // The caller's access context, once the ring owner has sealed it.
+        let access = match bytes.get(cursor..) {
+            Some([]) => None,
+            Some(trailer) => match crate::host_file::AccessContext::decode(trailer) {
+                Some((access, [])) => Some(access),
+                _ => return Err(ExecPayloadError::Invalid),
+            },
+            None => return Err(ExecPayloadError::Invalid),
+        };
         Ok(Self {
             bytes,
             call,
             path_len,
             argc,
             envc,
+            access,
         })
     }
 
@@ -355,6 +368,41 @@ impl<'a> ExecPayloadView<'a> {
     pub fn encoded_len(self) -> usize {
         self.bytes.len()
     }
+
+    /// The caller's own access context (credentials, umask, cwd, root), or
+    /// `None` for a payload its ring owner has not sealed.
+    pub const fn access(self) -> Option<crate::host_file::AccessContext<'a>> {
+        self.access
+    }
+}
+
+/// Seal a staged payload with its caller's encoded
+/// [`crate::host_file::AccessContext`]: the ring task row's values, which
+/// only the ring owner holds, appended once after the strings.
+pub fn seal_exec_payload_access(
+    bytes: &mut alloc::vec::Vec<u8>,
+    access: &[u8],
+) -> Result<(), ExecPayloadError> {
+    let view = ExecPayloadView::parse(bytes)?;
+    if view.access.is_some()
+        || !matches!(
+            crate::host_file::AccessContext::decode(access),
+            Some((_, []))
+        )
+    {
+        return Err(ExecPayloadError::Invalid);
+    }
+    let len = bytes
+        .len()
+        .checked_add(access.len())
+        .filter(|len| *len as u64 <= MAX_EXEC_PAYLOAD_BYTES)
+        .ok_or(ExecPayloadError::TooLarge)?;
+    bytes
+        .try_reserve_exact(access.len())
+        .map_err(|_| ExecPayloadError::TooLarge)?;
+    bytes.extend_from_slice(access);
+    bytes[28..32].copy_from_slice(&(len as u32).to_le_bytes());
+    Ok(())
 }
 
 pub struct ExecPayloadStrings<'a> {
@@ -614,6 +662,94 @@ impl ServiceBirth {
             self.mm.mm().raw(),
             self.mm.incarnation().get(),
         ]
+    }
+}
+
+/// Ring-owned reply record of the root fork seed crossing (#1392): the
+/// host-served root's live cwd and root, read once while the root is stopped
+/// in the fork that creates the child they seed. This is a #1393(a)
+/// `RootOnly` row: a ring-task root owns these values in its row, and the
+/// crossing is deleted with the host-served root. The carrier writes it
+/// once and marks it served; nothing is retained host side.
+#[repr(C, align(64))]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+    zerocopy::FromZeros,
+)]
+pub struct RootForkSeed {
+    capability: u64,
+    state: u64,
+    cwd_len: u32,
+    root_len: u32,
+    cwd: [u8; crate::host_file::ACCESS_MAX_PATH_BYTES],
+    root: [u8; crate::host_file::ACCESS_MAX_PATH_BYTES],
+}
+
+const ROOT_FORK_SEED_REQUESTED: u64 = 1;
+const ROOT_FORK_SEED_SERVED: u64 = 2;
+const ROOT_FORK_SEED_NO_ROOT: u32 = u32::MAX;
+
+impl RootForkSeed {
+    /// Arm a record to request the seed from `capability`'s service.
+    pub fn request(&mut self, capability: ExecCapabilityId) {
+        *self = <Self as zerocopy::FromZeros>::new_zeroed();
+        self.capability = capability.raw().get();
+        self.state = ROOT_FORK_SEED_REQUESTED;
+    }
+
+    /// The capability an armed, unserved request names.
+    pub fn requested(&self) -> Option<ExecCapabilityId> {
+        if self.state != ROOT_FORK_SEED_REQUESTED {
+            return None;
+        }
+        NonZeroU64::new(self.capability).map(ExecCapabilityId::new)
+    }
+
+    /// Serve an armed request once with the root's cwd and root spellings.
+    pub fn serve(&mut self, cwd: &[u8], root: Option<&[u8]>) -> bool {
+        let bound = crate::host_file::ACCESS_MAX_PATH_BYTES;
+        if self.requested().is_none()
+            || cwd.is_empty()
+            || cwd.len() > bound
+            || root.is_some_and(|root| root.is_empty() || root.len() > bound)
+        {
+            return false;
+        }
+        self.cwd[..cwd.len()].copy_from_slice(cwd);
+        self.cwd_len = cwd.len() as u32;
+        match root {
+            Some(root) => {
+                self.root[..root.len()].copy_from_slice(root);
+                self.root_len = root.len() as u32;
+            }
+            None => self.root_len = ROOT_FORK_SEED_NO_ROOT,
+        }
+        self.state = ROOT_FORK_SEED_SERVED;
+        true
+    }
+
+    /// The served cwd and root, or `None` for an unserved or torn record.
+    pub fn served(&self) -> Option<(&[u8], Option<&[u8]>)> {
+        if self.state != ROOT_FORK_SEED_SERVED {
+            return None;
+        }
+        let cwd = self
+            .cwd
+            .get(..self.cwd_len as usize)
+            .filter(|cwd| !cwd.is_empty())?;
+        let root = match self.root_len {
+            ROOT_FORK_SEED_NO_ROOT => None,
+            len => Some(
+                self.root
+                    .get(..len as usize)
+                    .filter(|root| !root.is_empty())?,
+            ),
+        };
+        Some((cwd, root))
     }
 }
 
@@ -1611,6 +1747,32 @@ fn decode_failure(raw: u64) -> Option<ServiceFailureCode> {
         .then(|| u32::try_from(raw & !FAILURE_TAG).ok())
         .flatten()
         .and_then(ServiceFailureCode::new)
+}
+
+#[cfg(test)]
+mod root_fork_seed_tests {
+    use super::*;
+
+    #[test]
+    fn root_fork_seed_is_served_once_and_read_back_exactly() {
+        let mut seed = <RootForkSeed as zerocopy::FromZeros>::new_zeroed();
+        assert_eq!(seed.requested(), None);
+        assert!(
+            !seed.serve(b"/tmp", None),
+            "an unarmed record is never served"
+        );
+        let capability = ExecCapabilityId::new(NonZeroU64::new(5).unwrap());
+        seed.request(capability);
+        assert_eq!(seed.requested(), Some(capability));
+        assert_eq!(seed.served(), None);
+        assert!(!seed.serve(b"", None));
+        assert!(seed.serve(b"/tmp", Some(b"/jail")));
+        assert_eq!(seed.served(), Some((&b"/tmp"[..], Some(&b"/jail"[..]))));
+        assert!(!seed.serve(b"/etc", None), "served once");
+        seed.request(capability);
+        assert!(seed.serve(b"/", None));
+        assert_eq!(seed.served(), Some((&b"/"[..], None)));
+    }
 }
 
 #[cfg(test)]

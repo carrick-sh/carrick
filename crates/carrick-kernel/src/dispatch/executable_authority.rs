@@ -1363,7 +1363,11 @@ mod tests {
             b"origin",
             "the origin task's own view still resolves its executable"
         );
-        let child = files.for_native_child();
+        let child = files.for_native_access(
+            "/".to_owned(),
+            carrick_abi::NsUid::ROOT,
+            carrick_abi::NsGid::ROOT,
+        );
         for path in ["/self-exe", "/procdir/self/exe", "/proc/self/exe"] {
             assert!(
                 matches!(child.acquire(path), Err(ExecSourceError::Linux(errno)) if errno.get() == 38),
@@ -1375,6 +1379,30 @@ mod tests {
         assert!(child.acquire("/stdin-link").is_err());
         assert_eq!(
             child.acquire("/image").unwrap().read_head(6).unwrap(),
+            b"origin"
+        );
+        // A relative path resolves under the caller's own cwd, never the
+        // origin's.
+        let in_root = files.for_native_access(
+            "/procdir".to_owned(),
+            carrick_abi::NsUid::ROOT,
+            carrick_abi::NsGid::ROOT,
+        );
+        assert!(
+            matches!(in_root.acquire("self/exe"), Err(ExecSourceError::Linux(errno)) if errno.get() == 38),
+            "a cwd-relative spelling of the caller's own view is refused too"
+        );
+        assert_eq!(
+            files
+                .for_native_access(
+                    "/".to_owned(),
+                    carrick_abi::NsUid::ROOT,
+                    carrick_abi::NsGid::ROOT
+                )
+                .acquire("image")
+                .unwrap()
+                .read_head(6)
+                .unwrap(),
             b"origin"
         );
         drop(context);

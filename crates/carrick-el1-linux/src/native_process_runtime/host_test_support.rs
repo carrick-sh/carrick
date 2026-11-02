@@ -3031,15 +3031,14 @@ fn sigkill_wins_over_an_in_progress_native_exec_drain() {
     exec_drain_is_upgraded_by_terminal_sibling(Some(9));
 }
 
-/// Review P0 on #905: ring set*id changes a native caller's credentials
-/// without the host. The carrier's exec service checks access with the
-/// origin's host credentials, so a caller whose ring credentials changed is
-/// refused (counted ENOSYS) before any exec service is issued, never served
-/// under the origin's identity. A child inherits its parent's ring
-/// credentials at fork, so a root setuid before fork reaches the same check.
+/// #1392 (supersedes the #905 refusal): a native caller's exec and path
+/// crossings carry its own ring credentials and cwd by value, so a ring
+/// set*id or chdir changes what the carrier checks instead of refusing the
+/// call. The access context is read from the caller's task row at service
+/// time.
 #[cfg(test)]
 #[test]
-fn native_child_exec_after_ring_setuid_is_refused_before_service() {
+fn native_child_exec_after_ring_setuid_carries_the_new_credentials() {
     use carrick_personality_linux::identity::ProcessIdentityVenue as _;
     let capacity = NativeServiceCapacityFixture::new(1);
     let fixture = &capacity.fixture;
@@ -3064,17 +3063,27 @@ fn native_child_exec_after_ring_setuid_is_refused_before_service() {
         child.resume_checkpoint(),
         Ok(NativeResume::NoPending)
     ));
-    assert!(child.caller_has_admitted_credentials().unwrap());
+    let decoded = |bytes: &[u8]| {
+        let (context, rest) = carrick_core_abi::host_file::AccessContext::decode(bytes).unwrap();
+        assert!(rest.is_empty());
+        (context.ids.fsuid, context.ids.euid, context.cwd.to_vec())
+    };
+    assert_eq!(
+        decoded(&child.caller_access().unwrap()),
+        (0, 0, b"/".to_vec())
+    );
     child.set_uid(1000).unwrap();
-    assert!(!child.caller_has_admitted_credentials().unwrap());
-    assert!(matches!(
-        child.begin_exec_service(test_exec_payload(b"/bin/static")),
-        Ok(NativeResume::Returned(result))
-            if result.raw() == carrick_syscall_abi::LINUX_ENOSYS.guest_retval()
-    ));
+    assert_eq!(
+        decoded(&child.caller_access().unwrap()),
+        (1000, 1000, b"/".to_vec())
+    );
     assert!(
-        child.take_handoff_receipt().is_none(),
-        "no exec service was issued under the wrong credentials"
+        !matches!(
+            child.begin_exec_service(test_exec_payload(b"/bin/static")),
+            Ok(NativeResume::Returned(result))
+                if result.raw() == carrick_syscall_abi::LINUX_ENOSYS.guest_retval()
+        ),
+        "the exec is served under the caller's own credentials, not refused"
     );
 }
 

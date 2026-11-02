@@ -539,6 +539,7 @@ fn private_file_mmap_stages_a_byte_source_request_with_its_exact_key() {
         output,
         resolves_path,
         map,
+        ..
     }) = run(HostFileCall::MapPrivate(key), &mut user)
     else {
         panic!("a host file mapping crosses for its byte source");
@@ -674,4 +675,111 @@ fn write_records_carry_the_writers_file_size_limit() {
         .unwrap();
     let view = host_file::HostFileRequestView::parse(&mut open).unwrap();
     assert_eq!(view.header().args, [0o1101, 0o644, 0, 0]);
+}
+
+/// #1392: a ring chdir stages one chdir lookup (a `Newfstatat` whose reply
+/// area has room for a name) and copies nothing back to user memory; the
+/// ring reads the directory spelling from the reply.
+#[test]
+fn chdir_stages_one_lookup_and_reads_the_directory_from_its_reply() {
+    let mut user = memory(b"sub\0");
+    let Some(HostFileStage::Request {
+        mut record,
+        output,
+        resolves_path,
+        map,
+        chdir,
+    }) = run(HostFileCall::Chdir { path: BASE }, &mut user)
+    else {
+        panic!("chdir crosses for its lookup");
+    };
+    assert_eq!(
+        (output, resolves_path, map, chdir),
+        (None, true, None, true)
+    );
+    let view = HostFileRequestView::parse(&mut record).unwrap();
+    assert_eq!(view.header().op, HostFileOp::Newfstatat);
+    assert_eq!(view.header().fd, LINUX_AT_FDCWD);
+    assert_eq!(view.input(), b"sub");
+    assert_eq!(view.output_capacity(), CHDIR_REPLY_BYTES);
+
+    let mut stat = carrick_syscall_abi::LinuxStat::from_fields(
+        &carrick_syscall_abi::LinuxStatFields::CARRICK_PIPE,
+    );
+    stat.st_mode = carrick_syscall_abi::LINUX_S_IFDIR | 0o755;
+    let mut reply = zerocopy::IntoBytes::as_bytes(&stat).to_vec();
+    reply.extend_from_slice(b"/tmp/sub");
+    view.reply(0, &reply).unwrap();
+    assert_eq!(
+        chdir_target(&record).unwrap().as_bytes(),
+        b"/tmp/sub",
+        "the carrier's canonical spelling becomes the cwd"
+    );
+
+    // An empty path is ENOENT in ring; a failed lookup's errno is the
+    // result; a reply that is not a directory never becomes a cwd.
+    let mut empty = memory(b"\0");
+    assert_eq!(
+        run(HostFileCall::Chdir { path: BASE }, &mut empty),
+        returned(carrick_syscall_abi::LINUX_ENOENT)
+    );
+    let (mut failed, ..) = request(run(HostFileCall::Chdir { path: BASE }, &mut user));
+    HostFileRequestView::parse(&mut failed)
+        .unwrap()
+        .reply(carrick_syscall_abi::LINUX_ENOTDIR.guest_retval(), &[])
+        .unwrap();
+    assert_eq!(
+        chdir_target(&failed).map(|_| ()),
+        Err(SyscallResult::from_errno(
+            carrick_syscall_abi::LINUX_ENOTDIR
+        ))
+    );
+    let (mut file, ..) = request(run(HostFileCall::Chdir { path: BASE }, &mut user));
+    stat.st_mode = carrick_syscall_abi::LINUX_S_IFREG | 0o644;
+    let mut reply = zerocopy::IntoBytes::as_bytes(&stat).to_vec();
+    reply.extend_from_slice(b"/tmp/file");
+    HostFileRequestView::parse(&mut file)
+        .unwrap()
+        .reply(0, &reply)
+        .unwrap();
+    assert!(chdir_target(&file).is_err());
+}
+
+/// #1392: a path record is re-staged with its caller's access context
+/// leading the input; a descriptor record is left exactly as staged.
+#[test]
+fn access_context_leads_only_path_records() {
+    let fs = crate::task_fs::TaskFs {
+        cwd: crate::task_fs::TaskPath::new(b"/tmp").unwrap(),
+        root: None,
+    };
+    let mut access = Vec::new();
+    fs.encode_access(&crate::identity::TaskCredentials::ROOT, 0o022, &mut access)
+        .unwrap();
+    let mut user = memory(b"rel\0");
+    let (record, ..) = request(run(
+        HostFileCall::Openat {
+            dirfd: LINUX_AT_FDCWD,
+            path: BASE,
+            flags: 0,
+            mode: 0,
+        },
+        &mut user,
+    ));
+    let mut stamped = stamp_access_context(&record, &access).unwrap();
+    let view = HostFileRequestView::parse(&mut stamped).unwrap();
+    let (context, path) = host_file::AccessContext::decode(view.input()).unwrap();
+    assert_eq!((context.cwd, path), (&b"/tmp"[..], &b"rel"[..]));
+    assert_eq!(view.header().op, HostFileOp::Openat);
+
+    let mut write = memory(b"data");
+    let (record, ..) = request(run(
+        HostFileCall::Write {
+            fd: 1,
+            buf: BASE,
+            count: 4,
+        },
+        &mut write,
+    ));
+    assert_eq!(&*stamp_access_context(&record, &access).unwrap(), &*record);
 }

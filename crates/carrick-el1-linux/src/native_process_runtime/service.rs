@@ -62,6 +62,9 @@ struct PendingHostFile {
     record: Box<[u8]>,
     output: Option<carrick_personality_linux::native_host_file::HostFileOutput>,
     map: Option<carrick_personality_linux::native_host_file::NativeMapKey>,
+    /// A chdir lookup: completion stores the named directory as the
+    /// caller's cwd.
+    chdir: bool,
 }
 
 /// Ring-owned input of a typed service, retained until completion ACK.
@@ -581,17 +584,29 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         payload: Box<[u8]>,
     ) -> Result<NativeResume, NativeProcessError> {
-        // The carrier's exec service checks access with the origin's host
-        // credentials, which it only accepts as the admitted superuser
-        // identity. Ring set*id changes the caller's credentials without the
-        // host knowing, so exec is served only while they are still exactly
-        // that identity; otherwise it is a counted ENOSYS, never an access
-        // decision under the wrong credentials.
-        if !self.caller_has_admitted_credentials()? {
-            return Ok(NativeResume::Returned(SyscallResult::new(
-                carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
+        // The carrier's exec service resolves and checks access with exactly
+        // the caller's own cwd and credentials, which the ring seals into
+        // the payload from the caller's task row (#1392).
+        let access = match self.caller_access() {
+            Ok(access) => access,
+            Err(errno) => return Ok(NativeResume::Returned(SyscallResult::from_errno(errno))),
+        };
+        let mut sealed = payload.into_vec();
+        if let Err(error) =
+            carrick_core_abi::service::seal_exec_payload_access(&mut sealed, &access)
+        {
+            return Ok(NativeResume::Returned(SyscallResult::from_errno(
+                match error {
+                    carrick_core_abi::service::ExecPayloadError::TooLarge => {
+                        carrick_syscall_abi::LINUX_E2BIG
+                    }
+                    carrick_core_abi::service::ExecPayloadError::Invalid => {
+                        carrick_syscall_abi::LINUX_EINVAL
+                    }
+                },
             )));
         }
+        let payload = sealed.into_boxed_slice();
         self.service_phase = NativeServicePhase::Capability;
         let capability = self
             .runtime
@@ -651,12 +666,31 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         output: Option<carrick_personality_linux::native_host_file::HostFileOutput>,
         resolves_path: bool,
         map: Option<carrick_personality_linux::native_host_file::NativeMapKey>,
+        chdir: bool,
     ) -> Result<NativeResume, NativeProcessError> {
-        if resolves_path && !self.caller_has_admitted_credentials()? {
-            return Ok(NativeResume::Returned(SyscallResult::new(
-                carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
-            )));
-        }
+        // A path resolves under the caller's own access context (its task
+        // row's credentials, umask, cwd and root), carried in the record.
+        let record = if resolves_path {
+            let access = match self.caller_access() {
+                Ok(access) => access,
+                Err(errno) => {
+                    return Ok(NativeResume::Returned(SyscallResult::from_errno(errno)));
+                }
+            };
+            match carrick_personality_linux::native_host_file::stamp_access_context(
+                &record, &access,
+            ) {
+                Some(record) => record,
+                // The context and path do not fit one record.
+                None => {
+                    return Ok(NativeResume::Returned(SyscallResult::from_errno(
+                        carrick_syscall_abi::LINUX_ENAMETOOLONG,
+                    )));
+                }
+            }
+        } else {
+            record
+        };
         let mut record = record;
         carrick_personality_linux::native_host_file::stamp_write_file_size_limit(
             &mut record,
@@ -683,6 +717,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 record,
                 output,
                 map,
+                chdir,
             }),
             false,
         )
@@ -699,18 +734,32 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .map(|limit| limit.rlim_cur)
             .ok_or(NativeProcessError::Stale)
     }
-    /// Whether the calling thread's ring credentials are still exactly the
-    /// identity a native process is admitted with.
-    pub(super) fn caller_has_admitted_credentials(&self) -> Result<bool, NativeProcessError> {
+    /// The calling thread's encoded access context: its credentials, and
+    /// its process's umask, cwd and root, all from the caller's task row.
+    pub(super) fn caller_access(&self) -> Result<Vec<u8>, carrick_syscall_abi::LinuxErrno> {
         let graph = self.runtime.graph.lock();
+        let stale = carrick_syscall_abi::LINUX_ESRCH;
+        let task = graph.owner.task(self.key).map_err(|_| stale)?;
+        let credentials = task.credentials_for(self.calling_tid).map_err(|_| stale)?;
+        let mut access = Vec::new();
+        task.fs
+            .encode_access(credentials, task.umask, &mut access)?;
+        Ok(access)
+    }
+    /// Store a served chdir lookup's directory as the caller's cwd: the one
+    /// writer of a ring process's cwd.
+    fn complete_chdir(&self, record: &[u8]) -> Result<SyscallResult, NativeProcessError> {
+        let target = match carrick_personality_linux::native_host_file::chdir_target(record) {
+            Ok(target) => target,
+            Err(result) => return Ok(result),
+        };
+        let mut graph = self.runtime.graph.lock();
         let task = graph
             .owner
-            .task(self.key)
+            .task_mut(self.key)
             .map_err(|_| NativeProcessError::Stale)?;
-        let credentials = task
-            .credentials_for(self.calling_tid)
-            .map_err(|_| NativeProcessError::Stale)?;
-        Ok(*credentials == carrick_personality_linux::identity::TaskCredentials::ROOT)
+        task.fs.cwd = target;
+        Ok(SyscallResult::new(0))
     }
     /// Park the exact ring operation on the producer observed before its
     /// failed admission. No physical service notice is published.
@@ -2244,6 +2293,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                                 Ok(NativeResume::RetrySyscall)
                             }
                         };
+                    }
+                    if pending_file.chdir {
+                        return self
+                            .complete_chdir(&pending_file.record)
+                            .map(NativeResume::Returned);
                     }
                     let mut copy_out = |address: u64, bytes: &[u8]| {
                         self.copy_syscall_output(carrick_guest_arch::UserVa::new(address), bytes)

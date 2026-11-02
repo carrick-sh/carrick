@@ -212,6 +212,32 @@ pub fn cross_hvc_child_reclaim(mm: u64, cpu: u64) -> Result<(), ()> {
     }
 }
 
+/// Read the host-served root's live cwd and root into the ring-owned
+/// [`carrick_core_abi::service::RootForkSeed`] at `record_va`, for a child
+/// the stopped root is forking (#1392, a #1393(a) `RootOnly` crossing).
+#[allow(clippy::result_unit_err)]
+pub fn cross_hvc_root_fork_seed(record_va: u64, cpu: u64) -> Result<(), ()> {
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    {
+        let mut status = carrick_el1_abi::GRANT_OP_ROOT_FORK_SEED;
+        // SAFETY: the HVC retains this ring-owned record until its reply has
+        // been written; the carrier authenticates the stopped root.
+        unsafe {
+            core::arch::asm!("hvc #6", inout("x0") status,
+                inlateout("x1") record_va => _, inlateout("x2") cpu => _,
+                inlateout("x3") 0u64 => _, options(nostack));
+        }
+        (status == carrick_el1_abi::METADATA_GRANT_SUCCESS)
+            .then_some(())
+            .ok_or(())
+    }
+    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+    {
+        let _ = (record_va, cpu);
+        Err(())
+    }
+}
+
 /// Consume the prepared native exec selected by the caller-owned adoption
 /// record while this CPU and its predecessor execution are synchronously
 /// stopped at the owner crossing.

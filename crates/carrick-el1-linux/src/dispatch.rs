@@ -868,6 +868,7 @@ struct StagedHostFile {
     output: Option<carrick_personality_linux::native_host_file::HostFileOutput>,
     resolves_path: bool,
     map: Option<carrick_personality_linux::native_host_file::NativeMapKey>,
+    chdir: bool,
 }
 
 /// One staged native service request, before its owner publishes it.
@@ -1091,11 +1092,13 @@ fn arm_native_service_exit(
                     output,
                     resolves_path,
                     map,
+                    chdir,
                 }) => NativeServiceStage::HostFile(alloc::boxed::Box::new(StagedHostFile {
                     record,
                     output,
                     resolves_path,
                     map,
+                    chdir,
                 })),
                 Some(carrick_personality_linux::native_host_file::HostFileStage::Returned(
                     result,
@@ -1241,8 +1244,9 @@ fn arm_native_service_exit(
                         output,
                         resolves_path,
                         map,
+                        chdir,
                     } = *staged;
-                    process.begin_host_file_service(record, output, resolves_path, map)
+                    process.begin_host_file_service(record, output, resolves_path, map, chdir)
                 }
             } else if retry_exec_stage {
                 match operation {
@@ -4185,6 +4189,7 @@ mod tests {
             output,
             resolves_path,
             map,
+            ..
         }) = native_host_file_stage(
             &frame,
             &task,
