@@ -67,8 +67,3 @@ embed = [
 docker = "Physical vCPU cancellation is host-internal; Linux supplies no equivalent HVF oracle."
 embed_structural = "Before-entry latch qualified on the director Mac. Signed el1_files stress must be rerun for the native exception terminal ownership changes."
 embed_timing = "No guest runtime ratio is claimed; the signed qualification bounds raw run return to two seconds and reports reason/time."
-
-# #1395 slice 1: scheduler refusal::queue_witnesses proves bounded cause
-# selection, release-before-park, retirement rerun and exactly one wake.
-# The zone-scoped abandoned-ticket counter changes the shared layout hash;
-# existing semantic/signed bindings and budgets above remain required.

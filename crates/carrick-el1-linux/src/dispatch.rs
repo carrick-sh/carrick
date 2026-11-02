@@ -2754,7 +2754,11 @@ impl<
                     )
                     && mailbox.request_generation() == generation
                     && let Ok(parked) =
-                        sched.park_object(&saved, key, snapshot, resume, operation, None)
+                        sched.park_object(&saved, key,
+                            // SAFETY: the epoch was sampled before the mailbox
+                            // state/generation probe above; park validates it.
+                            unsafe { carrick_sched_core::object_wait::ObjectStateSnapshot::before_object_probe(snapshot) },
+                            resume, operation, None)
                 {
                     let _ = sched.leave_after_object_park(parked);
                     return FamilyCompletion::AccountedSuspended;

@@ -2869,6 +2869,24 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
         }
     }
     fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(path) = call.func.as_ref() {
+            let segments: Vec<_> = path
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.unraw().to_string())
+                .collect();
+            if segments.ends_with(&["PortalOwnerWait".into(), "from_owner".into()]) {
+                self.census.contention_variants.push(ApiSite {
+                    file: self.file.clone(),
+                    line: call.span().start().line,
+                    owner: "carrick_core_abi::PortalOwnerWait::from_owner".into(),
+                    operation: "raw_owner_wait:from_owner".into(),
+                    lane: Lane::Shared,
+                });
+            }
+        }
+
         if let syn::Expr::Path(path) = call.func.as_ref()
             && (path.path.segments.len() > 1
                 || self

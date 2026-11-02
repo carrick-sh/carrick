@@ -49,8 +49,3 @@ embed = [
 docker = "Docker execution pending signed acceptance; differential oracle capture and comparison are maintained during director acceptance."
 embed_structural = "Entry counter (fault_taken >= 1) and architectural register preservation are verified; complete first-touch in-guest service is part of the subsequent memory milestone."
 embed_timing = "Timing is not asserted for entry/forwarding acceptance."
-
-# #1395 slice 1: scheduler refusal::queue_witnesses proves bounded cause
-# selection, release-before-park, retirement rerun and exactly one wake.
-# The zone-scoped abandoned-ticket counter changes the shared layout hash;
-# existing semantic/signed bindings and budgets above remain required.

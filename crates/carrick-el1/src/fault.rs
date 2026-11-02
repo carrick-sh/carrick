@@ -1115,9 +1115,10 @@ impl<'s> FaultSupply<'s> {
                 // from one retained region; its carrier was checked above.
                 let authority =
                     unsafe { PortalWaitAuthority::from_retained_zone(venue.zone, handle) };
-                if let Ok(wait) = ticket.into_portal_wait(&authority) {
-                    owner.outcome.set(OwnerFaultSupplyOutcome::Wait(wait));
-                }
+                let wait = ticket
+                    .into_portal_wait(&authority)
+                    .unwrap_or_else(|kind| panic!("fault ticket authority invariant: {kind:?}"));
+                owner.outcome.set(OwnerFaultSupplyOutcome::Wait(wait));
                 None
             }
             Err(_) => None,
@@ -1441,7 +1442,6 @@ fn dispatch_classified_fault<
             {
                 RootFaultAdmission::Declined => supply.decline(),
                 RootFaultAdmission::Unmapped if supply.is_owner() => supply.decline(),
-                RootFaultAdmission::Busy => {}
                 _ => {}
             }
         }

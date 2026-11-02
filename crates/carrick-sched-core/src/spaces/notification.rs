@@ -422,12 +422,6 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceNotificationLease<'a,
         drop(release);
     }
 
-    /// Reattach an owner-service revision to this still-live exact source.
-    /// Enrollment checks that revision again after linking the saved operation.
-    pub fn observed_revision(&self, cause: SpaceWaitCause, revision: u64) -> ObjectWaitSnapshot {
-        ObjectWaitSnapshot::at_revision(self.key(cause), revision)
-    }
-
     pub fn observe(&self, cause: SpaceWaitCause) -> ObjectWaitSnapshot {
         self.zone.notification_snapshot(self.key(cause))
     }
@@ -639,6 +633,13 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceAccess<'a, C> {
         } else {
             None
         };
+        // A known active editor cannot be excluded. Refuse before raising the
+        // gate so observe/reprobe does not publish unrelated Gate releases on
+        // every miss. The post-raise check below still closes editor admission
+        // races and the retained source authenticates a future Editor release.
+        if self.spaces.active_editor(index).is_some() {
+            return Err(ExclusionRefusal::Busy);
+        }
         self.spaces.raise(index);
         let exclusion = SpaceExclusion {
             access: self,
@@ -1358,6 +1359,47 @@ mod tests {
         assert!(!zone.record(record).has_object_operation());
         drop(queue);
         entry.retire_entry(access(&zone).venue().unwrap());
+    }
+    #[test]
+    fn busy_editor_probe_preserves_gate_revision_then_succeeds_after_release() {
+        use crate::refusal::{
+            Attempt, CancelReason, ContentionSource, InvariantKind, Refusal, ReleaseCause, Settled,
+        };
+        let zone = zone();
+        let entry = admitted(&zone);
+        let index = entry.index();
+        let access = access(&zone);
+        access.open(index);
+        let source = entry.notifications(NonZeroU64::MIN).unwrap();
+        let editor = access.try_begin_edit(index, 77, NonZeroU64::MIN).unwrap();
+        let before = source.observe(SpaceWaitCause::Gate);
+        let Err(Refusal::Contended(ticket)) = source.contend(|| {
+            access
+                .try_exclude_editor(index, 77)
+                .map_err(|error| match error {
+                    ExclusionRefusal::Busy => {
+                        Attempt::<()>::Contended(ReleaseCause::Space(SpaceWaitCause::Editor))
+                    }
+                    ExclusionRefusal::Stale => {
+                        Attempt::Settled(Settled::Invariant(InvariantKind {
+                            domain: "test_exclusion",
+                            code: 1,
+                        }))
+                    }
+                })
+        }) else {
+            panic!("held editor must contend");
+        };
+        ticket.cancel(CancelReason::OperationCancelled);
+        assert_eq!(
+            source.observe(SpaceWaitCause::Gate),
+            before,
+            "a refused editor probe must not publish unrelated Gate releases"
+        );
+        drop(editor);
+        let exclusion = access.try_exclude_editor(index, 77).unwrap();
+        drop(exclusion);
+        assert_eq!(zone.spaces.gate(index), 0);
     }
     #[test]
     fn transient_editor_exclusion_refuses_without_waiting_and_reopens_gate() {

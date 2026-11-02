@@ -68,7 +68,16 @@ fn suspended_turn_completes_only_through_exact_wait_owner() {
             .unwrap();
             let record = zone.current_or_new(slot, identity).unwrap();
             let operation = OperationToken::new(17, generation).unwrap();
-            let request = ObjectParkRequest::new(key, snapshot, operation, None);
+            let request = ObjectParkRequest::from_locked_snapshot(
+                key,
+                unsafe {
+                    carrick_sched_core::object_wait::ObjectStateSnapshot::taken_under_object_lock(
+                        snapshot,
+                    )
+                },
+                operation,
+                None,
+            );
             let mut parked =
                 park_object_record(&zone, slot, request, &|_| {}, || Ok((record, false))).unwrap();
             assert!(parked.matches(&zone, slot));
@@ -225,7 +234,16 @@ fn record_owned_entry_does_not_require_host_adoption_generation() {
     let parked = park_object_record(
         &zone,
         slot,
-        ObjectParkRequest::new(key, snapshot, OperationToken::new(17, 13).unwrap(), None),
+        ObjectParkRequest::from_locked_snapshot(
+            key,
+            unsafe {
+                carrick_sched_core::object_wait::ObjectStateSnapshot::taken_under_object_lock(
+                    snapshot,
+                )
+            },
+            OperationToken::new(17, 13).unwrap(),
+            None,
+        ),
         &|_| {},
         || Ok((record, false)),
     )

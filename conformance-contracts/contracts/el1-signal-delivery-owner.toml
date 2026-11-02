@@ -57,8 +57,3 @@ docker = "No Docker in preparation; native arm64 differential remains required a
 maximum = 2.0
 statistic = "p50"
 minimum_samples = 20
-
-# #1395 slice 1: scheduler refusal::queue_witnesses proves bounded cause
-# selection, release-before-park, retirement rerun and exactly one wake.
-# The zone-scoped abandoned-ticket counter changes the shared layout hash;
-# existing semantic/signed bindings and budgets above remain required.

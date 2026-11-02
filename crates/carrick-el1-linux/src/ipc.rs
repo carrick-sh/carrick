@@ -51,7 +51,7 @@ use carrick_el1_abi::ipc::{
 };
 use carrick_el1_abi::ipc_tables::IpcTableMap;
 use carrick_el1_abi::{CurrentTask, EL1_GUEST_LOCK_SPINS, IpcLeave, TrapFrame};
-use carrick_sched_core::object_wait::{ObjectWaitError, ObjectWaitSnapshot};
+use carrick_sched_core::object_wait::{ObjectStateSnapshot, ObjectWaitError};
 use carrick_sched_core::{LockWait, ShortLockSpin, WakeEffects};
 use core::sync::atomic::Ordering;
 
@@ -1167,13 +1167,19 @@ fn snapshot<C: ThreadCpu, U: UserWord>(
     sched: &Sched<'_, C, U>,
     object: IpcObjectHandle,
     lane: WaitFor,
-) -> Option<ObjectWaitSnapshot> {
+) -> Option<ObjectStateSnapshot> {
     let key = wait_key(object, lane)?;
     match sched.observe_object(key) {
-        Ok(snap) => Some(snap),
+        // SAFETY: run retains the IPC object guard across the blocked
+        // predicate and this observation, so no release can pass the probe.
+        Ok(snap) => Some(unsafe { ObjectStateSnapshot::taken_under_object_lock(snap) }),
         Err(ObjectWaitError::Stale) => {
             let _ = sched.zone.bind_object_wait(key, &EL1_WAIT);
-            sched.observe_object(key).ok()
+            // SAFETY: same retained IPC object guard as the first attempt.
+            sched
+                .observe_object(key)
+                .ok()
+                .map(|snap| unsafe { ObjectStateSnapshot::taken_under_object_lock(snap) })
         }
         Err(_) => None,
     }
@@ -1194,7 +1200,7 @@ fn park<C: ThreadCpu, U: UserWord>(
     op: IpcOperation,
     object: IpcObjectHandle,
     lane: WaitFor,
-    snap: ObjectWaitSnapshot,
+    snap: ObjectStateSnapshot,
     deadline: Option<u64>,
     interrupt: &mut dyn FnMut() -> bool,
 ) -> Parked {
@@ -1222,7 +1228,7 @@ fn park_key<C: ThreadCpu, U: UserWord>(
     token: IpcOpToken,
     op: IpcOperation,
     key: carrick_sched_core::object_wait::ObjectWaitKey,
-    snap: ObjectWaitSnapshot,
+    snap: ObjectStateSnapshot,
     deadline: Option<u64>,
     interrupt: Option<&mut dyn FnMut() -> bool>,
 ) -> Parked {

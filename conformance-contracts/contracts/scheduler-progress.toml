@@ -113,8 +113,3 @@ minimum_samples = 20
 
 [bindings.unresolved]
 x86_cpl0 = "Order 3 custody components now have a VM-free binding. Exact in-CPL0 X3 remains pending order 4, release-before-enroll, default-pool exhaustion and exec/clear-tid; no KVM or signed acceptance is conferred."
-
-# #1395 slice 1: scheduler refusal::queue_witnesses proves bounded cause
-# selection, release-before-park, retirement rerun and exactly one wake.
-# The zone-scoped abandoned-ticket counter changes the shared layout hash;
-# existing semantic/signed bindings and budgets above remain required.

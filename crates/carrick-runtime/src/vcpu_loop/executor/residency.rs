@@ -407,10 +407,18 @@ mod tests {
                     .object_wait_with_completion(key, &BoundedSpin(0), &complete)
                     .unwrap();
                 let operation = OperationToken::metadata_request(17).unwrap();
+                // SAFETY: this fixture owns the object state exclusively; its
+                // predicate is held blocked until the explicit source release.
+                let snapshot = unsafe {
+                    carrick_sched_core::object_wait::ObjectStateSnapshot::taken_under_object_lock(
+                        guard.snapshot(),
+                    )
+                }
+                .observed();
                 if host_owned {
-                    guard.park_host_rechecked(guard.snapshot(), record, operation, || true)
+                    guard.park_host_rechecked(snapshot, record, operation, || true)
                 } else {
-                    guard.park_rechecked(guard.snapshot(), record, operation, || true)
+                    guard.park_rechecked(snapshot, record, operation, || true)
                 }
                 .unwrap();
             }

@@ -44,8 +44,3 @@ metric = "kernel_redispatches"
 value = 0
 layers = ["vm-free"]
 rationale = "Waiting for a short lock does not retry the guest operation: each fixture invokes it once and checks its owned handoff/registration and completion. This is ownership evidence, not a wall-time spin ceiling."
-
-# #1395 slice 1: scheduler refusal::queue_witnesses proves bounded cause
-# selection, release-before-park, retirement rerun and exactly one wake.
-# The zone-scoped abandoned-ticket counter changes the shared layout hash;
-# existing semantic/signed bindings and budgets above remain required.

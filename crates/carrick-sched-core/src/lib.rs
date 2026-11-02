@@ -82,7 +82,7 @@
 
 extern crate alloc;
 
-#[cfg(test)]
+#[cfg(any(test, not(target_os = "none")))]
 extern crate std;
 
 /// Shared deadline-index publication protocol, authenticated by the image ABI.
@@ -1389,6 +1389,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for SlotGuard<'_, C> {
 pub struct ZoneCounters {
     /// Linear contention tickets abandoned without park or cancellation.
     pub contention_tickets_dropped: AtomicU64,
+    /// Explicit ticket cancellations, indexed by CancelReason.
+    pub contention_tickets_cancelled: [AtomicU64; 3],
     /// Threads parked by EL1 with a switch to another thread.
     pub el1_parks: AtomicU64,
     /// Threads parked by the host (forwarded or timed waits).

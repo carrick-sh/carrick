@@ -1994,7 +1994,14 @@ fn x4_shared_wait_records() {
     let record = zone.alloc_record(identity).unwrap();
     let op_token = OperationToken::new(tid, 1).unwrap();
 
-    let request = carrick_core_abi::ObjectParkRequest::new(key, snapshot, op_token, None);
+    let request = carrick_core_abi::ObjectParkRequest::from_locked_snapshot(
+        key,
+        unsafe {
+            carrick_sched_core::object_wait::ObjectStateSnapshot::taken_under_object_lock(snapshot)
+        },
+        op_token,
+        None,
+    );
     let parked = park_object_record(&zone, slot, request, &|_| {}, || Ok((record, false))).unwrap();
     assert!(parked.matches(&zone, slot));
     assert!(zone.slot(slot).current().is_none());
@@ -2020,9 +2027,14 @@ fn x4_shared_wait_records() {
             ..identity
         })
         .unwrap();
-    let concurrent_request = carrick_core_abi::ObjectParkRequest::new(
+    let concurrent_request = carrick_core_abi::ObjectParkRequest::from_locked_snapshot(
         concurrent_key,
-        concurrent_snapshot,
+        // SAFETY: the fixture owns all object state until explicit notification.
+        unsafe {
+            carrick_sched_core::object_wait::ObjectStateSnapshot::taken_under_object_lock(
+                concurrent_snapshot,
+            )
+        },
         bad_token,
         Some(5000),
     );
@@ -2041,8 +2053,14 @@ fn x4_shared_wait_records() {
 
     // Verify park_object_record does not invoke save_context when guard acquisition fails
     let stale_token = OperationToken::new(tid, 3).unwrap();
-    let stale_request =
-        carrick_core_abi::ObjectParkRequest::new(stale_key, snapshot, stale_token, None);
+    let stale_request = carrick_core_abi::ObjectParkRequest::from_locked_snapshot(
+        stale_key,
+        unsafe {
+            carrick_sched_core::object_wait::ObjectStateSnapshot::taken_under_object_lock(snapshot)
+        },
+        stale_token,
+        None,
+    );
     let res_stale = park_object_record(&zone, slot, stale_request, &|_| {}, || {
         context_saved.set(true);
         Ok((record, false))

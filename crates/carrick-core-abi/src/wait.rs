@@ -90,7 +90,7 @@ impl<'z, C: Copy + Send + Sync + zerocopy::FromZeros> PortalWaitAuthority<'z, C>
 pub struct PortalWaitEnrollment<'a, C: EntryContext = ThreadCtx> {
     source: SpaceNotificationLease<'a, C>,
     cause: SpaceWaitCause,
-    revision: u64,
+    snapshot: carrick_sched_core::object_wait::ObjectStateSnapshot,
 }
 
 impl<'a, C: EntryContext> PortalWaitEnrollment<'a, C> {
@@ -98,7 +98,10 @@ impl<'a, C: EntryContext> PortalWaitEnrollment<'a, C> {
         authority: &PortalWaitAuthority<'a, C>,
         operation: OperationToken,
         ticket: carrick_sched_core::refusal::ReleaseTicket<'a, C>,
-    ) -> carrick_sched_core::refusal::Rerun<(Self, OperationToken), OperationToken> {
+    ) -> Result<
+        carrick_sched_core::refusal::Rerun<(Self, OperationToken), OperationToken>,
+        (carrick_sched_core::refusal::InvariantKind, OperationToken),
+    > {
         let zone = authority.zone;
         let expected = authority.owner;
         use carrick_sched_core::refusal::{ReleaseCause, Rerun};
@@ -106,43 +109,63 @@ impl<'a, C: EntryContext> PortalWaitEnrollment<'a, C> {
         // scheduler enrollment or returns it; witnesses use the same real queue.
         unsafe {
             ticket.park_and_rerun(operation, |operation, enrollment| {
-                if !enrollment.belongs_to(zone) || !enrollment.unchanged() {
-                    return Rerun::Now(operation);
+                let bad = || carrick_sched_core::refusal::InvariantKind {
+                    domain: "portal_ticket_owner",
+                    code: 1,
+                };
+                if !enrollment.belongs_to(zone) {
+                    return Err((bad(), operation));
                 }
                 let Some(identity) = enrollment.identity() else {
-                    return Rerun::Now(operation);
+                    return Err((bad(), operation));
                 };
                 if identity.mm.get() != expected.mm().raw()
                     || identity.incarnation != expected.incarnation()
                 {
-                    return Rerun::Now(operation);
+                    return Err((bad(), operation));
                 }
                 let ReleaseCause::Space(cause) = enrollment.cause() else {
-                    return Rerun::Now(operation);
+                    return Err((bad(), operation));
                 };
+                if !enrollment.unchanged() {
+                    return Ok(Rerun::Now(operation));
+                }
                 let Some(source) = zone
                     .space_entry(identity.mm)
                     .and_then(|entry| entry.notifications(identity.incarnation).ok())
                 else {
-                    return Rerun::Now(operation);
+                    // A source may retire after the first epoch check. Only
+                    // that observed race licenses a rerun; a missing live
+                    // source with an unchanged ticket is an invariant.
+                    return if !enrollment.unchanged() {
+                        Ok(Rerun::Now(operation))
+                    } else {
+                        Err((bad(), operation))
+                    };
                 };
-                Rerun::Park((
-                    Self::new(source, cause, enrollment.observed().revision()),
+                Ok(Rerun::Park((
+                    Self::new(
+                        source,
+                        cause,
+                        carrick_sched_core::object_wait::ObjectStateSnapshot::before_object_probe(
+                            enrollment.observed(),
+                        ),
+                    ),
                     operation,
-                ))
+                )))
             })
         }
     }
 
-    pub const fn new(
+    const fn new(
         source: SpaceNotificationLease<'a, C>,
         cause: SpaceWaitCause,
-        revision: u64,
+        snapshot: carrick_sched_core::object_wait::ObjectStateSnapshot,
     ) -> Self {
         Self {
             source,
             cause,
-            revision,
+            snapshot,
         }
     }
 
@@ -151,7 +174,7 @@ impl<'a, C: EntryContext> PortalWaitEnrollment<'a, C> {
     }
 
     pub const fn revision(&self) -> u64 {
-        self.revision
+        self.snapshot.observed().revision()
     }
 
     /// Authenticate a ring-owned continuation against its retained birth MM.
@@ -177,20 +200,26 @@ impl<'a, C: EntryContext> PortalWaitEnrollment<'a, C> {
                 core::num::NonZeroU64::new(expected.mm().raw()).ok_or(ObjectWaitError::Stale)?,
             )
             .ok_or(ObjectWaitError::Stale)?;
-        Ok(Self::new(
-            entry.notifications(expected.incarnation())?,
-            cause,
-            receipt.revision(),
-        ))
+        let source = entry.notifications(expected.incarnation())?;
+        // SAFETY: the exact owner and live incarnation were authenticated above.
+        // The ratcheted owner wire producers sample under their object-state
+        // lock before refusing the operation; they retain that observation.
+        let snapshot = unsafe {
+            carrick_sched_core::object_wait::ObjectStateSnapshot::taken_under_owner_state_lock(
+                source.key(cause),
+                receipt.revision(),
+            )
+        };
+        Ok(Self::new(source, cause, snapshot))
     }
     pub fn owner_request(&self, operation: OperationToken) -> ObjectParkRequest {
-        let mut request = ObjectParkRequest::owner(
-            self.source.key(self.cause),
+        ObjectParkRequest {
+            key: self.source.key(self.cause),
+            snapshot: Some(self.observed_snapshot().observed()),
+            owner_entry: Some(carrick_sched_core::object_wait::OwnerEntry::Exception),
             operation,
-            carrick_sched_core::object_wait::OwnerEntry::Exception,
-        );
-        request.snapshot = Some(self.source.observed_revision(self.cause, self.revision));
-        request
+            deadline: None,
+        }
     }
     pub fn is_live(&self) -> bool {
         self.source.is_live()
@@ -198,8 +227,8 @@ impl<'a, C: EntryContext> PortalWaitEnrollment<'a, C> {
     pub fn key(&self) -> ObjectWaitKey {
         self.source.key(self.cause)
     }
-    pub fn observed_snapshot(&self) -> ObjectWaitSnapshot {
-        self.source.observed_revision(self.cause, self.revision)
+    pub fn observed_snapshot(&self) -> carrick_sched_core::object_wait::ObjectStateSnapshot {
+        self.snapshot
     }
 
     pub fn park_host(
@@ -209,7 +238,7 @@ impl<'a, C: EntryContext> PortalWaitEnrollment<'a, C> {
         completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
     ) -> Result<(), (ObjectWaitError, OperationToken)> {
         self.source.reserve(self.cause).park_host_rechecked(
-            self.source.observed_revision(self.cause, self.revision),
+            self.observed_snapshot().observed(),
             record,
             operation,
             completion,
@@ -231,6 +260,19 @@ pub enum EditWaitOutcome<T> {
     Refused,
 }
 
+/// Authority for a native owner whose save_context closure probes readiness
+/// while the object queue is locked. This is not a post-probe epoch fallback.
+pub struct OwnerProbeUnderQueueLock(());
+impl OwnerProbeUnderQueueLock {
+    /// # Safety
+    /// The paired save_context closure must check the owned operation's
+    /// readiness while park_object_record holds its object queue guard.
+    /// Changed/completed operations must refuse the park from that closure.
+    pub const unsafe fn for_save_context_probe() -> Self {
+        Self(())
+    }
+}
+
 /// Request parameters for parking an object wait record.
 #[derive(Debug)]
 pub struct ObjectParkRequest {
@@ -243,41 +285,78 @@ pub struct ObjectParkRequest {
 
 impl ObjectParkRequest {
     /// Ticket front door. No raw post-probe revision can be supplied here.
-    /// ```compile_fail
+    /// ```compile_fail,E0133
     /// use carrick_core_abi::wait::ObjectParkRequest;
     /// use carrick_sched_core::{ZoneTables, object_wait::OperationToken, refusal::ReleaseTicket};
     /// fn escape(zone: &ZoneTables, op: OperationToken, ticket: ReleaseTicket<'_>) {
     ///     let _ = ObjectParkRequest::from_ticket(zone, op, ticket);
     /// }
     /// ```
+    /// An observed snapshot cannot be injected through the ticket front door.
+    /// ```compile_fail,E0061
+    /// use carrick_core_abi::wait::ObjectParkRequest;
+    /// use carrick_sched_core::{ZoneTables, object_wait::{OperationToken, ObjectWaitSnapshot}, refusal::ReleaseTicket};
+    /// fn forge(zone: &ZoneTables, op: OperationToken, ticket: ReleaseTicket<'_>, snapshot: ObjectWaitSnapshot) {
+    ///     let _ = unsafe { ObjectParkRequest::from_ticket(zone, op, ticket, snapshot) };
+    /// }
+    /// ```
     /// # Safety
     /// A returned request must be enrolled only against `zone`, before its
-    /// retained entry authority is released. Use carrick_core::wait::park_and_rerun
-    /// for the safe end-to-end adapter; a raw request cannot retain zone custody.
+    /// retained entry authority is released; a raw request cannot retain zone custody.
     pub unsafe fn from_ticket<C: EntryContext>(
         zone: &ZoneTables<C>,
         operation: OperationToken,
         ticket: carrick_sched_core::refusal::ReleaseTicket<'_, C>,
-    ) -> carrick_sched_core::refusal::Rerun<Self, OperationToken> {
+    ) -> Result<
+        carrick_sched_core::refusal::Rerun<Self, OperationToken>,
+        (carrick_sched_core::refusal::InvariantKind, OperationToken),
+    > {
         use carrick_sched_core::refusal::Rerun;
         // SAFETY: this adapter transfers the owned operation through the existing
         // scheduler enrollment or returns it; witnesses use the same real queue.
         unsafe {
             ticket.park_and_rerun(operation, |operation, enrollment| {
-                if !enrollment.belongs_to(zone) || !enrollment.unchanged() {
-                    return Rerun::Now(operation);
+                if !enrollment.belongs_to(zone) {
+                    return Err((
+                        carrick_sched_core::refusal::InvariantKind {
+                            domain: "object_ticket_zone",
+                            code: 1,
+                        },
+                        operation,
+                    ));
                 }
-                Rerun::Park(Self::new(
+                if !enrollment.unchanged() {
+                    return Ok(Rerun::Now(operation));
+                }
+                Ok(Rerun::Park(Self::new(
                     enrollment.key(),
                     enrollment.observed(),
                     operation,
                     None,
-                ))
+                )))
             })
         }
     }
 
-    pub const fn new(
+    /// Explicit object-lock observation front door for existing wait protocols.
+    /// Raw snapshots cannot bypass that authority.
+    /// ```compile_fail,E0308
+    /// use carrick_core_abi::wait::ObjectParkRequest;
+    /// use carrick_sched_core::object_wait::{ObjectWaitKey, ObjectWaitSnapshot, OperationToken};
+    /// fn forge(key: ObjectWaitKey, snapshot: ObjectWaitSnapshot, op: OperationToken) {
+    ///     let _ = ObjectParkRequest::from_locked_snapshot(key, snapshot, op, None);
+    /// }
+    /// ```
+    pub const fn from_locked_snapshot(
+        key: ObjectWaitKey,
+        snapshot: carrick_sched_core::object_wait::ObjectStateSnapshot,
+        operation: OperationToken,
+        deadline: Option<u64>,
+    ) -> Self {
+        Self::new(key, snapshot.observed(), operation, deadline)
+    }
+
+    const fn new(
         key: ObjectWaitKey,
         snapshot: ObjectWaitSnapshot,
         operation: OperationToken,
@@ -297,6 +376,7 @@ impl ObjectParkRequest {
         key: ObjectWaitKey,
         operation: OperationToken,
         entry: carrick_sched_core::object_wait::OwnerEntry,
+        _probe: OwnerProbeUnderQueueLock,
     ) -> Self {
         Self {
             key,
@@ -461,7 +541,7 @@ mod ticket_tests {
             .publish(Waker::Host, &complete);
         let operation = OperationToken::new(19, 3).unwrap();
         let Rerun::Now(operation) =
-            (unsafe { ObjectParkRequest::from_ticket(&zone, operation, ticket) })
+            (unsafe { ObjectParkRequest::from_ticket(&zone, operation, ticket) }).unwrap()
         else {
             panic!("must rerun");
         };
@@ -488,7 +568,8 @@ mod ticket_tests {
             &authority(&zone, handle()),
             OperationToken::new(19, 3).unwrap(),
             ticket(&source),
-        ) else {
+        )
+        .unwrap() else {
             panic!("must enroll");
         };
         assert_eq!(enrollment.cause(), SpaceWaitCause::Editor);
@@ -562,12 +643,56 @@ mod ticket_tests {
         );
     }
     #[test]
+    fn portal_front_door_rejects_owner_and_zone_mismatch_as_invariants() {
+        let zone = zone();
+        let source = source(&zone);
+        let other = self::zone();
+        let foreign = unsafe {
+            crate::El1MmHandle::from_admitted_owner(
+                NonZeroU64::MIN,
+                crate::ReservationMm::new(78).unwrap(),
+                NonZeroU64::MIN,
+            )
+        };
+        for authority in [authority(&zone, foreign), authority(&other, handle())] {
+            let Err((kind, operation)) = PortalWaitEnrollment::from_ticket(
+                &authority,
+                OperationToken::new(19, 3).unwrap(),
+                ticket(&source),
+            ) else {
+                panic!("mismatch must be an invariant");
+            };
+            assert_eq!(kind.domain, "portal_ticket_owner");
+            assert_eq!((operation.index(), operation.generation()), (19, 3));
+        }
+    }
+    #[test]
     fn dropped_tickets_fail_in_production_dependency() {
         let zone = zone();
         let source = source(&zone);
         assert!(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(ticket(&source))))
                 .is_err()
+        );
+        assert_eq!(
+            zone.counters
+                .contention_tickets_dropped
+                .load(core::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+    #[test]
+    fn dropped_ticket_during_dependency_unwind_does_not_abort() {
+        let zone = zone();
+        let source = source(&zone);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ticket = ticket(&source);
+            panic!("original dependency panic");
+        }))
+        .unwrap_err();
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"original dependency panic")
         );
         assert_eq!(
             zone.counters
@@ -589,7 +714,13 @@ mod ticket_tests {
                     ticket(&source),
                 )
             },
-            Rerun::Now(_)
+            Err((
+                carrick_sched_core::refusal::InvariantKind {
+                    domain: "object_ticket_zone",
+                    ..
+                },
+                _
+            ))
         ));
     }
 }

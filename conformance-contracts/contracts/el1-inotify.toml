@@ -50,8 +50,3 @@ rationale = "Per run, host dispatches of inotify_add_watch (27), inotify_rm_watc
 maximum = 2.0
 statistic = "p50"
 minimum_samples = 5
-
-# #1395 slice 1: scheduler refusal::queue_witnesses proves bounded cause
-# selection, release-before-park, retirement rerun and exactly one wake.
-# The zone-scoped abandoned-ticket counter changes the shared layout hash;
-# existing semantic/signed bindings and budgets above remain required.
