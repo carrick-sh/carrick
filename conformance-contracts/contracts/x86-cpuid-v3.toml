@@ -1,4 +1,8 @@
 schema_version = 1
+# The progress witness lays out its scheduler table, observation record and
+# second root from their sizes. Compile-time bounds prevent overlap before
+# hardware execution; cpl0_progress retains its executed XSAVE/TLS isolation
+# checks and interrupt budgets. CPUID and XCR0 policy are unchanged.
 id = "x86.cpuid.v3"
 title = "KVM CPUID and XCR0 expose x86-64-v3 plus host-qualified AES, PCLMUL and deadline timer"
 guest_surfaces = ["vmm:kvm", "arch:x86-cpuid", "exec:x86-long-mode"]

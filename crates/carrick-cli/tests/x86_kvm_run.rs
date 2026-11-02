@@ -1746,7 +1746,10 @@ fn compile_assembly_with_flags(fixture: &str, elf: &std::path::Path, flags: &[&s
         .expect("compile native x86 assembly oracle");
     assert!(
         compile.status.success(),
-        "cc stderr: {}",
+        "compile native x86 assembly oracle {}: cc status: {}; stdout: {}; stderr: {}",
+        source.display(),
+        compile.status,
+        String::from_utf8_lossy(&compile.stdout),
         String::from_utf8_lossy(&compile.stderr)
     );
 }

@@ -16,9 +16,38 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-pub const SECOND_ROOT: u64 = 0x180_0000;
 const FIRST_ROOT: u64 = 0x60_0000;
 const PROGRESS_ZONE_GPA: u64 = 0x100_0000;
+// boot_lifecycle shares this mapping, including its two fixed sidecars.
+const SUPERVISOR_BYTES: u64 = 0x100_0000;
+const PROGRESS_STATE_GPA: u64 = PROGRESS_ZONE_GPA + (PROGRESS_STATE - PROGRESS_ZONE);
+pub const SECOND_ROOT: u64 = PROGRESS_ZONE_GPA + PROGRESS_SUPERVISOR_BYTES;
+const _: () = {
+    use carrick_x86::cpl0_lifecycle::{
+        LIFECYCLE_LANE, LIFECYCLE_STRIDE, LIFECYCLE_ZONE, LifecycleLane,
+    };
+
+    assert!(FIRST_ROOT + carrick_x86::X86_PML4_CAPACITY <= PROGRESS_ZONE_GPA);
+    assert!(
+        PROGRESS_ZONE_GPA + size_of::<ZoneTables<ParkedContextWords>>() as u64
+            <= PROGRESS_STATE_GPA
+    );
+    assert!(PROGRESS_STATE_GPA + size_of::<ProgressState>() as u64 <= SECOND_ROOT);
+    assert!(SECOND_ROOT.is_multiple_of(4096));
+    assert!(LIFECYCLE_ZONE == PROGRESS_ZONE);
+    let lanes_gpa = PROGRESS_ZONE_GPA + (LIFECYCLE_LANE - LIFECYCLE_ZONE);
+    assert!(SECOND_ROOT + carrick_x86::X86_PML4_CAPACITY <= lanes_gpa);
+    assert!(size_of::<LifecycleLane>() as u64 <= LIFECYCLE_STRIDE);
+    assert!(
+        lanes_gpa + LIFECYCLE_STRIDE + size_of::<LifecycleLane>() as u64
+            <= PROGRESS_ZONE_GPA + SUPERVISOR_BYTES
+    );
+    // boot_inner reserves two RAM_SIZE windows for this interrupt witness.
+    assert!(
+        PROGRESS_ZONE_GPA + SUPERVISOR_BYTES
+            <= 2 * carrick_x86_cpl0_host::cpl0_boot::RAM_SIZE as u64
+    );
+};
 const SLOT: SlotId = SlotId::new(0);
 const WAKE_ADDRESS: u64 = 0x5_0080;
 
@@ -31,7 +60,7 @@ pub(crate) fn supervisor_maps() -> [Pml4MapSpec; 2] {
         Pml4MapSpec {
             va: PROGRESS_ZONE,
             gpa: PROGRESS_ZONE_GPA,
-            len: 0x100_0000,
+            len: SUPERVISOR_BYTES,
             user: false,
             write: true,
             exec: false,
@@ -117,11 +146,6 @@ pub fn witness(
 ) -> Result<ProgressObservation, TrapError> {
     let mut carrier = Cpl0Carrier::boot_inner(frame_inventory, image, programs, true)?;
     let ram = Arc::clone(carrier.custody.ram());
-    if size_of::<ZoneTables<ParkedContextWords>>() > (PROGRESS_STATE - PROGRESS_ZONE) as usize
-        || size_of::<ProgressState>() > (SECOND_ROOT - 0x170_0000) as usize
-    {
-        return Err(fail("progress supervisor regions overlap"));
-    }
     let header = ram
         .host_ptr(PROGRESS_HEADER, size_of::<ProgressHeader>())
         .ok_or_else(|| fail("progress image header"))?;
@@ -279,7 +303,7 @@ pub fn witness(
     }
     let tasks: [ContextBinding; 2] = tasks.try_into().map_err(|_| fail("two contexts"))?;
     let state_ptr = ram
-        .host_ptr(0x170_0000, size_of::<ProgressState>())
+        .host_ptr(PROGRESS_STATE_GPA, size_of::<ProgressState>())
         .ok_or_else(|| fail("context backing"))?
         .cast::<ProgressState>();
     unsafe {

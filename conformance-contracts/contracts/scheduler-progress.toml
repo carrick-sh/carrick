@@ -112,4 +112,5 @@ statistic = "p50"
 minimum_samples = 20
 
 [bindings.unresolved]
+kvm = "Live witnesses: carrick-vmm-kvm::cpl0_progress::{entry_kick_and_timer_preempt_two_private_contexts,return_kick_and_timer_preempt_two_private_contexts}. One vCPU, two private contexts, 16 turns; unchanged wake, IRQ, preemption and host-exit budgets. Compile-time layout bounds keep scheduler, observation and page-table records disjoint. The contract evaluator has no registered KVM observation layer; these tests do not confer broader scheduler acceptance."
 x86_cpl0 = "Order 3 custody components now have a VM-free binding. Exact in-CPL0 X3 remains pending order 4, release-before-enroll, default-pool exhaustion and exec/clear-tid; no KVM or signed acceptance is conferred."
