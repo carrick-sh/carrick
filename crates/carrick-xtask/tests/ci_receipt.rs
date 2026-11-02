@@ -1460,7 +1460,7 @@ fn retirement_refuses_macro_generated_tests_anywhere_in_candidate_crate() {
 }
 
 #[test]
-fn retirement_accepts_global_asm_items_which_cannot_generate_tests() {
+fn retirement_accepts_item_macros_which_cannot_generate_tests() {
     // `global_asm!` emits assembly only; it can't define a Rust test. A crate
     // with a `global_asm!` item (carrick-el1-linux's entry stub) must still be
     // able to retire a renamed test (#1409).
@@ -1468,6 +1468,8 @@ fn retirement_accepts_global_asm_items_which_cannot_generate_tests() {
         "core::arch::global_asm!(\".text\");",
         "std::arch::global_asm!(\".text\");",
         "global_asm!(\".text\");",
+        "std::thread_local! { static CELL: core::cell::Cell<u32> = const { core::cell::Cell::new(0) }; }",
+        "thread_local! { static CELL: core::cell::Cell<u32> = const { core::cell::Cell::new(0) }; }",
     ] {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base");
@@ -1501,10 +1503,44 @@ fn retirement_still_refuses_other_item_macros_named_like_asm() {
 
 #[test]
 fn retirement_refuses_path_modules_anywhere_in_candidate_crate() {
+    // A `#[path]` target outside the crate root isn't among the scanned
+    // files, so it could hide a same-named test: refuse.
     assert_candidate_scan_refuses(
         "crates/example/src/lib.rs",
-        "#[path = \"../kept.rs\"] mod kept;",
+        "#[path = \"../../outside/kept.rs\"] mod kept;",
         None,
+    );
+}
+
+#[test]
+fn retirement_accepts_path_modules_that_stay_inside_the_crate() {
+    // An in-crate `#[path]` target is one of the scanned files already, so it
+    // hides nothing (carrick-el1-linux `tests/n2_creation_owner.rs`).
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    let cand = dir.path().join("cand");
+    write_source(&base, "crates/example/tests/foo.rs", "#[test] fn gone() {}");
+    write_source(
+        &cand,
+        "crates/example/tests/foo.rs",
+        "#[path = \"support/policy.rs\"] mod policy;",
+    );
+    write_source(
+        &cand,
+        "crates/example/tests/support/policy.rs",
+        "pub fn helper() {}",
+    );
+    let diff = diff_with_retired(
+        &cpl0_receipt(&["foo::gone"], &[]),
+        &cpl0_receipt(&[], &[]),
+        &[retirement("foo::gone", None)],
+        &base,
+        &cand,
+    )
+    .unwrap_or_else(|error| panic!("in-crate #[path] refused: {error}"));
+    assert!(
+        !format!("{diff:?}").contains("missing:foo::gone"),
+        "{diff:?}"
     );
 }
 
@@ -3101,4 +3137,20 @@ fn review_colored_cargo_population_keeps_binary_identity() {
     assert_eq!(s.started_tests, ["probes::witness"]);
     assert_eq!(s.finished_binaries, ["probes"]);
     assert_cli_self_diff(&receipt(vec![s]), true, "colored population");
+}
+
+#[test]
+fn retirement_scan_resolves_the_real_el1_linux_crate() {
+    // Every carrick-el1-linux test must stay retirable: the crate's item
+    // macros (global_asm!, thread_local!) must not be read as generators
+    // (#1409, #1424). A new unresolved item macro in the crate fails here
+    // instead of at a PR's receipt gate.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let found = carrick_xtask::ci_receipt::tree_has_test(
+        &root,
+        "carrick_el1_linux",
+        "native_process_runtime::host_test_support::a_test_name_that_does_not_exist",
+    )
+    .expect("carrick-el1-linux sources must resolve for test retirement");
+    assert!(!found);
 }

@@ -490,6 +490,41 @@ fn check_target_paths(crate_dir: &Path, manifest: &toml::Value) -> Result<(), Re
 struct TestSourceScan {
     tests: BTreeSet<String>,
     unresolved: Option<&'static str>,
+    /// Directory of the file being visited and the owning crate's root, so a
+    /// `#[path = "…"]` module that stays inside the crate (and is therefore
+    /// already among the scanned files) is not read as an unresolved source.
+    file_dir: std::path::PathBuf,
+    crate_root: std::path::PathBuf,
+}
+
+impl TestSourceScan {
+    /// A plain `#[path = "lit"]` whose target, resolved against the visiting
+    /// file's directory, is a file inside the crate root. Every `.rs` file
+    /// under the crate root is scanned anyway, so such a module hides nothing.
+    /// Anything else (a `cfg_attr` form, a non-literal, or an out-of-crate
+    /// target) stays unresolved.
+    fn path_stays_in_crate(&self, meta: &syn::Meta) -> bool {
+        let syn::Meta::NameValue(nv) = meta else {
+            return false;
+        };
+        if !nv.path.is_ident("path") {
+            return false;
+        }
+        let syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(lit),
+            ..
+        }) = &nv.value
+        else {
+            return false;
+        };
+        let (Ok(target), Ok(root)) = (
+            self.file_dir.join(lit.value()).canonicalize(),
+            self.crate_root.canonicalize(),
+        ) else {
+            return false;
+        };
+        target.is_file() && target.starts_with(root)
+    }
 }
 
 fn meta_has_path(meta: &syn::Meta) -> bool {
@@ -527,9 +562,10 @@ fn meta_is_test(meta: &syn::Meta) -> bool {
     false
 }
 
-/// `global_asm!`, `core::arch::global_asm!` or `std::arch::global_asm!`:
-/// an item macro that emits assembly only and so cannot define a test.
-fn is_global_asm(path: &syn::Path) -> bool {
+/// Item macros that provably cannot define a Rust test: `global_asm!`
+/// (assembly only) and `thread_local!` (thread-local statics only), under
+/// their bare, `core::arch`/`std::arch` and `std` spellings.
+fn is_non_generating_item_macro(path: &syn::Path) -> bool {
     let segments: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
     matches!(
         segments
@@ -537,16 +573,20 @@ fn is_global_asm(path: &syn::Path) -> bool {
             .map(String::as_str)
             .collect::<Vec<_>>()
             .as_slice(),
-        ["global_asm"] | ["core", "arch", "global_asm"] | ["std", "arch", "global_asm"]
+        ["global_asm"]
+            | ["core", "arch", "global_asm"]
+            | ["std", "arch", "global_asm"]
+            | ["thread_local"]
+            | ["std", "thread_local"]
     )
 }
 
 impl<'ast> syn::visit::Visit<'ast> for TestSourceScan {
     fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
         // An imported generator can emit tests without a local macro_rules!.
-        // `global_asm!` is the one item macro that provably can't: it emits
-        // assembly, never Rust items.
-        if !is_global_asm(&item.mac.path) {
+        // `global_asm!` and `thread_local!` provably can't: they emit
+        // assembly or thread-local statics, never Rust test functions.
+        if !is_non_generating_item_macro(&item.mac.path) {
             self.unresolved = Some("item macro generator");
         }
         syn::visit::visit_item_macro(self, item);
@@ -560,7 +600,7 @@ impl<'ast> syn::visit::Visit<'ast> for TestSourceScan {
     }
 
     fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
-        if meta_has_path(&attr.meta) {
+        if meta_has_path(&attr.meta) && !self.path_stays_in_crate(&attr.meta) {
             self.unresolved = Some("#[path] module");
         }
         syn::visit::visit_attribute(self, attr);
@@ -600,6 +640,8 @@ pub fn tree_has_test(tree_root: &Path, bin: &str, test_path: &str) -> Result<boo
             let syntax = syn::parse_file(&source).map_err(|e| {
                 ReceiptError::Retired(format!("cannot parse '{}': {e}", file.display()))
             })?;
+            scan.file_dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
+            scan.crate_root = crate_dir.clone();
             scan.visit_file(&syntax);
             if let Some(reason) = scan.unresolved {
                 return Err(ReceiptError::Retired(format!(
