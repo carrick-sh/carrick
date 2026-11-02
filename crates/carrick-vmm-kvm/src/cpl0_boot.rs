@@ -2106,9 +2106,6 @@ impl Cpl0Carrier {
         let ram = Arc::new(ram);
         let vm = KvmVm::create_empty().map_err(|e| fail(e.to_string()))?;
         let mut memory = CarrierMemory::new(vm).map_err(|e| fail(e.to_string()))?;
-        if hardware_interrupts {
-            crate::carrier_interrupts::create_irqchip(memory.vm())?;
-        }
         memory
             .install_bootstrap(Arc::clone(&ram))
             .map_err(|e| fail(e.to_string()))?;

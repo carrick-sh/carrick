@@ -12,13 +12,13 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
+carrick-x86 = { path = "../carrick-x86" }
 carrick-softmmu = { path = "../carrick-softmmu", features = ["std"] }
 iced-x86 = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
 carrick-hal = { path = "../carrick-hal" }
-carrick-x86 = { path = "../carrick-x86" }
 goblin = { workspace = true }
 
 [package.metadata.carrick.test-lanes]

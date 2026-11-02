@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use carrick_hal::guest_arch::GuestArch as _;
 use carrick_hal::x8664_arch::X8664GuestArch;
 use carrick_softcpu_x86::{
-    Cpl0CpuidView, CpuidRegs, DEFAULT_IA32_APIC_BASE, DEFAULT_IA32_PAT, DescriptorTablePtr,
-    EFER_LMA, EFER_LME, EFER_NXE, EFER_SCE, ExtentRecord, ExtentTable, FrameGpa, GuestCpuidView,
-    Level0CpuidView, LinearPlacement, MSR_IA32_APIC_BASE, MSR_IA32_CSTAR, MSR_IA32_EFER,
+    Cpl0CpuidView, CpuidAuthority, CpuidRegs, DEFAULT_IA32_APIC_BASE, DEFAULT_IA32_PAT,
+    DescriptorTablePtr, EFER_LMA, EFER_LME, EFER_NXE, EFER_SCE, ExtentRecord, ExtentTable,
+    FrameGpa, Level0CpuidView, LinearPlacement, MSR_IA32_APIC_BASE, MSR_IA32_CSTAR, MSR_IA32_EFER,
     MSR_IA32_FMASK, MSR_IA32_FS_BASE, MSR_IA32_GS_BASE, MSR_IA32_KERNEL_GS_BASE, MSR_IA32_LSTAR,
     MSR_IA32_MISC_ENABLE, MSR_IA32_PAT, MSR_IA32_STAR, MSR_IA32_TSC, MSR_IA32_TSC_DEADLINE,
     MmioHoles, MsrCapabilities, MsrError, MsrFile, MsrIndex, OwnerGeneration, PF_ERR_PRESENT,
@@ -192,7 +192,7 @@ fn pf(rip: u64, code: u32, cr2: u64) -> X86Exception {
 
 fn setup_cpl0_cpu(
     code: &[u8],
-    cpuid: Box<dyn GuestCpuidView>,
+    cpuid: Box<dyn CpuidAuthority>,
 ) -> (SoftCpu, Cpl0TestMemory, FrameGpa) {
     let mut mem = Cpl0TestMemory::new();
     let code_frame = mem.map_page(CODE_VA, Perms::KERNEL_RX);
@@ -754,8 +754,36 @@ fn sysret_and_iretq_enforce_privilege_transitions_and_fault_paths() {
     assert_vmx_valid(cpu.context());
 }
 
+#[test]
+fn shared_cpuid_authority_drives_softcpu_cpuid_and_osxsave() {
+    let view = carrick_x86::GuestCpuidView::x86_64_v3().with_apic_id(7);
+    let (mut cpu, mut mem, _) = setup_cpl0_cpu(b"\x0f\xa2", Box::new(view));
+    for osxsave in [false, true] {
+        if osxsave {
+            cpu.context_mut().cr4 |= 1 << 18;
+        } else {
+            cpu.context_mut().cr4 &= !(1 << 18);
+        }
+        for leaf in [0, 1, 7, 0x15, 0x8000_0001, 0x8000_0008] {
+            let ctx = cpu.context_mut();
+            ctx.rip = CODE_VA;
+            ctx.gpr[reg::RAX] = u64::from(leaf);
+            ctx.gpr[reg::RCX] = 0;
+            step_ok(&mut cpu, &mut mem, CODE_VA + 2);
+            let g = &cpu.context().gpr;
+            let got = CpuidRegs::new(
+                g[reg::RAX] as u32,
+                g[reg::RBX] as u32,
+                g[reg::RCX] as u32,
+                g[reg::RDX] as u32,
+            );
+            assert_eq!(got, view.cpuid_for_state(leaf, 0, osxsave, false));
+        }
+    }
+}
+
 struct CustomCpuidView;
-impl GuestCpuidView for CustomCpuidView {
+impl CpuidAuthority for CustomCpuidView {
     fn cpuid(&self, leaf: u32, subleaf: u32) -> CpuidRegs {
         CpuidRegs::new(
             0xaa00_0000 | leaf,

@@ -12,7 +12,7 @@ use std::time::Duration;
 use crate::apic::{ApicCluster, ApicNode, TscClock};
 use crate::context::{SoftCpuContext, SoftSegment, X86Exception, X86ExceptionVector, reg};
 use crate::cpu::{SoftCpu, SoftCpuExit, SoftCpuNewError};
-use crate::cpuid::GuestCpuidView;
+use crate::cpuid::CpuidAuthority;
 use crate::decode::SensitiveOp;
 use crate::emit::EmitError;
 use crate::mmu::{SoftMmuMemory, is_canonical_va, read_system_bytes, write_idt_stack_frame};
@@ -65,7 +65,7 @@ pub struct SoftMachine<M: SoftMmuMemory> {
 
 impl<M: SoftMmuMemory> SoftMachine<M> {
     /// Create a [`SoftMachine`] seated in `mem.extents()` with `cpuid`.
-    pub fn new(mem: M, cpuid: Box<dyn GuestCpuidView>) -> Result<Self, SoftCpuNewError> {
+    pub fn new(mem: M, cpuid: Box<dyn CpuidAuthority>) -> Result<Self, SoftCpuNewError> {
         let cpu = SoftCpu::with_cpuid_view(mem.extents(), cpuid)?;
         Ok(Self {
             cpu,

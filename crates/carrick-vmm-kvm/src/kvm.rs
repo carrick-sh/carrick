@@ -899,7 +899,7 @@ mod x86_tests {
     }
 
     #[test]
-    fn x86_vcpu_exposes_pinned_x86_64_v3_cpuid_and_no_non_v3_features() {
+    fn x86_vcpu_exposes_pinned_x86_64_v3_profile() {
         let mut vm = KvmVm::create_empty().expect("create kvm vm");
         let vcpu0 = vm.add_vcpu().expect("create kvm vcpu 0");
         let vcpu1 = vm.add_vcpu().expect("create kvm vcpu 1");
@@ -952,7 +952,7 @@ mod x86_tests {
             // Independent psABI feature oracle, separate from GuestCpuidView's
             // production masks so a mistaken expansion cannot bless itself.
             let leaf1 = cpuid_entry(&active_cpuid, 1, 0).expect("leaf 1 installed");
-            assert_eq!(leaf1.ecx, 0x3cd8_3201);
+            assert_eq!(leaf1.ecx & !((1 << 1) | (1 << 24) | (1 << 25)), 0x3cd8_3201);
             assert_eq!(leaf1.edx, 0x0789_a37d);
             let leaf7 = cpuid_entry(&active_cpuid, 7, 0).expect("leaf 7 installed");
             assert_eq!(leaf7.ebx, 0x0010_01a8);
@@ -1123,7 +1123,7 @@ impl KvmVm {
     /// `GuestRam` windows, so there is no `AddressSpace` to thread through.
     /// (`HvVm::create` ignores its `&AddressSpace` argument; this is the same
     /// bring-up without the unused parameter.)
-    pub fn create_empty() -> Result<Self, OsError> {
+    pub(crate) fn create_empty() -> Result<Self, OsError> {
         reset_kvm_stats_for_new_vm();
         let kvm = Kvm::new().map_err(|e| os_err("open /dev/kvm", e))?;
         // Probe KVM_CAP_SYNC_REGS once: it lets the syscall doorbell read the
@@ -1138,7 +1138,7 @@ impl KvmVm {
             let supported = kvm
                 .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
                 .map_err(|e| os_err("KVM_GET_SUPPORTED_CPUID", e))?;
-            let entries: Vec<carrick_x86::CpuidLeafEntry> = supported
+            let mut entries: Vec<carrick_x86::CpuidLeafEntry> = supported
                 .as_slice()
                 .iter()
                 .map(|e| carrick_x86::CpuidLeafEntry {
@@ -1148,12 +1148,26 @@ impl KvmVm {
                     regs: carrick_x86::CpuidRegs::new(e.eax, e.ebx, e.ecx, e.edx),
                 })
                 .collect();
+            // KVM API section 9.1: older hosts omit TSC_DEADLINE from
+            // GET_SUPPORTED_CPUID. Its capability is authoritative when an
+            // in-kernel LAPIC is installed (below, before any vCPU exists).
+            if let Some(leaf1) = entries.iter_mut().find(|e| e.function == 1) {
+                leaf1.regs.ecx &= !(1 << 24);
+                if kvm.check_extension(Cap::TscDeadlineTimer) {
+                    leaf1.regs.ecx |= 1 << 24;
+                }
+            }
             carrick_x86::GuestCpuidView::qualify_supported(&entries).map_err(|e| OsError {
                 context: format!("kvm: qualify x86-64-v3 guest CPUID: {e}"),
                 errno: libc::ENOTSUP,
             })?
         };
         let vm = kvm.create_vm().map_err(|e| os_err("KVM_CREATE_VM", e))?;
+        // The pinned APIC/deadline view needs a real in-kernel LAPIC on every
+        // x86 path, including run-elf. Create it once before publishing the VM.
+        #[cfg(target_arch = "x86_64")]
+        vm.create_irq_chip()
+            .map_err(|e| os_err("KVM_CREATE_IRQCHIP", e))?;
         // EPOCH INVARIANT: the shared dispatcher (clock_nanosleep TIMER_ABSTIME,
         // absolute FUTEX_WAIT_BITSET deadlines, timer/timerfd ABSTIME) compares
         // guest CLOCK_MONOTONIC deadlines against the HOST's monotonic clock
@@ -1348,6 +1362,12 @@ impl KvmVm {
         };
         #[cfg(target_arch = "x86_64")]
         {
+            // Carrick installs the entry state itself, without a firmware SIPI
+            // sequence. An in-kernel IRQ chip otherwise leaves APs uninitialized.
+            fd.set_mp_state(kvm_bindings::kvm_mp_state {
+                mp_state: kvm_bindings::KVM_MP_STATE_RUNNABLE,
+            })
+            .map_err(|e| os_err("KVM_SET_MP_STATE(RUNNABLE)", e))?;
             // Enable pinned x86-64-v3 AVX state on EVERY x86 vCPU:
             // XCR0 = x87(0) | SSE(1) | AVX(2) = 0x7 so guest XGETBV(0) matches
             // CPUID.(0Dh, 0) and AVX/AVX2 instructions execute without #UD.

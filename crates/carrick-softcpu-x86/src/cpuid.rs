@@ -2,35 +2,12 @@
 //!
 //! Host `CPUID` never leaks into translated blocks: `SoftCpu` routes every `0F A2`
 //! (`CPUID`) exit and feature-gated instruction check (`MOV CR4`, `WRMSR`, `XSETBV`,
-//! `CLAC`/`STAC`) through [`GuestCpuidView`].
+//! `CLAC`/`STAC`) through [`CpuidAuthority`].
 
-/// Four 32-bit general-purpose register outputs returned by `CPUID` (`EAX`, `EBX`, `ECX`, `EDX`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct CpuidRegs {
-    pub eax: u32,
-    pub ebx: u32,
-    pub ecx: u32,
-    pub edx: u32,
-}
-
-impl CpuidRegs {
-    /// All-zero leaf response for unsupported leaves/subleaves.
-    pub const ZERO: Self = Self {
-        eax: 0,
-        ebx: 0,
-        ecx: 0,
-        edx: 0,
-    };
-
-    /// Construct a `CPUID` register quad `(eax, ebx, ecx, edx)`.
-    #[must_use]
-    pub const fn new(eax: u32, ebx: u32, ecx: u32, edx: u32) -> Self {
-        Self { eax, ebx, ecx, edx }
-    }
-}
+pub use carrick_x86::{CpuidRegs, DEFAULT_TSC_HZ};
 
 /// Authority supplying the guest-visible `CPUID` topology and feature set for a [`crate::SoftCpu`].
-pub trait GuestCpuidView: Send + Sync {
+pub trait CpuidAuthority: Send + Sync {
     /// Query `(leaf, subleaf)` (`EAX = leaf`, `ECX = subleaf`).
     fn cpuid(&self, leaf: u32, subleaf: u32) -> CpuidRegs;
 
@@ -129,9 +106,6 @@ pub trait GuestCpuidView: Send + Sync {
     }
 }
 
-/// Default guest TSC crystal frequency (2 GHz) advertised via `CPUID.15H`.
-pub const DEFAULT_TSC_HZ: u64 = 2_000_000_000;
-
 // Excludes unimplemented VME (1), APIC (9), and SEP/SYSENTER (11).
 const LEAF1_EDX: u32 = (1 << 2)
     | (1 << 4)
@@ -154,7 +128,7 @@ const LEAF1_EDX: u32 = (1 << 2)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Level0CpuidView;
 
-impl GuestCpuidView for Level0CpuidView {
+impl CpuidAuthority for Level0CpuidView {
     fn cpuid(&self, leaf: u32, subleaf: u32) -> CpuidRegs {
         match (leaf, subleaf) {
             (0, _) => CpuidRegs::new(
@@ -227,7 +201,7 @@ impl Cpl0CpuidView {
     }
 }
 
-impl GuestCpuidView for Cpl0CpuidView {
+impl CpuidAuthority for Cpl0CpuidView {
     fn cpuid(&self, leaf: u32, subleaf: u32) -> CpuidRegs {
         let max_basic = if self.tsc_hz != 0 { 0x15 } else { 0x0d };
         match (leaf, subleaf) {
@@ -272,6 +246,15 @@ impl GuestCpuidView for Cpl0CpuidView {
         }
     }
 
+    fn mirrors_osxsave(&self) -> bool {
+        true
+    }
+}
+
+impl CpuidAuthority for carrick_x86::GuestCpuidView {
+    fn cpuid(&self, leaf: u32, subleaf: u32) -> CpuidRegs {
+        self.cpuid(leaf, subleaf)
+    }
     fn mirrors_osxsave(&self) -> bool {
         true
     }

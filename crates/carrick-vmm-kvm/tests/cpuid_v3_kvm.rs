@@ -5,9 +5,9 @@
 //! 1. Every `CPUID` leaf observed by ring-3 guest `CPUID` instructions matches
 //!    `carrick_x86::GuestCpuidView` (`x86-64-v3` + CPL0 `SMEP`/`SMAP`, per-vCPU `APIC ID`,
 //!    host-clamped `MAXPHYADDR`, calibrated `CPUID.15H`).
-//! 2. Zero features outside `x86-64-v3` (no `AVX-512`, `AMX`, `SHA`, `AES`, `PCLMULQDQ`,
+//! 2. Zero features outside the approved v3 + AES/PCLMUL/deadline profile (no `AVX-512`, `AMX`, `SHA`,
 //!    `RDRAND`, `RDSEED`, `ADX`, `FSGSBASE`, `PKU`, `LA57`, `UMIP`, `XSAVEOPT`/`XSAVEC`/`XSAVES`,
-//!    `TSC_DEADLINE`, `HYPERVISOR`, `0x4000_0000`, `RDTSCP`, `PDPE1GB`, or AMD SEV leaves)
+//!    `HYPERVISOR`, `0x4000_0000`, `RDTSCP`, `PDPE1GB`, or AMD SEV leaves)
 //!    leak through to the guest.
 //! 3. `XGETBV(0)` returns `0x7` (`x87 | SSE | AVX`) and `AVX2` (`vpcmpeqd ymm0` / `vpmovmskb`),
 //!    `BMI1` (`blsi`), `BMI2` (`pdep`), `LZCNT`, `POPCNT`, and `MOVBE` execute natively.
@@ -71,6 +71,38 @@ fn emit_observe_rax(code: &mut Vec<u8>) {
 
 /// Emit `AVX2` + `POPCNT` + `LZCNT` + `BMI1` + `BMI2` calculation leaving `EXPECTED_V3_ISA_WITNESS` in `eax`.
 fn emit_v3_isa_witness_into_eax(code: &mut Vec<u8>) {
+    // Execute each host-qualified crypto extension only when advertised. A bad
+    // result traps before the existing numeric witness can be published.
+    for (bit, body) in [
+        (
+            25_u32,
+            &[
+                0x66, 0x0f, 0xef, 0xc0, // pxor xmm0, xmm0
+                0x66, 0x0f, 0x38, 0xdc, 0xc0, // aesenc xmm0, xmm0
+                0x66, 0x0f, 0x7e, 0xc0, // movd eax, xmm0
+                0x3d, 0x63, 0x63, 0x63, 0x63, // cmp eax, 0x63636363
+                0x74, 0x02, 0x0f, 0x0b, // je +2; ud2 on incorrect result
+            ][..],
+        ),
+        (
+            1_u32,
+            &[
+                0xb8, 0x03, 0x00, 0x00, 0x00, // mov eax, 3
+                0x66, 0x0f, 0x6e, 0xc0, // movd xmm0, eax (upper bits zero)
+                0x66, 0x0f, 0x3a, 0x44, 0xc0, 0x00, // pclmulqdq xmm0, xmm0, 0
+                0x66, 0x0f, 0x7e, 0xc0, // movd eax, xmm0
+                0x83, 0xf8, 0x05, // cmp eax, 5 (polynomial 3 * 3)
+                0x74, 0x02, 0x0f, 0x0b,
+            ][..],
+        ),
+    ] {
+        code.extend_from_slice(&[0xb8, 1, 0, 0, 0, 0x31, 0xc9, 0x0f, 0xa2]); // cpuid(1)
+        code.extend_from_slice(&[0xf7, 0xc1]); // test ecx, bit
+        code.extend_from_slice(&(1_u32 << bit).to_le_bytes());
+        code.extend_from_slice(&[0x74, body.len() as u8]); // jz past unavailable extension
+        code.extend_from_slice(body);
+    }
+
     code.extend_from_slice(&[
         0xc5, 0xfd, 0x76, 0xc0, // vpcmpeqd ymm0, ymm0, ymm0   (AVX2 -> all 1s)
         0xc5, 0xfd, 0xd7, 0xc0, // vpmovmskb eax, ymm0         (AVX2 -> 0xffff_ffff)
@@ -137,6 +169,17 @@ fn cpl0_cpuid_probe_program() -> Vec<u8> {
     emit_v3_isa_witness_into_eax(&mut code);
     emit_observe_rax(&mut code);
 
+    // Arm through the production CPL0 interrupt-service witness, then stop at
+    // an observation so the host can inspect the programmed LAPIC timer mode.
+    code.extend_from_slice(&[0x48, 0xbf]);
+    code.extend_from_slice(&1_u64.to_le_bytes()); // arm_timer
+    code.extend_from_slice(&[0x48, 0xbe]);
+    code.extend_from_slice(&100_000_u64.to_le_bytes()); // 100 us
+    code.extend_from_slice(&[0x48, 0xb8]);
+    code.extend_from_slice(&0xffff_ffff_ffff_ff40_u64.to_le_bytes()); // INTERRUPT_WITNESS
+    code.extend_from_slice(&[0x0f, 0x05]);
+    emit_observe_rax(&mut code);
+
     code.extend_from_slice(&[0x0f, 0x0b]); // ud2 sentinel after all observations
     assert!(
         code.len() <= 4096,
@@ -146,7 +189,7 @@ fn cpl0_cpuid_probe_program() -> Vec<u8> {
     code
 }
 
-fn assert_observed_leaves_are_strictly_v3(
+fn assert_observed_leaves_match_pinned_profile(
     observed: &[((u32, u32), CpuidRegs)],
     expected_view: GuestCpuidView,
 ) {
@@ -173,7 +216,23 @@ fn assert_observed_leaves_are_strictly_v3(
     // production masks would let an accidental feature addition bless itself.
     let l1 = find(1, 0);
     assert_eq!(l1.eax, 0x0003_06d4, "pinned CPU signature");
-    assert_eq!(l1.ecx, 0x3cd8_3201, "exact v3 1.ECX features");
+    let kvm = kvm_ioctls::Kvm::new().unwrap();
+    let supported = kvm.get_supported_cpuid(256).unwrap();
+    let mut host_ecx = supported
+        .as_slice()
+        .iter()
+        .find(|e| e.function == 1)
+        .unwrap()
+        .ecx;
+    host_ecx &= !(1 << 24);
+    if kvm.check_extension(kvm_ioctls::Cap::TscDeadlineTimer) {
+        host_ecx |= 1 << 24;
+    }
+    assert_eq!(
+        l1.ecx,
+        0x3cd8_3201 | (host_ecx & ((1 << 1) | (1 << 24) | (1 << 25))),
+        "exact v3 plus host-qualified AES/PCLMUL/TSC_DEADLINE features"
+    );
     assert_eq!(l1.edx, 0x0789_a37d, "exact baseline 1.EDX features");
     assert_eq!(find(7, 0), CpuidRegs::new(0, 0x0010_01a8, 0, 0));
     assert_eq!(find(7, 1), CpuidRegs::ZERO);
@@ -186,19 +245,23 @@ fn assert_observed_leaves_are_strictly_v3(
         find(0x8000_0001, 0),
         CpuidRegs::new(0, 0, 0x21, 0x2010_0800)
     );
-    assert_eq!(find(0x8000_0007, 0), CpuidRegs::new(0, 0, 0, 1 << 8));
+    assert_eq!(find(0x8000_0007, 0).edx & !(1 << 8), 0);
     assert_eq!(find(0x8000_001f, 0), CpuidRegs::ZERO);
 }
 
 fn host_qualified_v3_view() -> GuestCpuidView {
     use carrick_hal::HvVm;
-    let mut vm = carrick_vmm_kvm::KvmVm::create_empty().expect("create reference KvmVm");
+    let elf = make_two_page_x86_elf(&[0x0f, 0x0b], 0x40_0000);
+    let space =
+        carrick_mem::memory::AddressSpace::load_elf_bytes_with_reader_for(&elf, &|_| None, 62)
+            .expect("reference ELF address space");
+    let mut vm = carrick_vmm_kvm::KvmVm::create(&space).expect("create reference KvmVm");
     let _vcpu0 = vm.add_vcpu().expect("create vCPU 0 to calibrate KVM TSC");
     vm.cpuid_view()
 }
 
 #[test]
-fn kvm_cpl0_guest_sees_pinned_x86_64_v3_cpuid_and_no_non_v3_features() {
+fn kvm_cpl0_guest_sees_pinned_x86_64_v3_profile() {
     let base_view = host_qualified_v3_view();
     let prog = cpl0_cpuid_probe_program();
     let mut carrier =
@@ -209,8 +272,9 @@ fn kvm_cpl0_guest_sees_pinned_x86_64_v3_cpuid_and_no_non_v3_features() {
     assert_eq!(expected_views[0].apic_id(), 0);
     assert_eq!(expected_views[1].apic_id(), 1);
     assert!(
-        !carrier.has_tsc_deadline(0).expect("CPU 0 tsc_deadline"),
-        "TSC_DEADLINE is outside x86-64-v3 and must not be advertised"
+        carrier.has_tsc_deadline(0).expect("CPU 0 tsc_deadline")
+            == (base_view.cpuid(1, 0).ecx & (1 << 24) != 0),
+        "TSC_DEADLINE must match host qualification"
     );
 
     for (slot, &expected_view) in expected_views.iter().enumerate() {
@@ -221,7 +285,7 @@ fn kvm_cpl0_guest_sees_pinned_x86_64_v3_cpuid_and_no_non_v3_features() {
             let regs = CpuidRegs::new(lo as u32, (lo >> 32) as u32, hi as u32, (hi >> 32) as u32);
             observed.push(((leaf, subleaf), regs));
         }
-        assert_observed_leaves_are_strictly_v3(&observed, expected_view);
+        assert_observed_leaves_match_pinned_profile(&observed, expected_view);
 
         let xcr0 = carrier.observe(slot).expect("observe XGETBV(0)").result as u64;
         assert_eq!(
@@ -236,6 +300,20 @@ fn kvm_cpl0_guest_sees_pinned_x86_64_v3_cpuid_and_no_non_v3_features() {
             u64::from(EXPECTED_V3_ISA_WITNESS),
             "CPU {slot} x86-64-v3 AVX2/BMI1/BMI2/LZCNT/POPCNT witness mismatch"
         );
+        assert_eq!(carrier.observe(slot).expect("arm timer").result, 0);
+        if base_view.cpuid(1, 0).ecx & (1 << 24) != 0 {
+            assert_eq!(
+                carrier.lapic_register(slot, 0x320).unwrap() & (3 << 17),
+                1 << 18,
+                "host-qualified TSC-deadline timer path must be used"
+            );
+        } else {
+            assert_eq!(
+                carrier.lapic_register(slot, 0x3e0).unwrap() & 0b1111,
+                0b1011,
+                "non-deadline host uses the calibrated APIC divider"
+            );
+        }
     }
 }
 
@@ -378,7 +456,7 @@ fn kvm_run_elf_guest_sees_pinned_x86_64_v3_cpuid_and_executes_v3_isa() {
         );
         observed.push(((leaf, subleaf), regs));
     }
-    assert_observed_leaves_are_strictly_v3(&observed, expected_view);
+    assert_observed_leaves_match_pinned_profile(&observed, expected_view);
 
     let tail = PROBED_LEAVES.len() * 16;
     let xcr0 = u64::from_le_bytes(out.stdout[tail..tail + 8].try_into().unwrap());

@@ -6,13 +6,13 @@
 //! - `LGDT`, `LIDT`, `LTR` and unprivileged/UMIP queries `SGDT`, `SIDT`, `SLDT`, `STR`, `SMSW`
 //! - `SWAPGS`, `SYSRET` / `SYSRETQ`, `IRET` / `IRETD` / `IRETQ`
 //! - `HLT`, `INVLPG`, `CLI`, `STI`, `CLAC`, `STAC`, `XSETBV`, `XGETBV`
-//! - `CPUID` routed through [`crate::cpuid::GuestCpuidView`]
+//! - `CPUID` routed through [`crate::cpuid::CpuidAuthority`]
 
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};
 
 use crate::cflow::compute_effective_va;
 use crate::context::{DescriptorTablePtr, SoftCpuContext, SoftSegment, X86Exception, reg};
-use crate::cpuid::GuestCpuidView;
+use crate::cpuid::CpuidAuthority;
 use crate::decode::{SensitiveOp, gpr_index};
 use crate::mmu::{
     SoftAccessKind, SoftMmuMemory, check_guest_alignment, check_system_write, is_canonical_va,
@@ -172,7 +172,7 @@ pub(crate) fn load_gdt_code_or_data_descriptor<M: SoftMmuMemory>(
 /// Emulate CPL0 privileged and system instructions on `ctx` before falling back to host exit.
 pub(crate) fn emulate_sensitive_op<M: SoftMmuMemory>(
     ctx: &mut SoftCpuContext,
-    cpuid: &dyn GuestCpuidView,
+    cpuid: &dyn CpuidAuthority,
     va: u64,
     resume: u64,
     op: SensitiveOp,
@@ -264,7 +264,7 @@ fn emulate_mov_from_cr(
 
 fn emulate_mov_to_cr(
     ctx: &mut SoftCpuContext,
-    cpuid: &dyn GuestCpuidView,
+    cpuid: &dyn CpuidAuthority,
     va: u64,
     resume: u64,
     cr: u8,
@@ -456,7 +456,7 @@ fn emulate_mov_dr(
 
 fn emulate_rdmsr(
     ctx: &mut SoftCpuContext,
-    cpuid: &dyn GuestCpuidView,
+    cpuid: &dyn CpuidAuthority,
     va: u64,
     resume: u64,
 ) -> Result<u64, X86Exception> {
@@ -477,7 +477,7 @@ fn emulate_rdmsr(
 
 fn emulate_wrmsr(
     ctx: &mut SoftCpuContext,
-    cpuid: &dyn GuestCpuidView,
+    cpuid: &dyn CpuidAuthority,
     va: u64,
     resume: u64,
 ) -> Result<u64, X86Exception> {
@@ -495,7 +495,7 @@ fn emulate_wrmsr(
 
 fn emulate_rdtsc(
     ctx: &mut SoftCpuContext,
-    cpuid: &dyn GuestCpuidView,
+    cpuid: &dyn CpuidAuthority,
     va: u64,
     resume: u64,
 ) -> Result<u64, X86Exception> {
@@ -994,7 +994,7 @@ fn emulate_invlpg(
 
 fn emulate_cpuid(
     ctx: &mut SoftCpuContext,
-    cpuid: &dyn GuestCpuidView,
+    cpuid: &dyn CpuidAuthority,
     resume: u64,
 ) -> Result<u64, X86Exception> {
     let leaf = ctx.gpr[reg::RAX] as u32;
@@ -1039,7 +1039,7 @@ fn emulate_cli_sti(
 
 fn emulate_clac_stac(
     ctx: &mut SoftCpuContext,
-    cpuid: &dyn GuestCpuidView,
+    cpuid: &dyn CpuidAuthority,
     va: u64,
     resume: u64,
     raw: &Instruction,
@@ -1074,7 +1074,7 @@ fn emulate_xgetbv(ctx: &mut SoftCpuContext, va: u64, resume: u64) -> Result<u64,
 
 fn emulate_xsetbv(
     ctx: &mut SoftCpuContext,
-    cpuid: &dyn GuestCpuidView,
+    cpuid: &dyn CpuidAuthority,
     va: u64,
     resume: u64,
 ) -> Result<u64, X86Exception> {

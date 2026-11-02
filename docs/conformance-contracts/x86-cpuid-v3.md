@@ -5,17 +5,15 @@ Intel SDM volume 2A `CPUID` / `XGETBV` specification (order 325383), clean-room
 architectural rules without host kernel or emulator implementation source.
 
 `carrick_x86::GuestCpuidView` defines the single 11-entry `CPUID` and `XCR0 = 0x7`
-(`x87 | SSE | AVX`, 832-byte legacy+header+YMM XSAVE frame) contract shared between
-the KVM lane and the x86 soft-CPU lane (#578, owner decision 3):
+(`x87 | SSE | AVX`, 832-byte legacy+header+YMM XSAVE frame) contract installed on KVM and available for soft-lane adoption (#578):
 
-- **Exact `x86-64-v3` feature set**: `CMOV`, `CX8`, `FPU`, `FXSR`, `MMX`, `SYSCALL`,
+- **`x86-64-v3` feature set plus host-qualified AES-NI, PCLMULQDQ and TSC_DEADLINE**: `CMOV`, `CX8`, `FPU`, `FXSR`, `MMX`, `SYSCALL`,
   `SSE`, `SSE2`, `CX16`, `LAHF_LM`, `POPCNT`, `SSE3`, `SSE4_1`, `SSE4_2`, `SSSE3`,
   `AVX`, `AVX2`, `BMI1`, `BMI2`, `F16C`, `FMA`, `LZCNT`, `MOVBE`, `XSAVE`/`OSXSAVE`,
   plus the IA-32e / CPL0 baseline Carrick programs (`LM`, `NX`, `PGE`, `PAT`, `TSC`,
   `MSR`, `PAE`, `APIC`, `CLFSH`, `SMEP`, `SMAP`, `INVTSC`).
-- **Zero non-v3 or host-identity leakage**: `AVX-512`, `AMX`, `SHA`, `AES`,
-  `PCLMULQDQ`, `RDRAND`, `RDSEED`, `ADX`, `FSGSBASE`, `PKU`, `LA57`, `UMIP`,
-  `XSAVEOPT`/`XSAVEC`/`XSAVES`, `TSC_DEADLINE`, `HYPERVISOR` (`CPUID.01H:ECX[31]`),
+- **No CPUID features outside the pinned profile**: `AVX-512`, `AMX`, `SHA`, `RDRAND`, `RDSEED`, `ADX`, `FSGSBASE`, `PKU`, `LA57`, `UMIP`,
+  `XSAVEOPT`/`XSAVEC`/`XSAVES`, `HYPERVISOR` (`CPUID.01H:ECX[31]`),
   `0x4000_0000..0x4000_ffff` hypervisor leaves, `RDTSCP`, `PDPE1GB`, processor brand
   strings, and AMD SEV leaves are never advertised. Leaf `0x16` is installed as an
   all-zero maximum basic leaf so out-of-range basic, hypervisor, and extended probes
@@ -57,3 +55,39 @@ rebuild, and run both again. This mutation witnesses rejection of an accidental
 feature expansion; it does not claim to reconstruct the pre-implementation
 host-pass-through tree. Run the live target with `CARRICK_REQUIRE_KVM=1` on
 an admitted KVM host under its existing VM-local gate lease.
+
+
+## Scope after independent review
+
+The pinned profile is x86-64-v3 plus host-qualified AES-NI, PCLMULQDQ and
+TSC_DEADLINE (owner decision #231, 2026-11-02). INVTSC is also host-qualified;
+a missing extended leaf clears it. SHA-NI and RDRAND remain off. The table
+uses GenuineIntel / signature 0x306d4 and zero cache leaves.
+
+The isolation claim covers architectural CPUID and XGETBV on KVM. It does
+not cover the synthetic x86 /proc/cpuinfo text, which still advertises extra
+flags. That surface needs a per-VM CPU authority threaded into procfs.
+The soft lane shares CpuidRegs and DEFAULT_TSC_HZ, and CpuidAuthority is
+implemented for GuestCpuidView, but its defaults still differ in XCR0,
+AVX/BMI/FMA, signature and topology. Switching the defaults requires the
+corresponding instruction/state support. These are follow-up slices under
+#578, not acceptance claims of this change.
+
+These follow-up slices belong under #578. Their acceptance must include both
+optional-feature populations rather than assume the host supports every extension.
+
+
+KVM qualifies TSC_DEADLINE through KVM_CAP_TSC_DEADLINE_TIMER, since older
+KVM_GET_SUPPORTED_CPUID implementations omit its bit. The VM installs one
+in-kernel IRQ chip before creating any vCPU; Carrick admits each vCPU as
+RUNNABLE because it supplies entry state without a firmware SIPI sequence.
+The carrier no longer creates a second IRQ chip.
+Authority: [KVM API, local APIC features](https://www.kernel.org/doc/html/latest/virt/kvm/api.html#local-apic-features).
+
+The live CPUID fixture also executes AESENC (zero input gives 0x63636363)
+and PCLMULQDQ (polynomial 3 times 3 gives 5) when host-qualified, arms the
+production CPL0 timer, and checks deadline mode in LAPIC LVT_TIMER when
+KVM reports the capability. To reproduce a missing-extension negative
+control, temporarily set CPUID_1_ECX_OPTIONAL to zero; the independent table
+and live oracles must reject the missing bits. Restore and rebuild before
+using any later verdict.
