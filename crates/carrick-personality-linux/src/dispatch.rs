@@ -304,6 +304,8 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
     fn refused_counters(&self) -> Option<&'a [core::sync::atomic::AtomicU64]> {
         None
     }
+    /// Record caller-class provenance for a refusal already counted by policy.
+    fn record_refusal_caller(&self, _bucket: usize) {}
     fn publish_forward_work(&self, original_argument0: u64) {
         if let Some(task) = self.task_state() {
             // No family ran: after owed work drains the execution owner must
@@ -1129,6 +1131,11 @@ fn finish<'a, C: EntryContext + 'a>(
             |ret| pending.install_result(ret),
         );
         if decision == crate::crossing::HostCrossingDecision::Refused {
+            pending.record_refusal_caller(
+                pending
+                    .crossing_set()
+                    .refusal_bucket(pending.native_number()),
+            );
             if pending.host_work() || pending.return_requires_host_boundary() {
                 if let Some(task) = pending.task_state() {
                     task.orig_arg0
@@ -1241,6 +1248,11 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
                 |ret| pending.install_result(ret),
             );
             if decision == crate::crossing::HostCrossingDecision::Refused {
+                pending.record_refusal_caller(
+                    pending
+                        .crossing_set()
+                        .refusal_bucket(pending.native_number()),
+                );
                 return CompletionRoute::Served;
             }
             pending.record_forwarded(ordinal);

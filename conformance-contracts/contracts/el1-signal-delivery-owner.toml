@@ -1,3 +1,6 @@
+# #1394: additional ABI bookkeeping witness only; existing semantic and
+# work-budget bindings remain authoritative. Census publication reads counters
+# after executor join and does not alter this contract's guest operation.
 # #1153: InotifyNameCache seqlock rebuild and EL1_ABI_LAYOUT_HASH update in
 # shared crates/carrick-el1-abi/src/lib.rs (bound under kernel.el1.inotify and
 # kernel.x86.file-region). Signal-owner semantics and stack budgets are unchanged.
@@ -42,6 +45,7 @@ vm_free = [
   "carrick-signal-linux::fork_reset::tests::*",
   "carrick-signal-linux::tests::single_mask_*",
   "carrick-x86::engine::tests::native_fault_entry_has_no_venue_without_register_changes",
+  "carrick-el1-abi::refusal_census_tests::refusal_snapshot_preserves_caller_populations_without_changing_service_counts",
 ]
 
 embed = [

@@ -1,3 +1,6 @@
+# #1394: additional ABI bookkeeping witness only; existing semantic and
+# work-budget bindings remain authoritative. Census publication reads counters
+# after executor join and does not alter this contract's guest operation.
 # #1028: type physical custody diagnostic reasons; no change to this
 # contract's semantics or work budgets. The host dispatch test
 # physical_custody_reasons_preserve_fatal_codes_and_debug_text checks
@@ -42,6 +45,7 @@ vm_free = [
   "carrick-kernel::kernel::exec::tests::{prepared_cloexec_two_live_tasks_preserve_peer_and_rollback,prepared_cloexec_retains_physical_releases_until_consumed_once}",
   "carrick-kernel::kernel::objects::tests::reserved_pair_refusal_publishes_neither_slot_or_functional_reference",
   "carrick-xtask::el1_image_sysroot::image_build::frame_budget::tests::{fd_inheritance_charges_retained_core_and_storage_frames,fd_retirement_charges_release_callbacks_after_revocation}",
+  "carrick-el1-abi::refusal_census_tests::refusal_snapshot_preserves_caller_populations_without_changing_service_counts",
 ]
 
 [bindings.unresolved]

@@ -531,14 +531,14 @@ pub fn run_native(
 }
 
 #[derive(::core::clone::Clone, ::core::marker::Copy)]
-enum Engine {
+pub(crate) enum Engine {
     Carrick,
     Docker,
     Native,
 }
 
 #[derive(::core::clone::Clone)]
-enum ExecutionCleanup {
+pub(crate) enum ExecutionCleanup {
     Hvf,
     KvmLima(crate::lane::LimaConfig),
     KvmLocal,
@@ -559,7 +559,7 @@ impl ExecutionCleanup {
     }
 }
 
-fn run_one(
+pub(crate) fn run_one(
     mut cmd: Command,
     argv: Vec<String>,
     deadline_budget: CarrickDeadline,

@@ -378,8 +378,18 @@ impl NativeService {
     /// chooses errno or signal. There is no host syscall dispatch fallback.
     pub fn refuse(self) -> Result<carrick_sched_core::WakeEffects, TrapError> {
         let request = self.request();
-        if let carrick_core_abi::service::ServiceOperation::Crossing { ordinal } = request.operation
-        {
+        let ordinal = match request.operation {
+            carrick_core_abi::service::ServiceOperation::Crossing { ordinal } => Some(ordinal),
+            carrick_core_abi::service::ServiceOperation::Exec { payload, .. } => {
+                Some(payload.ordinal())
+            }
+            carrick_core_abi::service::ServiceOperation::HostFile { payload, .. } => {
+                Some(payload.ordinal())
+            }
+            _ => None,
+        };
+        if let Some(ordinal) = ordinal {
+            crate::trap::record_native_venue_refusal(ordinal)?;
             carrick_observability::probes::hvpatch_native_crossing_refused(
                 request.identity.birth.mm.mm().raw(),
                 request.identity.birth.mm.incarnation().get(),
@@ -501,7 +511,14 @@ impl NativeService {
 
     fn refuse_host_file(self) -> Result<carrick_sched_core::WakeEffects, TrapError> {
         let request = self.request();
-        // Name the refused venue operation, above every syscall ordinal.
+        let carrick_core_abi::service::ServiceOperation::HostFile { payload, .. } =
+            request.operation
+        else {
+            return Err(stale());
+        };
+        // The census counts the refused syscall; the probe names the refused
+        // venue operation, above every syscall ordinal.
+        crate::trap::record_native_venue_refusal(payload.ordinal())?;
         let ordinal = self.exec_payload.as_ref().map_or(
             carrick_core_abi::host_file::HOST_FILE_REFUSAL_ORDINAL_BASE,
             |record| carrick_core_abi::host_file::refusal_ordinal(record.bytes()),

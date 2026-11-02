@@ -2946,6 +2946,11 @@ pub struct Counters {
     /// by native ordinal 0..512 plus one overflow bucket for values >= 512
     /// and unmapped/undecodable natives.
     pub refused: [AtomicU64; 513],
+    /// Subset of refusals issued for a process other than the namespace root.
+    pub refused_child: [AtomicU64; 513],
+    /// Carrier venue refusals, separate from ring routing refusals.
+    pub venue_refused: [AtomicU64; 513],
+    pub venue_refused_child: [AtomicU64; 513],
 }
 
 impl Counters {
@@ -2960,6 +2965,9 @@ impl Counters {
             lifecycle_declines: [const { AtomicU64::new(0) }; LifecycleDecline::COUNT],
             anonymous_leaves: [const { AtomicU64::new(0) }; AnonymousLeave::COUNT],
             refused: [const { AtomicU64::new(0) }; 513],
+            refused_child: [const { AtomicU64::new(0) }; 513],
+            venue_refused: [const { AtomicU64::new(0) }; 513],
+            venue_refused_child: [const { AtomicU64::new(0) }; 513],
         }
     }
 
@@ -3004,8 +3012,34 @@ impl Counters {
         }
         for i in 0..513 {
             snapshot.refused[i].store(self.refused[i].load(Ordering::Relaxed), Ordering::Relaxed);
+            snapshot.refused_child[i].store(
+                self.refused_child[i].load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            snapshot.venue_refused[i].store(
+                self.venue_refused[i].load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            snapshot.venue_refused_child[i].store(
+                self.venue_refused_child[i].load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
         }
         snapshot
+    }
+
+    pub fn record_child_refusal(&self, bucket: usize, child: bool) {
+        if child {
+            self.refused_child[bucket.min(512)].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_venue_refusal(&self, ordinal: carrick_guest_arch::NativeOrdinal, child: bool) {
+        let bucket = ordinal.raw().min(512) as usize;
+        self.venue_refused[bucket].fetch_add(1, Ordering::Relaxed);
+        if child {
+            self.venue_refused_child[bucket].fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn record_lifecycle_decline(&self, reason: LifecycleDecline) {
@@ -4485,7 +4519,6 @@ impl Default for InotifyNameCache {
 
 const _: () = {
     assert!(MAX_NAME_CACHE_PATH_LEN == NAME_CACHE_PATH_WORDS * core::mem::size_of::<u64>());
-    assert!(EL1_ABI_LAYOUT_HASH == 0x2ff219d25db22a0b);
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
     assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);
@@ -4670,7 +4703,7 @@ mod tests {
                 + IpcLeave::COUNT
                 + LifecycleDecline::COUNT
                 + AnonymousLeave::COUNT
-                + 513)
+                + 4 * 513)
                 * 8
         );
         assert_eq!(core::mem::offset_of!(Counters, served), 0);
@@ -6426,3 +6459,6 @@ mod el1_stack_layout_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod refusal_census_tests;

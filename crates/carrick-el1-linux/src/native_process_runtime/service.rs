@@ -682,6 +682,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         payload: Box<[u8]>,
         table: Option<[u64; 3]>,
+        ordinal: carrick_guest_arch::NativeOrdinal,
     ) -> Result<NativeResume, NativeProcessError> {
         // The carrier's exec service resolves and checks access with exactly
         // the caller's own cwd and credentials, which the ring seals into
@@ -715,6 +716,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let descriptor = carrick_core_abi::service::ExecPayloadDescriptor::checked(
             carrick_guest_arch::GuestVa::new(payload.as_ptr().addr() as u64),
             carrick_guest_arch::GuestLen::new(payload.len() as u64),
+            ordinal,
         )
         .ok_or(NativeProcessError::Exhausted)?;
         // The staged payload holds every argument: a vfork parent may run.
@@ -764,6 +766,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         resolves_path: bool,
         map: Option<carrick_personality_linux::native_host_file::NativeMapKey>,
         chdir: bool,
+        ordinal: carrick_guest_arch::NativeOrdinal,
     ) -> Result<NativeResume, NativeProcessError> {
         // A path resolves under the caller's own access context (its task
         // row's credentials, umask, cwd and root), carried in the record.
@@ -801,6 +804,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let payload = carrick_core_abi::service::HostFilePayloadDescriptor::checked(
             carrick_guest_arch::GuestVa::new(record.as_ptr().addr() as u64),
             carrick_guest_arch::GuestLen::new(record.len() as u64),
+            ordinal,
         )
         .ok_or(NativeProcessError::Exhausted)?;
         self.begin_service_inner(

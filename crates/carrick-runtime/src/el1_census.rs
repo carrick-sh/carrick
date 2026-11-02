@@ -13,7 +13,8 @@
 //! - `el1_boundaries`: syscalls EL1 served that still returned through the
 //!   host to deliver pending work.
 //!
-//! Enabled by `CARRICK_EL1_CENSUS=<directory>`; the carrier writes
+//! Always enabled unless `CARRICK_EL1_CENSUS=0`. The carrier emits a refusal
+//! evidence record on stderr at teardown. With `CARRICK_EL1_CENSUS=<directory>` it also writes
 //! `<directory>/<CARRICK_RUN_ID or "run">-<pid>.json` at teardown, while the
 //! EL1 region is still mapped. Disabled, each hook costs one relaxed load.
 //! Counts are exact (no sampling); timing uses the per-thread CPU clock.
@@ -42,16 +43,19 @@ static TABLE: Table = Table {
 static DIRECTORY: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
 static STARTED: OnceLock<std::time::Instant> = OnceLock::new();
 static ENABLED: AtomicBool = AtomicBool::new(false);
-static WRITTEN: AtomicBool = AtomicBool::new(false);
 
 /// Read the environment once; later calls are one relaxed load.
 pub fn init_from_env() {
     let directory = DIRECTORY.get_or_init(|| {
         std::env::var_os("CARRICK_EL1_CENSUS")
-            .filter(|value| !value.is_empty())
+            .filter(|value| !value.is_empty() && value != "0")
             .map(std::path::PathBuf::from)
     });
-    ENABLED.store(directory.is_some(), Ordering::Relaxed);
+    let _ = directory;
+    ENABLED.store(
+        std::env::var_os("CARRICK_EL1_CENSUS").as_deref() != Some(std::ffi::OsStr::new("0")),
+        Ordering::Relaxed,
+    );
     let _ = STARTED.get_or_init(std::time::Instant::now);
 }
 
@@ -78,6 +82,9 @@ pub fn enabled() -> bool {
 /// This thread's CPU time in nanoseconds.
 #[inline]
 pub fn thread_cpu_ns() -> u64 {
+    if !DIRECTORY.get().is_some_and(Option::is_some) {
+        return 0;
+    }
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -132,6 +139,8 @@ pub struct CensusRow {
     pub name: String,
     pub el1_served: u64,
     pub el1_forwarded: u64,
+    pub refused: u64,
+    pub venue_refused: u64,
     pub host_services: u64,
     pub host_cpu_ns: u64,
     pub redispatches: u64,
@@ -142,6 +151,7 @@ pub struct CensusRow {
 /// The census of one carrier.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Census {
+    pub refusal_evidence: carrick_spec::syscall_census::RefusalEvidence,
     pub schema: u32,
     pub run_id: Option<String>,
     pub pid: u32,
@@ -160,7 +170,44 @@ pub struct Census {
 }
 
 fn snapshot(run_id: Option<&carrick_kernel::kernel::CarrierScopeId>) -> Census {
-    let counters = crate::read_el1_counters();
+    snapshot_counters(
+        run_id,
+        crate::read_el1_counters().as_ref(),
+        carrick_spec::syscall_census::CensusIsa::Aarch64,
+    )
+}
+
+fn snapshot_counters(
+    run_id: Option<&carrick_kernel::kernel::CarrierScopeId>,
+    counters: Option<&carrick_el1_abi::Counters>,
+    isa: carrick_spec::syscall_census::CensusIsa,
+) -> Census {
+    // Legacy service rows use canonical ordinals. Refusal evidence below is
+    // native-indexed; remap only the diagnostic totals when joining these rows.
+    let mut refused_by_canonical = vec![0u64; SLOTS];
+    let mut venue_by_canonical = vec![0u64; SLOTS];
+    if let Some(counters) = counters {
+        for native in 0..SLOTS {
+            let canonical = match isa {
+                carrick_spec::syscall_census::CensusIsa::Aarch64 => {
+                    Some(carrick_abi::CanonicalNr::new(native as u64))
+                }
+                carrick_spec::syscall_census::CensusIsa::X86_64 => {
+                    carrick_syscall_abi::syscall_x86_64::canonical_x86_64(carrick_abi::NativeNr(
+                        native as u64,
+                    ))
+                }
+            };
+            if let Some(canonical) = canonical
+                .and_then(|nr| usize::try_from(nr.raw()).ok())
+                .filter(|nr| *nr < SLOTS)
+            {
+                refused_by_canonical[canonical] += counters.refused[native].load(Ordering::Relaxed);
+                venue_by_canonical[canonical] +=
+                    counters.venue_refused[native].load(Ordering::Relaxed);
+            }
+        }
+    }
     let mut rows = Vec::new();
     for index in 0..SLOTS {
         let (served, forwarded) = counters.as_ref().map_or((0, 0), |c| {
@@ -175,6 +222,8 @@ fn snapshot(run_id: Option<&carrick_kernel::kernel::CarrierScopeId>) -> Census {
                 .map_or_else(|| format!("nr{index}"), |s| s.name.to_owned()),
             el1_served: served,
             el1_forwarded: forwarded,
+            refused: refused_by_canonical[index],
+            venue_refused: venue_by_canonical[index],
             host_services: TABLE.host_services[index].load(Ordering::Relaxed),
             host_cpu_ns: TABLE.host_cpu_ns[index].load(Ordering::Relaxed),
             redispatches: TABLE.redispatches[index].load(Ordering::Relaxed),
@@ -183,6 +232,8 @@ fn snapshot(run_id: Option<&carrick_kernel::kernel::CarrierScopeId>) -> Census {
         };
         if row.el1_served
             + row.el1_forwarded
+            + row.refused
+            + row.venue_refused
             + row.host_services
             + row.redispatches
             + row.el1_boundaries
@@ -193,7 +244,8 @@ fn snapshot(run_id: Option<&carrick_kernel::kernel::CarrierScopeId>) -> Census {
     }
     let (process_user_ns, process_sys_ns) = process_cpu_ns();
     Census {
-        schema: 1,
+        refusal_evidence: refusal_evidence(counters, isa),
+        schema: 2,
         run_id: run_id.map(|id| id.as_str().to_owned()),
         pid: std::process::id(),
         el1_counters: counters.is_some(),
@@ -206,16 +258,97 @@ fn snapshot(run_id: Option<&carrick_kernel::kernel::CarrierScopeId>) -> Census {
     }
 }
 
+fn refusal_evidence(
+    counters: Option<&carrick_el1_abi::Counters>,
+    isa: carrick_spec::syscall_census::CensusIsa,
+) -> carrick_spec::syscall_census::RefusalEvidence {
+    use carrick_personality_linux::crossing::{AllowedHostCrossing, HostCrossingKind};
+    use carrick_spec::syscall_census::{
+        CallerClass, CensusIsa, RefusalEvidence, RefusalRow, SCHEMA,
+    };
+    let mut evidence = RefusalEvidence {
+        schema: SCHEMA,
+        isa,
+        complete: counters.is_some(),
+        rows: Vec::new(),
+    };
+    let Some(counters) = counters else {
+        return evidence;
+    };
+    for nr in 0..=512 {
+        let refused = counters.refused[nr].load(Ordering::Relaxed);
+        let child = counters.refused_child[nr].load(Ordering::Relaxed);
+        let venue = counters.venue_refused[nr].load(Ordering::Relaxed);
+        let child_venue = counters.venue_refused_child[nr].load(Ordering::Relaxed);
+        if child > refused || child_venue > venue {
+            evidence.complete = false;
+            continue;
+        }
+        let canonical = match isa {
+            CensusIsa::Aarch64 => Some(carrick_abi::CanonicalNr::new(nr as u64)),
+            CensusIsa::X86_64 => carrick_syscall_abi::syscall_x86_64::canonical_x86_64(
+                carrick_abi::NativeNr(nr as u64),
+            ),
+        };
+        let crossing = canonical.and_then(|canonical| match isa {
+            CensusIsa::Aarch64 => AllowedHostCrossing::from_canonical_aarch64(canonical),
+            CensusIsa::X86_64 => AllowedHostCrossing::from_canonical_x86(canonical),
+        });
+        let allowlisted = crossing.is_some_and(|crossing| {
+            matches!(
+                crossing.kind(),
+                Some(HostCrossingKind::Permanent | HostCrossingKind::Temporary)
+            )
+        });
+        for (caller, refused, venue_refused) in [
+            (CallerClass::Root, refused - child, venue - child_venue),
+            (CallerClass::NativeChild, child, child_venue),
+        ] {
+            if refused != 0 || venue_refused != 0 {
+                evidence.rows.push(RefusalRow {
+                    nr: nr as u64,
+                    caller,
+                    refused,
+                    venue_refused,
+                    allowlisted,
+                });
+            }
+        }
+    }
+    evidence
+}
+
 /// Write the census once, at carrier teardown while the EL1 region is still
 /// mapped. A failure to write is reported, never silently dropped.
 pub fn write_at_teardown(run_id: Option<&carrick_kernel::kernel::CarrierScopeId>) {
+    init_from_env();
+    if !enabled() {
+        return;
+    }
+    publish(snapshot(run_id));
+}
+
+/// Publish an ISA's mapped counters before its VM is retired.
+pub fn write_counters_at_teardown(
+    run_id: Option<&carrick_kernel::kernel::CarrierScopeId>,
+    counters: &carrick_el1_abi::Counters,
+    isa: carrick_spec::syscall_census::CensusIsa,
+) {
+    init_from_env();
+    if !enabled() {
+        return;
+    }
+    publish(snapshot_counters(run_id, Some(counters), isa));
+}
+
+fn publish(census: Census) {
+    match serde_json::to_string(&census) {
+        Ok(body) => eprintln!("\n{}{body}", carrick_spec::syscall_census::MARKER),
+        Err(error) => eprintln!("carrick: syscall census serialization failed: {error}"),
+    }
     let Some(Some(directory)) = DIRECTORY.get() else {
         return;
     };
-    if WRITTEN.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    let census = snapshot(run_id);
     let name = format!(
         "{}-{}.json",
         census.run_id.as_deref().unwrap_or("run"),
@@ -242,6 +375,8 @@ pub struct AggregateRow {
     pub name: String,
     pub el1_served: u64,
     pub el1_forwarded: u64,
+    pub refused: u64,
+    pub venue_refused: u64,
     pub host_services: u64,
     pub host_cpu_ns: u64,
     pub redispatches: u64,
@@ -276,7 +411,7 @@ pub fn aggregate(censuses: &[Census]) -> Result<Aggregate, String> {
     }
     let mut by_nr: std::collections::BTreeMap<u64, AggregateRow> = Default::default();
     for census in censuses {
-        if census.schema != 1 {
+        if census.schema != 2 {
             return Err(format!("unknown census schema {}", census.schema));
         }
         for row in &census.rows {
@@ -287,6 +422,8 @@ pub fn aggregate(censuses: &[Census]) -> Result<Aggregate, String> {
             });
             entry.el1_served += row.el1_served;
             entry.el1_forwarded += row.el1_forwarded;
+            entry.refused += row.refused;
+            entry.venue_refused += row.venue_refused;
             entry.host_services += row.host_services;
             entry.host_cpu_ns += row.host_cpu_ns;
             entry.redispatches += row.redispatches;
@@ -333,8 +470,8 @@ pub fn render_table(aggregate: &Aggregate, limit: usize) -> String {
         aggregate.process_cpu_ns as f64 / 1e6,
         aggregate.wall_ns as f64 / 1e6
     );
-    out.push_str("| syscall | nr | host services | host CPU ms | share | redispatches | EL1 served | EL1 forwarded | EL1 boundaries |\n");
-    out.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+    out.push_str("| syscall | nr | host services | host CPU ms | share | redispatches | EL1 served | EL1 forwarded | EL1 boundaries | refused | venue refused |\n");
+    out.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
     for row in aggregate.rows.iter().take(limit) {
         let share = if aggregate.host_total_ns == 0 {
             0.0
@@ -342,7 +479,7 @@ pub fn render_table(aggregate: &Aggregate, limit: usize) -> String {
             row.host_total_ns() as f64 * 100.0 / aggregate.host_total_ns as f64
         };
         out.push_str(&format!(
-            "| {} | {} | {} | {:.1} | {:.1}% | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {:.1} | {:.1}% | {} | {} | {} | {} | {} | {} |\n",
             row.name,
             row.nr,
             row.host_services,
@@ -351,7 +488,9 @@ pub fn render_table(aggregate: &Aggregate, limit: usize) -> String {
             row.redispatches,
             row.el1_served,
             row.el1_forwarded,
-            row.el1_boundaries
+            row.el1_boundaries,
+            row.refused,
+            row.venue_refused
         ));
     }
     out
@@ -412,6 +551,8 @@ mod tests {
             name: format!("s{nr}"),
             el1_served: 0,
             el1_forwarded: services,
+            refused: 0,
+            venue_refused: 0,
             host_services: services,
             host_cpu_ns: cpu,
             redispatches: 0,
@@ -422,7 +563,11 @@ mod tests {
 
     fn census(rows: Vec<CensusRow>) -> Census {
         Census {
-            schema: 1,
+            refusal_evidence: refusal_evidence(
+                None,
+                carrick_spec::syscall_census::CensusIsa::Aarch64,
+            ),
+            schema: 2,
             run_id: None,
             pid: 1,
             el1_counters: true,
@@ -431,6 +576,47 @@ mod tests {
             wall_ns: 30_000,
             rows,
         }
+    }
+
+    #[test]
+    fn mapped_refused_child_mkdirat_reaches_the_shared_gate() {
+        use carrick_spec::syscall_census::{CallerClass, CensusIsa};
+        let counters = carrick_el1_abi::Counters::new();
+        counters.refused[34].store(1, Ordering::Relaxed);
+        counters.record_child_refusal(34, true);
+        counters.record_venue_refusal(carrick_guest_arch::NativeOrdinal::new(34), true);
+        let snapshot = snapshot_counters(None, Some(&counters), CensusIsa::Aarch64);
+        assert!(snapshot.refusal_evidence.complete);
+        assert_eq!(snapshot.refusal_evidence.rows.len(), 1);
+        assert_eq!(
+            snapshot.refusal_evidence.rows[0].caller,
+            CallerClass::NativeChild
+        );
+        let log = format!(
+            "{}{}",
+            carrick_spec::syscall_census::MARKER,
+            serde_json::to_string(&snapshot).unwrap()
+        );
+        assert!(
+            carrick_spec::syscall_census::check_log(&log, None)
+                .unwrap_err()
+                .contains("allowlisted")
+        );
+        let empty = carrick_el1_abi::Counters::new();
+        let next = snapshot_counters(None, Some(&empty), CensusIsa::X86_64);
+        assert!(next.refusal_evidence.rows.is_empty());
+        assert!(next.refusal_evidence.check(None).is_ok());
+    }
+
+    #[test]
+    fn refused_child_mkdirat_survives_census_transport() {
+        let mut value = serde_json::to_value(row(34, 0, 0)).unwrap();
+        value["refused"] = serde_json::json!(1);
+        value["venue_refused"] = serde_json::json!(2);
+        let transported: CensusRow = serde_json::from_value(value).unwrap();
+        let encoded = serde_json::to_value(transported).unwrap();
+        assert_eq!(encoded["refused"], 1);
+        assert_eq!(encoded["venue_refused"], 2);
     }
 
     #[test]
@@ -462,7 +648,7 @@ mod tests {
         assert!(aggregate(&[]).is_err());
         assert!(aggregate(&[census(vec![])]).is_err());
         let mut odd = census(vec![row(1, 1, 1)]);
-        odd.schema = 2;
+        odd.schema = 3;
         assert!(aggregate(&[odd]).is_err());
     }
 }

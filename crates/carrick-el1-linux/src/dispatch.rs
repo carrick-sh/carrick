@@ -1106,6 +1106,7 @@ fn refuse_traced_native_exec(
     }
     let nr = frame.x[8] as usize;
     counters.refused[nr].fetch_add(1, Ordering::Relaxed);
+    counters.record_child_refusal(nr, task.visible_pid().is_some_and(|pid| pid != 1));
     counters.served[nr].fetch_add(1, Ordering::Relaxed);
     frame.x[0] = carrick_syscall_abi::LINUX_EPERM.guest_retval() as u64;
     true
@@ -1236,6 +1237,10 @@ fn arm_native_service_exit(
                     let nr = frame.x[8] as usize;
                     if nr < 512 {
                         counters.refused[nr].fetch_add(1, Ordering::Relaxed);
+                        counters.record_child_refusal(
+                            nr,
+                            task.visible_pid().is_some_and(|pid| pid != 1),
+                        );
                         counters.served[nr].fetch_add(1, Ordering::Relaxed);
                     }
                     NativeServiceStage::Return(carrick_syscall_abi::LINUX_ENOSYS.guest_retval())
@@ -1339,7 +1344,7 @@ fn arm_native_service_exit(
                     // table-map update must not read as "no table" (ENOSYS).
                     let table = ipc::guest_venue(frame.slot as u32)
                         .and_then(|venue| ipc::native_exec_table(venue.tables, task));
-                    process.begin_exec_service(payload, table)
+                    process.begin_exec_service(payload, table, carrick_guest_arch::NativeOrdinal::new(frame.x[8]))
                 }
             } else if let Some(staged) = host_file {
                 if service_wait.is_some() {
@@ -1352,7 +1357,7 @@ fn arm_native_service_exit(
                         map,
                         chdir,
                     } = *staged;
-                    process.begin_host_file_service(record, output, resolves_path, map, chdir)
+                    process.begin_host_file_service(record, output, resolves_path, map, chdir, carrick_guest_arch::NativeOrdinal::new(frame.x[8]))
                 }
             } else if retry_exec_stage {
                 match operation {
@@ -2763,6 +2768,13 @@ impl<
     fn refused_counters(&self) -> Option<&'a [core::sync::atomic::AtomicU64]> {
         Some(&self.counters.refused)
     }
+    fn record_refusal_caller(&self, bucket: usize) {
+        self.counters.record_child_refusal(
+            bucket,
+            self.task()
+                .is_some_and(|task| task.visible_pid().is_some_and(|pid| pid != 1)),
+        );
+    }
     fn lifecycle_native(
         &mut self,
     ) -> Option<&mut dyn carrick_personality_linux::lifecycle::LifecycleNative<'a>> {
@@ -3028,6 +3040,8 @@ impl<
             memory::DelegatedAnonymous::Forward if file.is_some() => {
                 let nr = carrick_personality_linux::native_host_file::LINUX_NR_MMAP.raw() as usize;
                 self.counters.refused[nr].fetch_add(1, Ordering::Relaxed);
+                self.counters
+                    .record_child_refusal(nr, task.visible_pid().is_some_and(|pid| pid != 1));
                 self.counters.served[nr].fetch_add(1, Ordering::Relaxed);
                 DelegatedStep::Served(SyscallResult::new(
                     carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),

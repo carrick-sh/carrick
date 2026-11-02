@@ -1,3 +1,6 @@
+# #1394: additional ABI bookkeeping witness only; existing semantic and
+# work-budget bindings remain authoritative. Census publication reads counters
+# after executor join and does not alter this contract's guest operation.
 schema_version = 1
 id = "kernel.vcpu.shutdown-entry"
 title = "Carrier shutdown remains visible across every physical vCPU entry"
@@ -55,6 +58,7 @@ vm_free = [
   "carrick-runtime::vcpu_loop::threads::child_tid_owner_tests::serial_host_last_sibling_clear_drain_leaves_retirement_to_terminal_owner",
   "carrick-runtime::vcpu_loop::threads::child_tid_owner_tests::serial_host_last_sibling_clear_drain_preserves_displaced_owner_clear",
   "carrick-sched-core::loom_models::concurrent_group_exit_keeps_direct_load_terminal_intent_before_release",
+  "carrick-el1-abi::refusal_census_tests::refusal_snapshot_preserves_caller_populations_without_changing_service_counts",
 ]
 embed = [
   "carrick-vmm-hvf::trap_engine_hvf::shutdown_kick::trap_engine_hvf_shutdown_kick_before_entry",

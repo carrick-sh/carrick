@@ -826,7 +826,7 @@ impl Personality for LinuxPersonality {
     fn handle_unrecognized_call(
         &mut self,
         frame: &mut NativeFrame,
-        _task: &CurrentTask,
+        task: &CurrentTask,
         _binding: &CpuBinding,
         counters: &Counters,
     ) {
@@ -838,6 +838,7 @@ impl Personality for LinuxPersonality {
             Some(&counters.refused),
             |ret| frame.rax = ret.raw() as u64,
         );
+        counters.record_child_refusal(512, task.visible_pid().is_some_and(|pid| pid != 1));
     }
 
     fn dispatch(
@@ -1021,6 +1022,10 @@ impl Personality for LinuxPersonality {
             // The x86 router never selects the ARM native-exec service; fail
             // closed with a counted-unrouted errno rather than forwarding.
             CompletionRoute::NativeService => {
+                let bucket = (call.native.raw().min(512)) as usize;
+                counters.refused[bucket].fetch_add(1, Ordering::Relaxed);
+                counters
+                    .record_child_refusal(bucket, task.visible_pid().is_some_and(|pid| pid != 1));
                 frame.rax = carrick_syscall_abi::LINUX_ENOSYS.guest_retval() as u64;
                 ControlFlow::Return(())
             }

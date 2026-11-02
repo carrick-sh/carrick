@@ -3049,7 +3049,7 @@ fn arm_host_born_fault_waiter_cancels_cleanly_on_exit_group_kill_and_sibling_exe
                         &mut service,
                         |entry| {
                             entry.give_fixture_root_a_cwd();
-                            let res = entry.begin_exec_service(payload.into_boxed_slice(), None);
+                            let res = entry.begin_exec_service(payload.into_boxed_slice(), None, carrick_guest_arch::NativeOrdinal::new(221));
                             assert!(entry.take_handoff_receipt().is_some());
                             res
                         },

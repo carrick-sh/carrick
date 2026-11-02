@@ -1012,6 +1012,24 @@ pub(crate) fn el1_irqs_taken(intid: u32) -> u64 {
         .map_or(0, |taken| taken.load(std::sync::atomic::Ordering::Relaxed))
 }
 
+/// The retained native ticket keeps this carrier's counters mapped until the
+/// refusal is acknowledged and all native work has joined at teardown.
+pub(crate) fn record_native_venue_refusal(
+    ordinal: carrick_guest_arch::NativeOrdinal,
+) -> Result<(), TrapError> {
+    let ptr = EL1_COUNTERS_HOST_PTR.load(std::sync::atomic::Ordering::Acquire);
+    if ptr == 0 {
+        return Err(TrapError::NativeRunFailure {
+            reason: "native refusal without live census counters",
+            crossings: 1,
+        });
+    }
+    // SAFETY: called with a live retained native service ticket, before teardown.
+    let counters = unsafe { &*(ptr as *const carrick_el1_abi::Counters) };
+    counters.record_venue_refusal(ordinal, true);
+    Ok(())
+}
+
 pub fn read_el1_counters() -> Option<carrick_el1_abi::Counters> {
     let ptr = EL1_COUNTERS_HOST_PTR.load(std::sync::atomic::Ordering::Acquire);
     if ptr != 0 {
