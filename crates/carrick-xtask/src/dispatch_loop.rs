@@ -719,7 +719,7 @@ fn worker_review(review: &Value, inline: &[Value], notes: &str) -> String {
 /// The launcher's capacity JSON is a `backends` map (capacity_report), not
 /// a list of tiers. Augment it with its live `models` roster: quota group
 /// descriptions are prose, not an allowlist of executable model IDs.
-fn capacity_command(actor: &Path, args: &[&str]) -> Command {
+fn capacity_command(actor: &Path, sqlite_home: &Path, args: &[&str]) -> Command {
     let mut command = Command::new("python3");
     private_environment(&mut command);
     command
@@ -730,6 +730,8 @@ fn capacity_command(actor: &Path, args: &[&str]) -> Command {
         .args(args)
         .env("HOME", actor.join("home"))
         .env("CODEX_HOME", actor.join("home/.codex"))
+        // Its own SQLite home, as a worker's (`codex_sqlite_home`).
+        .env("CODEX_SQLITE_HOME", sqlite_home)
         .env("AGY_BIN", actor.join("bin/agy"))
         .env("AGY_DIRECTOR_CODEX_VENV", CODEX_SDK_VENV)
         .env("AGY_CLI_DISABLE_AUTO_UPDATE", "1")
@@ -747,13 +749,14 @@ fn capacity_command(actor: &Path, args: &[&str]) -> Command {
 /// subcommand's own failure, which a caller may confine to one backend.
 fn capacity_output(
     actor: &Path,
+    sqlite_home: &Path,
     args: &[&str],
     deadline: Instant,
 ) -> Result<Result<String, String>, ScalerError> {
     let logs = tempfile::tempdir()?;
     let stdout = logs.path().join("out");
     let stderr = logs.path().join("err");
-    let mut command = capacity_command(actor, args);
+    let mut command = capacity_command(actor, sqlite_home, args);
     command
         .stdout(std::fs::File::create(&stdout)?)
         .stderr(std::fs::File::create(&stderr)?);
@@ -852,8 +855,12 @@ fn read_capacity(deadline: Instant) -> Result<Value, ScalerError> {
         )?;
     }
     hand_over(&actor)?;
+    // Removed when this probe returns, after `capacity_output` retired the
+    // agent account and with it every probe app-server.
+    let sqlite = codex_sqlite_home(Path::new(CODEX_SQLITE_ROOT), Some(AGENT_USER))?;
     let raw: Value = serde_json::from_str(
-        &capacity_output(&actor, &["capacity", "--json"], deadline)?.map_err(ScalerError::Usage)?,
+        &capacity_output(&actor, sqlite.path(), &["capacity", "--json"], deadline)?
+            .map_err(ScalerError::Usage)?,
     )?;
     let backends = raw["backends"]
         .as_object()
@@ -873,7 +880,13 @@ fn read_capacity(deadline: Instant) -> Result<Value, ScalerError> {
         // capacity (#1456): a backend without a live roster lists no
         // models, so `available_worker` refuses only that backend.
         let listed = if installed {
-            capacity_output(&actor, &["models", "--backend", backend], deadline)?.ok()
+            capacity_output(
+                &actor,
+                sqlite.path(),
+                &["models", "--backend", backend],
+                deadline,
+            )?
+            .ok()
         } else {
             None
         };
@@ -8383,8 +8396,9 @@ exec /usr/bin/git "$@"
             )
             .unwrap();
         let state = root.path().join("agent");
+        let sqlite = root.path().join("sqlite");
         let mut command = Command::new("python3");
-        worker_environment(&mut command, &state, &server.dispatch.worker).unwrap();
+        worker_environment(&mut command, &state, &server.dispatch.worker, Some(&sqlite)).unwrap();
         let env = |key: &str| {
             command
                 .get_envs()
@@ -8404,15 +8418,113 @@ exec /usr/bin/git "$@"
         // rather than launched into the two-app-server shape.
         let mut stale = server.dispatch.worker.clone();
         stale.roster.clear();
-        assert!(worker_environment(&mut Command::new("python3"), &state, &stale).is_err());
+        assert!(
+            worker_environment(&mut Command::new("python3"), &state, &stale, Some(&sqlite))
+                .is_err()
+        );
+        // A codex worker without its private SQLite home is refused too (#1464).
+        assert!(
+            worker_environment(
+                &mut Command::new("python3"),
+                &state,
+                &server.dispatch.worker,
+                None
+            )
+            .is_err()
+        );
         // An agy worker has no codex roster to carry.
         let mut agy = Command::new("python3");
         let worker = Worker {
             backend: "agy".into(),
             ..Worker::default()
         };
-        worker_environment(&mut agy, &state, &worker).unwrap();
+        worker_environment(&mut agy, &state, &worker, None).unwrap();
         assert!(agy.get_envs().all(|(name, _)| name != "CODEX_MODELS"));
+    }
+    /// Where Codex 0.163 opens its state databases for a launch environment:
+    /// `CODEX_SQLITE_HOME` when set, otherwise `CODEX_HOME`.
+    fn codex_state_databases(command: &Command) -> PathBuf {
+        let env = |key: &str| {
+            command
+                .get_envs()
+                .find(|(name, _)| *name == key)
+                .and_then(|(_, value)| value.map(PathBuf::from))
+        };
+        env("CODEX_SQLITE_HOME")
+            .or_else(|| env("CODEX_HOME"))
+            .unwrap()
+    }
+    /// #1464 (runs 41527870944, 41529626677, 41529708465): the turn's
+    /// app-server died with "failed to initialize sqlite state runtime"
+    /// before its first turn. Its state databases lived in the actor's
+    /// `CODEX_HOME`, on the filesystem `hand_over` had just filled with GBs.
+    /// Whatever that home holds (here a probe-shaped leftover: a
+    /// half-created database, its WAL and a held lock), each codex launch
+    /// opens its databases in a fresh, empty home of its own on the memory
+    /// filesystem, outside the actor tree.
+    #[test]
+    fn codex_worker_state_databases_start_in_a_private_empty_home() {
+        use std::os::unix::io::AsRawFd;
+        let root = tempfile::tempdir().unwrap();
+        let mut server = server(root.path());
+        let mut capacity = live_capacity();
+        capacity["backends"]["codex"]["models"] = json!(["gpt-6.1-sol"]);
+        server
+            .admit_worker(
+                &Notes {
+                    notes: "Sol has free capacity".into(),
+                    backend: "codex".into(),
+                    model: "gpt-6.1-sol".into(),
+                },
+                &capacity,
+            )
+            .unwrap();
+        let state = root.path().join("agent");
+        let codex_home = state.join("home/.codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::write(codex_home.join("state_5.sqlite"), b"SQLite format 3\0").unwrap();
+        std::fs::write(codex_home.join("state_5.sqlite-wal"), b"partial").unwrap();
+        let held = std::fs::File::open(codex_home.join("state_5.sqlite")).unwrap();
+        // SAFETY: flock on an open descriptor this test owns.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+        // The production root is a memory filesystem the test host may lack.
+        let memory = root.path().join("memory");
+        std::fs::create_dir(&memory).unwrap();
+        let mut homes = Vec::new();
+        for _ in 0..2 {
+            let sqlite = codex_sqlite_home(&memory, None).unwrap();
+            let mut command = Command::new("python3");
+            worker_environment(
+                &mut command,
+                &state,
+                &server.dispatch.worker,
+                Some(sqlite.path()),
+            )
+            .unwrap();
+            let databases = codex_state_databases(&command);
+            assert!(
+                !databases.starts_with(&state),
+                "codex state databases open inside the actor tree: {}",
+                databases.display()
+            );
+            assert!(databases.starts_with(&memory));
+            assert_eq!(std::fs::read_dir(&databases).unwrap().count(), 0);
+            homes.push((databases, sqlite));
+        }
+        assert_ne!(homes[0].0, homes[1].0, "two launches shared a SQLite home");
+        assert_eq!(CODEX_SQLITE_ROOT, "/dev/shm");
+        #[cfg(target_os = "linux")]
+        {
+            let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap();
+            assert!(
+                mounts.lines().any(|line| {
+                    let mut fields = line.split_whitespace().skip(1);
+                    fields.next() == Some(CODEX_SQLITE_ROOT) && fields.next() == Some("tmpfs")
+                }),
+                "{CODEX_SQLITE_ROOT} is not a tmpfs mount"
+            );
+        }
+        drop(held);
     }
     #[test]
     fn unavailable_or_exhausted_capacity_is_refused_without_any_charge() {
@@ -8482,13 +8594,23 @@ exec /usr/bin/git "$@"
     }
     #[test]
     fn capacity_command_runs_only_as_worker_without_runner_credentials() {
-        let command = capacity_command(Path::new("/private/actor"), &["capacity", "--json"]);
+        let command = capacity_command(
+            Path::new("/private/actor"),
+            Path::new("/dev/shm/probe-sqlite"),
+            &["capacity", "--json"],
+        );
         let args: Vec<_> = command
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert!(args.windows(3).any(|a| a == ["-u", AGENT_USER, "--"]));
         assert!(args.windows(2).any(|a| a == ["capacity", "--json"]));
+        // The probe's app-servers open their state databases in the
+        // probe's own SQLite home, never a worker's (#1464).
+        assert!(
+            args.iter()
+                .any(|a| a == "CODEX_SQLITE_HOME=/dev/shm/probe-sqlite")
+        );
         for key in [
             "GH_TOKEN",
             "DISPATCH_BOARD_TOKEN",
