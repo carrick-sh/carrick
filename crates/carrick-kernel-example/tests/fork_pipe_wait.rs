@@ -13,6 +13,44 @@ use carrick_kernel_example::{
     last_child, slot, sys, tagged_out,
 };
 
+/// Diagnostic reduction for #1399, not a shell implementation claim: the
+/// subshell creates, fills and closes its own pipe, redirects it to stdin,
+/// then reads one byte at a time until EOF while its parent remains alive.
+/// No writer task exits, and the parent has never created a pipe.
+#[test]
+fn subshell_local_pipe_redirect_reads_bytes_then_eof_without_writer_exit() {
+    let run = ScriptedBackend::new()
+        .run_root(vec![
+            Step::Sys(sys::fork()),
+            Step::ChildMarker(vec![
+                Step::Sys(
+                    sys::pipe2(0)
+                        .ret(0)
+                        .save_out_i32(0, 0, 0)
+                        .save_out_i32(0, 1, 1),
+                ),
+                Step::Sys(sys::write(slot(1), b"a\n").ret(2)),
+                Step::Sys(sys::close(slot(1)).ret(0)),
+                Step::Sys(sys::dup3(slot(0), 0, 0).ret(0)),
+                Step::Sys(sys::close(slot(0)).ret(0)),
+                Step::Sys(sys::read_tagged(0, 1, "letter").ret(1)),
+                Step::Sys(sys::read_tagged(0, 1, "newline").ret(1)),
+                Step::Sys(sys::read_tagged(0, 1, "eof").ret(0)),
+                Step::Sys(sys::close(0).ret(0)),
+                Step::Sys(sys::exit_group(0)),
+            ]),
+            Step::Sys(sys::wait4(last_child(), 0)),
+            Step::Sys(sys::exit_group(0)),
+        ])
+        .expect("subshell-local pipe must complete within the backend wait bound");
+    assert_eq!(run.exit_code(), 0);
+    assert_eq!(run.tasks_started(), 2);
+    assert_eq!(run.output_tagged("letter"), b"a");
+    assert_eq!(run.output_tagged("newline"), b"\n");
+    assert_eq!(run.output("wait4")[..4], 0i32.to_le_bytes());
+    assert_eq!(run.dispatches_for_pid(2, "read"), 3);
+}
+
 #[test]
 fn fork_pipe_wait_through_the_public_surface() {
     let script = vec![
