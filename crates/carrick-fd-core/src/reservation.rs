@@ -127,12 +127,13 @@ impl<B: SlotBacking, W: LockWait, const T: usize> Authority<'_, B, W, T> {
             if !t.storage.reserved(fd) {
                 return Err(Error::InvalidArgument);
             }
+            let covered = self.cover(fd)?;
             // Retain before touching the target. A refusal leaves both its
             // old description and the numeric claim unchanged.
             self.retain(pin.key.index, REF)?;
             let old = t.storage.get(fd);
             t.storage.install(
-                self.cover(fd),
+                covered,
                 Entry {
                     ofd: pin.key.index,
                     cloexec,
@@ -163,10 +164,11 @@ impl<B: SlotBacking, W: LockWait, const T: usize> Authority<'_, B, W, T> {
             if !t.storage.reserved(fd) {
                 return Err(Error::InvalidArgument);
             }
+            let covered = self.cover(fd)?;
             self.retain(pin.key.index, REF)?;
             let old = t.storage.get(fd);
             t.storage.install(
-                self.cover(fd),
+                covered,
                 Entry {
                     ofd: pin.key.index,
                     cloexec,

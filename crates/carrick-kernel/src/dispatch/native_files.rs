@@ -567,8 +567,18 @@ mod tests {
     /// The root's published namespace (implicit stdio plus a regular host
     /// file at fd 3), as a native fork child inherits it.
     fn fixture_with(dispatcher: SyscallDispatcher, rootfs: Option<tempfile::TempDir>) -> Fixture {
+        fixture_with_owner(dispatcher, rootfs, |_| {
+            Arc::new(HostIpc::new(1 << 20).unwrap())
+        })
+    }
+
+    fn fixture_with_owner(
+        dispatcher: SyscallDispatcher,
+        rootfs: Option<tempfile::TempDir>,
+        owner: impl FnOnce(&crate::kernel::KernelContext) -> Arc<HostIpc>,
+    ) -> Fixture {
         let context = dispatcher.capture_one_task_context().unwrap();
-        let owner = Arc::new(HostIpc::new(1 << 20).unwrap());
+        let owner = owner(&context);
         let files = context.resources().files();
         let ids = ObjectIdRegistry::new();
         let regular = Arc::new(FileDescription::regular(ids.file_description_id().unwrap()));
@@ -746,6 +756,60 @@ mod tests {
         );
         assert_eq!(fixture.serve(None, &mut open), Err(NativeHostFileRefusal));
         assert_eq!(host_file::reply(&open), None);
+    }
+
+    /// The carrier's descriptor-ceiling word, as the EL1 vector reads it.
+    #[derive(Debug, Default)]
+    struct CeilingWord(std::sync::atomic::AtomicU32);
+    impl carrick_hal::FdCeilingPublisher for CeilingWord {
+        fn raise(&self, maximum: u32) {
+            self.0
+                .fetch_max(maximum, std::sync::atomic::Ordering::AcqRel);
+        }
+        fn disable(&self) {}
+    }
+
+    /// #1398 review. A native child's venue `openat` installs its new
+    /// descriptor from the carrier (`NativeOpenSink` ->
+    /// `HostIpc::install_host_description`), never through a host FileTable.
+    /// With the kernel's own IPC authority, as production builds it, every
+    /// such number must be at or below the carrier word the EL1 vector's
+    /// close/fstat fast return compares against before it is visible.
+    #[test]
+    fn native_openat_raises_the_kernel_descriptor_ceiling_before_install() {
+        let lower = rootfs();
+        let rootfs = carrick_vfs::rootfs::RootFs::from_immutable_host_dir(lower.path()).unwrap();
+        let word = Arc::new(CeilingWord::default());
+        let published = Arc::clone(&word);
+        let fixture = fixture_with_owner(
+            SyscallDispatcher::with_rootfs(rootfs),
+            Some(lower),
+            move |context| {
+                let kernel = context.kernel();
+                kernel.fd_ceiling().register(published);
+                kernel.ipc().unwrap()
+            },
+        );
+        let ceiling = || word.0.load(std::sync::atomic::Ordering::Acquire);
+        assert_eq!(ceiling(), 3, "the root's FileTable published fd 3");
+        let authority = authority_of(&fixture.dispatcher);
+        for expected in 4..9 {
+            let open = record(
+                fixture.table,
+                HostFileOp::Openat,
+                FDCWD,
+                [0; 4],
+                b"/lib/libc.so.6",
+                0,
+            );
+            let (fd, _) = fixture.result(Some(&authority), open);
+            assert_eq!(fd, expected);
+            assert!(
+                i64::from(ceiling()) >= fd,
+                "native openat fd {fd} is live above the vector's ceiling {}",
+                ceiling()
+            );
+        }
     }
 
     /// The loader's sequence: access, open through the usrmerge symlink,

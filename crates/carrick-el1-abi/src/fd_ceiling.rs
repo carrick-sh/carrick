@@ -6,10 +6,14 @@
 //! strictly above the 32-bit word at [`EL1_FD_CEILING_CONTROL_BASE`] while
 //! the carrier gate is enabled (`write_fstat_ceiling_handler` in
 //! `carrick-mem`). That answer is only correct if the word is at least every
-//! descriptor number any table of the carrier has ever held. Host
-//! `FileTable` installs raise it through the kernel's `FdCeilingAuthority`;
-//! a ring-owned native table changes only in ring, so the ring raises the
-//! same word itself, before the new number becomes visible (#1398).
+//! descriptor number any table of the carrier has ever held (#1398).
+//!
+//! Every venue view of the shared descriptor authority carries a
+//! [`DescriptorCeiling`] sink: EL1 raises the word itself
+//! ([`GuestCeilingWord`]); a host view raises it through the kernel's
+//! authority, which owns the carrier publisher. A view without a sink
+//! refuses every install ([`crate::ipc::IpcRegion`]), so no venue can make
+//! a number live above the word by omission.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -25,60 +29,55 @@ pub const EL1_FD_CEILING_OFF_CEILING: u64 = 0;
 /// Offset of the gate word (uninitialized, enabled or permanently disabled).
 pub const EL1_FD_CEILING_OFF_GATE: u64 = 4;
 
-#[cfg(not(target_os = "none"))]
-static HOST_CEILING_WORD: core::sync::atomic::AtomicPtr<AtomicU32> =
-    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
-
-/// Host builds: name the word a VM-free fixture's ring venue raises, standing
-/// in for the guest VA the image reads. Production host venues never install
-/// into a ring-owned table and leave it unset: their installs are
-/// `FileTable` projections the kernel authority has already published.
-#[cfg(not(target_os = "none"))]
-pub fn record_fd_ceiling_host_word(word: &'static AtomicU32) {
-    HOST_CEILING_WORD.store(core::ptr::from_ref(word).cast_mut(), Ordering::Release);
+/// A venue's conservative descriptor ceiling.
+pub trait DescriptorCeiling: Sync {
+    /// Raise the ceiling to at least `fd`, then report whether it now covers
+    /// `fd`. `false` refuses the install. Infallible, lock-free or holding
+    /// only the ceiling's own short lock; must not reenter a descriptor
+    /// table.
+    fn cover(&self, fd: u32) -> bool;
 }
 
-fn ceiling_word() -> Option<&'static AtomicU32> {
-    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-    {
+/// EL1's view: the control-page word at its fixed VA.
+pub struct GuestCeilingWord;
+
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+impl DescriptorCeiling for GuestCeilingWord {
+    fn cover(&self, fd: u32) -> bool {
         // SAFETY: the carrier maps this naturally aligned word for the
         // lifetime of every address space (kernel-only, EL1 read/write), and
         // it is accessed only atomically by EL1 and the host.
-        Some(unsafe {
+        let word = unsafe {
             &*((EL1_FD_CEILING_CONTROL_BASE + EL1_FD_CEILING_OFF_CEILING) as *const AtomicU32)
-        })
-    }
-    #[cfg(all(target_os = "none", not(target_arch = "aarch64")))]
-    {
-        // The x86 CPL0 entry has no ceiling fast return to keep exact.
-        None
-    }
-    #[cfg(not(target_os = "none"))]
-    {
-        let word = HOST_CEILING_WORD.load(Ordering::Acquire);
-        // SAFETY: only `record_fd_ceiling_host_word` stores here, from a
-        // `'static` reference.
-        (!word.is_null()).then(|| unsafe { &*word })
+        };
+        raise_word(word, fd)
     }
 }
 
-/// Raise the carrier-wide descriptor ceiling to at least `fd` before `fd`
-/// becomes visible in a ring-owned table. Monotone, lock-free and O(1);
-/// a number already covered costs one acquire load.
-pub fn cover_guest_descriptor(fd: usize) {
-    let Ok(fd) = u32::try_from(fd) else {
-        return;
-    };
-    let Some(word) = ceiling_word() else {
-        return;
-    };
+/// A carrier whose entry has no ceiling fast reject (x86 CPL0): nothing reads
+/// a ceiling, so every number is covered.
+pub struct NoCeilingReader;
+
+impl DescriptorCeiling for NoCeilingReader {
+    fn cover(&self, _fd: u32) -> bool {
+        true
+    }
+}
+
+/// Monotone raise of one shared word: an acquire load, and `fetch_max` only
+/// when the word is below `fd`. Reports the covering read.
+pub fn raise_word(word: &AtomicU32, fd: u32) -> bool {
     if word.load(Ordering::Acquire) < fd {
         word.fetch_max(fd, Ordering::AcqRel);
     }
+    word.load(Ordering::Acquire) >= fd
 }
 
-/// The ceiling the vector would compare against now (host fixtures only).
-#[cfg(not(target_os = "none"))]
-pub fn fd_ceiling_host_value() -> Option<u32> {
-    ceiling_word().map(|word| word.load(Ordering::Acquire))
-}
+/// The sink the EL1 kernel's own guest-descriptor projections (the legacy
+/// fd_map dup paths) raise. Only the ARM EL1 image has a vector that reads
+/// the word; the x86 CPL0 image and host builds of the kernel crate have none.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+pub static GUEST_DESCRIPTOR_CEILING: GuestCeilingWord = GuestCeilingWord;
+/// See the ARM definition: no ceiling reader exists in this build.
+#[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+pub static GUEST_DESCRIPTOR_CEILING: NoCeilingReader = NoCeilingReader;

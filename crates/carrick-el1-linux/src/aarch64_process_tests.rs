@@ -9662,9 +9662,22 @@ fn activate_target(
 /// above the carrier ceiling word. A live descriptor it would answer is a
 /// descriptor the guest can never close (#1398).
 #[cfg(not(target_os = "macos"))]
-fn vector_fast_path_answers_ebadf(fd: i64) -> bool {
-    let ceiling = carrick_el1_abi::fd_ceiling_host_value().expect("fixture ceiling word");
-    fd >= 0 && fd > i64::from(ceiling)
+fn vector_fast_path_answers_ebadf(ceiling: &CarrierCeilingWord, fd: i64) -> bool {
+    fd >= 0 && fd > i64::from(ceiling.0.load(Ordering::Acquire))
+}
+
+/// The carrier's ceiling word, as the HVF publisher owns it: raised only
+/// through the kernel's `FdCeilingAuthority`, which every host install and
+/// (through the venue's sink) every ring install of this fixture reaches.
+#[cfg(not(target_os = "macos"))]
+#[derive(Debug, Default)]
+struct CarrierCeilingWord(core::sync::atomic::AtomicU32);
+#[cfg(not(target_os = "macos"))]
+impl carrick_hal::FdCeilingPublisher for CarrierCeilingWord {
+    fn raise(&self, maximum: u32) {
+        self.0.fetch_max(maximum, Ordering::AcqRel);
+    }
+    fn disable(&self) {}
 }
 
 // #1398. Production state this fixture models: the carrier-wide descriptor
@@ -9684,11 +9697,11 @@ fn serial_host_native_children_close_descriptors_above_inherited_capacity() {
     use carrick_personality_linux::dispatch::CompletionRoute;
     use std::sync::Arc;
 
-    // The host published the root's descriptors 0..=1 (FdCeilingAuthority
-    // starts at 2); nothing else raises this word but the ring.
-    let ceiling: &'static core::sync::atomic::AtomicU32 =
-        Box::leak(Box::new(core::sync::atomic::AtomicU32::new(2)));
-    carrick_el1_abi::record_fd_ceiling_host_word(ceiling);
+    // The carrier word starts at the authority's maximum 2 and is raised only
+    // through the authority this IPC owner's views are bound to.
+    let ceiling = Arc::new(CarrierCeilingWord::default());
+    let authority = Arc::new(carrick_kernel::kernel::FdCeilingAuthority::new());
+    authority.register(Arc::clone(&ceiling) as Arc<dyn carrick_hal::FdCeilingPublisher>);
 
     let fixture = Fixture::new(0x10000, asid(1));
     let source = BornInZoneSource {
@@ -9709,12 +9722,13 @@ fn serial_host_native_children_close_descriptors_above_inherited_capacity() {
     )
     .unwrap();
     let owner = Arc::new(
-        HostIpc::with_limits(
+        HostIpc::with_ceiling(
             1 << 20,
             IpcLimits {
                 descriptions: carrick_el1_abi::ipc::IPC_OFD_SEGMENT,
                 ..IpcLimits::ZONE
             },
+            Arc::clone(&authority),
         )
         .unwrap(),
     );
@@ -9880,9 +9894,9 @@ fn serial_host_native_children_close_descriptors_above_inherited_capacity() {
     for (idx, fds) in opened.iter().enumerate() {
         for &fd in fds.iter().rev() {
             assert!(
-                !vector_fast_path_answers_ebadf(fd),
+                !vector_fast_path_answers_ebadf(&ceiling, fd),
                 "child {idx} fd {fd} is live above the vector's ceiling {}",
-                ceiling.load(Ordering::Acquire)
+                ceiling.0.load(Ordering::Acquire)
             );
             let (route, ret) = run_in_child(idx, sys_close, fd as u64);
             assert_eq!(ret, 0, "child {idx} close({fd}) errno {}", -ret);
@@ -9895,7 +9909,7 @@ fn serial_host_native_children_close_descriptors_above_inherited_capacity() {
         }
     }
     assert!(
-        vector_fast_path_answers_ebadf(6),
+        vector_fast_path_answers_ebadf(&ceiling, 6),
         "the ceiling stays conservative: no descriptor above it was ever live"
     );
 }

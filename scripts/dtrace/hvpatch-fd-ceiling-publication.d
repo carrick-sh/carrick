@@ -24,8 +24,10 @@
  *     made them return 0. A vector-answered call never enters EL1 dispatch,
  *     so it shows no EL1 counter, no syscall-return and no event here.
  *     Since #1398 the ring raises the same word by fetch_max for numbers a
- *     ring-owned table makes live (`carrick_el1_abi::cover_guest_descriptor`);
- *     those guest-side raises are invisible to this host-side script.
+ *     ring-owned table makes live (`carrick_el1_abi::GuestCeilingWord`), and
+ *     host-side IPC installs (a native child's venue openat) go through the
+ *     kernel authority, so they appear here as host-install events (#1407
+ *     review). The guest-side raises are invisible to this script.
  * (c) Light: one line per publication; host closes are the root's few.
  */
 dtrace:::BEGIN { secs = 0; printf("FDCEIL|begin\n"); }

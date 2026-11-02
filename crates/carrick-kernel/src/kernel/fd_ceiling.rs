@@ -47,6 +47,14 @@ impl FdCeilingAuthority {
         }
     }
 
+    /// Whether every registered publisher's word now covers `fd`: the
+    /// authority's running maximum is at least `fd` (it publishes before it
+    /// records), or the fast reject is permanently disabled.
+    pub fn covers(&self, fd: u32) -> bool {
+        let state = self.state.lock();
+        state.disabled || state.maximum >= fd
+    }
+
     pub fn register(&self, publisher: Arc<dyn FdCeilingPublisher>) {
         let mut state = self.state.lock();
         if state
@@ -72,6 +80,20 @@ impl FdCeilingAuthority {
         for publisher in &state.publishers {
             publisher.disable();
         }
+    }
+}
+
+/// The host venue's ceiling sink: a descriptor the shared authority installs
+/// from the carrier (a native child's venue `openat`, a host-created pipe in a
+/// ring-owned table) raises the same carrier word as a host FileTable install
+/// (#1398).
+impl carrick_el1_abi::DescriptorCeiling for FdCeilingAuthority {
+    fn cover(&self, fd: u32) -> bool {
+        let Ok(number) = i32::try_from(fd) else {
+            return false;
+        };
+        self.publish(number);
+        self.covers(fd)
     }
 }
 

@@ -118,6 +118,14 @@ fn is_closed_stdio_tombstone(fd_map: &[FdMapSlot], file_table: u64, fd: i32) -> 
     (0..=2).contains(&fd) && tombstone_index(fd_map, file_table, fd).is_some()
 }
 
+/// Raise the carrier's descriptor ceiling for a number this ring makes live
+/// without any host FileTable (#1398); `false` refuses the projection.
+fn cover_in_ring(fd: i32) -> bool {
+    u32::try_from(fd).is_ok_and(|fd| {
+        carrick_el1_abi::DescriptorCeiling::cover(&carrick_el1_abi::GUEST_DESCRIPTOR_CEILING, fd)
+    })
+}
+
 /// Remove one guest descriptor; only the last reference yields a host-object
 /// release obligation. The host never owns the guest descriptor number.
 pub fn close_host_binding(
@@ -170,7 +178,7 @@ pub fn dup2_host_binding(
     new_fd: i32,
     cloexec: bool,
 ) -> Option<GuestDescriptorChange> {
-    if !(0..GUEST_FD_LIMIT).contains(&new_fd) {
+    if !(0..GUEST_FD_LIMIT).contains(&new_fd) || !cover_in_ring(new_fd) {
         return None;
     }
     let _guard = lock_fd_map(fd_map);
@@ -242,8 +250,6 @@ pub fn dup2_host_binding(
             }
         }
     };
-    // An in-ring number no host FileTable published (#1398).
-    carrick_el1_abi::cover_guest_descriptor(new_fd as usize);
     slot.set_with_flags(
         file_table,
         new_fd as u32,
@@ -406,6 +412,9 @@ pub fn dup_host_binding(
     }
     let incarnation = fd_map[source_index].incarnation.load(Ordering::Acquire);
     let new_fd = (min_fd..max_fd).find(|fd| fd_map_lookup(fd_map, file_table, *fd).is_none())?;
+    if !cover_in_ring(new_fd) {
+        return None;
+    }
     let tombstone = tombstone_index(fd_map, file_table, new_fd);
     let candidate = tombstone.map(|index| &fd_map[index]).or_else(|| {
         fd_map
@@ -434,8 +443,6 @@ pub fn dup_host_binding(
         return None;
     }
     let slot = candidate;
-    // An in-ring number no host FileTable published (#1398).
-    carrick_el1_abi::cover_guest_descriptor(new_fd as usize);
     slot.set_with_flags(
         file_table,
         new_fd as u32,
