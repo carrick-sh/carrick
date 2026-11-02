@@ -1148,10 +1148,15 @@ pub fn drain_to_host(slot: SlotId) {
 /// until [`come_back_to_slot`] (`ZoneTables::step_away`). Captured service
 /// work returns to its host run queue, where an executor
 /// borrowing the lent CPU can claim it.
-pub fn step_away_from_slot(slot: SlotId, driver: u64) {
+///
+/// Refused when the slot still holds a ring-owned occupancy word
+/// ([`SlotLeaveRefusal::RingOccupant`]): the stopped vCPU would hold that
+/// address space for the whole host wait, invisibly to every pause (#1100).
+pub fn step_away_from_slot(slot: SlotId, driver: u64) -> Result<(), SlotLeaveRefusal> {
     let Some(zone) = zone() else {
-        return;
+        return Ok(());
     };
+    refuse_ring_occupant(zone, slot, driver)?;
     #[cfg(all(feature = "test-support", feature = "deferred-capture-test-control"))]
     deferred_capture_control::release_at_step_away(zone, slot, driver);
     let mut records = Vec::new();
@@ -1171,6 +1176,39 @@ pub fn step_away_from_slot(slot: SlotId, driver: u64) {
             &mut capture_handbacks,
         );
     }
+    Ok(())
+}
+
+/// Why an executor may not stop driving (or step away from) its zone slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum SlotLeaveRefusal {
+    /// The slot still has a switched record, another executor drives it,
+    /// or its vCPU is running (`ZoneTables::leave_slot`).
+    #[error("slot {slot:?} retains a switched record, another driver, or a running vCPU")]
+    Retained { slot: SlotId },
+    /// The stopped vCPU's slot still names `space` with no host task loaded:
+    /// an EL1 exit left a ring-owned word behind (#1100). A broken invariant.
+    #[error("slot {slot:?} still names ring-installed address space {space} out of the guest")]
+    RingOccupant { slot: SlotId, space: u64 },
+}
+
+/// The leaving driver's slot may not keep a ring-owned word: only a vCPU in
+/// the guest may hold one ([`crate::kernel::ZoneSlotOccupant::Ring`]). A slot
+/// another executor drives now is that executor's to judge.
+fn refuse_ring_occupant(
+    zone: &ZoneTables,
+    slot: SlotId,
+    driver: u64,
+) -> Result<(), SlotLeaveRefusal> {
+    if zone.slot(slot).driver() != Some(driver) {
+        return Ok(());
+    }
+    match crate::kernel::zone_slot_occupant_in(zone, slot) {
+        crate::kernel::ZoneSlotOccupant::Ring { space } => {
+            Err(SlotLeaveRefusal::RingOccupant { slot, space })
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Executor `driver` of `slot` is back from its blocking host wait.
@@ -1185,17 +1223,24 @@ pub fn come_back_to_slot(slot: SlotId, driver: u64) {
 /// with no guest CPU and drives nothing. If nobody took `slot` over, what is
 /// queued there leaves; a first-entry thread no live slot will take waits on
 /// `now`, while a service thread goes back to its host run queue.
-#[must_use]
-pub fn leave_slot(slot: SlotId, driver: u64, now: Option<SlotId>) -> bool {
+/// Refused while the slot retains a switched record or (#1100) still names a
+/// ring-installed address space: a mailbox lease that moves on, or an
+/// executor that parks off-guest, must leave its slot vacated.
+pub fn leave_slot(slot: SlotId, driver: u64, now: Option<SlotId>) -> Result<(), SlotLeaveRefusal> {
     let Some(zone) = zone() else {
-        return true;
+        return Ok(());
     };
     leave_slot_in(zone, slot, driver, now)
 }
 
 /// [`leave_slot`] on the tables `zone`.
-#[must_use]
-pub fn leave_slot_in(zone: &ZoneTables, slot: SlotId, driver: u64, now: Option<SlotId>) -> bool {
+pub fn leave_slot_in(
+    zone: &ZoneTables,
+    slot: SlotId,
+    driver: u64,
+    now: Option<SlotId>,
+) -> Result<(), SlotLeaveRefusal> {
+    refuse_ring_occupant(zone, slot, driver)?;
     let mut records = Vec::new();
     let mut placements = Vec::new();
     if zone.leave_slot(
@@ -1212,9 +1257,9 @@ pub fn leave_slot_in(zone: &ZoneTables, slot: SlotId, driver: u64, now: Option<S
             &mut publish_handback,
             &mut capture_handbacks,
         );
-        true
+        Ok(())
     } else {
-        false
+        Err(SlotLeaveRefusal::Retained { slot })
     }
 }
 
@@ -1591,6 +1636,42 @@ mod tests {
             thread_record_runs_in(&zone, zone.record_ref(reused), other),
             Some(false)
         );
+    }
+
+    /// #1100 W2b/W2c: a stopped vCPU whose slot still names a space EL1
+    /// installed (no host task loaded, so no port) may neither stop being
+    /// driven (its mailbox lease moving on, or an off-guest park) nor step
+    /// away for a host wait: it would hold that space out of the guest,
+    /// invisibly to every pause. Once the word is vacated both proceed.
+    /// Serial: the slot's host port table is process-global.
+    #[test]
+    fn serial_host_a_ring_owned_word_refuses_leave_and_step_away() {
+        let zone: &'static ZoneTables = Box::leak(heap_zone());
+        let slot = SlotId::new(5);
+        let next = SlotId::new(6);
+        zone.drive(slot, 7);
+        zone.spaces.set_idle_ttbr(0x30000);
+        let space = zone.spaces.publish_closed(4, 0x10000, 0x10000).unwrap();
+        zone.spaces.open(space);
+        // EL1's installer: the word, then the gate (no host port behind it).
+        assert!(zone.install_space(slot, 4).is_some());
+        assert_eq!(
+            crate::kernel::zone_slot_occupant_in(zone, slot),
+            crate::kernel::ZoneSlotOccupant::Ring { space: 4 }
+        );
+        let refused = SlotLeaveRefusal::RingOccupant { slot, space: 4 };
+        with_test_zone(zone, || {
+            assert_eq!(step_away_from_slot(slot, 7), Err(refused));
+            assert_eq!(leave_slot(slot, 7, Some(next)), Err(refused));
+            assert_eq!(leave_slot(slot, 7, None), Err(refused));
+            // Another executor's slot is that executor's to judge.
+            assert_eq!(step_away_from_slot(slot, 8), Ok(()));
+            assert_eq!(zone.slot(slot).driver(), Some(7));
+            zone.release_space(slot);
+            assert_eq!(step_away_from_slot(slot, 7), Ok(()));
+            zone.step_back(slot, 7);
+            assert_eq!(leave_slot(slot, 7, None), Ok(()));
+        });
     }
 
     fn heap_zone() -> Box<ZoneTables> {
@@ -2381,7 +2462,7 @@ mod tests {
                     let hold = arm(Duration::from_secs(10));
                     // Before any step-away the workload may still be in its
                     // first run: nothing is held.
-                    step_away_from_slot(slot, 7);
+                    step_away_from_slot(slot, 7).expect("step away");
                     zone.step_back(slot, 7);
                     assert!(place_service(
                         context.thread(),
@@ -2389,14 +2470,14 @@ mod tests {
                     ));
                     // Held: not queued where the guest could run it.
                     assert_eq!(zone.slot(slot).queued(), 0);
-                    step_away_from_slot(slot, 7);
+                    step_away_from_slot(slot, 7).expect("step away");
                     // The independent actor can finish its inline host call
                     // and enter another before taking scheduler work. A held
                     // service row must not wait behind that actor or be
                     // captured again each time it lends the same CPU.
                     for _ in 0..2 {
                         come_back_to_slot(slot, 7);
-                        step_away_from_slot(slot, 7);
+                        step_away_from_slot(slot, 7).expect("step away");
                     }
                     outcome = hold.finish();
                 });
@@ -2455,10 +2536,10 @@ mod tests {
             let batches = captures(|| {
                 with_test_zone(zone, || {
                     let hold = arm(Duration::from_secs(10));
-                    step_away_from_slot(other, 8);
+                    step_away_from_slot(other, 8).expect("step away");
                     zone.step_back(other, 8);
                     place();
-                    step_away_from_slot(other, 8);
+                    step_away_from_slot(other, 8).expect("step away");
                     zone.step_back(other, 8);
                     stalled = hold.finish();
                 });
@@ -2473,10 +2554,10 @@ mod tests {
             let batches = captures(|| {
                 with_test_zone(zone, || {
                     let hold = arm(Duration::from_secs(10));
-                    step_away_from_slot(other, 8);
+                    step_away_from_slot(other, 8).expect("step away");
                     zone.step_back(other, 8);
                     place();
-                    step_away_from_slot(allowed, 7);
+                    step_away_from_slot(allowed, 7).expect("step away");
                     released = hold.finish();
                 });
             });
@@ -2523,11 +2604,11 @@ mod tests {
                     with_test_zone(zone, || {
                         if held {
                             let hold = arm(Duration::from_secs(10));
-                            step_away_from_slot(live, 8);
+                            step_away_from_slot(live, 8).expect("step away");
                             zone.step_back(live, 8);
                             assert!(place_service(context.thread(), generation));
                             assert_eq!(zone.slot(away).queued() + zone.slot(live).queued(), 0);
-                            step_away_from_slot(away, 7);
+                            step_away_from_slot(away, 7).expect("step away");
                             let HoldOutcome::ReleasedAtStepAway { record: held, slot } =
                                 hold.finish()
                             else {
@@ -2541,7 +2622,7 @@ mod tests {
                             let id = zone.alloc_host_runnable(expected).unwrap();
                             assert!(zone.requeue_on(away, id).is_some());
                             record = Some(zone.record_ref(id));
-                            step_away_from_slot(away, 7);
+                            step_away_from_slot(away, 7).expect("step away");
                         }
                     });
                 });
@@ -2576,7 +2657,7 @@ mod tests {
                     let hold = arm(Duration::from_secs(10));
                     // Before any step-away the workload may still be in its
                     // first run: nothing is held.
-                    step_away_from_slot(slot, 7);
+                    step_away_from_slot(slot, 7).expect("step away");
                     zone.step_back(slot, 7);
                     assert!(place_service(
                         context.thread(),

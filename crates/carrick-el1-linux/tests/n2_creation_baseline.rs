@@ -202,6 +202,9 @@ impl sched::ThreadCpu for NoCpu {
     fn set_translation(&mut self, _: u64, _: u64) {
         match *self {}
     }
+    fn live_ttbr0(&self) -> Option<u64> {
+        match *self {}
+    }
     fn invalidate_asid(&mut self, _: u64) {
         match *self {}
     }

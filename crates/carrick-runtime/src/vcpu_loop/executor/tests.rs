@@ -8913,7 +8913,7 @@ fn serial_host_captured_service_after_self_affinity_and_futex_wakes_current_idle
             1
         );
         assert_eq!(zone.slot(donor).queued(), 1);
-        carrick_kernel::el1_zone::step_away_from_slot(donor, 7);
+        carrick_kernel::el1_zone::step_away_from_slot(donor, 7).expect("step away");
         assert_eq!(wake_captured.lock().len(), 1);
         assert_eq!(zone.slot(donor).queued(), 0);
         assert_eq!(zone.slot(idle).queued(), 0);
@@ -8977,7 +8977,7 @@ fn serial_host_captured_service_after_self_affinity_and_futex_wakes_current_idle
         scheduler.settle_exited(served).unwrap();
         for _ in 0..3 {
             carrick_kernel::el1_zone::come_back_to_slot(donor, 7);
-            carrick_kernel::el1_zone::step_away_from_slot(donor, 7);
+            carrick_kernel::el1_zone::step_away_from_slot(donor, 7).expect("step away");
         }
         assert_eq!(
             captured.lock().len(),

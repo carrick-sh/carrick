@@ -26,14 +26,17 @@ core::arch::global_asm!(
 /// Also the entry of the vector's EL0 IRQ hook, which saves the same
 /// [`carrick_el1_abi::TrapFrame`] with `esr == 0`.
 ///
-/// Returns [`carrick_el1_abi::Action`] encoded as `u64`:
+/// Returns [`carrick_el1_abi::Action`] encoded as `u64`, built only by
+/// `El1Exit::encode` (an idle exit carries proof that it vacated the slot,
+/// #1100):
 /// - 0 (`Action::Served`): The syscall was fully handled in-guest (or the
 ///   interrupt was); restore registers and issue `eret` back to guest EL0.
 /// - 1 (`Action::Forward`): The syscall must be forwarded to the host; restore all
 ///   guest registers and branch to `mailbox_capture` (an interrupt: `hvc #4`).
 /// - 2 (`Action::ServedWithWork`): served, and host work is pending.
 /// - 3 (`Action::Idle`): the thread parked and the idle vCPU leaves for the
-///   host with no thread on it (`hvc #5`).
+///   host with no thread on it (`hvc #5`), on the maintenance root with its
+///   slot's occupancy word vacant.
 ///
 /// # Safety
 ///
@@ -41,43 +44,46 @@ core::arch::global_asm!(
 /// [`carrick_el1_abi::TrapFrame`] on the calling vCPU's kernel stack.
 #[cfg(target_os = "none")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn carrick_el1_syscall(frame: *mut carrick_el1_abi::TrapFrame) -> u64 {
+pub unsafe extern "C" fn carrick_el1_syscall(
+    frame: *mut carrick_el1_abi::TrapFrame,
+) -> carrick_el1::substrate::sched::ExitWord {
+    use carrick_el1::substrate::sched::El1Exit;
     if frame.is_null() {
-        return carrick_el1_abi::Action::Forward as u64;
+        return El1Exit::Forward.encode();
     }
     carrick_el1_linux::mm_portal::initialize_pending_forks();
     let frame_ref = unsafe { &mut *frame };
     if frame_ref.esr == carrick_el1_abi::MM_PORTAL_MAINTENANCE_ESR {
         carrick_el1_linux::mm_portal::serve_backing_maintenance_hw(frame_ref);
-        return carrick_el1_abi::Action::Served as u64;
+        return El1Exit::Served.encode();
     }
     if frame_ref.esr == carrick_el1_abi::MM_PORTAL_FORK_ESR {
         carrick_el1_linux::mm_portal::serve_fork_hw(frame_ref);
-        return carrick_el1_abi::Action::Served as u64;
+        return El1Exit::Served.encode();
     }
     if frame_ref.esr == carrick_el1_abi::MM_PORTAL_FORK_FINISH_ESR {
         carrick_el1_linux::mm_portal::finish_fork_hw(frame_ref);
-        return carrick_el1_abi::Action::Served as u64;
+        return El1Exit::Served.encode();
     }
     if frame_ref.esr == carrick_el1_abi::MM_PORTAL_BIND_ESR {
         carrick_el1_linux::mm_portal::bind_transfer_hw(frame_ref);
-        return carrick_el1_abi::Action::Served as u64;
+        return El1Exit::Served.encode();
     }
     if frame_ref.esr == carrick_el1_abi::MM_PORTAL_GRANT_ESR {
         carrick_el1_linux::mm_portal::serve_grant_hw(frame_ref);
-        return carrick_el1_abi::Action::Served as u64;
+        return El1Exit::Served.encode();
     }
     if frame_ref.esr == carrick_el1_abi::MM_PORTAL_SELECT_ESR {
         carrick_el1_linux::mm_portal::select_transfer_hw(frame_ref);
-        return carrick_el1_abi::Action::Served as u64;
+        return El1Exit::Served.encode();
     }
     if frame_ref.esr == carrick_el1_abi::MM_PORTAL_SERVICE_ESR {
         carrick_el1_linux::mm_portal::serve_transfer_hw(frame_ref);
-        return carrick_el1_abi::Action::Served as u64;
+        return El1Exit::Served.encode();
     }
     if frame_ref.esr == carrick_el1_abi::DESCRIPTOR_DRAIN_ESR {
         carrick_el1::fault::serve_host_drain_hw(frame_ref);
-        return carrick_el1_abi::Action::Served as u64;
+        return El1Exit::Served.encode();
     }
     let counters_ref =
         unsafe { &*(carrick_el1_abi::EL1_COUNTERS_BASE as *const carrick_el1_abi::Counters) };
@@ -85,12 +91,13 @@ pub unsafe extern "C" fn carrick_el1_syscall(frame: *mut carrick_el1_abi::TrapFr
     let action =
         carrick_el1_linux::dispatch::dispatch_entry(frame_ref, counters_ref, &mut owner_wait);
     let action = carrick_el1::fault::drain_before_el0_hw(frame_ref, action);
-    carrick_el1_linux::dispatch::capture_native_service_exit(
+    let action = carrick_el1_linux::dispatch::capture_native_service_exit(
         frame_ref,
         action,
         owner_wait,
         counters_ref,
-    ) as u64
+    );
+    carrick_el1_linux::dispatch::seal_entry_exit(frame_ref, action).encode()
 }
 
 /// Observable bare-metal panic handler.

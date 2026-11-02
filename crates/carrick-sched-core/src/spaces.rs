@@ -744,6 +744,24 @@ impl AddressSpaces {
         self.try_begin_edit_mode(index, key, owner, venue, true)
     }
 
+    /// What authenticates a kept occupancy word for `key` (#1100):
+    /// [`Self::grant`] by key when an entry names it, so a raised or closed
+    /// gate (or an entry re-keyed under the read) is
+    /// [`crate::KeptAuthority::Refused`] and the switch-in goes back through
+    /// the installer protocol.
+    pub fn kept_authority(&self, key: u64) -> crate::KeptAuthority {
+        let Some(index) = self.find(key) else {
+            return crate::KeptAuthority::Unpublished;
+        };
+        match self.grant(index, key) {
+            Some(grant) => crate::KeptAuthority::Open(crate::KeptGrant {
+                root: grant.ttbr0,
+                invalidation_owed: grant.cow_owed.is_some(),
+            }),
+            None => crate::KeptAuthority::Refused,
+        }
+    }
+
     /// Identity observation only, never admission to run guest user code.
     pub fn paused_root_identity(&self, index: SpaceIndex, key: u64) -> Option<u64> {
         let entry = self.entry(index);

@@ -677,7 +677,9 @@ impl IdleRootExit {
         binding: carrick_core_abi::ExecutionBinding,
         leave_root: impl FnOnce() -> Result<(), TrapError>,
     ) -> Result<Self, TrapError> {
-        let settled = SettledIdleSlot::admit(Some(slot)).map_err(|retained| {
+        // The crossing hands its installed space to this settlement, so only
+        // the switched record is checked here; the word is retired below.
+        let settled = SettledIdleSlot::admit_crossing(Some(slot)).map_err(|retained| {
             TrapError::Hypervisor(format!(
                 "root exit left a switched record on its idle slot: {retained:?}"
             ))
@@ -706,9 +708,13 @@ impl IdleRootExit {
 }
 
 /// Proof that a guest idle exit left this executor's zone slot with no
-/// switched record current (#890). The shared executor leaves the slot
-/// (`leave_driven_zone_slot`) or loads a task on it after an idle exit, and
-/// both are refused while EL1 still has a record switched in there (#885).
+/// switched record current (#890) and no address space installed (#1100).
+/// The shared executor leaves the slot (`leave_driven_zone_slot`) or loads a
+/// task on it after an idle exit, and both are refused while EL1 still has a
+/// record switched in there (#885). An idle executor has no task loaded, so
+/// a word naming a space is one EL1 left behind: the next idle entry would
+/// put the vCPU on the maintenance root under it, and the next switch-in of
+/// that space would trust the word.
 /// Every backend's idle lane therefore builds [`GuestIdleExit::Idle`]
 /// through [`Self::admit`]; how a backend settles a kick that lands on a
 /// switched record before it gets here is its own contract (ARM:
@@ -716,40 +722,71 @@ impl IdleRootExit {
 #[derive(Debug)]
 pub(crate) struct SettledIdleSlot(());
 
-/// An idle exit refused because its zone slot still held a switched record.
+/// An idle entry or exit refused because its zone slot was not settled.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct RetainedSwitchedRecord {
-    slot: carrick_el1_abi::SlotId,
-    record: carrick_el1_abi::RecordId,
+pub(crate) enum UnsettledIdleSlot {
+    /// EL1 still has a record switched in on the slot.
+    SwitchedRecord {
+        slot: carrick_el1_abi::SlotId,
+        record: carrick_el1_abi::RecordId,
+    },
+    /// The slot's occupancy word still names `space` (#1100).
+    InstalledSpace {
+        slot: carrick_el1_abi::SlotId,
+        space: u64,
+    },
 }
 
-impl From<RetainedSwitchedRecord> for TrapError {
-    fn from(refused: RetainedSwitchedRecord) -> Self {
-        TrapError::Hypervisor(format!(
-            "guest idle exit retained a switched record: slot={:?} record={:?}",
-            refused.slot, refused.record
-        ))
+impl From<UnsettledIdleSlot> for TrapError {
+    fn from(refused: UnsettledIdleSlot) -> Self {
+        match refused {
+            UnsettledIdleSlot::SwitchedRecord { slot, record } => TrapError::Hypervisor(format!(
+                "guest idle exit retained a switched record: slot={slot:?} record={record:?}"
+            )),
+            UnsettledIdleSlot::InstalledSpace { slot, space } => TrapError::Hypervisor(format!(
+                "guest idle slot {slot:?} still names address space {space} with no task loaded (#1100)"
+            )),
+        }
     }
 }
 
 impl SettledIdleSlot {
     /// Admit the idle exit of the executor leasing `slot` (`None`: it leases
     /// no zone slot) against the live zone tables.
-    pub(crate) fn admit(
-        slot: Option<carrick_el1_abi::SlotId>,
-    ) -> Result<Self, RetainedSwitchedRecord> {
+    pub(crate) fn admit(slot: Option<carrick_el1_abi::SlotId>) -> Result<Self, UnsettledIdleSlot> {
         Self::admit_in(carrick_kernel::el1_zone::zone(), slot)
+    }
+
+    /// A root-exit crossing on `slot`: it stopped the vCPU with the exiting
+    /// space installed on purpose, and [`IdleRootExit::settle`] retires that
+    /// word. Only the switched record is checked.
+    fn admit_crossing(slot: Option<carrick_el1_abi::SlotId>) -> Result<Self, UnsettledIdleSlot> {
+        match carrick_kernel::el1_zone::zone().zip(slot) {
+            Some((zone, slot)) => Self::no_switched_record(zone, slot),
+            None => Ok(Self(())),
+        }
     }
 
     fn admit_in(
         zone: Option<&carrick_el1_abi::ZoneTables>,
         slot: Option<carrick_el1_abi::SlotId>,
-    ) -> Result<Self, RetainedSwitchedRecord> {
-        match zone.zip(slot) {
-            Some((zone, slot)) => match zone.slot(slot).current() {
-                Some(record) => Err(RetainedSwitchedRecord { slot, record }),
-                None => Ok(Self(())),
-            },
+    ) -> Result<Self, UnsettledIdleSlot> {
+        let Some((zone, slot)) = zone.zip(slot) else {
+            return Ok(Self(()));
+        };
+        let settled = Self::no_switched_record(zone, slot)?;
+        match zone.installed_space(slot) {
+            0 => Ok(settled),
+            space => Err(UnsettledIdleSlot::InstalledSpace { slot, space }),
+        }
+    }
+
+    fn no_switched_record(
+        zone: &carrick_el1_abi::ZoneTables,
+        slot: carrick_el1_abi::SlotId,
+    ) -> Result<Self, UnsettledIdleSlot> {
+        match zone.slot(slot).current() {
+            Some(record) => Err(UnsettledIdleSlot::SwitchedRecord { slot, record }),
             None => Ok(Self(())),
         }
     }
@@ -757,7 +794,7 @@ impl SettledIdleSlot {
 
 #[cfg(test)]
 mod settled_idle_tests {
-    use super::{RetainedSwitchedRecord, SettledIdleSlot};
+    use super::{SettledIdleSlot, UnsettledIdleSlot};
     use carrick_el1_abi::{SlotId, ThreadIdentity, ZoneTables};
 
     fn zone() -> Box<ZoneTables> {
@@ -804,7 +841,7 @@ mod settled_idle_tests {
         assert_eq!(zone.slot(slot).current(), Some(record));
         assert_eq!(
             SettledIdleSlot::admit_in(Some(&zone), Some(slot)).unwrap_err(),
-            RetainedSwitchedRecord { slot, record },
+            UnsettledIdleSlot::SwitchedRecord { slot, record },
             "an idle exit with a switched record was admitted"
         );
     }
@@ -1621,9 +1658,13 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         let frame = carrick_el1_abi::prepare_idle_entry(usize::from(slot.raw()))
             .ok_or_else(|| TrapError::Hypervisor("idle entry without the EL1 region".into()))?;
         carrick_vmm_hvf::vcpu_kick::bind_zone_slot_vcpu(usize::from(slot.raw()), self.raw_vcpu_id);
-        // No address space is installed at entry. A host-owned thread leaves
-        // for this executor to load; a record with a published native owner
-        // may install its own MM and run directly from the zone.
+        // No address space is installed at entry, and that is checked, not
+        // assumed (#1100): the idle entry re-roots the vCPU on the
+        // maintenance root, so a word left naming a space would let the next
+        // switch-in of that space trust it. A host-owned thread leaves for
+        // this executor to load; a record with a published native owner may
+        // install its own MM and run directly from the zone.
+        let _vacant_at_entry = SettledIdleSlot::admit(Some(slot))?;
         drive_zone_slot(slot, zone_driver(self.executor_id))?;
         zone.publish_slot_with_affinity(
             slot,
@@ -1875,9 +1916,11 @@ pub(crate) fn zone_driver(executor: ExecutorId) -> u64 {
 pub(crate) fn drive_zone_slot(slot: carrick_el1_abi::SlotId, driver: u64) -> Result<(), TrapError> {
     let previous = DRIVEN_ZONE_SLOT.with(std::cell::Cell::get);
     if let Some((previous, previous_driver)) = previous.filter(|(previous, _)| *previous != slot) {
-        if !carrick_kernel::el1_zone::leave_slot(previous, previous_driver, Some(slot)) {
+        if let Err(refused) =
+            carrick_kernel::el1_zone::leave_slot(previous, previous_driver, Some(slot))
+        {
             return Err(TrapError::Hypervisor(format!(
-                "EL1 zone driver {previous_driver} cannot leave {previous:?} while it retains a switched record"
+                "EL1 zone driver {previous_driver} cannot leave {previous:?} for {slot:?}: {refused}"
             )));
         }
     }
@@ -1892,19 +1935,33 @@ pub(crate) fn drive_zone_slot(slot: carrick_el1_abi::SlotId, driver: u64) -> Res
 /// or its loop ends. Whatever waits on its slot goes elsewhere.
 pub(crate) fn leave_driven_zone_slot() {
     if let Some((slot, driver)) = DRIVEN_ZONE_SLOT.with(std::cell::Cell::get) {
-        if carrick_kernel::el1_zone::leave_slot(slot, driver, None) {
-            DRIVEN_ZONE_SLOT.with(|cell| cell.set(None));
-        } else {
-            fail_zone_slot(format_args!(
-                "EL1 zone driver {driver} tried to park while {slot:?} retained a switched record"
-            ));
+        match carrick_kernel::el1_zone::leave_slot(slot, driver, None) {
+            Ok(()) => DRIVEN_ZONE_SLOT.with(|cell| cell.set(None)),
+            Err(refused) => fail_zone_slot(format_args!(
+                "EL1 zone driver {driver} tried to park off-guest: {refused}"
+            )),
         }
     }
 }
 
+/// The calling executor enters a blocking inline host wait and lends its
+/// guest CPU. Its stopped vCPU may not keep a ring-installed address space
+/// for the wait (#1100): that is the same refused custody transition as an
+/// off-guest park.
+pub(crate) fn step_away_from_driven_zone_slot() {
+    if let Some((slot, driver)) = DRIVEN_ZONE_SLOT.with(std::cell::Cell::get)
+        && let Err(refused) = carrick_kernel::el1_zone::step_away_from_slot(slot, driver)
+    {
+        fail_zone_slot(format_args!(
+            "EL1 zone driver {driver} tried to step away for a host wait: {refused}"
+        ));
+    }
+}
+
 /// One carrier-fault boundary for a refused zone-slot custody transition.
-/// It covers two sites under one budgeted fatal: the `publish_zone_slot`
-/// reset and the refused leave in `leave_driven_zone_slot` (owner sign-off
+/// It covers its sites under one budgeted fatal: the `publish_zone_slot`
+/// reset, the refused leave in `leave_driven_zone_slot` and (#1100) the
+/// refused step-away in `step_away_from_driven_zone_slot` (owner sign-off
 /// 2026-10-26 on #231). Removing the refused-leave fatal by shape is #885.
 fn fail_zone_slot(message: std::fmt::Arguments<'_>) -> ! {
     carrick_fatal!("vcpu_loop::el1_zone", "{message}");

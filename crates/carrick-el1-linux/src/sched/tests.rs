@@ -1528,6 +1528,252 @@ fn a_raised_gate_sends_the_thread_to_its_executor() {
     assert_eq!(zone.counters.el1_space_refusals.load(Ordering::Relaxed), 1);
 }
 
+/// #1100 W1: an idle exit through the entry's seal (`carrick_el1_syscall`'s
+/// last step) leaves the slot vacant on the maintenance root, whichever
+/// producer chose `Idle`; the other exits keep the thread's space, since the
+/// thread (or its host task) stays loaded. The scheduler arm here is the
+/// production futex wait whose queued head's space is paused, the shape the
+/// signed trace caught (an idle exit that kept space 2).
+#[test]
+fn every_idle_exit_through_the_entry_seal_vacates_the_slot() {
+    use carrick_el1_abi::Action;
+    let zone = zone();
+    publish_space(&zone, MM, TTBR_MM);
+    let other = publish_space(&zone, OTHER_MM, TTBR_OTHER);
+    host_publish(&zone, SLOT, MM, None, 0);
+    zone.enter_guest(SLOT);
+    let a_word = AtomicU32::new(0);
+    let b_word = AtomicU32::new(0);
+    let (a_addr, b_addr) = (a_word.as_ptr() as u64, b_word.as_ptr() as u64);
+    let _b = queue_foreign(&zone, 202, OTHER_MM, b_addr, thread_ctx(0xB, b_addr));
+    zone.spaces.raise(other);
+    let task = task_for(101);
+    let (mut frame, mut cpu) = live(0xA, a_addr, FUTEX_WAIT_PRIVATE, 0);
+    cpu.ttbr = (TTBR_MM, TTBR_MM);
+    assert_eq!(
+        serve(&mut frame, &task, &zone, &mut cpu),
+        Some(Served::Idle)
+    );
+    assert_eq!(zone.installed_space(SLOT), MM, "the producer kept 7");
+    let exit = crate::dispatch::seal_entry_exit_with(&frame, Action::Idle, &zone, &mut cpu);
+    assert!(matches!(&exit, El1Exit::Idle(vacated) if vacated.slot() == SLOT));
+    assert_eq!(exit.encode().raw(), Action::Idle as u64);
+    assert_eq!(zone.installed_space(SLOT), 0, "the seal vacated the slot");
+    assert_eq!(
+        cpu.ttbr,
+        (IDLE_TTBR, IDLE_TTBR),
+        "root first, then the word"
+    );
+
+    // Any producer: a word some arm kept (here installed directly) is
+    // vacated by the seal all the same; a vacant slot stays vacant.
+    for (installed, live) in [(MM, TTBR_MM), (0, IDLE_TTBR)] {
+        if installed != 0 {
+            assert!(zone.install_space(SLOT, installed).is_some());
+        }
+        cpu.ttbr = (live, live);
+        let exit = crate::dispatch::seal_entry_exit_with(&frame, Action::Idle, &zone, &mut cpu);
+        assert!(matches!(exit, El1Exit::Idle(_)));
+        assert_eq!(zone.installed_space(SLOT), 0);
+        assert_eq!(cpu.ttbr, (IDLE_TTBR, IDLE_TTBR));
+    }
+
+    // Exits that keep the thread loaded keep its space.
+    assert!(zone.install_space(SLOT, MM).is_some());
+    cpu.ttbr = (TTBR_MM, TTBR_MM);
+    for (action, sealed) in [
+        (Action::Served, El1Exit::Served),
+        (Action::Forward, El1Exit::Forward),
+        (Action::ServedWithWork, El1Exit::ServedWithWork),
+        (Action::HostCustody, El1Exit::HostCustody),
+    ] {
+        let raw = action as u64;
+        let exit = crate::dispatch::seal_entry_exit_with(&frame, action, &zone, &mut cpu);
+        assert_eq!(exit, sealed);
+        assert_eq!(exit.encode().raw(), raw);
+        assert_eq!(zone.installed_space(SLOT), MM);
+        assert_eq!(cpu.ttbr, (TTBR_MM, TTBR_MM));
+    }
+}
+
+/// The #1100 sequence on one slot: thread A (space 7) waits while the
+/// queued head B (space 9) needs its executor, so the entry leaves with
+/// `Idle`; the host takes B, wakes A onto its home slot, and its idle entry
+/// rewrites both roots to the maintenance root (`run_idle_entry_on_vcpu`).
+/// Then A switches in. Returns the switch-in's outcome; `seal` is whether
+/// the idle exit went through the entry's seal.
+fn idle_round_trip_then_switch_in(
+    seal: bool,
+) -> (
+    std::thread::Result<carrick_el1_abi::Action>,
+    Box<ZoneTables>,
+    FakeCpu,
+    u64,
+) {
+    round_trip_then_switch_in(seal, IDLE_TTBR, |_| {})
+}
+
+/// [`idle_round_trip_then_switch_in`] with the root the host leaves live
+/// before the switch-in, and `before` run on the zone just before it.
+fn round_trip_then_switch_in(
+    seal: bool,
+    live_at_entry: u64,
+    before: impl FnOnce(&ZoneTables),
+) -> (
+    std::thread::Result<carrick_el1_abi::Action>,
+    Box<ZoneTables>,
+    FakeCpu,
+    u64,
+) {
+    const TRIP: SlotId = SlotId::new(47);
+    let zone = zone();
+    publish_space(&zone, MM, TTBR_MM);
+    let other = publish_space(&zone, OTHER_MM, TTBR_OTHER);
+    host_publish(&zone, TRIP, MM, None, 0);
+    zone.enter_guest(TRIP);
+    let a_word = AtomicU32::new(0);
+    let b_word = AtomicU32::new(0);
+    let (a_addr, b_addr) = (a_word.as_ptr() as u64, b_word.as_ptr() as u64);
+    let b = queue_foreign(&zone, 202, OTHER_MM, b_addr, thread_ctx(0xB, b_addr));
+    assert!(matches!(
+        zone.record(b).claim(),
+        Claim::Queued { slot, .. } if slot == TRIP
+    ));
+    zone.spaces.raise(other);
+    let task = task_for(101);
+    let (mut frame, mut cpu) = live(0xA, a_addr, FUTEX_WAIT_PRIVATE, 0);
+    frame.slot = u64::from(TRIP.raw());
+    cpu.ttbr = (TTBR_MM, TTBR_MM);
+    let counters = counters();
+    assert_eq!(
+        serve_on(TRIP, &mut frame, &task, &zone, &mut cpu, counters),
+        Some(Served::Idle)
+    );
+    if seal {
+        let _ = crate::dispatch::seal_entry_exit_with(
+            &frame,
+            carrick_el1_abi::Action::Idle,
+            &zone,
+            &mut cpu,
+        );
+    }
+    let switches_before = zone.counters.el1_space_switches.load(Ordering::Relaxed);
+    assert_eq!(zone.take_service_head(TRIP).map(|r| r.id), Some(b));
+    {
+        let guard = zone
+            .lock(ZoneTables::bucket_of_with_context(MM, a_addr), &HostWait)
+            .unwrap();
+        let woken = zone.wake_host(
+            &guard,
+            MM,
+            a_addr,
+            u32::MAX,
+            1,
+            true,
+            &mut |_| panic!("A's home slot is in the guest"),
+            &mut |_| {},
+        );
+        assert_eq!(woken, 1);
+    }
+    // `run_idle_entry_on_vcpu`: both roots to the maintenance root.
+    cpu.set_translation(live_at_entry, live_at_entry);
+    cpu.translations.clear();
+    before(&zone);
+    let mut idle_frame = TrapFrame {
+        slot: u64::from(TRIP.raw()),
+        ..TrapFrame::default()
+    };
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Sched {
+            handoff: None,
+            zone: &zone,
+            slot: TRIP,
+            task: &task,
+            cpu: &mut cpu,
+            user: &HardwareUserWord,
+            counters,
+        }
+        .serve_idle_entry(&mut idle_frame)
+    }));
+    (outcome, zone, cpu, switches_before)
+}
+
+/// #1100 W2 and the switch budget: across the host idle entry, A switches
+/// in with exactly one install of its own root (one space switch, one
+/// translation write), because the idle exit vacated the slot.
+#[test]
+fn a_switch_in_after_a_sealed_idle_exit_installs_its_own_root_once() {
+    let (outcome, zone, cpu, switches_before) = idle_round_trip_then_switch_in(true);
+    assert_eq!(outcome.expect("A runs"), carrick_el1_abi::Action::Served);
+    assert_eq!(cpu.ttbr, (TTBR_MM, TTBR_MM), "A runs on its own root");
+    assert_eq!(cpu.translations, [(TTBR_MM, TTBR_MM)], "one install");
+    assert_eq!(
+        zone.counters.el1_space_switches.load(Ordering::Relaxed) - switches_before,
+        1,
+        "one space switch per idle round trip"
+    );
+    assert_eq!(zone.installed_space(SlotId::new(47)), MM);
+}
+
+/// #1100 review: a kept word is authenticated against the space's open
+/// grant, not only the root register. With the word and the live root both
+/// naming 7, the switch-in keeps them only while 7's gate is open with
+/// nothing owed: a raised gate sends A back through the installer protocol
+/// (the vCPU leaves 7 and the install is refused, so A goes to its
+/// executor), and an owed foreign-COW invalidation is performed by a
+/// reinstall instead of being skipped.
+#[test]
+fn a_kept_word_runs_only_on_an_open_grant_with_nothing_owed() {
+    let (outcome, _zone, cpu, _) = round_trip_then_switch_in(false, TTBR_MM, |_| {});
+    assert_eq!(outcome.expect("A runs"), carrick_el1_abi::Action::Served);
+    assert!(cpu.translations.is_empty(), "kept: no install");
+
+    let (outcome, zone, cpu, _) = round_trip_then_switch_in(false, TTBR_MM, |zone| {
+        zone.spaces.raise(zone.spaces.find(MM).unwrap());
+    });
+    assert_eq!(outcome.expect("no fatal"), carrick_el1_abi::Action::Idle);
+    assert_eq!(cpu.ttbr, (IDLE_TTBR, IDLE_TTBR), "A did not run on 7");
+    assert_eq!(
+        cpu.translations,
+        [(IDLE_TTBR, IDLE_TTBR)],
+        "left, then refused"
+    );
+    assert_eq!(zone.installed_space(SlotId::new(47)), 0);
+
+    let (outcome, _zone, cpu, _) = round_trip_then_switch_in(false, TTBR_MM, |zone| {
+        zone.spaces.note_cow(zone.spaces.find(MM).unwrap());
+    });
+    assert_eq!(outcome.expect("A runs"), carrick_el1_abi::Action::Served);
+    assert_eq!(
+        cpu.asid_invalidations,
+        [TTBR_MM],
+        "the owed invalidation ran"
+    );
+    assert_eq!(cpu.translations.last(), Some(&(TTBR_MM, TTBR_MM)));
+}
+
+/// #1100 R1, red without the seal: an idle exit that keeps the word (the
+/// pre-fix behaviour of every `Idle` producer but the native-service park)
+/// is caught at the switch-in, which authenticates the live root against
+/// the space's published root instead of trusting the word.
+#[test]
+fn a_switch_in_that_trusts_a_kept_word_over_the_idle_root_is_a_stale_root_fatal() {
+    let (outcome, zone, cpu, _) = idle_round_trip_then_switch_in(false);
+    let fatal = outcome.expect_err("A must not run on the maintenance root");
+    let text = fatal
+        .downcast_ref::<std::string::String>()
+        .map(std::string::String::as_str)
+        .unwrap_or_default();
+    assert_eq!(
+        text,
+        std::format!(
+            "switch-in on a stale root: slot=47 mm=7 live={IDLE_TTBR:#x} expected={TTBR_MM:#x}"
+        )
+    );
+    assert!(cpu.translations.is_empty(), "nothing was installed");
+    assert_eq!(zone.installed_space(SlotId::new(47)), MM);
+}
+
 #[test]
 fn left_checkpoint_skips_selected_frame_and_runs_next_record() {
     let zone = zone();

@@ -113,6 +113,9 @@ impl sched::ThreadCpu for SaveCpu {
     fn set_translation(&mut self, _: u64, _: u64) {
         unreachable!("no root install")
     }
+    fn live_ttbr0(&self) -> Option<u64> {
+        None
+    }
     fn invalidate_asid(&mut self, _: u64) {
         unreachable!("no invalidation")
     }

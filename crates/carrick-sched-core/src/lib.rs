@@ -132,7 +132,8 @@ impl CensusContext for ParkedContextWords {
 }
 
 pub use occupancy::{
-    AddressSpaceKey, EXECUTION_SLOTS, ExecutionSlot, HOST_EXECUTION_SLOTS, Occupancy, SlotBusy,
+    AddressSpaceKey, EXECUTION_SLOTS, ExecutionSlot, HOST_EXECUTION_SLOTS, KeptAuthority,
+    KeptGrant, Occupancy, SlotBusy, SwitchInRoot, switch_in_root,
 };
 pub use spaces::{
     ADDRESS_SPACES, AddressSpaces, ExcludedEditor, GATE_CLOSED, JournalFull, SpaceEditor,

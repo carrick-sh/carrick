@@ -64,6 +64,12 @@ pub enum EntryBindingFatalReason {
     NativeServiceParkStale = 46,
     NativeServiceSettleStale = 47,
     NativeServiceCompleteStale = 48,
+    /// A switch-in found the slot's occupancy word naming the thread's
+    /// address space while the live TTBR0 named another table (#1100: an
+    /// exit to the host left the word behind and the host rewrote the
+    /// root). Numbered to match the #1100 diagnostics stack, which defines
+    /// 49..=59.
+    SwitchInStaleRoot = 60,
 }
 impl EntryBindingFatalReason {
     pub const fn from_raw(raw: u64) -> Option<Self> {
@@ -116,6 +122,7 @@ impl EntryBindingFatalReason {
             46 => Some(Self::NativeServiceParkStale),
             47 => Some(Self::NativeServiceSettleStale),
             48 => Some(Self::NativeServiceCompleteStale),
+            60 => Some(Self::SwitchInStaleRoot),
 
             _ => None,
         }
@@ -438,7 +445,7 @@ mod tests {
 
     #[test]
     fn fatal_detail_round_trip_and_formatter() {
-        for raw in 1..=48 {
+        for raw in (1..=48).chain(core::iter::once(60)) {
             let reason = EntryBindingFatalReason::from_raw(raw).unwrap();
             for (line, column) in [(0, 0), (1646, 9), (u32::MAX, u32::MAX)] {
                 let detail = EntryBindingFatalDetail {
@@ -757,7 +764,7 @@ mod tests {
             let observed = capture.record.as_mut().unwrap();
             observed.claim = claim;
             observed.claim_after = claim;
-            for reason in (1..=48).chain(core::iter::once(u64::MAX)) {
+            for reason in (1..=48).chain([60, u64::MAX]) {
                 capture.registers.reason = Some(reason);
                 let text = format!("{capture}");
                 assert!(
