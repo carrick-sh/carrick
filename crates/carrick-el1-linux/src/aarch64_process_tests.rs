@@ -9661,7 +9661,8 @@ fn activate_target(
 /// enabled, `-EBADF` before any EL1 dispatch for a nonnegative fd strictly
 /// above the carrier ceiling word. A live descriptor it would answer is a
 /// descriptor the guest can never close (#1398).
-#[cfg(not(target_os = "macos"))]
+// Test-only: this module also builds under `host-test`, without dev-deps.
+#[cfg(all(test, not(target_os = "macos")))]
 fn vector_fast_path_answers_ebadf(ceiling: &CarrierCeilingWord, fd: i64) -> bool {
     fd >= 0 && fd > i64::from(ceiling.0.load(Ordering::Acquire))
 }
@@ -9669,10 +9670,10 @@ fn vector_fast_path_answers_ebadf(ceiling: &CarrierCeilingWord, fd: i64) -> bool
 /// The carrier's ceiling word, as the HVF publisher owns it: raised only
 /// through the kernel's `FdCeilingAuthority`, which every host install and
 /// (through the venue's sink) every ring install of this fixture reaches.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(test, not(target_os = "macos")))]
 #[derive(Debug, Default)]
 struct CarrierCeilingWord(core::sync::atomic::AtomicU32);
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(test, not(target_os = "macos")))]
 impl carrick_hal::FdCeilingPublisher for CarrierCeilingWord {
     fn raise(&self, maximum: u32) {
         self.0.fetch_max(maximum, Ordering::AcqRel);
