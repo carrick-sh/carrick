@@ -118,11 +118,25 @@ fn service_terminal_operation(
     args: [u64; 3],
     ttbr0: u64,
 ) -> [u64; 4] {
+    use carrick_el1_abi::TerminalRetireDenial as Denial;
     use carrick_el1_abi::{GRANT_OP_CHILD_RETIRE, METADATA_GRANT_ERR_DENIED, NativeChildRetire};
     let retired = op != GRANT_OP_CHILD_RETIRE;
+    // A pending retirement's refusal names its arm in x1/x2 (#1100); x0 keeps
+    // the DENIED/INVALID status. Other terminal operations reply as before.
+    let deny = |status: u64, arm: Denial, detail: u64| -> [u64; 4] {
+        if retired {
+            [status, 0, 0, 0]
+        } else {
+            let [arm, detail] = carrick_el1_abi::TerminalRetireRefusal::new(arm, detail).words();
+            [status, arm, detail, 0]
+        }
+    };
     let expected_cpu = if retired { args[2] } else { args[1] };
-    if !request_has_live_vm(custody, generation) || expected_cpu != u64::from(cpu.raw()) {
-        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    if !request_has_live_vm(custody, generation) {
+        return deny(METADATA_GRANT_ERR_DENIED, Denial::NoLiveVm, 0);
+    }
+    if expected_cpu != u64::from(cpu.raw()) {
+        return deny(METADATA_GRANT_ERR_DENIED, Denial::CpuMismatch, expected_cpu);
     }
     let Some(binding) = terminal_child_binding(
         custody,
@@ -133,7 +147,7 @@ fn service_terminal_operation(
             carrick_sched_core::TerminalPhase::PendingRetirement
         },
     ) else {
-        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+        return deny(METADATA_GRANT_ERR_DENIED, Denial::TerminalBinding, 0);
     };
     if retired {
         let Some(zone) = carrick_el1_abi::zone_tables() else {
@@ -192,45 +206,54 @@ fn service_terminal_operation(
     // Pending retirement still needs the live child-root capability. Terminal
     // wakes use only the slot's exact execution receipt, which survives reclaim.
     let Some(region) = retained_abi_region(custody) else {
-        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+        return deny(METADATA_GRANT_ERR_DENIED, Denial::AbiRegion, 0);
     };
     let Some((task, _)) = stopped_records(region, cpu) else {
-        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+        return deny(METADATA_GRANT_ERR_DENIED, Denial::StoppedRecords, 0);
     };
-    let Some(execution) = (|| {
-        let mm = carrick_el1_abi::ReservationMm::new(binding.mm.raw())?;
+    let execution = (|| {
+        let mm = carrick_el1_abi::ReservationMm::new(binding.mm.raw())
+            .ok_or(Denial::BadReservationMm)?;
         let stock = custody.fork_stock.lock();
         if stock.owner.is_quarantined(mm) {
-            return None;
+            return Err(Denial::MmQuarantined);
         }
         let context = carrick_guest_arch::AddressContext {
-            root: stock.owner.child_root(mm)?,
-            mm: carrick_guest_arch::MmGeneration::new(core::num::NonZeroU64::new(mm.raw())?),
-            generation: task.root_generation()?,
+            root: stock.owner.child_root(mm).ok_or(Denial::NoChildRoot)?,
+            mm: carrick_guest_arch::MmGeneration::new(
+                core::num::NonZeroU64::new(mm.raw()).ok_or(Denial::BadReservationMm)?,
+            ),
+            generation: task.root_generation().ok_or(Denial::NoRootGeneration)?,
         };
-        Some(crate::fork_stock::GrantExecution::new(
+        Ok(crate::fork_stock::GrantExecution::new(
             cpu, binding, context,
         ))
-    })() else {
-        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    })();
+    let execution = match execution {
+        Ok(execution) => execution,
+        Err(arm) => return deny(METADATA_GRANT_ERR_DENIED, arm, binding.mm.raw()),
     };
     if execution.context.root.address().raw()
         != ttbr0 & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK
     {
-        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+        return deny(
+            METADATA_GRANT_ERR_DENIED,
+            Denial::RootMismatch,
+            ttbr0 & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK,
+        );
     }
     let Some(pointer) = retained_abi_region(custody).and_then(|region| {
         abi_stack_ptr::<NativeChildRetire>(region, cpu, carrick_guest_arch::KernelVa::new(args[0]))
     }) else {
-        return [METADATA_GRANT_ERR_INVALID, 0, 0, 0];
+        return deny(METADATA_GRANT_ERR_INVALID, Denial::RecordPointer, args[0]);
     };
     // Settle USED while the exact root still exists, then release unused pool
     // records. Physical bytes remain with ForkStock until neutral reclamation.
     let Some((_, zone)) = stopped_records(region, cpu) else {
-        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+        return deny(METADATA_GRANT_ERR_DENIED, Denial::StoppedZone, 0);
     };
     let Some(wake) = custody.native_wait_channel_wake.lock().clone() else {
-        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+        return deny(METADATA_GRANT_ERR_DENIED, Denial::NoWakeChannel, 0);
     };
     let deliver = |zone: &carrick_sched_core::ZoneTables<carrick_el1_abi::Aarch64ParkedContext>,
                    _: carrick_sched_core::Waker,
@@ -248,14 +271,35 @@ fn service_terminal_operation(
         },
     );
     let Some(index) = zone.spaces.find(binding.mm.raw()) else {
-        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+        return deny(
+            METADATA_GRANT_ERR_DENIED,
+            Denial::SpaceIndex,
+            binding.mm.raw(),
+        );
     };
-    let Ok(exclusion) = access.try_exclude_editor(index, binding.mm.raw()) else {
-        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    let exclusion = match access.try_exclude_editor(index, binding.mm.raw()) {
+        Ok(exclusion) => exclusion,
+        Err(carrick_sched_core::spaces::notification::ExclusionRefusal::Stale) => {
+            return deny(
+                METADATA_GRANT_ERR_DENIED,
+                Denial::EditorStale,
+                binding.mm.raw(),
+            );
+        }
+        // The holder: the active editor's owner word, read after the refusal.
+        Err(carrick_sched_core::spaces::notification::ExclusionRefusal::Busy) => {
+            return deny(
+                METADATA_GRANT_ERR_DENIED,
+                Denial::EditorBusy,
+                zone.spaces
+                    .active_editor(index)
+                    .map_or(0, |owner| owner.get()),
+            );
+        }
     };
     if let Some(pool) = carrick_el1_abi::cow_grant_pool_host() {
         if settle_native_cow(custody, pool, exclusion.proof()).is_err() {
-            return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+            return deny(METADATA_GRANT_ERR_DENIED, Denial::CowSettle, 0);
         }
         pool.release_mm(exclusion.proof());
     }
@@ -274,7 +318,7 @@ fn service_terminal_operation(
     if predecessor_receipt
         .is_some_and(|receipt| !settle_native_exec_predecessor(custody, region, zone, receipt))
     {
-        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+        return deny(METADATA_GRANT_ERR_DENIED, Denial::ExecPredecessor, 0);
     }
     if custody
         .fork_stock
@@ -283,13 +327,17 @@ fn service_terminal_operation(
         .retire_child(execution, retire)
         .is_err()
     {
-        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+        return deny(METADATA_GRANT_ERR_DENIED, Denial::RetireChild, 0);
     }
     let Some(zone) = carrick_el1_abi::zone_tables() else {
-        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+        return deny(METADATA_GRANT_ERR_DENIED, Denial::ZoneTables, 0);
     };
     let Some(slot) = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize) else {
-        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+        return deny(
+            METADATA_GRANT_ERR_DENIED,
+            Denial::Slot,
+            u64::from(cpu.raw()),
+        );
     };
     let identity = carrick_sched_core::ThreadIdentity {
         tid: execution.binding.task.raw(),
@@ -299,7 +347,7 @@ fn service_terminal_operation(
         ..Default::default()
     };
     if !zone.accept_terminal(slot, identity) {
-        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+        return deny(METADATA_GRANT_ERR_DENIED, Denial::AcceptTerminal, 0);
     }
     [METADATA_GRANT_SUCCESS, 0, 0, 0]
 }

@@ -990,6 +990,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         self.host_wanted.is_for(self.incarnation())
     }
 
+    /// Why a claimant asked for this incarnation back (the reason its
+    /// `OnCpu` became `OnCpuRequested`). Diagnostic observation only: it
+    /// grants no custody and never consumes the request (#1100).
+    pub fn requested_handback(&self) -> Option<Handback> {
+        self.host_wanted.kind(self.incarnation())
+    }
+
     pub fn entry_count(&self) -> u32 {
         self.entry_count.load(Ordering::Acquire)
     }

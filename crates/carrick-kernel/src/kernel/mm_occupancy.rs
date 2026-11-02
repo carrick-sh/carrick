@@ -181,6 +181,8 @@ type SlotWake = dyn Fn() + Send + Sync + 'static;
 struct SlotPort {
     running: Option<Port>,
     waiters: Vec<Weak<SlotWake>>,
+    /// How the slot's vCPU last left the guest idle entry (#1100).
+    last_exit: SlotExit,
 }
 
 impl SlotPort {
@@ -188,6 +190,7 @@ impl SlotPort {
         Self {
             running: None,
             waiters: Vec::new(),
+            last_exit: SlotExit::UNRECORDED,
         }
     }
 }
@@ -226,12 +229,14 @@ pub enum MmOccupancyError {
     )]
     SlotBusy { slot: ExecutionSlot, running: u64 },
     #[error(
-        "vCPU slot {slot:?} records address space {running} without a host owner while installing address space {requested}"
+        "vCPU slot {slot:?} records address space {running} without a host owner while installing address space {requested} (last guest exit: {last_exit})"
     )]
     SlotWordWithoutOwner {
         slot: ExecutionSlot,
         running: u64,
         requested: u64,
+        /// How the slot's vCPU last left the guest idle entry (#1100).
+        last_exit: SlotExit,
     },
     #[error("every host-only execution slot is allocated")]
     HostSlotsExhausted,
@@ -239,6 +244,66 @@ pub enum MmOccupancyError {
     CrashParticipationAlreadyActive { thread: ThreadKey },
     #[error("thread {thread:?} exhausted crash safe-point participation identities")]
     CrashParticipationIdentityExhausted { thread: ThreadKey },
+}
+
+/// How a zone slot's vCPU last left the guest idle entry, and which address
+/// space its occupancy word named right then. Diagnostic observation only
+/// (#1100): an idle exit that leaves a native space installed is the
+/// suspected source of a [`MmOccupancyError::SlotWordWithoutOwner`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SlotExitKind {
+    /// No idle exit recorded on this slot.
+    Unrecorded = 0,
+    /// EL1 `Action::Idle`: the `hvc #5` idle exit (`Aarch64Exit::Halt`).
+    Idle = 1,
+    /// A native service handed this executor an owned service notice.
+    ServiceIdle = 2,
+    /// The in-ring owner crossed a root exit from the idle entry.
+    RootExit = 3,
+    /// Any other raw exit (syscall, EL0 fault, stage-1 COW, other).
+    Raw = 4,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SlotExit {
+    pub kind: SlotExitKind,
+    /// The slot's occupancy word when the exit was recorded (0: vacant).
+    pub space_at_exit: u64,
+    /// The zone record still current on the slot at the exit (0: none).
+    pub record_at_exit: u32,
+}
+
+impl std::fmt::Display for SlotExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:?} with address space {} installed, record {}",
+            self.kind, self.space_at_exit, self.record_at_exit
+        )
+    }
+}
+
+impl SlotExit {
+    const UNRECORDED: Self = Self {
+        kind: SlotExitKind::Unrecorded,
+        space_at_exit: 0,
+        record_at_exit: 0,
+    };
+}
+
+/// Record how `slot`'s vCPU just left the idle entry, under the slot's port
+/// lock (the lock every installer holds when it reads it back).
+pub fn record_slot_exit(slot: ZoneSlotId, kind: SlotExitKind, space: u64, record: u32) {
+    PORTS[ExecutionSlot::zone(slot).index()].lock().last_exit = SlotExit {
+        kind,
+        space_at_exit: space,
+        record_at_exit: record,
+    };
+}
+
+#[cfg(test)]
+fn last_slot_exit(slot: ExecutionSlot) -> SlotExit {
+    PORTS[slot.index()].lock().last_exit
 }
 
 /// [`retire_exited_zone_space`] refused: the slot is not in the state a root
@@ -413,6 +478,7 @@ impl MmOccupancy {
                 slot,
                 running: busy.running.raw(),
                 requested: mm.raw(),
+                last_exit: state.last_exit,
             }
         })?;
         state.running = Some(Port {

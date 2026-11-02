@@ -83,6 +83,15 @@ pub enum EntryBindingFatalReason {
     NativeServiceBirthBusy = 55,
     /// Busy while settling the service exit.
     NativeServiceSettleBusy = 56,
+    /// The IRQ/fault/SVC user-return signal checkpoint's process admission
+    /// refused (#1100); the attribution words name the exact check.
+    UserReturnAdmission = 57,
+    /// A native service exit's process admission refused (#1100); the
+    /// attribution words name the exact check.
+    NativeServiceAdmission = 58,
+    /// `retire_mm` refused a child address-space retirement (#1100); the
+    /// attribution words name the EL1 step and the host's denial arm.
+    ChildRetireRefused = 59,
 }
 impl EntryBindingFatalReason {
     pub const fn from_raw(raw: u64) -> Option<Self> {
@@ -143,6 +152,9 @@ impl EntryBindingFatalReason {
             54 => Some(Self::NativeServicePublishBusy),
             55 => Some(Self::NativeServiceBirthBusy),
             56 => Some(Self::NativeServiceSettleBusy),
+            57 => Some(Self::UserReturnAdmission),
+            58 => Some(Self::NativeServiceAdmission),
+            59 => Some(Self::ChildRetireRefused),
 
             _ => None,
         }
@@ -216,6 +228,30 @@ pub struct ArmEntryFatalRegisters {
     pub far_el1: Option<u64>,
     pub elr_el1: Option<u64>,
     pub spsr_el1: Option<u64>,
+    /// x4..x12: the typed [`crate::FatalAttribution`] words (#1100).
+    pub attribution: [Option<u64>; crate::FATAL_ATTRIBUTION_WORDS],
+}
+
+impl ArmEntryFatalRegisters {
+    /// The decoded attribution; `None` when any word was unreadable.
+    pub fn attribution(&self) -> Option<crate::FatalAttribution> {
+        let mut words = [0; crate::FATAL_ATTRIBUTION_WORDS];
+        for (word, register) in words.iter_mut().zip(self.attribution) {
+            *word = register?;
+        }
+        Some(crate::FatalAttribution::decode(words))
+    }
+}
+
+/// Renders the attribution words, or says they could not be read.
+struct AttributionDetail<'a>(&'a ArmEntryFatalRegisters);
+impl fmt::Display for AttributionDetail<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0.attribution() {
+            Some(attribution) => attribution.fmt(f),
+            None => f.write_str(" attribution=unavailable"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -274,8 +310,9 @@ impl fmt::Display for ArmEl1FatalReport<'_> {
             Self::Entry(diagnostic) => diagnostic.fmt(f),
             Self::EntryUnavailable(registers) => write!(
                 f,
-                "entry_binding retained_entry=unavailable {} registers={registers:?}",
-                FatalDetail(registers.reason, registers.source_location)
+                "entry_binding retained_entry=unavailable {}{} registers={registers:?}",
+                FatalDetail(registers.reason, registers.source_location),
+                AttributionDetail(registers)
             ),
             Self::Panic {
                 sentinel,
@@ -346,7 +383,7 @@ impl ArmEntryBindingFatal {
 // Keep every custody field in the fixed 1024-byte sink. Flags are 0/1;
 // long variants avoid Debug's whitespace, slot wrappers and boolean words.
 // `host_req` is the complete host_requested flag, not omitted custody state.
-struct CompactClaim(Claim);
+pub(crate) struct CompactClaim(pub(crate) Claim);
 impl fmt::Display for CompactClaim {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
@@ -400,33 +437,54 @@ impl fmt::Display for Register {
 impl fmt::Display for ArmEntryBindingFatal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let r = &self.registers;
+        // An attributed fatal names its refusing check and the caller's
+        // source location. The fatal frame's live EL1 registers, the saved lr
+        // and SPSR and the x1..x3 arguments then carry nothing the check and the saved
+        // entry frame (`saved_esr/elr/far`) do not, and the record must
+        // still fit the fixed 1024-byte sink (#1100).
+        let attributed = !matches!(r.attribution(), None | Some(crate::FatalAttribution::None));
+        write!(f, "entry_binding cpu={} ", self.slot.raw())?;
+        if !attributed {
+            write!(
+                f,
+                "pc={} lr={} fp={} sp_el1={} ",
+                Register(r.pc),
+                Register(r.lr),
+                Register(r.fp),
+                Register(r.sp_el1)
+            )?;
+        }
+        if !attributed {
+            write!(
+                f,
+                "esr_el1={} far_el1={} elr_el1={} spsr_el1={} sp_el0={} ",
+                Register(r.esr_el1),
+                Register(r.far_el1),
+                Register(r.elr_el1),
+                Register(r.spsr_el1),
+                Register(r.sp_el0)
+            )?;
+        }
+        write!(f, "frame_slot={:#x} ", self.frame_slot)?;
+        if !attributed {
+            write!(f, "saved_lr={:#x} ", self.saved_lr)?;
+        }
+        write!(f, "saved_x0={:#x} ", self.saved_x[0])?;
+        if !attributed {
+            write!(
+                f,
+                "saved_x1={:#x} saved_x2={:#x} saved_x3={:#x} ",
+                self.saved_x[1], self.saved_x[2], self.saved_x[3]
+            )?;
+        }
+        write!(f, "saved_elr={:#x} ", self.saved_elr)?;
+        if !attributed {
+            write!(f, "saved_spsr={:#x} ", self.saved_spsr)?;
+        }
         write!(
             f,
-            "entry_binding cpu={} pc={} lr={} fp={} sp_el1={} esr_el1={} far_el1={} elr_el1={} spsr_el1={} sp_el0={} ",
-            self.slot.raw(),
-            Register(r.pc),
-            Register(r.lr),
-            Register(r.fp),
-            Register(r.sp_el1),
-            Register(r.esr_el1),
-            Register(r.far_el1),
-            Register(r.elr_el1),
-            Register(r.spsr_el1),
-            Register(r.sp_el0)
-        )?;
-        write!(
-            f,
-            "frame_slot={:#x} saved_lr={:#x} saved_x0={:#x} saved_x1={:#x} saved_x2={:#x} saved_x3={:#x} saved_elr={:#x} saved_spsr={:#x} saved_esr={:#x} saved_far={:#x} ",
-            self.frame_slot,
-            self.saved_lr,
-            self.saved_x[0],
-            self.saved_x[1],
-            self.saved_x[2],
-            self.saved_x[3],
-            self.saved_elr,
-            self.saved_spsr,
-            self.saved_esr,
-            self.saved_far
+            "saved_esr={:#x} saved_far={:#x} ",
+            self.saved_esr, self.saved_far
         )?;
         write!(
             f,
@@ -436,7 +494,12 @@ impl fmt::Display for ArmEntryBindingFatal {
             self.loaded.mm.raw(),
             self.loaded.thread_generation.raw()
         )?;
-        write!(f, "{} ", FatalDetail(r.reason, r.source_location))?;
+        write!(
+            f,
+            "{}{} ",
+            FatalDetail(r.reason, r.source_location),
+            AttributionDetail(r)
+        )?;
         match self.record {
             None => f.write_str("record=none"),
             Some(record) => write!(
@@ -725,6 +788,7 @@ mod tests {
             far_el1: Some(u64::MAX),
             elr_el1: Some(u64::MAX),
             spsr_el1: Some(u64::MAX),
+            attribution: [Some(u64::MAX); crate::FATAL_ATTRIBUTION_WORDS],
         };
         let mut capture = ArmEntryBindingFatal::capture(
             registers,
@@ -784,14 +848,61 @@ mod tests {
             let observed = capture.record.as_mut().unwrap();
             observed.claim = claim;
             observed.claim_after = claim;
-            for reason in (1..=56).chain(core::iter::once(u64::MAX)) {
-                capture.registers.reason = Some(reason);
-                let text = format!("{capture}");
-                assert!(
-                    text.len() <= 1024,
-                    "fatal sink truncates {} bytes: {text}",
-                    text.len()
-                );
+            // The widest attribution of each tag, plus raw unknown words.
+            let widest = [
+                crate::FatalAttribution::Admission(crate::AdmissionAttribution {
+                    check: crate::AdmissionCheck::RegisterAuthorizeGroup,
+                    error: crate::AdmissionError::GroupExitCustody,
+                    member: crate::MemberIdentity::Unobserved,
+                    member_generation: 0xff_ffff,
+                    binding_generation: 0xff_ffff,
+                    record: Some(u16::MAX),
+                    claim: Some(claim),
+                    claim_from_check: true,
+                    requested: Some(crate::Handback::GroupStop),
+                    cancelled: true,
+                    unadopted_birth: true,
+                    native_owner: true,
+                    path: crate::AdmissionPath::FreshRoot,
+                    context: Some(crate::AddressWords {
+                        mm: u32::MAX,
+                        generation: u32::MAX,
+                        root: u64::MAX,
+                    }),
+                    group: Some(crate::AddressWords {
+                        mm: u32::MAX,
+                        generation: u32::MAX,
+                        root: u64::MAX,
+                    }),
+                    root_generation: Some(u32::MAX),
+                    live_root: u64::MAX,
+                })
+                .encode(),
+                crate::FatalAttribution::Retire(crate::RetireAttribution {
+                    step: crate::RetireStep::CrossingRefused,
+                    host: Some(crate::TerminalRetireRefusal::new(
+                        crate::TerminalRetireDenial::NoRootGeneration,
+                        u64::MAX,
+                    )),
+                    mm: u64::MAX,
+                    binding_generation: u32::MAX,
+                    slot: u8::MAX,
+                    cancel: Some(crate::CancelTally::unpack(u64::MAX)),
+                })
+                .encode(),
+                [u64::MAX; crate::FATAL_ATTRIBUTION_WORDS],
+            ];
+            for words in widest {
+                capture.registers.attribution = words.map(Some);
+                for reason in (1..=59).chain(core::iter::once(u64::MAX)) {
+                    capture.registers.reason = Some(reason);
+                    let text = format!("{capture}");
+                    assert!(
+                        text.len() <= 1024,
+                        "fatal sink truncates {} bytes: {text}",
+                        text.len()
+                    );
+                }
             }
         }
         // Distinguish saved entry state from the architectural exception state.

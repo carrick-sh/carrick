@@ -1250,3 +1250,28 @@ fn successor_image_import_failure_keeps_old_root_and_success_stays_closed() {
     assert!(region.zone.spaces.find(43_002).is_some());
     drop(old);
 }
+
+/// #1100 attribution: a slot's last idle exit, with the space its word still
+/// named, is what an orphan-word install refusal reports.
+#[test]
+fn slot_exit_record_names_the_space_an_idle_exit_left_installed() {
+    let slot = ZoneSlotId::new(250);
+    assert_eq!(
+        super::last_slot_exit(ExecutionSlot::zone(slot)).kind,
+        SlotExitKind::Unrecorded
+    );
+    record_slot_exit(slot, SlotExitKind::Idle, 2, 7);
+    let exit = super::last_slot_exit(ExecutionSlot::zone(slot));
+    assert_eq!(
+        exit,
+        SlotExit {
+            kind: SlotExitKind::Idle,
+            space_at_exit: 2,
+            record_at_exit: 7,
+        }
+    );
+    assert_eq!(
+        exit.to_string(),
+        "Idle with address space 2 installed, record 7"
+    );
+}

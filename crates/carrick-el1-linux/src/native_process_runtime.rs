@@ -11,6 +11,7 @@ use super::{
     native_process_signals::{NativeExitSignals, NativeProcessSignals},
     process_owner::{GuestProcessOwner, GuestTask, GuestTaskMetadata, NativeProcessCustody},
 };
+use crate::admission_refusal::{AdmissionCheck, AdmissionRefusal};
 use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec, vec::Vec};
 use carrick_el1::lock::SpinLock;
 use carrick_el1_abi::{
@@ -1863,30 +1864,59 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         page: &ThreadLifecyclePage,
         control: &ThreadControlSlot,
     ) -> Result<Option<Arc<NativeProcessRuntime<'a, M, C>>>, NativeProcessError> {
+        self.rehome_entry_attributed(source, current, address, page, control)
+            .map_err(NativeProcessError::from)
+    }
+
+    /// [`Self::rehome_entry`], naming the refusing check (#1100).
+    #[inline(never)]
+    pub fn rehome_entry_attributed(
+        &self,
+        source: BornInZoneSource<'a, C>,
+        current: &CurrentTask,
+        address: AddressContext<RootGpa>,
+        page: &ThreadLifecyclePage,
+        control: &ThreadControlSlot,
+    ) -> Result<Option<Arc<NativeProcessRuntime<'a, M, C>>>, AdmissionRefusal> {
         let binding = super::common_entry::execution_binding(current);
-        let host_identity = member_host_identity(page, control)?;
-        let key = NativeExecutionKey::new(source.zone, binding, address)?;
-        let pid = current.visible_pid().ok_or(NativeProcessError::Stale)?;
+        let host_identity = member_host_identity(page, control)
+            .map_err(AdmissionRefusal::at(AdmissionCheck::RehomeHostIdentity))?;
+        let key = NativeExecutionKey::new(source.zone, binding, address)
+            .map_err(AdmissionRefusal::at(AdmissionCheck::RehomeKey))?;
+        let pid = current.visible_pid().ok_or(AdmissionRefusal::new(
+            AdmissionCheck::RehomeVisiblePid,
+            NativeProcessError::Stale,
+        ))?;
         let record = source
             .zone
             .slot(source.slot)
             .current()
             .or_else(|| source.zone.slot(source.slot).host_record())
-            .ok_or(NativeProcessError::Stale)?;
-        carrick_core::entry::prepare_handoff(binding, source, record)
-            .ok_or(NativeProcessError::Stale)?;
+            .ok_or(AdmissionRefusal::new(
+                AdmissionCheck::RehomeRecord,
+                NativeProcessError::Stale,
+            ))?;
+        carrick_core::entry::prepare_handoff(binding, source, record).ok_or_else(|| {
+            AdmissionRefusal::stale(AdmissionCheck::RehomeHandoff)
+                .observed(source.zone.record(record).claim())
+        })?;
         let reference = source.zone.record_ref(record);
         let mut state = self.state.lock();
         let (runtime, process) = state
             .groups
             .get(&Self::group_key(source.zone, address, page, pid))
             .cloned()
-            .ok_or(NativeProcessError::Stale)?;
+            .ok_or(AdmissionRefusal::new(
+                AdmissionCheck::RehomeGroup,
+                NativeProcessError::Stale,
+            ))?;
         let mut graph = runtime.graph.lock();
         let resources = graph
             .owner
             .task_mut(process)
-            .map_err(|_| NativeProcessError::Stale)?
+            .map_err(|_| {
+                AdmissionRefusal::new(AdmissionCheck::RehomeTask, NativeProcessError::Stale)
+            })?
             .native_mut()
             .resources_mut();
         if !core::ptr::eq(resources.page, page)
@@ -1896,7 +1926,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             || !current.owns_lifecycle_page(page)
             || !current.owns_control_slot(control)
         {
-            return Err(NativeProcessError::Stale);
+            return Err(AdmissionRefusal::new(
+                AdmissionCheck::RehomeResources,
+                NativeProcessError::Stale,
+            ));
         }
         let Some(member_index) = resources
             .members
@@ -1906,13 +1939,20 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             return Ok(None);
         };
         if resources.members[member_index].thread.id() != key.task.id() {
-            return Err(NativeProcessError::Stale);
+            return Err(AdmissionRefusal::new(
+                AdmissionCheck::RehomeMemberIdentity,
+                NativeProcessError::Stale,
+            ));
         }
         let old_record = resources.members[member_index].record;
-        let (_, keys) = state
-            .by_process
-            .get(&(key.carrier, process))
-            .ok_or(NativeProcessError::Stale)?;
+        let (_, keys) =
+            state
+                .by_process
+                .get(&(key.carrier, process))
+                .ok_or(AdmissionRefusal::new(
+                    AdmissionCheck::RehomeProcessKeys,
+                    NativeProcessError::Stale,
+                ))?;
         let key_index = keys.iter().position(|candidate| {
             state
                 .members
@@ -1924,22 +1964,34 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         };
         let old_key = keys[key_index];
         if old_key.thread_generation != key.thread_generation {
-            return Err(NativeProcessError::Stale);
+            return Err(AdmissionRefusal::new(
+                AdmissionCheck::RehomeThreadGeneration,
+                NativeProcessError::Stale,
+            ));
         }
         if old_record != reference && signal_record_exists(source.zone, old_record) {
-            return Err(NativeProcessError::Busy);
+            return Err(AdmissionRefusal::new(
+                AdmissionCheck::RehomeSignalRecordBusy,
+                NativeProcessError::Busy,
+            ));
         }
         let record_key = Self::record_key(source.zone, reference);
         if (old_key != key && state.members.contains_key(&key))
             || (old_record != reference && state.records.contains_key(&record_key))
         {
-            return Err(NativeProcessError::Busy);
+            return Err(AdmissionRefusal::new(
+                AdmissionCheck::RehomeKeyBusy,
+                NativeProcessError::Busy,
+            ));
         }
         let mut member = state
             .members
             .get(&old_key)
             .cloned()
-            .ok_or(NativeProcessError::Stale)?;
+            .ok_or(AdmissionRefusal::new(
+                AdmissionCheck::RehomeMember,
+                NativeProcessError::Stale,
+            ))?;
         member.record = reference;
         // Every refusing check precedes publication under both owner guards.
         // An adopted receipt is the slot's birth identity: renewing the
@@ -1949,7 +2001,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 matches!(receipt, OutstandingExitReceipt::Adopted { birth, control: expected }
                     if core::ptr::eq(expected.control(), control) && *birth != host_identity)
             }) {
-                return Err(NativeProcessError::Stale);
+                return Err(AdmissionRefusal::new(
+                    AdmissionCheck::RehomeAdoptedReceipt,
+                    NativeProcessError::Stale,
+                ));
             }
             for receipt in &mut pending.outstanding {
                 if let OutstandingExitReceipt::Pool {
@@ -1966,12 +2021,17 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         state
             .by_process
             .get_mut(&(key.carrier, process))
-            .ok_or(NativeProcessError::Stale)?
+            .ok_or(AdmissionRefusal::new(
+                AdmissionCheck::RehomeProcessKeysLost,
+                NativeProcessError::Stale,
+            ))?
             .1[key_index] = key;
         let resources = graph
             .owner
             .task_mut(process)
-            .map_err(|_| NativeProcessError::Stale)?
+            .map_err(|_| {
+                AdmissionRefusal::new(AdmissionCheck::RehomeTaskLost, NativeProcessError::Stale)
+            })?
             .native_mut()
             .resources_mut();
         if core::ptr::eq(resources.control, control) {
@@ -2016,6 +2076,33 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             .ok_or(NativeProcessError::Stale)?;
         self.fold_host_receipts(&runtime, process);
         Ok(runtime)
+    }
+
+    /// Fatal-path observation (#1100): is the registry member for `task` keyed
+    /// `Born` or `Issued`, and under which generation. Grants nothing.
+    pub fn member_identity_of(
+        &self,
+        binding: ExecutionBinding,
+    ) -> (crate::admission_refusal::MemberIdentity, u32) {
+        use crate::admission_refusal::MemberIdentity;
+        let Ok(loaded) = NativeThreadIdentity::from_binding(binding) else {
+            return (MemberIdentity::Absent, 0);
+        };
+        let state = self.state.lock();
+        let Some(identity) = state
+            .members
+            .keys()
+            .map(|key| key.task)
+            .find(|identity| identity.id() == loaded.id())
+        else {
+            return (MemberIdentity::Absent, 0);
+        };
+        match identity {
+            NativeThreadIdentity::Born(_) => (MemberIdentity::Born, 0),
+            NativeThreadIdentity::Issued(issued) => {
+                (MemberIdentity::Issued, issued.generation.raw() as u32)
+            }
+        }
     }
 
     pub fn for_record(
@@ -2491,47 +2578,80 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         page: &'a ThreadLifecyclePage,
         control: &'a ThreadControlSlot,
     ) -> Result<Arc<NativeProcessRuntime<'a, M, C>>, NativeProcessError> {
+        self.register_thread_attributed(source, current, address, page, control)
+            .map_err(NativeProcessError::from)
+    }
+
+    /// [`Self::register_thread`], naming the refusing check (#1100).
+    #[inline(never)]
+    pub fn register_thread_attributed(
+        &self,
+        source: BornInZoneSource<'a, C>,
+        current: &CurrentTask,
+        address: AddressContext<RootGpa>,
+        page: &'a ThreadLifecyclePage,
+        control: &'a ThreadControlSlot,
+    ) -> Result<Arc<NativeProcessRuntime<'a, M, C>>, AdmissionRefusal> {
         let binding = super::common_entry::execution_binding(current);
-        let key = NativeExecutionKey::new(source.zone, binding, address)?;
-        let visible_pid = current.visible_pid().ok_or(NativeProcessError::Stale)?;
+        let key = NativeExecutionKey::new(source.zone, binding, address)
+            .map_err(AdmissionRefusal::at(AdmissionCheck::RegisterKey))?;
+        let visible_pid = current.visible_pid().ok_or(AdmissionRefusal::new(
+            AdmissionCheck::RegisterVisiblePid,
+            NativeProcessError::Stale,
+        ))?;
         if current.metadata.lifecycle_page.load(Ordering::Acquire)
             != core::ptr::from_ref(page).addr() as u64
             || current.metadata.control_slot.load(Ordering::Acquire)
                 != core::ptr::from_ref(control).addr() as u64
         {
-            return Err(NativeProcessError::Stale);
+            return Err(AdmissionRefusal::new(
+                AdmissionCheck::RegisterMetadata,
+                NativeProcessError::Stale,
+            ));
         }
         let record = source
             .zone
             .slot(source.slot)
             .current()
             .or_else(|| source.zone.slot(source.slot).host_record())
-            .ok_or(NativeProcessError::Stale)?;
-        carrick_core::entry::prepare_handoff(binding, source, record)
-            .ok_or(NativeProcessError::Stale)?;
+            .ok_or(AdmissionRefusal::new(
+                AdmissionCheck::RegisterRecord,
+                NativeProcessError::Stale,
+            ))?;
+        carrick_core::entry::prepare_handoff(binding, source, record).ok_or_else(|| {
+            AdmissionRefusal::stale(AdmissionCheck::RegisterHandoff)
+                .observed(source.zone.record(record).claim())
+        })?;
         if control.zone_record() != Some(source.zone.record_ref(record)) {
-            return Err(NativeProcessError::Stale);
+            return Err(AdmissionRefusal::new(
+                AdmissionCheck::RegisterZoneRecord,
+                NativeProcessError::Stale,
+            ));
         }
         let (visible_tid, host_issued) = if let Some(entry) = control.entry() {
-            let born = page.born_record(entry).ok_or(NativeProcessError::Stale)?;
-            let identity = page.identity(entry).ok_or(NativeProcessError::Stale)?;
+            let born = page.born_record(entry).ok_or(AdmissionRefusal::new(
+                AdmissionCheck::RegisterBornRecord,
+                NativeProcessError::Stale,
+            ))?;
+            let identity = page.identity(entry).ok_or(AdmissionRefusal::new(
+                AdmissionCheck::RegisterBornIdentity,
+                NativeProcessError::Stale,
+            ))?;
             if page.control_address(entry) != Some(core::ptr::from_ref(control).addr() as u64)
                 || u64::from(identity.tid) != binding.task.raw()
                 || identity.thread_serial != binding.thread_generation.raw()
                 || born.clone_flags & 0x0001_0000 == 0
             {
-                return Err(NativeProcessError::Stale);
+                return Err(AdmissionRefusal::new(
+                    AdmissionCheck::RegisterBornMismatch,
+                    NativeProcessError::Stale,
+                ));
             }
             (identity.visible_tid, None)
         } else {
-            let issued = IssuedHostThread::authenticate(
-                source,
-                binding,
-                visible_pid,
-                page,
-                control,
-                record,
-            )?;
+            let issued =
+                IssuedHostThread::authenticate(source, binding, visible_pid, page, control, record)
+                    .map_err(AdmissionRefusal::at(AdmissionCheck::RegisterHostThread))?;
             (issued.visible_tid, Some(issued))
         };
         // Births were issued by this carrier before publication. Admission
@@ -2540,37 +2660,58 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         let group_key = Self::group_key(source.zone, address, page, visible_pid);
         let mut state = self.state.lock();
         if !page.gate().serves_ring() {
-            return Err(NativeProcessError::Stale);
+            return Err(AdmissionRefusal::new(
+                AdmissionCheck::RegisterGate,
+                NativeProcessError::Stale,
+            ));
         }
-        let (runtime, process) = state
-            .groups
-            .get(&group_key)
-            .cloned()
-            .ok_or(NativeProcessError::Stale)?;
+        let (runtime, process) =
+            state
+                .groups
+                .get(&group_key)
+                .cloned()
+                .ok_or(AdmissionRefusal::new(
+                    AdmissionCheck::RegisterGroup,
+                    NativeProcessError::Stale,
+                ))?;
         let record_key = Self::record_key(source.zone, source.zone.record_ref(record));
         if state.members.contains_key(&key) || state.records.contains_key(&record_key) {
-            return Err(NativeProcessError::Busy);
+            return Err(AdmissionRefusal::new(
+                AdmissionCheck::RegisterBusy,
+                NativeProcessError::Busy,
+            ));
         }
         if !state.by_process.contains_key(&(key.carrier, process)) {
-            return Err(NativeProcessError::Stale);
+            return Err(AdmissionRefusal::new(
+                AdmissionCheck::RegisterProcessKeys,
+                NativeProcessError::Stale,
+            ));
         }
-        let host_identity = member_host_identity(page, control)?;
+        let host_identity = member_host_identity(page, control)
+            .map_err(AdmissionRefusal::at(AdmissionCheck::RegisterHostIdentity))?;
         let closing = {
             let mut graph = runtime.graph.lock();
-            let row = graph
-                .owner
-                .task_mut(process)
-                .map_err(|_| NativeProcessError::Stale)?;
+            let row = graph.owner.task_mut(process).map_err(|_| {
+                AdmissionRefusal::new(AdmissionCheck::RegisterTask, NativeProcessError::Stale)
+            })?;
             let already_owned = if let Some(issued) = host_issued {
-                let already_owned = issued.authorize_group(source, row, address, page, control)?;
+                let already_owned = issued
+                    .authorize_group(source, row, address, page, control)
+                    .map_err(AdmissionRefusal::at(AdmissionCheck::RegisterAuthorizeGroup))?;
                 if !page.release_adopted_host_birth(host_identity) {
-                    return Err(NativeProcessError::Stale);
+                    return Err(AdmissionRefusal::new(
+                        AdmissionCheck::RegisterReleaseAdopted,
+                        NativeProcessError::Stale,
+                    ));
                 }
                 already_owned
             } else {
                 let resources = row.native_mut().resources_mut();
                 if !core::ptr::eq(resources.page, page) {
-                    return Err(NativeProcessError::Stale);
+                    return Err(AdmissionRefusal::new(
+                        AdmissionCheck::RegisterPage,
+                        NativeProcessError::Stale,
+                    ));
                 }
                 let imported = resources
                     .members
@@ -2581,14 +2722,21 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                         || (member.record != source.zone.record_ref(record)
                             && signal_record_exists(source.zone, member.record))
                 }) {
-                    return Err(NativeProcessError::Stale);
+                    return Err(AdmissionRefusal::new(
+                        AdmissionCheck::RegisterImported,
+                        NativeProcessError::Stale,
+                    ));
                 }
                 imported.is_some()
             };
             if row.credentials_for(visible_tid).is_err() {
                 let caller_tid = row.metadata().namespace_pid;
-                row.spawn_thread(caller_tid, visible_tid)
-                    .map_err(|_| NativeProcessError::Invalid)?;
+                row.spawn_thread(caller_tid, visible_tid).map_err(|_| {
+                    AdmissionRefusal::new(
+                        AdmissionCheck::RegisterSpawnThread,
+                        NativeProcessError::Invalid,
+                    )
+                })?;
             }
             if already_owned {
                 let member = row
@@ -2597,7 +2745,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     .members
                     .iter_mut()
                     .find(|member| member.thread.id() == key.task.id())
-                    .ok_or(NativeProcessError::Stale)?;
+                    .ok_or(AdmissionRefusal::new(
+                        AdmissionCheck::RegisterMember,
+                        NativeProcessError::Stale,
+                    ))?;
                 let old_record = member.record;
                 let replaced =
                     member.thread != key.task || old_record != source.zone.record_ref(record);
@@ -2615,9 +2766,15 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     resources.map_stash.remove(&old_record);
                 }
             } else {
-                let retained = retain_member_control(control)?;
+                let retained = retain_member_control(control)
+                    .map_err(AdmissionRefusal::at(AdmissionCheck::RegisterRetainControl))?;
                 let pending = carrick_el1_abi::NativePendingCustody::try_admit(retained.clone())
-                    .map_err(|_| NativeProcessError::Busy)?;
+                    .map_err(|_| {
+                        AdmissionRefusal::new(
+                            AdmissionCheck::RegisterPendingCustody,
+                            NativeProcessError::Busy,
+                        )
+                    })?;
                 retained.commit_registration();
                 let projection = row
                     .native()
@@ -2644,20 +2801,27 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 process,
                 address,
                 record: source.zone.record_ref(record),
-                control: retain_member_control(control)?,
+                control: retain_member_control(control)
+                    .map_err(AdmissionRefusal::at(AdmissionCheck::RegisterRetainControl))?,
             },
         );
         state
             .by_process
             .get_mut(&(key.carrier, process))
-            .ok_or(NativeProcessError::Stale)?
+            .ok_or(AdmissionRefusal::new(
+                AdmissionCheck::RegisterTail,
+                NativeProcessError::Stale,
+            ))?
             .1
             .push(key);
         state.records.insert(record_key, key);
         state
             .members
             .get(&key)
-            .ok_or(NativeProcessError::Stale)?
+            .ok_or(AdmissionRefusal::new(
+                AdmissionCheck::RegisterTail,
+                NativeProcessError::Stale,
+            ))?
             .control
             .commit_native_signal_owner();
         drop(state);
@@ -3647,6 +3811,21 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         words: &C,
         service: &'r mut S,
     ) -> Result<Box<NativeProcessEntry<'r, 'a, M, C, S>>, NativeProcessError> {
+        self.enter_registered_attributed(registry, source, current, address, words, service)
+            .map_err(NativeProcessError::from)
+    }
+
+    /// [`Self::enter_registered`], naming the refusing check (#1100).
+    #[inline(never)]
+    pub fn enter_registered_attributed<'r, S: NativeProcessService<'a, C, Mm = M>>(
+        &'r self,
+        registry: &NativeProcessRegistry<'a, M, C>,
+        source: BornInZoneSource<'a, C>,
+        current: &'a CurrentTask,
+        address: AddressContext<RootGpa>,
+        words: &C,
+        service: &'r mut S,
+    ) -> Result<Box<NativeProcessEntry<'r, 'a, M, C, S>>, AdmissionRefusal> {
         let (binding, record, member_control, process, calling_tid, owner_continuation) =
             self.authenticate_registered(registry, source, current, address, words)?;
         Ok(Box::new(NativeProcessEntry {
@@ -3657,8 +3836,14 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             record,
             control: member_control,
             _control_custody: Some(
-                carrick_core::lifecycle::MemberControlCustody::retain(member_control)
-                    .map_err(|_| NativeProcessError::Stale)?,
+                carrick_core::lifecycle::MemberControlCustody::retain(member_control).map_err(
+                    |_| {
+                        AdmissionRefusal::new(
+                            AdmissionCheck::EnterControlCustody,
+                            NativeProcessError::Stale,
+                        )
+                    },
+                )?,
             ),
             key: process,
             caller_address: address,
@@ -3694,9 +3879,12 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         source: BornInZoneSource<'a, C>,
         current: &'a CurrentTask,
         born: NativeExecutionKey,
-    ) -> Result<(ExecutionBinding, NativeExecutionKey), NativeProcessError> {
+    ) -> Result<(ExecutionBinding, NativeExecutionKey), AdmissionRefusal> {
         let NativeThreadIdentity::Born(id) = born.task else {
-            return Err(NativeProcessError::Stale);
+            return Err(AdmissionRefusal::new(
+                AdmissionCheck::IssueNotBorn,
+                NativeProcessError::Stale,
+            ));
         };
         let issued = NativeExecutionKey {
             task: NativeThreadIdentity::Issued(IssuedExecution {
@@ -3709,43 +3897,55 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .zone
             .slot(source.slot)
             .current()
-            .ok_or(NativeProcessError::Stale)?;
+            .ok_or(AdmissionRefusal::new(
+                AdmissionCheck::IssueRecord,
+                NativeProcessError::Stale,
+            ))?;
         let record_ref = source.zone.record_ref(record);
         let mut state = registry.state.lock();
-        let member = state.members.get(&born).ok_or(NativeProcessError::Stale)?;
+        let member = state.members.get(&born).ok_or(AdmissionRefusal::new(
+            AdmissionCheck::IssueMember,
+            NativeProcessError::Stale,
+        ))?;
         if !core::ptr::eq(Arc::as_ptr(&member.runtime), self)
             || member.record != record_ref
             || state.members.contains_key(&issued)
         {
-            return Err(NativeProcessError::Stale);
+            return Err(AdmissionRefusal::new(
+                AdmissionCheck::IssueMemberMismatch,
+                NativeProcessError::Stale,
+            ));
         }
         let process = member.process;
         {
             let mut graph = self.graph.lock();
-            let row = graph
-                .owner
-                .task_mut(process)
-                .map_err(|_| NativeProcessError::Stale)?;
+            let row = graph.owner.task_mut(process).map_err(|_| {
+                AdmissionRefusal::new(AdmissionCheck::IssueTask, NativeProcessError::Stale)
+            })?;
             let graph_member = row
                 .native_mut()
                 .resources_mut()
                 .members
                 .iter_mut()
                 .find(|m| m.thread == born.task && m.record == record_ref)
-                .ok_or(NativeProcessError::Stale)?;
+                .ok_or(AdmissionRefusal::new(
+                    AdmissionCheck::IssueGraphMember,
+                    NativeProcessError::Stale,
+                ))?;
             if !source
                 .zone
                 .record(record)
                 .issue_native_first_execution(source.slot)
             {
-                return Err(NativeProcessError::Stale);
+                return Err(AdmissionRefusal::stale(AdmissionCheck::IssueClaim)
+                    .observed(source.zone.record(record).claim()));
             }
             graph_member.thread = issued.task;
         }
-        let member = state
-            .members
-            .remove(&born)
-            .ok_or(NativeProcessError::Stale)?;
+        let member = state.members.remove(&born).ok_or(AdmissionRefusal::new(
+            AdmissionCheck::IssueRekey,
+            NativeProcessError::Stale,
+        ))?;
         state.members.insert(issued, member);
         for key in state.records.values_mut() {
             if *key == born {
@@ -3783,13 +3983,17 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             u32,
             bool,
         ),
-        NativeProcessError,
+        AdmissionRefusal,
     > {
         if !core::ptr::eq(source.zone, self.zone) {
-            return Err(NativeProcessError::Stale);
+            return Err(AdmissionRefusal::new(
+                AdmissionCheck::AuthZone,
+                NativeProcessError::Stale,
+            ));
         }
         let binding = super::common_entry::execution_binding(current);
-        let member_key = NativeExecutionKey::new(source.zone, binding, address)?;
+        let member_key = NativeExecutionKey::new(source.zone, binding, address)
+            .map_err(AdmissionRefusal::at(AdmissionCheck::AuthKey))?;
         // A native-owned thread birth's first admission is its first entry:
         // issue its execution before anything else authenticates it (#1100).
         // A host birth stays Born here; its host adopter issues it.
@@ -3812,25 +4016,35 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .members
             .get(&member_key)
             .cloned()
-            .ok_or(NativeProcessError::Stale)?;
+            .ok_or(AdmissionRefusal::new(
+                AdmissionCheck::AuthMember,
+                NativeProcessError::Stale,
+            ))?;
         if !core::ptr::eq(Arc::as_ptr(&member.runtime), self)
             || !words.authenticates(member.address)
         {
-            return Err(NativeProcessError::Stale);
+            return Err(AdmissionRefusal::new(
+                AdmissionCheck::AuthRuntime,
+                NativeProcessError::Stale,
+            ));
         }
         let record = source
             .zone
             .slot(source.slot)
             .current()
             .or_else(|| source.zone.slot(source.slot).host_record())
-            .ok_or(NativeProcessError::Stale)?;
-        carrick_core::entry::prepare_handoff(binding, source, record)
-            .ok_or(NativeProcessError::Stale)?;
+            .ok_or(AdmissionRefusal::new(
+                AdmissionCheck::AuthRecord,
+                NativeProcessError::Stale,
+            ))?;
+        carrick_core::entry::prepare_handoff(binding, source, record).ok_or_else(|| {
+            AdmissionRefusal::stale(AdmissionCheck::AuthHandoff)
+                .observed(source.zone.record(record).claim())
+        })?;
         let mut graph = self.graph.lock();
-        let row = graph
-            .owner
-            .task_mut(member.process)
-            .map_err(|_| NativeProcessError::Stale)?;
+        let row = graph.owner.task_mut(member.process).map_err(|_| {
+            AdmissionRefusal::new(AdmissionCheck::AuthTask, NativeProcessError::Stale)
+        })?;
         let resources = row.native().resources();
         if resources.address.mm != address.mm
             || resources.address.root != address.root
@@ -3838,32 +4052,46 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 != core::ptr::from_ref(resources.page).addr() as u64
             || current.visible_pid() != Some(row.metadata().namespace_pid)
         {
-            return Err(NativeProcessError::Stale);
+            return Err(AdmissionRefusal::new(
+                AdmissionCheck::AuthResources,
+                NativeProcessError::Stale,
+            ));
         }
         let member_control = resources
             .members
             .iter()
             .find(|m| m.thread == member_key.task)
             .map(|m| m.control.control())
-            .ok_or(NativeProcessError::Stale)?;
+            .ok_or(AdmissionRefusal::new(
+                AdmissionCheck::AuthMemberControl,
+                NativeProcessError::Stale,
+            ))?;
         if current.metadata.control_slot.load(Ordering::Acquire)
             != member_control as *const _ as u64
         {
-            return Err(NativeProcessError::Stale);
+            return Err(AdmissionRefusal::new(
+                AdmissionCheck::AuthControlSlot,
+                NativeProcessError::Stale,
+            ));
         }
         let record_ref = source.zone.record_ref(record);
         member_control.bind_zone_record(record_ref);
         if core::ptr::eq(member_control, resources.control) {
             if resources.record != record_ref {
-                return Err(NativeProcessError::Stale);
+                return Err(AdmissionRefusal::new(
+                    AdmissionCheck::AuthLeaderRecord,
+                    NativeProcessError::Stale,
+                ));
             }
             *row.context_mut() = *words;
         }
-        let calling_tid = member_control
-            .visible_tid()
-            .ok_or(NativeProcessError::Stale)?;
-        row.credentials_for(calling_tid)
-            .map_err(|_| NativeProcessError::Stale)?;
+        let calling_tid = member_control.visible_tid().ok_or(AdmissionRefusal::new(
+            AdmissionCheck::AuthVisibleTid,
+            NativeProcessError::Stale,
+        ))?;
+        row.credentials_for(calling_tid).map_err(|_| {
+            AdmissionRefusal::new(AdmissionCheck::AuthCredentials, NativeProcessError::Stale)
+        })?;
         let owner_continuation = graph.pending.parked_by(
             &member.process,
             ContinuationOwner::of(member_control, calling_tid),
@@ -6473,23 +6701,34 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .map_err(|_| NativeProcessError::Quarantined)?;
         }
         page.clear_exit_wait();
-        let permit = published
-            .effects
-            .cancel_members(|member| {
-                if member.zone.live(member.record).is_some() {
-                    let _ = member.zone.claim_for_host(
-                        member.record,
-                        None,
-                        Handback::Cancelled,
-                        &NativeBucketWait {
-                            lifetime: core::marker::PhantomData,
-                            #[cfg(test)]
-                            probe: self.publication_wait_probe,
-                        },
-                    );
-                }
-            })
-            .map_err(|_| NativeProcessError::Quarantined)?;
+        // Each claim's answer is counted, not acted on (#1100 attribution):
+        // the retirement fatal reports this tally for its slot.
+        let mut tally = carrick_el1_abi::CancelTally::default();
+        let cancelled = published.effects.cancel_members(|member| {
+            use carrick_el1_abi::CancelTally as Tally;
+            if member.zone.live(member.record).is_none() {
+                Tally::bump(&mut tally.not_live);
+                return;
+            }
+            match member.zone.claim_for_host(
+                member.record,
+                None,
+                Handback::Cancelled,
+                &NativeBucketWait {
+                    lifetime: core::marker::PhantomData,
+                    #[cfg(test)]
+                    probe: self.publication_wait_probe,
+                },
+            ) {
+                carrick_sched_core::HostClaim::Claimed => Tally::bump(&mut tally.claimed),
+                carrick_sched_core::HostClaim::El1Held { .. } => Tally::bump(&mut tally.el1_held),
+                carrick_sched_core::HostClaim::Deferred => Tally::bump(&mut tally.deferred),
+                carrick_sched_core::HostClaim::AlreadyHost => Tally::bump(&mut tally.already_host),
+                carrick_sched_core::HostClaim::Stale => Tally::bump(&mut tally.stale),
+            }
+        });
+        crate::admission_refusal::record_cancel_tally(self.source.slot, tally);
+        let permit = cancelled.map_err(|_| NativeProcessError::Quarantined)?;
         // Graph removal (`publish_exit`) and member cancellation are complete.
         // Unregister from `NativeProcessRegistry` and release all
         // `MemberControlCustody` references (graph resources, registry member,

@@ -1672,11 +1672,33 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 far,
             );
         }
+        // #1100 attribution: how this idle entry ended, and which space the
+        // slot's occupancy word still names, for a later install refusal.
+        let record_exit = |kind| {
+            carrick_kernel::kernel::mm_occupancy::record_slot_exit(
+                slot,
+                kind,
+                zone.occupancy
+                    .running_raw(carrick_sched_core::ExecutionSlot::zone(slot)),
+                zone.slot(slot)
+                    .current()
+                    .map_or(0, carrick_el1_abi::RecordId::raw),
+            )
+        };
         if let Some(service) =
             carrick_vmm_hvf::hvf_aarch64_engine::take_worker_native_service(lifecycle, slot)?
         {
+            record_exit(carrick_kernel::kernel::mm_occupancy::SlotExitKind::ServiceIdle);
             exit?;
             return Ok(GuestIdleExit::Service(Box::new(service)));
+        }
+        if let Ok(outcome) = &exit {
+            use carrick_kernel::kernel::mm_occupancy::SlotExitKind as Kind;
+            record_exit(match outcome {
+                carrick_aarch64::Aarch64Exit::Halt => Kind::Idle,
+                carrick_aarch64::Aarch64Exit::NativeRootExit { .. } => Kind::RootExit,
+                _ => Kind::Raw,
+            });
         }
         match exit? {
             carrick_aarch64::Aarch64Exit::Halt => {

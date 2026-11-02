@@ -456,7 +456,18 @@ pub fn restore_irq(guard: IrqGuard) {
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[track_caller]
 pub fn fatal_entry_binding(reason: carrick_el1_abi::EntryBindingFatalReason) -> ! {
+    fatal_entry_binding_attributed(reason, carrick_el1_abi::FatalAttribution::None)
+}
+
+/// [`fatal_entry_binding`] with the exact refusing check in x4..x12 (#1100).
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[track_caller]
+pub fn fatal_entry_binding_attributed(
+    reason: carrick_el1_abi::EntryBindingFatalReason,
+    attribution: carrick_el1_abi::FatalAttribution,
+) -> ! {
     let [reason, location] = carrick_el1_abi::EntryBindingFatalDetail::at_caller(reason).encode();
+    let [a, b, c, d, e, g, h, i, j] = attribution.encode();
     // SAFETY: this runs at EL1. HVC #3 is the image's fatal boundary, with
     // the established panic sentinel and no guest return/result publication.
     unsafe {
@@ -464,6 +475,9 @@ pub fn fatal_entry_binding(reason: carrick_el1_abi::EntryBindingFatalReason) -> 
             in("x0") carrick_el1_abi::PANIC_SENTINEL,
             in("x1") carrick_el1_abi::ENTRY_BINDING_FATAL_TAG,
             in("x2") reason, in("x3") location,
+            in("x4") a, in("x5") b, in("x6") c, in("x7") d,
+            in("x8") e, in("x9") g, in("x10") h, in("x11") i,
+            in("x12") j,
             options(nostack));
     }
     loop {
@@ -475,5 +489,15 @@ pub fn fatal_entry_binding(reason: carrick_el1_abi::EntryBindingFatalReason) -> 
 #[track_caller]
 pub fn fatal_entry_binding(reason: carrick_el1_abi::EntryBindingFatalReason) -> ! {
     let _ = reason;
+    crate::isa::x86::fatal_entry_binding()
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[track_caller]
+pub fn fatal_entry_binding_attributed(
+    reason: carrick_el1_abi::EntryBindingFatalReason,
+    attribution: carrick_el1_abi::FatalAttribution,
+) -> ! {
+    let _ = (reason, attribution);
     crate::isa::x86::fatal_entry_binding()
 }

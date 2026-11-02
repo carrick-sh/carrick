@@ -8562,6 +8562,18 @@ impl HvfInner {
                                 far_el1: vcpu.get_sys_reg(SysReg::FAR_EL1).ok(),
                                 elr_el1: vcpu.get_sys_reg(SysReg::ELR_EL1).ok(),
                                 spsr_el1: vcpu.get_sys_reg(SysReg::SPSR_EL1).ok(),
+                                attribution: [
+                                    Reg::X4,
+                                    Reg::X5,
+                                    Reg::X6,
+                                    Reg::X7,
+                                    Reg::X8,
+                                    Reg::X9,
+                                    Reg::X10,
+                                    Reg::X11,
+                                    Reg::X12,
+                                ]
+                                .map(|reg| vcpu.get_reg(reg).ok()),
                             }
                         });
                     let diagnostic = registers.and_then(|registers| {

@@ -139,24 +139,31 @@ pub fn cross_hvc_root_exit(record_gpa: u64, cpu: u64) -> Result<(), ()> {
     }
 }
 
-// `Err(())` is the carrier's single refusal; callers own its meaning.
-#[allow(clippy::result_unit_err)]
-pub fn cross_hvc_child_retire(record_gpa: u64, cpu: u64) -> Result<(), ()> {
+/// The carrier refuses with the arm that denied it (#1100), carried in
+/// x1/x2 of the reply; callers own its meaning.
+pub fn cross_hvc_child_retire(
+    record_gpa: u64,
+    cpu: u64,
+) -> Result<(), carrick_el1_abi::TerminalRetireRefusal> {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     {
         let mut status: u64 = carrick_el1_abi::GRANT_OP_CHILD_RETIRE;
+        let arm: u64;
+        let detail: u64;
         unsafe {
             core::arch::asm!(
                 "hvc #6",
                 inout("x0") status,
-                inlateout("x1") record_gpa => _,
-                inlateout("x2") cpu => _,
+                inlateout("x1") record_gpa => arm,
+                inlateout("x2") cpu => detail,
                 inlateout("x3") 0u64 => _,
                 options(nostack)
             );
         }
         if status != 0 {
-            return Err(());
+            return Err(carrick_el1_abi::TerminalRetireRefusal::from_words([
+                arm, detail,
+            ]));
         }
         Ok(())
     }

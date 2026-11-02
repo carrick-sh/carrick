@@ -28,6 +28,7 @@ use carrick_sched_core::{
 use core::num::NonZeroU64;
 use core::sync::atomic::Ordering;
 
+use super::admission_refusal::{AdmissionCheck as Check, AdmissionPath, AdmissionRefusal};
 use super::common_entry;
 use super::mm_portal::{LinuxForkPolicy, NativeForkPortal, UnpublishedEl1Child};
 use super::native_fork_refusal::{NativeForkStage, refused};
@@ -481,6 +482,7 @@ pub(super) fn map_resume<X: ForkStockCrossing>(
 }
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[cfg(test)]
 pub(super) fn process_record_for_call(
     source: BornInZoneSource<'_, Aarch64ParkedContext>,
     task: &CurrentTask,
@@ -488,6 +490,19 @@ pub(super) fn process_record_for_call(
     ttbr0: u64,
     control: &ThreadControlSlot,
 ) -> Result<RecordId, NativeProcessError> {
+    process_record_attributed(source, task, native, ttbr0, control)
+        .map_err(NativeProcessError::from)
+}
+
+/// [`process_record_for_call`], naming the refusing check (#1100).
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+fn process_record_attributed(
+    source: BornInZoneSource<'_, Aarch64ParkedContext>,
+    task: &CurrentTask,
+    native: &carrick_sched_core::ThreadCtx,
+    ttbr0: u64,
+    control: &ThreadControlSlot,
+) -> Result<RecordId, AdmissionRefusal> {
     let lane = source.zone.slot(source.slot);
     let existing = lane.current().or_else(|| lane.host_record());
     if let Some(record) = existing
@@ -509,16 +524,18 @@ fn init_process_record(
     ttbr0: u64,
     host_record: Option<RecordId>,
     control: &ThreadControlSlot,
-) -> Result<RecordId, NativeProcessError> {
+) -> Result<RecordId, AdmissionRefusal> {
     let lane = source.zone.slot(source.slot);
     let address = Mm {
         root: RootGpa::page_aligned(FrameGpa::new(ttbr0 & AARCH64_ROOT_ADDRESS_MASK))
-            .ok_or(NativeProcessError::Stale)?,
+            .ok_or(AdmissionRefusal::stale(Check::RecordRoot))?,
         mm: MmGeneration::new(
             NonZeroU64::new(task.mm.key.load(Ordering::Acquire))
-                .ok_or(NativeProcessError::Stale)?,
+                .ok_or(AdmissionRefusal::stale(Check::RecordMm))?,
         ),
-        generation: task.root_generation().ok_or(NativeProcessError::Stale)?,
+        generation: task
+            .root_generation()
+            .ok_or(AdmissionRefusal::stale(Check::RecordRootGeneration))?,
     };
     let record = match host_record {
         Some(record) => record,
@@ -528,7 +545,9 @@ fn init_process_record(
                 source.slot,
                 crate::sched::identity_of(task, lane.affinity()),
             )
-            .map_err(|_| NativeProcessError::Exhausted)?,
+            .map_err(|_| {
+                AdmissionRefusal::new(Check::RecordAllocate, NativeProcessError::Exhausted)
+            })?,
     };
     // SAFETY: the current host lane owns its unpublished home record.
     unsafe {
@@ -553,8 +572,9 @@ pub fn admit_entry(
     page: &'static ThreadLifecyclePage,
     control: &'static ThreadControlSlot,
 ) -> Result<(Arc<Runtime>, Mm, Aarch64ParkedContext), NativeProcessError> {
-    let (runtime, address) =
-        admit_entry_runtime(source, task, native, ttbr0, record, page, control)?;
+    let (runtime, address, _) =
+        admit_entry_runtime(source, task, native, ttbr0, record, page, control)
+            .map_err(NativeProcessError::from)?;
     let words = Aarch64ParkedContext::from_register(
         *native,
         ttbr0,
@@ -574,20 +594,19 @@ fn admit_entry_runtime(
     record: RecordId,
     page: &'static ThreadLifecyclePage,
     control: &'static ThreadControlSlot,
-) -> Result<(Arc<Runtime>, Mm), NativeProcessError> {
+) -> Result<(Arc<Runtime>, Mm, AdmissionPath), AdmissionRefusal> {
     // SAFETY: the EL1 caller owns the running slot and its record until the
     // process route returns to the vector.
-    let observed = unsafe { observed_entry_address(source, task, ttbr0, record)? };
+    let observed = unsafe { observed_entry_attributed(source, task, ttbr0, record)? };
+    let pid = || {
+        task.visible_pid()
+            .ok_or(AdmissionRefusal::stale(Check::GroupVisiblePid))
+    };
     let address = if control.entry().is_some() {
-        REGISTRY
-            .group_address(
-                source.zone,
-                observed,
-                page,
-                task.visible_pid().ok_or(NativeProcessError::Stale)?,
-            )
+        let group = REGISTRY.group_address(source.zone, observed, page, pid()?);
+        group
             .filter(|address| *address == observed)
-            .ok_or(NativeProcessError::Stale)?
+            .ok_or(AdmissionRefusal::stale(Check::GroupAddress))?
     } else {
         observed
     };
@@ -596,35 +615,79 @@ fn admit_entry_runtime(
             .for_record(source.zone, source.zone.record_ref(record))
             .is_some_and(|retained| Arc::ptr_eq(&retained, &runtime))
     {
-        return Ok((runtime, address));
+        return Ok((runtime, address, AdmissionPath::ForEntry));
     }
-    if control.entry().is_some()
-        || REGISTRY
-            .group_address(
-                source.zone,
-                address,
-                page,
-                task.visible_pid().ok_or(NativeProcessError::Stale)?,
-            )
-            .is_some()
-    {
-        let runtime = match REGISTRY.rehome_entry(source, task, address, page, control)? {
-            Some(runtime) => runtime,
-            None => REGISTRY.register_thread(source, task, address, page, control)?,
+    // Same short-circuit as before: a published birth never asks the group.
+    let group = if control.entry().is_some() {
+        None
+    } else {
+        REGISTRY.group_address(source.zone, address, page, pid()?)
+    };
+    let annotate = |path| move |refusal: AdmissionRefusal| refusal.routed(path);
+    if control.entry().is_some() || group.is_some() {
+        let runtime = match REGISTRY
+            .rehome_entry_attributed(source, task, address, page, control)
+            .map_err(annotate(AdmissionPath::Rehome))?
+        {
+            Some(runtime) => (runtime, AdmissionPath::Rehome),
+            None => (
+                REGISTRY
+                    .register_thread_attributed(source, task, address, page, control)
+                    .map_err(annotate(AdmissionPath::Register))?,
+                AdmissionPath::Register,
+            ),
         };
-        return Ok((runtime, address));
+        return Ok((runtime.0, address, runtime.1));
     }
+    admit_fresh_root_attributed(source, task, native, ttbr0, page, control, address)
+}
+
+/// The fresh-root arm of [`admit_entry_runtime`] (#1100). The runtime is
+/// built and boxed out of line exactly as before; only the `Arc` crosses
+/// back, so naming the refusing check never copies the runtime by value.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn admit_fresh_root_attributed(
+    source: BornInZoneSource<'static, Aarch64ParkedContext>,
+    task: &'static CurrentTask,
+    native: &carrick_sched_core::ThreadCtx,
+    ttbr0: u64,
+    page: &'static ThreadLifecyclePage,
+    control: &'static ThreadControlSlot,
+    address: Mm,
+) -> Result<(Arc<Runtime>, Mm, AdmissionPath), AdmissionRefusal> {
+    let refused =
+        |check| move |error| AdmissionRefusal::new(check, error).routed(AdmissionPath::FreshRoot);
+    let runtime = fresh_root_runtime(source, task, native, ttbr0, page, control, address)
+        .map_err(refused(Check::FreshRoot))?;
+    REGISTRY
+        .register_root(runtime.clone(), source, task, address)
+        .map_err(refused(Check::RegisterRoot))?;
+    Ok((runtime, address, AdmissionPath::FreshRoot))
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn fresh_root_runtime(
+    source: BornInZoneSource<'static, Aarch64ParkedContext>,
+    task: &'static CurrentTask,
+    native: &carrick_sched_core::ThreadCtx,
+    ttbr0: u64,
+    page: &'static ThreadLifecyclePage,
+    control: &'static ThreadControlSlot,
+    address: Mm,
+) -> Result<Arc<Runtime>, NativeProcessError> {
     let words = Aarch64ParkedContext::from_register(
         *native,
         ttbr0,
         address.mm.raw().get(),
         address.generation.raw().get(),
     );
-    let runtime = Arc::new(NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+    Ok(Arc::new(NativeProcessRuntime::admit_fresh_root::<
+        Aarch64Mmu,
+    >(
         source, task, page, control, address, address, words,
-    )?);
-    REGISTRY.register_root(runtime.clone(), source, task, address)?;
-    Ok((runtime, address))
+    )?))
 }
 
 /// Unpublished admission custody is scoped to this call: a home left in a
@@ -675,13 +738,11 @@ pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
         >,
     ) -> R,
 ) -> Result<R, NativeProcessError> {
-    let record = process_record_for_call(source, task, native, ttbr0, control)?;
-    let _home = AdmissionHome {
-        source,
-        record: source.zone.record_ref(record),
+    let (_home, runtime, address, path) =
+        admit_with_home(source, task, native, ttbr0, page, control)?;
+    let leave = |refusal: AdmissionRefusal| {
+        super::admission_refusal::leave_admission(source.slot, refusal.routed(path))
     };
-    let (runtime, address) =
-        admit_entry_runtime(source, task, native, ttbr0, record, page, control)?;
     task.publish_root_generation(address.generation);
     let (result, root_exit) = {
         let mut process = {
@@ -693,9 +754,13 @@ pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
             ));
             #[cfg(target_os = "none")]
             drain_native_signal_ingress(registry(), source, service);
-            runtime.enter_registered(registry(), source, task, address, &words, service)?
+            runtime
+                .enter_registered_attributed(registry(), source, task, address, &words, service)
+                .map_err(leave)?
         };
-        process.import_in_zone_standard_signals()?;
+        process
+            .import_in_zone_standard_signals()
+            .map_err(|error| leave(AdmissionRefusal::new(Check::ImportSignals, error)))?;
         let result = dispatch(&mut process);
         (result, process.take_root_exit())
     };
@@ -719,6 +784,30 @@ pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
         }
     }
     Ok(result)
+}
+
+/// The record and registry half of [`with_process_entry`], out of line so
+/// its refusal values never occupy the frame that later runs the dispatch
+/// (#1100: the native backing reply chain sums that frame).
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[inline(never)]
+fn admit_with_home(
+    source: BornInZoneSource<'static, Aarch64ParkedContext>,
+    task: &'static CurrentTask,
+    native: &carrick_sched_core::ThreadCtx,
+    ttbr0: u64,
+    page: &'static ThreadLifecyclePage,
+    control: &'static ThreadControlSlot,
+) -> Result<(AdmissionHome, Arc<Runtime>, Mm, AdmissionPath), NativeProcessError> {
+    let leave = |refusal| super::admission_refusal::leave_admission(source.slot, refusal);
+    let record = process_record_attributed(source, task, native, ttbr0, control).map_err(leave)?;
+    let home = AdmissionHome {
+        source,
+        record: source.zone.record_ref(record),
+    };
+    let (runtime, address, path) =
+        admit_entry_runtime(source, task, native, ttbr0, record, page, control).map_err(leave)?;
+    Ok((home, runtime, address, path))
 }
 
 /// Deliver a synchronous fault through the admitted `SignalOwner`: the host
@@ -778,7 +867,7 @@ where
                     },
                 )
                 .map_err(|_| NativeProcessError::Fault)?;
-            Ok(deliver(process))
+            Ok::<_, NativeProcessError>(deliver(process))
         },
     )??;
     if control
@@ -803,29 +892,65 @@ where
 ///
 /// # Safety
 /// The caller must own the stopped/running record exclusively.
+#[cfg(test)]
 pub(super) unsafe fn observed_entry_address(
     source: BornInZoneSource<'_, Aarch64ParkedContext>,
     task: &CurrentTask,
     ttbr0: u64,
     record: RecordId,
 ) -> Result<Mm, NativeProcessError> {
+    // SAFETY: forwarded caller contract.
+    unsafe { observed_entry_attributed(source, task, ttbr0, record) }
+        .map_err(NativeProcessError::from)
+}
+
+/// [`observed_entry_address`], naming the first refusing identity check
+/// (#1100). The checks and their order are unchanged.
+///
+/// # Safety
+/// As [`observed_entry_address`].
+#[inline(never)]
+unsafe fn observed_entry_attributed(
+    source: BornInZoneSource<'_, Aarch64ParkedContext>,
+    task: &CurrentTask,
+    ttbr0: u64,
+    record: RecordId,
+) -> Result<Mm, AdmissionRefusal> {
     let zone_record = source.zone.record(record);
     let binding = common_entry::execution_binding(task);
     let identity = zone_record.identity();
     // SAFETY: required by this function's caller contract.
     let address = unsafe { zone_record.ctx_mut() }
         .address_context()
-        .ok_or(NativeProcessError::Stale)?;
-    ((binding.issued() || carrick_core::entry::admit_born_in_zone(binding, source).is_some())
-        && identity.tid == binding.task.raw()
-        && identity.generation == binding.generation.raw()
-        && identity.serial == binding.thread_generation.raw()
-        && identity.mm == binding.mm.raw()
-        && source.zone.installed_space(source.slot) == binding.mm.raw()
-        && address.mm.raw().get() == binding.mm.raw()
-        && address.root.address().raw() == ttbr0 & AARCH64_ROOT_ADDRESS_MASK)
-        .then_some(address)
-        .ok_or(NativeProcessError::Stale)
+        .ok_or(AdmissionRefusal::stale(Check::ObservedAddressContext))?;
+    let refuse = |check| Err(AdmissionRefusal::stale(check));
+    if !(binding.issued() || carrick_core::entry::admit_born_in_zone(binding, source).is_some()) {
+        return Err(
+            AdmissionRefusal::stale(Check::ObservedBornAdmission).observed(zone_record.claim())
+        );
+    }
+    if identity.tid != binding.task.raw() {
+        return refuse(Check::ObservedTid);
+    }
+    if identity.generation != binding.generation.raw() {
+        return refuse(Check::ObservedGeneration);
+    }
+    if identity.serial != binding.thread_generation.raw() {
+        return refuse(Check::ObservedSerial);
+    }
+    if identity.mm != binding.mm.raw() {
+        return refuse(Check::ObservedMm);
+    }
+    if source.zone.installed_space(source.slot) != binding.mm.raw() {
+        return refuse(Check::ObservedInstalledSpace);
+    }
+    if address.mm.raw().get() != binding.mm.raw() {
+        return refuse(Check::ObservedAddressMm);
+    }
+    if address.root.address().raw() != ttbr0 & AARCH64_ROOT_ADDRESS_MASK {
+        return refuse(Check::ObservedRoot);
+    }
+    Ok(address)
 }
 
 pub struct AdmittedCustodyToken {
@@ -1182,8 +1307,10 @@ impl ForkStockCrossing for HvcForkStockCrossing {
     fn cross_child_retire(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError> {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
-            carrick_el1::isa::aarch64::cross_hvc_child_retire(record_gpa, cpu)
-                .map_err(|_| NativeProcessError::Fault)
+            carrick_el1::isa::aarch64::cross_hvc_child_retire(record_gpa, cpu).map_err(|denial| {
+                super::admission_refusal::record_retire_denial(cpu, denial);
+                NativeProcessError::Fault
+            })
         }
         #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         {
@@ -2520,40 +2647,59 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     }
 
     fn retire_mm(&mut self, mm: Self::Mm) {
+        use carrick_el1_abi::RetireStep as Step;
         let binding = common_entry::execution_binding(self.task);
         let source = carrick_el1_abi::BornInZoneSource {
             zone: self.zone,
             slot: self.slot,
         };
+        let slot = self.slot;
+        let refused = |step| -> ! { retire_refused(step, slot, mm.mm.raw().get(), binding, None) };
         if !carrick_core::entry::terminal_matches(
             binding,
             source,
             carrick_sched_core::TerminalPhase::PendingRetirement,
-        ) || binding.mm.raw() != mm.mm.raw().get()
-        {
-            fatal();
+        ) {
+            refused(Step::TerminalPhase);
+        }
+        if binding.mm.raw() != mm.mm.raw().get() {
+            refused(Step::MmMismatch);
         }
         let Some(index) = self.zone.spaces.find(binding.mm.raw()) else {
-            fatal();
+            refused(Step::SpaceMissing);
         };
         self.zone.spaces.close(index);
         let Some(mut retire) = carrick_el1_abi::NativeChildRetire::new(binding, mm) else {
-            fatal();
+            refused(Step::RetireRecord);
         };
         if self
             .crossing
             .cross_child_retire(&raw mut retire as u64, u64::from(self.worker()))
             .is_err()
-            || !matches!(retire.take(binding, mm), Some(Ok(())))
         {
-            fatal();
+            retire_refused(
+                Step::CrossingRefused,
+                self.slot,
+                mm.mm.raw().get(),
+                binding,
+                super::admission_refusal::retire_denial(u64::from(self.worker())),
+            );
+        }
+        match retire.take(binding, mm) {
+            Some(Ok(())) => {}
+            None => refused(Step::ReplyMissing),
+            Some(Err(carrick_el1_abi::ChildRetireRefusal::Stale)) => refused(Step::ReplyStale),
+            Some(Err(carrick_el1_abi::ChildRetireRefusal::Invalid)) => refused(Step::ReplyInvalid),
         }
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
             let live = carrick_el1::isa::aarch64::hardware_live_ttbr();
             let idle = self.zone.spaces.idle_ttbr();
-            if live & AARCH64_ROOT_ADDRESS_MASK != mm.root.address().raw() || idle == 0 {
-                fatal();
+            if live & AARCH64_ROOT_ADDRESS_MASK != mm.root.address().raw() {
+                refused(Step::LiveRoot);
+            }
+            if idle == 0 {
+                refused(Step::IdleRoot);
             }
             crate::sched::ThreadCpu::set_translation(&mut crate::sched::HardwareCpu, idle, idle);
             crate::sched::ThreadCpu::invalidate_asid(&mut crate::sched::HardwareCpu, live);
@@ -2563,7 +2709,15 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             carrier: self.carrier,
             zone: core::ptr::from_ref(self.zone).addr(),
             roots: core::ptr::from_ref(self.roots).addr(),
-            mm: ReservationMm::new(binding.mm.raw()).unwrap_or_else(|| fatal()),
+            mm: ReservationMm::new(binding.mm.raw()).unwrap_or_else(|| {
+                retire_refused(
+                    carrick_el1_abi::RetireStep::ReservationMm,
+                    self.slot,
+                    mm.mm.raw().get(),
+                    binding,
+                    None,
+                )
+            }),
         });
         // The final child may be the run's last fork. Once its translation
         // has been released, let the shared MM owner retire the closed root
@@ -2775,4 +2929,34 @@ pub fn cross_root_exit<X: ForkStockCrossing>(
 #[track_caller]
 fn fatal() -> ! {
     panic!("native aarch64 process service failure")
+}
+
+/// `retire_mm` refused a child address-space retirement: name the EL1 step,
+/// the host's denial arm and the preceding cancellation tally (#1100).
+#[cold]
+#[inline(never)]
+#[track_caller]
+fn retire_refused(
+    step: carrick_el1_abi::RetireStep,
+    slot: SlotId,
+    mm: u64,
+    binding: carrick_el1_abi::ExecutionBinding,
+    host: Option<carrick_el1_abi::TerminalRetireRefusal>,
+) -> ! {
+    let attribution =
+        carrick_el1_abi::FatalAttribution::Retire(carrick_el1_abi::RetireAttribution {
+            step,
+            host,
+            mm,
+            binding_generation: binding.generation.raw() as u32,
+            slot: slot.raw(),
+            cancel: super::admission_refusal::cancel_tally(slot),
+        });
+    #[cfg(target_os = "none")]
+    carrick_el1::substrate::sched::hw::fatal_entry_binding_attributed(
+        carrick_el1_abi::EntryBindingFatalReason::ChildRetireRefused,
+        attribution,
+    );
+    #[cfg(not(target_os = "none"))]
+    panic!("native aarch64 process service failure:{attribution}")
 }

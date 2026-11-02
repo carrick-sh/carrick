@@ -1243,9 +1243,17 @@ fn arm_native_service_exit(
             (result, process.native_service_phase())
         },
     )
-    // Keep entry admission separate from dispatch/settlement: these source
-    // locations and the exact error survive the existing fatal transport.
-    .unwrap_or_else(|error| invalid_completion(native_service_invariant(error)));
+    // Keep entry admission separate from dispatch/settlement: the refusing
+    // admission check and its custody state survive the fatal transport.
+    .unwrap_or_else(|error| {
+        invalid_admission(
+            carrick_el1_abi::EntryBindingFatalReason::NativeServiceAdmission,
+            error,
+            zone,
+            slot,
+            task,
+        )
+    });
     let result = result
         .unwrap_or_else(|error| invalid_completion(native_service_invariant_at(error, phase)));
     Some(match result {
@@ -1596,7 +1604,15 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
         &mut service,
         |process| super::arm_signal::deliver_on_user_return(task, process, frame),
     )
-    .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
+    .unwrap_or_else(|error| {
+        invalid_admission(
+            carrick_el1_abi::EntryBindingFatalReason::UserReturnAdmission,
+            error,
+            zone,
+            slot,
+            task,
+        )
+    });
     match delivered {
         None | Some(carrick_personality_linux::dispatch::CompletionRoute::Served) => Action::Served,
         Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended) => Action::Idle,
@@ -2064,6 +2080,33 @@ fn native_service_fatal_reason(
         Error::OwnerWait(_) => Fatal::NativeServiceOwnerWait,
         Error::ForkRefused(refusal) => native_service_fatal_reason(refusal.error()),
     }
+}
+
+/// A refused native process admission is fatal at this site: name the exact
+/// refusing check and the custody state it saw (#1100). Cold and out of line
+/// so the attribution never enlarges the admitting frame.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[cold]
+#[inline(never)]
+#[track_caller]
+pub(super) fn invalid_admission(
+    reason: carrick_el1_abi::EntryBindingFatalReason,
+    error: super::native_process_runtime::NativeProcessError,
+    zone: &ZoneTables,
+    slot: SlotId,
+    task: &CurrentTask,
+) -> ! {
+    let attribution =
+        carrick_el1_abi::FatalAttribution::Admission(super::admission_refusal::attribute(
+            super::admission_refusal::recorded(slot, error),
+            zone,
+            slot,
+            task,
+            super::aarch64_process::registry(),
+            carrick_el1::isa::aarch64::hardware_live_ttbr()
+                & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK,
+        ));
+    carrick_el1::substrate::sched::hw::fatal_entry_binding_attributed(reason, attribution)
 }
 
 #[track_caller]

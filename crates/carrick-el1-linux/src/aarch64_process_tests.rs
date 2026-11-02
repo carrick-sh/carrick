@@ -5932,6 +5932,23 @@ fn arm_host_born_sibling_refuses_stale_or_foreign_binding() {
             |_| (),
         );
         assert!(admitted.is_err(), "{defect:?} must not adopt");
+        // #1100 attribution: the production entry names the refusing check.
+        let refusal = crate::admission_refusal::recorded(service.slot, admitted.unwrap_err());
+        {
+            use crate::admission_refusal::{AdmissionCheck as Check, AdmissionPath as Path};
+            let expected = match defect {
+                Defect::UnissuedGeneration => (Check::ObservedBornAdmission, Path::Unrouted),
+                Defect::StaleRecordSerial => (Check::ObservedSerial, Path::Unrouted),
+                Defect::StaleRecordGeneration => (Check::ObservedGeneration, Path::Unrouted),
+                Defect::ForeignPage | Defect::ForeignPid => (Check::FreshRoot, Path::FreshRoot),
+                Defect::ForeignControl => (Check::RehomeHostIdentity, Path::Rehome),
+                Defect::LeaderTid | Defect::NoCensus => {
+                    (Check::RegisterAuthorizeGroup, Path::Register)
+                }
+                Defect::DuplicateTid => (Check::RegisterHostThread, Path::Register),
+            };
+            assert_eq!((refusal.check, refusal.path), expected, "{defect:?}");
+        }
         let source = BornInZoneSource {
             zone: fixture.zone,
             slot: fixture.slot,
@@ -11400,4 +11417,14 @@ fn arm_classified_fault_rejects_non_fault_returns_without_clobbering_syndrome() 
         assert_eq!(result, Err(NativeProcessError::Invalid));
         assert_eq!((frame.esr, frame.far), (esr, 0xabc));
     }
+}
+
+/// #1100 attribution: a refused child retirement names its exact EL1 step
+/// through the production `retire_mm`, not a bare service failure.
+#[test]
+#[should_panic(expected = "retire_step=TerminalPhase")]
+fn arm_retire_refusal_names_its_step() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    super::native_process_runtime::NativeProcessService::retire_mm(&mut service, fixture.address);
 }

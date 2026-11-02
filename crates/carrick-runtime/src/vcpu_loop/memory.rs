@@ -904,6 +904,7 @@ mod tests {
                 far_el1: Some(0x7070),
                 elr_el1: Some(0x8080),
                 spsr_el1: Some(0x9090),
+                attribution: [Some(0); carrick_el1_abi::FATAL_ATTRIBUTION_WORDS],
             },
             slot: carrick_el1_abi::SlotId::new(0),
             frame_slot: 0,

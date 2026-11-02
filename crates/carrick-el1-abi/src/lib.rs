@@ -36,6 +36,8 @@ mod image_layout_tests;
 #[cfg(all(test, feature = "loom"))]
 mod loom_models;
 pub use entry_binding_fatal::*;
+mod fatal_attribution;
+pub use fatal_attribution::*;
 mod open_lifetime;
 pub use open_lifetime::*;
 mod cow_grants;
