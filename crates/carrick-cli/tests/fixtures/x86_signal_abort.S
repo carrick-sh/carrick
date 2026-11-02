@@ -2,6 +2,24 @@
 .global _start
 .text
 _start:
+ # Set the limit in the fixture, not only in the host oracle launcher.
+ mov $160, %eax
+ mov $4, %edi
+ lea zero_core_limit(%rip), %rsi
+ syscall
+ test %rax, %rax
+ jne fail
+ # Both the Linux oracle and Carrick must enter the same zero-limit case.
+ mov $97, %eax
+ mov $4, %edi
+ lea core_limit(%rip), %rsi
+ syscall
+ test %rax, %rax
+ jne fail
+ cmpq $0, core_limit(%rip)
+ jne fail
+ cmpq $0, core_limit+8(%rip)
+ jne fail
  mov $14, %eax
  mov $2, %edi
  lea mask(%rip), %rsi
@@ -67,6 +85,8 @@ exit:
  ud2
 .data
 .align 8
+zero_core_limit: .quad 0, 0
+core_limit: .quad -1, -1
 mask: .quad 0x10000
 timeout: .quad 1, 0
 info: .zero 128

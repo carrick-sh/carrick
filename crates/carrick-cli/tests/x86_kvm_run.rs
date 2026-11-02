@@ -1760,24 +1760,7 @@ fn compare_mounted_binary_with_native(
     expected_exit: i32,
     run_id: &str,
 ) {
-    let mut native_command = std::process::Command::new(elf);
-    if run_id == "x86_signal_abort.S" {
-        // Only the native oracle child changes its limit. A core-class signal
-        // must not imply that a core file was actually written.
-        unsafe {
-            native_command.pre_exec(|| {
-                let limit = libc::rlimit {
-                    rlim_cur: 0,
-                    rlim_max: 0,
-                };
-                if libc::setrlimit(libc::RLIMIT_CORE, &limit) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
-    let native = Command::from_std(native_command)
+    let native = Command::new(elf)
         .timeout(Duration::from_secs(5))
         .output()
         .expect("run native x86 Linux oracle");

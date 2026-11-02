@@ -19,6 +19,11 @@ production carrier, physical/MM custody, task scheduling and work counters
 must be bound before this contract can claim a structural or runtime pass.
 The one-page, two-slot Cpl0Carrier fixture and retired bringup_fns path are
 not execution bindings for this contract.
+The SIGABRT fixture sets and reads back RLIMIT_CORE=0 inside the same ELF
+on both sides before fork. Its parent requires SIGCHLD si_code=CLD_KILLED,
+si_status=SIGABRT and wait4 status 6 (no WCOREDUMP). A host-only oracle
+limit cannot establish this common precondition. This witness covers zero
+limit termination only; unlimited-limit publication remains unresolved.
 """
 
 [bindings]
