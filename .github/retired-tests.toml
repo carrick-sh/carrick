@@ -1,0 +1,7 @@
+# PR-scoped retired or renamed gated tests (docs/ci/mac-hvf-runner.md#retiring-or-renaming-gated-tests-githubretired-teststoml).
+
+[[retired]]
+test = "carrick_el1_linux::native_process_runtime::host_test_support::native_child_exec_after_ring_setuid_is_refused_before_service"
+reason = "#1392: a child's exec after a ring setuid is now served with the child's own credentials instead of refused, so the refusal witness became a credential-carrying witness."
+replaced_by = "carrick_el1_linux::native_process_runtime::host_test_support::native_child_exec_after_ring_setuid_carries_the_new_credentials"
+pr = 1409
