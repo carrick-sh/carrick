@@ -188,7 +188,7 @@ jobs:
         run: '"$RUNNER_TEMP/carrick-dispatch-driver" agent-runner auth --event "$GITHUB_EVENT_PATH"'
       - name: Run owner dispatch through the policy tool server
         id: loop
-        if: ${{ !cancelled() && steps.driver.outcome == 'success' && steps.admission.outcome == 'success' && steps.bootstrap.outcome == 'success' && steps.auth.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.driver.outcome == 'success' && steps.admission.outcome == 'success' }}
         timeout-minutes: 72
         # Publish and board App tokens are minted on demand by the ctb
         # controller through the runner state directory (#1012).
@@ -200,24 +200,13 @@ jobs:
           "$RUNNER_TEMP/carrick-dispatch-driver" host-lease --mode gate --check-load -- \
             "$RUNNER_TEMP/carrick-dispatch-driver" dispatch-worker loop --event "$GITHUB_EVENT_PATH" \
             --setup-status '${{ steps.bootstrap.outcome }}/${{ steps.auth.outcome }}'
-      - name: Report bootstrap or auth failure
-        id: setup_failure
-        if: ${{ !cancelled() && steps.driver.outcome == 'success' && steps.admission.outcome == 'success' && (steps.bootstrap.outcome != 'success' || steps.auth.outcome != 'success') }}
-        timeout-minutes: 5
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          CARRICK_DISPATCH_STEP_STARTED_AT=$(date +%s)
-          export CARRICK_DISPATCH_STEP_STARTED_AT
-          "$RUNNER_TEMP/carrick-dispatch-driver" dispatch-worker loop --event "$GITHUB_EVENT_PATH" \
-            --setup-status '${{ steps.bootstrap.outcome }}/${{ steps.auth.outcome }}'
       - name: Verify retirement before credentialed completion
         id: retire
         if: ${{ !cancelled() && steps.driver.outcome == 'success' }}
         run: '"$RUNNER_TEMP/carrick-dispatch-driver" dispatch-worker guard --retire --event "$GITHUB_EVENT_PATH"'
       - uses: actions/upload-artifact@v4
         id: upload
-        if: ${{ !cancelled() && steps.retire.outcome == 'success' && ((steps.loop.outputs.artifacts_ready == 'true' && (steps.loop.outcome == 'success' || steps.loop.outcome == 'failure')) || (steps.setup_failure.outputs.artifacts_ready == 'true' && steps.setup_failure.outcome == 'failure')) }}
+        if: ${{ !cancelled() && steps.retire.outcome == 'success' && steps.loop.outputs.artifacts_ready == 'true' && (steps.loop.outcome == 'success' || steps.loop.outcome == 'failure') }}
         with:
           name: dispatch-${{ steps.admission.outputs.issue }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/dispatch-output
@@ -230,7 +219,7 @@ jobs:
             "$RUNNER_TEMP/carrick-dispatch-driver" agent-runner cleanup
           fi
       - name: Reflect the worker contract in the job verdict
-        if: ${{ !cancelled() && (steps.loop.outputs.worker_failed == 'true' || steps.setup_failure.outputs.worker_failed == 'true') }}
+        if: ${{ !cancelled() && steps.loop.outputs.worker_failed == 'true' }}
         run: exit 1
 
   chain:
