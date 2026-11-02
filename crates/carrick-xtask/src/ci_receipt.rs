@@ -527,10 +527,28 @@ fn meta_is_test(meta: &syn::Meta) -> bool {
     false
 }
 
+/// `global_asm!`, `core::arch::global_asm!` or `std::arch::global_asm!`:
+/// an item macro that emits assembly only and so cannot define a test.
+fn is_global_asm(path: &syn::Path) -> bool {
+    let segments: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+    matches!(
+        segments
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice(),
+        ["global_asm"] | ["core", "arch", "global_asm"] | ["std", "arch", "global_asm"]
+    )
+}
+
 impl<'ast> syn::visit::Visit<'ast> for TestSourceScan {
     fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
         // An imported generator can emit tests without a local macro_rules!.
-        self.unresolved = Some("item macro generator");
+        // `global_asm!` is the one item macro that provably can't: it emits
+        // assembly, never Rust items.
+        if !is_global_asm(&item.mac.path) {
+            self.unresolved = Some("item macro generator");
+        }
         syn::visit::visit_item_macro(self, item);
     }
 
