@@ -9656,6 +9656,250 @@ fn activate_target(
     panic!("target record {:?} not runnable in slot", binding.record.id);
 }
 
+/// The ARM EL1 vector's close(57)/fstat(80) fast return, as emitted by
+/// `carrick-mem`'s `write_fstat_ceiling_handler`: with the carrier gate
+/// enabled, `-EBADF` before any EL1 dispatch for a nonnegative fd strictly
+/// above the carrier ceiling word. A live descriptor it would answer is a
+/// descriptor the guest can never close (#1398).
+#[cfg(not(target_os = "macos"))]
+fn vector_fast_path_answers_ebadf(fd: i64) -> bool {
+    let ceiling = carrick_el1_abi::fd_ceiling_host_value().expect("fixture ceiling word");
+    fd >= 0 && fd > i64::from(ceiling)
+}
+
+// #1398. Production state this fixture models: the carrier-wide descriptor
+// ceiling word the EL1 vector reads before EL1 dispatch, which host
+// FileTable installs raised only to the root's highest descriptor. Two live
+// native children each dup a descriptor past the capacity they inherited
+// (in-ring table growth, no host FileTable), then close every new fd. Each
+// live fd must be at or below the ceiling the vector compares against, and
+// each close must complete in ring with 0. On main the ring never raised the
+// ceiling, so the vector answered EBADF for every fd above the root's.
+// Same Linux-only placement as the fixture below.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_children_close_descriptors_above_inherited_capacity() {
+    use carrick_el1_abi::ipc::{IpcBacking, fd, pipe::End};
+    use carrick_kernel::el1_ipc::{HostIpc, HostTable, IpcLimits};
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use std::sync::Arc;
+
+    // The host published the root's descriptors 0..=1 (FdCeilingAuthority
+    // starts at 2); nothing else raises this word but the ring.
+    let ceiling: &'static core::sync::atomic::AtomicU32 =
+        Box::leak(Box::new(core::sync::atomic::AtomicU32::new(2)));
+    carrick_el1_abi::record_fd_ceiling_host_word(ceiling);
+
+    let fixture = Fixture::new(0x10000, asid(1));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let words = fixture.tables.live(&fixture.maintenance);
+    let task = CurrentTask::new();
+    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+        source,
+        &fixture.task,
+        fixture.page,
+        fixture.control,
+        fixture.address,
+        fixture.address,
+        parked,
+    )
+    .unwrap();
+    let owner = Arc::new(
+        HostIpc::with_limits(
+            1 << 20,
+            IpcLimits {
+                descriptions: carrick_el1_abi::ipc::IPC_OFD_SEGMENT,
+                ..IpcLimits::ZONE
+            },
+        )
+        .unwrap(),
+    );
+    // Capacity 2: every child dup lands above the inherited capacity and
+    // grows the child's ring-owned table in ring.
+    let table = HostTable::create(Arc::clone(&owner), 64, 2).unwrap();
+    let object = owner.create_pipe(65536).unwrap();
+    let reader = owner
+        .admit_description(fd::Description::new(
+            IpcBacking::Pipe {
+                object,
+                end: End::Reader,
+            }
+            .encode(),
+            fd::AccessMode::ReadOnly,
+            fd::StatusFlags::default(),
+        ))
+        .unwrap();
+    let writer = owner
+        .admit_description(fd::Description::new(
+            IpcBacking::Pipe {
+                object,
+                end: End::Writer,
+            }
+            .encode(),
+            fd::AccessMode::WriteOnly,
+            fd::StatusFlags::default(),
+        ))
+        .unwrap();
+    reader.install(table.id(), fd::Fd(0), false).unwrap();
+    writer.install(table.id(), fd::Fd(1), false).unwrap();
+
+    let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    let map = unsafe {
+        &*region
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_IPC_TABLE_MAP_OFFSET as usize)
+            .cast::<carrick_el1_abi::ipc_tables::IpcTableMap>()
+    };
+    map.publish(5, table.id().to_raw()).unwrap();
+    let pages: Vec<_> = (0..32).map(|n| 0x20000 + n * 0x1000).collect();
+    let mut crossing = TestStockCrossing::new(&pages);
+    crossing.metadata_in_el1_window = true;
+    crossing.ipc = Some((Arc::clone(&owner), map));
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &crossing,
+    )
+    .with_words(&words);
+    let parent = TaskKey {
+        id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
+        serial: TaskSerial::from_raw_u64(11).unwrap(),
+    };
+    let child_bindings: [_; 2] = core::array::from_fn(|_| {
+        let mut entry = runtime
+            .enter(source, &fixture.task, parked, &mut service)
+            .unwrap();
+        let LifecycleOutcome::Returned { result, .. } = entry.fork(ProcessForkChildTid::NONE)
+        else {
+            panic!("native fork must return");
+        };
+        assert!(result.raw() > 0, "fork errno number: {}", -result.raw());
+        let child = runtime
+            .namespace_child_key(parent, result.raw() as u32)
+            .unwrap();
+        runtime.task_binding(child).unwrap()
+    });
+    let children = child_bindings
+        .each_ref()
+        .map(|binding| fixture.zone.record(binding.record.id).identity().file_table);
+    assert_ne!(children[0], children[1]);
+    for child in children {
+        assert!(
+            map.lookup_owned(child).is_some(),
+            "each child owns its table"
+        );
+    }
+    let parent_binding = runtime.task_binding(parent).unwrap();
+    fixture
+        .zone
+        .requeue_preempted(fixture.slot, parent_binding.record.id);
+
+    let tables = crate::ipc::MapTables(map);
+    let venue = crate::ipc::IpcVenue {
+        region: owner.region(),
+        tables: &tables,
+    };
+    let counters = Box::new(carrick_el1_abi::Counters::new());
+    let names = Box::new(carrick_el1_abi::InotifyNameCache::new());
+    let run_in_child = |idx: usize, nr: u64, fd: u64| -> (CompletionRoute, i64) {
+        activate_target(source, &task, &child_bindings[idx]);
+        let mut cpu = crate::sched::FakeCpu::default();
+        let mut svc = Aarch64NativeProcessService::with_crossing(
+            &task,
+            fixture.slot,
+            fixture.zone,
+            fixture.region.table(),
+            NonZeroU64::MIN,
+            &crossing,
+        )
+        .with_words(&words);
+        let child_ctx =
+            Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, child_bindings[idx].address);
+        let mut entry = runtime.enter(source, &task, child_ctx, &mut svc).unwrap();
+        let mut frame = carrick_el1_abi::TrapFrame {
+            slot: fixture.slot.index() as u64,
+            elr: 0x4004,
+            ..Default::default()
+        };
+        frame.x[8] = nr;
+        frame.x[0] = fd;
+        carrick_test_support::assert_guest_args(&[fd, 0, 0]);
+        let route = super::dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&task),
+            crossing.fd_map(),
+            &[],
+            crossing.open_table(),
+            &[],
+            &names,
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            }),
+            Some(&venue),
+            Some(&fixture),
+            Some(&mut entry),
+            Some(source),
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        let ret = frame.x[0] as i64;
+        drop(entry);
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, child_bindings[idx].record.id);
+        (route, ret)
+    };
+
+    let sys_dup = carrick_personality_linux::crossing::nr::DUP.raw();
+    let sys_close = carrick_personality_linux::crossing::nr::CLOSE.raw();
+    // Interleave the two live children so each grows and closes while its
+    // sibling holds descriptors above the inherited capacity too.
+    let mut opened = [Vec::new(), Vec::new()];
+    for _ in 0..4 {
+        for (idx, fds) in opened.iter_mut().enumerate() {
+            let (route, fd) = run_in_child(idx, sys_dup, 0);
+            assert!(
+                matches!(route, CompletionRoute::Served | CompletionRoute::WithWork),
+                "child {idx} dup must complete in ring, got {route:?}"
+            );
+            assert!(fd >= 2, "child {idx} dup(0) errno {}", -fd);
+            fds.push(fd);
+        }
+    }
+    assert_eq!(opened, [vec![2, 3, 4, 5], vec![2, 3, 4, 5]]);
+    for (idx, fds) in opened.iter().enumerate() {
+        for &fd in fds.iter().rev() {
+            assert!(
+                !vector_fast_path_answers_ebadf(fd),
+                "child {idx} fd {fd} is live above the vector's ceiling {}",
+                ceiling.load(Ordering::Acquire)
+            );
+            let (route, ret) = run_in_child(idx, sys_close, fd as u64);
+            assert_eq!(ret, 0, "child {idx} close({fd}) errno {}", -ret);
+            assert!(
+                matches!(route, CompletionRoute::Served | CompletionRoute::WithWork),
+                "child {idx} close({fd}) must complete in ring, got {route:?}"
+            );
+            let (_, again) = run_in_child(idx, sys_close, fd as u64);
+            assert_eq!(again, -9, "child {idx} fd {fd} must be gone after close");
+        }
+    }
+    assert!(
+        vector_fast_path_answers_ebadf(6),
+        "the ceiling stays conservative: no descriptor above it was ever live"
+    );
+}
+
 // Places host memory at the EL1 metadata window (0x2D_0800_0000). macOS 27
 // refuses every user allocation below 0x70_0000_0000 (even a fixed
 // `vm_allocate` in a fresh process), so this runs on Linux hosts, where

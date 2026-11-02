@@ -76,6 +76,8 @@ impl SharedVenue {
 }
 
 impl SlotBacking for SharedVenue {
+    /// These venues keep no descriptor ceiling.
+    fn cover_descriptor(&self, _fd: usize) {}
     fn resolve(&self, extent: Extent) -> Option<(&[DescriptorSlot], &[AtomicU64])> {
         let (slots, bitmap) = *extent_arena()
             .lock()
