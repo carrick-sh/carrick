@@ -775,8 +775,8 @@ fn capacity_output(
     cleanup_agent_user()?;
     let status = result?;
     if status != 0 {
-        // The launcher's stderr names the provider failure; it goes to the
-        // run's loop log (redacted), never to the coordinator (#1456).
+        // The launcher's stderr names the provider failure; a redacted tail
+        // goes to the run's loop log, never to the coordinator (#1456).
         let diagnostics = crate::safe_copy::text(&stderr, REQUEST_BYTES).unwrap_or_default();
         let (refusal, event) = capacity_failure(args, status, &diagnostics);
         let _ = loop_log(event);
@@ -794,8 +794,9 @@ const CAPACITY_COMMAND_LIMIT: Duration = Duration::from_secs(180);
 /// Bytes of the launcher's stderr kept in the loop log for a failed probe.
 const CAPACITY_STDERR_TAIL: usize = 2048;
 /// The coordinator's refusal for a failed probe subprocess, and the loop-log
-/// event that keeps its diagnostics. The refusal names only the subcommand and
-/// how it ended: provider output stays out of the coordinator's context.
+/// event that keeps a redacted tail of its stderr. The refusal names only the
+/// subcommand and how it ended: provider output stays out of the
+/// coordinator's context.
 fn capacity_failure(args: &[&str], status: i32, stderr: &str) -> (String, Value) {
     let command = args.join(" ");
     let ended = if status == 124 {
@@ -803,6 +804,9 @@ fn capacity_failure(args: &[&str], status: i32, stderr: &str) -> (String, Value)
     } else {
         format!("exited with status {status}")
     };
+    // Redact the whole stream before cutting: a credential split by the cut
+    // would lose the prefix the redactor recognises it by.
+    let stderr = crate::dispatch_redaction::redact(stderr.as_bytes());
     let mut start = stderr.len().saturating_sub(CAPACITY_STDERR_TAIL);
     while !stderr.is_char_boundary(start) {
         start += 1;
@@ -6669,6 +6673,18 @@ fi
             "{refusal}"
         );
         assert_eq!(event["status"], 124);
+    }
+    /// A credential that straddles the tail's cut point must not reach the
+    /// loop log as a prefix-less fragment the redactor no longer recognises.
+    #[test]
+    fn a_credential_straddling_the_stderr_tail_cut_is_redacted() {
+        let secret: String = "Q7".repeat(30);
+        let stderr = format!("auth ghp_{secret}\n{}\n", "y".repeat(2000));
+        let (_, event) = capacity_failure(&["capacity", "--json"], 1, &stderr);
+        let tail = event["stderr_tail"].as_str().unwrap();
+        assert!(tail.len() <= CAPACITY_STDERR_TAIL, "{}", tail.len());
+        assert!(!tail.contains(&secret[secret.len() - 16..]), "{tail}");
+        assert!(tail.contains("[REDACTED]"), "{tail}");
     }
     #[test]
     fn failed_capacity_probes_are_bounded_even_through_read_capacity() {
