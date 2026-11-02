@@ -98,6 +98,28 @@ pub fn visible_cwd(cwd: &[u8], root: Option<&[u8]>) -> Result<Vec<u8>, LinuxErrn
     Ok(cwd.to_vec())
 }
 
+/// The file-access capabilities the carrier's access checks model. The
+/// carrier grants them exactly when `fsuid` is 0 and never otherwise, so it
+/// serves a caller only when its effective set agrees.
+const CARRIER_FILE_CAPS: u64 = (1 << carrick_syscall_abi::CAP_DAC_OVERRIDE)
+    | (1 << carrick_syscall_abi::CAP_DAC_READ_SEARCH)
+    | (1 << carrick_syscall_abi::CAP_FOWNER);
+
+/// Whether the carrier's "fsuid 0 overrides DAC" model is exactly this
+/// caller's authority: fsuid 0 with all of `CAP_DAC_OVERRIDE`,
+/// `CAP_DAC_READ_SEARCH` and `CAP_FOWNER` effective, or a nonzero fsuid
+/// with none of them. Any other caller (a root that dropped a file
+/// capability, a non-root that holds one) is left unrouted rather than
+/// checked with the wrong privileges.
+pub fn carrier_models_file_caps(credentials: &TaskCredentials) -> bool {
+    let held = credentials.cap_effective.bits() & CARRIER_FILE_CAPS;
+    if credentials.fsuid.is_root() {
+        held == CARRIER_FILE_CAPS
+    } else {
+        held == 0
+    }
+}
+
 impl TaskFs {
     /// `getcwd(2)` of this context: the visible spelling, without its NUL.
     /// `None` when the cwd holds an escaped undecodable byte, which only the
@@ -120,6 +142,11 @@ impl TaskFs {
         umask: u32,
         out: &mut Vec<u8>,
     ) -> Result<(), LinuxErrno> {
+        // The context carries ids, not capabilities: only a caller whose
+        // capabilities the carrier's id-based checks reproduce crosses.
+        if !carrier_models_file_caps(credentials) {
+            return Err(carrick_syscall_abi::LINUX_ENOSYS);
+        }
         let ids = AccessIds {
             ruid: credentials.ruid.raw(),
             euid: credentials.euid.raw(),
@@ -193,10 +220,43 @@ mod tests {
         assert!(TaskPath::new(&alloc::vec![b'/'; ACCESS_MAX_PATH_BYTES + 1]).is_none());
     }
 
+    /// Review #1409 (1): a uid-0 caller that dropped `CAP_DAC_OVERRIDE`
+    /// must not be checked as a DAC-overriding root by the carrier, and a
+    /// non-root caller holding it must not be checked without it: both are
+    /// left unrouted (counted ENOSYS), so no file is opened at all.
+    #[test]
+    fn access_is_refused_when_capabilities_disagree_with_fsuid() {
+        let fs = TaskFs::default();
+        let mut out = Vec::new();
+        let mut dropped = TaskCredentials::ROOT;
+        dropped
+            .cap_effective
+            .remove(carrick_syscall_abi::LinuxCapabilitySet::CAP_DAC_OVERRIDE);
+        assert_eq!(
+            fs.encode_access(&dropped, 0o022, &mut out),
+            Err(carrick_syscall_abi::LINUX_ENOSYS)
+        );
+        let mut privileged = TaskCredentials::ROOT;
+        privileged.fsuid = crate::identity::TaskUid::new(1000);
+        assert_eq!(
+            fs.encode_access(&privileged, 0o022, &mut out),
+            Err(carrick_syscall_abi::LINUX_ENOSYS)
+        );
+        assert!(out.is_empty(), "nothing was encoded for a refused caller");
+        // Root with every file capability, and a non-root with none, cross.
+        assert!(
+            fs.encode_access(&TaskCredentials::ROOT, 0o022, &mut out)
+                .is_ok()
+        );
+        privileged.cap_effective = carrick_syscall_abi::LinuxCapabilitySet::empty();
+        assert!(fs.encode_access(&privileged, 0o022, &mut out).is_ok());
+    }
+
     #[test]
     fn encoded_access_carries_the_callers_own_values() {
         let mut credentials = TaskCredentials::ROOT;
         credentials.fsuid = crate::identity::TaskUid::new(1000);
+        credentials.cap_effective = carrick_syscall_abi::LinuxCapabilitySet::empty();
         credentials.groups = alloc::vec![crate::identity::TaskGid::new(7)];
         credentials.groups_installed = true;
         let fs = TaskFs {

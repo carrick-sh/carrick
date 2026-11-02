@@ -630,11 +630,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             false,
         )
     }
-    /// Stage one typed host-file crossing for the carrier venue. Fd-based
-    /// calls carry no credential decision: the open description's access
-    /// mode, checked by the staging step, is the authority Linux applies.
-    ///
-    /// A path operation resolves with the process tree's retained authority,
     /// Keep a carrier-retained private-mapping source for this record:
     /// `key` names the exact `mmap` retry that consumes it.
     fn stash_map_source(
@@ -656,10 +651,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         Ok(())
     }
 
-    /// which the carrier accepts only as the admitted superuser identity; it
-    /// is served only while the caller's ring credentials are still exactly
-    /// that identity, else a counted ENOSYS (the exec rule, never an access
-    /// decision under the wrong credentials).
+    /// Stage one typed host-file crossing for the carrier venue. Fd-based
+    /// calls carry no credential decision: the open description's access
+    /// mode, checked by the staging step, is the authority Linux applies. A
+    /// path record leads with the caller's own access context from its task
+    /// row; a caller the carrier cannot check exactly (an unknown cwd, file
+    /// capabilities that disagree with its fsuid) is a counted ENOSYS.
     pub fn begin_host_file_service(
         &mut self,
         record: Box<[u8]>,

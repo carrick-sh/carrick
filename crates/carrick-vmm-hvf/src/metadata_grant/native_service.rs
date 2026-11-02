@@ -26,8 +26,9 @@ pub trait NativeExecHostService: core::fmt::Debug + Send + Sync + 'static {
     ) -> Result<Box<dyn NativeExecPreparation>, ServiceFailureCode>;
 
     /// Serve one ring-staged host-file record
-    /// ([`carrick_core_abi::host_file`]) with the process tree's retained
-    /// authority, writing its reply in place. `Err` refuses the exact request
+    /// ([`carrick_core_abi::host_file`]) under the caller's own access
+    /// context, which a path record carries by value, writing its reply in
+    /// place. `Err` refuses the exact request
     /// (the ring answers counted ENOSYS); no reply may have been written. A
     /// private-mapping record returns the retained byte source, which the
     /// carrier registers for the caller's MM before acknowledging.

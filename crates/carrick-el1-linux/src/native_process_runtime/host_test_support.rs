@@ -208,6 +208,16 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         })
     }
 
+    /// The test carrier's host-served root sits in `/`.
+    fn root_fork_seed(
+        &mut self,
+        _capability: carrick_core_abi::service::ExecCapabilityId,
+    ) -> Result<super::RootFsSeed, NativeProcessError> {
+        Ok(super::RootFsSeed::Seeded(
+            carrick_personality_linux::task_fs::TaskFs::default(),
+        ))
+    }
+
     fn prepare_mm(
         &mut self,
         parent: &Self::Mm,
@@ -516,6 +526,7 @@ impl NativeSignalFixture {
             )
             .unwrap(),
         );
+        runtime.give_fixture_root_a_cwd();
         let registry = Box::leak(Box::new(NativeProcessRegistry::new()));
         registry
             .register_root(runtime.clone(), source, task, address)
@@ -1042,6 +1053,7 @@ impl NativeOwnerSignalFixture {
             )
             .unwrap(),
         );
+        runtime.give_fixture_root_a_cwd();
         let registry = Box::leak(Box::new(NativeProcessRegistry::new()));
         registry
             .register_root(
@@ -3072,6 +3084,42 @@ fn native_child_exec_after_ring_setuid_carries_the_new_credentials() {
         decoded(&child.caller_access().unwrap()),
         (0, 0, b"/".to_vec())
     );
+    // Review #1409 (1): the carrier models file capabilities from fsuid
+    // alone, so a uid-0 caller that drops CAP_DAC_OVERRIDE is refused
+    // (counted ENOSYS, no crossing): it can never open another owner's 0600
+    // file as a DAC-overriding root.
+    {
+        use carrick_personality_linux::identity::{LinuxCapabilitySet, TaskCapabilities};
+        let mut dropped = TaskCapabilities::FULL;
+        dropped
+            .effective
+            .remove(LinuxCapabilitySet::CAP_DAC_OVERRIDE);
+        child.capset(0, dropped).unwrap();
+        assert_eq!(
+            child.caller_access(),
+            Err(carrick_syscall_abi::LINUX_ENOSYS)
+        );
+        let mut open = alloc::vec![0u8; carrick_core_abi::host_file::record_len(15, 0).unwrap()];
+        carrick_core_abi::host_file::encode(
+            &mut open,
+            carrick_core_abi::host_file::HostFileHeader {
+                op: carrick_core_abi::host_file::HostFileOp::Openat,
+                table: [1, 1, 1],
+                fd: -100,
+                flags: 0,
+                args: [0; 4],
+            },
+            b"/home/u/private",
+            0,
+        )
+        .unwrap();
+        assert!(matches!(
+            child.begin_host_file_service(open.into_boxed_slice(), None, true, None, false),
+            Ok(NativeResume::Returned(result))
+                if result.raw() == carrick_syscall_abi::LINUX_ENOSYS.guest_retval()
+        ));
+        child.capset(0, TaskCapabilities::FULL).unwrap();
+    }
     child.set_uid(1000).unwrap();
     assert_eq!(
         decoded(&child.caller_access().unwrap()),

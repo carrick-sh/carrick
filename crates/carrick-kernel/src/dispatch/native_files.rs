@@ -734,39 +734,42 @@ mod tests {
         /// The record as the ring stages it: a path record leads its input
         /// with the caller's encoded access context.
         fn stamp(&self, bytes: &mut Vec<u8>) {
-            let Some((header, input, output)) = host_file::request_parts(bytes) else {
-                return;
+            use carrick_personality_linux::identity::{
+                LinuxCapabilitySet, TaskCredentials, TaskGid, TaskUid,
             };
-            if !header.op.resolves_path() {
-                return;
-            }
+            use carrick_personality_linux::task_fs::{TaskFs, TaskPath};
+            // The ring row these host credentials describe, encoded and
+            // stamped by the production ring helpers.
             let c = &self.credentials;
-            let mut staged = Vec::new();
-            let groups: Option<Vec<u32>> = c
-                .supplementary_groups_override()
-                .map(|groups| groups.iter().map(|group| group.0).collect());
-            AccessContext::encode_into(
-                &mut staged,
-                carrick_core_abi::host_file::AccessIds {
-                    ruid: c.ruid.0,
-                    euid: c.euid.0,
-                    suid: c.suid.0,
-                    fsuid: c.fsuid.0,
-                    rgid: c.rgid.0,
-                    egid: c.egid.0,
-                    sgid: c.sgid.0,
-                    fsgid: c.fsgid.0,
-                },
-                c.umask,
-                groups.as_deref(),
-                self.cwd.as_bytes(),
-                self.root.as_deref().map(str::as_bytes),
-            )
-            .unwrap();
-            staged.extend_from_slice(input);
-            let mut restaged = vec![0u8; host_file::record_len(staged.len(), output).unwrap()];
-            host_file::encode(&mut restaged, header, &staged, output).unwrap();
-            *bytes = restaged;
+            let mut row = TaskCredentials::ROOT;
+            row.ruid = TaskUid::new(c.ruid.0);
+            row.euid = TaskUid::new(c.euid.0);
+            row.suid = TaskUid::new(c.suid.0);
+            row.fsuid = TaskUid::new(c.fsuid.0);
+            row.rgid = TaskGid::new(c.rgid.0);
+            row.egid = TaskGid::new(c.egid.0);
+            row.sgid = TaskGid::new(c.sgid.0);
+            row.fsgid = TaskGid::new(c.fsgid.0);
+            if let Some(groups) = c.supplementary_groups_override() {
+                row.groups = groups.iter().map(|group| TaskGid::new(group.0)).collect();
+                row.groups_installed = true;
+            }
+            if !row.fsuid.is_root() {
+                row.cap_effective = LinuxCapabilitySet::empty();
+            }
+            let fs = TaskFs {
+                cwd: TaskPath::new(self.cwd.as_bytes()).unwrap(),
+                root: self
+                    .root
+                    .as_deref()
+                    .map(|root| TaskPath::new(root.as_bytes()).unwrap()),
+            };
+            let mut access = Vec::new();
+            fs.encode_access(&row, c.umask, &mut access).unwrap();
+            *bytes =
+                carrick_personality_linux::native_host_file::stamp_access_context(bytes, &access)
+                    .unwrap()
+                    .into_vec();
         }
     }
 
