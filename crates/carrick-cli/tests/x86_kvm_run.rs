@@ -2142,6 +2142,28 @@ fn mounted_static_x86_signal_abort_without_core_matches_native() {
     compare_mounted_assembly_with_native("x86_signal_abort.S", b"A\n");
 }
 
+// Red-first acceptance witness for #1454. The runner's native RLIMIT_CORE
+// hard limit may be zero; this case checks the guest's explicit unlimited
+// setting rather than silently comparing against a different native limit.
+#[test]
+fn mounted_static_x86_signal_abort_with_core_publishes_dumped_status_and_file() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("abort-core");
+    compile_assembly_with_flags("x86_signal_abort.S", &elf, &["-Wa,--defsym,CORE_ENABLED=1"]);
+    let run = run_mounted_binary(&elf, "abort-core", false);
+    assert_eq!(
+        run.status.code(),
+        Some(7),
+        "unlimited RLIMIT_CORE requires CLD_DUMPED, status 0x86 and an x86 ELF core; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    assert_eq!(run.stdout, b"A\n");
+}
+
 #[test]
 fn mounted_static_x86_signal_noncanonical_handler_matches_native() {
     compare_mounted_fault_with_native("x86_signal_bad_handler.S");

@@ -26,3 +26,25 @@ the neutral terminal owner the actual publication result. Failure and zero
 limit must settle without a core bit. A host-only fallback at root exit cannot
 repair an already-published native child wait status. The x86 register and ELF
 note format must be implemented before claiming both-ISA publication.
+
+## Unlimited-limit red-first witness
+
+The KVM production CLI witness
+`mounted_static_x86_signal_abort_with_core_publishes_dumped_status_and_file`
+selects `CORE_ENABLED` in the existing `x86_signal_abort.S` fixture. Both
+variants explicitly set and read back their limit. The zero-limit variant
+requires CLD_KILLED and raw status 6. The unlimited variant requires
+CLD_DUMPED, raw status 0x86, and a readable `core` with ELF64, ET_CORE and
+EM_X86_64. Exit 90/91 identifies limit setup/readback, 92 signal setup/wait,
+93 SIGCHLD metadata, 94 wait4, 95 file open/read and 96 ELF header validation;
+97 means the child's fatal tgkill returned. It retains the existing bounded
+SIGCHLD wait and CLI process-group cleanup.
+
+With CARRICK_REQUIRE_KVM=1, the zero-limit comparison passes; the unlimited
+case exits 93 after successful limit setup and readback. This checkpoint is
+intentionally red and does not implement publication. It is not landing-ready.
+The runner's native hard RLIMIT_CORE is zero: native unlimited execution exits
+90 at setup and supplies no unlimited oracle evidence. It must not silently
+substitute the zero-limit outcome for the required unlimited behavior. Signed
+ARM, native unlimited oracle, structural publication budgets and final
+artifact promotion remain unproved.

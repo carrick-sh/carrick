@@ -24,6 +24,13 @@ on both sides before fork. Its parent requires SIGCHLD si_code=CLD_KILLED,
 si_status=SIGABRT and wait4 status 6 (no WCOREDUMP). A host-only oracle
 limit cannot establish this common precondition. This witness covers zero
 limit termination only; unlimited-limit publication remains unresolved.
+The CORE_ENABLED variant explicitly sets and reads back unlimited RLIMIT_CORE.
+Its parent requires CLD_DUMPED, wait4 status 0x86, and a readable ELF64 core
+with ET_CORE and EM_X86_64. The production CLI binding is
+mounted_static_x86_signal_abort_with_core_publishes_dumped_status_and_file.
+This is a red-first acceptance witness, not a passing publication claim.
+Native execution cannot supply its oracle when the host hard core limit is
+zero; that environment must not silently substitute the zero-limit case.
 """
 
 [bindings]
