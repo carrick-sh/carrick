@@ -110,8 +110,9 @@ pub struct GuestTaskState<C, U, N: NativeProcessCustody> {
     pub rlimits: RlimitSet,
     pub umask: u32,
     /// The process's cwd and root (#1392). Its threads share this row, which
-    /// is `CLONE_FS`; fork copies it.
-    pub fs: carrick_personality_linux::task_fs::TaskFs,
+    /// is `CLONE_FS`; fork copies it. `None` when a host-served root's fork
+    /// seed was refused: the cwd is unknown and path calls stay unrouted.
+    pub fs: Option<carrick_personality_linux::task_fs::TaskFs>,
     pub personality: u64,
     pub pdeathsig: u8,
     pub dumpable: u32,
@@ -271,7 +272,7 @@ impl<C, U, N: NativeProcessCustody> GuestTaskState<C, U, N> {
             children_rusage: TaskRusage::default(),
             rlimits: RlimitSet::DEFAULT,
             umask: 0o022,
-            fs: carrick_personality_linux::task_fs::TaskFs::default(),
+            fs: Some(carrick_personality_linux::task_fs::TaskFs::default()),
             personality: 0,
             pdeathsig: 0,
             dumpable: 1,

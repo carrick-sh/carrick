@@ -369,7 +369,9 @@ pub fn reply(bytes: &[u8]) -> Option<HostFileReply<'_>> {
 pub struct AccessContext<'a> {
     pub ids: AccessIds,
     pub umask: u32,
-    groups: &'a [u8],
+    /// `None`: the launch identity's groups (no `setgroups` ran). `Some`,
+    /// even empty, is the complete list `setgroups` installed.
+    groups: Option<&'a [u8]>,
     pub cwd: &'a [u8],
     pub root: Option<&'a [u8]>,
 }
@@ -394,6 +396,7 @@ pub const ACCESS_MAX_PATH_BYTES: usize = 4096;
 /// Fixed prefix: eight ids, umask, group count, cwd length, root length.
 const ACCESS_FIXED_BYTES: usize = 12 * 4;
 const ACCESS_NO_ROOT: u32 = u32::MAX;
+const ACCESS_LAUNCH_GROUPS: u32 = u32::MAX;
 
 impl<'a> AccessContext<'a> {
     /// The encoded size, or `None` when a field exceeds its bound.
@@ -415,10 +418,12 @@ impl<'a> AccessContext<'a> {
         out: &mut alloc::vec::Vec<u8>,
         ids: AccessIds,
         umask: u32,
-        groups: &[u32],
+        groups: Option<&[u32]>,
         cwd: &[u8],
         root: Option<&[u8]>,
     ) -> Result<(), HostFileRecordError> {
+        let group_count = groups.map_or(ACCESS_LAUNCH_GROUPS, |groups| groups.len() as u32);
+        let groups = groups.unwrap_or(&[]);
         let len =
             Self::encoded_len(groups.len(), cwd, root).ok_or(HostFileRecordError::TooLarge)?;
         out.try_reserve(len)
@@ -434,7 +439,7 @@ impl<'a> AccessContext<'a> {
             ids.sgid,
             ids.fsgid,
             umask,
-            groups.len() as u32,
+            group_count,
             cwd.len() as u32,
             root_len,
         ] {
@@ -465,7 +470,9 @@ impl<'a> AccessContext<'a> {
             fsgid: word(7)?,
         };
         let umask = word(8)?;
-        let groups = word(9)? as usize;
+        let group_count = word(9)?;
+        let installed = group_count != ACCESS_LAUNCH_GROUPS;
+        let groups = if installed { group_count as usize } else { 0 };
         let cwd_len = word(10)? as usize;
         let root_len = word(11)?;
         let root = (root_len != ACCESS_NO_ROOT).then_some(root_len as usize);
@@ -484,7 +491,10 @@ impl<'a> AccessContext<'a> {
             Self {
                 ids,
                 umask,
-                groups: bytes.get(ACCESS_FIXED_BYTES..groups_end)?,
+                groups: match bytes.get(ACCESS_FIXED_BYTES..groups_end)? {
+                    groups if installed => Some(groups),
+                    _ => None,
+                },
                 cwd: bytes.get(groups_end..cwd_end)?,
                 root: root.map(|_| &bytes[cwd_end..end]),
             },
@@ -492,11 +502,14 @@ impl<'a> AccessContext<'a> {
         ))
     }
 
-    /// The supplementary groups, in the order the caller installed them.
-    pub fn groups(&self) -> impl ExactSizeIterator<Item = u32> + 'a {
-        self.groups
-            .chunks_exact(4)
-            .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+    /// The supplementary groups `setgroups` installed, in its order, or
+    /// `None` for the launch identity's groups.
+    pub fn groups(&self) -> Option<impl ExactSizeIterator<Item = u32> + 'a> {
+        self.groups.map(|groups| {
+            groups
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+        })
     }
 }
 
@@ -560,7 +573,7 @@ mod tests {
             &mut bytes,
             ids,
             0o027,
-            &[10, 20],
+            Some(&[10, 20]),
             b"/tmp/sub",
             Some(b"/jail"),
         )
@@ -569,20 +582,29 @@ mod tests {
         let (context, rest) = AccessContext::decode(&bytes).unwrap();
         assert_eq!(context.ids, ids);
         assert_eq!(context.umask, 0o027);
-        assert_eq!(context.groups().collect::<alloc::vec::Vec<_>>(), [10, 20]);
+        assert_eq!(
+            context.groups().unwrap().collect::<alloc::vec::Vec<_>>(),
+            [10, 20]
+        );
         assert_eq!(context.cwd, b"/tmp/sub");
         assert_eq!(context.root, Some(&b"/jail"[..]));
         assert_eq!(rest, b"rel/path");
 
         let mut bytes = alloc::vec::Vec::new();
-        AccessContext::encode_into(&mut bytes, ids, 0o022, &[], b"/", None).unwrap();
+        AccessContext::encode_into(&mut bytes, ids, 0o022, None, b"/", None).unwrap();
         let (context, rest) = AccessContext::decode(&bytes).unwrap();
         assert_eq!(
-            (context.root, rest, context.groups().len()),
-            (None, &[][..], 0)
+            (context.root, rest, context.groups().is_none()),
+            (None, &[][..], true)
         );
+        // An explicitly empty list (`setgroups(0, NULL)`) stays distinct
+        // from the launch identity's groups.
+        let mut bytes = alloc::vec::Vec::new();
+        AccessContext::encode_into(&mut bytes, ids, 0o022, Some(&[]), b"/", None).unwrap();
+        let (context, _) = AccessContext::decode(&bytes).unwrap();
+        assert_eq!(context.groups().map(|groups| groups.len()), Some(0));
         assert!(AccessContext::decode(&bytes[..bytes.len() - 1]).is_none());
-        assert!(AccessContext::encode_into(&mut bytes, ids, 0, &[], b"", None).is_err());
+        assert!(AccessContext::encode_into(&mut bytes, ids, 0, None, b"", None).is_err());
     }
 
     fn header(op: HostFileOp) -> HostFileHeader {

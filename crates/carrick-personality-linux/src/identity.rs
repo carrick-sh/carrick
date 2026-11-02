@@ -107,6 +107,10 @@ pub struct TaskCredentials {
     pub sgid: TaskGid,
     pub fsgid: TaskGid,
     pub groups: alloc::vec::Vec<TaskGid>,
+    /// Whether `setgroups(2)` installed `groups` (including an empty list).
+    /// `false` is the launch identity, whose supplementary groups come from
+    /// the image's `/etc/group`, exactly as for the host-served root.
+    pub groups_installed: bool,
     pub cap_permitted: LinuxCapabilitySet,
     pub cap_effective: LinuxCapabilitySet,
     pub cap_inheritable: LinuxCapabilitySet,
@@ -125,6 +129,7 @@ impl TaskCredentials {
         sgid: TaskGid::ROOT,
         fsgid: TaskGid::ROOT,
         groups: alloc::vec::Vec::new(),
+        groups_installed: false,
         cap_permitted: LinuxCapabilitySet::FULL,
         cap_effective: LinuxCapabilitySet::FULL,
         cap_inheritable: LinuxCapabilitySet::empty(),

@@ -1544,8 +1544,27 @@ fn arm_root_fork_seeds_each_childs_row_with_the_roots_live_cwd() {
     .unwrap();
     let first = first_frame.x[0] as u32;
     let first_record = fixture.zone.runnable_head(fixture.slot).unwrap();
-    // The root's host cwd moves after the first fork.
+    // After the first fork the root's host cwd moves, and the root drops
+    // privileges and tightens its umask in its ring row (`setgroups(0,
+    // NULL)`, `setresgid`, `setresuid`, `umask`). The root's identity is
+    // ring-served, so its row is its live authority, and the next fork
+    // copies exactly those values into the child's row.
     *service.crossing.root_cwd.lock().unwrap() = b"/srv/work".to_vec();
+    for (nr, args) in [
+        (159u64, [0u64, 0, 0]),
+        (149, [1000, 1000, 1000]),
+        (147, [1000, 1000, 1000]),
+        (166, [0o077, 0, 0]),
+    ] {
+        let mut call = carrick_el1_abi::TrapFrame::default();
+        call.x[8] = nr;
+        call.x[..3].copy_from_slice(&args);
+        arm_call_with_cpu(fixture, fixture.control, &mut service, &mut call, &mut cpu).unwrap();
+        assert!(
+            (call.x[0] as i64) >= 0,
+            "root identity call {nr} served in ring"
+        );
+    }
     let mut second_frame = frame;
     arm_call_with_cpu(
         fixture,
@@ -1556,6 +1575,26 @@ fn arm_root_fork_seeds_each_childs_row_with_the_roots_live_cwd() {
     )
     .unwrap();
     let second = second_frame.x[0] as u32;
+    // A refused seed still forks the child, with no known cwd.
+    service
+        .crossing
+        .refuse_root_seed
+        .store(true, Ordering::Release);
+    let mut third_frame = frame;
+    arm_call_with_cpu(
+        fixture,
+        fixture.control,
+        &mut service,
+        &mut third_frame,
+        &mut cpu,
+    )
+    .unwrap();
+    assert!(
+        (third_frame.x[0] as i64) > 0,
+        "the fork itself is not refused: {}",
+        third_frame.x[0] as i64
+    );
+    let third = third_frame.x[0] as u32;
     assert_eq!(service.crossing.root_seeds.load(Ordering::Acquire), 2);
     let runtime = registry()
         .for_record(fixture.zone, fixture.zone.record_ref(first_record))
@@ -1563,6 +1602,7 @@ fn arm_root_fork_seeds_each_childs_row_with_the_roots_live_cwd() {
     let cwd = |pid: u32| {
         runtime
             .task_fs_for_test(Some(pid))
+            .unwrap()
             .unwrap()
             .cwd
             .as_bytes()
@@ -1574,9 +1614,29 @@ fn arm_root_fork_seeds_each_childs_row_with_the_roots_live_cwd() {
         "the first child keeps its fork-time cwd"
     );
     assert_eq!(cwd(second), b"/srv/work");
+    let (credentials, umask) = runtime.task_identity_for_test(second).unwrap();
+    assert_eq!(
+        (
+            credentials.fsuid.raw(),
+            credentials.euid.raw(),
+            credentials.fsgid.raw()
+        ),
+        (1000, 1000, 1000),
+        "the child carries the root's dropped ids"
+    );
+    assert!(credentials.groups_installed && credentials.groups.is_empty());
+    assert_eq!(umask, 0o077);
+    let (before, before_umask) = runtime.task_identity_for_test(first).unwrap();
+    assert_eq!((before.fsuid.raw(), before_umask), (0, 0o022));
+    assert!(!before.groups_installed, "launch identity groups");
+    assert_eq!(
+        runtime.task_fs_for_test(Some(third)).unwrap(),
+        None,
+        "an unseeded child's cwd is unknown, never guessed"
+    );
     assert_eq!(
         runtime.task_fs_for_test(None).unwrap(),
-        carrick_personality_linux::task_fs::TaskFs::default(),
+        Some(carrick_personality_linux::task_fs::TaskFs::default()),
         "the host-served root's own row never mirrors its host cwd"
     );
 }

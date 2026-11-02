@@ -742,7 +742,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let task = graph.owner.task(self.key).map_err(|_| stale)?;
         let credentials = task.credentials_for(self.calling_tid).map_err(|_| stale)?;
         let mut access = Vec::new();
+        // A child whose root fork seed was refused has no known cwd: its
+        // path and exec calls are left unrouted.
         task.fs
+            .as_ref()
+            .ok_or(carrick_syscall_abi::LINUX_ENOSYS)?
             .encode_access(credentials, task.umask, &mut access)?;
         Ok(access)
     }
@@ -758,7 +762,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .owner
             .task_mut(self.key)
             .map_err(|_| NativeProcessError::Stale)?;
-        task.fs.cwd = target;
+        let Some(fs) = task.fs.as_mut() else {
+            return Ok(SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOSYS));
+        };
+        fs.cwd = target;
         Ok(SyscallResult::new(0))
     }
     /// Park the exact ring operation on the producer observed before its
