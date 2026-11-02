@@ -445,6 +445,14 @@ other token is tried. The workflow provisions every available
 worker credential: `CODEX_AUTH_JSON` and `AGY_OAUTH_TOKEN`. Worker-private homes
 contain only the selected backend’s credential subtree. The runner-private
 capacity-query home retains both; the separate loop home holds only agy auth.
+Exactly one Codex app-server uses a codex worker's `CODEX_HOME`: the launcher
+gets the admitting capacity report's live roster as `CODEX_MODELS`, so it does
+not start a second app-server to list models before the turn. A second live
+app-server on the same home makes the turn's fail with "failed to initialize
+sqlite state runtime" (#1381). Handing the worker tree to the agent account
+commits only when the agent's copy replaces it, bounded by the worker window;
+hand-back regroups only a committed tree, so a failed hand-over is harvested
+as the runner's tree under the worker's named failure.
 Codex can be absent; agy is required for the loop. These repository secrets are referenced only by
 `dispatch-worker.yml`, enforced by workflow tests. The owner's Mac still
 pushes these two long-lived secrets; it no longer supplies any App token to
