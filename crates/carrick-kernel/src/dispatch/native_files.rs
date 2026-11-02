@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use carrick_abi::{LINUX_AT_FDCWD, LinuxOpenFlags};
-use carrick_core_abi::host_file::{HostFileHeader, HostFileOp, HostFileRequestView};
+use carrick_core_abi::host_file::{AccessContext, HostFileHeader, HostFileOp, HostFileRequestView};
 use carrick_el1_abi::ipc::fd;
 use zerocopy::IntoBytes;
 
@@ -169,28 +169,87 @@ fn outcome_result(outcome: DispatchOutcome) -> i64 {
     }
 }
 
+/// A ring task's chdir lookup: a `Newfstatat` whose reply area has room
+/// past `struct stat` for a name ([`HostFileOp::Newfstatat`]). It runs the
+/// host task's own chdir lookup ([`super::FsView::chdir_target`]: a
+/// directory, searchable by the caller) under the caller's access context
+/// and replies with the directory's `struct stat` followed by the cwd
+/// spelling the ring then stores in the caller's row.
+fn native_chdir_lookup(fs: &super::FsView<'_>, path: &str) -> Served {
+    let target = match fs.chdir_target(path) {
+        Ok(target) => target,
+        Err(errno) => return Served::errno(errno),
+    };
+    let record = match fs.path_stat_record_for(None, LINUX_AT_FDCWD, &target, 0) {
+        Ok(record) => record,
+        Err(errno) => return Served::errno(errno),
+    };
+    let mut reply = native_stat_bytes(HostFileOp::Newfstatat, &record);
+    reply.extend_from_slice(target.as_bytes());
+    Served::Reply(0, reply)
+}
+
 impl SyscallDispatcher {
     /// Serve one ring-staged host-file record in place for a native process
     /// of this run. A descriptor is resolved and pinned in the caller's own
     /// ring table now, as Linux resolves it for an in-progress call. A path
-    /// resolves under `authority` (the caller's credentials and filesystem
-    /// context); no host task, fd table or credential of this dispatcher's
-    /// task is consulted.
+    /// resolves under the caller's own access context, which the ring task
+    /// row owns and the record carries by value (credentials, umask, cwd and
+    /// root); no host task, fd table, credential or cwd of this dispatcher's
+    /// task is consulted, and nothing outlives the call.
     pub fn serve_native_host_file(
         &self,
-        authority: Option<&NativeFsAuthority>,
         record: &mut [u8],
     ) -> Result<NativeHostFileServed, NativeHostFileRefusal> {
         let Some(owner) = self.kernel_binding.read().kernel().existing_ipc() else {
             return Err(NativeHostFileRefusal);
         };
-        self.serve_native_host_file_in(&owner, authority, record)
+        self.serve_native_host_file_in(&owner, record)
+    }
+
+    /// The transient filesystem authority of one path crossing, built from
+    /// the caller's access context. Fresh credential and fs-context objects:
+    /// they share nothing with any host task and drop with the call.
+    fn native_access_authority(&self, context: &AccessContext<'_>) -> Option<NativeFsAuthority> {
+        let cwd = std::str::from_utf8(context.cwd).ok()?.to_owned();
+        let root = match context.root {
+            Some(root) => Some(std::str::from_utf8(root).ok()?.to_owned()),
+            None => None,
+        };
+        let binding = self.kernel_binding.read();
+        let ids = binding.kernel().object_ids();
+        let id = context.ids;
+        let mut credentials =
+            crate::kernel::Credentials::from_values(crate::kernel::CredentialsValues {
+                id: ids.credentials_id().ok()?,
+                ruid: carrick_abi::NsUid::new(id.ruid),
+                euid: carrick_abi::NsUid::new(id.euid),
+                suid: carrick_abi::NsUid::new(id.suid),
+                rgid: carrick_abi::NsGid::new(id.rgid),
+                egid: carrick_abi::NsGid::new(id.egid),
+                sgid: carrick_abi::NsGid::new(id.sgid),
+                fsuid: carrick_abi::NsUid::new(id.fsuid),
+                fsgid: carrick_abi::NsGid::new(id.fsgid),
+                umask: context.umask & 0o777,
+            });
+        // An empty ring list is the launch identity, whose groups the host
+        // derives from `/etc/group` exactly as for the root task.
+        if context.groups().len() != 0 {
+            credentials
+                .set_supplementary_groups(context.groups().map(carrick_abi::NsGid::new).collect());
+        }
+        let fs_context = crate::kernel::FsContext::new(ids.fs_context_id().ok()?);
+        fs_context.set_cwd(cwd);
+        fs_context.set_chroot_root(root);
+        Some(NativeFsAuthority::new(
+            Arc::new(credentials),
+            Arc::new(fs_context),
+        ))
     }
 
     fn serve_native_host_file_in(
         &self,
         owner: &Arc<HostIpc>,
-        authority: Option<&NativeFsAuthority>,
         record: &mut [u8],
     ) -> Result<NativeHostFileServed, NativeHostFileRefusal> {
         let view = HostFileRequestView::parse(record).map_err(|_| NativeHostFileRefusal)?;
@@ -201,12 +260,18 @@ impl SyscallDispatcher {
             generation: header.table[2],
         });
         let served = if header.op.resolves_path() {
-            let authority = authority.ok_or(NativeHostFileRefusal)?;
+            // Every path record leads with its caller's access context.
+            let (context, path) =
+                AccessContext::decode(view.input()).ok_or(NativeHostFileRefusal)?;
+            let authority = self
+                .native_access_authority(&context)
+                .ok_or(NativeHostFileRefusal)?;
             // Carrick's VFS names paths as UTF-8; any other byte string is
             // not served rather than altered.
-            let path = std::str::from_utf8(view.input()).map_err(|_| NativeHostFileRefusal)?;
-            super::resources::with_native_fs_scope(authority, || {
-                self.serve_native_path(owner, table, header, path)
+            let path = std::str::from_utf8(path).map_err(|_| NativeHostFileRefusal)?;
+            let capacity = view.output_capacity();
+            super::resources::with_native_fs_scope(&authority, || {
+                self.serve_native_path(owner, table, header, path, capacity)
             })
             .ok_or(NativeHostFileRefusal)?
         } else {
@@ -316,6 +381,7 @@ impl SyscallDispatcher {
         table: fd::TableId,
         header: HostFileHeader,
         path: &str,
+        capacity: usize,
     ) -> Served {
         let fs = self.fs_view();
         match header.op {
@@ -359,6 +425,11 @@ impl SyscallDispatcher {
                 };
                 if !valid {
                     return Served::errno(carrick_abi::LINUX_EINVAL);
+                }
+                if header.op == HostFileOp::Newfstatat
+                    && capacity > carrick_personality_linux::native_host_file::LINUX_STAT_BYTES
+                {
+                    return native_chdir_lookup(&fs, path);
                 }
                 match fs.path_stat_record_for(None, LINUX_AT_FDCWD, path, flags) {
                     Ok(record) => Served::Reply(0, native_stat_bytes(header.op, &record)),
@@ -633,13 +704,73 @@ mod tests {
         fixture
     }
 
-    /// A process's filesystem authority as the capability captures it.
-    fn authority_of(dispatcher: &SyscallDispatcher) -> NativeFsAuthority {
+    /// A caller's access context as its ring task row holds it: values,
+    /// read once from a task's credentials and filesystem context.
+    #[derive(Clone)]
+    struct CallerAccess {
+        credentials: Arc<crate::kernel::Credentials>,
+        cwd: String,
+        root: Option<String>,
+    }
+
+    fn authority_of(dispatcher: &SyscallDispatcher) -> CallerAccess {
         let context = dispatcher.capture_one_task_context().unwrap();
-        NativeFsAuthority::new(
-            context.resources().credentials(),
-            context.resources().fs_context(),
-        )
+        let fs = context.resources().fs_context();
+        CallerAccess {
+            credentials: context.resources().credentials(),
+            cwd: fs.cwd(),
+            root: fs.chroot_root(),
+        }
+    }
+
+    impl CallerAccess {
+        fn in_cwd(&self, cwd: &str) -> Self {
+            Self {
+                cwd: cwd.to_owned(),
+                ..self.clone()
+            }
+        }
+
+        /// The record as the ring stages it: a path record leads its input
+        /// with the caller's encoded access context.
+        fn stamp(&self, bytes: &mut Vec<u8>) {
+            let Some((header, input, output)) = host_file::request_parts(bytes) else {
+                return;
+            };
+            if !header.op.resolves_path() {
+                return;
+            }
+            let c = &self.credentials;
+            let mut staged = Vec::new();
+            let groups: Vec<u32> = c
+                .supplementary_groups_override()
+                .unwrap_or(&[])
+                .iter()
+                .map(|group| group.0)
+                .collect();
+            AccessContext::encode_into(
+                &mut staged,
+                carrick_core_abi::host_file::AccessIds {
+                    ruid: c.ruid.0,
+                    euid: c.euid.0,
+                    suid: c.suid.0,
+                    fsuid: c.fsuid.0,
+                    rgid: c.rgid.0,
+                    egid: c.egid.0,
+                    sgid: c.sgid.0,
+                    fsgid: c.fsgid.0,
+                },
+                c.umask,
+                &groups,
+                self.cwd.as_bytes(),
+                self.root.as_deref().map(str::as_bytes),
+            )
+            .unwrap();
+            staged.extend_from_slice(input);
+            let mut restaged = vec![0u8; host_file::record_len(staged.len(), output).unwrap()];
+            host_file::encode(&mut restaged, header, &staged, output).unwrap();
+            *bytes = restaged;
+        }
     }
 
     fn record(
@@ -670,18 +801,17 @@ mod tests {
     impl Fixture {
         fn serve(
             &self,
-            authority: Option<&NativeFsAuthority>,
-            bytes: &mut [u8],
+            authority: Option<&CallerAccess>,
+            bytes: &mut Vec<u8>,
         ) -> Result<(), NativeHostFileRefusal> {
+            if let Some(authority) = authority {
+                authority.stamp(bytes);
+            }
             self.dispatcher
-                .serve_native_host_file_in(&self.owner, authority, bytes)
+                .serve_native_host_file_in(&self.owner, bytes)
                 .map(|_| ())
         }
-        fn result(
-            &self,
-            authority: Option<&NativeFsAuthority>,
-            mut bytes: Vec<u8>,
-        ) -> (i64, Vec<u8>) {
+        fn result(&self, authority: Option<&CallerAccess>, mut bytes: Vec<u8>) -> (i64, Vec<u8>) {
             self.serve(authority, &mut bytes).unwrap();
             let reply = host_file::reply(&bytes).unwrap();
             (reply.result, reply.output.to_vec())
@@ -1153,13 +1283,7 @@ mod tests {
     }
 
     impl Fixture {
-        fn venue_open(
-            &self,
-            authority: &NativeFsAuthority,
-            path: &[u8],
-            flags: u64,
-            mode: u64,
-        ) -> i64 {
+        fn venue_open(&self, authority: &CallerAccess, path: &[u8], flags: u64, mode: u64) -> i64 {
             self.result(
                 Some(authority),
                 record(
@@ -1190,7 +1314,7 @@ mod tests {
             )
         }
         /// The whole file, read back through a fresh read-only venue open.
-        fn venue_contents(&self, authority: &NativeFsAuthority, path: &[u8]) -> Vec<u8> {
+        fn venue_contents(&self, authority: &CallerAccess, path: &[u8]) -> Vec<u8> {
             let fd = self.venue_open(authority, path, carrick_abi::LINUX_O_RDONLY, 0);
             assert!(fd >= 0, "reopen {:?}: {fd}", String::from_utf8_lossy(path));
             let (read, bytes) = self.result(
@@ -1648,8 +1772,8 @@ mod tests {
             b"/tmp/child",
             0,
         );
-        root.serve_native_host_file_in(&owner, Some(&authority), &mut open)
-            .unwrap();
+        authority.stamp(&mut open);
+        root.serve_native_host_file_in(&owner, &mut open).unwrap();
         let native = host_file::reply(&open).unwrap().result as i32;
         assert_eq!(native, 3, "the child's lowest free ring descriptor");
         let region = owner.region();
@@ -1699,34 +1823,73 @@ mod tests {
         );
     }
 
-    /// The retained capability offers path authority only while the origin
-    /// still holds exactly the admitted superuser identity and the same
-    /// filesystem context; a set*id or chdir after capture withdraws it.
+    /// #1392: a native caller's path resolves under its own cwd, carried
+    /// by value, whatever the host task's live cwd or credentials are now.
+    /// Two callers of one tree with separate cwds create files side by side,
+    /// and the host task's later chdir changes neither.
     #[test]
-    fn native_path_authority_requires_the_unchanged_superuser_origin() {
+    fn native_paths_resolve_under_each_callers_own_cwd() {
         let fixture = rootfs_fixture();
-        let context = fixture.dispatcher.capture_one_task_context().unwrap();
-        let files = fixture.dispatcher.capture_exec_files(&context).unwrap();
-        drop(context);
-        assert!(files.native_fs_authority().is_some());
-        fixture.dispatcher.set_cwd("/usr");
+        let created = |authority: &CallerAccess, path: &[u8]| {
+            fixture.venue_open(authority, path, CREATE, 0o644)
+        };
+        let base = authority_of(&fixture.dispatcher);
+        let tmp = base.in_cwd("/tmp");
+        let etc = base.in_cwd("/usr");
+        // The host task moves after the children were "forked".
+        fixture.dispatcher.set_cwd("/etc");
+        assert!(created(&tmp, b"made-in-tmp") >= 0);
+        assert!(created(&etc, b"made-in-usr") >= 0);
+        let root = authority_of(&fixture.dispatcher).in_cwd("/");
         assert!(
-            files.native_fs_authority().is_none(),
-            "a changed cwd is not the snapshot's authority"
+            fixture.venue_open(&root, b"/tmp/made-in-tmp", carrick_abi::LINUX_O_RDONLY, 0) >= 0
+        );
+        assert!(
+            fixture.venue_open(&root, b"/usr/made-in-usr", carrick_abi::LINUX_O_RDONLY, 0) >= 0
+        );
+        assert_eq!(
+            fixture.venue_open(&root, b"/etc/made-in-tmp", carrick_abi::LINUX_O_RDONLY, 0),
+            carrick_abi::LINUX_ENOENT.guest_retval(),
+            "the host task's cwd was never the base"
         );
 
-        let unprivileged = rootfs_fixture();
-        unprivileged
-            .dispatcher
-            .set_credentials(carrick_abi::NsUid(1000), carrick_abi::NsGid(1000));
-        let context = unprivileged.dispatcher.capture_one_task_context().unwrap();
-        let files = unprivileged
-            .dispatcher
-            .capture_exec_files(&context)
-            .unwrap();
-        assert!(
-            files.native_fs_authority().is_none(),
-            "only the admitted superuser identity resolves for native callers"
+        // A path record without its caller's access context is refused.
+        let mut bare = record(fixture.table, HostFileOp::Openat, FDCWD, [0; 4], b"/tmp", 0);
+        assert_eq!(fixture.serve(None, &mut bare), Err(NativeHostFileRefusal));
+    }
+
+    /// #1392: the chdir lookup (a `Newfstatat` with a name area) answers the
+    /// directory's canonical spelling, ENOTDIR for a file and ENOENT for a
+    /// missing name.
+    #[test]
+    fn native_chdir_lookup_names_the_canonical_directory() {
+        let fixture = rootfs_fixture();
+        let base = authority_of(&fixture.dispatcher).in_cwd("/usr");
+        let lookup = |authority: &CallerAccess, path: &[u8]| {
+            fixture.result(
+                Some(authority),
+                record(
+                    fixture.table,
+                    HostFileOp::Newfstatat,
+                    FDCWD,
+                    [0; 4],
+                    path,
+                    carrick_personality_linux::native_host_file::LINUX_STAT_BYTES + 4096,
+                ),
+            )
+        };
+        let (result, output) = lookup(&base, b"../tmp/./");
+        assert_eq!(result, 0);
+        let name = &output[carrick_personality_linux::native_host_file::LINUX_STAT_BYTES..];
+        assert_eq!(name, b"/tmp");
+        assert!(fixture.venue_open(&base, b"/tmp/plain", CREATE, 0o644) >= 0);
+        assert_eq!(
+            lookup(&base, b"/tmp/plain").0,
+            carrick_abi::LINUX_ENOTDIR.guest_retval()
+        );
+        assert_eq!(
+            lookup(&base, b"/nonexistent").0,
+            carrick_abi::LINUX_ENOENT.guest_retval()
         );
     }
 
@@ -1758,7 +1921,7 @@ mod tests {
         );
         let served = fixture
             .dispatcher
-            .serve_native_host_file_in(&fixture.owner, None, &mut map)
+            .serve_native_host_file_in(&fixture.owner, &mut map)
             .unwrap();
         let source = served
             .retained_source
@@ -1791,7 +1954,7 @@ mod tests {
         );
         let second = fixture
             .dispatcher
-            .serve_native_host_file_in(&fixture.owner, None, &mut again)
+            .serve_native_host_file_in(&fixture.owner, &mut again)
             .unwrap()
             .retained_source
             .expect("a second mapping retains a source");

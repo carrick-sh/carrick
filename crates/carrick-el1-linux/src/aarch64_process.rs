@@ -1052,9 +1052,18 @@ pub trait ForkStockCrossing {
         let _ = (address, cpu);
         Err(NativeProcessError::Unsupported)
     }
+    /// Read the host-served root's live cwd and root into the ring-owned
+    /// record at `record_va` (#1392, a #1393(a) `RootOnly` crossing).
+    fn cross_root_fork_seed(&self, record_va: u64, cpu: u64) -> Result<(), NativeProcessError> {
+        let _ = (record_va, cpu);
+        Err(NativeProcessError::Unsupported)
+    }
 }
 
 impl<T: ForkStockCrossing> ForkStockCrossing for &T {
+    fn cross_root_fork_seed(&self, record_va: u64, cpu: u64) -> Result<(), NativeProcessError> {
+        (**self).cross_root_fork_seed(record_va, cpu)
+    }
     fn ipc_binding(
         &self,
     ) -> Option<(
@@ -1114,6 +1123,18 @@ impl<T: ForkStockCrossing> ForkStockCrossing for &T {
 pub struct HvcForkStockCrossing;
 
 impl ForkStockCrossing for HvcForkStockCrossing {
+    fn cross_root_fork_seed(&self, record_va: u64, cpu: u64) -> Result<(), NativeProcessError> {
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        {
+            carrick_el1::isa::aarch64::cross_hvc_root_fork_seed(record_va, cpu)
+                .map_err(|_| NativeProcessError::Stale)
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+        {
+            let _ = (record_va, cpu);
+            Err(NativeProcessError::Unsupported)
+        }
+    }
     fn cross_exec_adopt(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError> {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
@@ -2058,6 +2079,37 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     /// (`TrapError::NativeRootExit`), which ends every host and zone thread.
     fn root_exit_ends_run(&self) -> bool {
         true
+    }
+
+    /// The host-served root's live cwd and root, read once by the root
+    /// fork seed crossing while the root is stopped in this fork (#1392).
+    fn root_fork_seed(
+        &mut self,
+        capability: carrick_core_abi::service::ExecCapabilityId,
+    ) -> Result<Option<carrick_personality_linux::task_fs::TaskFs>, NativeProcessError> {
+        let mut record = super::native_process_runtime::FallibleBox::<
+            carrick_core_abi::service::RootForkSeed,
+        >::try_reserve()?
+        .zeroed();
+        record.request(capability);
+        self.crossing.cross_root_fork_seed(
+            core::ptr::from_mut(&mut *record).addr() as u64,
+            u64::from(self.worker()),
+        )?;
+        let (cwd, root) = record.served().ok_or(NativeProcessError::Stale)?;
+        let cwd = carrick_personality_linux::task_fs::TaskPath::new(cwd)
+            .ok_or(NativeProcessError::Stale)?;
+        let root = match root {
+            Some(root) => Some(
+                carrick_personality_linux::task_fs::TaskPath::new(root)
+                    .ok_or(NativeProcessError::Stale)?,
+            ),
+            None => None,
+        };
+        Ok(Some(carrick_personality_linux::task_fs::TaskFs {
+            cwd,
+            root,
+        }))
     }
 
     fn prepare_mm(

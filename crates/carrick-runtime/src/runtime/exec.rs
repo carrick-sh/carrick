@@ -76,24 +76,16 @@ impl NativeExecCapability {
     }
 }
 
-/// Native exec serves ring-owned fork children. Their chdir/chroot are host
-/// crossings the carrier refuses, so their filesystem context is the origin
-/// task's (any origin chdir/chroot publishes a new revision and fails this
-/// check closed). Their credentials live in the ring and can change there
-/// (set*id is served in ring); the native owner refuses exec unless the
-/// caller's ring credentials are still the admitted superuser identity, and
-/// this service requires the origin's host credentials to be that same
-/// identity, so the access check uses exactly the caller's authority. The
-/// capability holds no per-child cwd, descriptor table or executable, so the
-/// service resolves only an `execve` of an absolute path outside the
-/// caller-relative `/proc` and `/dev/fd` views (also refused when reached
-/// through a symlink), and refuses the rest.
-fn native_child_exec_is_exact(
-    capability: &NativeExecCapability,
-    call: carrick_core_abi::service::ExecCall,
-    path: &str,
-) -> bool {
-    let self_relative = [
+/// Native exec serves ring-owned fork children. Their cwd, umask and
+/// credentials live in their ring task row, and the ring owner seals them
+/// into the payload as the caller's access context, so the service resolves
+/// and checks access with exactly the caller's authority (#1392). The
+/// capability holds no per-child executable or descriptor table, so a path
+/// into the caller-relative `/proc` and `/dev/fd` views (also when reached
+/// through a symlink) is refused, and so is `execveat` of a real directory
+/// descriptor.
+fn native_child_exec_path_is_served(resolved: &str) -> bool {
+    ![
         "/proc",
         "/dev/fd",
         "/dev/stdin",
@@ -102,14 +94,10 @@ fn native_child_exec_is_exact(
     ]
     .iter()
     .any(|prefix| {
-        path.strip_prefix(prefix)
+        resolved
+            .strip_prefix(prefix)
             .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
-    });
-    matches!(call, carrick_core_abi::service::ExecCall::Execve)
-        && path.starts_with('/')
-        && !self_relative
-        && capability.files.origin_authority_unchanged()
-        && capability.files.origin_is_superuser()
+    })
 }
 
 fn prepare_native_exec_image(
@@ -118,11 +106,15 @@ fn prepare_native_exec_image(
 ) -> Result<LoadedExecImage, LinuxErrno> {
     let view = carrick_core_abi::service::ExecPayloadView::parse(payload)
         .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
+    // Served exactly or left unrouted: counted ENOSYS, never a guess.
+    let access = view.access().ok_or(crate::linux_abi::LINUX_ENOSYS)?;
+    let cwd = core::str::from_utf8(access.cwd).map_err(|_| crate::linux_abi::LINUX_ENOSYS)?;
+    let files = capability.files.for_native_access(
+        cwd.to_owned(),
+        carrick_abi::NsUid::new(access.ids.fsuid),
+        carrick_abi::NsGid::new(access.ids.fsgid),
+    );
     let path = core::str::from_utf8(view.path()).map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
-    if !native_child_exec_is_exact(capability, view.call(), path) {
-        // Served exactly or left unrouted: counted ENOSYS, never a guess.
-        return Err(crate::linux_abi::LINUX_ENOSYS);
-    }
     let path = match view.call() {
         carrick_core_abi::service::ExecCall::Execve => path.to_owned(),
         carrick_core_abi::service::ExecCall::Execveat { dirfd, flags } => {
@@ -140,16 +132,12 @@ fn prepare_native_exec_image(
             }
         }
     };
+    if !native_child_exec_path_is_served(&files.resolve_path(&path)) {
+        return Err(crate::linux_abi::LINUX_ENOSYS);
+    }
     let argv = view.argv().map(<[u8]>::to_vec).collect();
     let env = view.envp().map(<[u8]>::to_vec).collect();
-    load_execve_image(
-        &capability.loader,
-        &capability.files.for_native_child(),
-        &path,
-        argv,
-        env,
-        false,
-    )
+    load_execve_image(&capability.loader, &files, &path, argv, env, false)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -233,9 +221,25 @@ impl carrick_vmm_hvf::metadata_grant::NativeExecHostService for NativeExecCapabi
             .and_then(std::sync::Weak::upgrade)
             .ok_or(carrick_vmm_hvf::metadata_grant::NativeHostFileRefused)?;
         run.dispatcher
-            .serve_native_host_file(self.files.native_fs_authority().as_ref(), record)
+            .serve_native_host_file(record)
             .map(|served| served.retained_source)
             .map_err(|_| carrick_vmm_hvf::metadata_grant::NativeHostFileRefused)
+    }
+
+    /// The host-served root's live cwd and root, read once for a child the
+    /// stopped root is forking (#1392). The root's chdir and chroot are
+    /// served by this run's dispatcher, so its filesystem context is the
+    /// one authority; the child's ring row owns the copy from here on.
+    fn root_fork_seed(&self, record: &mut carrick_core_abi::service::RootForkSeed) -> bool {
+        let Some(run) = self.run.get().and_then(std::sync::Weak::upgrade) else {
+            return false;
+        };
+        let Ok(root) = run.dispatcher.capture_one_task_context() else {
+            return false;
+        };
+        let fs = root.resources().fs_context();
+        let root_dir = fs.chroot_root();
+        fs.with_cwd(|cwd| record.serve(cwd.as_bytes(), root_dir.as_deref().map(str::as_bytes)))
     }
 }
 
@@ -851,6 +855,7 @@ mod tests {
                 0,
             )
             .unwrap();
+            let payload = sealed(payload, 0, "/");
             match prepare_native_exec_image(&capability, &payload) {
                 Ok(_) => panic!("invalid image was accepted"),
                 Err(errno) => errno.get(),
@@ -861,6 +866,32 @@ mod tests {
         assert_eq!(load_errno(), 8, "ENOEXEC for executable non-ELF");
         std::fs::remove_file(&path).unwrap();
         assert_eq!(load_errno(), 2, "ENOENT after unlink");
+    }
+
+    /// Seal a staged payload with a caller's access context, as the ring
+    /// owner does from the caller's task row.
+    fn sealed(mut payload: Vec<u8>, fsuid: u32, cwd: &str) -> Vec<u8> {
+        let mut access = Vec::new();
+        carrick_core_abi::host_file::AccessContext::encode_into(
+            &mut access,
+            carrick_core_abi::host_file::AccessIds {
+                fsuid,
+                euid: fsuid,
+                ruid: fsuid,
+                suid: fsuid,
+                fsgid: fsuid,
+                egid: fsuid,
+                rgid: fsuid,
+                sgid: fsuid,
+            },
+            0o022,
+            &[],
+            cwd.as_bytes(),
+            None,
+        )
+        .unwrap();
+        carrick_core_abi::service::seal_exec_payload_access(&mut payload, &access).unwrap();
+        payload
     }
 
     fn native_exec_payload(call: carrick_core_abi::service::ExecCall, path: &str) -> Vec<u8> {
@@ -881,56 +912,67 @@ mod tests {
         payload
     }
 
-    /// Review P0 on #905: the retained capability is a snapshot of the origin
-    /// task. A native child's exec is served only when that snapshot is
-    /// exactly the child's authority; everything else is a counted ENOSYS,
-    /// never a resolution against the boot cwd, credentials or descriptors.
+    /// #1392: a native child's exec resolves under the cwd and checks
+    /// access with the ids its own task row carries in the payload, never
+    /// the origin task's live (or captured) cwd and credentials. What the
+    /// capability cannot hold (the caller's own `/proc/self` and `/dev/fd`
+    /// views, an unsealed payload) stays a counted ENOSYS.
     #[test]
-    fn native_child_exec_refuses_what_the_capability_cannot_resolve_exactly() {
+    fn native_child_exec_resolves_with_the_callers_own_access() {
         use carrick_core_abi::service::ExecCall;
         use std::os::unix::fs::PermissionsExt as _;
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("static-successor");
         std::fs::write(&path, synthetic_aarch64_exec()).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         let absolute = path.to_str().unwrap().to_owned();
+        let cwd = directory.path().to_str().unwrap().to_owned();
         let dispatcher = SyscallDispatcher::new();
         let capability = capture_native_exec_capability(&dispatcher).unwrap();
         let enosys = Err(crate::linux_abi::LINUX_ENOSYS);
-        let refused = |call, spelling: &str| {
-            prepare_native_exec_image(&capability, &native_exec_payload(call, spelling)).map(|_| ())
+        let exec = |call, spelling: &str, fsuid, cwd: &str| {
+            prepare_native_exec_image(
+                &capability,
+                &sealed(native_exec_payload(call, spelling), fsuid, cwd),
+            )
+            .map(|_| ())
         };
-        // Relative paths depend on the child's cwd, which the capability lacks.
-        assert_eq!(refused(ExecCall::Execve, "./static-successor"), enosys);
+        // The origin task moving (red on main: every child exec ENOSYS)
+        // changes nothing for a child that carries its own cwd.
+        dispatcher.set_cwd("/");
+        assert!(exec(ExecCall::Execve, &absolute, 0, "/").is_ok());
+        assert!(exec(ExecCall::Execve, "./static-successor", 0, &cwd).is_ok());
+        assert!(exec(ExecCall::Execve, "static-successor", 0, &cwd).is_ok());
+        assert_eq!(
+            exec(ExecCall::Execve, "./static-successor", 0, "/"),
+            Err(crate::linux_abi::LINUX_ENOENT),
+            "the base is the caller's cwd, not the image's directory"
+        );
+        // The caller's own ids decide access: 0700 root-owned is EACCES to
+        // uid 1000 (the temp file's real owner maps to root in the VFS).
+        assert_eq!(
+            exec(ExecCall::Execve, &absolute, 1000, "/"),
+            Err(crate::linux_abi::LINUX_EACCES)
+        );
         // /proc/self and /dev/fd name the caller, not the boot task.
-        assert_eq!(refused(ExecCall::Execve, "/proc/self/exe"), enosys);
-        assert_eq!(refused(ExecCall::Execve, "/dev/fd/3"), enosys);
+        assert_eq!(exec(ExecCall::Execve, "/proc/self/exe", 0, "/"), enosys);
+        assert_eq!(exec(ExecCall::Execve, "self/exe", 0, "/proc"), enosys);
+        assert_eq!(exec(ExecCall::Execve, "/dev/fd/3", 0, "/"), enosys);
         // An AT_EMPTY_PATH or dirfd exec needs the caller's descriptor table.
         assert_eq!(
-            refused(
+            exec(
                 ExecCall::Execveat {
                     dirfd: 3,
                     flags: carrick_abi::LINUX_AT_EMPTY_PATH as u32
                 },
-                "x"
+                "",
+                0,
+                "/"
             ),
             enosys
         );
-        // An absolute path under the unchanged origin authority is exact.
-        assert!(refused(ExecCall::Execve, &absolute).is_ok());
-        // Once the origin changes directory, the snapshot no longer proves a
-        // native child's authority, even for an absolute path.
-        dispatcher.set_cwd(directory.path().to_str().unwrap());
-        assert_eq!(refused(ExecCall::Execve, &absolute), enosys);
-        drop(dispatcher);
-
-        // A native child's ring credentials start as the admitted superuser
-        // identity. An origin captured under any other identity cannot be
-        // paired with them, so even an absolute exec is refused.
-        let unprivileged = SyscallDispatcher::new();
-        unprivileged.set_credentials(carrick_abi::NsUid(1000), carrick_abi::NsGid(1000));
-        let capability = capture_native_exec_capability(&unprivileged).unwrap();
+        // A payload its ring owner never sealed carries no authority at all.
         assert_eq!(
             prepare_native_exec_image(
                 &capability,
@@ -939,7 +981,7 @@ mod tests {
             .map(|_| ()),
             enosys
         );
-        drop(unprivileged);
+        drop(dispatcher);
     }
 
     #[test]
@@ -975,6 +1017,7 @@ mod tests {
         )
         .unwrap();
 
+        let payload = sealed(payload, 0, "/");
         let loaded = prepare_native_exec_image(&capability, &payload).unwrap();
         assert_eq!(loaded.image.entry(), 0x400000);
         assert_eq!(
@@ -1062,8 +1105,11 @@ mod tests {
 
         let capability = capture_native_exec_capability(&dispatcher).unwrap();
         for spelling in ["/usr/bin/true", "/bin/true"] {
-            let payload =
-                native_exec_payload(carrick_core_abi::service::ExecCall::Execve, spelling);
+            let payload = sealed(
+                native_exec_payload(carrick_core_abi::service::ExecCall::Execve, spelling),
+                0,
+                "/",
+            );
             let loaded = prepare_native_exec_image(&capability, &payload)
                 .unwrap_or_else(|errno| panic!("native exec of {spelling}: errno {errno:?}"));
             assert_ne!(loaded.image.entry(), 0x400000, "entered the interpreter");

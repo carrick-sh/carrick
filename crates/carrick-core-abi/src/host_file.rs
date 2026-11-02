@@ -29,6 +29,9 @@ pub enum HostFileOp {
     /// `faccessat2` of the staged path (`args[0]` mode, `flags` AT flags).
     Faccessat = 4,
     /// `newfstatat` of the staged path (`flags` AT flags); output `struct stat`.
+    /// With a reply area larger than `struct stat` it is a ring task's chdir
+    /// lookup: the carrier runs the chdir lookup (a searchable directory)
+    /// and replies with its `struct stat` followed by its cwd spelling.
     Newfstatat = 5,
     /// `statx` of the staged path, or of the descriptor for an empty path
     /// (`flags` AT flags, `args[0]` mask); output `struct statx`.
@@ -123,8 +126,9 @@ impl HostFileOp {
         })
     }
 
-    /// Whether the operation resolves a path, and therefore needs the
-    /// caller's filesystem authority (credentials, cwd, root).
+    /// Whether the operation resolves a path. Its input then leads with
+    /// the caller's [`AccessContext`] (credentials, umask, cwd, root),
+    /// followed by the path.
     pub const fn resolves_path(self) -> bool {
         matches!(
             self,
@@ -353,11 +357,233 @@ pub fn reply(bytes: &[u8]) -> Option<HostFileReply<'_>> {
     })
 }
 
+/// The caller's own filesystem access context, carried by value in every
+/// crossing that resolves a path (and in the exec payload): its credentials,
+/// file-mode creation mask, supplementary groups, working directory and root.
+/// The ring task row owns these values; the carrier resolves against them in
+/// a transient scope and keeps nothing.
+///
+/// Paths are the absolute, normalized spellings the host VFS uses. `root` is
+/// `None` until the caller (or an ancestor) has called `chroot`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AccessContext<'a> {
+    pub ids: AccessIds,
+    pub umask: u32,
+    groups: &'a [u8],
+    pub cwd: &'a [u8],
+    pub root: Option<&'a [u8]>,
+}
+
+/// The caller's real, effective, saved and filesystem user and group ids.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AccessIds {
+    pub ruid: u32,
+    pub euid: u32,
+    pub suid: u32,
+    pub fsuid: u32,
+    pub rgid: u32,
+    pub egid: u32,
+    pub sgid: u32,
+    pub fsgid: u32,
+}
+
+/// Largest supplementary group list an access context carries.
+pub const ACCESS_MAX_GROUPS: usize = 1024;
+/// Largest cwd or root spelling an access context carries (Linux `PATH_MAX`).
+pub const ACCESS_MAX_PATH_BYTES: usize = 4096;
+/// Fixed prefix: eight ids, umask, group count, cwd length, root length.
+const ACCESS_FIXED_BYTES: usize = 12 * 4;
+const ACCESS_NO_ROOT: u32 = u32::MAX;
+
+impl<'a> AccessContext<'a> {
+    /// The encoded size, or `None` when a field exceeds its bound.
+    pub fn encoded_len(groups: usize, cwd: &[u8], root: Option<&[u8]>) -> Option<usize> {
+        let root_len = root.map_or(0, <[u8]>::len);
+        if groups > ACCESS_MAX_GROUPS
+            || cwd.is_empty()
+            || cwd.len() > ACCESS_MAX_PATH_BYTES
+            || root_len > ACCESS_MAX_PATH_BYTES
+            || root.is_some_and(<[u8]>::is_empty)
+        {
+            return None;
+        }
+        Some(ACCESS_FIXED_BYTES + groups * 4 + cwd.len() + root_len)
+    }
+
+    /// Append the encoded context to `out`.
+    pub fn encode_into(
+        out: &mut alloc::vec::Vec<u8>,
+        ids: AccessIds,
+        umask: u32,
+        groups: &[u32],
+        cwd: &[u8],
+        root: Option<&[u8]>,
+    ) -> Result<(), HostFileRecordError> {
+        let len =
+            Self::encoded_len(groups.len(), cwd, root).ok_or(HostFileRecordError::TooLarge)?;
+        out.try_reserve(len)
+            .map_err(|_| HostFileRecordError::TooLarge)?;
+        let root_len = root.map_or(ACCESS_NO_ROOT, |root| root.len() as u32);
+        for word in [
+            ids.ruid,
+            ids.euid,
+            ids.suid,
+            ids.fsuid,
+            ids.rgid,
+            ids.egid,
+            ids.sgid,
+            ids.fsgid,
+            umask,
+            groups.len() as u32,
+            cwd.len() as u32,
+            root_len,
+        ] {
+            out.extend_from_slice(&word.to_le_bytes());
+        }
+        for group in groups {
+            out.extend_from_slice(&group.to_le_bytes());
+        }
+        out.extend_from_slice(cwd);
+        if let Some(root) = root {
+            out.extend_from_slice(root);
+        }
+        Ok(())
+    }
+
+    /// Split an encoded context from the front of `bytes`, returning it and
+    /// the bytes that follow it.
+    pub fn decode(bytes: &'a [u8]) -> Option<(Self, &'a [u8])> {
+        let word = |index: usize| read_u32(bytes, index * 4);
+        let ids = AccessIds {
+            ruid: word(0)?,
+            euid: word(1)?,
+            suid: word(2)?,
+            fsuid: word(3)?,
+            rgid: word(4)?,
+            egid: word(5)?,
+            sgid: word(6)?,
+            fsgid: word(7)?,
+        };
+        let umask = word(8)?;
+        let groups = word(9)? as usize;
+        let cwd_len = word(10)? as usize;
+        let root_len = word(11)?;
+        let root = (root_len != ACCESS_NO_ROOT).then_some(root_len as usize);
+        if groups > ACCESS_MAX_GROUPS
+            || cwd_len == 0
+            || cwd_len > ACCESS_MAX_PATH_BYTES
+            || root.is_some_and(|len| len == 0 || len > ACCESS_MAX_PATH_BYTES)
+        {
+            return None;
+        }
+        let groups_end = ACCESS_FIXED_BYTES + groups * 4;
+        let cwd_end = groups_end + cwd_len;
+        let end = cwd_end + root.unwrap_or(0);
+        let rest = bytes.get(end..)?;
+        Some((
+            Self {
+                ids,
+                umask,
+                groups: bytes.get(ACCESS_FIXED_BYTES..groups_end)?,
+                cwd: bytes.get(groups_end..cwd_end)?,
+                root: root.map(|_| &bytes[cwd_end..end]),
+            },
+            rest,
+        ))
+    }
+
+    /// The supplementary groups, in the order the caller installed them.
+    pub fn groups(&self) -> impl ExactSizeIterator<Item = u32> + 'a {
+        self.groups
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+    }
+}
+
+/// The header, staged input and output capacity of an unserved record, read
+/// without a mutable view (the ring re-stages a record with its caller's
+/// access context in front of the input).
+pub fn request_parts(bytes: &[u8]) -> Option<(HostFileHeader, &[u8], usize)> {
+    if read_u32(bytes, 0) != Some(MAGIC)
+        || read_u16(bytes, 4) != Some(VERSION)
+        || read_u32(bytes, STATE) != Some(REPLY_PENDING)
+    {
+        return None;
+    }
+    let op = HostFileOp::decode(read_u16(bytes, OP)?)?;
+    let mut table = [0u64; 3];
+    for (index, word) in table.iter_mut().enumerate() {
+        *word = read_u64(bytes, TABLE + index * 8)?;
+    }
+    let mut args = [0u64; 4];
+    for (index, arg) in args.iter_mut().enumerate() {
+        *arg = read_u64(bytes, ARGS + index * 8)?;
+    }
+    let input_len = read_u32(bytes, INPUT_LEN)? as usize;
+    let output_cap = read_u32(bytes, OUTPUT_CAP)? as usize;
+    if record_len(input_len, output_cap) != Some(bytes.len()) {
+        return None;
+    }
+    Some((
+        HostFileHeader {
+            op,
+            table,
+            fd: read_u32(bytes, FD)? as i32,
+            flags: read_u32(bytes, FLAGS)?,
+            args,
+        },
+        &bytes[HOST_FILE_HEADER_BYTES..HOST_FILE_HEADER_BYTES + input_len],
+        output_cap,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     extern crate alloc;
     use alloc::vec;
+
+    #[test]
+    fn access_context_round_trips_and_splits_the_path() {
+        let ids = AccessIds {
+            ruid: 1,
+            euid: 2,
+            suid: 3,
+            fsuid: 4,
+            rgid: 5,
+            egid: 6,
+            sgid: 7,
+            fsgid: 8,
+        };
+        let mut bytes = alloc::vec::Vec::new();
+        AccessContext::encode_into(
+            &mut bytes,
+            ids,
+            0o027,
+            &[10, 20],
+            b"/tmp/sub",
+            Some(b"/jail"),
+        )
+        .unwrap();
+        bytes.extend_from_slice(b"rel/path");
+        let (context, rest) = AccessContext::decode(&bytes).unwrap();
+        assert_eq!(context.ids, ids);
+        assert_eq!(context.umask, 0o027);
+        assert_eq!(context.groups().collect::<alloc::vec::Vec<_>>(), [10, 20]);
+        assert_eq!(context.cwd, b"/tmp/sub");
+        assert_eq!(context.root, Some(&b"/jail"[..]));
+        assert_eq!(rest, b"rel/path");
+
+        let mut bytes = alloc::vec::Vec::new();
+        AccessContext::encode_into(&mut bytes, ids, 0o022, &[], b"/", None).unwrap();
+        let (context, rest) = AccessContext::decode(&bytes).unwrap();
+        assert_eq!(
+            (context.root, rest, context.groups().len()),
+            (None, &[][..], 0)
+        );
+        assert!(AccessContext::decode(&bytes[..bytes.len() - 1]).is_none());
+        assert!(AccessContext::encode_into(&mut bytes, ids, 0, &[], b"", None).is_err());
+    }
 
     fn header(op: HostFileOp) -> HostFileHeader {
         HostFileHeader {

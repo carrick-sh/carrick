@@ -30,42 +30,41 @@ impl SyscallDispatcher {
 }
 
 impl<'a> FsView<'a> {
+    /// The directory `chdir(path)` makes the cwd, as the cwd spells it: the
+    /// one lookup the host task's `chdir` and a ring task's chdir crossing
+    /// share. Follows a trailing directory symlink through the full layered
+    /// VFS (so a link into another mount resolves, and a freshly created
+    /// directory is visible), requires a directory (ENOTDIR) and search
+    /// permission on it (EACCES), and reports the resolved target's
+    /// canonical path, which `getcwd` then reports, as Linux does.
+    pub(in crate::dispatch) fn chdir_target(&self, path: &str) -> Result<String, LinuxErrno> {
+        let path = self.resolve_at_path(LINUX_AT_FDCWD, path)?;
+        let resolved = self.canonicalize_following(&path)?;
+        let metadata = self.layered_metadata(&resolved)?;
+        if metadata.kind != RootFsEntryKind::Directory {
+            return Err(LINUX_ENOTDIR);
+        }
+        let target = display_rootfs_path(&metadata.path);
+        self.check_directory_search_access(&target)?;
+        Ok(target)
+    }
+}
+
+impl<'a> FsView<'a> {
     define_syscall! {
         fn getcwd(this, cx, address: GuestPtr, size: u64) {
             let address = address.0;
             let size =
                 usize::try_from(size).map_err(|_| DispatchError::LengthTooLarge(size))?;
-            // carrick stores the GLOBAL cwd and does NOT re-root path
-            // resolution, so getcwd(2) reports that global path verbatim in
-            // almost every case — including a cwd set by a post-chroot chdir
-            // (`chroot("/x"); chdir("/etc"); getcwd()` → "/etc", matching
-            // Linux). The ONE exception is the CVE-2018-1000001 shape realpath01
-            // exercises: the guest chroots into a SUBDIRECTORY of its cwd
-            // without chdir'ing in, leaving the cwd ABOVE the new root. Such a
-            // cwd is unreachable from the root, so getcwd returns ENOENT. A
-            // chroot("/") is a no-op and never triggers this.
+            // One rule for the host task and a ring task: the global cwd,
+            // except a cwd above a chroot (`task_fs::visible_cwd`).
             let fs_context = this.captured_fs_context();
-            let cwd = fs_context.cwd();
-            let cwd = match fs_context.chroot_root().as_deref() {
-                Some(root) if root != "/" => {
-                    if cwd == root {
-                        // The guest chdir'd into the new root itself.
-                        "/".to_owned()
-                    } else if let Some(rel) = cwd.strip_prefix(&format!("{root}/")) {
-                        // cwd lies inside the root subtree.
-                        format!("/{rel}")
-                    } else if cwd == "/" || root.starts_with(&format!("{cwd}/")) {
-                        // cwd is a strict ANCESTOR of the new root: it is above
-                        // the root and unreachable (realpath01 / CVE-2018-1000001).
-                        return Ok(DispatchOutcome::errno(LINUX_ENOENT));
-                    } else {
-                        // Neither inside nor above the root: report the global
-                        // cwd verbatim (carrick does not re-root).
-                        cwd
-                    }
-                }
-                // No chroot, or the chroot("/") no-op.
-                _ => cwd,
+            let cwd = match carrick_personality_linux::task_fs::visible_cwd(
+                fs_context.cwd().as_bytes(),
+                fs_context.chroot_root().as_deref().map(str::as_bytes),
+            ) {
+                Ok(visible) => String::from_utf8(visible).map_err(|_| DispatchError::Errno(LINUX_EINVAL))?,
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
             // The cwd is stored in the VFS layer's reversible escape form;
             // decode to the opaque path BYTES so getcwd is byte-exact for a
@@ -91,21 +90,11 @@ impl<'a> FsView<'a> {
         fn chdir(this, cx, pathname: GuestPtr) {
             let pathname = pathname.0;
             let path = read_guest_c_string(&*cx.memory, pathname)?;
-            let path = this.resolve_at_path(LINUX_AT_FDCWD, &path)?;
-            // Follow a trailing directory symlink the way Linux chdir(2) does,
-            // THROUGH the full VFS — so a symlink whose target lands in a
-            // different mount (e.g. a /tmp scratch link → /run bind mount)
-            // resolves instead of returning ENOTDIR (the per-backend real_stat
-            // only follows within one backend). getcwd then reports the resolved
-            // target's canonical path, matching the kernel. Uses the LAYERED
-            // lookup so a freshly mkdir'd dir is visible (dpkg-deb chdir).
-            let resolved = this.canonicalize_following(&path)?;
-            let metadata = this.layered_metadata(&resolved)?;
-            if metadata.kind != RootFsEntryKind::Directory {
-                return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
-            }
-            this.captured_fs_context()
-                .set_cwd(display_rootfs_path(&metadata.path));
+            let target = match this.chdir_target(&path) {
+                Ok(target) => target,
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            };
+            this.captured_fs_context().set_cwd(target);
             crate::el1_inotify::bump_cwd_generation();
             Ok(DispatchOutcome::Returned { value: 0 })
         }

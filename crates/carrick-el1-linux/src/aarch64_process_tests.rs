@@ -192,6 +192,10 @@ struct TestStockCrossing {
     exec_adopted: core::sync::atomic::AtomicBool,
     #[cfg(all(test, target_os = "linux"))]
     require_stack_commit: bool,
+    /// The host-served root's live cwd, as the root fork seed crossing
+    /// reads it, and how many seeds were served.
+    root_cwd: std::sync::Mutex<Vec<u8>>,
+    root_seeds: AtomicUsize,
 }
 
 impl TestStockCrossing {
@@ -245,11 +249,23 @@ impl TestStockCrossing {
             exec_adopted: core::sync::atomic::AtomicBool::new(false),
             #[cfg(all(test, target_os = "linux"))]
             require_stack_commit: false,
+            root_cwd: std::sync::Mutex::new(b"/".to_vec()),
+            root_seeds: AtomicUsize::new(0),
         }
     }
 }
 
 impl ForkStockCrossing for TestStockCrossing {
+    fn cross_root_fork_seed(&self, record_va: u64, _cpu: u64) -> Result<(), NativeProcessError> {
+        // SAFETY: the synchronous crossing retains the ring's boxed record.
+        let record = unsafe { &mut *(record_va as *mut carrick_core_abi::service::RootForkSeed) };
+        let cwd = self.root_cwd.lock().unwrap().clone();
+        if !record.serve(&cwd, None) {
+            return Err(NativeProcessError::Stale);
+        }
+        self.root_seeds.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
     #[cfg(test)]
     fn ipc_binding(
         &self,
@@ -3431,6 +3447,9 @@ pub fn with_native_file_fork(
         opens: &'a [carrick_el1_abi::DelegatedOpenFile],
     }
     impl ForkStockCrossing for Crossing<'_> {
+        fn cross_root_fork_seed(&self, record_va: u64, cpu: u64) -> Result<(), NativeProcessError> {
+            self.stock.cross_root_fork_seed(record_va, cpu)
+        }
         fn cross_child_reclaim(
             &self,
             mm: ReservationMm,

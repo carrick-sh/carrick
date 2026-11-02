@@ -1961,6 +1961,46 @@ fn service_native_cow_supply(
     Ok([METADATA_GRANT_SUCCESS, 0, 0, 0])
 }
 
+/// Serve the root fork seed crossing (#1392): write the host-served root's
+/// live cwd and root into the ring-owned record, once, for a child the
+/// stopped root is forking. The ring owner decides that the parent is the
+/// root (its process graph is the authority); the record names the tree's
+/// file capability, whose service reads the root's live filesystem context.
+/// A #1393(a) `RootOnly` crossing, deleted with the host-served root.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn service_root_fork_seed(
+    custody: &Arc<crate::trap::CarrierVmCustody>,
+    generation: Option<crate::trap::CarrierVmGeneration>,
+    region: RetainedAbiRegion<'_>,
+    cpu: carrick_guest_arch::CpuId,
+    address: carrick_guest_arch::KernelVa,
+    claimed_cpu: u64,
+    ttbr0: u64,
+) -> [u64; 4] {
+    let refused = [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    if claimed_cpu != u64::from(cpu.raw())
+        || !request_has_live_vm(custody, generation)
+        || stopped_execution(region, cpu, ttbr0).is_none()
+    {
+        return refused;
+    }
+    let Ok((record, _pin)) = native_service::retain_reply::<carrick_core_abi::service::RootForkSeed>(
+        custody, region, address,
+    ) else {
+        return [METADATA_GRANT_ERR_INVALID, 0, 0, 0];
+    };
+    // SAFETY: retain_reply pins the complete aligned ring-owned record, which
+    // the stopped CPU exclusively retains through this synchronous crossing.
+    let record = unsafe { &mut *record.as_ptr() };
+    let Some(capability) = record.requested() else {
+        return [METADATA_GRANT_ERR_INVALID, 0, 0, 0];
+    };
+    match custody.native_exec_services.resolve(capability) {
+        Ok(service) if service.root_fork_seed(record) => [METADATA_GRANT_SUCCESS, 0, 0, 0],
+        _ => refused,
+    }
+}
+
 /// Consume one exact prepared exec receipt for the stopped predecessor. The
 /// ring has already published the successor as a closed address space; this
 /// crossing authenticates that manifest, installs its physical backing, and
@@ -2296,6 +2336,23 @@ pub(crate) fn handle_metadata_grant_trap(
             .map_err(|e| TrapError::Hypervisor(format!("read exec cancellation root: {e}")))?;
         if let Some(region) = region {
             service_native_exec_cancel(
+                custody,
+                generation,
+                region,
+                cpu,
+                carrick_guest_arch::KernelVa::new(arg1),
+                arg2,
+                ttbr0,
+            )
+        } else {
+            [METADATA_GRANT_ERR_INVALID, 0, 0, 0]
+        }
+    } else if op == carrick_el1_abi::GRANT_OP_ROOT_FORK_SEED {
+        let ttbr0 = vcpu
+            .get_sys_reg(applevisor::vcpu::SysReg::TTBR0_EL1)
+            .map_err(|e| TrapError::Hypervisor(format!("read root fork seed root: {e}")))?;
+        if let Some(region) = region {
+            service_root_fork_seed(
                 custody,
                 generation,
                 region,

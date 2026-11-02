@@ -669,6 +669,10 @@ pub const GRANT_OP_EXEC_SETTLE: u64 = 12;
 /// Cancel one authenticated native-exec preparation before adoption. The
 /// retained receipt and stopped predecessor MM select exactly one host owner.
 pub const GRANT_OP_EXEC_CANCEL: u64 = 13;
+/// Read the host-served root's live cwd and root once, for a child it is
+/// forking ([`carrick_core_abi::service::RootForkSeed`], #1392). A
+/// #1393(a) `RootOnly` crossing: deleted when the root becomes a ring task.
+pub const GRANT_OP_ROOT_FORK_SEED: u64 = 14;
 
 /// Bounded debug rendering of a typed refusal, retained on the stopped EL1 stack.
 #[repr(C, align(64))]

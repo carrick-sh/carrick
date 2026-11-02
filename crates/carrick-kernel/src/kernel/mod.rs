@@ -111,7 +111,7 @@ pub use mm_occupancy::{
 };
 pub use netns::{NetNs, UtsNs};
 pub use objects::{
-    Credentials, DumpableMode, FileDescription, FileDescriptionBackingKind,
+    Credentials, CredentialsValues, DumpableMode, FileDescription, FileDescriptionBackingKind,
     FileDescriptionBackingSnapshot, FileSlot, FileTable, FsContext, HandlerFrameState,
     LinuxWaitStatus, Mm, ObjectGraphError, OpenDescriptionBackingSnapshot, PendingQueue,
     PendingSignal, PidfdTarget, ProcessGroup, RlimitSet, RunnerDirective, Session, Sighand,

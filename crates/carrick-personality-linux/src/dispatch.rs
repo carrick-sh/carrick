@@ -766,6 +766,7 @@ const fn route_shared(ordinal: u64, allocator_control: u64) -> Family {
             Family::Sysinfo(SysinfoCall::GetRusage)
         }
         nr if nr == carrick_syscall_abi::nr::UMASK.raw() => Family::Sysinfo(SysinfoCall::Umask),
+        nr if nr == crate::crossing::nr::GETCWD.raw() => Family::Sysinfo(SysinfoCall::Getcwd),
         nr if nr == carrick_syscall_abi::nr::PRCTL.raw() => Family::Identity(IdentityCall::Prctl),
         nr if nr == carrick_syscall_abi::nr::GETPPID.raw() => {
             Family::Identity(IdentityCall::GetPpid)
