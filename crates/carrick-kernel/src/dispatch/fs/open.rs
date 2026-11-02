@@ -512,15 +512,16 @@ impl<'a> FsView<'a> {
         }
 
         // O_NOATIME may only be requested by the file's owner (or a holder of
-        // CAP_FOWNER, modeled here as euid==0). Linux's do_dentry_open rejects a
-        // non-owner with EPERM (fs/open.c -> inode_owner_or_capable). Only
-        // enforce when the backing file exists and reports a real owner; a
+        // CAP_FOWNER, modeled with the other file capabilities as fsuid 0,
+        // `dac_identity`). Linux's do_dentry_open rejects a non-owner with
+        // EPERM (inode_owner_or_capable compares the fsuid). Only enforce
+        // when the backing file exists and reports a real owner; a
         // not-yet-existent O_CREAT target has no owner to compare against.
         if open_flags.contains(LinuxOpenFlags::NOATIME) {
-            let creds = self.cred_snapshot();
-            if !creds.euid.is_root()
+            let (fsuid, _) = self.dac_identity();
+            if !fsuid.is_root()
                 && let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&path, true)
-                && real.uid != creds.euid
+                && real.uid != fsuid
             {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
