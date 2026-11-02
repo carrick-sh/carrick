@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Root on a known KVM clone site (Willow or the Contabo host, issue #287)
-# only. Builds approved template 300, 9000 or 9001; never allocates or operates a clone. The site's node,
+# only. Builds approved template 300, 9000 or 9001; agent qualification boots
+# and destroys reserved linked clone 9501. The site's node,
 # storage, bridge and template size come from `carrick-xtask ci-scaler site`,
 # the same typed table the controller authenticates the template against.
 # Dependencies are existing PVE tools; no host package/service/network changes.
@@ -17,7 +18,7 @@ commit=$2
 xtask=$(realpath "$3")
 [[ $commit =~ ^[0-9a-f]{40}$ ]] || exit 1
 [[ -f $inputs/rust-toolchain.toml && -f $inputs/Cargo.lock ]] || exit 1
-for tool in qm pvesh curl jq genisoimage sha512sum objdump; do command -v "$tool" >/dev/null; done
+for tool in qm pvesh curl jq genisoimage sha512sum objdump timeout; do command -v "$tool" >/dev/null; done
 # The guest is Debian 13 (glibc 2.41). A static (musl) xtask or a glibc build
 # needing at most GLIBC_2.41 runs there; provisioning also executes it
 # (verify-kvm). Refuse an incompatible binary before creating any VM.
@@ -308,11 +309,16 @@ done
 }
 qm guest exec "$template" -- /bin/cat /var/lib/carrick-ci/qualification.json | jq -r '."out-data"' > qualification.json
 qm guest exec "$template" -- /bin/cat /var/lib/carrick-ci/packages.txt | jq -r '."out-data"' > packages.txt
-# Clean clone identities/SSH credentials and shut down from inside the template.
-qm guest exec "$template" -- /bin/bash -c 'cloud-init clean --logs --machine-id; rm -f /etc/ssh/ssh_host_* /home/runner/.ssh/authorized_keys; rm -rf /var/lib/cloud/instances /home/runner/.cache; sync'
-if [[ $profile == agent ]]; then qm stop "$template"; else
-  pve_call POST "/nodes/$node/qemu/$template/status/stop"
-fi
+# Refuse to publish if cleanup timed out, is still running, or failed inside
+# the guest. qm's transport success alone does not prove guest success.
+cleanup=$(timeout 120 qm guest exec "$template" --timeout 100 -- /bin/bash -ec 'cloud-init clean --logs --machine-id; rm -f /etc/ssh/ssh_host_* /home/runner/.ssh/authorized_keys; rm -rf /var/lib/cloud/instances /home/runner/.cache; sync') || {
+  echo 'Template cleanup transport failed; preserve VM for diagnosis' >&2; exit 1;
+}
+jq -e '(.exited == 1 or .exited == true) and .exitcode == 0' <<< "$cleanup" >/dev/null || {
+  echo 'Template cleanup did not complete successfully; refusing publication' >&2; exit 1;
+}
+# ACPI shutdown flushes filesystems; never freeze a template with qm stop.
+timeout 320 qm shutdown "$template" --timeout 300
 for ((attempt=0; attempt<60; attempt++)); do
   [[ $(qm status "$template") == 'status: stopped' ]] && break
   sleep 2
@@ -321,6 +327,10 @@ done
 qm set "$template" --ide2 "$storage:cloudinit" --ciuser runner --ipconfig0 "$ipconfig"
 if [[ $nameserver != none ]]; then qm set "$template" --nameserver "$nameserver"; fi
 qm template "$template"
+# A provisioned base is not proof that its cloud-init linked clones boot.
+if [[ $profile == agent ]]; then
+  "$xtask" ci-scaler qualify-clone --template "$template" > clone-qualification.json
+fi
 jq -n --arg commit "$commit" --arg script_hash "$(sha256sum "$inputs/scripts/ci/build-template-debian.sh" | cut -d' ' -f1)" \
   --arg image_url "$image_url" --arg image_sha512 "$image_sha512" --arg runner_version "$runner_version" --arg runner_sha256 "$runner_sha256" \
   --arg sccache_sha256 "$sccache_sha256" --arg rustup_sha256 "$rustup_sha256" --arg gh_sha256 "$gh_sha256" --arg toolchain_hash "$(sha256sum seed/rust-toolchain.toml | cut -d' ' -f1)" \

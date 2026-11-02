@@ -17,10 +17,10 @@ struct Token {
     secret: String,
 }
 #[derive(Copy, Clone, PartialEq, Eq)]
-struct GuestExit(i32);
-struct GuestOutput {
-    exit: GuestExit,
-    stdout: String,
+pub(super) struct GuestExit(pub(super) i32);
+pub(super) struct GuestOutput {
+    pub(super) exit: GuestExit,
+    pub(super) stdout: String,
 }
 #[derive(Deserialize)]
 struct CloudStatus {
@@ -119,6 +119,62 @@ fn cloud_init_complete(output: &GuestOutput) -> Result<bool, ScalerError> {
                         .all(|warning| warning == PVE_USER_DEPRECATION)
             }))
 }
+pub(super) fn wait_for_readiness(
+    deadline: Instant,
+    mut probe: impl FnMut() -> Result<(), ScalerError>,
+) -> Result<(), ScalerError> {
+    while Instant::now() < deadline {
+        match probe() {
+            Ok(()) => return Ok(()),
+            Err(error) => eprintln!("clone readiness: {error}"),
+        }
+        std::thread::sleep(remaining(Some(deadline), Duration::from_secs(5))?);
+    }
+    Err(ScalerError::External(
+        "guest five-minute readiness deadline",
+    ))
+}
+
+pub(super) fn qualify_guest(
+    mut run: impl FnMut(&[&str]) -> Result<GuestOutput, ScalerError>,
+) -> Result<(), ScalerError> {
+    let cloud = run(&[
+        "/usr/bin/timeout",
+        "20",
+        "/usr/bin/cloud-init",
+        "status",
+        "--wait",
+        "--format=json",
+    ])?;
+    if !cloud_init_complete(&cloud)? {
+        return Err(ScalerError::Guard("cloud-init not completely qualified"));
+    }
+    for command in [
+        &["/usr/bin/systemctl", "start", "carrick-ci-ready.service"][..],
+        &[
+            "/usr/bin/systemctl",
+            "is-active",
+            "carrick-ci-ready.service",
+        ][..],
+        &["/usr/bin/test", "-x", "/usr/bin/setsid"][..],
+        &["/usr/bin/test", "-x", "/bin/kill"][..],
+        &[
+            "/usr/sbin/runuser",
+            "-u",
+            "runner",
+            "--",
+            "/usr/local/bin/carrick-xtask",
+            "ci-scaler",
+            "verify-kvm",
+        ][..],
+    ] {
+        if run(command)?.exit != GuestExit(0) {
+            return Err(ScalerError::External("guest qualification"));
+        }
+    }
+    Ok(())
+}
+
 enum PveCall {
     Get,
     Post(Value),
@@ -695,6 +751,17 @@ fn ssh(
     let ip = row
         .ip
         .ok_or(ScalerError::Guard("guest has no qualified IP"))?;
+    ssh_transport(&key, &hosts, ip, input, command, deadline)
+}
+
+pub(super) fn ssh_transport(
+    key: &Path,
+    hosts: &Path,
+    ip: Ipv4Addr,
+    input: &[u8],
+    command: &str,
+    deadline: Option<Instant>,
+) -> Result<Vec<u8>, ScalerError> {
     execute(
         Command::new("ssh").args([
             "-T",
@@ -905,84 +972,25 @@ fn boot_and_register(
             .as_deref()
             .ok_or(ScalerError::Guard("start task missing"))?,
     )?;
-    let mut ready = false;
-    while Instant::now() < deadline {
-        let qualification = (|| {
-            let cloud = pve.agent_output(
-                row,
-                &[
-                    "/usr/bin/timeout",
-                    "20",
-                    "/usr/bin/cloud-init",
-                    "status",
-                    "--wait",
-                    "--format=json",
-                ],
-            )?;
-            if !cloud_init_complete(&cloud)? {
-                return Err(ScalerError::Guard("cloud-init not completely qualified"));
-            }
-            // cloud-final orders after multi-user.target. Starting this service
-            // explicitly after completed provisioning avoids the target cycle
-            // and makes removal of cloud-init sudo authority mandatory for JIT.
-            pve.agent(
-                row,
-                &["/usr/bin/systemctl", "start", "carrick-ci-ready.service"],
-            )?;
-            pve.agent(
-                row,
-                &[
-                    "/usr/bin/systemctl",
-                    "is-active",
-                    "carrick-ci-ready.service",
-                ],
-            )?;
-            for executable in ["/usr/bin/setsid", "/bin/kill"] {
-                pve.agent(row, &["/usr/bin/test", "-x", executable])?;
-            }
-            pve.agent(
-                row,
-                &[
-                    "/usr/sbin/runuser",
-                    "-u",
-                    "runner",
-                    "--",
-                    "/usr/local/bin/carrick-xtask",
-                    "ci-scaler",
-                    "verify-kvm",
-                ],
-            )
-        })();
-        if qualification.is_ok()
-            && let Ok(ip) = pve.guest_ip(row)
-        {
-            row.ip = Some(ip);
-            let key = pve.agent(row, &["/bin/cat", "/etc/ssh/ssh_host_ed25519_key.pub"])?;
-            if !key.starts_with("ssh-ed25519 ") || key.lines().count() != 1 {
-                return Err(ScalerError::Guard("invalid authenticated SSH host key"));
-            }
-            std::fs::write(&hosts, format!("{ip} {}\n", key.trim()))?;
-            std::fs::set_permissions(&hosts, std::fs::Permissions::from_mode(0o600))?;
-            if ssh(
-                dir,
-                row,
-                &[],
-                "test -x /usr/local/bin/carrick-ci-run-once",
-                Some(deadline),
-            )
-            .is_ok()
-            {
-                ready = true;
-                break;
-            }
+    wait_for_readiness(deadline, || {
+        qualify_guest(|command| pve.agent_output(row, command))?;
+        let ip = pve.guest_ip(row)?;
+        row.ip = Some(ip);
+        let key = pve.agent(row, &["/bin/cat", "/etc/ssh/ssh_host_ed25519_key.pub"])?;
+        if !key.starts_with("ssh-ed25519 ") || key.lines().count() != 1 {
+            return Err(ScalerError::Guard("invalid authenticated SSH host key"));
         }
-        std::thread::sleep(remaining(Some(deadline), Duration::from_secs(5))?);
-    }
-    if !ready {
-        return Err(ScalerError::External(
-            "guest five-minute readiness deadline",
-        ));
-    }
+        std::fs::write(&hosts, format!("{ip} {}\n", key.trim()))?;
+        std::fs::set_permissions(&hosts, std::fs::Permissions::from_mode(0o600))?;
+        ssh(
+            dir,
+            row,
+            &[],
+            "test -x /usr/local/bin/carrick-ci-run-once",
+            Some(deadline),
+        )
+        .map(|_| ())
+    })?;
     // Public launch payloads are bound to the exact controller artifact. A
     // cached template must not select a stale job-start guard or launch path.
     for script in &GUEST_SCRIPTS {

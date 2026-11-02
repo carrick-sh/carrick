@@ -191,19 +191,14 @@ impl Site {
         match self.network {
             Network::Dhcp => Ok("ip=dhcp".into()),
             Network::Static {
-                subnet: [a, b, c],
                 gateway,
+                subnet: [a, b, c],
                 ..
             } => {
-                if !(300..=349).contains(&vmid) && AgentTemplate::try_from(vmid).is_err() {
-                    return Err(ScalerError::Guard("static address outside CI VMIDs"));
-                }
-                let host = if AgentTemplate::try_from(vmid).is_ok() {
-                    150 + vmid - 9000
-                } else {
-                    vmid - 200
-                };
-                Ok(format!("ip={a}.{b}.{c}.{host}/24,gw={a}.{b}.{c}.{gateway}"))
+                let address = self
+                    .static_address(vmid)?
+                    .ok_or(ScalerError::Guard("missing static address"))?;
+                Ok(format!("ip={address}/24,gw={a}.{b}.{c}.{gateway}"))
             }
         }
     }
@@ -289,12 +284,17 @@ impl Site {
             Network::Static {
                 subnet: [a, b, c], ..
             } => {
-                if !(300..=349).contains(&vmid) && AgentTemplate::try_from(vmid).is_err() {
+                if !(300..=349).contains(&vmid)
+                    && AgentTemplate::try_from(vmid).is_err()
+                    && vmid != 9501
+                {
                     return Err(ScalerError::Guard("static address outside CI VMIDs"));
                 }
                 Ok(Some(format!(
                     "{a}.{b}.{c}.{}",
-                    if AgentTemplate::try_from(vmid).is_ok() {
+                    if vmid == 9501 {
+                        152 // Reserved qualification clone, outside controller identities.
+                    } else if AgentTemplate::try_from(vmid).is_ok() {
                         150 + vmid - 9000
                     } else {
                         vmid - 200
@@ -418,6 +418,21 @@ impl FirewallRule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qualification_clone_has_its_own_ipfilter_address() {
+        let site = CONTABO.for_lane(super::super::CloneLane::Agent).unwrap();
+        assert_eq!(
+            site.ipconfig(9501).unwrap(),
+            "ip=10.77.0.152/24,gw=10.77.0.1"
+        );
+        assert!(
+            site.vm_firewall_file(9501)
+                .unwrap()
+                .unwrap()
+                .contains("[IPSET ipfilter-net0]\n10.77.0.152\n")
+        );
+    }
 
     #[test]
     fn builder_selects_only_approved_agent_template_slots() {
