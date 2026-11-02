@@ -452,9 +452,8 @@ app-server on the same home makes the turn's fail with "failed to initialize
 sqlite state runtime" (#1381). Every dispatch Codex app-server, the worker's
 and the capacity probe's, opens its SQLite state in its own fresh, empty
 `CODEX_SQLITE_HOME` under `/dev/shm`, removed after the agent account
-retires. Codex gives those databases 30 s to open, and on the actor
-filesystem a worker's first `fsync` waited behind the GB copy that hands the
-actor over (#1464). Handing the worker tree to the agent account
+retires, so it shares neither state nor filesystem with the actor tree
+(#1464). Handing the worker tree to the agent account
 commits only when the agent's copy replaces it, bounded by the worker window;
 hand-back regroups only a committed tree, so a failed hand-over is harvested
 as the runner's tree under the worker's named failure.

@@ -1084,14 +1084,13 @@ pub(crate) const CODEX_SQLITE_ROOT: &str = "/dev/shm";
 /// A fresh, empty SQLite home for one Codex app-server, under `root`
 /// ([`CODEX_SQLITE_ROOT`] in production), writable by the agent `group`.
 ///
-/// Codex opens its state databases at startup and gives up after SQLx's 30 s
-/// connection deadline, exiting with "failed to initialize sqlite state
-/// runtime". A worker's app-server starts right after `hand_over` copied the
-/// whole actor (checkout and Rust homes, GBs) on the actor filesystem, so
-/// its first `fsync` there waits behind that write-back. With several clones
-/// sharing one host disk, three strong rounds' workers died 33-52 s into
-/// their first turn (#1464). A home on the memory filesystem has no
-/// write-back to wait on, and starts empty whatever `CODEX_HOME` holds.
+/// Codex opens its state databases under `CODEX_HOME` by default and exits
+/// with "failed to initialize sqlite state runtime" when it cannot, after
+/// up to SQLx's 30 s connection deadline. Three strong rounds' workers died
+/// that way 33-52 s into their first turn, with the actor's `CODEX_HOME`
+/// on the filesystem `hand_over` had just filled (#1464); the exact SQLite
+/// error is not observable. A private home on the memory filesystem starts
+/// empty whatever `CODEX_HOME` holds and does not share that filesystem.
 /// The caller keeps the directory until the agent account has retired.
 pub(crate) fn codex_sqlite_home(
     root: &Path,
