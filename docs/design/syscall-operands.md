@@ -1,6 +1,6 @@
 # One syscall operand authority (#1396)
 
-Status: round 2 proposed design for independent review before implementation. This
+Status: round 3 proposed design for independent review before implementation. This
 change contains documentation only. It does not establish runtime acceptance
 or close the migration issues. The owner decision on #231 (2026-11-01) makes
 this descriptor the implementation of #1363, rather than a second table.
@@ -177,8 +177,21 @@ capability-consuming memory venue and owns no scheduler or VMM. `carrick-kernel`
 adapters implement its venue using existing neutral memory/continuation
 mechanisms. `carrick-abi` may depend on `carrick-guest-arch`, never the reverse.
 No edge from `carrick-core` or a neutral personality API to this Linux crate is
-allowed. Check the actual feature closures and cycle-free build in slice 1.
+allowed. The proposed `carrick-personality-linux → carrick-linux-operands`
+edge nevertheless reaches `carrick-el1` transitively through #366's personality
+separation debt. Slice 1 must check the actual feature closures and cycle-free
+build and forbid direct use of `carrick-linux-operands` in `carrick-el1` and
+`carrick-x86-carrier`; Linux consumers belong in the Linux-owned layer.
 Neutral `UserRange` preparation remains below this Linux interpretation layer.
+
+`StagedOperation<Binding, Wait>` is generic over an adapter-owned exact
+execution binding and typed wait dependency. The binding authenticates the task
+and thread incarnations, MM and ASID generation on intake and every resume;
+`Wait` preserves OwnerWait, Supply and Physical distinctions. Narrow venue
+traits require that authentication and typed suspension without importing host
+kernel or scheduler types into `carrick-linux-operands`. Host and ring adapters
+supply their concrete binding and wait types; no new dependency on
+`carrick-kernel` or `carrick-core` is needed by the interpreter.
 
 Implement by moving/generalizing existing retained-output machinery. An
 operation-specific resource (socket description, dequeue reservation, directory
@@ -228,8 +241,16 @@ otherwise retain ordered units so a later fault preserves the earlier output.
 Prepared commit cannot suspend. For streams, preserve Linux-valid prefixes with
 an exact cursor across bounded units; never roll back bytes already visible or
 pretend the whole buffer fits one MM portal permit. Multi-permit operations
-retain completed data and resource custody between units. Error outputs such as
-an interrupted sleep remainder are explicitly selected even on error results.
+retain completed data and resource custody between units.
+The 4 KiB portal permit bounds each published unit, not the host transfer.
+Preserve one host read/write call per guest request up to `MAX_RW_COUNT` on the
+existing single-call paths in `dispatch/fs/rw.rs` and the other transfer sites;
+do not split host I/O into portal-sized calls. The operation retains ownership
+of the host result backing across publication units. Portal window storage is
+bounded independently of that completed result, and input staging must likewise
+preserve the existing host-call size and Linux consumption semantics. Error
+outputs such as an interrupted sleep remainder are explicitly selected even on
+error results.
 
 The proposed rule is owned completion with Linux-prescribed publication units,
 including partial fixed outputs as above. Independent review must confirm it
@@ -241,8 +262,17 @@ contracts; this design does not claim that protocol already exists.
 
 #1363 builds crossing staging directly from `SyscallOperands`. A staged
 `GuestMemory` facade can bridge a migrated handler signature, but its capability
-is only the descriptor's active ranges. It never falls back to raw memory for
-an undeclared read or write. Eventually handlers take the narrower staged view.
+is only the descriptor's active ranges. For #1363/#1393 crossings, ring
+validation of the fd and command precedes fault-reporting operand staging.
+Resolve and retain the validated resource identity across staging and service;
+do not re-look up a possibly recycled numeric fd. An invalid fd returns EBADF
+(9) without reading the bad pointer, and an unsupported command returns its
+declared error without chasing opaque input. Witness this through the production
+crossing entry point with `write(-1, bad, n)` and a valid fd plus the same bad
+input (EFAULT, 14), plus a command-dependent case; a host-handler-only test does
+not establish crossing precedence. Lazy nested decoding follows the same
+validation phases. The facade never falls back to raw memory for an undeclared
+read or write. Eventually handlers take the narrower staged view.
 Ring-served calls use the same declaration without gaining permission to cross.
 #1393's crossing/RootOnly retirement and #1363's staging must share these operand
 keys: retiring a host-served root path also removes its operand adapter, rather
@@ -283,13 +313,20 @@ Use native GitHub stack tooling if layers are dispatched together.
 
 | Slice | Removal/replacement | Red-first production witness |
 |---|---|---|
-| 1. Exhaustive schema plus one live consumer | Explicit status for every canonical/private identity; Pending for unmigrated families; migrate getresuid through production host and ring dispatch with ABI codecs, shared interpreter and minimal retained completion, after its NULL oracle check | Missing status fails exhaustiveness; NULL and later-slot fault oracle pins publication; Busy once resumes the original result on ARM and CPL0; no direct-copy fallback in this consumer |
-| 2. Crossing integration | Extend slice 1's live operation machinery to crossing staging; move the applicable retained completion payloads | Production crossing refuses undeclared range; Busy once retains input snapshot, then succeeds without a second effect |
+| 1. Exhaustive schema plus one live consumer | Explicit status for every canonical/private identity; Pending for unmigrated families; migrate getresuid through production host and ring dispatch with ABI codecs, shared interpreter and minimal retained completion, after its NULL oracle check | Missing status fails exhaustiveness; NULL and later-slot fault oracle pins publication; Busy once resumes the original result on ARM and CPL0; no direct-copy fallback in this consumer; feature closure is cycle-free and forbids direct interpreter use in carrick-el1 and carrick-x86-carrier |
+| 2. Crossing integration | Extend slice 1's live operation machinery to crossing staging; move the applicable retained completion payloads | Production crossing proves EBADF-before-EFAULT and command precedence before staging, and refuses undeclared range; Busy once retains input snapshot, then succeeds without a second effect |
 | 3. Fixed records, paths, value-result words | Migrate stat/time/identity and simple fs output; remove their ad-hoc ranges | Both stat layouts, optional NULL, invalid fd precedence, length mutation, second-slot refusal and exact output sentinels |
 | 4. Readiness and consuming records | Migrate wait/epoll/directory and fd creation outputs | Completed wait is not reaped twice; accepted fd survives suspension/close/reuse; second page refusal preserves original readiness |
 | 5. Streams and vectors | Migrate read/write/readv and transfer families | Default executor pool exhausted by producers; two live MMs, COW, sparse vectors, partial fault, no prefix replay |
 | 6. Message/control families | Migrate msghdr, socket options, queues, SysV, command-dependent operands | Nested iovec/control aliases, truncated ancillary data, SCM resource cleanup, fatal cancellation and command/layout coverage |
 | 7. Lifecycle, live atomic and remote operations; retirement | Migrate registered pointers, sigreturn, exec construction, futex atomic capabilities and supported async/remote-MM paths; retire UserCopy and all zero debt | Two-thread exit/robust/rseq, malformed signal frame, exec failure, futex compare/wake and remote target exec; no raw copy authority remains |
+
+Slices 3 through 6 each migrate the family's host and ring paths together,
+including ARM and CPL0 consumers, and remove both old range authorities in the
+same slice. Neither a host-only migration nor an ARM-only migration completes
+a family. Slice 7 may require its own native GitHub stack of independently
+reviewed lifecycle/live-atomic/remote-operation layers; preserve each layer's
+production witness and remove the remaining authority only at zero.
 
 Each slice extends existing contracts `kernel.copyout.owner-refusal`,
 `kernel.memory.owner-wait`, `kernel.fs.directory-copyout` or
@@ -320,17 +357,25 @@ separate actions), each output byte is published at most once, and each nested
 metadata element is decoded once. Per-page preparation is at most one successful
 unit plus one attempt per delivered refusal notification; no polling. Ordinary
 fixed operands need no heap allocation for payloads up to 256 bytes, stored in
-retained task-owned storage rather than automatic ring arrays. Streams retain
-at most one page of payload per active transfer, plus bounded ABI metadata;
-never reserve total user capacity. Handle/dispatch stack overhead is capped at
-256 additional bytes, with no by-value StagedOperation or payload returns.
+retained task-owned storage rather than automatic ring arrays. The operation
+owns that fixed-payload slot through suspension and releases it once on
+settlement. Streams use at most one page of publication-window storage per
+active transfer, plus bounded ABI metadata; separately owned host transfer
+backing may span the admitted request up to `MAX_RW_COUNT`. Never reserve total
+user capacity merely to publish it or split host calls to satisfy the window.
+Handle/dispatch stack overhead is capped at 256 additional bytes, with no by-value StagedOperation or payload returns.
 Prove that bound with the existing EL1/CPL0 frame-budget checker and full entry
 envelope, not just size_of. If a no-allocation fixed path cannot meet the frame
 budget, change ownership/storage before migration; do not widen the budget.
 
 Measure paired, interleaved uninstrumented base/candidate scalar and fixed-copy
-hot loops on the same host, with native Linux control. Require candidate median
-per-call cost <= 1.05x base and the affected workload <= 2x native Linux;
+hot loops on the same host, with native Linux control. Include 1 MiB host-file
+read and write requests and a 1 MiB pipe stream. Count host syscalls per guest
+call on host-file paths: one data call on the existing single-call paths,
+independent of publication-unit count. The pipe case checks exact delivery,
+consumption, retained progress and host-syscall counts (zero host data calls for
+an in-zone pipe); it must not acquire host I/O as a staging mechanism.
+Require candidate median per-call cost <= 1.05x base and the affected workload <= 2x native Linux;
 report distributions and measurement completeness. A failed cost gate blocks
 migration, rather than becoming a deferred optimization.
 
