@@ -699,29 +699,37 @@ impl NativeService {
         let source = entry
             .notifications(handle.incarnation())
             .map_err(|_| stale())?;
-        // Observe the exact editor producer before raising its gate/probing.
-        let revision = source.observe(SpaceWaitCause::Editor).revision();
+        use carrick_core_abi::wait::{PortalWaitAuthority, ReleaseTicketPortalExt};
+        use carrick_sched_core::refusal::{
+            Attempt, ContentionSource, Refusal, ReleaseCause, Settled,
+        };
         let access = SpaceAccess::notified(SpaceReleaseVenue {
             zone,
             waker: carrick_sched_core::Waker::Host,
             deliver: SpaceWakeDelivery::Function(deliver),
         });
         let index = zone.spaces.find(handle.mm().raw()).ok_or_else(|| stale())?;
-        let exclusion = match access.try_exclude_editor(index, handle.mm().raw()) {
-            Ok(exclusion) => exclusion,
-            Err(carrick_sched_core::spaces::notification::ExclusionRefusal::Busy) => {
-                // SAFETY: authenticated source above, sampled before the probe.
-                let wait = unsafe {
-                    carrick_el1_abi::PortalOwnerWait::from_owner(
-                        handle,
-                        carrick_el1_abi::PortalWaitCause::Editor,
-                        revision,
-                    )
-                };
-                return self.complete_wait(wait);
-            }
-            Err(_) => return self.refuse(),
-        };
+        let exclusion =
+            match source.contend(
+                || match access.try_exclude_editor(index, handle.mm().raw()) {
+                    Ok(exclusion) => Ok(exclusion),
+                    Err(carrick_sched_core::spaces::notification::ExclusionRefusal::Busy) => Err(
+                        Attempt::Contended(ReleaseCause::Space(SpaceWaitCause::Editor)),
+                    ),
+                    Err(_) => Err(Attempt::Settled(Settled::Guest(()))),
+                },
+            ) {
+                Ok(exclusion) => exclusion,
+                Err(Refusal::Contended(ticket)) => {
+                    // SAFETY: stopped_records borrowed this zone from the retained
+                    // custody that authenticated this service's exact carrier.
+                    let authority =
+                        unsafe { PortalWaitAuthority::from_retained_zone(zone, handle) };
+                    let wait = ticket.into_portal_wait(&authority).map_err(|_| stale())?;
+                    return self.complete_wait(wait);
+                }
+                Err(_) => return self.refuse(),
+            };
         let pool = carrick_el1_abi::cow_grant_pool_host().ok_or_else(|| stale())?;
         let mut stock = custody.fork_stock.lock();
         if stock.owner.child_owner(handle.mm()) != Some(handle)

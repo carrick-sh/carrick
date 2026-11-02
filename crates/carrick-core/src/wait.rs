@@ -282,3 +282,35 @@ where
         }
     }
 }
+
+/// Ticket entry adapter over the existing save/park path. The returned park
+/// receipt is switched by the caller after all guards have been released.
+pub fn park_and_rerun<'a, S, C: carrick_core_abi::EntryContext>(
+    zone: &'a ZoneTables<C>,
+    slot: SlotId,
+    operation: OperationToken,
+    ticket: crate::refusal::ReleaseTicket<'a, C>,
+    completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
+    save_context: S,
+) -> Result<
+    crate::refusal::Rerun<ObjectParked<'a, C>, OperationToken>,
+    (ObjectWaitError, OperationToken),
+>
+where
+    S: FnOnce() -> Result<(RecordId, bool), ObjectWaitError>,
+{
+    use crate::refusal::Rerun;
+    // SAFETY: the request never escapes this adapter; enrollment below uses
+    // this same borrowed zone while its entry authority remains retained.
+    let request = match unsafe { ObjectParkRequest::from_ticket(zone, operation, ticket) } {
+        Rerun::Now(operation) => return Ok(Rerun::Now(operation)),
+        Rerun::Park(request) => request,
+    };
+    match park_object_record(zone, slot, request, completion, save_context) {
+        Ok(parked) => Ok(Rerun::Park(parked)),
+        Err((ObjectWaitError::Changed | ObjectWaitError::Stale, operation)) => {
+            Ok(Rerun::Now(operation))
+        }
+        Err(error) => Err(error),
+    }
+}

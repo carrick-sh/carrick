@@ -58,3 +58,8 @@ metric = "kernel_redispatches"
 value = 0
 layers = ["vm-free"]
 rationale = "The original owned parent wait resumes once, retirement is accepted once, duplicate/stale requests are refused, and one host wake consumes the original park. No semantic retry or polling is admitted."
+
+# #1395 slice 1: scheduler refusal::queue_witnesses proves bounded cause
+# selection, release-before-park, retirement rerun and exactly one wake.
+# The zone-scoped abandoned-ticket counter changes the shared layout hash;
+# existing semantic/signed bindings and budgets above remain required.

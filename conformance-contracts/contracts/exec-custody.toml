@@ -33,3 +33,8 @@ vm_free = [
 [bindings.unresolved]
 embed_structural = "Ring file/mapping services, nonleader replacement, CLOEXEC authority binding, and exact old-MM completion rejection remain #785 work. No signed ring exec witness is claimed."
 docker = "No new Linux semantics in this guard extraction. The complete exec transaction still requires native arm64 errno and replacement differential witnesses."
+
+# #1395 slice 1: scheduler refusal::queue_witnesses proves bounded cause
+# selection, release-before-park, retirement rerun and exactly one wake.
+# The zone-scoped abandoned-ticket counter changes the shared layout hash;
+# existing semantic/signed bindings and budgets above remain required.

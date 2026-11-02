@@ -37,3 +37,8 @@ embed = "Deterministic signed evacuation/retirement/reuse interleaving remains t
 embed_structural = "Scoped WorkObservation for deferred handback dispatch is not registered yet."
 docker = "This internal record-identity interleaving is VM-free; guest futex/lifecycle differential coverage and pinned Python comparison remain required."
 observation = "The VM-free retired-delivery fixture now emits source-hashed ContractObservation/WorkSnapshot at 1/8/32 and enforces zero wake publications, with excess-publication negative controls. Live-handback work, queue visits, other producer transitions and signed structural bindings remain open."
+
+# #1395 slice 1: scheduler refusal::queue_witnesses proves bounded cause
+# selection, release-before-park, retirement rerun and exactly one wake.
+# The zone-scoped abandoned-ticket counter changes the shared layout hash;
+# existing semantic/signed bindings and budgets above remain required.

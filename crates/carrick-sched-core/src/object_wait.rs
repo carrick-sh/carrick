@@ -525,6 +525,9 @@ pub struct BorrowedObjectNotificationSource<
 impl<'scope, 'zone, C: Copy + Send + Sync + zerocopy::FromZeros>
     BorrowedObjectNotificationSource<'scope, 'zone, C>
 {
+    pub(crate) fn observe(&self) -> ObjectWaitSnapshot {
+        self.zone.notification_snapshot(self.key)
+    }
     pub fn reserve(&self) -> ObjectNotificationTicket<'zone, C> {
         let queue = self.zone.object_queue(self.key.index as usize);
         // The borrowed source retains a publisher, excluding rebind while
@@ -574,6 +577,28 @@ pub struct ObjectNotificationTicket<
     retained: bool,
 }
 impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectNotificationTicket<'a, C> {
+    pub(crate) fn record_dropped_ticket(&self) {
+        self.zone
+            .counters
+            .contention_tickets_dropped
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn unchanged(&self, snapshot: ObjectWaitSnapshot) -> bool {
+        self.zone.notification_generation(self.key) == self.key.generation()
+            && self.zone.notification_snapshot(self.key) == snapshot
+    }
+    pub(crate) fn space_is_live(
+        &self,
+        id: crate::spaces::notification::SpaceNotificationIdentity,
+    ) -> bool {
+        self.zone
+            .space_entry(id.mm)
+            .and_then(|entry| entry.notifications(id.incarnation).ok())
+            .is_some_and(|source| source.is_live())
+    }
+    pub fn belongs_to(&self, zone: &ZoneTables<C>) -> bool {
+        core::ptr::eq(self.zone, zone)
+    }
     pub fn into_source(self) -> ObjectNotificationSource<'a, C> {
         ObjectNotificationSource { ticket: self }
     }

@@ -59,3 +59,8 @@ ecosystem = [
 [bindings.unresolved]
 docker = "The GIC is a host-internal hypervisor device. The one guest-visible fact it could change, the EL0 view of ID_AA64PFR0_EL1, is asserted against Linux's documented userspace view (GIC field hidden, reads 0) by the signed embed fixture; blessing a Docker oracle for a new generic probe needs a Docker phase that was not run in this session."
 embed_structural = "GIC presence and the configured vCPU count are read through carrick_runtime::carrier_gic_snapshot(), EL1 interrupt deliveries through the EL1 counters (irq_taken), and the probed vCPU's exits through carrick_runtime::el1_vtimer_probe_report(); no WorkObservation metric is registered for them."
+
+# #1395 slice 1: scheduler refusal::queue_witnesses proves bounded cause
+# selection, release-before-park, retirement rerun and exactly one wake.
+# The zone-scoped abandoned-ticket counter changes the shared layout hash;
+# existing semantic/signed bindings and budgets above remain required.
