@@ -443,6 +443,9 @@ pub struct HostIpc {
     limits: IpcLimits,
     /// Serializes store growth (the one growth venue) and counts its work.
     growth: Mutex<IpcGrowth>,
+    /// The carrier descriptor ceiling every host-side install raises first
+    /// (the kernel's authority, which owns the carrier publisher; #1398).
+    ceiling: std::sync::Arc<crate::kernel::FdCeilingAuthority>,
 }
 impl std::fmt::Debug for HostIpc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -481,6 +484,23 @@ impl HostIpc {
     /// the ABI's reservation). The directory reserves address space for every
     /// store's full span; pages are committed only as segments are published.
     pub fn with_limits(pool_bytes: usize, limits: IpcLimits) -> Result<Self, AdmissionError> {
+        Self::with_ceiling(
+            pool_bytes,
+            limits,
+            std::sync::Arc::new(crate::kernel::FdCeilingAuthority::new()),
+        )
+    }
+
+    /// An authority whose host-side installs raise `ceiling`: a kernel passes
+    /// its own [`crate::kernel::FdCeilingAuthority`], so a descriptor this
+    /// authority installs from the carrier is covered by the same word the
+    /// EL1 vector reads. [`HostIpc::new`]/[`HostIpc::with_limits`] own a
+    /// private authority no carrier reads.
+    pub fn with_ceiling(
+        pool_bytes: usize,
+        limits: IpcLimits,
+        ceiling: std::sync::Arc<crate::kernel::FdCeilingAuthority>,
+    ) -> Result<Self, AdmissionError> {
         if pool_bytes < (IPC_POOL_AREAS * IPC_POOL_ALIGN) as usize || !pool_bytes.is_power_of_two()
         {
             return Err(AdmissionError::NoMemory);
@@ -503,6 +523,7 @@ impl HostIpc {
             }),
             limits,
             growth: Mutex::new(IpcGrowth::default()),
+            ceiling,
         };
         let identity = NEXT_REGION
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
@@ -741,6 +762,12 @@ impl HostIpc {
             )
         }
         .unwrap_or_else(|_| carrick_fatal::carrick_fatal!("IPC", "corrupt owned IPC region"))
+        .with_ceiling(&*self.ceiling)
+    }
+
+    /// The descriptor ceiling this authority's installs raise.
+    pub fn fd_ceiling(&self) -> &std::sync::Arc<crate::kernel::FdCeilingAuthority> {
+        &self.ceiling
     }
 
     fn bind_waits(&self, object: IpcObjectHandle) {

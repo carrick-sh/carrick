@@ -370,14 +370,16 @@ impl Extent {
 /// number this core makes live is therefore offered to
 /// [`SlotBacking::cover_descriptor`] before its slot is published, whichever
 /// venue publishes it; a slot can only be installed through the
-/// [`Covered`] proof that call produces.
+/// `Covered` proof that call produces.
 pub trait SlotBacking {
     fn resolve(&self, extent: Extent) -> Option<(&[DescriptorSlot], &[AtomicU64])>;
     fn ofd(&self, index: usize) -> Option<&OfdRecord>;
-    /// Raise the venue's descriptor ceiling, if it keeps one, to at least
-    /// `fd` before `fd` becomes visible in any table. Infallible, lock-free
-    /// and idempotent; it must not reenter this authority.
-    fn cover_descriptor(&self, fd: usize);
+    /// Raise the venue's descriptor ceiling to at least `fd` before `fd`
+    /// becomes visible in any table, and report whether the ceiling now
+    /// covers it. `false` refuses the install (`Error::BadBacking`) before
+    /// any effect. Lock-free or holding only the ceiling's own short lock;
+    /// it must not reenter this authority.
+    fn cover_descriptor(&self, fd: usize) -> bool;
     fn object(&self, _index: usize) -> Option<&handle::ObjectRecord> {
         None
     }
@@ -439,27 +441,6 @@ impl<'a> TableStorage<'a> {
         self.entries
             .get(fd)
             .and_then(|slot| decode_entry(slot.0.load(Ordering::Relaxed)))
-    }
-    fn set(&self, fd: usize, entry: Option<Entry>) {
-        let reserved = self.entries[fd].0.load(Ordering::Relaxed) & SLOT_RESERVED;
-        self.entries[fd]
-            .0
-            .store(encode_entry(entry) | reserved, Ordering::Relaxed);
-        self.mark_free(fd, entry.is_none() && reserved == 0);
-    }
-    /// Make a covered descriptor number live with `entry`.
-    fn install(&self, fd: Covered, entry: Entry) {
-        self.set(fd.0, Some(entry));
-    }
-    /// Remove a descriptor number's entry.
-    fn vacate(&self, fd: usize) {
-        self.set(fd, None);
-    }
-    /// Rewrite the flags of a descriptor that is already live; its number
-    /// was covered when it was installed.
-    fn update(&self, fd: usize, entry: Entry) {
-        debug_assert!(self.get(fd).is_some(), "update of a vacant descriptor");
-        self.set(fd, Some(entry));
     }
     fn reserved(&self, fd: usize) -> bool {
         self.entries
@@ -544,6 +525,37 @@ impl<'a> TableStorage<'a> {
         )
     }
 }
+/// The only writers of a descriptor slot's entry. `set` is private to this
+/// module, so a number can become live only through [`TableStorage::install`]
+/// and its [`Covered`] proof (#1398).
+mod slot_writes {
+    use super::{Covered, Entry, Ordering, SLOT_RESERVED, TableStorage, encode_entry};
+
+    impl TableStorage<'_> {
+        fn set(&self, fd: usize, entry: Option<Entry>) {
+            let reserved = self.entries[fd].0.load(Ordering::Relaxed) & SLOT_RESERVED;
+            self.entries[fd]
+                .0
+                .store(encode_entry(entry) | reserved, Ordering::Relaxed);
+            self.mark_free(fd, entry.is_none() && reserved == 0);
+        }
+        /// Make a covered descriptor number live with `entry`.
+        pub(super) fn install(&self, fd: Covered, entry: Entry) {
+            self.set(fd.0, Some(entry));
+        }
+        /// Remove a descriptor number's entry.
+        pub(super) fn vacate(&self, fd: usize) {
+            self.set(fd, None);
+        }
+        /// Rewrite the flags of a descriptor that is already live; its number
+        /// was covered when it was installed.
+        pub(super) fn update(&self, fd: usize, entry: Entry) {
+            debug_assert!(self.get(fd).is_some(), "update of a vacant descriptor");
+            self.set(fd, Some(entry));
+        }
+    }
+}
+
 /// A descriptor number the venue's ceiling already covers
 /// ([`SlotBacking::cover_descriptor`]). Only [`Authority::cover`] makes one,
 /// so no slot can become live without first raising the ceiling.
@@ -1156,6 +1168,7 @@ impl<B: SlotBacking, W: LockWait, const T: usize> SlotTableTransaction<'_, '_, B
         // No bitmap/slot change during preparation: the next lowest hole is
         // strictly above the first, so two searches suffice without a scan.
         let second = self.table.allocate(first + 1)?;
+        let covered = [c.cover(first)?, c.cover(second)?];
         c.retain(pins[0].key.index, REF)?;
         if let Err(error) = c.retain(pins[1].key.index, REF) {
             // The preparation pin prevents this rollback being a final hold.
@@ -1163,16 +1176,16 @@ impl<B: SlotBacking, W: LockWait, const T: usize> SlotTableTransaction<'_, '_, B
             return Err(error);
         }
         self.guard.record.begin_write();
-        for (fd, pin) in [(first, pins[0]), (second, pins[1])] {
+        for (fd, pin) in [(covered[0], pins[0]), (covered[1], pins[1])] {
             self.table.storage.install(
-                c.cover(fd),
+                fd,
                 Entry {
                     ofd: pin.key.index,
                     cloexec,
                 },
             );
             #[cfg(test)]
-            if fd == first
+            if fd.0 == first
                 && let Some(probe) = self.after_first_publication
             {
                 probe(self);
@@ -1193,11 +1206,15 @@ impl Drop for Locked<'_> {
 }
 
 impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
-    /// Offer `fd` to the venue's descriptor ceiling before it can be
-    /// installed: the only constructor of [`Covered`].
-    fn cover(&self, fd: usize) -> Covered {
-        self.backing.cover_descriptor(fd);
-        Covered(fd)
+    /// Raise the venue's descriptor ceiling over `fd` and require that it
+    /// covers it: the only constructor of [`Covered`]. Call before any
+    /// effect of the install, so a refusal leaves nothing to roll back.
+    fn cover(&self, fd: usize) -> Result<Covered, Error> {
+        if self.backing.cover_descriptor(fd) {
+            Ok(Covered(fd))
+        } else {
+            Err(Error::BadBacking)
+        }
     }
 
     /// Authenticate and lock one table for a typed mutation transaction.
@@ -1601,8 +1618,9 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         }
         let (_guard, t) = self.lock(table)?;
         let fd = t.allocate(min.0 as usize)?;
+        let covered = self.cover(fd)?;
         let ofd = self.alloc_ofd(description)?;
-        t.storage.install(self.cover(fd), Entry { ofd, cloexec });
+        t.storage.install(covered, Entry { ofd, cloexec });
         Ok(Fd(fd as i32))
     }
     /// O(1) read-only snapshot, taking no lock (see [`TableRecord`]); it
@@ -1774,9 +1792,10 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
     ) -> Result<Fd, Error> {
         let entry = t.entry(old)?;
         let fd = t.allocate(min)?;
+        let covered = self.cover(fd)?;
         self.retain(entry.ofd, REF)?;
         t.storage.install(
-            self.cover(fd),
+            covered,
             Entry {
                 ofd: entry.ofd,
                 cloexec,
@@ -1837,6 +1856,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         if t.storage.reserved(new.0 as usize) {
             return Err(Error::Busy);
         }
+        let covered = self.cover(new.0 as usize)?;
         // Retain first, so replacing an alias cannot temporarily finalize it.
         self.retain(ofd, REF)?;
         let released = match self.close_locked(t, new) {
@@ -1844,8 +1864,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
             Err(Error::BadFd) => None,
             Err(e) => return Err(e),
         };
-        t.storage
-            .install(self.cover(new.0 as usize), Entry { ofd, cloexec });
+        t.storage.install(covered, Entry { ofd, cloexec });
         Ok(released)
     }
     /// Remove `fd`. Returns the description exactly when this removed its
@@ -1876,14 +1895,14 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         if t.storage.reserved(new.0 as usize) {
             return Err(Error::Busy);
         }
+        let covered = self.cover(new.0 as usize)?;
         self.retain(ofd, REF)?;
         let released = match self.close_locked_filtered(t, new, release_here) {
             Ok(d) => d,
             Err(Error::BadFd) => DeferredRelease::None,
             Err(e) => return Err(e),
         };
-        t.storage
-            .install(self.cover(new.0 as usize), Entry { ofd, cloexec });
+        t.storage.install(covered, Entry { ofd, cloexec });
         Ok(released)
     }
 
@@ -2355,9 +2374,10 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         if t.storage.get(target.0 as usize).is_some() {
             return Err(Error::TooManyFiles);
         }
+        let covered = self.cover(target.0 as usize)?;
         self.retain(pin.key.index, REF)?;
         t.storage.install(
-            self.cover(target.0 as usize),
+            covered,
             Entry {
                 ofd: pin.key.index,
                 cloexec,

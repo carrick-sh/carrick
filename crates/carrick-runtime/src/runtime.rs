@@ -881,9 +881,8 @@ fn with_hvf_syscall_mailbox(
         image
     };
     let image = image.with_syscall_mailbox_arena()?;
-    image
-        .with_carrier_maintenance_root()?
-        .with_fd_ceiling_control()
+    // The ceiling vectors above already installed their control page.
+    image.with_carrier_maintenance_root()
 }
 
 /// Construct the immutable HVPatch image boundary shared by initial boots and

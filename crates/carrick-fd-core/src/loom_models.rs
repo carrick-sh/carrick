@@ -50,8 +50,10 @@ fn table_sequence_publishes_a_complete_pair() {
 
 struct Backing(OfdRecord);
 impl SlotBacking for Backing {
-    /// These venues keep no descriptor ceiling.
-    fn cover_descriptor(&self, _fd: usize) {}
+    /// No reader of a descriptor ceiling exists for this venue.
+    fn cover_descriptor(&self, _fd: usize) -> bool {
+        true
+    }
     fn resolve(&self, _: Extent) -> Option<(&[DescriptorSlot], &[AtomicU64])> {
         None
     }
@@ -134,8 +136,10 @@ use crate::handle::*;
 use carrick_sched_core::process::TaskKey;
 
 impl SlotBacking for HandleLoomBacking {
-    /// These venues keep no descriptor ceiling.
-    fn cover_descriptor(&self, _fd: usize) {}
+    /// No reader of a descriptor ceiling exists for this venue.
+    fn cover_descriptor(&self, _fd: usize) -> bool {
+        true
+    }
     fn resolve(&self, extent: Extent) -> Option<(&[DescriptorSlot], &[AtomicU64])> {
         let idx = extent.token.checked_sub(1)? as usize;
         let slots = &self.slots.get(idx)?[..extent.capacity as usize];
@@ -570,8 +574,10 @@ fn two_retiring_tables_transfer_final_release_once() {
         ofd: OfdRecord,
     }
     impl SlotBacking for Tables {
-        /// These venues keep no descriptor ceiling.
-        fn cover_descriptor(&self, _fd: usize) {}
+        /// No reader of a descriptor ceiling exists for this venue.
+        fn cover_descriptor(&self, _fd: usize) -> bool {
+            true
+        }
         fn resolve(&self, extent: Extent) -> Option<(&[DescriptorSlot], &[AtomicU64])> {
             let index = usize::try_from(extent.token).ok()?;
             Some((
@@ -665,8 +671,10 @@ fn reserved_target_close_and_settlement_preserve_owned_claim() {
         ofd: OfdRecord,
     }
     impl SlotBacking for Tables {
-        /// These venues keep no descriptor ceiling.
-        fn cover_descriptor(&self, _fd: usize) {}
+        /// No reader of a descriptor ceiling exists for this venue.
+        fn cover_descriptor(&self, _fd: usize) -> bool {
+            true
+        }
         fn resolve(&self, extent: Extent) -> Option<(&[DescriptorSlot], &[AtomicU64])> {
             let index = usize::try_from(extent.token).ok()?;
             Some((

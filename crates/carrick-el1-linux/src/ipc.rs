@@ -240,7 +240,8 @@ pub fn guest_venue(slot: u32) -> Option<IpcVenue<'static>> {
     let region = carrick_el1_abi::ipc_window_guest()?
         .attach()
         .ok()?
-        .for_el1_slot(slot);
+        .for_el1_slot(slot)
+        .with_ceiling(&carrick_el1_abi::GUEST_DESCRIPTOR_CEILING);
     Some(IpcVenue {
         region,
         tables: &TABLES,
@@ -1709,7 +1710,9 @@ mod tests {
                 42,
             )
         }
-        .unwrap();
+        .unwrap()
+        // The EL1 venue's own sink, as this kernel crate builds it.
+        .with_ceiling(&carrick_el1_abi::GUEST_DESCRIPTOR_CEILING);
         zone.spaces.set_idle_ttbr(IDLE_TTBR);
         for (mm, ttbr) in [(MM, TTBR_MM), (OTHER_MM, TTBR_OTHER)] {
             let index = zone.spaces.publish_closed(mm, ttbr, ttbr).unwrap();

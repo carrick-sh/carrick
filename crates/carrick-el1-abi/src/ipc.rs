@@ -880,6 +880,9 @@ pub struct IpcRegion<'a> {
     pool_len: u64,
     /// Who this view's object locks name as their holder.
     holder: IpcLockHolder,
+    /// The descriptor ceiling this venue raises before any number goes live
+    /// ([`crate::DescriptorCeiling`]). Unbound, every install is refused.
+    ceiling: Option<&'a dyn crate::DescriptorCeiling>,
     _pool: PhantomData<&'a UnsafeCell<[u8]>>,
 }
 
@@ -963,6 +966,7 @@ impl<'a> IpcRegion<'a> {
             pool,
             pool_len: pool_len as u64,
             holder: IpcLockHolder::Host,
+            ceiling: None,
             _pool: PhantomData,
         };
         region
@@ -1021,8 +1025,19 @@ impl<'a> IpcRegion<'a> {
             pool,
             pool_len: pool_len as u64,
             holder: IpcLockHolder::Host,
+            ceiling: None,
             _pool: PhantomData,
         })
+    }
+
+    /// This view raising `ceiling` before any descriptor it installs goes
+    /// live. Every venue that may install binds its own sink; an unbound view
+    /// refuses installs (`Error::BadBacking`) rather than skip the raise.
+    pub fn with_ceiling(self, ceiling: &'a dyn crate::DescriptorCeiling) -> Self {
+        Self {
+            ceiling: Some(ceiling),
+            ..self
+        }
     }
 
     /// This view as EL1 on the vCPU of mailbox `slot` uses it: its object
@@ -1853,8 +1868,11 @@ impl<'a> IpcRegion<'a> {
 }
 
 impl SlotBacking for IpcRegion<'_> {
-    fn cover_descriptor(&self, fd: usize) {
-        crate::cover_guest_descriptor(fd);
+    fn cover_descriptor(&self, fd: usize) -> bool {
+        match (self.ceiling, u32::try_from(fd)) {
+            (Some(ceiling), Ok(fd)) => ceiling.cover(fd),
+            _ => false,
+        }
     }
 
     fn ofd(&self, index: usize) -> Option<&OfdRecord> {

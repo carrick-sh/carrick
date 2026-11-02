@@ -61,6 +61,15 @@ struct Fixture {
 }
 static IDENTITY: AtomicU64 = AtomicU64::new(0x1_0000);
 
+/// The venues' shared descriptor-ceiling word in these fixtures.
+struct TestCeiling(core::sync::atomic::AtomicU32);
+impl crate::DescriptorCeiling for TestCeiling {
+    fn cover(&self, fd: u32) -> bool {
+        crate::raise_word(&self.0, fd)
+    }
+}
+static TEST_CEILING: TestCeiling = TestCeiling(core::sync::atomic::AtomicU32::new(2));
+
 /// A zeroed directory mapping (lazily committed by the system allocator).
 pub(super) fn zeroed_directory() -> *mut IpcDirectory {
     let layout = Layout::from_size_align(IPC_DIRECTORY_BYTES, 4096).unwrap();
@@ -75,7 +84,8 @@ fn fixture(pool_len: usize) -> Fixture {
     let identity = IDENTITY.fetch_add(1, Ordering::Relaxed);
     let region =
         unsafe { IpcRegion::initialize(dir, IPC_DIRECTORY_BYTES, pool, pool_len, identity) }
-            .unwrap();
+            .unwrap()
+            .with_ceiling(&TEST_CEILING);
     Fixture {
         region: Box::leak(Box::new(region)),
         next: Cell::new(0),
@@ -286,7 +296,9 @@ fn el1_ipc_region_attach_authenticates_the_header() {
         Some(IpcError::BadRegion),
         "a directory mapping shorter than the stores' reservation"
     );
-    let host = unsafe { IpcRegion::initialize(dir, dl, pool, len, 77) }.unwrap();
+    let host = unsafe { IpcRegion::initialize(dir, dl, pool, len, 77) }
+        .unwrap()
+        .with_ceiling(&TEST_CEILING);
     assert_eq!(
         unsafe { IpcRegion::initialize(dir, dl, pool, len, 78) }.err(),
         Some(IpcError::BadRegion)
@@ -304,7 +316,8 @@ fn el1_ipc_region_attach_authenticates_the_header() {
         unsafe { IpcRegion::attach(dir, dl - 1, pool, len) }.err(),
         Some(IpcError::BadRegion)
     );
-    let el1 = unsafe { IpcRegion::attach(dir, dl, pool, len) }.unwrap();
+    let unbound = unsafe { IpcRegion::attach(dir, dl, pool, len) }.unwrap();
+    let el1 = unbound.with_ceiling(&TEST_CEILING);
     // The two views share one authority: a table the host creates is the
     // table EL1 resolves.
     let h: &'static IpcRegion<'static> = Box::leak(Box::new(host));
@@ -330,6 +343,24 @@ fn el1_ipc_region_attach_authenticates_the_header() {
             true,
         )
         .unwrap();
+    // A view no venue bound to a ceiling refuses to make a number live
+    // rather than skip the raise (#1398 review).
+    let u: &'static IpcRegion<'static> = Box::leak(Box::new(unbound));
+    assert_eq!(
+        u.fd(Spin)
+            .open(
+                t,
+                Fd(0),
+                Description::new(token, AccessMode::ReadWrite, StatusFlags::default()),
+                false,
+            )
+            .err(),
+        Some(crate::ipc::fd::Error::BadBacking)
+    );
+    assert_eq!(
+        u.fd(Spin).dup(t, fd).err(),
+        Some(crate::ipc::fd::Error::BadBacking)
+    );
     assert_eq!(e.fd(EL1).get(t, fd).unwrap().backing, token);
     assert_eq!(e.lock(object, &EL1).unwrap().eventfd().unwrap().value(), 3);
     // A corrupted layout hash is refused.
@@ -1097,7 +1128,8 @@ fn el1_ipc_object_and_description_stores_grow_by_segment() {
             fx.pool_len as usize,
         )
     }
-    .unwrap();
+    .unwrap()
+    .with_ceiling(&TEST_CEILING);
     assert_eq!(el1.lock(grown, &EL1).unwrap().eventfd().unwrap().value(), 9);
     assert_eq!(el1.object_count(), 2 * IPC_OBJECT_SEGMENT);
     // Descriptions: the first segment is exhausted, then grown.

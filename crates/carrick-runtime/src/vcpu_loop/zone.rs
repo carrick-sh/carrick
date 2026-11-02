@@ -2048,7 +2048,9 @@ mod ipc_tests {
                     3,
                 )
             }
-            .unwrap(),
+            .unwrap()
+            // A fixture venue whose carrier reads no descriptor ceiling.
+            .with_ceiling(&carrick_el1_abi::NoCeilingReader),
         ))
     }
 

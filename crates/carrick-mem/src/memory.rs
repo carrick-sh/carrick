@@ -405,7 +405,7 @@ const _: () = assert!(
 /// kernel-only block. The host raises the ceiling word for host `FileTable`
 /// installs and owns the gate word through the owned carrier backing; EL1
 /// raises the same ceiling word, only by `fetch_max`, for descriptors a
-/// ring-owned table makes live (`carrick_el1_abi::cover_guest_descriptor`,
+/// ring-owned table makes live (`carrick_el1_abi::GuestCeilingWord`,
 /// #1398). EL1 never writes the gate.
 pub const LINUX_FD_CEILING_CONTROL_BASE: u64 = carrick_el1_abi::EL1_FD_CEILING_CONTROL_BASE;
 pub const LINUX_FD_CEILING_CONTROL_SIZE: u64 = carrick_el1_abi::EL1_FD_CEILING_CONTROL_SIZE;
@@ -2090,9 +2090,10 @@ impl AddressSpace {
     }
 
     /// Install the identity shim plus the opt-in carrier descriptor-ceiling
-    /// fstat guard.  The caller must have installed the carrier control page.
+    /// fstat/close guard, with the control page that guard reads.
     pub fn with_el1_vectors_shim_fd_ceiling(self) -> Result<Self, AddressSpaceError> {
-        self.with_el1_vectors_from_bytes(el1_vectors_bytes_shim_fd_ceiling())
+        self.with_el1_vectors_from_bytes(el1_vectors_bytes_shim_fd_ceiling())?
+            .with_fd_ceiling_control()
     }
 
     pub fn with_el1_vectors_mailbox(
@@ -2109,15 +2110,16 @@ impl AddressSpace {
     }
 
     /// Install mailbox vectors with the opt-in carrier descriptor-ceiling
-    /// fstat guard.  This is intentionally separate from the universal mailbox
-    /// builder because minimal and non-HVF images do not map its control page.
+    /// fstat/close guard and the control page it reads. Separate from the
+    /// universal mailbox builder because minimal and non-HVF images map no
+    /// control page; a ceiling vector never exists without one.
     pub fn with_el1_vectors_mailbox_fd_ceiling(
         self,
         identity_fast_path: bool,
     ) -> Result<Self, AddressSpaceError> {
-        let image = self.with_el1_vectors_from_bytes(el1_vectors_bytes_mailbox_fd_ceiling(
-            identity_fast_path,
-        ))?;
+        let image = self
+            .with_el1_vectors_from_bytes(el1_vectors_bytes_mailbox_fd_ceiling(identity_fast_path))?
+            .with_fd_ceiling_control()?;
         if el1_kernel_enabled() {
             image.with_el1_region()
         } else {
@@ -2136,10 +2138,16 @@ impl AddressSpace {
         fd_ceiling: bool,
         irq: El1IrqMode,
     ) -> Result<Self, AddressSpaceError> {
-        self.with_mailbox_vectors(
+        let image = self.with_mailbox_vectors(
             el1_vectors_bytes_mailbox_clock(identity_fast_path, fd_ceiling, irq),
             identity_fast_path,
-        )
+        )?;
+        // A ceiling vector reads the control page: the two are one install.
+        if fd_ceiling {
+            image.with_fd_ceiling_control()
+        } else {
+            Ok(image)
+        }
     }
 
     fn with_mailbox_vectors(

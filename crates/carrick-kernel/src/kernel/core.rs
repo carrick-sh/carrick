@@ -1406,8 +1406,12 @@ impl Kernel {
         if let Some(owner) = ipc.as_ref() {
             return Ok(Arc::clone(owner));
         }
-        let owner = Arc::new(crate::el1_ipc::HostIpc::new(
+        // Host-side installs into any table of this authority raise the
+        // same carrier ceiling as this kernel's FileTables (#1398).
+        let owner = Arc::new(crate::el1_ipc::HostIpc::with_ceiling(
             crate::el1_ipc::HostIpc::DEFAULT_POOL_BYTES,
+            crate::el1_ipc::IpcLimits::ZONE,
+            self.fd_ceiling(),
         )?);
         *ipc = Some(Arc::clone(&owner));
         Ok(owner)

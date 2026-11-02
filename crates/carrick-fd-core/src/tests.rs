@@ -222,6 +222,8 @@ pub(crate) struct TestArena {
     objects: &'static [ObjectRecord],
     /// The venue's monotone descriptor ceiling, as the ARM vector reads it.
     ceiling: AtomicU64,
+    /// A venue whose ceiling cannot cover a number (an unbound view).
+    refuse_cover: core::sync::atomic::AtomicBool,
 }
 impl TestArena {
     /// A leaked venue holding `ofds` zeroed OFD records.
@@ -246,6 +248,7 @@ impl TestArena {
             ofds: records,
             objects: obj_records,
             ceiling: AtomicU64::new(0),
+            refuse_cover: core::sync::atomic::AtomicBool::new(false),
         }))
     }
 }
@@ -261,13 +264,21 @@ impl TestArena {
     pub(crate) fn ceiling(&self) -> u64 {
         self.ceiling.load(Ordering::Acquire)
     }
+    /// Make every later cover fail, as an unbound venue view does.
+    pub(crate) fn refuse_covers(&self) {
+        self.refuse_cover.store(true, Ordering::Release);
+    }
 }
 impl SlotBacking for TestArena {
     fn resolve(&self, extent: Extent) -> Option<(&[DescriptorSlot], &[AtomicU64])> {
         resolve_extent(extent)
     }
-    fn cover_descriptor(&self, fd: usize) {
+    fn cover_descriptor(&self, fd: usize) -> bool {
+        if self.refuse_cover.load(Ordering::Acquire) {
+            return false;
+        }
         self.ceiling.fetch_max(fd as u64, Ordering::AcqRel);
+        true
     }
     fn ofd(&self, index: usize) -> Option<&OfdRecord> {
         self.ofds.get(index)
@@ -382,6 +393,45 @@ fn every_installed_descriptor_is_covered_by_the_venue_ceiling() {
     for table in [t, child] {
         c.destroy_table(table, |_| {}).unwrap();
     }
+}
+
+/// A venue whose ceiling cannot cover a number refuses the install before
+/// any effect: no slot, no hold, no reservation consumed (#1398 review).
+#[test]
+fn uncovered_install_is_refused_before_any_effect() {
+    let (core, arena) = core_with::<2>(8);
+    let c = core.bind(arena, Spin);
+    let t = c.create_table(64, &mut storage(16)).unwrap();
+    let source = c.open(t, Fd(0), description(1), false).unwrap();
+    let exact = c.reserve_exact(t, Fd(9)).unwrap();
+    let (pin, _) = c.pin(t, source).unwrap();
+    arena.refuse_covers();
+    assert_eq!(c.dup(t, source), Err(Error::BadBacking));
+    assert_eq!(c.dup2(t, source, Fd(4)), Err(Error::BadBacking));
+    assert_eq!(
+        c.open(t, Fd(0), description(2), false),
+        Err(Error::BadBacking)
+    );
+    assert_eq!(c.install_pin(t, Fd(5), &pin, false), Err(Error::BadBacking));
+    let refused = c.commit_reservation(exact, &pin, false).unwrap_err();
+    assert_eq!(refused.error(), Error::BadBacking);
+    assert_eq!(
+        c.transaction(t)
+            .unwrap()
+            .install_pair(Fd(0), [&pin, &pin], false),
+        Err(Error::BadBacking)
+    );
+    for fd in 1..10 {
+        assert_eq!(
+            c.get(t, Fd(fd)).err(),
+            Some(Error::BadFd),
+            "fd {fd} stayed vacant"
+        );
+    }
+    assert_eq!(c.refcount(t, source), Ok(1), "no hold was taken");
+    c.cancel_reservation(refused.into_reservation()).unwrap();
+    assert_eq!(c.unpin(pin), Ok(None));
+    c.destroy_table(t, |_| {}).unwrap();
 }
 
 #[test]
@@ -2548,8 +2598,8 @@ struct FailResolveOnce {
     fail_at: AtomicU64,
 }
 impl SlotBacking for FailResolveOnce {
-    fn cover_descriptor(&self, fd: usize) {
-        self.arena.cover_descriptor(fd);
+    fn cover_descriptor(&self, fd: usize) -> bool {
+        self.arena.cover_descriptor(fd)
     }
     fn resolve(&self, extent: Extent) -> Option<(&[DescriptorSlot], &[AtomicU64])> {
         let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;

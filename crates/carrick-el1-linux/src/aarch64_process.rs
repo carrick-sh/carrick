@@ -982,7 +982,11 @@ pub trait ForkStockCrossing {
             if !map.window_published() {
                 return None;
             }
-            Some((carrick_el1_abi::ipc_window_guest()?.attach().ok()?, map))
+            let region = carrick_el1_abi::ipc_window_guest()?
+                .attach()
+                .ok()?
+                .with_ceiling(&carrick_el1_abi::GUEST_DESCRIPTOR_CEILING);
+            Some((region, map))
         }
         #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         {
