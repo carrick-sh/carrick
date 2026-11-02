@@ -1636,7 +1636,7 @@ fn arm_root_fork_seeds_each_childs_row_with_the_roots_live_cwd() {
     );
     assert_eq!(
         runtime.task_fs_for_test(None).unwrap(),
-        Some(carrick_personality_linux::task_fs::TaskFs::default()),
+        None,
         "the host-served root's own row never mirrors its host cwd"
     );
 }

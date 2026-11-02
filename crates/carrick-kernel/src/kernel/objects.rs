@@ -3825,6 +3825,12 @@ impl FsContext {
         self.state.read().chroot_root.clone()
     }
 
+    /// The cwd and root together, read under one lock acquisition.
+    pub fn with_cwd_and_root<R>(&self, f: impl FnOnce(&str, Option<&str>) -> R) -> R {
+        let state = self.state.read();
+        f(&state.cwd, state.chroot_root.as_deref())
+    }
+
     pub fn with_chroot_root<R>(&self, f: impl FnOnce(Option<&str>) -> R) -> R {
         let state = self.state.read();
         f(state.chroot_root.as_deref())

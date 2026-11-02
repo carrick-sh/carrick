@@ -125,7 +125,8 @@ pub enum ServiceOperation {
     /// Serve one host-file crossing staged by the ring
     /// ([`crate::host_file`]). The payload is one ring-owned request/reply
     /// record; the carrier writes only its reply area, before acknowledgment.
-    /// The capability selects the process tree's retained file authority.
+    /// The capability selects the run's file service; a path record carries
+    /// the caller's own access context.
     HostFile {
         capability: ExecCapabilityId,
         payload: HostFilePayloadDescriptor,

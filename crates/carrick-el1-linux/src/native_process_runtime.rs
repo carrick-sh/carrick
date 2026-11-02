@@ -429,13 +429,15 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
         child: MmGeneration,
     ) -> Result<Self::PreparedMm, NativeProcessError>;
     /// The live cwd and root of the host-served root, read once for a child
-    /// the root is forking (the #1393(a) `RootOnly` seed).
+    /// the root is forking (the #1393(a) `RootOnly` seed). A venue without
+    /// the seed crossing fails closed: the child's cwd is unknown and its
+    /// path calls stay unrouted (x86 CPL0 until its seam lands).
     fn root_fork_seed(
         &mut self,
         capability: carrick_core_abi::service::ExecCapabilityId,
     ) -> Result<RootFsSeed, NativeProcessError> {
         let _ = capability;
-        Ok(RootFsSeed::NoHostRoot)
+        Ok(RootFsSeed::Refused)
     }
     fn prepared_mm(&self, prepared: &Self::PreparedMm) -> Self::Mm;
     fn prepared_context(&self, prepared: &Self::PreparedMm) -> AddressContext<RootGpa>;
@@ -3265,7 +3267,23 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             )
             .ok_or(NativeProcessError::Invalid)?,
         );
-        Self::admit_fresh_root::<B>(source, current, page, control, mm, address, words)
+        let runtime =
+            Self::admit_fresh_root::<B>(source, current, page, control, mm, address, words)?;
+        runtime.give_fixture_root_a_cwd();
+        Ok(runtime)
+    }
+
+    /// Fixtures that exec their root row through the native exec owner (a
+    /// route production never takes for the host-served root, whose exec
+    /// keeps the host route) give that row the `/` such an exec resolves
+    /// from. Production admission leaves the root's row without a cwd.
+    #[cfg(any(test, feature = "host-test"))]
+    pub(crate) fn give_fixture_root_a_cwd(&self) {
+        let mut graph = self.graph.lock();
+        let root = graph.root_key;
+        if let Ok(task) = graph.owner.task_mut(root) {
+            task.fs = Some(carrick_personality_linux::task_fs::TaskFs::default());
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3459,6 +3477,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             carrick_personality_linux::identity::TaskCredentials::ROOT,
             [0u8; 16],
         );
+        // The host-served root's cwd and root live in its host task; its row
+        // holds none (a #1393(a) `RootOnly` row), so nothing can copy a
+        // placeholder from it. Its children are seeded at their fork.
+        initial.fs = None;
         for (_, tid, _) in &imported {
             initial
                 .spawn_thread(visible.get(), tid.get())
@@ -3876,8 +3898,6 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
 }
 /// The outcome of the root fork seed crossing (#1392).
 pub enum RootFsSeed {
-    /// This venue has no host-served root: the ring row is the authority.
-    NoHostRoot,
     /// The host-served root's live cwd and root at this fork.
     Seeded(carrick_personality_linux::task_fs::TaskFs),
     /// The carrier did not serve the seed (for example the root's file
@@ -4206,6 +4226,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         request_signal_reschedule(self.source.zone, self.service, record);
     }
 
+    /// See [`NativeProcessRuntime::give_fixture_root_a_cwd`].
+    #[cfg(test)]
+    pub(crate) fn give_fixture_root_a_cwd(&self) {
+        self.runtime.give_fixture_root_a_cwd();
+    }
     pub fn take_root_exit(&mut self) -> Option<LinuxWaitStatus> {
         self.root_exit.take()
     }
@@ -6580,9 +6605,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .runtime
                 .exec_capability()
                 .ok_or(NativeProcessError::Stale)?;
-            self.service.root_fork_seed(capability)?
+            Some(self.service.root_fork_seed(capability)?)
         } else {
-            RootFsSeed::NoHostRoot
+            None
         };
         let (
             snapshot,
@@ -6640,10 +6665,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .clone();
             let parent_rlimits = row.rlimits;
             let parent_umask = row.umask;
-            let parent_fs = match core::mem::replace(&mut root_seed, RootFsSeed::NoHostRoot) {
-                RootFsSeed::Seeded(seed) => Some(seed),
-                RootFsSeed::Refused => None,
-                RootFsSeed::NoHostRoot => row.fs.clone(),
+            let parent_fs = match root_seed.take() {
+                Some(RootFsSeed::Seeded(seed)) => Some(seed),
+                Some(RootFsSeed::Refused) => None,
+                None => row.fs.clone(),
             };
             let parent_personality = row.personality;
             let parent_dumpable = row.dumpable;

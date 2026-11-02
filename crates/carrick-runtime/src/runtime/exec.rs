@@ -108,6 +108,11 @@ fn prepare_native_exec_image(
         .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
     // Served exactly or left unrouted: counted ENOSYS, never a guess.
     let access = view.access().ok_or(crate::linux_abi::LINUX_ENOSYS)?;
+    // `ExecFiles` resolves from the global root; a chrooted caller's exec
+    // is left unrouted until it resolves under the caller's root.
+    if access.root.is_some_and(|root| root != b"/") {
+        return Err(crate::linux_abi::LINUX_ENOSYS);
+    }
     let cwd = core::str::from_utf8(access.cwd).map_err(|_| crate::linux_abi::LINUX_ENOSYS)?;
     let files = capability.files.for_native_access(
         cwd.to_owned(),
@@ -134,7 +139,9 @@ fn prepare_native_exec_image(
             } else if path.starts_with('/') || dirfd == -100 {
                 path.to_owned()
             } else {
-                return Err(crate::linux_abi::LINUX_EBADF);
+                // Linux resolves a relative path from `dirfd`, a descriptor
+                // this capability does not hold: unrouted, never EBADF.
+                return Err(crate::linux_abi::LINUX_ENOSYS);
             }
         }
     };
@@ -243,9 +250,9 @@ impl carrick_vmm_hvf::metadata_grant::NativeExecHostService for NativeExecCapabi
         let Ok(root) = run.dispatcher.capture_one_task_context() else {
             return false;
         };
-        let fs = root.resources().fs_context();
-        let root_dir = fs.chroot_root();
-        fs.with_cwd(|cwd| record.serve(cwd.as_bytes(), root_dir.as_deref().map(str::as_bytes)))
+        root.resources()
+            .fs_context()
+            .with_cwd_and_root(|cwd, root| record.serve(cwd.as_bytes(), root.map(str::as_bytes)))
     }
 }
 
@@ -876,26 +883,42 @@ mod tests {
 
     /// Seal a staged payload with a caller's access context, as the ring
     /// owner does from the caller's task row.
-    fn sealed(mut payload: Vec<u8>, fsuid: u32, cwd: &str) -> Vec<u8> {
+    fn sealed(payload: Vec<u8>, fsuid: u32, cwd: &str) -> Vec<u8> {
+        sealed_in(payload, fsuid, cwd, None)
+    }
+
+    /// Seal a staged payload as the ring owner does, through the production
+    /// encoder, from a task row with `fsuid` everywhere, the capabilities
+    /// Linux leaves that uid, `cwd` and `root`.
+    fn sealed_in(mut payload: Vec<u8>, fsuid: u32, cwd: &str, root: Option<&str>) -> Vec<u8> {
+        use carrick_personality_linux::identity::{TaskCredentials, TaskGid, TaskUid};
+        use carrick_personality_linux::task_fs::{TaskFs, TaskPath};
+        let mut credentials = TaskCredentials::ROOT;
+        let (uid, gid) = (TaskUid::new(fsuid), TaskGid::new(fsuid));
+        (
+            credentials.ruid,
+            credentials.euid,
+            credentials.suid,
+            credentials.fsuid,
+        ) = (uid, uid, uid, uid);
+        (
+            credentials.rgid,
+            credentials.egid,
+            credentials.sgid,
+            credentials.fsgid,
+        ) = (gid, gid, gid, gid);
+        if fsuid != 0 {
+            credentials.cap_effective =
+                carrick_personality_linux::identity::LinuxCapabilitySet::empty();
+            credentials.cap_permitted =
+                carrick_personality_linux::identity::LinuxCapabilitySet::empty();
+        }
+        let fs = TaskFs {
+            cwd: TaskPath::new(cwd.as_bytes()).unwrap(),
+            root: root.map(|root| TaskPath::new(root.as_bytes()).unwrap()),
+        };
         let mut access = Vec::new();
-        carrick_core_abi::host_file::AccessContext::encode_into(
-            &mut access,
-            carrick_core_abi::host_file::AccessIds {
-                fsuid,
-                euid: fsuid,
-                ruid: fsuid,
-                suid: fsuid,
-                fsgid: fsuid,
-                egid: fsuid,
-                rgid: fsuid,
-                sgid: fsuid,
-            },
-            0o022,
-            None,
-            cwd.as_bytes(),
-            None,
-        )
-        .unwrap();
+        fs.encode_access(&credentials, 0o022, &mut access).unwrap();
         carrick_core_abi::service::seal_exec_payload_access(&mut payload, &access).unwrap();
         payload
     }
@@ -978,6 +1001,33 @@ mod tests {
             ),
             enosys
         );
+        // A relative execveat resolves from a descriptor the capability
+        // does not hold: unrouted, never EBADF (review #1409, 3).
+        assert_eq!(
+            exec(
+                ExecCall::Execveat { dirfd: 3, flags: 0 },
+                "static-successor",
+                0,
+                &cwd
+            ),
+            enosys
+        );
+        // A chrooted caller's exec is unrouted until it resolves under its
+        // root; a root of `/` is the global root (review #1409, 2).
+        let chrooted = |root| {
+            prepare_native_exec_image(
+                &capability,
+                &sealed_in(
+                    native_exec_payload(ExecCall::Execve, &absolute),
+                    0,
+                    "/",
+                    Some(root),
+                ),
+            )
+            .map(|_| ())
+        };
+        assert_eq!(chrooted("/jail"), enosys);
+        assert!(chrooted("/").is_ok());
         // A no-follow execveat is never served as a following lookup.
         assert_eq!(
             exec(
