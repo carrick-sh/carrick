@@ -47,3 +47,13 @@ not itself a red execution of the pinned-table test. Record a failing run and
 its implementation variant separately from the subsequent green run. A
 compile-only KVM fixture result is also not a live verdict: acceptance still
 requires the merge queue's `kvm-tests` and `kvm-gate` receipt with `NEW=[]`.
+
+To reproduce the independent-oracle red witness, temporarily add `1 << 16`
+(`AVX512F`) to the production `(7, 0)` response in `cpuid_for_state`, leaving
+the tests unchanged. Run the VM-free pinned-table test and the live
+`cpuid_v3_kvm` target. Both must reject leaf 7 EBX `1114536` (`0x1101a8`)
+against the pinned `1049000` (`0x1001a8`). Restore the production response,
+rebuild, and run both again. This mutation witnesses rejection of an accidental
+feature expansion; it does not claim to reconstruct the pre-implementation
+host-pass-through tree. Run the live target with `CARRICK_REQUIRE_KVM=1` on
+an admitted KVM host under its existing VM-local gate lease.
