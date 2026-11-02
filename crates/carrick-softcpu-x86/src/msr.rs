@@ -9,7 +9,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use crate::apic::{MonotonicTscClock, TscClock};
-use crate::cpuid::{DEFAULT_TSC_HZ, GuestCpuidView};
+use crate::cpuid::{CpuidAuthority, DEFAULT_TSC_HZ};
 use crate::mmu::is_canonical_va;
 
 /// Typed 32-bit architectural MSR selector (`ECX` operand of `RDMSR`/`WRMSR`).
@@ -85,9 +85,9 @@ impl Default for MsrCapabilities {
 }
 
 impl MsrCapabilities {
-    /// Derive MSR validation capabilities from a [`GuestCpuidView`].
+    /// Derive MSR validation capabilities from a [`CpuidAuthority`].
     #[must_use]
-    pub fn from_cpuid(view: &dyn GuestCpuidView) -> Self {
+    pub fn from_cpuid(view: &dyn CpuidAuthority) -> Self {
         Self {
             max_phy_addr: view.max_phy_addr(),
             nxe: view.supports_nxe(),

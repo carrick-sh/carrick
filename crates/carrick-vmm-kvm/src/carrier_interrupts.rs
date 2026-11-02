@@ -61,12 +61,6 @@ pub(crate) fn data_map(index: u64) -> Pml4MapSpec {
     }
 }
 
-pub(crate) fn create_irqchip(vm: &KvmVm) -> Result<(), TrapError> {
-    vm.vm
-        .create_irq_chip()
-        .map_err(|e| fail(format!("KVM_CREATE_IRQCHIP: {e}")))
-}
-
 /// Inject a fixed edge-triggered wake at the retained LAPIC CPU destination.
 /// KVM performs hardware delivery, including deferral while CPL0 masks IF.
 /// No host pthread wake is a completion of a guest task.

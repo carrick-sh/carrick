@@ -10,7 +10,7 @@
 //! (`carrick-softcpu-x86` / `carrick-vmm-soft`) must expose the same pinned `x86-64-v3`
 //! `CPUID` topology and feature set so guest binaries take identical `glibc` / `musl` /
 //! Go / Rust IFUNC and runtime dispatch paths regardless of the host CPU (`x86-64-v4`
-//! AVX-512, AMX, SHA, AES, RDRAND, LA57, PKU, CET, and hypervisor leaves stay masked off).
+//! AVX-512, AMX, SHA, RDRAND, LA57, PKU, CET, and hypervisor leaves stay masked off).
 
 use core::fmt;
 use core::num::NonZeroU64;
@@ -142,6 +142,10 @@ pub const CPUID_1_ECX_OSXSAVE: u32 = 1 << 27;
 pub const CPUID_1_ECX_AVX: u32 = 1 << 28;
 pub const CPUID_1_ECX_F16C: u32 = 1 << 29;
 pub const CPUID_1_ECX_HYPERVISOR: u32 = 1 << 31;
+
+/// Owner-approved optional AES-NI, PCLMULQDQ and TSC-deadline extensions.
+/// Intersected with host capabilities independently of required v3 features.
+pub const CPUID_1_ECX_OPTIONAL: u32 = (1 << 1) | (1 << 24) | (1 << 25);
 
 /// Static hardware `CPUID.01H:ECX` bits required for `x86-64-v3` (excludes dynamic `OSXSAVE`).
 pub const CPUID_1_ECX_X86_64_V3_HW: u32 = CPUID_1_ECX_SSE3
@@ -434,6 +438,9 @@ pub struct GuestCpuidView {
     apic_id: u8,
     max_phy_addr: u8,
     tsc: Option<TscCrystalRatio>,
+    // Owner-approved extensions; qualified independently from required v3 bits.
+    optional_ecx: u32,
+    invtsc: u32,
 }
 
 impl Default for GuestCpuidView {
@@ -443,6 +450,8 @@ impl Default for GuestCpuidView {
 }
 
 impl GuestCpuidView {
+    /// Architectural template with AES-NI, PCLMULQDQ and TSC_DEADLINE.
+    /// Hardware callers must use `qualify_supported` before installing it.
     /// Default pinned `x86-64-v3` view (`apic_id = 0`, `MAXPHYADDR = 48`, `TSC = 2 GHz`).
     #[must_use]
     pub const fn x86_64_v3() -> Self {
@@ -450,6 +459,8 @@ impl GuestCpuidView {
             apic_id: 0,
             max_phy_addr: DEFAULT_GUEST_MAX_PHY_ADDR,
             tsc: Some(TscCrystalRatio::DEFAULT),
+            optional_ecx: CPUID_1_ECX_OPTIONAL,
+            invtsc: CPUID_8000_0007_EDX_INVTSC,
         }
     }
 
@@ -523,11 +534,12 @@ impl GuestCpuidView {
             ),
             (1, _) => {
                 let ebx = ((self.apic_id as u32) << 24) | (CPUID_CLFLUSH_LINE_CHUNKS << 8);
-                let ecx = if osxsave_enabled {
-                    CPUID_1_ECX_X86_64_V3
-                } else {
-                    CPUID_1_ECX_X86_64_V3_HW
-                };
+                let ecx = self.optional_ecx
+                    | if osxsave_enabled {
+                        CPUID_1_ECX_X86_64_V3
+                    } else {
+                        CPUID_1_ECX_X86_64_V3_HW
+                    };
                 CpuidRegs::new(CPUID_V3_SIGNATURE_EAX, ebx, ecx, CPUID_1_EDX_X86_64_V3)
             }
             (7, 0) => CpuidRegs::new(0, CPUID_7_0_EBX_PINNED, 0, 0),
@@ -551,7 +563,7 @@ impl GuestCpuidView {
                 CPUID_8000_0001_ECX_X86_64_V3,
                 CPUID_8000_0001_EDX_X86_64_V3,
             ),
-            (0x8000_0007, _) => CpuidRegs::new(0, 0, 0, CPUID_8000_0007_EDX_INVTSC),
+            (0x8000_0007, _) => CpuidRegs::new(0, 0, 0, self.invtsc),
             (0x8000_0008, _) => CpuidRegs::new(
                 (self.max_phy_addr as u32) | ((GUEST_LINEAR_ADDR_BITS as u32) << 8),
                 0,
@@ -726,9 +738,12 @@ impl GuestCpuidView {
         let supported_tsc = find_supported_leaf(supported, 0x15, 0)
             .and_then(|r| TscCrystalRatio::new(r.eax, r.ebx, r.ecx));
         let clamped_phy = host_phy.min(DEFAULT_GUEST_MAX_PHY_ADDR);
-        Self::x86_64_v3()
+        let mut view = Self::x86_64_v3()
             .with_tsc(supported_tsc)
-            .with_max_phy_addr(clamped_phy)
+            .with_max_phy_addr(clamped_phy)?;
+        view.optional_ecx &= l1.ecx;
+        view.invtsc &= find_supported_leaf(supported, 0x8000_0007, 0).map_or(0, |r| r.edx);
+        Ok(view)
     }
 }
 
@@ -806,8 +821,8 @@ mod tests {
     }
 
     /// Audit that a CPUID query function exposes every `x86-64-v3` capability and ZERO
-    /// features outside the pinned `x86-64-v3` + baseline/CPL0 profile.
-    fn audit_strict_x86_64_v3_only(
+    /// features outside the pinned v3 + baseline/CPL0 + AES/PCLMUL/deadline profile.
+    fn audit_pinned_x86_64_v3_profile(
         query: impl Fn(u32, u32) -> CpuidRegs,
         expected_apic_id: u8,
         expected_max_phy_addr: u8,
@@ -831,9 +846,9 @@ mod tests {
                 l1.ebx
             ));
         }
-        if l1.ecx != CPUID_1_ECX_X86_64_V3 {
-            let missing = CPUID_1_ECX_X86_64_V3 & !l1.ecx;
-            let extra = l1.ecx & !CPUID_1_ECX_X86_64_V3;
+        if l1.ecx != 0x3fd8_3203 {
+            let missing = 0x3fd8_3203 & !l1.ecx;
+            let extra = l1.ecx & !0x3fd8_3203;
             return Err(format!(
                 "leaf 1 ECX mismatch: got={:#010x} missing={missing:#010x} non_v3_extra={extra:#010x}",
                 l1.ecx
@@ -1032,6 +1047,7 @@ mod tests {
                 ),
             ),
             CpuidLeafEntry::basic(0x8000_0000, CpuidRegs::new(0x8000_0022, 0, 0, 0)),
+            CpuidLeafEntry::basic(0x8000_0007, CpuidRegs::new(0, 0, 0, 1 << 8)),
             CpuidLeafEntry::basic(
                 0x8000_0001,
                 CpuidRegs::new(
@@ -1050,22 +1066,23 @@ mod tests {
     fn raw_unscrubbed_host_cpuid_fails_v3_isolation_audit() {
         // Negative control reproducing pre-#667 KVM behavior (`KVM_GET_SUPPORTED_CPUID` pass-through).
         let raw = synthetic_epyc_zen4_v4_supported();
-        let err = audit_strict_x86_64_v3_only(|l, s| emulate_cpuid_table_query(&raw, l, s), 0, 48)
-            .expect_err("raw x86-64-v4 host CPUID table must fail the strict v3 audit");
+        let err =
+            audit_pinned_x86_64_v3_profile(|l, s| emulate_cpuid_table_query(&raw, l, s), 0, 48)
+                .expect_err("raw x86-64-v4 host CPUID table must fail the strict v3 audit");
         assert!(err.contains("mismatch"), "unexpected audit error: {err}");
     }
 
     #[test]
-    fn x86_64_v3_table_advertises_exact_psabi_v3_and_no_feature_outside_v3() {
+    fn x86_64_v3_table_advertises_exact_pinned_profile() {
         let view = GuestCpuidView::x86_64_v3();
         // Keep these architectural bit positions independent of the production
         // masks: adding a feature to a mask must not also update its oracle.
-        assert_eq!(view.cpuid(1, 0).ecx, 0x3cd8_3201);
+        assert_eq!(view.cpuid(1, 0).ecx, 0x3fd8_3203);
         assert_eq!(view.cpuid(1, 0).edx, 0x0789_a37d);
         assert_eq!(view.cpuid(7, 0), CpuidRegs::new(0, 0x0010_01a8, 0, 0));
         assert_eq!(view.cpuid(0x8000_0001, 0).ecx, 0x21);
         assert_eq!(view.cpuid(0x8000_0001, 0).edx, 0x2010_0800);
-        audit_strict_x86_64_v3_only(|leaf, subleaf| view.cpuid(leaf, subleaf), 0, 48)
+        audit_pinned_x86_64_v3_profile(|leaf, subleaf| view.cpuid(leaf, subleaf), 0, 48)
             .expect("GuestCpuidView::cpuid must satisfy strict x86-64-v3 profile");
 
         let entries = view.to_leaf_entries();
@@ -1074,7 +1091,7 @@ mod tests {
             11,
             "the installed table has a fixed work budget"
         );
-        audit_strict_x86_64_v3_only(
+        audit_pinned_x86_64_v3_profile(
             |leaf, subleaf| emulate_cpuid_table_query(&entries, leaf, subleaf),
             0,
             48,
@@ -1115,7 +1132,7 @@ mod tests {
         let view = GuestCpuidView::qualify_supported(&epyc).expect("qualify EPYC Zen 4");
         assert_eq!(view.max_phy_addr(), 48);
         let entries = view.to_leaf_entries();
-        audit_strict_x86_64_v3_only(|l, s| emulate_cpuid_table_query(&entries, l, s), 0, 48)
+        audit_pinned_x86_64_v3_profile(|l, s| emulate_cpuid_table_query(&entries, l, s), 0, 48)
             .expect("scrubbed EPYC table must pass strict v3 audit");
 
         // 46-bit Intel Xeon Skylake-SP host (lacking UMIP, MAXPHYADDR = 46 < 48) -> clamped to 46.
@@ -1131,7 +1148,7 @@ mod tests {
         let skylake_view = GuestCpuidView::qualify_supported(&skylake).expect("qualify Skylake-SP");
         assert_eq!(skylake_view.max_phy_addr(), 46);
         let skylake_entries = skylake_view.to_leaf_entries();
-        audit_strict_x86_64_v3_only(
+        audit_pinned_x86_64_v3_profile(
             |l, s| emulate_cpuid_table_query(&skylake_entries, l, s),
             0,
             46,
@@ -1275,6 +1292,45 @@ mod tests {
                 supported: 32,
                 minimum: 36,
             })
+        );
+    }
+
+    #[test]
+    fn optional_features_are_host_qualified() {
+        let base = synthetic_epyc_zen4_v4_supported();
+        let full = GuestCpuidView::qualify_supported(&base).unwrap();
+        assert_eq!(full.cpuid(1, 0).ecx, 0x3fd8_3203);
+        assert_eq!(full.cpuid(0x8000_0007, 0).edx, 1 << 8);
+        for (leaf, bit) in [(1, 1), (1, 24), (1, 25), (0x8000_0007, 8)] {
+            let mut supported = base.clone();
+            for entry in &mut supported {
+                if entry.function == leaf {
+                    if leaf == 1 {
+                        entry.regs.ecx &= !(1 << bit);
+                    } else {
+                        entry.regs.edx &= !(1 << bit);
+                    }
+                }
+            }
+            let view = GuestCpuidView::qualify_supported(&supported).unwrap();
+            let mut expected = full.cpuid(leaf, 0);
+            if leaf == 1 {
+                expected.ecx &= !(1 << bit);
+            } else {
+                expected.edx &= !(1 << bit);
+            }
+            assert_eq!(view.cpuid(leaf, 0), expected);
+            let other_leaf = if leaf == 1 { 0x8000_0007 } else { 1 };
+            assert_eq!(view.cpuid(other_leaf, 0), full.cpuid(other_leaf, 0));
+        }
+        let mut supported = base;
+        supported.retain(|e| e.function != 0x8000_0007);
+        assert_eq!(
+            GuestCpuidView::qualify_supported(&supported)
+                .unwrap()
+                .cpuid(0x8000_0007, 0)
+                .edx,
+            0
         );
     }
 

@@ -11,7 +11,7 @@ semantic_authority = [
 fixture = "carrick-softcpu-x86::softcpu_cpl0"
 scale_points = [1, 8, 64]
 rationale = """
-Slice #668 (#578) adds clean-room Ring-0 system state (`MsrFile`), `GuestCpuidView`
+Slice #668 (#578) adds clean-room Ring-0 system state (`MsrFile`), `CpuidAuthority`
 (`Level0CpuidView`, `Cpl0CpuidView`), CPL0 privileged instruction emulation
 (`MOV CR0/CR2/CR3/CR4/CR8`, `MOV DR0..DR7`, `RDMSR`/`WRMSR`, `LGDT`/`LIDT`/`LTR`,
 `SWAPGS`, `SYSRETQ`, `IRETQ`, `HLT`, `INVLPG`, `CLI`/`STI`, `CLAC`/`STAC`,

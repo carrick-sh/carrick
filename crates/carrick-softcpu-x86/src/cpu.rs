@@ -11,7 +11,7 @@ use crate::context::{
     EXIT_REASON_CFLOW, EXIT_REASON_CONTINUE, EXIT_REASON_RESTART, EXIT_REASON_SENSITIVE,
     EXIT_REASON_SYSCALL, GUEST_MXCSR_MASK, SoftCpuContext, X86Exception, X86ExceptionVector, reg,
 };
-use crate::cpuid::{GuestCpuidView, Level0CpuidView};
+use crate::cpuid::{CpuidAuthority, Level0CpuidView};
 use crate::decode::SensitiveOp;
 use crate::emit::{EmitError, emit_block};
 use crate::mmu::{
@@ -177,7 +177,7 @@ impl Drop for JitCodeBuffer {
 pub struct SoftCpu {
     ctx: Box<SoftCpuContext>,
     jit: JitCodeBuffer,
-    cpuid: Box<dyn GuestCpuidView>,
+    cpuid: Box<dyn CpuidAuthority>,
     pub max_block_insns: usize,
     pub max_block_span: usize,
 }
@@ -315,10 +315,10 @@ impl SoftCpu {
         Self::with_cpuid_view(extents, Box::new(Level0CpuidView))
     }
 
-    /// Create a new [`SoftCpu`] configured with a custom [`GuestCpuidView`].
+    /// Create a new [`SoftCpu`] configured with a custom [`CpuidAuthority`].
     pub fn with_cpuid_view(
         extents: &ExtentTable,
-        cpuid: Box<dyn GuestCpuidView>,
+        cpuid: Box<dyn CpuidAuthority>,
     ) -> Result<Self, SoftCpuNewError> {
         let mut ctx = SoftCpuContext::new(extents).map_err(SoftCpuNewError::Seat)?;
         ctx.walker.set_max_phy_addr(cpuid.max_phy_addr());
@@ -333,15 +333,15 @@ impl SoftCpu {
         })
     }
 
-    /// Inspect the installed [`GuestCpuidView`].
+    /// Inspect the installed [`CpuidAuthority`].
     #[must_use]
-    pub fn cpuid_view(&self) -> &dyn GuestCpuidView {
+    pub fn cpuid_view(&self) -> &dyn CpuidAuthority {
         &*self.cpuid
     }
 
-    /// Replace the installed [`GuestCpuidView`] between runs, updating `MAXPHYADDR`, `tsc_hz`,
+    /// Replace the installed [`CpuidAuthority`] between runs, updating `MAXPHYADDR`, `tsc_hz`,
     /// and local APIC ID.
-    pub fn set_cpuid_view(&mut self, cpuid: Box<dyn GuestCpuidView>) {
+    pub fn set_cpuid_view(&mut self, cpuid: Box<dyn CpuidAuthority>) {
         self.ctx.walker.set_max_phy_addr(cpuid.max_phy_addr());
         self.ctx.tsc_hz = cpuid.tsc_hz();
         self.ctx.lapic.set_apic_id(cpuid.apic_id());
