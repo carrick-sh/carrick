@@ -34951,6 +34951,384 @@
       "owner": "carrick_kernel::dispatch::sysv::IpcView<'a>::lock_sysv_process",
       "lane": "shared",
       "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_core::mm::fault::RootFaultAdmission",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_core::mm::fault::RootMappingIncarnation",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_core::mm::fork::ForkError",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_core::mm::transaction::error::MmError",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_core::mm::transaction::user_write::CopyoutPreparation",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_core::mm::transaction::user_write::UserWriteError",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_core_abi::metadata_extent::MetadataResolutionError",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_core_abi::mm::reservation::Refusal",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_core_abi::service::ServiceError",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_el1::isa::ArchError",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_el1_linux::native_fork_refusal::NativeForkCause",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_el1_linux::native_process_runtime::NativeProcessError",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_fd_core::Error",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_guest_arch::EntryDecodeError",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_hal::threaded::VcpuLeaseDrainEnrollment",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_host::guest_cpu::VirtualPtraceStopRequest",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_kernel::dispatch::mem::el1_reservations::provider::RootAccessRefusal",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_kernel::dispatch::mem::host_first_touch::HostFirstTouchError",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_kernel::event_ring::RingReadError",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_kernel::kernel::address::SnapshotError",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_kernel::kernel::operations::thread::ThreadPublicationReservationAttempt",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_kernel::kernel::process_lifecycle::ProcessThreadExit",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_kernel::kernel::snapshot::KernelSnapshotError",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_kernel_arena::process::ProcessRecordTransitionError",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_pipe_core::Error",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_runtime::vcpu_loop::crash::CrashLeaseDrainTimeout",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_runtime::vcpu_loop::quiesce::ProcessForkStart",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_runtime::vcpu_loop::threads::PersistentThreadExitDisposition",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_sched_core::object_wait::ObjectWaitError",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_sched_core::process::birth::BirthError",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_sched_core::process::exit::ExitError",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_sched_core::process::exit::TaskSetError",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_sched_core::process::wait::WaitError",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_sched_core::spaces::notification::ExclusionRefusal",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Busy",
+      "owner": "carrick_signal_core::fasync::SlotSearch",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Contended",
+      "owner": "carrick_el1_abi::ipc::IpcError",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Contended",
+      "owner": "carrick_fd_core::Error",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Contended",
+      "owner": "carrick_fd_core::handle::HandleError",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Contended",
+      "owner": "carrick_fd_core::storage::StorageError",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Contended",
+      "owner": "carrick_mmu_core::descriptor_refusal::DescriptorRefusal",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Contended",
+      "owner": "carrick_vmm_hvf::metadata_grant::delayed_owner::Observation",
+      "lane": "hvf",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Occupied",
+      "owner": "carrick_el1_abi::ipc_tables::IpcTableMapError",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Occupied",
+      "owner": "carrick_fd_core::handle::SlotState",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Occupied",
+      "owner": "carrick_host::host_proc::DirectVmReservationError",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Occupied",
+      "owner": "carrick_mmu_core::aarch64::TerminalRefusal",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Occupied",
+      "owner": "carrick_mmu_core::descriptor_refusal::DescriptorRefusal",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:Occupied",
+      "owner": "carrick_sched_core::object_wait::ObjectWaitError",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:OwnerWait",
+      "owner": "carrick_aarch64::user_transfer::SupplyProgress",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:OwnerWait",
+      "owner": "carrick_aarch64::user_transfer::TransferProgress",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:OwnerWait",
+      "owner": "carrick_el1_linux::native_process_runtime::NativeProcessError",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:OwnerWait",
+      "owner": "carrick_guest_mem::MemoryError",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:OwnerWait",
+      "owner": "carrick_guest_mem::prepared::MemoryPrepareError",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:OwnerWait",
+      "owner": "carrick_observability::probes::HvpatchNativeFaultPhase",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "contention_variant:PinRaced",
+      "owner": "carrick_fd_core::Error",
+      "lane": "shared",
+      "ceiling": 1
     }
   ]
 }

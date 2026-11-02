@@ -99,6 +99,7 @@ mod aarch64_context;
 pub mod completion_queue;
 pub mod object_wait;
 pub mod occupancy;
+pub mod refusal;
 pub mod spaces;
 mod x86_context;
 pub use aarch64_context::{AARCH64_ROOT_ADDRESS_MASK, Aarch64ParkedContext};
@@ -1386,6 +1387,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for SlotGuard<'_, C> {
 #[repr(C)]
 #[cfg_attr(all(test, feature = "loom"), derive(Default))]
 pub struct ZoneCounters {
+    /// Linear contention tickets abandoned without park or cancellation.
+    pub contention_tickets_dropped: AtomicU64,
     /// Threads parked by EL1 with a switch to another thread.
     pub el1_parks: AtomicU64,
     /// Threads parked by the host (forwarded or timed waits).

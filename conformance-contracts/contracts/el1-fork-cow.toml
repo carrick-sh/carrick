@@ -80,3 +80,8 @@ metric = "hvf_syscall_exits"
 maximum = 64
 layers = ["embed-structural"]
 rationale = "Budget kernel.el1.fork-lifecycle-exits. Distinct from the per-page COW slope above: today the fixture's HVF exits are dominated by per-round process lifecycle (fork, 8 thread spawns, pipes, poll, wait), not by COW faults, so this stays RED until thread and process lifecycle is born in the zone. It is declared so that the lifecycle cost is named and cannot be hidden behind, or relaxed into, the COW ceiling `exits <= forks*pages/4+64` that the test still asserts unchanged. The fixed 64 matches that ceiling's constant term."
+
+# #1395 slice 1: scheduler refusal::queue_witnesses proves bounded cause
+# selection, release-before-park, retirement rerun and exactly one wake.
+# The zone-scoped abandoned-ticket counter changes the shared layout hash;
+# existing semantic/signed bindings and budgets above remain required.

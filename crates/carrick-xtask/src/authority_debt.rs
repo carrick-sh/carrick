@@ -14,6 +14,7 @@ pub const CEILINGS_PATH: &str = "scripts/migrate/authority-debt-ceilings.json";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Family {
+    ContentionVariant,
     BuildTime,
     RawLock,
     K1CreateInstall,
@@ -482,6 +483,21 @@ fn source_counts(
         policy.assign(&[family], operation, &owner, lane)?;
         add(&mut actual, family, operation, &owner, lane);
     }
+    for site in &source.contention_variants {
+        policy.assign(
+            &[Family::ContentionVariant],
+            &site.operation,
+            &site.owner,
+            site.lane,
+        )?;
+        add(
+            &mut actual,
+            Family::ContentionVariant,
+            &site.operation,
+            &site.owner,
+            site.lane,
+        );
+    }
     for site in &source.k1 {
         let family = policy.assign(
             if source.is_build_file(&site.file) {
@@ -613,7 +629,41 @@ fn base_policy(root: &Path, base: &str) -> Result<AuthorityDebtCeilings, DebtErr
     let exists = command::run_checked("git", ["ls-tree", base, "--", CEILINGS_PATH], Some(root))?;
     if !exists.stdout.trim().is_empty() {
         let output = command::run_checked("git", ["show", &path], Some(root))?;
-        return Ok(serde_json::from_str(&output.stdout)?);
+        let mut policy: AuthorityDebtCeilings = serde_json::from_str(&output.stdout)?;
+        if !policy
+            .counters
+            .iter()
+            .any(|counter| counter.family == Family::ContentionVariant)
+        {
+            // Bootstrap a newly introduced census from the immutable PR base,
+            // never from candidate source or a hand-authored head ceiling.
+            let output = std::process::Command::new("git")
+                .args(["archive", base])
+                .current_dir(root)
+                .output()?;
+            if !output.status.success() {
+                return fail("cannot read contention census base");
+            }
+            let temporary = tempfile::tempdir()?;
+            tar::Archive::new(output.stdout.as_slice()).unpack(temporary.path())?;
+            let source = SourceCensus::load(temporary.path())?;
+            let mut counters = BTreeMap::new();
+            for site in source.contention_variants {
+                *counters
+                    .entry((site.operation, site.owner, site.lane))
+                    .or_insert(0) += 1;
+            }
+            policy.counters.extend(counters.into_iter().map(
+                |((operation, owner, lane), ceiling)| Counter {
+                    family: Family::ContentionVariant,
+                    operation,
+                    owner,
+                    lane,
+                    ceiling,
+                },
+            ));
+        }
+        return Ok(policy);
     }
     let output = std::process::Command::new("git")
         .args(["archive", base])

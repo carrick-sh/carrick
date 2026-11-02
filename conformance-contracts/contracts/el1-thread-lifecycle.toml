@@ -112,3 +112,8 @@ base = 1024
 per_unit = 2
 layers = ["embed-structural"]
 rationale = "Declared from el1_thread_lifecycle_spawn_slope (4 threads per round in each of two processes, so 8 threads per scale unit = one round). Today each thread costs about 9 forwarded calls (about 72 per round). With thread birth, exit, signal masks, sigaltstack and robust-list setup served in the zone, forwarded dispatches per round are a small constant, so at most 2 per round remain (the design's own budget is about 0 per round) on top of a fixed base for fixture start-up, the fork and the pipe pair. The test's exact assertion, forwarded thread exits per added thread below 0.05, is stricter than this integer form and stays in the embed test."
+
+# #1395 slice 1: scheduler refusal::queue_witnesses proves bounded cause
+# selection, release-before-park, retirement rerun and exactly one wake.
+# The zone-scoped abandoned-ticket counter changes the shared layout hash;
+# existing semantic/signed bindings and budgets above remain required.

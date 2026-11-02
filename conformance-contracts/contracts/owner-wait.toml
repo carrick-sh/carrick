@@ -17,6 +17,8 @@ rationale = "Owner waits are killable-only: handled signals and stops never comp
 
 [bindings]
 vm_free = [
+  "carrick-sched-core::refusal::queue_witnesses",
+  "carrick-core-abi::wait::ticket_tests",
   "carrick-kernel::kernel::continuation::output::tests::fd_wait_initial_publication_authenticates_before_preparing",
   "carrick-kernel::kernel::continuation::output::tests::fd_wait_output_retains_original_deadline_and_wait_authority",
   "carrick-kernel::dispatch::copyout_tests::{select_large_output_retained_on_initial_owner_refusal,select_large_output_retains_selection_across_later_window_refusal,retained_poll_output_refusal_keeps_terminal_selection_and_edited_inputs,retained_select_timeout_suspends_between_large_set_windows,select_output_fault_keeps_the_committed_prefix,select_output_rejects_stale_resume_and_cancellation_before_access,select_owner_output_requires_exact_execution_authority,retained_poll_sparse_output_keeps_prefix_across_owner_supply_and_physical}",
@@ -84,3 +86,8 @@ vm_free = [
 embed_structural = "Signed HVF unavailable on ctb-w1; exact-artifact signed acceptance and live guest handled-signal delivery remain director-owned."
 docker = "Docker unavailable and forbidden on ctb-w1; this internal owner-refusal schedule has no external Linux producer."
 holder_audit = "The model's editor releases without guest work. A complete typed holder audit across all owner authorities is not established by this model."
+
+# #1395 slice 1: scheduler refusal::queue_witnesses proves bounded cause
+# selection, release-before-park, retirement rerun and exactly one wake.
+# The zone-scoped abandoned-ticket counter changes the shared layout hash;
+# existing semantic/signed bindings and budgets above remain required.

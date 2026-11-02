@@ -14,6 +14,10 @@ pub mod mm;
 pub mod personality;
 pub mod terminal;
 pub mod wait;
+/// Shared typed refusal vocabulary owned by the scheduler wait substrate.
+pub mod refusal {
+    pub use carrick_sched_core::refusal::*;
+}
 pub use personality::{
     CallContext, CallOrdinal, EntryDecodeError, Personality, PersonalityAbi, ServiceError, TaskId,
     TaskKey, TaskSerial, ThreadKey, UserCopy, UserMemory, UserStackOffset,

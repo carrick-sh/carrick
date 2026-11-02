@@ -105,6 +105,7 @@ pub struct SourceCensus {
     unbound_files: std::collections::BTreeSet<String>,
     owners: BTreeMap<String, Vec<Owner>>,
     pub k1: Vec<ApiSite>,
+    pub contention_variants: Vec<ApiSite>,
     inherent_methods: BTreeMap<String, BTreeSet<String>>,
     unrelated_traits: BTreeMap<String, BTreeSet<String>>,
     trait_implementations: BTreeMap<String, Vec<(syn::TypePath, String)>>,
@@ -2627,6 +2628,40 @@ impl Scanner<'_> {
     }
 }
 impl<'ast> Visit<'ast> for Scanner<'_> {
+    fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+        if test_only(&item.attrs) {
+            self.test_span(item.span());
+            return;
+        }
+        // The new vocabulary is closed and reviewed. Legacy names remain
+        // position-free debt owned by each enum, never a Semgrep baseline.
+        let vocabulary = self.krate == "carrick_sched_core"
+            && self.modules == ["refusal"]
+            && matches!(
+                item.ident.unraw().to_string().as_str(),
+                "Refusal" | "Attempt"
+            );
+        if !vocabulary {
+            let owner = self.owner(&item.ident.unraw().to_string(), item.span());
+            for variant in &item.variants {
+                let name = variant.ident.unraw().to_string();
+                if matches!(
+                    name.as_str(),
+                    "Busy" | "Contended" | "OwnerWait" | "PinRaced" | "Occupied"
+                ) {
+                    self.census.contention_variants.push(ApiSite {
+                        file: self.file.clone(),
+                        line: variant.span().start().line,
+                        owner: owner.clone(),
+                        operation: format!("contention_variant:{name}"),
+                        lane: self.lane(),
+                    });
+                }
+            }
+        }
+        visit::visit_item_enum(self, item);
+    }
+
     fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
         if test_only(&item.attrs) {
             self.test_span(item.span());

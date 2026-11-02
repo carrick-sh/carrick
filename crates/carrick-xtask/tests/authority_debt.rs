@@ -3502,3 +3502,33 @@ fn file_table_type_alias_lifecycle_calls_remain_visible() {
         1
     );
 }
+
+#[test]
+fn contention_variants_are_scoped_production_debt() {
+    let temp = tempfile::tempdir().unwrap();
+    let src = temp.path().join("crates/carrick-demo/src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        r#"
+        pub enum Legacy { Busy, Contended(u64), OwnerWait(u64), PinRaced(u64), Occupied, Guest }
+        #[cfg(test)] mod tests { enum Fixture { Busy } }
+        pub enum Modern { Guest, Invariant }
+    "#,
+    )
+    .unwrap();
+    let census = load_census(temp.path()).unwrap();
+    assert_eq!(census.contention_variants.len(), 5);
+    for site in census.contention_variants {
+        assert_eq!(site.owner, "carrick_demo::Legacy");
+        assert_eq!(site.lane, Lane::Shared);
+    }
+    let mut base = ceilings(1);
+    base.counters[0].family = Family::ContentionVariant;
+    let mut increased = base.clone();
+    increased.counters[0].ceiling += 1;
+    assert!(increased.ratchet(&base, &MoveMap::default()).is_err());
+    let mut decreased = base.clone();
+    decreased.counters[0].ceiling = 0;
+    decreased.ratchet(&base, &MoveMap::default()).unwrap();
+}

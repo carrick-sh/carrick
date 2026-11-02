@@ -371,3 +371,17 @@ rules:
       uninitialized kernel stack bytes to the guest. Derive `zerocopy::{FromBytes,
       IntoBytes, Immutable, KnownLayout}` with explicit pad fields and use
       `UserCopy::{read_val, write_val}` or `zerocopy::IntoBytes::as_bytes`.
+
+  # #1395: only the linear ticket adapter may consume contention. Legacy enum
+  # declarations are ratcheted by Family::ContentionVariant, not line baselines.
+  - id: carrick-no-contention-errno
+    languages: [rust]
+    severity: ERROR
+    message: Preserve the owned operation and park_and_rerun its release ticket; contention cannot become an errno, fatal, Forward, or polling loop.
+    pattern-regex: '(?s)\bContended\s*\([^)]*\)\s*=>\s*(?:\{[^{}]*?)?(?:[A-Za-z_:]+\s*\(\s*)?(?:LINUX_E[A-Z]+|LinuxErrno\b|[A-Za-z_:]*Fatal::|invalid_completion\b|carrick_fatal!|Action::Forward|Admission::Forward|HostServed\b|(?:[A-Za-z_:]*)(?:yield_now|spin_loop)\s*\(|-[0-9]+)'
+
+  - id: carrick-no-ticket-wildcard
+    languages: [rust]
+    severity: ERROR
+    message: Carry the release ticket, park_and_rerun it, or cancel it with a reason; do not discard contention custody.
+    pattern-regex: '\bContended\s*\(\s*_\s*\)'
