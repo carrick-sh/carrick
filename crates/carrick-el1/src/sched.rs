@@ -145,7 +145,8 @@ pub trait ThreadCpu {
     /// The live `TTBR0_EL1`, which authenticates a switch-in that keeps the
     /// installed address space (#1100). `None`: this CPU cannot report it (a
     /// test stand-in that never installed a root, or an ISA whose switch
-    /// does not run this path); the check is then skipped, never failed.
+    /// does not run this path); switch-in must install through the gate
+    /// rather than keeping an unauthenticated root.
     fn live_ttbr0(&self) -> Option<u64>;
     /// Invalidate, on every PE, the stage-1 translations of the ASID in
     /// `ttbr0` (`TLBI ASIDE1IS`), complete before the call returns.

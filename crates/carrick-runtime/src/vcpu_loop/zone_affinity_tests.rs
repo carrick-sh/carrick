@@ -731,7 +731,10 @@ fn switched_self_affinity(exclude: bool) {
         // Settle the stopped sibling's real home record through the ordinary
         // preemption/drain/unhome protocol, then queue that same incarnation
         // on CPU 0. Its identity and control came from commit_for_el1 above.
-        let mut cpu = FakeCpu::default();
+        let mut cpu = FakeCpu {
+            ttbr: (0x1000, 0x1000),
+            ..Default::default()
+        };
         let mut frame = carrick_el1_abi::TrapFrame::default();
         // SAFETY: the fixture owns this stopped, unpublished home record.
         let saved = unsafe { p.zone.record(sibling.id).ctx_mut() };

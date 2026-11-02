@@ -278,6 +278,7 @@ enum SupplyEnd {
     Cancel,
     FailTables,
     EarlyApplyError,
+    ReparkAllocationFailure,
 }
 
 #[test]
@@ -293,6 +294,11 @@ fn native_backing_early_apply_error_settles_the_reply_before_returning() {
 #[test]
 fn native_backing_table_failure_retains_applied_receipt_without_ack() {
     composed_native_supply(false, None, false, SupplyEnd::FailTables);
+}
+
+#[test]
+fn native_backing_repark_retains_custody_when_allocation_fails() {
+    composed_native_supply(false, None, false, SupplyEnd::ReparkAllocationFailure);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2105,6 +2111,62 @@ fn composed_native_supply_with_prepared(
         .idle_entry(&mut frame, 0),
         carrick_el1_abi::Action::Served
     );
+    if end == SupplyEnd::ReparkAllocationFailure {
+        // A sibling owns the editor when the delivered physical reply resumes.
+        // Allocation failure must not drop the pending service or its claim.
+        // The adapter settles the unused physical offer before returning Wait;
+        // release must finish the retained retry without settling it twice.
+        let editor = access
+            .try_begin_edit(
+                access.find(identity.mm).unwrap(),
+                identity.mm,
+                NonZeroU64::new(99).unwrap(),
+            )
+            .unwrap();
+        let injection = crate::native_process_runtime::InjectTryReserveFailure::activate();
+        let resumed = resume_selected(
+            &owner,
+            registry(),
+            source,
+            &fixture.task,
+            child,
+            &mut service,
+        );
+        drop(injection);
+        assert!(
+            matches!(resumed, NativeResume::Left(None)),
+            "repark must retain custody despite allocator failure"
+        );
+        assert_eq!(page.claimed_count(), 1, "the exact claim survives repark");
+        assert!(
+            reply_slot.window().is_none(),
+            "the adapter settled the unused physical offer before waiting"
+        );
+        assert_eq!(
+            leaf(words, child_root, fresh),
+            0,
+            "no publication under the editor"
+        );
+        crate::dispatch::native_service_idle(fixture.zone, fixture.slot, &mut cpu);
+        drop(editor);
+        let mut handoff = None;
+        let mut zone = crate::dispatch::Zone {
+            tables: fixture.zone,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+        };
+        assert_eq!(
+            crate::dispatch::native_scheduler(
+                &mut zone,
+                &fixture.task,
+                &counters,
+                fixture.slot,
+                &mut handoff
+            )
+            .idle_entry(&mut frame, 0),
+            carrick_el1_abi::Action::Served
+        );
+    }
     assert!(matches!(
         resume_selected(
             &owner,
@@ -2123,7 +2185,10 @@ fn composed_native_supply_with_prepared(
     );
     assert_eq!(
         leaf(words, child_root, fresh) & AARCH64_ROOT_ADDRESS_MASK,
-        if matches!(end, SupplyEnd::Cancel | SupplyEnd::EarlyApplyError) {
+        if matches!(
+            end,
+            SupplyEnd::Cancel | SupplyEnd::EarlyApplyError | SupplyEnd::ReparkAllocationFailure
+        ) {
             0
         } else if competing_publication {
             0xb0020000

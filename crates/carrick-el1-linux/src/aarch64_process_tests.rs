@@ -4535,15 +4535,16 @@ fn arm_call_with_cpu<X: ForkStockCrossing>(
 #[test]
 fn arm_signal_setup_then_timed_futex_keeps_its_deadline() {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
-    // The fake CPU starts without an observed live root. L3 must reinstall
-    // through the real space gate, which requires a maintenance root.
-    fixture.zone.spaces.set_idle_ttbr(0x30000);
     let mut service = fixture.process_service();
+    let mut cpu = crate::sched::FakeCpu {
+        ttbr: (fixture_ttbr0(fixture), fixture_ttbr0(fixture)),
+        ..Default::default()
+    };
     let mut setup = carrick_el1_abi::TrapFrame::default();
     setup.x[8] = 134;
     setup.x[0] = 13;
     setup.x[3] = 8;
-    arm_call(fixture, fixture.control, &mut service, &mut setup).unwrap();
+    arm_call_with_cpu(fixture, fixture.control, &mut service, &mut setup, &mut cpu).unwrap();
     assert_eq!(setup.x[0], 0);
 
     let word = carrick_test_support::GuestUserBuffer::from_value(0u32);
@@ -4553,7 +4554,8 @@ fn arm_signal_setup_then_timed_futex_keeps_its_deadline() {
     frame.x[0] = word.arg();
     frame.x[1] = 128;
     frame.x[3] = timeout.arg();
-    let route = arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap();
+    let route =
+        arm_call_with_cpu(fixture, fixture.control, &mut service, &mut frame, &mut cpu).unwrap();
     assert_eq!(
         route,
         carrick_personality_linux::dispatch::CompletionRoute::Served
@@ -6987,9 +6989,6 @@ fn arm_closing_during_raw_exit_admission_settles_after_commit() {
 fn arm_unadopted_exit_wakes_closing_owner_without_process_venue() {
     use carrick_el1_abi::Lifecycle;
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
-    // The fake CPU starts without an observed live root. L3 must reinstall
-    // through the real space gate, which requires a maintenance root.
-    fixture.zone.spaces.set_idle_ttbr(0x30000);
     let (control, record) =
         imported_thread_with_identity(fixture, |identity| identity.generation = 0);
     let mut worker_service = fixture.process_service();
@@ -7002,7 +7001,16 @@ fn arm_unadopted_exit_wakes_closing_owner_without_process_venue() {
     failed_frame.x[8] = 93;
     assert!(
         matches!(
-            arm_call(fixture, control, &mut worker_service, &mut failed_frame),
+            arm_call_with_cpu(
+                fixture,
+                control,
+                &mut worker_service,
+                &mut failed_frame,
+                &mut crate::sched::FakeCpu {
+                    ttbr: (fixture_ttbr0(fixture), fixture_ttbr0(fixture)),
+                    ..Default::default()
+                }
+            ),
             Err(NativeProcessError::Stale)
         ),
         "a Born sibling cannot register a group before its root owner exists"
@@ -7052,7 +7060,17 @@ fn arm_unadopted_exit_wakes_closing_owner_without_process_venue() {
             frame.x[0] = 7;
             frame.x[8] = 94;
             assert_eq!(
-                arm_call(fixture, fixture.control, service, &mut frame).unwrap(),
+                arm_call_with_cpu(
+                    fixture,
+                    fixture.control,
+                    service,
+                    &mut frame,
+                    &mut crate::sched::FakeCpu {
+                        ttbr: (fixture_ttbr0(fixture), fixture_ttbr0(fixture)),
+                        ..Default::default()
+                    }
+                )
+                .unwrap(),
                 carrick_personality_linux::dispatch::CompletionRoute::Suspended
             );
             assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
@@ -7063,7 +7081,10 @@ fn arm_unadopted_exit_wakes_closing_owner_without_process_venue() {
     frame.x[8] = 93;
     let counters = Box::new(carrick_el1_abi::Counters::new());
     let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
-    let mut cpu = crate::sched::FakeCpu::default();
+    let mut cpu = crate::sched::FakeCpu {
+        ttbr: (fixture_ttbr0(fixture), fixture_ttbr0(fixture)),
+        ..Default::default()
+    };
     let route = super::dispatch::dispatch_syscall_with_native(
         &mut frame,
         &counters,
@@ -8170,9 +8191,6 @@ fn arm_concurrent_exit_group_loser_retires_and_wakes_owner() {
     use carrick_el1_abi::Lifecycle;
 
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
-    // The fake CPU starts without an observed live root. L3 must reinstall
-    // through the real space gate, which requires a maintenance root.
-    fixture.zone.spaces.set_idle_ttbr(0x30000);
     let slot2 = SlotId::new(1);
     fixture.zone.drive(slot2, 2);
     fixture.zone.publish_slot(slot2, 1, Some(1), 1);
@@ -8315,7 +8333,17 @@ fn arm_concurrent_exit_group_loser_retires_and_wakes_owner() {
                     sibling2_exit_frame.x[0] = 9;
                     sibling2_exit_frame.x[8] = 94;
                     assert_eq!(
-                        arm_call(fixture, control2, service2, &mut sibling2_exit_frame).unwrap(),
+                        arm_call_with_cpu(
+                            fixture,
+                            control2,
+                            service2,
+                            &mut sibling2_exit_frame,
+                            &mut crate::sched::FakeCpu {
+                                ttbr: (fixture_ttbr0(fixture), fixture_ttbr0(fixture)),
+                                ..Default::default()
+                            }
+                        )
+                        .unwrap(),
                         carrick_personality_linux::dispatch::CompletionRoute::Suspended
                     );
                     assert_eq!(fixture.zone.counters.el1_wakes.load(Ordering::Acquire), 0);
@@ -8332,7 +8360,17 @@ fn arm_concurrent_exit_group_loser_retires_and_wakes_owner() {
             leader_exit_frame.x[0] = 7;
             leader_exit_frame.x[8] = 94;
             assert_eq!(
-                arm_call(fixture, fixture.control, service, &mut leader_exit_frame).unwrap(),
+                arm_call_with_cpu(
+                    fixture,
+                    fixture.control,
+                    service,
+                    &mut leader_exit_frame,
+                    &mut crate::sched::FakeCpu {
+                        ttbr: (fixture_ttbr0(fixture), fixture_ttbr0(fixture)),
+                        ..Default::default()
+                    }
+                )
+                .unwrap(),
                 carrick_personality_linux::dispatch::CompletionRoute::Suspended
             );
             assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
@@ -8348,7 +8386,10 @@ fn arm_concurrent_exit_group_loser_retires_and_wakes_owner() {
     raw_exit_frame.x[8] = 93;
     let counters = Box::new(carrick_el1_abi::Counters::new());
     let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
-    let mut cpu = crate::sched::FakeCpu::default();
+    let mut cpu = crate::sched::FakeCpu {
+        ttbr: (fixture_ttbr0(fixture), fixture_ttbr0(fixture)),
+        ..Default::default()
+    };
     let route = super::dispatch::dispatch_syscall_with_native(
         &mut raw_exit_frame,
         &counters,

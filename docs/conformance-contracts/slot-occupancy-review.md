@@ -8,8 +8,9 @@ S1 (`Keep` instead of `Install { leave_live_root: true }`) for that case.
 The successful matching-root fast path and its constant work are unchanged.
 
 The idle-exit token and its constructor now share a private module. The
-constructor's field is inaccessible to sibling scheduler modules. Its
-compile-fail doctest also checks that callers cannot fabricate the token.
+constructor's field is inaccessible to sibling scheduler modules. The
+compile-fail doctest is an API visibility check, not contract evidence for
+production idle exits.
 The token attests EL1 relinquishment, not an unconditional live-root read:
 already vacant slots are not re-read and the no-maintenance-root case retains
 host-owned occupancy. This documents the existing ownership boundary rather

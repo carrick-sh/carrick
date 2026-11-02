@@ -2039,10 +2039,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         request: &ServiceRequest,
         mut pending: Box<PendingService<'a>>,
         wait: carrick_core_abi::PortalOwnerWait,
-    ) -> Result<Box<ServiceRequest>, NativeProcessError> {
-        // Keep the retry snapshot off the caller's retained application frame.
-        // Reserve before publishing a replacement request or taking its queue.
-        let snapshot = FallibleBox::<ServiceRequest>::try_reserve()?;
+    ) -> Result<ServiceRequest, NativeProcessError> {
+        // Pending already owns the reply and lifecycle claim outside the graph.
+        // Return the small request by value so allocation failure cannot
+        // discard that custody before its replacement wait is published.
         let key = ObjectWaitKey::native_service(self.record).ok_or(NativeProcessError::Stale)?;
         let queue = self
             .source
@@ -2066,7 +2066,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .lock()
             .insert_member_wait(self.record, MemberWait::Service(pending));
         drop(queue);
-        Ok(snapshot.put(next))
+        Ok(next)
     }
 
     // Fault application above must not retain exec-close or host-file result
