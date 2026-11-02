@@ -1359,7 +1359,14 @@ fn arm_native_service_exit(
                         map,
                         chdir,
                     } = *staged;
-                    process.begin_host_file_service(record, output, resolves_path, map, chdir, carrick_guest_arch::NativeOrdinal::new(frame.x[8]))
+                    process.begin_host_file_service(
+                        record,
+                        output,
+                        resolves_path,
+                        map,
+                        chdir,
+                        carrick_guest_arch::NativeOrdinal::new(frame.x[8]),
+                    )
                 }
             } else if retry_exec_stage {
                 match operation {
