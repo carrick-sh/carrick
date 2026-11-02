@@ -289,8 +289,7 @@ impl Occupancy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SwitchInRoot {
     /// The word names `space`, its grant is open with nothing owed, and the
-    /// live root is the grant's root (or the CPU cannot report one): run on
-    /// it, with no install.
+    /// observed live root is the grant's root: run on it, with no install.
     Keep,
     /// The word names `space` and its grant is open, but the live root is
     /// another table: an exit left the word behind while the root was
@@ -299,8 +298,9 @@ pub enum SwitchInRoot {
     StaleWord,
     /// Install `space` through the installer protocol (word, then gate),
     /// which refuses a raised gate or a freed key. Chosen as well for a kept
-    /// word whose grant is refused or owes an invalidation, so a kept word
-    /// never bypasses the gate. When `leave_live_root`, the live root is not
+    /// word whose live root is unknown, grant is refused or owes an
+    /// invalidation, so a kept word never bypasses the gate. When
+    /// `leave_live_root`, the live root is not
     /// the maintenance root, so the CPU moves there first: vacancy is never
     /// published on a slot whose live root still names a space.
     Install { leave_live_root: bool },
