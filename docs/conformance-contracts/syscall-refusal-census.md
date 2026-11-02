@@ -49,3 +49,26 @@ Docker refresh and exact-artifact smoke remain required acceptance evidence.
 The KVM `production_cpl0_refuses_non_allowlisted_forwards_with_enosys`
 binding also checks mapped census counts for the initial process with a
 non-1 visible PID. Both refused ordinals belong to the root population.
+
+The per-process access-context integration preserves both authorities: host-file
+service intake carries the `chdir` completion flag alongside its native census
+ordinal, and exec seals the caller's current cwd and credentials before service
+publication. Changing uid is served under the changed identity; the previous
+expectation that every such exec must be refused is superseded. The capability
+refusal check remains intact. The portable process-owner bindings include
+`native_child_exec_after_ring_setuid_carries_the_new_credentials` and
+`arm_root_fork_seeds_each_childs_row_with_the_roots_live_cwd`.
+
+Live AArch64 follow-through requires the signed `task_cwd` test
+`sibling_processes_own_their_cwd_and_umask`, the generic probe shards with the
+changed-cwd child differential, and the exact-artifact `smoke-signed` gate.
+The x86 KVM root-refusal binding does not replace a live child `mkdirat`
+(ordinal 34) census and refusal-gate witness on AArch64.
+
+One additional integration gap needs a production witness: `caller_access`
+can reject an exec or path request with ENOSYS before a service ticket is
+published. The current `begin_exec_service` / `begin_host_file_service` early
+returns and ARM service-return adapter do not increment a refusal counter for
+that case. The mapped-counter and KVM-root bindings do not cover it. Full
+refusal completeness cannot be claimed until that admission boundary is
+instrumented and witnessed.

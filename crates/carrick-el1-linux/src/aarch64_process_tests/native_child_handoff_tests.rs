@@ -222,8 +222,14 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool) {
                 else {
                     panic!("the fork child's stdout must stage a host request");
                 };
-                let result =
-                    entry.begin_host_file_service(record, output, resolves_path, map, chdir, carrick_guest_arch::NativeOrdinal::new(56));
+                let result = entry.begin_host_file_service(
+                    record,
+                    output,
+                    resolves_path,
+                    map,
+                    chdir,
+                    carrick_guest_arch::NativeOrdinal::new(56),
+                );
                 entry.settle_service_exit(
                     result,
                     super::super::native_process_runtime::NativeServiceExit::Bridge,
