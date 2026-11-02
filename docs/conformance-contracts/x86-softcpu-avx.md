@@ -58,3 +58,13 @@ both failed on admitted main before implementation.
 The worker's focused native and KVM results do not constitute signed HVF,
 Docker differential, ecosystem-ratio or whole-stack acceptance. Those gates
 remain explicit director/CI responsibilities on their supported hosts.
+
+The refusal witnesses also cover both default CPUID views: leaf 0xD keeps
+its component bitmap at 3 and CPL0 XSETBV(7) raises #GP with OSXSAVE enabled.
+Gather and masked moves each raise #UD with either XCR0=3 or OSXSAVE clear,
+without changing vector state. With vector state enabled, valid FMA, F16C,
+BMI1, BMI2, VEX AES, VEX PCLMULQDQ and EVEX encodings remain refused.
+Mutation checks independently changed each default bitmap to 7, moved each
+software memory dispatch before the control checks, and removed the iced
+feature filter. Each mutation failed its production-entry witness; restoring
+the implementation restored the passes.

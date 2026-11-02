@@ -1377,18 +1377,42 @@ fn ignored_legacy_segment_prefixes_execute_in_long_mode() {
 
 #[test]
 fn unsupported_ymm_state_is_neither_advertised_nor_executed() {
-    let (mut cpu, mut mem, va) = setup_snippet(&[0x0f, 0xa2]);
-    cpu.context_mut().gpr[reg::RAX] = 1;
-    cpu.step_block(&mut mem).unwrap();
-    assert_eq!(
-        cpu.context_mut().gpr[reg::RCX] & ((1 << 28) | (1 << 12) | (1 << 29)),
-        0
-    );
-    assert_eq!(cpu.context_mut().xcr0, 3);
-    // A block end must never make unpreserved YMM upper halves observable.
-    mem.write_direct(va, &[0xc5, 0xfc, 0x57, 0xc0, 0xeb, 0]); // vxorps ymm0,ymm0,ymm0
-    cpu.context_mut().rip = va;
-    assert_eq!(cpu.step_block(&mut mem).unwrap(), ud(va));
+    use carrick_softcpu_x86::{Cpl0CpuidView, CpuidAuthority, Level0CpuidView};
+
+    let views: [Box<dyn CpuidAuthority>; 2] = [
+        Box::new(Level0CpuidView),
+        Box::new(Cpl0CpuidView::default()),
+    ];
+    for view in views {
+        let (_, mut mem, va) = setup_snippet(&[]);
+        let mut cpu = SoftCpu::with_cpuid_view(mem.extents(), view).unwrap();
+        cpu.context_mut().gpr[reg::RAX] = 1;
+        avx_run(&mut cpu, &mut mem, va, &[0x0f, 0xa2]);
+        assert_eq!(
+            cpu.context().gpr[reg::RCX] & ((1 << 28) | (1 << 12) | (1 << 29)),
+            0
+        );
+        cpu.context_mut().gpr[reg::RAX] = 0x0d;
+        cpu.context_mut().gpr[reg::RCX] = 0;
+        avx_run(&mut cpu, &mut mem, va, &[0x0f, 0xa2]);
+        assert_eq!(cpu.context().gpr[reg::RAX], 3);
+
+        // XSETBV must refuse component 2 because the view does not expose it,
+        // not because of CPL or OSXSAVE (Intel SDM Vol. 2, XSETBV).
+        cpu.context_mut().cpl = 0;
+        cpu.context_mut().cr4 &= !((1 << 20) | (1 << 21));
+        cpu.context_mut().cr4 |= 1 << 18;
+        cpu.context_mut().gpr[reg::RCX] = 0;
+        cpu.context_mut().gpr[reg::RDX] = 0;
+        cpu.context_mut().gpr[reg::RAX] = 7;
+        assert_eq!(avx_run(&mut cpu, &mut mem, va, &[0x0f, 0x01, 0xd1]), gp(va));
+        assert_eq!(cpu.context().xcr0, 3);
+        // A block end must never make disabled YMM upper halves observable.
+        assert_eq!(
+            avx_run(&mut cpu, &mut mem, va, &[0xc5, 0xfc, 0x57, 0xc0]),
+            ud(va)
+        );
+    }
 }
 
 #[test]
@@ -3519,4 +3543,64 @@ fn avx_xstate_second_page_fault_publishes_no_partial_component() {
     );
     assert_eq!(cpu.context().read_xmm(0), 0x1234);
     assert_eq!(&cpu.context().ymm_hi128, &[0x71; 256]);
+}
+
+#[test]
+fn avx_gather_and_masked_move_require_enabled_vector_state() {
+    // Intel SDM Vol. 2: AVX/AVX2 #UD checks precede memory access, including
+    // the software gather and masked-move paths that do not use a native leaf.
+    let cases: &[(&str, &[u8])] = &[
+        (
+            "vpgatherdd ymm0,[rdi+ymm2*4],ymm1",
+            &[0xc4, 0xe2, 0x75, 0x90, 0x04, 0x97],
+        ),
+        (
+            "vmaskmovps ymm0,ymm1,[rdi]",
+            &[0xc4, 0xe2, 0x75, 0x2c, 0x07],
+        ),
+    ];
+    for (name, bytes) in cases {
+        for (xcr0, osxsave) in [(3, true), (7, false)] {
+            let (mut cpu, mut mem, va) = setup_snippet(&[]);
+            cpu.context_mut().xcr0 = xcr0;
+            if osxsave {
+                cpu.context_mut().cr4 |= 1 << 18;
+            } else {
+                cpu.context_mut().cr4 &= !(1 << 18);
+            }
+            cpu.context_mut().ymm_hi128.fill(0x71);
+            let before = cpu.context().fxsave.clone();
+            assert_eq!(
+                avx_run(&mut cpu, &mut mem, va, bytes),
+                ud(va),
+                "{name}: XCR0={xcr0}, OSXSAVE={osxsave}"
+            );
+            assert_eq!(cpu.context().fxsave.0, before.0);
+            assert_eq!(cpu.context().ymm_hi128, [0x71; 256]);
+        }
+    }
+}
+
+#[test]
+fn avx_unadmitted_extensions_raise_invalid_opcode() {
+    // Valid encodings from the Intel SDM, but outside this slice's AVX/AVX2
+    // feature set. Enabled vector state must not grant these extensions.
+    let cases: &[(&str, &[u8])] = &[
+        ("FMA vfmadd132ps", &[0xc4, 0xe2, 0x71, 0x98, 0xc2]),
+        ("F16C vcvtph2ps", &[0xc4, 0xe2, 0x79, 0x13, 0xc1]),
+        ("BMI1 andn", &[0xc4, 0xe2, 0x70, 0xf2, 0xc2]),
+        ("BMI2 pdep", &[0xc4, 0xe2, 0x73, 0xf5, 0xc2]),
+        ("VEX vaesenc", &[0xc4, 0xe2, 0x71, 0xdc, 0xc2]),
+        ("VEX vpclmulqdq", &[0xc4, 0xe3, 0x71, 0x44, 0xc2, 0]),
+        ("EVEX vaddps", &[0x62, 0xf1, 0x74, 0x48, 0x58, 0xc2]),
+    ];
+    for (name, bytes) in cases {
+        let decoded = iced_x86::Decoder::new(64, bytes, iced_x86::DecoderOptions::NONE).decode();
+        assert!(!decoded.is_invalid(), "invalid fixture: {name}");
+        assert_eq!(decoded.len(), bytes.len(), "incomplete fixture: {name}");
+        let (mut cpu, mut mem, va) = setup_snippet(&[]);
+        cpu.context_mut().xcr0 = 7;
+        assert_ne!(cpu.context().cr4 & (1 << 18), 0);
+        assert_eq!(avx_run(&mut cpu, &mut mem, va, bytes), ud(va), "{name}");
+    }
 }
