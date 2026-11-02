@@ -1100,13 +1100,14 @@ fn refuse_traced_native_exec(
     frame: &mut TrapFrame,
     task: &CurrentTask,
     counters: &Counters,
+    child: impl FnOnce() -> bool,
 ) -> bool {
     if !matches!(frame.x[8], 221 | 281) || !task.ptrace_traced() {
         return false;
     }
     let nr = frame.x[8] as usize;
     counters.refused[nr].fetch_add(1, Ordering::Relaxed);
-    counters.record_child_refusal(nr, task.visible_pid().is_some_and(|pid| pid != 1));
+    counters.record_child_refusal(nr, child());
     counters.served[nr].fetch_add(1, Ordering::Relaxed);
     frame.x[0] = carrick_syscall_abi::LINUX_EPERM.guest_retval() as u64;
     true
@@ -1155,7 +1156,11 @@ fn arm_native_service_exit(
             }
         };
     }
-    if refuse_traced_native_exec(frame, task, counters) {
+    let child = || {
+        arm_thread_group_owner(zone, task, page)
+            == super::native_process_runtime::NativeThreadGroupOwner::ForkChild
+    };
+    if refuse_traced_native_exec(frame, task, counters, child) {
         return Some(arm_signal_user_return(frame));
     }
     let mut service_wait = wait;
@@ -1237,10 +1242,7 @@ fn arm_native_service_exit(
                     let nr = frame.x[8] as usize;
                     if nr < 512 {
                         counters.refused[nr].fetch_add(1, Ordering::Relaxed);
-                        counters.record_child_refusal(
-                            nr,
-                            task.visible_pid().is_some_and(|pid| pid != 1),
-                        );
+                        counters.record_child_refusal(nr, child());
                         counters.served[nr].fetch_add(1, Ordering::Relaxed);
                     }
                     NativeServiceStage::Return(carrick_syscall_abi::LINUX_ENOSYS.guest_retval())
@@ -2771,8 +2773,9 @@ impl<
     fn record_refusal_caller(&self, bucket: usize) {
         self.counters.record_child_refusal(
             bucket,
-            self.task()
-                .is_some_and(|task| task.visible_pid().is_some_and(|pid| pid != 1)),
+            self.process
+                .as_deref()
+                .is_some_and(|process| !process.is_root_process()),
         );
     }
     fn lifecycle_native(
@@ -3040,8 +3043,12 @@ impl<
             memory::DelegatedAnonymous::Forward if file.is_some() => {
                 let nr = carrick_personality_linux::native_host_file::LINUX_NR_MMAP.raw() as usize;
                 self.counters.refused[nr].fetch_add(1, Ordering::Relaxed);
-                self.counters
-                    .record_child_refusal(nr, task.visible_pid().is_some_and(|pid| pid != 1));
+                self.counters.record_child_refusal(
+                    nr,
+                    self.process
+                        .as_deref()
+                        .is_some_and(|process| !process.is_root_process()),
+                );
                 self.counters.served[nr].fetch_add(1, Ordering::Relaxed);
                 DelegatedStep::Served(SyscallResult::new(
                     carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
@@ -5370,7 +5377,12 @@ mod tests {
         for ordinal in [221, 281] {
             let mut frame = TrapFrame::default();
             frame.x[8] = ordinal;
-            assert!(refuse_traced_native_exec(&mut frame, &task, &counters));
+            assert!(refuse_traced_native_exec(
+                &mut frame,
+                &task,
+                &counters,
+                || true
+            ));
             assert_eq!(
                 frame.x[0] as i64,
                 carrick_syscall_abi::LINUX_EPERM.guest_retval()
@@ -5384,6 +5396,11 @@ mod tests {
         task.publish_ptrace_traced(false);
         let mut frame = TrapFrame::default();
         frame.x[8] = 221;
-        assert!(!refuse_traced_native_exec(&mut frame, &task, &counters));
+        assert!(!refuse_traced_native_exec(
+            &mut frame,
+            &task,
+            &counters,
+            || true
+        ));
     }
 }

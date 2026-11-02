@@ -2017,6 +2017,20 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         state.members.get(key).map(|member| member.runtime.clone())
     }
 
+    /// Classify a retained record against its own graph, including roots whose
+    /// visible PID is not 1. An unregistered record is not a native child.
+    pub fn record_is_fork_child(&self, zone: &ZoneTables<C>, record: RecordRef) -> bool {
+        let state = self.state.lock();
+        let Some(member) = state
+            .records
+            .get(&Self::record_key(zone, record))
+            .and_then(|key| state.members.get(key))
+        else {
+            return false;
+        };
+        member.process != member.runtime.graph.lock().root_key
+    }
+
     /// Exact wait-interruption predicate, sampled once after futex enrollment.
     /// The caller holds the wait bucket. Signal senders release graph custody
     /// before acquiring that bucket; selection retains the canonical signal
@@ -7247,6 +7261,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
 impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> ProcessNative<C>
     for NativeProcessEntry<'_, 'a, M, C, S>
 {
+    fn is_root_process(&self) -> bool {
+        NativeProcessEntry::is_root_process(self)
+    }
     fn interrupt_pending_wait(&mut self) -> bool {
         let pending = self.signal_interrupts_current();
         if pending
