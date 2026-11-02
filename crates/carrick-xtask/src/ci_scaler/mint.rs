@@ -487,7 +487,7 @@ fn decide(
         || !Admission::Agent.identifies_run(&run)
         || !crate::dispatch_worker::dispatch_run_admitted(&run, None, &mut |login: &str| {
             crate::dispatch_worker::write_collaborator(login, |endpoint| api.permission(endpoint))
-        })
+        })?
     {
         return Ok(Err(MintRefusal::IdentityMismatch));
     }

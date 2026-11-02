@@ -490,7 +490,7 @@ impl Github {
                 crate::dispatch_worker::write_collaborator(login, |endpoint| {
                     request("GET", endpoint, None, false)
                 })
-            })
+            })?
             || crate::dispatch_worker::comment_digest(&comment) != *digest
         {
             return Ok(false);
@@ -572,7 +572,7 @@ impl Github {
                         request("GET", endpoint, None, false)
                     })
                 },
-            ) {
+            )? {
                 return Ok(false);
             }
             issue = request(
@@ -654,7 +654,7 @@ impl Github {
                     crate::dispatch_worker::write_collaborator(login, |endpoint| {
                         request("GET", endpoint, None, false)
                     })
-                })
+                })?
             {
                 return Ok(false);
             }
@@ -689,8 +689,9 @@ impl Github {
                 None,
                 false,
             )?;
-            if !prs.as_array().into_iter().flatten().any(|pr| {
-                pr["head"]["sha"] == run["head_sha"]
+            let mut matched = false;
+            for pr in prs.as_array().into_iter().flatten() {
+                if pr["head"]["sha"] == run["head_sha"]
                     && crate::dispatch_worker::owned_pr(
                         pr,
                         &original,
@@ -707,8 +708,13 @@ impl Github {
                                 request("GET", endpoint, None, false)
                             })
                         },
-                    )
-            }) {
+                    )?
+                {
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
                 return Ok(false);
             }
             let head = run["head_sha"]

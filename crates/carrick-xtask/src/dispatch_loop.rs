@@ -519,7 +519,7 @@ fn provenance_with(
     item: &Value,
     issue: u64,
     mut run: impl FnMut(&str) -> Option<ArtifactRun>,
-    trusted: &mut dyn FnMut(&str) -> bool,
+    trusted: &mut TrustLookup<'_>,
     write: bool,
 ) -> String {
     let user = &item["user"];
@@ -535,7 +535,7 @@ fn provenance_with(
             let r = r.run;
             issue_bound
                 && r["id"].as_u64().map(|n| n.to_string()).as_deref() == Some(id)
-                && dispatch_run_admitted(&r, Some(issue), trusted)
+                && dispatch_run_admitted(&r, Some(issue), trusted).unwrap_or(false)
         })
     {
         return format!("dispatch-agent(run {id})");
@@ -555,34 +555,50 @@ impl ProvenanceCache {
         item: &Value,
         issue: u64,
         runs: &mut RunCache,
-        lookup: impl FnMut(&str) -> Option<Value>,
+        lookup: impl FnMut(&str) -> Result<Value, ScalerError>,
     ) -> String {
         // Run authentication reads both evidence and actor permission
         // through this one transport, one call at a time; each login's
-        // permission is read once per event (#1214).
+        // permission is read once per event (#1214), while lookup errors
+        // stay uncached across state reads (#1459).
         let lookup = std::cell::RefCell::new(lookup);
         let read = |endpoint: &str| (lookup.borrow_mut())(endpoint);
         let known = std::cell::RefCell::new(std::mem::take(&mut self.permissions));
-        let trusts = |login: &str| -> bool {
+        let failed = std::cell::RefCell::new(std::collections::BTreeSet::new());
+        let trusts = |login: &str| -> Result<bool, ScalerError> {
             if let Some(trusted) = known.borrow().get(login) {
-                return *trusted;
+                return Ok(*trusted);
             }
-            let trusted = write_collaborator(login, |endpoint| {
-                read(endpoint).ok_or(ScalerError::Guard("permission lookup failed"))
-            });
-            known.borrow_mut().insert(login.to_owned(), trusted);
-            trusted
+            if failed.borrow().contains(login) {
+                return Err(ScalerError::Guard("permission lookup failed"));
+            }
+            match write_collaborator(login, read) {
+                Ok(trusted) => {
+                    known.borrow_mut().insert(login.to_owned(), trusted);
+                    Ok(trusted)
+                }
+                Err(err) => {
+                    failed.borrow_mut().insert(login.to_owned());
+                    Err(err)
+                }
+            }
         };
         let user = &item["user"];
         let login = user["login"].as_str().unwrap_or_default();
-        let write = user["type"] == "User" && login != "tjfontaine" && trusts(login);
+        let write =
+            user["type"] == "User" && login != "tjfontaine" && trusts(login).unwrap_or(false);
         let provenance = provenance_with(
             item,
             issue,
             |id| {
                 let id = RunId(id.parse().ok()?);
-                runs.authenticate_with(issue, id, &mut |l: &str| trusts(l), read)
-                    .ok()
+                runs.authenticate_with(
+                    issue,
+                    id,
+                    &mut |l: &str| trusts(l),
+                    |endpoint| read(endpoint).ok(),
+                )
+                .ok()
             },
             &mut |l: &str| trusts(l),
             write,
@@ -951,13 +967,13 @@ struct ArtifactRun {
 fn authenticate_artifact_run(
     run: Value,
     issue: u64,
-    trusted: &mut dyn FnMut(&str) -> bool,
+    trusted: &mut TrustLookup<'_>,
     mut lookup: impl FnMut(&str) -> Option<Value>,
 ) -> Result<ArtifactRun, ScalerError> {
     let refused = || ScalerError::Guard("prior run lacks trusted main workflow and agent worker");
     // The only constructor of `ArtifactRun`: its actors pass the live
     // collaborator check here (#1214), so later shape checks need no transport.
-    if !dispatch_run_admitted(&run, Some(issue), trusted) || run["status"] != "completed" {
+    if !dispatch_run_admitted(&run, Some(issue), trusted)? || run["status"] != "completed" {
         return Err(refused());
     }
     if run["event"] == "pull_request_review"
@@ -1115,18 +1131,19 @@ pub(super) struct RunCache {
     /// the artifact handoff, whatever credential the process holds.
     public_receipts_only: bool,
 }
-/// The always-authenticated permission read behind [`RunCache`].
+/// The always-authenticated permission read behind [`RunCache`]; lookup errors
+/// are returned without caching so transient outages never stick (#1459).
 fn cached_trust(
     known: &mut std::collections::BTreeMap<String, bool>,
     root: &Path,
     login: &str,
-) -> bool {
+) -> Result<bool, ScalerError> {
     if let Some(trusted) = known.get(login) {
-        return *trusted;
+        return Ok(*trusted);
     }
-    let trusted = write_collaborator(login, |endpoint| authenticated_api(root, endpoint));
+    let trusted = write_collaborator(login, |endpoint| permission_api(root, endpoint))?;
     known.insert(login.to_owned(), trusted);
-    trusted
+    Ok(trusted)
 }
 struct BranchSnapshot {
     prs: Value,
@@ -1235,7 +1252,7 @@ impl RunCache {
         &mut self,
         issue: u64,
         id: RunId,
-        trusted: &mut dyn FnMut(&str) -> bool,
+        trusted: &mut TrustLookup<'_>,
         mut lookup: impl FnMut(&str) -> Option<Value>,
     ) -> Result<ArtifactRun, ScalerError> {
         self.authenticated
@@ -1246,11 +1263,26 @@ impl RunCache {
                     return Ok(None);
                 }
                 let mut unavailable = false;
-                let result = authenticate_artifact_run(run, issue, trusted, |endpoint| {
-                    let value = lookup(endpoint);
-                    unavailable |= value.is_none();
-                    value
-                });
+                let mut trust_error = None;
+                let result = authenticate_artifact_run(
+                    run,
+                    issue,
+                    &mut |login| match trusted(login) {
+                        Ok(ok) => Ok(ok),
+                        Err(err) => {
+                            trust_error = Some(err);
+                            Err(ScalerError::Guard("permission lookup failed"))
+                        }
+                    },
+                    |endpoint| {
+                        let value = lookup(endpoint);
+                        unavailable |= value.is_none();
+                        value
+                    },
+                );
+                if let Some(err) = trust_error {
+                    return Err(err);
+                }
                 if unavailable {
                     return Err(ScalerError::Guard("dispatch run evidence lookup failed"));
                 }
@@ -1284,7 +1316,7 @@ impl RunCache {
         result
     }
     /// Whether `login` is a write collaborator (#1214).
-    fn trusts(&mut self, root: &Path, login: &str) -> bool {
+    fn trusts(&mut self, root: &Path, login: &str) -> Result<bool, ScalerError> {
         cached_trust(&mut self.collaborators, root, login)
     }
     fn artifacts(&mut self, root: &Path, id: RunId) -> Result<Vec<Value>, ScalerError> {
@@ -1517,7 +1549,7 @@ pub(super) fn verified_branch_cached(
                 cache.publication(root, pr, &run, issue, branch),
             ))
         },
-        &mut collaborators(|endpoint| authenticated_api(root, endpoint)),
+        &mut collaborators(|endpoint| permission_api(root, endpoint)),
     )?;
     let mut expected = None;
     let pr = if let Some(pr) = pr {
@@ -2537,6 +2569,7 @@ impl Server<'_> {
                         publication.as_ref(),
                         &mut |login: &str| self.runs.trusts(self.root, login),
                     )
+                    .unwrap_or(false)
                 } {
                     items.push(json!({"kind":"branch_candidate","provenance":format!("dispatch-agent(run {id})"),"data":{"branch":branch,"pr":number}}));
                 }
@@ -2597,6 +2630,7 @@ impl Server<'_> {
                                 publication.as_ref(),
                                 &mut |login: &str| self.runs.trusts(self.root, login),
                             )
+                            .unwrap_or(false)
                         });
                     if bound {
                         format!(
@@ -2611,7 +2645,15 @@ impl Server<'_> {
                         &item,
                         self.dispatch.issue,
                         &mut self.runs,
-                        |endpoint| api(self.root, endpoint).ok(),
+                        |endpoint| {
+                            if endpoint.ends_with("/permission")
+                                && std::env::var_os("GH_TOKEN").is_some()
+                            {
+                                permission_api(self.root, endpoint)
+                            } else {
+                                api(self.root, endpoint)
+                            }
+                        },
                     )
                 };
                 if provenance.starts_with("dispatch-agent(")
@@ -4588,7 +4630,8 @@ fi
                 branch,
                 None,
                 &mut owner_collaborator()
-            ));
+            )
+            .unwrap());
             run["event"] = "workflow_dispatch".into();
             run["head_branch"] = "main".into();
             run["actor"] = json!({"login":"github-actions[bot]","type":"Bot"});
@@ -4604,7 +4647,8 @@ fi
                 branch,
                 None,
                 &mut owner_collaborator()
-            ));
+            )
+            .unwrap());
         });
     }
     #[test]
@@ -4696,7 +4740,8 @@ fi
                 "work/dispatch-799-42",
                 Some(&publication),
                 &mut owner_collaborator(),
-            ));
+            )
+            .unwrap());
             handoff["applied"]["publication_pr"] = 801.into();
             std::fs::write(root.join("handoff.json"), handoff.to_string()).unwrap();
             assert!(
@@ -4711,7 +4756,8 @@ fi
                 "work/dispatch-799-42",
                 Some(&publication),
                 &mut owner_collaborator(),
-            ));
+            )
+            .unwrap());
         });
     }
     #[test]
@@ -6129,7 +6175,8 @@ fi
                     &dispatch.branch,
                     None,
                     &mut owner_collaborator()
-                ),
+                )
+                .unwrap(),
                 "edited PR lost creation-run ownership"
             );
             assert!(!body.contains("Failed worker body") && !body.contains("fixture-token"));
@@ -6391,7 +6438,7 @@ fi
                     &item,
                     799,
                     &mut RunCache::default(),
-                    |endpoint| Some(if endpoint.contains("/jobs?") {
+                    |endpoint| Ok(if endpoint.contains("/jobs?") {
                         jobs.clone()
                     } else {
                         run.clone()
@@ -6493,7 +6540,7 @@ fi
             let mut runs = RunCache::default();
             for (issue, expected) in [(799, "dispatch-agent(run 42)"), (587, "unverified")] {
                 let provenance = cache.classify(&item, issue, &mut runs, |endpoint| {
-                    Some(if endpoint.contains("/jobs?") {
+                    Ok(if endpoint.contains("/jobs?") {
                         jobs.clone()
                     } else if endpoint.ends_with("/collaborators/tjfontaine/permission") {
                         json!({"permission":"admin"})
@@ -8579,7 +8626,7 @@ exec /usr/bin/git "$@"
             ] {
                 cache.classify(&item, 799, &mut runs, |endpoint| {
                     calls.push(endpoint.to_owned());
-                    Some(json!({"id":42}))
+                    Ok(json!({"id":42}))
                 });
             }
         }
@@ -8587,6 +8634,20 @@ exec /usr/bin/git "$@"
             calls.len(),
             2,
             "lookups were repeated across state reads: {calls:?}"
+        );
+        // Permission lookup errors are never cached across state reads (#1459).
+        let comment = json!({"user":{"login":"maintainer","type":"User"},"body":"hello"});
+        assert_eq!(
+            cache.classify(&comment, 799, &mut runs, |_| {
+                Err(ScalerError::Guard("API unavailable"))
+            }),
+            "unverified"
+        );
+        assert_eq!(
+            cache.classify(&comment, 799, &mut runs, |_| {
+                Ok(json!({"permission":"maintain"}))
+            }),
+            "collaborator(maintainer)"
         );
     }
     #[test]

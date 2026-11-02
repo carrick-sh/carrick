@@ -22,15 +22,40 @@ Trust is checked live. The guard, clone admission, the controller and the
 token mint read `GET repos/carrick-sh/carrick/collaborators/{login}/permission`
 for the sender, the triggering actor, the comment or review author and, for
 workflow runs, the run's actor and triggering actor. Only `admin`, `maintain`
-and `write` are accepted; `read`, `triage`, `none`, a malformed login, a 404
-and any API error are refused. The workflow's `if:` is only a cheap
-pre-filter: comment and review triggers need an `OWNER`, `MEMBER` or
-`COLLABORATOR` author association, and label events already need triage
-access to apply a label. A trusted actor's label, comment or review is the
-approval, so the issue or PR author no longer matters. A comment must have
-identical creation/update timestamps, match `/agent` followed by whitespace or
-end-of-body, and still match the original webhook when admission fetches it.
-Edited events and triggers from anyone without write access are refused.
+and `write` are accepted; `read`, `triage`, `none`, a malformed login and HTTP
+404 are refused as untrusted. Transient permission-API failures (5xx, 429 or
+rate-limit responses, timeouts and transport resets) are retried up to three
+attempts; any other or persistent API failure still fails closed as a
+collaborator permission lookup error, never cached as an untrusted refusal and
+never reported as an untrusted actor or non-collaborator (#1459). The
+workflow's `if:` is only a cheap pre-filter: comment and review triggers need
+an `OWNER`, `MEMBER` or `COLLABORATOR` author association, and label events
+already need triage access to apply a label. A trusted actor's label, comment
+or review is the approval, so the issue or PR author no longer matters. A
+comment must have identical creation/update timestamps, match `/agent` followed
+by whitespace or end-of-body, and still match the original webhook when
+admission fetches it. Edited events and triggers from anyone without write
+access are refused.
+
+### Re-running a Blocked first round (#1459)
+
+When an issue's first round ends `Blocked` (or fails before opening a dispatch
+PR), any collaborator with write access (`admin`, `maintain` or `write`) can
+start a new round on the open issue in either of two ways:
+
+- **Relabel the issue:** remove `dispatch` (or `dispatch:*`) and apply it again
+  so GitHub emits a fresh `issues: [labeled]` event.
+- **Comment on the issue:** post a new unedited `/agent [free text]` comment on
+  the open issue.
+
+Both triggers pass the hosted guard and the worker clone's continuation
+admission (`dispatch-worker guard --admit`), start a fresh
+`work/dispatch-<issue>-<run>` branch when no PR exists yet, bind a relabel's
+`Round trigger:` to the newest matching `labeled` timeline event, and carry
+forward the earlier `Blocked` outcome and any unseen comments from the round's
+mailbox opening. Once a round has opened an owned dispatch PR, follow-up rounds
+can also be triggered by commenting `/agent` or submitting a
+`changes_requested` review on that PR.
 
 The approval covers only issue text a collaborator saw or wrote. On every
 path that admits an issue (label, `/agent` on the issue, `/agent` or a review

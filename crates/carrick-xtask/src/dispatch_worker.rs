@@ -79,24 +79,145 @@ struct LoopConfig {
     loop_policy: agent_loop::Policy,
 }
 
-/// Who may trigger dispatch (#1214, owner decision on #231): a repository
-/// collaborator with `write`, `maintain` or `admin` permission, read live
-/// from `GET repos/{REPOSITORY}/collaborators/{login}/permission`. Callers
+/// Fallible live collaborator permission lookup: `Ok(true)` for a repository
+/// collaborator with `write`, `maintain` or `admin` access; `Ok(false)` when
+/// the login is malformed, not found (HTTP 404), or holds `read`, `triage` or
+/// `none`; `Err` when the permission API lookup itself fails (#1459).
+pub(crate) type TrustLookup<'a> = dyn FnMut(&str) -> Result<bool, ScalerError> + 'a;
+
+const PERMISSION_LOOKUP_ATTEMPTS: u32 = 3;
+const PERMISSION_RETRY_BACKOFF: [std::time::Duration; 2] = [
+    std::time::Duration::from_millis(200),
+    std::time::Duration::from_millis(500),
+];
+
+fn is_permission_not_found(error: &ScalerError) -> bool {
+    if matches!(error, ScalerError::GithubGone) {
+        return true;
+    }
+    let text = error.to_string().to_ascii_lowercase();
+    text.contains("http 404")
+        || text.contains("http/1.1 404")
+        || text.contains("http/2 404")
+        || text.contains("returned error: 404")
+}
+
+fn is_transient_permission_error(error: &ScalerError) -> bool {
+    if is_permission_not_found(error) {
+        return false;
+    }
+    let text = error.to_string().to_ascii_lowercase();
+    if text.contains("loop wall budget exhausted")
+        || text.contains("bad credentials")
+        || text.contains("http 400")
+        || text.contains("http 401")
+        || text.contains("http 422")
+        || (text.contains("http 403") && !text.contains("rate limit") && !text.contains("abuse"))
+    {
+        return false;
+    }
+    matches!(error, ScalerError::Io(_) | ScalerError::CommandFailed(_))
+        || [
+            "http 429",
+            "http 500",
+            "http 502",
+            "http 503",
+            "http 504",
+            "bad gateway",
+            "service unavailable",
+            "gateway timeout",
+            "internal server error",
+            "rate limit",
+            "abuse detection",
+            "timed out",
+            "timeout",
+            "connection reset",
+            "connection refused",
+            "eof",
+            "broken pipe",
+            "temporary failure",
+            "no such host",
+            "network is unreachable",
+            "tls handshake",
+            "server closed",
+            "connection lost",
+            "stream error",
+            "context deadline exceeded",
+            "error connecting to",
+            "exited with code",
+            "killed by signal",
+        ]
+        .iter()
+        .any(|marker| text.contains(marker))
+}
+
+fn sleep_until_deadline(delay: std::time::Duration) -> bool {
+    let allowed = COMMAND_DEADLINE.with(|slot| {
+        slot.get()
+            .map(|d| d.saturating_duration_since(std::time::Instant::now()))
+    });
+    match allowed {
+        Some(remaining) if remaining.is_zero() => return false,
+        Some(remaining) => std::thread::sleep(delay.min(remaining)),
+        None => std::thread::sleep(delay),
+    }
+    true
+}
+
+fn permission_lookup_error(login: &str, attempts: u32, error: &ScalerError) -> ScalerError {
+    let detail = crate::dispatch_redaction::redact(error.to_string().as_bytes());
+    let detail: String = detail.chars().take(2048).collect();
+    if attempts > 1 {
+        ScalerError::Usage(format!(
+            "collaborator permission lookup failed for {login} (after {attempts} attempts): {detail}"
+        ))
+    } else {
+        ScalerError::Usage(format!(
+            "collaborator permission lookup failed for {login}: {detail}"
+        ))
+    }
+}
+
+/// Who may trigger dispatch (#1214, #1459, owner decision on #231): a
+/// repository collaborator with `write`, `maintain` or `admin` permission, read
+/// live from `GET repos/{REPOSITORY}/collaborators/{login}/permission`. Callers
 /// supply the transport so the validators stay pure. `read`, `triage` and
-/// `none`, a malformed login, a 404 and any other API error are refused.
+/// `none`, a malformed login, and HTTP 404 return `Ok(false)`. Transient
+/// transport/5xx failures are retried up to [`PERMISSION_LOOKUP_ATTEMPTS`]; any
+/// remaining non-404 API failure returns `Err` rather than `Ok(false)`.
 pub(crate) fn write_collaborator(
     login: &str,
-    read: impl FnOnce(&str) -> Result<Value, ScalerError>,
-) -> bool {
+    mut read: impl FnMut(&str) -> Result<Value, ScalerError>,
+) -> Result<bool, ScalerError> {
     let Some(endpoint) = permission_endpoint(login) else {
-        return false;
+        return Ok(false);
     };
-    read(&endpoint).is_ok_and(|v| {
-        matches!(
-            v["permission"].as_str(),
-            Some("admin" | "maintain" | "write")
-        )
-    })
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match read(&endpoint) {
+            Ok(v) => {
+                return Ok(matches!(
+                    v["permission"].as_str(),
+                    Some("admin" | "maintain" | "write")
+                ));
+            }
+            Err(error) if is_permission_not_found(&error) => return Ok(false),
+            Err(error) => {
+                let retry_delay = PERMISSION_RETRY_BACKOFF
+                    .get((attempts - 1) as usize)
+                    .copied();
+                if attempts < PERMISSION_LOOKUP_ATTEMPTS
+                    && is_transient_permission_error(&error)
+                    && let Some(delay) = retry_delay
+                    && sleep_until_deadline(delay)
+                {
+                    continue;
+                }
+                return Err(permission_lookup_error(login, attempts, &error));
+            }
+        }
+    }
 }
 /// The permission endpoint for a syntactically valid GitHub login only, so
 /// event text can never reshape the request path.
@@ -110,30 +231,40 @@ pub(crate) fn permission_endpoint(login: &str) -> Option<String> {
     valid.then(|| format!("repos/{REPOSITORY}/collaborators/{login}/permission"))
 }
 /// A per-event trusted-login predicate over one transport, caching each
-/// login's answer (refusals included) for the life of the predicate.
+/// login's decided answer (refusals included) for the life of the predicate.
+/// Transport or API failures propagate without poisoning the cache.
 pub(crate) fn collaborators<'a>(
     mut read: impl FnMut(&str) -> Result<Value, ScalerError> + 'a,
-) -> impl FnMut(&str) -> bool + 'a {
+) -> impl FnMut(&str) -> Result<bool, ScalerError> + 'a {
     let mut cache = std::collections::BTreeMap::<String, bool>::new();
     move |login: &str| {
         if let Some(trusted) = cache.get(login) {
-            return *trusted;
+            return Ok(*trusted);
         }
-        let trusted = write_collaborator(login, &mut read);
+        let trusted = write_collaborator(login, &mut read)?;
         cache.insert(login.to_owned(), trusted);
-        trusted
+        Ok(trusted)
     }
 }
 /// A human account that [`write_collaborator`] trusts.
-pub(crate) fn trusted_user(user: &Value, trusted: &mut dyn FnMut(&str) -> bool) -> bool {
-    user["type"] == "User" && user["login"].as_str().is_some_and(trusted)
+pub(crate) fn trusted_user(
+    user: &Value,
+    trusted: &mut TrustLookup<'_>,
+) -> Result<bool, ScalerError> {
+    if user["type"] != "User" {
+        return Ok(false);
+    }
+    let Some(login) = user["login"].as_str() else {
+        return Ok(false);
+    };
+    trusted(login)
 }
 /// Test transport for [`collaborators`]: each listed login answers its
 /// permission; any other login gets the API's 404.
 #[cfg(test)]
 pub(crate) fn fake_collaborators(
     table: &'static [(&'static str, &'static str)],
-) -> impl FnMut(&str) -> bool {
+) -> impl FnMut(&str) -> Result<bool, ScalerError> {
     collaborators(move |endpoint| {
         table
             .iter()
@@ -144,7 +275,7 @@ pub(crate) fn fake_collaborators(
 }
 /// The fixtures' usual actor, `tjfontaine`, as an admin collaborator.
 #[cfg(test)]
-pub(crate) fn owner_collaborator() -> impl FnMut(&str) -> bool {
+pub(crate) fn owner_collaborator() -> impl FnMut(&str) -> Result<bool, ScalerError> {
     fake_collaborators(&[("tjfontaine", "admin")])
 }
 
@@ -282,8 +413,14 @@ pub(crate) struct TrustedBrief {
 }
 /// A GraphQL `Actor` for a human account (`__typename == "User"`) that
 /// [`write_collaborator`] trusts.
-fn trusted_graphql_actor(actor: &Value, trusted: &mut dyn FnMut(&str) -> bool) -> bool {
-    actor["__typename"] == "User" && actor["login"].as_str().is_some_and(trusted)
+fn trusted_graphql_actor(actor: &Value, trusted: &mut TrustLookup<'_>) -> Result<bool, ScalerError> {
+    if actor["__typename"] != "User" {
+        return Ok(false);
+    }
+    let Some(login) = actor["login"].as_str() else {
+        return Ok(false);
+    };
+    trusted(login)
 }
 /// The issue title and body a worker round may admit. Any issue author may be
 /// approved by a collaborator's label, comment or review (#1214), but the
@@ -299,7 +436,7 @@ fn trusted_graphql_actor(actor: &Value, trusted: &mut dyn FnMut(&str) -> bool) -
 pub(crate) fn trusted_brief(
     response: &Value,
     number: u64,
-    trusted: &mut dyn FnMut(&str) -> bool,
+    trusted: &mut TrustLookup<'_>,
 ) -> Result<TrustedBrief, ScalerError> {
     if response.get("errors").is_some() {
         return Err(ScalerError::Guard("issue brief query returned errors"));
@@ -314,7 +451,7 @@ pub(crate) fn trusted_brief(
     match issue.get("lastEditedAt") {
         Some(Value::Null) => {}
         Some(Value::String(at)) if !at.is_empty() => {
-            if !trusted_graphql_actor(&issue["editor"], trusted) {
+            if !trusted_graphql_actor(&issue["editor"], trusted)? {
                 return Err(ScalerError::Guard(
                     "issue body was last edited by a non-collaborator; a collaborator must edit or re-file it",
                 ));
@@ -335,7 +472,7 @@ pub(crate) fn trusted_brief(
             if rename["__typename"] == "RenamedTitleEvent"
                 && rename["currentTitle"].as_str() == Some(title) =>
         {
-            if !trusted_graphql_actor(&rename["actor"], trusted) {
+            if !trusted_graphql_actor(&rename["actor"], trusted)? {
                 return Err(ScalerError::Guard(
                     "issue title was last edited by a non-collaborator; a collaborator must retitle or re-file it",
                 ));
@@ -354,7 +491,7 @@ pub(crate) fn trusted_brief(
 fn apply_trusted_brief(
     event: &mut Value,
     read: impl FnOnce(u64) -> Result<Value, ScalerError>,
-    trusted: &mut dyn FnMut(&str) -> bool,
+    trusted: &mut TrustLookup<'_>,
 ) -> Result<(), ScalerError> {
     let number = event["issue"]["number"]
         .as_u64()
@@ -481,17 +618,21 @@ pub(crate) fn dispatch_label(label: &str) -> bool {
 
 /// Used by the guard and controller; text is context, never executable policy.
 /// The author must be a trusted collaborator ([`write_collaborator`]).
-pub(crate) fn agent_comment(comment: &Value, trusted: &mut dyn FnMut(&str) -> bool) -> bool {
+pub(crate) fn agent_comment(
+    comment: &Value,
+    trusted: &mut TrustLookup<'_>,
+) -> Result<bool, ScalerError> {
     let body = comment["body"].as_str().unwrap_or_default();
-    trusted_user(&comment["user"], trusted)
-        && comment["created_at"]
-            .as_str()
-            .is_some_and(|s| !s.is_empty())
-        && comment["created_at"] == comment["updated_at"]
-        && (body == "/agent"
+    if comment["created_at"].as_str().is_none_or(str::is_empty)
+        || comment["created_at"] != comment["updated_at"]
+        || !(body == "/agent"
             || body
                 .strip_prefix("/agent")
                 .is_some_and(|s| s.starts_with(char::is_whitespace)))
+    {
+        return Ok(false);
+    }
+    trusted_user(&comment["user"], trusted)
 }
 
 /// Director consent to rebase an adopted PR (owner decision, #1215): the
@@ -516,14 +657,14 @@ pub(crate) fn comment_digest(comment: &Value) -> String {
 pub(crate) fn validate_event(
     event: &Value,
     triggering_actor: &str,
-    trusted: &mut dyn FnMut(&str) -> bool,
+    trusted: &mut TrustLookup<'_>,
 ) -> Result<Dispatch, ScalerError> {
     validate_event_with_publication(event, triggering_actor, trusted, None, None, None)
 }
 fn validate_event_with_publication(
     event: &Value,
     triggering_actor: &str,
-    trusted: &mut dyn FnMut(&str) -> bool,
+    trusted: &mut TrustLookup<'_>,
     publication: Option<&PublishedPr>,
     adoption: Option<&Adoption>,
     chain: Option<&ChainLink>,
@@ -552,9 +693,9 @@ fn validate_event_with_publication(
             && event["sender"]["type"] == "Bot"
             && triggering_actor == CHAIN_ACTOR
     } else {
-        trusted_user(&event["sender"], trusted)
+        trusted_user(&event["sender"], trusted)?
             && !triggering_actor.is_empty()
-            && trusted(triggering_actor)
+            && trusted(triggering_actor)?
     };
     if event["repository"]["full_name"] != REPOSITORY
         || !actors
@@ -575,7 +716,7 @@ fn validate_event_with_publication(
     } else if review {
         if event["action"] != "submitted"
             || event["review"]["state"] != "changes_requested"
-            || !trusted_user(&event["review"]["user"], trusted)
+            || !trusted_user(&event["review"]["user"], trusted)?
         {
             return Err(ScalerError::Guard(
                 "review requires collaborator changes_requested",
@@ -584,7 +725,7 @@ fn validate_event_with_publication(
     } else if comment {
         if event["action"] != "created"
             || event["issue"]["state"] != "open"
-            || !agent_comment(&event["comment"], trusted)
+            || !agent_comment(&event["comment"], trusted)?
         {
             return Err(ScalerError::Guard(
                 "comment requires an unedited collaborator /agent creation",
@@ -626,7 +767,7 @@ fn validate_event_with_publication(
             branch,
             publication,
             trusted,
-        ) {
+        )? {
             (branch.to_owned(), Continuation::Owned)
         } else {
             return Err(ScalerError::Guard(
@@ -2268,12 +2409,15 @@ pub(crate) fn dispatch_run_identity(run: &Value, issue: Option<u64>) -> bool {
 pub(crate) fn dispatch_run_admitted(
     run: &Value,
     issue: Option<u64>,
-    trusted: &mut dyn FnMut(&str) -> bool,
-) -> bool {
-    dispatch_run_identity(run, issue)
-        && (chain_run(run)
-            || (trusted_user(&run["actor"], trusted)
-                && trusted_user(&run["triggering_actor"], trusted)))
+    trusted: &mut TrustLookup<'_>,
+) -> Result<bool, ScalerError> {
+    if !dispatch_run_identity(run, issue) {
+        return Ok(false);
+    }
+    if chain_run(run) {
+        return Ok(true);
+    }
+    Ok(trusted_user(&run["actor"], trusted)? && trusted_user(&run["triggering_actor"], trusted)?)
 }
 
 /// The account a chained run starts as: `workflow_dispatch` sent with a
@@ -2669,12 +2813,12 @@ pub(crate) fn owned_pr(
     issue: u64,
     branch: &str,
     publication: Option<&PublishedPr>,
-    trusted: &mut dyn FnMut(&str) -> bool,
-) -> bool {
+    trusted: &mut TrustLookup<'_>,
+) -> Result<bool, ScalerError> {
     let Ok(id) = branch_run(issue, branch) else {
-        return false;
+        return Ok(false);
     };
-    (dispatch_comment_author(&pr["user"])
+    let structural = (dispatch_comment_author(&pr["user"])
         || (publish_app_author(&pr["user"])
             && publication.is_some_and(|p| p.matches(pr, issue, branch))))
         && pr["head"]["repo"]["full_name"] == REPOSITORY
@@ -2686,7 +2830,6 @@ pub(crate) fn owned_pr(
         // checkpoint branch of the owner-rooted round it chains from, so
         // ownership keeps that run's live collaborator re-check.
         && !chain_run(run)
-        && dispatch_run_admitted(run, Some(issue), trusted)
         && pr["body"].as_str().is_some_and(|body| {
             body.lines().any(|line| line == format!("Closes #{issue}"))
                 && body.lines().any(|line| {
@@ -2694,7 +2837,11 @@ pub(crate) fn owned_pr(
                         "Dispatch run: https://github.com/{REPOSITORY}/actions/runs/{id}"
                     )
                 })
-        })
+        });
+    if !structural {
+        return Ok(false);
+    }
+    dispatch_run_admitted(run, Some(issue), trusted)
 }
 
 fn require_owned_pr(root: &Path, dispatch: &Dispatch) -> Result<Value, ScalerError> {
@@ -2703,6 +2850,7 @@ fn require_owned_pr(root: &Path, dispatch: &Dispatch) -> Result<Value, ScalerErr
         root,
         &["api", &format!("repos/{REPOSITORY}/actions/runs/{id}")],
     )?)?;
+    let mut trusted = collaborators(|endpoint| permission_api(root, endpoint));
     for pr in open_prs(root, &dispatch.branch)?
         .as_array()
         .into_iter()
@@ -2737,8 +2885,8 @@ fn require_owned_pr(root: &Path, dispatch: &Dispatch) -> Result<Value, ScalerErr
             dispatch.issue,
             &dispatch.branch,
             publication.as_ref(),
-            &mut collaborators(|endpoint| authenticated_api(root, endpoint)),
-        ) {
+            &mut trusted,
+        )? {
             return Ok(pr.clone());
         }
     }
@@ -2999,6 +3147,16 @@ fn authenticated_api(root: &Path, endpoint: &str) -> Result<Value, ScalerError> 
     Ok(serde_json::from_str(&gh(root, &["api", endpoint])?)?)
 }
 
+/// Authenticated read of a collaborator permission endpoint, bounded to 20 s
+/// per attempt (or the active command window, if tighter) so a stalled socket
+/// fails in time for [`write_collaborator`] to retry (#1459).
+pub(super) fn permission_api(root: &Path, endpoint: &str) -> Result<Value, ScalerError> {
+    let cap = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let deadline = COMMAND_DEADLINE.with(|slot| slot.get().map_or(cap, |d| d.min(cap)));
+    let _window = CommandWindow::until(deadline);
+    authenticated_api(root, endpoint)
+}
+
 fn api(root: &Path, endpoint: &str) -> Result<Value, ScalerError> {
     let response = if std::env::var_os("GH_TOKEN").is_some() {
         gh(root, &["api", endpoint])?
@@ -3036,7 +3194,7 @@ fn admitted_head(event: &Value) -> Option<String> {
 pub(crate) fn load_event(
     root: &Path,
     path: &Path,
-    trusted: &mut dyn FnMut(&str) -> bool,
+    trusted: &mut TrustLookup<'_>,
 ) -> Result<(Value, Option<Adoption>, Option<ChainLink>), ScalerError> {
     let (mut event, adoption, chain) = resolve_event(root, path, trusted)?;
     // Whatever path resolved the issue (the label payload, a live re-read for
@@ -3085,7 +3243,7 @@ fn checkpoint_pr(root: &Path, branch: &str) -> Result<Option<Value>, ScalerError
 fn resolve_event(
     root: &Path,
     path: &Path,
-    trusted: &mut dyn FnMut(&str) -> bool,
+    trusted: &mut TrustLookup<'_>,
 ) -> Result<(Value, Option<Adoption>, Option<ChainLink>), ScalerError> {
     let mut event: Value = serde_json::from_slice(&std::fs::read(path)?)?;
     let mut chain = None;
@@ -3118,7 +3276,7 @@ fn resolve_event(
         }
         event["chain"] = link.outcome.clone();
         chain = Some(link);
-    } else if !trusted_user(&event["sender"], trusted) {
+    } else if !trusted_user(&event["sender"], trusted)? {
         return Err(ScalerError::Guard("untrusted event actor"));
     }
     if event.get("comment").is_some() {
@@ -3126,7 +3284,7 @@ fn resolve_event(
             .as_u64()
             .ok_or(ScalerError::Guard("missing comment id"))?;
         let live = api(root, &format!("repos/{REPOSITORY}/issues/comments/{id}"))?;
-        if !agent_comment(&live, trusted)
+        if !agent_comment(&live, trusted)?
             || ["id", "body", "created_at", "updated_at"]
                 .iter()
                 .any(|k| live[k] != event["comment"][k])
@@ -3183,7 +3341,7 @@ fn select_owned_pr(
     issue: u64,
     prs: &[Value],
     mut run: impl FnMut(&Value, &str) -> Result<(Value, Option<PublishedPr>), ScalerError>,
-    trusted: &mut dyn FnMut(&str) -> bool,
+    trusted: &mut TrustLookup<'_>,
 ) -> Result<Option<Value>, ScalerError> {
     let mut selected = None;
     for pr in prs.iter().filter(|pr| pr["state"] == "open") {
@@ -3192,7 +3350,7 @@ fn select_owned_pr(
             continue;
         }
         let (original, publication) = run(pr, branch_run(issue, branch)?)?;
-        if owned_pr(pr, &original, issue, branch, publication.as_ref(), trusted) {
+        if owned_pr(pr, &original, issue, branch, publication.as_ref(), trusted)? {
             if selected.is_some() {
                 return Err(ScalerError::Guard("multiple open owned dispatch PRs"));
             }
@@ -3366,7 +3524,7 @@ fn guard_admission(
 ) -> Result<(Value, Dispatch), ScalerError> {
     // Both guard phases hold the job token (the endpoint answers 401
     // without one); the live permission read fails closed.
-    let mut trusted = collaborators(|endpoint| authenticated_api(root, endpoint));
+    let mut trusted = collaborators(|endpoint| permission_api(root, endpoint));
     let (event, adoption, chain) = load_event(root, event_path, &mut trusted)?;
     let publication = if adoption.is_none() && publish_app_author(&event["pull_request"]["user"]) {
         let branch = event["pull_request"]["head"]["ref"]
@@ -6950,7 +7108,8 @@ mod tests {
                 "work/dispatch-634-42",
                 None,
                 &mut owner_collaborator(),
-            ),
+            )
+            .unwrap(),
             "shared App PR without authenticated publication_pr is owned"
         );
     }
@@ -7108,7 +7267,8 @@ mod tests {
             "work/dispatch-634-42",
             Some(&publication),
             &mut owner_collaborator(),
-        ));
+        )
+        .unwrap());
         pr["user"]["login"] = "another-app[bot]".into();
         assert!(!owned_pr(
             &pr,
@@ -7117,7 +7277,8 @@ mod tests {
             "work/dispatch-634-42",
             Some(&publication),
             &mut owner_collaborator(),
-        ));
+        )
+        .unwrap());
     }
     #[test]
     fn publish_token_authenticates_create_and_continuation_writes() {
@@ -9203,7 +9364,8 @@ fi
             branch,
             None,
             &mut owner_collaborator()
-        ));
+        )
+        .unwrap());
         assert!(!owned_pr(
             &pr,
             &run,
@@ -9211,7 +9373,8 @@ fi
             branch,
             None,
             &mut owner_collaborator()
-        ));
+        )
+        .unwrap());
         assert!(!owned_pr(
             &pr,
             &run,
@@ -9219,7 +9382,8 @@ fi
             "work/dispatch-634-43",
             None,
             &mut owner_collaborator()
-        ));
+        )
+        .unwrap());
         for pointer in [
             "/user/login",
             "/user/type",
@@ -9231,7 +9395,7 @@ fi
             let mut bad = pr.clone();
             *bad.pointer_mut(pointer).unwrap() = "foreign".into();
             assert!(
-                !owned_pr(&bad, &run, 634, branch, None, &mut owner_collaborator()),
+                !owned_pr(&bad, &run, 634, branch, None, &mut owner_collaborator()).unwrap(),
                 "{pointer}"
             );
         }
@@ -9244,7 +9408,8 @@ fi
             branch,
             None,
             &mut owner_collaborator()
-        ));
+        )
+        .unwrap());
         for pointer in [
             "/path",
             "/event",
@@ -9255,7 +9420,7 @@ fi
             let mut bad = run.clone();
             *bad.pointer_mut(pointer).unwrap() = "foreign".into();
             assert!(
-                !owned_pr(&pr, &bad, 634, branch, None, &mut owner_collaborator()),
+                !owned_pr(&pr, &bad, 634, branch, None, &mut owner_collaborator()).unwrap(),
                 "{pointer}"
             );
         }
@@ -9531,9 +9696,16 @@ fi
                     "{login} rerun admitted"
                 );
             }
-            // Any permission API failure refuses (fail closed).
+            // Any permission API failure refuses (fail closed), reporting lookup failure rather than untrusted.
             let mut failing = collaborators(|_| Err(ScalerError::Guard("API unavailable")));
-            assert!(validate_event(trigger, "tjfontaine", &mut failing).is_err());
+            let err = validate_event(trigger, "tjfontaine", &mut failing)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("collaborator permission lookup failed")
+                    && !err.to_ascii_lowercase().contains("untrusted"),
+                "unexpected failure text: {err}"
+            );
         }
         // The comment author is checked on its own, beyond the sender.
         let mut foreign = as_actor(comment.clone(), "writer");
@@ -9558,7 +9730,8 @@ fi
             assert!(!write_collaborator(login, |endpoint| {
                 reads.push(endpoint.to_owned());
                 Ok(json!({"permission":"admin"}))
-            }));
+            })
+            .unwrap());
         }
         assert!(reads.is_empty(), "{reads:?}");
         assert!(write_collaborator("Mixed-Case-1", |endpoint| {
@@ -9567,13 +9740,14 @@ fi
                 "repos/carrick-sh/carrick/collaborators/Mixed-Case-1/permission"
             );
             Ok(json!({"permission":"write","role_name":"write"}))
-        }));
+        })
+        .unwrap());
         for answer in [
             json!({}),
             json!({"permission":null}),
             json!({"role_name":"admin"}),
         ] {
-            assert!(!write_collaborator("writer", |_| Ok(answer.clone())));
+            assert!(!write_collaborator("writer", |_| Ok(answer.clone())).unwrap());
         }
         // Each login is read once per predicate, refusals included.
         let mut count = 0;
@@ -9581,9 +9755,20 @@ fi
             count += 1;
             Ok(json!({"permission":"read"}))
         });
-        assert!(!trusted("reader") && !trusted("reader"));
+        assert!(!trusted("reader").unwrap() && !trusted("reader").unwrap());
         drop(trusted);
         assert_eq!(count, 1);
+        // Lookup errors are never cached as negative answers (#1459).
+        let mut fail_once = true;
+        let mut recovering = collaborators(|_| {
+            if std::mem::replace(&mut fail_once, false) {
+                Err(ScalerError::Guard("API unavailable"))
+            } else {
+                Ok(json!({"permission":"write"}))
+            }
+        });
+        assert!(recovering("writer").is_err());
+        assert!(recovering("writer").unwrap());
     }
     #[test]
     fn dispatch_runs_need_collaborator_actors_live() {
@@ -9594,7 +9779,8 @@ fi
             &run,
             Some(634),
             &mut fake_collaborators(PERMISSIONS)
-        ));
+        )
+        .unwrap());
         for (pointer, login) in [
             ("/actor/login", "reader"),
             ("/triggering_actor/login", "stranger"),
@@ -9604,18 +9790,20 @@ fi
             *bad.pointer_mut(pointer).unwrap() = login.into();
             assert!(dispatch_run_identity(&bad, Some(634)), "{pointer}");
             assert!(
-                !dispatch_run_admitted(&bad, Some(634), &mut fake_collaborators(PERMISSIONS)),
+                !dispatch_run_admitted(&bad, Some(634), &mut fake_collaborators(PERMISSIONS))
+                    .unwrap(),
                 "{pointer}={login}"
             );
         }
         let mut bot = run.clone();
         bot["actor"]["type"] = "Bot".into();
         assert!(!dispatch_run_identity(&bot, Some(634)));
-        assert!(!dispatch_run_admitted(
+        assert!(dispatch_run_admitted(
             &run,
             Some(634),
             &mut collaborators(|_| Err(ScalerError::Guard("API unavailable")))
-        ));
+        )
+        .is_err());
     }
     #[test]
     fn app_authored_pr_with_one_closing_issue_is_adoptable() {
@@ -10811,4 +10999,304 @@ cat "$file"
         // Reporting commands can run after the tool window closes.
         assert!(output(&mut Command::new("/usr/bin/true")).is_ok());
     }
+    /// #1459: a trusted write collaborator re-triggers an open issue whose
+    /// first round ended `Blocked` (without opening a PR) via either relabel
+    /// (`dispatch`) or `/agent` on the issue; both the hosted guard and the
+    /// worker clone's continuation admission (`guard --admit`) admit the round,
+    /// transient permission-API failures are retried, and persistent API
+    /// failures report a permission lookup failure rather than "untrusted".
+    #[test]
+    fn blocked_first_round_relabel_and_transient_permission_lookup_admit_continuation() {
+        const CHILD: &str = "CARRICK_TEST_BLOCKED_RELABEL_1459";
+        if std::env::var_os(CHILD).is_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let repo = temp.path().join("repo");
+            std::fs::create_dir(&repo).unwrap();
+            fixture_repository(&repo);
+            let base = git(&repo, &["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+            let bin = temp.path().join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            crate::lock_file::tests::write_test_executable(
+                bin.join("gh"),
+                r#"#!/bin/sh
+test "$1" = api || exit 93
+test "$GH_TOKEN" = fixture-token || exit 92
+if test "$2" = graphql; then
+  cat "$BLOCKED_FIXTURE/issue-graphql.json"
+  exit 0
+fi
+endpoint="$(printf '%s' "$2" | sed 's/[?].*$//')"
+case "$endpoint" in
+  repos/carrick-sh/carrick/collaborators/*/permission)
+    count_file="$BLOCKED_FIXTURE/perm-calls"
+    n=0
+    test -f "$count_file" && n="$(cat "$count_file")"
+    n=$((n + 1))
+    printf '%s' "$n" > "$count_file"
+    mode="$(cat "$BLOCKED_FIXTURE/perm-mode" 2>/dev/null || printf 'ok')"
+    case "$mode" in
+      transient-502)
+        if test "$n" -eq 1; then
+          echo "gh: Bad Gateway (HTTP 502)" >&2
+          exit 1
+        fi
+        ;;
+      transient-timeout)
+        if test "$n" -eq 1; then
+          echo "Post \"https://api.github.com\": net/http: TLS handshake timeout" >&2
+          exit 1
+        fi
+        ;;
+      always-503)
+        echo "gh: Service Unavailable (HTTP 503)" >&2
+        exit 1
+        ;;
+      always-401)
+        echo "gh: Bad credentials (HTTP 401)" >&2
+        exit 1
+        ;;
+      not-found-404)
+        echo "gh: Not Found (HTTP 404)" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+esac
+file="$BLOCKED_FIXTURE/$(printf '%s' "$endpoint" | tr '/' '_')"
+test -f "$file" || { echo "unexpected endpoint $2" >&2; exit 91; }
+cat "$file"
+"#,
+                std::fs::Permissions::from_mode(0o700),
+            );
+            for actor in ["writer", "tjfontaine"] {
+                let state = temp.path().join(format!("state-{actor}"));
+                std::fs::create_dir_all(&state).unwrap();
+                let output = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        std::thread::current().name().unwrap(),
+                        "--nocapture",
+                    ])
+                    .env(CHILD, actor)
+                    .env("BLOCKED_FIXTURE", temp.path())
+                    .env("BLOCKED_REPO", &repo)
+                    .env("RUNNER_TEMP", &state)
+                    .env("GH_TOKEN", "fixture-token")
+                    .env("GITHUB_RUN_ID", "42")
+                    .env("GITHUB_RUN_ATTEMPT", "1")
+                    .env("GITHUB_SHA", &base)
+                    .env("CARRICK_DISPATCH_BASE", &base)
+                    .env("GITHUB_TRIGGERING_ACTOR", actor)
+                    .env_remove("CARRICK_DISPATCH_HEAD")
+                    .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "actor={actor}:\n{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        }
+        let actor = std::env::var(CHILD).unwrap();
+        let fixture = PathBuf::from(std::env::var_os("BLOCKED_FIXTURE").unwrap());
+        let repo = PathBuf::from(std::env::var_os("BLOCKED_REPO").unwrap());
+        let write_ep = |name: &str, value: &Value| {
+            std::fs::write(
+                fixture.join(format!("repos/{REPOSITORY}/{name}").replace('/', "_")),
+                value.to_string(),
+            )
+            .unwrap();
+        };
+        let issue = json!({
+            "number": 1410,
+            "state": "open",
+            "title": "Isolate blocked capacity probe",
+            "body": "## Brief\nHandle blocked round rerun.",
+            "labels": [{"name": "dispatch"}],
+            "user": {"login": "tjfontaine", "type": "User"}
+        });
+        write_ep("issues/1410", &issue);
+        std::fs::write(
+            fixture.join("issue-graphql.json"),
+            issue_brief(&issue, Some(&actor)).to_string(),
+        )
+        .unwrap();
+        write_ep("pulls", &json!([]));
+        write_ep(
+            "collaborators/tjfontaine/permission",
+            &json!({"permission": "admin"}),
+        );
+        write_ep(
+            "collaborators/writer/permission",
+            &json!({"permission": "write"}),
+        );
+        write_ep(
+            "collaborators/reader/permission",
+            &json!({"permission": "read"}),
+        );
+        // Round 1 (run 41) was triggered by #event-10 and ended Blocked with no PR.
+        write_ep(
+            "actions/runs/41",
+            &json!({
+                "id": 41,
+                "status": "completed",
+                "conclusion": "success",
+                "path": ".github/workflows/dispatch-worker.yml",
+                "event": "issues",
+                "head_branch": "main",
+                "head_sha": "a".repeat(40),
+                "repository": {"full_name": REPOSITORY},
+                "head_repository": {"full_name": REPOSITORY},
+                "actor": {"login": "tjfontaine", "type": "User"},
+                "triggering_actor": {"login": "tjfontaine", "type": "User"}
+            }),
+        );
+        write_ep(
+            "issues/1410/comments",
+            &json!([{
+                "id": 300,
+                "html_url": format!("https://github.com/{REPOSITORY}/issues/1410#issuecomment-300"),
+                "user": {"login": "github-actions[bot]", "type": "Bot"},
+                "created_at": "2026-11-02T19:40:00Z",
+                "updated_at": "2026-11-02T19:40:00Z",
+                "body": format!(
+                    "Dispatch outcome: Blocked\nRound trigger: https://github.com/{REPOSITORY}/issues/1410#event-10\n\nCapacity probe timed out.\n\nDispatch run: https://github.com/{REPOSITORY}/actions/runs/41"
+                )
+            }]),
+        );
+        // The collaborator removed and re-applied `dispatch` at 20:05Z (#event-20).
+        write_ep(
+            "issues/1410/timeline",
+            &json!([
+                {
+                    "id": 10,
+                    "event": "labeled",
+                    "label": {"name": "dispatch"},
+                    "actor": {"login": "tjfontaine", "type": "User"},
+                    "created_at": "2026-11-02T19:33:00Z"
+                },
+                {
+                    "id": 15,
+                    "event": "unlabeled",
+                    "label": {"name": "dispatch"},
+                    "actor": {"login": &actor, "type": "User"},
+                    "created_at": "2026-11-02T20:04:55Z"
+                },
+                {
+                    "id": 20,
+                    "event": "labeled",
+                    "label": {"name": "dispatch"},
+                    "actor": {"login": &actor, "type": "User"},
+                    "created_at": "2026-11-02T20:05:00Z"
+                }
+            ]),
+        );
+        let relabel = json!({
+            "action": "labeled",
+            "label": {"name": "dispatch"},
+            "issue": issue,
+            "repository": {"full_name": REPOSITORY},
+            "sender": {"login": &actor, "type": "User"}
+        });
+        let event_path = fixture.join("event.json");
+        std::fs::write(&event_path, relabel.to_string()).unwrap();
+
+        let reset = |mode: &str| {
+            let _ = std::fs::remove_file(fixture.join("perm-calls"));
+            std::fs::write(fixture.join("perm-mode"), mode).unwrap();
+        };
+        let calls = || -> u32 {
+            std::fs::read_to_string(fixture.join("perm-calls"))
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0)
+        };
+
+        // 1. Clean relabel after Blocked first round: hosted guard and clone `--admit` succeed.
+        reset("ok");
+        let (_, hosted) = guard_admission(&repo, &event_path, false, || Ok(())).unwrap();
+        assert!(!hosted.resume);
+        assert_eq!(hosted.issue, 1410);
+        let (_, admitted) = guard_admission(&repo, &event_path, true, || Ok(())).unwrap();
+        assert_eq!(admitted.branch, "work/dispatch-1410-42");
+        assert!(!admitted.resume);
+        assert_eq!(admitted.continuation, Continuation::Owned);
+        let persisted = read_admission(&event_path).unwrap();
+        assert_eq!(
+            persisted.trigger["html_url"],
+            format!("https://github.com/{REPOSITORY}/issues/1410#event-20")
+        );
+
+        // 2. Transient 502 and TLS timeout on the permission lookup during `--admit` retry and admit.
+        for mode in ["transient-502", "transient-timeout"] {
+            reset(mode);
+            let (_, admitted) = guard_admission(&repo, &event_path, true, || Ok(()))
+                .unwrap_or_else(|e| panic!("{mode} refused trusted collaborator {actor}: {e}"));
+            assert_eq!(admitted.branch, "work/dispatch-1410-42");
+            assert_eq!(calls(), 2, "{mode} should succeed on second attempt");
+        }
+
+        // 3. Persistent 503 retries boundedly and reports lookup failure, never "untrusted" / "non-collaborator".
+        reset("always-503");
+        let err_503 = guard_admission(&repo, &event_path, true, || Ok(()))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(calls(), 3, "503 must stop after bounded retry budget");
+        assert!(
+            err_503.contains("collaborator permission lookup failed"),
+            "unexpected 503 error: {err_503}"
+        );
+        assert!(
+            !err_503.to_ascii_lowercase().contains("untrusted")
+                && !err_503.to_ascii_lowercase().contains("non-collaborator"),
+            "503 misreported as untrusted: {err_503}"
+        );
+
+        // 4. Non-transient 401 fails immediately without retrying and never reports "untrusted".
+        reset("always-401");
+        let err_401 = guard_admission(&repo, &event_path, true, || Ok(()))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(calls(), 1, "401 must not waste retries");
+        assert!(
+            err_401.contains("collaborator permission lookup failed")
+                && !err_401.to_ascii_lowercase().contains("untrusted"),
+            "unexpected 401 error: {err_401}"
+        );
+
+        // 5. Genuine 404 (not a collaborator) refuses without retrying as "untrusted event actor".
+        reset("not-found-404");
+        let err_404 = guard_admission(&repo, &event_path, true, || Ok(()))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(calls(), 1, "404 must not retry");
+        assert_eq!(err_404, "untrusted event actor");
+
+        // 6. Documented `/agent` comment on the Blocked-first-round issue also admits continuation.
+        reset("ok");
+        let comment = json!({
+            "id": 500,
+            "html_url": format!("https://github.com/{REPOSITORY}/issues/1410#issuecomment-500"),
+            "user": {"login": &actor, "type": "User"},
+            "body": "/agent retry after capacity probe timeout",
+            "created_at": "2026-11-02T20:06:00Z",
+            "updated_at": "2026-11-02T20:06:00Z"
+        });
+        write_ep("issues/comments/500", &comment);
+        let on_issue = json!({
+            "action": "created",
+            "comment": comment,
+            "issue": issue,
+            "repository": {"full_name": REPOSITORY},
+            "sender": {"login": &actor, "type": "User"}
+        });
+        std::fs::write(&event_path, on_issue.to_string()).unwrap();
+        let (_, admitted_comment) = guard_admission(&repo, &event_path, true, || Ok(())).unwrap();
+        assert_eq!(admitted_comment.branch, "work/dispatch-1410-42");
+        assert!(!admitted_comment.resume);
+    }
 }
+
