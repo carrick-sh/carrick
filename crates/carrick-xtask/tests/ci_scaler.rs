@@ -19,7 +19,7 @@ fn vm(id: u16, name: &str) -> Vm {
 
 #[test]
 fn clone_range_cannot_deserialize_protected_or_template_ids() {
-    for id in [105, 106, 210, 211, 299, 300, 307, 350] {
+    for id in [105, 106, 210, 211, 299, 300, 307, 350, 9501] {
         assert!(serde_json::from_str::<CloneId>(&id.to_string()).is_err());
     }
     for id in [308, 349] {
@@ -1871,6 +1871,55 @@ runuser() {{ printf '%s\n' "$@"; return {kvm_status}; }}
                 "carrick-dispatch-agent\n--\n/usr/local/bin/carrick-xtask\nci-scaler\nverify-kvm\n"
             ),
             checked
+        );
+    }
+}
+
+#[test]
+fn template_cleanup_refuses_timeout_unfinished_and_failed_guest_exec() {
+    let source = include_str!("../../../scripts/ci/build-template-debian.sh");
+    let start = source
+        .find("cleanup=$(timeout 120 qm guest exec")
+        .expect("bounded cleanup");
+    let end = source[start..]
+        .find("for ((attempt=0; attempt<60;")
+        .expect("shutdown poll")
+        + start;
+    for (transport, response, passes) in [
+        (124, r#"{"exited":1,"exitcode":0}"#, false),
+        (0, r#"{"exited":0}"#, false),
+        (0, r#"{"exited":1,"exitcode":1}"#, false),
+        (0, r#"{"exited":1,"exitcode":0}"#, true),
+        (0, r#"{"exited":true,"exitcode":0}"#, true),
+    ] {
+        let script = format!(
+            r#"set -euo pipefail
+template=9001
+timeout() {{
+  if [[ $1 == 120 && $2 == qm && $3 == guest ]]; then
+    printf '%s\n' '{response}'
+    return {transport}
+  fi
+  [[ "$*" == '320 qm shutdown 9001 --timeout 300' ]] || exit 99
+  echo graceful-shutdown
+}}
+{}
+"#,
+            &source[start..end]
+        );
+        let output = std::process::Command::new("bash")
+            .args(["-c", &script])
+            .output()
+            .expect("cleanup fixture");
+        assert_eq!(
+            output.status.success(),
+            passes,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).contains("graceful-shutdown"),
+            passes
         );
     }
 }

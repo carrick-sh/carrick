@@ -380,6 +380,28 @@ and `ci-scaler verify-kvm` **as `carrick-dispatch-agent`**, which opens
 `/dev/kvm` and verifies API 12. A failed qualification preserves the new VM
 for diagnosis and leaves the running source alone.
 
+The builder now refuses guest cleanup timeouts, unfinished commands and nonzero
+exit codes, then waits for `qm shutdown --timeout 300` before templating.
+It also runs `ci-scaler qualify-clone --template 9001` as root on Contabo.
+This reserves VMID **9501**, name `template-qualification-9501`, and address
+`10.77.0.152`, outside the controller range and pool. An occupied VMID or
+firewall file is refused; never delete either without checking its owner.
+The linked clone receives a fresh cloud-init identity, SSH key and per-clone
+ipfilter. It must pass the controller's five-minute guest readiness checks,
+non-root KVM checks, and SSH with an authenticated host key. Qualification
+rejects empty critical unit/executable files and ext4 journal recovery,
+reads the clone's `qualification.json`, and destroys the clone on success
+or failure. Failure diagnostics go to stderr; keep that log together with
+`clone-qualification.json`. Cleanup failure is itself a failed qualification.
+The base template remains available for diagnosis. The qualification command
+does not register a GitHub runner or exercise a dispatch job.
+
+Do not infer readiness from the base manifest alone. Before redeploying the
+controller, record the qualification result and before/after cutover notes
+on #231, then verify a real fresh dispatch job including runner registration.
+The 9001 readiness incident has not been diagnosed merely by adding this gate;
+collect clone cloud-init, network and service diagnostics on the PVE host.
+
 Before cutover, grant only source rights to both ACL principals:
 
 ```sh

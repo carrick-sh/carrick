@@ -17,6 +17,7 @@ pub(crate) use github::dispatch_workflow_unchanged;
 mod live;
 mod mac;
 pub(crate) mod mint;
+mod qualify_clone;
 mod site;
 mod template_retirement;
 
@@ -1166,6 +1167,11 @@ pub enum ScalerAction {
         #[arg(long)]
         template: u16,
     },
+    /// Boot and destroy an isolated linked clone before admitting a template.
+    QualifyClone {
+        #[arg(long)]
+        template: u16,
+    },
     /// Fail unless the calling (non-root runner) user can open KVM API 12.
     VerifyKvm,
     /// Runner job-start hook: authorize before any workflow step executes.
@@ -1256,6 +1262,7 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
             print!("{file}");
             Ok(())
         }
+        ScalerAction::QualifyClone { template } => qualify_clone::run(template),
         ScalerAction::CheckTemplateRetirement { template } => template_retirement::check(template),
         ScalerAction::VerifyKvm => verify_kvm(),
         ScalerAction::AdmitJob {
