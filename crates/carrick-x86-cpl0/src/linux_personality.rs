@@ -826,8 +826,8 @@ impl Personality for LinuxPersonality {
     fn handle_unrecognized_call(
         &mut self,
         frame: &mut NativeFrame,
-        task: &CurrentTask,
-        _binding: &CpuBinding,
+        _task: &CurrentTask,
+        binding: &CpuBinding,
         counters: &Counters,
     ) {
         evaluate_host_crossing(
@@ -838,7 +838,14 @@ impl Personality for LinuxPersonality {
             Some(&counters.refused),
             |ret| frame.rax = ret.raw() as u64,
         );
-        counters.record_child_refusal(512, task.visible_pid().is_some_and(|pid| pid != 1));
+        let slot = checked_scheduler_slot(carrick_guest_arch::CpuId::new(binding.cpu_slot))
+            .unwrap_or_else(|| fatal_boot());
+        let source = carrick_x86_carrier::native_execution::source(slot);
+        let child = source.zone.slot(slot).current().is_some_and(|record| {
+            native_process::registry()
+                .record_is_fork_child(source.zone, source.zone.record_ref(record))
+        });
+        counters.record_child_refusal(512, child);
     }
 
     fn dispatch(
@@ -1024,8 +1031,11 @@ impl Personality for LinuxPersonality {
             CompletionRoute::NativeService => {
                 let bucket = (call.native.raw().min(512)) as usize;
                 counters.refused[bucket].fetch_add(1, Ordering::Relaxed);
-                counters
-                    .record_child_refusal(bucket, task.visible_pid().is_some_and(|pid| pid != 1));
+                let child = source.zone.slot(slot).current().is_some_and(|record| {
+                    native_process::registry()
+                        .record_is_fork_child(source.zone, source.zone.record_ref(record))
+                });
+                counters.record_child_refusal(bucket, child);
                 frame.rax = carrick_syscall_abi::LINUX_ENOSYS.guest_retval() as u64;
                 ControlFlow::Return(())
             }

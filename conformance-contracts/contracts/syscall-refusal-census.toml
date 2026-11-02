@@ -6,7 +6,7 @@ semantic_authority = ["docs/conformance-contracts/syscall-refusal-census.md", "s
 fixture = "crates/carrick-el1-abi/src/refusal_census_tests.rs"
 scale_points = [1]
 structural_budgets = []
-rationale = "Ring refusal and carrier venue refusal are separate exact counters. The child population is a subset of its carrier total. Refusal hooks perform bounded atomic work; no clock reads are added to the default path. Publication scans 513 native ordinals once after executor join. Overflow, missing evidence and an unavailable oracle shape are incomplete measurements, never semantic passes."
+rationale = "Ring refusal and carrier venue refusal are separate exact counters. The child population is a subset of its carrier total. Refusal hooks classify the caller through its admitted owner only on refusal and increment atomic counters; no clock reads are added to the default path. Publication scans 513 native ordinals once after executor join. Overflow, missing evidence and an unavailable oracle shape are incomplete measurements, never semantic passes."
 
 [bindings]
 vm_free = [
@@ -16,6 +16,7 @@ vm_free = [
 ]
 embed = [
   "carrick-conformance-next::generic_probe_shard_0",
+  "carrick-vmm-kvm::cpl0_shared_entry::production_cpl0_refuses_non_allowlisted_forwards_with_enosys (KVM root census; does not qualify the AArch64 child mkdirat witness)",
 ]
 docker = [
   "scripts/bpftrace/oracle-served.bt",

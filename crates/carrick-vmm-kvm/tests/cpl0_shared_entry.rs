@@ -131,4 +131,16 @@ fn production_cpl0_refuses_non_allowlisted_forwards_with_enosys() {
         1
     );
     assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
+    let counters = outcome.physical.syscall_counters().expect("mapped census");
+    for nr in [101, 103] {
+        assert_eq!(
+            counters.refused[nr].load(core::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            counters.refused_child[nr].load(core::sync::atomic::Ordering::Relaxed),
+            0,
+            "the initial process is the graph root even when its visible PID is not 1"
+        );
+    }
 }

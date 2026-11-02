@@ -8,7 +8,9 @@ counting adds no thread-clock reads.
 
 `CARRICK_SYSCALL_CENSUS` on carrier stderr contains the full census. Its
 `refusal_evidence` uses native ordinals, an explicit ISA, and root/native-child
-populations. Ring refusals and carrier venue refusals remain separate. Bucket
+populations. Root identity comes from the admitted process graph, rather
+than assuming its visible PID is 1. Caller classification runs only when a
+refusal occurs. Ring refusals and carrier venue refusals remain separate. Bucket
 512 means unknown/out of range and cannot qualify. Carrier service payloads
 retain the requesting ordinal, including write/writev and execve/execveat;
 length and ordinal share the existing bounded service-cell word, preserving
@@ -43,3 +45,7 @@ The VM-free bindings prove counter preservation, caller splitting, overflow,
 wire transport and the gate's refusal override of otherwise passing output.
 They do not prove the live child mkdirat or cd/exec witness. Signed execution,
 Docker refresh and exact-artifact smoke remain required acceptance evidence.
+
+The KVM `production_cpl0_refuses_non_allowlisted_forwards_with_enosys`
+binding also checks mapped census counts for the initial process with a
+non-1 visible PID. Both refused ordinals belong to the root population.
