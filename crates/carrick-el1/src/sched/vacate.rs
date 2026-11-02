@@ -1,6 +1,7 @@
 //! The idle-exit seal and its sole constructor. Sibling scheduler modules
 //! cannot manufacture the proof without performing the leave transition.
-use super::{SlotId, ThreadCpu, ZoneTables};
+use crate::substrate::sched::ThreadCpu;
+use carrick_el1_abi::{SlotId, ZoneTables};
 
 /// Leave a process's translations before releasing its installed occupancy.
 /// Service handoffs, scheduler idling and every idle exit to the host
