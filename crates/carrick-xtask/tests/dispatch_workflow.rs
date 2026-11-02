@@ -274,11 +274,68 @@ fn review_workflow_pins_main_and_orders_the_loop() {
             .position(|s| s["id"].as_str() == Some(id))
             .unwrap()
     };
-    assert!(position("admission") < position("loop") && position("loop") < position("retire"));
+    assert_eq!(
+        steps[position("bootstrap")]["name"].as_str(),
+        Some("Bootstrap pinned agent tools and private foreground launcher")
+    );
+    assert_eq!(
+        steps[position("auth")]["name"].as_str(),
+        Some("Materialize available worker and loop credentials")
+    );
+    let loop_if = steps[position("loop")]["if"].as_str().unwrap();
+    assert!(
+        loop_if.contains("steps.bootstrap.outcome == 'success'")
+            && loop_if.contains("steps.auth.outcome == 'success'"),
+        "loop step must not start when bootstrap or auth failed: {loop_if}"
+    );
+    let setup_failure = position("setup_failure");
+    assert!(
+        position("admission") < position("loop")
+            && position("loop") < setup_failure
+            && setup_failure < position("retire")
+    );
+    let setup_if = steps[setup_failure]["if"].as_str().unwrap();
+    assert!(
+        setup_if.contains("steps.driver.outcome == 'success'")
+            && setup_if.contains("steps.admission.outcome == 'success'")
+            && setup_if.contains(
+                "(steps.bootstrap.outcome != 'success' || steps.auth.outcome != 'success')"
+            ),
+        "unexpected setup_failure condition: {setup_if}"
+    );
+    assert_eq!(steps[setup_failure]["env"].as_hash().unwrap().len(), 1);
+    assert_eq!(
+        steps[setup_failure]["env"]["GH_TOKEN"].as_str(),
+        Some("${{ github.token }}")
+    );
+    assert!(
+        !steps[setup_failure]["run"]
+            .as_str()
+            .unwrap()
+            .contains("host-lease"),
+        "setup failure report must not wait on the VM gate lease"
+    );
+    let upload_if = steps[position("upload")]["if"].as_str().unwrap();
+    assert!(
+        upload_if.contains("steps.setup_failure.outputs.artifacts_ready == 'true'")
+            && upload_if.contains("steps.setup_failure.outcome == 'failure'"),
+        "setup failure artifacts must upload when scanned: {upload_if}"
+    );
+    let verdict = steps
+        .iter()
+        .find(|s| s["name"].as_str() == Some("Reflect the worker contract in the job verdict"))
+        .unwrap();
+    assert!(
+        verdict["if"]
+            .as_str()
+            .unwrap()
+            .contains("steps.setup_failure.outputs.worker_failed == 'true'")
+    );
     for s in steps {
         if !s["env"]["GH_TOKEN"].is_badvalue() {
             assert!(
-                ["bootstrap", "admission", "loop"].contains(&s["id"].as_str().unwrap_or(""))
+                ["bootstrap", "admission", "loop", "setup_failure"]
+                    .contains(&s["id"].as_str().unwrap_or(""))
                     || s["name"].as_str() == Some("Mask the job token before agent execution")
             );
         }
@@ -598,6 +655,17 @@ fi
     );
     let report = std::fs::read_to_string(temp.path().join("posted.md")).unwrap();
     assert!(report.contains("Dispatch outcome: Failed"));
+    assert!(
+        report.contains(
+            "Server observed: bootstrap failed: Bootstrap pinned agent tools and private foreground launcher."
+        ),
+        "{report}"
+    );
+    assert!(
+        !report.contains("coordinator stopped")
+            && !report.contains("loop bootstrap/auth did not complete"),
+        "{report}"
+    );
     assert!(report.contains("Worker was not invoked"));
     assert!(report.contains("\"calls\":0"));
     assert!(
@@ -647,6 +715,25 @@ fi
     assert_eq!(
         std::fs::metadata(credential).unwrap().permissions().mode() & 0o777,
         0o600
+    );
+    let auth_failed = invoke(&[
+        "dispatch-worker",
+        "loop",
+        "--setup-status",
+        "success/failure",
+        "--event",
+    ]);
+    assert!(!auth_failed.status.success());
+    let auth_report = std::fs::read_to_string(temp.path().join("posted.md")).unwrap();
+    assert!(
+        auth_report.contains(
+            "Server observed: bootstrap failed: Materialize available worker and loop credentials."
+        ),
+        "{auth_report}"
+    );
+    assert!(
+        !auth_report.contains("coordinator stopped"),
+        "{auth_report}"
     );
 }
 

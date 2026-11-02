@@ -62,13 +62,49 @@ fn valid_roster(models: &[String]) -> bool {
         })
 }
 
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const BOOTSTRAP_BUDGET: std::time::Duration = std::time::Duration::from_secs(9 * 60);
+const FETCH_ATTEMPTS: usize = 2;
+
+struct BootstrapEnv<'a> {
+    state: PathBuf,
+    github_path: PathBuf,
+    path_env: Option<&'a std::ffi::OsStr>,
+    manifest: &'a str,
+    fetch_timeout: std::time::Duration,
+    deadline: std::time::Instant,
+}
+
+fn is_fetch_timeout(error: &ScalerError) -> bool {
+    let ScalerError::CommandFailed(detail) = error else {
+        return false;
+    };
+    let reason = detail.split("; stderr: ").next().unwrap_or(detail);
+    reason.contains(" timed out after ") || reason == "curl exited with code 28"
+}
+
+fn fetch_limit(
+    deadline: std::time::Instant,
+    fetch_timeout: std::time::Duration,
+) -> Result<std::time::Duration, ScalerError> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(ScalerError::Guard(
+            "host/infra: bootstrap fetch time budget exhausted",
+        ));
+    }
+    Ok(fetch_timeout.min(remaining))
+}
+
 /// Run a bootstrap command. No inherited GitHub token reaches it; only the
 /// launcher fetch gets the controller-minted `launcher` token (#1034).
-fn invoke(
+fn run_command(
     dir: &Path,
     program: &str,
     args: &[&str],
     launcher: Option<&AppToken>,
+    path_env: Option<&std::ffi::OsStr>,
+    timeout: std::time::Duration,
 ) -> Result<(), ScalerError> {
     let mut command = if program == "git" {
         crate::dispatch_worker::git_invocation(dir, args)
@@ -77,18 +113,81 @@ fn invoke(
         command.args(args).current_dir(dir);
         command
     };
+    if let Some(path) = path_env {
+        command.env("PATH", path);
+    }
     command.env_remove("GH_TOKEN").env_remove("GITHUB_TOKEN");
     if let Some(token) = launcher {
         command.env("GH_TOKEN", token.secret());
     }
-    let result = execute(&mut command, &[], std::time::Duration::from_secs(120));
-    if let Err(error) = result {
+    execute(&mut command, &[], timeout).map(|_| ())
+}
+
+fn invoke(
+    dir: &Path,
+    program: &str,
+    args: &[&str],
+    launcher: Option<&AppToken>,
+    path_env: Option<&std::ffi::OsStr>,
+    timeout: std::time::Duration,
+) -> Result<(), ScalerError> {
+    if let Err(error) = run_command(dir, program, args, launcher, path_env, timeout) {
         if let Some(token) = launcher {
-            return Err(check_token(dir, token).err().unwrap_or(error));
+            return Err(check_token(dir, token, path_env).err().unwrap_or(error));
         }
         return Err(error);
     }
     Ok(())
+}
+
+/// Retry a timed-out bootstrap network fetch once within `env.deadline` (#1457).
+/// Non-timeout failures stop immediately; `check_token` runs only after the
+/// final attempt fails.
+fn retry_fetch(
+    label: &str,
+    env: &BootstrapEnv<'_>,
+    check_dir: &Path,
+    launcher: Option<&AppToken>,
+    mut attempt_fn: impl FnMut(usize, std::time::Duration) -> Result<(), ScalerError>,
+) -> Result<(), ScalerError> {
+    for attempt in 0..FETCH_ATTEMPTS {
+        let limit = fetch_limit(env.deadline, env.fetch_timeout)?;
+        match attempt_fn(attempt, limit) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let remaining = env
+                    .deadline
+                    .saturating_duration_since(std::time::Instant::now());
+                let timed_out = is_fetch_timeout(&error);
+                if attempt + 1 < FETCH_ATTEMPTS && timed_out && !remaining.is_zero() {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "bootstrap: {label} timed out; retrying once ({}s budget remaining)",
+                        remaining.as_secs()
+                    );
+                    continue;
+                }
+                let error = match error {
+                    ScalerError::CommandFailed(detail) if attempt > 0 => {
+                        ScalerError::CommandFailed(format!("{detail} (after 1 retry)"))
+                    }
+                    ScalerError::CommandFailed(detail) if timed_out && remaining.is_zero() => {
+                        ScalerError::CommandFailed(format!(
+                            "{detail} (bootstrap fetch time budget exhausted before retry)"
+                        ))
+                    }
+                    other => other,
+                };
+                if let Some(token) = launcher {
+                    return Err(check_token(check_dir, token, env.path_env)
+                        .err()
+                        .unwrap_or(error));
+                }
+                return Err(error);
+            }
+        }
+    }
+    Err(ScalerError::Guard("bootstrap fetch attempts exhausted"))
 }
 
 /// The launcher token, minted by the ctb controller for this job. A refusal
@@ -104,7 +203,11 @@ fn launcher_token(
     })
 }
 
-fn check_token(root: &Path, token: &AppToken) -> Result<(), ScalerError> {
+fn check_token(
+    root: &Path,
+    token: &AppToken,
+    path_env: Option<&std::ffi::OsStr>,
+) -> Result<(), ScalerError> {
     let repository = "carrick-sh/agy-director";
     let message = "host/infra: controller-minted bootstrap token rejected or expired, or GitHub access unavailable; bootstrap requires read access to the private launcher repository";
     let mut command = std::process::Command::new("gh");
@@ -113,6 +216,9 @@ fn check_token(root: &Path, token: &AppToken) -> Result<(), ScalerError> {
         .current_dir(root)
         .env_remove("GITHUB_TOKEN")
         .env("GH_TOKEN", token.secret());
+    if let Some(path) = path_env {
+        command.env("PATH", path);
+    }
     execute(
         &mut command,
         &[],
@@ -354,14 +460,30 @@ fn bootstrap(
     // Mint first, before any state or download, and before `remember` so the
     // token is in this job's redaction set.
     let launcher = launcher_token(mint)?;
-    let state = state()?;
-    private_dir(&state)?;
-    crate::dispatch_redaction::remember()?;
-    let bin = state.join("bin");
+    let env = BootstrapEnv {
+        state: state()?,
+        github_path: PathBuf::from(
+            std::env::var_os("GITHUB_PATH").ok_or(ScalerError::Guard("missing GITHUB_PATH"))?,
+        ),
+        path_env: None,
+        manifest: include_str!("../../../scripts/ci/inputs/agent-tools.json"),
+        fetch_timeout: FETCH_TIMEOUT,
+        deadline: std::time::Instant::now() + BOOTSTRAP_BUDGET.min(job_remaining(80)?),
+    };
+    bootstrap_with_env(root, &launcher, &env)
+}
+
+fn bootstrap_with_env(
+    root: &Path,
+    launcher: &AppToken,
+    env: &BootstrapEnv<'_>,
+) -> Result<(), ScalerError> {
+    private_dir(&env.state)?;
+    crate::dispatch_redaction::remember_in(&env.state)?;
+    let bin = env.state.join("bin");
     private_dir(&bin)?;
-    private_dir(&state.join("home"))?;
-    let manifest: Manifest =
-        serde_json::from_str(include_str!("../../../scripts/ci/inputs/agent-tools.json"))?;
+    private_dir(&env.state.join("home"))?;
+    let manifest: Manifest = serde_json::from_str(env.manifest)?;
     if manifest.director_repository != "carrick-sh/agy-director"
         || manifest.director_sha.len() != 40
         || !manifest.director_sha.bytes().all(|b| b.is_ascii_hexdigit())
@@ -380,59 +502,94 @@ fn bootstrap(
         if !matches!(tool.name.as_str(), "agy" | "just") || !tool.url.starts_with("https://") {
             return Err(ScalerError::Guard("invalid pinned agent tool"));
         }
-        let archive = state.join(format!("{}.tar.gz", tool.name));
-        invoke(
-            root,
-            "curl",
-            &[
-                "--fail",
-                "--silent",
-                "--show-error",
-                "--location",
-                "--proto",
-                "=https",
-                "--tlsv1.2",
-                "--max-time",
-                "110",
-                "--output",
-                archive
-                    .to_str()
-                    .ok_or(ScalerError::Guard("non-UTF8 runner path"))?,
-                &tool.url,
-            ],
-            None,
-        )?;
+        let archive = env.state.join(format!("{}.tar.gz", tool.name));
+        let label = format!("tool {}", tool.name);
+        retry_fetch(&label, env, root, None, |attempt, limit| {
+            if attempt > 0 {
+                match std::fs::remove_file(&archive) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            let max_time = limit.as_secs().saturating_sub(10).max(1).to_string();
+            run_command(
+                root,
+                "curl",
+                &[
+                    "--fail",
+                    "--silent",
+                    "--show-error",
+                    "--location",
+                    "--proto",
+                    "=https",
+                    "--tlsv1.2",
+                    "--max-time",
+                    &max_time,
+                    "--output",
+                    archive
+                        .to_str()
+                        .ok_or(ScalerError::Guard("non-UTF8 runner path"))?,
+                    &tool.url,
+                ],
+                None,
+                env.path_env,
+                limit,
+            )
+        })?;
         extract(tool, &archive, &bin)?;
         std::fs::remove_file(archive)?;
     }
     // Cargo's repository toolchain selection installs rust-toolchain.toml before
     // this driver is built. The workflow caches tools, never the isolated home.
-    invoke(root, "rustup", &["show", "active-toolchain"], None)?;
-    let director = state.join("director");
-    private_dir(&director)?;
-    invoke(&director, "git", &["init"], None)?;
     invoke(
-        &director,
-        "git",
-        &[
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "credential.helper=!gh auth git-credential",
-            "fetch",
-            "--depth=1",
-            "https://github.com/carrick-sh/agy-director",
-            &manifest.director_sha,
-        ],
-        Some(&launcher),
+        root,
+        "rustup",
+        &["show", "active-toolchain"],
+        None,
+        env.path_env,
+        fetch_limit(env.deadline, env.fetch_timeout)?,
+    )?;
+    let director = env.state.join("director");
+    retry_fetch(
+        "launcher repository",
+        env,
+        root,
+        Some(launcher),
+        |attempt, limit| {
+            if attempt > 0 && director.exists() {
+                std::fs::remove_dir_all(&director)?;
+            }
+            private_dir(&director)?;
+            run_command(&director, "git", &["init"], None, env.path_env, limit)?;
+            run_command(
+                &director,
+                "git",
+                &[
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "core.fsmonitor=false",
+                    "-c",
+                    "credential.helper=!gh auth git-credential",
+                    "fetch",
+                    "--depth=1",
+                    "https://github.com/carrick-sh/agy-director",
+                    &manifest.director_sha,
+                ],
+                Some(launcher),
+                env.path_env,
+                limit,
+            )
+        },
     )?;
     invoke(
         &director,
         "git",
         &["checkout", "--detach", "FETCH_HEAD"],
         None,
+        env.path_env,
+        fetch_limit(env.deadline, env.fetch_timeout)?,
     )?;
     // Copied with the launcher into every model account (`AGY_MODELS_SEED`).
     std::fs::write(
@@ -441,7 +598,7 @@ fn bootstrap(
     )?;
     let mut paths = std::fs::OpenOptions::new()
         .append(true)
-        .open(std::env::var_os("GITHUB_PATH").ok_or(ScalerError::Guard("missing GITHUB_PATH"))?)?;
+        .open(&env.github_path)?;
     writeln!(paths, "{}", bin.display())?;
     Ok(())
 }
@@ -510,7 +667,7 @@ pub fn run(root: &Path, args: Args) -> Result<(), ScalerError> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     #[test]
     fn runner_wrapper_configuration_never_reaches_agent_cargo() {
@@ -730,6 +887,295 @@ printf '%s\n%s\n' "$CARGO_HOME" "$RUSTUP_HOME"
         assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
         assert!(secret_file(&path, b"replace").is_err());
         assert_eq!(std::fs::read(path).unwrap(), b"opaque");
+    }
+
+    struct BootstrapFixture {
+        temp: tempfile::TempDir,
+        bin: PathBuf,
+        manifest: String,
+    }
+    impl BootstrapFixture {
+        fn new(curl_mode: &str, git_mode: &str) -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let bin = temp.path().join("fake-bin");
+            std::fs::create_dir(&bin).unwrap();
+            let archives = temp.path().join("archives");
+            std::fs::create_dir(&archives).unwrap();
+            let mut tools = Vec::new();
+            for (name, member) in [("agy", "agy"), ("just", "just")] {
+                let archive = archives.join(format!("{name}.tar.gz"));
+                let encoder = flate2::write::GzEncoder::new(
+                    std::fs::File::create(&archive).unwrap(),
+                    flate2::Compression::default(),
+                );
+                let mut tar = tar::Builder::new(encoder);
+                let payload = format!("pinned-{name}");
+                let mut header = tar::Header::new_gnu();
+                header.set_size(payload.len() as u64);
+                header.set_mode(0o700);
+                header.set_cksum();
+                tar.append_data(&mut header, member, payload.as_bytes())
+                    .unwrap();
+                tar.into_inner().unwrap().finish().unwrap();
+                let sha256 = crate::provision::compute_sha256(&archive).unwrap();
+                tools.push(serde_json::json!({
+                    "name": name,
+                    "url": format!("https://fixture.invalid/{name}.tar.gz"),
+                    "sha256": sha256,
+                    "member": member,
+                }));
+            }
+            let remote = temp.path().join("remote-director");
+            std::fs::create_dir(&remote).unwrap();
+            let run_git = |args: &[&str]| {
+                let out = crate::safe_copy::git_command(&remote, args)
+                    .current_dir(&remote)
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "{args:?}: {out:?}");
+                String::from_utf8(out.stdout).unwrap().trim().to_owned()
+            };
+            run_git(&["init", "-q"]);
+            std::fs::write(remote.join("agy_worker.py"), "#!/usr/bin/env python3\n").unwrap();
+            run_git(&["add", "agy_worker.py"]);
+            run_git(&["commit", "-q", "-m", "pin"]);
+            let director_sha = run_git(&["rev-parse", "HEAD"]);
+            let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+            let manifest = serde_json::json!({
+                "director_repository": "carrick-sh/agy-director",
+                "director_sha": director_sha,
+                "agy_models_seed": ["gemini-4-argon-high"],
+                "platforms": { platform: tools },
+            })
+            .to_string();
+            crate::lock_file::tests::write_test_executable(
+                bin.join("rustup"),
+                b"#!/bin/sh\ntest \"$1 $2\" = 'show active-toolchain'\n",
+                std::fs::Permissions::from_mode(0o700),
+            );
+            crate::lock_file::tests::write_test_executable(
+                bin.join("gh"),
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '{{\"full_name\":\"carrick-sh/agy-director\"}}\\n'\n",
+                    temp.path().join("gh.calls").display()
+                ),
+                std::fs::Permissions::from_mode(0o700),
+            );
+            crate::lock_file::tests::write_test_executable(
+                bin.join("curl"),
+                format!(
+                    r#"#!/bin/sh
+set -eu
+out=''
+url=''
+prev=''
+for arg do
+  if [ "$prev" = --output ]; then out="$arg"; fi
+  prev="$arg"
+  url="$arg"
+done
+name=$(basename "$url" .tar.gz)
+count_file='{root}/curl.'"$name"'.attempts'
+n=0
+if [ -f "$count_file" ]; then n=$(cat "$count_file"); fi
+n=$((n + 1))
+printf '%s' "$n" > "$count_file"
+if [ "$name" = agy ]; then
+  case '{curl_mode}' in
+    exit28_once)
+      if [ "$n" -eq 1 ]; then
+        printf 'partial' > "$out"
+        echo 'curl: (28) Operation timed out' >&2
+        exit 28
+      fi
+      ;;
+    hang_once)
+      if [ "$n" -eq 1 ]; then
+        printf 'partial' > "$out"
+        sleep 5
+      fi
+      ;;
+    http_fail)
+      echo 'curl: (22) The requested URL returned error: 503' >&2
+      exit 22
+      ;;
+  esac
+fi
+cp '{archives}/'"$name"'.tar.gz' "$out"
+"#,
+                    root = temp.path().display(),
+                    archives = archives.display(),
+                ),
+                std::fs::Permissions::from_mode(0o700),
+            );
+            crate::lock_file::tests::write_test_executable(
+                bin.join("git"),
+                format!(
+                    r#"#!/bin/sh
+set -eu
+is_fetch=0
+for arg do
+  if [ "$arg" = fetch ]; then is_fetch=1; fi
+done
+if [ "$is_fetch" -eq 0 ]; then
+  exec /usr/bin/git "$@"
+fi
+if [ -e .git/shallow.lock ]; then
+  echo 'fatal: shallow.lock left behind by killed fetch' >&2
+  exit 95
+fi
+count_file='{root}/git-fetch.attempts'
+n=0
+if [ -f "$count_file" ]; then n=$(cat "$count_file"); fi
+n=$((n + 1))
+printf '%s' "$n" > "$count_file"
+case '{git_mode}' in
+  hang_once)
+    if [ "$n" -eq 1 ]; then
+      : > .git/shallow.lock
+      sleep 5
+    fi
+    ;;
+  hang_always)
+    : > .git/shallow.lock
+    sleep 5
+    ;;
+  fatal_once)
+    echo 'fatal: remote error (timed out after 5ms in untrusted text)' >&2
+    exit 128
+    ;;
+esac
+exec /usr/bin/git -c protocol.file.allow=always fetch --depth=1 '{remote}' '{sha}'
+"#,
+                    root = temp.path().display(),
+                    remote = remote.display(),
+                    sha = director_sha,
+                ),
+                std::fs::Permissions::from_mode(0o700),
+            );
+            Self {
+                temp,
+                bin,
+                manifest,
+            }
+        }
+        fn run(
+            &self,
+            run_name: &str,
+            fetch_timeout: std::time::Duration,
+            budget: std::time::Duration,
+        ) -> Result<PathBuf, ScalerError> {
+            let state = self.temp.path().join(run_name);
+            let github_path = self.temp.path().join(format!("{run_name}.path"));
+            std::fs::write(&github_path, "").unwrap();
+            let path = std::ffi::OsString::from(format!("{}:/usr/bin:/bin", self.bin.display()));
+            let env = BootstrapEnv {
+                state: state.clone(),
+                github_path,
+                path_env: Some(path.as_os_str()),
+                manifest: &self.manifest,
+                fetch_timeout,
+                deadline: std::time::Instant::now() + budget,
+            };
+            let token = AppToken::for_test("ghs_launcherFixture0123");
+            bootstrap_with_env(self.temp.path(), &token, &env)?;
+            Ok(state)
+        }
+        fn count(&self, file: &str) -> usize {
+            std::fs::read_to_string(self.temp.path().join(file))
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0)
+        }
+    }
+
+    #[test]
+    fn bootstrap_retries_timed_out_fetches_once_within_budget() {
+        use std::time::Duration;
+        // 1. Timed-out git fetch (leaving .git/shallow.lock) and timed-out curl
+        // each retry once, clean partial state, and install tools + launcher.
+        let ok = BootstrapFixture::new("exit28_once", "hang_once");
+        let state = ok
+            .run(
+                "retry-ok",
+                Duration::from_millis(250),
+                Duration::from_secs(5),
+            )
+            .expect("single timeout on curl and git fetch should recover on retry");
+        assert_eq!(ok.count("curl.agy.attempts"), 2);
+        assert_eq!(ok.count("curl.just.attempts"), 1);
+        assert_eq!(ok.count("git-fetch.attempts"), 2);
+        assert!(
+            !ok.temp.path().join("gh.calls").exists(),
+            "recoverable first-attempt timeout must not probe check_token before retry"
+        );
+        assert_eq!(std::fs::read(state.join("bin/agy")).unwrap(), b"pinned-agy");
+        assert!(state.join("director/agy_worker.py").is_file());
+        assert!(state.join("director").join(MODELS_SEED).is_file());
+
+        // 2. Hanging curl killed by execute() also retries once and succeeds.
+        let curl_hang = BootstrapFixture::new("hang_once", "ok");
+        curl_hang
+            .run(
+                "curl-hang",
+                Duration::from_millis(250),
+                Duration::from_secs(5),
+            )
+            .expect("killed hanging curl should retry once");
+        assert_eq!(curl_hang.count("curl.agy.attempts"), 2);
+
+        // 3. Two consecutive git fetch timeouts stop after one retry (2 attempts).
+        let twice = BootstrapFixture::new("ok", "hang_always");
+        let err = twice
+            .run(
+                "hang-twice",
+                Duration::from_millis(200),
+                Duration::from_secs(5),
+            )
+            .unwrap_err()
+            .to_string();
+        assert_eq!(twice.count("git-fetch.attempts"), 2);
+        assert!(err.contains("git timed out after"), "{err}");
+
+        // 4. Non-timeout failures never retry, even if stderr mentions "timed out after".
+        let git_fatal = BootstrapFixture::new("ok", "fatal_once");
+        let err = git_fatal
+            .run(
+                "git-fatal",
+                Duration::from_millis(250),
+                Duration::from_secs(5),
+            )
+            .unwrap_err()
+            .to_string();
+        assert_eq!(git_fatal.count("git-fetch.attempts"), 1);
+        assert!(err.contains("git exited with code 128"), "{err}");
+
+        let curl_http = BootstrapFixture::new("http_fail", "ok");
+        let err = curl_http
+            .run(
+                "curl-http",
+                Duration::from_millis(250),
+                Duration::from_secs(5),
+            )
+            .unwrap_err()
+            .to_string();
+        assert_eq!(curl_http.count("curl.agy.attempts"), 1);
+        assert!(err.contains("curl exited with code 22"), "{err}");
+
+        // 5. Overall bootstrap budget bounds retries: when attempt 1 consumes the
+        // entire budget, no second attempt starts.
+        let exhausted = BootstrapFixture::new("ok", "hang_once");
+        let started = std::time::Instant::now();
+        let err = exhausted
+            .run(
+                "budget-exhausted",
+                Duration::from_millis(300),
+                Duration::from_millis(220),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(exhausted.count("git-fetch.attempts"), 1, "{err}");
     }
 }
 

@@ -1832,7 +1832,12 @@ impl Server<'_> {
         let applied = Applied::load()?;
         self.pr = applied.publication_pr.or(self.pr);
         let manual_repair = applied.manual_repair.clone();
+        let setup_failed =
+            setup_failure_step(self.setup).map(|step| format!("bootstrap failed: {step}"));
         let mut observations = Vec::new();
+        if let Some(reason) = setup_failed.as_deref() {
+            observations.push(reason);
+        }
         let last_failed = self.used.workers > 0
             && self
                 .history
@@ -3493,7 +3498,7 @@ fn fallback_reason(
         .err()
         .map(|e| e.to_string())
         .unwrap_or_else(|| "Loop exited without calling finish".into());
-    if used.calls != 0 || ended.contains("timed out") {
+    if used.calls != 0 || ended.contains("timed out") || ended.contains("bootstrap failed: ") {
         return ended;
     }
     // Only the pinned launcher's own diagnostic line is quoted; the rest of
@@ -3511,6 +3516,35 @@ fn fallback_reason(
     format!(
         "Infrastructure failure: the coordinator stopped before its first tool call, so no work was attempted ({ended}).{launcher} This says nothing about the requested work; the round can be rerun once the launcher is healthy."
     )
+}
+const BOOTSTRAP_STEP: &str = "Bootstrap pinned agent tools and private foreground launcher";
+const AUTH_STEP: &str = "Materialize available worker and loop credentials";
+
+fn setup_failure_step(setup: &str) -> Option<String> {
+    if setup == "success/success" {
+        return None;
+    }
+    let step_label = |name: &str, outcome: &str| {
+        if outcome == "failure" {
+            name.to_owned()
+        } else {
+            format!("{name} ({outcome})")
+        }
+    };
+    match setup.split_once('/') {
+        Some((bootstrap, _)) if bootstrap != "success" => {
+            Some(step_label(BOOTSTRAP_STEP, bootstrap))
+        }
+        Some(("success", auth)) => Some(step_label(AUTH_STEP, auth)),
+        _ => Some(setup.to_owned()),
+    }
+}
+
+fn setup_failure_reason(setup: &str) -> Option<String> {
+    let step = setup_failure_step(setup)?;
+    Some(format!(
+        "Infrastructure failure: bootstrap failed: {step}; the loop did not start and no work was attempted. This says nothing about the requested work; the round can be rerun."
+    ))
 }
 fn loop_completion(code: Result<i32, std::io::Error>, finished: bool) -> Result<(), ScalerError> {
     match (code?, finished) {
@@ -3646,10 +3680,17 @@ pub(super) fn run(root: &Path, event_path: &Path, setup: &str) -> Result<(), Sca
     // still reaches this round; minus what earlier rounds handled.
     let (since, handled, owed) = mailbox_opening(root, &threads, &since);
     super::round_inbox::start(root, threads, trigger_url, &since, handled, owed);
+    if let Some(reason) = setup_failure_reason(setup) {
+        let _final_commands = CommandWindow::until(final_deadline);
+        server.outcome(ContractStatus::Failed, &reason)?;
+        return Err(ScalerError::Guard(
+            "bootstrap failed; fallback outcome posted",
+        ));
+    }
     let result = (|| -> Result<(), ScalerError> {
         let commands = CommandWindow::until(server.deadline);
-        if setup != "success/success" {
-            return Err(ScalerError::Guard("loop bootstrap/auth did not complete"));
+        if setup_failure_step(setup).is_some() {
+            return Err(ScalerError::Guard("bootstrap failed: loop must not start"));
         }
         seal_runner(root)?;
         cleanup_agent_user()?;
@@ -7179,6 +7220,37 @@ exec /usr/bin/git "$@"
         assert_eq!(
             fallback_reason(&used, &exited, None),
             "Finish outcome post failed; server fallback."
+        );
+    }
+    #[test]
+    fn bootstrap_failure_names_the_failed_step_instead_of_a_stopped_coordinator() {
+        assert_eq!(setup_failure_step("success/success"), None);
+        assert_eq!(
+            setup_failure_step("failure/skipped").as_deref(),
+            Some("Bootstrap pinned agent tools and private foreground launcher")
+        );
+        assert_eq!(
+            setup_failure_step("success/failure").as_deref(),
+            Some("Materialize available worker and loop credentials")
+        );
+        assert_eq!(
+            setup_failure_step("success/skipped").as_deref(),
+            Some("Materialize available worker and loop credentials (skipped)")
+        );
+        let reason = setup_failure_reason("failure/skipped").unwrap();
+        assert!(
+            reason.contains(
+                "bootstrap failed: Bootstrap pinned agent tools and private foreground launcher"
+            ) && reason.contains("the loop did not start")
+                && !reason.contains("coordinator stopped"),
+            "{reason}"
+        );
+        let guard: Result<(), ScalerError> =
+            Err(ScalerError::Guard("bootstrap failed: loop must not start"));
+        let fallback = fallback_reason(&Used::default(), &guard, None);
+        assert!(
+            fallback.contains("bootstrap failed: ") && !fallback.contains("coordinator stopped"),
+            "{fallback}"
         );
     }
     #[test]

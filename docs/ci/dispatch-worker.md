@@ -441,7 +441,10 @@ with a `bootstrap` App token that the ctb controller mints on demand, like
 publish and board tokens (#1034). Its fixed grant is `contents: read` on that
 one repository, one mint per job, held in the controller ledger and revoked
 when the clone is reaped. A refused or unanswered request fails bootstrap; no
-other token is tried. The workflow provisions every available
+other token is tried. Each bootstrap network fetch (`curl` for pinned tools and
+`git fetch` for the pinned launcher) is bounded at 120 seconds inside a
+9-minute bootstrap budget and retried once on timeout after cleaning partial
+state before failing the step (#1457). The workflow provisions every available
 worker credential: `CODEX_AUTH_JSON` and `AGY_OAUTH_TOKEN`. Worker-private homes
 contain only the selected backend’s credential subtree. The runner-private
 capacity-query home retains both; the separate loop home holds only agy auth.
@@ -557,7 +560,11 @@ Blocked with those facts (#1215: a rebase round once reported Done on a PR
 108 commits behind and in conflict). Otherwise the coordinator's own
 judgement stands, so answer-only and review-only rounds can still be done.
 
-When the coordinator ends without `finish` before its first tool call, the
+The `loop` step runs only when both `bootstrap` and `auth` succeeded; when
+either failed, `setup_failure` posts a Failed outcome reporting
+`bootstrap failed: <step>` without acquiring the VM gate lease or starting the
+coordinator (#1457). When the coordinator itself starts and ends without
+`finish` before its first tool call, the
 fallback outcome says it is an infrastructure failure: no work was
 attempted, so it says nothing about the requested work. Only the pinned
 launcher's own `agy-worker:` diagnostic line is quoted; the rest of its

@@ -55,6 +55,9 @@ impl DiagnosticSecrets {
     }
     /// Capture once before agent execution, never from agent-modified state.
     pub(crate) fn capture() -> Result<Self, ScalerError> {
+        Self::capture_in(crate::agent_runner::state().ok().as_deref())
+    }
+    fn capture_in(state: Option<&std::path::Path>) -> Result<Self, ScalerError> {
         let mut gate = Self { secrets: vec![] };
         for key in [
             "GH_TOKEN",
@@ -71,7 +74,7 @@ impl DiagnosticSecrets {
         for value in crate::dispatch_mint::minted_secrets() {
             gate.add(&value);
         }
-        if let Ok(state) = crate::agent_runner::state() {
+        if let Some(state) = state {
             for path in [
                 "redaction-secrets.json",
                 "home/.codex/auth.json",
@@ -153,8 +156,11 @@ fn token_shape(bytes: &[u8], prefix: &[u8], jwt: bool) -> bool {
 }
 /// Persist earlier-step secrets outside artifacts; the run captures them once.
 pub(crate) fn remember() -> Result<(), ScalerError> {
-    let gate = DiagnosticSecrets::capture()?;
-    let path = crate::agent_runner::state()?.join("redaction-secrets.json");
+    remember_in(&crate::agent_runner::state()?)
+}
+pub(crate) fn remember_in(state: &std::path::Path) -> Result<(), ScalerError> {
+    let gate = DiagnosticSecrets::capture_in(Some(state))?;
+    let path = state.join("redaction-secrets.json");
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(true)
