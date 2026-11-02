@@ -1033,10 +1033,14 @@ fn worker_prompt(dispatch: &Dispatch) -> String {
 /// runtime"). The capacity report that admitted this worker already listed
 /// the live roster, so the launcher gets it as `CODEX_MODELS` and resolves
 /// the model without starting Codex.
+///
+/// A codex worker also needs its own SQLite home (`sqlite_home`, from
+/// [`codex_sqlite_home`]); without one it is refused.
 fn worker_environment(
     command: &mut Command,
     state: &Path,
     worker: &Worker,
+    sqlite_home: Option<&Path>,
 ) -> Result<(), ScalerError> {
     let home = state.join("home");
     command
@@ -1064,9 +1068,43 @@ fn worker_environment(
                 "codex worker admitted without the live roster that lists its model",
             ));
         }
-        command.env("CODEX_MODELS", worker.roster.join(" "));
+        let sqlite_home = sqlite_home.ok_or(ScalerError::Guard(
+            "codex worker launched without its private SQLite home",
+        ))?;
+        command
+            .env("CODEX_MODELS", worker.roster.join(" "))
+            .env("CODEX_SQLITE_HOME", sqlite_home);
     }
     Ok(())
+}
+
+/// Memory filesystem that holds each dispatch Codex app-server's SQLite state.
+pub(crate) const CODEX_SQLITE_ROOT: &str = "/dev/shm";
+
+/// A fresh, empty SQLite home for one Codex app-server, under `root`
+/// ([`CODEX_SQLITE_ROOT`] in production), writable by the agent `group`.
+///
+/// Codex opens its state databases at startup and gives up after SQLx's 30 s
+/// connection deadline, exiting with "failed to initialize sqlite state
+/// runtime". A worker's app-server starts right after `hand_over` copied the
+/// whole actor (checkout and Rust homes, GBs) on the actor filesystem, so
+/// its first `fsync` there waits behind that write-back. With several clones
+/// sharing one host disk, three strong rounds' workers died 33-52 s into
+/// their first turn (#1464). A home on the memory filesystem has no
+/// write-back to wait on, and starts empty whatever `CODEX_HOME` holds.
+/// The caller keeps the directory until the agent account has retired.
+pub(crate) fn codex_sqlite_home(
+    root: &Path,
+    group: Option<&str>,
+) -> Result<tempfile::TempDir, ScalerError> {
+    let home = tempfile::Builder::new()
+        .prefix("carrick-codex-sqlite-")
+        .tempdir_in(root)?;
+    std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o770))?;
+    if let Some(group) = group {
+        output(Command::new("/usr/bin/chgrp").arg(group).arg(home.path()))?;
+    }
+    Ok(home)
 }
 
 fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
@@ -1110,7 +1148,16 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
             state.join("rust/cargo/bin").display()
         ),
     );
-    worker_environment(&mut command, &state, &dispatch.worker)?;
+    // Held past `retire_agent` below: the app-server must be gone first.
+    let sqlite_home = (dispatch.worker.backend == "codex")
+        .then(|| codex_sqlite_home(Path::new(CODEX_SQLITE_ROOT), Some(AGENT_USER)))
+        .transpose()?;
+    worker_environment(
+        &mut command,
+        &state,
+        &dispatch.worker,
+        sqlite_home.as_ref().map(tempfile::TempDir::path),
+    )?;
     command.current_dir(root);
     // Held until the agent retires; the agent only validates and joins it.
     let (_lease, handoff) = agent_lease()?.unzip();
