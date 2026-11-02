@@ -121,7 +121,8 @@ pub fn generic_probe_container(
 /// Exercise the same probe as namespace init and behind a live shell. The
 /// shell must wait after the subshell: a final `(probe)` alone can be
 /// optimized into exec, erasing the two-process witness. `cd` also traverses
-/// the inherited filesystem-context seam before child exec (#1392).
+/// the inherited filesystem-context seam before child exec (#1392). Keep
+/// the changed directory: returning to `/` masks the stale startup-cwd bug.
 pub fn run_probe_differential(
     probe: &str,
     container: &TestContainer,
@@ -130,7 +131,7 @@ pub fn run_probe_differential(
     let child = container.run([
         "/bin/sh",
         "-c",
-        "cd /tmp && cd / && ( /tmp/p ); status=$?; exit \"$status\"",
+        "cd /tmp && ( /tmp/p ); status=$?; exit \"$status\"",
     ])?;
     assert_eq!(
         root.exit_code, child.exit_code,

@@ -31,8 +31,9 @@ entry/return populations, no tracked survivors and no reported drops are
 required. Only ordinary workload execution supplies semantic/timing evidence.
 
 Generic probe shards run each probe directly as PID1 and behind a waiting
-shell that performs `cd /` before fork/exec. Each run retains its own existing
-carrier deadline. Compare termination and every output line. Three deliberate
+shell that performs `cd /tmp` before fork/exec and stays there. Returning
+to the startup directory would hide the stale-cwd refusal in #1392. Each run
+retains its own existing carrier deadline. Compare termination and every output line. Three deliberate
 Linux topology observations have exact expectations rather than equality:
 PID1's absent namespace parent (`pidnsroot`), orphan adoption by namespace
 init (`pidnsorphanreap`), and session-leader setpgid EPERM (`proclife`). No
