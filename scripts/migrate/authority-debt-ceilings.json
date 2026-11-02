@@ -35329,6 +35329,13 @@
       "owner": "carrick_fd_core::Error",
       "lane": "shared",
       "ceiling": 1
+    },
+    {
+      "family": "contention_variant",
+      "operation": "raw_owner_wait:from_owner",
+      "owner": "carrick_core_abi::PortalOwnerWait::from_owner",
+      "lane": "shared",
+      "ceiling": 9
     }
   ]
 }

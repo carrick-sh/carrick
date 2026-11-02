@@ -80,6 +80,8 @@ vm_free = [
   "carrick-el1-linux::aarch64_process::native_user_write_preserves_nonfault_refusals",
   "carrick-el1-linux::dispatch::host_owned_poll_copyout_refusal_keeps_the_host_fallback",
   "carrick-el1-linux::ipc::tests::native_structural_refusals_retire_without_host_handback",
+  "carrick-sched-core::refusal::queue_witnesses::{switched_cause_uses_its_own_preprobe_revision,release_between_miss_and_park_returns_owned_operation,retired_source_reruns_then_returns_guest_answer,parked_operation_has_exactly_one_wake,cancelled_ticket_does_not_count_as_abandoned,abandoned_ticket_during_unwind_preserves_original_panic}",
+  "carrick-core-abi::wait::ticket_tests::{portal_front_door_rejects_owner_and_zone_mismatch_as_invariants,foreign_zone_cannot_enroll_a_ticket,dropped_ticket_during_dependency_unwind_does_not_abort}",
 ]
 
 [bindings.unresolved]

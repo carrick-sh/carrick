@@ -716,7 +716,14 @@ impl NativeService {
                     Err(carrick_sched_core::spaces::notification::ExclusionRefusal::Busy) => Err(
                         Attempt::Contended(ReleaseCause::Space(SpaceWaitCause::Editor)),
                     ),
-                    Err(_) => Err(Attempt::Settled(Settled::Guest(()))),
+                    Err(carrick_sched_core::spaces::notification::ExclusionRefusal::Stale) => {
+                        Err(Attempt::<()>::Settled(Settled::Invariant(
+                            carrick_sched_core::refusal::InvariantKind {
+                                domain: "native_service_exclusion",
+                                code: 1,
+                            },
+                        )))
+                    }
                 },
             ) {
                 Ok(exclusion) => exclusion,
@@ -728,7 +735,8 @@ impl NativeService {
                     let wait = ticket.into_portal_wait(&authority).map_err(|_| stale())?;
                     return self.complete_wait(wait);
                 }
-                Err(_) => return self.refuse(),
+                Err(Refusal::Invariant(_)) => return Err(stale()),
+                Err(Refusal::Guest(())) => return self.refuse(),
             };
         let pool = carrick_el1_abi::cow_grant_pool_host().ok_or_else(|| stale())?;
         let mut stock = custody.fork_stock.lock();

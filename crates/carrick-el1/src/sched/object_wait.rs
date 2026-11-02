@@ -233,13 +233,15 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
     /// Save and park a pending operation without switching while any caller
     /// lock might still be live. On Changed the caller rechecks the object;
     /// no bytes may be replayed, and the returned token remains its property.
+    /// The caller supplies the observation taken under its object-state
+    /// protocol before probing the blocked predicate, never after the miss.
     /// `deadline` (`CNTVCT`) bounds the park on this slot's timer; only a
     /// park [`Self::may_time_park`] allows may carry one (else `Occupied`).
     pub fn park_object(
         &mut self,
         frame: &TrapFrame,
         key: ObjectWaitKey,
-        snapshot: ObjectWaitSnapshot,
+        snapshot: carrick_sched_core::object_wait::ObjectStateSnapshot,
         resume: OperationResumePc,
         operation: OperationToken,
         deadline: Option<u64>,
@@ -250,8 +252,9 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
             '_,
             Aarch64ParkedContext,
         >| { deliver_completion(zone, slot, effects) };
-        let request =
-            carrick_core::wait::ObjectParkRequest::new(key, snapshot, operation, deadline);
+        let request = carrick_core::wait::ObjectParkRequest::from_locked_snapshot(
+            key, snapshot, operation, deadline,
+        );
         carrick_core::wait::park_object_record(zone, slot, request, &completion, || {
             let fresh = zone.slot(slot).current().is_none();
             let record = match self.current_record() {

@@ -1002,7 +1002,14 @@ fn allocator_control_with_pending_host_work_and_no_token_enrolls_three_waiters()
                     && let Ok(mut parked) = park_object_record(
                         self.zone,
                         self.slot,
-                        ObjectParkRequest::new(key, snapshot, operation, None),
+                        ObjectParkRequest::from_locked_snapshot(
+                            key,
+                            unsafe {
+                                carrick_sched_core::object_wait::ObjectStateSnapshot::taken_under_object_lock(snapshot)
+                            },
+                            operation,
+                            None,
+                        ),
                         &|_| {},
                         || Ok((self.record, false)),
                     )

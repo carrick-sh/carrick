@@ -89,8 +89,3 @@ embed = "Exact signed source ef5764582 passes sequential growth/return and refus
 docker = "Internal EL1 kernel metadata allocator operates inside guest EL1 and host VMM boundary; user-visible Linux syscall parity is maintained across higher-level interfaces."
 embed_structural = "Structural bounds of bounded O(1) search inspections (<= 2), block splits (<= 2), coalescing merges (<= 2), and exact byte accounting are derived and asserted at runtime via VM-free unit tests across 1, 8, 32, and 128 extent scales."
 embed_timing = "Timing ratio is not asserted for internal kernel metadata allocation."
-
-# #1395 slice 1: scheduler refusal::queue_witnesses proves bounded cause
-# selection, release-before-park, retirement rerun and exactly one wake.
-# The zone-scoped abandoned-ticket counter changes the shared layout hash;
-# existing semantic/signed bindings and budgets above remain required.

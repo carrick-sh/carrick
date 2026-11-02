@@ -71,8 +71,23 @@ where
         Ok(guard) => guard,
         Err(error) => return Err((error, request.operation)),
     };
-    let snapshot = request.observed().unwrap_or_else(|| guard.snapshot());
     let owner_entry = request.owner_entry();
+    let snapshot = match (request.observed(), owner_entry) {
+        (Some(snapshot), _) => snapshot,
+        (None, Some(_)) => {
+            // SAFETY: owner-entry save_context probes native object state while
+            // this queue guard is held; no release can pass between this
+            // observation and that probe. Only the explicit owner constructor
+            // admits this protocol, never an ordinary raw snapshot request.
+            unsafe {
+                carrick_sched_core::object_wait::ObjectStateSnapshot::taken_under_object_lock(
+                    guard.snapshot(),
+                )
+            }
+            .observed()
+        }
+        (None, None) => return Err((ObjectWaitError::Stale, request.operation)),
+    };
     let (record, fresh) = match save_context() {
         Ok(pair) => pair,
         Err(err) => {
@@ -236,7 +251,7 @@ where
     C: FnMut(&mut crate::mm::reservation::Reservations<'_, P, G, Context>) -> Option<bool>,
     F: FnMut(
         ObjectWaitKey,
-        ObjectWaitSnapshot,
+        carrick_sched_core::object_wait::ObjectStateSnapshot,
         OperationToken,
     ) -> Result<T, (ObjectWaitError, OperationToken)>,
 {
@@ -264,6 +279,11 @@ where
             Ok(s) => s,
             Err(_) => return EditWaitOutcome::Refused,
         };
+        // SAFETY: this reservation root guard owns the object state while
+        // sampling the epoch and probing the prepared-overlap predicate.
+        let snapshot = unsafe {
+            carrick_sched_core::object_wait::ObjectStateSnapshot::taken_under_object_lock(snapshot)
+        };
         let conflict = match check_conflict(&mut root) {
             Some(c) => c,
             None => return EditWaitOutcome::Refused,
@@ -280,37 +300,5 @@ where
             Err((ObjectWaitError::Changed, _)) => continue,
             Err(_) => return EditWaitOutcome::Refused,
         }
-    }
-}
-
-/// Ticket entry adapter over the existing save/park path. The returned park
-/// receipt is switched by the caller after all guards have been released.
-pub fn park_and_rerun<'a, S, C: carrick_core_abi::EntryContext>(
-    zone: &'a ZoneTables<C>,
-    slot: SlotId,
-    operation: OperationToken,
-    ticket: crate::refusal::ReleaseTicket<'a, C>,
-    completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
-    save_context: S,
-) -> Result<
-    crate::refusal::Rerun<ObjectParked<'a, C>, OperationToken>,
-    (ObjectWaitError, OperationToken),
->
-where
-    S: FnOnce() -> Result<(RecordId, bool), ObjectWaitError>,
-{
-    use crate::refusal::Rerun;
-    // SAFETY: the request never escapes this adapter; enrollment below uses
-    // this same borrowed zone while its entry authority remains retained.
-    let request = match unsafe { ObjectParkRequest::from_ticket(zone, operation, ticket) } {
-        Rerun::Now(operation) => return Ok(Rerun::Now(operation)),
-        Rerun::Park(request) => request,
-    };
-    match park_object_record(zone, slot, request, completion, save_context) {
-        Ok(parked) => Ok(Rerun::Park(parked)),
-        Err((ObjectWaitError::Changed | ObjectWaitError::Stale, operation)) => {
-            Ok(Rerun::Now(operation))
-        }
-        Err(error) => Err(error),
     }
 }

@@ -566,6 +566,37 @@ impl<'scope, 'zone, C: Copy + Send + Sync + zerocopy::FromZeros>
     }
 }
 
+/// An observation authenticated by the object's admission protocol. This
+/// explicit boundary is for existing protocols that cannot yet issue a ticket.
+#[derive(core::clone::Clone, core::marker::Copy, core::fmt::Debug)]
+pub struct ObjectStateSnapshot(ObjectWaitSnapshot);
+impl ObjectStateSnapshot {
+    /// # Safety
+    /// The caller holds the object's state lock across both this observation
+    /// and its blocked-predicate probe, in either order. The lock excludes a
+    /// release between them. Retain the observation when unlocking to enroll.
+    pub const unsafe fn taken_under_object_lock(snapshot: ObjectWaitSnapshot) -> Self {
+        Self(snapshot)
+    }
+    /// Authenticate an epoch sampled before probing the object predicate.
+    /// # Safety
+    /// The observation precedes the failed predicate probe. Enrollment must
+    /// revalidate this exact epoch; no post-probe epoch may be substituted.
+    pub const unsafe fn before_object_probe(snapshot: ObjectWaitSnapshot) -> Self {
+        Self(snapshot)
+    }
+    /// Reconstitute an observation carried by the legacy owner wire protocol.
+    /// # Safety
+    /// The receipt authenticates this exact key and incarnation, and the owner
+    /// held its object-state lock across sampling revision and the failed probe.
+    pub const unsafe fn taken_under_owner_state_lock(key: ObjectWaitKey, revision: u64) -> Self {
+        Self(ObjectWaitSnapshot::at_revision(key, revision))
+    }
+    pub const fn observed(self) -> ObjectWaitSnapshot {
+        self.0
+    }
+}
+
 /// Linear notification custody; no source may be consumed before admission.
 #[must_use = "notification admission must be published, detached, or cancelled"]
 pub struct ObjectNotificationTicket<
@@ -581,6 +612,10 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectNotificationTicket<'
         self.zone
             .counters
             .contention_tickets_dropped
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn record_cancelled_ticket(&self, reason: crate::refusal::CancelReason) {
+        self.zone.counters.contention_tickets_cancelled[reason as usize]
             .fetch_add(1, Ordering::Relaxed);
     }
     pub(crate) fn unchanged(&self, snapshot: ObjectWaitSnapshot) -> bool {

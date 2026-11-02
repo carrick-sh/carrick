@@ -74,8 +74,3 @@ ecosystem = [
 [bindings.unresolved]
 docker = "The fixture asserts the Linux futex results (0 on a wake, EINTR on a signal, exit_group status, the exec successor's output) directly; blessing a generic Docker probe needs a Docker phase that was not run in this session. The LTP futex rows compare against the cached Docker oracle."
 embed_structural = "Host exits are read through carrick_embed::vcpu_run_exits_total() and in-guest parks, switches and claims through the zone counters in shared EL1 memory (carrick_el1_abi::zone_tables); no WorkObservation metric is registered for them."
-
-# #1395 slice 1: scheduler refusal::queue_witnesses proves bounded cause
-# selection, release-before-park, retirement rerun and exactly one wake.
-# The zone-scoped abandoned-ticket counter changes the shared layout hash;
-# existing semantic/signed bindings and budgets above remain required.

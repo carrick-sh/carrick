@@ -1047,7 +1047,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let parked = carrick_core::wait::park_object_record(
             zone,
             self.source.slot,
-            carrick_core::wait::ObjectParkRequest::owner(key, token, entry),
+            carrick_core::wait::ObjectParkRequest::owner(
+                key,
+                token,
+                entry,
+                // SAFETY: the save_context closure below probes completion,
+                // cancellation and service ownership under this same queue.
+                unsafe { carrick_core::wait::OwnerProbeUnderQueueLock::for_save_context_probe() },
+            ),
             &|_| {},
             || {
                 if ((!adapter && self.signal_interrupts_current())

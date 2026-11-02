@@ -48,8 +48,3 @@ base = 512
 per_unit = 127
 layers = ["embed-structural"]
 rationale = "Forwarded reads stay below pairs * rounds (127 per pair for 128 rounds, plus fixed scaffolding for fork, thread start and join): blocking reads are parked and woken in the guest instead of forwarded per round. The per-pair coefficient is an upper bound on the dispatch population the test's forwarded-read assertion admits, not an allowance for the writes, which are served at EL1."
-
-# #1395 slice 1: scheduler refusal::queue_witnesses proves bounded cause
-# selection, release-before-park, retirement rerun and exactly one wake.
-# The zone-scoped abandoned-ticket counter changes the shared layout hash;
-# existing semantic/signed bindings and budgets above remain required.

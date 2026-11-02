@@ -32,8 +32,3 @@ terminal_open_release = "F3 (issue #384) owns region-indexed terminal open retir
 x86_cpl0 = "Live KVM bindings: carrick-vmm-kvm::cpl0_boot::cpl0_layout_tests::file_region_published_before_guest_entry , carrick-vmm-kvm::cpl0_shared_entry::production_file_region_stdio_dup_parity and carrick-vmm-kvm::cpl0_entry::{file_region_guest_stdio_parity_and_two_carrier_independence,file_region_guest_closes_record_beyond_fifteen,file_region_guest_refuses_foreign_publication,file_region_guest_refuses_retired_publication,file_region_guest_refuses_unpublished_binding}, carrick-vmm-kvm::cpl0_initial_mm::file_region_guest_fork_dup_and_child_retirement_preserve_parent and cpl0_layout_tests::{file_region_host_mutation_refused_while_cpu_running,file_region_host_refuses_paused_cpl0_descriptor_transaction,file_region_run_refuses_host_access_without_waiting,file_region_poisoned_admission_is_repeated_typed_fatal}. Merge-queue NEW=[] receipt remains director-owned."
 embed_structural = "Full signed gate on the director's HVF host remains required by the approved F2 exit."
 docker = "F2 changes storage venue and carrier custody, not regular-file Open lowering; full file-service differential binding belongs to F4. No Docker is available on the F2 worker."
-
-# #1395 slice 1: scheduler refusal::queue_witnesses proves bounded cause
-# selection, release-before-park, retirement rerun and exactly one wake.
-# The zone-scoped abandoned-ticket counter changes the shared layout hash;
-# existing semantic/signed bindings and budgets above remain required.

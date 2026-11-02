@@ -88,19 +88,19 @@ struct Custody<'z, C: Copy + Send + Sync + zerocopy::FromZeros> {
 
 /// A linear ticket, constructed only by an attached source's observe/probe.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// use carrick_sched_core::refusal::ReleaseTicket;
 /// let ticket = ReleaseTicket::new();
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// use carrick_sched_core::refusal::ReleaseTicket;
 /// fn duplicate(t: ReleaseTicket<'_>) { let _ = t.clone(); }
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carrick_sched_core::refusal::{Refusal, Settled};
 /// fn commit(r: Refusal<'_, u16>) -> Settled<u16> { r.into() }
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carrick_sched_core::refusal::ReleaseTicket;
 /// fn errno(t: ReleaseTicket<'_>) -> i32 { t.into() }
 /// ```
@@ -120,6 +120,12 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for ReleaseTicket<'_, C> 
             self.custody.notification.record_dropped_ticket();
             // Abandonment is a broken ownership invariant in every build,
             // including signed gates; it is not a contention verdict.
+            // Host unwinding must preserve the original panic, not abort the
+            // carrier with a second panic. Bare guest venues do not unwind.
+            #[cfg(not(target_os = "none"))]
+            if std::thread::panicking() {
+                return;
+            }
             assert!(
                 self.discharged,
                 "release ticket abandoned without park or cancellation"
@@ -157,7 +163,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> TicketEnrollment<'_, '_, C> {
     }
 }
 impl<'z, C: Copy + Send + Sync + zerocopy::FromZeros> ReleaseTicket<'z, C> {
-    pub fn cancel(mut self, _reason: CancelReason) {
+    pub fn cancel(mut self, reason: CancelReason) {
+        self.custody.notification.record_cancelled_ticket(reason);
         self.discharged = true;
     }
 
@@ -195,10 +202,10 @@ mod sealed {
 }
 /// Sealed: an unnotified holder cannot manufacture a release ticket.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carrick_sched_core::refusal::ContentionSource;
 /// struct Unattached;
-/// impl ContentionSource for Unattached {}
+/// impl<'z> ContentionSource<'z> for Unattached {}
 /// ```
 pub trait ContentionSource<'z, C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx>:
     sealed::Sealed
@@ -207,8 +214,9 @@ pub trait ContentionSource<'z, C: Copy + Send + Sync + zerocopy::FromZeros = Thr
     fn observation(&self, cause: ReleaseCause) -> Option<SourceObservation<'z, C>>;
 
     /// Each newly encountered cause is observed before retrying the predicate.
-    /// Revisited causes already have a pre-probe observation. Thus seven causes
-    /// bound this to eight probes, without polling or observing after failure.
+    /// Revisited causes already have a pre-probe observation. The finite cause
+    /// set bounds the probes to one plus its size, without polling or observing
+    /// after failure.
     fn contend<T, G>(
         &self,
         mut probe: impl FnMut() -> Result<T, Attempt<G>>,
@@ -233,7 +241,7 @@ where
     C: Copy + Send + Sync + zerocopy::FromZeros,
     S: ContentionSource<'z, C> + ?Sized,
 {
-    let mut observations = [const { None }; 7];
+    let mut observations = [const { None }; SpaceWaitCause::ALL.len() + 1];
     loop {
         let index = cause.index();
         if let Some(custody) = observations[index].take() {
@@ -457,7 +465,21 @@ mod queue_witnesses {
         // SAFETY: this adapter transfers the owned operation through the existing
         // scheduler enrollment or returns it; witnesses use the same real queue.
         unsafe { ticket.park_and_rerun((), |(), enrollment| assert!(!enrollment.unchanged())) };
-        let answer = source.contend(|| Err::<(), _>(Attempt::Settled(Settled::Guest("retired"))));
+        let answer = source.contend(|| {
+            zone.spaces
+                .try_begin_edit_cause(
+                    zone.spaces.find(77).unwrap(),
+                    77,
+                    NonZeroU64::MIN,
+                    Some(venue(&zone)),
+                )
+                .map_err(|refusal| match refusal {
+                    crate::spaces::EditAdmissionRefusal::Stale => {
+                        Attempt::Settled(Settled::Guest("retired"))
+                    }
+                    _ => panic!("retired space must refuse as stale"),
+                })
+        });
         assert!(matches!(answer, Err(Refusal::Guest("retired"))));
     }
     #[test]
@@ -512,6 +534,25 @@ mod queue_witnesses {
         assert_eq!(handed, 1);
     }
     #[test]
+    fn abandoned_ticket_during_unwind_preserves_original_panic() {
+        let zone = zone();
+        let source = source(&zone);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let Refusal::Contended(_ticket) = contend(&source, SpaceWaitCause::Gate) else {
+                panic!("ticket");
+            };
+            panic!("original panic");
+        }))
+        .unwrap_err();
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"original panic"));
+        assert_eq!(
+            zone.counters
+                .contention_tickets_dropped
+                .load(core::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+    #[test]
     fn cancelled_ticket_does_not_count_as_abandoned() {
         let zone = zone();
         let source = source(&zone);
@@ -519,6 +560,11 @@ mod queue_witnesses {
             panic!("ticket");
         };
         ticket.cancel(CancelReason::OperationCancelled);
+        assert_eq!(
+            zone.counters.contention_tickets_cancelled[CancelReason::OperationCancelled as usize]
+                .load(core::sync::atomic::Ordering::Relaxed),
+            1
+        );
         assert_eq!(
             zone.counters
                 .contention_tickets_dropped

@@ -2061,7 +2061,12 @@ fn el1_ipc_wait_cross_mm_resume_restores_arguments_and_owned_operation() {
     let (report, effects) = sched.notify_object(key_b).unwrap();
     assert_eq!(report.queued, 1);
     sched.finish_object_wake(effects);
-    let snapshot = sched.observe_object(key_a).unwrap();
+    // SAFETY: this fixture exclusively owns the blocked object's state.
+    let snapshot = unsafe {
+        carrick_sched_core::object_wait::ObjectStateSnapshot::taken_under_object_lock(
+            sched.observe_object(key_a).unwrap(),
+        )
+    };
     let parked = sched
         .park_object(
             &frame,
@@ -2095,7 +2100,12 @@ fn el1_ipc_wait_cross_mm_resume_restores_arguments_and_owned_operation() {
     let (report, effects) = sched.notify_object(key_a).unwrap();
     assert_eq!(report.queued, 1);
     sched.finish_object_wake(effects);
-    let snapshot = sched.observe_object(key_b).unwrap();
+    // SAFETY: this fixture exclusively owns the blocked object's state.
+    let snapshot = unsafe {
+        carrick_sched_core::object_wait::ObjectStateSnapshot::taken_under_object_lock(
+            sched.observe_object(key_b).unwrap(),
+        )
+    };
     let parked = sched
         .park_object(
             &frame,
@@ -2319,7 +2329,12 @@ fn concurrent_timer_park_and_guard_refusal_preserve_record_ownership() {
 
     let key = ObjectWaitKey::new(1, 1).unwrap();
     zone.bind_object_wait(key, &HostWait).unwrap();
-    let snapshot = sched.observe_object(key).unwrap();
+    // SAFETY: this fixture exclusively owns the blocked object's state.
+    let snapshot = unsafe {
+        carrick_sched_core::object_wait::ObjectStateSnapshot::taken_under_object_lock(
+            sched.observe_object(key).unwrap(),
+        )
+    };
     let resume = OperationResumePc::new(0x8000).unwrap();
     let op = OperationToken::new(101, 1).unwrap();
 

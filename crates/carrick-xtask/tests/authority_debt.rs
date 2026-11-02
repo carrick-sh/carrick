@@ -3532,3 +3532,32 @@ fn contention_variants_are_scoped_production_debt() {
     decreased.counters[0].ceiling = 0;
     decreased.ratchet(&base, &MoveMap::default()).unwrap();
 }
+
+#[test]
+fn raw_owner_wait_census_counts_producers_across_moves_and_excludes_fixtures() {
+    let temp = tempfile::tempdir().unwrap();
+    let src = temp.path().join("crates/carrick-demo/src");
+    std::fs::create_dir_all(&src).unwrap();
+    let before = r#"
+        pub fn producer() { unsafe { crate::PortalOwnerWait::from_owner(handle, cause, revision) }; }
+        #[cfg(test)] mod tests {
+            fn fixture() { unsafe { PortalOwnerWait::from_owner(handle, cause, revision) }; }
+        }
+    "#;
+    std::fs::write(src.join("lib.rs"), before).unwrap();
+    for source in [before.to_owned(), format!("\n\nmod moved {{ {before} }}")] {
+        std::fs::write(src.join("lib.rs"), source).unwrap();
+        let census = load_census(temp.path()).unwrap();
+        let sites: Vec<_> = census
+            .contention_variants
+            .iter()
+            .filter(|site| site.operation == "raw_owner_wait:from_owner")
+            .collect();
+        assert_eq!(sites.len(), 1);
+        assert_eq!(
+            sites[0].owner,
+            "carrick_core_abi::PortalOwnerWait::from_owner"
+        );
+        assert_eq!(sites[0].lane, Lane::Shared);
+    }
+}
