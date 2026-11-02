@@ -157,8 +157,14 @@ pub struct ContextBinding {
 /// Bounded hardware witness/control record, outside the common ABI. This is
 /// NOT a production task graph or MM owner. The carrier initializes it while
 /// stopped and retains it until VM retirement.
-pub const PROGRESS_STATE: u64 = 0xffff_ffff_b070_0000;
 pub const PROGRESS_ZONE: u64 = 0xffff_ffff_b000_0000;
+// Shared by the image and host: growing the scheduler record must move the
+// observation record too, rather than overwrite it at a fixed offset.
+pub const PROGRESS_STATE: u64 = PROGRESS_ZONE
+    + (core::mem::size_of::<ZoneTables<ParkedContextWords>>() as u64).next_multiple_of(4096);
+pub const PROGRESS_SUPERVISOR_BYTES: u64 = (PROGRESS_STATE - PROGRESS_ZONE
+    + core::mem::size_of::<ProgressState>() as u64)
+    .next_multiple_of(4096);
 pub const PROGRESS_HEADER: u64 = 0x10_2000;
 pub const PROGRESS_MAGIC: u64 = 0x4d34_4350_4c30_0001;
 pub const PROGRESS_DATA: u64 = 0x5_0000;
@@ -193,6 +199,23 @@ pub struct ProgressState {
     pub wake_address: u64,
     pub scratch: XsaveArea,
 }
+
+const _: () = {
+    assert!(
+        PROGRESS_ZONE + core::mem::size_of::<ZoneTables<ParkedContextWords>>() as u64
+            <= PROGRESS_STATE
+    );
+    assert!(
+        PROGRESS_STATE + core::mem::size_of::<ProgressState>() as u64
+            <= PROGRESS_ZONE + PROGRESS_SUPERVISOR_BYTES
+    );
+    assert!(
+        PROGRESS_ZONE
+            .is_multiple_of(core::mem::align_of::<ZoneTables<ParkedContextWords>>() as u64)
+    );
+    assert!(PROGRESS_STATE.is_multiple_of(core::mem::align_of::<ProgressState>() as u64));
+    assert!(PROGRESS_SUPERVISOR_BYTES.is_multiple_of(4096));
+};
 
 impl ContextBinding {
     pub fn owned_on(&self, zone: &ZoneTables<ParkedContextWords>, slot: SlotId) -> bool {
