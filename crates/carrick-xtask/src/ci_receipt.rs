@@ -495,6 +495,11 @@ struct TestSourceScan {
     /// already among the scanned files) is not read as an unresolved source.
     file_dir: std::path::PathBuf,
     crate_root: std::path::PathBuf,
+    /// Canonical paths of every `.rs` file the scan reads for this crate.
+    scanned: BTreeSet<std::path::PathBuf>,
+    /// Nesting depth of inline `mod x { … }` blocks: rustc resolves a nested
+    /// `#[path]` against a subdirectory, so only depth 0 is resolvable here.
+    inline_depth: usize,
 }
 
 impl TestSourceScan {
@@ -504,6 +509,9 @@ impl TestSourceScan {
     /// Anything else (a `cfg_attr` form, a non-literal, or an out-of-crate
     /// target) stays unresolved.
     fn path_stays_in_crate(&self, meta: &syn::Meta) -> bool {
+        if self.inline_depth != 0 {
+            return false;
+        }
         let syn::Meta::NameValue(nv) = meta else {
             return false;
         };
@@ -517,13 +525,21 @@ impl TestSourceScan {
         else {
             return false;
         };
-        let (Ok(target), Ok(root)) = (
-            self.file_dir.join(lit.value()).canonicalize(),
-            self.crate_root.canonicalize(),
-        ) else {
+        let candidate = self.file_dir.join(lit.value());
+        if candidate.extension().is_none_or(|e| e != "rs") {
+            return false;
+        }
+        // No symlinked final component; the target must be one of the exact
+        // files this scan reads, so it hides nothing the scan doesn't see.
+        let Ok(meta) = std::fs::symlink_metadata(&candidate) else {
             return false;
         };
-        target.is_file() && target.starts_with(root)
+        if !meta.file_type().is_file() {
+            return false;
+        }
+        candidate
+            .canonicalize()
+            .is_ok_and(|target| self.scanned.contains(&target))
     }
 }
 
@@ -563,8 +579,9 @@ fn meta_is_test(meta: &syn::Meta) -> bool {
 }
 
 /// Item macros that provably cannot define a Rust test: `global_asm!`
-/// (assembly only) and `thread_local!` (thread-local statics only), under
-/// their bare, `core::arch`/`std::arch` and `std` spellings.
+/// (assembly only) and `thread_local!` (thread-local statics only). Only the
+/// fully qualified `core::arch`/`std::arch`/`std` spellings count: a bare
+/// name could be rebound by `use some::generator as thread_local`.
 fn is_non_generating_item_macro(path: &syn::Path) -> bool {
     let segments: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
     matches!(
@@ -573,11 +590,7 @@ fn is_non_generating_item_macro(path: &syn::Path) -> bool {
             .map(String::as_str)
             .collect::<Vec<_>>()
             .as_slice(),
-        ["global_asm"]
-            | ["core", "arch", "global_asm"]
-            | ["std", "arch", "global_asm"]
-            | ["thread_local"]
-            | ["std", "thread_local"]
+        ["core", "arch", "global_asm"] | ["std", "arch", "global_asm"] | ["std", "thread_local"]
     )
 }
 
@@ -597,6 +610,21 @@ impl<'ast> syn::visit::Visit<'ast> for TestSourceScan {
             self.tests.insert(item.sig.ident.to_string());
         }
         syn::visit::visit_item_fn(self, item);
+    }
+
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        // Attributes on the declaration resolve at the current depth; the
+        // body of an inline module is one level deeper.
+        for attr in &item.attrs {
+            self.visit_attribute(attr);
+        }
+        if let Some((_, items)) = &item.content {
+            self.inline_depth += 1;
+            for nested in items {
+                self.visit_item(nested);
+            }
+            self.inline_depth -= 1;
+        }
     }
 
     fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
@@ -635,6 +663,7 @@ pub fn tree_has_test(tree_root: &Path, bin: &str, test_path: &str) -> Result<boo
         check_target_paths(&crate_dir, &manifest)?;
         let mut files = Vec::new();
         collect_rs_files(&crate_dir, &mut files)?;
+        scan.scanned = files.iter().filter_map(|f| f.canonicalize().ok()).collect();
         for file in files {
             let source = std::fs::read_to_string(&file).map_err(|e| source_io(&file, e))?;
             let syntax = syn::parse_file(&source).map_err(|e| {
