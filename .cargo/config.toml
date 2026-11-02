@@ -52,3 +52,14 @@ rustflags = ["-C", "force-frame-pointers=yes"]
 # CPL0 lives in the canonical high half. Keep frame pointers from the host
 # default because a target-specific rustflags list takes precedence.
 rustflags = ["-C", "force-frame-pointers=yes", "-C", "code-model=kernel"]
+
+[target.aarch64-unknown-linux-musl]
+# Signed tests build Linux guest fixtures (libpython-map, directory-copyout,
+# elf-exec-errno) on the Mac. Without a linker here rustc falls back to `cc`,
+# which is Apple clang and cannot link Linux ELF, so CI runners whose CARGO_HOME
+# has no personal config fail the probe build (#1336). `rust-lld` with the
+# self-contained musl runtime links them without a cross-toolchain; this does
+# not touch the macOS host link, so `__dof_carrick` and ld64 are unaffected.
+# A target rustflags list replaces [build] rustflags, so frame pointers repeat.
+linker = "rust-lld"
+rustflags = ["-C", "force-frame-pointers=yes", "-C", "link-self-contained=yes"]
