@@ -277,8 +277,17 @@ mod tests {
         ] {
             std::fs::write(dir.path().join(&paths[0][1..]), contents).expect("unit");
             let mut script = format!("journalctl() {{ echo '{kernel}'; }}\n{HEALTH}");
-            for prefix in ["/etc/", "/usr/", "/var/", "/run/"] {
-                script = script.replace(prefix, &format!("{}{prefix}", dir.path().display()));
+            // Two passes: on macOS the tempdir itself lives under /var/, so a
+            // sequential rewrite would re-prefix paths an earlier pass inserted.
+            let prefixes = ["/etc/", "/usr/", "/var/", "/run/"];
+            for (index, prefix) in prefixes.iter().enumerate() {
+                script = script.replace(prefix, &format!("\u{0}PREFIX{index}\u{0}"));
+            }
+            for (index, prefix) in prefixes.iter().enumerate() {
+                script = script.replace(
+                    &format!("\u{0}PREFIX{index}\u{0}"),
+                    &format!("{}{prefix}", dir.path().display()),
+                );
             }
             assert_eq!(
                 Command::new("sh")
