@@ -2052,10 +2052,9 @@ fn test_wait4_consumes_zombie_once_with_exact_status() {
     wait4_consumes_zombie_once_with_exact_status(Wait4TerminalCase::Exited);
 }
 
-/// A default core signal selected by the production delivery owner must retain
-/// Linux's bit-7 core marker through child retirement and the shared wait4
-/// owner. This is a two-process witness: the parent publishes SIGSEGV, the
-/// child consumes it at the ARM return checkpoint, and the parent reaps it.
+/// A core-class signal without a published core must report CLD_KILLED and
+/// no WCOREDUMP bit. The parent publishes SIGSEGV, the child consumes it at
+/// the production return checkpoint, and the parent observes and reaps it.
 #[cfg(test)]
 #[test]
 fn arm_wait4_reports_default_core_signal_from_production_delivery() {
@@ -2327,7 +2326,7 @@ fn wait4_consumes_zombie_once_with_exact_status(terminal: Wait4TerminalCase) {
     assert_eq!(si_signo, 17);
     let expected_code = match terminal {
         Wait4TerminalCase::Exited => carrick_syscall_abi::LINUX_CLD_EXITED,
-        Wait4TerminalCase::CoreSignal => carrick_syscall_abi::LINUX_CLD_DUMPED,
+        Wait4TerminalCase::CoreSignal => carrick_syscall_abi::LINUX_CLD_KILLED,
         Wait4TerminalCase::PipeSignal => carrick_syscall_abi::LINUX_CLD_KILLED,
     };
     assert_eq!(si_code, expected_code);
@@ -2354,7 +2353,7 @@ fn wait4_consumes_zombie_once_with_exact_status(terminal: Wait4TerminalCase) {
     ));
     let expected_status = match terminal {
         Wait4TerminalCase::Exited => 9 << 8,
-        Wait4TerminalCase::CoreSignal => 11 | 0x80,
+        Wait4TerminalCase::CoreSignal => 11,
         Wait4TerminalCase::PipeSignal => 13,
     };
     let status = status_storage.get::<i32>(0);
@@ -2363,7 +2362,7 @@ fn wait4_consumes_zombie_once_with_exact_status(terminal: Wait4TerminalCase) {
         assert_ne!(status & 0x7f, 0, "WIFSIGNALED");
         assert_ne!(status & 0x7f, 0x7f, "WIFSIGNALED");
         assert_eq!(status & 0x7f, 11, "WTERMSIG");
-        assert_eq!(status & 0x80, 0x80, "core flag");
+        assert_eq!(status & 0x80, 0, "no core was published");
     }
 
     // Second wait on the consumed child must fail with ECHILD (error code -10)
