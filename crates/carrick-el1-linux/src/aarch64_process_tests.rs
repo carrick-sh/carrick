@@ -113,6 +113,9 @@ impl<X: ForkStockCrossing> crate::sched::ThreadCpu for ResumeCpu<'_, '_, X> {
     fn set_translation(&mut self, a: u64, b: u64) {
         self.inner.set_translation(a, b);
     }
+    fn live_ttbr0(&self) -> Option<u64> {
+        self.inner.live_ttbr0()
+    }
     fn invalidate_asid(&mut self, root: u64) {
         self.inner.invalidate_asid(root);
     }

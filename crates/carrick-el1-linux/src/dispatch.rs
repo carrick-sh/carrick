@@ -701,6 +701,27 @@ pub fn capture_native_service_exit(
     action
 }
 
+/// The entry's last step (#1100): seal its decision into the vector's
+/// return word. An idle exit vacates the slot here
+/// ([`sched::El1Exit::seal`]), whichever producer chose it.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub fn seal_entry_exit_with(
+    frame: &TrapFrame,
+    action: Action,
+    zone: &ZoneTables,
+    cpu: &mut impl sched::ThreadCpu,
+) -> sched::El1Exit {
+    sched::El1Exit::seal(action, zone, SlotId::from_index(frame.slot as usize), cpu)
+}
+
+/// [`seal_entry_exit_with`] on this vCPU and the image's zone tables.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+pub fn seal_entry_exit(frame: &TrapFrame, action: Action) -> sched::El1Exit {
+    // SAFETY: the EL1 zone tables are fixed image-lifetime ABI storage.
+    let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
+    seal_entry_exit_with(frame, action, zone, &mut sched::HardwareCpu)
+}
+
 /// Interpret the final entry boundary without granting custody. Only the
 /// authenticated native owner below may publish the resulting operation.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
@@ -1267,7 +1288,9 @@ pub(super) fn native_service_idle(
     slot: SlotId,
     cpu: &mut impl sched::ThreadCpu,
 ) -> Action {
-    sched::leave_space(zone, slot, cpu);
+    // The entry's seal vacates again (a no-op on a vacant word); leaving
+    // here keeps the park's own order: the root first, then the word.
+    let _vacated = sched::leave_space(zone, slot, cpu);
     Action::Idle
 }
 

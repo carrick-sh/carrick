@@ -58,6 +58,9 @@ impl ThreadCpu for HardwareCpu {
     fn invalidate_asid(&mut self, root: u64) {
         carrick_el1::substrate::sched::hw::HardwareCpu.invalidate_asid(root);
     }
+    fn live_ttbr0(&self) -> Option<u64> {
+        carrick_el1::substrate::sched::hw::HardwareCpu.live_ttbr0()
+    }
     fn now(&self) -> u64 {
         carrick_el1::substrate::sched::hw::HardwareCpu.now()
     }

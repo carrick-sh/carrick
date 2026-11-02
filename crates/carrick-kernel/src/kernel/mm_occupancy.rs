@@ -225,8 +225,10 @@ pub enum MmOccupancyError {
         "vCPU slot {slot:?} already runs address space {running} (host admission still owns slot)"
     )]
     SlotBusy { slot: ExecutionSlot, running: u64 },
+    /// The word is ring-owned ([`ZoneSlotOccupant::Ring`]) on a vCPU out of
+    /// the guest: an EL1 exit left it behind (#1100). A broken invariant.
     #[error(
-        "vCPU slot {slot:?} records address space {running} without a host owner while installing address space {requested}"
+        "vCPU slot {slot:?} records address space {running} without a host owner while installing address space {requested} (a ring-owned word left out of the guest)"
     )]
     SlotWordWithoutOwner {
         slot: ExecutionSlot,
@@ -278,6 +280,43 @@ pub fn retire_exited_zone_space(
             slot,
             running: foreign.running,
         })
+}
+
+/// Who owns a zone slot's occupancy word: the word, decoded by whether a
+/// host installer's port is attached. One word stays the authority; the
+/// port only says which party wrote it (#1100).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ZoneSlotOccupant {
+    Vacant,
+    /// A host task is loaded on the slot (its [`MmOccupancy`] holds the
+    /// port). EL1 may have switched the word since the install; whatever it
+    /// holds ends with that occupancy.
+    Host {
+        word: u64,
+    },
+    /// EL1 installed `space` with no host task loaded. Valid only while the
+    /// vCPU is in the guest: every EL1 exit to the host either vacates it
+    /// (an idle exit, a native-service park) or hands it to a typed
+    /// crossing (a root exit, retired by [`retire_exited_zone_space`]). A
+    /// stopped vCPU whose slot still holds one is a broken invariant.
+    Ring {
+        space: u64,
+    },
+}
+
+/// Decode `slot`'s occupancy word in `zone` under the slot's port lock, the
+/// lock every host installer holds while it publishes a word.
+pub fn zone_slot_occupant_in(
+    zone: &carrick_el1_abi::ZoneTables,
+    slot: ZoneSlotId,
+) -> ZoneSlotOccupant {
+    let state = PORTS[ExecutionSlot::zone(slot).index()].lock();
+    let word = zone.installed_space(slot);
+    match (state.running.is_some(), word) {
+        (true, word) => ZoneSlotOccupant::Host { word },
+        (false, 0) => ZoneSlotOccupant::Vacant,
+        (false, space) => ZoneSlotOccupant::Ring { space },
+    }
 }
 
 /// A host-only execution slot, for a vCPU (or a native executor) without a

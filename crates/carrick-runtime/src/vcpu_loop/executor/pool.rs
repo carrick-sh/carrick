@@ -545,9 +545,7 @@ impl ExecutorKick for WorkerKick {
 
     fn host_wait_began(&self) {
         // The hooks run on the executor's own thread, inside its quantum.
-        if let Some((slot, driver)) = super::backend::driven_zone_slot() {
-            carrick_kernel::el1_zone::step_away_from_slot(slot, driver);
-        }
+        super::backend::step_away_from_driven_zone_slot();
     }
 
     fn host_wait_ended(&self) {

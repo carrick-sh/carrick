@@ -142,6 +142,11 @@ pub trait ThreadCpu {
     /// Install translation roots (`TTBR0_EL1`, `TTBR1_EL1`), effective for
     /// everything after the call.
     fn set_translation(&mut self, ttbr0: u64, ttbr1: u64);
+    /// The live `TTBR0_EL1`, which authenticates a switch-in that keeps the
+    /// installed address space (#1100). `None`: this CPU cannot report it (a
+    /// test stand-in that never installed a root, or an ISA whose switch
+    /// does not run this path); the check is then skipped, never failed.
+    fn live_ttbr0(&self) -> Option<u64>;
     /// Invalidate, on every PE, the stage-1 translations of the ASID in
     /// `ttbr0` (`TLBI ASIDE1IS`), complete before the call returns.
     fn invalidate_asid(&mut self, ttbr0: u64);
@@ -631,7 +636,16 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// foreign-COW publication is not yet covered.
     fn enter_space(&mut self, mm: u64, native_owned: bool) -> bool {
         let (zone, slot) = (self.zone, self.slot);
-        if mm != 0 && zone.installed_space(slot) == mm {
+        // The word is half of "this vCPU runs `mm`" (#1100). A kept word runs
+        // only with `mm`'s open grant (gate, key, no owed invalidation) and
+        // with the live root being the grant's root. Every exit to the host
+        // vacates the word ([`El1Exit::Idle`]), so a kept word over another
+        // root is a broken invariant, never a reason to run; a refused or
+        // owing grant reinstalls below, through the gate.
+        if mm != 0
+            && zone.installed_space(slot) == mm
+            && keeps_installed_root(zone, slot, mm, self.cpu.live_ttbr0())
+        {
             return true;
         }
         // A native owner has no host thread for the idle executor to load;
@@ -669,7 +683,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// translations, so no pause of that process kicks it, and it walks no
     /// page table a retiring address space frees.
     fn leave_space(&mut self) {
-        leave_space(self.zone, self.slot, self.cpu);
+        let _vacated = leave_space(self.zone, self.slot, self.cpu);
     }
 
     /// Nothing is runnable on this vCPU: poll, then park in WFI, until a
@@ -1055,17 +1069,177 @@ pub struct FakeRegs {
 }
 
 /// Leave a process's translations before releasing its installed occupancy.
-/// Service handoffs and scheduler idling use the same ordered transition.
-pub fn leave_space(zone: &ZoneTables, slot: SlotId, cpu: &mut impl ThreadCpu) {
+/// Service handoffs, scheduler idling and every idle exit to the host
+/// ([`El1Exit::Idle`]) use the same ordered transition. The result is the
+/// only constructor of [`VacatedSlot`].
+pub fn leave_space(zone: &ZoneTables, slot: SlotId, cpu: &mut impl ThreadCpu) -> VacatedSlot {
     if zone.installed_space(slot) == 0 {
-        return;
+        return VacatedSlot { slot };
     }
     let idle = zone.spaces.idle_ttbr();
     if idle == 0 {
-        return;
+        // No maintenance root is published, so EL1 never installed a space
+        // here (`enter_space` refuses without one): the word is a host
+        // installer's, released by its own occupancy.
+        return VacatedSlot { slot };
     }
     cpu.set_translation(idle, idle);
     zone.release_space(slot);
+    VacatedSlot { slot }
+}
+
+/// Proof that `slot`'s vCPU holds no address space EL1 installed: its
+/// occupancy word is vacant and its live root is the maintenance root (or
+/// no maintenance root exists, so EL1 installed nothing). Only
+/// [`leave_space`] builds one; neither `Clone` nor `Copy`.
+///
+/// #1100: an idle exit that kept the word let the host's idle entry rewrite
+/// the vCPU's root to the maintenance root under a word still naming the
+/// space, and the next switch-in trusted the word and ran on the wrong root.
+#[must_use]
+#[derive(Debug, Eq, PartialEq)]
+pub struct VacatedSlot {
+    slot: SlotId,
+}
+
+impl VacatedSlot {
+    pub fn slot(&self) -> SlotId {
+        self.slot
+    }
+}
+
+/// The one way an EL1 entry leaves for the vector. An idle exit (`hvc #5`:
+/// the vCPU leaves for the host with no thread on it) carries the proof that
+/// its slot was vacated, so no producer of an idle exit can leave an
+/// address space installed on a vCPU the host is about to re-root.
+#[must_use]
+#[derive(Debug, Eq, PartialEq)]
+pub enum El1Exit {
+    Served,
+    Forward,
+    ServedWithWork,
+    Idle(VacatedSlot),
+    /// Raw thread-exit custody for the host retirement lane: the vector
+    /// captures the syscall with the thread (and its space) still loaded,
+    /// like a forward.
+    HostCustody,
+}
+
+impl El1Exit {
+    /// The vector's return word. The only constructor of [`ExitWord`].
+    pub fn encode(self) -> ExitWord {
+        use carrick_el1_abi::Action;
+        ExitWord(match self {
+            Self::Served => Action::Served,
+            Self::Forward => Action::Forward,
+            Self::ServedWithWork => Action::ServedWithWork,
+            Self::Idle(_) => Action::Idle,
+            Self::HostCustody => Action::HostCustody,
+        } as u64)
+    }
+
+    /// Seal a dispatch decision at the entry's final boundary. An idle exit
+    /// leaves the slot's space here, after every producer (scheduler arms,
+    /// dispatch routes, personality `Served::Idle` returns) has decided, so
+    /// none can be missed. `slot` is the entry's zone slot; an idle exit
+    /// without one is a broken entry binding.
+    pub fn seal(
+        action: carrick_el1_abi::Action,
+        zone: &ZoneTables,
+        slot: Option<SlotId>,
+        cpu: &mut impl ThreadCpu,
+    ) -> Self {
+        use carrick_el1_abi::Action;
+        match action {
+            Action::Served => Self::Served,
+            Action::Forward => Self::Forward,
+            Action::ServedWithWork => Self::ServedWithWork,
+            Action::HostCustody => Self::HostCustody,
+            Action::Idle => match slot {
+                Some(slot) => Self::Idle(leave_space(zone, slot, cpu)),
+                None => idle_exit_without_slot(),
+            },
+        }
+    }
+}
+
+/// The word `carrick_el1_syscall` returns to the vector: an encoded
+/// [`carrick_el1_abi::Action`]. `repr(transparent)` over `u64`, so it is the
+/// same register the vector reads; the field is private, so only
+/// [`El1Exit::encode`] builds one and `Action::Idle as u64` cannot be
+/// returned by the entry.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExitWord(u64);
+
+impl ExitWord {
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+#[cold]
+#[inline(never)]
+#[track_caller]
+fn idle_exit_without_slot() -> ! {
+    #[cfg(target_os = "none")]
+    hw::fatal_entry_binding(carrick_el1_abi::EntryBindingFatalReason::EntryBinding);
+    #[cfg(not(target_os = "none"))]
+    panic!("an idle exit names no zone slot to vacate")
+}
+
+/// Whether a switch-in may keep the installed `mm`: the shared
+/// [`carrick_sched_core::switch_in_root`] on the word, the live TTBR0 and
+/// `mm`'s [`carrick_sched_core::KeptAuthority`] (a word for an unpublished
+/// space is a host installer's and keeps, as before #1100). The table base address is compared (the ASID and CnP
+/// bits do not name another table). A stale root is fatal; `false` sends
+/// the switch-in through the installer protocol.
+#[inline(never)]
+fn keeps_installed_root(zone: &ZoneTables, slot: SlotId, mm: u64, live: Option<u64>) -> bool {
+    const TTBR_BADDR: u64 = 0x0000_ffff_ffff_fffe;
+    let published = zone.spaces.kept_authority(mm);
+    let authority = match published {
+        carrick_sched_core::KeptAuthority::Open(grant) => {
+            carrick_sched_core::KeptAuthority::Open(carrick_sched_core::KeptGrant {
+                root: grant.root & TTBR_BADDR,
+                ..grant
+            })
+        }
+        other => other,
+    };
+    let plan = carrick_sched_core::switch_in_root(
+        mm,
+        mm,
+        live.map(|root| root & TTBR_BADDR),
+        authority,
+        zone.spaces.idle_ttbr() & TTBR_BADDR,
+    );
+    match (plan, live, published) {
+        (carrick_sched_core::SwitchInRoot::Keep, _, _) => true,
+        (
+            carrick_sched_core::SwitchInRoot::StaleWord,
+            Some(live),
+            carrick_sched_core::KeptAuthority::Open(grant),
+        ) => stale_root(slot, mm, live, grant.root),
+        _ => false,
+    }
+}
+
+/// A switch-in would run `mm`'s thread on another table.
+#[cold]
+#[inline(never)]
+#[track_caller]
+fn stale_root(slot: SlotId, mm: u64, live: u64, expected: u64) -> ! {
+    #[cfg(target_os = "none")]
+    {
+        let _ = (slot, mm, live, expected);
+        hw::fatal_entry_binding(carrick_el1_abi::EntryBindingFatalReason::SwitchInStaleRoot);
+    }
+    #[cfg(not(target_os = "none"))]
+    panic!(
+        "switch-in on a stale root: slot={} mm={mm} live={live:#x} expected={expected:#x}",
+        slot.raw()
+    )
 }
 
 /// A host-test stand-in for the CPU: the registers a switch moves, plus a
@@ -1200,6 +1374,11 @@ impl ThreadCpu for FakeCpu {
     fn set_translation(&mut self, ttbr0: u64, ttbr1: u64) {
         self.ttbr = (ttbr0, ttbr1);
         self.translations.push((ttbr0, ttbr1));
+    }
+
+    /// A stand-in that never installed a root reports none.
+    fn live_ttbr0(&self) -> Option<u64> {
+        (self.ttbr.0 != 0).then_some(self.ttbr.0)
     }
 
     fn invalidate_asid(&mut self, ttbr0: u64) {

@@ -223,6 +223,13 @@ impl ChildExitRecord {
     }
 }
 
+/// This CPU's executing CPL0 root: the lane's one reader of the live CR3,
+/// for the fork parent's root and the switch-in check (#1100, #1405).
+#[cfg(target_os = "none")]
+fn lane_live_root() -> Option<RootGpa> {
+    carrick_el1::isa::x86::hardware_live_root().ok()
+}
+
 #[cfg(test)]
 mod process_exit_tests {
     use super::ChildExitRecord;
@@ -510,10 +517,48 @@ impl NativeLane<'_> {
             .position(|ctx| ctx.record == Some(reference))?;
         let identity = self.zone.record(switched.record).identity();
         let context = self.lane.contexts[index].clone();
+        // The word alone never decides (#1405, the x86 half of #1100): a
+        // kept word runs as is only with the space's open grant (gate, key,
+        // no owed invalidation) and the live CR3 being the grant's root.
+        // Otherwise CR3 leaves for the maintenance root before vacancy is
+        // published, the install reads the gate again, and the space's
+        // root is loaded after it.
         #[cfg(target_os = "none")]
-        let changed_mm = self.zone.installed_space(self.lane.slot) != identity.mm;
+        let plan = {
+            let installed = self.zone.installed_space(self.lane.slot);
+            // CPL0 installs only published spaces and has no host-installed
+            // words, so an unpublished space is refused here, as the
+            // install below would refuse it.
+            let authority = match self.zone.spaces.kept_authority(identity.mm) {
+                carrick_sched_core::KeptAuthority::Open(grant) => {
+                    carrick_sched_core::KeptAuthority::Open(carrick_sched_core::KeptGrant {
+                        root: grant.root & !0xfff,
+                        ..grant
+                    })
+                }
+                _ => carrick_sched_core::KeptAuthority::Refused,
+            };
+            carrick_sched_core::switch_in_root(
+                installed,
+                identity.mm,
+                lane_live_root().map(|root| root.address().raw()),
+                authority,
+                self.lane.maintenance_root.address().raw(),
+            )
+        };
+        #[cfg(not(target_os = "none"))]
+        let plan = carrick_sched_core::SwitchInRoot::Install {
+            leave_live_root: false,
+        };
+        let keep = plan == carrick_sched_core::SwitchInRoot::Keep;
         #[cfg(target_os = "none")]
-        if changed_mm {
+        if matches!(
+            plan,
+            carrick_sched_core::SwitchInRoot::StaleWord
+                | carrick_sched_core::SwitchInRoot::Install {
+                    leave_live_root: true
+                }
+        ) {
             use carrick_guest_arch::{AddressContext, ContextGeneration, MmGeneration, MmuBackend};
             let context = AddressContext {
                 root: self.lane.maintenance_root,
@@ -524,10 +569,14 @@ impl NativeLane<'_> {
                 .install_context(context)
                 .ok()?;
         }
-        self.zone.release_space(self.lane.slot);
-        let grant = self.zone.install_space(self.lane.slot, identity.mm)?;
+        let grant = if keep {
+            None
+        } else {
+            self.zone.release_space(self.lane.slot);
+            Some(self.zone.install_space(self.lane.slot, identity.mm)?)
+        };
         #[cfg(target_os = "none")]
-        if changed_mm {
+        if let Some(grant) = grant {
             use carrick_guest_arch::{
                 AddressContext, ContextGeneration, FrameGpa, MmGeneration, MmuBackend, RootGpa,
             };
@@ -543,7 +592,7 @@ impl NativeLane<'_> {
                 .ok()?;
         }
         #[cfg(not(target_os = "none"))]
-        let _ = grant;
+        let _ = (grant, keep);
         *self.frame = context.frame;
         if let Some(result) = switched.result {
             let slot = u32::try_from(result).ok()?;
@@ -819,7 +868,7 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         let Some(visible_tid) = u32::try_from(child.tid).ok() else {
             return refused();
         };
-        let Some(parent_root) = carrick_el1::isa::x86::hardware_live_root().ok() else {
+        let Some(parent_root) = lane_live_root() else {
             return refused();
         };
         let Some(residency) = crate::process::residency() else {

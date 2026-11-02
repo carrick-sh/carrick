@@ -279,6 +279,81 @@ impl Occupancy {
     }
 }
 
+/// How a switch-in of address space `space` treats the vCPU's live
+/// translation root (#1100), on either ISA. The slot's word is only half of
+/// "this vCPU runs `space`". A kept word is authenticated twice: against the
+/// space's open grant (gate open, key still `space`, no owed invalidation;
+/// [`crate::AddressSpaces::grant`]) and with the live root against the
+/// grant's root. Roots are table base addresses; the caller masks ISA tag
+/// bits (ARM's ASID and CnP).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SwitchInRoot {
+    /// The word names `space`, its grant is open with nothing owed, and the
+    /// live root is the grant's root (or the CPU cannot report one): run on
+    /// it, with no install.
+    Keep,
+    /// The word names `space` and its grant is open, but the live root is
+    /// another table: an exit left the word behind while the root was
+    /// rewritten. ARM fails loud here (every exit vacates there); x86
+    /// reinstalls (#1405).
+    StaleWord,
+    /// Install `space` through the installer protocol (word, then gate),
+    /// which refuses a raised gate or a freed key. Chosen as well for a kept
+    /// word whose grant is refused or owes an invalidation, so a kept word
+    /// never bypasses the gate. When `leave_live_root`, the live root is not
+    /// the maintenance root, so the CPU moves there first: vacancy is never
+    /// published on a slot whose live root still names a space.
+    Install { leave_live_root: bool },
+}
+
+/// The open grant a kept word is checked against: its root and whether an
+/// invalidation is owed before the space may run again.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KeptGrant {
+    pub root: u64,
+    pub invalidation_owed: bool,
+}
+
+/// What authenticates a kept word for `space` ([`crate::AddressSpaces::kept_authority`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeptAuthority {
+    /// Published with its gate open.
+    Open(KeptGrant),
+    /// Published, but its gate is raised or closed (a pause, a retirement)
+    /// or the entry no longer names `space`: never kept.
+    Refused,
+    /// No published entry names `space`. EL1 installs only published
+    /// spaces, so such a word is a host installer's (its task's own roots
+    /// are live), governed by the host's occupancy, not by an EL1 gate.
+    Unpublished,
+}
+
+/// Decide [`SwitchInRoot`] from the slot's word, the live root, `space`'s
+/// [`KeptAuthority`] and the maintenance root.
+pub fn switch_in_root(
+    installed: u64,
+    space: u64,
+    live: Option<u64>,
+    authority: KeptAuthority,
+    maintenance: u64,
+) -> SwitchInRoot {
+    if space != 0 && installed == space {
+        match (authority, live) {
+            (KeptAuthority::Open(grant), Some(live)) if live != grant.root => {
+                return SwitchInRoot::StaleWord;
+            }
+            (KeptAuthority::Open(grant), _) if !grant.invalidation_owed => {
+                return SwitchInRoot::Keep;
+            }
+            (KeptAuthority::Unpublished, _) => return SwitchInRoot::Keep,
+            _ => {}
+        }
+    }
+    SwitchInRoot::Install {
+        leave_live_root: live != Some(maintenance),
+    }
+}
+
 #[cfg(test)]
 #[cfg(not(feature = "loom"))]
 mod tests {
@@ -297,6 +372,68 @@ mod tests {
         let mut slots = Vec::new();
         table.for_each_running(space, |slot| slots.push(slot.index()));
         slots
+    }
+
+    /// #1100 W6 (x86 #1405 and the ARM switch-in): a kept word is trusted
+    /// only with an open grant and its own live root. A word left over a
+    /// rewritten root is stale. A kept word whose space is regated, freed or
+    /// owes an invalidation is reinstalled through the gate, never kept. An
+    /// install leaves the live root first unless the CPU is already on the
+    /// maintenance root, so vacancy is never published while the live root
+    /// names a space.
+    #[test]
+    fn a_switch_in_authenticates_the_live_root_and_never_vacates_under_a_space() {
+        const MAINTENANCE: u64 = 0x1000;
+        const ROOT_Y: u64 = 0x7000;
+        const ROOT_Z: u64 = 0x9000;
+        let open = KeptAuthority::Open(KeptGrant {
+            root: ROOT_Y,
+            invalidation_owed: false,
+        });
+        let plan = |installed, live| switch_in_root(installed, 7, live, open, MAINTENANCE);
+        let reinstall = |leave_live_root| SwitchInRoot::Install { leave_live_root };
+        assert_eq!(plan(7, Some(ROOT_Y)), SwitchInRoot::Keep);
+        assert_eq!(plan(7, Some(MAINTENANCE)), SwitchInRoot::StaleWord);
+        assert_eq!(plan(7, Some(ROOT_Z)), SwitchInRoot::StaleWord);
+        // A CPU that cannot report its root keeps on an open grant.
+        assert_eq!(plan(7, None), SwitchInRoot::Keep);
+        // Regated, closed or re-keyed: through the gate again.
+        let refused = KeptAuthority::Refused;
+        assert_eq!(
+            switch_in_root(7, 7, Some(ROOT_Y), refused, MAINTENANCE),
+            reinstall(true)
+        );
+        assert_eq!(
+            switch_in_root(7, 7, Some(MAINTENANCE), refused, MAINTENANCE),
+            reinstall(false)
+        );
+        // A word no published entry names is a host installer's.
+        assert_eq!(
+            switch_in_root(7, 7, Some(ROOT_Z), KeptAuthority::Unpublished, MAINTENANCE),
+            SwitchInRoot::Keep
+        );
+        // An owed invalidation is never skipped by a keep.
+        let owed = KeptAuthority::Open(KeptGrant {
+            root: ROOT_Y,
+            invalidation_owed: true,
+        });
+        assert_eq!(
+            switch_in_root(7, 7, Some(ROOT_Y), owed, MAINTENANCE),
+            reinstall(true)
+        );
+        assert_eq!(plan(0, Some(MAINTENANCE)), reinstall(false));
+        for (installed, live) in [(9, Some(ROOT_Z)), (0, Some(ROOT_Z)), (0, None)] {
+            assert_eq!(
+                plan(installed, live),
+                reinstall(true),
+                "word {installed} live {live:?}"
+            );
+        }
+        // Space 0 is never kept.
+        assert_eq!(
+            switch_in_root(0, 0, Some(MAINTENANCE), open, MAINTENANCE),
+            reinstall(false)
+        );
     }
 
     #[test]
