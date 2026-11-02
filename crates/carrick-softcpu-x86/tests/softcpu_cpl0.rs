@@ -758,17 +758,26 @@ fn sysret_and_iretq_enforce_privilege_transitions_and_fault_paths() {
 fn shared_cpuid_authority_drives_softcpu_cpuid_and_osxsave() {
     let view = carrick_x86::GuestCpuidView::x86_64_v3().with_apic_id(7);
     let (mut cpu, mut mem, _) = setup_cpl0_cpu(b"\x0f\xa2", Box::new(view));
-    for osxsave in [false, true] {
-        if osxsave {
-            cpu.context_mut().cr4 |= 1 << 18;
-        } else {
-            cpu.context_mut().cr4 &= !(1 << 18);
-        }
-        for leaf in [0, 1, 7, 0x15, 0x8000_0001, 0x8000_0008] {
+    for (osxsave, avx) in [
+        (false, false),
+        (true, false),
+        (true, true),
+        (false, true),
+        (true, false),
+    ] {
+        let ctx = cpu.context_mut();
+        ctx.cr4 = (ctx.cr4 & !(1 << 18)) | (u64::from(osxsave) << 18);
+        ctx.xcr0 = if avx { 7 } else { 3 };
+        for (leaf, subleaf) in view
+            .to_leaf_entries()
+            .iter()
+            .map(|entry| (entry.function, entry.index))
+            .chain([(0x0b, 0), (0x0d, 1), (0x4000_0000, 0)])
+        {
             let ctx = cpu.context_mut();
             ctx.rip = CODE_VA;
             ctx.gpr[reg::RAX] = u64::from(leaf);
-            ctx.gpr[reg::RCX] = 0;
+            ctx.gpr[reg::RCX] = u64::from(subleaf);
             step_ok(&mut cpu, &mut mem, CODE_VA + 2);
             let g = &cpu.context().gpr;
             let got = CpuidRegs::new(
@@ -777,7 +786,11 @@ fn shared_cpuid_authority_drives_softcpu_cpuid_and_osxsave() {
                 g[reg::RCX] as u32,
                 g[reg::RDX] as u32,
             );
-            assert_eq!(got, view.cpuid_for_state(leaf, 0, osxsave, false));
+            assert_eq!(
+                got,
+                view.cpuid_for_state(leaf, subleaf, osxsave, avx),
+                "leaf {leaf:#x}/{subleaf}, OSXSAVE={osxsave}, AVX={avx}"
+            );
         }
     }
 }

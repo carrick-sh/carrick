@@ -91,3 +91,23 @@ KVM reports the capability. To reproduce a missing-extension negative
 control, temporarily set CPUID_1_ECX_OPTIONAL to zero; the independent table
 and live oracles must reject the missing bits. Restore and rebuild before
 using any later verdict.
+
+## Soft authority live-state prerequisite (#1430)
+
+The shared authority adapter now queries `GuestCpuidView::cpuid_for_state`
+using the executing SoftCpu's CR4.OSXSAVE and XCR0.AVX. The VM-free production
+CPUID binding checks every installed table entry, absent topology and hypervisor
+leaves, and both enabled XSAVE sizes. Its red-first failure was leaf `0xD/0`
+with XCR0.AVX clear: EBX was 832 rather than 576. Query work remains one
+constant-time shared-view lookup, without host CPUID or table scans.
+
+This prerequisite does not establish #1430 acceptance. `Cpl0CpuidView` remains:
+`decode::supported_body` rejects VEX encodings and does not admit AESENC or
+PCLMULQDQ; `SoftCpuContext` stores only a 512-byte FXSAVE image; and
+`cpu::emulate_fx_image` masks the XSAVE component request to `3`, with a
+576-byte buffer. Full adoption must implement the advertised instruction
+families and preserve YMM state through execution, exceptions, CPU switches
+and XSAVE/XRSTOR before replacing the CPL0 view. Reducing the shared profile
+instead requires the owner decision specified by #1430. No reduced-profile
+decision is assumed here, and no full soft/KVM leaf-equivalence acceptance is
+claimed. The registered binding proves shared-authority consumption only.

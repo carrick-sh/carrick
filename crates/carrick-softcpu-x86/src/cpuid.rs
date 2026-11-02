@@ -11,6 +11,23 @@ pub trait CpuidAuthority: Send + Sync {
     /// Query `(leaf, subleaf)` (`EAX = leaf`, `ECX = subleaf`).
     fn cpuid(&self, leaf: u32, subleaf: u32) -> CpuidRegs;
 
+    /// Query using the executing CPU's live OSXSAVE and AVX component state.
+    /// Synthetic authorities retain their verbatim answers unless they opt into
+    /// architectural OSXSAVE mirroring.
+    fn cpuid_for_state(
+        &self,
+        leaf: u32,
+        subleaf: u32,
+        osxsave_enabled: bool,
+        _xcr0_avx_enabled: bool,
+    ) -> CpuidRegs {
+        let mut out = self.cpuid(leaf, subleaf);
+        if leaf == 1 && self.mirrors_osxsave() && (out.ecx & (1 << 26)) != 0 {
+            out.ecx = (out.ecx & !(1 << 27)) | (u32::from(osxsave_enabled) << 27);
+        }
+        out
+    }
+
     /// Whether `CPUID.01H:ECX.OSXSAVE[bit 27]` should dynamically mirror `CR4.OSXSAVE`
     /// when `CPUID.01H:ECX.XSAVE[bit 26]` is set (Intel SDM Vol. 2A `CPUID`).
     ///
@@ -257,5 +274,15 @@ impl CpuidAuthority for carrick_x86::GuestCpuidView {
     }
     fn mirrors_osxsave(&self) -> bool {
         true
+    }
+
+    fn cpuid_for_state(
+        &self,
+        leaf: u32,
+        subleaf: u32,
+        osxsave_enabled: bool,
+        xcr0_avx_enabled: bool,
+    ) -> CpuidRegs {
+        self.cpuid_for_state(leaf, subleaf, osxsave_enabled, xcr0_avx_enabled)
     }
 }

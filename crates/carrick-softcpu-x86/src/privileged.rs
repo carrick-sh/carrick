@@ -999,14 +999,12 @@ fn emulate_cpuid(
 ) -> Result<u64, X86Exception> {
     let leaf = ctx.gpr[reg::RAX] as u32;
     let subleaf = ctx.gpr[reg::RCX] as u32;
-    let mut out = cpuid.cpuid(leaf, subleaf);
-    if leaf == 1 && cpuid.mirrors_osxsave() && (out.ecx & (1 << 26)) != 0 {
-        if (ctx.cr4 & CR4_OSXSAVE) != 0 {
-            out.ecx |= 1 << 27;
-        } else {
-            out.ecx &= !(1 << 27);
-        }
-    }
+    let out = cpuid.cpuid_for_state(
+        leaf,
+        subleaf,
+        (ctx.cr4 & CR4_OSXSAVE) != 0,
+        (ctx.xcr0 & (1 << 2)) != 0,
+    );
     ctx.gpr[reg::RAX] = u64::from(out.eax);
     ctx.gpr[reg::RBX] = u64::from(out.ebx);
     ctx.gpr[reg::RCX] = u64::from(out.ecx);
