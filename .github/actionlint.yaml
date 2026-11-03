@@ -7,7 +7,6 @@ self-hosted-runner:
     - carrick-hvf-closure
     - carrick-kvm
     - kvm
-    - willow-kvm
     - carrick-agent
 paths:
   .github/workflows/kernel-runtime.yml:

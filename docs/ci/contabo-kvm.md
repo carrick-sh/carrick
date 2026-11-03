@@ -85,14 +85,14 @@ DNS to the public resolver and NAT to the internet still work.
 
 ## Runner lane
 
-The `kvm-tests-willow` job and its `willow-kvm` runner labels are served from
-Contabo; there is no separate workflow arm. Only one standing controller may
-serve those labels, so Willow's stays stopped. The lane runs when
-`CARRICK_SELF_HOSTED_KVM=true`.
+The `kvm-tests` job and its `carrick-kvm` runner labels (`[self-hosted, Linux,
+X64, carrick-kvm]`, `ci_scaler::LABELS`) are served from Contabo; Willow was
+retired on 2026-10-12 (#1552). Only one standing controller may serve those
+labels. The lane runs when `CARRICK_SELF_HOSTED_KVM=true`.
 
 ## Events and receipts
 
-`kernel-runtime.yml` runs `kvm-tests-willow` on each `push` to `main` and
+`kernel-runtime.yml` runs `kvm-tests` on each `push` to `main` and
 owner `workflow_dispatch` on `main`, when this backend is selected. The
 standing controller and job-start hook admit exactly those events for this
 workflow (dispatch requires both `actor` and `triggering_actor` to be
@@ -285,8 +285,8 @@ administrative changes.
 
 The [agent dispatch provider](dispatch-worker.md) shares the existing ledger,
 VMID pool, admission checks, assignment re-vetting, deadlines and destruction
-path with `willow-kvm`. Its active template is VM 9001 (9000 retained until unreferenced), with 8 vCPU and 20 GiB per
-clone and at most four live agent clones. KVM capacity is counted separately.
+path with `carrick-kvm`. Its active template is VM 9000 (9001 retained until unreferenced), with 8 vCPU and 20 GiB per
+clone and `--max-agent-clones 6` live agent clones (1 to 8, default 4). KVM capacity is counted separately, and hitting the 80% projected-CPU ceiling defers new or pre-boot clones in both standing lanes rather than stopping the controller (#1552).
 Clones are destroyed after one job, including failed or timed-out jobs. The
 owner deploys the controller and verifies the live trial; portable tests alone
 do not establish deployed acceptance.

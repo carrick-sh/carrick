@@ -42,8 +42,8 @@ pub const DISPATCH_OWNER: &str = "tjfontaine";
 /// Credentialed agent clones, served by the same Contabo controller.
 pub const AGENT_LABELS: [&str; 1] = ["carrick-agent"];
 pub const DISPATCH_WORKFLOW: &str = ".github/workflows/dispatch-worker.yml";
-/// The KVM runner label set, shared by Willow and Contabo.
-pub const LABELS: [&str; 4] = ["self-hosted", "Linux", "X64", "willow-kvm"];
+/// The KVM runner label set served by Contabo standing clones.
+pub const LABELS: [&str; 4] = ["self-hosted", "Linux", "X64", "carrick-kvm"];
 /// The one HVF runner label set for cloudmac main-push JIT runners.
 pub const HVF_LABELS: [&str; 4] = ["self-hosted", "macOS", "ARM64", "carrick-hvf"];
 /// The 24-hour closure job's labels: never served by `mac-jit`, so it can

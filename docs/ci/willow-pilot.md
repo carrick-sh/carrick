@@ -65,10 +65,11 @@ gh workflow run willow-pilot.yml --ref work/willow-pilot
 ## Standing mode (main pushes and owner dispatch)
 
 The standing controller now runs on the Contabo host
-([contabo-kvm.md](contabo-kvm.md)); Willow's stays stopped, because only one
-controller may serve the `willow-kvm` labels.
+([contabo-kvm.md](contabo-kvm.md)); the Willow fleet was retired on 2026-10-12
+and `.github/workflows/willow-pilot.yml` was removed (#1552). Only one
+controller may serve the `carrick-kvm` labels (`ci_scaler::LABELS`).
 `ci-scaler standing` reuses this controller for `kernel-runtime.yml`'s
-`kvm-tests-willow` job (selected when `CARRICK_SELF_HOSTED_KVM` is `true`):
+`kvm-tests` job (selected when `CARRICK_SELF_HOSTED_KVM` is `true`):
 pushes to main and owner dispatches on
 main (`Admission::Standing`; see the
 [security review](willow-pilot-security-review.md#standing-admission-surface)).
@@ -79,9 +80,10 @@ reservation records demand provenance; every assignment still requires
 controller approval. It admits at most
 `--max-concurrency` clones (1 by default, never more than 2). Demand lists
 only this workflow's runs. GitHub/PVE admission failures back off (30 s
-doubling to 10 min) and never end the loop; the 80% CPU ceiling still stops
-it. A job whose clone closed without a job is served again, at most three
-times per job key.
+doubling to 10 min) and never end the loop; in standing mode the 80% projected-CPU
+ceiling defers new and pre-boot clones rather than stopping the controller
+(the one-job pilot mode keeps the 80% stop rule). A job whose clone closed
+without a job is served again, at most three times per job key.
 
 ### Receipt chain
 
@@ -108,7 +110,7 @@ the same credential-free rendezvous as cloudmac ([mac-jit.md](mac-jit.md)):
    `/run/carrick-ci/approved-policy`.
 2. A dedicated assignment worker reads that request as root through the
    scoped guest agent, with a one-second timer between passes and under the same flock. It authenticates the job by this
-   clone's runner id and the exact `willow-kvm` label set, re-vets the actual
+   clone's runner id and the exact `carrick-kvm` label set, re-vets the actual
    run through `Github::vet_assignment` (main push or owner dispatch admission), and fsyncs the actual job into the
    ledger (`assigned`, `assigned_key`, `approved`). Approval and supersession
    use the same controller admission lock; a superseded run gets no approval.

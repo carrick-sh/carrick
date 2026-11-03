@@ -3,7 +3,7 @@
 # check counts as passing.
 #
 # Having this placeholder trigger only on pull_request ensures pull requests
-# satisfy the required check name while the merge queue re-evaluates it on real
+# satisfy the check name while post-landing pushes to main evaluate it on real
 # hardware via .github/workflows/kernel-runtime.yml.
 
 name: Trusted hardware (PR placeholder)
@@ -21,4 +21,4 @@ jobs:
     timeout-minutes: 2
     steps:
       - run: |
-          echo "Trusted hardware lanes (HVF signed + KVM) run only in the merge queue: .github/workflows/kernel-runtime.yml. This placeholder lets a pull request satisfy the required check name; the merge group re-evaluates it on real hardware."
+          echo "Trusted hardware lanes (HVF signed + KVM) run post-landing on push to main and owner dispatch: .github/workflows/kernel-runtime.yml. This placeholder lets a pull request satisfy the check name."

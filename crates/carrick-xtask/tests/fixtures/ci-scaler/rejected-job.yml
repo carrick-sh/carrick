@@ -3,7 +3,7 @@
   "on": { "workflow_dispatch": {} },
   "jobs": {
     "rejected": {
-      "runs-on": ["self-hosted", "Linux", "X64", "willow-kvm"],
+      "runs-on": ["self-hosted", "Linux", "X64", "carrick-kvm"],
       "steps": [
         { "if": "always()", "run": "printf 'always executed\\n' > always-ran" },
         { "if": "failure()", "run": "printf 'failure executed\\n' > failure-ran" }

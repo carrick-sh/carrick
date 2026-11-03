@@ -720,11 +720,12 @@ SendMessage.
   exclusive `gate`). Worktree admission keys on the checkout root's
   device+inode: never copy or cross-volume move an admitted checkout; remove
   and re-add it.
-- **KVM evidence comes from the merge queue** (PRs never run `kvm-tests`,
-  so an admin merge has none). The `kvm-tests` lane produces
-  a receipt and `kvm-gate` fails on NEW failures against the merge-group base.
-  Do not run `just test-kvm` on the shared willow worker VMs; a targeted KVM
-  test to debug a specific defect runs under `just lease gate`.
+- **KVM evidence runs post-landing on Contabo** (PRs and merge groups run only
+  VM-free `x86-host-tests`; `kernel-runtime.yml` runs `kvm-tests` on Contabo
+  `carrick-kvm` JIT clones on `main` push and owner dispatch). The `kvm-tests`
+  lane produces a receipt and `kvm-gate` fails on NEW failures against the
+  receipted main ancestor; prove pre-merge x86/KVM/HAL/CPL0 changes locally or
+  on an ephemeral KVM runner under `just lease gate`.
 - **Personality split:** the shared kernel is personality-neutral. Linux is
   one personality (`carrick-personality-linux`); out-of-tree personalities
   build only on `carrick-personality-api`. Nothing in carrick names NT or any

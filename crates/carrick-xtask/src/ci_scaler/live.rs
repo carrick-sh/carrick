@@ -607,6 +607,24 @@ fn admission_verdict(
         pending,
     ))
 }
+/// Whether `admission` treats a live 80% projected-CPU breach as a deferral
+/// (`Ok(false)`) rather than a fatal pilot stop (`Err(CpuCeiling)`).
+///
+/// The one-job pilot (`Admission::Pilot`) stops on a busy shared host; the
+/// standing controller (`Admission::Standing` and its `Admission::Agent` lane)
+/// runs up to 8 nominal 8-vCPU clones on 48 threads and defers new or booting
+/// clones until running work finishes (#1552).
+fn admit_for_policy(
+    admission: &Admission,
+    verdict: Result<bool, ScalerError>,
+) -> Result<bool, ScalerError> {
+    match verdict {
+        Err(ScalerError::CpuCeiling { .. }) if !matches!(admission, Admission::Pilot { .. }) => {
+            Ok(false)
+        }
+        other => other,
+    }
+}
 fn resource_admission(pve: &Pve, pending: Pending) -> Result<bool, ScalerError> {
     fn cpu() -> Result<(u64, u64), ScalerError> {
         let stat = std::fs::read_to_string("/proc/stat")?;
@@ -894,6 +912,29 @@ impl PreBoot {
     }
 }
 
+/// Wait for host resources before starting an owned stopped clone.
+///
+/// Other clones still booting are charged at nominal size although they may
+/// already use part of it, so a refusal here means "not now". A provisioning
+/// worker waits for them to run or retire; the lifecycle loop fails fast.
+fn await_pre_boot_admission(
+    admission: &Admission,
+    pre_boot: PreBoot,
+    mut check: impl FnMut() -> Result<bool, ScalerError>,
+    mut pause: impl FnMut(Duration),
+) -> Result<(), ScalerError> {
+    let admit_by = pre_boot.deadline();
+    loop {
+        if admit_for_policy(admission, check())? {
+            return Ok(());
+        }
+        if Instant::now() >= admit_by {
+            return Err(ScalerError::Guard("host admission denied before boot"));
+        }
+        pause(Duration::from_secs(15));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn boot_and_register(
     pve: &Pve,
@@ -931,20 +972,15 @@ fn boot_and_register(
         )?),
         &format!("{}/config", pve.base(row.vm)),
     )?;
-    // Other clones still booting are charged at nominal size although they
-    // may already use part of it, so a refusal here means "not now". A
-    // worker waits for them to run (or retire); the loop fails fast.
-    let admit_by = pre_boot.deadline();
-    loop {
-        ledger.refresh()?;
-        if resource_admission(pve, ledger.pending(&row.name, nominal(pve)))? {
-            break;
-        }
-        if Instant::now() >= admit_by {
-            return Err(ScalerError::Guard("host admission denied before boot"));
-        }
-        std::thread::sleep(Duration::from_secs(15));
-    }
+    await_pre_boot_admission(
+        admission,
+        pre_boot,
+        || {
+            ledger.refresh()?;
+            resource_admission(pve, ledger.pending(&row.name, nominal(pve)))
+        },
+        std::thread::sleep,
+    )?;
     pve.guard(row)?;
     // A linked clone inherits the template's `allow-ksm: 0`; refuse one
     // that lost it before the guest runs.
@@ -1223,8 +1259,8 @@ struct Pass {
     frozen: Option<ScalerError>,
 }
 /// Reconcile every active clone. One row's error does not starve the others.
-/// KVM CPU-ceiling stops retain their existing policy. Agent admission
-/// pressure freezes new work while reconciliation continues for live agents.
+/// Pilot CPU-ceiling stops retain their one-job stop rule; standing KVM and
+/// agent admission pressure freezes new work while reconciliation continues.
 fn reconcile_all(
     pve: &Pve,
     gh: &Github,
@@ -1242,11 +1278,12 @@ fn reconcile_all(
     let mut finished = 0;
     let mut first_error = None;
     for row in active {
-        let lane = row.lane;
         match reconcile_one(pve, gh, ledger, dir, path, approval, row) {
             Ok(true) => finished += 1,
             Ok(false) => {}
-            Err(error @ ScalerError::CpuCeiling { .. }) if lane == CloneLane::Kvm => {
+            Err(error @ ScalerError::CpuCeiling { .. })
+                if matches!(approval.1, Admission::Pilot { .. }) =>
+            {
                 return Err(error);
             }
             Err(error) => {
@@ -2237,10 +2274,7 @@ fn admit_one(
         (budget, lane),
         || {
             gh.vet(admission, job)?;
-            match resource_admission(pve, pending) {
-                Err(ScalerError::CpuCeiling { .. }) if lane == CloneLane::Agent => Ok(false),
-                result => result,
-            }
+            admit_for_policy(admission, resource_admission(pve, pending))
         },
         || pve.inventory(),
     )?
@@ -3141,7 +3175,7 @@ mod tests {
         ));
         // A standing controller never resumes a pilot clone's job.
         assert!(!pending_owned_job(&row, &job, &run, &Admission::Standing));
-        job["labels"] = json!(["self-hosted", "Linux", "X64", "willow-kvm", "extra"]);
+        job["labels"] = json!(["self-hosted", "Linux", "X64", "carrick-kvm", "extra"]);
         assert!(!pending_owned_job(&row, &job, &run, &approved));
     }
     #[test]
@@ -3149,6 +3183,112 @@ mod tests {
         assert!(enforce_cpu_ceiling(0.675, 16, 2).is_ok());
         assert!(matches!(
             enforce_cpu_ceiling(0.676, 16, 2),
+            Err(ScalerError::CpuCeiling { .. })
+        ));
+    }
+    /// #1552: Contabo runs up to six 8-vCPU agent clones beside two 8-vCPU KVM
+    /// clones on 48 threads. When running clones push live CPU past 63.3%,
+    /// both `CloneLane::Kvm` (`Admission::Standing`) and `CloneLane::Agent`
+    /// (`Admission::Agent`) must defer at reservation and pre-boot instead of
+    /// crashing `carrick-ci-standing` or burning `MAX_SERVES_PER_JOB`; only
+    /// `Admission::Pilot` treats the 80% ceiling as a fatal stop condition.
+    #[test]
+    fn standing_kvm_and_agent_lanes_defer_on_cpu_ceiling_while_pilot_stops() {
+        let busy_ctb = HostSample {
+            busy: 0.70,
+            threads: 48,
+            available: 80 << 30,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("ledger.json");
+        let budget = CloneBudget {
+            kvm: Concurrency::try_from(2).unwrap(),
+            agents: "6".parse().unwrap(),
+        };
+        let key = JobKey {
+            run: RunId(41_703_799_043),
+            attempt: 1,
+            job: JobId(99),
+        };
+        let mut ledger = Ledger::default();
+        for lane in [CloneLane::Kvm, CloneLane::Agent] {
+            let admission = lane.admission();
+            let nominal_size = site::CONTABO
+                .for_lane(lane)
+                .map(|s| (s.cores, s.memory_mib))
+                .unwrap();
+            let reserved = reserve_admitted_clone(
+                &mut ledger,
+                &path,
+                key,
+                (budget, lane),
+                || {
+                    admit_for_policy(
+                        &admission,
+                        admission_verdict(&busy_ctb, nominal_size, Pending::default()),
+                    )
+                },
+                || panic!("inventory must not be queried when CPU ceiling defers {lane:?}"),
+            )
+            .unwrap();
+            assert!(reserved.is_none(), "{lane:?} must defer on busy host");
+            assert!(
+                !ledger.served(key),
+                "{lane:?} deferral must not consume a serve"
+            );
+
+            let mut checks = 0;
+            let mut pauses = 0;
+            await_pre_boot_admission(
+                &admission,
+                PreBoot::Defer,
+                || {
+                    checks += 1;
+                    let sample = HostSample {
+                        busy: if checks == 1 { 0.70 } else { 0.40 },
+                        ..busy_ctb
+                    };
+                    admission_verdict(&sample, nominal_size, Pending::default())
+                },
+                |_| pauses += 1,
+            )
+            .unwrap();
+            assert_eq!(
+                (checks, pauses),
+                (2, 1),
+                "{lane:?} pre-boot must wait and retry"
+            );
+
+            let fail_fast = await_pre_boot_admission(
+                &admission,
+                PreBoot::FailFast,
+                || admission_verdict(&busy_ctb, nominal_size, Pending::default()),
+                |_| panic!("FailFast must not sleep"),
+            );
+            assert!(
+                matches!(
+                    fail_fast,
+                    Err(ScalerError::Guard("host admission denied before boot"))
+                ),
+                "{lane:?} FailFast must return Guard, never fatal CpuCeiling: {fail_fast:?}"
+            );
+        }
+
+        let pilot = Admission::pilot(&"a".repeat(40)).unwrap();
+        assert!(matches!(
+            admit_for_policy(
+                &pilot,
+                admission_verdict(&busy_ctb, (2, 4096), Pending::default()),
+            ),
+            Err(ScalerError::CpuCeiling { .. })
+        ));
+        assert!(matches!(
+            await_pre_boot_admission(
+                &pilot,
+                PreBoot::Defer,
+                || admission_verdict(&busy_ctb, (2, 4096), Pending::default()),
+                |_| panic!("pilot must stop immediately on CpuCeiling"),
+            ),
             Err(ScalerError::CpuCeiling { .. })
         ));
     }
