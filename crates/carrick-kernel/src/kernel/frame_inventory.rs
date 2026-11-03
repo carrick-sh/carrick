@@ -890,6 +890,9 @@ impl FrameInventoryAuthority {
         grant: Option<ExactMappingRow>,
     ) -> Result<(T, u64, bool), FrameInventoryError> {
         let transaction = commit.batch().transaction();
+        // Declare custody before the guard: on rejection or unwind, backend
+        // destructors must run after the inventory lock has been released.
+        let (outcome, batch);
         let mut state = self.state.lock();
         let reserved_provenance = state
             .reservations
@@ -903,7 +906,7 @@ impl FrameInventoryAuthority {
             .reservations
             .remove(&transaction)
             .ok_or(FrameInventoryError::UnreservedTransaction(transaction))?;
-        let (outcome, batch) = commit.into_parts();
+        (outcome, batch) = commit.into_parts();
         if batch.events().is_empty() {
             return Err(FrameInventoryError::EmptyBatch);
         }
@@ -5506,6 +5509,45 @@ mod prepared_return_tests {
         assert_eq!(inventory.frame_mapping_count(row.frame), None);
         assert!(inventory.snapshot_for_mm(sibling).mappings.is_empty());
     }
+    #[test]
+    fn rejected_inventory_commit_drops_backend_custody_outside_inventory_lock() {
+        struct BackendCustody {
+            inventory: Arc<FrameInventoryAuthority>,
+            unlocked: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl Drop for BackendCustody {
+            fn drop(&mut self) {
+                self.unlocked.store(
+                    self.inventory.state.try_lock().is_some(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }
+        }
+        for entry in 0..3 {
+            let (inventory, ids, owner, _) = fixture();
+            let unlocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reservation = inventory
+                .reserve(&ids, 0, 0, FrameEventCapacity::for_event_count(1).unwrap())
+                .unwrap();
+            let commit = reservation.commit(BackendCustody {
+                inventory: inventory.clone(),
+                unlocked: unlocked.clone(),
+            });
+            let result = match entry {
+                0 => inventory.apply(owner, commit).map(|_| ()),
+                1 => inventory.apply_with_receipt(owner, commit).map(|_| ()),
+                _ => inventory
+                    .apply_retirement_with_receipt(owner, commit)
+                    .map(|_| ()),
+            };
+            assert_eq!(result, Err(FrameInventoryError::EmptyBatch));
+            assert!(
+                unlocked.load(std::sync::atomic::Ordering::SeqCst),
+                "entry {entry} dropped backend custody while holding the inventory lock"
+            );
+        }
+    }
+
     #[test]
     fn completion_drops_quarantine_outside_inventory_lock() {
         struct CheckDrop {

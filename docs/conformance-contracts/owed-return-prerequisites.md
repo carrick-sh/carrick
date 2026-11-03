@@ -83,3 +83,15 @@ identity without scanning mappings or MMs. The Linux semantic requirement is
 unchanged: shared-file coherence is supplied by the host `MAP_SHARED` mapping.
 This backend test stubs hardware mapping and supplies kernel reference counts;
 it does not prove neutral physical permits, signed execution, or runtime ratios.
+
+The inventory rejection witness
+`rejected_inventory_commit_drops_backend_custody_outside_inventory_lock`
+drives the public apply, receipt, and retirement-receipt APIs with an empty
+transaction carrying backend custody. Its destructor probes the inventory
+mutex without blocking. Rejection must release that mutex before destroying
+the outcome, just as successful apply returns custody after unlocking. This
+closes a generic failure-path lock inversion; it does not exercise physical
+retirement permits or establish the backend release receipt. The change adds
+no inventory operations or guest crossings. Mapping reservations and return
+claims also share the existing fork-aware transaction/provenance draw, before
+acquiring the inventory mutex; no authority cohort or ceiling changes.
