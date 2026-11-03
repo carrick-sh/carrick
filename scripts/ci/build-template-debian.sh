@@ -174,6 +174,12 @@ if [[ $(cat profile) == agent ]]; then
     COPILOT_CLI_DOWNLOAD_BASE_URL=file:///mnt/carrick-seed/copilot-release \
     /opt/carrick-agent/copilot-sdk/bin/python -m copilot download-runtime
   sed -n 's/^github-copilot-sdk==\([^ ]*\) .*/\1/p' copilot-sdk-requirements.txt > /opt/carrick-agent/copilot-sdk/.agy-director-sdk
+  # Host-only lint gates run inside the isolated agent account too (#1531).
+  # Keep the environment read-only and expose its entry point on the default PATH.
+  python3 -m venv /opt/carrick-agent/semgrep
+  /opt/carrick-agent/semgrep/bin/pip install --quiet --disable-pip-version-check \
+    --only-binary=:all: semgrep
+  ln -s /opt/carrick-agent/semgrep/bin/semgrep /usr/local/bin/semgrep
   chmod -R a+rX,go-w /opt/carrick-agent
 fi
 install -m 755 carrick-xtask /usr/local/bin/carrick-xtask
@@ -253,6 +259,12 @@ runuser -u runner -- /usr/local/bin/carrick-xtask ci-scaler verify-kvm
 if [[ $(cat profile) == agent ]]; then
   id -nG carrick-dispatch-agent | tr ' ' '\n' | grep -qx kvm
   runuser -u carrick-dispatch-agent -- /usr/local/bin/carrick-xtask ci-scaler verify-kvm
+  # This service account has no home. Qualification must supply writable state;
+  # real worker turns already receive their own isolated home.
+  install -d -m 700 -o carrick-dispatch-agent -g carrick-dispatch-agent /run/carrick-ci/semgrep-qualification
+  runuser -u carrick-dispatch-agent -- env \
+    XDG_CONFIG_HOME=/run/carrick-ci/semgrep-qualification \
+    XDG_CACHE_HOME=/run/carrick-ci/semgrep-qualification semgrep --version
 fi
 gh_version=$(cat gh-version)
 gh_first_line=$(gh --version </dev/null | head -n1)

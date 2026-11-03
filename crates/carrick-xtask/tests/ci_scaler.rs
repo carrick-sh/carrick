@@ -1898,16 +1898,22 @@ fn agent_template_qualification_requires_worker_group_and_kvm_open() {
         .split("gh_version=")
         .next()
         .unwrap();
-    for (groups, kvm_status, allowed, checked) in [
-        ("carrick-dispatch-agent kvm", 0, true, true),
-        ("carrick-dispatch-agent", 0, false, false),
-        ("carrick-dispatch-agent kvm", 1, false, true),
+    for (groups, kvm_status, semgrep_status, allowed, checked) in [
+        ("carrick-dispatch-agent kvm", 0, 0, true, true),
+        ("carrick-dispatch-agent", 0, 0, false, false),
+        ("carrick-dispatch-agent kvm", 1, 0, false, true),
+        ("carrick-dispatch-agent kvm", 0, 1, false, true),
     ] {
         let script = format!(
             r#"set -euo pipefail
 cat() {{ echo agent; }}
 id() {{ echo '{groups}'; }}
-runuser() {{ printf '%s\n' "$@"; return {kvm_status}; }}
+install() {{ :; }}
+runuser() {{
+  printf '%s\n' "$@"
+  if [[ $4 == env ]]; then return {semgrep_status}; fi
+  return {kvm_status}
+}}
 {fragment}"#
         );
         let output = std::process::Command::new("bash")
@@ -1921,6 +1927,10 @@ runuser() {{ printf '%s\n' "$@"; return {kvm_status}; }}
                 "carrick-dispatch-agent\n--\n/usr/local/bin/carrick-xtask\nci-scaler\nverify-kvm\n"
             ),
             checked
+        );
+        assert_eq!(
+            calls.contains("XDG_CONFIG_HOME=/run/carrick-ci/semgrep-qualification"),
+            checked && kvm_status == 0
         );
     }
 }

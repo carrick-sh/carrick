@@ -3815,6 +3815,42 @@ fn seal_runner(root: &Path) -> Result<(), ScalerError> {
     Ok(())
 }
 
+/// Retain the server's comparison authorities even after a worker rebases.
+/// A normal clone omits remote/private refs and unreachable objects. The run's
+/// admitted and published tips can be outside HEAD's ancestry, but publication
+/// still needs them. Import exact server-owned SHAs, never candidate refs.
+fn carry_publication_history(
+    source: &Path,
+    target: &Path,
+    admitted: &str,
+    published: &str,
+) -> Result<(), ScalerError> {
+    for (name, tip) in [("admitted", admitted), ("published", published)] {
+        if tip.is_empty() {
+            continue;
+        }
+        if !sha(tip) {
+            return Err(ScalerError::Guard("invalid publication history tip"));
+        }
+        git(
+            target,
+            &[
+                "fetch",
+                "--no-tags",
+                "--no-write-fetch-head",
+                source
+                    .to_str()
+                    .ok_or(ScalerError::Guard("publication history source"))?,
+                &format!("+{tip}:refs/carrick/publication-{name}"),
+            ],
+        )?;
+    }
+    // HEAD resolving alone does not prove that its parent/tree/blob objects
+    // survived a handoff. Reject incomplete stores before replacing a receipt.
+    git(target, &["fsck", "--connectivity-only", "--no-dangling"])?;
+    Ok(())
+}
+
 /// Clone only reconstructed data. A later worker starts at its predecessor's
 /// commits, preserving the first fetched remote tip as publication authority.
 fn worker_checkout(
@@ -3853,6 +3889,13 @@ fn worker_checkout(
             &format!("{}:refs/carrick/dispatch-main", dispatch.base),
         ],
     )?;
+    if let Some(previous) = previous {
+        let state = previous_work
+            .parent()
+            .ok_or(ScalerError::Guard("worker state parent"))?;
+        let lease = RunLease::load(state, &previous.expected_tip)?;
+        carry_publication_history(source, target, &previous.expected_tip, lease.current())?;
+    }
     if previous.is_some() || dispatch.resume {
         let reference = format!("origin/{}", dispatch.branch);
         let tip = git(target, &["rev-parse", &reference])?.trim().to_owned();
@@ -4220,6 +4263,17 @@ fn produce(
         let harvested = timed_phase("worker.harvest", || {
             harvest_worker(&actor, &staging.path().join("candidate"), dispatch, result)
         })?;
+        // Restore history from server custody after reading candidate bytes.
+        // This also repairs a worker that pruned its old comparison tips; no
+        // manual harvest.patch replay or change to the publication lease is needed.
+        let history = if previous.is_some() { &work } else { root };
+        let lease = RunLease::load(&state, &expected_tip)?;
+        carry_publication_history(
+            history,
+            &staging.path().join("candidate"),
+            &expected_tip,
+            lease.current(),
+        )?;
         contract = harvested.contract;
         diffstat = harvested.diffstat;
         code = harvested.exit_code;
@@ -9388,6 +9442,114 @@ fi
         assert!(
             survivors.is_empty(),
             "agent processes survived timeout: {survivors:?}"
+        );
+    }
+    #[test]
+    fn second_worker_keeps_rewritten_publication_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let state = temp.path().join("state");
+        let first = state.join("work");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&first).unwrap();
+        fixture_repository(&root);
+        let mut dispatch =
+            validate_event(&event(), "tjfontaine", &mut owner_collaborator()).unwrap();
+        dispatch.base = git(&root, &["rev-parse", "HEAD"]).unwrap().trim().into();
+        dispatch.branch = "work/dispatch-634-42".into();
+        fixture_repository(&first);
+        git(&first, &["checkout", "-B", &dispatch.branch]).unwrap();
+        git(&first, &["commit", "--allow-empty", "-m", "first worker"]).unwrap();
+        let admitted = git(&first, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_owned();
+        // A consented rebase leaves the admitted tip in remote refs only.
+        git(
+            &first,
+            &["update-ref", "refs/remotes/origin/admitted", &admitted],
+        )
+        .unwrap();
+        git(
+            &first,
+            &[
+                "commit",
+                "--amend",
+                "--allow-empty",
+                "-m",
+                "rebased first worker",
+            ],
+        )
+        .unwrap();
+        let pushed = git(&first, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_owned();
+        let remote = temp.path().join("remote.git");
+        git(temp.path(), &["init", "--bare", remote.to_str().unwrap()]).unwrap();
+        let refspec = format!("HEAD:refs/heads/{}", dispatch.branch);
+        git(&first, &["push", remote.to_str().unwrap(), &refspec]).unwrap();
+        std::fs::write(state.join("published-tip"), &pushed).unwrap();
+        let receipt = Receipt {
+            head: pushed.clone(),
+            checkpointed: false,
+            base: dispatch.base.clone(),
+            branch: dispatch.branch.clone(),
+            exit_code: 0,
+            expected_tip: admitted.clone(),
+            pr_body: None,
+            worker: dispatch.worker.clone(),
+            contract: Contract {
+                loop_summary: None,
+                status: ContractStatus::Done,
+                summary: "first worker".into(),
+                tests: vec![],
+                risks: vec![],
+            },
+        };
+        let actor = temp.path().join("actor");
+        std::fs::create_dir(&actor).unwrap();
+        let second = actor.join("work");
+        worker_checkout(&root, &first, &second, &dispatch, Some(&receipt)).unwrap();
+        git(&second, &["commit", "--allow-empty", "-m", "second worker"]).unwrap();
+        let harvested = temp.path().join("harvested");
+        snapshot(&second, &harvested, &dispatch.branch).unwrap();
+        // Publication checks both the admitted tip and the last pushed tip.
+        // Main loses the former at clone: rev-list exits 128 (bad object).
+        git(&harvested, &["rev-list", "HEAD", "--not", &admitted]).unwrap();
+        // Even if a worker prunes its pin, the server restores the harvested
+        // comparison history from its own checkpoint before publishing it.
+        git(
+            &harvested,
+            &["update-ref", "-d", "refs/carrick/publication-admitted"],
+        )
+        .unwrap();
+        git(&harvested, &["reflog", "expire", "--expire=now", "--all"]).unwrap();
+        git(&harvested, &["gc", "--prune=now"]).unwrap();
+        let missing = git(&harvested, &["rev-list", &admitted])
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("exited with code 128"), "{missing}");
+        carry_publication_history(&first, &harvested, &admitted, &pushed).unwrap();
+        git(&harvested, &["rev-list", "HEAD", "--not", &admitted]).unwrap();
+        git(
+            &harvested,
+            &["merge-base", "--is-ancestor", &pushed, "HEAD"],
+        )
+        .unwrap();
+        let lease = format!("--force-with-lease=refs/heads/{}:{pushed}", dispatch.branch);
+        git(
+            &harvested,
+            &["push", &lease, remote.to_str().unwrap(), &refspec],
+        )
+        .unwrap();
+        assert_eq!(
+            git(&harvested, &["rev-parse", "HEAD"]).unwrap(),
+            git(
+                &remote,
+                &["rev-parse", &format!("refs/heads/{}", dispatch.branch)]
+            )
+            .unwrap()
         );
     }
     #[test]
