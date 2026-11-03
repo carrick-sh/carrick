@@ -21,9 +21,12 @@ harvest_seconds = 180
 # Strong-tier rounds (#1275) run for about three hours (owner decision
 # 2026-11-03, #231). The loop step is 180 minutes
 # (`agent_runner::DISPATCH_LOOP_STEP_MINUTES`); wall_minutes may use all of
-# it but the five-minute final reserve. Five 40-minute turns cover the
-# worker budget, each followed by a checkpoint.
+# it but the five-minute final reserve. A strong turn may run 80 minutes:
+# building and gating the whole workspace did not fit in 40 (three #1485
+# rounds cut off at the gate stage, 2026-11-03). The server still pushes a
+# WIP checkpoint after every worker.
 [loop.strong]
 workers = 5
 wall_minutes = 175
 worker_minutes = 165
+worker_turn_minutes = 80
