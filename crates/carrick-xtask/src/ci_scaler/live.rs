@@ -373,23 +373,59 @@ fn storage_command(args: &[&str]) -> Result<Value, ScalerError> {
     )?;
     Ok(serde_json::from_slice(&bytes)?)
 }
+// PVE accepts one content type, not a comma-separated list. Keep all storage
+// consumers on the JSON endpoint and exclude backups even if PVE returns them.
+pub(super) fn image_inventory(
+    node: &str,
+    storage: &str,
+    run: &mut impl FnMut(&[&str]) -> Result<Value, ScalerError>,
+) -> Result<Vec<Value>, ScalerError> {
+    let path = format!("/nodes/{node}/storage/{storage}/content");
+    let value = run(&[
+        "pvesh",
+        "get",
+        &path,
+        "--content",
+        "images",
+        "--output-format",
+        "json",
+    ])?;
+    Ok(value
+        .as_array()
+        .ok_or(ScalerError::Guard("invalid storage inventory"))?
+        .iter()
+        .filter(|row| row["content"] == "images")
+        .cloned()
+        .collect())
+}
+fn storage_reservations(volumes: &[Value]) -> Vec<PoolMember> {
+    volumes
+        .iter()
+        .filter_map(|volume| {
+            let raw = u16::try_from(volume["vmid"].as_u64()?).ok()?;
+            CloneId::try_from(raw).ok()?;
+            Some(PoolMember {
+                id: raw,
+                pool: String::new(),
+                template: false,
+            })
+        })
+        .collect()
+}
 fn clone_volumes(
+    node: &str,
     storage: &str,
     id: CloneId,
     run: &mut impl FnMut(&[&str]) -> Result<Value, ScalerError>,
 ) -> Result<Vec<String>, ScalerError> {
-    let value = run(&["pvesm", "list", storage, "--vmid", &id.get().to_string()])?;
-    value
-        .as_array()
-        .ok_or(ScalerError::Guard("invalid storage inventory"))?
+    image_inventory(node, storage, run)?
         .iter()
+        .filter(|row| row["vmid"].as_u64() == Some(u64::from(id.get())))
         .map(|row| {
             let volid = row["volid"]
                 .as_str()
                 .ok_or(ScalerError::Guard("missing volume identity"))?;
-            if row["vmid"].as_u64() != Some(u64::from(id.get()))
-                || !volid.starts_with(&format!("{storage}:"))
-            {
+            if !volid.starts_with(&format!("{storage}:")) {
                 return Err(ScalerError::Guard(
                     "storage returned another owner's volume",
                 ));
@@ -399,11 +435,12 @@ fn clone_volumes(
         .collect()
 }
 fn clear_clone_volumes(
+    node: &str,
     storage: &str,
     id: CloneId,
     run: &mut impl FnMut(&[&str]) -> Result<Value, ScalerError>,
 ) -> Result<(), ScalerError> {
-    let volumes = clone_volumes(storage, id, run)?;
+    let volumes = clone_volumes(node, storage, id, run)?;
     if !volumes.is_empty() {
         eprintln!("vm={} leaked_volumes_detected={}", id.get(), volumes.len());
     }
@@ -432,7 +469,7 @@ fn clear_clone_volumes(
         // `pvesm free` has no JSON result. The adapter supplies null on success.
         run(&["pvesm", "free", volume])?;
     }
-    let remaining = clone_volumes(storage, id, run)?;
+    let remaining = clone_volumes(node, storage, id, run)?;
     eprintln!(
         "vm={} leaked_volumes_remaining={} volumes_reaped={}",
         id.get(),
@@ -446,76 +483,36 @@ fn clear_clone_volumes(
     }
     Ok(())
 }
-fn parse_volume_listing(bytes: &[u8]) -> Result<Value, ScalerError> {
-    let text =
-        std::str::from_utf8(bytes).map_err(|_| ScalerError::Guard("invalid storage output"))?;
-    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
-    if lines
-        .next()
-        .map(|line| line.split_whitespace().collect::<Vec<_>>())
-        != Some(vec!["Volid", "Format", "Type", "Size", "VMID"])
-    {
-        return Err(ScalerError::Guard("invalid storage listing header"));
-    }
-    let mut rows = Vec::new();
-    for line in lines {
-        let fields: Vec<_> = line.split_whitespace().collect();
-        if fields.len() != 5 {
-            return Err(ScalerError::Guard("invalid storage listing row"));
-        }
-        let vmid = fields[4]
-            .parse::<u16>()
-            .map_err(|_| ScalerError::Guard("invalid volume VMID"))?;
-        rows.push(json!({"volid":fields[0], "vmid":vmid}));
-    }
-    Ok(Value::Array(rows))
-}
 fn local_storage_command(args: &[&str]) -> Result<Value, ScalerError> {
     if args.first() == Some(&"pvesm") {
-        let bytes = execute(
+        execute(
             Command::new(args[0]).args(&args[1..]),
             &[],
             Duration::from_secs(90),
         )?;
-        if args.get(1) == Some(&"list") {
-            parse_volume_listing(&bytes)
-        } else {
-            Ok(Value::Null)
-        }
+        Ok(Value::Null)
     } else {
         storage_command(args)
     }
 }
 impl Pve {
     fn clear_volumes(&self, id: CloneId) -> Result<(), ScalerError> {
-        clear_clone_volumes(self.site.storage, id, &mut local_storage_command)
+        clear_clone_volumes(
+            self.site.node,
+            self.site.storage,
+            id,
+            &mut local_storage_command,
+        )
     }
     fn reservation_inventory(&self) -> Result<Vec<PoolMember>, ScalerError> {
         let mut inventory = self.inventory()?;
         // One listing per reservation, rather than one process per free VMID.
-        let volumes = local_storage_command(&[
-            "pvesm",
-            "list",
+        let volumes = image_inventory(
+            self.site.node,
             self.site.storage,
-            "--content",
-            "images,rootdir",
-        ])?;
-        for volume in volumes
-            .as_array()
-            .ok_or(ScalerError::Guard("invalid volume inventory"))?
-        {
-            let raw = volume["vmid"]
-                .as_u64()
-                .and_then(|id| u16::try_from(id).ok())
-                .ok_or(ScalerError::Guard("invalid volume VMID"))?;
-            if CloneId::try_from(raw).is_ok() {
-                inventory.push(PoolMember {
-                    id: raw,
-                    pool: String::new(),
-                    template: false,
-                });
-            }
-        }
+            &mut local_storage_command,
+        )?;
+        inventory.extend(storage_reservations(&volumes));
         Ok(inventory)
     }
 }
@@ -547,7 +544,9 @@ pub(super) fn sweep_clone_volumes(dir: &Path) -> Result<(), ScalerError> {
         let id = CloneId::try_from(
             u16::try_from(raw).map_err(|_| ScalerError::Guard("invalid clone VMID"))?,
         )?;
-        if let Err(error) = clear_clone_volumes(site.storage, id, &mut local_storage_command) {
+        if let Err(error) =
+            clear_clone_volumes(site.node, site.storage, id, &mut local_storage_command)
+        {
             failed += 1;
             eprintln!("vm={raw} orphan sweep deferred: {error}");
         }
