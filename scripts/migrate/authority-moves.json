@@ -70,6 +70,11 @@
       "from": "carrick_runtime::el1_census::write_at_teardown",
       "to": "carrick_runtime::el1_census::publish",
       "issue": 1394
+    },
+    {
+      "from": "carrick_runtime::el1_census::snapshot",
+      "to": "carrick_runtime::el1_census::snapshot_counters",
+      "issue": 1394
     }
   ],
   "terminal_custody": []
