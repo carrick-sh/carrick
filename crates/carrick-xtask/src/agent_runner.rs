@@ -122,6 +122,28 @@ fn check_token(root: &Path, token: &AppToken) -> Result<(), ScalerError> {
     Ok(())
 }
 
+/// The dispatch loop step's `timeout-minutes` in
+/// `.github/workflows/dispatch-worker.yml`. Owner decision 2026-11-03
+/// (#231): strong-tier rounds run for about three hours. The workflow
+/// repeats these numbers as literals; `tests/dispatch_workflow.rs` holds
+/// the two in agreement.
+pub const DISPATCH_LOOP_STEP_MINUTES: u64 = 180;
+/// Checkout, driver build, bootstrap, credentials, retirement and upload
+/// around the loop step.
+pub const DISPATCH_JOB_OVERHEAD_MINUTES: u64 = 13;
+/// The dispatch worker job's `timeout-minutes`.
+pub const DISPATCH_JOB_MINUTES: u64 = DISPATCH_LOOP_STEP_MINUTES + DISPATCH_JOB_OVERHEAD_MINUTES;
+/// The loop's final reserve, at the end of both the loop step and the job:
+/// final capture, the outcome post and the artifact upload.
+pub const DISPATCH_FINAL_RESERVE_MINUTES: u64 = 5;
+/// The job minute by which the coordinator loop stops.
+pub const DISPATCH_LOOP_JOB_MINUTES: u64 = DISPATCH_JOB_MINUTES - DISPATCH_FINAL_RESERVE_MINUTES;
+/// The job minute by which a worker turn is cut off, leaving its harvest
+/// and the loop's reporting inside the job.
+pub const DISPATCH_WORKER_JOB_MINUTES: u64 = DISPATCH_JOB_MINUTES - 2;
+const _: () = assert!(DISPATCH_FINAL_RESERVE_MINUTES < DISPATCH_LOOP_STEP_MINUTES);
+const _: () = assert!(DISPATCH_LOOP_JOB_MINUTES < DISPATCH_WORKER_JOB_MINUTES);
+
 /// Bound a phase against job admission time, reserving time for reporting.
 pub(crate) fn job_remaining(minutes: u64) -> Result<std::time::Duration, ScalerError> {
     let now = std::time::SystemTime::now()

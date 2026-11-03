@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 /// How long one request waits for the controller's answer.
 const WAIT: Duration = Duration::from_secs(60);
 /// A minted token lives an hour; reuse it for at most 45 minutes.
-const FRESH: Duration = Duration::from_secs(45 * 60);
+pub(crate) const FRESH: Duration = Duration::from_secs(45 * 60);
 /// A timeout or failed mint is asked again only after this long, so a down
 /// controller costs one bounded wait per interval, not one per board read.
 const RETRY: Duration = Duration::from_secs(5 * 60);

@@ -1149,9 +1149,9 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
         .unwrap_or(limit);
     let outcome = wait_agent(
         &mut isolated,
-        remaining
-            .min(limit)
-            .min(crate::agent_runner::job_remaining(83)?),
+        remaining.min(limit).min(crate::agent_runner::job_remaining(
+            crate::agent_runner::DISPATCH_WORKER_JOB_MINUTES,
+        )?),
     );
     live_log::unfollow(&label);
     live_log::unfollow(&label_err);

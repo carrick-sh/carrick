@@ -33,6 +33,13 @@ pub(crate) const RESPONSE_LIMIT: usize = 8192;
 /// operation reuses its token for up to 45 minutes, so a normal job mints at
 /// most two or three of each.
 pub(super) const MINTS_PER_SCOPE: usize = 6;
+// A whole dispatch job, refreshing each token when it turns stale, stays
+// inside the per-scope budget (owner decision 2026-11-03, #231: three-hour
+// rounds), with one mint to spare.
+const _: () = assert!(
+    (MINTS_PER_SCOPE as u64 - 1) * crate::dispatch_mint::FRESH.as_secs()
+        >= crate::agent_runner::DISPATCH_JOB_MINUTES * 60
+);
 /// Bootstrap fetches the launcher once per job, so it gets one token. A
 /// re-run is a new job with its own budget.
 pub(super) const BOOTSTRAP_MINTS: usize = 1;

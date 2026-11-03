@@ -1,5 +1,43 @@
 //! Shape B's workflow contract; H1's executable witnesses stay in-file.
+use carrick_xtask::agent_runner::{
+    DISPATCH_FINAL_RESERVE_MINUTES, DISPATCH_JOB_MINUTES, DISPATCH_LOOP_JOB_MINUTES,
+    DISPATCH_LOOP_STEP_MINUTES,
+};
 use yaml_rust2::YamlLoader;
+
+/// The workflow's job and loop-step `timeout-minutes` are the Rust
+/// deadlines' constants (owner decision 2026-11-03, #231: about three
+/// hours). A change to either side without the other fails here.
+#[test]
+fn workflow_timeouts_agree_with_the_loop_deadlines() {
+    let docs = YamlLoader::load_from_str(include_str!(
+        "../../../.github/workflows/dispatch-worker.yml"
+    ))
+    .unwrap();
+    let worker = &docs[0]["jobs"]["worker"];
+    let minutes = |value: &yaml_rust2::Yaml| value.as_i64().and_then(|m| u64::try_from(m).ok());
+    assert_eq!(
+        minutes(&worker["timeout-minutes"]),
+        Some(DISPATCH_JOB_MINUTES)
+    );
+    let step = worker["steps"]
+        .as_vec()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"].as_str() == Some("loop"))
+        .unwrap();
+    assert_eq!(
+        minutes(&step["timeout-minutes"]),
+        Some(DISPATCH_LOOP_STEP_MINUTES)
+    );
+    // The loop step fits the job with its setup before and reserve after.
+    const {
+        assert!(DISPATCH_LOOP_STEP_MINUTES + DISPATCH_FINAL_RESERVE_MINUTES < DISPATCH_JOB_MINUTES);
+        assert!(DISPATCH_LOOP_JOB_MINUTES < DISPATCH_JOB_MINUTES);
+        // About three hours.
+        assert!(DISPATCH_LOOP_STEP_MINUTES >= 170 && DISPATCH_LOOP_STEP_MINUTES <= 190);
+    }
+}
 
 #[test]
 fn disposable_worker_has_no_publisher_or_artifact_transfer() {
@@ -18,7 +56,10 @@ fn disposable_worker_has_no_publisher_or_artifact_transfer() {
         assert!(!text.contains(removed), "retained {removed}");
     }
     let worker = &workflow["jobs"]["worker"];
-    assert_eq!(worker["timeout-minutes"].as_i64(), Some(85));
+    assert_eq!(
+        worker["timeout-minutes"].as_i64(),
+        i64::try_from(DISPATCH_JOB_MINUTES).ok()
+    );
     assert_eq!(worker["runs-on"][0].as_str(), Some("carrick-agent"));
     let permissions = worker["permissions"].as_hash().unwrap();
     assert_eq!(permissions.len(), 4);
@@ -249,7 +290,10 @@ fn review_workflow_pins_main_and_orders_the_loop() {
         w["on"]["pull_request_review"]["types"][0].as_str(),
         Some("submitted")
     );
-    assert_eq!(w["jobs"]["worker"]["timeout-minutes"].as_i64(), Some(85));
+    assert_eq!(
+        w["jobs"]["worker"]["timeout-minutes"].as_i64(),
+        i64::try_from(DISPATCH_JOB_MINUTES).ok()
+    );
     assert_eq!(
         w["jobs"]["guard"]["outputs"]["base"].as_str(),
         Some("${{ steps.validate.outputs.base }}")
