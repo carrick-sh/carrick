@@ -477,8 +477,15 @@ contended. The controller checks the JSON image inventory at
 Backups and VMIDs outside the owned range are excluded. Leftover volumes
 are counted in the controller log
 (`leaked_volumes_detected`, `leaked_volumes_remaining`, `volumes_reaped`). It
-frees them only after a successful cluster inventory proves that no VM or
-container config owns the VMID, then lists storage again. A storage error
+frees them only while holding PVE's own per-VMID locks
+(`/var/lock/qemu-server/lock-<vmid>.conf`, the lock `qm` takes, and
+`/run/lock/lxc/pve-config-<vmid>.lock`, the one `pct` takes), after a cluster
+inventory taken under those locks proves that no VM or container config owns
+the VMID, then lists storage again. PVE writes a new VM's config under the
+same lock before allocating its disks, so a clone into the VMID cannot slip
+between the check and the free; volume IDs such as
+`local:309/vm-309-cloudinit.qcow2` are reused per VMID. A lock still busy
+after 10 s fails closed and leaves cleanup for the next reconciliation. A storage error
 keeps the cleanup record open for the next reconciliation. Admission also
 excludes VMIDs with existing volumes.
 
@@ -497,5 +504,4 @@ the reported VMIDs and storage errors before restarting the controller. Do
 not run a second provisioner during this maintenance operation.
 
 The controller and sweep require root on the selected PVE node to invoke
-`pvesh` and `pvesm free`. The cluster-config check and free are not protected
-by PVE’s per-VMID lock; keep external provisioners stopped during a sweep.
+`pvesh` and `pvesm free` and to take PVE's per-VMID lock files.

@@ -69,11 +69,7 @@ fn check_with(
         if !Path::new(&path).is_absolute() || path.contains(['\n', '\r']) {
             return Err(ScalerError::Guard("invalid image path"));
         }
-        let owner = volume["vmid"].as_u64().or_else(|| {
-            volume["vmid"]
-                .as_str()
-                .and_then(|id| id.parse::<u64>().ok())
-        });
+        let owner = super::live::pve_vmid(volume);
         if owner == Some(u64::from(vmid)) {
             bases.push(image_identity(&path)?);
         } else {

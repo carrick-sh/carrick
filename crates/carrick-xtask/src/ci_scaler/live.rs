@@ -398,11 +398,19 @@ pub(super) fn image_inventory(
         .cloned()
         .collect())
 }
+/// PVE reports `vmid` as a number in most endpoints and as a decimal string
+/// in some storage listings; every owner check must accept both spellings.
+pub(super) fn pve_vmid(row: &Value) -> Option<u64> {
+    let field = &row["vmid"];
+    field
+        .as_u64()
+        .or_else(|| field.as_str().and_then(|id| id.parse::<u64>().ok()))
+}
 fn storage_reservations(volumes: &[Value]) -> Vec<PoolMember> {
     volumes
         .iter()
         .filter_map(|volume| {
-            let raw = u16::try_from(volume["vmid"].as_u64()?).ok()?;
+            let raw = u16::try_from(pve_vmid(volume)?).ok()?;
             CloneId::try_from(raw).ok()?;
             Some(PoolMember {
                 id: raw,
@@ -420,7 +428,7 @@ fn clone_volumes(
 ) -> Result<Vec<String>, ScalerError> {
     image_inventory(node, storage, run)?
         .iter()
-        .filter(|row| row["vmid"].as_u64() == Some(u64::from(id.get())))
+        .filter(|row| pve_vmid(row) == Some(u64::from(id.get())))
         .map(|row| {
             let volid = row["volid"]
                 .as_str()
@@ -434,38 +442,105 @@ fn clone_volumes(
         })
         .collect()
 }
-fn clear_clone_volumes(
+/// Pool absence is insufficient: any VM/container config anywhere in the
+/// cluster, including objects moved out of our pool, owns the VMID's volumes.
+fn vmid_configured(
+    id: CloneId,
+    run: &mut impl FnMut(&[&str]) -> Result<Value, ScalerError>,
+) -> Result<bool, ScalerError> {
+    let resources = run(&[
+        "pvesh",
+        "get",
+        "/cluster/resources",
+        "--type",
+        "vm",
+        "--output-format",
+        "json",
+    ])?;
+    Ok(resources
+        .as_array()
+        .ok_or(ScalerError::Guard("invalid cluster inventory"))?
+        .iter()
+        .any(|vm| pve_vmid(vm) == Some(u64::from(id.get()))))
+}
+/// PVE's own per-VMID config locks: `qm` takes
+/// `/var/lock/qemu-server/lock-<vmid>.conf`, `pct` takes
+/// `/run/lock/lxc/pve-config-<vmid>.lock`. Creating or cloning into a VMID
+/// writes its config under one of them before allocating any disk, so while
+/// both are held "no config" stays true and no new volume can appear.
+fn pve_vmid_lock_paths(id: CloneId) -> [PathBuf; 2] {
+    [
+        PathBuf::from(format!("/var/lock/qemu-server/lock-{}.conf", id.get())),
+        PathBuf::from(format!("/run/lock/lxc/pve-config-{}.lock", id.get())),
+    ]
+}
+/// PVE's own `lock_config` default; a longer hold-off would stall its tasks.
+const PVE_VMID_LOCK_WAIT: Duration = Duration::from_secs(10);
+/// Take every lock in order, failing closed on timeout. PVE never holds both
+/// for one VMID (a VMID is one kind), so the fixed order cannot deadlock it.
+pub(super) fn lock_files_within(
+    paths: &[PathBuf],
+    wait: Duration,
+) -> Result<Vec<crate::lock_file::OwnedFileLock>, ScalerError> {
+    use std::os::fd::AsRawFd;
+    let deadline = Instant::now() + wait;
+    let mut held = Vec::with_capacity(paths.len());
+    for path in paths {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o644)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        loop {
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
+                return Err(error.into());
+            }
+            if Instant::now() >= deadline {
+                return Err(ScalerError::External(
+                    "PVE VMID lock busy; retry cleanup next reconcile",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        held.push(crate::lock_file::OwnedFileLock::from_locked(file));
+    }
+    Ok(held)
+}
+fn lock_pve_vmid(id: CloneId) -> Result<Vec<crate::lock_file::OwnedFileLock>, ScalerError> {
+    lock_files_within(&pve_vmid_lock_paths(id), PVE_VMID_LOCK_WAIT)
+}
+fn clear_clone_volumes<G>(
     node: &str,
     storage: &str,
     id: CloneId,
     run: &mut impl FnMut(&[&str]) -> Result<Value, ScalerError>,
+    lock: &mut impl FnMut(CloneId) -> Result<G, ScalerError>,
 ) -> Result<(), ScalerError> {
+    if clone_volumes(node, storage, id, run)?.is_empty() {
+        return Ok(());
+    }
+    // Volume IDs are reused per VMID, so a clone into this VMID between an
+    // unlocked owner check and the free would lose a live disk. Decide and
+    // free under PVE's own per-VMID lock; a busy lock leaves cleanup open.
+    let _guard = lock(id)?;
+    if vmid_configured(id, run)? {
+        return Err(ScalerError::Guard(
+            "refusing to free volumes with an existing config",
+        ));
+    }
     let volumes = clone_volumes(node, storage, id, run)?;
     if !volumes.is_empty() {
         eprintln!("vm={} leaked_volumes_detected={}", id.get(), volumes.len());
     }
     for volume in &volumes {
-        // Pool absence is insufficient: refuse any VM/container config anywhere
-        // in the cluster, including objects moved out of our pool.
-        let resources = run(&[
-            "pvesh",
-            "get",
-            "/cluster/resources",
-            "--type",
-            "vm",
-            "--output-format",
-            "json",
-        ])?;
-        if resources
-            .as_array()
-            .ok_or(ScalerError::Guard("invalid cluster inventory"))?
-            .iter()
-            .any(|vm| vm["vmid"].as_u64() == Some(u64::from(id.get())))
-        {
-            return Err(ScalerError::Guard(
-                "refusing to free volumes with an existing config",
-            ));
-        }
         // `pvesm free` has no JSON result. The adapter supplies null on success.
         run(&["pvesm", "free", volume])?;
     }
@@ -502,6 +577,7 @@ impl Pve {
             self.site.storage,
             id,
             &mut local_storage_command,
+            &mut lock_pve_vmid,
         )
     }
     fn reservation_inventory(&self) -> Result<Vec<PoolMember>, ScalerError> {
@@ -525,28 +601,19 @@ pub(super) fn sweep_clone_volumes(dir: &Path) -> Result<(), ScalerError> {
     let site = Site::local()?;
     let _lock = super::acquire_controller_lock(dir)?;
     let mut failed = 0;
-    for raw in 308..=349 {
-        let resources = storage_command(&[
-            "pvesh",
-            "get",
-            "/cluster/resources",
-            "--type",
-            "vm",
-            "--output-format",
-            "json",
-        ])?;
-        let rows = resources
-            .as_array()
-            .ok_or(ScalerError::Guard("invalid cluster inventory"))?;
-        if rows.iter().any(|vm| vm["vmid"].as_u64() == Some(raw)) {
+    for raw in 308u16..=349 {
+        let id = CloneId::try_from(raw)?;
+        // Cheap skip; the authoritative check repeats under the VMID lock.
+        if vmid_configured(id, &mut storage_command)? {
             continue;
         }
-        let id = CloneId::try_from(
-            u16::try_from(raw).map_err(|_| ScalerError::Guard("invalid clone VMID"))?,
-        )?;
-        if let Err(error) =
-            clear_clone_volumes(site.node, site.storage, id, &mut local_storage_command)
-        {
+        if let Err(error) = clear_clone_volumes(
+            site.node,
+            site.storage,
+            id,
+            &mut local_storage_command,
+            &mut lock_pve_vmid,
+        ) {
             failed += 1;
             eprintln!("vm={raw} orphan sweep deferred: {error}");
         }
@@ -570,8 +637,7 @@ fn pool_inventory(pool: &Value, node: &str) -> Result<Vec<PoolMember>, ScalerErr
             if member["node"] != node {
                 return Err(ScalerError::Guard("unexpected pool node"));
             }
-            let id = member["vmid"]
-                .as_u64()
+            let id = pve_vmid(member)
                 .and_then(|n| u16::try_from(n).ok())
                 .ok_or(ScalerError::External("VMID"))?;
             result.push(PoolMember {
