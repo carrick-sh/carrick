@@ -554,8 +554,13 @@ acceptance.
   - scoped signed witnesses when they have HVF.
 
   Whole-workspace `just lint-domains` and `just test-kernel` are left to CI.
-  Workers post the results on the PR. Shared-kernel changes start with a
-  design post on the issue, reviewed before code (#231 item 3). The director
+  Workers post the results on the PR. **Code first by default** (owner,
+  2026-11-03, #231): a shared-kernel change starts as a draft PR whose body
+  carries a short design note, and the independent review covers the code
+  and the approach together; iterate from there. A separate design pass,
+  reviewed before code, is kept only for ABI or wire-protocol layouts,
+  lock orders that span crates, and multi-slice stacks whose workers need
+  a shared interface first. The director
   runs `just accept --profile linux-portable` and the signed gate once per
   stack or batch, at the top SHA, in a dedicated detached worktree, never in
   a worker's live worktree.
