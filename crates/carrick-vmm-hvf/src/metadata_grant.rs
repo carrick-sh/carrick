@@ -1771,19 +1771,21 @@ pub(crate) fn service_native_fork_stock(
             };
             let mut stock = custody.fork_stock.lock();
             if kind == Some(ForkStockKind::Reserve) {
-                // Capture inherited receipts before reserve mutably borrows stock.
-                let mut inherited = carrick_hal::fork_stock::ForkHostBackingCustody::default();
-                if let Some(pending) = stock.owner.pending(execution.cpu)
-                    && let Some(rows) = stock
-                        .owner
-                        .child_custody(pending.loan.request.operation, execution.context.root)
-                {
-                    for row in &rows.inherited {
-                        if let Some(source) = row.retained_host_backing() {
-                            inherited.inherit(source);
-                        }
-                    }
-                }
+                // Capture the parent's source receipts before reserve mutably
+                // borrows stock: everything its custody holds, including the
+                // sources it acquired after birth (an exec image, a native
+                // private file mapping), not only the rows its own fork
+                // inherited.
+                let inherited = stock
+                    .owner
+                    .pending(execution.cpu)
+                    .and_then(|pending| {
+                        stock
+                            .owner
+                            .child_custody(pending.loan.request.operation, execution.context.root)
+                    })
+                    .map(crate::fork_stock::NativeChildPhysical::fork_sources)
+                    .unwrap_or_default();
                 let result = stock.owner.reserve_custody(
                     execution,
                     settlement,
