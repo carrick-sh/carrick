@@ -61,3 +61,16 @@ other shifts and packed comparisons. MMX beyond MOVQ/PADDB/EMMS is not
 admitted here. A representative feature witness is not full family coverage.
 Native differential and VM-free tests do not supply signed HVF, Docker,
 KVM workload integration, ecosystem performance or release acceptance.
+
+Review fixes extend the native differential to immediate PSLLD, PSLLW and
+PSRLW. Before admission the differential failed at PSLLD with #UD.
+`advertised_mmx_em_precedes_ts_and_operand_faults` was red because EM
+returned #NM instead of #UD. It checks MOVQ, PADDB and EMMS with EM, TS,
+and both controls set, preserving RIP and the virtual FXSAVE image on
+fault. EM takes precedence over TS and invalid memory; TS alone raises
+#NM. x87 retains its separate EM behavior. CLFLUSH uses the standard host
+intrinsic after the existing capability and guest-translation checks.
+
+The base remains main. Whichever of this slice and #1469 lands second must
+integrate the legacy SSE admission in `avx.rs` and shared FXSAVE/MMX leaf
+and CLFLUSH dispatch in `context.rs`.
