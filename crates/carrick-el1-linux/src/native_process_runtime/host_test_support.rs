@@ -3131,6 +3131,19 @@ fn root_exec_access_refusal_is_counted_before_service_publication() {
         )
         .unwrap();
     assert!(root.is_root_process());
+    // Matching the stored root key is insufficient when its generation no
+    // longer names an admitted owner row. Missing authority must not turn a
+    // descendant refusal into evidence attributed to the initial process.
+    let admitted_key = root.key;
+    let stale_key = TaskKey {
+        serial: TaskSerial::from_registry_allocation(NonZeroU64::new(u64::MAX).unwrap()),
+        ..admitted_key
+    };
+    root.key = stale_key;
+    fixture.runtime.graph.lock().root_key = stale_key;
+    assert!(!root.is_root_process());
+    root.key = admitted_key;
+    fixture.runtime.graph.lock().root_key = admitted_key;
     {
         let mut graph = fixture.runtime.graph.lock();
         graph.owner.task_mut(root.key).unwrap().fs = None;

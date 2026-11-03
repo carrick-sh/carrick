@@ -103,7 +103,7 @@ commands before checking the same evidence as local lanes.
 ## Six-item review audit for the continuation worker
 
 This audits the independent review on PR #1403, not acceptance of the branch.
-All seven inherited commits were retained when rebasing onto admitted main.
+All nine inherited commits were retained when rebasing onto admitted main.
 The #1444 carrier census ownership and #1409 per-process access semantics are
 retained. No syscall routing allowance, errno policy or work budget changed.
 
@@ -133,11 +133,20 @@ retained. No syscall routing allowance, errno policy or work budget changed.
    implements it using the admitted graph and test doubles state their identity.
    `service_lineage_survives_ticket_intake_and_exec_rebind` and the non-1-root
    access witness cover lineage transport and graph identity respectively.
+   The root access witness also substitutes an unadmitted generation for both
+   the caller and stored root key and requires `is_root_process` to return false;
+   key equality alone cannot establish root authority. A negative control replacing
+   `is_ok_and` with a fail-open `map_or(true, ...)` fails this assertion
+   (exit 101); restoring the production lookup preserves fail-closed behavior.
 5. **Emission: implemented under the latest owner ruling.** No default output
    or sidecar; `CARRICK_EL1_CENSUS=<directory>` opts in. The unset/empty/exact-0
    policy test fails against the previous default-on implementation and passes
    after the fix. Both CI workflows and the signed runner explicitly enable
    evidence. Conformance and smoke request private destinations themselves.
+   The last inherited checkpoint had removed the two workflow settings because
+   dispatch credentials could not publish workflow files; this continuation
+   restores them. Publication requires credentials permitted to update workflows,
+   or the workflow owner must apply these two settings before acceptance.
 6. **Landing behavior: implemented; live oracle gate remains.** Missing shapes
    remain counted debt under the existing 11,484-row ceiling, and shape capture
    accepts natural nonzero workload exits. A killed row without teardown keeps
