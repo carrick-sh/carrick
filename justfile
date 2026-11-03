@@ -1138,7 +1138,7 @@ test-embed *ARGS: build
 # runs but never qualifies). Attach a green receipt for your exact HEAD before
 # reporting signed-lane work. Needs the fixture bundle for HEAD's inputs.
 smoke-signed *ARGS:
-    {{_xtask}} smoke-signed {{ARGS}}
+    {{_admit}} {{_cargo}} run --locked -p carrick-xtask --features smoke-signed -- smoke-signed {{ARGS}}
 
 # Guest-running tests of carrick-vmm-hvf from SIGNED cargo test executables.
 test-hvf *ARGS:

@@ -73,30 +73,6 @@ impl RefusalEvidence {
     }
 }
 
-/// Load explicitly requested carrier files into the same wire transcript
-/// used by gate receipts. Callers keep this evidence beside their run logs.
-pub fn read_directory(directory: &std::path::Path) -> std::io::Result<String> {
-    let mut paths = std::fs::read_dir(directory)?
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<Result<Vec<_>, _>>()?;
-    paths.sort();
-    let mut log = String::new();
-    for path in paths {
-        if path
-            .extension()
-            .is_some_and(|extension| extension == "json")
-        {
-            let body = std::fs::read_to_string(path)?;
-            // Collapse the pretty-printed file into exactly one wire line.
-            let body: serde_json::Value = serde_json::from_str(&body)?;
-            log.push_str(MARKER);
-            log.push_str(&body.to_string());
-            log.push('\n');
-        }
-    }
-    Ok(log)
-}
-
 /// Read all carrier censuses in a subprocess log. Missing, malformed and
 /// incomplete evidence fail closed, including when the guest exited zero.
 pub fn check_log(log: &str, oracle_served: Option<&[u64]>) -> Result<(), String> {
