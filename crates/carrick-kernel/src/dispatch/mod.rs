@@ -2260,6 +2260,12 @@ impl SyscallDispatcher {
         }
         #[cfg(test)]
         {
+            // A native process's scope has no host MM: the test
+            // fallback must not hide an escape production fails on (#1503).
+            assert!(
+                !resources::in_native_fs_scope(),
+                "mm access escaped its captured KernelContext scope"
+            );
             self.capture_one_task_context()
                 .expect("test mm context")
                 .shared()
@@ -2281,6 +2287,12 @@ impl SyscallDispatcher {
         }
         #[cfg(test)]
         {
+            // A native process's scope has no host file table: the test
+            // fallback must not hide an escape production fails on (#1503).
+            assert!(
+                !resources::in_native_fs_scope(),
+                "file-table access escaped its captured KernelContext scope"
+            );
             self.capture_one_task_context()
                 .expect("test file-table context")
                 .resources()
