@@ -862,6 +862,7 @@ surfaces = [
   { path = "crates/carrick-signal-core/src/wait.rs", contract = "kernel.signal.socket-restart" },
   { path = "crates/carrick-signal-linux/src/fork_reset.rs", contract = "kernel.el1.signal-delivery-owner" },
   { path = "crates/carrick-signal-linux/src/lib.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-softcpu-x86/examples/scan_unsupported.rs", contracts = [] },
   { path = "crates/carrick-softcpu-x86/src/apic.rs", contract = "x86.softcpu.apic-timer" },
   { path = "crates/carrick-softcpu-x86/src/avx.rs", contract = "x86.softcpu.level0" },
   { path = "crates/carrick-softcpu-x86/src/block.rs", contract = "x86.softcpu.apic-timer" },
