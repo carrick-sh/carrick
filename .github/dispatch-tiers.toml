@@ -12,5 +12,18 @@ status_updates = 3
 response_bytes = 65536
 wall_minutes = 67
 worker_minutes = 60
+# One worker's longest turn. The server pushes a WIP checkpoint after every
+# worker, so a round checkpoints at least this often while workers run.
+worker_turn_minutes = 40
 # Included in worker_minutes and wall_minutes, never added to either.
 harvest_seconds = 180
+
+# Strong-tier rounds (#1275) run for about three hours (owner decision
+# 2026-11-03, #231). The loop step is 180 minutes
+# (`agent_runner::DISPATCH_LOOP_STEP_MINUTES`); wall_minutes may use all of
+# it but the five-minute final reserve. Five 40-minute turns cover the
+# worker budget, each followed by a checkpoint.
+[loop.strong]
+workers = 5
+wall_minutes = 175
+worker_minutes = 165

@@ -28,18 +28,59 @@ pub(super) struct Policy {
     response_bytes: usize,
     wall_minutes: u64,
     worker_minutes: u64,
+    /// One worker's longest turn. The server pushes a WIP checkpoint after
+    /// every worker, so this bounds the time between checkpoints however
+    /// long the round runs.
+    worker_turn_minutes: u64,
     #[serde(default = "default_harvest_seconds")]
     harvest_seconds: u64,
+    /// The strong-tier round's budgets (owner decision 2026-11-03, #231).
+    #[serde(skip_serializing)]
+    strong: TierBudget,
+}
+/// The budgets a worker tier overrides in [`Policy`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TierBudget {
+    workers: u32,
+    wall_minutes: u64,
+    worker_minutes: u64,
 }
 fn default_harvest_seconds() -> u64 {
     180
 }
+/// The longest round the loop step can hold: the step minus its final reserve.
+const MAX_WALL_MINUTES: u64 = crate::agent_runner::DISPATCH_LOOP_STEP_MINUTES
+    - crate::agent_runner::DISPATCH_FINAL_RESERVE_MINUTES;
+/// The tool client waits this long beyond a worker turn for the server's
+/// answer: the capacity probe before the turn and the harvest after it.
+const TOOL_REPLY_MARGIN: Duration = Duration::from_secs(10 * 60);
 impl Policy {
     fn load() -> Result<Self, ScalerError> {
         let config: LoopConfig =
             toml::from_str(include_str!("../../../.github/dispatch-tiers.toml"))
                 .map_err(|_| ScalerError::Guard("invalid dispatch policy"))?;
         let p = config.loop_policy;
+        p.validate()?;
+        p.for_tier(super::worker_tier::WorkerTier::Strong)
+            .validate()?;
+        Ok(p)
+    }
+    /// The policy a round of `tier` runs under.
+    fn for_tier(&self, tier: super::worker_tier::WorkerTier) -> Self {
+        let mut p = self.clone();
+        if tier == super::worker_tier::WorkerTier::Strong {
+            p.workers = p.strong.workers;
+            p.wall_minutes = p.strong.wall_minutes;
+            p.worker_minutes = p.strong.worker_minutes;
+        }
+        p
+    }
+    fn worker_turn(&self) -> Duration {
+        Duration::from_secs(self.worker_turn_minutes * 60)
+    }
+    fn validate(&self) -> Result<(), ScalerError> {
+        let p = self;
         if p.loop_backend != "agy"
             || p.loop_model != "high"
             || p.status_updates == 0
@@ -50,17 +91,22 @@ impl Policy {
             || p.reads > 2
             || p.response_bytes < 1024
             || p.response_bytes > 64 * 1024
-            || p.wall_minutes > 70
-            || p.worker_minutes > 60
+            || p.wall_minutes > MAX_WALL_MINUTES
             || p.worker_minutes == 0
             || p.worker_minutes > p.wall_minutes
             || p.harvest_seconds == 0
             || p.harvest_seconds >= p.worker_minutes * 60
             || p.wall_minutes == 0
+            || p.workers == 0
+            || p.worker_turn_minutes == 0
+            || p.worker_turn_minutes > p.worker_minutes
+            || p.harvest_seconds >= p.worker_turn_minutes * 60
+            // Enough turns to spend the worker budget.
+            || u64::from(p.workers) * p.worker_turn_minutes < p.worker_minutes
         {
             return Err(ScalerError::Guard("invalid loop policy"));
         }
-        Ok(p)
+        Ok(())
     }
 }
 #[derive(Debug, Deserialize)]
@@ -2899,9 +2945,11 @@ impl Server<'_> {
                 let started = Instant::now();
                 let worker_index = self.history.len();
                 let result = (|| -> Result<Value, ScalerError> {
-                    let remaining = self.policy.worker_minutes * 60_000 - self.used.worker_millis;
-                    let worker_deadline =
-                        (started + Duration::from_millis(remaining)).min(self.deadline);
+                    let remaining = Duration::from_millis(
+                        self.policy.worker_minutes * 60_000 - self.used.worker_millis,
+                    )
+                    .min(self.policy.worker_turn());
+                    let worker_deadline = (started + remaining).min(self.deadline);
                     let agent_deadline = worker_deadline
                         .checked_sub(Duration::from_secs(self.policy.harvest_seconds))
                         .filter(|deadline| *deadline > Instant::now())
@@ -3185,8 +3233,9 @@ pub(super) fn client(name: &str) -> Result<(), ScalerError> {
     let socket = std::env::var_os("CARRICK_DISPATCH_SOCKET")
         .ok_or(ScalerError::Guard("missing tool socket"))?;
     let mut stream = UnixStream::connect(socket)?;
-    // Worker calls may legitimately occupy 35 minutes; the server owns that budget.
-    stream.set_read_timeout(Some(Duration::from_secs(45 * 60)))?;
+    // A worker call occupies at most one turn plus its capacity probe and
+    // harvest; the server owns that budget.
+    stream.set_read_timeout(Some(Policy::load()?.worker_turn() + TOOL_REPLY_MARGIN))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     writeln!(stream, "{request}")?;
     let mut response = String::new();
@@ -3612,12 +3661,14 @@ fn loop_windows(
     step_started: u64,
     now: u64,
 ) -> (Duration, Duration) {
-    let final_window =
-        Duration::from_secs(step_started.saturating_add(72 * 60).saturating_sub(now))
-            .min(job.saturating_add(Duration::from_secs(300)));
-    let work = policy
-        .min(job)
-        .min(final_window.saturating_sub(Duration::from_secs(300)));
+    let reserve = Duration::from_secs(crate::agent_runner::DISPATCH_FINAL_RESERVE_MINUTES * 60);
+    let final_window = Duration::from_secs(
+        step_started
+            .saturating_add(crate::agent_runner::DISPATCH_LOOP_STEP_MINUTES * 60)
+            .saturating_sub(now),
+    )
+    .min(job.saturating_add(reserve));
+    let work = policy.min(job).min(final_window.saturating_sub(reserve));
     (work, final_window)
 }
 
@@ -3638,7 +3689,15 @@ pub(super) fn run(root: &Path, event_path: &Path, setup: &str) -> Result<(), Sca
     } else {
         None
     };
-    let policy = Policy::load()?;
+    // The worker tier's facts (#1275): the brief and the admitted labels.
+    // The tier sets the round's budgets, so it is decided before the windows.
+    let tier = super::worker_tier::decide(
+        &dispatch.title,
+        &dispatch.body,
+        admission.trigger["body"].as_str().unwrap_or_default(),
+        &admission.labels,
+    );
+    let policy = Policy::load()?.for_tier(tier.tier);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| ScalerError::Guard("invalid dispatch clock"))?
@@ -3652,30 +3711,18 @@ pub(super) fn run(root: &Path, event_path: &Path, setup: &str) -> Result<(), Sca
         ))?;
     let (limit, final_limit) = loop_windows(
         Duration::from_secs(policy.wall_minutes * 60),
-        crate::agent_runner::job_remaining(80)?,
+        crate::agent_runner::job_remaining(crate::agent_runner::DISPATCH_LOOP_JOB_MINUTES)?,
         step_started,
         now,
     );
     let final_deadline = Instant::now() + final_limit;
-    // The worker tier's facts (#1275): the brief and the admitted labels.
-    let (dispatch_title, dispatch_body) = (dispatch.title.clone(), dispatch.body.clone());
-    let trigger_body = admission.trigger["body"]
-        .as_str()
-        .unwrap_or_default()
-        .to_owned();
-    let issue_labels = admission.labels.clone();
     let mut server = Server {
         root,
         dispatch,
         pr,
         trigger: admission.trigger,
         review_pr: pr,
-        tier: super::worker_tier::decide(
-            &dispatch_title,
-            &dispatch_body,
-            &trigger_body,
-            &issue_labels,
-        ),
+        tier,
         tier_unavailable: false,
         choices: Vec::new(),
         history: Vec::new(),
@@ -6368,7 +6415,10 @@ fi
             server.dispatch.review = false;
             let record = install_fixture_launcher(&mut server, live_capacity());
             server.execute(worker_request()).unwrap();
-            server.used.worker_millis += 60_000;
+            // Leave less than one turn so the shared total, not the turn
+            // cap, bounds the second worker.
+            server.used.worker_millis +=
+                (server.policy.worker_minutes - server.policy.worker_turn_minutes + 5) * 60_000;
             server.execute(worker_request()).unwrap();
             assert_eq!(server.used.workers, 2);
             assert_eq!(
@@ -6388,6 +6438,79 @@ fi
                 "second worker reset total time"
             );
             assert_eq!(server.history.len(), 2);
+        });
+    }
+    /// Owner decision 2026-11-03 (#231): a strong-tier round runs about
+    /// three hours, and still checkpoints regularly: each worker turn is
+    /// capped, and the server pushes a WIP checkpoint after every worker.
+    #[test]
+    fn a_strong_round_gets_three_hours_in_checkpointed_turns() {
+        let base = Policy::load().unwrap();
+        let standard = base.for_tier(super::super::worker_tier::WorkerTier::Standard);
+        let strong = base.for_tier(super::super::worker_tier::WorkerTier::Strong);
+        assert_eq!((standard.wall_minutes, standard.worker_minutes), (67, 60));
+        assert_eq!(strong.wall_minutes, MAX_WALL_MINUTES);
+        assert!((170..=180).contains(&strong.wall_minutes), "{strong:?}");
+        assert!(strong.worker_minutes < strong.wall_minutes);
+        assert!(strong.worker_turn_minutes < strong.worker_minutes);
+        assert!(
+            u64::from(strong.workers) * strong.worker_turn_minutes >= strong.worker_minutes,
+            "turns cannot spend the strong worker budget"
+        );
+        // The tool client waits out a whole turn and its probe and harvest.
+        assert!(
+            strong.worker_turn() + Duration::from_secs(strong.harvest_seconds)
+                < strong.worker_turn() + TOOL_REPLY_MARGIN
+        );
+        // At step start the strong round gets its whole wall budget.
+        let job = Duration::from_secs(
+            (crate::agent_runner::DISPATCH_LOOP_JOB_MINUTES
+                - crate::agent_runner::DISPATCH_JOB_OVERHEAD_MINUTES
+                + 5)
+                * 60,
+        );
+        let (work, final_window) = loop_windows(
+            Duration::from_secs(strong.wall_minutes * 60),
+            job,
+            1000,
+            1000,
+        );
+        assert_eq!(work, Duration::from_secs(strong.wall_minutes * 60));
+        assert_eq!(
+            final_window,
+            Duration::from_secs(crate::agent_runner::DISPATCH_LOOP_STEP_MINUTES * 60)
+        );
+        // A policy past the loop step is refused.
+        let mut long = strong.clone();
+        long.wall_minutes = MAX_WALL_MINUTES + 1;
+        assert!(long.validate().is_err());
+        let mut few = strong;
+        few.workers = 1;
+        assert!(few.validate().is_err(), "one turn cannot spend the budget");
+    }
+    #[test]
+    fn a_strong_worker_turn_is_capped_so_the_round_checkpoints() {
+        shared_fixture(|temporary| {
+            let root = temporary.join("base");
+            std::fs::create_dir(&root).unwrap();
+            git(&root, &["init", "-b", "main"]).unwrap();
+            git(&root, &["commit", "--allow-empty", "-m", "base"]).unwrap();
+            let mut server = server(&root);
+            server.dispatch.base = git(&root, &["rev-parse", "HEAD"]).unwrap().trim().into();
+            server.dispatch.resume = false;
+            server.dispatch.review = false;
+            server.policy = server
+                .policy
+                .for_tier(super::super::worker_tier::WorkerTier::Strong);
+            server.deadline = Instant::now() + Duration::from_secs(server.policy.wall_minutes * 60);
+            let record = install_fixture_launcher(&mut server, live_capacity());
+            server.execute(worker_request()).unwrap();
+            let turn = server.policy.worker_turn_minutes * 60 - server.policy.harvest_seconds;
+            let limit = record.borrow().limits[0];
+            assert!(
+                limit <= turn && limit + 60 > turn,
+                "worker got {limit}s, not one {turn}s turn of the strong budget"
+            );
         });
     }
     #[test]
@@ -7346,18 +7469,20 @@ exec /usr/bin/git "$@"
     }
     #[test]
     fn review_lease_wait_leaves_final_reserve() {
+        // A ten-minute lease wait into the step, with job time to spare.
+        let step = crate::agent_runner::DISPATCH_LOOP_STEP_MINUTES;
         let (work, final_window) = loop_windows(
-            Duration::from_secs(67 * 60),
-            Duration::from_secs(75 * 60),
+            Duration::from_secs(MAX_WALL_MINUTES * 60),
+            Duration::from_secs((step + 5) * 60),
             1000,
             1000 + 10 * 60,
         );
         assert_eq!(
             work.as_secs(),
-            57 * 60,
+            (MAX_WALL_MINUTES - 10) * 60,
             "lease wait was added to the step budget"
         );
-        assert_eq!(final_window.as_secs(), 62 * 60);
+        assert_eq!(final_window.as_secs(), (step - 10) * 60);
         assert_eq!(final_window - work, Duration::from_secs(300));
     }
     struct SlowCapacity;
