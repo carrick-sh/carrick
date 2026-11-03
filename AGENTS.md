@@ -521,6 +521,19 @@ acceptance.
 - **Every large or shared-kernel PR gets an independent review by a strong
   reviewer before landing.** Gates passed what review caught: two P0s in #338,
   forged two-task witnesses standing in for production operations in #331.
+- **Review findings are triaged by severity, and only P0s and P1s block
+  landing** (owner, 2026-11-03). A reviewer rates every finding:
+  - **P0:** a wrong guest-visible result, a crash or hang, data loss, a
+    security hole or a broken invariant;
+  - **P1:** a real defect that will bite, or a missing witness for the
+    change's own claim;
+  - **P2:** everything else: improvements, style, wider coverage, adjacent
+    gaps.
+
+  The PR fixes its P0s and P1s before it lands. P2s become linked
+  `follow-up` issues, filed by the reviewer or the fixing round, never
+  scope added to the PR and never a reason to hold it. Rate with judgement,
+  not by keyword. A disputed rating goes to the director as tie-breaker.
 - **Grep diffs for out-of-fence changes** — a page-table worker flipped
   `pwrite64` on a pipe read end ESPIPE→EBADF, broke main for a day, and a later
   worker "fixed" the test to match. Out-of-fence changes need an oracle line.
