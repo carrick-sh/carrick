@@ -12,14 +12,14 @@ const SYNTHETIC_SECRET: &str = "synthetic-never-a-real-credential";
 
 #[test]
 fn both_agent_templates_reject_destructive_permissions_in_every_site_profile() {
-    for target in [9000, 9001] {
+    for target in [9001, 9000] {
         for lane in [CloneLane::Kvm, CloneLane::Agent] {
             let site = site::CONTABO.for_lane(lane).unwrap();
             let result = verify_protected_vms(site, |vm| {
                 Ok(if vm == target {
                     json!({format!("/vms/{vm}"): {"VM.PowerMgmt": 1}})
-                } else if vm == 9001 {
-                    json!({"/vms/9001": {"VM.Audit": 1, "VM.Clone": 1}})
+                } else if vm == 9000 {
+                    json!({"/vms/9000": {"VM.Audit": 1, "VM.Clone": 1}})
                 } else {
                     json!({})
                 })
@@ -33,13 +33,13 @@ fn both_agent_templates_reject_destructive_permissions_in_every_site_profile() {
 }
 
 #[test]
-fn template_9001_clone_rights_never_license_other_protected_workers() {
+fn template_9000_clone_rights_never_license_other_protected_workers() {
     for lane in [CloneLane::Kvm, CloneLane::Agent] {
         let site = site::CONTABO.for_lane(lane).unwrap();
         assert!(
             verify_protected_vms(site, |vm| {
-                Ok(if vm == 9001 {
-                    serde_json::json!({"/vms/9001": {"VM.Audit": 1, "VM.Clone": 1}})
+                Ok(if vm == 9000 {
+                    serde_json::json!({"/vms/9000": {"VM.Audit": 1, "VM.Clone": 1}})
                 } else {
                     serde_json::json!({})
                 })
@@ -869,7 +869,7 @@ fn startup_fixture(agents: bool, pooled: bool, rights: Value) -> Result<(), Scal
     .unwrap();
     if pooled {
         inventory.push(PoolMember {
-            id: 9001,
+            id: 9000,
             pool: POOL.into(),
             template: true,
         });
@@ -891,13 +891,13 @@ fn startup_fixture(agents: bool, pooled: bool, rights: Value) -> Result<(), Scal
                     "scsi0":"local:300/base-300-disk-0.qcow2,size=100G",
                     "net0":"virtio,bridge=vmbr1,firewall=1"
                 }),
-                "/nodes/carrick-ctb/qemu/9001/config" if agents => json!({
+                "/nodes/carrick-ctb/qemu/9000/config" if agents => json!({
                     "template":1,"cpu":"host","cores":8,"memory":"20480","allow-ksm":0,
-                    "scsi0":"local:9001/base-9001-disk-0.qcow2,size=100G",
+                    "scsi0":"local:9000/base-9000-disk-0.qcow2,size=100G",
                     "net0":"virtio,bridge=vmbr1,firewall=1"
                 }),
-                "/access/permissions?path=/vms/9001" => rights.clone(),
-                "/access/permissions?path=/vms/9000" => json!({}),
+                "/access/permissions?path=/vms/9000" => rights.clone(),
+                "/access/permissions?path=/vms/9001" => json!({}),
                 "/access/permissions?path=/vms/101"
                 | "/access/permissions?path=/vms/102"
                 | "/access/permissions?path=/vms/103"
@@ -911,7 +911,7 @@ fn startup_fixture(agents: bool, pooled: bool, rights: Value) -> Result<(), Scal
         },
     );
     if result.is_ok() {
-        assert_eq!(firewalls, if agents { vec![300, 9001] } else { vec![300] });
+        assert_eq!(firewalls, if agents { vec![300, 9000] } else { vec![300] });
     }
     result
 }
@@ -921,7 +921,7 @@ fn startup_agent_source_outside_pool() {
     startup_fixture(
         true,
         false,
-        json!({"/vms/9001":{"VM.Audit":1,"VM.Clone":1}}),
+        json!({"/vms/9000":{"VM.Audit":1,"VM.Clone":1}}),
     )
     .unwrap();
 }
@@ -931,7 +931,7 @@ fn startup_agent_source_inside_pool_refused() {
     let error = startup_fixture(
         true,
         true,
-        json!({"/vms/9001":{
+        json!({"/vms/9000":{
             "VM.Audit":1,"VM.Clone":1,"VM.PowerMgmt":1,"VM.Config.CPU":1
         }}),
     )
@@ -951,7 +951,7 @@ fn startup_kvm_only_unchanged() {
     startup_fixture(
         false,
         false,
-        json!({"/vms/9001":{"VM.Audit":1,"VM.Clone":1}}),
+        json!({"/vms/9000":{"VM.Audit":1,"VM.Clone":1}}),
     )
     .unwrap();
 }
@@ -960,8 +960,8 @@ fn startup_kvm_only_unchanged() {
 fn startup_agent_source_requires_both_rights() {
     for rights in [
         json!({}),
-        json!({"/vms/9001":{"VM.Audit":1}}),
-        json!({"/vms/9001":{"VM.Clone":1}}),
+        json!({"/vms/9000":{"VM.Audit":1}}),
+        json!({"/vms/9000":{"VM.Clone":1}}),
     ] {
         assert!(matches!(
             startup_fixture(true, false, rights),
@@ -1009,15 +1009,15 @@ fn template_cutover_admits_new_source_while_old_clone_runs() {
     let mut old = ledger
         .reserve_lane(key(1), &[], 1, budget, CloneLane::Agent)
         .unwrap();
-    // The pre-cutover controller issued this clone from the blue source.
+    // The pre-cutover controller issued this clone from the green source.
     let old_site = site::CONTABO
         .for_lane(CloneLane::Agent)
         .unwrap()
-        .with_template(Some(9000))
+        .with_template(Some(9001))
         .unwrap();
     assert_eq!(
         clone_call(old_site, &old).unwrap().1,
-        "/nodes/carrick-ctb/qemu/9000/clone"
+        "/nodes/carrick-ctb/qemu/9001/clone"
     );
     old.state = State::Running;
     ledger.rows[0] = old.clone();
@@ -1030,7 +1030,7 @@ fn template_cutover_admits_new_source_while_old_clone_runs() {
         .reserve_lane(key(2), &inventory, 2, budget, CloneLane::Agent)
         .unwrap();
     let (call, source) = clone_call(site::CONTABO, &new).unwrap();
-    assert_eq!(source, "/nodes/carrick-ctb/qemu/9001/clone");
+    assert_eq!(source, "/nodes/carrick-ctb/qemu/9000/clone");
     let PveCall::Post(body) = call else {
         panic!("expected clone POST")
     };

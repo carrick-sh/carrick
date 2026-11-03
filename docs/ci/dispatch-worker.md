@@ -1095,8 +1095,9 @@ retired. These trials also complete #799's pending live acceptance.
 ## Rebuild an agent template beside the running source (#1384)
 
 Agent templates 9000 and 9001 are approved slots outside `carrick-ci`.
-The Contabo site row selects 9001 for new clones; existing clones keep the
-9000 base until they are destroyed. Their provisioning addresses are
+The Contabo site row selects 9000 (rebuilt for the shared Rust toolchain,
+#1521) for new clones; existing clones keep the 9001 base until they are
+destroyed. Their provisioning addresses are
 `10.77.0.150` and `10.77.0.151`, with separate VM firewall files.
 
 Follow the [beside rebuild procedure](contabo-kvm.md#rebuild-an-agent-template-beside-the-running-source-1384).

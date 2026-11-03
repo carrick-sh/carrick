@@ -103,7 +103,7 @@ pub(super) const WILLOW: Site = Site {
 /// directory storage, and the agent-worker VMs/template protected.
 pub(super) const CONTABO: Site = Site {
     lane: super::CloneLane::Kvm,
-    agent_template: Some(AgentTemplate::Green),
+    agent_template: Some(AgentTemplate::Blue),
     node: "carrick-ctb",
     api_host: "carrick-ctb.turkey-moth.ts.net",
     api_ca: Some("/etc/pve/pve-root-ca.pem"),
@@ -457,7 +457,7 @@ mod tests {
         for vmid in [300, 308, 8999, 9002, u16::MAX] {
             assert!(site.with_template(Some(vmid)).is_err());
         }
-        assert!(CONTABO.with_template(Some(9001)).is_err());
+        assert!(CONTABO.with_template(Some(9000)).is_err());
         assert!(WILLOW.for_lane(super::super::CloneLane::Agent).is_err());
     }
 
@@ -501,7 +501,7 @@ mod tests {
             CONTABO,
             Site {
                 lane: super::super::CloneLane::Kvm,
-                agent_template: Some(AgentTemplate::Green),
+                agent_template: Some(AgentTemplate::Blue),
                 node: "carrick-ctb",
                 api_host: "carrick-ctb.turkey-moth.ts.net",
                 api_ca: Some("/etc/pve/pve-root-ca.pem"),
@@ -551,12 +551,12 @@ OUT ACCEPT -dest 0.0.0.0/0 -log nolog # remaining IPv4 through the NAT gateway\n
         let site = CONTABO.for_lane(super::super::CloneLane::Agent).unwrap();
         let env = site.shell_env().unwrap();
         for line in [
-            "SITE_TEMPLATE_VMID=9001",
+            "SITE_TEMPLATE_VMID=9000",
             "SITE_CORES=8",
             "SITE_MEMORY_MIB=20480",
             "SITE_ALLOW_KSM=0",
             "SITE_VM_FIREWALL=1",
-            "SITE_TEMPLATE_IPCONFIG=ip=10.77.0.151/24,gw=10.77.0.1",
+            "SITE_TEMPLATE_IPCONFIG=ip=10.77.0.150/24,gw=10.77.0.1",
         ] {
             assert!(env.lines().any(|actual| actual == line), "{line}");
         }
@@ -566,14 +566,14 @@ OUT ACCEPT -dest 0.0.0.0/0 -log nolog # remaining IPv4 through the NAT gateway\n
         );
         assert_eq!(site.cores, 8);
         assert_eq!(site.memory_mib, 20480);
-        assert_eq!(site.template().unwrap(), 9001);
+        assert_eq!(site.template().unwrap(), 9000);
         assert_eq!(site.protected, &[101, 102, 103, 104, 9000, 9001]);
-        assert_eq!(site.static_address(9000).unwrap().unwrap(), "10.77.0.150");
+        assert_eq!(site.static_address(9001).unwrap().unwrap(), "10.77.0.151");
         assert!(
-            site.vm_firewall_file(9000)
+            site.vm_firewall_file(9001)
                 .unwrap()
                 .unwrap()
-                .contains("10.77.0.150")
+                .contains("10.77.0.151")
         );
         assert!(WILLOW.for_lane(super::super::CloneLane::Agent).is_err());
     }

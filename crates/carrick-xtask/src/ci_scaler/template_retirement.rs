@@ -160,20 +160,20 @@ mod tests {
     #[test]
     fn retirement_checks_stopped_and_unpooled_disks_and_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
-        for subdir in ["9000", "308"] {
+        for subdir in ["9001", "308"] {
             std::fs::create_dir(dir.path().join(subdir)).unwrap();
         }
-        std::fs::write(dir.path().join("9000/base.qcow2"), []).unwrap();
+        std::fs::write(dir.path().join("9001/base.qcow2"), []).unwrap();
         std::fs::write(dir.path().join("308/disk.qcow2"), []).unwrap();
         std::fs::hard_link(
-            dir.path().join("9000/base.qcow2"),
+            dir.path().join("9001/base.qcow2"),
             dir.path().join("alias.qcow2"),
         )
         .unwrap();
         for (chain, allowed) in [
             (
-                json!([{"filename":"/images/308/disk.qcow2", "full-backing-filename":"/images/9000/base.qcow2"},
-                    {"filename":"/images/9000/base.qcow2"}]),
+                json!([{"filename":"/images/308/disk.qcow2", "full-backing-filename":"/images/9001/base.qcow2"},
+                    {"filename":"/images/9001/base.qcow2"}]),
                 false,
             ),
             (
@@ -183,9 +183,9 @@ mod tests {
             (json!([{"filename":"/images/308/disk.qcow2"}]), true),
             (json!([]), false),
         ] {
-            let result = check_with(site::CONTABO, 9000, |args| {
+            let result = check_with(site::CONTABO, 9001, |args| {
                 let output: String = match args {
-                    ["qm", "config", "9000"] => "template: 1\n".into(),
+                    ["qm", "config", "9001"] => "template: 1\n".into(),
                     [
                         "pvesh",
                         "get",
@@ -195,12 +195,12 @@ mod tests {
                         "--output-format",
                         "json",
                     ] => json!([
-                        {"vmid":"9000","format":"qcow2","volid":"local:9000/base.qcow2"},
+                        {"vmid":"9001","format":"qcow2","volid":"local:9001/base.qcow2"},
                         {"vmid":308,"format":"qcow2","volid":"local:308/disk.qcow2"}
                     ])
                     .to_string(),
-                    ["pvesm", "path", "local:9000/base.qcow2"] => {
-                        "/images/9000/base.qcow2\n".into()
+                    ["pvesm", "path", "local:9001/base.qcow2"] => {
+                        "/images/9001/base.qcow2\n".into()
                     }
                     ["pvesm", "path", "local:308/disk.qcow2"] => "/images/308/disk.qcow2\n".into(),
                     [
@@ -221,7 +221,7 @@ mod tests {
 
     #[test]
     fn retirement_refuses_active_and_unapproved_ids_before_commands() {
-        for vmid in [9001, 9002, 300, 308] {
+        for vmid in [9000, 9002, 300, 308] {
             assert!(check_with(site::CONTABO, vmid, |_| panic!("must refuse first")).is_err());
         }
     }
