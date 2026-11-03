@@ -1977,8 +1977,7 @@ impl Server<'_> {
             let last_exit = applied.last_worker_exit.or_else(|| {
                 state
                     .as_deref()
-                    .and_then(|s| worker_checkpoint(s, &self.dispatch).ok().flatten())
-                    .map(|r| LauncherExit::from_code(r.exit_code))
+                    .and_then(|s| extract_result_exit(&s.join("result.json")))
             });
             let last_error = applied
                 .last_worker_error
@@ -1999,7 +1998,7 @@ impl Server<'_> {
                 .filter(|e| !e.is_empty());
             let exit = last_exit.map(|exit| match exit {
                 LauncherExit::Clean => "exit status 0".to_owned(),
-                LauncherExit::TimedOut => "exit status 124, timed out".to_owned(),
+                LauncherExit::TimedOut => "exit status 124, director timeout fired".to_owned(),
                 LauncherExit::Code(code) => format!("exit status {code}"),
             });
             let detail = match (exit, last_error.as_deref()) {
@@ -2014,8 +2013,7 @@ impl Server<'_> {
             if let Some(error) = last_error.as_deref()
                 && loop_summary_claims_absent_cause(summary, error)
             {
-                observations
-                    .push("loop summary names a cause absent from the worker error".to_owned());
+                observations.push("summary cause not found in worker error".to_owned());
             }
         }
         if applied.published_checkpoint {
@@ -2339,7 +2337,10 @@ impl Server<'_> {
             }
             Applied::record(|a| {
                 a.wip_pushed = Some(receipt.head.clone());
-                a.wip_exit = Some(LauncherExit::from_code(receipt.exit_code));
+                a.wip_exit = Some(
+                    a.last_worker_exit
+                        .unwrap_or_else(|| LauncherExit::from_code(receipt.exit_code)),
+                );
             })?;
             Ok(Some(format!("pushed WIP at `{}`", receipt.head)))
         })();
@@ -3560,36 +3561,109 @@ pub(super) fn chain_section(body: &str) -> Option<ChainSection> {
     })
 }
 
-/// Whether the coordinator's `loop_summary` claims a failure cause (such as
-/// missing auth/credentials or an HTTP status) absent from the worker's own
-/// observed error (#1473).
+/// Whether the coordinator's `loop_summary` names a specific failure class
+/// (`auth/401/403`, `quota`, `capacity`, `network`, or `timeout`) absent from
+/// the worker's own observed error (#1473).
 fn loop_summary_claims_absent_cause(summary: &str, worker_error: &str) -> bool {
+    fn contains_term(text: &str, term: &str) -> bool {
+        let bytes = text.as_bytes();
+        let mut start = 0;
+        while let Some(pos) = text[start..].find(term) {
+            let idx = start + pos;
+            let end = idx + term.len();
+            let before_ok = idx == 0 || !bytes[idx - 1].is_ascii_alphanumeric();
+            let after_ok = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
+            if before_ok && after_ok {
+                return true;
+            }
+            start = idx + 1;
+        }
+        false
+    }
+
+    const FAILURE_CLASSES: &[&[&str]] = &[
+        // auth/401/403
+        &[
+            "401",
+            "403",
+            "auth",
+            "authentication",
+            "unauthorized",
+            "unauthenticated",
+            "forbidden",
+            "credential",
+            "credentials",
+            "bearer",
+            "oauth",
+            "api key",
+            "api-key",
+        ],
+        // quota
+        &[
+            "quota",
+            "quotas",
+            "429",
+            "rate limit",
+            "rate-limit",
+            "ratelimit",
+            "rate limited",
+            "rate-limited",
+            "usage limit",
+            "billing",
+        ],
+        // capacity
+        &[
+            "capacity",
+            "no free slot",
+            "no free slots",
+            "free slot",
+            "free slots",
+            "slot unavailable",
+            "slots unavailable",
+            "overloaded",
+        ],
+        // network
+        &[
+            "network",
+            "networking",
+            "connection refused",
+            "connection reset",
+            "connection closed",
+            "dns",
+            "econnrefused",
+            "econnreset",
+            "enetunreach",
+            "ehostunreach",
+            "tls",
+            "ssl",
+            "socket hang up",
+            "unreachable",
+        ],
+        // timeout
+        &[
+            "timeout",
+            "timeouts",
+            "timed out",
+            "time out",
+            "deadline exceeded",
+            "etimedout",
+        ],
+    ];
+
     let summary_lower = summary.to_ascii_lowercase();
     let error_lower = worker_error.to_ascii_lowercase();
     if error_lower.is_empty() || summary_lower.contains(&error_lower) {
         return false;
     }
-    const CAUSES: &[&str] = &[
-        "401",
-        "403",
-        "429",
-        "unauthorized",
-        "unauthenticated",
-        "authentication",
-        "credential",
-        "bearer",
-        "oauth",
-        "api key",
-        "quota",
-        "rate limit",
-        "rate-limit",
-        "due to ",
-        "because ",
-        "caused by ",
-    ];
-    CAUSES
-        .iter()
-        .any(|cause| summary_lower.contains(cause) && !error_lower.contains(cause))
+    FAILURE_CLASSES.iter().any(|class_terms| {
+        let in_summary = class_terms
+            .iter()
+            .any(|term| contains_term(&summary_lower, term));
+        let in_error = class_terms
+            .iter()
+            .any(|term| contains_term(&error_lower, term));
+        in_summary && !in_error
+    })
 }
 
 /// The server-written part of a dispatch outcome: before `<details>`, which
@@ -5757,7 +5831,201 @@ fi
                 "credential leaked in outcome: {posted}"
             );
             assert!(
-                server_section.contains("loop summary names a cause absent from the worker error"),
+                server_section.contains("summary cause not found in worker error"),
+                "{server_section}"
+            );
+        });
+    }
+    #[test]
+    fn record_worker_failure_records_real_process_exit_status_and_does_not_overflag_restated_cause()
+    {
+        shared_fixture(|root| {
+            struct ProcessExitHost {
+                retired: bool,
+            }
+            impl WorkerHost for ProcessExitHost {
+                fn initialize(&mut self) -> Result<(), ScalerError> {
+                    Ok(())
+                }
+                fn prepare(&mut self, _: &Path, _: &Path, _: &str) -> Result<(), ScalerError> {
+                    Ok(())
+                }
+                fn agent(&mut self, root: &Path, _: &Dispatch) -> Result<i32, ScalerError> {
+                    self.retired = false;
+                    let state = crate::agent_runner::state()?;
+                    let actor = root.parent().unwrap();
+                    std::fs::write(state.join("agent.out"), "")?;
+                    std::fs::write(
+                        state.join("agent.err"),
+                        "fatal: sqlite state runtime failed because lock timed out\n",
+                    )?;
+                    let _ = std::fs::remove_file(actor.join("result.json"));
+                    Err(ScalerError::CommandFailed(
+                        "carrick-agent-runner exited with code 23; stderr: fatal: sqlite state runtime failed because lock timed out".into(),
+                    ))
+                }
+                fn retire(&mut self) -> Result<(), ScalerError> {
+                    self.retired = true;
+                    Ok(())
+                }
+                fn hand_back(&mut self, _: &Path) -> Result<(), ScalerError> {
+                    assert!(self.retired);
+                    Ok(())
+                }
+            }
+
+            let base = root.join("base");
+            let dispatch = native_dispatch(&base);
+            let mut server = server(&base);
+            server.dispatch = dispatch;
+            server.launcher = Box::new(ObservedNativeLauncher(NativeLauncher {
+                host: Box::new(ProcessExitHost { retired: true }),
+            }));
+            let response = server.execute(worker_request()).unwrap();
+            assert_eq!(response["status"], "failed");
+            server
+                .execute(Request::Finish(Outcome {
+                    status: FinishStatus::Failed,
+                    summary:
+                        "Worker failed due to sqlite state runtime failure because the lock timed out"
+                            .into(),
+                    brief: None,
+                }))
+                .unwrap();
+            let posted = regular_text(&root.join("posted.md")).unwrap();
+            let server_section = server_part(&posted);
+            assert!(
+                server_section.contains(
+                    "Server observed: the last worker failed, timed out, or did not produce complete output (exit status 23: fatal: sqlite state runtime failed because lock timed out)"
+                ),
+                "{server_section}"
+            );
+            assert!(
+                !server_section.contains("summary cause not found in worker error"),
+                "restated worker error should not be flagged: {server_section}"
+            );
+        });
+    }
+    #[test]
+    fn record_worker_failure_records_real_launcher_envelope_exit_status() {
+        shared_fixture(|root| {
+            struct LauncherEnvelopeExitHost {
+                retired: bool,
+            }
+            impl WorkerHost for LauncherEnvelopeExitHost {
+                fn initialize(&mut self) -> Result<(), ScalerError> {
+                    Ok(())
+                }
+                fn prepare(&mut self, _: &Path, _: &Path, _: &str) -> Result<(), ScalerError> {
+                    Ok(())
+                }
+                fn agent(&mut self, root: &Path, _: &Dispatch) -> Result<i32, ScalerError> {
+                    self.retired = false;
+                    let state = crate::agent_runner::state()?;
+                    let actor = root.parent().unwrap();
+                    let envelope = json!({
+                        "transport": {
+                            "exit_code": 42,
+                            "timed_out": false
+                        },
+                        "result": null
+                    });
+                    std::fs::write(state.join("agent.out"), "")?;
+                    std::fs::write(state.join("agent.err"), "error: sandbox setup failed\n")?;
+                    std::fs::write(state.join("result.json"), envelope.to_string())?;
+                    std::fs::write(actor.join("result.json"), envelope.to_string())?;
+                    Ok(1)
+                }
+                fn retire(&mut self) -> Result<(), ScalerError> {
+                    self.retired = true;
+                    Ok(())
+                }
+                fn hand_back(&mut self, _: &Path) -> Result<(), ScalerError> {
+                    assert!(self.retired);
+                    Ok(())
+                }
+            }
+
+            let base = root.join("base");
+            let dispatch = native_dispatch(&base);
+            let mut server = server(&base);
+            server.dispatch = dispatch;
+            server.launcher = Box::new(ObservedNativeLauncher(NativeLauncher {
+                host: Box::new(LauncherEnvelopeExitHost { retired: true }),
+            }));
+            server.execute(worker_request()).unwrap();
+            server
+                .execute(Request::Finish(Outcome {
+                    status: FinishStatus::Failed,
+                    summary: "Worker failed because sandbox setup failed".into(),
+                    brief: None,
+                }))
+                .unwrap();
+            let posted = regular_text(&root.join("posted.md")).unwrap();
+            let server_section = server_part(&posted);
+            assert!(
+                server_section.contains("exit status 42: error: sandbox setup failed"),
+                "{server_section}"
+            );
+            assert!(
+                !server_section.contains("summary cause not found in worker error"),
+                "restated worker error should not be flagged: {server_section}"
+            );
+        });
+    }
+    #[test]
+    fn record_worker_failure_uses_124_only_when_director_timeout_fired() {
+        shared_fixture(|root| {
+            struct DirectorTimeoutHost {
+                retired: bool,
+            }
+            impl WorkerHost for DirectorTimeoutHost {
+                fn initialize(&mut self) -> Result<(), ScalerError> {
+                    Ok(())
+                }
+                fn prepare(&mut self, _: &Path, _: &Path, _: &str) -> Result<(), ScalerError> {
+                    Ok(())
+                }
+                fn agent(&mut self, root: &Path, _: &Dispatch) -> Result<i32, ScalerError> {
+                    self.retired = false;
+                    let state = crate::agent_runner::state()?;
+                    let actor = root.parent().unwrap();
+                    std::fs::write(state.join("agent.out"), "")?;
+                    std::fs::write(state.join("agent.err"), "")?;
+                    let _ = std::fs::remove_file(actor.join("result.json"));
+                    Err(ScalerError::CommandFailed(
+                        "carrick-agent-runner timed out after 2700s".into(),
+                    ))
+                }
+                fn retire(&mut self) -> Result<(), ScalerError> {
+                    self.retired = true;
+                    Ok(())
+                }
+                fn hand_back(&mut self, _: &Path) -> Result<(), ScalerError> {
+                    assert!(self.retired);
+                    Ok(())
+                }
+            }
+
+            let base = root.join("base");
+            let dispatch = native_dispatch(&base);
+            let mut server = server(&base);
+            server.dispatch = dispatch;
+            server.launcher = Box::new(ObservedNativeLauncher(NativeLauncher {
+                host: Box::new(DirectorTimeoutHost { retired: true }),
+            }));
+            server.execute(worker_request()).unwrap();
+            server
+                .execute(Request::Finish(Outcome {
+                    status: FinishStatus::Failed,
+                    summary: "Worker turn timed out".into(),
+                    brief: None,
+                }))
+                .unwrap();
+            let posted = regular_text(&root.join("posted.md")).unwrap();
+            let server_section = server_part(&posted);
+            assert!(
+                server_section.contains("exit status 124, director timeout fired"),
                 "{server_section}"
             );
         });
@@ -5829,7 +6097,7 @@ fi
                 "tail cut leaked unredacted credential suffix: {posted}"
             );
             assert!(
-                !server_section.contains("loop summary names a cause absent from the worker error"),
+                !server_section.contains("summary cause not found in worker error"),
                 "{server_section}"
             );
         });

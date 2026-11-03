@@ -1597,6 +1597,79 @@ pub(crate) fn extract_result_error(result_path: &Path) -> Option<String> {
     json_error_text(&value["error"]).or_else(|| json_error_text(&value["result"]["error"]))
 }
 
+/// Extract the launcher or worker exit status from `result.json` (#1473).
+/// `LauncherExit::TimedOut` (124) is returned only when the director's own
+/// timeout fired (`timed_out: true`).
+pub(crate) fn extract_result_exit(result_path: &Path) -> Option<LauncherExit> {
+    let text = unredacted_diagnostic_text(result_path).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    let transport = &value["transport"];
+    if transport["timed_out"].as_bool() == Some(true) || value["timed_out"].as_bool() == Some(true)
+    {
+        return Some(LauncherExit::TimedOut);
+    }
+    let code = transport["exit_code"]
+        .as_i64()
+        .or_else(|| value["exit_code"].as_i64())
+        .or_else(|| value["result"]["exit_code"].as_i64())
+        .and_then(|c| i32::try_from(c).ok())?;
+    Some(match code {
+        0 => LauncherExit::Clean,
+        code => LauncherExit::Code(code),
+    })
+}
+
+/// Extract the actual process exit status from a process failure error,
+/// ignoring stderr output and never fabricating 1 or 124 (#1473).
+pub(crate) fn extract_process_exit(error: &ScalerError) -> Option<LauncherExit> {
+    let text = match error {
+        ScalerError::CommandFailed(msg) | ScalerError::Usage(msg) => msg.as_str(),
+        _ => return None,
+    };
+    let reason = text.split_once("; stderr: ").map_or(text, |(r, _)| r);
+    for marker in [" exited with code ", " exited with status "] {
+        if let Some((_, rest)) = reason.rsplit_once(marker)
+            && let Some(token) = rest.split_whitespace().next()
+            && let Ok(code) = token
+                .trim_matches(|c: char| !c.is_ascii_digit() && c != '-')
+                .parse::<i32>()
+        {
+            return Some(match code {
+                0 => LauncherExit::Clean,
+                code => LauncherExit::Code(code),
+            });
+        }
+    }
+    if let Some((_, rest)) = reason.rsplit_once(" killed by signal ")
+        && let Some(token) = rest.split_whitespace().next()
+        && let Ok(sig) = token
+            .trim_matches(|c: char| !c.is_ascii_digit())
+            .parse::<i32>()
+    {
+        return Some(LauncherExit::Code(128 + sig));
+    }
+    if reason.contains(" timed out") {
+        return Some(LauncherExit::TimedOut);
+    }
+    None
+}
+
+pub(crate) fn resolve_worker_exit(
+    agent_result: &Result<i32, ScalerError>,
+    result_path: Option<&Path>,
+) -> Option<LauncherExit> {
+    let from_result = result_path.and_then(extract_result_exit);
+    match (agent_result, from_result) {
+        (_, Some(LauncherExit::TimedOut)) => Some(LauncherExit::TimedOut),
+        (Ok(124), Some(exit)) => Some(exit),
+        (Ok(124), None) => Some(LauncherExit::TimedOut),
+        (Ok(0 | 1), Some(exit @ LauncherExit::Code(_))) => Some(exit),
+        (Ok(code), _) => Some(LauncherExit::from_code(*code)),
+        (Err(_), Some(exit)) => Some(exit),
+        (Err(error), None) => extract_process_exit(error),
+    }
+}
+
 pub(crate) fn extract_stderr_error(stderr: &str) -> Option<String> {
     let trimmed = stderr.trim();
     if trimmed.is_empty() {
@@ -1669,15 +1742,16 @@ fn record_worker_failure(error: &ScalerError, dispatch: &Dispatch) -> Result<(),
         .ok()
         .and_then(|err| extract_stderr_error(&err));
     let raw_error = stderr_err.unwrap_or_else(|| error.to_string());
-    let exit_code = if error.to_string().contains("timed out") {
-        124
-    } else {
-        1
-    };
+    let fallback_exit =
+        extract_result_exit(&state.join("result.json")).or_else(|| extract_process_exit(error));
     let _ = Applied::record(|applied| {
-        applied.last_worker_exit = Some(LauncherExit::from_code(exit_code));
-        applied.last_worker_error =
-            Some(format_worker_error(&raw_error, &token)).filter(|err| !err.is_empty());
+        if applied.last_worker_exit.is_none() {
+            applied.last_worker_exit = fallback_exit;
+        }
+        if applied.last_worker_error.is_none() {
+            applied.last_worker_error =
+                Some(format_worker_error(&raw_error, &token)).filter(|err| !err.is_empty());
+        }
     });
     let contract = Contract {
         loop_summary: None,
@@ -3829,27 +3903,39 @@ fn harvest_worker(
     let (mut contract, _) = timed_phase("worker.read_result", || {
         Ok(read_result(&actor.join("result.json")))
     })?;
-    let code = match result {
-        Ok(124) => {
+    let resolved_exit = resolve_worker_exit(&result, Some(&actor.join("result.json")));
+    let code = match (&result, resolved_exit) {
+        (_, Some(LauncherExit::TimedOut)) => {
             contract.status = ContractStatus::Failed;
             contract
                 .summary
                 .push_str("\nWorker timed out; partial work harvested for continuation");
             124
         }
-        Ok(code) => {
-            if code != 0 {
+        (Ok(_), Some(LauncherExit::Code(code))) => {
+            contract.status = ContractStatus::Failed;
+            contract
+                .risks
+                .push(format!("Worker launcher exited with code {code}"));
+            code
+        }
+        (Ok(code), _) => {
+            if *code != 0 {
                 contract.status = ContractStatus::Failed;
                 contract
                     .risks
                     .push(format!("Worker launcher exited with code {code}"));
             }
-            code
+            *code
         }
-        Err(error) => {
+        (Err(error), exit) => {
             contract.status = ContractStatus::Failed;
             contract.summary = format!("Worker failed: {error}");
-            1
+            match exit {
+                Some(LauncherExit::Code(code)) => code,
+                Some(LauncherExit::TimedOut) => 124,
+                _ => 1,
+            }
         }
     };
     let checkpointed = timed_phase("worker.checkpoint", || checkpoint(work, dispatch))?;
@@ -3981,6 +4067,8 @@ fn produce(
         risks: vec![],
     };
     let mut code = 1;
+    let mut resolved_exit = None;
+    let token = std::env::var("GH_TOKEN").unwrap_or_default();
     let previous = worker_checkpoint(&state, dispatch)?;
     let mut expected_tip = previous
         .as_ref()
@@ -4031,7 +4119,7 @@ fn produce(
         {
             agent_dispatch.body.push_str(&format!(
                 "\n## Earlier PR body proposal (untrusted worker claims)\nThe server retains this proposal if you write no pr-body.md. Write that file to revise it.\n```json\n{}\n```\n",
-                serde_json::to_string(&agent_loop::masked(body, &std::env::var("GH_TOKEN").unwrap_or_default()))?
+                serde_json::to_string(&agent_loop::masked(body, &token))?
             ));
         }
         agent_dispatch.loop_deadline = dispatch
@@ -4040,6 +4128,10 @@ fn produce(
         let commands = agent_dispatch.loop_deadline.map(CommandWindow::until);
         let result = timed_phase("worker.agent", || host.agent(&actor_work, &agent_dispatch));
         drop(commands);
+        resolved_exit = resolve_worker_exit(&result, None);
+        let _ = Applied::record(|applied| {
+            applied.last_worker_exit = resolved_exit;
+        });
         // Dropping the agent window restores NativeLauncher's harvest window.
         // This is mandatory even on launcher failure, before scanning or hand-back.
         timed_phase("worker.retirement", || host.retire())?;
@@ -4048,6 +4140,7 @@ fn produce(
         timed_phase("worker.hand_back", || host.hand_back(&actor))?;
         let (_, evidence) = read_result(&actor.join("result.json"));
         record_worker_session(&actor.join("runtime/dispatch/worker.log"), &package)?;
+        resolved_exit = resolve_worker_exit(&result, Some(&actor.join("result.json")));
         let agent_error = result.as_ref().err().map(ToString::to_string);
         worker_error = unredacted_diagnostic_text(&actor.join("runtime/dispatch/worker.log"))
             .ok()
@@ -4064,6 +4157,14 @@ fn produce(
                     .and_then(|err| extract_stderr_error(&err))
             })
             .or(agent_error);
+        let preharvest_error = worker_error
+            .as_deref()
+            .map(|err| format_worker_error(err, &token))
+            .filter(|err| !err.is_empty());
+        let _ = Applied::record(|applied| {
+            applied.last_worker_exit = resolved_exit;
+            applied.last_worker_error = preharvest_error;
+        });
         let prior_raw = std::mem::take(&mut raw);
         raw.push_str(&evidence);
         for name in ["runtime/dispatch/worker.log", "runtime/dispatch/worker.err"] {
@@ -4105,14 +4206,13 @@ fn produce(
         });
         candidate = Some(staging);
     }
-    let token = std::env::var("GH_TOKEN").unwrap_or_default();
     let recorded_error = (contract.status == ContractStatus::Failed)
         .then_some(worker_error)
         .flatten()
         .map(|err| format_worker_error(&err, &token))
         .filter(|err| !err.is_empty());
     let _ = Applied::record(|applied| {
-        applied.last_worker_exit = Some(LauncherExit::from_code(code));
+        applied.last_worker_exit = resolved_exit;
         applied.last_worker_error = recorded_error;
     });
     std::fs::write(package.join("raw.log"), &raw)?;
