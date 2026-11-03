@@ -3493,7 +3493,7 @@ fn finish_foreign_cow_publication(
     let host_resolved = owner_rollback.is_some();
     let retired_old_stage2 = {
         let mut inventory = lease.state.frame_inventory.ledger.lock();
-        HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || {
+        HvfVmState::commit_cow_inventory_split(&mut inventory, &split, runtime.authority.as_ref(), || {
             HvfVmState::retire_stage2_extent_from_mappings_in(
                 &lease.custody,
                 &mut TaskMappingIndex::new(),

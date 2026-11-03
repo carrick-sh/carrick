@@ -553,6 +553,7 @@ pub(crate) fn settle_one(
     let retired_old_stage2 = HvfVmState::commit_cow_inventory_split(
         &mut state.frame_inventory.ledger.lock(),
         &split,
+        runtime.authority.as_ref(),
         || {
             HvfVmState::retire_stage2_extent_from_mappings_in(
                 custody,

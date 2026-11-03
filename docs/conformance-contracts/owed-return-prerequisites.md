@@ -197,3 +197,30 @@ separate explicit unused-release path retains its existing behavior. C2's
 legacy COW/registry gates and monotone counter are still open, as is slice 2b's
 neutral settlement routine, hook generalization and minimal host-root port.
 Keep this prerequisite draft; it does not close the original slice-2 brief.
+
+### COW commit inventory recheck (partial C2)
+
+The host, guest-completion and foreign-copy COW paths now pass their kernel
+inventory authority to `commit_cow_inventory_split`. Before changing the
+backend ledger, the commit queries the old frame under the existing backend
+registry lock. A published or claimed kernel row (including a zero-count frame
+that has not retired) prevents physical retirement and retains the carrier
+lease. The query adds one logarithmic frame lookup per COW commit; it does not
+scan other MMs or wait for physical pins. This retains the existing legacy
+registry-to-inventory lock order, not the future permit-only settlement order.
+
+`cow_split_preserves_a_claimed_kernel_mapping_missing_from_backend_registry`
+uses two actual kernel MM bindings, publishes a sibling alias, claims it, then
+stages and applies a local COW transaction. It injects incomplete backend
+population information independently of the valid kernel transaction. Commit
+must not invoke physical retirement; aborting the sibling claim restores its
+original row. A failed inventory query must leave the backend ledger unchanged.
+The test is macOS/AArch64-gated: a Linux cross-check proves compilation only,
+not its red/green behavioral verdict. Execute both versions on the signed host
+before accepting this change.
+
+This does not complete C2: `retire_stage2_candidate_if_unreferenced` and the
+`RetirementAuthority::LegacyRegistry` falling counter remain open. B1–B3 also
+still need atomic whole-MM permit output and production backend consumption
+before `MmReleaseReceipt::join` can be introduced honestly. Slice 2b remains
+separate. No signed runtime or performance acceptance is claimed.

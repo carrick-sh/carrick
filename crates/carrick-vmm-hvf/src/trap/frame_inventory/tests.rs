@@ -4777,10 +4777,15 @@ fn cow_split_keeps_stage2_when_the_authority_keeps_the_old_frame_live() {
     let stage2_retired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let observed = std::sync::Arc::clone(&stage2_retired);
 
-    let retired = HvfVmState::commit_cow_inventory_split(&mut inventory, &split, move || {
-        observed.store(true, std::sync::atomic::Ordering::SeqCst);
-        Ok(())
-    })
+    let retired = HvfVmState::commit_cow_inventory_split(
+        &mut inventory,
+        &split,
+        &TestFrameMappingCount::Exact(1),
+        move || {
+            observed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+    )
     .expect("commit authority-retained COW split");
 
     assert!(!retired, "the old stage-2 extent must remain installed");
@@ -5278,8 +5283,13 @@ fn cow_collision_is_rejected_before_backend_inventory_mutation() {
         },
     };
 
-    let error = HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || Ok(()))
-        .expect_err("colliding COW extent must fail closed");
+    let error = HvfVmState::commit_cow_inventory_split(
+        &mut inventory,
+        &split,
+        &TestFrameMappingCount::PerFrame(Default::default()),
+        || Ok(()),
+    )
+    .expect_err("colliding COW extent must fail closed");
     assert!(error.to_string().contains("before backend mutation"));
     assert_eq!(
         inventory.extents.get(&old_key).unwrap().mapping,
@@ -5366,7 +5376,15 @@ fn cow_split_commit_preserves_old_owner_and_publishes_replacement_owner() {
         },
     };
 
-    assert!(!HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || Ok(())).unwrap());
+    assert!(
+        !HvfVmState::commit_cow_inventory_split(
+            &mut inventory,
+            &split,
+            &TestFrameMappingCount::PerFrame(Default::default()),
+            || Ok(())
+        )
+        .unwrap()
+    );
     assert_eq!(
         inventory
             .extents
@@ -5438,13 +5456,18 @@ fn cow_stage2_recycle_holds_the_publication_lock() {
     let frames = std::sync::Arc::clone(&inventory.frames);
 
     assert!(
-        HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || {
-            assert!(
-                frames.try_lock().is_none(),
-                "COW must retain the shared registry lock through old-IPA recycle",
-            );
-            Ok(())
-        })
+        HvfVmState::commit_cow_inventory_split(
+            &mut inventory,
+            &split,
+            &TestFrameMappingCount::PerFrame(Default::default()),
+            || {
+                assert!(
+                    frames.try_lock().is_none(),
+                    "COW must retain the shared registry lock through old-IPA recycle",
+                );
+                Ok(())
+            }
+        )
         .unwrap(),
     );
     assert!(!inventory.extents.contains_key(&old_key));
@@ -5584,15 +5607,26 @@ fn cow_reuse_commit_keeps_destination_mapping_and_reference_counts() {
     assert_eq!(reservation.commit(()).batch().events().len(), 2);
     split.new_extent.stage2_owner.generation += 1;
     assert!(
-        HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || panic!(
-            "stale destination must fail before retirement"
-        ))
+        HvfVmState::commit_cow_inventory_split(
+            &mut inventory,
+            &split,
+            &TestFrameMappingCount::PerFrame(Default::default()),
+            || panic!("stale destination must fail before retirement")
+        )
         .is_err()
     );
     assert_eq!(inventory.extents[&old_key], old);
     assert_eq!(inventory.extents[&new_key], new);
     split.new_extent = new;
-    assert!(HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || Ok(())).unwrap());
+    assert!(
+        HvfVmState::commit_cow_inventory_split(
+            &mut inventory,
+            &split,
+            &TestFrameMappingCount::PerFrame(Default::default()),
+            || Ok(())
+        )
+        .unwrap()
+    );
     assert_eq!(inventory.extents.len(), 1);
     assert_eq!(inventory.extents[&new_key].mapping, new.mapping);
     let frames = inventory.frames.lock();
@@ -5981,9 +6015,12 @@ fn cow_then_fork_distant_alias_keeps_inventory_for_live_owner() {
         },
         retirement: shape.retirement,
     };
-    let retired = HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || {
-        panic!("a live distant projection must prevent physical retirement")
-    })
+    let retired = HvfVmState::commit_cow_inventory_split(
+        &mut inventory,
+        &split,
+        &TestFrameMappingCount::PerFrame(Default::default()),
+        || panic!("a live distant projection must prevent physical retirement"),
+    )
     .expect("commit COW while preserving old inventory authority");
 
     assert!(!retired);
@@ -8759,4 +8796,160 @@ fn a_sibling_exit_cannot_decide_between_an_unmap_apply_and_its_backend_decrement
         observer.snapshot().returns_completed - before.returns_completed,
         1
     );
+}
+
+/// A sibling's claimed mapping survives a local COW whose backend census
+/// omits that sibling. The kernel COW transaction still commits normally.
+#[test]
+fn cow_split_preserves_a_claimed_kernel_mapping_missing_from_backend_registry() {
+    use carrick_hal::{FrameInventoryEvent, FrameLength, MappingGeneration};
+    use carrick_kernel::kernel::{ObjectIdRegistry, frame_inventory::FrameInventoryAuthority};
+    let kernel = std::sync::Arc::new(FrameInventoryAuthority::new());
+    let ids = std::sync::Arc::new(ObjectIdRegistry::new());
+    let projection = kernel.physical_projection(ids);
+    let bind = |mm| {
+        projection.bind(carrick_hal::GuestFrameOwner {
+            native_mm: carrick_guest_arch::MmGeneration::new(id(mm)),
+            root_generation: carrick_guest_arch::ContextGeneration::new(id(73)),
+        })
+    };
+    let authority = bind(41);
+    let sibling = bind(42);
+    let old_key = (0xa090_0000_0000, 0x4000);
+    let new_key = (0xa092_0000_0000, 0x4000);
+    let generation = MappingGeneration::from_backend_counter(id(1));
+    let length = FrameLength::from_mapping_extent(id(old_key.1));
+    let gpa = carrick_guest_mem::Gpa::new(old_key.0);
+    let mut reservation = authority.reserve(1, 1, 2).unwrap();
+    let frame = reservation.claim_frame().unwrap();
+    let mapping = reservation.claim_mapping().unwrap();
+    let publish = |reservation: &mut carrick_hal::FrameInventoryReservation, mapping| {
+        let transaction = reservation.transaction();
+        reservation
+            .push(FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation,
+                gpa,
+                length,
+                permissions: carrick_hal::physical_grants::COW_GRANT_PERMISSIONS,
+            })
+            .unwrap();
+        reservation
+            .push(FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation,
+            })
+            .unwrap();
+    };
+    publish(&mut reservation, mapping);
+    reservation
+        .bind_physical_frame(
+            frame,
+            carrick_hal::FrameBackingIdentity::from_allocator(
+                carrick_guest_arch::FrameGpa::new(old_key.0),
+                id(73),
+                length,
+            ),
+        )
+        .unwrap();
+    authority.apply(reservation.commit(())).unwrap();
+    let mut alias = sibling.reserve(0, 1, 2).unwrap();
+    let sibling_mapping = alias.claim_mapping().unwrap();
+    publish(&mut alias, sibling_mapping);
+    sibling.apply(alias.commit(())).unwrap();
+    let claim = sibling
+        .prepare_return(&[carrick_hal::ExactReturnMappingRow {
+            mapping: sibling_mapping,
+            frame,
+            generation,
+            gpa,
+            length,
+        }])
+        .unwrap();
+    let old = InventoryExtent {
+        frame,
+        mapping,
+        backing: InventoryBackingIdentity::Private(41),
+        stage2_base: old_key.0,
+        stage2_length: old_key.1,
+        stage2_owner: InventoryStage2OwnerIdentity {
+            host_addr: 0x1000,
+            generation: 73,
+        },
+    };
+    let mut inventory = HvpatchFrameInventory::default();
+    inventory.extents.insert(old_key, old);
+    {
+        let mut frames = inventory.frames.lock();
+        frames.references.insert(frame, 1);
+        frames
+            .extent_references
+            .insert((frame, old_key.0, old_key.1), 1);
+        frames.stage2_references.insert(old_key, 1);
+    }
+    let mut replacement = authority.reserve(1, 1, 3).unwrap();
+    let split = HvfVmState::stage_cow_inventory_split(
+        &mut replacement,
+        old_key,
+        old,
+        &[],
+        CowInventoryRetirementDecision {
+            retire_old_frame: false,
+            // Model the incomplete backend population independently of the
+            // valid kernel transaction, which preserves the sibling's frame.
+            backend_frame_references_complete: true,
+        },
+        CowInventoryReplacementStage {
+            existing: None,
+            gpa: new_key.0,
+            backing: InventoryBackingIdentity::Private(42),
+            stage2_owner: InventoryStage2OwnerIdentity {
+                host_addr: 0x2000,
+                generation: 74,
+            },
+        },
+    )
+    .unwrap();
+    authority.apply(replacement.commit(())).unwrap();
+    assert_eq!(kernel.frame_mapping_count(frame), Some(1));
+    assert!(
+        HvfVmState::commit_cow_inventory_split(
+            &mut inventory,
+            &split,
+            &TestFrameMappingCount::Error,
+            || panic!("a refused inventory query cannot retire backing"),
+        )
+        .is_err()
+    );
+    assert_eq!(inventory.extents.get(&old_key), Some(&old));
+    assert_eq!(inventory.frames.lock().references.get(&frame), Some(&1));
+    let mut retirements = 0;
+    assert!(
+        !HvfVmState::commit_cow_inventory_split(&mut inventory, &split, authority.as_ref(), || {
+            retirements += 1;
+            Ok(())
+        },)
+        .unwrap()
+    );
+    assert_eq!(retirements, 0);
+    assert!(
+        inventory
+            .frames
+            .lock()
+            .authority_retained_stage2
+            .contains(&old_key)
+    );
+    claim.abort();
+    assert!(sibling.mapping_is_live_exact_generation(
+        sibling_mapping,
+        frame,
+        generation,
+        gpa,
+        length
+    ));
+    assert!(authority.live_mapping_row(mapping).is_none());
+    assert_eq!(kernel.frame_mapping_count(frame), Some(1));
 }

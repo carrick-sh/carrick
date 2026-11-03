@@ -2254,6 +2254,7 @@ impl HvfVmState {
     pub(crate) fn commit_cow_inventory_split(
         inventory: &mut HvpatchFrameInventory,
         split: &CowInventorySplit,
+        authority: &dyn carrick_hal::FrameCowAuthority,
         retire_stage2: impl FnOnce() -> Result<(), TrapError>,
     ) -> Result<bool, TrapError> {
         if split.replacement_is_existing {
@@ -2278,6 +2279,17 @@ impl HvfVmState {
                 split.new_key, split.old_key, split.fragments,
             )));
         }
+        let mut frames = inventory.frames.lock();
+        // The plan predates the kernel commit. A sibling may still own a
+        // published or claimed row even when this registry has no references.
+        // Claims retain their counter unit until apply, so only absence from
+        // the kernel inventory permits this legacy backend retirement.
+        let kernel_retired = authority
+            .frame_mapping_count(split.old.frame)
+            .map_err(|error| {
+                TrapError::Hypervisor(format!("query COW retirement inventory: {error}"))
+            })?
+            .is_none();
         let removed = inventory.extents.remove(&split.old_key).ok_or_else(|| {
             TrapError::Hypervisor("HVPatch COW old inventory mapping disappeared".to_owned())
         })?;
@@ -2286,7 +2298,6 @@ impl HvfVmState {
                 "HVPatch COW old inventory identity drifted".to_owned(),
             ));
         }
-        let mut frames = inventory.frames.lock();
         decrement_inventory_reference(&mut frames.references, split.old.frame)?;
         decrement_inventory_reference(
             &mut frames.extent_references,
@@ -2334,12 +2345,14 @@ impl HvfVmState {
                 "HVPatch COW retired old frame retains backend mappings".to_owned(),
             ));
         }
+        let population_complete =
+            split.retirement.backend_frame_references_complete && kernel_retired;
         reconcile_carrier_stage2_authority_retention(
             &mut frames,
             (split.old.stage2_base, split.old.stage2_length),
-            split.retirement.backend_frame_references_complete,
+            population_complete,
         );
-        let retire_old_stage2 = split.retirement.backend_frame_references_complete
+        let retire_old_stage2 = population_complete
             && !frames
                 .stage2_references
                 .contains_key(&(split.old.stage2_base, split.old.stage2_length));
