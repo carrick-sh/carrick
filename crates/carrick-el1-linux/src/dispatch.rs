@@ -695,51 +695,28 @@ pub fn capture_native_service_exit(
     {
         return owned;
     }
-    if action == Action::Forward
-        && (frame.esr >> 26) & 0x3f == 0x15
-        && let Some(owner) = native_syscall_owner(frame)
-        && unclaimed_native_syscall(owner) == UnclaimedNativeSyscall::CountedEnosys
-    {
-        return refuse_unclaimed_native_syscall(frame, counters);
-    }
     action
-}
-
-/// The owner kind of the ring-owned (native) process whose syscall left this
-/// frame, or `None` when no native owner holds this entry.
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
-fn native_syscall_owner(
-    frame: &TrapFrame,
-) -> Option<super::native_process_runtime::NativeThreadGroupOwner> {
-    let task = carrick_el1_abi::current_task_guest(frame.slot as usize)?;
-    let slot = SlotId::from_index(frame.slot as usize)?;
-    let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
-    let (page, control) = task.lifecycle_refs()?;
-    super::native_process_runtime::native_entry_owned(
-        carrick_el1_abi::BornInZoneSource { zone, slot },
-        task,
-        page,
-        control,
-        carrick_sched_core::object_wait::OwnerEntry::Syscall,
-    )
-    .then(|| arm_thread_group_owner(zone, task, page))
 }
 
 /// Where a native-owned syscall goes when its owner claimed none of it.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UnclaimedNativeSyscall {
-    /// The task has a host task (a host-loaded root), or no ring owner
-    /// admitted it: the host serves it, as before.
+    /// A root (host-loaded) or unadmitted task keeps its existing route: an
+    /// unclaimed exec leaves for its host task, any other call is captured
+    /// as a crossing for the carrier.
     HostRoute,
     /// A ring-owned fork child (or its exec successor) has no host task, so a
     /// raw host exit has no one to serve it: the executor would fail and the
-    /// carrier with it (#1530). Ring-first: counted ENOSYS, in ring.
+    /// carrier with it (#1530). A crossing could only be refused by the
+    /// carrier. Ring-first: counted ENOSYS, in ring, counted once here.
     CountedEnosys,
 }
 
 /// The one place that decides an unclaimed native syscall's route, so a
-/// future unclaimed ordinal is covered too.
+/// future unclaimed ordinal is covered too. Both of an owned native entry's
+/// unclaimed exits ask it: an unclaimed exec ([`arm_native_service_exit`])
+/// and a syscall no ring stage served ([`native_unstaged_exit`]).
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 fn unclaimed_native_syscall(
     owner: super::native_process_runtime::NativeThreadGroupOwner,
@@ -770,6 +747,40 @@ fn refuse_unclaimed_native_syscall(frame: &mut TrapFrame, counters: &Counters) -
     {
         Action::Served
     }
+}
+
+/// How an owned native entry that no ring stage served leaves the ring.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[derive(Debug, Eq, PartialEq)]
+enum NativeUnstagedExit {
+    /// Answered in ring ([`refuse_unclaimed_native_syscall`]); return to EL0.
+    Refused(Action),
+    /// Park on this operation for the carrier.
+    Operation(carrick_core_abi::service::ServiceOperation),
+    /// No operation describes this boundary: the entry keeps its action.
+    Declined,
+}
+
+/// The final capture of an owned native entry no stage served. An unserved
+/// syscall asks [`unclaimed_native_syscall`] before it may become a
+/// crossing, so the in-ring refusal is the single exit for a fork child's
+/// unclaimed call and is counted once, never also as a carrier refusal.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+fn native_unstaged_exit(
+    frame: &mut TrapFrame,
+    state: &carrick_el1_abi::LinuxTaskState,
+    action: Action,
+    owner: impl FnOnce() -> super::native_process_runtime::NativeThreadGroupOwner,
+    counters: &Counters,
+) -> NativeUnstagedExit {
+    if action == Action::Forward
+        && (frame.esr >> 26) & 0x3f == 0x15
+        && unclaimed_native_syscall(owner()) == UnclaimedNativeSyscall::CountedEnosys
+    {
+        return NativeUnstagedExit::Refused(refuse_unclaimed_native_syscall(frame, counters));
+    }
+    native_service_operation(frame, state, action)
+        .map_or(NativeUnstagedExit::Declined, NativeUnstagedExit::Operation)
 }
 
 /// The entry's last step (#1100): seal its decision into the vector's
@@ -1136,7 +1147,12 @@ fn arm_native_service_exit(
         && matches!(frame.x[8], 221 | 281)
         && !arm_process_call_claimed(frame.x[8], 0, || arm_thread_group_owner(zone, task, page))
     {
-        return None;
+        return match unclaimed_native_syscall(arm_thread_group_owner(zone, task, page)) {
+            UnclaimedNativeSyscall::HostRoute => None,
+            UnclaimedNativeSyscall::CountedEnosys => {
+                Some(refuse_unclaimed_native_syscall(frame, counters))
+            }
+        };
     }
     if refuse_traced_native_exec(frame, task, counters) {
         return Some(arm_signal_user_return(frame));
@@ -1265,12 +1281,17 @@ fn arm_native_service_exit(
                     }
                 }
             }
-            NativeServiceStage::Operation => (
-                Some(native_service_operation(frame, &task.linux, action)?),
-                None,
-                None,
-                false,
-            ),
+            NativeServiceStage::Operation => match native_unstaged_exit(
+                frame,
+                &task.linux,
+                action,
+                || arm_thread_group_owner(zone, task, page),
+                counters,
+            ) {
+                NativeUnstagedExit::Refused(refused) => return Some(refused),
+                NativeUnstagedExit::Operation(operation) => (Some(operation), None, None, false),
+                NativeUnstagedExit::Declined => return None,
+            },
         }
     };
     // This CPU still exclusively owns its portal slot. Bind its selection
@@ -1313,9 +1334,11 @@ fn arm_native_service_exit(
                     Err(super::native_process_runtime::NativeProcessError::Quarantined)
                 } else {
                     // The exec service resolves a descriptor `execveat`
-                    // names in the caller's own ring table (#1530).
+                    // names in the caller's own ring table (#1530), read
+                    // through the stable owned-table authority: an unrelated
+                    // table-map update must not read as "no table" (ENOSYS).
                     let table = ipc::guest_venue(frame.slot as u32)
-                        .and_then(|venue| ipc::native_table(&venue, task));
+                        .and_then(|venue| ipc::native_exec_table(venue.tables, task));
                     process.begin_exec_service(payload, table)
                 }
             } else if let Some(staged) = host_file {
@@ -4617,6 +4640,87 @@ mod tests {
         );
         assert_eq!(frame.x[0] as i64, -38);
         assert_eq!(counters.refused[281].load(Ordering::Relaxed), 1);
+    }
+
+    /// The production order of an owned native entry no stage served
+    /// (#1530): the unclaimed-syscall decision runs before the crossing
+    /// capture, so a fork child's unclaimed call is one counted in-ring
+    /// ENOSYS and never also a carrier crossing. Red if the crossing capture
+    /// wins: the fork child's call would park as `Crossing`.
+    #[test]
+    fn native_fork_child_unclaimed_syscall_is_refused_before_any_crossing() {
+        use super::super::native_process_runtime::NativeThreadGroupOwner;
+        use carrick_core_abi::service::ServiceOperation;
+        use carrick_guest_arch::NativeOrdinal;
+
+        let svc = |nr: u64| {
+            let mut frame = TrapFrame {
+                esr: 0x15 << 26,
+                ..TrapFrame::default()
+            };
+            frame.x[8] = nr;
+            frame.x[0] = 0xfeed;
+            frame
+        };
+        let task = CurrentTask::new();
+
+        // A fork child: refused in ring, counted once, no operation.
+        let counters = Counters::new();
+        let mut frame = svc(451);
+        assert_eq!(
+            native_unstaged_exit(
+                &mut frame,
+                &task.linux,
+                Action::Forward,
+                || NativeThreadGroupOwner::ForkChild,
+                &counters,
+            ),
+            NativeUnstagedExit::Refused(Action::Served)
+        );
+        assert_eq!(frame.x[0] as i64, -38);
+        assert_eq!(counters.refused[451].load(Ordering::Relaxed), 1);
+        assert_eq!(counters.served[451].load(Ordering::Relaxed), 1);
+
+        // A root or unadmitted task keeps its crossing; nothing is counted.
+        for owner in [
+            NativeThreadGroupOwner::Root,
+            NativeThreadGroupOwner::Unowned,
+        ] {
+            let counters = Counters::new();
+            let mut frame = svc(451);
+            assert_eq!(
+                native_unstaged_exit(
+                    &mut frame,
+                    &task.linux,
+                    Action::Forward,
+                    || owner,
+                    &counters
+                ),
+                NativeUnstagedExit::Operation(ServiceOperation::Crossing {
+                    ordinal: NativeOrdinal::new(451)
+                })
+            );
+            assert_eq!(frame.x[0], 0xfeed);
+            assert_eq!(counters.refused[451].load(Ordering::Relaxed), 0);
+        }
+
+        // Not a syscall: a fork child's breakpoint stays its exception
+        // service, and the owner is never asked.
+        let counters = Counters::new();
+        let mut frame = TrapFrame {
+            esr: 0x3c << 26,
+            ..TrapFrame::default()
+        };
+        assert!(matches!(
+            native_unstaged_exit(
+                &mut frame,
+                &task.linux,
+                Action::Forward,
+                || panic!("an exception asks no syscall route"),
+                &counters,
+            ),
+            NativeUnstagedExit::Operation(ServiceOperation::Exception(_))
+        ));
     }
 
     #[test]

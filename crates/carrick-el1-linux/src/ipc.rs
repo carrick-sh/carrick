@@ -277,6 +277,16 @@ pub fn native_table(venue: &IpcVenue<'_>, task: &CurrentTask) -> Option<[u64; 3]
     Some([raw.authority, raw.index, raw.generation])
 }
 
+/// The ring descriptor table a native fork child's `execveat` resolves its
+/// descriptor in. A fork child's table is directory-owned and immutable until
+/// that process retires it, so this reads the owned entry, which an unrelated
+/// in-progress table-map update cannot hide (the fail-forward
+/// [`native_table`] would read it as absent and the exec as ENOSYS).
+pub fn native_exec_table(tables: &dyn IpcTables, task: &CurrentTask) -> Option<[u64; 3]> {
+    let raw = tables.owned_table_of(task)?;
+    Some([raw.authority, raw.index, raw.generation])
+}
+
 /// What `fd` names in `table`, for the native host-file venue. In-zone
 /// objects stay with their ring owner; only a host-backed description
 /// crosses. `None` when the table is contended: the call keeps its route.
@@ -4965,5 +4975,80 @@ mod tests {
             libc::close(pipe[0]);
             libc::close(pipe[1]);
         }
+    }
+
+    /// A fork child's `fexecve` resolves its descriptor table while another
+    /// table's map entry is mid-update on the same probe chain (#1530). The
+    /// fail-forward lookup reads that as "no table", which the exec service
+    /// answers ENOSYS; the owned authority still names the child's table,
+    /// both while the unrelated writer is busy and after it publishes.
+    #[test]
+    fn native_exec_table_survives_an_unrelated_table_map_update() {
+        use carrick_el1_abi::ipc_tables::{IPC_TABLE_MAP_ENTRIES, IpcTableMapEntry};
+        use core::mem::size_of;
+        use core::sync::atomic::AtomicU64;
+        // SAFETY: all-zero is the empty table map.
+        let map: &'static IpcTableMap = unsafe {
+            &*std::alloc::alloc_zeroed(Layout::new::<IpcTableMap>()).cast::<IpcTableMap>()
+        };
+        // The map's open-addressing home slot (`ipc_tables::home`).
+        let home = |key: u64| {
+            (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize % IPC_TABLE_MAP_ENTRIES
+        };
+        let keys: Vec<u64> = (1..u64::MAX)
+            .filter(|key| home(*key) == home(1))
+            .take(2)
+            .collect();
+        let (other, child) = (keys[0], keys[1]);
+        let raw = |n: u64| RawTableId {
+            authority: 7,
+            index: n,
+            generation: n + 100,
+        };
+        map.publish(other, raw(1)).unwrap();
+        map.publish_owned(child, raw(2)).unwrap();
+        let task = CurrentTask::new();
+        task.linux.file_table.store(child, Ordering::Relaxed);
+        let tables = MapTables(map);
+        let expected = Some([7, 2, 102]);
+        assert_eq!(native_exec_table(&tables, &task), expected);
+
+        // The unrelated entry, at the head of the child's probe chain, through
+        // the map's repr(C) layout: its sequence word is the entry's first.
+        let header =
+            size_of::<IpcTableMap>() - IPC_TABLE_MAP_ENTRIES * size_of::<IpcTableMapEntry>();
+        // SAFETY: in bounds of the leaked map; entries are 64-byte aligned
+        // records whose first word is the `AtomicU64` sequence.
+        let (seq, key) = unsafe {
+            let entry = (map as *const IpcTableMap)
+                .cast::<u8>()
+                .add(header + home(other) * size_of::<IpcTableMapEntry>());
+            (
+                &*entry.cast::<AtomicU64>(),
+                &*entry.add(8).cast::<AtomicU64>(),
+            )
+        };
+        assert_eq!(
+            key.load(Ordering::Relaxed),
+            other,
+            "layout: the other entry"
+        );
+
+        // Busy: the unrelated writer is mid-update.
+        seq.fetch_add(1, Ordering::Release);
+        assert_eq!(
+            tables.table_of(&task),
+            None,
+            "precondition: the fail-forward lookup reads the update as no table"
+        );
+        assert_eq!(
+            native_exec_table(&tables, &task),
+            expected,
+            "an unrelated update must not make fexecve ENOSYS"
+        );
+        // Then success: the writer publishes.
+        seq.fetch_add(1, Ordering::Release);
+        assert_eq!(tables.table_of(&task), Some(raw(2)));
+        assert_eq!(native_exec_table(&tables, &task), expected);
     }
 }
