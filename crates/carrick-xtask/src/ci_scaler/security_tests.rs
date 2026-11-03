@@ -310,11 +310,14 @@ fn serial_host_authenticated_curl_template_ignores_ambient_trace() {
 #[derive(Copy, Clone, PartialEq)]
 enum Interruption {
     AfterStop,
+    StorageLock,
+    DestroyLock,
     AfterRunnerRemoval,
 }
 struct MockTeardown {
     vm: Option<Vm>,
     stopped: bool,
+    volume: bool,
     registered: bool,
     name: String,
     interruption: Option<Interruption>,
@@ -344,11 +347,29 @@ impl TeardownApi for MockTeardown {
         self.vm = None;
         Ok("destroy-task".into())
     }
-    fn wait_task(&mut self, _: &str) -> Result<(), ScalerError> {
+    fn wait_task(&mut self, task: &str) -> Result<(), ScalerError> {
+        if task == "destroy-task" && self.interruption == Some(Interruption::DestroyLock) {
+            self.interruption = None;
+            return Err(ScalerError::External("destroy storage lock timeout"));
+        }
+        Ok(())
+    }
+    fn clear_volumes(&mut self, _: &Record) -> Result<(), ScalerError> {
+        if self.interruption == Some(Interruption::StorageLock) {
+            self.interruption = None;
+            return Err(ScalerError::External(
+                "storage lock timeout; volume remains",
+            ));
+        }
+        self.volume = false;
         Ok(())
     }
     fn remove_runner(&mut self, row: &Record) -> Result<(), ScalerError> {
         assert_eq!(row.name, self.name);
+        assert!(
+            !self.volume,
+            "volume must be gone before registration removal"
+        );
         assert!(
             self.vm.is_none(),
             "registration was removed before VM teardown"
@@ -394,6 +415,7 @@ fn teardown_fixture(dir: &Path) -> (Ledger, Record, MockTeardown, PathBuf) {
             template: false,
         }),
         stopped: false,
+        volume: true,
         registered: true,
         name: row.name.clone(),
         interruption: None,
@@ -1038,4 +1060,140 @@ fn template_cutover_admits_new_source_while_old_clone_runs() {
     assert_eq!(body["full"], false);
     assert_eq!(ledger.rows[0].state, State::Running);
     assert_eq!(ledger.rows[0].vm, old.vm);
+}
+
+#[test]
+fn teardown_storage_lock_keeps_license_until_volume_cleanup_succeeds() {
+    for interruption in [Interruption::DestroyLock, Interruption::StorageLock] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, mut row, mut api, path) = teardown_fixture(dir.path());
+        api.interruption = Some(interruption);
+        assert!(continue_teardown(&mut api, &mut ledger, &mut row, dir.path(), &path).is_err());
+        assert!(api.vm.is_none()); // PVE reported success but storage is still locked.
+        assert!(api.registered);
+        assert!(api.volume);
+        let mut ledger = Ledger::load(&path).unwrap();
+        let mut row = ledger.rows[0].clone();
+        assert_eq!(row.state, State::Reaping);
+        assert!(continue_teardown(&mut api, &mut ledger, &mut row, dir.path(), &path).unwrap());
+        assert_eq!(row.state, State::Destroyed);
+        assert!(!api.volume);
+    }
+}
+
+#[test]
+fn orphan_volume_reaped_and_verified_after_destroy_lock_timeout() {
+    let mut volume = true;
+    let mut locked = true;
+    let mut frees = 0;
+    let mut run = |args: &[&str]| -> Result<Value, ScalerError> {
+        match &args[..2] {
+            ["pvesm", "list"] => Ok(if volume {
+                json!([{"volid":"local:308/vm-308-disk-0.qcow2", "vmid":308}])
+            } else {
+                json!([])
+            }),
+            ["pvesh", "get"] => Ok(json!([])),
+            ["pvesm", "free"] => {
+                frees += 1;
+                if locked {
+                    locked = false;
+                    return Err(ScalerError::External("storage lock timeout"));
+                }
+                volume = false;
+                Ok(Value::Null)
+            }
+            _ => panic!("unexpected storage command"),
+        }
+    };
+    let id = CloneId::try_from(308).unwrap();
+    assert!(clear_clone_volumes("local", id, &mut run).is_err());
+    clear_clone_volumes("local", id, &mut run).unwrap();
+    assert!(!volume);
+    assert_eq!(frees, 2);
+}
+
+#[test]
+fn orphan_cleanup_refuses_existing_config_and_foreign_volumes() {
+    for foreign in [false, true] {
+        let mut run = |args: &[&str]| -> Result<Value, ScalerError> {
+            match &args[..2] {
+                ["pvesm", "list"] => {
+                    Ok(json!([{"volid":"local:308/disk", "vmid":if foreign {309} else {308}}]))
+                }
+                ["pvesh", "get"] => Ok(json!([{"vmid":308,"type":"lxc"}])),
+                _ => panic!("must never free a configured or foreign volume"),
+            }
+        };
+        assert!(clear_clone_volumes("local", CloneId::try_from(308).unwrap(), &mut run).is_err());
+    }
+}
+
+#[test]
+fn storage_listing_requires_positive_empty_proof() {
+    assert_eq!(
+        parse_volume_listing(b"Volid Format Type Size VMID\n").unwrap(),
+        json!([])
+    );
+    assert_eq!(
+        parse_volume_listing(
+            b"Volid Format Type Size VMID\nlocal:308/disk.qcow2 qcow2 images 6442450944 308\n"
+        )
+        .unwrap(),
+        json!([{"volid":"local:308/disk.qcow2","vmid":308}])
+    );
+    for invalid in [
+        b"".as_slice(),
+        b"lock timeout\n",
+        b"Volid Format Type Size VMID\nwarning: storage lock timeout\n",
+    ] {
+        assert!(parse_volume_listing(invalid).is_err());
+    }
+}
+
+#[test]
+fn successful_free_without_volume_removal_is_not_completion() {
+    let mut run = |args: &[&str]| -> Result<Value, ScalerError> {
+        match &args[..2] {
+            ["pvesm", "list"] => Ok(json!([{"volid":"local:308/disk", "vmid":308}])),
+            ["pvesh", "get"] => Ok(json!([])),
+            ["pvesm", "free"] => Ok(Value::Null), // PVE silently kept the volume.
+            _ => panic!("unexpected command"),
+        }
+    };
+    assert!(clear_clone_volumes("local", CloneId::try_from(308).unwrap(), &mut run).is_err());
+}
+
+#[test]
+fn reservation_refuses_a_vmid_occupied_only_by_storage() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ledger = Ledger::default();
+    let job = JobKey {
+        run: RunId(1),
+        attempt: 1,
+        job: JobId(2),
+    };
+    let row = reserve_admitted_clone(
+        &mut ledger,
+        &dir.path().join("ledger.json"),
+        job,
+        (
+            CloneBudget {
+                kvm: Concurrency::ONE,
+                agents: AgentClones::DEFAULT,
+            },
+            CloneLane::Kvm,
+        ),
+        || Ok(true),
+        || {
+            Ok(vec![PoolMember {
+                id: 308,
+                pool: String::new(),
+                template: false,
+            }])
+        },
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(row.vm.get(), 309);
 }

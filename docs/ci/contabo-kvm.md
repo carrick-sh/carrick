@@ -468,3 +468,28 @@ After retirement there is no binary rollback. Rolling back then means
 rebuilding a template in the freed slot with this procedure, and because
 `main` still points the site row at the new slot, it needs a fix-forward PR
 that changes the site row before its controller is deployed.
+
+### Reaping clone volumes after a storage lock timeout
+
+A successful VM DELETE task can leave a disk behind when `local` storage is
+contended. The controller now checks `pvesm list <storage> --vmid <id>` before
+closing a cleanup record. Leftover volumes are counted in the controller log
+(`leaked_volumes_detected`, `leaked_volumes_remaining`, `volumes_reaped`). It
+frees them only after a successful cluster inventory proves that no VM or
+container config owns the VMID, then lists storage again. A storage error
+keeps the cleanup record open for the next reconciliation. Admission also
+excludes VMIDs with existing volumes.
+
+For the one-time cleanup of pre-existing leaks on ctb, stop its controller
+service and run the deployed binary as root:
+
+```sh
+carrick-xtask ci-scaler sweep-clone-volumes --state-dir /root/carrick-ci/state
+```
+
+Use the controller's actual state directory if overridden. The command takes
+its controller lock, scans only clone VMIDs 308–349, skips configured VMs and
+containers, and refuses template/protected VMIDs by construction. Keep its
+output as sweep evidence. A nonzero exit means cleanup is incomplete; inspect
+the reported VMIDs and storage errors before restarting the controller. Do
+not run a second provisioner during this maintenance operation.
