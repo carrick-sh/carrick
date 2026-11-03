@@ -18,9 +18,10 @@ workspace = true
 [features]
 default = []
 impact = ["dep:carrick-conformance"]
+# The signed smoke reads its census through the conformance test tooling.
+smoke-signed = ["dep:carrick-conformance"]
 
 [dependencies]
-carrick-spec = { path = "../carrick-spec" }
 carrick-fatal = { path = "../carrick-fatal" }
 clap.workspace = true
 regex.workspace = true

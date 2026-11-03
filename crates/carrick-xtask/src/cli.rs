@@ -59,6 +59,7 @@ pub enum Commands {
     CiReceipt(crate::ci_receipt::ReceiptArgs),
     #[command(about = "Authorize, execute and publish the on-demand signed Actions gate")]
     SignedGate(crate::signed_gate::SignedGateArgs),
+    #[cfg(feature = "smoke-signed")]
     #[command(
         about = "Signed first-boot smoke (carrick-embed smoke_signed) with an exact-HEAD receipt"
     )]
@@ -291,6 +292,7 @@ pub enum CliError {
     HostLease(#[from] crate::host_lease::HostLeaseError),
     #[error("stress-capture: {0}")]
     StressCapture(#[from] crate::stress_capture::Error),
+    #[cfg(feature = "smoke-signed")]
     #[error("smoke-signed: {0}")]
     SmokeSigned(#[from] crate::smoke_signed::SmokeSignedError),
     #[error("accept error: {0}")]
@@ -514,6 +516,7 @@ where
             crate::signed_gate::run(&root, args)?;
             Ok(())
         }
+        #[cfg(feature = "smoke-signed")]
         Commands::SmokeSigned(args) => {
             let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
             let receipt = crate::smoke_signed::run(&root, args)?;

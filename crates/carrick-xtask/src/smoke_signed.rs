@@ -532,10 +532,7 @@ pub fn run(root: &Path, args: SmokeSignedArgs) -> Result<SmokeReceipt, SmokeSign
         tree_unchanged: head_after == head && after == before,
     });
     let mut failures = verdict.failures;
-    if let Err(error) = carrick_spec::syscall_census::read_directory(&census_dir)
-        .map_err(|error| error.to_string())
-        .and_then(|evidence| carrick_spec::syscall_census::check_log(&evidence, None))
-    {
+    if let Err(error) = carrick_conformance::census::check_directory(&census_dir) {
         failures.push(format!("syscall census: {error}"));
     }
     let artifact = match verdict.executable.as_deref().map(inspect_executable) {

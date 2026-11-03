@@ -1,3 +1,4 @@
+#![cfg(feature = "smoke-signed")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Verdict witnesses for `carrick-xtask smoke-signed` (#893): the receipt is
 //! computed fail-closed from the signed runner's full log.

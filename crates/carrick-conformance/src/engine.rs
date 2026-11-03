@@ -392,7 +392,7 @@ pub fn run_carrick(
             ],
             &format!("{run_id}-census-copy"),
         )?;
-        let evidence = carrick_spec::syscall_census::read_directory(&destination)?;
+        let evidence = crate::census::read_directory(&destination)?;
         append_census(&output.stderr_path, &evidence)?;
         run_evidence_command(
             vec![
@@ -738,7 +738,7 @@ pub(crate) fn run_one(
     }
 
     if let Some(directory) = census {
-        let evidence = carrick_spec::syscall_census::read_directory(directory.path())?;
+        let evidence = crate::census::read_directory(directory.path())?;
         append_census(&stderr_path, &evidence)?;
     }
     Ok(RunOutput {

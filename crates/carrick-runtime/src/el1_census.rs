@@ -621,7 +621,7 @@ mod tests {
             snapshot_counters(None, Some(&clean), CensusIsa::Aarch64),
             directory.path().to_owned(),
         );
-        let evidence = carrick_spec::syscall_census::read_directory(directory.path()).unwrap();
+        let evidence = carrick_conformance::census::read_directory(directory.path()).unwrap();
         assert_eq!(
             evidence
                 .lines()
