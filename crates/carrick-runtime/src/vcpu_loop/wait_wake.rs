@@ -757,7 +757,6 @@ impl HvpatchRuntimeDirectory {
         authority: carrick_vmm_hvf::hvf_aarch64_engine::HvpatchPersistentExecutorFactoryAuthority,
         vcpu_ceiling: usize,
         services: &PreparedPersistentServices,
-        scope: &carrick_kernel::kernel::CarrierScopeId,
     ) -> Result<bool, RuntimeError> {
         let mut pool = self.persistent_pool.lock();
         if pool.is_some() {
