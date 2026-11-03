@@ -1,5 +1,5 @@
 //! Static admission census (not proof that disassembled code is reachable).
-//! Usage: scan_unsupported --expect-files 530 [--baseline residue.tsv] ELF...
+//! Usage: scan_unsupported --expect-files 552 ELF...
 //! Stdout is a reproducible ceiling file: Code occurrences affected_files.
 //! Linear decoding of SHF_EXECINSTR sections includes inline data and deliberate
 //! UD2 traps; keep these visible in the residue rather than silently hiding them.
@@ -12,14 +12,12 @@ use goblin::elf::{Elf, header::EM_X86_64, section_header::SHF_EXECINSTR};
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let mut expected = None;
-    let mut baseline = None;
     let mut files = BTreeSet::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--expect-files" => {
                 expected = Some(args.next().ok_or("missing count")?.parse::<usize>()?)
             }
-            "--baseline" => baseline = Some(args.next().ok_or("missing baseline")?),
             _ if arg.starts_with('-') => return Err(format!("unknown option: {arg}").into()),
             _ => {
                 if !files.insert(std::fs::canonicalize(arg)?) {
@@ -83,29 +81,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     for (code, (occurrences, affected)) in &counts {
         println!("{code}\t{occurrences}\t{affected}");
     }
-    if let Some(path) = baseline {
-        let mut ceilings = BTreeMap::new();
-        for line in std::fs::read_to_string(path)?.lines() {
-            let fields: Vec<_> = line.split_whitespace().collect();
-            if fields.len() != 3 {
-                return Err("invalid residue row".into());
-            }
-            let count = (fields[1].parse::<usize>()?, fields[2].parse::<usize>()?);
-            if ceilings.insert(fields[0].to_owned(), count).is_some() {
-                return Err("duplicate residue encoding".into());
-            }
-        }
-        for (code, &(occurrences, affected)) in &counts {
-            let &(max_occurrences, max_affected) = ceilings.get(code).unwrap_or(&(0, 0));
-            if occurrences > max_occurrences || affected > max_affected {
-                return Err(format!("residue increased: {code} ({occurrences}, {affected}) > ({max_occurrences}, {max_affected})").into());
-            }
-        }
-    } else if !counts.is_empty() {
-        return Err(
-            "unsupported instructions remain; review the counted residue and supply --baseline"
-                .into(),
-        );
+    if !counts.is_empty() {
+        return Err("unsupported instructions remain; census is diagnostic only".into());
     }
     Ok(())
 }

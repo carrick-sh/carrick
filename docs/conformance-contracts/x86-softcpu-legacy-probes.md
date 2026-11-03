@@ -15,6 +15,11 @@ memory input, immediate lane masking, and guest BMI1 authority replacement.
 Native fault qualification independently confirms that a cross-page BTR fault
 sets the page-fault write bit. RMW slow paths now validate reads as write
 accesses, including on the second page, before modifying guest bytes.
+`same_page_add_fault_is_write` and `same_page_failed_cmpxchg_fault_is_write`
+also require W=1 for an absent same-page operand, preserve RIP/RAX/RFLAGS on
+fault, and resume after mapping the page. CMPXCHG then fails its comparison
+and leaves the memory unchanged. Both fail with W=0 under the old read-phase
+classification.
 
 Memory bit indexes select a signed word offset before translation. The emitted
 native operation uses only the index modulo the operand bit width. RCX is an
@@ -43,24 +48,22 @@ Wrong ISA, empty/missing executable sections, duplicate inputs, and population
 mismatches fail closed. Supply only the admitted probe binaries, never a broad
 release-directory glob containing dependency artifacts.
 
-Without `--baseline`, any residue returns failure while printing the census.
-With `--baseline residue.tsv`, every current encoding must have both counts
-less than or equal to its reviewed ceiling; new encodings fail. An empty
-baseline requires zero residue. Compare only identical probe input identities
-and compiler settings; inventory and hash binaries separately before accepting
-a census. A smaller fixture set cannot stand in for the 530-probe population.
+Any residue returns failure while printing the census. This diagnostic is not
+an enforced ratchet: no fixture bundle currently identifies its input population.
+Inventory and hash binaries separately before comparing diagnostic censuses.
 
 The admitted checkout builds 552 musl binaries with Rust 1.96.0, rather than
 the earlier assessment's 530. A fresh `cargo build --manifest-path
 conformance-probes/Cargo.toml --release --target x86_64-unknown-linux-musl
 --keep-going --jobs 4` produced all 552; eight source bins remain unbuildable
 on x86 (`ctrel0`, `forkfpregs`, `inzonetcp`, `mmapv8align`, `nativeetexecfork`,
-`ptracepoketext`, `tlsswitch`, `windowcoherence`). These build failures are
+`ptracepoketext`, `tlsswitch`, `windowcoherence`). The first six use AArch64 assembly. `inzonetcp` instead takes references to
+packed epoll fields (E0793), and `windowcoherence` reads the AArch64-only
+`uc_mcontext.pc`; both need portability follow-ups. These build failures are
 explicit exclusions, not successful probes. No stale binaries were present.
 The final census decoded 47,050,390 instructions and found 51 unsupported encodings
 (down from 54 before the extended legacy SIMD addition).
-The ceiling is `conformance-contracts/softcpu-x86-musl-residue.tsv`; counts may
-only decrease for this input population. The newly served PMOVMSKB, PINSRW,
+This historical census is not a checked ceiling. The newly served PMOVMSKB, PINSRW,
 BTR memory and TZCNT encodings are absent from the residue. Highest remaining
 non-trap counts are PCMPGTB (26,496), PSRLQ immediate (11,040), and x87 FSTP
 (9,384). UD2 (32,156) remains visible as an intentional architectural #UD.

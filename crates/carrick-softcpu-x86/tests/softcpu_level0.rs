@@ -3605,35 +3605,76 @@ fn avx_unadmitted_extensions_raise_invalid_opcode() {
     }
 }
 
+// Native baseline-SSE2 oracle. Only caller-saved RAX/RCX/RDX and XMM0
+// are used; FXSAVE/FXRSTOR preserve the caller's floating-point state.
+#[repr(C, align(16))]
+struct ScalarOracle {
+    host: [u8; 512],
+    xmm: u128,
+    gprs: [u64; 3],
+    flags: u64,
+    operand: [u64; 6],
+}
+
+fn native_scalar_oracle(bytes: &[u8], xmm: u128, gprs: [u64; 3]) -> ScalarOracle {
+    let mut run = ScalarOracle {
+        host: [0; 512],
+        xmm,
+        gprs,
+        flags: 0,
+        operand: [u64::MAX; 6],
+    };
+    let mut code = vec![0x48, 0x0f, 0xae, 0x07]; // fxsave64 [rdi]
+    code.extend_from_slice(&[0xf3, 0x0f, 0x6f, 0x87]); // movdqu xmm0,[rdi+512]
+    code.extend_from_slice(&512u32.to_le_bytes());
+    for (modrm, offset) in [(0x87, 528u32), (0x8f, 536), (0x97, 544)] {
+        code.extend_from_slice(&[0x48, 0x8b, modrm]);
+        code.extend_from_slice(&offset.to_le_bytes());
+    }
+    code.extend_from_slice(&[0x48, 0x8d, 0x97]); // rdx=&operand[2]
+    code.extend_from_slice(
+        &(std::mem::offset_of!(ScalarOracle, operand) as u32 + 16).to_le_bytes(),
+    );
+    code.extend_from_slice(bytes);
+    for (modrm, offset) in [(0x87, 528u32), (0x8f, 536), (0x97, 544)] {
+        code.extend_from_slice(&[0x48, 0x89, modrm]);
+        code.extend_from_slice(&offset.to_le_bytes());
+    }
+    code.extend_from_slice(&[0x9c, 0x8f, 0x87]); // pushfq; pop [rdi+flags]
+    code.extend_from_slice(&(std::mem::offset_of!(ScalarOracle, flags) as u32).to_le_bytes());
+    code.extend_from_slice(&[0xf3, 0x0f, 0x7f, 0x87]);
+    code.extend_from_slice(&512u32.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0x0f, 0xae, 0x0f, 0xc3]); // fxrstor64 [rdi]; ret
+    let mut buffer = JitCodeBuffer::new(code.len()).unwrap();
+    let address = buffer.publish(&code).unwrap();
+    // SAFETY: the private callers supply only scalar/XMM0 instructions using
+    // caller-saved registers and the owned operand. The thunk preserves host
+    // xstate, balances the stack and keeps RDI as the record pointer.
+    let execute: unsafe extern "sysv64" fn(*mut ScalarOracle) =
+        unsafe { std::mem::transmute(address as usize) };
+    unsafe { execute(&mut run) };
+    run
+}
+
 // Intel SDM Vol. 2 PMOVMSKB/PINSRW/BTR/TZCNT; native instructions are
 // independent oracles. Each snippet drives the production block translator.
 #[test]
 fn legacy_probe_pmovmskb_matches_native() {
     for bits in [0, u128::MAX, 0x80ff_007f_aa55_0180_8080_0102_03ff_fe00] {
-        let native: u32;
-        // SAFETY: baseline SSE2, register operands only.
-        unsafe {
-            std::arch::asm!("movdqu xmm0, [{p}]", "pmovmskb {out:e}, xmm0",
-            p = in(reg) &bits, out = lateout(reg) native, out("xmm0") _, options(nostack, readonly));
-        }
+        let native = native_scalar_oracle(&[0x66, 0x0f, 0xd7, 0xc0], bits, [0; 3]).gprs[0];
         let (mut cpu, mut mem, va) = setup_snippet(&[0x66, 0x0f, 0xd7, 0xc0, 0x0f, 0x05]);
         cpu.context_mut().write_xmm(0, bits);
         cpu.context_mut().gpr[reg::RAX] = u64::MAX;
         step_ok(&mut cpu, &mut mem, sys(va + 4, va + 6));
-        assert_eq!(cpu.context().gpr[reg::RAX], u64::from(native));
+        assert_eq!(cpu.context().gpr[reg::RAX], native);
     }
 }
 
 #[test]
 fn legacy_probe_pinsrw_matches_native() {
     let before = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210u128;
-    let mut native = 0u128;
-    // SAFETY: baseline SSE2; pointers cover exactly 16 readable/writable bytes.
-    unsafe {
-        std::arch::asm!("movdqu xmm0, [{src}]", "pinsrw xmm0, eax, 255", "movdqu [{dst}], xmm0",
-        src=in(reg) &before, dst=in(reg) &mut native, in("eax") 0xdead_beefu32,
-        out("xmm0") _, options(nostack));
-    }
+    let native =
+        native_scalar_oracle(&[0x66, 0x0f, 0xc4, 0xc0, 0xff], before, [0xdead_beef, 0, 0]).xmm;
     let (mut cpu, mut mem, va) = setup_snippet(&[0x66, 0x0f, 0xc4, 0xc0, 0xff, 0x0f, 0x05]);
     cpu.context_mut().write_xmm(0, before);
     cpu.context_mut().gpr[reg::RAX] = 0xdead_beef;
@@ -3644,14 +3685,9 @@ fn legacy_probe_pinsrw_matches_native() {
 #[test]
 fn legacy_probe_btr_memory_matches_native() {
     for index in [-65i64, -1, 0, 63, 64, 127] {
-        let mut native = [u64::MAX; 6];
-        let carry: u8;
-        // SAFETY: the signed indexes select words within this six-word array.
-        unsafe {
-            std::arch::asm!("btr qword ptr [{p}], {i}", "setc {c}",
-            p=in(reg) native.as_mut_ptr().add(2), i=in(reg) index,
-            c=lateout(reg_byte) carry, options(nostack));
-        }
+        let oracle = native_scalar_oracle(&[0x48, 0x0f, 0xb3, 0x0a], 0, [0, index as u64, 0]);
+        let native = oracle.operand;
+        let carry = oracle.flags & 1;
         let (mut cpu, mut mem, va) = setup_snippet(&[0x48, 0x0f, 0xb3, 0x0f, 0x0f, 0x05]);
         let data = 0x2000_0000;
         mem.map_range(data, 4096, PagePerms::USER_RW);
@@ -3663,7 +3699,7 @@ fn legacy_probe_btr_memory_matches_native() {
             let got = mem.read_direct(data + i as u64 * 8, 8);
             assert_eq!(got.unwrap(), word.to_le_bytes(), "index {index}");
         }
-        assert_eq!(cpu.context().rflags & 1, u64::from(carry));
+        assert_eq!(cpu.context().rflags & 1, carry);
         assert_eq!(cpu.context().gpr[reg::RCX], index as u64);
     }
 }
@@ -3671,19 +3707,15 @@ fn legacy_probe_btr_memory_matches_native() {
 #[test]
 fn legacy_probe_tzcnt_without_bmi1_is_bsf() {
     for input in [0u64, 1, 0x8000_0000, 1 << 63] {
-        let mut native = 0x1234u64;
-        let zero: u8;
-        // SAFETY: baseline BSF, register operands only. Zero leaves the
-        // destination architecturally undefined, so only ZF is compared there.
-        unsafe {
-            std::arch::asm!("bsf {out}, {src}","setz {z}",
-            out=inout(reg) native,src=in(reg) input,z=lateout(reg_byte) zero,options(nostack));
-        }
+        // BSF's zero-input destination is undefined; compare only ZF there.
+        let oracle = native_scalar_oracle(&[0x48, 0x0f, 0xbc, 0xc1], 0, [0x1234, input, 0]);
+        let native = oracle.gprs[0];
+        let zero = (oracle.flags >> 6) & 1;
         let (mut cpu, mut mem, va) = setup_snippet(&[0xf3, 0x48, 0x0f, 0xbc, 0xc1, 0x0f, 0x05]);
         cpu.context_mut().gpr[reg::RCX] = input;
         cpu.context_mut().gpr[reg::RAX] = 0x1234;
         step_ok(&mut cpu, &mut mem, sys(va + 5, va + 7));
-        assert_eq!((cpu.context().rflags >> 6) & 1, u64::from(zero));
+        assert_eq!((cpu.context().rflags >> 6) & 1, zero);
         if input != 0 {
             assert_eq!(cpu.context().gpr[reg::RAX], native);
         }
@@ -3785,13 +3817,9 @@ fn legacy_probe_tzcnt_bmi1_follows_guest_cpuid() {
             u64::from(input == 0) | (u64::from(count == 0) << 6)
         );
         if std::is_x86_feature_detected!("bmi1") {
-            let native: u64;
-            let flags: u64;
-            // SAFETY: feature detection guards TZCNT; push/pop balance the host stack.
-            unsafe {
-                std::arch::asm!("tzcnt {out}, {src}","pushfq","pop {flags}",
-                out=lateout(reg) native,src=in(reg) input,flags=lateout(reg) flags);
-            }
+            let oracle = native_scalar_oracle(&[0xf3, 0x48, 0x0f, 0xbc, 0xc1], 0, [0, input, 0]);
+            let native = oracle.gprs[0];
+            let flags = oracle.flags;
             assert_eq!(native, count);
             assert_eq!(cpu.context().rflags & 0x41, flags & 0x41);
         }
@@ -4170,4 +4198,42 @@ fn legacy_scalar_counts_obey_sized_results_and_feature_switches() {
             }
         }
     }
+}
+
+fn check_same_page_rmw_fault(bytes: &[u8]) {
+    let mut code = bytes.to_vec();
+    code.extend_from_slice(&[0x0f, 0x05]);
+    let (mut cpu, mut mem, va) = setup_snippet(&code);
+    let data = 0x2000_0000;
+    cpu.context_mut().gpr[reg::RDI] = data;
+    cpu.context_mut().gpr[reg::RAX] = 7;
+    cpu.context_mut().gpr[reg::RCX] = 9;
+    cpu.context_mut().rflags = 0x203;
+    step_ok(&mut cpu, &mut mem, pf(va, PF_ERR_USER | PF_ERR_WRITE, data));
+    assert_eq!(cpu.context().rip, va);
+    assert_eq!(cpu.context().gpr[reg::RAX], 7);
+    assert_eq!(cpu.context().rflags, 0x203);
+    mem.map_range(data, 4096, PagePerms::USER_RW);
+    mem.write_direct(data, &5u32.to_le_bytes());
+    step_ok(
+        &mut cpu,
+        &mut mem,
+        sys(va + bytes.len() as u64, va + code.len() as u64),
+    );
+    let expected = if bytes[0] == 0x01 { 12u32 } else { 5 };
+    assert_eq!(mem.read_direct(data, 4).unwrap(), expected.to_le_bytes());
+    if bytes[0] != 0x01 {
+        assert_eq!(cpu.context().gpr[reg::RAX], 5);
+        assert_eq!(cpu.context().rflags & 0x40, 0);
+    }
+}
+
+#[test]
+fn same_page_add_fault_is_write() {
+    check_same_page_rmw_fault(&[0x01, 0x07]);
+}
+
+#[test]
+fn same_page_failed_cmpxchg_fault_is_write() {
+    check_same_page_rmw_fault(&[0x0f, 0xb1, 0x0f]);
 }
