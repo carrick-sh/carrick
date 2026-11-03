@@ -1346,7 +1346,14 @@ fn arm_native_service_exit(
                     // table-map update must not read as "no table" (ENOSYS).
                     let table = ipc::guest_venue(frame.slot as u32)
                         .and_then(|venue| ipc::native_exec_table(venue.tables, task));
-                    process.begin_exec_service(payload, table, carrick_guest_arch::NativeOrdinal::new(frame.x[8]))
+                    process.begin_exec_service(
+                        payload,
+                        table,
+                        crate::native_process_runtime::NativeServiceCall::new(
+                            carrick_guest_arch::NativeOrdinal::new(frame.x[8]),
+                            counters,
+                        ),
+                    )
                 }
             } else if let Some(staged) = host_file {
                 if service_wait.is_some() {
@@ -1365,7 +1372,10 @@ fn arm_native_service_exit(
                         resolves_path,
                         map,
                         chdir,
-                        carrick_guest_arch::NativeOrdinal::new(frame.x[8]),
+                        crate::native_process_runtime::NativeServiceCall::new(
+                            carrick_guest_arch::NativeOrdinal::new(frame.x[8]),
+                            counters,
+                        ),
                     )
                 }
             } else if retry_exec_stage {

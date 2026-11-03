@@ -13,6 +13,8 @@ vm_free = [
   "carrick-el1-abi::refusal_census_tests::refusal_snapshot_preserves_caller_populations_without_changing_service_counts",
   "carrick-runtime::el1_census::tests::mapped_refused_child_mkdirat_reaches_the_shared_gate",
   "carrick-spec::syscall_census::tests::refused_child_mkdirat_fails_even_without_oracle_shape",
+  "carrick-el1-linux::native_process_runtime::host_test_support::native_child_exec_after_ring_setuid_carries_the_new_credentials",
+  "carrick-el1-linux::native_process_runtime::host_test_support::root_exec_access_refusal_is_counted_before_service_publication",
 ]
 embed = [
   "carrick-conformance-next::generic_probe_shard_0",
