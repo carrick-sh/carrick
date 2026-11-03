@@ -152,10 +152,16 @@ pub enum WorkMetric {
     /// steady-state safe point (a debt-free block entry of a running soft
     /// vCPU). Loads on the member's own line are the only allowed work.
     InvalidationSteadyStateSharedWrites,
+    /// Soft CPU blocks planned from instruction bytes.
+    SoftcpuBlockDecodes,
+    /// Soft CPU native blocks emitted on translation misses.
+    SoftcpuBlockEmits,
+    /// Page-table walks for the code-only loop fixture.
+    SoftcpuCodePageWalks,
 }
 
 impl WorkMetric {
-    pub const COUNT: usize = 59;
+    pub const COUNT: usize = 62;
     pub const ALL: [WorkMetric; Self::COUNT] = [
         Self::KernelDispatches,
         Self::KernelRedispatches,
@@ -216,6 +222,9 @@ impl WorkMetric {
         Self::InvalidationMembersCounted,
         Self::InvalidationKicks,
         Self::InvalidationSteadyStateSharedWrites,
+        Self::SoftcpuBlockDecodes,
+        Self::SoftcpuBlockEmits,
+        Self::SoftcpuCodePageWalks,
     ];
 }
 

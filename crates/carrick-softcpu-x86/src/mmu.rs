@@ -573,3 +573,36 @@ pub(crate) fn check_guest_alignment<M: SoftMmuMemory>(
     }
     Err(exc)
 }
+
+/// Validate a translation dependency without walking a warm executable TLB entry.
+/// A miss must authenticate the physical frame again after remap or shootdown.
+pub(crate) fn code_page_matches<M: SoftMmuMemory>(
+    ctx: &mut SoftCpuContext,
+    mem: &mut M,
+    page: &crate::block::CodePage,
+) -> bool {
+    if !mem.extents().is_code_page(page.frame)
+        || mem.extents().code_generation(page.frame) != page.generation
+    {
+        return false;
+    }
+    let Ok(mut access) = admit(ctx, mem, page.va.raw()) else {
+        return false;
+    };
+    let mode = access.access_mode();
+    if let Some(host) = access
+        .context_mut()
+        .tlb
+        .probe(page.va, 1, SoftAccessKind::Execute, mode)
+    {
+        return host == page.host_page.raw();
+    }
+    walk_with_frame_mode(
+        &mut access,
+        mem,
+        page.va.raw(),
+        SoftAccessKind::Execute,
+        mode,
+    )
+    .is_ok_and(|(ptr, frame)| frame == page.frame && ptr as usize == page.host_page.raw())
+}

@@ -58,9 +58,18 @@ pub enum BlockFetchFault {
     PageFault { rip: u64, fault: SoftPageFault },
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct CodePage {
+    pub va: crate::mmu::GuestVa,
+    pub frame: crate::mmu::AuthenticatedGpa,
+    pub generation: u64,
+    pub host_page: crate::mmu::HostVa,
+}
+
 /// Planned basic block ready for [`crate::emit::emit_block`].
 #[derive(Clone, Debug)]
 pub struct PlannedBlock {
+    pub(crate) code_pages: Vec<CodePage>,
     pub start: u64,
     pub end: u64,
     pub insns: Vec<DecodedInsn>,
@@ -74,6 +83,7 @@ fn fetch_one_insn<M: SoftMmuMemory>(
     va: u64,
     ctx: &mut SoftCpuContext,
     mem: &mut M,
+    pages: &mut Vec<CodePage>,
 ) -> Result<(DecodedInsn, [u8; MAX_INSN_BYTES]), BlockFetchFault> {
     if !is_canonical_va(va) {
         return Err(BlockFetchFault::GeneralProtection {
@@ -87,7 +97,15 @@ fn fetch_one_insn<M: SoftMmuMemory>(
     let mut buf = [0u8; MAX_INSN_BYTES];
     let (first_ptr, first_frame) = translate_with_frame(ctx, mem, va, SoftAccessKind::Execute)
         .map_err(|fault| BlockFetchFault::PageFault { rip: va, fault })?;
-    let _ = mem.mark_code_page(first_frame, &mut [&mut ctx.tlb]);
+    let generation = mem.mark_code_page(first_frame, &mut [&mut ctx.tlb]);
+    if !pages.iter().any(|p| p.va.raw() == va & SOFT_TLB_PAGE_MASK) {
+        pages.push(CodePage {
+            va: crate::mmu::GuestVa::new(va & SOFT_TLB_PAGE_MASK),
+            frame: first_frame,
+            generation,
+            host_page: crate::mmu::HostVa::new(first_ptr as usize - page_off),
+        });
+    }
     // SAFETY: `first_ptr` has at least `first_chunk` valid bytes within its 4 KiB page.
     unsafe { std::ptr::copy_nonoverlapping(first_ptr, buf.as_mut_ptr(), first_chunk) };
 
@@ -106,7 +124,13 @@ fn fetch_one_insn<M: SoftMmuMemory>(
             let (second_ptr, second_frame) =
                 translate_with_frame(ctx, mem, next_page_va, SoftAccessKind::Execute)
                     .map_err(|fault| BlockFetchFault::PageFault { rip: va, fault })?;
-            let _ = mem.mark_code_page(second_frame, &mut [&mut ctx.tlb]);
+            let generation = mem.mark_code_page(second_frame, &mut [&mut ctx.tlb]);
+            pages.push(CodePage {
+                va: crate::mmu::GuestVa::new(next_page_va),
+                frame: second_frame,
+                generation,
+                host_page: crate::mmu::HostVa::from_ptr(second_ptr),
+            });
             let dst = buf[first_chunk..].as_mut_ptr();
             // SAFETY: `second_ptr` and `dst` each have `MAX_INSN_BYTES - first_chunk` valid bytes.
             unsafe { std::ptr::copy_nonoverlapping(second_ptr, dst, MAX_INSN_BYTES - first_chunk) };
@@ -153,11 +177,12 @@ pub fn plan_block_from_memory<M: SoftMmuMemory>(
     let max_span = max_span.max(MAX_INSN_BYTES);
     let (mut insns, mut insn_bytes, mut cursor) = (Vec::new(), Vec::new(), entry_va);
 
+    let mut code_pages = Vec::new();
     let exit = loop {
         if insns.len() >= max_insns {
             break BlockExit::Continue { target: cursor };
         }
-        let (decoded, raw_bytes) = match fetch_one_insn(cursor, ctx, mem) {
+        let (decoded, raw_bytes) = match fetch_one_insn(cursor, ctx, mem, &mut code_pages) {
             Ok(pair) => pair,
             Err(fault) if insns.is_empty() => return Err(fault),
             Err(_) => break BlockExit::Continue { target: cursor },
@@ -200,6 +225,7 @@ pub fn plan_block_from_memory<M: SoftMmuMemory>(
     };
 
     Ok(PlannedBlock {
+        code_pages,
         start: entry_va,
         end: cursor,
         insns,

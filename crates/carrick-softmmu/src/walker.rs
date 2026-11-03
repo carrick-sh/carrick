@@ -659,20 +659,29 @@ impl ExtentTable {
         ))
     }
 
-    /// Mark `frame_gpa` as holding cached translated blocks and flush the `write` plane across `tlbs`.
+    /// Mark a new code incarnation and flush write planes only on activation.
+    /// Returns zero (and leaves it inactive) if generation space is exhausted.
     pub fn mark_code_page(
         &mut self,
         frame_gpa: AuthenticatedGpa,
         tlbs: &mut [&mut SoftTlb],
     ) -> u64 {
         let entry = self.code_pages.entry(frame_gpa.raw()).or_insert((false, 0));
-        entry.0 = true;
-        if entry.1 == 0 {
-            entry.1 = 1;
+        let changed = !entry.0;
+        if changed {
+            // Reactivation after retirement/clear is a new code incarnation.
+            // Refuse caching on exhaustion rather than resurrect an old key.
+            let Some(next) = entry.1.checked_add(1) else {
+                return 0;
+            };
+            entry.1 = next;
+            entry.0 = true;
         }
         let code_gen = entry.1;
-        for tlb in tlbs {
-            tlb.flush_write_plane();
+        if changed {
+            for tlb in tlbs {
+                tlb.flush_write_plane();
+            }
         }
         code_gen
     }
@@ -728,6 +737,8 @@ impl ExtentTable {
 /// access must not introduce conflicting Rust references or data races; in
 /// particular, page-table atomics must not race with non-atomic guest accesses.
 /// A borrowed placement alone does not keep its backing alive.
+/// Host writes to marked code frames must advance their code generation before
+/// another block executes, just like guest writes through the walker.
 pub unsafe trait SoftMmuMemory {
     fn placement(&self) -> &LinearPlacement;
     fn extents(&self) -> &ExtentTable;
@@ -1212,6 +1223,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn repeated_code_mark_flushes_only_on_state_change() {
+        let mut table = ExtentTable::new().unwrap();
+        let frame = AuthenticatedGpa::from_authenticated_raw(0x5000);
+        let mut tlb = SoftTlb::new();
+        assert_eq!(table.mark_code_page(frame, &mut [&mut tlb]), 1);
+        assert_eq!(table.mark_code_page(frame, &mut [&mut tlb]), 1);
+        assert_eq!(tlb.stats().write_evictions, 1);
+        table.clear_code_page(frame);
+        assert_eq!(table.mark_code_page(frame, &mut [&mut tlb]), 2);
+        assert_eq!(tlb.stats().write_evictions, 2);
+    }
+
+    #[test]
     fn code_generation_refuses_exhaustion_instead_of_saturating() {
         let mut table = ExtentTable::new().expect("fresh domain");
         let frame = AuthenticatedGpa::from_authenticated_raw(0x5000);
@@ -1220,5 +1244,11 @@ mod tests {
         table.code_pages.insert(frame.raw(), (true, u64::MAX));
         assert_eq!(table.on_code_page_write(frame, &mut []), None);
         assert_eq!(table.code_generation(frame), u64::MAX, "nothing changed");
+        table.clear_code_page(frame);
+        assert_eq!(table.mark_code_page(frame, &mut []), 0);
+        assert!(
+            !table.is_code_page(frame),
+            "an exhausted identity stays inactive"
+        );
     }
 }

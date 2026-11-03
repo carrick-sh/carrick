@@ -1140,6 +1140,14 @@ fn frame_keyed_code_page_alias_invalidation_and_retired_table_frame_refusal()
     let gen1 = rig
         .mem
         .mark_code_page(rx_walk.frame_gpa, &mut [&mut rig.tlb, &mut tlb_cpu1]);
+    let evictions = rig.tlb.stats().write_evictions;
+    rig.mem
+        .mark_code_page(rx_walk.frame_gpa, &mut [&mut rig.tlb]);
+    assert_eq!(
+        rig.tlb.stats().write_evictions,
+        evictions,
+        "already marked code does not evict the write plane"
+    );
     assert_eq!(gen1, 1);
     assert_eq!(rig.tlb.probe(va_rw, 8, Access::Write, mode), None);
     assert_eq!(tlb_cpu1.probe(va_rw, 8, Access::Write, mode), None);

@@ -2583,6 +2583,7 @@ mod tests {
         let mut bytes = [0; 15];
         bytes[..4].copy_from_slice(&[0xf3, 0x0f, 0x59, 0xc1]); // mulss xmm0,xmm1
         crate::block::PlannedBlock {
+            code_pages: Vec::new(),
             start: ip,
             end: ip + 4,
             insns: vec![crate::decode::classify(&bytes[..4], ip).unwrap()],

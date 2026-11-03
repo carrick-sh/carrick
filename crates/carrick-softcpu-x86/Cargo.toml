@@ -18,6 +18,7 @@ iced-x86 = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+carrick-conformance-contract = { path = "../carrick-conformance-contract" }
 carrick-hal = { path = "../carrick-hal" }
 goblin = { workspace = true }
 
