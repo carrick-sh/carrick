@@ -607,16 +607,6 @@ enum ExecutableBacking {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl CarrierVmCustody {
-    /// Fixed ABI storage belongs to this carrier's mapped stage-2 record.
-    pub(crate) fn abi_region_pointer(&self) -> Option<core::ptr::NonNull<u8>> {
-        let start = carrick_el1_abi::EL1_REGION_BASE;
-        let identity =
-            self.stage2_record_covering(start, carrick_el1_abi::EL1_REGION_SIZE as usize)?;
-        let record = self.stage2_record_snapshot(identity.record_id)?;
-        let offset = usize::try_from(start.checked_sub(record.ipa)?).ok()?;
-        core::ptr::NonNull::new((record.host_addr as *mut u8).wrapping_add(offset))
-    }
-
     /// The backing that owns physical `ipa`: a global frame or a structural
     /// backing (tracked: its `CodeContent` carries per-page instruction-cache
     /// state), else any other carrier stage-2 extent (untracked).
