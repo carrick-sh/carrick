@@ -19,6 +19,8 @@ permissions:
   contents: read
 
 env:
+  # Census output is opt-in for users; CI always retains refusal evidence.
+  CARRICK_EL1_CENSUS: ${{ github.workspace }}/target/carrick-census
   CARGO_TERM_COLOR: always
   # Swatinem/rust-cache exports CARGO_INCREMENTAL=0 in the jobs that use it, and
   # sccache hashes every CARGO_* variable into its key. Pin it workflow-wide so
