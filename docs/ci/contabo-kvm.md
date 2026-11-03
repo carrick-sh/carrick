@@ -353,8 +353,9 @@ Then confirm with `pveum acl list` that no `/vms/<old VMID>` entry remains.
 ## Rebuild an agent template beside the running source (#1384)
 
 Agent template slots are the typed set **9000 and 9001**, outside
-`carrick-ci`. The Contabo site row now selects **9001** for new clones;
-9000 remains a protected base until its last linked clone is destroyed.
+`carrick-ci`. The Contabo site row now selects **9000** (rebuilt for the
+shared Rust toolchain, #1521) for new clones; 9001 remains a protected base
+until its last linked clone is destroyed.
 Their provisioning addresses are `10.77.0.150` and `10.77.0.151`, respectively.
 KVM source 300 and clone VMIDs 308–349 are unchanged. No clone drain or pause
 in dispatch is required while the new template builds.
