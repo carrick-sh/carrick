@@ -426,9 +426,12 @@ impl<
         {
             return false;
         }
+        // The native process runtime is this birth's only issuer: it commits
+        // the record issued and native-owned before it is published, so its
+        // first entry is an ordinary issued admission (#1100).
         self.zone.as_ref().is_some_and(|zone| {
             zone.tables.record(record.id).incarnation() == record.incarnation
-                && zone.tables.mark_native_owned(record.id)
+                && zone.tables.issue_native_birth(record.id)
         })
     }
     fn release_native_birth(&mut self, record: RecordRef, control: &ThreadControlSlot) -> bool {
@@ -532,7 +535,8 @@ impl<
             reference: zone.record_ref(id),
             identity: record.identity(),
             home: zone.slot(slot).host_record() == Some(id),
-            unadopted: record.is_unadopted_birth(),
+            // No host thread adopts a native-owned execution either (#1100).
+            unadopted: record.is_unadopted_birth() || record.has_native_execution_owner(),
             on_cpu: matches!(record.claim(), Claim::OnCpu {slot: owner, ..} if owner == slot),
             needs_host: record.needs_host(),
             cancelled: record.is_cancelled(),

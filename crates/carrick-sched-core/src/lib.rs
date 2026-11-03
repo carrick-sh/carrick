@@ -317,6 +317,11 @@ pub enum Claim {
     FirstEntryHost { incarnation: u64 },
 }
 
+/// The first execution generation of a freshly published execution; equal to
+/// `carrick_core_abi::SnapshotGeneration::INITIAL` (asserted in
+/// `carrick-core`, which sees both crates).
+pub const FIRST_EXECUTION_GENERATION: u64 = 1;
+
 const STATE_FREE: u64 = 0;
 const STATE_PARKED: u64 = 1;
 const STATE_QUEUED: u64 = 2;
@@ -931,13 +936,14 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
     /// The one decision of who performs an unadopted birth's first entry.
     ///
     /// A host birth's first entry is a host executor's adoption of its host
-    /// thread. A native-owned birth has no host thread to adopt: the ring
-    /// performs its first entry ([`Claim::OnCpu`] with generation 0, admitted
-    /// by `carrick_core::entry::admit_born_in_zone`), so no host venue takes
-    /// first-entry custody of it. Before #1100 every unadopted birth was a
-    /// host first entry; an executor took a native fork child's new thread,
-    /// found no host thread, released it as [`Claim::FirstEntryHost`] and
-    /// left it on no queue. ISA-neutral: x86 CPL0 births use these tables.
+    /// thread. A native-owned birth has no host thread to adopt: its process
+    /// runtime issues it at birth commit ([`ZoneTables::issue_native_birth`]),
+    /// so it is never an unadopted birth and the ring switches it in like any
+    /// issued execution. Before #1100 every unadopted birth was a host first
+    /// entry; an executor took a native fork child's new thread, found no
+    /// host thread, released it as [`Claim::FirstEntryHost`] and left it on
+    /// no queue. The native-owner term still refuses host first-entry custody
+    /// to an exception owner. ISA-neutral: x86 CPL0 births use these tables.
     pub fn needs_host_first_entry(&self) -> bool {
         self.is_unadopted_birth() && !self.has_native_execution_owner()
     }
@@ -2274,14 +2280,38 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
 
     /// Publish the execution owner before making a freshly allocated record
     /// runnable, or while its running slot adopts an already switched-in root.
+    /// An unadopted birth is refused: a native-owned birth is issued by
+    /// [`Self::issue_native_birth`], never left at generation 0 (#1100).
     pub fn mark_native_owned(&self, id: RecordId) -> bool {
         let record = self.record(id);
+        if record.is_unadopted_birth() {
+            return false;
+        }
         match record.claim() {
             Claim::Free => {}
             Claim::OnCpu { slot, .. } | Claim::OnCpuRequested { slot, .. }
                 if self.slot(slot).current() == Some(id) => {}
             _ => return false,
         }
+        record.native_owned.store(1, Ordering::Release);
+        true
+    }
+
+    /// Commit a native process's thread birth to the ring: issue its first
+    /// execution generation and publish its native execution owner together,
+    /// before the record is ever runnable. The native process runtime is the
+    /// birth's only issuer (#1100): a native birth has no host thread to adopt
+    /// it, so it never exists native-owned at generation 0. Refused unless
+    /// the record is a freshly allocated, unpublished ([`Claim::Free`])
+    /// unadopted birth.
+    pub fn issue_native_birth(&self, id: RecordId) -> bool {
+        let record = self.record(id);
+        if !matches!(record.claim(), Claim::Free) || !record.is_unadopted_birth() {
+            return false;
+        }
+        record
+            .generation
+            .store(FIRST_EXECUTION_GENERATION, Ordering::Relaxed);
         record.native_owned.store(1, Ordering::Release);
         true
     }
