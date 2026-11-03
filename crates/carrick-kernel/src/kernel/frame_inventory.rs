@@ -538,7 +538,7 @@ impl FrameInventoryAuthority {
         mapping_candidates: usize,
         event_capacity: FrameEventCapacity,
     ) -> Result<FrameInventoryReservation, FrameInventoryReserveError> {
-        let (reservation, record) = prepare_reservation(
+        let (reservation, record) = prepare_mapping_reservation(
             ids,
             frame_candidates,
             mapping_candidates,
@@ -1639,7 +1639,21 @@ fn snapshot_state(state: &InventoryState, mm_filter: Option<FrameOwner>) -> Fram
     }
 }
 
+/// Issue transaction identity and fork-safe provenance for both event batches
+/// and claimed returns, before either acquires the inventory lock.
 fn prepare_reservation(
+    ids: &ObjectIdRegistry,
+    entropy: &Mutex<ProvenanceEntropyBatch>,
+) -> Result<(KernelTransactionId, FrameInventoryProvenance), FrameInventoryReserveError> {
+    let transaction = ids.transaction_id()?;
+    let provenance_bytes = entropy.lock().next(std::process::id(), |bytes| {
+        getrandom::fill(bytes).map_err(|_| FrameInventoryReserveError::EntropyUnavailable)
+    })?;
+    let provenance = FrameInventoryProvenance::from_kernel_entropy(provenance_bytes);
+    Ok((transaction, provenance))
+}
+
+fn prepare_mapping_reservation(
     ids: &ObjectIdRegistry,
     frame_candidates: usize,
     mapping_candidates: usize,
@@ -1665,11 +1679,7 @@ fn prepare_reservation(
     recorded_mappings
         .try_reserve_exact(mapping_candidates)
         .map_err(|_| FrameInventoryReserveError::AllocationFailed)?;
-    let transaction = ids.transaction_id()?;
-    let provenance_bytes = entropy.lock().next(std::process::id(), |bytes| {
-        getrandom::fill(bytes).map_err(|_| FrameInventoryReserveError::EntropyUnavailable)
-    })?;
-    let provenance = FrameInventoryProvenance::from_kernel_entropy(provenance_bytes);
+    let (transaction, provenance) = prepare_reservation(ids, entropy)?;
     let batch = FrameInventoryBatch::prepare(transaction, event_capacity)?;
     for _ in 0..frame_candidates {
         let frame = ids.frame_id()?;
@@ -4953,9 +4963,9 @@ mod inventory_origin_tests {
 mod claimed_return {
     use super::{
         BTreeSet, FrameId, FrameInventoryApplyReceipt, FrameInventoryAuthority,
-        FrameInventoryProvenance, FrameInventoryReserveError, FrameOwner, KernelTransactionId,
-        MappingEntry, MappingId, MappingRow, MappingSlot, MappingState, Mutex, ObjectIdRegistry,
-        decrement_mm_mapping_count, next_generation,
+        FrameInventoryProvenance, FrameOwner, KernelTransactionId, MappingEntry, MappingId,
+        MappingRow, MappingSlot, MappingState, Mutex, ObjectIdRegistry, decrement_mm_mapping_count,
+        next_generation,
     };
 
     /// Only claim preparation can replace a live row with this placeholder.
@@ -5092,16 +5102,8 @@ mod claimed_return {
             if rows.is_empty() || rows.len() > 512 || bytes.is_none_or(|bytes| bytes > 512 * 4096) {
                 return Err(Error::Capacity);
             }
-            let transaction = ids.transaction_id().map_err(|_| Error::Capacity)?;
-            let provenance = FrameInventoryProvenance::from_kernel_entropy(
-                self.entropy
-                    .lock()
-                    .next(std::process::id(), |bytes| {
-                        getrandom::fill(bytes)
-                            .map_err(|_| FrameInventoryReserveError::EntropyUnavailable)
-                    })
-                    .map_err(|_| Error::Capacity)?,
-            );
+            let (transaction, provenance) =
+                super::prepare_reservation(ids, &self.entropy).map_err(|_| Error::Capacity)?;
             let mm = mm.into();
             let mut retained_rows = Vec::new();
             retained_rows
