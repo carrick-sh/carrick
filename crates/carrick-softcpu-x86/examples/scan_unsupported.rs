@@ -3,12 +3,26 @@
 //! Stdout is a reproducible ceiling file: Code occurrences affected_files.
 //! Linear decoding of SHF_EXECINSTR sections includes inline data and deliberate
 //! UD2 traps; keep these visible in the residue rather than silently hiding them.
+// The soft CPU crate is x86_64-only (`#![cfg(target_arch = "x86_64")]`);
+// on other hosts this example compiles to a stub so workspace-wide
+// `--all-targets` builds (e.g. macOS arm64 clippy) still succeed.
+#[cfg(not(target_arch = "x86_64"))]
+fn main() {
+    eprintln!("scan_unsupported requires an x86_64 host");
+    std::process::exit(2);
+}
+
+#[cfg(target_arch = "x86_64")]
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(target_arch = "x86_64")]
 use std::error::Error;
 
+#[cfg(target_arch = "x86_64")]
 use carrick_softcpu_x86::{InsnClass, classify};
+#[cfg(target_arch = "x86_64")]
 use goblin::elf::{Elf, header::EM_X86_64, section_header::SHF_EXECINSTR};
 
+#[cfg(target_arch = "x86_64")]
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let mut expected = None;
