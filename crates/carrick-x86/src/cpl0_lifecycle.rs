@@ -358,7 +358,10 @@ mod process_exit_tests {
 }
 
 pub const LIFECYCLE_ZONE: u64 = 0xffff_ffff_b000_0000;
-pub const LIFECYCLE_LANE: u64 = 0xffff_ffff_b090_0000;
+// Above the zone tables, progress state and the KVM witness's second root
+// (`carrick-vmm-kvm` `carrier_interrupts` asserts the ordering); the native
+// member release queues (#1100) pushed that end past 0x90_0000.
+pub const LIFECYCLE_LANE: u64 = 0xffff_ffff_b0a0_0000;
 pub const LIFECYCLE_STRIDE: u64 = 0x1_0000;
 #[cfg(not(target_os = "none"))]
 pub const LIFECYCLE_DATA: u64 = 0x5_0000;
