@@ -918,6 +918,8 @@ surfaces = [
   { path = "crates/carrick-softcpu-x86/tests/softcpu_idt_delivery.rs", contract = "x86.softcpu.level0" },
   { path = "crates/carrick-softcpu-x86/tests/softcpu_level0.rs", contract = "softmmu.x86.physical-retirement" },
   { path = "crates/carrick-softcpu-x86/tests/softcpu_level0.rs", contract = "x86.softcpu.level0" },
+  { path = "crates/carrick-softcpu-x86/tests/softcpu_v3.rs", contract = "x86.cpuid.v3" },
+  { path = "crates/carrick-softcpu-x86/tests/softcpu_v3.rs", contract = "x86.softcpu.level0" },
   { path = "crates/carrick-softmmu/src/domains.rs", contract = "softmmu.x86.physical-retirement" },
   { path = "crates/carrick-softmmu/src/domains.rs", contract = "softmmu.x86.tlb-walker" },
   { path = "crates/carrick-softmmu/src/lib.rs", contract = "softmmu.x86.physical-retirement" },
