@@ -17,6 +17,21 @@ const MM: IpcMmKey = IpcMmKey(7);
 const BUF: u64 = 0x10_0000;
 
 #[test]
+fn el1_ipc_host_finish_publishes_operation_slot_release_once() {
+    let w = world();
+    let token = w.region.begin_operation(IpcOperation::EMPTY).unwrap();
+    let raw = token.into_raw();
+    let wakes = Wakes::default();
+    finish(w.region, IpcOpToken::from_raw(raw), &wakes).unwrap();
+    assert_eq!(wakes.1.get(), 1);
+    assert_eq!(
+        finish(w.region, IpcOpToken::from_raw(raw), &wakes),
+        Err(IpcError::Stale)
+    );
+    assert_eq!(wakes.1.get(), 1);
+}
+
+#[test]
 fn serial_host_el1_ipc_finish_releases_host_forwarding_token() {
     use std::sync::{
         Arc,
@@ -136,8 +151,11 @@ struct World {
 }
 
 #[derive(Default)]
-struct Wakes(RefCell<Vec<(IpcObjectHandle, WakeSet)>>);
+struct Wakes(RefCell<Vec<(IpcObjectHandle, WakeSet)>>, Cell<usize>);
 impl IpcHostServices for Wakes {
+    fn operation_slot_released(&self, _region: &IpcRegion<'_>) {
+        self.1.set(self.1.get() + 1);
+    }
     fn validate_region(&self, _region: &IpcRegion<'_>) -> Result<(), IpcError> {
         Ok(())
     }
@@ -395,6 +413,9 @@ struct Clocked {
     now: u64,
 }
 impl IpcHostServices for Clocked {
+    fn operation_slot_released(&self, region: &IpcRegion<'_>) {
+        self.wakes.operation_slot_released(region);
+    }
     fn validate_region(&self, region: &IpcRegion<'_>) -> Result<(), IpcError> {
         self.wakes.validate_region(region)
     }

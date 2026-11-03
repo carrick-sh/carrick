@@ -169,7 +169,7 @@ impl carrick_el1_abi::MetadataCompletionWake for MetadataCompletionWake {
     }
 }
 
-fn complete_object_wake<C: carrick_el1_abi::EntryContext>(
+pub(crate) fn complete_object_wake<C: carrick_el1_abi::EntryContext>(
     zone: &carrick_sched_core::ZoneTables<C>,
     owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>,
 ) {

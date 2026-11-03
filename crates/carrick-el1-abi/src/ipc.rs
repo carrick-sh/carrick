@@ -110,7 +110,8 @@ pub const IPC_MAX_OFDS: usize = 1 << 20;
 /// OFD records published per growth step.
 pub const IPC_OFD_SEGMENT: usize = 2048;
 /// Suspended-operation records ([`IpcOperation`] behind an [`IpcOpToken`]).
-/// Exhaustion refuses before effects (`NoOperations`: EL1 forwards).
+/// Exhaustion refuses before effects (`NoOperations`); retained admission
+/// subscribes to the carrier operation-slot release source before probing.
 pub const IPC_OPERATIONS: usize = 1024;
 /// Zone-wide ceiling on pipe and eventfd objects: the elastic object store's
 /// reservation (ENFILE beyond it).
@@ -1813,6 +1814,12 @@ impl<'a> IpcRegion<'a> {
         Ok(slot)
     }
 
+    /// Exact carrier IPC authority used by the operation-slot release source.
+    pub fn operation_slot_generation(&self) -> core::num::NonZeroU64 {
+        // SAFETY: initialize/attach require the nonzero fd authority identity.
+        unsafe { core::num::NonZeroU64::new_unchecked(self.dir.fd.identity()) }
+    }
+
     /// Record a suspended operation (moving its pin into `op`) and return
     /// the owned token the scheduler keeps with the parked thread. Lock-free.
     pub fn begin_operation(&self, op: IpcOperation) -> Result<IpcOpToken, IpcError> {
@@ -1848,8 +1855,13 @@ impl<'a> IpcRegion<'a> {
     }
 
     /// Complete the operation: return its record (the caller then unpins
-    /// `op.pin` exactly once) and retire the token.
-    pub fn finish_operation(&self, token: IpcOpToken) -> Result<IpcOperation, IpcError> {
+    /// `op.pin` exactly once) and retire the token. `released` publishes the
+    /// carrier release notification, only after a reusable slot is returned.
+    pub fn finish_operation(
+        &self,
+        token: IpcOpToken,
+        released: impl FnOnce(),
+    ) -> Result<IpcOperation, IpcError> {
         let slot = self.op_slot(&token)?;
         // SAFETY: the token's owner is the slot's only accessor.
         let op = unsafe { *slot.op.get() };
@@ -1862,6 +1874,9 @@ impl<'a> IpcRegion<'a> {
                 token.index as usize,
                 &slot.next_free,
             );
+            // The slot is visible before the release revision advances. Every
+            // venue must publish through its exact carrier completion owner.
+            released();
         }
         Ok(op)
     }

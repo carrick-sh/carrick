@@ -30,6 +30,7 @@ pub const ORIGINAL_OBJECT_WAIT_QUEUES: usize =
     (ADDRESS_SPACE_WAIT_BASE + 1 + spaces::ADDRESS_SPACES).div_ceil(64) * 64;
 const METADATA_WAIT_INDEX: usize = ADDRESS_SPACE_WAIT_BASE;
 const RESERVATION_POOL_WAIT_INDEX: usize = ADDRESS_SPACE_WAIT_BASE + 1 + spaces::ADDRESS_SPACES;
+const IPC_OPERATION_SLOT_WAIT_INDEX: usize = RESERVATION_POOL_WAIT_INDEX + 1;
 pub const EXTRA_CAUSE_QUEUES: usize = 5 * spaces::ADDRESS_SPACES;
 const DELEGATED_FILE_WAIT_BASE: usize = ORIGINAL_OBJECT_WAIT_QUEUES + EXTRA_CAUSE_QUEUES;
 const NATIVE_SERVICE_WAIT_BASE: usize = DELEGATED_FILE_WAIT_BASE + DELEGATED_FILE_WAIT_QUEUES;
@@ -38,11 +39,16 @@ pub const OBJECT_WAIT_QUEUES: usize = NATIVE_SERVICE_WAIT_BASE + ZONE_RECORDS;
 // Every producer owns one disjoint index range. Keep this a compile-time gate
 // so adding a queue cannot silently alias another owner or its generation.
 const _: () = {
+    assert!(IPC_OPERATION_SLOT_WAIT_INDEX < ORIGINAL_OBJECT_WAIT_QUEUES);
     let domains = [
         (1, ZONE_RECORDS),
         (METADATA_WAIT_INDEX, METADATA_WAIT_INDEX + 1),
         (ADDRESS_SPACE_WAIT_BASE + 1, RESERVATION_POOL_WAIT_INDEX),
         (RESERVATION_POOL_WAIT_INDEX, RESERVATION_POOL_WAIT_INDEX + 1),
+        (
+            IPC_OPERATION_SLOT_WAIT_INDEX,
+            IPC_OPERATION_SLOT_WAIT_INDEX + 1,
+        ),
         (ORIGINAL_OBJECT_WAIT_QUEUES, DELEGATED_FILE_WAIT_BASE),
         (DELEGATED_FILE_WAIT_BASE, NATIVE_SERVICE_WAIT_BASE),
         (NATIVE_SERVICE_WAIT_BASE, OBJECT_WAIT_QUEUES),
@@ -66,7 +72,7 @@ const fn cause_queue_index(index: usize, cause: spaces::notification::SpaceWaitC
         ORIGINAL_OBJECT_WAIT_QUEUES + (cause as usize - 1) * spaces::ADDRESS_SPACES + index
     }
 }
-pub const OBJECT_WAIT_PROTOCOL: u64 = 12;
+pub const OBJECT_WAIT_PROTOCOL: u64 = 13;
 pub const OBJECT_WAIT_LAYOUT_HASH: u64 = {
     let words = [
         OBJECT_WAIT_PROTOCOL,
@@ -88,6 +94,7 @@ pub const OBJECT_WAIT_LAYOUT_HASH: u64 = {
         ORIGINAL_OBJECT_WAIT_QUEUES as u64,
         METADATA_WAIT_INDEX as u64,
         RESERVATION_POOL_WAIT_INDEX as u64,
+        IPC_OPERATION_SLOT_WAIT_INDEX as u64,
         DELEGATED_FILE_WAIT_BASE as u64,
         DELEGATED_FILE_WAIT_QUEUES as u64,
         core::mem::offset_of!(crate::ZoneTables, delegated_file_waits) as u64,
@@ -168,6 +175,14 @@ impl ObjectWaitKey {
             generation: generation.get(),
         }
     }
+    /// One carrier's IPC operation arena; disjoint from every object lane.
+    pub const fn ipc_operation_slots(generation: core::num::NonZeroU64) -> Self {
+        Self {
+            index: IPC_OPERATION_SLOT_WAIT_INDEX as u32,
+            generation: generation.get(),
+        }
+    }
+
     /// Carrier reservation-pool progress uses the first rounded spare queue,
     /// disjoint from metadata, IPC objects and exact-MM prepared-overlap queues.
     pub const fn reservation_pool(generation: core::num::NonZeroU64) -> Self {
@@ -525,7 +540,7 @@ pub struct BorrowedObjectNotificationSource<
 impl<'scope, 'zone, C: Copy + Send + Sync + zerocopy::FromZeros>
     BorrowedObjectNotificationSource<'scope, 'zone, C>
 {
-    pub(crate) fn observe(&self) -> ObjectWaitSnapshot {
+    pub fn observe(&self) -> ObjectWaitSnapshot {
         self.zone.notification_snapshot(self.key)
     }
     pub fn reserve(&self) -> ObjectNotificationTicket<'zone, C> {
@@ -1706,6 +1721,63 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         }
     }
 
+    /// Admit the carrier-lifetime release source before probing its operation
+    /// arena. The permanent base pin prevents rebinding while any caller can
+    /// finish an operation. Admission contention is Busy, never a spin.
+    pub fn ipc_operation_slot_source(
+        &self,
+        generation: core::num::NonZeroU64,
+        completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
+    ) -> Result<BorrowedObjectNotificationSource<'_, '_, C>, ObjectWaitError> {
+        let key = ObjectWaitKey::ipc_operation_slots(generation);
+        if self.notification_generation(key) == 0 {
+            if !self.completion_handbacks.initialize() {
+                return Err(ObjectWaitError::Busy);
+            }
+            let guard = self.lock_completion_index(key, &BoundedSpin(0), completion)?;
+            let queue = guard.queue();
+            if queue.generation.load(Ordering::Acquire) == 0 {
+                assert!(self.object_admission_handbacks[key.index as usize].initialize());
+                queue.completion_mode.store(1, Ordering::Release);
+                queue.epoch.store(1, Ordering::SeqCst);
+                queue.publishers.store(1, Ordering::Release);
+                queue.generation.store(key.generation, Ordering::Release);
+            }
+        }
+        if self.notification_generation(key) != key.generation {
+            return Err(ObjectWaitError::Stale);
+        }
+        Ok(BorrowedObjectNotificationSource {
+            zone: self,
+            key,
+            _source: core::marker::PhantomData,
+        })
+    }
+
+    /// Publish after the free-list push, without acquiring the waiter lock.
+    /// Before first admission there can be no subscriber: its first probe
+    /// follows source admission and observes every earlier returned slot.
+    pub fn notify_ipc_operation_slot_release(
+        &self,
+        generation: core::num::NonZeroU64,
+        waker: Waker,
+        completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
+    ) {
+        let key = ObjectWaitKey::ipc_operation_slots(generation);
+        let actual = self.notification_generation(key);
+        if actual == 0 {
+            return;
+        }
+        assert_eq!(actual, key.generation, "one IPC arena per carrier");
+        BorrowedObjectNotificationSource {
+            zone: self,
+            key,
+            _source: core::marker::PhantomData,
+        }
+        .reserve()
+        .publish(waker, completion);
+    }
+
     fn completion_transfer(&self, id: RecordId) -> HostTransfer<'_, C> {
         let claim = self.record(id).claim();
         assert!(
@@ -2304,6 +2376,118 @@ mod host_tests {
             .notify_object_host(&mut |r| handed.push(r.id), &mut |_| {})
             .unwrap();
         (report, handed)
+    }
+
+    #[test]
+    fn ipc_operation_slot_source_busy_once_then_success() {
+        let zone = fixture(false);
+        let generation = core::num::NonZeroU64::new(42).unwrap();
+        let key = ObjectWaitKey::ipc_operation_slots(generation);
+        assert!(key.index() as usize >= ZONE_RECORDS);
+        assert_ne!(key, ObjectWaitKey::reservation_pool(generation));
+        let completion = |owned: OwnedObjectWakeEffects<'_>| {
+            let _ = owned.into_parts();
+        };
+        let held = zone
+            .lock_completion_index(key, &BoundedSpin(0), &completion)
+            .unwrap();
+        assert!(matches!(
+            zone.ipc_operation_slot_source(generation, &completion),
+            Err(ObjectWaitError::Busy)
+        ));
+        drop(held);
+        let source = zone
+            .ipc_operation_slot_source(generation, &completion)
+            .unwrap();
+        assert_eq!(source.reserve().key(), key);
+        assert!(matches!(
+            zone.ipc_operation_slot_source(core::num::NonZeroU64::new(43).unwrap(), &completion),
+            Err(ObjectWaitError::Stale)
+        ));
+        assert!(matches!(
+            zone.bind_object_wait_with_completion(
+                ObjectWaitKey::ipc_operation_slots(core::num::NonZeroU64::new(43).unwrap()),
+                &BoundedSpin(0),
+                &completion
+            ),
+            Err(ObjectWaitError::Occupied)
+        ));
+    }
+
+    #[test]
+    fn ipc_operation_slot_release_before_enrollment_cannot_park_stale_probe() {
+        let zone = fixture(true);
+        let generation = core::num::NonZeroU64::new(42).unwrap();
+        let completion = |owned: OwnedObjectWakeEffects<'_>| {
+            let _ = owned.into_parts();
+        };
+        let source = zone
+            .ipc_operation_slot_source(generation, &completion)
+            .unwrap();
+        let ticket = source.reserve();
+        let before = source.observe();
+        zone.notify_ipc_operation_slot_release(generation, Waker::Host, &completion);
+        let record = allocate(&zone, 408);
+        let operation = OperationToken::new(408, 1).unwrap();
+        let expected = operation.identity();
+        let (error, operation) = ticket
+            .park_host_rechecked(before, record, operation, &completion, || true)
+            .unwrap_err();
+        assert_eq!(error, ObjectWaitError::Changed);
+        assert_eq!(operation.identity(), expected);
+        assert_eq!(
+            zone.object_queue_census(source.reserve().key().index())
+                .unwrap()
+                .waiters,
+            0
+        );
+        assert!(!zone.record(record).has_object_operation());
+    }
+
+    #[test]
+    fn ipc_operation_slot_release_under_queue_contention_is_delivered_once() {
+        use std::cell::Cell;
+        let zone = fixture(true);
+        let generation = core::num::NonZeroU64::new(42).unwrap();
+        let key = ObjectWaitKey::ipc_operation_slots(generation);
+        let delivered = Cell::new(0);
+        let completion = |owned: OwnedObjectWakeEffects<'_>| {
+            assert!(!zone.object_queue_census(key.index()).unwrap().locked);
+            let _ = owned.deliver_handbacks(&mut |_| panic!("available slot"));
+            delivered.set(delivered.get() + 1);
+        };
+        let source = zone
+            .ipc_operation_slot_source(generation, &completion)
+            .unwrap();
+        let before = source.observe();
+        let record = allocate(&zone, 409);
+        let operation = OperationToken::new(409, 1).unwrap();
+        let identity = operation.identity();
+        let guard = zone
+            .object_wait_with_completion(key, &BoundedSpin(0), &completion)
+            .unwrap();
+        guard.park(before, record, operation).unwrap();
+        zone.notify_ipc_operation_slot_release(generation, Waker::El1 { slot: SLOT }, &completion);
+        assert_eq!(
+            delivered.get(),
+            0,
+            "release never waits for the queue holder"
+        );
+        assert_ne!(source.observe(), before);
+        drop(guard);
+        assert_eq!(delivered.get(), 1);
+        assert!(matches!(zone.record(record).claim(), Claim::Queued { .. }));
+        assert_eq!(
+            zone.record(record).object.operation.load(Ordering::Acquire),
+            identity.index
+        );
+        assert_eq!(
+            zone.record(record)
+                .object
+                .operation_generation
+                .load(Ordering::Acquire),
+            identity.generation
+        );
     }
 
     #[test]

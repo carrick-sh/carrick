@@ -4717,7 +4717,7 @@ fn retained_ipc_supply(
         assert_eq!(object_guard.eventfd().unwrap().value(), 0);
         drop(object_guard);
         assert_eq!(copy.0, 7u64.to_ne_bytes());
-        let op = region.finish_operation(token).unwrap();
+        let op = region.finish_operation(token, || {}).unwrap();
         let release = region
             .fd(carrick_sched_core::ShortLockSpin)
             .unpin_filtered(

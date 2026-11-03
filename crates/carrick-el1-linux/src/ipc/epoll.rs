@@ -35,7 +35,7 @@
 
 use super::{
     EL1_WAIT, Finish, IpcServed, IpcVenue, Parked, Sched, ThreadCpu, UserCopy, UserWord, finish,
-    leave, linux, mm_key, park, release_pin, snapshot, task_key,
+    leave, linux, mm_key, notify_operation_release, park, release_pin, snapshot, task_key,
 };
 use carrick_el1_abi::IpcLeave;
 use carrick_el1_abi::TrapFrame;
@@ -286,7 +286,9 @@ fn serve_with<C: ThreadCpu, U: UserWord, M: UserCopy>(
             Parked::Done(served) => return served,
             // Readiness moved before the park: retire the record (the pin
             // stays with `op`) and harvest again.
-            Parked::Retry(token) => match region.finish_operation(token) {
+            Parked::Retry(token) => match region.finish_operation(token, || {
+                notify_operation_release(region, sched.zone, sched.slot)
+            }) {
                 Ok(back) => op = back,
                 Err(_) => return leave(sched, IpcLeave::StaleOperation, IpcServed::Forward),
             },
