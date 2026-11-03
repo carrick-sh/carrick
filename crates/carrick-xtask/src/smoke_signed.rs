@@ -48,6 +48,11 @@ pub struct SmokeCase {
 /// fails the run. Informational cases are `#[ignore]`d there.
 pub const CASES: &[SmokeCase] = &[
     SmokeCase {
+        name: "smoke_terminal_census_precedes_pool_shutdown_for_two_carriers",
+        covers: "durable census before terminal delivery, two sequential carriers, no shutdown duplicate",
+        role: CaseRole::Required,
+    },
+    SmokeCase {
         name: "smoke_root_exit_then_successor_bootstrap_in_one_carrier",
         covers: "bootstrap, clean root exit, two successor bootstraps in one carrier",
         role: CaseRole::Required,

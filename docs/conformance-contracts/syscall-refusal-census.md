@@ -176,3 +176,19 @@ Signed smoke, generic probe shards, `task_cwd::sibling_processes_own_their_cwd_a
 live AArch64 child mkdirat census/gate witness remain director work. The
 reviewer's signed mkdirat observation is historical evidence, not a receipt
 for this rebased artifact. Keep the PR draft.
+
+### Terminal publication custody
+
+The run terminal owner publishes the census before delivering the result to
+CLI or embed callers. HVF does this in the existing run finalization callback,
+while the explicit carrier and persistent pool remain alive. KVM publishes
+from its terminal completion path before shutting down the pool. Shutdown no
+longer publishes a second census. Publication writes a private `.pending`
+file, syncs its contents, renames it to `.json`, and syncs the directory.
+Readers ignore pending files; an I/O failure fails terminal delivery.
+
+`smoke_terminal_census_precedes_pool_shutdown_for_two_carriers` reads each
+census immediately after a real guest terminal result, before shutdown, then
+runs a second explicit carrier in the same process. This witness is expected
+to fail against the old shutdown-only writer. It requires signed HVF execution;
+compilation and the VM-free atomic writer test do not qualify the live ordering.

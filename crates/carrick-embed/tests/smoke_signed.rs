@@ -184,3 +184,49 @@ fn smoke_fork_pipe_then_wait_reaps_child() {
         describe(&result)
     );
 }
+
+/// Terminal delivery must include durable census evidence while the explicit
+/// carrier and its persistent pool are still alive. Repeat in the same host
+/// process so a stale mapping cannot silently qualify the next carrier.
+#[test]
+fn smoke_terminal_census_precedes_pool_shutdown_for_two_carriers() {
+    let _guard = common::guest_lock();
+    let _clock = CaseClock::start("smoke_terminal_census_precedes_pool_shutdown_for_two_carriers");
+    let directory = std::path::PathBuf::from(
+        std::env::var_os("CARRICK_EL1_CENSUS").expect("signed runner enables census"),
+    );
+    std::fs::create_dir_all(&directory).unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let files = || -> std::collections::BTreeSet<std::path::PathBuf> {
+        std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .collect()
+    };
+    for round in 0..2 {
+        let before = files();
+        let carrier = common::carrier_or_fail();
+        let result = run_shell(&carrier, "exit 0");
+        assert!(result.success(), "round {round}: {}", describe(&result));
+        let after = files();
+        let added: Vec<_> = after.difference(&before).collect();
+        assert_eq!(
+            added.len(),
+            1,
+            "terminal result must publish before shutdown"
+        );
+        let census: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(added[0]).unwrap()).unwrap();
+        assert_eq!(census["el1_counters"], true);
+        assert_eq!(census["refusal_evidence"]["complete"], true);
+        runtime
+            .block_on(carrier.shutdown())
+            .expect("carrier shutdown");
+        assert_eq!(
+            files(),
+            after,
+            "shutdown must not publish a duplicate census"
+        );
+    }
+}

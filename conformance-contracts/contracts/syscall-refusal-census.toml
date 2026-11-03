@@ -6,10 +6,11 @@ semantic_authority = ["docs/conformance-contracts/syscall-refusal-census.md", "s
 fixture = "crates/carrick-el1-abi/src/refusal_census_tests.rs"
 scale_points = [1]
 structural_budgets = []
-rationale = "Ring refusal and carrier venue refusal are separate exact counters. The child population is a subset of its carrier total. Refusal hooks classify the caller through its admitted owner only on refusal and increment atomic counters; no clock reads are added to the default path. Publication scans 513 native ordinals once after executor join. Overflow and missing census evidence are incomplete measurements. Missing Docker shapes are counted coverage debt under a monotone committed-row ceiling; allowlisted refusals always fail."
+rationale = "Ring refusal and carrier venue refusal are separate exact counters. The child population is a subset of its carrier total. Refusal hooks classify the caller through its admitted owner only on refusal and increment atomic counters; no clock reads are added to the default path. Publication scans 513 native ordinals once in terminal custody before result delivery. Overflow and missing census evidence are incomplete measurements. Missing Docker shapes are counted coverage debt under a monotone committed-row ceiling; allowlisted refusals always fail."
 
 [bindings]
 vm_free = [
+  "carrick-runtime::el1_census::tests::terminal_publication_returns_a_complete_file_and_propagates_io_failure",
   "carrick-core-abi::service::tests::service_lineage_survives_ticket_intake_and_exec_rebind",
   "carrick-el1-linux::ipc::tests::native_structural_refusals_retire_without_host_handback",
   "carrick-el1-abi::refusal_census_tests::typed_refusal_records_total_and_lineage_in_the_same_carrier",
@@ -21,6 +22,7 @@ vm_free = [
   "carrick-el1-linux::native_process_runtime::host_test_support::root_exec_access_refusal_is_counted_before_service_publication",
 ]
 embed = [
+  "carrick-embed::smoke_signed::smoke_terminal_census_precedes_pool_shutdown_for_two_carriers",
   "carrick-conformance-next::generic_probe_shard_0",
   "carrick-vmm-kvm::cpl0_shared_entry::production_cpl0_refuses_non_allowlisted_forwards_with_enosys (KVM root census; does not qualify the AArch64 child mkdirat witness)",
 ]
