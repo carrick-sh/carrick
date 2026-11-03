@@ -402,3 +402,60 @@ The amended addendum 2 status after this continuation is:
 Keep the PR draft under **#1369 slice 2a: preserve owned return claims**. The
 completed split prerequisite does not establish full slice-2 acceptance or
 make the dormant prerequisites a separate landing unit.
+
+## Physical identity continuation: shared-file deduplication
+
+The physical-permit audit found that the existing shared-file index merges
+independent physical allocations into one `FrameId`. `HvfTaskState::add_alias`
+in `trap/cow_engine.rs` maps each shared-file alias with
+`OwnedHostMapping::map_shared_file`, reserves a fresh `GlobalFrameStage2Lease`,
+and registers a fresh host owner. It then calls `stage_mapping_in` with
+`inherited_frame: None`. That routine reused a frame ID solely by
+`SharedFile { device, inode, offset, length }`, while keeping the distinct
+physical lease and owner in each `InventoryExtent`.
+
+That behavior prevents the planned frame cell from naming one physical
+owner. Storing the first or last allocation's identity in the cell would
+strand backing or authorize the wrong release. Keeping every allocation
+until the logical frame's last unmap is also insufficient: one long-lived
+shared-file alias could retain every subsequently mapped-and-unmapped
+physical allocation indefinitely.
+
+The shared-file index now includes the full physical lease and exact owner
+identity. Independent physical allocations receive distinct frame IDs;
+inherited mappings keep their existing frame ID. Every insertion and removal
+uses the same key. File coherence still comes from the existing host
+`MAP_SHARED` mappings; it does not require independent physical allocations
+to share an inventory frame ID.
+
+`serial_host_shared_file_frames_follow_physical_owner_leases` drives production
+allocation, owner registration and mapping staging. It requires distinct
+frame IDs for distinct physical leases, preserves the source ID for an
+inherited alias, and checks independent retirement and stage-2 cleanup.
+Its hardware map/unmap uses the existing test stub and its kernel counts use
+the existing test authority; it does not exercise a kernel inventory commit
+or a guest. The old shared-file key contradicts the distinct-frame assertion.
+An executed red/green witness still requires macOS; cross-compilation on
+Linux is not that evidence.
+
+The independent review confirmed the shared-file collision. An initial
+review hypothesis about COW creating another frame ID for a reused physical
+compound was rejected on inspection: `guest_reservation` requires
+`fresh_destination`. This correction does not claim a global frame/physical
+bijection. Remaining producers, including structural owner-fork admission,
+must be audited, and alias publication must validate physical identity
+transactionally before the inventory can issue permits.
+
+Shared-file conditional-retirement eligibility is unchanged. Review also
+identified a pre-existing same-owner schedule requiring a dedicated witness:
+two retirements stage before either inventory apply, leaving a zero-count
+shared frame instead of a retired frame. The remainder settler requires
+absence, not zero. This continuation does not prove retirement progress for
+that schedule, nor rely on a future independent file mapping to reclaim it.
+That proof remains with the physical retirement integration.
+
+Addendum 2 status remains: A1–A3 implemented; A4's logical release and unmap
+bookkeeping implemented; B1–B3 physical identity transport, linear permits
+and two-half receipts remain; C1–C2 retirement gates remain; slice 2b
+settlement remains. The shared-file correction removes one concrete obstacle
+to B1, not those remaining requirements. Keep slice 2a draft.

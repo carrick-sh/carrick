@@ -73,3 +73,13 @@ emits the fragment events before the source unmap; its mapping-ID and receipt
 collectors include those events. This is an inventory-level proof, not execution
 of the HVF producer on this Linux runner. The physical permit and backend
 receipt requirements remain open.
+
+The physical-identity continuation also binds `kernel.fork.stage1-image`:
+`serial_host_shared_file_frames_follow_physical_owner_leases` requires distinct
+physical shared-file allocations to have distinct inventory frame IDs, while
+an inherited alias retains its source ID. Shared-file index lookup and removal
+remain logarithmic in the indexed population; the key adds exact physical
+identity without scanning mappings or MMs. The Linux semantic requirement is
+unchanged: shared-file coherence is supplied by the host `MAP_SHARED` mapping.
+This backend test stubs hardware mapping and supplies kernel reference counts;
+it does not prove neutral physical permits, signed execution, or runtime ratios.

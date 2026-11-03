@@ -31,6 +31,7 @@ vm_free = [
   "carrick-vmm-hvf::trap::user_transfer::tests::identity_publication_retains_writer_and_copies_to_exact_physical_owner",
   "carrick-vmm-hvf::trap::foreign_mm::tests::owner_selected_fork_leaf_retains_vvar_compound_for_child_bootstrap",
   "carrick-vmm-hvf::trap::owner_fork::tests::owner_fork_shared_leaves_inherit_one_exact_extent_and_keep_file_offsets",
+  "carrick-vmm-hvf::trap::frame_inventory::tests::serial_host_shared_file_frames_follow_physical_owner_leases (backend physical identity and inherited alias accounting; hardware map/unmap stubbed, not a kernel inventory or guest execution proof)",
   "carrick-el1-linux::mm_portal::tests::owner_fork_publishes_child_with_two_live_same_va_mms",
   "carrick-vmm-hvf::trap::process_plan::tests::fork_bootstrap_heap_projects_live_vmas_after_stock_return",
   "carrick-mmu-core::aarch64::tests::{live_snapshot_includes_hierarchy_allocated_by_guest_editor,recycled_live_images_do_not_reallocate_snapshot_buffers}",
