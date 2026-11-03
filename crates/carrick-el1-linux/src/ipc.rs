@@ -2126,9 +2126,8 @@ mod tests {
         w.counters.ipc_leaves[why as usize].load(Ordering::Relaxed)
     }
 
-    /// Ready zone items are reported in the guest; every case EL1 does not
-    /// serve forwards unchanged before any effect, and an undelivered
-    /// report is reported again.
+    /// Exhaust the real arena, retain admission through the shared ticket,
+    /// and wake through the production retirement adapter before retrying.
     #[test]
     fn ipc_operation_slot_busy_once_then_success() {
         use carrick_sched_core::object_wait::{OperationToken, OwnedObjectWakeEffects};

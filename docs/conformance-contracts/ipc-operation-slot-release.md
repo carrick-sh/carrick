@@ -36,3 +36,32 @@ prove neither retained poll semantics nor ARM guest execution. PollWait,
 its contract `kernel.poll.retained-wait`, oracle fixtures and the signed ARM
 `el1_memory_first_touch_stays_in_guest` confirmation belong to the next layer
 and director acceptance. No Docker timing or signed result is claimed here.
+
+## ABI compatibility
+
+`IpcRegion::finish_operation` now requires a release callback; every native
+and host caller supplies its existing scheduler completion venue. This is a
+Rust API change, with no new fields, operation kinds or IPC layout facts:
+`IPC_LAYOUT_HASH` is unchanged. The scheduler reserves a previously spare
+queue for this carrier source, adds that index to its layout facts, and
+increments `OBJECT_WAIT_PROTOCOL` from 12 to 13. Consequently the enclosing
+`EL1_ABI_LAYOUT_HASH` changes; host and guest images must be rebuilt together.
+This layer adds no PollWait payload or protocol discriminant.
+
+## Reproducing the pre-fix failure
+
+Keep the admission API and witness, but replace the single `released()` in
+`IpcRegion::finish_operation` with `let _ = released;`. This restores the
+admitted main's retirement behavior: the free-list push occurs without a
+scheduler notification. Run:
+
+```sh
+cargo test -p carrick-el1-linux --lib ipc_operation_slot_busy_once_then_success -- --test-threads=2
+```
+
+The mutation exits 101 at `actual operation retirement must wake the enrolled
+waiter` (one test failed). Restore `released()` for the green run. This is a
+production-path mutation of main's missing publication, not a claim that the
+new admission API or witness already exists on main. The witness calls the
+public `admit_operation_wait`, enrolls its shared contention ticket through
+`park_and_rerun`, then calls the same `finish` used by shipping IPC completion.
