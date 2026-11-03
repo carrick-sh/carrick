@@ -8,6 +8,14 @@
  * instead, which this script cannot see: zero events means the refusal
  * is elsewhere, never that nothing was refused (#1335).
  *
+ * Since #1530, a fork child's unclaimed syscall ordinal (an unknown or
+ * Forward-only row, including an unserved exec) is refused in ring with a
+ * counted ENOSYS (`Counters::refused`, carrick-el1-linux
+ * `native_unstaged_exit`) and never reaches the carrier, so it no longer
+ * fires this probe. The probe still fires for host file venue refusals and
+ * for root/unowned native crossings. The qualification lines below predate
+ * that change.
+ *
  * What it measures: every carrick*:::hvpatch-native-crossing-refused event,
  * counted by ordinal (AArch64 syscall number) and child mm, plus a
  * timestamped line per event.
