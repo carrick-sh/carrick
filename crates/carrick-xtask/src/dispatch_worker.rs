@@ -1492,6 +1492,162 @@ fn loop_transcript() -> Result<(), ScalerError> {
     )?;
     Ok(())
 }
+/// Bytes of a failed worker's `turn.failed` or launcher error retained in the
+/// server-written outcome observation (#1473).
+pub(crate) const WORKER_ERROR_TAIL: usize = 2048;
+
+fn json_error_text(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| {
+            value["message"]
+                .as_str()
+                .or_else(|| value["error"]["message"].as_str())
+                .or_else(|| value["error"].as_str())
+                .or_else(|| value["data"]["message"].as_str())
+                .map(str::to_owned)
+        })
+        .filter(|s| !s.trim().is_empty())
+}
+
+pub(crate) fn extract_worker_log_error(log: &str) -> Option<String> {
+    let mut turn_failed = None;
+    let mut other_error = None;
+    for line in log.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("AGY_ERROR:") {
+            let msg = rest.trim();
+            if !msg.is_empty() && other_error.is_none() {
+                other_error = Some(msg.to_owned());
+            }
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        let kind = value["type"]
+            .as_str()
+            .or_else(|| value["event"].as_str())
+            .unwrap_or_default();
+        match kind {
+            "turn.failed" => {
+                if let Some(msg) =
+                    json_error_text(&value["error"]).or_else(|| json_error_text(&value))
+                {
+                    if !matches!(
+                        msg.trim().to_ascii_lowercase().as_str(),
+                        "turn failed" | "turn.failed"
+                    ) {
+                        return Some(msg);
+                    }
+                    if turn_failed.is_none() {
+                        turn_failed = Some(msg);
+                    }
+                }
+            }
+            "error" | "session.error" => {
+                if other_error.is_none() {
+                    other_error =
+                        json_error_text(&value["error"]).or_else(|| json_error_text(&value));
+                }
+            }
+            "result" => {
+                let is_err = value["is_error"] == true
+                    || value["status"].as_str() == Some("ERROR")
+                    || value["result"]["status"].as_str() == Some("ERROR")
+                    || value["subtype"]
+                        .as_str()
+                        .is_some_and(|s| s.starts_with("error"));
+                if is_err && other_error.is_none() {
+                    other_error = json_error_text(&value["result"]["error"])
+                        .or_else(|| json_error_text(&value["error"]))
+                        .or_else(|| value["result"].as_str().map(str::to_owned))
+                        .or_else(|| {
+                            value["errors"]
+                                .as_array()
+                                .and_then(|a| a.first())
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .filter(|s| !s.trim().is_empty());
+                }
+            }
+            _ => {}
+        }
+    }
+    other_error.or(turn_failed)
+}
+
+pub(crate) fn unredacted_diagnostic_text(path: &Path) -> Result<String, ScalerError> {
+    use std::io::Read;
+    let file = crate::safe_copy::open_text(path)?;
+    let mut bytes = Vec::new();
+    file.take(TRANSCRIPT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+pub(crate) fn extract_result_error(result_path: &Path) -> Option<String> {
+    let text = unredacted_diagnostic_text(result_path).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    json_error_text(&value["error"]).or_else(|| json_error_text(&value["result"]["error"]))
+}
+
+pub(crate) fn extract_stderr_error(stderr: &str) -> Option<String> {
+    let trimmed = stderr.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(line) = trimmed
+        .lines()
+        .rev()
+        .find(|line| line.starts_with("agy-worker: "))
+    {
+        return Some(line.to_owned());
+    }
+    Some(trimmed.to_owned())
+}
+
+pub(crate) fn latest_worker_session_error(package: &Path) -> Option<String> {
+    let latest = std::fs::read_dir(package)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            let index = name
+                .strip_prefix("worker-")?
+                .strip_suffix(".jsonl")?
+                .parse::<u32>()
+                .ok()?;
+            Some((index, entry.path()))
+        })
+        .max_by_key(|(index, _)| *index)
+        .map(|(_, path)| path)?;
+    let log = unredacted_diagnostic_text(&latest).ok()?;
+    extract_worker_log_error(&log)
+}
+
+/// Redact before tail-cutting (#1458) and normalize control characters so a
+/// worker error fits on the single-line `Server observed:` record (#1473).
+pub(crate) fn format_worker_error(raw: &str, token: &str) -> String {
+    let raw = if token.is_empty() {
+        std::borrow::Cow::Borrowed(raw)
+    } else {
+        std::borrow::Cow::Owned(raw.replace(token, "[REDACTED]"))
+    };
+    let tail = crate::dispatch_redaction::redact_tail(raw.as_bytes(), WORKER_ERROR_TAIL);
+    tail.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
 fn record_worker_failure(error: &ScalerError, dispatch: &Dispatch) -> Result<(), ScalerError> {
     let state = crate::agent_runner::state()?;
     let package =
@@ -1508,6 +1664,21 @@ fn record_worker_failure(error: &ScalerError, dispatch: &Dispatch) -> Result<(),
             std::fs::remove_file(state.join("receipt.json"))?;
         }
     }
+    let token = std::env::var("GH_TOKEN").unwrap_or_default();
+    let stderr_err = unredacted_diagnostic_text(&state.join("agent.err"))
+        .ok()
+        .and_then(|err| extract_stderr_error(&err));
+    let raw_error = stderr_err.unwrap_or_else(|| error.to_string());
+    let exit_code = if error.to_string().contains("timed out") {
+        124
+    } else {
+        1
+    };
+    let _ = Applied::record(|applied| {
+        applied.last_worker_exit = Some(LauncherExit::from_code(exit_code));
+        applied.last_worker_error =
+            Some(format_worker_error(&raw_error, &token)).filter(|err| !err.is_empty());
+    });
     let contract = Contract {
         loop_summary: None,
         status: ContractStatus::Failed,
@@ -3824,6 +3995,8 @@ fn produce(
         String::new()
     };
     let mut diffstat = String::new();
+    let mut worker_error =
+        (setup != "success/success").then(|| format!("Worker setup did not complete: {setup}"));
     if setup == "success/success" {
         let preparation_commands = dispatch.loop_deadline.map(CommandWindow::until);
         host.initialize()?;
@@ -3875,6 +4048,22 @@ fn produce(
         timed_phase("worker.hand_back", || host.hand_back(&actor))?;
         let (_, evidence) = read_result(&actor.join("result.json"));
         record_worker_session(&actor.join("runtime/dispatch/worker.log"), &package)?;
+        let agent_error = result.as_ref().err().map(ToString::to_string);
+        worker_error = unredacted_diagnostic_text(&actor.join("runtime/dispatch/worker.log"))
+            .ok()
+            .and_then(|log| extract_worker_log_error(&log))
+            .or_else(|| extract_result_error(&actor.join("result.json")))
+            .or_else(|| {
+                unredacted_diagnostic_text(&actor.join("runtime/dispatch/worker.err"))
+                    .ok()
+                    .and_then(|err| extract_stderr_error(&err))
+            })
+            .or_else(|| {
+                unredacted_diagnostic_text(&state.join("agent.err"))
+                    .ok()
+                    .and_then(|err| extract_stderr_error(&err))
+            })
+            .or(agent_error);
         let prior_raw = std::mem::take(&mut raw);
         raw.push_str(&evidence);
         for name in ["runtime/dispatch/worker.log", "runtime/dispatch/worker.err"] {
@@ -3916,6 +4105,16 @@ fn produce(
         });
         candidate = Some(staging);
     }
+    let token = std::env::var("GH_TOKEN").unwrap_or_default();
+    let recorded_error = (contract.status == ContractStatus::Failed)
+        .then_some(worker_error)
+        .flatten()
+        .map(|err| format_worker_error(&err, &token))
+        .filter(|err| !err.is_empty());
+    let _ = Applied::record(|applied| {
+        applied.last_worker_exit = Some(LauncherExit::from_code(code));
+        applied.last_worker_error = recorded_error;
+    });
     std::fs::write(package.join("raw.log"), &raw)?;
     let transcript = format!(
         "# Dispatch issue {}\n\n{}\n\nTests (agent claims):\n{}\n\nRisks:\n{}\n",
@@ -4226,6 +4425,13 @@ struct Applied {
     /// publish `.github/workflows/*` (#1241); the owner publishes them.
     #[serde(default)]
     workflow_left_out: Vec<String>,
+    /// How the last worker's launcher ended (#1473).
+    #[serde(default)]
+    pub(crate) last_worker_exit: Option<LauncherExit>,
+    /// The last worker's `turn.failed` or launcher error message, redacted
+    /// and tail-limited (#1473).
+    #[serde(default)]
+    pub(crate) last_worker_error: Option<String>,
 }
 impl Applied {
     fn load() -> Result<Self, ScalerError> {

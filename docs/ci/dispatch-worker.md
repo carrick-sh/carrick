@@ -547,7 +547,10 @@ records a failed result and its reason for every admitted worker whose setup,
 fetch, review read, harvest, contract parsing or retirement fails.
 Only the last admitted worker governs this floor; an earlier failed attempt
 does not invalidate a later successful worker. The server
-verdict and evidence appear first; the loop's claimed status and summary are
+verdict and evidence appear first, including the last failed worker's exit
+status and `turn.failed`/launcher error message (redacted before cutting to a
+2 KiB tail) and a flag when `loop_summary` names a cause absent from the
+worker's error; the loop's claimed status and summary are
 quoted below them. A successful worker that adds a normal commit on top of a
 checkpoint clears the floor. The checkpoint commit remains in the published
 history.
