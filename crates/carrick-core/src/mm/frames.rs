@@ -394,6 +394,7 @@ pub fn apply_grant<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
 )]
 pub struct FrameReferences {
     mapping_count: u32,
+    claimed_count: u32,
     retire_on_last_unmap: bool,
 }
 #[derive(
@@ -433,6 +434,9 @@ impl FrameReferences {
         Ok(())
     }
     pub fn unmap(&mut self) -> Result<bool, ReferenceError> {
+        if self.mapping_count == self.claimed_count {
+            return Err(ReferenceError::Underflow);
+        }
         self.mapping_count = self
             .mapping_count
             .checked_sub(1)
@@ -448,5 +452,206 @@ impl FrameReferences {
             self.retire_on_last_unmap = true;
             ReferenceRetirement::Deferred
         }
+    }
+}
+
+/// Stable inventory-owned storage. Implementations must always access the same
+/// counter, including after `Clone`, and serialize access with the inventory
+/// transaction lock. Overlays may copy `FrameReferences`; they must update this cell only at commit.
+pub trait FrameReferenceCell: Clone {
+    fn with_references<R>(&self, update: impl FnOnce(&mut FrameReferences) -> R) -> R;
+}
+
+/// An owned unit of one stable inventory counter, outside copied overlay rows.
+/// There is no API accepting a token and a second counter: every operation
+/// consumes the token's own cell.
+/// ```compile_fail
+/// fn cannot_duplicate<C: carrick_core::mm::frames::FrameReferenceCell>(
+///     reference: carrick_core::mm::frames::FrameRef<C>,
+/// ) { let _ = reference.clone(); }
+/// ```
+#[must_use]
+pub struct FrameRef<C: FrameReferenceCell> {
+    cell: C,
+}
+impl<C: FrameReferenceCell> FrameRef<C> {
+    pub fn claim(cell: C) -> Result<Self, ReferenceError> {
+        cell.with_references(|references| {
+            if references.mapping_count == references.claimed_count {
+                return Err(ReferenceError::Underflow);
+            }
+            references.claimed_count += 1;
+            Ok(())
+        })?;
+        Ok(Self { cell })
+    }
+    pub fn restore(self) {
+        self.cell
+            .with_references(|references| references.claimed_count -= 1);
+    }
+    pub fn release(self, policy: ReferenceReleasePolicy) -> ReferenceRelease {
+        self.cell.with_references(|references| {
+            references.claimed_count -= 1;
+            references.mapping_count -= 1;
+            references.retire_on_last_unmap |= policy == ReferenceReleasePolicy::RetireIfLast;
+            match (references.mapping_count, references.retire_on_last_unmap) {
+                (0, true) => ReferenceRelease::Last,
+                (0, false) => ReferenceRelease::Zero,
+                _ => ReferenceRelease::Shared,
+            }
+        })
+    }
+    /// Replace one owned unit with `pieces` owned units in the same cell.
+    /// Failure returns the original unit without changing the counter.
+    pub fn split(self, pieces: core::num::NonZeroU32) -> Result<alloc::vec::Vec<Self>, Self> {
+        let extra = pieces.get() - 1;
+        let mut units = alloc::vec::Vec::new();
+        if units.try_reserve_exact(pieces.get() as usize).is_err() {
+            return Err(self);
+        }
+        let accepted = self.cell.with_references(|references| {
+            let Some(count) = references.mapping_count.checked_add(extra) else {
+                return false;
+            };
+            references.mapping_count = count;
+            references.claimed_count += extra;
+            true
+        });
+        if !accepted {
+            return Err(self);
+        }
+        for _ in 0..extra {
+            units.push(Self {
+                cell: self.cell.clone(),
+            });
+        }
+        units.push(self);
+        Ok(units)
+    }
+}
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub enum ReferenceReleasePolicy {
+    IfRequested,
+    RetireIfLast,
+}
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub enum ReferenceRelease {
+    Shared,
+    Zero,
+    Last,
+}
+
+#[cfg(test)]
+mod frame_ref_tests {
+    use super::*;
+    use alloc::sync::Arc;
+    use parking_lot::Mutex;
+
+    #[derive(::core::clone::Clone)]
+    struct Cell(Arc<Mutex<FrameReferences>>);
+    impl FrameReferenceCell for Cell {
+        fn with_references<R>(&self, update: impl FnOnce(&mut FrameReferences) -> R) -> R {
+            update(&mut self.0.lock())
+        }
+    }
+    fn retained() -> Cell {
+        let cell = Cell(Arc::new(Mutex::new(FrameReferences::default())));
+        cell.0.lock().retain().unwrap();
+        cell
+    }
+    #[test]
+    fn owned_reference_blocks_unmap_and_restore_keeps_the_retained_unit() {
+        let cell = retained();
+        let claim = FrameRef::claim(cell.clone()).unwrap();
+        assert_eq!(cell.0.lock().unmap(), Err(ReferenceError::Underflow));
+        assert!(FrameRef::claim(cell.clone()).is_err());
+        claim.restore();
+        assert_eq!(cell.0.lock().count(), 1);
+        assert_eq!(cell.0.lock().unmap(), Ok(false));
+    }
+    #[test]
+    fn owned_release_distinguishes_zero_and_requested_last() {
+        for requested in [false, true] {
+            let cell = retained();
+            let claim = FrameRef::claim(cell.clone()).unwrap();
+            if requested {
+                assert_eq!(
+                    cell.0.lock().request_retirement(),
+                    ReferenceRetirement::Deferred
+                );
+            }
+            assert_eq!(
+                claim.release(ReferenceReleasePolicy::IfRequested),
+                if requested {
+                    ReferenceRelease::Last
+                } else {
+                    ReferenceRelease::Zero
+                }
+            );
+            assert_eq!(cell.0.lock().count(), 0);
+        }
+        let claim = FrameRef::claim(retained()).unwrap();
+        assert_eq!(
+            claim.release(ReferenceReleasePolicy::RetireIfLast),
+            ReferenceRelease::Last
+        );
+    }
+    #[test]
+    fn split_claim_releases_shared_until_the_last_sibling() {
+        let cell = retained();
+        let claim = FrameRef::claim(cell.clone()).unwrap();
+        cell.0.lock().request_retirement();
+        let mut pieces = claim
+            .split(core::num::NonZeroU32::new(3).unwrap())
+            .ok()
+            .unwrap();
+        assert_eq!(cell.0.lock().count(), 3);
+        assert_eq!(
+            pieces
+                .pop()
+                .unwrap()
+                .release(ReferenceReleasePolicy::IfRequested),
+            ReferenceRelease::Shared
+        );
+        assert_eq!(
+            pieces
+                .pop()
+                .unwrap()
+                .release(ReferenceReleasePolicy::IfRequested),
+            ReferenceRelease::Shared
+        );
+        assert_eq!(
+            pieces
+                .pop()
+                .unwrap()
+                .release(ReferenceReleasePolicy::IfRequested),
+            ReferenceRelease::Last
+        );
+    }
+    #[test]
+    fn overflowing_split_returns_the_unchanged_owned_unit() {
+        let cell = retained();
+        let claim = FrameRef::claim(cell.clone()).unwrap();
+        // Exercise the full u32 counter capacity without allocating its rows.
+        cell.0.lock().mapping_count = u32::MAX;
+        let claim = claim
+            .split(core::num::NonZeroU32::new(2).unwrap())
+            .err()
+            .unwrap();
+        assert_eq!(cell.0.lock().count(), u32::MAX);
+        claim.restore();
+        assert_eq!(cell.0.lock().claimed_count, 0);
     }
 }

@@ -26,3 +26,19 @@ The release join also retains `FrameInventoryOrigin` at construction. The
 foreign-inventory witness first failed to compile because the constructor
 accepted no issuing authority; it now refuses a foreign receipt with identical
 numeric fields and accepts the intended issuer without losing the journal.
+
+
+The owned-reference continuation replaces frame re-lookup at claimed apply with
+`FrameRef`, paired to its stable counter cell. Overlay commits update that same
+cell; they do not copy an owned token. Reference units are counted by
+`PrepareMapping` before publication; a failed overlay discards its tentative
+unit. Claimed release preserves `Shared`, `Zero`, and requested `Last` semantics.
+`FrameRef::split` preserves a pending retirement request across its pieces.
+Ordinary event-based mapping splits still need conversion to that owned API.
+
+The new overlay witness invokes production `prepare_return` and inventory
+publication: an injected failure after alias prepare leaves one reference,
+a successful sibling publication preserves the cell, the claim releases as
+shared, and sibling teardown retires the frame. The alias-after-last witness
+requires `UnreservedFrame`, with no republished row. These are logical inventory
+witnesses; no stage-2 permit or backend release is established by them.

@@ -9,7 +9,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroU64;
 use std::time::Instant;
 
-use carrick_fatal::carrick_fatal;
 use carrick_guest_mem::Gpa;
 use carrick_hal::{
     FrameEventCapacity, FrameId, FrameInventoryApplyReceipt, FrameInventoryBatch,
@@ -322,8 +321,27 @@ struct ReservationRecord {
     mappings: Vec<MappingId>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 struct FrameEntry {
+    length: FrameLength,
+    references: std::sync::Arc<Mutex<carrick_core::mm::frames::FrameReferences>>,
+}
+impl PartialEq for FrameEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.snapshot() == other.snapshot()
+    }
+}
+impl Eq for FrameEntry {}
+impl FrameEntry {
+    fn snapshot(&self) -> FrameSnapshot {
+        FrameSnapshot {
+            length: self.length,
+            references: *self.references.lock(),
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FrameSnapshot {
     length: FrameLength,
     references: carrick_core::mm::frames::FrameReferences,
 }
@@ -426,13 +444,13 @@ fn decrement_mm_mapping_count(counts: &mut BTreeMap<FrameOwner, usize>, mm: Fram
 
 struct InventoryOverlay<'a> {
     base: &'a InventoryState,
-    frames: BTreeMap<FrameId, Option<FrameEntry>>,
+    frames: BTreeMap<FrameId, Option<FrameSnapshot>>,
     mappings: BTreeMap<MappingId, Option<MappingEntry>>,
     last_unmapped: BTreeMap<FrameId, MappingGeneration>,
 }
 
 struct InventoryChanges {
-    frames: BTreeMap<FrameId, Option<FrameEntry>>,
+    frames: BTreeMap<FrameId, Option<FrameSnapshot>>,
     mappings: BTreeMap<MappingId, Option<MappingEntry>>,
 }
 
@@ -450,7 +468,11 @@ impl<'a> InventoryOverlay<'a> {
         match self.mappings.get(&mapping) {
             Some(Some(entry)) => Some(entry),
             Some(None) => None,
-            None => self.base.mappings.get(&mapping).and_then(MappingSlot::live),
+            None => self
+                .base
+                .mappings
+                .get(&mapping)
+                .and_then(|slot| slot.live()),
         }
     }
 
@@ -471,23 +493,22 @@ impl<'a> InventoryOverlay<'a> {
         self.last_unmapped.insert(frame, generation);
     }
 
-    fn frame(&self, frame: FrameId) -> Option<&FrameEntry> {
+    fn frame(&self, frame: FrameId) -> Option<FrameSnapshot> {
         match self.frames.get(&frame) {
-            Some(Some(entry)) => Some(entry),
-            Some(None) => None,
-            None => self.base.frames.get(&frame),
+            Some(entry) => *entry,
+            None => self.base.frames.get(&frame).map(FrameEntry::snapshot),
         }
     }
 
-    fn frame_mut(&mut self, frame: FrameId) -> Option<&mut FrameEntry> {
+    fn frame_mut(&mut self, frame: FrameId) -> Option<&mut FrameSnapshot> {
         if !self.frames.contains_key(&frame) {
-            let entry = *self.base.frames.get(&frame)?;
+            let entry = self.base.frames.get(&frame)?.snapshot();
             self.frames.insert(frame, Some(entry));
         }
         self.frames.get_mut(&frame)?.as_mut()
     }
 
-    fn insert_frame(&mut self, frame: FrameId, entry: FrameEntry) {
+    fn insert_frame(&mut self, frame: FrameId, entry: FrameSnapshot) {
         self.frames.insert(frame, Some(entry));
     }
 
@@ -649,7 +670,7 @@ impl FrameInventoryAuthority {
             let entry = state
                 .mappings
                 .get(&mapping)
-                .and_then(MappingSlot::live)
+                .and_then(|slot| slot.live())
                 .ok_or(FrameInventoryError::RollbackReceiptMismatch(mapping))?;
             if !entry.state.is_published() || entry.mm != mm || entry.frame != frame {
                 return Err(FrameInventoryError::RollbackReceiptMismatch(mapping));
@@ -658,7 +679,7 @@ impl FrameInventoryAuthority {
                 .frames
                 .get(&frame)
                 .ok_or(FrameInventoryError::RollbackReceiptMismatch(mapping))?;
-            if frame_entry.references.count() == 0 {
+            if frame_entry.references.lock().count() == 0 {
                 return Err(FrameInventoryError::MappingCountUnderflow(frame));
             }
         }
@@ -676,9 +697,10 @@ impl FrameInventoryAuthority {
                     .ok_or(FrameInventoryError::RollbackReceiptMismatch(mapping))?;
                 frame_entry
                     .references
+                    .lock()
                     .unmap()
                     .map_err(|_| FrameInventoryError::MappingCountUnderflow(frame))?;
-                frame_entry.references.count() == 0
+                frame_entry.references.lock().count() == 0
             };
             if retire_frame {
                 state.frames.remove(&frame);
@@ -916,9 +938,18 @@ impl FrameInventoryAuthority {
         let changes = candidate.into_changes();
         for (frame, entry) in changes.frames {
             match entry {
-                Some(entry) => {
-                    state.frames.insert(frame, entry);
-                }
+                Some(entry) => match state.frames.get_mut(&frame) {
+                    Some(cell) => *cell.references.lock() = entry.references,
+                    None => {
+                        state.frames.insert(
+                            frame,
+                            FrameEntry {
+                                length: entry.length,
+                                references: std::sync::Arc::new(Mutex::new(entry.references)),
+                            },
+                        );
+                    }
+                },
                 None => {
                     state.frames.remove(&frame);
                 }
@@ -967,7 +998,7 @@ impl FrameInventoryAuthority {
         let entry = state
             .mappings
             .get(&mapping)
-            .and_then(MappingSlot::live)
+            .and_then(|slot| slot.live())
             .filter(|entry| entry.mm == mm && entry.state.is_published())?;
         Some(MappingRow {
             mapping,
@@ -1024,7 +1055,7 @@ impl FrameInventoryAuthority {
         state
             .mappings
             .get(&mapping)
-            .and_then(MappingSlot::live)
+            .and_then(|slot| slot.live())
             .filter(|entry| {
                 entry.state.is_published()
                     && entry.mm == mm
@@ -1079,7 +1110,7 @@ impl FrameInventoryAuthority {
         state
             .frames
             .get(&frame)
-            .map(|entry| entry.references.count() as usize)
+            .map(|entry| entry.references.lock().count() as usize)
     }
 
     /// Query extent liveness for a batch of candidate extents and reference
@@ -1098,7 +1129,7 @@ impl FrameInventoryAuthority {
                 state
                     .mappings
                     .get(&target_map)
-                    .and_then(MappingSlot::live)
+                    .and_then(|slot| slot.live())
                     .is_some_and(|entry| {
                         entry.state.is_published()
                             && entry.mm == mm
@@ -1114,7 +1145,7 @@ impl FrameInventoryAuthority {
                 state
                     .frames
                     .get(&frame)
-                    .map(|entry| entry.references.count() as usize)
+                    .map(|entry| entry.references.lock().count() as usize)
             })
             .collect();
         (extent_liveness, frame_counts)
@@ -1234,7 +1265,7 @@ fn apply_event(
                 }
                 state.insert_frame(
                     frame,
-                    FrameEntry {
+                    FrameSnapshot {
                         length,
                         references: carrick_core::mm::frames::FrameReferences::default(),
                     },
@@ -1365,7 +1396,7 @@ fn apply_event(
         FrameInventoryEvent::RetireFrameIfLastUnmap {
             frame, generation, ..
         } => {
-            let outcome = match state.frame(frame).copied() {
+            let outcome = match state.frame(frame) {
                 // An earlier holder's pending retirement already ran in this
                 // batch's last unmap, or another holder's batch retired it.
                 None => ConditionalRetirement::AlreadyRetired,
@@ -1724,7 +1755,7 @@ impl FrameInventoryAuthority {
             .lock()
             .mappings
             .get(&mapping)
-            .and_then(MappingSlot::live)
+            .and_then(|slot| slot.live())
             .is_some_and(|entry| {
                 entry.state.is_published()
                     && entry.mm == mm
@@ -4780,7 +4811,12 @@ mod inventory_origin_tests {
 }
 
 mod claimed_return {
-    use super::*;
+    use super::{
+        BTreeSet, FrameId, FrameInventoryApplyReceipt, FrameInventoryAuthority,
+        FrameInventoryProvenance, FrameInventoryReserveError, FrameOwner, KernelTransactionId,
+        MappingEntry, MappingId, MappingRow, MappingSlot, MappingState, Mutex, ObjectIdRegistry,
+        decrement_mm_mapping_count, next_generation,
+    };
 
     /// Only claim preparation can replace a live row with this placeholder.
     #[derive(Debug, Eq, PartialEq)]
@@ -4792,9 +4828,21 @@ mod claimed_return {
             self.row
         }
     }
+    #[derive(Clone)]
+    struct ClaimFrameCell(std::sync::Arc<Mutex<carrick_core::mm::frames::FrameReferences>>);
+    impl carrick_core::mm::frames::FrameReferenceCell for ClaimFrameCell {
+        fn with_references<R>(
+            &self,
+            update: impl FnOnce(&mut carrick_core::mm::frames::FrameReferences) -> R,
+        ) -> R {
+            update(&mut self.0.lock())
+        }
+    }
+    type FrameRef = carrick_core::mm::frames::FrameRef<ClaimFrameCell>;
     struct ClaimedRow {
         id: MappingId,
         entry: MappingEntry,
+        reference: FrameRef,
     }
     enum ReturnDisposition {
         Prepared,
@@ -4816,6 +4864,7 @@ mod claimed_return {
         fn restore(&mut self, abandoned: bool) {
             let mut state = self.inventory.state.lock();
             for row in self.rows.drain(..) {
+                row.reference.restore();
                 state.mappings.insert(row.id, MappingSlot::Live(row.entry));
             }
             state.return_claims -= 1;
@@ -4854,23 +4903,14 @@ mod claimed_return {
             let mut state = self.inventory.state.lock();
             for row in self.rows.drain(..) {
                 state.mappings.remove(&row.id);
-                let row = row.entry;
                 decrement_mm_mapping_count(&mut state.mm_mapping_counts, self.mm);
-                if let Some(frame) = state.frames.get_mut(&row.frame) {
-                    if frame.references.unmap().is_err() {
-                        carrick_fatal!(
-                            "kernel::frame_inventory",
-                            "prepared return reference count underflow"
-                        );
-                    }
-                    if frame.references.count() == 0 {
-                        state.frames.remove(&row.frame);
-                        last_unmapped.push(row.frame);
-                    } else {
-                        let _ = frame.references.request_retirement();
-                    }
-                } else {
-                    carrick_fatal!("kernel::frame_inventory", "prepared return lost its frame");
+                if row
+                    .reference
+                    .release(carrick_core::mm::frames::ReferenceReleasePolicy::RetireIfLast)
+                    == carrick_core::mm::frames::ReferenceRelease::Last
+                {
+                    state.frames.remove(&row.entry.frame);
+                    last_unmapped.push(row.entry.frame);
                 }
             }
             state.return_claims -= 1;
@@ -4947,6 +4987,10 @@ mod claimed_return {
                     generation: next_generation(row.generation).map_err(|_| Error::RowMismatch)?,
                 });
             }
+            let mut references = Vec::new();
+            references
+                .try_reserve_exact(rows.len())
+                .map_err(|_| Error::Capacity)?;
             let mut state = self.state.lock();
             state
                 .revision
@@ -4958,7 +5002,7 @@ mod claimed_return {
                 let entry = state
                     .mappings
                     .get(&row.mapping)
-                    .and_then(MappingSlot::live)
+                    .and_then(|slot| slot.live())
                     .ok_or(Error::RowMismatch)?;
                 let published = match entry.state {
                     MappingState::Published => true,
@@ -4972,11 +5016,29 @@ mod claimed_return {
                     || entry.gpa != row.gpa
                     || entry.length != row.length
                     || row.generation.raw() == u64::MAX
+                    || !state.frames.contains_key(&row.frame)
                 {
                     return Err(Error::RowMismatch);
                 }
             }
             for row in rows {
+                let cell = state
+                    .frames
+                    .get(&row.frame)
+                    .ok_or(Error::RowMismatch)?
+                    .references
+                    .clone();
+                match FrameRef::claim(ClaimFrameCell(cell)) {
+                    Ok(reference) => references.push(reference),
+                    Err(_) => {
+                        for reference in references {
+                            FrameRef::restore(reference);
+                        }
+                        return Err(Error::RowMismatch);
+                    }
+                }
+            }
+            for (row, reference) in rows.iter().zip(references) {
                 if let Some(slot) = state.mappings.get_mut(&row.mapping)
                     && let MappingSlot::Live(entry) = slot
                 {
@@ -4994,6 +5056,7 @@ mod claimed_return {
                     retained_rows.push(ClaimedRow {
                         id: row.mapping,
                         entry,
+                        reference,
                     });
                 }
             }
@@ -5064,6 +5127,93 @@ mod prepared_return_tests {
             .unwrap();
         inventory.apply(owner, reservation.commit(())).unwrap();
         (inventory, ids, owner, row)
+    }
+    fn alias_commit(
+        inventory: &FrameInventoryAuthority,
+        ids: &ObjectIdRegistry,
+        row: carrick_hal::ExactReturnMappingRow,
+    ) -> FrameInventoryCommit<()> {
+        let mut reservation = inventory
+            .reserve(ids, 0, 1, FrameEventCapacity::for_event_count(2).unwrap())
+            .unwrap();
+        let transaction = reservation.transaction();
+        let mapping = reservation.claim_mapping().unwrap();
+        reservation
+            .push(FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame: row.frame,
+                mapping,
+                generation: row.generation,
+                gpa: row.gpa,
+                length: row.length,
+                permissions: MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation: row.generation,
+            })
+            .unwrap();
+        reservation.commit(())
+    }
+    #[test]
+    fn overlay_alias_preserves_the_claim_cell_and_failed_prepare_returns_its_unit() {
+        let (inventory, ids, owner, row) = fixture();
+        let sibling = FrameOwner::HostMm(MmId::from_raw_u64(43).unwrap());
+        let cell = inventory
+            .state
+            .lock()
+            .frames
+            .get(&row.frame)
+            .unwrap()
+            .references
+            .clone();
+        let claim = inventory.prepare_return(&ids, owner, &[row]).unwrap();
+        let failed = alias_commit(&inventory, &ids, row);
+        assert_eq!(
+            inventory
+                .apply_inner(sibling, failed, Some(1), None)
+                .unwrap_err(),
+            FrameInventoryError::InjectedFailure(1)
+        );
+        assert_eq!(inventory.frame_mapping_count(row.frame), Some(1));
+        let alias = alias_commit(&inventory, &ids, row);
+        inventory.apply(sibling, alias).unwrap();
+        assert_eq!(inventory.frame_mapping_count(row.frame), Some(2));
+        assert!(Arc::ptr_eq(
+            &cell,
+            &inventory
+                .state
+                .lock()
+                .frames
+                .get(&row.frame)
+                .unwrap()
+                .references
+        ));
+        assert!(claim.apply().last_unmapped.is_empty());
+        assert_eq!(inventory.frame_mapping_count(row.frame), Some(1));
+        assert_eq!(inventory.retire_mm(&ids, sibling).unwrap(), 1);
+        assert_eq!(inventory.frame_mapping_count(row.frame), None);
+    }
+    #[test]
+    fn alias_after_last_return_cannot_republish_the_retired_frame() {
+        let (inventory, ids, owner, row) = fixture();
+        let sibling = FrameOwner::HostMm(MmId::from_raw_u64(43).unwrap());
+        let staged_alias = alias_commit(&inventory, &ids, row);
+        let claim = inventory.prepare_return(&ids, owner, &[row]).unwrap();
+        assert_eq!(claim.apply().last_unmapped, vec![row.frame]);
+        assert_eq!(
+            inventory.apply(sibling, staged_alias).unwrap_err(),
+            FrameInventoryError::UnreservedFrame(row.frame)
+        );
+        assert_eq!(inventory.frame_mapping_count(row.frame), None);
+        assert!(inventory.snapshot_for_mm(sibling).mappings.is_empty());
     }
     #[test]
     fn completion_drops_quarantine_outside_inventory_lock() {

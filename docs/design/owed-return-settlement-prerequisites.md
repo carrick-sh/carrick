@@ -275,3 +275,38 @@ of adding an invariant-fatal branch; the CPL0 cleanup callers refuse a failed
 conversion before invoking release. This removes that fatal site, but is not
 the proposed admission-time retained `ReturnOwner`. Existing fork-stock
 execution contexts already carry the typed owner used at release.
+
+
+## Owned-reference continuation on admitted main 9bc605a1bd
+
+The two explicit fatal sites in claimed apply were **new against main**, not
+carried over. This continuation removes both, without a ceiling change. A
+claim now owns a `FrameRef` containing its stable counter cell, outside copied
+mapping and frame snapshots. Overlay publication updates the existing cell.
+There is no API that accepts a reference token together with a different
+counter. Ordinary unmap cannot consume a claimed unit. Restore gives that unit
+back; apply consumes it and preserves the existing unmap generation, provenance,
+revision, and MM-count bookkeeping.
+
+The neutral counter provides an owned `split` with checked headroom and
+preallocated output, plus `Shared`, `Zero`, and `Last` release outcomes. This
+is not yet the required conversion of every event-based COW/munmap split.
+Integrating a fallible split into a multi-frame commit would be wrong: all
+split storage and headroom must be prepared before the first publication.
+
+Remaining implementation work is explicit, not awaiting an owner ruling:
+
+- Connect owned splitting to the production mapping split paths.
+- Carry physical IPA and host-owner generation into the inventory frame cell;
+  mapping generation cannot substitute for that identity.
+- Issue linear retirement permits and consume them into the backend half of
+  the two-half MM release receipt after inventory locking ends.
+- Gate `NativeFrameBacking::Drop`, `commit_cow_inventory_split`, and
+  `retire_stage2_candidate_if_unreferenced` against the kernel inventory.
+- Complete slice 2b's neutral settlement routine and minimal host-root port.
+
+The stable cell adds one allocation and a small lock per frame. The reference
+operations remain constant-time and the overlay remains proportional to touched
+rows; runtime overhead has not been measured. The independent review found and
+prompted removal of an earlier unbound public counter token; it did not approve
+the unimplemented physical-retirement work. Keep the PR draft.
