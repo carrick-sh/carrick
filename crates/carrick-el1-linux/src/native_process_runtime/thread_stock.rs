@@ -321,7 +321,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             let parked = carrick_core::wait::park_object_record(
                 zone,
                 self.source.slot,
-                carrick_core::wait::ObjectParkRequest::owner(key, token, OwnerEntry::Syscall),
+                carrick_core::wait::ObjectParkRequest::owner(
+                    key,
+                    token,
+                    OwnerEntry::Syscall,
+                    // SAFETY: the save_context closure below re-reads the
+                    // stock's Reserved and recyclable identities and arms
+                    // their release under this same object queue.
+                    unsafe {
+                        carrick_core::wait::OwnerProbeUnderQueueLock::for_save_context_probe()
+                    },
+                ),
                 &|owned| crate::sched::object_wait::deliver_host_completion(zone, owned),
                 || {
                     let mut graph = self.runtime.graph.lock();
@@ -464,9 +474,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             stock.waiters.retain(|record| *record != self.record);
         }
     }
+    /// Resume a clone caller parked on the thread stock, or report no
+    /// pending work. Out of line: the resume checkpoint frame is charged on
+    /// the EL1 native backing-reply chain.
+    #[inline(never)]
     pub(super) fn resume_thread_stock_wait(
         &mut self,
-    ) -> Result<Option<NativeResume>, NativeProcessError> {
+    ) -> Result<NativeResume, carrick_core_abi::NativeRunFailureReason> {
+        self.take_thread_stock_wait()
+            .map(|resumed| resumed.unwrap_or(NativeResume::NoPending))
+            .map_err(NativeProcessError::run_failure_reason)
+    }
+    fn take_thread_stock_wait(&mut self) -> Result<Option<NativeResume>, NativeProcessError> {
         let key = {
             let graph = self.runtime.graph.lock();
             let task = graph
