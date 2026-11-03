@@ -3872,8 +3872,9 @@ fn interrupt_parked_futex_rechecks_claim_after_futex_enrollment() {
     assert_eq!(selected.result.map(|value| value as i64), Some(-4));
 }
 
-/// A native process's freshly allocated thread birth: generation 0 with a
-/// lifecycle page and control slot (an unadopted birth), owned by the ring.
+/// A native process's freshly allocated thread birth (generation 0 with a
+/// lifecycle page and control slot), committed to the ring the way
+/// `serve_clone` does: issued and native-owned before it is runnable.
 fn native_birth(zone: &ZoneTables, tid: u64) -> RecordId {
     let id = zone
         .alloc_record(ThreadIdentity {
@@ -3883,9 +3884,42 @@ fn native_birth(zone: &ZoneTables, tid: u64) -> RecordId {
             ..identity(tid)
         })
         .unwrap();
-    assert!(zone.mark_native_owned(id));
     assert!(zone.record(id).is_unadopted_birth());
+    assert!(
+        !zone.mark_native_owned(id),
+        "a native owner never adopts a generation-0 birth"
+    );
+    assert!(zone.issue_native_birth(id));
+    assert_eq!(
+        zone.record(id).identity().generation,
+        FIRST_EXECUTION_GENERATION
+    );
+    assert!(!zone.record(id).is_unadopted_birth());
+    assert!(zone.record(id).has_native_execution_owner());
     id
+}
+
+/// #1100: the native birth issuer refuses anything but a fresh, unpublished
+/// unadopted birth, so it can never re-issue a live execution.
+#[test]
+fn native_birth_issuer_refuses_issued_or_published_records() {
+    let zone = zone();
+    host_publish(&zone, SLOT, 0, Some(0), 0);
+    zone.enter_guest(SLOT);
+    let issued = zone.alloc_record(identity(5)).unwrap();
+    assert!(!zone.issue_native_birth(issued), "already issued");
+    let born = zone
+        .alloc_record(ThreadIdentity {
+            generation: 0,
+            lifecycle_page: 1,
+            control_slot: 1,
+            ..identity(6)
+        })
+        .unwrap();
+    assert!(zone.requeue_preempted(SLOT, born).is_queued());
+    assert!(!zone.issue_native_birth(born), "already published");
+    assert!(zone.record(born).is_unadopted_birth());
+    assert!(!zone.record(born).is_native_owned());
 }
 
 /// #1100: a native fork child's thread birth has no host thread for an

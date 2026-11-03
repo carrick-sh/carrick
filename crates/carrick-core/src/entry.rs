@@ -476,6 +476,13 @@ pub fn terminal_matches<C: EntryContext>(
 /// ```
 const _: () = ();
 
+// A native birth's issuer (`ZoneTables::issue_native_birth`) and native fork
+// publication name the same first execution generation (#1100).
+const _: () = assert!(
+    carrick_sched_core::FIRST_EXECUTION_GENERATION
+        == carrick_core_abi::SnapshotGeneration::INITIAL.raw()
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
