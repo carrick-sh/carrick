@@ -1,6 +1,6 @@
 {
   "director_repository": "carrick-sh/agy-director",
-  "director_sha": "323380096c5c9988c094ff4c461d59459c68e4a2",
+  "director_sha": "1f5e6f71d8bc943d3b2f805febcf4a4259e28771",
   "agy_models_seed": [
     "gemini-4-argon-medium",
     "gemini-4-argon-high",

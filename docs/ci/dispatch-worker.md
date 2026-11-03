@@ -443,9 +443,9 @@ publish and board tokens (#1034). Its fixed grant is `contents: read` on that
 one repository, one mint per job, held in the controller ledger and revoked
 when the clone is reaped. A refused or unanswered request fails bootstrap; no
 other token is tried. The workflow provisions every available
-worker credential: `CODEX_AUTH_JSON` and `AGY_OAUTH_TOKEN`. Worker-private homes
+worker credential: `CODEX_AUTH_JSON`, `AGY_OAUTH_TOKEN` and `COPILOT_TOKEN`. Worker-private homes
 contain only the selected backend’s credential subtree. The runner-private
-capacity-query home retains both; the separate loop home holds only agy auth.
+capacity-query home retains every backend's; the separate loop home holds only agy auth.
 Exactly one Codex app-server uses a codex worker's `CODEX_HOME`: the launcher
 gets the admitting capacity report's live roster as `CODEX_MODELS`, so it does
 not start a second app-server to list models before the turn. A second live
@@ -458,9 +458,9 @@ retires, so it shares neither state nor filesystem with the actor tree
 commits only when the agent's copy replaces it, bounded by the worker window;
 hand-back regroups only a committed tree, so a failed hand-over is harvested
 as the runner's tree under the worker's named failure.
-Codex can be absent; agy is required for the loop. These repository secrets are referenced only by
+Codex and Copilot can be absent; agy is required for the loop. These repository secrets are referenced only by
 `dispatch-worker.yml`, enforced by workflow tests. The owner's Mac still
-pushes these two long-lived secrets; it no longer supplies any App token to
+pushes these three long-lived secrets; it no longer supplies any App token to
 the workflow.
 
 A model can read its own provider credential, including its refresh token,
@@ -727,8 +727,14 @@ it can show:
 4. otherwise standard.
 
 On a strong round, `invoke_worker` admits only any Codex model, any Claude
-Opus model, or Claude Sonnet at high effort. Dispatch sets no reasoning
-effort, so a Codex worker runs at the launcher's default. The coordinator
+Opus model (on agy or Copilot), or Claude Sonnet at high effort on agy.
+Dispatch sets no reasoning effort, so a Codex worker runs at the launcher's
+default. Copilot is a strong-tier peer backend billed to the owner (owner
+decision, #231): a strong round may pick `copilot` `claude-opus-*` at any
+time, even while Codex has free slots, and a standard round never uses
+Copilot; `invoke_worker` refuses it there. Copilot's Sonnet ids carry no
+effort and its GPT roster mixes small models with Codex ones, so neither is
+admitted on a strong round either. The coordinator
 reads the tier as the `worker_tier` state item. A strong round that runs no
 worker because its capacity report offered no strong-tier model ends
 Blocked with "no strong-tier worker had capacity", rather than on a weaker
@@ -981,6 +987,72 @@ When the pinned launcher's `CODEX_SDK_VERSION` changes, regenerate the lock
 file for the template's Python (3.13, x86_64) and rebuild the agent template.
 The test `agent_template_prebuilds_the_hash_locked_codex_sdk_the_driver_uses`
 ties the builder, the lock file and the driver together.
+
+### Copilot: a strong-tier peer backend billed to the owner (#1474)
+
+Copilot is a third worker backend. Owner decisions (#231): it bills the owner
+personally, never the organization, and it serves strong-tier rounds only
+(Claude Opus), at any time, never standard rounds. Nothing mints an
+organization-billed Copilot token, and the controller has no Copilot scope.
+
+The credential is the owner's fine-grained personal access token whose only
+permission is "Copilot Requests". It lives on the director Mac at
+`~/.config/carrick-workers/copilot-token`. The `sh.carrick.agent-secrets`
+sync pushes it as the repository secret `COPILOT_TOKEN`, beside
+`CODEX_AUTH_JSON` and `AGY_OAUTH_TOKEN`, and only `dispatch-worker.yml`
+references it. `agent-runner auth` checks it before use and refuses:
+
+- any token that is not a fine-grained PAT (`github_pat_`), including
+  classic (`ghp_`), OAuth (`gho_`), user-to-server (`ghu_`), App (`ghs_`)
+  and refresh (`ghr_`) tokens, without a network call;
+- a fine-grained PAT that GitHub does not accept on `GET /rate_limit`, or
+  that reports any `X-OAuth-Scopes`.
+
+The "Copilot Requests only" permission is the owner's configuration of the
+PAT and is not verified by code: GitHub sends no `X-OAuth-Scopes` for
+fine-grained PATs, so the check proves only that the token is a live
+fine-grained PAT.
+
+The token is sent to GitHub in a curl config on stdin, never on a command
+line (`curl -q`, HTTPS only). A refused token is left out with a fixed reason on stderr (never the
+value), and the step still succeeds for the other backends.
+
+An accepted token goes to `home/.copilot-dispatch/token` (0600, in a 0700
+directory). Capacity probes copy that home. A Copilot worker's home gets only
+that subtree. The loop (coordinator) home never gets it. Redaction captures
+the file by exact value as well as by the `github_pat_` shape. The launcher
+reads the file named by `AGY_DIRECTOR_COPILOT_TOKEN_FILE` (agy-director
+3.3.2) and passes it to the SDK as its explicit token with logged-in-user
+discovery off. Each turn starts a fresh client, so the file is re-read.
+
+**The worker can read this token.** It runs as the same uid, and the
+runtime passes the token to its own child process as `COPILOT_SDK_AUTH_TOKEN`.
+So the token is not secret from the model. Its protection is its single
+"Copilot Requests" permission, a short expiry and the owner's Copilot
+spending cap.
+
+A missing or unreadable token file marks only Copilot as not installed. The
+capacity reading still reports Codex and agy (#1456).
+
+The template builds `/opt/carrick-agent/copilot-sdk` from
+`scripts/ci/inputs/copilot-sdk-requirements.txt` (hash-locked wheels for
+Python 3.13, x86_64). It extracts the runtime the SDK drives into
+`/opt/carrick-agent/copilot-runtime`. The runtime asset
+(`github-copilot-1.0.98-linux-x64.tgz`) is downloaded into the seed and
+checked against a SHA-256 pinned in `build-template-debian.sh`, as for `gh`.
+The SDK then installs it from that seed through `COPILOT_CLI_DOWNLOAD_BASE_URL`,
+reading a sums file written from the pinned hash, not the release's own
+`SHA256SUMS.txt`. Workers and capacity probes set `COPILOT_CLI_EXTRACT_DIR`
+to the runtime directory and `COPILOT_SKIP_CLI_DOWNLOAD=1`, so no job
+downloads a runtime. When the pinned launcher's `COPILOT_SDK_VERSION`
+changes, regenerate the lock file, re-pin the runtime and rebuild the
+template.
+
+The capacity report lists Copilot's Claude and GPT models, credited to
+`Claude <noreply@anthropic.com>` and `GPT <noreply@openai.com>`. Other
+vendors' models have no co-author rule and are left out. Copilot's quota is
+the owner's premium-request reading; an empty or failed reading counts as no
+quota, so Copilot is not offered.
 
 ### Pinned GitHub CLI
 

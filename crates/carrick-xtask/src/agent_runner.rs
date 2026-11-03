@@ -488,6 +488,25 @@ fn auth(_root: &Path, event: &Path) -> Result<(), ScalerError> {
             b"cli_auth_credentials_store = \"file\"\n",
         )?;
     }
+    // The owner's Copilot PAT (#1474) goes only into the runner's agent
+    // home, which capacity probes and a selected Copilot worker copy from;
+    // never into the loop home. A refused token is left out, so Copilot
+    // reads as not installed and the other backends are unaffected.
+    if let Ok(token) = std::env::var("COPILOT_TOKEN")
+        && !token.is_empty()
+    {
+        match copilot_token_refusal(token.trim(), copilot_scope_probe) {
+            None => {
+                let directory = home.join(".copilot-dispatch");
+                private_dir(&directory)?;
+                secret_file(
+                    &home.join(crate::dispatch_worker::COPILOT_TOKEN_FILE),
+                    token.trim().as_bytes(),
+                )?;
+            }
+            Some(reason) => eprintln!("agent-runner: COPILOT_TOKEN refused: {reason}"),
+        }
+    }
     let raw = std::env::var("AGY_OAUTH_TOKEN")
         .ok()
         .filter(|s| !s.is_empty())
@@ -498,6 +517,96 @@ fn auth(_root: &Path, event: &Path) -> Result<(), ScalerError> {
     agy_auth(&loop_home, &raw)?;
     crate::dispatch_redaction::remember()?;
     Ok(())
+}
+
+/// Why a Copilot token must not be used, or `None` to accept it (#1474).
+/// The owner's decision: Copilot bills the owner, through a fine-grained
+/// PAT whose only permission is "Copilot Requests". Classic (`ghp_`),
+/// OAuth (`gho_`), user-to-server (`ghu_`), App (`ghs_`) and refresh
+/// (`ghr_`) tokens are refused by shape; a fine-grained PAT is accepted only
+/// when GitHub answers it and reports no OAuth scopes (`X-OAuth-Scopes` is
+/// a classic-scope header). `probe` returns the response header block.
+/// Reasons are fixed text and never contain the token.
+pub(crate) fn copilot_token_refusal(
+    token: &str,
+    probe: impl FnOnce(&str) -> Result<String, ScalerError>,
+) -> Option<&'static str> {
+    if ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"]
+        .iter()
+        .any(|prefix| token.starts_with(prefix))
+    {
+        return Some(
+            "a classic, OAuth, App or refresh token; only a fine-grained PAT (github_pat_) is accepted",
+        );
+    }
+    if !token.starts_with("github_pat_")
+        || token.len() > 512
+        || !token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return Some("not a fine-grained personal access token (github_pat_)");
+    }
+    let Ok(headers) = probe(token) else {
+        return Some("the scope check could not reach GitHub");
+    };
+    let mut lines = headers.lines().map(str::trim);
+    let ok = lines.next().is_some_and(|status| {
+        status.starts_with("HTTP/") && status.split_whitespace().nth(1) == Some("200")
+    });
+    if !ok {
+        return Some("GitHub did not accept the token");
+    }
+    if lines.any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.trim().eq_ignore_ascii_case("x-oauth-scopes") && !value.trim().is_empty()
+        })
+    }) {
+        return Some("the token reports OAuth scopes");
+    }
+    None
+}
+/// One authenticated `GET /rate_limit` (any valid token may call it), with
+/// the token in a curl config on stdin rather than on the command line.
+fn copilot_scope_probe(token: &str) -> Result<String, ScalerError> {
+    let mut command = std::process::Command::new("curl");
+    command
+        // `-q` first: ignore any ~/.curlrc. HTTPS only, redirects included.
+        .args([
+            "-q",
+            "-sS",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--max-time",
+            "20",
+            "-o",
+            "/dev/null",
+            "-D",
+            "-",
+            "--config",
+            "-",
+        ])
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN");
+    let config = format!(
+        "url = \"https://api.github.com/rate_limit\"\nheader = \"Accept: application/vnd.github+json\"\nheader = {}\n",
+        serde_json::to_string(&format!("Authorization: Bearer {token}"))?
+    );
+    let out = execute(
+        &mut command,
+        config.as_bytes(),
+        std::time::Duration::from_secs(30),
+    )?;
+    // Keep the last response block: curl prints one per redirect.
+    let text = String::from_utf8_lossy(&out).replace("\r\n", "\n");
+    Ok(text
+        .trim_end()
+        .rsplit("\n\n")
+        .next()
+        .unwrap_or_default()
+        .to_owned())
 }
 
 fn agy_auth(home: &Path, raw: &str) -> Result<(), ScalerError> {
@@ -534,6 +643,46 @@ pub fn run(root: &Path, args: Args) -> Result<(), ScalerError> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    /// #1474: only a fine-grained PAT with no OAuth scopes is used for
+    /// Copilot. Fixtures are fake; no reason ever echoes the token.
+    #[test]
+    fn copilot_token_accepts_only_unscoped_fine_grained_pats() {
+        let fine = "github_pat_11FIXTURE0123456789_abcdefFIXTURE";
+        let ok = |_: &str| Ok("HTTP/2 200\nx-ratelimit-limit: 5000\n".to_owned());
+        assert_eq!(copilot_token_refusal(fine, ok), None);
+        let empty = |_: &str| Ok("HTTP/2 200\nX-OAuth-Scopes: \n".to_owned());
+        assert_eq!(copilot_token_refusal(fine, empty), None);
+        let unreachable = |_: &str| -> Result<String, ScalerError> {
+            panic!("an over-broad token reached the network")
+        };
+        for broad in [
+            "ghp_classicFixture0123",
+            "gho_oauthFixture0123",
+            "ghu_userFixture0123",
+            "ghs_appFixture0123",
+            "ghr_refreshFixture0123",
+            "plain-text",
+            "github_pat_has space",
+        ] {
+            let reason = copilot_token_refusal(broad, unreachable).unwrap();
+            assert!(!reason.contains(broad), "{reason}");
+        }
+        let scoped = |_: &str| Ok("HTTP/2 200\nx-oauth-scopes: repo, workflow\n".to_owned());
+        assert_eq!(
+            copilot_token_refusal(fine, scoped),
+            Some("the token reports OAuth scopes")
+        );
+        let rejected = |_: &str| Ok("HTTP/2 401\n".to_owned());
+        assert_eq!(
+            copilot_token_refusal(fine, rejected),
+            Some("GitHub did not accept the token")
+        );
+        let down = |_: &str| Err(ScalerError::Guard("offline"));
+        assert_eq!(
+            copilot_token_refusal(fine, down),
+            Some("the scope check could not reach GitHub")
+        );
+    }
     #[test]
     fn runner_wrapper_configuration_never_reaches_agent_cargo() {
         // Exercise Cargo's real config selection, without a daemon or uid switch.

@@ -682,6 +682,27 @@ pub fn valid_branch(branch: &str) -> bool {
 
 /// Built by `scripts/ci/build-template-debian.sh` for the agent profile.
 pub const CODEX_SDK_VENV: &str = "/opt/carrick-agent/codex-sdk";
+/// The Copilot SDK venv and the runtime it drives (#1474), built by the same
+/// script. The runtime is extracted once at template build; workers set
+/// `COPILOT_SKIP_CLI_DOWNLOAD` so no job downloads one.
+pub const COPILOT_SDK_VENV: &str = "/opt/carrick-agent/copilot-sdk";
+pub const COPILOT_RUNTIME_DIR: &str = "/opt/carrick-agent/copilot-runtime";
+/// A Copilot worker's credential, relative to its home: the owner's
+/// fine-grained PAT whose only permission is "Copilot Requests" (secret
+/// `COPILOT_TOKEN`, billed to the owner), written by `agent-runner auth` and
+/// handed to the launcher as a file so it never appears on a command line.
+pub(crate) const COPILOT_TOKEN_FILE: &str = ".copilot-dispatch/token";
+/// The launcher environment for the template's prebuilt Copilot SDK.
+pub(crate) fn copilot_environment(command: &mut Command, home: &Path) {
+    command
+        .env("AGY_DIRECTOR_COPILOT_VENV", COPILOT_SDK_VENV)
+        .env("COPILOT_CLI_EXTRACT_DIR", COPILOT_RUNTIME_DIR)
+        .env("COPILOT_SKIP_CLI_DOWNLOAD", "1")
+        .env(
+            "AGY_DIRECTOR_COPILOT_TOKEN_FILE",
+            home.join(COPILOT_TOKEN_FILE),
+        );
+}
 
 fn schema() -> Value {
     json!({"type":"object","additionalProperties":false,
@@ -1074,6 +1095,9 @@ fn worker_environment(
         command
             .env("CODEX_MODELS", worker.roster.join(" "))
             .env("CODEX_SQLITE_HOME", sqlite_home);
+    }
+    if worker.backend == "copilot" {
+        copilot_environment(command, &home);
     }
     Ok(())
 }
@@ -3615,6 +3639,7 @@ fn prepare_worker_actor(state: &Path, actor: &Path, backend: &str) -> Result<(),
     let credential = match backend {
         "codex" => ".codex",
         "agy" => ".gemini",
+        "copilot" => ".copilot-dispatch",
         _ => return Err(ScalerError::Guard("worker credential backend refused")),
     };
     std::fs::create_dir(actor.join("home"))?;
@@ -9457,18 +9482,31 @@ fi
             "agy-secret",
         )
         .unwrap();
+        // #1474: the Copilot App token is one more backend's subtree.
+        std::fs::create_dir_all(state.join("home/.copilot-dispatch")).unwrap();
+        std::fs::write(state.join("home/.copilot-dispatch/token"), "copilot-secret").unwrap();
         let mut leaked = Vec::new();
-        for (backend, wanted, forbidden) in
-            [("agy", ".gemini", ".codex"), ("codex", ".codex", ".gemini")]
-        {
+        let all = [".codex", ".gemini", ".copilot-dispatch"];
+        for (backend, wanted) in [
+            ("agy", ".gemini"),
+            ("codex", ".codex"),
+            ("copilot", ".copilot-dispatch"),
+        ] {
             let actor = temp.path().join(backend);
             std::fs::create_dir(&actor).unwrap();
             prepare_worker_actor(&state, &actor, backend).unwrap();
             assert!(actor.join("home").join(wanted).is_dir());
-            if actor.join("home").join(forbidden).exists() {
+            if all
+                .iter()
+                .any(|other| *other != wanted && actor.join("home").join(other).exists())
+            {
                 leaked.push(backend);
             }
         }
+        assert!(
+            prepare_worker_actor(&state, &temp.path().join("other"), "grok").is_err(),
+            "an unknown backend got a home"
+        );
         assert!(
             leaked.is_empty(),
             "worker homes leaked other backend credentials: {leaked:?}"

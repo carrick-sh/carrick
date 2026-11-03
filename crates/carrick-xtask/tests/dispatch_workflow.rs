@@ -150,6 +150,10 @@ fn provider_workflow_provisions_every_available_worker_credential() {
         auth["env"]["AGY_OAUTH_TOKEN"].as_str(),
         Some("${{ secrets.AGY_OAUTH_TOKEN }}")
     );
+    assert_eq!(
+        auth["env"]["COPILOT_TOKEN"].as_str(),
+        Some("${{ secrets.COPILOT_TOKEN }}")
+    );
     assert!(!include_str!("../../../.github/dispatch-tiers.toml").contains("[tiers."));
 }
 
@@ -157,7 +161,7 @@ fn provider_workflow_provisions_every_available_worker_credential() {
 fn only_dispatch_workflow_references_dispatch_secrets() {
     let workflows =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows");
-    let secrets = ["CODEX_AUTH_JSON", "AGY_OAUTH_TOKEN"];
+    let secrets = ["CODEX_AUTH_JSON", "AGY_OAUTH_TOKEN", "COPILOT_TOKEN"];
     // Minted on demand by the ctb controller (#1012, #1034); no workflow
     // passes them.
     let retired = [
@@ -672,9 +676,17 @@ fi
         .env("GITHUB_TRIGGERING_ACTOR", "tjfontaine")
         .env("CODEX_AUTH_JSON", "{\"token\":\"worker-codex-secret\"}")
         .env("AGY_OAUTH_TOKEN", "loop-agy-secret")
+        // #1474: a classic PAT is refused by shape, before any network
+        // check, and the rest of auth still succeeds.
+        .env("COPILOT_TOKEN", "ghp_classicFixtureNeverUsed0123")
         .output()
         .unwrap();
     assert!(auth.status.success(), "{auth:?}");
+    let stderr = String::from_utf8_lossy(&auth.stderr);
+    assert!(stderr.contains("COPILOT_TOKEN refused"), "{stderr}");
+    assert!(!stderr.contains("ghp_classicFixture"), "{stderr}");
+    assert!(!state.join("home/.copilot-dispatch").exists());
+    assert!(!state.join("loop-home/.copilot-dispatch").exists());
     assert_eq!(
         std::fs::read_to_string(temp.path().join("gh.args")).unwrap(),
         calls,

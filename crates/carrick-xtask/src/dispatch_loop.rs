@@ -787,6 +787,7 @@ fn capacity_command(actor: &Path, sqlite_home: &Path, args: &[&str]) -> Command 
                 .join("director")
                 .join(crate::agent_runner::MODELS_SEED),
         );
+    copilot_environment(&mut command, &actor.join("home"));
     account_command(&command, AGENT_USER, actor, None)
 }
 /// Runs one launcher subcommand as the agent account. The outer error is a
@@ -883,6 +884,40 @@ fn roster(text: &str) -> Vec<Value> {
         .map(|id| json!(id))
         .collect()
 }
+/// Each backend's credential, relative to the runner's agent home. A
+/// backend is installed only when its credential is present.
+fn backend_credential(backend: &str) -> Option<&'static str> {
+    match backend {
+        "codex" => Some(".codex/auth.json"),
+        "agy" => Some(".gemini/antigravity-cli/antigravity-oauth-token"),
+        "copilot" => Some(COPILOT_TOKEN_FILE),
+        _ => None,
+    }
+}
+/// Whether `backend`'s credential is a readable regular file in `home`.
+/// A missing, unreadable or odd credential marks only that backend as not
+/// installed; it never fails the whole capacity reading (#1456), so one
+/// backend's broken credential cannot hide the others.
+fn credential_present(home: &Path, backend: &str) -> bool {
+    backend_credential(backend).is_some_and(|credential| {
+        let path = home.join(credential);
+        std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file())
+            && std::fs::File::open(&path).is_ok()
+    })
+}
+/// The model families a backend's roster may offer: those it runs and
+/// dispatch can credit to a vendor. Copilot also lists Grok and Kimi models,
+/// which have no co-author rule here.
+fn roster_admits(backend: &str, id: &str) -> bool {
+    match backend {
+        "codex" => id.starts_with("gpt-"),
+        "agy" => {
+            id.starts_with("gemini-") || id.starts_with("claude-") || id.starts_with("gpt-oss")
+        }
+        "copilot" => id.starts_with("claude-") || id.starts_with("gpt-"),
+        _ => false,
+    }
+}
 fn read_capacity(deadline: Instant) -> Result<Value, ScalerError> {
     cleanup_agent_user()?;
     let outer = tempfile::Builder::new()
@@ -912,16 +947,12 @@ fn read_capacity(deadline: Instant) -> Result<Value, ScalerError> {
         .as_object()
         .ok_or(ScalerError::Guard("invalid capacity_report"))?;
     let mut report = serde_json::Map::new();
-    for backend in ["codex", "agy"] {
+    for backend in ["codex", "agy", "copilot"] {
         let Some(entry) = backends.get(backend) else {
             continue;
         };
-        let credential = if backend == "codex" {
-            "home/.codex/auth.json"
-        } else {
-            "home/.gemini/antigravity-cli/antigravity-oauth-token"
-        };
-        let installed = entry["installed"] == true && state.join(credential).is_file();
+        let installed =
+            entry["installed"] == true && credential_present(&state.join("home"), backend);
         // One backend's roster failure must not hide the other backend's
         // capacity (#1456): a backend without a live roster lists no
         // models, so `available_worker` refuses only that backend.
@@ -939,17 +970,7 @@ fn read_capacity(deadline: Instant) -> Result<Value, ScalerError> {
         let models = if let Some(listed) = &listed {
             roster(listed)
                 .into_iter()
-                .filter(|id| {
-                    id.as_str().is_some_and(|id| {
-                        if backend == "codex" {
-                            id.starts_with("gpt-")
-                        } else {
-                            id.starts_with("gemini-")
-                                || id.starts_with("claude-")
-                                || id.starts_with("gpt-oss")
-                        }
-                    })
-                })
+                .filter(|id| id.as_str().is_some_and(|id| roster_admits(backend, id)))
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
@@ -988,7 +1009,7 @@ fn read_capacity(deadline: Instant) -> Result<Value, ScalerError> {
 fn available_worker(capacity: &Value, backend: &str, model: &str) -> Result<Worker, ScalerError> {
     let entry = &capacity["backends"][backend];
     let positive = |v: &Value| v.as_f64().is_some_and(|v| v.is_finite() && v > 0.0);
-    if !matches!(backend, "codex" | "agy")
+    if !matches!(backend, "codex" | "agy" | "copilot")
         || entry["installed"] != true
         || !positive(&entry["free_slots"])
         || !positive(&entry["quota_free"])
@@ -1003,6 +1024,16 @@ fn available_worker(capacity: &Value, backend: &str, model: &str) -> Result<Work
     }
     let vendor = if backend == "codex" {
         "Codex <noreply@openai.com>"
+    } else if backend == "copilot" {
+        // Copilot serves other vendors' models; credit the model's vendor.
+        // Premium-request quota is the backend's own `quota_free`.
+        if model.starts_with("claude-") {
+            "Claude <noreply@anthropic.com>"
+        } else if model.starts_with("gpt-") {
+            "GPT <noreply@openai.com>"
+        } else {
+            return Err(ScalerError::Guard("model vendor unknown"));
+        }
     } else {
         let group = if model.starts_with("gemini-") {
             "gemini"
@@ -8427,6 +8458,150 @@ exec /usr/bin/git "$@"
             assert_eq!(server.used.workers, 1);
         });
     }
+    /// #1474: after a Codex worker (whose launch may fail, #1464), a strong
+    /// round's next worker can be Claude Opus through Copilot, credited to
+    /// Claude. The tier still refuses Copilot's weaker models, and Copilot
+    /// models no vendor rule names are refused before any charge.
+    #[test]
+    fn a_strong_round_falls_back_to_copilot_claude_opus_after_codex() {
+        shared_fixture(|root| {
+            let mut server = server(root);
+            server.tier = super::super::worker_tier::decide("x", "", "", &["mm".into()]);
+            let mut capacity = live_capacity();
+            capacity["backends"]["copilot"] = json!({"installed":true,"free_slots":2,
+                "quota_free":1.0,"score":1.0,
+                "models":["claude-opus-5.5","claude-sonnet-5.5","gpt-6.1-sol","grok-4.7"]});
+            let pick = |backend: &str, model: &str| Notes {
+                notes: "fallback".into(),
+                backend: backend.into(),
+                model: model.into(),
+            };
+            // The Codex worker is admitted first; its launch failure is a
+            // worker result, not a refusal, so the round may try again.
+            server
+                .admit_worker(&pick("codex", "gpt-6.1-sol"), &capacity)
+                .unwrap();
+            for weaker in ["claude-sonnet-5.5", "gpt-6.1-sol", "grok-4.7"] {
+                let error = server
+                    .admit_worker(&pick("copilot", weaker), &capacity)
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("worker tier is strong"), "{weaker}: {error}");
+            }
+            assert_eq!(server.used.workers, 1);
+            server
+                .admit_worker(&pick("copilot", "claude-opus-5.5"), &capacity)
+                .unwrap();
+            assert_eq!(server.used.workers, 2);
+            assert_eq!(server.dispatch.worker.backend, "copilot");
+            assert_eq!(
+                server.dispatch.worker.coauthor,
+                "Claude <noreply@anthropic.com>"
+            );
+        });
+        // Copilot's Claude and GPT models are creditable; no model whose
+        // vendor has no co-author rule is.
+        let mut capacity = live_capacity();
+        capacity["backends"]["copilot"] = json!({"installed":true,"free_slots":2,
+            "quota_free":1.0,"score":1.0,"models":["gpt-6.1-sol","grok-4.7"]});
+        let worker = available_worker(&capacity, "copilot", "gpt-6.1-sol").unwrap();
+        assert_eq!(worker.coauthor, "GPT <noreply@openai.com>");
+        assert!(available_worker(&capacity, "copilot", "grok-4.7").is_err());
+        capacity["backends"]["copilot"]["installed"] = json!(false);
+        assert!(available_worker(&capacity, "copilot", "gpt-6.1-sol").is_err());
+    }
+    /// Owner policy (#231, #1474): a standard round refuses Copilot at
+    /// `invoke_worker` without a charge; a strong round may pick Copilot
+    /// Claude Opus even while Codex has free slots.
+    #[test]
+    fn copilot_is_a_strong_tier_peer_and_never_a_standard_worker() {
+        shared_fixture(|root| {
+            let mut capacity = live_capacity();
+            capacity["backends"]["copilot"] = json!({"installed":true,"free_slots":2,
+                "quota_free":1.0,"score":1.0,"models":["claude-opus-5.5","gpt-6.1-sol"]});
+            let pick = |model: &str| Notes {
+                notes: "copilot".into(),
+                backend: "copilot".into(),
+                model: model.into(),
+            };
+            let mut standard = server(root);
+            for model in ["claude-opus-5.5", "gpt-6.1-sol"] {
+                assert!(
+                    standard.admit_worker(&pick(model), &capacity).is_err(),
+                    "{model}"
+                );
+            }
+            assert_eq!((standard.used.calls, standard.used.workers), (0, 0));
+            let mut strong = server(root);
+            strong.tier = super::super::worker_tier::decide("x", "", "", &["mm".into()]);
+            assert!(capacity["backends"]["codex"]["free_slots"].as_u64() > Some(0));
+            strong
+                .admit_worker(&pick("claude-opus-5.5"), &capacity)
+                .unwrap();
+            assert_eq!(strong.dispatch.worker.backend, "copilot");
+        });
+    }
+    /// #1474 (#1456 rule): a missing or unreadable Copilot credential marks
+    /// only Copilot as not installed; Codex and agy still read as present.
+    #[test]
+    fn a_broken_copilot_credential_hides_only_copilot() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = tempfile::tempdir().unwrap();
+        for (path, secret) in [
+            (".codex/auth.json", "codex-fixture"),
+            (
+                ".gemini/antigravity-cli/antigravity-oauth-token",
+                "agy-fixture",
+            ),
+        ] {
+            let path = home.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, secret).unwrap();
+        }
+        let present = |backend| credential_present(home.path(), backend);
+        assert!(!present("copilot"), "a missing token read as installed");
+        assert!(present("codex") && present("agy"));
+        let token = home.path().join(COPILOT_TOKEN_FILE);
+        std::fs::create_dir_all(token.parent().unwrap()).unwrap();
+        std::fs::write(&token, "copilot-fixture").unwrap();
+        assert!(present("copilot"));
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&token).is_err() {
+            assert!(!present("copilot"), "an unreadable token read as installed");
+        }
+        std::fs::remove_file(&token).unwrap();
+        std::fs::create_dir(&token).unwrap();
+        assert!(!present("copilot"), "a directory read as a token");
+        assert!(present("codex") && present("agy"));
+    }
+    /// The capacity report lists only the model families each backend can
+    /// run and dispatch can credit.
+    #[test]
+    fn capacity_rosters_keep_each_backends_creditable_models() {
+        let ids = |backend| {
+            [
+                "gpt-6.1-sol",
+                "gpt-oss-120b",
+                "claude-opus-5.5",
+                "gemini-4-argon-high",
+                "grok-4.7",
+            ]
+            .into_iter()
+            .filter(|id| roster_admits(backend, id))
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(ids("codex"), ["gpt-6.1-sol", "gpt-oss-120b"]);
+        assert_eq!(
+            ids("agy"),
+            ["gpt-oss-120b", "claude-opus-5.5", "gemini-4-argon-high"]
+        );
+        assert_eq!(
+            ids("copilot"),
+            ["gpt-6.1-sol", "gpt-oss-120b", "claude-opus-5.5"]
+        );
+        assert_eq!(backend_credential("copilot"), Some(COPILOT_TOKEN_FILE));
+        assert_eq!(backend_credential("grok"), None);
+    }
     /// #1275 acceptance: the outcome names the tier and every worker; a
     /// strong round whose capacity offered no strong worker ends Blocked
     /// (nothing downgraded to a weaker model) and says why.
@@ -8565,6 +8740,51 @@ exec /usr/bin/git "$@"
         };
         worker_environment(&mut agy, &state, &worker, None).unwrap();
         assert!(agy.get_envs().all(|(name, _)| name != "CODEX_MODELS"));
+        assert!(
+            agy.get_envs()
+                .all(|(name, _)| name != "AGY_DIRECTOR_COPILOT_TOKEN_FILE")
+        );
+    }
+    /// #1474: a Copilot worker's launcher reads its credential from a file
+    /// in its own home (argv and the sudo command line are readable by
+    /// other uids) and uses the template's prebuilt SDK and runtime.
+    #[test]
+    fn copilot_worker_launcher_reads_its_token_from_a_file() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("agent");
+        let mut command = Command::new("python3");
+        let worker = Worker {
+            backend: "copilot".into(),
+            model: "claude-opus-5.5".into(),
+            ..Worker::default()
+        };
+        worker_environment(&mut command, &state, &worker, None).unwrap();
+        let env = |key: &str| {
+            command
+                .get_envs()
+                .find(|(name, _)| *name == key)
+                .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+        };
+        assert_eq!(
+            env("AGY_DIRECTOR_COPILOT_TOKEN_FILE").as_deref(),
+            state.join("home").join(COPILOT_TOKEN_FILE).to_str()
+        );
+        assert_eq!(
+            env("AGY_DIRECTOR_COPILOT_VENV").as_deref(),
+            Some(COPILOT_SDK_VENV)
+        );
+        assert_eq!(
+            env("COPILOT_CLI_EXTRACT_DIR").as_deref(),
+            Some(COPILOT_RUNTIME_DIR)
+        );
+        for (name, value) in command.get_envs() {
+            let value = value.map(|v| v.to_string_lossy().into_owned());
+            assert!(
+                !value.as_deref().unwrap_or_default().starts_with("ghs_"),
+                "{name:?} carries a token"
+            );
+        }
+        assert!(command.get_envs().all(|(name, _)| name != "CODEX_MODELS"));
     }
     /// Where Codex 0.163 opens its state databases for a launch environment:
     /// `CODEX_SQLITE_HOME` when set, otherwise `CODEX_HOME`.

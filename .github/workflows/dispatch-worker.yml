@@ -187,6 +187,8 @@ jobs:
         env:
           CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
           AGY_OAUTH_TOKEN: ${{ secrets.AGY_OAUTH_TOKEN }}
+          # The owner's fine-grained PAT, "Copilot Requests" only (#1474).
+          COPILOT_TOKEN: ${{ secrets.COPILOT_TOKEN }}
         run: '"$RUNNER_TEMP/carrick-dispatch-driver" agent-runner auth --event "$GITHUB_EVENT_PATH"'
       - name: Run owner dispatch through the policy tool server
         id: loop
