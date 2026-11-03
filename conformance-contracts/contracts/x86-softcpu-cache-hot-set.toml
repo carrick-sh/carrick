@@ -1,0 +1,46 @@
+schema_version = 1
+id = "x86.softcpu.cache-hot-set"
+title = "Bound translation work for a hot translation set"
+guest_surfaces = ["isa:x86_64", "vmm:soft"]
+semantic_authority = ["Intel SDM Vol. 3A self- and cross-modifying code: subsequent block entries must observe modified code; unchanged code retains instruction semantics."]
+fixture = "carrick-softcpu-x86::softcpu_level0"
+scale_points = [129, 201, 1001]
+rationale = "Translation ownership is keyed by RIP and planning policy. Replace stale incarnations under the same key; evict one owner at a time. This row preserves the unchanged-loop budget in x86.softcpu.level0."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "softcpu_block_decodes"
+base = 0
+per_unit = 1
+layers = ["vm-free"]
+rationale = "Ten laps execute 10*n blocks; each of n distinct keys translates once within the 1024-entry capacity."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "softcpu_block_emits"
+base = 0
+per_unit = 1
+layers = ["vm-free"]
+rationale = "Ten laps execute 10*n blocks; each of n distinct keys translates once within the 1024-entry capacity."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "softcpu_code_page_walks"
+base = 0
+per_unit = 1
+layers = ["vm-free"]
+rationale = "Ten laps execute 10*n blocks; each of n distinct keys translates once within the 1024-entry capacity."
+
+[bindings]
+vm_free = [
+  "carrick-softcpu-x86::softcpu_level0::hot_set_over_128_blocks_translates_once_per_key",
+  "carrick-softcpu-x86::softcpu_level0::capacity_eviction_keeps_other_resident_blocks",
+]
+[bindings.unresolved]
+embed_structural = "Soft carrier integration remains #671; this fixture executes production SoftCpu blocks on native x86_64."
+docker = "Instruction semantics are checked directly against native x86_64; Docker is unavailable on this worker."
+
+[runtime_ratio]
+maximum = 2.0
+statistic = "p50"
+minimum_samples = 20

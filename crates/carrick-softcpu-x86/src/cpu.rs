@@ -1,5 +1,6 @@
 //! Level 0 `SoftCpu` execution engine and executable code-buffer management.
 
+use std::collections::{BTreeMap, VecDeque};
 use std::ptr::NonNull;
 
 use carrick_softmmu::{ExtentTable, InventoryTerminal, SoftRequester, SoftSeatError};
@@ -162,9 +163,11 @@ impl Drop for JitCodeBuffer {
     }
 }
 
+const TRANSLATION_CACHE_CAPACITY: usize = 1024;
+type BlockKey = (u64, (usize, usize, bool));
+
 struct CachedBlock {
     plan: std::sync::Arc<PlannedBlock>,
-    limits: (usize, usize, bool),
     _code: JitCodeBuffer,
     entry: crate::mmu::HostVa,
 }
@@ -188,7 +191,8 @@ pub struct SoftCpu {
     cpuid: Box<dyn CpuidAuthority>,
     translations: u64,
     emissions: u64,
-    blocks: Vec<CachedBlock>,
+    blocks: BTreeMap<BlockKey, CachedBlock>,
+    block_order: VecDeque<BlockKey>,
     pub max_block_insns: usize,
     pub max_block_span: usize,
 }
@@ -342,7 +346,8 @@ impl SoftCpu {
             cpuid,
             translations: 0,
             emissions: 0,
-            blocks: Vec::new(),
+            blocks: BTreeMap::new(),
+            block_order: VecDeque::new(),
             max_block_insns: 64,
             max_block_span: 4096,
         })
@@ -416,9 +421,9 @@ impl SoftCpu {
         &mut self.ctx
     }
 
-    /// Actual page-table walks (all accesses, including code).
+    /// Actual instruction-fetch page-table walks; data walks are excluded.
     pub fn code_walk_count(&self) -> u64 {
-        self.ctx.walker.stats().walks
+        self.ctx.walker.stats().code_walks
     }
 
     /// Native blocks emitted on translation misses.
@@ -503,16 +508,15 @@ impl SoftCpu {
         // Re-authenticate execute permission and physical identity through the live
         // TLB. Retirement/shootdown invalidates that TLB; writes bump frame code
         // generation. No guest pointer or mapping authority is cached here.
+        let key = (rip, limits);
         let cached = self
             .blocks
-            .iter()
-            .find(|b| {
-                b.plan.start == rip
-                    && b.limits == limits
-                    && b.plan
-                        .code_pages
-                        .iter()
-                        .all(|page| crate::mmu::code_page_matches(&mut self.ctx, mem, page))
+            .get(&key)
+            .filter(|b| {
+                b.plan
+                    .code_pages
+                    .iter()
+                    .all(|page| crate::mmu::code_page_matches(&mut self.ctx, mem, page))
             })
             .map(|b| (b.plan.clone(), b.entry));
         let planned = if let Some(b) = &cached {
@@ -556,17 +560,25 @@ impl SoftCpu {
                                 va: rip,
                                 detail: "translation cache publication failed".to_string(),
                             })?;
-                    // Bounded ownership: eviction drops RX memory only between blocks.
-                    if self.blocks.len() == 128 {
-                        self.blocks.clear();
+                    // Replace stale incarnations under the same key. FIFO eviction
+                    // removes one RX owner between blocks, never the whole hot set.
+                    if !self.blocks.contains_key(&key) {
+                        if self.blocks.len() == TRANSLATION_CACHE_CAPACITY
+                            && let Some(oldest) = self.block_order.pop_front()
+                        {
+                            self.blocks.remove(&oldest);
+                        }
+                        self.block_order.push_back(key);
                     }
                     let entry = crate::mmu::HostVa::new(entry as usize);
-                    self.blocks.push(CachedBlock {
-                        plan: b.clone(),
-                        limits,
-                        _code: code,
-                        entry,
-                    });
+                    self.blocks.insert(
+                        key,
+                        CachedBlock {
+                            plan: b.clone(),
+                            _code: code,
+                            entry,
+                        },
+                    );
                     entry
                 };
                 let result = self.execute_block_at(&b, mem, entry)?;

@@ -47,7 +47,6 @@ struct TestSoftMmuMemory {
     _backing: Vec<AtomicU64>,
     placement: LinearPlacement,
     extents: ExtentTable,
-    code_frames: Vec<carrick_softcpu_x86::AuthenticatedGpa>,
     next_frame_gpa: u64,
     va_to_frame: BTreeMap<u64, FrameGpa>,
 }
@@ -80,7 +79,6 @@ impl TestSoftMmuMemory {
             _backing: backing,
             placement,
             extents,
-            code_frames: Vec::new(),
             next_frame_gpa: SOFT_TLB_PAGE_SIZE,
             va_to_frame: BTreeMap::new(),
         }
@@ -180,18 +178,25 @@ impl TestSoftMmuMemory {
     }
 
     fn write_direct(&mut self, va: u64, data: &[u8]) -> bool {
-        // Host fixture writes participate in the same frame-generation protocol
-        // as guest writes; direct backing mutation cannot retain translations.
-        for &frame in &self.code_frames {
-            self.extents.on_code_page_write(frame, &mut []).unwrap();
-        }
-
-        for (i, &b) in data.iter().enumerate() {
-            let Some(dst) = self.host_byte_ptr(va.wrapping_add(i as u64)) else {
+        let mut copied = 0;
+        while copied < data.len() {
+            let current = va + copied as u64;
+            let Some(frame) = self.frame_for_va(current) else {
                 return false;
             };
-            // SAFETY: `dst` lies within `_backing`.
-            unsafe { *dst = b };
+            let offset = current & SOFT_TLB_OFFSET_MASK;
+            let len = (data.len() - copied).min((SOFT_TLB_PAGE_SIZE - offset) as usize);
+            if self
+                .write_host_bytes(
+                    FrameGpa::new(frame.raw() + offset),
+                    Self::GEN,
+                    &data[copied..copied + len],
+                )
+                .is_err()
+            {
+                return false;
+            }
+            copied += len;
         }
         true
     }
@@ -216,16 +221,6 @@ unsafe impl SoftMmuMemory for TestSoftMmuMemory {
     }
     fn extents(&self) -> &ExtentTable {
         &self.extents
-    }
-    fn mark_code_page(
-        &mut self,
-        frame: carrick_softcpu_x86::AuthenticatedGpa,
-        tlbs: &mut [&mut carrick_softcpu_x86::SoftTlb],
-    ) -> u64 {
-        if !self.code_frames.contains(&frame) {
-            self.code_frames.push(frame);
-        }
-        self.extents.mark_code_page(frame, tlbs)
     }
     fn extents_mut(&mut self) -> &mut ExtentTable {
         &mut self.extents
@@ -3662,7 +3657,7 @@ fn unchanged_loop_translates_once_at_three_scales() {
         assert_eq!(cpu.translation_count(), 1, "{blocks} executed blocks");
         assert_eq!(cpu.emission_count(), 1);
         assert_eq!(cpu.code_walk_count(), 1);
-        assert_eq!(cpu.context().tlb_stats().write_evictions, 2); // initial mode + first code mark
+        assert_eq!(cpu.context().tlb_stats().write_evictions, 3); // mode, local activation, domain debt
     }
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -3769,4 +3764,223 @@ fn peer_reactivation_cannot_resurrect_an_old_translation() {
     cpu.context_mut().rip = va;
     assert_eq!(cpu.step_block(&mut mem).unwrap(), sys(va, va + 2));
     assert_eq!(cpu.translation_count(), 2);
+}
+
+#[test]
+fn peer_warm_write_tlb_cannot_hide_cross_modification() {
+    let (mut cpu, mut mem, va) = setup_snippet(&[0xeb, 0xfe]);
+    let alias = 0x5000_0000;
+    mem.map_alias(alias, mem.frame_for_va(va).unwrap(), PagePerms::USER_RW);
+    let mut peer = SoftCpu::new(mem.extents()).unwrap();
+    write_guest_bytes(peer.context_mut(), &mut mem, alias, &[0xeb, 0xfe]).unwrap();
+    cpu.step_block(&mut mem).unwrap();
+    write_guest_bytes(peer.context_mut(), &mut mem, alias, &[0x0f, 0x05]).unwrap();
+    assert_eq!(cpu.step_block(&mut mem).unwrap(), sys(va, va + 2));
+}
+
+#[test]
+fn peer_native_store_cross_modification() {
+    // B's store block lives on another physical page; first execute it while
+    // A's target is data, leaving the native write TLB warm before activation.
+    let (mut cpu, mut mem, va) = setup_snippet(&[0xeb, 0xfe]);
+    let store = va + 4096;
+    let alias = 0x5000_0000;
+    mem.map_alias(alias, mem.frame_for_va(va).unwrap(), PagePerms::USER_RW);
+    mem.map_range(store, 4096, PagePerms::USER_RX);
+    mem.write_direct(store, &[0x66, 0x89, 0x03, 0xeb, 0xfb]); // mov [rbx],ax; jmp store
+    let mut peer = SoftCpu::new(mem.extents()).unwrap();
+    peer.context_mut().rip = store;
+    peer.context_mut().gpr[reg::RBX] = alias;
+    peer.context_mut().gpr[reg::RAX] = 0xfeeb;
+    peer.step_block(&mut mem).unwrap();
+    cpu.step_block(&mut mem).unwrap();
+    peer.context_mut().gpr[reg::RAX] = 0x050f;
+    peer.step_block(&mut mem).unwrap();
+    assert_eq!(cpu.step_block(&mut mem).unwrap(), sys(va, va + 2));
+}
+
+#[test]
+fn hot_set_over_128_blocks_translates_once_per_key() {
+    for count in [129, 201, 1001] {
+        let (mut cpu, mut mem, va) = setup_hot_set(count);
+        for _ in 0..10 * count {
+            assert!(matches!(
+                cpu.step_block(&mut mem).unwrap(),
+                SoftCpuExit::Continue { .. }
+            ));
+        }
+        assert_eq!(cpu.context().rip, va);
+        evaluate_cache_row("x86.softcpu.cache-hot-set", count as u64, &cpu);
+        assert_eq!(cpu.translation_count(), count as u64, "{count} hot blocks");
+        assert_eq!(cpu.emission_count(), count as u64);
+    }
+}
+
+#[test]
+fn self_modifying_loop_replaces_stale_key_without_evicting_hot_peer() {
+    for laps in [64, 512, 4096] {
+        // The guest increments a byte on its own code frame through an RW
+        // alias, then branches to an independent hot block which returns here.
+        let (mut cpu, mut mem, va) = setup_snippet(&[]);
+        let hot = va + 4096;
+        mem.map_range(hot, 4096, PagePerms::USER_RX);
+        let mut modifying = vec![0xfe, 0x03, 0xe9]; // inc byte [rbx]; jmp hot
+        modifying.extend_from_slice(&((hot - (va + 7)) as i32).to_le_bytes());
+        mem.write_direct(va, &modifying);
+        let mut returning = vec![0xe9];
+        returning.extend_from_slice(&((va as i64 - hot as i64 - 5) as i32).to_le_bytes());
+        mem.write_direct(hot, &returning);
+        let alias = 0x5000_0000;
+        mem.map_alias(alias, mem.frame_for_va(va).unwrap(), PagePerms::USER_RW);
+        cpu.context_mut().gpr[reg::RBX] = alias + 128;
+        for _ in 0..laps {
+            assert_eq!(
+                cpu.step_block(&mut mem).unwrap(),
+                SoftCpuExit::Continue { next_rip: hot }
+            );
+            assert_eq!(
+                cpu.step_block(&mut mem).unwrap(),
+                SoftCpuExit::Continue { next_rip: va }
+            );
+        }
+        assert_eq!(mem.read_direct(va + 128, 1).unwrap(), [laps as u8]);
+        evaluate_cache_row("x86.softcpu.cache-smc", laps, &cpu);
+        assert_eq!(cpu.translation_count(), laps + 1);
+        assert_eq!(cpu.emission_count(), laps + 1);
+    }
+}
+
+fn evaluate_cache_row(id: &str, scale: u64, cpu: &SoftCpu) {
+    use carrick_conformance_contract::{
+        Completeness, ContractId, ContractObservation, ContractRegistry, ExecutionLayer,
+        SemanticAssertion, WorkMetric, WorkSnapshot, evaluate,
+    };
+    let mut work = WorkSnapshot::new();
+    for (metric, count) in [
+        (WorkMetric::SoftcpuBlockDecodes, cpu.translation_count()),
+        (WorkMetric::SoftcpuBlockEmits, cpu.emission_count()),
+        (WorkMetric::SoftcpuCodePageWalks, cpu.code_walk_count()),
+    ] {
+        work.insert(metric, count).unwrap();
+    }
+    let observation = ContractObservation {
+        contract_id: ContractId::new(id).unwrap(),
+        layer: ExecutionLayer::VmFree,
+        implementation_revision: "softcpu-cache-review-fix".into(),
+        fixture_identity: "carrick-softcpu-x86::softcpu_level0".into(),
+        scale,
+        semantic_assertions: vec![SemanticAssertion::pass("completed_loop_observes_code")],
+        work: Some(work),
+        timing: None,
+        completeness: Completeness::Complete,
+    };
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let registry = ContractRegistry::load(root).unwrap();
+    evaluate(registry.require(id).unwrap(), &[observation]).unwrap();
+}
+
+#[test]
+fn typed_host_write_invalidates_cached_code_and_rejects_wrong_owner() {
+    let (mut cpu, mut mem, va) = setup_snippet(&[0xeb, 0xfe]);
+    cpu.step_block(&mut mem).unwrap();
+    let frame = mem.frame_for_va(va).unwrap();
+    let other = OwnerGeneration::FIRST.checked_next().unwrap();
+    assert!(mem.write_host_bytes(frame, other, &[0x0f, 0x05]).is_err());
+    assert_eq!(mem.read_direct(va, 2).unwrap(), [0xeb, 0xfe]);
+    mem.write_host_bytes(frame, TestSoftMmuMemory::GEN, &[0x0f, 0x05])
+        .unwrap();
+    assert_eq!(cpu.step_block(&mut mem).unwrap(), sys(va, va + 2));
+    assert_eq!(cpu.translation_count(), 2);
+}
+
+fn setup_hot_set(count: usize) -> (SoftCpu, TestSoftMmuMemory, u64) {
+    let (cpu, mut mem, va) = setup_snippet(&[]);
+    mem.map_range(va, count * 16, PagePerms::USER_RX);
+    for i in 0..count {
+        let here = va + i as u64 * 16;
+        let next = va + ((i + 1) % count) as u64 * 16;
+        let mut code = vec![0xe9];
+        code.extend_from_slice(&((next as i64 - here as i64 - 5) as i32).to_le_bytes());
+        assert!(mem.write_direct(here, &code));
+    }
+    (cpu, mem, va)
+}
+
+#[test]
+#[ignore = "run explicitly in release mode for paired cache-thrash measurement"]
+fn translation_cache_hot_set_timing() {
+    let (mut cpu, mut mem, va) = setup_hot_set(201);
+    let start = std::time::Instant::now();
+    for index in 0..20_100 {
+        assert_eq!(
+            std::hint::black_box(cpu.step_block(&mut mem).unwrap()),
+            SoftCpuExit::Continue {
+                next_rip: va + ((index + 1) % 201) * 16
+            }
+        );
+    }
+    let elapsed = start.elapsed();
+    assert_eq!(cpu.context().rip, va);
+    println!("hot_set_ns={}", elapsed.as_nanos());
+}
+
+#[test]
+fn capacity_eviction_keeps_other_resident_blocks() {
+    let (mut cpu, mut mem, va) = setup_hot_set(1025);
+    for _ in 0..1025 {
+        cpu.step_block(&mut mem).unwrap();
+    }
+    assert_eq!(cpu.translation_count(), 1025);
+    // FIFO evicted the oldest key only. The second key is still resident.
+    cpu.context_mut().rip = va + 16;
+    assert_eq!(
+        cpu.step_block(&mut mem).unwrap(),
+        SoftCpuExit::Continue { next_rip: va + 32 }
+    );
+    assert_eq!(cpu.translation_count(), 1025);
+}
+
+#[test]
+fn typed_host_write_preflights_the_entire_physical_span() {
+    let (mut cpu, mut mem, va) = setup_snippet(&[]);
+    let frame = FrameGpa::new(TestSoftMmuMemory::POOL_BYTES - SOFT_TLB_PAGE_SIZE);
+    mem.map_alias(va, frame, PagePerms::USER_RX);
+    mem.write_host_bytes(frame, TestSoftMmuMemory::GEN, &[0xeb, 0xfe])
+        .unwrap();
+    cpu.step_block(&mut mem).unwrap();
+    // The first byte is valid but the second falls outside the inventory.
+    // Neither bytes nor the first frame's generation may change on refusal.
+    let (_, authenticated) =
+        translate_with_frame(cpu.context_mut(), &mut mem, va, SoftAccessKind::Execute).unwrap();
+    let generation = mem.code_generation(authenticated);
+    assert!(
+        mem.write_host_bytes(
+            FrameGpa::new(TestSoftMmuMemory::POOL_BYTES - 1),
+            TestSoftMmuMemory::GEN,
+            &[0xcc, 0xcc]
+        )
+        .is_err()
+    );
+    assert_eq!(mem.read_direct(va + 4095, 1).unwrap(), [0]);
+    assert_eq!(mem.code_generation(authenticated), generation);
+    assert_eq!(
+        cpu.step_block(&mut mem).unwrap(),
+        SoftCpuExit::Continue { next_rip: va }
+    );
+    assert_eq!(cpu.translation_count(), 1);
+    // Data walks do not inflate the instruction-fetch budget.
+    let mut bytes = [0; 2];
+    read_guest_bytes(
+        cpu.context_mut(),
+        &mut mem,
+        va,
+        &mut bytes,
+        SoftAccessKind::Read,
+    )
+    .unwrap();
+    assert_eq!(cpu.code_walk_count(), 2); // cold plan + explicit execute walk above
 }

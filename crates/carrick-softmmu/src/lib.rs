@@ -67,6 +67,6 @@ pub use tlb::{
 };
 pub use walker::{
     AccessOutcome, AuthenticatedDescriptorWords, ExtentCloneError, ExtentEditError, ExtentRecord,
-    ExtentTable, Reclaimed, ResolvedAccess, ResolvedSpan, RetiredIdentity, Retirement,
-    SoftMmuMemory, SoftWalker, SoftWalkerStats, WalkOutcome,
+    ExtentTable, HostWriteError, Reclaimed, ResolvedAccess, ResolvedSpan, RetiredIdentity,
+    Retirement, SoftMmuMemory, SoftWalker, SoftWalkerStats, WalkOutcome,
 };

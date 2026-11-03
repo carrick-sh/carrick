@@ -659,6 +659,62 @@ impl ExtentTable {
         ))
     }
 
+    /// Copy host-owned bytes into authenticated physical memory, invalidating
+    /// any code translations before publishing the bytes. The inventory borrow
+    /// excludes edits; the caller retains exclusive access to its backing.
+    /// Preflight every page so a range/owner/exhaustion refusal copies no bytes.
+    ///
+    /// # Safety
+    /// `placement` must belong to this inventory and retain live writable
+    /// backing throughout the call. The caller must exclude CPU/host accesses
+    /// to the destination until this copy completes, including through aliases.
+    pub unsafe fn write_host_bytes(
+        &mut self,
+        placement: &LinearPlacement,
+        start: FrameGpa,
+        owner: OwnerGeneration,
+        bytes: &[u8],
+    ) -> Result<(), HostWriteError> {
+        if self.is_terminal() {
+            return Err(HostWriteError::Terminal);
+        }
+        let end = start
+            .raw()
+            .checked_add(bytes.len() as u64)
+            .ok_or(HostWriteError::Range)?;
+        let mut pieces = alloc::vec::Vec::new();
+        let mut current = start.raw();
+        while current < end {
+            let frame = self
+                .authenticate(Stage1Gpa::new(current), PAGE_SIZE_4K, owner)
+                .ok_or(HostWriteError::Owner)?;
+            let offset = current & PAGE_OFFSET_MASK_4K;
+            let len = (end - current).min(PAGE_SIZE_4K - offset) as usize;
+            let host = placement
+                .host_range(frame, offset as usize + len)
+                .map_err(|_| HostWriteError::Range)?;
+            if self.is_code_page(frame) && self.code_generation(frame) == u64::MAX {
+                return Err(HostWriteError::GenerationExhausted);
+            }
+            pieces.push((frame, host.raw() + offset as usize, len));
+            current += len as u64;
+        }
+        let mut copied = 0;
+        for (frame, host, len) in pieces {
+            if self.is_code_page(frame) {
+                self.on_code_page_write(frame, &mut [])
+                    .ok_or(HostWriteError::GenerationExhausted)?;
+            }
+            // SAFETY: authenticated, placement-bounded span; the caller guarantees
+            // exclusive backing access and a disjoint source slice.
+            unsafe {
+                core::ptr::copy_nonoverlapping(bytes[copied..].as_ptr(), host as *mut u8, len)
+            };
+            copied += len;
+        }
+        Ok(())
+    }
+
     /// Mark a new code incarnation and flush write planes only on activation.
     /// Returns zero (and leaves it inactive) if generation space is exhausted.
     pub fn mark_code_page(
@@ -679,6 +735,18 @@ impl ExtentTable {
         }
         let code_gen = entry.1;
         if changed {
+            // Activation revokes writes in every seated CPU, including parked
+            // peers whose write TLB predates the first code fetch. The local
+            // caller is inside a block and must revoke immediately; every peer
+            // serves the published debt before its next access/block entry.
+            // No retired storage is held here, so the completion need not be
+            // retained. Dropping it does not cancel the domain's debt.
+            if commit_domain(&self.domain, InvalidationKind::RevokeWrite, None).is_err() {
+                self.terminal = true;
+                self.domain.make_terminal();
+                self.clear_code_page(frame_gpa);
+                return 0;
+            }
             for tlb in tlbs {
                 tlb.flush_write_plane();
             }
@@ -722,6 +790,15 @@ impl ExtentTable {
     }
 }
 
+/// A host physical write was refused before any backing bytes changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostWriteError {
+    Terminal,
+    Range,
+    Owner,
+    GenerationExhausted,
+}
+
 /// Trait representing the guest-physical memory and extent inventory seen by [`SoftWalker`].
 ///
 /// # Safety
@@ -737,12 +814,29 @@ impl ExtentTable {
 /// access must not introduce conflicting Rust references or data races; in
 /// particular, page-table atomics must not race with non-atomic guest accesses.
 /// A borrowed placement alone does not keep its backing alive.
-/// Host writes to marked code frames must advance their code generation before
-/// another block executes, just like guest writes through the walker.
+/// Host mutations use [`Self::write_host_bytes`], which authenticates physical
+/// ownership and advances code generations. Raw backing writes are only valid
+/// before publication or while no translations can exist.
 pub unsafe trait SoftMmuMemory {
     fn placement(&self) -> &LinearPlacement;
     fn extents(&self) -> &ExtentTable;
     fn extents_mut(&mut self) -> &mut ExtentTable;
+    /// Authenticated physical host copy through the inventory's generation
+    /// authority; the exclusive memory borrow retains and protects its backing.
+    fn write_host_bytes(
+        &mut self,
+        start: FrameGpa,
+        owner: OwnerGeneration,
+        bytes: &[u8],
+    ) -> Result<(), HostWriteError> {
+        let placement = *self.placement();
+        // SAFETY: SoftMmuMemory owns the live placement and its inventory;
+        // this exclusive borrow excludes competing accesses to the destination.
+        unsafe {
+            self.extents_mut()
+                .write_host_bytes(&placement, start, owner, bytes)
+        }
+    }
     fn on_descriptor_load(&self) {}
     fn before_descriptor_cas(&self, _pa: u64, _slot: &AtomicU64, _current: u64, _new: u64) {}
     fn mark_code_page(&mut self, frame_gpa: AuthenticatedGpa, tlbs: &mut [&mut SoftTlb]) -> u64 {
@@ -871,6 +965,7 @@ pub enum ResolvedSpan {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SoftWalkerStats {
     pub walks: u64,
+    pub code_walks: u64,
     pub tlb_fills: u64,
     pub page_faults: u64,
     pub cpu_exceptions: u64,
@@ -916,6 +1011,7 @@ impl SoftWalker {
             nxe,
             stats: SoftWalkerStats {
                 walks: 0,
+                code_walks: 0,
                 tlb_fills: 0,
                 page_faults: 0,
                 cpu_exceptions: 0,
@@ -972,6 +1068,9 @@ impl SoftWalker {
         mode: CpuAccessMode,
     ) -> Result<WalkOutcome, SoftTranslationError> {
         self.stats.walks += 1;
+        if access == Access::Execute {
+            self.stats.code_walks += 1;
+        }
         let effective_nxe = self.nxe && mode.efer_nxe;
         let effective_mode = mode.with_efer_nxe(effective_nxe);
         let hw_config = HardwareWalkConfig {
