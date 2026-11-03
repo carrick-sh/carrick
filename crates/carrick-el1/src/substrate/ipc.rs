@@ -5,6 +5,7 @@
 //! here; the Linux adapter (`personality::ipc`) decides what a step means.
 
 pub mod frame;
+pub mod scheduler;
 
 use crate::substrate::file::UserCopy;
 use carrick_el1_abi::ipc::pipe::{self, WaitFor, WakeSet};

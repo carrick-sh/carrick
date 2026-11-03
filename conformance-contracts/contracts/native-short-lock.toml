@@ -1,3 +1,7 @@
+# #1040 scheduler prerequisite: IPC consumes IpcScheduler with associated
+# context and frame types. The ARM adapter delegates to the existing Sched
+# methods; operation pins, queue enrollment and work budgets are unchanged.
+# Controls: focused ipc::tests, native_ipc_wake_tests and substrate IPC tests.
 # #1040 frame prerequisite: the park adapter computes its re-entry PC before
 # queue enrollment. The existing native short-lock protocol and zero-redispatch
 # budget are unchanged. Rerun bucket_contention_msgrcv and

@@ -1,3 +1,7 @@
+# #1040 scheduler prerequisite: IPC consumes IpcScheduler with associated
+# context and frame types. The ARM adapter delegates to the existing Sched
+# methods; operation pins, queue enrollment and work budgets are unchanged.
+# Controls: focused ipc::tests, native_ipc_wake_tests and substrate IPC tests.
 # #1040 frame prerequisite: ipc::park_key now obtains its ARM re-entry PC
 # through IpcFrame. Endpoint pins, token custody and release are unchanged.
 # Control: carrick-el1-linux::ipc::tests::el1_ipc_io_blocked_read_resumes_by_token_after_fd_reuse

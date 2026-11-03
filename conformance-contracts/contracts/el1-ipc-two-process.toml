@@ -1,3 +1,7 @@
+# #1040 scheduler prerequisite: IPC consumes IpcScheduler with associated
+# context and frame types. The ARM adapter delegates to the existing Sched
+# methods; operation pins, queue enrollment and work budgets are unchanged.
+# Controls: focused ipc::tests, native_ipc_wake_tests and substrate IPC tests.
 schema_version = 1
 id = "kernel.el1.ipc-two-process"
 title = "Two-process blocking pipe and eventfd IPC is served and parked in the guest"

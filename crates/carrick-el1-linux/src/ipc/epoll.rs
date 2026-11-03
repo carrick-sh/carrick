@@ -34,11 +34,10 @@
 //! reports `Changed`.
 
 use super::{
-    EL1_WAIT, Finish, IpcServed, IpcVenue, Parked, Sched, ThreadCpu, UserCopy, UserWord, finish,
-    leave, linux, mm_key, park, release_pin, snapshot, task_key,
+    EL1_WAIT, Finish, IpcServed, IpcVenue, LinuxIpcFrame, LinuxIpcScheduler, Parked, UserCopy,
+    finish, leave, linux, mm_key, park, release_pin, snapshot, task_key,
 };
 use carrick_el1_abi::IpcLeave;
-use carrick_el1_abi::TrapFrame;
 use carrick_el1_abi::ipc::epoll::{EpollItemRef, EpollReport};
 use carrick_el1_abi::ipc::fd::{Error as FdError, Fd, TableId};
 use carrick_el1_abi::ipc::pipe::WaitFor;
@@ -46,6 +45,7 @@ use carrick_el1_abi::ipc::{
     BackingToken, IpcBacking, IpcCounterDeadline, IpcHandback, IpcObjectHandle, IpcOpKind,
     IpcOpToken, IpcOperation, IpcUserVa, OfdPin, RawIpcObject, RawOfdPin,
 };
+use carrick_personality_linux::dispatch::SyscallFrame;
 
 /// `epoll_pwait` on AArch64 (`epoll_wait` is not in its table).
 pub const SYS_EPOLL_PWAIT: usize = 22;
@@ -79,9 +79,9 @@ enum Wait {
 /// A woken, expired or re-entered wait: retire the operation (dropping its
 /// pin), then serve the call from its original registers with what is left
 /// of its wait.
-pub(super) fn resume<C: ThreadCpu, U: UserWord, M: UserCopy>(
-    sched: &mut Sched<'_, C, U>,
-    frame: &mut TrapFrame,
+pub(super) fn resume<'zone, S: LinuxIpcScheduler<'zone>, M: UserCopy>(
+    sched: &mut S,
+    frame: &mut S::Frame,
     venue: &IpcVenue<'_>,
     user: &mut M,
     token: IpcOpToken,
@@ -98,9 +98,9 @@ pub(super) fn resume<C: ThreadCpu, U: UserWord, M: UserCopy>(
 }
 
 /// Serve a fresh `epoll_pwait` (see the module docs for what forwards).
-pub(super) fn serve<C: ThreadCpu, U: UserWord, M: UserCopy>(
-    sched: &mut Sched<'_, C, U>,
-    frame: &mut TrapFrame,
+pub(super) fn serve<'zone, S: LinuxIpcScheduler<'zone>, M: UserCopy>(
+    sched: &mut S,
+    frame: &mut S::Frame,
     venue: &IpcVenue<'_>,
     user: &mut M,
     interrupt: &mut dyn FnMut() -> bool,
@@ -110,41 +110,52 @@ pub(super) fn serve<C: ThreadCpu, U: UserWord, M: UserCopy>(
 
 /// `wait`: what is left of a resumed call's wait (`None`: a fresh call,
 /// whose timeout argument starts now).
-fn serve_with<C: ThreadCpu, U: UserWord, M: UserCopy>(
-    sched: &mut Sched<'_, C, U>,
-    frame: &mut TrapFrame,
+fn serve_with<'zone, S: LinuxIpcScheduler<'zone>, M: UserCopy>(
+    sched: &mut S,
+    frame: &mut S::Frame,
     venue: &IpcVenue<'_>,
     user: &mut M,
     wait: Option<Wait>,
     interrupt: &mut dyn FnMut() -> bool,
 ) -> IpcServed {
-    if frame.x[4] != 0 {
+    if frame.argument(4).unwrap_or_else(|| {
+        crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+    }) != 0
+    {
         return leave(sched, IpcLeave::EpollSigmask, IpcServed::Forward);
     }
-    let maxevents = i64::from(frame.x[2] as i32);
+    let maxevents = i64::from(frame.argument(2).unwrap_or_else(|| {
+        crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+    }) as i32);
     if maxevents <= 0 || maxevents > EP_MAX_EVENTS {
         // EINVAL, from the host's full validation.
         return IpcServed::Forward;
     }
-    let wait = wait.unwrap_or_else(|| match frame.x[3] as i32 {
-        0 => Wait::Poll,
-        ms if ms < 0 => Wait::Forever,
-        // Round up by one tick: the wait lasts at least `ms` (epoll_wait(2)).
-        ms => Wait::Until(
-            sched
-                .cpu
-                .now()
-                .saturating_add(sched.ticks(ms as u64 * 1_000_000))
-                .saturating_add(1),
-        ),
+    let wait = wait.unwrap_or_else(|| {
+        match frame.argument(3).unwrap_or_else(|| {
+            crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+        }) as i32
+        {
+            0 => Wait::Poll,
+            ms if ms < 0 => Wait::Forever,
+            // Round up by one tick: the wait lasts at least `ms` (epoll_wait(2)).
+            ms => Wait::Until(
+                sched
+                    .now()
+                    .saturating_add(sched.ticks(ms as u64 * 1_000_000))
+                    .saturating_add(1),
+            ),
+        }
     });
-    let task = sched.task;
+    let task = sched.task();
     let region = &venue.region;
     let Some(table) = venue.tables.table_of(task) else {
         return leave(sched, IpcLeave::NoTable, IpcServed::Forward);
     };
     let table = TableId::from_raw(table);
-    let fd = Fd(frame.x[0] as i32);
+    let fd = Fd(frame.argument(0).unwrap_or_else(|| {
+        crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+    }) as i32);
     let fda = region.fd(EL1_WAIT);
     match fda.get(table, fd) {
         Ok(snapshot) if epoll_of(snapshot.backing).is_some() => {}
@@ -162,8 +173,12 @@ fn serve_with<C: ThreadCpu, U: UserWord, M: UserCopy>(
         object,
         task: task_key(task),
         mm: mm_key(task),
-        buf: IpcUserVa(frame.x[1]),
-        orig_x0: frame.x[0],
+        buf: IpcUserVa(frame.argument(1).unwrap_or_else(|| {
+            crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+        })),
+        orig_x0: frame.argument(0).unwrap_or_else(|| {
+            crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+        }),
         nr: SYS_EPOLL_PWAIT as u32,
         ..IpcOperation::EMPTY
     };
@@ -193,12 +208,14 @@ fn serve_with<C: ThreadCpu, U: UserWord, M: UserCopy>(
     if let Wait::Until(deadline) = wait {
         op.deadline = IpcCounterDeadline::at(deadline);
     }
-    let buf = frame.x[1];
+    let buf = frame.argument(1).unwrap_or_else(|| {
+        crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+    });
     let limit = usize::try_from(maxevents).map_or(BATCH, |n| n.min(BATCH));
     loop {
         // Before the harvest: an item queued after it moves this snapshot.
         let wait = match wait {
-            Wait::Until(deadline) if sched.cpu.now() >= deadline => Wait::Poll,
+            Wait::Until(deadline) if sched.now() >= deadline => Wait::Poll,
             wait => wait,
         };
         let snap = if wait == Wait::Poll {
@@ -298,16 +315,16 @@ fn serve_with<C: ThreadCpu, U: UserWord, M: UserCopy>(
     }
 }
 
-fn returned(frame: &mut TrapFrame, result: i64) -> IpcServed {
-    frame.x[0] = result as u64;
+fn returned<G: LinuxIpcFrame>(frame: &mut G, result: i64) -> IpcServed {
+    frame.set_result(carrick_guest_arch::NativeReturnWord(result as u64));
     IpcServed::Returned { switched: false }
 }
 
 /// No effect was taken but the pin is not one EL1 may drop: the host drops
 /// it and runs the original call.
-fn restart<C: ThreadCpu, U: UserWord>(
-    sched: &mut Sched<'_, C, U>,
-    frame: &mut TrapFrame,
+fn restart<'zone, S: LinuxIpcScheduler<'zone>>(
+    sched: &mut S,
+    frame: &mut S::Frame,
     venue: &IpcVenue<'_>,
     op: IpcOperation,
 ) -> IpcServed {

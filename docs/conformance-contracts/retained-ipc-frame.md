@@ -30,12 +30,26 @@ not instruction execution, scheduling, endpoint retention or copyout supply.
 No descriptor lookup, syscall routing, copy cursor or wait queue policy changes
 in this prerequisite. Each save/restore copies a fixed eight words.
 
-The requested x86 blocking pipe-read witness is still missing: its production
-entry passes neither a scheduler venue nor an IPC venue, while the existing
-IPC scheduler transport carries `Aarch64ParkedContext`. The frame adapter alone
-does not authorize replacing either with another ISA's context or claiming an
-in-ring read. A common scheduler continuation transport and the real x86 IPC
-venue, followed by a red-first KVM park/write/wake witness, remain necessary.
+`IpcScheduler` now binds the shared IPC client to associated saved-context
+and frame types. IPC admission, transfer, owner-wait enrollment, operation
+retention and epoll no longer name `Sched` or `Aarch64ParkedContext`. The ARM
+implementation delegates to the existing scheduler methods, including park
+receipt consumption and wake delivery. `LinuxIpcFrame` separates canonical
+arguments/results and the Linux restart/handback markers from neutral register
+saves. The saved native ordinal remains owned by `IpcFrame`. This prerequisite
+changes neither the routing allowlist nor the current ARM epoll wire format.
+
+The x86 blocking pipe-read witness is still missing. Its production dispatch
+passes no IPC venue; the CPL0 host carrier has no IPC-directory/pool mapping
+or IPC-table-map publication. Calling the ARM `guest_venue` would access a
+window that x86 has not installed. The context-neutral interface is therefore
+necessary but insufficient for a runtime claim. An x86 implementation must
+bind the real retained authority, save full native context (including XSAVE
+and TLS), hand its typed park receipt to the common entry completion owner,
+and wake through the existing scheduler before a red-first KVM park/write/wake
+witness can pass. It must also preserve x86's packed epoll layout and native
+signal restart semantics when those families are admitted. No x86 execution,
+readv/pselect6 routing or signed acceptance is claimed by this prerequisite.
 
 The adapter's behavioural negative control replaces ARM's four-byte rewind
 with eight bytes and x86's two-byte rewind with four bytes. The focused frame
