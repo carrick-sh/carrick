@@ -891,7 +891,9 @@ printf '%s\n%s\n' "$CARGO_HOME" "$RUSTUP_HOME"
                 "private proxy:{}\n{}\n{}\n",
                 state.join("rust/cargo/bin/cargo").display(),
                 state.join("rust/cargo").display(),
-                rustup.display()
+                // The runner hands the child its canonical RUSTUP_HOME; on
+                // macOS the fixture's `/var` tempdir resolves to `/private/var`.
+                std::fs::canonicalize(&rustup).unwrap().display()
             )
         );
         assert_eq!(
