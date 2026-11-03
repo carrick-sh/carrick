@@ -29,49 +29,33 @@ pub struct AppliedReturn {
     pub mm_empty_at_revision: bool,
 }
 /// Inventory-owned implementation. Methods must not acquire an outer lock.
+/// Dropping a prepared claim restores its rows; after `stage1_cleared`, dropping
+/// it must quarantine the exact owner instead. Consuming methods disarm drop.
 pub trait ReturnClaim: Send {
-    fn owner(&self) -> FrameInventoryReceiptOwner;
     fn apply(self: Box<Self>) -> AppliedReturn;
     fn abort(self: Box<Self>);
-    fn abandon(self: Box<Self>);
-    fn retain_quarantined(self: Box<Self>);
+    fn stage1_cleared(&mut self, quarantine: Arc<dyn ReturnQuarantine>);
 }
 pub trait ReturnQuarantine: Send + Sync {
     fn quarantine(&self, owner: FrameInventoryReceiptOwner);
 }
 #[must_use]
 pub struct PreparedReturn {
-    claim: Option<Box<dyn ReturnClaim>>,
+    claim: Box<dyn ReturnClaim>,
 }
 impl PreparedReturn {
     pub fn from_inventory(claim: Box<dyn ReturnClaim>) -> Self {
-        Self { claim: Some(claim) }
+        Self { claim }
     }
-    pub fn abort(mut self) {
-        if let Some(claim) = self.claim.take() {
-            claim.abort();
-        }
+    pub fn abort(self) {
+        self.claim.abort();
     }
-    pub fn apply(mut self) -> AppliedReturn {
-        self.claim
-            .take()
-            .unwrap_or_else(|| {
-                carrick_fatal::carrick_fatal!("hal::prepared_return", "owned return claim missing")
-            })
-            .apply()
+    pub fn apply(self) -> AppliedReturn {
+        self.claim.apply()
     }
     pub fn stage1_cleared(mut self, quarantine: Arc<dyn ReturnQuarantine>) -> Stage1Cleared {
-        Stage1Cleared {
-            claim: self.claim.take(),
-            quarantine,
-        }
-    }
-}
-impl Drop for PreparedReturn {
-    fn drop(&mut self) {
-        if let Some(claim) = self.claim.take() {
-            claim.abandon();
-        }
+        self.claim.stage1_cleared(quarantine);
+        Stage1Cleared { claim: self.claim }
     }
 }
 /// After clearing stage-1, ordinary abort is unavailable.
@@ -88,31 +72,15 @@ impl Drop for PreparedReturn {
 /// ```
 #[must_use]
 pub struct Stage1Cleared {
-    claim: Option<Box<dyn ReturnClaim>>,
-    quarantine: Arc<dyn ReturnQuarantine>,
+    claim: Box<dyn ReturnClaim>,
 }
 impl Stage1Cleared {
-    pub fn apply(mut self) -> AppliedReturn {
-        self.claim
-            .take()
-            .unwrap_or_else(|| {
-                carrick_fatal::carrick_fatal!("hal::prepared_return", "owned return claim missing")
-            })
-            .apply()
+    pub fn apply(self) -> AppliedReturn {
+        self.claim.apply()
     }
     /// The caller retains the undo log and restores all leaves before returning.
-    pub fn undo_and_abort(mut self, undo: impl FnOnce()) {
+    pub fn undo_and_abort(self, undo: impl FnOnce()) {
         undo();
-        if let Some(claim) = self.claim.take() {
-            claim.abort();
-        }
-    }
-}
-impl Drop for Stage1Cleared {
-    fn drop(&mut self) {
-        if let Some(claim) = self.claim.take() {
-            self.quarantine.quarantine(claim.owner());
-            claim.retain_quarantined();
-        }
+        self.claim.abort();
     }
 }

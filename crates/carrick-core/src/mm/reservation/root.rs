@@ -143,7 +143,7 @@ pub struct ReturnSlot<'table> {
 
 /// Exact root lifetime. Incarnations are table-unique; the index also binds
 /// journal custody to its source root. Repeated raw MMs cannot stand in for it.
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub struct JournalIdentity<'table> {
     // A local custody token, never stored in the shared ABI. The borrow keeps
     // the originating table alive and unmoved until settlement finishes.
@@ -170,7 +170,13 @@ impl<'table> JournalIdentity<'table> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 struct JournalSlot {
     index: usize,
     epoch: u64,
@@ -181,7 +187,7 @@ struct JournalSlot {
 /// Slice 2a still eagerly clears these slots at retirement; slice 2b switches
 /// that existing path to retain them until the joined release acknowledges.
 #[must_use]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 pub struct RetiredJournal<'table> {
     identity: JournalIdentity<'table>,
     slots: [Option<JournalSlot>; DEFERRED_RETURNS],
@@ -202,7 +208,7 @@ impl<'table> RetiredJournal<'table> {
 /// retained at admission. Carrier integration must still finish physical
 /// release before acknowledging retained slots; 2a clears them eagerly.
 #[must_use]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct JournalRelease<'table> {
     identity: JournalIdentity<'table>,
     receipt: MmReleaseReceipt,
@@ -235,7 +241,7 @@ impl<'table> JournalRelease<'table> {
 /// Carrier-owned rendezvous. Either event may arrive first; acknowledgement is
 /// possible only after both exact-lifetime authorities have joined. No root
 /// lookup is performed, so a borrowed root and a recycled index are harmless.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct RetiredJournalJoin<'table> {
     origin: FrameInventoryOrigin,
     identity: JournalIdentity<'table>,

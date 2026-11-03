@@ -4712,7 +4712,13 @@ mod inventory_origin_tests {
     }
 }
 
+enum ReturnDisposition {
+    Prepared,
+    Cleared(std::sync::Arc<dyn carrick_hal::ReturnQuarantine>),
+    Completed,
+}
 struct ClaimedReturn {
+    disposition: ReturnDisposition,
     inventory: std::sync::Arc<FrameInventoryAuthority>,
     mm: FrameOwner,
     transaction: KernelTransactionId,
@@ -4720,7 +4726,7 @@ struct ClaimedReturn {
     last_unmapped: Vec<FrameId>,
 }
 impl ClaimedReturn {
-    fn restore(self: Box<Self>, abandoned: bool) {
+    fn restore(&mut self, abandoned: bool) {
         let mut state = self.inventory.state.lock();
         for row in &self.rows {
             match state.mappings.get_mut(&row.mapping) {
@@ -4737,26 +4743,32 @@ impl ClaimedReturn {
         if abandoned {
             state.abandoned_returns += 1;
         }
+        drop(state);
+        self.disposition = ReturnDisposition::Completed;
+    }
+}
+impl Drop for ClaimedReturn {
+    fn drop(&mut self) {
+        match std::mem::replace(&mut self.disposition, ReturnDisposition::Completed) {
+            ReturnDisposition::Prepared => self.restore(true),
+            ReturnDisposition::Cleared(quarantine) => {
+                // The exact-MM callback runs before acquiring the inventory leaf lock.
+                quarantine.quarantine(self.mm.receipt_owner());
+                self.inventory.state.lock().quarantined_returns += 1;
+            }
+            ReturnDisposition::Completed => {}
+        }
     }
 }
 impl carrick_hal::ReturnClaim for ClaimedReturn {
-    fn owner(&self) -> FrameInventoryReceiptOwner {
-        self.mm.receipt_owner()
-    }
-    fn abort(self: Box<Self>) {
+    fn abort(mut self: Box<Self>) {
         self.restore(false);
     }
-    fn abandon(self: Box<Self>) {
-        self.restore(true);
+    fn stage1_cleared(&mut self, quarantine: std::sync::Arc<dyn carrick_hal::ReturnQuarantine>) {
+        self.disposition = ReturnDisposition::Cleared(quarantine);
     }
-    fn retain_quarantined(self: Box<Self>) {
-        // Retiring rows and their reserved revision remain owned forever. No
-        // other entry point can mutate them; quarantine is performed outside
-        // this leaf lock by the required exact-MM callback.
-        self.inventory.state.lock().quarantined_returns += 1;
-    }
-    fn apply(self: Box<Self>) -> carrick_hal::AppliedReturn {
-        let mut last_unmapped = self.last_unmapped;
+    fn apply(mut self: Box<Self>) -> carrick_hal::AppliedReturn {
+        let mut last_unmapped = std::mem::take(&mut self.last_unmapped);
         let mut state = self.inventory.state.lock();
         for row in &self.rows {
             match state.mappings.get(&row.mapping) {
@@ -4791,11 +4803,14 @@ impl carrick_hal::ReturnClaim for ClaimedReturn {
         }
         state.return_claims -= 1;
         state.revision += 1;
-        carrick_hal::AppliedReturn {
+        let outcome = carrick_hal::AppliedReturn {
             revision: state.revision,
             last_unmapped,
             mm_empty_at_revision: !state.mm_mapping_counts.contains_key(&self.mm),
-        }
+        };
+        drop(state);
+        self.disposition = ReturnDisposition::Completed;
+        outcome
     }
 }
 impl FrameInventoryAuthority {
@@ -4862,6 +4877,7 @@ impl FrameInventoryAuthority {
         drop(state);
         Ok(carrick_hal::PreparedReturn::from_inventory(Box::new(
             ClaimedReturn {
+                disposition: ReturnDisposition::Prepared,
                 inventory: self.clone(),
                 mm,
                 transaction,
@@ -4920,6 +4936,43 @@ mod prepared_return_tests {
             .unwrap();
         inventory.apply(owner, reservation.commit(())).unwrap();
         (inventory, ids, owner, row)
+    }
+    #[test]
+    fn completion_drops_quarantine_outside_inventory_lock() {
+        struct CheckDrop {
+            inventory: Arc<FrameInventoryAuthority>,
+            observed: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl carrick_hal::ReturnQuarantine for CheckDrop {
+            fn quarantine(&self, _: FrameInventoryReceiptOwner) {
+                panic!("completed return must not quarantine");
+            }
+        }
+        impl Drop for CheckDrop {
+            fn drop(&mut self) {
+                self.observed.store(
+                    self.inventory.state.try_lock().is_some(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }
+        }
+        for abort in [false, true] {
+            let (inventory, ids, owner, row) = fixture();
+            let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let cleared = inventory
+                .prepare_return(&ids, owner, &[row])
+                .unwrap()
+                .stage1_cleared(Arc::new(CheckDrop {
+                    inventory: inventory.clone(),
+                    observed: observed.clone(),
+                }));
+            if abort {
+                cleared.undo_and_abort(|| {});
+            } else {
+                cleared.apply();
+            }
+            assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
+        }
     }
     #[test]
     fn return_claim_blocks_teardown_aborts_and_retries() {

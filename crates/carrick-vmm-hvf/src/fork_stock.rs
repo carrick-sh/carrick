@@ -13,6 +13,10 @@ use carrick_hal::fork_stock::{ForkStock, ForkTableLedger};
 #[derive(Default)]
 pub(crate) struct NativeChildPhysical {
     pub inherited: Vec<crate::trap::ForkPhysicalRetention>,
+    #[expect(
+        dead_code,
+        reason = "approved slice 2a prerequisite consumed by slice 2b"
+    )]
     pub(crate) inherited_by_frame: std::collections::BTreeMap<(u64, u64), Vec<usize>>,
     pub sources: carrick_hal::fork_stock::ForkHostBackingCustody,
     pub supplied: Option<
@@ -52,6 +56,10 @@ impl carrick_hal::physical_grants::NativePreparedSupplyCustody for NativeChildPh
 impl NativeChildPhysical {
     /// Settlement removes inventory rows first, then releases the exact
     /// inherited incarnation. Supplied grants retain their own typed owner.
+    #[expect(
+        dead_code,
+        reason = "approved slice 2a prerequisite consumed by slice 2b"
+    )]
     pub(crate) fn release_inherited_frame(&mut self, ipa: u64, generation: u64) {
         if let Some(indices) = self.inherited_by_frame.remove(&(ipa, generation)) {
             for index in indices {

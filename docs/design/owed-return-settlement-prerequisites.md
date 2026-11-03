@@ -174,7 +174,7 @@ The new claim lifecycle keeps the inventory lock innermost:
   locking, then validates rows and reserves revision headroom under the lock.
 - `ClaimedReturn::apply` and `restore` modify only inventory maps, reference
   arithmetic and counters. Apply's output vector is preallocated.
-- `Stage1Cleared::drop` calls quarantine **before** reacquiring the inventory
+- The concrete `ClaimedReturn::drop` in its cleared state calls quarantine **before** reacquiring the inventory
   lock to retain and count the abandoned claim.
 
 None of these critical sections acquires `fork_stock`, a reservation root,
@@ -185,3 +185,18 @@ tracing. Activation of the wider physical gate still requires review.
 
 The branch remains draft. Slice 2a and its consuming 2b must be reviewed and
 gated together; the dormant prerequisite types are not a landing unit.
+
+### Authority-debt blocker
+
+The HAL wrappers now own mandatory boxed claims. The inventory-owned claim
+carries its abandonment policy, so consuming a wrapper needs no missing-claim
+fatal branch. Prepared drop restores rows; cleared drop quarantines the exact
+MM before taking the inventory lock; successful apply or abort disarms drop.
+
+The checkpoint still introduces invariant-fatal sites in the inventory claim
+and the admitted-MM conversion. The authority-debt source gate rejects these
+unclassified sites. Its ceilings have not been increased. The inventory claim
+retains IDs into mutable maps rather than owning stable row/reference tokens;
+removing those checks safely requires stronger inventory custody types. This
+is an additional draft blocker, not a passing gate or permission to remove
+checks from an allegedly infallible commit.
