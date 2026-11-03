@@ -191,8 +191,21 @@ install -m 755 rustup-init /tmp/rustup-init
 cp rust-toolchain.toml /home/runner/rust-toolchain.toml
 chown -R runner:runner /home/runner
 channel=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)
-runuser -u runner -- /tmp/rustup-init -y --profile minimal --default-toolchain "$channel"
-runuser -u runner -- bash -c 'cd /home/runner; . "$HOME/.cargo/env"; rustup show; rustup target add x86_64-unknown-none; rustc --version; cargo --version'
+if [[ $(cat profile) == agent ]]; then
+  # Install once under a root-owned prefix. The runner and each dispatch worker
+  # have writable Cargo homes, but cannot replace the compiler or rustup state.
+  export RUSTUP_HOME=/opt/carrick-rust/rustup
+  CARGO_HOME=/home/runner/.cargo /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain "$channel"
+  (cd /home/runner; CARGO_HOME=/home/runner/.cargo /home/runner/.cargo/bin/rustup show)
+  chown -R root:root /opt/carrick-rust
+  chmod -R a+rX,go-w /opt/carrick-rust
+  chown -R runner:runner /home/runner/.cargo
+  runuser -u runner -- env RUSTUP_HOME="$RUSTUP_HOME" RUSTUP_AUTO_INSTALL=0 /home/runner/.cargo/bin/rustc --version
+  runuser -u runner -- test ! -w "$RUSTUP_HOME"
+else
+  runuser -u runner -- /tmp/rustup-init -y --profile minimal --default-toolchain "$channel"
+  runuser -u runner -- bash -c 'cd /home/runner; . "$HOME/.cargo/env"; rustup show; rustup target add x86_64-unknown-none; rustc --version; cargo --version'
+fi
 systemctl enable --now qemu-guest-agent
 # Guest-only firewall: permit replies to the controller's SSH connection and
 # DHCP/DNS, but deny job-initiated connections to management/private networks.
@@ -252,7 +265,7 @@ if ! gh api --help </dev/null | grep -q -- '--slurp'; then
   exit 1
 fi
 mkdir -p /var/lib/carrick-ci
-jq -n --arg kernel "$(uname -r)" --arg rust "$(runuser -u runner -- /home/runner/.cargo/bin/rustc --version)" \
+jq -n --arg kernel "$(uname -r)" --arg rust "$(runuser -u runner -- env RUSTUP_HOME="${RUSTUP_HOME:-/home/runner/.rustup}" /home/runner/.cargo/bin/rustc --version)" \
   --arg gh "$gh_version" \
   '{kernel:$kernel,rust:$rust,gh:$gh,kvm_api:12,user:"runner",svm:true,runner_registered:false}' > /var/lib/carrick-ci/qualification.json
 dpkg-query -W -f='${Package}=${Version}\n' > /var/lib/carrick-ci/packages.txt

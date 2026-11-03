@@ -4,9 +4,9 @@ use crate::ci_scaler::{ScalerError, execute};
 use crate::dispatch_mint::MintFailure;
 use serde::Deserialize;
 use sha2::{Digest, Sha512};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 #[derive(clap::Args, Debug)]
@@ -192,8 +192,20 @@ pub(crate) fn isolate_rust_homes(
     command: &mut std::process::Command,
     state: &Path,
 ) -> Result<(), ScalerError> {
+    isolate_rust_homes_owned(command, state, 0)
+}
+
+fn isolate_rust_homes_owned(
+    command: &mut std::process::Command,
+    state: &Path,
+    owner: u32,
+) -> Result<(), ScalerError> {
     let private = state.canonicalize()?.join("rust");
     private_dir(&private)?;
+    command.env(
+        "CARGO_TARGET_DIR",
+        state.canonicalize()?.join("work/target"),
+    );
     let mut homes = Vec::new();
     for (key, directory) in [("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")] {
         let configured = command
@@ -226,7 +238,11 @@ pub(crate) fn isolate_rust_homes(
                 )?;
             }
         } else {
-            copy_rust_home(&source, &destination, &mut Vec::new())?;
+            verify_rustup_tree(&source, owner, &mut BTreeSet::new())?;
+            command
+                .env("RUSTUP_HOME", &source)
+                .env("RUSTUP_AUTO_INSTALL", "0");
+            continue;
         }
         command.env(key, &destination);
         homes.push((source, destination));
@@ -256,6 +272,48 @@ pub(crate) fn isolate_rust_homes(
         "PATH",
         std::env::join_paths(paths).map_err(|_| ScalerError::Guard("invalid private Rust PATH"))?,
     );
+    Ok(())
+}
+
+// Provisioned toolchains contain regular files and directories. Refuse links
+// rather than letting a writable link target redirect a compiler after validation.
+// Verify metadata only; never read or copy toolchain file contents.
+fn verify_rustup_tree(
+    path: &Path,
+    owner: u32,
+    seen: &mut BTreeSet<PathBuf>,
+) -> Result<(), ScalerError> {
+    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(ScalerError::Guard(
+            "links are not admitted in the shared Rust toolchain",
+        ));
+    }
+    let path = path.canonicalize()?;
+    if seen.contains(&path) {
+        return Ok(());
+    }
+    // Production also authenticates every ancestor. Fixture owners can validate
+    // a tree beneath a temporary directory without owning the system root.
+    for ancestor in path
+        .ancestors()
+        .take_while(|ancestor| owner == 0 || ancestor.starts_with(&path))
+    {
+        let metadata = ancestor.metadata()?;
+        if metadata.uid() != owner || metadata.permissions().mode() & 0o022 != 0 {
+            return Err(ScalerError::Guard(
+                "Rust toolchain must be root-owned and not group/other writable",
+            ));
+        }
+    }
+    let metadata = path.metadata()?;
+    if metadata.is_dir() {
+        seen.insert(path.clone());
+        for entry in std::fs::read_dir(path)? {
+            verify_rustup_tree(&entry?.path(), owner, seen)?;
+        }
+    } else if !metadata.is_file() {
+        return Err(ScalerError::Guard("unsupported Rust toolchain entry"));
+    }
     Ok(())
 }
 
@@ -643,6 +701,19 @@ pub fn run(root: &Path, args: Args) -> Result<(), ScalerError> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    fn lock_fixture_tree(path: &Path) {
+        let metadata = path.metadata().unwrap();
+        std::fs::set_permissions(
+            path,
+            std::fs::Permissions::from_mode(metadata.permissions().mode() & !0o022),
+        )
+        .unwrap();
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(path).unwrap() {
+                lock_fixture_tree(&entry.unwrap().path());
+            }
+        }
+    }
     /// #1474: only a fine-grained PAT with no OAuth scopes is used for
     /// Copilot. Fixtures are fake; no reason ever echoes the token.
     #[test]
@@ -723,7 +794,8 @@ mod tests {
                 .env("RUSTC", cargo.parent().unwrap().join("rustc"))
                 .env("CARGO_HOME", &cargo_home)
                 .env("RUSTUP_HOME", &rustup);
-            isolate_rust_homes(&mut command, &state).unwrap();
+            lock_fixture_tree(&rustup);
+            isolate_rust_homes_owned(&mut command, &state, unsafe { libc::geteuid() }).unwrap();
             let output = command.output().unwrap();
             assert!(
                 !marker.exists(),
@@ -748,13 +820,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let cargo = temp.path().join("cargo");
         let rustup = temp.path().join("rustup");
-        let toolchain = temp.path().join("linked-toolchain");
+        let toolchain = rustup.join("toolchains/stable");
         let state = temp.path().join("state");
         std::fs::create_dir_all(cargo.join("bin")).unwrap();
         std::fs::create_dir_all(cargo.join("registry/cache")).unwrap();
         std::fs::create_dir_all(rustup.join("toolchains")).unwrap();
         std::fs::create_dir_all(toolchain.join("bin")).unwrap();
-        std::os::unix::fs::symlink(&toolchain, rustup.join("toolchains/stable")).unwrap();
         std::fs::create_dir(&state).unwrap();
         let state = state.canonicalize().unwrap();
         let proxy = b"#!/bin/sh\nprintf 'private proxy:%s\\n' \"$0\"\n";
@@ -787,7 +858,7 @@ mod tests {
                 "-c",
                 r#"cargo
 printf poisoned > "$CARGO_HOME/registry/cache/sample"
-printf poisoned > "$RUSTUP_HOME/toolchains/stable/bin/rustc"
+test ! -e "${CARGO_HOME}/../rustup"
 printf poisoned > "$CARGO_HOME/bin/cargo"
 printf '%s\n%s\n' "$CARGO_HOME" "$RUSTUP_HOME"
 "#,
@@ -795,7 +866,8 @@ printf '%s\n%s\n' "$CARGO_HOME" "$RUSTUP_HOME"
             .env("CARGO_HOME", &cargo)
             .env("RUSTUP_HOME", &rustup)
             .env("PATH", cargo.join("bin"));
-        isolate_rust_homes(&mut child, &state).unwrap();
+        lock_fixture_tree(&rustup);
+        isolate_rust_homes_owned(&mut child, &state, unsafe { libc::geteuid() }).unwrap();
         let output = child.output().unwrap();
         assert!(output.status.success(), "{output:?}");
         assert_eq!(
@@ -819,7 +891,7 @@ printf '%s\n%s\n' "$CARGO_HOME" "$RUSTUP_HOME"
                 "private proxy:{}\n{}\n{}\n",
                 state.join("rust/cargo/bin/cargo").display(),
                 state.join("rust/cargo").display(),
-                state.join("rust/rustup").display()
+                rustup.display()
             )
         );
         assert_eq!(
@@ -827,17 +899,46 @@ printf '%s\n%s\n' "$CARGO_HOME" "$RUSTUP_HOME"
             0o700
         );
         assert!(!state.join("rust/cargo/bin/cargo").is_symlink());
-        assert!(!state.join("rust/rustup/toolchains/stable").is_symlink());
-        assert_eq!(
-            state
-                .join("rust/rustup/toolchains/stable/bin/rustc")
-                .metadata()
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
-        );
+        assert!(!state.join("rust/rustup").exists());
+    }
+    #[test]
+    fn worker_refuses_a_writable_toolchain_instead_of_copying_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let cargo = temp.path().join("cargo");
+        let rustup = temp.path().join("rustup");
+        let state = temp.path().join("state");
+        for path in [&cargo, &rustup, &state] {
+            std::fs::create_dir(path).unwrap();
+        }
+        std::fs::set_permissions(&rustup, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let mut command = std::process::Command::new("/bin/true");
+        command
+            .env("CARGO_HOME", &cargo)
+            .env("RUSTUP_HOME", &rustup);
+        assert!(isolate_rust_homes(&mut command, &state).is_err());
+        assert!(!state.join("rust/rustup").exists());
+    }
+    #[test]
+    fn shared_toolchain_rejects_writable_entries_and_link_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let tree = temp.path().join("rustup");
+        std::fs::create_dir(&tree).unwrap();
+        let compiler = tree.join("rustc");
+        std::fs::write(&compiler, "compiler").unwrap();
+        let owner = unsafe { libc::geteuid() };
+        lock_fixture_tree(&tree);
+        verify_rustup_tree(&tree, owner, &mut BTreeSet::new()).unwrap();
+        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(verify_rustup_tree(&tree, owner, &mut BTreeSet::new()).is_err());
+        std::fs::remove_file(&compiler).unwrap();
+        let external = temp.path().join("external");
+        std::fs::write(&external, "writable compiler").unwrap();
+        std::fs::set_permissions(&external, std::fs::Permissions::from_mode(0o666)).unwrap();
+        std::os::unix::fs::symlink(&external, &compiler).unwrap();
+        assert!(verify_rustup_tree(&tree, owner, &mut BTreeSet::new()).is_err());
+        if owner != 0 {
+            assert!(verify_rustup_tree(&tree, 0, &mut BTreeSet::new()).is_err());
+        }
     }
     #[test]
     fn tool_digest_is_verified_before_extracting_the_named_binary() {

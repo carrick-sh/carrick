@@ -1022,3 +1022,13 @@ fn only_the_chain_step_holds_actions_write() {
         "the dispatch carries the outcome id only"
     );
 }
+
+#[test]
+fn workers_verify_the_template_toolchain_without_installing_it() {
+    let workflow = include_str!("../../../.github/workflows/dispatch-worker.yml");
+    assert!(!workflow.contains("dtolnay/rust-toolchain@"));
+    assert!(workflow.contains("test ! -w \"$RUSTUP_HOME\""));
+    assert!(workflow.contains("test \"$RUSTUP_AUTO_INSTALL\" = 0"));
+    let launcher = include_str!("../../../scripts/ci/runner-once.sh");
+    assert!(launcher.contains("export RUSTUP_HOME=/opt/carrick-rust/rustup"));
+}
