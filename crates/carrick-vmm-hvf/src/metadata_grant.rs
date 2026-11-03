@@ -2556,12 +2556,12 @@ pub(crate) fn abi_stack_ptr<T>(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn retained_abi_region(
-    custody: &crate::trap::CarrierVmCustody,
+    _custody: &crate::trap::CarrierVmCustody,
 ) -> Option<RetainedAbiRegion<'_>> {
     // SAFETY: the synchronous stopped lane retains this carrier's ABI mapping.
     unsafe {
         RetainedAbiRegion::new(
-            custody.abi_region_pointer()?.as_ptr(),
+            carrick_el1_abi::get_el1_region_host_ptr() as *mut u8,
             carrick_el1_abi::EL1_REGION_SIZE as usize,
         )
     }
