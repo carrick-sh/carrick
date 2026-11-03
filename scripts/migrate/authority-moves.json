@@ -65,6 +65,11 @@
       "from": "carrick_kernel::kernel::scheduler::IdleAnnouncement<'a>::release",
       "to": "carrick_kernel::kernel::scheduler::IdleAnnouncement::release",
       "issue": 1071
+    },
+    {
+      "from": "carrick_runtime::el1_census::write_at_teardown",
+      "to": "carrick_runtime::el1_census::publish",
+      "issue": 1394
     }
   ],
   "terminal_custody": []
