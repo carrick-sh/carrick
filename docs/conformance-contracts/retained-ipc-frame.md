@@ -28,3 +28,10 @@ IPC scheduler transport carries `Aarch64ParkedContext`. The frame adapter alone
 does not authorize replacing either with another ISA's context or claiming an
 in-ring read. A common continuation transport and the real x86 IPC venue,
 followed by a red-first KVM park/write/wake witness, remain necessary.
+
+The adapter's behavioural negative control replaces ARM's four-byte rewind
+with eight bytes and x86's two-byte rewind with four bytes. The focused frame
+suite then exits 101: the ARM entry is 4092 rather than 4096, the x86 entry is
+4094 rather than 4096, and the unaligned x86 entry is 4095 rather than 4097.
+The tests check both the production park's `ipc_reentry_pc` and snapshot
+restoration, so a wrong offset cannot pass by changing only one adapter method.

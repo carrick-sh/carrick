@@ -124,6 +124,7 @@ mod tests {
         frame.x[..6].copy_from_slice(&[3, 0x4000, 9, 11, 12, 13]);
         frame.x[8] = 63;
         frame.x[19] = 0x1919;
+        assert_eq!(frame.ipc_reentry_pc().map(|pc| pc.raw()), Some(0x1000));
         let saved = frame.save_ipc_call();
         frame.x[..6].fill(0xdead);
         frame.x[8] = 0xbeef;
@@ -156,6 +157,7 @@ mod tests {
             rsp: 0x8000,
             ..NativeFrame::default()
         };
+        assert_eq!(frame.ipc_reentry_pc().map(|pc| pc.raw()), Some(0x1000));
         let saved = frame.save_ipc_call();
         frame.rax = 42;
         frame.rdi = 0xdead;
@@ -189,6 +191,7 @@ mod tests {
             rcx: 0x1003,
             ..NativeFrame::default()
         };
+        assert_eq!(frame.ipc_reentry_pc().map(|pc| pc.raw()), Some(0x1001));
         let saved = frame.save_ipc_call();
         assert!(frame.restore_ipc_reentry(&saved));
         assert_eq!(frame.rcx, 0x1001);
@@ -201,6 +204,7 @@ mod tests {
                 elr: pc,
                 ..TrapFrame::default()
             };
+            assert!(arm.ipc_reentry_pc().is_none());
             let saved = arm.save_ipc_call();
             let before = arm;
             assert!(!arm.restore_ipc_reentry(&saved));
@@ -212,6 +216,7 @@ mod tests {
                 rax: 7,
                 ..NativeFrame::default()
             };
+            assert!(x86.ipc_reentry_pc().is_none());
             let saved = x86.save_ipc_call();
             assert!(!x86.restore_ipc_reentry(&saved));
             assert_eq!((x86.rcx, x86.rax), (pc, 7));
