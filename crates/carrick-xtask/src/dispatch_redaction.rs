@@ -177,6 +177,16 @@ pub(crate) fn redact(bytes: &[u8]) -> String {
         .map(|gate| gate.diagnostic(bytes))
         .unwrap_or_else(|_| "[REDACTED: credential state unavailable]".into())
 }
+/// Redact the whole stream before cutting to `limit` tail bytes: a credential
+/// split by the cut would lose the prefix the redactor recognises it by (#1458).
+pub(crate) fn redact_tail(bytes: &[u8], limit: usize) -> String {
+    let redacted = redact(bytes);
+    let mut start = redacted.len().saturating_sub(limit);
+    while !redacted.is_char_boundary(start) {
+        start += 1;
+    }
+    redacted[start..].to_owned()
+}
 #[cfg(test)]
 mod tests {
     #[test]
@@ -235,5 +245,14 @@ mod tests {
             super::redact(b"curl: connection refused"),
             "curl: connection refused"
         );
+    }
+    #[test]
+    fn redact_tail_redacts_before_cutting_on_char_boundary() {
+        let secret = "Q7".repeat(30);
+        let text = format!("auth ghp_{secret}\n{}é\n", "y".repeat(60));
+        let tail = super::redact_tail(text.as_bytes(), 80);
+        assert!(tail.len() <= 80, "{}", tail.len());
+        assert!(!tail.contains(&secret[secret.len() - 16..]), "{tail}");
+        assert!(tail.contains("[REDACTED]"), "{tail}");
     }
 }

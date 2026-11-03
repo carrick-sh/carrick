@@ -854,19 +854,13 @@ fn capacity_failure(args: &[&str], status: i32, stderr: &str) -> (String, Value)
     } else {
         format!("exited with status {status}")
     };
-    // Redact the whole stream before cutting: a credential split by the cut
-    // would lose the prefix the redactor recognises it by.
-    let stderr = crate::dispatch_redaction::redact(stderr.as_bytes());
-    let mut start = stderr.len().saturating_sub(CAPACITY_STDERR_TAIL);
-    while !stderr.is_char_boundary(start) {
-        start += 1;
-    }
+    let stderr = crate::dispatch_redaction::redact_tail(stderr.as_bytes(), CAPACITY_STDERR_TAIL);
     (
         format!(
             "live capacity query failed: `{command}` {ended}; this is a probe failure, not a capacity reading"
         ),
         json!({"phase":"capacity-command","command":command,"status":status,
-            "outcome":ended,"stderr_tail":&stderr[start..]}),
+            "outcome":ended,"stderr_tail":stderr}),
     )
 }
 fn roster(text: &str) -> Vec<Value> {
@@ -2009,14 +2003,57 @@ impl Server<'_> {
             )
         });
         if last_failed && published_exit.is_none() {
-            observations
-                .push("the last worker failed, timed out, or did not produce complete output");
+            let state = crate::agent_runner::state().ok();
+            let package = path.parent();
+            let last_exit = applied.last_worker_exit.or_else(|| {
+                state
+                    .as_deref()
+                    .and_then(|s| worker_checkpoint(s, &self.dispatch).ok().flatten())
+                    .map(|r| LauncherExit::from_code(r.exit_code))
+            });
+            let last_error = applied
+                .last_worker_error
+                .as_deref()
+                .map(|e| format_worker_error(e, &self.token))
+                .or_else(|| {
+                    package
+                        .and_then(latest_worker_session_error)
+                        .map(|e| format_worker_error(&e, &self.token))
+                })
+                .or_else(|| {
+                    state
+                        .as_deref()
+                        .and_then(|s| diagnostic_text(&s.join("agent.err")).ok())
+                        .and_then(|e| extract_stderr_error(&e))
+                        .map(|e| format_worker_error(&e, &self.token))
+                })
+                .filter(|e| !e.is_empty());
+            let exit = last_exit.map(|exit| match exit {
+                LauncherExit::Clean => "exit status 0".to_owned(),
+                LauncherExit::TimedOut => "exit status 124, timed out".to_owned(),
+                LauncherExit::Code(code) => format!("exit status {code}"),
+            });
+            let detail = match (exit, last_error.as_deref()) {
+                (Some(exit), Some(error)) => format!(" ({exit}: {error})"),
+                (Some(exit), None) => format!(" ({exit})"),
+                (None, Some(error)) => format!(" ({error})"),
+                (None, None) => String::new(),
+            };
+            observations.push(format!(
+                "the last worker failed, timed out, or did not produce complete output{detail}"
+            ));
+            if let Some(error) = last_error.as_deref()
+                && loop_summary_claims_absent_cause(summary, error)
+            {
+                observations
+                    .push("loop summary names a cause absent from the worker error".to_owned());
+            }
         }
         if applied.published_checkpoint {
-            observations.push("the published HEAD is a server-created checkpoint");
+            observations.push("the published HEAD is a server-created checkpoint".to_owned());
         }
         if matches!(applied.body, AppliedBody::Failed(_)) {
-            observations.push("PR body publication failed");
+            observations.push("PR body publication failed".to_owned());
         }
         let unpushed = (observations.is_empty() && claimed_done)
             .then(|| self.unpushed_head())
@@ -2975,6 +3012,10 @@ impl Server<'_> {
                 }
                 let started = Instant::now();
                 let worker_index = self.history.len();
+                let _ = Applied::record(|applied| {
+                    applied.last_worker_exit = None;
+                    applied.last_worker_error = None;
+                });
                 let result = (|| -> Result<Value, ScalerError> {
                     let remaining = Duration::from_millis(
                         self.policy.worker_minutes * 60_000 - self.used.worker_millis,
@@ -3040,8 +3081,20 @@ impl Server<'_> {
                     let contract: Contract = serde_json::from_str(&text)?;
                     self.history.push(contract.clone());
                     self.write_handoff()?;
-                    Ok(json!({"ok":true,"status":contract.status,
-                    "worker_contract_excerpt":text.chars().take(8000).collect::<String>()}))
+                    let mut response = json!({"ok":true,"status":contract.status,
+                    "worker_contract_excerpt":text.chars().take(8000).collect::<String>()});
+                    if contract.status == ContractStatus::Failed
+                        && let Ok(applied) = Applied::load()
+                    {
+                        if let Some(error) = applied.last_worker_error {
+                            response["worker_error"] =
+                                format_worker_error(&error, &self.token).into();
+                        }
+                        if let Some(exit) = applied.last_worker_exit {
+                            response["worker_exit"] = exit.to_string().into();
+                        }
+                    }
+                    Ok(response)
                 })();
                 self.used.worker_millis = self.used.worker_millis.saturating_add(
                     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -3059,6 +3112,13 @@ impl Server<'_> {
                         ),
                         tests: vec![],
                         risks: vec![],
+                    });
+                    let _ = Applied::record(|applied| {
+                        if applied.last_worker_error.is_none() {
+                            applied.last_worker_error =
+                                Some(format_worker_error(&error.to_string(), &self.token))
+                                    .filter(|err| !err.is_empty());
+                        }
                     });
                 }
                 let checkpoint = self.checkpoint_publish();
@@ -3529,6 +3589,38 @@ pub(super) fn chain_section(body: &str) -> Option<ChainSection> {
         checkpoint,
         brief,
     })
+}
+
+/// Whether the coordinator's `loop_summary` claims a failure cause (such as
+/// missing auth/credentials or an HTTP status) absent from the worker's own
+/// observed error (#1473).
+fn loop_summary_claims_absent_cause(summary: &str, worker_error: &str) -> bool {
+    let summary_lower = summary.to_ascii_lowercase();
+    let error_lower = worker_error.to_ascii_lowercase();
+    if error_lower.is_empty() || summary_lower.contains(&error_lower) {
+        return false;
+    }
+    const CAUSES: &[&str] = &[
+        "401",
+        "403",
+        "429",
+        "unauthorized",
+        "unauthenticated",
+        "authentication",
+        "credential",
+        "bearer",
+        "oauth",
+        "api key",
+        "quota",
+        "rate limit",
+        "rate-limit",
+        "due to ",
+        "because ",
+        "caused by ",
+    ];
+    CAUSES
+        .iter()
+        .any(|cause| summary_lower.contains(cause) && !error_lower.contains(cause))
 }
 
 /// The server-written part of a dispatch outcome: before `<details>`, which
@@ -5614,6 +5706,164 @@ fi
     #[test]
     fn followup_recovered_worker_can_finish_done() {
         outcome_floor_fixture(vec![FixtureTurn::MissingResult, FixtureTurn::Good], true);
+    }
+    /// #1473: when the last worker fails with a `turn.failed` or launcher
+    /// error X, the server-observed outcome section includes X verbatim
+    /// (redacted, tail-limited via `redact_tail`) and the exit status, and
+    /// flags a coordinator `loop_summary` that names a cause absent from X.
+    #[test]
+    fn server_observed_outcome_includes_worker_turn_failed_error_and_exit_status() {
+        shared_fixture(|root| {
+            struct TurnFailedHost {
+                error_msg: String,
+                exit_code: i32,
+                retired: bool,
+            }
+            impl WorkerHost for TurnFailedHost {
+                fn initialize(&mut self) -> Result<(), ScalerError> {
+                    Ok(())
+                }
+                fn prepare(&mut self, _: &Path, _: &Path, _: &str) -> Result<(), ScalerError> {
+                    Ok(())
+                }
+                fn agent(&mut self, root: &Path, _: &Dispatch) -> Result<i32, ScalerError> {
+                    self.retired = false;
+                    let state = crate::agent_runner::state()?;
+                    let actor = root.parent().unwrap();
+                    std::fs::write(state.join("agent.out"), "agent started\n")?;
+                    std::fs::write(state.join("agent.err"), "")?;
+                    std::fs::write(actor.join("result.json"), "{}")?;
+                    let runtime = actor.join("runtime/dispatch");
+                    std::fs::create_dir_all(&runtime)?;
+                    let log = format!(
+                        "{{\"type\":\"thread.started\",\"thread_id\":\"t1\"}}\n{}\n",
+                        json!({"type":"turn.failed","error":{"message":self.error_msg}})
+                    );
+                    std::fs::write(runtime.join("worker.log"), log)?;
+                    Ok(self.exit_code)
+                }
+                fn retire(&mut self) -> Result<(), ScalerError> {
+                    self.retired = true;
+                    Ok(())
+                }
+                fn hand_back(&mut self, _: &Path) -> Result<(), ScalerError> {
+                    assert!(self.retired);
+                    Ok(())
+                }
+            }
+
+            let base = root.join("base");
+            let dispatch = native_dispatch(&base);
+            let mut server = server(&base);
+            server.dispatch = dispatch;
+            let raw_error = "failed to initialize sqlite state runtime: token fixture-token\nauth ghp_secretcredential1234";
+            let expected_redacted =
+                "failed to initialize sqlite state runtime: token [REDACTED] [REDACTED]";
+            server.launcher = Box::new(ObservedNativeLauncher(NativeLauncher {
+                host: Box::new(TurnFailedHost {
+                    error_msg: raw_error.into(),
+                    exit_code: 1,
+                    retired: true,
+                }),
+            }));
+            let response = server.execute(worker_request()).unwrap();
+            assert_eq!(response["worker_error"], expected_redacted);
+            server
+                .execute(Request::Finish(Outcome {
+                    status: FinishStatus::Failed,
+                    summary: "HTTP 401 Unauthorized due to missing bearer credentials".into(),
+                    brief: None,
+                }))
+                .unwrap();
+            let posted = regular_text(&root.join("posted.md")).unwrap();
+            let server_section = server_part(&posted);
+            assert!(
+                server_section.contains(&format!(
+                    "Server observed: the last worker failed, timed out, or did not produce complete output (exit status 1: {expected_redacted})"
+                )),
+                "{server_section}"
+            );
+            assert!(
+                !posted.contains("fixture-token") && !posted.contains("ghp_secretcredential1234"),
+                "credential leaked in outcome: {posted}"
+            );
+            assert!(
+                server_section.contains("loop summary names a cause absent from the worker error"),
+                "{server_section}"
+            );
+        });
+    }
+    #[test]
+    fn server_observed_worker_error_redacts_credential_straddling_tail_cut() {
+        shared_fixture(|root| {
+            struct LauncherStderrHost {
+                stderr: String,
+                retired: bool,
+            }
+            impl WorkerHost for LauncherStderrHost {
+                fn initialize(&mut self) -> Result<(), ScalerError> {
+                    Ok(())
+                }
+                fn prepare(&mut self, _: &Path, _: &Path, _: &str) -> Result<(), ScalerError> {
+                    Ok(())
+                }
+                fn agent(&mut self, root: &Path, _: &Dispatch) -> Result<i32, ScalerError> {
+                    self.retired = false;
+                    let state = crate::agent_runner::state()?;
+                    let actor = root.parent().unwrap();
+                    std::fs::write(state.join("agent.out"), "")?;
+                    std::fs::write(state.join("agent.err"), &self.stderr)?;
+                    std::fs::write(actor.join("result.json"), "{}")?;
+                    let runtime = actor.join("runtime/dispatch");
+                    std::fs::create_dir_all(&runtime)?;
+                    std::fs::write(runtime.join("worker.log"), "")?;
+                    Ok(17)
+                }
+                fn retire(&mut self) -> Result<(), ScalerError> {
+                    self.retired = true;
+                    Ok(())
+                }
+                fn hand_back(&mut self, _: &Path) -> Result<(), ScalerError> {
+                    assert!(self.retired);
+                    Ok(())
+                }
+            }
+
+            let base = root.join("base");
+            let dispatch = native_dispatch(&base);
+            let mut server = server(&base);
+            server.dispatch = dispatch;
+            let secret = "Q7".repeat(30);
+            let stderr = format!("launcher auth ghp_{secret}\n{}\n", "y".repeat(2000));
+            server.launcher = Box::new(ObservedNativeLauncher(NativeLauncher {
+                host: Box::new(LauncherStderrHost {
+                    stderr,
+                    retired: true,
+                }),
+            }));
+            server.execute(worker_request()).unwrap();
+            server
+                .execute(Request::Finish(Outcome {
+                    status: FinishStatus::Failed,
+                    summary: "Launcher exited".into(),
+                    brief: None,
+                }))
+                .unwrap();
+            let posted = regular_text(&root.join("posted.md")).unwrap();
+            let server_section = server_part(&posted);
+            assert!(
+                server_section.contains("exit status 17: [REDACTED] y"),
+                "{server_section}"
+            );
+            assert!(
+                !posted.contains(&secret[secret.len() - 16..]),
+                "tail cut leaked unredacted credential suffix: {posted}"
+            );
+            assert!(
+                !server_section.contains("loop summary names a cause absent from the worker error"),
+                "{server_section}"
+            );
+        });
     }
     #[test]
     fn timed_out_worker_work_is_pushed_without_a_publish_call() {
