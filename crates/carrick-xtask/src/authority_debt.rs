@@ -744,6 +744,7 @@ pub fn verify_host(
 pub fn run(root: &Path, args: &AuthorityDebtArgs) -> Result<(), DebtError> {
     let root = root.canonicalize()?;
     let base = comparison_base(&root, args.base.as_deref())?;
+    crate::root_only_debt::check(&root, base.as_deref())?;
     let policy: AuthorityDebtCeilings =
         serde_json::from_slice(&std::fs::read(root.join(CEILINGS_PATH))?)?;
     policy.validate()?;

@@ -36,6 +36,10 @@ pub type MutationSyscallHandler<M> =
 /// syscall by editing ONE module's `dispatch_<area>` — never this function (the
 /// central `dispatch()` chokepoint is gone). See [[plan-concurrent-fanout-lanes]].
 pub(crate) fn resolve_handler<M: CurrentMmMemory>(number: u64) -> Option<SyscallHandler<M>> {
+    super::root_only::resolve(number, || resolve_legacy_handler(number))
+}
+
+pub(super) fn resolve_legacy_handler<M: CurrentMmMemory>(number: u64) -> Option<SyscallHandler<M>> {
     fs::dispatch_fs(number)
         .or_else(|| net::dispatch_net(number))
         .or_else(|| mem::dispatch_mem(number))
@@ -53,6 +57,12 @@ pub(crate) fn resolve_handler<M: CurrentMmMemory>(number: u64) -> Option<Syscall
 }
 
 pub(crate) fn resolve_mutation_handler<M: CurrentMmMemory>(
+    number: u64,
+) -> Option<MutationSyscallHandler<M>> {
+    super::root_only::resolve(number, || resolve_legacy_mutation_handler(number))
+}
+
+pub(super) fn resolve_legacy_mutation_handler<M: CurrentMmMemory>(
     number: u64,
 ) -> Option<MutationSyscallHandler<M>> {
     fs::dispatch_fs_mutation(number)

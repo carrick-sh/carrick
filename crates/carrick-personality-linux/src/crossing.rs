@@ -168,6 +168,15 @@ macro_rules! host_crossings {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
         #[repr(u64)]
         pub enum AllowedHostCrossing { $( $variant = $canonical.raw(), )+ }
+        impl AllowedHostCrossing {
+            /// Exhaustive identity binding for the shared service owner. Operand
+            /// staging remains #1396; this grants no user-memory authority.
+            pub const fn operand_spec(self) -> crate::dispatch::OperandSpec {
+                match self {
+                    $( Self::$variant => crate::dispatch::OperandSpec { crossing: Self::$variant }, )+
+                }
+            }
+        }
         const HOST_CROSSINGS: [Option<(AllowedHostCrossing, bool, HostCrossingKind)>; 513] = {
             let mut table = [None; 513];
             $( table[$canonical.raw() as usize] = Some((AllowedHostCrossing::$variant, $x86, HostCrossingKind::$kind)); )+

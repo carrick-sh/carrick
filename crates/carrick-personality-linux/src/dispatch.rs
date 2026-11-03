@@ -803,6 +803,96 @@ pub const fn route_x86(ordinal: u64, allocator_control: u64) -> Family {
     }
 }
 
+/// The owner of a syscall, independent of whether the caller is the root or a
+/// forked task. This classifies service, not the availability of today's venue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceOwner {
+    Ring(Family),
+    Crossing(OperandSpec),
+    CountedEnosys,
+}
+
+/// Identity of the crossing whose operands must be supplied by #1396.
+/// This is deliberately not a memory layout, staging permit or access authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OperandSpec {
+    pub crossing: crate::crossing::AllowedHostCrossing,
+}
+
+impl ServiceOwner {
+    /// Preserve the existing family fallback path. Crossing permission is still
+    /// evaluated separately on a decline, including terminal carrier handbacks.
+    pub const fn family_for_isa(
+        self,
+        isa: carrick_guest_arch::GuestIsa,
+        ordinal: CanonicalNr,
+        allocator_control: u64,
+    ) -> Family {
+        match self {
+            // Retain today's ISA wiring while (a) changes classification only.
+            // The shared owner is independent of this implementation coverage.
+            Self::Ring(Family::Descriptor) => Family::Descriptor,
+            Self::Ring(Family::Poll) => Family::Poll,
+            Self::Ring(_) => match isa {
+                carrick_guest_arch::GuestIsa::Aarch64 => {
+                    route_aarch64(ordinal.raw(), allocator_control)
+                }
+                carrick_guest_arch::GuestIsa::X86_64 => route_x86(ordinal.raw(), allocator_control),
+            },
+            Self::Crossing(_) | Self::CountedEnosys => Family::Unported,
+        }
+    }
+}
+
+/// Derive ownership from the existing family and crossing declarations. Neither
+/// caller identity nor implementation availability is an input. Canonical
+/// identities have one owner, even where one ISA has not wired its family yet.
+pub const fn service_owner(ordinal: CanonicalNr, allocator_control: u64) -> ServiceOwner {
+    if matches!(ordinal.raw(), 23 | 24 | 25 | 57)
+        || ordinal.raw() == carrick_syscall_abi::CARRICK_PRIVATE_X86_DUP2
+    {
+        return ServiceOwner::Ring(Family::Descriptor);
+    }
+    if ordinal.raw() == carrick_syscall_abi::nr::PPOLL.raw() {
+        return ServiceOwner::Ring(Family::Poll);
+    }
+    let arm = route_aarch64(ordinal.raw(), allocator_control);
+    let family = if matches!(arm, Family::Unported) {
+        route_x86(ordinal.raw(), allocator_control)
+    } else {
+        arm
+    };
+    // Exhaustive by design: a new family must participate in owner review.
+    match family {
+        Family::Anonymous(_)
+        | Family::Read
+        | Family::Write
+        | Family::EpollWait
+        | Family::Lifecycle(_)
+        | Family::Sched(_)
+        | Family::Signal(_)
+        | Family::Futex
+        | Family::InotifyAdd
+        | Family::InotifyRemove
+        | Family::FileSeek
+        | Family::FilePositioned
+        | Family::AllocatorControl
+        | Family::SignalReturn
+        | Family::Poll
+        | Family::Descriptor
+        | Family::Identity(_)
+        | Family::Sysinfo(_)
+        | Family::Ipc(_)
+        | Family::NativeExec => ServiceOwner::Ring(family),
+        Family::Unported => {
+            match crate::crossing::AllowedHostCrossing::from_canonical_aarch64(ordinal) {
+                Some(crossing) => ServiceOwner::Crossing(crossing.operand_spec()),
+                None => ServiceOwner::CountedEnosys,
+            }
+        }
+    }
+}
+
 /// Return transport selected by the Linux completion owner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompletionRoute {
@@ -998,29 +1088,16 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
     pending: &mut dyn PendingFamilies<'a, C>,
 ) -> CompletionRoute {
     let original_argument0 = pending.original_argument0();
-    let descriptor_ordinal = [
-        crate::crossing::nr::DUP,
-        crate::crossing::nr::DUP3,
-        crate::crossing::nr::CLOSE,
-        crate::crossing::nr::FCNTL,
-    ]
-    .iter()
-    .any(|nr| nr.raw() == ordinal);
-    let family = if pending.may_serve_descriptor() && descriptor_ordinal
-        || (pending.may_serve_descriptor()
-            && ordinal == carrick_syscall_abi::CARRICK_PRIVATE_X86_DUP2)
-    {
-        Family::Descriptor
-    } else if ordinal == carrick_syscall_abi::nr::PPOLL.raw() {
-        if pending.may_serve_poll() {
-            Family::Poll
-        } else {
+    let owner = service_owner(CanonicalNr::new(ordinal), control);
+    // Implementation availability is retained compatibility debt, separate from
+    // the owner. In particular the root and child may have different fd venues.
+    let family = match owner {
+        ServiceOwner::Ring(Family::Descriptor) if !pending.may_serve_descriptor() => {
             Family::Unported
         }
-    } else {
-        match pending.guest_isa() {
-            carrick_guest_arch::GuestIsa::X86_64 => route_x86(ordinal, control),
-            carrick_guest_arch::GuestIsa::Aarch64 => route_aarch64(ordinal, control),
+        ServiceOwner::Ring(Family::Poll) if !pending.may_serve_poll() => Family::Unported,
+        ServiceOwner::Ring(_) | ServiceOwner::Crossing(_) | ServiceOwner::CountedEnosys => {
+            owner.family_for_isa(pending.guest_isa(), CanonicalNr::new(ordinal), control)
         }
     };
     let completion = pending.binding().and_then(|binding| {
@@ -1825,6 +1902,97 @@ mod ring_first_tests {
                 1
             );
             assert_eq!(pending.refused[ordinal as usize].load(Ordering::Relaxed), 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod service_owner_tests {
+    extern crate std;
+    use super::*;
+    use crate::crossing::{AllowedHostCrossing, HostCrossingSet};
+    use carrick_guest_arch::GuestIsa;
+
+    #[test]
+    fn service_owner_preserves_both_isa_routes_and_crossing_policy() {
+        for ordinal in (0..=512).chain([
+            carrick_syscall_abi::CARRICK_PRIVATE_X86_DUP2,
+            carrick_syscall_abi::CARRICK_PRIVATE_X86_POLL,
+            u64::MAX,
+        ]) {
+            let canonical = CanonicalNr::new(ordinal);
+            let owner = service_owner(canonical, u64::MAX);
+            for (isa, previous) in [
+                (GuestIsa::Aarch64, route_aarch64(ordinal, u64::MAX)),
+                (GuestIsa::X86_64, route_x86(ordinal, u64::MAX)),
+            ] {
+                let wired = owner.family_for_isa(isa, canonical, u64::MAX);
+                let legacy = if matches!(wired, Family::Descriptor | Family::Poll) {
+                    Family::Unported
+                } else {
+                    wired
+                };
+                assert_eq!(
+                    legacy, previous,
+                    "ISA wiring changed for {isa:?} ordinal={ordinal}"
+                );
+                if previous != Family::Unported {
+                    assert!(matches!(owner, ServiceOwner::Ring(_)));
+                }
+            }
+            match owner {
+                ServiceOwner::Ring(family) => assert_ne!(family, Family::Unported),
+                ServiceOwner::Crossing(spec) => {
+                    assert_eq!(spec.crossing.canonical(), canonical);
+                    assert!(HostCrossingSet::Aarch64.is_allowed(canonical));
+                }
+                ServiceOwner::CountedEnosys => {
+                    assert!(!HostCrossingSet::Aarch64.is_allowed(canonical));
+                    assert!(!HostCrossingSet::X86.is_allowed(canonical));
+                }
+            }
+        }
+        // Native family ownership wins over terminal and file crossing entries.
+        for ordinal in [17, 63, 64, 93, 94, 221, 281] {
+            assert!(matches!(
+                service_owner(CanonicalNr::new(ordinal), u64::MAX),
+                ServiceOwner::Ring(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn service_owner_agrees_with_tsv_crossings_and_retains_wired_families() {
+        for row in include_str!("../../../docs/design/arm-ring-first-flip.tsv")
+            .lines()
+            .skip(1)
+        {
+            let columns: std::vec::Vec<_> = row.split('\t').collect();
+            let ordinal = CanonicalNr::new(columns[0].parse().unwrap());
+            let crossing = AllowedHostCrossing::from_canonical_aarch64(ordinal);
+            let expected_crossing = matches!(columns[9], "Forward-Allowlist" | "Temporary-forward")
+                || matches!(ordinal.raw(), 93 | 94);
+            assert_eq!(
+                crossing.is_some(),
+                expected_crossing,
+                "TSV ordinal={ordinal:?}"
+            );
+            let owner = service_owner(ordinal, u64::MAX);
+            if route_aarch64(ordinal.raw(), u64::MAX) != Family::Unported
+                || route_x86(ordinal.raw(), u64::MAX) != Family::Unported
+            {
+                assert!(
+                    matches!(owner, ServiceOwner::Ring(_)),
+                    "lost wired owner {ordinal:?}"
+                );
+            } else if !matches!(owner, ServiceOwner::Ring(Family::Descriptor | Family::Poll)) {
+                assert_eq!(
+                    owner,
+                    crossing.map_or(ServiceOwner::CountedEnosys, |crossing| {
+                        ServiceOwner::Crossing(crossing.operand_spec())
+                    })
+                );
+            }
         }
     }
 }

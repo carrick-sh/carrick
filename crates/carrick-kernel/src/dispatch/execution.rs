@@ -478,6 +478,9 @@ impl SyscallDispatcher {
         if !threaded_independent_dispatch_supports(request.number.raw()) {
             return None;
         }
+        // This retained host fast path has the same service owner and explicit
+        // root compatibility admission as the normalized handler path.
+        super::root_only::resolve(request.number.raw(), || Some(()))?;
         match request.number.raw() {
             130 => {
                 let target =
