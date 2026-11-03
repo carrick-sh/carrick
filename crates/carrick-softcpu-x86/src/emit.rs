@@ -139,6 +139,9 @@ fn is_routed_to_complex_helper(insn: &Instruction) -> bool {
         || matches!(
             insn.mnemonic(),
             Mnemonic::Tzcnt
+                | Mnemonic::Lzcnt
+                | Mnemonic::Crc32
+                | Mnemonic::Popcnt
                 | Mnemonic::Maskmovdqu
                 | Mnemonic::Div
                 | Mnemonic::Idiv
@@ -287,7 +290,11 @@ fn emit_mem_insn(
     emit_mov_r15_disp32_from_gpr(code, CTX_PROBE_SPILL0_OFF as i32, 0);
     emit_mov_r15_disp32_from_gpr(code, CTX_PROBE_SPILL1_OFF as i32, 1);
     emit_save_flags_into_ctx(code);
-    emit_effective_address_into_r14(code, insn);
+    emit_effective_address_into_r14(
+        code,
+        insn,
+        mem_info.address_size() == iced_x86::CodeSize::Code32,
+    );
 
     let mut branch_patches = Vec::with_capacity(4);
     if size > 1 {
@@ -557,7 +564,7 @@ fn map_reg_width(orig: Register, new_gpr: usize) -> Register {
     }
 }
 
-fn emit_effective_address_into_r14(code: &mut Vec<u8>, insn: &Instruction) {
+fn emit_effective_address_into_r14(code: &mut Vec<u8>, insn: &Instruction, address32: bool) {
     if insn.is_ip_rel_memory_operand() {
         emit_movabs(code, 0x49, 0xBE, insn.ip_rel_memory_address());
         emit_bit_string_word_offset(code, insn);
@@ -582,9 +589,9 @@ fn emit_effective_address_into_r14(code: &mut Vec<u8>, insn: &Instruction) {
             code.extend_from_slice(&[0x49, 0x01, 0xC6]);
         }
         emit_bit_string_word_offset(code, insn);
-        if base.size() == 4 || index.size() == 4 {
-            code.extend_from_slice(&[0x45, 0x89, 0xF6]);
-        }
+    }
+    if address32 {
+        code.extend_from_slice(&[0x45, 0x89, 0xf6]); // wrap before segment base
     }
 
     let seg_disp = match insn.segment_prefix() {

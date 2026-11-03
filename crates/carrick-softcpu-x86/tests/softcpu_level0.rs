@@ -3860,3 +3860,314 @@ fn legacy_probe_high_registers_remain_guest_state() {
     assert_eq!(cpu.context().gpr[reg::R14], 65);
     assert_eq!(mem.read_direct(data + 8, 1).unwrap(), [0xfd]);
 }
+
+#[test]
+fn legacy_probe_bit_string_eip_relative_wraps_before_translation() {
+    let code_va = 0x0040_0000u64;
+    let mut code = vec![0x67, 0x48, 0x0f, 0xb3, 0x0d]; // btr [eip+disp32],rcx
+    code.extend_from_slice(&(0u32.wrapping_sub((code_va + 9) as u32)).to_le_bytes());
+    code.extend_from_slice(&[0x0f, 0x05]);
+    let mut absolute = vec![0x67, 0x48, 0x0f, 0xb3, 0x0c, 0x25, 0, 0, 0, 0];
+    absolute.extend_from_slice(&[0x0f, 0x05]);
+    for (code, len) in [(code, 9), (absolute, 10)] {
+        let (mut cpu, mut mem, va) = setup_snippet(&code);
+        mem.map_range(0xffff_f000, 4096, PagePerms::USER_RW);
+        mem.write_direct(0xffff_fff8, &[0xff; 8]);
+        cpu.context_mut().gpr[reg::RCX] = u64::MAX;
+        step_ok(&mut cpu, &mut mem, sys(va + len, va + len + 2));
+        assert_eq!(
+            mem.read_direct(0xffff_fff8, 8).unwrap(),
+            [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]
+        );
+    }
+}
+
+#[test]
+fn legacy_extended_families_match_native() {
+    for bytes in [
+        &[0xf2, 0x0f, 0x7c, 0xc2][..],         // haddps (SSE3)
+        &[0x66, 0x0f, 0x38, 0x00, 0xc2],       // pshufb (SSSE3)
+        &[0x66, 0x0f, 0x3a, 0x0e, 0xc2, 0x31], // pblendw (SSE4.1)
+        &[0x66, 0x0f, 0x3a, 0x63, 0xc2, 0x31], // pcmpistri (SSE4.2)
+        &[0xf3, 0x48, 0x0f, 0xb8, 0xc1],       // popcnt rax,rcx
+    ] {
+        let mut initial = [0u8; 832];
+        initial[..512].copy_from_slice(&carrick_softcpu_x86::FxsaveArea::default().0);
+        initial[512..520].copy_from_slice(&7u64.to_le_bytes());
+        for i in 0..16 {
+            initial[160 + i * 16..176 + i * 16].fill((i + 1) as u8);
+        }
+        let oracle = native_avx_oracle(bytes, initial, false);
+        let (mut cpu, mut mem, va) = setup_snippet(&[bytes, &[0xeb, 0]].concat());
+        cpu.set_cpuid_view(Box::new(carrick_softcpu_x86::Cpl0CpuidView::default()));
+        cpu.context_mut().fxsave.0.copy_from_slice(&initial[..512]);
+        for (r, v) in [reg::RAX, reg::RCX, reg::RDX]
+            .into_iter()
+            .zip([0x12345678, 3, 7])
+        {
+            cpu.context_mut().gpr[r] = v;
+        }
+        assert!(
+            matches!(
+                cpu.step_block(&mut mem).unwrap(),
+                SoftCpuExit::Continue { .. }
+            ),
+            "{bytes:x?} at {va:x}"
+        );
+        assert_eq!(
+            &cpu.context().fxsave.0[160..416],
+            &oracle.guest[160..416],
+            "{bytes:x?}"
+        );
+        for (i, r) in [reg::RAX, reg::RCX, reg::RDX].into_iter().enumerate() {
+            assert_eq!(cpu.context().gpr[r], oracle.gprs[i], "{bytes:x?}");
+        }
+    }
+}
+
+#[test]
+fn legacy_lzcnt_without_feature_is_bsr() {
+    for input in [0u64, 1, 2, 1 << 63] {
+        let (mut cpu, mut mem, va) = setup_snippet(&[0xf3, 0x48, 0x0f, 0xbd, 0xc1, 0x0f, 0x05]);
+        cpu.context_mut().gpr[reg::RCX] = input;
+        step_ok(&mut cpu, &mut mem, sys(va + 5, va + 7));
+        assert_eq!((cpu.context().rflags >> 6) & 1, u64::from(input == 0));
+        if input != 0 {
+            assert_eq!(
+                cpu.context().gpr[reg::RAX],
+                63 - u64::from(input.leading_zeros())
+            );
+        }
+    }
+}
+
+#[test]
+fn legacy_extended_all_encodings_match_native_and_guest_admission() {
+    use iced_x86::{CpuidFeature, Decoder, DecoderOptions, EncodingKind, OpKind};
+    let mut encodings = BTreeMap::new();
+    for prefix in [0, 0x66, 0xf2, 0xf3] {
+        for rex in [0, 0x48] {
+            for map in [0, 0x38, 0x3a] {
+                for op in 0..=255u8 {
+                    for memory in [false, true] {
+                        let mut bytes = Vec::new();
+                        if prefix != 0 {
+                            bytes.push(prefix);
+                        }
+                        if rex != 0 {
+                            bytes.push(rex);
+                        }
+                        bytes.push(0x0f);
+                        if map != 0 {
+                            bytes.push(map);
+                        }
+                        bytes.extend_from_slice(&[op, if memory { 0x07 } else { 0xc2 }, 0x31]);
+                        let insn = Decoder::new(64, &bytes, DecoderOptions::NONE).decode();
+                        if insn.is_invalid()
+                            || insn.encoding() != EncodingKind::Legacy
+                            || !insn.cpuid_features().iter().all(|f| {
+                                matches!(
+                                    f,
+                                    CpuidFeature::SSE3
+                                        | CpuidFeature::SSSE3
+                                        | CpuidFeature::SSE4_1
+                                        | CpuidFeature::SSE4_2
+                                        | CpuidFeature::POPCNT
+                                )
+                            })
+                            || !(insn.op_kinds().enumerate().any(|(i, k)| {
+                                k == OpKind::Register && insn.op_register(i as u32).is_xmm()
+                            }) || matches!(
+                                insn.mnemonic(),
+                                iced_x86::Mnemonic::Crc32 | iced_x86::Mnemonic::Popcnt
+                            ))
+                        {
+                            continue;
+                        }
+                        if insn.op_kinds().any(|k| k == OpKind::Memory) != memory
+                            || (memory
+                                && (insn.memory_base() != iced_x86::Register::RDI
+                                    || insn.memory_index() != iced_x86::Register::None))
+                        {
+                            continue;
+                        }
+                        bytes.truncate(insn.len());
+                        encodings
+                            .entry((insn.code(), memory))
+                            .or_insert((insn, bytes));
+                    }
+                }
+            }
+        }
+    }
+    assert!(encodings.len() > 100, "{}", encodings.len());
+    let (mut cpu, mut mem, va) = setup_snippet(&[]);
+    let data = 0x2000_0000;
+    mem.map_range(data, 4096, PagePerms::USER_RW);
+    for ((_, memory), (insn, bytes)) in &encodings {
+        for salt in [0, 0x53, 0xff] {
+            let mut initial = [0u8; 832];
+            initial[..512].copy_from_slice(&carrick_softcpu_x86::FxsaveArea::default().0);
+            initial[512..520].copy_from_slice(&7u64.to_le_bytes());
+            for i in 0..256 {
+                initial[160 + i] = (i as u8).wrapping_add(salt);
+            }
+            let oracle = native_avx_oracle(bytes, initial, *memory);
+            mem.write_direct(va, &[bytes.as_slice(), &[0xeb, 0]].concat());
+            mem.write_direct(data, &[0x3f; 32]);
+            cpu.set_cpuid_view(Box::new(carrick_softcpu_x86::Cpl0CpuidView::default()));
+            cpu.context_mut().rip = va;
+            cpu.context_mut().rflags = 0x202;
+            cpu.context_mut().fxsave.0.copy_from_slice(&initial[..512]);
+            cpu.context_mut().gpr[reg::RDI] = data;
+            for (r, v) in [reg::RAX, reg::RCX, reg::RDX]
+                .into_iter()
+                .zip([0x12345678, 3, 7])
+            {
+                cpu.context_mut().gpr[r] = v;
+            }
+            assert!(
+                matches!(
+                    cpu.step_block(&mut mem).unwrap(),
+                    SoftCpuExit::Continue { .. }
+                ),
+                "{:?} {bytes:x?}",
+                insn.code()
+            );
+            assert_eq!(
+                &cpu.context().fxsave.0[160..416],
+                &oracle.guest[160..416],
+                "{:?} salt {salt}",
+                insn.code()
+            );
+            for (i, r) in [reg::RAX, reg::RCX, reg::RDX].into_iter().enumerate() {
+                assert_eq!(cpu.context().gpr[r], oracle.gprs[i], "{:?}", insn.code());
+            }
+            if insn.rflags_modified() != 0 {
+                assert_eq!(
+                    cpu.context().rflags & 0x8d5,
+                    oracle.flags & 0x8d5,
+                    "{:?}",
+                    insn.code()
+                );
+            }
+            if *memory {
+                assert_eq!(
+                    mem.read_direct(data, 32).unwrap(),
+                    oracle.operand,
+                    "{:?}",
+                    insn.code()
+                );
+            }
+            // The identical executable bytes must refuse before memory access
+            // or register mutation when the installed view lacks the family.
+            cpu.set_cpuid_view(Box::new(carrick_softcpu_x86::Level0CpuidView));
+            cpu.context_mut().rip = va;
+            cpu.context_mut().gpr[reg::RDI] = 0x1234_0000;
+            let before = cpu.context().gpr;
+            let xmm = cpu.context().fxsave.0;
+            step_ok(&mut cpu, &mut mem, ud(va));
+            assert_eq!(cpu.context().gpr, before);
+            assert_eq!(cpu.context().fxsave.0, xmm);
+        }
+    }
+    eprintln!("legacy encodings witnessed: {}", encodings.len());
+}
+
+#[test]
+fn legacy_extended_faults_and_unadvertised_extensions() {
+    // Legacy aligned SIMD still requires alignment; PCMPSTR and LDDQU do not.
+    for (bytes, aligned) in [
+        (&[0xf2, 0x0f, 0x7c, 0x07][..], true),
+        (&[0x66, 0x0f, 0x3a, 0x63, 0x07, 0][..], false),
+        (&[0xf2, 0x0f, 0xf0, 0x07][..], false),
+    ] {
+        let (mut cpu, mut mem, va) = setup_snippet(&[bytes, &[0xeb, 0]].concat());
+        cpu.set_cpuid_view(Box::new(carrick_softcpu_x86::Cpl0CpuidView::default()));
+        let data = 0x2000_0000;
+        mem.map_range(data, 4096, PagePerms::USER_RW);
+        cpu.context_mut().gpr[reg::RDI] = data + 1;
+        if aligned {
+            step_ok(&mut cpu, &mut mem, gp(va));
+        } else {
+            assert!(matches!(
+                cpu.step_block(&mut mem).unwrap(),
+                SoftCpuExit::Continue { .. }
+            ));
+        }
+        cpu.context_mut().rip = va;
+        cpu.context_mut().gpr[reg::RDI] = data + 4096 - 8;
+        let before = cpu.context().fxsave.0;
+        if aligned {
+            step_ok(&mut cpu, &mut mem, gp(va));
+        } else {
+            step_ok(&mut cpu, &mut mem, pf(va, PF_ERR_USER, data + 4096));
+        }
+        assert_eq!(cpu.context().fxsave.0, before);
+    }
+    // These #1469 extensions are absent from the admitted main and remain
+    // refused here, rather than executing because the host supports them.
+    for bytes in [
+        &[0xc4, 0xe2, 0xf8, 0xf2, 0xc1][..], // andn (BMI1)
+        &[0x0f, 0x38, 0xf0, 0x07],           // movbe
+        &[0x66, 0x0f, 0x38, 0xdc, 0xc1],     // aesenc
+        &[0x66, 0x0f, 0x3a, 0x44, 0xc1, 0],  // pclmulqdq
+    ] {
+        let (mut cpu, mut mem, va) = setup_snippet(bytes);
+        step_ok(&mut cpu, &mut mem, ud(va));
+    }
+}
+
+#[test]
+fn legacy_scalar_counts_obey_sized_results_and_feature_switches() {
+    use carrick_softcpu_x86::{CpuidAuthority, CpuidRegs, Level0CpuidView};
+    struct Counts;
+    impl CpuidAuthority for Counts {
+        fn cpuid(&self, leaf: u32, subleaf: u32) -> CpuidRegs {
+            let mut r = Level0CpuidView.cpuid(leaf, subleaf);
+            if leaf == 1 {
+                r.ecx |= 1 << 23;
+            }
+            if leaf == 0x8000_0001 {
+                r.ecx |= 1 << 5;
+            }
+            r
+        }
+    }
+    for (prefix, width) in [
+        (vec![0xf3, 0x66], 16),
+        (vec![0xf3], 32),
+        (vec![0xf3, 0x48], 64),
+    ] {
+        for opcode in [0xb8, 0xbd] {
+            // POPCNT and LZCNT
+            for input in [0u64, 1, 0x8000, 1 << 31, 1 << 63] {
+                let mut bytes = prefix.clone();
+                bytes.extend_from_slice(&[0x0f, opcode, 0xc1]);
+                let len = bytes.len() as u64;
+                bytes.extend_from_slice(&[0x0f, 0x05]);
+                let (mut cpu, mut mem, va) = setup_snippet(&bytes);
+                cpu.set_cpuid_view(Box::new(Counts));
+                cpu.context_mut().gpr[reg::RAX] = u64::MAX;
+                cpu.context_mut().gpr[reg::RCX] = input;
+                step_ok(&mut cpu, &mut mem, sys(va + len, va + len + 2));
+                let value = if width == 64 {
+                    input
+                } else {
+                    input & ((1 << width) - 1)
+                };
+                let count = if opcode == 0xb8 {
+                    u64::from(value.count_ones())
+                } else {
+                    u64::from((value << (64 - width)).leading_zeros()).min(width)
+                };
+                let expected = if width == 16 {
+                    !0xffffu64 | count
+                } else {
+                    count
+                };
+                assert_eq!(cpu.context().gpr[reg::RAX], expected);
+            }
+        }
+    }
+}
