@@ -95,3 +95,43 @@ retirement permits or establish the backend release receipt. The change adds
 no inventory operations or guest crossings. Mapping reservations and return
 claims also share the existing fork-aware transaction/provenance draw, before
 acquiring the inventory mutex; no authority cohort or ceiling changes.
+
+
+### Physical identity and claimed-return permits
+
+The claimed-return result now carries linear `FrameRetirementPermit` values,
+not frame IDs. A publication can bind the allocator's physical IPA, full
+extent and host-owner generation in the same inventory transaction. That
+identity is distinct from the per-mapping generation. Rebinding a live frame
+or publishing another frame ID for the same physical owner is refused before
+any inventory changes commit. Native HVF grant staging, ordinary host mapping
+staging and COW replacement staging supply their allocator identities.
+Unbound legacy frames cannot enter `prepare_return`; they return
+`MissingPhysicalIdentity`, leaving their rows unchanged.
+
+The inventory retains physical admission while a permit is outstanding and
+while its request is pending. Abandonment counts and retains that exclusion.
+`PendingFrameRetirement::complete` is an unsafe backend boundary: only actual
+physical completion (including pins), outside all backend registry locks,
+may release it. The cleanup removes the exact frame's admission, so completed
+requests do not accumulate an index of historical allocations. It is not an
+MM-release receipt and must not delay journal acknowledgement until pin drain.
+
+The VM-free witnesses exercise production inventory preparation/application,
+physical identity mismatch rollback, retry custody, and rejection of a new
+frame ID while retirement is pending or abandoned. Chunk work remains bounded
+by 512 pages; physical identity lookups are logarithmic in live/pending physical
+owners, and apply preallocates its permit output before the inventory lock.
+The allocator identity shares the existing reference-cell allocation; the
+hot `FrameEntry` remains 16 bytes even with 1,024 aliases. The unchanged
+structural witness rejected the first 48-byte layout before this correction.
+No physical callback runs under that lock. These witnesses do not execute a
+backend unmap or prove end-to-end physical retirement.
+
+This continuation remains incomplete: whole-MM retirement still needs permits,
+`InventoryReleased`, `BackendCustodyReleased`, and `MmReleaseReceipt::join`;
+the backend must consume permits into its actual completion owner. C1's
+`NativeFrameBacking::drop` gate, C2's cross-MM legacy checks and monotone counter,
+and slice 2b remain open. The new pending token must be wired into S2b, rather
+than completed at mere request acceptance. No signed, KVM-runtime, or runtime
+ratio acceptance is claimed by these VM-free tests.

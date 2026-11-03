@@ -100,6 +100,7 @@ pub struct FrameInventorySnapshot {
 #[derive(Debug, Default)]
 pub struct FrameInventoryAuthority {
     origin: FrameInventoryOrigin,
+    abandoned_permits: std::sync::Arc<std::sync::atomic::AtomicU64>,
     state: Mutex<InventoryState>,
     entropy: Mutex<ProvenanceEntropyBatch>,
 }
@@ -300,6 +301,7 @@ struct InventoryState {
     quarantined_returns: u64,
     reservations: BTreeMap<KernelTransactionId, ReservationRecord>,
     frames: BTreeMap<FrameId, FrameEntry>,
+    physical_frames: BTreeMap<(carrick_guest_arch::FrameGpa, NonZeroU64), PhysicalAdmission>,
     mappings: BTreeMap<MappingId, MappingSlot>,
     /// Live mapping count per address space, maintained alongside `mappings`.
     ///
@@ -322,9 +324,40 @@ struct ReservationRecord {
 }
 
 #[derive(Debug)]
+struct PhysicalAdmission {
+    frame: FrameId,
+    lease: std::sync::Weak<()>,
+}
+impl PartialEq for PhysicalAdmission {
+    fn eq(&self, other: &Self) -> bool {
+        self.frame == other.frame && self.lease.ptr_eq(&other.lease)
+    }
+}
+impl Eq for PhysicalAdmission {}
+
+#[derive(Debug)]
 struct FrameEntry {
     length: FrameLength,
-    references: std::sync::Arc<Mutex<carrick_core::mm::frames::FrameReferences>>,
+    references: std::sync::Arc<Mutex<FrameCell>>,
+}
+/// Physical identity lives beside the reference authority, not in the hot
+/// inventory entry or in each alias. Claims retain this same cell.
+#[derive(Debug)]
+struct FrameCell {
+    admission: std::sync::Arc<()>,
+    backing: Option<carrick_hal::FrameBackingIdentity>,
+    references: carrick_core::mm::frames::FrameReferences,
+}
+impl core::ops::Deref for FrameCell {
+    type Target = carrick_core::mm::frames::FrameReferences;
+    fn deref(&self) -> &Self::Target {
+        &self.references
+    }
+}
+impl core::ops::DerefMut for FrameCell {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.references
+    }
 }
 impl PartialEq for FrameEntry {
     fn eq(&self, other: &Self) -> bool {
@@ -333,15 +366,21 @@ impl PartialEq for FrameEntry {
 }
 impl Eq for FrameEntry {}
 impl FrameEntry {
+    fn backing(&self) -> Option<carrick_hal::FrameBackingIdentity> {
+        self.references.lock().backing
+    }
     fn snapshot(&self) -> FrameSnapshot {
+        let cell = self.references.lock();
         FrameSnapshot {
+            backing: cell.backing,
             length: self.length,
-            references: *self.references.lock(),
+            references: cell.references,
         }
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FrameSnapshot {
+    backing: Option<carrick_hal::FrameBackingIdentity>,
     length: FrameLength,
     references: carrick_core::mm::frames::FrameReferences,
 }
@@ -707,8 +746,15 @@ impl FrameInventoryAuthority {
                     .map_err(|_| FrameInventoryError::MappingCountUnderflow(frame))?;
                 frame_entry.references.lock().count() == 0
             };
-            if retire_frame {
-                state.frames.remove(&frame);
+            if retire_frame
+                && let Some(backing) = state
+                    .frames
+                    .remove(&frame)
+                    .and_then(|entry| entry.backing())
+            {
+                state
+                    .physical_frames
+                    .remove(&(backing.ipa(), backing.host_owner_generation()));
             }
         }
         state.revision = next_revision;
@@ -923,6 +969,36 @@ impl FrameInventoryAuthority {
             }
             apply_event(&mut candidate, &reservation, mm, transaction, event)?;
         }
+        let mut bound = BTreeMap::new();
+        for &(frame, backing) in batch.physical_frames() {
+            if state
+                .physical_frames
+                .get(&(backing.ipa(), backing.host_owner_generation()))
+                .is_some_and(|existing| {
+                    existing.lease.strong_count() != 0 && existing.frame != frame
+                })
+                || bound
+                    .insert((backing.ipa(), backing.host_owner_generation()), frame)
+                    .is_some_and(|existing| existing != frame)
+            {
+                return Err(FrameInventoryError::PhysicalIdentityMismatch(frame));
+            }
+            let entry = candidate
+                .frame_mut(frame)
+                .ok_or(FrameInventoryError::RetiredFrame(frame))?;
+            if (entry.backing.is_none() && reservation.frames.binary_search(&frame).is_err())
+                || entry.backing.is_some_and(|existing| existing != backing)
+                || backing.length().raw() < entry.length.raw()
+                || backing
+                    .ipa()
+                    .raw()
+                    .checked_add(backing.length().raw())
+                    .is_none()
+            {
+                return Err(FrameInventoryError::PhysicalIdentityMismatch(frame));
+            }
+            entry.backing = Some(backing);
+        }
         if fail_before_event == Some(batch.events().len()) {
             return Err(FrameInventoryError::InjectedFailure(batch.events().len()));
         }
@@ -950,19 +1026,45 @@ impl FrameInventoryAuthority {
         for (frame, entry) in changes.frames {
             match entry {
                 Some(entry) => match state.frames.get_mut(&frame) {
-                    Some(cell) => *cell.references.lock() = entry.references,
+                    Some(cell) => {
+                        let mut cell = cell.references.lock();
+                        cell.backing = entry.backing;
+                        cell.references = entry.references;
+                    }
                     None => {
+                        let admission = std::sync::Arc::new(());
+                        if let Some(backing) = entry.backing {
+                            state.physical_frames.insert(
+                                (backing.ipa(), backing.host_owner_generation()),
+                                PhysicalAdmission {
+                                    frame,
+                                    lease: std::sync::Arc::downgrade(&admission),
+                                },
+                            );
+                        }
                         state.frames.insert(
                             frame,
                             FrameEntry {
                                 length: entry.length,
-                                references: std::sync::Arc::new(Mutex::new(entry.references)),
+                                references: std::sync::Arc::new(Mutex::new(FrameCell {
+                                    admission,
+                                    backing: entry.backing,
+                                    references: entry.references,
+                                })),
                             },
                         );
                     }
                 },
                 None => {
-                    state.frames.remove(&frame);
+                    if let Some(backing) = state
+                        .frames
+                        .remove(&frame)
+                        .and_then(|entry| entry.backing())
+                    {
+                        state
+                            .physical_frames
+                            .remove(&(backing.ipa(), backing.host_owner_generation()));
+                    }
                 }
             }
         }
@@ -1120,6 +1222,11 @@ impl FrameInventoryAuthority {
             .iter()
             .find(|(_, record)| record.frames.binary_search(&frame).is_ok())
             .map(|(transaction, _)| *transaction)
+    }
+
+    pub fn abandoned_retirement_permits(&self) -> u64 {
+        self.abandoned_permits
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn frame_mapping_count(&self, frame: FrameId) -> Option<usize> {
@@ -1323,6 +1430,7 @@ fn apply_event(
                 state.insert_frame(
                     frame,
                     FrameSnapshot {
+                        backing: None,
                         length,
                         references: carrick_core::mm::frames::FrameReferences::default(),
                     },
@@ -1740,6 +1848,8 @@ pub enum FrameInventoryReserveError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum FrameInventoryError {
+    #[error("frame {0:?} physical allocator identity differs from publication")]
+    PhysicalIdentityMismatch(FrameId),
     #[error("frame inventory batch is empty")]
     EmptyBatch,
     #[error("frame inventory transaction {0:?} was not reserved by this authority")]
@@ -4971,6 +5081,24 @@ mod claimed_return {
         next_generation,
     };
 
+    #[derive(Debug)]
+    struct RetirementCleanup(std::sync::Weak<FrameInventoryAuthority>);
+    impl carrick_core_abi::FrameRetirementCleanup for RetirementCleanup {
+        fn complete(&self, frame: FrameId, backing: carrick_hal::FrameBackingIdentity) {
+            if let Some(inventory) = self.0.upgrade() {
+                let mut state = inventory.state.lock();
+                let key = (backing.ipa(), backing.host_owner_generation());
+                if state
+                    .physical_frames
+                    .get(&key)
+                    .is_some_and(|entry| entry.frame == frame)
+                {
+                    state.physical_frames.remove(&key);
+                }
+            }
+        }
+    }
+
     /// Only claim preparation can replace a live row with this placeholder.
     #[derive(Debug, Eq, PartialEq)]
     pub(super) struct ClaimMark {
@@ -4982,7 +5110,7 @@ mod claimed_return {
         }
     }
     #[derive(Clone)]
-    struct ClaimFrameCell(std::sync::Arc<Mutex<carrick_core::mm::frames::FrameReferences>>);
+    struct ClaimFrameCell(std::sync::Arc<Mutex<super::FrameCell>>);
     impl carrick_core::mm::frames::FrameReferenceCell for ClaimFrameCell {
         fn with_references<R>(
             &self,
@@ -4996,6 +5124,8 @@ mod claimed_return {
         id: MappingId,
         entry: MappingEntry,
         reference: FrameRef,
+        backing: carrick_hal::FrameBackingIdentity,
+        admission: std::sync::Arc<()>,
     }
     enum ReturnDisposition {
         Prepared,
@@ -5011,7 +5141,8 @@ mod claimed_return {
         provenance: FrameInventoryProvenance,
         receipt_mappings: Vec<(MappingId, FrameId)>,
         unmapped: Vec<carrick_hal::prepared_return::UnmappedReturnRow>,
-        last_unmapped: Vec<FrameId>,
+        last_unmapped: Vec<carrick_hal::FrameRetirementPermit>,
+        cleanup: std::sync::Arc<RetirementCleanup>,
     }
     impl ClaimedReturn {
         fn restore(&mut self, abandoned: bool) {
@@ -5063,7 +5194,21 @@ mod claimed_return {
                     == carrick_core::mm::frames::ReferenceRelease::Last
                 {
                     state.frames.remove(&row.entry.frame);
-                    last_unmapped.push(row.entry.frame);
+
+                    // SAFETY: the owned reference consumed the final unit under
+                    // this inventory lock; the exact allocator identity was
+                    // retained at prepare and cannot be rebound by an overlay.
+                    last_unmapped.push(unsafe {
+                        carrick_hal::FrameRetirementPermit::from_inventory(
+                            self.inventory.origin.clone(),
+                            row.entry.frame,
+                            row.backing,
+                            state.revision + 1,
+                            self.inventory.abandoned_permits.clone(),
+                            row.admission,
+                            self.cleanup.clone(),
+                        )
+                    });
                 }
             }
             state.return_claims -= 1;
@@ -5132,6 +5277,7 @@ mod claimed_return {
                     generation: next_generation(row.generation).map_err(|_| Error::RowMismatch)?,
                 });
             }
+            let cleanup = std::sync::Arc::new(RetirementCleanup(std::sync::Arc::downgrade(self)));
             let mut references = Vec::new();
             references
                 .try_reserve_exact(rows.len())
@@ -5176,17 +5322,37 @@ mod claimed_return {
                     .ok_or(Error::RowMismatch)?
                     .references
                     .clone();
+                let Some(backing) = state
+                    .frames
+                    .get(&row.frame)
+                    .and_then(|entry| entry.backing())
+                else {
+                    for (reference, _, _) in references {
+                        FrameRef::restore(reference);
+                    }
+                    return Err(Error::MissingPhysicalIdentity);
+                };
+                let admission = state
+                    .frames
+                    .get(&row.frame)
+                    .map(|entry| entry.references.lock().admission.clone());
+                let Some(admission) = admission else {
+                    for (reference, _, _) in references {
+                        FrameRef::restore(reference);
+                    }
+                    return Err(Error::RowMismatch);
+                };
                 match FrameRef::claim(ClaimFrameCell(cell)) {
-                    Ok(reference) => references.push(reference),
+                    Ok(reference) => references.push((reference, backing, admission)),
                     Err(_) => {
-                        for reference in references {
+                        for (reference, _, _) in references {
                             FrameRef::restore(reference);
                         }
                         return Err(Error::RowMismatch);
                     }
                 }
             }
-            for (row, reference) in rows.iter().zip(references) {
+            for (row, (reference, backing, admission)) in rows.iter().zip(references) {
                 if let Some(slot) = state.mappings.get_mut(&row.mapping)
                     && let MappingSlot::Live(entry) = slot
                 {
@@ -5205,6 +5371,8 @@ mod claimed_return {
                         id: row.mapping,
                         entry,
                         reference,
+                        backing,
+                        admission,
                     });
                 }
             }
@@ -5221,6 +5389,7 @@ mod claimed_return {
                     receipt_mappings,
                     unmapped,
                     last_unmapped,
+                    cleanup,
                 },
             )))
         }
@@ -5231,6 +5400,162 @@ mod claimed_return {
 mod prepared_return_tests {
     use super::*;
     use std::sync::Arc;
+    #[test]
+    fn return_permit_preserves_physical_identity_not_mapping_generation() {
+        let (inventory, ids, owner, row) = fixture();
+        let applied = inventory
+            .prepare_return(&ids, owner, &[row])
+            .unwrap()
+            .apply();
+        let permit = applied.last_unmapped.into_iter().next().unwrap();
+        assert_eq!(permit.frame(), row.frame);
+        assert_eq!(permit.backing().ipa().raw(), 0x9000);
+        assert_eq!(permit.backing().host_owner_generation().get(), 73);
+        assert_eq!(permit.revision(), applied.revision);
+        assert!(inventory.state.try_lock().is_some());
+        let before = inventory.abandoned_retirement_permits();
+        drop(permit);
+        assert_eq!(inventory.abandoned_retirement_permits(), before + 1);
+    }
+
+    #[test]
+    fn physical_identity_binding_is_transactional_and_cannot_replace_a_live_owner() {
+        let (inventory, ids, owner, row) = fixture();
+        let before = inventory.snapshot();
+        let mut reservation = inventory
+            .reserve(&ids, 0, 0, FrameEventCapacity::for_event_count(1).unwrap())
+            .unwrap();
+        reservation
+            .push(FrameInventoryEvent::ProtectMapping {
+                transaction: reservation.transaction(),
+                mapping: row.mapping,
+                generation: MappingGeneration::from_backend_counter(NonZeroU64::new(2).unwrap()),
+                permissions: MemPerms {
+                    read: true,
+                    write: false,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .bind_physical_frame(
+                row.frame,
+                carrick_hal::FrameBackingIdentity::from_allocator(
+                    carrick_guest_arch::FrameGpa::new(0x9000),
+                    NonZeroU64::new(74).unwrap(),
+                    row.length,
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            inventory.apply(owner, reservation.commit(())).unwrap_err(),
+            FrameInventoryError::PhysicalIdentityMismatch(row.frame)
+        );
+        assert_eq!(
+            inventory.snapshot(),
+            before,
+            "failed binding must undo the protect too"
+        );
+        let permit = inventory
+            .prepare_return(&ids, owner, &[row])
+            .unwrap()
+            .apply()
+            .last_unmapped
+            .pop()
+            .unwrap();
+        assert_eq!(permit.backing().host_owner_generation().get(), 73);
+        let pending = permit.retire(|_| Ok::<_, ()>(())).unwrap();
+        // SAFETY: this VM-free fixture has no physical storage or pins.
+        unsafe { pending.complete() };
+        assert_eq!(inventory.abandoned_retirement_permits(), 0);
+    }
+
+    #[test]
+    fn failed_physical_retirement_retains_the_same_permit() {
+        let (inventory, ids, owner, row) = fixture();
+        let permit = inventory
+            .prepare_return(&ids, owner, &[row])
+            .unwrap()
+            .apply()
+            .last_unmapped
+            .pop()
+            .unwrap();
+        let (permit, ()) = permit.retire(|_| Err(())).unwrap_err();
+        assert_eq!(inventory.abandoned_retirement_permits(), 0);
+        assert_eq!(permit.frame(), row.frame);
+        let pending = permit
+            .retire(|backing| {
+                assert!(
+                    inventory.state.try_lock().is_some(),
+                    "physical callback runs unlocked"
+                );
+                assert_eq!(backing.host_owner_generation().get(), 73);
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        // SAFETY: this VM-free fixture has no physical storage or pins.
+        unsafe { pending.complete() };
+        assert_eq!(inventory.abandoned_retirement_permits(), 0);
+    }
+
+    #[test]
+    fn outstanding_and_abandoned_permits_exclude_new_frame_ids_for_the_same_owner() {
+        for abandon in [false, true] {
+            let (inventory, ids, owner, row) = fixture();
+            let permit = inventory
+                .prepare_return(&ids, owner, &[row])
+                .unwrap()
+                .apply()
+                .last_unmapped
+                .pop()
+                .unwrap();
+            let backing = permit.backing();
+            let pending = if abandon {
+                drop(permit);
+                None
+            } else {
+                Some(permit.retire(|_| Ok::<_, ()>(())).unwrap())
+            };
+            let mut reservation = inventory
+                .reserve(&ids, 1, 1, FrameEventCapacity::for_event_count(2).unwrap())
+                .unwrap();
+            let frame = reservation.claim_frame().unwrap();
+            let mapping = reservation.claim_mapping().unwrap();
+            let transaction = reservation.transaction();
+            reservation
+                .push(FrameInventoryEvent::PrepareMapping {
+                    transaction,
+                    frame,
+                    mapping,
+                    generation: row.generation,
+                    gpa: row.gpa,
+                    length: row.length,
+                    permissions: MemPerms {
+                        read: true,
+                        write: true,
+                        exec: false,
+                    },
+                })
+                .unwrap();
+            reservation
+                .push(FrameInventoryEvent::PublishMapping {
+                    transaction,
+                    mapping,
+                    generation: row.generation,
+                })
+                .unwrap();
+            reservation.bind_physical_frame(frame, backing).unwrap();
+            assert_eq!(
+                inventory.apply(owner, reservation.commit(())).unwrap_err(),
+                FrameInventoryError::PhysicalIdentityMismatch(frame)
+            );
+            assert!(inventory.snapshot().mappings.is_empty());
+            if let Some(pending) = pending {
+                // SAFETY: the fixture has no physical storage or pins.
+                unsafe { pending.complete() };
+            }
+        }
+    }
     fn fixture() -> (
         Arc<FrameInventoryAuthority>,
         ObjectIdRegistry,
@@ -5282,6 +5607,16 @@ mod prepared_return_tests {
                 mapping: row.mapping,
                 generation: row.generation,
             })
+            .unwrap();
+        reservation
+            .bind_physical_frame(
+                row.frame,
+                carrick_hal::FrameBackingIdentity::from_allocator(
+                    carrick_guest_arch::FrameGpa::new(0x9000),
+                    NonZeroU64::new(73).unwrap(),
+                    row.length,
+                ),
+            )
             .unwrap();
         inventory.apply(owner, reservation.commit(())).unwrap();
         (inventory, ids, owner, row)
@@ -5448,7 +5783,13 @@ mod prepared_return_tests {
             .prepare_return(&ids, owner, &pieces[1..])
             .unwrap()
             .apply();
-        assert_eq!(last.last_unmapped, vec![row.frame]);
+        assert_eq!(
+            last.last_unmapped
+                .iter()
+                .map(|permit| permit.frame())
+                .collect::<Vec<_>>(),
+            vec![row.frame]
+        );
     }
 
     #[test]
@@ -5501,7 +5842,15 @@ mod prepared_return_tests {
         let sibling = FrameOwner::HostMm(MmId::from_raw_u64(43).unwrap());
         let staged_alias = alias_commit(&inventory, &ids, row);
         let claim = inventory.prepare_return(&ids, owner, &[row]).unwrap();
-        assert_eq!(claim.apply().last_unmapped, vec![row.frame]);
+        assert_eq!(
+            claim
+                .apply()
+                .last_unmapped
+                .iter()
+                .map(|permit| permit.frame())
+                .collect::<Vec<_>>(),
+            vec![row.frame]
+        );
         assert_eq!(
             inventory.apply(sibling, staged_alias).unwrap_err(),
             FrameInventoryError::UnreservedFrame(row.frame)
@@ -5604,7 +5953,14 @@ mod prepared_return_tests {
             applied.unmapped[0].generation.raw(),
             row.generation.raw() + 1
         );
-        assert_eq!(applied.last_unmapped, vec![row.frame]);
+        assert_eq!(
+            applied
+                .last_unmapped
+                .iter()
+                .map(|permit| permit.frame())
+                .collect::<Vec<_>>(),
+            vec![row.frame]
+        );
         assert!(applied.mm_empty_at_revision);
     }
     #[test]
@@ -5622,7 +5978,14 @@ mod prepared_return_tests {
             .unwrap()
             .apply();
         assert!(applied.mm_empty_at_revision);
-        assert_eq!(applied.last_unmapped, vec![row.frame]);
+        assert_eq!(
+            applied
+                .last_unmapped
+                .iter()
+                .map(|permit| permit.frame())
+                .collect::<Vec<_>>(),
+            vec![row.frame]
+        );
         assert_eq!(inventory.retire_mm(&ids, owner).unwrap(), 0);
     }
     #[test]
@@ -5758,7 +6121,15 @@ mod prepared_return_tests {
         let claim = inventory.prepare_return(&ids, owner, &[row]).unwrap();
         assert_eq!(inventory.retire_mm(&ids, sibling).unwrap(), 1);
         assert_eq!(inventory.frame_mapping_count(row.frame), Some(1));
-        assert_eq!(claim.apply().last_unmapped, vec![row.frame]);
+        assert_eq!(
+            claim
+                .apply()
+                .last_unmapped
+                .iter()
+                .map(|permit| permit.frame())
+                .collect::<Vec<_>>(),
+            vec![row.frame]
+        );
     }
     #[test]
     fn shared_frame_stays_live_after_one_return() {
@@ -5856,7 +6227,14 @@ mod prepared_return_tests {
             .unwrap()
             .stage1_cleared(Arc::new(NoQuarantine))
             .apply();
-        assert_eq!(applied.last_unmapped, vec![row.frame]);
+        assert_eq!(
+            applied
+                .last_unmapped
+                .iter()
+                .map(|permit| permit.frame())
+                .collect::<Vec<_>>(),
+            vec![row.frame]
+        );
         assert!(applied.mm_empty_at_revision);
         assert_eq!(inventory.state.lock().quarantined_returns, 0);
     }

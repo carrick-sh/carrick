@@ -2210,6 +2210,20 @@ impl HvfVmState {
             )?;
             (frame, mapping)
         };
+        if let Some(generation) = std::num::NonZeroU64::new(replacement.stage2_owner.generation) {
+            let length = std::num::NonZeroU64::new(CowArmedRanges::COMPOUND_SIZE)
+                .ok_or_else(|| TrapError::Hypervisor("empty COW compound".into()))?;
+            reservation
+                .bind_physical_frame(
+                    new_frame,
+                    carrick_hal::FrameBackingIdentity::from_allocator(
+                        carrick_guest_arch::FrameGpa::new(replacement.gpa),
+                        generation,
+                        carrick_hal::FrameLength::from_mapping_extent(length),
+                    ),
+                )
+                .map_err(Self::reservation_error)?;
+        }
         if retirement.retire_old_frame {
             reservation
                 .push(carrick_hal::FrameInventoryEvent::RetireFrame {
@@ -2426,6 +2440,21 @@ impl HvfVmState {
             ));
         };
         let length_typed = carrick_hal::FrameLength::from_mapping_extent(length_value);
+        if let Some(generation) = std::num::NonZeroU64::new(stage2_owner.generation) {
+            let physical_length = std::num::NonZeroU64::new(stage2_lease.1)
+                .ok_or_else(|| TrapError::Hypervisor("empty physical backing".into()))?;
+            reservation
+                .bind_physical_frame(
+                    frame,
+                    carrick_hal::FrameBackingIdentity::from_allocator(
+                        carrick_guest_arch::FrameGpa::new(stage2_lease.0),
+                        generation,
+                        carrick_hal::FrameLength::from_mapping_extent(physical_length),
+                    ),
+                )
+                .map_err(Self::reservation_error)?;
+        }
+
         reservation
             .push(carrick_hal::FrameInventoryEvent::PrepareMapping {
                 transaction,

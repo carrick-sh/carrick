@@ -15,9 +15,10 @@ use crate::MemPerms;
 pub const MAX_FRAME_INVENTORY_EVENTS_PER_BATCH: usize = 262_144;
 
 pub use carrick_core_abi::{
-    FrameId, FrameInventoryApplyReceipt, FrameInventoryOrigin, FrameInventoryProvenance,
-    FrameInventoryReceiptChallenge, FrameInventoryReceiptOwner, FrameInventoryRetirementReceipt,
-    FrameLength, KernelTransactionId, MappingGeneration, MappingId, MmReleaseReceipt,
+    FrameBackingIdentity, FrameId, FrameInventoryApplyReceipt, FrameInventoryOrigin,
+    FrameInventoryProvenance, FrameInventoryReceiptChallenge, FrameInventoryReceiptOwner,
+    FrameInventoryRetirementReceipt, FrameLength, FrameRetirementPermit, KernelTransactionId,
+    MappingGeneration, MappingId, MmReleaseReceipt,
 };
 
 /// Revision of the backend MM binding observed by foreign-memory transport.
@@ -189,6 +190,7 @@ pub struct FrameInventoryBatch {
     transaction: KernelTransactionId,
     event_capacity: FrameEventCapacity,
     events: Vec<FrameInventoryEvent>,
+    physical_frames: Vec<(FrameId, FrameBackingIdentity)>,
 }
 
 impl FrameInventoryBatch {
@@ -207,6 +209,7 @@ impl FrameInventoryBatch {
             transaction,
             event_capacity,
             events,
+            physical_frames: Vec::new(),
         })
     }
 
@@ -248,6 +251,10 @@ impl FrameInventoryBatch {
 
     pub fn events(&self) -> &[FrameInventoryEvent] {
         &self.events
+    }
+
+    pub fn physical_frames(&self) -> &[(FrameId, FrameBackingIdentity)] {
+        &self.physical_frames
     }
 
     pub fn into_events(self) -> Vec<FrameInventoryEvent> {
@@ -317,6 +324,28 @@ impl FrameInventoryReservation {
         event: FrameInventoryEvent,
     ) -> Result<(), FrameInventoryReservationError> {
         self.batch.push(event).map_err(Into::into)
+    }
+
+    /// Bind the allocation's exact physical identity in the same transaction as
+    /// publication. Rebinding a live frame to a different owner is rejected.
+    pub fn bind_physical_frame(
+        &mut self,
+        frame: FrameId,
+        backing: FrameBackingIdentity,
+    ) -> Result<(), FrameInventoryReservationError> {
+        if self.batch.physical_frames.len() == self.batch.event_capacity.get() {
+            return Err(FrameInventoryBatchError::BatchFull {
+                capacity: self.batch.event_capacity.get(),
+            }
+            .into());
+        }
+        self.batch.physical_frames.try_reserve(1).map_err(|_| {
+            FrameInventoryBatchError::AllocationFailed {
+                requested: self.batch.physical_frames.len() + 1,
+            }
+        })?;
+        self.batch.physical_frames.push((frame, backing));
+        Ok(())
     }
 
     /// Finish backend work and carry its ordinary outcome beside the complete

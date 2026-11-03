@@ -21,6 +21,8 @@ pub enum PrepareReturnError {
     RevisionExhausted,
     #[error("return preparation unsupported")]
     Unsupported,
+    #[error("frame has no authenticated physical allocator identity")]
+    MissingPhysicalIdentity,
 }
 /// The generation published by a claimed unmap, reserved before stage-1 clear.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,7 +36,7 @@ pub struct AppliedReturn {
     pub revision: u64,
     pub receipt: crate::FrameInventoryApplyReceipt,
     pub unmapped: Vec<UnmappedReturnRow>,
-    pub last_unmapped: Vec<FrameId>,
+    pub last_unmapped: Vec<crate::FrameRetirementPermit>,
     pub mm_empty_at_revision: bool,
 }
 /// Inventory-owned implementation. Methods must not acquire an outer lock.

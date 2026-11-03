@@ -54,6 +54,160 @@ inventory_id!(FrameId);
 inventory_id!(MappingId);
 inventory_id!(KernelTransactionId);
 
+/// The allocator's physical owner identity, independent of mapping generations.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct FrameBackingIdentity {
+    ipa: carrick_guest_arch::FrameGpa,
+    host_owner_generation: NonZeroU64,
+    length: FrameLength,
+}
+impl FrameBackingIdentity {
+    pub const fn from_allocator(
+        ipa: carrick_guest_arch::FrameGpa,
+        host_owner_generation: NonZeroU64,
+        length: FrameLength,
+    ) -> Self {
+        Self {
+            ipa,
+            host_owner_generation,
+            length,
+        }
+    }
+    pub const fn ipa(self) -> carrick_guest_arch::FrameGpa {
+        self.ipa
+    }
+    pub const fn host_owner_generation(self) -> NonZeroU64 {
+        self.host_owner_generation
+    }
+    pub const fn length(self) -> FrameLength {
+        self.length
+    }
+}
+
+/// Inventory-side release of a physical publication exclusion. Backend callers
+/// cannot invoke this through a permit; only terminal completion exposes it.
+pub trait FrameRetirementCleanup: core::fmt::Debug + Send + Sync {
+    fn complete(&self, frame: FrameId, backing: FrameBackingIdentity);
+}
+
+/// Linear permission to request retirement of one exact physical owner.
+/// Dropping an unconsumed permit is safe but leaks retirement; the issuing
+/// inventory counts it. A permit is returned only after its inventory unlocks.
+/// ```compile_fail
+/// fn duplicate(p: carrick_core_abi::FrameRetirementPermit) { let _ = p.clone(); }
+/// ```
+#[derive(Debug)]
+#[must_use = "request physical retirement or retain the permit for retry"]
+pub struct FrameRetirementPermit {
+    origin: FrameInventoryOrigin,
+    frame: FrameId,
+    backing: FrameBackingIdentity,
+    revision: u64,
+    abandoned: Arc<core::sync::atomic::AtomicU64>,
+    admission: Option<Arc<()>>,
+    cleanup: Arc<dyn FrameRetirementCleanup>,
+}
+impl FrameRetirementPermit {
+    /// # Safety
+    /// Only the issuing inventory may call this, after irrevocably removing
+    /// the last reference to `frame`. `backing` must be its publication-time
+    /// allocator identity, never the mapping generation or virtual address.
+    pub unsafe fn from_inventory(
+        origin: FrameInventoryOrigin,
+        frame: FrameId,
+        backing: FrameBackingIdentity,
+        revision: u64,
+        abandoned: Arc<core::sync::atomic::AtomicU64>,
+        admission: Arc<()>,
+        cleanup: Arc<dyn FrameRetirementCleanup>,
+    ) -> Self {
+        Self {
+            origin,
+            frame,
+            backing,
+            revision,
+            abandoned,
+            admission: Some(admission),
+            cleanup,
+        }
+    }
+    pub const fn frame(&self) -> FrameId {
+        self.frame
+    }
+    pub const fn backing(&self) -> FrameBackingIdentity {
+        self.backing
+    }
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub fn issued_by(&self, origin: &FrameInventoryOrigin) -> bool {
+        self.origin == *origin
+    }
+
+    /// Consume only after the physical owner accepts the retirement request.
+    /// A failed request returns the same linear permit for a later attempt.
+    /// The consumer must check the allocator generation before touching storage;
+    /// an already pending retirement is completion, not a stale successor.
+    pub fn retire<E>(
+        mut self,
+        request: impl FnOnce(FrameBackingIdentity) -> Result<(), E>,
+    ) -> Result<PendingFrameRetirement, (Self, E)> {
+        match request(self.backing) {
+            Ok(()) => Ok(PendingFrameRetirement {
+                admission: self.admission.take(),
+                abandoned: self.abandoned.clone(),
+                cleanup: self.cleanup.clone(),
+                frame: self.frame,
+                backing: self.backing,
+            }),
+            Err(error) => Err((self, error)),
+        }
+    }
+}
+impl Drop for FrameRetirementPermit {
+    fn drop(&mut self) {
+        if let Some(admission) = self.admission.take() {
+            self.abandoned
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            // Fail closed: an abandoned retirement must never reopen physical
+            // publication. The inventory keeps only a weak admission index.
+            core::mem::forget(admission);
+        }
+    }
+}
+
+/// Physical publication stays excluded after the retirement request, until
+/// the backend proves the exact owner can no longer be reached or reissued.
+#[derive(Debug)]
+#[must_use = "retain through physical retirement completion"]
+pub struct PendingFrameRetirement {
+    admission: Option<Arc<()>>,
+    abandoned: Arc<core::sync::atomic::AtomicU64>,
+    cleanup: Arc<dyn FrameRetirementCleanup>,
+    frame: FrameId,
+    backing: FrameBackingIdentity,
+}
+impl PendingFrameRetirement {
+    /// # Safety
+    /// The backend must have completed retirement for the exact owner named
+    /// by the issuing permit, including stage-2 removal and pin drain, or
+    /// proved that the VM containing that owner was destroyed. All backend
+    /// registry locks must be released: completion calls the inventory owner.
+    pub unsafe fn complete(mut self) {
+        self.cleanup.complete(self.frame, self.backing);
+        self.admission.take();
+    }
+}
+impl Drop for PendingFrameRetirement {
+    fn drop(&mut self) {
+        if let Some(admission) = self.admission.take() {
+            self.abandoned
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            core::mem::forget(admission);
+        }
+    }
+}
+
 /// Unpredictable authority capability bound to one runtime reservation.
 ///
 /// The bytes are deliberately not exported or printed. Public construction

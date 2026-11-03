@@ -51,13 +51,13 @@ pub mod hypervisor;
 pub use hypervisor::{HvVcpu, HvVm, VcpuExit};
 pub mod kernel;
 pub use kernel::{
-    ForeignBackendRevision, ForeignFrameInventoryRevision, ForeignVmaRevision, FrameEventCapacity,
-    FrameId, FrameInventoryApplyReceipt, FrameInventoryBatch, FrameInventoryBatchError,
-    FrameInventoryCommit, FrameInventoryEvent, FrameInventoryOrigin, FrameInventoryProvenance,
-    FrameInventoryReceiptChallenge, FrameInventoryReceiptOwner, FrameInventoryReservation,
-    FrameInventoryReservationError, FrameInventoryRetirementReceipt, FrameLength,
-    KernelTransactionId, MAX_FRAME_INVENTORY_EVENTS_PER_BATCH, MappingGeneration, MappingId,
-    MmReleaseReceipt,
+    ForeignBackendRevision, ForeignFrameInventoryRevision, ForeignVmaRevision,
+    FrameBackingIdentity, FrameEventCapacity, FrameId, FrameInventoryApplyReceipt,
+    FrameInventoryBatch, FrameInventoryBatchError, FrameInventoryCommit, FrameInventoryEvent,
+    FrameInventoryOrigin, FrameInventoryProvenance, FrameInventoryReceiptChallenge,
+    FrameInventoryReceiptOwner, FrameInventoryReservation, FrameInventoryReservationError,
+    FrameInventoryRetirementReceipt, FrameLength, FrameRetirementPermit, KernelTransactionId,
+    MAX_FRAME_INVENTORY_EVENTS_PER_BATCH, MappingGeneration, MappingId, MmReleaseReceipt,
 };
 pub mod event;
 pub use event::{EventMultiplexer, Interest, PollEvent, Readiness, TriggerMode, VnodeEvents};

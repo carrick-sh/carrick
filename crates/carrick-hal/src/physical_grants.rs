@@ -100,6 +100,21 @@ impl PhysicalGrantRelease {
     }
 }
 
+/// Allocator identity supplied separately from the inventory mapping version.
+#[derive(Clone, Copy, Debug)]
+pub struct PhysicalFrameAllocation {
+    gpa: FrameGpa,
+    host_owner_generation: Option<NonZeroU64>,
+}
+impl PhysicalFrameAllocation {
+    pub const fn from_allocator(gpa: FrameGpa, host_owner_generation: NonZeroU64) -> Self {
+        Self {
+            gpa,
+            host_owner_generation: Some(host_owner_generation),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct PhysicalFrameGrant {
     pub gpa: FrameGpa,
@@ -172,7 +187,10 @@ impl StagedPhysicalGrants {
         Self::stage_with_permissions(
             rollback,
             source,
-            gpas,
+            gpas.into_iter().map(|gpa| PhysicalFrameAllocation {
+                gpa,
+                host_owner_generation: None,
+            }),
             table_grants,
             frame_len,
             owner,
@@ -186,7 +204,7 @@ impl StagedPhysicalGrants {
     pub fn stage_with_permissions(
         rollback: Arc<PhysicalGrantRollback>,
         source: Arc<dyn PhysicalFrameInventory>,
-        gpas: impl IntoIterator<Item = FrameGpa>,
+        gpas: impl IntoIterator<Item = PhysicalFrameAllocation>,
         table_grants: usize,
         frame_len: u64,
         owner: GuestFrameOwner,
@@ -217,7 +235,8 @@ impl StagedPhysicalGrants {
             NonZeroU64::new(frame_len).ok_or_else(|| fail("initial frame length".into()))?,
         );
         let mut rows = Vec::with_capacity(gpas.len());
-        for (index, gpa) in gpas.into_iter().enumerate() {
+        for (index, allocation) in gpas.into_iter().enumerate() {
+            let gpa = allocation.gpa;
             let frame = reservation
                 .claim_frame()
                 .map_err(|error| fail(format!("initial frame candidate: {error}")))?;
@@ -243,6 +262,16 @@ impl StagedPhysicalGrants {
                         generation,
                     })
                     .map_err(|error| fail(format!("initial inventory publish: {error}")))?;
+            }
+            if index >= table_grants
+                && let Some(generation) = allocation.host_owner_generation
+            {
+                reservation
+                    .bind_physical_frame(
+                        frame,
+                        crate::FrameBackingIdentity::from_allocator(gpa, generation, length),
+                    )
+                    .map_err(|error| fail(format!("initial physical identity: {error}")))?;
             }
             rows.push((gpa, frame, mapping, index >= table_grants));
         }
