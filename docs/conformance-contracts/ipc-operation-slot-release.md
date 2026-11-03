@@ -5,8 +5,9 @@ permit Carrick's internal operation-arena capacity to produce an errno or
 force a retained call onto a different service path.
 
 The retained-admission primitive subscribes to a carrier-lifetime release
-source before its one allocation attempt. Busy owns the unchanged operation,
-a counted notification ticket and the pre-probe snapshot. The next retained
+source. A miss observes that source before one re-probe. The shared
+`Refusal::Contended` owns the unchanged operation, a linear release ticket
+and the pre-probe snapshot. The next retained
 poll layer must enroll that owner and recheck once, preserving its syscall
 arguments; this prerequisite does not change existing read/write admission.
 
@@ -29,8 +30,8 @@ occurs once after unlock, and the original continuation token survives.
 The ABI witness requires free-list visibility inside the notification and
 zero notifications for stale or quarantined records.
 
-These deterministic tests establish release custody and bounded work (one
-allocation attempt and one release publication, without retry loops). They
+These deterministic tests establish release custody and bounded work (at most two
+allocation probes and one release publication, without polling). They
 prove neither retained poll semantics nor ARM guest execution. PollWait,
 its contract `kernel.poll.retained-wait`, oracle fixtures and the signed ARM
 `el1_memory_first_touch_stays_in_guest` confirmation belong to the next layer

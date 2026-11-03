@@ -540,7 +540,7 @@ pub struct BorrowedObjectNotificationSource<
 impl<'scope, 'zone, C: Copy + Send + Sync + zerocopy::FromZeros>
     BorrowedObjectNotificationSource<'scope, 'zone, C>
 {
-    pub fn observe(&self) -> ObjectWaitSnapshot {
+    pub(crate) fn observe(&self) -> ObjectWaitSnapshot {
         self.zone.notification_snapshot(self.key)
     }
     pub fn reserve(&self) -> ObjectNotificationTicket<'zone, C> {
