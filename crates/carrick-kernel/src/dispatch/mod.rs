@@ -3150,5 +3150,3 @@ fn write_eventfd(_this: &SyscallDispatcher, bytes: &[u8], state: &EventFdState) 
 
 #[cfg(test)]
 include!("tests.rs");
-
-mod root_only;

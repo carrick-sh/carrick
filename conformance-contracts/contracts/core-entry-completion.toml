@@ -56,7 +56,7 @@ ISA adapter. The existing return-work and x86 context witnesses still apply.
 [bindings]
 vm_free = [
   "carrick-el1-linux::dispatch::tests::native_service_refusals_keep_the_error_in_the_fatal_transport",
-  "carrick-kernel::dispatch::root_only::tests::root_only_compatibility_covers_existing_handlers_and_may_only_shrink",
+  "carrick-kernel::dispatch::routing::root_only::tests::root_only_compatibility_covers_existing_handlers_and_may_only_shrink",
   "carrick-personality-linux::dispatch::service_owner_tests::service_owner_preserves_both_isa_routes_and_crossing_policy",
   "carrick-el1-abi::entry_binding_fatal::tests::{fatal_detail_round_trip_and_formatter,entry_binding_fatal_capture_keeps_two_slot_identities_and_saved_registers}",
   "carrick-el1-linux::aarch64_process_tests::native_child_handoff_tests::{arm_native_fork_child_stdout_service_keeps_exact_entry,arm_native_fork_child_stdout_retains_capability_after_root_exit_publication,arm_native_fork_tree_releases_capability_after_last_exit} (real fork-child host-file bridge across root exit_group publication and final tree release)",
