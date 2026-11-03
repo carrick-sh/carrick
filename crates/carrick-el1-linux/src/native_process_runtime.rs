@@ -5649,18 +5649,24 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             return Err(reason);
         }
         match outcome {
-            // A refused adapter admission published no service wait. The
-            // scheduler still owns the exact IPC token and pin: retry its
-            // preparation through that owner before returning to userspace.
-            None if self
-                .source
-                .zone
-                .record(self.record.id)
-                .has_adapter_operation() =>
-            {
-                Ok(NativeResume::RetrySyscall)
-            }
-            None => self.resume_thread_stock_wait(),
+            // The thread-stock park token has the adapter shape, so the stock
+            // owner consumes its exact token before the generic IPC retry
+            // below could leave it attached to the resumed clone caller.
+            None => match self.resume_thread_stock_wait()? {
+                // A refused adapter admission published no service wait. The
+                // scheduler still owns the exact IPC token and pin: retry its
+                // preparation through that owner before returning to userspace.
+                NativeResume::NoPending
+                    if self
+                        .source
+                        .zone
+                        .record(self.record.id)
+                        .has_adapter_operation() =>
+                {
+                    Ok(NativeResume::RetrySyscall)
+                }
+                resumed => Ok(resumed),
+            },
             Some(LifecycleOutcome::Returned { result, .. }) => Ok(NativeResume::Returned(result)),
             Some(LifecycleOutcome::HostCustody) => {
                 // An adopted host member has no pool entry to retire in the
