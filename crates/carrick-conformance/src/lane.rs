@@ -71,6 +71,13 @@ pub enum Lane {
 }
 
 impl Lane {
+    /// These carriers publish mapped refusal counters at teardown. The BSD
+    /// engine lanes have no census transport yet; their absence is coverage
+    /// debt, not a new workload verdict.
+    pub fn emits_syscall_census(&self) -> bool {
+        matches!(self, Self::Hvf | Self::Kvm(_) | Self::KvmLocal(_))
+    }
+
     pub fn is_lima_kvm(&self) -> bool {
         matches!(self, Lane::Kvm(_))
     }

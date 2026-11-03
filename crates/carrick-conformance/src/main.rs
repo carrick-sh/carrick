@@ -959,7 +959,13 @@ fn run() -> anyhow::Result<ExitCode> {
                     timed_out: false,
                 };
                 let cout = out.as_ref().ok();
-                let rep = build_report(s, cout, &docker, classification);
+                let rep = build_report(
+                    s,
+                    cout,
+                    &docker,
+                    classification,
+                    lane.emits_syscall_census(),
+                );
                 if rep.gating {
                     let gating = phase1_gating.fetch_add(1, Ordering::SeqCst) + 1;
                     if fail_fast.should_abort(gating)
@@ -1300,7 +1306,13 @@ fn run() -> anyhow::Result<ExitCode> {
         .enumerate()
         .map(|(i, (s, cout))| {
             let cout = cout.as_ref().and_then(|r| r.as_ref().ok());
-            let report = build_report(s, cout, &docker_sides[i], classification);
+            let report = build_report(
+                s,
+                cout,
+                &docker_sides[i],
+                classification,
+                lane.emits_syscall_census(),
+            );
             match confirmations.get(&i) {
                 Some(confirmation) => adopt_serial_confirmation(report, confirmation.clone()),
                 None => report,
@@ -1345,7 +1357,13 @@ fn run() -> anyhow::Result<ExitCode> {
                     docker_sides[i].elapsed_ms,
                 )
                 .ok();
-                let rep = build_report(s, cout.as_ref(), &docker_sides[i], classification);
+                let rep = build_report(
+                    s,
+                    cout.as_ref(),
+                    &docker_sides[i],
+                    classification,
+                    lane.emits_syscall_census(),
+                );
                 eprintln!(
                     "  [retry] {} attempt {attempt}/{retries} -> {}{}",
                     s.name,
@@ -1491,6 +1509,7 @@ fn build_report(
     cout: Option<&engine::RunOutput>,
     docker: &DockerSide,
     policy: ClassificationPolicy<'_>,
+    census_required: bool,
 ) -> SuiteReport {
     let (c_raw, c_timed, c_runid, c_argv, c_elapsed_ms) = match cout {
         Some(o) => (
@@ -1541,8 +1560,19 @@ fn build_report(
         ClassificationPolicy::Baseline(baseline) => classify(s, facts(), d_res, baseline),
     };
 
-    if let Err(error) =
-        carrick_spec::syscall_census::check_log(&c_raw.stderr, docker.served_ordinals.as_deref())
+    let has_census = c_raw
+        .stderr
+        .lines()
+        .any(|line| line.starts_with(carrick_spec::syscall_census::MARKER));
+    // Missing teardown after a kill retains the workload's original verdict.
+    // Any evidence that did arrive is still checked, even on a killed row or
+    // a lane with no required transport. Completed supported runs fail closed.
+    let expects_teardown = census_required && cout.is_some() && !c_timed && c_raw.exit_code >= 0;
+    if (has_census || expects_teardown)
+        && let Err(error) = carrick_spec::syscall_census::check_log(
+            &c_raw.stderr,
+            docker.served_ordinals.as_deref(),
+        )
     {
         cl.gating = true;
         cl.verdict = Verdict::Incomplete;
@@ -3026,7 +3056,13 @@ mod tests {
             timed_out: false,
         };
 
-        let report = build_report(&suite, Some(&run), &docker, ClassificationPolicy::Closure);
+        let report = build_report(
+            &suite,
+            Some(&run),
+            &docker,
+            ClassificationPolicy::Closure,
+            true,
+        );
         assert_eq!(report.verdict, Verdict::Match);
         assert!(!report.gating);
 
@@ -3037,10 +3073,84 @@ mod tests {
             r#"{"refusal_evidence":{"schema":1,"isa":"aarch64","complete":true,"rows":[{"nr":34,"caller":"native_child","refused":1,"venue_refused":0,"allowlisted":true}]}}"#,
             "\n",
         )).expect("write refused-child evidence");
-        let report = build_report(&suite, Some(&run), &docker, ClassificationPolicy::Closure);
+        let report = build_report(
+            &suite,
+            Some(&run),
+            &docker,
+            ClassificationPolicy::Closure,
+            true,
+        );
         assert!(report.gating);
         assert!(
             report
+                .new_diffs
+                .iter()
+                .any(|diff| diff.contains("allowlisted syscall refused"))
+        );
+
+        let unsupported_refusal = build_report(
+            &suite,
+            Some(&run),
+            &docker,
+            ClassificationPolicy::Closure,
+            false,
+        );
+        assert!(unsupported_refusal.gating);
+        let refused_evidence = std::fs::read_to_string(&run.stderr_path).expect("retain evidence");
+
+        // A killed row cannot publish teardown evidence. Preserve its
+        // existing classification instead of manufacturing a census regression.
+        std::fs::write(&run.stderr_path, "").expect("remove teardown evidence");
+        let unsupported = build_report(
+            &suite,
+            Some(&run),
+            &docker,
+            ClassificationPolicy::Closure,
+            false,
+        );
+        assert_eq!(unsupported.verdict, Verdict::Match);
+        assert!(!unsupported.gating);
+        let missing = build_report(
+            &suite,
+            Some(&run),
+            &docker,
+            ClassificationPolicy::Closure,
+            true,
+        );
+        assert!(missing.gating);
+        assert!(
+            missing
+                .new_diffs
+                .iter()
+                .any(|diff| diff.contains("missing syscall refusal census"))
+        );
+        let mut killed = run;
+        killed.timed_out = true;
+        killed.exit_code = -1;
+        let report = build_report(
+            &suite,
+            Some(&killed),
+            &docker,
+            ClassificationPolicy::Closure,
+            true,
+        );
+        assert!(
+            !report
+                .new_diffs
+                .iter()
+                .any(|diff| diff.contains("syscall census"))
+        );
+
+        std::fs::write(&killed.stderr_path, refused_evidence).expect("retain killed-row evidence");
+        let refused_kill = build_report(
+            &suite,
+            Some(&killed),
+            &docker,
+            ClassificationPolicy::Closure,
+            true,
+        );
+        assert!(
+            refused_kill
                 .new_diffs
                 .iter()
                 .any(|diff| diff.contains("allowlisted syscall refused"))

@@ -1,11 +1,12 @@
 # Syscall refusal evidence (#1394)
 
 The acceptance question is whether Carrick served the guest operation, not
-whether the workload found a fallback and exited zero. The census is enabled
-unless `CARRICK_EL1_CENSUS=0`. JSON files go to `target/carrick-census`;
-an explicit directory value selects another destination and enables the
-existing CPU timing diagnostics. Default
-counting adds no thread-clock reads.
+whether the workload found a fallback and exited zero. Under the owner's
+2026-11-03 ruling on #231, census emission is opt-in: set
+`CARRICK_EL1_CENSUS=<directory>`. Unset, empty, and exact `0` disable emission
+and host timing hooks. Ring counters still exist independently. No census JSON
+is printed to user stderr. CI and signed test runners explicitly enable a
+census destination; conformance and smoke override it with private directories.
 
 The gates request a private directory, read its files and retain
 `CARRICK_SYSCALL_CENSUS` records in their evidence logs. The CLI does not
@@ -98,3 +99,59 @@ Each publication retains a uniquely created JSON file, including sequential
 embedded carriers sharing a host PID and grouping ID. The Lima lane forwards
 the destination into its VM and retrieves those files with bounded collection
 commands before checking the same evidence as local lanes.
+
+## Six-item review audit for the continuation worker
+
+This audits the independent review on PR #1403, not acceptance of the branch.
+All seven inherited commits were retained when rebasing onto admitted main.
+The #1444 carrier census ownership and #1409 per-process access semantics are
+retained. No syscall routing allowance, errno policy or work budget changed.
+
+1. **Authority catalogue: implemented.** The catalogue names
+   `carrick_runtime::el1_census::publish` for its existing filesystem APIs.
+   The continuation gate worker must quote source-debt and lint-domains results
+   on the final head; an older worker's receipt does not qualify this head.
+2. **Refusal holes: implemented; carrier-path proof remains.** Exec failure 38
+   and publication-race refusal count in the retained carrier ticket before
+   acknowledgement. Ring overflow, missing-fs chdir completion and structural
+   IPC leaves use `Counters::record_refusal`. The remaining policy and mmap
+   sites now also use that method, and the separate child-only updater is
+   removed. Counter tests cover both venues, both caller classes and overflow;
+   `unconfigured_host_aperture_refuses_unported_calls_and_counts` drives dispatch
+   overflow; `native_structural_refusals_retire_without_host_handback` drives
+   IPC. The access-refusal production witnesses remain bound above. **Remaining:**
+   red-first witnesses through carrier `prepare_exec`, its publication race,
+   and missing-fs chdir completion have not been supplied by earlier workers.
+   Counter-only tests do not substitute for those production paths.
+3. **Ticket-scoped bookkeeping: implemented.** Intake obtains the census from
+   retained carrier custody; `NativeService` retains that pointer until ACK.
+   Recording does not look up a process-global pointer and cannot add a fatal
+   error. The two-carrier counter test proves inventory isolation; a retiring
+   sibling-carrier production witness remains unrun.
+4. **Caller identity: implemented.** Venue accounting uses the ticket's sealed
+   `ServiceOrigin`. `ProcessNative::is_root_process` has no default; production
+   implements it using the admitted graph and test doubles state their identity.
+   `service_lineage_survives_ticket_intake_and_exec_rebind` and the non-1-root
+   access witness cover lineage transport and graph identity respectively.
+5. **Emission: implemented under the latest owner ruling.** No default output
+   or sidecar; `CARRICK_EL1_CENSUS=<directory>` opts in. The unset/empty/exact-0
+   policy test fails against the previous default-on implementation and passes
+   after the fix. Both CI workflows and the signed runner explicitly enable
+   evidence. Conformance and smoke request private destinations themselves.
+6. **Landing behavior: implemented; live oracle gate remains.** Missing shapes
+   remain counted debt under the existing 11,484-row ceiling, and shape capture
+   accepts natural nonzero workload exits. A killed row without teardown keeps
+   its ordinary verdict; a completed HVF/KVM row still requires a census.
+   BSD lanes lacking transport retain their ordinary verdict in its absence.
+   Evidence that is present is always checked, including on killed/BSD rows.
+   The report-builder witness fails before this correction and covers missing
+   evidence, unsupported transport, and allowlisted child refusal after it.
+   **Remaining:** Docker is absent here, so committed-cache
+   `conformance-quick` and live nonzero-exit shape capture are unrun.
+
+The separate gate worker must run the requested lint-domains, both native test
+partitions, clippy, check-linux and cross-check-macos. Signed smoke, generic
+probe shards, `task_cwd::sibling_processes_own_their_cwd_and_umask`, and the
+live AArch64 child mkdirat census/gate witness remain director work. The
+reviewer's signed mkdirat observation is historical evidence, not a receipt
+for this rebased artifact. Keep the PR draft.

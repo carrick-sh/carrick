@@ -3058,12 +3058,6 @@ impl Counters {
         }
     }
 
-    pub fn record_child_refusal(&self, bucket: usize, child: bool) {
-        if child {
-            self.refused_child[bucket.min(512)].fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
     pub fn record_lifecycle_decline(&self, reason: LifecycleDecline) {
         self.lifecycle_declines[reason as usize].fetch_add(1, Ordering::Relaxed);
     }

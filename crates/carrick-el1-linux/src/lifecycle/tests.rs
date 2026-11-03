@@ -1658,6 +1658,9 @@ fn process_native_hooks_require_every_execution_identity_component() {
         calls: usize,
     }
     impl ProcessNative for Probe {
+        fn is_root_process(&self) -> bool {
+            true
+        }
         fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
             self.binding
         }
@@ -1883,6 +1886,9 @@ fn clone_uses_the_exact_stamped_dispatch_identity() {
         binding: carrick_el1_abi::ExecutionBinding,
     }
     impl ProcessNative for BirthProbe {
+        fn is_root_process(&self) -> bool {
+            true
+        }
         fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
             self.binding
         }
@@ -1963,6 +1969,9 @@ fn clone_refuses_missing_dispatch_identity_without_registering() {
         binding: carrick_el1_abi::ExecutionBinding,
     }
     impl ProcessNative for BirthProbe {
+        fn is_root_process(&self) -> bool {
+            true
+        }
         fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
             self.binding
         }
@@ -2040,6 +2049,9 @@ fn clone_missing_nonleader_identity_cannot_inherit_leader() {
         binding: carrick_el1_abi::ExecutionBinding,
     }
     impl ProcessNative for BirthProbe {
+        fn is_root_process(&self) -> bool {
+            true
+        }
         fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
             self.binding
         }
@@ -2131,6 +2143,9 @@ fn clone_stamped_nonleader_inherits_the_calling_thread() {
         binding: carrick_el1_abi::ExecutionBinding,
     }
     impl ProcessNative for BirthProbe {
+        fn is_root_process(&self) -> bool {
+            true
+        }
         fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
             self.binding
         }
@@ -2222,6 +2237,9 @@ fn clone_stamped_nonleader_inherits_the_calling_thread() {
 }
 struct IdentityOwner(carrick_el1_abi::ExecutionBinding);
 impl<C: carrick_el1_abi::EntryContext> ProcessNative<C> for IdentityOwner {
+    fn is_root_process(&self) -> bool {
+        true
+    }
     fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
         self.0
     }
@@ -2473,6 +2491,9 @@ fn clone_terminal_close_rolls_back_before_owned_exit_settlement() {
         refuse_birth: bool,
     }
     impl ProcessNative for GraphOwner<'_> {
+        fn is_root_process(&self) -> bool {
+            true
+        }
         fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
             self.binding
         }
@@ -2608,6 +2629,9 @@ fn clone_queue_publication_can_reenter_the_process_graph_after_unlock() {
         refuse_birth: bool,
     }
     impl ProcessNative for GraphOwner<'_> {
+        fn is_root_process(&self) -> bool {
+            true
+        }
         fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
             self.binding
         }
@@ -2806,6 +2830,9 @@ fn clone_terminal_failure_witness(mode: u8) {
         mode: u8,
     }
     impl ProcessNative for GraphOwner<'_> {
+        fn is_root_process(&self) -> bool {
+            true
+        }
         fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
             self.binding
         }
@@ -3005,6 +3032,9 @@ fn native_exit_group_leaves_the_woken_successor_to_the_scheduler() {
         binding: carrick_el1_abi::ExecutionBinding,
     }
     impl ProcessNative for Exiting {
+        fn is_root_process(&self) -> bool {
+            true
+        }
         fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
             self.binding
         }
@@ -3095,6 +3125,9 @@ fn arm_dispatch_consumes_native_run_failure_before_return() {
         binding: carrick_el1_abi::ExecutionBinding,
     }
     impl ProcessNative for Failed {
+        fn is_root_process(&self) -> bool {
+            true
+        }
         fn take_run_failure(&mut self) -> Option<carrick_core_abi::NativeRunFailureReason> {
             Some(carrick_core_abi::NativeRunFailureReason::X86GroupExitCustody)
         }

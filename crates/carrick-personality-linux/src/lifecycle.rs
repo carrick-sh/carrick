@@ -245,9 +245,7 @@ pub enum OwnedCopyError {
 /// remain in the shared scheduler owner; this adapter retains machine context.
 pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::ThreadCtx> {
     /// The admitted process graph owns root identity; namespace PID 1 does not.
-    fn is_root_process(&self) -> bool {
-        true
-    }
+    fn is_root_process(&self) -> bool;
     /// Resume this exact thread's retained operation before a new syscall is
     /// dispatched. Readiness alone cannot authorize a user return.
     fn resume_owned_continuation(&mut self) -> Option<LifecycleOutcome> {

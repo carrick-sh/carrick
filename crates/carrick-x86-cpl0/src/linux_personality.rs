@@ -830,14 +830,9 @@ impl Personality for LinuxPersonality {
         binding: &CpuBinding,
         counters: &Counters,
     ) {
-        evaluate_host_crossing(
-            HostCrossingSet::X86,
-            true,
-            None,
-            None,
-            Some(&counters.refused),
-            |ret| frame.rax = ret.raw() as u64,
-        );
+        evaluate_host_crossing(HostCrossingSet::X86, true, None, None, None, |ret| {
+            frame.rax = ret.raw() as u64
+        });
         let slot = checked_scheduler_slot(carrick_guest_arch::CpuId::new(binding.cpu_slot))
             .unwrap_or_else(|| fatal_boot());
         let source = carrick_x86_carrier::native_execution::source(slot);
@@ -845,7 +840,15 @@ impl Personality for LinuxPersonality {
             native_process::registry()
                 .record_is_fork_child(source.zone, source.zone.record_ref(record))
         });
-        counters.record_child_refusal(512, child);
+        counters.record_refusal(
+            carrick_guest_arch::NativeOrdinal::new(512),
+            if child {
+                carrick_core_abi::service::ServiceOrigin::Descendant
+            } else {
+                carrick_core_abi::service::ServiceOrigin::Initial
+            },
+            carrick_el1_abi::RefusalVenue::Ring,
+        );
     }
 
     fn dispatch(
@@ -1029,13 +1032,19 @@ impl Personality for LinuxPersonality {
             // The x86 router never selects the ARM native-exec service; fail
             // closed with a counted-unrouted errno rather than forwarding.
             CompletionRoute::NativeService => {
-                let bucket = (call.native.raw().min(512)) as usize;
-                counters.refused[bucket].fetch_add(1, Ordering::Relaxed);
                 let child = source.zone.slot(slot).current().is_some_and(|record| {
                     native_process::registry()
                         .record_is_fork_child(source.zone, source.zone.record_ref(record))
                 });
-                counters.record_child_refusal(bucket, child);
+                counters.record_refusal(
+                    carrick_guest_arch::NativeOrdinal::new(call.native.raw()),
+                    if child {
+                        carrick_core_abi::service::ServiceOrigin::Descendant
+                    } else {
+                        carrick_core_abi::service::ServiceOrigin::Initial
+                    },
+                    carrick_el1_abi::RefusalVenue::Ring,
+                );
                 frame.rax = carrick_syscall_abi::LINUX_ENOSYS.guest_retval() as u64;
                 ControlFlow::Return(())
             }
