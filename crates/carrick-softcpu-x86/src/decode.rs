@@ -482,7 +482,7 @@ pub const fn is_memory_kind(kind: OpKind) -> bool {
 /// Unsupported Level 0 instructions produce guest #UD, never a native fault.
 #[rustfmt::skip]
 pub(crate) fn supported_body(insn: &Instruction) -> bool {
-    if crate::avx::supported(insn) { return true; }
+    if crate::avx::supported(insn) || is_mmx(insn) || insn.mnemonic() == Mnemonic::Clflush { return true; }
     if insn.encoding() != iced_x86::EncodingKind::Legacy || insn.is_vsib() {
         return false;
     }
@@ -628,4 +628,19 @@ pub(crate) fn is_x87(insn: &Instruction) -> bool {
         | Mnemonic::Fprem | Mnemonic::Fprem1 | Mnemonic::F2xm1 | Mnemonic::Fyl2x | Mnemonic::Fyl2xp1
         | Mnemonic::Fsin | Mnemonic::Fcos | Mnemonic::Fsincos | Mnemonic::Fptan | Mnemonic::Fpatan | Mnemonic::Fnop
     )
+}
+
+/// MMX shares the physical x87 register file, including tag transitions.
+pub(crate) fn is_mmx(insn: &Instruction) -> bool {
+    insn.encoding() == iced_x86::EncodingKind::Legacy
+        && insn
+            .op_kinds()
+            .enumerate()
+            .all(|(i, k)| k != OpKind::Register || insn.op_register(i as u32).is_mm())
+        && (insn.mnemonic() == Mnemonic::Emms
+            || (matches!(insn.mnemonic(), Mnemonic::Movq | Mnemonic::Paddb)
+                && insn
+                    .op_kinds()
+                    .enumerate()
+                    .any(|(i, k)| k == OpKind::Register && insn.op_register(i as u32).is_mm())))
 }
