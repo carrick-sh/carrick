@@ -158,9 +158,13 @@ jobs:
           git fetch --no-tags https://github.com/carrick-sh/carrick refs/heads/main
           test "$(git rev-parse HEAD)" = "$CARRICK_DISPATCH_BASE"
           git merge-base --is-ancestor "$CARRICK_DISPATCH_BASE" FETCH_HEAD
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
-        with:
-          toolchain: '1.96.0'
+      - name: Verify the template's pinned read-only Rust toolchain
+        run: |
+          test "$RUSTUP_HOME" = /opt/carrick-rust/rustup
+          test ! -w "$RUSTUP_HOME"
+          test "$RUSTUP_AUTO_INSTALL" = 0
+          rustup show active-toolchain
+          cargo --version
       # Credentialed driver code must never be compiled from restored objects or
       # toolchains. Keep the resulting executable outside the restored target.
       - name: Build workflow driver

@@ -1124,3 +1124,22 @@ and `.fw` file. After retirement, rolling back means rebuilding a template,
 and since `main` still selects the new slot, a fix-forward PR must change
 the site row first. Details are in the
 [beside rebuild procedure](contabo-kvm.md#rollback).
+
+### Rust homes in agent templates
+
+The Debian template installs the complete `rust-toolchain.toml` toolchain once
+at `/opt/carrick-rust/rustup`. Root owns this tree and its ancestors; no group
+or other write permission is admitted. Toolchain symlinks are refused.
+`runner-once.sh` exports this `RUSTUP_HOME` and disables automatic installation.
+A toolchain pin change requires rebuilding the template before dispatching it.
+
+Each worker still gets a private writable Cargo home (without runner config or
+credentials) and target directory. Toolchain contents are never copied into the
+worker home. The existing agent census and job cleanup continue to own only
+job state; they do not remove the template toolchain.
+
+To qualify the disk saving, repeat the per-round disk-write measurement from
+#1511 on a rebuilt template, with the same worker population. The removed copy
+is approximately 1.9 GB per worker; metadata validation still reads the shared
+tree. A source change or a fixture pass alone does not establish that measured
+round-level saving.

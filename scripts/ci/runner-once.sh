@@ -13,6 +13,10 @@ rm -f /home/runner/.ssh/authorized_keys
   trap '' HUP
   cd /home/runner/actions-runner
   export PATH="/home/runner/.cargo/bin:$PATH"
+  if [[ -d /opt/carrick-rust/rustup ]]; then
+    export RUSTUP_HOME=/opt/carrick-rust/rustup
+    export RUSTUP_AUTO_INSTALL=0
+  fi
   export CARGO_BUILD_JOBS=2
   export SCCACHE_DIR=/home/runner/.cache/sccache
   export SCCACHE_CACHE_SIZE=2G
