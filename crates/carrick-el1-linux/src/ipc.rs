@@ -514,6 +514,54 @@ fn op_kind(
     }
 }
 
+/// Allocation refusal retains its input and a counted release subscription.
+/// The caller enrolls with `ticket.park_host_rechecked` (or its native owner
+/// equivalent), then probes the arena once; it must not forward on Busy.
+#[must_use]
+pub enum OperationAdmission<'a, C: carrick_el1_abi::EntryContext> {
+    Admitted(IpcOpToken),
+    Busy {
+        operation: IpcOperation,
+        ticket: carrick_sched_core::object_wait::ObjectNotificationTicket<'a, C>,
+        snapshot: carrick_sched_core::object_wait::ObjectWaitSnapshot,
+    },
+    Refused {
+        operation: IpcOperation,
+        error: ObjectWaitError,
+    },
+}
+
+/// Subscribe before the single allocation attempt. A release between failure
+/// and enrollment changes the snapshot, so no returned slot can be missed.
+/// This is the admission primitive for retained poll; existing read/write
+/// admission is unchanged in this prerequisite slice.
+pub fn admit_operation_wait<'a, C: carrick_el1_abi::EntryContext>(
+    region: &IpcRegion<'_>,
+    zone: &'a carrick_sched_core::ZoneTables<C>,
+    operation: IpcOperation,
+    completion: &dyn Fn(carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>),
+) -> OperationAdmission<'a, C> {
+    let source =
+        match zone.ipc_operation_slot_source(region.operation_slot_generation(), completion) {
+            Ok(source) => source,
+            Err(error) => return OperationAdmission::Refused { operation, error },
+        };
+    let ticket = source.reserve();
+    let snapshot = source.observe();
+    match region.begin_operation(operation) {
+        Ok(token) => OperationAdmission::Admitted(token),
+        Err(carrick_el1_abi::ipc::IpcError::NoOperations) => OperationAdmission::Busy {
+            operation,
+            ticket,
+            snapshot,
+        },
+        Err(_) => OperationAdmission::Refused {
+            operation,
+            error: ObjectWaitError::Stale,
+        },
+    }
+}
+
 /// Decode a fresh call and take ownership of it, before any effect.
 fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
     sched: &mut Sched<'_, C, U>,
@@ -1273,13 +1321,27 @@ fn park_key<C: ThreadCpu, U: UserWord>(
     }
 }
 
+fn notify_operation_release<C: carrick_el1_abi::EntryContext>(
+    region: &IpcRegion<'_>,
+    zone: &carrick_sched_core::ZoneTables<C>,
+    slot: carrick_el1_abi::SlotId,
+) {
+    zone.notify_ipc_operation_slot_release(
+        region.operation_slot_generation(),
+        carrick_sched_core::Waker::El1 { slot },
+        &|owned| crate::sched::object_wait::deliver_completion(zone, slot, owned),
+    );
+}
+
 /// Retire the operation record and drop its pin.
 fn finish<C: ThreadCpu, U: UserWord>(
     sched: &mut Sched<'_, C, U>,
     token: IpcOpToken,
     region: &IpcRegion<'_>,
 ) {
-    if let Ok(op) = region.finish_operation(token) {
+    if let Ok(op) = region.finish_operation(token, || {
+        notify_operation_release(region, sched.zone, sched.slot)
+    }) {
         release_pin(sched, OfdPin::from_raw(op.pin), region);
     }
 }
@@ -1303,7 +1365,7 @@ pub(crate) fn retire_native_operation<C: carrick_el1_abi::EntryContext>(
         return Err(NativeProcessError::Quarantined);
     }
     let op = region
-        .finish_operation(token)
+        .finish_operation(token, || notify_operation_release(region, zone, slot))
         .map_err(|_| NativeProcessError::Stale)?;
     let release = region
         .fd(EL1_WAIT)
@@ -1429,9 +1491,13 @@ fn finish_native<C: ThreadCpu, U: UserWord>(
     token: IpcOpToken,
     region: &IpcRegion<'_>,
 ) {
-    let op = region.finish_operation(token).unwrap_or_else(|_| {
-        crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
-    });
+    let op = region
+        .finish_operation(token, || {
+            notify_operation_release(region, sched.zone, sched.slot)
+        })
+        .unwrap_or_else(|_| {
+            crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+        });
     let release = region
         .fd(EL1_WAIT)
         .unpin_filtered(OfdPin::from_raw(op.pin), is_zone_releasable_backing)
@@ -2064,6 +2130,75 @@ mod tests {
     /// Ready zone items are reported in the guest; every case EL1 does not
     /// serve forwards unchanged before any effect, and an undelivered
     /// report is reported again.
+    #[test]
+    fn ipc_operation_slot_busy_once_then_success() {
+        use carrick_sched_core::object_wait::{OperationToken, OwnedObjectWakeEffects};
+        let mut w = world();
+        let mut held = Vec::new();
+        for _ in 0..carrick_el1_abi::ipc::IPC_OPERATIONS {
+            held.push(w.region.begin_operation(IpcOperation::EMPTY).unwrap());
+        }
+        let delivered = Cell::new(0);
+        let completion =
+            |owned: OwnedObjectWakeEffects<'_, carrick_el1_abi::Aarch64ParkedContext>| {
+                let _ = owned.deliver_handbacks(&mut |_| panic!("slot is available"));
+                delivered.set(delivered.get() + 1);
+            };
+        let operation = IpcOperation {
+            orig_x0: 123,
+            ..IpcOperation::EMPTY
+        };
+        let (operation, ticket, snapshot) =
+            match admit_operation_wait(w.region, &w.zone, operation, &completion) {
+                OperationAdmission::Busy {
+                    operation,
+                    ticket,
+                    snapshot,
+                } => (operation, ticket, snapshot),
+                _ => panic!("full arena must retain a Busy subscription"),
+            };
+        let record = w.zone.alloc_record(identity(909, MM)).unwrap();
+        let retained = OperationToken::new(9001, 1).unwrap();
+        let queue = w
+            .zone
+            .object_wait_with_completion(
+                ticket.key(),
+                &carrick_sched_core::BoundedSpin(0),
+                &completion,
+            )
+            .unwrap();
+        queue.park(snapshot, record, retained).unwrap();
+        drop(queue);
+        drop(ticket);
+        assert_eq!(delivered.get(), 0);
+        let mut sched = Sched {
+            handoff: None,
+            zone: &w.zone,
+            slot: SLOT,
+            task: &w.task,
+            cpu: &mut w.cpu,
+            user: &HardwareUserWord,
+            counters: w.counters,
+        };
+        finish(&mut sched, held.pop().unwrap(), w.region);
+        assert!(
+            matches!(
+                w.zone.record(record).claim(),
+                carrick_sched_core::Claim::Queued { .. }
+            ),
+            "actual operation retirement must wake the enrolled waiter"
+        );
+        let resumed = match admit_operation_wait(w.region, &w.zone, operation, &completion) {
+            OperationAdmission::Admitted(token) => token,
+            _ => panic!("returned slot must admit the same operation"),
+        };
+        assert_eq!(w.region.operation(&resumed).unwrap().orig_x0, 123);
+        finish(&mut sched, resumed, w.region);
+        for token in held {
+            finish(&mut sched, token, w.region);
+        }
+    }
+
     #[test]
     fn el1_epoll_zone_wait_reports_in_guest_and_forwards_the_rest() {
         let mut w = world();

@@ -36,6 +36,8 @@ pub use crate::el1_zone::HostLockWait as HostIpcWait;
 /// Host services for one completion owner: authenticate its mapping, retire
 /// host tokens, and deliver object wakes. Callbacks run with no IPC lock held.
 pub trait IpcHostServices {
+    /// Publish a returned operation slot through the exact carrier owner.
+    fn operation_slot_released(&self, region: &IpcRegion<'_>);
     fn validate_region(&self, region: &IpcRegion<'_>) -> Result<(), IpcError>;
     fn release_host(&self, token: carrick_el1_abi::ipc::HostResourceToken) -> Result<(), IpcError>;
     /// Deliver a published change after every IPC lock is released: the
@@ -105,6 +107,15 @@ impl ZoneHostServices {
 }
 
 impl IpcHostServices for ZoneHostServices {
+    fn operation_slot_released(&self, region: &IpcRegion<'_>) {
+        if let Some(zone) = crate::el1_zone::zone() {
+            zone.notify_ipc_operation_slot_release(
+                region.operation_slot_generation(),
+                carrick_sched_core::Waker::Host,
+                &|owned| crate::el1_zone::complete_object_wake(zone, owned),
+            );
+        }
+    }
     fn validate_region(&self, region: &IpcRegion<'_>) -> Result<(), IpcError> {
         if region.same_mapping(&self.owner.region()) {
             Ok(())
@@ -416,7 +427,7 @@ pub fn finish(
     wake: &impl IpcHostServices,
 ) -> Result<IpcOperation, IpcError> {
     wake.validate_region(region)?;
-    let op = region.finish_operation(token)?;
+    let op = region.finish_operation(token, || wake.operation_slot_released(region))?;
     if op.pin.authority != 0 {
         let fd = region.fd(HostIpcWait);
         if let Some(description) = fd.unpin(OfdPin::from_raw(op.pin)).map_err(IpcError::Fd)? {

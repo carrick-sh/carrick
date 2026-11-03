@@ -856,13 +856,16 @@ fn el1_ipc_operation_tokens_own_their_record_and_reject_stale_copies() {
     let mut current = fx.region.operation(&token).unwrap();
     current.progress.written = 4;
     fx.region.update_operation(&token, current).unwrap();
-    let done = fx.region.finish_operation(token).unwrap();
+    let done = fx.region.finish_operation(token, || {}).unwrap();
     assert_eq!(done.progress.written, 4);
     assert_eq!(fx.el1().unpin(OfdPin::from_raw(done.pin)), Ok(None));
     // A copied raw token is not a second owner.
     let stale = IpcOpToken::from_raw(raw);
     assert_eq!(fx.region.operation(&stale), Err(IpcError::Stale));
-    assert_eq!(fx.region.finish_operation(stale), Err(IpcError::Stale));
+    assert_eq!(
+        fx.region.finish_operation(stale, || {}),
+        Err(IpcError::Stale)
+    );
     let reused = fx.region.begin_operation(IpcOperation::EMPTY).unwrap();
     assert_eq!(
         fx.region.operation(&IpcOpToken::from_raw(raw)),
@@ -881,8 +884,44 @@ fn el1_ipc_operation_tokens_own_their_record_and_reject_stale_copies() {
         Err(IpcError::NoOperations)
     );
     for t in held {
-        fx.region.finish_operation(t).unwrap();
+        fx.region.finish_operation(t, || {}).unwrap();
     }
+}
+
+#[test]
+fn el1_ipc_operation_release_only_follows_a_reusable_slot_push() {
+    use core::cell::Cell;
+    let fx = fixture(1 << 20);
+    let token = fx.region.begin_operation(IpcOperation::EMPTY).unwrap();
+    let raw = token.into_raw();
+    let notices = Cell::new(0);
+    fx.region
+        .finish_operation(IpcOpToken::from_raw(raw), || {
+            notices.set(notices.get() + 1);
+            // The release observer can immediately claim the slot it announces.
+            let next = fx.region.begin_operation(IpcOperation::EMPTY).unwrap();
+            assert_eq!(next.into_raw().index, raw.index);
+        })
+        .unwrap();
+    assert_eq!(notices.get(), 1);
+    assert_eq!(
+        fx.region
+            .finish_operation(IpcOpToken::from_raw(raw), || notices.set(99)),
+        Err(IpcError::Stale)
+    );
+    assert_eq!(notices.get(), 1);
+
+    let token = fx.region.begin_operation(IpcOperation::EMPTY).unwrap();
+    let mut raw = token.into_raw();
+    // The last incarnation is permanently quarantined rather than returned.
+    raw.generation = u32::MAX - 1;
+    fx.region.dir.operations[raw.index as usize]
+        .generation
+        .store(raw.generation, Ordering::Release);
+    fx.region
+        .finish_operation(IpcOpToken::from_raw(raw), || notices.set(99))
+        .unwrap();
+    assert_eq!(notices.get(), 1, "quarantine is not an availability edge");
 }
 
 #[test]
