@@ -141,12 +141,13 @@ retained. No syscall routing allowance, errno policy or work budget changed.
 5. **Emission: implemented under the latest owner ruling.** No default output
    or sidecar; `CARRICK_EL1_CENSUS=<directory>` opts in. The unset/empty/exact-0
    policy test fails against the previous default-on implementation and passes
-   after the fix. Both CI workflows and the signed runner explicitly enable
-   evidence. Conformance and smoke request private destinations themselves.
-   The last inherited checkpoint had removed the two workflow settings because
-   dispatch credentials could not publish workflow files; this continuation
-   restores them. Publication requires credentials permitted to update workflows,
-   or the workflow owner must apply these two settings before acceptance.
+   after the fix. The signed runner explicitly enables evidence; conformance
+   and smoke request private destinations themselves. **Remaining:** the final dispatch checkpoint
+   removed the two CI workflow settings because dispatch credentials cannot
+   publish workflow files. Both workflow `env` blocks still need
+   `CARRICK_EL1_CENSUS: ${{ github.workspace }}/target/carrick-census` applied
+   by a workflow-capable publisher before acceptance. The current tree does not
+   satisfy that CI requirement.
 6. **Landing behavior: implemented; live oracle gate remains.** Missing shapes
    remain counted debt under the existing 11,484-row ceiling, and shape capture
    accepts natural nonzero workload exits. A killed row without teardown keeps
@@ -158,9 +159,21 @@ retained. No syscall routing allowance, errno policy or work budget changed.
    **Remaining:** Docker is absent here, so committed-cache
    `conformance-quick` and live nonzero-exit shape capture are unrun.
 
-The separate gate worker must run the requested lint-domains, both native test
-partitions, clippy, check-linux and cross-check-macos. Signed smoke, generic
-probe shards, `task_cwd::sibling_processes_own_their_cwd_and_umask`, and the
+The separate Linux x86_64 gate turn returned these results:
+
+- `just lint-domains`: exit 1, blocked at `scripts/lint-domains.sh` because
+  Semgrep is not installed. The full typed-domain/compiler gate is unqualified.
+- `just test-el1-native`: exit 0; both partitions ran in the one-process-per-test
+  runner: 633 regular tests passed, one ignored, and 29 `serial_host` tests passed.
+- `just clippy`: exit 0.
+- `just check-linux`: exit 0, including the no-HVF closure assertion.
+- `just cross-check-macos`: exit 0 (cross-compilation and clippy, not HVF execution).
+- `just xtask authority-debt --source-only`: exit 0; source ceilings pass.
+  Repeating with `--base` admitted main also exits 0 and passes the PR-base ratchet.
+- `just check-contract-change` against admitted main: exit 0.
+- `cargo check -p carrick-vmm-kvm`: exit 0; no live KVM test is claimed.
+
+Signed smoke, generic probe shards, `task_cwd::sibling_processes_own_their_cwd_and_umask`, and the
 live AArch64 child mkdirat census/gate witness remain director work. The
 reviewer's signed mkdirat observation is historical evidence, not a receipt
 for this rebased artifact. Keep the PR draft.
