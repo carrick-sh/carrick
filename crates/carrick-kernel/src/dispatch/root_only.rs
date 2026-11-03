@@ -60,7 +60,6 @@ macro_rules! root_only {
                 }
             }
         }
-        #[cfg(test)]
         const ROOT_ONLY_IDENTITIES: &[CanonicalNr] = &[$($nr,)*];
     };
 }
@@ -349,6 +348,8 @@ root_only! {
     nr::WRITE,
     nr::WRITEV,
 }
+
+const _: () = assert!(ROOT_ONLY_IDENTITIES.len() <= 283);
 
 /// Consult the same owner as native entry, retaining only enumerated root debt.
 /// No task class is supplied to service_owner. The compatibility token is local
