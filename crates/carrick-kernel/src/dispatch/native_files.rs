@@ -270,10 +270,17 @@ impl SyscallDispatcher {
             // not served rather than altered.
             let path = std::str::from_utf8(path).map_err(|_| NativeHostFileRefusal)?;
             let capacity = view.output_capacity();
-            super::resources::with_native_fs_scope(&authority, || {
-                self.serve_native_path(owner, table, header, path, capacity)
-            })
-            .ok_or(NativeHostFileRefusal)?
+            if path.is_empty() {
+                // The descriptor form of a path call (`statx(fd, "",
+                // AT_EMPTY_PATH)`): it names the caller's descriptor, which
+                // lives in its ring table, never a host fd table (#1503).
+                self.serve_native_empty_path(owner, table, header, capacity)
+            } else {
+                super::resources::with_native_fs_scope(&authority, || {
+                    self.serve_native_path(owner, table, header, path, capacity)
+                })
+                .ok_or(NativeHostFileRefusal)?
+            }
         } else if header.op == HostFileOp::Poll {
             self.serve_native_poll(owner, table, header, view.input(), view.output_capacity())
         } else {
@@ -297,6 +304,42 @@ impl SyscallDispatcher {
         view.reply(result, &output)
             .map_err(|_| NativeHostFileRefusal)?;
         Ok(NativeHostFileServed { retained_source })
+    }
+
+    /// A path call with an empty path. Only `statx(fd, "", AT_EMPTY_PATH)`
+    /// is staged this way (the ring stages `newfstatat`'s descriptor form as
+    /// [`HostFileOp::Fstat`], and an `AT_FDCWD` base as `"."`): it is the
+    /// pinned descriptor's own stat, exactly as `fstat`. Any other empty
+    /// path is refused (counted ENOSYS) rather than resolved: the dispatcher's
+    /// empty-path lookup reads a host fd table a native process does not have.
+    fn serve_native_empty_path(
+        &self,
+        owner: &Arc<HostIpc>,
+        table: fd::TableId,
+        header: HostFileHeader,
+        capacity: usize,
+    ) -> Served {
+        let flags = u64::from(header.flags);
+        if header.op != HostFileOp::Statx
+            || flags & carrick_abi::LINUX_AT_EMPTY_PATH == 0
+            || header.fd < 0
+        {
+            return Served::Refused;
+        }
+        if !super::format_stat::linux_statx_flags_are_supported(flags)
+            || header.args[0] & carrick_abi::LINUX_STATX_RESERVED != 0
+        {
+            return Served::errno(carrick_abi::LINUX_EINVAL);
+        }
+        match owner.with_pinned_host_resource(table, fd::Fd(header.fd), |resource| {
+            self.serve_native_resource(header, resource, &[], capacity)
+        }) {
+            Ok(served) => served,
+            Err(PinnedHostResourceError::BadFd) => Served::errno(carrick_abi::LINUX_EBADF),
+            Err(PinnedHostResourceError::InZone | PinnedHostResourceError::Unavailable) => {
+                Served::Refused
+            }
+        }
     }
 
     /// A non-blocking readiness snapshot of a native `ppoll` set
@@ -1322,6 +1365,73 @@ mod tests {
             .unwrap();
         fixture.owner.release(released.backing).unwrap();
         assert_eq!(fixture.owner.retained_host_resources(), before - 1);
+    }
+
+    /// #1503: `statx(fd, "", AT_EMPTY_PATH)` of a venue-opened file. The ring
+    /// stages it as a `Statx` record naming the descriptor with an empty
+    /// path (a path op, so the record carries the caller's access context).
+    /// The carrier must stat the pinned descriptor, exactly as `fstat`; it
+    /// used to resolve the empty path against `AT_FDCWD`, which reached for a
+    /// host file table the native scope does not have and killed the carrier
+    /// ("file-table access escaped its captured KernelContext scope").
+    #[test]
+    fn native_statx_of_a_descriptor_is_its_fstat() {
+        let fixture = rootfs_fixture();
+        let authority = authority_of(&fixture.dispatcher);
+        let open = record(
+            fixture.table,
+            HostFileOp::Openat,
+            FDCWD,
+            [carrick_abi::LINUX_O_CLOEXEC, 0, 0, 0],
+            b"/lib/libc.so.6",
+            0,
+        );
+        let (fd, _) = fixture.result(Some(&authority), open);
+        assert!(fd >= 0, "open: {fd}");
+        let fd = fd as i32;
+        let statx_bytes = carrick_personality_linux::native_host_file::LINUX_STATX_BYTES;
+        let statx = |flags: u32, fd: i32| {
+            let mut bytes = vec![0u8; host_file::record_len(0, statx_bytes).unwrap()];
+            host_file::encode(
+                &mut bytes,
+                HostFileHeader {
+                    op: HostFileOp::Statx,
+                    table: fixture.table,
+                    fd,
+                    flags,
+                    args: [0x0fff, 0, 0, 0],
+                },
+                &[],
+                statx_bytes,
+            )
+            .unwrap();
+            fixture.result(Some(&authority), bytes)
+        };
+        let (result, bytes) = statx(carrick_abi::LINUX_AT_EMPTY_PATH as u32, fd);
+        assert_eq!(result, 0, "statx(fd, \"\", AT_EMPTY_PATH)");
+        let size = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
+        assert_eq!(size, b"\x7fELF-libc-bytes".len() as u64, "stx_size");
+        let ino = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
+        let (result, stat) = fixture.result(
+            None,
+            record(
+                fixture.table,
+                HostFileOp::Fstat,
+                fd,
+                [0; 4],
+                &[],
+                carrick_personality_linux::native_host_file::LINUX_STAT_BYTES,
+            ),
+        );
+        assert_eq!(result, 0);
+        assert_eq!(
+            ino,
+            u64::from_le_bytes(stat[8..16].try_into().unwrap()),
+            "statx and fstat name one inode"
+        );
+        // A closed descriptor is EBADF, as Linux, never a path lookup.
+        let (result, _) = statx(carrick_abi::LINUX_AT_EMPTY_PATH as u32, 9);
+        assert_eq!(result, carrick_abi::LINUX_EBADF.guest_retval());
     }
 
     /// The ring answers `fstat`/`statx` of its in-zone pipes itself; those

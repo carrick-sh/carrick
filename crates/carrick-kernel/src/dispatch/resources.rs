@@ -204,6 +204,19 @@ pub(super) fn with_native_fs_scope<R>(
     Some(operation())
 }
 
+/// Whether a carrier host-file service runs for a native process on this
+/// thread ([`with_native_fs_scope`]) with no task's resources captured: the
+/// scope has no host file table or MM, so reaching for one is an escape.
+/// Production fails closed on the absent table; test builds, whose
+/// dispatcher helpers fall back to a test task, ask this first.
+#[cfg(test)]
+pub(super) fn in_native_fs_scope() -> bool {
+    CAPTURED_RESOURCES.with(|stack| {
+        let stack = stack.borrow();
+        stack.is_empty() && stack.native_fs.is_some()
+    })
+}
+
 /// Exhaustive current-thread resource-scope audit used before an executor is
 /// allowed to load another logical task.
 pub fn executor_boundary_is_clear() -> bool {
