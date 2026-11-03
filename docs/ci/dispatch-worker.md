@@ -92,6 +92,38 @@ including renames and capped comparisons, as in #799. Comment YAML comes from
 main. Issue/comment events serialize by webhook issue/PR number; reviews by
 head ref. The expected-tip push lease closes cross-key races.
 
+### Dispatching a stack layer (#1543)
+
+Both owned dispatch PRs and adopted director PRs can target another layer.
+The guard resolves the base branch through live GitHub PR facts: exactly one
+open PR must have that head branch in this repository. Every parent must be
+open, with head and base in this repository, and the chain must reach `main`.
+Missing parents, foreign repositories, cycles and chains exceeding 64 hops
+are refused. No PR-body marker grants stack admission.
+
+A stacked round admits two commits. Main remains the trusted driver checkout;
+parent code is worker data, never credentialed driver code. The immediate
+parent's head is the worker's admitted base, supplied at
+`refs/carrick/dispatch-parent`; main is supplied at
+`refs/carrick/dispatch-main`. Workers rebase onto that parent layer, preserve
+this layer's earlier commits, and push only this layer's admitted branch under
+its expected-tip lease. Dispatch never pushes or restacks lower layers.
+
+History preservation, ancestry, workflow-change attribution and commit closing
+scope use the parent in place of main. In particular, owned PR commits are
+measured from `merge-base(parent, HEAD)`, so lower-layer commits and their
+closing references are not charged to this round. Adopted rounds still count
+only commits above the director's admitted tip (or its preserved rebased
+counterpart). The existing owner `Rebase: allowed` consent is required for an
+adopted layer's rebase.
+
+When a parent moves before admission, the next round admits its new head and
+can rebase this layer onto it, with the same consent rules. If the immediate
+parent moves or the layer is retargeted during a round, publication refuses;
+start another round to admit the new parent. This keeps an in-flight round
+from silently changing its rebase target. A live dispatch round on a real
+stack remains a deployment acceptance check after these changes are published.
+
 ### Adopting a director PR (#1175)
 
 Dispatch can also continue a PR it did not open, such as a director session's
@@ -100,8 +132,8 @@ Dispatch can also continue a PR it did not open, such as a director session's
 above. Adoption needs
 all of these, checked against the live PR when the comment is admitted:
 
-- The PR is open, its head branch is in this repository, and it targets
-  `main`.
+- The PR is open, its head branch is in this repository, and its base is
+  `main` or a verified parent layer as described below.
 - The head branch is a valid `work/*` name that is not a
   `work/dispatch-<issue>-<run>` name. Dispatch-named branches always take
   the owned-PR path above.
@@ -129,7 +161,7 @@ in the admitted `/agent` comment, from the owner account (which director
 sessions post as); a write collaborator's trigger cannot consent. The guard
 records it as `Continuation::Adopted.rebase`, the coordinator sees it in
 `read_state` as an `adoption` item (`rebase_allowed`), and the worker brief
-asks for a rebase onto admitted main. Publication then accepts a HEAD that
+asks for a rebase onto admitted main (the admitted parent for a stack layer). Publication then accepts a HEAD that
 descends from admitted main instead of the admitted tip, pushes it only under
 the same `--force-with-lease` that starts at the admitted tip, and reports
 "Rebased onto main". The rebase must keep the director's history:
@@ -526,7 +558,8 @@ closing reference in any repository. Both connections are bounded at 100 nodes;
 truncated or malformed responses, and responses over 64 KiB, are unverifiable.
 
 Before publication, the server applies the same conservative closing-keyword
-filter to `merge-base(live main, HEAD)..HEAD`, excluding commits already
+filter to `merge-base(live main, HEAD)..HEAD` (the admitted parent replaces
+main for a stacked layer), excluding commits already
 published on the branch before this run. Main and previously published history
 are trusted. Closing this issue in this repository is allowed. A new worker
 commit targeting another issue or repository refuses publication and names the
