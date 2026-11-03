@@ -837,6 +837,7 @@ impl NativeService {
                     crate::trap::hvf_mem_perms(carrick_hal::physical_grants::COW_GRANT_PERMISSIONS),
                 )?;
                 let retained = Arc::new(crate::fork_stock::NativeFrameBacking {
+                    inventory: Arc::clone(&inventory),
                     carrier: Arc::downgrade(&custody),
                     ipa,
                     generation,
@@ -1010,6 +1011,7 @@ impl NativeService {
         let length = data_len;
         let (host, ipa, generation) = crate::trap::allocate_grant_extent(&custody, perms, length)?;
         let retained = Arc::new(crate::fork_stock::NativeFrameBacking {
+            inventory: Arc::clone(&inventory),
             carrier: Arc::downgrade(&custody),
             ipa,
             generation,

@@ -446,6 +446,12 @@ mod allocator_stats_tests {
         let weak_mapping = std::sync::Arc::downgrade(&owner.mapping);
         let pin = owner.pin().unwrap();
         let backing = std::sync::Arc::new(crate::fork_stock::NativeFrameBacking {
+            inventory: std::sync::Arc::new(
+                carrick_kernel::kernel::frame_inventory::FrameInventoryAuthority::new(),
+            )
+            .physical_projection(std::sync::Arc::new(
+                carrick_kernel::kernel::ObjectIdRegistry::new(),
+            )),
             carrier: std::sync::Arc::downgrade(&custody),
             ipa: base,
             generation,
@@ -538,6 +544,166 @@ mod allocator_stats_tests {
     }
 
     #[test]
+    fn native_backing_drop_waits_for_inventory_and_physical_pin_completion() {
+        use carrick_hal::{
+            FrameEventCapacity, FrameInventoryEvent, FrameLength, MappingGeneration,
+        };
+        use carrick_kernel::kernel::{ObjectIdRegistry, frame_inventory::FrameInventoryAuthority};
+        let _guard = global_frame_allocator_test_lock().lock();
+        let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+        let (base, owner) = grant_owned_for_mm(&custody, El1FrameGrantMm::new(41).unwrap());
+        let inventory = std::sync::Arc::new(FrameInventoryAuthority::new());
+        let ids = std::sync::Arc::new(ObjectIdRegistry::new());
+        let mm = ids.mm_id().unwrap();
+        let projection = inventory.physical_projection(ids.clone());
+        let backing_identity = carrick_hal::FrameBackingIdentity::from_allocator(
+            carrick_guest_arch::FrameGpa::new(base),
+            core::num::NonZeroU64::new(owner.generation()).unwrap(),
+            FrameLength::from_mapping_extent(core::num::NonZeroU64::new(owner.length()).unwrap()),
+        );
+        let mut reservation = inventory
+            .reserve(&ids, 1, 1, FrameEventCapacity::for_event_count(2).unwrap())
+            .unwrap();
+        let transaction = reservation.transaction();
+        let frame = reservation.claim_frame().unwrap();
+        let mapping = reservation.claim_mapping().unwrap();
+        let generation = MappingGeneration::from_backend_counter(core::num::NonZeroU64::MIN);
+        reservation
+            .push(FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation,
+                gpa: carrick_guest_mem::Gpa::new(0x1000),
+                length: backing_identity.length(),
+                permissions: carrick_hal::physical_grants::COW_GRANT_PERMISSIONS,
+            })
+            .unwrap();
+        reservation
+            .push(FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation,
+            })
+            .unwrap();
+        reservation
+            .bind_physical_frame(frame, backing_identity)
+            .unwrap();
+        inventory.apply(mm, reservation.commit(())).unwrap();
+        let make_backing = || crate::fork_stock::NativeFrameBacking {
+            inventory: projection.clone(),
+            carrier: std::sync::Arc::downgrade(&custody),
+            ipa: base,
+            generation: owner.generation(),
+            length: owner.length(),
+            retained_owner: Default::default(),
+        };
+        let pin = owner.pin().unwrap();
+        drop(make_backing());
+        assert!(
+            !owner.snapshot().unwrap().retirement_requested,
+            "a native backing drop must not retire a live inventory mapping"
+        );
+        assert_eq!(inventory.frame_mapping_count(frame), Some(1));
+        inventory.retire_mm(&ids, mm).unwrap();
+        drop(make_backing());
+        assert!(owner.snapshot().unwrap().retirement_requested);
+        assert!(owner.inventory_retirement.lock().is_some());
+        assert!(
+            projection
+                .claim_unused_backing(backing_identity)
+                .unwrap()
+                .is_none()
+        );
+        drop(pin);
+        let mut unmaps = 0;
+        let report =
+            retry_pending_global_frame_retirements_at_idle_in_using(&custody, &mut |_, _| {
+                unmaps += 1;
+                Ok(())
+            });
+        assert_eq!(unmaps, 1);
+        assert_eq!(report.remaining, 0);
+        assert!(owner.inventory_retirement.lock().is_none());
+        assert_eq!(inventory.abandoned_retirement_permits(), 0);
+    }
+
+    #[test]
+    fn inventory_permit_install_after_idle_empty_check_reenrolls_owner() {
+        use carrick_kernel::kernel::{ObjectIdRegistry, frame_inventory::FrameInventoryAuthority};
+        let _guard = global_frame_allocator_test_lock().lock();
+        let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+        let (base, owner) = grant_owned_for_mm(&custody, El1FrameGrantMm::new(41).unwrap());
+        let inventory = std::sync::Arc::new(FrameInventoryAuthority::new());
+        let identity = carrick_hal::FrameBackingIdentity::from_allocator(
+            carrick_guest_arch::FrameGpa::new(base),
+            core::num::NonZeroU64::new(owner.generation()).unwrap(),
+            carrick_hal::FrameLength::from_mapping_extent(
+                core::num::NonZeroU64::new(owner.length()).unwrap(),
+            ),
+        );
+        let permit = inventory
+            .claim_unused_backing(&ObjectIdRegistry::new(), identity)
+            .unwrap()
+            .unwrap();
+        let pending = permit
+            .retire(|_| {
+                assert!(
+                    retire_global_frame_host_owner_if_generation_in_using(
+                        &custody,
+                        base,
+                        owner.length(),
+                        owner.generation(),
+                        &mut |_, _| Ok(())
+                    )
+                    .is_retired()
+                );
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        retain_pending_global_frame_owner(&custody, owner.clone());
+        let (checked_tx, checked_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let cleanup_custody = custody.clone();
+        let cleanup = std::thread::spawn(move || {
+            INVENTORY_RETIREMENT_FINISH_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    checked_tx.send(()).unwrap();
+                    resume_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                }));
+            });
+            retry_pending_global_frame_retirements_at_idle_in_using(
+                &cleanup_custody,
+                &mut |_, _| panic!("already completed physical retirement"),
+            );
+        });
+        checked_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        // This assertion is red when the empty check releases its guard
+        // before removing the queued owner.
+        assert!(owner.inventory_retirement.try_lock().is_none());
+        let install_custody = custody.clone();
+        let install_owner = owner.clone();
+        let install = std::thread::spawn(move || {
+            retain_inventory_retirement(&install_custody, install_owner, pending);
+        });
+        resume_tx.send(()).unwrap();
+        cleanup.join().unwrap();
+        install.join().unwrap();
+        assert!(owner.inventory_retirement.lock().is_some());
+        let report =
+            retry_pending_global_frame_retirements_at_idle_in_using(&custody, &mut |_, _| {
+                panic!("already completed physical retirement")
+            });
+        assert_eq!(report.remaining, 0);
+        assert!(owner.inventory_retirement.lock().is_none());
+        assert_eq!(inventory.abandoned_retirement_permits(), 0);
+    }
+
+    #[test]
     fn native_backing_absence_does_not_claim_a_retiring_successor() {
         use carrick_hal::physical_grants::PhysicalGrantRelease;
         let _guard = global_frame_allocator_test_lock().lock();
@@ -548,6 +714,12 @@ mod allocator_stats_tests {
         let generation = predecessor.generation();
         let length = predecessor.length();
         let backing = crate::fork_stock::NativeFrameBacking {
+            inventory: std::sync::Arc::new(
+                carrick_kernel::kernel::frame_inventory::FrameInventoryAuthority::new(),
+            )
+            .physical_projection(std::sync::Arc::new(
+                carrick_kernel::kernel::ObjectIdRegistry::new(),
+            )),
             carrier: std::sync::Arc::downgrade(&custody),
             ipa: base,
             generation,
@@ -1544,6 +1716,7 @@ pub(crate) struct GlobalFrameHostOwner {
     grant_publication: std::sync::OnceLock<std::sync::Weak<PhysicalGrantWait>>,
     pub(crate) retirement: PhysicalRetirementCompletion<CarrierStage2RecordIdentity>,
     retirement_publication: parking_lot::Mutex<Option<RetirementPublication>>,
+    inventory_retirement: parking_lot::Mutex<Option<carrick_core_abi::PendingFrameRetirement>>,
     pub(crate) mapping: std::sync::Arc<GlobalFrameSharedMapping>,
     pub(crate) custody: std::sync::Weak<CarrierVmCustody>,
     pub(crate) record_identity: CarrierStage2RecordIdentity,
@@ -1575,6 +1748,7 @@ impl GlobalFrameHostOwner {
             grant_publication: std::sync::OnceLock::new(),
             retirement: PhysicalRetirementCompletion::new(record_identity),
             retirement_publication: parking_lot::Mutex::new(None),
+            inventory_retirement: parking_lot::Mutex::new(None),
             mapping,
             custody: std::sync::Arc::downgrade(&custody),
             record_identity,
@@ -3645,6 +3819,43 @@ pub(crate) fn retire_global_frame_host_owner_in(
     retire_global_frame_host_owner_inner_in(custody, ipa, length, None)
 }
 
+/// The inventory excludes publication before physical retirement begins.
+/// Completion returns to that inventory only at the existing idle boundary,
+/// after the physical owner's pin drain and all outer backend locks.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn retire_global_frame_with_inventory_permit(
+    custody: &CarrierVmCustody,
+    owner: std::sync::Arc<GlobalFrameHostOwner>,
+    permit: carrick_hal::FrameRetirementPermit,
+) {
+    let pending = permit.retire(|identity| {
+        let _ = retire_global_frame_host_owner_if_generation_in(
+            custody,
+            identity.ipa().raw(),
+            identity.length().raw(),
+            identity.host_owner_generation().get(),
+        );
+        // The exact physical owner above retains its completion, including
+        // a pending pin drain or a retryable backend unmap.
+        Ok::<_, core::convert::Infallible>(())
+    });
+    let pending = match pending {
+        Ok(pending) => pending,
+        Err((_, never)) => match never {},
+    };
+    retain_inventory_retirement(custody, owner, pending);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn retain_inventory_retirement(
+    custody: &CarrierVmCustody,
+    owner: std::sync::Arc<GlobalFrameHostOwner>,
+    pending: carrick_core_abi::PendingFrameRetirement,
+) {
+    *owner.inventory_retirement.lock() = Some(pending);
+    retain_pending_global_frame_owner(custody, owner);
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn retire_global_frame_host_owner_if_generation_in(
     custody: &CarrierVmCustody,
@@ -4154,6 +4365,12 @@ pub(crate) fn retain_pending_global_frame_owner(
     custody.enqueue_detached_global_frame_retirement(record_id);
 }
 
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+thread_local! {
+    static INVENTORY_RETIREMENT_FINISH_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Completed notification effects remain with the existing physical owner
 /// until the idle boundary can publish them without an outer owner guard.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -4162,10 +4379,20 @@ fn finish_pending_global_frame_owner(
     owner: &std::sync::Arc<GlobalFrameHostOwner>,
 ) {
     let record_id = owner.record_identity.record_id;
-    if owner.retirement_publication.lock().is_some() {
+    // Keep permit publication excluded through removal from both pending
+    // indexes. A later installer re-enrolls after removal; an earlier
+    // installer keeps this owner queued.
+    let inventory_retirement = owner.inventory_retirement.lock();
+    if owner.retirement_publication.lock().is_some() || inventory_retirement.is_some() {
         custody.enqueue_detached_global_frame_retirement(record_id);
         return;
     }
+    #[cfg(test)]
+    INVENTORY_RETIREMENT_FINISH_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
     custody
         .pending_global_frame_owners
         .lock()
@@ -4220,6 +4447,8 @@ pub(crate) fn retry_pending_global_frame_retirements_at_idle_in_using(
     let _turn = PendingGlobalFrameRetirementTurn(custody);
     let mut report = PendingGlobalFrameRetirementTurnReport::default();
     let mut publications = Vec::new();
+    let mut inventory_completions = Vec::new();
+    let mut abandoned_inventory = Vec::new();
     let directory_attempts = custody
         .pending_global_frame_directory_retries
         .lock()
@@ -4298,8 +4527,29 @@ pub(crate) fn retry_pending_global_frame_retirements_at_idle_in_using(
         // Absence alone never certifies release; only its retained publication
         // permits this notification-only completion of existing owner work.
         let publication = owner.retirement_publication.lock().take();
-        if let Some(publication) = publication {
-            publications.push(publication);
+        let retirement = owner.retirement.wait().state();
+        if publication.is_some()
+            || !matches!(
+                retirement,
+                carrick_thread::physical_retirement::PhysicalRetirementState::Pending
+            )
+        {
+            if let Some(publication) = publication {
+                publications.push(publication);
+            }
+            match retirement {
+                carrick_thread::physical_retirement::PhysicalRetirementState::Retired(_) => {
+                    if let Some(pending) = owner.inventory_retirement.lock().take() {
+                        inventory_completions.push(pending);
+                    }
+                }
+                carrick_thread::physical_retirement::PhysicalRetirementState::Abandoned(_) => {
+                    if let Some(pending) = owner.inventory_retirement.lock().take() {
+                        abandoned_inventory.push(pending);
+                    }
+                }
+                carrick_thread::physical_retirement::PhysicalRetirementState::Pending => {}
+            }
             finish_pending_global_frame_owner(custody, &owner);
             continue;
         }
@@ -4313,6 +4563,9 @@ pub(crate) fn retry_pending_global_frame_retirements_at_idle_in_using(
             let publication = owner.retirement_publication.lock().take();
             if let Some(publication) = publication {
                 publications.push(publication);
+            }
+            if let Some(pending) = owner.inventory_retirement.lock().take() {
+                inventory_completions.push(pending);
             }
             finish_pending_global_frame_owner(custody, &owner);
         } else {
@@ -4330,6 +4583,14 @@ pub(crate) fn retry_pending_global_frame_retirements_at_idle_in_using(
     }
     for publication in publications {
         publication.publish();
+    }
+    // Abandonment preserves the inventory exclusion and records the leak;
+    // it must not masquerade as completion or repeatedly queue absent work.
+    drop(abandoned_inventory);
+    for pending in inventory_completions {
+        // SAFETY: exact-owner finalization above certified stage-2 removal
+        // and pin drain. No directory, record or inventory lock is held here.
+        unsafe { pending.complete() };
     }
     report
 }

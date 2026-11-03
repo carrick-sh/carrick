@@ -2382,6 +2382,14 @@ struct DummyInventory;
 
 #[allow(clippy::unimplemented)]
 impl crate::PhysicalFrameInventory for DummyInventory {
+    fn claim_unused_backing(
+        &self,
+        _backing: crate::FrameBackingIdentity,
+    ) -> Result<Option<crate::FrameRetirementPermit>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        Err("unused in test".into())
+    }
+
     fn bind(&self, _owner: crate::GuestFrameOwner) -> std::sync::Arc<dyn crate::FrameCowAuthority> {
         unimplemented!()
     }

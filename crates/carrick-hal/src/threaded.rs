@@ -2621,6 +2621,14 @@ impl PartialOrd for GuestFrameOwner {
 }
 
 pub trait PhysicalFrameInventory: Send + Sync {
+    /// Exclude new publication of an allocator incarnation with no inventory
+    /// custody. A live mapping, claimed return or outstanding permit refuses
+    /// the request without changing that custody. Backend work runs only after
+    /// this method returns and must retain the permit through pin drain.
+    fn claim_unused_backing(
+        &self,
+        backing: crate::FrameBackingIdentity,
+    ) -> Result<Option<crate::FrameRetirementPermit>, Box<dyn std::error::Error + Send + Sync>>;
     fn bind(&self, owner: GuestFrameOwner) -> Arc<dyn FrameCowAuthority>;
     fn allocate_backing_ids(
         &self,

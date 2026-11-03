@@ -111,7 +111,8 @@ pub struct FrameRetirementPermit {
 impl FrameRetirementPermit {
     /// # Safety
     /// Only the issuing inventory may call this, after irrevocably removing
-    /// the last reference to `frame`. `backing` must be its publication-time
+    /// the last reference to `frame`, or atomically excluding publication of
+    /// an unused allocator incarnation. `backing` must be its authenticated
     /// allocator identity, never the mapping generation or virtual address.
     pub unsafe fn from_inventory(
         origin: FrameInventoryOrigin,

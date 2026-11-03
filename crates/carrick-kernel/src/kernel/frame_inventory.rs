@@ -136,6 +136,14 @@ impl FrameInventoryAuthority {
     }
 }
 impl carrick_hal::PhysicalFrameInventory for PhysicalInventoryProjection {
+    fn claim_unused_backing(
+        &self,
+        backing: carrick_hal::FrameBackingIdentity,
+    ) -> Result<Option<carrick_hal::FrameRetirementPermit>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        Ok(self.inventory.claim_unused_backing(&self.ids, backing)?)
+    }
+
     fn bind(
         &self,
         owner: carrick_hal::GuestFrameOwner,
@@ -5233,6 +5241,52 @@ mod claimed_return {
         }
     }
     impl FrameInventoryAuthority {
+        /// A backing owner may outlive rollback or whole-MM inventory removal.
+        /// Absence is tested and publication excluded in one leaf-lock turn.
+        /// The fresh ID is only the retirement claim's identity; it is never a
+        /// live frame or mapping. No physical callback runs under this lock.
+        pub fn claim_unused_backing(
+            self: &std::sync::Arc<Self>,
+            ids: &ObjectIdRegistry,
+            backing: carrick_hal::FrameBackingIdentity,
+        ) -> Result<Option<carrick_hal::FrameRetirementPermit>, super::ObjectIdError> {
+            let frame = ids.frame_id()?;
+            let admission = std::sync::Arc::new(());
+            let cleanup = std::sync::Arc::new(RetirementCleanup(std::sync::Arc::downgrade(self)));
+            let key = (backing.ipa(), backing.host_owner_generation());
+            let mut state = self.state.lock();
+            if state
+                .physical_frames
+                .get(&key)
+                .is_some_and(|entry| entry.lease.strong_count() != 0)
+            {
+                return Ok(None);
+            }
+            state.physical_frames.insert(
+                key,
+                super::PhysicalAdmission {
+                    frame,
+                    lease: std::sync::Arc::downgrade(&admission),
+                },
+            );
+            let revision = state.revision;
+            drop(state);
+            // SAFETY: the inventory atomically established no published or
+            // claimed reference to this exact allocator identity and installed
+            // the exclusion retained by this permit until backend completion.
+            Ok(Some(unsafe {
+                carrick_hal::FrameRetirementPermit::from_inventory(
+                    self.origin.clone(),
+                    frame,
+                    backing,
+                    revision,
+                    self.abandoned_permits.clone(),
+                    admission,
+                    cleanup,
+                )
+            }))
+        }
+
         /// Claim at most 512 4-KiB pages without retaining the inventory lock.
         /// Lock audit: ID allocation happens before the leaf lock; claim, apply,
         /// and restore touch only inventory-owned maps and arithmetic. No root,
@@ -5401,6 +5455,66 @@ mod prepared_return_tests {
     use super::*;
     use std::sync::Arc;
     #[test]
+    fn backing_retirement_requires_inventory_absence_and_excludes_republication() {
+        let (inventory, ids, owner, row) = fixture();
+        let backing = carrick_hal::FrameBackingIdentity::from_allocator(
+            carrick_guest_arch::FrameGpa::new(0x9000),
+            NonZeroU64::new(73).unwrap(),
+            row.length,
+        );
+        assert!(
+            inventory
+                .claim_unused_backing(&ids, backing)
+                .unwrap()
+                .is_none()
+        );
+        let claim = inventory.prepare_return(&ids, owner, &[row]).unwrap();
+        assert!(
+            inventory
+                .claim_unused_backing(&ids, backing)
+                .unwrap()
+                .is_none()
+        );
+        claim.abort();
+        inventory.retire_mm(&ids, owner).unwrap();
+        let permit = inventory
+            .claim_unused_backing(&ids, backing)
+            .unwrap()
+            .unwrap();
+        assert_eq!(permit.backing(), backing);
+        assert!(inventory.state.try_lock().is_some());
+        assert!(
+            inventory
+                .claim_unused_backing(&ids, backing)
+                .unwrap()
+                .is_none()
+        );
+        let pending = permit
+            .retire(|exact| {
+                assert_eq!(exact, backing);
+                assert!(inventory.state.try_lock().is_some());
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert!(
+            inventory
+                .claim_unused_backing(&ids, backing)
+                .unwrap()
+                .is_none()
+        );
+        // SAFETY: this VM-free physical owner has no mappings or pins.
+        unsafe { pending.complete() };
+        assert_eq!(inventory.abandoned_retirement_permits(), 0);
+        let retry = inventory
+            .claim_unused_backing(&ids, backing)
+            .unwrap()
+            .unwrap();
+        let pending = retry.retire(|_| Ok::<_, ()>(())).unwrap();
+        // SAFETY: same VM-free owner, with no intervening publication.
+        unsafe { pending.complete() };
+    }
+
+    #[test]
     fn return_permit_preserves_physical_identity_not_mapping_generation() {
         let (inventory, ids, owner, row) = fixture();
         let applied = inventory
@@ -5500,15 +5614,28 @@ mod prepared_return_tests {
 
     #[test]
     fn outstanding_and_abandoned_permits_exclude_new_frame_ids_for_the_same_owner() {
-        for abandon in [false, true] {
+        for (abandon, unused) in [(false, false), (true, false), (false, true), (true, true)] {
             let (inventory, ids, owner, row) = fixture();
-            let permit = inventory
-                .prepare_return(&ids, owner, &[row])
-                .unwrap()
-                .apply()
-                .last_unmapped
-                .pop()
-                .unwrap();
+            let permit = if unused {
+                inventory.retire_mm(&ids, owner).unwrap();
+                let backing = carrick_hal::FrameBackingIdentity::from_allocator(
+                    carrick_guest_arch::FrameGpa::new(0x9000),
+                    NonZeroU64::new(73).unwrap(),
+                    row.length,
+                );
+                inventory
+                    .claim_unused_backing(&ids, backing)
+                    .unwrap()
+                    .unwrap()
+            } else {
+                inventory
+                    .prepare_return(&ids, owner, &[row])
+                    .unwrap()
+                    .apply()
+                    .last_unmapped
+                    .pop()
+                    .unwrap()
+            };
             let backing = permit.backing();
             let pending = if abandon {
                 drop(permit);

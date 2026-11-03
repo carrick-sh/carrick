@@ -160,3 +160,40 @@ This is partial B1–B3 work: `InventoryReleased` still needs the whole-MM
 permit population and backend consumption before a production join can be
 introduced. The pending S2b owner, C1/C2, and slice 2b remain unfinished.
 The join performs constant-time identity comparisons and adds no guest work.
+
+
+### Native backing drop admission (C1)
+
+`NativeFrameBacking` retains the physical inventory that published its grants.
+Its final drop no longer treats last-Arc ownership as permission to retire a
+physical frame. The kernel atomically checks the allocator incarnation's
+absence and excludes publication before returning a linear retirement permit.
+Live mappings, claimed returns, and pending or abandoned permits refuse this
+request without changing their custody. The lookup is logarithmic in the
+physical-identity index; it does not scan mappings or other MMs. Unpublished
+allocations and backing left after existing whole-MM inventory removal use
+this same absence admission.
+
+The HVF owner retains the accepted permit through its existing S2b pin drain
+and backend retry. Only the idle boundary consumes a successful exact-owner
+completion, outside backend locks. Abandonment keeps the inventory exclusion
+and counts the abandoned permit. Pending-owner removal holds the permit lock
+through both index removals, so an installer either prevents removal or
+re-enrolls afterward. No new retry loop or physical completion owner is added.
+
+The new kernel admission test failed to compile against the preceding API
+and passes with the admission method. The existing physical-republication
+witness now covers both claimed returns and unused-backing permits, including
+abandonment. The new macOS witnesses drive production `Drop` with a real
+kernel inventory and a pinned owner, and pause the production idle cleanup
+at its empty check to verify concurrent permit installation. Linux can
+cross-check those witnesses but cannot execute them. Their signed/macOS
+execution remains required; no runtime-ratio claim follows from this work.
+
+B1–B3 remain partially integrated: `MmReleaseReceipt::join` and claimed-return
+permits exist, but whole-MM release still lacks a permit population and a
+production backend-half join. C1 now guards final native backing drop; the
+separate explicit unused-release path retains its existing behavior. C2's
+legacy COW/registry gates and monotone counter are still open, as is slice 2b's
+neutral settlement routine, hook generalization and minimal host-root port.
+Keep this prerequisite draft; it does not close the original slice-2 brief.

@@ -139,14 +139,23 @@ impl core::fmt::Debug for NativeChildPhysical {
             .finish_non_exhaustive()
     }
 }
-#[derive(Debug)]
 pub(crate) struct NativeFrameBacking {
+    pub inventory: std::sync::Arc<dyn carrick_hal::PhysicalFrameInventory>,
     pub carrier: std::sync::Weak<CarrierVmCustody>,
     pub ipa: u64,
     pub generation: u64,
     pub length: u64,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub retained_owner: std::sync::OnceLock<std::sync::Arc<crate::trap::GlobalFrameHostOwner>>,
+}
+impl core::fmt::Debug for NativeFrameBacking {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("NativeFrameBacking")
+            .field("ipa", &self.ipa)
+            .field("generation", &self.generation)
+            .field("length", &self.length)
+            .finish_non_exhaustive()
+    }
 }
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl NativeFrameBacking {
@@ -208,12 +217,32 @@ impl Drop for NativeFrameBacking {
                 .native_frame_backings
                 .lock()
                 .remove(&(self.ipa, self.generation));
-            crate::trap::retire_global_frame_host_owner_if_generation_in(
-                &carrier,
-                self.ipa,
-                self.length,
-                self.generation,
+            let (Some(generation), Some(length)) = (
+                NonZeroU64::new(self.generation),
+                NonZeroU64::new(self.length),
+            ) else {
+                return;
+            };
+            let identity = carrick_hal::FrameBackingIdentity::from_allocator(
+                FrameGpa::new(self.ipa),
+                generation,
+                carrick_hal::FrameLength::from_mapping_extent(length),
             );
+            let owner = carrier
+                .global_frame_host_owners
+                .lock()
+                .get(&(self.ipa, self.length))
+                .filter(|entry| entry.owner().generation() == self.generation)
+                .map(|entry| std::sync::Arc::clone(entry.owner()));
+            let Some(owner) = owner else {
+                return;
+            };
+            let Ok(Some(permit)) = self.inventory.claim_unused_backing(identity) else {
+                // Inventory custody (including a claimed return) owns the
+                // eventual release. The global directory keeps its bytes live.
+                return;
+            };
+            crate::trap::retire_global_frame_with_inventory_permit(&carrier, owner, permit);
         }
     }
 }
