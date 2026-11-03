@@ -809,6 +809,8 @@ pub const fn route_x86(ordinal: u64, allocator_control: u64) -> Family {
 pub enum ServiceOwner {
     Ring(Family),
     Crossing(OperandSpec),
+    /// Temporary host implementation owed to the ring.
+    RingOwed(OperandSpec),
     CountedEnosys,
 }
 
@@ -832,7 +834,7 @@ impl ServiceOwner {
     ) -> Family {
         match self {
             Self::Ring(Family::Descriptor) if descriptor_available => Family::Descriptor,
-            Self::Ring(Family::Poll) => {
+            Self::Ring(Family::Poll) if ordinal.raw() == carrick_syscall_abi::nr::PPOLL.raw() => {
                 if poll_available {
                     Family::Poll
                 } else {
@@ -842,13 +844,82 @@ impl ServiceOwner {
             // Keep today's ISA wiring, including an explicitly enabled
             // diagnostic control colliding with a Linux ordinal. Availability
             // cannot select another service owner or widen crossing policy.
-            Self::Ring(_) => match isa {
-                carrick_guest_arch::GuestIsa::Aarch64 => {
-                    route_aarch64(ordinal.raw(), allocator_control)
-                }
-                carrick_guest_arch::GuestIsa::X86_64 => route_x86(ordinal.raw(), allocator_control),
+            Self::Ring(_) => match self.wiring(isa, ordinal, allocator_control) {
+                WiredService::Wired(family) => family,
+                WiredService::MissingRingFamily(_) | WiredService::Unrouted => Family::Unported,
             },
-            Self::Crossing(_) | Self::CountedEnosys => Family::Unported,
+            Self::Crossing(_) | Self::RingOwed(_) | Self::CountedEnosys => Family::Unported,
+        }
+    }
+}
+
+/// Canonical twin used only for ownership, never to rewrite ABI operands.
+pub const fn owner_ordinal(ordinal: CanonicalNr) -> CanonicalNr {
+    use crate::crossing::nr;
+    use carrick_syscall_abi::{
+        CARRICK_PRIVATE_X86_ALARM, CARRICK_PRIVATE_X86_DUP2, CARRICK_PRIVATE_X86_EPOLL_CREATE,
+        CARRICK_PRIVATE_X86_FSTAT, CARRICK_PRIVATE_X86_LSTAT, CARRICK_PRIVATE_X86_NEWFSTATAT,
+        CARRICK_PRIVATE_X86_POLL, CARRICK_PRIVATE_X86_SELECT, CARRICK_PRIVATE_X86_STAT,
+        CARRICK_PRIVATE_X86_TIME,
+    };
+    match ordinal.raw() {
+        CARRICK_PRIVATE_X86_STAT | CARRICK_PRIVATE_X86_LSTAT | CARRICK_PRIVATE_X86_NEWFSTATAT => {
+            nr::NEWFSTATAT
+        }
+        CARRICK_PRIVATE_X86_FSTAT => nr::FSTAT,
+        CARRICK_PRIVATE_X86_POLL => nr::PPOLL,
+        CARRICK_PRIVATE_X86_SELECT => nr::PSELECT6,
+        CARRICK_PRIVATE_X86_EPOLL_CREATE => nr::EPOLL_CREATE1,
+        CARRICK_PRIVATE_X86_ALARM => carrick_syscall_abi::nr::SETITIMER,
+        CARRICK_PRIVATE_X86_TIME => nr::GETTIMEOFDAY,
+        CARRICK_PRIVATE_X86_DUP2 => nr::DUP3,
+        _ => ordinal,
+    }
+}
+
+/// Descriptor ownership is shared by classification and venue admission.
+pub const fn descriptor_ordinal(ordinal: CanonicalNr) -> bool {
+    use crate::crossing::nr;
+    matches!(
+        owner_ordinal(ordinal),
+        nr::DUP | nr::DUP3 | nr::FCNTL | nr::CLOSE
+    )
+}
+
+/// Retirement ceiling, checked against the PR base by authority-debt.
+pub const ISA_WIRING_GAP_CEILING: usize = 12;
+
+/// Today's ISA wiring, explicit even when the shared owner owes a ring family.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WiredService {
+    Wired(Family),
+    MissingRingFamily(Family),
+    Unrouted,
+}
+
+impl ServiceOwner {
+    pub const fn wiring(
+        self,
+        isa: carrick_guest_arch::GuestIsa,
+        ordinal: CanonicalNr,
+        allocator_control: u64,
+    ) -> WiredService {
+        let family = match isa {
+            carrick_guest_arch::GuestIsa::Aarch64 => {
+                route_aarch64(ordinal.raw(), allocator_control)
+            }
+            carrick_guest_arch::GuestIsa::X86_64 => route_x86(ordinal.raw(), allocator_control),
+        };
+        if !matches!(family, Family::Unported) {
+            WiredService::Wired(family)
+        } else if let Self::Ring(expected) = self {
+            if matches!(expected, Family::Descriptor | Family::Poll) {
+                WiredService::Unrouted
+            } else {
+                WiredService::MissingRingFamily(expected)
+            }
+        } else {
+            WiredService::Unrouted
         }
     }
 }
@@ -857,10 +928,13 @@ impl ServiceOwner {
 /// caller identity nor implementation availability is an input. Canonical
 /// identities have one owner, even where one ISA has not wired its family yet.
 pub const fn service_owner(ordinal: CanonicalNr, allocator_control: u64) -> ServiceOwner {
-    if matches!(ordinal.raw(), 23 | 24 | 25 | 57)
-        || ordinal.raw() == carrick_syscall_abi::CARRICK_PRIVATE_X86_DUP2
-    {
+    let original = ordinal;
+    let ordinal = owner_ordinal(ordinal);
+    if descriptor_ordinal(ordinal) {
         return ServiceOwner::Ring(Family::Descriptor);
+    }
+    if original.raw() != ordinal.raw() && allocator_control == original.raw() {
+        return ServiceOwner::Ring(Family::AllocatorControl);
     }
     if ordinal.raw() == carrick_syscall_abi::nr::PPOLL.raw() {
         return ServiceOwner::Ring(Family::Poll);
@@ -895,7 +969,16 @@ pub const fn service_owner(ordinal: CanonicalNr, allocator_control: u64) -> Serv
         | Family::NativeExec => ServiceOwner::Ring(family),
         Family::Unported => {
             match crate::crossing::AllowedHostCrossing::from_canonical_aarch64(ordinal) {
-                Some(crossing) => ServiceOwner::Crossing(crossing.operand_spec()),
+                Some(crossing) => match crossing.kind() {
+                    Some(crate::crossing::HostCrossingKind::Temporary) => {
+                        ServiceOwner::RingOwed(crossing.operand_spec())
+                    }
+                    Some(
+                        crate::crossing::HostCrossingKind::Permanent
+                        | crate::crossing::HostCrossingKind::Terminal,
+                    ) => ServiceOwner::Crossing(crossing.operand_spec()),
+                    None => ServiceOwner::CountedEnosys,
+                },
                 None => ServiceOwner::CountedEnosys,
             }
         }
@@ -1922,32 +2005,28 @@ mod service_owner_tests {
 
     #[test]
     fn service_owner_preserves_both_isa_routes_and_crossing_policy() {
-        for ordinal in (0..=512).chain([
-            carrick_syscall_abi::CARRICK_PRIVATE_X86_DUP2,
-            carrick_syscall_abi::CARRICK_PRIVATE_X86_POLL,
-            u64::MAX,
-        ]) {
+        for ordinal in (0..=512)
+            .chain(
+                carrick_syscall_abi::CARRICK_PRIVATE_X86_TIME
+                    ..=carrick_syscall_abi::CARRICK_PRIVATE_X86_DUP2,
+            )
+            .chain([u64::MAX])
+        {
             let canonical = CanonicalNr::new(ordinal);
             let owner = service_owner(canonical, u64::MAX);
-            for (isa, previous) in [
-                (GuestIsa::Aarch64, route_aarch64(ordinal, u64::MAX)),
-                (GuestIsa::X86_64, route_x86(ordinal, u64::MAX)),
+            for previous in [
+                route_aarch64(ordinal, u64::MAX),
+                route_x86(ordinal, u64::MAX),
             ] {
-                let wired = owner.family_for_venue(isa, canonical, u64::MAX, false, false);
-                let legacy = wired;
-                assert_eq!(
-                    legacy, previous,
-                    "ISA wiring changed for {isa:?} ordinal={ordinal}"
-                );
                 if previous != Family::Unported {
                     assert!(matches!(owner, ServiceOwner::Ring(_)));
                 }
             }
             match owner {
                 ServiceOwner::Ring(family) => assert_ne!(family, Family::Unported),
-                ServiceOwner::Crossing(spec) => {
-                    assert_eq!(spec.crossing.canonical(), canonical);
-                    assert!(HostCrossingSet::Aarch64.is_allowed(canonical));
+                ServiceOwner::Crossing(spec) | ServiceOwner::RingOwed(spec) => {
+                    assert_eq!(spec.crossing.canonical(), owner_ordinal(canonical));
+                    assert!(HostCrossingSet::Aarch64.is_allowed(owner_ordinal(canonical)));
                 }
                 ServiceOwner::CountedEnosys => {
                     assert!(!HostCrossingSet::Aarch64.is_allowed(canonical));
@@ -1965,18 +2044,83 @@ mod service_owner_tests {
     }
 
     #[test]
+    fn temporary_crossings_are_owed_to_ring() {
+        for raw in 0..=512 {
+            let ordinal = CanonicalNr::new(raw);
+            let Some(crossing) = AllowedHostCrossing::from_canonical_aarch64(ordinal) else {
+                continue;
+            };
+            if crossing.kind() == Some(crate::crossing::HostCrossingKind::Temporary) {
+                assert!(
+                    !matches!(service_owner(ordinal, u64::MAX), ServiceOwner::Crossing(_)),
+                    "temporary crossing escapes ring retirement: {ordinal:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn private_aliases_and_isa_gaps_are_explicit() {
+        use crate::crossing::nr;
+        use carrick_syscall_abi::{
+            CARRICK_PRIVATE_X86_ALARM, CARRICK_PRIVATE_X86_DUP2, CARRICK_PRIVATE_X86_EPOLL_CREATE,
+            CARRICK_PRIVATE_X86_FSTAT, CARRICK_PRIVATE_X86_LSTAT, CARRICK_PRIVATE_X86_NEWFSTATAT,
+            CARRICK_PRIVATE_X86_POLL, CARRICK_PRIVATE_X86_SELECT, CARRICK_PRIVATE_X86_STAT,
+            CARRICK_PRIVATE_X86_TIME,
+        };
+        for (alias, canonical) in [
+            (CARRICK_PRIVATE_X86_STAT, nr::NEWFSTATAT),
+            (CARRICK_PRIVATE_X86_FSTAT, nr::FSTAT),
+            (CARRICK_PRIVATE_X86_LSTAT, nr::NEWFSTATAT),
+            (CARRICK_PRIVATE_X86_NEWFSTATAT, nr::NEWFSTATAT),
+            (CARRICK_PRIVATE_X86_POLL, nr::PPOLL),
+            (CARRICK_PRIVATE_X86_SELECT, nr::PSELECT6),
+            (CARRICK_PRIVATE_X86_EPOLL_CREATE, nr::EPOLL_CREATE1),
+            (
+                CARRICK_PRIVATE_X86_ALARM,
+                carrick_syscall_abi::nr::SETITIMER,
+            ),
+            (CARRICK_PRIVATE_X86_TIME, nr::GETTIMEOFDAY),
+            (CARRICK_PRIVATE_X86_DUP2, nr::DUP3),
+        ] {
+            assert_eq!(
+                service_owner(CanonicalNr::new(alias), u64::MAX),
+                service_owner(canonical, u64::MAX),
+                "private alias {alias}"
+            );
+        }
+        let mut gaps = 0;
+        for raw in 0..=512 {
+            let ordinal = CanonicalNr::new(raw);
+            let owner = service_owner(ordinal, u64::MAX);
+            for isa in [GuestIsa::Aarch64, GuestIsa::X86_64] {
+                if matches!(
+                    owner.wiring(isa, ordinal, u64::MAX),
+                    WiredService::MissingRingFamily(_)
+                ) {
+                    gaps += 1;
+                }
+            }
+        }
+        assert_eq!(
+            gaps, ISA_WIRING_GAP_CEILING,
+            "retire the ISA wiring ceiling when a seam closes"
+        );
+    }
+
+    #[test]
     fn service_owner_preserves_enabled_diagnostic_control_and_venue_guards() {
-        for ordinal in (0..=512).chain([carrick_syscall_abi::CARRICK_PRIVATE_X86_DUP2]) {
+        for ordinal in (0..=512).chain(
+            carrick_syscall_abi::CARRICK_PRIVATE_X86_TIME
+                ..=carrick_syscall_abi::CARRICK_PRIVATE_X86_DUP2,
+        ) {
             let canonical = CanonicalNr::new(ordinal);
             for control in [u64::MAX, ordinal] {
                 let owner = service_owner(canonical, control);
                 for isa in [GuestIsa::Aarch64, GuestIsa::X86_64] {
                     for descriptor in [false, true] {
                         for poll in [false, true] {
-                            let expected = if descriptor
-                                && (matches!(ordinal, 23 | 24 | 25 | 57)
-                                    || ordinal == carrick_syscall_abi::CARRICK_PRIVATE_X86_DUP2)
-                            {
+                            let expected = if descriptor && descriptor_ordinal(canonical) {
                                 Family::Descriptor
                             } else if ordinal == 73 {
                                 if poll { Family::Poll } else { Family::Unported }
@@ -2026,7 +2170,11 @@ mod service_owner_tests {
                 assert_eq!(
                     owner,
                     crossing.map_or(ServiceOwner::CountedEnosys, |crossing| {
-                        ServiceOwner::Crossing(crossing.operand_spec())
+                        if crossing.kind() == Some(crate::crossing::HostCrossingKind::Temporary) {
+                            ServiceOwner::RingOwed(crossing.operand_spec())
+                        } else {
+                            ServiceOwner::Crossing(crossing.operand_spec())
+                        }
                     })
                 );
             }

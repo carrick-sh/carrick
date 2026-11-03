@@ -63,6 +63,8 @@ pub use signal::{
 
 /// Canonical numbers served by the shared guest lifecycle owner.
 pub mod nr {
+    /// Linux interval timer programming (also the owner of x86 alarm).
+    pub const SETITIMER: CanonicalNr = CanonicalNr(103);
     use super::CanonicalNr;
 
     pub const CAPGET: CanonicalNr = CanonicalNr(90);

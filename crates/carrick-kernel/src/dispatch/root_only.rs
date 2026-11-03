@@ -12,7 +12,6 @@ use carrick_personality_linux::dispatch::{ServiceOwner, service_owner};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct RootOnly {
     ordinal: CanonicalNr,
-    state: &'static [RootOnlyState],
 }
 
 // Cross-cutting state found by #1335's census and independent ambient-state
@@ -55,7 +54,7 @@ macro_rules! root_only {
         impl RootOnly {
             pub(super) const fn admit(number: u64) -> Option<Self> {
                 match CanonicalNr::new(number) {
-                    $($nr => Some(Self { ordinal: $nr, state: ROOT_ONLY_STATE }),)*
+                    $($nr => Some(Self { ordinal: $nr }),)*
                     _ => None,
                 }
             }
@@ -350,6 +349,7 @@ root_only! {
 }
 
 const _: () = assert!(ROOT_ONLY_IDENTITIES.len() <= 283);
+const _: () = assert!(ROOT_ONLY_STATE.len() <= 21);
 
 /// Consult the same owner as native entry, retaining only enumerated root debt.
 /// No task class is supplied to service_owner. The compatibility token is local
@@ -358,12 +358,16 @@ pub(in crate::dispatch) fn resolve<T>(
     number: u64,
     legacy: impl FnOnce() -> Option<T>,
 ) -> Option<T> {
-    match service_owner(CanonicalNr::new(number), u64::MAX) {
-        ServiceOwner::Crossing(_) => legacy(),
-        ServiceOwner::Ring(_) | ServiceOwner::CountedEnosys => {
-            let _retained = RootOnly::admit(number)?;
-            legacy()
-        }
+    let owner = service_owner(CanonicalNr::new(number), u64::MAX);
+    // Every current host handler still depends on the root task, including
+    // permanent crossings. Ownership alone grants no ambient state authority.
+    let retained = RootOnly::admit(number)?;
+    debug_assert_eq!(retained.ordinal.raw(), number);
+    match owner {
+        ServiceOwner::Crossing(_)
+        | ServiceOwner::RingOwed(_)
+        | ServiceOwner::Ring(_)
+        | ServiceOwner::CountedEnosys => legacy(),
     }
 }
 
@@ -385,12 +389,12 @@ mod tests {
             }
             let existing = routing::resolve_legacy_handler::<LinearMemory>(number).is_some()
                 || routing::resolve_legacy_mutation_handler::<LinearMemory>(number).is_some();
-            if existing {
-                assert!(
-                    RootOnly::admit(number).is_some(),
-                    "unclassified root handler {number}"
-                );
-            }
+            let threaded = crate::dispatch::request::threaded_independent_dispatch_supports(number);
+            assert_eq!(
+                RootOnly::admit(number).is_some(),
+                existing || threaded,
+                "root compatibility must exactly cover handlers and threaded entry: {number}"
+            );
             assert_eq!(
                 routing::resolve_handler::<LinearMemory>(number).is_some(),
                 routing::resolve_legacy_handler::<LinearMemory>(number).is_some(),
