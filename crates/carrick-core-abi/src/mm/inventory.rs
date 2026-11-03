@@ -1,4 +1,5 @@
 //! Exact logical inventory identities and receipt authentication.
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::{fmt, num::NonZeroU64};
@@ -388,26 +389,19 @@ impl FrameInventoryRetirementReceipt {
     }
 }
 
-/// Exact empty-MM inventory proof carried past residency release.
-///
-/// This proves inventory emptiness, not completion of backend memslot or
-/// stage-2 retirement. Carrier custody must finish those steps and residency
-/// retirement before publishing it to journal settlement. It is linear so
-/// one retirement cannot authorize two journal joins.
+/// Inventory half of whole-MM release. This retains the exact empty-MM
+/// revision, but cannot authorize journal acknowledgement by itself.
 #[derive(Debug, Eq, PartialEq)]
-pub struct MmReleaseReceipt {
+#[must_use = "retain the inventory half until backend custody is released"]
+pub struct InventoryReleased {
     retirement: FrameInventoryRetirementReceipt,
 }
-impl MmReleaseReceipt {
-    /// Retain the inventory owner's emptiness verdict at its commit revision.
-    /// The physical release owner must finish residency retirement before
-    /// publishing this receipt to journal custody.
+impl InventoryReleased {
     pub fn from_retirement(retirement: FrameInventoryRetirementReceipt) -> Option<Self> {
         retirement
             .mm_empty_at_revision()
             .then_some(Self { retirement })
     }
-    /// Inventory identity is independent of the numeric MM and revision.
     pub fn issued_by(&self, origin: &FrameInventoryOrigin) -> bool {
         self.retirement.apply.issued_by(origin)
     }
@@ -416,6 +410,83 @@ impl MmReleaseReceipt {
     }
     pub const fn revision(&self) -> u64 {
         self.retirement.revision()
+    }
+}
+
+/// Backend half for one exact inventory release, including its transaction.
+/// The unsafe constructor is the backend implementation boundary; settlement
+/// cannot manufacture a backend release through a safe inventory operation.
+#[derive(Debug, Eq, PartialEq)]
+#[must_use = "join with the exact inventory release"]
+pub struct BackendCustodyReleased {
+    origin: FrameInventoryOrigin,
+    owner: FrameInventoryReceiptOwner,
+    revision: u64,
+    transaction: KernelTransactionId,
+}
+impl BackendCustodyReleased {
+    /// # Safety
+    /// Only the physical backend release owner may call this, after retiring
+    /// residency and releasing the exact MM's backend custody. Every last-frame
+    /// retirement must have been accepted by its physical owner, which retains
+    /// the pending retirement until stage-2 removal and pin drain complete.
+    /// Merely observing an empty inventory or dropping a receipt is insufficient.
+    pub unsafe fn from_backend_release(inventory: &InventoryReleased) -> Self {
+        Self {
+            origin: inventory.retirement.apply.origin.clone(),
+            owner: inventory.owner(),
+            revision: inventory.revision(),
+            transaction: inventory.retirement.transaction(),
+        }
+    }
+}
+
+/// Joined inventory and backend release. Pending physical retirement may
+/// outlive this receipt; the physical owner must prevent frame reuse meanwhile.
+/// Inventory emptiness alone cannot authorize whole-MM acknowledgement.
+/// ```compile_fail
+/// fn inventory_is_not_backend_release(
+///     retired: carrick_core_abi::FrameInventoryRetirementReceipt,
+/// ) -> Option<carrick_core_abi::MmReleaseReceipt> {
+///     carrick_core_abi::MmReleaseReceipt::from_retirement(retired)
+/// }
+/// ```
+/// ```compile_fail
+/// fn inventory_half_is_not_a_receipt(
+///     released: carrick_core_abi::InventoryReleased,
+/// ) -> carrick_core_abi::MmReleaseReceipt {
+///     released
+/// }
+/// ```
+#[derive(Debug, Eq, PartialEq)]
+#[must_use = "deliver the joined release to journal settlement"]
+pub struct MmReleaseReceipt {
+    inventory: InventoryReleased,
+}
+impl MmReleaseReceipt {
+    /// A rejected join returns both halves, preserving retry custody.
+    pub fn join(
+        inventory: InventoryReleased,
+        backend: BackendCustodyReleased,
+    ) -> Result<Self, Box<(InventoryReleased, BackendCustodyReleased)>> {
+        if inventory.issued_by(&backend.origin)
+            && inventory.owner() == backend.owner
+            && inventory.revision() == backend.revision
+            && inventory.retirement.transaction() == backend.transaction
+        {
+            Ok(Self { inventory })
+        } else {
+            Err(Box::new((inventory, backend)))
+        }
+    }
+    pub fn issued_by(&self, origin: &FrameInventoryOrigin) -> bool {
+        self.inventory.issued_by(origin)
+    }
+    pub const fn owner(&self) -> FrameInventoryReceiptOwner {
+        self.inventory.owner()
+    }
+    pub const fn revision(&self) -> u64 {
+        self.inventory.revision()
     }
 }
 
@@ -479,11 +550,53 @@ mod tests {
                 empty,
             )
         };
-        assert!(MmReleaseReceipt::from_retirement(make(false)).is_none());
-        let release = MmReleaseReceipt::from_retirement(make(true)).expect("empty MM");
+        assert!(InventoryReleased::from_retirement(make(false)).is_none());
+        let inventory = InventoryReleased::from_retirement(make(true)).expect("empty MM");
+        // SAFETY: this ABI fixture has no physical custody or residency.
+        let backend = unsafe { BackendCustodyReleased::from_backend_release(&inventory) };
+        let release = MmReleaseReceipt::join(inventory, backend).unwrap();
         assert_eq!(release.owner(), owner);
         assert_eq!(release.revision(), 27);
     }
+    #[test]
+    fn mm_release_join_rejects_foreign_origin_owner_revision_and_transaction() {
+        let origin = FrameInventoryOrigin::default();
+        let make = |origin, owner, revision, transaction| {
+            InventoryReleased::from_retirement(
+                FrameInventoryRetirementReceipt::from_kernel_authority(
+                    FrameInventoryApplyReceipt::from_kernel_authority(
+                        origin,
+                        FrameInventoryProvenance::from_kernel_entropy([2; 32]),
+                        KernelTransactionId::from_kernel_allocation(id(transaction)),
+                        FrameInventoryReceiptOwner::HostMm(id(owner)),
+                        revision,
+                        Vec::new(),
+                    ),
+                    true,
+                ),
+            )
+            .unwrap()
+        };
+        for wrong in [
+            make(FrameInventoryOrigin::default(), 7, 27, 8),
+            make(origin.clone(), 9, 27, 8),
+            make(origin.clone(), 7, 28, 8),
+            make(origin.clone(), 7, 27, 9),
+        ] {
+            let expected = make(origin.clone(), 7, 27, 8);
+            // SAFETY: these ABI fixtures hold no physical custody or residency.
+            let backend = unsafe { BackendCustodyReleased::from_backend_release(&expected) };
+            let (retained, backend) = *MmReleaseReceipt::join(wrong, backend).unwrap_err();
+            // A refused join consumes neither half: the intended inventory can
+            // still join, and the wrong inventory remains owned by the caller.
+            assert_ne!(retained, expected);
+            let receipt = MmReleaseReceipt::join(expected, backend).unwrap();
+            assert!(receipt.issued_by(&origin));
+            assert_eq!(receipt.owner(), FrameInventoryReceiptOwner::HostMm(id(7)));
+            assert_eq!(receipt.revision(), 27);
+        }
+    }
+
     /// A receipt keeps its mapping set sorted however the Kernel listed it,
     /// so `authorizes` is a search, not a scan: process retirement asks it
     /// once per mapping, which made a linear scan O(n^2) in the process's

@@ -135,3 +135,28 @@ the backend must consume permits into its actual completion owner. C1's
 and slice 2b remain open. The new pending token must be wired into S2b, rather
 than completed at mere request acceptance. No signed, KVM-runtime, or runtime
 ratio acceptance is claimed by these VM-free tests.
+
+
+### Inventory and backend release halves
+
+`InventoryReleased` now names the result the existing inventory retirement
+paths actually produce. It cannot be passed to journal acknowledgement.
+`MmReleaseReceipt::join` additionally requires `BackendCustodyReleased`,
+authenticating origin, owner/root incarnation, revision and transaction.
+A rejected join returns both halves. The backend constructor is an unsafe
+implementation boundary requiring actual residency and custody release plus
+accepted physical retirement requests; no production caller asserts that
+contract in this checkpoint.
+
+The negative compilation witness was executed against the preceding API and
+failed because `MmReleaseReceipt::from_retirement` compiled successfully.
+The corrected API removes that constructor. Identity witnesses reject each
+mismatched component independently and retain custody for the correct join.
+The existing root-journal tests use an explicit VM-free backend proof, with
+no claim to exercise physical release. The production inventory producers
+now return the intermediate type, without changing their release operations.
+
+This is partial B1–B3 work: `InventoryReleased` still needs the whole-MM
+permit population and backend consumption before a production join can be
+introduced. The pending S2b owner, C1/C2, and slice 2b remain unfinished.
+The join performs constant-time identity comparisons and adds no guest work.

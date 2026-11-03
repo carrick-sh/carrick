@@ -19,10 +19,12 @@ fn journal_release<'a>(identity: JournalIdentity<'a>, revision: u64, origin: &Fr
         ),
         true,
     );
-    JournalRelease::from_mm_release(
-        identity,
-        MmReleaseReceipt::from_retirement(retirement).unwrap(),
-    )
+    let inventory = carrick_core_abi::InventoryReleased::from_retirement(retirement).unwrap();
+    // SAFETY: this VM-free journal fixture has no physical custody or residency.
+    let backend = unsafe {
+        carrick_core_abi::BackendCustodyReleased::from_backend_release(&inventory)
+    };
+    JournalRelease::from_mm_release(identity, MmReleaseReceipt::join(inventory, backend).unwrap())
     .unwrap()
 }
 

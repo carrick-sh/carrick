@@ -591,12 +591,12 @@ pub fn release_child_mm(
     inventory: &dyn crate::PhysicalFrameInventory,
     residency: &carrick_el1_abi::FrameGrantResidencyTable,
     absence: &SlotAbsence,
-) -> Option<crate::MmReleaseReceipt> {
+) -> Option<crate::InventoryReleased> {
     let receipt = inventory.retire_mm(absence.inventory_owner()?).ok()?;
     if !residency.retire_overlapping(absence.mm().raw(), 0, u64::MAX) {
         return None;
     }
-    crate::MmReleaseReceipt::from_retirement(receipt)
+    crate::InventoryReleased::from_retirement(receipt)
 }
 
 /// Ordered key of one MM in carrier custody.
