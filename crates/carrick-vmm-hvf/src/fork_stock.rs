@@ -70,6 +70,17 @@ impl NativeChildPhysical {
         }
     }
 
+    /// Every byte source this MM's custody holds, as a fork from this MM
+    /// must retain them. `sources` is that one set: `new` seeds it from the
+    /// rows inherited at birth, and an exec image or a native private file
+    /// mapping adds its source there after birth (and the ring's release
+    /// list removes it). Reading only `inherited` refused every fork whose
+    /// parent maps a source it acquired after birth (an exec successor's
+    /// own image) as `Inventory`, which the guest saw as EAGAIN.
+    pub fn fork_sources(&self) -> carrick_hal::fork_stock::ForkHostBackingCustody {
+        self.sources.clone()
+    }
+
     pub fn inherited_frame(
         &self,
         address: carrick_guest_arch::UserVa,
@@ -849,6 +860,8 @@ mod tests {
     fn native_stock_reserve_accepts_custody_in_dynamic_metadata() {
         native_stock_retirement_race(true);
     }
+
+    mod native_source;
 
     fn native_stock_retirement_race(dynamic_custody: bool) {
         let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
