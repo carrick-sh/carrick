@@ -11,6 +11,7 @@ rationale = "A warm ordinary syscall retains the captured ThreadResources, TaskS
 [bindings]
 vm_free = [
   "carrick-kernel::dispatch::resources::tests::ordinary_scope_retains_bundles_without_cloning_each_resource",
+  "carrick-kernel::dispatch::native_files::tests::native_statx_of_a_descriptor_is_its_fstat (#1503: inside a native fs scope, the test-build fallbacks of captured_file_table and captured_mm fail as production does, so a carrier host-file service that escapes its captured KernelContext scope fails every native venue test instead of borrowing the test task's table)",
 ]
 
 [bindings.unresolved]
