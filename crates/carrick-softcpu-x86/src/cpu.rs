@@ -306,6 +306,55 @@ pub enum SoftCpuNewError {
     Seat(SoftSeatError),
     /// The host refused the JIT code buffer.
     Jit,
+    /// An advertised native instruction needs a host capability that is absent.
+    UnsupportedHostFeature(&'static str),
+}
+
+#[cfg(test)]
+thread_local! {
+    static MISSING_HOST_FEATURE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(not(test))]
+fn native_feature_available(_feature: &str, supported: bool) -> bool {
+    supported
+}
+
+#[cfg(test)]
+fn native_feature_available(feature: &str, supported: bool) -> bool {
+    supported && !MISSING_HOST_FEATURE.with(|f| f.get() == Some(feature))
+}
+
+fn qualify_native_cpuid(cpuid: &dyn CpuidAuthority) -> Result<(), SoftCpuNewError> {
+    let leaf1 = cpuid.cpuid(1, 0).ecx;
+    let leaf7 = cpuid.cpuid(7, 0).ebx;
+    macro_rules! require {
+        ($advertised:expr, $feature:tt) => {
+            if $advertised {
+                if !native_feature_available($feature, std::is_x86_feature_detected!($feature)) {
+                    return Err(SoftCpuNewError::UnsupportedHostFeature($feature));
+                }
+            }
+        };
+    }
+    // VEX leaves load the full guest YMM bank, including integer VEX forms.
+    // Legacy crypto/MOVBE leaves never use YMM; bit scans run in software.
+    let checked_leaf = leaf1 & ((1 << 12) | (1 << 28) | (1 << 29)) != 0
+        || leaf7 & ((1 << 3) | (1 << 5) | (1 << 8)) != 0;
+    require!(checked_leaf, "avx");
+    require!(checked_leaf, "avx2");
+    require!(leaf1 & 1 != 0, "sse3");
+    require!(leaf1 & (1 << 9) != 0, "ssse3");
+    require!(leaf1 & (1 << 19) != 0, "sse4.1");
+    require!(leaf1 & (1 << 20) != 0, "sse4.2");
+    require!(leaf1 & (1 << 1) != 0, "pclmulqdq");
+    require!(leaf1 & (1 << 12) != 0, "fma");
+    require!(leaf1 & (1 << 22) != 0, "movbe");
+    require!(leaf1 & (1 << 25) != 0, "aes");
+    require!(leaf1 & (1 << 29) != 0, "f16c");
+    require!(leaf7 & (1 << 3) != 0, "bmi1");
+    require!(leaf7 & (1 << 8) != 0, "bmi2");
+    Ok(())
 }
 
 impl SoftCpu {
@@ -320,10 +369,12 @@ impl SoftCpu {
         extents: &ExtentTable,
         cpuid: Box<dyn CpuidAuthority>,
     ) -> Result<Self, SoftCpuNewError> {
+        qualify_native_cpuid(&*cpuid)?;
         let mut ctx = SoftCpuContext::new(extents).map_err(SoftCpuNewError::Seat)?;
         ctx.walker.set_max_phy_addr(cpuid.max_phy_addr());
         ctx.tsc_hz = cpuid.tsc_hz();
         ctx.legacy_features = cpuid.cpuid(1, 0).ecx;
+        ctx.extended_features = cpuid.cpuid(7, 0).ebx;
         ctx.fpu = cpuid.cpuid(1, 0).edx & 1 != 0;
         ctx.lzcnt = cpuid.cpuid(0x8000_0001, 0).ecx & (1 << 5) != 0;
         ctx.bmi1 = cpuid.cpuid(7, 0).ebx & (1 << 3) != 0;
@@ -345,15 +396,21 @@ impl SoftCpu {
 
     /// Replace the installed [`CpuidAuthority`] between runs, updating `MAXPHYADDR`, `tsc_hz`,
     /// and local APIC ID.
-    pub fn set_cpuid_view(&mut self, cpuid: Box<dyn CpuidAuthority>) {
+    pub fn set_cpuid_view(
+        &mut self,
+        cpuid: Box<dyn CpuidAuthority>,
+    ) -> Result<(), SoftCpuNewError> {
+        qualify_native_cpuid(&*cpuid)?;
         self.ctx.walker.set_max_phy_addr(cpuid.max_phy_addr());
         self.ctx.tsc_hz = cpuid.tsc_hz();
         self.ctx.legacy_features = cpuid.cpuid(1, 0).ecx;
+        self.ctx.extended_features = cpuid.cpuid(7, 0).ebx;
         self.ctx.fpu = cpuid.cpuid(1, 0).edx & 1 != 0;
         self.ctx.lzcnt = cpuid.cpuid(0x8000_0001, 0).ecx & (1 << 5) != 0;
         self.ctx.bmi1 = cpuid.cpuid(7, 0).ebx & (1 << 3) != 0;
         self.ctx.lapic.set_apic_id(cpuid.apic_id());
         self.cpuid = cpuid;
+        Ok(())
     }
 
     /// Attaches an injectable [`crate::apic::TscClock`] to this CPU.
@@ -516,6 +573,7 @@ impl SoftCpu {
     ) -> Result<SoftCpuExit, EmitError> {
         if (self.ctx.cr0 & 0xc) != 0
             && let Some(first) = planned.insns.first()
+            && !crate::avx::supported(&first.raw)
             && first.raw.encoding() != iced_x86::EncodingKind::VEX
             && (0..first.raw.op_count()).any(|i| {
                 first.raw.op_kind(i) == iced_x86::OpKind::Register
@@ -650,7 +708,9 @@ impl SoftCpu {
                     }
                     SensitiveOp::Ldmxcsr | SensitiveOp::Stmxcsr => {
                         if raw.encoding() == iced_x86::EncodingKind::VEX
-                            && (self.ctx.cr4 & (1 << 18) == 0 || self.ctx.xcr0 & 6 != 6)
+                            && (self.ctx.legacy_features & (1 << 28) == 0
+                                || self.ctx.cr4 & (1 << 18) == 0
+                                || self.ctx.xcr0 & 6 != 6)
                         {
                             return self.raise(X86Exception::invalid_opcode(va));
                         }
@@ -1143,4 +1203,73 @@ fn emulate_legacy_x87<M: SoftMmuMemory>(
         ctx.fxsave = restored;
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod cpuid_admission_tests {
+    use super::*;
+
+    struct CryptoOnly;
+    impl CpuidAuthority for CryptoOnly {
+        fn cpuid(&self, leaf: u32, _subleaf: u32) -> crate::CpuidRegs {
+            if leaf == 1 {
+                crate::CpuidRegs::new(0, 0, 1 << 25, 0)
+            } else {
+                crate::CpuidRegs::ZERO
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_crypto_profile_does_not_require_host_vector_storage() {
+        let extents = ExtentTable::new().unwrap();
+        let mut cpu = SoftCpu::new(&extents).unwrap();
+        MISSING_HOST_FEATURE.with(|f| f.set(Some("avx2")));
+        let constructed = SoftCpu::with_cpuid_view(&extents, Box::new(CryptoOnly));
+        let replaced = cpu.set_cpuid_view(Box::new(CryptoOnly));
+        MISSING_HOST_FEATURE.with(|f| f.set(None));
+        assert!(constructed.is_ok());
+        assert_eq!(replaced, Ok(()));
+        assert_eq!(cpu.cpuid_view().cpuid(1, 0), CryptoOnly.cpuid(1, 0));
+    }
+
+    #[test]
+    fn cpuid_admission_refuses_missing_host_features_before_mutating_cpu() {
+        let extents = ExtentTable::new().unwrap();
+        let mut cpu = SoftCpu::new(&extents).unwrap();
+        for feature in [
+            "sse3",
+            "ssse3",
+            "sse4.1",
+            "sse4.2",
+            "avx",
+            "avx2",
+            "fma",
+            "f16c",
+            "bmi1",
+            "bmi2",
+            "movbe",
+            "aes",
+            "pclmulqdq",
+        ] {
+            MISSING_HOST_FEATURE.with(|f| f.set(Some(feature)));
+            let view = crate::GuestCpuidView::default()
+                .with_apic_id(7)
+                .with_tsc(carrick_x86::TscCrystalRatio::new(1, 1, 1_000_000_000));
+            let result = SoftCpu::with_cpuid_view(&extents, Box::new(view));
+            let replaced = cpu.set_cpuid_view(Box::new(view));
+            MISSING_HOST_FEATURE.with(|f| f.set(None));
+            assert!(
+                matches!(result, Err(SoftCpuNewError::UnsupportedHostFeature(f)) if f == feature),
+                "{feature}"
+            );
+            assert_eq!(
+                replaced,
+                Err(SoftCpuNewError::UnsupportedHostFeature(feature))
+            );
+            assert_eq!(cpu.cpuid_view().cpuid(1, 0), Level0CpuidView.cpuid(1, 0));
+            assert_eq!(cpu.context().tsc_hz, crate::cpuid::DEFAULT_TSC_HZ);
+        }
+    }
 }

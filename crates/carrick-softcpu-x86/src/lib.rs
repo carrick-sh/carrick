@@ -38,6 +38,7 @@ pub use apic::{
     LapicTimerMode, LocalApic, ManualTscClock, MonotonicTscClock, TscClock,
 };
 pub use block::{BlockExit, BlockFetchFault, MAX_INSN_BYTES, PlannedBlock, plan_block_from_memory};
+pub use carrick_x86::GuestCpuidView;
 pub use cflow::{compute_effective_va, eval_cc, resolve_cflow};
 pub use context::{
     AdmitRefused, DescriptorTablePtr, FxsaveArea, HostAccess, SoftCpuContext, SoftSegment,

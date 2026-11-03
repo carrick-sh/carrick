@@ -2666,7 +2666,7 @@ fn alignment_check_applies_to_checked_image_and_string_helpers() {
 #[test]
 fn avx_xstate_component_round_trip_and_initial_state() {
     // SDM Vol. 1 chapter 13: standard YMM_Hi128 is 256 bytes at 576.
-    let (mut cpu, mut mem, va) = setup_snippet(&[0x0f, 0xae, 0x2f]); // xrstor [rdi]
+    let (mut cpu, mut mem, va) = setup_avx_snippet(&[0x0f, 0xae, 0x2f]); // xrstor [rdi]
     let addr = 0x2000_0000;
     mem.map_range(addr, 4096, PagePerms::USER_RW);
     let mut image = [0u8; 832];
@@ -2722,7 +2722,7 @@ fn avx_vex_two_and_three_byte_three_operand_execution() {
         &[0xc5, 0xf5, 0xfe, 0xc2][..],
         &[0xc4, 0xe1, 0x75, 0xfe, 0xc2],
     ] {
-        let (mut cpu, mut mem, va) = setup_snippet(&[code, &[0xeb, 0]].concat());
+        let (mut cpu, mut mem, va) = setup_avx_snippet(&[code, &[0xeb, 0]].concat());
         cpu.context_mut().xcr0 = 7;
         cpu.context_mut().write_xmm(1, u128::from_le_bytes([1; 16]));
         cpu.context_mut().write_xmm(2, u128::from_le_bytes([2; 16]));
@@ -2853,7 +2853,7 @@ fn avx_each_register_encoding_matches_independent_xsave_native_oracle() {
         "unexpectedly small instruction population: {}",
         encodings.len()
     );
-    let (mut cpu, mut mem, va) = setup_snippet(&[]);
+    let (mut cpu, mut mem, va) = setup_avx_snippet(&[]);
     let mut mnemonics = std::collections::BTreeSet::new();
     for (insn, bytes) in encodings.values() {
         mnemonics.insert(insn.mnemonic());
@@ -2932,6 +2932,23 @@ fn avx_each_register_encoding_matches_independent_xsave_native_oracle() {
     );
 }
 
+// Exercise AVX with explicit guest admission. XSAVEOPT/XSAVEC are a
+// synthetic test extension, deliberately absent from the shared pinned view.
+struct AvxTestView;
+impl carrick_softcpu_x86::CpuidAuthority for AvxTestView {
+    fn cpuid(&self, leaf: u32, subleaf: u32) -> carrick_softcpu_x86::CpuidRegs {
+        if (leaf, subleaf) == (0xd, 1) {
+            return carrick_softcpu_x86::CpuidRegs::new(3, 832, 0, 0);
+        }
+        carrick_softcpu_x86::GuestCpuidView::default().cpuid(leaf, subleaf)
+    }
+}
+fn setup_avx_snippet(code: &[u8]) -> (SoftCpu, TestSoftMmuMemory, u64) {
+    let (mut cpu, mem, va) = setup_snippet(code);
+    cpu.set_cpuid_view(Box::new(AvxTestView)).unwrap();
+    (cpu, mem, va)
+}
+
 fn avx_encode(insn: iced_x86::Instruction) -> Vec<u8> {
     let mut encoder = iced_x86::Encoder::new(64);
     encoder.encode(&insn, 0).unwrap();
@@ -2947,7 +2964,7 @@ fn avx_run(cpu: &mut SoftCpu, mem: &mut TestSoftMmuMemory, va: u64, bytes: &[u8]
 #[test]
 fn avx_memory_widths_high_registers_and_fault_atomicity() {
     use iced_x86::{Code, Instruction, MemoryOperand, Register};
-    let (mut cpu, mut mem, va) = setup_snippet(&[]);
+    let (mut cpu, mut mem, va) = setup_avx_snippet(&[]);
     let addr = 0x2000_0ff0;
     mem.map_range(0x2000_0000, 8192, PagePerms::USER_RW);
     cpu.context_mut().xcr0 = 7;
@@ -3025,7 +3042,7 @@ fn avx_memory_widths_high_registers_and_fault_atomicity() {
 #[test]
 fn avx_masked_memory_does_not_touch_inactive_page() {
     use iced_x86::{Code, Instruction, MemoryOperand, Register};
-    let (mut cpu, mut mem, va) = setup_snippet(&[]);
+    let (mut cpu, mut mem, va) = setup_avx_snippet(&[]);
     mem.map_range(0x2000_0000, 4096, PagePerms::USER_RW);
     let addr = 0x2000_0ff0;
     mem.write_direct(addr, &[0x39; 16]);
@@ -3089,7 +3106,7 @@ fn avx_masked_memory_does_not_touch_inactive_page() {
 #[test]
 fn avx_gather_retains_completed_lanes_on_page_fault() {
     use iced_x86::{Code, Instruction, MemoryOperand, Register};
-    let (mut cpu, mut mem, va) = setup_snippet(&[]);
+    let (mut cpu, mut mem, va) = setup_avx_snippet(&[]);
     let addr = 0x2000_0000;
     mem.map_range(addr, 4096, PagePerms::USER_RW);
     mem.write_direct(addr, &[17, 0, 0, 0, 29, 0, 0, 0]);
@@ -3145,7 +3162,7 @@ fn avx_gather_retains_completed_lanes_on_page_fault() {
 
 #[test]
 fn avx_controls_and_vzero_obey_architectural_fault_order() {
-    let (mut cpu, mut mem, va) = setup_snippet(&[]);
+    let (mut cpu, mut mem, va) = setup_avx_snippet(&[]);
     let code = [0xc5, 0xfc, 0x77]; // vzeroall, no explicit register operands
     cpu.context_mut().ymm_hi128.fill(0x71);
     cpu.context_mut().cr0 |= 8;
@@ -3210,7 +3227,7 @@ fn avx_each_memory_encoding_matches_native_operand_and_register_results() {
         }
     }
     assert!(encodings.len() >= 400, "memory forms: {}", encodings.len());
-    let (mut cpu, mut mem, va) = setup_snippet(&[]);
+    let (mut cpu, mut mem, va) = setup_avx_snippet(&[]);
     let addr = 0x2000_0000;
     mem.map_range(addr, 4096, PagePerms::USER_RW);
     for (insn, bytes) in encodings.values() {
@@ -3286,7 +3303,7 @@ fn avx_each_memory_encoding_matches_native_operand_and_register_results() {
 
 #[test]
 fn avx_unmasked_exact_underflow_preserves_destination() {
-    let (mut cpu, mut mem, va) = setup_snippet(&[]);
+    let (mut cpu, mut mem, va) = setup_avx_snippet(&[]);
     cpu.context_mut().xcr0 = 7;
     cpu.context_mut().write_xmm(0, 0x1234);
     cpu.context_mut().write_xmm(1, 0x0080_0000); // smallest normal f32
@@ -3312,7 +3329,7 @@ fn avx_dot_product_reports_intermediate_underflow_even_when_sum_is_zero() {
         &[0xc4, 0xe3, 0x71, 0x40, 0xc2, 0x3f][..], // vdpps xmm0,xmm1,xmm2,0x3f
         &[0xc4, 0xe3, 0x71, 0x41, 0xc2, 0x3f],     // vdppd xmm0,xmm1,xmm2,0x3f
     ] {
-        let (mut cpu, mut mem, va) = setup_snippet(&[]);
+        let (mut cpu, mut mem, va) = setup_avx_snippet(&[]);
         cpu.context_mut().xcr0 = 7;
         cpu.context_mut().write_xmm(0, 0x1234);
         if bytes[3] == 0x40 {
@@ -3342,7 +3359,7 @@ fn avx_dot_product_reports_intermediate_underflow_even_when_sum_is_zero() {
 #[test]
 fn avx_gather_normalizes_mask_and_suppresses_alignment_checks() {
     use iced_x86::{Code, Instruction, MemoryOperand, Register};
-    let (mut cpu, mut mem, va) = setup_snippet(&[]);
+    let (mut cpu, mut mem, va) = setup_avx_snippet(&[]);
     let addr = 0x2000_0000;
     mem.map_range(addr, 4096, PagePerms::USER_RW);
     mem.write_direct(addr + 1, &0x11223344u32.to_le_bytes());
@@ -3380,7 +3397,7 @@ fn avx_gather_normalizes_mask_and_suppresses_alignment_checks() {
 
 #[test]
 fn avx_packed_memory_and_masked_lanes_suppress_ac_and_ignore_em() {
-    let (mut cpu, mut mem, va) = setup_snippet(&[]);
+    let (mut cpu, mut mem, va) = setup_avx_snippet(&[]);
     let addr = 0x2000_0001;
     mem.map_range(0x2000_0000, 4096, PagePerms::USER_RW);
     mem.write_direct(addr, &[1; 32]);
@@ -3411,10 +3428,10 @@ fn avx_packed_memory_and_masked_lanes_suppress_ac_and_ignore_em() {
 
 #[test]
 fn avx_xsetbv_and_component_masks_preserve_unrequested_state() {
-    let (_, mut mem, va) = setup_snippet(&[]);
+    let (_, mut mem, va) = setup_avx_snippet(&[]);
     let mut cpu = SoftCpu::with_cpuid_view(
         mem.extents(),
-        Box::new(carrick_x86::GuestCpuidView::x86_64_v3()),
+        Box::new(carrick_softcpu_x86::GuestCpuidView::default()),
     )
     .unwrap();
     cpu.context_mut().cpl = 0;
@@ -3476,7 +3493,7 @@ fn avx_xsetbv_and_component_masks_preserve_unrequested_state() {
 #[test]
 fn avx_rounding_and_unmasked_invalid_operation_are_guest_state() {
     use iced_x86::{Code, Instruction, Register};
-    let (mut cpu, mut mem, va) = setup_snippet(&[]);
+    let (mut cpu, mut mem, va) = setup_avx_snippet(&[]);
     cpu.context_mut().xcr0 = 7;
     let convert = avx_encode(
         Instruction::with2(
@@ -3518,7 +3535,7 @@ fn avx_rounding_and_unmasked_invalid_operation_are_guest_state() {
 
 #[test]
 fn avx_xstate_second_page_fault_publishes_no_partial_component() {
-    let (mut cpu, mut mem, va) = setup_snippet(&[]);
+    let (mut cpu, mut mem, va) = setup_avx_snippet(&[]);
     let addr = 0x2000_0d00;
     mem.map_range(0x2000_0000, 4096, PagePerms::USER_RW);
     let mut image = [0x55u8; 768];
@@ -3560,7 +3577,7 @@ fn avx_gather_and_masked_move_require_enabled_vector_state() {
     ];
     for (name, bytes) in cases {
         for (xcr0, osxsave) in [(3, true), (7, false)] {
-            let (mut cpu, mut mem, va) = setup_snippet(&[]);
+            let (mut cpu, mut mem, va) = setup_avx_snippet(&[]);
             cpu.context_mut().xcr0 = xcr0;
             if osxsave {
                 cpu.context_mut().cr4 |= 1 << 18;
@@ -3581,9 +3598,9 @@ fn avx_gather_and_masked_move_require_enabled_vector_state() {
 }
 
 #[test]
-fn avx_unadmitted_extensions_raise_invalid_opcode() {
-    // Valid encodings from the Intel SDM, but outside this slice's AVX/AVX2
-    // feature set. Enabled vector state must not grant these extensions.
+fn avx_v3_extensions_execute_and_evex_remains_refused() {
+    // Valid v3 and crypto encodings from the Intel SDM. EVEX remains outside
+    // the admitted profile even with vector state enabled.
     let cases: &[(&str, &[u8])] = &[
         ("FMA vfmadd132ps", &[0xc4, 0xe2, 0x71, 0x98, 0xc2]),
         ("F16C vcvtph2ps", &[0xc4, 0xe2, 0x79, 0x13, 0xc1]),
@@ -3597,10 +3614,18 @@ fn avx_unadmitted_extensions_raise_invalid_opcode() {
         let decoded = iced_x86::Decoder::new(64, bytes, iced_x86::DecoderOptions::NONE).decode();
         assert!(!decoded.is_invalid(), "invalid fixture: {name}");
         assert_eq!(decoded.len(), bytes.len(), "incomplete fixture: {name}");
-        let (mut cpu, mut mem, va) = setup_snippet(&[]);
+        let (mut cpu, mut mem, va) = setup_avx_snippet(&[]);
         cpu.context_mut().xcr0 = 7;
         assert_ne!(cpu.context().cr4 & (1 << 18), 0);
-        assert_eq!(avx_run(&mut cpu, &mut mem, va, bytes), ud(va), "{name}");
+        let result = avx_run(&mut cpu, &mut mem, va, bytes);
+        if name.starts_with("EVEX") {
+            assert_eq!(result, ud(va), "{name}");
+        } else {
+            assert!(
+                matches!(result, SoftCpuExit::Continue { .. }),
+                "{name}: {result:?}"
+            );
+        }
     }
 }
 
@@ -3806,7 +3831,7 @@ fn legacy_probe_tzcnt_bmi1_follows_guest_cpuid() {
     }
     for input in [0u64, 1, 2, 1 << 63] {
         let (mut cpu, mut mem, va) = setup_snippet(&[0xf3, 0x48, 0x0f, 0xbc, 0xc1, 0x0f, 0x05]);
-        cpu.set_cpuid_view(Box::new(Bmi1));
+        cpu.set_cpuid_view(Box::new(Bmi1)).unwrap();
         cpu.context_mut().gpr[reg::RCX] = input;
         step_ok(&mut cpu, &mut mem, sys(va + 5, va + 7));
         let count = u64::from(input.trailing_zeros());
@@ -3823,7 +3848,7 @@ fn legacy_probe_tzcnt_bmi1_follows_guest_cpuid() {
             assert_eq!(cpu.context().rflags & 0x41, flags & 0x41);
         }
         // Replacing the authority switches the same decoded encoding to BSF.
-        cpu.set_cpuid_view(Box::new(Level0CpuidView));
+        cpu.set_cpuid_view(Box::new(Level0CpuidView)).unwrap();
         cpu.context_mut().rip = va;
         step_ok(&mut cpu, &mut mem, sys(va + 5, va + 7));
         assert_eq!((cpu.context().rflags >> 6) & 1, u64::from(input == 0));
@@ -3926,7 +3951,8 @@ fn legacy_extended_families_match_native() {
         }
         let oracle = native_avx_oracle(bytes, initial, false);
         let (mut cpu, mut mem, va) = setup_snippet(&[bytes, &[0xeb, 0]].concat());
-        cpu.set_cpuid_view(Box::new(carrick_softcpu_x86::Cpl0CpuidView::default()));
+        cpu.set_cpuid_view(Box::new(carrick_softcpu_x86::Cpl0CpuidView::default()))
+            .unwrap();
         cpu.context_mut().fxsave.0.copy_from_slice(&initial[..512]);
         for (r, v) in [reg::RAX, reg::RCX, reg::RDX]
             .into_iter()
@@ -4042,7 +4068,8 @@ fn legacy_extended_all_encodings_match_native_and_guest_admission() {
             let oracle = native_avx_oracle(bytes, initial, *memory);
             mem.write_direct(va, &[bytes.as_slice(), &[0xeb, 0]].concat());
             mem.write_direct(data, &[0x3f; 32]);
-            cpu.set_cpuid_view(Box::new(carrick_softcpu_x86::Cpl0CpuidView::default()));
+            cpu.set_cpuid_view(Box::new(carrick_softcpu_x86::Cpl0CpuidView::default()))
+                .unwrap();
             cpu.context_mut().rip = va;
             cpu.context_mut().rflags = 0x202;
             cpu.context_mut().fxsave.0.copy_from_slice(&initial[..512]);
@@ -4088,7 +4115,8 @@ fn legacy_extended_all_encodings_match_native_and_guest_admission() {
             }
             // The identical executable bytes must refuse before memory access
             // or register mutation when the installed view lacks the family.
-            cpu.set_cpuid_view(Box::new(carrick_softcpu_x86::Level0CpuidView));
+            cpu.set_cpuid_view(Box::new(carrick_softcpu_x86::Level0CpuidView))
+                .unwrap();
             cpu.context_mut().rip = va;
             cpu.context_mut().gpr[reg::RDI] = 0x1234_0000;
             let before = cpu.context().gpr;
@@ -4110,7 +4138,8 @@ fn legacy_extended_faults_and_unadvertised_extensions() {
         (&[0xf2, 0x0f, 0xf0, 0x07][..], false),
     ] {
         let (mut cpu, mut mem, va) = setup_snippet(&[bytes, &[0xeb, 0]].concat());
-        cpu.set_cpuid_view(Box::new(carrick_softcpu_x86::Cpl0CpuidView::default()));
+        cpu.set_cpuid_view(Box::new(carrick_softcpu_x86::Cpl0CpuidView::default()))
+            .unwrap();
         let data = 0x2000_0000;
         mem.map_range(data, 4096, PagePerms::USER_RW);
         cpu.context_mut().gpr[reg::RDI] = data + 1;
@@ -4174,7 +4203,7 @@ fn legacy_scalar_counts_obey_sized_results_and_feature_switches() {
                 let len = bytes.len() as u64;
                 bytes.extend_from_slice(&[0x0f, 0x05]);
                 let (mut cpu, mut mem, va) = setup_snippet(&bytes);
-                cpu.set_cpuid_view(Box::new(Counts));
+                cpu.set_cpuid_view(Box::new(Counts)).unwrap();
                 cpu.context_mut().gpr[reg::RAX] = u64::MAX;
                 cpu.context_mut().gpr[reg::RCX] = input;
                 step_ok(&mut cpu, &mut mem, sys(va + len, va + len + 2));
@@ -4840,7 +4869,8 @@ fn setup_x87_snippet(code: &[u8]) -> (SoftCpu, TestSoftMmuMemory, u64) {
         fpu: true,
         cx16: true,
         sse3: true,
-    }));
+    }))
+    .unwrap();
     (cpu, mem, va)
 }
 
@@ -4878,7 +4908,8 @@ fn x87_cx16_and_fisttp_obey_installed_view() {
             fpu: true,
             cx16: true,
             sse3: false,
-        }));
+        }))
+        .unwrap();
         cpu.context_mut().rip = va;
         if bytes == [0xdb, 0x0f] {
             step_ok(&mut cpu, &mut mem, ud(va));
@@ -4887,7 +4918,8 @@ fn x87_cx16_and_fisttp_obey_installed_view() {
             fpu: true,
             cx16: true,
             sse3: true,
-        }));
+        }))
+        .unwrap();
         cpu.context_mut().rip = va;
         cpu.context_mut().gpr[reg::RDI] = 0x800000;
         step_ok(
@@ -4895,7 +4927,8 @@ fn x87_cx16_and_fisttp_obey_installed_view() {
             &mut mem,
             sys(va + bytes.len() as u64, va + bytes.len() as u64 + 2),
         );
-        cpu.set_cpuid_view(Box::new(carrick_softcpu_x86::Level0CpuidView));
+        cpu.set_cpuid_view(Box::new(carrick_softcpu_x86::Level0CpuidView))
+            .unwrap();
         cpu.context_mut().rip = va;
         let before = cpu.context().fxsave.0;
         step_ok(&mut cpu, &mut mem, ud(va));

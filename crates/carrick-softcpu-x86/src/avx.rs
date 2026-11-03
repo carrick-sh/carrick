@@ -1,4 +1,4 @@
-//! Checked legacy extended SIMD and VEX execution. The native leaf sees only private, aligned operands;
+//! Checked v3 and cryptographic instruction execution. The native leaf sees only private, aligned operands;
 //! guest addresses and masked/VSIB accesses are resolved by the software MMU.
 
 use std::mem::offset_of;
@@ -38,23 +38,95 @@ pub(crate) fn legacy_feature_mask(insn: &Instruction) -> u32 {
     mask
 }
 
-pub(crate) fn controls_allow(ctx: &SoftCpuContext, insn: &Instruction) -> bool {
-    let legacy = legacy_feature_mask(insn);
-    if legacy != 0 {
-        ctx.legacy_features & legacy == legacy && ctx.cr0 & 4 == 0 && ctx.cr4 & (1 << 9) != 0
-    } else {
-        ctx.cr4 & (1 << 18) != 0 && ctx.xcr0 & 6 == 6
-    }
+pub(crate) fn supported(insn: &Instruction) -> bool {
+    let features = insn.cpuid_features();
+    !matches!(insn.mnemonic(), Mnemonic::Tzcnt | Mnemonic::Lzcnt)
+        && (legacy_feature_mask(insn) != 0
+            || (matches!(insn.encoding(), EncodingKind::Legacy | EncodingKind::VEX)
+                && !features.is_empty()
+                && features.iter().all(|f| {
+                    matches!(
+                        f,
+                        CpuidFeature::AVX
+                            | CpuidFeature::AVX2
+                            | CpuidFeature::BMI1
+                            | CpuidFeature::BMI2
+                            | CpuidFeature::FMA
+                            | CpuidFeature::F16C
+                            | CpuidFeature::LZCNT
+                            | CpuidFeature::MOVBE
+                            | CpuidFeature::AES
+                            | CpuidFeature::PCLMULQDQ
+                    )
+                })
+                && !matches!(insn.mnemonic(), Mnemonic::Vldmxcsr | Mnemonic::Vstmxcsr)))
 }
 
-pub(crate) fn supported(insn: &Instruction) -> bool {
-    legacy_feature_mask(insn) != 0
-        || (insn.encoding() == EncodingKind::VEX
-            && insn
-                .cpuid_features()
-                .iter()
-                .all(|f| matches!(f, CpuidFeature::AVX | CpuidFeature::AVX2))
-            && !matches!(insn.mnemonic(), Mnemonic::Vldmxcsr | Mnemonic::Vstmxcsr))
+fn integer(insn: &Instruction) -> bool {
+    insn.cpuid_features().iter().any(|f| {
+        matches!(
+            f,
+            CpuidFeature::BMI1 | CpuidFeature::BMI2 | CpuidFeature::LZCNT | CpuidFeature::MOVBE
+        )
+    })
+}
+
+/// Integer VEX encodings do not consume vector state. Legacy crypto uses
+/// SSE controls; VEX vector instructions require OSXSAVE and both components.
+pub(crate) fn check_controls(
+    ctx: &SoftCpuContext,
+    insn: &Instruction,
+    ip: u64,
+) -> Result<(), X86Exception> {
+    for feature in insn.cpuid_features() {
+        let allowed = match feature {
+            CpuidFeature::SSE3 => ctx.legacy_features & 1 != 0,
+            CpuidFeature::SSSE3 => ctx.legacy_features & (1 << 9) != 0,
+            CpuidFeature::SSE4_1 => ctx.legacy_features & (1 << 19) != 0,
+            CpuidFeature::SSE4_2 => ctx.legacy_features & (1 << 20) != 0,
+            CpuidFeature::PCLMULQDQ => ctx.legacy_features & (1 << 1) != 0,
+            CpuidFeature::FMA => ctx.legacy_features & (1 << 12) != 0,
+            CpuidFeature::MOVBE => ctx.legacy_features & (1 << 22) != 0,
+            CpuidFeature::AES => ctx.legacy_features & (1 << 25) != 0,
+            CpuidFeature::AVX => ctx.legacy_features & (1 << 28) != 0,
+            CpuidFeature::F16C => ctx.legacy_features & (1 << 29) != 0,
+            CpuidFeature::BMI1 => ctx.bmi1,
+            CpuidFeature::BMI2 => ctx.extended_features & (1 << 8) != 0,
+            CpuidFeature::AVX2 => {
+                ctx.extended_features & (1 << 5) != 0 && ctx.legacy_features & (1 << 28) != 0
+            }
+            _ => false,
+        };
+        if !allowed {
+            return Err(X86Exception::invalid_opcode(ip));
+        }
+    }
+    if integer(insn) {
+        return Ok(());
+    }
+    if insn.encoding() == EncodingKind::VEX {
+        if ctx.legacy_features & (1 << 28) == 0 || ctx.cr4 & (1 << 18) == 0 || ctx.xcr0 & 6 != 6 {
+            return Err(X86Exception::invalid_opcode(ip));
+        }
+    } else if ctx.cr0 & 4 != 0 || ctx.cr4 & (1 << 9) == 0 {
+        return Err(X86Exception::invalid_opcode(ip));
+    }
+    if ctx.cr0 & 8 != 0 {
+        return Err(X86Exception::device_not_available(ip));
+    }
+    Ok(())
+}
+
+fn native_gpr(insn: &Instruction, operand: u32) -> Register {
+    // Keep aliases (notably MULX's two outputs) aliases in the native leaf.
+    let original = insn.op_register(operand);
+    let index = (0..operand)
+        .find(|&i| {
+            insn.op_kind(i) == OpKind::Register
+                && insn.op_register(i).full_register() == original.full_register()
+        })
+        .unwrap_or(operand);
+    Register::R8 + index
 }
 
 fn masked(insn: &Instruction) -> bool {
@@ -74,7 +146,6 @@ pub(crate) struct Run {
     working: FxsaveArea,
     host: FxsaveArea,
     vectors: [[u8; 32]; 16],
-    host_vectors: [[u8; 32]; 16],
     operand: [u8; 32],
     gpr: [u64; 4],
     flags: u64,
@@ -109,7 +180,7 @@ fn slot(offset: usize) -> MemoryOperand {
 /// Immutable, per-encoding leaf; no guest register can name the host stack or
 /// the leaf's context pointer. AVX GPR operands are explicit and remapped.
 pub(crate) fn image(insn: &Instruction) -> Result<Vec<u8>, String> {
-    let legacy = legacy_feature_mask(insn) != 0;
+    let legacy = insn.encoding() == EncodingKind::Legacy;
     if legacy
         && !(std::is_x86_feature_detected!("sse3")
             && std::is_x86_feature_detected!("ssse3")
@@ -120,6 +191,28 @@ pub(crate) fn image(insn: &Instruction) -> Result<Vec<u8>, String> {
     }
     if !legacy && !std::is_x86_feature_detected!("avx2") {
         return Err("AVX execution needs an AVX2-capable same-ISA host".into());
+    }
+    for feature in insn.cpuid_features() {
+        let available = match feature {
+            CpuidFeature::BMI1 => std::is_x86_feature_detected!("bmi1"),
+            CpuidFeature::BMI2 => std::is_x86_feature_detected!("bmi2"),
+            CpuidFeature::FMA => std::is_x86_feature_detected!("fma"),
+            CpuidFeature::F16C => std::is_x86_feature_detected!("f16c"),
+            CpuidFeature::LZCNT => std::is_x86_feature_detected!("lzcnt"),
+            CpuidFeature::MOVBE => std::is_x86_feature_detected!("movbe"),
+            CpuidFeature::AES => std::is_x86_feature_detected!("aes"),
+            CpuidFeature::PCLMULQDQ => std::is_x86_feature_detected!("pclmulqdq"),
+            CpuidFeature::AVX
+            | CpuidFeature::AVX2
+            | CpuidFeature::SSE3
+            | CpuidFeature::SSSE3
+            | CpuidFeature::SSE4_1
+            | CpuidFeature::SSE4_2 => true,
+            _ => false,
+        };
+        if !available {
+            return Err(format!("native instruction requires host {feature:?}"));
+        }
     }
     let mut encoder = Encoder::new(64);
     let mut emit = |instruction: Result<Instruction, iced_x86::IcedError>| -> Result<(), String> {
@@ -132,15 +225,6 @@ pub(crate) fn image(insn: &Instruction) -> Result<Vec<u8>, String> {
         Code::Fxsave64_m512byte,
         slot(offset_of!(Run, host)),
     ))?;
-    if !legacy {
-        for i in 0..16 {
-            emit(Instruction::with2(
-                Code::VEX_Vmovdqu_ymmm256_ymm,
-                slot(offset_of!(Run, host_vectors) + i * 32),
-                Register::YMM0 + i as u32,
-            ))?;
-        }
-    }
     emit(Instruction::with1(
         Code::Fxrstor64_m512byte,
         slot(offset_of!(Run, working)),
@@ -170,16 +254,19 @@ pub(crate) fn image(insn: &Instruction) -> Result<Vec<u8>, String> {
         } else if insn.op_kind(i) == OpKind::Register && insn.op_register(i).is_gpr() {
             emit(Instruction::with2(
                 Code::Mov_r64_rm64,
-                Register::R8 + i,
+                native_gpr(insn, i),
                 slot(offset_of!(Run, gpr) + i as usize * 8),
             ))?;
             native.set_op_register(
                 i,
-                match insn.op_register(i).size() {
-                    1 => Register::R8L + i,
-                    2 => Register::R8W + i,
-                    4 => Register::R8D + i,
-                    _ => Register::R8 + i,
+                if insn.op_register(i).is_gpr64() {
+                    native_gpr(insn, i)
+                } else if insn.op_register(i).is_gpr32() {
+                    Register::R8D + (native_gpr(insn, i) as u32 - Register::R8 as u32)
+                } else if insn.op_register(i).is_gpr8() {
+                    Register::R8L + (native_gpr(insn, i) as u32 - Register::R8 as u32)
+                } else {
+                    Register::R8W + (native_gpr(insn, i) as u32 - Register::R8 as u32)
                 },
             );
         }
@@ -221,7 +308,7 @@ pub(crate) fn image(insn: &Instruction) -> Result<Vec<u8>, String> {
             emit(Instruction::with2(
                 Code::Mov_rm64_r64,
                 slot(offset_of!(Run, gpr) + i as usize * 8),
-                Register::R8 + i,
+                native_gpr(insn, i),
             ))?;
         }
     }
@@ -243,13 +330,9 @@ pub(crate) fn image(insn: &Instruction) -> Result<Vec<u8>, String> {
         slot(offset_of!(Run, host)),
     ))?;
     if !legacy {
-        for i in 0..16 {
-            emit(Instruction::with2(
-                Code::VEX_Vmovdqu_ymm_ymmm256,
-                Register::YMM0 + i as u32,
-                slot(offset_of!(Run, host_vectors) + i * 32),
-            ))?;
-        }
+        // SysV vector registers are caller-saved. Guest state was captured above;
+        // clear upper halves before returning to baseline Rust/SSE code.
+        emit(Ok(Instruction::with(Code::VEX_Vzeroupper)))?;
     }
     emit(Ok(Instruction::with(Code::Retnq)))?;
     Ok(encoder.take_buffer())
@@ -275,13 +358,7 @@ pub(crate) fn step(
     ip: u64,
     leaf: Option<LeafFn>,
 ) -> Result<(), X86Exception> {
-    // SDM Vol. 2 AVX exception class: #UD controls precede #NM and memory.
-    if !controls_allow(ctx, insn) {
-        return Err(X86Exception::invalid_opcode(ip));
-    }
-    if ctx.cr0 & 8 != 0 {
-        return Err(X86Exception::device_not_available(ip));
-    }
+    check_controls(ctx, insn, ip)?;
     if insn.mnemonic() == Mnemonic::Vmaskmovdqu {
         return crate::context::step_maskmov(ctx, insn, ip);
     }
@@ -296,7 +373,6 @@ pub(crate) fn step(
         working: ctx.fxsave.clone(),
         host: FxsaveArea::default(),
         vectors: std::array::from_fn(|i| vector(ctx, i)),
-        host_vectors: [[0; 32]; 16],
         operand: [0; 32],
         gpr: [0; 4],
         flags: 0,
@@ -351,6 +427,15 @@ pub(crate) fn step(
             {
                 return Err(X86Exception::general_protection(ip, 0));
             }
+            if insn.encoding() == EncodingKind::Legacy
+                && insn
+                    .cpuid_features()
+                    .iter()
+                    .any(|f| matches!(f, CpuidFeature::AES | CpuidFeature::PCLMULQDQ))
+                && va & 15 != 0
+            {
+                return Err(X86Exception::general_protection(ip, 0));
+            }
             let write = info.op_access(i) == OpAccess::Write;
             transfer(
                 ctx,
@@ -359,7 +444,7 @@ pub(crate) fn step(
                 write,
                 false,
                 ip,
-                size <= 8,
+                alignment_check(insn, size),
             )?;
             memory = Some((va, size, write));
         }
@@ -368,7 +453,7 @@ pub(crate) fn step(
     // including exact intermediate products in DPPS/DPPD. A second private
     // evaluation supplies UE when guest UM is unmasked; it publishes no data.
     // Unlike inspecting final lanes, this also detects cancellation to zero.
-    let mut underflow_probe = if original & (1 << 11) == 0 {
+    let mut underflow_probe = if !integer(insn) && original & (1 << 11) == 0 {
         Some(run.clone())
     } else {
         None
@@ -401,10 +486,18 @@ pub(crate) fn step(
         });
     }
     if let Some((va, size, true)) = memory {
-        transfer(ctx, va, &mut run.operand[..size], true, true, ip, size <= 8)?;
+        transfer(
+            ctx,
+            va,
+            &mut run.operand[..size],
+            true,
+            true,
+            ip,
+            alignment_check(insn, size),
+        )?;
     }
     for i in 0..16 {
-        if legacy_feature_mask(insn) != 0 {
+        if insn.encoding() == EncodingKind::Legacy {
             run.vectors[i][..16].copy_from_slice(&run.working.0[160 + i * 16..176 + i * 16]);
         }
         set_vector(ctx, i, &run.vectors[i]);
@@ -437,6 +530,11 @@ pub(crate) fn step(
     ctx.rflags = (ctx.rflags & !flags) | (run.flags & flags);
     ctx.fxsave.0[24..28].copy_from_slice(&mxcsr.to_le_bytes());
     Ok(())
+}
+
+fn alignment_check(insn: &Instruction, size: usize) -> bool {
+    // SDM exception class 11 explicitly suppresses #AC for F16C, including m64.
+    size <= 8 && !insn.cpuid_features().contains(&CpuidFeature::F16C)
 }
 
 fn transfer(
@@ -599,4 +697,57 @@ fn step_gather(ctx: &mut SoftCpuContext, insn: &Instruction, ip: u64) -> Result<
     mask.fill(0);
     set_vector(ctx, mask_reg.number(), &mask);
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_leaf_never_emits_ymm_or_vzeroupper() {
+        for code in [
+            Code::Aesenc_xmm_xmmm128,
+            Code::Aesimc_xmm_xmmm128,
+            Code::Pshufb_xmm_xmmm128,
+            Code::Movbe_r16_m16,
+        ] {
+            let instruction = if code == Code::Movbe_r16_m16 {
+                Instruction::with2(code, Register::AX, MemoryOperand::with_base(Register::RSI))
+            } else {
+                Instruction::with2(code, Register::XMM0, Register::XMM1)
+            }
+            .unwrap();
+            let bytes = image(&instruction).unwrap();
+            for decoded in iced_x86::Decoder::new(64, &bytes, iced_x86::DecoderOptions::NONE) {
+                assert_eq!(
+                    decoded.encoding(),
+                    EncodingKind::Legacy,
+                    "{code:?}: {decoded:?}"
+                );
+                assert!(!decoded.op_register(0).is_ymm());
+            }
+        }
+    }
+
+    #[test]
+    fn native_leaf_returns_with_vzeroupper() {
+        let instruction = Instruction::with3(
+            Code::VEX_Vaddps_xmm_xmm_xmmm128,
+            Register::XMM0,
+            Register::XMM1,
+            Register::XMM2,
+        );
+        let Ok(instruction) = instruction else {
+            panic!("fixture")
+        };
+        let Ok(bytes) = image(&instruction) else {
+            panic!("native leaf unavailable")
+        };
+        let decoded: Vec<_> = iced_x86::Decoder::new(64, &bytes, iced_x86::DecoderOptions::NONE)
+            .into_iter()
+            .collect();
+        assert_eq!(decoded[decoded.len() - 2].mnemonic(), Mnemonic::Vzeroupper);
+        assert_eq!(decoded[decoded.len() - 1].mnemonic(), Mnemonic::Ret);
+    }
 }

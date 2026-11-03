@@ -424,6 +424,7 @@ pub struct SoftCpuContext {
     pub(crate) bmi1: bool,
     pub(crate) lzcnt: bool,
     pub(crate) legacy_features: u32,
+    pub(crate) extended_features: u32,
     pub(crate) fpu: bool,
     pub xcr0: u64,
     pub cr0: u64,
@@ -577,6 +578,7 @@ impl SoftCpuContext {
             bmi1: false,
             lzcnt: false,
             legacy_features: 0,
+            extended_features: 0,
             fpu: false,
             xcr0: 0x3,
             // EM stays clear for native-backed SSE and x87 operations. The
@@ -938,8 +940,7 @@ impl SoftCpuContext {
                 None
             };
             let avx = if crate::avx::needs_leaf(&d.raw)
-                && crate::avx::controls_allow(self, &d.raw)
-                && self.cr0 & 8 == 0
+                && crate::avx::check_controls(self, &d.raw, d.va).is_ok()
             {
                 let key = crate::avx::key(&d.raw)
                     .map_err(|detail| EmitError::EncodeFailed { va: d.va, detail })?;
@@ -2926,7 +2927,11 @@ mod tests {
 
     #[test]
     fn avx_leaf_allocation_is_once_across_repeated_blocks() {
-        let mut cpu = crate::SoftCpu::new(&test_extents()).unwrap();
+        let mut cpu = crate::SoftCpu::with_cpuid_view(
+            &test_extents(),
+            Box::new(crate::GuestCpuidView::default()),
+        )
+        .unwrap();
         cpu.context_mut().xcr0 = 7;
         let mut planned = fp_block();
         planned.insn_bytes[0][..4].copy_from_slice(&[0xc5, 0xf5, 0xfe, 0xc2]);
