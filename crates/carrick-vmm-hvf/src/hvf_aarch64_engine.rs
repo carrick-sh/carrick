@@ -1467,7 +1467,7 @@ impl HvpatchTaskOnlyEngineState {
         apply: impl FnOnce(
             carrick_hal::FrameInventoryCommit<()>,
         ) -> Result<carrick_hal::FrameInventoryRetirementReceipt, TrapError>,
-    ) -> Result<(), TrapError> {
+    ) -> Result<Option<carrick_hal::MmReleaseReceipt>, TrapError> {
         if let Some(parked) = self.parked_task.lock().as_ref() {
             if let Some(reg) = parked.registration.as_ref() {
                 return reg.apply_inventory_retirement(apply);

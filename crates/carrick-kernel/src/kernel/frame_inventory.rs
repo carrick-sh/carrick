@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroU64;
 use std::time::Instant;
 
+use carrick_fatal::carrick_fatal;
 use carrick_guest_mem::Gpa;
 use carrick_hal::{
     FrameEventCapacity, FrameId, FrameInventoryApplyReceipt, FrameInventoryBatch,
@@ -152,25 +153,22 @@ impl carrick_hal::PhysicalFrameInventory for PhysicalInventoryProjection {
     }
     fn retire_mm(
         &self,
-        mm: carrick_hal::MmGeneration,
-    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        let owners: BTreeSet<_> = self
+        owner: carrick_hal::GuestFrameOwner,
+    ) -> Result<FrameInventoryRetirementReceipt, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self
             .inventory
-            .state
-            .lock()
-            .mm_mapping_counts
-            .keys()
-            .filter(|owner| matches!(owner, FrameOwner::GuestMm(guest) if guest.native_mm == mm))
-            .copied()
-            .collect();
-        let mut retired = 0;
-        for owner in owners {
-            retired += self.inventory.retire_mm(&self.ids, owner)?;
-        }
-        Ok(retired)
+            .retire_mm_with_receipt(&self.ids, FrameOwner::GuestMm(owner))?
+            .1)
     }
 }
 impl carrick_hal::FrameCowAuthority for PhysicalInventoryBinding {
+    fn prepare_return(
+        &self,
+        rows: &[carrick_hal::ExactReturnMappingRow],
+    ) -> Result<carrick_hal::PreparedReturn, carrick_hal::PrepareReturnError> {
+        self.inventory.prepare_return(&self.ids, self.mm, rows)
+    }
+
     fn quiesce(
         &self,
     ) -> Result<Box<dyn carrick_hal::FrameCowQuiesce>, Box<dyn std::error::Error + Send + Sync>>
@@ -298,6 +296,9 @@ impl ProvenanceEntropyBatch {
 #[derive(Debug, Default, Eq, PartialEq)]
 struct InventoryState {
     revision: u64,
+    return_claims: u64,
+    abandoned_returns: u64,
+    quarantined_returns: u64,
     reservations: BTreeMap<KernelTransactionId, ReservationRecord>,
     frames: BTreeMap<FrameId, FrameEntry>,
     mappings: BTreeMap<MappingId, MappingEntry>,
@@ -342,6 +343,16 @@ struct MappingEntry {
 enum MappingState {
     Prepared(KernelTransactionId),
     Published,
+    Retiring(KernelTransactionId),
+}
+
+impl MappingState {
+    fn is_published(self) -> bool {
+        match self {
+            Self::Published => true,
+            Self::Prepared(_) | Self::Retiring(_) => false,
+        }
+    }
 }
 
 /// Transaction-local copy-on-write view. Only touched mappings and frames are
@@ -583,10 +594,12 @@ impl FrameInventoryAuthority {
         }
         let mm = FrameOwner::from_receipt_owner(receipt.owner());
         let mut state = self.state.lock();
-        let next_revision = state
+        state
             .revision
-            .checked_add(1)
+            .checked_add(state.return_claims)
+            .and_then(|reserved| reserved.checked_add(1))
             .ok_or(FrameInventoryError::RevisionExhausted)?;
+        let next_revision = state.revision + 1;
         let mut unique = BTreeSet::new();
         for &(mapping, frame) in receipt.mapping_set() {
             if !unique.insert(mapping) {
@@ -596,7 +609,7 @@ impl FrameInventoryAuthority {
                 .mappings
                 .get(&mapping)
                 .ok_or(FrameInventoryError::RollbackReceiptMismatch(mapping))?;
-            if entry.state != MappingState::Published || entry.mm != mm || entry.frame != frame {
+            if !entry.state.is_published() || entry.mm != mm || entry.frame != frame {
                 return Err(FrameInventoryError::RollbackReceiptMismatch(mapping));
             }
             let frame_entry = state
@@ -639,7 +652,7 @@ impl FrameInventoryAuthority {
     /// Returns the number of mappings unmapped; the receipt must prove the
     /// MM empty at the produced revision.
     ///
-    /// Every committed row is `Published`: `apply_inner` refuses a batch
+    /// Return claims refuse teardown with `RetryPending`. Otherwise every committed row is `Published`: `apply_inner` refuses a batch
     /// that leaves a `Prepared` mapping (`UnpublishedMapping`) and applies
     /// nothing, so the scan takes every row of `mm` and an empty receipt
     /// follows unless a concurrent commit maps into `mm`. A fork child is
@@ -650,11 +663,55 @@ impl FrameInventoryAuthority {
         ids: &ObjectIdRegistry,
         mm: impl Into<FrameOwner>,
     ) -> Result<usize, FrameInventoryRetireMmError> {
+        self.retire_mm_with_receipt(ids, mm).map(|(count, _)| count)
+    }
+
+    pub fn retire_mm_with_receipt(
+        &self,
+        ids: &ObjectIdRegistry,
+        mm: impl Into<FrameOwner>,
+    ) -> Result<(usize, FrameInventoryRetirementReceipt), FrameInventoryRetireMmError> {
         let mm = mm.into();
         let rows: Vec<(MappingId, FrameId, MappingGeneration)> = {
             let state = self.state.lock();
             if state.mm_mapping_counts.get(&mm).copied().unwrap_or(0) == 0 {
-                return Ok(0);
+                drop(state);
+                let reservation = self.reserve(
+                    ids,
+                    0,
+                    0,
+                    FrameEventCapacity::for_event_count(1)
+                        .map_err(FrameInventoryReserveError::from)?,
+                )?;
+                let transaction = reservation.transaction();
+                let mut state = self.state.lock();
+                if state.mm_mapping_counts.contains_key(&mm) {
+                    state.reservations.remove(&transaction);
+                    return Err(FrameInventoryRetireMmError::RetryPending);
+                }
+                let record = state
+                    .reservations
+                    .remove(&transaction)
+                    .ok_or(FrameInventoryReserveError::DuplicateTransaction)?;
+                let apply = FrameInventoryApplyReceipt::from_kernel_authority(
+                    self.origin.clone(),
+                    record.provenance,
+                    transaction,
+                    mm.receipt_owner(),
+                    state.revision,
+                    Vec::new(),
+                );
+                return Ok((
+                    0,
+                    FrameInventoryRetirementReceipt::from_kernel_authority(apply, true),
+                ));
+            }
+            if state
+                .mappings
+                .values()
+                .any(|entry| entry.mm == mm && matches!(entry.state, MappingState::Retiring(_)))
+            {
+                return Err(FrameInventoryRetireMmError::RetryPending);
             }
             state
                 .mappings
@@ -694,7 +751,7 @@ impl FrameInventoryAuthority {
         if !receipt.mm_empty_at_revision() {
             return Err(FrameInventoryRetireMmError::NotEmpty);
         }
-        Ok(rows.len())
+        Ok((rows.len(), receipt))
     }
 
     pub fn apply_retirement_with_receipt<T>(
@@ -768,10 +825,12 @@ impl FrameInventoryAuthority {
         if batch.events().is_empty() {
             return Err(FrameInventoryError::EmptyBatch);
         }
-        let next_revision = state
+        state
             .revision
-            .checked_add(1)
+            .checked_add(state.return_claims)
+            .and_then(|reserved| reserved.checked_add(1))
             .ok_or(FrameInventoryError::RevisionExhausted)?;
+        let next_revision = state.revision + 1;
         let mut candidate = InventoryOverlay::new(&state);
         for (index, event) in batch.events().iter().copied().enumerate() {
             if fail_before_event == Some(index) {
@@ -792,7 +851,7 @@ impl FrameInventoryAuthority {
             // overlay), exactly, in this mm.
             let exact = matches!(
                 candidate.mappings.get(&grant.mapping),
-                Some(Some(entry)) if entry.state == MappingState::Published
+                Some(Some(entry)) if entry.state.is_published()
                     && entry.mm == mm
                     && entry.frame == grant.frame
                     && entry.gpa == grant.gpa
@@ -855,7 +914,7 @@ impl FrameInventoryAuthority {
         let entry = state
             .mappings
             .get(&mapping)
-            .filter(|entry| entry.mm == mm && entry.state == MappingState::Published)?;
+            .filter(|entry| entry.mm == mm && entry.state.is_published())?;
         Some(MappingRow {
             mapping,
             frame: entry.frame,
@@ -912,7 +971,7 @@ impl FrameInventoryAuthority {
             .mappings
             .get(&mapping)
             .filter(|entry| {
-                entry.state == MappingState::Published
+                entry.state.is_published()
                     && entry.mm == mm
                     && entry.frame == frame
                     && entry.gpa == gpa
@@ -982,7 +1041,7 @@ impl FrameInventoryAuthority {
             .iter()
             .map(|&(target_map, frame, gpa, length)| {
                 state.mappings.get(&target_map).is_some_and(|entry| {
-                    entry.state == MappingState::Published
+                    entry.state.is_published()
                         && entry.mm == mm
                         && entry.frame == frame
                         && entry.gpa == gpa
@@ -1307,7 +1366,7 @@ fn live_mapping_mut<'a>(
             attempted: mm,
         });
     }
-    if entry.state != MappingState::Published {
+    if !entry.state.is_published() {
         return Err(FrameInventoryError::MappingNotPublished(mapping));
     }
     Ok(entry)
@@ -1361,7 +1420,14 @@ fn snapshot_state(state: &InventoryState, mm_filter: Option<FrameOwner>) -> Fram
     }
     let mut mappings = Vec::with_capacity(state.mappings.len());
     for (mapping, entry) in &state.mappings {
-        if entry.state != MappingState::Published || mm_filter.is_some_and(|mm| entry.mm != mm) {
+        // Claims retain physical ownership until apply. Diagnostic snapshots
+        // include those rows, while mutation/authentication queries require
+        // Published and therefore refuse a claimed mapping.
+        let inventoried = match entry.state {
+            MappingState::Published | MappingState::Retiring(_) => true,
+            MappingState::Prepared(_) => false,
+        };
+        if !inventoried || mm_filter.is_some_and(|mm| entry.mm != mm) {
             continue;
         }
         let row = MappingRow {
@@ -1446,6 +1512,8 @@ fn prepare_reservation(
 pub enum FrameInventoryRetireMmError {
     #[error("MM retirement event count overflows")]
     Capacity,
+    #[error("MM has an outstanding return claim; retry after its release")]
+    RetryPending,
     #[error("MM retirement left mappings live in the MM")]
     NotEmpty,
     #[error(transparent)]
@@ -1591,7 +1659,7 @@ impl FrameInventoryAuthority {
             .mappings
             .get(&mapping)
             .is_some_and(|entry| {
-                entry.state == MappingState::Published
+                entry.state.is_published()
                     && entry.mm == mm
                     && entry.frame == frame
                     && entry.generation == generation
@@ -3167,7 +3235,7 @@ mod tests {
                     |mm| carrick_hal::fork_stock::SlotAbsence::scan(mm, []),
                     |_| true,
                     |life| window.clear(life),
-                    |absence| release_child_mm(&*inventory, &residency, absence.mm()),
+                    |absence| release_child_mm(&*inventory, &residency, absence).is_some(),
                 )
                 .unwrap_or_else(|error| panic!("cycle {cycle}: {error:?}"));
             assert_eq!(returned, 1, "cycle {cycle}");
@@ -4641,5 +4709,383 @@ mod inventory_origin_tests {
         assert_eq!(second.snapshot().mappings.len(), 1);
         first.rollback_unpublished_apply(&first_receipt).unwrap();
         second.rollback_unpublished_apply(&second_receipt).unwrap();
+    }
+}
+
+struct ClaimedReturn {
+    inventory: std::sync::Arc<FrameInventoryAuthority>,
+    mm: FrameOwner,
+    transaction: KernelTransactionId,
+    rows: Vec<carrick_hal::ExactReturnMappingRow>,
+    last_unmapped: Vec<FrameId>,
+}
+impl ClaimedReturn {
+    fn restore(self: Box<Self>, abandoned: bool) {
+        let mut state = self.inventory.state.lock();
+        for row in &self.rows {
+            match state.mappings.get_mut(&row.mapping) {
+                Some(entry) if entry.state == MappingState::Retiring(self.transaction) => {
+                    entry.state = MappingState::Published
+                }
+                _ => carrick_fatal!(
+                    "kernel::frame_inventory",
+                    "prepared return abort lost its claimed row"
+                ),
+            }
+        }
+        state.return_claims -= 1;
+        if abandoned {
+            state.abandoned_returns += 1;
+        }
+    }
+}
+impl carrick_hal::ReturnClaim for ClaimedReturn {
+    fn owner(&self) -> FrameInventoryReceiptOwner {
+        self.mm.receipt_owner()
+    }
+    fn abort(self: Box<Self>) {
+        self.restore(false);
+    }
+    fn abandon(self: Box<Self>) {
+        self.restore(true);
+    }
+    fn retain_quarantined(self: Box<Self>) {
+        // Retiring rows and their reserved revision remain owned forever. No
+        // other entry point can mutate them; quarantine is performed outside
+        // this leaf lock by the required exact-MM callback.
+        self.inventory.state.lock().quarantined_returns += 1;
+    }
+    fn apply(self: Box<Self>) -> carrick_hal::AppliedReturn {
+        let mut last_unmapped = self.last_unmapped;
+        let mut state = self.inventory.state.lock();
+        for row in &self.rows {
+            match state.mappings.get(&row.mapping) {
+                Some(entry)
+                    if entry.state == MappingState::Retiring(self.transaction)
+                        && entry.mm == self.mm
+                        && entry.frame == row.frame
+                        && entry.generation == row.generation => {}
+                _ => carrick_fatal!(
+                    "kernel::frame_inventory",
+                    "prepared return lost its exact claimed row"
+                ),
+            }
+            state.mappings.remove(&row.mapping);
+            decrement_mm_mapping_count(&mut state.mm_mapping_counts, self.mm);
+            if let Some(frame) = state.frames.get_mut(&row.frame) {
+                if frame.references.unmap().is_err() {
+                    carrick_fatal!(
+                        "kernel::frame_inventory",
+                        "prepared return reference count underflow"
+                    );
+                }
+                if frame.references.count() == 0 {
+                    state.frames.remove(&row.frame);
+                    last_unmapped.push(row.frame);
+                } else {
+                    let _ = frame.references.request_retirement();
+                }
+            } else {
+                carrick_fatal!("kernel::frame_inventory", "prepared return lost its frame");
+            }
+        }
+        state.return_claims -= 1;
+        state.revision += 1;
+        carrick_hal::AppliedReturn {
+            revision: state.revision,
+            last_unmapped,
+            mm_empty_at_revision: !state.mm_mapping_counts.contains_key(&self.mm),
+        }
+    }
+}
+impl FrameInventoryAuthority {
+    /// Claim at most 512 4-KiB pages without retaining the inventory lock.
+    /// Lock audit: ID allocation happens before the leaf lock; claim, apply,
+    /// and restore touch only inventory-owned maps and arithmetic. No root,
+    /// fork-stock, stage-2, owner-directory, callback or pin wait runs inside.
+    pub fn prepare_return(
+        self: &std::sync::Arc<Self>,
+        ids: &ObjectIdRegistry,
+        mm: impl Into<FrameOwner>,
+        rows: &[carrick_hal::ExactReturnMappingRow],
+    ) -> Result<carrick_hal::PreparedReturn, carrick_hal::PrepareReturnError> {
+        use carrick_hal::PrepareReturnError as Error;
+        let bytes = rows
+            .iter()
+            .try_fold(0u64, |sum, row| sum.checked_add(row.length.raw()));
+        if rows.is_empty() || rows.len() > 512 || bytes.is_none_or(|bytes| bytes > 512 * 4096) {
+            return Err(Error::Capacity);
+        }
+        let transaction = ids.transaction_id().map_err(|_| Error::Capacity)?;
+        let mm = mm.into();
+        let mut retained_rows = Vec::new();
+        retained_rows
+            .try_reserve_exact(rows.len())
+            .map_err(|_| Error::Capacity)?;
+        retained_rows.extend_from_slice(rows);
+        let rows = retained_rows;
+        let mut last_unmapped = Vec::new();
+        last_unmapped
+            .try_reserve_exact(rows.len())
+            .map_err(|_| Error::Capacity)?;
+        let mut state = self.state.lock();
+        state
+            .revision
+            .checked_add(state.return_claims)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(Error::RevisionExhausted)?;
+        let mut unique = BTreeSet::new();
+        for row in &rows {
+            let entry = state.mappings.get(&row.mapping).ok_or(Error::RowMismatch)?;
+            let published = match entry.state {
+                MappingState::Published => true,
+                MappingState::Prepared(_) | MappingState::Retiring(_) => false,
+            };
+            if !unique.insert(row.mapping)
+                || !published
+                || entry.mm != mm
+                || entry.frame != row.frame
+                || entry.generation != row.generation
+                || entry.gpa != row.gpa
+                || entry.length != row.length
+                || row.generation.raw() == u64::MAX
+            {
+                return Err(Error::RowMismatch);
+            }
+        }
+        for row in &rows {
+            if let Some(entry) = state.mappings.get_mut(&row.mapping) {
+                entry.state = MappingState::Retiring(transaction);
+            }
+        }
+        state.return_claims += 1;
+        drop(state);
+        Ok(carrick_hal::PreparedReturn::from_inventory(Box::new(
+            ClaimedReturn {
+                inventory: self.clone(),
+                mm,
+                transaction,
+                rows,
+                last_unmapped,
+            },
+        )))
+    }
+}
+
+#[cfg(test)]
+mod prepared_return_tests {
+    use super::*;
+    use std::sync::Arc;
+    fn fixture() -> (
+        Arc<FrameInventoryAuthority>,
+        ObjectIdRegistry,
+        FrameOwner,
+        carrick_hal::ExactReturnMappingRow,
+    ) {
+        let inventory = Arc::new(FrameInventoryAuthority::new());
+        let ids = ObjectIdRegistry::new();
+        let owner = FrameOwner::HostMm(MmId::from_raw_u64(42).unwrap());
+        let mut reservation = inventory
+            .reserve(&ids, 1, 1, FrameEventCapacity::for_event_count(2).unwrap())
+            .unwrap();
+        let transaction = reservation.transaction();
+        let row = carrick_hal::ExactReturnMappingRow {
+            frame: reservation.claim_frame().unwrap(),
+            mapping: reservation.claim_mapping().unwrap(),
+            generation: MappingGeneration::from_backend_counter(NonZeroU64::MIN),
+            gpa: Gpa::new(4096),
+            length: FrameLength::from_mapping_extent(NonZeroU64::new(4096).unwrap()),
+        };
+        reservation
+            .push(FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame: row.frame,
+                mapping: row.mapping,
+                generation: row.generation,
+                gpa: row.gpa,
+                length: row.length,
+                permissions: MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping: row.mapping,
+                generation: row.generation,
+            })
+            .unwrap();
+        inventory.apply(owner, reservation.commit(())).unwrap();
+        (inventory, ids, owner, row)
+    }
+    #[test]
+    fn return_claim_blocks_teardown_aborts_and_retries() {
+        let (inventory, ids, owner, row) = fixture();
+        let claim = inventory.prepare_return(&ids, owner, &[row]).unwrap();
+        assert_eq!(
+            inventory.retire_mm(&ids, owner),
+            Err(FrameInventoryRetireMmError::RetryPending)
+        );
+        assert!(inventory.prepare_return(&ids, owner, &[row]).is_err());
+        claim.abort();
+        let applied = inventory
+            .prepare_return(&ids, owner, &[row])
+            .unwrap()
+            .apply();
+        assert!(applied.mm_empty_at_revision);
+        assert_eq!(applied.last_unmapped, vec![row.frame]);
+        assert_eq!(inventory.retire_mm(&ids, owner).unwrap(), 0);
+    }
+    #[test]
+    fn sibling_unmaps_shared_frame_between_prepare_and_apply() {
+        let (inventory, ids, owner, row) = fixture();
+        let sibling = FrameOwner::HostMm(MmId::from_raw_u64(43).unwrap());
+        let mut reservation = inventory
+            .reserve(&ids, 0, 1, FrameEventCapacity::for_event_count(2).unwrap())
+            .unwrap();
+        let transaction = reservation.transaction();
+        let mapping = reservation.claim_mapping().unwrap();
+        reservation
+            .push(FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame: row.frame,
+                mapping,
+                generation: row.generation,
+                gpa: row.gpa,
+                length: row.length,
+                permissions: MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation: row.generation,
+            })
+            .unwrap();
+        inventory.apply(sibling, reservation.commit(())).unwrap();
+        let claim = inventory.prepare_return(&ids, owner, &[row]).unwrap();
+        assert_eq!(inventory.retire_mm(&ids, sibling).unwrap(), 1);
+        assert_eq!(inventory.frame_mapping_count(row.frame), Some(1));
+        assert_eq!(claim.apply().last_unmapped, vec![row.frame]);
+    }
+    #[test]
+    fn shared_frame_stays_live_after_one_return() {
+        let (inventory, ids, owner, row) = fixture();
+        let sibling = FrameOwner::HostMm(MmId::from_raw_u64(43).unwrap());
+        let mut reservation = inventory
+            .reserve(&ids, 0, 1, FrameEventCapacity::for_event_count(2).unwrap())
+            .unwrap();
+        let transaction = reservation.transaction();
+        let mapping = reservation.claim_mapping().unwrap();
+        reservation
+            .push(FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame: row.frame,
+                mapping,
+                generation: row.generation,
+                gpa: row.gpa,
+                length: row.length,
+                permissions: MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation: row.generation,
+            })
+            .unwrap();
+        inventory.apply(sibling, reservation.commit(())).unwrap();
+        assert!(
+            inventory
+                .prepare_return(&ids, owner, &[row])
+                .unwrap()
+                .apply()
+                .last_unmapped
+                .is_empty()
+        );
+        assert!(inventory.live_mapping_row(sibling, mapping).is_some());
+        inventory.retire_mm(&ids, sibling).unwrap();
+        assert_eq!(inventory.frame_mapping_count(row.frame), None);
+    }
+    #[test]
+    fn dropped_return_restores_exact_row_and_counts_abandonment() {
+        let (inventory, ids, owner, row) = fixture();
+        drop(inventory.prepare_return(&ids, owner, &[row]).unwrap());
+        assert_eq!(inventory.state.lock().abandoned_returns, 1);
+        assert!(inventory.live_mapping_row(owner, row.mapping).is_some());
+        let stale = carrick_hal::ExactReturnMappingRow {
+            generation: MappingGeneration::from_backend_counter(NonZeroU64::new(2).unwrap()),
+            ..row
+        };
+        assert!(inventory.prepare_return(&ids, owner, &[stale]).is_err());
+        assert!(
+            inventory
+                .prepare_return(
+                    &ids,
+                    FrameOwner::HostMm(MmId::from_raw_u64(43).unwrap()),
+                    &[row]
+                )
+                .is_err()
+        );
+    }
+    #[test]
+    fn return_claim_reserves_revision_headroom() {
+        let (inventory, ids, owner, row) = fixture();
+        inventory.state.lock().revision = u64::MAX - 1;
+        let claim = inventory.prepare_return(&ids, owner, &[row]).unwrap();
+        assert_eq!(inventory.state.lock().return_claims, 1);
+        let mut reservation = inventory
+            .reserve(&ids, 0, 0, FrameEventCapacity::for_event_count(1).unwrap())
+            .unwrap();
+        let transaction = reservation.transaction();
+        reservation
+            .push(FrameInventoryEvent::UnmapMapping {
+                transaction,
+                mapping: row.mapping,
+                generation: MappingGeneration::from_backend_counter(NonZeroU64::new(2).unwrap()),
+            })
+            .unwrap();
+        assert_eq!(
+            inventory.apply(owner, reservation.commit(())).unwrap_err(),
+            FrameInventoryError::RevisionExhausted
+        );
+        claim.apply();
+        assert_eq!(inventory.state.lock().revision, u64::MAX);
+    }
+    #[test]
+    fn cleared_drop_quarantines_exact_owner_and_retains_claim() {
+        struct Quarantine(std::sync::Mutex<Option<FrameInventoryReceiptOwner>>);
+        impl carrick_hal::ReturnQuarantine for Quarantine {
+            fn quarantine(&self, owner: FrameInventoryReceiptOwner) {
+                *self.0.lock().unwrap() = Some(owner);
+            }
+        }
+        let (inventory, ids, owner, row) = fixture();
+        let quarantine = Arc::new(Quarantine(std::sync::Mutex::new(None)));
+        drop(
+            inventory
+                .prepare_return(&ids, owner, &[row])
+                .unwrap()
+                .stage1_cleared(quarantine.clone()),
+        );
+        assert_eq!(*quarantine.0.lock().unwrap(), Some(owner.receipt_owner()));
+        assert_eq!(inventory.state.lock().quarantined_returns, 1);
+        assert_eq!(
+            inventory.retire_mm(&ids, owner),
+            Err(FrameInventoryRetireMmError::RetryPending)
+        );
     }
 }

@@ -2585,6 +2585,17 @@ pub struct GuestFrameOwner {
     pub root_generation: carrick_guest_arch::ContextGeneration,
 }
 
+impl From<carrick_el1_abi::El1MmHandle> for GuestFrameOwner {
+    fn from(owner: carrick_el1_abi::El1MmHandle) -> Self {
+        Self {
+            native_mm: carrick_guest_arch::MmGeneration::new(
+                std::num::NonZeroU64::new(owner.mm().raw()).expect("admitted nonzero MM"),
+            ),
+            root_generation: carrick_guest_arch::ContextGeneration::new(owner.incarnation()),
+        }
+    }
+}
+
 impl From<carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>> for GuestFrameOwner {
     fn from(context: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>) -> Self {
         Self {
@@ -2611,12 +2622,13 @@ pub trait PhysicalFrameInventory: Send + Sync {
     fn allocate_backing_ids(
         &self,
     ) -> Result<(crate::FrameId, crate::MappingId), Box<dyn std::error::Error + Send + Sync>>;
-    /// Unmap every published mapping of a retired MM (a fork child leaving
-    /// quarantine), retiring frames no other MM maps. Returns the count.
+    /// Retire one exact root incarnation and return the inventory owner's
+    /// empty-MM proof. Residency retirement remains with the release owner.
     fn retire_mm(
         &self,
-        mm: carrick_guest_arch::MmGeneration,
-    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>>;
+        owner: GuestFrameOwner,
+    ) -> Result<crate::FrameInventoryRetirementReceipt, Box<dyn std::error::Error + Send + Sync>>;
+
 }
 
 /// An unpublished apply retains the exact authority that issued its receipt.
@@ -2664,6 +2676,14 @@ pub struct PhysicalMappingRow {
 }
 
 pub trait FrameCowAuthority: Send + Sync {
+    /// Claim exact published rows before clearing their retired stage-1 leaves.
+    fn prepare_return(
+        &self,
+        _rows: &[crate::prepared_return::ExactReturnMappingRow],
+    ) -> Result<crate::prepared_return::PreparedReturn, crate::prepared_return::PrepareReturnError> {
+        Err(crate::prepared_return::PrepareReturnError::Unsupported)
+    }
+
     /// Bounded byte service for an owner-selected retained host source. No
     /// guest VA or permission decision crosses this physical boundary.
     /// Authenticate physical handle custody without consulting mapping policy.

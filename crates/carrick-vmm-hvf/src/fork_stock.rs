@@ -13,6 +13,7 @@ use carrick_hal::fork_stock::{ForkStock, ForkTableLedger};
 #[derive(Default)]
 pub(crate) struct NativeChildPhysical {
     pub inherited: Vec<crate::trap::ForkPhysicalRetention>,
+    pub(crate) inherited_by_frame: std::collections::BTreeMap<(u64, u64), Vec<usize>>,
     pub sources: carrick_hal::fork_stock::ForkHostBackingCustody,
     pub supplied: Option<
         carrick_hal::physical_grants::NativePhysicalGrants<std::sync::Arc<NativeFrameBacking>>,
@@ -49,6 +50,15 @@ impl carrick_hal::physical_grants::NativePreparedSupplyCustody for NativeChildPh
     }
 }
 impl NativeChildPhysical {
+    /// Settlement removes inventory rows first, then releases the exact
+    /// inherited incarnation. Supplied grants retain their own typed owner.
+    pub(crate) fn release_inherited_frame(&mut self, ipa: u64, generation: u64) {
+        if let Some(indices) = self.inherited_by_frame.remove(&(ipa, generation)) {
+            for index in indices {
+                self.inherited[index].release_frame(ipa, generation);
+            }
+        }
+    }
     pub fn new(mut inherited: Vec<crate::trap::ForkPhysicalRetention>) -> Self {
         // Keep the physical retentions themselves ordered, rather than a
         // second VA-to-output authority. First touch finds one covering frame
@@ -57,6 +67,12 @@ impl NativeChildPhysical {
             carrick_el1_abi::PortalForkCustody::Frame { va, .. } => va,
             _ => u64::MAX,
         });
+        let mut inherited_by_frame: std::collections::BTreeMap<_, Vec<_>> = Default::default();
+        for (index, retention) in inherited.iter().enumerate() {
+            for key in retention.frame_keys() {
+                inherited_by_frame.entry(key).or_default().push(index);
+            }
+        }
         let mut sources = carrick_hal::fork_stock::ForkHostBackingCustody::default();
         for row in &inherited {
             if let Some(source) = row.retained_host_backing() {
@@ -65,6 +81,7 @@ impl NativeChildPhysical {
         }
         Self {
             inherited,
+            inherited_by_frame,
             sources,
             ..Default::default()
         }

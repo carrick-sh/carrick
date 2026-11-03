@@ -2394,9 +2394,9 @@ impl crate::PhysicalFrameInventory for DummyInventory {
 
     fn retire_mm(
         &self,
-        _mm: carrick_guest_arch::MmGeneration,
-    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(0)
+        _mm: crate::GuestFrameOwner,
+    ) -> Result<crate::FrameInventoryRetirementReceipt, Box<dyn std::error::Error + Send + Sync>> {
+        Err("unused in test".into())
     }
 }
 

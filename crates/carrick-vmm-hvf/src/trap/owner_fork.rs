@@ -25,8 +25,10 @@ impl ForkPhysicalCustody {
 /// No host pointer can outlive its source allocation through this receipt.
 pub struct ForkPhysicalRetention {
     selected: PortalForkCustody,
-    _frames: Vec<(CarrierStage2Pin, Arc<GlobalFrameSharedMapping>)>,
-    _native_owners: Vec<Arc<crate::fork_stock::NativeFrameBacking>>,
+    _frames:
+        std::collections::BTreeMap<(u64, u64), (CarrierStage2Pin, Arc<GlobalFrameSharedMapping>)>,
+    _native_owners:
+        std::collections::BTreeMap<(u64, u64), Arc<crate::fork_stock::NativeFrameBacking>>,
     source: Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>,
 }
 impl core::fmt::Debug for ForkPhysicalRetention {
@@ -42,6 +44,16 @@ impl ForkPhysicalRetention {
         &self,
     ) -> Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>> {
         self.source.clone()
+    }
+    /// Drop only this MM's custody of one exact physical incarnation.
+    /// HostMm frames remain owned by GlobalFrameHostOwner's inventory-gated
+    /// retirement; a child's pin is never the root's retirement authority.
+    pub(crate) fn frame_keys(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self._frames.keys().copied()
+    }
+    pub(crate) fn release_frame(&mut self, ipa: u64, generation: u64) {
+        self._frames.remove(&(ipa, generation));
+        self._native_owners.remove(&(ipa, generation));
     }
     pub fn selected(&self) -> PortalForkCustody {
         self.selected
@@ -128,8 +140,8 @@ impl ForkPhysicalCustody {
             return Ok(None);
         };
         let mut cursor = ipa;
-        let mut frames = Vec::new();
-        let mut native_owners = Vec::new();
+        let mut frames = std::collections::BTreeMap::new();
+        let mut native_owners = std::collections::BTreeMap::new();
         while cursor < end {
             let Some((pin, mapping, record)) = self.retain_extent(cursor, 1)? else {
                 return Ok(None);
@@ -145,10 +157,16 @@ impl ForkPhysicalCustody {
                     .get(&(record.ipa, logical.generation))
                     .and_then(std::sync::Weak::upgrade)
             {
-                native_owners.push(owner);
+                native_owners.insert((record.ipa, logical.generation), owner);
             }
             cursor = bound.min(end);
-            frames.push((pin, mapping));
+            frames.insert(
+                (
+                    record.ipa,
+                    record.logical_owner.map_or(0, |owner| owner.generation),
+                ),
+                (pin, mapping),
+            );
         }
         Ok(Some(ForkPhysicalRetention {
             selected: PortalForkCustody::Frame {
@@ -179,8 +197,8 @@ impl ForkCustody for ForkPhysicalCustody {
             )
             .map(|source| ForkPhysicalRetention {
                 selected,
-                _frames: Vec::new(),
-                _native_owners: Vec::new(),
+                _frames: Default::default(),
+                _native_owners: Default::default(),
                 source: Some(source),
             })),
             PortalForkCustody::Frame { ipa, len, .. } => {
@@ -188,8 +206,8 @@ impl ForkCustody for ForkPhysicalCustody {
                     return Ok(None);
                 };
                 let mut cursor = ipa;
-                let mut frames = Vec::new();
-                let mut native_owners = Vec::new();
+                let mut frames = std::collections::BTreeMap::new();
+                let mut native_owners = std::collections::BTreeMap::new();
                 while cursor < end {
                     let Some((pin, mapping, record)) = self.retain_extent(cursor, 1)? else {
                         return Ok(None);
@@ -205,10 +223,16 @@ impl ForkCustody for ForkPhysicalCustody {
                             .get(&(record.ipa, logical.generation))
                             .and_then(std::sync::Weak::upgrade)
                     {
-                        native_owners.push(owner);
+                        native_owners.insert((record.ipa, logical.generation), owner);
                     }
                     cursor = bound.min(end);
-                    frames.push((pin, mapping));
+                    frames.insert(
+                        (
+                            record.ipa,
+                            record.logical_owner.map_or(0, |owner| owner.generation),
+                        ),
+                        (pin, mapping),
+                    );
                 }
                 Ok(Some(ForkPhysicalRetention {
                     selected,
@@ -288,11 +312,29 @@ impl ForkCustody for ForkPhysicalCustody {
                 Ok(Some(ForkPhysicalRetention {
                     selected,
                     source: None,
-                    _native_owners: Vec::new(),
-                    _frames: vec![
-                        (source_pin, source_mapping),
-                        (destination_pin, destination_mapping),
-                    ],
+                    _native_owners: Default::default(),
+                    _frames: [
+                        (
+                            (
+                                source_record.ipa,
+                                source_record
+                                    .logical_owner
+                                    .map_or(0, |owner| owner.generation),
+                            ),
+                            (source_pin, source_mapping),
+                        ),
+                        (
+                            (
+                                destination_record.ipa,
+                                destination_record
+                                    .logical_owner
+                                    .map_or(0, |owner| owner.generation),
+                            ),
+                            (destination_pin, destination_mapping),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
                 }))
             }
         }
@@ -1055,7 +1097,7 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        let destination = &retained._frames[1].1;
+        let destination = &retained._frames.values().nth(1).unwrap().1;
         // SAFETY: the receipt pins the copied destination extent.
         assert_eq!(unsafe { *destination.host_base() }, 0x53);
         assert_eq!(custody.publish_user_executable(
@@ -1117,8 +1159,8 @@ mod tests {
         assert_eq!(b._frames.len(), 1);
         // SAFETY: each exact record pin keeps its allocation alive.
         unsafe {
-            assert_eq!(*a._frames[0].1.host_base(), 0x41);
-            assert_eq!(*b._frames[0].1.host_base(), 0x42);
+            assert_eq!(*a._frames.values().next().unwrap().1.host_base(), 0x41);
+            assert_eq!(*b._frames.values().next().unwrap().1.host_base(), 0x42);
         }
         // A block receipt spans physical records; custody follows records,
         // rather than assuming one allocation for one owner-selected leaf.

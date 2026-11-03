@@ -413,6 +413,17 @@ impl InventoryRetirement for AlreadyRetiredInventory {
         if self.authority.live_mapping_row(mapping).is_some() {
             return Err(error("retired child memslot frame is still mapped"));
         }
+        let frame = carrick_hal::FrameId::from_kernel_allocation(identity.frame_id);
+        if self
+            .authority
+            .frame_mapping_count(frame)
+            .map_err(|reason| error(format!("physical retirement inventory gate: {reason}")))?
+            .is_some_and(|count| count != 0)
+        {
+            return Err(error(
+                "retired child memslot frame has another live inventory row",
+            ));
+        }
         Ok(())
     }
     fn rollback(&mut self) -> Result<(), MemoryError> {
@@ -728,6 +739,24 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                 carrick_hal::MappingId::from_kernel_allocation(slot.backing.identity.mapping_id);
             if authority.live_mapping_row(mapping).is_some() {
                 return Err(error("retired child memslot frame is still mapped"));
+            }
+            // Check the frame population across all MMs before deleting any
+            // memslot. A dead local MappingId alone proves no physical release.
+            for identity in
+                core::iter::once(&slot.backing.identity).chain(slot.frame_identities.values())
+            {
+                let frame = carrick_hal::FrameId::from_kernel_allocation(identity.frame_id);
+                if authority
+                    .frame_mapping_count(frame)
+                    .map_err(|reason| {
+                        error(format!("physical retirement inventory gate: {reason}"))
+                    })?
+                    .is_some_and(|count| count != 0)
+                {
+                    return Err(error(
+                        "retired child memslot frame has another live inventory row",
+                    ));
+                }
             }
             private.push(slot.handle);
         }

@@ -5,8 +5,9 @@ pub use carrick_personality_linux::mm::LinuxReservationLayout as Layout;
 pub use carrick_personality_linux::mm::LinuxReservationLayout;
 use carrick_personality_linux::mm::LinuxReservationPolicy;
 pub use owner::{
-    Charges, DEFERRED_RETURNS, Decision, DeferredReturn, HOST_RESERVE, Mapping, MoveTarget,
-    NoRootWait, Placement, Refusal, ReservationFaultPlan, ReturnSlot, RootHolder, RootWait,
+    Charges, DEFERRED_RETURNS, Decision, DeferredReturn, HOST_RESERVE, JournalIdentity,
+    JournalRelease, Mapping, MoveTarget, NoRootWait, Placement, Refusal, ReservationFaultPlan,
+    RetiredJournal, RetiredJournalJoin, ReturnSlot, RootHolder, RootWait,
 };
 pub struct NativeReservationGeometry;
 impl owner::ReservationGeometry for NativeReservationGeometry {

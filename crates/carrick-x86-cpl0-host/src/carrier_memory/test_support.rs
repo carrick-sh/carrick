@@ -1340,7 +1340,104 @@ pub fn refused_retire_child_mutates_nothing_and_its_retry_completes(_make: fn() 
     // Once the inventory side releases the MM, the same call completes.
     fixture
         .inventory()
-        .retire_mm(MmGeneration::new(fixture.key(2)))
+        .retire_mm(fixture.context(2).into())
+        .unwrap();
+    let retired = fixture.retire(2).unwrap();
+    assert_eq!(
+        retired,
+        RetiredChild {
+            aliases: 1,
+            revoked_slots: 1
+        }
+    );
+    assert!(fixture.memory.record(private).is_err());
+    assert_eq!(fixture.allowed(shared), vec![fixture.key(1)]);
+    fixture.assert_admitted_exact();
+}
+
+pub fn custody_release_before_another_mm_unmaps_keeps_physical_registration(
+    _make: fn() -> MemoryTestIo,
+) {
+    use carrick_hal::{FrameEventCapacity, FrameInventoryEvent, FrameLength, MappingGeneration};
+    let mut fixture = RetireFixture::new(2, _make);
+    // The child's private frame is still mapped in the inventory: the
+    // carrier must refuse before touching any of its own state.
+    let child = fixture.context(1);
+    let mut reservation = fixture
+        .authority
+        .reserve(
+            &fixture.ids,
+            1,
+            1,
+            FrameEventCapacity::for_event_count(2).unwrap(),
+        )
+        .unwrap();
+    let transaction = reservation.transaction();
+    let frame = reservation.claim_frame().unwrap();
+    let mapping = reservation.claim_mapping().unwrap();
+    let generation = MappingGeneration::from_backend_counter(nz(1));
+    reservation
+        .push(FrameInventoryEvent::PrepareMapping {
+            transaction,
+            frame,
+            mapping,
+            generation,
+            gpa: carrick_guest_mem::Gpa::new(0x800000),
+            length: FrameLength::from_mapping_extent(nz(PAGE)),
+            permissions: carrick_hal::MemPerms {
+                read: true,
+                write: true,
+                exec: false,
+            },
+        })
+        .unwrap();
+    reservation
+        .push(FrameInventoryEvent::PublishMapping {
+            transaction,
+            mapping,
+            generation,
+        })
+        .unwrap();
+    fixture
+        .authority
+        .apply(
+            carrick_kernel::kernel::FrameOwner::GuestMm(child.into()),
+            reservation.commit(()),
+        )
+        .unwrap();
+    let mut prepared = backing(0x800000, PAGE as usize, 91);
+    prepared.identity.frame_id = nz(frame.raw());
+    // This MM has already removed its own row; a different MM still maps F.
+    prepared.identity.mapping_id = nz(u64::MAX);
+    let private = fixture.slot_with(prepared, &[2]);
+    let shared = fixture.slot(0x900000, 92, &[1, 2]);
+    fixture.alias(2, shared, 0x4000, Some(0x900000));
+    fixture.owe_drain(2, shared);
+
+    assert!(fixture.retire(2).is_err());
+    // Nothing moved: root, aliases, drains and admissions all intact.
+    assert!(fixture.memory.root(fixture.key(2)).is_some());
+    assert_eq!(fixture.allowed(private), vec![fixture.key(2)]);
+    assert_eq!(
+        fixture.allowed(shared),
+        vec![fixture.key(1), fixture.key(2)]
+    );
+    assert_eq!(fixture.memory.record(shared).unwrap().alias_count, 1);
+    assert_eq!(
+        fixture.memory.record(shared).unwrap().drains,
+        vec![fixture.context(2)]
+    );
+    assert!(fixture.memory.drained_by.contains_key(&fixture.key(2)));
+    assert_eq!(
+        fixture.memory.admitted.get(&fixture.key(2)),
+        Some(&BTreeSet::from([private.slot, shared.slot]))
+    );
+    assert!(!fixture.memory.is_quarantined());
+
+    // Once the inventory side releases the MM, the same call completes.
+    fixture
+        .inventory()
+        .retire_mm(MmGeneration::new(fixture.key(1)))
         .unwrap();
     let retired = fixture.retire(2).unwrap();
     assert_eq!(

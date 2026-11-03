@@ -16,7 +16,7 @@ pub const MAX_FRAME_INVENTORY_EVENTS_PER_BATCH: usize = 262_144;
 
 pub use carrick_core_abi::{
     FrameId, FrameInventoryApplyReceipt, FrameInventoryOrigin, FrameInventoryProvenance,
-    FrameInventoryReceiptChallenge, FrameInventoryReceiptOwner, FrameInventoryRetirementReceipt,
+    FrameInventoryReceiptChallenge, FrameInventoryReceiptOwner, FrameInventoryRetirementReceipt, MmReleaseReceipt,
     FrameLength, KernelTransactionId, MappingGeneration, MappingId,
 };
 

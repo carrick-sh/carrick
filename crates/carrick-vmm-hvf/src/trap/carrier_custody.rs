@@ -415,6 +415,7 @@ type RetainedNativeExecPreparation = (
 #[derive(::core::fmt::Debug)]
 #[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
 pub struct CarrierVmCustody {
+    pub(crate) inventory_retirement_gate: std::sync::OnceLock<InventoryRetirementGate>,
     pub(crate) transfer_carrier: core::num::NonZeroU64,
     pub(crate) el1_frame_grants: std::sync::Arc<El1FrameGrantLedger>,
     /// Host COW accounting for every MM admitted to this carrier.
@@ -771,6 +772,7 @@ impl CarrierVmCustody {
             metadata_aperture: parking_lot::Mutex::new(
                 crate::metadata_grant::HostApertureState::new(),
             ),
+            inventory_retirement_gate: Default::default(),
             native_frame_backings: Default::default(),
             fork_stock: parking_lot::Mutex::new(
                 crate::fork_stock::ForkStockHostCustody::with_asids(
@@ -4919,5 +4921,19 @@ mod carrier_vm_custody_tests {
                 .expect("successor remains mapped")
                 .mapped
         );
+    }
+}
+
+/// The physical frame owner consults the same inventory as every MM in its carrier.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct InventoryRetirementGate {
+    pub(crate) frames: std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
+    pub(crate) authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
+}
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl core::fmt::Debug for InventoryRetirementGate {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("InventoryRetirementGate")
+            .finish_non_exhaustive()
     }
 }

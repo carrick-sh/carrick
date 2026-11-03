@@ -382,7 +382,7 @@ impl HvpatchTaskEngineBindingState {
                     ),
                 };
                 state.prepare_inventory_retirement(commit)?;
-                state.apply_inventory_retirement(apply_with_receipt)?;
+                let _ = state.apply_inventory_retirement(apply_with_receipt)?;
                 carrick_vmm_hvf::hvf_aarch64_engine::settle_detached_task_only_engine_declined_remainders(
                     state,
                 )?;

@@ -1640,7 +1640,7 @@ fn first_exec_after_fork_exit_reuses_the_slot_with_a_fresh_root_incarnation() {
         )
         .unwrap();
     let view = crate::mm_portal::test_support::nodes(fixture.region);
-    fixture
+    let _retired_journal = fixture
         .region
         .table()
         .lock_el1_resolved(retired_space.index(), retired_mm, &view, 0)

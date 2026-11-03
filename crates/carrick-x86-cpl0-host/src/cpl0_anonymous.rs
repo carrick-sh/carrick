@@ -362,7 +362,7 @@ fn release_retired_child<M: CarrierMemoryIo>(
         ))
     }
     .map_err(|e| fail(e.to_string()))?;
-    if !carrick_hal::fork_stock::release_child_mm(inventory, residency, absence.mm()) {
+    if !carrick_hal::fork_stock::release_child_mm(inventory, residency, absence).is_some() {
         return Err(fail("retired child inventory or residency release"));
     }
     memory
@@ -1304,13 +1304,16 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         if refused && inventory_published.get() {
             if root_installed.get() {
                 let absence = SlotAbsence::scan(loan.request.child_mm, [])
+                    .and_then(|absence| absence.with_owner(completion.child.into()))
                     .ok_or_else(|| fail("unpublished child MM slot absence"))?;
                 release_retired_child(&mut self._vm, &*frame_inventory, &absence)?;
             } else if !carrick_hal::fork_stock::release_child_mm(
                 &*frame_inventory,
                 self.cow_residency()?,
-                loan.request.child_mm,
-            ) {
+                &SlotAbsence::scan(loan.request.child_mm, [])
+                    .and_then(|absence| absence.with_owner(completion.child.into()))
+                    .ok_or_else(|| fail("unpublished child inventory owner"))?,
+            ).is_some() {
                 return Err(fail("unpublished child inventory rollback"));
             }
         }
@@ -1343,11 +1346,12 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         let (physical, mut record) = unsafe {
             self.read_stack_record::<ForkStockSettlement, I>(lease, execution.context, address)
         }?;
-        let had_admitted = self
+        let admitted_owner = self
             .fork_stock
             .pending(execution.cpu)
             .and_then(|pending| pending.admitted_custody())
-            .is_some();
+            .map(|admitted| admitted.completion().child);
+        let had_admitted = admitted_owner.is_some();
         let is_abort = record.abort_matches(loan);
         let committed_child = if !is_abort {
             let (completion, _custody, _count) = record
@@ -1381,6 +1385,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .map_err(|e: ForkStockServiceError| fail(format!("physical fork settlement: {e:?}")))?;
         if is_abort && had_admitted {
             let absence = SlotAbsence::scan(loan.request.child_mm, [])
+                .and_then(|absence| absence.with_owner(admitted_owner?.into()))
                 .ok_or_else(|| fail("aborted child MM slot absence"))?;
             release_retired_child(&mut self._vm, &*self.frame_inventory, &absence)?;
         }

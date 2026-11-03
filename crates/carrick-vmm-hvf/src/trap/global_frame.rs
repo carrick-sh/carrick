@@ -632,6 +632,55 @@ mod allocator_stats_tests {
     }
 
     #[test]
+    fn pending_retirement_excludes_allocator_reuse_at_different_lengths() {
+        let _guard = global_frame_allocator_test_lock().lock();
+        let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+        let (base, owner) = grant_owned(&custody);
+        let length = owner.length();
+        let pin = owner.pin().unwrap();
+        assert!(matches!(
+            retire_global_frame_host_owner_if_generation_in_using(
+                &custody,
+                base,
+                length,
+                owner.generation(),
+                &mut |_, _| panic!("pinned owner unmapped")
+            ),
+            GlobalFrameRetirementOutcome::DeferredActivePins { .. }
+        ));
+        for requested in [length, length * 2, length * 3] {
+            let (_, successor, generation) =
+                allocate_grant_extent(&custody, applevisor::memory::MemPerms::RW, requested)
+                    .unwrap();
+            assert!(
+                successor + requested <= base || successor >= base + length,
+                "RetirementPending owns the full IPA interval, regardless of successor length"
+            );
+            assert!(
+                retire_global_frame_host_owner_if_generation_in_using(
+                    &custody,
+                    successor,
+                    requested,
+                    generation,
+                    &mut |_, _| Ok(())
+                )
+                .is_retired()
+            );
+        }
+        drop(pin);
+        assert!(
+            retire_global_frame_host_owner_if_generation_in_using(
+                &custody,
+                base,
+                length,
+                owner.generation(),
+                &mut |_, _| Ok(())
+            )
+            .is_retired()
+        );
+    }
+
+    #[test]
     fn physical_retirement_enrollment_and_last_pin_use_the_existing_idle_owner() {
         use carrick_guest_mem::PhysicalMemoryWait;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3669,6 +3718,13 @@ pub(crate) fn retire_global_frame_host_owner_inner_in_using(
             );
         }
         let key = (ipa, length);
+        // Lock order matches publication: frame registry, then owner directory.
+        // Holding this guard until RetirementPending is published prevents a
+        // new inventory row appearing between the count check and the claim.
+        let inventory = custody
+            .inventory_retirement_gate
+            .get()
+            .map(|gate| (gate, gate.frames.lock()));
         // Claim the exact directory slot before record retirement, but do not hold
         // the directory lock across the backend unmap. The backend also retires
         // replay/alias state, whose lock order can meet a concurrent semantic owner
@@ -3710,6 +3766,27 @@ pub(crate) fn retire_global_frame_host_owner_inner_in_using(
             }
         };
         let generation = owner.generation();
+        if let Some((gate, frames)) = &inventory {
+            if let Some(ids) = frames.physical_owner_frames.get(&(ipa, length, generation)) {
+                for frame in ids {
+                    match gate.authority.frame_mapping_count(*frame) {
+                        Ok(None | Some(0)) => {}
+                        Ok(Some(_)) => carrick_fatal!(
+                            "hvpatch::physical_retirement",
+                            "physical custody exhausted with live inventory rows"
+                        ),
+                        Err(error) => {
+                            return GlobalFrameRetirementOutcome::RetryPending {
+                                ipa,
+                                length,
+                                generation,
+                                error: format!("physical retirement inventory gate: {error}"),
+                            };
+                        }
+                    }
+                }
+            }
+        }
         if owner.mapping.pin_count() != 0 {
             let outcome = custody.request_stage2_record_retirement(owner.record_identity);
             if outcome != CarrierStage2RetireOutcome::DeferredActivePins {
@@ -3743,6 +3820,7 @@ pub(crate) fn retire_global_frame_host_owner_inner_in_using(
             },
         );
         drop(owners);
+        drop(inventory);
 
         let outcome = custody.retire_stage2_record_using(owner.record_identity, unmap);
         let mut owners = custody.global_frame_host_owners.lock();
@@ -3785,6 +3863,13 @@ pub(crate) fn retire_global_frame_host_owner_inner_in_using(
                     };
                 }
                 owners.remove(&key);
+                drop(owners);
+                if let Some(gate) = custody.inventory_retirement_gate.get() {
+                    gate.frames
+                        .lock()
+                        .physical_owner_frames
+                        .remove(&(ipa, length, generation));
+                }
                 if terminalized {
                     GlobalFrameRetirementOutcome::TerminalizedByVmDestroy {
                         ipa,

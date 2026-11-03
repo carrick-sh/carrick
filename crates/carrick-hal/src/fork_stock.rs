@@ -316,6 +316,7 @@ impl ChildAddressTags for UntaggedRoots {
 #[derive(Debug, Eq, PartialEq)]
 pub struct SlotAbsence {
     mm: ReservationMm,
+    owner: Option<crate::GuestFrameOwner>,
 }
 
 impl SlotAbsence {
@@ -324,8 +325,16 @@ impl SlotAbsence {
         installed
             .into_iter()
             .all(|space| space != mm.raw())
-            .then_some(Self { mm })
+            .then_some(Self { mm, owner: None })
     }
+
+    /// Bind the absence proof to the carrier's already authenticated root.
+    pub fn with_owner(mut self, owner: crate::GuestFrameOwner) -> Option<Self> {
+        if owner.native_mm.raw().get() != self.mm.raw() { return None; }
+        self.owner = Some(owner);
+        Some(self)
+    }
+    pub fn inventory_owner(&self) -> Option<crate::GuestFrameOwner> { self.owner }
 
     pub fn mm(&self) -> ReservationMm {
         self.mm
@@ -577,13 +586,11 @@ impl LifecycleWindow {
 pub fn release_child_mm(
     inventory: &dyn crate::PhysicalFrameInventory,
     residency: &carrick_el1_abi::FrameGrantResidencyTable,
-    mm: ReservationMm,
-) -> bool {
-    let Some(generation) = NonZeroU64::new(mm.raw()).map(carrick_guest_arch::MmGeneration::new)
-    else {
-        return false;
-    };
-    inventory.retire_mm(generation).is_ok() && residency.retire_overlapping(mm.raw(), 0, u64::MAX)
+    absence: &SlotAbsence,
+) -> Option<crate::MmReleaseReceipt> {
+    let receipt = inventory.retire_mm(absence.inventory_owner()?).ok()?;
+    if !residency.retire_overlapping(absence.mm().raw(), 0, u64::MAX) { return None; }
+    crate::MmReleaseReceipt::from_retirement(receipt)
 }
 
 /// Ordered key of one MM in carrier custody.
@@ -662,6 +669,7 @@ struct CommittedChild<T, C> {
 /// the predecessor installed.
 #[derive(Debug)]
 struct ExecPredecessor<T, C> {
+    owner: crate::GuestFrameOwner,
     predecessor: ReservationMm,
     successor: ReservationMm,
     tag: Option<ChildTag<T>>,
@@ -1581,6 +1589,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         let replaced = self.children.insert(successor_key, successor_child);
         debug_assert!(replaced.is_none());
         let pending = ExecPredecessor {
+            owner: execution.context.into(),
             predecessor: predecessor_mm,
             successor: successor_mm,
             tag: predecessor_tag,
@@ -1625,6 +1634,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             self.exec_predecessors.insert(receipt.sequence, pending);
             return Err(ForkStockServiceError::StaleExecution);
         }
+        let absence = absence.with_owner(pending.owner).ok_or(ForkStockServiceError::InvalidRecord)?;
         if !pending.released {
             if let ExecPredecessorPhysical::Child(physical) = &pending.physical
                 && !release(physical, &absence)
@@ -2345,7 +2355,13 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             })
             .collect();
         let mut reclaimed = 0;
-        for (key, absence) in candidates {
+        for (key, mut absence) in candidates {
+            if let Some(child) = self.children.get(&key) {
+                absence.owner = Some(crate::GuestFrameOwner {
+                    native_mm: carrick_guest_arch::MmGeneration::new(NonZeroU64::new(child.owner.mm().raw()).ok_or(ForkStockServiceError::InvalidRecord)?),
+                    root_generation: carrick_guest_arch::ContextGeneration::new(child.owner.incarnation()),
+                });
+            }
             let mm = key.mm().ok_or(ForkStockServiceError::InvalidRecord)?;
             let child = self
                 .children

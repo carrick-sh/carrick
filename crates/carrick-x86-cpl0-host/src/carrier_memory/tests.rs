@@ -122,3 +122,10 @@ fn inherited_inventory_edge_survives_protect_advancing_mapping_generation() {
     })
     .unwrap();
 }
+
+#[test]
+fn custody_release_before_another_mm_unmaps_keeps_physical_registration() {
+    test_support::custody_release_before_another_mm_unmaps_keeps_physical_registration(|| {
+        test_support::MemoryTestIo::new(TestMemoryIo::default())
+    });
+}

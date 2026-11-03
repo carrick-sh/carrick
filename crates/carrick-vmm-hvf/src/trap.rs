@@ -1933,6 +1933,10 @@ impl HvfTaskState {
         authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
         identity: carrick_hal::FrameCowIdentity,
     ) {
+        let _ = self.custody_arc().inventory_retirement_gate.set(InventoryRetirementGate {
+            frames: std::sync::Arc::clone(&self.frame_inventory.ledger.lock().frames),
+            authority: std::sync::Arc::clone(&authority),
+        });
         self.cow_authority = Some(std::sync::Arc::clone(&authority));
         self.cow_identity = Some(identity);
         self.mm_access.bind_cow_runtime(MmCowRuntimeBinding {
@@ -3459,7 +3463,7 @@ impl HvpatchTaskOnlyBackendState {
         apply: impl FnOnce(
             carrick_hal::FrameInventoryCommit<()>,
         ) -> Result<carrick_hal::FrameInventoryRetirementReceipt, TrapError>,
-    ) -> Result<(), TrapError> {
+    ) -> Result<Option<carrick_hal::MmReleaseReceipt>, TrapError> {
         self.registration
             .as_ref()
             .ok_or_else(|| TrapError::Hypervisor("retired HVPatch registration".to_owned()))?
@@ -4132,7 +4136,7 @@ impl HvpatchTaskInventoryAuthority {
         apply: impl FnOnce(
             carrick_hal::FrameInventoryCommit<()>,
         ) -> Result<carrick_hal::FrameInventoryRetirementReceipt, TrapError>,
-    ) -> Result<(), TrapError> {
+    ) -> Result<Option<carrick_hal::MmReleaseReceipt>, TrapError> {
         let current = std::mem::replace(self, Self::Retired);
         match current {
             Self::Active {
@@ -4152,7 +4156,7 @@ impl HvpatchTaskInventoryAuthority {
                         &retired,
                     );
                     if challenge && revision_advanced && transaction_distinct && audit.ok() {
-                        return Ok(());
+                        return Ok(carrick_hal::MmReleaseReceipt::from_retirement(retired));
                     }
                     // Abort is unrecoverable, so name the exact clause that
                     // rejected the receipt rather than only its verdict.
@@ -4430,7 +4434,7 @@ impl HvpatchTaskMmAuthority {
         apply: impl FnOnce(
             carrick_hal::FrameInventoryCommit<()>,
         ) -> Result<carrick_hal::FrameInventoryRetirementReceipt, TrapError>,
-    ) -> Result<(), TrapError> {
+    ) -> Result<Option<carrick_hal::MmReleaseReceipt>, TrapError> {
         let mm = (*self.kernel_mm.lock()).ok_or_else(|| {
             TrapError::Hypervisor("HVPatch MM has no exact Kernel binding".to_owned())
         })?;
@@ -6025,7 +6029,7 @@ impl HvpatchTaskRegistration {
         apply: impl FnOnce(
             carrick_hal::FrameInventoryCommit<()>,
         ) -> Result<carrick_hal::FrameInventoryRetirementReceipt, TrapError>,
-    ) -> Result<(), TrapError> {
+    ) -> Result<Option<carrick_hal::MmReleaseReceipt>, TrapError> {
         self.task_mm
             .as_ref()
             .ok_or_else(|| TrapError::Hypervisor("missing HVPatch task MM".to_owned()))?
