@@ -22,9 +22,18 @@ pub enum PrepareReturnError {
     #[error("return preparation unsupported")]
     Unsupported,
 }
+/// The generation published by a claimed unmap, reserved before stage-1 clear.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnmappedReturnRow {
+    pub mapping: MappingId,
+    pub frame: FrameId,
+    pub generation: MappingGeneration,
+}
 #[derive(Debug)]
 pub struct AppliedReturn {
     pub revision: u64,
+    pub receipt: crate::FrameInventoryApplyReceipt,
+    pub unmapped: Vec<UnmappedReturnRow>,
     pub last_unmapped: Vec<FrameId>,
     pub mm_empty_at_revision: bool,
 }

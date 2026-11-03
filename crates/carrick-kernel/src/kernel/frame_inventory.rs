@@ -343,11 +343,7 @@ struct MappingEntry {
 #[derive(Debug, Eq, PartialEq)]
 enum MappingSlot {
     Live(MappingEntry),
-    Claimed(ClaimMark),
-}
-#[derive(Debug, Eq, PartialEq)]
-struct ClaimMark {
-    row: MappingRow,
+    Claimed(claimed_return::ClaimMark),
 }
 impl MappingSlot {
     fn live(&self) -> Option<&MappingEntry> {
@@ -359,13 +355,13 @@ impl MappingSlot {
     fn owner(&self) -> FrameOwner {
         match self {
             Self::Live(entry) => entry.mm,
-            Self::Claimed(mark) => mark.row.mm,
+            Self::Claimed(mark) => mark.row().mm,
         }
     }
     fn frame(&self) -> FrameId {
         match self {
             Self::Live(entry) => entry.frame,
-            Self::Claimed(mark) => mark.row.frame,
+            Self::Claimed(mark) => mark.row().frame,
         }
     }
     fn snapshot(&self, mapping: MappingId) -> Option<MappingRow> {
@@ -380,13 +376,9 @@ impl MappingSlot {
                 permissions: entry.permissions,
             }),
             Self::Live(_) => None,
-            Self::Claimed(mark) => Some(mark.row),
+            Self::Claimed(mark) => Some(mark.row()),
         }
     }
-}
-struct ClaimedRow {
-    id: MappingId,
-    entry: MappingEntry,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4787,177 +4779,240 @@ mod inventory_origin_tests {
     }
 }
 
-enum ReturnDisposition {
-    Prepared,
-    Cleared(std::sync::Arc<dyn carrick_hal::ReturnQuarantine>),
-    Completed,
-}
-struct ClaimedReturn {
-    disposition: ReturnDisposition,
-    inventory: std::sync::Arc<FrameInventoryAuthority>,
-    mm: FrameOwner,
-    rows: Vec<ClaimedRow>,
-    last_unmapped: Vec<FrameId>,
-}
-impl ClaimedReturn {
-    fn restore(&mut self, abandoned: bool) {
-        let mut state = self.inventory.state.lock();
-        for row in self.rows.drain(..) {
-            state.mappings.insert(row.id, MappingSlot::Live(row.entry));
-        }
-        state.return_claims -= 1;
-        if abandoned {
-            state.abandoned_returns += 1;
-        }
-        drop(state);
-        self.disposition = ReturnDisposition::Completed;
+mod claimed_return {
+    use super::*;
+
+    /// Only claim preparation can replace a live row with this placeholder.
+    #[derive(Debug, Eq, PartialEq)]
+    pub(super) struct ClaimMark {
+        row: MappingRow,
     }
-}
-impl Drop for ClaimedReturn {
-    fn drop(&mut self) {
-        match std::mem::replace(&mut self.disposition, ReturnDisposition::Completed) {
-            ReturnDisposition::Prepared => self.restore(true),
-            ReturnDisposition::Cleared(quarantine) => {
-                // The exact-MM callback runs before acquiring the inventory leaf lock.
-                quarantine.quarantine(self.mm.receipt_owner());
-                self.inventory.state.lock().quarantined_returns += 1;
+    impl ClaimMark {
+        pub(super) fn row(&self) -> MappingRow {
+            self.row
+        }
+    }
+    struct ClaimedRow {
+        id: MappingId,
+        entry: MappingEntry,
+    }
+    enum ReturnDisposition {
+        Prepared,
+        Cleared(std::sync::Arc<dyn carrick_hal::ReturnQuarantine>),
+        Completed,
+    }
+    struct ClaimedReturn {
+        disposition: ReturnDisposition,
+        inventory: std::sync::Arc<FrameInventoryAuthority>,
+        mm: FrameOwner,
+        rows: Vec<ClaimedRow>,
+        transaction: KernelTransactionId,
+        provenance: FrameInventoryProvenance,
+        receipt_mappings: Vec<(MappingId, FrameId)>,
+        unmapped: Vec<carrick_hal::prepared_return::UnmappedReturnRow>,
+        last_unmapped: Vec<FrameId>,
+    }
+    impl ClaimedReturn {
+        fn restore(&mut self, abandoned: bool) {
+            let mut state = self.inventory.state.lock();
+            for row in self.rows.drain(..) {
+                state.mappings.insert(row.id, MappingSlot::Live(row.entry));
             }
-            ReturnDisposition::Completed => {}
+            state.return_claims -= 1;
+            if abandoned {
+                state.abandoned_returns += 1;
+            }
+            drop(state);
+            self.disposition = ReturnDisposition::Completed;
         }
     }
-}
-impl carrick_hal::ReturnClaim for ClaimedReturn {
-    fn abort(mut self: Box<Self>) {
-        self.restore(false);
-    }
-    fn stage1_cleared(&mut self, quarantine: std::sync::Arc<dyn carrick_hal::ReturnQuarantine>) {
-        self.disposition = ReturnDisposition::Cleared(quarantine);
-    }
-    fn apply(mut self: Box<Self>) -> carrick_hal::AppliedReturn {
-        let mut last_unmapped = std::mem::take(&mut self.last_unmapped);
-        let mut state = self.inventory.state.lock();
-        for row in self.rows.drain(..) {
-            state.mappings.remove(&row.id);
-            let row = row.entry;
-            decrement_mm_mapping_count(&mut state.mm_mapping_counts, self.mm);
-            if let Some(frame) = state.frames.get_mut(&row.frame) {
-                if frame.references.unmap().is_err() {
-                    carrick_fatal!(
-                        "kernel::frame_inventory",
-                        "prepared return reference count underflow"
-                    );
+    impl Drop for ClaimedReturn {
+        fn drop(&mut self) {
+            match std::mem::replace(&mut self.disposition, ReturnDisposition::Completed) {
+                ReturnDisposition::Prepared => self.restore(true),
+                ReturnDisposition::Cleared(quarantine) => {
+                    // The exact-MM callback runs before acquiring the inventory leaf lock.
+                    quarantine.quarantine(self.mm.receipt_owner());
+                    self.inventory.state.lock().quarantined_returns += 1;
                 }
-                if frame.references.count() == 0 {
-                    state.frames.remove(&row.frame);
-                    last_unmapped.push(row.frame);
+                ReturnDisposition::Completed => {}
+            }
+        }
+    }
+    impl carrick_hal::ReturnClaim for ClaimedReturn {
+        fn abort(mut self: Box<Self>) {
+            self.restore(false);
+        }
+        fn stage1_cleared(
+            &mut self,
+            quarantine: std::sync::Arc<dyn carrick_hal::ReturnQuarantine>,
+        ) {
+            self.disposition = ReturnDisposition::Cleared(quarantine);
+        }
+        fn apply(mut self: Box<Self>) -> carrick_hal::AppliedReturn {
+            let mut last_unmapped = std::mem::take(&mut self.last_unmapped);
+            let mut state = self.inventory.state.lock();
+            for row in self.rows.drain(..) {
+                state.mappings.remove(&row.id);
+                let row = row.entry;
+                decrement_mm_mapping_count(&mut state.mm_mapping_counts, self.mm);
+                if let Some(frame) = state.frames.get_mut(&row.frame) {
+                    if frame.references.unmap().is_err() {
+                        carrick_fatal!(
+                            "kernel::frame_inventory",
+                            "prepared return reference count underflow"
+                        );
+                    }
+                    if frame.references.count() == 0 {
+                        state.frames.remove(&row.frame);
+                        last_unmapped.push(row.frame);
+                    } else {
+                        let _ = frame.references.request_retirement();
+                    }
                 } else {
-                    let _ = frame.references.request_retirement();
+                    carrick_fatal!("kernel::frame_inventory", "prepared return lost its frame");
                 }
-            } else {
-                carrick_fatal!("kernel::frame_inventory", "prepared return lost its frame");
             }
-        }
-        state.return_claims -= 1;
-        state.revision += 1;
-        let outcome = carrick_hal::AppliedReturn {
-            revision: state.revision,
-            last_unmapped,
-            mm_empty_at_revision: !state.mm_mapping_counts.contains_key(&self.mm),
-        };
-        drop(state);
-        self.disposition = ReturnDisposition::Completed;
-        outcome
-    }
-}
-impl FrameInventoryAuthority {
-    /// Claim at most 512 4-KiB pages without retaining the inventory lock.
-    /// Lock audit: ID allocation happens before the leaf lock; claim, apply,
-    /// and restore touch only inventory-owned maps and arithmetic. No root,
-    /// fork-stock, stage-2, owner-directory, callback or pin wait runs inside.
-    pub fn prepare_return(
-        self: &std::sync::Arc<Self>,
-        ids: &ObjectIdRegistry,
-        mm: impl Into<FrameOwner>,
-        rows: &[carrick_hal::ExactReturnMappingRow],
-    ) -> Result<carrick_hal::PreparedReturn, carrick_hal::PrepareReturnError> {
-        use carrick_hal::PrepareReturnError as Error;
-        let bytes = rows
-            .iter()
-            .try_fold(0u64, |sum, row| sum.checked_add(row.length.raw()));
-        if rows.is_empty() || rows.len() > 512 || bytes.is_none_or(|bytes| bytes > 512 * 4096) {
-            return Err(Error::Capacity);
-        }
-        let _transaction = ids.transaction_id().map_err(|_| Error::Capacity)?;
-        let mm = mm.into();
-        let mut retained_rows = Vec::new();
-        retained_rows
-            .try_reserve_exact(rows.len())
-            .map_err(|_| Error::Capacity)?;
-        let mut last_unmapped = Vec::new();
-        last_unmapped
-            .try_reserve_exact(rows.len())
-            .map_err(|_| Error::Capacity)?;
-        let mut state = self.state.lock();
-        state
-            .revision
-            .checked_add(state.return_claims)
-            .and_then(|value| value.checked_add(1))
-            .ok_or(Error::RevisionExhausted)?;
-        let mut unique = BTreeSet::new();
-        for row in rows {
-            let entry = state
-                .mappings
-                .get(&row.mapping)
-                .and_then(MappingSlot::live)
-                .ok_or(Error::RowMismatch)?;
-            let published = match entry.state {
-                MappingState::Published => true,
-                MappingState::Prepared(_) => false,
+            state.return_claims -= 1;
+            state.revision += 1;
+            let outcome = carrick_hal::AppliedReturn {
+                revision: state.revision,
+                receipt: FrameInventoryApplyReceipt::from_kernel_authority(
+                    self.inventory.origin.clone(),
+                    self.provenance,
+                    self.transaction,
+                    self.mm.receipt_owner(),
+                    state.revision,
+                    std::mem::take(&mut self.receipt_mappings),
+                ),
+                unmapped: std::mem::take(&mut self.unmapped),
+                last_unmapped,
+                mm_empty_at_revision: !state.mm_mapping_counts.contains_key(&self.mm),
             };
-            if !unique.insert(row.mapping)
-                || !published
-                || entry.mm != mm
-                || entry.frame != row.frame
-                || entry.generation != row.generation
-                || entry.gpa != row.gpa
-                || entry.length != row.length
-                || row.generation.raw() == u64::MAX
-            {
-                return Err(Error::RowMismatch);
-            }
+            drop(state);
+            self.disposition = ReturnDisposition::Completed;
+            outcome
         }
-        for row in rows {
-            if let Some(slot) = state.mappings.get_mut(&row.mapping)
-                && let MappingSlot::Live(entry) = slot
-            {
-                let snapshot = MappingRow {
+    }
+    impl FrameInventoryAuthority {
+        /// Claim at most 512 4-KiB pages without retaining the inventory lock.
+        /// Lock audit: ID allocation happens before the leaf lock; claim, apply,
+        /// and restore touch only inventory-owned maps and arithmetic. No root,
+        /// fork-stock, stage-2, owner-directory, callback or pin wait runs inside.
+        pub fn prepare_return(
+            self: &std::sync::Arc<Self>,
+            ids: &ObjectIdRegistry,
+            mm: impl Into<FrameOwner>,
+            rows: &[carrick_hal::ExactReturnMappingRow],
+        ) -> Result<carrick_hal::PreparedReturn, carrick_hal::PrepareReturnError> {
+            use carrick_hal::PrepareReturnError as Error;
+            let bytes = rows
+                .iter()
+                .try_fold(0u64, |sum, row| sum.checked_add(row.length.raw()));
+            if rows.is_empty() || rows.len() > 512 || bytes.is_none_or(|bytes| bytes > 512 * 4096) {
+                return Err(Error::Capacity);
+            }
+            let transaction = ids.transaction_id().map_err(|_| Error::Capacity)?;
+            let provenance = FrameInventoryProvenance::from_kernel_entropy(
+                self.entropy
+                    .lock()
+                    .next(std::process::id(), |bytes| {
+                        getrandom::fill(bytes)
+                            .map_err(|_| FrameInventoryReserveError::EntropyUnavailable)
+                    })
+                    .map_err(|_| Error::Capacity)?,
+            );
+            let mm = mm.into();
+            let mut retained_rows = Vec::new();
+            retained_rows
+                .try_reserve_exact(rows.len())
+                .map_err(|_| Error::Capacity)?;
+            let mut last_unmapped = Vec::new();
+            last_unmapped
+                .try_reserve_exact(rows.len())
+                .map_err(|_| Error::Capacity)?;
+            let mut receipt_mappings = Vec::new();
+            receipt_mappings
+                .try_reserve_exact(rows.len())
+                .map_err(|_| Error::Capacity)?;
+            let mut unmapped = Vec::new();
+            unmapped
+                .try_reserve_exact(rows.len())
+                .map_err(|_| Error::Capacity)?;
+            for row in rows {
+                receipt_mappings.push((row.mapping, row.frame));
+                unmapped.push(carrick_hal::prepared_return::UnmappedReturnRow {
                     mapping: row.mapping,
-                    frame: entry.frame,
-                    mm: entry.mm,
-                    generation: entry.generation,
-                    gpa: entry.gpa,
-                    length: entry.length,
-                    permissions: entry.permissions,
-                };
-                let entry = *entry;
-                *slot = MappingSlot::Claimed(ClaimMark { row: snapshot });
-                retained_rows.push(ClaimedRow {
-                    id: row.mapping,
-                    entry,
+                    frame: row.frame,
+                    generation: next_generation(row.generation).map_err(|_| Error::RowMismatch)?,
                 });
             }
+            let mut state = self.state.lock();
+            state
+                .revision
+                .checked_add(state.return_claims)
+                .and_then(|value| value.checked_add(1))
+                .ok_or(Error::RevisionExhausted)?;
+            let mut unique = BTreeSet::new();
+            for row in rows {
+                let entry = state
+                    .mappings
+                    .get(&row.mapping)
+                    .and_then(MappingSlot::live)
+                    .ok_or(Error::RowMismatch)?;
+                let published = match entry.state {
+                    MappingState::Published => true,
+                    MappingState::Prepared(_) => false,
+                };
+                if !unique.insert(row.mapping)
+                    || !published
+                    || entry.mm != mm
+                    || entry.frame != row.frame
+                    || entry.generation != row.generation
+                    || entry.gpa != row.gpa
+                    || entry.length != row.length
+                    || row.generation.raw() == u64::MAX
+                {
+                    return Err(Error::RowMismatch);
+                }
+            }
+            for row in rows {
+                if let Some(slot) = state.mappings.get_mut(&row.mapping)
+                    && let MappingSlot::Live(entry) = slot
+                {
+                    let snapshot = MappingRow {
+                        mapping: row.mapping,
+                        frame: entry.frame,
+                        mm: entry.mm,
+                        generation: entry.generation,
+                        gpa: entry.gpa,
+                        length: entry.length,
+                        permissions: entry.permissions,
+                    };
+                    let entry = *entry;
+                    *slot = MappingSlot::Claimed(ClaimMark { row: snapshot });
+                    retained_rows.push(ClaimedRow {
+                        id: row.mapping,
+                        entry,
+                    });
+                }
+            }
+            state.return_claims += 1;
+            drop(state);
+            Ok(carrick_hal::PreparedReturn::from_inventory(Box::new(
+                ClaimedReturn {
+                    disposition: ReturnDisposition::Prepared,
+                    inventory: self.clone(),
+                    mm,
+                    rows: retained_rows,
+                    transaction,
+                    provenance,
+                    receipt_mappings,
+                    unmapped,
+                    last_unmapped,
+                },
+            )))
         }
-        state.return_claims += 1;
-        drop(state);
-        Ok(carrick_hal::PreparedReturn::from_inventory(Box::new(
-            ClaimedReturn {
-                disposition: ReturnDisposition::Prepared,
-                inventory: self.clone(),
-                mm,
-                rows: retained_rows,
-                last_unmapped,
-            },
-        )))
     }
 }
 
@@ -5046,6 +5101,28 @@ mod prepared_return_tests {
             }
             assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
         }
+    }
+    #[test]
+    fn applied_claim_reports_unmap_generation_and_authenticated_provenance() {
+        let (inventory, ids, owner, row) = fixture();
+        let before = inventory.snapshot().revision;
+        let claim = inventory.prepare_return(&ids, owner, &[row]).unwrap();
+        assert_eq!(inventory.snapshot().revision, before);
+        let applied = claim.apply();
+        assert_eq!(applied.revision, before + 1);
+        assert!(applied.receipt.issued_by(&inventory.origin));
+        assert_eq!(applied.receipt.owner(), owner.receipt_owner());
+        assert_eq!(applied.receipt.revision(), applied.revision);
+        assert_eq!(applied.receipt.mapping_set(), &[(row.mapping, row.frame)]);
+        assert_eq!(applied.unmapped.len(), 1);
+        assert_eq!(applied.unmapped[0].mapping, row.mapping);
+        assert_eq!(applied.unmapped[0].frame, row.frame);
+        assert_eq!(
+            applied.unmapped[0].generation.raw(),
+            row.generation.raw() + 1
+        );
+        assert_eq!(applied.last_unmapped, vec![row.frame]);
+        assert!(applied.mm_empty_at_revision);
     }
     #[test]
     fn return_claim_blocks_teardown_aborts_and_retries() {
