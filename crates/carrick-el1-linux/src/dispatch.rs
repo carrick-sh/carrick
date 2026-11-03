@@ -1120,6 +1120,32 @@ fn refuse_traced_native_exec(
     true
 }
 
+/// Settle a host-file staging answer in ring. Staging can refuse before a
+/// carrier request exists, so its ENOSYS belongs to the ring census too.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+fn native_host_file_return(
+    result: i64,
+    ordinal: carrick_guest_arch::NativeOrdinal,
+    counters: &Counters,
+    child: impl FnOnce() -> bool,
+) -> i64 {
+    if result == carrick_syscall_abi::LINUX_ENOSYS.guest_retval() {
+        counters.record_refusal(
+            ordinal,
+            if child() {
+                carrick_core_abi::service::ServiceOrigin::Descendant
+            } else {
+                carrick_core_abi::service::ServiceOrigin::Initial
+            },
+            carrick_el1_abi::RefusalVenue::Ring,
+        );
+        if let Some(served) = counters.served.get(ordinal.raw() as usize) {
+            served.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    result
+}
+
 /// Capture the exception while its native owner still owns the trap words.
 /// The host receives a selector only after this continuation has parked.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -1210,7 +1236,12 @@ fn arm_native_service_exit(
                 })),
                 Some(carrick_personality_linux::native_host_file::HostFileStage::Returned(
                     result,
-                )) => NativeServiceStage::Return(result.raw()),
+                )) => NativeServiceStage::Return(native_host_file_return(
+                    result.raw(),
+                    carrick_guest_arch::NativeOrdinal::new(frame.x[8]),
+                    counters,
+                    child,
+                )),
                 Some(carrick_personality_linux::native_host_file::HostFileStage::InRingReply {
                     output,
                     bytes,
@@ -1246,20 +1277,12 @@ fn arm_native_service_exit(
                 Some(carrick_personality_linux::native_host_file::HostFileStage::InRing) => {
                     // An in-zone object the ring does not serve yet never
                     // exits to the host: counted ENOSYS here, in ring.
-                    let nr = frame.x[8] as usize;
-                    counters.record_refusal(
+                    NativeServiceStage::Return(native_host_file_return(
+                        carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
                         carrick_guest_arch::NativeOrdinal::new(frame.x[8]),
-                        if child() {
-                            carrick_core_abi::service::ServiceOrigin::Descendant
-                        } else {
-                            carrick_core_abi::service::ServiceOrigin::Initial
-                        },
-                        carrick_el1_abi::RefusalVenue::Ring,
-                    );
-                    if nr < 512 {
-                        counters.served[nr].fetch_add(1, Ordering::Relaxed);
-                    }
-                    NativeServiceStage::Return(carrick_syscall_abi::LINUX_ENOSYS.guest_retval())
+                        counters,
+                        child,
+                    ))
                 }
                 None => NativeServiceStage::Operation,
             },
@@ -5398,6 +5421,75 @@ mod tests {
         }
         pending.frame.x[8] = 124;
         assert!(PendingFamilies::sched_venue(&mut pending).is_some());
+    }
+
+    #[test]
+    fn native_host_file_staging_refusal_is_counted_once() {
+        use carrick_personality_linux::native_host_file::{DescriptionAccess, HostFileStage};
+        struct Resident;
+        impl file::MemoryValidator for Resident {
+            fn writable_bytes(&self, _: u64, len: usize) -> usize {
+                len
+            }
+            fn readable_bytes(&self, _: u64, len: usize) -> usize {
+                len
+            }
+        }
+        let task = CurrentTask::new();
+        let path = b"relative\0";
+        for child in [false, true] {
+            let counters = Counters::default();
+            let mut frame = TrapFrame {
+                esr: 0x15 << 26,
+                ..TrapFrame::default()
+            };
+            frame.x[8] = 56; // openat relative to a host directory
+            frame.x[0] = 3;
+            frame.x[1] = path.as_ptr().addr() as u64;
+            let Some(HostFileStage::Returned(result)) = native_host_file_stage(
+                &frame,
+                &task,
+                &Resident,
+                [3, 4, 5],
+                |_| {
+                    Some(NativeDescriptor::HostBacked {
+                        access: DescriptionAccess::ReadWrite,
+                    })
+                },
+                &mut |_| panic!("openat releases no mappings"),
+            ) else {
+                panic!("relative host-dirfd staging must refuse");
+            };
+            assert_eq!(
+                result.raw(),
+                carrick_syscall_abi::LINUX_ENOSYS.guest_retval()
+            );
+            assert_eq!(
+                native_host_file_return(
+                    result.raw(),
+                    carrick_guest_arch::NativeOrdinal::new(frame.x[8]),
+                    &counters,
+                    || child
+                ),
+                result.raw()
+            );
+            let snapshot = counters.copy_snapshot();
+            assert_eq!(snapshot.refused[56].load(Ordering::Relaxed), 1);
+            assert_eq!(
+                snapshot.refused_child[56].load(Ordering::Relaxed),
+                u64::from(child)
+            );
+            assert_eq!(snapshot.venue_refused[56].load(Ordering::Relaxed), 0);
+            assert_eq!(snapshot.served[56].load(Ordering::Relaxed), 1);
+            // Ordinary staging errors are answers, not refusals.
+            native_host_file_return(
+                carrick_syscall_abi::LINUX_EBADF.guest_retval(),
+                carrick_guest_arch::NativeOrdinal::new(56),
+                &counters,
+                || child,
+            );
+            assert_eq!(counters.refused[56].load(Ordering::Relaxed), 1);
+        }
     }
 
     #[test]

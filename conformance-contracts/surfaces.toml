@@ -189,6 +189,7 @@ surfaces = [
   { path = "crates/carrick-el1-linux/src/cow_resolver.rs", contract = "kernel.el1.fork-cow" },
   { path = "crates/carrick-el1-linux/src/dispatch.rs", contract = "core.entry.completion" },
   { path = "crates/carrick-el1-linux/src/dispatch.rs", contract = "core.personality.files" },
+  { path = "crates/carrick-el1-linux/src/dispatch.rs", contract = "diagnostics.syscall-refusal" },
   { path = "crates/carrick-el1-linux/src/dispatch.rs", contract = "kernel.el1.ipc-fd-authority" },
   { path = "crates/carrick-el1-linux/src/dispatch.rs", contract = "kernel.el1.ipc-two-process" },
   { path = "crates/carrick-el1-linux/src/dispatch.rs", contract = "kernel.el1.signal-delivery-owner" },
