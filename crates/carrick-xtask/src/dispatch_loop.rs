@@ -45,6 +45,11 @@ pub(super) struct TierBudget {
     workers: u32,
     wall_minutes: u64,
     worker_minutes: u64,
+    /// One worker's longest turn in this tier. Strong rounds build and gate
+    /// the whole workspace, which a 40-minute turn cut off three times in a
+    /// row on 2026-11-03 (#1485); the WIP checkpoint after every worker still
+    /// bounds how much a turn can lose.
+    worker_turn_minutes: u64,
 }
 fn default_harvest_seconds() -> u64 {
     180
@@ -73,6 +78,7 @@ impl Policy {
             p.workers = p.strong.workers;
             p.wall_minutes = p.strong.wall_minutes;
             p.worker_minutes = p.strong.worker_minutes;
+            p.worker_turn_minutes = p.strong.worker_turn_minutes;
         }
         p
     }
@@ -7002,6 +7008,11 @@ fi
         assert!((170..=180).contains(&strong.wall_minutes), "{strong:?}");
         assert!(strong.worker_minutes < strong.wall_minutes);
         assert!(strong.worker_turn_minutes < strong.worker_minutes);
+        // Strong turns are long enough to build and gate the workspace
+        // (#1485 lost three rounds to a 40-minute cap at the gate stage),
+        // and longer than a standard turn.
+        assert!(strong.worker_turn_minutes >= 75, "{strong:?}");
+        assert!(strong.worker_turn_minutes > standard.worker_turn_minutes);
         assert!(
             u64::from(strong.workers) * strong.worker_turn_minutes >= strong.worker_minutes,
             "turns cannot spend the strong worker budget"
