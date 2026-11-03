@@ -229,3 +229,20 @@ This VM-free witness does not qualify signed guest execution or oracle shapes.
 With the shared return settlement's accounting removed, the witness failed
 with `refused[56] == 0` instead of `1` (exit 101). Restoring accounting is
 required for the green witness; staging still returns errno 38 unchanged.
+
+### Combined ABI after object-wait protocol 13
+
+The census layout must be fingerprinted together with main's object-wait
+protocol 13, rather than pinning the pre-rebase census hash. The combined
+`EL1_ABI_LAYOUT_HASH` is `0xe329ce06dd84c0a6`. The compile-time assertion was
+red with `0x486abff97ce01d37` (E0080, exit 101).
+
+Relative to admitted main, `Counters` appends `refused_child`,
+`venue_refused` and `venue_refused_child`, each 513 atomic u64 entries.
+`ServiceCell` retains its byte layout but encodes `ServiceBirth` lineage
+in the high half of the process-ID word and Exec/HostFile diagnostic
+ordinals in the high half of the payload-length word. The corresponding
+Rust `ServiceBirth`, `ExecPayloadDescriptor` and `HostFilePayloadDescriptor`
+values gain those fields. `NATIVE_SERVICE_PROTOCOL` advances once from
+main's 6 to 7; `OBJECT_WAIT_PROTOCOL` stays at main's 13. This fix round
+only refreshes the layout pin; it changes no protocol or record again.
