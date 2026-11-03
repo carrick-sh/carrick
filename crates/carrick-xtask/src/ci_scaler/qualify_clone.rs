@@ -274,9 +274,10 @@ test -c /dev/kvm
 fn destroy_container(site: &site::Site) -> Result<(), ScalerError> {
     let cleanup = Instant::now() + Duration::from_secs(360);
     if command(&["pct", "status", VM], cleanup).is_ok() {
-        // Stop fails on a container that never started; destroy decides.
+        // Stop fails on a container that never started and unlock on one
+        // that holds no lock; destroy decides.
         let _ = command(&["pct", "stop", VM], cleanup);
-        command(&["pct", "unlock", VM], cleanup)?;
+        let _ = command(&["pct", "unlock", VM], cleanup);
         command(&["pct", "destroy", VM, "--purge", "1"], cleanup)?;
     }
     let volumes: Value = serde_json::from_str(&command(

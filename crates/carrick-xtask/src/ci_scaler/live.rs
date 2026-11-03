@@ -280,8 +280,10 @@ fn container_clone_config(site: &Site, vm: CloneId) -> Result<Value, ScalerError
 }
 /// Root in the container: authorize the controller's transport key for the
 /// runner (key on stdin) and give this clone its own SSH host keys, since a
-/// full container copy carries the template's.
-pub(super) const CONTAINER_TRANSPORT: &str = "set -eu; install -d -o runner -g runner -m 700 /home/runner/.ssh; install -o runner -g runner -m 600 /dev/stdin /home/runner/.ssh/authorized_keys; rm -f /etc/ssh/ssh_host_*; ssh-keygen -q -A; systemctl restart ssh";
+/// full container copy carries the template's. The key is read from the
+/// inherited descriptor: the pipe belongs to host root, so an unprivileged
+/// container cannot reopen it as `/dev/stdin` (EACCES, live on ctb).
+pub(super) const CONTAINER_TRANSPORT: &str = "set -eu; install -d -o runner -g runner -m 700 /home/runner/.ssh; umask 077; cat > /home/runner/.ssh/authorized_keys; chown runner:runner /home/runner/.ssh/authorized_keys; rm -f /etc/ssh/ssh_host_*; ssh-keygen -q -A; systemctl restart ssh";
 
 fn pve_response(bytes: &[u8]) -> Result<Value, ScalerError> {
     let end = bytes
