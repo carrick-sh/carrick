@@ -301,7 +301,7 @@ struct InventoryState {
     quarantined_returns: u64,
     reservations: BTreeMap<KernelTransactionId, ReservationRecord>,
     frames: BTreeMap<FrameId, FrameEntry>,
-    mappings: BTreeMap<MappingId, MappingEntry>,
+    mappings: BTreeMap<MappingId, MappingSlot>,
     /// Live mapping count per address space, maintained alongside `mappings`.
     ///
     /// `apply_inner` has to report whether the committing mm still owns any
@@ -339,18 +339,67 @@ struct MappingEntry {
     state: MappingState,
 }
 
+/// The placeholder exposes diagnostic metadata only; the claimant owns the row.
+#[derive(Debug, Eq, PartialEq)]
+enum MappingSlot {
+    Live(MappingEntry),
+    Claimed(ClaimMark),
+}
+#[derive(Debug, Eq, PartialEq)]
+struct ClaimMark {
+    row: MappingRow,
+}
+impl MappingSlot {
+    fn live(&self) -> Option<&MappingEntry> {
+        match self {
+            Self::Live(entry) => Some(entry),
+            Self::Claimed(_) => None,
+        }
+    }
+    fn owner(&self) -> FrameOwner {
+        match self {
+            Self::Live(entry) => entry.mm,
+            Self::Claimed(mark) => mark.row.mm,
+        }
+    }
+    fn frame(&self) -> FrameId {
+        match self {
+            Self::Live(entry) => entry.frame,
+            Self::Claimed(mark) => mark.row.frame,
+        }
+    }
+    fn snapshot(&self, mapping: MappingId) -> Option<MappingRow> {
+        match self {
+            Self::Live(entry) if entry.state.is_published() => Some(MappingRow {
+                mapping,
+                frame: entry.frame,
+                mm: entry.mm,
+                generation: entry.generation,
+                gpa: entry.gpa,
+                length: entry.length,
+                permissions: entry.permissions,
+            }),
+            Self::Live(_) => None,
+            Self::Claimed(mark) => Some(mark.row),
+        }
+    }
+}
+struct ClaimedRow {
+    id: MappingId,
+    entry: MappingEntry,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MappingState {
     Prepared(KernelTransactionId),
     Published,
-    Retiring(KernelTransactionId),
 }
 
 impl MappingState {
     fn is_published(self) -> bool {
         match self {
             Self::Published => true,
-            Self::Prepared(_) | Self::Retiring(_) => false,
+            Self::Prepared(_) => false,
         }
     }
 }
@@ -369,7 +418,7 @@ impl MappingState {
 fn recomputed_mm_mapping_counts(state: &InventoryState) -> BTreeMap<FrameOwner, usize> {
     let mut counts = BTreeMap::new();
     for mapping in state.mappings.values() {
-        *counts.entry(mapping.mm).or_insert(0) += 1;
+        *counts.entry(mapping.owner()).or_insert(0) += 1;
     }
     counts
 }
@@ -409,13 +458,13 @@ impl<'a> InventoryOverlay<'a> {
         match self.mappings.get(&mapping) {
             Some(Some(entry)) => Some(entry),
             Some(None) => None,
-            None => self.base.mappings.get(&mapping),
+            None => self.base.mappings.get(&mapping).and_then(MappingSlot::live),
         }
     }
 
     fn mapping_mut(&mut self, mapping: MappingId) -> Option<&mut MappingEntry> {
         if !self.mappings.contains_key(&mapping) {
-            let entry = *self.base.mappings.get(&mapping)?;
+            let entry = *self.base.mappings.get(&mapping)?.live()?;
             self.mappings.insert(mapping, Some(entry));
         }
         self.mappings.get_mut(&mapping)?.as_mut()
@@ -608,6 +657,7 @@ impl FrameInventoryAuthority {
             let entry = state
                 .mappings
                 .get(&mapping)
+                .and_then(MappingSlot::live)
                 .ok_or(FrameInventoryError::RollbackReceiptMismatch(mapping))?;
             if !entry.state.is_published() || entry.mm != mm || entry.frame != frame {
                 return Err(FrameInventoryError::RollbackReceiptMismatch(mapping));
@@ -626,7 +676,7 @@ impl FrameInventoryAuthority {
                 .mappings
                 .remove(&mapping)
                 .ok_or(FrameInventoryError::RollbackReceiptMismatch(mapping))?;
-            decrement_mm_mapping_count(&mut state.mm_mapping_counts, removed.mm);
+            decrement_mm_mapping_count(&mut state.mm_mapping_counts, removed.owner());
             let retire_frame = {
                 let frame_entry = state
                     .frames
@@ -709,13 +759,14 @@ impl FrameInventoryAuthority {
             if state
                 .mappings
                 .values()
-                .any(|entry| entry.mm == mm && matches!(entry.state, MappingState::Retiring(_)))
+                .any(|entry| entry.owner() == mm && matches!(entry, MappingSlot::Claimed(_)))
             {
                 return Err(FrameInventoryRetireMmError::RetryPending);
             }
             state
                 .mappings
                 .iter()
+                .filter_map(|(id, slot)| slot.live().map(|entry| (id, entry)))
                 .filter(|(_, entry)| entry.mm == mm)
                 .map(|(mapping, entry)| (*mapping, entry.frame, entry.generation))
                 .collect()
@@ -784,7 +835,7 @@ impl FrameInventoryAuthority {
                 let frame = state
                     .mappings
                     .get(&mapping)
-                    .map(|entry| entry.frame)
+                    .map(MappingSlot::frame)
                     .ok_or(FrameInventoryError::NonliveMapping(mapping))?;
                 mappings.push((mapping, frame));
             }
@@ -885,14 +936,15 @@ impl FrameInventoryAuthority {
             match entry {
                 Some(entry) => {
                     let mm_after = entry.mm;
-                    if let Some(previous) = state.mappings.insert(mapping, entry) {
-                        decrement_mm_mapping_count(&mut state.mm_mapping_counts, previous.mm);
+                    if let Some(previous) = state.mappings.insert(mapping, MappingSlot::Live(entry))
+                    {
+                        decrement_mm_mapping_count(&mut state.mm_mapping_counts, previous.owner());
                     }
                     *state.mm_mapping_counts.entry(mm_after).or_insert(0) += 1;
                 }
                 None => {
                     if let Some(previous) = state.mappings.remove(&mapping) {
-                        decrement_mm_mapping_count(&mut state.mm_mapping_counts, previous.mm);
+                        decrement_mm_mapping_count(&mut state.mm_mapping_counts, previous.owner());
                     }
                 }
             }
@@ -923,6 +975,7 @@ impl FrameInventoryAuthority {
         let entry = state
             .mappings
             .get(&mapping)
+            .and_then(MappingSlot::live)
             .filter(|entry| entry.mm == mm && entry.state.is_published())?;
         Some(MappingRow {
             mapping,
@@ -979,6 +1032,7 @@ impl FrameInventoryAuthority {
         state
             .mappings
             .get(&mapping)
+            .and_then(MappingSlot::live)
             .filter(|entry| {
                 entry.state.is_published()
                     && entry.mm == mm
@@ -1049,13 +1103,17 @@ impl FrameInventoryAuthority {
         let extent_liveness = extents
             .iter()
             .map(|&(target_map, frame, gpa, length)| {
-                state.mappings.get(&target_map).is_some_and(|entry| {
-                    entry.state.is_published()
-                        && entry.mm == mm
-                        && entry.frame == frame
-                        && entry.gpa == gpa
-                        && entry.length == length
-                })
+                state
+                    .mappings
+                    .get(&target_map)
+                    .and_then(MappingSlot::live)
+                    .is_some_and(|entry| {
+                        entry.state.is_published()
+                            && entry.mm == mm
+                            && entry.frame == frame
+                            && entry.gpa == gpa
+                            && entry.length == length
+                    })
             })
             .collect();
         let frame_counts = frames
@@ -1128,14 +1186,12 @@ fn apply_event(
         | FrameInventoryEvent::RetireFrameIfLastUnmap { .. } => None,
     };
     if let Some(mapping) = mapping
-        && let Some(entry) = state.mapping(mapping)
+        && matches!(
+            state.base.mappings.get(&mapping),
+            Some(MappingSlot::Claimed(_))
+        )
     {
-        match entry.state {
-            MappingState::Retiring(_) => {
-                return Err(FrameInventoryError::ClaimedMapping(mapping));
-            }
-            MappingState::Prepared(_) | MappingState::Published => {}
-        }
+        return Err(FrameInventoryError::ClaimedMapping(mapping));
     }
     match event {
         FrameInventoryEvent::PrepareMapping {
@@ -1448,27 +1504,14 @@ fn snapshot_state(state: &InventoryState, mm_filter: Option<FrameOwner>) -> Fram
         });
     }
     let mut mappings = Vec::with_capacity(state.mappings.len());
-    for (mapping, entry) in &state.mappings {
-        // Claims retain physical ownership until apply. Diagnostic snapshots
-        // include those rows, while mutation/authentication queries require
-        // Published and therefore refuse a claimed mapping.
-        let inventoried = match entry.state {
-            MappingState::Published | MappingState::Retiring(_) => true,
-            MappingState::Prepared(_) => false,
+    for (mapping, slot) in &state.mappings {
+        let Some(row) = slot.snapshot(*mapping) else {
+            continue;
         };
-        if !inventoried || mm_filter.is_some_and(|mm| entry.mm != mm) {
+        if mm_filter.is_some_and(|mm| row.mm != mm) {
             continue;
         }
-        let row = MappingRow {
-            mapping: *mapping,
-            frame: entry.frame,
-            mm: entry.mm,
-            generation: entry.generation,
-            gpa: entry.gpa,
-            length: entry.length,
-            permissions: entry.permissions,
-        };
-        if let Some(index) = frame_indexes.get(&entry.frame).copied() {
+        if let Some(index) = frame_indexes.get(&row.frame).copied() {
             frames[index].mappings.push(*mapping);
         }
         mappings.push(row);
@@ -1689,6 +1732,7 @@ impl FrameInventoryAuthority {
             .lock()
             .mappings
             .get(&mapping)
+            .and_then(MappingSlot::live)
             .is_some_and(|entry| {
                 entry.state.is_published()
                     && entry.mm == mm
@@ -4752,23 +4796,14 @@ struct ClaimedReturn {
     disposition: ReturnDisposition,
     inventory: std::sync::Arc<FrameInventoryAuthority>,
     mm: FrameOwner,
-    transaction: KernelTransactionId,
-    rows: Vec<carrick_hal::ExactReturnMappingRow>,
+    rows: Vec<ClaimedRow>,
     last_unmapped: Vec<FrameId>,
 }
 impl ClaimedReturn {
     fn restore(&mut self, abandoned: bool) {
         let mut state = self.inventory.state.lock();
-        for row in &self.rows {
-            match state.mappings.get_mut(&row.mapping) {
-                Some(entry) if entry.state == MappingState::Retiring(self.transaction) => {
-                    entry.state = MappingState::Published
-                }
-                _ => carrick_fatal!(
-                    "kernel::frame_inventory",
-                    "prepared return abort lost its claimed row"
-                ),
-            }
+        for row in self.rows.drain(..) {
+            state.mappings.insert(row.id, MappingSlot::Live(row.entry));
         }
         state.return_claims -= 1;
         if abandoned {
@@ -4801,19 +4836,9 @@ impl carrick_hal::ReturnClaim for ClaimedReturn {
     fn apply(mut self: Box<Self>) -> carrick_hal::AppliedReturn {
         let mut last_unmapped = std::mem::take(&mut self.last_unmapped);
         let mut state = self.inventory.state.lock();
-        for row in &self.rows {
-            match state.mappings.get(&row.mapping) {
-                Some(entry)
-                    if entry.state == MappingState::Retiring(self.transaction)
-                        && entry.mm == self.mm
-                        && entry.frame == row.frame
-                        && entry.generation == row.generation => {}
-                _ => carrick_fatal!(
-                    "kernel::frame_inventory",
-                    "prepared return lost its exact claimed row"
-                ),
-            }
-            state.mappings.remove(&row.mapping);
+        for row in self.rows.drain(..) {
+            state.mappings.remove(&row.id);
+            let row = row.entry;
             decrement_mm_mapping_count(&mut state.mm_mapping_counts, self.mm);
             if let Some(frame) = state.frames.get_mut(&row.frame) {
                 if frame.references.unmap().is_err() {
@@ -4862,14 +4887,12 @@ impl FrameInventoryAuthority {
         if rows.is_empty() || rows.len() > 512 || bytes.is_none_or(|bytes| bytes > 512 * 4096) {
             return Err(Error::Capacity);
         }
-        let transaction = ids.transaction_id().map_err(|_| Error::Capacity)?;
+        let _transaction = ids.transaction_id().map_err(|_| Error::Capacity)?;
         let mm = mm.into();
         let mut retained_rows = Vec::new();
         retained_rows
             .try_reserve_exact(rows.len())
             .map_err(|_| Error::Capacity)?;
-        retained_rows.extend_from_slice(rows);
-        let rows = retained_rows;
         let mut last_unmapped = Vec::new();
         last_unmapped
             .try_reserve_exact(rows.len())
@@ -4881,11 +4904,15 @@ impl FrameInventoryAuthority {
             .and_then(|value| value.checked_add(1))
             .ok_or(Error::RevisionExhausted)?;
         let mut unique = BTreeSet::new();
-        for row in &rows {
-            let entry = state.mappings.get(&row.mapping).ok_or(Error::RowMismatch)?;
+        for row in rows {
+            let entry = state
+                .mappings
+                .get(&row.mapping)
+                .and_then(MappingSlot::live)
+                .ok_or(Error::RowMismatch)?;
             let published = match entry.state {
                 MappingState::Published => true,
-                MappingState::Prepared(_) | MappingState::Retiring(_) => false,
+                MappingState::Prepared(_) => false,
             };
             if !unique.insert(row.mapping)
                 || !published
@@ -4899,9 +4926,25 @@ impl FrameInventoryAuthority {
                 return Err(Error::RowMismatch);
             }
         }
-        for row in &rows {
-            if let Some(entry) = state.mappings.get_mut(&row.mapping) {
-                entry.state = MappingState::Retiring(transaction);
+        for row in rows {
+            if let Some(slot) = state.mappings.get_mut(&row.mapping)
+                && let MappingSlot::Live(entry) = slot
+            {
+                let snapshot = MappingRow {
+                    mapping: row.mapping,
+                    frame: entry.frame,
+                    mm: entry.mm,
+                    generation: entry.generation,
+                    gpa: entry.gpa,
+                    length: entry.length,
+                    permissions: entry.permissions,
+                };
+                let entry = *entry;
+                *slot = MappingSlot::Claimed(ClaimMark { row: snapshot });
+                retained_rows.push(ClaimedRow {
+                    id: row.mapping,
+                    entry,
+                });
             }
         }
         state.return_claims += 1;
@@ -4911,8 +4954,7 @@ impl FrameInventoryAuthority {
                 disposition: ReturnDisposition::Prepared,
                 inventory: self.clone(),
                 mm,
-                transaction,
-                rows,
+                rows: retained_rows,
                 last_unmapped,
             },
         )))
@@ -5079,6 +5121,34 @@ mod prepared_return_tests {
         claim.abort();
         assert!(inventory.live_mapping_row(owner, row.mapping).is_some());
     }
+    #[test]
+    fn claim_placeholder_is_not_copied_into_overlay_and_restore_keeps_metadata() {
+        let (inventory, ids, owner, row) = fixture();
+        let before = inventory.snapshot();
+        let claim = inventory.prepare_return(&ids, owner, &[row]).unwrap();
+        {
+            let state = inventory.state.lock();
+            assert!(matches!(
+                state.mappings.get(&row.mapping),
+                Some(MappingSlot::Claimed(_))
+            ));
+            let mut overlay = InventoryOverlay::new(&state);
+            assert!(overlay.mapping(row.mapping).is_none());
+            assert!(overlay.mapping_mut(row.mapping).is_none());
+            assert!(overlay.mappings.is_empty());
+            assert_eq!(
+                recomputed_mm_mapping_counts(&state),
+                state.mm_mapping_counts
+            );
+        }
+        claim.abort();
+        assert_eq!(inventory.snapshot(), before);
+        assert!(matches!(
+            inventory.state.lock().mappings.get(&row.mapping),
+            Some(MappingSlot::Live(_))
+        ));
+    }
+
     #[test]
     fn sibling_unmaps_shared_frame_between_prepare_and_apply() {
         let (inventory, ids, owner, row) = fixture();
