@@ -10945,56 +10945,56 @@
     {
       "family": "host_backing",
       "operation": "std::fs::create_dir_all",
-      "owner": "carrick_runtime::el1_census::write_at_teardown",
+      "owner": "carrick_runtime::el1_census::publish",
       "lane": "freebsd_cli",
       "ceiling": 1
     },
     {
       "family": "host_backing",
       "operation": "std::fs::create_dir_all",
-      "owner": "carrick_runtime::el1_census::write_at_teardown",
+      "owner": "carrick_runtime::el1_census::publish",
       "lane": "freebsd_runtime",
       "ceiling": 1
     },
     {
       "family": "host_backing",
       "operation": "std::fs::create_dir_all",
-      "owner": "carrick_runtime::el1_census::write_at_teardown",
+      "owner": "carrick_runtime::el1_census::publish",
       "lane": "linux_cli",
       "ceiling": 1
     },
     {
       "family": "host_backing",
       "operation": "std::fs::create_dir_all",
-      "owner": "carrick_runtime::el1_census::write_at_teardown",
+      "owner": "carrick_runtime::el1_census::publish",
       "lane": "linux_runtime",
       "ceiling": 1
     },
     {
       "family": "host_backing",
       "operation": "std::fs::create_dir_all",
-      "owner": "carrick_runtime::el1_census::write_at_teardown",
+      "owner": "carrick_runtime::el1_census::publish",
       "lane": "macos_cli_default",
       "ceiling": 1
     },
     {
       "family": "host_backing",
       "operation": "std::fs::create_dir_all",
-      "owner": "carrick_runtime::el1_census::write_at_teardown",
+      "owner": "carrick_runtime::el1_census::publish",
       "lane": "macos_runtime_default",
       "ceiling": 1
     },
     {
       "family": "host_backing",
       "operation": "std::fs::create_dir_all",
-      "owner": "carrick_runtime::el1_census::write_at_teardown",
+      "owner": "carrick_runtime::el1_census::publish",
       "lane": "netbsd_cli",
       "ceiling": 1
     },
     {
       "family": "host_backing",
       "operation": "std::fs::create_dir_all",
-      "owner": "carrick_runtime::el1_census::write_at_teardown",
+      "owner": "carrick_runtime::el1_census::publish",
       "lane": "netbsd_runtime",
       "ceiling": 1
     },
@@ -19702,56 +19702,56 @@
     {
       "family": "host_backing",
       "operation": "std::fs::write",
-      "owner": "carrick_runtime::el1_census::write_at_teardown",
+      "owner": "carrick_runtime::el1_census::publish",
       "lane": "freebsd_cli",
       "ceiling": 1
     },
     {
       "family": "host_backing",
       "operation": "std::fs::write",
-      "owner": "carrick_runtime::el1_census::write_at_teardown",
+      "owner": "carrick_runtime::el1_census::publish",
       "lane": "freebsd_runtime",
       "ceiling": 1
     },
     {
       "family": "host_backing",
       "operation": "std::fs::write",
-      "owner": "carrick_runtime::el1_census::write_at_teardown",
+      "owner": "carrick_runtime::el1_census::publish",
       "lane": "linux_cli",
       "ceiling": 1
     },
     {
       "family": "host_backing",
       "operation": "std::fs::write",
-      "owner": "carrick_runtime::el1_census::write_at_teardown",
+      "owner": "carrick_runtime::el1_census::publish",
       "lane": "linux_runtime",
       "ceiling": 1
     },
     {
       "family": "host_backing",
       "operation": "std::fs::write",
-      "owner": "carrick_runtime::el1_census::write_at_teardown",
+      "owner": "carrick_runtime::el1_census::publish",
       "lane": "macos_cli_default",
       "ceiling": 1
     },
     {
       "family": "host_backing",
       "operation": "std::fs::write",
-      "owner": "carrick_runtime::el1_census::write_at_teardown",
+      "owner": "carrick_runtime::el1_census::publish",
       "lane": "macos_runtime_default",
       "ceiling": 1
     },
     {
       "family": "host_backing",
       "operation": "std::fs::write",
-      "owner": "carrick_runtime::el1_census::write_at_teardown",
+      "owner": "carrick_runtime::el1_census::publish",
       "lane": "netbsd_cli",
       "ceiling": 1
     },
     {
       "family": "host_backing",
       "operation": "std::fs::write",
-      "owner": "carrick_runtime::el1_census::write_at_teardown",
+      "owner": "carrick_runtime::el1_census::publish",
       "lane": "netbsd_runtime",
       "ceiling": 1
     },
