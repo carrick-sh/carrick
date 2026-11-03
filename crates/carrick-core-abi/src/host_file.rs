@@ -49,6 +49,58 @@ pub enum HostFileOp {
     /// ring then maps it with its own reservation owner. Input is the list of
     /// sources the caller's owner retired, which the carrier releases first.
     MapPrivate = 11,
+    /// A non-blocking readiness snapshot of a `ppoll` set whose every live
+    /// entry names a host-backed description (or no descriptor). Input and
+    /// output are the caller's `struct pollfd` array ([`POLLFD_BYTES`] per
+    /// entry); the reply is that array with `revents` filled and the ready
+    /// count as the result. `args[0]` is a [`PollWait`] word: for
+    /// [`PollWait::Snapshot`] (a zero timeout) the empty snapshot is the
+    /// answer; for [`PollWait::MayWait`] the carrier, which never blocks,
+    /// refuses an empty snapshot (counted ENOSYS) and writes no `revents`.
+    /// The header `fd` is unused (`-1`); each entry is pinned in the
+    /// caller's table.
+    Poll = 12,
+}
+
+/// Bytes of one Linux `struct pollfd` (`int fd; short events, revents`).
+pub const POLLFD_BYTES: usize = 8;
+/// [`HostFileOp::Poll`] `args[0]`: whether the caller would wait.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u64)]
+pub enum PollWait {
+    /// A zero timeout: the snapshot is the answer, even an empty one.
+    Snapshot = 0,
+    /// The caller would wait: an empty snapshot is refused rather than
+    /// reported as a timeout.
+    MayWait = 1,
+}
+
+impl PollWait {
+    pub const fn raw(self) -> u64 {
+        self as u64
+    }
+
+    pub const fn from_raw(raw: u64) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Snapshot),
+            1 => Some(Self::MayWait),
+            _ => None,
+        }
+    }
+}
+
+/// The `ordinal` a refused host-file record reports through the
+/// `hvpatch-native-crossing-refused` probe: this base plus the record's
+/// [`HostFileOp`] wire value (the base alone for a record that does not
+/// parse). It sits above every syscall number, so a refused venue
+/// operation never reads as syscall 0 (`io_setup`).
+pub const HOST_FILE_REFUSAL_ORDINAL_BASE: u64 = 0x1_0000;
+
+/// The refusal probe ordinal of one staged record
+/// ([`HOST_FILE_REFUSAL_ORDINAL_BASE`] + op).
+pub fn refusal_ordinal(bytes: &[u8]) -> u64 {
+    HOST_FILE_REFUSAL_ORDINAL_BASE
+        + request_parts(bytes).map_or(0, |(header, _, _)| header.op as u16 as u64)
 }
 
 /// The byte-source identity a [`HostFileOp::MapPrivate`] reply carries: the
@@ -122,6 +174,7 @@ impl HostFileOp {
             9 => Self::Lseek,
             10 => Self::Getdents64,
             11 => Self::MapPrivate,
+            12 => Self::Poll,
             _ => return None,
         })
     }

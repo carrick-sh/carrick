@@ -783,3 +783,159 @@ fn access_context_leads_only_path_records() {
     ));
     assert_eq!(&*stamp_access_context(&record, &access).unwrap(), &*record);
 }
+
+fn pollfds(entries: &[(i32, i16)]) -> Vec<u8> {
+    entries
+        .iter()
+        .flat_map(|&(fd, events)| {
+            let mut entry = [0u8; host_file::POLLFD_BYTES];
+            entry[..4].copy_from_slice(&fd.to_le_bytes());
+            entry[4..6].copy_from_slice(&events.to_le_bytes());
+            // A stale revents the guest left behind travels unchanged; the
+            // carrier overwrites it.
+            entry[6..].copy_from_slice(&0x7fffi16.to_le_bytes());
+            entry
+        })
+        .collect()
+}
+
+/// `ppoll(fds, nfds, timeout, NULL)` with the pollfd array at `BASE` and a
+/// timespec, when given, right after it.
+fn ppoll(entries: &[(i32, i16)], timespec: Option<(i64, i64)>) -> (HostFileCall, Memory) {
+    let mut bytes = pollfds(entries);
+    let timeout = timespec.map_or(0, |(seconds, nanoseconds)| {
+        let address = BASE + bytes.len() as u64;
+        bytes.extend_from_slice(&seconds.to_le_bytes());
+        bytes.extend_from_slice(&nanoseconds.to_le_bytes());
+        address
+    });
+    (
+        HostFileCall::Ppoll {
+            fds: BASE,
+            nfds: entries.len() as u64,
+            timeout,
+            sigmask: 0,
+        },
+        memory(&bytes),
+    )
+}
+
+#[test]
+fn ppoll_decodes_its_four_routing_arguments() {
+    assert_eq!(
+        HostFileCall::decode(crate::crossing::nr::PPOLL, &[BASE, 3, 0x20, 0x30, 8, 0]),
+        Some(HostFileCall::Ppoll {
+            fds: BASE,
+            nfds: 3,
+            timeout: 0x20,
+            sigmask: 0x30,
+        })
+    );
+}
+
+#[test]
+fn ppoll_over_host_stdio_stages_one_readiness_snapshot() {
+    // Rust std's startup shape: fds 0-2, no events, zero timeout. Here fd 1
+    // is host stdout and fd 7 is absent (the carrier reports POLLNVAL).
+    let entries = [(1, 0), (-1, 0x1), (7, 0)];
+    let (call, mut user) = ppoll(&entries, Some((0, 0)));
+    let (mut record, output, resolves_path) = request(run(call, &mut user));
+    assert!(!resolves_path);
+    assert_eq!(
+        output,
+        Some(HostFileOutput {
+            address: BASE,
+            len: entries.len() * host_file::POLLFD_BYTES,
+        })
+    );
+    let view = HostFileRequestView::parse(&mut record).unwrap();
+    assert_eq!(view.header().op, HostFileOp::Poll);
+    assert_eq!(view.header().table, TABLE);
+    assert_eq!(view.header().args[0], host_file::PollWait::Snapshot.raw());
+    assert_eq!(view.input(), pollfds(&entries));
+    assert_eq!(view.output_capacity(), view.input().len());
+}
+
+#[test]
+fn ppoll_that_would_wait_marks_its_snapshot_may_wait() {
+    for timespec in [None, Some((0, 1)), Some((5, 0))] {
+        let (call, mut user) = ppoll(&[(1, 0x4)], timespec);
+        let (mut record, _, _) = request(run(call, &mut user));
+        let view = HostFileRequestView::parse(&mut record).unwrap();
+        assert_eq!(
+            view.header().args[0],
+            host_file::PollWait::MayWait.raw(),
+            "{timespec:?}"
+        );
+    }
+}
+
+#[test]
+fn ppoll_sets_the_carrier_cannot_answer_whole_keep_their_route() {
+    // A mixed set (fd 0 is an in-zone pipe) needs the ring's wait (#1051).
+    let (call, mut user) = ppoll(&[(1, 0x4), (0, 0x1)], Some((0, 0)));
+    assert_eq!(run(call, &mut user), None);
+    // No host-backed member: nothing for the carrier to observe.
+    let (call, mut user) = ppoll(&[(7, 0x1), (-1, 0)], Some((0, 0)));
+    assert_eq!(run(call, &mut user), None);
+    // A signal mask is installed by the ring's wait, not by a snapshot.
+    let (call, mut user) = ppoll(&[(1, 0x4)], Some((0, 0)));
+    let HostFileCall::Ppoll {
+        fds, nfds, timeout, ..
+    } = call
+    else {
+        unreachable!()
+    };
+    let masked = HostFileCall::Ppoll {
+        fds,
+        nfds,
+        timeout,
+        sigmask: BASE,
+    };
+    assert_eq!(run(masked, &mut user), None);
+    // More entries than one record carries.
+    let huge = HostFileCall::Ppoll {
+        fds: BASE,
+        nfds: (HOST_FILE_CHUNK_BYTES / host_file::POLLFD_BYTES) as u64 + 1,
+        timeout: 0,
+        sigmask: 0,
+    };
+    assert_eq!(run(huge, &mut user), None);
+    // A contended namespace keeps the route too.
+    let (call, mut user) = ppoll(&[(1, 0x4)], Some((0, 0)));
+    let mut resolve = |_| None;
+    let mut releases = |_: &mut [host_file::MapSourceReply]| 0;
+    let mut namespace = NativeNamespace {
+        table: TABLE,
+        resolve: &mut resolve,
+        releases: &mut releases,
+    };
+    assert_eq!(stage(call, &mut namespace, &mut user), None);
+}
+
+#[test]
+fn ppoll_arrays_need_readable_input_and_writable_output_before_crossing() {
+    let (_, mut user) = ppoll(&[(1, 0x4)], None);
+    let unreadable = HostFileCall::Ppoll {
+        fds: BASE - 4096,
+        nfds: 1,
+        timeout: 0,
+        sigmask: 0,
+    };
+    assert_eq!(
+        run(unreadable, &mut user),
+        Some(HostFileStage::Fault {
+            address: BASE - 4096,
+            access: Access::Read,
+        })
+    );
+    let (call, mut user) = ppoll(&[(1, 0x4)], None);
+    user.writable = false;
+    assert_eq!(
+        run(call, &mut user),
+        Some(HostFileStage::Fault {
+            address: BASE,
+            access: Access::Write,
+        })
+    );
+}

@@ -14,7 +14,11 @@
  *
  * Provider ABI (crates/carrick-observability/src/probes.rs,
  * `hvpatch_native_crossing_refused`): arg0 mm u64, arg1 incarnation u64,
- * arg2 record u32, arg3 sequence u64, arg4 ordinal u64. Fired from
+ * arg2 record u32, arg3 sequence u64, arg4 ordinal u64. A host file venue
+ * refusal reports 0x10000 + its HostFileOp wire value as the ordinal
+ * (`carrick_core_abi::host_file::refusal_ordinal`; e.g. 65548 = Poll, 65537 =
+ * Write), never a syscall number. Before #894's slice it reported 0, which
+ * read as io_setup in the qualification below. Fired from
  * crates/carrick-vmm-hvf/src/metadata_grant/native_service.rs (`refuse` for
  * Crossing operations, `refuse_host_file` for host file venue refusals).
  *

@@ -1134,12 +1134,21 @@ impl<'a> NetView<'a> {
         let Some(open_file) = self.open_file(fd) else {
             return self.bare_stdio_poll_ready_events(fd, requested_events);
         };
-        if open_file.description.is_closed() {
+        self.description_poll_ready_events(&open_file.description, requested_events)
+    }
+
+    /// Linux poll readiness of one open description: the one answer a host
+    /// task's descriptor and a native venue descriptor naming it share.
+    pub(in crate::dispatch) fn description_poll_ready_events(
+        &self,
+        description: &crate::kernel::FileDescription,
+        requested_events: i16,
+    ) -> i16 {
+        if description.is_closed() {
             return LINUX_POLLNVAL;
         }
         let interest = carrick_abi::LinuxPollEvents::from_bits_truncate(requested_events);
-        open_file
-            .description
+        description
             .readiness(interest.to_epoll(), self)
             .to_poll()
             .bits()
@@ -3759,6 +3768,16 @@ impl SyscallDispatcher {
     #[inline]
     pub(in crate::dispatch) fn poll_ready_events(&self, fd: i32, requested_events: i16) -> i16 {
         self.net_view().poll_ready_events(fd, requested_events)
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn description_poll_ready_events(
+        &self,
+        description: &crate::kernel::FileDescription,
+        requested_events: i16,
+    ) -> i16 {
+        self.net_view()
+            .description_poll_ready_events(description, requested_events)
     }
 
     #[inline]
