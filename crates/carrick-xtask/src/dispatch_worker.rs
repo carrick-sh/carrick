@@ -4836,6 +4836,132 @@ fn check_commit_closures(
     }
     Ok(())
 }
+/// Normalize only the SDK's known identity; never guess an agent from a model
+/// string or discard another contributor's attribution.
+fn publication_commit_message(message: &str, coauthor: &str) -> Result<String, ScalerError> {
+    let expected = format!("Co-Authored-By: {coauthor}");
+    let mut replaced = false;
+    let mut lines = Vec::new();
+    for line in message.lines() {
+        if line.eq_ignore_ascii_case(
+            "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>",
+        ) {
+            replaced = true;
+        } else if line.to_ascii_lowercase().starts_with("co-authored-by:")
+            && line.to_ascii_lowercase().contains("copilot")
+        {
+            return Err(ScalerError::Guard("unknown Copilot coauthor trailer"));
+        } else {
+            lines.push(line);
+        }
+    }
+    if !replaced {
+        return Ok(message.to_owned());
+    }
+    if !crate::commit_trailers::validate_commit_message("worker.coauthor", &expected).is_empty()
+        || coauthor.contains(['\n', '\r'])
+        || crate::commit_trailers::detect_vendor(coauthor, "").is_none()
+    {
+        return Err(ScalerError::Guard("invalid worker coauthor"));
+    }
+    lines.retain(|line| *line != expected);
+    while lines.last() == Some(&"") {
+        lines.pop();
+    }
+    lines.push("");
+    lines.push(&expected);
+    let normalized = format!("{}\n", lines.join("\n"));
+    if !crate::commit_trailers::validate_commit_message("publication", &normalized).is_empty() {
+        return Err(ScalerError::Guard("invalid publication coauthor trailers"));
+    }
+    Ok(normalized)
+}
+
+/// Rebuild the run's linear suffix with identical trees and author metadata.
+/// Update HEAD only after every message has been admitted. Earlier published
+/// history is excluded and a merge is refused rather than flattened.
+fn normalize_publication_trailers(
+    work: &Path,
+    base: &str,
+    published_tip: Option<&str>,
+    coauthor: &str,
+) -> Result<bool, ScalerError> {
+    let range = format!("{base}..HEAD");
+    let mut args = vec!["rev-list", "--reverse", &range];
+    if let Some(tip) = published_tip {
+        args.extend(["--not", tip]);
+    }
+    let commits = git(work, &args)?;
+    let mut prepared = Vec::new();
+    for sha in commits.lines() {
+        let message = git(work, &["show", "-s", "--format=%B", sha])?;
+        let normalized = publication_commit_message(&message, coauthor)?;
+        prepared.push((sha, message, normalized));
+    }
+    if prepared.iter().all(|(_, old, new)| old == new) {
+        return Ok(false);
+    }
+    let old_head = git(work, &["rev-parse", "HEAD"])?;
+    let mut parent = None;
+    let mut rewritten = false;
+    let mut previous = None;
+    for (sha, original, message) in prepared {
+        let parents = git(work, &["show", "-s", "--format=%P", sha])?;
+        let parents: Vec<_> = parents.split_whitespace().collect();
+        if parents.len() != 1 {
+            return Err(ScalerError::Guard(
+                "trailer normalization requires linear worker history",
+            ));
+        }
+        if previous.is_some_and(|previous| parents[0] != previous) {
+            return Err(ScalerError::Guard(
+                "noncontiguous worker publication history",
+            ));
+        }
+        previous = Some(sha);
+        if !rewritten && original == message {
+            parent = Some(sha.to_owned());
+            continue;
+        }
+        rewritten = true;
+        let tree = git(work, &["show", "-s", "--format=%T", sha])?;
+        let mut command = git_invocation(
+            work,
+            &[
+                "commit-tree",
+                tree.trim(),
+                "-p",
+                parent.as_deref().unwrap_or(parents[0]),
+                "-m",
+                &message,
+            ],
+        );
+        for (key, format) in [
+            ("GIT_AUTHOR_NAME", "%an"),
+            ("GIT_AUTHOR_EMAIL", "%ae"),
+            ("GIT_AUTHOR_DATE", "%aI"),
+            ("GIT_COMMITTER_NAME", "%cn"),
+            ("GIT_COMMITTER_EMAIL", "%ce"),
+            ("GIT_COMMITTER_DATE", "%cI"),
+        ] {
+            command.env(
+                key,
+                git(work, &["show", "-s", &format!("--format={format}"), sha])?.trim(),
+            );
+        }
+        parent = Some(
+            String::from_utf8(output(&mut command)?)
+                .map_err(|_| ScalerError::Guard("non-UTF8 commit id"))?
+                .trim()
+                .to_owned(),
+        );
+    }
+    if let Some(head) = parent {
+        git(work, &["update-ref", "HEAD", &head, old_head.trim()])?;
+    }
+    Ok(true)
+}
+
 fn read_pr_body(directory: &Path) -> Result<Option<String>, ScalerError> {
     let path = directory.join("pr-body.md");
     match std::fs::symlink_metadata(&path) {
@@ -5886,6 +6012,13 @@ fn publish_commits(
             refresh_checkpoint_head(&state, &work)?;
             base = live_main.clone();
             *preserve = Some(base.clone());
+        }
+        let protected_tip = lease
+            .pushed
+            .as_deref()
+            .or((!receipt.expected_tip.is_empty()).then_some(receipt.expected_tip.as_str()));
+        if normalize_publication_trailers(&work, &base, protected_tip, &dispatch.worker.coauthor)? {
+            refresh_checkpoint_head(&state, &work)?;
         }
         let tip = live_branch_tip(&work, &dispatch.branch)?;
         let head = git(&work, &["rev-parse", "HEAD"])?;
@@ -7580,6 +7713,44 @@ mod tests {
     fn refused_publish_mint_keeps_publication_and_records_its_reason() {
         publication_fixture("publish-mint-refused");
     }
+    #[test]
+    fn publication_normalizes_copilot_sdk_trailer() {
+        publication_fixture("copilot-trailer");
+    }
+
+    #[test]
+    fn publication_trailers_replace_sdk_identity_once() {
+        let coauthor = "Claude Opus 5.5 <noreply@anthropic.com>";
+        let expected = format!("Co-Authored-By: {coauthor}");
+        for existing in [String::new(), format!("{expected}\n{expected}\n")] {
+            let message = format!(
+                "fix(ci): fixture\n\n{existing}Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>\n"
+            );
+            let normalized = publication_commit_message(&message, coauthor).unwrap();
+            assert_eq!(normalized.matches(&expected).count(), 1);
+            assert!(!normalized.contains("Copilot"));
+            assert_eq!(
+                publication_commit_message(&normalized, coauthor).unwrap(),
+                normalized
+            );
+        }
+    }
+
+    #[test]
+    fn publication_trailers_refuse_unknown_copilot_identity() {
+        assert!(
+            publication_commit_message(
+                "fix(ci): example\n\nCo-authored-by: Copilot <unknown@example.com>\n",
+                "Claude Opus 5.5 <noreply@anthropic.com>",
+            )
+            .is_err()
+        );
+        assert!(publication_commit_message(
+            "fix(ci): example\n\nCo-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>\n",
+            "unknown <unknown@example.com>",
+        ).is_err());
+    }
+
     fn publication_fixture(witness: &str) {
         publication_fixture_outcome(witness, |_, _| {});
     }
@@ -9119,6 +9290,40 @@ fi
             );
             return;
         }
+        let before_normalization = git(&work, &["rev-parse", "HEAD^{tree}"]).unwrap();
+        if witness == "copilot-trailer" {
+            dispatch.worker.coauthor = "Claude Opus 5.5 <noreply@anthropic.com>".into();
+            receipt.expected_tip = git(&work, &["rev-parse", "HEAD"]).unwrap().trim().into();
+            std::fs::write(
+                state.join("receipt.json"),
+                serde_json::to_vec(&receipt).unwrap(),
+            )
+            .unwrap();
+            git(&work, &["commit", "--allow-empty", "-m",
+                "fix(ci): Copilot worker change\n\nWhy: fixture.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nCo-Authored-By: Human Example <human@example.com>\nCo-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>",
+            ]).unwrap();
+            let identity = git(
+                &work,
+                &[
+                    "show",
+                    "-s",
+                    "--format=%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI",
+                    "HEAD",
+                ],
+            )
+            .unwrap();
+            std::fs::write(outer.join("copilot-identity"), identity).unwrap();
+            git(
+                &work,
+                &[
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "test(ci): follow the Copilot fix",
+                ],
+            )
+            .unwrap();
+        }
         assert_eq!(
             publish(
                 &work,
@@ -9133,6 +9338,66 @@ fi
             Some(800),
             "publication blamed live main workflow changes on the worker"
         );
+        if witness == "copilot-trailer" {
+            assert_eq!(
+                git(&work, &["show", "-s", "--format=%s", "HEAD"])
+                    .unwrap()
+                    .trim(),
+                "test(ci): follow the Copilot fix"
+            );
+            assert_eq!(
+                git(
+                    &work,
+                    &[
+                        "show",
+                        "-s",
+                        "--format=%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI",
+                        "HEAD^"
+                    ]
+                )
+                .unwrap(),
+                regular_text(&outer.join("copilot-identity")).unwrap()
+            );
+            assert_eq!(
+                git(&work, &["rev-parse", "HEAD^^"]).unwrap().trim(),
+                receipt.expected_tip
+            );
+            let persisted: Receipt =
+                serde_json::from_str(&regular_text(&state.join("receipt.json")).unwrap()).unwrap();
+            assert_eq!(
+                persisted.head,
+                git(&work, &["rev-parse", "HEAD"]).unwrap().trim()
+            );
+            crate::commit_trailers::run(
+                &work,
+                crate::commit_trailers::CommitTrailersArgs {
+                    action: crate::commit_trailers::CommitTrailersAction::CheckRange {
+                        range: format!("{}..HEAD", receipt.expected_tip),
+                    },
+                },
+                &mut Vec::new(),
+            )
+            .unwrap();
+            let message = git(&work, &["show", "-s", "--format=%B", "HEAD^"]).unwrap();
+            assert!(!message.contains("Copilot <"), "{message}");
+            assert_eq!(
+                message
+                    .matches("Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>")
+                    .count(),
+                1
+            );
+            assert!(message.contains("Co-Authored-By: Human Example <human@example.com>"));
+            assert!(crate::commit_trailers::validate_commit_message("HEAD", &message).is_empty());
+            assert_eq!(
+                git(&work, &["rev-parse", "HEAD^{tree}"]).unwrap(),
+                before_normalization
+            );
+            assert_eq!(
+                regular_text(&outer.join("remote-tip")).unwrap().trim(),
+                git(&work, &["rev-parse", "HEAD"]).unwrap().trim()
+            );
+            return;
+        }
         let applied = Applied::load().unwrap();
         if matches!(witness, "live-main-rebase" | "live-main-workflow") {
             let live = regular_text(&outer.join("live-base")).unwrap();
