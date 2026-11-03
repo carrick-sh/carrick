@@ -660,10 +660,16 @@ pub fn dispatch_entry(
     }
     let action = if frame.esr == 0 {
         dispatch_irq(frame, counters)
-    } else if matches!((frame.esr >> 26) & 0x3f, 0x20 | 0x24) {
-        dispatch_fault(frame, counters, owner_wait)
     } else {
-        dispatch_syscall(frame, counters)
+        match (frame.esr >> 26) & 0x3f {
+            0x20 | 0x24 => dispatch_fault(frame, counters, owner_wait),
+            0x15 => dispatch_syscall(frame, counters),
+            // Any other EL0 synchronous exception (BRK, step, undefined
+            // instruction, alignment, FP) is never a syscall (#1502). It
+            // forwards unserved: a native owner captures it as its exception
+            // service; a host task's leaves through `hvc #2` as before.
+            _ => Action::Forward,
+        }
     };
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     if action == Action::Served
@@ -4865,6 +4871,46 @@ mod tests {
             Action::Forward
         );
         assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 1);
+    }
+
+    /// #1502: the vector now enters EL1 for every EL0 synchronous
+    /// exception. A BRK, an undefined instruction, an alignment or an FP
+    /// trap is never a syscall: its x8 is whatever the program left there,
+    /// and dispatching it as one would run (and return from) a call the
+    /// program never made. It forwards unserved, so a ring-owned process's
+    /// native owner captures it as its exception service and a host task's
+    /// exception leaves through `hvc #2` exactly as before.
+    #[test]
+    fn el0_sync_exceptions_forward_without_dispatching_x8() {
+        for esr in [
+            0x3c << 26 | 0x1234, // brk #0x1234
+            1 << 25,             // undefined instruction (EC 0)
+            0x22 << 26,          // PC alignment
+            0x26 << 26,          // SP alignment
+            0x07 << 26,          // FP access
+            0x2c << 26,          // FP exception
+            0x32 << 26,          // software step
+            0x30 << 26,          // hardware breakpoint
+        ] {
+            let counters = Counters::default();
+            let mut frame = TrapFrame {
+                esr,
+                elr: 0x40_1000,
+                x: {
+                    let mut x = [0u64; 31];
+                    x[8] = 172; // SYS_getpid, as a program might leave it
+                    x
+                },
+                ..TrapFrame::default()
+            };
+            let action = dispatch_entry(&mut frame, &counters, &mut None);
+            assert_eq!(action, Action::Forward, "esr={esr:#x}");
+            assert_eq!(frame.x[0], 0, "esr={esr:#x}: no call result");
+            assert_eq!(frame.elr, 0x40_1000, "esr={esr:#x}: no replay");
+            assert_eq!(counters.served[172].load(Ordering::Relaxed), 0);
+            assert_eq!(counters.forwarded[172].load(Ordering::Relaxed), 0);
+            assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 0);
+        }
     }
 
     #[test]

@@ -283,7 +283,9 @@ impl Machine {
         let far = self.read(frame + 280);
         let irq = esr == 0;
         let signal_check = matches!(esr, 0xfffc..=0xfffe);
-        let is_fault = matches!((esr >> 26) & 0x3F, 0x20 | 0x24);
+        // As `dispatch_entry`: every EL0 synchronous exception except an
+        // SVC is forwarded unserved (an abort, BRK, step, undefined, ...).
+        let is_fault = !irq && !signal_check && (esr >> 26) & 0x3F != 0x15;
         if is_fault {
             self.fault_frames += 1;
         }
@@ -892,6 +894,35 @@ fn instruction_abort_enters_owner_fault_hook_then_forwards_to_host() {
         m.fault_frames, 1,
         "instruction abort must enter the EL1 owner hook"
     );
+}
+
+/// #1502: a BRK (and every other non-abort, non-system-register EL0 sync
+/// exception) enters the EL1 image through the fault hook, so a native
+/// owner can serve it; an unhandled one still forwards with ESR, ELR, FAR
+/// and every register intact.
+#[test]
+fn el0_brk_enters_the_owner_fault_hook_then_forwards_to_host() {
+    for esr in [
+        (0xF2_u64 << 24) | 0x1234, // brk #0x1234 (EC 0x3c, IL)
+        1 << 25,                   // undefined instruction (EC 0)
+        (0x22 << 26) | (1 << 25),  // PC alignment
+    ] {
+        let original: [u64; 31] = std::array::from_fn(|i| 0xBAAD_0000 + i as u64);
+        let mut m = Machine {
+            regs: original,
+            elr: 0x5000_1000,
+            spsr: EL0_DAIF_MASKED,
+            esr,
+            far: 0x1000_5000,
+            ..Machine::full_vector_page(El1IrqMode::Masked)
+        };
+        assert_eq!(m.run(None), Exit::Host, "esr={esr:#x} must forward");
+        assert_eq!(m.fault_frames, 1, "esr={esr:#x} must enter the EL1 hook");
+        assert_eq!(m.esr, esr);
+        assert_eq!(m.elr, 0x5000_1000);
+        assert_eq!(m.far, 0x1000_5000);
+        assert_eq!(m.regs, original);
+    }
 }
 
 #[test]

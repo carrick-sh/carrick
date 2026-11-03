@@ -5047,10 +5047,11 @@ pub const fn native_owner_cancel_entry() -> u64 {
     LINUX_EL1_VECTORS_BASE + NATIVE_OWNER_CANCEL_ENTRY_OFFSET as u64
 }
 
-/// The EL0 fault hook: the lower-EL sync slot branches here for EC 0x20
-/// instruction aborts and EC 0x24 data aborts,
-/// saving all architectural registers, ESR and FAR, calling the EL1 image, and forwarding
-/// via legacy HVC if unhandled.
+/// The EL0 fault hook: the lower-EL sync slot branches here for every
+/// non-SVC exception (EC 0x20 instruction and EC 0x24 data aborts, and the
+/// BRK, step, undefined, alignment and FP classes, #1502), saving all
+/// architectural registers, ESR and FAR, calling the EL1 image, and
+/// forwarding via legacy HVC if unhandled.
 const EL0_FAULT_HOOK_OFFSET: usize = 0x3000;
 
 /// Every occupant of the 16 KiB EL1 vector page, as `(name, offset, size)`.
@@ -5162,8 +5163,9 @@ enum HookEntry {
     /// boundary.
     Irq,
     SignalCheck,
-    /// An EL0 instruction or data abort (EC 0x20 or 0x24): a forward restores all registers and
-    /// leaves through `legacy_hvc` (`hvc #2`).
+    /// An EL0 synchronous exception other than an SVC (an abort, BRK, step,
+    /// undefined instruction, alignment or FP trap): a forward restores all
+    /// registers and leaves through `legacy_hvc` (`hvc #2`).
     Fault,
 }
 
@@ -6254,10 +6256,23 @@ fn el1_vectors_bytes_mailbox_with_layout(
     let fault_dest_branch = cursor;
     emit(&mut bytes, &mut cursor, 0);
 
-    // Other non-SVC, non-data-abort exception:
+    // Any other EL0 synchronous exception (BRK, step, undefined
+    // instruction, alignment, FP): with EL1 enabled it enters the same hook
+    // (#1502). A host task's exception forwards through `hvc #2` exactly as
+    // the bare legacy exit did; a ring-owned process has no host task, and
+    // only its native owner can deliver the signal. A trapped system
+    // register access (EC 0x18, e.g. ld.so's `mrs MIDR_EL1`) is the host's
+    // to emulate and keeps the direct exit.
     let not_data_abort = cursor;
+    emit(&mut bytes, &mut cursor, enc_cmp_xn_imm(16, 0x18));
+    let sys_trap_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
     emit(&mut bytes, &mut cursor, AARCH64_MRS_TPIDR_EL1_X16_OPCODE);
     let other_dest_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
+    let sys_trap = cursor;
+    emit(&mut bytes, &mut cursor, AARCH64_MRS_TPIDR_EL1_X16_OPCODE);
+    let sys_dest_branch = cursor;
     emit(&mut bytes, &mut cursor, 0);
 
     put(
@@ -6288,7 +6303,17 @@ fn el1_vectors_bytes_mailbox_with_layout(
     put(
         &mut bytes,
         other_dest_branch,
-        enc_b(other_dest_branch as u64, legacy_hvc as u64),
+        enc_b(other_dest_branch as u64, fault_target),
+    );
+    put(
+        &mut bytes,
+        sys_trap_branch,
+        enc_beq(sys_trap_branch as u64, sys_trap as u64),
+    );
+    put(
+        &mut bytes,
+        sys_dest_branch,
+        enc_b(sys_dest_branch as u64, legacy_hvc as u64),
     );
     if let Some(handler) = mailbox_fstat_handler {
         write_fstat_ceiling_handler(&mut bytes, handler, mailbox_capture, false);
@@ -10173,6 +10198,57 @@ mod el1_shim_tests {
             assert!(EL0_IRQ_HOOK_OFFSET + 0x1000 <= EL0_FAULT_HOOK_OFFSET);
             assert!(EL0_FAULT_HOOK_OFFSET + 0x1000 <= LINUX_EL1_VECTORS_SIZE as usize);
         }
+    }
+
+    /// #1502: every lower-EL synchronous exception other than an SVC enters
+    /// the EL1 image when EL1 is enabled, not only the two abort classes. A
+    /// BRK, undefined instruction, alignment or FP trap from a ring-owned
+    /// (native) process has no host task to deliver its signal; leaving
+    /// through `hvc #2` straight from the vector handed it to an executor
+    /// that could only die with the slot still naming the process's space.
+    #[test]
+    fn every_el0_sync_exception_enters_the_el1_fault_hook() {
+        let enabled = el1_vectors_bytes_mailbox_configured(true, false, true);
+        let words: Vec<u32> = enabled
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+            .collect();
+        let mut routed = 0;
+        for (index, op) in words.iter().enumerate() {
+            if *op != AARCH64_CMP_X16_DATA_ABORT_OPCODE {
+                continue;
+            }
+            let cmp = index * 4;
+            // cmp x16, #0x24 ; b.ne not_data_abort
+            // owner_fault:    mrs x16, tpidr_el1 ; b <abort target>
+            // not_data_abort: mrs x16, tpidr_el1 ; b <other target>
+            let not_data_abort = decode_bne(rd_u32(&enabled, cmp + 4), cmp + 4)
+                .expect("the data-abort test must branch to the other-EC path");
+            let abort_target = decode_b(rd_u32(&enabled, cmp + 12), cmp + 12)
+                .expect("the abort path must branch to its hook");
+            // not_data_abort: cmp x16, #0x18 ; b.eq sys_trap ;
+            //                 mrs x16, tpidr_el1 ; b <other target>
+            // sys_trap:       mrs x16, tpidr_el1 ; b <legacy hvc>
+            assert_eq!(rd_u32(&enabled, not_data_abort), enc_cmp_xn_imm(16, 0x18));
+            let sys_trap = decode_beq(rd_u32(&enabled, not_data_abort + 4), not_data_abort + 4)
+                .expect("a system-register trap keeps its own exit");
+            let other_target = decode_b(rd_u32(&enabled, not_data_abort + 12), not_data_abort + 12)
+                .expect("the other-EC path must branch to its hook");
+            let sys_target = decode_b(rd_u32(&enabled, sys_trap + 4), sys_trap + 4)
+                .expect("the system-register path must branch to the host exit");
+            assert_eq!(
+                rd_u32(&enabled, sys_target),
+                AARCH64_HVC_SYSCALL_OPCODE,
+                "a trapped system-register access is the host's to emulate"
+            );
+            assert_eq!(abort_target, EL0_FAULT_HOOK_OFFSET);
+            assert_eq!(
+                other_target, EL0_FAULT_HOOK_OFFSET,
+                "a non-abort EL0 exception must enter the EL1 fault hook, not leave by hvc"
+            );
+            routed += 1;
+        }
+        assert!(routed > 0, "the lower-EL sync slot must classify the EC");
     }
 }
 
