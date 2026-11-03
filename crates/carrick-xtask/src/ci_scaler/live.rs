@@ -589,6 +589,9 @@ impl Pve {
         Err(ScalerError::External("no private guest IPv4 address"))
     }
 }
+/// The longest a container's full-copy clone task may run.
+pub(super) const CONTAINER_CLONE_WAIT: Duration = Duration::from_secs(900);
+
 /// Runs before the command and reports its exit status after its output,
 /// the shape the guest agent's `exec-status` gives a VM's command.
 const CONTAINER_EXEC_WRAPPER: &str = r#""$@"; status=$?; printf '\n%s' "$status""#;
@@ -985,11 +988,17 @@ fn provision(
     let (call, source) = clone_call(pve.site, row)?;
     row.task = Some(task_id(pve.request(call, &source)?)?);
     update(ledger, row, path)?;
+    // A linked VM clone is instant; a full container copy on ctb's disk
+    // took six minutes under load in the pilot, past the default wait.
+    let clone_wait = (row.kind == RunnerKind::Lxc).then(|| Instant::now() + CONTAINER_CLONE_WAIT);
+    pve.deadline.set(clone_wait);
+    let clone_deadline = ApiDeadline(&pve.deadline);
     pve.wait_task(
         row.task
             .as_deref()
             .ok_or(ScalerError::Guard("clone task missing"))?,
     )?;
+    drop(clone_deadline);
     boot_and_register(pve, gh, ledger, row, dir, path, approval, PreBoot::Defer)
 }
 

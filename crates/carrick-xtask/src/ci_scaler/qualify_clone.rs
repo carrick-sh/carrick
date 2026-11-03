@@ -25,12 +25,14 @@ fi
 "#;
 
 fn command(args: &[&str], deadline: Instant) -> Result<String, ScalerError> {
+    bounded(args, deadline, Duration::from_secs(300))
+}
+/// [`command`] with its own per-command cap.
+fn bounded(args: &[&str], deadline: Instant, cap: Duration) -> Result<String, ScalerError> {
     let (program, args) = args
         .split_first()
         .ok_or(ScalerError::Guard("empty command"))?;
-    let duration = deadline
-        .saturating_duration_since(Instant::now())
-        .min(Duration::from_secs(300));
+    let duration = deadline.saturating_duration_since(Instant::now()).min(cap);
     if duration.is_zero() {
         return Err(ScalerError::External("clone qualification deadline"));
     }
@@ -266,6 +268,39 @@ pgrep -u root >/dev/null
 test -c /dev/kvm
 "#;
 
+/// Remove container 9501 whatever state qualification left it in: a copy
+/// interrupted mid-clone stays locked (`create`) and owns a volume its
+/// configuration does not list yet, so `pct destroy` alone would leak it.
+fn destroy_container(site: &site::Site) -> Result<(), ScalerError> {
+    let cleanup = Instant::now() + Duration::from_secs(360);
+    if command(&["pct", "status", VM], cleanup).is_ok() {
+        // Stop fails on a container that never started; destroy decides.
+        let _ = command(&["pct", "stop", VM], cleanup);
+        command(&["pct", "unlock", VM], cleanup)?;
+        command(&["pct", "destroy", VM, "--purge", "1"], cleanup)?;
+    }
+    let volumes: Value = serde_json::from_str(&command(
+        &[
+            "pvesh",
+            "get",
+            &format!("/nodes/{}/storage/{}/content", site.node, site.storage),
+            "--vmid",
+            VM,
+            "--output-format",
+            "json",
+        ],
+        cleanup,
+    )?)?;
+    for volume in volumes.as_array().into_iter().flatten() {
+        let volid = volume["volid"]
+            .as_str()
+            .filter(|id| id.starts_with(&format!("{}:{VM}/", site.storage)))
+            .ok_or(ScalerError::Guard("unexpected qualification volume"))?;
+        command(&["pvesm", "free", volid], cleanup)?;
+    }
+    Ok(())
+}
+
 /// [`run`] for the gated container template: full-clone it into reserved
 /// slot 9501, boot it with its own address and the site firewall, reach it
 /// exactly as the controller would (root `pct exec`, then SSH with a pinned
@@ -336,8 +371,9 @@ pub(super) fn run_container(template: u16) -> Result<(), ScalerError> {
         prepare,
     )?;
     // No --pool, and a hostname the standing controller cannot adopt. A
-    // directory storage permits only a full container copy.
-    command(
+    // directory storage permits only a full container copy, which can take
+    // longer than one ordinary command; a failed copy is still cleaned up.
+    let cloned = bounded(
         &[
             "pct",
             "clone",
@@ -349,8 +385,9 @@ pub(super) fn run_container(template: u16) -> Result<(), ScalerError> {
             "template-qualification-9501",
         ],
         prepare,
-    )?;
-    let result = (|| {
+        live::CONTAINER_CLONE_WAIT,
+    );
+    let result = cloned.and_then(|_| {
         command(
             &[
                 "pct",
@@ -429,7 +466,7 @@ pub(super) fn run_container(template: u16) -> Result<(), ScalerError> {
             return Err(ScalerError::Guard("invalid clone qualification manifest"));
         }
         Ok(manifest)
-    })();
+    });
     if let Err(error) = &result {
         eprintln!("container qualification failed: {error}");
         match live::container_exec(
@@ -445,9 +482,7 @@ pub(super) fn run_container(template: u16) -> Result<(), ScalerError> {
             Err(error) => eprintln!("container diagnostics unavailable: {error}"),
         }
     }
-    let cleanup = Instant::now() + Duration::from_secs(360);
-    let stop = command(&["pct", "stop", VM], cleanup);
-    let destroy = stop.and_then(|_| command(&["pct", "destroy", VM, "--purge", "1"], cleanup));
+    let destroy = destroy_container(&site);
     let firewall = std::fs::remove_file("/etc/pve/firewall/9501.fw");
     if let Err(error) = destroy {
         eprintln!(
