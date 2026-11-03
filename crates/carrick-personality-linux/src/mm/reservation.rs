@@ -33,9 +33,12 @@ pub(super) fn place<M: ReservationPolicyAccess>(
                 .and_then(|end| ReservationRange::new(addr, end))
             {
                 Some(r) if root.in_layout(r) => {
+                    // A hint is a hint (mmap(2)): an occupied or owed range
+                    // relocates instead of refusing.
                     if root
                         .next_range(UserVa::new(addr))
                         .is_none_or(|n| n.start() >= r.end())
+                        && !root.return_owed_within(r)
                     {
                         addr
                     } else {

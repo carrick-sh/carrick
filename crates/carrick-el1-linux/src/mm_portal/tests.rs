@@ -3017,28 +3017,24 @@ fn fork_child_write_preparation(prepare_first: bool) {
     assert_eq!(&replacement.borrow()[..4], b"fork");
 }
 
-#[test]
-fn owner_fork_guest_prot_none_mprotect_serves_parent_and_child_and_cow_isolates_writes() {
+/// The production anonymous editors over fixture table arenas: stage-1
+/// probe, permission and retirement steps of the real descriptor code.
+mod anonymous_editor {
+    use super::Tables;
     use carrick_el1::memory::{
-        AnonymousBackingProbe, AnonymousPermissionEditor, AnonymousRetirementEditor,
-        DelegatedAnonymous, Stage1Backing, classify_stage1_range, serve_delegated_anonymous,
+        AnonymousBackingProbe, AnonymousPermissionEditor, AnonymousRetirementEditor, Stage1Backing,
+        classify_stage1_range,
     };
-    use carrick_el1_abi::{Counters, CowDecline, CurrentTask, TrapFrame};
-    use carrick_mmu_core::aarch64::descriptor_txn::{
-        BackingIdentity, DescriptorOp, DescriptorOutcome, InlineJournal, LiveDescriptorWords,
-        PageSpan, TableGrants, TableWindow, execute_descriptor_op,
-    };
+    use carrick_mmu_core::aarch64::descriptor_txn::TableWindow;
     use carrick_mmu_core::aarch64::{
-        GuestLeafPublication, GuestPermissionEdit, GuestPermissionEditError, GuestRetirementError,
-        LeafAccess, SubstrateGpa, protect_existing_el1_private_pages,
-        retire_existing_el1_private_pages, terminal_descriptor_is_fork_cow,
-        terminal_descriptor_permits_el0, terminal_descriptor_permits_host_buffer,
+        GuestPermissionEdit, GuestPermissionEditError, GuestRetirementError,
+        protect_existing_el1_private_pages, retire_existing_el1_private_pages,
     };
-    use carrick_sched_core::spaces::notification::SpaceAccess;
+    use core::sync::atomic::Ordering;
 
-    struct ForkAnonymousEditor<'a> {
-        arenas: &'a [&'a Tables],
-        pool: TableWindow,
+    pub(super) struct ForkAnonymousEditor<'a> {
+        pub(super) arenas: &'a [&'a Tables],
+        pub(super) pool: TableWindow,
     }
     impl ForkAnonymousEditor<'_> {
         const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
@@ -3120,6 +3116,22 @@ fn owner_fork_guest_prot_none_mprotect_serves_parent_and_child_and_cow_isolates_
             Ok(())
         }
     }
+}
+use anonymous_editor::ForkAnonymousEditor;
+
+#[test]
+fn owner_fork_guest_prot_none_mprotect_serves_parent_and_child_and_cow_isolates_writes() {
+    use carrick_el1::memory::{DelegatedAnonymous, serve_delegated_anonymous};
+    use carrick_el1_abi::{Counters, CowDecline, CurrentTask, TrapFrame};
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        BackingIdentity, DescriptorOp, DescriptorOutcome, InlineJournal, LiveDescriptorWords,
+        PageSpan, TableGrants, TableWindow, execute_descriptor_op,
+    };
+    use carrick_mmu_core::aarch64::{
+        GuestLeafPublication, LeafAccess, SubstrateGpa, terminal_descriptor_is_fork_cow,
+        terminal_descriptor_permits_el0, terminal_descriptor_permits_host_buffer,
+    };
+    use carrick_sched_core::spaces::notification::SpaceAccess;
 
     let region = Region::new();
     let spaces = AddressSpaces::new();
@@ -5888,4 +5900,148 @@ fn untouched_copyout_selects_backing_supply_without_copying() {
     let window = venue.window.unwrap();
     assert_eq!(window.operation.mm, mm);
     assert_eq!(window.fault_page, VA);
+}
+
+/// #1478 (slice 1 of #1369), through the production in-ring entry: an
+/// owner's `munmap` of resident EL1-private pages journals an owed return,
+/// and the next `mmap(NULL)` (musl's stdout buffer in the signed
+/// first-touch child) is served in ring outside the owed range instead of
+/// being refused `Busy` and forwarded to a venue a ring-owned child lacks.
+/// A peer MM's journal is its own: the peer still reuses its unmapped VA.
+#[test]
+fn owner_munmap_then_mmap_null_places_outside_owed_return_in_ring() {
+    use carrick_el1::memory::{DelegatedAnonymous, serve_delegated_anonymous};
+    use carrick_el1_abi::{Counters, CurrentTask, TrapFrame};
+    use carrick_mmu_core::aarch64::GuestLeafPublication;
+    use carrick_mmu_core::aarch64::SubstrateGpa;
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        BackingIdentity, DescriptorOp, DescriptorOutcome, InlineJournal, PageSpan, TableGrants,
+        TableWindow, execute_descriptor_op,
+    };
+    use carrick_sched_core::spaces::notification::SpaceAccess;
+
+    const PEER_ROOT: u64 = ROOT + 0x30_0000;
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let owner = admit(&region, &spaces, 77, ROOT, 2, 0);
+    let peer = admit(&region, &spaces, 78, PEER_ROOT, 2, 0);
+    let view = nodes(&region);
+    let owner_tables = Tables::new(ROOT, IPA, 0);
+    let peer_tables = Tables::new(PEER_ROOT, 0, 0);
+    let supply = Tables::new(ROOT + 0x20_0000, 0, 0);
+    let nz = |v| NonZeroU64::new(v).unwrap();
+    // Two resident EL1-private RW pages at VA in the owner only.
+    let prepared = execute_descriptor_op(
+        &owner_tables.live(&CallerInvalidatesAsid),
+        SubstrateGpa(ROOT),
+        DescriptorOp::Prepare {
+            publication: GuestLeafPublication {
+                va: VA,
+                ipa: IPA,
+                len: 8192,
+                writable: true,
+                executable: false,
+            },
+            resident: PageSpan::new(VA, 8192),
+            backing: BackingIdentity {
+                frame_id: nz(1),
+                mapping_id: nz(2),
+                owner_generation: nz(3),
+                inventory_revision: nz(4),
+            },
+        },
+        &TableGrants::NONE,
+        &mut InlineJournal::new(),
+    );
+    assert!(
+        matches!(prepared, DescriptorOutcome::Applied(_)),
+        "{prepared:?}"
+    );
+    let arenas = [&owner_tables, &peer_tables, &supply];
+    let counters = Box::new(Counters::default());
+    let syscall = |mm_key: u64, nr: u64, args: [u64; 6]| {
+        let task = CurrentTask::new();
+        task.execution.task.store(mm_key + 100, Ordering::Relaxed);
+        task.mm.thread_generation.store(1, Ordering::Relaxed);
+        task.mm.key.store(mm_key, Ordering::Relaxed);
+        let mut frame = TrapFrame {
+            slot: 0,
+            elr: 0x40004,
+            ..TrapFrame::default()
+        };
+        frame.x[..6].copy_from_slice(&args);
+        frame.x[8] = nr;
+        let mut editor = ForkAnonymousEditor {
+            arenas: &arenas,
+            pool: TableWindow {
+                words: supply.words.as_ptr().cast_mut(),
+                physical_base: supply.base,
+                byte_len: supply.words.len() * 8,
+            },
+        };
+        let route = serve_delegated_anonymous(
+            &mut frame,
+            &counters,
+            &task,
+            SpaceAccess::source_free(&spaces),
+            region.table(),
+            &mut editor,
+            None,
+        );
+        (route, frame.x[0] as i64)
+    };
+    const MUNMAP: u64 = 215;
+    const MMAP: u64 = 222;
+    // PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, no fd.
+    let mmap_null = |len: u64| [0, len, 3, 0x22, u64::MAX, 0];
+    let owed = ReservationRange::new(VA, VA + 8192).unwrap();
+    let owed_rows = |mm| {
+        let index = spaces.find(mm).unwrap().index();
+        let key = ReservationMm::new(mm).unwrap();
+        let root = region
+            .table()
+            .lock_el1_resolved(index, key, &view, 0)
+            .unwrap();
+        let mut rows = Vec::new();
+        root.observe_deferred_returns(&mut |row| rows.push(row.range));
+        rows
+    };
+
+    // The owner's munmap retires resident leaves in ring: an owed return.
+    assert_eq!(
+        syscall(77, MUNMAP, [VA, 8192, 0, 0, 0, 0]),
+        (DelegatedAnonymous::Served, 0)
+    );
+    assert_eq!(owed_rows(77), [owed]);
+    // mmap(NULL) of the same size: served in ring, outside the owed range.
+    let (route, placed) = syscall(77, MMAP, mmap_null(8192));
+    assert_eq!(route, DelegatedAnonymous::Served, "placed={placed:#x}");
+    let placed = placed as u64;
+    assert!(
+        placed + 8192 <= owed.start() || owed.end() <= placed,
+        "{placed:#x} overlaps owed {owed:?}"
+    );
+    // A smaller request that fits the owed hole still routes around it.
+    let (route, small) = syscall(77, MMAP, mmap_null(4096));
+    assert_eq!(route, DelegatedAnonymous::Served, "placed={small:#x}");
+    assert!(
+        small as u64 >= owed.end(),
+        "{small:#x} inside owed {owed:?}"
+    );
+    assert_eq!(
+        owed_rows(77),
+        [owed],
+        "placement must not settle the return"
+    );
+    // The peer's lazy unmap owes nothing; it reuses its own VA.
+    assert_eq!(
+        syscall(78, MUNMAP, [VA, 8192, 0, 0, 0, 0]),
+        (DelegatedAnonymous::Served, 0)
+    );
+    assert!(owed_rows(78).is_empty());
+    assert_eq!(
+        syscall(78, MMAP, mmap_null(8192)),
+        (DelegatedAnonymous::Served, VA as i64)
+    );
+    let _ = (owner, peer);
 }
