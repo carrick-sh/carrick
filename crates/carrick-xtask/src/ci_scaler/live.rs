@@ -476,6 +476,8 @@ fn pve_vmid_lock_paths(id: CloneId) -> [PathBuf; 2] {
 }
 /// PVE's own `lock_config` default; a longer hold-off would stall its tasks.
 const PVE_VMID_LOCK_WAIT: Duration = Duration::from_secs(10);
+/// Retry interval for PVE's busy VMID lock within `PVE_VMID_LOCK_WAIT`.
+const PVE_VMID_LOCK_POLL: Duration = Duration::from_millis(50);
 /// Take every lock in order, failing closed on timeout. PVE never holds both
 /// for one VMID (a VMID is one kind), so the fixed order cannot deadlock it.
 pub(super) fn lock_files_within(
@@ -508,7 +510,11 @@ pub(super) fn lock_files_within(
                     "PVE VMID lock busy; retry cleanup next reconcile",
                 ));
             }
-            std::thread::sleep(Duration::from_millis(50));
+            // PVE's holder is another process and flock has no release
+            // notification, so poll the external lock until the deadline.
+            std::thread::sleep(
+                PVE_VMID_LOCK_POLL.min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
         held.push(crate::lock_file::OwnedFileLock::from_locked(file));
     }
