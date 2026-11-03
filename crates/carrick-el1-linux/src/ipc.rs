@@ -514,18 +514,13 @@ fn op_kind(
     }
 }
 
-/// Allocation refusal retains its input and the shared linear release ticket.
+/// Allocation result retains its input snapshot beside the typed outcome.
+/// The token alone authorizes completion; refusal retains the release ticket.
 #[must_use]
-pub enum OperationAdmission<'a, C: carrick_el1_abi::EntryContext> {
-    Admitted(IpcOpToken),
-    Refused {
-        operation: IpcOperation,
-        reason: carrick_sched_core::refusal::Refusal<'a, core::convert::Infallible, C>,
-    },
-    SourceUnavailable {
-        operation: IpcOperation,
-        error: ObjectWaitError,
-    },
+pub struct OperationAdmission<'a, C: carrick_el1_abi::EntryContext> {
+    pub operation: IpcOperation,
+    pub result:
+        Result<IpcOpToken, carrick_sched_core::refusal::Refusal<'a, core::convert::Infallible, C>>,
 }
 
 /// Probe the arena through its attached release source. A miss observes the
@@ -544,20 +539,30 @@ pub fn admit_operation_wait<'a, C: carrick_el1_abi::EntryContext>(
     let source =
         match zone.ipc_operation_slot_source(region.operation_slot_generation(), completion) {
             Ok(source) => source,
-            Err(error) => return OperationAdmission::SourceUnavailable { operation, error },
+            Err(_) => {
+                return OperationAdmission {
+                    operation,
+                    result: Err(carrick_sched_core::refusal::Refusal::Invariant(
+                        InvariantKind {
+                            domain: "ipc_operation_slot_source",
+                            code: 1,
+                        },
+                    )),
+                };
+            }
         };
-    match source.contend(|| match region.begin_operation(operation) {
-        Ok(token) => Ok(token),
-        Err(carrick_el1_abi::ipc::IpcError::NoOperations) => {
-            Err(Attempt::Contended(ReleaseCause::Object))
-        }
-        Err(_) => Err(Attempt::Settled(Settled::Invariant(InvariantKind {
-            domain: "ipc_operation_slots",
-            code: 1,
-        }))),
-    }) {
-        Ok(token) => OperationAdmission::Admitted(token),
-        Err(reason) => OperationAdmission::Refused { operation, reason },
+    OperationAdmission {
+        operation,
+        result: source.contend(|| match region.begin_operation(operation) {
+            Ok(token) => Ok(token),
+            Err(carrick_el1_abi::ipc::IpcError::NoOperations) => {
+                Err(Attempt::Contended(ReleaseCause::Object))
+            }
+            Err(_) => Err(Attempt::Settled(Settled::Invariant(InvariantKind {
+                domain: "ipc_operation_slots",
+                code: 1,
+            }))),
+        }),
     }
 }
 
@@ -1784,6 +1789,10 @@ mod tests {
         .unwrap()
         // The EL1 venue's own sink, as this kernel crate builds it.
         .with_ceiling(&carrick_el1_abi::GUEST_DESCRIPTOR_CEILING);
+        zone.bind_ipc_operation_slots(region.operation_slot_generation(), &HostWait, &|owned| {
+            let _ = owned.into_parts();
+        })
+        .unwrap();
         zone.spaces.set_idle_ttbr(IDLE_TTBR);
         for (mm, ttbr) in [(MM, TTBR_MM), (OTHER_MM, TTBR_OTHER)] {
             let index = zone.spaces.publish_closed(mm, ttbr, ttbr).unwrap();
@@ -2148,9 +2157,9 @@ mod tests {
         };
         let (operation, ticket) =
             match admit_operation_wait(w.region, &w.zone, operation, &completion) {
-                OperationAdmission::Refused {
+                OperationAdmission {
                     operation,
-                    reason: carrick_sched_core::refusal::Refusal::Contended(ticket),
+                    result: Err(carrick_sched_core::refusal::Refusal::Contended(ticket)),
                 } => (operation, ticket),
                 _ => panic!("full arena must retain a contention subscription"),
             };
@@ -2190,7 +2199,9 @@ mod tests {
             "actual operation retirement must wake the enrolled waiter"
         );
         let resumed = match admit_operation_wait(w.region, &w.zone, operation, &completion) {
-            OperationAdmission::Admitted(token) => token,
+            OperationAdmission {
+                result: Ok(token), ..
+            } => token,
             _ => panic!("returned slot must admit the same operation"),
         };
         assert_eq!(w.region.operation(&resumed).unwrap().orig_x0, 123);
@@ -2198,6 +2209,219 @@ mod tests {
         for token in held {
             finish(&mut sched, token, w.region);
         }
+    }
+
+    // Exhaust the remaining arena and enroll a real retained-admission owner.
+    // Returning these tokens keeps all slots unavailable until the tested site
+    // alone publishes its release.
+    fn slot_release_waiter(w: &World) -> (Vec<IpcOpToken>, carrick_el1_abi::RecordId) {
+        use carrick_sched_core::object_wait::OperationToken;
+        let mut held = Vec::new();
+        while let Ok(token) = w.region.begin_operation(IpcOperation::EMPTY) {
+            held.push(token);
+        }
+        let completion = |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_el1_abi::Aarch64ParkedContext,
+        >| {
+            let _ = owned.into_parts();
+        };
+        let OperationAdmission {
+            result: Err(carrick_sched_core::refusal::Refusal::Contended(ticket)),
+            ..
+        } = admit_operation_wait(w.region, &w.zone, IpcOperation::EMPTY, &completion)
+        else {
+            panic!("arena must be exhausted");
+        };
+        let record = w.zone.alloc_record(identity(909, MM)).unwrap();
+        // SAFETY: enrollment publishes this exact owned continuation on the
+        // real queue, with no retained queue or endpoint guard.
+        unsafe {
+            ticket.park_and_rerun(
+                OperationToken::new(9001, 1).unwrap(),
+                |operation, enrollment| {
+                    w.zone
+                        .object_wait_with_completion(enrollment.key(), &HostWait, &completion)
+                        .unwrap()
+                        .park(enrollment.observed(), record, operation)
+                        .unwrap();
+                },
+            );
+        }
+        (held, record)
+    }
+
+    #[test]
+    fn ipc_operation_slot_native_finish_and_retire_publish() {
+        for retiring in [false, true] {
+            let w = world();
+            let table = w.table(w.a_tid);
+            let fd = w.eventfd(table, 1, EventMode::Counter, BLOCK);
+            let frame = syscall(SYS_READ, fd, 0x10000, 8, A_SVC);
+            let venue = w.venue();
+            let mut cpu = FakeCpu::default();
+            let mut sched = Sched {
+                handoff: None,
+                zone: &w.zone,
+                slot: SLOT,
+                task: &w.task,
+                cpu: &mut cpu,
+                user: &HardwareUserWord,
+                counters: w.counters,
+            };
+            let mut user = User {
+                task: &w.task,
+                mem: &w.mem,
+            };
+            let Admission::Admitted(token, _) = admit(&mut sched, &frame, &venue, &mut user) else {
+                panic!("real endpoint operation");
+            };
+            let (_held, waiter) = slot_release_waiter(&w);
+            if retiring {
+                let binding = carrick_el1_abi::ExecutionBinding {
+                    task: carrick_el1_abi::EntryTaskKey::from_raw(task_key(&w.task).0),
+                    generation: carrick_el1_abi::SnapshotGeneration::from_raw(1),
+                    mm: carrick_el1_abi::EntryMmKey::from_raw(MM),
+                    thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(1101),
+                };
+                retire_native_operation(
+                    w.region,
+                    &w.zone,
+                    SLOT,
+                    &w.task,
+                    binding,
+                    to_sched_token(token).unwrap(),
+                )
+                .unwrap();
+            } else {
+                finish_native(&mut sched, token, w.region);
+            }
+            assert!(
+                matches!(
+                    w.zone.record(waiter).claim(),
+                    carrick_sched_core::Claim::Queued { .. }
+                ),
+                "site must publish: retiring={retiring}"
+            );
+            assert!(w.region.begin_operation(IpcOperation::EMPTY).is_ok());
+        }
+    }
+
+    struct ReleaseDuringSave<'a> {
+        cpu: FakeCpu,
+        release: Option<Box<dyn FnOnce() + 'a>>,
+    }
+    impl ThreadCpu for ReleaseDuringSave<'_> {
+        fn save(&mut self, frame: &TrapFrame, ctx: &mut carrick_el1_abi::Aarch64ParkedContext) {
+            self.cpu.save(frame, ctx);
+            if let Some(release) = self.release.take() {
+                release();
+            }
+        }
+        fn load(&mut self, f: &mut TrapFrame, c: &carrick_el1_abi::Aarch64ParkedContext) {
+            self.cpu.load(f, c);
+        }
+        fn set_translation(&mut self, a: u64, b: u64) {
+            self.cpu.set_translation(a, b);
+        }
+        fn live_ttbr0(&self) -> Option<u64> {
+            self.cpu.live_ttbr0()
+        }
+        fn invalidate_asid(&mut self, a: u64) {
+            self.cpu.invalidate_asid(a);
+        }
+        fn now(&self) -> u64 {
+            self.cpu.now()
+        }
+        fn freq(&self) -> u64 {
+            self.cpu.freq()
+        }
+        fn set_timer(&mut self, t: Option<u64>) {
+            self.cpu.set_timer(t);
+        }
+        fn send_sgi(&mut self, s: u64) {
+            self.cpu.send_sgi(s);
+        }
+        fn ack_irq(&mut self) -> u32 {
+            self.cpu.ack_irq()
+        }
+        fn end_irq(&mut self, i: u32) {
+            self.cpu.end_irq(i);
+        }
+        fn wait_for_interrupt(&mut self) {
+            self.cpu.wait_for_interrupt();
+        }
+        fn spin(&mut self) {
+            self.cpu.spin();
+        }
+        fn own_sgi_target(&self) -> u64 {
+            self.cpu.own_sgi_target()
+        }
+    }
+
+    #[test]
+    fn ipc_operation_slot_epoll_retry_publishes() {
+        let w = world();
+        let table = w.table(w.a_tid);
+        let fd = w.eventfd(table, 0, EventMode::Counter, NONBLOCK);
+        let (ep, object) = zone_epoll(&w, table, fd, 9);
+        let key = wait_key(object, WaitFor::Readable).unwrap();
+        let complete = |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_el1_abi::Aarch64ParkedContext,
+        >| {
+            let _ = owned.into_parts();
+        };
+        w.zone
+            .bind_object_wait_with_completion(key, &HostWait, &complete)
+            .unwrap();
+        let source = w
+            .zone
+            .admit_object_notification(key, &HostWait, &complete)
+            .unwrap()
+            .into_source();
+        let slot_key = carrick_sched_core::object_wait::ObjectWaitKey::ipc_operation_slots(
+            w.region.operation_slot_generation(),
+        );
+        let before = w.zone.object_queue_census(slot_key.index()).unwrap().epoch;
+        let mut cpu = ReleaseDuringSave {
+            cpu: FakeCpu::default(),
+            release: Some(Box::new(|| {
+                source
+                    .reserve()
+                    .publish(carrick_sched_core::Waker::El1 { slot: SLOT }, &complete);
+                // The next admission parks and hands back without retiring:
+                // only Retry can advance the operation-slot source epoch.
+                w.task.linux.mark_pending_host_work();
+            })),
+        };
+        let mut sched = Sched {
+            handoff: None,
+            zone: &w.zone,
+            slot: SLOT,
+            task: &w.task,
+            cpu: &mut cpu,
+            user: &HardwareUserWord,
+            counters: w.counters,
+        };
+        let mut user = User {
+            task: &w.task,
+            mem: &w.mem,
+        };
+        let mut frame = epoll_pwait(ep, 0x20000, 8, -1, A_SVC);
+        assert_eq!(
+            epoll::serve(&mut sched, &mut frame, &w.venue(), &mut user, &mut || false),
+            IpcServed::Idle
+        );
+        assert!(
+            cpu.release.is_none(),
+            "production park must reach the scheduled publication"
+        );
+        assert_eq!(
+            w.zone.object_queue_census(slot_key.index()).unwrap().epoch,
+            before + 1,
+            "epoll Retry alone must publish exactly once"
+        );
     }
 
     #[test]

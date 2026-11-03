@@ -24,7 +24,7 @@ The VM-free Busy-once witness fills all 1024 real operation records, enrolls
 a real scheduler record, retires through the shipping adapter, requires the
 waiter to become runnable, and admits the unchanged input into the returned
 slot. Its pre-fix failure was `actual operation retirement must wake the
-enrolled waiter`. Scheduler witnesses also cover initial admission Busy and
+enrolled waiter`. Scheduler witnesses also cover source borrowing under a held queue and
 publication while the queue is held: revision advances immediately, delivery
 occurs once after unlock, and the original continuation token survives.
 The ABI witness requires free-list visibility inside the notification and
@@ -65,3 +65,33 @@ production-path mutation of main's missing publication, not a claim that the
 new admission API or witness already exists on main. The witness calls the
 public `admit_operation_wait`, enrolls its shared contention ticket through
 `park_and_rerun`, then calls the same `finish` used by shipping IPC completion.
+
+## Independent publication witnesses (#1527 review)
+
+Window publication binds the carrier source before exposing the IPC region.
+Retained admission only borrows it and cannot return an unsubscribed Busy.
+The scheduler binding publishes its epoch and permanent publisher before its
+release-store of the generation. A foreign arena notification returns without
+publishing or panicking.
+
+The native completion and exec/exit retirement witness fills the remaining
+arena, parks a retained owner, and requires the selected adapter alone to wake
+it. The epoll witness publishes a readiness epoch during the production
+context save, forcing Retry; its next admission parks and hands back without
+retiring, isolating that arm's one slot-release edge. The host witness binds
+the real kernel authority under a scoped zone, then invokes production host
+`finish` and checks the exact epoch advanced by `ZoneHostServices`, including
+a stale retry with no new edge. These complement the original common
+`finish` and host `finish` witnesses.
+
+Each publication was removed independently. Native completion failed at
+`site must publish: retiring=false`; exec/exit retirement failed at
+`site must publish: retiring=true`. Epoll Retry and the host service each
+failed with epoch 1 instead of 2. Every mutation exited 101 with the named
+assertion, and each publication was restored. Restoring the former foreign
+arena assertion and lazy source admission separately also made the scheduler
+binding witness fail (exit 101). Logs and final green gates are recorded in
+the PR body and worker result.
+
+Wake-all fairness remains separate follow-up work, not acceptance for this
+prerequisite. This bottom layer references #1509; it does not close PollWait.

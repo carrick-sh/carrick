@@ -1721,29 +1721,48 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         }
     }
 
-    /// Admit the carrier-lifetime release source before probing its operation
-    /// arena. The permanent base pin prevents rebinding while any caller can
-    /// finish an operation. Admission contention is Busy, never a spin.
+    /// Bind before publishing the IPC region. The caller owns publication;
+    /// no operation can probe or retire until this returns successfully.
+    pub fn bind_ipc_operation_slots(
+        &self,
+        generation: core::num::NonZeroU64,
+        wait: &impl LockWait<C>,
+        completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
+    ) -> Result<(), ObjectWaitError> {
+        let key = ObjectWaitKey::ipc_operation_slots(generation);
+        if self.notification_generation(key) == key.generation {
+            return Ok(());
+        }
+        if !self.completion_handbacks.initialize() {
+            return Err(ObjectWaitError::Busy);
+        }
+        let guard = self.lock_completion_index(key, wait, completion)?;
+        let queue = guard.queue();
+        let actual = queue.generation.load(Ordering::Acquire);
+        if actual == key.generation {
+            return Ok(());
+        }
+        if actual != 0 {
+            return Err(ObjectWaitError::Stale);
+        }
+        if !self.object_admission_handbacks[key.index as usize].initialize() {
+            return Err(ObjectWaitError::Busy);
+        }
+        queue.completion_mode.store(1, Ordering::Release);
+        queue.epoch.store(1, Ordering::SeqCst);
+        queue.publishers.store(1, Ordering::Release);
+        queue.generation.store(key.generation, Ordering::Release);
+        Ok(())
+    }
+
+    /// Borrow the already published source. Missing or mismatched binding is
+    /// an invariant refusal, never contention without a release subscription.
     pub fn ipc_operation_slot_source(
         &self,
         generation: core::num::NonZeroU64,
-        completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
+        _completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
     ) -> Result<BorrowedObjectNotificationSource<'_, '_, C>, ObjectWaitError> {
         let key = ObjectWaitKey::ipc_operation_slots(generation);
-        if self.notification_generation(key) == 0 {
-            if !self.completion_handbacks.initialize() {
-                return Err(ObjectWaitError::Busy);
-            }
-            let guard = self.lock_completion_index(key, &BoundedSpin(0), completion)?;
-            let queue = guard.queue();
-            if queue.generation.load(Ordering::Acquire) == 0 {
-                assert!(self.object_admission_handbacks[key.index as usize].initialize());
-                queue.completion_mode.store(1, Ordering::Release);
-                queue.epoch.store(1, Ordering::SeqCst);
-                queue.publishers.store(1, Ordering::Release);
-                queue.generation.store(key.generation, Ordering::Release);
-            }
-        }
         if self.notification_generation(key) != key.generation {
             return Err(ObjectWaitError::Stale);
         }
@@ -1755,8 +1774,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     }
 
     /// Publish after the free-list push, without acquiring the waiter lock.
-    /// Before first admission there can be no subscriber: its first probe
-    /// follows source admission and observes every earlier returned slot.
+    /// The source is bound before the IPC region is published to the zone.
+    /// An absent or foreign binding is rejected without touching any queue.
     pub fn notify_ipc_operation_slot_release(
         &self,
         generation: core::num::NonZeroU64,
@@ -1768,7 +1787,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         if actual == 0 {
             return;
         }
-        assert_eq!(actual, key.generation, "one IPC arena per carrier");
+        if actual != key.generation {
+            return;
+        }
         BorrowedObjectNotificationSource {
             zone: self,
             key,
@@ -2379,39 +2400,41 @@ mod host_tests {
     }
 
     #[test]
-    fn ipc_operation_slot_source_busy_once_then_success() {
+    fn ipc_operation_slot_source_is_bound_before_admission() {
         let zone = fixture(false);
         let generation = core::num::NonZeroU64::new(42).unwrap();
-        let key = ObjectWaitKey::ipc_operation_slots(generation);
-        assert!(key.index() as usize >= ZONE_RECORDS);
-        assert_ne!(key, ObjectWaitKey::reservation_pool(generation));
         let completion = |owned: OwnedObjectWakeEffects<'_>| {
             let _ = owned.into_parts();
         };
+        assert!(matches!(
+            zone.ipc_operation_slot_source(generation, &completion),
+            Err(ObjectWaitError::Stale)
+        ));
+        zone.bind_ipc_operation_slots(generation, &SpinForever, &completion)
+            .unwrap();
+        let key = ObjectWaitKey::ipc_operation_slots(generation);
+        assert!(key.index() as usize >= ZONE_RECORDS);
+        assert_ne!(key, ObjectWaitKey::reservation_pool(generation));
+        let before = zone.object_queue_census(key.index()).unwrap().epoch;
         let held = zone
             .lock_completion_index(key, &BoundedSpin(0), &completion)
             .unwrap();
-        assert!(matches!(
-            zone.ipc_operation_slot_source(generation, &completion),
-            Err(ObjectWaitError::Busy)
-        ));
+        assert!(
+            zone.ipc_operation_slot_source(generation, &completion)
+                .is_ok()
+        );
+        // A foreign arena must fail closed even while the queue is locked.
+        zone.notify_ipc_operation_slot_release(
+            core::num::NonZeroU64::new(43).unwrap(),
+            Waker::Host,
+            &completion,
+        );
         drop(held);
-        let source = zone
-            .ipc_operation_slot_source(generation, &completion)
-            .unwrap();
-        assert_eq!(source.reserve().key(), key);
-        assert!(matches!(
-            zone.ipc_operation_slot_source(core::num::NonZeroU64::new(43).unwrap(), &completion),
-            Err(ObjectWaitError::Stale)
-        ));
-        assert!(matches!(
-            zone.bind_object_wait_with_completion(
-                ObjectWaitKey::ipc_operation_slots(core::num::NonZeroU64::new(43).unwrap()),
-                &BoundedSpin(0),
-                &completion
-            ),
-            Err(ObjectWaitError::Occupied)
-        ));
+        assert_eq!(zone.object_queue_census(key.index()).unwrap().epoch, before);
+        assert!(
+            zone.ipc_operation_slot_source(generation, &completion)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -2421,6 +2444,8 @@ mod host_tests {
         let completion = |owned: OwnedObjectWakeEffects<'_>| {
             let _ = owned.into_parts();
         };
+        zone.bind_ipc_operation_slots(generation, &SpinForever, &completion)
+            .unwrap();
         let source = zone
             .ipc_operation_slot_source(generation, &completion)
             .unwrap();
@@ -2456,6 +2481,8 @@ mod host_tests {
             let _ = owned.deliver_handbacks(&mut |_| panic!("available slot"));
             delivered.set(delivered.get() + 1);
         };
+        zone.bind_ipc_operation_slots(generation, &SpinForever, &completion)
+            .unwrap();
         let source = zone
             .ipc_operation_slot_source(generation, &completion)
             .unwrap();
