@@ -186,7 +186,7 @@ tracing. Activation of the wider physical gate still requires review.
 The branch remains draft. Slice 2a and its consuming 2b must be reviewed and
 gated together; the dormant prerequisite types are not a landing unit.
 
-### Authority-debt blocker
+### Authority-debt correction
 
 The HAL wrappers now own mandatory boxed claims. The inventory-owned claim
 carries its abandonment policy, so consuming a wrapper needs no missing-claim
@@ -194,12 +194,11 @@ fatal branch. Prepared drop restores rows; cleared drop quarantines the exact
 MM before taking the inventory lock; successful apply or abort disarms drop.
 
 The checkpoint introduced invariant-fatal sites in the inventory claim
-and the admitted-MM conversion. The authority-debt source gate rejects these
-unclassified sites. Its ceilings have not been increased. The inventory claim
-retains IDs into mutable maps rather than owning stable row/reference tokens;
-removing those checks safely requires stronger inventory custody types. This
-is an additional draft blocker, not a passing gate or permission to remove
-checks from an allegedly infallible commit.
+and the admitted-MM conversion. Subsequent changes removed them by owning
+mapping rows and stable reference units, and by making admitted-MM conversion
+fallible. The two counter-related fatal sites were new against admitted main;
+neither remains. No authority-debt ceiling was increased. This corrects the
+claim's bookkeeping, but does not supply the missing physical retirement gate.
 
 ## Continuation audit against the current owner brief
 
@@ -222,12 +221,12 @@ The six items in the original ruling have this status:
 | CPL0 path | Named and witnessed through `CarrierMemory::retire_child` and `custody_release_before_another_mm_unmaps_keeps_physical_registration`. Backend-half receipt integration remains part of the addendum work. |
 
 The continuation moves mapping rows into the claim, leaving constructor-sealed
-`Claimed` placeholders; overlays cannot copy a claimed row. Addendum 2 still
-requires stable reference custody outside the copied overlay;
-prepare/abort/split reference accounting;
-`Shared`/`Zero`/`Last` release semantics and complete unmap bookkeeping; linear
-retirement permits consumed into a backend release half; and gates on native
-backing drop and the cross-MM legacy retirement sites. No new debt ceiling or
+`Claimed` placeholders; overlays cannot copy a claimed row. The owned-reference
+continuation below adds stable reference custody outside the copied overlay,
+prepare/abort accounting, and `Shared`/`Zero`/`Last` release semantics with full
+unmap bookkeeping. Addendum 2 still requires production split conversion,
+linear retirement permits consumed into a backend release half, and gates on
+native backing drop and the cross-MM legacy retirement sites. No new debt ceiling or
 legacy exemption is introduced by this continuation. Passing prerequisite
 tests cannot substitute for these missing production changes or slice 2b.
 
@@ -260,14 +259,12 @@ the actual custody drop; CPL0 must retain it through `CarrierMemory::retire_chil
 Neither the existing receipt constructor nor a successful inventory query
 proves that step completed.
 
-The remaining stable-counter work is also substantive: the current overlay
-copies `FrameEntry` and its numeric `FrameReferences`. An `Arc` around that
-copied value alone cannot make a claimed decrement infallible. An owned unit
-must remain attached to one counter across ordinary overlay commits, aborts,
-and splits, without losing full reference-count capacity or allowing a last
-release while a staged alias is being published. The owned-row change closes
-the row re-lookup problem only. The two frame lookup/underflow fatal sites and
-the missing physical permit gate remain implementation blockers.
+The owned-reference continuation below resolves the stable-counter gap:
+`FrameEntry` owns a stable counter cell, and the overlay copies only its numeric
+snapshot. An owned unit stays attached to that cell across overlay commits and
+aborts. The split primitive is present, but production mapping splits still use
+the event-based path. The physical permit gate remains an implementation
+blocker.
 
 
 The admitted-handle conversion now returns `Option<GuestFrameOwner>` instead

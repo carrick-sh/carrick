@@ -362,7 +362,7 @@ fn release_retired_child<M: CarrierMemoryIo>(
         ))
     }
     .map_err(|e| fail(e.to_string()))?;
-    if !carrick_hal::fork_stock::release_child_mm(inventory, residency, absence).is_some() {
+    if carrick_hal::fork_stock::release_child_mm(inventory, residency, absence).is_none() {
         return Err(fail("retired child inventory or residency release"));
     }
     memory
@@ -1311,7 +1311,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                     })
                     .ok_or_else(|| fail("unpublished child MM slot absence"))?;
                 release_retired_child(&mut self._vm, &*frame_inventory, &absence)?;
-            } else if !carrick_hal::fork_stock::release_child_mm(
+            } else if carrick_hal::fork_stock::release_child_mm(
                 &*frame_inventory,
                 self.cow_residency()?,
                 &SlotAbsence::scan(loan.request.child_mm, [])
@@ -1322,7 +1322,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                     })
                     .ok_or_else(|| fail("unpublished child inventory owner"))?,
             )
-            .is_some()
+            .is_none()
             {
                 return Err(fail("unpublished child inventory rollback"));
             }

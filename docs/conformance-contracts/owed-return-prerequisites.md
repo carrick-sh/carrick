@@ -42,3 +42,11 @@ a successful sibling publication preserves the cell, the claim releases as
 shared, and sibling teardown retires the frame. The alias-after-last witness
 requires `UnreservedFrame`, with no republished row. These are logical inventory
 witnesses; no stage-2 permit or backend release is established by them.
+
+The native first-exec fixture also assumed the recycled root's incarnation was
+always 2. Table-wide incarnation allocation invalidates that numeric assumption.
+Its isolated red run failed with actual 3 versus expected 2. The fixture now
+uses the successor slot's admitted incarnation throughout manifest sealing,
+adoption and gate notifications, and asserts it differs from both the retired
+root's incarnation and the adoption receipt. The production physical-switch
+and gate-revision assertions remain intact.

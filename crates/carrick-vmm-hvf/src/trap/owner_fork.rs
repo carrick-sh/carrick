@@ -51,10 +51,6 @@ impl ForkPhysicalRetention {
     pub(crate) fn frame_keys(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
         self._frames.keys().copied()
     }
-    #[expect(
-        dead_code,
-        reason = "approved slice 2a prerequisite consumed by slice 2b"
-    )]
     pub(crate) fn release_frame(&mut self, ipa: u64, generation: u64) {
         self._frames.remove(&(ipa, generation));
         self._native_owners.remove(&(ipa, generation));

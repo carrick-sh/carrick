@@ -13,10 +13,6 @@ use carrick_hal::fork_stock::{ForkStock, ForkTableLedger};
 #[derive(Default)]
 pub(crate) struct NativeChildPhysical {
     pub inherited: Vec<crate::trap::ForkPhysicalRetention>,
-    #[expect(
-        dead_code,
-        reason = "approved slice 2a prerequisite consumed by slice 2b"
-    )]
     pub(crate) inherited_by_frame: std::collections::BTreeMap<(u64, u64), Vec<usize>>,
     pub sources: carrick_hal::fork_stock::ForkHostBackingCustody,
     pub supplied: Option<

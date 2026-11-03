@@ -1640,7 +1640,7 @@ fn first_exec_after_fork_exit_reuses_the_slot_with_a_fresh_root_incarnation() {
         )
         .unwrap();
     let view = crate::mm_portal::test_support::nodes(fixture.region);
-    let _retired_journal = fixture
+    let retired_journal = fixture
         .region
         .table()
         .lock_el1_resolved(retired_space.index(), retired_mm, &view, 0)
@@ -1672,29 +1672,35 @@ fn first_exec_after_fork_exit_reuses_the_slot_with_a_fresh_root_incarnation() {
         execution: SnapshotGeneration::from_raw(29),
         sequence: NonZeroU64::new(31).unwrap(),
     };
-    // This key hashes to the just-retired slot. Receipt 1 is intentionally
-    // distinct from the real next reservation-root incarnation 2.
+    // This key hashes to the just-retired slot. Root incarnations are allocated
+    // across the table; neither the slot index nor the adoption receipt chooses
+    // the successor's incarnation.
     let successor_mm = ReservationMm::new(1031).unwrap();
     let slot = service.prepare_exec_successor_slot(successor_mm).unwrap();
-    assert_eq!(slot.root_generation(), NonZeroU64::new(2).unwrap());
+    let successor_incarnation = slot.root_generation();
+    assert_ne!(
+        successor_incarnation.get(),
+        retired_journal.identity().incarnation().raw()
+    );
+    assert_ne!(successor_incarnation, NonZeroU64::MIN);
     let receipt = ExecAdoptionReceipt::checked(NonZeroU64::MIN).unwrap();
-    let manifest =
-        ExecSuccessorManifest::propose(identity, successor_mm, NonZeroU64::new(2).unwrap())
-            .seal(
-                identity,
-                receipt,
-                ExecSuccessorBacking {
-                    root: RootGpa::page_aligned(FrameGpa::new(0x90_0000)).unwrap(),
-                    asid: asid(47),
-                    asid_generation: NonZeroU64::new(53).unwrap(),
-                },
-                ExecSuccessorEntry {
-                    entry: UserVa::new(0x40_0000),
-                    stack_pointer: UserVa::new(0x7fff_f000),
-                },
-            )
-            .unwrap();
+    let manifest = ExecSuccessorManifest::propose(identity, successor_mm, successor_incarnation)
+        .seal(
+            identity,
+            receipt,
+            ExecSuccessorBacking {
+                root: RootGpa::page_aligned(FrameGpa::new(0x90_0000)).unwrap(),
+                asid: asid(47),
+                asid_generation: NonZeroU64::new(53).unwrap(),
+            },
+            ExecSuccessorEntry {
+                entry: UserVa::new(0x40_0000),
+                stack_pointer: UserVa::new(0x7fff_f000),
+            },
+        )
+        .unwrap();
     let index = fixture.zone.spaces.find(successor_mm.raw()).unwrap();
+    assert_eq!(index.index(), retired_space.index());
     let root = RootGpa::page_aligned(FrameGpa::new(0x90_0000)).unwrap();
     let ttbr = (u64::from(asid(47).raw()) << 48) | root.address().raw();
     assert!(
@@ -1705,16 +1711,16 @@ fn first_exec_after_fork_exit_reuses_the_slot_with_a_fresh_root_incarnation() {
     );
 
     let admitted = slot.prepare_adoption().unwrap();
-    assert_eq!(admitted.incarnation(), NonZeroU64::new(2).unwrap());
+    assert_eq!(admitted.incarnation(), successor_incarnation);
     let successor = service
         .adopt_exec_successor(identity, receipt, &manifest)
-        .expect("the first exec after a fork/exit must use slot 7 incarnation 2");
+        .expect("the first exec after a fork/exit must use the admitted successor incarnation");
     slot.commit();
     let notifications = fixture
         .zone
         .space_entry(NonZeroU64::new(successor_mm.raw()).unwrap())
         .unwrap()
-        .notifications(NonZeroU64::new(2).unwrap())
+        .notifications(successor_incarnation)
         .unwrap();
     let cause = carrick_sched_core::spaces::notification::SpaceWaitCause::Gate;
     let before = notifications.observe(cause).revision();
