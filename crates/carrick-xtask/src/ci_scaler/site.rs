@@ -29,6 +29,12 @@ impl TryFrom<u16> for AgentTemplate {
     }
 }
 
+/// The pilot's agent container template on Contabo (unprivileged, `/dev/kvm`
+/// passed through, rootfs derived from agent template 9001's disk). Like
+/// 9000/9001 it stays outside pool `carrick-ci`, and the scoped token may
+/// hold only `VM.Audit` and `VM.Clone` on it.
+pub const CONTAINER_TEMPLATE: u16 = 9579;
+
 /// How admission measures free space on the clone storage before booting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Headroom {
@@ -63,6 +69,9 @@ pub(super) enum Network {
 pub(super) struct Site {
     pub lane: super::CloneLane,
     pub agent_template: Option<AgentTemplate>,
+    /// What agent clones are made of. Always `Vm` unless the controller was
+    /// started with the gated `--agent-runner-kind lxc` (KVM clones are VMs).
+    pub agent_kind: super::RunnerKind,
     /// `/etc/hostname`, which is also the PVE node name.
     pub node: &'static str,
     /// Name on the node's PVE certificate; resolved to 127.0.0.1.
@@ -86,6 +95,7 @@ pub(super) struct Site {
 pub(super) const WILLOW: Site = Site {
     lane: super::CloneLane::Kvm,
     agent_template: None,
+    agent_kind: super::RunnerKind::Vm,
     node: "willow",
     api_host: "willow.atxconsulting.com",
     api_ca: None,
@@ -104,6 +114,7 @@ pub(super) const WILLOW: Site = Site {
 pub(super) const CONTABO: Site = Site {
     lane: super::CloneLane::Kvm,
     agent_template: Some(AgentTemplate::Green),
+    agent_kind: super::RunnerKind::Vm,
     node: "carrick-ctb",
     api_host: "carrick-ctb.turkey-moth.ts.net",
     api_ca: Some("/etc/pve/pve-root-ca.pem"),
@@ -119,7 +130,7 @@ pub(super) const CONTABO: Site = Site {
     cores: 8,
     memory_mib: 16384,
     disk_gib: 100,
-    protected: &[101, 102, 103, 104, 9000, 9001],
+    protected: &[101, 102, 103, 104, 9000, 9001, CONTAINER_TEMPLATE],
 };
 
 pub(super) const SITES: [Site; 2] = [WILLOW, CONTABO];
@@ -128,6 +139,11 @@ impl Site {
     pub(super) fn template(&self) -> Result<u16, ScalerError> {
         match self.lane {
             super::CloneLane::Kvm => Ok(300),
+            super::CloneLane::Agent if self.agent_kind == super::RunnerKind::Lxc => {
+                self.agent_template
+                    .ok_or(ScalerError::Guard("site has no agent template"))?;
+                Ok(CONTAINER_TEMPLATE)
+            }
             super::CloneLane::Agent => self
                 .agent_template
                 .map(AgentTemplate::vmid)
@@ -145,9 +161,27 @@ impl Site {
         Ok(self)
     }
 
+    /// Gated pilot override: agent clones become containers. Only the site
+    /// with an agent template (Contabo) accepts it; KVM clones stay VMs.
+    pub(super) fn with_agent_kind(mut self, kind: super::RunnerKind) -> Result<Self, ScalerError> {
+        if kind == super::RunnerKind::Lxc && self.agent_template.is_none() {
+            return Err(ScalerError::Guard("container agent clones require Contabo"));
+        }
+        self.agent_kind = kind;
+        Ok(self)
+    }
+    /// What this site's clones on its current lane are made of.
+    pub(super) fn runner_kind(&self) -> super::RunnerKind {
+        match self.lane {
+            super::CloneLane::Kvm => super::RunnerKind::Vm,
+            super::CloneLane::Agent => self.agent_kind,
+        }
+    }
+
     pub(super) fn for_lane(self, lane: super::CloneLane) -> Result<Self, ScalerError> {
         let mut site = Self::for_hostname(self.node)?;
         site.agent_template = self.agent_template;
+        site.agent_kind = self.agent_kind;
         if lane == super::CloneLane::Agent {
             if site.node != CONTABO.node {
                 return Err(ScalerError::Guard("agent clones require Contabo"));
@@ -181,7 +215,11 @@ impl Site {
         format!("{}:8006:127.0.0.1", self.api_host)
     }
     pub(super) fn qemu(&self, vmid: u16) -> String {
-        format!("/nodes/{}/qemu/{vmid}", self.node)
+        self.guest(super::RunnerKind::Vm, vmid)
+    }
+    /// `/nodes/<node>/qemu/<id>` or `/nodes/<node>/lxc/<id>`.
+    pub(super) fn guest(&self, kind: super::RunnerKind, vmid: u16) -> String {
+        format!("/nodes/{}/{}/{vmid}", self.node, kind.api_type())
     }
     pub(super) fn task_prefix(&self) -> String {
         format!("UPID:{}:", self.node)
@@ -287,6 +325,7 @@ impl Site {
                 if !(300..=349).contains(&vmid)
                     && AgentTemplate::try_from(vmid).is_err()
                     && vmid != 9501
+                    && vmid != CONTAINER_TEMPLATE
                 {
                     return Err(ScalerError::Guard("static address outside CI VMIDs"));
                 }
@@ -294,6 +333,8 @@ impl Site {
                     "{a}.{b}.{c}.{}",
                     if vmid == 9501 {
                         152 // Reserved qualification clone, outside controller identities.
+                    } else if vmid == CONTAINER_TEMPLATE {
+                        179
                     } else if AgentTemplate::try_from(vmid).is_ok() {
                         150 + vmid - 9000
                     } else {
@@ -469,6 +510,7 @@ mod tests {
             Site {
                 lane: super::super::CloneLane::Kvm,
                 agent_template: None,
+                agent_kind: super::super::RunnerKind::Vm,
                 node: "willow",
                 api_host: "willow.atxconsulting.com",
                 api_ca: None,
@@ -502,6 +544,7 @@ mod tests {
             Site {
                 lane: super::super::CloneLane::Kvm,
                 agent_template: Some(AgentTemplate::Green),
+                agent_kind: super::super::RunnerKind::Vm,
                 node: "carrick-ctb",
                 api_host: "carrick-ctb.turkey-moth.ts.net",
                 api_ca: Some("/etc/pve/pve-root-ca.pem"),
@@ -517,7 +560,7 @@ mod tests {
                 cores: 8,
                 memory_mib: 16384,
                 disk_gib: 100,
-                protected: &[101, 102, 103, 104, 9000, 9001],
+                protected: &[101, 102, 103, 104, 9000, 9001, CONTAINER_TEMPLATE],
             }
         );
         assert_eq!(
@@ -567,7 +610,10 @@ OUT ACCEPT -dest 0.0.0.0/0 -log nolog # remaining IPv4 through the NAT gateway\n
         assert_eq!(site.cores, 8);
         assert_eq!(site.memory_mib, 20480);
         assert_eq!(site.template().unwrap(), 9001);
-        assert_eq!(site.protected, &[101, 102, 103, 104, 9000, 9001]);
+        assert_eq!(
+            site.protected,
+            &[101, 102, 103, 104, 9000, 9001, CONTAINER_TEMPLATE]
+        );
         assert_eq!(site.static_address(9000).unwrap().unwrap(), "10.77.0.150");
         assert!(
             site.vm_firewall_file(9000)

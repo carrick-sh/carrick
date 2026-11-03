@@ -467,3 +467,48 @@ After retirement there is no binary rollback. Rolling back then means
 rebuilding a template in the freed slot with this procedure, and because
 `main` still points the site row at the new slot, it needs a fix-forward PR
 that changes the site row before its controller is deployed.
+
+## Container agent clones (gated pilot)
+
+`ci-scaler standing --agent-runner-kind lxc` serves agent clones from
+unprivileged container template 9579 instead of VM template 9001. The default
+is `vm`, and KVM clones (template 300) are always VMs. The 2026-11-03 pilot
+measured no write or I/O-pressure benefit on ctb, so the kind stays off; the
+measurements and the switch conditions are in the pilot issue linked from the
+PR that added this section.
+
+What the kind changes:
+
+- Each ledger row records its kind (`kind`, absent in older rows, which read
+  as `vm`), so a row is always torn down under the PVE subtree it was created
+  in (`/nodes/<node>/lxc/<id>` or `/qemu/<id>`).
+- The clone is a full copy (`full: true`, `hostname` = ledger name): directory
+  storage cannot snapshot a container rootfs. On ctb that is about 5.5 GB and
+  six minutes per clone under load.
+- Containers have no guest agent and the PVE API has no container exec. The
+  root controller runs `pct exec` on its own node for every guest command
+  (readiness, script install, policy, token mints, assignment rendezvous);
+  the scoped token is not used for exec.
+- No cloud-init: the clone gets `net0` (static address, `firewall=1`), CPU,
+  memory, `swap: 0` and the resolver through the API. After boot the
+  controller installs its transport key for `runner` over `pct exec` stdin and
+  regenerates the clone's SSH host keys, then pins them as for VMs.
+- Readiness is `systemctl is-system-running --wait` reporting `running`,
+  then the same runner checks as VMs (non-root KVM API 12 included).
+- KSM does not apply (no separate guest memory). The PVE firewall file,
+  ipfilter and verification are the same as for VMs, on the container subtree.
+- A container in pool `carrick-ci` is refused unless the controller runs this
+  kind. 9579 is a protected VMID: the token may hold only `VM.Audit` and
+  `VM.Clone` on it, as for 9000 and 9001.
+
+`ci-scaler qualify-clone --kind lxc --template 9579` (root on ctb) full-clones
+the template into reserved slot 9501, boots it with the site firewall,
+reaches it exactly as the controller would, proves non-root KVM for the
+runner and agent accounts and the agent-retirement census prerequisites
+(`/proc`, `pgrep` by uid), then destroys it.
+
+The template has no builder in this repository. The pilot built it from
+template 9001's own disk (read-only `qemu-nbd`, `tar --numeric-owner`), with
+`ifupdown` added, netplan and cloud-init disabled, an empty `fstab`, and
+`dev0: /dev/kvm,gid=992,mode=0660` (the image's `kvm` group), `features:
+nesting=1`, `unprivileged: 1`.

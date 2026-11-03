@@ -135,9 +135,31 @@ pub(super) fn wait_for_readiness(
     ))
 }
 
+/// A container runs no cloud-init (PVE writes its network and hostname);
+/// readiness is systemd reaching `running` with no failed unit.
+fn container_booted(output: &GuestOutput) -> bool {
+    output.exit == GuestExit(0) && output.stdout.trim() == "running"
+}
+
 pub(super) fn qualify_guest(
+    kind: RunnerKind,
     mut run: impl FnMut(&[&str]) -> Result<GuestOutput, ScalerError>,
 ) -> Result<(), ScalerError> {
+    if kind == RunnerKind::Lxc {
+        let boot = run(&[
+            "/usr/bin/timeout",
+            "20",
+            "/usr/bin/systemctl",
+            "is-system-running",
+            "--wait",
+        ])?;
+        if !container_booted(&boot) {
+            return Err(ScalerError::Guard(
+                "container boot not completely qualified",
+            ));
+        }
+        return qualify_runner(run);
+    }
     let cloud = run(&[
         "/usr/bin/timeout",
         "20",
@@ -149,6 +171,12 @@ pub(super) fn qualify_guest(
     if !cloud_init_complete(&cloud)? {
         return Err(ScalerError::Guard("cloud-init not completely qualified"));
     }
+    qualify_runner(run)
+}
+/// The checks every clone kind shares once its init has finished.
+fn qualify_runner(
+    mut run: impl FnMut(&[&str]) -> Result<GuestOutput, ScalerError>,
+) -> Result<(), ScalerError> {
     for command in [
         &["/usr/bin/systemctl", "start", "carrick-ci-ready.service"][..],
         &[
@@ -236,6 +264,25 @@ fn clone_config(public_key: &str, site: &Site, vm: CloneId) -> Result<Value, Sca
     }
     Ok(config)
 }
+/// A container's per-clone configuration. PVE applies `net0`'s address and
+/// the resolver itself; the transport key is installed through
+/// [`container_exec`] after boot, because containers have no cloud-init.
+fn container_clone_config(site: &Site, vm: CloneId) -> Result<Value, ScalerError> {
+    let mut config = json!({
+        "net0": format!("name=eth0,bridge={},firewall=1,{}", site.bridge, site.ipconfig(vm.get())?),
+        "tags":"carrick-ci;willow-pilot",
+        "cores":site.cores,"memory":site.memory_mib,"swap":0,"cpulimit":site.cores
+    });
+    if let Some(nameserver) = site.nameserver() {
+        config["nameserver"] = json!(nameserver);
+    }
+    Ok(config)
+}
+/// Root in the container: authorize the controller's transport key for the
+/// runner (key on stdin) and give this clone its own SSH host keys, since a
+/// full container copy carries the template's.
+pub(super) const CONTAINER_TRANSPORT: &str = "set -eu; install -d -o runner -g runner -m 700 /home/runner/.ssh; install -o runner -g runner -m 600 /dev/stdin /home/runner/.ssh/authorized_keys; rm -f /etc/ssh/ssh_host_*; ssh-keygen -q -A; systemctl restart ssh";
+
 fn pve_response(bytes: &[u8]) -> Result<Value, ScalerError> {
     let end = bytes
         .iter()
@@ -347,12 +394,17 @@ impl Pve {
         )?;
         pve_response(&bytes)
     }
-    fn base(&self, id: CloneId) -> String {
-        self.site.qemu(id.get())
+    /// The row's own PVE subtree: a row keeps the kind it was created with.
+    fn base(&self, row: &Record) -> String {
+        self.site.guest(row.kind, row.vm.get())
     }
     fn inventory(&self) -> Result<Vec<PoolMember>, ScalerError> {
         let pool = self.request(PveCall::Get, "/pools/carrick-ci")?;
-        pool_inventory(&pool, self.site.node)
+        pool_inventory(
+            &pool,
+            self.site.node,
+            self.site.agent_kind == RunnerKind::Lxc,
+        )
     }
     fn guard(&self, row: &Record) -> Result<Vm, ScalerError> {
         let inventory = self.inventory()?;
@@ -360,11 +412,19 @@ impl Pve {
             .into_iter()
             .find(|v| v.id == row.vm.get())
             .ok_or(ScalerError::Guard("ledger VM is absent"))?;
-        let config = self.request(PveCall::Get, &format!("{}/config", self.base(row.vm)))?;
+        let config = self.request(PveCall::Get, &format!("{}/config", self.base(row)))?;
         authenticate_config(row, vm, &config)
     }
 }
-fn pool_inventory(pool: &Value, node: &str) -> Result<Vec<PoolMember>, ScalerError> {
+/// Pool members with their kind. A container in the pool is refused unless
+/// the controller runs the gated container kind (`containers`); then it is
+/// an ordinary member, and the ledger still treats an unknown one as
+/// occupying the whole budget.
+fn pool_inventory(
+    pool: &Value,
+    node: &str,
+    containers: bool,
+) -> Result<Vec<PoolMember>, ScalerError> {
     if pool["poolid"] != POOL {
         return Err(ScalerError::Guard("PVE returned another pool"));
     }
@@ -373,7 +433,17 @@ fn pool_inventory(pool: &Value, node: &str) -> Result<Vec<PoolMember>, ScalerErr
         .ok_or(ScalerError::External("pool members"))?;
     let mut result = Vec::new();
     for member in members {
-        if member["type"] == "qemu" {
+        let kind = match member["type"].as_str() {
+            Some("qemu") => Some(RunnerKind::Vm),
+            Some("lxc") if containers => Some(RunnerKind::Lxc),
+            Some("lxc") => {
+                return Err(ScalerError::Guard(
+                    "unknown container occupies pool; owner inspection needed",
+                ));
+            }
+            _ => None,
+        };
+        if let Some(kind) = kind {
             if member["node"] != node {
                 return Err(ScalerError::Guard("unexpected pool node"));
             }
@@ -385,11 +455,8 @@ fn pool_inventory(pool: &Value, node: &str) -> Result<Vec<PoolMember>, ScalerErr
                 id,
                 pool: POOL.into(),
                 template: member["template"].as_u64() == Some(1),
+                kind,
             });
-        } else if member["type"] == "lxc" {
-            return Err(ScalerError::Guard(
-                "unknown container occupies pool; owner inspection needed",
-            ));
         }
     }
     Ok(result)
@@ -451,13 +518,16 @@ impl Pve {
         input: Option<&str>,
     ) -> Result<GuestOutput, ScalerError> {
         self.guard(row)?;
+        if row.kind == RunnerKind::Lxc {
+            return container_exec(row.vm.get(), command, input);
+        }
         let mut body = json!({"command":command});
         if let Some(input) = input {
             body["input-data"] = input.into();
         }
         let response = self.request(
             PveCall::Post(body),
-            &format!("{}/agent/exec", self.base(row.vm)),
+            &format!("{}/agent/exec", self.base(row)),
         )?;
         let pid = response["pid"]
             .as_u64()
@@ -466,7 +536,7 @@ impl Pve {
         while Instant::now() < deadline {
             let status = self.request(
                 PveCall::Get,
-                &format!("{}/agent/exec-status?pid={pid}", self.base(row.vm)),
+                &format!("{}/agent/exec-status?pid={pid}", self.base(row)),
             )?;
             if status["exited"].as_bool() == Some(true) || status["exited"].as_u64() == Some(1) {
                 let exit = status["exitcode"]
@@ -484,9 +554,19 @@ impl Pve {
     }
     fn guest_ip(&self, row: &Record) -> Result<Ipv4Addr, ScalerError> {
         self.guard(row)?;
+        if row.kind == RunnerKind::Lxc {
+            // PVE assigns a container's address from its own `net0`; there
+            // is no agent to report it, and the site table is the authority.
+            return self
+                .site
+                .static_address(row.vm.get())?
+                .ok_or(ScalerError::Guard("container clones need a static site"))?
+                .parse()
+                .map_err(|_| ScalerError::Guard("invalid container address"));
+        }
         let data = self.request(
             PveCall::Get,
-            &format!("{}/agent/network-get-interfaces", self.base(row.vm)),
+            &format!("{}/agent/network-get-interfaces", self.base(row)),
         )?;
         let interfaces = data["result"]
             .as_array()
@@ -509,14 +589,65 @@ impl Pve {
         Err(ScalerError::External("no private guest IPv4 address"))
     }
 }
+/// Runs before the command and reports its exit status after its output,
+/// the shape the guest agent's `exec-status` gives a VM's command.
+const CONTAINER_EXEC_WRAPPER: &str = r#""$@"; status=$?; printf '\n%s' "$status""#;
+
+/// A container has no guest agent and the PVE API has no container exec, so
+/// the root controller runs `pct exec` on its own node (the scoped token
+/// cannot). `input` reaches the command on stdin, never in argv.
+pub(super) fn container_exec(
+    vmid: u16,
+    command: &[&str],
+    input: Option<&str>,
+) -> Result<GuestOutput, ScalerError> {
+    let id = vmid.to_string();
+    let mut pct = Command::new("pct");
+    pct.args([
+        "exec",
+        &id,
+        "--",
+        "/bin/sh",
+        "-c",
+        CONTAINER_EXEC_WRAPPER,
+        "sh",
+    ])
+    .args(command);
+    let bytes = execute(
+        &mut pct,
+        input.unwrap_or_default().as_bytes(),
+        Duration::from_secs(25),
+    )?;
+    parse_container_exec(&bytes)
+}
+fn parse_container_exec(bytes: &[u8]) -> Result<GuestOutput, ScalerError> {
+    let end = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .ok_or(ScalerError::External("container exec lacks its status"))?;
+    let exit = std::str::from_utf8(&bytes[end + 1..])
+        .ok()
+        .and_then(|status| status.parse::<i32>().ok())
+        .ok_or(ScalerError::External("invalid container exec status"))?;
+    Ok(GuestOutput {
+        exit: GuestExit(exit),
+        stdout: String::from_utf8_lossy(&bytes[..end]).into_owned(),
+    })
+}
+
 fn authenticate_config(
     row: &Record,
     member: PoolMember,
     config: &Value,
 ) -> Result<Vm, ScalerError> {
     // Pool membership licenses the VMID; its resource display can lag a clone.
-    // Authenticate mutable identity from the live per-VM configuration.
-    let name = config["name"]
+    // Authenticate mutable identity from the live per-VM configuration. A
+    // container carries its ledger name as `hostname`.
+    let name_field = match member.kind {
+        RunnerKind::Vm => "name",
+        RunnerKind::Lxc => "hostname",
+    };
+    let name = config[name_field]
         .as_str()
         .ok_or(ScalerError::Guard("live VM configuration lacks a name"))?
         .to_owned();
@@ -531,6 +662,7 @@ fn authenticate_config(
         pool: member.pool,
         name,
         template,
+        kind: member.kind,
     };
     row.guard(&vm)?;
     Ok(vm)
@@ -864,7 +996,24 @@ fn provision(
 /// One source-selection path for every newly admitted clone. Existing rows
 /// resume their own VM and retain its backing image across a template cutover.
 fn clone_call(site: Site, row: &Record) -> Result<(PveCall, String), ScalerError> {
-    let template = site.for_lane(row.lane)?.template()?;
+    let site = site.for_lane(row.lane)?;
+    if row.kind != site.runner_kind() {
+        return Err(ScalerError::Guard(
+            "row kind differs from the lane's clone kind",
+        ));
+    }
+    let template = site.template()?;
+    if row.kind == RunnerKind::Lxc {
+        // Directory storage cannot snapshot a container rootfs, so PVE
+        // refuses linked container clones there: the clone is a full copy.
+        return Ok((
+            PveCall::Post(json!({
+                "newid":row.vm.get(), "pool":POOL, "hostname":row.name, "full":true,
+                "description":format!("Carrick pilot ledger identity {}", row.name)
+            })),
+            format!("{}/clone", site.guest(RunnerKind::Lxc, template)),
+        ));
+    }
     Ok((
         PveCall::Post(json!({
             "newid":row.vm.get(), "pool":POOL, "name":row.name, "full":false,
@@ -914,22 +1063,19 @@ fn boot_and_register(
         ));
     }
     pve.guard(row)?;
-    let status = pve.request(
-        PveCall::Get,
-        &format!("{}/status/current", pve.base(row.vm)),
-    )?;
+    let status = pve.request(PveCall::Get, &format!("{}/status/current", pve.base(row)))?;
     if status["status"] != "stopped" {
         return Err(ScalerError::Guard(
             "clone preparation requires a stopped owned VM",
         ));
     }
+    let public_key = std::fs::read_to_string(key.with_extension("key.pub"))?;
     pve.request(
-        PveCall::Put(clone_config(
-            &std::fs::read_to_string(key.with_extension("key.pub"))?,
-            &pve.site,
-            row.vm,
-        )?),
-        &format!("{}/config", pve.base(row.vm)),
+        PveCall::Put(match row.kind {
+            RunnerKind::Vm => clone_config(&public_key, &pve.site, row.vm)?,
+            RunnerKind::Lxc => container_clone_config(&pve.site, row.vm)?,
+        }),
+        &format!("{}/config", pve.base(row)),
     )?;
     // Other clones still booting are charged at nominal size although they
     // may already use part of it, so a refusal here means "not now". A
@@ -948,14 +1094,15 @@ fn boot_and_register(
     pve.guard(row)?;
     // A linked clone inherits the template's `allow-ksm: 0`; refuse one
     // that lost it before the guest runs.
-    let config = pve.request(PveCall::Get, &format!("{}/config", pve.base(row.vm)))?;
-    if !ksm_matches(&config, &pve.site) {
+    // A container has no guest RAM of its own for KSM to merge.
+    let config = pve.request(PveCall::Get, &format!("{}/config", pve.base(row)))?;
+    if row.kind == RunnerKind::Vm && !ksm_matches(&config, &pve.site) {
         return Err(ScalerError::Guard("clone may join KSM page merging"));
     }
     // The clone inherits 300.fw; give it its own ipfilter address, then
     // prove the whole firewall before the guest can send a packet.
-    pve.set_clone_ipfilter(row.vm.get())?;
-    pve.verify_vm_firewall(row.vm.get())?;
+    pve.set_clone_ipfilter(row.kind, row.vm.get())?;
+    pve.verify_vm_firewall(row.kind, row.vm.get())?;
     let deadline = Instant::now() + Duration::from_secs(300);
     pve.deadline.set(Some(deadline));
     let shared_deadline = ApiDeadline(&pve.deadline);
@@ -964,7 +1111,7 @@ fn boot_and_register(
     update(ledger, row, path)?;
     row.task = Some(task_id(pve.request(
         PveCall::Post(json!({})),
-        &format!("{}/status/start", pve.base(row.vm)),
+        &format!("{}/status/start", pve.base(row)),
     )?)?);
     update(ledger, row, path)?;
     pve.wait_task(
@@ -973,7 +1120,17 @@ fn boot_and_register(
             .ok_or(ScalerError::Guard("start task missing"))?,
     )?;
     wait_for_readiness(deadline, || {
-        qualify_guest(|command| pve.agent_output(row, command))?;
+        if row.kind == RunnerKind::Lxc {
+            let transport = pve.agent_output_input(
+                row,
+                &["/bin/sh", "-c", CONTAINER_TRANSPORT],
+                Some(&public_key),
+            )?;
+            if transport.exit != GuestExit(0) {
+                return Err(ScalerError::External("container transport setup"));
+            }
+        }
+        qualify_guest(row.kind, |command| pve.agent_output(row, command))?;
         let ip = pve.guest_ip(row)?;
         row.ip = Some(ip);
         let key = pve.agent(row, &["/bin/cat", "/etc/ssh/ssh_host_ed25519_key.pub"])?;
@@ -1107,7 +1264,7 @@ impl TeardownApi for LiveTeardown<'_> {
         self.pve.guard(row)?;
         let status = self.pve.request(
             PveCall::Get,
-            &format!("{}/status/current", self.pve.base(row.vm)),
+            &format!("{}/status/current", self.pve.base(row)),
         )?;
         if status["status"] == "stopped" {
             return Ok(None);
@@ -1123,12 +1280,12 @@ impl TeardownApi for LiveTeardown<'_> {
         self.pve.guard(row)?;
         Ok(Some(task_id(self.pve.request(
             PveCall::Post(json!({})),
-            &format!("{}/status/stop", self.pve.base(row.vm)),
+            &format!("{}/status/stop", self.pve.base(row)),
         )?)?))
     }
     fn destroy(&mut self, row: &Record) -> Result<String, ScalerError> {
         self.pve.guard(row)?;
-        task_id(self.pve.request(PveCall::Delete, &self.pve.base(row.vm))?)
+        task_id(self.pve.request(PveCall::Delete, &self.pve.base(row))?)
     }
     fn wait_task(&mut self, task: &str) -> Result<(), ScalerError> {
         self.pve.wait_task(task)
@@ -1505,13 +1662,13 @@ impl Pve {
     /// address); replace it with exactly the clone's own address. Fails if
     /// the inherited set is missing, so a clone without the template's
     /// firewall never gets one invented here.
-    fn set_clone_ipfilter(&self, vmid: u16) -> Result<(), ScalerError> {
+    fn set_clone_ipfilter(&self, kind: RunnerKind, vmid: u16) -> Result<(), ScalerError> {
         let Some(address) = self.site.static_address(vmid)? else {
             return Ok(());
         };
         let path = format!(
             "{}/firewall/ipset/{}",
-            self.site.qemu(vmid),
+            self.site.guest(kind, vmid),
             super::site::IPFILTER_SET
         );
         let entries = self.request(PveCall::Get, &path)?;
@@ -1546,14 +1703,14 @@ impl Pve {
     /// On an isolating site, refuse a VM (template or clone, before boot)
     /// whose PVE firewall is not exactly the site's, or a host whose
     /// datacenter firewall is off. A no-op on other sites.
-    fn verify_vm_firewall(&self, vmid: u16) -> Result<(), ScalerError> {
+    fn verify_vm_firewall(&self, kind: RunnerKind, vmid: u16) -> Result<(), ScalerError> {
         if !self.site.isolates_bridge() {
             return Ok(());
         }
         if !cluster_firewall_enabled(&std::fs::read_to_string("/etc/pve/firewall/cluster.fw")?) {
             return Err(ScalerError::Guard("datacenter firewall is not enabled"));
         }
-        let base = self.site.qemu(vmid);
+        let base = self.site.guest(kind, vmid);
         let options = self.request(PveCall::Get, &format!("{base}/firewall/options"))?;
         let rules = self.request(PveCall::Get, &format!("{base}/firewall/rules"))?;
         let ipset = self.request(
@@ -1572,7 +1729,10 @@ impl Pve {
         }
     }
 }
-fn qualified_template(config: &Value, site: &Site) -> bool {
+pub(super) fn qualified_template(config: &Value, site: &Site) -> bool {
+    if site.runner_kind() == RunnerKind::Lxc {
+        return qualified_container_template(config, site);
+    }
     // PVE 9 returns memory's decimal MiB quantity as a JSON string.
     let memory_mib = config["memory"].as_u64().or_else(|| {
         config["memory"]
@@ -1601,6 +1761,39 @@ fn qualified_template(config: &Value, site: &Site) -> bool {
             s.contains(&bridge) && (!site.isolates_bridge() || s.contains("firewall=1"))
         })
         && ksm_matches(config, site)
+}
+/// The gated container template: unprivileged, the agent lane's CPU and
+/// memory, a rootfs on the clone storage at least the lane's size, the
+/// isolating bridge with the PVE firewall, and `/dev/kvm` passed through so
+/// the x86 KVM lane still runs as a non-root account.
+fn qualified_container_template(config: &Value, site: &Site) -> bool {
+    let number = |field: &str| {
+        config[field]
+            .as_u64()
+            .or_else(|| config[field].as_str().and_then(|v| v.parse::<u64>().ok()))
+    };
+    let storage = format!("{}:", site.storage);
+    let bridge = format!("bridge={}", site.bridge);
+    number("unprivileged") == Some(1)
+        && number("cores") == Some(u64::from(site.cores))
+        && number("memory") == Some(site.memory_mib)
+        && config["rootfs"].as_str().is_some_and(|s| {
+            s.starts_with(&storage)
+                && s.split(',').any(|field| {
+                    field
+                        .strip_prefix("size=")
+                        .and_then(|v| v.strip_suffix('G'))
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .is_some_and(|gib| gib >= site.disk_gib)
+                })
+        })
+        && config["net0"].as_str().is_some_and(|s| {
+            s.split(',').any(|f| f == bridge)
+                && (!site.isolates_bridge() || s.split(',').any(|f| f == "firewall=1"))
+        })
+        && config["dev0"]
+            .as_str()
+            .is_some_and(|s| s.split(',').next() == Some("/dev/kvm"))
 }
 /// On a site that keeps CI out of KSM, the VM config must say
 /// `allow-ksm: 0` (PVE's default is 1, and absence means 1).
@@ -1883,8 +2076,8 @@ fn verify_protected_vms(
     // whether agent clone demand is enabled. Only the source template may
     // carry the non-mutating rights needed to inspect and clone it.
     for vm in site.protected {
-        let source_template =
-            site.node == site::CONTABO.node && site::AgentTemplate::try_from(*vm).is_ok();
+        let source_template = site.node == site::CONTABO.node
+            && (site::AgentTemplate::try_from(*vm).is_ok() || *vm == site::CONTAINER_TEMPLATE);
         let protected = permissions(*vm)?;
         let source_required =
             source_template && site.lane == CloneLane::Agent && *vm == site.template()?;
@@ -1915,7 +2108,7 @@ fn verify_startup(
     lanes: &[CloneLane],
     inventory: &[PoolMember],
     mut request: impl FnMut(&str) -> Result<Value, ScalerError>,
-    mut firewall: impl FnMut(u16) -> Result<(), ScalerError>,
+    mut firewall: impl FnMut(RunnerKind, u16) -> Result<(), ScalerError>,
 ) -> Result<(), ScalerError> {
     for lane in lanes {
         let lane_pve = site.for_lane(*lane)?;
@@ -1936,7 +2129,8 @@ fn verify_startup(
         }
         // inventory() is /pools/carrick-ci, not /cluster/resources. The
         // source is deliberately absent there; VM.Audit licenses this lookup.
-        let config = request(&format!("{}/config", site.qemu(template)))?;
+        let kind = lane_pve.runner_kind();
+        let config = request(&format!("{}/config", site.guest(kind, template)))?;
         if *lane == CloneLane::Agent && config["template"].as_u64() != Some(1) {
             return Err(ScalerError::Guard("agent source is not a template"));
         }
@@ -1945,7 +2139,7 @@ fn verify_startup(
                 "template does not match approved size/storage/bridge",
             ));
         }
-        firewall(template)?;
+        firewall(kind, template)?;
     }
     let protected_site = if lanes.contains(&CloneLane::Agent) {
         site.for_lane(CloneLane::Agent)?
@@ -1966,11 +2160,19 @@ pub(super) fn controller(
     group: u64,
     one_job: bool,
     budget: CloneBudget,
+    agent_kind: RunnerKind,
 ) -> Result<(), ScalerError> {
     if matches!(admission, Admission::Pilot { .. }) && budget.kvm != Concurrency::ONE {
         return Err(ScalerError::Guard("the pilot admission is one clone only"));
     }
-    let pve = Pve::local()?;
+    let mut pve = Pve::local()?;
+    pve.site = pve.site.with_agent_kind(agent_kind)?;
+    if agent_kind == RunnerKind::Lxc {
+        println!(
+            "agent clones are containers from template {}",
+            site::CONTAINER_TEMPLATE
+        );
+    }
     let _lock = super::acquire_controller_lock(dir)?;
     let inventory = pve.inventory()?;
     let contabo_standing =
@@ -1986,7 +2188,7 @@ pub(super) fn controller(
         &lanes,
         &inventory,
         |path| pve.request(PveCall::Get, path),
-        |vm| pve.verify_vm_firewall(vm),
+        |kind, vm| pve.verify_vm_firewall(kind, vm),
     )?;
     let gh = Github;
     let path = dir.join("ledger.json");
@@ -2158,7 +2360,7 @@ fn reserve_admitted_clone(
     ledger: &mut Ledger,
     path: &Path,
     job: JobKey,
-    capacity: (CloneBudget, CloneLane),
+    capacity: (CloneBudget, CloneLane, RunnerKind),
     admit: impl FnOnce() -> Result<bool, ScalerError>,
     inventory: impl FnOnce() -> Result<Vec<PoolMember>, ScalerError>,
 ) -> Result<Option<Record>, ScalerError> {
@@ -2170,7 +2372,13 @@ fn reserve_admitted_clone(
     if ledger.served(job) {
         return Ok(None);
     }
-    let row = ledger.reserve_lane(job, &inventory, now()?, capacity.0, capacity.1)?;
+    let row = ledger.reserve_kind(
+        job,
+        &inventory,
+        now()?,
+        capacity.0,
+        (capacity.1, capacity.2),
+    )?;
     ledger.save(path)?;
     Ok(Some(row))
 }
@@ -2234,7 +2442,7 @@ fn admit_one(
         ledger,
         path,
         job,
-        (budget, lane),
+        (budget, lane, pve.site.runner_kind()),
         || {
             gh.vet(admission, job)?;
             match resource_admission(pve, pending) {
@@ -2583,7 +2791,7 @@ mod tests {
                 &mut ledger,
                 &path,
                 job(n),
-                (budget, CloneLane::Agent),
+                (budget, CloneLane::Agent, RunnerKind::Vm),
                 || Ok(true),
                 || Ok(Vec::new()),
             )
@@ -2595,7 +2803,7 @@ mod tests {
             &mut ledger,
             &path,
             job(6),
-            (budget, CloneLane::Agent),
+            (budget, CloneLane::Agent, RunnerKind::Vm),
             || Ok(true),
             || Ok(Vec::new()),
         );
@@ -2609,7 +2817,7 @@ mod tests {
                 &mut ledger,
                 &path,
                 job(n),
-                (budget, CloneLane::Kvm),
+                (budget, CloneLane::Kvm, RunnerKind::Vm),
                 || Ok(true),
                 || Ok(Vec::new()),
             )
@@ -2621,7 +2829,7 @@ mod tests {
                 &mut ledger,
                 &path,
                 job(9),
-                (budget, CloneLane::Kvm),
+                (budget, CloneLane::Kvm, RunnerKind::Vm),
                 || Ok(true),
                 || Ok(Vec::new()),
             )
@@ -2651,6 +2859,7 @@ mod tests {
                     agents: AgentClones::DEFAULT,
                 },
                 CloneLane::Kvm,
+                RunnerKind::Vm,
             ),
             || Ok(false),
             || panic!("inventory must not be queried when resource_admission is false"),
@@ -2670,6 +2879,7 @@ mod tests {
                     agents: AgentClones::DEFAULT,
                 },
                 CloneLane::Kvm,
+                RunnerKind::Vm,
             ),
             || Ok(true),
             || Ok(Vec::new()),
@@ -2689,6 +2899,7 @@ mod tests {
                     agents: AgentClones::DEFAULT,
                 },
                 CloneLane::Kvm,
+                RunnerKind::Vm,
             ),
             || Ok(true),
             || Ok(Vec::new()),
@@ -3071,6 +3282,218 @@ mod tests {
         assert!(!error.contains("secret-value"));
         assert_eq!(pve_response(b"{\"data\":null}\n200").unwrap(), Value::Null);
     }
+    fn container_row() -> Record {
+        Ledger::default()
+            .reserve_kind(
+                JobKey {
+                    run: RunId(1),
+                    attempt: 1,
+                    job: JobId(3),
+                },
+                &[],
+                0,
+                CloneBudget {
+                    kvm: Concurrency::ONE,
+                    agents: AgentClones::DEFAULT,
+                },
+                (CloneLane::Agent, RunnerKind::Lxc),
+            )
+            .unwrap()
+    }
+    fn container_site() -> Site {
+        super::site::CONTABO
+            .with_agent_kind(RunnerKind::Lxc)
+            .unwrap()
+            .for_lane(CloneLane::Agent)
+            .unwrap()
+    }
+    #[test]
+    fn container_kind_is_gated_to_agent_clones_on_contabo() {
+        // Default everywhere is a VM; the KVM lane stays a VM even when the
+        // controller runs agent clones as containers.
+        assert_eq!(super::site::CONTABO.runner_kind(), RunnerKind::Vm);
+        assert_eq!(super::site::CONTABO.agent_kind, RunnerKind::Vm);
+        let site = container_site();
+        assert_eq!(site.runner_kind(), RunnerKind::Lxc);
+        assert_eq!(site.template().unwrap(), super::site::CONTAINER_TEMPLATE);
+        assert_eq!(
+            site.for_lane(CloneLane::Kvm).unwrap().runner_kind(),
+            RunnerKind::Vm
+        );
+        assert_eq!(
+            site.for_lane(CloneLane::Kvm).unwrap().template().unwrap(),
+            300
+        );
+        assert!(
+            super::site::WILLOW
+                .with_agent_kind(RunnerKind::Lxc)
+                .is_err()
+        );
+        assert_eq!(
+            site.guest(RunnerKind::Lxc, 310),
+            "/nodes/carrick-ctb/lxc/310"
+        );
+        assert_eq!(
+            site.guest(RunnerKind::Vm, 310),
+            "/nodes/carrick-ctb/qemu/310"
+        );
+        assert!(
+            Ledger::default()
+                .reserve_kind(
+                    JobKey {
+                        run: RunId(1),
+                        attempt: 1,
+                        job: JobId(4),
+                    },
+                    &[],
+                    0,
+                    CloneBudget {
+                        kvm: Concurrency::ONE,
+                        agents: AgentClones::DEFAULT,
+                    },
+                    (CloneLane::Kvm, RunnerKind::Lxc),
+                )
+                .is_err()
+        );
+    }
+    #[test]
+    fn ledger_rows_written_before_the_pilot_read_back_as_vms() {
+        let mut value = serde_json::to_value(row()).unwrap();
+        value.as_object_mut().unwrap().remove("kind");
+        let old: Record = serde_json::from_value(value).unwrap();
+        assert_eq!(old.kind, RunnerKind::Vm);
+        let lxc = serde_json::to_value(container_row()).unwrap();
+        assert_eq!(lxc["kind"], "lxc");
+    }
+    #[test]
+    fn container_clone_is_a_full_copy_of_the_container_template() {
+        let row = container_row();
+        let (call, source) = clone_call(container_site(), &row).unwrap();
+        assert_eq!(source, "/nodes/carrick-ctb/lxc/9579/clone");
+        let body = call.body().unwrap();
+        assert_eq!(body["hostname"], row.name);
+        assert_eq!(body["full"], true);
+        assert_eq!(body["pool"], POOL);
+        assert!(body.get("name").is_none());
+        // A row never clones from another kind's template.
+        assert!(clone_call(super::site::CONTABO, &row).is_err());
+        let mut vm = row.clone();
+        vm.kind = RunnerKind::Vm;
+        assert!(clone_call(container_site(), &vm).is_err());
+    }
+    #[test]
+    fn container_config_sets_address_firewall_and_no_swap() {
+        let vm = CloneId::try_from(310).unwrap();
+        let config = container_clone_config(&container_site(), vm).unwrap();
+        assert_eq!(
+            config["net0"],
+            "name=eth0,bridge=vmbr1,firewall=1,ip=10.77.0.110/24,gw=10.77.0.1"
+        );
+        assert_eq!(config["swap"], 0);
+        assert_eq!(config["cores"], 8);
+        assert_eq!(config["memory"], 20480);
+        assert_eq!(config["nameserver"], "1.1.1.1");
+        assert!(config.get("sshkeys").is_none() && config.get("ciuser").is_none());
+    }
+    #[test]
+    fn containers_in_the_pool_are_refused_unless_the_kind_is_enabled() {
+        let pool = json!({"poolid":POOL,"members":[
+            {"type":"lxc","node":"carrick-ctb","vmid":310,"template":0},
+            {"type":"qemu","node":"carrick-ctb","vmid":311,"template":0}
+        ]});
+        assert!(pool_inventory(&pool, "carrick-ctb", false).is_err());
+        let members = pool_inventory(&pool, "carrick-ctb", true).unwrap();
+        assert_eq!(members[0].kind, RunnerKind::Lxc);
+        assert_eq!(members[1].kind, RunnerKind::Vm);
+        // A container's ledger name is its hostname; the kinds must agree.
+        let mut row = container_row();
+        row.vm = CloneId::try_from(310).unwrap();
+        let config = json!({"hostname":row.name});
+        assert!(authenticate_config(&row, members[0].clone(), &config).is_ok());
+        assert!(authenticate_config(&row, members[0].clone(), &json!({"name":row.name})).is_err());
+        let mut vm_row = row.clone();
+        vm_row.kind = RunnerKind::Vm;
+        let mut as_vm = members[0].clone();
+        as_vm.kind = RunnerKind::Vm;
+        assert!(
+            authenticate_config(&vm_row, members[0].clone(), &json!({"name":row.name})).is_err()
+        );
+        assert!(authenticate_config(&row, as_vm, &json!({"name":row.name})).is_err());
+    }
+    #[test]
+    fn container_template_must_be_unprivileged_with_kvm_on_the_isolating_bridge() {
+        let site = container_site();
+        let good = json!({
+            "template":1,"unprivileged":1,"cores":8,"memory":20480,
+            "rootfs":"local:9579/vm-9579-disk-0.raw,mountoptions=discard;lazytime,size=100G",
+            "net0":"name=eth0,bridge=vmbr1,firewall=1,gw=10.77.0.1,ip=10.77.0.179/24,type=veth",
+            "dev0":"/dev/kvm,gid=992,mode=0660"
+        });
+        assert!(qualified_template(&good, &site));
+        for (field, value) in [
+            ("unprivileged", json!(0)),
+            ("dev0", json!("/dev/fuse")),
+            ("net0", json!("name=eth0,bridge=vmbr0,firewall=1")),
+            ("net0", json!("name=eth0,bridge=vmbr1")),
+            ("rootfs", json!("local:9579/vm-9579-disk-0.raw,size=8G")),
+            ("rootfs", json!("other:9579/vm-9579-disk-0.raw,size=100G")),
+            ("memory", json!(4096)),
+        ] {
+            let mut config = good.clone();
+            config[field] = value;
+            assert!(!qualified_template(&config, &site), "{field}");
+        }
+        let mut missing = good.clone();
+        missing.as_object_mut().unwrap().remove("dev0");
+        assert!(!qualified_template(&missing, &site));
+        // A VM-shaped config never qualifies as the container template.
+        assert!(!qualified_template(
+            &json!({"template":1,"cpu":"host","cores":8,"memory":"20480","allow-ksm":0,
+                "scsi0":"local:9001/base-9001-disk-0.qcow2,size=100G","net0":"virtio,bridge=vmbr1,firewall=1"}),
+            &site
+        ));
+    }
+    #[test]
+    fn container_exec_reports_output_and_exit_status() {
+        let output = parse_container_exec(b"line one\nline two\n\n3").unwrap();
+        assert!(output.exit == GuestExit(3));
+        assert_eq!(output.stdout, "line one\nline two\n");
+        let quiet = parse_container_exec(b"\n0").unwrap();
+        assert!(quiet.exit == GuestExit(0) && quiet.stdout.is_empty());
+        assert!(parse_container_exec(b"no status").is_err());
+        assert!(parse_container_exec(b"out\nnot-a-number").is_err());
+        assert!(container_booted(&GuestOutput {
+            exit: GuestExit(0),
+            stdout: "running\n".into()
+        }));
+        assert!(!container_booted(&GuestOutput {
+            exit: GuestExit(1),
+            stdout: "degraded\n".into()
+        }));
+    }
+    /// The wrapper `pct exec` runs, driven through the same `execute` path
+    /// with `/bin/sh` standing in for `pct exec <id> --`.
+    #[test]
+    fn serial_host_container_exec_wrapper_keeps_stdout_stdin_and_status() {
+        let run = |args: &[&str], input: &str| {
+            let mut command = Command::new("/bin/sh");
+            command
+                .args(["-c", CONTAINER_EXEC_WRAPPER, "sh"])
+                .args(args);
+            parse_container_exec(
+                &execute(&mut command, input.as_bytes(), Duration::from_secs(10)).unwrap(),
+            )
+            .unwrap()
+        };
+        let failed = run(&["/bin/sh", "-c", "printf partial; exit 7"], "");
+        assert!(failed.exit == GuestExit(7));
+        assert_eq!(failed.stdout, "partial");
+        let echoed = run(&["/bin/cat"], "ssh-ed25519 AAAA key\n");
+        assert!(echoed.exit == GuestExit(0));
+        assert_eq!(echoed.stdout, "ssh-ed25519 AAAA key\n");
+        let missing = run(&["/nonexistent/command"], "");
+        assert!(missing.exit == GuestExit(127));
+    }
     #[test]
     fn provider_http_400_requires_urlencoded_sshkeys_in_json() {
         // Exact provider response from a non-mutating cores=0 validation request.
@@ -3157,9 +3580,9 @@ mod tests {
         let pool = json!({"poolid":POOL,"members":[
             {"type":"qemu","node":"willow","vmid":308,"template":0}
         ]});
-        let members = pool_inventory(&pool, "willow").unwrap();
+        let members = pool_inventory(&pool, "willow", false).unwrap();
         // Membership on another site's node is foreign, never adopted.
-        assert!(pool_inventory(&pool, "carrick-ctb").is_err());
+        assert!(pool_inventory(&pool, "carrick-ctb", false).is_err());
         assert_eq!(members[0].id, 308);
         let row = row();
         assert!(authenticate_config(&row, members[0].clone(), &json!({"name":row.name})).is_ok());
@@ -3224,6 +3647,7 @@ mod tests {
     fn ownership_uses_live_config_identity_and_retains_pool_and_template_fences() {
         let row = row();
         let cached = PoolMember {
+            kind: RunnerKind::Vm,
             id: row.vm.get(),
             pool: POOL.into(),
             template: false,

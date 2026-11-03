@@ -10,6 +10,7 @@ fn job(id: u64) -> JobKey {
 }
 fn vm(id: u16, name: &str) -> Vm {
     Vm {
+        kind: carrick_xtask::ci_scaler::RunnerKind::Vm,
         id,
         name: name.into(),
         pool: "carrick-ci".into(),
@@ -44,6 +45,7 @@ fn ledger_reserves_before_api_and_counts_booting_and_deduplicates() {
 fn existing_unknown_clone_blocks_admission_even_without_ledger_entry() {
     let mut ledger = Ledger::default();
     let unknown = PoolMember {
+        kind: carrick_xtask::ci_scaler::RunnerKind::Vm,
         id: 309,
         pool: POOL.into(),
         template: false,
@@ -138,6 +140,7 @@ fn serial_host_template_cpu_admission_uses_same_eighty_percent_ceiling() {
 #[test]
 fn cached_template_flag_cannot_exempt_a_clone_id_from_the_budget() {
     let member = PoolMember {
+        kind: carrick_xtask::ci_scaler::RunnerKind::Vm,
         id: 308,
         pool: POOL.into(),
         template: true,
@@ -668,6 +671,7 @@ fn standing_concurrency_is_bounded_at_two_and_unknown_objects_still_block() {
     let mut ledger = Ledger::default();
     let first = ledger.reserve(job(1), &[], 10, two).unwrap();
     let member = |id| PoolMember {
+        kind: carrick_xtask::ci_scaler::RunnerKind::Vm,
         id,
         pool: POOL.into(),
         template: false,
@@ -1195,6 +1199,7 @@ fn four_agent_clones_and_one_kvm_have_separate_durable_budgets() {
     let path = dir.path().join("ledger.json");
     let mut ledger = Ledger::default();
     let inventory = [300, 9000].map(|id| PoolMember {
+        kind: carrick_xtask::ci_scaler::RunnerKind::Vm,
         id,
         pool: POOL.into(),
         template: true,
@@ -1229,6 +1234,7 @@ fn four_agent_clones_and_one_kvm_have_separate_durable_budgets() {
             .is_ok()
     );
     let unknown = [PoolMember {
+        kind: carrick_xtask::ci_scaler::RunnerKind::Vm,
         id: 345,
         pool: POOL.into(),
         template: false,

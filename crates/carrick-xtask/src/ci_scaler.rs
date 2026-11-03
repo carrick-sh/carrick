@@ -166,10 +166,36 @@ impl CloneLane {
     }
 }
 
+/// What a clone is on PVE. `Vm` (a QEMU linked clone reached through the
+/// guest agent) is the deployed kind and the default everywhere. `Lxc` (an
+/// unprivileged container, full-cloned and reached through root `pct exec`
+/// on the node) is the ctb pilot's gated alternative for agent clones only;
+/// see `docs/ci/contabo-kvm.md#container-agent-clones-gated-pilot`.
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum RunnerKind {
+    #[default]
+    Vm,
+    Lxc,
+}
+impl RunnerKind {
+    /// The PVE API node subtree for this kind: `/nodes/<node>/<type>/<id>`.
+    pub fn api_type(self) -> &'static str {
+        match self {
+            Self::Vm => "qemu",
+            Self::Lxc => "lxc",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Record {
     #[serde(default)]
     pub lane: CloneLane,
+    /// Absent in rows written before the pilot, which were all VMs. A row
+    /// keeps its kind for life, so teardown never asks the wrong subtree.
+    #[serde(default)]
+    pub kind: RunnerKind,
     pub key: JobKey,
     pub vm: CloneId,
     pub name: String,
@@ -197,16 +223,23 @@ pub struct Vm {
     pub name: String,
     pub pool: String,
     pub template: bool,
+    pub kind: RunnerKind,
 }
 #[derive(Debug, Clone)]
 pub struct PoolMember {
     pub id: u16,
     pub pool: String,
     pub template: bool,
+    pub kind: RunnerKind,
 }
 impl Record {
     pub fn guard(&self, vm: &Vm) -> Result<(), ScalerError> {
-        if vm.id != self.vm.get() || vm.pool != POOL || vm.name != self.name || vm.template {
+        if vm.id != self.vm.get()
+            || vm.pool != POOL
+            || vm.name != self.name
+            || vm.template
+            || vm.kind != self.kind
+        {
             return Err(ScalerError::Guard("VM ownership mismatch; quarantined"));
         }
         Ok(())
@@ -248,6 +281,21 @@ impl Ledger {
         budget: CloneBudget,
         lane: CloneLane,
     ) -> Result<Record, ScalerError> {
+        self.reserve_kind(key, inventory, now, budget, (lane, RunnerKind::Vm))
+    }
+    /// [`Ledger::reserve_lane`] for a clone of `kind`; only the agent lane
+    /// may reserve a container.
+    pub fn reserve_kind(
+        &mut self,
+        key: JobKey,
+        inventory: &[PoolMember],
+        now: u64,
+        budget: CloneBudget,
+        (lane, kind): (CloneLane, RunnerKind),
+    ) -> Result<Record, ScalerError> {
+        if kind == RunnerKind::Lxc && lane != CloneLane::Agent {
+            return Err(ScalerError::Guard("only agent clones may be containers"));
+        }
         assignment::supersession_capacity(&self.superseded)?;
         if self.served(key) {
             return Err(ScalerError::Guard("job already reserved"));
@@ -281,6 +329,7 @@ impl Ledger {
             .ok_or(ScalerError::Guard("no free reserved VMID"))?;
         let row = Record {
             lane,
+            kind,
             key,
             vm: CloneId::try_from(vm)?,
             name: format!(
@@ -1090,6 +1139,10 @@ pub enum ScalerAction {
         /// Concurrent dispatch-agent clones (Contabo only), 1 to 8.
         #[arg(long, default_value = "4")]
         max_agent_clones: AgentClones,
+        /// Gated ctb pilot: `lxc` serves agent clones from container template
+        /// 9579 instead of VM template 9001. KVM clones are always VMs.
+        #[arg(long, value_enum, default_value_t = RunnerKind::Vm)]
+        agent_runner_kind: RunnerKind,
     },
     /// Director-Mac controller for cloudmac: mint one JIT config per queued
     /// carrick-hvf job and feed it to one runner over SSH stdin.
@@ -1171,6 +1224,9 @@ pub enum ScalerAction {
     QualifyClone {
         #[arg(long)]
         template: u16,
+        /// `lxc` qualifies the gated container template (9579) instead.
+        #[arg(long, value_enum, default_value_t = RunnerKind::Vm)]
+        kind: RunnerKind,
     },
     /// Fail unless the calling (non-root runner) user can open KVM API 12.
     VerifyKvm,
@@ -1262,7 +1318,10 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
             print!("{file}");
             Ok(())
         }
-        ScalerAction::QualifyClone { template } => qualify_clone::run(template),
+        ScalerAction::QualifyClone { template, kind } => match kind {
+            RunnerKind::Vm => qualify_clone::run(template),
+            RunnerKind::Lxc => qualify_clone::run_container(template),
+        },
         ScalerAction::CheckTemplateRetirement { template } => template_retirement::check(template),
         ScalerAction::VerifyKvm => verify_kvm(),
         ScalerAction::AdmitJob {
@@ -1335,12 +1394,14 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
                 kvm: Concurrency::ONE,
                 agents: AgentClones::DEFAULT,
             },
+            RunnerKind::Vm,
         ),
         ScalerAction::Standing {
             state_dir,
             runner_group_id,
             max_concurrency,
             max_agent_clones,
+            agent_runner_kind,
         } => live::controller(
             &Admission::Standing,
             &state_dir,
@@ -1350,6 +1411,7 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
                 kvm: max_concurrency,
                 agents: max_agent_clones,
             },
+            agent_runner_kind,
         ),
         ScalerAction::MacJit {
             host,

@@ -713,6 +713,7 @@ mod tests {
             job: JobId(77),
         };
         Record {
+            kind: RunnerKind::Vm,
             lane: CloneLane::Agent,
             key,
             vm: CloneId::try_from(310).unwrap(),

@@ -388,6 +388,7 @@ fn teardown_fixture(dir: &Path) -> (Ledger, Record, MockTeardown, PathBuf) {
     ledger.save(&path).unwrap();
     let api = MockTeardown {
         vm: Some(Vm {
+            kind: RunnerKind::Vm,
             id: 308,
             name: row.name.clone(),
             pool: POOL.into(),
@@ -476,24 +477,28 @@ fn teardown_requires_durable_license_and_all_ownership_guards() {
     );
     for vm in [
         Vm {
+            kind: RunnerKind::Vm,
             id: 105,
             name: row.name.clone(),
             pool: POOL.into(),
             template: false,
         },
         Vm {
+            kind: RunnerKind::Vm,
             id: 308,
             name: row.name.clone(),
             pool: "other".into(),
             template: false,
         },
         Vm {
+            kind: RunnerKind::Vm,
             id: 308,
             name: "different-owner".into(),
             pool: POOL.into(),
             template: false,
         },
         Vm {
+            kind: RunnerKind::Vm,
             id: 308,
             name: row.name.clone(),
             pool: POOL.into(),
@@ -865,10 +870,12 @@ fn startup_fixture(agents: bool, pooled: bool, rights: Value) -> Result<(), Scal
             {"type":"qemu","node":"carrick-ctb","vmid":300,"template":1}
         ]}),
         "carrick-ctb",
+        false,
     )
     .unwrap();
     if pooled {
         inventory.push(PoolMember {
+            kind: RunnerKind::Vm,
             id: 9001,
             pool: POOL.into(),
             template: true,
@@ -897,7 +904,9 @@ fn startup_fixture(agents: bool, pooled: bool, rights: Value) -> Result<(), Scal
                     "net0":"virtio,bridge=vmbr1,firewall=1"
                 }),
                 "/access/permissions?path=/vms/9001" => rights.clone(),
-                "/access/permissions?path=/vms/9000" => json!({}),
+                "/access/permissions?path=/vms/9000" | "/access/permissions?path=/vms/9579" => {
+                    json!({})
+                }
                 "/access/permissions?path=/vms/101"
                 | "/access/permissions?path=/vms/102"
                 | "/access/permissions?path=/vms/103"
@@ -905,7 +914,8 @@ fn startup_fixture(agents: bool, pooled: bool, rights: Value) -> Result<(), Scal
                 _ => panic!("unexpected startup request: {path}"),
             })
         },
-        |vm| {
+        |kind, vm| {
+            assert_eq!(kind, RunnerKind::Vm);
             firewalls.push(vm);
             Ok(())
         },
@@ -1022,6 +1032,7 @@ fn template_cutover_admits_new_source_while_old_clone_runs() {
     old.state = State::Running;
     ledger.rows[0] = old.clone();
     let inventory = vec![PoolMember {
+        kind: RunnerKind::Vm,
         id: old.vm.get(),
         pool: POOL.into(),
         template: false,
