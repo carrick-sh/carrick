@@ -484,13 +484,15 @@ pub(super) fn arm_process_call_claimed(
 ) -> bool {
     use super::native_process_runtime::NativeThreadGroupOwner;
 
-    // Only a ring-owned fork child's execve is the native owner's. A root or
-    // host-loaded task execs through the host with its own live cwd,
-    // credentials, executable and descriptor table; execveat stays unclaimed.
+    // Only a ring-owned fork child's execve and execveat are the native
+    // owner's. A root or host-loaded task execs through the host with its own
+    // live cwd, credentials, executable and descriptor table. A fork child
+    // has no host task: its execveat is served by the native exec service,
+    // which resolves a named descriptor in the child's ring table (#1530).
     nr == 435
         || (nr == 220 && flags & 0x0001_0000 == 0)
         || match nr {
-            221 => owner() == NativeThreadGroupOwner::ForkChild,
+            221 | 281 => owner() == NativeThreadGroupOwner::ForkChild,
             260 | 93 | 94 | 95 | 58 | 139 => owner() != NativeThreadGroupOwner::Unowned,
             _ => false,
         }
@@ -693,7 +695,81 @@ pub fn capture_native_service_exit(
     {
         return owned;
     }
+    if action == Action::Forward
+        && (frame.esr >> 26) & 0x3f == 0x15
+        && let Some(owner) = native_syscall_owner(frame)
+        && unclaimed_native_syscall(owner) == UnclaimedNativeSyscall::CountedEnosys
+    {
+        return refuse_unclaimed_native_syscall(frame, counters);
+    }
     action
+}
+
+/// The owner kind of the ring-owned (native) process whose syscall left this
+/// frame, or `None` when no native owner holds this entry.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+fn native_syscall_owner(
+    frame: &TrapFrame,
+) -> Option<super::native_process_runtime::NativeThreadGroupOwner> {
+    let task = carrick_el1_abi::current_task_guest(frame.slot as usize)?;
+    let slot = SlotId::from_index(frame.slot as usize)?;
+    let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
+    let (page, control) = task.lifecycle_refs()?;
+    super::native_process_runtime::native_entry_owned(
+        carrick_el1_abi::BornInZoneSource { zone, slot },
+        task,
+        page,
+        control,
+        carrick_sched_core::object_wait::OwnerEntry::Syscall,
+    )
+    .then(|| arm_thread_group_owner(zone, task, page))
+}
+
+/// Where a native-owned syscall goes when its owner claimed none of it.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnclaimedNativeSyscall {
+    /// The task has a host task (a host-loaded root), or no ring owner
+    /// admitted it: the host serves it, as before.
+    HostRoute,
+    /// A ring-owned fork child (or its exec successor) has no host task, so a
+    /// raw host exit has no one to serve it: the executor would fail and the
+    /// carrier with it (#1530). Ring-first: counted ENOSYS, in ring.
+    CountedEnosys,
+}
+
+/// The one place that decides an unclaimed native syscall's route, so a
+/// future unclaimed ordinal is covered too.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+fn unclaimed_native_syscall(
+    owner: super::native_process_runtime::NativeThreadGroupOwner,
+) -> UnclaimedNativeSyscall {
+    use super::native_process_runtime::NativeThreadGroupOwner;
+    match owner {
+        NativeThreadGroupOwner::ForkChild => UnclaimedNativeSyscall::CountedEnosys,
+        NativeThreadGroupOwner::Root | NativeThreadGroupOwner::Unowned => {
+            UnclaimedNativeSyscall::HostRoute
+        }
+    }
+}
+
+/// Answer an unclaimed native syscall with a counted ENOSYS in ring.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+fn refuse_unclaimed_native_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
+    let nr = frame.x[8] as usize;
+    if nr < 512 {
+        counters.refused[nr].fetch_add(1, Ordering::Relaxed);
+        counters.served[nr].fetch_add(1, Ordering::Relaxed);
+    }
+    frame.x[0] = carrick_syscall_abi::LINUX_ENOSYS.guest_retval() as u64;
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    {
+        arm_signal_user_return(frame)
+    }
+    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+    {
+        Action::Served
+    }
 }
 
 /// The entry's last step (#1100): seal its decision into the vector's
@@ -1053,9 +1129,9 @@ fn arm_native_service_exit(
     ) {
         return None;
     }
-    // Only a fork child's execve is staged for the native exec service; a
-    // root's exec keeps the host route and its live cwd, credentials,
-    // executable and descriptor table (execveat is never claimed).
+    // Only a fork child's execve and execveat are staged for the native exec
+    // service; a root's exec keeps the host route and its live cwd,
+    // credentials, executable and descriptor table.
     if (frame.esr >> 26) & 0x3f == 0x15
         && matches!(frame.x[8], 221 | 281)
         && !arm_process_call_claimed(frame.x[8], 0, || arm_thread_group_owner(zone, task, page))
@@ -1236,7 +1312,11 @@ fn arm_native_service_exit(
                 if service_wait.is_some() {
                     Err(super::native_process_runtime::NativeProcessError::Quarantined)
                 } else {
-                    process.begin_exec_service(payload)
+                    // The exec service resolves a descriptor `execveat`
+                    // names in the caller's own ring table (#1530).
+                    let table = ipc::guest_venue(frame.slot as u32)
+                        .and_then(|venue| ipc::native_table(&venue, task));
+                    process.begin_exec_service(payload, table)
                 }
             } else if let Some(staged) = host_file {
                 if service_wait.is_some() {
@@ -4431,9 +4511,14 @@ mod tests {
                 "{owner:?} execve"
             );
         }
+        // execveat follows execve (#1530): a fork child has no host task,
+        // so its execveat is the native owner's, never a host exit.
+        assert!(
+            arm_process_call_claimed(281, 0, || NativeThreadGroupOwner::ForkChild),
+            "native child execveat"
+        );
         for owner in [
             NativeThreadGroupOwner::Root,
-            NativeThreadGroupOwner::ForkChild,
             NativeThreadGroupOwner::Unowned,
         ] {
             assert!(
@@ -4444,6 +4529,94 @@ mod tests {
         assert!(!arm_process_call_claimed(62, 0, || panic!(
             "ordinary lseek queried registry"
         )));
+    }
+
+    /// `fexecve` from a native fork child (#1530): libc issues
+    /// `execveat(fd, "", argv, envp, AT_EMPTY_PATH)`. Before, the owner left
+    /// it unclaimed, so it left the guest as a raw host syscall exit with no
+    /// host task to serve it, and the carrier died. Now it is claimed, it
+    /// stages as the descriptor form of the exec request, and any syscall a
+    /// fork child's owner leaves unclaimed is a counted ENOSYS in ring.
+    #[test]
+    fn native_fork_child_fexecve_is_claimed_staged_and_never_a_host_exit() {
+        use super::super::native_process_runtime::NativeThreadGroupOwner;
+
+        // Claimed for the fork child, as the production gate asks it.
+        assert!(arm_process_call_claimed(281, 0, || {
+            NativeThreadGroupOwner::ForkChild
+        }));
+
+        // Staged with the descriptor and flags, and an empty path.
+        struct Resident;
+        impl file::MemoryValidator for Resident {
+            fn writable_bytes(&self, _user_va: u64, len: usize) -> usize {
+                len
+            }
+            fn readable_bytes(&self, _user_va: u64, len: usize) -> usize {
+                len
+            }
+        }
+        let task = CurrentTask::new();
+        let empty = b"\0";
+        let arg = b"sh\0";
+        let argv = [arg.as_ptr().addr() as u64, 0];
+        let envp = [0_u64];
+        let mut frame = TrapFrame {
+            esr: 0x15 << 26,
+            ..TrapFrame::default()
+        };
+        frame.x[8] = 281;
+        frame.x[0] = 3;
+        frame.x[1] = empty.as_ptr().addr() as u64;
+        frame.x[2] = argv.as_ptr().addr() as u64;
+        frame.x[3] = envp.as_ptr().addr() as u64;
+        frame.x[4] = carrick_abi::LINUX_AT_EMPTY_PATH;
+        let request = crate::exec_stage::ExecStageRequest {
+            call: carrick_core_abi::service::ExecCall::Execveat {
+                dirfd: frame.x[0] as i32,
+                flags: frame.x[4] as u32,
+            },
+            path: frame.x[1],
+            argv: frame.x[2],
+            envp: frame.x[3],
+        };
+        let Some(NativeExecStage::Payload(payload)) =
+            native_exec_stage_request(&task, &Resident, request)
+        else {
+            panic!("fexecve did not stage an exec request");
+        };
+        let view = carrick_core_abi::service::ExecPayloadView::parse(&payload).unwrap();
+        assert_eq!(
+            view.call(),
+            carrick_core_abi::service::ExecCall::Execveat {
+                dirfd: 3,
+                flags: carrick_abi::LINUX_AT_EMPTY_PATH as u32
+            }
+        );
+        assert!(view.path().is_empty());
+
+        // The one route decision for an unclaimed native syscall: a fork
+        // child (no host task) is answered in ring; a root keeps the host.
+        assert_eq!(
+            unclaimed_native_syscall(NativeThreadGroupOwner::ForkChild),
+            UnclaimedNativeSyscall::CountedEnosys
+        );
+        for owner in [
+            NativeThreadGroupOwner::Root,
+            NativeThreadGroupOwner::Unowned,
+        ] {
+            assert_eq!(
+                unclaimed_native_syscall(owner),
+                UnclaimedNativeSyscall::HostRoute
+            );
+        }
+        let counters = Counters::new();
+        assert_eq!(
+            refuse_unclaimed_native_syscall(&mut frame, &counters),
+            Action::Served
+        );
+        assert_eq!(frame.x[0] as i64, -38);
+        assert_eq!(counters.refused[281].load(Ordering::Relaxed), 1);
     }
 
     #[test]

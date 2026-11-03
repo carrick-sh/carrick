@@ -41,6 +41,8 @@ vm_free = [
   "carrick-personality-linux::native_host_file::tests::chdir_stages_one_lookup_and_reads_the_directory_from_its_reply",
   "carrick-personality-linux::task_fs::tests::visible_cwd_reports_the_global_cwd_except_above_the_root",
   "carrick-kernel::dispatch::native_files::tests::native_statx_of_a_descriptor_is_its_fstat (#1503: the descriptor form of statx(fd, \"\", AT_EMPTY_PATH) is served from the pinned ring descriptor through the same code as fstat, equal size and inode; a closed fd is EBADF; never resolved against AT_FDCWD)",
+  "carrick-kernel::dispatch::native_files::tests::native_fexecve_source_is_the_open_file_not_its_path (#1530: fexecve selects the pinned ring descriptor's own object; replacing the path after the open still yields the opened bytes)",
+  "carrick-runtime::runtime::exec::tests::native_child_fexecve_executes_the_open_file_not_its_path (#1530: the native exec service runs the opened image from the sealed ring table, never a re-resolution of its path; EBADF, missing table and fexecve'd scripts are exact)",
 ]
 
 [bindings.unresolved]

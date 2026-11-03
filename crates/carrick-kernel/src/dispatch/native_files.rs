@@ -43,6 +43,43 @@ pub struct NativeHostFileServed {
     pub retained_source: Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>,
 }
 
+fn native_descriptor_exec_source_in(
+    owner: &Arc<HostIpc>,
+    table: [u64; 3],
+    fd: i32,
+) -> Result<super::executable_authority::ExecSource, carrick_abi::LinuxErrno> {
+    if fd < 0 {
+        return Err(carrick_abi::LINUX_EBADF);
+    }
+    let table = fd::TableId::from_raw(fd::RawTableId {
+        authority: table[0],
+        index: table[1],
+        generation: table[2],
+    });
+    let source = owner.with_pinned_host_resource(table, fd::Fd(fd), |resource| {
+        let file = resource.downcast_ref::<NativeOpenFile>()?;
+        Some(match file.description.retained_exec_source() {
+            Some(source) => Ok(source),
+            None => super::executable_authority::ExecSource::from_open_description(Arc::clone(
+                &file.description,
+            ))
+            .map_err(|error| match error.raw_os_error() {
+                Some(libc::EBADF) => carrick_abi::LINUX_EBADF,
+                Some(libc::EACCES) => carrick_abi::LINUX_EACCES,
+                _ => carrick_abi::LINUX_EIO,
+            }),
+        })
+    });
+    match source {
+        Ok(Some(source)) => source,
+        Ok(None) => Err(carrick_abi::LINUX_ENOSYS),
+        Err(PinnedHostResourceError::BadFd) => Err(carrick_abi::LINUX_EBADF),
+        Err(PinnedHostResourceError::InZone | PinnedHostResourceError::Unavailable) => {
+            Err(carrick_abi::LINUX_ENOSYS)
+        }
+    }
+}
+
 /// A host description the venue opened for a native process: the host
 /// resource behind its `IpcBacking::Host` token, dropped when the ring
 /// releases the last descriptor naming it.
@@ -190,6 +227,36 @@ fn native_chdir_lookup(fs: &super::FsView<'_>, path: &str) -> Served {
 }
 
 impl SyscallDispatcher {
+    /// The executable object behind a native process's descriptor `fd`, for
+    /// `execveat(fd, "", AT_EMPTY_PATH)` (`fexecve`, #1530). The descriptor
+    /// lives in the caller's ring table (`table`, the raw table id words its
+    /// ring owner sealed into the exec request) and is pinned there now, as
+    /// Linux resolves it for the in-progress call.
+    ///
+    /// Linux executes the open file, never its name, so this retains the
+    /// description's own object exactly as the host lane's `/proc/self/fd/N`
+    /// exec does (`HostExecFdSources`): its retained exec source, or the
+    /// opened file itself (a duplicated host descriptor, or a memory file's
+    /// shared bytes). A rename or replacement of the path after the open
+    /// cannot change what runs.
+    ///
+    /// Served exactly or left unrouted: a closed descriptor is EBADF; an
+    /// opened object that is not a regular file is EACCES, as Linux; an
+    /// in-zone object or implicit stdio is ENOSYS.
+    pub fn native_descriptor_exec_source(
+        &self,
+        table: [u64; 3],
+        fd: i32,
+    ) -> Result<super::executable_authority::ExecSource, carrick_abi::LinuxErrno> {
+        let owner = self
+            .kernel_binding
+            .read()
+            .kernel()
+            .existing_ipc()
+            .ok_or(carrick_abi::LINUX_ENOSYS)?;
+        native_descriptor_exec_source_in(&owner, table, fd)
+    }
+
     /// Serve one ring-staged host-file record in place for a native process
     /// of this run. A descriptor is resolved and pinned in the caller's own
     /// ring table now, as Linux resolves it for an in-progress call. A path
@@ -1432,6 +1499,46 @@ mod tests {
         // A closed descriptor is EBADF, as Linux, never a path lookup.
         let (result, _) = statx(carrick_abi::LINUX_AT_EMPTY_PATH as u32, 9);
         assert_eq!(result, carrick_abi::LINUX_EBADF.guest_retval());
+    }
+
+    /// `fexecve` from a native process (#1530) executes the open file, never
+    /// its name: the exec source is the pinned description's own object. A
+    /// replacement of the path after the open must not change what runs (a
+    /// re-resolution would load the replacement's bytes).
+    #[test]
+    fn native_fexecve_source_is_the_open_file_not_its_path() {
+        let fixture = rootfs_fixture();
+        let authority = authority_of(&fixture.dispatcher);
+        let open = record(
+            fixture.table,
+            HostFileOp::Openat,
+            FDCWD,
+            [carrick_abi::LINUX_O_CLOEXEC, 0, 0, 0],
+            b"/lib/libc.so.6",
+            0,
+        );
+        let (fd, _) = fixture.result(Some(&authority), open);
+        assert!(fd >= 0, "open: {fd}");
+        // Replace the file at that path after the open: a new inode with
+        // different bytes takes the name.
+        let lower = fixture._rootfs.as_ref().unwrap().path();
+        let target = lower.join("usr/lib/libc.so.6");
+        let replacement = lower.join("usr/lib/libc.so.6.new");
+        std::fs::write(&replacement, b"\x7fELF-REPLACED").unwrap();
+        std::fs::rename(&replacement, &target).unwrap();
+
+        let source =
+            |fd| super::native_descriptor_exec_source_in(&fixture.owner, fixture.table, fd);
+        let bytes = source(fd as i32)
+            .expect("the open file's exec source")
+            .read_all()
+            .unwrap();
+        assert_eq!(
+            bytes, b"\x7fELF-libc-bytes",
+            "fexecve must run the opened file, never the replacement at its path"
+        );
+        assert_eq!(source(9).map(|_| ()), Err(carrick_abi::LINUX_EBADF));
+        assert_eq!(source(-1).map(|_| ()), Err(carrick_abi::LINUX_EBADF));
     }
 
     /// The ring answers `fstat`/`statx` of its in-zone pipes itself; those
