@@ -131,16 +131,114 @@ impl PendingService<'_> {
             .ok_or(NativeProcessError::Stale)?;
         let view = carrick_core_abi::service::ExecPayloadView::parse(payload)
             .map_err(|_| NativeProcessError::Stale)?;
-        let path = view.path();
-        let basename = path
-            .rsplit(|byte| *byte == b'/')
-            .next()
-            .filter(|name| !name.is_empty())
-            .ok_or(NativeProcessError::Stale)?;
-        let mut comm = [0; 16];
-        let length = basename.len().min(comm.len() - 1);
-        comm[..length].copy_from_slice(&basename[..length]);
-        Ok(comm)
+        exec_comm_of(view).ok_or(NativeProcessError::Stale)
+    }
+}
+
+/// The successor's `comm`: the basename of the name Linux gives the
+/// program. An `execveat(fd, "", AT_EMPTY_PATH)` (`fexecve`) names it
+/// `/dev/fd/<fd>`, so its comm is the descriptor number; it used to be an
+/// empty basename here, which refused the already-committed exec and killed
+/// the successor (#1530).
+fn exec_comm_of(view: carrick_core_abi::service::ExecPayloadView<'_>) -> Option<[u8; 16]> {
+    use carrick_core_abi::service::ExecCall;
+    let mut descriptor = [0u8; 11];
+    let path = match view.call() {
+        ExecCall::Execveat { dirfd, flags }
+            if view.path().is_empty() && flags & carrick_abi::LINUX_AT_EMPTY_PATH as u32 != 0 =>
+        {
+            let mut cursor = descriptor.len();
+            let mut value = u32::try_from(dirfd).ok()?;
+            loop {
+                cursor -= 1;
+                descriptor[cursor] = b'0' + (value % 10) as u8;
+                value /= 10;
+                if value == 0 {
+                    break;
+                }
+            }
+            &descriptor[cursor..]
+        }
+        _ => view.path(),
+    };
+    let basename = path
+        .rsplit(|byte| *byte == b'/')
+        .next()
+        .filter(|name| !name.is_empty())?;
+    let mut comm = [0; 16];
+    let length = basename.len().min(comm.len() - 1);
+    comm[..length].copy_from_slice(&basename[..length]);
+    Some(comm)
+}
+
+#[cfg(test)]
+mod exec_comm_tests {
+    use super::exec_comm_of;
+    use carrick_core_abi::service::{EXEC_PAYLOAD_HEADER_BYTES, ExecCall, ExecPayloadView};
+
+    fn payload(call: ExecCall, path: &str) -> std::vec::Vec<u8> {
+        let mut bytes = std::vec![0; EXEC_PAYLOAD_HEADER_BYTES];
+        bytes.extend_from_slice(path.as_bytes());
+        bytes.push(0);
+        carrick_core_abi::service::encode_exec_payload_header(
+            &mut bytes,
+            call,
+            path.len() + 1,
+            0,
+            0,
+        )
+        .unwrap();
+        bytes
+    }
+
+    fn comm(call: ExecCall, path: &str) -> Option<std::string::String> {
+        let bytes = payload(call, path);
+        let comm = exec_comm_of(ExecPayloadView::parse(&bytes).unwrap())?;
+        let end = comm
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(comm.len());
+        Some(std::string::String::from_utf8(comm[..end].to_vec()).unwrap())
+    }
+
+    /// Linux names an `fexecve`'d program `/dev/fd/<fd>`: its comm is the
+    /// descriptor number, never an empty name that refuses the exec.
+    #[test]
+    fn fexecve_comm_is_the_descriptor_number() {
+        let at_empty = carrick_abi::LINUX_AT_EMPTY_PATH as u32;
+        assert_eq!(
+            comm(
+                ExecCall::Execveat {
+                    dirfd: 3,
+                    flags: at_empty
+                },
+                ""
+            ),
+            Some("3".into())
+        );
+        assert_eq!(
+            comm(
+                ExecCall::Execveat {
+                    dirfd: 1234,
+                    flags: at_empty
+                },
+                ""
+            ),
+            Some("1234".into())
+        );
+        assert_eq!(comm(ExecCall::Execve, "/usr/bin/dash"), Some("dash".into()));
+        assert_eq!(
+            comm(
+                ExecCall::Execveat {
+                    dirfd: -100,
+                    flags: 0
+                },
+                "/bin/averyveryverylongname"
+            ),
+            Some("averyveryverylo".into())
+        );
+        // A path that names no file (a trailing slash) still has no comm.
+        assert_eq!(comm(ExecCall::Execve, "/bin/"), None);
     }
 }
 
@@ -583,17 +681,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     pub fn begin_exec_service(
         &mut self,
         payload: Box<[u8]>,
+        table: Option<[u64; 3]>,
     ) -> Result<NativeResume, NativeProcessError> {
         // The carrier's exec service resolves and checks access with exactly
         // the caller's own cwd and credentials, which the ring seals into
-        // the payload from the caller's task row (#1392).
+        // the payload from the caller's task row (#1392), and resolves a
+        // descriptor `execveat` names in the caller's ring table (#1530).
         let access = match self.caller_access() {
             Ok(access) => access,
             Err(errno) => return Ok(NativeResume::Returned(SyscallResult::from_errno(errno))),
         };
         let mut sealed = payload.into_vec();
         if let Err(error) =
-            carrick_core_abi::service::seal_exec_payload_access(&mut sealed, &access)
+            carrick_core_abi::service::seal_exec_payload_access(&mut sealed, &access, table)
         {
             return Ok(NativeResume::Returned(SyscallResult::from_errno(
                 match error {

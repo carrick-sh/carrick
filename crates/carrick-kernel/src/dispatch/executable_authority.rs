@@ -250,6 +250,12 @@ pub struct CurrentExecutable {
 }
 
 impl ExecSource {
+    /// The guest path this object was selected at: what `/proc/self/exe`
+    /// names for an image loaded from it.
+    pub fn resolved_path(&self) -> &str {
+        &self.resolved_path
+    }
+
     pub fn host(file: std::fs::File, resolved_path: String) -> io::Result<Self> {
         let metadata = file.metadata()?;
         if !metadata.is_file() {

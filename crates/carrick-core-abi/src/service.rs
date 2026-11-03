@@ -176,12 +176,19 @@ pub const MAX_EXEC_PAYLOAD_BYTES: u64 = (EXEC_ARGUMENT_BYTES_MAX
     + MAX_EXEC_PATH_BYTES
     + EXEC_PAYLOAD_HEADER_BYTES
     + MAX_EXEC_ACCESS_BYTES) as u64;
-/// The caller's [`crate::host_file::AccessContext`] trails the strings.
-pub const MAX_EXEC_ACCESS_BYTES: usize =
-    12 * 4 + crate::host_file::ACCESS_MAX_GROUPS * 4 + 2 * crate::host_file::ACCESS_MAX_PATH_BYTES;
+/// The caller's [`crate::host_file::AccessContext`] trails the strings,
+/// followed by its ring descriptor table ([`EXEC_TABLE_BYTES`]).
+pub const MAX_EXEC_ACCESS_BYTES: usize = 12 * 4
+    + crate::host_file::ACCESS_MAX_GROUPS * 4
+    + 2 * crate::host_file::ACCESS_MAX_PATH_BYTES
+    + EXEC_TABLE_BYTES;
+/// The caller's ring descriptor table, as the `fd-core` raw table id words
+/// ([`crate::host_file::HostFileHeader::table`]); all zero when the ring
+/// sealed no table. An `execveat` that names a descriptor resolves it here.
+pub const EXEC_TABLE_BYTES: usize = 3 * 8;
 
 const EXEC_PAYLOAD_MAGIC: u32 = u32::from_le_bytes(*b"CEXE");
-const EXEC_PAYLOAD_VERSION: u16 = 2;
+const EXEC_PAYLOAD_VERSION: u16 = 3;
 
 /// Which Linux exec entry produced the staged request. All raw user pointers
 /// have already been consumed by the ring before this value crosses the ABI.
@@ -256,6 +263,7 @@ pub struct ExecPayloadView<'a> {
     argc: usize,
     envc: usize,
     access: Option<crate::host_file::AccessContext<'a>>,
+    table: Option<[u64; 3]>,
 }
 
 impl<'a> ExecPayloadView<'a> {
@@ -321,11 +329,21 @@ impl<'a> ExecPayloadView<'a> {
                 return Err(ExecPayloadError::TooLarge);
             }
         }
-        // The caller's access context, once the ring owner has sealed it.
-        let access = match bytes.get(cursor..) {
-            Some([]) => None,
+        // The caller's access context and descriptor table, once the ring
+        // owner has sealed them.
+        let (access, table) = match bytes.get(cursor..) {
+            Some([]) => (None, None),
             Some(trailer) => match crate::host_file::AccessContext::decode(trailer) {
-                Some((access, [])) => Some(access),
+                Some((access, table)) if table.len() == EXEC_TABLE_BYTES => {
+                    let word = |index: usize| {
+                        table[index * 8..index * 8 + 8]
+                            .try_into()
+                            .map(u64::from_le_bytes)
+                            .unwrap_or(0)
+                    };
+                    let words = [word(0), word(1), word(2)];
+                    (Some(access), (words != [0; 3]).then_some(words))
+                }
                 _ => return Err(ExecPayloadError::Invalid),
             },
             None => return Err(ExecPayloadError::Invalid),
@@ -337,6 +355,7 @@ impl<'a> ExecPayloadView<'a> {
             argc,
             envc,
             access,
+            table,
         })
     }
 
@@ -375,14 +394,21 @@ impl<'a> ExecPayloadView<'a> {
     pub const fn access(self) -> Option<crate::host_file::AccessContext<'a>> {
         self.access
     }
+
+    /// The caller's ring descriptor table, when its ring owner sealed one.
+    pub const fn table(self) -> Option<[u64; 3]> {
+        self.table
+    }
 }
 
 /// Seal a staged payload with its caller's encoded
-/// [`crate::host_file::AccessContext`]: the ring task row's values, which
-/// only the ring owner holds, appended once after the strings.
+/// [`crate::host_file::AccessContext`] and ring descriptor table: the ring
+/// task row's values, which only the ring owner holds, appended once after
+/// the strings. `table` is `None` when the caller has no ring table.
 pub fn seal_exec_payload_access(
     bytes: &mut alloc::vec::Vec<u8>,
     access: &[u8],
+    table: Option<[u64; 3]>,
 ) -> Result<(), ExecPayloadError> {
     let view = ExecPayloadView::parse(bytes)?;
     if view.access.is_some()
@@ -395,13 +421,16 @@ pub fn seal_exec_payload_access(
     }
     let len = bytes
         .len()
-        .checked_add(access.len())
+        .checked_add(access.len() + EXEC_TABLE_BYTES)
         .filter(|len| *len as u64 <= MAX_EXEC_PAYLOAD_BYTES)
         .ok_or(ExecPayloadError::TooLarge)?;
     bytes
-        .try_reserve_exact(access.len())
+        .try_reserve_exact(access.len() + EXEC_TABLE_BYTES)
         .map_err(|_| ExecPayloadError::TooLarge)?;
     bytes.extend_from_slice(access);
+    for word in table.unwrap_or([0; 3]) {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
     bytes[28..32].copy_from_slice(&(len as u32).to_le_bytes());
     Ok(())
 }

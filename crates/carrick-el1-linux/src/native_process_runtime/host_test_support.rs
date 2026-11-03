@@ -1321,7 +1321,7 @@ impl NativeServiceCapacityFixture {
                 )
                 .unwrap();
             assert!(matches!(
-                root.begin_exec_service(test_exec_payload(b"/bin/static")),
+                root.begin_exec_service(test_exec_payload(b"/bin/static"), None),
                 Ok(NativeResume::Left(None))
             ));
             assert!(root.take_handoff_receipt().is_some());
@@ -1763,7 +1763,7 @@ fn refused_exec_preparation_is_cancelled_exactly_once() {
             )
             .unwrap();
         assert!(matches!(
-            entry.begin_exec_service(test_exec_payload(b"/bin/static")),
+            entry.begin_exec_service(test_exec_payload(b"/bin/static"), None),
             Ok(NativeResume::Left(None))
         ));
         assert!(entry.take_handoff_receipt().is_some());
@@ -2228,7 +2228,7 @@ fn native_exec_successor_retracts_exec_cancellation_before_owner_wait() {
                 &mut service,
             )
             .unwrap();
-        let result = entry.begin_exec_service(test_exec_payload(b"/bin/static"));
+        let result = entry.begin_exec_service(test_exec_payload(b"/bin/static"), None);
         match result {
             Ok(NativeResume::Left(None)) => {}
             Ok(_) => panic!("exec intake returned the wrong continuation"),
@@ -2369,7 +2369,7 @@ fn sole_member_exec_closes_admission_before_adopting_successor() {
             )
             .unwrap();
         assert!(matches!(
-            entry.begin_exec_service(test_exec_payload(b"/bin/static")),
+            entry.begin_exec_service(test_exec_payload(b"/bin/static"), None),
             Ok(NativeResume::Left(None))
         ));
         assert!(entry.take_handoff_receipt().is_some());
@@ -2425,7 +2425,7 @@ fn exec_closes_over_predecessor_gate(gate: carrick_el1_abi::GateState) {
             )
             .unwrap();
         assert!(matches!(
-            entry.begin_exec_service(test_exec_payload(b"/bin/static")),
+            entry.begin_exec_service(test_exec_payload(b"/bin/static"), None),
             Ok(NativeResume::Left(None))
         ));
         assert!(entry.take_handoff_receipt().is_some());
@@ -2499,7 +2499,7 @@ fn exec_after_sibling_drain(parked_read: bool) {
             )
             .unwrap();
         assert!(matches!(
-            entry.begin_exec_service(test_exec_payload(b"/bin/static")),
+            entry.begin_exec_service(test_exec_payload(b"/bin/static"), None),
             Ok(NativeResume::Left(None))
         ));
         assert!(entry.take_handoff_receipt().is_some());
@@ -2725,7 +2725,7 @@ fn concurrent_native_exec_loser_is_killed_without_a_run_failure() {
             )
             .unwrap();
         assert!(matches!(
-            root.begin_exec_service(test_exec_payload(b"/bin/winner")),
+            root.begin_exec_service(test_exec_payload(b"/bin/winner"), None),
             Ok(NativeResume::Left(None))
         ));
         assert!(root.take_handoff_receipt().is_some());
@@ -2748,7 +2748,7 @@ fn concurrent_native_exec_loser_is_killed_without_a_run_failure() {
             )
             .unwrap();
         assert!(matches!(
-            loser.begin_exec_service(test_exec_payload(b"/bin/loser")),
+            loser.begin_exec_service(test_exec_payload(b"/bin/loser"), None),
             Ok(NativeResume::Left(None))
         ));
         assert!(loser.take_handoff_receipt().is_some());
@@ -2880,7 +2880,7 @@ fn exec_drain_is_upgraded_by_terminal_sibling(signal: Option<u8>) {
             )
             .unwrap();
         assert!(matches!(
-            root.begin_exec_service(test_exec_payload(b"/bin/replaced")),
+            root.begin_exec_service(test_exec_payload(b"/bin/replaced"), None),
             Ok(NativeResume::Left(None))
         ));
         assert!(root.take_handoff_receipt().is_some());
@@ -3127,7 +3127,7 @@ fn native_child_exec_after_ring_setuid_carries_the_new_credentials() {
     );
     assert!(
         !matches!(
-            child.begin_exec_service(test_exec_payload(b"/bin/static")),
+            child.begin_exec_service(test_exec_payload(b"/bin/static"), None),
             Ok(NativeResume::Returned(result))
                 if result.raw() == carrick_syscall_abi::LINUX_ENOSYS.guest_retval()
         ),
@@ -3169,7 +3169,7 @@ fn native_parent_reaps_then_execs_a_child_after_slot_reuse() {
             Ok(NativeResume::NoPending)
         ));
         assert!(matches!(
-            child.begin_exec_service(test_exec_payload(b"/bin/static")),
+            child.begin_exec_service(test_exec_payload(b"/bin/static"), None),
             Ok(NativeResume::Left(None))
         ));
         assert!(child.take_handoff_receipt().is_some());
@@ -3275,7 +3275,7 @@ fn native_parent_reaps_then_execs_a_child_after_slot_reuse() {
         Ok(NativeResume::NoPending)
     ));
     assert!(matches!(
-        reused.begin_exec_service(test_exec_payload(b"/bin/reused")),
+        reused.begin_exec_service(test_exec_payload(b"/bin/reused"), None),
         Ok(NativeResume::Left(None))
     ));
     assert!(reused.take_handoff_receipt().is_some());
