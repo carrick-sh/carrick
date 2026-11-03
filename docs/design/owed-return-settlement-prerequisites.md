@@ -307,3 +307,35 @@ operations remain constant-time and the overlay remains proportional to touched
 rows; runtime overhead has not been measured. The independent review found and
 prompted removal of an earlier unbound public counter token; it did not approve
 the unimplemented physical-retirement work. Keep the PR draft.
+
+## Terminal-custody census correction
+
+Comparing the incoming slice with admitted main `53ecfb0c0` identifies nine
+additional scanner sites, all in `frame_inventory.rs`. They are calls to
+`MappingSlot::live`, the new projection from `Live(MappingEntry)` or
+`Claimed(ClaimMark)` to an optional row. The cited dispatcher
+`exit_one_task_thread` site is unchanged from main. These additions do not
+decide task exit or MM terminal eligibility, so moving them into
+`TerminalCustody` would put inventory claim ownership in the wrong owner.
+
+The projection is removed. Each inventory operation now matches the sealed
+slot exhaustively: a claimed row is unavailable for copying or authentication,
+while its reference and diagnostic snapshot remain owned by the claim.
+Whole-MM retirement still returns `RetryPending`; event mutation still returns
+`ClaimedMapping`. No scanner rule, exemption, ceiling, or task-exit path changes.
+The kernel terminal-custody population returns from 38 to main's 29 sites.
+
+Addendum 2 remains incomplete. The implementation status is:
+
+| Requirement | Status |
+|---|---|
+| Owned `FrameRef` outside copied entries, prepare/abort reference accounting | Implemented in the preceding continuation; overlay and claim witnesses exist. |
+| `FrameRef::split` in every production split | Remaining; the primitive and its unit tests exist, but COW/munmap still use mapping events. |
+| `Shared` / `Zero` / requested `Last`, full claimed-unmap bookkeeping | Implemented at the inventory layer; `Last` still yields a frame ID, not a physical permit. |
+| Linear permit consumed into `BackendCustodyReleased` | Remaining, including transport of exact physical IPA and host-owner generation at publication. |
+| `NativeFrameBacking::Drop` gate | Remaining; last-Arc drop still requests physical retirement directly. |
+| Cross-MM legacy reference checks | Remaining in `commit_cow_inventory_split` and `retire_stage2_candidate_if_unreferenced`. |
+
+This census correction is not evidence for those missing production changes,
+the two-half release receipt, or slice 2b settlement. The full gate turn and
+independent review must retain those as open implementation requirements.

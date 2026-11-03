@@ -364,12 +364,6 @@ enum MappingSlot {
     Claimed(claimed_return::ClaimMark),
 }
 impl MappingSlot {
-    fn live(&self) -> Option<&MappingEntry> {
-        match self {
-            Self::Live(entry) => Some(entry),
-            Self::Claimed(_) => None,
-        }
-    }
     fn owner(&self) -> FrameOwner {
         match self {
             Self::Live(entry) => entry.mm,
@@ -472,13 +466,19 @@ impl<'a> InventoryOverlay<'a> {
                 .base
                 .mappings
                 .get(&mapping)
-                .and_then(|slot| slot.live()),
+                .and_then(|slot| match slot {
+                    MappingSlot::Live(entry) => Some(entry),
+                    MappingSlot::Claimed(_) => None,
+                }),
         }
     }
 
     fn mapping_mut(&mut self, mapping: MappingId) -> Option<&mut MappingEntry> {
         if !self.mappings.contains_key(&mapping) {
-            let entry = *self.base.mappings.get(&mapping)?.live()?;
+            let entry = match self.base.mappings.get(&mapping)? {
+                MappingSlot::Live(entry) => *entry,
+                MappingSlot::Claimed(_) => return None,
+            };
             self.mappings.insert(mapping, Some(entry));
         }
         self.mappings.get_mut(&mapping)?.as_mut()
@@ -670,7 +670,10 @@ impl FrameInventoryAuthority {
             let entry = state
                 .mappings
                 .get(&mapping)
-                .and_then(|slot| slot.live())
+                .and_then(|slot| match slot {
+                    MappingSlot::Live(entry) => Some(entry),
+                    MappingSlot::Claimed(_) => None,
+                })
                 .ok_or(FrameInventoryError::RollbackReceiptMismatch(mapping))?;
             if !entry.state.is_published() || entry.mm != mm || entry.frame != frame {
                 return Err(FrameInventoryError::RollbackReceiptMismatch(mapping));
@@ -780,7 +783,10 @@ impl FrameInventoryAuthority {
             state
                 .mappings
                 .iter()
-                .filter_map(|(id, slot)| slot.live().map(|entry| (id, entry)))
+                .filter_map(|(id, slot)| match slot {
+                    MappingSlot::Live(entry) => Some((id, entry)),
+                    MappingSlot::Claimed(_) => None,
+                })
                 .filter(|(_, entry)| entry.mm == mm)
                 .map(|(mapping, entry)| (*mapping, entry.frame, entry.generation))
                 .collect()
@@ -998,7 +1004,10 @@ impl FrameInventoryAuthority {
         let entry = state
             .mappings
             .get(&mapping)
-            .and_then(|slot| slot.live())
+            .and_then(|slot| match slot {
+                MappingSlot::Live(entry) => Some(entry),
+                MappingSlot::Claimed(_) => None,
+            })
             .filter(|entry| entry.mm == mm && entry.state.is_published())?;
         Some(MappingRow {
             mapping,
@@ -1055,7 +1064,10 @@ impl FrameInventoryAuthority {
         state
             .mappings
             .get(&mapping)
-            .and_then(|slot| slot.live())
+            .and_then(|slot| match slot {
+                MappingSlot::Live(entry) => Some(entry),
+                MappingSlot::Claimed(_) => None,
+            })
             .filter(|entry| {
                 entry.state.is_published()
                     && entry.mm == mm
@@ -1129,7 +1141,10 @@ impl FrameInventoryAuthority {
                 state
                     .mappings
                     .get(&target_map)
-                    .and_then(|slot| slot.live())
+                    .and_then(|slot| match slot {
+                        MappingSlot::Live(entry) => Some(entry),
+                        MappingSlot::Claimed(_) => None,
+                    })
                     .is_some_and(|entry| {
                         entry.state.is_published()
                             && entry.mm == mm
@@ -1755,7 +1770,10 @@ impl FrameInventoryAuthority {
             .lock()
             .mappings
             .get(&mapping)
-            .and_then(|slot| slot.live())
+            .and_then(|slot| match slot {
+                MappingSlot::Live(entry) => Some(entry),
+                MappingSlot::Claimed(_) => None,
+            })
             .is_some_and(|entry| {
                 entry.state.is_published()
                     && entry.mm == mm
@@ -5002,7 +5020,10 @@ mod claimed_return {
                 let entry = state
                     .mappings
                     .get(&row.mapping)
-                    .and_then(|slot| slot.live())
+                    .and_then(|slot| match slot {
+                        MappingSlot::Live(entry) => Some(entry),
+                        MappingSlot::Claimed(_) => None,
+                    })
                     .ok_or(Error::RowMismatch)?;
                 let published = match entry.state {
                     MappingState::Published => true,
