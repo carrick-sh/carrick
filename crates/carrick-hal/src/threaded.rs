@@ -2585,19 +2585,17 @@ pub struct GuestFrameOwner {
     pub root_generation: carrick_guest_arch::ContextGeneration,
 }
 
-impl From<carrick_el1_abi::El1MmHandle> for GuestFrameOwner {
-    fn from(owner: carrick_el1_abi::El1MmHandle) -> Self {
-        Self {
-            native_mm: carrick_guest_arch::MmGeneration::new(
-                std::num::NonZeroU64::new(owner.mm().raw()).unwrap_or_else(|| {
-                    carrick_fatal::carrick_fatal!(
-                        "hal::frame_owner",
-                        "admitted MM has zero identity"
-                    )
-                }),
-            ),
+impl GuestFrameOwner {
+    /// Project an admitted root into inventory identity before taking custody.
+    /// Callers retain the resulting owner through release; settlement must not
+    /// invent an owner or terminate the carrier on a refused conversion.
+    pub fn from_admitted(owner: carrick_el1_abi::El1MmHandle) -> Option<Self> {
+        Some(Self {
+            native_mm: carrick_guest_arch::MmGeneration::new(std::num::NonZeroU64::new(
+                owner.mm().raw(),
+            )?),
             root_generation: carrick_guest_arch::ContextGeneration::new(owner.incarnation()),
-        }
+        })
     }
 }
 

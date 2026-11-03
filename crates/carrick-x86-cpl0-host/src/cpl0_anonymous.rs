@@ -1304,14 +1304,22 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         if refused && inventory_published.get() {
             if root_installed.get() {
                 let absence = SlotAbsence::scan(loan.request.child_mm, [])
-                    .and_then(|absence| absence.with_owner(completion.child.into()))
+                    .and_then(|absence| {
+                        absence.with_owner(carrick_hal::GuestFrameOwner::from_admitted(
+                            completion.child,
+                        )?)
+                    })
                     .ok_or_else(|| fail("unpublished child MM slot absence"))?;
                 release_retired_child(&mut self._vm, &*frame_inventory, &absence)?;
             } else if !carrick_hal::fork_stock::release_child_mm(
                 &*frame_inventory,
                 self.cow_residency()?,
                 &SlotAbsence::scan(loan.request.child_mm, [])
-                    .and_then(|absence| absence.with_owner(completion.child.into()))
+                    .and_then(|absence| {
+                        absence.with_owner(carrick_hal::GuestFrameOwner::from_admitted(
+                            completion.child,
+                        )?)
+                    })
                     .ok_or_else(|| fail("unpublished child inventory owner"))?,
             )
             .is_some()
@@ -1387,7 +1395,11 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .map_err(|e: ForkStockServiceError| fail(format!("physical fork settlement: {e:?}")))?;
         if is_abort && had_admitted {
             let absence = SlotAbsence::scan(loan.request.child_mm, [])
-                .and_then(|absence| absence.with_owner(admitted_owner?.into()))
+                .and_then(|absence| {
+                    absence.with_owner(carrick_hal::GuestFrameOwner::from_admitted(
+                        admitted_owner?,
+                    )?)
+                })
                 .ok_or_else(|| fail("aborted child MM slot absence"))?;
             release_retired_child(&mut self._vm, &*self.frame_inventory, &absence)?;
         }

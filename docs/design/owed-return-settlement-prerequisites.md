@@ -105,7 +105,7 @@ supersede the proposal above. The checkpoint implements the inventory claim
 and receipt prerequisites; it does **not** implement slice 2b settlement.
 
 `PreparedReturn` claims at most 512 pages. Other transactions cannot mutate
-its `Retiring` rows, and revision headroom includes outstanding claims.
+its `Claimed` rows, and revision headroom includes outstanding claims.
 `Stage1Cleared` has no ordinary abort: an explicit undo runs before abort,
 apply is infallible, and drop retains the claim and invokes exact-owner
 quarantine. Whole-MM inventory retirement returns `RetryPending` during the
@@ -193,7 +193,7 @@ carries its abandonment policy, so consuming a wrapper needs no missing-claim
 fatal branch. Prepared drop restores rows; cleared drop quarantines the exact
 MM before taking the inventory lock; successful apply or abort disarms drop.
 
-The checkpoint still introduces invariant-fatal sites in the inventory claim
+The checkpoint introduced invariant-fatal sites in the inventory claim
 and the admitted-MM conversion. The authority-debt source gate rejects these
 unclassified sites. Its ceilings have not been increased. The inventory claim
 retains IDs into mutable maps rather than owning stable row/reference tokens;
@@ -221,8 +221,10 @@ The six items in the original ruling have this status:
 | Inventory lock audit | The claim lifecycle audit above covers the new critical sections; `completion_drops_quarantine_outside_inventory_lock` checks callback destruction on apply and undo. It does not establish a lock-level guarantee for generic transaction outcomes. |
 | CPL0 path | Named and witnessed through `CarrierMemory::retire_child` and `custody_release_before_another_mm_unmaps_keeps_physical_registration`. Backend-half receipt integration remains part of the addendum work. |
 
-Addendum 2 still requires owned mapping rows and stable reference custody
-outside the copied overlay; prepare/abort/split reference accounting;
+The continuation moves mapping rows into the claim, leaving constructor-sealed
+`Claimed` placeholders; overlays cannot copy a claimed row. Addendum 2 still
+requires stable reference custody outside the copied overlay;
+prepare/abort/split reference accounting;
 `Shared`/`Zero`/`Last` release semantics and complete unmap bookkeeping; linear
 retirement permits consumed into a backend release half; and gates on native
 backing drop and the cross-MM legacy retirement sites. No new debt ceiling or
@@ -237,3 +239,39 @@ The continuation translates `ClaimedMapping` from that apply into
 `RetryPending`, matching the initial scan's refusal. The existing
 pre-admitted-claim witness does not exercise the concurrent interleaving;
 the event witness proves the later apply refuses without changing rows.
+
+
+### Physical identity and backend receipt integration still required
+
+A retirement permit cannot use `ExactReturnMappingRow::generation` as its
+host-owner generation. In `StagedPhysicalGrants::stage_with_permissions`,
+`owner_generation = NonZeroU64::MIN` initializes the inventory mapping
+generation; it is not the generation returned by the physical allocator.
+The HVF native allocator already returns the actual IPA and owner generation
+before calling that staging API. `stage_mapping_in` also has the stage-2
+lease and physical `stage2_owner`, but `PrepareMapping` does not carry that
+identity into the inventory frame cell. The implementation must transport
+this exact physical identity through publication before it can issue a permit.
+
+Similarly, the current fork-stock reclaim callback releases inventory before
+`NativeChildPhysical` drops. Minting a backend half inside that callback would
+still claim custody release too early. The retained inventory half must cross
+the actual custody drop; CPL0 must retain it through `CarrierMemory::retire_child`.
+Neither the existing receipt constructor nor a successful inventory query
+proves that step completed.
+
+The remaining stable-counter work is also substantive: the current overlay
+copies `FrameEntry` and its numeric `FrameReferences`. An `Arc` around that
+copied value alone cannot make a claimed decrement infallible. An owned unit
+must remain attached to one counter across ordinary overlay commits, aborts,
+and splits, without losing full reference-count capacity or allowing a last
+release while a staged alias is being published. The owned-row change closes
+the row re-lookup problem only. The two frame lookup/underflow fatal sites and
+the missing physical permit gate remain implementation blockers.
+
+
+The admitted-handle conversion now returns `Option<GuestFrameOwner>` instead
+of adding an invariant-fatal branch; the CPL0 cleanup callers refuse a failed
+conversion before invoking release. This removes that fatal site, but is not
+the proposed admission-time retained `ReturnOwner`. Existing fork-stock
+execution contexts already carry the typed owner used at release.
