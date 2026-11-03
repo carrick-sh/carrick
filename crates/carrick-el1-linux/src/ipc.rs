@@ -514,51 +514,50 @@ fn op_kind(
     }
 }
 
-/// Allocation refusal retains its input and a counted release subscription.
-/// The caller enrolls with `ticket.park_host_rechecked` (or its native owner
-/// equivalent), then probes the arena once; it must not forward on Busy.
+/// Allocation refusal retains its input and the shared linear release ticket.
 #[must_use]
 pub enum OperationAdmission<'a, C: carrick_el1_abi::EntryContext> {
     Admitted(IpcOpToken),
-    Busy {
-        operation: IpcOperation,
-        ticket: carrick_sched_core::object_wait::ObjectNotificationTicket<'a, C>,
-        snapshot: carrick_sched_core::object_wait::ObjectWaitSnapshot,
-    },
     Refused {
+        operation: IpcOperation,
+        reason: carrick_sched_core::refusal::Refusal<'a, core::convert::Infallible, C>,
+    },
+    SourceUnavailable {
         operation: IpcOperation,
         error: ObjectWaitError,
     },
 }
 
-/// Subscribe before the single allocation attempt. A release between failure
-/// and enrollment changes the snapshot, so no returned slot can be missed.
-/// This is the admission primitive for retained poll; existing read/write
-/// admission is unchanged in this prerequisite slice.
+/// Probe the arena through its attached release source. A miss observes the
+/// source before one re-probe, producing the common typed contention ticket.
+/// The retained poll owner must park or cancel it; it must never forward it.
+/// Existing read/write admission is unchanged in this prerequisite slice.
 pub fn admit_operation_wait<'a, C: carrick_el1_abi::EntryContext>(
     region: &IpcRegion<'_>,
     zone: &'a carrick_sched_core::ZoneTables<C>,
     operation: IpcOperation,
     completion: &dyn Fn(carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>),
 ) -> OperationAdmission<'a, C> {
+    use carrick_sched_core::refusal::{
+        Attempt, ContentionSource, InvariantKind, ReleaseCause, Settled,
+    };
     let source =
         match zone.ipc_operation_slot_source(region.operation_slot_generation(), completion) {
             Ok(source) => source,
-            Err(error) => return OperationAdmission::Refused { operation, error },
+            Err(error) => return OperationAdmission::SourceUnavailable { operation, error },
         };
-    let ticket = source.reserve();
-    let snapshot = source.observe();
-    match region.begin_operation(operation) {
+    match source.contend(|| match region.begin_operation(operation) {
+        Ok(token) => Ok(token),
+        Err(carrick_el1_abi::ipc::IpcError::NoOperations) => {
+            Err(Attempt::Contended(ReleaseCause::Object))
+        }
+        Err(_) => Err(Attempt::Settled(Settled::Invariant(InvariantKind {
+            domain: "ipc_operation_slots",
+            code: 1,
+        }))),
+    }) {
         Ok(token) => OperationAdmission::Admitted(token),
-        Err(carrick_el1_abi::ipc::IpcError::NoOperations) => OperationAdmission::Busy {
-            operation,
-            ticket,
-            snapshot,
-        },
-        Err(_) => OperationAdmission::Refused {
-            operation,
-            error: ObjectWaitError::Stale,
-        },
+        Err(reason) => OperationAdmission::Refused { operation, reason },
     }
 }
 
@@ -2148,28 +2147,31 @@ mod tests {
             orig_x0: 123,
             ..IpcOperation::EMPTY
         };
-        let (operation, ticket, snapshot) =
+        let (operation, ticket) =
             match admit_operation_wait(w.region, &w.zone, operation, &completion) {
-                OperationAdmission::Busy {
+                OperationAdmission::Refused {
                     operation,
-                    ticket,
-                    snapshot,
-                } => (operation, ticket, snapshot),
-                _ => panic!("full arena must retain a Busy subscription"),
+                    reason: carrick_sched_core::refusal::Refusal::Contended(ticket),
+                } => (operation, ticket),
+                _ => panic!("full arena must retain a contention subscription"),
             };
         let record = w.zone.alloc_record(identity(909, MM)).unwrap();
         let retained = OperationToken::new(9001, 1).unwrap();
-        let queue = w
-            .zone
-            .object_wait_with_completion(
-                ticket.key(),
-                &carrick_sched_core::BoundedSpin(0),
-                &completion,
-            )
-            .unwrap();
-        queue.park(snapshot, record, retained).unwrap();
-        drop(queue);
-        drop(ticket);
+        // SAFETY: this adapter publishes the exact owned continuation on the
+        // real scheduler queue; no guard survives enrollment.
+        unsafe {
+            ticket.park_and_rerun(retained, |retained, enrollment| {
+                let queue = w
+                    .zone
+                    .object_wait_with_completion(
+                        enrollment.key(),
+                        &carrick_sched_core::BoundedSpin(0),
+                        &completion,
+                    )
+                    .unwrap();
+                queue.park(enrollment.observed(), record, retained).unwrap();
+            })
+        };
         assert_eq!(delivered.get(), 0);
         let mut sched = Sched {
             handoff: None,
