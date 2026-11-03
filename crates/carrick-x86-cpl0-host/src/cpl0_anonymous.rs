@@ -1313,7 +1313,9 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 &SlotAbsence::scan(loan.request.child_mm, [])
                     .and_then(|absence| absence.with_owner(completion.child.into()))
                     .ok_or_else(|| fail("unpublished child inventory owner"))?,
-            ).is_some() {
+            )
+            .is_some()
+            {
                 return Err(fail("unpublished child inventory rollback"));
             }
         }

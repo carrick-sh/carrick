@@ -96,3 +96,92 @@ idempotent retry.
 The relevant existing conformance family is
 `kernel.el1.anonymous-reservations`. No semantic, structural-budget, signed,
 KVM or Docker acceptance is established by this investigation.
+
+## Slice 2a continuation and review limits
+
+The [addendum](https://github.com/carrick-sh/carrick/issues/1369#issuecomment-6593315291)
+and its [independent review](https://github.com/carrick-sh/carrick/issues/1369#issuecomment-6593369414)
+supersede the proposal above. The checkpoint implements the inventory claim
+and receipt prerequisites; it does **not** implement slice 2b settlement.
+
+`PreparedReturn` claims at most 512 pages. Other transactions cannot mutate
+its `Retiring` rows, and revision headroom includes outstanding claims.
+`Stage1Cleared` has no ordinary abort: an explicit undo runs before abort,
+apply is infallible, and drop retains the claim and invokes exact-owner
+quarantine. Whole-MM inventory retirement returns `RetryPending` during the
+claim. The VM-free witnesses drive those inventory entry points, including
+another MM unmapping a shared frame between prepare and apply. They do not
+claim to exercise a guest `exit_group` or physical pin retirement.
+
+`RetiredJournal` records the root incarnation and each slot epoch. Local
+custody tokens also borrow their originating table: two independently
+allocated tables with identical numeric MM/root/slot IDs cannot exchange
+return tokens. The borrow keeps that table alive and unmoved. These are local
+Rust custody tokens, not transport or shared-memory ABI records; separate
+virtual aliases compare unequal. A future carrier transport must authenticate
+its own source and reconstruct custody through its admitted mapping.
+
+`RetiredJournalJoin` accepts marking and release in either order and consumes
+its proofs once. **Root retirement still eagerly clears slots in 2a.** Its
+current `Some(0)` witnesses prove identity and proof consumption, not delayed
+physical acknowledgement. Retaining retired-owed slots and the table release
+notification belong to 2b. Likewise, `MmReleaseReceipt` proves empty inventory
+at a revision; it does not prove backend memslot deletion. The carrier must
+finish residency and physical custody work before publishing it to journal
+settlement. The join retains the admitted `FrameInventoryOrigin` and rejects a receipt
+from another inventory even when every numeric owner field matches. Carrier
+integration must supply that admitted source, not derive it from an incoming
+receipt.
+
+### Physical gate blocker found in checkpoint review
+
+The checkpoint's new central HVF retirement gate was unsafe and has been
+removed in a follow-up change:
+
+- `settle_declined_lease_remainders`, `commit_cow_split`, and
+  `retire_stage2_candidate_if_unreferenced` already hold the frame registry
+  when they call physical retirement. Acquiring it again deadlocks.
+- `retire_task_state_process_grants` stages an inventory commit, retires
+  physical candidates, and returns the commit for subsequent apply. A central
+  check that rejects every still-live inventory row rejects this existing
+  order. It cannot become active as a no-behaviour-change prerequisite.
+- Indexing only `stage_mapping_in` misses frames installed by COW splitting.
+
+Do not restore that gate or merely drop the caller's registry lock: that
+would reopen the publication/retirement race the existing lock prevents.
+The production port must pass existing custody explicitly and reconcile the
+old retirement order with the prepared-return transaction. The existing
+pending-retirement IPA allocator witness is retained, but is not evidence
+for this missing inventory gate. The inherited-frame custody index is also
+only a prerequisite; it does not activate chunk settlement.
+
+CPL0's corresponding physical owner is `CarrierMemory`, not HVF's
+`NativeFrameBacking`. `retire_child` checks inventory before mutation and
+`AlreadyRetiredInventory` checks the last frame population before releasing
+private memslots. Its shared-frame witness refuses early custody release,
+keeps registrations intact, then completes after the other MM unmaps.
+`release_retired_child` currently calls the neutral inventory/residency release
+before `CarrierMemory::retire_child`; 2b must retain the intermediate receipt
+until that backend step succeeds. Native `cross_child_reclaim` errors are
+fatal today. There is no general native release-fails-then-succeeds retry;
+that planned witness applies only to the host-root path.
+
+### Inventory lock audit
+
+The new claim lifecycle keeps the inventory lock innermost:
+
+- `prepare_return` allocates its transaction ID and output buffers before
+  locking, then validates rows and reserves revision headroom under the lock.
+- `ClaimedReturn::apply` and `restore` modify only inventory maps, reference
+  arithmetic and counters. Apply's output vector is preallocated.
+- `Stage1Cleared::drop` calls quarantine **before** reacquiring the inventory
+  lock to retain and count the abandoned claim.
+
+None of these critical sections acquires `fork_stock`, a reservation root,
+physical-owner custody, or a pin wait. This is a scoped audit, not a claim
+about every existing generic inventory API: `apply_inner<T>` can drop a
+caller's outcome on failure under its lock, and event application emits
+tracing. Activation of the wider physical gate still requires review.
+
+The branch remains draft. Slice 2a and its consuming 2b must be reviewed and
+gated together; the dormant prerequisite types are not a landing unit.

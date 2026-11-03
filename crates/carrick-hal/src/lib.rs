@@ -55,8 +55,9 @@ pub use kernel::{
     FrameId, FrameInventoryApplyReceipt, FrameInventoryBatch, FrameInventoryBatchError,
     FrameInventoryCommit, FrameInventoryEvent, FrameInventoryOrigin, FrameInventoryProvenance,
     FrameInventoryReceiptChallenge, FrameInventoryReceiptOwner, FrameInventoryReservation,
-    FrameInventoryReservationError, FrameInventoryRetirementReceipt, MmReleaseReceipt, FrameLength,
+    FrameInventoryReservationError, FrameInventoryRetirementReceipt, FrameLength,
     KernelTransactionId, MAX_FRAME_INVENTORY_EVENTS_PER_BATCH, MappingGeneration, MappingId,
+    MmReleaseReceipt,
 };
 pub mod event;
 pub use event::{EventMultiplexer, Interest, PollEvent, Readiness, TriggerMode, VnodeEvents};
@@ -150,4 +151,7 @@ pub use carrick_guest_arch::MmGeneration;
 pub mod diagnostic_capture;
 
 pub mod prepared_return;
-pub use prepared_return::{AppliedReturn, ExactReturnMappingRow, PrepareReturnError, PreparedReturn, ReturnClaim, ReturnQuarantine, Stage1Cleared};
+pub use prepared_return::{
+    AppliedReturn, ExactReturnMappingRow, PrepareReturnError, PreparedReturn, ReturnClaim,
+    ReturnQuarantine, Stage1Cleared,
+};

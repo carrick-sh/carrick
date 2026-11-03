@@ -330,11 +330,15 @@ impl SlotAbsence {
 
     /// Bind the absence proof to the carrier's already authenticated root.
     pub fn with_owner(mut self, owner: crate::GuestFrameOwner) -> Option<Self> {
-        if owner.native_mm.raw().get() != self.mm.raw() { return None; }
+        if owner.native_mm.raw().get() != self.mm.raw() {
+            return None;
+        }
         self.owner = Some(owner);
         Some(self)
     }
-    pub fn inventory_owner(&self) -> Option<crate::GuestFrameOwner> { self.owner }
+    pub fn inventory_owner(&self) -> Option<crate::GuestFrameOwner> {
+        self.owner
+    }
 
     pub fn mm(&self) -> ReservationMm {
         self.mm
@@ -589,7 +593,9 @@ pub fn release_child_mm(
     absence: &SlotAbsence,
 ) -> Option<crate::MmReleaseReceipt> {
     let receipt = inventory.retire_mm(absence.inventory_owner()?).ok()?;
-    if !residency.retire_overlapping(absence.mm().raw(), 0, u64::MAX) { return None; }
+    if !residency.retire_overlapping(absence.mm().raw(), 0, u64::MAX) {
+        return None;
+    }
     crate::MmReleaseReceipt::from_retirement(receipt)
 }
 
@@ -1634,7 +1640,9 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             self.exec_predecessors.insert(receipt.sequence, pending);
             return Err(ForkStockServiceError::StaleExecution);
         }
-        let absence = absence.with_owner(pending.owner).ok_or(ForkStockServiceError::InvalidRecord)?;
+        let absence = absence
+            .with_owner(pending.owner)
+            .ok_or(ForkStockServiceError::InvalidRecord)?;
         if !pending.released {
             if let ExecPredecessorPhysical::Child(physical) = &pending.physical
                 && !release(physical, &absence)
@@ -2358,8 +2366,13 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         for (key, mut absence) in candidates {
             if let Some(child) = self.children.get(&key) {
                 absence.owner = Some(crate::GuestFrameOwner {
-                    native_mm: carrick_guest_arch::MmGeneration::new(NonZeroU64::new(child.owner.mm().raw()).ok_or(ForkStockServiceError::InvalidRecord)?),
-                    root_generation: carrick_guest_arch::ContextGeneration::new(child.owner.incarnation()),
+                    native_mm: carrick_guest_arch::MmGeneration::new(
+                        NonZeroU64::new(child.owner.mm().raw())
+                            .ok_or(ForkStockServiceError::InvalidRecord)?,
+                    ),
+                    root_generation: carrick_guest_arch::ContextGeneration::new(
+                        child.owner.incarnation(),
+                    ),
                 });
             }
             let mm = key.mm().ok_or(ForkStockServiceError::InvalidRecord)?;

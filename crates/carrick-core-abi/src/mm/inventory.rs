@@ -236,9 +236,10 @@ impl FrameInventoryRetirementReceipt {
 
 /// Exact empty-MM inventory proof carried past residency release.
 ///
-/// The releasing authority constructs this only after its existing physical
-/// release and residency retirement have succeeded. It is linear so one
-/// retirement cannot authorize two journal joins.
+/// This proves inventory emptiness, not completion of backend memslot or
+/// stage-2 retirement. Carrier custody must finish those steps and residency
+/// retirement before publishing it to journal settlement. It is linear so
+/// one retirement cannot authorize two journal joins.
 #[derive(Debug, Eq, PartialEq)]
 pub struct MmReleaseReceipt {
     retirement: FrameInventoryRetirementReceipt,
@@ -248,10 +249,20 @@ impl MmReleaseReceipt {
     /// The physical release owner must finish residency retirement before
     /// publishing this receipt to journal custody.
     pub fn from_retirement(retirement: FrameInventoryRetirementReceipt) -> Option<Self> {
-        retirement.mm_empty_at_revision().then_some(Self { retirement })
+        retirement
+            .mm_empty_at_revision()
+            .then_some(Self { retirement })
     }
-    pub const fn owner(&self) -> FrameInventoryReceiptOwner { self.retirement.owner() }
-    pub const fn revision(&self) -> u64 { self.retirement.revision() }
+    /// Inventory identity is independent of the numeric MM and revision.
+    pub fn issued_by(&self, origin: &FrameInventoryOrigin) -> bool {
+        self.retirement.apply.issued_by(origin)
+    }
+    pub const fn owner(&self) -> FrameInventoryReceiptOwner {
+        self.retirement.owner()
+    }
+    pub const fn revision(&self) -> u64 {
+        self.retirement.revision()
+    }
 }
 
 impl FrameInventoryReceiptChallenge {
@@ -301,12 +312,19 @@ mod tests {
             native_mm: carrick_guest_arch::MmGeneration::new(id(7)),
             root_generation: carrick_guest_arch::ContextGeneration::new(id(13)),
         };
-        let make = |empty| FrameInventoryRetirementReceipt::from_kernel_authority(
-            FrameInventoryApplyReceipt::from_kernel_authority(
-                Default::default(), FrameInventoryProvenance::from_kernel_entropy([2; 32]),
-                KernelTransactionId::from_kernel_allocation(id(8)), owner, 27, Vec::new(),
-            ), empty,
-        );
+        let make = |empty| {
+            FrameInventoryRetirementReceipt::from_kernel_authority(
+                FrameInventoryApplyReceipt::from_kernel_authority(
+                    Default::default(),
+                    FrameInventoryProvenance::from_kernel_entropy([2; 32]),
+                    KernelTransactionId::from_kernel_allocation(id(8)),
+                    owner,
+                    27,
+                    Vec::new(),
+                ),
+                empty,
+            )
+        };
         assert!(MmReleaseReceipt::from_retirement(make(false)).is_none());
         let release = MmReleaseReceipt::from_retirement(make(true)).expect("empty MM");
         assert_eq!(release.owner(), owner);

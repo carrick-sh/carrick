@@ -1669,7 +1669,9 @@ fn reclaim_fork_stock(
         },
         |pages| crate::fork_stock::ForkStockHostCustody::clear_tables(custody, pages),
         |life| lifecycle_window(custody, life).is_some_and(|window| window.clear(life)),
-        |absence| carrick_hal::fork_stock::release_child_mm(&*inventory, residency, absence).is_some(),
+        |absence| {
+            carrick_hal::fork_stock::release_child_mm(&*inventory, residency, absence).is_some()
+        },
     )
 }
 

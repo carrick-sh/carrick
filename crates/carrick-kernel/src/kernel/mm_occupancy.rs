@@ -1721,6 +1721,7 @@ fn retire_reservation_root(
         Some(provider) => provider.prepare().and_then(|view| {
             view.lock(key, &carrick_el1::memory::reservations::NoRootWait)?
                 .retire_final()
+                .map(drop)
         }),
         None => tables
             .release_venue()
@@ -1735,7 +1736,7 @@ fn retire_reservation_root(
                     &carrick_el1::memory::reservations::NoRootWait,
                 )
             })
-            .and_then(|root| root.retire_final()),
+            .and_then(|root| root.retire_final().map(drop)),
     };
     match settled {
         Ok(_) | Err(Refusal::Stale) => {}

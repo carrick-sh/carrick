@@ -1437,7 +1437,7 @@ pub fn custody_release_before_another_mm_unmaps_keeps_physical_registration(
     // Once the inventory side releases the MM, the same call completes.
     fixture
         .inventory()
-        .retire_mm(MmGeneration::new(fixture.key(1)))
+        .retire_mm(fixture.context(1).into())
         .unwrap();
     let retired = fixture.retire(2).unwrap();
     assert_eq!(

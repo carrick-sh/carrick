@@ -53,7 +53,12 @@ impl PreparedReturn {
         }
     }
     pub fn apply(mut self) -> AppliedReturn {
-        self.claim.take().expect("owned return claim").apply()
+        self.claim
+            .take()
+            .unwrap_or_else(|| {
+                carrick_fatal::carrick_fatal!("hal::prepared_return", "owned return claim missing")
+            })
+            .apply()
     }
     pub fn stage1_cleared(mut self, quarantine: Arc<dyn ReturnQuarantine>) -> Stage1Cleared {
         Stage1Cleared {
@@ -88,7 +93,12 @@ pub struct Stage1Cleared {
 }
 impl Stage1Cleared {
     pub fn apply(mut self) -> AppliedReturn {
-        self.claim.take().expect("owned return claim").apply()
+        self.claim
+            .take()
+            .unwrap_or_else(|| {
+                carrick_fatal::carrick_fatal!("hal::prepared_return", "owned return claim missing")
+            })
+            .apply()
     }
     /// The caller retains the undo log and restores all leaves before returning.
     pub fn undo_and_abort(mut self, undo: impl FnOnce()) {

@@ -2589,7 +2589,12 @@ impl From<carrick_el1_abi::El1MmHandle> for GuestFrameOwner {
     fn from(owner: carrick_el1_abi::El1MmHandle) -> Self {
         Self {
             native_mm: carrick_guest_arch::MmGeneration::new(
-                std::num::NonZeroU64::new(owner.mm().raw()).expect("admitted nonzero MM"),
+                std::num::NonZeroU64::new(owner.mm().raw()).unwrap_or_else(|| {
+                    carrick_fatal::carrick_fatal!(
+                        "hal::frame_owner",
+                        "admitted MM has zero identity"
+                    )
+                }),
             ),
             root_generation: carrick_guest_arch::ContextGeneration::new(owner.incarnation()),
         }
@@ -2628,7 +2633,6 @@ pub trait PhysicalFrameInventory: Send + Sync {
         &self,
         owner: GuestFrameOwner,
     ) -> Result<crate::FrameInventoryRetirementReceipt, Box<dyn std::error::Error + Send + Sync>>;
-
 }
 
 /// An unpublished apply retains the exact authority that issued its receipt.
@@ -2680,7 +2684,8 @@ pub trait FrameCowAuthority: Send + Sync {
     fn prepare_return(
         &self,
         _rows: &[crate::prepared_return::ExactReturnMappingRow],
-    ) -> Result<crate::prepared_return::PreparedReturn, crate::prepared_return::PrepareReturnError> {
+    ) -> Result<crate::prepared_return::PreparedReturn, crate::prepared_return::PrepareReturnError>
+    {
         Err(crate::prepared_return::PrepareReturnError::Unsupported)
     }
 

@@ -5042,6 +5042,42 @@ mod prepared_return_tests {
         );
     }
     #[test]
+    fn stage1_undo_finishes_before_inventory_abort_and_retry() {
+        struct NoQuarantine;
+        impl carrick_hal::ReturnQuarantine for NoQuarantine {
+            fn quarantine(&self, _: FrameInventoryReceiptOwner) {
+                panic!("explicit undo must not quarantine");
+            }
+        }
+        let (inventory, ids, owner, row) = fixture();
+        let cleared = inventory
+            .prepare_return(&ids, owner, &[row])
+            .unwrap()
+            .stage1_cleared(Arc::new(NoQuarantine));
+        let mut undo_ran = false;
+        cleared.undo_and_abort(|| {
+            // A descriptor undo runs outside the inventory lock, while its
+            // rows remain claimed. Teardown cannot steal them in this window.
+            assert_eq!(
+                inventory.retire_mm(&ids, owner),
+                Err(FrameInventoryRetireMmError::RetryPending)
+            );
+            assert_eq!(inventory.frame_mapping_count(row.frame), Some(1));
+            undo_ran = true;
+        });
+        assert!(undo_ran);
+        assert!(inventory.live_mapping_row(owner, row.mapping).is_some());
+        let applied = inventory
+            .prepare_return(&ids, owner, &[row])
+            .unwrap()
+            .stage1_cleared(Arc::new(NoQuarantine))
+            .apply();
+        assert_eq!(applied.last_unmapped, vec![row.frame]);
+        assert!(applied.mm_empty_at_revision);
+        assert_eq!(inventory.state.lock().quarantined_returns, 0);
+    }
+
+    #[test]
     fn return_claim_reserves_revision_headroom() {
         let (inventory, ids, owner, row) = fixture();
         inventory.state.lock().revision = u64::MAX - 1;

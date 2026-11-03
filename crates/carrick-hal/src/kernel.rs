@@ -16,8 +16,8 @@ pub const MAX_FRAME_INVENTORY_EVENTS_PER_BATCH: usize = 262_144;
 
 pub use carrick_core_abi::{
     FrameId, FrameInventoryApplyReceipt, FrameInventoryOrigin, FrameInventoryProvenance,
-    FrameInventoryReceiptChallenge, FrameInventoryReceiptOwner, FrameInventoryRetirementReceipt, MmReleaseReceipt,
-    FrameLength, KernelTransactionId, MappingGeneration, MappingId,
+    FrameInventoryReceiptChallenge, FrameInventoryReceiptOwner, FrameInventoryRetirementReceipt,
+    FrameLength, KernelTransactionId, MappingGeneration, MappingId, MmReleaseReceipt,
 };
 
 /// Revision of the backend MM binding observed by foreign-memory transport.

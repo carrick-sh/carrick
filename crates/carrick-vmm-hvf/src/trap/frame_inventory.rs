@@ -416,11 +416,6 @@ pub(crate) fn increment_inventory_reference<K: Ord + Copy + std::fmt::Debug>(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(::core::fmt::Debug, ::core::default::Default)]
 pub(crate) struct InventoryFrameRegistry {
-    /// Exact physical incarnations retain their frame identities until terminal retirement.
-    pub(crate) physical_owner_frames: std::collections::BTreeMap<
-        (u64, u64, u64),
-        std::collections::BTreeSet<carrick_hal::FrameId>,
-    >,
     pub(crate) shared: std::collections::BTreeMap<InventoryBackingIdentity, carrick_hal::FrameId>,
     pub(crate) references: std::collections::BTreeMap<carrick_hal::FrameId, usize>,
     pub(crate) extent_references:
@@ -2435,11 +2430,6 @@ impl HvfVmState {
         // before the shared registry is mutated. A rejected publication has no
         // InventoryExtent for rollback to discover, so partial insertion here
         // would manufacture phantom frame authority permanently.
-        frames
-            .physical_owner_frames
-            .entry((stage2_lease.0, stage2_lease.1, stage2_owner.generation))
-            .or_default()
-            .insert(frame);
         frames.references.insert(frame, frame_references);
         frames
             .extent_references

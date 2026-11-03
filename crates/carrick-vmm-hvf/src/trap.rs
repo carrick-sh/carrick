@@ -1933,10 +1933,6 @@ impl HvfTaskState {
         authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
         identity: carrick_hal::FrameCowIdentity,
     ) {
-        let _ = self.custody_arc().inventory_retirement_gate.set(InventoryRetirementGate {
-            frames: std::sync::Arc::clone(&self.frame_inventory.ledger.lock().frames),
-            authority: std::sync::Arc::clone(&authority),
-        });
         self.cow_authority = Some(std::sync::Arc::clone(&authority));
         self.cow_identity = Some(identity);
         self.mm_access.bind_cow_runtime(MmCowRuntimeBinding {

@@ -133,9 +133,9 @@ pub struct DeferredReturn {
 /// released by its refusal.
 #[must_use]
 #[derive(::core::fmt::Debug)]
-pub struct ReturnSlot {
+pub struct ReturnSlot<'table> {
     index: usize,
-    identity: JournalIdentity,
+    identity: JournalIdentity<'table>,
     epoch: u64,
     /// Joins the owed extent already in the slot.
     merge: bool,
@@ -143,13 +143,25 @@ pub struct ReturnSlot {
 
 /// Exact root lifetime. Incarnations are table-unique; the index also binds
 /// journal custody to its source root. Repeated raw MMs cannot stand in for it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct JournalIdentity {
+#[derive(Clone, Copy, Debug)]
+pub struct JournalIdentity<'table> {
+    // A local custody token, never stored in the shared ABI. The borrow keeps
+    // the originating table alive and unmoved until settlement finishes.
+    table: &'table AtomicU64,
     mm: ReservationMm,
     root: usize,
     incarnation: ReservationGeneration,
 }
-impl JournalIdentity {
+impl PartialEq for JournalIdentity<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        core::ptr::eq(self.table, other.table)
+            && self.mm == other.mm
+            && self.root == other.root
+            && self.incarnation == other.incarnation
+    }
+}
+impl Eq for JournalIdentity<'_> {}
+impl<'table> JournalIdentity<'table> {
     pub fn mm(self) -> ReservationMm {
         self.mm
     }
@@ -170,13 +182,13 @@ struct JournalSlot {
 /// that existing path to retain them until the joined release acknowledges.
 #[must_use]
 #[derive(Debug, PartialEq, Eq)]
-pub struct RetiredJournal {
-    identity: JournalIdentity,
+pub struct RetiredJournal<'table> {
+    identity: JournalIdentity<'table>,
     slots: [Option<JournalSlot>; DEFERRED_RETURNS],
     count: usize,
 }
-impl RetiredJournal {
-    pub fn identity(&self) -> JournalIdentity {
+impl<'table> RetiredJournal<'table> {
+    pub fn identity(&self) -> JournalIdentity<'table> {
         self.identity
     }
     /// Number of owed extents present at root retirement.
@@ -185,19 +197,22 @@ impl RetiredJournal {
     }
 }
 
-/// Evidence that physical custody and inventory retirement completed for the
-/// exact root lifetime. The inventory receipt owner authenticates this identity.
+/// Local rendezvous payload for an inventory release and root lifetime.
+/// The join authenticates the receipt's inventory origin against the source
+/// retained at admission. Carrier integration must still finish physical
+/// release before acknowledging retained slots; 2a clears them eagerly.
 #[must_use]
 #[derive(Debug)]
-pub struct JournalRelease {
-    identity: JournalIdentity,
+pub struct JournalRelease<'table> {
+    identity: JournalIdentity<'table>,
     receipt: MmReleaseReceipt,
 }
-impl JournalRelease {
-    /// Bind the inventory owner's exact guest-MM release to journal custody.
+impl<'table> JournalRelease<'table> {
+    /// Check the numeric guest-MM owner against local journal custody.
     /// Host receipts do not carry a reservation incarnation yet and are refused.
+    /// `RetiredJournalJoin::record_release` also checks the issuing inventory.
     pub fn from_mm_release(
-        identity: JournalIdentity,
+        identity: JournalIdentity<'table>,
         receipt: MmReleaseReceipt,
     ) -> Result<Self, Refusal> {
         match receipt.owner() {
@@ -221,28 +236,33 @@ impl JournalRelease {
 /// possible only after both exact-lifetime authorities have joined. No root
 /// lookup is performed, so a borrowed root and a recycled index are harmless.
 #[derive(Debug)]
-pub struct RetiredJournalJoin {
-    identity: JournalIdentity,
-    journal: Option<RetiredJournal>,
-    release: Option<JournalRelease>,
+pub struct RetiredJournalJoin<'table> {
+    origin: FrameInventoryOrigin,
+    identity: JournalIdentity<'table>,
+    journal: Option<RetiredJournal<'table>>,
+    release: Option<JournalRelease<'table>>,
 }
-impl RetiredJournalJoin {
-    pub fn new(identity: JournalIdentity) -> Self {
+impl<'table> RetiredJournalJoin<'table> {
+    pub fn new(identity: JournalIdentity<'table>, origin: FrameInventoryOrigin) -> Self {
         Self {
+            origin,
             identity,
             journal: None,
             release: None,
         }
     }
-    pub fn record_journal(&mut self, journal: RetiredJournal) -> Result<(), Refusal> {
+    pub fn record_journal(&mut self, journal: RetiredJournal<'table>) -> Result<(), Refusal> {
         if journal.identity != self.identity || self.journal.is_some() {
             return Err(Refusal::Stale);
         }
         self.journal = Some(journal);
         Ok(())
     }
-    pub fn record_release(&mut self, release: JournalRelease) -> Result<(), Refusal> {
-        if release.identity != self.identity || self.release.is_some() {
+    pub fn record_release(&mut self, release: JournalRelease<'table>) -> Result<(), Refusal> {
+        if release.identity != self.identity
+            || !release.receipt.issued_by(&self.origin)
+            || self.release.is_some()
+        {
             return Err(Refusal::Stale);
         }
         self.release = Some(release);
@@ -254,6 +274,9 @@ impl RetiredJournalJoin {
         &mut self,
         table: &SharedReservations<P, G>,
     ) -> Option<usize> {
+        if !core::ptr::eq(self.identity.table, &table.layout_hash) {
+            return None;
+        }
         self.release.as_ref()?;
         let journal = self.journal.take()?;
         self.release.take();
@@ -681,7 +704,10 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         this
     }
 
-    fn acknowledge_retired_journal(&self, journal: RetiredJournal) -> usize {
+    fn acknowledge_retired_journal(&self, journal: RetiredJournal<'_>) -> usize {
+        if !core::ptr::eq(journal.identity.table, &self.layout_hash) {
+            return 0;
+        }
         let mut released = 0;
         for identity in journal.slots.into_iter().flatten() {
             let slot = &self.deferred[identity.index];
@@ -1118,10 +1144,11 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
 /// The host and guest translate this same offset, never persist either venue's
 /// pointer. The carrier owns the zeroed region throughout every borrowed view.
 impl<
+    'a,
     Policy: ReservationPolicy,
     Geometry: ReservationGeometry,
     C: Copy + Send + Sync + zerocopy::FromZeros,
-> Reservations<'_, Policy, Geometry, C>
+> Reservations<'a, Policy, Geometry, C>
 {
     fn state(&self) -> &State {
         unsafe { (&*self.root.state.get()).assume_init_ref() }
@@ -2861,8 +2888,9 @@ impl<
     }
     /// Identity captured by carrier custody before a root can be borrowed or
     /// retired. The release receipt must name this exact incarnation.
-    pub fn journal_identity(&self) -> JournalIdentity {
+    pub fn journal_identity(&self) -> JournalIdentity<'a> {
         JournalIdentity {
+            table: &self.table.layout_hash,
             mm: self.mm,
             root: self.index(),
             incarnation: self.incarnation,
@@ -2927,7 +2955,7 @@ impl<
     /// BEFORE its descriptor step, so the commit after that step cannot
     /// fail for lack of room. `Busy` when this root's share or the table is
     /// full: the retirement is then forwarded and the host drains first.
-    pub fn reserve_return(&mut self, range: ReservationRange) -> Result<ReturnSlot, Refusal> {
+    pub fn reserve_return(&mut self, range: ReservationRange) -> Result<ReturnSlot<'a>, Refusal> {
         let mm = self.mm.raw();
         loop {
             let (index, merge) = self.deferred_slot_for(range).ok_or(Refusal::Busy)?;
@@ -2959,7 +2987,7 @@ impl<
             }
         }
     }
-    fn authenticates_return_slot(&self, slot: &ReturnSlot) -> bool {
+    fn authenticates_return_slot(&self, slot: &ReturnSlot<'_>) -> bool {
         slot.identity == self.journal_identity()
             && self.owns_deferred_slot(&self.table.deferred[slot.index])
             && self.table.deferred[slot.index]
@@ -2968,7 +2996,7 @@ impl<
                 == slot.epoch
     }
     /// Give back a reservation whose retirement was not committed.
-    pub fn release_return(&mut self, slot: ReturnSlot) {
+    pub fn release_return(&mut self, slot: ReturnSlot<'_>) {
         let entry = &self.table.deferred[slot.index];
         if !slot.merge && self.authenticates_return_slot(&slot) {
             entry.free();
@@ -3011,7 +3039,7 @@ impl<
     pub fn complete_deferring_return(
         &mut self,
         completion: ReservationCompletion,
-        slot: ReturnSlot,
+        slot: ReturnSlot<'_>,
     ) -> Result<u64, Refusal> {
         let request = match self.pending() {
             Some(request)
@@ -3629,7 +3657,7 @@ impl<
     /// Unlike ordinary retirement (also used for fork rollback), this consumes
     /// deferred returns because the entire MM is being destroyed. Refusal
     /// preserves the journal, so a still-borrowed root can be retried safely.
-    pub fn retire_final(mut self) -> Result<RetiredJournal, Refusal> {
+    pub fn retire_final(mut self) -> Result<RetiredJournal<'a>, Refusal> {
         self.reap_prepared();
         if self.has_prepared_copy() || self.pending().is_some() || self.state().fork_pending {
             return Err(Refusal::Busy);

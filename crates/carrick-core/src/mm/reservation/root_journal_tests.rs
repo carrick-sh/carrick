@@ -1,6 +1,6 @@
 // The physical release itself is represented by the VM-free release authority;
 // production custody wiring and retention of retired-owed slots land in 2b.
-fn journal_release(identity: JournalIdentity, revision: u64) -> JournalRelease {
+fn journal_release<'a>(identity: JournalIdentity<'a>, revision: u64, origin: &FrameInventoryOrigin) -> JournalRelease<'a> {
     let id = |raw| core::num::NonZeroU64::new(raw).unwrap();
     let owner = FrameInventoryReceiptOwner::GuestMm {
         native_mm: carrick_guest_arch::MmGeneration::new(id(identity.mm().raw())),
@@ -10,7 +10,7 @@ fn journal_release(identity: JournalIdentity, revision: u64) -> JournalRelease {
     };
     let retirement = FrameInventoryRetirementReceipt::from_kernel_authority(
         FrameInventoryApplyReceipt::from_kernel_authority(
-            Default::default(),
+            origin.clone(),
             FrameInventoryProvenance::from_kernel_entropy([4; 32]),
             KernelTransactionId::from_kernel_allocation(id(1)),
             owner,
@@ -57,14 +57,15 @@ fn journal_owed(root: &mut Reservations<'_>) {
 
 #[test]
 fn retired_journal_release_before_borrowed_root_retirement_joins_once() {
+    let origin = FrameInventoryOrigin::default();
     let table = table();
     let mut root = admitted(&table, 0, 41);
     journal_owed(&mut root);
     let identity = root.journal_identity();
-    let mut join = RetiredJournalJoin::new(identity);
+    let mut join = RetiredJournalJoin::new(identity, origin.clone());
     // Models the authenticated whole-MM physical release arriving
     // while the reservation root is still borrowed by this guard.
-    join.record_release(journal_release(identity, 17)).unwrap();
+    join.record_release(journal_release(identity, 17, &origin)).unwrap();
     assert_eq!(join.acknowledge(&table), None);
     assert_eq!(root.deferred().count(), 1);
     let journal = root.retire_final().unwrap();
@@ -78,6 +79,7 @@ fn retired_journal_release_before_borrowed_root_retirement_joins_once() {
 
 #[test]
 fn retired_journal_recycled_slots_and_same_raw_mm_do_not_touch_successor() {
+    let origin = FrameInventoryOrigin::default();
     let table = table();
     let mut root = admitted(&table, 0, 41);
     journal_owed(&mut root);
@@ -90,11 +92,11 @@ fn retired_journal_recycled_slots_and_same_raw_mm_do_not_touch_successor() {
     assert_ne!(old_identity, new_identity);
     let next = &table.deferred[old_slot.index];
     assert_ne!(next.epoch.load(Ordering::Relaxed), old_slot.epoch);
-    let mut join = RetiredJournalJoin::new(old_identity);
+    let mut join = RetiredJournalJoin::new(old_identity, origin.clone());
     join.record_journal(journal).unwrap();
     assert_eq!(join.acknowledge(&table), None);
     // Models a late release of the predecessor, not the successor.
-    join.record_release(journal_release(old_identity, 18))
+    join.record_release(journal_release(old_identity, 18, &origin))
         .unwrap();
     assert_eq!(join.acknowledge(&table), Some(0));
     assert_eq!(successor.deferred().count(), 1);
@@ -104,10 +106,10 @@ fn retired_journal_recycled_slots_and_same_raw_mm_do_not_touch_successor() {
         new_identity.incarnation(),
         "incarnations are unique even across root indices"
     );
-    let mut mismatched = RetiredJournalJoin::new(new_identity);
+    let mut mismatched = RetiredJournalJoin::new(new_identity, origin.clone());
     // Models a real release proof belonging to the old root only.
     assert_eq!(
-        mismatched.record_release(journal_release(old_identity, 19)),
+        mismatched.record_release(journal_release(old_identity, 19, &origin)),
         Err(Refusal::Stale)
     );
     assert_eq!(successor.deferred().count(), 1);
@@ -136,13 +138,14 @@ fn return_slot_cannot_release_reused_raw_mm_incarnation() {
 
 #[test]
 fn journal_receipt_cannot_cross_same_mm_roots_at_equal_local_epochs() {
+    let origin = FrameInventoryOrigin::default();
     let table = table();
     let first = admitted(&table, 0, 41);
     let second = admitted(&table, 1, 41);
     let first_identity = first.journal_identity();
     let second_identity = second.journal_identity();
     assert_ne!(first_identity.incarnation(), second_identity.incarnation());
-    let release = journal_release(first_identity, 23);
+    let release = journal_release(first_identity, 23, &origin);
     assert!(matches!(
         JournalRelease::from_mm_release(second_identity, release.receipt),
         Err(Refusal::Stale)
@@ -157,4 +160,56 @@ fn journal_incarnation_exhaustion_does_not_publish_a_root() {
     assert_eq!(table.publish(0, mm, layout()), Err(Refusal::Stale));
     assert_eq!(table.lock(0, mm).err(), Some(Refusal::Stale));
     assert_eq!(table.roots[0].key.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn return_tokens_cannot_cross_tables_with_identical_numeric_ids() {
+    let first = table();
+    let second = table();
+    let mut a = admitted(&first, 0, 41);
+    let mut b = admitted(&second, 0, 41);
+    let span = range(0x200000, 0x201000);
+    let foreign = a.reserve_return(span).unwrap();
+    let local = b.reserve_return(span).unwrap();
+    b.release_return(foreign);
+    assert!(b.authenticates_return_slot(&local));
+    b.release_return(local);
+}
+
+#[test]
+fn journal_join_preserves_proofs_when_given_another_table() {
+    let origin = FrameInventoryOrigin::default();
+    let first = table();
+    let second = table();
+    let mut a = admitted(&first, 0, 41);
+    let mut b = admitted(&second, 0, 41);
+    journal_owed(&mut a);
+    journal_owed(&mut b);
+    let identity = a.journal_identity();
+    let mut join = RetiredJournalJoin::new(identity, origin.clone());
+    join.record_journal(a.retire_final().unwrap()).unwrap();
+    join.record_release(journal_release(identity, 29, &origin)).unwrap();
+    assert_eq!(join.acknowledge(&second), None);
+    assert_eq!(b.deferred().count(), 1);
+    // 2a keeps eager clearing; the matching join consumes its proofs once.
+    assert_eq!(join.acknowledge(&first), Some(0));
+    assert_eq!(join.acknowledge(&first), None);
+}
+
+#[test]
+fn journal_join_rejects_foreign_inventory_with_same_numeric_owner() {
+    let origin = FrameInventoryOrigin::default();
+    let table = table();
+    let mut root = admitted(&table, 0, 41);
+    journal_owed(&mut root);
+    let identity = root.journal_identity();
+    let mut join = RetiredJournalJoin::new(identity, origin.clone());
+    join.record_journal(root.retire_final().unwrap()).unwrap();
+    assert_eq!(
+        join.record_release(journal_release(identity, 29, &FrameInventoryOrigin::default())),
+        Err(Refusal::Stale)
+    );
+    assert_eq!(join.acknowledge(&table), None);
+    join.record_release(journal_release(identity, 29, &origin)).unwrap();
+    assert_eq!(join.acknowledge(&table), Some(0));
 }
