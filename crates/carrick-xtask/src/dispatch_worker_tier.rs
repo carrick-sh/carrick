@@ -115,6 +115,10 @@ fn decision(tier: WorkerTier, reason: String) -> TierDecision {
 /// no effort, so it runs at the launcher's default), any Claude Opus model,
 /// or Claude Sonnet at high effort. Gemini and the smaller open models are
 /// the fast instruction-following tier.
+///
+/// Through Copilot (#1474) only Claude Opus counts: it is the same model
+/// agy serves. Copilot's Sonnet ids carry no effort, and its GPT roster
+/// mixes small models with Codex ones, so neither is admitted here.
 pub(crate) fn strong_model(backend: &str, model: &str) -> bool {
     match backend {
         "codex" => !model.is_empty(),
@@ -122,16 +126,29 @@ pub(crate) fn strong_model(backend: &str, model: &str) -> bool {
             model.starts_with("claude-opus-")
                 || (model.starts_with("claude-sonnet-") && model.ends_with("-high"))
         }
+        "copilot" => model.starts_with("claude-opus-"),
         _ => false,
     }
 }
+/// The strong tier's models, as the coordinator and refusals name them.
+const STRONG_MODELS: &str = "any Codex model, any Claude Opus model (on agy or Copilot), or Claude Sonnet at high effort on agy";
+/// Owner policy (#231): Copilot bills the owner personally, so it is a
+/// strong-tier peer backend, usable on any strong round (Claude Opus only)
+/// and never on a standard one.
+const COPILOT: &str = "copilot";
 
 impl TierDecision {
     /// Refuse a worker outside the tier.
     pub(crate) fn admits(&self, backend: &str, model: &str) -> Result<(), ScalerError> {
+        if self.tier == WorkerTier::Standard && backend == COPILOT {
+            return Err(ScalerError::Usage(format!(
+                "this round's worker tier is standard ({}); Copilot is billed to the owner and serves strong-tier rounds only. Use a Codex or agy worker.",
+                self.reason
+            )));
+        }
         if self.tier == WorkerTier::Strong && !strong_model(backend, model) {
             return Err(ScalerError::Usage(format!(
-                "this round's worker tier is strong ({}); `{backend}` `{model}` is not a strong-tier model. Strong-tier models: any Codex model, any Claude Opus model, Claude Sonnet at high effort.",
+                "this round's worker tier is strong ({}); `{backend}` `{model}` is not a strong-tier model. Strong-tier models: {STRONG_MODELS}.",
                 self.reason
             )));
         }
@@ -145,7 +162,8 @@ impl TierDecision {
         };
         let positive = |v: &Value| v.as_f64().is_some_and(|v| v.is_finite() && v > 0.0);
         backends.iter().any(|(backend, entry)| {
-            entry["installed"] == true
+            (self.tier == WorkerTier::Strong || backend != COPILOT)
+                && entry["installed"] == true
                 && positive(&entry["free_slots"])
                 && positive(&entry["quota_free"])
                 && entry["models"].as_array().is_some_and(|models| {
@@ -162,8 +180,8 @@ impl TierDecision {
             "tier": match self.tier { WorkerTier::Standard => "standard", WorkerTier::Strong => "strong" },
             "reason": self.reason,
             "admits": match self.tier {
-                WorkerTier::Standard => "any worker the capacity report offers",
-                WorkerTier::Strong => "any Codex model, any Claude Opus model, or Claude Sonnet at high effort; invoke_worker refuses other models",
+                WorkerTier::Standard => "any Codex or agy worker the capacity report offers; never Copilot, which serves strong-tier rounds only".to_owned(),
+                WorkerTier::Strong => format!("{STRONG_MODELS}; invoke_worker refuses other models"),
             },
         })
     }
@@ -255,6 +273,80 @@ mod tests {
         assert!(!strong.available(&report(json!(["claude-opus-5-5-high"]), 0.0)));
         assert!(
             decide("docs", "", "", &[]).available(&report(json!(["gemini-4-argon-high"]), 2.0))
+        );
+    }
+
+    /// #1474: on a strong round Copilot counts only through Claude Opus,
+    /// the model agy and the owner already rank strong. Copilot's Sonnet (no
+    /// effort is set), GPT (its roster mixes small models with Codex ones)
+    /// and other vendors stay out.
+    #[test]
+    fn a_strong_round_admits_copilot_only_through_claude_opus() {
+        let strong = decide("x", "carrick-kernel", "", &[]);
+        assert!(strong.admits("copilot", "claude-opus-5.5").is_ok());
+        assert!(strong.admits("copilot", "claude-opus-5").is_ok());
+        for model in [
+            "claude-sonnet-5.5",
+            "claude-haiku-5.5",
+            "claude-fable-5.1",
+            "gpt-6.1-sol",
+            "gpt-5-mini",
+            "grok-4.7",
+            "",
+        ] {
+            assert!(strong.admits("copilot", model).is_err(), "{model}");
+        }
+        assert!(
+            strong.fact()["admits"]
+                .as_str()
+                .unwrap()
+                .contains("Copilot")
+        );
+        let report = json!({"backends":{"codex":{"installed":true,"free_slots":0,"quota_free":0.0,
+            "score":0.0,"models":["gpt-6.1-sol"]},
+            "copilot":{"installed":true,"free_slots":2,"quota_free":1.0,"score":1.0,
+            "models":["claude-sonnet-5.5","claude-opus-5.5"]}}});
+        assert!(strong.available(&report));
+        let mut sonnet_only = report.clone();
+        sonnet_only["backends"]["copilot"]["models"] = json!(["claude-sonnet-5.5"]);
+        assert!(!strong.available(&sonnet_only));
+    }
+
+    /// Owner policy (#231, #1474): Copilot, billed to the owner, is a
+    /// strong-tier peer backend. A standard round never uses it, whatever
+    /// the model; a strong round may pick Copilot Claude Opus even while
+    /// Codex has free slots.
+    #[test]
+    fn copilot_serves_strong_rounds_only() {
+        let standard = decide("docs", "", "", &[]);
+        for model in ["claude-opus-5.5", "claude-sonnet-5.5", "gpt-6.1-sol"] {
+            let error = standard.admits("copilot", model).unwrap_err().to_string();
+            assert!(error.contains("strong-tier"), "{model}: {error}");
+        }
+        assert!(standard.admits("codex", "gpt-6.1-sol").is_ok());
+        let copilot_only = json!({"backends":{"copilot":{"installed":true,"free_slots":2,
+            "quota_free":1.0,"score":1.0,"models":["claude-opus-5.5","gpt-6.1-sol"]}}});
+        assert!(
+            !standard.available(&copilot_only),
+            "a standard round counted Copilot"
+        );
+        assert!(
+            standard.fact()["admits"]
+                .as_str()
+                .unwrap()
+                .contains("never Copilot")
+        );
+        let strong = decide("x", "carrick-kernel", "", &[]);
+        assert!(strong.admits("copilot", "claude-opus-5.5").is_ok());
+        let both = json!({"backends":{
+            "codex":{"installed":true,"free_slots":2,"quota_free":1.0,"score":1.0,"models":["gpt-6.1-sol"]},
+            "copilot":{"installed":true,"free_slots":2,"quota_free":1.0,"score":1.0,"models":["claude-opus-5.5"]}}});
+        assert!(strong.available(&both));
+        assert!(
+            !strong.fact()["admits"]
+                .as_str()
+                .unwrap()
+                .contains("fallback")
         );
     }
 }

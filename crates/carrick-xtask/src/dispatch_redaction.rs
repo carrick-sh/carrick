@@ -53,6 +53,34 @@ impl DiagnosticSecrets {
             _ => {}
         }
     }
+    /// Every credential file under the runner's agent `state`, by exact value.
+    fn state_files(&mut self, state: &std::path::Path) -> Result<(), ScalerError> {
+        for path in [
+            "redaction-secrets.json",
+            "home/.codex/auth.json",
+            "home/.gemini/antigravity-cli/antigravity-oauth-token",
+            "loop-home/.gemini/antigravity-cli/antigravity-oauth-token",
+            // The owner's Copilot PAT (#1474).
+            "home/.copilot-dispatch/token",
+        ] {
+            let path = state.join(path);
+            match std::fs::symlink_metadata(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+                Ok(meta) if meta.is_file() && meta.len() <= MAX_FILE_BYTES => {}
+                _ => return Err(ScalerError::Guard(REFUSAL)),
+            }
+            let value = std::fs::read_to_string(&path)?;
+            if path.ends_with("redaction-secrets.json") {
+                self.json_values(
+                    &serde_json::from_str(&value).map_err(|_| ScalerError::Guard(REFUSAL))?,
+                );
+            } else {
+                self.add(&value);
+            }
+        }
+        Ok(())
+    }
     /// Capture once before agent execution, never from agent-modified state.
     pub(crate) fn capture() -> Result<Self, ScalerError> {
         let mut gate = Self { secrets: vec![] };
@@ -72,28 +100,7 @@ impl DiagnosticSecrets {
             gate.add(&value);
         }
         if let Ok(state) = crate::agent_runner::state() {
-            for path in [
-                "redaction-secrets.json",
-                "home/.codex/auth.json",
-                "home/.gemini/antigravity-cli/antigravity-oauth-token",
-                "loop-home/.gemini/antigravity-cli/antigravity-oauth-token",
-            ] {
-                let path = state.join(path);
-                match std::fs::symlink_metadata(&path) {
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(e) => return Err(e.into()),
-                    Ok(meta) if meta.is_file() && meta.len() <= MAX_FILE_BYTES => {}
-                    _ => return Err(ScalerError::Guard(REFUSAL)),
-                }
-                let value = std::fs::read_to_string(&path)?;
-                if path.ends_with("redaction-secrets.json") {
-                    gate.json_values(
-                        &serde_json::from_str(&value).map_err(|_| ScalerError::Guard(REFUSAL))?,
-                    );
-                } else {
-                    gate.add(&value);
-                }
-            }
+            gate.state_files(&state)?;
         }
         Ok(gate)
     }
@@ -181,6 +188,30 @@ mod tests {
                 .is_ok()
         );
         Ok(())
+    }
+    /// #1474: the Copilot PAT is redacted by its exact value, not only by
+    /// its `github_pat_` shape.
+    #[test]
+    fn the_copilot_token_file_is_redacted_by_value() {
+        let state = tempfile::tempdir().unwrap();
+        let token = state.path().join("home/.copilot-dispatch/token");
+        std::fs::create_dir_all(token.parent().unwrap()).unwrap();
+        let secret = "github_pat_11FIXTURE_copilotOnlyValue0123";
+        std::fs::write(&token, secret).unwrap();
+        let mut gate = super::DiagnosticSecrets { secrets: vec![] };
+        gate.state_files(state.path()).unwrap();
+        assert!(
+            gate.secrets.iter().any(|s| s == secret),
+            "not captured by value"
+        );
+        let text = format!("worker said {secret} once");
+        assert!(gate.check(text.as_bytes()).is_err());
+        assert!(!gate.diagnostic(text.as_bytes()).contains(secret));
+        // Without the file, nothing is captured by value.
+        let empty = tempfile::tempdir().unwrap();
+        let mut none = super::DiagnosticSecrets { secrets: vec![] };
+        none.state_files(empty.path()).unwrap();
+        assert!(none.secrets.is_empty());
     }
     #[test]
     fn credential_shapes_are_removed_from_diagnostics() {

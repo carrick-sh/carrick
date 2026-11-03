@@ -74,6 +74,9 @@ sccache_sha256=45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89
 rustup_sha256=dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71
 gh_version=2.102.0
 gh_sha256=bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386
+# The Copilot runtime the pinned github-copilot-sdk 1.0.22 drives (#1474).
+copilot_runtime_version=1.0.98
+copilot_runtime_sha256=a4f5ffe9ca28886ca9b1f8901699a3a45650265dbb473cc175772cbfc7b88a8f
 curl -fSL --retry 2 "$image_url" -o "$image"
 printf '%s  %s\n' "$image_sha512" "$image" | sha512sum -c -
 curl -fSL "https://github.com/actions/runner/releases/download/v${runner_version}/actions-runner-linux-x64-${runner_version}.tar.gz" -o seed/runner.tar.gz
@@ -84,11 +87,21 @@ curl -fSL https://static.rust-lang.org/rustup/archive/1.29.1/x86_64-unknown-linu
 printf '%s  %s\n' "$rustup_sha256" seed/rustup-init | sha256sum -c -
 curl -fSL "https://github.com/cli/cli/releases/download/v${gh_version}/gh_${gh_version}_linux_amd64.tar.gz" -o seed/gh.tar.gz
 printf '%s  %s\n' "$gh_sha256" seed/gh.tar.gz | sha256sum -c -
+copilot_runtime=github-copilot-${copilot_runtime_version}-linux-x64.tgz
+mkdir -p "seed/copilot-release/v${copilot_runtime_version}"
+curl -fSL "https://github.com/github/copilot-cli/releases/download/v${copilot_runtime_version}/${copilot_runtime}" \
+  -o "seed/copilot-release/v${copilot_runtime_version}/${copilot_runtime}"
+# Pinned here, not taken from the release's own SHA256SUMS.txt; the SDK then
+# reads this one-line sums file, so it installs exactly the pinned bytes.
+printf '%s  %s\n' "$copilot_runtime_sha256" "$copilot_runtime" \
+  > "seed/copilot-release/v${copilot_runtime_version}/SHA256SUMS.txt"
+(cd "seed/copilot-release/v${copilot_runtime_version}" && sha256sum -c SHA256SUMS.txt)
 cp "$xtask" seed/carrick-xtask
 cp "$inputs/rust-toolchain.toml" "$inputs/Cargo.lock" seed/
 cp "$inputs/scripts/ci/runner-once.sh" seed/
 cp "$inputs/scripts/ci/admit-job.sh" seed/
 cp "$inputs/scripts/ci/inputs/codex-sdk-requirements.txt" seed/
+cp "$inputs/scripts/ci/inputs/copilot-sdk-requirements.txt" seed/
 printf '%s\n' "$profile" > seed/profile
 printf '%s\n' "$gh_version" > seed/gh-version
 cat > seed/meta-data <<DATA
@@ -151,6 +164,16 @@ if [[ $(cat profile) == agent ]]; then
   /opt/carrick-agent/codex-sdk/bin/pip install --quiet --disable-pip-version-check \
     --no-deps --only-binary=:all: --require-hashes -r codex-sdk-requirements.txt
   sed -n 's/^openai-codex==\([^ ]*\) .*/\1/p' codex-sdk-requirements.txt > /opt/carrick-agent/codex-sdk/.agy-director-sdk
+  # The Copilot fallback worker's SDK (#1474), the same way, plus the runtime
+  # it drives, extracted once here from the seed's hash-pinned asset.
+  # Workers set COPILOT_SKIP_CLI_DOWNLOAD, so no job downloads a runtime.
+  python3 -m venv /opt/carrick-agent/copilot-sdk
+  /opt/carrick-agent/copilot-sdk/bin/pip install --quiet --disable-pip-version-check \
+    --no-deps --only-binary=:all: --require-hashes -r copilot-sdk-requirements.txt
+  COPILOT_CLI_EXTRACT_DIR=/opt/carrick-agent/copilot-runtime \
+    COPILOT_CLI_DOWNLOAD_BASE_URL=file:///mnt/carrick-seed/copilot-release \
+    /opt/carrick-agent/copilot-sdk/bin/python -m copilot download-runtime
+  sed -n 's/^github-copilot-sdk==\([^ ]*\) .*/\1/p' copilot-sdk-requirements.txt > /opt/carrick-agent/copilot-sdk/.agy-director-sdk
   chmod -R a+rX,go-w /opt/carrick-agent
 fi
 install -m 755 carrick-xtask /usr/local/bin/carrick-xtask

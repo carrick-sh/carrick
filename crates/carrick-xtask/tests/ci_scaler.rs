@@ -1352,6 +1352,56 @@ fn agent_template_profile_preserves_hardening_without_root_sudo() {
     assert!(!source.contains("rm -f /etc/sudoers.d/carrick-dispatch-agent"));
 }
 
+/// #1474: the Copilot fallback worker runs from a prebuilt, hash-locked SDK
+/// and a runtime extracted at template build; no job installs either, and
+/// the version marker matches the launcher's pinned `COPILOT_SDK_VERSION`.
+#[test]
+fn agent_template_prebuilds_the_hash_locked_copilot_sdk_and_runtime() {
+    let builder = include_str!("../../../scripts/ci/build-template-debian.sh");
+    let venv = carrick_xtask::dispatch_worker::COPILOT_SDK_VENV;
+    let runtime = carrick_xtask::dispatch_worker::COPILOT_RUNTIME_DIR;
+    assert!(builder.contains(&format!("python3 -m venv {venv}\n")));
+    assert!(builder.contains(
+        "--no-deps --only-binary=:all: --require-hashes -r copilot-sdk-requirements.txt"
+    ));
+    assert!(builder.contains(&format!("COPILOT_CLI_EXTRACT_DIR={runtime} \\\n")));
+    assert!(builder.contains(&format!("{venv}/bin/python -m copilot download-runtime")));
+    // The runtime comes from the seed, checked against a hash pinned in this
+    // repository, never against the release's own SHA256SUMS.txt.
+    assert!(
+        builder.contains("COPILOT_CLI_DOWNLOAD_BASE_URL=file:///mnt/carrick-seed/copilot-release")
+    );
+    assert!(builder.contains(
+        "copilot_runtime_sha256=a4f5ffe9ca28886ca9b1f8901699a3a45650265dbb473cc175772cbfc7b88a8f\n"
+    ));
+    assert!(builder.contains("sha256sum -c SHA256SUMS.txt"));
+    assert!(builder.contains(&format!("> {venv}/.agy-director-sdk")));
+    assert!(
+        builder.contains("cp \"$inputs/scripts/ci/inputs/copilot-sdk-requirements.txt\" seed/")
+    );
+    let requirements = include_str!("../../../scripts/ci/inputs/copilot-sdk-requirements.txt");
+    assert!(
+        requirements
+            .lines()
+            .any(|line| line.starts_with("github-copilot-sdk==1.0.22 "))
+    );
+    for line in requirements.lines() {
+        let (pin, hash) = line.split_once(" --hash=sha256:").unwrap();
+        assert!(
+            pin.split_once("==")
+                .is_some_and(|(n, v)| !n.is_empty() && !v.is_empty()),
+            "{line}"
+        );
+        assert!(
+            hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{line}"
+        );
+    }
+    let driver = include_str!("../src/dispatch_worker.rs");
+    assert!(driver.contains(".env(\"AGY_DIRECTOR_COPILOT_VENV\", COPILOT_SDK_VENV)"));
+    assert!(driver.contains(".env(\"COPILOT_SKIP_CLI_DOWNLOAD\", \"1\")"));
+}
+
 #[test]
 fn agent_template_prebuilds_the_hash_locked_codex_sdk_the_driver_uses() {
     // The codex tier failed live because `python3 -m venv` was unavailable
