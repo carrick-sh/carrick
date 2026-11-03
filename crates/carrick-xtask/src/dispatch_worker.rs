@@ -2978,6 +2978,12 @@ pub(crate) fn recorded_publication(
     agent_loop::RunCache::for_controller().publication(Path::new("."), pr, run, issue, branch)
 }
 
+/// Ownership is decided from facts the server holds, never from editable PR
+/// text (#1539): the dispatch-named branch binds issue and creating run, the
+/// author is the dispatch bot (or the publish App bound by the publication
+/// ledger), and head repository, base and draft state are GitHub's fields. A
+/// rewritten body, a retitle or a `Refs` instead of `Closes` does not
+/// unown the PR; the round's coordinator judges those from the facts.
 pub(crate) fn owned_pr(
     pr: &Value,
     run: &Value,
@@ -3002,14 +3008,6 @@ pub(crate) fn owned_pr(
         // ownership keeps that run's live collaborator re-check.
         && !chain_run(run)
         && dispatch_run_admitted(run, Some(issue), trusted)
-        && pr["body"].as_str().is_some_and(|body| {
-            body.lines().any(|line| line == format!("Closes #{issue}"))
-                && body.lines().any(|line| {
-                    line == format!(
-                        "Dispatch run: https://github.com/{REPOSITORY}/actions/runs/{id}"
-                    )
-                })
-        })
 }
 
 fn require_owned_pr(root: &Path, dispatch: &Dispatch) -> Result<Value, ScalerError> {
@@ -6041,8 +6039,8 @@ fn publish_commits(
                 let number = pr["number"]
                     .as_u64()
                     .ok_or(ScalerError::Guard("invalid PR number"))?;
-                // Retain the creation footer for ownership and credit this edit
-                // to the current run with the final footer.
+                // Credit this edit to the current run with the final footer;
+                // the footer is for readers, not ownership (#1539).
                 let current_run = run_id()?;
                 let body = if current_run == id {
                     body.clone()
@@ -9936,7 +9934,6 @@ fi
             "/head/ref",
             "/head/repo/full_name",
             "/base/ref",
-            "/body",
         ] {
             let mut bad = pr.clone();
             *bad.pointer_mut(pointer).unwrap() = "foreign".into();
@@ -9945,6 +9942,17 @@ fi
                 "{pointer}"
             );
         }
+        // #1539: the body is editable text, not an ownership fact.
+        let mut rewritten = pr.clone();
+        rewritten["body"] = "foreign".into();
+        assert!(owned_pr(
+            &rewritten,
+            &run,
+            634,
+            branch,
+            None,
+            &mut owner_collaborator()
+        ));
         let mut ready = pr.clone();
         ready["draft"] = false.into();
         assert!(!owned_pr(
@@ -10516,6 +10524,65 @@ fi
         assert!(validate_event(&reader, "reader", &mut fake_collaborators(PERMISSIONS)).is_err());
     }
 
+    /// #1539: ownership comes from server facts, so a director rewrite of
+    /// the body (no `Closes`, no `Dispatch run:` footer, a retitle, `Refs`)
+    /// still continues the PR; each hard gate still refuses on its own.
+    #[test]
+    fn rewritten_pr_body_continues_and_hard_gates_still_refuse() {
+        let event = review_event();
+        for body in [
+            json!("Director rewrote this body.\n\nRefs #634"),
+            json!(""),
+            Value::Null,
+        ] {
+            let mut rewritten = event.clone();
+            rewritten["pull_request"]["body"] = body.clone();
+            rewritten["pull_request"]["title"] = "retitled by the director".into();
+            let dispatch = validate_event(&rewritten, "tjfontaine", &mut owner_collaborator())
+                .unwrap_or_else(|e| panic!("body {body} refused: {e}"));
+            assert_eq!(dispatch.branch, "work/dispatch-634-42");
+            assert!(matches!(dispatch.continuation, Continuation::Owned));
+        }
+        let mut rewritten = event.clone();
+        rewritten["pull_request"]["body"] = "Refs #634".into();
+        let refused = |pointer: &str, value: Value, actor: &str| {
+            let mut bad = rewritten.clone();
+            *bad.pointer_mut(pointer).unwrap() = value;
+            validate_event(&bad, actor, &mut owner_collaborator()).is_err()
+        };
+        // Fork head.
+        assert!(refused(
+            "/pull_request/head/repo/full_name",
+            json!("outsider/carrick"),
+            "tjfontaine"
+        ));
+        // Another repository's event.
+        assert!(refused(
+            "/repository/full_name",
+            json!("outsider/carrick"),
+            "tjfontaine"
+        ));
+        // Non-owner trigger: sender, reviewer and rerun actor.
+        assert!(refused("/sender/login", json!("outsider"), "tjfontaine"));
+        assert!(refused(
+            "/review/user/login",
+            json!("outsider"),
+            "tjfontaine"
+        ));
+        assert!(validate_event(&rewritten, "outsider", &mut owner_collaborator()).is_err());
+        // Untrusted PR author, and a run the branch does not name.
+        assert!(refused(
+            "/pull_request/user/login",
+            json!("outsider"),
+            "tjfontaine"
+        ));
+        assert!(refused("/dispatch_run/id", json!(43), "tjfontaine"));
+        assert!(refused(
+            "/dispatch_run/triggering_actor/login",
+            json!("outsider"),
+            "tjfontaine"
+        ));
+    }
     #[test]
     fn agent_comment_on_an_unowned_pr_is_refused() {
         let mut event = review_event();
