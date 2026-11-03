@@ -4,10 +4,8 @@ use carrick_core::wait::OperationResumePc;
 use carrick_el1_abi::TrapFrame;
 use carrick_guest_arch::{NativeOrdinal, UserVa};
 
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
-use carrick_el1::isa::x86::context::native::NativeFrame;
-#[cfg(test)]
-use carrick_x86::cpl0_entry::NativeFrame;
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+use crate::isa::x86::context::native::NativeFrame;
 
 /// Only syscall inputs and the post-instruction PC. Scheduler context custody
 /// still owns TLS, extended registers, the stack and all nonargument GPRs.
@@ -33,6 +31,22 @@ pub trait IpcFrame {
     /// Restore inputs and select the syscall instruction, without a partial
     /// frame mutation if the snapshot cannot name a valid re-entry address.
     fn restore_ipc_reentry(&mut self, call: &Self::SavedCall) -> bool;
+
+    /// Present the original syscall instruction to a context saver, then
+    /// restore the live entry frame even when saving reports contention.
+    /// No scheduler ticket or operation token is consumed here.
+    fn with_ipc_reentry<R>(&mut self, save: impl FnOnce(&Self) -> R) -> Option<R>
+    where
+        Self: Sized,
+    {
+        let call = self.save_ipc_call();
+        if !self.restore_ipc_reentry(&call) {
+            return None;
+        }
+        let result = save(self);
+        self.restore_ipc_call(&call);
+        Some(result)
+    }
 }
 
 impl IpcFrame for TrapFrame {
@@ -52,13 +66,13 @@ impl IpcFrame for TrapFrame {
         self.elr = call.return_pc.raw();
     }
     fn ipc_reentry_pc(&self) -> Option<OperationResumePc> {
-        OperationResumePc::new(self.elr.checked_sub(super::linux::SVC_LEN)?)
+        OperationResumePc::new(self.elr.checked_sub(4)?)
     }
     fn restore_ipc_reentry(&mut self, call: &Self::SavedCall) -> bool {
         let Some(pc) = call
             .return_pc
             .raw()
-            .checked_sub(super::linux::SVC_LEN)
+            .checked_sub(4)
             .and_then(OperationResumePc::new)
         else {
             return false;
@@ -109,6 +123,38 @@ mod tests {
     use super::IpcFrame;
     use super::NativeFrame;
     use carrick_el1_abi::TrapFrame;
+
+    #[test]
+    fn reentry_transport_restores_live_inputs_after_failed_context_save() {
+        let mut frame = NativeFrame {
+            rax: 0,
+            rdi: 3,
+            rsi: 0x4000,
+            rdx: 9,
+            rcx: 0x1003,
+            user_rcx: 0xcccc,
+            ..NativeFrame::default()
+        };
+        let result = frame.with_ipc_reentry(|saved| {
+            assert_eq!(
+                (saved.rax, saved.rdi, saved.rsi, saved.rdx),
+                (0, 3, 0x4000, 9)
+            );
+            assert_eq!((saved.rcx, saved.user_rcx), (0x1001, 0xcccc));
+            Err::<(), _>(carrick_sched_core::object_wait::ObjectWaitError::Busy)
+        });
+        assert_eq!(
+            result,
+            Some(Err(carrick_sched_core::object_wait::ObjectWaitError::Busy))
+        );
+        assert_eq!((frame.rax, frame.rdi, frame.rcx), (0, 3, 0x1003));
+        frame.rcx = 1;
+        assert_eq!(
+            frame.with_ipc_reentry(|_| panic!("invalid PC must not save context")),
+            None::<()>
+        );
+        assert_eq!(frame.rcx, 1);
+    }
 
     #[test]
     fn arm_reentry_restores_inputs_and_rewinds_svc_once() {

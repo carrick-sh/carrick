@@ -35,9 +35,9 @@
 //!   other argument register is untouched, and the record says what to do
 //!   ([`IpcHandback`]) and carries the original `x0` and syscall number.
 
-use self::frame::IpcFrame;
 use super::sched::{Sched, Served, ThreadCpu, UserWord};
 use carrick_el1::substrate::file::UserCopy;
+use carrick_el1::substrate::ipc::frame::IpcFrame;
 use carrick_el1::substrate::ipc::{
     PrefixCopy, StepStatus, from_sched_token, to_sched_token, transfer, wait_key,
 };
@@ -67,13 +67,10 @@ mod linux {
     pub const MAX_RW_COUNT: u64 = 0x7fff_f000;
     /// eventfd reads and writes move one native-endian u64.
     pub const EVENTFD_WORD: u64 = 8;
-    /// Length of the AArch64 SVC instruction ELR points past.
-    pub const SVC_LEN: u64 = 4;
 }
 pub use linux::{SYS_READ, SYS_WRITE};
 
 mod epoll;
-pub mod frame;
 pub use epoll::SYS_EPOLL_PWAIT;
 
 /// Where the venue finds a task's descriptor table in the shared authority.
@@ -1243,7 +1240,17 @@ fn park_key<C: ThreadCpu, U: UserWord>(
         Ok(t) => t,
         Err(token) => return Parked::Refused(token),
     };
-    match sched.park_object(frame, key, snap, resume, sched_token, deadline) {
+    // Save the syscall's re-entry inputs through the neutral frame transport.
+    // The live entry is restored before consuming a park ticket or retrying
+    // Changed, so repeated attempts cannot rewind the instruction twice.
+    let Some(parked) = frame.with_ipc_reentry(|saved| {
+        sched.park_object(saved, key, snap, resume, sched_token, deadline)
+    }) else {
+        // The same frame was validated above; it cannot change between the
+        // validation and this local save (there is no scheduling boundary).
+        crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding);
+    };
+    match parked {
         Ok(parked) => {
             // Enrollment precedes the single pending-signal probe. A signal
             // before enrollment is seen here; a later one owns queue intake.

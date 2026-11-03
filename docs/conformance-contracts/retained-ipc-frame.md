@@ -5,7 +5,8 @@ with its original syscall inputs and retained operation token before looking
 up the numeric descriptor. Linux pipe blocking semantics remain the authority;
 frame restoration is only one component of this obligation.
 
-`ipc::frame::IpcFrame` separates syscall register mechanics from IPC ownership.
+`carrick_el1::substrate::ipc::frame::IpcFrame` separates syscall register
+mechanics from IPC ownership.
 Its bounded snapshot contains six argument words, the native syscall number
 and the post-instruction PC. It does not duplicate the scheduler's custody of
 TLS, extended state, nonargument registers or the user stack. ARM selects the
@@ -16,8 +17,15 @@ return PC in `rcx`, using the existing unaligned-PC constructor. The distinct
 the snapshot so repeated restoration does not rewind another instruction.
 Invalid re-entry leaves the live frame unchanged.
 
-The production ARM IPC park calls the same adapter. The frame tests compile
-the production x86 frame definition on the host; they prove register mechanics,
+The neutral `with_ipc_reentry` transport presents the instruction address to
+the context saver and restores the live entry afterward, including when the
+saver returns Busy or Changed. Invalid re-entry never calls the saver. It
+copies only the fixed syscall snapshot; it neither clones a machine context
+nor owns a descriptor, queue ticket or operation token. The production ARM
+IPC park uses this transport before consuming the park result.
+
+The frame tests compile the production x86 frame definition on the host;
+they prove register mechanics,
 not instruction execution, scheduling, endpoint retention or copyout supply.
 No descriptor lookup, syscall routing, copy cursor or wait queue policy changes
 in this prerequisite. Each save/restore copies a fixed eight words.
@@ -26,8 +34,8 @@ The requested x86 blocking pipe-read witness is still missing: its production
 entry passes neither a scheduler venue nor an IPC venue, while the existing
 IPC scheduler transport carries `Aarch64ParkedContext`. The frame adapter alone
 does not authorize replacing either with another ISA's context or claiming an
-in-ring read. A common continuation transport and the real x86 IPC venue,
-followed by a red-first KVM park/write/wake witness, remain necessary.
+in-ring read. A common scheduler continuation transport and the real x86 IPC
+venue, followed by a red-first KVM park/write/wake witness, remain necessary.
 
 The adapter's behavioural negative control replaces ARM's four-byte rewind
 with eight bytes and x86's two-byte rewind with four bytes. The focused frame

@@ -4,6 +4,8 @@
 //! an object lock. No syscall numbers, errno values or flag decoding live
 //! here; the Linux adapter (`personality::ipc`) decides what a step means.
 
+pub mod frame;
+
 use crate::substrate::file::UserCopy;
 use carrick_el1_abi::ipc::pipe::{self, WaitFor, WakeSet};
 use carrick_el1_abi::ipc::{
