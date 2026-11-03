@@ -17,6 +17,8 @@ permissions:
   actions: read
 
 env:
+  # Census output is opt-in for users; CI always retains refusal evidence.
+  CARRICK_EL1_CENSUS: ${{ github.workspace }}/target/carrick-census
   CARGO_TERM_COLOR: always
   # Harden registry transport against intermittent network errors without retrying tests.
   CARGO_HTTP_MULTIPLEXING: "false"   # avoid HTTP/2 framing failures against the crates.io index
