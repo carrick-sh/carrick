@@ -353,7 +353,10 @@ root_only! {
 /// Consult the same owner as native entry, retaining only enumerated root debt.
 /// No task class is supplied to service_owner. The compatibility token is local
 /// to this old host resolver; it cannot grant a child access to host task state.
-pub(super) fn resolve<T>(number: u64, legacy: impl FnOnce() -> Option<T>) -> Option<T> {
+pub(in crate::dispatch) fn resolve<T>(
+    number: u64,
+    legacy: impl FnOnce() -> Option<T>,
+) -> Option<T> {
     match service_owner(CanonicalNr::new(number), u64::MAX) {
         ServiceOwner::Crossing(_) => legacy(),
         ServiceOwner::Ring(_) | ServiceOwner::CountedEnosys => {
@@ -365,8 +368,8 @@ pub(super) fn resolve<T>(number: u64, legacy: impl FnOnce() -> Option<T>) -> Opt
 
 #[cfg(test)]
 mod tests {
-    use super::super::{LinearMemory, routing};
     use super::*;
+    use crate::dispatch::{LinearMemory, routing};
 
     #[test]
     fn root_only_compatibility_covers_existing_handlers_and_may_only_shrink() {
@@ -412,6 +415,27 @@ mod tests {
             count,
             "duplicate compatibility identity"
         );
+    }
+
+    #[test]
+    fn root_resolution_enters_only_the_shared_owner_or_explicit_compatibility() {
+        // The real root resolver's gate must not invoke even an available
+        // host handler for a counted refusal absent from compatibility.
+        for number in [512, u64::MAX] {
+            let entered = std::cell::Cell::new(false);
+            assert_eq!(
+                resolve(number, || {
+                    entered.set(true);
+                    Some(7)
+                }),
+                None
+            );
+            assert!(!entered.get());
+        }
+        // Exercise the Ring and Crossing arms through the production gate.
+        for number in [nr::GETPID.raw(), nr::MKDIRAT.raw()] {
+            assert_eq!(resolve(number, || Some(7)), Some(7));
+        }
     }
 
     const ROOT_ONLY_CEILING: usize = 283;

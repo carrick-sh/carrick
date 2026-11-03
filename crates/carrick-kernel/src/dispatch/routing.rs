@@ -3,6 +3,9 @@
 //! Chains each subsystem module's routing table into a single resolution
 //! mechanism for claimed syscalls, separating ordinary and MM-mutation routes.
 
+#[path = "root_only.rs"]
+pub(super) mod root_only;
+
 use carrick_abi::syscall::nr;
 use carrick_guest_mem::CurrentMmMemory;
 
@@ -36,7 +39,7 @@ pub type MutationSyscallHandler<M> =
 /// syscall by editing ONE module's `dispatch_<area>` — never this function (the
 /// central `dispatch()` chokepoint is gone). See [[plan-concurrent-fanout-lanes]].
 pub(crate) fn resolve_handler<M: CurrentMmMemory>(number: u64) -> Option<SyscallHandler<M>> {
-    super::root_only::resolve(number, || resolve_legacy_handler(number))
+    root_only::resolve(number, || resolve_legacy_handler(number))
 }
 
 pub(super) fn resolve_legacy_handler<M: CurrentMmMemory>(number: u64) -> Option<SyscallHandler<M>> {
@@ -59,7 +62,7 @@ pub(super) fn resolve_legacy_handler<M: CurrentMmMemory>(number: u64) -> Option<
 pub(crate) fn resolve_mutation_handler<M: CurrentMmMemory>(
     number: u64,
 ) -> Option<MutationSyscallHandler<M>> {
-    super::root_only::resolve(number, || resolve_legacy_mutation_handler(number))
+    root_only::resolve(number, || resolve_legacy_mutation_handler(number))
 }
 
 pub(super) fn resolve_legacy_mutation_handler<M: CurrentMmMemory>(

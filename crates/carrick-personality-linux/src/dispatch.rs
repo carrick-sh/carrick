@@ -822,17 +822,26 @@ pub struct OperandSpec {
 impl ServiceOwner {
     /// Preserve the existing family fallback path. Crossing permission is still
     /// evaluated separately on a decline, including terminal carrier handbacks.
-    pub const fn family_for_isa(
+    pub const fn family_for_venue(
         self,
         isa: carrick_guest_arch::GuestIsa,
         ordinal: CanonicalNr,
         allocator_control: u64,
+        descriptor_available: bool,
+        poll_available: bool,
     ) -> Family {
         match self {
-            // Retain today's ISA wiring while (a) changes classification only.
-            // The shared owner is independent of this implementation coverage.
-            Self::Ring(Family::Descriptor) => Family::Descriptor,
-            Self::Ring(Family::Poll) => Family::Poll,
+            Self::Ring(Family::Descriptor) if descriptor_available => Family::Descriptor,
+            Self::Ring(Family::Poll) => {
+                if poll_available {
+                    Family::Poll
+                } else {
+                    Family::Unported
+                }
+            }
+            // Keep today's ISA wiring, including an explicitly enabled
+            // diagnostic control colliding with a Linux ordinal. Availability
+            // cannot select another service owner or widen crossing policy.
             Self::Ring(_) => match isa {
                 carrick_guest_arch::GuestIsa::Aarch64 => {
                     route_aarch64(ordinal.raw(), allocator_control)
@@ -1091,15 +1100,13 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
     let owner = service_owner(CanonicalNr::new(ordinal), control);
     // Implementation availability is retained compatibility debt, separate from
     // the owner. In particular the root and child may have different fd venues.
-    let family = match owner {
-        ServiceOwner::Ring(Family::Descriptor) if !pending.may_serve_descriptor() => {
-            Family::Unported
-        }
-        ServiceOwner::Ring(Family::Poll) if !pending.may_serve_poll() => Family::Unported,
-        ServiceOwner::Ring(_) | ServiceOwner::Crossing(_) | ServiceOwner::CountedEnosys => {
-            owner.family_for_isa(pending.guest_isa(), CanonicalNr::new(ordinal), control)
-        }
-    };
+    let family = owner.family_for_venue(
+        pending.guest_isa(),
+        CanonicalNr::new(ordinal),
+        control,
+        pending.may_serve_descriptor(),
+        pending.may_serve_poll(),
+    );
     let completion = pending.binding().and_then(|binding| {
         if let Some(token) = carrick_core::entry::admit(binding, pending.record_source()) {
             Some(CompletionAuthority::Entry(token))
@@ -1926,12 +1933,8 @@ mod service_owner_tests {
                 (GuestIsa::Aarch64, route_aarch64(ordinal, u64::MAX)),
                 (GuestIsa::X86_64, route_x86(ordinal, u64::MAX)),
             ] {
-                let wired = owner.family_for_isa(isa, canonical, u64::MAX);
-                let legacy = if matches!(wired, Family::Descriptor | Family::Poll) {
-                    Family::Unported
-                } else {
-                    wired
-                };
+                let wired = owner.family_for_venue(isa, canonical, u64::MAX, false, false);
+                let legacy = wired;
                 assert_eq!(
                     legacy, previous,
                     "ISA wiring changed for {isa:?} ordinal={ordinal}"
@@ -1958,6 +1961,40 @@ mod service_owner_tests {
                 service_owner(CanonicalNr::new(ordinal), u64::MAX),
                 ServiceOwner::Ring(_)
             ));
+        }
+    }
+
+    #[test]
+    fn service_owner_preserves_enabled_diagnostic_control_and_venue_guards() {
+        for ordinal in (0..=512).chain([carrick_syscall_abi::CARRICK_PRIVATE_X86_DUP2]) {
+            let canonical = CanonicalNr::new(ordinal);
+            for control in [u64::MAX, ordinal] {
+                let owner = service_owner(canonical, control);
+                for isa in [GuestIsa::Aarch64, GuestIsa::X86_64] {
+                    for descriptor in [false, true] {
+                        for poll in [false, true] {
+                            let expected = if descriptor
+                                && (matches!(ordinal, 23 | 24 | 25 | 57)
+                                    || ordinal == carrick_syscall_abi::CARRICK_PRIVATE_X86_DUP2)
+                            {
+                                Family::Descriptor
+                            } else if ordinal == 73 {
+                                if poll { Family::Poll } else { Family::Unported }
+                            } else {
+                                match isa {
+                                    GuestIsa::Aarch64 => route_aarch64(ordinal, control),
+                                    GuestIsa::X86_64 => route_x86(ordinal, control),
+                                }
+                            };
+                            assert_eq!(
+                                owner.family_for_venue(isa, canonical, control, descriptor, poll),
+                                expected,
+                                "ordinal={ordinal} control={control} isa={isa:?} descriptor={descriptor} poll={poll}"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
