@@ -6,6 +6,8 @@ use carrick_guest_arch::{NativeOrdinal, UserVa};
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 use carrick_el1::isa::x86::context::native::NativeFrame;
+#[cfg(test)]
+use carrick_x86::cpl0_entry::NativeFrame;
 
 /// Only syscall inputs and the post-instruction PC. Scheduler context custody
 /// still owns TLS, extended registers, the stack and all nonargument GPRs.
@@ -101,13 +103,6 @@ impl IpcFrame for NativeFrame {
         true
     }
 }
-
-#[cfg(test)]
-#[path = "../../../carrick-x86/src/cpl0_entry.rs"]
-#[allow(dead_code)]
-mod x86_native;
-#[cfg(test)]
-use x86_native::NativeFrame;
 
 #[cfg(test)]
 mod tests {
