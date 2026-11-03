@@ -7227,6 +7227,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         control
             .service
             .bind(carrick_core_abi::service::ServiceBirth {
+                origin: carrick_core_abi::service::ServiceOrigin::Descendant,
                 process: child_key,
                 thread: carrick_core_abi::EntryThreadGeneration::from_raw(thread_serial.get()),
                 record: self.source.zone.record_ref(record),

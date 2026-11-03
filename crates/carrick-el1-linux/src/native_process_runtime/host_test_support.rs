@@ -3164,7 +3164,7 @@ fn root_exec_access_refusal_is_counted_before_service_publication() {
 #[cfg(test)]
 #[test]
 fn native_child_exec_after_ring_setuid_carries_the_new_credentials() {
-    let counters = carrick_el1_abi::Counters::new();
+    let counters = Box::leak(Box::new(carrick_el1_abi::Counters::new()));
     use carrick_personality_linux::identity::ProcessIdentityVenue as _;
     let capacity = NativeServiceCapacityFixture::new(1);
     let fixture = &capacity.fixture;
@@ -3199,7 +3199,7 @@ fn native_child_exec_after_ring_setuid_carries_the_new_credentials() {
             &child
                 .caller_access(NativeServiceCall::new(
                     carrick_guest_arch::NativeOrdinal::new(221),
-                    &counters
+                    counters
                 ))
                 .unwrap()
         ),
@@ -3232,14 +3232,14 @@ fn native_child_exec_after_ring_setuid_carries_the_new_credentials() {
         )
         .unwrap();
         assert!(matches!(
-            child.begin_host_file_service(open.into_boxed_slice(), None, true, None, false, crate::native_process_runtime::NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(56), &counters)),
+            child.begin_host_file_service(open.into_boxed_slice(), None, true, None, false, crate::native_process_runtime::NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(56), counters)),
             Ok(NativeResume::Returned(result))
                 if result.raw() == carrick_syscall_abi::LINUX_ENOSYS.guest_retval()
         ));
         assert_eq!(counters.refused[56].load(Ordering::Relaxed), 1);
         assert_eq!(counters.refused_child[56].load(Ordering::Relaxed), 1);
         assert!(matches!(
-            child.begin_exec_service(test_exec_payload(b"/bin/static"), crate::native_process_runtime::NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(221), &counters)),
+            child.begin_exec_service(test_exec_payload(b"/bin/static"), crate::native_process_runtime::NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(221), counters)),
             Ok(NativeResume::Returned(result))
                 if result.raw() == carrick_syscall_abi::LINUX_ENOSYS.guest_retval()
         ));
@@ -3255,7 +3255,7 @@ fn native_child_exec_after_ring_setuid_carries_the_new_credentials() {
             &child
                 .caller_access(NativeServiceCall::new(
                     carrick_guest_arch::NativeOrdinal::new(221),
-                    &counters
+                    counters
                 ))
                 .unwrap()
         ),
@@ -3263,7 +3263,7 @@ fn native_child_exec_after_ring_setuid_carries_the_new_credentials() {
     );
     assert!(
         !matches!(
-            child.begin_exec_service(test_exec_payload(b"/bin/static"), None, crate::native_process_runtime::NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(221), &counters)),
+            child.begin_exec_service(test_exec_payload(b"/bin/static"), None, crate::native_process_runtime::NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(221), counters)),
             Ok(NativeResume::Returned(result))
                 if result.raw() == carrick_syscall_abi::LINUX_ENOSYS.guest_retval()
         ),

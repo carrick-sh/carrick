@@ -77,7 +77,8 @@ enum CarrierContinuation {
 
 /// A staged host-file crossing: the ring-owned request/reply record (its
 /// address is published in the request) and the user output it fills.
-struct PendingHostFile {
+struct PendingHostFile<'a> {
+    call: NativeServiceCall<'a>,
     record: Box<[u8]>,
     output: Option<carrick_personality_linux::native_host_file::HostFileOutput>,
     map: Option<carrick_personality_linux::native_host_file::NativeMapKey>,
@@ -101,12 +102,12 @@ pub(super) struct AdapterPreparation {
     pub identity: carrick_sched_core::object_wait::OperationIdentity,
 }
 
-enum ServicePayload {
+enum ServicePayload<'a> {
     None,
     Copyout(OwnedCopyout),
     Adapter,
     Exec(Box<[u8]>),
-    HostFile(PendingHostFile),
+    HostFile(PendingHostFile<'a>),
 }
 
 pub(super) struct PendingService<'a> {
@@ -115,7 +116,7 @@ pub(super) struct PendingService<'a> {
     /// in the request and cannot be recycled until completion/cancellation ACK.
     _exec_payload: Option<Box<[u8]>>,
     /// The same custody for a host-file record, which the carrier also writes.
-    host_file: Option<PendingHostFile>,
+    host_file: Option<PendingHostFile<'a>>,
     copyout: Option<Box<OwnedCopyout>>,
     adapter: bool,
     exec_successor: Option<Box<dyn ExecSuccessorSlot + 'a>>,
@@ -785,7 +786,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         resolves_path: bool,
         map: Option<carrick_personality_linux::native_host_file::NativeMapKey>,
         chdir: bool,
-        call: NativeServiceCall<'_>,
+        call: NativeServiceCall<'a>,
     ) -> Result<NativeResume, NativeProcessError> {
         // A path resolves under the caller's own access context (its task
         // row's credentials, umask, cwd and root), carried in the record.
@@ -832,6 +833,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             None,
             None,
             ServicePayload::HostFile(PendingHostFile {
+                call,
                 record,
                 output,
                 map,
@@ -860,10 +862,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     ) -> Result<Vec<u8>, CallerAccessFailure> {
         self.encode_caller_access().map_err(|errno| {
             if errno == carrick_syscall_abi::LINUX_ENOSYS {
-                let bucket = call.ordinal.raw().min(512) as usize;
-                call.counters.refused[bucket].fetch_add(1, Ordering::Relaxed);
-                call.counters
-                    .record_child_refusal(bucket, !self.is_root_process());
+                call.counters.record_refusal(
+                    call.ordinal,
+                    if self.is_root_process() {
+                        carrick_core_abi::service::ServiceOrigin::Initial
+                    } else {
+                        carrick_core_abi::service::ServiceOrigin::Descendant
+                    },
+                    carrick_el1_abi::RefusalVenue::Ring,
+                );
             }
             CallerAccessFailure(SyscallResult::from_errno(errno))
         })
@@ -885,7 +892,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     }
     /// Store a served chdir lookup's directory as the caller's cwd: the one
     /// writer of a ring process's cwd.
-    fn complete_chdir(&self, record: &[u8]) -> Result<SyscallResult, NativeProcessError> {
+    fn complete_chdir(
+        &self,
+        record: &[u8],
+        call: NativeServiceCall<'a>,
+    ) -> Result<SyscallResult, NativeProcessError> {
         let target = match carrick_personality_linux::native_host_file::chdir_target(record) {
             Ok(target) => target,
             Err(result) => return Ok(result),
@@ -896,6 +907,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .task_mut(self.key)
             .map_err(|_| NativeProcessError::Stale)?;
         let Some(fs) = task.fs.as_mut() else {
+            let origin = if self.key == graph.root_key {
+                carrick_core_abi::service::ServiceOrigin::Initial
+            } else {
+                carrick_core_abi::service::ServiceOrigin::Descendant
+            };
+            call.counters
+                .record_refusal(call.ordinal, origin, carrick_el1_abi::RefusalVenue::Ring);
             return Ok(SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOSYS));
         };
         fs.cwd = target;
@@ -916,7 +934,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         operation: ServiceOperation,
         fault_sequence: Option<core::num::NonZeroU64>,
         owner_wait: Option<carrick_core_abi::PortalOwnerWait>,
-        payload: ServicePayload,
+        payload: ServicePayload<'a>,
         retry_syscall_after_supply: bool,
     ) -> Result<NativeResume, NativeProcessError> {
         // Publish into the existing boxed pending owner before descending into
@@ -942,7 +960,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         operation: ServiceOperation,
         fault_sequence: Option<core::num::NonZeroU64>,
         owner_wait: Option<carrick_core_abi::PortalOwnerWait>,
-        payload: ServicePayload,
+        payload: ServicePayload<'a>,
         retry_syscall_after_supply: bool,
     ) -> Result<(ServiceRequest, bool), NativeProcessError> {
         self.service_phase = NativeServicePhase::Payload;
@@ -1012,6 +1030,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     control
                         .service
                         .bind(carrick_core_abi::service::ServiceBirth {
+                            origin: if self.is_root_process() {
+                                carrick_core_abi::service::ServiceOrigin::Initial
+                            } else {
+                                carrick_core_abi::service::ServiceOrigin::Descendant
+                            },
                             process: self.key,
                             thread: self.binding.thread_generation,
                             record: self.record,
@@ -2488,7 +2511,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     }
                     if pending_file.chdir {
                         return self
-                            .complete_chdir(&pending_file.record)
+                            .complete_chdir(&pending_file.record, pending_file.call)
                             .map(NativeResume::Returned);
                     }
                     let mut copy_out = |address: u64, bytes: &[u8]| {

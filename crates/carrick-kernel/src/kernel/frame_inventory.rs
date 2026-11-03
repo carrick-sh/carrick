@@ -3948,6 +3948,7 @@ mod physical_projection_tests {
                 if boundary == 11 {
                     use carrick_core_abi::service::*;
                     let birth = ServiceBirth {
+                        origin: carrick_core_abi::service::ServiceOrigin::Initial,
                         process: carrick_sched_core::process::TaskKey {
                             id: carrick_sched_core::process::TaskId::from_registry_allocation(
                                 core::num::NonZeroI32::new(1).unwrap(),

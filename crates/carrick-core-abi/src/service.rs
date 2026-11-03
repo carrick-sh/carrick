@@ -40,8 +40,26 @@ impl ExecAdoptionReceipt {
     }
 }
 
+/// Process lineage selected by the ring owner, independent of visible IDs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u64)]
+pub enum ServiceOrigin {
+    Initial = 1,
+    Descendant = 2,
+}
+impl ServiceOrigin {
+    fn decode(raw: u64) -> Result<Self, ServiceError> {
+        match raw {
+            1 => Ok(Self::Initial),
+            2 => Ok(Self::Descendant),
+            _ => Err(ServiceError::Stale),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ServiceBirth {
+    pub origin: ServiceOrigin,
     pub process: TaskKey,
     pub thread: EntryThreadGeneration,
     pub record: RecordRef,
@@ -563,7 +581,7 @@ pub enum PreparedDeliveryError {
     Service(ServiceError),
 }
 
-pub const NATIVE_SERVICE_PROTOCOL: u64 = 6;
+pub const NATIVE_SERVICE_PROTOCOL: u64 = 7;
 
 /// Transport selector only: authority remains in the member's retained cell.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -720,9 +738,11 @@ impl Default for ServiceCell {
 }
 impl ServiceBirth {
     fn words(self) -> [u64; 8] {
+        // Registry process IDs are positive i32 values. The high half of
+        // their existing word seals lineage without growing ServiceCell.
         [
             self.mm.carrier().get(),
-            self.process.id.raw() as u64,
+            (self.process.id.raw() as u32 as u64) | ((self.origin as u64) << 32),
             self.process.serial.raw(),
             self.thread.raw(),
             u64::from(self.record.id.raw()),
@@ -1056,6 +1076,7 @@ impl ServiceCell {
             // outstanding request and the WRITING reservation excludes reset.
             let mm = unsafe { El1MmHandle::from_admitted_owner(carrier, mm, incarnation) };
             let birth = ServiceBirth {
+                origin: ServiceOrigin::decode(self.words[1].load(Ordering::Relaxed) >> 32)?,
                 process,
                 thread,
                 record,
@@ -1076,7 +1097,7 @@ impl ServiceCell {
         record: RecordRef,
         thread: EntryThreadGeneration,
     ) -> Result<El1MmHandle, ServiceError> {
-        let id = i32::try_from(self.words[1].load(Ordering::Acquire))
+        let id = i32::try_from(self.words[1].load(Ordering::Acquire) & u64::from(u32::MAX))
             .ok()
             .and_then(core::num::NonZeroI32::new)
             .ok_or(ServiceError::Stale)?;
@@ -1283,10 +1304,11 @@ impl ServiceCell {
             // SAFETY: this is a copy of the admitted handle retained by the
             // ring's outstanding claim, not admission from a raw host request.
             let mm = unsafe { El1MmHandle::from_admitted_owner(carrier, mm, incarnation) };
-            let process_id = i32::try_from(cell.words[1].load(Ordering::Relaxed))
-                .ok()
-                .and_then(core::num::NonZeroI32::new)
-                .ok_or(ServiceError::Stale)?;
+            let process_id =
+                i32::try_from(cell.words[1].load(Ordering::Relaxed) & u64::from(u32::MAX))
+                    .ok()
+                    .and_then(core::num::NonZeroI32::new)
+                    .ok_or(ServiceError::Stale)?;
             let birth = NonZeroU64::new(cell.words[2].load(Ordering::Relaxed))
                 .ok_or(ServiceError::Stale)?;
             let process = TaskKey {
@@ -1295,6 +1317,7 @@ impl ServiceCell {
             };
             let identity = ServiceIdentity {
                 birth: ServiceBirth {
+                    origin: ServiceOrigin::decode(cell.words[1].load(Ordering::Relaxed) >> 32)?,
                     process,
                     thread: EntryThreadGeneration::from_raw(member.serial),
                     record: selector.record,
@@ -1868,6 +1891,7 @@ mod tests {
     fn birth(id: u32, generation: u64) -> ServiceBirth {
         let generation = NonZeroU64::new(generation).unwrap();
         ServiceBirth {
+            origin: ServiceOrigin::Initial,
             process: TaskKey {
                 id: TaskId::from_registry_allocation(NonZeroI32::new(id as i32).unwrap()),
                 serial: TaskSerial::from_registry_allocation(generation),
@@ -1906,6 +1930,42 @@ mod tests {
     }
     fn exec_capability() -> ExecCapabilityId {
         ExecCapabilityId::new(NonZeroU64::new(17).unwrap())
+    }
+
+    #[test]
+    fn service_lineage_survives_ticket_intake_and_exec_rebind() {
+        for origin in [ServiceOrigin::Initial, ServiceOrigin::Descendant] {
+            let cell = ServiceCell::new();
+            let owner = ServiceBirth {
+                origin,
+                ..birth(7, 7)
+            };
+            cell.bind(owner).unwrap();
+            assert_eq!(
+                cell.bound_birth(owner.process, owner.thread, owner.record),
+                Ok(owner)
+            );
+            let request = cell
+                .publish(owner, SnapshotGeneration::INITIAL, fault(), None)
+                .unwrap();
+            let ticket = cell.claim(request).unwrap();
+            assert_eq!(ticket.request().identity.birth.origin, origin);
+            assert!(ticket.complete(false).is_ok());
+            assert_eq!(cell.consume(request.identity), Ok(ServiceResult::Refused));
+            let successor = birth(8, 8).mm;
+            let rebound = cell.rebind_exec_mm(owner, successor).unwrap();
+            assert_eq!(rebound.origin, origin);
+            assert_eq!(
+                cell.bound_birth(owner.process, owner.thread, owner.record),
+                Ok(rebound)
+            );
+            // A missing/invalid lineage never decodes as the initial process.
+            cell.words[1].store(owner.process.id.raw() as u64, Ordering::Relaxed);
+            assert_eq!(
+                cell.bound_birth(owner.process, owner.thread, owner.record),
+                Err(ServiceError::Stale)
+            );
+        }
     }
 
     #[test]

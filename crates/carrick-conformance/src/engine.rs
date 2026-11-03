@@ -350,14 +350,97 @@ pub fn run_carrick(
     // Lane-scaled deadline: nested-KVM runs get a stretched budget (the gate
     // asserts correctness parity with docker, not speed parity); docker
     // oracles below keep the unscaled suite budget.
-    run_one(
+    let remote = if let crate::lane::Lane::Kvm(config) = lane {
+        let directory = crate::lane::lima_census_directory(run_id);
+        // Each selected suite owns this exact run ID. Clear an interrupted
+        // earlier invocation before admitting the next guest population.
+        run_evidence_command(
+            vec![
+                "limactl".into(),
+                "shell".into(),
+                config.vm.clone(),
+                "--".into(),
+                "rm".into(),
+                "-rf".into(),
+                "--".into(),
+                directory.clone(),
+            ],
+            &format!("{run_id}-census-reset"),
+        )?;
+        Some((config, directory))
+    } else {
+        None
+    };
+    let output = run_one(
         cmd,
         argv,
         deadline.scaled_by(|s| lane.scaled_timeout(s)),
         run_id,
         Engine::Carrick,
         Some(cleanup),
-    )
+    )?;
+    if let Some((config, directory)) = remote {
+        let local = tempfile::tempdir()?;
+        let destination = local.path().join("census");
+        run_evidence_command(
+            vec![
+                "limactl".into(),
+                "copy".into(),
+                "-r".into(),
+                format!("{}:{directory}", config.vm),
+                destination.to_string_lossy().into_owned(),
+            ],
+            &format!("{run_id}-census-copy"),
+        )?;
+        let evidence = carrick_spec::syscall_census::read_directory(&destination)?;
+        append_census(&output.stderr_path, &evidence)?;
+        run_evidence_command(
+            vec![
+                "limactl".into(),
+                "shell".into(),
+                config.vm.clone(),
+                "--".into(),
+                "rm".into(),
+                "-rf".into(),
+                "--".into(),
+                directory,
+            ],
+            &format!("{run_id}-census-cleanup"),
+        )?;
+    }
+    Ok(output)
+}
+
+/// Collectors have their own short bound; they never alter the guest's
+/// measured duration or invoke a Docker/guest cleanup authority.
+fn run_evidence_command(argv: Vec<String>, run_id: &str) -> anyhow::Result<()> {
+    let mut command = Command::new("limactl");
+    command.args(&argv[1..]);
+    let output = run_one(
+        command,
+        argv,
+        CarrickDeadline {
+            declared_s: 10,
+            effective_s: 10,
+            origin: DeadlineOrigin::Declared,
+        },
+        run_id,
+        Engine::Evidence,
+        None,
+    )?;
+    anyhow::ensure!(
+        !output.timed_out && output.exit_code == 0,
+        "census collection failed; see {}",
+        output.stderr_path.display()
+    );
+    Ok(())
+}
+
+fn append_census(path: &Path, evidence: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut log = std::fs::OpenOptions::new().append(true).open(path)?;
+    writeln!(log, "\n{evidence}")?;
+    Ok(())
 }
 
 /// Apply the operator's Carrick-only diagnostic deadline without changing the
@@ -535,6 +618,7 @@ pub(crate) enum Engine {
     Carrick,
     Docker,
     Native,
+    Evidence,
 }
 
 #[derive(::core::clone::Clone)]
@@ -570,6 +654,15 @@ pub(crate) fn run_one(
     std::fs::create_dir_all(raw_dir())?;
     let stdout_path = raw_dir().join(format!("{run_id}.out"));
     let stderr_path = raw_dir().join(format!("{run_id}.err"));
+    let census = if matches!(engine, Engine::Carrick) {
+        let directory = tempfile::Builder::new()
+            .prefix("census-")
+            .tempdir_in(raw_dir())?;
+        cmd.env("CARRICK_EL1_CENSUS", directory.path().canonicalize()?);
+        Some(directory)
+    } else {
+        None
+    };
     let out_file = File::create(&stdout_path)?;
     let err_file = File::create(&stderr_path)?;
     cmd.stdin(Stdio::null())
@@ -644,6 +737,10 @@ pub(crate) fn run_one(
         }
     }
 
+    if let Some(directory) = census {
+        let evidence = carrick_spec::syscall_census::read_directory(directory.path())?;
+        append_census(&stderr_path, &evidence)?;
+    }
     Ok(RunOutput {
         stdout_path,
         stderr_path,
@@ -978,6 +1075,7 @@ fn kill_scoped(
         (Engine::Native, _) => {
             anyhow::bail!("native cleanup must use its namespace init authority");
         }
+        (Engine::Evidence, _) => {}
         (Engine::Docker, _) => {
             let container = run_id.to_string();
             let _ = Command::new("docker")

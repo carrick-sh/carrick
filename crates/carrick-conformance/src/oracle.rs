@@ -1666,3 +1666,28 @@ mod tests {
         }
     }
 }
+
+// Monotone coverage debt: lower this ceiling when committed Docker shapes
+// remove missing observations. Unshaped non-allowlisted refusals are not yet
+// verdicts; allowlisted refusals and observed Docker-served calls always are.
+#[cfg(test)]
+mod syscall_shape_debt_tests {
+    const MISSING_SHAPE_CEILING: usize = 11_484;
+
+    #[test]
+    fn committed_missing_syscall_shapes_do_not_increase() {
+        let missing = include_str!("../../../scripts/conformance/oracle-cache.jsonl")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|row| {
+                row.get("served_ordinals")
+                    .is_none_or(serde_json::Value::is_null)
+            })
+            .count();
+        assert!(
+            missing <= MISSING_SHAPE_CEILING,
+            "missing Docker syscall shapes: {missing} > {MISSING_SHAPE_CEILING}"
+        );
+    }
+}

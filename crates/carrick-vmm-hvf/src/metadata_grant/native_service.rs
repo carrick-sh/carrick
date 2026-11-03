@@ -304,6 +304,7 @@ impl Deref for ServicePin {
 /// and member; this host object retains only backing and carrier observation.
 #[must_use]
 pub struct NativeService {
+    census: core::ptr::NonNull<carrick_el1_abi::Counters>,
     ticket: ServiceTicket<ServicePin>,
     custody: Arc<crate::trap::CarrierVmCustody>,
     slot: carrick_sched_core::SlotId,
@@ -370,6 +371,16 @@ fn with_native_sources_of<R>(
 }
 
 impl NativeService {
+    fn record_venue_refusal(&self, ordinal: carrick_guest_arch::NativeOrdinal) {
+        // SAFETY: intake selected this exact carrier's initialized fixed
+        // counters; the service ticket retains carrier custody through ACK.
+        unsafe { self.census.as_ref() }.record_refusal(
+            ordinal,
+            self.request().identity.birth.origin,
+            carrick_el1_abi::RefusalVenue::Carrier,
+        );
+    }
+
     pub fn request(&self) -> ServiceRequest {
         self.ticket.request()
     }
@@ -389,7 +400,7 @@ impl NativeService {
             _ => None,
         };
         if let Some(ordinal) = ordinal {
-            crate::trap::record_native_venue_refusal(ordinal)?;
+            self.record_venue_refusal(ordinal);
             carrick_observability::probes::hvpatch_native_crossing_refused(
                 request.identity.birth.mm.mm().raw(),
                 request.identity.birth.mm.incarnation().get(),
@@ -518,7 +529,7 @@ impl NativeService {
         };
         // The census counts the refused syscall; the probe names the refused
         // venue operation, above every syscall ordinal.
-        crate::trap::record_native_venue_refusal(payload.ordinal())?;
+        self.record_venue_refusal(payload.ordinal());
         let ordinal = self.exec_payload.as_ref().map_or(
             carrick_core_abi::host_file::HOST_FILE_REFUSAL_ORDINAL_BASE,
             |record| carrick_core_abi::host_file::refusal_ordinal(record.bytes()),
@@ -620,6 +631,8 @@ impl NativeService {
         }) {
             return Err(stale());
         }
+        let census = self.census;
+        let request = self.request();
         self.finish_exec_ticket(|ticket| {
             match ticket.publish_exec_prepared(receipt, prepared, |receipt, prepared| {
                 custody.retain_native_exec_preparation(receipt, identity, prepared);
@@ -629,6 +642,16 @@ impl NativeService {
             }) {
                 Ok(()) => Ok(()),
                 Err((_, ticket, prepared)) => {
+                    if let carrick_core_abi::service::ServiceOperation::Exec { payload, .. } =
+                        request.operation
+                    {
+                        // SAFETY: the returned ticket retains the same carrier.
+                        unsafe { census.as_ref() }.record_refusal(
+                            payload.ordinal(),
+                            request.identity.birth.origin,
+                            carrick_el1_abi::RefusalVenue::Carrier,
+                        );
+                    }
                     drop(prepared);
                     ticket.complete(false).map_err(|_| stale())
                 }
@@ -640,6 +663,13 @@ impl NativeService {
         self,
         failure: ServiceFailureCode,
     ) -> Result<carrick_sched_core::WakeEffects, TrapError> {
+        if failure.raw() == 38 {
+            if let carrick_core_abi::service::ServiceOperation::Exec { payload, .. } =
+                self.request().operation
+            {
+                self.record_venue_refusal(payload.ordinal());
+            }
+        }
         self.finish_exec_ticket(|ticket| ticket.complete_failure(failure).map_err(|_| stale()))
     }
 
@@ -1463,6 +1493,14 @@ pub(super) fn take(
                     _ => None,
                 };
                 Ok(NativeService {
+                    census: core::ptr::NonNull::new(
+                        region
+                            .record_ptr::<carrick_el1_abi::Counters>(
+                                carrick_el1_abi::EL1_COUNTERS_OFFSET as usize,
+                            )
+                            .ok_or_else(stale)?,
+                    )
+                    .ok_or_else(stale)?,
                     reply,
                     _reply_pin: reply_pin,
                     exec_payload,
@@ -1772,6 +1810,7 @@ mod intake_tests {
     fn birth() -> carrick_core_abi::service::ServiceBirth {
         let generation = NonZeroU64::MIN;
         carrick_core_abi::service::ServiceBirth {
+            origin: carrick_core_abi::service::ServiceOrigin::Initial,
             process: TaskKey {
                 id: TaskId::from_registry_allocation(NonZeroI32::new(1).unwrap()),
                 serial: TaskSerial::from_registry_allocation(generation),

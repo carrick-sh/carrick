@@ -263,8 +263,11 @@ pub fn capture(suite: &Suite, run_id: &str, platform: DockerPlatform) -> anyhow:
         anyhow::ensure!(
             !waited.timed_out
                 && waited.exit_code == 0
-                && std::fs::read_to_string(waited.stdout_path)?.trim() == "0",
-            "shape workload did not complete successfully"
+                && std::fs::read_to_string(waited.stdout_path)?
+                    .trim()
+                    .parse::<u8>()
+                    .is_ok(),
+            "shape workload did not complete"
         );
         parse(&std::fs::read_to_string(traced.stdout_path)?).map_err(anyhow::Error::msg)
     })

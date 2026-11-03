@@ -14,8 +14,9 @@
 //!   host to deliver pending work.
 //!
 //! Always enabled unless `CARRICK_EL1_CENSUS=0`. The carrier emits a refusal
-//! evidence record on stderr at teardown. With `CARRICK_EL1_CENSUS=<directory>` it also writes
-//! `<directory>/<CARRICK_RUN_ID or "run">-<pid>.json` at teardown, while the
+//! evidence record in `target/carrick-census` at teardown.
+//! `CARRICK_EL1_CENSUS=<directory>` selects another destination for
+//! `<directory>/<CARRICK_RUN_ID or "run">-<pid>-<unique>.json` at teardown, while the
 //! EL1 region is still mapped. Disabled, each hook costs one relaxed load.
 //! Counts are exact (no sampling); timing uses the per-thread CPU clock.
 
@@ -325,7 +326,7 @@ pub fn write_at_teardown(run_id: Option<&carrick_kernel::kernel::CarrierScopeId>
     if !enabled() {
         return;
     }
-    publish(snapshot(run_id));
+    publish(snapshot(run_id), destination());
 }
 
 /// Publish an ISA's mapped counters before its VM is retired.
@@ -338,26 +339,38 @@ pub fn write_counters_at_teardown(
     if !enabled() {
         return;
     }
-    publish(snapshot_counters(run_id, Some(counters), isa));
+    publish(
+        snapshot_counters(run_id, Some(counters), isa),
+        destination(),
+    );
 }
 
-fn publish(census: Census) {
-    match serde_json::to_string(&census) {
-        Ok(body) => eprintln!("\n{}{body}", carrick_spec::syscall_census::MARKER),
-        Err(error) => eprintln!("carrick: syscall census serialization failed: {error}"),
-    }
-    let Some(Some(directory)) = DIRECTORY.get() else {
-        return;
-    };
+fn destination() -> std::path::PathBuf {
+    DIRECTORY
+        .get()
+        .and_then(Option::as_ref)
+        .cloned()
+        .unwrap_or_else(|| std::path::PathBuf::from("target/carrick-census"))
+}
+
+fn publish(census: Census, directory: std::path::PathBuf) {
     let name = format!(
-        "{}-{}.json",
+        "{}-{}-",
         census.run_id.as_deref().unwrap_or("run"),
         census.pid
     );
-    let path = directory.join(name);
-    let result = std::fs::create_dir_all(directory).and_then(|()| {
+    let path = &directory;
+    let result = std::fs::create_dir_all(&directory).and_then(|()| {
+        // Multiple embedded carriers may share both run ID and host PID.
+        // Retain one uniquely created file for every publication.
+        let file = tempfile::Builder::new()
+            .prefix(&name)
+            .suffix(".json")
+            .tempfile_in(&directory)?;
         let body = serde_json::to_vec_pretty(&census).map_err(std::io::Error::other)?;
-        std::fs::write(&path, body)
+        std::fs::write(file.path(), body)?;
+        file.keep().map_err(|error| error.error)?;
+        Ok(())
     });
     if let Err(error) = result {
         tracing::error!(path = %path.display(), %error, "EL1 census write failed");
@@ -579,12 +592,50 @@ mod tests {
     }
 
     #[test]
+    fn sequential_carriers_with_one_grouping_id_preserve_every_census() {
+        use carrick_spec::syscall_census::{CensusIsa, MARKER};
+        let directory = tempfile::tempdir().unwrap();
+        let refused = carrick_el1_abi::Counters::new();
+        refused.record_refusal(
+            carrick_guest_arch::NativeOrdinal::new(34),
+            carrick_core_abi::service::ServiceOrigin::Descendant,
+            carrick_el1_abi::RefusalVenue::Carrier,
+        );
+        let clean = carrick_el1_abi::Counters::new();
+        publish(
+            snapshot_counters(None, Some(&refused), CensusIsa::Aarch64),
+            directory.path().to_owned(),
+        );
+        publish(
+            snapshot_counters(None, Some(&clean), CensusIsa::Aarch64),
+            directory.path().to_owned(),
+        );
+        let evidence = carrick_spec::syscall_census::read_directory(directory.path()).unwrap();
+        assert_eq!(
+            evidence
+                .lines()
+                .filter(|line| line.starts_with(MARKER))
+                .count(),
+            2
+        );
+        assert!(
+            carrick_spec::syscall_census::check_log(&evidence, None)
+                .unwrap_err()
+                .contains("allowlisted")
+        );
+    }
+
+    #[test]
     fn mapped_refused_child_mkdirat_reaches_the_shared_gate() {
         use carrick_spec::syscall_census::{CallerClass, CensusIsa};
         let counters = carrick_el1_abi::Counters::new();
         counters.refused[34].store(1, Ordering::Relaxed);
         counters.record_child_refusal(34, true);
-        counters.record_venue_refusal(carrick_guest_arch::NativeOrdinal::new(34), true);
+        counters.record_refusal(
+            carrick_guest_arch::NativeOrdinal::new(34),
+            carrick_core_abi::service::ServiceOrigin::Descendant,
+            carrick_el1_abi::RefusalVenue::Carrier,
+        );
         let snapshot = snapshot_counters(None, Some(&counters), CensusIsa::Aarch64);
         assert!(snapshot.refusal_evidence.complete);
         assert_eq!(snapshot.refusal_evidence.rows.len(), 1);

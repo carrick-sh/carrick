@@ -139,6 +139,11 @@ pub fn rewrite_registry_host(image: &str, from: &str, to: &str) -> String {
 
 /// Build the FULL OS-level argv to execute one suite's `carrick run` on `lane`.
 /// `carrick_bin` is the local binary path for Hvf, or the IN-GUEST path for Kvm.
+/// A run-scoped directory inside the Lima VM, never a host-local path.
+pub(crate) fn lima_census_directory(run_id: &str) -> String {
+    format!("/tmp/carrick-census-{run_id}")
+}
+
 pub fn carrick_invocation_argv(
     suite: &Suite,
     carrick_bin: &str,
@@ -156,10 +161,12 @@ pub fn carrick_invocation_argv(
             // <carrick-in-guest> run … <rewritten image> … <cmd>`. The env is
             // carried INTO the guest (limactl shell does not forward host env);
             // the image-ref registry host is rewritten localhost->gateway.
-            let mut inner: Vec<String> = Vec::new();
+            let mut inner: Vec<String> = vec![
+                "env".into(),
+                format!("CARRICK_EL1_CENSUS={}", lima_census_directory(run_id)),
+            ];
             if let Some(host) = suite.registry_host() {
                 let host = rewrite_registry_host(host, "localhost", &cfg.gateway);
-                inner.push("env".to_string());
                 inner.push(format!("CARRICK_INSECURE_REGISTRIES={host}"));
             }
             inner.extend(base.into_iter().map(|tok| {
@@ -421,6 +428,7 @@ mod tests {
         assert_eq!(argv.len(), 8, "the sg command string is one final arg");
         let inner = &argv[7]; // the single shell-string `sg kvm -c` runs
         assert!(inner.contains("CARRICK_INSECURE_REGISTRIES=host.lima.internal:5005"));
+        assert!(inner.contains("CARRICK_EL1_CENSUS=/tmp/carrick-census-conf-1-2"));
         assert!(inner.contains("/home/user/carrick/target/release/carrick"));
         assert!(inner.contains(" run "));
         assert!(!inner.contains("--exec-backend"), "{inner}");

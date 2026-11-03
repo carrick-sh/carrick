@@ -1471,6 +1471,11 @@ fn bail<C: ThreadCpu, U: UserWord, M: UserCopy>(
                 op.progress.written
             }
         } else {
+            sched.counters.record_refusal(
+                carrick_guest_arch::NativeOrdinal::new(u64::from(op.nr)),
+                user.service_origin(),
+                carrick_el1_abi::RefusalVenue::Ring,
+            );
             carrick_syscall_abi::LINUX_ENOSYS.guest_retval() as u64
         };
         return Ok(IpcServed::Returned { switched: false });
@@ -3739,56 +3744,87 @@ mod tests {
 
     #[test]
     fn native_structural_refusals_retire_without_host_handback() {
-        for why in [
-            IpcLeave::FlagsRefused,
-            IpcLeave::TransferRefused,
-            IpcLeave::ObjectBusy,
-            IpcLeave::ParkRefused,
-        ] {
-            let mut w = world();
-            let table = w.table(w.a_tid);
-            let fd = w.eventfd(table, 7, EventMode::Counter, BLOCK);
-            let backing = w.host().get(table, Fd(fd)).unwrap().backing;
-            let Some(IpcBacking::EventFd { object }) = IpcBacking::decode(backing) else {
-                unreachable!()
-            };
-            let mut frame = syscall(SYS_READ, fd, 0x10000, 8, A_SVC);
-            let venue = IpcVenue {
-                region: *w.region,
-                tables: &w.tables,
-            };
-            {
-                let mut sched = Sched {
-                    handoff: None,
-                    zone: &w.zone,
-                    slot: SLOT,
-                    task: &w.task,
-                    cpu: &mut w.cpu,
-                    user: &HardwareUserWord,
-                    counters: w.counters,
-                };
-                let mut user = User {
-                    task: &w.task,
-                    mem: &w.mem,
-                };
-                let Admission::Admitted(token, op) = admit(&mut sched, &frame, &venue, &mut user)
-                else {
-                    panic!("the eventfd read must own an operation")
-                };
-                assert!(matches!(
-                    bail(
-                        &mut sched, &mut frame, token, op, true, &venue, why, &mut user, true
-                    ),
-                    Ok(RETURNED)
-                ));
-                assert_eq!(frame.x[8], SYS_READ as u64);
-                assert_eq!(frame.x[0] as i64, -38);
+        use carrick_core_abi::service::ServiceOrigin;
+        struct Caller<'a> {
+            inner: User<'a>,
+            origin: ServiceOrigin,
+        }
+        impl UserCopy for Caller<'_> {
+            fn service_origin(&self) -> ServiceOrigin {
+                self.origin
             }
-            w.host_close(table, fd);
-            assert!(
-                w.region.lock(object, &HostWait).is_err(),
-                "the operation pin leaked"
-            );
+            fn copy_in(&mut self, dst: &mut [u8], va: u64) -> bool {
+                self.inner.copy_in(dst, va)
+            }
+            fn copy_out(&mut self, va: u64, src: &[u8]) -> bool {
+                self.inner.copy_out(va, src)
+            }
+        }
+        for origin in [ServiceOrigin::Initial, ServiceOrigin::Descendant] {
+            for why in [
+                IpcLeave::FlagsRefused,
+                IpcLeave::TransferRefused,
+                IpcLeave::ObjectBusy,
+                IpcLeave::ParkRefused,
+            ] {
+                let mut w = world();
+                let table = w.table(w.a_tid);
+                let fd = w.eventfd(table, 7, EventMode::Counter, BLOCK);
+                let backing = w.host().get(table, Fd(fd)).unwrap().backing;
+                let Some(IpcBacking::EventFd { object }) = IpcBacking::decode(backing) else {
+                    unreachable!()
+                };
+                let mut frame = syscall(SYS_READ, fd, 0x10000, 8, A_SVC);
+                let venue = IpcVenue {
+                    region: *w.region,
+                    tables: &w.tables,
+                };
+                {
+                    let mut sched = Sched {
+                        handoff: None,
+                        zone: &w.zone,
+                        slot: SLOT,
+                        task: &w.task,
+                        cpu: &mut w.cpu,
+                        user: &HardwareUserWord,
+                        counters: w.counters,
+                    };
+                    let mut user = Caller {
+                        inner: User {
+                            task: &w.task,
+                            mem: &w.mem,
+                        },
+                        origin,
+                    };
+                    let Admission::Admitted(token, op) =
+                        admit(&mut sched, &frame, &venue, &mut user)
+                    else {
+                        panic!("the eventfd read must own an operation")
+                    };
+                    assert!(matches!(
+                        bail(
+                            &mut sched, &mut frame, token, op, true, &venue, why, &mut user, true
+                        ),
+                        Ok(RETURNED)
+                    ));
+                    assert_eq!(frame.x[8], SYS_READ as u64);
+                    assert_eq!(frame.x[0] as i64, -38);
+                    assert_eq!(w.counters.refused[SYS_READ].load(Ordering::Relaxed), 1);
+                    assert_eq!(
+                        w.counters.refused_child[SYS_READ].load(Ordering::Relaxed),
+                        u64::from(origin == ServiceOrigin::Descendant)
+                    );
+                    assert_eq!(
+                        w.counters.venue_refused[SYS_READ].load(Ordering::Relaxed),
+                        0
+                    );
+                }
+                w.host_close(table, fd);
+                assert!(
+                    w.region.lock(object, &HostWait).is_err(),
+                    "the operation pin leaked"
+                );
+            }
         }
     }
 

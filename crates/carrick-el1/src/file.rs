@@ -303,6 +303,11 @@ impl MemoryValidator for HardwareValidator {
 /// `false` means the copy cannot be done exactly here, and the caller takes its
 /// fallback path (EL1 forwards to the host; the host recalls the object).
 pub trait UserCopy {
+    /// Lineage of the owner that receives a structural service refusal.
+    fn service_origin(&self) -> carrick_core_abi::service::ServiceOrigin {
+        carrick_core_abi::service::ServiceOrigin::Initial
+    }
+
     fn take_copyout_refusal(&mut self) -> Option<carrick_core::mm::transaction::CopyoutRequest> {
         None
     }

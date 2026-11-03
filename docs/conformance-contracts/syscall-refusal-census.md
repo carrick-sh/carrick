@@ -2,15 +2,18 @@
 
 The acceptance question is whether Carrick served the guest operation, not
 whether the workload found a fallback and exited zero. The census is enabled
-unless `CARRICK_EL1_CENSUS=0`; an optional directory value also retains the
-full JSON sidecar and enables the existing CPU timing diagnostics. Default
+unless `CARRICK_EL1_CENSUS=0`. JSON files go to `target/carrick-census`;
+an explicit directory value selects another destination and enables the
+existing CPU timing diagnostics. Default
 counting adds no thread-clock reads.
 
-`CARRICK_SYSCALL_CENSUS` on carrier stderr contains the full census. Its
+The gates request a private directory, read its files and retain
+`CARRICK_SYSCALL_CENSUS` records in their evidence logs. The CLI does not
+write JSON to the user's stderr. The
 `refusal_evidence` uses native ordinals, an explicit ISA, and root/native-child
 populations. Root identity comes from the admitted process graph, rather
-than assuming its visible PID is 1. Caller classification runs only when a
-refusal occurs. Ring refusals and carrier venue refusals remain separate. Bucket
+than assuming its visible PID is 1. The ring owner seals caller lineage into the retained service birth;
+exec preserves it and invalid lineage fails closed. Ring refusals and carrier venue refusals remain separate. Bucket
 512 means unknown/out of range and cannot qualify. Carrier service payloads
 retain the requesting ordinal, including write/writev and execve/execveat;
 length and ordinal share the existing bounded service-cell word, preserving
@@ -19,9 +22,12 @@ its size. The image layout fingerprint changes with the counter geometry.
 Both smoke and conformance consume this evidence. Permanent/Temporary
 allowlisted refusals fail independently of the oracle. Other refusals require
 a source-qualified syscall shape and fail if Docker served that ordinal.
-Missing shapes require `--refresh-oracle`; old semantic oracle cache entries
-cannot manufacture syscall evidence. Native-oracle runs currently provide no
-bpftrace shape and therefore cannot qualify a nonallowlisted refusal.
+Missing shapes are reported as coverage debt and do not gate nonallowlisted
+refusals until an observation exists. A VM-free test caps committed missing
+shape rows at 11,484; lower that ceiling as shapes land. `--refresh-oracle`
+captures shapes; old semantic cache entries cannot manufacture them.
+Native-oracle runs currently provide no bpftrace shape. This temporary debt
+does not excuse allowlisted refusals, overflow or missing census files.
 
 Shape capture is a separate Docker-only pass; its duration is never a speed
 oracle. The workload retains its ordinary PID namespace and security flags.
@@ -78,3 +84,17 @@ known cwd, checks execve/execveat and the unknown-ordinal bucket, and proves
 that a non-1 root does not enter the child population. These are VM-free
 production service entries, not live guest instruction execution. The signed
 child mkdirat and changed-cwd differential witnesses remain required.
+
+Refusal bookkeeping uses one typed `Counters::record_refusal` operation for
+ring/carrier venue and initial/descendant lineage. Native tickets retain their
+own mapped counters, resolved from carrier stage-2 custody. A later process-global
+counter pointer cannot redirect a ticket's refusal into another carrier.
+Exec failure 38 and publication-race refusal follow this same path. Missing
+cwd at chdir completion and structural IPC leaves count before returning 38.
+Docker shape capture admits every naturally completed workload exit status,
+including the nonzero statuses deliberately exercised by conformance suites.
+
+Each publication retains a uniquely created JSON file, including sequential
+embedded carriers sharing a host PID and grouping ID. The Lima lane forwards
+the destination into its VM and retrieves those files with bounded collection
+commands before checking the same evidence as local lanes.

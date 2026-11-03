@@ -1522,6 +1522,7 @@ fn native_exec_adoption_publishes_closed_manifest_before_consuming_receipt() {
     let service = fixture.process_service();
     let identity = ServiceIdentity {
         birth: ServiceBirth {
+            origin: carrick_core_abi::service::ServiceOrigin::Initial,
             process: TaskKey {
                 id: TaskId::from_registry_allocation(NonZeroI32::new(7).unwrap()),
                 serial: TaskSerial::from_registry_allocation(NonZeroU64::new(11).unwrap()),
@@ -1637,6 +1638,7 @@ fn first_exec_after_fork_exit_reuses_the_slot_with_a_fresh_root_incarnation() {
 
     let identity = ServiceIdentity {
         birth: ServiceBirth {
+            origin: carrick_core_abi::service::ServiceOrigin::Initial,
             process: TaskKey {
                 id: TaskId::from_registry_allocation(NonZeroI32::new(7).unwrap()),
                 serial: TaskSerial::from_registry_allocation(NonZeroU64::new(11).unwrap()),

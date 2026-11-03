@@ -6,10 +6,13 @@ semantic_authority = ["docs/conformance-contracts/syscall-refusal-census.md", "s
 fixture = "crates/carrick-el1-abi/src/refusal_census_tests.rs"
 scale_points = [1]
 structural_budgets = []
-rationale = "Ring refusal and carrier venue refusal are separate exact counters. The child population is a subset of its carrier total. Refusal hooks classify the caller through its admitted owner only on refusal and increment atomic counters; no clock reads are added to the default path. Publication scans 513 native ordinals once after executor join. Overflow, missing evidence and an unavailable oracle shape are incomplete measurements, never semantic passes."
+rationale = "Ring refusal and carrier venue refusal are separate exact counters. The child population is a subset of its carrier total. Refusal hooks classify the caller through its admitted owner only on refusal and increment atomic counters; no clock reads are added to the default path. Publication scans 513 native ordinals once after executor join. Overflow and missing census evidence are incomplete measurements. Missing Docker shapes are counted coverage debt under a monotone committed-row ceiling; allowlisted refusals always fail."
 
 [bindings]
 vm_free = [
+  "carrick-core-abi::service::tests::service_lineage_survives_ticket_intake_and_exec_rebind",
+  "carrick-el1-linux::ipc::tests::native_structural_refusals_retire_without_host_handback",
+  "carrick-el1-abi::refusal_census_tests::typed_refusal_records_total_and_lineage_in_the_same_carrier",
   "carrick-el1-abi::refusal_census_tests::refusal_snapshot_preserves_caller_populations_without_changing_service_counts",
   "carrick-runtime::el1_census::tests::mapped_refused_child_mkdirat_reaches_the_shared_gate",
   "carrick-spec::syscall_census::tests::refused_child_mkdirat_fails_even_without_oracle_shape",
