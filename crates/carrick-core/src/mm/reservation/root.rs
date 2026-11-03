@@ -1912,12 +1912,33 @@ impl<
         *cursor = (*cursor).max(n.end);
         self.gap(n.right, cursor, len, end)
     }
+    /// The lowest arena hole of `len` bytes that no node occupies and no
+    /// owed return covers. Without `MAP_FIXED` Linux chooses the address
+    /// (mmap(2)), so placement routes around an owed extent's VA (still
+    /// the only record of its unreturned frames) instead of choosing it
+    /// and having [`Self::proposal`] refuse `Busy`. Each owed extent moves
+    /// the cursor strictly forward, so the search is bounded by the
+    /// journal's [`DEFERRED_RETURNS`] extents.
     fn first_fit(&mut self, len: u64) -> Option<u64> {
         let arena = self.state().layout.arena;
-        let mut cursor = arena.start();
         let root = self.state().tree;
-        self.gap(root, &mut cursor, len, arena.end())
-            .or_else(|| (arena.end().saturating_sub(cursor) >= len).then_some(cursor))
+        let mut from = arena.start();
+        loop {
+            let mut cursor = from;
+            let start = self
+                .gap(root, &mut cursor, len, arena.end())
+                .or_else(|| (arena.end().saturating_sub(cursor) >= len).then_some(cursor))?;
+            let end = start.checked_add(len)?;
+            let owed_end = self
+                .deferred()
+                .filter(|owed| owed.range.start() < end && start < owed.range.end())
+                .map(|owed| owed.range.end())
+                .max();
+            match owed_end {
+                None => return Some(start),
+                Some(owed_end) => from = owed_end,
+            }
+        }
     }
     fn in_layout(&self, range: ReservationRange) -> bool {
         let layout = self.state().layout;
@@ -3512,6 +3533,9 @@ impl<
     fn first_fit(&mut self, len: GuestLen) -> Option<UserVa> {
         self.first_fit(len.raw()).map(UserVa::new)
     }
+    fn return_owed_within(&self, range: ReservationRange) -> bool {
+        self.return_owed_within(range)
+    }
     fn in_layout(&self, range: ReservationRange) -> bool {
         self.in_layout(range)
     }
@@ -3614,6 +3638,176 @@ mod tests {
         .unwrap();
         guard.complete(receipt).unwrap()
     }
+    /// `munmap` of resident memory whose stage-1 terminals the guest
+    /// venue retired: the range is journalled as an owed return.
+    fn retire_owed(guard: &mut Reservations<'_>, owed: ReservationRange) -> ReservationSequence {
+        let Decision::Work(request) = guard.munmap(owed).unwrap() else {
+            panic!("return proposal");
+        };
+        let slot = guard.reserve_return(request.range).unwrap();
+        // SAFETY: this VM-free owner test models completed descriptor retirement.
+        let receipt = unsafe {
+            ReservationCompletion::after_descriptor_and_backing_commit(
+                request,
+                ReservationBackingReceipt {
+                    receipt: request.sequence.raw(),
+                    granted_bytes: 0,
+                    returned_bytes: 0,
+                },
+            )
+        }
+        .unwrap();
+        guard.complete_deferring_return(receipt, slot).unwrap();
+        request.sequence
+    }
+    fn placed(decision: Result<Decision, Refusal>) -> ReservationRange {
+        match decision {
+            Ok(Decision::Work(request)) => request.range,
+            other => panic!("expected a placement, got {other:?}"),
+        }
+    }
+    fn disjoint(a: ReservationRange, b: ReservationRange) -> bool {
+        a.end() <= b.start() || b.end() <= a.start()
+    }
+
+    /// #1478 (slice 1 of #1369): without `MAP_FIXED` the kernel chooses the
+    /// address (mmap(2)), so placement routes around an owed return
+    /// instead of choosing it and refusing `Busy`. The ring-owned child's
+    /// `munmap` then `mmap(NULL)` (musl's stdout buffer after the
+    /// first-touch fixture's unmap) had no venue for that refusal.
+    #[test]
+    fn anonymous_placement_skips_owed_return_of_the_exact_mm() {
+        let table = table();
+        let (child, peer) = (
+            ReservationMm::new(1478).unwrap(),
+            ReservationMm::new(1479).unwrap(),
+        );
+        for (slot, mm) in [(0, child), (1, peer)] {
+            table.publish(slot, mm, layout()).unwrap();
+            table.lock(slot, mm).unwrap().finish_import().unwrap();
+        }
+        let rw = ReservationProtection::READ_WRITE;
+        const MIB: u64 = 0x100000;
+        let mut root = table.lock(0, child).unwrap();
+        let first = root.mmap(Placement::Anywhere, MIB, rw).unwrap();
+        assert_eq!(complete(&mut root, first), 0x100000);
+        let owed = range(0x100000, 0x100000 + MIB);
+        let sequence = retire_owed(&mut root, owed);
+        assert!(root.mapping(0x100000).is_none());
+
+        // mmap(NULL) of the same size lands outside the owed extent.
+        let fresh = placed(root.mmap(Placement::Anywhere, MIB, rw));
+        assert!(disjoint(fresh, owed), "{fresh:?} overlaps owed {owed:?}");
+        assert_eq!(fresh.start(), owed.end());
+        root.refuse(root.pending().unwrap()).unwrap();
+        // A smaller request fits inside the owed hole yet still skips it.
+        let small = placed(root.mmap(Placement::Anywhere, 4096, rw));
+        assert!(disjoint(small, owed), "{small:?} overlaps owed {owed:?}");
+        root.refuse(root.pending().unwrap()).unwrap();
+        // A hint is a hint: an owed hint range relocates, never refuses.
+        let hinted = placed(root.mmap(Placement::Hint(0x100000), MIB, rw));
+        assert!(disjoint(hinted, owed), "{hinted:?} overlaps owed {owed:?}");
+        root.refuse(root.pending().unwrap()).unwrap();
+        // A free hint beyond the owed extent is still honoured exactly.
+        let exact = placed(root.mmap(Placement::Hint(0x400000), MIB, rw));
+        assert_eq!(exact, range(0x400000, 0x400000 + MIB));
+        root.refuse(root.pending().unwrap()).unwrap();
+        // `mremap(MREMAP_MAYMOVE)` placement shares `first_fit`.
+        assert!(first_fit_avoids(&mut root, owed, MIB));
+        drop(root);
+
+        // The owed extent is this MM's alone: the peer still places there.
+        let mut other = table.lock(1, peer).unwrap();
+        let decision = other.mmap(Placement::Anywhere, MIB, rw).unwrap();
+        assert_eq!(complete(&mut other, decision), 0x100000);
+        drop(other);
+
+        // Settled, the VA is reusable again and placement returns to it.
+        let mut root = table.lock(0, child).unwrap();
+        root.acknowledge_deferred_returns(sequence).unwrap();
+        let decision = root.mmap(Placement::Anywhere, MIB, rw).unwrap();
+        assert_eq!(complete(&mut root, decision), 0x100000);
+    }
+    fn first_fit_avoids(root: &mut Reservations<'_>, owed: ReservationRange, len: u64) -> bool {
+        let start = root.first_fit(len).unwrap();
+        disjoint(range(start, start + len), owed)
+    }
+
+    /// `MAP_FIXED` and `MAP_FIXED_NOREPLACE` name the address: over an owed
+    /// return they keep today's `Busy` (the host venue settles first);
+    /// settling for a ring-owned MM is #1369's later slices.
+    #[test]
+    fn fixed_placement_over_owed_return_keeps_busy() {
+        let table = table();
+        let mm = ReservationMm::new(1480).unwrap();
+        table.publish(0, mm, layout()).unwrap();
+        let mut root = table.lock(0, mm).unwrap();
+        root.finish_import().unwrap();
+        let rw = ReservationProtection::READ_WRITE;
+        let decision = root.mmap(Placement::Fixed(0x200000), 0x4000, rw).unwrap();
+        complete(&mut root, decision);
+        let owed = range(0x200000, 0x204000);
+        retire_owed(&mut root, owed);
+        assert_eq!(
+            root.mmap(Placement::Fixed(0x200000), 0x4000, rw),
+            Err(Refusal::Busy)
+        );
+        assert_eq!(
+            root.mmap(Placement::Fixed(0x203000), 0x2000, rw),
+            Err(Refusal::Busy)
+        );
+        assert_eq!(
+            root.mmap(Placement::NoReplace(0x201000), 0x1000, rw),
+            Err(Refusal::Busy)
+        );
+        assert!(root.pending().is_none());
+        // Adjacent to, not over, the owed extent: fixed placement proceeds.
+        let decision = root.mmap(Placement::Fixed(0x204000), 0x1000, rw).unwrap();
+        assert_eq!(complete(&mut root, decision), 0x204000);
+    }
+
+    /// Adversarial row: owed extents fragment the arena below its free
+    /// tail. Placement passes each at most once (bounded by the journal's
+    /// `DEFERRED_RETURNS` extents) and lands in the first unowed hole.
+    #[test]
+    fn anonymous_placement_skips_a_fragmented_owed_journal() {
+        let table = table();
+        let mm = ReservationMm::new(1481).unwrap();
+        table.publish(0, mm, layout()).unwrap();
+        let mut root = table.lock(0, mm).unwrap();
+        root.finish_import().unwrap();
+        let rw = ReservationProtection::READ_WRITE;
+        // Live page, owed page, alternating: every hole below the tail is owed.
+        let mut owed = Vec::new();
+        for index in 0..DEFERRED_RETURNS as u64 {
+            let base = 0x100000 + index * 0x2000;
+            let decision = root.mmap(Placement::Fixed(base), 0x2000, rw).unwrap();
+            complete(&mut root, decision);
+            let page = range(base, base + 0x1000);
+            retire_owed(&mut root, page);
+            owed.push(page);
+        }
+        let tail = 0x100000 + DEFERRED_RETURNS as u64 * 0x2000;
+        for len in [0x1000, 0x2000, 0x10000] {
+            let fresh = placed(root.mmap(Placement::Anywhere, len, rw));
+            assert!(owed.iter().all(|page| disjoint(fresh, *page)));
+            assert_eq!(fresh.start(), tail);
+            root.refuse(root.pending().unwrap()).unwrap();
+        }
+        // The journal is full: a ninth disjoint retirement still refuses
+        // `Busy` (unchanged; journal-full settlement is a later slice).
+        let decision = root.mmap(Placement::Fixed(tail), 0x2000, rw).unwrap();
+        complete(&mut root, decision);
+        let Decision::Work(request) = root.munmap(range(tail, tail + 0x1000)).unwrap() else {
+            panic!("return proposal");
+        };
+        assert!(matches!(
+            root.reserve_return(request.range),
+            Err(Refusal::Busy)
+        ));
+        root.refuse(request).unwrap();
+    }
+
     #[test]
     fn private_stock_plan_future_holes_are_exact_mm_and_revalidated() {
         let table = table();

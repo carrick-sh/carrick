@@ -491,7 +491,11 @@ pub trait ReservationPolicyAccess {
     fn fork_pending(&self) -> bool;
     fn layout(&self) -> Layout;
     fn next_range(&mut self, address: UserVa) -> Option<ReservationRange>;
+    /// The lowest free arena range of `len` bytes, skipping owed returns.
     fn first_fit(&mut self, len: GuestLen) -> Option<UserVa>;
+    /// Whether an owed return (retired stage-1 leaves whose frames the
+    /// owner has not settled) overlaps `range`: its VA is not placeable.
+    fn return_owed_within(&self, range: ReservationRange) -> bool;
     fn in_layout(&self, range: ReservationRange) -> bool;
     fn mapping(&mut self, address: UserVa) -> Option<Mapping>;
     fn run_covering(&mut self, range: ReservationRange) -> Option<ReservationNodeData>;
