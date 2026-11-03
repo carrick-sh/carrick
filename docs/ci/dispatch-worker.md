@@ -532,6 +532,14 @@ are trusted. Closing this issue in this repository is allowed. A new worker
 commit targeting another issue or repository refuses publication and names the
 commit, so rebase landing cannot close an unrelated issue through its message.
 
+Publication replaces the Copilot SDK's known `Copilot` GitHub noreply
+trailer on new worker commits with the admitted `worker.coauthor`. It keeps
+other contributors, author metadata and file trees, and excludes previously
+published commits. Unknown Copilot identities or invalid assigned agent
+trailers refuse publication. A suffix requiring normalization must be linear;
+the server never flattens a merge to repair attribution. The checkpoint head
+is refreshed before pushing the normalized history.
+
 Every PR body write (including restoration) and loop-authored post, including
 the loop summary and worker-choice reasons,
 inserts a WORD JOINER after mention-leading `@` characters. This works inside
