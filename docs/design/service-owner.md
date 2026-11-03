@@ -1,7 +1,8 @@
 # One syscall service owner (#1393, slice a)
 
 The owner classifies a canonical ordinal, without a task class or an ISA input:
-`Ring(Family)`, `Crossing(OperandSpec)` or `CountedEnosys`. The declarations in
+`Ring(Family)`, `RingOwed(OperandSpec)`, `Crossing(OperandSpec)` or
+`CountedEnosys`. The declarations in
 `dispatch::route_aarch64`, `dispatch::route_x86` and `crossing::host_crossings!`
 remain the sources. Existing ring families take precedence over allowlist
 membership. Descriptor and ppoll families are classified before their venue
@@ -9,9 +10,11 @@ availability is checked. `OperandSpec` currently binds the typed crossing
 identity only; #1396 supplies the operand schema and #1363 the transport. It
 provides neither a memory permit nor authority to act for another task.
 
-This implements the design posted on #1393, with an independent design review
-before implementation. It does not flip the root or claim root/child semantic
-parity. The shared classifier describes ownership; existing ISA wiring, venue
+This implements the design posted on #1393. No independent design review
+preceded implementation. The
+[first independent review](https://github.com/carrick-sh/carrick/pull/1481#issuecomment-6594390809)
+requested the corrections recorded here. It does not flip the root or claim
+root/child semantic parity. The shared classifier describes ownership; existing ISA wiring, venue
 availability, family declines, refusal counters, handbacks and completion work
 retain their current behavior. In particular, a ring owner does not remove a
 valid host-file fallback, and the x86 allowlist remains narrower than ARM's.
@@ -21,7 +24,7 @@ independent threaded paths consult this owner. The root keeps its current host
 handlers through `RootOnly` compatibility. The registry initially names all
 283 retained handler identities, conservatively including real crossings whose
 handlers still have ambient host-task dependencies. This counts retained code
-paths, not 283 observed guest failures. A root handler outside the crossing set
+paths, not 283 observed guest failures. A root handler, including a permanent crossing,
 cannot be added without explicit compatibility admission. Tests independently
 enumerate the Linux and private x86 namespaces and compare both root resolver
 populations with the preexisting module chains. The bitmap membership lookup
@@ -70,3 +73,32 @@ ordinal matches with no allocation or user-memory access. No Linux answer or
 work budget changes. Signed guest behavior, runtime ratios and the later
 native-root flip remain separate acceptance obligations; this slice makes no
 runtime parity claim.
+
+Temporary crossings are `RingOwed`, rather than permanent host ownership. All
+283 retained handlers, including permanent crossings, require RootOnly admission:
+those host handlers still depend on ambient root state, so none of their rows
+are inert. The exact mirror test includes the nine threaded independent entries.
+
+`WiredService::MissingRingFamily` exposes the twelve ISA wiring gaps separately
+from the shared service owner. The gap ceiling is twelve and must shrink as
+wiring lands. Private x86 aliases use their canonical twin for ownership only;
+ABI operand interpretation and current venue selection remain unchanged.
+
+The child-side venue predicates and family declines are still outside the
+RootOnly population ([#1089](https://github.com/carrick-sh/carrick/issues/1089),
+[#1059](https://github.com/carrick-sh/carrick/issues/1059), and
+[#1369](https://github.com/carrick-sh/carrick/issues/1369)).
+They need their own counted migration before slice (c),
+as do optional host-object crossings carried by ring families.
+
+All twelve wiring gaps already have seam issues (no duplicate issues filed):
+
+| Missing ISA | Operations | Seam |
+|---|---|---|
+| x86 | sched_setaffinity, sched_getaffinity | [#1092](https://github.com/carrick-sh/carrick/issues/1092) |
+| x86 | execve, execveat | [#1093](https://github.com/carrick-sh/carrick/issues/1093) |
+| ARM | msgget, msgctl, msgrcv, msgsnd, semget, semctl, semtimedop, semop | [#1091](https://github.com/carrick-sh/carrick/issues/1091) |
+
+The production `authority-debt` check rejects an increase in the wiring ceiling
+relative to the PR base. The projection test derives the actual population from
+both routing tables and requires the ceiling to decrease when wiring lands.

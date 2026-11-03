@@ -50,11 +50,51 @@ fn ratchet(base: [usize; 2], head: [usize; 2]) -> Result<(), DebtError> {
     Ok(())
 }
 
+fn retains_root_resolution(directory: &Path) -> Result<bool, DebtError> {
+    if !directory.exists() {
+        return Ok(false);
+    }
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            if entry.file_name() != "target" && retains_root_resolution(&path)? {
+                return Ok(true);
+            }
+        } else if path.extension().is_some_and(|extension| extension == "rs")
+            && std::fs::read_to_string(path)?.contains("root_only::resolve")
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+const OWNER_SOURCE: &str = "crates/carrick-personality-linux/src/dispatch.rs";
+
+fn wiring_ceiling(source: &str) -> Result<usize, DebtError> {
+    for item in syn::parse_file(source)?.items {
+        if let syn::Item::Const(item) = item
+            && item.ident == "ISA_WIRING_GAP_CEILING"
+            && let syn::Expr::Lit(value) = *item.expr
+            && let syn::Lit::Int(value) = value.lit
+        {
+            return Ok(value.base10_parse()?);
+        }
+    }
+    Err(DebtError::Policy("missing ISA wiring gap ceiling".into()))
+}
+
 pub(crate) fn check(root: &Path, base: Option<&str>) -> Result<(), DebtError> {
     let source = root.join(SOURCE);
     let head = if source.exists() {
         counts(&std::fs::read_to_string(source)?)?
     } else {
+        if retains_root_resolution(&root.join("crates/carrick-kernel/src"))? {
+            return Err(DebtError::Policy(
+                "RootOnly module missing while compatibility entry is retained".into(),
+            ));
+        }
         [0; 2]
     };
     if let Some(base) = base {
@@ -70,6 +110,31 @@ pub(crate) fn check(root: &Path, base: Option<&str>) -> Result<(), DebtError> {
         };
         ratchet(previous, head)?;
     }
+    if !root.join(OWNER_SOURCE).exists() && head == [0, 0] {
+        return Ok(());
+    }
+    let current_wiring = wiring_ceiling(&std::fs::read_to_string(root.join(OWNER_SOURCE))?)?;
+    let old_wiring = if let Some(base) = base {
+        let previous = command::run_checked(
+            "git",
+            ["show", &format!("{base}:{OWNER_SOURCE}")],
+            Some(root),
+        )?;
+        // First admission is the twelve gaps documented in #1091/#1092/#1093.
+        if previous.stdout.contains("ISA_WIRING_GAP_CEILING") {
+            wiring_ceiling(&previous.stdout)?
+        } else {
+            12
+        }
+    } else {
+        12
+    };
+    if current_wiring > old_wiring {
+        return Err(DebtError::Policy(format!(
+            "ISA wiring gaps grew: {old_wiring} -> {current_wiring}"
+        )));
+    }
+    println!("ISA wiring gaps: {current_wiring}");
     println!(
         "RootOnly: {} retained handlers, {} ambient-state obligations",
         head[0], head[1]
@@ -87,6 +152,28 @@ mod tests {
         assert!(ratchet([2, 1], [3, 1]).is_err());
         assert!(ratchet([2, 1], [2, 2]).is_err());
         assert!(ratchet([0, 0], [0, 0]).is_ok());
+    }
+
+    #[test]
+    fn moved_module_cannot_hide_retained_resolution() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("routing.rs"),
+            "root_only::resolve(number, legacy)",
+        )
+        .unwrap();
+        assert!(retains_root_resolution(directory.path()).unwrap());
+        std::fs::remove_file(directory.path().join("routing.rs")).unwrap();
+        assert!(!retains_root_resolution(directory.path()).unwrap());
+    }
+
+    #[test]
+    fn wiring_ceiling_is_typed_and_required() {
+        assert_eq!(
+            wiring_ceiling("pub const ISA_WIRING_GAP_CEILING: usize = 12;").unwrap(),
+            12
+        );
+        assert!(wiring_ceiling("").is_err());
     }
 
     #[test]
