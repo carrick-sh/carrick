@@ -65,10 +65,16 @@ changed-cwd child differential, and the exact-artifact `smoke-signed` gate.
 The x86 KVM root-refusal binding does not replace a live child `mkdirat`
 (ordinal 34) census and refusal-gate witness on AArch64.
 
-One additional integration gap needs a production witness: `caller_access`
-can reject an exec or path request with ENOSYS before a service ticket is
-published. The current `begin_exec_service` / `begin_host_file_service` early
-returns and ARM service-return adapter do not increment a refusal counter for
-that case. The mapped-counter and KVM-root bindings do not cover it. Full
-refusal completeness cannot be claimed until that admission boundary is
-instrumented and witnessed.
+Access admission is counted before a service ticket is published. A typed
+`NativeServiceCall` binds the native ordinal to its census; `caller_access`
+returns an opaque failure only after recording ENOSYS in the ring population.
+Both exec and path admission consume that failure directly. Carrier venue
+counts remain zero because no carrier request exists yet. Ordinary access
+errors (such as ESRCH) preserve their errno and do not become refusals.
+
+The native-child production service binding drops CAP_DAC_OVERRIDE and checks
+one refusal each for openat and execve. The root exec binding removes the
+known cwd, checks execve/execveat and the unknown-ordinal bucket, and proves
+that a non-1 root does not enter the child population. These are VM-free
+production service entries, not live guest instruction execution. The signed
+child mkdirat and changed-cwd differential witnesses remain required.

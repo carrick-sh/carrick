@@ -35,6 +35,25 @@ fn native_exception_signal(
     }
 }
 
+/// Only the access admission funnel constructs this error. Returning it as
+/// a syscall result cannot lose a routing refusal's census evidence.
+pub(super) struct CallerAccessFailure(SyscallResult);
+
+impl core::fmt::Debug for CallerAccessFailure {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_tuple("CallerAccessFailure")
+            .field(&self.0)
+            .finish()
+    }
+}
+
+impl CallerAccessFailure {
+    pub(super) fn into_resume(self) -> NativeResume {
+        NativeResume::Returned(self.0)
+    }
+}
+
 enum PendingServiceReply {
     Fault(Box<carrick_el1_abi::PortalGrantSlot>),
     Exec(Box<ExecSuccessorManifest>),
@@ -682,15 +701,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         payload: Box<[u8]>,
         table: Option<[u64; 3]>,
-        ordinal: carrick_guest_arch::NativeOrdinal,
+        call: NativeServiceCall<'_>,
     ) -> Result<NativeResume, NativeProcessError> {
         // The carrier's exec service resolves and checks access with exactly
         // the caller's own cwd and credentials, which the ring seals into
         // the payload from the caller's task row (#1392), and resolves a
         // descriptor `execveat` names in the caller's ring table (#1530).
-        let access = match self.caller_access() {
+        let access = match self.caller_access(call) {
             Ok(access) => access,
-            Err(errno) => return Ok(NativeResume::Returned(SyscallResult::from_errno(errno))),
+            Err(failure) => return Ok(failure.into_resume()),
         };
         let mut sealed = payload.into_vec();
         if let Err(error) =
@@ -716,7 +735,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let descriptor = carrick_core_abi::service::ExecPayloadDescriptor::checked(
             carrick_guest_arch::GuestVa::new(payload.as_ptr().addr() as u64),
             carrick_guest_arch::GuestLen::new(payload.len() as u64),
-            ordinal,
+            call.ordinal,
         )
         .ok_or(NativeProcessError::Exhausted)?;
         // The staged payload holds every argument: a vfork parent may run.
@@ -766,16 +785,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         resolves_path: bool,
         map: Option<carrick_personality_linux::native_host_file::NativeMapKey>,
         chdir: bool,
-        ordinal: carrick_guest_arch::NativeOrdinal,
+        call: NativeServiceCall<'_>,
     ) -> Result<NativeResume, NativeProcessError> {
         // A path resolves under the caller's own access context (its task
         // row's credentials, umask, cwd and root), carried in the record.
         let record = if resolves_path {
-            let access = match self.caller_access() {
+            let access = match self.caller_access(call) {
                 Ok(access) => access,
-                Err(errno) => {
-                    return Ok(NativeResume::Returned(SyscallResult::from_errno(errno)));
-                }
+                Err(failure) => return Ok(failure.into_resume()),
             };
             match carrick_personality_linux::native_host_file::stamp_access_context(
                 &record, &access,
@@ -804,7 +821,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let payload = carrick_core_abi::service::HostFilePayloadDescriptor::checked(
             carrick_guest_arch::GuestVa::new(record.as_ptr().addr() as u64),
             carrick_guest_arch::GuestLen::new(record.len() as u64),
-            ordinal,
+            call.ordinal,
         )
         .ok_or(NativeProcessError::Exhausted)?;
         self.begin_service_inner(
@@ -837,7 +854,22 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     }
     /// The calling thread's encoded access context: its credentials, and
     /// its process's umask, cwd and root, all from the caller's task row.
-    pub(super) fn caller_access(&self) -> Result<Vec<u8>, carrick_syscall_abi::LinuxErrno> {
+    pub(super) fn caller_access(
+        &self,
+        call: NativeServiceCall<'_>,
+    ) -> Result<Vec<u8>, CallerAccessFailure> {
+        self.encode_caller_access().map_err(|errno| {
+            if errno == carrick_syscall_abi::LINUX_ENOSYS {
+                let bucket = call.ordinal.raw().min(512) as usize;
+                call.counters.refused[bucket].fetch_add(1, Ordering::Relaxed);
+                call.counters
+                    .record_child_refusal(bucket, !self.is_root_process());
+            }
+            CallerAccessFailure(SyscallResult::from_errno(errno))
+        })
+    }
+
+    fn encode_caller_access(&self) -> Result<Vec<u8>, carrick_syscall_abi::LinuxErrno> {
         let graph = self.runtime.graph.lock();
         let stale = carrick_syscall_abi::LINUX_ESRCH;
         let task = graph.owner.task(self.key).map_err(|_| stale)?;

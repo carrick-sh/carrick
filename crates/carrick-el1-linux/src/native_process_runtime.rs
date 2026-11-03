@@ -3954,6 +3954,23 @@ struct ForkReservation<'a, M> {
     parent_page: &'a ThreadLifecyclePage,
     parent_file_table: u64,
 }
+/// A service admission carries its native ordinal and refusal accounting
+/// authority together, including calls rejected before publishing a ticket.
+#[derive(Clone, Copy)]
+pub struct NativeServiceCall<'a> {
+    ordinal: carrick_guest_arch::NativeOrdinal,
+    counters: &'a carrick_el1_abi::Counters,
+}
+
+impl<'a> NativeServiceCall<'a> {
+    pub fn new(
+        ordinal: carrick_guest_arch::NativeOrdinal,
+        counters: &'a carrick_el1_abi::Counters,
+    ) -> Self {
+        Self { ordinal, counters }
+    }
+}
+
 pub struct NativeProcessEntry<
     'r,
     'a,
