@@ -582,6 +582,26 @@ server commits `.github/workflows/` back to its admitted-main state on top,
 pushes that under the same lease, and the outcome lists the workflow files
 left out for the owner to publish from `harvest.patch`.
 
+Worker handoffs retain both the admitted branch tip and the run's last
+published tip as explicit `refs/carrick/publication-*` refs. These are
+comparison authorities, even when a consented rebase removes them from
+HEAD's ancestry. A normal clone omits the source's remote refs and can lose
+these objects on worker 2 (#1531); the deprecated-grafts warning printed by
+hardened Git is incidental to the resulting `bad object` exit 128.
+
+The server imports those exact SHAs from its previous checkpoint into each
+worker checkout and again into the harvested candidate. This automatically
+repairs pruned comparison history before publication without replaying the
+worker's commits or changing the push lease. Connectivity is checked before
+the new checkpoint replaces the previous one. Other publication failures
+remain explicit failures with `harvest.patch` as diagnostic evidence; access
+or lease refusals are never bypassed by replaying a patch.
+
+Agent templates install Semgrep in a read-only virtual environment exposed
+on the default PATH. Template qualification executes `semgrep --version` as
+the agent account, so a missing or inaccessible lint dependency fails the
+template build.
+
 ### One round at a time, and the round's mailbox (#1241)
 
 Workers serialize per dispatch issue (`concurrency` on the `worker` job,
