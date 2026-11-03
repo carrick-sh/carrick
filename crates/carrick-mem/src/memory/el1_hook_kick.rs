@@ -923,6 +923,22 @@ fn el0_brk_enters_the_owner_fault_hook_then_forwards_to_host() {
         assert_eq!(m.far, 0x1000_5000);
         assert_eq!(m.regs, original);
     }
+    // A trapped system-register access (EC 0x18, `mrs MIDR_EL1`) is the
+    // host's to emulate: it keeps the direct exit and never enters the hook.
+    let esr = (0x18_u64 << 26) | (1 << 25) | 0x30_0000;
+    let original: [u64; 31] = std::array::from_fn(|i| 0xBAAD_0000 + i as u64);
+    let mut m = Machine {
+        regs: original,
+        elr: 0x5000_1000,
+        spsr: EL0_DAIF_MASKED,
+        esr,
+        far: 0x1000_5000,
+        ..Machine::full_vector_page(El1IrqMode::Masked)
+    };
+    assert_eq!(m.run(None), Exit::Host, "EC 0x18 must reach the host");
+    assert_eq!(m.fault_frames, 0, "EC 0x18 must not enter the EL1 hook");
+    assert_eq!((m.esr, m.elr, m.far), (esr, 0x5000_1000, 0x1000_5000));
+    assert_eq!(m.regs, original);
 }
 
 #[test]

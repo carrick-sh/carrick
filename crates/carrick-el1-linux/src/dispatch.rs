@@ -796,7 +796,15 @@ pub(super) fn native_service_operation(
             kind: NativeExceptionKind::FloatingPoint,
             address: UserVa::new(frame.elr),
         })),
-        _ => None,
+        // Every other EL0 synchronous exception the vector delivers (a
+        // trapped `wfi`/`wfe`, SVE/SME access, PAC, BTI, FPAC, ...): Linux
+        // answers an EL0 exception it has no handler for with SIGILL
+        // (ILL_ILLOPC) at the PC. Never `None`: a native process has no host
+        // task, so a host exit would kill its executor (#1502).
+        _ => Some(ServiceOperation::Exception(NativeException {
+            kind: NativeExceptionKind::UndefinedInstruction,
+            address: UserVa::new(frame.elr),
+        })),
     }
 }
 

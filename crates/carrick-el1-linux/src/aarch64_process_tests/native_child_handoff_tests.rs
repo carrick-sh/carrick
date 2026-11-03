@@ -918,6 +918,21 @@ fn native_el0_sync_exceptions_have_owned_service_operations() {
             NativeExceptionKind::FloatingPoint,
             frame.elr,
         ),
+        // #1502 review: a class with no handler of its own (here a trapped
+        // EL0 `wfi`, EC 0x01; SVE/SME, PAC, BTI alike) is SIGILL at the PC,
+        // as Linux answers an unknown EL0 exception, never a host exit.
+        (
+            "trapped wfi",
+            (0x01 << 26) | (1 << 25),
+            NativeExceptionKind::UndefinedInstruction,
+            frame.elr,
+        ),
+        (
+            "sme access",
+            (0x1d << 26) | (1 << 25),
+            NativeExceptionKind::UndefinedInstruction,
+            frame.elr,
+        ),
     ] {
         frame.esr = esr;
         let operation = super::super::dispatch::native_service_operation(
