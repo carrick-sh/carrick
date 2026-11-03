@@ -1,3 +1,7 @@
+# #1040 frame prerequisite: ipc::park_key now obtains its ARM re-entry PC
+# through IpcFrame. Endpoint pins, token custody and release are unchanged.
+# Control: carrick-el1-linux::ipc::tests::el1_ipc_io_blocked_read_resumes_by_token_after_fd_reuse
+# (included in the focused ipc:: suite); frame tests cover input restoration.
 schema_version = 1
 id = "kernel.el1.ipc-lifecycle"
 title = "Pipe and eventfd lifecycle has one shared owner"

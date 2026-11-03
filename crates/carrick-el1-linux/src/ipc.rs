@@ -35,12 +35,12 @@
 //!   other argument register is untouched, and the record says what to do
 //!   ([`IpcHandback`]) and carries the original `x0` and syscall number.
 
+use self::frame::IpcFrame;
 use super::sched::{Sched, Served, ThreadCpu, UserWord};
 use carrick_el1::substrate::file::UserCopy;
 use carrick_el1::substrate::ipc::{
     PrefixCopy, StepStatus, from_sched_token, to_sched_token, transfer, wait_key,
 };
-use carrick_el1::substrate::sched::object_wait::OperationResumePc;
 pub use carrick_el1_abi::ipc::IPC_HANDBACK_NR;
 use carrick_el1_abi::ipc::fd::{AccessMode, Error as FdError, Fd, TableId};
 use carrick_el1_abi::ipc::pipe::{WaitFor, WakeSet};
@@ -73,6 +73,7 @@ mod linux {
 pub use linux::{SYS_READ, SYS_WRITE};
 
 mod epoll;
+pub mod frame;
 pub use epoll::SYS_EPOLL_PWAIT;
 
 /// Where the venue finds a task's descriptor table in the shared authority.
@@ -1232,7 +1233,7 @@ fn park_key<C: ThreadCpu, U: UserWord>(
     deadline: Option<u64>,
     interrupt: Option<&mut dyn FnMut() -> bool>,
 ) -> Parked {
-    let Some(resume) = OperationResumePc::new(frame.elr.wrapping_sub(linux::SVC_LEN)) else {
+    let Some(resume) = frame.ipc_reentry_pc() else {
         return Parked::Refused(token);
     };
     if region.update_operation(&token, op).is_err() {
