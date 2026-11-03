@@ -2800,15 +2800,19 @@ impl<
     fn preflight_host_crossing(&mut self, ordinal: u64) -> bool {
         self.frame.preflight_host_crossing(ordinal)
     }
-    fn refused_counters(&self) -> Option<&'a [core::sync::atomic::AtomicU64]> {
-        Some(&self.counters.refused)
-    }
-    fn record_refusal_caller(&self, bucket: usize) {
-        self.counters.record_child_refusal(
-            bucket,
-            self.process
+    fn record_refusal(&self, bucket: usize) {
+        self.counters.record_refusal(
+            carrick_guest_arch::NativeOrdinal::new(bucket as u64),
+            if self
+                .process
                 .as_deref()
-                .is_some_and(|process| !process.is_root_process()),
+                .is_some_and(|process| !process.is_root_process())
+            {
+                carrick_core_abi::service::ServiceOrigin::Descendant
+            } else {
+                carrick_core_abi::service::ServiceOrigin::Initial
+            },
+            carrick_el1_abi::RefusalVenue::Ring,
         );
     }
     fn lifecycle_native(
@@ -3075,13 +3079,7 @@ impl<
             // only repeat this answer. Counted ENOSYS, served in ring.
             memory::DelegatedAnonymous::Forward if file.is_some() => {
                 let nr = carrick_personality_linux::native_host_file::LINUX_NR_MMAP.raw() as usize;
-                self.counters.refused[nr].fetch_add(1, Ordering::Relaxed);
-                self.counters.record_child_refusal(
-                    nr,
-                    self.process
-                        .as_deref()
-                        .is_some_and(|process| !process.is_root_process()),
-                );
+                <Self as PendingFamilies<'_, Context>>::record_refusal(self, nr);
                 self.counters.served[nr].fetch_add(1, Ordering::Relaxed);
                 DelegatedStep::Served(SyscallResult::new(
                     carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),

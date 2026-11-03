@@ -659,6 +659,9 @@ fn common_linux_entry_calls_native_process_custody() {
         idle: bool,
     }
     impl ProcessNative for Process {
+        fn is_root_process(&self) -> bool {
+            true
+        }
         fn binding(&self) -> carrick_core_abi::ExecutionBinding {
             self.binding
         }
@@ -921,6 +924,9 @@ fn compact_common_entry_suspends_only_after_authenticated_park() {
         visits: usize,
     }
     impl ProcessNative<ParkedContextWords> for Process<'_> {
+        fn is_root_process(&self) -> bool {
+            true
+        }
         fn binding(&self) -> carrick_core_abi::ExecutionBinding {
             self.binding
         }

@@ -43,6 +43,9 @@
 # on a gate destroys evidence): every executable's full output goes to the
 # terminal.
 set -euo pipefail
+# Signed probes must retain refusal evidence even outside CI. Gates choose
+# their own private destination when checking a particular workload.
+export CARRICK_EL1_CENSUS="${CARRICK_EL1_CENSUS:-$PWD/target/carrick-census}"
 # Also loads the shared compiler-cache environment before any cargo call.
 # shellcheck disable=SC1091
 . scripts/lib/post-link-sign.sh

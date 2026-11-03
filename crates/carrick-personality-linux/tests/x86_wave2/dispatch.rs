@@ -954,9 +954,6 @@ fn allocator_control_with_pending_host_work_and_no_token_enrolls_three_waiters()
                 .current()
                 .is_some_and(|rec| self.zone.record(rec).has_object_operation())
         }
-        fn refused_counters(&self) -> Option<&'a [AtomicU64]> {
-            None
-        }
         fn original_argument0(&self) -> u64 {
             self.arg0
         }

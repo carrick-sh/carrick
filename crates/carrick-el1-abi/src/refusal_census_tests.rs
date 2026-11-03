@@ -7,9 +7,16 @@ fn refusal_snapshot_preserves_caller_populations_without_changing_service_counts
     let root = Counters::new();
     root.served[34].store(7, Ordering::Relaxed);
     root.forwarded[34].store(5, Ordering::Relaxed);
-    root.refused[34].fetch_add(1, Ordering::Relaxed);
-    root.refused[34].fetch_add(1, Ordering::Relaxed);
-    root.record_child_refusal(34, true);
+    for origin in [
+        carrick_core_abi::service::ServiceOrigin::Initial,
+        carrick_core_abi::service::ServiceOrigin::Descendant,
+    ] {
+        root.record_refusal(
+            carrick_guest_arch::NativeOrdinal::new(34),
+            origin,
+            super::RefusalVenue::Ring,
+        );
+    }
     root.record_refusal(
         carrick_guest_arch::NativeOrdinal::new(34),
         carrick_core_abi::service::ServiceOrigin::Descendant,

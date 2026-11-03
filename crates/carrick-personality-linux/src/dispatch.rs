@@ -300,12 +300,8 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
     fn preflight_host_crossing(&mut self, _ordinal: u64) -> bool {
         true
     }
-    /// Access to the refusal counters array, if available.
-    fn refused_counters(&self) -> Option<&'a [core::sync::atomic::AtomicU64]> {
-        None
-    }
-    /// Record caller-class provenance for a refusal already counted by policy.
-    fn record_refusal_caller(&self, _bucket: usize) {}
+    /// Record a policy refusal together with its caller provenance.
+    fn record_refusal(&self, _bucket: usize) {}
     fn publish_forward_work(&self, original_argument0: u64) {
         if let Some(task) = self.task_state() {
             // No family ran: after owed work drains the execution owner must
@@ -1121,17 +1117,16 @@ fn finish<'a, C: EntryContext + 'a>(
         let canonical = carrick_syscall_abi::CanonicalNr::new(ordinal);
         let crossing_set = pending.crossing_set();
         let ring_first_strict = pending.ring_first_strict();
-        let counters = pending.refused_counters();
         let decision = crate::crossing::evaluate_host_crossing(
             crossing_set,
             ring_first_strict,
             Some(canonical),
             pending.native_number(),
-            counters,
+            None,
             |ret| pending.install_result(ret),
         );
         if decision == crate::crossing::HostCrossingDecision::Refused {
-            pending.record_refusal_caller(
+            pending.record_refusal(
                 pending
                     .crossing_set()
                     .refusal_bucket(pending.native_number()),
@@ -1238,17 +1233,16 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
             }
             let set = pending.crossing_set();
             let strict = pending.ring_first_strict();
-            let counters = pending.refused_counters();
             let decision = crate::crossing::evaluate_host_crossing(
                 set,
                 strict,
                 Some(carrick_syscall_abi::CanonicalNr::new(ordinal)),
                 pending.native_number(),
-                counters,
+                None,
                 |ret| pending.install_result(ret),
             );
             if decision == crate::crossing::HostCrossingDecision::Refused {
-                pending.record_refusal_caller(
+                pending.record_refusal(
                     pending
                         .crossing_set()
                         .refusal_bucket(pending.native_number()),
@@ -1570,8 +1564,8 @@ mod ring_first_tests {
         fn ring_first_strict(&self) -> bool {
             self.strict
         }
-        fn refused_counters(&self) -> Option<&'a [AtomicU64]> {
-            Some(self.refused)
+        fn record_refusal(&self, bucket: usize) {
+            self.refused[bucket].fetch_add(1, Ordering::Relaxed);
         }
         fn original_argument0(&self) -> u64 {
             self.result as u64

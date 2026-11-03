@@ -7285,6 +7285,9 @@ pub(crate) mod tests {
             calls: usize,
         }
         impl ProcessNative<carrick_el1_abi::Aarch64ParkedContext> for Owner {
+            fn is_root_process(&self) -> bool {
+                true
+            }
             fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
                 self.binding
             }

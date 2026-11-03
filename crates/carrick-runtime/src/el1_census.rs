@@ -13,8 +13,8 @@
 //! - `el1_boundaries`: syscalls EL1 served that still returned through the
 //!   host to deliver pending work.
 //!
-//! Always enabled unless `CARRICK_EL1_CENSUS=0`. The carrier emits a refusal
-//! evidence record in `target/carrick-census` at teardown.
+//! Emission is opt-in through a nonempty `CARRICK_EL1_CENSUS` destination.
+//! Unset, empty, or exact `0` emits no census and enables no timing hooks.
 //! `CARRICK_EL1_CENSUS=<directory>` selects another destination for
 //! `<directory>/<CARRICK_RUN_ID or "run">-<pid>-<unique>.json` at teardown, while the
 //! EL1 region is still mapped. Disabled, each hook costs one relaxed load.
@@ -45,14 +45,15 @@ static DIRECTORY: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
 static STARTED: OnceLock<std::time::Instant> = OnceLock::new();
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
+fn census_requested(setting: Option<&std::ffi::OsStr>) -> bool {
+    setting.is_some_and(|value| !value.is_empty() && value != "0")
+}
+
 /// Read the environment once; later calls are one relaxed load.
 pub fn init_from_env() {
     DIRECTORY.get_or_init(|| {
         let setting = std::env::var_os("CARRICK_EL1_CENSUS");
-        ENABLED.store(
-            setting.as_deref() != Some(std::ffi::OsStr::new("0")),
-            Ordering::Relaxed,
-        );
+        ENABLED.store(census_requested(setting.as_deref()), Ordering::Relaxed);
         setting
             .filter(|value| !value.is_empty() && value != "0")
             .map(std::path::PathBuf::from)
@@ -592,6 +593,16 @@ mod tests {
     }
 
     #[test]
+    fn census_emission_requires_an_explicit_destination() {
+        use std::ffi::OsStr;
+        assert!(!census_requested(None));
+        assert!(!census_requested(Some(OsStr::new(""))));
+        assert!(!census_requested(Some(OsStr::new("0"))));
+        assert!(census_requested(Some(OsStr::new("/tmp/census"))));
+        assert!(census_requested(Some(OsStr::new("00"))));
+    }
+
+    #[test]
     fn sequential_carriers_with_one_grouping_id_preserve_every_census() {
         use carrick_spec::syscall_census::{CensusIsa, MARKER};
         let directory = tempfile::tempdir().unwrap();
@@ -629,8 +640,11 @@ mod tests {
     fn mapped_refused_child_mkdirat_reaches_the_shared_gate() {
         use carrick_spec::syscall_census::{CallerClass, CensusIsa};
         let counters = carrick_el1_abi::Counters::new();
-        counters.refused[34].store(1, Ordering::Relaxed);
-        counters.record_child_refusal(34, true);
+        counters.record_refusal(
+            carrick_guest_arch::NativeOrdinal::new(34),
+            carrick_core_abi::service::ServiceOrigin::Descendant,
+            carrick_el1_abi::RefusalVenue::Ring,
+        );
         counters.record_refusal(
             carrick_guest_arch::NativeOrdinal::new(34),
             carrick_core_abi::service::ServiceOrigin::Descendant,
