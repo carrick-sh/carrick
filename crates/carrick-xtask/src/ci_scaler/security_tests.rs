@@ -1107,8 +1107,8 @@ fn orphan_volume_reaped_and_verified_after_destroy_lock_timeout() {
         }
     };
     let id = CloneId::try_from(308).unwrap();
-    assert!(clear_clone_volumes("carrick-ctb", "local", id, &mut run).is_err());
-    clear_clone_volumes("carrick-ctb", "local", id, &mut run).unwrap();
+    assert!(clear_clone_volumes("carrick-ctb", "local", id, &mut run, &mut free_lock).is_err());
+    clear_clone_volumes("carrick-ctb", "local", id, &mut run, &mut free_lock).unwrap();
     assert!(!volume);
     assert_eq!(frees, 2);
 }
@@ -1130,7 +1130,8 @@ fn orphan_cleanup_refuses_existing_config_and_foreign_volumes() {
                 "carrick-ctb",
                 "local",
                 CloneId::try_from(308).unwrap(),
-                &mut run
+                &mut run,
+                &mut free_lock,
             )
             .is_err()
         );
@@ -1184,6 +1185,7 @@ fn json_inventory_reaps_only_owned_images() {
             }
             _ => panic!("unexpected command"),
         },
+        &mut free_lock,
     )
     .unwrap();
     assert_eq!(
@@ -1219,7 +1221,8 @@ fn successful_free_without_volume_removal_is_not_completion() {
             "carrick-ctb",
             "local",
             CloneId::try_from(308).unwrap(),
-            &mut run
+            &mut run,
+            &mut free_lock,
         )
         .is_err()
     );
@@ -1305,4 +1308,176 @@ fn image_inventory_exhaustion_refuses_reservation_and_backs_off() {
     // This is the controller's admission-error policy: no immediate retry.
     backoff.grow();
     assert_eq!(backoff.delay(), Duration::from_secs(60));
+}
+
+fn free_lock(_: CloneId) -> Result<(), ScalerError> {
+    Ok(())
+}
+
+/// A scripted PVE with one competing `qm clone` into the same VMID. Like real
+/// PVE, the clone writes its config under the per-VMID lock before it
+/// allocates disks, reusing the orphan's volume ID.
+#[derive(Default)]
+struct RacingPve {
+    lock_held: bool,
+    config: bool,
+    orphan: bool,
+    clone_pending: bool,
+    /// The clone wins the lock just before cleanup asks for it.
+    clone_before_lock: bool,
+    freed_while_configured: bool,
+    frees: usize,
+}
+impl RacingPve {
+    fn clone_if_unlocked(&mut self) {
+        if self.clone_pending && !self.lock_held {
+            self.clone_pending = false;
+            self.config = true;
+            // The clone's disk takes the same volume ID as the orphan.
+            self.orphan = true;
+        }
+    }
+    fn run(&mut self, args: &[&str]) -> Result<Value, ScalerError> {
+        let owner_check = args[2] == "/cluster/resources";
+        let result = match &args[..2] {
+            ["pvesh", "get"] if args[2].contains("/storage/") => Ok(if self.orphan {
+                json!([{"content":"images","vmid":"309","volid":"local:309/vm-309-cloudinit.qcow2"}])
+            } else {
+                json!([])
+            }),
+            ["pvesh", "get"] => Ok(if self.config {
+                json!([{"vmid":"309","type":"qemu"}])
+            } else {
+                json!([])
+            }),
+            ["pvesm", "free"] => {
+                self.frees += 1;
+                self.freed_while_configured |= self.config;
+                self.orphan = false;
+                Ok(Value::Null)
+            }
+            _ => panic!("unexpected command {args:?}"),
+        };
+        // The reviewed window: right after the owner check, before the free.
+        if owner_check {
+            self.clone_if_unlocked();
+        }
+        result
+    }
+}
+
+#[test]
+fn config_appearing_between_check_and_free_never_frees_a_live_disk() {
+    let id = CloneId::try_from(309).unwrap();
+    for clone_before_lock in [false, true] {
+        let pve = std::cell::RefCell::new(RacingPve {
+            orphan: true,
+            clone_pending: true,
+            clone_before_lock,
+            ..RacingPve::default()
+        });
+        struct Release<'a>(&'a std::cell::RefCell<RacingPve>);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                let mut pve = self.0.borrow_mut();
+                pve.lock_held = false;
+                pve.clone_if_unlocked();
+            }
+        }
+        let result = clear_clone_volumes(
+            "carrick-ctb",
+            "local",
+            id,
+            &mut |args| pve.borrow_mut().run(args),
+            &mut |_| {
+                let mut state = pve.borrow_mut();
+                if state.clone_before_lock {
+                    state.clone_if_unlocked();
+                }
+                state.lock_held = true;
+                Ok(Release(&pve))
+            },
+        );
+        let pve = pve.into_inner();
+        assert!(
+            !pve.freed_while_configured,
+            "freed a configured VMID's disk"
+        );
+        assert!(pve.config && pve.orphan, "the clone's disk must survive");
+        if clone_before_lock {
+            assert!(result.is_err());
+            assert_eq!(pve.frees, 0);
+        } else {
+            // The real orphan is reaped; the clone waits for the lock.
+            result.unwrap();
+            assert_eq!(pve.frees, 1);
+        }
+    }
+}
+
+#[test]
+fn vmid_lock_timeout_fails_closed_and_frees_nothing() {
+    let id = CloneId::try_from(309).unwrap();
+    let mut pve = RacingPve {
+        orphan: true,
+        ..RacingPve::default()
+    };
+    let mut busy = true;
+    let mut lock = |_: CloneId| {
+        if std::mem::take(&mut busy) {
+            Err(ScalerError::External(
+                "PVE VMID lock busy; retry cleanup next reconcile",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    let mut run = |args: &[&str]| pve.run(args);
+    assert!(clear_clone_volumes("carrick-ctb", "local", id, &mut run, &mut lock).is_err());
+    clear_clone_volumes("carrick-ctb", "local", id, &mut run, &mut lock).unwrap();
+    assert_eq!(pve.frees, 1);
+    assert!(!pve.orphan);
+}
+
+#[test]
+fn pve_vmid_lock_files_exclude_a_holder_and_time_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = [
+        dir.path().join("qemu-server/lock-309.conf"),
+        dir.path().join("lxc/pve-config-309.lock"),
+    ];
+    let held = lock_files_within(&paths, Duration::ZERO).unwrap();
+    assert_eq!(held.len(), 2);
+    // flock binds open file descriptions, so a second open contends like qm.
+    assert!(matches!(
+        lock_files_within(&paths[1..], Duration::from_millis(100)),
+        Err(ScalerError::External(_))
+    ));
+    drop(held);
+    lock_files_within(&paths, Duration::ZERO).unwrap();
+    assert_eq!(
+        pve_vmid_lock_paths(CloneId::try_from(309).unwrap()),
+        [
+            PathBuf::from("/var/lock/qemu-server/lock-309.conf"),
+            PathBuf::from("/run/lock/lxc/pve-config-309.lock"),
+        ]
+    );
+}
+
+#[test]
+fn owner_parsers_accept_string_and_number_vmids() {
+    for row in [json!({"vmid":309}), json!({"vmid":"309"})] {
+        assert_eq!(pve_vmid(&row), Some(309));
+    }
+    assert_eq!(pve_vmid(&json!({"vmid":"30x"})), None);
+    let rows = [json!({"content":"images","vmid":"309","volid":"local:309/d"})];
+    assert_eq!(storage_reservations(&rows)[0].id, 309);
+    let volumes = clone_volumes(
+        "carrick-ctb",
+        "local",
+        CloneId::try_from(309).unwrap(),
+        &mut |_| Ok(Value::Array(rows.to_vec())),
+    )
+    .unwrap();
+    assert_eq!(volumes, ["local:309/d"]);
 }
