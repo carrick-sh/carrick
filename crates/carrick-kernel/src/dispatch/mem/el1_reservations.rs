@@ -946,6 +946,16 @@ mod tests {
             )
             .unwrap();
         }
+        // Each root starts with its own table-unique generation. Capture the
+        // peer before changing A so this checks B's stability, not equality
+        // between two independent MM lifetimes.
+        let peer_initial = ReservationProcMaps::capture(
+            &mut table
+                .lock_with_context::<carrick_el1_abi::Aarch64ParkedContext>(1, b)
+                .unwrap(),
+            &NonAnonymousVmas::try_from((b, VmaMap::new())).unwrap(),
+        )
+        .unwrap();
         let initial = ReservationProcMaps::capture(
             &mut table
                 .lock_with_context::<carrick_el1_abi::Aarch64ParkedContext>(0, a)
@@ -1011,7 +1021,7 @@ mod tests {
         let host = NonAnonymousVmas::try_from((b, VmaMap::new())).unwrap();
         let unchanged = ReservationProcMaps::capture(&mut peer, &host).unwrap();
         assert_eq!(unchanged.mm(), b);
-        assert_eq!(unchanged.generation(), initial.generation());
+        assert_eq!(unchanged.generation(), peer_initial.generation());
         assert!(unchanged.maps()[0].write);
         assert_eq!(
             peer.fault_plan(va, 4096, ReservationProtection::READ_WRITE)
