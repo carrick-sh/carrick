@@ -5,7 +5,7 @@ name: Kernel runtime · trusted hardware
 # pull_request trigger: the persistent HVF runner (`carrick-hvf`), the
 # standing KVM controller (`carrick-xtask ci-scaler standing`), and each
 # runner's job-start hook admit only these events for this workflow file
-# (docs/ci/mac-hvf-runner.md, docs/ci/contabo-kvm.md).
+# (docs/ci/mac-hvf-runner.md, docs/ci/willow-pilot.md).
 on:
   push:
     branches: [main]
@@ -409,18 +409,18 @@ jobs:
   # A real KVM device is the contract. An incidental or software-emulated
   # hosted environment is not accepted as this lane. Every `kvm`-lane test
   # target runs (`just test-kvm`, derived from Cargo metadata) on a real
-  # /dev/kvm, on push to main or owner dispatch, on Contabo JIT clones
-  # (`ci-scaler standing`, docs/ci/contabo-kvm.md).
+  # /dev/kvm, on push to main or owner dispatch, on Willow JIT clones
+  # (`ci-scaler standing`, docs/ci/willow-pilot.md, docs/ci/contabo-kvm.md).
   # Its labels are `ci_scaler::LABELS`; a test keeps them identical.
   # Pull requests and merge groups are not run here; only main pushes and
   # owner dispatches may reach the hardware.
-  kvm-tests:
-    name: KVM · x86 kvm-lane tests (Contabo)
+  kvm-tests-willow:
+    name: KVM · x86 kvm-lane tests (Willow)
     if: >-
       ${{ !cancelled() &&
           vars.CARRICK_SELF_HOSTED_KVM == 'true' &&
           (github.event_name != 'workflow_dispatch' || (github.ref == 'refs/heads/main' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine')) }}
-    runs-on: [self-hosted, Linux, X64, carrick-kvm]
+    runs-on: [self-hosted, Linux, X64, willow-kvm]
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
@@ -640,8 +640,8 @@ jobs:
     permissions:
       contents: read
       actions: read
-    needs: [kvm-tests]
-    if: ${{ !cancelled() && github.event_name == 'push' && needs.kvm-tests.result != 'skipped' }}
+    needs: [kvm-tests-willow]
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.kvm-tests-willow.result != 'skipped' }}
     runs-on: ubuntu-latest
     timeout-minutes: 110
     steps:
@@ -831,7 +831,7 @@ jobs:
   trusted-hardware-ok:
     name: Trusted hardware OK
     if: ${{ always() }}
-    needs: [signed-fixtures, hvf-kernel, kvm-tests, hvf-gate, kvm-gate, el1-native-tests, el1-native-gate]
+    needs: [signed-fixtures, hvf-kernel, kvm-tests-willow, hvf-gate, kvm-gate, el1-native-tests, el1-native-gate]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -866,7 +866,7 @@ jobs:
         env:
           SUPERSEDED: ${{ steps.superseded.outputs.superseded }}
           HVF: ${{ needs.hvf-kernel.result }}
-          KVM: ${{ needs.kvm-tests.result }}
+          KVM: ${{ needs.kvm-tests-willow.result }}
           HVF_GATE: ${{ needs.hvf-gate.result }}
           KVM_GATE: ${{ needs.kvm-gate.result }}
           EL1N: ${{ needs.el1-native-tests.result }}
