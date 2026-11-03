@@ -192,3 +192,40 @@ census immediately after a real guest terminal result, before shutdown, then
 runs a second explicit carrier in the same process. This witness is expected
 to fail against the old shutdown-only writer. It requires signed HVF execution;
 compilation and the VM-free atomic writer test do not qualify the live ordering.
+
+### Host-file staging refusal audit (carrick-87)
+
+`native_host_file_staging_refusal_is_counted_once` drives the production
+`native_host_file_stage` entry with a relative `openat` through a host-backed
+dirfd, then its production return settlement. It requires one ring refusal,
+one served answer, the exact root/child subset, and no carrier refusal.
+An ordinary EBADF settlement must leave refusal counts unchanged.
+Both `Returned(ENOSYS)` and `InRing` settle through `native_host_file_return`;
+there is no carrier ticket to count these answers later.
+
+The native-path ENOSYS audit found these other sites:
+
+- `native_host_file::Staging::path_base` and `Faccessat` with an empty path
+  and `AT_EMPTY_PATH` produce `Returned(ENOSYS)`. Both now reach this settlement.
+- `dispatch`'s delegated private mmap refusal already records through
+  `PendingFamilies::record_refusal`, then counts its served answer.
+- `ipc`'s structural refusal already records in its completion path.
+- `native_process_runtime::service::encode_caller_access` propagates ENOSYS
+  to `caller_access`, which records it; missing-fs `complete_chdir` records
+  before returning ENOSYS.
+- `service`'s Crossing, HostFile and Exec `ServiceResult::Refused` arms consume
+  carrier refusals. `NativeService::refuse` and `refuse_host_file` record the
+  venue refusal before acknowledgement; recording again in ring would count
+  the same refusal twice.
+- The `GuestDispatchFrame` signal-frame default methods return unsupported
+  capability errors, rather than native host-file dispatch answers. Native
+  ARM signal restoration overrides the default, and signal setup uses the
+  process backend. Exec staging itself emits only E2BIG, EFAULT,
+  ENAMETOOLONG and ENOMEM, not ENOSYS.
+
+No additional uncounted native dispatch ENOSYS return was found in this audit.
+This VM-free witness does not qualify signed guest execution or oracle shapes.
+
+With the shared return settlement's accounting removed, the witness failed
+with `refused[56] == 0` instead of `1` (exit 101). Restoring accounting is
+required for the green witness; staging still returns errno 38 unchanged.
