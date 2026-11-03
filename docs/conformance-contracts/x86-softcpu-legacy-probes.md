@@ -34,7 +34,7 @@ zero input and ZF for a zero result. No feature is newly advertised.
 
 ## Static admission census
 
-`cargo run -p carrick-softcpu-x86 --example scan_unsupported -- --expect-files 530 ELF...`
+`cargo run -p carrick-softcpu-x86 --example scan_unsupported -- --expect-files 552 ELF...`
 linearly decodes executable ELF sections through the production classifier.
 It reports every unsupported encoding, its occurrence count, and affected ELF
 count, sorted by encoding. Inline data and deliberate UD2 traps remain visible:
@@ -57,10 +57,44 @@ conformance-probes/Cargo.toml --release --target x86_64-unknown-linux-musl
 on x86 (`ctrel0`, `forkfpregs`, `inzonetcp`, `mmapv8align`, `nativeetexecfork`,
 `ptracepoketext`, `tlsswitch`, `windowcoherence`). These build failures are
 explicit exclusions, not successful probes. No stale binaries were present.
-The census decoded 47,050,390 instructions and found 54 unsupported encodings.
+The final census decoded 47,050,390 instructions and found 51 unsupported encodings
+(down from 54 before the extended legacy SIMD addition).
 The ceiling is `conformance-contracts/softcpu-x86-musl-residue.tsv`; counts may
 only decrease for this input population. The newly served PMOVMSKB, PINSRW,
 BTR memory and TZCNT encodings are absent from the residue. Highest remaining
 non-trap counts are PCMPGTB (26,496), PSRLQ immediate (11,040), and x87 FSTP
 (9,384). UD2 (32,156) remains visible as an intentional architectural #UD.
 This is not a runtime conformance verdict for those binaries.
+
+## Owner scope addition: extended legacy SIMD
+
+The checked vector executor now also serves the XMM forms of SSE3, SSSE3,
+SSE4.1 and SSE4.2. It reuses its existing private operand, masked exception,
+and transactional destination publication protocol. Legacy leaves use FXSAVE
+for XMM state and never touch YMM upper halves or require guest AVX/XCR0.
+Full-width legacy arithmetic retains its alignment requirement; LDDQU and
+PCMP*STR* accept unaligned operands. Integer widening/extraction/insertion
+uses the exact decoded memory width. Explicit GPRs are remapped with their
+8/16/32/64-bit width, and string comparisons publish implicit ECX/XMM0 and
+architectural flags. x87 FISTTP remains refused while CPUID.FPU is clear.
+
+Cpl0CpuidView now advertises leaf-1 ECX bits 0, 9, 19, 20 and 23. Admission
+checks the installed guest authority before memory or register changes;
+Level0CpuidView continues to omit those features. A native differential
+census covers 182 register/memory encodings at three input patterns and
+repeats each with the feature absent to prove refusal before mutation.
+Separate witnesses cover alignment, cross-page faults, feature replacement,
+and sized scalar destinations. The initial SSE3 witness failed with #UD.
+
+POPCNT and SSE4.2 CRC32 execute as bounded scalar operations without vector
+leaves or FXSAVE. F3 BSR now follows the guest LZCNT bit, falling back to BSR
+when absent; its first production-path witness failed before implementation.
+TZCNT/LZCNT also remain scalar. CRC32 uses the SDM's reflected Castagnoli
+polynomial, independently compared against native results by the census.
+
+The owner's #1469 review describes BMI/MOVBE/AES/PCLMUL implementations that
+are absent from admitted main. Their encodings remain refused here, with an
+explicit regression witness under Level0CpuidView. There is no scalar BMI or
+MOVBE vector leaf to optimize on this base. Integrating those implementations
+must preserve guest-feature admission and the scalar execution split; this
+slice cannot qualify absent code. No CPUID bits for those extensions are added.

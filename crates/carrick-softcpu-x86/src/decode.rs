@@ -528,7 +528,7 @@ pub(crate) fn supported_body(insn: &Instruction) -> bool {
         | Mnemonic::Shr | Mnemonic::Sal | Mnemonic::Sar | Mnemonic::Rol | Mnemonic::Ror
         | Mnemonic::Rcl | Mnemonic::Rcr | Mnemonic::Shld | Mnemonic::Shrd | Mnemonic::Bswap
         | Mnemonic::Xchg | Mnemonic::Xadd | Mnemonic::Cmpxchg | Mnemonic::Cmpxchg8b | Mnemonic::Bt
-        | Mnemonic::Btc | Mnemonic::Btr | Mnemonic::Bts | Mnemonic::Bsf | Mnemonic::Bsr | Mnemonic::Tzcnt
+        | Mnemonic::Btc | Mnemonic::Btr | Mnemonic::Bts | Mnemonic::Bsf | Mnemonic::Bsr | Mnemonic::Tzcnt | Mnemonic::Lzcnt | Mnemonic::Popcnt | Mnemonic::Crc32
         | Mnemonic::Cbw | Mnemonic::Cwde | Mnemonic::Cdqe | Mnemonic::Cwd | Mnemonic::Cdq
         | Mnemonic::Cqo | Mnemonic::Clc | Mnemonic::Stc | Mnemonic::Cmc | Mnemonic::Cld
         | Mnemonic::Std | Mnemonic::Lahf | Mnemonic::Sahf | Mnemonic::Cmova | Mnemonic::Cmovae

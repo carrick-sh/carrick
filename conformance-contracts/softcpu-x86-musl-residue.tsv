@@ -28,13 +28,10 @@ Fucomi_st0_sti	2208	552
 Fucomip_st0_sti	2208	552
 Fxch_st0_sti	8280	552
 Movlhps_xmm_xmm	552	552
-Pblendw_xmm_xmmm128_imm8	3	1
 Pclmulqdq_xmm_xmmm128_imm8	6	1
 Pcmpgtb_xmm_xmmm128	26496	552
-Pextrd_rm32_xmm_imm8	1	1
 Pextrw_r32_xmm_imm8	35	7
 Pmaddwd_xmm_xmmm128	8	1
-Pmovzxdq_xmm_xmmm64	1	1
 Pmuludq_xmm_xmmm128	4416	552
 Psadbw_xmm_xmmm128	188	24
 Pslld_xmm_imm8	2	1

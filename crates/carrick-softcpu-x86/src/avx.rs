@@ -1,4 +1,4 @@
-//! Checked VEX execution. The native leaf sees only private, aligned operands;
+//! Checked legacy extended SIMD and VEX execution. The native leaf sees only private, aligned operands;
 //! guest addresses and masked/VSIB accesses are resolved by the software MMU.
 
 use std::mem::offset_of;
@@ -13,13 +13,48 @@ use crate::context::{
 };
 use crate::mmu::{SoftAccessKind, TranslatedTarget};
 
+pub(crate) fn legacy_feature_mask(insn: &Instruction) -> u32 {
+    if insn.encoding() != EncodingKind::Legacy {
+        return 0;
+    }
+    let mut mask = 0;
+    for f in insn.cpuid_features() {
+        mask |= match f {
+            CpuidFeature::SSE3 => 1,
+            CpuidFeature::SSSE3 => 1 << 9,
+            CpuidFeature::SSE4_1 => 1 << 19,
+            CpuidFeature::SSE4_2 => 1 << 20,
+            _ => return 0,
+        };
+    }
+    // SSE3 x87 instructions do not become executable while CPUID.FPU is clear.
+    if !insn
+        .op_kinds()
+        .enumerate()
+        .any(|(i, k)| k == OpKind::Register && insn.op_register(i as u32).is_xmm())
+    {
+        return 0;
+    }
+    mask
+}
+
+pub(crate) fn controls_allow(ctx: &SoftCpuContext, insn: &Instruction) -> bool {
+    let legacy = legacy_feature_mask(insn);
+    if legacy != 0 {
+        ctx.legacy_features & legacy == legacy && ctx.cr0 & 4 == 0 && ctx.cr4 & (1 << 9) != 0
+    } else {
+        ctx.cr4 & (1 << 18) != 0 && ctx.xcr0 & 6 == 6
+    }
+}
+
 pub(crate) fn supported(insn: &Instruction) -> bool {
-    insn.encoding() == EncodingKind::VEX
-        && insn
-            .cpuid_features()
-            .iter()
-            .all(|f| matches!(f, CpuidFeature::AVX | CpuidFeature::AVX2))
-        && !matches!(insn.mnemonic(), Mnemonic::Vldmxcsr | Mnemonic::Vstmxcsr)
+    legacy_feature_mask(insn) != 0
+        || (insn.encoding() == EncodingKind::VEX
+            && insn
+                .cpuid_features()
+                .iter()
+                .all(|f| matches!(f, CpuidFeature::AVX | CpuidFeature::AVX2))
+            && !matches!(insn.mnemonic(), Mnemonic::Vldmxcsr | Mnemonic::Vstmxcsr))
 }
 
 fn masked(insn: &Instruction) -> bool {
@@ -74,7 +109,16 @@ fn slot(offset: usize) -> MemoryOperand {
 /// Immutable, per-encoding leaf; no guest register can name the host stack or
 /// the leaf's context pointer. AVX GPR operands are explicit and remapped.
 pub(crate) fn image(insn: &Instruction) -> Result<Vec<u8>, String> {
-    if !std::is_x86_feature_detected!("avx2") {
+    let legacy = legacy_feature_mask(insn) != 0;
+    if legacy
+        && !(std::is_x86_feature_detected!("sse3")
+            && std::is_x86_feature_detected!("ssse3")
+            && std::is_x86_feature_detected!("sse4.1")
+            && std::is_x86_feature_detected!("sse4.2"))
+    {
+        return Err("legacy SIMD execution needs an SSE4.2-capable same-ISA host".into());
+    }
+    if !legacy && !std::is_x86_feature_detected!("avx2") {
         return Err("AVX execution needs an AVX2-capable same-ISA host".into());
     }
     let mut encoder = Encoder::new(64);
@@ -88,23 +132,27 @@ pub(crate) fn image(insn: &Instruction) -> Result<Vec<u8>, String> {
         Code::Fxsave64_m512byte,
         slot(offset_of!(Run, host)),
     ))?;
-    for i in 0..16 {
-        emit(Instruction::with2(
-            Code::VEX_Vmovdqu_ymmm256_ymm,
-            slot(offset_of!(Run, host_vectors) + i * 32),
-            Register::YMM0 + i as u32,
-        ))?;
+    if !legacy {
+        for i in 0..16 {
+            emit(Instruction::with2(
+                Code::VEX_Vmovdqu_ymmm256_ymm,
+                slot(offset_of!(Run, host_vectors) + i * 32),
+                Register::YMM0 + i as u32,
+            ))?;
+        }
     }
     emit(Instruction::with1(
         Code::Fxrstor64_m512byte,
         slot(offset_of!(Run, working)),
     ))?;
-    for i in 0..16 {
-        emit(Instruction::with2(
-            Code::VEX_Vmovdqu_ymm_ymmm256,
-            Register::YMM0 + i as u32,
-            slot(offset_of!(Run, vectors) + i * 32),
-        ))?;
+    if !legacy {
+        for i in 0..16 {
+            emit(Instruction::with2(
+                Code::VEX_Vmovdqu_ymm_ymmm256,
+                Register::YMM0 + i as u32,
+                slot(offset_of!(Run, vectors) + i * 32),
+            ))?;
+        }
     }
     emit(Instruction::with2(
         Code::Lea_r64_m,
@@ -127,10 +175,11 @@ pub(crate) fn image(insn: &Instruction) -> Result<Vec<u8>, String> {
             ))?;
             native.set_op_register(
                 i,
-                if insn.op_register(i).is_gpr64() {
-                    Register::R8 + i
-                } else {
-                    Register::R8D + i
+                match insn.op_register(i).size() {
+                    1 => Register::R8L + i,
+                    2 => Register::R8W + i,
+                    4 => Register::R8D + i,
+                    _ => Register::R8 + i,
                 },
             );
         }
@@ -176,12 +225,14 @@ pub(crate) fn image(insn: &Instruction) -> Result<Vec<u8>, String> {
             ))?;
         }
     }
-    for i in 0..16 {
-        emit(Instruction::with2(
-            Code::VEX_Vmovdqu_ymmm256_ymm,
-            slot(offset_of!(Run, vectors) + i * 32),
-            Register::YMM0 + i as u32,
-        ))?;
+    if !legacy {
+        for i in 0..16 {
+            emit(Instruction::with2(
+                Code::VEX_Vmovdqu_ymmm256_ymm,
+                slot(offset_of!(Run, vectors) + i * 32),
+                Register::YMM0 + i as u32,
+            ))?;
+        }
     }
     emit(Instruction::with1(
         Code::Fxsave64_m512byte,
@@ -191,12 +242,14 @@ pub(crate) fn image(insn: &Instruction) -> Result<Vec<u8>, String> {
         Code::Fxrstor64_m512byte,
         slot(offset_of!(Run, host)),
     ))?;
-    for i in 0..16 {
-        emit(Instruction::with2(
-            Code::VEX_Vmovdqu_ymm_ymmm256,
-            Register::YMM0 + i as u32,
-            slot(offset_of!(Run, host_vectors) + i * 32),
-        ))?;
+    if !legacy {
+        for i in 0..16 {
+            emit(Instruction::with2(
+                Code::VEX_Vmovdqu_ymm_ymmm256,
+                Register::YMM0 + i as u32,
+                slot(offset_of!(Run, host_vectors) + i * 32),
+            ))?;
+        }
     }
     emit(Ok(Instruction::with(Code::Retnq)))?;
     Ok(encoder.take_buffer())
@@ -223,7 +276,7 @@ pub(crate) fn step(
     leaf: Option<LeafFn>,
 ) -> Result<(), X86Exception> {
     // SDM Vol. 2 AVX exception class: #UD controls precede #NM and memory.
-    if ctx.cr4 & (1 << 18) == 0 || ctx.xcr0 & 6 != 6 {
+    if !controls_allow(ctx, insn) {
         return Err(X86Exception::invalid_opcode(ip));
     }
     if ctx.cr0 & 8 != 0 {
@@ -272,16 +325,29 @@ pub(crate) fn step(
             if size > 32 {
                 return Err(X86Exception::invalid_opcode(ip));
             }
-            if matches!(
-                insn.mnemonic(),
-                Mnemonic::Vmovaps
-                    | Mnemonic::Vmovapd
-                    | Mnemonic::Vmovdqa
-                    | Mnemonic::Vmovntps
-                    | Mnemonic::Vmovntpd
-                    | Mnemonic::Vmovntdq
-                    | Mnemonic::Vmovntdqa
-            ) && va & (size as u64 - 1) != 0
+            let legacy_aligned = legacy_feature_mask(insn) != 0
+                && size == 16
+                && !matches!(
+                    insn.mnemonic(),
+                    Mnemonic::Lddqu
+                        | Mnemonic::Pcmpistri
+                        | Mnemonic::Pcmpistrm
+                        | Mnemonic::Pcmpestri
+                        | Mnemonic::Pcmpestri64
+                        | Mnemonic::Pcmpestrm
+                        | Mnemonic::Pcmpestrm64
+                );
+            if (legacy_aligned && va & 15 != 0)
+                || matches!(
+                    insn.mnemonic(),
+                    Mnemonic::Vmovaps
+                        | Mnemonic::Vmovapd
+                        | Mnemonic::Vmovdqa
+                        | Mnemonic::Vmovntps
+                        | Mnemonic::Vmovntpd
+                        | Mnemonic::Vmovntdq
+                        | Mnemonic::Vmovntdqa
+                ) && va & (size as u64 - 1) != 0
             {
                 return Err(X86Exception::general_protection(ip, 0));
             }
@@ -308,7 +374,7 @@ pub(crate) fn step(
         None
     };
     // SAFETY: image remaps every explicit address/GPR, masks FP exceptions,
-    // saves/restores host vectors and publishes a leaf only on an AVX2 host.
+    // saves/restores host vectors and qualifies the native ISA before publication.
     unsafe {
         leaf(&mut run);
     }
@@ -338,6 +404,9 @@ pub(crate) fn step(
         transfer(ctx, va, &mut run.operand[..size], true, true, ip, size <= 8)?;
     }
     for i in 0..16 {
+        if legacy_feature_mask(insn) != 0 {
+            run.vectors[i][..16].copy_from_slice(&run.working.0[160 + i * 16..176 + i * 16]);
+        }
         set_vector(ctx, i, &run.vectors[i]);
     }
     for i in 0..insn.op_count() {
@@ -350,7 +419,12 @@ pub(crate) fn step(
     }
     if matches!(
         insn.mnemonic(),
-        Mnemonic::Vpcmpestri | Mnemonic::Vpcmpestri64 | Mnemonic::Vpcmpistri
+        Mnemonic::Vpcmpestri
+            | Mnemonic::Vpcmpestri64
+            | Mnemonic::Vpcmpistri
+            | Mnemonic::Pcmpestri
+            | Mnemonic::Pcmpestri64
+            | Mnemonic::Pcmpistri
     ) {
         ctx.gpr[crate::context::reg::RCX] = run.implicit_gprs[1];
     }

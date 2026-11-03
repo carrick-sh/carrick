@@ -413,6 +413,8 @@ pub struct SoftCpuContext {
     pub cpl: u8,
     pub pkru: u32,
     pub(crate) bmi1: bool,
+    pub(crate) lzcnt: bool,
+    pub(crate) legacy_features: u32,
     pub xcr0: u64,
     pub cr0: u64,
     pub cr2: u64,
@@ -568,6 +570,8 @@ impl SoftCpuContext {
             cpl: 3,
             pkru: 0,
             bmi1: false,
+            lzcnt: false,
+            legacy_features: 0,
             xcr0: 0x3,
             // EM stays clear for SSE data operations. CPUID.FPU remains clear:
             // x87 instructions are refused independently of this control bit.
@@ -912,8 +916,7 @@ impl SoftCpuContext {
                 None
             };
             let avx = if crate::avx::needs_leaf(&d.raw)
-                && self.cr4 & (1 << 18) != 0
-                && self.xcr0 & 6 == 6
+                && crate::avx::controls_allow(self, &d.raw)
                 && self.cr0 & 8 == 0
             {
                 let key = crate::avx::key(&d.raw)
@@ -1396,7 +1399,54 @@ fn step_complex_inner(
             let entry = fp_leaf.ok_or_else(|| X86Exception::invalid_opcode(insn_va))?;
             step_fp(ctx, insn, insn_va, entry)
         }
-        Mnemonic::Tzcnt => step_tzcnt(ctx, insn, insn_va),
+        Mnemonic::Crc32 => {
+            if ctx.legacy_features & (1 << 20) == 0 {
+                return Err(X86Exception::invalid_opcode(insn_va));
+            }
+            let value = if insn.op1_kind() == OpKind::Memory {
+                read_int(
+                    ctx,
+                    compute_effective_va(insn, ctx),
+                    insn.memory_size().size(),
+                    insn_va,
+                )?
+            } else {
+                read_reg_sized(ctx, insn.op1_register()).0
+            };
+            let width = if insn.op1_kind() == OpKind::Memory {
+                insn.memory_size().size()
+            } else {
+                insn.op1_register().size()
+            };
+            let mut crc = read_reg_sized(ctx, insn.op0_register()).0 as u32;
+            for byte in value.to_le_bytes().iter().take(width) {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = (crc >> 1) ^ (0x82f6_3b78 & 0u32.wrapping_sub(crc & 1));
+                }
+            }
+            write_reg_sized(ctx, insn.op0_register(), u64::from(crc));
+            Ok(())
+        }
+        Mnemonic::Popcnt => {
+            if ctx.legacy_features & (1 << 23) == 0 {
+                return Err(X86Exception::invalid_opcode(insn_va));
+            }
+            let v = if insn.op1_kind() == OpKind::Memory {
+                read_int(
+                    ctx,
+                    compute_effective_va(insn, ctx),
+                    insn.op0_register().size(),
+                    insn_va,
+                )?
+            } else {
+                read_reg_sized(ctx, insn.op1_register()).0
+            };
+            write_reg_sized(ctx, insn.op0_register(), u64::from(v.count_ones()));
+            ctx.rflags = (ctx.rflags & !0x8d5) | (u64::from(v == 0) << 6);
+            Ok(())
+        }
+        Mnemonic::Tzcnt | Mnemonic::Lzcnt => step_bit_scan(ctx, insn, insn_va),
         Mnemonic::Div => step_div(ctx, insn, insn_va, false),
         Mnemonic::Idiv => step_div(ctx, insn, insn_va, true),
         Mnemonic::Push => step_push(ctx, insn, insn_va),
@@ -1833,16 +1883,23 @@ fn read_op0_val(
 
 // F3 0F BC is BSF when the guest CPUID authority lacks BMI1. Never let
 // the host CPU choose this encoding's semantics for the guest.
-fn step_tzcnt(ctx: &mut SoftCpuContext, insn: &Instruction, va: u64) -> Result<(), X86Exception> {
+fn step_bit_scan(
+    ctx: &mut SoftCpuContext,
+    insn: &Instruction,
+    va: u64,
+) -> Result<(), X86Exception> {
     let width = insn.op0_register().size();
     let value = if insn.op1_kind() == OpKind::Memory {
         read_int(ctx, compute_effective_va(insn, ctx), width, va)?
     } else {
         read_reg_sized(ctx, insn.op1_register()).0
     };
-    if ctx.bmi1 {
+    let leading = insn.mnemonic() == Mnemonic::Lzcnt;
+    if if leading { ctx.lzcnt } else { ctx.bmi1 } {
         let count = if value == 0 {
             (width * 8) as u64
+        } else if leading {
+            u64::from((value << (64 - width * 8)).leading_zeros())
         } else {
             u64::from(value.trailing_zeros())
         };
@@ -1851,7 +1908,15 @@ fn step_tzcnt(ctx: &mut SoftCpuContext, insn: &Instruction, va: u64) -> Result<(
     } else {
         ctx.rflags = (ctx.rflags & !0x40) | (u64::from(value == 0) << 6);
         if value != 0 {
-            write_reg_sized(ctx, insn.op0_register(), u64::from(value.trailing_zeros()));
+            write_reg_sized(
+                ctx,
+                insn.op0_register(),
+                if leading {
+                    63 - u64::from(value.leading_zeros())
+                } else {
+                    u64::from(value.trailing_zeros())
+                },
+            );
         }
     }
     Ok(())

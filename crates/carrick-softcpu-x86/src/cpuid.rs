@@ -157,6 +157,7 @@ impl CpuidAuthority for Level0CpuidView {
 /// Configurable CPL0 supervisor `CPUID` view matching the Carrick x86 CPL0 carrier contract
 /// (leaf `0x15` crystal/TSC frequency, APIC ID, `SMEP`, `SMAP`, `PCID`; unimplemented
 /// `APIC`, `SEP`, and `TSC_Deadline` stay clear by default).
+/// SSE3/SSSE3/SSE4.1/SSE4.2 and POPCNT use checked guest-feature admission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cpl0CpuidView {
     pub apic_id: u8,
@@ -212,7 +213,8 @@ impl CpuidAuthority for Cpl0CpuidView {
                 u32::from_le_bytes(*b"ineI"),
             ),
             (1, _) => {
-                let mut ecx = (1 << 26) | (1 << 27);
+                let mut ecx =
+                    (1 << 26) | (1 << 27) | 1 | (1 << 9) | (1 << 19) | (1 << 20) | (1 << 23);
                 if self.pcid {
                     ecx |= 1 << 17;
                 }
