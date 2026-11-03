@@ -339,3 +339,26 @@ Addendum 2 remains incomplete. The implementation status is:
 This census correction is not evidence for those missing production changes,
 the two-half release receipt, or slice 2b settlement. The full gate turn and
 independent review must retain those as open implementation requirements.
+
+### Gate-turn scope
+
+The source-built census was checked again against admitted main and against
+the correction's parent. The parent fails with 38 kernel sites against 29;
+the corrected tree's full site list equals main. All nine removed sites are the
+inventory projection above, not new dispatcher terminal-policy decisions.
+The scanner implementation is unchanged between the compared trees.
+
+Keep the proposal titled **#1369 slice 2a: preserve owned return claims** and
+in draft. Successful prerequisite tests do not establish the original slice-2
+acceptance: the neutral owed-return routine, `SettlementGuard`, chunk
+compare-and-swap acknowledgement, generalized COW-before-return hook and
+minimal host reconciler port are still absent. The inventory's infallible
+apply boundary proves only its logical commit; it does not prove physical
+release preceded that commit. Physical permits and backend receipt integration
+remain implementation requirements, not a pending design decision.
+
+On a Linux worker, the macOS cross-check establishes compilation and linting,
+not execution of HVF retirement or signed guest behavior. KVM carrier-memory
+tests can exercise real memslot custody, but do not supply the missing HVF
+drop-gate witness. Retain these distinctions in the gate report and independent
+review before promoting this prerequisite together with its consumer.
