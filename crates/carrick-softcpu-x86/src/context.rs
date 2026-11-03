@@ -426,6 +426,7 @@ pub struct SoftCpuContext {
     pub(crate) legacy_features: u32,
     pub(crate) extended_features: u32,
     pub(crate) fpu: bool,
+    pub(crate) baseline_features: u32,
     pub xcr0: u64,
     pub cr0: u64,
     pub cr2: u64,
@@ -580,6 +581,7 @@ impl SoftCpuContext {
             legacy_features: 0,
             extended_features: 0,
             fpu: false,
+            baseline_features: 0,
             xcr0: 0x3,
             // EM stays clear for native-backed SSE and x87 operations. The
             // default CPUID remains conservative until shared-view admission.
@@ -890,6 +892,16 @@ impl SoftCpuContext {
         use crate::emit::{EmitError, JitStage};
         self.active_block_insns.clear();
         for (index, d) in planned.insns.iter().enumerate() {
+            // CLFLUSH is separately enumerated by host CPUID even on x86_64.
+            // Refuse preparation rather than allowing a host #UD in the helper.
+            if d.raw.mnemonic() == Mnemonic::Clflush
+                && std::arch::x86_64::__cpuid(1).edx & (1 << 19) == 0
+            {
+                return Err(EmitError::EncodeFailed {
+                    va: d.va,
+                    detail: "CLFLUSH requires a CLFSH-capable same-ISA host".into(),
+                });
+            }
             #[cfg(target_arch = "x86_64")]
             if d.raw.mnemonic() == Mnemonic::Cmpxchg16b
                 && !std::is_x86_feature_detected!("cmpxchg16b")
@@ -907,7 +919,9 @@ impl SoftCpuContext {
                 });
             }
             let leaf = if crate::decode::supported_body(&d.raw)
-                && (crate::decode::is_fp_arithmetic(&d.raw) || crate::decode::is_x87(&d.raw))
+                && (crate::decode::is_fp_arithmetic(&d.raw)
+                    || crate::decode::is_x87(&d.raw)
+                    || crate::decode::is_mmx(&d.raw))
             {
                 let bytes = native_fp_bytes(&d.raw)
                     .map_err(|detail| EmitError::EncodeFailed { va: d.va, detail })?;
@@ -1439,6 +1453,26 @@ fn step_complex_inner(
     x87_opcode: u16,
 ) -> Result<(), X86Exception> {
     match insn.mnemonic() {
+        Mnemonic::Clflush => {
+            let va = compute_effective_va(insn, ctx);
+            walk_active_span_aligned(
+                ctx,
+                va,
+                1,
+                SoftAccessKind::Read,
+                insn_va,
+                false,
+                |_, _, target, _| {
+                    if let TranslatedTarget::Ram(ptr) = target {
+                        // SAFETY: the walker authenticated a readable guest byte.
+                        // CLFLUSH uses only that byte's containing cache line.
+                        unsafe {
+                            core::arch::asm!("clflush [{p}]", p = in(reg) ptr, options(nostack, preserves_flags));
+                        }
+                    }
+                },
+            )
+        }
         _ if crate::decode::is_fp_arithmetic(insn) => {
             let entry = fp_leaf.ok_or_else(|| X86Exception::invalid_opcode(insn_va))?;
             step_fp(ctx, insn, insn_va, entry)
@@ -1491,7 +1525,7 @@ fn step_complex_inner(
             Ok(())
         }
         Mnemonic::Tzcnt | Mnemonic::Lzcnt => step_bit_scan(ctx, insn, insn_va),
-        _ if crate::decode::is_x87(insn) => {
+        _ if crate::decode::is_x87(insn) || crate::decode::is_mmx(insn) => {
             let entry = fp_leaf.ok_or_else(|| X86Exception::invalid_opcode(insn_va))?;
             step_x87(ctx, insn, insn_va, entry, x87_opcode)
         }
@@ -1640,6 +1674,7 @@ fn step_x87(
     if ctx.cr0 & 0xc != 0 {
         return Err(X86Exception::device_not_available(ip));
     }
+    let mmx = crate::decode::is_mmx(insn);
     let no_wait = matches!(
         insn.mnemonic(),
         Mnemonic::Fninit | Mnemonic::Fnclex | Mnemonic::Fnstcw | Mnemonic::Fnstsw
@@ -1672,7 +1707,7 @@ fn step_x87(
             | Mnemonic::Fbstp
             | Mnemonic::Fnstcw
             | Mnemonic::Fnstsw
-    );
+    ) || (mmx && insn.op0_kind() == OpKind::Memory);
     let ea = compute_effective_va(insn, ctx);
     // At most ten bytes, hence at most two page spans. Retain authenticated
     // destinations until publication, without a second fallible translation.
@@ -1743,7 +1778,7 @@ fn step_x87(
     // instructions preserve the prior virtual pointers; FNINIT clears them.
     if insn.mnemonic() != Mnemonic::Fninit {
         run.working.0[6..24].copy_from_slice(&ctx.fxsave.0[6..24]);
-        if !no_wait && insn.mnemonic() != Mnemonic::Fldcw {
+        if !mmx && !no_wait && insn.mnemonic() != Mnemonic::Fldcw {
             run.working.0[8..16].copy_from_slice(&ip.to_le_bytes());
             run.working.0[6..8].copy_from_slice(&opcode.to_le_bytes());
             if memory {

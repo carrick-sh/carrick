@@ -171,6 +171,9 @@ pub fn plan_block_from_memory<M: SoftMmuMemory>(
         // or host-leaf preparation. Replanning after set_cpuid_view also revokes
         // previously executable encodings without exposing host capabilities.
         if (crate::decode::is_x87(&raw) && !ctx.fpu)
+            || (crate::decode::is_mmx(&raw) && ctx.baseline_features & (1 << 23) == 0)
+            || (raw.mnemonic() == iced_x86::Mnemonic::Clflush
+                && ctx.baseline_features & (1 << 19) == 0)
             || (raw.mnemonic() == iced_x86::Mnemonic::Cmpxchg16b
                 && ctx.legacy_features & (1 << 13) == 0)
             || (raw.mnemonic() == iced_x86::Mnemonic::Fisttp && ctx.legacy_features & 1 == 0)

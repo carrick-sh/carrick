@@ -13,6 +13,60 @@ use crate::context::{
 };
 use crate::mmu::{SoftAccessKind, TranslatedTarget};
 
+// Baseline families missing from the original copy-through allowlist. Keep
+// them in the checked executor: conversions and comparisons can raise #XM.
+pub(crate) fn baseline_sse(insn: &Instruction) -> bool {
+    insn.encoding() == EncodingKind::Legacy
+        && insn
+            .cpuid_features()
+            .iter()
+            .all(|f| matches!(f, CpuidFeature::SSE | CpuidFeature::SSE2))
+        && !insn
+            .op_kinds()
+            .enumerate()
+            .any(|(i, k)| k == OpKind::Register && insn.op_register(i as u32).is_mm())
+        && matches!(
+            insn.mnemonic(),
+            Mnemonic::Shufps
+                | Mnemonic::Ucomiss
+                | Mnemonic::Movmskps
+                | Mnemonic::Movhlps
+                | Mnemonic::Movlhps
+                | Mnemonic::Unpcklps
+                | Mnemonic::Cvtsi2ss
+                | Mnemonic::Rcpps
+                | Mnemonic::Pcmpgtb
+                | Mnemonic::Pcmpgtd
+                | Mnemonic::Psrlq
+                | Mnemonic::Psrld
+                | Mnemonic::Psrldq
+                | Mnemonic::Pmuludq
+                | Mnemonic::Pmullw
+                | Mnemonic::Pmaddwd
+                | Mnemonic::Psadbw
+                | Mnemonic::Pminub
+                | Mnemonic::Pmaxub
+                | Mnemonic::Pavgb
+                | Mnemonic::Psubusb
+                | Mnemonic::Packuswb
+                | Mnemonic::Punpckhbw
+                | Mnemonic::Punpckhwd
+                | Mnemonic::Punpckhdq
+                | Mnemonic::Punpckhqdq
+                | Mnemonic::Shufpd
+                | Mnemonic::Unpckhpd
+                | Mnemonic::Ucomisd
+                | Mnemonic::Comisd
+                | Mnemonic::Cvtsi2sd
+                | Mnemonic::Cvttsd2si
+                | Mnemonic::Cvtss2sd
+                | Mnemonic::Cvtdq2ps
+                | Mnemonic::Pextrw
+                | Mnemonic::Movntdq
+                | Mnemonic::Movnti
+        )
+}
+
 pub(crate) fn legacy_feature_mask(insn: &Instruction) -> u32 {
     if insn.encoding() != EncodingKind::Legacy {
         return 0;
@@ -41,7 +95,7 @@ pub(crate) fn legacy_feature_mask(insn: &Instruction) -> u32 {
 pub(crate) fn supported(insn: &Instruction) -> bool {
     let features = insn.cpuid_features();
     !matches!(insn.mnemonic(), Mnemonic::Tzcnt | Mnemonic::Lzcnt)
-        && (legacy_feature_mask(insn) != 0
+        && (baseline_sse(insn) || legacy_feature_mask(insn) != 0
             || (matches!(insn.encoding(), EncodingKind::Legacy | EncodingKind::VEX)
                 && !features.is_empty()
                 && features.iter().all(|f| {
@@ -80,6 +134,8 @@ pub(crate) fn check_controls(
 ) -> Result<(), X86Exception> {
     for feature in insn.cpuid_features() {
         let allowed = match feature {
+            CpuidFeature::SSE => ctx.baseline_features & (1 << 25) != 0,
+            CpuidFeature::SSE2 => ctx.baseline_features & (1 << 26) != 0,
             CpuidFeature::SSE3 => ctx.legacy_features & 1 != 0,
             CpuidFeature::SSSE3 => ctx.legacy_features & (1 << 9) != 0,
             CpuidFeature::SSE4_1 => ctx.legacy_features & (1 << 19) != 0,
@@ -101,7 +157,7 @@ pub(crate) fn check_controls(
             return Err(X86Exception::invalid_opcode(ip));
         }
     }
-    if integer(insn) {
+    if integer(insn) || insn.mnemonic() == Mnemonic::Movnti {
         return Ok(());
     }
     if insn.encoding() == EncodingKind::VEX {
@@ -284,7 +340,11 @@ pub(crate) fn image(insn: &Instruction) -> Result<Vec<u8>, String> {
     emit(Ok(native))?;
     if matches!(
         insn.mnemonic(),
-        Mnemonic::Vmovntps | Mnemonic::Vmovntpd | Mnemonic::Vmovntdq
+        Mnemonic::Vmovntps
+            | Mnemonic::Vmovntpd
+            | Mnemonic::Vmovntdq
+            | Mnemonic::Movntdq
+            | Mnemonic::Movnti
     ) {
         emit(Ok(Instruction::with(Code::Sfence)))?;
     }
@@ -401,7 +461,7 @@ pub(crate) fn step(
             if size > 32 {
                 return Err(X86Exception::invalid_opcode(ip));
             }
-            let legacy_aligned = legacy_feature_mask(insn) != 0
+            let legacy_aligned = legacy(insn)
                 && size == 16
                 && !matches!(
                     insn.mnemonic(),

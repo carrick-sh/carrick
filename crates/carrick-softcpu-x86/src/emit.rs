@@ -136,6 +136,8 @@ fn is_routed_to_complex_helper(insn: &Instruction) -> bool {
     crate::avx::supported(insn)
         || is_fp_arithmetic(insn)
         || crate::decode::is_x87(insn)
+        || crate::decode::is_mmx(insn)
+        || insn.mnemonic() == Mnemonic::Clflush
         || insn.is_string_instruction()
         || matches!(
             insn.mnemonic(),

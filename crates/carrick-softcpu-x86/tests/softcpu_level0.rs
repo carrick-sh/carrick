@@ -4935,3 +4935,414 @@ fn x87_cx16_and_fisttp_obey_installed_view() {
         assert_eq!(cpu.context().fxsave.0, before);
     }
 }
+
+#[test]
+fn advertised_sse_census_matches_native() {
+    let cases: &[&[u8]] = &[
+        &[0x0f, 0xc6, 0xc2, 0x31],
+        &[0x0f, 0x2e, 0xc2],
+        &[0x0f, 0x50, 0xc0],
+        &[0x0f, 0x12, 0xc2],
+        &[0x0f, 0x16, 0xc2],
+        &[0x0f, 0x14, 0xc2],
+        &[0xf3, 0x48, 0x0f, 0x2a, 0xc1],
+        &[0x0f, 0x53, 0xc2],
+        &[0x66, 0x0f, 0x64, 0xc2],
+        &[0x66, 0x0f, 0x66, 0xc2],
+        &[0x66, 0x0f, 0x73, 0xd0, 7],
+        &[0x66, 0x0f, 0x72, 0xd0, 7],
+        &[0x66, 0x0f, 0x73, 0xd8, 7],
+        &[0x66, 0x0f, 0xf4, 0xc2],
+        &[0x66, 0x0f, 0xd5, 0xc2],
+        &[0x66, 0x0f, 0xf5, 0xc2],
+        &[0x66, 0x0f, 0xf6, 0xc2],
+        &[0x66, 0x0f, 0xda, 0xc2],
+        &[0x66, 0x0f, 0xde, 0xc2],
+        &[0x66, 0x0f, 0xe0, 0xc2],
+        &[0x66, 0x0f, 0xd8, 0xc2],
+        &[0x66, 0x0f, 0x67, 0xc2],
+        &[0x66, 0x0f, 0x68, 0xc2],
+        &[0x66, 0x0f, 0x69, 0xc2],
+        &[0x66, 0x0f, 0x6a, 0xc2],
+        &[0x66, 0x0f, 0x6d, 0xc2],
+        &[0x66, 0x0f, 0xc6, 0xc2, 1],
+        &[0x66, 0x0f, 0x15, 0xc2],
+        &[0x66, 0x0f, 0x2e, 0xc2],
+        &[0x66, 0x0f, 0x2f, 0xc2],
+        &[0xf2, 0x48, 0x0f, 0x2a, 0xc1],
+        &[0xf2, 0x48, 0x0f, 0x2c, 0xc2],
+        &[0xf3, 0x0f, 0x5a, 0xc2],
+        &[0x0f, 0x5b, 0xc2],
+        &[0x66, 0x0f, 0xc5, 0xc2, 3],
+        &[0x66, 0x0f, 0xe7, 0x07],
+        &[0x48, 0x0f, 0xc3, 0x07],
+    ];
+    let mut expanded: Vec<Vec<u8>> = cases.iter().map(|b| b.to_vec()).collect();
+    // Exercise legal memory variants through the independent decoder, retaining
+    // only the same mnemonic (MOVHLPS, for example, becomes MOVLPS in memory).
+    for bytes in cases {
+        let mut decoder = iced_x86::Decoder::new(64, bytes, iced_x86::DecoderOptions::NONE);
+        let insn = decoder.decode();
+        let offsets = decoder.get_constant_offsets(&insn);
+        let mut memory = bytes.to_vec();
+        let modrm = bytes.len() - offsets.immediate_size() - 1;
+        memory[modrm] = (memory[modrm] & 0x38) | 7;
+        let candidate =
+            iced_x86::Decoder::new(64, &memory, iced_x86::DecoderOptions::NONE).decode();
+        if !candidate.is_invalid()
+            && candidate.mnemonic() == insn.mnemonic()
+            && candidate.op_kinds().any(|k| k == iced_x86::OpKind::Memory)
+        {
+            expanded.push(memory);
+        }
+    }
+    for bytes in &expanded {
+        let insn = iced_x86::Decoder::new(64, bytes, iced_x86::DecoderOptions::NONE).decode();
+        assert!(!insn.is_invalid(), "{bytes:x?}");
+        for salt in [0u8, 0x53, 0xff] {
+            let mut initial = [0u8; 832];
+            initial[..512].copy_from_slice(&carrick_softcpu_x86::FxsaveArea::default().0);
+            initial[512..520].copy_from_slice(&7u64.to_le_bytes());
+            for i in 0..256 {
+                initial[160 + i] = (i as u8).wrapping_add(salt);
+            }
+            let memory = insn.op_kinds().any(|k| k == iced_x86::OpKind::Memory);
+            let oracle = native_avx_oracle(bytes, initial, memory);
+            let (mut cpu, mut mem, va) = setup_snippet(&[bytes.as_slice(), &[0xeb, 0]].concat());
+            cpu.context_mut().fxsave.0.copy_from_slice(&initial[..512]);
+            cpu.context_mut().ymm_hi128.fill(0xa5);
+            cpu.context_mut().gpr[reg::RDI] = 0x800000;
+            for (r, v) in [reg::RAX, reg::RCX, reg::RDX]
+                .into_iter()
+                .zip([0x12345678, 3, 7])
+            {
+                cpu.context_mut().gpr[r] = v;
+            }
+            mem.write_direct(0x800000, &[0x3f; 32]);
+            let exit = cpu.step_block(&mut mem).unwrap();
+            assert!(
+                matches!(exit, SoftCpuExit::Continue { .. }),
+                "{:?}: {exit:?} at {va:x}",
+                insn.code()
+            );
+            assert_eq!(
+                &cpu.context().fxsave.0[160..416],
+                &oracle.guest[160..416],
+                "{:?}",
+                insn.code()
+            );
+            assert_eq!(
+                &cpu.context().fxsave.0[24..28],
+                &oracle.guest[24..28],
+                "{:?}",
+                insn.code()
+            );
+            for (i, r) in [reg::RAX, reg::RCX, reg::RDX].into_iter().enumerate() {
+                assert_eq!(cpu.context().gpr[r], oracle.gprs[i], "{:?}", insn.code());
+            }
+            assert_eq!(cpu.context().ymm_hi128, [0xa5; 256]);
+            if insn.rflags_modified() != 0 {
+                assert_eq!(
+                    cpu.context().rflags & 0x8d5,
+                    oracle.flags & 0x8d5,
+                    "{:?}",
+                    insn.code()
+                );
+            }
+            if memory {
+                assert_eq!(
+                    mem.read_direct(0x800000, 32).unwrap(),
+                    oracle.operand,
+                    "{:?}",
+                    insn.code()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn advertised_mmx_uses_virtual_x87_image() {
+    let code = [
+        0x0f, 0x6f, 0x07, 0x0f, 0xfc, 0xc0, 0x0f, 0x7f, 0x06, 0x0f, 0x77, 0x0f, 0x05,
+    ];
+    let (mut cpu, mut mem, va) = setup_snippet(&code);
+    cpu.set_cpuid_view(Box::new(carrick_x86::GuestCpuidView::default()));
+    cpu.context_mut().gpr[reg::RDI] = 0x800000;
+    cpu.context_mut().gpr[reg::RSI] = 0x800010;
+    mem.write_direct(0x800000, &[0x81; 8]);
+    step_ok(&mut cpu, &mut mem, sys(va + 11, va + 13));
+    assert_eq!(mem.read_direct(0x800010, 8).unwrap(), [2; 8]);
+    assert_eq!(cpu.context().fxsave.0[4], 0); // EMMS empties all x87 tags
+}
+
+#[test]
+fn advertised_clflush_checks_guest_translation() {
+    let (mut cpu, mut mem, va) = setup_snippet(&[0x0f, 0xae, 0x3f, 0x0f, 0x05]);
+    cpu.set_cpuid_view(Box::new(carrick_x86::GuestCpuidView::default()));
+    cpu.context_mut().gpr[reg::RDI] = 0x800001;
+    step_ok(&mut cpu, &mut mem, sys(va + 3, va + 5));
+    cpu.context_mut().rip = va;
+    cpu.context_mut().gpr[reg::RDI] = 0xdead0000;
+    step_ok(&mut cpu, &mut mem, pf(va, PF_ERR_USER, 0xdead0000));
+}
+
+#[test]
+fn advertised_baseline_faults_and_feature_revocation() {
+    // Compare a NaN with IE unmasked: status publishes, flags and destination do not.
+    let (mut cpu, mut mem, va) = setup_snippet(&[0x66, 0x0f, 0x2f, 0xc1, 0x0f, 0x05]);
+    cpu.context_mut().write_xmm(0, 0x7ff8_0000_0000_0001);
+    cpu.context_mut().write_xmm(1, 0);
+    cpu.context_mut().fxsave.0[24..28].copy_from_slice(&0x1f00u32.to_le_bytes());
+    let before = cpu.context().rflags;
+    step_ok(
+        &mut cpu,
+        &mut mem,
+        SoftCpuExit::Exception(X86Exception::new(
+            X86ExceptionVector::SimdFloatingPoint,
+            va,
+            None,
+            None,
+        )),
+    );
+    assert_eq!(cpu.context().rflags, before);
+    assert_eq!(cpu.context().fxsave.0[24] & 1, 1);
+    // Aligned packed input is validated before native execution.
+    let (mut cpu, mut mem, va) = setup_snippet(&[0x66, 0x0f, 0x64, 0x07, 0x0f, 0x05]);
+    cpu.context_mut().gpr[reg::RDI] = 0x800001;
+    step_ok(&mut cpu, &mut mem, gp(va));
+    cpu.context_mut().gpr[reg::RDI] = 0xdead0000;
+    step_ok(&mut cpu, &mut mem, pf(va, PF_ERR_USER, 0xdead0000));
+    // MMX cross-page load must retain both virtual register file and RIP.
+    let (mut cpu, mut mem, va) = setup_snippet(&[0x0f, 0x6f, 0x07, 0x0f, 0x05]);
+    cpu.set_cpuid_view(Box::new(carrick_x86::GuestCpuidView::default()));
+    cpu.context_mut().gpr[reg::RDI] = 0x801ffc;
+    let before = cpu.context().fxsave.0;
+    step_ok(&mut cpu, &mut mem, pf(va, PF_ERR_USER, 0x802000));
+    assert_eq!(cpu.context().fxsave.0, before);
+    // Replacing the authority revokes already prepared MMX and CLFLUSH code.
+    for bytes in [&[0x0f, 0x6f, 0x07][..], &[0x0f, 0xae, 0x3f], &[0x0f, 0x77]] {
+        let (mut cpu, mut mem, va) = setup_snippet(&[bytes, &[0x0f, 0x05]].concat());
+        cpu.set_cpuid_view(Box::new(carrick_x86::GuestCpuidView::default()));
+        cpu.context_mut().gpr[reg::RDI] = 0x800000;
+        step_ok(
+            &mut cpu,
+            &mut mem,
+            sys(va + bytes.len() as u64, va + bytes.len() as u64 + 2),
+        );
+        cpu.set_cpuid_view(Box::new(carrick_softcpu_x86::Level0CpuidView));
+        cpu.context_mut().rip = va;
+        cpu.context_mut().gpr[reg::RDI] = 0xdead0000;
+        let before = cpu.context().fxsave.0;
+        step_ok(&mut cpu, &mut mem, ud(va));
+        assert_eq!(cpu.context().fxsave.0, before);
+    }
+}
+
+// Unlike a mask-equality assertion this executes every witness. There is no
+// fallback for a newly advertised bit. CPL0 controls and memory prerequisites
+// are fixture inputs, never accepted faults standing in for execution.
+#[test]
+fn advertised_bit_allowlist_executes_through_step_block() {
+    use carrick_softcpu_x86::{Cpl0CpuidView, CpuidAuthority, Level0CpuidView};
+    // (leaf, subleaf, output register, bit, instruction, ECX input)
+    type Witness = (u32, u32, usize, u32, &'static [u8], u64);
+    let witnesses: &[Witness] = &[
+        (1, 0, 3, 0, &[0xd9, 0xe8], 0),       // FPU: fld1
+        (1, 0, 3, 2, &[0x0f, 0x21, 0xc0], 0), // DE: mov rax,dr0
+        (1, 0, 3, 3, &[0x0f, 0x20, 0xe0], 0), // PSE: read paging controls
+        (1, 0, 3, 4, &[0x0f, 0x31], 0),
+        (1, 0, 3, 5, &[0x0f, 0x32], 0xc0000080),
+        (1, 0, 3, 6, &[0x0f, 0x20, 0xe0], 0),
+        (1, 0, 3, 7, &[0x0f, 0x20, 0xe0], 0),
+        (1, 0, 3, 8, &[0x0f, 0xc7, 0x0f], 0),
+        (1, 0, 3, 9, &[0x0f, 0x32], 0x1b),
+        (1, 0, 3, 13, &[0x0f, 0x20, 0xe0], 0),
+        (1, 0, 3, 15, &[0x0f, 0x44, 0xc0], 0),
+        (1, 0, 3, 16, &[0x0f, 0x32], 0x277),
+        (1, 0, 3, 19, &[0x0f, 0xae, 0x3f], 0),
+        (1, 0, 3, 23, &[0x0f, 0xfc, 0xc0], 0),
+        (1, 0, 3, 24, &[0x0f, 0xae, 0x07], 0),
+        (1, 0, 3, 25, &[0x0f, 0xc6, 0xc0, 0], 0),
+        (1, 0, 3, 26, &[0x66, 0x0f, 0x64, 0xc0], 0),
+        (1, 0, 2, 0, &[0xf2, 0x0f, 0x7c, 0xc0], 0),
+        (1, 0, 2, 1, &[0x66, 0x0f, 0x3a, 0x44, 0xc0, 0], 0),
+        (1, 0, 2, 9, &[0x66, 0x0f, 0x38, 0x00, 0xc0], 0),
+        (1, 0, 2, 12, &[0xc4, 0xe2, 0x71, 0x98, 0xc2], 0),
+        (1, 0, 2, 13, &[0x48, 0x0f, 0xc7, 0x0f], 0),
+        (1, 0, 2, 17, &[0x0f, 0x20, 0xd8], 0),
+        (1, 0, 2, 19, &[0x66, 0x0f, 0x3a, 0x0e, 0xc0, 0], 0),
+        (1, 0, 2, 20, &[0x66, 0x0f, 0x3a, 0x63, 0xc0, 0], 0),
+        (1, 0, 2, 22, &[0x0f, 0x38, 0xf0, 0x07], 0),
+        (1, 0, 2, 23, &[0xf3, 0x0f, 0xb8, 0xc0], 0),
+        (1, 0, 2, 24, &[0x0f, 0x30], 0x6e0),
+        (1, 0, 2, 25, &[0x66, 0x0f, 0x38, 0xdc, 0xc0], 0),
+        (1, 0, 2, 26, &[0x0f, 0xae, 0x27], 0),
+        (1, 0, 2, 27, &[0x0f, 0x01, 0xd0], 0),
+        (1, 0, 2, 28, &[0xc5, 0xf0, 0x58, 0xc2], 0),
+        (1, 0, 2, 29, &[0xc4, 0xe2, 0x79, 0x13, 0xc0], 0),
+        (7, 0, 1, 3, &[0xc4, 0xe2, 0x70, 0xf2, 0xc2], 0),
+        (7, 0, 1, 5, &[0xc5, 0xf5, 0xfe, 0xc2], 0),
+        (7, 0, 1, 7, &[0x0f, 0x20, 0xe0], 0),
+        (7, 0, 1, 8, &[0xc4, 0xe2, 0xf3, 0xf7, 0xc2], 0),
+        (7, 0, 1, 20, &[0x0f, 0x01, 0xca], 0),
+        (7, 0, 2, 2, &[0x0f, 0x01, 0x07], 0),
+        (0xd, 1, 0, 0, &[0x0f, 0xae, 0x37], 0),
+        (0xd, 1, 0, 1, &[0x0f, 0xc7, 0x27], 0),
+        (0x80000001, 0, 2, 0, &[0x9f], 0),
+        (0x80000001, 0, 2, 5, &[0xf3, 0x0f, 0xbd, 0xc0], 0),
+        (0x80000001, 0, 3, 11, &[0x0f, 0x05], 0),
+        (0x80000001, 0, 3, 20, &[0x0f, 0x32], 0xc0000080),
+        (0x80000001, 0, 3, 29, &[0x48, 0x89, 0xc0], 0),
+        (0x80000007, 0, 3, 8, &[0x0f, 0x31], 0),
+    ];
+    let shared = std::env::var_os("CARRICK_CPUID_WITNESS_SHARED").is_some();
+    let views: Vec<Box<dyn CpuidAuthority>> = if shared {
+        vec![Box::new(carrick_x86::GuestCpuidView::default())]
+    } else {
+        vec![
+            Box::new(Level0CpuidView),
+            Box::new(Cpl0CpuidView::default()),
+        ]
+    };
+    let mut failures = Vec::new();
+    for view in views {
+        for (leaf, sub, register) in [
+            (1, 0, 2),
+            (1, 0, 3),
+            (7, 0, 1),
+            (7, 0, 2),
+            (0xd, 1, 0),
+            (0x80000001, 0, 2),
+            (0x80000001, 0, 3),
+            (0x80000007, 0, 3),
+        ] {
+            let r = view.cpuid(leaf, sub);
+            let mask = [r.eax, r.ebx, r.ecx, r.edx][register];
+            for bit in 0..32 {
+                if mask & (1 << bit) == 0 {
+                    continue;
+                }
+                let Some((_, _, _, _, bytes, ecx)) = witnesses
+                    .iter()
+                    .find(|w| (w.0, w.1, w.2, w.3) == (leaf, sub, register, bit))
+                else {
+                    failures.push(format!(
+                        "{leaf:x}:{sub} reg {register} bit {bit}: no execution witness"
+                    ));
+                    continue;
+                };
+                let (mut cpu, mut mem, va) = setup_snippet(&[*bytes, &[0xeb, 0]].concat());
+                // Delegate to exactly the selected authority, without substituting
+                // host CPUID or silently dropping any advertised feature.
+                struct Snapshot(Vec<(u32, u32, carrick_softcpu_x86::CpuidRegs)>);
+                impl CpuidAuthority for Snapshot {
+                    fn cpuid(&self, l: u32, s: u32) -> carrick_softcpu_x86::CpuidRegs {
+                        self.0
+                            .iter()
+                            .find(|r| r.0 == l && r.1 == s)
+                            .map_or(carrick_softcpu_x86::CpuidRegs::ZERO, |r| r.2)
+                    }
+                }
+                cpu.set_cpuid_view(Box::new(Snapshot(
+                    [
+                        (0, 0),
+                        (1, 0),
+                        (7, 0),
+                        (0xd, 0),
+                        (0xd, 1),
+                        (0x15, 0),
+                        (0x80000001, 0),
+                        (0x80000008, 0),
+                    ]
+                    .into_iter()
+                    .map(|(l, s)| (l, s, view.cpuid(l, s)))
+                    .collect(),
+                )));
+                cpu.context_mut().cpl = 0;
+                cpu.context_mut().cr4 &= !((1 << 20) | (1 << 21));
+                cpu.context_mut().cr4 |= 1 << 18;
+                cpu.context_mut().xcr0 = if view.cpuid(0xd, 0).eax & 4 != 0 {
+                    7
+                } else {
+                    3
+                };
+                cpu.context_mut().gpr[reg::RDI] = 0x800000;
+                cpu.context_mut().gpr[reg::RAX] = 0;
+                cpu.context_mut().gpr[reg::RDX] = 0;
+                cpu.context_mut().gpr[reg::RCX] = *ecx;
+                let exit = cpu.step_block(&mut mem);
+                if !matches!(
+                    exit,
+                    Ok(SoftCpuExit::Continue { .. }) | Ok(SoftCpuExit::Syscall { .. })
+                ) {
+                    failures.push(format!(
+                        "{leaf:x}:{sub} reg {register} bit {bit}: {bytes:x?} at {va:x}: {exit:?}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "unexecuted advertised bits:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn advertised_baseline_controls_and_store_fault_atomicity() {
+    let (mut cpu, mut mem, va) = setup_snippet(&[0x66, 0x0f, 0x64, 0x07, 0x0f, 0x05]);
+    cpu.context_mut().gpr[reg::RDI] = 0xdead0000;
+    cpu.context_mut().cr0 |= 8;
+    step_ok(
+        &mut cpu,
+        &mut mem,
+        SoftCpuExit::Exception(X86Exception::device_not_available(va)),
+    );
+    cpu.context_mut().cr4 &= !(1 << 9);
+    step_ok(&mut cpu, &mut mem, ud(va));
+    // MOVNTI needs SSE2 CPUID but neither FP controls nor execution state.
+    let (mut cpu, mut mem, va) = setup_snippet(&[0x48, 0x0f, 0xc3, 0x07, 0x0f, 0x05]);
+    cpu.context_mut().cr0 |= 12;
+    cpu.context_mut().cr4 &= !(1 << 9);
+    cpu.context_mut().gpr[reg::RDI] = 0x800003;
+    cpu.context_mut().gpr[reg::RAX] = 0x1122_3344_5566_7788;
+    step_ok(
+        &mut cpu,
+        &mut mem,
+        SoftCpuExit::Continue { next_rip: va + 4 },
+    );
+    assert_eq!(
+        mem.read_direct(0x800003, 8).unwrap(),
+        0x1122_3344_5566_7788u64.to_le_bytes()
+    );
+    cpu.context_mut().rip = va;
+    cpu.context_mut().gpr[reg::RDI] = 0x801ffc;
+    mem.write_direct(0x801ffc, &[0xaa; 4]);
+    step_ok(
+        &mut cpu,
+        &mut mem,
+        pf(va, PF_ERR_USER | PF_ERR_WRITE, 0x802000),
+    );
+    assert_eq!(mem.read_direct(0x801ffc, 4).unwrap(), [0xaa; 4]);
+}
+
+#[test]
+fn advertised_sse2_pcmpgtb_uses_signed_lanes() {
+    let (mut cpu, mut mem, va) = setup_snippet(&[0x66, 0x0f, 0x64, 0xc1, 0x0f, 0x05]);
+    cpu.context_mut().write_xmm(
+        0,
+        u128::from_le_bytes([
+            0x80, 0x7f, 0xff, 0, 1, 0x81, 0x7e, 2, 0x80, 0x7f, 0xff, 0, 1, 0x81, 0x7e, 2,
+        ]),
+    );
+    cpu.context_mut().write_xmm(1, 0);
+    step_ok(&mut cpu, &mut mem, sys(va + 4, va + 6));
+    assert_eq!(
+        cpu.context().read_xmm(0).to_le_bytes(),
+        [
+            0, 0xff, 0, 0, 0xff, 0, 0xff, 0xff, 0, 0xff, 0, 0, 0xff, 0, 0xff, 0xff,
+        ]
+    );
+}

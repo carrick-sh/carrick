@@ -376,6 +376,7 @@ impl SoftCpu {
         ctx.legacy_features = cpuid.cpuid(1, 0).ecx;
         ctx.extended_features = cpuid.cpuid(7, 0).ebx;
         ctx.fpu = cpuid.cpuid(1, 0).edx & 1 != 0;
+        ctx.baseline_features = cpuid.cpuid(1, 0).edx;
         ctx.lzcnt = cpuid.cpuid(0x8000_0001, 0).ecx & (1 << 5) != 0;
         ctx.bmi1 = cpuid.cpuid(7, 0).ebx & (1 << 3) != 0;
         ctx.lapic.set_apic_id(cpuid.apic_id());
@@ -406,6 +407,7 @@ impl SoftCpu {
         self.ctx.legacy_features = cpuid.cpuid(1, 0).ecx;
         self.ctx.extended_features = cpuid.cpuid(7, 0).ebx;
         self.ctx.fpu = cpuid.cpuid(1, 0).edx & 1 != 0;
+        self.ctx.baseline_features = cpuid.cpuid(1, 0).edx;
         self.ctx.lzcnt = cpuid.cpuid(0x8000_0001, 0).ecx & (1 << 5) != 0;
         self.ctx.bmi1 = cpuid.cpuid(7, 0).ebx & (1 << 3) != 0;
         self.ctx.lapic.set_apic_id(cpuid.apic_id());
@@ -575,6 +577,7 @@ impl SoftCpu {
             && let Some(first) = planned.insns.first()
             && !crate::avx::supported(&first.raw)
             && first.raw.encoding() != iced_x86::EncodingKind::VEX
+            && !crate::avx::baseline_sse(&first.raw)
             && (0..first.raw.op_count()).any(|i| {
                 first.raw.op_kind(i) == iced_x86::OpKind::Register
                     && first.raw.op_register(i).is_xmm()
