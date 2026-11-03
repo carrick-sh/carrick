@@ -530,6 +530,7 @@ impl Github {
                         Some(crate::dispatch_worker::closing_references_request(number)),
                         false,
                     ),
+                    AdoptionRead::Parent(endpoint) => request("GET", &endpoint, None, false),
                     AdoptionRead::Issue(number) => request(
                         "GET",
                         &format!("repos/{REPOSITORY}/issues/{number}"),
@@ -556,7 +557,11 @@ impl Github {
                 None,
                 false,
             )?;
-            if !crate::dispatch_worker::owned_pr(
+            let valid_base = crate::dispatch_worker::stack_parent(&pr, |endpoint| {
+                request("GET", &endpoint, None, false)
+            })
+            .ok();
+            if !crate::dispatch_worker::owned_pr_on_base(
                 &pr,
                 &original,
                 issue_number,
@@ -567,6 +572,7 @@ impl Github {
                     None
                 })
                 .as_ref(),
+                valid_base.as_ref(),
                 &mut |login: &str| {
                     crate::dispatch_worker::write_collaborator(login, |endpoint| {
                         request("GET", endpoint, None, false)
@@ -685,13 +691,17 @@ impl Github {
             )?;
             let prs = request(
                 "GET",
-                &format!("repos/{REPOSITORY}/pulls?state=open&base=main&head=carrick-sh:{branch}"),
+                &format!("repos/{REPOSITORY}/pulls?state=open&head=carrick-sh:{branch}"),
                 None,
                 false,
             )?;
             if !prs.as_array().into_iter().flatten().any(|pr| {
+                let valid_base = crate::dispatch_worker::stack_parent(pr, |endpoint| {
+                    request("GET", &endpoint, None, false)
+                })
+                .ok();
                 pr["head"]["sha"] == run["head_sha"]
-                    && crate::dispatch_worker::owned_pr(
+                    && crate::dispatch_worker::owned_pr_on_base(
                         pr,
                         &original,
                         issue,
@@ -702,6 +712,7 @@ impl Github {
                             None
                         })
                         .as_ref(),
+                        valid_base.as_ref(),
                         &mut |login: &str| {
                             crate::dispatch_worker::write_collaborator(login, |endpoint| {
                                 request("GET", endpoint, None, false)

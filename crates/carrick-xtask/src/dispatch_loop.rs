@@ -1637,7 +1637,7 @@ fn pr_endpoints(number: u64) -> [(&'static str, String, bool); 5] {
 }
 #[derive(Clone)]
 pub(super) struct BranchTarget {
-    pr: Option<u64>,
+    pub(super) pr: Option<u64>,
     tip: String,
 }
 /// An open owned PR or an authenticated prior publication binds the branch
@@ -1894,9 +1894,10 @@ struct Server<'a> {
 /// Server-checked facts about a PR round's result (#1215).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RoundFacts {
+    base: String,
     /// Commits this round added to the PR; `None` when unreadable.
     pushed: Option<u64>,
-    /// Commits on `main` the PR head lacks.
+    /// Commits on the PR base the head lacks.
     behind: Option<u64>,
     /// GitHub reports the PR as not mergeable.
     conflicts: Option<bool>,
@@ -1905,9 +1906,11 @@ impl RoundFacts {
     fn report(&self) -> String {
         let known = |v: Option<String>| v.unwrap_or_else(|| "unknown".into());
         format!(
-            "Server checked: commits pushed this round: {}; commits behind main: {}; conflicts with main: {}.",
+            "Server checked: commits pushed this round: {}; commits behind {}: {}; conflicts with {}: {}.",
             known(self.pushed.map(|n| n.to_string())),
+            self.base,
             known(self.behind.map(|n| n.to_string())),
+            self.base,
             known(
                 self.conflicts
                     .map(|c| if c { "yes" } else { "no" }.to_owned())
@@ -1925,11 +1928,16 @@ impl RoundFacts {
         match (behind, conflicts) {
             (None, false) => None,
             (Some(n), false) => Some(format!(
-                "nothing was pushed and the PR is {n} commits behind main"
+                "nothing was pushed and the PR is {n} commits behind {}",
+                self.base
             )),
-            (None, true) => Some("nothing was pushed and the PR conflicts with main".into()),
+            (None, true) => Some(format!(
+                "nothing was pushed and the PR conflicts with {}",
+                self.base
+            )),
             (Some(n), true) => Some(format!(
-                "nothing was pushed and the PR is {n} commits behind main and conflicts with it"
+                "nothing was pushed and the PR is {n} commits behind {} and conflicts with it",
+                self.base
             )),
         }
     }
@@ -2464,7 +2472,13 @@ impl Server<'_> {
         let behind = head.and_then(|head| {
             let compare = gh(
                 self.root,
-                &["api", &format!("repos/{REPOSITORY}/compare/main...{head}")],
+                &[
+                    "api",
+                    &format!(
+                        "repos/{REPOSITORY}/compare/{}...{head}",
+                        self.dispatch.parent_branch.as_deref().unwrap_or("main")
+                    ),
+                ],
             )
             .ok()?;
             serde_json::from_str::<Value>(&compare).ok()?["behind_by"].as_u64()
@@ -2481,6 +2495,11 @@ impl Server<'_> {
             live = read_pr().or(live);
         }
         RoundFacts {
+            base: self
+                .dispatch
+                .parent_branch
+                .clone()
+                .unwrap_or_else(|| "main".into()),
             pushed,
             behind,
             conflicts: live.and_then(|p| p["mergeable"].as_bool().map(|m| !m)),
@@ -2580,6 +2599,20 @@ impl Server<'_> {
                 &mut self.runs,
             )?)
         };
+        let parent = if let Some(number) = target.as_ref().and_then(|t| t.pr) {
+            let pr = api(self.root, &format!("repos/{REPOSITORY}/pulls/{number}"))?;
+            stack_parent(&pr, |endpoint| api(self.root, &endpoint))?.parent()
+        } else {
+            None
+        };
+        if self.dispatch.main.is_empty() {
+            self.dispatch.main = self.dispatch.base.clone();
+        }
+        self.dispatch.base = parent
+            .as_ref()
+            .map(|(_, tip)| tip.clone())
+            .unwrap_or_else(|| self.dispatch.main.clone());
+        self.dispatch.parent_branch = parent.map(|(branch, _)| branch);
         self.dispatch.branch = branch.to_owned();
         self.dispatch.resume = target.is_some();
         self.dispatch.selected_tip = target.as_ref().map(|t| t.tip.clone());
@@ -2688,6 +2721,12 @@ impl Server<'_> {
             ),
             state_item("worker_tier", "server", self.tier.fact()),
         ];
+        items.push(state_item(
+            "admitted_base",
+            "server",
+            json!({"base":self.dispatch.base,
+            "parent_branch":self.dispatch.parent_branch,"main":self.dispatch.main}),
+        ));
         // Server facts about an adopted round's scope (#1215). The
         // coordinator judges what they mean; publication enforces them.
         if let Continuation::Adopted {
@@ -2699,7 +2738,7 @@ impl Server<'_> {
                 "server",
                 json!({"pr":pr,"admitted_tip":tip,"rebase_allowed":rebase,
                     "publication":if *rebase {
-                        "accepts a HEAD that descends from the admitted tip, or a rebase of it onto admitted main"
+                        "accepts a HEAD that descends from the admitted tip, or a rebase of it onto the admitted base"
                     } else {
                         "accepts only a HEAD that descends from the admitted tip; the owner's trigger did not say `Rebase: allowed`"
                     }}),
@@ -3915,7 +3954,13 @@ fn loop_windows(
 pub(super) fn run(root: &Path, event_path: &Path, setup: &str) -> Result<(), ScalerError> {
     let admission = read_admission(event_path)?;
     let dispatch = admission.dispatch;
-    if git(root, &["rev-parse", "HEAD"])?.trim() != dispatch.base {
+    if git(root, &["rev-parse", "HEAD"])?.trim()
+        != if dispatch.main.is_empty() {
+            &dispatch.base
+        } else {
+            &dispatch.main
+        }
+    {
         return Err(ScalerError::Guard(
             "driver checkout differs from admitted main",
         ));
@@ -4201,6 +4246,8 @@ mod tests {
                     roster: Vec::new(),
                 },
                 base: "a".repeat(40),
+                main: "a".repeat(40),
+                parent_branch: None,
                 review: true,
                 review_text: String::new(),
                 continuation: Continuation::Owned,

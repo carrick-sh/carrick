@@ -159,6 +159,10 @@ pub struct Dispatch {
     pub selected_tip: Option<String>,
     pub worker: Worker,
     pub base: String,
+    #[serde(default)]
+    pub main: String,
+    #[serde(default)]
+    pub parent_branch: Option<String>,
     pub review: bool,
     pub review_text: String,
     pub continuation: Continuation,
@@ -220,10 +224,71 @@ pub(crate) enum AdoptionRead {
     ClosingReferences(u64),
     /// REST issue object.
     Issue(u64),
+    Parent(String),
+}
+
+/// A live local PR chain reaching main. Only the resolver constructs proof.
+pub(crate) struct StackBase(Option<(String, String)>);
+impl StackBase {
+    pub(crate) fn parent(self) -> Option<(String, String)> {
+        self.0
+    }
+}
+
+/// Resolve a parent from live PR facts, bounded and cycle checked. A branch
+/// name alone never admits a stack: every hop must be an open local PR.
+pub(crate) fn stack_parent(
+    pr: &Value,
+    mut read: impl FnMut(String) -> Result<Value, ScalerError>,
+) -> Result<StackBase, ScalerError> {
+    let mut layer = pr.clone();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut parent = None;
+    for _ in 0..64 {
+        let branch = layer["base"]["ref"].as_str().unwrap_or_default();
+        if branch == "main" {
+            return Ok(StackBase(parent));
+        }
+        if layer["state"] != "open"
+            || layer["head"]["repo"]["full_name"] != REPOSITORY
+            || layer["base"]["repo"]["full_name"] != REPOSITORY
+            || !valid_ref_branch(branch)
+            || !seen.insert(branch.to_owned())
+            || layer["head"]["ref"] == branch
+        {
+            return Err(ScalerError::Guard("invalid stack parent chain"));
+        }
+        let prs = read(format!(
+            "repos/{REPOSITORY}/pulls?state=open&head=carrick-sh:{branch}"
+        ))?;
+        let Some([next]) = prs.as_array().map(Vec::as_slice) else {
+            return Err(ScalerError::Guard(
+                "stack parent must be one open repository PR",
+            ));
+        };
+        if next["state"] != "open"
+            || next["head"]["ref"] != branch
+            || next["head"]["repo"]["full_name"] != REPOSITORY
+            || next["base"]["repo"]["full_name"] != REPOSITORY
+        {
+            return Err(ScalerError::Guard(
+                "stack parent leaves repository or is closed",
+            ));
+        }
+        let tip = next["head"]["sha"]
+            .as_str()
+            .filter(|s| sha(s))
+            .ok_or(ScalerError::Guard("stack parent lacks head SHA"))?;
+        if parent.is_none() {
+            parent = Some((branch.to_owned(), tip.to_owned()));
+        }
+        layer = next.clone();
+    }
+    Err(ScalerError::Guard("stack parent chain exceeds bound"))
 }
 
 /// The one adoption predicate, shared by the hosted guard, clone admission,
-/// the controller and the loop. A same-repository `work/*` PR into main that
+/// the controller and the loop. A same-repository `work/*` PR whose base chain reaches main that
 /// no dispatch run named, closing exactly one open issue in this repository.
 /// Authorship is not checked (#1214): a same-repository head already needs
 /// write access to push, and the trusted `/agent` comment is the approval.
@@ -242,11 +307,15 @@ pub(crate) fn adopted_pr(
     if pr["state"] != "open"
         || pr["head"]["repo"]["full_name"] != REPOSITORY
         || pr["base"]["repo"]["full_name"] != REPOSITORY
-        || pr["base"]["ref"] != "main"
         || !valid_branch(branch)
         || dispatch_branch(branch).is_some()
     {
         return Ok(None);
+    }
+    match stack_parent(pr, |endpoint| read(AdoptionRead::Parent(endpoint))) {
+        Ok(_) => {}
+        Err(ScalerError::Guard(_)) => return Ok(None),
+        Err(error) => return Err(error),
     }
     let references = parse_closing_references(&read(AdoptionRead::ClosingReferences(number))?)?;
     let [reference] = references.all.iter().collect::<Vec<_>>()[..] else {
@@ -385,6 +454,7 @@ fn issue_brief_response(root: &Path, number: u64) -> Result<Value, ScalerError> 
 fn adoption_read(root: &Path, read: AdoptionRead) -> Result<Value, ScalerError> {
     match read {
         AdoptionRead::ClosingReferences(number) => closing_references_response(root, number),
+        AdoptionRead::Parent(endpoint) => api(root, &endpoint),
         AdoptionRead::Issue(number) => api(root, &format!("repos/{REPOSITORY}/issues/{number}")),
     }
 }
@@ -656,6 +726,8 @@ fn validate_event_with_publication(
             .map(str::to_owned),
         worker: Worker::default(),
         base: String::new(),
+        main: String::new(),
+        parent_branch: None,
         review,
         review_text: String::new(),
         continuation,
@@ -666,8 +738,10 @@ fn validate_event_with_publication(
 }
 
 pub fn valid_branch(branch: &str) -> bool {
-    branch.starts_with("work/")
-        && branch.len() > 5
+    branch.starts_with("work/") && branch.len() > 5 && valid_ref_branch(branch)
+}
+fn valid_ref_branch(branch: &str) -> bool {
+    !branch.is_empty()
         && branch.len() <= 180
         && branch
             .bytes()
@@ -677,6 +751,8 @@ pub fn valid_branch(branch: &str) -> bool {
         && branch
             .split('/')
             .all(|part| !part.starts_with('.') && !part.ends_with('.') && !part.ends_with(".lock"))
+        && !branch.starts_with('/')
+        && !branch.starts_with('-')
         && !branch.ends_with('/')
 }
 
@@ -1008,6 +1084,17 @@ fn worker_prompt(dispatch: &Dispatch) -> String {
             do not rebase or rewrite existing commits; the director owns keeping the branch current with main.\n\
             Publication refuses any HEAD that does not descend from {tip}. The PR body is not yours to change.\n"
         ),
+    };
+    let history = if let Some(parent) = &dispatch.parent_branch {
+        history
+            .replace("admitted main", &format!("admitted parent layer {parent}"))
+            .replace("refs/carrick/dispatch-main", "refs/carrick/dispatch-parent")
+            + &format!(
+                "Admitted main anchor: {} (refs/carrick/dispatch-main). Push only this layer.\n",
+                dispatch.main
+            )
+    } else {
+        history
     };
     // The owner can steer a running round (#1241): new comments land here.
     let inbox = round_inbox::worker_path()
@@ -2490,11 +2577,7 @@ fn open_prs(root: &Path, branch: &str) -> Result<Value, ScalerError> {
     branch_prs(root, branch, "open")
 }
 fn branch_prs(root: &Path, branch: &str, state: &str) -> Result<Value, ScalerError> {
-    let filter = if state == "open" {
-        "&base=main"
-    } else {
-        "&per_page=100"
-    };
+    let filter = if state == "open" { "" } else { "&per_page=100" };
     let prs: Value = serde_json::from_str(&gh(
         root,
         &[
@@ -2677,10 +2760,7 @@ fn read_pages(read: &mut Read<'_>, path: &str) -> Result<Vec<Value>, ScalerError
 /// dispatch PRs.
 fn chain_threads(read: &mut Read<'_>, issue: u64) -> Result<Vec<u64>, ScalerError> {
     let mut threads = vec![issue];
-    for pr in read_pages(
-        read,
-        &format!("repos/{REPOSITORY}/pulls?state=open&base=main"),
-    )? {
+    for pr in read_pages(read, &format!("repos/{REPOSITORY}/pulls?state=open"))? {
         if pr["head"]["ref"].as_str().and_then(dispatch_branch) == Some(issue)
             && pr["head"]["repo"]["full_name"] == REPOSITORY
             && let Some(number) = pr["number"].as_u64()
@@ -2992,6 +3072,30 @@ pub(crate) fn owned_pr(
     publication: Option<&PublishedPr>,
     trusted: &mut dyn FnMut(&str) -> bool,
 ) -> bool {
+    owned_pr_on_base(
+        pr,
+        run,
+        issue,
+        branch,
+        publication,
+        stack_parent(pr, |endpoint| authenticated_api(Path::new("."), &endpoint))
+            .ok()
+            .as_ref(),
+        trusted,
+    )
+}
+
+/// Ownership after the caller has checked the live parent chain using its
+/// authenticated transport (the controller has no gh subprocess credentials).
+pub(crate) fn owned_pr_on_base(
+    pr: &Value,
+    run: &Value,
+    issue: u64,
+    branch: &str,
+    publication: Option<&PublishedPr>,
+    valid_base: Option<&StackBase>,
+    trusted: &mut dyn FnMut(&str) -> bool,
+) -> bool {
     let Ok(id) = branch_run(issue, branch) else {
         return false;
     };
@@ -3000,7 +3104,7 @@ pub(crate) fn owned_pr(
             && publication.is_some_and(|p| p.matches(pr, issue, branch))))
         && pr["head"]["repo"]["full_name"] == REPOSITORY
         && pr["head"]["ref"] == branch
-        && pr["base"]["ref"] == "main"
+        && valid_base.is_some()
         && pr["draft"] == true
         && run["id"].as_u64().map(|n| n.to_string()).as_deref() == Some(id)
         // A chained run never owns a branch (#1262): it continues the
@@ -3060,13 +3164,32 @@ fn require_owned_pr(root: &Path, dispatch: &Dispatch) -> Result<Value, ScalerErr
     ))
 }
 
+/// Retargeting changes the admitted unit of work, including main -> parent.
+/// A new round must admit that change before any existing branch is written.
+fn require_admitted_parent(
+    dispatch: &Dispatch,
+    live: &Value,
+    read: impl FnMut(String) -> Result<Value, ScalerError>,
+) -> Result<(), ScalerError> {
+    let live = stack_parent(live, read)?.parent();
+    match (dispatch.parent_branch.as_deref(), live) {
+        (None, None) => Ok(()),
+        (Some(branch), Some((current, tip))) if branch == current && dispatch.base == tip => Ok(()),
+        _ => Err(ScalerError::Guard(
+            "stack parent moved or PR retargeted after admission; start a new round",
+        )),
+    }
+}
+
 /// The PR this run continues, re-resolved from the server: an owned dispatch
 /// PR, or the adopted PR re-checked against the one adoption predicate. The
 /// head is not compared here: it moves when this run publishes, and the push
 /// lease is what protects the admitted tip.
 pub(crate) fn require_target_pr(root: &Path, dispatch: &Dispatch) -> Result<Value, ScalerError> {
     let Continuation::Adopted { pr, branch, .. } = &dispatch.continuation else {
-        return require_owned_pr(root, dispatch);
+        let live = require_owned_pr(root, dispatch)?;
+        require_admitted_parent(dispatch, &live, |endpoint| api(root, &endpoint))?;
+        return Ok(live);
     };
     let live = api(root, &format!("repos/{REPOSITORY}/pulls/{pr}"))?;
     let adoption = adopted_pr(&live, |read| adoption_read(root, read))?.ok_or(
@@ -3079,6 +3202,7 @@ pub(crate) fn require_target_pr(root: &Path, dispatch: &Dispatch) -> Result<Valu
     {
         return Err(ScalerError::Guard("adopted PR scope changed"));
     }
+    require_admitted_parent(dispatch, &live, |endpoint| api(root, &endpoint))?;
     Ok(live)
 }
 
@@ -3383,7 +3507,7 @@ fn dispatch_event(event: &Value) -> bool {
 fn checkpoint_pr(root: &Path, branch: &str) -> Result<Option<Value>, ScalerError> {
     let prs = api(
         root,
-        &format!("repos/{REPOSITORY}/pulls?state=open&base=main&head=carrick-sh:{branch}"),
+        &format!("repos/{REPOSITORY}/pulls?state=open&head=carrick-sh:{branch}"),
     )?;
     Ok(match prs.as_array().map(Vec::as_slice) {
         Some([pr]) if pr["head"]["ref"] == branch => {
@@ -3520,7 +3644,7 @@ fn linked_prs(root: &Path, issue: u64, state: &str) -> Result<Vec<Value>, Scaler
     for page in 1.. {
         let data = api(
             root,
-            &format!("repos/{REPOSITORY}/pulls?state={state}&base=main&per_page=100&page={page}"),
+            &format!("repos/{REPOSITORY}/pulls?state={state}&per_page=100&page={page}"),
         )?;
         let prs = data
             .as_array()
@@ -3706,6 +3830,14 @@ fn guard_admission(
     )?;
     dispatch.base =
         admitted_base(dispatch.review || event.get("comment").is_some() || chain.is_some())?;
+    dispatch.main = dispatch.base.clone();
+    if event.get("pull_request").is_some()
+        && let Some((branch, tip)) =
+            stack_parent(&event["pull_request"], |endpoint| api(root, &endpoint))?.parent()
+    {
+        dispatch.parent_branch = Some(branch);
+        dispatch.base = tip;
+    }
     if admit {
         retire_previous_agent()?;
     }
@@ -3772,7 +3904,7 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
         writeln!(
             std::fs::OpenOptions::new().append(true).open(path)?,
             "base={}\nhead={}\nissue={}\ncomment={}\nchain={}",
-            dispatch.base,
+            dispatch.main,
             event["pull_request"]["head"]["sha"]
                 .as_str()
                 .unwrap_or_default(),
@@ -3864,6 +3996,17 @@ fn worker_checkout(
     dispatch: &Dispatch,
     previous: Option<&Receipt>,
 ) -> Result<String, ScalerError> {
+    if dispatch.parent_branch.is_some() {
+        git(
+            root,
+            &[
+                "fetch",
+                "--no-tags",
+                "https://github.com/carrick-sh/carrick",
+                &dispatch.base,
+            ],
+        )?;
+    }
     let source = if previous.is_some() {
         previous_work
     } else {
@@ -3890,7 +4033,15 @@ fn worker_checkout(
             "--no-tags",
             root.to_str()
                 .ok_or(ScalerError::Guard("main checkout path"))?,
-            &format!("{}:refs/carrick/dispatch-main", dispatch.base),
+            &format!(
+                "{}:{}",
+                dispatch.base,
+                if dispatch.parent_branch.is_some() {
+                    "refs/carrick/dispatch-parent"
+                } else {
+                    "refs/carrick/dispatch-main"
+                }
+            ),
         ],
     )?;
     if let Some(previous) = previous {
@@ -3899,6 +4050,17 @@ fn worker_checkout(
             .ok_or(ScalerError::Guard("worker state parent"))?;
         let lease = RunLease::load(state, &previous.expected_tip)?;
         carry_publication_history(source, target, &previous.expected_tip, lease.current())?;
+    }
+    if dispatch.parent_branch.is_some() {
+        git(
+            target,
+            &[
+                "fetch",
+                "--no-tags",
+                root.to_str().ok_or(ScalerError::Guard("checkout path"))?,
+                &format!("{}:refs/carrick/dispatch-main", dispatch.main),
+            ],
+        )?;
     }
     if previous.is_some() || dispatch.resume {
         let reference = format!("origin/{}", dispatch.branch);
@@ -4583,6 +4745,8 @@ struct Applied {
     published_checkpoint: bool,
     #[serde(default)]
     rebased_onto: Option<String>,
+    #[serde(default)]
+    rebase_parent: Option<String>,
     /// Director commits whose patch changed in a consented rebase (#1215).
     #[serde(default)]
     rebase_changed: Vec<String>,
@@ -4702,7 +4866,7 @@ impl Applied {
                         .filter(|r| !r.is_empty())
                         .map(|r| format!("\n\n<details><summary>Director commits before and after the rebase</summary>\n\n```\n{r}\n```\n</details>"))
                         .unwrap_or_default();
-                    format!("\n- Rebased onto main at {base}.{changed}{range}")
+                    format!("\n- Rebased onto {} at {base}.{changed}{range}", self.rebase_parent.as_deref().unwrap_or("main"))
                 })
                 .unwrap_or_default(),
             match &self.body {
@@ -5812,7 +5976,11 @@ fn publish_commits(
     if adopted.is_some() {
         require_target_pr(root, dispatch)?;
     } else if dispatch.resume {
-        agent_loop::verified_branch_cached(root, dispatch.issue, &dispatch.branch, runs)?;
+        let target =
+            agent_loop::verified_branch_cached(root, dispatch.issue, &dispatch.branch, runs)?;
+        if target.pr.is_some() {
+            require_target_pr(root, dispatch)?;
+        }
     } else {
         branch_prs(root, &dispatch.branch, "all")?;
     }
@@ -5899,6 +6067,7 @@ fn publish_commits(
                     Ok(kept) => {
                         Applied::record(|a| {
                             a.rebased_onto = Some(dispatch.base.clone());
+                            a.rebase_parent = dispatch.parent_branch.clone();
                             a.rebase_tip = Some(kept.director_tip.clone());
                             a.rebase_changed = kept.changed;
                             a.rebase_range_diff = Some(kept.range_diff);
@@ -5929,7 +6098,20 @@ fn publish_commits(
                 ScalerError::Guard("worker must rebase onto admitted main before publication")
             })?;
         }
-        let live_main = live_publication_main(&work, token)?;
+        let live_main = if let Some(branch) = &dispatch.parent_branch {
+            let live = require_target_pr(root, dispatch)?;
+            let (current, tip) = stack_parent(&live, |endpoint| api(root, &endpoint))?
+                .parent()
+                .ok_or(ScalerError::Guard("stack was retargeted during round"))?;
+            if current != *branch || tip != dispatch.base {
+                return Err(ScalerError::Guard(
+                    "stack parent moved after admission; start a new round",
+                ));
+            }
+            dispatch.base.clone()
+        } else {
+            live_publication_main(&work, token)?
+        };
         // An adopted run is measured from its admitted tip, so the
         // director's own commits are never charged to it.
         let mut base = match adopted {
@@ -5979,7 +6161,10 @@ fn publish_commits(
         // them. A base that is merely behind such a change is not a blocker:
         // replay the run's commits onto current main.
         // Never on an adopted PR: keeping it current with main is the director's.
-        if adopted.is_none() && base != live_main && !workflow_files(&base, &live_main)?.is_empty()
+        if dispatch.parent_branch.is_none()
+            && adopted.is_none()
+            && base != live_main
+            && !workflow_files(&base, &live_main)?.is_empty()
         {
             let rebase = output(&mut git_invocation(
                 &work,
@@ -6153,6 +6338,7 @@ fn publish_commits(
                 // the owned-branch rebase detection does not apply to it.
                 if adopted.is_none() {
                     a.rebased_onto = rebased_onto;
+                    a.rebase_parent = dispatch.parent_branch.clone();
                 }
             })?;
         }
@@ -6427,7 +6613,7 @@ pub(crate) mod chain_fixture {
             format!("repos/{REPOSITORY}/issues/799"),
             json!({"number":799,"state":"open","title":"Fixture","body":"Do it","user":{"login":"tjfontaine","type":"User"}}),
         );
-        put(page("pulls?state=open&base=main"), json!([pr()]));
+        put(page("pulls?state=open"), json!([pr()]));
         put(page("issues/799/comments"), json!([trigger]));
         put(page("issues/800/comments"), json!([first, second]));
         put(page("pulls/800/reviews"), json!([]));
@@ -7751,6 +7937,68 @@ mod tests {
         ).is_err());
     }
 
+    #[test]
+    fn stacked_owned_layer_two_pushes_only_its_layer() {
+        publication_fixture("stack-owned");
+    }
+    #[test]
+    fn stacked_owned_publication_refuses_main_to_parent_retarget() {
+        publication_fixture("stack-owned-retarget");
+    }
+    #[test]
+    fn stacked_adopted_layer_three_pushes_only_its_layer() {
+        publication_fixture("adopted-stack");
+    }
+    #[test]
+    fn stacked_adopted_layer_rebases_after_parent_moves() {
+        publication_fixture("adopted-stack-rebase");
+    }
+    fn stack_pr(branch: &str, base: &str, tip: &str) -> Value {
+        json!({"number":900,"state":"open", "head":{"ref":branch,"sha":tip,"repo":{"full_name":REPOSITORY}},
+            "base":{"ref":base,"repo":{"full_name":REPOSITORY}}})
+    }
+    #[test]
+    fn stacked_parent_chain_refuses_missing_foreign_closed_and_cycles() {
+        let pr = stack_pr("work/top", "work/parent-one", &"a".repeat(40));
+        assert!(
+            adopted_pr(&pr, |read| match read {
+                AdoptionRead::Parent(_) => Ok(json!([])),
+                _ => panic!("an invalid chain must be refused before closing-scope reads"),
+            })
+            .unwrap()
+            .is_none()
+        );
+        for parent in [
+            json!([]),
+            {
+                let mut p = stack_pr("work/parent-one", "main", &"b".repeat(40));
+                p["head"]["repo"]["full_name"] = "outsider/carrick".into();
+                json!([p])
+            },
+            {
+                let mut p = stack_pr("work/parent-one", "main", &"b".repeat(40));
+                p["state"] = "closed".into();
+                json!([p])
+            },
+            json!([stack_pr("work/parent-one", "work/top", &"b".repeat(40))]),
+        ] {
+            assert!(stack_parent(&pr, |_| Ok(parent.clone())).is_err());
+        }
+    }
+    #[test]
+    fn stacked_publication_refuses_retargeting_in_either_direction_and_parent_movement() {
+        let mut dispatch =
+            validate_event(&event(), "tjfontaine", &mut owner_collaborator()).unwrap();
+        dispatch.base = "a".repeat(40);
+        let stacked = stack_pr("work/top", "work/parent-one", &"b".repeat(40));
+        let parent = stack_pr("work/parent-one", "main", &dispatch.base);
+        assert!(require_admitted_parent(&dispatch, &stacked, |_| Ok(json!([parent]))).is_err());
+        dispatch.parent_branch = Some("work/parent-one".into());
+        let main = stack_pr("work/top", "main", &"b".repeat(40));
+        assert!(require_admitted_parent(&dispatch, &main, |_| unreachable!()).is_err());
+        let moved = stack_pr("work/parent-one", "main", &"c".repeat(40));
+        assert!(require_admitted_parent(&dispatch, &stacked, |_| Ok(json!([moved]))).is_err());
+    }
     fn publication_fixture(witness: &str) {
         publication_fixture_outcome(witness, |_, _| {});
     }
@@ -7857,6 +8105,8 @@ REFS
  */issues/634) cat "$RUNNER_TEMP/adopted-issue.json" ;;
  */actions/runs/42) cat "$RUNNER_TEMP/original.json" ;;
  */actions/runs/42/jobs*) echo '{"jobs":[{"name":"worker","status":"completed","runner_name":"carrick-agent-123","steps":[{"name":"Run actions/upload-artifact@v4","status":"completed","conclusion":"success"}]}]}' ;;
+ *'/pulls?state=open&head=carrick-sh:work/parent-two') cat "$RUNNER_TEMP/parent-two.json" ;;
+ *'/pulls?state=open&head=carrick-sh:work/parent-one') cat "$RUNNER_TEMP/parent-one.json" ;;
  *'/pulls?'*) if test -f "$RUNNER_TEMP/created"; then cat "$RUNNER_TEMP/pr.json"; else echo '[]'; fi ;;
  *) exit 91 ;;
  esac
@@ -8065,9 +8315,150 @@ fi
         }
         let report = state.join("report.md");
         std::fs::write(&report, "").unwrap();
+        if witness.starts_with("stack-owned") {
+            // Parent has its own closing scope; only this layer is charged.
+            let main = dispatch.base.clone();
+            git(&work, &["checkout", "-b", "work/parent-one", &main]).unwrap();
+            git(
+                &work,
+                &[
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "fix(ci): parent layer\n\nCloses #999",
+                ],
+            )
+            .unwrap();
+            let parent = git(&work, &["rev-parse", "HEAD"])
+                .unwrap()
+                .trim()
+                .to_owned();
+            git(&work, &["checkout", "-B", &dispatch.branch]).unwrap();
+            git(
+                &work,
+                &["commit", "--allow-empty", "-m", "fix(ci): owned layer two"],
+            )
+            .unwrap();
+            let tip = git(&work, &["rev-parse", "HEAD"])
+                .unwrap()
+                .trim()
+                .to_owned();
+            git(
+                &work,
+                &["commit", "--allow-empty", "-m", "fix(ci): round change"],
+            )
+            .unwrap();
+            dispatch.main = main;
+            dispatch.base = parent.clone();
+            dispatch.parent_branch = Some("work/parent-one".into());
+            dispatch.resume = true;
+            receipt.base = parent.clone();
+            receipt.expected_tip = tip.clone();
+            receipt.head = git(&work, &["rev-parse", "HEAD"]).unwrap().trim().into();
+            pr["base"] = json!({"ref":"work/parent-one","repo":{"full_name":REPOSITORY}});
+            std::fs::write(outer.join("pr.json"), json!([pr]).to_string()).unwrap();
+            std::fs::write(
+                outer.join("parent-one.json"),
+                json!([stack_pr("work/parent-one", "main", &parent)]).to_string(),
+            )
+            .unwrap();
+            std::fs::write(outer.join("created"), "").unwrap();
+            std::fs::write(
+                outer.join("remote-tip"),
+                format!("{tip}\trefs/heads/{}\n", dispatch.branch),
+            )
+            .unwrap();
+            if witness == "stack-owned-retarget" {
+                dispatch.parent_branch = None;
+                dispatch.base = dispatch.main.clone();
+                receipt.base = dispatch.base.clone();
+                let error = publish(
+                    &work,
+                    &dispatch,
+                    &receipt,
+                    &contract,
+                    &report,
+                    "fixture-token",
+                    &mut agent_loop::RunCache::default(),
+                )
+                .unwrap_err();
+                assert!(error.to_string().contains("retargeted"), "{error}");
+                assert!(!outer.join("push.args").exists());
+                return;
+            }
+            assert_eq!(
+                publish(
+                    &work,
+                    &dispatch,
+                    &receipt,
+                    &contract,
+                    &report,
+                    "fixture-token",
+                    &mut agent_loop::RunCache::default()
+                )
+                .unwrap(),
+                Some(800)
+            );
+            let pushes = regular_text(&outer.join("push.args")).unwrap();
+            assert_eq!(
+                pushes
+                    .lines()
+                    .filter(|line| line.starts_with("HEAD:"))
+                    .collect::<Vec<_>>(),
+                [format!("HEAD:refs/heads/{}", dispatch.branch)]
+            );
+            assert!(pushes.contains(&format!(
+                "--force-with-lease=refs/heads/{}:{tip}",
+                dispatch.branch
+            )));
+            assert_eq!(
+                git(&work, &["rev-parse", "work/parent-one"])
+                    .unwrap()
+                    .trim(),
+                parent
+            );
+            assert_eq!(Applied::load().unwrap().commits.len(), 2);
+            return;
+        }
         if witness.starts_with("adopted") {
             let branch = "work/634-slice";
             git(&work, &["checkout", "-B", branch, &director_fork]).unwrap();
+            if witness.starts_with("adopted-stack") {
+                dispatch.main = director_fork.clone();
+                for (branch, base_branch) in [
+                    ("work/parent-one", "main"),
+                    ("work/parent-two", "work/parent-one"),
+                ] {
+                    git(
+                        &work,
+                        &[
+                            "commit",
+                            "--allow-empty",
+                            "-m",
+                            "fix(ci): lower layer\n\nCloses #999",
+                        ],
+                    )
+                    .unwrap();
+                    let tip = git(&work, &["rev-parse", "HEAD"])
+                        .unwrap()
+                        .trim()
+                        .to_owned();
+                    git(&work, &["branch", branch, &tip]).unwrap();
+                    let file = if branch == "work/parent-one" {
+                        "parent-one.json"
+                    } else {
+                        "parent-two.json"
+                    };
+                    std::fs::write(
+                        outer.join(file),
+                        json!([stack_pr(branch, base_branch, &tip)]).to_string(),
+                    )
+                    .unwrap();
+                    dispatch.base = tip;
+                }
+                dispatch.parent_branch = Some("work/parent-two".into());
+                receipt.base = dispatch.base.clone();
+            }
             if witness == "adopted-director-history" {
                 // Director history below the tip: a closing reference to
                 // another issue and a workflow change main does not have.
@@ -8290,6 +8681,38 @@ fi
                 .unwrap();
                 git(&work, &["reset", "--hard", orphan.trim()]).unwrap();
             }
+            if witness == "adopted-stack-rebase" {
+                let old_parent = dispatch.base.clone();
+                let old_head = git(&work, &["rev-parse", "HEAD"])
+                    .unwrap()
+                    .trim()
+                    .to_owned();
+                git(&work, &["checkout", "work/parent-two"]).unwrap();
+                git(
+                    &work,
+                    &[
+                        "commit",
+                        "--allow-empty",
+                        "-m",
+                        "fix(ci): parent moved\n\nCloses #999",
+                    ],
+                )
+                .unwrap();
+                let parent = git(&work, &["rev-parse", "HEAD"])
+                    .unwrap()
+                    .trim()
+                    .to_owned();
+                git(&work, &["checkout", branch]).unwrap();
+                git(&work, &["rebase", "--onto", &parent, &old_parent]).unwrap();
+                assert_ne!(git(&work, &["rev-parse", "HEAD"]).unwrap().trim(), old_head);
+                dispatch.base = parent.clone();
+                receipt.base = parent.clone();
+                std::fs::write(
+                    outer.join("parent-two.json"),
+                    json!([stack_pr("work/parent-two", "work/parent-one", &parent)]).to_string(),
+                )
+                .unwrap();
+            }
             if witness == "adopted-race" {
                 // Someone pushes while ours is in flight: the lease rejects it.
                 std::fs::write(outer.join("publish-mode"), "publish-token-lease").unwrap();
@@ -8302,15 +8725,18 @@ fi
             dispatch.branch = branch.into();
             dispatch.resume = true;
             dispatch.continuation = Continuation::Adopted {
-                rebase: witness.starts_with("adopted-rebase"),
+                rebase: witness.starts_with("adopted-rebase") || witness == "adopted-stack-rebase",
 
                 pr: 800,
                 branch: branch.into(),
                 tip: tip.clone(),
             };
-            let adopted = json!({"state":"open","number":800,"draft":true,"user":{"login":"carrick-workers[bot]","type":"Bot"},
+            let mut adopted = json!({"state":"open","number":800,"draft":true,"user":{"login":"carrick-workers[bot]","type":"Bot"},
                 "head":{"ref":branch,"sha":live,"repo":{"full_name":REPOSITORY}},
                 "base":{"ref":"main","repo":{"full_name":REPOSITORY}},"body":"Director body\n\nCloses #634"});
+            if witness.starts_with("adopted-stack") {
+                adopted["base"]["ref"] = "work/parent-two".into();
+            }
             std::fs::write(outer.join("adopted-pr.json"), adopted.to_string()).unwrap();
             std::fs::write(
                 outer.join("adopted-issue.json"),
@@ -8403,7 +8829,10 @@ fi
             }
             if matches!(
                 witness,
-                "adopted-rebase" | "adopted-rebase-main-moved" | "adopted-rebase-upstream"
+                "adopted-rebase"
+                    | "adopted-rebase-main-moved"
+                    | "adopted-rebase-upstream"
+                    | "adopted-stack-rebase"
             ) {
                 // Consent (#1215): the rebased history is pushed, still only
                 // under the lease that starts at the admitted tip.
@@ -8418,7 +8847,13 @@ fi
                     Some(dispatch.base.as_str())
                 );
                 assert!(
-                    applied.report().contains("Rebased onto main"),
+                    applied
+                        .report()
+                        .contains(if witness == "adopted-stack-rebase" {
+                            "Rebased onto work/parent-two"
+                        } else {
+                            "Rebased onto main"
+                        }),
                     "{}",
                     applied.report()
                 );
@@ -8448,7 +8883,10 @@ fi
                 }
                 return;
             }
-            if matches!(witness, "adopted" | "adopted-director-history") {
+            if matches!(
+                witness,
+                "adopted" | "adopted-director-history" | "adopted-stack"
+            ) {
                 assert_eq!(result.unwrap(), Some(800));
                 assert_eq!(
                     applied.commits,
@@ -11011,6 +11449,49 @@ cat "$file"
             closed["state"] = "closed".into();
             write("issues/986", &closed);
             assert!(guard_admission(&fixture, &event_path, true, || Ok(())).is_err());
+            let mut stacked = pr.clone();
+            stacked["base"]["ref"] = "work/parent-two".into();
+            write(
+                "pulls?state=open&head=carrick-sh:work/parent-one",
+                &json!([stack_pr("work/parent-one", "main", &"b".repeat(40))]),
+            );
+            write(
+                "pulls?state=open&head=carrick-sh:work/parent-two",
+                &json!([stack_pr(
+                    "work/parent-two",
+                    "work/parent-one",
+                    &"c".repeat(40)
+                )]),
+            );
+            // Each synthetic round has its own write-once admission.
+            std::fs::remove_file(crate::agent_runner::state().unwrap().join("admission.json"))
+                .unwrap();
+            admit(&event, &stacked, &issue, &comment, &[986]).unwrap();
+            let (_, hosted) = guard_admission(&fixture, &event_path, false, || Ok(())).unwrap();
+            let (_, admitted) = guard_admission(&fixture, &event_path, true, || Ok(())).unwrap();
+            assert_eq!(hosted.base, "c".repeat(40));
+            assert_eq!(admitted.base, hosted.base);
+            assert_eq!(admitted.main, "f".repeat(40));
+            assert_eq!(admitted.parent_branch.as_deref(), Some("work/parent-two"));
+            assert_eq!(
+                read_admission(&event_path).unwrap().dispatch.base,
+                admitted.base
+            );
+            // A later round admits the new parent while retaining the same
+            // adopted tip and its branch-specific publication lease.
+            write(
+                "pulls?state=open&head=carrick-sh:work/parent-two",
+                &json!([stack_pr(
+                    "work/parent-two",
+                    "work/parent-one",
+                    &"d".repeat(40)
+                )]),
+            );
+            std::fs::remove_file(crate::agent_runner::state().unwrap().join("admission.json"))
+                .unwrap();
+            let (_, moved) = guard_admission(&fixture, &event_path, true, || Ok(())).unwrap();
+            assert_eq!(moved.base, "d".repeat(40));
+            assert_eq!(moved.continuation, admitted.continuation);
             return;
         }
         if std::env::var_os("CARRICK_DISPATCH_HEAD").is_some() {
@@ -11317,9 +11798,7 @@ cat "$file"
             json!({"permission":"admin"}),
         );
         map.insert(
-            format!(
-                "repos/{REPOSITORY}/pulls?state=open&base=main&head=carrick-sh:work/dispatch-799-42"
-            ),
+            format!("repos/{REPOSITORY}/pulls?state=open&head=carrick-sh:work/dispatch-799-42"),
             json!([chain_fixture::pr()]),
         );
         for (endpoint, value) in &map {

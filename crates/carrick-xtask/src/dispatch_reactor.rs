@@ -243,14 +243,18 @@ pub(crate) fn classify(user: &Value, body: &str) -> Option<Class> {
     })
 }
 
-/// Same-repository `work/*` PR into main by the owner or publish App: the
+/// Same-repository `work/*` PR by the owner or publish App: the
 /// PRs this owner-local reactor watches. Adoption itself no longer checks
 /// the PR author (#1214); the reactor posts `/agent` as the owner, so it
 /// deliberately stays on the owner's and the App's PRs.
 fn director_pr(pr: &Value) -> bool {
     let branch = pr["head"]["ref"].as_str().unwrap_or_default();
     pr["head"]["repo"]["full_name"] == REPOSITORY
-        && pr["base"]["ref"] == "main"
+        && (pr["base"]["ref"] == "main"
+            || (pr["base"]["repo"]["full_name"] == REPOSITORY
+                && pr["base"]["ref"]
+                    .as_str()
+                    .is_some_and(super::valid_ref_branch)))
         && branch.starts_with("work/")
         && dispatch_branch(branch).is_none()
         && ((pr["user"]["login"] == "tjfontaine" && pr["user"]["type"] == "User")
@@ -747,6 +751,10 @@ impl Github for Live<'_> {
             AdoptionRead::ClosingReferences(number) => {
                 super::closing_references_response(self.root, number)
             }
+            AdoptionRead::Parent(endpoint) => Ok(serde_json::from_str(&super::gh(
+                self.root,
+                &["api", &endpoint],
+            )?)?),
             AdoptionRead::Issue(number) => Ok(serde_json::from_str(&super::gh(
                 self.root,
                 &["api", &format!("repos/{REPOSITORY}/issues/{number}")],
@@ -977,6 +985,7 @@ mod tests {
                     let c = json!({"nodes":nodes,"pageInfo":{"hasNextPage":false}});
                     json!({"data":{"repository":{"pullRequest":{"closingIssuesReferences":c,"bodyReferences":c}}}})
                 }
+                AdoptionRead::Parent(_) => panic!("unexpected stack read"),
                 AdoptionRead::Issue(n) => {
                     json!({"number":n,"state":"open","user":{"login":"tjfontaine","type":"User"}})
                 }
