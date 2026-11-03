@@ -1377,6 +1377,9 @@ impl TerminalCustody<Thread, Terminal> {
         })
     }
 
+    // Keep the by-value retirement out of the EL1 resume frame, which the
+    // native backing-reply stack chain charges in full.
+    #[inline(never)]
     pub fn retire_zone_current<C: carrick_core_abi::EntryContext>(
         &self,
         member: &dyn MemberControl,

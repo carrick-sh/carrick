@@ -1038,6 +1038,8 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         }
     }
 
+    // Out of line: the interrupt frame is charged on every EL1 resume chain.
+    #[inline(never)]
     fn send_sgis(&mut self, effects: &WakeEffects) {
         for slot in effects.sgi_slots() {
             let target = self.zone.slot(slot).sgi_target();

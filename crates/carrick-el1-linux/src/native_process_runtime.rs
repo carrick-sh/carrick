@@ -5660,10 +5660,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             {
                 Ok(NativeResume::RetrySyscall)
             }
-            None => self
-                .resume_thread_stock_wait()
-                .map_err(NativeProcessError::run_failure_reason)
-                .map(|resumed| resumed.unwrap_or(NativeResume::NoPending)),
+            None => self.resume_thread_stock_wait(),
             Some(LifecycleOutcome::Returned { result, .. }) => Ok(NativeResume::Returned(result)),
             Some(LifecycleOutcome::HostCustody) => {
                 // An adopted host member has no pool entry to retire in the
