@@ -142,12 +142,11 @@ retained. No syscall routing allowance, errno policy or work budget changed.
    or sidecar; `CARRICK_EL1_CENSUS=<directory>` opts in. The unset/empty/exact-0
    policy test fails against the previous default-on implementation and passes
    after the fix. The signed runner explicitly enables evidence; conformance
-   and smoke request private destinations themselves. **Remaining:** the final dispatch checkpoint
-   removed the two CI workflow settings because dispatch credentials cannot
-   publish workflow files. Both workflow `env` blocks still need
-   `CARRICK_EL1_CENSUS: ${{ github.workspace }}/target/carrick-census` applied
-   by a workflow-capable publisher before acceptance. The current tree does not
-   satisfy that CI requirement.
+   and smoke request private destinations themselves. Both CI workflow `env`
+   blocks (`ci.yml`, `kernel-runtime.yml`) set
+   `CARRICK_EL1_CENSUS: ${{ github.workspace }}/target/carrick-census`; the
+   director published them, since dispatch credentials cannot update workflow
+   files.
 6. **Landing behavior: implemented; live oracle gate remains.** Missing shapes
    remain counted debt under the existing 11,484-row ceiling, and shape capture
    accepts natural nonzero workload exits. A killed row without teardown keeps
