@@ -40,18 +40,7 @@ pub enum PollSignalMask {
     Replace(carrick_signal_core::SignalSet),
 }
 
-fn ppoll_timeout_ms(
-    seconds: i64,
-    nanoseconds: i64,
-) -> Result<i32, carrick_syscall_abi::LinuxErrno> {
-    if seconds < 0 || !(0..1_000_000_000).contains(&nanoseconds) {
-        return Err(carrick_syscall_abi::LINUX_EINVAL);
-    }
-    let milliseconds = seconds
-        .saturating_mul(1_000)
-        .saturating_add((nanoseconds + 999_999) / 1_000_000);
-    Ok(milliseconds.min(i64::from(i32::MAX)) as i32)
-}
+use carrick_personality_linux::native_host_file::ppoll_timeout_ms;
 
 pub trait GuestDispatchFrame: SyscallFrame {
     fn native_number(&self) -> carrick_guest_arch::NativeOrdinal;
@@ -4226,6 +4215,110 @@ mod tests {
                 &Resident,
                 table,
                 |_| { panic!("a fault never resolves descriptors") },
+                &mut |_| 0
+            ),
+            None
+        );
+    }
+
+    /// #894: Rust std's startup `ppoll` over host-bound fds 0-2 (no events,
+    /// zero timeout) from a native child. Its in-ring owner leaves the set
+    /// unrouted (only the carrier observes host descriptions); the native
+    /// venue must stage it as one readiness snapshot instead of letting it
+    /// reach the carrier as a bare crossing that is refused with ENOSYS.
+    #[test]
+    fn native_ppoll_over_host_stdio_crosses_as_a_readiness_snapshot() {
+        use carrick_personality_linux::native_host_file::{
+            DescriptionAccess, HostFileStage, InZoneKind,
+        };
+        struct Resident;
+        impl file::MemoryValidator for Resident {
+            fn writable_bytes(&self, _user_va: u64, len: usize) -> usize {
+                len
+            }
+            fn readable_bytes(&self, _user_va: u64, len: usize) -> usize {
+                len
+            }
+        }
+        let task = CurrentTask::new();
+        let mut pollfds = [0u8; 24];
+        for (fd, entry) in pollfds.chunks_exact_mut(8).enumerate() {
+            entry[..4].copy_from_slice(&(fd as i32).to_le_bytes());
+        }
+        let timespec = [0u8; 16];
+        let mut frame = TrapFrame {
+            esr: 0x15 << 26,
+            ..TrapFrame::default()
+        };
+        frame.x[8] = carrick_syscall_abi::nr::PPOLL.raw();
+        frame.x[0] = pollfds.as_mut_ptr().addr() as u64;
+        frame.x[1] = 3;
+        frame.x[2] = timespec.as_ptr().addr() as u64;
+        frame.x[3] = 0;
+        frame.x[4] = 8;
+        let table = [3, 4, 5];
+        let host = |_| {
+            Some(NativeDescriptor::HostBacked {
+                access: DescriptionAccess::ReadWrite,
+            })
+        };
+        let Some(HostFileStage::Request {
+            mut record,
+            output,
+            resolves_path,
+            map,
+            chdir,
+        }) = native_host_file_stage(&frame, &task, &Resident, table, host, &mut |_| {
+            panic!("a poll releases no mapping sources")
+        })
+        else {
+            panic!("a host-bound ppoll from a native process must stage a readiness snapshot");
+        };
+        assert!(!resolves_path && map.is_none() && !chdir);
+        let output = output.expect("the pollfd array is the reply");
+        assert_eq!(output.address, frame.x[0]);
+        assert_eq!(output.len, pollfds.len());
+        let view = carrick_core_abi::host_file::HostFileRequestView::parse(&mut record).unwrap();
+        assert_eq!(
+            view.header().op,
+            carrick_core_abi::host_file::HostFileOp::Poll
+        );
+        assert_eq!(view.header().table, table);
+        assert_eq!(
+            view.header().args[0],
+            carrick_core_abi::host_file::PollWait::Snapshot.raw()
+        );
+        assert_eq!(view.input(), pollfds);
+        // The carrier's snapshot: stderr has hung up.
+        let mut reply = pollfds;
+        reply[22..24].copy_from_slice(&carrick_syscall_abi::LINUX_POLLHUP.to_le_bytes());
+        view.reply(1, &reply).unwrap();
+        let result = carrick_personality_linux::native_host_file::complete(
+            &record,
+            Some(output),
+            &mut |address, bytes| {
+                assert_eq!(address, pollfds.as_ptr().addr() as u64);
+                pollfds.copy_from_slice(bytes);
+                true
+            },
+        );
+        assert_eq!(result.raw(), 1, "readiness, not ENOSYS");
+        assert_eq!(pollfds, reply);
+
+        // A mixed set keeps its route: the carrier cannot observe the pipe.
+        assert_eq!(
+            native_host_file_stage(
+                &frame,
+                &task,
+                &Resident,
+                table,
+                |fd| Some(if fd == 0 {
+                    NativeDescriptor::InZone(InZoneKind::Pipe)
+                } else {
+                    NativeDescriptor::HostBacked {
+                        access: DescriptionAccess::ReadWrite,
+                    }
+                }),
                 &mut |_| 0
             ),
             None

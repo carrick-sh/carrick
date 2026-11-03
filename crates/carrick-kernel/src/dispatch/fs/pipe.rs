@@ -447,7 +447,7 @@ impl PipeInner {
         self.finish(guard, step)
     }
     #[cfg(test)]
-    fn install_endpoint_for_test(
+    pub(crate) fn install_endpoint_for_test(
         &self,
         end: core_pipe::End,
         table: carrick_el1_abi::ipc::fd::TableId,

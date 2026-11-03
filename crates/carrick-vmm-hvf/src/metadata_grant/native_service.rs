@@ -501,12 +501,17 @@ impl NativeService {
 
     fn refuse_host_file(self) -> Result<carrick_sched_core::WakeEffects, TrapError> {
         let request = self.request();
+        // Name the refused venue operation, above every syscall ordinal.
+        let ordinal = self.exec_payload.as_ref().map_or(
+            carrick_core_abi::host_file::HOST_FILE_REFUSAL_ORDINAL_BASE,
+            |record| carrick_core_abi::host_file::refusal_ordinal(record.bytes()),
+        );
         carrick_observability::probes::hvpatch_native_crossing_refused(
             request.identity.birth.mm.mm().raw(),
             request.identity.birth.mm.incarnation().get(),
             request.identity.birth.record.id.raw(),
             request.identity.sequence.get(),
-            0,
+            ordinal,
         );
         self.finish_exec_ticket(|ticket| ticket.complete(false).map_err(|_| stale()))
     }

@@ -274,6 +274,8 @@ impl SyscallDispatcher {
                 self.serve_native_path(owner, table, header, path, capacity)
             })
             .ok_or(NativeHostFileRefusal)?
+        } else if header.op == HostFileOp::Poll {
+            self.serve_native_poll(owner, table, header, view.input(), view.output_capacity())
         } else {
             match owner.with_pinned_host_resource(table, fd::Fd(header.fd), |resource| {
                 self.serve_native_resource(header, resource, view.input(), view.output_capacity())
@@ -295,6 +297,88 @@ impl SyscallDispatcher {
         view.reply(result, &output)
             .map_err(|_| NativeHostFileRefusal)?;
         Ok(NativeHostFileServed { retained_source })
+    }
+
+    /// A non-blocking readiness snapshot of a native `ppoll` set
+    /// ([`HostFileOp::Poll`]). Each live entry is pinned in the caller's
+    /// table now, as Linux resolves each descriptor during the scan, and
+    /// observed through the same readiness the dispatcher reports for that
+    /// resource to a host-served task (implicit stdio streams and venue-opened
+    /// descriptions). An absent descriptor is `POLLNVAL`. An in-zone member,
+    /// a contended table or a resource this venue does not observe refuses
+    /// the whole set: a partial answer would misreport its ready count. The
+    /// carrier never waits: an empty snapshot for a caller that would wait
+    /// is refused, so the ring never reports a fake timeout (#1051 owns the
+    /// blocking wait).
+    ///
+    /// Divergence from Linux: a zero-timeout scan that finds nothing ready
+    /// while an unblocked signal is pending returns 0 here, where Linux
+    /// returns EINTR. The carrier cannot see the caller's pending signals;
+    /// the ring delivers the signal on return. #1051 owns poll's signal and
+    /// EINTR semantics.
+    fn serve_native_poll(
+        &self,
+        owner: &Arc<HostIpc>,
+        table: fd::TableId,
+        header: HostFileHeader,
+        input: &[u8],
+        capacity: usize,
+    ) -> Served {
+        use carrick_core_abi::host_file::{POLLFD_BYTES, PollWait};
+        let may_wait = match PollWait::from_raw(header.args[0]) {
+            Some(PollWait::Snapshot) => false,
+            Some(PollWait::MayWait) => true,
+            None => return Served::Refused,
+        };
+        if input.is_empty() || !input.len().is_multiple_of(POLLFD_BYTES) || capacity != input.len()
+        {
+            return Served::Refused;
+        }
+        let mut output = input.to_vec();
+        let mut ready = 0i64;
+        for entry in output.chunks_exact_mut(POLLFD_BYTES) {
+            let fd = i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
+            let events = i16::from_le_bytes([entry[4], entry[5]]);
+            let revents = if fd < 0 {
+                0
+            } else {
+                match owner.with_pinned_host_resource(table, fd::Fd(fd), |resource| {
+                    self.native_resource_poll_events(resource, events)
+                }) {
+                    Ok(Some(revents)) => {
+                        revents
+                            & (events
+                                | carrick_abi::LINUX_POLLERR
+                                | carrick_abi::LINUX_POLLHUP
+                                | carrick_abi::LINUX_POLLNVAL)
+                    }
+                    Err(PinnedHostResourceError::BadFd) => carrick_abi::LINUX_POLLNVAL,
+                    Ok(None)
+                    | Err(PinnedHostResourceError::InZone | PinnedHostResourceError::Unavailable) =>
+                    {
+                        return Served::Refused;
+                    }
+                }
+            };
+            entry[6..8].copy_from_slice(&revents.to_le_bytes());
+            ready += i64::from(revents != 0);
+        }
+        if ready == 0 && may_wait {
+            return Served::Refused;
+        }
+        Served::Reply(ready, output)
+    }
+
+    /// Linux poll readiness of one pinned host resource, or `None` for a
+    /// resource this venue does not observe.
+    fn native_resource_poll_events(&self, resource: &HostResource, events: i16) -> Option<i16> {
+        if let Some(stdio) = resource.downcast_ref::<ImplicitHostStdio>() {
+            return Some(self.bare_stdio_poll_ready_events(stdio.fd.0, events));
+        }
+        if let Some(file) = resource.downcast_ref::<NativeOpenFile>() {
+            return Some(self.description_poll_ready_events(&file.description, events));
+        }
+        None
     }
 
     fn serve_native_resource(
@@ -371,7 +455,10 @@ impl SyscallDispatcher {
                 Ok(super::fs::CarrierWritten::NeedsTask) | Err(_) => Served::Refused,
             },
             HostFileOp::MapPrivate => self.native_map_source(description),
-            HostFileOp::Openat | HostFileOp::Faccessat | HostFileOp::Newfstatat => Served::Refused,
+            HostFileOp::Openat
+            | HostFileOp::Faccessat
+            | HostFileOp::Newfstatat
+            | HostFileOp::Poll => Served::Refused,
         }
     }
 
@@ -871,6 +958,208 @@ mod tests {
         let mut stdin = record(fixture.table, HostFileOp::Write, 0, [0; 4], b"x", 0);
         assert_eq!(fixture.serve(None, &mut stdin), Err(NativeHostFileRefusal));
         assert!(fixture.dispatcher.stdout().is_empty());
+    }
+
+    fn pollfds(entries: &[(i32, i16, i16)]) -> Vec<u8> {
+        entries
+            .iter()
+            .flat_map(|&(fd, events, revents)| {
+                let mut entry = [0u8; host_file::POLLFD_BYTES];
+                entry[..4].copy_from_slice(&fd.to_le_bytes());
+                entry[4..6].copy_from_slice(&events.to_le_bytes());
+                entry[6..].copy_from_slice(&revents.to_le_bytes());
+                entry
+            })
+            .collect()
+    }
+
+    fn poll_record(table: [u64; 3], wait: u64, entries: &[(i32, i16, i16)]) -> Vec<u8> {
+        let input = pollfds(entries);
+        record(
+            table,
+            HostFileOp::Poll,
+            -1,
+            [wait, 0, 0, 0],
+            &input,
+            input.len(),
+        )
+    }
+
+    #[test]
+    fn native_stdio_poll_snapshot_reports_the_dispatchers_stdio_readiness() {
+        use carrick_abi::{LINUX_POLLIN, LINUX_POLLNVAL, LINUX_POLLOUT};
+        let fixture = fixture();
+        // Rust std's startup check (no events, zero timeout) over stdout and
+        // stderr: nothing is ready and nothing is invalid. The stale revents
+        // the guest left are overwritten.
+        let (result, output) = fixture.result(
+            None,
+            poll_record(
+                fixture.table,
+                host_file::PollWait::Snapshot.raw(),
+                &[(1, 0, 0x7fff), (-1, LINUX_POLLIN, 0x7fff), (2, 0, 0x7fff)],
+            ),
+        );
+        assert_eq!(result, 0);
+        assert_eq!(
+            output,
+            pollfds(&[(1, 0, 0), (-1, LINUX_POLLIN, 0), (2, 0, 0)])
+        );
+        // The captured stdout route is always writable, never readable; an
+        // absent descriptor is POLLNVAL and counts as ready.
+        let (result, output) = fixture.result(
+            None,
+            poll_record(
+                fixture.table,
+                host_file::PollWait::Snapshot.raw(),
+                &[(1, LINUX_POLLIN | LINUX_POLLOUT, 0), (9, LINUX_POLLIN, 0)],
+            ),
+        );
+        assert_eq!(result, 2);
+        assert_eq!(
+            output,
+            pollfds(&[
+                (1, LINUX_POLLIN | LINUX_POLLOUT, LINUX_POLLOUT),
+                (9, LINUX_POLLIN, LINUX_POLLNVAL),
+            ])
+        );
+        // A caller that would wait gets its ready snapshot.
+        let (result, _) = fixture.result(
+            None,
+            poll_record(
+                fixture.table,
+                host_file::PollWait::MayWait.raw(),
+                &[(2, LINUX_POLLOUT, 0)],
+            ),
+        );
+        assert_eq!(result, 1);
+    }
+
+    #[test]
+    fn native_poll_never_waits_or_answers_part_of_a_set() {
+        use carrick_abi::{LINUX_POLLIN, LINUX_POLLOUT};
+        let fixture = fixture();
+        // An empty snapshot for a caller that would wait is refused, not a
+        // fake timeout: no reply is written.
+        let mut empty = poll_record(
+            fixture.table,
+            host_file::PollWait::MayWait.raw(),
+            &[(1, LINUX_POLLIN, 0)],
+        );
+        assert_eq!(fixture.serve(None, &mut empty), Err(NativeHostFileRefusal));
+        assert_eq!(host_file::reply(&empty), None);
+        // A resource this venue does not observe refuses the whole set.
+        let mut unobserved = poll_record(
+            fixture.table,
+            host_file::PollWait::Snapshot.raw(),
+            &[(1, LINUX_POLLOUT, 0), (3, LINUX_POLLIN, 0)],
+        );
+        assert_eq!(
+            fixture.serve(None, &mut unobserved),
+            Err(NativeHostFileRefusal)
+        );
+        assert_eq!(host_file::reply(&unobserved), None);
+        // Unknown wait words and torn arrays are not guessed at.
+        let mut unknown = poll_record(fixture.table, 7, &[(1, LINUX_POLLOUT, 0)]);
+        assert_eq!(
+            fixture.serve(None, &mut unknown),
+            Err(NativeHostFileRefusal)
+        );
+        let mut torn = record(
+            fixture.table,
+            HostFileOp::Poll,
+            -1,
+            [host_file::PollWait::Snapshot.raw(), 0, 0, 0],
+            &[1, 0, 0],
+            3,
+        );
+        assert_eq!(fixture.serve(None, &mut torn), Err(NativeHostFileRefusal));
+    }
+
+    /// A description the venue opened is polled through its own
+    /// description readiness: the same answer the dispatcher gives a host
+    /// task's descriptor for that description.
+    #[test]
+    fn native_poll_reports_a_venue_opened_descriptions_readiness() {
+        use carrick_abi::{LINUX_POLLIN, LINUX_POLLOUT};
+        let fixture = rootfs_fixture();
+        let authority = authority_of(&fixture.dispatcher);
+        let (fd, _) = fixture.result(
+            Some(&authority),
+            record(
+                fixture.table,
+                HostFileOp::Openat,
+                FDCWD,
+                [carrick_abi::LINUX_O_RDONLY, 0, 0, 0],
+                b"/lib/libc.so.6",
+                0,
+            ),
+        );
+        assert_eq!(fd, 4, "lowest free descriptor after stdio and fd 3");
+        let (result, output) = fixture.result(
+            None,
+            poll_record(
+                fixture.table,
+                host_file::PollWait::MayWait.raw(),
+                &[(fd as i32, LINUX_POLLIN | LINUX_POLLOUT, 0)],
+            ),
+        );
+        // A regular file is always readable and writable for poll.
+        assert_eq!(result, 1);
+        assert_eq!(
+            output,
+            pollfds(&[(
+                fd as i32,
+                LINUX_POLLIN | LINUX_POLLOUT,
+                LINUX_POLLIN | LINUX_POLLOUT
+            )])
+        );
+    }
+
+    /// The ring staged the set while every member was host-backed, but a
+    /// member was replaced by an in-zone object before the carrier served
+    /// it (another thread's dup2). The carrier cannot observe that object,
+    /// and calling it absent (POLLNVAL) would be wrong: the whole set is
+    /// refused and no reply is written.
+    #[test]
+    fn native_poll_refuses_a_member_replaced_by_an_in_zone_object() {
+        use carrick_abi::{LINUX_POLLIN, LINUX_POLLOUT};
+        use carrick_el1_abi::ipc::pipe::End;
+        let fixture = fixture();
+        let table = fd::TableId::from_raw(fd::RawTableId {
+            authority: fixture.table[0],
+            index: fixture.table[1],
+            generation: fixture.table[2],
+        });
+        let pipe = super::super::fs::pipe::PipeInner::create(
+            Arc::clone(&fixture.owner),
+            1,
+            super::super::fs::pipe::PIPE_BUF,
+        )
+        .unwrap();
+        // Replace fd 3 (a host description) with the pipe's read end, as a
+        // dup2 from another thread would after the ring staged the set.
+        let region = fixture.owner.region();
+        if let Some(closed) = region
+            .fd(crate::el1_zone::HostLockWait)
+            .close(table, fd::Fd(3))
+            .unwrap()
+        {
+            fixture.owner.release(closed.backing).unwrap();
+        }
+        pipe.retain_endpoint(End::Reader);
+        pipe.install_endpoint_for_test(End::Reader, table, fd::Fd(3))
+            .unwrap();
+        let mut replaced = poll_record(
+            fixture.table,
+            host_file::PollWait::Snapshot.raw(),
+            &[(1, LINUX_POLLOUT, 0), (3, LINUX_POLLIN, 0)],
+        );
+        assert_eq!(
+            fixture.serve(None, &mut replaced),
+            Err(NativeHostFileRefusal)
+        );
+        assert_eq!(host_file::reply(&replaced), None);
     }
 
     #[test]

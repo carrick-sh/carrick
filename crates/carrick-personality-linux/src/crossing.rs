@@ -453,6 +453,10 @@ mod tests {
         assert!(!HostCrossingSet::Aarch64.is_allowed(nr::RT_SIGRETURN));
     }
 
+    /// A native ppoll over host-backed descriptions crosses only as the
+    /// typed host-file venue's readiness snapshot
+    /// (`HostFileOp::Poll`, #894; `docs/design/arm-ring-first-flip.tsv` row
+    /// 73), never as this table's raw syscall forward.
     #[test]
     fn ppoll_has_no_host_syscall_fallback() {
         assert!(!HostCrossingSet::Aarch64.is_allowed(nr::PPOLL));

@@ -160,6 +160,16 @@ pub enum HostFileCall {
     Chdir {
         path: u64,
     },
+    /// `ppoll(2)` that its in-ring owner left unrouted. Only a set whose
+    /// every live entry is host-backed (or absent) and that installs no
+    /// signal mask crosses, as a non-blocking readiness snapshot
+    /// ([`HostFileOp::Poll`]); every other set keeps its route (#1051).
+    Ppoll {
+        fds: u64,
+        nfds: u64,
+        timeout: u64,
+        sigmask: u64,
+    },
 }
 
 /// The exact arguments of a private file `mmap`. The carrier retains the
@@ -274,6 +284,12 @@ impl HostFileCall {
                 request: args[1],
             },
             c if c == nr::CHDIR => Self::Chdir { path: args[0] },
+            c if c == nr::PPOLL => Self::Ppoll {
+                fds: args[0],
+                nfds: args[1],
+                timeout: args[2],
+                sigmask: args[3],
+            },
             c if c == LINUX_NR_MMAP
                 && args[3] & (LINUX_MAP_ANONYMOUS | LINUX_MAP_SHARED | LINUX_MAP_PRIVATE)
                     == LINUX_MAP_PRIVATE =>
@@ -903,6 +919,12 @@ fn stage_call(
                 }
             }
         },
+        HostFileCall::Ppoll {
+            fds,
+            nfds,
+            timeout,
+            sigmask,
+        } => return stage_ppoll(&mut staging, user, fds, nfds, timeout, sigmask),
         HostFileCall::Chdir { path } => {
             let path = match copy_path(user, path) {
                 Path::Bytes(path) => path,
@@ -937,6 +959,99 @@ fn stage_call(
             }
         }
     })
+}
+
+/// Linux `ppoll` timespec validation and conversion to whole milliseconds,
+/// rounded up and saturated at `i32::MAX`: EINVAL for a negative second
+/// count or nanoseconds outside `0..1e9`. The one validator the in-ring
+/// poll body and the native venue's staging share.
+pub fn ppoll_timeout_ms(seconds: i64, nanoseconds: i64) -> Result<i32, LinuxErrno> {
+    if seconds < 0 || !(0..1_000_000_000).contains(&nanoseconds) {
+        return Err(carrick_syscall_abi::LINUX_EINVAL);
+    }
+    let milliseconds = seconds
+        .saturating_mul(1_000)
+        .saturating_add((nanoseconds + 999_999) / 1_000_000);
+    Ok(milliseconds.min(i64::from(i32::MAX)) as i32)
+}
+
+/// Stage a `ppoll` its in-ring owner left unrouted as one non-blocking
+/// host readiness snapshot. The ring owner has already answered every
+/// argument error, every all-in-zone set and `nfds == 0`; what reaches here
+/// is a set that names a host-backed description, which only the carrier
+/// can observe. Scope (#894, #1051):
+/// - a signal mask, an in-zone member (a mixed set) or a set larger than
+///   one record keeps its route (`None`, counted ENOSYS): answering part
+///   of a set would misreport its one ready count;
+/// - the carrier never blocks: with a non-zero timeout an empty snapshot
+///   is refused, never reported as a timeout.
+///
+/// Divergence from Linux: a zero-timeout set with nothing ready returns 0
+/// even while an unblocked signal is pending, where Linux returns EINTR;
+/// the signal is delivered on return. #1051 owns poll's signal semantics.
+fn stage_ppoll(
+    staging: &mut Staging<'_, '_>,
+    user: &mut dyn HostFileUser,
+    fds: u64,
+    nfds: u64,
+    timeout: u64,
+    sigmask: u64,
+) -> Option<HostFileStage> {
+    use host_file::{POLLFD_BYTES, PollWait};
+    if sigmask != 0 || nfds == 0 || nfds > (HOST_FILE_CHUNK_BYTES / POLLFD_BYTES) as u64 {
+        return None;
+    }
+    let wait = if timeout == 0 {
+        PollWait::MayWait
+    } else {
+        let mut spec = [0u8; 16];
+        if !user.copy_in(&mut spec, timeout) {
+            return Some(HostFileStage::Fault {
+                address: timeout,
+                access: Access::Read,
+            });
+        }
+        let seconds = i64::from_le_bytes(spec[..8].try_into().unwrap_or([0; 8]));
+        let nanoseconds = i64::from_le_bytes(spec[8..].try_into().unwrap_or([0; 8]));
+        match ppoll_timeout_ms(seconds, nanoseconds) {
+            Ok(0) => PollWait::Snapshot,
+            Ok(_) => PollWait::MayWait,
+            Err(errno) => return Some(HostFileStage::Returned(SyscallResult::from_errno(errno))),
+        }
+    };
+    let len = nfds as usize * POLLFD_BYTES;
+    let mut entries = vec![0u8; len];
+    if !user.copy_in(&mut entries, fds) {
+        return Some(HostFileStage::Fault {
+            address: fds,
+            access: Access::Read,
+        });
+    }
+    let mut host_backed = false;
+    for entry in entries.chunks_exact(POLLFD_BYTES) {
+        let fd = i32::from_le_bytes(entry[..4].try_into().unwrap_or([0; 4]));
+        if fd < 0 {
+            continue;
+        }
+        match staging.descriptor(fd)? {
+            NativeDescriptor::HostBacked { .. } => host_backed = true,
+            NativeDescriptor::Absent => {}
+            // A mixed set waits on a guest-owned producer the carrier
+            // cannot observe (#1051).
+            NativeDescriptor::InZone(_) => return None,
+        }
+    }
+    if !host_backed {
+        return None;
+    }
+    Some(staging.request(
+        HostFileOp::Poll,
+        -1,
+        0,
+        [wait.raw(), 0, 0, 0],
+        &entries,
+        Some(HostFileOutput { address: fds, len }),
+    ))
 }
 
 /// A chdir lookup's reply area: `struct stat`, then at most `PATH_MAX` bytes
