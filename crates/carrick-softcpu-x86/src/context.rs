@@ -412,6 +412,7 @@ pub struct SoftCpuContext {
     pub walker: SoftWalker,
     pub cpl: u8,
     pub pkru: u32,
+    pub(crate) bmi1: bool,
     pub xcr0: u64,
     pub cr0: u64,
     pub cr2: u64,
@@ -566,6 +567,7 @@ impl SoftCpuContext {
             walker: SoftWalker::new(),
             cpl: 3,
             pkru: 0,
+            bmi1: false,
             xcr0: 0x3,
             // EM stays clear for SSE data operations. CPUID.FPU remains clear:
             // x87 instructions are refused independently of this control bit.
@@ -1224,9 +1226,9 @@ extern "sysv64" fn softcpu_mem_slow_path(
         let target = match access_code {
             0 => translate_or_record_target(ctx, guest_va, SoftAccessKind::Read, insn_va),
             1 => translate_or_record_target(ctx, guest_va, SoftAccessKind::Write, insn_va),
-            _ => translate_or_record_target(ctx, guest_va, SoftAccessKind::Read, insn_va).and_then(
-                |_| translate_or_record_target(ctx, guest_va, SoftAccessKind::Write, insn_va),
-            ),
+            // An RMW is a write access even when its read phase faults.
+            // x86 writable memory is readable; Write checks both PKRU AD/WD.
+            _ => translate_or_record_target(ctx, guest_va, SoftAccessKind::Write, insn_va),
         };
         let Some(target) = target else {
             return 0;
@@ -1263,10 +1265,15 @@ extern "sysv64" fn softcpu_mem_slow_path(
 
     let mut read_ptrs = (std::ptr::null_mut(), std::ptr::null_mut());
     if needs_read {
-        let Some(p0) = translate_or_record_ram(ctx, guest_va, SoftAccessKind::Read, insn_va) else {
+        let kind = if needs_write {
+            SoftAccessKind::Write
+        } else {
+            SoftAccessKind::Read
+        };
+        let Some(p0) = translate_or_record_ram(ctx, guest_va, kind, insn_va) else {
             return 0;
         };
-        let Some(p1) = translate_or_record_ram(ctx, page1_va, SoftAccessKind::Read, insn_va) else {
+        let Some(p1) = translate_or_record_ram(ctx, page1_va, kind, insn_va) else {
             return 0;
         };
         read_ptrs = (p0, p1);
@@ -1389,6 +1396,7 @@ fn step_complex_inner(
             let entry = fp_leaf.ok_or_else(|| X86Exception::invalid_opcode(insn_va))?;
             step_fp(ctx, insn, insn_va, entry)
         }
+        Mnemonic::Tzcnt => step_tzcnt(ctx, insn, insn_va),
         Mnemonic::Div => step_div(ctx, insn, insn_va, false),
         Mnemonic::Idiv => step_div(ctx, insn, insn_va, true),
         Mnemonic::Push => step_push(ctx, insn, insn_va),
@@ -1821,6 +1829,32 @@ fn read_op0_val(
         }
         _ => Err(X86Exception::invalid_opcode(insn_va)),
     }
+}
+
+// F3 0F BC is BSF when the guest CPUID authority lacks BMI1. Never let
+// the host CPU choose this encoding's semantics for the guest.
+fn step_tzcnt(ctx: &mut SoftCpuContext, insn: &Instruction, va: u64) -> Result<(), X86Exception> {
+    let width = insn.op0_register().size();
+    let value = if insn.op1_kind() == OpKind::Memory {
+        read_int(ctx, compute_effective_va(insn, ctx), width, va)?
+    } else {
+        read_reg_sized(ctx, insn.op1_register()).0
+    };
+    if ctx.bmi1 {
+        let count = if value == 0 {
+            (width * 8) as u64
+        } else {
+            u64::from(value.trailing_zeros())
+        };
+        write_reg_sized(ctx, insn.op0_register(), count);
+        ctx.rflags = (ctx.rflags & !0x41) | u64::from(value == 0) | (u64::from(count == 0) << 6);
+    } else {
+        ctx.rflags = (ctx.rflags & !0x40) | (u64::from(value == 0) << 6);
+        if value != 0 {
+            write_reg_sized(ctx, insn.op0_register(), u64::from(value.trailing_zeros()));
+        }
+    }
+    Ok(())
 }
 
 fn step_div(

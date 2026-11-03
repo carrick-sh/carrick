@@ -3604,3 +3604,259 @@ fn avx_unadmitted_extensions_raise_invalid_opcode() {
         assert_eq!(avx_run(&mut cpu, &mut mem, va, bytes), ud(va), "{name}");
     }
 }
+
+// Intel SDM Vol. 2 PMOVMSKB/PINSRW/BTR/TZCNT; native instructions are
+// independent oracles. Each snippet drives the production block translator.
+#[test]
+fn legacy_probe_pmovmskb_matches_native() {
+    for bits in [0, u128::MAX, 0x80ff_007f_aa55_0180_8080_0102_03ff_fe00] {
+        let native: u32;
+        // SAFETY: baseline SSE2, register operands only.
+        unsafe {
+            std::arch::asm!("movdqu xmm0, [{p}]", "pmovmskb {out:e}, xmm0",
+            p = in(reg) &bits, out = lateout(reg) native, out("xmm0") _, options(nostack, readonly));
+        }
+        let (mut cpu, mut mem, va) = setup_snippet(&[0x66, 0x0f, 0xd7, 0xc0, 0x0f, 0x05]);
+        cpu.context_mut().write_xmm(0, bits);
+        cpu.context_mut().gpr[reg::RAX] = u64::MAX;
+        step_ok(&mut cpu, &mut mem, sys(va + 4, va + 6));
+        assert_eq!(cpu.context().gpr[reg::RAX], u64::from(native));
+    }
+}
+
+#[test]
+fn legacy_probe_pinsrw_matches_native() {
+    let before = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210u128;
+    let mut native = 0u128;
+    // SAFETY: baseline SSE2; pointers cover exactly 16 readable/writable bytes.
+    unsafe {
+        std::arch::asm!("movdqu xmm0, [{src}]", "pinsrw xmm0, eax, 255", "movdqu [{dst}], xmm0",
+        src=in(reg) &before, dst=in(reg) &mut native, in("eax") 0xdead_beefu32,
+        out("xmm0") _, options(nostack));
+    }
+    let (mut cpu, mut mem, va) = setup_snippet(&[0x66, 0x0f, 0xc4, 0xc0, 0xff, 0x0f, 0x05]);
+    cpu.context_mut().write_xmm(0, before);
+    cpu.context_mut().gpr[reg::RAX] = 0xdead_beef;
+    step_ok(&mut cpu, &mut mem, sys(va + 5, va + 7));
+    assert_eq!(cpu.context().read_xmm(0), native);
+}
+
+#[test]
+fn legacy_probe_btr_memory_matches_native() {
+    for index in [-65i64, -1, 0, 63, 64, 127] {
+        let mut native = [u64::MAX; 6];
+        let carry: u8;
+        // SAFETY: the signed indexes select words within this six-word array.
+        unsafe {
+            std::arch::asm!("btr qword ptr [{p}], {i}", "setc {c}",
+            p=in(reg) native.as_mut_ptr().add(2), i=in(reg) index,
+            c=lateout(reg_byte) carry, options(nostack));
+        }
+        let (mut cpu, mut mem, va) = setup_snippet(&[0x48, 0x0f, 0xb3, 0x0f, 0x0f, 0x05]);
+        let data = 0x2000_0000;
+        mem.map_range(data, 4096, PagePerms::USER_RW);
+        mem.write_direct(data, &[0xff; 48]);
+        cpu.context_mut().gpr[reg::RDI] = data + 16;
+        cpu.context_mut().gpr[reg::RCX] = index as u64;
+        step_ok(&mut cpu, &mut mem, sys(va + 4, va + 6));
+        for (i, word) in native.iter().enumerate() {
+            let got = mem.read_direct(data + i as u64 * 8, 8);
+            assert_eq!(got.unwrap(), word.to_le_bytes(), "index {index}");
+        }
+        assert_eq!(cpu.context().rflags & 1, u64::from(carry));
+        assert_eq!(cpu.context().gpr[reg::RCX], index as u64);
+    }
+}
+
+#[test]
+fn legacy_probe_tzcnt_without_bmi1_is_bsf() {
+    for input in [0u64, 1, 0x8000_0000, 1 << 63] {
+        let mut native = 0x1234u64;
+        let zero: u8;
+        // SAFETY: baseline BSF, register operands only. Zero leaves the
+        // destination architecturally undefined, so only ZF is compared there.
+        unsafe {
+            std::arch::asm!("bsf {out}, {src}","setz {z}",
+            out=inout(reg) native,src=in(reg) input,z=lateout(reg_byte) zero,options(nostack));
+        }
+        let (mut cpu, mut mem, va) = setup_snippet(&[0xf3, 0x48, 0x0f, 0xbc, 0xc1, 0x0f, 0x05]);
+        cpu.context_mut().gpr[reg::RCX] = input;
+        cpu.context_mut().gpr[reg::RAX] = 0x1234;
+        step_ok(&mut cpu, &mut mem, sys(va + 5, va + 7));
+        assert_eq!((cpu.context().rflags >> 6) & 1, u64::from(zero));
+        if input != 0 {
+            assert_eq!(cpu.context().gpr[reg::RAX], native);
+        }
+    }
+}
+
+#[test]
+fn legacy_probe_bit_string_widths_lock_and_fault_atomicity() {
+    for (prefix, width) in [(vec![0x66], 2usize), (vec![], 4), (vec![0x48], 8)] {
+        for lock in [false, true] {
+            for index in [-1i64, 0, 17, 65] {
+                let mut code = Vec::new();
+                if lock {
+                    code.push(0xf0);
+                }
+                code.extend_from_slice(&prefix);
+                code.extend_from_slice(&[0x0f, 0xb3, 0x07]); // btr [rdi], ax/eax/rax
+                let len = code.len() as u64;
+                code.extend_from_slice(&[0x0f, 0x05]);
+                let (mut cpu, mut mem, va) = setup_snippet(&code);
+                let data = 0x2000_0000;
+                mem.map_range(data, 4096, PagePerms::USER_RW);
+                mem.write_direct(data, &[0xff; 64]);
+                cpu.context_mut().gpr[reg::RDI] = data + 16;
+                cpu.context_mut().gpr[reg::RAX] = index as u64;
+                step_ok(&mut cpu, &mut mem, sys(va + len, va + len + 2));
+                let mut expected = vec![0xff; 64];
+                let byte = (16 + index.div_euclid(8)) as usize;
+                expected[byte] &= !(1 << index.rem_euclid(8));
+                assert_eq!(
+                    mem.read_direct(data, 64).unwrap(),
+                    expected,
+                    "width {width}, index {index}"
+                );
+                assert_eq!(cpu.context().gpr[reg::RAX], index as u64);
+                assert_eq!(cpu.context().rflags & 1, 1);
+            }
+        }
+    }
+    // The index selects an unmapped word even though the base is readable.
+    let (mut cpu, mut mem, va) = setup_snippet(&[0x48, 0x0f, 0xb3, 0x0f, 0x0f, 0x05]);
+    let data = 0x2000_0000;
+    mem.map_range(data, 4096, PagePerms::USER_RW);
+    mem.write_direct(data + 4093, &[0xff; 3]);
+    cpu.context_mut().gpr[reg::RDI] = data + 4093 - 8;
+    cpu.context_mut().gpr[reg::RCX] = 64;
+    cpu.context_mut().rflags = 0x203;
+    step_ok(
+        &mut cpu,
+        &mut mem,
+        pf(va, PF_ERR_USER | PF_ERR_WRITE, data + 4096),
+    );
+    assert_eq!(cpu.context().rip, va);
+    assert_eq!(cpu.context().rflags & 1, 1);
+    assert_eq!(mem.read_direct(data + 4093, 3).unwrap(), [0xff; 3]);
+}
+
+#[test]
+fn legacy_probe_pinsrw_memory_fault_preserves_xmm() {
+    let (mut cpu, mut mem, va) = setup_snippet(&[0x66, 0x0f, 0xc4, 0x07, 0xff, 0x0f, 0x05]);
+    let data = 0x2000_0000;
+    mem.map_range(data, 4096, PagePerms::USER_RW);
+    mem.write_direct(data + 4095, &[0xab]);
+    cpu.context_mut().gpr[reg::RDI] = data + 4095;
+    cpu.context_mut().write_xmm(0, u128::MAX);
+    step_ok(&mut cpu, &mut mem, pf(va, PF_ERR_USER, data + 4096));
+    assert_eq!(cpu.context().read_xmm(0), u128::MAX);
+    mem.map_range(data + 4096, 4096, PagePerms::USER_RW);
+    mem.write_direct(data + 4096, &[0xcd]);
+    step_ok(&mut cpu, &mut mem, sys(va + 5, va + 7));
+    assert_eq!(
+        cpu.context().read_xmm(0),
+        (u128::MAX >> 16) | (0xcdabu128 << 112)
+    );
+}
+
+#[test]
+fn legacy_probe_tzcnt_bmi1_follows_guest_cpuid() {
+    use carrick_softcpu_x86::{CpuidAuthority, CpuidRegs, Level0CpuidView};
+    struct Bmi1;
+    impl CpuidAuthority for Bmi1 {
+        fn cpuid(&self, leaf: u32, subleaf: u32) -> CpuidRegs {
+            let mut result = Level0CpuidView.cpuid(leaf, subleaf);
+            if (leaf, subleaf) == (7, 0) {
+                result.ebx |= 1 << 3;
+            }
+            result
+        }
+    }
+    for input in [0u64, 1, 2, 1 << 63] {
+        let (mut cpu, mut mem, va) = setup_snippet(&[0xf3, 0x48, 0x0f, 0xbc, 0xc1, 0x0f, 0x05]);
+        cpu.set_cpuid_view(Box::new(Bmi1));
+        cpu.context_mut().gpr[reg::RCX] = input;
+        step_ok(&mut cpu, &mut mem, sys(va + 5, va + 7));
+        let count = u64::from(input.trailing_zeros());
+        assert_eq!(cpu.context().gpr[reg::RAX], count);
+        assert_eq!(
+            cpu.context().rflags & 0x41,
+            u64::from(input == 0) | (u64::from(count == 0) << 6)
+        );
+        if std::is_x86_feature_detected!("bmi1") {
+            let native: u64;
+            let flags: u64;
+            // SAFETY: feature detection guards TZCNT; push/pop balance the host stack.
+            unsafe {
+                std::arch::asm!("tzcnt {out}, {src}","pushfq","pop {flags}",
+                out=lateout(reg) native,src=in(reg) input,flags=lateout(reg) flags);
+            }
+            assert_eq!(native, count);
+            assert_eq!(cpu.context().rflags & 0x41, flags & 0x41);
+        }
+        // Replacing the authority switches the same decoded encoding to BSF.
+        cpu.set_cpuid_view(Box::new(Level0CpuidView));
+        cpu.context_mut().rip = va;
+        step_ok(&mut cpu, &mut mem, sys(va + 5, va + 7));
+        assert_eq!((cpu.context().rflags >> 6) & 1, u64::from(input == 0));
+    }
+}
+
+#[test]
+fn legacy_probe_bit_string_family_and_immediate_indexes() {
+    for (opcode, expected) in [
+        (0xa3, 0xffffu64),
+        (0xab, 0xffff),
+        (0xb3, 0xfffe),
+        (0xbb, 0xfffe),
+    ] {
+        let (mut cpu, mut mem, va) = setup_snippet(&[0x66, 0x0f, opcode, 0x0f, 0x0f, 0x05]);
+        let data = 0x2000_0000;
+        mem.map_range(data, 4096, PagePerms::USER_RW);
+        mem.write_direct(data, &[0xff; 4]);
+        cpu.context_mut().gpr[reg::RDI] = data;
+        cpu.context_mut().gpr[reg::RCX] = 16; // select the second word
+        step_ok(&mut cpu, &mut mem, sys(va + 4, va + 6));
+        assert_eq!(
+            mem.read_direct(data, 4).unwrap(),
+            [0xff, 0xff, expected as u8, (expected >> 8) as u8]
+        );
+        assert_eq!(cpu.context().rflags & 1, 1);
+    }
+    // Immediate indexes are masked, never sign-extended or used as a word offset.
+    let (mut cpu, mut mem, va) = setup_snippet(&[0x66, 0x0f, 0xba, 0x37, 0xff, 0x0f, 0x05]);
+    let data = 0x2000_0000;
+    mem.map_range(data, 4096, PagePerms::USER_RW);
+    mem.write_direct(data, &[0xff; 4]);
+    cpu.context_mut().gpr[reg::RDI] = data;
+    step_ok(&mut cpu, &mut mem, sys(va + 5, va + 7));
+    assert_eq!(mem.read_direct(data, 4).unwrap(), [0xff, 0x7f, 0xff, 0xff]);
+}
+
+#[test]
+fn legacy_probe_high_registers_remain_guest_state() {
+    // pmovmskb r15d,xmm14; pinsrw xmm15,r14d,3; syscall
+    let (mut cpu, mut mem, va) = setup_snippet(&[
+        0x66, 0x45, 0x0f, 0xd7, 0xfe, 0x66, 0x45, 0x0f, 0xc4, 0xfe, 3, 0x0f, 0x05,
+    ]);
+    cpu.context_mut().write_xmm(14, u128::MAX);
+    cpu.context_mut().write_xmm(15, 0);
+    cpu.context_mut().gpr[reg::R14] = 0xcafe;
+    cpu.context_mut().gpr[reg::R15] = u64::MAX;
+    step_ok(&mut cpu, &mut mem, sys(va + 11, va + 13));
+    assert_eq!(cpu.context().gpr[reg::R15], 0xffff);
+    assert_eq!(cpu.context().gpr[reg::R14], 0xcafe);
+    assert_eq!(cpu.context().read_xmm(15), 0xcafeu128 << 48);
+    // btr [r15],r14: both reserved host registers are virtualized.
+    let (mut cpu, mut mem, va) = setup_snippet(&[0x4d, 0x0f, 0xb3, 0x37, 0x0f, 0x05]);
+    let data = 0x2000_0000;
+    mem.map_range(data, 4096, PagePerms::USER_RW);
+    mem.write_direct(data, &[0xff; 16]);
+    cpu.context_mut().gpr[reg::R15] = data;
+    cpu.context_mut().gpr[reg::R14] = 65;
+    step_ok(&mut cpu, &mut mem, sys(va + 4, va + 6));
+    assert_eq!(cpu.context().gpr[reg::R15], data);
+    assert_eq!(cpu.context().gpr[reg::R14], 65);
+    assert_eq!(mem.read_direct(data + 8, 1).unwrap(), [0xfd]);
+}

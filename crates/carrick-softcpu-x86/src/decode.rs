@@ -501,14 +501,6 @@ pub(crate) fn supported_body(insn: &Instruction) -> bool {
     }) {
         return false;
     }
-    if matches!(
-        insn.mnemonic(),
-        Mnemonic::Bt | Mnemonic::Btc | Mnemonic::Btr | Mnemonic::Bts
-    ) && insn.op0_kind() == OpKind::Memory
-    {
-        // A register bit index can address outside the nominal operand width.
-        return false;
-    }
     // Implicit address helpers currently implement only flat 64-bit addressing.
     if (insn.is_string_instruction() || insn.mnemonic() == Mnemonic::Xlatb)
         && (matches!(insn.segment_prefix(), Register::FS | Register::GS)
@@ -536,7 +528,7 @@ pub(crate) fn supported_body(insn: &Instruction) -> bool {
         | Mnemonic::Shr | Mnemonic::Sal | Mnemonic::Sar | Mnemonic::Rol | Mnemonic::Ror
         | Mnemonic::Rcl | Mnemonic::Rcr | Mnemonic::Shld | Mnemonic::Shrd | Mnemonic::Bswap
         | Mnemonic::Xchg | Mnemonic::Xadd | Mnemonic::Cmpxchg | Mnemonic::Cmpxchg8b | Mnemonic::Bt
-        | Mnemonic::Btc | Mnemonic::Btr | Mnemonic::Bts | Mnemonic::Bsf | Mnemonic::Bsr
+        | Mnemonic::Btc | Mnemonic::Btr | Mnemonic::Bts | Mnemonic::Bsf | Mnemonic::Bsr | Mnemonic::Tzcnt
         | Mnemonic::Cbw | Mnemonic::Cwde | Mnemonic::Cdqe | Mnemonic::Cwd | Mnemonic::Cdq
         | Mnemonic::Cqo | Mnemonic::Clc | Mnemonic::Stc | Mnemonic::Cmc | Mnemonic::Cld
         | Mnemonic::Std | Mnemonic::Lahf | Mnemonic::Sahf | Mnemonic::Cmova | Mnemonic::Cmovae
@@ -561,7 +553,7 @@ pub(crate) fn supported_body(insn: &Instruction) -> bool {
         | Mnemonic::Psubb | Mnemonic::Psubw | Mnemonic::Psubd | Mnemonic::Psubq | Mnemonic::Pcmpeqb
         | Mnemonic::Pcmpeqw | Mnemonic::Pcmpeqd | Mnemonic::Punpcklbw | Mnemonic::Punpcklwd
         | Mnemonic::Punpckldq | Mnemonic::Punpcklqdq | Mnemonic::Pshufd | Mnemonic::Pshufhw
-        | Mnemonic::Pshuflw | Mnemonic::Pshufw | Mnemonic::Maskmovdqu
+        | Mnemonic::Pshuflw | Mnemonic::Pshufw | Mnemonic::Pmovmskb | Mnemonic::Pinsrw | Mnemonic::Maskmovdqu
         | Mnemonic::Lfence | Mnemonic::Sfence | Mnemonic::Mfence | Mnemonic::Prefetchnta
         | Mnemonic::Prefetcht0 | Mnemonic::Prefetcht1 | Mnemonic::Prefetcht2
     )

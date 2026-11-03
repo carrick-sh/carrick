@@ -138,7 +138,8 @@ fn is_routed_to_complex_helper(insn: &Instruction) -> bool {
         || insn.is_string_instruction()
         || matches!(
             insn.mnemonic(),
-            Mnemonic::Maskmovdqu
+            Mnemonic::Tzcnt
+                | Mnemonic::Maskmovdqu
                 | Mnemonic::Div
                 | Mnemonic::Idiv
                 | Mnemonic::Push
@@ -369,6 +370,26 @@ fn emit_rewritten_mem_op(
         _ => {}
     }
 
+    // Translate the actual bit-string word, then use a bounded native index.
+    // RCX is scratch only for these memory-only destinations and is restored
+    // with MOV, preserving the instruction's carry output (including LOCK).
+    let bit_string = is_register_bit_string(insn);
+    if bit_string {
+        emit_save_flags_into_ctx(out);
+        emit_load_addr_reg_into_rax(out, insn.op1_register());
+        out.push(0x25); // and eax, operand_bits - 1
+        out.extend_from_slice(&((insn.memory_size().size() * 8 - 1) as u32).to_le_bytes());
+        out.extend_from_slice(&[0x48, 0x89, 0xc1]); // mov rcx, rax
+        out.extend_from_slice(&[0x41, 0x8b, 0x87]);
+        out.extend_from_slice(&(CTX_SAVED_LAHF_OFF as i32).to_le_bytes());
+        out.extend_from_slice(&[0x04, 0x7f, 0x9e]);
+        emit_mov_gpr_from_r15_disp32(out, 0, CTX_PROBE_SPILL0_OFF as i32);
+        rewritten.set_op1_register(match insn.memory_size().size() {
+            2 => Register::CX,
+            4 => Register::ECX,
+            _ => Register::RCX,
+        });
+    }
     let virt = begin_virt_r14_r15(out, &mut rewritten, info_factory, false);
     rewritten.set_segment_prefix(Register::None);
     rewritten.set_memory_base(Register::R14);
@@ -379,6 +400,9 @@ fn emit_rewritten_mem_op(
 
     encode_one(out, &rewritten, va)?;
     end_virt_r14_r15(out, &virt);
+    if bit_string {
+        emit_mov_gpr_from_r15_disp32(out, 1, CTX_PROBE_SPILL1_OFF as i32);
+    }
     Ok(())
 }
 
@@ -536,6 +560,7 @@ fn map_reg_width(orig: Register, new_gpr: usize) -> Register {
 fn emit_effective_address_into_r14(code: &mut Vec<u8>, insn: &Instruction) {
     if insn.is_ip_rel_memory_operand() {
         emit_movabs(code, 0x49, 0xBE, insn.ip_rel_memory_address());
+        emit_bit_string_word_offset(code, insn);
     } else {
         emit_movabs(code, 0x49, 0xBE, insn.memory_displacement64());
         let (base, index) = (insn.memory_base(), insn.memory_index());
@@ -556,6 +581,7 @@ fn emit_effective_address_into_r14(code: &mut Vec<u8>, insn: &Instruction) {
             }
             code.extend_from_slice(&[0x49, 0x01, 0xC6]);
         }
+        emit_bit_string_word_offset(code, insn);
         if base.size() == 4 || index.size() == 4 {
             code.extend_from_slice(&[0x45, 0x89, 0xF6]);
         }
@@ -570,6 +596,36 @@ fn emit_effective_address_into_r14(code: &mut Vec<u8>, insn: &Instruction) {
         code.extend_from_slice(&[0x4D, 0x03, 0xB7]);
         code.extend_from_slice(&disp.to_le_bytes());
     }
+}
+
+fn is_register_bit_string(insn: &Instruction) -> bool {
+    insn.op0_kind() == OpKind::Memory
+        && insn.op1_kind() == OpKind::Register
+        && matches!(
+            insn.mnemonic(),
+            Mnemonic::Bt | Mnemonic::Btc | Mnemonic::Btr | Mnemonic::Bts
+        )
+}
+
+fn emit_bit_string_word_offset(code: &mut Vec<u8>, insn: &Instruction) {
+    if !is_register_bit_string(insn) {
+        return;
+    }
+    emit_load_addr_reg_into_rax(code, insn.op1_register());
+    let (word_shift, bit_shift) = match insn.memory_size().size() {
+        2 => {
+            code.extend_from_slice(&[0x48, 0x0f, 0xbf, 0xc0]); // movsx rax, ax
+            (1, 4)
+        }
+        4 => {
+            code.extend_from_slice(&[0x48, 0x63, 0xc0]); // movsxd rax, eax
+            (2, 5)
+        }
+        _ => (3, 6),
+    };
+    code.extend_from_slice(&[0x48, 0xc1, 0xf8, bit_shift]); // signed word index
+    code.extend_from_slice(&[0x48, 0xc1, 0xe0, word_shift]);
+    code.extend_from_slice(&[0x49, 0x01, 0xc6]); // add r14, rax
 }
 
 fn emit_load_addr_reg_into_rax(code: &mut Vec<u8>, r: Register) {

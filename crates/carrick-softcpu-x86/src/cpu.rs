@@ -323,6 +323,7 @@ impl SoftCpu {
         let mut ctx = SoftCpuContext::new(extents).map_err(SoftCpuNewError::Seat)?;
         ctx.walker.set_max_phy_addr(cpuid.max_phy_addr());
         ctx.tsc_hz = cpuid.tsc_hz();
+        ctx.bmi1 = cpuid.cpuid(7, 0).ebx & (1 << 3) != 0;
         ctx.lapic.set_apic_id(cpuid.apic_id());
         Ok(Self {
             ctx: Box::new(ctx),
@@ -344,6 +345,7 @@ impl SoftCpu {
     pub fn set_cpuid_view(&mut self, cpuid: Box<dyn CpuidAuthority>) {
         self.ctx.walker.set_max_phy_addr(cpuid.max_phy_addr());
         self.ctx.tsc_hz = cpuid.tsc_hz();
+        self.ctx.bmi1 = cpuid.cpuid(7, 0).ebx & (1 << 3) != 0;
         self.ctx.lapic.set_apic_id(cpuid.apic_id());
         self.cpuid = cpuid;
     }
