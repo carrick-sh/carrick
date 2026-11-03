@@ -324,6 +324,7 @@ impl SoftCpu {
         ctx.walker.set_max_phy_addr(cpuid.max_phy_addr());
         ctx.tsc_hz = cpuid.tsc_hz();
         ctx.legacy_features = cpuid.cpuid(1, 0).ecx;
+        ctx.fpu = cpuid.cpuid(1, 0).edx & 1 != 0;
         ctx.lzcnt = cpuid.cpuid(0x8000_0001, 0).ecx & (1 << 5) != 0;
         ctx.bmi1 = cpuid.cpuid(7, 0).ebx & (1 << 3) != 0;
         ctx.lapic.set_apic_id(cpuid.apic_id());
@@ -348,6 +349,7 @@ impl SoftCpu {
         self.ctx.walker.set_max_phy_addr(cpuid.max_phy_addr());
         self.ctx.tsc_hz = cpuid.tsc_hz();
         self.ctx.legacy_features = cpuid.cpuid(1, 0).ecx;
+        self.ctx.fpu = cpuid.cpuid(1, 0).edx & 1 != 0;
         self.ctx.lzcnt = cpuid.cpuid(0x8000_0001, 0).ecx & (1 << 5) != 0;
         self.ctx.bmi1 = cpuid.cpuid(7, 0).ebx & (1 << 3) != 0;
         self.ctx.lapic.set_apic_id(cpuid.apic_id());
@@ -952,6 +954,9 @@ fn emulate_xstate<M: SoftMmuMemory>(
                 restored.0[20..24].fill(0);
             }
         }
+        if request & 1 != 0 {
+            normalize_x87_exception_summary(&mut restored);
+        }
         restored.0[28..32].copy_from_slice(&GUEST_MXCSR_MASK.to_le_bytes());
         ctx.fxsave = restored;
         if ext && request & 4 != 0 {
@@ -963,6 +968,17 @@ fn emulate_xstate<M: SoftMmuMemory>(
         }
     }
     Ok(())
+}
+
+// SDM Vol. 1 ch. 8: environment restores derive ES/B from exception
+// flags and masks, rather than trusting those summary bits in the image.
+fn normalize_x87_exception_summary(state: &mut crate::context::FxsaveArea) {
+    let control = u16::from_le_bytes([state.0[0], state.0[1]]);
+    let mut status = u16::from_le_bytes([state.0[2], state.0[3]]) & !0x8080;
+    if status & !control & 0x3f != 0 {
+        status |= 0x8080;
+    }
+    state.0[2..4].copy_from_slice(&status.to_le_bytes());
 }
 
 /// Intel SDM Vol. 1, x87 environment and FSAVE/FXSAVE formats. The largest
@@ -993,6 +1009,18 @@ fn emulate_legacy_x87<M: SoftMmuMemory>(
     }
     if (ctx.cr0 & 0xc) != 0 {
         return Err(X86Exception::device_not_available(ip));
+    }
+    if matches!(op, SensitiveOp::Fldenv | SensitiveOp::Frstor) {
+        let cw = u16::from_le_bytes([ctx.fxsave.0[0], ctx.fxsave.0[1]]);
+        let sw = u16::from_le_bytes([ctx.fxsave.0[2], ctx.fxsave.0[3]]);
+        if sw & !cw & 0x3f != 0 {
+            return Err(X86Exception::new(
+                X86ExceptionVector::X87FloatingPoint,
+                ip,
+                None,
+                None,
+            ));
+        }
     }
     let size = insn.memory_size().size();
     let full = matches!(op, SensitiveOp::Fnsave | SensitiveOp::Frstor);
@@ -1077,12 +1105,17 @@ fn emulate_legacy_x87<M: SoftMmuMemory>(
             ctx.x87_data_selector = 0;
         } else {
             ctx.fxsave.0[0] |= 0x3f;
+            // The stored environment retains the pending exception summary;
+            // masking all exceptions clears ES/B in the live environment.
+            ctx.fxsave.0[2] &= !0x80;
+            ctx.fxsave.0[3] &= !0x80;
         }
     } else {
         read_guest_bytes(ctx, mem, ea, &mut image[..size], SoftAccessKind::Read).map_err(fault)?;
         let mut restored = ctx.fxsave.clone();
         restored.0[..2].copy_from_slice(&image[cw..cw + 2]);
         restored.0[2..4].copy_from_slice(&image[sw..sw + 2]);
+        normalize_x87_exception_summary(&mut restored);
         let tags = u16::from_le_bytes([image[tag], image[tag + 1]]);
         restored.0[4] = (0..8).fold(0u8, |v, i| {
             v | if (tags >> (i * 2)) & 3 != 3 {

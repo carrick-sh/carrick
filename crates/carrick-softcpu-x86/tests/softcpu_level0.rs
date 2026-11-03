@@ -1472,7 +1472,6 @@ fn native_admission_denies_unimplemented_host_features() {
         &[0xf2, 0x0f, 0x38, 0xf8, 0x07], // enqcmd
         &[0xf3, 0x0f, 0x38, 0xf8, 0x07], // enqcmds
         &[0xf3, 0x0f, 0xae, 0xf0],       // umonitor
-        &[0x48, 0x0f, 0xc7, 0x0f],       // cmpxchg16b (CX16 is not exposed)
     ];
     for bytes in cases {
         assert_eq!(
@@ -4236,4 +4235,670 @@ fn same_page_add_fault_is_write() {
 #[test]
 fn same_page_failed_cmpxchg_fault_is_write() {
     check_same_page_rmw_fault(&[0x0f, 0xb1, 0x0f]);
+}
+
+#[test]
+fn cmpxchg16b_success_failure_and_alignment() {
+    for locked in [false, true] {
+        let prefix = if locked { &[0xf0][..] } else { &[][..] };
+        let code = [prefix, &[0x48, 0x0f, 0xc7, 0x0f, 0x0f, 0x05]].concat();
+        for offset in [0, 1, 4080, 4081] {
+            let (mut cpu, mut mem, va) = setup_x87_snippet(&code);
+            let addr = 0x800000 + offset;
+            mem.write_direct(addr, &7u128.to_le_bytes());
+            let ctx = cpu.context_mut();
+            ctx.gpr[reg::RDI] = addr;
+            ctx.gpr[reg::RAX] = 7;
+            ctx.gpr[reg::RDX] = 0;
+            ctx.gpr[reg::RBX] = 11;
+            ctx.gpr[reg::RCX] = 13;
+            ctx.rflags = 0x8d7; // CMPXCHG16B changes only ZF.
+            if offset & 15 != 0 {
+                step_ok(
+                    &mut cpu,
+                    &mut mem,
+                    SoftCpuExit::Exception(X86Exception::general_protection(va, 0)),
+                );
+                assert_eq!(mem.read_direct(addr, 16).unwrap(), 7u128.to_le_bytes());
+                continue;
+            }
+            assert!(matches!(
+                cpu.step_block(&mut mem).unwrap(),
+                SoftCpuExit::Syscall { .. }
+            ));
+            assert_ne!(cpu.context().rflags & 64, 0);
+            assert_eq!(cpu.context().rflags & 0x895, 0x895);
+            let replacement = (13u128 << 64) | 11;
+            assert_eq!(
+                mem.read_direct(addr, 16).unwrap(),
+                replacement.to_le_bytes()
+            );
+            cpu.context_mut().rip = va;
+            assert!(matches!(
+                cpu.step_block(&mut mem).unwrap(),
+                SoftCpuExit::Syscall { .. }
+            ));
+            assert_eq!(cpu.context().rflags & 64, 0);
+            assert_eq!(cpu.context().rflags & 0x895, 0x895);
+            assert_eq!(cpu.context().gpr[reg::RAX], 11);
+            assert_eq!(cpu.context().gpr[reg::RDX], 13);
+        }
+    }
+}
+
+#[test]
+fn x87_integer_round_trip_preserves_more_than_binary64_precision() {
+    // fldcw [rdi]; fnstcw [rsi]; fild qword [rdx]; fxam;
+    // fnstsw ax; fistp qword [rcx]; syscall. Exercise the public execution
+    // entry with the control-word sequence used around libc conversions.
+    let code = [
+        0xd9, 0x2f, 0xd9, 0x3e, 0xdf, 0x2a, 0xd9, 0xe5, 0xdf, 0xe0, 0xdf, 0x39, 0x0f, 0x05,
+    ];
+    for rounding in 0..4u16 {
+        for value in [
+            i64::MIN,
+            -9_007_199_254_740_993,
+            9_007_199_254_740_993,
+            i64::MAX,
+        ] {
+            let (mut cpu, mut mem, _) = setup_x87_snippet(&code);
+            let cw = 0x037f | (rounding << 10);
+            mem.write_direct(0x800000, &cw.to_le_bytes());
+            mem.write_direct(0x800010, &value.to_le_bytes());
+            let ctx = cpu.context_mut();
+            ctx.gpr[reg::RDI] = 0x800000;
+            ctx.gpr[reg::RSI] = 0x800008;
+            ctx.gpr[reg::RDX] = 0x800010;
+            ctx.gpr[reg::RCX] = 0x800018;
+            assert!(matches!(
+                cpu.step_block(&mut mem).unwrap(),
+                SoftCpuExit::Syscall { .. }
+            ));
+            assert_eq!(mem.read_direct(0x800008, 2).unwrap(), cw.to_le_bytes());
+            assert_eq!(mem.read_direct(0x800018, 8).unwrap(), value.to_le_bytes());
+            // FXAM: C3:C2:C0=010 for a normal finite value; C1 is its sign.
+            let status = cpu.context().gpr[reg::RAX] as u16;
+            assert_eq!(status & 0x4700, 0x0400 | if value < 0 { 0x0200 } else { 0 });
+            assert_eq!(cpu.context().fxsave.0[4], 0); // FISTP consumed ST0.
+        }
+    }
+}
+
+#[test]
+fn x87_extended_precision_load_arithmetic_store() {
+    // fld tbyte [rdi]; fld1; faddp; fstp tbyte [rsi]; syscall.
+    // 2^63 + 1 is exact in extended precision, but not in binary64.
+    let (mut cpu, mut mem, va) =
+        setup_x87_snippet(&[0xdb, 0x2f, 0xd9, 0xe8, 0xde, 0xc1, 0xdb, 0x3e, 0x0f, 0x05]);
+    let mut input = [0u8; 10];
+    input[..8].copy_from_slice(&(1u64 << 63).to_le_bytes());
+    input[8..].copy_from_slice(&0x403eu16.to_le_bytes());
+    mem.write_direct(0x800000, &input);
+    cpu.context_mut().gpr[reg::RDI] = 0x800000;
+    cpu.context_mut().gpr[reg::RSI] = 0x801ffc; // crosses a page; map the successor
+    mem.map_range(0x802000, 4096, PagePerms::USER_RW);
+    assert!(matches!(
+        cpu.step_block(&mut mem).unwrap(),
+        SoftCpuExit::Syscall { .. }
+    ));
+    input[0] = 1;
+    assert_eq!(mem.read_direct(0x801ffc, 10).unwrap(), input);
+    assert_eq!(&cpu.context().fxsave.0[8..16], &(va + 6).to_le_bytes());
+    assert_eq!(&cpu.context().fxsave.0[16..24], &0x801ffcu64.to_le_bytes());
+    assert_eq!(cpu.context().fxsave.0[4], 0); // both pushes popped
+}
+
+#[test]
+fn x87_instructions_match_native_control_status_and_extended_registers() {
+    #[repr(C, align(16))]
+    struct Image([u8; 544]);
+    // Independent native execution: operands use RDI; RSI holds the image.
+    // Preserve host x87/SSE, execute one instruction, capture AX/RFLAGS and
+    // the complete x87 stack before restoring the host, without a WAIT.
+    let mut cases: Vec<Vec<u8>> = vec![];
+    for op in [0xd8, 0xdc, 0xde] {
+        // arithmetic and comparisons, with/without pop
+        for group in 0..8 {
+            cases.push(vec![op, 0xc1 + group * 8]);
+        }
+    }
+    for modrm in [
+        0xc0, 0xc1, 0xc9, 0xd0, 0xe0, 0xe1, 0xe4, 0xe5, 0xe8, 0xe9, 0xea, 0xeb, 0xec, 0xed, 0xee,
+        0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe,
+        0xff,
+    ] {
+        cases.push(vec![0xd9, modrm]);
+    }
+    for (op, values) in [
+        (0xda, &[0xc1, 0xc9, 0xd1, 0xd9, 0xe9][..]),
+        (0xdb, &[0xc1, 0xc9, 0xd1, 0xd9, 0xe2, 0xe3, 0xe9, 0xf1]),
+        (0xdd, &[0xc1, 0xd1, 0xd9, 0xe1, 0xe9]),
+        (0xdf, &[0xc1, 0xe0, 0xe9, 0xf1]),
+    ] {
+        for &v in values {
+            cases.push(vec![op, v]);
+        }
+    }
+    for (op, groups) in [
+        (0xd8, &[0, 1, 2, 3, 4, 5, 6, 7][..]),
+        (0xda, &[0, 1, 2, 3, 4, 5, 6, 7]),
+        (0xdc, &[0, 1, 2, 3, 4, 5, 6, 7]),
+        (0xde, &[0, 1, 2, 3, 4, 5, 6, 7]),
+        (0xd9, &[0, 2, 3, 5, 7]),
+        (0xdb, &[0, 1, 2, 3, 5, 7]),
+        (0xdd, &[0, 1, 2, 3, 7]),
+        (0xdf, &[0, 1, 2, 3, 4, 5, 6, 7]),
+    ] {
+        for &g in groups {
+            cases.push(vec![op, 7 + g * 8]);
+        }
+    }
+    for bytes in cases {
+        let decoded = iced_x86::Decoder::new(64, &bytes, iced_x86::DecoderOptions::NONE).decode();
+        if decoded.is_invalid() {
+            continue;
+        }
+        for (precision, rounding, tags, masks) in [0, 2, 3].into_iter().flat_map(|pc| {
+            (0..4u16)
+                .flat_map(move |rc| [(pc, rc, 0xffu8, 0x3fu16), (pc, rc, 3, 0x3f), (pc, rc, 3, 0)])
+        }) {
+            let (mut cpu, mut mem, _) =
+                setup_x87_snippet(&[bytes.as_slice(), &[0x0f, 0x05]].concat());
+            let mut reference = Image([0; 544]);
+            reference.0[..512].copy_from_slice(&cpu.context().fxsave.0);
+            reference.0[..2].copy_from_slice(
+                &(0x0040u16 | (precision << 8) | masks | (rounding << 10)).to_le_bytes(),
+            );
+            reference.0[4] = tags;
+            for i in 0..8 {
+                // Full stack, ST0=1.5, ST1=2.25: also witnesses stack overflow.
+                reference.0[32 + i * 16..40 + i * 16].copy_from_slice(
+                    &(if i == 0 {
+                        0xc000000000000000u64
+                    } else {
+                        0x9000000000000000u64
+                    })
+                    .to_le_bytes(),
+                );
+                reference.0[40 + i * 16..42 + i * 16]
+                    .copy_from_slice(&(if i == 0 { 0x3fffu16 } else { 0x4000u16 }).to_le_bytes());
+            }
+            cpu.context_mut()
+                .fxsave
+                .0
+                .copy_from_slice(&reference.0[..512]);
+            cpu.context_mut().gpr[reg::RAX] = 0x12345678;
+            cpu.context_mut().gpr[reg::RDI] = 0x800000;
+            let flags = [2, 3, 0x42, 6][rounding as usize];
+            cpu.context_mut().rflags = flags;
+            let mut operand = [0u8; 16];
+            operand[..8].copy_from_slice(&(-2.5f64).to_le_bytes());
+            if decoded.mnemonic() == iced_x86::Mnemonic::Fldcw {
+                operand[..2].copy_from_slice(&0x037fu16.to_le_bytes());
+            }
+            mem.write_direct(0x800000, &operand);
+            let mut host = Image([0; 544]);
+            let mut native = vec![
+                0x48, 0x0f, 0xae, 0x02, 0x48, 0x0f, 0xae, 0x0e, 0xb8, 0x78, 0x56, 0x34, 0x12, 0x51,
+                0x9d,
+            ];
+            native.extend_from_slice(&bytes);
+            native.extend_from_slice(&[
+                0x9c, 0x59, 0x48, 0x89, 0x86, 0, 2, 0, 0, 0x48, 0x89, 0x8e, 8, 2, 0, 0, 0x48, 0x0f,
+                0xae, 0x06, 0x48, 0x0f, 0xae, 0x0a, 0xc3,
+            ]);
+            let mut jit = JitCodeBuffer::new(native.len()).unwrap();
+            let entry = jit.publish(&native).unwrap();
+            // SAFETY: fixed wrapper preserves host FP state, all operands point
+            // to live aligned images, and only the listed x87 instructions run.
+            unsafe {
+                let run: unsafe extern "sysv64" fn(*mut u8, *mut u8, *mut u8, u64) =
+                    std::mem::transmute(entry);
+                run(
+                    operand.as_mut_ptr(),
+                    reference.0.as_mut_ptr(),
+                    host.0.as_mut_ptr(),
+                    flags,
+                );
+            }
+            assert!(
+                matches!(
+                    cpu.step_block(&mut mem).unwrap(),
+                    SoftCpuExit::Syscall { .. }
+                ),
+                "{bytes:02x?}"
+            );
+            assert_eq!(
+                &cpu.context().fxsave.0[..5],
+                &reference.0[..5],
+                "status/control {bytes:02x?} rc={rounding}"
+            );
+            for i in 0..8 {
+                assert_eq!(
+                    &cpu.context().fxsave.0[32 + i * 16..42 + i * 16],
+                    &reference.0[32 + i * 16..42 + i * 16],
+                    "ST{i} {bytes:02x?}"
+                );
+            }
+            assert_eq!(
+                mem.read_direct(0x800000, 16).unwrap(),
+                operand,
+                "memory {bytes:02x?}"
+            );
+            if bytes == [0xdf, 0xe0] {
+                assert_eq!(
+                    cpu.context().gpr[reg::RAX],
+                    u64::from_le_bytes(reference.0[512..520].try_into().unwrap())
+                );
+            }
+            // SYSCALL saves flags but does not change arithmetic condition codes.
+            assert_eq!(
+                cpu.context().rflags & 0x8d5,
+                u64::from_le_bytes(reference.0[520..528].try_into().unwrap()) & 0x8d5,
+                "flags {bytes:02x?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn x87_pending_exceptions_and_faults_preserve_guest_state() {
+    let (mut cpu, mut mem, va) = setup_x87_snippet(&[]);
+    cpu.context_mut().fxsave.0[0] &= !1; // unmask invalid operation
+    assert!(matches!(
+        avx_run(
+            &mut cpu,
+            &mut mem,
+            va,
+            &[0xd9, 0xee, 0xd9, 0xee, 0xde, 0xf9]
+        ),
+        SoftCpuExit::Continue { .. }
+    )); // 0/0
+    assert_ne!(cpu.context().fxsave.0[2] & 1, 0);
+    // Nonwaiting status/control instructions remain usable with pending #MF.
+    assert!(matches!(
+        avx_run(&mut cpu, &mut mem, va, &[0xdf, 0xe0]),
+        SoftCpuExit::Continue { .. }
+    ));
+    assert_ne!(cpu.context().gpr[reg::RAX] & 1, 0);
+    let pending = cpu.context().fxsave.clone();
+    for instruction in [&[0xd9, 0x27][..], &[0xdd, 0x27]] {
+        // FLDENV / FRSTOR
+        cpu.context_mut().gpr[reg::RDI] = 0xdead0000;
+        assert_eq!(
+            avx_run(&mut cpu, &mut mem, va, instruction),
+            SoftCpuExit::Exception(X86Exception::new(
+                X86ExceptionVector::X87FloatingPoint,
+                va,
+                None,
+                None
+            ))
+        );
+        assert_eq!(cpu.context().fxsave.0, pending.0);
+    }
+
+    assert_eq!(
+        avx_run(&mut cpu, &mut mem, va, &[0xd9, 0xe8]),
+        SoftCpuExit::Exception(X86Exception::new(
+            X86ExceptionVector::X87FloatingPoint,
+            va,
+            None,
+            None
+        ))
+    );
+    assert_eq!(cpu.context().fxsave.0, pending.0);
+    assert!(matches!(
+        avx_run(&mut cpu, &mut mem, va, &[0xdb, 0xe2]),
+        SoftCpuExit::Continue { .. }
+    )); // fnclex
+    assert_eq!(cpu.context().fxsave.0[2] & 0x3f, 0);
+    assert!(matches!(
+        avx_run(&mut cpu, &mut mem, va, &[0xdb, 0xe3, 0xd9, 0xe8]),
+        SoftCpuExit::Continue { .. }
+    ));
+    let before = cpu.context().fxsave.clone();
+    cpu.context_mut().gpr[reg::RDI] = 0x801ffc;
+    mem.write_direct(0x801ffc, &[0x55; 4]);
+    assert_eq!(
+        avx_run(&mut cpu, &mut mem, va, &[0xdb, 0x3f]),
+        pf(va, PF_ERR_USER | PF_ERR_WRITE, 0x802000)
+    );
+    assert_eq!(cpu.context().fxsave.0, before.0);
+    assert_eq!(mem.read_direct(0x801ffc, 4).unwrap(), [0x55; 4]);
+    for cr0 in [4, 8, 12] {
+        cpu.context_mut().cr0 |= cr0;
+        assert_eq!(
+            avx_run(&mut cpu, &mut mem, va, &[0xd9, 0xe8]),
+            SoftCpuExit::Exception(X86Exception::device_not_available(va))
+        );
+        cpu.context_mut().cr0 &= !12;
+    }
+    // Different contexts keep independent stacks/control words across gateways.
+    let (mut peer, mut other, peer_va) = setup_x87_snippet(&[]);
+    assert!(matches!(
+        avx_run(&mut peer, &mut other, peer_va, &[0xd9, 0xee]),
+        SoftCpuExit::Continue { .. }
+    ));
+    assert_eq!(cpu.context().fxsave.0, before.0);
+    assert_ne!(
+        &cpu.context().fxsave.0[32..42],
+        &peer.context().fxsave.0[32..42]
+    );
+}
+
+#[test]
+fn cmpxchg16b_failure_still_requires_write_permission() {
+    let (mut cpu, mut mem, va) = setup_x87_snippet(&[0xf0, 0x48, 0x0f, 0xc7, 0x0f]);
+    mem.map_range(0x20000000, 4096, PagePerms::USER_RO);
+    mem.write_direct(0x20000000, &7u128.to_le_bytes());
+    cpu.context_mut().gpr[reg::RDI] = 0x20000000;
+    cpu.context_mut().gpr[reg::RAX] = 9;
+    step_ok(
+        &mut cpu,
+        &mut mem,
+        pf(va, PF_ERR_PRESENT | PF_ERR_USER | PF_ERR_WRITE, 0x20000000),
+    );
+    assert_eq!(cpu.context().gpr[reg::RAX], 9);
+    assert_eq!(
+        mem.read_direct(0x20000000, 16).unwrap(),
+        7u128.to_le_bytes()
+    );
+}
+
+#[test]
+fn cmpxchg16b_locked_updates_are_atomic_against_native_peer() {
+    let loop_bytes = [
+        0x31, 0xc0, 0x31, 0xd2, 0x48, 0x89, 0xc3, 0x48, 0x83, 0xc3, 1, 0x48, 0x89, 0xd1, 0x48,
+        0x83, 0xd1, 0, 0xf0, 0x48, 0x0f, 0xc7, 0x0f, 0x75, 0xeb, 0x48, 0xff, 0xce, 0x75, 0xe6,
+    ];
+    // Bound attempts, rather than successes: an unthrottled native writer can
+    // legitimately invalidate every soft comparison. Keep the conditional
+    // branch as a block boundary so its flags witness each CAS outcome.
+    let mut soft_loop = loop_bytes;
+    soft_loop[24] = 0; // JNZ +0: both outcomes reach the decrement.
+    let (mut cpu, mut mem, va) = setup_x87_snippet(&[soft_loop.as_slice(), &[0x0f, 0x05]].concat());
+    let addr = 0x800000;
+    let ptr = mem.placement.base_host_addr() + mem.va_to_frame[&addr].raw() as usize;
+    cpu.context_mut().gpr[reg::RDI] = addr;
+    cpu.context_mut().gpr[reg::RSI] = 2000;
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (start_tx, start_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let stop_ref = &stop;
+    // Scoped custody and the deadline retain backing storage through cleanup.
+    std::thread::scope(|scope| {
+        let peer = scope.spawn(move || {
+            let native = [&[0x53][..], &loop_bytes, &[0x5b, 0xc3]].concat();
+            let mut jit = JitCodeBuffer::new(native.len()).unwrap();
+            let entry = jit.publish(&native).unwrap();
+            ready_tx.send(()).unwrap();
+            start_rx.recv_timeout(RETIRE_WAIT).unwrap();
+            // SAFETY: the parent retains the aligned backing allocation until join.
+            // Both actors access this location only through LOCK CMPXCHG16B. The
+            // wrapper preserves RBX and uses the SysV RDI/RSI argument registers.
+            let deadline = std::time::Instant::now() + RETIRE_WAIT;
+            let mut updates = 0u128;
+            while !stop_ref.load(std::sync::atomic::Ordering::Acquire)
+                && std::time::Instant::now() < deadline
+            {
+                unsafe {
+                    let run: unsafe extern "sysv64" fn(usize, u64) = std::mem::transmute(entry);
+                    run(ptr, 1024);
+                }
+                updates += 1024;
+            }
+            done_tx.send(updates).unwrap();
+        });
+        ready_rx.recv_timeout(RETIRE_WAIT).unwrap();
+        start_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + RETIRE_WAIT;
+        let mut failed_cas = 0u128;
+        let mut attempts = 0;
+        let mut overlapping_failures = 0;
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "atomic update loop did not finish"
+            );
+            match cpu.step_block(&mut mem).unwrap() {
+                SoftCpuExit::Continue { .. } => {
+                    // JNZ at +23 ends the CAS block before DEC changes ZF.
+                    if cpu.context().rip == va + 25 {
+                        if cpu.context().rflags & 0x40 == 0 {
+                            failed_cas += 1;
+                            // Exclude an initial stale expectation: a later
+                            // failure requires progress after a soft CAS has
+                            // already sampled the concurrently updated word.
+                            overlapping_failures += u64::from(attempts != 0);
+                        }
+                        attempts += 1;
+                    }
+                }
+                SoftCpuExit::Syscall { .. } => break,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        let native_updates = done_rx.recv_timeout(RETIRE_WAIT).unwrap();
+        peer.join().unwrap();
+        assert_eq!(attempts, 2000);
+        assert!(failed_cas > 0, "soft CAS never saw a native update");
+        assert!(overlapping_failures > 0, "only the initial soft CAS failed");
+        assert_eq!(
+            mem.read_direct(addr, 16).unwrap(),
+            (native_updates + 2000 - failed_cas).to_le_bytes()
+        );
+    });
+}
+
+#[test]
+fn x87_environment_load_save_matches_native_tags_and_exception_summary() {
+    use carrick_softcpu_x86::FxsaveArea;
+    #[repr(C, align(16))]
+    struct Run {
+        guest: FxsaveArea,
+        host: FxsaveArea,
+        operand: [u8; 512],
+    }
+    // Loading environments must preserve TOP and physical tags, and derive
+    // ES/B from the loaded exception flags/masks exactly as native does.
+    // No waiting instruction follows a potentially pending exception.
+    for (short, full) in [(false, false), (true, false), (false, true), (true, true)] {
+        for (cw, sw) in [(0x037fu16, 0x2800u16), (0x037e, 0x2801), (0x037f, 0xa881)] {
+            let mut input = [0u8; 512];
+            input[..2].copy_from_slice(&cw.to_le_bytes());
+            let (sw_off, tag_off) = if short { (2, 4) } else { (4, 8) };
+            input[sw_off..sw_off + 2].copy_from_slice(&sw.to_le_bytes());
+            input[tag_off..tag_off + 2].copy_from_slice(&0xe493u16.to_le_bytes());
+            let prefix = if short { &[0x66][..] } else { &[][..] };
+            let opcode = if full { 0xdd } else { 0xd9 };
+            let load = [prefix, &[opcode, 0x27]].concat(); // fldenv/frstor [rdi]
+            let save = [prefix, &[opcode, 0x37]].concat(); // fnstenv/fnsave [rdi]
+            let mut run = Run {
+                guest: FxsaveArea::default(),
+                host: FxsaveArea::default(),
+                operand: input,
+            };
+            // RDI=operand, RSI=guest, RDX=host. Independent native oracle.
+            let mut code = vec![0x48, 0x0f, 0xae, 0x02, 0x48, 0x0f, 0xae, 0x0e];
+            code.extend_from_slice(&load);
+            code.extend_from_slice(&save);
+            code.extend_from_slice(&[0x48, 0x0f, 0xae, 0x06, 0x48, 0x0f, 0xae, 0x0a, 0xc3]);
+            let mut jit = JitCodeBuffer::new(code.len()).unwrap();
+            let entry = jit.publish(&code).unwrap();
+            // SAFETY: aligned live images, nonwaiting capture, host restored
+            // before returning to Rust, no native guest addresses.
+            unsafe {
+                let execute: unsafe extern "sysv64" fn(*mut u8, *mut u8, *mut u8) =
+                    std::mem::transmute(entry);
+                execute(
+                    run.operand.as_mut_ptr(),
+                    run.guest.0.as_mut_ptr(),
+                    run.host.0.as_mut_ptr(),
+                );
+            }
+            let (mut cpu, mut mem, va) = setup_x87_snippet(&[]);
+            cpu.context_mut().gpr[reg::RDI] = 0x800000;
+            mem.write_direct(0x800000, &input);
+            assert!(matches!(
+                avx_run(&mut cpu, &mut mem, va, &load),
+                SoftCpuExit::Continue { .. }
+            ));
+            assert!(matches!(
+                avx_run(&mut cpu, &mut mem, va, &save),
+                SoftCpuExit::Continue { .. }
+            ));
+            let len = if short { 14 } else { 28 } + if full { 80 } else { 0 };
+            assert_eq!(
+                mem.read_direct(0x800000, len).unwrap(),
+                run.operand[..len],
+                "environment short={short} cw={cw:x} sw={sw:x}"
+            );
+            assert_eq!(
+                &cpu.context().fxsave.0[..5],
+                &run.guest.0[..5],
+                "state short={short} cw={cw:x} sw={sw:x}"
+            );
+        }
+    }
+}
+
+#[test]
+fn x87_fxrstor_fxsave_matches_native_with_pending_exceptions() {
+    use carrick_softcpu_x86::FxsaveArea;
+    for (cw, sw) in [(0x037fu16, 0x2800u16), (0x037e, 0x2801), (0x037f, 0xa881)] {
+        let mut input = FxsaveArea::default();
+        input.0[..2].copy_from_slice(&cw.to_le_bytes());
+        input.0[2..4].copy_from_slice(&sw.to_le_bytes());
+        input.0[4] = 0xa6;
+        for i in 0..8 {
+            input.0[32 + i * 16..40 + i * 16]
+                .copy_from_slice(&(0x8000000000000000u64 + i as u64).to_le_bytes());
+            input.0[40 + i * 16..42 + i * 16].copy_from_slice(&0x3fffu16.to_le_bytes());
+        }
+        let mut native = input.clone();
+        let mut host = FxsaveArea::default();
+        // Save host, load input, nonwaiting save, restore host. RDI/RSI are
+        // aligned images; there is deliberately no FWAIT in this oracle.
+        let code = [
+            0x48, 0x0f, 0xae, 0x06, 0x48, 0x0f, 0xae, 0x0f, 0x48, 0x0f, 0xae, 0x07, 0x48, 0x0f,
+            0xae, 0x0e, 0xc3,
+        ];
+        let mut jit = JitCodeBuffer::new(code.len()).unwrap();
+        let entry = jit.publish(&code).unwrap();
+        // SAFETY: both operands are live aligned images; host restored before Rust.
+        unsafe {
+            let execute: unsafe extern "sysv64" fn(*mut u8, *mut u8) = std::mem::transmute(entry);
+            execute(native.0.as_mut_ptr(), host.0.as_mut_ptr());
+        }
+        let (mut cpu, mut mem, va) = setup_x87_snippet(&[]);
+        mem.write_direct(0x800000, &input.0);
+        cpu.context_mut().gpr[reg::RDI] = 0x800000;
+        assert!(matches!(
+            avx_run(&mut cpu, &mut mem, va, &[0x48, 0x0f, 0xae, 0x0f]),
+            SoftCpuExit::Continue { .. }
+        ));
+        assert!(matches!(
+            avx_run(&mut cpu, &mut mem, va, &[0x48, 0x0f, 0xae, 0x07]),
+            SoftCpuExit::Continue { .. }
+        ));
+        let saved = mem.read_direct(0x800000, 512).unwrap();
+        assert_eq!(&saved[..5], &native.0[..5], "cw={cw:x} sw={sw:x}");
+        for i in 0..8 {
+            assert_eq!(
+                &saved[32 + i * 16..42 + i * 16],
+                &native.0[32 + i * 16..42 + i * 16]
+            );
+        }
+        cpu.context_mut().gpr[reg::RDI] = 0xdead0000;
+        // Pending #MF precedes an operand #PF; nonwaiting FNSTCW still
+        // accesses memory. FWAIT observes the pending exception as well.
+        if cw & 1 == 0 {
+            for bytes in [&[0xd9, 0x07][..], &[0x9b]] {
+                assert_eq!(
+                    avx_run(&mut cpu, &mut mem, va, bytes),
+                    SoftCpuExit::Exception(X86Exception::new(
+                        X86ExceptionVector::X87FloatingPoint,
+                        va,
+                        None,
+                        None
+                    ))
+                );
+            }
+            assert_eq!(
+                avx_run(&mut cpu, &mut mem, va, &[0xd9, 0x3f]),
+                pf(va, PF_ERR_USER | PF_ERR_WRITE, 0xdead0000)
+            );
+        }
+    }
+}
+
+fn setup_x87_snippet(code: &[u8]) -> (SoftCpu, TestSoftMmuMemory, u64) {
+    let (mut cpu, mem, va) = setup_snippet(code);
+    cpu.set_cpuid_view(Box::new(X87Features {
+        fpu: true,
+        cx16: true,
+        sse3: true,
+    }));
+    (cpu, mem, va)
+}
+
+struct X87Features {
+    fpu: bool,
+    cx16: bool,
+    sse3: bool,
+}
+impl carrick_softcpu_x86::CpuidAuthority for X87Features {
+    fn cpuid(&self, leaf: u32, subleaf: u32) -> carrick_softcpu_x86::CpuidRegs {
+        use carrick_softcpu_x86::Level0CpuidView;
+        let mut r = Level0CpuidView.cpuid(leaf, subleaf);
+        if leaf == 1 {
+            r.edx |= u32::from(self.fpu);
+            r.ecx |= (u32::from(self.cx16) << 13) | u32::from(self.sse3);
+        }
+        r
+    }
+}
+
+#[test]
+fn x87_cx16_and_fisttp_obey_installed_view() {
+    for bytes in [
+        &[0xd9, 0xe8][..],
+        &[0xf0, 0x48, 0x0f, 0xc7, 0x0f],
+        &[0xdb, 0x0f],
+    ] {
+        let (mut cpu, mut mem, va) = setup_snippet(&[bytes, &[0x0f, 0x05]].concat());
+        // Invalid memory must not win over missing feature #UD.
+        cpu.context_mut().gpr[reg::RDI] = 0xdead0001;
+        let before = cpu.context().fxsave.0;
+        step_ok(&mut cpu, &mut mem, ud(va));
+        assert_eq!(cpu.context().fxsave.0, before);
+        cpu.set_cpuid_view(Box::new(X87Features {
+            fpu: true,
+            cx16: true,
+            sse3: false,
+        }));
+        cpu.context_mut().rip = va;
+        if bytes == [0xdb, 0x0f] {
+            step_ok(&mut cpu, &mut mem, ud(va));
+        }
+        cpu.set_cpuid_view(Box::new(X87Features {
+            fpu: true,
+            cx16: true,
+            sse3: true,
+        }));
+        cpu.context_mut().rip = va;
+        cpu.context_mut().gpr[reg::RDI] = 0x800000;
+        step_ok(
+            &mut cpu,
+            &mut mem,
+            sys(va + bytes.len() as u64, va + bytes.len() as u64 + 2),
+        );
+        cpu.set_cpuid_view(Box::new(carrick_softcpu_x86::Level0CpuidView));
+        cpu.context_mut().rip = va;
+        let before = cpu.context().fxsave.0;
+        step_ok(&mut cpu, &mut mem, ud(va));
+        assert_eq!(cpu.context().fxsave.0, before);
+    }
 }

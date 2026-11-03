@@ -19,6 +19,15 @@ use crate::mmu::{
     SoftTlbStats, SoftVcpuSeat, SoftWalker, TranslatedTarget, is_canonical_va, translate_target_va,
 };
 
+#[derive(Clone, Copy)]
+struct ActiveInsn {
+    va: u64,
+    insn: Instruction,
+    fp_leaf: Option<FpLeafFn>,
+    avx_leaf: Option<crate::avx::LeafFn>,
+    x87_opcode: u16,
+}
+
 /// Monomorphized translation callback for active [`SoftMmuMemory`] during block execution.
 type ActiveTranslateFn =
     unsafe fn(&mut SoftCpuContext, u64, SoftAccessKind) -> Result<TranslatedTarget, SoftPageFault>;
@@ -415,6 +424,7 @@ pub struct SoftCpuContext {
     pub(crate) bmi1: bool,
     pub(crate) lzcnt: bool,
     pub(crate) legacy_features: u32,
+    pub(crate) fpu: bool,
     pub xcr0: u64,
     pub cr0: u64,
     pub cr2: u64,
@@ -425,12 +435,7 @@ pub struct SoftCpuContext {
     bounce_writeback: BounceWriteback,
     active_mem_ptr: Option<NonNull<()>>,
     active_translate_fn: Option<ActiveTranslateFn>,
-    active_block_insns: Vec<(
-        u64,
-        Instruction,
-        Option<FpLeafFn>,
-        Option<crate::avx::LeafFn>,
-    )>,
+    active_block_insns: Vec<ActiveInsn>,
     fp_leaves: HashMap<Vec<u8>, FpLeaf>,
     avx_leaves: HashMap<Vec<u8>, crate::avx::Leaf>,
     host_fxsave: FxsaveArea,
@@ -572,9 +577,10 @@ impl SoftCpuContext {
             bmi1: false,
             lzcnt: false,
             legacy_features: 0,
+            fpu: false,
             xcr0: 0x3,
-            // EM stays clear for SSE data operations. CPUID.FPU remains clear:
-            // x87 instructions are refused independently of this control bit.
+            // EM stays clear for native-backed SSE and x87 operations. The
+            // default CPUID remains conservative until shared-view admission.
             cr0: 0x8005_0033,
             cr2: 0,
             cr3: 0,
@@ -881,9 +887,25 @@ impl SoftCpuContext {
     ) -> Result<(), crate::emit::EmitError> {
         use crate::emit::{EmitError, JitStage};
         self.active_block_insns.clear();
-        for d in &planned.insns {
+        for (index, d) in planned.insns.iter().enumerate() {
+            #[cfg(target_arch = "x86_64")]
+            if d.raw.mnemonic() == Mnemonic::Cmpxchg16b
+                && !std::is_x86_feature_detected!("cmpxchg16b")
+            {
+                return Err(EmitError::EncodeFailed {
+                    va: d.va,
+                    detail: "CMPXCHG16B requires a CX16-capable same-ISA host".into(),
+                });
+            }
+            #[cfg(target_arch = "x86_64")]
+            if d.raw.mnemonic() == Mnemonic::Fisttp && !std::is_x86_feature_detected!("sse3") {
+                return Err(EmitError::EncodeFailed {
+                    va: d.va,
+                    detail: "FISTTP requires an SSE3-capable same-ISA host".into(),
+                });
+            }
             let leaf = if crate::decode::supported_body(&d.raw)
-                && crate::decode::is_fp_arithmetic(&d.raw)
+                && (crate::decode::is_fp_arithmetic(&d.raw) || crate::decode::is_x87(&d.raw))
             {
                 let bytes = native_fp_bytes(&d.raw)
                     .map_err(|detail| EmitError::EncodeFailed { va: d.va, detail })?;
@@ -950,7 +972,21 @@ impl SoftCpuContext {
             } else {
                 None
             };
-            self.active_block_insns.push((d.va, d.raw, leaf, avx));
+            let x87_opcode = if crate::decode::is_x87(&d.raw) {
+                planned.insn_bytes[index][..d.len]
+                    .windows(2)
+                    .find(|pair| (0xd8..=0xdf).contains(&pair[0]))
+                    .map_or(0, |pair| (u16::from(pair[0] & 7) << 8) | u16::from(pair[1]))
+            } else {
+                0
+            };
+            self.active_block_insns.push(ActiveInsn {
+                va: d.va,
+                insn: d.raw,
+                fp_leaf: leaf,
+                avx_leaf: avx,
+                x87_opcode,
+            });
         }
         Ok(())
     }
@@ -1347,7 +1383,13 @@ fn record_exception(ctx: &mut SoftCpuContext, exc: X86Exception) {
 /// Execute a complex body instruction (`div`/`idiv`, string ops, `push`/`pop`, etc.).
 #[unsafe(no_mangle)]
 extern "sysv64" fn softcpu_step_complex(ctx: &mut SoftCpuContext, insn_idx: u64) -> u64 {
-    let Some(&(insn_va, insn, fp_leaf, avx_leaf)) = ctx.active_block_insns.get(insn_idx as usize)
+    let Some(&ActiveInsn {
+        va: insn_va,
+        insn,
+        fp_leaf,
+        avx_leaf,
+        x87_opcode,
+    }) = ctx.active_block_insns.get(insn_idx as usize)
     else {
         record_exception(ctx, X86Exception::invalid_opcode(ctx.rip));
         return 0;
@@ -1357,7 +1399,7 @@ extern "sysv64" fn softcpu_step_complex(ctx: &mut SoftCpuContext, insn_idx: u64)
     match if crate::avx::supported(&insn) {
         crate::avx::step(ctx, &insn, insn_va, avx_leaf)
     } else {
-        step_complex_inner(ctx, &insn, insn_va, fp_leaf)
+        step_complex_inner(ctx, &insn, insn_va, fp_leaf, x87_opcode)
     } {
         Ok(()) => u64::from(ctx.exit_reason != EXIT_REASON_RESTART),
         Err(exc) => {
@@ -1393,6 +1435,7 @@ fn step_complex_inner(
     insn: &Instruction,
     insn_va: u64,
     fp_leaf: Option<FpLeafFn>,
+    x87_opcode: u16,
 ) -> Result<(), X86Exception> {
     match insn.mnemonic() {
         _ if crate::decode::is_fp_arithmetic(insn) => {
@@ -1447,6 +1490,10 @@ fn step_complex_inner(
             Ok(())
         }
         Mnemonic::Tzcnt | Mnemonic::Lzcnt => step_bit_scan(ctx, insn, insn_va),
+        _ if crate::decode::is_x87(insn) => {
+            let entry = fp_leaf.ok_or_else(|| X86Exception::invalid_opcode(insn_va))?;
+            step_x87(ctx, insn, insn_va, entry, x87_opcode)
+        }
         Mnemonic::Div => step_div(ctx, insn, insn_va, false),
         Mnemonic::Idiv => step_div(ctx, insn, insn_va, true),
         Mnemonic::Push => step_push(ctx, insn, insn_va),
@@ -1521,15 +1568,24 @@ fn step_complex_inner(
     }
 }
 
-// An SSE instruction cannot fault natively: all memory is copied into aligned
-// host-owned storage first, and every MXCSR exception is masked during execution.
-// Guest status and destination commit only after checking the guest mask bits.
+// Checked FP leaves see only aligned host-owned storage. SSE masks native
+// exceptions and checks guest masks before publication; x87 retains deferred
+// exceptions and uses nonwaiting save/restore around exactly one instruction.
 #[repr(C, align(16))]
 struct FpRun {
     working: FxsaveArea,
     host: FxsaveArea,
     operand: [u8; 16],
+    flags: u64,
+    ax: u64,
 }
+
+const _: () = {
+    assert!(offset_of!(FpRun, host) == 512);
+    assert!(offset_of!(FpRun, operand) == 1024);
+    assert!(offset_of!(FpRun, flags) == 1040);
+    assert!(offset_of!(FpRun, ax) == 1048);
+};
 
 type FpLeafFn = unsafe extern "sysv64" fn(*mut FpRun);
 struct FpLeaf {
@@ -1557,12 +1613,158 @@ fn fp_leaf_image(native: &[u8]) -> Vec<u8> {
     let mut code = vec![
         0x48, 0x0f, 0xae, 0x87, 0, 2, 0, 0, 0x48, 0x0f, 0xae, 0x0f, 0x48, 0x8d, 0x87, 0, 4, 0, 0,
     ];
+    // Load only guest arithmetic flags (FCMOV), then capture FCOMI/FNSTSW AX.
+    code.extend_from_slice(&[0xff, 0xb7, 0x10, 4, 0, 0, 0x9d]);
     code.extend_from_slice(native);
+    code.extend_from_slice(&[
+        0x48, 0x89, 0x87, 0x18, 4, 0, 0, 0x9c, 0x8f, 0x87, 0x10, 4, 0, 0,
+    ]);
     // fxsave64 [rdi]; fxrstor64 [rdi+512]; ret
     code.extend_from_slice(&[
         0x48, 0x0f, 0xae, 0x07, 0x48, 0x0f, 0xae, 0x8f, 0, 2, 0, 0, 0xc3,
     ]);
     code
+}
+
+/// One native x87 instruction, with no following waiting instruction. FXSAVE
+/// and FXRSTOR do not deliver pending #MF (SDM Vol. 1 ch. 8): unmasked
+/// exceptions remain guest state until the next waiting guest instruction.
+fn step_x87(
+    ctx: &mut SoftCpuContext,
+    insn: &Instruction,
+    ip: u64,
+    execute: FpLeafFn,
+    opcode: u16,
+) -> Result<(), X86Exception> {
+    if ctx.cr0 & 0xc != 0 {
+        return Err(X86Exception::device_not_available(ip));
+    }
+    let no_wait = matches!(
+        insn.mnemonic(),
+        Mnemonic::Fninit | Mnemonic::Fnclex | Mnemonic::Fnstcw | Mnemonic::Fnstsw
+    );
+    let cw = u16::from_le_bytes([ctx.fxsave.0[0], ctx.fxsave.0[1]]);
+    let sw = u16::from_le_bytes([ctx.fxsave.0[2], ctx.fxsave.0[3]]);
+    if !no_wait && sw & !cw & 0x3f != 0 {
+        return Err(X86Exception::new(
+            X86ExceptionVector::X87FloatingPoint,
+            ip,
+            None,
+            None,
+        ));
+    }
+    let mut run = FpRun {
+        working: ctx.fxsave.clone(),
+        host: FxsaveArea::default(),
+        operand: [0; 16],
+        flags: (ctx.rflags & 0x8d5) | 2,
+        ax: 0,
+    };
+    let memory = insn.op_kinds().any(|k| k == OpKind::Memory);
+    let store = matches!(
+        insn.mnemonic(),
+        Mnemonic::Fst
+            | Mnemonic::Fstp
+            | Mnemonic::Fist
+            | Mnemonic::Fistp
+            | Mnemonic::Fisttp
+            | Mnemonic::Fbstp
+            | Mnemonic::Fnstcw
+            | Mnemonic::Fnstsw
+    );
+    let ea = compute_effective_va(insn, ctx);
+    // At most ten bytes, hence at most two page spans. Retain authenticated
+    // destinations until publication, without a second fallible translation.
+    let mut destinations = [None; 2];
+    let mut count = 0;
+    if memory {
+        walk_active_span(
+            ctx,
+            ea,
+            insn.memory_size().size(),
+            if store {
+                SoftAccessKind::Write
+            } else {
+                SoftAccessKind::Read
+            },
+            ip,
+            |ctx, off, target, n| {
+                if store {
+                    destinations[count] = Some((off, target, n));
+                    count += 1;
+                } else {
+                    match target {
+                        TranslatedTarget::Ram(ptr) => {
+                            // SAFETY: the walk authenticated this span; the admitted operand is <=10 bytes.
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    ptr,
+                                    run.operand[off..].as_mut_ptr(),
+                                    n,
+                                );
+                            }
+                        }
+                        TranslatedTarget::LapicMmio { offset } => {
+                            let bytes = ctx.lapic_mmio_read(offset, n);
+                            run.operand[off..off + n].copy_from_slice(&bytes[..n]);
+                        }
+                    }
+                }
+            },
+        )?;
+    }
+    // SAFETY: the cached leaf executes exactly one admitted instruction on
+    // private aligned storage. Pending exceptions were checked above; its
+    // nonwaiting save/restore returns host FP state before any Rust executes.
+    unsafe {
+        execute(&mut run);
+    }
+    let status = u16::from_le_bytes([run.working.0[2], run.working.0[3]]);
+    // An unmasked precision exception is post-completion: the rounded
+    // memory result is written (SDM FST/FIST). The other exception classes
+    // suppress the store; native execution already supplies the correct pop.
+    if no_wait || status & !cw & 0x1f == 0 {
+        for (off, target, n) in destinations.into_iter().flatten() {
+            match target {
+                TranslatedTarget::Ram(ptr) => {
+                    // SAFETY: write permission for all destination spans was established before execution.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(run.operand[off..].as_ptr(), ptr, n);
+                    }
+                }
+                TranslatedTarget::LapicMmio { offset } => {
+                    ctx.lapic_mmio_write(offset, &run.operand[off..off + n])
+                }
+            }
+        }
+    }
+    // Never publish a native leaf IP or its private operand address. Control
+    // instructions preserve the prior virtual pointers; FNINIT clears them.
+    if insn.mnemonic() != Mnemonic::Fninit {
+        run.working.0[6..24].copy_from_slice(&ctx.fxsave.0[6..24]);
+        if !no_wait && insn.mnemonic() != Mnemonic::Fldcw {
+            run.working.0[8..16].copy_from_slice(&ip.to_le_bytes());
+            run.working.0[6..8].copy_from_slice(&opcode.to_le_bytes());
+            if memory {
+                run.working.0[16..24].copy_from_slice(&ea.to_le_bytes());
+            }
+        }
+    } else {
+        ctx.x87_code_selector = 0;
+        ctx.x87_data_selector = 0;
+    }
+    ctx.fxsave.0[..24].copy_from_slice(&run.working.0[..24]);
+    ctx.fxsave.0[32..160].copy_from_slice(&run.working.0[32..160]);
+    if insn.mnemonic() == Mnemonic::Fnstsw && !memory {
+        ctx.gpr[reg::RAX] = (ctx.gpr[reg::RAX] & !0xffff) | (run.ax & 0xffff);
+    }
+    if matches!(
+        insn.mnemonic(),
+        Mnemonic::Fcomi | Mnemonic::Fcomip | Mnemonic::Fucomi | Mnemonic::Fucomip
+    ) {
+        ctx.rflags = (ctx.rflags & !0x8d5) | (run.flags & 0x8d5);
+    }
+    Ok(())
 }
 
 fn step_fp(
@@ -1575,6 +1777,8 @@ fn step_fp(
         working: ctx.fxsave.clone(),
         host: FxsaveArea::default(),
         operand: [0; 16],
+        flags: 2,
+        ax: 0,
     };
     let original = u32::from_le_bytes(
         ctx.fxsave.0[24..28]
@@ -2702,6 +2906,22 @@ mod tests {
             cpu.execute_planned_block(&planned, &mut NoMemory).unwrap();
         }
         crate::cpu::JIT_ALLOCATIONS.with(|count| assert_eq!(count.get(), 1));
+    }
+
+    #[test]
+    fn x87_leaf_allocation_is_once_across_repeated_blocks() {
+        let mut cpu = crate::SoftCpu::new(&test_extents()).unwrap();
+        let mut planned = fp_block();
+        planned.insn_bytes[0][..2].copy_from_slice(&[0xd9, 0xe5]); // FXAM
+        planned.insns[0] =
+            crate::decode::classify(&planned.insn_bytes[0][..2], planned.start).unwrap();
+        crate::cpu::JIT_ALLOCATIONS.with(|count| count.set(0));
+        for scale in [1, 4, 16] {
+            for _ in 0..scale {
+                cpu.execute_planned_block(&planned, &mut NoMemory).unwrap();
+            }
+            crate::cpu::JIT_ALLOCATIONS.with(|count| assert_eq!(count.get(), 1));
+        }
     }
 
     #[test]

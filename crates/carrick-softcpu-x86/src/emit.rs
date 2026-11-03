@@ -135,6 +135,7 @@ pub fn emit_block(block: &PlannedBlock) -> Result<EmittedBlock, EmitError> {
 fn is_routed_to_complex_helper(insn: &Instruction) -> bool {
     crate::avx::supported(insn)
         || is_fp_arithmetic(insn)
+        || crate::decode::is_x87(insn)
         || insn.is_string_instruction()
         || matches!(
             insn.mnemonic(),
@@ -655,7 +656,8 @@ fn emit_load_addr_reg_into_rax(code: &mut Vec<u8>, r: Register) {
 fn requires_16byte_alignment(insn: &Instruction, size: u8) -> bool {
     if matches!(
         insn.mnemonic(),
-        Mnemonic::Movaps
+        Mnemonic::Cmpxchg16b
+            | Mnemonic::Movaps
             | Mnemonic::Movapd
             | Mnemonic::Movdqa
             | Mnemonic::Movntps
