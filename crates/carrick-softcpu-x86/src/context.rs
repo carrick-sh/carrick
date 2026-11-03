@@ -1467,7 +1467,7 @@ fn step_complex_inner(
                         // SAFETY: the walker authenticated a readable guest byte.
                         // CLFLUSH uses only that byte's containing cache line.
                         unsafe {
-                            core::arch::asm!("clflush [{p}]", p = in(reg) ptr, options(nostack, preserves_flags));
+                            core::arch::x86_64::_mm_clflush(ptr.cast_const());
                         }
                     }
                 },
@@ -1671,10 +1671,14 @@ fn step_x87(
     execute: FpLeafFn,
     opcode: u16,
 ) -> Result<(), X86Exception> {
+    let mmx = crate::decode::is_mmx(insn);
+    // MMX uses #UD for emulation, unlike x87's #NM. EM wins over TS.
+    if mmx && ctx.cr0 & 4 != 0 {
+        return Err(X86Exception::invalid_opcode(ip));
+    }
     if ctx.cr0 & 0xc != 0 {
         return Err(X86Exception::device_not_available(ip));
     }
-    let mmx = crate::decode::is_mmx(insn);
     let no_wait = matches!(
         insn.mnemonic(),
         Mnemonic::Fninit | Mnemonic::Fnclex | Mnemonic::Fnstcw | Mnemonic::Fnstsw

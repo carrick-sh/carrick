@@ -4952,6 +4952,9 @@ fn advertised_sse_census_matches_native() {
         &[0x66, 0x0f, 0x73, 0xd0, 7],
         &[0x66, 0x0f, 0x72, 0xd0, 7],
         &[0x66, 0x0f, 0x73, 0xd8, 7],
+        &[0x66, 0x0f, 0x72, 0xf0, 7], // PSLLD imm
+        &[0x66, 0x0f, 0x71, 0xf0, 7], // PSLLW imm
+        &[0x66, 0x0f, 0x71, 0xd0, 7], // PSRLW imm
         &[0x66, 0x0f, 0xf4, 0xc2],
         &[0x66, 0x0f, 0xd5, 0xc2],
         &[0x66, 0x0f, 0xf5, 0xc2],
@@ -5074,6 +5077,27 @@ fn advertised_mmx_uses_virtual_x87_image() {
     step_ok(&mut cpu, &mut mem, sys(va + 11, va + 13));
     assert_eq!(mem.read_direct(0x800010, 8).unwrap(), [2; 8]);
     assert_eq!(cpu.context().fxsave.0[4], 0); // EMMS empties all x87 tags
+}
+
+#[test]
+fn advertised_mmx_em_precedes_ts_and_operand_faults() {
+    for bytes in [&[0x0f, 0x6f, 0x07][..], &[0x0f, 0xfc, 0xc0], &[0x0f, 0x77]] {
+        for (controls, invalid) in [(4, true), (8, false), (12, true)] {
+            let (mut cpu, mut mem, va) = setup_snippet(&[bytes, &[0x0f, 0x05]].concat());
+            cpu.set_cpuid_view(Box::new(carrick_x86::GuestCpuidView::default()));
+            cpu.context_mut().gpr[reg::RDI] = 0xdead0000;
+            cpu.context_mut().cr0 |= controls;
+            let before = cpu.context().fxsave.0;
+            let expected = if invalid {
+                ud(va)
+            } else {
+                SoftCpuExit::Exception(X86Exception::device_not_available(va))
+            };
+            step_ok(&mut cpu, &mut mem, expected);
+            assert_eq!(cpu.context().fxsave.0, before);
+            assert_eq!(cpu.context().rip, va);
+        }
+    }
 }
 
 #[test]

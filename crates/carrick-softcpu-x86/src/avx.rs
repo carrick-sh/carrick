@@ -39,6 +39,9 @@ pub(crate) fn baseline_sse(insn: &Instruction) -> bool {
                 | Mnemonic::Pcmpgtd
                 | Mnemonic::Psrlq
                 | Mnemonic::Psrld
+                | Mnemonic::Pslld
+                | Mnemonic::Psllw
+                | Mnemonic::Psrlw
                 | Mnemonic::Psrldq
                 | Mnemonic::Pmuludq
                 | Mnemonic::Pmullw
