@@ -593,12 +593,16 @@ The server imports those exact SHAs from its previous checkpoint into each
 worker checkout and again into the harvested candidate. This automatically
 repairs pruned comparison history before publication without replaying the
 worker's commits or changing the push lease. Connectivity is checked before
-the new checkpoint replaces the previous one. Other publication failures
+the new checkpoint replaces the previous one, restricted to HEAD and the
+publication comparison refs. A refusal preserves the candidate commits in
+`harvest.patch` before discarding the candidate. Other publication failures
 remain explicit failures with `harvest.patch` as diagnostic evidence; access
 or lease refusals are never bypassed by replaying a patch.
 
 Agent templates install Semgrep in a read-only virtual environment exposed
-on the default PATH. Template qualification executes `semgrep --version` as
+on the default PATH. Its wheel-only dependency closure is hash-locked in
+`scripts/ci/inputs/semgrep-requirements.txt`; CI pins the same Semgrep version.
+Template qualification executes `semgrep --version` as
 the agent account, so a missing or inaccessible lint dependency fails the
 template build.
 
