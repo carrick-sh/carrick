@@ -82,6 +82,7 @@ vm_free = [
   "carrick-el1-linux::ipc::tests::native_structural_refusals_retire_without_host_handback",
   "carrick-sched-core::refusal::queue_witnesses::{switched_cause_uses_its_own_preprobe_revision,release_between_miss_and_park_returns_owned_operation,retired_source_reruns_then_returns_guest_answer,parked_operation_has_exactly_one_wake,cancelled_ticket_does_not_count_as_abandoned,abandoned_ticket_during_unwind_preserves_original_panic}",
   "carrick-core-abi::wait::ticket_tests::{portal_front_door_rejects_owner_and_zone_mismatch_as_invariants,foreign_zone_cannot_enroll_a_ticket,dropped_ticket_during_dependency_unwind_does_not_abort}",
+  "carrick-kernel::dispatch::native_files::tests::native_poll_never_waits_or_answers_part_of_a_set (#1503: the native host-file venue never parks the carrier or owner-waits; it runs under the native fs scope guard, which fails on any escape to a host MM or file table as production does)",
 ]
 
 [bindings.unresolved]
