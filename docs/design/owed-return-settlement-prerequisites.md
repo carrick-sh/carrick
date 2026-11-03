@@ -200,3 +200,40 @@ retains IDs into mutable maps rather than owning stable row/reference tokens;
 removing those checks safely requires stronger inventory custody types. This
 is an additional draft blocker, not a passing gate or permission to remove
 checks from an allegedly infallible commit.
+
+## Continuation audit against the current owner brief
+
+The [superseding brief](https://github.com/carrick-sh/carrick/pull/1485#issuecomment-6594790619)
+adopts [addendum 2](https://github.com/carrick-sh/carrick/issues/1369#issuecomment-6594737829)
+with its [five review changes](https://github.com/carrick-sh/carrick/issues/1369#issuecomment-6594782213).
+The three gaps above are therefore **implementation work**, no longer waiting
+for a design ruling. The checkpoint must not be described as awaiting approval
+to implement them.
+
+The six items in the original ruling have this status:
+
+| Item | Status and witness |
+|---|---|
+| Post-clear custody | Implemented: `Stage1Cleared` has no ordinary abort (compile-fail doctest); `stage1_undo_finishes_before_inventory_abort_and_retry` checks undo ordering; `cleared_drop_quarantines_exact_owner_and_retains_claim` checks abandonment. |
+| Outstanding claims | Headroom and teardown refusal implemented: `return_claim_reserves_revision_headroom` and `return_claim_blocks_teardown_aborts_and_retries`. The mapping-event refusal witness covers prepare, publish, protect and unmap without modifying the claimed row or frame count. This is an inventory-level reclaim witness, not a guest `exit_group` test. |
+| Physical gate and per-frame custody | Remaining: custody is indexed by `(ipa, generation)` and `pending_retirement_excludes_allocator_reuse_at_different_lengths` exists, but the inventory permit gate and the cross-MM retirement protections are absent. |
+| Retired journal | Identity and order-independent joining implemented: `retired_journal_release_before_borrowed_root_retirement_joins_once`, `retired_journal_recycled_slots_and_same_raw_mm_do_not_touch_successor`, and `journal_join_rejects_foreign_inventory_with_same_numeric_owner`. The two-half backend release proof required by addendum 2 is remaining. Existing joins still acknowledge zero slots after eager clearing. |
+| Inventory lock audit | The claim lifecycle audit above covers the new critical sections; `completion_drops_quarantine_outside_inventory_lock` checks callback destruction on apply and undo. It does not establish a lock-level guarantee for generic transaction outcomes. |
+| CPL0 path | Named and witnessed through `CarrierMemory::retire_child` and `custody_release_before_another_mm_unmaps_keeps_physical_registration`. Backend-half receipt integration remains part of the addendum work. |
+
+Addendum 2 still requires owned mapping rows and stable reference custody
+outside the copied overlay; prepare/abort/split reference accounting;
+`Shared`/`Zero`/`Last` release semantics and complete unmap bookkeeping; linear
+retirement permits consumed into a backend release half; and gates on native
+backing drop and the cross-MM legacy retirement sites. No new debt ceiling or
+legacy exemption is introduced by this continuation. Passing prerequisite
+tests cannot substitute for these missing production changes or slice 2b.
+
+The continuation's independent review also found a teardown classification race:
+`retire_mm_with_receipt` releases the inventory lock after collecting rows.
+A claim admitted before the later apply safely refuses that apply, but the
+checkpoint returned a generic apply error rather than `RetryPending`.
+The continuation translates `ClaimedMapping` from that apply into
+`RetryPending`, matching the initial scan's refusal. The existing
+pre-admitted-claim witness does not exercise the concurrent interleaving;
+the event witness proves the later apply refuses without changing rows.

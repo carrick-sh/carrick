@@ -747,7 +747,16 @@ impl FrameInventoryAuthority {
                 generation,
             })?;
         }
-        let (_, receipt) = self.apply_retirement_with_receipt(mm, reservation.commit(()))?;
+        // A return may claim a row after the snapshot above. Its owned
+        // operation must finish before teardown can retry, just as when the
+        // initial scan found it. Do not lower that contention to an apply
+        // invariant merely because admission raced the scan.
+        let (_, receipt) = self
+            .apply_retirement_with_receipt(mm, reservation.commit(()))
+            .map_err(|error| match error {
+                FrameInventoryError::ClaimedMapping(_) => FrameInventoryRetireMmError::RetryPending,
+                error => FrameInventoryRetireMmError::Apply(error),
+            })?;
         if !receipt.mm_empty_at_revision() {
             return Err(FrameInventoryRetireMmError::NotEmpty);
         }
@@ -1107,6 +1116,26 @@ fn apply_event(
 ) -> Result<(), FrameInventoryError> {
     if event.transaction() != transaction {
         return Err(FrameInventoryError::TransactionMismatch);
+    }
+    // A claim is an owned operation, not an unpublished mapping. Refuse
+    // every mapping mutation before copying its row into the overlay.
+    let mapping = match event {
+        FrameInventoryEvent::PrepareMapping { mapping, .. }
+        | FrameInventoryEvent::PublishMapping { mapping, .. }
+        | FrameInventoryEvent::ProtectMapping { mapping, .. }
+        | FrameInventoryEvent::UnmapMapping { mapping, .. } => Some(mapping),
+        FrameInventoryEvent::RetireFrame { .. }
+        | FrameInventoryEvent::RetireFrameIfLastUnmap { .. } => None,
+    };
+    if let Some(mapping) = mapping
+        && let Some(entry) = state.mapping(mapping)
+    {
+        match entry.state {
+            MappingState::Retiring(_) => {
+                return Err(FrameInventoryError::ClaimedMapping(mapping));
+            }
+            MappingState::Prepared(_) | MappingState::Published => {}
+        }
     }
     match event {
         FrameInventoryEvent::PrepareMapping {
@@ -1564,6 +1593,8 @@ pub enum FrameInventoryError {
     },
     #[error("mapping {0:?} is not live")]
     NonliveMapping(MappingId),
+    #[error("mapping {0:?} is held by an outstanding return claim")]
+    ClaimedMapping(MappingId),
     /// The mapping EXISTS but is still `Prepared` — its publishing transaction
     /// has not committed. Distinct from [`Self::NonliveMapping`], which means no
     /// such mapping at all. They were one error for a long time, which made a
@@ -4991,6 +5022,62 @@ mod prepared_return_tests {
         assert!(applied.mm_empty_at_revision);
         assert_eq!(applied.last_unmapped, vec![row.frame]);
         assert_eq!(inventory.retire_mm(&ids, owner).unwrap(), 0);
+    }
+    #[test]
+    fn claimed_row_refuses_every_mapping_event_without_changing_inventory() {
+        let (inventory, ids, owner, row) = fixture();
+        let claim = inventory.prepare_return(&ids, owner, &[row]).unwrap();
+        let before = inventory.snapshot();
+        for kind in 0..4 {
+            let mut reservation = inventory
+                .reserve(&ids, 0, 0, FrameEventCapacity::for_event_count(1).unwrap())
+                .unwrap();
+            let transaction = reservation.transaction();
+            let event = match kind {
+                0 => FrameInventoryEvent::PrepareMapping {
+                    transaction,
+                    frame: row.frame,
+                    mapping: row.mapping,
+                    generation: row.generation,
+                    gpa: row.gpa,
+                    length: row.length,
+                    permissions: MemPerms {
+                        read: true,
+                        write: false,
+                        exec: false,
+                    },
+                },
+                1 => FrameInventoryEvent::PublishMapping {
+                    transaction,
+                    mapping: row.mapping,
+                    generation: row.generation,
+                },
+                2 => FrameInventoryEvent::ProtectMapping {
+                    transaction,
+                    mapping: row.mapping,
+                    generation: next_generation(row.generation).unwrap(),
+                    permissions: MemPerms {
+                        read: true,
+                        write: false,
+                        exec: false,
+                    },
+                },
+                _ => FrameInventoryEvent::UnmapMapping {
+                    transaction,
+                    mapping: row.mapping,
+                    generation: next_generation(row.generation).unwrap(),
+                },
+            };
+            reservation.push(event).unwrap();
+            assert_eq!(
+                inventory.apply(owner, reservation.commit(())).unwrap_err(),
+                FrameInventoryError::ClaimedMapping(row.mapping)
+            );
+            assert_eq!(inventory.snapshot(), before);
+            assert_eq!(inventory.frame_mapping_count(row.frame), Some(1));
+        }
+        claim.abort();
+        assert!(inventory.live_mapping_row(owner, row.mapping).is_some());
     }
     #[test]
     fn sibling_unmaps_shared_frame_between_prepare_and_apply() {
