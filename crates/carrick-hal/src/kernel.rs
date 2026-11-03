@@ -103,6 +103,19 @@ pub enum FrameInventoryEvent {
         length: FrameLength,
         permissions: MemPerms,
     },
+    /// Prepare a fragment of a still-published mapping in the same MM.
+    /// Unlike an independent alias, splitting preserves a pending retirement
+    /// request. Emit all fragments before unmapping the source in this batch.
+    PrepareMappingFragment {
+        transaction: KernelTransactionId,
+        source: MappingId,
+        frame: FrameId,
+        mapping: MappingId,
+        generation: MappingGeneration,
+        gpa: Gpa,
+        length: FrameLength,
+        permissions: MemPerms,
+    },
     PublishMapping {
         transaction: KernelTransactionId,
         mapping: MappingId,
@@ -146,6 +159,7 @@ impl FrameInventoryEvent {
     pub const fn transaction(self) -> KernelTransactionId {
         match self {
             Self::PrepareMapping { transaction, .. }
+            | Self::PrepareMappingFragment { transaction, .. }
             | Self::PublishMapping { transaction, .. }
             | Self::ProtectMapping { transaction, .. }
             | Self::UnmapMapping { transaction, .. }
@@ -157,6 +171,7 @@ impl FrameInventoryEvent {
     pub const fn generation(self) -> MappingGeneration {
         match self {
             Self::PrepareMapping { generation, .. }
+            | Self::PrepareMappingFragment { generation, .. }
             | Self::PublishMapping { generation, .. }
             | Self::ProtectMapping { generation, .. }
             | Self::UnmapMapping { generation, .. }

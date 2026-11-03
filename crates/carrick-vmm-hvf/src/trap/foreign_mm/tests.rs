@@ -469,6 +469,13 @@ impl carrick_hal::FrameCowAuthority for TestForeignCowAuthority {
                     gpa,
                     length,
                     ..
+                }
+                | carrick_hal::FrameInventoryEvent::PrepareMappingFragment {
+                    frame,
+                    mapping,
+                    gpa,
+                    length,
+                    ..
                 } => prepared.push((mapping, frame, gpa, length.raw())),
                 _ => {}
             }
@@ -512,9 +519,10 @@ impl carrick_hal::FrameCowAuthority for TestForeignCowAuthority {
             .events()
             .iter()
             .filter_map(|event| match *event {
-                carrick_hal::FrameInventoryEvent::PrepareMapping { mapping, frame, .. } => {
-                    Some((mapping, frame))
-                }
+                carrick_hal::FrameInventoryEvent::PrepareMapping { mapping, frame, .. }
+                | carrick_hal::FrameInventoryEvent::PrepareMappingFragment {
+                    mapping, frame, ..
+                } => Some((mapping, frame)),
                 _ => None,
             })
             .collect();
@@ -8291,9 +8299,12 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
                 .events()
                 .iter()
                 .filter_map(|event| match *event {
-                    carrick_hal::FrameInventoryEvent::PrepareMapping { mapping, frame, .. } => {
-                        Some((mapping, frame))
-                    }
+                    carrick_hal::FrameInventoryEvent::PrepareMapping { mapping, frame, .. }
+                    | carrick_hal::FrameInventoryEvent::PrepareMappingFragment {
+                        mapping,
+                        frame,
+                        ..
+                    } => Some((mapping, frame)),
                     _ => None,
                 })
                 .collect();

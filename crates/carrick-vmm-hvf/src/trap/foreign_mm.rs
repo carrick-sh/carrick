@@ -2972,7 +2972,8 @@ pub(crate) fn perform_foreign_cow_transaction(
             carrick_hal::FrameInventoryEvent::UnmapMapping { mapping, .. } => {
                 committed_mapping_ids.retain(|candidate| *candidate != mapping);
             }
-            carrick_hal::FrameInventoryEvent::PrepareMapping { mapping, .. } => {
+            carrick_hal::FrameInventoryEvent::PrepareMapping { mapping, .. }
+            | carrick_hal::FrameInventoryEvent::PrepareMappingFragment { mapping, .. } => {
                 committed_mapping_ids.push(mapping);
             }
             _ => {}
@@ -3344,7 +3345,8 @@ fn perform_foreign_guest_cow(
             carrick_hal::FrameInventoryEvent::UnmapMapping { mapping, .. } => {
                 committed_mapping_ids.retain(|candidate| *candidate != mapping);
             }
-            carrick_hal::FrameInventoryEvent::PrepareMapping { mapping, .. } => {
+            carrick_hal::FrameInventoryEvent::PrepareMapping { mapping, .. }
+            | carrick_hal::FrameInventoryEvent::PrepareMappingFragment { mapping, .. } => {
                 committed_mapping_ids.push(mapping);
             }
             _ => {}

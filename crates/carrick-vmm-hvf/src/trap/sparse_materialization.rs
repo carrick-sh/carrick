@@ -1650,9 +1650,10 @@ pub(super) fn publish_replacing(
                     carrick_hal::FrameInventoryEvent::UnmapMapping { mapping, .. } => {
                         mapping_ids.retain(|id| *id != mapping)
                     }
-                    carrick_hal::FrameInventoryEvent::PrepareMapping { mapping, .. } => {
-                        mapping_ids.push(mapping)
-                    }
+                    carrick_hal::FrameInventoryEvent::PrepareMapping { mapping, .. }
+                    | carrick_hal::FrameInventoryEvent::PrepareMappingFragment {
+                        mapping, ..
+                    } => mapping_ids.push(mapping),
                     _ => {}
                 }
             }

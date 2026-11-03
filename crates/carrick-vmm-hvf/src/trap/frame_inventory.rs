@@ -1640,6 +1640,7 @@ impl HvfVmState {
     pub(crate) fn push_exact_mapping_events(
         reservation: &mut carrick_hal::FrameInventoryReservation,
         frame: carrick_hal::FrameId,
+        source: Option<carrick_hal::MappingId>,
         gpa: u64,
         length: u64,
         permissions: carrick_hal::MemPerms,
@@ -1651,17 +1652,31 @@ impl HvfVmState {
             TrapError::Hypervisor("HVPatch inventory received an empty mapping extent".to_owned())
         })?;
         let transaction = reservation.transaction();
-        reservation
-            .push(carrick_hal::FrameInventoryEvent::PrepareMapping {
+        let generation = Self::inventory_generation(1);
+        let gpa = carrick_guest_mem::Gpa::new(gpa);
+        let length = carrick_hal::FrameLength::from_mapping_extent(length);
+        let event = match source {
+            Some(source) => carrick_hal::FrameInventoryEvent::PrepareMappingFragment {
+                transaction,
+                source,
+                frame,
+                mapping,
+                generation,
+                gpa,
+                length,
+                permissions,
+            },
+            None => carrick_hal::FrameInventoryEvent::PrepareMapping {
                 transaction,
                 frame,
                 mapping,
-                generation: Self::inventory_generation(1),
-                gpa: carrick_guest_mem::Gpa::new(gpa),
-                length: carrick_hal::FrameLength::from_mapping_extent(length),
+                generation,
+                gpa,
+                length,
                 permissions,
-            })
-            .map_err(Self::reservation_error)?;
+            },
+        };
+        reservation.push(event).map_err(Self::reservation_error)?;
         reservation
             .push(carrick_hal::FrameInventoryEvent::PublishMapping {
                 transaction,
@@ -2095,13 +2110,6 @@ impl HvfVmState {
         replacement: CowInventoryReplacementStage,
     ) -> Result<CowInventorySplit, TrapError> {
         let transaction = reservation.transaction();
-        reservation
-            .push(carrick_hal::FrameInventoryEvent::UnmapMapping {
-                transaction,
-                mapping: old.mapping,
-                generation: Self::inventory_generation(2),
-            })
-            .map_err(Self::reservation_error)?;
         let permissions = carrick_hal::MemPerms {
             read: true,
             write: true,
@@ -2109,14 +2117,29 @@ impl HvfVmState {
         };
         let mut fragments = Vec::with_capacity(fragment_shapes.len());
         for &(gpa, length) in fragment_shapes {
-            let mapping =
-                Self::push_exact_mapping_events(reservation, old.frame, gpa, length, permissions)?;
+            let mapping = Self::push_exact_mapping_events(
+                reservation,
+                old.frame,
+                Some(old.mapping),
+                gpa,
+                length,
+                permissions,
+            )?;
             fragments.push(CowInventoryFragment {
                 gpa,
                 length,
                 mapping,
             });
         }
+        // Keep the source reference until every surviving fragment owns a
+        // unit. A pending retirement must not observe an intermediate zero.
+        reservation
+            .push(carrick_hal::FrameInventoryEvent::UnmapMapping {
+                transaction,
+                mapping: old.mapping,
+                generation: Self::inventory_generation(2),
+            })
+            .map_err(Self::reservation_error)?;
         let (new_frame, new_mapping) = if let Some(existing) = replacement.existing {
             if existing.frame == old.frame
                 || existing.stage2_base != replacement.gpa
@@ -2134,6 +2157,7 @@ impl HvfVmState {
             let mapping = Self::push_exact_mapping_events(
                 reservation,
                 frame,
+                None,
                 replacement.gpa,
                 CowArmedRanges::COMPOUND_SIZE,
                 permissions,

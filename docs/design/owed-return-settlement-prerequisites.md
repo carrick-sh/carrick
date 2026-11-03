@@ -362,3 +362,43 @@ not execution of HVF retirement or signed guest behavior. KVM carrier-memory
 tests can exercise real memslot custody, but do not supply the missing HVF
 drop-gate witness. Retain these distinctions in the gate report and independent
 review before promoting this prerequisite together with its consumer.
+
+
+## Production split continuation (slice 2a)
+
+The admitted-main rebase preserves all thirteen preceding commits. The
+source-built `lint-source` passes and `terminal-custody --list` reports 29
+`carrick-kernel` sites, equal to the unchanged ceiling.
+
+The production mapping-fragment operation now uses `FrameRef::split`. A
+fragment must name a published source in the same MM and frame and lie within
+that source's extent. The split operates on the transaction-local reference
+snapshot, under the inventory lock; every temporary owned unit is restored
+before that snapshot can publish. Failed allocation or later event validation
+publishes nothing. The original mapping remains referenced until its surviving
+fragments have been prepared, so a pending retirement never observes a
+transient zero. Ordinary independent aliases keep their existing semantics.
+
+All current production COW fragment producers converge on
+`stage_cow_inventory_split` (guest COW, engine COW and both foreign COW paths).
+That producer and the receipt/mapping-ID collectors now understand fragments.
+The x86 fork emitter publishes new child aliases, not fragments, and retains
+ordinary preparation. The independent A3 review found two missing test-authority
+collectors; both were corrected. This review does not approve the remaining
+physical-retirement work.
+
+The amended addendum 2 status after this continuation is:
+
+| Requirement | Status |
+|---|---|
+| A1: owned reference outside copied entries; overlay witness | Implemented by the preceding continuation; unchanged here. |
+| A2: reference counted at prepare, returned on abort | Implemented; failed fragment-overlay publication also leaves the original count intact. |
+| A3: production split uses the owned primitive; split then claim | Implemented in the shared inventory event and HVF split producer. Pending retirement, sibling survival, receipt population, rollback, and claimed/foreign/out-of-range source witnesses cover the logical transaction. HVF execution still needs its host lane. |
+| A4: Zero versus requested Last; claimed-unmap bookkeeping | Implemented at the logical inventory layer. Last still returns a frame ID, not a physical permit. |
+| B1–B3: linear physical permits, two-half receipt, in-progress retirement, post-lock consumption | Remaining. Exact physical IPA and host-owner generation must first reach the inventory frame cell. The existing alias-after-last test is only the logical half of B2. |
+| C1–C2: native backing-drop gate and cross-MM legacy retirement checks | Remaining. No new legacy authority variant or ceiling was introduced. The director still owns any required policy record. |
+| Original slice 2b: settlement routine, guard, slot epochs/chunk acknowledgement, COW-before-return hook and host port | Remaining, as previously recorded. |
+
+Keep the PR draft under **#1369 slice 2a: preserve owned return claims**. The
+completed split prerequisite does not establish full slice-2 acceptance or
+make the dormant prerequisites a separate landing unit.

@@ -34,7 +34,7 @@ cell; they do not copy an owned token. Reference units are counted by
 `PrepareMapping` before publication; a failed overlay discards its tentative
 unit. Claimed release preserves `Shared`, `Zero`, and requested `Last` semantics.
 `FrameRef::split` preserves a pending retirement request across its pieces.
-Ordinary event-based mapping splits still need conversion to that owned API.
+The production fragment event now uses that owned split API on the transaction-local counter; publication updates the stable cell only after the full batch validates.
 
 The new overlay witness invokes production `prepare_return` and inventory
 publication: an injected failure after alias prepare leaves one reference,
@@ -50,3 +50,26 @@ uses the successor slot's admitted incarnation throughout manifest sealing,
 adoption and gate notifications, and asserts it differs from both the retired
 root's incarnation and the adoption receipt. The production physical-switch
 and gate-revision assertions remain intact.
+
+
+The production split continuation adds `PrepareMappingFragment`. It validates a
+published source in the same MM and frame, and confines the new mapping to its
+source extent. It splits an owned reference in the tentative overlay before
+unmapping the source, preserving any pending retirement request. Ordinary fork
+aliases retain their existing `PrepareMapping` behavior.
+
+The red witness `published_mapping_can_split_into_exact_subranges_of_the_same_frame`
+failed with `UnreservedFrame(FrameId(2))`: the old unmap-first sequence retired
+the frame before preparing its fragments. The revised witness requires the
+last fragment's ordinary unmap to honor the original retirement request.
+`split_then_claim_preserves_sibling_and_receipt_and_rolls_back_failed_overlay`
+drives production inventory apply and claim entry points, checking two fragment
+receipts, failure before publication, and shared-then-last claim release.
+Claimed-source rejection is tested with an additional unclaimed alias so that
+an available counter unit cannot substitute for source custody.
+
+The shared HVF split producer serves guest, engine, and foreign COW. It now
+emits the fragment events before the source unmap; its mapping-ID and receipt
+collectors include those events. This is an inventory-level proof, not execution
+of the HVF producer on this Linux runner. The physical permit and backend
+receipt requirements remain open.

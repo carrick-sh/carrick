@@ -157,7 +157,8 @@ impl GuestPreparedBacking {
                 carrick_hal::FrameInventoryEvent::UnmapMapping { mapping, .. } => {
                     unmapped_ids.push(mapping)
                 }
-                carrick_hal::FrameInventoryEvent::PrepareMapping { mapping, .. } => {
+                carrick_hal::FrameInventoryEvent::PrepareMapping { mapping, .. }
+                | carrick_hal::FrameInventoryEvent::PrepareMappingFragment { mapping, .. } => {
                     prepared_ids.push(mapping)
                 }
                 _ => {}
