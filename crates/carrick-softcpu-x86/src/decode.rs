@@ -477,7 +477,7 @@ pub const fn is_memory_kind(kind: OpKind) -> bool {
 
 /// Body admission is explicit. Checked helpers serve FP and implicit memory
 /// before native copying. AVX/AVX2 VEX uses the checked vector helper.
-/// No EVEX/XOP, x87 arithmetic, host state, unknown
+/// No EVEX/XOP, host state, unknown
 /// memory images, VSIB, or unchecked FP operations reach native execution.
 /// Unsupported Level 0 instructions produce guest #UD, never a native fault.
 #[rustfmt::skip]
@@ -515,7 +515,7 @@ pub(crate) fn supported_body(insn: &Instruction) -> bool {
     {
         return false;
     }
-    if is_fp_arithmetic(insn) {
+    if is_fp_arithmetic(insn) || is_x87(insn) {
         return true;
     }
     if insn.mnemonic() == Mnemonic::Cmpsd && !insn.is_string_instruction() { return false; }
@@ -527,7 +527,7 @@ pub(crate) fn supported_body(insn: &Instruction) -> bool {
         | Mnemonic::Mul | Mnemonic::Imul | Mnemonic::Div | Mnemonic::Idiv | Mnemonic::Shl
         | Mnemonic::Shr | Mnemonic::Sal | Mnemonic::Sar | Mnemonic::Rol | Mnemonic::Ror
         | Mnemonic::Rcl | Mnemonic::Rcr | Mnemonic::Shld | Mnemonic::Shrd | Mnemonic::Bswap
-        | Mnemonic::Xchg | Mnemonic::Xadd | Mnemonic::Cmpxchg | Mnemonic::Cmpxchg8b | Mnemonic::Bt
+        | Mnemonic::Xchg | Mnemonic::Xadd | Mnemonic::Cmpxchg | Mnemonic::Cmpxchg8b | Mnemonic::Cmpxchg16b | Mnemonic::Bt
         | Mnemonic::Btc | Mnemonic::Btr | Mnemonic::Bts | Mnemonic::Bsf | Mnemonic::Bsr | Mnemonic::Tzcnt | Mnemonic::Lzcnt | Mnemonic::Popcnt | Mnemonic::Crc32
         | Mnemonic::Cbw | Mnemonic::Cwde | Mnemonic::Cdqe | Mnemonic::Cwd | Mnemonic::Cdq
         | Mnemonic::Cqo | Mnemonic::Clc | Mnemonic::Stc | Mnemonic::Cmc | Mnemonic::Cld
@@ -600,5 +600,32 @@ pub(crate) fn is_fp_arithmetic(insn: &Instruction) -> bool {
             | Mnemonic::Maxpd
             | Mnemonic::Maxss
             | Mnemonic::Maxsd
+    )
+}
+
+/// x87 data/control operations served by the checked single-instruction leaf.
+/// Environment images and FWAIT remain sensitive exits with their own helpers.
+#[rustfmt::skip]
+pub(crate) fn is_x87(insn: &Instruction) -> bool {
+    matches!(insn.mnemonic(),
+        Mnemonic::Fld | Mnemonic::Fst | Mnemonic::Fstp | Mnemonic::Fild
+        | Mnemonic::Fist | Mnemonic::Fistp | Mnemonic::Fisttp | Mnemonic::Fbld | Mnemonic::Fbstp
+        | Mnemonic::Fldcw | Mnemonic::Fnstcw | Mnemonic::Fnstsw | Mnemonic::Fnclex | Mnemonic::Fninit
+        | Mnemonic::Fld1 | Mnemonic::Fldz | Mnemonic::Fldpi | Mnemonic::Fldl2e
+        | Mnemonic::Fldl2t | Mnemonic::Fldlg2 | Mnemonic::Fldln2
+        | Mnemonic::Fadd | Mnemonic::Faddp | Mnemonic::Fiadd
+        | Mnemonic::Fsub | Mnemonic::Fsubp | Mnemonic::Fsubr | Mnemonic::Fsubrp | Mnemonic::Fisub | Mnemonic::Fisubr
+        | Mnemonic::Fmul | Mnemonic::Fmulp | Mnemonic::Fimul
+        | Mnemonic::Fdiv | Mnemonic::Fdivp | Mnemonic::Fdivr | Mnemonic::Fdivrp | Mnemonic::Fidiv | Mnemonic::Fidivr
+        | Mnemonic::Fcom | Mnemonic::Fcomp | Mnemonic::Fcompp | Mnemonic::Ficom | Mnemonic::Ficomp
+        | Mnemonic::Fucom | Mnemonic::Fucomp | Mnemonic::Fucompp
+        | Mnemonic::Fcomi | Mnemonic::Fcomip | Mnemonic::Fucomi | Mnemonic::Fucomip
+        | Mnemonic::Fcmovb | Mnemonic::Fcmovbe | Mnemonic::Fcmove | Mnemonic::Fcmovu
+        | Mnemonic::Fcmovnb | Mnemonic::Fcmovnbe | Mnemonic::Fcmovne | Mnemonic::Fcmovnu
+        | Mnemonic::Fxam | Mnemonic::Ftst | Mnemonic::Fabs | Mnemonic::Fchs
+        | Mnemonic::Fxch | Mnemonic::Ffree | Mnemonic::Ffreep | Mnemonic::Fincstp | Mnemonic::Fdecstp
+        | Mnemonic::Fsqrt | Mnemonic::Frndint | Mnemonic::Fscale | Mnemonic::Fxtract
+        | Mnemonic::Fprem | Mnemonic::Fprem1 | Mnemonic::F2xm1 | Mnemonic::Fyl2x | Mnemonic::Fyl2xp1
+        | Mnemonic::Fsin | Mnemonic::Fcos | Mnemonic::Fsincos | Mnemonic::Fptan | Mnemonic::Fpatan | Mnemonic::Fnop
     )
 }

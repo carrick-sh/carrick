@@ -167,6 +167,16 @@ pub fn plan_block_from_memory<M: SoftMmuMemory>(
             break BlockExit::Continue { target: cursor };
         }
         let (va, raw) = (decoded.va, decoded.raw);
+        // Admission follows the installed guest view before operand translation
+        // or host-leaf preparation. Replanning after set_cpuid_view also revokes
+        // previously executable encodings without exposing host capabilities.
+        if (crate::decode::is_x87(&raw) && !ctx.fpu)
+            || (raw.mnemonic() == iced_x86::Mnemonic::Cmpxchg16b
+                && ctx.legacy_features & (1 << 13) == 0)
+            || (raw.mnemonic() == iced_x86::Mnemonic::Fisttp && ctx.legacy_features & 1 == 0)
+        {
+            break BlockExit::InvalidOpcode { va };
+        }
         match decoded.class {
             InsnClass::Body => {
                 insns.push(decoded);
