@@ -2367,6 +2367,9 @@ impl Server<'_> {
                     other?;
                 }
             }
+            if let Some(refreshed) = worker_checkpoint(&state, &self.dispatch)? {
+                receipt = refreshed;
+            }
             if RunLease::load(&state, "")?.current() != receipt.head {
                 return Ok(Some(
                     "WIP checkpoint not pushed: the existing branch was retained".into(),

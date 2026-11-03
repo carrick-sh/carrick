@@ -692,6 +692,11 @@ pub const COPILOT_RUNTIME_DIR: &str = "/opt/carrick-agent/copilot-runtime";
 /// `COPILOT_TOKEN`, billed to the owner), written by `agent-runner auth` and
 /// handed to the launcher as a file so it never appears on a command line.
 pub(crate) const COPILOT_TOKEN_FILE: &str = ".copilot-dispatch/token";
+/// Copilot's user settings file, relative to `HOME`, resolved by the runtime's
+/// `user.settings.getPaths` (`~/.copilot/settings.json`). `includeCoAuthoredBy`
+/// defaults to `true` and makes Copilot append its own `Co-authored-by: Copilot`
+/// trailer, which fails `commit-trailers` and miscredits the model (#1550).
+pub(crate) const COPILOT_SETTINGS_FILE: &str = ".copilot/settings.json";
 /// The launcher environment for the template's prebuilt Copilot SDK.
 pub(crate) fn copilot_environment(command: &mut Command, home: &Path) {
     command
@@ -3936,14 +3941,24 @@ fn prepare_worker_actor(state: &Path, actor: &Path, backend: &str) -> Result<(),
         "copilot" => ".copilot-dispatch",
         _ => return Err(ScalerError::Guard("worker credential backend refused")),
     };
-    std::fs::create_dir(actor.join("home"))?;
-    std::fs::set_permissions(actor.join("home"), std::fs::Permissions::from_mode(0o700))?;
+    let home = actor.join("home");
+    std::fs::create_dir(&home)?;
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
     copy_tree(
         &state.join("home").join(credential),
-        &actor.join("home").join(credential),
+        &home.join(credential),
         &mut 0,
         TreeLinks::Preserve,
     )?;
+    if backend == "copilot" {
+        let settings = home.join(COPILOT_SETTINGS_FILE);
+        if let Some(parent) = settings.parent() {
+            std::fs::create_dir_all(parent)?;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
+        std::fs::write(&settings, b"{\"includeCoAuthoredBy\":false}\n")?;
+        std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o600))?;
+    }
     for name in ["bin", "director"] {
         copy_tree(
             &state.join(name),
@@ -3954,6 +3969,317 @@ fn prepare_worker_actor(state: &Path, actor: &Path, backend: &str) -> Result<(),
     }
     Ok(())
 }
+
+fn parse_coauthor_identity(rest: &str) -> Option<(&str, &str)> {
+    let rest = rest.trim();
+    let open = rest.rfind('<')?;
+    let close = rest.rfind('>')?;
+    if open >= close || close + 1 != rest.len() {
+        return None;
+    }
+    let name = rest[..open].trim();
+    let email = rest[open + 1..close].trim();
+    if name.is_empty() || email.is_empty() {
+        return None;
+    }
+    Some((name, email))
+}
+
+fn is_copilot_coauthor(name: &str, email: &str) -> bool {
+    let name_lower = name.trim().to_ascii_lowercase();
+    let email_lower = email.trim().to_ascii_lowercase();
+    let copilot_name = matches!(
+        name_lower.as_str(),
+        "copilot"
+            | "github copilot"
+            | "copilot[bot]"
+            | "github-copilot[bot]"
+            | "copilot-swe-agent"
+            | "copilot-swe-agent[bot]"
+    );
+    let copilot_email = email_lower == "copilot@github.com"
+        || email_lower == "copilot@users.noreply.github.com"
+        || email_lower.ends_with("+copilot@users.noreply.github.com")
+        || email_lower.ends_with("+copilot-swe-agent[bot]@users.noreply.github.com");
+    copilot_email || (copilot_name && crate::commit_trailers::detect_vendor(name, email).is_none())
+}
+
+enum CoauthorLineKind {
+    NotCoauthor,
+    Copilot,
+    Canonical {
+        line: String,
+        vendor: Option<crate::commit_trailers::Vendor>,
+    },
+    Unfixable,
+}
+
+fn classify_coauthor_line(line: &str) -> CoauthorLineKind {
+    let trimmed = line.trim_end_matches('\r').trim();
+    if trimmed.starts_with('#') || trimmed.is_empty() {
+        return CoauthorLineKind::NotCoauthor;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let is_candidate = lower.starts_with("co-authored-by")
+        || lower.starts_with("coauthored-by")
+        || lower.starts_with("co-author-by")
+        || lower.starts_with("coauthor-by");
+    if !is_candidate {
+        return CoauthorLineKind::NotCoauthor;
+    }
+    let Some(colon) = trimmed.find(':') else {
+        return if lower.contains("copilot") {
+            CoauthorLineKind::Copilot
+        } else {
+            CoauthorLineKind::Unfixable
+        };
+    };
+    let rest = trimmed[colon + 1..].trim();
+    let Some((name, email)) = parse_coauthor_identity(rest) else {
+        return if rest.to_ascii_lowercase().contains("copilot") {
+            CoauthorLineKind::Copilot
+        } else {
+            CoauthorLineKind::Unfixable
+        };
+    };
+    if is_copilot_coauthor(name, email) {
+        return CoauthorLineKind::Copilot;
+    }
+    if let Some(vendor) = crate::commit_trailers::detect_vendor(name, email) {
+        return CoauthorLineKind::Canonical {
+            line: format!("Co-Authored-By: {name} <{}>", vendor.noreply_email()),
+            vendor: Some(vendor),
+        };
+    }
+    if crate::commit_trailers::is_well_formed_email(email)
+        && !email.eq_ignore_ascii_case("noreply@example.com")
+    {
+        return CoauthorLineKind::Canonical {
+            line: format!("Co-Authored-By: {name} <{email}>"),
+            vendor: None,
+        };
+    }
+    CoauthorLineKind::Unfixable
+}
+
+/// Normalize Copilot or misformatted `Co-Authored-By:` trailers on a worker
+/// commit message to the canonical vendor line (#1550). Returns `None` when
+/// the message already has valid trailers and no Copilot co-author line, so
+/// clean commits keep their exact SHA.
+fn normalize_worker_commit_message(message: &str, worker_coauthor: &str) -> Option<String> {
+    let raw_lines: Vec<&str> = message.lines().collect();
+    let classified: Vec<CoauthorLineKind> = raw_lines
+        .iter()
+        .map(|line| classify_coauthor_line(line))
+        .collect();
+    let has_copilot = classified
+        .iter()
+        .any(|kind| matches!(kind, CoauthorLineKind::Copilot));
+    if !has_copilot
+        && crate::commit_trailers::validate_commit_message("", message).is_empty()
+    {
+        return None;
+    }
+
+    let coauthor = worker_coauthor.trim();
+    let worker_vendor = parse_coauthor_identity(coauthor)
+        .and_then(|(name, email)| crate::commit_trailers::detect_vendor(name, email));
+    let worker_line = (!coauthor.is_empty())
+        .then(|| format!("Co-Authored-By: {coauthor}"))
+        .filter(|line| crate::commit_trailers::validate_commit_message("", line).is_empty());
+    let already_credits_worker = classified.iter().any(|kind| match kind {
+        CoauthorLineKind::Canonical { vendor, line } => match worker_vendor {
+            Some(expected) => *vendor == Some(expected),
+            None => worker_line.as_ref() == Some(line),
+        },
+        _ => false,
+    });
+
+    let mut credited = already_credits_worker;
+    let mut emitted = std::collections::BTreeSet::new();
+    let mut out = Vec::with_capacity(raw_lines.len());
+    for (raw, kind) in raw_lines.into_iter().zip(classified) {
+        match kind {
+            CoauthorLineKind::NotCoauthor => out.push(raw.trim_end_matches('\r').to_owned()),
+            CoauthorLineKind::Copilot | CoauthorLineKind::Unfixable => {
+                if !credited
+                    && let Some(ref replacement) = worker_line
+                {
+                    credited = true;
+                    if emitted.insert(replacement.clone()) {
+                        out.push(replacement.clone());
+                    }
+                }
+            }
+            CoauthorLineKind::Canonical { line, .. } => {
+                if emitted.insert(line.clone()) {
+                    out.push(line);
+                }
+            }
+        }
+    }
+    while out.last().is_some_and(|line| line.trim().is_empty()) {
+        out.pop();
+    }
+    let normalized = format!("{}\n", out.join("\n"));
+    (normalized != message).then_some(normalized)
+}
+
+fn rewrite_commit_trailers(
+    work: &Path,
+    exclusions: &[&str],
+    worker_coauthor: &str,
+) -> Result<bool, ScalerError> {
+    use std::io::Write;
+    let valid_exclusions: Vec<&str> = exclusions
+        .iter()
+        .copied()
+        .filter(|rev| !rev.is_empty())
+        .collect();
+    if valid_exclusions.is_empty() {
+        return Ok(false);
+    }
+    let old_head = git(work, &["rev-parse", "HEAD"])?.trim().to_owned();
+    let mut args = vec![
+        "rev-list",
+        "--reverse",
+        "--topo-order",
+        "--parents",
+        "HEAD",
+        "--not",
+    ];
+    args.extend(valid_exclusions);
+    let list = git(work, &args)?;
+    if list.trim().is_empty() {
+        return Ok(false);
+    }
+    let mut remapped: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let scratch_dir = work.parent().unwrap_or(work);
+    for line in list.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(commit) = parts.next() else {
+            continue;
+        };
+        let parents: Vec<&str> = parts.collect();
+        let message = git(work, &["log", "-1", "--format=format:%B", commit])?;
+        let normalized = (parents.len() <= 1)
+            .then(|| normalize_worker_commit_message(&message, worker_coauthor))
+            .flatten();
+        let parent_changed = parents.iter().any(|parent| remapped.contains_key(*parent));
+        if normalized.is_none() && !parent_changed {
+            continue;
+        }
+        let meta = git(
+            work,
+            &[
+                "log",
+                "-1",
+                "--format=format:%T%x00%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI",
+                commit,
+            ],
+        )?;
+        let fields: Vec<&str> = meta.split('\0').collect();
+        let [tree, an, ae, ai, cn, ce, ci] = fields.as_slice() else {
+            return Err(ScalerError::Guard("invalid commit metadata"));
+        };
+        let final_message = normalized.as_deref().unwrap_or(&message);
+        let mut msg_file = tempfile::NamedTempFile::new_in(scratch_dir)?;
+        msg_file.write_all(final_message.as_bytes())?;
+        msg_file.flush()?;
+        let msg_path = msg_file
+            .path()
+            .to_str()
+            .ok_or(ScalerError::Guard("commit message path"))?;
+        let mapped_parents: Vec<&str> = parents
+            .iter()
+            .map(|parent| remapped.get(*parent).map_or(*parent, String::as_str))
+            .collect();
+        let mut tree_args = vec!["commit-tree", *tree];
+        for parent in &mapped_parents {
+            tree_args.extend(["-p", parent]);
+        }
+        tree_args.extend(["-F", msg_path]);
+        let mut cmd = git_invocation(work, &tree_args);
+        cmd.env("GIT_AUTHOR_NAME", *an)
+            .env("GIT_AUTHOR_EMAIL", *ae)
+            .env("GIT_AUTHOR_DATE", *ai)
+            .env("GIT_COMMITTER_NAME", *cn)
+            .env("GIT_COMMITTER_EMAIL", *ce)
+            .env("GIT_COMMITTER_DATE", *ci);
+        let created = String::from_utf8(output(&mut cmd)?)
+            .map_err(|_| ScalerError::Guard("non-UTF8 commit-tree id"))?;
+        let new_sha = created.trim().to_owned();
+        if !sha(&new_sha) {
+            return Err(ScalerError::Guard("invalid commit-tree id"));
+        }
+        if new_sha != commit {
+            remapped.insert(commit.to_owned(), new_sha);
+        }
+    }
+    if let Some(new_head) = remapped.get(&old_head) {
+        git(
+            work,
+            &[
+                "update-ref",
+                "-m",
+                "normalize worker commit trailers",
+                "HEAD",
+                new_head,
+                &old_head,
+            ],
+        )?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn normalize_harvested_trailers(work: &Path, dispatch: &Dispatch) -> Result<(), ScalerError> {
+    if git(
+        work,
+        &["cat-file", "-e", &format!("{}^{{commit}}", dispatch.base)],
+    )
+    .is_err()
+    {
+        return Ok(());
+    }
+    let mut exclusions = vec![dispatch.base.clone()];
+    if let Continuation::Adopted { tip, rebase, .. } = &dispatch.continuation {
+        if git(work, &["cat-file", "-e", &format!("{tip}^{{commit}}")]).is_err() {
+            return Ok(());
+        }
+        if git(work, &["merge-base", "--is-ancestor", tip, "HEAD"]).is_ok() {
+            exclusions.push(tip.clone());
+        } else if *rebase
+            && git(
+                work,
+                &["merge-base", "--is-ancestor", &dispatch.base, "HEAD"],
+            )
+            .is_ok()
+        {
+            let Ok(kept) = rebase_kept_commits(work, tip, &dispatch.base)? else {
+                return Ok(());
+            };
+            exclusions.push(kept.director_tip);
+        } else {
+            return Ok(());
+        }
+        if let Ok(published) = git(
+            work,
+            &["rev-parse", "--verify", "refs/carrick/publication-published"],
+        ) {
+            let published = published.trim();
+            if sha(published)
+                && git(work, &["merge-base", "--is-ancestor", published, "HEAD"]).is_ok()
+            {
+                exclusions.push(published.to_owned());
+            }
+        }
+    }
+    let refs: Vec<&str> = exclusions.iter().map(String::as_str).collect();
+    let _ = rewrite_commit_trailers(work, &refs, &dispatch.worker.coauthor)?;
+    Ok(())
+}
+
 struct HarvestedWorker {
     contract: Contract,
     checkpointed: bool,
@@ -4019,6 +4345,7 @@ fn harvest_worker(
             .risks
             .push("Workflow checkpointed unfinished changes".into());
     }
+    normalize_harvested_trailers(work, dispatch)?;
     let diffstat = git(work, &["diff", "--stat", &dispatch.base, "HEAD"])?;
     Ok(HarvestedWorker {
         contract,
@@ -4290,6 +4617,7 @@ fn produce(
                 },
             );
         }
+        normalize_harvested_trailers(&staging.path().join("candidate"), dispatch)?;
         contract = harvested.contract;
         diffstat = harvested.diffstat;
         code = harvested.exit_code;
@@ -5817,6 +6145,17 @@ fn publish_commits(
                 .to_owned(),
         };
         *preserve = Some(base.clone());
+        let mut trailer_exclusions = vec![base.as_str()];
+        if adopted.is_some()
+            && let Some(pushed) = lease.pushed.as_deref()
+        {
+            trailer_exclusions.push(pushed);
+        }
+        if rewrite_commit_trailers(&work, &trailer_exclusions, &receipt.worker.coauthor)?
+            && state.join("receipt.json").is_file()
+        {
+            refresh_checkpoint_head(&state, &work)?;
+        }
         // Main and the branch tip admitted before this run are trusted history.
         // A worker may rebase across either without owning their messages.
         check_commit_closures(
@@ -11534,4 +11873,343 @@ cat "$file"
         // Reporting commands can run after the tool window closes.
         assert!(output(&mut Command::new("/usr/bin/true")).is_ok());
     }
+
+    #[test]
+    fn copilot_worker_home_disables_copilot_coauthor_trailer() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        for name in [
+            "home/.codex",
+            "home/.gemini/antigravity-cli",
+            "home/.copilot-dispatch",
+            "bin",
+            "director",
+        ] {
+            std::fs::create_dir_all(state.join(name)).unwrap();
+        }
+        std::fs::write(state.join("home/.codex/auth.json"), "codex-secret").unwrap();
+        std::fs::write(
+            state.join("home/.gemini/antigravity-cli/antigravity-oauth-token"),
+            "agy-secret",
+        )
+        .unwrap();
+        std::fs::write(state.join("home/.copilot-dispatch/token"), "copilot-secret").unwrap();
+
+        for backend in ["codex", "agy"] {
+            let actor = temp.path().join(backend);
+            std::fs::create_dir(&actor).unwrap();
+            prepare_worker_actor(&state, &actor, backend).unwrap();
+            assert!(
+                !actor.join("home/.copilot").exists(),
+                "{backend} unexpectedly created home/.copilot"
+            );
+        }
+
+        let actor = temp.path().join("copilot");
+        std::fs::create_dir(&actor).unwrap();
+        prepare_worker_actor(&state, &actor, "copilot").unwrap();
+        let settings_path = actor.join("home/.copilot/settings.json");
+        assert!(
+            settings_path.is_file(),
+            "copilot worker home missing .copilot/settings.json"
+        );
+        let dir_mode = std::fs::metadata(actor.join("home/.copilot"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let file_mode = std::fs::metadata(&settings_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+        let parsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(parsed, json!({"includeCoAuthoredBy": false}));
+
+        let sdk_python = Path::new(COPILOT_SDK_VENV).join("bin/python3");
+        if sdk_python.is_file() && Path::new(COPILOT_RUNTIME_DIR).is_dir() {
+            let probe = Command::new(&sdk_python)
+                .env("HOME", actor.join("home"))
+                .env("COPILOT_CLI_EXTRACT_DIR", COPILOT_RUNTIME_DIR)
+                .env("COPILOT_SKIP_CLI_DOWNLOAD", "1")
+                .args([
+                    "-c",
+                    "import asyncio, json\nfrom copilot import CopilotClient\nasync def main():\n    c = CopilotClient(github_token='fake', use_logged_in_user=False)\n    await c.start()\n    try:\n        got = await c.rpc.user.settings.get()\n        print(json.dumps(got.settings['includeCoAuthoredBy'].to_dict()))\n    finally:\n        await c.stop()\nasyncio.run(main())\n",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                probe.status.success(),
+                "copilot runtime probe failed: {}",
+                String::from_utf8_lossy(&probe.stderr)
+            );
+            let meta: Value = serde_json::from_slice(&probe.stdout).unwrap();
+            assert_eq!(meta["value"], json!(false), "{meta}");
+            assert_eq!(meta["isDefault"], json!(false), "{meta}");
+        }
+    }
+
+    /// #1550 production witness: a Copilot `claude-opus-5.5` worker commit
+    /// carrying `Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>`
+    /// (alongside `worker.coauthor`, alone, or capitalized) is normalized to
+    /// the model vendor's single `Co-Authored-By:` line and passes
+    /// `commit-trailers`, without rewriting prior workers' or adopted
+    /// directors' commits.
+    #[test]
+    fn serial_host_copilot_worker_round_normalizes_coauthor_and_passes_commit_trailers() {
+        const CHILD: &str = "CARRICK_1550_WITNESS_CHILD";
+        struct Scripted(fn(&Path));
+        impl WorkerHost for Scripted {
+            fn initialize(&mut self) -> Result<(), ScalerError> {
+                Ok(())
+            }
+            fn prepare(&mut self, _: &Path, _: &Path, _: &str) -> Result<(), ScalerError> {
+                Ok(())
+            }
+            fn agent(&mut self, root: &Path, _: &Dispatch) -> Result<i32, ScalerError> {
+                (self.0)(root);
+                Ok(0)
+            }
+            fn retire(&mut self) -> Result<(), ScalerError> {
+                Ok(())
+            }
+            fn hand_back(&mut self, _: &Path) -> Result<(), ScalerError> {
+                Ok(())
+            }
+        }
+        if std::env::var_os(CHILD).is_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let runner = temp.path().join("runner");
+            std::fs::create_dir(&runner).unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    std::thread::current().name().unwrap(),
+                    "--nocapture",
+                ])
+                .env(CHILD, temp.path())
+                .env("RUNNER_TEMP", &runner)
+                .env("GITHUB_RUN_ID", "88")
+                .env("GITHUB_RUN_ATTEMPT", "1")
+                .env("GH_TOKEN", "fixture-1550-job-token")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let temp = PathBuf::from(std::env::var_os(CHILD).unwrap());
+        let root = temp.join("root");
+        std::fs::create_dir(&root).unwrap();
+        fixture_repository(&root);
+        let base = git(&root, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_owned();
+        let branch = "work/dispatch-1550-88";
+        let mut dispatch =
+            validate_event(&event(), "tjfontaine", &mut owner_collaborator()).unwrap();
+        dispatch.issue = 1550;
+        dispatch.base = base.clone();
+        dispatch.branch = branch.into();
+        dispatch.loop_deadline = None;
+
+        // Worker 1: Codex commit whose trailer and SHA must stay intact.
+        dispatch.worker = Worker {
+            backend: "codex".into(),
+            model: "gpt-6.1-sol".into(),
+            effort: None,
+            coauthor: "Codex <noreply@openai.com>".into(),
+            roster: vec!["gpt-6.1-sol".into()],
+        };
+        produce(
+            &root,
+            &dispatch,
+            "success/success",
+            &mut Scripted(|work| {
+                std::fs::write(work.join("codex.txt"), "codex step\n").unwrap();
+                git(work, &["add", "codex.txt"]).unwrap();
+                git(
+                    work,
+                    &[
+                        "commit",
+                        "-q",
+                        "-m",
+                        "feat(xtask): first step\n\nWhy: setup.\n\nWhat: add codex.txt.\n\nVerified: unit test.\n\nCo-Authored-By: Codex <noreply@openai.com>",
+                    ],
+                )
+                .unwrap();
+            }),
+        )
+        .unwrap();
+        let state = crate::agent_runner::state().unwrap();
+        let codex_sha = git(&state.join("work"), &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_owned();
+
+        // Worker 2: Copilot running claude-opus-5.5 (#1544 commit 7b9c83c981 shape
+        // plus Copilot-only and capitalized Copilot variants).
+        dispatch.worker = Worker {
+            backend: "copilot".into(),
+            model: "claude-opus-5.5".into(),
+            effort: None,
+            coauthor: "Claude <noreply@anthropic.com>".into(),
+            roster: vec!["claude-opus-5.5".into()],
+        };
+        produce(
+            &root,
+            &dispatch,
+            "success/success",
+            &mut Scripted(|work| {
+                for (name, body) in [
+                    (
+                        "both.txt",
+                        "fix(xtask): dual trailer\n\nWhy: #1544.\n\nWhat: change.\n\nVerified: test.\n\nCo-Authored-By: Claude <noreply@anthropic.com>\nCo-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>",
+                    ),
+                    (
+                        "only_copilot.txt",
+                        "fix(xtask): copilot trailer only\n\nWhy: #1550.\n\nWhat: change.\n\nVerified: test.\n\nCo-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>",
+                    ),
+                    (
+                        "cap_copilot.txt",
+                        "fix(xtask): capitalized copilot trailer\n\nWhy: #1550.\n\nWhat: change.\n\nVerified: test.\n\nCo-Authored-By: Copilot <223556219+Copilot@users.noreply.github.com>",
+                    ),
+                ] {
+                    std::fs::write(work.join(name), name).unwrap();
+                    git(work, &["add", name]).unwrap();
+                    git(work, &["commit", "-q", "-m", body]).unwrap();
+                }
+            }),
+        )
+        .unwrap();
+
+        let harvested_work = state.join("work");
+        let mut out = Vec::new();
+        crate::commit_trailers::run(
+            &harvested_work,
+            crate::commit_trailers::CommitTrailersArgs {
+                action: crate::commit_trailers::CommitTrailersAction::CheckRange {
+                    range: format!("{base}..HEAD"),
+                },
+            },
+            &mut out,
+        )
+        .expect("Copilot round commits must pass commit-trailers");
+
+        let shas: Vec<String> = git(
+            &harvested_work,
+            &["rev-list", "--reverse", &format!("{base}..HEAD")],
+        )
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+        assert_eq!(shas.len(), 4);
+        assert_eq!(shas[0], codex_sha, "prior Codex commit SHA must not change");
+        for sha in &shas[1..] {
+            let msg = git(&harvested_work, &["log", "-1", "--format=%B", sha]).unwrap();
+            assert!(
+                !msg.to_ascii_lowercase().contains("copilot@"),
+                "Copilot co-author leaked into {sha}: {msg}"
+            );
+            let coauthors: Vec<&str> = msg
+                .lines()
+                .filter(|l| l.to_ascii_lowercase().contains("co-authored-by"))
+                .collect();
+            assert_eq!(
+                coauthors,
+                vec!["Co-Authored-By: Claude <noreply@anthropic.com>"],
+                "unexpected trailers on {sha}: {msg}"
+            );
+        }
+
+        // Adopted PR: director commit stays untouched while new Copilot commit above it is normalized.
+        let adopted_root = temp.join("adopted-root");
+        std::fs::create_dir(&adopted_root).unwrap();
+        fixture_repository(&adopted_root);
+        let adopted_base = git(&adopted_root, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_owned();
+        git(&adopted_root, &["checkout", "-q", "-b", "feat/director-pr"]).unwrap();
+        std::fs::write(adopted_root.join("director.txt"), "director\n").unwrap();
+        git(&adopted_root, &["add", "director.txt"]).unwrap();
+        git(
+            &adopted_root,
+            &["commit", "-q", "-m", "feat(core): director commit"],
+        )
+        .unwrap();
+        let director_tip = git(&adopted_root, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_owned();
+        git(
+            &adopted_root,
+            &[
+                "update-ref",
+                "refs/remotes/origin/feat/director-pr",
+                &director_tip,
+            ],
+        )
+        .unwrap();
+        git(&adopted_root, &["checkout", "-q", &adopted_base]).unwrap();
+        std::fs::remove_dir_all(&state).unwrap();
+
+        let mut adopted_dispatch = dispatch.clone();
+        adopted_dispatch.base = adopted_base;
+        adopted_dispatch.branch = "feat/director-pr".into();
+        adopted_dispatch.resume = true;
+        adopted_dispatch.selected_tip = Some(director_tip.clone());
+        adopted_dispatch.continuation = Continuation::Adopted {
+            rebase: false,
+            pr: 1544,
+            branch: "feat/director-pr".into(),
+            tip: director_tip.clone(),
+        };
+        produce(
+            &adopted_root,
+            &adopted_dispatch,
+            "success/success",
+            &mut Scripted(|work| {
+                std::fs::write(work.join("copilot_fix.txt"), "fix\n").unwrap();
+                git(work, &["add", "copilot_fix.txt"]).unwrap();
+                git(
+                    work,
+                    &[
+                        "commit",
+                        "-q",
+                        "-m",
+                        "fix(core): review fix\n\nWhy: review.\n\nWhat: fix.\n\nVerified: test.\n\nCo-Authored-By: Claude <noreply@anthropic.com>\nCo-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>",
+                    ],
+                )
+                .unwrap();
+            }),
+        )
+        .unwrap();
+        let adopted_work = state.join("work");
+        git(
+            &adopted_work,
+            &["merge-base", "--is-ancestor", &director_tip, "HEAD"],
+        )
+        .expect("director commit SHA must stay untouched on adopted PR");
+        crate::commit_trailers::run(
+            &adopted_work,
+            crate::commit_trailers::CommitTrailersArgs {
+                action: crate::commit_trailers::CommitTrailersAction::CheckRange {
+                    range: format!("{director_tip}..HEAD"),
+                },
+            },
+            &mut out,
+        )
+        .expect("adopted PR Copilot commit must pass commit-trailers");
+    }
 }
+

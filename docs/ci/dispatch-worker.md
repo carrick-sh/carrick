@@ -1080,7 +1080,13 @@ template.
 
 The capacity report lists Copilot's Claude and GPT models, credited to
 `Claude <noreply@anthropic.com>` and `GPT <noreply@openai.com>`. Other
-vendors' models have no co-author rule and are left out. Copilot's quota is
+vendors' models have no co-author rule and are left out. `prepare_worker_actor`
+writes `home/.copilot/settings.json` with `{"includeCoAuthoredBy":false}` so the
+Copilot runtime does not instruct the session to add its own
+`Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>` trailer,
+and harvest and publication normalize any Copilot or misformatted co-author
+trailers on the round's commits to the model vendor's `worker.coauthor` so
+published commits pass `commit-trailers` (#1550). Copilot's quota is
 the owner's premium-request reading; an empty or failed reading counts as no
 quota, so Copilot is not offered.
 
