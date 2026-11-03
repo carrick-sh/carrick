@@ -364,6 +364,200 @@ impl Pve {
         authenticate_config(row, vm, &config)
     }
 }
+// These commands run only on the selected PVE node, never through a guest.
+fn storage_command(args: &[&str]) -> Result<Value, ScalerError> {
+    let bytes = execute(
+        Command::new(args[0]).args(&args[1..]),
+        &[],
+        Duration::from_secs(90),
+    )?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+fn clone_volumes(
+    storage: &str,
+    id: CloneId,
+    run: &mut impl FnMut(&[&str]) -> Result<Value, ScalerError>,
+) -> Result<Vec<String>, ScalerError> {
+    let value = run(&["pvesm", "list", storage, "--vmid", &id.get().to_string()])?;
+    value
+        .as_array()
+        .ok_or(ScalerError::Guard("invalid storage inventory"))?
+        .iter()
+        .map(|row| {
+            let volid = row["volid"]
+                .as_str()
+                .ok_or(ScalerError::Guard("missing volume identity"))?;
+            if row["vmid"].as_u64() != Some(u64::from(id.get()))
+                || !volid.starts_with(&format!("{storage}:"))
+            {
+                return Err(ScalerError::Guard(
+                    "storage returned another owner's volume",
+                ));
+            }
+            Ok(volid.to_owned())
+        })
+        .collect()
+}
+fn clear_clone_volumes(
+    storage: &str,
+    id: CloneId,
+    run: &mut impl FnMut(&[&str]) -> Result<Value, ScalerError>,
+) -> Result<(), ScalerError> {
+    let volumes = clone_volumes(storage, id, run)?;
+    if !volumes.is_empty() {
+        eprintln!("vm={} leaked_volumes_detected={}", id.get(), volumes.len());
+    }
+    for volume in &volumes {
+        // Pool absence is insufficient: refuse any VM/container config anywhere
+        // in the cluster, including objects moved out of our pool.
+        let resources = run(&[
+            "pvesh",
+            "get",
+            "/cluster/resources",
+            "--type",
+            "vm",
+            "--output-format",
+            "json",
+        ])?;
+        if resources
+            .as_array()
+            .ok_or(ScalerError::Guard("invalid cluster inventory"))?
+            .iter()
+            .any(|vm| vm["vmid"].as_u64() == Some(u64::from(id.get())))
+        {
+            return Err(ScalerError::Guard(
+                "refusing to free volumes with an existing config",
+            ));
+        }
+        // `pvesm free` has no JSON result. The adapter supplies null on success.
+        run(&["pvesm", "free", volume])?;
+    }
+    let remaining = clone_volumes(storage, id, run)?;
+    eprintln!(
+        "vm={} leaked_volumes_remaining={} volumes_reaped={}",
+        id.get(),
+        remaining.len(),
+        volumes.len().saturating_sub(remaining.len())
+    );
+    if !remaining.is_empty() {
+        return Err(ScalerError::External(
+            "clone volumes remain; retry cleanup next reconcile",
+        ));
+    }
+    Ok(())
+}
+fn parse_volume_listing(bytes: &[u8]) -> Result<Value, ScalerError> {
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| ScalerError::Guard("invalid storage output"))?;
+    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+    if lines
+        .next()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        != Some(vec!["Volid", "Format", "Type", "Size", "VMID"])
+    {
+        return Err(ScalerError::Guard("invalid storage listing header"));
+    }
+    let mut rows = Vec::new();
+    for line in lines {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() != 5 {
+            return Err(ScalerError::Guard("invalid storage listing row"));
+        }
+        let vmid = fields[4]
+            .parse::<u16>()
+            .map_err(|_| ScalerError::Guard("invalid volume VMID"))?;
+        rows.push(json!({"volid":fields[0], "vmid":vmid}));
+    }
+    Ok(Value::Array(rows))
+}
+fn local_storage_command(args: &[&str]) -> Result<Value, ScalerError> {
+    if args.first() == Some(&"pvesm") {
+        let bytes = execute(
+            Command::new(args[0]).args(&args[1..]),
+            &[],
+            Duration::from_secs(90),
+        )?;
+        if args.get(1) == Some(&"list") {
+            parse_volume_listing(&bytes)
+        } else {
+            Ok(Value::Null)
+        }
+    } else {
+        storage_command(args)
+    }
+}
+impl Pve {
+    fn clear_volumes(&self, id: CloneId) -> Result<(), ScalerError> {
+        clear_clone_volumes(self.site.storage, id, &mut local_storage_command)
+    }
+    fn reservation_inventory(&self) -> Result<Vec<PoolMember>, ScalerError> {
+        let mut inventory = self.inventory()?;
+        // One listing per reservation, rather than one process per free VMID.
+        let volumes = local_storage_command(&[
+            "pvesm",
+            "list",
+            self.site.storage,
+            "--content",
+            "images,rootdir",
+        ])?;
+        for volume in volumes
+            .as_array()
+            .ok_or(ScalerError::Guard("invalid volume inventory"))?
+        {
+            let raw = volume["vmid"]
+                .as_u64()
+                .and_then(|id| u16::try_from(id).ok())
+                .ok_or(ScalerError::Guard("invalid volume VMID"))?;
+            if CloneId::try_from(raw).is_ok() {
+                inventory.push(PoolMember {
+                    id: raw,
+                    pool: String::new(),
+                    template: false,
+                });
+            }
+        }
+        Ok(inventory)
+    }
+}
+/// Explicit maintenance, with provisioning stopped: never adopt an unknown
+/// config or touch template/protected VMIDs outside the clone range.
+pub(super) fn sweep_clone_volumes(dir: &Path) -> Result<(), ScalerError> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err(ScalerError::Guard("volume sweep requires root on PVE"));
+    }
+    let site = Site::local()?;
+    let _lock = super::acquire_controller_lock(dir)?;
+    let mut failed = 0;
+    for raw in 308..=349 {
+        let resources = storage_command(&[
+            "pvesh",
+            "get",
+            "/cluster/resources",
+            "--type",
+            "vm",
+            "--output-format",
+            "json",
+        ])?;
+        let rows = resources
+            .as_array()
+            .ok_or(ScalerError::Guard("invalid cluster inventory"))?;
+        if rows.iter().any(|vm| vm["vmid"].as_u64() == Some(raw)) {
+            continue;
+        }
+        let id = CloneId::try_from(
+            u16::try_from(raw).map_err(|_| ScalerError::Guard("invalid clone VMID"))?,
+        )?;
+        if let Err(error) = clear_clone_volumes(site.storage, id, &mut local_storage_command) {
+            failed += 1;
+            eprintln!("vm={raw} orphan sweep deferred: {error}");
+        }
+    }
+    println!("orphan_sweep_failed_vmids={failed}");
+    if failed != 0 {
+        return Err(ScalerError::External("orphan sweep incomplete"));
+    }
+    Ok(())
+}
 fn pool_inventory(pool: &Value, node: &str) -> Result<Vec<PoolMember>, ScalerError> {
     if pool["poolid"] != POOL {
         return Err(ScalerError::Guard("PVE returned another pool"));
@@ -1093,6 +1287,7 @@ trait TeardownApi {
     fn stop(&mut self, row: &Record, dir: &Path) -> Result<Option<String>, ScalerError>;
     fn destroy(&mut self, row: &Record) -> Result<String, ScalerError>;
     fn wait_task(&mut self, task: &str) -> Result<(), ScalerError>;
+    fn clear_volumes(&mut self, row: &Record) -> Result<(), ScalerError>;
     fn remove_runner(&mut self, row: &Record) -> Result<(), ScalerError>;
 }
 struct LiveTeardown<'a> {
@@ -1132,6 +1327,9 @@ impl TeardownApi for LiveTeardown<'_> {
     }
     fn wait_task(&mut self, task: &str) -> Result<(), ScalerError> {
         self.pve.wait_task(task)
+    }
+    fn clear_volumes(&mut self, row: &Record) -> Result<(), ScalerError> {
+        self.pve.clear_volumes(row.vm)
     }
     fn remove_runner(&mut self, row: &Record) -> Result<(), ScalerError> {
         self.gh.remove_runner(row)
@@ -1173,6 +1371,7 @@ fn continue_teardown(
     }
     // Removing registration cannot strand a running VM: the VM is absent first.
     // If GitHub fails or this process dies, Reaping remains a resumable license.
+    api.clear_volumes(row)?;
     api.remove_runner(row)?;
     finish_destroyed(ledger, row, dir, path)?;
     Ok(true)
@@ -1334,6 +1533,7 @@ fn reconcile_one(
             }
             // Removal recovers a POST whose ID save was interrupted by name;
             // never query job assignment after the VM has disappeared.
+            pve.clear_volumes(row.vm)?;
             gh.remove_runner(&row)?;
             finish_destroyed(ledger, &mut row, dir, path)?;
             return Ok(true);
@@ -2242,7 +2442,7 @@ fn admit_one(
                 result => result,
             }
         },
-        || pve.inventory(),
+        || pve.reservation_inventory(),
     )?
     else {
         return Ok(false);

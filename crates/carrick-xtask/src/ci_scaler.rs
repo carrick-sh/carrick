@@ -1172,6 +1172,11 @@ pub enum ScalerAction {
         #[arg(long)]
         template: u16,
     },
+    /// Root on PVE: reap orphaned clone volumes (stop the controller first).
+    SweepCloneVolumes {
+        #[arg(long, default_value = "/root/carrick-ci/state")]
+        state_dir: PathBuf,
+    },
     /// Fail unless the calling (non-root runner) user can open KVM API 12.
     VerifyKvm,
     /// Runner job-start hook: authorize before any workflow step executes.
@@ -1263,6 +1268,7 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
             Ok(())
         }
         ScalerAction::QualifyClone { template } => qualify_clone::run(template),
+        ScalerAction::SweepCloneVolumes { state_dir } => live::sweep_clone_volumes(&state_dir),
         ScalerAction::CheckTemplateRetirement { template } => template_retirement::check(template),
         ScalerAction::VerifyKvm => verify_kvm(),
         ScalerAction::AdmitJob {
