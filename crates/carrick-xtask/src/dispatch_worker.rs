@@ -3825,6 +3825,7 @@ fn carry_publication_history(
     admitted: &str,
     published: &str,
 ) -> Result<(), ScalerError> {
+    let mut revisions = vec!["rev-list", "--objects", "--quiet", "HEAD"];
     for (name, tip) in [("admitted", admitted), ("published", published)] {
         if tip.is_empty() {
             continue;
@@ -3832,6 +3833,10 @@ fn carry_publication_history(
         if !sha(tip) {
             return Err(ScalerError::Guard("invalid publication history tip"));
         }
+        revisions.push(match name {
+            "admitted" => "refs/carrick/publication-admitted",
+            _ => "refs/carrick/publication-published",
+        });
         git(
             target,
             &[
@@ -3847,7 +3852,8 @@ fn carry_publication_history(
     }
     // HEAD resolving alone does not prove that its parent/tree/blob objects
     // survived a handoff. Reject incomplete stores before replacing a receipt.
-    git(target, &["fsck", "--connectivity-only", "--no-dangling"])?;
+    // Unrelated worker refs are not publication authorities.
+    git(target, &revisions)?;
     Ok(())
 }
 
@@ -4268,12 +4274,22 @@ fn produce(
         // manual harvest.patch replay or change to the publication lease is needed.
         let history = if previous.is_some() { &work } else { root };
         let lease = RunLease::load(&state, &expected_tip)?;
-        carry_publication_history(
+        if let Err(error) = carry_publication_history(
             history,
             &staging.path().join("candidate"),
             &expected_tip,
             lease.current(),
-        )?;
+        ) {
+            return Err(
+                match preserve_harvest(&staging.path().join("candidate"), &base, &token) {
+                    Ok(Some(note)) => ScalerError::Usage(format!("{error}; {note}")),
+                    Ok(None) => error,
+                    Err(saving) => ScalerError::Usage(format!(
+                        "{error}; harvested commits could not be kept: {saving}"
+                    )),
+                },
+            );
+        }
         contract = harvested.contract;
         diffstat = harvested.diffstat;
         code = harvested.exit_code;
@@ -9444,6 +9460,161 @@ fi
             "agent processes survived timeout: {survivors:?}"
         );
     }
+    /// #1531 production witness: two `produce` rounds through the real
+    /// `worker_checkout` -> agent -> `harvest_worker` -> checkpoint path.
+    /// Worker 1 makes the consented rebase onto admitted main (the admitted
+    /// PR tip leaves HEAD's ancestry); worker 2 commits. Publication's own
+    /// `check_commit_closures(.., Some(expected_tip), ..)` must still resolve
+    /// the admitted tip in the installed checkpoint.
+    #[test]
+    fn serial_host_two_worker_round_keeps_admitted_tip_after_consented_rebase() {
+        const CHILD: &str = "CARRICK_1531_WITNESS_CHILD";
+        struct Scripted(fn(&Path));
+        impl WorkerHost for Scripted {
+            fn initialize(&mut self) -> Result<(), ScalerError> {
+                Ok(())
+            }
+            fn prepare(&mut self, _: &Path, _: &Path, _: &str) -> Result<(), ScalerError> {
+                Ok(())
+            }
+            fn agent(&mut self, root: &Path, _: &Dispatch) -> Result<i32, ScalerError> {
+                (self.0)(root);
+                Ok(0)
+            }
+            fn retire(&mut self) -> Result<(), ScalerError> {
+                Ok(())
+            }
+            fn hand_back(&mut self, _: &Path) -> Result<(), ScalerError> {
+                Ok(())
+            }
+        }
+        if std::env::var_os(CHILD).is_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let runner = temp.path().join("runner");
+            std::fs::create_dir(&runner).unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    std::thread::current().name().unwrap(),
+                    "--nocapture",
+                ])
+                .env(CHILD, temp.path())
+                .env("RUNNER_TEMP", &runner)
+                .env("GITHUB_RUN_ID", "77")
+                .env("GITHUB_RUN_ATTEMPT", "1")
+                // Artifact masking requires a job token, never ambient credentials.
+                .env("GH_TOKEN", "fixture-1531-job-token")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let temp = PathBuf::from(std::env::var_os(CHILD).unwrap());
+        let root = temp.join("root");
+        std::fs::create_dir(&root).unwrap();
+        fixture_repository(&root);
+        let branch = "work/dispatch-634-42";
+        git(&root, &["checkout", "-q", "-b", branch]).unwrap();
+        std::fs::write(root.join("pr"), "admitted pr work").unwrap();
+        git(&root, &["add", "pr"]).unwrap();
+        git(&root, &["commit", "-q", "-m", "admitted pr work"]).unwrap();
+        let admitted = git(&root, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_owned();
+        git(&root, &["checkout", "-q", "work/dispatch-634-pending"]).unwrap();
+        std::fs::write(root.join("main"), "main moved").unwrap();
+        git(&root, &["add", "main"]).unwrap();
+        git(&root, &["commit", "-q", "-m", "main moved"]).unwrap();
+        let base = git(&root, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_owned();
+        let mut dispatch =
+            validate_event(&event(), "tjfontaine", &mut owner_collaborator()).unwrap();
+        dispatch.base = base.clone();
+        dispatch.branch = branch.into();
+        dispatch.resume = true;
+        dispatch.loop_deadline = None;
+        // Worker 1: the consented rebase onto admitted main.
+        produce(
+            &root,
+            &dispatch,
+            "success/success",
+            &mut Scripted(|work| {
+                git(work, &["rebase", "-q", "refs/carrick/dispatch-main"]).unwrap();
+            }),
+        )
+        .unwrap();
+        let state = crate::agent_runner::state().unwrap();
+        let first = git(&state.join("work"), &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_owned();
+        assert!(
+            git(
+                &state.join("work"),
+                &["merge-base", "--is-ancestor", &admitted, "HEAD"]
+            )
+            .is_err(),
+            "worker 1 must have rewritten the admitted tip"
+        );
+        // The WIP checkpoint push of worker 1 advanced the run lease.
+        std::fs::write(state.join("published-tip"), &first).unwrap();
+        // Worker 2: one more commit on top of worker 1.
+        produce(
+            &root,
+            &dispatch,
+            "success/success",
+            &mut Scripted(|work| {
+                std::fs::write(work.join("second"), "second worker").unwrap();
+                git(work, &["add", "second"]).unwrap();
+                git(work, &["commit", "-q", "-m", "second worker"]).unwrap();
+            }),
+        )
+        .unwrap();
+        let receipt = worker_checkpoint(&state, &dispatch).unwrap().unwrap();
+        assert_eq!(receipt.expected_tip, admitted);
+        // The exact call publication makes (exit 128 `bad object` on main).
+        check_commit_closures(&state.join("work"), &base, Some(&admitted), 634).unwrap();
+        git(
+            &state.join("work"),
+            &["merge-base", "--is-ancestor", &first, "HEAD"],
+        )
+        .unwrap();
+
+        // A later candidate must survive even a history-import refusal. Model
+        // a missing server comparison object after checkout, leaving HEAD's
+        // closure intact so the new commit can still be harvested.
+        let error = produce(
+            &root,
+            &dispatch,
+            "success/success",
+            &mut Scripted(|work| {
+                std::fs::write(work.join("refused"), "keep this worker commit").unwrap();
+                git(work, &["add", "refused"]).unwrap();
+                git(work, &["commit", "-q", "-m", "keep refused candidate"]).unwrap();
+                let state = crate::agent_runner::state().unwrap();
+                std::fs::write(state.join("published-tip"), "f".repeat(40)).unwrap();
+            }),
+        )
+        .unwrap_err();
+        std::fs::write(state.join("published-tip"), &first).unwrap();
+        assert!(error.to_string().contains("harvest.patch"), "{error}");
+        let patch = std::fs::read_to_string(
+            PathBuf::from(std::env::var_os("RUNNER_TEMP").unwrap())
+                .join("dispatch-output/harvest.patch"),
+        )
+        .unwrap();
+        assert!(patch.contains("keep refused candidate"));
+        assert!(patch.contains("+keep this worker commit"));
+    }
+
     #[test]
     fn second_worker_keeps_rewritten_publication_history() {
         let temp = tempfile::tempdir().unwrap();

@@ -555,7 +555,7 @@ test-xtask *ARGS:
 
 [private]
 _test-xtask *ARGS:
-    {{_cargo}} test --locked -p carrick-xtask --all-features --lib --bins --test build_cache --test host_lease --test fixtures --test test_batch --test loom_run --test ci_cache --test ci_changes --test ci_receipt --test signed_receipt --test smoke_signed --test ci_scaler --test ci_scaler_hook --test ci_scaler_mac --test commit_trailers --test cli --test claims --test workorder {{ARGS}}
+    {{_cargo}} test --locked -p carrick-xtask --all-features --lib --bins --test build_cache --test host_lease --test fixtures --test test_batch --test loom_run --test ci_cache --test ci_changes --test ci_receipt --test signed_receipt --test smoke_signed --test ci_scaler --test ci_scaler_hook --test ci_scaler_mac --test commit_trailers --test cli --test claims --test workorder --test dispatch_workflow {{ARGS}}
 
 # Fail on missing, duplicate or changed selections or per-binary features, plus missing workflow jobs.
 check-test-shards:
@@ -1378,7 +1378,7 @@ ci-install-semgrep:
     # Wheels only: semgrep pins `ruamel.yaml.clib==0.2.12` as a source package
     # that imports `ast.Str`, which Python 3.14 removed, so building it fails.
     # With `--only-binary` pip resolves a release that ships a 3.14 wheel (#1000).
-    "$RUNNER_TEMP/semgrep/bin/pip" install --only-binary=:all: semgrep
+    "$RUNNER_TEMP/semgrep/bin/pip" install --only-binary=:all: semgrep==1.183.0
     echo "$RUNNER_TEMP/semgrep/bin" >> "${GITHUB_PATH:?}"
 
 # The cross toolchains install from an actions/cache directory, so a slow

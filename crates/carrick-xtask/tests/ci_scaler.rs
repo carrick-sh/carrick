@@ -1352,6 +1352,35 @@ fn agent_template_profile_preserves_hardening_without_root_sudo() {
     assert!(!source.contains("rm -f /etc/sudoers.d/carrick-dispatch-agent"));
 }
 
+/// The lint executable and its dependency closure are immutable template inputs.
+#[test]
+fn agent_template_hash_locks_semgrep_at_the_ci_version() {
+    let builder = include_str!("../../../scripts/ci/build-template-debian.sh");
+    assert!(builder.contains("cp \"$inputs/scripts/ci/inputs/semgrep-requirements.txt\" seed/"));
+    assert!(
+        builder
+            .contains("--no-deps --only-binary=:all: --require-hashes -r semgrep-requirements.txt")
+    );
+    let requirements = include_str!("../../../scripts/ci/inputs/semgrep-requirements.txt");
+    let mut semgrep = None;
+    for line in requirements
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.is_empty())
+    {
+        let (pin, hash) = line.split_once(" --hash=sha256:").unwrap();
+        let (name, version) = pin.split_once("==").unwrap();
+        assert!(!name.is_empty() && !version.is_empty());
+        assert!(hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()));
+        if name == "semgrep" {
+            semgrep = Some(pin);
+        }
+    }
+    let pin = semgrep.unwrap();
+    assert!(
+        include_str!("../../../justfile").contains(&format!("install --only-binary=:all: {pin}\n"))
+    );
+}
+
 /// #1474: the Copilot fallback worker runs from a prebuilt, hash-locked SDK
 /// and a runtime extracted at template build; no job installs either, and
 /// the version marker matches the launcher's pinned `COPILOT_SDK_VERSION`.

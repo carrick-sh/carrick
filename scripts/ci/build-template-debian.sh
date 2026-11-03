@@ -102,6 +102,7 @@ cp "$inputs/scripts/ci/runner-once.sh" seed/
 cp "$inputs/scripts/ci/admit-job.sh" seed/
 cp "$inputs/scripts/ci/inputs/codex-sdk-requirements.txt" seed/
 cp "$inputs/scripts/ci/inputs/copilot-sdk-requirements.txt" seed/
+cp "$inputs/scripts/ci/inputs/semgrep-requirements.txt" seed/
 printf '%s\n' "$profile" > seed/profile
 printf '%s\n' "$gh_version" > seed/gh-version
 cat > seed/meta-data <<DATA
@@ -178,7 +179,7 @@ if [[ $(cat profile) == agent ]]; then
   # Keep the environment read-only and expose its entry point on the default PATH.
   python3 -m venv /opt/carrick-agent/semgrep
   /opt/carrick-agent/semgrep/bin/pip install --quiet --disable-pip-version-check \
-    --only-binary=:all: semgrep
+    --no-deps --only-binary=:all: --require-hashes -r semgrep-requirements.txt
   ln -s /opt/carrick-agent/semgrep/bin/semgrep /usr/local/bin/semgrep
   chmod -R a+rX,go-w /opt/carrick-agent
 fi
