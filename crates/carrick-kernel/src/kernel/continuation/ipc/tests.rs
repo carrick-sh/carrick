@@ -17,6 +17,56 @@ const MM: IpcMmKey = IpcMmKey(7);
 const BUF: u64 = 0x10_0000;
 
 #[test]
+fn serial_host_zone_operation_slot_release_reaches_bound_source() {
+    // SAFETY: all-zero is the valid empty ABI state; aligned storage lives
+    // through the scoped host binding.
+    let zone = unsafe {
+        let ptr = std::alloc::alloc_zeroed(Layout::new::<carrick_el1_abi::ZoneTables>());
+        assert!(!ptr.is_null());
+        Box::leak(Box::from_raw(ptr.cast::<carrick_el1_abi::ZoneTables>()))
+    };
+    crate::el1_zone::with_test_zone(zone, || {
+        let dispatcher = crate::dispatch::SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let owner = context.kernel().ipc().unwrap();
+        let _backing = host_window_backing(&dispatcher).unwrap();
+        let region = owner.region();
+        let complete = |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_el1_abi::Aarch64ParkedContext,
+        >| {
+            crate::el1_zone::complete_object_wake(zone, owned);
+        };
+        // Mirror the carrier's pre-publication binding, then exercise the
+        // real host completion owner, rather than a mock callback counter.
+        zone.bind_ipc_operation_slots(region.operation_slot_generation(), &HostIpcWait, &complete)
+            .unwrap();
+        let source = zone
+            .ipc_operation_slot_source(region.operation_slot_generation(), &complete)
+            .unwrap();
+        let key = source.reserve().key();
+        let before = zone.object_queue_census(key.index()).unwrap().epoch;
+        let token = region.begin_operation(IpcOperation::EMPTY).unwrap();
+        let raw = token.into_raw();
+        let service = ZoneHostServices::new(context.kernel()).unwrap();
+        finish(&region, IpcOpToken::from_raw(raw), &service).unwrap();
+        assert_eq!(
+            zone.object_queue_census(key.index()).unwrap().epoch,
+            before + 1,
+            "production host service must deliver release"
+        );
+        assert_eq!(
+            finish(&region, IpcOpToken::from_raw(raw), &service),
+            Err(IpcError::Stale)
+        );
+        assert_eq!(
+            zone.object_queue_census(key.index()).unwrap().epoch,
+            before + 1
+        );
+    });
+}
+
+#[test]
 fn el1_ipc_host_finish_publishes_operation_slot_release_once() {
     let w = world();
     let token = w.region.begin_operation(IpcOperation::EMPTY).unwrap();

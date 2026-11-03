@@ -1552,6 +1552,35 @@ pub(crate) fn install_registered_ipc_window(custody: &CarrierVmCustody) -> Resul
     let Some(backing) = registered_ipc_window_backing() else {
         return Ok(());
     };
+    // SAFETY: registered backing has validated geometry and retains the memory.
+    let window = unsafe {
+        carrick_el1_abi::IpcWindow::new(
+            backing.directory_ptr() as usize,
+            backing.directory_len(),
+            backing.pool_ptr() as usize,
+            backing.pool_len(),
+        )
+    };
+    // The zone may have been installed after host backing registration.
+    // Bind before either publication store lets a guest probe or retire.
+    if let Some(window) = window {
+        let region = window.attach().map_err(|error| {
+            TrapError::Hypervisor(format!("IPC window attachment failed: {error:?}"))
+        })?;
+        let zone = carrick_el1_abi::zone_tables().ok_or_else(|| {
+            TrapError::Hypervisor("IPC window publication requires its carrier zone".to_owned())
+        })?;
+        zone.bind_ipc_operation_slots(
+            region.operation_slot_generation(),
+            &carrick_sched_core::BoundedSpin(0),
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+        )
+        .map_err(|error| {
+            TrapError::Hypervisor(format!("IPC slot source publication failed: {error:?}"))
+        })?;
+    }
     let installed = install_ipc_window_using(
         custody,
         backing,
@@ -1568,15 +1597,6 @@ pub(crate) fn install_registered_ipc_window(custody: &CarrierVmCustody) -> Resul
             }
         },
     )?;
-    // SAFETY: validated geometry; the installation retains the memory.
-    let window = unsafe {
-        carrick_el1_abi::IpcWindow::new(
-            installed._backing.directory_ptr() as usize,
-            installed._backing.directory_len(),
-            installed._backing.pool_ptr() as usize,
-            installed._backing.pool_len(),
-        )
-    };
     *INSTALLED_IPC_WINDOW.lock() = Some(installed);
     carrick_el1_abi::record_ipc_window_host(window);
     // Only now may EL1 touch the window (its header decides the rest).

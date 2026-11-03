@@ -1053,6 +1053,7 @@ surfaces = [
   { path = "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs", contract = "kernel.el1.stage1-publication" },
   { path = "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs", contract = "kernel.mm.image-page-permissions" },
   { path = "crates/carrick-vmm-hvf/src/trap/stage2_backend.rs", contract = "kernel.el1.gic" },
+  { path = "crates/carrick-vmm-hvf/src/trap/stage2_backend.rs", contract = "kernel.el1.ipc-two-process" },
   { path = "crates/carrick-vmm-hvf/src/trap/stage2_backend.rs", contract = "process.exec.backing" },
   { path = "crates/carrick-vmm-hvf/src/trap/task_mapping_index.rs", contract = "kernel.fork.stage1-image" },
   { path = "crates/carrick-vmm-hvf/src/trap/task_mapping_index.rs", contract = "kernel.mm.backing-maintenance-lookup" },
