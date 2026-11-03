@@ -2953,6 +2953,19 @@ pub struct Counters {
     pub venue_refused_child: [AtomicU64; 513],
 }
 
+/// The authority that declined to serve the operation.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub enum RefusalVenue {
+    Ring,
+    Carrier,
+}
+
 impl Counters {
     pub const fn new() -> Self {
         Self {
@@ -3028,17 +3041,26 @@ impl Counters {
         snapshot
     }
 
-    pub fn record_child_refusal(&self, bucket: usize, child: bool) {
-        if child {
-            self.refused_child[bucket.min(512)].fetch_add(1, Ordering::Relaxed);
+    pub fn record_refusal(
+        &self,
+        ordinal: carrick_guest_arch::NativeOrdinal,
+        origin: carrick_core_abi::service::ServiceOrigin,
+        venue: RefusalVenue,
+    ) {
+        let bucket = ordinal.raw().min(512) as usize;
+        let (total, children) = match venue {
+            RefusalVenue::Ring => (&self.refused, &self.refused_child),
+            RefusalVenue::Carrier => (&self.venue_refused, &self.venue_refused_child),
+        };
+        total[bucket].fetch_add(1, Ordering::Relaxed);
+        if origin == carrick_core_abi::service::ServiceOrigin::Descendant {
+            children[bucket].fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    pub fn record_venue_refusal(&self, ordinal: carrick_guest_arch::NativeOrdinal, child: bool) {
-        let bucket = ordinal.raw().min(512) as usize;
-        self.venue_refused[bucket].fetch_add(1, Ordering::Relaxed);
+    pub fn record_child_refusal(&self, bucket: usize, child: bool) {
         if child {
-            self.venue_refused_child[bucket].fetch_add(1, Ordering::Relaxed);
+            self.refused_child[bucket.min(512)].fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -4519,7 +4541,7 @@ impl Default for InotifyNameCache {
 
 const _: () = {
     assert!(MAX_NAME_CACHE_PATH_LEN == NAME_CACHE_PATH_WORDS * core::mem::size_of::<u64>());
-    assert!(EL1_ABI_LAYOUT_HASH == 0xfb4bbc7b19f51d1e);
+    assert!(EL1_ABI_LAYOUT_HASH == 0x486abff97ce01d37);
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
     assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);

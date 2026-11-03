@@ -504,11 +504,13 @@ pub fn run(root: &Path, args: SmokeSignedArgs) -> Result<SmokeReceipt, SmokeSign
         "smoke-signed: {head} run_id={run_id}\nsmoke-signed: log {}",
         log_path.display()
     );
+    let census_dir = dir.join("census");
     let clock = Instant::now();
     let status = Command::new("./scripts/test-signed.sh")
         .args([PACKAGE, FILTER, "--include-ignored", "--nocapture"])
         .current_dir(&root)
         .env("CARRICK_RUN_ID", &run_id)
+        .env("CARRICK_EL1_CENSUS", &census_dir)
         .env("CARRICK_TEST_TARGET", TARGET)
         .env("CARRICK_TEST_SIGNED_DEADLINE_SECS", DEADLINE_SECS)
         .env_remove("CARRICK_TEST_SIGNED_FEATURES")
@@ -530,7 +532,10 @@ pub fn run(root: &Path, args: SmokeSignedArgs) -> Result<SmokeReceipt, SmokeSign
         tree_unchanged: head_after == head && after == before,
     });
     let mut failures = verdict.failures;
-    if let Err(error) = carrick_spec::syscall_census::check_log(&log, None) {
+    if let Err(error) = carrick_spec::syscall_census::read_directory(&census_dir)
+        .map_err(|error| error.to_string())
+        .and_then(|evidence| carrick_spec::syscall_census::check_log(&evidence, None))
+    {
         failures.push(format!("syscall census: {error}"));
     }
     let artifact = match verdict.executable.as_deref().map(inspect_executable) {

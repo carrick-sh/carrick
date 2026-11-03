@@ -9248,5 +9248,3 @@ mod el1_resume_tests {
         assert_eq!(x0, 0xDEAD_CAFE_DEAD_BEEF);
     }
 }
-
-pub(crate) use stage2_backend::record_native_venue_refusal;

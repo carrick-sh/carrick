@@ -230,7 +230,7 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool) {
                     chdir,
                     crate::native_process_runtime::NativeServiceCall::new(
                         carrick_guest_arch::NativeOrdinal::new(56),
-                        &carrick_el1_abi::Counters::new(),
+                        Box::leak(Box::new(carrick_el1_abi::Counters::new())),
                     ),
                 );
                 entry.settle_service_exit(

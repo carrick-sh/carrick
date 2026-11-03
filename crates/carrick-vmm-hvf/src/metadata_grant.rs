@@ -2556,12 +2556,12 @@ pub(crate) fn abi_stack_ptr<T>(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn retained_abi_region(
-    _custody: &crate::trap::CarrierVmCustody,
+    custody: &crate::trap::CarrierVmCustody,
 ) -> Option<RetainedAbiRegion<'_>> {
     // SAFETY: the synchronous stopped lane retains this carrier's ABI mapping.
     unsafe {
         RetainedAbiRegion::new(
-            carrick_el1_abi::get_el1_region_host_ptr() as *mut u8,
+            custody.abi_region_pointer()?.as_ptr(),
             carrick_el1_abi::EL1_REGION_SIZE as usize,
         )
     }
@@ -2878,6 +2878,7 @@ mod tests {
         .unwrap();
         let identity = ServiceIdentity {
             birth: ServiceBirth {
+                origin: carrick_core_abi::service::ServiceOrigin::Initial,
                 process: TaskKey {
                     id: TaskId::from_registry_allocation(NonZeroI32::new(41).unwrap()),
                     serial: TaskSerial::from_registry_allocation(NonZeroU64::MIN),

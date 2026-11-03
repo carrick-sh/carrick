@@ -10,9 +10,21 @@ fn refusal_snapshot_preserves_caller_populations_without_changing_service_counts
     root.refused[34].fetch_add(1, Ordering::Relaxed);
     root.refused[34].fetch_add(1, Ordering::Relaxed);
     root.record_child_refusal(34, true);
-    root.record_venue_refusal(carrick_guest_arch::NativeOrdinal::new(34), true);
-    root.record_venue_refusal(carrick_guest_arch::NativeOrdinal::new(34), false);
-    root.record_venue_refusal(carrick_guest_arch::NativeOrdinal::new(u64::MAX), true);
+    root.record_refusal(
+        carrick_guest_arch::NativeOrdinal::new(34),
+        carrick_core_abi::service::ServiceOrigin::Descendant,
+        super::RefusalVenue::Carrier,
+    );
+    root.record_refusal(
+        carrick_guest_arch::NativeOrdinal::new(34),
+        carrick_core_abi::service::ServiceOrigin::Initial,
+        super::RefusalVenue::Carrier,
+    );
+    root.record_refusal(
+        carrick_guest_arch::NativeOrdinal::new(u64::MAX),
+        carrick_core_abi::service::ServiceOrigin::Descendant,
+        super::RefusalVenue::Carrier,
+    );
     let snapshot = root.copy_snapshot();
     assert_eq!(snapshot.served[34].load(Ordering::Relaxed), 7);
     assert_eq!(snapshot.forwarded[34].load(Ordering::Relaxed), 5);
@@ -27,4 +39,40 @@ fn refusal_snapshot_preserves_caller_populations_without_changing_service_counts
     let successor = Counters::new().copy_snapshot();
     assert_eq!(successor.refused[34].load(Ordering::Relaxed), 0);
     assert_eq!(root.refused[34].load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn typed_refusal_records_total_and_lineage_in_the_same_carrier() {
+    use super::RefusalVenue;
+    use carrick_core_abi::service::ServiceOrigin;
+    let first = Counters::new();
+    let second = Counters::new();
+    for nr in [34, 512, u64::MAX] {
+        for venue in [RefusalVenue::Ring, RefusalVenue::Carrier] {
+            first.record_refusal(
+                carrick_guest_arch::NativeOrdinal::new(nr),
+                ServiceOrigin::Initial,
+                venue,
+            );
+            first.record_refusal(
+                carrick_guest_arch::NativeOrdinal::new(nr),
+                ServiceOrigin::Descendant,
+                venue,
+            );
+        }
+    }
+    for (bucket, total, children) in [(34, 2, 1), (512, 4, 2)] {
+        assert_eq!(first.refused[bucket].load(Ordering::Relaxed), total);
+        assert_eq!(
+            first.refused_child[bucket].load(Ordering::Relaxed),
+            children
+        );
+        assert_eq!(first.venue_refused[bucket].load(Ordering::Relaxed), total);
+        assert_eq!(
+            first.venue_refused_child[bucket].load(Ordering::Relaxed),
+            children
+        );
+        assert_eq!(second.refused[bucket].load(Ordering::Relaxed), 0);
+        assert_eq!(second.venue_refused[bucket].load(Ordering::Relaxed), 0);
+    }
 }

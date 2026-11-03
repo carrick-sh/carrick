@@ -1106,8 +1106,15 @@ fn refuse_traced_native_exec(
         return false;
     }
     let nr = frame.x[8] as usize;
-    counters.refused[nr].fetch_add(1, Ordering::Relaxed);
-    counters.record_child_refusal(nr, child());
+    counters.record_refusal(
+        carrick_guest_arch::NativeOrdinal::new(frame.x[8]),
+        if child() {
+            carrick_core_abi::service::ServiceOrigin::Descendant
+        } else {
+            carrick_core_abi::service::ServiceOrigin::Initial
+        },
+        carrick_el1_abi::RefusalVenue::Ring,
+    );
     counters.served[nr].fetch_add(1, Ordering::Relaxed);
     frame.x[0] = carrick_syscall_abi::LINUX_EPERM.guest_retval() as u64;
     true
@@ -1240,9 +1247,16 @@ fn arm_native_service_exit(
                     // An in-zone object the ring does not serve yet never
                     // exits to the host: counted ENOSYS here, in ring.
                     let nr = frame.x[8] as usize;
+                    counters.record_refusal(
+                        carrick_guest_arch::NativeOrdinal::new(frame.x[8]),
+                        if child() {
+                            carrick_core_abi::service::ServiceOrigin::Descendant
+                        } else {
+                            carrick_core_abi::service::ServiceOrigin::Initial
+                        },
+                        carrick_el1_abi::RefusalVenue::Ring,
+                    );
                     if nr < 512 {
-                        counters.refused[nr].fetch_add(1, Ordering::Relaxed);
-                        counters.record_child_refusal(nr, child());
                         counters.served[nr].fetch_add(1, Ordering::Relaxed);
                     }
                     NativeServiceStage::Return(carrick_syscall_abi::LINUX_ENOSYS.guest_retval())
@@ -1374,7 +1388,9 @@ fn arm_native_service_exit(
                         chdir,
                         crate::native_process_runtime::NativeServiceCall::new(
                             carrick_guest_arch::NativeOrdinal::new(frame.x[8]),
-                            counters,
+                            // SAFETY: this in-ring path retains the fixed ABI
+                            // mapping for the lifetime of every continuation.
+                            unsafe { &*(carrick_el1_abi::EL1_COUNTERS_BASE as *const Counters) },
                         ),
                     )
                 }

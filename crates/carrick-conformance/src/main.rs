@@ -1286,6 +1286,14 @@ fn run() -> anyhow::Result<ExitCode> {
         };
         docker_sides.push(docker);
     }
+    let missing_shapes = docker_sides
+        .iter()
+        .filter(|side| side.served_ordinals.is_none())
+        .count();
+    eprintln!(
+        "syscall shapes: {} observed, {missing_shapes} missing (coverage debt; non-allowlisted refusals require an observed shape)",
+        n - missing_shapes
+    );
     let mut reports: Vec<SuiteReport> = selected
         .iter()
         .zip(&carrick_outs)

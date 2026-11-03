@@ -182,6 +182,18 @@ pub(crate) struct OwnerCopy<'a, 'p, U, C: carrick_core_abi::EntryContext> {
     pub wait: Option<carrick_core::mm::transaction::CopyoutRequest>,
 }
 impl<U: UserCopy, C: carrick_core_abi::EntryContext> UserCopy for OwnerCopy<'_, '_, U, C> {
+    fn service_origin(&self) -> carrick_core_abi::service::ServiceOrigin {
+        if self
+            .owner
+            .as_deref()
+            .is_some_and(|owner| !owner.is_root_process())
+        {
+            carrick_core_abi::service::ServiceOrigin::Descendant
+        } else {
+            carrick_core_abi::service::ServiceOrigin::Initial
+        }
+    }
+
     fn copy_in(&mut self, dst: &mut [u8], address: u64) -> bool {
         self.inner.copy_in(dst, address)
     }
