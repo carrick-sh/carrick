@@ -280,6 +280,30 @@ fn destroy_container(site: &site::Site) -> Result<(), ScalerError> {
         let _ = command(&["pct", "unlock", VM], cleanup);
         command(&["pct", "destroy", VM, "--purge", "1"], cleanup)?;
     }
+    // `pct destroy` exits 0 with only a task warning when it cannot take the
+    // storage lock to delete the rootfs (live on ctb, where clone traffic
+    // holds `local`'s lock), so prove the volumes are gone, retrying frees
+    // across lock timeouts, and fail loudly instead of leaking 5.5 GB.
+    let mut leaked = Vec::new();
+    while Instant::now() < cleanup {
+        leaked = container_volumes(site, cleanup)?;
+        if leaked.is_empty() {
+            return Ok(());
+        }
+        for volid in &leaked {
+            if let Err(error) = command(&["pvesm", "free", volid], cleanup) {
+                eprintln!("qualification volume {volid} not freed yet: {error}");
+            }
+        }
+        std::thread::sleep(Duration::from_secs(5));
+    }
+    eprintln!("qualification volumes leaked: {}", leaked.join(", "));
+    Err(ScalerError::External(
+        "qualification container volume leaked",
+    ))
+}
+/// Volumes the clone storage still lists for slot 9501.
+fn container_volumes(site: &site::Site, deadline: Instant) -> Result<Vec<String>, ScalerError> {
     let volumes: Value = serde_json::from_str(&command(
         &[
             "pvesh",
@@ -290,16 +314,20 @@ fn destroy_container(site: &site::Site) -> Result<(), ScalerError> {
             "--output-format",
             "json",
         ],
-        cleanup,
+        deadline,
     )?)?;
-    for volume in volumes.as_array().into_iter().flatten() {
-        let volid = volume["volid"]
-            .as_str()
-            .filter(|id| id.starts_with(&format!("{}:{VM}/", site.storage)))
-            .ok_or(ScalerError::Guard("unexpected qualification volume"))?;
-        command(&["pvesm", "free", volid], cleanup)?;
-    }
-    Ok(())
+    volumes
+        .as_array()
+        .ok_or(ScalerError::Guard("invalid storage content listing"))?
+        .iter()
+        .map(|volume| {
+            volume["volid"]
+                .as_str()
+                .filter(|id| id.starts_with(&format!("{}:{VM}/", site.storage)))
+                .map(str::to_owned)
+                .ok_or(ScalerError::Guard("unexpected qualification volume"))
+        })
+        .collect()
 }
 
 /// [`run`] for the gated container template: full-clone it into reserved
