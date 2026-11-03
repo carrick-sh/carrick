@@ -1088,8 +1088,8 @@ fn orphan_volume_reaped_and_verified_after_destroy_lock_timeout() {
     let mut frees = 0;
     let mut run = |args: &[&str]| -> Result<Value, ScalerError> {
         match &args[..2] {
-            ["pvesm", "list"] => Ok(if volume {
-                json!([{"volid":"local:308/vm-308-disk-0.qcow2", "vmid":308}])
+            ["pvesh", "get"] if args[2].contains("/storage/") => Ok(if volume {
+                json!([{"content":"images","volid":"local:308/vm-308-disk-0.qcow2", "vmid":308}])
             } else {
                 json!([])
             }),
@@ -1107,8 +1107,8 @@ fn orphan_volume_reaped_and_verified_after_destroy_lock_timeout() {
         }
     };
     let id = CloneId::try_from(308).unwrap();
-    assert!(clear_clone_volumes("local", id, &mut run).is_err());
-    clear_clone_volumes("local", id, &mut run).unwrap();
+    assert!(clear_clone_volumes("carrick-ctb", "local", id, &mut run).is_err());
+    clear_clone_volumes("carrick-ctb", "local", id, &mut run).unwrap();
     assert!(!volume);
     assert_eq!(frees, 2);
 }
@@ -1118,50 +1118,111 @@ fn orphan_cleanup_refuses_existing_config_and_foreign_volumes() {
     for foreign in [false, true] {
         let mut run = |args: &[&str]| -> Result<Value, ScalerError> {
             match &args[..2] {
-                ["pvesm", "list"] => {
-                    Ok(json!([{"volid":"local:308/disk", "vmid":if foreign {309} else {308}}]))
-                }
+                ["pvesh", "get"] if args[2].contains("/storage/") => Ok(
+                    json!([{"content":"images","volid":if foreign {"other:308/disk"} else {"local:308/disk"}, "vmid":308}]),
+                ),
                 ["pvesh", "get"] => Ok(json!([{"vmid":308,"type":"lxc"}])),
                 _ => panic!("must never free a configured or foreign volume"),
             }
         };
-        assert!(clear_clone_volumes("local", CloneId::try_from(308).unwrap(), &mut run).is_err());
+        assert!(
+            clear_clone_volumes(
+                "carrick-ctb",
+                "local",
+                CloneId::try_from(308).unwrap(),
+                &mut run
+            )
+            .is_err()
+        );
     }
 }
 
+// Fields and volume identities captured read-only on ctb, 2026-11-03.
+fn real_image_inventory() -> Value {
+    json!([
+        {"content":"images","format":"qcow2","vmid":309,"volid":"local:309/vm-309-cloudinit.qcow2","size":4194304},
+        {"content":"images","format":"qcow2","vmid":309,"volid":"local:9001/base-9001-disk-0.qcow2/309/vm-309-disk-0.qcow2","size":107374182400_u64},
+        {"content":"images","format":"qcow2","vmid":9001,"volid":"local:9001/base-9001-disk-0.qcow2"},
+        {"content":"images","format":"qcow2","vmid":9000,"volid":"local:9000/base-9000-disk-0.qcow2"},
+        {"content":"backup","vmid":309,"volid":"local:backup/vzdump-qemu-309.vma.zst"},
+        {"content":"images","vmid":100000,"volid":"local:100000/disk"}
+    ])
+}
+
 #[test]
-fn storage_listing_requires_positive_empty_proof() {
+fn json_inventory_reaps_only_owned_images() {
+    let mut volumes = real_image_inventory();
+    let mut freed = Vec::new();
+    clear_clone_volumes(
+        "carrick-ctb",
+        "local",
+        CloneId::try_from(309).unwrap(),
+        &mut |args| match &args[..2] {
+            ["pvesh", "get"] if args[2].contains("/storage/") => {
+                assert_eq!(
+                    args,
+                    [
+                        "pvesh",
+                        "get",
+                        "/nodes/carrick-ctb/storage/local/content",
+                        "--content",
+                        "images",
+                        "--output-format",
+                        "json"
+                    ]
+                );
+                Ok(volumes.clone())
+            }
+            ["pvesh", "get"] => Ok(json!([])),
+            ["pvesm", "free"] => {
+                freed.push(args[2].to_owned());
+                volumes
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|row| row["volid"] != args[2]);
+                Ok(Value::Null)
+            }
+            _ => panic!("unexpected command"),
+        },
+    )
+    .unwrap();
     assert_eq!(
-        parse_volume_listing(b"Volid Format Type Size VMID\n").unwrap(),
-        json!([])
+        freed,
+        [
+            "local:309/vm-309-cloudinit.qcow2",
+            "local:9001/base-9001-disk-0.qcow2/309/vm-309-disk-0.qcow2"
+        ]
     );
-    assert_eq!(
-        parse_volume_listing(
-            b"Volid Format Type Size VMID\nlocal:308/disk.qcow2 qcow2 images 6442450944 308\n"
-        )
-        .unwrap(),
-        json!([{"volid":"local:308/disk.qcow2","vmid":308}])
+    assert_eq!(volumes.as_array().unwrap().len(), 4);
+    assert!(
+        image_inventory("carrick-ctb", "local", &mut |_| Ok(json!([])))
+            .unwrap()
+            .is_empty()
     );
-    for invalid in [
-        b"".as_slice(),
-        b"lock timeout\n",
-        b"Volid Format Type Size VMID\nwarning: storage lock timeout\n",
-    ] {
-        assert!(parse_volume_listing(invalid).is_err());
-    }
+    assert!(image_inventory("carrick-ctb", "local", &mut |_| Ok(Value::Null)).is_err());
 }
 
 #[test]
 fn successful_free_without_volume_removal_is_not_completion() {
     let mut run = |args: &[&str]| -> Result<Value, ScalerError> {
         match &args[..2] {
-            ["pvesm", "list"] => Ok(json!([{"volid":"local:308/disk", "vmid":308}])),
+            ["pvesh", "get"] if args[2].contains("/storage/") => {
+                Ok(json!([{"content":"images","volid":"local:308/disk", "vmid":308}]))
+            }
             ["pvesh", "get"] => Ok(json!([])),
             ["pvesm", "free"] => Ok(Value::Null), // PVE silently kept the volume.
             _ => panic!("unexpected command"),
         }
     };
-    assert!(clear_clone_volumes("local", CloneId::try_from(308).unwrap(), &mut run).is_err());
+    assert!(
+        clear_clone_volumes(
+            "carrick-ctb",
+            "local",
+            CloneId::try_from(308).unwrap(),
+            &mut run
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -1186,14 +1247,62 @@ fn reservation_refuses_a_vmid_occupied_only_by_storage() {
         ),
         || Ok(true),
         || {
-            Ok(vec![PoolMember {
+            let mut rows =
+                storage_reservations(&image_inventory("carrick-ctb", "local", &mut |_| {
+                    Ok(real_image_inventory())
+                })?);
+            rows.push(PoolMember {
                 id: 308,
                 pool: String::new(),
                 template: false,
-            }])
+            });
+            Ok(rows)
         },
     )
     .unwrap()
     .unwrap();
-    assert_eq!(row.vm.get(), 309);
+    assert_eq!(row.vm.get(), 310);
+}
+
+#[test]
+fn image_inventory_exhaustion_refuses_reservation_and_backs_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ledger = Ledger::default();
+    let mut backoff = Backoff::default();
+    let result = reserve_admitted_clone(
+        &mut ledger,
+        &dir.path().join("ledger.json"),
+        JobKey {
+            run: RunId(1),
+            attempt: 1,
+            job: JobId(2),
+        },
+        (
+            CloneBudget {
+                kvm: Concurrency::ONE,
+                agents: AgentClones::DEFAULT,
+            },
+            CloneLane::Kvm,
+        ),
+        || Ok(true),
+        || {
+            let mut volumes = real_image_inventory().as_array().unwrap().clone();
+            volumes.extend((308..=349).map(
+                |id| json!({"content":"images","vmid":id,"volid":format!("local:{id}/disk")}),
+            ));
+            Ok(storage_reservations(&image_inventory(
+                "carrick-ctb",
+                "local",
+                &mut |_| Ok(Value::Array(volumes.clone())),
+            )?))
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(ScalerError::Guard("no free reserved VMID"))
+    ));
+    assert!(ledger.rows.is_empty());
+    // This is the controller's admission-error policy: no immediate retry.
+    backoff.grow();
+    assert_eq!(backoff.delay(), Duration::from_secs(60));
 }

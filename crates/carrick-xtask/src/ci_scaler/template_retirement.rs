@@ -47,22 +47,12 @@ fn check_with(
     // Inspect storage, not the controller ledger or pool: stopped clones and
     // clones outside the pool also retain bases. Directory-backed agent bases
     // cannot be referenced by raw disks; every qcow2 chain must be readable.
-    let content = format!("/nodes/{}/storage/{}/content", site.node, site.storage);
-    let inventory: Value = serde_json::from_str(&run(&[
-        "pvesh",
-        "get",
-        &content,
-        "--content",
-        "images",
-        "--output-format",
-        "json",
-    ])?)?;
-    let volumes = inventory
-        .as_array()
-        .ok_or(ScalerError::Guard("invalid storage inventory"))?;
+    let volumes = super::live::image_inventory(site.node, site.storage, &mut |args| {
+        Ok(serde_json::from_str(&run(args)?)?)
+    })?;
     let mut bases = Vec::new();
     let mut disks = Vec::new();
-    for volume in volumes {
+    for volume in &volumes {
         let format = volume["format"]
             .as_str()
             .ok_or(ScalerError::Guard("missing volume format"))?;
@@ -195,8 +185,8 @@ mod tests {
                         "--output-format",
                         "json",
                     ] => json!([
-                        {"vmid":"9001","format":"qcow2","volid":"local:9001/base.qcow2"},
-                        {"vmid":308,"format":"qcow2","volid":"local:308/disk.qcow2"}
+                        {"content":"images","vmid":"9001","format":"qcow2","volid":"local:9001/base.qcow2"},
+                        {"content":"images","vmid":308,"format":"qcow2","volid":"local:308/disk.qcow2"}
                     ])
                     .to_string(),
                     ["pvesm", "path", "local:9001/base.qcow2"] => {

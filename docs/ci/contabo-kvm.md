@@ -472,8 +472,10 @@ that changes the site row before its controller is deployed.
 ### Reaping clone volumes after a storage lock timeout
 
 A successful VM DELETE task can leave a disk behind when `local` storage is
-contended. The controller now checks `pvesm list <storage> --vmid <id>` before
-closing a cleanup record. Leftover volumes are counted in the controller log
+contended. The controller checks the JSON image inventory at
+`/nodes/<node>/storage/<storage>/content` before closing a cleanup record.
+Backups and VMIDs outside the owned range are excluded. Leftover volumes
+are counted in the controller log
 (`leaked_volumes_detected`, `leaked_volumes_remaining`, `volumes_reaped`). It
 frees them only after a successful cluster inventory proves that no VM or
 container config owns the VMID, then lists storage again. A storage error
@@ -493,3 +495,7 @@ containers, and refuses template/protected VMIDs by construction. Keep its
 output as sweep evidence. A nonzero exit means cleanup is incomplete; inspect
 the reported VMIDs and storage errors before restarting the controller. Do
 not run a second provisioner during this maintenance operation.
+
+The controller and sweep require root on the selected PVE node to invoke
+`pvesh` and `pvesm free`. The cluster-config check and free are not protected
+by PVE’s per-VMID lock; keep external provisioners stopped during a sweep.
