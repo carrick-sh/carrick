@@ -70,6 +70,7 @@ const BOOT: &str = "smoke_root_exit_then_successor_bootstrap_in_one_carrier";
 const PIPE: &str = "smoke_pipe_round_trips_complete";
 const EXEC: &str = "smoke_exec_replaces_root_image";
 const FORK: &str = "smoke_fork_pipe_then_wait_reaps_child";
+const CENSUS: &str = "smoke_terminal_census_precedes_pool_shutdown_for_two_carriers";
 const NATIVE: &str = "smoke_native_child_exec_after_fork_and_wait";
 
 fn observed(log: &str, exit: i32) -> Observed<'_> {
@@ -88,6 +89,7 @@ fn required_pass_with_informational_failure_is_green() {
         &[
             (EXEC, true),
             (NATIVE, true),
+            (CENSUS, true),
             (FORK, false),
             (PIPE, true),
             (BOOT, true),
@@ -117,6 +119,7 @@ fn all_pass_with_runner_success_is_green() {
         &[
             (EXEC, true),
             (NATIVE, true),
+            (CENSUS, true),
             (FORK, true),
             (PIPE, true),
             (BOOT, true),
@@ -133,6 +136,7 @@ fn failed_successor_bootstrap_is_red() {
         &[
             (EXEC, true),
             (NATIVE, true),
+            (CENSUS, true),
             (FORK, false),
             (PIPE, true),
             (BOOT, false),
@@ -169,6 +173,7 @@ fn cleanup_leak_is_red() {
         &[
             (EXEC, true),
             (NATIVE, true),
+            (CENSUS, true),
             (FORK, true),
             (PIPE, true),
             (BOOT, true),
@@ -187,6 +192,7 @@ fn test_outside_the_smoke_set_is_red() {
         &[
             (EXEC, true),
             (NATIVE, true),
+            (CENSUS, true),
             (FORK, true),
             (PIPE, true),
             (BOOT, true),
@@ -206,6 +212,7 @@ fn dirty_or_moved_tree_never_qualifies() {
         &[
             (EXEC, true),
             (NATIVE, true),
+            (CENSUS, true),
             (FORK, true),
             (PIPE, true),
             (BOOT, true),
@@ -255,6 +262,7 @@ fn carrier_fatal_during_a_passing_required_case_is_red() {
         &[
             (EXEC, true),
             (NATIVE, true),
+            (CENSUS, true),
             (FORK, true),
             (PIPE, true),
             (BOOT, true),
@@ -281,6 +289,7 @@ fn carrier_fatal_in_an_informational_case_is_recorded_not_decisive() {
         &[
             (EXEC, true),
             (NATIVE, true),
+            (CENSUS, true),
             (FORK, false),
             (PIPE, true),
             (BOOT, true),
@@ -305,6 +314,7 @@ fn carrier_fatal_outside_any_case_is_red() {
             &[
                 (EXEC, true),
                 (NATIVE, true),
+                (CENSUS, true),
                 (FORK, true),
                 (PIPE, true),
                 (BOOT, true)
@@ -316,4 +326,30 @@ fn carrier_fatal_outside_any_case_is_red() {
     let verdict = evaluate(&observed(&text, 0));
     assert!(!verdict.passed);
     assert_eq!(verdict.fatals[0].case, None);
+}
+
+#[test]
+fn missing_terminal_census_witness_is_red() {
+    let text = log(
+        &[
+            (EXEC, true),
+            (NATIVE, true),
+            (FORK, true),
+            (PIPE, true),
+            (BOOT, true),
+        ],
+        true,
+        0,
+    );
+    let verdict = evaluate(&observed(&text, 0));
+    assert!(
+        !verdict.passed,
+        "missing terminal publication witness must fail smoke"
+    );
+    assert!(
+        verdict
+            .failures
+            .iter()
+            .any(|failure| failure.contains(CENSUS))
+    );
 }

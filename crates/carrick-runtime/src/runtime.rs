@@ -808,7 +808,11 @@ fn run_address_space_with_hvf_and_dispatcher(
                 Ok(())
             },
             |terminal| carrier.record_terminal(terminal),
-            |_| Ok(()),
+            |_| {
+                crate::el1_census::publish_terminal(Some(carrier.scope())).map_err(|error| {
+                    RuntimeError::Configuration(format!("publish terminal census: {error}"))
+                })
+            },
         );
         // Keep mutating control live through VM destruction, terminal receipt,
         // and optional lifecycle-artifact publication.  Only then publish the

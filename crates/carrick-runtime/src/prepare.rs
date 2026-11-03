@@ -404,17 +404,28 @@ fn run_prepared_kvm_pool_with_debug(
     drop(factory);
     crate::el1_census::init_from_env();
     let completion = completed_rx.recv();
+    // The terminal owner has completed the root. Publish before pool teardown
+    // and before returning its result to the CLI or embedder.
+    let census = if crate::el1_census::enabled() {
+        physical
+            .syscall_counters()
+            .map_err(std::io::Error::other)
+            .and_then(|counters| {
+                crate::el1_census::publish_counters_terminal(
+                    Some(&census_scope),
+                    &counters,
+                    carrick_spec::syscall_census::CensusIsa::X86_64,
+                )
+            })
+    } else {
+        Ok(())
+    };
     let shutdown = pool.shutdown();
-    // Pool workers have joined; retain the exact carrier mapping for the
-    // snapshot even when guest execution returned a failure.
-    if let Ok(counters) = physical.syscall_counters() {
-        crate::el1_census::write_counters_at_teardown(
-            Some(&census_scope),
-            &counters,
-            carrick_spec::syscall_census::CensusIsa::X86_64,
-        );
-    }
     let authority_refusals = stats.authority_refusals().unwrap_or_default();
+    census.map_err(|error| PreparedKvmPoolFailure {
+        error: RuntimeError::Configuration(format!("publish terminal census: {error}")),
+        authority_refusals: authority_refusals.clone(),
+    })?;
     let outcome = completion
         .map_err(|error| PreparedKvmPoolFailure {
             error: RuntimeError::Configuration(format!("KVM executor completion: {error}")),

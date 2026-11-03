@@ -92,6 +92,8 @@ fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
     );
 
     let run = Command::new(&cli)
+        .current_dir(dir.path())
+        .env_remove("CARRICK_EL1_CENSUS")
         .timeout(Duration::from_secs(5))
         .env("CARRICK_HOME", &home)
         .env("CARRICK_RUN_ID", "x86-kvm-hello-test")
@@ -126,6 +128,11 @@ fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
         String::from_utf8_lossy(&run.stderr)
     );
 
+    assert!(
+        !dir.path().join("target/carrick-census").exists(),
+        "carrick run without CARRICK_EL1_CENSUS must not emit a census"
+    );
+
     // The JSON run exposes a guest-entry receipt. Exact CPL0 lane identity
     // plus two shared-kernel entries and the write's host forward distinguish
     // this from the retired carrick-x86 bringup_fns trap path.
@@ -133,6 +140,7 @@ fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
         .timeout(Duration::from_secs(5))
         .env("CARRICK_HOME", &home)
         .env("CARRICK_RUN_ID", "x86-kvm-hello-receipt-test")
+        .env("CARRICK_EL1_CENSUS", dir.path().join("census"))
         .args([
             "run",
             "--json",
@@ -165,6 +173,16 @@ fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
         json["report"]["execution_witness"]["host_forwards"], 1,
         "only write crosses host dispatch; exit uses the owned root receipt"
     );
+    let census_files: Vec<_> = std::fs::read_dir(dir.path().join("census"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(census_files.len(), 1);
+    assert_eq!(census_files[0].extension().unwrap(), "json");
+    let census: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&census_files[0]).unwrap()).unwrap();
+    assert_eq!(census["refusal_evidence"]["complete"], true);
+    assert_eq!(census["refusal_evidence"]["isa"], "x86_64");
 }
 
 #[test]

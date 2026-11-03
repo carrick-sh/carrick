@@ -16,8 +16,8 @@
 //! Emission is opt-in through a nonempty `CARRICK_EL1_CENSUS` destination.
 //! Unset, empty, or exact `0` emits no census and enables no timing hooks.
 //! `CARRICK_EL1_CENSUS=<directory>` selects another destination for
-//! `<directory>/<CARRICK_RUN_ID or "run">-<pid>-<unique>.json` at teardown, while the
-//! EL1 region is still mapped. Disabled, each hook costs one relaxed load.
+//! `<directory>/<CARRICK_RUN_ID or "run">-<pid>-<unique>.json` before terminal
+//! delivery, while EL1 is still mapped. Disabled, each hook costs one relaxed load.
 //! Counts are exact (no sampling); timing uses the per-thread CPU clock.
 
 use std::sync::OnceLock;
@@ -165,7 +165,7 @@ pub struct Census {
     /// The carrier's system CPU for the whole run.
     #[serde(default)]
     pub process_sys_ns: u64,
-    /// Wall time from EL1 setup to teardown.
+    /// Wall time from EL1 setup to terminal publication.
     #[serde(default)]
     pub wall_ns: u64,
     pub rows: Vec<CensusRow>,
@@ -320,30 +320,32 @@ fn refusal_evidence(
     evidence
 }
 
-/// Write the census once, at carrier teardown while the EL1 region is still
-/// mapped. A failure to write is reported, never silently dropped.
-pub fn write_at_teardown(run_id: Option<&carrick_kernel::kernel::CarrierScopeId>) {
+/// Persist the mapped census before handing the terminal result to the caller.
+/// Publication failures fail the run instead of delivering unqualified success.
+pub fn publish_terminal(
+    run_id: Option<&carrick_kernel::kernel::CarrierScopeId>,
+) -> std::io::Result<()> {
     init_from_env();
     if !enabled() {
-        return;
+        return Ok(());
     }
-    publish(snapshot(run_id), destination());
+    publish(snapshot(run_id), destination())
 }
 
-/// Publish an ISA's mapped counters before its VM is retired.
-pub fn write_counters_at_teardown(
+/// Persist an ISA's exact mapped counters before terminal delivery.
+pub fn publish_counters_terminal(
     run_id: Option<&carrick_kernel::kernel::CarrierScopeId>,
     counters: &carrick_el1_abi::Counters,
     isa: carrick_spec::syscall_census::CensusIsa,
-) {
+) -> std::io::Result<()> {
     init_from_env();
     if !enabled() {
-        return;
+        return Ok(());
     }
     publish(
         snapshot_counters(run_id, Some(counters), isa),
         destination(),
-    );
+    )
 }
 
 fn destination() -> std::path::PathBuf {
@@ -354,32 +356,28 @@ fn destination() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("target/carrick-census"))
 }
 
-fn publish(census: Census, directory: std::path::PathBuf) {
+fn publish(census: Census, directory: std::path::PathBuf) -> std::io::Result<()> {
+    use std::io::Write;
+    std::fs::create_dir_all(&directory)?;
+    // Readers admit only .json files. Reserve a unique final name, but keep
+    // the unpublished body under a different extension until it is durable.
     let name = format!(
         "{}-{}-",
         census.run_id.as_deref().unwrap_or("run"),
         census.pid
     );
-    let path = &directory;
-    let result = std::fs::create_dir_all(&directory).and_then(|()| {
-        // Multiple embedded carriers may share both run ID and host PID.
-        // Retain one uniquely created file for every publication.
-        let file = tempfile::Builder::new()
-            .prefix(&name)
-            .suffix(".json")
-            .tempfile_in(&directory)?;
-        let body = serde_json::to_vec_pretty(&census).map_err(std::io::Error::other)?;
-        std::fs::write(file.path(), body)?;
-        file.keep().map_err(|error| error.error)?;
-        Ok(())
-    });
-    if let Err(error) = result {
-        tracing::error!(path = %path.display(), %error, "EL1 census write failed");
-        eprintln!(
-            "carrick: EL1 census write to {} failed: {error}",
-            path.display()
-        );
-    }
+    let mut file = tempfile::Builder::new()
+        .prefix(&name)
+        .suffix(".pending")
+        .tempfile_in(&directory)?;
+    let body = serde_json::to_vec_pretty(&census).map_err(std::io::Error::other)?;
+    file.write_all(&body)?;
+    file.as_file().sync_all()?;
+    let final_path = file.path().with_extension("json");
+    file.persist_noclobber(&final_path)
+        .map_err(|error| error.error)?;
+    std::fs::File::open(&directory)?.sync_all()?;
+    Ok(())
 }
 
 /// One syscall class summed over several censuses.
@@ -603,6 +601,42 @@ mod tests {
     }
 
     #[test]
+    fn serial_host_terminal_census_is_off_without_a_destination() {
+        const CHILD: &str = "CARRICK_CENSUS_POLICY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            publish_terminal(None).unwrap();
+            assert!(!enabled());
+            return;
+        }
+        for setting in [None, Some(""), Some("0")] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "el1_census::tests::serial_host_terminal_census_is_off_without_a_destination",
+                ])
+                .env(CHILD, "1")
+                .env_remove("CARRICK_EL1_CENSUS")
+                .current_dir(directory.path());
+            if let Some(setting) = setting {
+                command.env("CARRICK_EL1_CENSUS", setting);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "the fresh-process policy witness must actually run"
+            );
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
     fn sequential_carriers_with_one_grouping_id_preserve_every_census() {
         use carrick_spec::syscall_census::{CensusIsa, MARKER};
         let directory = tempfile::tempdir().unwrap();
@@ -616,11 +650,13 @@ mod tests {
         publish(
             snapshot_counters(None, Some(&refused), CensusIsa::Aarch64),
             directory.path().to_owned(),
-        );
+        )
+        .unwrap();
         publish(
             snapshot_counters(None, Some(&clean), CensusIsa::Aarch64),
             directory.path().to_owned(),
-        );
+        )
+        .unwrap();
         let evidence = carrick_conformance::census::read_directory(directory.path()).unwrap();
         assert_eq!(
             evidence
@@ -634,6 +670,23 @@ mod tests {
                 .unwrap_err()
                 .contains("allowlisted")
         );
+    }
+
+    #[test]
+    fn terminal_publication_returns_a_complete_file_and_propagates_io_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        publish(census(vec![row(34, 1, 0)]), directory.path().to_owned()).unwrap();
+        let paths: Vec<_> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].extension().unwrap(), "json");
+        let decoded: Census = serde_json::from_slice(&std::fs::read(&paths[0]).unwrap()).unwrap();
+        assert_eq!(decoded.rows, vec![row(34, 1, 0)]);
+        // A regular file cannot serve as a destination directory. The terminal
+        // owner must receive this failure, rather than an unqualified success.
+        assert!(publish(census(vec![]), paths[0].clone()).is_err());
     }
 
     #[test]
