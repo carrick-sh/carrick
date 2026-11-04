@@ -276,3 +276,10 @@ exposed a group-writable destination under host umask `0007`: the guest wrote
 creation, that same binding returns the guest's status 7 and reads one complete
 x86_64 census file. Its failure assertion retains stdout and stderr so future
 publication errors identify their cause.
+
+Collectors that pre-create a census destination also request private
+permissions explicitly: `tempfile` directories otherwise inherit the host's
+creation mask. The conformance runner requests `0700` on its census temporary
+directory, and the signed smoke fixture uses private directory creation. The
+successive-carrier unit binding lets the production publisher create its census
+subdirectory and then reuses that same directory for both publications.

@@ -14,6 +14,7 @@
 
 use crate::manifest::Suite;
 use std::fs::File;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -657,6 +658,7 @@ pub(crate) fn run_one(
     let census = if matches!(engine, Engine::Carrick) {
         let directory = tempfile::Builder::new()
             .prefix("census-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
             .tempdir_in(raw_dir())?;
         cmd.env("CARRICK_EL1_CENSUS", directory.path().canonicalize()?);
         Some(directory)

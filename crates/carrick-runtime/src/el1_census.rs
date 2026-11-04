@@ -661,6 +661,7 @@ mod tests {
     fn sequential_carriers_with_one_grouping_id_preserve_every_census() {
         use carrick_spec::syscall_census::{CensusIsa, MARKER};
         let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("census");
         let refused = carrick_el1_abi::Counters::new();
         refused.record_refusal(
             carrick_guest_arch::NativeOrdinal::new(34),
@@ -670,15 +671,15 @@ mod tests {
         let clean = carrick_el1_abi::Counters::new();
         publish(
             snapshot_counters(None, Some(&refused), CensusIsa::Aarch64),
-            directory.path().to_owned(),
+            destination.clone(),
         )
         .unwrap();
         publish(
             snapshot_counters(None, Some(&clean), CensusIsa::Aarch64),
-            directory.path().to_owned(),
+            destination.clone(),
         )
         .unwrap();
-        let evidence = carrick_conformance::census::read_directory(directory.path()).unwrap();
+        let evidence = carrick_conformance::census::read_directory(&destination).unwrap();
         assert_eq!(
             evidence
                 .lines()
