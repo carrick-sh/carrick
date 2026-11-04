@@ -693,7 +693,11 @@ SendMessage.
   jobs (`macos-build`, `macos-clippy`, `macos-authority`) and the KVM gate,
   which PRs never run. So admin-merge only stacks that touch no x86, KVM,
   HAL or CPL0 code; enqueue those stacks instead, or attach a `kvm-tests`
-  run on the exact head.
+  run on the exact head. **The owner may direct an admin merge of x86, KVM,
+  HAL or CPL0 code** (owner, 2026-11-04, #231), for example when the merge
+  queue is stalled. Record the direction on the PR, announce the landing
+  SHA on #231 with the KVM lane to watch, and treat main's next
+  kernel-runtime KVM receipt as that change's KVM evidence.
   Workflow: [`.agents/skills/carrick-stacked-prs`](.agents/skills/carrick-stacked-prs/SKILL.md).
 - **Lanes:** hosted Linux/macOS jobs in `ci.yml`. Heavy pull requests run the
   full macOS suite; same-repo PRs run it on the self-hosted `carrick-macos-ci`
