@@ -5,9 +5,13 @@ Closed PRs and runs already blocked by a named main defect should not occupy
 `scripts/ci/patches/1628-ci-fairness.patch` with `git apply`, then deletes the
 patch. It adds one observer workflow, leaving Hosted CI's existing supersession
 concurrency unchanged. Install the observer on the default branch before testing
-it: `workflow_run` only triggers workflows present there.
+it: `repository_dispatch` only triggers workflows present there.
 
-The observer has no concurrency group and uses an Ubuntu hosted runner. It runs
+The one-shot classifier uses an Ubuntu hosted runner and a concurrency group
+keyed by run and job ID
+with `cancel-in-progress: false`; closure events have a separate PR key.
+The job subkey prevents simultaneous distinct failures from replacing a pending
+invocation. Duplicate deliveries of the same job may coalesce safely. It runs
 only default-branch xtask code, never a PR checkout, artifact or executable.
 `pull_request_target: closed` is intentional: ordinary `pull_request: closed`
 has a read-only token for forks, so cannot cancel their runs. The target event
@@ -17,10 +21,21 @@ API PR association matches. It cannot cancel merge groups, other workflows or
 unassociated runs. It enumerates active statuses with pagination rather than
 scanning historical runs. No branch-name comparison is used for fork identity.
 
-For `workflow_run: in_progress`, the observer watches only that Hosted CI PR run,
-including rerun attempts. Every minute, for at most five hours, it fetches the
-current attempt's jobs. While a self-hosted macOS job remains queued or running,
-it checks completed failed jobs against the current open `main-defect` issues.
+GitHub does **not** support `workflow_job` as an Actions workflow trigger.
+A trusted webhook relay must forward only `workflow_job` events whose action is
+`completed` and conclusion is `failure` as `repository_dispatch` with event type
+`ci-job-failed` and the original payload as `client_payload`. The relay must
+verify GitHub's webhook signature and repository identity before forwarding;
+its App needs Contents write for dispatch. That separate credential is never
+provided to this workflow (which has only Actions write and read permissions).
+Provisioning this relay is a director deployment prerequisite, not implemented
+by this patch. Do not claim the watcher is live until delivery is witnessed.
+
+Each invocation classifies exactly the triggering job and exits, with no sleeps,
+polling or long-lived observer. It rechecks the run's workflow/event and current
+attempt membership through GitHub, rejecting stale events from older attempts.
+While a self-hosted macOS job remains queued or running, it compares that job's
+log against current open `main-defect` issues.
 All Hosted CI jobs except `cache-warm` feed `ci-ok`; the cache publisher is
 excluded. Each issue must contain a separate line such as:
 
@@ -41,8 +56,9 @@ link. GitHub exposes run cancellation, not individual job cancellation: the
 entire doomed Hosted CI run is cancelled, which releases its remaining macOS
 jobs and preserves the completed failure logs. It never turns that failure into
 a green check. Jobs using `always()` can finish their short cleanup/gate work.
-The observer costs one hosted Linux slot while watching; it never consumes a
-Mac slot. The five-hour observer limit is explicit, not a test timeout change.
+The classifier occupies a hosted Linux slot for one API pass, with a five-minute
+workflow safety bound; it never consumes a Mac slot. Compilation may dominate
+startup time; there is no promise of seconds from delivery on a cold runner.
 
 ## Giving the fix capacity
 
@@ -60,7 +76,8 @@ otherwise ordinary queued jobs can consume it. This requires real extra runner
 capacity and a director-owned workflow/routing change; this patch does not
 invent a label on the existing three runners or claim queue priority.
 
-GitHub documents [workflow events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows),
+GitHub documents [concurrency queues](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency),
+[workflow events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows),
 [run cancellation](https://docs.github.com/en/rest/actions/workflow-runs#cancel-a-workflow-run)
 and [self-hosted routing](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/use-in-a-workflow).
 

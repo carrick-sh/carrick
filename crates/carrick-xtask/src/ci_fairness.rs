@@ -16,8 +16,8 @@ pub enum FairnessCommand {
     Classify { issues: PathBuf, log: PathBuf },
     /// Cancel active Hosted CI runs belonging to this closed PR.
     Closed { repo: String, pr: u64 },
-    /// Observe a single Hosted CI run until completion or a known test failure.
-    Watch { repo: String, run: u64 },
+    /// Classify one completed workflow_job webhook (or forwarded client_payload).
+    Completed { repo: String, event: PathBuf },
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,6 +130,15 @@ fn failed_job(job: &Value) -> bool {
             .is_some_and(|name| !name.starts_with("cache-warm"))
 }
 
+/// Event qualification is deliberately independent of untrusted log contents.
+pub fn completed_candidate(event: &Value) -> Option<(u64, u64)> {
+    let job = &event["workflow_job"];
+    if event["action"] != "completed" || !failed_job(job) {
+        return None;
+    }
+    Some((job["run_id"].as_u64()?, job["id"].as_u64()?))
+}
+
 fn macos_remaining(jobs: &[Value]) -> bool {
     jobs.iter().any(|job| {
         job["status"] != "completed"
@@ -142,26 +151,25 @@ fn macos_remaining(jobs: &[Value]) -> bool {
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 fn api(repo: &str, endpoint: &str, method: &str) -> Result<Vec<u8>> {
-    let output = Command::new("gh")
-        .args([
+    Ok(crate::ci_scaler::execute(
+        Command::new("gh").args([
             "api",
             "--method",
             method,
             &format!("repos/{repo}/{endpoint}"),
-        ])
-        .output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "GitHub {method} {endpoint}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
-    }
-    Ok(output.stdout)
+        ]),
+        &[],
+        Duration::from_secs(60),
+    )?)
 }
 
 fn json(repo: &str, endpoint: &str) -> Result<Value> {
-    Ok(serde_json::from_slice(&api(repo, endpoint, "GET")?)?)
+    Ok(crate::ci_scaler::github::Github.request(
+        "GET",
+        &format!("repos/{repo}/{endpoint}"),
+        None,
+        false,
+    )?)
 }
 
 fn pages(repo: &str, endpoint: &str, field: Option<&str>) -> Result<Vec<Value>> {
@@ -240,66 +248,50 @@ pub fn run(args: FairnessArgs, writer: &mut dyn Write) -> Result<()> {
                 }
             }
         }
-        FairnessCommand::Watch { repo, run } => {
-            // Bounded API observer, not a self-hosted runner. Job logs become available
-            // on job completion, before the containing workflow completes.
-            for _ in 0..300 {
-                let current = json(&repo, &format!("actions/runs/{run}"))?;
-                if !hosted_pr_run(&current) || current["status"] == "completed" {
-                    return Ok(());
-                }
-                // The close event's census can race a newly created/rerun CI run.
-                // A fresh observer also releases runs started after PR closure.
-                if let Some(prs) = current["pull_requests"].as_array() {
-                    let mut all_closed = !prs.is_empty();
-                    for pr in prs {
-                        let number = pr["number"]
-                            .as_u64()
-                            .ok_or("missing associated PR number")?;
-                        if json(&repo, &format!("pulls/{number}"))?["state"] != "closed" {
-                            all_closed = false;
-                        }
-                    }
-                    if all_closed {
-                        cancel(&repo, run, "all associated PRs are closed", writer)?;
-                        return Ok(());
-                    }
-                }
-                let attempt = current["run_attempt"]
-                    .as_u64()
-                    .ok_or("missing run attempt")?;
-                let jobs = pages(
-                    &repo,
-                    &format!("actions/runs/{run}/attempts/{attempt}/jobs"),
-                    Some("jobs"),
-                )?;
-                if macos_remaining(&jobs) {
-                    let issues: Vec<Defect> = serde_json::from_value(Value::Array(pages(
-                        &repo,
-                        "issues?state=open&labels=main-defect",
-                        None,
-                    )?))?;
-                    for job in jobs.iter().filter(|job| failed_job(job)) {
-                        let job_id = id(job)?;
-                        let log = api(&repo, &format!("actions/jobs/{job_id}/logs"), "GET")?;
-                        let matches = classify(&issues, &String::from_utf8(log)?);
-                        if let Some(found) = matches.first() {
-                            cancel(
-                                &repo,
-                                run,
-                                &format!(
-                                    "`{}` failed; open main defect https://github.com/{repo}/issues/{}",
-                                    found.test, found.issue
-                                ),
-                                writer,
-                            )?;
-                            return Ok(());
-                        }
-                    }
-                }
-                std::thread::sleep(Duration::from_secs(60));
+        FairnessCommand::Completed { repo, event } => {
+            let payload: Value = serde_json::from_slice(&fs::read(event)?)?;
+            let payload = payload.get("client_payload").unwrap_or(&payload);
+            let Some((run, job_id)) = completed_candidate(payload) else {
+                return Ok(());
+            };
+            let current = json(&repo, &format!("actions/runs/{run}"))?;
+            if !hosted_pr_run(&current) || current["status"] == "completed" {
+                return Ok(());
             }
-            return Err("Hosted CI observer reached its five-hour deadline".into());
+            let attempt = current["run_attempt"]
+                .as_u64()
+                .ok_or("missing run attempt")?;
+            let jobs = pages(
+                &repo,
+                &format!("actions/runs/{run}/attempts/{attempt}/jobs"),
+                Some("jobs"),
+            )?;
+            // Membership in the current attempt authenticates forwarded IDs and
+            // rejects delayed failure events from an earlier rerun attempt.
+            if !jobs
+                .iter()
+                .any(|job| job["id"].as_u64() == Some(job_id) && failed_job(job))
+                || !macos_remaining(&jobs)
+            {
+                return Ok(());
+            }
+            let issues: Vec<Defect> = serde_json::from_value(Value::Array(pages(
+                &repo,
+                "issues?state=open&labels=main-defect",
+                None,
+            )?))?;
+            let log = api(&repo, &format!("actions/jobs/{job_id}/logs"), "GET")?;
+            if let Some(found) = classify(&issues, &String::from_utf8(log)?).first() {
+                cancel(
+                    &repo,
+                    run,
+                    &format!(
+                        "`{}` failed; open main defect https://github.com/{repo}/issues/{}",
+                        found.test, found.issue,
+                    ),
+                    writer,
+                )?;
+            }
         }
     }
     Ok(())

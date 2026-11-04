@@ -1,21 +1,23 @@
 diff --git a/.github/workflows/ci-fairness.yml b/.github/workflows/ci-fairness.yml
 new file mode 100644
-index 000000000..9ef61f634
 --- /dev/null
 +++ b/.github/workflows/ci-fairness.yml
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,47 @@
 +name: Hosted CI fairness
 +
 +on:
 +  # Trusted base context, including fork closures; never check out PR code.
 +  pull_request_target:
 +    types: [closed]
-+  workflow_run:
-+    workflows: [Hosted CI]
-+    types: [in_progress]
++  # workflow_job is webhook-only. A trusted relay forwards completed failures.
++  repository_dispatch:
++    types: [ci-job-failed]
 +
-+# Deliberately no concurrency group: neither a closure nor another run may
-+# evict an observer. This workflow never occupies carrick-macos-ci capacity.
++# Dedupe each run/job event without dropping another failed job event.
++# Closure events use a separate PR key so they cannot suppress job failures.
++concurrency:
++  group: ci-fairness-${{ github.event_name }}-${{ github.event.client_payload.workflow_job.run_id || github.event.pull_request.number }}-${{ github.event.client_payload.workflow_job.id || 'closed' }}
++  cancel-in-progress: false
 +permissions:
 +  contents: read
 +  actions: write
@@ -24,9 +26,9 @@ index 000000000..9ef61f634
 +
 +jobs:
 +  observe:
-+    if: github.event_name == 'pull_request_target' || github.event.workflow_run.event == 'pull_request'
++    if: github.event_name == 'pull_request_target' || (github.event.client_payload.action == 'completed' && github.event.client_payload.workflow_job.conclusion == 'failure')
 +    runs-on: ubuntu-latest
-+    timeout-minutes: 320
++    timeout-minutes: 5
 +    steps:
 +      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 +        with:
@@ -41,10 +43,10 @@ index 000000000..9ef61f634
 +          REPO: ${{ github.repository }}
 +          EVENT: ${{ github.event_name }}
 +          PR: ${{ github.event.pull_request.number }}
-+          RUN: ${{ github.event.workflow_run.id }}
++          EVENT_PATH: ${{ github.event_path }}
 +        run: |
 +          if [ "$EVENT" = pull_request_target ]; then
 +            target/debug/carrick-xtask ci-fairness closed "$REPO" "$PR"
 +          else
-+            target/debug/carrick-xtask ci-fairness watch "$REPO" "$RUN"
++            target/debug/carrick-xtask ci-fairness completed "$REPO" "$EVENT_PATH"
 +          fi

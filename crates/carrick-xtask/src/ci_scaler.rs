@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 mod assignment;
-mod github;
+pub(crate) mod github;
 pub(crate) use github::dispatch_workflow_unchanged;
 mod live;
 mod mac;

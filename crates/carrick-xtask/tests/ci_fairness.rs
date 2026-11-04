@@ -1,5 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-use carrick_xtask::ci_fairness::{Defect, classify, closed_candidate};
+use carrick_xtask::ci_fairness::{Defect, classify, closed_candidate, completed_candidate};
 use serde_json::json;
 
 fn issues() -> Vec<Defect> {
@@ -109,8 +109,15 @@ fn observer_fixture(command: &str, responses: serde_json::Value) -> (String, Str
     script.push_str("*) printf 'unexpected API call: %s\\n' \"$4\" >&2; exit 1 ;;\nesac\n");
     std::fs::write(&gh, script).unwrap();
     std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let event = dir.path().join("event.json");
+    std::fs::write(&event, json!({"client_payload":{"action":"completed","workflow_job":{"id":3,"run_id":42,"status":"completed","conclusion":"failure","name":"lint-gates"}}}).to_string()).unwrap();
+    let argument = if command == "completed" {
+        event.to_str().unwrap()
+    } else {
+        "42"
+    };
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
-        .args(["ci-fairness", command, "owner/repo", "42"])
+        .args(["ci-fairness", command, "owner/repo", argument])
         .env("PATH", dir.path())
         .env("CALLS", &calls)
         .env_remove("GITHUB_STEP_SUMMARY")
@@ -159,7 +166,7 @@ fn closed_cli_cancels_only_associated_active_hosted_ci_runs() {
 #[cfg(unix)]
 fn watcher_cli_cancels_exact_defect_with_remaining_mac_job() {
     let (out, calls) = observer_fixture(
-        "watch",
+        "completed",
         json!({
             "repos/owner/repo/actions/runs/42":{"id":42,"event":"pull_request","path":".github/workflows/ci.yml","status":"in_progress","run_attempt":2,"pull_requests":[{"number":1}]},
             "repos/owner/repo/pulls/1":{"state":"open"},
@@ -177,24 +184,52 @@ fn watcher_cli_cancels_exact_defect_with_remaining_mac_job() {
 }
 
 #[test]
+fn completed_events_only_classify_required_failed_jobs() {
+    let event = json!({"action":"completed","workflow_job":{"id":3,"run_id":42,"status":"completed","conclusion":"failure","name":"lint-gates"}});
+    assert_eq!(completed_candidate(&event), Some((42, 3)));
+    for (field, value) in [
+        ("status", json!("in_progress")),
+        ("conclusion", json!("success")),
+        ("conclusion", json!("cancelled")),
+        ("conclusion", json!("timed_out")),
+        ("name", json!("cache-warm")),
+        ("id", serde_json::Value::Null),
+    ] {
+        let mut other = event.clone();
+        other["workflow_job"][field] = value;
+        assert_eq!(completed_candidate(&other), None);
+    }
+    let mut other = event;
+    other["action"] = json!("queued");
+    assert_eq!(completed_candidate(&other), None);
+}
+
+#[test]
 #[cfg(unix)]
-fn watcher_cli_closes_census_race_but_never_cancels_merge_group() {
-    let (_, calls) = observer_fixture(
-        "watch",
-        json!({
-            "repos/owner/repo/actions/runs/42":{"event":"pull_request","path":".github/workflows/ci.yml","status":"in_progress","pull_requests":[{"number":1}]},
-            "repos/owner/repo/pulls/1":{"state":"closed"},
-            "repos/owner/repo/actions/runs/42/cancel":""
-        }),
-    );
-    assert!(calls.contains("POST"));
-    let (_, calls) = observer_fixture(
-        "watch",
-        json!({
-            "repos/owner/repo/actions/runs/42":{"event":"merge_group","path":".github/workflows/ci.yml","status":"in_progress"}
-        }),
-    );
-    assert!(!calls.contains("POST"));
+fn completed_cli_ignores_other_workflows_and_old_attempt_jobs() {
+    for run in [
+        json!({"event":"merge_group","path":".github/workflows/ci.yml","status":"in_progress"}),
+        json!({"event":"pull_request","path":".github/workflows/other.yml","status":"in_progress"}),
+        json!({"event":"pull_request","path":".github/workflows/ci.yml","status":"completed"}),
+    ] {
+        let (_, calls) =
+            observer_fixture("completed", json!({"repos/owner/repo/actions/runs/42":run}));
+        assert_eq!(calls.lines().count(), 1);
+    }
+    for jobs in [
+        json!([]),
+        json!([{"id":3,"name":"lint-gates","status":"completed","conclusion":"failure"}]),
+        json!([{"id":8,"name":"lint-gates","status":"completed","conclusion":"failure"},{"id":4,"status":"queued","labels":["carrick-macos-ci"]}]),
+    ] {
+        let (_, calls) = observer_fixture(
+            "completed",
+            json!({
+                "repos/owner/repo/actions/runs/42":{"event":"pull_request","path":".github/workflows/ci.yml","status":"in_progress","run_attempt":2},
+                "repos/owner/repo/actions/runs/42/attempts/2/jobs?per_page=100&page=1":{"jobs":jobs}
+            }),
+        );
+        assert_eq!(calls.lines().count(), 2);
+    }
 }
 
 #[test]
@@ -214,4 +249,24 @@ fn completed_cancellation_race_does_not_abort_closure_census() {
     let (out, calls) = observer_fixture("closed", responses);
     assert!(out.contains("already completed"));
     assert!(calls.contains("POST repos/owner/repo/actions/runs/8/cancel"));
+}
+
+#[test]
+#[cfg(unix)]
+fn unmatched_event_exits_after_one_job_without_polling() {
+    let (_, calls) = observer_fixture(
+        "completed",
+        json!({
+            "repos/owner/repo/actions/runs/42":{"event":"pull_request","path":".github/workflows/ci.yml","status":"in_progress","run_attempt":1},
+            "repos/owner/repo/actions/runs/42/attempts/1/jobs?per_page=100&page=1":{"jobs":[
+                {"id":3,"name":"lint-gates","status":"completed","conclusion":"failure"},
+                {"id":5,"name":"unit","status":"completed","conclusion":"failure"},
+                {"id":4,"status":"queued","labels":["carrick-macos-ci"]}]},
+            "repos/owner/repo/issues?state=open&labels=main-defect&per_page=100&page=1":[{"number":1619,"state":"open","labels":[{"name":"main-defect"}],"body":"Failing test: kernel::wake"}],
+            "repos/owner/repo/actions/jobs/3/logs":"test kernel::wake_more ... FAILED\n"
+        }),
+    );
+    assert_eq!(calls.lines().count(), 4);
+    assert!(!calls.contains("POST"));
+    assert!(!calls.contains("jobs/5/logs"));
 }
