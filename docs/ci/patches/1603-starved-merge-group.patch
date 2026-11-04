@@ -1,12 +1,11 @@
 --- a/.github/workflows/ci.yml
 +++ b/.github/workflows/ci.yml
-@@ -2160,6 +2160,29 @@
+@@ -2160,6 +2160,28 @@
            CI_REPOSITORY: ${{ github.repository }}
            CI_EVENT: ${{ github.event_name }}
          run: just ci-superseded
-+      # Diagnostic slice only: GitHub refuses reruns while this workflow runs.
-+      # Keep the existing ci-results verdict authoritative until queue-safe
-+      # retry orchestration is agreed for #1603.
++      # Report infrastructure failures without retrying inside this run.
++      # Keep the existing ci-results verdict authoritative (#1603).
 +      - name: Download xtask for cancellation diagnostics
 +        continue-on-error: true
 +        if: github.event_name == 'merge_group' && contains(toJSON(needs), 'cancelled')

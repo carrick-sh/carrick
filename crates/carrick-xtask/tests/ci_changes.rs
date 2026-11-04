@@ -1422,7 +1422,9 @@ fn starved_jobs_cli_classifies_without_excusing_execution_failures() {
         .unwrap();
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("never-assigned (1): retry-eligible"));
+    assert!(stdout.contains("never-assigned (1): infrastructure-failure candidate"));
+    assert!(!stdout.contains("retry-eligible"));
+    assert!(stdout.contains("no in-run retry"));
     assert!(stdout.contains("started-failed (2): fail"));
     assert!(stdout.contains("started-cancelled (3): fail"));
 
