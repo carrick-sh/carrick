@@ -249,6 +249,7 @@ surfaces = [
   { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs", contract = "kernel.el1.thread-lifecycle" },
   { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs", contract = "kernel.vcpu.shutdown-entry" },
   { path = "crates/carrick-el1-linux/src/native_process_runtime/service.rs", contract = "diagnostics.syscall-refusal" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs", contract = "process.native.terminal-child" },
   { path = "crates/carrick-el1-linux/src/native_process_runtime/service.rs", contract = "kernel.el1.ipc-two-process" },
   { path = "crates/carrick-el1-linux/src/native_process_runtime/service.rs", contract = "kernel.el1.thread-lifecycle" },
   { path = "crates/carrick-el1-linux/src/native_process_runtime/service.rs", contract = "kernel.scheduler.runnable-progress" },

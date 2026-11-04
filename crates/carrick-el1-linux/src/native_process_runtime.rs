@@ -1474,6 +1474,8 @@ pub struct NativeProcessRuntime<'a, M: Clone, C: ProcessContext> {
     #[cfg(test)]
     service_cancel_hook: SpinLock<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
+    service_cancel_snapshot_hook: SpinLock<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
     pool_control_hook: SpinLock<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     pool_retained_hook: SpinLock<Option<Box<dyn FnOnce() + Send>>>,
@@ -3547,6 +3549,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             closing_race_hook: SpinLock::new(None),
             #[cfg(test)]
             service_cancel_hook: SpinLock::new(None),
+            #[cfg(test)]
+            service_cancel_snapshot_hook: SpinLock::new(None),
             #[cfg(test)]
             pool_control_hook: SpinLock::new(None),
             #[cfg(test)]

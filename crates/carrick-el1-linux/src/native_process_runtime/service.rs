@@ -368,6 +368,13 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             }
             return Ok(());
         };
+        #[cfg(test)]
+        {
+            let hook = self.service_cancel_snapshot_hook.lock().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let key = ObjectWaitKey::native_service(record).ok_or(NativeProcessError::Stale)?;
         let guard = self
             .zone
