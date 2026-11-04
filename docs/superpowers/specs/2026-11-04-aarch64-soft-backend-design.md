@@ -144,6 +144,22 @@ hardware updates, alignment/memory attributes, PAN/UAO and exact fault level.
 Unsupported translation regimes are rejected at configuration, never treated
 as successful translations. COW remains the ring's abort handling path.
 
+### Concrete reuse and extraction boundaries
+
+| Existing source | Reuse / required change and destination |
+| --- | --- |
+| `carrick-softmmu/src/placement.rs`: `LinearPlacement::host`, `host_range`, `MmioHoles` | Keep the authenticated placement conversion in softmmu; parameterize host granularity and ISA device layout rather than copying it into ARM. |
+| `carrick-softmmu/src/walker.rs`: `ExtentTable`, `AuthenticatedDescriptorWords`, `SoftMmuMemory` | Keep inventory, owner-generation authentication and descriptor reads shared in softmmu; replace only `SoftWalker`'s x86 hardware-walk binding with an ISA adapter. |
+| `carrick-softmmu/src/tlb.rs`: `SoftTlb`, `SoftTlbEntry`, `SoftTlbPlane`, `probe`, `flush_all`, `evict_range` | Retain storage/probe/eviction in softmmu, parameterize page geometry and mode tags; x86 permission types stay in its adapter. |
+| `carrick-softmmu/src/retirement.rs`: `SoftVcpu`, `SoftVcpuSeat`, `RunningSeat::block_entry`, `PendingRetirement` | Retain seat custody, admission and safe-point service; ARM engine enters through the same owned running seat. |
+| `carrick-core/src/mm/retirement/invalidation.rs`: `MemberSeat`, `stage`, `PendingInvalidation`, `DomainCompletion`, `ReclaimQueue` | Keep the neutral authority in core; softmmu remains its venue. Cache/JIT reclamation consumes completion, never invents another served watermark. |
+| `carrick-softmmu/src/walker.rs`: `mark_code_page`, `code_generation`, `on_code_page_write` | Reuse frame-keyed tracking, extending publication under #601/#684; current helpers alone do not establish peer write-plane closure. |
+| `carrick-softcpu-x86/src/cpu.rs`: block planning/emission/publication in `SoftCpu`, `JitCodeBuffer` | Current path plans/emits again; there is no resident block cache here to claim as already reused. #616 supplies cache storage, deduplication, reverse indexes and budgets once in proposed neutral `carrick-softcpu-core`; both ISA translators consume it. Move host executable allocation from `JitCodeBuffer` behind the neutral host JIT adapter in `carrick-vmm-soft`; x86 `PlannedBlock` and instruction emission remain x86. |
+
+The retired `carrick-dsr/src/cache.rs` is historical design input, not an
+additional cache to ship or an audited source import. N2's implementation must
+use one neutral cache; #616 must change ownership before ARM and x86 diverge.
+
 ### Cache, code writes and retirement
 
 The #616 cache is neutral storage and lifecycle with ISA-specific emitted
@@ -223,6 +239,34 @@ one implementation and test matrix.
 | #670 (closed, APIC/timer) | APIC and TSC registers stay x86. Deadline wake/enrollment, kick generation and loop coordination become neutral; ARM supplies CNTV/GIC state. |
 | #671 (open, backend/selection) | Change before landing: neutral machine composition, selection and runtime seam; add ARM capability explicitly, not a second x86-only selector later. ARM integration can follow, but no claim it already works. |
 
+## Decoder and emitter provenance
+
+Choose in-tree generation rather than auditing and adopting another decoder
+or assembler. The generator is Carrick-written Rust, emitting mask/value decode
+tables, operand extraction/validation and A64 encoding constructors from the
+Arm ARM's machine-readable A64 instruction descriptions. Semantic lowering,
+exception behavior and helper sequences are authored here from the Arm ARM;
+we do not import a third-party implementation or copy ASL implementation code.
+The emitter uses generated checked field packers for the bounded instructions
+our host glue emits, not a general-purpose assembler dependency.
+
+Slice 0 selects and records an exact upstream Arm package, input hashes and
+applicable license notices, and obtains approval for generation and redistribution
+of resulting tables before importing data or generated output. Start from
+[Arm's corresponding machine-readable collateral](https://support.arm.com/documentation/ddi0487/mc/Preface/About-this-Manual/Corresponding-Collateral).
+Availability of a specification does not imply a redistribution license. If its
+terms do not permit the intended use, stop this slice for director resolution;
+do not substitute an unaudited library. No package has been license-admitted
+or downloaded for this design round. No claim of an audited permissive dependency
+is made. This explicitly supersedes the October decoder/emitter salvage advice.
+
+Generation must be deterministic (two runs byte-identical), reject overlapping
+patterns and reserved operand combinations, and retain source encoding IDs.
+Test decode/encode round trips plus independently authored invalid encodings;
+round trips alone cannot prove semantics. Differential native microfixtures and
+same-image HVF execution supply independent evidence. Generated coverage must
+include loader words, the kernel and the selected EL0 closure before admission.
+
 ## A64 execution semantics
 
 An arm64 host can copy through register-only EL0 operations, and equivalent
@@ -235,9 +279,9 @@ WFI/WFE/SEV. Never issue guest SVC/HVC against the host. Preserve all guest
 GPRs, SP, NZCV, Q registers, FPCR/FPSR and restart PC across helpers. Exclusive
 monitors are virtual per CPU with alias-aware write generations; do not depend
 on a host exclusive reservation surviving a helper. LSE and exclusive paths
-share memory authority. Use clean-room Arm instruction specifications and a
-license-reviewed decoder (evaluate the existing `bad64` dependency declaration;
-it is not evidence of implemented ARM translation). No QEMU/copyleft source.
+share memory authority. Use our own A64 decoder and emitter generated from Arm's machine-readable
+instruction specification, as described below. No third-party decoder/emitter
+implementation is admitted; no copyleft source, including file-level copyleft.
 
 Maintain virtual EL0/EL1, PSTATE/DAIF and banked SP/return state. SVC from EL0
 saves next PC and syndrome, then enters VBAR's lower-A64 synchronous slot
@@ -253,10 +297,16 @@ PAN is required by the loader's kernel-only mappings and user-copy discipline.
 Model PSTATE.PAN, SCTLR.SPAN and the configured FEAT_PAN3/EPAN permission
 behavior from the Arm specification, rather than relying on the host's PAN.
 `memory.rs` documents the AP/PXN/UXN layout workaround; preserve those bytes.
-No explicit UAO access was found in the cited scheduler/ISA sources. Census
-must confirm this across generated code: initially advertise UAO absent unless
-the image profile requires it, otherwise implement UAO and unprivileged
-load/store checks. Host ARM capabilities never silently change guest behavior.
+The image already uses EL1 unprivileged loads: `HardwareUserWord::read_u32`
+and `read_u64` in `carrick-el1/src/sched/hw.rs` issue LDTR, and the file user-copy
+path in `carrick-el1/src/file.rs` issues LDTRB. These require EL0 permission
+checks even while executing at EL1; ordinary EL1 LDR semantics are wrong.
+No explicit UAO register write was found in those sources. UAO=0 still requires
+correct LDTR semantics; do not treat absence of UAO writes as absence of
+unprivileged accesses. Census confirms the configured feature/state and all
+LDTR/STTR variants; if UAO is exposed, model its override explicitly. Pair
+PAN on/off and UAO off/on instruction tests with the hardware profile.
+Host ARM capabilities never silently change guest behavior.
 
 Model the minimal GICv3 CPU interface actually used: pending/active Group-1
 interrupts, acknowledge/spurious ID, EOI, priority masking, enable state and
@@ -361,8 +411,14 @@ claim the native-process suite. The unchanged scheduler programs timers on
 entry/switch paths, so A3b must implement the real register/deadline behavior
 needed by slice 1; if its census reaches asynchronous IRQ delivery, that part
 of A4 moves before the milestone as well. No timer masking or stubbed GIC is
-allowed to manufacture a pass. The named existing test also exercises a real
-exec successor, unlike a host-called inner helper.
+allowed to manufacture a pass. The named existing test exercises a real
+exec successor. Its current assertions prove successful exit and exactly
+`pid1_exec_ok\n` stdout, repeated by the harness. They do not independently
+prove the requested provider was used, same image bytes, instruction coverage,
+SVC/ERET/HVC traversal, two live processes/CPUs, timer preemption, shootdown,
+safe frame/JIT retirement or scoped cleanup. Slice 1 must add provider/image
+identity and boundary/cleanup evidence; A4 and H1 retain their separate witnesses.
+Passing this test alone cannot admit the soft lane.
 
 Before funding A1/A2/A3 implementation, checkpoint after slice 0 and N3
 call-site sizing: publish opcode-family coverage, proposed move sizes, shared
@@ -381,6 +437,39 @@ These are proposed investment thresholds for review, not permission to relax
 contracts. One hello timing cannot prove suite throughput: advancing additionally
 requires the suite-minute model to predict at least 2 saved Mac-hours/day after
 retained hardware checks. No retry-until-green or timeout expansion qualifies.
+
+### Binary stopping checks per slice
+
+The following commands are **proposed interfaces to be implemented by the named
+slice**, not commands available today or results of this docs change. Use one
+neutral `carrick debug soft-qualify <slice> --receipt <path>` runner for both
+ISAs. Each command exits 0 only when every listed metric passes, otherwise 1;
+missing counters, empty test populations or omitted receipts fail closed.
+Invoke as `carrick debug soft-qualify <ID> --receipt <ID>.json`. Each split PR
+must implement its own applicable check before it can land.
+
+| ID | Metric required for exit 0; any violation stops that slice |
+| --- | --- |
+| 0 | License admission recorded; generated outputs differ by 0 bytes across two runs; census unknown words = 0 over declared executable spans; negative fixture rejected; measured suite minutes and fixture population present. |
+| N1 | Existing x86 fixture failures added = 0; two-root same-VA wrong translations = 0; warm-hit inventory scans/coordinator locks = 0; guest granule/host-page matrix fully finished. |
+| N2-cache | For resident U blocks and N=1,100,10000 iterations: decode/emit counts <= U at each scale, cache bytes <= configured cap; stale direct-link executions = 0. |
+| N2-peer | Two live CPUs, writable aliases and host copyout: stale executions = 0; reuse before counted acknowledgements = 0; visits <= affected CPUs + affected reverse links; exhaustion fixture refuses publication. |
+| A1 | Unclassified words in slice-0 closure = 0; native microfixture register/exception diffs = 0; illegal fixtures enter the expected guest exception, not host execution. |
+| A2 | Permission/fault-level diffs = 0 for TTBR/root, PAN/UAO/LDTR, NX/AF and crossing/alignment matrix; all declared rows finish. |
+| A3-register | Native register/branch/FP diffs = 0; straight-line and back-edge checkpoint distance <= declared maximum block instruction count. |
+| A3-memory | Scalar/atomic restart-state and memory diffs = 0; hot-loop N2-cache budget violations = 0; alias tests finish with two live CPUs. |
+| N3 | Hardware fixture population lost = 0 and added failures = 0; neutral lifecycle copy count = 1, verified by source review; provider selection/error matrix failures = 0 for both ISAs. |
+| A3b | Boot-profile register and CNTV deadline/status diffs = 0; successful unknown-register stubs = 0; every census-required register has a completed witness. |
+| 1 | Named exec test stdout/exit diffs = 0, missing provider/image/boundary/cleanup evidence = 0; completed within existing watchdog; elapsed implementation <= ten worker-days after prerequisites and paired soft/HVF ratio <= 20. |
+| A4 | GIC timer, preemption, parked wake and two-CPU handoff populations complete; lost/duplicate IRQs and stale shootdown accesses = 0; hardware state/result diffs = 0. |
+| H1-linux / H1-macos | Per-host suite population lost = 0, soft-vs-HVF added semantic failures = 0, budget violations = 0; macOS writable published entries = 0; measured model predicts >= 2 saved Mac-hours/day with retained hardware checks. |
+
+The first funding checkpoint fails if slice-0 evidence is incomplete, any
+proposed PR exceeds 4k changed lines without a split, or the measured capacity
+model predicts less than 2 saved Mac-hours/day. Runtime thresholds assess the
+investment; semantic or structural failures always stop admission regardless
+of speed. These future checks do not assert design approval or equivalent
+execution today.
 
 ## Risks and acceptance handoff
 
