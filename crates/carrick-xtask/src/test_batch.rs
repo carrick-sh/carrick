@@ -390,6 +390,16 @@ pub fn run(root: &Path, args: TestBatchArgs) -> Result<()> {
                 }
             }
             eprintln!("test-batch: run {test:?}");
+            if pkg["name"] == "carrick-el1-linux" {
+                if !crate::test_isolated::run_command(&mut test)? {
+                    red.push(format!(
+                        "{} {:?}: isolated tests failed",
+                        exe.display(),
+                        lane.harness
+                    ));
+                }
+                continue;
+            }
             let status = test.status()?;
             if !status.success() {
                 red.push(format!("{} {:?}: {status}", exe.display(), lane.harness));

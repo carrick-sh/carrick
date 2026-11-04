@@ -513,7 +513,7 @@ test *ARGS: _test-stdio
         # host-lane selection is DERIVED from Cargo metadata (`test-lanes args --lane host`
         # via `_test-unit-lanes`), and `lint-domains-source` runs `test-lanes check`.
         {{_admit}} {{_xtask}} test-batch _test-unit-lanes -- --exclude-package=carrick-el1-linux {{ARGS}}
-        just --justfile {{justfile()}} _test-unit-lanes --package=carrick-el1-linux {{ARGS}}
+        {{_admit}} {{_xtask}} test-batch _test-unit-lanes -- --package=carrick-el1-linux {{ARGS}}
         just --justfile {{justfile()}} _test-unit-cli {{ARGS}}
         just --justfile {{justfile()}} _test-unit-host {{ARGS}}
         just --justfile {{justfile()}} _test-unit-vfs {{ARGS}}
@@ -526,7 +526,7 @@ test *ARGS: _test-stdio
         just --justfile {{justfile()}} _test-unit-kernel {{ARGS}}
         just --justfile {{justfile()}} _test-unit-runtime {{ARGS}}
         {{_admit}} {{_xtask}} test-batch _test-unit-lanes -- --exclude-package=carrick-el1-linux {{ARGS}}
-        just --justfile {{justfile()}} _test-unit-lanes --package=carrick-el1-linux {{ARGS}}
+        {{_admit}} {{_xtask}} test-batch _test-unit-lanes -- --package=carrick-el1-linux {{ARGS}}
     fi
 
 # Unit groups are whole Cargo selections: newly added tests stay selected.
@@ -544,7 +544,7 @@ test-shard-b *ARGS: _test-stdio
     just --justfile {{justfile()}} _test-unit-vfs {{ARGS}}
     # EL1 production-routing witnesses must not inherit kernel-example's or
     # runtime's carrick-el1-linux/host-test feature. Keep their original package selection.
-    just --justfile {{justfile()}} _test-unit-lanes --package=carrick-el1-linux {{ARGS}}
+    {{_admit}} {{_xtask}} test-batch _test-unit-lanes -- --package=carrick-el1-linux {{ARGS}}
     just --justfile {{justfile()}} _test-unit-kernel {{ARGS}}
     just --justfile {{justfile()}} _test-unit-runtime {{ARGS}}
     just --justfile {{justfile()}} _test-unit-hvf {{ARGS}}

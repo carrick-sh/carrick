@@ -2,9 +2,9 @@
 //! (#1297). `carrick-el1-linux`'s native-process fixtures leak their
 //! `'static` structures for the life of the test process, so one process
 //! running the whole suite accumulated past a 16 GiB runner (cgroup
-//! `memory.peak` at the cap, `oom_kill 1`), while no single test peaks
-//! above 1 GiB. A process per test returns each test's memory when it
-//! exits, at the same parallelism libtest would use.
+//! `memory.peak` at the cap, `oom_kill 1`). The #1570 measurements found
+//! a single-test maximum of 1.2 GiB. A process per test returns memory when it
+//! exits. Concurrency is capped by available memory (#1570).
 //!
 //! The output is libtest's own format (`Running … (<binary>)`,
 //! `test <name> ... ok|FAILED|ignored`, the `failures:` block and the
@@ -37,7 +37,7 @@ pub struct TestIsolatedArgs {
     #[arg(long)]
     pub serial: Option<String>,
     /// Concurrent test processes. Defaults to `RUST_TEST_THREADS`, then the
-    /// available parallelism: the same count libtest's threads would use.
+    /// available parallelism, capped by the available memory budget.
     #[arg(long)]
     pub jobs: Option<usize>,
     /// Seconds one test process may run before it is killed and itemized
@@ -179,11 +179,214 @@ fn compile(root: &Path, args: &TestIsolatedArgs) -> Result<PathBuf> {
     binary.ok_or_else(|| format!("no lib test executable for {}", args.package))
 }
 
+/// A reusable child command, preserving Cargo's working directory and lane environment.
+#[derive(Clone)]
+struct TestProcess {
+    binary: PathBuf,
+    directory: Option<PathBuf>,
+    environment: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)>,
+    switches: Vec<String>,
+}
+
+impl TestProcess {
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.binary);
+        if let Some(directory) = &self.directory {
+            command.current_dir(directory);
+        }
+        for (key, value) in &self.environment {
+            match value {
+                Some(value) => {
+                    command.env(key, value);
+                }
+                None => {
+                    command.env_remove(key);
+                }
+            }
+        }
+        command.args(&self.switches);
+        command
+    }
+}
+
+/// Reserve half the available memory for the host and runner. Each isolated
+/// test gets 2 GiB: the largest measured EL1 test used 1.2 GiB (#1570).
+/// An explicit thread request is still subject to this ceiling.
+fn memory_jobs(requested: usize, available: Option<u64>) -> usize {
+    let slots = available
+        .map(|bytes| bytes / 2 / (2 * 1024 * 1024 * 1024))
+        .unwrap_or(1);
+    requested
+        .max(1)
+        .min(usize::try_from(slots).unwrap_or(usize::MAX).max(1))
+}
+
+fn available_memory() -> Option<u64> {
+    let mut available = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|text| {
+            text.lines().find_map(|line| {
+                line.strip_prefix("MemAvailable:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<u64>()
+                    .ok()?
+                    .checked_mul(1024)
+            })
+        });
+    // Honour all cgroup v2 ancestors, including a job limit below physical RAM.
+    if let Ok(groups) = std::fs::read_to_string("/proc/self/cgroup") {
+        for line in groups.lines() {
+            if let Some(group) = line.strip_prefix("0::/") {
+                let root = Path::new("/sys/fs/cgroup");
+                let mut path = root.join(group);
+                loop {
+                    let remaining = std::fs::read_to_string(path.join("memory.max"))
+                        .ok()
+                        .and_then(|v| v.trim().parse::<u64>().ok())
+                        .zip(
+                            std::fs::read_to_string(path.join("memory.current"))
+                                .ok()
+                                .and_then(|v| v.trim().parse::<u64>().ok()),
+                        )
+                        .map(|(limit, used)| limit.saturating_sub(used));
+                    if let Some(remaining) = remaining {
+                        available = Some(available.map_or(remaining, |v| v.min(remaining)));
+                    }
+                    if path == root || !path.pop() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if available.is_none() {
+        // BSD/macOS: conservatively budget from physical memory, then reserve half.
+        available = Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| String::from_utf8_lossy(&out.stdout).trim().parse().ok());
+    }
+    available
+}
+
+/// Execute the exact libtest population selected by an already compiled Cargo
+/// lane. Listing uses libtest itself, including repeated filters and skips.
+/// This never recompiles or changes the lane's feature union.
+pub fn run_command(command: &mut Command) -> Result<bool> {
+    let harness: Vec<String> = command
+        .get_args()
+        .map(|v| v.to_string_lossy().into_owned())
+        .collect();
+    let mut switches = Vec::new();
+    let mut harness_threads = None;
+    let mut args = harness.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--test-threads" => {
+                harness_threads = Some(
+                    args.next()
+                        .ok_or("missing --test-threads value")?
+                        .parse::<usize>()
+                        .map_err(|e| e.to_string())?,
+                );
+            }
+            value if value.starts_with("--test-threads=") => {
+                harness_threads = Some(value[15..].parse::<usize>().map_err(|e| e.to_string())?);
+            }
+            "--skip" | "--format" | "--color" => {
+                args.next()
+                    .ok_or_else(|| format!("missing value for {arg}"))?;
+            }
+            "--exact" => {}
+            "--ignored" | "--include-ignored" | "--nocapture" | "--show-output" => {
+                switches.push(arg.clone())
+            }
+            value if !value.starts_with('-') => {}
+            value => return Err(format!("unsupported isolated libtest argument {value}")),
+        }
+    }
+    let process = TestProcess {
+        binary: PathBuf::from(command.get_program()),
+        directory: command.get_current_dir().map(Path::to_path_buf),
+        environment: command
+            .get_envs()
+            .map(|(k, v)| (k.to_owned(), v.map(std::ffi::OsStr::to_owned)))
+            .collect(),
+        switches,
+    };
+    let listing = command
+        .args(["--list", "--format", "terse"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !listing.status.success() {
+        return Err("isolated libtest listing failed".into());
+    }
+    let tests = select(&String::from_utf8_lossy(&listing.stdout), None, None);
+    let requested = harness_threads
+        .or_else(|| {
+            command
+                .get_envs()
+                .find(|(key, _)| *key == "RUST_TEST_THREADS")
+                .and_then(|(_, value)| value.and_then(|v| v.to_str()?.parse().ok()))
+        })
+        .or_else(|| std::thread::available_parallelism().ok().map(usize::from))
+        .unwrap_or(1);
+    let available = available_memory();
+    let jobs = memory_jobs(requested, available);
+    eprintln!(
+        "test-isolated: available_memory={available:?} jobs={jobs} selected={}",
+        tests.len()
+    );
+    let mut stdout = std::io::stdout().lock();
+    let _ = writeln!(
+        stdout,
+        "     Running unittests ({})\n\nrunning {} tests",
+        process.binary.display(),
+        tests.len()
+    );
+    let expected = tests.len();
+    let started = Instant::now();
+    let results = execute_process(
+        &process,
+        tests,
+        Vec::new(),
+        jobs,
+        std::time::Duration::from_secs(600),
+        &mut stdout,
+    );
+    if results.len() != expected {
+        return Err(format!(
+            "isolated population incomplete: expected {expected}, completed {}",
+            results.len()
+        ));
+    }
+    let (text, ok) = summary(&process.binary, &results, started.elapsed().as_secs_f64());
+    let _ = write!(stdout, "{text}");
+    Ok(ok)
+}
+
+#[cfg(test)]
 fn run_one(binary: &Path, name: &str, timeout: std::time::Duration) -> Outcome {
+    run_one_process(
+        &TestProcess {
+            binary: binary.to_owned(),
+            directory: None,
+            environment: Vec::new(),
+            switches: Vec::new(),
+        },
+        name,
+        timeout,
+    )
+}
+
+fn run_one_process(process: &TestProcess, name: &str, timeout: std::time::Duration) -> Outcome {
     use std::io::Read;
-    let spawned = Command::new(binary)
+    let spawned = process
+        .command()
         .args(["--exact", name, "--test-threads=1"])
-        .env_remove("RUST_TEST_THREADS")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -241,6 +444,29 @@ pub fn execute(
     timeout: std::time::Duration,
     out: &mut dyn Write,
 ) -> Vec<(String, Outcome)> {
+    execute_process(
+        &TestProcess {
+            binary: binary.to_owned(),
+            directory: None,
+            environment: Vec::new(),
+            switches: Vec::new(),
+        },
+        parallel,
+        serial,
+        jobs,
+        timeout,
+        out,
+    )
+}
+
+fn execute_process(
+    process: &TestProcess,
+    parallel: Vec<String>,
+    serial: Vec<String>,
+    jobs: usize,
+    timeout: std::time::Duration,
+    out: &mut dyn Write,
+) -> Vec<(String, Outcome)> {
     let mut results = Vec::new();
     for (tests, jobs) in [(parallel, jobs.max(1)), (serial, 1)] {
         let queue = Arc::new(Mutex::new(tests.into_iter().collect::<VecDeque<_>>()));
@@ -249,12 +475,12 @@ pub fn execute(
             .map(|_| {
                 let queue = Arc::clone(&queue);
                 let send = send.clone();
-                let binary = binary.to_owned();
+                let process = process.clone();
                 std::thread::spawn(move || {
                     loop {
                         let next = queue.lock().ok().and_then(|mut q| q.pop_front());
                         let Some(name) = next else { break };
-                        let outcome = run_one(&binary, &name, timeout);
+                        let outcome = run_one_process(&process, &name, timeout);
                         if send.send((name, outcome)).is_err() {
                             break;
                         }
@@ -299,6 +525,7 @@ pub fn run(root: &Path, args: TestIsolatedArgs) -> Result<()> {
         .or_else(|| std::thread::available_parallelism().ok().map(usize::from))
         .unwrap_or(1)
         .max(1);
+    let jobs = memory_jobs(jobs, available_memory());
     let (serial, parallel): (Vec<_>, Vec<_>) = tests
         .into_iter()
         .partition(|name| args.serial.as_deref().is_some_and(|f| name.contains(f)));
@@ -333,6 +560,16 @@ pub fn run(root: &Path, args: TestIsolatedArgs) -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn memory_budget_caps_requests_and_falls_back_conservatively() {
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(memory_jobs(64, Some(20 * gib)), 5);
+        assert_eq!(memory_jobs(64, Some(7 * gib)), 1);
+        assert_eq!(memory_jobs(2, Some(64 * gib)), 2);
+        assert_eq!(memory_jobs(64, None), 1);
+        assert_eq!(memory_jobs(0, Some(0)), 1);
+    }
 
     #[test]
     fn selection_follows_libtest_filters() {
