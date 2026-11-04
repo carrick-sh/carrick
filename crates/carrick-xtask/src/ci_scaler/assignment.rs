@@ -643,7 +643,7 @@ pub(super) fn admit_demand<T>(
 pub(super) fn refuse(
     ledger: &mut impl Refusals,
     key: JobKey,
-    error: &ScalerError,
+    error: &impl std::fmt::Display,
     path: &Path,
 ) -> Result<(), ScalerError> {
     if ledger.refused().contains(&key) {
@@ -698,6 +698,86 @@ impl AssignmentApi for Github {
     }
 }
 
+/// A refusal outcome outlives its runner. Only the controller's assignment
+/// worker writes this outbox, under the controller's lifetime lock; lifecycle
+/// publication never overwrites it. The GitHub marker makes replay idempotent.
+#[derive(Serialize, Deserialize)]
+struct PendingOutcome {
+    key: JobKey,
+    reason: String,
+}
+
+fn outcome_path(ledger: &Path) -> std::path::PathBuf {
+    ledger.with_extension("refusal-outcomes.json")
+}
+
+fn pending_outcomes(path: &Path) -> Result<Vec<PendingOutcome>, ScalerError> {
+    match std::fs::read(outcome_path(path)) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Run before enumerating live clones, including when every clone was reaped.
+/// A failed destination remains durable; it cannot prevent other deliveries.
+pub(super) fn retry_refusal_outcomes(
+    api: &impl AssignmentApi,
+    ledger: &mut impl Refusals,
+    path: &Path,
+) -> Result<(), ScalerError> {
+    let mut pending = pending_outcomes(path)?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    for outcome in &pending {
+        refuse(ledger, outcome.key, &outcome.reason, path)?;
+    }
+    pending.retain(|outcome| {
+        if let Err(error) = api.report_refusal(outcome.key, &outcome.reason) {
+            eprintln!(
+                "run={} attempt={} job={} outcome pending: {}; reporting failed: {error}",
+                outcome.key.run.0, outcome.key.attempt, outcome.key.job.0, outcome.reason
+            );
+            true
+        } else {
+            false
+        }
+    });
+    save_json(&pending, &outcome_path(path))
+}
+
+fn report_refusal(
+    api: &impl AssignmentApi,
+    ledger: &mut impl Refusals,
+    key: JobKey,
+    reason: &str,
+    path: &Path,
+) -> Result<(), ScalerError> {
+    let mut pending = pending_outcomes(path)?;
+    if !pending.iter().any(|outcome| outcome.key == key) {
+        if pending.len() >= 4096 {
+            return Err(ScalerError::External(
+                "refusal outcome outbox capacity exhausted",
+            ));
+        }
+        pending.push(PendingOutcome {
+            key,
+            reason: reason.to_owned(),
+        });
+        save_json(&pending, &outcome_path(path))?;
+    }
+    let reason = &pending
+        .iter()
+        .find(|outcome| outcome.key == key)
+        .ok_or(ScalerError::External("pending refusal outcome missing"))?
+        .reason;
+    refuse(ledger, key, reason, path)?;
+    api.report_refusal(key, reason)?;
+    pending.retain(|outcome| outcome.key != key);
+    save_json(&pending, &outcome_path(path))
+}
+
 /// What one rendezvous step decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Revetted {
@@ -743,7 +823,7 @@ pub(super) fn serve_assignment<L: Refusals>(
     let key = assigned_job_key(&context, runner, labels, &jobs)?;
     record(ledger, key)?; // True assignment is durable BEFORE steps may run.
     if run_superseded(ledger.superseded(), key) {
-        api.report_refusal(key, "run superseded before admission")?;
+        report_refusal(api, ledger, key, "run superseded before admission", path)?;
         refuse(
             ledger,
             key,
@@ -760,20 +840,26 @@ pub(super) fn serve_assignment<L: Refusals>(
     }
     supersession_capacity(ledger.superseded())?;
     if ledger.refused().contains(&key) {
-        api.report_refusal(key, "previously refused by the controller")?;
+        report_refusal(
+            api,
+            ledger,
+            key,
+            "previously refused by the controller",
+            path,
+        )?;
         return Ok(Revetted::Refused(key)); // Withhold approval.
     }
     let policy = match api.revet(key) {
         Ok(policy) => policy,
         Err(error @ ScalerError::Guard(_)) => {
-            api.report_refusal(key, &error.to_string())?;
+            report_refusal(api, ledger, key, &error.to_string(), path)?;
             refuse(ledger, key, &error, path)?;
             return Ok(Revetted::Refused(key));
         }
         Err(error) => return Err(error),
     };
     if let Err(error) = policy.authorize(&context) {
-        api.report_refusal(key, &error.to_string())?;
+        report_refusal(api, ledger, key, &error.to_string(), path)?;
         refuse(ledger, key, &error, path)?;
         return Ok(Revetted::Refused(key));
     }

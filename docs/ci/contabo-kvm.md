@@ -97,6 +97,21 @@ serves. Sharing one lane across hosts needs the per-job claim in #1597. The lane
 
 ## Events and receipts
 
+Assignment re-vetting preserves the failed check in the refusal log and
+outcome comment. Unavailable API reads remain pending and do not create a
+negative admission decision. Approved runs have no queue-age expiry.
+
+Before reporting a genuine assignment refusal, the controller atomically
+writes its reason to `ledger.refusal-outcomes.json` beside `ledger.json`
+(`mac-ledger.refusal-outcomes.json` for cloudmac), then records the refusal.
+The assignment worker replays this outbox before enumerating live clones,
+including after a restart or clone destruction. Keep it with the ledger
+when moving controller state. Delivery uses a run/attempt comment marker,
+so replay after an interrupted write does not duplicate the outcome.
+Reporting errors retain the entry; repair the named API or guard-evidence
+failure rather than deleting pending outcomes. The outbox holds at most
+4096 pending entries and fails closed if full.
+
 `kernel-runtime.yml` runs `kvm-tests-willow` on each `push` to `main` and
 owner `workflow_dispatch` on `main`, when this backend is selected. The
 standing controller and job-start hook admit exactly those events for this

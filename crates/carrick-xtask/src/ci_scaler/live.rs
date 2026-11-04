@@ -2245,6 +2245,10 @@ fn revet_assignments(
     path: &Path,
     settled: &mut Vec<String>,
 ) {
+    if let Err(error) = assignment::retry_refusal_outcomes(gh, ledger, path) {
+        eprintln!("refusal outcome replay failed: {error}; retried next poll");
+        return;
+    }
     settled.retain(|name| {
         ledger
             .rows
@@ -2306,11 +2310,9 @@ fn revet_assignments(
                 );
                 settled.push(row.name);
             }
-            Ok(Revetted::Refused(key)) => {
-                println!(
-                    "vm={vm} reserved job={} assigned run={} attempt={} job={}: admission refused (reason recorded above)",
-                    row.key.job.0, key.run.0, key.attempt, key.job.0
-                );
+            Ok(Revetted::Refused(_)) => {
+                // `assignment::refuse` logs the exact failed check with the
+                // run, attempt and job after durable refusal publication.
                 settled.push(row.name);
             }
             Err(error) => {

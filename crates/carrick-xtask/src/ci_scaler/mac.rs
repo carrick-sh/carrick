@@ -530,6 +530,7 @@ pub(super) fn controller(
         let pass = (|| -> Result<(), ScalerError> {
             let mut ledger = worker_publication.snapshot()?;
             ledger.publication = Some(worker_publication.clone());
+            assignment::retry_refusal_outcomes(&Github, &mut ledger, &worker_path)?;
             settled.retain(|name| {
                 ledger
                     .rows

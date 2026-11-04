@@ -429,13 +429,15 @@ impl Github {
             None,
             false,
         )?;
-        self.vet(
+        Self::vet_inner(
             &if run["path"] == DISPATCH_WORKFLOW {
                 Admission::Agent
             } else {
                 Admission::Standing
             },
             key,
+            |method, endpoint, body, paginate| self.request(method, endpoint, body, paginate),
+            &mut crate::dispatch_worker::recorded_publication,
         )
     }
 
@@ -478,6 +480,7 @@ impl Github {
         run: &Value,
         request: &mut impl FnMut(&str, &str, Option<Value>, bool) -> Result<Value, ScalerError>,
         publication: &mut crate::dispatch_worker::PublicationLookup<'_>,
+        reason: &mut &'static str,
     ) -> Result<bool, ScalerError> {
         let id = run["id"]
             .as_u64()
@@ -492,6 +495,7 @@ impl Github {
             true,
         )?;
         let jobs = pages(&data, "jobs")?;
+        *reason = "trigger guard has not succeeded";
         if !guard_ready(&Admission::Agent, &jobs) {
             return Ok(false);
         }
@@ -509,6 +513,7 @@ impl Github {
             .iter()
             .filter_map(|s| s["name"].as_str()?.strip_prefix("Dispatch comment "))
             .collect();
+        *reason = "trigger comment marker missing or ambiguous";
         if markers.len() != 1 {
             return Ok(false);
         }
@@ -530,6 +535,7 @@ impl Github {
             None,
             false,
         )?;
+        *reason = "trigger comment identity, permission or digest check refused";
         if comment["id"].as_u64() != Some(comment_id)
             || comment["issue_url"]
                 != format!("https://api.github.com/repos/{REPOSITORY}/issues/{number}")
@@ -560,6 +566,7 @@ impl Github {
                 .iter()
                 .filter_map(|s| s["name"].as_str()?.strip_prefix("Dispatch head "))
                 .collect();
+            *reason = "trigger PR head or open state check refused";
             if heads.len() != 1
                 || !full_sha(heads[0])
                 || pr["head"]["sha"] != heads[0]
@@ -590,6 +597,7 @@ impl Github {
                     .iter()
                     .filter_map(|s| s["name"].as_str()?.strip_prefix("Dispatch issue "))
                     .collect();
+                *reason = "trigger PR adoption or issue binding check refused";
                 return Ok(adoption.is_some_and(|adoption| {
                     guard_issue.len() == 1
                         && adoption
@@ -608,6 +616,7 @@ impl Github {
                 request("GET", &endpoint, None, false)
             })
             .ok();
+            *reason = "PR ownership or publication check refused";
             if !crate::dispatch_worker::owned_pr_on_base(
                 &pr,
                 &original,
@@ -636,6 +645,7 @@ impl Github {
             )?;
         }
         // Any issue author (#1214); the trusted comment is the approval.
+        *reason = "trigger issue is no longer open";
         Ok(issue["state"] == "open")
     }
 
@@ -690,11 +700,28 @@ impl Github {
 
     /// Both queued demand and the final pre-clone/reassignment vet use this
     /// API-backed admission. A successful PR-supplied guard is insufficient.
+    #[cfg(test)]
     fn admits_run(
         admission: &Admission,
         run: &Value,
         request: &mut impl FnMut(&str, &str, Option<Value>, bool) -> Result<Value, ScalerError>,
         publication: &mut crate::dispatch_worker::PublicationLookup<'_>,
+    ) -> Result<bool, ScalerError> {
+        Self::admits_run_reason(
+            admission,
+            run,
+            request,
+            publication,
+            &mut "admission refused",
+        )
+    }
+
+    fn admits_run_reason(
+        admission: &Admission,
+        run: &Value,
+        request: &mut impl FnMut(&str, &str, Option<Value>, bool) -> Result<Value, ScalerError>,
+        publication: &mut crate::dispatch_worker::PublicationLookup<'_>,
+        reason: &mut &'static str,
     ) -> Result<bool, ScalerError> {
         // Boolean policy callbacks must not turn an unavailable authority into
         // a negative verdict. Retain the original typed error across them.
@@ -705,6 +732,7 @@ impl Github {
             ) {
                 Ok(value) => Ok(value),
                 Err(error) => {
+                    eprintln!("admission read failed: {method} {endpoint}: {error}");
                     if unavailable.is_none() {
                         unavailable = Some(error);
                     }
@@ -713,11 +741,13 @@ impl Github {
             };
         let request = &mut checked_request;
         let checked = (|| -> Result<bool, ScalerError> {
+            *reason = "workflow identity check refused";
             if !admission.identifies_run(run) {
                 return Ok(false);
             }
             // Run shape is structural; the run's actors must be live
             // write collaborators (#1214) before any demand or vet.
+            *reason = "actor or triggering actor permission check refused";
             if matches!(admission, Admission::Agent)
                 && !crate::dispatch_worker::dispatch_run_admitted(run, None, &mut |login: &str| {
                     crate::dispatch_worker::write_collaborator(login, |endpoint| {
@@ -728,9 +758,11 @@ impl Github {
                 return Ok(false);
             }
             if matches!(admission, Admission::Agent) && run["event"] == "issue_comment" {
-                return Self::admits_comment(run, request, publication);
+                *reason = "trigger comment, publication or issue state check refused";
+                return Self::admits_comment(run, request, publication, reason);
             }
             if matches!(admission, Admission::Agent) && run["event"] == "workflow_dispatch" {
+                *reason = "chained trigger outcome check refused";
                 return Self::admits_chain(run, request);
             }
             if !matches!(admission, Admission::Agent) || run["event"] != "pull_request_review" {
@@ -739,6 +771,7 @@ impl Github {
             // REST runs carry no review payload. Main's guard condition and
             // driver admission enforce changes_requested; PR workflow changes
             // are refused below so the merge uses main's policy.
+            *reason = "review trigger branch check refused";
             let branch = run["head_branch"]
                 .as_str()
                 .ok_or(ScalerError::Guard("review branch missing"))?;
@@ -784,12 +817,14 @@ impl Github {
                         },
                     );
             }
+            *reason = "PR ownership or publication check refused";
             if !owned {
                 return Ok(false);
             }
             let head = run["head_sha"]
                 .as_str()
                 .ok_or(ScalerError::Guard("review SHA missing"))?;
+            *reason = "workflow identity changed from trusted main";
             dispatch_workflow_unchanged(head, |endpoint| request("GET", endpoint, None, false))
         })();
         if let Some(error) = unavailable {
@@ -797,7 +832,7 @@ impl Github {
         }
         match checked {
             Ok(false) if matches!(admission, Admission::Agent) => {
-                admission_refused(run, "PR head/ownership or workflow check refused");
+                admission_refused(run, reason);
                 Ok(false)
             }
             result => result,
@@ -810,12 +845,10 @@ impl Github {
         request: &mut impl FnMut(&str, &str, Option<Value>, bool) -> Result<Value, ScalerError>,
         publication: &mut crate::dispatch_worker::PublicationLookup<'_>,
     ) -> Result<bool, ScalerError> {
-        let checked = Self::admits_run(admission, run, request, publication);
+        let mut reason = "admission refused";
+        let checked = Self::admits_run_reason(admission, run, request, publication, &mut reason);
         let (admitted, reason) = match checked {
-            Ok(admitted) => (
-                admitted,
-                "run approval no longer satisfies dispatch admission",
-            ),
+            Ok(admitted) => (admitted, reason),
             Err(ScalerError::Guard(reason)) if matches!(admission, Admission::Agent) => {
                 (false, reason)
             }
@@ -837,8 +870,8 @@ impl Github {
     }
 
     /// Publish before committing a terminal refusal. Transport failures leave
-    /// the reservation pending; permanent reporting failures are logged and
-    /// must not prevent settlement.
+    /// the reservation pending; reporting failures must not silently discard
+    /// the required outcome.
     fn vet_reported(
         admission: &Admission,
         key: JobKey,
@@ -868,13 +901,12 @@ impl Github {
         result: Result<(), ScalerError>,
     ) -> Result<(), ScalerError> {
         match result {
-            Err(error @ ScalerError::Transient(_)) => Err(error),
             Err(error) => {
                 eprintln!(
-                    "run={} attempt={} job={} refused: {reason}; outcome reporting failed: {error}; settling refusal",
+                    "run={} attempt={} job={} refused: {reason}; outcome reporting failed: {error}; outcome remains pending",
                     key.run.0, key.attempt, key.job.0
                 );
-                Ok(())
+                Err(error)
             }
             Ok(()) => Ok(()),
         }
@@ -957,11 +989,16 @@ impl Github {
             None,
             false,
         )?;
-        if !Self::admits_run(admission, &run, &mut request, publication)?
-            || run["id"].as_u64() != Some(key.run.0)
+        let mut reason = "admission refused";
+        if !Self::admits_run_reason(admission, &run, &mut request, publication, &mut reason)? {
+            return Err(ScalerError::Guard(reason));
+        }
+        if run["id"].as_u64() != Some(key.run.0)
             || run["run_attempt"].as_u64() != Some(u64::from(key.attempt))
         {
-            return Err(ScalerError::Guard("reserved run is no longer admitted"));
+            return Err(ScalerError::Guard(
+                "reserved run or attempt identity changed",
+            ));
         }
         if matches!(admission, Admission::Agent) {
             let data = request(
@@ -1172,7 +1209,8 @@ mod tests {
     /// GitHub admission, durable refusal and approval publication paths.
     struct RevetFixture {
         unavailable: std::cell::Cell<bool>,
-        denied: bool,
+        denied: std::cell::Cell<bool>,
+        workflow_changed: std::cell::Cell<bool>,
         ambiguous_guard: std::cell::Cell<bool>,
         permanent_reporting_failure: std::cell::Cell<bool>,
         run_lookup_count: std::cell::Cell<usize>,
@@ -1184,7 +1222,8 @@ mod tests {
         fn new(unavailable: bool, denied: bool, outcome_unavailable: bool) -> Self {
             Self {
                 unavailable: std::cell::Cell::new(unavailable),
-                denied,
+                denied: std::cell::Cell::new(denied),
+                workflow_changed: Default::default(),
                 ambiguous_guard: Default::default(),
                 permanent_reporting_failure: Default::default(),
                 run_lookup_count: Default::default(),
@@ -1211,7 +1250,7 @@ mod tests {
                 if self.unavailable.replace(false) {
                     return Err(ScalerError::Transient(TransientFailure::GithubServer));
                 }
-                return Ok(json!({"permission": if self.denied {"read"} else {"write"}}));
+                return Ok(json!({"permission": if self.denied.get() {"read"} else {"write"}}));
             }
             if endpoint.ends_with("/runs/42") {
                 let count = self.run_lookup_count.get();
@@ -1219,9 +1258,14 @@ mod tests {
                 if count > 0 && self.fail_reporting_run_lookup.get() {
                     return Err(ScalerError::External("GitHub HTTP 403"));
                 }
+                let branch = if self.workflow_changed.get() {
+                    "untrusted"
+                } else {
+                    "main"
+                };
                 return Ok(
                     json!({"id":42,"run_attempt":1,"event":"issues","head_sha":"a".repeat(40),
-                    "created_at":"2026-01-01T00:00:00Z", "head_branch":"main","path":DISPATCH_WORKFLOW,
+                    "created_at":"2026-01-01T00:00:00Z", "head_branch":branch,"path":DISPATCH_WORKFLOW,
                     "repository":{"full_name":REPOSITORY},"head_repository":{"full_name":REPOSITORY},
                     "actor":{"login":"tjfontaine","type":"User"},"triggering_actor":{"login":"tjfontaine","type":"User"}}),
                 );
@@ -1273,7 +1317,7 @@ mod tests {
             pages(&self.request("GET", "/jobs?", None, true)?, "jobs")
         }
         fn revet(&self, key: JobKey) -> Result<JobPolicy, ScalerError> {
-            Github::vet_reported(
+            Github::vet_inner(
                 &Admission::Agent,
                 key,
                 |method, endpoint, body, paginate| self.request(method, endpoint, body, paginate),
@@ -1371,7 +1415,7 @@ mod tests {
             revet_poll(&api, &mut guest, &mut ledger, &path),
             Err(ScalerError::Transient(_))
         ));
-        assert!(ledger.refused.is_empty(), "do not settle before reporting");
+        assert_eq!(ledger.refused, vec![RevetFixture::key()]);
         assert_eq!(
             revet_poll(&api, &mut guest, &mut ledger, &path).unwrap(),
             assignment::Revetted::Refused(RevetFixture::key())
@@ -1387,7 +1431,7 @@ mod tests {
             comments[0]["body"]
                 .as_str()
                 .unwrap()
-                .contains("reserved run is no longer admitted")
+                .contains("actor or triggering actor permission check refused")
         );
         drop(comments);
         // A process restart after the comment POST but before ledger publication
@@ -1396,7 +1440,7 @@ mod tests {
         assert_eq!(api.comments.borrow().len(), 1);
     }
     #[test]
-    fn revet_ambiguous_guard_settles_refusal_without_publishing() {
+    fn revet_ambiguous_guard_keeps_outcome_pending() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ledger.json");
         let mut ledger = revet_ledger();
@@ -1406,20 +1450,27 @@ mod tests {
         };
         let api = RevetFixture::new(false, true, false);
         api.ambiguous_guard.set(true);
-        assert_eq!(
-            revet_poll(&api, &mut guest, &mut ledger, &path).unwrap(),
-            assignment::Revetted::Refused(RevetFixture::key())
-        );
+        assert!(revet_poll(&api, &mut guest, &mut ledger, &path).is_err());
         assert_eq!(
             Ledger::load(&path).unwrap().refused,
             vec![RevetFixture::key()]
         );
         assert_eq!(guest.approvals, 0);
         assert!(api.comments.borrow().is_empty());
+        api.ambiguous_guard.set(false);
+        assert_eq!(
+            revet_poll(&api, &mut guest, &mut ledger, &path).unwrap(),
+            assignment::Revetted::Refused(RevetFixture::key())
+        );
+        assert_eq!(api.comments.borrow().len(), 1);
+        assert_eq!(
+            Ledger::load(&path).unwrap().refused,
+            vec![RevetFixture::key()]
+        );
     }
 
     #[test]
-    fn revet_permanent_reporting_failure_settles_refusal() {
+    fn revet_permanent_reporting_failure_keeps_outcome_pending() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ledger.json");
         let mut ledger = revet_ledger();
@@ -1429,20 +1480,27 @@ mod tests {
         };
         let api = RevetFixture::new(false, true, false);
         api.permanent_reporting_failure.set(true);
-        assert_eq!(
-            revet_poll(&api, &mut guest, &mut ledger, &path).unwrap(),
-            assignment::Revetted::Refused(RevetFixture::key())
-        );
+        assert!(revet_poll(&api, &mut guest, &mut ledger, &path).is_err());
         assert_eq!(
             Ledger::load(&path).unwrap().refused,
             vec![RevetFixture::key()]
         );
         assert_eq!(guest.approvals, 0);
         assert!(api.comments.borrow().is_empty());
+        api.permanent_reporting_failure.set(false);
+        assert_eq!(
+            revet_poll(&api, &mut guest, &mut ledger, &path).unwrap(),
+            assignment::Revetted::Refused(RevetFixture::key())
+        );
+        assert_eq!(api.comments.borrow().len(), 1);
+        assert_eq!(
+            Ledger::load(&path).unwrap().refused,
+            vec![RevetFixture::key()]
+        );
     }
 
     #[test]
-    fn revet_permanent_reporting_run_lookup_failure_settles_refusal() {
+    fn revet_permanent_reporting_run_lookup_failure_keeps_outcome_pending() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ledger.json");
         let mut ledger = revet_ledger();
@@ -1452,17 +1510,23 @@ mod tests {
         };
         let api = RevetFixture::new(false, false, false);
         api.fail_reporting_run_lookup.set(true);
-        assert_eq!(
-            revet_poll(&api, &mut guest, &mut ledger, &path).unwrap(),
-            assignment::Revetted::Refused(RevetFixture::key())
-        );
+        assert!(revet_poll(&api, &mut guest, &mut ledger, &path).is_err());
         assert_eq!(
             Ledger::load(&path).unwrap().refused,
             vec![RevetFixture::key()]
         );
-        assert_eq!(api.run_lookup_count.get(), 2);
         assert_eq!(guest.approvals, 0);
         assert!(api.comments.borrow().is_empty());
+        api.fail_reporting_run_lookup.set(false);
+        assert_eq!(
+            revet_poll(&api, &mut guest, &mut ledger, &path).unwrap(),
+            assignment::Revetted::Refused(RevetFixture::key())
+        );
+        assert_eq!(api.comments.borrow().len(), 1);
+        assert_eq!(
+            Ledger::load(&path).unwrap().refused,
+            vec![RevetFixture::key()]
+        );
     }
 
     #[test]
@@ -1539,6 +1603,86 @@ mod tests {
         );
         assert_eq!(guest.approvals, 0);
         assert_eq!(api.comments.borrow().len(), 1);
+    }
+
+    #[test]
+    fn revet_outcome_survives_clone_destruction_and_controller_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let api = RevetFixture::new(false, true, true);
+        let mut ledger = revet_ledger();
+        let mut guest = RevetGuest {
+            approvals: 0,
+            stale_sha: false,
+        };
+        assert!(revet_poll(&api, &mut guest, &mut ledger, &path).is_err());
+        assert!(api.comments.borrow().is_empty());
+        // Reaping and a process restart leave no live exchange to re-vet.
+        let mut restarted = Ledger::load(&path).unwrap();
+        restarted.rows[0].state = State::Destroyed;
+        restarted.save(&path).unwrap();
+        drop(ledger);
+        assignment::retry_refusal_outcomes(&api, &mut restarted, &path).unwrap();
+        assert_eq!(api.comments.borrow().len(), 1);
+        assignment::retry_refusal_outcomes(&api, &mut restarted, &path).unwrap();
+        assert_eq!(api.comments.borrow().len(), 1);
+        assert_eq!(guest.approvals, 0);
+    }
+
+    #[test]
+    fn revet_reporting_recovery_cannot_reverse_a_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let api = RevetFixture::new(false, true, true);
+        let mut ledger = revet_ledger();
+        let mut guest = RevetGuest {
+            approvals: 0,
+            stale_sha: false,
+        };
+        assert!(revet_poll(&api, &mut guest, &mut ledger, &path).is_err());
+        api.denied.set(false);
+        assignment::retry_refusal_outcomes(&api, &mut ledger, &path).unwrap();
+        assert!(matches!(
+            revet_poll(&api, &mut guest, &mut ledger, &path),
+            Ok(assignment::Revetted::Refused(_))
+        ));
+        assert_eq!(api.comments.borrow().len(), 1);
+        assert_eq!(guest.approvals, 0);
+    }
+
+    #[test]
+    fn revet_refusal_names_the_failed_check() {
+        for (denied, workflow_changed, reason) in [
+            (
+                true,
+                false,
+                "actor or triggering actor permission check refused",
+            ),
+            (false, true, "workflow identity check refused"),
+        ] {
+            let api = RevetFixture::new(false, denied, false);
+            api.workflow_changed.set(workflow_changed);
+            let dir = tempfile::tempdir().unwrap();
+            assert!(matches!(
+                revet_poll(
+                    &api,
+                    &mut RevetGuest {
+                        approvals: 0,
+                        stale_sha: false
+                    },
+                    &mut revet_ledger(),
+                    &dir.path().join("ledger")
+                ),
+                Ok(assignment::Revetted::Refused(_))
+            ));
+            assert_eq!(api.comments.borrow().len(), 1);
+            assert!(
+                api.comments.borrow()[0]["body"]
+                    .as_str()
+                    .unwrap()
+                    .contains(reason)
+            );
+        }
     }
 
     #[test]
