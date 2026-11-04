@@ -60,6 +60,9 @@ jobs:
         with:
           tool: sccache@0.18.0
 
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
       - name: Publish exact-SHA fixture bundle
         run: just fixtures-publish "$GITHUB_SHA"
 
@@ -164,6 +167,8 @@ jobs:
         with:
           shared-key: hvf-arm64-release
 
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
       - name: Download exact-SHA fixture bundle
         id: relay
         continue-on-error: true
@@ -387,8 +392,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
-        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
       - name: Install just
         uses: taiki-e/install-action@v2
         with:
@@ -438,14 +447,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
       - name: Install just
         uses: taiki-e/install-action@v2
         with:
           tool: just
 
       - name: Install per-user compiler cache
-        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
-
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
       - name: Install x86 image and fixture targets
         run: rustup target add x86_64-unknown-none x86_64-unknown-linux-musl
 
@@ -508,6 +520,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
       - name: Install just
         uses: taiki-e/install-action@v2
         with:
@@ -580,10 +594,15 @@ jobs:
           workspaces: selector -> target
           cache-workspace-crates: "true"
           save-if: false
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./selector/.github/actions/prepare-cargo
+        with:
+          root: selector
+          root-only: "true"
       - name: Build the trusted selector (owner seeding required at rollout)
         working-directory: selector
         run: |
-          cargo build --locked --release -p carrick-xtask
+          cargo build --locked --offline --release -p carrick-xtask
           target/release/carrick-xtask ci-receipt --help > "$RUNNER_TEMP/receipt-help"
           if ! grep -q select-baseline "$RUNNER_TEMP/receipt-help"; then
             echo "::error title=Baseline selector unavailable::The trusted pre-push commit predates the selector. Seed current main with an owner dispatch; subsequent pushes can compare."
@@ -615,10 +634,16 @@ jobs:
           workspaces: baseline -> target
           cache-workspace-crates: "true"
           save-if: false
+      - name: Prepare locked Cargo cache (infrastructure)
+        if: ${{ steps.baseline.outputs.reuse != 'true' }}
+        uses: ./selector/.github/actions/prepare-cargo
+        with:
+          root: baseline
+          root-only: "true"
       - name: Build the selected baseline xtask with its own lockfile
         if: ${{ steps.baseline.outputs.reuse != 'true' }}
         working-directory: baseline
-        run: cargo build --locked --release -p carrick-xtask
+        run: cargo build --locked --offline --release -p carrick-xtask
       - name: Download candidate receipt data
         uses: actions/download-artifact@v4
         with:
@@ -667,10 +692,15 @@ jobs:
           workspaces: selector -> target
           cache-workspace-crates: "true"
           save-if: false
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./selector/.github/actions/prepare-cargo
+        with:
+          root: selector
+          root-only: "true"
       - name: Build the trusted selector (owner seeding required at rollout)
         working-directory: selector
         run: |
-          cargo build --locked --release -p carrick-xtask
+          cargo build --locked --offline --release -p carrick-xtask
           target/release/carrick-xtask ci-receipt --help > "$RUNNER_TEMP/receipt-help"
           if ! grep -q select-baseline "$RUNNER_TEMP/receipt-help"; then
             echo "::error title=Baseline selector unavailable::The trusted pre-push commit predates the selector. Seed current main with an owner dispatch; subsequent pushes can compare."
@@ -702,10 +732,16 @@ jobs:
           workspaces: baseline -> target
           cache-workspace-crates: "true"
           save-if: false
+      - name: Prepare locked Cargo cache (infrastructure)
+        if: ${{ steps.baseline.outputs.reuse != 'true' }}
+        uses: ./selector/.github/actions/prepare-cargo
+        with:
+          root: baseline
+          root-only: "true"
       - name: Build the selected baseline xtask with its own lockfile
         if: ${{ steps.baseline.outputs.reuse != 'true' }}
         working-directory: baseline
-        run: cargo build --locked --release -p carrick-xtask
+        run: cargo build --locked --offline --release -p carrick-xtask
       - name: Download candidate receipt data
         uses: actions/download-artifact@v4
         with:
@@ -754,10 +790,15 @@ jobs:
           workspaces: selector -> target
           cache-workspace-crates: "true"
           save-if: false
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./selector/.github/actions/prepare-cargo
+        with:
+          root: selector
+          root-only: "true"
       - name: Build the trusted selector (owner seeding required at rollout)
         working-directory: selector
         run: |
-          cargo build --locked --release -p carrick-xtask
+          cargo build --locked --offline --release -p carrick-xtask
           target/release/carrick-xtask ci-receipt --help > "$RUNNER_TEMP/receipt-help"
           if ! grep -q select-baseline "$RUNNER_TEMP/receipt-help"; then
             echo "::error title=Baseline selector unavailable::The trusted pre-push commit predates the selector. Seed current main with an owner dispatch; subsequent pushes can compare."
@@ -789,10 +830,16 @@ jobs:
           workspaces: baseline -> target
           cache-workspace-crates: "true"
           save-if: false
+      - name: Prepare locked Cargo cache (infrastructure)
+        if: ${{ steps.baseline.outputs.reuse != 'true' }}
+        uses: ./selector/.github/actions/prepare-cargo
+        with:
+          root: baseline
+          root-only: "true"
       - name: Build the selected baseline xtask with its own lockfile
         if: ${{ steps.baseline.outputs.reuse != 'true' }}
         working-directory: baseline
-        run: cargo build --locked --release -p carrick-xtask
+        run: cargo build --locked --offline --release -p carrick-xtask
       - name: Download candidate receipt data
         uses: actions/download-artifact@v4
         with:
@@ -823,8 +870,10 @@ jobs:
           shared-key: gate-xtask-release
           cache-workspace-crates: "true"
           save-if: true
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
       - name: Build the trusted xtask
-        run: cargo build --locked --release -p carrick-xtask
+        run: cargo build --locked --offline --release -p carrick-xtask
 
   # Post-landing aggregate (not a merge requirement). Skipped or cancelled
   # lanes fail visibly; pushes also require both ancestor receipt comparisons.

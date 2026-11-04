@@ -79,6 +79,9 @@ jobs:
       - name: Start this job's local compiler cache server
         if: steps.compiler-cache.outputs.backend == 'local'
         run: scripts/ci/compiler-cache-start-local.sh
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
       - name: Build lean xtask
         run: just ci-prebuild-xtask
       - name: Compiler cache statistics
@@ -172,6 +175,9 @@ jobs:
         run: |
           scripts/ci/apt-cached-install.sh "$RUNNER_TEMP/apt-cross" gcc-aarch64-linux-gnu
           scripts/ci/apt-cached-install.sh "$RUNNER_TEMP/apt-bsd" clang llvm
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
       - name: Warm native build and test compilation union
         env:
           FAMILY: ${{ matrix.family }}
@@ -214,9 +220,9 @@ jobs:
               just check
               just test-loom --no-run
               just test-kernel-semantics --no-run
-              cargo test --locked --no-run -p carrick-host-linux
-              cargo test --locked --no-run -p carrick-softcpu-x86 --lib --tests
-              cargo test --locked --no-run -p carrick-x86-cpl0-host
+              cargo test --locked --offline --no-run -p carrick-host-linux
+              cargo test --locked --offline --no-run -p carrick-softcpu-x86 --lib --tests
+              cargo test --locked --offline --no-run -p carrick-x86-cpl0-host
               just clippy
               # Refresh compiler-cache LRU even when earlier Cargo outputs are
               # fresh. Keep the default admission build and the exact all-feature
@@ -230,10 +236,10 @@ jobs:
               ;;
             linux-arm64)
               just ci-prebuild-xtask
-              cargo check --locked -p carrick-kernel-example --tests
-              cargo build --locked -p carrick-kernel-example --tests
-              cargo test --locked --no-run -p carrick-kernel-example --tests
-              cargo test --locked --no-run -p carrick-el1-linux --lib
+              cargo check --locked --offline -p carrick-kernel-example --tests
+              cargo build --locked --offline -p carrick-kernel-example --tests
+              cargo test --locked --offline --no-run -p carrick-kernel-example --tests
+              cargo test --locked --offline --no-run -p carrick-el1-linux --lib
               ;;
           esac
       - name: Compiler cache statistics after critical replay
@@ -302,6 +308,9 @@ jobs:
       - name: Start this job's local compiler cache server
         if: steps.compiler-cache.outputs.backend == 'local'
         run: scripts/ci/compiler-cache-start-local.sh
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
       - name: Detect changed surfaces
         id: filter
         env:
@@ -366,6 +375,9 @@ jobs:
         run: |
           chmod +x "$RUNNER_TEMP/xtask/carrick-xtask"
           echo "CARRICK_XTASK_BIN=$RUNNER_TEMP/xtask/carrick-xtask" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
       - name: Compile the all-features xtask test union once
         run: just ci-build-xtask-tests
       - name: Compiler cache statistics
@@ -501,6 +513,8 @@ jobs:
           cache-workspace-crates: "true"
           cache-targets: true
           save-if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -570,6 +584,8 @@ jobs:
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -670,6 +686,8 @@ jobs:
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -749,6 +767,8 @@ jobs:
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -871,6 +891,8 @@ jobs:
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -943,6 +965,8 @@ jobs:
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -954,7 +978,7 @@ jobs:
         if: steps.compiler-cache.outputs.backend == 'local'
         run: scripts/ci/compiler-cache-start-local.sh
       - name: Software x86 CPU, MMU, and CPL0 host coordinator tests on x86_64
-        run: cargo test --locked -p carrick-softcpu-x86 -p carrick-softmmu -p carrick-x86-cpl0-host
+        run: cargo test --locked --offline -p carrick-softcpu-x86 -p carrick-softmmu -p carrick-x86-cpl0-host
       - name: Compiler cache statistics
         if: ${{ always() }}
         run: just ci-cache-finish
@@ -1000,6 +1024,8 @@ jobs:
             . -> target
             fuzz -> target
           save-if: false
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -1076,6 +1102,8 @@ jobs:
           cache-workspace-crates: "true"
           cache-targets: true
           save-if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -1142,6 +1170,8 @@ jobs:
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -1201,6 +1231,8 @@ jobs:
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -1265,6 +1297,8 @@ jobs:
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -1324,6 +1358,8 @@ jobs:
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -1383,6 +1419,8 @@ jobs:
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -1441,6 +1479,8 @@ jobs:
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -1471,8 +1511,8 @@ jobs:
       - name: Native x86_64 soft CPU tests and API witnesses
         if: ${{ !cancelled() }}
         run: |
-          cargo test --locked -p carrick-softcpu-x86 --lib --tests
-          cargo test --locked -p carrick-softcpu-x86 --doc
+          cargo test --locked --offline -p carrick-softcpu-x86 --lib --tests
+          cargo test --locked --offline -p carrick-softcpu-x86 --doc
 
       - name: Compiler cache statistics
         if: ${{ always() }}
@@ -1487,7 +1527,7 @@ jobs:
   # the macOS job: ~5 s of tests after the build. Measured 2026-09-17 in the lima
   # aarch64 VM before wiring: 94 passed, 0 failed.
   #
-  # NOT yet run here: the kernel lib lane (`cargo test -p carrick-kernel --lib
+  # NOT yet run here: the kernel lib lane (`cargo test --locked --offline -p carrick-kernel --lib
   # --features test-support -- --skip serial_host`). On Linux it passes 1957/1964;
   # the seven failures are host-specific expectations, each a named follow-up
   # (fix the Linux host path or gate the Darwin expectation), never a skip list:
@@ -1538,6 +1578,8 @@ jobs:
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -1602,6 +1644,8 @@ jobs:
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -1699,11 +1743,16 @@ jobs:
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./selector/.github/actions/prepare-cargo
+        with:
+          root: selector
+          root-only: "true"
       - name: Build the trusted selector
         working-directory: selector
         run: |
           rustup show active-toolchain
-          cargo build --locked --release -p carrick-xtask
+          cargo build --locked --offline --release -p carrick-xtask
       - name: Select the nearest trusted receipt baseline
         id: baseline
         working-directory: selector
@@ -1737,12 +1786,18 @@ jobs:
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false
+      - name: Prepare locked Cargo cache (infrastructure)
+        if: ${{ steps.baseline.outputs.sha != steps.ancestor.outputs.selector_sha }}
+        uses: ./selector/.github/actions/prepare-cargo
+        with:
+          root: baseline
+          root-only: "true"
       - name: Build the selected baseline xtask with its own lockfile
         if: ${{ steps.baseline.outputs.sha != steps.ancestor.outputs.selector_sha }}
         working-directory: baseline
         run: |
           rustup show active-toolchain
-          cargo build --locked --release -p carrick-xtask
+          cargo build --locked --offline --release -p carrick-xtask
       - name: Download candidate receipt data
         uses: actions/download-artifact@v4
         with:
@@ -1801,6 +1856,8 @@ jobs:
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -1927,6 +1984,8 @@ jobs:
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -2045,6 +2104,8 @@ jobs:
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -2150,6 +2211,9 @@ jobs:
       - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: just
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+      - name: Prepare locked Cargo cache (infrastructure)
+        uses: ./.github/actions/prepare-cargo
       - name: Detect a run superseded on the same head
         id: superseded
         env:
