@@ -910,6 +910,30 @@ fn roster(text: &str) -> Vec<Value> {
         .map(|id| json!(id))
         .collect()
 }
+/// The pinned launcher's `models` output tags only live-catalog Blue models.
+fn daybreak_roster(text: &str) -> Vec<Value> {
+    let admitted = roster(text);
+    text.lines()
+        .take_while(|line| !line.is_empty())
+        .filter(|line| {
+            line.split_once('(').is_some_and(|(_, tags)| {
+                tags.trim_end_matches(')')
+                    .split(',')
+                    .any(|tag| tag.trim() == "daybreak")
+            })
+        })
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|id| admitted.iter().any(|value| value == id))
+        .map(|id| json!(id))
+        .collect()
+}
+
+fn daybreak_requested(trigger: &Value) -> bool {
+    trigger["body"]
+        .as_str()
+        .is_some_and(|body| body.lines().any(|line| line.trim() == "Daybreak: allowed"))
+}
+
 /// Each backend's credential, relative to the runner's agent home. A
 /// backend is installed only when its credential is present.
 fn backend_credential(backend: &str) -> Option<&'static str> {
@@ -1024,6 +1048,7 @@ fn read_capacity(deadline: Instant) -> Result<Value, ScalerError> {
         report.insert(backend.to_owned(), json!({"installed":installed,"free_slots":entry["free_slots"].as_u64(),
             "quota_free":entry["quota_free"].as_f64(),"score":entry["score"].as_f64(),"quota":{"groups":groups},
             "group_scores":group_scores,"models":models,
+            "daybreak_models": if backend == "codex" { listed.as_deref().map(daybreak_roster).unwrap_or_default() } else { vec![] },
             "roster":if installed && listed.is_none() { "unavailable" } else { "live" }}));
     }
     let report = json!({"backends":report});
@@ -1046,6 +1071,16 @@ fn available_worker(capacity: &Value, backend: &str, model: &str) -> Result<Work
     {
         return Err(ScalerError::Guard(
             "backend or model unavailable or exhausted",
+        ));
+    }
+    if model == DAYBREAK_MODEL
+        && (backend != "codex"
+            || !entry["daybreak_models"]
+                .as_array()
+                .is_some_and(|models| models.iter().any(|id| id == model)))
+    {
+        return Err(ScalerError::Guard(
+            "Daybreak Blue model unavailable in live access-program catalog; owner must verify the dispatch credential's Daybreak access",
         ));
     }
     let vendor = if backend == "codex" {
@@ -2207,7 +2242,9 @@ impl Server<'_> {
                     self.tier.reason
                 )
             });
-        let status = if !observations.is_empty() {
+        let status = if applied.last_provider_filter {
+            RoundStatus::Blocked
+        } else if !observations.is_empty() {
             RoundStatus::Failed
         } else if applied.adoption_blocked.is_some() && claimed_done {
             // An adopted PR moved or was rewritten: nothing was pushed.
@@ -3164,7 +3201,12 @@ impl Server<'_> {
                 Ok(response)
             }
             Request::SelectBranch(Branch { branch }) => self.select_branch(&branch),
-            Request::InvokeWorker(selection) => {
+            Request::InvokeWorker(mut selection) => {
+                let upfront = daybreak_requested(&self.trigger) && self.used.workers == 0;
+                if upfront {
+                    selection.backend = "codex".into();
+                    selection.model = DAYBREAK_MODEL.into();
+                }
                 if self.used.refused_workers >= self.policy.refused_workers {
                     return Err(ScalerError::Guard("refused worker budget exhausted"));
                 }
@@ -3193,6 +3235,7 @@ impl Server<'_> {
                 let started = Instant::now();
                 let worker_index = self.history.len();
                 let _ = Applied::record(|applied| {
+                    applied.last_provider_filter = false;
                     applied.last_worker_exit = None;
                     applied.last_worker_error = None;
                 });
@@ -3302,6 +3345,32 @@ impl Server<'_> {
                     });
                 }
                 let checkpoint = self.checkpoint_publish();
+                if upfront {
+                    Applied::record(|a| {
+                        a.provider_events.push(
+                            "owner requested Daybreak Blue up front (`Daybreak: allowed`)".into(),
+                        )
+                    })?;
+                }
+                let provider_filter = Applied::load()?.last_provider_filter;
+                if provider_filter {
+                    let switching = self.dispatch.worker.model != DAYBREAK_MODEL;
+                    Applied::record(|a| {
+                        a.provider_events.push(if switching {
+                        "hardware-key refusal classified as provider filter, not worker failure; checkpoint retained; retrying the same brief on Daybreak Blue".into()
+                    } else {
+                        "Daybreak Blue was refused; owner must verify Daybreak eligibility and hardware-key sign-in in the approved workspace, refresh CODEX_AUTH_JSON through the existing owner secret sync, and verify a clone turn; exported-session hardware-key assurance is unproven; credentials were not changed".into()
+                    })
+                    })?;
+                    if switching {
+                        // Fresh capacity and the ordinary admission/budget checks apply.
+                        return self.execute(Request::InvokeWorker(Notes {
+                            notes: selection.notes,
+                            backend: "codex".into(),
+                            model: DAYBREAK_MODEL.into(),
+                        }));
+                    }
+                }
                 result.map(|mut response| {
                     if let Some(note) = checkpoint {
                         response["checkpoint"] = note.into();
@@ -5670,6 +5739,8 @@ fi
     }
     #[derive(Clone, Copy)]
     enum FixtureTurn {
+        ProviderFilter,
+        AfterProviderFilter,
         Good,
         ProposeBody,
         CorruptBody,
@@ -5728,6 +5799,14 @@ fi
             let state = crate::agent_runner::state()?;
             let actor = root.parent().unwrap();
             let script = match self.active {
+                FixtureTurn::ProviderFilter => {
+                    "printf partial > filter-checkpoint; rm ../result.json"
+                }
+                FixtureTurn::AfterProviderFilter => {
+                    assert_eq!(dispatch.worker.model, DAYBREAK_MODEL);
+                    assert_eq!(regular_text(&root.join("filter-checkpoint"))?, "partial");
+                    "printf complete > completed"
+                }
                 FixtureTurn::Good => "printf good > first-good",
                 FixtureTurn::ProposeBody => {
                     "printf 'Explain the completed fix. fixture-token\\n' > ../pr-body.md; printf good > first-good"
@@ -5774,6 +5853,14 @@ fi
                     .unwrap()
                     .saturating_duration_since(Instant::now()),
             );
+            if matches!(self.active, FixtureTurn::ProviderFilter) {
+                let refusal = "approved for Daybreak Blue, but this response cannot be shown as this session was not authenticated with one of your authorized hardware keys";
+                std::fs::write(
+                    actor.join("runtime/dispatch/worker.log"),
+                    json!({"type":"item.completed","item":{"type":"agent_message","text":refusal}})
+                        .to_string(),
+                )?;
+            }
             std::fs::write(state.join("agent.err"), "")?;
             if matches!(self.active, FixtureTurn::Timeout) {
                 assert!(
@@ -5785,12 +5872,21 @@ fi
                 Ok(124)
             } else {
                 result?;
-                if matches!(self.active, FixtureTurn::Good) {
-                    git(root, &["add", "--", "first-good"])?;
+                if matches!(
+                    self.active,
+                    FixtureTurn::Good | FixtureTurn::AfterProviderFilter
+                ) {
+                    let file = if matches!(self.active, FixtureTurn::Good) {
+                        "first-good"
+                    } else {
+                        "completed"
+                    };
+                    git(root, &["add", "--", file])?;
                     git(root, &["commit", "-m", "fix(ci): first good worker"])?;
                 }
                 Ok(match self.active {
-                    FixtureTurn::MissingResult
+                    FixtureTurn::ProviderFilter
+                    | FixtureTurn::MissingResult
                     | FixtureTurn::LauncherFailure
                     | FixtureTurn::PublishThenExit => 1,
                     FixtureTurn::ReportedTimeout => 124,
@@ -5853,6 +5949,105 @@ fi
         ) -> Result<(), ScalerError> {
             self.0.produce(root, dispatch, setup)
         }
+    }
+    struct DaybreakFixtureLauncher(NativeLauncher);
+    impl WorkerLauncher for DaybreakFixtureLauncher {
+        fn capacity(&mut self, _: Instant) -> Result<Value, ScalerError> {
+            let mut report = live_capacity();
+            report["backends"]["codex"]["models"] = json!(["gpt-6.1-sol", DAYBREAK_MODEL]);
+            report["backends"]["codex"]["daybreak_models"] = json!([DAYBREAK_MODEL]);
+            Ok(report)
+        }
+        fn produce(
+            &mut self,
+            root: &Path,
+            dispatch: &Dispatch,
+            setup: &str,
+        ) -> Result<(), ScalerError> {
+            self.0.produce(root, dispatch, setup)
+        }
+    }
+    #[test]
+    fn daybreak_provider_filter_checkpoints_and_replays_once() {
+        shared_fixture(|root| {
+            let base = root.join("base");
+            let dispatch = native_dispatch(&base);
+            let mut server = server(&base);
+            server.dispatch = dispatch;
+            let (native, calls) = native_fixture(vec![
+                FixtureTurn::ProviderFilter,
+                FixtureTurn::AfterProviderFilter,
+            ]);
+            server.launcher = Box::new(DaybreakFixtureLauncher(native));
+            let response = server.execute(worker_request()).unwrap();
+            assert_eq!(response["status"], "done", "{response}");
+            assert_eq!(calls.get(), 2);
+            assert_eq!(server.history[0].status, ContractStatus::Blocked);
+            assert_eq!(server.used.workers, 2);
+            let state = crate::agent_runner::state().unwrap();
+            let receipt = worker_checkpoint(&state, &server.dispatch)
+                .unwrap()
+                .unwrap();
+            assert_eq!(receipt.worker.model, DAYBREAK_MODEL);
+            assert_eq!(
+                regular_text(&state.join("work/filter-checkpoint")).unwrap(),
+                "partial"
+            );
+            let report = Applied::load().unwrap().report();
+            assert!(report.contains("Provider filter:"), "{report}");
+            assert!(report.contains("retrying the same brief on Daybreak Blue"));
+        });
+    }
+    #[test]
+    fn daybreak_owner_trigger_uses_existing_admission_and_stops_after_refusal() {
+        shared_fixture(|root| {
+            let base = root.join("base");
+            let dispatch = native_dispatch(&base);
+            let mut server = server(&base);
+            server.dispatch = dispatch;
+            server.trigger["body"] = json!("/agent\nDaybreak: allowed");
+            let (native, calls) = native_fixture(vec![FixtureTurn::ProviderFilter]);
+            server.launcher = Box::new(DaybreakFixtureLauncher(native));
+            let response = server.execute(worker_request()).unwrap();
+            assert_eq!(response["status"], "blocked");
+            assert_eq!(calls.get(), 1);
+            assert_eq!(server.dispatch.worker.model, DAYBREAK_MODEL);
+            assert!(Applied::load().unwrap().report().contains("owner must"));
+        });
+    }
+    #[test]
+    fn daybreak_catalog_and_launcher_parameters() {
+        let listed = "gpt-6.1-sol\ngpt-daybreak-blue-latest  (daybreak)\ngpt-5-sol  (superseded, daybreak)\n\n--model medium -> gpt-6.1-sol";
+        assert_eq!(daybreak_roster(listed), vec![json!(DAYBREAK_MODEL)]);
+        let mut capacity = live_capacity();
+        capacity["backends"]["codex"]["models"] = json!([DAYBREAK_MODEL]);
+        assert!(available_worker(&capacity, "codex", DAYBREAK_MODEL).is_err());
+        capacity["backends"]["codex"]["daybreak_models"] = json!([DAYBREAK_MODEL]);
+        let worker = available_worker(&capacity, "codex", DAYBREAK_MODEL).unwrap();
+        let state = Path::new("/fixture");
+        let command = foreground_command(
+            state,
+            state,
+            Foreground {
+                run: "dispatch",
+                name: "worker",
+                backend: "codex",
+                model: &worker.model,
+                effort: None,
+                schema: None,
+                limit: Duration::from_secs(10),
+            },
+        );
+        assert!(command.get_args().any(|arg| arg == "--daybreak"));
+        let mut environment = Command::new("python3");
+        worker_environment(&mut environment, state, &worker, Some(state)).unwrap();
+        assert!(
+            environment
+                .get_envs()
+                .any(|(key, value)| key == "CODEX_DAYBREAK_MODELS"
+                    && value == Some(std::ffi::OsStr::new(DAYBREAK_MODEL)))
+        );
+        assert!(!daybreak_requested(&json!({"body":"> Daybreak: allowed"})));
     }
     #[test]
     fn admitted_worker_inline_read_error_is_recorded() {

@@ -958,6 +958,17 @@ pub(crate) fn private_environment(command: &mut Command) {
         .env("CARRICK_SCCACHE", "0");
 }
 
+/// Dispatch uses the launcher's existing Daybreak protocol, never a second client.
+pub(crate) const DAYBREAK_MODEL: &str = "gpt-daybreak-blue-latest";
+
+/// Match the provider's specific access refusal, including normal assistant replies.
+/// Other refusals and ordinary worker errors must not trigger a program switch.
+pub(crate) fn daybreak_refusal(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("approved for daybreak blue")
+        && text.contains("not authenticated with one of your authorized hardware keys")
+}
+
 struct Foreground<'a> {
     run: &'a str,
     name: &'a str,
@@ -998,6 +1009,9 @@ fn foreground_command(state: &Path, root: &Path, launch: Foreground<'_>) -> Comm
         "--model",
         launch.model,
     ]);
+    if launch.backend == "codex" && launch.model == DAYBREAK_MODEL {
+        command.arg("--daybreak");
+    }
     if let Some(effort) = launch.effort {
         command.args(["--effort", effort]);
     }
@@ -1206,6 +1220,14 @@ fn worker_environment(
         ))?;
         command
             .env("CODEX_MODELS", worker.roster.join(" "))
+            .env(
+                "CODEX_DAYBREAK_MODELS",
+                if worker.model == DAYBREAK_MODEL {
+                    DAYBREAK_MODEL
+                } else {
+                    ""
+                },
+            )
             .env("CODEX_SQLITE_HOME", sqlite_home);
     }
     if worker.backend == "copilot" {
@@ -1645,6 +1667,28 @@ fn json_error_text(value: &Value) -> Option<String> {
                 .map(str::to_owned)
         })
         .filter(|s| !s.trim().is_empty())
+}
+
+pub(crate) fn provider_filter_in_log(log: &str) -> bool {
+    let mut terminal = false;
+    for v in log
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+    {
+        if v["item"]["type"] == "agent_message" {
+            terminal = v["item"]["text"].as_str().is_some_and(daybreak_refusal);
+        } else if matches!(
+            v["item"]["type"].as_str(),
+            Some("command_execution" | "mcp_tool_call")
+        ) {
+            terminal = false;
+        } else if v["type"] == "turn.failed" {
+            terminal = json_error_text(&v["error"])
+                .as_deref()
+                .is_some_and(daybreak_refusal);
+        }
+    }
+    terminal
 }
 
 pub(crate) fn extract_worker_log_error(log: &str) -> Option<String> {
@@ -4393,6 +4437,7 @@ fn produce(
         String::new()
     };
     let mut diffstat = String::new();
+    let mut provider_filtered = false;
     let mut worker_error =
         (setup != "success/success").then(|| format!("Worker setup did not complete: {setup}"));
     if setup == "success/success" {
@@ -4467,6 +4512,9 @@ fn produce(
                     .and_then(|err| extract_stderr_error(&err))
             })
             .or(agent_error);
+        provider_filtered = unredacted_diagnostic_text(&actor.join("runtime/dispatch/worker.log"))
+            .is_ok_and(|log| provider_filter_in_log(&log))
+            || worker_error.as_deref().is_some_and(daybreak_refusal);
         let preharvest_error = worker_error
             .as_deref()
             .map(|err| format_worker_error(err, &token))
@@ -4537,12 +4585,18 @@ fn produce(
         });
         candidate = Some(staging);
     }
+    if provider_filtered && contract.status != ContractStatus::Done {
+        contract.status = ContractStatus::Blocked;
+        contract.summary = "Provider filter: Daybreak Blue hardware-key authentication refusal; work checkpointed for Daybreak admission".into();
+    }
     let recorded_error = (contract.status == ContractStatus::Failed)
         .then_some(worker_error)
         .flatten()
         .map(|err| format_worker_error(&err, &token))
         .filter(|err| !err.is_empty());
     let _ = Applied::record(|applied| {
+        applied.last_provider_filter =
+            provider_filtered && contract.status == ContractStatus::Blocked;
         applied.last_worker_exit = resolved_exit;
         applied.last_worker_error = recorded_error;
     });
@@ -4867,6 +4921,10 @@ struct Applied {
     /// and tail-limited (#1473).
     #[serde(default)]
     pub(crate) last_worker_error: Option<String>,
+    #[serde(default)]
+    provider_events: Vec<String>,
+    #[serde(default)]
+    last_provider_filter: bool,
 }
 impl Applied {
     fn load() -> Result<Self, ScalerError> {
@@ -4888,7 +4946,8 @@ impl Applied {
     }
     fn report(&self) -> String {
         format!(
-            "{}{}- PR commits: {}.{}\n- PR body: {}.\n- Board status: {}.{}",
+            "{}{}{}- PR commits: {}.{}\n- PR body: {}.\n- Board status: {}.{}",
+            self.provider_events.iter().map(|event| format!("- Provider filter: {event}.\n")).collect::<String>(),
             self.adoption_blocked
                 .as_ref()
                 .map(|reason| format!("- Push refused: {reason}.\n"))
@@ -7073,6 +7132,20 @@ pub(crate) mod chain_fixture {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #[test]
+    fn daybreak_refusal_requires_terminal_provider_evidence() {
+        let refusal = "approved for Daybreak Blue, but this response cannot be shown as this session was not authenticated with one of your authorized hardware keys";
+        assert!(super::daybreak_refusal(refusal));
+        assert!(!super::daybreak_refusal("ordinary worker failure"));
+        let event = serde_json::json!({"type":"item.completed","item":{"type":"agent_message","text":refusal}}).to_string();
+        assert!(super::provider_filter_in_log(&event));
+        let done = serde_json::json!({"type":"item.completed","item":{"type":"agent_message","text":"Implemented and verified"}}).to_string();
+        assert!(!super::provider_filter_in_log(&format!("{event}\n{done}")));
+        assert!(!super::provider_filter_in_log(
+            &serde_json::json!({"item":{"type":"command_execution","text":refusal}}).to_string()
+        ));
+    }
+
     use super::*;
     /// A fixture procfs: `(tid, stat, status)` per thread of `pid`.
     fn fake_proc(root: &Path, pid: i32, leader: &str, threads: &[(i32, &str, &str)]) {
