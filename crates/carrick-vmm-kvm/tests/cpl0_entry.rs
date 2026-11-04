@@ -1289,7 +1289,7 @@ fn x1_boot_shared_substrate() {
     };
     // SAFETY: this new record remains host-owned until requeue.
     unsafe { *zone.record(record).ctx_mut() = park_native_context(&native) };
-    zone.requeue_preempted(slot, record);
+    assert!(zone.requeue_preempted(slot, record).is_queued());
     let on_cpu = zone.switch_in(slot).unwrap();
     assert_eq!(on_cpu, record);
 

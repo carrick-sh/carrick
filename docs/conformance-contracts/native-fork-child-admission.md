@@ -70,3 +70,12 @@ ordinary sibling-exit interleaving; signed execution remains director-owned.
 These witnesses map their lifecycle metadata in the EL1 dynamic metadata
 window, which macOS hosts cannot reserve, so like main's other window
 fixtures they are compiled out on macOS and run on Linux (el1-native).
+
+The neutral `carrick_core::lifecycle::stock::StockEntries` owns the native
+stock's identity reservations and their lifecycle decisions. It reaps only
+exact exited generations after their last control pin, selects reusable slots,
+and decides queue-locked clone admission while arming final-pin notifications.
+The Linux adapter retains namespace allocation, control reset and scheduler
+wiring. No lifecycle ceiling, concurrency, wait policy or work budget changes.
+The existing two-live-process allocation, reuse, final-pin, Claimed-sibling
+and ExitingBorn-sibling bindings exercise this owner through native dispatch.

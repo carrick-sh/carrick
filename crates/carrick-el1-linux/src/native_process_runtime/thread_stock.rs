@@ -1,11 +1,12 @@
 //! Native graph adapter for the shared thread-birth stock owner.
 use super::*;
-use carrick_core::lifecycle::stock::{DEFAULT_THREAD_POOL_DEPTH, ThreadStock};
-use carrick_core::lifecycle::{EntryState, MemberControl};
+use carrick_core::lifecycle::stock::{
+    DEFAULT_THREAD_POOL_DEPTH, StockAdmission, StockEntries, ThreadStock,
+};
 
 pub(super) struct NativeThreadStock<'a, C: ProcessContext> {
     controls: &'a [ThreadControlSlot],
-    identities: Vec<(EntryRef, NativeClaim)>,
+    identities: StockEntries<NativeClaim>,
     waiters: Vec<carrick_el1_abi::RecordRef>,
     release: Arc<ControlRelease<'a, C>>,
 }
@@ -56,7 +57,7 @@ impl<'a, C: ProcessContext> NativeThreadStock<'a, C> {
                 Ok(ticket) => {
                     return Ok(Self {
                         controls,
-                        identities: Vec::new(),
+                        identities: StockEntries::default(),
                         waiters: Vec::with_capacity(carrick_el1_abi::THREAD_POOL_ENTRIES + 1),
                         release: Arc::new(ControlRelease {
                             zone,
@@ -74,35 +75,9 @@ impl<'a, C: ProcessContext> NativeThreadStock<'a, C> {
         Err(NativeProcessError::Exhausted)
     }
     fn settle(&mut self, page: &ThreadLifecyclePage) -> Result<(), NativeProcessError> {
-        let mut index = 0;
-        while index < self.identities.len() {
-            let entry = self.identities[index].0;
-            match page.state(entry.index()) {
-                Some((generation, EntryState::ExitedInZone))
-                    if generation == entry.generation() =>
-                {
-                    let control = &self.controls[entry.index() + 1];
-                    if control.exit_custody().referenced() {
-                        index += 1;
-                        continue;
-                    }
-                    page.reap(entry).map_err(|_| NativeProcessError::Stale)?;
-                    self.identities.swap_remove(index);
-                }
-                Some((generation, EntryState::Reaped | EntryState::Revoked))
-                    if generation == entry.generation() =>
-                {
-                    if self.controls[entry.index() + 1].exit_custody().referenced() {
-                        index += 1;
-                    } else {
-                        self.identities.swap_remove(index);
-                    }
-                }
-                Some((generation, _)) if generation == entry.generation() => index += 1,
-                _ => return Err(NativeProcessError::Stale),
-            }
-        }
-        Ok(())
+        self.identities
+            .settle(page, self.controls)
+            .map_err(|_| NativeProcessError::Stale)
     }
 }
 
@@ -184,27 +159,18 @@ pub(super) fn replenish<'a, M: Clone, C: ProcessContext>(
             self.page
         }
         fn standing(&self) -> usize {
-            self.stock
-                .identities
-                .iter()
-                .filter(|(entry, _)| {
-                    self.page.state(entry.index())
-                        == Some((entry.generation(), EntryState::Reserved))
-                })
-                .count()
+            self.stock.identities.standing(self.page)
         }
+
         fn reserve_and_stock(&mut self) -> bool {
             if self.limit {
                 return false;
             }
-            let Some(index) = (0..self.page.entry_count()).find(|&i| {
-                self.page.state(i).is_some_and(|(_, state)| {
-                    matches!(
-                        state,
-                        EntryState::Vacant | EntryState::Reaped | EntryState::Revoked
-                    )
-                }) && !self.stock.controls[i + 1].exit_custody().referenced()
-            }) else {
+            let Some(index) = self
+                .stock
+                .identities
+                .recyclable(self.page, self.stock.controls)
+            else {
                 return false;
             };
             // Recycle only after the final graph/control pin is released.
@@ -248,7 +214,7 @@ pub(super) fn replenish<'a, M: Clone, C: ProcessContext>(
             ) else {
                 return false;
             };
-            self.stock.identities.push((entry, claim));
+            self.stock.identities.insert(entry, claim);
             true
         }
     }
@@ -353,56 +319,22 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         .thread_stock
                         .as_ref()
                         .ok_or(ObjectWaitError::Stale)?;
-                    if stock.identities.iter().any(|(entry, _)| {
-                        resources.page.state(entry.index())
-                            == Some((entry.generation(), EntryState::Reserved))
-                    }) {
-                        return Err(ObjectWaitError::Changed);
-                    }
-                    // Only native pool births have the admission-settled
-                    // notifier. The process-close census also includes host
-                    // claims and external work, which cannot release this stock.
-                    let mut pending_release = (0..resources.page.entry_count()).any(|index| {
-                        resources
-                            .page
-                            .state(index)
-                            .is_some_and(|(_, state)| state == EntryState::Claimed)
-                    });
-                    for (entry, _) in &stock.identities {
-                        if resources
-                            .page
-                            .state(entry.index())
-                            .is_some_and(|(generation, state)| {
-                                generation == entry.generation()
-                                    && matches!(
-                                        state,
-                                        EntryState::ExitingBorn
-                                            | EntryState::ExitingPublished
-                                            | EntryState::ExitedInZone
-                                            | EntryState::Reaped
-                                            | EntryState::Revoked
-                                    )
-                            })
-                        {
-                            // SAFETY: the process stock owns this source and
-                            // retains the control extent through final-pin
-                            // settlement; its zone outlives these members.
-                            // Fork-loan member/projection pins are dropped in
-                            // the shared supervisor mapping, never by the host.
-                            if !unsafe {
-                                carrick_core::lifecycle::arm_member_release(
-                                    &stock.controls[entry.index() + 1],
-                                    release.clone(),
-                                )
-                            } {
-                                return Err(ObjectWaitError::Changed);
-                            }
-                            pending_release = true;
+                    // SAFETY: stock retains the source and control extent in
+                    // the shared mapping until final-pin settlement. The queue
+                    // is enrolled before this neutral admission decision.
+                    match unsafe {
+                        stock
+                            .identities
+                            .admission(resources.page, stock.controls, release.clone())
+                    } {
+                        StockAdmission::Ready | StockAdmission::Changed => {
+                            return Err(ObjectWaitError::Changed);
                         }
-                    }
-                    if !pending_release {
-                        limit = true;
-                        return Err(ObjectWaitError::Changed);
+                        StockAdmission::Exhausted => {
+                            limit = true;
+                            return Err(ObjectWaitError::Changed);
+                        }
+                        StockAdmission::Waiting => {}
                     }
                     let stock = graph
                         .owner
@@ -450,12 +382,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         .map_err(|_| NativeProcessError::Stale)?
                         .native()
                         .resources();
-                    if (0..resources.page.entry_count()).any(|i| {
-                        resources
-                            .page
-                            .state(i)
-                            .is_some_and(|(_, state)| state == EntryState::Reserved)
-                    }) {
+                    if resources
+                        .thread_stock
+                        .as_ref()
+                        .ok_or(NativeProcessError::Stale)?
+                        .identities
+                        .standing(resources.page)
+                        != 0
+                    {
                         return Ok(ThreadBirthAdmission::Ready);
                     }
                 }
