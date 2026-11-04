@@ -968,7 +968,29 @@ fn hardware_lanes_never_wait_and_hosted_gates_grade_with_receipted_baseline_code
                 .starts_with(name)
         );
         let script = runs(gate).join("\n");
-        assert!(script.contains("cargo build --locked --release -p carrick-xtask"));
+        // #1571: the locked build runs offline, after `prepare-cargo` has
+        // populated the registry from the lockfile.
+        assert!(script.contains("cargo build --locked --offline --release -p carrick-xtask"));
+        let prepare = steps
+            .iter()
+            .position(|s| {
+                s["uses"]
+                    .as_str()
+                    .is_some_and(|u| u.ends_with(".github/actions/prepare-cargo"))
+            })
+            .unwrap_or_else(|| panic!("{name} must prepare the locked cargo cache"));
+        let build = steps
+            .iter()
+            .position(|s| {
+                s["run"]
+                    .as_str()
+                    .is_some_and(|r| r.contains("cargo build --locked --offline"))
+            })
+            .unwrap();
+        assert!(
+            prepare < build,
+            "{name} must prepare before its offline build"
+        );
         assert!(script.contains("--wait-minutes 90"));
         assert!(script.contains("--run-attempt \"$GITHUB_RUN_ATTEMPT\""));
         assert!(
