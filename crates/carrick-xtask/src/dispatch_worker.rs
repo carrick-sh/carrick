@@ -10770,6 +10770,117 @@ fi
             "agent processes survived timeout: {survivors:?}"
         );
     }
+    /// #1626 P2 3: production `agent-runner cleanup` (the real
+    /// `HostDispatchAccounts` authority, no double) retires a live,
+    /// SIGTERM/SIGHUP-ignoring process of each dispatch account and then
+    /// removes the job state.
+    ///
+    /// Privileged-only, so no CI lane runs it:
+    /// - hosted CI runners have neither pre-created account nor the
+    ///   `runner ALL=(<account>) NOPASSWD` sudoers rules that
+    ///   `scripts/ci/build-template-debian.sh` installs on agent clones;
+    /// - inside a dispatch job the test suite runs as
+    ///   `carrick-dispatch-agent`, which by design can't `sudo` to the loop
+    ///   account;
+    /// - the `runner` user that holds those rights is running the live
+    ///   dispatch loop, which this retirement would kill.
+    ///
+    /// Run it as `runner` on an idle agent-profile clone (no dispatch job);
+    /// `--bins` builds `target/debug/carrick-xtask`, the retirement helper
+    /// that `retirement_command` copies under `cfg(test)`:
+    /// `cargo test -p carrick-xtask --lib --bins --
+    /// --ignored --exact
+    /// dispatch_worker::tests::serial_host_cleanup_retires_both_dispatch_accounts_then_removes_state`.
+    /// An explicit run without those prerequisites fails; it never skips.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "privileged runner-only witness: run as `runner` on an idle agent clone"]
+    fn serial_host_cleanup_retires_both_dispatch_accounts_then_removes_state() {
+        // SAFETY: geteuid has no preconditions.
+        let euid = unsafe { libc::geteuid() };
+        for user in [AGENT_USER, LOOP_USER] {
+            let id = Command::new("/usr/bin/id")
+                .args(["-u", user])
+                .output()
+                .unwrap();
+            assert!(
+                id.status.success(),
+                "privileged lane prerequisite missing: account {user} absent"
+            );
+            assert_ne!(
+                String::from_utf8_lossy(&id.stdout).trim(),
+                euid.to_string(),
+                "run as the account owner (`runner`), not as {user}"
+            );
+            let mut probe = Command::new("/usr/bin/sudo");
+            private_environment(&mut probe);
+            let probe = probe
+                .args(["-n", "-u", user, "--", "/bin/true"])
+                .output()
+                .unwrap();
+            assert!(
+                probe.status.success(),
+                "privileged lane prerequisite missing: no `sudo -n -u {user}`"
+            );
+        }
+        cleanup_dispatch_users().expect("accounts must start retirable and idle");
+        let mut holders = Vec::new();
+        for user in [AGENT_USER, LOOP_USER] {
+            let mut command = Command::new("/usr/bin/sudo");
+            private_environment(&mut command);
+            let mut child = command
+                .args([
+                    "-n",
+                    "-u",
+                    user,
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    "trap '' TERM HUP; echo $$; exec /bin/sleep 60",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut line = String::new();
+            std::io::BufRead::read_line(
+                &mut std::io::BufReader::new(child.stdout.take().unwrap()),
+                &mut line,
+            )
+            .unwrap();
+            let pid: libc::pid_t = line.trim().parse().unwrap();
+            holders.push((user, pid, child));
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("carrick-agent-42-1");
+        std::fs::create_dir_all(state.join("home/.codex")).unwrap();
+        std::fs::write(state.join("home/.codex/auth.json"), b"fixture").unwrap();
+
+        let verdict = crate::agent_runner::cleanup(
+            &mut crate::agent_runner::HostDispatchAccounts,
+            Ok(state.clone()),
+        );
+
+        let mut survivors = Vec::new();
+        for (user, pid, mut child) in holders {
+            // sudo reaps its killed child, then exits itself.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            if census_entry(pid).is_some_and(|entry| !entry.live_threads.is_empty()) {
+                survivors.push(format!("{user} pid {pid}"));
+                // The fixture owns its holders even when retirement failed.
+                let _ = sudo_as(user, &["/usr/bin/kill", "-KILL", "--", &pid.to_string()]);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(verdict.is_ok(), "{verdict:?}");
+        assert!(survivors.is_empty(), "survived cleanup: {survivors:?}");
+        assert!(!state.try_exists().unwrap(), "job state left behind");
+    }
     /// #1531 production witness: two `produce` rounds through the real
     /// `worker_checkout` -> agent -> `harvest_worker` -> checkpoint path.
     /// Worker 1 makes the consented rebase onto admitted main (the admitted

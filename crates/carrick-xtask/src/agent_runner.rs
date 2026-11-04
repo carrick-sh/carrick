@@ -24,14 +24,9 @@ pub enum Action {
         event: PathBuf,
     },
     /// Retire the dispatch accounts' processes, then remove the entire
-    /// job-scoped home, credentials and launcher state.
-    Cleanup {
-        /// Leave the OS accounts alone and remove only this run's state.
-        /// For fixtures that must not census or signal a host's real
-        /// dispatch accounts; the workflow never passes it.
-        #[arg(long)]
-        state_only: bool,
-    },
+    /// job-scoped home, credentials and launcher state. The state is
+    /// removed even when retirement fails; that failure is still reported.
+    Cleanup,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -682,27 +677,65 @@ fn agy_auth(home: &Path, raw: &str) -> Result<(), ScalerError> {
     secret_file(&agy.join("antigravity-oauth-token"), raw.as_bytes())
 }
 
+/// The authority that retires every process the dispatch accounts still own
+/// before `cleanup` removes their job state (#1626). Production retires the
+/// host's pre-created accounts; fixtures inject a `cfg(test)` double so a
+/// test never censuses or signals a real host's dispatch accounts.
+pub(crate) trait AccountRetirement {
+    fn retire_dispatch_accounts(&mut self) -> Result<(), ScalerError>;
+}
+
+/// The host's pre-created dispatch accounts, retired through the shared
+/// STOP/KILL helper and the fail-closed uid census.
+pub(crate) struct HostDispatchAccounts;
+
+impl AccountRetirement for HostDispatchAccounts {
+    fn retire_dispatch_accounts(&mut self) -> Result<(), ScalerError> {
+        crate::dispatch_worker::cleanup_dispatch_users()
+    }
+}
+
+/// Retire the dispatch accounts, then remove this job's state whatever the
+/// retirement's verdict: the state holds the provider credentials, and a
+/// failed census must not leave them behind (#1626). A retirement failure
+/// is still the step's verdict, reported after the state is gone.
+pub(crate) fn cleanup(
+    accounts: &mut impl AccountRetirement,
+    state: Result<PathBuf, ScalerError>,
+) -> Result<(), ScalerError> {
+    // Retirement runs first so no agent process can write into the state
+    // while it is removed.
+    let retired = accounts.retire_dispatch_accounts();
+    let removed = state.and_then(|state| remove_state(&state));
+    match (retired, removed) {
+        (Ok(()), removed) => removed,
+        (Err(retirement), Ok(())) => Err(ScalerError::Usage(format!(
+            "dispatch account retirement failed: {retirement}; job state was removed"
+        ))),
+        (Err(retirement), Err(removal)) => Err(ScalerError::Usage(format!(
+            "dispatch account retirement failed: {retirement}; job state removal also failed: {removal}"
+        ))),
+    }
+}
+
+fn remove_state(state: &Path) -> Result<(), ScalerError> {
+    match std::fs::symlink_metadata(state) {
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
+            Ok(std::fs::remove_dir_all(state)?)
+        }
+        Ok(_) => Err(ScalerError::Guard("refusing non-directory agent state")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub fn run(root: &Path, args: Args) -> Result<(), ScalerError> {
     match args.action {
         Action::Bootstrap => bootstrap(root, || {
             crate::dispatch_mint::app_token(MintScope::Bootstrap)
         }),
         Action::Auth { event } => auth(root, &event),
-        Action::Cleanup { state_only } => {
-            if !state_only {
-                crate::dispatch_worker::cleanup_dispatch_users()?;
-            }
-            let state = state()?;
-            match std::fs::symlink_metadata(&state) {
-                Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
-                    std::fs::remove_dir_all(state)?
-                }
-                Ok(_) => return Err(ScalerError::Guard("refusing non-directory agent state")),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            }
-            Ok(())
-        }
+        Action::Cleanup => cleanup(&mut HostDispatchAccounts, state()),
     }
 }
 
@@ -1018,6 +1051,122 @@ printf '%s\n%s\n' "$CARGO_HOME" "$RUSTUP_HOME"
         assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
         assert!(secret_file(&path, b"replace").is_err());
         assert_eq!(std::fs::read(path).unwrap(), b"opaque");
+    }
+
+    /// The `cfg(test)` account-retirement double (#1626): it records each
+    /// retirement and whether the job state still existed at that moment,
+    /// and answers with a scripted verdict. It never touches a host account.
+    struct ScriptedAccounts {
+        state: PathBuf,
+        verdict: fn() -> Result<(), ScalerError>,
+        state_present_at_retirement: Vec<bool>,
+    }
+    impl AccountRetirement for ScriptedAccounts {
+        fn retire_dispatch_accounts(&mut self) -> Result<(), ScalerError> {
+            self.state_present_at_retirement
+                .push(self.state.try_exists().unwrap());
+            (self.verdict)()
+        }
+    }
+    /// The tree `agent-runner auth` leaves behind: private worker and loop
+    /// homes holding provider credentials and the redaction list.
+    fn auth_state(root: &Path) -> PathBuf {
+        let state = root.join("carrick-agent-42-1");
+        for dir in [
+            "home/.codex",
+            "home/.gemini/antigravity-cli",
+            "loop-home/.gemini",
+        ] {
+            std::fs::create_dir_all(state.join(dir)).unwrap();
+        }
+        secret_file(&state.join("home/.codex/auth.json"), b"codex-only-secret").unwrap();
+        secret_file(
+            &state.join("home/.gemini/antigravity-cli/antigravity-oauth-token"),
+            b"agy-only-secret",
+        )
+        .unwrap();
+        secret_file(&state.join("redaction-secrets.json"), b"[]").unwrap();
+        state
+    }
+
+    /// Retirement runs before the state goes, and a second cleanup of an
+    /// absent state still retires and succeeds.
+    #[test]
+    fn cleanup_retires_the_accounts_before_removing_job_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = auth_state(temp.path());
+        let mut accounts = ScriptedAccounts {
+            state: state.clone(),
+            verdict: || Ok(()),
+            state_present_at_retirement: Vec::new(),
+        };
+        cleanup(&mut accounts, Ok(state.clone())).unwrap();
+        assert!(!state.try_exists().unwrap());
+        cleanup(&mut accounts, Ok(state.clone())).unwrap();
+        assert_eq!(accounts.state_present_at_retirement, [true, false]);
+    }
+
+    /// #1626 P2 2: a failed account census used to return before the state
+    /// was removed, leaving the provider credentials on the runner. The
+    /// state now goes regardless, and the step still fails, naming both the
+    /// retirement failure and the completed removal.
+    #[test]
+    fn cleanup_removes_job_state_and_reports_a_failed_retirement() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = auth_state(temp.path());
+        let mut accounts = ScriptedAccounts {
+            state: state.clone(),
+            verdict: || Err(ScalerError::Guard("cannot verify agent process retirement")),
+            state_present_at_retirement: Vec::new(),
+        };
+        let error = cleanup(&mut accounts, Ok(state.clone()))
+            .unwrap_err()
+            .to_string();
+        assert!(!state.try_exists().unwrap(), "credentials left behind");
+        assert_eq!(accounts.state_present_at_retirement, [true]);
+        assert!(
+            error.contains("dispatch account retirement failed")
+                && error.contains("cannot verify agent process retirement")
+                && error.contains("job state was removed"),
+            "{error}"
+        );
+    }
+
+    /// Neither failure hides the other: a refused state path and a failed
+    /// retirement are reported together, and an unresolvable state path
+    /// (no run identity) still lets retirement run.
+    #[test]
+    fn cleanup_reports_retirement_and_state_failures_together() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        let state = temp.path().join("carrick-agent-42-1");
+        std::os::unix::fs::symlink(&target, &state).unwrap();
+        let mut accounts = ScriptedAccounts {
+            state: state.clone(),
+            verdict: || Err(ScalerError::Guard("agent account must not be root")),
+            state_present_at_retirement: Vec::new(),
+        };
+        let error = cleanup(&mut accounts, Ok(state.clone()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("agent account must not be root")
+                && error.contains("job state removal also failed")
+                && error.contains("refusing non-directory agent state"),
+            "{error}"
+        );
+        assert!(target.try_exists().unwrap(), "followed the state symlink");
+
+        accounts.verdict = || Ok(());
+        let error = cleanup(
+            &mut accounts,
+            Err(ScalerError::Guard("invalid Actions run identity")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(error, "invalid Actions run identity");
+        assert_eq!(accounts.state_present_at_retirement.len(), 2);
     }
 }
 

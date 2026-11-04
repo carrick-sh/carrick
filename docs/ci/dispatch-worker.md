@@ -542,6 +542,20 @@ query also retires the worker uid. The accounts remain installed. Agent Git
 configuration is discarded during reconstruction; runner Git never executes
 agent hooks, filters or scripts. The clone is destroyed after the job.
 
+`agent-runner cleanup` retires both accounts, then removes the job state
+(homes, provider credentials, launcher state) even when retirement fails, so
+a failed census never leaves credentials behind; the step still fails and
+names the retirement error (#1626). Its account authority is injected: unit
+tests use a `cfg(test)` double and never touch a host's real accounts. The
+full-retirement witness,
+`dispatch_worker::tests::serial_host_cleanup_retires_both_dispatch_accounts_then_removes_state`,
+is `#[ignore]`d and runs in no CI lane: hosted runners lack the pre-created
+accounts and their sudoers rules, a dispatch job's tests run as
+`carrick-dispatch-agent` (which cannot `sudo` to the loop account), and the
+`runner` user that can is running the live loop the retirement would kill.
+Run it by hand as `runner` on an idle agent-profile clone; without those
+prerequisites it fails rather than skipping.
+
 ## Policy tools and budgets
 
 The loop runs Gemini Flash via `agy --model high`. It calls
