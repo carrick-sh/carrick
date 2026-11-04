@@ -1440,8 +1440,8 @@ fn arm_native_service_exit(
     // Keep entry admission separate from dispatch/settlement: these source
     // locations and the exact error survive the existing fatal transport.
     .unwrap_or_else(|error| invalid_completion(native_service_invariant(error)));
-    let result = result
-        .unwrap_or_else(|error| invalid_completion(native_service_invariant_at(error, phase)));
+    let result = native_service_completion(result, phase)
+        .unwrap_or_else(|reason| invalid_completion(reason));
     Some(match result {
         NativeResume::Left(None) => native_service_idle(zone, slot, &mut sched::HardwareCpu),
         NativeResume::NoPending => arm_signal_user_return(frame),
@@ -2194,6 +2194,19 @@ fn native_service_invariant(
     error: super::native_process_runtime::NativeProcessError,
 ) -> NativeInvariant {
     NativeInvariant::NativeService(native_service_fatal_reason(error))
+}
+
+/// The production service-exit failure boundary, also exercised by VM-free
+/// native-process witnesses without invoking the non-returning fatal transport.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub(crate) fn native_service_completion(
+    result: Result<
+        super::native_process_runtime::NativeResume,
+        super::native_process_runtime::NativeProcessError,
+    >,
+    phase: super::native_process_runtime::NativeServicePhase,
+) -> Result<super::native_process_runtime::NativeResume, NativeInvariant> {
+    result.map_err(|error| native_service_invariant_at(error, phase))
 }
 
 /// A stale dispatch identifies the last actual owner entered, rather than

@@ -1543,6 +1543,140 @@ fn native_exec_fixture() -> NativeSignalFixture {
     )
 }
 
+/// These are corrupt custody, not a sibling holding a releasable resource.
+/// Drive the same begin/settle pair as arm_native_service_exit: an exact
+/// member may have only one cell, pending row and execution-lane notice.
+#[test]
+#[cfg(test)]
+fn native_service_duplicate_custody_is_an_invariant_at_bridge_settlement() {
+    use carrick_core_abi::service::{ServiceOperation, ServiceOrigin};
+    for occupied_notice in [false, true] {
+        let fixture = native_exec_fixture();
+        let mut service = fixture.service();
+        let context = words(fixture.address);
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: fixture.slot,
+                },
+                fixture.task,
+                fixture.address,
+                &context,
+                &mut service,
+            )
+            .unwrap();
+        let mm = entry.service.service_mm_handle(&fixture.address).unwrap();
+        service::bind_member_service(
+            fixture.zone,
+            entry.key,
+            ServiceOrigin::Initial,
+            fixture.record,
+            entry.binding.thread_generation,
+            fixture.control,
+            mm,
+        )
+        .unwrap();
+        let birth = fixture
+            .control
+            .service
+            .bound_birth(entry.key, entry.binding.thread_generation, fixture.record)
+            .unwrap();
+        let operation = ServiceOperation::Crossing {
+            ordinal: carrick_guest_arch::NativeOrdinal::new(115),
+        };
+        let request = fixture
+            .control
+            .service
+            .publish(birth, entry.binding.generation, operation, None)
+            .unwrap();
+        if occupied_notice {
+            // Keep the lane's earlier notice, but restore the cell to idle.
+            fixture
+                .task
+                .service_notice
+                .publish(request.identity.into())
+                .unwrap();
+            // SAFETY: this fixture never runs a transport. The retained notice
+            // is deliberately corrupt lane custody, not a delivered ticket.
+            unsafe { fixture.control.service.abort_unpublished(request.identity) }.unwrap();
+            fixture.control.service.consume(request.identity).unwrap();
+        }
+        let result = entry.begin_service(operation, None);
+        assert!(
+            matches!(
+                entry.settle_service_exit(result, NativeServiceExit::Bridge),
+                Err(NativeProcessError::Quarantined)
+            ),
+            "duplicate custody must not report transient Busy (notice={occupied_notice})"
+        );
+        assert_eq!(carrick_el1_abi::Lifecycle::claimed_count(fixture.page), 0);
+        assert!(
+            !fixture
+                .runtime
+                .graph
+                .lock()
+                .has_member_wait(&fixture.record)
+        );
+        assert_eq!(
+            fixture.task.service_notice.take().unwrap(),
+            occupied_notice.then_some(request.identity.into()),
+            "refused publication must preserve the earlier notice"
+        );
+    }
+}
+
+#[test]
+#[cfg(test)]
+fn native_service_suspended_member_cannot_admit_a_second_bridge() {
+    let fixture = native_exec_fixture();
+    let mut service = fixture.service();
+    let context = words(fixture.address);
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            fixture.task,
+            fixture.address,
+            &context,
+            &mut service,
+        )
+        .unwrap();
+    fixture.runtime.graph.lock().insert_member_wait(
+        fixture.record,
+        MemberWait::Signal(PendingSignalWait {
+            kind: PendingSignalKind::Suspend,
+            channel: Arc::new(WaitChannel {
+                generation: ProcessWake::new(),
+                mm: fixture.address.mm.raw().get(),
+            }),
+            deadline: None,
+        }),
+    );
+    let result = entry.begin_service(
+        carrick_core_abi::service::ServiceOperation::Crossing {
+            ordinal: carrick_guest_arch::NativeOrdinal::new(115),
+        },
+        None,
+    );
+    let settled = entry.settle_service_exit(result, NativeServiceExit::Bridge);
+    let fatal = crate::dispatch::native_service_completion(settled, entry.native_service_phase())
+        .err()
+        .expect("a second bridge cannot own a suspended member");
+    assert_eq!(
+        fatal.fatal_reason(),
+        carrick_el1_abi::EntryBindingFatalReason::NativeServiceQuarantined
+    );
+    assert!(fixture.task.service_notice.take().unwrap().is_none());
+    assert_eq!(carrick_el1_abi::Lifecycle::claimed_count(fixture.page), 0);
+}
+
 #[cfg(test)]
 #[test]
 fn carrier_work_wake_preserves_the_completed_syscall_result() {
@@ -1578,15 +1712,6 @@ fn carrier_work_wake_preserves_the_completed_syscall_result() {
         assert!(matches!(
             entry.settle_service_exit(result, NativeServiceExit::CarrierWork),
             Ok(NativeResume::Left(None))
-        ));
-        // A native service token is not an IPC token/pin. Its ordinary
-        // bridge refusal must retain main's outcome rather than gain a retry.
-        assert!(matches!(
-            entry.settle_service_exit(
-                Err(NativeProcessError::Busy),
-                NativeServiceExit::CarrierWork
-            ),
-            Err(NativeProcessError::Busy)
         ));
     }
 

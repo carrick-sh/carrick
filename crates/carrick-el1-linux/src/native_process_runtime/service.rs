@@ -31,7 +31,7 @@ pub(super) fn bind_member_service<C: ProcessContext>(
             record,
             mm,
         })
-        .map_err(service_error)
+        .map_err(service_protocol_error)
 }
 
 fn native_exception_signal(
@@ -388,7 +388,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         control
             .service
             .cancel(request.identity)
-            .map_err(service_error)?;
+            .map_err(service_protocol_error)?;
         let wait = self
             .graph
             .lock()
@@ -596,24 +596,25 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         Ok(NativeResume::Returned(output.result))
     }
 
+    /// Authenticate retained adapter custody while the caller holds the graph.
+    /// A service payload may be empty at the CarrierWork bridge even though
+    /// the exact member still owns its separately installed IPC operation.
+    fn retains_adapter_under(&self, graph: &Graph<'a, M, C>) -> bool {
+        self.source
+            .zone
+            .record(self.record.id)
+            .has_adapter_operation()
+            && graph
+                .service_wait(&self.record)
+                .is_none_or(|pending| pending.adapter)
+    }
+
     /// Only a retained IPC operation authorizes this refusal handback.
     /// A native service token has its own pending row and is not an IPC pin.
     #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
     fn retains_ipc_operation(&self, exit: NativeServiceExit) -> bool {
-        if !matches!(exit, NativeServiceExit::CarrierWork)
-            || !self
-                .source
-                .zone
-                .record(self.record.id)
-                .has_adapter_operation()
-        {
-            return false;
-        }
-        self.runtime
-            .graph
-            .lock()
-            .service_wait(&self.record)
-            .is_none_or(|pending| pending.adapter)
+        matches!(exit, NativeServiceExit::CarrierWork)
+            && self.retains_adapter_under(&self.runtime.graph.lock())
     }
 
     /// Fold the owned-IPC exit after preparation unwinds. Unadmitted bridges,
@@ -1025,7 +1026,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let (page, control, mm) = {
             let graph = self.runtime.graph.lock();
             if graph.has_member_wait(&self.record) {
-                return Err(NativeProcessError::Busy);
+                // IPC keeps its separately retained operation on refusal.
+                // A bridge owns the executing exact member and cannot also
+                // have an outstanding suspended operation on that member.
+                return Err(
+                    if adapter
+                        || (matches!(operation, ServiceOperation::CarrierWork { .. })
+                            && self.retains_adapter_under(&graph))
+                    {
+                        NativeProcessError::Busy
+                    } else {
+                        NativeProcessError::Quarantined
+                    },
+                );
             }
             let resources = graph
                 .owner
@@ -1074,9 +1087,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     control
                         .service
                         .bound_birth(self.key, self.binding.thread_generation, self.record)
-                        .map_err(service_error)?
+                        .map_err(service_protocol_error)?
                 }
-                Err(error) => return Err(service_error(error)),
+                Err(error) => return Err(service_protocol_error(error)),
             };
         self.service_phase = NativeServicePhase::Unspecified;
         let exec_successor = matches!(operation, ServiceOperation::Exec { .. })
@@ -1135,12 +1148,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 closing = graph.pending.has_exit(&self.key);
                 Err(NativeProcessError::Quarantined)
             } else if graph.has_member_wait(&self.record) {
-                Err(NativeProcessError::Busy)
+                Err(
+                    if adapter
+                        || (matches!(operation, ServiceOperation::CarrierWork { .. })
+                            && self.retains_adapter_under(&graph))
+                    {
+                        NativeProcessError::Busy
+                    } else {
+                        NativeProcessError::Quarantined
+                    },
+                )
             } else if let Some(wait) = owner_wait {
                 self.control
                     .service
                     .begin_owner_wait(birth, self.binding.generation, operation, wait)
-                    .map_err(service_error)
+                    .map_err(service_protocol_error)
             } else {
                 self.control
                     .service
@@ -1151,7 +1173,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         fault_sequence,
                         reply.as_ref().map(PendingServiceReply::address),
                     )
-                    .map_err(service_error)
+                    .map_err(service_protocol_error)
             }
         };
         let request = match published {
@@ -1160,6 +1182,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 drop(owner_queue);
                 self.release_service_claim(claim)?;
                 if closing {
+                    // No request reached the transport. Cancel the exact
+                    // retained IPC owner before terminal retirement: the
+                    // scheduler deliberately requeues records with operations
+                    // still attached, and their endpoint pins must not leak.
+                    if self
+                        .source
+                        .zone
+                        .record(self.record.id)
+                        .has_adapter_operation()
+                    {
+                        self.retire_adapter_result(SyscallResult::new(0))?;
+                        self.adapter_ready = None;
+                    }
                     return self.retire_closing_entry().map(PreparedService::Retired);
                 }
                 return Err(error);
@@ -1204,7 +1239,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .current
             .service_notice
             .publish(request.identity.into())
-            .map_err(service_error)
+            .map_err(service_protocol_error)
         {
             let key =
                 ObjectWaitKey::native_service(self.record).ok_or(NativeProcessError::Stale)?;
@@ -1216,12 +1251,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             // SAFETY: notice publication failed, so no transport can hold
             // this identity. The queue also excludes concurrent cancellation.
             unsafe { self.control.service.abort_unpublished(request.identity) }
-                .map_err(service_error)?;
+                .map_err(service_protocol_error)?;
             {
                 self.control
                     .service
                     .consume(request.identity)
-                    .map_err(service_error)?;
+                    .map_err(service_protocol_error)?;
                 drop(guard);
                 let pending = self
                     .runtime
@@ -1338,7 +1373,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     || self.runtime.graph.lock().pending.has_exit(&self.key))
                     && let Err(error) = self.control.service.cancel(request.identity)
                 {
-                    failure = Some(service_error(error));
+                    failure = Some(service_protocol_error(error));
                     return Err(ObjectWaitError::Stale);
                 }
                 if defer_adapter {
@@ -1349,7 +1384,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         }
                         Ok(false) | Err(ServiceError::Busy) => {}
                         Err(error) => {
-                            failure = Some(service_error(error));
+                            failure = Some(service_protocol_error(error));
                             return Err(ObjectWaitError::Stale);
                         }
                     }
@@ -1372,7 +1407,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         }
                         Err(ServiceError::Busy) => {}
                         Err(error) => {
-                            failure = Some(service_error(error));
+                            failure = Some(service_protocol_error(error));
                             return Err(ObjectWaitError::Stale);
                         }
                     }
@@ -1596,7 +1631,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .control
             .service
             .finish_owner_wait(request.identity)
-            .map_err(service_error)?;
+            .map_err(service_protocol_error)?;
         // Remove the phase under the service queue before cancellation observes IDLE.
         let pending = self
             .runtime
@@ -2314,7 +2349,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 request.operation,
                 wait,
             )
-            .map_err(service_error)?;
+            .map_err(service_protocol_error)?;
         pending.request = next;
         pending.wait = Some(wait);
         self.runtime
@@ -2646,9 +2681,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         completed
     }
 }
-fn service_error(error: ServiceError) -> NativeProcessError {
+fn service_protocol_error(error: ServiceError) -> NativeProcessError {
     match error {
-        ServiceError::Busy => NativeProcessError::Busy,
+        // All callers either own the exact executing member before transport
+        // publication, or hold its native-service queue. The transport takes
+        // that same queue for claim and acknowledgment. Expected not-ready
+        // consumption is handled before this mapper; a failed transition here
+        // means duplicate/mismatched custody, not a releasable resource.
+        ServiceError::Busy => NativeProcessError::Quarantined,
         ServiceError::Stale => NativeProcessError::Stale,
         ServiceError::Exhausted => NativeProcessError::Exhausted,
     }
