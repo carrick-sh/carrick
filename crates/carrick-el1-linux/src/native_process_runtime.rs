@@ -954,7 +954,7 @@ impl ContinuationTask {
         }
     }
     fn of_record<C: ProcessContext>(zone: &ZoneTables<C>, record: RecordRef) -> Option<Self> {
-        let identity = zone.live(record)?.identity();
+        let identity = carrick_core::terminal::continuation_member_identity(zone, record)?;
         Some(Self {
             task: carrick_core_abi::EntryTaskKey::from_raw(identity.tid),
             generation: carrick_core_abi::EntryThreadGeneration::from_raw(identity.serial),

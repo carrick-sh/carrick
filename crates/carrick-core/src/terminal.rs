@@ -17,6 +17,16 @@ use crate::lifecycle::{
     Lifecycle, MemberControl, MemberExitKind, MembershipFloor, NonfinalExitMembership,
 };
 
+/// Resolve a continuation's member identity only while the exact scheduler
+/// incarnation remains live. Callers must retain their existing record custody;
+/// this observation does not grant execution or retirement authority.
+pub fn continuation_member_identity<C: carrick_core_abi::EntryContext>(
+    zone: &carrick_sched_core::ZoneTables<C>,
+    record: carrick_sched_core::RecordRef,
+) -> Option<carrick_sched_core::ThreadIdentity> {
+    zone.live(record).map(|member| member.identity())
+}
+
 /// Native exception service cancellation owns its retained checkpoint. The
 /// host terminal batch must not turn that checkpoint into a host resume.
 /// Authenticate the member and record incarnation before issuing the verdict.
@@ -28,10 +38,10 @@ pub fn native_exception_retains_terminal_wake<C: carrick_core_abi::EntryContext>
     generation: EntryThreadGeneration,
 ) -> bool {
     use carrick_sched_core::object_wait::{OwnerEntry, ResumeDisposition};
-    let Some(rec) = zone.live(record) else {
+    let Some(identity) = continuation_member_identity(zone, record) else {
         return false;
     };
-    let identity = rec.identity();
+    let rec = zone.record(record.id);
     let owned = member.exit_custody().native_signal_owner()
         && identity.tid == task.raw()
         && identity.serial == generation.raw()

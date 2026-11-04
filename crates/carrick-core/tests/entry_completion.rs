@@ -21,6 +21,33 @@ fn zone() -> Box<ZoneTables> {
 }
 
 #[test]
+fn continuation_identity_refuses_retired_and_reused_record() {
+    use carrick_core::terminal::continuation_member_identity;
+    let zone = zone();
+    let identity = ThreadIdentity {
+        tid: 41,
+        serial: 7,
+        ..ThreadIdentity::default()
+    };
+    let record = zone.alloc_host_runnable(identity).unwrap();
+    let original = zone.record_ref(record);
+    let observed = continuation_member_identity(&zone, original).unwrap();
+    assert_eq!((observed.tid, observed.serial), (41, 7));
+    zone.free_record(record);
+    assert!(continuation_member_identity(&zone, original).is_none());
+    let replacement = zone
+        .alloc_host_runnable(ThreadIdentity {
+            serial: 8,
+            ..identity
+        })
+        .unwrap();
+    assert_eq!(replacement, record);
+    assert!(continuation_member_identity(&zone, original).is_none());
+    let observed = continuation_member_identity(&zone, zone.record_ref(replacement)).unwrap();
+    assert_eq!((observed.tid, observed.serial), (41, 8));
+}
+
+#[test]
 fn suspended_turn_completes_only_through_exact_wait_owner() {
     for scale in [1, 2, 8] {
         let mut completions = 0;

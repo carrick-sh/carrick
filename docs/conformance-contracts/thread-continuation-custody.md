@@ -37,3 +37,11 @@ There is no polling, host wait, extra worker or timeout budget in this change.
 
 Signed pipe and pool-exhaustion integration and Docker comparison remain
 required higher-layer evidence; VM-free results do not confer acceptance.
+
+Continuation lookup asks the neutral terminal owner for the exact live record's
+identity. The owner reuses the scheduler's incarnation and non-Free check;
+Linux only converts that identity into its continuation key. Terminal exception
+wake authentication uses the same identity lookup. The core
+`continuation_identity_refuses_retired_and_reused_record` witness requires a
+retired reference to stay absent after its slot is reused with a new thread
+birth generation. This adds no scan, park, retry or alternate liveness rule.

@@ -37,6 +37,7 @@ rationale = "The successful authenticated zone retirement retains task, executio
 # binds the shared owner verdict for ARM and x86 compact-context callers.
 vm_free = [
   "carrick-core::entry_completion::pool_cancellation_refuses_record_release_before_terminal_gate",
+  "carrick-core::entry_completion::continuation_identity_refuses_retired_and_reused_record (neutral exact-incarnation continuation identity refuses retired and recycled records)",
   "carrick-el1-linux::native_process_runtime::tests::{sibling_wait4_and_vfork_retain_independent_continuations,sibling_vfork_host_request_retains_committed_continuation,vfork_parent_stays_suspended_until_child_execs_or_exits} (exact process generation plus waiting task birth generation owns each wait; two live threads retain independent wait4 and vfork rows on one execution slot)",
   "carrick-el1-linux::aarch64_process_tests::native_fault_supply_tests::native_child_empty_supply_resumes_cow_without_changing_parent (real native fork, COW and backing service continuations, terminal USED settlement, exact-MM inventory release before physical backing, structural retirement without a later Loan)",
   "carrick-el1-linux::aarch64_process_tests::native_retirement_tests::native_backing_release_already_retired_owner_is_clean_absence_without_quarantine (neutral stage-2 owner reports VM destruction, generation advance or absent record; settlement succeeds with zero retained rollback entries and no MM quarantine)",
