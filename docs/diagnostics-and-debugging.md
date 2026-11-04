@@ -468,6 +468,50 @@ otherwise it uses `/tmp/carrick-kvm-deadlines`.
 > forkserver-from-forkserver `test_parent_process` deadlock
 > (`docs/archive/forkserver-parent-process-deadlock.md`).
 
+### KVM fixture compiler kills
+
+`compile native x86 assembly oracle ... cc status: signal: 9 (SIGKILL)`
+comes from building the native assembly fixture, before guest execution.
+The `x86_kvm_run` helper runs `cc` through `assert_cmd` with a 15-second
+deadline; `assert_cmd` itself kills the compiler when that deadline expires.
+Signal 9 alone therefore does not identify the OOM killer or a guest defect.
+Keep this signature separate from a later `KVM deadline capture` failure.
+
+For attribution, preserve the raw test output, exact command and feature set,
+compiler PID, elapsed time, exit status, peak RSS and simultaneous compiler
+population. Check kernel OOM records (`dmesg` or `journalctl -k`) and the
+applicable cgroup's `memory.events` before and after the run. Record denied
+kernel-log access explicitly; counters from a new clone cannot establish what
+happened on an earlier runner. Cargo compilation and linking finish before
+this test target executes, so measure those build steps separately from the
+fixture compiler. Compare the affected target on both revisions with separate
+`CARGO_TARGET_DIR`s and the features and regular/`serial_host` selections from
+`just test-kvm`.
+
+The compiler-kill reports in [#1580](https://github.com/carrick-sh/carrick/issues/1580)
+illustrate this distinction. Passing subsequent runs, an initial batch of
+failures, or a low-memory hypothesis does not establish a cause or justify an
+admission bound. Preserve missing provenance until a reproducer distinguishes
+the compiler deadline, OOM and other external kills.
+
+Before attempting a sender-attribution run, verify that the runner has
+`bpftrace`, access to `tracepoint:signal:signal_generate`, and permission to
+read the kernel log. KVM device access alone does not grant these permissions.
+Capture signal generation with `args->sig == 9`, recording the sender's
+`pid`/`comm` and the target's `args->pid`/`args->comm`, together with monotonic
+timestamps. Start capture before the test binary and bound its lifetime;
+stop it on every exit path and verify `pgrep -x bpftrace` is empty afterwards.
+Correlate each killed compiler PID with its test key, compiler start time and
+concurrent compiler population. A signal from the test process at roughly
+15 seconds supports the harness-deadline diagnosis; kernel OOM records are
+needed to identify OOM, rather than inferring it from SIGKILL alone.
+
+If these capture permissions are unavailable, report sender attribution as
+blocked before spending a reproduction run. Source inspection establishes
+that the deadline can kill `cc`, but does not establish who killed any of
+the original 16 compilers. Do not assign one observed sender to uncaptured
+test keys or treat a passing rerun as attribution.
+
 ### Loading the plugin and reading the ring
 
 ```sh
