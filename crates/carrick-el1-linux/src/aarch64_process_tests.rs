@@ -11652,12 +11652,57 @@ fn arm_classified_fault_rejects_non_fault_returns_without_clobbering_syndrome() 
 /// and `fork_cow`). Green: the sibling retires with the close status in the
 /// same entry (no host work published, no EL0 return), and the group ends 7.
 #[test]
+#[cfg(test)]
 fn arm_closed_gate_service_entry_retires_the_sibling_instead_of_busy() {
+    closed_gate_service_entry(false);
+}
+
+#[test]
+#[cfg(test)]
+fn arm_closed_gate_service_entry_cancels_retained_ipc_before_retirement() {
+    closed_gate_service_entry(true);
+}
+
+#[cfg(test)]
+fn closed_gate_service_entry(retained_ipc: bool) {
     use crate::native_process_runtime::{NativeResume, NativeServiceExit};
     use carrick_core_abi::service::ServiceOperation;
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let (control, record) = imported_thread_with_identity(fixture, |_| {});
     let mut service = fixture.process_service();
+    let ipc = retained_ipc.then(|| {
+        use carrick_el1_abi::ipc::{IpcBacking, fd};
+        let owner = std::sync::Arc::new(
+            carrick_kernel::el1_ipc::HostIpc::with_limits(
+                1 << 20,
+                carrick_kernel::el1_ipc::IpcLimits::ZONE,
+            )
+            .unwrap(),
+        );
+        let object = owner
+            .create_eventfd(7, carrick_el1_abi::ipc::EventMode::Counter)
+            .unwrap();
+        let table = owner.create_table(64, 64).unwrap();
+        let description = owner
+            .admit_description(fd::Description::new(
+                IpcBacking::EventFd { object }.encode(),
+                fd::AccessMode::ReadOnly,
+                fd::StatusFlags::default(),
+            ))
+            .unwrap();
+        description.install(table, fd::Fd(0), false).unwrap();
+        drop(description);
+        let storage = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+        // SAFETY: this typed fixture owns the aligned, zero-valid map storage.
+        let map = unsafe {
+            &*storage
+                .as_ptr()
+                .add(carrick_el1_abi::EL1_IPC_TABLE_MAP_OFFSET as usize)
+                .cast::<carrick_el1_abi::ipc_tables::IpcTableMap>()
+        };
+        service.crossing.ipc = Some((std::sync::Arc::clone(&owner), map));
+        (owner, table, object)
+    });
     let ttbr0 = fixture_ttbr0(fixture);
     fixture
         .enter(fixture.control, ttbr0, &mut service, |_| ())
@@ -11670,7 +11715,44 @@ fn arm_closed_gate_service_entry_retires_the_sibling_instead_of_busy() {
     );
     fixture
         .enter(control, ttbr0, &mut service, |process| {
-            assert!(process.has_thread(41) && process.has_thread(42))
+            assert!(process.has_thread(41) && process.has_thread(42));
+            if let Some((owner, table, object)) = &ipc {
+                use carrick_el1_abi::ipc::{
+                    IpcMmKey, IpcOpKind, IpcOperation, IpcTaskKey, IpcUserVa, WriteProgress, fd::Fd,
+                };
+                let region = owner.region();
+                let (pin, _) = region
+                    .fd(carrick_sched_core::ShortLockSpin)
+                    .pin(*table, Fd(0))
+                    .unwrap();
+                let binding = process.binding();
+                let operation = region
+                    .begin_operation(IpcOperation {
+                        kind: IpcOpKind::EventFdRead,
+                        pin: pin.into_raw(),
+                        object: object.to_raw(),
+                        task: IpcTaskKey(binding.task.raw()),
+                        mm: IpcMmKey(binding.mm.raw()),
+                        buf: IpcUserVa(0x10000),
+                        progress: WriteProgress::new(8),
+                        ..IpcOperation::EMPTY
+                    })
+                    .unwrap();
+                let token = carrick_el1::substrate::ipc::to_sched_token(operation).unwrap();
+                assert!(matches!(
+                    process.yield_owned_operation(token),
+                    carrick_core::mm::transaction::OwnedOperationYield::Suspended
+                ));
+                // Only the operation's pin now retains the endpoint.
+                assert!(
+                    region
+                        .fd(carrick_sched_core::ShortLockSpin)
+                        .close(*table, Fd(0))
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(region.observe(*object).is_ok());
+            }
         })
         .unwrap();
     assert!(
@@ -11713,24 +11795,33 @@ fn arm_closed_gate_service_entry_retires_the_sibling_instead_of_busy() {
         control,
         &mut service,
         |entry| {
-            let result = entry.begin_service(
+            let operation = if retained_ipc {
+                assert!(fixture.zone.record(record.id).has_adapter_operation());
+                ServiceOperation::CarrierWork {
+                    entry: carrick_sched_core::object_wait::OwnerEntry::Syscall,
+                }
+            } else {
                 ServiceOperation::Crossing {
                     ordinal: carrick_guest_arch::NativeOrdinal::new(115),
+                }
+            };
+            let result = entry.begin_service(operation, None);
+            let result = entry.settle_service_exit(
+                result,
+                if retained_ipc {
+                    NativeServiceExit::CarrierWork
+                } else {
+                    NativeServiceExit::Bridge
                 },
-                None,
             );
-            assert!(
-                !matches!(result, Err(NativeProcessError::Busy)),
-                "a closed gate is terminal, not contention"
-            );
-            entry.settle_service_exit(result, NativeServiceExit::Bridge)
+            crate::dispatch::native_service_completion(result, entry.native_service_phase())
+                .unwrap_or_else(|reason| panic!("service-exit fatal: {:?}", reason.fatal_reason()))
         },
     )
     .expect("the sibling's admission precedes its service");
     assert!(
-        matches!(entered, Ok(NativeResume::Left(None))),
-        "the sibling leaves its lane for the terminal checkpoint: {:?}",
-        entered.as_ref().err()
+        matches!(entered, NativeResume::Left(None)),
+        "the sibling leaves its lane for the terminal checkpoint"
     );
     assert!(
         fixture.task.service_notice.take().unwrap().is_none(),
@@ -11750,6 +11841,13 @@ fn arm_closed_gate_service_entry_retires_the_sibling_instead_of_busy() {
         "the sibling's record retired"
     );
     assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 0);
+    if let Some((owner, _, object)) = &ipc {
+        assert!(!fixture.zone.record(record.id).has_adapter_operation());
+        assert!(
+            owner.region().observe(*object).is_err(),
+            "terminal cancellation releases the last endpoint pin"
+        );
+    }
     // The sibling's retirement woke the closing owner; it completes the close.
     assert!(matches!(
         resume_closing_root(fixture, &mut service),
