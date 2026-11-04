@@ -5461,29 +5461,34 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 Err(error) => self.run_failed(error.run_failure_reason()),
             });
         }
-        if matches!(
-            self.source.zone.record(self.record.id).resume_disposition(),
+        let record = self.source.zone.record(self.record.id);
+        let continuation = matches!(
+            record.resume_disposition(),
             carrick_sched_core::object_wait::ResumeDisposition::OwnerContinuation(_)
-        ) {
+        );
+        if continuation {
             // SAFETY: this exact record is selected by the execution owner;
             // a losing exit_group caller retires its record instead of
             // returning to EL0.
             unsafe {
-                self.source
-                    .zone
-                    .record(self.record.id)
-                    .consume_owner_continuation();
+                record.consume_owner_continuation();
             }
-            if let Some(status) = self.pending_close_status() {
-                return Some(match self.retire_closing_member(status) {
-                    Ok(outcome) => outcome,
-                    Err(error) => self.run_failed(error.run_failure_reason()),
-                });
-            }
-            // Wait/IPC handbacks re-enter the saved syscall instruction too.
-            // Their owned operation, rather than a readiness scalar or a new
-            // dispatch, decides completion below.
         }
+        // Process close requests every member's exit. A ring-born member
+        // that was runnable (queued, not parked in a wait) has no host
+        // thread to honour that request: its next selection is the only
+        // point that can retire it, so it must not return to EL0.
+        if (continuation || (self.control.host_exit_requested() && !record.has_adapter_operation()))
+            && let Some(status) = self.pending_close_status()
+        {
+            return Some(match self.retire_closing_member(status) {
+                Ok(outcome) => outcome,
+                Err(error) => self.run_failed(error.run_failure_reason()),
+            });
+        }
+        // Wait/IPC handbacks re-enter the saved syscall instruction too.
+        // Their owned operation, rather than a readiness scalar or a new
+        // dispatch, decides completion below.
         self.resume_pending_wait()
     }
 
