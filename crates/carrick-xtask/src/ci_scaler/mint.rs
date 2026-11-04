@@ -724,6 +724,7 @@ mod tests {
             assigned: Some(key.job),
             ip: None,
             failure: None,
+            quarantined: false,
             assigned_key: Some(key),
             approved: true,
             mints: vec![],

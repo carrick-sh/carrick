@@ -245,6 +245,9 @@ fn pve_response(bytes: &[u8]) -> Result<Value, ScalerError> {
     if code.len() != 3 || !code.iter().all(u8::is_ascii_digit) {
         return Err(ScalerError::External("invalid PVE HTTP status"));
     }
+    if code[0] == b'5' {
+        return Err(ScalerError::Transient(TransientFailure::PveServer));
+    }
     let response: Value = serde_json::from_slice(&bytes[..end])?;
     if code[0] != b'2' {
         let fields = response
@@ -333,20 +336,111 @@ impl Pve {
         })
     }
     fn request(&self, call: PveCall, path: &str) -> Result<Value, ScalerError> {
-        let limit = remaining(self.deadline.get(), Duration::from_secs(45))?;
-        let config = request_config(&self.token, &call)?;
-        let bytes = execute(
-            &mut pve_curl(
-                &call,
-                &self.site.api_resolve(),
-                self.site.api_ca,
-                &self.site.api_url(path),
-            ),
-            config.as_bytes(),
-            limit,
-        )?;
-        pve_response(&bytes)
+        let invoke = || {
+            let limit = remaining(self.deadline.get(), Duration::from_secs(45))?;
+            let config = request_config(&self.token, &call)?;
+            let bytes = execute(
+                &mut pve_curl(
+                    &call,
+                    &self.site.api_resolve(),
+                    self.site.api_ca,
+                    &self.site.api_url(path),
+                ),
+                config.as_bytes(),
+                limit,
+            )?;
+            pve_response(&bytes)
+        };
+        if matches!(call, PveCall::Get) {
+            retry_transport(invoke)
+        } else {
+            invoke()
+        }
     }
+
+    /// PVE's qmclone task belongs to the source template. A source task may
+    /// lack its destination in history: retain ambiguity in that case rather
+    /// than infer absence from a missing destination task.
+    fn clone_never_submitted(&self, row: &Record) -> Result<bool, ScalerError> {
+        if row.state != State::Cloning
+            || row.task.is_some()
+            || row.runner.is_some()
+            || row.assigned.is_some()
+            || row.assigned_key.is_some()
+            || row.approved
+        {
+            return Ok(false);
+        }
+        let node = self.site.node;
+        // Rows predate source-slot switches and do not record their source.
+        // Include both licensed agent slots so deployment cannot erase evidence.
+        let templates = match row.lane {
+            CloneLane::Kvm => vec![self.site.template()?],
+            CloneLane::Agent => vec![
+                site::AgentTemplate::Blue.vmid(),
+                site::AgentTemplate::Green.vmid(),
+            ],
+        };
+        for template in templates {
+            let tasks = self.request(PveCall::Get, &format!(
+                "/nodes/{node}/tasks?source=all&typefilter=qmclone&vmid={template}&since={}&limit=500", row.created
+            ))?;
+            let Some(tasks) = tasks.as_array() else {
+                return Ok(false);
+            };
+            // Any source-template task in this interval is positive or
+            // ambiguous evidence. Once nonempty, later pages cannot clear it.
+            if !tasks.is_empty() {
+                return Ok(false);
+            }
+        }
+        let vms = self.request(PveCall::Get, &format!("/nodes/{node}/qemu"))?;
+        let Some(vms) = vms.as_array() else {
+            return Ok(false);
+        };
+        for vm in vms {
+            match pve_vmid(vm) {
+                Some(id) if id != u64::from(row.vm.get()) => {}
+                _ => return Ok(false),
+            }
+        }
+        let storages = self.request(PveCall::Get, &format!("/nodes/{node}/storage"))?;
+        let Some(storages) = storages.as_array() else {
+            return Ok(false);
+        };
+        if storages.is_empty() {
+            return Ok(false);
+        }
+        for storage in storages {
+            let Some(name) = storage["storage"].as_str() else {
+                return Ok(false);
+            };
+            if !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+                || name.is_empty()
+            {
+                return Ok(false);
+            }
+            let volumes = self.request(
+                PveCall::Get,
+                &format!("/nodes/{node}/storage/{name}/content?content=images"),
+            )?;
+            let Some(volumes) = volumes.as_array() else {
+                return Ok(false);
+            };
+            for volume in volumes {
+                let Some(vmid) = pve_vmid(volume) else {
+                    return Ok(false);
+                };
+                if vmid == u64::from(row.vm.get()) {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
     fn base(&self, id: CloneId) -> String {
         self.site.qemu(id.get())
     }
@@ -1083,6 +1177,7 @@ fn finish_destroyed(
     }
     // Release the ledger budget only after the one-use transport is removed.
     row.state = State::Destroyed;
+    row.quarantined = false;
     update(ledger, row, path)?;
     println!(
         "vm={} absent; owned transport keys removed; ledger closed",
@@ -1490,7 +1585,7 @@ fn cleanup(
 /// One reconciliation pass over every active clone.
 struct Pass {
     finished: usize,
-    /// Any row error or ambiguity freezes new admission until a clean pass.
+    /// Reconciliation failures freeze admission; quarantined rows retain only their own reservation.
     frozen: Option<ScalerError>,
 }
 /// Reconcile every active clone. One row's error does not starve the others.
@@ -1525,10 +1620,44 @@ fn reconcile_all(
             }
         }
     }
+    publish_reconcile_status(ledger, dir, first_error.as_ref())?;
     Ok(Pass {
         finished,
         frozen: first_error,
     })
+}
+
+/// Durable sweep input. Publish failures outside reconciliation too, so an
+/// admission/provisioning outage is visible before the next 60-second pass.
+fn publish_reconcile_status(
+    ledger: &Ledger,
+    dir: &Path,
+    error: Option<&ScalerError>,
+) -> Result<(), ScalerError> {
+    let status = serde_json::json!({
+        "updated": now()?,
+        "admission_frozen": error.is_some(),
+        "cause": error.map(ToString::to_string),
+        "quarantined": ledger.rows.iter().filter(|row| row.state != State::Destroyed
+            && row.quarantined)
+            .map(|row| serde_json::json!({"vm": row.vm, "cause": row.failure})).collect::<Vec<_>>()
+    });
+    save_json(&status, &dir.join("reconcile-status.json"))?;
+    Ok(())
+}
+
+fn recovery_note(row: &mut Record, note: &str) {
+    if row
+        .failure
+        .as_deref()
+        .is_some_and(|previous| previous.starts_with(note))
+    {
+        return;
+    }
+    row.failure = Some(match row.failure.take() {
+        Some(previous) => format!("{note}; previous: {previous}"),
+        None => note.to_owned(),
+    });
 }
 
 /// The committed copy of `name` for this reconcile step, or `None` while a
@@ -1579,16 +1708,30 @@ fn reconcile_one(
         Some(task) => pve.task_state(task)?,
         None => TaskState::Absent,
     };
-    match recovery_decision(&row, present, task, now()?) {
+    let recovery = recovery_decision(&row, present, task, now()?);
+    if recovery != Recovery::Quarantine && row.quarantined {
+        row.quarantined = false;
+        update(ledger, &row, path)?;
+    }
+    match recovery {
         Recovery::Wait => return Ok(false),
         Recovery::Quarantine => {
-            eprintln!(
-                "vm={} ambiguous/missing state; admission frozen, owner inspection required",
-                row.vm.get()
+            if pve.clone_never_submitted(&row)? && !gh.registration_exists(&row)? {
+                recovery_note(
+                    &mut row,
+                    "clone never submitted: no source-template qmclone task since reservation, VM, registration, assignment or storage volume",
+                );
+                finish_destroyed(ledger, &mut row, dir, path)?;
+                return Ok(true);
+            }
+            row.quarantined = true;
+            recovery_note(
+                &mut row,
+                "quarantined: ambiguous/missing clone state; owner inspection required",
             );
-            return Err(ScalerError::Guard(
-                "ambiguous clone state; admission frozen for owner inspection",
-            ));
+            update(ledger, &row, path)?;
+            eprintln!("vm={} quarantined; owner inspection required", row.vm.get());
+            return Ok(false);
         }
         Recovery::FinishAbsent => {
             if task == TaskState::Failed {
@@ -2380,6 +2523,7 @@ pub(super) fn controller(
         }
         if let Some(error) = provision_failed {
             eprintln!("provisioning failed: {error}; backing off");
+            publish_reconcile_status(&ledger, dir, Some(&error))?;
             frozen = true;
             backoff.grow();
             admit_after = Instant::now() + backoff.delay();
@@ -2411,6 +2555,7 @@ pub(super) fn controller(
                 Err(error) => {
                     // Transient GitHub/PVE failures never end the controller.
                     eprintln!("admission pass failed: {error}; backing off");
+                    publish_reconcile_status(&ledger, dir, Some(&error))?;
                     frozen = true;
                     backoff.grow();
                     admit_after = Instant::now() + backoff.delay();
@@ -3722,6 +3867,257 @@ mod tests {
             .is_err()
         );
     }
+    fn reconcile_fixture(case: &str) {
+        const CHILD: &str = "CARRICK_RECONCILE_1577";
+        if std::env::var(CHILD).as_deref() != Ok(case) {
+            let codes: &[u16] = if case == "transient" {
+                &[7, 28, 55, 56, 500, 503]
+            } else {
+                &[55]
+            };
+            for code in codes {
+                let output = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        &format!("ci_scaler::live::tests::serial_host_reconcile_{case}"),
+                        "--nocapture",
+                    ])
+                    .env(CHILD, case)
+                    .env("CARRICK_CURL_STATUS", code.to_string())
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "code={code}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        let curl = dir.join("curl");
+        std::fs::write(
+            &curl,
+            r#"#!/bin/sh
+cat >/dev/null
+for arg do url=$arg; done
+printf '%s\n' "$url" >> "$CARRICK_FIXTURE_DIR/calls"
+if [ "$CARRICK_RECONCILE_1577" = transient ] || [ "$CARRICK_RECONCILE_1577" = persistent ]; then
+  if [ ! -f "$CARRICK_FIXTURE_DIR/retried" ] || [ "$CARRICK_RECONCILE_1577" = persistent ]; then
+    touch "$CARRICK_FIXTURE_DIR/retried"
+    if [ "$CARRICK_CURL_STATUS" -ge 500 ]; then
+      printf 'upstream unavailable\n%s' "$CARRICK_CURL_STATUS"
+      exit 0
+    fi
+    exit "$CARRICK_CURL_STATUS"
+  fi
+fi
+case "$url" in
+ */pools/carrick-ci) body='{"poolid":"carrick-ci","members":[]}' ;;
+ *'/tasks?'*)
+   case "$CARRICK_RECONCILE_1577" in
+     task) body='[{"type":"qmclone","id":"300","starttime":1}]' ;;
+     *) body='[]' ;;
+   esac ;;
+ */tasks/*/status) body='{"status":"running"}' ;;
+ */qemu) body='[]' ;;
+ */storage)
+   case "$CARRICK_RECONCILE_1577" in
+     incomplete) body='[]' ;;
+     *) body='[{"storage":"local"}]' ;;
+   esac ;;
+ *'/content?'*)
+   case "$CARRICK_RECONCILE_1577" in
+     volume) body='[{"vmid":308,"volid":"local:308/vm-308-disk-0.raw"}]' ;;
+     *) body='[]' ;;
+   esac ;;
+ *) exit 92 ;;
+esac
+printf '{"data":%s}\n200' "$body"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let gh = dir.join("gh");
+        std::fs::write(&gh, "#!/bin/sh\nprintf '[{\"runners\":[]}]'\n").unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Subprocess isolation: no sibling test can observe these fixture tools.
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!("{}:{}", dir.display(), std::env::var("PATH").unwrap()),
+            );
+            std::env::set_var("CARRICK_FIXTURE_DIR", dir);
+        }
+        let pve = Pve {
+            site: site::WILLOW,
+            token: Token {
+                id: "fixture".into(),
+                secret: "synthetic".into(),
+            },
+            deadline: std::cell::Cell::new(None),
+        };
+        let mut ledger = Ledger::default();
+        let mut row = row();
+        row.state = State::Cloning;
+        if case == "absent" {
+            row.failure = Some("lost clone response".into());
+        }
+        if case == "transient" {
+            row.task = Some(format!("{}fixture", site::WILLOW.task_prefix()));
+        }
+        ledger.rows.push(row.clone());
+        let path = dir.join("ledger.json");
+        ledger.save(&path).unwrap();
+        let pass = reconcile_all(
+            &pve,
+            &Github,
+            &mut ledger,
+            dir,
+            &path,
+            (1, &Admission::Standing),
+        )
+        .unwrap();
+        if case == "persistent" {
+            assert!(pass.frozen.is_some());
+            assert_eq!(ledger.rows[0].state, State::Cloning);
+            assert!(ledger.rows[0].failure.is_none());
+            let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+            assert_eq!(calls.lines().count(), 3);
+            return;
+        }
+        assert!(
+            pass.frozen.is_none(),
+            "transport recovery/quarantine must not freeze other rows"
+        );
+        if case == "transient" {
+            assert_eq!(pass.finished, 0);
+            assert_eq!(
+                serde_json::to_value(&ledger.rows[0]).unwrap(),
+                serde_json::to_value(&row).unwrap()
+            );
+            assert!(dir.join("retried").exists());
+            assert_eq!(
+                std::fs::read_to_string(dir.join("calls"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                3
+            );
+            return;
+        }
+        if matches!(case, "task" | "volume" | "incomplete") {
+            assert_eq!(pass.finished, 0);
+            assert_eq!(ledger.rows[0].state, State::Cloning);
+            assert!(ledger.rows[0].quarantined);
+            assert!(
+                ledger.rows[0]
+                    .failure
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("quarantined:")
+            );
+        } else {
+            assert_eq!(pass.finished, 1);
+            assert_eq!(ledger.rows[0].state, State::Destroyed);
+            assert!(
+                ledger.rows[0]
+                    .failure
+                    .as_deref()
+                    .unwrap()
+                    .contains("never submitted")
+            );
+        }
+        if case == "absent" {
+            assert!(
+                ledger.rows[0]
+                    .failure
+                    .as_deref()
+                    .unwrap()
+                    .contains("lost clone response")
+            );
+        }
+        // The production admission entry point reserves a different row while
+        // the quarantined reservation continues to consume its own slot.
+        let admitted = reserve_admitted_clone(
+            &mut ledger,
+            &path,
+            JobKey {
+                run: RunId(7),
+                attempt: 1,
+                job: JobId(8),
+            },
+            (
+                CloneBudget {
+                    kvm: Concurrency::try_from(2).unwrap(),
+                    agents: "4".parse().unwrap(),
+                },
+                CloneLane::Kvm,
+            ),
+            || Ok(true),
+            || Ok(vec![]),
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(admitted.name, row.name);
+        let status: Value =
+            serde_json::from_slice(&std::fs::read(dir.join("reconcile-status.json")).unwrap())
+                .unwrap();
+        assert_eq!(status["admission_frozen"], false);
+        assert_eq!(
+            status["quarantined"].as_array().unwrap().len(),
+            usize::from(matches!(case, "task" | "volume" | "incomplete"))
+        );
+    }
+    #[test]
+    fn serial_host_reconcile_absent() {
+        reconcile_fixture("absent");
+    }
+    #[test]
+    fn serial_host_reconcile_task() {
+        reconcile_fixture("task");
+    }
+    #[test]
+    fn serial_host_reconcile_volume() {
+        reconcile_fixture("volume");
+    }
+    #[test]
+    fn serial_host_reconcile_transient() {
+        reconcile_fixture("transient");
+    }
+    #[test]
+    fn serial_host_reconcile_persistent() {
+        reconcile_fixture("persistent");
+    }
+    #[test]
+    fn serial_host_reconcile_incomplete() {
+        reconcile_fixture("incomplete");
+    }
+    #[test]
+    fn serial_host_ssh_connect_timeout_retries_within_command_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join("ssh");
+        let marker =
+            crate::remote_accept::shell_quote(&dir.path().join("connected").display().to_string());
+        std::fs::write(&ssh, format!("#!/bin/sh\nif [ ! -e {marker} ]; then touch {marker}; printf 'ssh: connect to host fixture port 22: Connection timed out' >&2; exit 255; fi\nprintf connected\n")).unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            execute(&mut Command::new(ssh), &[], Duration::from_secs(2)).unwrap(),
+            b"connected"
+        );
+    }
+    #[test]
+    fn pve_server_errors_are_transient_even_without_json() {
+        for status in [500, 502, 503, 504] {
+            assert!(matches!(
+                pve_response(format!("bad gateway\n{status}").as_bytes()),
+                Err(ScalerError::Transient(TransientFailure::PveServer))
+            ));
+        }
+    }
+
     fn row() -> Record {
         Ledger::default()
             .reserve(

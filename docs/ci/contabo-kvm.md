@@ -474,6 +474,36 @@ rebuilding a template in the freed slot with this procedure, and because
 `main` still points the site row at the new slot, it needs a fix-forward PR
 that changes the site row before its controller is deployed.
 
+### Reconciliation status and missing clone submissions
+
+Director sweeps should read `reconcile-status.json` in the controller's state
+directory (beside `ledger.json`). Each reconciliation pass atomically replaces
+it with `updated` (Unix seconds), `admission_frozen`, `cause`, and a
+`quarantined` list containing VMIDs and reasons. Admission and provisioning
+failures also publish their freeze cause immediately. A stale `updated` value
+means the controller has not completed a pass; check its service and journal.
+The file is owner-only, like the ledger.
+
+A missing VM with a `Cloning` row and no recorded task is closed only after
+successful queries show no source-template `qmclone` task since reservation,
+no VM config, no volume on any listed node storage, and no runner registration
+or ledger assignment. The failure history retains the reason. A source task
+whose destination cannot be established, a leftover volume, or incomplete
+evidence quarantines that row and retains its reservation. Other rows can
+still be reconciled and admitted within the remaining capacity.
+
+Read-only PVE and GitHub calls retry transient transport failures three times
+with 100 ms and 400 ms backoff. PVE 5xx, curl connection/send/receive errors,
+and timeouts are typed transport failures, never absence evidence. SSH connect
+timeouts retry within the original command budget. A clone POST is never
+blindly replayed after losing its response: reconciliation must establish
+what PVE received. Exhausted API retries freeze admission and appear in the
+status file; they do not change the row into a quarantine verdict.
+
+Deployment remains a director operation: review first, announce the swap,
+retain the serving binary for rollback, and follow the controller cutover
+procedure above. Portable fixtures do not establish deployed PVE acceptance.
+
 ### Reaping clone volumes after a storage lock timeout
 
 A successful VM DELETE task can leave a disk behind when `local` storage is
