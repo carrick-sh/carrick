@@ -66,6 +66,8 @@ pub enum Commands {
     SmokeSigned(crate::smoke_signed::SmokeSignedArgs),
     #[command(about = "Classify CI diff paths and derive referenced doc/agent dependencies")]
     CiChanges(crate::ci_changes::CiChangesArgs),
+    /// Classify cancelled Actions jobs without retrying or changing a verdict.
+    CiStarvedJobs(crate::ci_changes::StarvedJobsArgs),
     #[command(about = "Census clean landed worktrees; dry-run unless --apply")]
     WorktreeGc(crate::worktree_gc::WorktreeGcArgs),
 
@@ -527,6 +529,10 @@ where
         }
         Commands::CiReceipt(args) => {
             crate::ci_receipt::run(args)?;
+            Ok(())
+        }
+        Commands::CiStarvedJobs(args) => {
+            crate::ci_changes::starved_jobs(args, writer)?;
             Ok(())
         }
         Commands::CiChanges(args) => {

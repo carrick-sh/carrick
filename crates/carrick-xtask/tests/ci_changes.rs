@@ -1405,3 +1405,33 @@ fn el1_native_closure_gates_pr_surfaces_and_refuses_new_failures_before_landing(
         "merge_group entry with NEW native-process failure (el1-native-gate=failure) must be refused by ci-ok"
     );
 }
+
+#[test]
+fn starved_jobs_cli_classifies_without_excusing_execution_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let jobs = dir.path().join("jobs.json");
+    fs::write(&jobs, serde_json::json!({"total_count": 3, "jobs": [
+        {"id": 1, "name": "never-assigned", "status": "completed", "conclusion": "cancelled", "runner_name": "", "steps": []},
+        {"id": 2, "name": "started-failed", "status": "completed", "conclusion": "failure", "runner_name": "runner", "steps": []},
+        {"id": 3, "name": "started-cancelled", "status": "completed", "conclusion": "cancelled", "runner_name": "runner", "steps": []}
+    ]}).to_string()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .args(["ci-starved-jobs", "--jobs"])
+        .arg(&jobs)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("never-assigned (1): retry-eligible"));
+    assert!(stdout.contains("started-failed (2): fail"));
+    assert!(stdout.contains("started-cancelled (3): fail"));
+
+    fs::write(&jobs, r#"{"total_count":101,"jobs":[]}"#).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .args(["ci-starved-jobs", "--jobs"])
+        .arg(&jobs)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("incomplete jobs response"));
+}
