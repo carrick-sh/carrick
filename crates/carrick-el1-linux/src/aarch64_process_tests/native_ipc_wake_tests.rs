@@ -24,6 +24,7 @@ struct SignalCase {
     epoll: bool,
     partial: bool,
     eof_race: bool,
+    restore_identity: bool,
 }
 
 struct ByteCopy;
@@ -63,6 +64,17 @@ fn serial_host_two_native_children_pipe_eof_wake_with_the_executor_away() {
 #[test]
 fn serial_host_two_native_children_pipe_signal_with_the_executor_away() {
     two_native_children_pipe_eof_wake(true, Some(SignalCase::default()));
+}
+
+#[test]
+fn serial_host_forked_child_ipc_signal_checkpoint_restores_process_identity() {
+    two_native_children_pipe_eof_wake(
+        true,
+        Some(SignalCase {
+            restore_identity: true,
+            ..Default::default()
+        }),
+    );
 }
 
 #[test]
@@ -132,8 +144,8 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
         ProcessSignals, SignalInfo, SignalProcessSelector, SignalRequest,
     };
     use carrick_signal_core::policy::{Action, ActionFlags, Disposition, HandlerAddress, Signal};
-    let fixture = Fixture::new(0x10000, asid(1));
-    let sender_task = CurrentTask::new();
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let sender_task = Box::leak(Box::new(CurrentTask::new()));
     struct RestoreRegion(usize);
     impl Drop for RestoreRegion {
         fn drop(&mut self) {
@@ -157,17 +169,31 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
         slot: fixture.slot,
     };
     let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
-    let words = fixture.tables.live(&fixture.maintenance);
-    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
-        source,
-        &fixture.task,
-        fixture.page,
-        fixture.control,
-        fixture.address,
-        fixture.address,
-        parked,
-    )
-    .unwrap();
+    let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
+    let runtime = Arc::new(
+        NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+            source,
+            &fixture.task,
+            fixture.page,
+            fixture.control,
+            fixture.address,
+            fixture.address,
+            parked,
+        )
+        .unwrap(),
+    );
+    struct RootRegistration(Arc<NativeProcessRuntime<'static, Mm, Aarch64ParkedContext>>);
+    impl Drop for RootRegistration {
+        fn drop(&mut self) {
+            registry().unregister_root_for_test(&self.0);
+        }
+    }
+    let _registration = signal.is_some_and(|case| case.restore_identity).then(|| {
+        registry()
+            .register_root(runtime.clone(), source, &fixture.task, fixture.address)
+            .unwrap();
+        RootRegistration(runtime.clone())
+    });
     let owner = Arc::new(
         HostIpc::with_limits(
             1 << 20,
@@ -231,7 +257,7 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
         NonZeroU64::MIN,
         &crossing,
     )
-    .with_words(&words);
+    .with_words(words);
     let parent = TaskKey {
         id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
         serial: TaskSerial::from_raw_u64(11).unwrap(),
@@ -264,14 +290,14 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
         slot: sender_slot,
     };
     let mut sender_service = Aarch64NativeProcessService::with_crossing(
-        &sender_task,
+        sender_task,
         sender_slot,
         fixture.zone,
         fixture.region.table(),
         NonZeroU64::MIN,
         &crossing,
     )
-    .with_words(&words);
+    .with_words(words);
     let mut sender = if signal.is_some() {
         fixture
             .zone
@@ -301,12 +327,12 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
             .zone
             .requeue_on(sender_slot, parent_binding.record.id)
             .unwrap();
-        activate_target(sender_source, &sender_task, &parent_binding);
+        activate_target(sender_source, sender_task, &parent_binding);
         Some(
             runtime
                 .enter(
                     sender_source,
-                    &sender_task,
+                    sender_task,
                     parent_binding.words,
                     &mut sender_service,
                 )
@@ -367,7 +393,7 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
             handoff: None,
             zone: fixture.zone,
             slot: sender_slot,
-            task: &sender_task,
+            task: sender_task,
             cpu: &mut cpu,
             user: &crate::sched::HardwareUserWord,
             counters: &counters,
@@ -602,6 +628,54 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
                 switched.result, None,
                 "retained syscall arguments survive handback"
             );
+            if signal.is_some_and(|case| case.restore_identity) {
+                // This slot last ran the live parent. Drive the registered
+                // child's real IPC continuation with that stale Linux process
+                // projection, then enter the same process boundary used by
+                // arm_signal_user_return. Before #1576 the registered fast
+                // path skipped identity restoration and this entry was Stale.
+                fixture.task.publish_visible_pid(41);
+                assert_eq!(
+                    crate::aarch64_process::resume_production_with_service(
+                        fixture.zone,
+                        &fixture.task,
+                        fixture.slot,
+                        child.record.id,
+                        &mut service,
+                    ),
+                    crate::sched::ResumeAction::RetrySyscall
+                );
+                assert_eq!(fixture.task.visible_pid(), Some(child.visible_pid));
+                let context = unsafe { *fixture.zone.record(child.record.id).ctx_mut() };
+                let identity = fixture.zone.record(child.record.id).identity();
+                let page = unsafe {
+                    &*(identity.lifecycle_page as *const carrick_el1_abi::ThreadLifecyclePage)
+                };
+                let control = unsafe {
+                    &*(identity.control_slot as *const carrick_el1_abi::ThreadControlSlot)
+                };
+                // A direct user-return checkpoint may follow retained IPC
+                // completion without another scheduler resume.
+                fixture.task.publish_visible_pid(41);
+                crate::aarch64_process::with_process_entry(
+                    source,
+                    &fixture.task,
+                    &context.native,
+                    context.address_context().unwrap().root.address().raw(),
+                    page,
+                    control,
+                    &mut service,
+                    |process| assert!(process.signal_checkpoint_needed()),
+                )
+                .unwrap();
+                assert!(
+                    fixture
+                        .zone
+                        .requeue_preempted(fixture.slot, child.record.id)
+                        .is_queued()
+                );
+                continue;
+            }
             let mut frame = carrick_el1_abi::TrapFrame {
                 slot: u64::from(fixture.slot.raw()),
                 ..Default::default()
@@ -745,6 +819,9 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
                     .requeue_preempted(fixture.slot, child.record.id)
                     .is_queued()
             );
+        }
+        if signal.is_some_and(|case| case.restore_identity) {
+            return;
         }
         assert_eq!(fixture.zone.counters.el1_parks.load(Ordering::Relaxed), 2);
         return;

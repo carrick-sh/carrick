@@ -59,3 +59,26 @@ nor retries admission nor scans the carrier's process population. VM-free
 coverage cannot establish the signed carrier fatal population; the director
 must rerun the affected signed fork-COW, two-process, spawn-slope, seccomp clone
 filter and allocator tests, and report zero of the #1576 EntryBinding fatals.
+
+The follow-up signed attribution found two populations. The inherited-IPC
+fatals occur on this change but not on either admitted-main run; they are a
+regression of the newborn restoration. The sibling-exec and clone-storm
+exit-group fatals also occur on main and are the older #1576 cases. Both reach
+the same stale namespace projection at a later lifecycle point: a direct
+`with_process_entry` checkpoint before another scheduler resume. Its
+PID-qualified `group_address` lookup returns `Stale`, which
+`arm_signal_user_return` in `dispatch.rs` lowers to the `EntryBinding` fatal.
+
+`serial_host_forked_child_ipc_signal_checkpoint_restores_process_identity`
+forks two children with inherited pipe descriptions, parks both reads, targets
+them with caught signals, and drives the production IPC resume and process
+entry. With the admission restoration removed it fails with `Stale` at that
+entry. Admission now restores the namespace PID before the group lookup:
+registered records use the exact indexed `resume_visible_pid` identity owner,
+while an entryless record uses the existing authenticated
+`newborn_visible_pid` lifecycle resolver. Record, execution generation, MM,
+lifecycle, control and address authentication remain unchanged; there is no
+retry, polling, population scan or lifecycle-fatal suppression. This VM-free
+witness covers the two signed IPC regressions directly and the sibling-exec
+and clone-storm exit-group cases at their shared entry boundary. Signed
+population evidence remains director-owned.
