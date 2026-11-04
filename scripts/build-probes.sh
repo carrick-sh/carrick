@@ -34,7 +34,10 @@
 set -e
 cd "$(dirname "$0")/.."
 
-CARRICK_REGISTRY_CACHE="${CARGO_HOME:-$HOME/.cargo}/registry"
+CARRICK_DOCKER_CARGO_CACHE=()
+if [ "${CARGO_NET_OFFLINE:-false}" = true ]; then
+  CARRICK_DOCKER_CARGO_CACHE=(-e CARGO_NET_OFFLINE -v "${CARGO_HOME:-$HOME/.cargo}/registry:/usr/local/cargo/registry:ro")
+fi
 HOST_ARCH="$(uname -m)"
 MODE="${1:-default}"
 
@@ -54,15 +57,14 @@ if [ "$MODE" = "--closure-arm64" ]; then
   rm -rf conformance-probes/target/aarch64-unknown-linux-musl/release
   rm -rf conformance-probes/target/aarch64-unknown-linux-gnu/release
 
-  docker run --rm --platform linux/arm64 \
+  docker run --rm "${CARRICK_DOCKER_CARGO_CACHE[@]}" --platform linux/arm64 \
     -e CARRICK_CLOSURE_BINS \
-    -v "$CARRICK_REGISTRY_CACHE:/usr/local/cargo/registry:ro" \
     -v "$PWD/conformance-probes:/p" -w /p \
     rust:alpine sh -ec '
       rustup target add aarch64-unknown-linux-musl >/dev/null 2>&1 || true
       # Closure is an evidence gate: serialize the 430-bin build so artifact
       # publication on the bind-mounted target is deterministic.
-      set -- cargo build --locked --offline --release --jobs 1 --target aarch64-unknown-linux-musl
+      set -- cargo build --locked --release --jobs 1 --target aarch64-unknown-linux-musl
       for name in $CARRICK_CLOSURE_BINS; do
         set -- "$@" --bin "$name"
       done
@@ -71,13 +73,12 @@ if [ "$MODE" = "--closure-arm64" ]; then
   python3 scripts/probe-inventory.py check-binaries \
     conformance-probes/target/aarch64-unknown-linux-musl/release arm64-musl
 
-  docker run --rm --platform linux/arm64 \
+  docker run --rm "${CARRICK_DOCKER_CARGO_CACHE[@]}" --platform linux/arm64 \
     -e CARRICK_CLOSURE_BINS \
-    -v "$CARRICK_REGISTRY_CACHE:/usr/local/cargo/registry:ro" \
     -v "$PWD/conformance-probes:/p" -w /p \
     rust:bookworm sh -ec '
       rustup target add aarch64-unknown-linux-gnu >/dev/null 2>&1 || true
-      set -- cargo build --locked --offline --release --jobs 1 --target aarch64-unknown-linux-gnu
+      set -- cargo build --locked --release --jobs 1 --target aarch64-unknown-linux-gnu
       for name in $CARRICK_CLOSURE_BINS; do
         set -- "$@" --bin "$name"
       done
@@ -95,8 +96,7 @@ if [ "$MODE" = "--native-pie" ] || [ "$MODE" = "--native-pie-musl" ]; then
     exit 2
   fi
 
-  docker run --rm --platform linux/arm64 \
-    -v "$CARRICK_REGISTRY_CACHE:/usr/local/cargo/registry:ro" \
+  docker run --rm "${CARRICK_DOCKER_CARGO_CACHE[@]}" --platform linux/arm64 \
     -v "$PWD/conformance-probes:/p" -w /p \
     rust:alpine sh -ec '
       rustup target add aarch64-unknown-linux-musl >/dev/null 2>&1 || true
@@ -106,7 +106,7 @@ if [ "$MODE" = "--native-pie" ] || [ "$MODE" = "--native-pie-musl" ]; then
       CARGO_TARGET_DIR=target/native-pie \
         CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=cc \
         RUSTFLAGS="-C link-self-contained=no -C relocation-model=pic -C link-arg=-static-pie -C link-arg=-L${sysroot}/lib/rustlib/aarch64-unknown-linux-musl/lib/self-contained" \
-        cargo build --locked --offline --release --target aarch64-unknown-linux-musl
+        cargo build --locked --release --target aarch64-unknown-linux-musl
 
       probe=target/native-pie/aarch64-unknown-linux-musl/release/devnullseek
       readelf -h "$probe" | awk '\''$1 == "Type:" { found = 1; if ($2 != "DYN") exit 1 } END { if (!found) exit 1 }'\''
@@ -120,8 +120,7 @@ if [ "$MODE" = "--native-pie" ] || [ "$MODE" = "--native-pie-musl" ]; then
     exit 0
   fi
 
-  docker run --rm --platform linux/arm64 \
-    -v "$CARRICK_REGISTRY_CACHE:/usr/local/cargo/registry:ro" \
+  docker run --rm "${CARRICK_DOCKER_CARGO_CACHE[@]}" --platform linux/arm64 \
     -v "$PWD/conformance-probes:/p" -w /p \
     rust:bookworm sh -ec '
       rustup target add aarch64-unknown-linux-gnu >/dev/null 2>&1 || true
@@ -131,7 +130,7 @@ if [ "$MODE" = "--native-pie" ] || [ "$MODE" = "--native-pie-musl" ]; then
       rm -rf target/native-pie/aarch64-unknown-linux-gnu/release
       CARGO_TARGET_DIR=target/native-pie \
         RUSTFLAGS="-C relocation-model=pie -C link-arg=-pie" \
-        cargo build --locked --offline --release --target aarch64-unknown-linux-gnu
+        cargo build --locked --release --target aarch64-unknown-linux-gnu
 
       probe=target/native-pie/aarch64-unknown-linux-gnu/release/devnullseek
       readelf -h "$probe" | awk '\''$1 == "Type:" { found = 1; if ($2 != "DYN") exit 1 } END { if (!found) exit 1 }'\''
@@ -163,7 +162,7 @@ build_native() {
   (
     cd conformance-probes
     # shellcheck disable=SC2086 # linker_env is a deliberate "VAR=val" prefix
-    env $linker_env cargo build --locked --offline --release --target "$triple" --keep-going || true
+    env $linker_env cargo build --locked --release --target "$triple" --keep-going || true
   )
 }
 
@@ -186,29 +185,27 @@ fi
 # ── macOS / aarch64 host: build via arm64 rust containers (cross-compile) ─────
 
 # ── aarch64-musl (static) + x86_64-musl (static, Rust-only cross-link) ───────
-docker run --rm --platform linux/arm64 \
-  -v "$CARRICK_REGISTRY_CACHE:/usr/local/cargo/registry:ro" \
+docker run --rm "${CARRICK_DOCKER_CARGO_CACHE[@]}" --platform linux/arm64 \
     -v "$PWD/conformance-probes:/p" -w /p \
   rust:alpine sh -c '
     rustup target add aarch64-unknown-linux-musl >/dev/null 2>&1 || true
     rustup target add x86_64-unknown-linux-musl >/dev/null 2>&1 || true
-    cargo build --locked --offline --release --target aarch64-unknown-linux-musl
+    cargo build --locked --release --target aarch64-unknown-linux-musl
     rm -rf target/x86_64-unknown-linux-musl/release
     # The full x86_64-musl set: rust-lld cross-links the Rust-only probes
     # without an x86 C toolchain; --keep-going skips the ~handful of
     # aarch64-only raw-asm probes. This is what feeds the macOS Rosetta amd64
     # lane (the gating x86_64-musl set).
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
-      cargo build --locked --offline --release --target x86_64-unknown-linux-musl --keep-going || true
+      cargo build --locked --release --target x86_64-unknown-linux-musl --keep-going || true
   '
 
 # ── aarch64-gnu (dynamic glibc) ─────────────────────────────────────────────
-docker run --rm --platform linux/arm64 \
-  -v "$CARRICK_REGISTRY_CACHE:/usr/local/cargo/registry:ro" \
+docker run --rm "${CARRICK_DOCKER_CARGO_CACHE[@]}" --platform linux/arm64 \
     -v "$PWD/conformance-probes:/p" -w /p \
   rust:bookworm sh -c '
     rustup target add aarch64-unknown-linux-gnu >/dev/null 2>&1 || true
-    cargo build --locked --offline --release --target aarch64-unknown-linux-gnu --keep-going || true
+    cargo build --locked --release --target aarch64-unknown-linux-gnu --keep-going || true
   '
 
 # Note: x86_64-unknown-linux-gnu is intentionally NOT built on macOS (no x86 C

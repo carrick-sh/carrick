@@ -129,7 +129,7 @@ def _expected_profile_commands() -> dict[str, tuple[str, ...]]:
         "macos-cli-default": (
             "cargo",
             "clippy",
-            "--locked", "--offline",
+            "--locked",
             "-p",
             "carrick-cli",
             "--target",
@@ -144,7 +144,7 @@ def _expected_profile_commands() -> dict[str, tuple[str, ...]]:
         "macos-runtime-default": (
             "cargo",
             "clippy",
-            "--locked", "--offline",
+            "--locked",
             "-p",
             "carrick-runtime",
             "--target",
@@ -158,7 +158,7 @@ def _expected_profile_commands() -> dict[str, tuple[str, ...]]:
         "macos-hvf-default": (
             "cargo",
             "clippy",
-            "--locked", "--offline",
+            "--locked",
             "-p",
             "carrick-vmm-hvf",
             "--target",
@@ -182,7 +182,7 @@ def _expected_profile_commands() -> dict[str, tuple[str, ...]]:
             commands[f"{host}-{target}"] = (
                 "cargo",
                 "clippy",
-                "--locked", "--offline",
+                "--locked",
                 "-p",
                 package,
                 "--no-default-features",

@@ -130,7 +130,7 @@ fn checked(status: ExitStatus) -> Result<()> {
 }
 
 fn build(lane: &Lane) -> Result<(PathBuf, PathBuf)> {
-    let mut command = crate::command::offline_cargo();
+    let mut command = crate::command::locked_cargo();
     command
         .current_dir(&lane.cwd)
         .args(crate::command::cargo_replay_args(&lane.build))

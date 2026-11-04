@@ -606,16 +606,9 @@ impl El1NativeClosure {
         if !repo_root.join("Cargo.toml").is_file() {
             return None;
         }
-        let output = crate::command::offline_cargo()
+        let output = crate::command::locked_cargo()
             .current_dir(repo_root)
-            .args([
-                "metadata",
-                "--format-version",
-                "1",
-                "--no-deps",
-                "--locked",
-                "--offline",
-            ])
+            .args(["metadata", "--format-version", "1", "--no-deps", "--locked"])
             .stderr(std::process::Stdio::null())
             .output()
             .ok()?;

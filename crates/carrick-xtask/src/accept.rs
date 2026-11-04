@@ -1409,7 +1409,7 @@ fn run_command_redirect(
     let err_file = log_file.try_clone()?;
 
     let mut cmd = if prog == "cargo" {
-        crate::command::offline_cargo()
+        crate::command::locked_cargo()
     } else {
         Command::new(prog)
     };

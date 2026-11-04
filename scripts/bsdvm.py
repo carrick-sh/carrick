@@ -116,7 +116,7 @@ _HOST_CRATES = "-p carrick-portable -p carrick-hal -p carrick-host -p carrick-me
 
 STAGES: dict[str, Stage] = {
     "stage0": Stage(
-        cmds=[f"cd /root/carrick && cargo test --locked --offline {_HOST_CRATES}"],
+        cmds=[f"cd /root/carrick && cargo test --locked {_HOST_CRATES}"],
         report_only=False,
         available=True,
     ),
@@ -133,7 +133,7 @@ STAGES: dict[str, Stage] = {
         # the campaign actually needs -- the CLI, engine and runtime built
         # against this host's backend.
         cmds=[
-            "cd /root/carrick && cargo build --locked --offline -p carrick-cli "
+            "cd /root/carrick && cargo build --locked -p carrick-cli "
             "--no-default-features --features {platform_feature}"
         ],
         report_only=True,  # red list IS the bring-up worklist (spec)

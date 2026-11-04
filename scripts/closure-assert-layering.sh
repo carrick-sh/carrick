@@ -30,7 +30,7 @@ fail=0
 # targets. A text scrape would silently drop every lib-only crate (including
 # carrick-vmm-hvf) from `members`, and this gate would report them "skipped"
 # forever instead of actually walking their closure.
-members="$(cargo metadata --locked --offline --no-deps --format-version 1 | jq -r '.packages[].name' | sort -u)"
+members="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[].name' | sort -u)"
 
 # check() takes an optional cargo-tree target/feature override as its 2nd
 # arg (a single space-separated string of flags, or '' for none), so a
@@ -48,12 +48,12 @@ check() {
   # shellcheck disable=SC2086 -- target_args is a fixed, script-controlled
   # flag string (e.g. "--target x86_64-unknown-linux-gnu --all-features"),
   # never user input; word-splitting it is intentional here.
-  tree="$(cargo tree --locked --offline -p "$crate" --edges normal --prefix none $target_args 2>/dev/null | awk '{print $1}' | sort -u)"
+  tree="$(cargo tree --locked -p "$crate" --edges normal --prefix none $target_args 2>/dev/null | awk '{print $1}' | sort -u)"
   for forbidden in "$@"; do
     if grep -Eq "^${forbidden}$" <<<"$tree"; then
       echo "layering FAIL: $crate depends on $forbidden"
       # shellcheck disable=SC2086
-      cargo tree --locked --offline -p "$crate" --edges normal --invert "$(grep -E "^${forbidden}$" <<<"$tree" | head -1)" $target_args 2>/dev/null | head -20 || true
+      cargo tree --locked -p "$crate" --edges normal --invert "$(grep -E "^${forbidden}$" <<<"$tree" | head -1)" $target_args 2>/dev/null | head -20 || true
       fail=1
     fi
   done
@@ -130,12 +130,12 @@ done
 # that checked nothing. A `--workspace` selection (clippy, doc, test) does
 # unify the feature, on purpose: that is what lints and renders the gated
 # surface.
-default_members="$(cargo metadata --locked --offline --no-deps --format-version 1 | jq -r '.workspace_default_members[]' | sed -E 's#^(path\+file://)?##; s#\#.*$##' | xargs -n1 basename | sort | paste -sd ' ' -)"
+default_members="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.workspace_default_members[]' | sed -E 's#^(path\+file://)?##; s#\#.*$##' | xargs -n1 basename | sort | paste -sd ' ' -)"
 echo "layering: product selection (default-members) = ${default_members}"
 product_feature_rule() {
   local crate="$1" feature="${2:-test-support}" tree
-  if ! tree="$(cargo tree --locked --offline --edges normal,features --invert "$crate" --prefix none 2>&1)"; then
-    echo "layering FAIL: cargo tree --locked --offline could not resolve $crate in the product selection:"
+  if ! tree="$(cargo tree --locked --edges normal,features --invert "$crate" --prefix none 2>&1)"; then
+    echo "layering FAIL: cargo tree --locked could not resolve $crate in the product selection:"
     head -5 <<<"$tree"
     fail=1
     return
@@ -147,7 +147,7 @@ product_feature_rule() {
   fi
   if grep -Eq "^${crate} feature \"${feature}\"$" <<<"$tree"; then
     echo "layering FAIL: the product selection enables $crate feature \"${feature}\" (test-only surface in the shipped binary); enabled through:"
-    cargo tree --locked --offline --edges normal,features --invert "$crate" 2>/dev/null | grep -E -A3 "^.*${crate} feature \"${feature}\"" | head -12 || true
+    cargo tree --locked --edges normal,features --invert "$crate" 2>/dev/null | grep -E -A3 "^.*${crate} feature \"${feature}\"" | head -12 || true
     fail=1
     return
   fi

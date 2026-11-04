@@ -33,7 +33,8 @@ const CAPTURE: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
 
 locked=0
-offline=0
+offline=${CARGO_NET_OFFLINE:-0}
+[ "$offline" != true ] || offline=1
 for arg in "$@"; do
     [ "$arg" != "--" ] || break
     case "$arg" in
@@ -117,6 +118,7 @@ pub fn records(root: &Path, recipe: &str, args: &[String]) -> Result<Vec<Vec<Str
         .arg(recipe)
         .args(args)
         .current_dir(root)
+        .env("CARGO_NET_OFFLINE", "true")
         .env("PATH", capture_path)
         .env("CARRICK_REAL_CARGO", real_cargo)
         .env("CARRICK_TEST_CAPTURE", temp.path().join("commands"))
@@ -743,6 +745,7 @@ fn check_host(root: &Path, host: &str) -> Result<String> {
         let output = Command::new("just")
             .arg(recipe)
             .current_dir(&root)
+            .env("CARGO_NET_OFFLINE", "true")
             .env("PATH", &capture_path)
             .env("CARRICK_REAL_CARGO", &real_cargo)
             .env("CARRICK_TEST_CAPTURE", &log)

@@ -289,7 +289,7 @@ pub fn build_accept_job_script(
             FixtureBundle::Remote(_) => "remote",
         };
         let preparation = format!(
-            "test -d {q_lock} && cargo run --locked --offline -p carrick-xtask -- fixtures prepare --bundle {} --run-dir {} --source {source} && just accept --phase {phase} --receipt {q_receipt}",
+            "test -d {q_lock} && cargo run --locked -p carrick-xtask -- fixtures prepare --bundle {} --run-dir {} --source {source} && just accept --phase {phase} --receipt {q_receipt}",
             shell_quote(bundle.path()),
             shell_quote(&run_dir.to_string_lossy()),
         );

@@ -3041,7 +3041,7 @@ fn review_signed_build_diagnostics_reach_receipt() {
     let script = include_str!("../../../scripts/lib/test-signed-body.sh");
     let build = script
         .lines()
-        .find(|line| line.starts_with("cargo test --locked --offline -p \"$pkg\""))
+        .find(|line| line.starts_with("cargo test --locked -p \"$pkg\""))
         .unwrap();
     let format = build
         .split_whitespace()

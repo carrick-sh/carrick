@@ -72,7 +72,7 @@ fi
 CARRICK_BUILD_SOURCE_HEAD="$source_head" \
     CARRICK_BUILD_SOURCE_TREE="$source_tree" \
     CARRICK_BUILD_SOURCE_STATE="$source_state" \
-    cargo build --locked --offline --release $cargo_args
+    cargo build --locked --release $cargo_args
 
 built="${CARGO_TARGET_DIR:-target}/release/carrick"
 signed="target/release/carrick"

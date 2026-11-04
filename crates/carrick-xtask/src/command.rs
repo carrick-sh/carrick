@@ -115,11 +115,18 @@ pub(crate) fn sanitize_cargo_package_env(command: &mut Command) {
     }
 }
 
-/// Cargo children consume an already prepared lockfile cache. Keep the policy
+/// Recipe children inherit offline mode only after workflow preparation.
+pub fn locked_cargo() -> Command {
+    let mut command = Command::new("cargo");
+    command.arg("--locked");
+    command
+}
+
+/// Test children consume an already prepared lockfile cache. Keep the policy
 /// on the command itself so callers cannot accidentally inherit online defaults.
 pub fn offline_cargo() -> Command {
-    let mut command = Command::new("cargo");
-    command.args(["--locked", "--offline"]);
+    let mut command = locked_cargo();
+    command.arg("--offline");
     command.env("CARGO_NET_OFFLINE", "true");
     command
 }

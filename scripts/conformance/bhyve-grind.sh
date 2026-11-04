@@ -36,7 +36,7 @@ REG="${BHYVE_REG:-localhost:5050}"
 IMG="${BHYVE_IMG:-localhost:5050/ltp:arm64}"
 SSH="ssh -o ConnectTimeout=15 -o ServerAliveInterval=20 -o ServerAliveCountMax=400 -o BatchMode=yes"
 ENVV="CARRICK_INSECURE_REGISTRIES=$REG"
-BUILD="cargo build --locked --offline --release -j4 -p carrick-cli --no-default-features --features platform-freebsd,syscall-shim"
+BUILD="cargo build --locked --release -j4 -p carrick-cli --no-default-features --features platform-freebsd,syscall-shim"
 # The harness is a SECOND explicit build, and it is not optional: the root
 # manifest's `default-members` is `crates/carrick-cli`, and carrick-conformance
 # is a bin-only crate outside that closure, so no carrick build of any shape
@@ -45,7 +45,7 @@ BUILD="cargo build --locked --offline --release -j4 -p carrick-cli --no-default-
 # baseline comparison silently attributing its verdicts to the synced tree.
 # It links none of the guest stack and has no platform features, so it takes
 # the plain host build on the FreeBSD box.
-BUILD_CONF="cargo build --locked --offline --release -j4 -p carrick-conformance"
+BUILD_CONF="cargo build --locked --release -j4 -p carrick-conformance"
 # Reap leaked/wedged guests; works whether run remotely (in a heredoc) or as a phrase.
 REAP='ps -axo pid,etimes,command 2>/dev/null | awk "/carrick:/ && \$2>180 {print \$1}" | xargs -r kill -9 2>/dev/null; for vm in $(ls /dev/vmm/ 2>/dev/null | grep carrick); do pid=$(echo "$vm" | sed "s/carrick-\([0-9]*\)-.*/\1/"); kill -0 "$pid" 2>/dev/null || bhyvectl --destroy --vm="$vm" >/dev/null 2>&1; done'
 

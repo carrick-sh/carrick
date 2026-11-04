@@ -957,7 +957,7 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
         .output(environment.configure(Command::new("rustc").current_dir(root).arg("-vV")))?;
     let cargo = environment.output(
         environment.configure(
-            crate::command::offline_cargo()
+            crate::command::locked_cargo()
                 .current_dir(root)
                 .arg("--version"),
         ),
@@ -991,7 +991,7 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
     };
     let names = probe_names(&source)?;
     for target in [GuestTarget::Musl, GuestTarget::Gnu] {
-        let mut command = crate::command::offline_cargo();
+        let mut command = crate::command::locked_cargo();
         environment
             .configure(&mut command)
             .current_dir(source.join("conformance-probes"))
@@ -1031,7 +1031,7 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
     // shared raw/musl script must remain usable on hosted macOS without them.
     run_build(
         environment
-            .configure(&mut crate::command::offline_cargo())
+            .configure(&mut crate::command::locked_cargo())
             .current_dir(source.join("fixtures/linux-aarch64-hello"))
             .args([
                 "build",

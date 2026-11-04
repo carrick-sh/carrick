@@ -35,7 +35,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .args([
             "build",
             "--locked",
-            "--offline",
             "--release",
             "-p",
             "carrick-x86-cpl0",

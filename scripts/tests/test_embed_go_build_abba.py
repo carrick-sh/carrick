@@ -291,7 +291,7 @@ class EmbedArmPreparationTest(unittest.TestCase):
 
     def test_receipt_rejects_wrong_build_artifact_contract(self):
         receipt = self.prepare()
-        receipt["build"]["command"] = ["cargo", "build", "--locked", "--offline", ]
+        receipt["build"]["command"] = ["cargo", "build", "--locked", ]
         receipt_path = self.destination / "arm.json"
         receipt_path.chmod(0o644)
         receipt_path.write_text(json.dumps(receipt))

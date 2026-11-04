@@ -344,7 +344,7 @@ fn workspace_capture_with_artifact_and_no_cargo_environment() {
 fn capture_refuses_unlocked_or_online_cargo_before_execution() {
     for invocation in [
         "cargo test",
-        "cargo test --locked",
+        "env CARGO_NET_OFFLINE=false cargo test --locked",
         "cargo test --offline",
         "cargo test -- --locked --offline",
     ] {
@@ -407,6 +407,7 @@ fn cache_preparation_failure_is_infrastructure_and_offline_gate_never_fetches() 
             .arg(&root)
             .env("PATH", &path)
             .env("CALL_LOG", &log)
+            .env("CARGO_NET_OFFLINE", "true")
             .output()
             .unwrap()
     };
@@ -435,5 +436,5 @@ fn cache_preparation_failure_is_infrastructure_and_offline_gate_never_fetches() 
     assert!(!run(false).status.success());
     let calls = std::fs::read_to_string(&log).unwrap();
     assert_eq!(calls.lines().count(), 1);
-    assert!(calls.starts_with("metadata --locked --offline"));
+    assert!(calls.starts_with("metadata --locked --format-version"));
 }

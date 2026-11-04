@@ -793,7 +793,7 @@ mod tests {
             let mut command = std::process::Command::new(&cargo);
             super::super::dispatch_worker::private_environment(&mut command);
             command
-                .args(["check", "--locked", "--offline"])
+                .args(["check", "--locked"])
                 .current_dir(&project)
                 .env("CARGO_BUILD_JOBS", "3")
                 .env("RUSTC", cargo.parent().unwrap().join("rustc"))

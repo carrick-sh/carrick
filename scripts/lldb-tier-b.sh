@@ -18,7 +18,7 @@ binary="./target/release/carrick"
 entitlements="./scripts/entitlements.plist"
 lldb_init="./scripts/carrick.lldb"
 
-cargo build --locked --offline --release --bin carrick --message-format short >&2
+cargo build --locked --release --bin carrick --message-format short >&2
 codesign --force --sign - --entitlements "$entitlements" "$binary" >&2
 
 case "${1:-}" in

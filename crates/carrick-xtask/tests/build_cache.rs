@@ -662,3 +662,35 @@ esac
         );
     }
 }
+
+#[test]
+fn recipes_inherit_offline_only_after_cache_preparation() {
+    let dir = tempfile::tempdir().unwrap();
+    let cargo = dir.path().join("cargo");
+    fs::write(
+        &cargo,
+        "#!/bin/sh\nprintf '%s\\n' \"${CARGO_NET_OFFLINE-unset}\" \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/lib/build-env.sh");
+    for prepared in [false, true] {
+        let mut command = Command::new(find("sh"));
+        command
+            .args(["-c", ". \"$1\"; cargo metadata", "witness"])
+            .arg(&script)
+            .env("PATH", dir.path())
+            .env("CARRICK_SCCACHE", "0")
+            .env_remove("CARGO_NET_OFFLINE");
+        if prepared {
+            command.env("CARGO_NET_OFFLINE", "true");
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let args: Vec<_> = stdout.lines().collect();
+        assert_eq!(args[0], if prepared { "true" } else { "unset" });
+        assert!(args.contains(&"--locked"));
+        assert!(!args.contains(&"--offline"), "{stdout}");
+    }
+}
