@@ -26,15 +26,12 @@ fn deadline_names_unfinished_test_reaps_process_and_preserves_results() {
     "#,
     )
     .unwrap();
-    fs::write(dir.path().join("justfile"), "green:\n    cargo test --locked --features loom --lib passing\nred:\n    cargo test --locked --features loom --lib failing\nstall:\n    cargo test --locked --features loom --lib -- --skip failing\nduplicate:\n    cargo test --locked --features loom --lib passing\n    cargo test --locked --features loom --lib failing\nbad-build:\n    cargo test --locked --features missing --lib passing\n").unwrap();
-    assert!(
-        Command::new("cargo")
-            .args(["generate-lockfile", "--offline"])
-            .current_dir(dir.path())
-            .status()
-            .unwrap()
-            .success()
-    );
+    fs::write(dir.path().join("justfile"), "green:\n    cargo --locked --offline test --locked --features loom --lib passing\nred:\n    cargo --locked --offline test --locked --features loom --lib failing\nstall:\n    cargo --locked --offline test --locked --features loom --lib -- --skip failing\nduplicate:\n    cargo --locked --offline test --locked --features loom --lib passing\n    cargo --locked --offline test --locked --features loom --lib failing\nbad-build:\n    cargo --locked --offline test --locked --features missing --lib passing\n").unwrap();
+    fs::write(
+        dir.path().join("Cargo.lock"),
+        "version = 4\n[[package]]\nname = \"loom-watchdog-fixture\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
     // Only the stall recipe should reach its deadline; the others get room
     // for a loaded host.
     let spawn = |recipe: &str, timeout: &str| {

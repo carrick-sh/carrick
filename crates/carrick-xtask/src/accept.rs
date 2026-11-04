@@ -1408,7 +1408,11 @@ fn run_command_redirect(
     let log_file = fs::File::create(log_path)?;
     let err_file = log_file.try_clone()?;
 
-    let mut cmd = Command::new(prog);
+    let mut cmd = if prog == "cargo" {
+        crate::command::offline_cargo()
+    } else {
+        Command::new(prog)
+    };
     cmd.args(args);
     lease.configure_command(&mut cmd)?;
     cmd.current_dir(cwd);

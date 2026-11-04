@@ -784,11 +784,16 @@ mod tests {
             for name in ["credentials", "credentials.toml"] {
                 std::fs::write(cargo_home.join(name), "runner-registry-secret").unwrap();
             }
+            std::fs::write(
+                project.join("Cargo.lock"),
+                "version = 4\n[[package]]\nname = \"isolation-witness\"\nversion = \"0.0.0\"\n",
+            )
+            .unwrap();
             let cargo = PathBuf::from(env!("CARGO"));
             let mut command = std::process::Command::new(&cargo);
             super::super::dispatch_worker::private_environment(&mut command);
             command
-                .args(["check", "--offline"])
+                .args(["check", "--locked", "--offline"])
                 .current_dir(&project)
                 .env("CARGO_BUILD_JOBS", "3")
                 .env("RUSTC", cargo.parent().unwrap().join("rustc"))

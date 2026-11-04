@@ -42,6 +42,7 @@ edition = "2024"
 syscall-shim = []
 platform-linux = []
 ''')
+    (root / 'Cargo.lock').write_text('version = 4\n[[package]]\nname = "carrick-runtime"\nversion = "0.1.0"\n')
     for path in ['.cargo/config.toml', 'rust-toolchain.toml', 'clippy.toml']:
         shutil.copyfile(ROOT / path, root / path)
     (root / 'crates/carrick-runtime/src/lib.rs').write_text('''

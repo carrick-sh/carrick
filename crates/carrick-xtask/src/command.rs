@@ -114,3 +114,28 @@ pub(crate) fn sanitize_cargo_package_env(command: &mut Command) {
         }
     }
 }
+
+/// Cargo children consume an already prepared lockfile cache. Keep the policy
+/// on the command itself so callers cannot accidentally inherit online defaults.
+pub fn offline_cargo() -> Command {
+    let mut command = Command::new("cargo");
+    command.args(["--locked", "--offline"]);
+    command.env("CARGO_NET_OFFLINE", "true");
+    command
+}
+
+// A captured recipe can carry Cargo's global policy flags. The command
+// constructor already owns them; replay keeps only one copy in that scope.
+pub(crate) fn cargo_replay_args(arguments: &[String]) -> impl Iterator<Item = &String> {
+    let separator = arguments
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(arguments.len());
+    arguments.iter().enumerate().filter_map(move |(i, arg)| {
+        if i < separator && matches!(arg.as_str(), "--locked" | "--offline" | "--frozen") {
+            None
+        } else {
+            Some(arg)
+        }
+    })
+}

@@ -103,8 +103,6 @@ pub struct GuestImageBuildConfig {
     pub profile: BuildProfile,
     /// Features to enable (`--features <features>`).
     pub features: Vec<String>,
-    /// Whether to pass `--locked` to cargo.
-    pub locked: bool,
     /// Custom cargo binary path (defaults to `CARGO` env or `cargo`).
     pub cargo_path: Option<PathBuf>,
     /// Routines audited and allowed to use FP/SIMD on AArch64.
@@ -129,7 +127,6 @@ impl GuestImageBuildConfig {
             bin_name: None,
             profile: BuildProfile::Release,
             features: Vec::new(),
-            locked: false,
             cargo_path: None,
             expected_fpsimd_routines: Vec::new(),
             rustflags: Vec::new(),
@@ -482,7 +479,7 @@ pub fn package_guest_image(
         .unwrap_or_else(|| PathBuf::from("cargo"));
 
     let mut cmd = Command::new(&cargo);
-    cmd.arg("build");
+    cmd.args(["build", "--locked", "--offline"]);
     cmd.arg("--manifest-path").arg(&manifest_path);
     if let Some(pkg) = &config.package {
         cmd.arg("-p").arg(pkg);
@@ -495,9 +492,6 @@ pub fn package_guest_image(
         cmd.arg("--release");
     }
     cmd.arg("--target-dir").arg(&target_dir);
-    if config.locked {
-        cmd.arg("--locked");
-    }
     if !config.features.is_empty() {
         cmd.arg("--features").arg(config.features.join(","));
     }
@@ -589,9 +583,6 @@ pub struct PackageGuestImageArgs {
 
     #[arg(long, help = "Features to enable (comma-separated)")]
     pub features: Vec<String>,
-
-    #[arg(long, help = "Run cargo with --locked")]
-    pub locked: bool,
 }
 
 pub fn run_package_guest_image(args: &PackageGuestImageArgs) -> Result<(), GuestImageError> {
@@ -600,7 +591,6 @@ pub fn run_package_guest_image(args: &PackageGuestImageArgs) -> Result<(), Guest
     config.bin_name = args.bin.clone();
     config.profile = args.profile;
     config.features = args.features.clone();
-    config.locked = args.locked;
 
     let artifact = package_guest_image(&config)?;
     println!(

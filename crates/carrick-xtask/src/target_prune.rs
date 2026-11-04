@@ -1387,9 +1387,14 @@ mod tests {
         fs::create_dir(temp.path().join("src")).unwrap();
         fs::write(temp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
         fs::write(temp.path().join("build.rs"),r#"use std::io::{Read,Write}; fn main() { let mut s = std::os::unix::net::UnixStream::connect(std::env::var_os("BUILD_CENSUS_SOCKET").unwrap()).unwrap(); s.write_all(b"ready\n").unwrap(); let mut reply=[0]; s.read_exact(&mut reply).unwrap(); }"#).unwrap();
+        fs::write(
+            temp.path().join("Cargo.lock"),
+            "version = 4\n[[package]]\nname = \"native-lock-proof\"\nversion = \"0.0.0\"\n",
+        )
+        .unwrap();
         let socket = temp.path().join("cargo.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let mut cargo = Command::new("cargo")
+        let mut cargo = crate::command::offline_cargo()
             .arg("build")
             .current_dir(temp.path())
             .env("CARGO_TARGET_DIR", &target)

@@ -955,8 +955,13 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
     // the original clean checkout again after builds to reject source races.
     let rustc = environment
         .output(environment.configure(Command::new("rustc").current_dir(root).arg("-vV")))?;
-    let cargo = environment
-        .output(environment.configure(Command::new("cargo").current_dir(root).arg("--version")))?;
+    let cargo = environment.output(
+        environment.configure(
+            crate::command::offline_cargo()
+                .current_dir(root)
+                .arg("--version"),
+        ),
+    )?;
     let host = rustc
         .lines()
         .find_map(|l| l.strip_prefix("host: "))
@@ -986,7 +991,7 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
     };
     let names = probe_names(&source)?;
     for target in [GuestTarget::Musl, GuestTarget::Gnu] {
-        let mut command = Command::new("cargo");
+        let mut command = crate::command::offline_cargo();
         environment
             .configure(&mut command)
             .current_dir(source.join("conformance-probes"))
@@ -1026,7 +1031,7 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
     // shared raw/musl script must remain usable on hosted macOS without them.
     run_build(
         environment
-            .configure(&mut Command::new("cargo"))
+            .configure(&mut crate::command::offline_cargo())
             .current_dir(source.join("fixtures/linux-aarch64-hello"))
             .args([
                 "build",

@@ -94,7 +94,7 @@ log "building signed carrick + conformance harness"
 # checkout happened to leave in target/release -- a stale suite table,
 # baseline comparison or oracle-cache schema producing verdicts that belong
 # to no revision. A gate result belongs to exactly one pair of binaries.
-cargo build --release -p carrick-conformance
+cargo build --locked --offline --release -p carrick-conformance
 
 # --- 3. run -----------------------------------------------------------------
 TIER="${TIER:-full}"

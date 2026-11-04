@@ -17,7 +17,7 @@ limactl shell "$vm" -- env REPO="$repo" bash -lc '
   # features` is REQUIRED: the default feature is platform-macos, which pulls in
   # carrick-vmm-hvf/applevisor and fails to build on Linux (E0433). The platform-linux
   # closure is HVF-free (scripts/closure-assert-no-hvf.sh), matching kvm-smoke-lima.sh.
-  cargo build --release -p carrick-cli --no-default-features --features platform-linux \
-    --target-dir "$HOME/ct" --locked >&2
+  cargo build --locked --offline --release -p carrick-cli --no-default-features --features platform-linux \
+    --target-dir "$HOME/ct"  >&2
   echo "$HOME/ct/release/carrick"
 '

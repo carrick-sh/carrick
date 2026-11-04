@@ -132,6 +132,7 @@ def _run_command(root: Path, command: RunnerCommand, libc: str) -> CommandResult
         args = [
             "cargo",
             "test",
+            "--locked", "--offline",
             "-p",
             command.package,
             "--test",
@@ -167,7 +168,7 @@ def _run_command(root: Path, command: RunnerCommand, libc: str) -> CommandResult
     if process.returncode == 0 and transport_completed and passed:
         return CommandResult("PASS", output, "")
     if process.returncode != 0 and transport_completed and failed:
-        return CommandResult("FAIL", output, f"cargo test exited {process.returncode}")
+        return CommandResult("FAIL", output, f"cargo test --locked --offline exited {process.returncode}")
     return CommandResult(
         "ERROR",
         output,

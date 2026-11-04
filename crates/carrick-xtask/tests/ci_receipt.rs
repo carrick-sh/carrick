@@ -3041,7 +3041,7 @@ fn review_signed_build_diagnostics_reach_receipt() {
     let script = include_str!("../../../scripts/lib/test-signed-body.sh");
     let build = script
         .lines()
-        .find(|line| line.starts_with("cargo test -p \"$pkg\""))
+        .find(|line| line.starts_with("cargo test --locked --offline -p \"$pkg\""))
         .unwrap();
     let format = build
         .split_whitespace()
@@ -3054,8 +3054,13 @@ fn review_signed_build_diagnostics_reach_receipt() {
         "[package]\nname='libpython-map'\nversion='0.0.0'\nedition='2024'\n[workspace]\n",
     )
     .unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.lock"),
+        "version = 4\n[[package]]\nname = \"libpython-map\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
     std::fs::write(dir.path().join("src/lib.rs"), "#[test] fn missing_link() { unsafe extern \"C\" { fn carrick_receipt_missing_symbol(); } unsafe { carrick_receipt_missing_symbol(); } }\n").unwrap();
-    let output = Command::new("cargo")
+    let output = carrick_xtask::command::offline_cargo()
         .current_dir(dir.path())
         .args(["test", "--offline", "--no-run", format])
         .env_remove("CARGO_TARGET_DIR")

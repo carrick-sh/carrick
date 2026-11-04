@@ -70,7 +70,7 @@ if [ -z "${CARRICK_HOST_LEASE_SOCKET:-}" ]; then
 fi
 # Validate the supervised lease and check host load before any work. The runner
 # logs detected PIDs and parent commands even with CARRICK_ALLOW_LOAD=1.
-cargo run --locked -p carrick-xtask -- host-lease --mode carrick --check-load -- true
+cargo run --locked --offline -p carrick-xtask -- host-lease --mode carrick --check-load -- true
 
 pkg="${1:?usage: scripts/test-signed.sh <package> [libtest args...]}"
 shift
@@ -414,7 +414,7 @@ case "$pkg" in
     carrick-embed|carrick-conformance-next)
         fixture_receipt="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-fixtures.XXXXXX")"
         scratch+=("$fixture_receipt")
-        cargo run --locked -p carrick-xtask -- fixtures verify --receipt "$fixture_receipt"
+        cargo run --locked --offline -p carrick-xtask -- fixtures verify --receipt "$fixture_receipt"
         jq -c '. + {schema:"carrick.signed-embed-test.v1",record_type:"fixture_validation"}' \
             "$fixture_receipt" >>"$receipt_tmp"
         ;;
@@ -426,7 +426,7 @@ esac
 if [ "$pkg" = "carrick-conformance-next" ]; then
     witness_json="$(mktemp "${TMPDIR:-/tmp}/forkexecstorm-witness-build.XXXXXX")"
     scratch+=("$witness_json")
-    (cd conformance-probes && cargo test --locked --release \
+    (cd conformance-probes && cargo test --locked --offline --release \
         --target aarch64-unknown-linux-musl --bin forkexecstorm \
         --no-run --message-format=json) >"$witness_json"
     witness_exe="$(jq -ers '[.[] | select(.reason == "compiler-artifact" and .target.name == "forkexecstorm" and .profile.test == true and .executable != null)] | if length == 1 then .[0].executable else error("expected one forkexecstorm test executable") end' "$witness_json")"
@@ -453,20 +453,20 @@ if [ "$pkg" = "carrick-conformance-next" ]; then
     libpython_map_source_sha256="$(shasum -a 256 "$libpython_map_fixture/src/main.rs" | cut -d ' ' -f 1)"
     CARRICK_LIBPYTHON_MAP_SOURCE_SHA256="$libpython_map_source_sha256" \
         CARGO_TARGET_DIR="$PWD/target/libpython-map" \
-        cargo build --manifest-path "$libpython_map_fixture/Cargo.toml" \
-        --target aarch64-unknown-linux-musl --release --locked
+        cargo build --locked --offline --manifest-path "$libpython_map_fixture/Cargo.toml" \
+        --target aarch64-unknown-linux-musl --release
     directory_fixture="crates/carrick-conformance-next/tests/fixtures/directory-copyout"
     directory_source_sha256="$(shasum -a 256 "$directory_fixture/src/main.rs" | cut -d ' ' -f 1)"
     CARRICK_DIRECTORY_COPYOUT_SOURCE_SHA256="$directory_source_sha256" \
         CARGO_TARGET_DIR="$PWD/target/directory-copyout" \
-        cargo build --manifest-path "$directory_fixture/Cargo.toml" \
-        --target aarch64-unknown-linux-musl --release --locked
+        cargo build --locked --offline --manifest-path "$directory_fixture/Cargo.toml" \
+        --target aarch64-unknown-linux-musl --release
     elf_errno_fixture="crates/carrick-conformance-next/tests/fixtures/elf-exec-errno"
     elf_errno_source_sha256="$(shasum -a 256 "$elf_errno_fixture/src/main.rs" | cut -d ' ' -f 1)"
     CARRICK_ELF_FIXTURE_SOURCE_SHA256="$elf_errno_source_sha256" \
         CARGO_TARGET_DIR="$PWD/target/elf-exec-errno" \
-        cargo build --manifest-path "$elf_errno_fixture/Cargo.toml" \
-        --target aarch64-unknown-linux-musl --release --locked
+        cargo build --locked --offline --manifest-path "$elf_errno_fixture/Cargo.toml" \
+        --target aarch64-unknown-linux-musl --release
 fi
 
 # 1. Build (never run) the package's test executables and collect their
@@ -488,7 +488,7 @@ if [ -n "${CARRICK_TEST_TARGET:-}" ]; then
 fi
 # Render compiler diagnostics to stderr so build failures reach the gate log;
 # compiler-artifact records still go to the JSON executable inventory.
-cargo test -p "$pkg" ${cargo_target_flags[@]+"${cargo_target_flags[@]}"} ${cargo_feature_flags[@]+"${cargo_feature_flags[@]}"} --release --no-run --message-format=json-render-diagnostics >"$json_log"
+cargo test --locked --offline -p "$pkg" ${cargo_target_flags[@]+"${cargo_target_flags[@]}"} ${cargo_feature_flags[@]+"${cargo_feature_flags[@]}"} --release --no-run --message-format=json-render-diagnostics >"$json_log"
 exes=()
 while IFS= read -r exe; do
     [ -n "$exe" ] && exes+=("$exe")

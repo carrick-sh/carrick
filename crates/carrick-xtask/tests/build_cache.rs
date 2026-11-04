@@ -37,6 +37,11 @@ impl Build {
         justfile.push_str("\ncache-recipe-witness:\n    {{_cargo}} check --offline\n    {{_cargo}} check --offline\n");
         fs::write(root.path().join("justfile"), justfile).unwrap();
         fs::write(root.path().join("Cargo.toml"), "[workspace]\n[package]\nname = \"cache-recipe-witness\"\nversion = \"0.0.0\"\nedition = \"2021\"\n").unwrap();
+        fs::write(
+            root.path().join("Cargo.lock"),
+            "version = 4\n[[package]]\nname = \"cache-recipe-witness\"\nversion = \"0.0.0\"\n",
+        )
+        .unwrap();
         fs::write(root.path().join("src/lib.rs"), "pub fn witness() {}\n").unwrap();
         symlink(env!("CARGO"), root.path().join("bin/cargo")).unwrap();
         // Link individual utilities instead of admitting their system/cache
@@ -586,7 +591,13 @@ fn clippy_recipes_keep_production_features_and_fail_closed_on_discovery() {
     fs::write(
         &cargo,
         r#"#!/bin/sh
-if [ "$1" = --config ]; then shift 2; fi
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --config) shift 2 ;;
+        --locked|--offline|--frozen) shift ;;
+        *) break ;;
+    esac
+done
 case "$1" in
  tree)
     case "$TREE_MODE" in

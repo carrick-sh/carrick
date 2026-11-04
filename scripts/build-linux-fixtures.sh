@@ -151,7 +151,7 @@ build_fixture "udp_dns.rs" "carrick-linux-aarch64-udp-dns"
 build_fixture "udp_dns_debian.rs" "carrick-linux-aarch64-udp-dns-debian"
 build_pie_fixture "pie_hello.rs" "carrick-linux-aarch64-pie-hello"
 
-cargo metadata \
+cargo metadata --locked --offline \
   --manifest-path "$fixture_dir/Cargo.toml" \
   --format-version 1 \
   >/dev/null

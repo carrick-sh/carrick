@@ -7,8 +7,8 @@ set -euo pipefail
 target="aarch64-unknown-linux-gnu"
 features="platform-linux"
 
-echo "cargo tree --no-default-features --features $features --target $target ..."
-tree="$(cargo tree -p carrick-cli \
+echo "cargo tree --locked --offline --no-default-features --features $features --target $target ..."
+tree="$(cargo tree --locked --offline -p carrick-cli \
   --no-default-features --features "$features" \
   --target "$target" --edges normal 2>&1)"
 

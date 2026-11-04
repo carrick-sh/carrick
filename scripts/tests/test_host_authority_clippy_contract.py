@@ -21,6 +21,7 @@ def capture_fixture(extra_args: list[str]) -> list[dict[str, object]]:
     command = [
         "cargo",
         "clippy",
+        "--locked", "--offline",
         "--manifest-path",
         str(FIXTURE / "Cargo.toml"),
         "--lib",

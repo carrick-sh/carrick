@@ -23,7 +23,7 @@ carrick="$repo_root/target/release/carrick"
 script="$repo_root/scripts/dtrace/syscalls.d"
 
 if [ ! -x "$carrick" ]; then
-    echo "carrick-trace: $carrick not found; run 'cargo build --release' first" >&2
+    echo "carrick-trace: $carrick not found; run 'cargo build --locked --offline --release' first" >&2
     exit 1
 fi
 if [ ! -f "$script" ]; then

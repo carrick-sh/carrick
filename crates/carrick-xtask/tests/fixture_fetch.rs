@@ -1,5 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-//! Fixture dependency prefetch: the publisher's only network step.
+//! Fixture dependencies must already be prepared before publishing.
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -35,7 +35,7 @@ fn publisher_fetches_before_the_offline_environment_is_created() {
 }
 
 #[test]
-fn serial_host_fetch_tries_offline_then_locked_network_for_each_lockfile() {
+fn serial_host_fetch_requires_prepared_cache_without_network_fallback() {
     let root = repo();
     let plan = carrick_xtask::fixtures::fetch_plan(&root).unwrap();
     let fake = tempfile::tempdir().unwrap();
@@ -49,11 +49,11 @@ fn serial_host_fetch_tries_offline_then_locked_network_for_each_lockfile() {
     let bin = tempfile::tempdir().unwrap();
     let log = bin.path().join("log");
     let cargo = bin.path().join("cargo");
-    // A cold cache: offline fails, the locked network fetch succeeds.
+    // A warm cache: every invocation must remain locked and offline.
     std::fs::write(
         &cargo,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \" $* \" in *' --offline '*) exit 101;; esac\nexit 0\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
             log.display()
         ),
     )
@@ -71,18 +71,26 @@ fn serial_host_fetch_tries_offline_then_locked_network_for_each_lockfile() {
         .lines()
         .map(str::to_owned)
         .collect();
-    assert_eq!(calls.len(), plan.len() * 2);
-    for pair in calls.chunks(2) {
-        assert!(pair[0].starts_with("fetch --locked --offline --manifest-path "));
-        assert!(pair[1].starts_with("fetch --locked --manifest-path "));
+    assert_eq!(calls.len(), plan.len());
+    for call in calls {
+        assert!(call.starts_with("--locked --offline fetch --manifest-path "));
     }
-    // A failing network fetch is an explicit error naming the manifest.
-    std::fs::write(&cargo, "#!/bin/sh\necho 'no network' >&2\nexit 101\n").unwrap();
+    // A missing cache is an explicit error; no online retry may follow.
+    std::fs::write(&log, "").unwrap();
+    std::fs::write(
+        &cargo,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\necho 'missing cache' >&2\nexit 101\n",
+            log.display()
+        ),
+    )
+    .unwrap();
     let mut paths = vec![bin.path().to_path_buf()];
     paths.extend(std::env::split_paths(&old));
     unsafe { std::env::set_var("PATH", std::env::join_paths(paths).unwrap()) };
     let error = carrick_xtask::fixtures::fetch_dependencies(fake.path()).unwrap_err();
     unsafe { std::env::set_var("PATH", &old) };
     assert!(error.to_string().contains("cargo fetch --locked failed"));
-    assert!(error.to_string().contains("no network"));
+    assert!(error.to_string().contains("missing cache"));
+    assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
 }

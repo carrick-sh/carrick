@@ -78,7 +78,7 @@ PY
 fi
 
 if [[ -z "${CARRICK_BIN:-}" ]]; then
-    cargo build --quiet --bin carrick
+    cargo build --locked --offline --quiet --bin carrick
 fi
 if [[ "$(uname -s)" == "Darwin" && -x "$carrick_bin" ]]; then
     codesign --force --sign - --entitlements scripts/entitlements.plist "$carrick_bin" >/dev/null 2>&1 || true

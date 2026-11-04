@@ -229,6 +229,21 @@ struct Fixture {
     manifest: Manifest,
     path: PathBuf,
 }
+// These synthetic graphs have only path dependencies. Seed their exact locks
+// before the production resolver runs; fixture setup never needs Cargo online.
+fn fixture_lock(packages: &[(&str, &[&str])]) -> String {
+    let mut lock = String::from("version = 4\n");
+    for (name, dependencies) in packages {
+        lock.push_str(&format!(
+            "\n[[package]]\nname = {name:?}\nversion = \"0.0.0\"\n"
+        ));
+        if !dependencies.is_empty() {
+            lock.push_str(&format!("dependencies = {dependencies:?}\n"));
+        }
+    }
+    lock
+}
+
 impl Fixture {
     fn new() -> Self {
         Self::with_probe_count(1)
@@ -350,17 +365,27 @@ impl Fixture {
             } else {
                 write(root, &format!("{directory}/src/lib.rs"), b"// source\n");
             }
-            let output = Command::new("cargo")
-                .current_dir(root)
-                .args(["generate-lockfile", "--offline", "--manifest-path"])
-                .arg(format!("{directory}/Cargo.toml"))
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+            let lock = if name == "embed-el1-sched" {
+                fixture_lock(&[
+                    ("carrick-el1-abi", &["fixture-transitive"]),
+                    ("carrick-runtime", &[]),
+                    (
+                        "embed-el1-sched",
+                        &[
+                            "carrick-el1-abi",
+                            "carrick-runtime",
+                            "fixture-builder",
+                            "fixture-host-helper",
+                        ],
+                    ),
+                    ("fixture-builder", &[]),
+                    ("fixture-host-helper", &[]),
+                    ("fixture-transitive", &[]),
+                ])
+            } else {
+                fixture_lock(&[(name, &[])])
+            };
+            write(root, &format!("{directory}/Cargo.lock"), lock.as_bytes());
         }
         git(root, &["add", "."]);
         git(root, &["commit", "-qm", "fixture inputs"]);
@@ -1218,7 +1243,13 @@ impl Preparation {
             &bin,
             "cargo",
             br#"#!/bin/sh
-if [ "$1" = --config ]; then shift 2; fi
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --config) shift 2 ;;
+        --locked|--offline|--frozen) shift ;;
+        *) break ;;
+    esac
+done
 if [ "$1" = metadata ]; then exec "$FIXTURE_TEST_CARGO" "$@"; fi
 while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
 [ "$#" -gt 0 ] || exit 91
@@ -2531,7 +2562,12 @@ fn cargo_dep_info_records_out_of_package_compiler_inputs() {
         "fixtures/probe/src/main.rs",
         b"#[path = \"../../../outside/abi.rs\"]\nmod abi;\nconst BANNER: &str = include_str!(\"../../../shared/banner.txt\");\nfn main() { println!(\"{} {}\", abi::ABI, BANNER); }\n",
     );
-    let output = Command::new(env!("CARGO"))
+    write(
+        root,
+        "fixtures/probe/Cargo.lock",
+        b"version = 4\n[[package]]\nname = \"probe\"\nversion = \"0.0.0\"\n",
+    );
+    let output = carrick_xtask::command::offline_cargo()
         .current_dir(root.join("fixtures/probe"))
         .args(["build", "--offline", "--quiet"])
         .output()
@@ -2816,20 +2852,14 @@ fn unreviewed_proc_macro_refuses() {
     let mut text = fs::read_to_string(root.join(manifest)).unwrap();
     text.push_str("[dependencies]\nfixture-macro = { path = \"../../crates/fixture-macro\" }\n");
     write(root, manifest, text.as_bytes());
-    let output = Command::new("cargo")
-        .current_dir(root)
-        .args([
-            "generate-lockfile",
-            "--offline",
-            "--manifest-path",
-            manifest,
+    write(
+        root,
+        "fixtures/embed-icache-reuse/Cargo.lock",
+        fixture_lock(&[
+            ("embed-icache-reuse", &["fixture-macro"]),
+            ("fixture-macro", &[]),
         ])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+        .as_bytes(),
     );
     git(root, &["add", "."]);
     git(root, &["commit", "-qm", "proc-macro dependency"]);

@@ -228,3 +228,28 @@ closed, with no shell removal fallback. Low-disk recovery needs no Cargo run,
 build or gate checkout mutation. A busy lock, unavailable root lsof or helper,
 or insufficient reclaimed space preserves the 40 GiB refusal. The helper
 honors the existing `CARRICK_HOST_LEASE_PATH` environment plumbing.
+
+### Prepare Cargo dependencies before gates
+
+Recipes and test harness Cargo children use `--locked --offline`. Restore the
+existing Rust dependency cache, then run
+`scripts/check-fixture-lockfiles.sh --prepare` once before building or testing.
+This extends the fixture lockfile preparation to the root and active nested
+workspaces. A warm cache needs no registry request. An incomplete cache gets one
+locked fetch per workspace with retries disabled and a 30 second HTTP timeout.
+CI bounds the entire preparation step to ten minutes and reports failures with
+an `Infrastructure` annotation and exit 75. Later validation never fetches.
+
+The director workflow delta is
+[`1571-offline-cargo.patch`](ci/patches/1571-offline-cargo.patch). Publish it with
+the code change; it extends the existing rust-cache restores, then exports
+`CARGO_NET_OFFLINE=true` for subsequent steps. Historical baseline and selector
+checkouts prepare their own root lockfile in their own directory, without
+requiring new preparation tooling in an old commit. Tool installation uses
+binary downloads rather than Cargo compilation against an unrelated lockfile.
+Docker probe builds mount the prepared host registry cache read-only.
+
+The performance arm materializer still derives a new standalone driver lockfile
+with `cargo generate-lockfile --offline` during preparation. That operation
+necessarily creates a lockfile; the subsequent driver build is locked and
+offline. Dependency-free test workspaces instead seed explicit lockfiles.
