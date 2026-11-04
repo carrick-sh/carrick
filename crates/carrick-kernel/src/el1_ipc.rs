@@ -275,6 +275,66 @@ pub struct HostPreparedDescriptions<const N: usize> {
     prepared: fd::prepared::PreparedDescriptions<N>,
 }
 
+/// One retained native pipe creation, from canonical endpoint preparation to
+/// atomic descriptor publication. The exact table incarnation is captured at
+/// admission; dropping this value before publication cancels both endpoint
+/// descriptions through [`HostPreparedDescriptions`]'s settlement owner.
+///
+/// Output preparation happens while this value is retained, but outside every
+/// IPC lock. [`Self::publish`] accepts only a whole-word physical output whose
+/// mappings and exact-MM editor are already held. It therefore has exactly two
+/// effects, neither of which can suspend: publish both descriptors, then write
+/// their numbers. A refused publication returns this same transaction.
+#[derive(Debug)]
+#[must_use = "retain native pipe creation until publication or cancellation"]
+pub struct NativePipeCreation {
+    table: fd::TableId,
+    object: IpcObjectHandle,
+    prepared: HostPreparedDescriptions<2>,
+}
+
+impl NativePipeCreation {
+    /// The exact descriptor-table incarnation captured by this transaction.
+    pub fn table(&self) -> fd::TableId {
+        self.table
+    }
+
+    /// The exact pipe incarnation retained by both unpublished endpoints.
+    pub fn object(&self) -> IpcObjectHandle {
+        self.object
+    }
+
+    fn publish_with(
+        mut self,
+        cloexec: bool,
+        write: impl FnOnce([u8; 8]),
+    ) -> Result<[fd::Fd; 2], (AdmissionError, Self)> {
+        let pair = match self.prepared.install_pair(self.table, cloexec) {
+            Ok(pair) => pair,
+            Err(error) => return Err((error, self)),
+        };
+        let mut bytes = [0; 8];
+        bytes[..4].copy_from_slice(&pair[0].0.to_ne_bytes());
+        bytes[4..].copy_from_slice(&pair[1].0.to_ne_bytes());
+        write(bytes);
+        Ok(pair)
+    }
+
+    /// Publish the pair and consume an already-bound, infallible whole-word
+    /// output. On refusal, physical output custody is released before the
+    /// retained transaction is returned to its owner for growth or waiting.
+    pub fn publish<Context>(
+        self,
+        cloexec: bool,
+        output: carrick_core::mm::transaction::WordWriteOutput<'_, '_, Context>,
+    ) -> Result<[fd::Fd; 2], (AdmissionError, Self)>
+    where
+        Context: Copy + Send + Sync + zerocopy::FromZeros,
+    {
+        self.publish_with(cloexec, |bytes| output.write(bytes))
+    }
+}
+
 impl<const N: usize> Drop for HostPreparedDescriptions<N> {
     fn drop(&mut self) {
         let region = self.owner.region();
@@ -1098,6 +1158,24 @@ impl HostIpc {
             .map(|prepared| (object, prepared))
     }
 
+    /// Begin one native pipe creation before any descriptor or user output is
+    /// published. Canonical object/description growth, retired-ring reclaim,
+    /// wait binding and stock replenishment all run through `prepare_pipe`;
+    /// the returned owner then survives output preparation and publication.
+    pub fn begin_native_pipe_creation(
+        self: &std::sync::Arc<Self>,
+        table: fd::TableId,
+        capacity: usize,
+        flags: fd::StatusFlags,
+    ) -> Result<NativePipeCreation, AdmissionError> {
+        let (object, prepared) = self.prepare_pipe(capacity, flags)?;
+        Ok(NativePipeCreation {
+            table,
+            object,
+            prepared,
+        })
+    }
+
     pub fn create_table(
         &self,
         limit: usize,
@@ -1433,6 +1511,87 @@ mod tests {
                 .unwrap();
             owner.reclaim_descriptors(storage).unwrap();
         }
+    }
+
+    #[test]
+    fn serial_host_native_pipe_copyout_fault_cancels_both_descriptors_once() {
+        let owner = std::sync::Arc::new(HostIpc::new(1 << 20).unwrap());
+        let table = owner.create_table(8, 8).unwrap();
+        let creation = owner
+            .begin_native_pipe_creation(table, 65536, fd::StatusFlags::default())
+            .unwrap();
+        let object = creation.object();
+
+        // Production prepares and binds the whole output before publish. A
+        // genuine fault at that checkpoint drops the retained transaction.
+        drop(creation);
+
+        let region = owner.region();
+        let authority = region.fd(HostLockWait);
+        assert_eq!(authority.get(table, fd::Fd(0)), Err(fd::Error::BadFd));
+        assert_eq!(authority.get(table, fd::Fd(1)), Err(fd::Error::BadFd));
+        assert!(matches!(
+            owner.region().lock(object, &HostLockWait),
+            Err(IpcError::Stale)
+        ));
+    }
+
+    #[test]
+    fn serial_host_native_pipe_growth_refusal_retains_then_publishes_exact_pair() {
+        let owner = std::sync::Arc::new(HostIpc::new(1 << 20).unwrap());
+        let table = owner.create_table(8, 1).unwrap();
+        let creation = owner
+            .begin_native_pipe_creation(table, 65536, fd::StatusFlags::default())
+            .unwrap();
+        let object = creation.object();
+        let (error, creation) = creation
+            .publish_with(false, |_| panic!("refused publication cannot write output"))
+            .unwrap_err();
+        let descriptors = match error {
+            AdmissionError::Shared(IpcError::Fd(fd::Error::NeedsBacking { descriptors })) => {
+                descriptors
+            }
+            error => panic!("unexpected refusal: {error:?}"),
+        };
+        assert_eq!(creation.object(), object);
+        assert_eq!(creation.table(), table);
+        let region = owner.region();
+        let authority = region.fd(HostLockWait);
+        assert_eq!(authority.get(table, fd::Fd(0)), Err(fd::Error::BadFd));
+        owner.ensure_capacity(table, descriptors).unwrap();
+        let mut output = None;
+        let pair = creation
+            .publish_with(true, |bytes| output = Some(bytes))
+            .unwrap();
+        assert_eq!(pair, [fd::Fd(0), fd::Fd(1)]);
+        assert_eq!(output.unwrap(), [0, 0, 0, 0, 1, 0, 0, 0]);
+        assert_eq!(authority.getfd(table, fd::Fd(0)), Ok(true));
+        assert_eq!(authority.getfd(table, fd::Fd(1)), Ok(true));
+    }
+
+    #[test]
+    fn serial_host_native_pipe_fatal_cancel_releases_stock_and_descriptors() {
+        let owner = std::sync::Arc::new(HostIpc::new(1 << 20).unwrap());
+        let table = owner.create_table(8, 8).unwrap();
+        let before = owner.rings.lock().allocated.len();
+        let creation = owner
+            .begin_native_pipe_creation(table, 65536, fd::StatusFlags::default())
+            .unwrap();
+        let object = creation.object();
+        // Fatal native cancellation owns this drop; no numeric close is used.
+        drop(creation);
+        assert!(matches!(
+            owner.region().lock(object, &HostLockWait),
+            Err(IpcError::Stale)
+        ));
+        let region = owner.region();
+        let authority = region.fd(HostLockWait);
+        assert_eq!(authority.get(table, fd::Fd(0)), Err(fd::Error::BadFd));
+        assert_eq!(authority.get(table, fd::Fd(1)), Err(fd::Error::BadFd));
+        assert!(
+            owner.rings.lock().allocated.len() <= before + 1,
+            "bounded first-write stock must remain reusable"
+        );
     }
 
     #[test]

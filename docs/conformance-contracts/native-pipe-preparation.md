@@ -66,3 +66,18 @@ Native operation retention, canonical service growth, owner-wait/cancellation
 integration, production physical output binding and shared native pipe2
 routing are still required. The two native-child witnesses are still expected
 to fail; this checkpoint does not satisfy the signed CLI acceptance criterion.
+
+## Retained native creation transaction
+
+`NativePipeCreation` captures the exact descriptor-table and pipe incarnations
+with both prepared endpoints. It survives table growth and output preparation
+without retaining an IPC lock. Final publication accepts only the already-bound
+whole-word physical output, installs both descriptors atomically, then performs
+the infallible eight-byte write. A refused publication returns the same
+transaction; dropping it for a copyout fault or fatal cancellation settles both
+endpoints through the canonical release owner exactly once.
+
+The VM-free bindings exercise copyout-fault cancellation, a real one-slot table
+refusal followed by canonical growth and success, and fatal cancellation with
+no descriptors or unbounded ring stock. Pipe2 routing remains #1620 and is not
+enabled by this ownership slice.
