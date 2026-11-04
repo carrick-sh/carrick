@@ -671,3 +671,45 @@ rollback phase and the original loan identity, and supply the exact physical
 release notification before a production fork continuation can demonstrate
 Busy once followed by success. Keep this prerequisite draft; slice 2b and the
 other acceptance blockers above remain open.
+
+### Reordering alone: executed retry refusal
+
+The next director instruction selected returning stock before freeing the child
+space in both ISA services, and required stopping if retry needed more than
+that slot. A temporary experiment after rebasing onto admitted main moved both
+`spaces.free` calls after successful stock return. The existing
+`test_abort_after_stock_loan_returns_every_page_once` then injected one Busy
+Abort crossing without consuming the pending loan. Its first abort returned the
+owned preparation. An assertion proved the original child MM still had its
+space entry. The second abort nevertheless failed with:
+
+```text
+retained abort must retry with original child slot still present:
+ForkRefused(NativeForkRefusal { stage: Abort, cause: Mm(Stale) })
+```
+
+One test ran, zero passed, one failed, exit 101. The missing state is the
+reservation-root identity and pending-fork authorization, not just the scheduler
+space slot:
+
+- `carrick-core/src/mm/fork.rs:526` finishes the parent's fork publication;
+  line 539 retires the child root after rollback.
+- `carrick-core/src/mm/reservation/root.rs:3717` clears the child's fork origin;
+  lines 3728–3729 remove admission and clear its key.
+- The next portal abort still calls `child_root` at
+  `carrick-el1-linux/src/mm_portal/fork.rs:146`. The root lock rejects the
+  cleared key at `carrick-core/src/mm/reservation/root.rs:962` even though the
+  scheduler slot survives. Neutral abort also requires pending-fork authority
+  at `carrick-core/src/mm/fork.rs:515–521`, already consumed by the first abort.
+
+`SpaceTable::free` itself returns `()` (`carrick-sched-core/src/spaces.rs:586`),
+so it has no Busy refusal to retain. The experiment changed neither the neutral
+rollback nor the runtime continuation policy. It demonstrates the explicit
+stop condition; it does not prove a production fork-entry recovery witness or
+an x86 runtime result. The temporary reorder and injection were saved with the
+dispatch evidence and removed. No failing or ignored test ships.
+
+The director must resolve how physical return can resume after those existing
+neutral transitions without replaying their authentication. This round adds no
+retained rollback phase or terminal decision under #1579, and makes no new
+settlement or acceptance claim. Keep the work draft.
