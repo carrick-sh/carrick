@@ -400,9 +400,12 @@ removed to resolve them.
 The first post-rebase focused build fails the EL1 stack gate before tests
 start: the native backing reply envelope is 10,302 bytes, while the retained
 11,311-byte ceiling requires 1,024 bytes of reserve (effective maximum
-10,287). The admitted-main image build reports 10,270 bytes and passes.
-Do not weaken either the ceiling or the reserve, or report a zero-failure
-population for binaries that did not build.
+10,287). Matching `allocator-test-control` image builds fail identically
+on admitted main and this branch. Default image builds pass at 10,270 bytes
+on both trees. The default build is not evidence for the test-control
+configuration. This is a baseline gate failure, not a demonstrated rebase
+regression. Do not weaken either the ceiling or the reserve, or report a
+zero-failure population for binaries that did not build.
 
 Rebase verification must become green before this continuation adds either
 HVF backend receipt joining or the unpublished-abort continuation. Both remain
