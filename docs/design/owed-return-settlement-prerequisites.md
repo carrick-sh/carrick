@@ -1,9 +1,41 @@
 # Owed-return settlement: transaction and teardown prerequisites
 
 Implementation inspection for [#1480](https://github.com/carrick-sh/carrick/issues/1480)
-found two gaps between the approved settlement sequence and the existing
-interfaces. This note proposes how to close them; it does not implement the
-settlement routine or amend the approved design.
+found gaps between the approved settlement sequence and the existing
+interfaces. This note records the slice 2a prerequisites and their remaining
+integration work. Slice 2b implements the settlement routine and host port.
+
+## Current acceptance status
+
+Slice 2a remains an incomplete draft. Its types and inventory witnesses are
+available for collaborator review, but passing their gates does not establish
+backend release or make the prerequisite an independent landing unit. The
+sections below preserve the design and implementation history; this table
+summarizes the current code rather than the earlier checkpoints.
+
+| Requirement | Implemented | Still required |
+|---|---|---|
+| Owned return claims (A1–A4) | Stable reference custody outside copied overlays, prepare/abort accounting, production fragment splitting, shared/zero/last outcomes, and infallible claimed unmap bookkeeping. | Integration with slice 2b's physical settlement sequence. |
+| Physical permits and release receipts (B1–B3) | Exact allocator identity, claimed-return permits, atomic whole-MM permit output, two distinct release halves, and authenticated join. | Production callers still use receipt-only whole-MM retirement. Neither `MmReleaseReceipt::join` nor `BackendCustodyReleased::from_backend_release` has a production caller. HVF and CPL0 must consume the permits through actual backend custody release before joining. |
+| Native backing drop (C1) | `NativeFrameBacking::drop` requests an inventory permit; the existing S2b owner retains it through physical completion. | Execute its macOS witnesses, including pin drain and concurrent idle cleanup. Linux cross-compilation cannot prove those behaviors. |
+| Legacy retirement checks (C2) | `commit_cow_inventory_split` consults kernel inventory. | `retire_stage2_candidate_if_unreferenced` still checks only the backend registry. Its kernel-inventory check and the falling `RetirementAuthority::LegacyRegistry` counter are absent. |
+| Original six review changes | Typed post-clear custody, claim/headroom handling, journal identity, an inventory-lock destructor witness, and the named CPL0 retirement path. | Physical backend integration and execution remain open; journal identity tests still observe eager clearing and do not prove delayed acknowledgement. |
+| Slice 2b | Not implemented in this prerequisite. | Neutral owed-return routine, `SettlementGuard`, slot-epoch chunk acknowledgement, COW-before-return exclusion hook, whole-MM settlement and minimal host reconciler port. |
+
+The whole-MM output is exercised through `retire_mm_with_permits` by tests,
+but `PhysicalInventoryProjection::retire_mm` still calls
+`retire_mm_with_receipt`. `release_child_mm` returns an inventory half before
+the backend finishes releasing its custody. Adopting the permit output at
+that call alone would abandon permits; each backend must carry it through
+its existing completion owner. CPL0 additionally needs allocator identity
+before inventory publication and must preserve slots shared by live frames.
+
+A focused independent source review found no additional P0/P1 in the atomic
+whole-MM permit primitive. It confirmed the missing backend integration and
+C2 work as acceptance blockers. It was not approval of the entire draft.
+The final gate report must preserve these blockers even when the inventory
+tests pass. No debt ceiling, timeout, retry policy or concurrency reduction
+can substitute for completing them.
 
 The governing design is [round 2](https://github.com/carrick-sh/carrick/issues/1369#issuecomment-6592668931),
 its [approval](https://github.com/carrick-sh/carrick/issues/1369#issuecomment-6592713783),
