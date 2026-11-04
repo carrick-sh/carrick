@@ -1,10 +1,22 @@
 //! x86_64 signal frame setup and restoration for in-guest Linux personality.
 use carrick_guest_arch::{ReturnKind, UserFlags, UserReturn, UserVa};
-use carrick_personality_linux::signal::{SignalBackend, SignalFrameParams};
+#[cfg(target_os = "none")]
+use carrick_personality_linux::signal::SignalBackend;
+use carrick_personality_linux::signal::SignalFrameParams;
 
 use carrick_el1::isa::ArchError;
+#[cfg(target_os = "none")]
 use carrick_el1::isa::x86::X86Backend;
+#[cfg(target_os = "none")]
 use carrick_el1::isa::x86::context::native::NativeFrame;
+
+// Compile the production frame record and codec in the VM-free suite too.
+#[cfg(test)]
+#[path = "../../carrick-x86/src/cpl0_entry.rs"]
+#[allow(dead_code)]
+mod native_test_frame;
+#[cfg(test)]
+use native_test_frame::NativeFrame;
 
 use carrick_syscall_abi::{
     LinuxSiginfo as Siginfo, X8664Rtsigframe as RtSigframe, X8664Ucontext as Ucontext,
@@ -14,6 +26,7 @@ use zerocopy::{FromBytes, IntoBytes};
 /// The Linux signal-frame codec over the neutral x86 backend's types.
 pub struct LinuxX86Backend;
 
+#[cfg(target_os = "none")]
 impl carrick_guest_arch::ArchTypes for LinuxX86Backend {
     type Error = <X86Backend as carrick_guest_arch::ArchTypes>::Error;
     type NativeFrame = <X86Backend as carrick_guest_arch::ArchTypes>::NativeFrame;
@@ -158,6 +171,7 @@ impl LinuxX86Backend {
     }
 }
 
+#[cfg(target_os = "none")]
 impl SignalBackend for LinuxX86Backend {
     fn setup_signal_frame<'a>(
         &mut self,
@@ -182,13 +196,24 @@ impl SignalBackend for LinuxX86Backend {
         )
     }
 
-    #[inline(never)]
     fn restore_signal_frame(
         &mut self,
         frame: &mut NativeFrame,
         fpstate: &mut [u8],
         copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> bool,
     ) -> Result<carrick_personality_linux::signal::RestoredSignalFrame, Self::Error> {
+        self.restore_frame(frame, fpstate, copy_in)
+    }
+}
+
+impl LinuxX86Backend {
+    #[inline(never)]
+    fn restore_frame(
+        &mut self,
+        frame: &mut NativeFrame,
+        fpstate: &mut [u8],
+        copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> bool,
+    ) -> Result<carrick_personality_linux::signal::RestoredSignalFrame, ArchError> {
         let uc_addr = UserVa::new(frame.rsp);
         let mut uc_bytes = [0u8; core::mem::size_of::<Ucontext>()];
         if !copy_in(&mut uc_bytes, uc_addr) {
@@ -296,5 +321,209 @@ impl SignalBackend for LinuxX86Backend {
             ),
             stack,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use carrick_guest_arch::{X86Register, X86Registers};
+    use carrick_signal_core::policy::{SigBlockMask, Signal};
+
+    const STACK_BASE: usize = 0x10_000;
+    const STACK_TOP: usize = 0x14_000;
+    const FP_BYTES: usize = carrick_sched_core::X86_XSAVE_BYTES;
+
+    fn interrupted() -> NativeFrame {
+        NativeFrame {
+            r15: 15,
+            r14: 14,
+            r13: 13,
+            r12: 12,
+            rbp: 6,
+            rbx: 3,
+            r9: 9,
+            r8: 8,
+            r10: 10,
+            rdx: 2,
+            rsi: 4,
+            rdi: 5,
+            rax: 1,
+            rcx: 0x40_1000,
+            r11: 0x202,
+            rsp: STACK_TOP as u64,
+            user_rcx: 0x1234,
+            user_r11: 0x5678,
+        }
+    }
+
+    fn xstate() -> [u8; FP_BYTES] {
+        let mut state = [0; FP_BYTES];
+        state[..2].copy_from_slice(&0x027fu16.to_le_bytes());
+        state[2..4].copy_from_slice(&0x2800u16.to_le_bytes());
+        state[4] = 0xff;
+        state[24..28].copy_from_slice(&0x5f80u32.to_le_bytes());
+        state[28..32].copy_from_slice(&0xffffu32.to_le_bytes());
+        for slot in 0..8 {
+            state[32 + slot * 16..42 + slot * 16].fill(0x10 + slot as u8);
+        }
+        for register in 0..16 {
+            state[160 + register * 16..176 + register * 16].fill(0x40 + register as u8);
+            state[576 + register * 16..592 + register * 16].fill(0x80 + register as u8);
+        }
+        state[512..520].copy_from_slice(&7u64.to_le_bytes());
+        state
+    }
+
+    fn publish(frame: &mut NativeFrame, fp: &[u8]) -> (Vec<u8>, usize) {
+        let mut memory = vec![0; STACK_TOP - STACK_BASE];
+        let params = SignalFrameParams {
+            stack: carrick_syscall_abi::LinuxSignalStack {
+                ss_flags: carrick_syscall_abi::LINUX_SS_DISABLE as i32,
+                ..carrick_syscall_abi::LinuxSignalStack::empty()
+            },
+            signal: Signal::from_number(10).unwrap(),
+            sigcode: 0,
+            fault_addr: 0,
+            sp: UserVa::new(frame.rsp),
+            interrupted_sp: UserVa::new(frame.rsp),
+            handler: UserVa::new(0x40_2000),
+            restorer: Some(UserVa::new(0x40_3000)),
+            mask: SigBlockMask::blocking_all_of(carrick_signal_core::SignalSet::from_bits(1 << 9)),
+        };
+        let resume = UserReturn {
+            pc: UserVa::new(frame.rcx),
+            stack: UserVa::new(frame.rsp),
+            flags: UserFlags::new(frame.r11),
+            kind: ReturnKind::ExceptionReturn,
+        };
+        let mut copies = Vec::new();
+        let sp = LinuxX86Backend
+            .setup_signal_frame_with_resume(
+                frame,
+                params,
+                resume,
+                None,
+                fp,
+                &mut |address, bytes| {
+                    let start = address.raw() as usize - STACK_BASE;
+                    memory[start..start + bytes.len()].copy_from_slice(bytes);
+                    copies.push(bytes.len());
+                    true
+                },
+            )
+            .unwrap();
+        assert_eq!(copies, [FP_BYTES + 4, core::mem::size_of::<RtSigframe>()]);
+        assert_eq!(sp.raw() & 15, 8);
+        // The handler's RET consumes pretcode before rt_sigreturn reads uc.
+        frame.rsp = sp.raw() + 8;
+        let uc_start = frame.rsp as usize - STACK_BASE;
+        let uc = Ucontext::read_from_bytes(
+            &memory[uc_start..uc_start + core::mem::size_of::<Ucontext>()],
+        )
+        .unwrap();
+        let fp_start = uc.uc_mcontext.fpstate as usize - STACK_BASE;
+        assert_eq!((fp_start + STACK_BASE) & 63, 0);
+        (memory, fp_start)
+    }
+
+    fn restore(
+        frame: &mut NativeFrame,
+        fp: &mut [u8],
+        memory: &[u8],
+    ) -> Result<carrick_personality_linux::signal::RestoredSignalFrame, ArchError> {
+        LinuxX86Backend.restore_frame(frame, fp, &mut |bytes, address| {
+            let Some(start) = (address.raw() as usize).checked_sub(STACK_BASE) else {
+                return false;
+            };
+            let Some(source) = memory.get(start..start + bytes.len()) else {
+                return false;
+            };
+            bytes.copy_from_slice(source);
+            true
+        })
+    }
+
+    #[test]
+    fn signal_frame_round_trip_preserves_gprs_x87_sse_and_avx() {
+        let original = interrupted();
+        let fp = xstate();
+        let mut frame = original;
+        let (memory, _) = publish(&mut frame, &fp);
+        frame = NativeFrame {
+            rsp: frame.rsp,
+            r11: frame.r11,
+            r15: 115,
+            r14: 114,
+            r13: 113,
+            r12: 112,
+            rbp: 106,
+            rbx: 103,
+            r9: 109,
+            r8: 108,
+            r10: 110,
+            rdx: 102,
+            rsi: 104,
+            rdi: 105,
+            rax: 101,
+            rcx: 0x40_4000,
+            user_rcx: 0xaaaa,
+            user_r11: 0xbbbb,
+        };
+        let mut returned_fp = [0xee; FP_BYTES];
+        // The live CPU's MXCSR capability mask is an input to validation.
+        returned_fp[28..32].copy_from_slice(&fp[28..32]);
+        let result = restore(&mut frame, &mut returned_fp, &memory).unwrap();
+        for register in [
+            X86Register::Rax,
+            X86Register::Rbx,
+            X86Register::Rcx,
+            X86Register::Rdx,
+            X86Register::Rsi,
+            X86Register::Rdi,
+            X86Register::Rbp,
+            X86Register::Rsp,
+            X86Register::R8,
+            X86Register::R9,
+            X86Register::R10,
+            X86Register::R11,
+            X86Register::R12,
+            X86Register::R13,
+            X86Register::R14,
+            X86Register::R15,
+        ] {
+            assert_eq!(
+                frame.read(register),
+                original.read(register),
+                "{register:?}"
+            );
+        }
+        assert_eq!(frame.user_rcx, original.user_rcx);
+        assert_eq!(frame.user_r11, original.user_r11);
+        assert_eq!(&returned_fp[..464], &fp[..464]);
+        assert_eq!(&returned_fp[512..], &fp[512..]);
+        assert_eq!(result.mask.signals().bits(), 1 << 9);
+    }
+
+    #[test]
+    fn invalid_signal_xstate_does_not_publish_registers_or_fp_state() {
+        for corruption in [24, 512, 520, FP_BYTES] {
+            let mut frame = interrupted();
+            let (mut memory, fp_start) = publish(&mut frame, &xstate());
+            // Invalid MXCSR, unsupported xfeature, reserved header, bad magic2.
+            if corruption == 24 {
+                memory[fp_start + 27] = 0x80;
+            } else {
+                memory[fp_start + corruption] ^= 0x80;
+            }
+            let before = format!("{frame:?}");
+            let mut fp = xstate();
+            assert!(matches!(
+                restore(&mut frame, &mut fp, &memory),
+                Err(ArchError::InvalidFrame)
+            ));
+            assert_eq!(format!("{frame:?}"), before);
+            assert_eq!(fp, xstate());
+        }
     }
 }

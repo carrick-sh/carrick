@@ -46,6 +46,7 @@ vm_free = [
   "carrick-signal-linux::tests::single_mask_*",
   "carrick-x86::engine::tests::native_fault_entry_has_no_venue_without_register_changes",
   "carrick-el1-abi::refusal_census_tests::refusal_snapshot_preserves_caller_populations_without_changing_service_counts",
+  "carrick-el1-linux::x86_signal::tests::{signal_frame_round_trip_preserves_gprs_x87_sse_and_avx,invalid_signal_xstate_does_not_publish_registers_or_fp_state}",
 ]
 
 embed = [
