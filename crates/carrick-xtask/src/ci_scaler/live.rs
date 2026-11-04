@@ -975,7 +975,8 @@ fn storage_headroom(pve: &Pve, pending: Pending) -> Result<bool, ScalerError> {
             let free = number("lv_size")? * (1.0 - number("data_percent")? / 100.0);
             Ok(free >= free_needed as f64 && number("metadata_percent")? < 80.0)
         }
-        Headroom::Directory => {
+        // Both report free bytes through the PVE storage status API.
+        Headroom::Directory | Headroom::ZfsPool => {
             let status = pve.request(
                 PveCall::Get,
                 &format!(
@@ -2154,8 +2155,7 @@ fn verify_protected_vms(
     // whether agent clone demand is enabled. Only the source template may
     // carry the non-mutating rights needed to inspect and clone it.
     for vm in site.protected {
-        let source_template =
-            site.node == site::CONTABO.node && site::AgentTemplate::try_from(*vm).is_ok();
+        let source_template = site.serves_agents() && site::AgentTemplate::try_from(*vm).is_ok();
         let protected = permissions(*vm)?;
         let source_required =
             source_template && site.lane == CloneLane::Agent && *vm == site.template()?;
@@ -2244,9 +2244,8 @@ pub(super) fn controller(
     let pve = Pve::local()?;
     let _lock = super::acquire_controller_lock(dir)?;
     let inventory = pve.inventory()?;
-    let contabo_standing =
-        pve.site.node == site::CONTABO.node && matches!(admission, Admission::Standing);
-    let agents = contabo_standing && std::env::var("CARRICK_AGENT_CLONES").as_deref() != Ok("0");
+    let agent_standing = pve.site.serves_agents() && matches!(admission, Admission::Standing);
+    let agents = agent_standing && std::env::var("CARRICK_AGENT_CLONES").as_deref() != Ok("0");
     let lanes = if agents {
         vec![CloneLane::Kvm, CloneLane::Agent]
     } else {
@@ -2456,7 +2455,7 @@ fn admit_one(
     (budget, provisioners): (CloneBudget, &Provisioners),
 ) -> Result<bool, ScalerError> {
     let (group, original_admission, kvm_demand) = demand;
-    let agents = pve.site.node == site::CONTABO.node
+    let agents = pve.site.serves_agents()
         && matches!(original_admission, Admission::Standing)
         && std::env::var("CARRICK_AGENT_CLONES").as_deref() != Ok("0");
     let mut selected = None;
@@ -3674,6 +3673,18 @@ mod tests {
         assert!(directory_headroom(&status(0, free * 4), free).is_err());
         assert!(directory_headroom(&json!({"active":1,"enabled":1}), free).is_err());
         assert!(directory_headroom(&json!({"active":1,"enabled":0,"avail":free}), free).is_err());
+    }
+    #[test]
+    fn zfs_pool_status_reports_the_same_headroom_fields() {
+        // carrick-hz's `tank-vm` status reply, verbatim from the live PVE API
+        // (2026-11-04): a zfspool storage answers with the fields
+        // `directory_headroom` reads, so both variants share it.
+        let live = json!({"active":1,"avail":1731408150528_u64,"content":"images,rootdir","enabled":1,"shared":0,"total":1731408248832_u64,"type":"zfspool","used":98304});
+        assert!(directory_headroom(&live, storage_floor(Pending::default())).unwrap());
+        assert!(!directory_headroom(&live, 1731408150528 + 1).unwrap());
+        let mut inactive = live.clone();
+        inactive["active"] = json!(0);
+        assert!(directory_headroom(&inactive, 0).is_err());
     }
     #[test]
     fn shared_readiness_deadline_bounds_a_nested_external_command() {

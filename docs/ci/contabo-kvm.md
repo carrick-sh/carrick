@@ -21,14 +21,14 @@ adversarial isolation boundary.
 
 ## Site
 
-| | Willow | Contabo |
-|---|---|---|
-| PVE node (`/etc/hostname`) | `willow` | `carrick-ctb` (FQDN `carrick-ctb.turkey-moth.ts.net`, its Tailscale name) |
-| Clone storage | `local-lvm` (thin pool, `lvs` headroom) | `local` directory (PVE storage-status headroom) |
-| Bridge, addressing | `vmbr0`, LAN DHCP | `vmbr1` NAT, static `10.77.0.(VMID-200)/24`, resolver 1.1.1.1 |
-| Template 300 and each clone | 2 vCPU, 4 GiB, 64 GiB | 8 vCPU, 16 GiB, 100 GiB |
-| VMs the token must not touch | 105 | 101-104 (agent workers); 9000/9001 permit only source inspection and cloning |
-| KSM page merging | allowed (PVE default) | off (`allow-ksm: 0` on template 300, inherited by clones, checked before each boot) |
+| | Willow | Contabo | Hetzner (#1590) |
+|---|---|---|---|
+| PVE node (`/etc/hostname`) | `willow` | `carrick-ctb` (FQDN `carrick-ctb.turkey-moth.ts.net`, its Tailscale name) | `carrick-hz` (the PVE certificate names only the short name) |
+| Clone storage | `local-lvm` (thin pool, `lvs` headroom) | `local` directory (PVE storage-status headroom) | `tank-vm` ZFS pool, thin raw zvols (same storage-status headroom) |
+| Bridge, addressing | `vmbr0`, LAN DHCP | `vmbr1` NAT, static `10.77.0.(VMID-200)/24`, resolver 1.1.1.1 | `vmbr1` NAT, static `10.78.0.(VMID-200)/24`, resolver 1.1.1.1 |
+| Template 300 and each clone | 2 vCPU, 4 GiB, 64 GiB | 8 vCPU, 16 GiB, 100 GiB | 8 vCPU, 16 GiB, 100 GiB |
+| VMs the token must not touch | 105 | 101-104 (agent workers); 9000/9001 permit only source inspection and cloning | 9000/9001 only (no fixed worker VMs) |
+| KSM page merging | allowed (PVE default) | off (`allow-ksm: 0` on template 300, inherited by clones, checked before each boot) | off, as Contabo |
 
 Selection is by `/etc/hostname` and fails closed: an unknown host is refused,
 never treated as Willow. Both sites use pool `carrick-ci`, template VMID 300
