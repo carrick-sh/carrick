@@ -321,6 +321,10 @@ fn lint_source_reports_later_checks_after_a_ratchet_failure() {
     let fixture = tempfile::tempdir().unwrap();
     let files = command::run_checked("git", ["ls-files", "-z"], Some(&root)).unwrap();
     for relative in files.stdout.split('\0').filter(|path| !path.is_empty()) {
+        // This fixture isolates the source ratchets from staged workflow work.
+        if relative.starts_with("docs/ci/patches/") {
+            continue;
+        }
         let source = root.join(relative);
         let target = fixture.path().join(relative);
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
@@ -353,6 +357,7 @@ fn lint_source_reports_later_checks_after_a_ratchet_failure() {
     assert_eq!(
         verdicts,
         [
+            "lint-source: workflow-patches: ok",
             "lint-source: terminal-custody: FAIL",
             "lint-source: copyout-debt: ok",
             "lint-source: test-lanes check: ok",
@@ -440,4 +445,38 @@ fn lease_closed_descriptors_fixture() {
             "nested command reacquired the lock"
         );
     }
+}
+
+#[test]
+fn workflow_patches_require_application_in_the_same_tree() {
+    let fixture = tempfile::tempdir().unwrap();
+    init_git_repo(fixture.path());
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .arg("--root")
+            .arg(fixture.path())
+            .arg("workflow-patches")
+            .output()
+            .unwrap()
+    };
+    assert!(run().status.success(), "no patches passes");
+    std::fs::create_dir_all(fixture.path().join("docs/ci/patches")).unwrap();
+    std::fs::create_dir_all(fixture.path().join(".github/workflows")).unwrap();
+    let workflow = fixture.path().join(".github/workflows/example.yml");
+    std::fs::write(&workflow, "old\n").unwrap();
+    std::fs::write(fixture.path().join("docs/ci/patches/example.patch"),
+        "--- a/.github/workflows/example.yml\n+++ b/.github/workflows/example.yml\n@@ -1 +1 @@\n-old\n+new\n").unwrap();
+    let failed = run();
+    assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains(
+        "workflow patch not applied: docs/ci/patches/example.patch; the director applies it on this branch before landing"));
+    command::run_checked(
+        "git",
+        ["apply", "docs/ci/patches/example.patch"],
+        Some(fixture.path()),
+    )
+    .unwrap();
+    assert!(run().status.success(), "applied patch passes");
+    std::fs::write(&workflow, "drift\n").unwrap();
+    assert!(!run().status.success(), "subsequent workflow drift fails");
 }

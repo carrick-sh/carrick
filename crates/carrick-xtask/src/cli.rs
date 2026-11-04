@@ -38,6 +38,8 @@ pub enum Commands {
     CheckTestShards,
     #[command(about = "Run every source lint ratchet and report all failures")]
     LintSource,
+    /// Require retained CI workflow patches to be applied in this tree.
+    WorkflowPatches,
     #[command(about = "Compile all recipe lanes once and run their test binaries")]
     TestBatch(crate::test_batch::TestBatchArgs),
     #[command(about = "Run each lib test of one package in its own process")]
@@ -233,6 +235,8 @@ pub enum CliError {
     LoomRun { message: String, code: i32 },
     #[error("lint-source: {0} check(s) failed")]
     LintSource(usize),
+    #[error("{0}")]
+    WorkflowPatches(String),
     #[error("claims: {0}")]
     Claims(#[from] crate::claims::ClaimError),
     #[error("work order: {0}")]
@@ -456,6 +460,10 @@ where
             Ok(())
         }
         Commands::LintSource => run_lint_source(cli.root, writer),
+        Commands::WorkflowPatches => {
+            let info = resolve_repo_info(cli.root.as_deref())?;
+            check_workflow_patches(&info.repository_root)
+        }
         Commands::Workorder(args) => {
             let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
             crate::workorder::run(&root, args, writer)?;
@@ -748,7 +756,8 @@ where
 }
 
 fn run_lint_source<W: Write>(root: Option<PathBuf>, writer: &mut W) -> Result<(), CliError> {
-    let checks: [&[&str]; 6] = [
+    let checks: [&[&str]; 7] = [
+        &["workflow-patches"],
         &["terminal-custody"],
         &["copyout-debt"],
         &["test-lanes", "check"],
@@ -783,5 +792,60 @@ fn run_lint_source<W: Write>(root: Option<PathBuf>, writer: &mut W) -> Result<()
         Ok(())
     } else {
         Err(CliError::LintSource(failed))
+    }
+}
+
+// Check every retained patch, including unchanged ones: main must never carry
+// an unapplied workflow half. No diff base or CI environment is required.
+fn check_workflow_patches(root: &Path) -> Result<(), CliError> {
+    let directory = root.join("docs/ci/patches");
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(CliError::Io {
+                path: directory,
+                source,
+            });
+        }
+    };
+    let mut patches = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| CliError::Io {
+            path: directory.clone(),
+            source,
+        })?;
+        if entry
+            .path()
+            .extension()
+            .is_some_and(|extension| extension == "patch")
+        {
+            patches.push(entry.path());
+        }
+    }
+    patches.sort();
+    let mut failures = Vec::new();
+    for patch in patches {
+        let relative = patch
+            .strip_prefix(root)
+            .map_err(|error| CliError::WorkflowPatches(error.to_string()))?;
+        if let Err(error) = command::run_checked(
+            "git",
+            [
+                std::ffi::OsStr::new("apply"),
+                std::ffi::OsStr::new("--check"),
+                std::ffi::OsStr::new("-R"),
+                std::ffi::OsStr::new("--include=.github/**"),
+                relative.as_os_str(),
+            ],
+            Some(root),
+        ) {
+            failures.push(format!("workflow patch not applied: {}; the director applies it on this branch before landing\n{error}", relative.display()));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(CliError::WorkflowPatches(failures.join("\n")))
     }
 }
