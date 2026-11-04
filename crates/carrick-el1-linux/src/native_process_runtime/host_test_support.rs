@@ -5036,3 +5036,257 @@ fn native_service_exit_missing_unowned_receipt_remains_an_invariant() {
         Err(NativeProcessError::Busy)
     ));
 }
+
+/// A signal canceller retains a control allocation, not the scheduler record.
+/// Force the other lane to complete, exit and recycle that record before the
+/// canceller acquires its queue. Every transition uses the native process owner.
+#[cfg(test)]
+#[test]
+fn obsolete_service_cancellation_preserves_reforked_record() {
+    use carrick_core_abi::service::{ServiceOperation, ServiceRequest};
+    use carrick_sched_core::object_wait::ObjectWaitKey;
+
+    let mut capacity = NativeServiceCapacityFixture::new(1);
+    assert_eq!(capacity.park_next(), Some(1));
+    let old_request = capacity.pending[0].request();
+    let old_record = old_request.identity.birth.record;
+    let runtime = capacity.fixture.runtime.clone();
+    let zone = capacity.fixture.zone;
+    let slot = capacity.fixture.slot;
+    let mut cancelling_service = capacity.fixture.service();
+    let replacement = Arc::new(std::sync::Mutex::new(
+        None::<(ServiceRequest, &'static ThreadControlSlot)>,
+    ));
+    let observed = replacement.clone();
+    *runtime.service_cancel_snapshot_hook.lock() = Some(Box::new(move || {
+        let ticket = capacity.pending.pop().unwrap();
+        let fixture = &capacity.fixture;
+        let source = BornInZoneSource { zone, slot };
+        let queue = zone
+            .object_wait(
+                ObjectWaitKey::native_service(old_record).unwrap(),
+                &carrick_sched_core::ShortLockSpin,
+            )
+            .unwrap();
+        assert!(ticket.complete(true).is_ok());
+        queue
+            .notify_object(slot, &mut WakeEffects::default())
+            .unwrap();
+        drop(queue);
+
+        let (record, address, saved) = capacity.select().unwrap();
+        assert_eq!(record, old_record);
+        let mut service = fixture.service();
+        let mut child = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                address,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            child.resume_checkpoint(),
+            Ok(NativeResume::Returned(_))
+        ));
+        let child_pid = child.calling_tid();
+        assert!(matches!(
+            child.exit_group(7),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert!(child.take_run_failure().is_none());
+        assert!(child.take_handoff_receipt().is_some());
+        drop(child);
+        assert!(zone.live(old_record).is_none());
+
+        let (parent_record, address, saved) = capacity.select().unwrap();
+        assert_eq!(parent_record, fixture.record);
+        let mut parent = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                address,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(
+            matches!(parent.resume_checkpoint(), Ok(NativeResume::Returned(result))
+            if result.raw() == i64::from(child_pid))
+        );
+        assert!(matches!(parent.fork(ProcessForkChildTid::NONE),
+            LifecycleOutcome::Returned { result, .. } if result.raw() > 0));
+        assert!(matches!(
+            parent.wait4(
+                ProcessWaitPid::from_syscall_argument(u64::MAX),
+                UserVa::new(0x1000),
+                LinuxWaitOptions::empty(),
+                UserVa::new(0),
+            ),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert!(parent.take_handoff_receipt().is_some());
+        drop(parent);
+
+        let (record, address, saved) = capacity.select().unwrap();
+        assert_eq!(
+            record.id, old_record.id,
+            "production fork must reuse the retired record"
+        );
+        assert!(record.incarnation > old_record.incarnation);
+        let identity = zone.record(record.id).identity();
+        // SAFETY: the native owner retains this replacement's live control.
+        let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
+        let mut child = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                address,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            child.resume_checkpoint(),
+            Ok(NativeResume::NoPending)
+        ));
+        assert!(matches!(
+            child.begin_service(
+                ServiceOperation::CarrierWork {
+                    entry: OwnerEntry::Syscall,
+                },
+                None
+            ),
+            Ok(NativeResume::Left(None))
+        ));
+        assert!(child.take_handoff_receipt().is_some());
+        let notice = fixture.task.service_notice.take().unwrap().unwrap();
+        let queue = zone
+            .object_wait(
+                ObjectWaitKey::native_service(record).unwrap(),
+                &carrick_sched_core::ShortLockSpin,
+            )
+            .unwrap();
+        // SAFETY: the queue authenticates this live replacement's notice.
+        let ticket = unsafe {
+            carrick_core_abi::service::ServiceCell::claim_notice(
+                &control.service,
+                notice,
+                NonZeroU64::MIN,
+                identity,
+            )
+        }
+        .unwrap();
+        let request = ticket.request();
+        assert!(ticket.complete(true).is_ok());
+        drop(queue);
+        assert_ne!(
+            request.identity.birth.process,
+            old_request.identity.birth.process
+        );
+        drop(child);
+        drop(service);
+        *observed.lock().unwrap() = Some((request, control, capacity));
+    }));
+    assert_eq!(
+        runtime.cancel_service(old_record, slot, &mut cancelling_service),
+        Ok(()),
+        "obsolete cancellation must not quarantine a replacement queue"
+    );
+    let (request, control, capacity) = replacement.lock().unwrap().take().unwrap();
+    assert!(
+        runtime
+            .graph
+            .lock()
+            .has_member_wait(&request.identity.birth.record)
+    );
+    assert_eq!(control.service.completion_ready(request.identity), Ok(true));
+    let queue = zone
+        .object_wait(
+            ObjectWaitKey::native_service(request.identity.birth.record).unwrap(),
+            &carrick_sched_core::ShortLockSpin,
+        )
+        .unwrap();
+    queue
+        .notify_object(slot, &mut WakeEffects::default())
+        .unwrap();
+    drop(queue);
+    let (record, address, saved) = capacity.select().unwrap();
+    assert_eq!(record, request.identity.birth.record);
+    let fixture = &capacity.fixture;
+    let mut service = fixture.service();
+    let mut child = runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource { zone, slot },
+            fixture.task,
+            address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    assert!(
+        matches!(child.resume_checkpoint(), Ok(NativeResume::Returned(result))
+        if result.raw() == saved.syscall_return() as i64),
+        "the replacement must settle its own result through the production owner"
+    );
+    assert!(child.take_run_failure().is_none());
+    assert!(!runtime.graph.lock().has_member_wait(&record));
+    assert!(matches!(
+        zone.object_wait(
+            ObjectWaitKey::native_service(old_record).unwrap(),
+            &carrick_sched_core::ShortLockSpin
+        ),
+        Err(carrick_sched_core::object_wait::ObjectWaitError::Stale)
+    ));
+}
+
+/// Deliberate queue corruption must remain fatal while its exact request is
+/// still owned. This is a negative control, not a reachable lifecycle schedule.
+#[cfg(test)]
+#[test]
+fn current_service_cancellation_rejects_foreign_queue_generation() {
+    use carrick_sched_core::object_wait::ObjectWaitKey;
+    let mut capacity = NativeServiceCapacityFixture::new(1);
+    assert_eq!(capacity.park_next(), Some(1));
+    let ticket = capacity.pending.pop().unwrap();
+    let request = ticket.request();
+    let fixture = &capacity.fixture;
+    let record = request.identity.birth.record;
+    let key = ObjectWaitKey::native_service(record).unwrap();
+    let queue = fixture
+        .zone
+        .object_wait(key, &carrick_sched_core::ShortLockSpin)
+        .unwrap();
+    assert!(ticket.complete(true).is_ok());
+    queue
+        .notify_object(fixture.slot, &mut WakeEffects::default())
+        .unwrap();
+    drop(queue);
+    // Fault injection: advance the empty queue without settling the request.
+    // A blanket Stale->Ok change would incorrectly pass this control.
+    let foreign = ObjectWaitKey::native_service(RecordRef {
+        incarnation: record.incarnation + 1,
+        ..record
+    })
+    .unwrap();
+    fixture
+        .zone
+        .bind_object_wait(foreign, &carrick_sched_core::ShortLockSpin)
+        .unwrap();
+    let mut service = fixture.service();
+    assert_eq!(
+        fixture
+            .runtime
+            .cancel_service(record, fixture.slot, &mut service),
+        Err(NativeProcessError::Quarantined)
+    );
+    assert!(fixture.runtime.graph.lock().has_member_wait(&record));
+}
