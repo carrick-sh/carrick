@@ -6,6 +6,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+#[path = "dispatch_actions.rs"]
+mod actions;
 #[path = "dispatch_loop.rs"]
 mod agent_loop;
 #[path = "dispatch_live_log.rs"]
@@ -2252,6 +2254,20 @@ fn publish_permission_failure(error: &str) -> bool {
     .any(|marker| error.contains(marker))
 }
 fn gh_with_token(root: &Path, args: &[&str], token: Option<&str>) -> Result<String, ScalerError> {
+    gh_response(root, args, token, |bytes| {
+        String::from_utf8(bytes).map_err(|_| ScalerError::Guard("non-UTF8 GitHub output"))
+    })
+}
+/// Shared bounded, credentialed transport, including binary Actions archives.
+fn gh_bytes(root: &Path, args: &[&str], token: Option<&str>) -> Result<Vec<u8>, ScalerError> {
+    gh_response(root, args, token, Ok)
+}
+fn gh_response<T>(
+    root: &Path,
+    args: &[&str],
+    token: Option<&str>,
+    decode: impl FnOnce(Vec<u8>) -> Result<T, ScalerError>,
+) -> Result<T, ScalerError> {
     let endpoint = match args {
         ["api", rest @ ..] => rest
             .iter()
@@ -2276,19 +2292,15 @@ fn gh_with_token(root: &Path, args: &[&str], token: Option<&str>) -> Result<Stri
         if let Some(token) = token {
             command.env("GH_TOKEN", token).env_remove("GITHUB_TOKEN");
         }
-        output(&mut command)
-            .and_then(|bytes| {
-                String::from_utf8(bytes).map_err(|_| ScalerError::Guard("non-UTF8 GitHub output"))
-            })
-            .map_err(|error| {
-                // execute already drains and redacts a bounded stderr prefix. Mask
-                // again before clipping so a cut credential cannot escape.
-                let detail = crate::dispatch_redaction::redact(error.to_string().as_bytes());
-                ScalerError::Usage(format!(
-                    "GitHub {endpoint}: {}",
-                    detail.chars().take(2048).collect::<String>()
-                ))
-            })
+        output(&mut command).and_then(decode).map_err(|error| {
+            // execute already drains and redacts a bounded stderr prefix. Mask
+            // again before clipping so a cut credential cannot escape.
+            let detail = crate::dispatch_redaction::redact(error.to_string().as_bytes());
+            ScalerError::Usage(format!(
+                "GitHub {endpoint}: {}",
+                detail.chars().take(2048).collect::<String>()
+            ))
+        })
     });
     GITHUB_FAILURES.with(|failures| {
         let mut failures = failures.borrow_mut();
@@ -4466,8 +4478,16 @@ fn produce(
                 "41898282+github-actions[bot]@users.noreply.github.com",
             ],
         )?;
-        drop(preparation_commands);
         let mut agent_dispatch = dispatch.clone();
+        let inputs = timed_phase("worker.actions_inputs", || {
+            actions::stage(
+                root,
+                &actor_work,
+                &format!("{}\n{}", dispatch.body, dispatch.review_text),
+            )
+        })?;
+        agent_dispatch.body.push_str(&inputs);
+        drop(preparation_commands);
         if let Some(body) = previous
             .as_ref()
             .and_then(|receipt| receipt.pr_body.as_ref())
@@ -10923,6 +10943,87 @@ fi
         .unwrap();
         assert!(patch.contains("keep refused candidate"));
         assert!(patch.contains("+keep this worker commit"));
+    }
+
+    /// The production preparation path must stage evidence before calling agent.
+    #[test]
+    fn serial_host_actions_inputs_reach_worker_launch() {
+        const CHILD: &str = "CARRICK_ACTIONS_LAUNCH_WITNESS";
+        struct Witness;
+        impl WorkerHost for Witness {
+            fn initialize(&mut self) -> Result<(), ScalerError> {
+                Ok(())
+            }
+            fn prepare(&mut self, _: &Path, _: &Path, _: &str) -> Result<(), ScalerError> {
+                Ok(())
+            }
+            fn agent(&mut self, work: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
+                let inputs = work.parent().unwrap().join("inputs/actions");
+                let manifest = std::fs::read_to_string(inputs.join("manifest.json"))
+                    .expect("Actions inputs must exist before worker launch");
+                assert!(manifest.contains("job 71"));
+                assert!(worker_prompt(dispatch).contains("../inputs/actions/manifest.json"));
+                let log = std::fs::read_to_string(inputs.join("input-0.txt")).unwrap();
+                assert!(log.contains("failed step evidence"));
+                assert!(!log.contains("launch-witness-secret"));
+                Ok(0)
+            }
+            fn retire(&mut self) -> Result<(), ScalerError> {
+                Ok(())
+            }
+            fn hand_back(&mut self, _: &Path) -> Result<(), ScalerError> {
+                Ok(())
+            }
+        }
+        if std::env::var_os(CHILD).is_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let bin = temp.path().join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            let script = bin.join("gh");
+            std::fs::write(&script, r#"#!/bin/sh
+case "$*" in
+ 'api repos/carrick-sh/carrick/actions/jobs/71') echo '{"steps":[{"conclusion":"failure"}]}' ;;
+ 'run view --repo carrick-sh/carrick --job 71 --log-failed') printf 'failed step evidence\n%s\n' "$GH_TOKEN" ;;
+ *) exit 1 ;;
+esac
+"#).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let result = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    std::thread::current().name().unwrap(),
+                    "--nocapture",
+                ])
+                .env(CHILD, temp.path())
+                .env("RUNNER_TEMP", temp.path())
+                .env("GH_TOKEN", "launch-witness-secret")
+                .env("GITHUB_RUN_ID", "77")
+                .env("GITHUB_RUN_ATTEMPT", "1")
+                .env(
+                    "PATH",
+                    format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+                )
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        let temp = PathBuf::from(std::env::var_os(CHILD).unwrap());
+        let root = temp.join("root");
+        std::fs::create_dir(&root).unwrap();
+        fixture_repository(&root);
+        let mut dispatch =
+            validate_event(&event(), "tjfontaine", &mut owner_collaborator()).unwrap();
+        dispatch.base = git(&root, &["rev-parse", "HEAD"]).unwrap().trim().into();
+        dispatch.branch = "work/dispatch-634-42".into();
+        dispatch.body =
+            "Inspect https://github.com/carrick-sh/carrick/actions/runs/42/job/71".into();
+        produce(&root, &dispatch, "success/success", &mut Witness).unwrap();
     }
 
     #[test]

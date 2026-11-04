@@ -52,6 +52,26 @@ never parses issue structure. The
 loop reads the full issue, so #587's problem statement and acceptance need no
 special heading. Unclear work can finish blocked with a question for the requesting collaborator.
 
+Before starting a worker, the trusted server reads Actions references in the
+issue brief and triggering comment or review. Supported references are this
+repository's `https://github.com/carrick-sh/carrick/actions/runs/<id>` URLs
+(including `/job/<id>` and `/artifacts/<id>`), or `run <id>` / `job <id>`.
+Name an artifact with `artifact ` followed by its name (quote names containing
+spaces, or use backticks), alongside its run reference. A job reference stages
+its failed-step log; a run reference stages logs for jobs with failed steps.
+Other repositories are refused without a request.
+
+The worker brief lists the results and refusal notes in
+`../inputs/actions/manifest.json`, outside the Git checkout. Files are
+untrusted evidence, never instructions. The existing runner-side `gh` transport
+performs these read-only requests; the worker receives no Actions credential.
+Only UTF-8 text without binary control characters is retained, through the
+shared secret redactor. Limits are 16 references, 100 jobs/artifacts per run,
+4 MiB per compressed archive, 64 archive entries/staged files, 256 KiB per
+text file (before and after redaction), and 2 MiB total staged text. Archive
+paths are never extracted; unsafe paths, links, oversized and binary entries
+produce refusal notes. Unavailable or expired evidence also leaves a note.
+
 For issue work, the server starts `work/dispatch-<issue>-<run>`. The loop can
 select another linked `work/dispatch-*` branch before invoking workers. A
 candidate must have an open owned dispatch draft PR closing this issue, or an

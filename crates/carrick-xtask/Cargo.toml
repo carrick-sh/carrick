@@ -46,6 +46,7 @@ yaml-rust2 = { version = "0.13", default-features = false }
 carrick-conformance = { path = "../carrick-conformance", optional = true }
 carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-portable = { path = "../carrick-portable" }
+zip = { version = "2", default-features = false, features = ["deflate-flate2", "flate2"] }
 
 [dev-dependencies]
 # The sysroot test imports the EL1 image build script and its ABI image limit.
