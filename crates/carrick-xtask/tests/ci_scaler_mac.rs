@@ -203,6 +203,38 @@ fn run_once_state_is_one_use_and_bound_to_the_vetted_run() {
     assert!(prepare_run_once("carrick-hvf-1-1-1-9", &exe, &state_root, &short, uid, uid).is_err());
 }
 
+/// The run user reads the policy and runs the hook as a different uid from the
+/// one that created them, so their modes are a contract, not a function of
+/// the umask `sudo` happened to pass down (a developer's 0007 gave 0640).
+#[test]
+fn serial_host_run_once_state_modes_do_not_depend_on_the_callers_umask() {
+    for mask in [0o000, 0o007, 0o027, 0o077, 0o277] {
+        let _umask = UmaskGuard::new(mask);
+        let (root, exe, uid) = fixture();
+        let state_root = root.path().join("run");
+        let state = prepare_run_once(
+            "carrick-hvf-10-1-1-100",
+            &exe,
+            &state_root,
+            &binding(),
+            uid,
+            uid,
+        )
+        .unwrap();
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&state), 0o755, "state dir under umask {mask:o}");
+        assert_eq!(mode(&state.join("policy")), 0o644, "umask {mask:o}");
+        assert_eq!(mode(&state.join("admit-job.sh")), 0o755, "umask {mask:o}");
+        assert_eq!(
+            mode(&state.join("assignment.json")),
+            0o600,
+            "umask {mask:o}"
+        );
+        assert_eq!(mode(&state.join("admission.lock")), 0o600, "umask {mask:o}");
+    }
+}
+
 #[test]
 fn run_once_refuses_a_job_writable_hook_binary_or_state_root() {
     let (root, exe, uid) = fixture();

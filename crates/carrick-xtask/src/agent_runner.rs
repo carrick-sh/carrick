@@ -23,8 +23,15 @@ pub enum Action {
         #[arg(long)]
         event: PathBuf,
     },
-    /// Remove the entire job-scoped home, credentials and launcher state.
-    Cleanup,
+    /// Retire the dispatch accounts' processes, then remove the entire
+    /// job-scoped home, credentials and launcher state.
+    Cleanup {
+        /// Leave the OS accounts alone and remove only this run's state.
+        /// For fixtures that must not census or signal a host's real
+        /// dispatch accounts; the workflow never passes it.
+        #[arg(long)]
+        state_only: bool,
+    },
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -681,8 +688,10 @@ pub fn run(root: &Path, args: Args) -> Result<(), ScalerError> {
             crate::dispatch_mint::app_token(MintScope::Bootstrap)
         }),
         Action::Auth { event } => auth(root, &event),
-        Action::Cleanup => {
-            crate::dispatch_worker::cleanup_dispatch_users()?;
+        Action::Cleanup { state_only } => {
+            if !state_only {
+                crate::dispatch_worker::cleanup_dispatch_users()?;
+            }
             let state = state()?;
             match std::fs::symlink_metadata(&state) {
                 Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {

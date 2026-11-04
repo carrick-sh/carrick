@@ -323,9 +323,15 @@ esac
                 .status
                 .success()
         );
-        assert!(invoke(&["agent-runner", "cleanup"]).status.success());
+        // The full `cleanup` also retires the host's real dispatch accounts
+        // through sudo, so on a dispatch host (both accounts exist, the test
+        // user lacks sudo for the other) its verdict would depend on the
+        // machine. This witness owns state removal only; retirement has its
+        // own witnesses in `dispatch_worker`.
+        let cleanup = ["agent-runner", "cleanup", "--state-only"];
+        assert!(invoke(&cleanup).status.success());
         assert!(!state.exists());
-        assert!(invoke(&["agent-runner", "cleanup"]).status.success());
+        assert!(invoke(&cleanup).status.success());
     }
 }
 
