@@ -36,6 +36,9 @@ pub(super) enum Headroom {
     LvmThin { pool: &'static str },
     /// A PVE directory storage: available bytes from the PVE storage status API.
     Directory,
+    /// A PVE `zfspool` storage (thin zvols): available bytes from the same
+    /// PVE storage status API. Its disks are raw; `qcow2` is directory-only.
+    ZfsPool,
 }
 
 /// How a clone (and the template while it is built) gets its IPv4 address.
@@ -122,7 +125,32 @@ pub(super) const CONTABO: Site = Site {
     protected: &[101, 102, 103, 104, 9000, 9001],
 };
 
-pub(super) const SITES: [Site; 2] = [WILLOW, CONTABO];
+/// The dedicated Hetzner host (issue #1590), Contabo's planned successor:
+/// the same NAT layout on its own /24, ZFS clone storage, and no fixed worker
+/// VMs, so only the agent template slots are protected.
+pub(super) const HETZNER: Site = Site {
+    lane: super::CloneLane::Kvm,
+    agent_template: Some(AgentTemplate::Blue),
+    node: "carrick-hz",
+    // The PVE node certificate names the short node name only.
+    api_host: "carrick-hz",
+    api_ca: Some("/etc/pve/pve-root-ca.pem"),
+    storage: "tank-vm",
+    headroom: Headroom::ZfsPool,
+    bridge: "vmbr1",
+    network: Network::Static {
+        subnet: [10, 78, 0],
+        gateway: 1,
+        nameserver: "1.1.1.1",
+        host_public: "2.29.243.212",
+    },
+    cores: 8,
+    memory_mib: 16384,
+    disk_gib: 100,
+    protected: &[9000, 9001],
+};
+
+pub(super) const SITES: [Site; 3] = [WILLOW, CONTABO, HETZNER];
 
 impl Site {
     pub(super) fn template(&self) -> Result<u16, ScalerError> {
@@ -149,14 +177,20 @@ impl Site {
         let mut site = Self::for_hostname(self.node)?;
         site.agent_template = self.agent_template;
         if lane == super::CloneLane::Agent {
-            if site.node != CONTABO.node {
-                return Err(ScalerError::Guard("agent clones require Contabo"));
+            if !site.serves_agents() {
+                return Err(ScalerError::Guard("agent clones require an agent site"));
             }
             site.cores = 8;
             site.memory_mib = 20480;
         }
         site.lane = lane;
         Ok(site)
+    }
+
+    /// Whether this site's table row admits agent clones: it names an
+    /// approved agent template. Decided by the typed row, never by node name.
+    pub(super) fn serves_agents(&self) -> bool {
+        self.agent_template.is_some()
     }
 
     pub(super) fn for_hostname(hostname: &str) -> Result<Site, ScalerError> {
@@ -337,7 +371,7 @@ impl Site {
     /// value is a bare token (no quoting needed); the script validates each.
     pub(super) fn shell_env(&self) -> Result<String, ScalerError> {
         let disk_format = match self.headroom {
-            Headroom::LvmThin { .. } => "raw",
+            Headroom::LvmThin { .. } | Headroom::ZfsPool => "raw",
             Headroom::Directory => "qcow2",
         };
         Ok(format!(
@@ -578,6 +612,54 @@ OUT ACCEPT -dest 0.0.0.0/0 -log nolog # remaining IPv4 through the NAT gateway\n
         assert!(WILLOW.for_lane(super::super::CloneLane::Agent).is_err());
     }
     #[test]
+    fn hetzner_row_is_pinned() {
+        assert_eq!(
+            HETZNER.shell_env().unwrap(),
+            "SITE_NODE=carrick-hz\nSITE_API_HOST=carrick-hz\nSITE_STORAGE=tank-vm\nSITE_DISK_FORMAT=raw\nSITE_BRIDGE=vmbr1\nSITE_CORES=8\nSITE_MEMORY_MIB=16384\nSITE_DISK_GIB=100\nSITE_TEMPLATE_IPCONFIG=ip=10.78.0.100/24,gw=10.78.0.1\nSITE_NAMESERVER=1.1.1.1\nSITE_VM_FIREWALL=1\nSITE_API_CA=/etc/pve/pve-root-ca.pem\nSITE_ALLOW_KSM=0\nSITE_TEMPLATE_VMID=300\n"
+        );
+        assert_eq!(
+            HETZNER.vm_firewall_file(308).unwrap().unwrap(),
+            "[OPTIONS]\nenable: 1\npolicy_in: DROP\npolicy_out: DROP\nipfilter: 1\nmacfilter: 1\n\n[IPSET ipfilter-net0]\n10.78.0.108\n\n[RULES]\n\
+IN ACCEPT -source 10.78.0.1 -p tcp -dport 22 -log nolog # controller SSH from the host\n\
+OUT DROP -dest 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,100.64.0.0/10,2.29.243.212 -log nolog # no private, shared, link-local or host destination\n\
+OUT ACCEPT -dest 0.0.0.0/0 -log nolog # remaining IPv4 through the NAT gateway\n"
+        );
+        assert_eq!(HETZNER.qemu(308), "/nodes/carrick-hz/qemu/308");
+        assert_eq!(HETZNER.api_resolve(), "carrick-hz:8006:127.0.0.1");
+        let agent = HETZNER.for_lane(super::super::CloneLane::Agent).unwrap();
+        let env = agent.shell_env().unwrap();
+        for line in [
+            "SITE_TEMPLATE_VMID=9000",
+            "SITE_CORES=8",
+            "SITE_MEMORY_MIB=20480",
+            "SITE_STORAGE=tank-vm",
+            "SITE_DISK_FORMAT=raw",
+            "SITE_TEMPLATE_IPCONFIG=ip=10.78.0.150/24,gw=10.78.0.1",
+        ] {
+            assert!(env.lines().any(|actual| actual == line), "{line}");
+        }
+        assert_eq!(
+            agent.ipconfig(9501).unwrap(),
+            "ip=10.78.0.152/24,gw=10.78.0.1"
+        );
+        assert_eq!(agent.protected, &[9000, 9001]);
+    }
+    #[test]
+    fn agent_lane_follows_the_typed_row_not_the_node_name() {
+        assert!(WILLOW.for_lane(super::super::CloneLane::Agent).is_err());
+        for site in [CONTABO, HETZNER] {
+            assert!(site.serves_agents());
+            assert_eq!(
+                site.for_lane(super::super::CloneLane::Agent)
+                    .unwrap()
+                    .template()
+                    .unwrap(),
+                9000
+            );
+        }
+        assert!(!WILLOW.serves_agents());
+    }
+    #[test]
     fn template_builder_inputs_are_bare_tokens() {
         assert_eq!(
             WILLOW.shell_env().unwrap(),
@@ -600,6 +682,7 @@ OUT ACCEPT -dest 0.0.0.0/0 -log nolog # remaining IPv4 through the NAT gateway\n
     fn site_selection_fails_closed_on_an_unknown_host() {
         assert_eq!(Site::for_hostname("willow\n").unwrap(), WILLOW);
         assert_eq!(Site::for_hostname("carrick-ctb").unwrap(), CONTABO);
+        assert_eq!(Site::for_hostname("carrick-hz\n").unwrap(), HETZNER);
         // Contabo's /etc/hostname may hold the FQDN (its Tailscale name).
         assert_eq!(
             Site::for_hostname("carrick-ctb.turkey-moth.ts.net\n").unwrap(),
@@ -616,6 +699,9 @@ OUT ACCEPT -dest 0.0.0.0/0 -log nolog # remaining IPv4 through the NAT gateway\n
             // The pre-rename node name no longer selects a site.
             "m28112",
             "m28112.contaboserver.net",
+            "carrick-hz2",
+            "carrick-hz.turkey-moth.ts.net",
+            "Debian-trixie-latest-amd64-base",
         ] {
             assert!(
                 matches!(Site::for_hostname(host), Err(ScalerError::Guard(_))),
