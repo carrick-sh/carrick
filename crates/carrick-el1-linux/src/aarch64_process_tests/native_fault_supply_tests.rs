@@ -3050,7 +3050,8 @@ fn arm_host_born_fault_waiter_cancels_cleanly_on_exit_group_kill_and_sibling_exe
                         |entry| {
                             entry.give_fixture_root_a_cwd();
                             let res = entry.begin_exec_service(
-                                payload.into_boxed_slice(), None,
+                                payload.into_boxed_slice(),
+                                None,
                                 crate::native_process_runtime::NativeServiceCall::new(
                                     carrick_guest_arch::NativeOrdinal::new(221),
                                     &carrick_el1_abi::Counters::new(),

@@ -357,7 +357,6 @@ fn destination() -> std::path::PathBuf {
 }
 
 fn publish(census: Census, directory: std::path::PathBuf) -> std::io::Result<()> {
-    use std::io::Write;
     std::fs::create_dir_all(&directory)?;
     // Readers admit only .json files. Reserve a unique final name, but keep
     // the unpublished body under a different extension until it is durable.
@@ -366,18 +365,16 @@ fn publish(census: Census, directory: std::path::PathBuf) -> std::io::Result<()>
         census.run_id.as_deref().unwrap_or("run"),
         census.pid
     );
-    let mut file = tempfile::Builder::new()
+    let reservation = tempfile::Builder::new()
         .prefix(&name)
         .suffix(".pending")
         .tempfile_in(&directory)?;
     let body = serde_json::to_vec_pretty(&census).map_err(std::io::Error::other)?;
-    file.write_all(&body)?;
-    file.as_file().sync_all()?;
-    let final_path = file.path().with_extension("json");
-    file.persist_noclobber(&final_path)
-        .map_err(|error| error.error)?;
-    std::fs::File::open(&directory)?.sync_all()?;
-    Ok(())
+    let final_path = reservation.path().with_extension("json");
+    // Keep the name reserved until the existing artifact owner has durably
+    // published the complete body. Readers never admit the .pending file.
+    carrick_observability::vm_lifecycle::publish_artifact_bytes(&final_path, &body)
+        .map_err(std::io::Error::other)
 }
 
 /// One syscall class summed over several censuses.
@@ -602,6 +599,8 @@ mod tests {
 
     #[test]
     fn serial_host_terminal_census_is_off_without_a_destination() {
+        use wait_timeout::ChildExt;
+
         const CHILD: &str = "CARRICK_CENSUS_POLICY_TEST_CHILD";
         if std::env::var_os(CHILD).is_some() {
             publish_terminal(None).unwrap();
@@ -622,7 +621,21 @@ mod tests {
             if let Some(setting) = setting {
                 command.env("CARRICK_EL1_CENSUS", setting);
             }
-            let output = command.output().unwrap();
+            let mut child = command
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            if child
+                .wait_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .is_none()
+            {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("census policy witness exceeded its five-second bound");
+            }
+            let output = child.wait_with_output().unwrap();
             assert!(
                 output.status.success(),
                 "{}",

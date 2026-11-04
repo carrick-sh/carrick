@@ -1322,7 +1322,8 @@ impl NativeServiceCapacityFixture {
                 .unwrap();
             assert!(matches!(
                 root.begin_exec_service(
-                    test_exec_payload(b"/bin/static"), None,
+                    test_exec_payload(b"/bin/static"),
+                    None,
                     NativeServiceCall::new(
                         carrick_guest_arch::NativeOrdinal::new(221),
                         &carrick_el1_abi::Counters::new()
@@ -1770,7 +1771,8 @@ fn refused_exec_preparation_is_cancelled_exactly_once() {
             .unwrap();
         assert!(matches!(
             entry.begin_exec_service(
-                test_exec_payload(b"/bin/static"), None,
+                test_exec_payload(b"/bin/static"),
+                None,
                 NativeServiceCall::new(
                     carrick_guest_arch::NativeOrdinal::new(221),
                     &carrick_el1_abi::Counters::new()
@@ -2241,7 +2243,8 @@ fn native_exec_successor_retracts_exec_cancellation_before_owner_wait() {
             )
             .unwrap();
         let result = entry.begin_exec_service(
-            test_exec_payload(b"/bin/static"), None,
+            test_exec_payload(b"/bin/static"),
+            None,
             crate::native_process_runtime::NativeServiceCall::new(
                 carrick_guest_arch::NativeOrdinal::new(221),
                 &carrick_el1_abi::Counters::new(),
@@ -2388,7 +2391,8 @@ fn sole_member_exec_closes_admission_before_adopting_successor() {
             .unwrap();
         assert!(matches!(
             entry.begin_exec_service(
-                test_exec_payload(b"/bin/static"), None,
+                test_exec_payload(b"/bin/static"),
+                None,
                 NativeServiceCall::new(
                     carrick_guest_arch::NativeOrdinal::new(221),
                     &carrick_el1_abi::Counters::new()
@@ -2450,7 +2454,8 @@ fn exec_closes_over_predecessor_gate(gate: carrick_el1_abi::GateState) {
             .unwrap();
         assert!(matches!(
             entry.begin_exec_service(
-                test_exec_payload(b"/bin/static"), None,
+                test_exec_payload(b"/bin/static"),
+                None,
                 NativeServiceCall::new(
                     carrick_guest_arch::NativeOrdinal::new(221),
                     &carrick_el1_abi::Counters::new()
@@ -2530,7 +2535,8 @@ fn exec_after_sibling_drain(parked_read: bool) {
             .unwrap();
         assert!(matches!(
             entry.begin_exec_service(
-                test_exec_payload(b"/bin/static"), None,
+                test_exec_payload(b"/bin/static"),
+                None,
                 NativeServiceCall::new(
                     carrick_guest_arch::NativeOrdinal::new(221),
                     &carrick_el1_abi::Counters::new()
@@ -2762,7 +2768,8 @@ fn concurrent_native_exec_loser_is_killed_without_a_run_failure() {
             .unwrap();
         assert!(matches!(
             root.begin_exec_service(
-                test_exec_payload(b"/bin/winner"), None,
+                test_exec_payload(b"/bin/winner"),
+                None,
                 NativeServiceCall::new(
                     carrick_guest_arch::NativeOrdinal::new(221),
                     &carrick_el1_abi::Counters::new()
@@ -2791,7 +2798,8 @@ fn concurrent_native_exec_loser_is_killed_without_a_run_failure() {
             .unwrap();
         assert!(matches!(
             loser.begin_exec_service(
-                test_exec_payload(b"/bin/loser"), None,
+                test_exec_payload(b"/bin/loser"),
+                None,
                 NativeServiceCall::new(
                     carrick_guest_arch::NativeOrdinal::new(221),
                     &carrick_el1_abi::Counters::new()
@@ -2929,7 +2937,8 @@ fn exec_drain_is_upgraded_by_terminal_sibling(signal: Option<u8>) {
             .unwrap();
         assert!(matches!(
             root.begin_exec_service(
-                test_exec_payload(b"/bin/replaced"), None,
+                test_exec_payload(b"/bin/replaced"),
+                None,
                 NativeServiceCall::new(
                     carrick_guest_arch::NativeOrdinal::new(221),
                     &carrick_el1_abi::Counters::new()
@@ -3150,7 +3159,7 @@ fn root_exec_access_refusal_is_counted_before_service_publication() {
     }
     for ordinal in [221, 281, 600] {
         assert!(matches!(
-            root.begin_exec_service(test_exec_payload(b"/bin/static"), NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(ordinal), &counters)),
+            root.begin_exec_service(test_exec_payload(b"/bin/static"), None, NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(ordinal), &counters)),
             Ok(NativeResume::Returned(result)) if result.raw() == carrick_syscall_abi::LINUX_ENOSYS.guest_retval()
         ));
         let bucket = ordinal.min(512) as usize;
@@ -3163,7 +3172,7 @@ fn root_exec_access_refusal_is_counted_before_service_publication() {
     // A vanished caller is an ordinary ESRCH, not a routing refusal.
     root.calling_tid = u32::MAX;
     assert!(matches!(
-        root.begin_exec_service(test_exec_payload(b"/bin/static"), NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(221), &counters)),
+        root.begin_exec_service(test_exec_payload(b"/bin/static"), None, NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(221), &counters)),
         Ok(NativeResume::Returned(result)) if result.raw() == carrick_syscall_abi::LINUX_ESRCH.guest_retval()
     ));
     assert_eq!(counters.refused[221].load(Ordering::Relaxed), 1);
@@ -3252,7 +3261,7 @@ fn native_child_exec_after_ring_setuid_carries_the_new_credentials() {
         assert_eq!(counters.refused[56].load(Ordering::Relaxed), 1);
         assert_eq!(counters.refused_child[56].load(Ordering::Relaxed), 1);
         assert!(matches!(
-            child.begin_exec_service(test_exec_payload(b"/bin/static"), crate::native_process_runtime::NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(221), counters)),
+            child.begin_exec_service(test_exec_payload(b"/bin/static"), None, crate::native_process_runtime::NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(221), counters)),
             Ok(NativeResume::Returned(result))
                 if result.raw() == carrick_syscall_abi::LINUX_ENOSYS.guest_retval()
         ));
@@ -3319,7 +3328,8 @@ fn native_parent_reaps_then_execs_a_child_after_slot_reuse() {
         ));
         assert!(matches!(
             child.begin_exec_service(
-                test_exec_payload(b"/bin/static"), None,
+                test_exec_payload(b"/bin/static"),
+                None,
                 NativeServiceCall::new(
                     carrick_guest_arch::NativeOrdinal::new(221),
                     &carrick_el1_abi::Counters::new()
@@ -3431,7 +3441,8 @@ fn native_parent_reaps_then_execs_a_child_after_slot_reuse() {
     ));
     assert!(matches!(
         reused.begin_exec_service(
-            test_exec_payload(b"/bin/reused"), None,
+            test_exec_payload(b"/bin/reused"),
+            None,
             NativeServiceCall::new(
                 carrick_guest_arch::NativeOrdinal::new(221),
                 &carrick_el1_abi::Counters::new()
