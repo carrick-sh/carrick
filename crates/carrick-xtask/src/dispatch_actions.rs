@@ -214,9 +214,9 @@ fn stage_with(
         let result = (|| {
             let metadata = api(read, &format!("actions/artifacts/{artifact}"))?;
             if metadata["expired"] != false
-                || !metadata["size_in_bytes"]
+                || metadata["size_in_bytes"]
                     .as_u64()
-                    .is_some_and(|n| n <= ARCHIVE_BYTES as u64)
+                    .is_none_or(|n| n > ARCHIVE_BYTES as u64)
             {
                 return Err(ScalerError::Guard("artifact expired or exceeds 4 MiB"));
             }
