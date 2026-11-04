@@ -4,6 +4,73 @@ use super::*;
 use std::sync::{Mutex, OnceLock};
 use std::{boxed::Box, vec, vec::Vec};
 
+#[test]
+fn prepared_pair_second_admission_refusal_releases_wrapped_and_raw_backings() {
+    let c = authority::<1, 1>();
+    let mut pair = prepared::PreparedDescriptions::new([description(10), description(11)]);
+    assert_eq!(pair.admit(&c), Err(Error::NeedsOfds));
+    // Neither refusal nor a retry allocates a second description for the
+    // already prepared reader. The raw writer still belongs to this owner.
+    assert_eq!(pair.admit(&c), Err(Error::NeedsOfds));
+    let foreign = authority::<1, 1>();
+    assert_eq!(pair.release_next(&foreign), Err(Error::StalePin));
+    assert_eq!(pair.release_next(&c), Ok(Some(description(10))));
+    assert_eq!(pair.release_next(&c), Ok(Some(description(11))));
+    assert_eq!(pair.release_next(&c), Ok(None));
+    let pin = c.create_pinned(description(12)).unwrap();
+    assert_eq!(c.unpin(pin), Ok(Some(description(12))));
+}
+
+#[test]
+fn prepared_pair_refused_publication_and_growth_preserve_exact_custody() {
+    let c = authority::<2, 2>();
+    let parent = c.create_table(4, &mut storage(1)).unwrap();
+    let peer = c.create_table(1, &mut storage(1)).unwrap();
+    let mut pair = prepared::PreparedDescriptions::new([description(20), description(21)]);
+    pair.admit(&c).unwrap();
+    assert_eq!(
+        pair.install_pair(&c, peer, Fd(0), true),
+        Err(Error::TooManyFiles)
+    );
+    assert_eq!(c.get(peer, Fd(0)), Err(Error::BadFd));
+    assert_eq!(
+        pair.install_pair(&c, parent, Fd(0), true),
+        Err(Error::NeedsBacking { descriptors: 2 })
+    );
+    assert_eq!(c.get(parent, Fd(0)), Err(Error::BadFd));
+    c.grow_table(parent, &mut storage(4)).unwrap();
+    assert_eq!(
+        pair.install_pair(&c, parent, Fd(0), true),
+        Ok([Fd(0), Fd(1)])
+    );
+    assert_eq!(
+        pair.release_next(&c),
+        Ok(None),
+        "slots now own both descriptions"
+    );
+    assert_eq!(c.getfd(parent, Fd(0)), Ok(true));
+    assert_eq!(c.getfd(parent, Fd(1)), Ok(true));
+    assert_eq!(c.close(parent, Fd(0)), Ok(Some(description(20))));
+    assert_eq!(c.close(parent, Fd(1)), Ok(Some(description(21))));
+    c.destroy_table(parent, |_| {}).unwrap();
+    c.destroy_table(peer, |_| {}).unwrap();
+}
+
+#[test]
+fn prepared_pair_admission_resumes_after_description_growth() {
+    let core = Core::<1>::new().unwrap();
+    let arena = TestArena::with_ofds(2);
+    let c = core.bind(arena, Spin);
+    c.publish_ofds(1).unwrap();
+    let mut pair = prepared::PreparedDescriptions::new([description(30), description(31)]);
+    assert_eq!(pair.admit(&c), Err(Error::NeedsOfds));
+    c.publish_ofds(1).unwrap();
+    pair.admit(&c).unwrap();
+    assert_eq!(pair.release_next(&c), Ok(Some(description(30))));
+    assert_eq!(pair.release_next(&c), Ok(Some(description(31))));
+    assert_eq!(pair.release_next(&c), Ok(None));
+}
+
 // Reservation custody stays in one authority, including across backing growth.
 #[test]
 fn owned_reservations_two_live_tables_keep_targets_and_fork_private() {

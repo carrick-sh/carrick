@@ -1,7 +1,12 @@
 # Native child pipe creation (#1346)
 
-Status: investigation only. The native-child `pipe2` route is still missing.
-This note does not claim the issue's implementation or runtime acceptance.
+Status: preparation-owner checkpoint. The native-child `pipe2` route is still
+missing. `carrick-fd-core::prepared::PreparedDescriptions` now retains raw
+backings and admitted pins across partial admission. `HostIpc::prepare_pipe`
+uses canonical growth and release, and host pipe construction consumes that
+owner. Atomic pair publication reuses the fd-core transaction. See
+[the checkpoint contract note](../conformance-contracts/native-pipe-preparation.md).
+This does not claim native routing or runtime acceptance.
 
 The VM-free production-dispatch witnesses in
 `carrick-el1-linux::aarch64_process_tests` reproduce the failure:

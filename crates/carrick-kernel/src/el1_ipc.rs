@@ -266,6 +266,66 @@ pub struct HostDescription {
     flags: std::sync::Arc<HostDescriptionFlags>,
 }
 
+/// Venue custody for unpublished descriptions. The neutral preparation owns
+/// raw backings as well as admitted pins; this wrapper supplies canonical
+/// growth and releases every remaining backing on cancellation or refusal.
+#[derive(Debug)]
+pub struct HostPreparedDescriptions<const N: usize> {
+    owner: std::sync::Arc<HostIpc>,
+    prepared: fd::prepared::PreparedDescriptions<N>,
+}
+
+impl<const N: usize> Drop for HostPreparedDescriptions<N> {
+    fn drop(&mut self) {
+        let region = self.owner.region();
+        let authority = region.fd(HostLockWait);
+        loop {
+            match self.prepared.release_next(&authority) {
+                Ok(Some(description)) => {
+                    self.owner
+                        .release(description.backing)
+                        .unwrap_or_else(|error| {
+                            carrick_fatal::carrick_fatal!(
+                                "ipc::preparation",
+                                "backing release failed: {error:?}"
+                            )
+                        });
+                }
+                Ok(None) => break,
+                Err(error) => carrick_fatal::carrick_fatal!(
+                    "ipc::preparation",
+                    "invalid description custody: {error:?}"
+                ),
+            }
+        }
+    }
+}
+
+impl HostPreparedDescriptions<2> {
+    /// Atomic numeric publication, with no allocation, growth or user copy.
+    /// On NeedsBacking the caller retains this owner, releases any secured
+    /// output, and requests canonical table growth before preparing output
+    /// again. This method can then be retried as the bounded final commit.
+    pub fn install_pair(
+        &self,
+        table: fd::TableId,
+        cloexec: bool,
+    ) -> Result<[fd::Fd; 2], AdmissionError> {
+        let region = self.owner.region();
+        self.prepared
+            .install_pair(&region.fd(HostLockWait), table, fd::Fd(0), cloexec)
+            .map_err(Into::into)
+    }
+
+    /// Move the same OFDs to the host pipe's functional endpoint owners.
+    pub fn into_pair(mut self) -> [HostDescription; 2] {
+        let pins = self.prepared.take_pair().unwrap_or_else(|_| {
+            carrick_fatal::carrick_fatal!("ipc::preparation", "unadmitted pair transfer")
+        });
+        pins.map(|pin| self.owner.own_description(pin))
+    }
+}
+
 /// Non-owning observation of a host description's shared mutable flags.
 /// Holding this view never retains an OFD pin. After host retirement it reads
 /// a terminal snapshot, without touching a potentially recycled shared slot.
@@ -973,12 +1033,59 @@ impl HostIpc {
                 result => break result?,
             }
         };
-        Ok(HostDescription {
+        Ok(self.own_description(pin))
+    }
+
+    fn own_description(self: &std::sync::Arc<Self>, pin: fd::OfdPin) -> HostDescription {
+        HostDescription {
             flags: std::sync::Arc::new(HostDescriptionFlags {
                 owner: std::sync::Arc::clone(self),
                 state: Mutex::new(HostDescriptionState::Live(pin)),
             }),
-        })
+        }
+    }
+
+    /// Own every input backing before trying the first description. Partial
+    /// admission retains its prefix across canonical growth and aborts through
+    /// the same release path when the configured description ceiling is hit.
+    pub fn prepare_descriptions<const N: usize>(
+        self: &std::sync::Arc<Self>,
+        descriptions: [fd::Description; N],
+    ) -> Result<HostPreparedDescriptions<N>, AdmissionError> {
+        let mut prepared = HostPreparedDescriptions {
+            owner: std::sync::Arc::clone(self),
+            prepared: fd::prepared::PreparedDescriptions::new(descriptions),
+        };
+        loop {
+            let region = self.region();
+            let seen = region.ofd_count();
+            match prepared.prepared.admit(&region.fd(HostLockWait)) {
+                Err(fd::Error::NeedsOfds) => self.grow_descriptions(seen)?,
+                Ok(()) => return Ok(prepared),
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    /// Prepare both endpoints using the canonical object and description
+    /// growth owners. Ring retirement and first-write stock remain owned by
+    /// create_pipe; neither a growth refusal nor cancellation leaks an end.
+    pub fn prepare_pipe(
+        self: &std::sync::Arc<Self>,
+        capacity: usize,
+        flags: fd::StatusFlags,
+    ) -> Result<(IpcObjectHandle, HostPreparedDescriptions<2>), AdmissionError> {
+        use carrick_el1_abi::ipc::IpcBacking;
+        let object = self.create_pipe(capacity)?;
+        let descriptions = [
+            (pipe::End::Reader, fd::AccessMode::ReadOnly),
+            (pipe::End::Writer, fd::AccessMode::WriteOnly),
+        ]
+        .map(|(end, access)| {
+            fd::Description::new(IpcBacking::Pipe { object, end }.encode(), access, flags)
+        });
+        self.prepare_descriptions(descriptions)
+            .map(|prepared| (object, prepared))
     }
 
     pub fn create_table(
@@ -1201,6 +1308,117 @@ impl HostIpc {
 mod tests {
     use super::*;
     use carrick_el1_abi::ipc::{IpcBacking, fd, pipe};
+
+    #[test]
+    fn serial_host_prepared_pipe_second_description_ceiling_releases_both_ends() {
+        let owner = std::sync::Arc::new(
+            HostIpc::with_limits(
+                1 << 20,
+                IpcLimits {
+                    objects: 2 * IPC_OBJECT_SEGMENT,
+                    descriptions: IPC_OFD_SEGMENT,
+                },
+            )
+            .unwrap(),
+        );
+        let mut held = Vec::new();
+        // Leave exactly one OFD for the reader. The writer requests growth,
+        // hits the canonical ceiling and must release its still-raw endpoint.
+        for _ in 0..IPC_OFD_SEGMENT - 1 {
+            let object = owner.create_eventfd(0, pipe::EventMode::Counter).unwrap();
+            held.push(
+                owner
+                    .admit_description(fd::Description::new(
+                        IpcBacking::EventFd { object }.encode(),
+                        fd::AccessMode::ReadWrite,
+                        fd::StatusFlags::default(),
+                    ))
+                    .unwrap(),
+            );
+        }
+        let initial_growth = owner.growth();
+        for _ in 0..2 * IPC_OBJECT_SEGMENT {
+            assert!(matches!(
+                owner.prepare_pipe(65536, fd::StatusFlags::default()),
+                Err(AdmissionError::Shared(IpcError::ZoneLimit))
+            ));
+        }
+        assert_eq!(
+            owner.growth(),
+            initial_growth,
+            "no growth beyond configured ceilings"
+        );
+        drop(held);
+        let (object, prepared) = owner
+            .prepare_pipe(65536, fd::StatusFlags::default())
+            .unwrap();
+        drop(prepared);
+        assert!(matches!(
+            owner.region().lock(object, &HostLockWait),
+            Err(IpcError::Stale)
+        ));
+    }
+
+    #[test]
+    fn serial_host_prepared_pipe_pair_refusal_growth_and_repeated_reuse() {
+        let owner = std::sync::Arc::new(HostIpc::new(1 << 20).unwrap());
+        let table = owner.create_table(4, 1).unwrap();
+        let peer = owner.create_table(1, 1).unwrap();
+        let flags = fd::StatusFlags {
+            nonblock: true,
+            ..Default::default()
+        };
+        for _ in 0..256 {
+            let (object, prepared) = owner.prepare_pipe(65536, flags).unwrap();
+            assert_eq!(
+                prepared.install_pair(peer, true),
+                Err(AdmissionError::Shared(IpcError::Fd(
+                    fd::Error::TooManyFiles
+                )))
+            );
+            let region = owner.region();
+            let authority = region.fd(HostLockWait);
+            assert_eq!(authority.get(peer, fd::Fd(0)), Err(fd::Error::BadFd));
+            let pair = match prepared.install_pair(table, true) {
+                Err(AdmissionError::Shared(IpcError::Fd(fd::Error::NeedsBacking {
+                    descriptors,
+                }))) => {
+                    assert_eq!(authority.get(table, fd::Fd(0)), Err(fd::Error::BadFd));
+                    region
+                        .ensure_table_capacity(table, descriptors, &HostLockWait)
+                        .unwrap();
+                    prepared.install_pair(table, true).unwrap()
+                }
+                result => result.unwrap(),
+            };
+            assert_eq!(pair, [fd::Fd(0), fd::Fd(1)]);
+            drop(prepared);
+            for number in [fd::Fd(0), fd::Fd(1)] {
+                assert_eq!(authority.getfd(table, number), Ok(true));
+                assert!(authority.getfl(table, number).unwrap().1.nonblock);
+                owner
+                    .release(authority.close(table, number).unwrap().unwrap().backing)
+                    .unwrap();
+            }
+            assert!(matches!(
+                region.lock(object, &HostLockWait),
+                Err(IpcError::Stale)
+            ));
+        }
+        assert_eq!(owner.growth(), IpcGrowth::default());
+        assert!(
+            owner.rings.lock().allocated.len() <= 4,
+            "bounded ring stock reuse"
+        );
+        for table in [table, peer] {
+            let storage = owner
+                .region()
+                .fd(HostLockWait)
+                .destroy_table(table, |_| unreachable!())
+                .unwrap();
+            owner.reclaim_descriptors(storage).unwrap();
+        }
+    }
 
     #[test]
     fn serial_host_el1_ipc_host_subscription_lifetime_is_exact() {
