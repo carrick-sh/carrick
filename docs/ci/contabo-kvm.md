@@ -92,7 +92,19 @@ lanes (#1590): KVM and agent jobs carry different labels, so a host started
 with `CARRICK_AGENT_CLONES=0` (KVM only) and another started with
 `CARRICK_KVM_CLONES=0` (agents only) never claim the same job. The KVM-off
 host reads no KVM demand, so it never cancels a superseded run the KVM host
-serves. Sharing one lane across hosts needs the per-job claim in #1597. The lane runs when
+serves.
+
+Two hosts may also share a lane (#1597). Before reserving a clone, every
+standing controller claims the job with a create-only GitHub ref,
+`refs/ci-claims/job/<run>-<attempt>-<job>`: `POST /git/refs` refuses an
+existing name (HTTP 422), so one host wins. The ref's empty-tree commit records
+the host and creation time; a claim older than 15 minutes no longer blocks,
+and a closed row releases its own claim. `--role leader` (the default) admits a
+queued job at once, and `--role follower` only after it has seen the job queued
+for 90 seconds, so the leader gets first pick. A follower needs claims; any
+controller can opt out with `CARRICK_JOB_CLAIMS=0`, which is only safe when no
+other host serves its lanes. Deploy the claiming binary to every controller
+before letting two of them share a lane. The lane runs when
 `CARRICK_SELF_HOSTED_KVM=true`.
 
 ## Events and receipts

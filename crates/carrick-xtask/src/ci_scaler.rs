@@ -12,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 mod assignment;
+mod claim;
 mod github;
 pub(crate) use github::dispatch_workflow_unchanged;
 mod live;
@@ -94,6 +95,13 @@ pub enum ScalerError {
     External(&'static str),
     #[error("GitHub resource is Gone (HTTP 404)")]
     GithubGone,
+    /// `POST /git/refs` on a ref that exists (HTTP 422): another holder.
+    #[error("GitHub reference already exists (HTTP 422)")]
+    GithubConflict,
+    /// Not now: skip this job this pass without recording a refusal (a
+    /// cross-host claim held elsewhere, or a follower's grace period).
+    #[error("deferred: {0}")]
+    Deferred(&'static str),
     #[error(
         "supersession capacity exceeded ({live} live entries, limit {limit}); new runner admission stopped"
     )]
@@ -1180,6 +1188,11 @@ pub enum ScalerAction {
         /// assignments, reaping) and exit 0 once none remain (#1599).
         #[arg(long)]
         drain: bool,
+        /// First pick of shared demand (#1597): the leader admits a queued
+        /// job at once; a follower only after seeing it queued for the
+        /// grace period. Both take a cross-host claim before booting.
+        #[arg(long, value_enum, default_value = "leader")]
+        role: claim::Role,
     },
     /// Director-Mac controller for cloudmac: mint one JIT config per queued
     /// carrick-hvf job and feed it to one runner over SSH stdin.
@@ -1432,6 +1445,7 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
                 agents: AgentClones::DEFAULT,
             },
             Intake::Open,
+            claim::Role::Leader,
         ),
         ScalerAction::Standing {
             state_dir,
@@ -1439,6 +1453,7 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
             max_concurrency,
             max_agent_clones,
             drain,
+            role,
         } => live::controller(
             &Admission::Standing,
             &state_dir,
@@ -1449,6 +1464,7 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
                 agents: max_agent_clones,
             },
             if drain { Intake::Drain } else { Intake::Open },
+            role,
         ),
         ScalerAction::MacJit {
             host,

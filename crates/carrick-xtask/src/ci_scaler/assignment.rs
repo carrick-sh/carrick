@@ -630,6 +630,8 @@ pub(super) fn admit_demand<T>(
         }
         match admit(job) {
             Ok(vetted) => return Ok(Some(vetted)),
+            // Not now (another host's claim, a follower's grace): no refusal.
+            Err(ScalerError::Deferred(_)) => continue,
             Err(error @ ScalerError::Guard(_)) => {
                 refuse(ledger, job, &error, path)?;
             }
@@ -800,6 +802,31 @@ mod tests {
             event: context.event.clone(),
             sha: context.sha.clone(),
         }
+    }
+
+    #[test]
+    fn a_deferred_job_is_skipped_without_a_refusal_and_admission_moves_on() {
+        // #1597: a job another host has claimed (or a follower's grace) is
+        // "not now": the next job is admitted, and the deferred one stays
+        // eligible for a later pass instead of being refused for good.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let mut ledger = Ledger::default();
+        let (deferred, next) = (key(&run_a(), 11), key(&run_a(), 12));
+        let admitted = admit_demand(&mut ledger, &path, vec![deferred, next], |job| {
+            if job == deferred {
+                Err(ScalerError::Deferred("claimed by another host"))
+            } else {
+                Ok(job)
+            }
+        })
+        .unwrap();
+        assert_eq!(admitted, Some(next));
+        assert!(!ledger.refused().contains(&deferred));
+        assert_eq!(
+            admit_demand(&mut ledger, &path, vec![deferred], Ok).unwrap(),
+            Some(deferred)
+        );
     }
 
     #[test]
