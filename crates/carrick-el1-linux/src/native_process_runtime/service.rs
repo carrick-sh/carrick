@@ -81,6 +81,11 @@ impl CallerAccessFailure {
     }
 }
 
+enum PreparedService {
+    Request(ServiceRequest, bool),
+    Retired(NativeResume),
+}
+
 enum PendingServiceReply {
     Fault(Box<carrick_el1_abi::PortalGrantSlot>),
     Exec(Box<ExecSuccessorManifest>),
@@ -967,13 +972,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         // Publish into the existing boxed pending owner before descending into
         // completion. Admission's payload/manifests and rollback locals must
         // unwind before a ready reply walks four descriptor-table levels.
-        let (request, adapter) = self.prepare_service_inner(
+        let prepared = self.prepare_service_inner(
             operation,
             fault_sequence,
             owner_wait,
             payload,
             retry_syscall_after_supply,
         )?;
+        let (request, adapter) = match prepared {
+            PreparedService::Request(request, adapter) => (request, adapter),
+            PreparedService::Retired(result) => return Ok(result),
+        };
         if let Some(wait) = owner_wait {
             self.park_owner_wait(&request, wait)
         } else {
@@ -989,7 +998,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         owner_wait: Option<carrick_core_abi::PortalOwnerWait>,
         payload: ServicePayload<'a>,
         retry_syscall_after_supply: bool,
-    ) -> Result<(ServiceRequest, bool), NativeProcessError> {
+    ) -> Result<PreparedService, NativeProcessError> {
         self.service_phase = NativeServicePhase::Payload;
         let (payload, copyout, adapter) = match payload {
             ServicePayload::Copyout(output) => {
@@ -1113,12 +1122,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .map_err(|_| NativeProcessError::Stale)
             })
             .transpose()?;
+        // Claim acquisition refuses only on counter overflow, not contention.
         let claim = carrick_core::terminal::NativeServiceClaim::acquire(page)
-            .map_err(|_| NativeProcessError::Busy)?;
+            .map_err(|_| NativeProcessError::Quarantined)?;
         self.service_phase = NativeServicePhase::Publication;
+        let mut closing = false;
         let published = {
             let graph = self.runtime.graph.lock();
-            if !claim.admitted() || graph.has_member_wait(&self.record) {
+            if !claim.admitted() {
+                // Close publishes its gate and pending operation under this
+                // lock. A terminal gate without that owner is broken custody.
+                closing = graph.pending.has_exit(&self.key);
+                Err(NativeProcessError::Quarantined)
+            } else if graph.has_member_wait(&self.record) {
                 Err(NativeProcessError::Busy)
             } else if let Some(wait) = owner_wait {
                 self.control
@@ -1143,6 +1159,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             Err(error) => {
                 drop(owner_queue);
                 self.release_service_claim(claim)?;
+                if closing {
+                    return self.retire_closing_entry().map(PreparedService::Retired);
+                }
                 return Err(error);
             }
         };
@@ -1178,7 +1197,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         );
         drop(owner_queue);
         if owner_wait.is_some() {
-            return Ok((request, adapter));
+            return Ok(PreparedService::Request(request, adapter));
         }
         self.service_phase = NativeServicePhase::Notice;
         if let Err(error) = self
@@ -1214,7 +1233,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 return Err(error);
             }
         }
-        Ok((request, adapter))
+        Ok(PreparedService::Request(request, adapter))
     }
 
     fn has_adapter_operation(&self) -> bool {
