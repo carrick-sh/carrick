@@ -1481,6 +1481,8 @@ pub struct NativeProcessRuntime<'a, M: Clone, C: ProcessContext> {
     settle_race_hook: SpinLock<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     raw_exit_after_commit_hook: SpinLock<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    yield_receipt_race_hook: SpinLock<Option<Box<dyn FnOnce() + Send + 'a>>>,
     registry: SpinLock<Option<&'a NativeProcessRegistry<'a, M, C>>>,
 }
 
@@ -3132,6 +3134,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         *self.settle_race_hook.lock() = Some(hook);
     }
     #[cfg(test)]
+    pub(super) fn install_yield_receipt_race_hook(&self, hook: Box<dyn FnOnce() + Send + 'a>) {
+        *self.yield_receipt_race_hook.lock() = Some(hook);
+    }
+    #[cfg(test)]
     pub(super) fn install_raw_exit_after_commit_hook(&self, hook: Box<dyn FnOnce() + Send>) {
         *self.raw_exit_after_commit_hook.lock() = Some(hook);
     }
@@ -3555,6 +3561,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             settle_race_hook: SpinLock::new(None),
             #[cfg(test)]
             raw_exit_after_commit_hook: SpinLock::new(None),
+            #[cfg(test)]
+            yield_receipt_race_hook: SpinLock::new(None),
             registry: SpinLock::new(None),
         })
     }

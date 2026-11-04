@@ -5047,8 +5047,53 @@ fn native_service_exit_missing_unowned_receipt_remains_an_invariant() {
 #[cfg(test)]
 #[test]
 fn host_request_during_service_park_yields_then_reparks() {
+    host_contended_service_park(
+        carrick_core_abi::service::ServiceOperation::CarrierWork {
+            entry: OwnerEntry::Syscall,
+        },
+        false,
+    );
+}
+
+/// #1467 review P0: the requester that closed the park takes the yielded
+/// record from the run queue before the yield's receipt is constructed. That
+/// takeover is the request being honoured, so the receipt still stands and the
+/// exact operation reruns after the handback; it must never quarantine.
+#[cfg(test)]
+#[test]
+fn host_takeover_before_yield_receipt_is_not_now() {
+    host_contended_service_park(
+        carrick_core_abi::service::ServiceOperation::CarrierWork {
+            entry: OwnerEntry::Syscall,
+        },
+        true,
+    );
+}
+
+/// #1467 review P1: a contended exception service yields through the
+/// exception owner checkpoint, so its next owner entry re-delivers the
+/// exception instead of re-executing a syscall at that PC.
+#[cfg(test)]
+#[test]
+fn host_request_during_exception_service_park_yields_as_exception() {
+    host_contended_service_park(
+        carrick_core_abi::service::ServiceOperation::Exception(
+            carrick_core_abi::service::NativeException {
+                kind: carrick_core_abi::service::NativeExceptionKind::UndefinedInstruction,
+                address: UserVa::new(0x4000),
+            },
+        ),
+        false,
+    );
+}
+
+#[cfg(test)]
+fn host_contended_service_park(
+    operation: carrick_core_abi::service::ServiceOperation,
+    takeover_before_receipt: bool,
+) {
     use carrick_core_abi::service::{ServiceCell, ServiceOperation};
-    use carrick_sched_core::object_wait::{ObjectWaitKey, OwnerEntry};
+    use carrick_sched_core::object_wait::{ObjectWaitKey, OwnerEntry, ResumeDisposition};
     use carrick_sched_core::{Claim, Handback, HostClaim, ShortLockSpin};
 
     let capacity = NativeServiceCapacityFixture::new(1);
@@ -5083,12 +5128,30 @@ fn host_request_during_service_park_yields_then_reparks() {
         entry.resume_checkpoint().unwrap(),
         NativeResume::NoPending
     ));
-    let parked = entry.begin_service(
-        ServiceOperation::CarrierWork {
-            entry: OwnerEntry::Syscall,
-        },
-        None,
-    );
+    if takeover_before_receipt {
+        let (zone, slot) = (fixture.zone, fixture.slot);
+        fixture
+            .runtime
+            .install_yield_receipt_race_hook(alloc::boxed::Box::new(move || {
+                assert!(matches!(
+                    zone.record(record.id).claim(),
+                    Claim::Queued { .. }
+                ));
+                // The stopped executor honours the request from its run queue
+                // (`el1_zone::hand_back_wanted`) before the receipt exists.
+                let mut wanted = alloc::vec::Vec::new();
+                assert_eq!(
+                    zone.take_host_wanted(slot, &mut |wanted_record| wanted.push(wanted_record)),
+                    1
+                );
+                assert_eq!(wanted.as_slice(), &[record]);
+            }));
+    }
+    let expected_entry = match operation {
+        ServiceOperation::Exception(_) | ServiceOperation::Fault(_) => OwnerEntry::Exception,
+        _ => OwnerEntry::Syscall,
+    };
+    let parked = entry.begin_service(operation, None);
     assert!(
         matches!(parked, Ok(NativeResume::Left(None))),
         "host request during service park must yield, not quarantine: {:?}",
@@ -5100,10 +5163,22 @@ fn host_request_during_service_park_yields_then_reparks() {
     assert!(fixture.zone.slot(fixture.slot).current().is_none());
     // The request was published before the park; the yield keeps it.
     let notice = fixture.task.service_notice.take().unwrap().unwrap();
-    assert!(matches!(
-        fixture.zone.record(record.id).claim(),
-        Claim::Queued { .. }
-    ));
+    assert_eq!(
+        fixture.zone.record(record.id).resume_disposition(),
+        ResumeDisposition::OwnerContinuation(expected_entry),
+        "the yield must resume through the operation's own owner entry"
+    );
+    if takeover_before_receipt {
+        assert!(matches!(
+            fixture.zone.record(record.id).claim(),
+            Claim::Host { .. }
+        ));
+    } else {
+        assert!(matches!(
+            fixture.zone.record(record.id).claim(),
+            Claim::Queued { .. }
+        ));
+    }
     assert!(fixture.zone.record(record.id).has_object_operation());
     assert!(fixture.runtime.graph.lock().has_member_wait(&record));
     // SAFETY: the real native owner retains this exact control allocation.
@@ -5114,16 +5189,20 @@ fn host_request_during_service_park_yields_then_reparks() {
 
     // The stopped executor honours the request (`el1_zone::hand_back_wanted`),
     // and the native handback places the exact record back on a slot.
-    assert!(fixture.zone.record(record.id).needs_host());
-    let mut wanted = alloc::vec::Vec::new();
-    assert_eq!(
-        fixture
-            .zone
-            .take_host_wanted(fixture.slot, &mut |wanted_record| wanted
-                .push(wanted_record)),
-        1
-    );
-    assert_eq!(wanted.as_slice(), &[record]);
+    if expected_entry == OwnerEntry::Syscall && !takeover_before_receipt {
+        assert!(fixture.zone.record(record.id).needs_host());
+    }
+    if !takeover_before_receipt {
+        let mut wanted = alloc::vec::Vec::new();
+        assert_eq!(
+            fixture
+                .zone
+                .take_host_wanted(fixture.slot, &mut |wanted_record| wanted
+                    .push(wanted_record)),
+            1
+        );
+        assert_eq!(wanted.as_slice(), &[record]);
+    }
     assert!(fixture.zone.place_native_handback(record).is_some());
     assert!(!fixture.zone.record(record.id).needs_host());
 
@@ -5153,7 +5232,18 @@ fn host_request_during_service_park_yields_then_reparks() {
                 Claim::Parked { .. }
             ));
         } else {
-            assert!(matches!(resumed, Ok(NativeResume::Returned(_))));
+            assert!(
+                matches!(resumed, Ok(NativeResume::Returned(_))),
+                "{}",
+                match &resumed {
+                    Ok(NativeResume::NoPending) => "NoPending",
+                    Ok(NativeResume::RetrySyscall) => "RetrySyscall",
+                    Ok(NativeResume::Returned(_)) => "Returned",
+                    Ok(NativeResume::Left(_)) => "Left",
+                    Ok(NativeResume::Invalid) => "Invalid",
+                    Err(_) => "Err",
+                }
+            );
         }
     };
     reenter(true);
@@ -5167,6 +5257,12 @@ fn host_request_during_service_park_yields_then_reparks() {
     assert_eq!(queue.native_service_member(record), Some(identity));
     drop(queue);
     assert!(fixture.task.service_notice.take().unwrap().is_none());
+    if expected_entry == OwnerEntry::Exception {
+        // The exception arm's contract ends at the exact repark: completion of
+        // an exception service is not a syscall return.
+        drop(ticket);
+        return;
+    }
     ticket
         .complete(true)
         .unwrap_or_else(|_| panic!("yielded service ticket was cancelled"));
@@ -5215,9 +5311,12 @@ fn host_request_during_owner_wait_park_yields_then_reparks() {
         zone: fixture.zone,
         slot: fixture.slot,
     };
-    fixture
-        .zone
-        .requeue_preempted(fixture.slot, fixture.record.id);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, fixture.record.id)
+            .is_queued()
+    );
     assert_eq!(
         fixture.zone.switch_in(fixture.slot),
         Some(fixture.record.id)
