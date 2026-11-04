@@ -629,6 +629,154 @@ mod allocator_stats_tests {
     }
 
     #[test]
+    fn inventory_permit_rejects_foreign_completion_owner_without_consuming_authority() {
+        use carrick_kernel::kernel::{ObjectIdRegistry, frame_inventory::FrameInventoryAuthority};
+        let _guard = global_frame_allocator_test_lock().lock();
+        let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+        let (base, owner) = grant_owned_for_mm(&custody, El1FrameGrantMm::new(41).unwrap());
+        let (_, peer) = grant_owned_for_mm(&custody, El1FrameGrantMm::new(42).unwrap());
+        let inventory = std::sync::Arc::new(FrameInventoryAuthority::new());
+        let ids = ObjectIdRegistry::new();
+        let identity = carrick_hal::FrameBackingIdentity::from_allocator(
+            carrick_guest_arch::FrameGpa::new(base),
+            core::num::NonZeroU64::new(owner.generation()).unwrap(),
+            carrick_hal::FrameLength::from_mapping_extent(
+                core::num::NonZeroU64::new(owner.length()).unwrap(),
+            ),
+        );
+        let permit = inventory
+            .claim_unused_backing(&ids, identity)
+            .unwrap()
+            .unwrap();
+        let frame = permit.frame();
+        let other_carrier = CarrierVmCustody::new_live_fixture();
+        let permit =
+            retire_global_frame_with_inventory_permit(&other_carrier, owner.clone(), permit)
+                .expect_err("numeric physical identity does not authorize another carrier");
+        let permit = retire_global_frame_with_inventory_permit(&custody, peer.clone(), permit)
+            .expect_err("another MM's owner cannot receive this completion authority");
+        assert_eq!(permit.frame(), frame);
+        assert_eq!(permit.backing(), identity);
+        assert!(!owner.snapshot().unwrap().retirement_requested);
+        assert!(!peer.snapshot().unwrap().retirement_requested);
+        assert!(owner.inventory_retirement.lock().is_none());
+        assert!(peer.inventory_retirement.lock().is_none());
+        assert!(
+            inventory
+                .claim_unused_backing(&ids, identity)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(inventory.abandoned_retirement_permits(), 0);
+        // The original permit remains usable by the exact owner after refusal.
+        let _pin = owner.pin().unwrap();
+        assert!(matches!(
+            retire_global_frame_host_owner_if_generation_in_using(
+                &custody,
+                base,
+                owner.length(),
+                owner.generation(),
+                &mut |_, _| Ok(()),
+            ),
+            GlobalFrameRetirementOutcome::DeferredActivePins { .. }
+        ));
+        // Same-generation RetirementPending is existing work, not staleness.
+        retire_global_frame_with_inventory_permit(&custody, owner.clone(), permit).unwrap();
+        assert!(owner.inventory_retirement.lock().is_some());
+        assert!(peer.inventory_retirement.lock().is_none());
+        assert_eq!(inventory.abandoned_retirement_permits(), 0);
+    }
+
+    #[test]
+    fn stale_inventory_permit_preserves_successor_and_returns_original_authority() {
+        use carrick_kernel::kernel::{ObjectIdRegistry, frame_inventory::FrameInventoryAuthority};
+        let _guard = global_frame_allocator_test_lock().lock();
+        let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+        let (_, predecessor) = grant_owned_for_mm(&custody, El1FrameGrantMm::new(41).unwrap());
+        let (base, successor) = grant_owned_for_mm(&custody, El1FrameGrantMm::new(42).unwrap());
+        assert_ne!(predecessor.generation(), successor.generation());
+        let inventory = std::sync::Arc::new(FrameInventoryAuthority::new());
+        let ids = ObjectIdRegistry::new();
+        let stale = carrick_hal::FrameBackingIdentity::from_allocator(
+            carrick_guest_arch::FrameGpa::new(base),
+            core::num::NonZeroU64::new(predecessor.generation()).unwrap(),
+            carrick_hal::FrameLength::from_mapping_extent(
+                core::num::NonZeroU64::new(successor.length()).unwrap(),
+            ),
+        );
+        let permit = inventory
+            .claim_unused_backing(&ids, stale)
+            .unwrap()
+            .unwrap();
+        let frame = permit.frame();
+        let permit = retire_global_frame_with_inventory_permit(&custody, successor.clone(), permit)
+            .expect_err("stale generation cannot transfer authority to the live successor");
+        assert_eq!(permit.frame(), frame);
+        assert_eq!(permit.backing(), stale);
+        assert!(!successor.snapshot().unwrap().retirement_requested);
+        assert!(successor.inventory_retirement.lock().is_none());
+        assert!(
+            inventory
+                .claim_unused_backing(&ids, stale)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(inventory.abandoned_retirement_permits(), 0);
+        drop(permit);
+        assert_eq!(inventory.abandoned_retirement_permits(), 1);
+        assert!(
+            inventory
+                .claim_unused_backing(&ids, stale)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn absent_backend_owner_returns_unconsumed_inventory_permit() {
+        use carrick_kernel::kernel::{ObjectIdRegistry, frame_inventory::FrameInventoryAuthority};
+        let _guard = global_frame_allocator_test_lock().lock();
+        let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+        let (base, owner) = grant_owned_for_mm(&custody, El1FrameGrantMm::new(41).unwrap());
+        let inventory = std::sync::Arc::new(FrameInventoryAuthority::new());
+        let ids = ObjectIdRegistry::new();
+        let identity = carrick_hal::FrameBackingIdentity::from_allocator(
+            carrick_guest_arch::FrameGpa::new(base),
+            core::num::NonZeroU64::new(owner.generation()).unwrap(),
+            carrick_hal::FrameLength::from_mapping_extent(
+                core::num::NonZeroU64::new(owner.length()).unwrap(),
+            ),
+        );
+        let permit = inventory
+            .claim_unused_backing(&ids, identity)
+            .unwrap()
+            .unwrap();
+        assert!(
+            retire_global_frame_host_owner_if_generation_in_using(
+                &custody,
+                base,
+                owner.length(),
+                owner.generation(),
+                &mut |_, _| Ok(()),
+            )
+            .is_retired()
+        );
+        let permit = retire_global_frame_with_inventory_permit(&custody, owner.clone(), permit)
+            .expect_err("directory absence is not accepted physical completion custody");
+        assert_eq!(permit.backing(), identity);
+        assert!(owner.inventory_retirement.lock().is_none());
+        assert!(
+            inventory
+                .claim_unused_backing(&ids, identity)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(inventory.abandoned_retirement_permits(), 0);
+        drop(permit);
+        assert_eq!(inventory.abandoned_retirement_permits(), 1);
+    }
+
+    #[test]
     fn inventory_permit_install_after_idle_empty_check_reenrolls_owner() {
         use carrick_kernel::kernel::{ObjectIdRegistry, frame_inventory::FrameInventoryAuthority};
         let _guard = global_frame_allocator_test_lock().lock();
@@ -3827,23 +3975,40 @@ pub(crate) fn retire_global_frame_with_inventory_permit(
     custody: &CarrierVmCustody,
     owner: std::sync::Arc<GlobalFrameHostOwner>,
     permit: carrick_hal::FrameRetirementPermit,
-) {
+) -> Result<(), carrick_hal::FrameRetirementPermit> {
+    let identity = permit.backing();
+    if !owner
+        .custody
+        .upgrade()
+        .is_some_and(|issuing| core::ptr::eq(issuing.as_ref(), custody))
+        || owner.ipa() != identity.ipa().raw()
+        || owner.length() != identity.length().raw()
+        || owner.generation() != identity.host_owner_generation().get()
+    {
+        return Err(permit);
+    }
     let pending = permit.retire(|identity| {
-        let _ = retire_global_frame_host_owner_if_generation_in(
+        let outcome = retire_global_frame_host_owner_if_generation_in(
             custody,
             identity.ipa().raw(),
             identity.length().raw(),
             identity.host_owner_generation().get(),
         );
-        // The exact physical owner above retains its completion, including
-        // a pending pin drain or a retryable backend unmap.
-        Ok::<_, core::convert::Infallible>(())
+        match outcome {
+            GlobalFrameRetirementOutcome::RetiredUnmapped { .. }
+            | GlobalFrameRetirementOutcome::TerminalizedByVmDestroy { .. }
+            | GlobalFrameRetirementOutcome::DeferredActivePins { .. }
+            | GlobalFrameRetirementOutcome::RetryPending { .. } => Ok(()),
+            GlobalFrameRetirementOutcome::NotFound { .. }
+            | GlobalFrameRetirementOutcome::MismatchedGeneration { .. } => Err(()),
+        }
     });
     let pending = match pending {
         Ok(pending) => pending,
-        Err((_, never)) => match never {},
+        Err((permit, ())) => return Err(permit),
     };
     retain_inventory_retirement(custody, owner, pending);
+    Ok(())
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

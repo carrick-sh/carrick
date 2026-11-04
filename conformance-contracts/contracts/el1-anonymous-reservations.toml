@@ -23,6 +23,7 @@ rationale = "EL1 increment 2 anonymous reservation checkpoint (TASK 1). Under th
 
 [bindings]
 vm_free = [
+  "carrick-vmm-hvf::trap::global_frame::allocator_stats_tests::{inventory_permit_rejects_foreign_completion_owner_without_consuming_authority,stale_inventory_permit_preserves_successor_and_returns_original_authority,absent_backend_owner_returns_unconsumed_inventory_permit} (production permit transfer authenticates carrier and physical owner; refusal retains original authority; macOS execution required)",
   "carrick-core::mm::retirement::nonce_tests::release_record_pin_outcome_classifies_held_premapped_and_predecessor (last requested mapped pin yields neutral ReadyToRetry; premapped safe-point retirement and superseded predecessors retain their existing verdicts)",
   "carrick-core-abi::mm::inventory::tests::{mm_release_requires_empty_inventory_and_preserves_exact_owner,mm_release_join_rejects_foreign_origin_owner_revision_and_transaction} (two-half receipt identity only; backend permit consumption remains pending)",
   "carrick-thread::physical_retirement::tests (S2b exact-record completion enrollment, release-before-enrollment, identity/reuse control, cancellation, deferred callback publication, typed producer abandonment and revocation of captured callbacks; no native Pending ACK or service-budget claim)",

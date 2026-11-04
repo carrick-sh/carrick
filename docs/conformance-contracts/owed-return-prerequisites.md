@@ -248,3 +248,30 @@ construction and logarithmic physical-index operations. Receipt attachment
 sorts the frame population once and uses binary searches, avoiding a quadratic
 scan for large MMs. Backend consumption and production receipt joining,
 C2's remaining candidate check and legacy ratchet, and slice 2b remain open.
+
+### Exact backend completion custody (partial B1)
+
+The existing HVF permit consumer now authenticates the completion owner's
+carrier, IPA, extent length and allocator generation before requesting physical
+retirement. Backend absence or a changed generation returns the original
+unconsumed permit. It cannot attach that permit's publication exclusion to a
+foreign physical owner. Accepted pending retirement still uses the existing
+pin-drain owner; no lock, retry loop or completion venue is added.
+
+The production-entry witnesses cover a second MM's live backing owner, a foreign
+carrier, a stale generation and backend refusal after inventory admission. Refusal keeps
+the original permit and excludes new publication. The backing-owner witness then
+transfers that same permit to its exact owner. Explicit abandonment remains
+counted and keeps publication excluded. The final backing destructor cannot
+retry a refused transfer and uses that existing fail-closed abandonment rule.
+These tests need macOS execution; cross-compilation alone is not a behavioral
+red/green result. Transfer adds constant-time identity checks.
+
+This is a bounded ownership correction in the current production consumer,
+not whole-MM release integration. B1–B3 still need retained in-progress MM
+release state, backend permit consumption and receipt joining in HVF and CPL0.
+C2's candidate admission and ratchet also remain open. In particular, adding a
+zero-kernel-reference check to terminal candidate retirement would be wrong:
+that path publishes its own inventory unmaps after physical cleanup. Keep the
+draft incomplete. The earlier EL1 truncation and runtime failures remain failed
+evidence until attributed against admitted main with complete populations.

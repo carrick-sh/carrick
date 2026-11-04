@@ -242,7 +242,14 @@ impl Drop for NativeFrameBacking {
                 // eventual release. The global directory keeps its bytes live.
                 return;
             };
-            crate::trap::retire_global_frame_with_inventory_permit(&carrier, owner, permit);
+            if let Err(permit) =
+                crate::trap::retire_global_frame_with_inventory_permit(&carrier, owner, permit)
+            {
+                // Drop cannot retry a refused transfer. Abandonment counts the
+                // failure and retains publication exclusion in the inventory;
+                // it must never attach this authority to a successor owner.
+                drop(permit);
+            }
         }
     }
 }
