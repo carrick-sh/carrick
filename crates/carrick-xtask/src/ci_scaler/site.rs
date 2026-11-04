@@ -1,10 +1,13 @@
-//! The Proxmox hosts a KVM clone controller may run on. Selection is by the
+//! The Proxmox hosts a KVM clone controller may run on: Willow (DHCP LAN,
+//! LVM thin pool, KVM clones only), Contabo and carrick-hz (private NAT
+//! bridges with static addresses, KVM and agent clones). Selection is by the
 //! host's own `/etc/hostname` and fails closed: an unknown host never borrows
 //! another site's node, storage, bridge or protected-VM set.
 
 use super::ScalerError;
 
-/// The only agent base images admitted by the Contabo rollout contract.
+/// The only agent base images admitted by the agent-site rollout contract
+/// (the same blue/green slots on every site that has an agent template).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentTemplate {
     Blue,
@@ -36,6 +39,10 @@ pub(super) enum Headroom {
     LvmThin { pool: &'static str },
     /// A PVE directory storage: available bytes from the PVE storage status API.
     Directory,
+    /// A PVE `zfspool` storage: available bytes from the same PVE storage
+    /// status API as [`Headroom::Directory`]. Disks are zvols, so the
+    /// template's disk format is `raw`.
+    ZfsPool,
 }
 
 /// How a clone (and the template while it is built) gets its IPv4 address.
@@ -62,6 +69,9 @@ pub(super) enum Network {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Site {
     pub lane: super::CloneLane,
+    /// The agent base image this site clones agent VMs from. `None` = the
+    /// site runs KVM clones only and [`Site::for_lane`] refuses the agent
+    /// lane there; any site with a template (Contabo, carrick-hz) admits it.
     pub agent_template: Option<AgentTemplate>,
     /// `/etc/hostname`, which is also the PVE node name.
     pub node: &'static str,
@@ -75,6 +85,7 @@ pub(super) struct Site {
     pub headroom: Headroom,
     /// Bridge the template's (and so every clone's) `net0` must use.
     pub bridge: &'static str,
+    /// DHCP (Willow) or a private static bridge (Contabo, carrick-hz).
     pub network: Network,
     pub cores: u32,
     pub memory_mib: u64,
@@ -122,7 +133,33 @@ pub(super) const CONTABO: Site = Site {
     protected: &[101, 102, 103, 104, 9000, 9001],
 };
 
-pub(super) const SITES: [Site; 2] = [WILLOW, CONTABO];
+/// The Hetzner host carrick-hz (issue #1591): Contabo's layout on its own
+/// /24 behind NAT bridge `vmbr1` (no DHCP), with clones on PVE `zfspool`
+/// storage `tank-vm` (sparse ZFS dataset `tank/vm`). No fixed worker VMs
+/// live here, so only the agent template slots are protected. The PVE node
+/// certificate's only name is `DNS:carrick-hz`.
+pub(super) const HETZNER: Site = Site {
+    lane: super::CloneLane::Kvm,
+    agent_template: Some(AgentTemplate::Blue),
+    node: "carrick-hz",
+    api_host: "carrick-hz",
+    api_ca: Some("/etc/pve/pve-root-ca.pem"),
+    storage: "tank-vm",
+    headroom: Headroom::ZfsPool,
+    bridge: "vmbr1",
+    network: Network::Static {
+        subnet: [10, 78, 0],
+        gateway: 1,
+        nameserver: "1.1.1.1",
+        host_public: "2.29.243.212",
+    },
+    cores: 8,
+    memory_mib: 16384,
+    disk_gib: 100,
+    protected: &[9000, 9001],
+};
+
+pub(super) const SITES: [Site; 3] = [WILLOW, CONTABO, HETZNER];
 
 impl Site {
     pub(super) fn template(&self) -> Result<u16, ScalerError> {
@@ -134,7 +171,7 @@ impl Site {
                 .ok_or(ScalerError::Guard("site has no agent template")),
         }
     }
-    /// Builder override: approved inactive slots are allowed only on the agent site.
+    /// Builder override: approved inactive slots are allowed only on an agent site.
     pub(super) fn with_template(mut self, vmid: Option<u16>) -> Result<Self, ScalerError> {
         if let Some(vmid) = vmid {
             if self.lane != super::CloneLane::Agent || self.agent_template.is_none() {
@@ -145,16 +182,21 @@ impl Site {
         Ok(self)
     }
 
+    /// The site's row re-read from [`SITES`] for `lane`. The agent lane is
+    /// admitted only where that table row names an agent template, so a
+    /// caller's copy cannot confer agent eligibility on a KVM-only site.
     pub(super) fn for_lane(self, lane: super::CloneLane) -> Result<Self, ScalerError> {
         let mut site = Self::for_hostname(self.node)?;
-        site.agent_template = self.agent_template;
         if lane == super::CloneLane::Agent {
-            if site.node != CONTABO.node {
-                return Err(ScalerError::Guard("agent clones require Contabo"));
+            if site.agent_template.is_none() {
+                return Err(ScalerError::Guard(
+                    "agent clones require a site with an agent template",
+                ));
             }
             site.cores = 8;
             site.memory_mib = 20480;
         }
+        site.agent_template = self.agent_template;
         site.lane = lane;
         Ok(site)
     }
@@ -337,7 +379,8 @@ impl Site {
     /// value is a bare token (no quoting needed); the script validates each.
     pub(super) fn shell_env(&self) -> Result<String, ScalerError> {
         let disk_format = match self.headroom {
-            Headroom::LvmThin { .. } => "raw",
+            // Thin LVs and zvols are block devices: raw disks only.
+            Headroom::LvmThin { .. } | Headroom::ZfsPool => "raw",
             Headroom::Directory => "qcow2",
         };
         Ok(format!(
@@ -616,6 +659,13 @@ OUT ACCEPT -dest 0.0.0.0/0 -log nolog # remaining IPv4 through the NAT gateway\n
             // The pre-rename node name no longer selects a site.
             "m28112",
             "m28112.contaboserver.net",
+            // carrick-hz matches only its exact node name.
+            "Carrick-hz",
+            "carrick-h",
+            "carrick-hz2",
+            "carrick-hz.",
+            "carrick-hz.evil.example",
+            "hz",
         ] {
             assert!(
                 matches!(Site::for_hostname(host), Err(ScalerError::Guard(_))),
@@ -628,8 +678,110 @@ OUT ACCEPT -dest 0.0.0.0/0 -log nolog # remaining IPv4 through the NAT gateway\n
         for (i, a) in SITES.iter().enumerate() {
             for b in &SITES[i + 1..] {
                 assert_ne!(a.node, b.node);
+                // No name selects two sites (carrick-hz's node is its API host).
+                for name in [a.node, a.api_host] {
+                    assert!(name != b.node && name != b.api_host, "{name}");
+                }
             }
             assert!(a.protected.iter().all(|id| !(300..=349).contains(id)));
         }
+    }
+    #[test]
+    fn hetzner_row_is_pinned_and_selected_by_its_node_name() {
+        assert_eq!(
+            HETZNER,
+            Site {
+                lane: super::super::CloneLane::Kvm,
+                agent_template: Some(AgentTemplate::Blue),
+                node: "carrick-hz",
+                api_host: "carrick-hz",
+                api_ca: Some("/etc/pve/pve-root-ca.pem"),
+                storage: "tank-vm",
+                headroom: Headroom::ZfsPool,
+                bridge: "vmbr1",
+                network: Network::Static {
+                    subnet: [10, 78, 0],
+                    gateway: 1,
+                    nameserver: "1.1.1.1",
+                    host_public: "2.29.243.212",
+                },
+                cores: 8,
+                memory_mib: 16384,
+                disk_gib: 100,
+                protected: &[9000, 9001],
+            }
+        );
+        assert_eq!(Site::for_hostname("carrick-hz").unwrap(), HETZNER);
+        assert_eq!(Site::for_hostname("carrick-hz\n").unwrap(), HETZNER);
+        assert_eq!(
+            HETZNER.api_url("/pools/carrick-ci"),
+            "https://carrick-hz:8006/api2/json/pools/carrick-ci"
+        );
+        assert_eq!(HETZNER.api_resolve(), "carrick-hz:8006:127.0.0.1");
+        assert_eq!(HETZNER.qemu(308), "/nodes/carrick-hz/qemu/308");
+        assert_eq!(HETZNER.task_prefix(), "UPID:carrick-hz:");
+        assert!(HETZNER.isolates_bridge() && !HETZNER.allows_ksm());
+        assert_eq!(
+            HETZNER.ipconfig(349).unwrap(),
+            "ip=10.78.0.149/24,gw=10.78.0.1"
+        );
+        assert!(HETZNER.ipconfig(299).is_err() && HETZNER.ipconfig(350).is_err());
+    }
+    #[test]
+    fn hetzner_template_builder_inputs_are_pinned() {
+        assert_eq!(
+            HETZNER.shell_env().unwrap(),
+            "SITE_NODE=carrick-hz\nSITE_API_HOST=carrick-hz\nSITE_STORAGE=tank-vm\nSITE_DISK_FORMAT=raw\nSITE_BRIDGE=vmbr1\nSITE_CORES=8\nSITE_MEMORY_MIB=16384\nSITE_DISK_GIB=100\nSITE_TEMPLATE_IPCONFIG=ip=10.78.0.100/24,gw=10.78.0.1\nSITE_NAMESERVER=1.1.1.1\nSITE_VM_FIREWALL=1\nSITE_API_CA=/etc/pve/pve-root-ca.pem\nSITE_ALLOW_KSM=0\nSITE_TEMPLATE_VMID=300\n"
+        );
+        let agent = HETZNER.for_lane(super::super::CloneLane::Agent).unwrap();
+        assert_eq!(
+            agent.shell_env().unwrap(),
+            "SITE_NODE=carrick-hz\nSITE_API_HOST=carrick-hz\nSITE_STORAGE=tank-vm\nSITE_DISK_FORMAT=raw\nSITE_BRIDGE=vmbr1\nSITE_CORES=8\nSITE_MEMORY_MIB=20480\nSITE_DISK_GIB=100\nSITE_TEMPLATE_IPCONFIG=ip=10.78.0.150/24,gw=10.78.0.1\nSITE_NAMESERVER=1.1.1.1\nSITE_VM_FIREWALL=1\nSITE_API_CA=/etc/pve/pve-root-ca.pem\nSITE_ALLOW_KSM=0\nSITE_TEMPLATE_VMID=9000\n"
+        );
+        let green = agent.with_template(Some(9001)).unwrap();
+        assert!(
+            green
+                .shell_env()
+                .unwrap()
+                .contains("SITE_TEMPLATE_IPCONFIG=ip=10.78.0.151/24,gw=10.78.0.1\n")
+        );
+    }
+    #[test]
+    fn hetzner_vm_firewall_blocks_its_own_public_address() {
+        assert_eq!(
+            HETZNER.vm_firewall_file(308).unwrap().unwrap(),
+            "[OPTIONS]\nenable: 1\npolicy_in: DROP\npolicy_out: DROP\nipfilter: 1\nmacfilter: 1\n\n[IPSET ipfilter-net0]\n10.78.0.108\n\n[RULES]\n\
+IN ACCEPT -source 10.78.0.1 -p tcp -dport 22 -log nolog # controller SSH from the host\n\
+OUT DROP -dest 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,100.64.0.0/10,2.29.243.212 -log nolog # no private, shared, link-local or host destination\n\
+OUT ACCEPT -dest 0.0.0.0/0 -log nolog # remaining IPv4 through the NAT gateway\n"
+        );
+        assert!(HETZNER.vm_firewall_file(350).is_err());
+    }
+    #[test]
+    fn agent_lane_requires_a_site_with_an_agent_template() {
+        use super::super::CloneLane;
+        assert!(matches!(
+            WILLOW.for_lane(CloneLane::Agent),
+            Err(ScalerError::Guard(
+                "agent clones require a site with an agent template"
+            ))
+        ));
+        // A caller's copy cannot make a KVM-only site agent-capable: the rule
+        // reads the table row.
+        let forged = Site {
+            agent_template: Some(AgentTemplate::Blue),
+            ..WILLOW
+        };
+        assert!(forged.for_lane(CloneLane::Agent).is_err());
+        for row in [CONTABO, HETZNER] {
+            let agent = row.for_lane(CloneLane::Agent).unwrap();
+            assert_eq!(agent.lane, CloneLane::Agent);
+            assert_eq!(agent.node, row.node);
+            assert_eq!(agent.template().unwrap(), 9000);
+            assert_eq!((agent.cores, agent.memory_mib), (8, 20480));
+            assert_eq!(agent.protected, row.protected);
+            assert_eq!(agent.for_lane(CloneLane::Kvm).unwrap(), row);
+        }
+        assert_eq!(WILLOW.for_lane(CloneLane::Kvm).unwrap(), WILLOW);
     }
 }

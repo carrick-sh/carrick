@@ -947,8 +947,18 @@ fn storage_floor(pending: Pending) -> u64 {
     (150 << 30) + u64::from(pending.clones) * (20 << 30)
 }
 fn storage_headroom(pve: &Pve, pending: Pending) -> Result<bool, ScalerError> {
-    let free_needed = storage_floor(pending);
-    match pve.site.headroom {
+    storage_headroom_with(&pve.site, storage_floor(pending), |path| {
+        pve.request(PveCall::Get, path)
+    })
+}
+/// [`storage_headroom`] for `site`, reading PVE storage status through
+/// `status` (a GET of the given API path).
+fn storage_headroom_with(
+    site: &Site,
+    free_needed: u64,
+    status: impl FnOnce(&str) -> Result<Value, ScalerError>,
+) -> Result<bool, ScalerError> {
+    match site.headroom {
         Headroom::LvmThin { pool } => {
             let output = execute(
                 Command::new("lvs").args([
@@ -975,20 +985,20 @@ fn storage_headroom(pve: &Pve, pending: Pending) -> Result<bool, ScalerError> {
             let free = number("lv_size")? * (1.0 - number("data_percent")? / 100.0);
             Ok(free >= free_needed as f64 && number("metadata_percent")? < 80.0)
         }
-        Headroom::Directory => {
-            let status = pve.request(
-                PveCall::Get,
-                &format!(
-                    "/nodes/{}/storage/{}/status",
-                    pve.site.node, pve.site.storage
-                ),
-            )?;
+        // PVE reports a zfspool's free space (the dataset's ZFS `available`)
+        // through the same status API as a directory storage.
+        Headroom::Directory | Headroom::ZfsPool => {
+            let status = status(&format!(
+                "/nodes/{}/storage/{}/status",
+                site.node, site.storage
+            ))?;
             directory_headroom(&status, free_needed)
         }
     }
 }
-/// A directory storage admits a clone only while active, enabled and with at
-/// least `free` bytes available.
+/// A PVE storage polled through its status API (directory or ZFS pool)
+/// admits a clone only while active, enabled and with at least `free` bytes
+/// available.
 fn directory_headroom(status: &Value, free: u64) -> Result<bool, ScalerError> {
     if status["active"].as_u64() != Some(1) || status["enabled"].as_u64() != Some(1) {
         return Err(ScalerError::Guard("clone storage is not active"));
@@ -3674,6 +3684,34 @@ mod tests {
         assert!(directory_headroom(&status(0, free * 4), free).is_err());
         assert!(directory_headroom(&json!({"active":1,"enabled":1}), free).is_err());
         assert!(directory_headroom(&json!({"active":1,"enabled":0,"avail":free}), free).is_err());
+    }
+    #[test]
+    fn zfs_pool_storage_admits_only_active_storage_above_the_floor() {
+        let site = super::site::HETZNER;
+        assert_eq!(site.headroom, Headroom::ZfsPool);
+        let floor = storage_floor(Pending {
+            clones: 2,
+            ..Pending::default()
+        });
+        assert_eq!(floor, 190 << 30);
+        let headroom = |status: Value| {
+            storage_headroom_with(&site, floor, |path| {
+                assert_eq!(path, "/nodes/carrick-hz/storage/tank-vm/status");
+                Ok(status)
+            })
+        };
+        let status = |active: u64, enabled: u64, avail: u64| json!({"type":"zfspool","active":active,"enabled":enabled,"avail":avail});
+        assert!(headroom(status(1, 1, floor)).unwrap());
+        // Below the floor defers admission; it is not an error.
+        assert!(!headroom(status(1, 1, floor - 1)).unwrap());
+        // Inactive or disabled storage, or no statistics, is refused.
+        assert!(headroom(status(0, 1, floor * 4)).is_err());
+        assert!(headroom(status(1, 0, floor * 4)).is_err());
+        assert!(headroom(json!({"active":1,"enabled":1})).is_err());
+        // A failed status read propagates instead of admitting.
+        assert!(
+            storage_headroom_with(&site, floor, |_| Err(ScalerError::Guard("pve down"))).is_err()
+        );
     }
     #[test]
     fn shared_readiness_deadline_bounds_a_nested_external_command() {
