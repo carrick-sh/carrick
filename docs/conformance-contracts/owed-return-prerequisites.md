@@ -388,3 +388,25 @@ that a host DENIED response supplies a continuation would be incorrect.
 Keep this checkpoint draft. Unaccepted-permit final destruction, complete
 partial-admission rollback, HVF backend receipt joining, B1–B3/C2 acceptance,
 slice 2b and the earlier unattributed EL1/runtime failures remain open.
+
+
+### Continuation admission: rebase verification is blocked
+
+The continuation preserves all 28 prerequisite commits. The two contract
+binding conflicts were additive: keep both the new refusal-census binding
+and the existing physical-retirement witnesses. No implementation was
+removed to resolve them.
+
+The first post-rebase focused build fails the EL1 stack gate before tests
+start: the native backing reply envelope is 10,302 bytes, while the retained
+11,311-byte ceiling requires 1,024 bytes of reserve (effective maximum
+10,287). The admitted-main image build reports 10,270 bytes and passes.
+Do not weaken either the ceiling or the reserve, or report a zero-failure
+population for binaries that did not build.
+
+Rebase verification must become green before this continuation adds either
+HVF backend receipt joining or the unpublished-abort continuation. Both remain
+open. In particular, a boolean backend result is not a joined receipt, and
+retaining abort custody is not a notification-backed retry venue. CPL0
+receipt joining and VM-destruction custody are retained unchanged. C2 and
+slice 2b remain outside this continuation.
