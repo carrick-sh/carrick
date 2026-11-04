@@ -1128,3 +1128,125 @@ pub fn run<W: Write>(
     })?;
     Ok(outputs)
 }
+
+/// Dry-run the infrastructure classification used by the ci-ok summary.
+/// This never mutates a run or licenses a cancelled dependency to pass.
+#[derive(Args, Debug)]
+pub struct StarvedJobsArgs {
+    /// Unmodified response from GET actions/runs/{run_id}/jobs?per_page=100.
+    #[arg(long)]
+    pub jobs: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct JobPage {
+    total_count: usize,
+    jobs: Vec<ActionJob>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActionJob {
+    id: u64,
+    name: String,
+    status: String,
+    conclusion: Option<String>,
+    // Missing metadata is unknown, never evidence of runner starvation.
+    runner_name: Option<String>,
+    steps: Option<Vec<ActionStep>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActionStep {
+    status: String,
+    started_at: Option<String>,
+}
+
+impl ActionJob {
+    fn never_assigned_cancelled(&self) -> bool {
+        self.status == "completed"
+            && self.conclusion.as_deref() == Some("cancelled")
+            && self.runner_name.as_deref() == Some("")
+            && self.steps.as_ref().is_some_and(|steps| {
+                steps
+                    .iter()
+                    .all(|step| step.started_at.is_none() && step.status == "queued")
+            })
+    }
+}
+
+pub fn starved_jobs<W: Write>(args: StarvedJobsArgs, writer: &mut W) -> Result<(), CiChangesError> {
+    let bytes = fs::read(&args.jobs).map_err(|source| CiChangesError::Io {
+        path: args.jobs.clone(),
+        source,
+    })?;
+    let page: JobPage = serde_json::from_slice(&bytes)
+        .map_err(|err| CiChangesError::Git(format!("parse jobs: {err}")))?;
+    if page.jobs.len() != page.total_count {
+        return Err(CiChangesError::Git(
+            "incomplete jobs response; fetch every page before classifying".into(),
+        ));
+    }
+    for job in page.jobs {
+        if matches!(job.conclusion.as_deref(), Some("cancelled" | "failure")) {
+            let disposition = if job.never_assigned_cancelled() {
+                "retry-eligible: cancelled before runner assignment; retry once after run completion"
+            } else {
+                "fail: started, failed, or assignment metadata unknown"
+            };
+            writeln!(writer, "{} ({}): {disposition}", job.name, job.id).map_err(|source| {
+                CiChangesError::Io {
+                    path: PathBuf::from("stdout"),
+                    source,
+                }
+            })?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod starved_job_tests {
+    use super::*;
+
+    fn classify(value: serde_json::Value) -> bool {
+        serde_json::from_value::<ActionJob>(value)
+            .expect("job fixture")
+            .never_assigned_cancelled()
+    }
+
+    #[test]
+    fn never_assigned_cancelled_is_retry_eligible() {
+        assert!(classify(
+            serde_json::json!({"id": 1, "name": "macos-clippy", "status": "completed",
+            "conclusion": "cancelled", "runner_name": "", "steps": []})
+        ));
+    }
+
+    #[test]
+    fn started_failures_and_cancellations_fail() {
+        for conclusion in ["failure", "cancelled"] {
+            assert!(!classify(
+                serde_json::json!({"id": 1, "name": "macos-clippy", "status": "completed",
+                "conclusion": conclusion, "runner_name": "runner", "steps": [
+                    {"status": "completed", "started_at": "2026-11-04T16:20:39Z"}]})
+            ));
+        }
+    }
+
+    #[test]
+    fn missing_metadata_and_started_steps_fail_closed() {
+        for extra in [
+            serde_json::json!({}),
+            serde_json::json!({"runner_name": "", "steps": null}),
+            serde_json::json!({"runner_name": "", "steps": [{"status": "completed", "started_at": "2026-11-04T16:20:39Z"}]}),
+            serde_json::json!({"runner_name": "assigned", "steps": []}),
+        ] {
+            let mut job = serde_json::json!({"id": 1, "name": "macos-clippy", "status": "completed", "conclusion": "cancelled"});
+            job.as_object_mut()
+                .expect("object")
+                .extend(extra.as_object().expect("object").clone());
+            assert!(!classify(job));
+        }
+    }
+}
