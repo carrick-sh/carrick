@@ -568,3 +568,67 @@ Open work remains explicit:
 All 24 inherited commits are kept; the admitted-main rebase was already
 satisfied, with no conflicts, ported commits or dropped commits. No earlier
 failed or unavailable gate is promoted by these component witnesses.
+
+## Fork-abort continuation and return-channel audit
+
+The next continuation has two separate obligations: rollback must retain its
+phase, and physical-release refusal must retain an operation with an exact
+release notification. The current production path satisfies neither obligation
+end to end. This is implementation work, not a request for another design
+approval. The notification-backed abort and partial-admission transaction remain
+P1 acceptance blockers.
+
+`NativeProcessEntry::fork_publish` returns a failed publication's birth
+reservation before calling `NativeProcessService::abort_mm`. On refusal it
+quarantines the returned preparation. Its `PendingContinuation` variants cover
+wait, IPC and vfork suspension; none retains this aborted preparation. Keeping
+`ChildMmRelease` in the carrier's pending loan therefore protects physical
+custody but cannot resume the guest operation.
+
+Both native services also cross an irreversible boundary inside `abort_mm`:
+they abort the child portal transaction, free its space entry, scrub its tables,
+then ask the carrier to return the loan. A refused last step cannot be repaired
+by re-running `abort_mm`: the child lookup now fails, or the index may name a
+successor. The continuation must retain the completed rollback phase and exact
+loan identity, and resume only the owed remainder. A new boolean recording
+successful release would not cover refusal after partial portal rollback.
+
+The stock settlement transport does not currently carry that wait authority.
+HVF returns `METADATA_GRANT_ERR_DENIED` when `release_aborted_child` refuses;
+CPL0 converts the same refusal to a trap error. `PortalOwnerWait` requires an
+exact admitted handle, cause and producer revision sampled before the failed
+probe. Neither a generic denied reply nor the already-freed child's space is
+that producer. Polling, replaying the fork syscall, or parking on an unrelated
+parent reservation notification would not close this gap.
+
+The return-channel audit distinguishes journal producers from other physical
+release obligations:
+
+- Resident `Retire`, replacing `Prepare`, and `Decommit` all enter the one
+  journal producer in `serve_delegated_anonymous`. Linux reaches these through
+  munmap, brk shrink, mmap replacement and mremap shrink. Decommit has a core
+  API, but this audit found no Linux caller. Ordinary host reconciliation
+  still uses sequence acknowledgement; epoch/cursor chunk settlement is 2b.
+- Both final-root retirement callers still discard `RetiredJournal` after
+  eager clearing. Delayed acknowledgement through a joined whole-MM release
+  is 2b. CPL0's joined backend receipt does not change those callers.
+- Unused first-touch stock joins host reconciliation, outside the deferred
+  journal. The minimal 2b host port must preserve restoration on backend
+  failure, as well as its mapping-metadata cleanup.
+- Admitted fork aborts retain `ChildMmRelease` in the loan. Pre-admission
+  rollback still uses the receipt-only path. Neither is a completed
+  notification-backed runtime continuation; both belong to the outstanding
+  fork-abort correction above, rather than being classified as 2b work.
+- Native backing replies already have their own owned publication/rollback
+  channel. They are not deferred journal records. COW completion settlement
+  remains separate and must precede owed-return settlement in 2b's generalized
+  exclusion hook.
+- Explicit HVF stage-2 candidate retirement still consults only the backend
+  reference registry. Its inventory-authority conversion and falling legacy
+  counter remain C2; final backing-drop permits do not replace that work.
+
+The audit does not establish settlement completeness. It names the outstanding
+channels so none can be inferred complete from the inventory witnesses or from
+a green compile check. The PR's continuation report carries source locations
+and verification populations; this note retains the ownership relationships
+without adding a line-pinned source inventory.
