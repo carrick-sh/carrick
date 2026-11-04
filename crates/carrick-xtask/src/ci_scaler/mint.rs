@@ -725,6 +725,7 @@ mod tests {
             ip: None,
             failure: None,
             quarantined: false,
+            clone_absent_since: None,
             assigned_key: Some(key),
             approved: true,
             mints: vec![],

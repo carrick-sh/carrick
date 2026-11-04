@@ -1695,6 +1695,13 @@ fn reconcile_one(
     let Some(mut row) = reconcile_target(ledger, &row.name)? else {
         return Ok(false);
     };
+    // Consume the previous observation before any fallible API query. An
+    // interrupted or inconclusive pass breaks consecutiveness, including
+    // across controller restarts. Only complete absence republishes it.
+    let previous_absence = row.clone_absent_since.take();
+    if previous_absence.is_some() {
+        update(ledger, &row, path)?;
+    }
     let lane_pve = pve.for_lane(row.lane)?;
     let pve = &lane_pve;
     let lane_admission = row.lane.admission();
@@ -1717,6 +1724,25 @@ fn reconcile_one(
         Recovery::Wait => return Ok(false),
         Recovery::Quarantine => {
             if pve.clone_never_submitted(&row)? && !gh.registration_exists(&row)? {
+                let observed = now()?;
+                if !previous_absence.is_some_and(|first| {
+                    observed
+                        .checked_sub(first)
+                        .is_some_and(|age| age >= RECONCILE_INTERVAL.as_secs())
+                }) {
+                    row.clone_absent_since = Some(
+                        previous_absence
+                            .filter(|first| *first <= observed)
+                            .unwrap_or(observed),
+                    );
+                    row.quarantined = true;
+                    recovery_note(
+                        &mut row,
+                        "quarantined: awaiting second complete clone absence observation",
+                    );
+                    update(ledger, &row, path)?;
+                    return Ok(false);
+                }
                 recovery_note(
                     &mut row,
                     "clone never submitted: no source-template qmclone task since reservation, VM, registration, assignment or storage volume",
@@ -2289,6 +2315,7 @@ fn revet_assignments(
 
 /// Controller poll period; admission retries back off separately.
 const POLL: Duration = Duration::from_secs(30);
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 
 fn verify_protected_vms(
     site: site::Site,
@@ -2407,7 +2434,7 @@ pub(super) fn controller(
     let gh = Github;
     let path = dir.join("ledger.json");
     let mut ledger = Ledger::load(&path)?;
-    let mut reconcile = Instant::now() - Duration::from_secs(60);
+    let mut reconcile = Instant::now() - RECONCILE_INTERVAL;
     let mut frozen = true;
     let mut backoff = Backoff::default();
     let mut admit_after = Instant::now();
@@ -2459,7 +2486,7 @@ pub(super) fn controller(
     };
     loop {
         ledger.refresh()?;
-        if reconcile.elapsed() >= Duration::from_secs(60) {
+        if reconcile.elapsed() >= RECONCILE_INTERVAL {
             let pass = reconcile_all(&pve, &gh, &mut ledger, dir, &path, (group, admission))?;
             if pass.finished > 0 && one_job {
                 ledger.refresh()?;
@@ -3980,6 +4007,39 @@ printf '{"data":%s}\n200' "$body"
             (1, &Admission::Standing),
         )
         .unwrap();
+        let pass = if matches!(case, "absent" | "appears") {
+            assert_eq!(pass.finished, 0, "one absence must retain the reservation");
+            assert_eq!(ledger.rows[0].state, State::Cloning);
+            assert!(ledger.rows[0].clone_absent_since.is_some());
+            let early = reconcile_all(
+                &pve,
+                &Github,
+                &mut ledger,
+                dir,
+                &path,
+                (1, &Admission::Standing),
+            )
+            .unwrap();
+            assert_eq!(early.finished, 0, "two immediate passes are insufficient");
+            ledger.rows[0].clone_absent_since = Some(now().unwrap() - RECONCILE_INTERVAL.as_secs());
+            ledger.save(&path).unwrap();
+            if case == "appears" {
+                unsafe {
+                    std::env::set_var(CHILD, "task");
+                }
+            }
+            reconcile_all(
+                &pve,
+                &Github,
+                &mut ledger,
+                dir,
+                &path,
+                (1, &Admission::Standing),
+            )
+            .unwrap()
+        } else {
+            pass
+        };
         if case == "persistent" {
             assert!(pass.frozen.is_some());
             assert_eq!(ledger.rows[0].state, State::Cloning);
@@ -4008,10 +4068,11 @@ printf '{"data":%s}\n200' "$body"
             );
             return;
         }
-        if matches!(case, "task" | "volume" | "incomplete") {
+        if matches!(case, "task" | "volume" | "incomplete" | "appears") {
             assert_eq!(pass.finished, 0);
             assert_eq!(ledger.rows[0].state, State::Cloning);
             assert!(ledger.rows[0].quarantined);
+            assert!(ledger.rows[0].clone_absent_since.is_none());
             assert!(
                 ledger.rows[0]
                     .failure
@@ -4068,12 +4129,16 @@ printf '{"data":%s}\n200' "$body"
         assert_eq!(status["admission_frozen"], false);
         assert_eq!(
             status["quarantined"].as_array().unwrap().len(),
-            usize::from(matches!(case, "task" | "volume" | "incomplete"))
+            usize::from(matches!(case, "task" | "volume" | "incomplete" | "appears"))
         );
     }
     #[test]
     fn serial_host_reconcile_absent() {
         reconcile_fixture("absent");
+    }
+    #[test]
+    fn serial_host_reconcile_appears() {
+        reconcile_fixture("appears");
     }
     #[test]
     fn serial_host_reconcile_task() {
