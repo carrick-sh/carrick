@@ -246,3 +246,23 @@ Rust `ServiceBirth`, `ExecPayloadDescriptor` and `HostFilePayloadDescriptor`
 values gain those fields. `NATIVE_SERVICE_PROTOCOL` advances once from
 main's 6 to 7; `OBJECT_WAIT_PROTOCOL` stays at main's 13. This fix round
 only refreshes the layout pin; it changes no protocol or record again.
+
+### Artifact authority and isolated policy tests
+
+Census publication uses the existing observability artifact publisher, which
+owns the host directory open, durable temporary write, no-clobber publication,
+inode verification and directory sync. The census keeps its unique name
+reservation until that publication completes. The existing terminal-publication
+and successive-carrier bindings still prove complete-file transport, distinct
+publications and propagation of I/O failures. The shared publisher's
+`artifact_publication_is_private_durable_and_no_clobber` binding additionally
+checks that writable artifact directories are refused. No authority ceiling
+increases are needed.
+
+The emission-policy test self-spawns only its exact test function to get a
+fresh environment and `OnceLock`; it bounds and reaps each child. The runtime
+process-creation inventory now lives in the portable `host_process` test module
+so every host runs the same check. It classifies this test-only call explicitly, keeping
+production host-process creation forbidden. After rebasing onto the admitted
+main, exec test calls retain the new caller-table argument alongside the
+`NativeServiceCall` census context; neither authority is dropped.

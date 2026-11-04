@@ -1188,7 +1188,14 @@ pub fn validate_authenticated_artifact(
     Ok(summary)
 }
 
-fn publish_artifact_bytes(path: &Path, bytes: &[u8]) -> Result<(), VmLifecycleArtifactError> {
+/// Publish diagnostic bytes durably without replacing an existing artifact.
+///
+/// The caller selects a final path in an existing directory that is not
+/// group- or world-writable. This owner writes and syncs a private temporary
+/// file, publishes it without clobbering, verifies its identity, and syncs the
+/// parent directory before returning. Census and lifecycle evidence share
+/// this host filesystem authority.
+pub fn publish_artifact_bytes(path: &Path, bytes: &[u8]) -> Result<(), VmLifecycleArtifactError> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
     let parent = path
