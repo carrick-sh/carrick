@@ -32,6 +32,7 @@ vm_free = [
   "carrick-el1-linux::aarch64_process_tests::first_exec_after_fork_exit_reuses_the_slot_with_a_fresh_root_incarnation (admit the successor notification source, open via the production finish path, publish exactly one Gate revision and install the successor before the refused test host settlement)",
   "carrick-el1-linux::exec_stage::tests::{partial_chunk_fault_narrows_from_known_good_offset_without_recopying,long_string_at_page_boundary_and_huge_argv_stay_within_copy_budget}",
   "carrick-el1-abi::refusal_census_tests::refusal_snapshot_preserves_caller_populations_without_changing_service_counts",
+  "carrick-el1-linux::native_process_runtime::host_test_support::{host_request_during_service_park_yields_then_reparks,host_request_during_owner_wait_park_yields_then_reparks} (#1467: entry_binding no longer turns an Occupied service or owner-wait park into NativeServiceQuarantined; the exact operation stays bound to its record across the host handback; VM-free only)",
 ]
 
 [bindings.unresolved]

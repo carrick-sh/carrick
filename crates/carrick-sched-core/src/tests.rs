@@ -2774,6 +2774,53 @@ fn host_request_wins_against_enrolled_guest_park() {
     }
 }
 
+/// #1467: an object-queue park publishes only from the claim its enrollment
+/// observed. A host request that lands after the observation (OnCpu ->
+/// OnCpuRequested, no queue lock) must refuse the park and keep the request,
+/// never be overwritten by an unconditional Parked store.
+#[test]
+fn host_request_after_observation_refuses_the_object_park() {
+    for kind in [Handback::Signal, Handback::Control, Handback::Cancelled] {
+        let zone = zone();
+        let record = park(&zone, 1, 0x1000);
+        wake(&zone, 0x1000, 1, Waker::El1 { slot: SLOT }).unwrap();
+        assert_eq!(zone.switch_in(SLOT), Some(record));
+        let original = zone.record_ref(record);
+        let observed = zone.record(record).claim();
+        assert!(matches!(observed, Claim::OnCpu { .. }));
+        let seq = zone.next_seq(record);
+        assert_eq!(
+            zone.claim_for_host(original, None, kind, &HostWait),
+            HostClaim::El1Held { slot: SLOT }
+        );
+        assert!(!zone.publish_object_park(record, seq, observed));
+        assert!(matches!(
+            zone.record(record).claim(),
+            Claim::OnCpuRequested { .. }
+        ));
+        assert!(zone.record(record).host_wanted(), "request was lost");
+        assert_eq!(zone.slot(SLOT).current(), Some(record));
+        assert_eq!(
+            zone.handback_current(SLOT, record),
+            if kind == Handback::Cancelled {
+                CurrentHandback::Retired
+            } else {
+                CurrentHandback::HandedBack
+            }
+        );
+    }
+
+    let zone = zone();
+    let record = park(&zone, 1, 0x1000);
+    wake(&zone, 0x1000, 1, Waker::El1 { slot: SLOT }).unwrap();
+    assert_eq!(zone.switch_in(SLOT), Some(record));
+    let observed = zone.record(record).claim();
+    let seq = zone.next_seq(record);
+    assert!(zone.publish_object_park(record, seq, observed));
+    assert_eq!(zone.record(record).claim(), Claim::Parked { seq });
+    assert!(!zone.record(record).host_wanted());
+}
+
 #[test]
 fn host_request_after_guest_park_claims_the_published_wait() {
     let zone = zone();
