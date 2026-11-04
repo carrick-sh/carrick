@@ -518,6 +518,83 @@ status file; they do not change the row into a quarantine verdict.
 Deployment remains a director operation: review first, announce the swap,
 retain the serving binary for rollback, and follow the controller cutover
 procedure above. Portable fixtures do not establish deployed PVE acceptance.
+### Scoped capture privilege (#1621)
+
+The owner decided on 2026-11-04 (recorded on #231) that agent clones get a
+scoped privileged path for capture rounds, and no general root. Agent
+templates built from this script therefore:
+
+- install Debian's `bpftrace`;
+- give `carrick-dispatch-agent` passwordless sudo for exactly three
+  commands through `/etc/sudoers.d/carrick-dispatch-capture`: full paths,
+  no shell, no wildcards. The text is
+  `carrick-xtask ci-scaler capture-sudoers`. `dmesg` (bare only) and
+  `journalctl -k` (exactly that argument) carry sudo's `NOEXEC` tag;
+- name `/usr/local/sbin/bpftrace` in that rule, not `/usr/bin/bpftrace`.
+  Raw bpftrace as root is general root: `-o FILE` and `--emit-elf` write
+  any file, `-c` runs a command and `--unsafe` enables `system()`. The
+  sudoers path is a root-owned copy of `carrick-xtask`. Under that name it
+  admits only `[-q] [-f text|json] [-B none|line|full] -e PROGRAM`,
+  `-l PATTERN` and `--version`. It then runs `/usr/bin/bpftrace` with a
+  cleared environment and sudo's `sudo_noexec.so` preloaded. The worker's
+  sudo `secure_path` lists `/usr/local/sbin` first, so `sudo bpftrace -e ...`
+  reaches it;
+- rely on systemd's static `sys-kernel-tracing.mount` for tracefs, which
+  the qualification checks rather than mounting it a second time.
+
+Bpftrace programs can still read any file (`cat()`) and any kernel or
+process memory, which is what tracing needs. Without `--unsafe` they
+cannot write, signal or override. `runner` can sudo to the worker account
+and so reaches the same three commands.
+
+The builder runs `ci-scaler verify-capture` as the worker while
+provisioning, and `qualify-clone` runs it again on clone 9501 after root
+checks. The root checks are: `visudo -c` for the whole policy and for the
+drop-in, the drop-in bytes equal to `capture-sudoers`, modes
+`440 root root` and `755 root root`, the front byte-identical to
+`/usr/local/bin/carrick-xtask`, and `bpftrace --version`. As the worker,
+`verify-capture` requires:
+
+- tracefs mounted at `/sys/kernel/tracing`;
+- `sudo -n dmesg` printing the kernel log, and `sudo -n journalctl -k`
+  passing;
+- a bounded live `sudo -n bpftrace` trace on
+  `tracepoint:signal:signal_generate` that reports a SIGKILL sent to a
+  victim process;
+- sudo's own refusal of `true`, `bash`, raw `/usr/bin/bpftrace`,
+  `dmesg -C`, bare `journalctl` and `journalctl -k -f`;
+- the front's refusal of `-o`, `--emit-elf`, `--unsafe`, `-c` and a
+  program file, with no `-o` file created.
+
+A passing `clone-qualification.json` is the owner's acceptance check on
+the qualification clone.
+
+Rollout follows the slot rules above. The director runs it; workers only
+document it:
+
+1. Announce the template change on #231, naming 9001 as the new slot and
+   9000 as the rollback.
+2. Free slot 9001. Under the installed controller, run
+   `carrick-xtask ci-scaler check-template-retirement --template 9001`,
+   then `qm destroy 9001` and remove its grants and firewall file as in
+   the retirement steps. If the check refuses, wait for its linked clones
+   to drain; never bypass it.
+3. With 9000 still active, build the new template:
+   `scripts/ci/build-template-debian.sh INPUT_DIR FULL_COMMIT STAGED_XTASK agent 9001`.
+   Provisioning fails on any capture check. The builder then qualifies
+   linked clone 9501 and destroys it. Keep the stderr log and
+   `clone-qualification.json` with the manifest.
+4. Grant 9001 its source ACLs, keep a `carrick-xtask.pre-<pr>` copy of the
+   controller, and flip the Contabo site row (`agent_template` in
+   `crates/carrick-xtask/src/ci_scaler/site.rs`, Blue → Green) in its own
+   PR. Deploy that controller and restart it on the existing ledger.
+5. Verify a fresh dispatch round, rerun #1600's capture round unchanged,
+   then announce on #231 how the other session would notice a broken
+   template: `qualify-clone` or `verify-capture` failures, or dispatch
+   clones that never become ready.
+6. Keep 9000, its ACL grants and `/etc/pve/firewall/9000.fw` until that
+   live round passes. Rollback is the controller copy above, which selects
+   9000 again.
 
 ### Reaping clone volumes after a storage lock timeout
 

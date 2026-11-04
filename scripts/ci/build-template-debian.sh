@@ -157,6 +157,22 @@ if [[ $(cat profile) == agent ]]; then
   /usr/sbin/usermod -aG carrick-dispatch-loop runner
   printf '%s\n' 'runner ALL=(carrick-dispatch-loop) NOPASSWD: ALL' > /etc/sudoers.d/carrick-dispatch-loop
   chmod 0440 /etc/sudoers.d/carrick-dispatch-loop
+  # Scoped capture privilege (#1621): the worker may sudo exactly bpftrace,
+  # dmesg and journalctl -k, never a shell or general root. Raw bpftrace as
+  # root could write any file (-o, --emit-*) or run commands (-c, --unsafe),
+  # so sudo admits /usr/local/sbin/bpftrace instead: a root-owned COPY of
+  # xtask (a link would share its inode with the general CLI) that, under
+  # that name, only checks an argument allowlist and runs /usr/bin/bpftrace
+  # without exec. The drop-in text is xtask's, so qualification compares
+  # the installed bytes. systemd's static sys-kernel-tracing.mount already
+  # mounts tracefs at boot; ci-scaler verify-capture requires it.
+  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y --no-install-recommends bpftrace
+  install -m 755 -o root -g root carrick-xtask /usr/local/sbin/bpftrace
+  # sudo skips included names containing '.', so the staged file is inert.
+  ./carrick-xtask ci-scaler capture-sudoers > /etc/sudoers.d/carrick-dispatch-capture.new
+  chmod 0440 /etc/sudoers.d/carrick-dispatch-capture.new
+  /usr/sbin/visudo -c -f /etc/sudoers.d/carrick-dispatch-capture.new
+  mv /etc/sudoers.d/carrick-dispatch-capture.new /etc/sudoers.d/carrick-dispatch-capture
   /usr/sbin/visudo -c
   # The codex dispatch tier's pinned SDK, built once from hash-locked wheels.
   # Root-owned and read-only for the agent; the driver points the launcher
@@ -260,6 +276,9 @@ runuser -u runner -- /usr/local/bin/carrick-xtask ci-scaler verify-kvm
 if [[ $(cat profile) == agent ]]; then
   id -nG carrick-dispatch-agent | tr ' ' '\n' | grep -qx kvm
   runuser -u carrick-dispatch-agent -- /usr/local/bin/carrick-xtask ci-scaler verify-kvm
+  # Allowed capture commands run non-interactively (including a live
+  # SIGKILL trace); sudo -n true, sudo -n bash and refused bpftrace shapes fail.
+  runuser -u carrick-dispatch-agent -- /usr/local/bin/carrick-xtask ci-scaler verify-capture
   # This service account has no home. Qualification must supply writable state;
   # real worker turns already receive their own isolated home.
   install -d -m 700 -o carrick-dispatch-agent -g carrick-dispatch-agent /run/carrick-ci/semgrep-qualification
