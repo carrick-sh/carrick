@@ -110,3 +110,35 @@ Kept: the earlier worker's two red witnesses and their positive data-transfer
 tails. Ported: none (the admitted-main rebase required no conflict resolution).
 Dropped: none. No routing, crossing allowlist, budgets, timeouts or concurrency
 policy changed.
+
+## Routing-first review
+
+The routing-first review rechecked the rebased preparation commits against
+the admitted main. All six commits were kept without conflicts; none were
+ported or dropped. The fresh independent Codex review found no confirmed
+P0/P1 defect in the preparation substrate, but the routing work is unfinished.
+
+The prerequisite is **a retained native IPC creation transaction**. This must
+be a production owner, not another preparation helper. It must retain the
+exact caller and descriptor-table generation and the prepared endpoints while
+canonical service growth or user-output preparation waits. Fatal cancellation
+must settle both raw endpoints and admitted pins exactly once. Only after
+growth and output preparation finish may it bind both physical output pieces,
+install the pair and perform the infallible eight-byte output. Neither a
+table lock nor an MM editor may survive a service crossing or park.
+
+The review rated publication before fallible `complete_copyout` as a P0 risk:
+that continuation retains bytes and a result, but cannot undo descriptor
+publication. Missing creation continuation, canonical supply and contention
+handling are P1 prerequisites. In particular, `NativeFdWait` and
+`map_fd_error` are not a template for creation: spinning or returning EBUSY
+would violate the owned-wait contract. Direct `IpcRegion::create_pipe` also
+cannot replace `HostIpc::create_pipe`, which owns configured growth limits,
+retired-ring reclamation, wait binding and stock replenishment.
+
+The physical output fence has only VM-free test bindings. It excludes mapping
+changes but explicitly does not supply physical memory custody. Merely
+enabling the descriptor classifier and crossing entry would not provide any
+of these owners. The route must remain unaccepted until the production
+transaction makes both native-child witnesses Served and the signed CLI
+witness prints `a`.
