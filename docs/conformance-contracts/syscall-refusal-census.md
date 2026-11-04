@@ -266,3 +266,13 @@ so every host runs the same check. It classifies this test-only call explicitly,
 production host-process creation forbidden. After rebasing onto the admitted
 main, exec test calls retain the new caller-table argument alongside the
 `NativeServiceCall` census context; neither authority is dropped.
+
+New census directories request mode `0700` at creation. An existing directory
+keeps its permissions and remains subject to the shared publisher's admission
+check. The real KVM CLI binding
+`mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel`
+exposed a group-writable destination under host umask `0007`: the guest wrote
+`hello`, but terminal publication returned status 125. With private directory
+creation, that same binding returns the guest's status 7 and reads one complete
+x86_64 census file. Its failure assertion retains stdout and stderr so future
+publication errors identify their cause.

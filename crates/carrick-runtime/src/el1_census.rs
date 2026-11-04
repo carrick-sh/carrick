@@ -357,7 +357,15 @@ fn destination() -> std::path::PathBuf {
 }
 
 fn publish(census: Census, directory: std::path::PathBuf) -> std::io::Result<()> {
-    std::fs::create_dir_all(&directory)?;
+    use std::os::unix::fs::DirBuilderExt;
+
+    // The artifact owner requires a non-writable parent. Choose private
+    // permissions at creation instead of inheriting a permissive host umask
+    // or changing an existing directory's permissions.
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&directory)?;
     // Readers admit only .json files. Reserve a unique final name, but keep
     // the unpublished body under a different extension until it is durable.
     let name = format!(
@@ -687,9 +695,21 @@ mod tests {
 
     #[test]
     fn terminal_publication_returns_a_complete_file_and_propagates_io_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
         let directory = tempfile::tempdir().unwrap();
-        publish(census(vec![row(34, 1, 0)]), directory.path().to_owned()).unwrap();
-        let paths: Vec<_> = std::fs::read_dir(directory.path())
+        let destination = directory.path().join("new-census");
+        publish(census(vec![row(34, 1, 0)]), destination.clone()).unwrap();
+        assert_eq!(
+            std::fs::metadata(&destination)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "new census destinations must be private regardless of the host creation mask"
+        );
+        let paths: Vec<_> = std::fs::read_dir(destination)
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .collect();

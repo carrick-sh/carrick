@@ -154,7 +154,13 @@ fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
         ])
         .output()
         .expect("observe shared CPL0 run receipt");
-    assert_eq!(observed.status.code(), Some(7));
+    assert_eq!(
+        observed.status.code(),
+        Some(7),
+        "stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&observed.stdout),
+        String::from_utf8_lossy(&observed.stderr),
+    );
     let envelope = observed
         .stdout
         .strip_prefix(b"hello\n")
