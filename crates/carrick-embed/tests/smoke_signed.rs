@@ -195,7 +195,14 @@ fn smoke_terminal_census_precedes_pool_shutdown_for_two_carriers() {
     let directory = std::path::PathBuf::from(
         std::env::var_os("CARRICK_EL1_CENSUS").expect("signed runner enables census"),
     );
-    std::fs::create_dir_all(&directory).unwrap();
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+    }
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let files = || -> std::collections::BTreeSet<std::path::PathBuf> {
         std::fs::read_dir(&directory)
