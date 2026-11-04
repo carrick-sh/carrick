@@ -980,7 +980,7 @@ fn fixture_lockfile_change_refuses_by_input_identity() {
     let path = "fixtures/embed-el1-sched/Cargo.lock";
     let lock = fs::read_to_string(root.join(path)).unwrap();
     // A still-valid `--locked` lockfile with different bytes.
-    let changed = lock.replace("\nversion = 4\n", "\nversion = 3\n");
+    let changed = lock.replacen("version = 4\n", "version = 3\n", 1);
     assert_ne!(changed, lock);
     commit(root, path, changed.as_bytes(), "fixture lockfile change");
     assert_identity_refusal(&f, path);
