@@ -2388,6 +2388,11 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
     ///
     /// # Safety
     /// The caller owns the selected record and its published lifecycle backing.
+    #[cfg(any(
+        test,
+        feature = "host-test",
+        all(target_os = "none", target_arch = "aarch64")
+    ))]
     pub(super) unsafe fn newborn_visible_pid(
         &self,
         source: BornInZoneSource<'_, C>,

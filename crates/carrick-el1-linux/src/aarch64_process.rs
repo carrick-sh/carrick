@@ -601,23 +601,6 @@ fn admit_entry_runtime(
     // SAFETY: the EL1 caller owns the running slot and its record until the
     // process route returns to the vector.
     let observed = unsafe { observed_entry_address(source, task, ttbr0, record)? };
-    // A signal/IPC checkpoint can enter directly after a retained operation,
-    // without another scheduler resume. Restore the process projection from
-    // either the registered record or the same retained lifecycle authority
-    // used by a newborn's first resume, before the PID-qualified lookup below.
-    let record_ref = source.zone.record_ref(record);
-    let pid = if let Some(runtime) = REGISTRY.for_record(source.zone, record_ref) {
-        // SAFETY: the EL1 caller owns this selected record until entry returns.
-        unsafe { runtime.resume_visible_pid(record_ref) }
-    } else {
-        // SAFETY: entry owns the exact selected record and retains its
-        // lifecycle backing until this call returns.
-        unsafe { REGISTRY.newborn_visible_pid(source, task, record_ref, observed, page, control) }
-    };
-    if let Some(pid) = pid {
-        task.publish_visible_pid(pid);
-        task.publish_root_generation(observed.generation);
-    }
     let address = if control.entry().is_some() {
         REGISTRY
             .group_address(
