@@ -203,7 +203,14 @@ fn cancel(repo: &str, run: u64, reason: &str, writer: &mut dyn Write) -> Result<
             "Cancelling [Hosted CI run {run}](https://github.com/{repo}/actions/runs/{run}): {reason}"
         )?;
     }
-    api(repo, &format!("actions/runs/{run}/cancel"), "POST")?;
+    if let Err(error) = api(repo, &format!("actions/runs/{run}/cancel"), "POST") {
+        // Completion can win the race with cancellation. Verify terminal state
+        // rather than aborting the closure census and leaving other runs alive.
+        if json(repo, &format!("actions/runs/{run}"))?["status"] != "completed" {
+            return Err(error);
+        }
+        writeln!(writer, "Hosted CI run {run} already completed")?;
+    }
     Ok(())
 }
 

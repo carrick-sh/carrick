@@ -88,6 +88,14 @@ fn observer_fixture(command: &str, responses: serde_json::Value) -> (String, Str
     let mut script =
         String::from("#!/bin/sh\nprintf '%s %s\\n' \"$3\" \"$4\" >> \"$CALLS\"\ncase \"$4\" in\n");
     for (endpoint, value) in responses.as_object().unwrap() {
+        if let Some(error) = value.get("$error").and_then(|v| v.as_str()) {
+            script.push_str(&format!(
+                "{}) printf '%s\\n' {} >&2; exit 1 ;;\n",
+                quote(endpoint),
+                quote(error)
+            ));
+            continue;
+        }
         let response = value
             .as_str()
             .map(str::to_owned)
@@ -187,4 +195,23 @@ fn watcher_cli_closes_census_race_but_never_cancels_merge_group() {
         }),
     );
     assert!(!calls.contains("POST"));
+}
+
+#[test]
+#[cfg(unix)]
+fn completed_cancellation_race_does_not_abort_closure_census() {
+    let mut responses = json!({
+        "repos/owner/repo/pulls/42": {"state":"closed"},
+        "repos/owner/repo/actions/runs/7/cancel": {"$error":"HTTP 409: already completed"},
+        "repos/owner/repo/actions/runs/7": {"status":"completed"},
+        "repos/owner/repo/actions/runs/8/cancel": ""
+    });
+    for status in ["queued", "in_progress", "waiting", "pending", "requested"] {
+        responses[format!(
+            "repos/owner/repo/actions/workflows/ci.yml/runs?event=pull_request&status={status}&per_page=100&page=1"
+        )] = json!({"workflow_runs": if status == "queued" { [7,8].into_iter().map(|id| json!({"id":id,"event":"pull_request","path":".github/workflows/ci.yml","status":"queued","pull_requests":[{"number":42}]})).collect::<Vec<_>>() } else {vec![]} });
+    }
+    let (out, calls) = observer_fixture("closed", responses);
+    assert!(out.contains("already completed"));
+    assert!(calls.contains("POST repos/owner/repo/actions/runs/8/cancel"));
 }
