@@ -2395,7 +2395,7 @@ mod host_tests {
         let zone = fixture(true);
         let record = allocate(&zone, 101);
         let record_ref = zone.record_ref(record);
-        zone.requeue_preempted(SLOT, record);
+        assert!(zone.requeue_preempted(SLOT, record).is_queued());
         assert_eq!(zone.switch_in(SLOT), Some(record));
         let key = ObjectWaitKey::native_service(record_ref).unwrap();
         zone.bind_object_wait(key, &SpinForever).unwrap();
