@@ -1902,6 +1902,36 @@ fn run_mounted_binary_with_capture(
         .tempdir_in(&capture_dir)
         .expect("reserve KVM capture directory")
         .keep();
+    // Teardown may remove the debug endpoint before the child exits. The
+    // unreaped child handle still identifies that exact process.
+    #[cfg(target_os = "linux")]
+    for (tool, args) in [
+        ("eu-stack", vec!["-s", "-p"]),
+        (
+            "gdb",
+            vec!["-nx", "-batch", "-ex", "thread apply all bt", "-p"],
+        ),
+    ] {
+        let result = Command::new(tool)
+            .timeout(Duration::from_secs(3))
+            .args(args)
+            .arg(child.id().to_string())
+            .output();
+        let report = match result {
+            Ok(output) => format!(
+                "pid: {}\nrun: {}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+                child.id(),
+                scoped_run_id,
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) => format!("capture tool unavailable: {error}\n"),
+        };
+        if let Err(error) = std::fs::write(capture_dir.join(format!("{tool}.txt")), report) {
+            eprintln!("KVM deadline {tool} report write failed: {error}");
+        }
+    }
     let capture_path = capture_dir.join("post-mortem.json");
     let capture = Command::new(&cli)
         .timeout(Duration::from_secs(4))
