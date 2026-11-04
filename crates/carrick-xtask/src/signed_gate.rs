@@ -48,7 +48,7 @@ pub enum SignedGateAction {
         request: PathBuf,
         #[arg(long)]
         output: PathBuf,
-        /// Runner-provisioned immutable archive; restore checks fixture input identity.
+        /// Same-run exact-SHA archive; admission also checks fixture input identity.
         #[arg(long, env = "CARRICK_SIGNED_FIXTURE_BUNDLE")]
         fixture_bundle: PathBuf,
     },
@@ -420,6 +420,26 @@ fn logged(command: &mut Command, lease: &HostLease, log: &Path) -> Result<bool, 
         .map_err(|e| fail(e.to_string()))?;
     Ok(status.success())
 }
+/// Admit the same-run fixture archive before any installation or guest work.
+/// General fixture reuse permits equal inputs across commits; this Actions
+/// lane additionally requires the authorized publisher's exact commit.
+pub fn verify_fixture_artifact(
+    root: &Path,
+    bundle: &Path,
+    expected: &str,
+) -> Result<(), ReceiptError> {
+    let (manifest, _) = crate::fixtures::archive::verify(root, bundle, expected)
+        .map_err(|e| fail(e.to_string()))?;
+    let expected = crate::fixtures::CommitSha::try_from(expected.to_owned())
+        .map_err(|e| fail(e.to_string()))?;
+    if manifest.source_head != expected {
+        return Err(fail(
+            "signed fixture artifact source SHA differs from authorized SHA",
+        ));
+    }
+    Ok(())
+}
+
 fn execute(
     root: &Path,
     request_path: &Path,
@@ -467,6 +487,7 @@ fn execute(
         if !logged(&mut fetch, &lease, &output.join("fixture-fetch.log"))? {
             return Err(fail("fixture dependency fetch failed"));
         }
+        verify_fixture_artifact(&tree, &bundle, &request.sha)?;
         let mut restore = Command::new(&xtask);
         restore.current_dir(&tree).args([
             "--root",
@@ -478,7 +499,7 @@ fn execute(
         ]);
         if !logged(&mut restore, &lease, &output.join("fixture-restore.log"))? {
             return Err(fail(
-                "fixture restore failed; provision a bundle matching this SHA's fixture input identity",
+                "fixture restore failed for the authorized exact-SHA artifact",
             ));
         }
         let mut build = Command::new("just");
