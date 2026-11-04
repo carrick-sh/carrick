@@ -1955,21 +1955,29 @@ fn cloudmac_ci_macos_runner_jobs_serialize_builds_and_tests_under_carrick_lease(
 #[cfg(target_os = "linux")]
 fn template_builder_refuses_existing_slot_and_accepts_the_other() {
     let source = include_str!("../../../scripts/ci/build-template-debian.sh");
-    let profile_guard = source
+    let syntax_guard = source
         .lines()
-        .find(|line| line.starts_with("case $profile:$template"))
+        .find(|line| line.starts_with("[[ $template =~"))
         .unwrap();
     let existence_guard = source
         .lines()
         .find(|line| line.starts_with("! qm status"))
         .unwrap();
-    for (template, allowed) in [(9000, false), (9001, true), (9002, false)] {
+    // Slot admission is exercised through the Rust site selector; this
+    // shell consumer validates syntax and refuses replacement.
+    for (template, allowed) in [
+        ("300", false),
+        ("301", true),
+        ("9000", false),
+        ("9001", true),
+        ("bad", false),
+    ] {
         let script = format!(
             r#"set -euo pipefail
 profile=agent
 template={template}
-qm() {{ [[ $1 == status && $2 == 9000 ]]; }}
-{profile_guard}
+qm() {{ [[ $1 == status && ( $2 == 300 || $2 == 9000 ) ]]; }}
+{syntax_guard}
 {existence_guard}
 "#
         );

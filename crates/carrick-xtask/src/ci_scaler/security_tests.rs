@@ -1481,3 +1481,119 @@ fn owner_parsers_accept_string_and_number_vmids() {
     .unwrap();
     assert_eq!(volumes, ["local:309/d"]);
 }
+
+#[test]
+fn kvm_source_selection_drives_builder_provisioner_and_rollback() {
+    let mut ledger = Ledger::default();
+    let row = ledger
+        .reserve(
+            JobKey {
+                run: RunId(77),
+                attempt: 1,
+                job: JobId(77),
+            },
+            &[],
+            1,
+            Concurrency::ONE,
+        )
+        .unwrap();
+    for vmid in [301, 300] {
+        let selected = site::CONTABO.with_template(Some(vmid)).unwrap();
+        assert!(
+            selected
+                .shell_env()
+                .unwrap()
+                .contains(&format!("SITE_TEMPLATE_VMID={vmid}\n"))
+        );
+        #[cfg(target_os = "linux")]
+        {
+            // Execute the builder's real site-output consumer, without crossing
+            // into PVE operations. The fixture supplies this selector's output.
+            let builder = include_str!("../../../../scripts/ci/build-template-debian.sh");
+            let consumer = builder
+                .split("declare -A site=()\n")
+                .nth(1)
+                .unwrap()
+                .split("node=${site[SITE_NODE]}")
+                .next()
+                .unwrap();
+            let script = format!(
+                r#"set -euo pipefail
+fixture_xtask() {{ printf '%s' "$SITE_FIXTURE"; }}
+hostname() {{ echo carrick-ctb; }}
+xtask=fixture_xtask
+profile=kvm
+template_args=()
+declare -A site=()
+{consumer}
+printf '%s' "$template"
+"#
+            );
+            let output = Command::new("bash")
+                .args(["-c", &script])
+                .env("SITE_FIXTURE", selected.shell_env().unwrap())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), vmid.to_string());
+        }
+        assert_eq!(
+            clone_call(selected, &row).unwrap().1,
+            format!("/nodes/carrick-ctb/qemu/{vmid}/clone")
+        );
+        let mut agent = row.clone();
+        agent.lane = CloneLane::Agent;
+        assert_eq!(
+            clone_call(selected, &agent).unwrap().1,
+            "/nodes/carrick-ctb/qemu/9000/clone"
+        );
+    }
+}
+
+#[test]
+fn kvm_cutover_keeps_both_sources_and_running_clone_in_inventory() {
+    let mut ledger = Ledger::default();
+    let limit = Concurrency::try_from(2).unwrap();
+    let key = |n| JobKey {
+        run: RunId(n),
+        attempt: 1,
+        job: JobId(n),
+    };
+    let mut old = ledger.reserve(key(1), &[], 1, limit).unwrap();
+    assert_eq!(
+        clone_call(site::CONTABO, &old).unwrap().1,
+        "/nodes/carrick-ctb/qemu/300/clone"
+    );
+    old.state = State::Running;
+    ledger.rows[0] = old.clone();
+    let inventory = vec![
+        PoolMember {
+            id: 300,
+            pool: POOL.into(),
+            template: true,
+        },
+        PoolMember {
+            id: 301,
+            pool: POOL.into(),
+            template: true,
+        },
+        PoolMember {
+            id: old.vm.get(),
+            pool: POOL.into(),
+            template: false,
+        },
+    ];
+    let new = ledger.reserve(key(2), &inventory, 2, limit).unwrap();
+    let selected = site::CONTABO.with_template(Some(301)).unwrap();
+    assert_eq!(
+        clone_call(selected, &new).unwrap().1,
+        "/nodes/carrick-ctb/qemu/301/clone"
+    );
+    assert_eq!(ledger.rows[0].state, State::Running);
+    assert_eq!(ledger.rows[0].vm, old.vm);
+    assert_eq!(inventory.iter().filter(|v| v.template).count(), 2);
+}

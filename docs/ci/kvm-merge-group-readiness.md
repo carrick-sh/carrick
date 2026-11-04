@@ -263,14 +263,27 @@ storage and controller reservations. Neither agent source 9000/9001 nor
 agent qualification slot 9501 is a KVM slot. No slot number in this proposal
 authorizes an infrastructure change.
 
-The existing selector must gain typed KVM source selection in a separately
-reviewed controller change before cutover. Today `Site::template` selects
-300; the agent blue/green selector does not select KVM sources. Extend that
-authority rather than adding an environment variable, wrapper or second
-selector. Both builder admission and clone provisioning must consume the
-same selected source, with inventory and retirement retaining every source
-still referenced by a linked clone. Until that change is reviewed and
-qualified, deployment remains blocked; this worker does not implement it.
+The controller now uses `Site::kvm_template: KvmTemplate` alongside the
+existing agent selector. `KvmTemplate::Blue` maps to 300 and `Green` to 301;
+these are controller source slots, not permission to create or replace a VM.
+The director must verify those slots against live inventory before building.
+`ci-scaler site --lane kvm --template 301` and the matching `vm-firewall`
+command supply builder inputs through the same typed authority. They select
+a build target only; they do not change the running controller. Publish the
+reviewed `CONTABO.kvm_template` selection and matching controller artifact
+through the normal deployment procedure for cutover or rollback. The default
+remains `Blue`, so this change alone does not cut over source 300.
+
+Clone provisioning uses `Site::template` through `clone_call`; lane changes
+preserve both selectors. Pool admission retains both KVM source slots, and
+`ci-scaler check-template-retirement --template <source>` refuses an active
+source or any source still referenced by a linked clone, including stopped
+and unpooled clones and orphan disks. Directory storage is required for this
+retirement check; other storage fails closed. Agent sources and qualification
+slot 9501 remain unchanged. A separate KVM qualification slot must still be
+reserved by the director; the existing agent `qualify-clone` command is not
+a KVM qualification path. Deployment and the live readiness pilot remain
+blocked until the director qualifies the selected source.
 
 Using the integrated builder and controller, build the new source from a
 recorded commit and artifact identity, retain the current source, and

@@ -279,7 +279,8 @@ impl Ledger {
         let unknown = inventory.iter().any(|v| {
             v.pool == POOL
                 && !(v.template
-                    && ((300..=307).contains(&v.id) || site::AgentTemplate::try_from(v.id).is_ok()))
+                    && (site::KvmTemplate::try_from(v.id).is_ok()
+                        || site::AgentTemplate::try_from(v.id).is_ok()))
                 && !active.iter().any(|r| r.vm.get() == v.id)
         });
         if unknown {
@@ -1197,7 +1198,7 @@ pub enum ScalerAction {
         #[arg(long)]
         template: Option<u16>,
     },
-    /// Root on Contabo: refuse retirement of an active or referenced agent base.
+    /// Root on Contabo: refuse retirement of an active or referenced source base.
     CheckTemplateRetirement {
         #[arg(long)]
         template: u16,

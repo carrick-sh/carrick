@@ -22,7 +22,7 @@ pub(super) fn check(vmid: u16) -> Result<(), ScalerError> {
         .map_err(|_| ScalerError::Guard("non UTF-8 storage output"))
     })?;
     println!(
-        "Agent template {vmid} has no linked disk references; Proxmox must recheck at destruction. Keep its ACL and firewall until qm destroy succeeds."
+        "Template {vmid} has no linked disk references; Proxmox must recheck at destruction. Keep its ACL and firewall until qm destroy succeeds."
     );
     Ok(())
 }
@@ -32,12 +32,20 @@ fn check_with(
     vmid: u16,
     mut run: impl FnMut(&[&str]) -> Result<String, ScalerError>,
 ) -> Result<(), ScalerError> {
-    let template = site::AgentTemplate::try_from(vmid)?;
-    let agent_site = site.for_lane(CloneLane::Agent)?;
-    if agent_site.template()? == template.vmid() {
-        return Err(ScalerError::Guard(
-            "cannot retire the active agent template",
-        ));
+    let lane = if site::KvmTemplate::try_from(vmid).is_ok() {
+        CloneLane::Kvm
+    } else {
+        site::AgentTemplate::try_from(vmid)?;
+        CloneLane::Agent
+    };
+    let selected_site = site.for_lane(lane)?;
+    if selected_site.template()? == vmid {
+        return Err(ScalerError::Guard("cannot retire the active template"));
+    }
+    // This authority understands qcow2 backing chains, not LVM thin origins.
+    // Never treat an uninspected raw base as unreferenced.
+    if !matches!(site.headroom, site::Headroom::Directory) {
+        return Err(ScalerError::Guard("retirement requires directory storage"));
     }
     let id = vmid.to_string();
     let config = run(&["qm", "config", &id])?;
@@ -107,9 +115,7 @@ fn check_with(
                 .map(image_identity)
                 .transpose()?;
             if bases.contains(&identity) || backing.is_some_and(|id| bases.contains(&id)) {
-                return Err(ScalerError::Guard(
-                    "agent template still has a linked clone",
-                ));
+                return Err(ScalerError::Guard("template still has a linked clone"));
             }
         }
     }
@@ -202,6 +208,60 @@ mod tests {
                 Ok(output.replace("/images", &dir.path().to_string_lossy()))
             });
             assert_eq!(result.is_ok(), allowed, "{result:?}");
+        }
+    }
+
+    #[test]
+    fn kvm_retirement_retains_referenced_source_then_allows_unreferenced_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.qcow2");
+        let disk = dir.path().join("disk.qcow2");
+        std::fs::write(&base, []).unwrap();
+        std::fs::write(&disk, []).unwrap();
+        for linked in [true, false] {
+            let result = check_with(site::CONTABO, 301, |args| {
+                Ok(match args {
+                    ["qm", "config", "301"] => "template: 1\n".into(),
+                    [
+                        "pvesh",
+                        "get",
+                        _,
+                        "--content",
+                        "images",
+                        "--output-format",
+                        "json",
+                    ] => json!([
+                        {"content":"images","vmid":"301","format":"qcow2","volid":"base"},
+                        {"content":"images","vmid":777,"format":"qcow2","volid":"disk"}
+                    ])
+                    .to_string(),
+                    ["pvesm", "path", "base"] => base.display().to_string(),
+                    ["pvesm", "path", "disk"] => disk.display().to_string(),
+                    [
+                        "qemu-img",
+                        "info",
+                        "-U",
+                        "--backing-chain",
+                        "--output=json",
+                        _,
+                    ] => {
+                        if linked {
+                            json!([{"filename":disk,"full-backing-filename":base},{"filename":base}]).to_string()
+                        } else {
+                            json!([{"filename":disk}]).to_string()
+                        }
+                    }
+                    _ => panic!("unexpected command: {args:?}"),
+                })
+            });
+            if linked {
+                assert!(
+                    matches!(result, Err(ScalerError::Guard(reason)) if reason.contains("linked clone")),
+                    "{result:?}"
+                );
+            } else {
+                assert!(result.is_ok(), "{result:?}");
+            }
         }
     }
 

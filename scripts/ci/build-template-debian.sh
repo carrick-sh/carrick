@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Root on a known KVM clone site (Willow or the Contabo host, issue #287)
-# only. Builds approved template 300, 9000 or 9001; agent qualification boots
+# only. Builds a source admitted by the typed site selector; agent qualification boots
 # and destroys reserved linked clone 9501. The site's node,
 # storage, bridge and template size come from `carrick-xtask ci-scaler site`,
 # the same typed table the controller authenticates the template against.
@@ -8,7 +8,7 @@
 set -euo pipefail
 umask 077
 [[ ${EUID} == 0 ]] || { echo 'Run as root on a KVM clone site' >&2; exit 1; }
-[[ $# == 3 || $# == 4 || $# == 5 ]] || { echo 'Usage: build-template-debian.sh INPUT_DIR SCRIPT_COMMIT X86_LINUX_XTASK [kvm|agent] [AGENT_TEMPLATE_VMID]' >&2; exit 1; }
+[[ $# == 3 || $# == 4 || $# == 5 ]] || { echo 'Usage: build-template-debian.sh INPUT_DIR SCRIPT_COMMIT X86_LINUX_XTASK [kvm|agent] [TEMPLATE_VMID]' >&2; exit 1; }
 profile=${4:-kvm}
 template_args=()
 if [[ $# == 5 ]]; then template_args=(--template "$5"); fi
@@ -39,7 +39,9 @@ for name in SITE_NODE SITE_API_HOST SITE_STORAGE SITE_DISK_FORMAT SITE_BRIDGE SI
 done
 [[ ${site[SITE_NODE]} == $(hostname -s) ]] || { echo 'site node is not this host' >&2; exit 1; }
 template=${site[SITE_TEMPLATE_VMID]}
-case $profile:$template in kvm:300|agent:9000|agent:9001) ;; *) echo "bad profile template" >&2; exit 1 ;; esac
+# Slot admission belongs to ci-scaler site, including lane validation above.
+# Validate syntax here without maintaining a second source-slot allowlist.
+[[ $template =~ ^[1-9][0-9]*$ ]] || { echo "bad template VMID" >&2; exit 1; }
 node=${site[SITE_NODE]} api_host=${site[SITE_API_HOST]} storage=${site[SITE_STORAGE]}
 disk_format=${site[SITE_DISK_FORMAT]} bridge=${site[SITE_BRIDGE]}
 cores=${site[SITE_CORES]} memory_mib=${site[SITE_MEMORY_MIB]} disk_gib=${site[SITE_DISK_GIB]}

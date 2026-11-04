@@ -29,6 +29,32 @@ impl TryFrom<u16> for AgentTemplate {
     }
 }
 
+/// KVM source slots. Slot identity permits selection, never infrastructure mutation.
+/// Keep the selected source in the site's reviewed configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvmTemplate {
+    Blue,
+    Green,
+}
+impl KvmTemplate {
+    pub fn vmid(self) -> u16 {
+        match self {
+            Self::Blue => 300,
+            Self::Green => 301,
+        }
+    }
+}
+impl TryFrom<u16> for KvmTemplate {
+    type Error = ScalerError;
+    fn try_from(vmid: u16) -> Result<Self, Self::Error> {
+        match vmid {
+            300 => Ok(Self::Blue),
+            301 => Ok(Self::Green),
+            _ => Err(ScalerError::Guard("unapproved KVM template VMID")),
+        }
+    }
+}
+
 /// How admission measures free space on the clone storage before booting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Headroom {
@@ -62,6 +88,7 @@ pub(super) enum Network {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Site {
     pub lane: super::CloneLane,
+    pub kvm_template: KvmTemplate,
     pub agent_template: Option<AgentTemplate>,
     /// `/etc/hostname`, which is also the PVE node name.
     pub node: &'static str,
@@ -85,6 +112,7 @@ pub(super) struct Site {
 
 pub(super) const WILLOW: Site = Site {
     lane: super::CloneLane::Kvm,
+    kvm_template: KvmTemplate::Blue,
     agent_template: None,
     node: "willow",
     api_host: "willow.atxconsulting.com",
@@ -103,6 +131,7 @@ pub(super) const WILLOW: Site = Site {
 /// directory storage, and the agent-worker VMs/template protected.
 pub(super) const CONTABO: Site = Site {
     lane: super::CloneLane::Kvm,
+    kvm_template: KvmTemplate::Blue,
     agent_template: Some(AgentTemplate::Blue),
     node: "carrick-ctb",
     api_host: "carrick-ctb.turkey-moth.ts.net",
@@ -127,20 +156,25 @@ pub(super) const SITES: [Site; 2] = [WILLOW, CONTABO];
 impl Site {
     pub(super) fn template(&self) -> Result<u16, ScalerError> {
         match self.lane {
-            super::CloneLane::Kvm => Ok(300),
+            super::CloneLane::Kvm => Ok(self.kvm_template.vmid()),
             super::CloneLane::Agent => self
                 .agent_template
                 .map(AgentTemplate::vmid)
                 .ok_or(ScalerError::Guard("site has no agent template")),
         }
     }
-    /// Builder override: approved inactive slots are allowed only on the agent site.
+    /// Builder target selection uses the same typed slots as provisioning.
     pub(super) fn with_template(mut self, vmid: Option<u16>) -> Result<Self, ScalerError> {
         if let Some(vmid) = vmid {
-            if self.lane != super::CloneLane::Agent || self.agent_template.is_none() {
-                return Err(ScalerError::Guard("template override requires agent site"));
+            match self.lane {
+                super::CloneLane::Kvm => self.kvm_template = KvmTemplate::try_from(vmid)?,
+                super::CloneLane::Agent => {
+                    if self.agent_template.is_none() {
+                        return Err(ScalerError::Guard("site has no agent template"));
+                    }
+                    self.agent_template = Some(AgentTemplate::try_from(vmid)?);
+                }
             }
-            self.agent_template = Some(AgentTemplate::try_from(vmid)?);
         }
         Ok(self)
     }
@@ -148,6 +182,7 @@ impl Site {
     pub(super) fn for_lane(self, lane: super::CloneLane) -> Result<Self, ScalerError> {
         let mut site = Self::for_hostname(self.node)?;
         site.agent_template = self.agent_template;
+        site.kvm_template = self.kvm_template;
         if lane == super::CloneLane::Agent {
             if site.node != CONTABO.node {
                 return Err(ScalerError::Guard("agent clones require Contabo"));
@@ -462,12 +497,28 @@ mod tests {
     }
 
     #[test]
+    fn kvm_builder_slots_are_typed_and_cannot_select_agent_or_clone_ids() {
+        for site in SITES {
+            for vmid in [300, 301] {
+                assert_eq!(
+                    site.with_template(Some(vmid)).unwrap().template().unwrap(),
+                    vmid
+                );
+            }
+            for vmid in [0, 299, 302, 307, 308, 9000, 9001, 9501, u16::MAX] {
+                assert!(site.with_template(Some(vmid)).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn willow_row_is_pinned_to_the_pre_site_constants() {
         // Exactly the values live.rs hard-coded before sites existed.
         assert_eq!(
             WILLOW,
             Site {
                 lane: super::super::CloneLane::Kvm,
+                kvm_template: KvmTemplate::Blue,
                 agent_template: None,
                 node: "willow",
                 api_host: "willow.atxconsulting.com",
@@ -501,6 +552,7 @@ mod tests {
             CONTABO,
             Site {
                 lane: super::super::CloneLane::Kvm,
+                kvm_template: KvmTemplate::Blue,
                 agent_template: Some(AgentTemplate::Blue),
                 node: "carrick-ctb",
                 api_host: "carrick-ctb.turkey-moth.ts.net",
