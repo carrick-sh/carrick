@@ -343,21 +343,53 @@ fn publish_handoff_park_with<C: EntryContext>(
     Some(start.published())
 }
 
+/// The scheduler transition that moved a running record onto its slot's run
+/// queue. Only that transition's own result licenses a yield receipt.
+pub trait YieldTransition {
+    fn requeued(self) -> bool;
+}
+impl YieldTransition for carrick_sched_core::Requeue {
+    fn requeued(self) -> bool {
+        self.is_queued()
+    }
+}
+impl YieldTransition for carrick_sched_core::CurrentRelease {
+    fn requeued(self) -> bool {
+        matches!(self, Self::Requeued)
+    }
+}
+
 /// Publish a yield handoff only after the running record has left the CPU
 /// for the run queue. The initiating entry's receipt still names its exact
 /// pre-switch record and binding, even though the live frame names a sibling.
+///
+/// The requeue result is the publication: once queued, the record belongs to
+/// the run queue, and a host requester may already have claimed it (#1467).
+/// Re-reading its claim here would turn that legitimate takeover into a
+/// missing receipt, so only this lane's slot is checked afterwards.
 pub fn publish_handoff_yield<C: EntryContext>(
     start: HandoffStart<'_, C>,
+    transition: impl YieldTransition,
 ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
     let zone = start.source.zone;
     let slot = start.source.slot;
-    if zone.slot(slot).current() == Some(start.record.record)
-        || !matches!(zone.record(start.record.record).claim(),
-            carrick_sched_core::Claim::Queued { slot: owner, .. } if owner == slot)
-    {
+    if !transition.requeued() || zone.slot(slot).current() == Some(start.record.record) {
         return None;
     }
     Some(start.published())
+}
+
+/// Whether a host requester holds the exact running record this entry owns:
+/// its `OnCpuRequested` claim on this slot closes every new park, so the
+/// owner must leave through its checkpoint instead (#1467).
+pub fn host_requested_running<C: EntryContext>(
+    binding: ExecutionBinding,
+    source: BornInZoneSource<'_, C>,
+    record: carrick_sched_core::RecordId,
+) -> bool {
+    record_binding(binding, source, record).is_some()
+        && matches!(source.zone.record(record).claim(),
+            carrick_sched_core::Claim::OnCpuRequested { slot, .. } if slot == source.slot)
 }
 
 /// Yield a consumed native continuation to its host execution owner. The

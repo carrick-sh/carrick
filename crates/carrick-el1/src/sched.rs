@@ -546,11 +546,11 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             record,
         )?;
         frame.x[0] = 0;
-        let loaded = self.preempt_record(frame, record);
+        let (loaded, requeue) = self.preempt_record(frame, record);
         if self.zone.slot(self.slot).current() == Some(record) {
             return Some(Served::Returned { switched: false });
         }
-        let receipt = carrick_core::entry::publish_handoff_yield(start);
+        let receipt = carrick_core::entry::publish_handoff_yield(start, requeue);
         self.record_handoff(receipt);
         if loaded {
             self.program_timer(true);
@@ -976,10 +976,16 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         let Ok(prev) = self.current_record() else {
             return true;
         };
-        self.preempt_record(frame, prev)
+        self.preempt_record(frame, prev).0
     }
 
-    fn preempt_record(&mut self, frame: &mut TrapFrame, prev: carrick_el1_abi::RecordId) -> bool {
+    /// Switch `prev` out for the run queue's head. Returns whether a thread
+    /// is loaded, and the exact requeue of `prev` that licenses its receipt.
+    fn preempt_record(
+        &mut self,
+        frame: &mut TrapFrame,
+        prev: carrick_el1_abi::RecordId,
+    ) -> (bool, carrick_sched_core::Requeue) {
         let (zone, slot) = (self.zone, self.slot);
         let fresh = zone.slot(slot).current().is_none();
         // SAFETY: `prev` holds the running thread (a fresh home record, or
@@ -989,15 +995,19 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             Some(switched) => {
                 if !requeue_owned(zone, slot, prev) {
                     // Hosted builds only: the target build failed closed.
-                    return false;
+                    return (
+                        false,
+                        carrick_sched_core::Requeue::Refused(zone.record(prev).claim()),
+                    );
                 }
-                match self.load(frame, switched) {
+                let loaded = match self.load(frame, switched) {
                     LoadResult::Running => true,
                     LoadResult::NeedsHost => false,
                     LoadResult::Left => {
                         matches!(self.run_next(frame, 0), Served::Returned { switched: true })
                     }
-                }
+                };
+                (loaded, carrick_sched_core::Requeue::Queued)
             }
             None => {
                 // The head changed under us (it cannot: only this vCPU takes
@@ -1005,7 +1015,10 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
                 if fresh {
                     zone.discard_unpublished(slot, prev);
                 }
-                true
+                (
+                    true,
+                    carrick_sched_core::Requeue::Refused(zone.record(prev).claim()),
+                )
             }
         }
     }

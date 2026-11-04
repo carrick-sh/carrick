@@ -1480,13 +1480,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     /// Whether a host requester holds this lane's exact running record: its
     /// OnCpuRequested claim on this slot refuses every new park.
     fn host_requested_current(&self) -> bool {
-        let zone = self.source.zone;
-        zone.slot(self.source.slot).current() == Some(self.record.id)
-            && zone.live(self.record).is_some_and(|record| {
-                matches!(record.claim(),
-                    carrick_sched_core::Claim::OnCpuRequested { slot, .. }
-                        if slot == self.source.slot)
-            })
+        carrick_core::entry::host_requested_running(self.binding, self.source, self.record.id)
     }
 
     /// A supply that won before enrollment is ready work, not a reason to
@@ -1494,6 +1488,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     #[inline(never)]
     pub(super) fn yield_service_checkpoint(&mut self) -> Result<NativeResume, NativeProcessError> {
         self.yield_service_checkpoint_as(OwnerEntry::Syscall)
+    }
+
+    /// Test seam: a host requester acting between the requeue and the
+    /// receipt it licenses.
+    fn yield_receipt_race(&self) {
+        #[cfg(test)]
+        if let Some(hook) = self.runtime.yield_receipt_race_hook.lock().take() {
+            hook();
+        }
     }
 
     /// Leave through the owner checkpoint that resumes `entry`'s service.
@@ -1510,32 +1513,35 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             *record.ctx_mut() = *self.words;
             record.publish_owner_continuation(entry);
         }
-        if self.source.zone.record(self.record.id).claim() == carrick_sched_core::Claim::Free {
-            // The root's first entry has a retained, unqueued host-loaded
-            // record. Materialize it on this slot's queue with its token.
-            if !self
-                .source
-                .zone
-                .requeue_preempted(self.source.slot, self.record.id)
-                .is_queued()
-            {
-                return Err(NativeProcessError::Quarantined);
-            }
-            self.source.zone.clear_current(self.source.slot);
-        } else if !matches!(
-            self.source.zone.release_current(
-                self.source.slot,
-                self.record.id,
-                &carrick_sched_core::ShortLockSpin
-            ),
-            carrick_sched_core::CurrentRelease::Requeued
-        ) {
-            return Err(NativeProcessError::Quarantined);
-        }
-        self.handoff = Some(
-            carrick_core::entry::publish_handoff_yield(start)
-                .ok_or(NativeProcessError::Quarantined)?,
-        );
+        let receipt =
+            if self.source.zone.record(self.record.id).claim() == carrick_sched_core::Claim::Free {
+                // The root's first entry has a retained, unqueued host-loaded
+                // record. Materialize it on this slot's queue with its token.
+                let requeue = self
+                    .source
+                    .zone
+                    .requeue_preempted(self.source.slot, self.record.id);
+                if !requeue.is_queued() {
+                    return Err(NativeProcessError::Quarantined);
+                }
+                self.source.zone.clear_current(self.source.slot);
+                self.yield_receipt_race();
+                carrick_core::entry::publish_handoff_yield(start, requeue)
+            } else {
+                let release = self.source.zone.release_current(
+                    self.source.slot,
+                    self.record.id,
+                    &carrick_sched_core::ShortLockSpin,
+                );
+                if release != carrick_sched_core::CurrentRelease::Requeued {
+                    return Err(NativeProcessError::Quarantined);
+                }
+                // From here the queued record may already be the host's (#1467):
+                // the requeue itself, not a later claim read, is the publication.
+                self.yield_receipt_race();
+                carrick_core::entry::publish_handoff_yield(start, release)
+            };
+        self.handoff = Some(receipt.ok_or(NativeProcessError::Quarantined)?);
         Ok(NativeResume::Left(None))
     }
 
