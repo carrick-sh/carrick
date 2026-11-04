@@ -711,8 +711,13 @@ on every worker, keeping new, unedited items (`round_inbox`):
   before any brief, so the path can't be claimed in advance; created with
   `O_NOFOLLOW` and deleted after the worker); if it can't be made, the brief
   names no inbox;
-- an owner comment that is exactly `/agent stop` stops the coordinator or
-  worker at once; the checkpoint is pushed and the round finishes Blocked;
+- an owner comment that is exactly `/agent stop` and was posted after the
+  round's trigger stops the coordinator or worker at once; the checkpoint is
+  pushed and the round finishes Blocked. A later trigger supersedes earlier
+  stops on either the issue or its PR, even when those stops remain unseen.
+  Issue-comment ids break timestamp ties across those threads. GitHub gives
+  reviews and label events separate id spaces and second-resolution times;
+  when their order within a second is unknown, the stop remains effective;
 - the mailbox reads once more just before the outcome. The outcome's
   server section names the round's trigger (`Round trigger:`) and lists
   each comment; only a Done round marks one as seen, so a failed, stopped

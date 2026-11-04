@@ -4196,8 +4196,8 @@ pub(super) fn run(root: &Path, event_path: &Path, setup: &str) -> Result<(), Sca
     };
     // The round's mailbox: the owner's new comments on the issue and PR
     // reach this round while it runs (#1241). It opens at the trigger's own
-    // time, or the run's creation for a label, so nothing posted while the
-    // worker was queued is missed.
+    // time (including label events), falling back to the run's creation only
+    // when no trigger timestamp is available, so queued input is not missed.
     let trigger_url = server.trigger["html_url"].as_str().map(str::to_owned);
     let since = ["created_at", "submitted_at"]
         .iter()
@@ -4230,8 +4230,8 @@ pub(super) fn run(root: &Path, event_path: &Path, setup: &str) -> Result<(), Sca
     // Open where the previous round's trigger was, so a trigger GitHub
     // cancelled while it waited (one pending job per concurrency group)
     // still reaches this round; minus what earlier rounds handled.
-    let (since, handled, owed) = mailbox_opening(root, &threads, &since);
-    super::round_inbox::start(root, threads, trigger_url, &since, handled, owed);
+    let (opening, handled, owed) = mailbox_opening(root, &threads, &since);
+    super::round_inbox::start(root, threads, trigger_url, &opening, handled, owed, &since);
     let result = (|| -> Result<(), ScalerError> {
         let commands = CommandWindow::until(server.deadline);
         if setup != "success/success" {
@@ -6828,6 +6828,7 @@ fi
                 "2026-10-31T10:00:00Z",
                 Vec::new(),
                 Vec::new(),
+                "2026-10-31T10:00:00Z",
             );
             let comment = |id: u64, body: &str| {
                 json!({"id":id,"user":{"login":"tjfontaine","type":"User"},"created_at":"2026-10-31T10:05:00Z","updated_at":"2026-10-31T10:05:00Z",
@@ -6865,6 +6866,114 @@ fi
                 server.should_stop(),
                 "the owner's /agent stop ends the round"
             );
+        });
+    }
+    #[test]
+    fn stop_only_targets_rounds_triggered_before_it() {
+        shared_fixture(|root| {
+            let comment = |thread: u64, id: u64, at: &str, body: &str| {
+                json!({"id":id,"user":{"login":"tjfontaine","type":"User"},
+                    "created_at":at,"updated_at":at,
+                    "html_url":format!("https://github.com/{REPOSITORY}/issues/{thread}#issuecomment-{id}"),"body":body})
+            };
+            for (name, thread, trigger_at, trigger_id, stops, stopped) in [
+                (
+                    "stop cancels its round",
+                    799,
+                    "2026-11-04T18:00:00Z",
+                    3,
+                    1,
+                    true,
+                ),
+                (
+                    "later issue trigger",
+                    799,
+                    "2026-11-04T22:19:00Z",
+                    3,
+                    1,
+                    false,
+                ),
+                (
+                    "issue stop then closing PR trigger",
+                    800,
+                    "2026-11-04T22:19:00Z",
+                    3,
+                    1,
+                    false,
+                ),
+                (
+                    "two stops then trigger",
+                    800,
+                    "2026-11-04T22:38:00Z",
+                    3,
+                    2,
+                    false,
+                ),
+                (
+                    "same second stop after trigger",
+                    799,
+                    "2026-11-04T18:33:38Z",
+                    0,
+                    1,
+                    true,
+                ),
+                (
+                    "same second trigger after stop",
+                    800,
+                    "2026-11-04T18:33:38Z",
+                    3,
+                    1,
+                    false,
+                ),
+            ] {
+                let mut items = vec![comment(799, 1, "2026-11-04T18:33:38Z", "/agent stop")];
+                if stops == 2 {
+                    items.push(comment(799, 2, "2026-11-04T22:00:00Z", "/agent stop"));
+                }
+                let trigger = comment(thread, trigger_id, trigger_at, "/agent");
+                items.push(trigger.clone());
+                items.push(comment(
+                    799,
+                    4,
+                    "2026-11-04T18:33:38Z",
+                    "keep earlier instructions",
+                ));
+                // The closing PR and issue are read as separate threads.
+                let (pr_items, issue_items): (Vec<_>, Vec<_>) = items
+                    .into_iter()
+                    .partition(|c| c["html_url"].as_str().unwrap().contains("/issues/800#"));
+                std::fs::write(root.join("comments.json"), json!([issue_items]).to_string())
+                    .unwrap();
+                std::fs::write(
+                    root.join("layer-comments.json"),
+                    json!([pr_items]).to_string(),
+                )
+                .unwrap();
+                let (opening, handled, owed) = mailbox_opening(root, &[799, 800], trigger_at);
+                super::super::round_inbox::start(
+                    root,
+                    vec![799, 800],
+                    trigger["html_url"].as_str().map(str::to_owned),
+                    &opening,
+                    handled,
+                    owed,
+                    trigger_at,
+                );
+                super::super::round_inbox::pump_now();
+                let mut coordinator = server(root);
+                assert_eq!(coordinator.should_stop(), stopped, "{name}");
+                if !stopped {
+                    let reply = coordinator.respond(br#"{"tool":"read_capacity","arguments":{}}"#);
+                    assert!(
+                        reply["inbox"]["comments"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|c| c["body"] == "keep earlier instructions"),
+                        "{name}: {reply}"
+                    );
+                }
+            }
         });
     }
     /// #1241: a trigger queued behind a round that took it in (its outcome
@@ -6926,6 +7035,7 @@ fi
                 "2026-10-31T10:00:00Z",
                 Vec::new(),
                 Vec::new(),
+                "2026-10-31T10:00:00Z",
             );
             let late = format!("https://github.com/{REPOSITORY}/issues/799#issuecomment-70");
             std::fs::write(
@@ -7084,6 +7194,7 @@ fi
                     &since,
                     handled,
                     owed,
+                    &since,
                 );
                 let mut items = thread;
                 items.extend(extra);
@@ -7125,6 +7236,7 @@ fi
                 "2026-10-31T10:00:00Z",
                 Vec::new(),
                 Vec::new(),
+                "2026-10-31T10:00:00Z",
             );
             super::super::round_inbox::receive(vec![
                 json!({"id":5,"user":{"login":"tjfontaine","type":"User"},
@@ -10846,6 +10958,7 @@ exec /usr/bin/git "$@"
                 "2026-10-31T10:00:00Z",
                 Vec::new(),
                 Vec::new(),
+                "2026-10-31T10:00:00Z",
             );
             std::fs::write(root.join("comments.json"), json!([comment]).to_string()).unwrap();
             super::super::round_inbox::pump_now();
