@@ -576,21 +576,39 @@ fn exempt_agents_are_real_root_owned_apple_paths_with_launchd_parent() {
             "{agent}"
         );
     }
-    // A real-path match of a root-owned, non-writable binary under launchd.
-    let real = std::path::Path::new("/bin/sleep");
-    assert!(exempt_agent(Some(real), 1, &["/bin/sleep"]));
+    // Production receives the kernel's real executable path. On Ubuntu,
+    // /bin/sleep can be a symlink to a multicall coreutils installation.
+    let real = std::fs::canonicalize("/bin/sleep").unwrap();
+    let real_text = real.to_str().unwrap();
+    assert!(
+        exempt_agent(Some(&real), 1, &[real_text]),
+        "{real:?}: {:?}",
+        std::fs::symlink_metadata(&real)
+    );
     // Not launchd's child, unknown path, or no path: not exempt.
-    assert!(!exempt_agent(Some(real), 4242, &["/bin/sleep"]));
-    assert!(!exempt_agent(Some(real), 1, &EXEMPT_AGENTS));
-    assert!(!exempt_agent(None, 1, &["/bin/sleep"]));
+    assert!(!exempt_agent(Some(&real), 4242, &[real_text]));
+    assert!(!exempt_agent(Some(&real), 1, &EXEMPT_AGENTS));
+    assert!(!exempt_agent(None, 1, &[real_text]));
     // A look-alike copy the job owns, even if someone allowlisted its path.
     let dir = tempfile::tempdir().unwrap();
+    // Even an allowlisted symlink to the trusted file is not a real path.
+    let alias = dir.path().join("sleep");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    assert!(!exempt_agent(Some(&alias), 1, &[alias.to_str().unwrap()]));
     let copy = dir.path().join("distnoted");
-    std::fs::copy(real, &copy).unwrap();
+    std::fs::copy(&real, &copy).unwrap();
     let copy_text = copy.to_str().unwrap();
     if unsafe { libc::geteuid() } != 0 {
         assert!(!exempt_agent(Some(&copy), 1, &[copy_text]));
     }
+    // Writable binaries are rejected even when tests themselves run as root.
+    std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(!exempt_agent(Some(&copy), 1, &[copy_text]));
+    assert!(!exempt_agent(
+        Some(dir.path()),
+        1,
+        &[dir.path().to_str().unwrap()]
+    ));
 }
 
 #[cfg(target_os = "macos")]
