@@ -3262,6 +3262,9 @@ fn managed_clone_copyout_fault_unbinds_birth_before_retry() {
         zone: *const ZoneTables,
     }
     impl ProcessNative for Owner {
+        fn is_root_process(&self) -> bool {
+            false
+        }
         fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
             self.binding
         }
@@ -3308,6 +3311,7 @@ fn managed_clone_copyout_fault_unbinds_birth_before_retry() {
             control
                 .service
                 .bind(carrick_core_abi::service::ServiceBirth {
+                    origin: carrick_core_abi::service::ServiceOrigin::Descendant,
                     process: carrick_sched_core::process::TaskKey {
                         id: carrick_sched_core::process::TaskId::from_registry_allocation(
                             core::num::NonZeroI32::new(PARENT_TID as i32).unwrap(),

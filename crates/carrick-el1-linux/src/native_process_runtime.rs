@@ -7664,6 +7664,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         service::bind_member_service(
             self.source.zone,
             self.key,
+            if self.is_root_process() {
+                carrick_core_abi::service::ServiceOrigin::Initial
+            } else {
+                carrick_core_abi::service::ServiceOrigin::Descendant
+            },
             record,
             carrick_core_abi::EntryThreadGeneration::from_raw(identity.serial),
             control,
