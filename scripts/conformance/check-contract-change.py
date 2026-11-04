@@ -12,6 +12,7 @@ from pathlib import Path
 
 # Tooling, test, and host crates outside guest execution surfaces
 NON_GUEST_CRATES = {
+    "crates/carrick-capture",
     "crates/carrick-conformance-contract",
     "crates/carrick-conformance",
     "crates/carrick-conformance-next",

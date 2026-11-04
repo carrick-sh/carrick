@@ -103,6 +103,12 @@ cp "$inputs/scripts/ci/admit-job.sh" seed/
 cp "$inputs/scripts/ci/inputs/codex-sdk-requirements.txt" seed/
 cp "$inputs/scripts/ci/inputs/copilot-sdk-requirements.txt" seed/
 cp "$inputs/scripts/ci/inputs/semgrep-requirements.txt" seed/
+if [[ $profile == agent ]]; then
+  # The root capture front's source and its reviewed bpftrace scripts
+  # (#1621); provisioning builds the front with the pinned rustc alone.
+  mkdir -p seed/capture
+  cp -R "$inputs/crates/carrick-capture/src" "$inputs/crates/carrick-capture/scripts" seed/capture/
+fi
 printf '%s\n' "$profile" > seed/profile
 printf '%s\n' "$gh_version" > seed/gh-version
 cat > seed/meta-data <<DATA
@@ -157,17 +163,16 @@ if [[ $(cat profile) == agent ]]; then
   /usr/sbin/usermod -aG carrick-dispatch-loop runner
   printf '%s\n' 'runner ALL=(carrick-dispatch-loop) NOPASSWD: ALL' > /etc/sudoers.d/carrick-dispatch-loop
   chmod 0440 /etc/sudoers.d/carrick-dispatch-loop
-  # Scoped capture privilege (#1621): the worker may sudo exactly bpftrace,
-  # dmesg and journalctl -k, never a shell or general root. Raw bpftrace as
-  # root could write any file (-o, --emit-*) or run commands (-c, --unsafe),
-  # so sudo admits /usr/local/sbin/bpftrace instead: a root-owned COPY of
-  # xtask (a link would share its inode with the general CLI) that, under
-  # that name, only checks an argument allowlist and runs /usr/bin/bpftrace
-  # without exec. The drop-in text is xtask's, so qualification compares
-  # the installed bytes. systemd's static sys-kernel-tracing.mount already
-  # mounts tracefs at boot; ci-scaler verify-capture requires it.
+  # Scoped capture privilege (#1621): the worker may sudo exactly
+  # carrick-capture, bare dmesg and journalctl -k, never a shell, raw
+  # bpftrace or general root. Root bpftrace with a free-form program can
+  # read any process's memory and any file, so carrick-capture (built after
+  # the toolchain below) runs only its reviewed, root-owned scripts by name,
+  # with no program text, files or options. The drop-in text is xtask's, so
+  # qualification compares the installed bytes. systemd's static
+  # sys-kernel-tracing.mount already mounts tracefs at boot; ci-scaler
+  # verify-capture requires it.
   DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y --no-install-recommends bpftrace
-  install -m 755 -o root -g root carrick-xtask /usr/local/sbin/bpftrace
   # sudo skips included names containing '.', so the staged file is inert.
   ./carrick-xtask ci-scaler capture-sudoers > /etc/sudoers.d/carrick-dispatch-capture.new
   chmod 0440 /etc/sudoers.d/carrick-dispatch-capture.new
@@ -225,6 +230,20 @@ if [[ $(cat profile) == agent ]]; then
   chown -R runner:runner /home/runner/.cargo
   runuser -u runner -- env RUSTUP_HOME="$RUSTUP_HOME" RUSTUP_AUTO_INSTALL=0 /home/runner/.cargo/bin/rustc --version
   runuser -u runner -- test ! -w "$RUSTUP_HOME"
+  # The root capture front (#1621) is std only, so the pinned rustc builds
+  # it from the seed without cargo, the network or any other crate. Its
+  # scripts must match the copies compiled into it, or it refuses to run.
+  rustc=$RUSTUP_HOME/toolchains/${channel}-x86_64-unknown-linux-gnu/bin/rustc
+  capture_build=$(mktemp -d)
+  "$rustc" --edition 2024 -C opt-level=2 --crate-type rlib --crate-name carrick_capture \
+    --out-dir "$capture_build" capture/src/lib.rs
+  "$rustc" --edition 2024 -C opt-level=2 --crate-type bin --crate-name carrick_capture \
+    --extern carrick_capture="$capture_build/libcarrick_capture.rlib" \
+    -o "$capture_build/carrick-capture" capture/src/main.rs
+  install -m 755 -o root -g root "$capture_build/carrick-capture" /usr/local/sbin/carrick-capture
+  install -d -m 755 -o root -g root /usr/local/lib/carrick-capture
+  install -m 644 -o root -g root capture/scripts/*.bt /usr/local/lib/carrick-capture/
+  rm -rf "$capture_build"
 else
   runuser -u runner -- /tmp/rustup-init -y --profile minimal --default-toolchain "$channel"
   runuser -u runner -- bash -c 'cd /home/runner; . "$HOME/.cargo/env"; rustup show; rustup target add x86_64-unknown-none; rustc --version; cargo --version'
@@ -277,7 +296,8 @@ if [[ $(cat profile) == agent ]]; then
   id -nG carrick-dispatch-agent | tr ' ' '\n' | grep -qx kvm
   runuser -u carrick-dispatch-agent -- /usr/local/bin/carrick-xtask ci-scaler verify-kvm
   # Allowed capture commands run non-interactively (including a live
-  # SIGKILL trace); sudo -n true, sudo -n bash and refused bpftrace shapes fail.
+  # SIGKILL capture through carrick-capture); sudo -n true, sudo -n bash,
+  # raw bpftrace and every other carrick-capture shape fail.
   runuser -u carrick-dispatch-agent -- /usr/local/bin/carrick-xtask ci-scaler verify-capture
   # This service account has no home. Qualification must supply writable state;
   # real worker turns already receive their own isolated home.
@@ -399,17 +419,23 @@ qm template "$template"
 if [[ $profile == agent ]]; then
   "$xtask" ci-scaler qualify-clone --template "$template" > clone-qualification.json
 fi
+# The capture front's staged source and scripts, as one hash (agent only).
+capture_hash=none
+if [[ -d seed/capture ]]; then
+  capture_hash=$( (cd seed/capture && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum) | sha256sum | cut -d' ' -f1)
+fi
 jq -n --arg commit "$commit" --arg script_hash "$(sha256sum "$inputs/scripts/ci/build-template-debian.sh" | cut -d' ' -f1)" \
   --arg image_url "$image_url" --arg image_sha512 "$image_sha512" --arg runner_version "$runner_version" --arg runner_sha256 "$runner_sha256" \
   --arg sccache_sha256 "$sccache_sha256" --arg rustup_sha256 "$rustup_sha256" --arg gh_sha256 "$gh_sha256" --arg toolchain_hash "$(sha256sum seed/rust-toolchain.toml | cut -d' ' -f1)" \
   --arg lock_hash "$(sha256sum seed/Cargo.lock | cut -d' ' -f1)" --arg xtask_hash "$(sha256sum seed/carrick-xtask | cut -d' ' -f1)" \
   --arg packages_hash "$(sha256sum packages.txt | cut -d' ' -f1)" --slurpfile qualification qualification.json \
+  --arg capture_hash "$capture_hash" \
   --arg pool "$template_pool" --argjson vmid "$template" --arg profile "$profile" --arg node "$node" --arg storage "$storage" --arg bridge "$bridge" \
   --argjson cores "$cores" --argjson memory_mib "$memory_mib" --argjson disk_gib "$disk_gib" \
   --arg bootstrap_hash "$(sha256sum seed/runner-once.sh | cut -d' ' -f1)" --arg hook_hash "$(sha256sum seed/admit-job.sh | cut -d' ' -f1)" \
   '{vmid:$vmid,profile:$profile,node:$node,pool:$pool,cpu:"host",vcpus:$cores,memory_mib:$memory_mib,disk_gib:$disk_gib,storage:$storage,bridge:$bridge,script_commit:$commit,
     script_sha256:$script_hash,image_url:$image_url,image_sha512:$image_sha512,runner_version:$runner_version,runner_sha256:$runner_sha256,
     sccache_sha256:$sccache_sha256,rustup_sha256:$rustup_sha256,gh_sha256:$gh_sha256,toolchain_sha256:$toolchain_hash,cargo_lock_sha256:$lock_hash,
-    xtask_sha256:$xtask_hash,bootstrap_sha256:$bootstrap_hash,hook_sha256:$hook_hash,packages_sha256:$packages_hash,qualification:$qualification[0]}' > manifest.json
+    xtask_sha256:$xtask_hash,capture_sha256:$capture_hash,bootstrap_sha256:$bootstrap_hash,hook_sha256:$hook_hash,packages_sha256:$packages_hash,qualification:$qualification[0]}' > manifest.json
 qm config "$template"
 cat manifest.json

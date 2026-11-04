@@ -217,10 +217,13 @@ pub(super) fn run(template: u16) -> Result<(), ScalerError> {
             deadline,
         )?;
         // Scoped capture privilege (#1621), on its own deadline so a slow but
-        // valid boot cannot starve the live bpftrace witness: root checks the
-        // installed policy, then the worker account exercises it.
-        let capture = Instant::now() + Duration::from_secs(150);
+        // valid boot cannot starve the live capture witness: root checks the
+        // installed policy and that carrick-capture refuses a script outside
+        // its allowlist or a tampered one (this clone is destroyed after),
+        // then the worker account exercises the policy.
+        let capture = Instant::now() + Duration::from_secs(180);
         capture::verify_policy(|args| guest(args, capture))?;
+        capture::verify_root_refusals(|args| guest(args, capture))?;
         let worker = guest_within(
             &[
                 "/usr/sbin/runuser",

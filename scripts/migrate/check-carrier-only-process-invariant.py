@@ -91,6 +91,7 @@ EXPECTED_FIELDS = {"path", "line", "column", "kind", "detail", "enclosing_item"}
 
 NON_PRODUCT_CRATES = frozenset(
     {
+        "carrick-capture",
         "carrick-conformance",
         "carrick-coordinator",
         "carrick-investigation",

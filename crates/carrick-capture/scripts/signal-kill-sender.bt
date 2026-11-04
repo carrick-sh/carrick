@@ -1,0 +1,37 @@
+// signal-kill-sender: who sends SIGKILL to whom (#1621, for #1580's
+// compiler SIGKILLs).
+//
+// A reviewed capture script. Workers run it only as
+// `sudo carrick-capture signal-kill-sender [--seconds N]`; carrick-capture
+// passes N as $1 and this script exits after N interval ticks. One line per
+// SIGKILL generated anywhere on the clone. The sender is current: `pid` is
+// its process id and `comm` its name (the killer, or the allocating task
+// for an OOM kill). The target's `pid` (its kernel task id, which is the
+// thread id) and `comm` come from the signal_generate tracepoint record.
+// It dereferences no pointer and reads no file.
+
+BEGIN
+{
+	printf("capture ready: signal-kill-sender for %d s\n", $1);
+}
+
+tracepoint:signal:signal_generate
+/args->sig == 9/
+{
+	time("%H:%M:%S ");
+	printf("sigkill sender_pid=%d sender_comm=%s target_pid=%d target_comm=%s result=%d\n",
+		pid, comm, args->pid, args->comm, args->result);
+}
+
+interval:s:1
+{
+	@seconds = @seconds + 1;
+	if (@seconds >= $1) {
+		exit();
+	}
+}
+
+END
+{
+	clear(@seconds);
+}

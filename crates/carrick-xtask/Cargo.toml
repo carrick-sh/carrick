@@ -44,6 +44,9 @@ toml.workspace = true
 yaml-rust2 = { version = "0.13", default-features = false }
 
 carrick-conformance = { path = "../carrick-conformance", optional = true }
+# Constants and the argument parser of the root capture front (#1621); xtask
+# only checks its installation and is never root-run itself.
+carrick-capture = { path = "../carrick-capture" }
 carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-portable = { path = "../carrick-portable" }
 

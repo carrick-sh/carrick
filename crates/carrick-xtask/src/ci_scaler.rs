@@ -14,7 +14,6 @@ use thiserror::Error;
 mod assignment;
 mod claim;
 mod capture;
-pub use capture::bpftrace_front;
 mod github;
 pub(crate) use github::dispatch_workflow_unchanged;
 mod live;
@@ -1287,7 +1286,8 @@ pub enum ScalerAction {
     /// Print the agent template's scoped capture sudoers drop-in (#1621).
     CaptureSudoers,
     /// As the dispatch worker: fail unless sudo admits exactly the scoped
-    /// capture commands (bpftrace, dmesg, journalctl -k) and nothing else.
+    /// capture commands (carrick-capture's reviewed scripts, dmesg,
+    /// journalctl -k) and nothing else.
     VerifyCapture,
     /// Runner job-start hook: authorize before any workflow step executes.
     AdmitJob {
