@@ -6,6 +6,10 @@ Owner inputs (2026-10-17): x86_64 guests on x86_64 Linux hosts first, same ISA
 only; then AArch64 on macOS hosted runners. Capacity, not product performance,
 is the driver. Plan only, no implementation in this pass.
 
+AArch64 continuation: [shared substrate and ARM software vCPU proposal](2026-11-04-aarch64-soft-backend-design.md)
+(#1236), grounded in the 2026-11-04 tree. Its updated shared-layer proposal
+and current-state audit should be reviewed alongside this historical plan.
+
 ## 1. Summary
 
 Carrick cannot run a guest without `/dev/kvm`, `Hypervisor.framework`, bhyve or
