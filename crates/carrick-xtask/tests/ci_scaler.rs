@@ -973,11 +973,10 @@ fn hardware_lanes_never_wait_and_hosted_gates_grade_with_receipted_baseline_code
         assert!(script.contains("cargo build --locked --offline --release -p carrick-xtask"));
         let prepare = steps
             .iter()
-            .position(|s| {
-                s["uses"]
-                    .as_str()
-                    .is_some_and(|u| u.ends_with(".github/actions/prepare-cargo"))
-            })
+            // The trusted selector/baseline trees may predate the
+            // prepare-cargo action, so these gates inline its root-only
+            // preparation; match the step by name, either form.
+            .position(|s| s["name"].as_str() == Some("Prepare locked Cargo cache (infrastructure)"))
             .unwrap_or_else(|| panic!("{name} must prepare the locked cargo cache"));
         let build = steps
             .iter()
