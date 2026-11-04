@@ -64,6 +64,7 @@ pub enum TransientFailure {
     Connection,
     SshConnect,
     PveServer,
+    GithubServer,
 }
 
 #[derive(Debug, Error)]

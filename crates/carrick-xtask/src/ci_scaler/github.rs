@@ -115,8 +115,15 @@ impl Github {
         let mut invoke = || {
             execute_with_failure(&mut cmd, &input, Duration::from_secs(60), |bytes| {
                 let body: Value = serde_json::from_slice(bytes).ok()?;
-                (body["status"] == "404" || body["status"] == 404)
-                    .then_some(ScalerError::GithubGone)
+                if body["status"] == "404" || body["status"] == 404 {
+                    Some(ScalerError::GithubGone)
+                } else {
+                    let status = body["status"]
+                        .as_u64()
+                        .or_else(|| body["status"].as_str()?.parse().ok())?;
+                    (status == 429 || (500..600).contains(&status))
+                        .then_some(ScalerError::Transient(TransientFailure::GithubServer))
+                }
             })
         };
         let output = if method == "GET" {
@@ -213,7 +220,7 @@ impl Github {
             &runs,
             |run| self.jobs(run),
             |run| {
-                Self::admits_run(
+                Self::admit_reported(
                     admission,
                     run,
                     &mut |method, endpoint, body, paginate| {
@@ -281,7 +288,7 @@ impl Github {
             })();
             match pending {
                 Ok(pending) => demand.extend(pending),
-                Err(error) if matches!(admission, Admission::Agent) => {
+                Err(error @ ScalerError::Guard(_)) if matches!(admission, Admission::Agent) => {
                     admission_refused(run, &error.to_string())
                 }
                 Err(error) => return Err(error),
@@ -407,7 +414,7 @@ impl Github {
     /// Re-read admission and attempt immediately before minting a runner.
     /// The hook's policy is bound to this exact run and SHA.
     pub(super) fn vet(&self, admission: &Admission, key: JobKey) -> Result<JobPolicy, ScalerError> {
-        Self::vet_inner(
+        Self::vet_reported(
             admission,
             key,
             |method, endpoint, body, paginate| self.request(method, endpoint, body, paginate),
@@ -430,6 +437,25 @@ impl Github {
             },
             key,
         )
+    }
+
+    pub(super) fn report_assignment_refusal(
+        &self,
+        key: JobKey,
+        reason: &str,
+    ) -> Result<(), ScalerError> {
+        let run = self.request(
+            "GET",
+            &format!("repos/{REPOSITORY}/actions/runs/{}", key.run.0),
+            None,
+            false,
+        )?;
+        if run["path"] == DISPATCH_WORKFLOW {
+            Self::report_refusal(key, reason, &mut |method, endpoint, body, paginate| {
+                self.request(method, endpoint, body, paginate)
+            })?;
+        }
+        Ok(())
     }
 
     /// issue_comment runs use main, so their REST run has no issue/PR mapping.
@@ -575,7 +601,7 @@ impl Github {
                 issue_number,
                 branch,
                 (if pr["user"]["login"] == "carrick-workers[bot]" {
-                    publication(&pr, &original, issue_number, branch)
+                    publication(&pr, &original, issue_number, branch)?
                 } else {
                     None
                 })
@@ -657,6 +683,22 @@ impl Github {
         request: &mut impl FnMut(&str, &str, Option<Value>, bool) -> Result<Value, ScalerError>,
         publication: &mut crate::dispatch_worker::PublicationLookup<'_>,
     ) -> Result<bool, ScalerError> {
+        // Boolean policy callbacks must not turn an unavailable authority into
+        // a negative verdict. Retain the original typed error across them.
+        let mut unavailable = None;
+        let mut checked_request =
+            |method: &str, endpoint: &str, body: Option<Value>, paginate| match request(
+                method, endpoint, body, paginate,
+            ) {
+                Ok(value) => Ok(value),
+                Err(error) => {
+                    if unavailable.is_none() {
+                        unavailable = Some(error);
+                    }
+                    Err(ScalerError::External("admission authority unavailable"))
+                }
+            };
+        let request = &mut checked_request;
         let checked = (|| -> Result<bool, ScalerError> {
             if !admission.identifies_run(run) {
                 return Ok(false);
@@ -703,19 +745,20 @@ impl Github {
                 None,
                 false,
             )?;
-            if !prs.as_array().into_iter().flatten().any(|pr| {
+            let mut owned = false;
+            for pr in prs.as_array().into_iter().flatten() {
                 let valid_base = crate::dispatch_worker::stack_parent(pr, |endpoint| {
                     request("GET", &endpoint, None, false)
                 })
                 .ok();
-                pr["head"]["sha"] == run["head_sha"]
+                owned |= pr["head"]["sha"] == run["head_sha"]
                     && crate::dispatch_worker::owned_pr_on_base(
                         pr,
                         &original,
                         issue,
                         branch,
                         (if pr["user"]["login"] == "carrick-workers[bot]" {
-                            publication(pr, &original, issue, branch)
+                            publication(pr, &original, issue, branch)?
                         } else {
                             None
                         })
@@ -726,8 +769,9 @@ impl Github {
                                 request("GET", endpoint, None, false)
                             })
                         },
-                    )
-            }) {
+                    );
+            }
+            if !owned {
                 return Ok(false);
             }
             let head = run["head_sha"]
@@ -735,18 +779,130 @@ impl Github {
                 .ok_or(ScalerError::Guard("review SHA missing"))?;
             dispatch_workflow_unchanged(head, |endpoint| request("GET", endpoint, None, false))
         })();
+        if let Some(error) = unavailable {
+            return Err(error);
+        }
         match checked {
-            Ok(true) => Ok(true),
-            result if matches!(admission, Admission::Agent) => {
-                let reason = result
-                    .err()
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| "PR head/ownership or workflow check refused".into());
-                admission_refused(run, &reason);
+            Ok(false) if matches!(admission, Admission::Agent) => {
+                admission_refused(run, "PR head/ownership or workflow check refused");
                 Ok(false)
             }
             result => result,
         }
+    }
+
+    fn admit_reported(
+        admission: &Admission,
+        run: &Value,
+        request: &mut impl FnMut(&str, &str, Option<Value>, bool) -> Result<Value, ScalerError>,
+        publication: &mut crate::dispatch_worker::PublicationLookup<'_>,
+    ) -> Result<bool, ScalerError> {
+        let checked = Self::admits_run(admission, run, request, publication);
+        let (admitted, reason) = match checked {
+            Ok(admitted) => (
+                admitted,
+                "run approval no longer satisfies dispatch admission",
+            ),
+            Err(ScalerError::Guard(reason)) if matches!(admission, Admission::Agent) => {
+                (false, reason)
+            }
+            Err(error) => return Err(error),
+        };
+        if !admitted && matches!(admission, Admission::Agent) {
+            let (run, attempt) = AdmissionNotices::key(run);
+            Self::report_refusal(
+                JobKey {
+                    run,
+                    attempt,
+                    job: JobId(0),
+                },
+                reason,
+                request,
+            )?;
+        }
+        Ok(admitted)
+    }
+
+    /// Publish before committing a terminal refusal. If publication is
+    /// unavailable, the reservation remains pending and the next poll retries.
+    fn vet_reported(
+        admission: &Admission,
+        key: JobKey,
+        mut request: impl FnMut(&str, &str, Option<Value>, bool) -> Result<Value, ScalerError>,
+        publication: &mut crate::dispatch_worker::PublicationLookup<'_>,
+    ) -> Result<JobPolicy, ScalerError> {
+        let result = Self::vet_inner(admission, key, &mut request, publication);
+        if let Err(ScalerError::Guard(reason)) = &result
+            && matches!(admission, Admission::Agent)
+        {
+            Self::report_refusal(key, reason, &mut request)?;
+        }
+        result
+    }
+
+    fn report_refusal(
+        key: JobKey,
+        reason: &str,
+        request: &mut impl FnMut(&str, &str, Option<Value>, bool) -> Result<Value, ScalerError>,
+    ) -> Result<(), ScalerError> {
+        let data = request(
+            "GET",
+            &format!(
+                "repos/{REPOSITORY}/actions/runs/{}/attempts/{}/jobs?per_page=100",
+                key.run.0, key.attempt
+            ),
+            None,
+            true,
+        )?;
+        let jobs = pages(&data, "jobs")?;
+        let targets: Vec<u64> = jobs
+            .iter()
+            .filter(|job| job["name"] == "guard" && job["conclusion"] == "success")
+            .flat_map(|job| job["steps"].as_array().into_iter().flatten())
+            .filter(|step| step["conclusion"] == "success")
+            .filter_map(|step| {
+                step["name"]
+                    .as_str()?
+                    .strip_prefix("Dispatch issue ")?
+                    .parse()
+                    .ok()
+            })
+            .filter(|number| *number > 0)
+            .collect();
+        let [target] = targets.as_slice() else {
+            return Err(ScalerError::External(
+                "refusal outcome has no unique trusted guard issue",
+            ));
+        };
+        let endpoint = format!("repos/{REPOSITORY}/issues/{target}/comments");
+        let marker = format!("<!-- carrick-admission:{}:{} -->", key.run.0, key.attempt);
+        let comments = request("GET", &format!("{endpoint}?per_page=100"), None, true)?;
+        let comments = comments
+            .as_array()
+            .ok_or(ScalerError::External("refusal outcome comments"))?;
+        if comments
+            .iter()
+            .flat_map(|page| page.as_array().into_iter().flatten())
+            .any(|comment| {
+                matches!(
+                    comment["user"]["login"].as_str(),
+                    Some("carrick-workers[bot]" | "tjfontaine")
+                ) && comment["body"]
+                    .as_str()
+                    .is_some_and(|body| body.contains(&marker))
+            })
+        {
+            return Ok(());
+        }
+        request(
+            "POST",
+            &endpoint,
+            Some(json!({"body": format!(
+                "Dispatch round refused before worker execution: {reason}.\n\nRun: https://github.com/{REPOSITORY}/actions/runs/{}/attempts/{}\n\nRe-trigger the round after resolving the refusal.\n\n{marker}", key.run.0, key.attempt
+            )})),
+            false,
+        )?;
+        Ok(())
     }
 
     fn vet_inner(
@@ -972,6 +1128,301 @@ mod tests {
         }
     }
 
+    /// Script only the external API; drive the controller's actual rendezvous,
+    /// GitHub admission, durable refusal and approval publication paths.
+    struct RevetFixture {
+        unavailable: std::cell::Cell<bool>,
+        denied: bool,
+        outcome_unavailable: std::cell::Cell<bool>,
+        comments: std::cell::RefCell<Vec<Value>>,
+    }
+    impl RevetFixture {
+        fn new(unavailable: bool, denied: bool, outcome_unavailable: bool) -> Self {
+            Self {
+                unavailable: std::cell::Cell::new(unavailable),
+                denied,
+                outcome_unavailable: std::cell::Cell::new(outcome_unavailable),
+                comments: Default::default(),
+            }
+        }
+        fn key() -> JobKey {
+            JobKey {
+                run: RunId(42),
+                attempt: 1,
+                job: JobId(43),
+            }
+        }
+        fn request(
+            &self,
+            method: &str,
+            endpoint: &str,
+            body: Option<Value>,
+            _: bool,
+        ) -> Result<Value, ScalerError> {
+            if endpoint.contains("/collaborators/") {
+                if self.unavailable.replace(false) {
+                    return Err(ScalerError::Transient(TransientFailure::GithubServer));
+                }
+                return Ok(json!({"permission": if self.denied {"read"} else {"write"}}));
+            }
+            if endpoint.ends_with("/runs/42") {
+                return Ok(
+                    json!({"id":42,"run_attempt":1,"event":"issues","head_sha":"a".repeat(40),
+                    "created_at":"2026-01-01T00:00:00Z", "head_branch":"main","path":DISPATCH_WORKFLOW,
+                    "repository":{"full_name":REPOSITORY},"head_repository":{"full_name":REPOSITORY},
+                    "actor":{"login":"tjfontaine","type":"User"},"triggering_actor":{"login":"tjfontaine","type":"User"}}),
+                );
+            }
+            if endpoint.contains("/jobs?") {
+                return Ok(
+                    json!([{"jobs":[{"id":43,"runner_id":700,"labels":AGENT_LABELS},
+                    {"name":"guard","status":"completed","conclusion":"success","steps":[
+                        {"name":"Dispatch issue 1605","conclusion":"success"}]}]}]),
+                );
+            }
+            assert!(endpoint.contains("/issues/1605/comments"), "{endpoint}");
+            if method == "GET" {
+                return Ok(json!([self.comments.borrow().clone()]));
+            }
+            assert_eq!(method, "POST");
+            if self.outcome_unavailable.replace(false) {
+                return Err(ScalerError::Transient(TransientFailure::Connection));
+            }
+            self.comments.borrow_mut().push(
+                json!({"user":{"login":"carrick-workers[bot]"},"body":body.unwrap()["body"]}),
+            );
+            Ok(Value::Null)
+        }
+    }
+    impl assignment::AssignmentApi for RevetFixture {
+        fn report_refusal(&self, key: JobKey, reason: &str) -> Result<(), ScalerError> {
+            Github::report_refusal(key, reason, &mut |method, endpoint, body, paginate| {
+                self.request(method, endpoint, body, paginate)
+            })
+        }
+
+        fn run_jobs(&self, _: RunId, _: u32) -> Result<Vec<Value>, ScalerError> {
+            pages(&self.request("GET", "/jobs?", None, true)?, "jobs")
+        }
+        fn revet(&self, key: JobKey) -> Result<JobPolicy, ScalerError> {
+            Github::vet_reported(
+                &Admission::Agent,
+                key,
+                |method, endpoint, body, paginate| self.request(method, endpoint, body, paginate),
+                &mut |_, _, _, _| Ok(None),
+            )
+        }
+    }
+    struct RevetGuest {
+        approvals: usize,
+        stale_sha: bool,
+    }
+    impl assignment::AssignmentExchange for RevetGuest {
+        fn read(&mut self) -> Result<Option<assignment::AssignmentRequest>, ScalerError> {
+            Ok(Some(assignment::AssignmentRequest {
+                approved: false,
+                finished: false,
+                context: JobContext {
+                    repository: REPOSITORY.into(),
+                    actor: "tjfontaine".into(),
+                    triggering_actor: "tjfontaine".into(),
+                    event: "issues".into(),
+                    workflow_ref: format!("{REPOSITORY}/{DISPATCH_WORKFLOW}@refs/heads/main"),
+                    git_ref: "refs/heads/main".into(),
+                    sha: if self.stale_sha { "b" } else { "a" }.repeat(40),
+                    run_id: 42,
+                    run_attempt: 1,
+                },
+            }))
+        }
+        fn approve(&mut self, _: &JobPolicy) -> Result<(), ScalerError> {
+            self.approvals += 1;
+            Ok(())
+        }
+    }
+    fn revet_poll(
+        api: &RevetFixture,
+        guest: &mut RevetGuest,
+        ledger: &mut Ledger,
+        path: &Path,
+    ) -> Result<assignment::Revetted, ScalerError> {
+        assignment::serve_assignment(
+            api,
+            guest,
+            &AGENT_LABELS,
+            Some(RunnerId(700)),
+            ledger,
+            path,
+            |ledger, key| {
+                ledger.rows[0].assigned = Some(key.job);
+                ledger.rows[0].assigned_key = Some(key);
+                ledger.save(path)
+            },
+        )
+    }
+    fn revet_ledger() -> Ledger {
+        let mut ledger = Ledger::default();
+        ledger
+            .reserve(RevetFixture::key(), &[], 100, Concurrency::ONE)
+            .unwrap();
+        ledger
+    }
+    #[test]
+    fn revet_api_failure_retries_then_admits_without_a_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let mut ledger = revet_ledger();
+        let mut guest = RevetGuest {
+            approvals: 0,
+            stale_sha: false,
+        };
+        let api = RevetFixture::new(true, false, false);
+        assert!(matches!(
+            revet_poll(&api, &mut guest, &mut ledger, &path),
+            Err(ScalerError::Transient(TransientFailure::GithubServer))
+        ));
+        assert!(ledger.refused.is_empty());
+        assert_eq!(guest.approvals, 0);
+        assert!(api.comments.borrow().is_empty());
+        let result = revet_poll(&api, &mut guest, &mut ledger, &path).unwrap();
+        assert!(matches!(result, assignment::Revetted::Approved(..)));
+        assert_eq!(guest.approvals, 1);
+        assert!(Ledger::load(&path).unwrap().refused.is_empty());
+    }
+    #[test]
+    fn revet_real_refusal_has_an_outcome_and_outcome_failure_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let mut ledger = revet_ledger();
+        let mut guest = RevetGuest {
+            approvals: 0,
+            stale_sha: false,
+        };
+        let api = RevetFixture::new(false, true, true);
+        assert!(matches!(
+            revet_poll(&api, &mut guest, &mut ledger, &path),
+            Err(ScalerError::Transient(_))
+        ));
+        assert!(ledger.refused.is_empty(), "do not settle before reporting");
+        assert_eq!(
+            revet_poll(&api, &mut guest, &mut ledger, &path).unwrap(),
+            assignment::Revetted::Refused(RevetFixture::key())
+        );
+        assert_eq!(guest.approvals, 0);
+        assert_eq!(
+            Ledger::load(&path).unwrap().refused,
+            vec![RevetFixture::key()]
+        );
+        let comments = api.comments.borrow();
+        assert_eq!(comments.len(), 1);
+        assert!(
+            comments[0]["body"]
+                .as_str()
+                .unwrap()
+                .contains("reserved run is no longer admitted")
+        );
+        drop(comments);
+        // A process restart after the comment POST but before ledger publication
+        // finds the authenticated outcome rather than posting it a second time.
+        assert!(assignment::AssignmentApi::revet(&api, RevetFixture::key()).is_err());
+        assert_eq!(api.comments.borrow().len(), 1);
+    }
+    #[test]
+    fn queued_chain_refusal_retries_outcome_before_leaving_demand() {
+        let api = RevetFixture::new(false, false, true);
+        let mut run = api.request("GET", "/runs/42", None, false).unwrap();
+        run["event"] = json!("workflow_dispatch");
+        run["actor"] = json!({"login":"github-actions[bot]", "type":"Bot"});
+        run["triggering_actor"] = run["actor"].clone();
+        let poll = || {
+            Github::queued_jobs(
+                &Admission::Agent,
+                &AGENT_LABELS,
+                std::slice::from_ref(&run),
+                |_| {
+                    Ok(vec![
+                        json!({"id":43,"status":"queued","labels":AGENT_LABELS,"runner_id":0,"conclusion":null}),
+                        json!({"name":"guard","status":"completed","conclusion":"success","labels":[]}),
+                    ])
+                },
+                |run| {
+                    Github::admit_reported(
+                        &Admission::Agent,
+                        run,
+                        &mut |method, endpoint, body, paginate| {
+                            if endpoint.contains("/jobs?") {
+                                return Ok(
+                                    json!([{"jobs":[{"name":"guard","status":"completed","conclusion":"success","steps":[
+                            {"name":"Chain outcome 1605 30","conclusion":"success"},
+                            {"name":"Dispatch issue 1605","conclusion":"success"}]}]}]),
+                                );
+                            }
+                            if endpoint.ends_with("/issues/comments/30") {
+                                return Ok(json!({"body":"no longer a dispatch outcome"}));
+                            }
+                            api.request(method, endpoint, body, paginate)
+                        },
+                        &mut |_, _, _, _| Ok(None),
+                    )
+                },
+            )
+        };
+        assert!(
+            matches!(poll(), Err(ScalerError::Transient(_))),
+            "failed outcome publication must retain queued work"
+        );
+        assert!(api.comments.borrow().is_empty());
+        assert!(
+            poll().unwrap().is_empty(),
+            "a real policy refusal leaves demand after reporting"
+        );
+        let comments = api.comments.borrow();
+        assert_eq!(comments.len(), 1);
+        assert!(
+            comments[0]["body"]
+                .as_str()
+                .unwrap()
+                .contains("not a dispatch outcome")
+        );
+    }
+
+    #[test]
+    fn revet_policy_context_mismatch_reports_before_refusing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = revet_ledger();
+        let mut guest = RevetGuest {
+            approvals: 0,
+            stale_sha: true,
+        };
+        let api = RevetFixture::new(false, false, false);
+        assert_eq!(
+            revet_poll(&api, &mut guest, &mut ledger, &dir.path().join("ledger")).unwrap(),
+            assignment::Revetted::Refused(RevetFixture::key())
+        );
+        assert_eq!(guest.approvals, 0);
+        assert_eq!(api.comments.borrow().len(), 1);
+    }
+
+    #[test]
+    fn revet_long_queued_approval_is_admitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = revet_ledger();
+        let mut guest = RevetGuest {
+            approvals: 0,
+            stale_sha: false,
+        };
+        assert!(matches!(
+            revet_poll(
+                &RevetFixture::new(false, false, false),
+                &mut guest,
+                &mut ledger,
+                &dir.path().join("ledger")
+            ),
+            Ok(assignment::Revetted::Approved(..))
+        ));
+        assert_eq!(guest.approvals, 1);
+    }
+
     #[test]
     fn agent_comment_controller_rechecks_collaborator_unedited_comment_and_owned_pr() {
         let mut run = review_run(99);
@@ -1027,18 +1478,45 @@ mod tests {
                 pr["head"]["sha"] = "b".repeat(40).into();
             }
             let mut calls = Vec::new();
-            let admitted = Github::admits_run(&Admission::Agent, &run, &mut |_, endpoint, _, _| {
-                calls.push(endpoint.to_owned());
-                Ok(if endpoint.contains("/jobs?") {
-                    json!([{"jobs":[{"name":"guard","status":"completed","conclusion":if case=="no_guard" {"failure"} else {"success"},"steps":[{"name":format!("Dispatch comment 800 123 {digest}"),"conclusion":"success"},{"name":format!("Dispatch head {}","a".repeat(40)),"conclusion":"success"}]}]}])
-                } else if endpoint.ends_with("/issues/comments/123") { comment.clone() }
-                else if endpoint.ends_with("/issues/800") { if pr_case { json!({"pull_request":{}}) } else { issue.clone() } }
-                else if endpoint.ends_with("/pulls/800") { pr.clone() }
-                else if endpoint.ends_with("/actions/runs/42") { original.clone() }
-                else if endpoint.ends_with("/issues/799") { issue.clone() }
-                else if endpoint.contains("/collaborators/") { permission(endpoint)? }
-                else { panic!("unexpected endpoint {endpoint}") })
-            }, &mut |_, _, _, _| None).unwrap();
+            let admitted = Github::admits_run(
+                &Admission::Agent,
+                &run,
+                &mut |_, endpoint, _, _| {
+                    calls.push(endpoint.to_owned());
+                    Ok(if endpoint.contains("/jobs?") {
+                        json!([{"jobs":[{"name":"guard","status":"completed","conclusion":if case=="no_guard" {"failure"} else {"success"},"steps":[{"name":format!("Dispatch comment 800 123 {digest}"),"conclusion":"success"},{"name":format!("Dispatch head {}","a".repeat(40)),"conclusion":"success"}]}]}])
+                    } else if endpoint.ends_with("/issues/comments/123") {
+                        comment.clone()
+                    } else if endpoint.ends_with("/issues/800") {
+                        if pr_case {
+                            json!({"pull_request":{}})
+                        } else {
+                            issue.clone()
+                        }
+                    } else if endpoint.ends_with("/pulls/800") {
+                        pr.clone()
+                    } else if endpoint.ends_with("/actions/runs/42") {
+                        original.clone()
+                    } else if endpoint.ends_with("/issues/799") {
+                        issue.clone()
+                    } else if endpoint.contains("/collaborators/") {
+                        permission(endpoint)?
+                    } else {
+                        panic!("unexpected endpoint {endpoint}")
+                    })
+                },
+                &mut |_, _, _, _| Ok(None),
+            );
+            if case == "api-down" {
+                assert!(matches!(admitted, Err(ScalerError::GithubGone)));
+            }
+            let admitted = match admitted {
+                Ok(value) => value,
+                Err(_) => {
+                    assert!(!allowed, "{case}");
+                    false
+                }
+            };
             if admitted != allowed {
                 unsafe_cases.push(case);
             }
@@ -1132,9 +1610,15 @@ mod tests {
                     }
                     serve(endpoint)
                 },
-                &mut |_, _, _, _| None,
-            )
-            .unwrap();
+                &mut |_, _, _, _| Ok(None),
+            );
+            let admitted = match admitted {
+                Ok(value) => value,
+                Err(_) => {
+                    assert!(!allowed, "{case}");
+                    false
+                }
+            };
             if admitted != allowed {
                 wrong.push(case);
             }
@@ -1263,22 +1747,42 @@ mod tests {
             original["event"] = "issues".into();
             original["head_branch"] = "main".into();
             let mut graphql = 0;
-            let admitted = Github::admits_run(&Admission::Agent, &run, &mut |method, endpoint, body, _| {
-                Ok(if endpoint.contains("/jobs?") {
-                    json!([{"jobs":[{"name":"guard","status":"completed","conclusion":"success","steps":steps}]}])
-                } else if endpoint == "graphql" {
-                    graphql += 1;
-                    assert_eq!(method, "POST");
-                    assert_eq!(body.unwrap()["variables"]["number"], 1150);
-                    json!({"data":{"repository":{"pullRequest":{"closingIssuesReferences":connection,"bodyReferences":connection}}}})
-                } else if endpoint.ends_with("/issues/comments/123") { comment.clone() }
-                else if endpoint.ends_with("/issues/1150") { json!({"pull_request":{}}) }
-                else if endpoint.ends_with("/pulls/1150") { pr.clone() }
-                else if endpoint.ends_with("/issues/986") { issue.clone() }
-                else if endpoint.ends_with("/actions/runs/42") { original.clone() }
-                else if endpoint.contains("/collaborators/") { permission(endpoint)? }
-                else { panic!("unexpected endpoint {endpoint}") })
-            }, &mut |_, _, _, _| None).unwrap();
+            let admitted = Github::admits_run(
+                &Admission::Agent,
+                &run,
+                &mut |method, endpoint, body, _| {
+                    Ok(if endpoint.contains("/jobs?") {
+                        json!([{"jobs":[{"name":"guard","status":"completed","conclusion":"success","steps":steps}]}])
+                    } else if endpoint == "graphql" {
+                        graphql += 1;
+                        assert_eq!(method, "POST");
+                        assert_eq!(body.unwrap()["variables"]["number"], 1150);
+                        json!({"data":{"repository":{"pullRequest":{"closingIssuesReferences":connection,"bodyReferences":connection}}}})
+                    } else if endpoint.ends_with("/issues/comments/123") {
+                        comment.clone()
+                    } else if endpoint.ends_with("/issues/1150") {
+                        json!({"pull_request":{}})
+                    } else if endpoint.ends_with("/pulls/1150") {
+                        pr.clone()
+                    } else if endpoint.ends_with("/issues/986") {
+                        issue.clone()
+                    } else if endpoint.ends_with("/actions/runs/42") {
+                        original.clone()
+                    } else if endpoint.contains("/collaborators/") {
+                        permission(endpoint)?
+                    } else {
+                        panic!("unexpected endpoint {endpoint}")
+                    })
+                },
+                &mut |_, _, _, _| Ok(None),
+            );
+            let admitted = match admitted {
+                Ok(value) => value,
+                Err(_) => {
+                    assert!(!allowed, "{case}");
+                    false
+                }
+            };
             if case == "dispatch_ref" {
                 assert_eq!(
                     graphql, 0,
@@ -1371,7 +1875,7 @@ mod tests {
                         panic!("unexpected API endpoint: {endpoint}")
                     }
                 },
-                &mut |_, _, _, _| None,
+                &mut |_, _, _, _| Ok(None),
             );
             if result.is_ok() != allowed {
                 failures.push(format!(
@@ -1405,7 +1909,7 @@ mod tests {
                     Ok(json!({"type":"file","sha":if endpoint.ends_with(&"a".repeat(40)) {head_blob.repeat(40)} else {"b".repeat(40)}}))
                 } else if endpoint.contains("/collaborators/") { permission(endpoint) }
                 else { panic!("unexpected endpoint {endpoint}") }
-            }, &mut |_, _, _, _| None).unwrap();
+            }, &mut |_, _, _, _| Ok(None)).unwrap();
             assert_eq!(admitted, allowed);
             assert_eq!(blobs.len(), 2);
             assert!(blobs[1].ends_with(&format!("ref={}", "b".repeat(40))));
@@ -1445,7 +1949,7 @@ mod tests {
         assert_eq!(demand[0].key.run, RunId(102));
     }
     #[test]
-    fn dispatch_review_api_failure_does_not_hide_other_demand() {
+    fn dispatch_review_api_failure_retains_demand_for_the_next_poll() {
         let runs = vec![review_run(99), review_run(100)];
         let demand = Github::queued_jobs(
             &Admission::Agent,
@@ -1458,17 +1962,26 @@ mod tests {
                         &Admission::Agent,
                         run,
                         &mut |_, _, _, _| Err(ScalerError::GithubGone),
-                        &mut |_, _, _, _| None,
+                        &mut |_, _, _, _| Ok(None),
                     )
                 } else {
                     Ok(true)
                 }
             },
         );
-        assert!(demand.is_ok(), "one missing review run blocked all demand");
-        let demand = demand.unwrap();
-        assert_eq!(demand.len(), 1);
-        assert_eq!(demand[0].key.run, RunId(100));
+        assert!(
+            matches!(demand, Err(ScalerError::GithubGone)),
+            "an API failure is not a refusal"
+        );
+        let retried = Github::queued_jobs(
+            &Admission::Agent,
+            &AGENT_LABELS,
+            &runs,
+            |run| Ok(review_jobs(run["id"].as_u64().unwrap())),
+            |_| Ok(true),
+        )
+        .unwrap();
+        assert_eq!(retried.len(), 2, "both jobs remain demand on recovery");
         let key = JobKey {
             run: RunId(99),
             attempt: 1,
@@ -1485,7 +1998,7 @@ mod tests {
                         Err(ScalerError::GithubGone)
                     }
                 },
-                &mut |_, _, _, _| None
+                &mut |_, _, _, _| Ok(None)
             )
             .is_err()
         );
@@ -1524,7 +2037,7 @@ mod tests {
                         json!([{"jobs":[{"name":"guard", "status":status,"conclusion":conclusion}]}]),
                     )
                 },
-                &mut |_, _, _, _| None,
+                &mut |_, _, _, _| Ok(None),
             );
             assert_eq!(policy.is_ok(), permitted);
             if permitted {
@@ -1561,7 +2074,7 @@ mod tests {
                     assert!(endpoint.ends_with("/runs/1"), "{endpoint}");
                     Ok(run.clone())
                 },
-                &mut |_, _, _, _| None,
+                &mut |_, _, _, _| Ok(None),
             );
             assert_eq!(result.is_ok(), admitted, "{event} {branch}");
             if let Ok(policy) = result {
@@ -1894,7 +2407,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let gh = dir.path().join("gh");
-        for status in ["404", "403"] {
+        for status in ["404", "403", "429", "503"] {
             crate::lock_file::tests::write_test_executable(
                 &gh,
                 format!(
@@ -1915,6 +2428,12 @@ mod tests {
                     json!("Gone")
                 );
             } else {
+                if matches!(status, "429" | "503") {
+                    assert!(matches!(
+                        &decision,
+                        Err(ScalerError::Transient(TransientFailure::GithubServer))
+                    ));
+                }
                 let error = decision.unwrap_err().to_string();
                 assert!(!error.contains("sensitive-body"), "{error}");
             }

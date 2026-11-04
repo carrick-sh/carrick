@@ -1301,7 +1301,7 @@ impl<K: Ord + Clone, V: Clone> LookupCache<K, V> {
         }
         let attempts = self.attempts.entry(key.clone()).or_default();
         if *attempts >= RUN_LOOKUP_ATTEMPTS {
-            return Err(ScalerError::Guard("run lookup retry budget exhausted"));
+            return Err(ScalerError::External("run lookup retry budget exhausted"));
         }
         *attempts += 1;
         let value = fetch()?;
@@ -1439,19 +1439,36 @@ impl RunCache {
         run: &Value,
         issue: u64,
         branch: &str,
-    ) -> Option<PublishedPr> {
+    ) -> Result<Option<PublishedPr>, ScalerError> {
         if !publish_app_author(&pr["user"]) {
-            return None;
+            return Ok(None);
         }
-        let id = branch_run(issue, branch).ok()?.parse::<u64>().ok()?;
-        let authenticated = self.authenticate(root, issue, RunId(id)).ok()?;
+        let Ok(id) = branch_run(issue, branch).and_then(|id| {
+            id.parse::<u64>()
+                .map_err(|_| ScalerError::Guard("publication run id"))
+        }) else {
+            return Ok(None);
+        };
+        let authenticated = match self.authenticate(root, issue, RunId(id)) {
+            Ok(run) => run,
+            Err(ScalerError::Guard(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         if authenticated.run["id"] != run["id"] {
-            return None;
+            return Ok(None);
         }
         let credentialed = !self.public_receipts_only
             && (self.stored_gh_auth || std::env::var_os("GH_TOKEN").is_some());
-        if credentialed
-            && let Ok(text) = self.prior_artifact(root, issue, RunId(id), "handoff.json")
+        let handoff = if credentialed {
+            match self.prior_artifact(root, issue, RunId(id), "handoff.json") {
+                Ok(text) => Some(text),
+                Err(ScalerError::Guard(_) | ScalerError::GithubGone) => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        if let Some(text) = handoff
             && let Ok(handoff) = serde_json::from_str::<Value>(&text)
             && handoff["issue"] == issue
             && handoff["branch"] == branch
@@ -1464,23 +1481,22 @@ impl RunCache {
                 layer: None,
             });
             if publication.matches(pr, issue, branch) {
-                return Some(publication);
+                return Ok(Some(publication));
             }
         }
         // An Actions-authored server outcome remains usable after artifact expiry.
         if authenticated.footer_issue != Some(issue)
             && authenticated.run["event"] != "pull_request_review"
         {
-            return None;
+            return Ok(None);
         }
-        let number = pr["number"].as_u64()?;
+        let Some(number) = pr["number"].as_u64() else {
+            return Ok(None);
+        };
         for destination in [number, issue] {
             let path = format!("repos/{REPOSITORY}/issues/{destination}/comments");
             let comments = if credentialed {
-                let Ok(comments) = list(root, &path) else {
-                    continue;
-                };
-                comments
+                list(root, &path)?
             } else {
                 public_comments(root, &path)
             };
@@ -1509,12 +1525,12 @@ impl RunCache {
                 if let Ok(record) = serde_json::from_str::<PublicationRecord>(text) {
                     let publication = PublishedPr(record);
                     if publication.matches(pr, issue, branch) {
-                        return Some(publication);
+                        return Ok(Some(publication));
                     }
                 }
             }
         }
-        None
+        Ok(None)
     }
     fn authenticate_with(
         &mut self,
@@ -1559,13 +1575,48 @@ impl RunCache {
         // are public: the hosted guard holds the job token for it (#1214).
         // One answer per login per event, however many runs it authenticates.
         let mut known = std::mem::take(&mut self.collaborators);
+        let unavailable = std::cell::RefCell::new(None);
+        let remember = |error| {
+            let mut saved = unavailable.borrow_mut();
+            if saved.is_none() {
+                *saved = Some(error);
+            }
+        };
         let result = self.authenticate_with(
             issue,
             id,
-            &mut |login: &str| cached_trust(&mut known, root, login),
-            |endpoint| lookup(root, endpoint).ok(),
+            &mut |login: &str| {
+                if let Some(trusted) = known.get(login) {
+                    return *trusted;
+                }
+                let trusted =
+                    write_collaborator(login, |endpoint| match authenticated_api(root, endpoint) {
+                        Ok(value) => Ok(value),
+                        Err(error) => {
+                            remember(error);
+                            Err(ScalerError::External("publication authority unavailable"))
+                        }
+                    });
+                if unavailable.borrow().is_none() {
+                    known.insert(login.to_owned(), trusted);
+                }
+                trusted
+            },
+            |endpoint| match lookup(root, endpoint) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    remember(error);
+                    None
+                }
+            },
         );
         self.collaborators = known;
+        if let Some(error) = unavailable.into_inner() {
+            // A boolean collaborator callback may have made resolve cache a
+            // negative policy answer. An unavailable read is not that answer.
+            self.authenticated.values.remove(&(issue, id));
+            return Err(error);
+        }
         result
     }
     /// Whether `login` is a write collaborator (#1214).
@@ -1799,7 +1850,7 @@ pub(super) fn verified_branch_cached(
         |pr, _| {
             Ok((
                 run.clone(),
-                cache.publication(root, pr, &run, issue, branch),
+                cache.publication(root, pr, &run, issue, branch)?,
             ))
         },
         &mut collaborators(|endpoint| authenticated_api(root, endpoint)),
@@ -2934,9 +2985,13 @@ impl Server<'_> {
             {
                 earlier.insert(RunId(id_number));
                 if pr["state"] == "open" && {
-                    let publication =
-                        self.runs
-                            .publication(self.root, &pr, &origin, self.dispatch.issue, branch);
+                    let publication = self.runs.publication(
+                        self.root,
+                        &pr,
+                        &origin,
+                        self.dispatch.issue,
+                        branch,
+                    )?;
                     owned_pr(
                         &pr,
                         &origin,
@@ -2990,13 +3045,17 @@ impl Server<'_> {
                                 .ok()
                         })
                         .is_some_and(|origin| {
-                            let publication = self.runs.publication(
-                                self.root,
-                                &item,
-                                &origin.run,
-                                self.dispatch.issue,
-                                branch,
-                            );
+                            let publication = self
+                                .runs
+                                .publication(
+                                    self.root,
+                                    &item,
+                                    &origin.run,
+                                    self.dispatch.issue,
+                                    branch,
+                                )
+                                .ok()
+                                .flatten();
                             owned_pr(
                                 &item,
                                 &origin.run,
@@ -5260,12 +5319,14 @@ fi
             assert!(
                 RunCache::for_guard(true)
                     .publication(root, &pr, &run, 799, branch)
+                    .unwrap()
                     .is_some(),
                 "admission lost the artifact handoff"
             );
             assert!(
                 RunCache::for_guard(false)
                     .publication(root, &pr, &run, 799, branch)
+                    .unwrap()
                     .is_none(),
                 "guard bound publication through the artifact handoff"
             );
@@ -5403,6 +5464,7 @@ fi
             assert!(
                 RunCache::for_guard(true)
                     .publication(root, &pr, &run, 799, "work/dispatch-799-42")
+                    .unwrap()
                     .is_some()
             );
             let mut dispatch = server(root).dispatch;
@@ -5436,7 +5498,32 @@ fi
                 serde_json::from_str(&regular_text(&root.join("handoff.json")).unwrap()).unwrap();
             handoff["applied"] = json!({"publication_pr":800});
             std::fs::write(root.join("handoff.json"), handoff.to_string()).unwrap();
+            let gh_path = root.join("bin/gh");
+            let saved = root.join("bin/gh-available");
+            std::fs::rename(&gh_path, &saved).unwrap();
+            crate::lock_file::tests::write_test_executable(
+                &gh_path,
+                "#!/bin/sh\ncase \"$*\" in *collaborators*) exit 1 ;; esac\nexec \"${0%/*}/gh-available\" \"$@\"\n",
+                std::fs::Permissions::from_mode(0o700),
+            );
+            let mut cache = RunCache::for_controller();
+            assert!(
+                matches!(
+                    cache.publication(root, &pr, &run, 799, "work/dispatch-799-42"),
+                    Err(ScalerError::Usage(_))
+                ),
+                "an API failure is not missing publication evidence"
+            );
+            std::fs::rename(&saved, &gh_path).unwrap();
+            assert!(
+                cache
+                    .publication(root, &pr, &run, 799, "work/dispatch-799-42")
+                    .unwrap()
+                    .is_some(),
+                "permission failure poisoned a reused cache"
+            );
             let publication = recorded_publication(&pr, &run, 799, "work/dispatch-799-42")
+                .expect("controller publication read failed")
                 .expect("controller lost authenticated handoff ownership");
             assert!(owned_pr(
                 &pr,
@@ -5449,7 +5536,9 @@ fi
             handoff["applied"]["publication_pr"] = 801.into();
             std::fs::write(root.join("handoff.json"), handoff.to_string()).unwrap();
             assert!(
-                recorded_publication(&pr, &run, 799, "work/dispatch-799-42").is_none(),
+                recorded_publication(&pr, &run, 799, "work/dispatch-799-42")
+                    .unwrap()
+                    .is_none(),
                 "controller reused stale publication proof"
             );
             pr["number"] = 801.into();
@@ -5499,6 +5588,7 @@ fi
             assert!(
                 RunCache::default()
                     .publication(root, &pr, &run, 799, "work/dispatch-799-42")
+                    .unwrap()
                     .is_some()
             );
             let mut forged = pr;
@@ -5506,6 +5596,7 @@ fi
             assert!(
                 RunCache::default()
                     .publication(root, &forged, &run, 799, "work/dispatch-799-42")
+                    .unwrap()
                     .is_none()
             );
         });

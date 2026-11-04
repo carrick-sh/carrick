@@ -1994,7 +1994,9 @@ fn output(command: &mut Command) -> Result<Vec<u8>, ScalerError> {
         .unwrap_or(std::time::Duration::from_secs(120))
         .min(std::time::Duration::from_secs(120));
     if limit.is_zero() {
-        return Err(ScalerError::Guard("loop wall budget exhausted"));
+        return Err(ScalerError::Transient(
+            crate::ci_scaler::TransientFailure::Timeout,
+        ));
     }
     crate::ci_scaler::execute(command, &[], limit)
 }
@@ -2008,7 +2010,9 @@ fn window_output(command: &mut Command) -> Result<Vec<u8>, ScalerError> {
         })
         .unwrap_or(std::time::Duration::from_secs(120));
     if limit.is_zero() {
-        return Err(ScalerError::Guard("loop wall budget exhausted"));
+        return Err(ScalerError::Transient(
+            crate::ci_scaler::TransientFailure::Timeout,
+        ));
     }
     crate::ci_scaler::execute(command, &[], limit)
 }
@@ -2281,6 +2285,9 @@ fn gh_with_token(root: &Path, args: &[&str], token: Option<&str>) -> Result<Stri
                 String::from_utf8(bytes).map_err(|_| ScalerError::Guard("non-UTF8 GitHub output"))
             })
             .map_err(|error| {
+                if matches!(error, ScalerError::Transient(_)) {
+                    return error;
+                }
                 // execute already drains and redacts a bounded stderr prefix. Mask
                 // again before clipping so a cut credential cannot escape.
                 let detail = crate::dispatch_redaction::redact(error.to_string().as_bytes());
@@ -3122,7 +3129,7 @@ impl PublishedPr {
     }
 }
 pub(crate) type PublicationLookup<'a> =
-    dyn FnMut(&Value, &Value, u64, &str) -> Option<PublishedPr> + 'a;
+    dyn FnMut(&Value, &Value, u64, &str) -> Result<Option<PublishedPr>, ScalerError> + 'a;
 /// The controller uses the same authenticated artifact/comment resolver as the
 /// hosted guard and tool server. Every gh destination is repository-explicit.
 pub(crate) fn recorded_publication(
@@ -3130,7 +3137,7 @@ pub(crate) fn recorded_publication(
     run: &Value,
     issue: u64,
     branch: &str,
-) -> Option<PublishedPr> {
+) -> Result<Option<PublishedPr>, ScalerError> {
     let limit = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let deadline = COMMAND_DEADLINE.with(|slot| slot.get().map_or(limit, |d| d.min(limit)));
     let _window = CommandWindow::until(deadline);
@@ -3223,7 +3230,7 @@ fn require_owned_pr(root: &Path, dispatch: &Dispatch) -> Result<Value, ScalerErr
                     &run,
                     dispatch.issue,
                     &dispatch.branch,
-                )
+                )?
             }
         } else {
             None
@@ -3928,7 +3935,7 @@ fn guard_admission(
             &event["dispatch_run"],
             issue,
             branch,
-        )
+        )?
     } else {
         None
     };

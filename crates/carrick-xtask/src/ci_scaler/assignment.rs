@@ -684,6 +684,7 @@ pub(super) trait AssignmentApi {
     fn run_jobs(&self, run: RunId, attempt: u32) -> Result<Vec<Value>, ScalerError>;
     /// The same standing vet that admits demand.
     fn revet(&self, key: JobKey) -> Result<JobPolicy, ScalerError>;
+    fn report_refusal(&self, key: JobKey, reason: &str) -> Result<(), ScalerError>;
 }
 impl AssignmentApi for Github {
     fn run_jobs(&self, run: RunId, attempt: u32) -> Result<Vec<Value>, ScalerError> {
@@ -691,6 +692,9 @@ impl AssignmentApi for Github {
     }
     fn revet(&self, key: JobKey) -> Result<JobPolicy, ScalerError> {
         self.vet_assignment(key)
+    }
+    fn report_refusal(&self, key: JobKey, reason: &str) -> Result<(), ScalerError> {
+        self.report_assignment_refusal(key, reason)
     }
 }
 
@@ -739,6 +743,7 @@ pub(super) fn serve_assignment<L: Refusals>(
     let key = assigned_job_key(&context, runner, labels, &jobs)?;
     record(ledger, key)?; // True assignment is durable BEFORE steps may run.
     if run_superseded(ledger.superseded(), key) {
+        api.report_refusal(key, "run superseded before admission")?;
         refuse(
             ledger,
             key,
@@ -755,17 +760,20 @@ pub(super) fn serve_assignment<L: Refusals>(
     }
     supersession_capacity(ledger.superseded())?;
     if ledger.refused().contains(&key) {
+        api.report_refusal(key, "previously refused by the controller")?;
         return Ok(Revetted::Refused(key)); // Withhold approval.
     }
     let policy = match api.revet(key) {
         Ok(policy) => policy,
         Err(error @ ScalerError::Guard(_)) => {
+            api.report_refusal(key, &error.to_string())?;
             refuse(ledger, key, &error, path)?;
             return Ok(Revetted::Refused(key));
         }
         Err(error) => return Err(error),
     };
     if let Err(error) = policy.authorize(&context) {
+        api.report_refusal(key, &error.to_string())?;
         refuse(ledger, key, &error, path)?;
         return Ok(Revetted::Refused(key));
     }
@@ -860,6 +868,10 @@ mod tests {
         }
     }
     impl AssignmentApi for FakeGithub {
+        fn report_refusal(&self, _: JobKey, _: &str) -> Result<(), ScalerError> {
+            Ok(())
+        }
+
         fn run_jobs(&self, run: RunId, attempt: u32) -> Result<Vec<Value>, ScalerError> {
             assert_eq!(
                 (run, attempt),
@@ -1460,6 +1472,10 @@ mod tests {
         rerun.run_attempt = 2;
         struct RerunApi(JobContext);
         impl AssignmentApi for RerunApi {
+            fn report_refusal(&self, _: JobKey, _: &str) -> Result<(), ScalerError> {
+                Ok(())
+            }
+
             fn run_jobs(&self, run: RunId, attempt: u32) -> Result<Vec<Value>, ScalerError> {
                 assert_eq!((run, attempt), (RunId(20), 2));
                 Ok(vec![json!({"id":25,"runner_id":RUNNER.0,"labels":LABELS})])

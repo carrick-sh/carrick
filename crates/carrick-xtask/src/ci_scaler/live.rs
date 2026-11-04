@@ -2299,9 +2299,16 @@ fn revet_assignments(
                 );
                 settled.push(row.name);
             }
-            Ok(Revetted::Refused(key) | Revetted::Recorded(key)) => {
+            Ok(Revetted::Recorded(key)) => {
                 println!(
-                    "vm={vm} reserved job={} assigned run={} attempt={} job={}: not approved",
+                    "vm={vm} assigned run={} attempt={} job={}: already approved or finished",
+                    key.run.0, key.attempt, key.job.0
+                );
+                settled.push(row.name);
+            }
+            Ok(Revetted::Refused(key)) => {
+                println!(
+                    "vm={vm} reserved job={} assigned run={} attempt={} job={}: admission refused (reason recorded above)",
                     row.key.job.0, key.run.0, key.attempt, key.job.0
                 );
                 settled.push(row.name);
