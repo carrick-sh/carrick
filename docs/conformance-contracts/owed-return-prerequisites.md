@@ -433,3 +433,47 @@ open. In particular, a boolean backend result is not a joined receipt, and
 retaining abort custody is not a notification-backed retry venue. CPL0
 receipt joining and VM-destruction custody are retained unchanged. C2 and
 slice 2b remain outside this continuation.
+
+### IRQ resume headroom checkpoint
+
+All 31 inherited commits are kept after rebasing onto the admitted main ref;
+none needed a conflict port and none were dropped. This round changes only
+compiled IRQ resume storage and its structural witness. HVF receipt joining,
+unpublished rollback and the slice-2 settlement routine remain later work.
+
+`resume_production` previously retained the unregistered-record branch's
+aligned terminal custody while a registered record resumed its native service.
+The unregistered branch now owns that scratch in `resume_unregistered` and
+returns before any registered owner entry. The checker charges the maximum
+of that branch and the registered `resume_selected`/checkpoint descent. It
+still charges their common scheduler/IRQ prefix and all existing service tails;
+no ceiling or reserve changes. The new parser witness is red against the old
+checker because it did not charge the extracted terminal branch, then green
+with the alternative descent accounted for.
+
+The existing unregistered cancellation witnesses still drive the production
+resume entry: terminal intent precedes record release, adapter operations
+requeue without retirement, missing lifecycle retains host custody, and pool
+cancellation reaps the exact entry. The registered resume and fault-reply
+witnesses remain applicable. This move adds no allocation or wake operation.
+Per-build measurements and focused main/candidate populations accompany the
+checkpoint evidence; they do not establish signed guest acceptance.
+
+Both rebased pre-change configurations (default and `allocator-test-control`)
+measure 10,270 bytes. Both clean candidate configurations measure 9,950 bytes,
+a 320-byte reduction and 337 bytes below the unchanged 10,287-byte effective
+maximum. The common production-resume frame falls from 639 to 319 bytes;
+`interrupt` remains 128 bytes. The extracted terminal frame is 544 bytes,
+with its 128-byte handback closure charged too. Their 672-byte alternative
+fits below the already charged registered owner descent. The checker still
+requires the existing 1,024-byte reserve below its 11,311-byte ceiling.
+
+Comparison checkouts initially shared one Cargo target directory. Cached
+workspace metadata and a nested image retained the earlier source checkout;
+those candidate attempts are invalid evidence. Cleaning workspace package
+outputs and checking nested dependency paths establishes the fresh candidate
+builds above. The main combined EL1 Linux process was SIGKILLed after 294 of
+655 regular-test completions. The repository's existing process-isolated
+harness completes main's full population: 683 passed, one ignored, including
+29 serial-host passes, with four concurrent regular test processes. Neither
+the incomplete process nor stale-cache attempts are acceptance results.
