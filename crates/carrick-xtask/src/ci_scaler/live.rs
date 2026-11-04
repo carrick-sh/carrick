@@ -1179,6 +1179,7 @@ fn finish_destroyed(
     row.state = State::Destroyed;
     row.quarantined = false;
     update(ledger, row, path)?;
+    super::claim::release_on_close(row.key);
     println!(
         "vm={} absent; owned transport keys removed; ledger closed",
         row.vm.get()
@@ -2408,6 +2409,7 @@ pub(super) fn controller(
     one_job: bool,
     budget: CloneBudget,
     intake: Intake,
+    role: super::claim::Role,
 ) -> Result<(), ScalerError> {
     if matches!(admission, Admission::Pilot { .. }) && budget.kvm != Concurrency::ONE {
         return Err(ScalerError::Guard("the pilot admission is one clone only"));
@@ -2424,6 +2426,17 @@ pub(super) fn controller(
         |name| std::env::var(name).ok(),
     )?;
     let agents = enabled.agents;
+    // Cross-host claims (#1597) are on for every standing controller, with
+    // an exact `CARRICK_JOB_CLAIMS=0` opt-out; a follower needs them.
+    let mut claims = (matches!(admission, Admission::Standing)
+        && std::env::var("CARRICK_JOB_CLAIMS").as_deref() != Ok("0"))
+    .then(|| super::claim::Claims::new(role, pve.site.node));
+    if claims.is_none() && role == super::claim::Role::Follower {
+        return Err(ScalerError::Guard("a follower needs cross-host job claims"));
+    }
+    if claims.is_some() {
+        super::claim::activate(pve.site.node);
+    }
     verify_startup(
         pve.site,
         &enabled.list(),
@@ -2569,13 +2582,16 @@ pub(super) fn controller(
                         dir,
                         &path,
                         (group, admission, demand.clone()),
-                        (budget, enabled, &provisioners),
+                        (budget, enabled, &provisioners, claims.as_mut()),
                     )?
                 {
                     admitted += 1;
                 }
                 Ok(())
             });
+            if let Some(claims) = claims.as_mut() {
+                claims.end_pass();
+            }
             match admitted {
                 Ok(()) => backoff.reset(),
                 Err(error @ ScalerError::CpuCeiling { .. }) => return Err(error),
@@ -2646,7 +2662,12 @@ fn admit_one(
     dir: &Path,
     path: &Path,
     demand: (u64, &Admission, Vec<JobKey>),
-    (budget, enabled, provisioners): (CloneBudget, Lanes, &Provisioners),
+    (budget, enabled, provisioners, mut claims): (
+        CloneBudget,
+        Lanes,
+        &Provisioners,
+        Option<&mut super::claim::Claims>,
+    ),
 ) -> Result<bool, ScalerError> {
     let (group, original_admission, kvm_demand) = demand;
     let mut selected = None;
@@ -2674,7 +2695,28 @@ fn admit_one(
             } else {
                 gh.demand(&policy, lane.labels())?
             },
-            |job| gh.vet(&policy, job).map(|_| job),
+            |job| {
+                // A follower leaves fresh demand to the leader (#1597).
+                if let Some(claims) = claims.as_deref_mut()
+                    && !claims.ready(job, Instant::now())
+                {
+                    return Err(ScalerError::Deferred("follower grace period"));
+                }
+                gh.vet(&policy, job)?;
+                // Claim only a vetted job, before any reservation, so two
+                // hosts never both boot a clone for it.
+                if let Some(claims) = claims.as_deref_mut()
+                    && super::claim::claim(
+                        &mut super::claim::github_api(),
+                        job,
+                        claims.host,
+                        now()?,
+                    )? == super::claim::Outcome::HeldElsewhere
+                {
+                    return Err(ScalerError::Deferred("claimed by another host"));
+                }
+                Ok(job)
+            },
         )? {
             selected = Some((lane, policy, job));
             break;
@@ -2688,7 +2730,7 @@ fn admit_one(
     let admission = &admission;
     // Clones admitted but not yet running are charged at their nominal size.
     let pending = ledger.pending("", nominal(pve));
-    let Some(row) = reserve_admitted_clone(
+    let reserved = reserve_admitted_clone(
         ledger,
         path,
         job,
@@ -2701,8 +2743,13 @@ fn admit_one(
             }
         },
         || pve.reservation_inventory(),
-    )?
-    else {
+    );
+    // A claimed job this host won't serve after all goes back at once,
+    // rather than blocking the other host until the claim expires.
+    if claims.is_some() && !matches!(reserved, Ok(Some(_))) {
+        super::claim::release_on_close(job);
+    }
+    let Some(row) = reserved? else {
         return Ok(false);
     };
     println!("reserved vm={} job={}", row.vm.get(), job.job.0);

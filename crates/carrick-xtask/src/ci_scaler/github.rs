@@ -112,11 +112,19 @@ impl Github {
         } else {
             vec![]
         };
+        // One body classifier for every `gh api` failure: 404 is Gone; a
+        // ref create on an existing name is a held claim (#1597); other
+        // 422s stay ordinary failures. Transport failures are classified
+        // underneath as `Transient` and only idempotent GETs retry them.
         let mut invoke = || {
             execute_with_failure(&mut cmd, &input, Duration::from_secs(60), |bytes| {
                 let body: Value = serde_json::from_slice(bytes).ok()?;
-                (body["status"] == "404" || body["status"] == 404)
-                    .then_some(ScalerError::GithubGone)
+                if body["status"] == "404" || body["status"] == 404 {
+                    return Some(ScalerError::GithubGone);
+                }
+                ((body["status"] == "422" || body["status"] == 422)
+                    && body["message"] == "Reference already exists")
+                    .then_some(ScalerError::GithubConflict)
             })
         };
         let output = if method == "GET" {
