@@ -6045,3 +6045,101 @@ fn owner_munmap_then_mmap_null_places_outside_owed_return_in_ring() {
     );
     let _ = (owner, peer);
 }
+
+/// pipe2's eight-byte destination may straddle two unrelated physical pages.
+/// No publication may start until both pieces share one exact-MM fence.
+#[test]
+fn pipe_pair_output_fences_both_pages_and_refuses_an_invalid_tail() {
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let mm = admit(&region, &spaces, 77, ROOT, 2, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::MIN, region.table(), &spaces, &view);
+    let tables = Tables::new(ROOT, IPA, 2);
+    let handle = portal.admitted_handle(mm, 0).unwrap();
+    let address = carrick_guest_arch::UserVa::new(VA + 4093);
+    // Deliberately non-contiguous output: masking or assuming adjacency is wrong.
+    let tail = IPA + 0x10000;
+    let original = tables.words[1537].load(Ordering::Relaxed);
+    tables.words[1537].store((original & 0xfff) | tail, Ordering::Release);
+    let words = tables.live(&CallerInvalidatesAsid);
+    let fence = portal.fence_word_write(handle, address, &words, 0).unwrap();
+    let pieces = fence.pieces();
+    assert_eq!(pieces.len(), 2);
+    assert_eq!(
+        (pieces[0].address.raw(), pieces[0].len.raw()),
+        (IPA + 4093, 3)
+    );
+    assert_eq!((pieces[1].address.raw(), pieces[1].len.raw()), (tail, 5));
+    assert!(
+        spaces
+            .try_begin_edit(spaces.find(77).unwrap(), 77, NonZeroU64::new(2).unwrap())
+            .is_none()
+    );
+    let mut first = [0xaa; 3];
+    let mut second = [0xbb; 5];
+    // SAFETY: fixture storage models the two separately retained physical
+    // mappings just checked above; no production mapping is substituted.
+    let output = unsafe { fence.bind(&mut first, &mut second) }.unwrap();
+    output.write(*b"12345678");
+    assert_eq!(first, *b"123");
+    assert_eq!(second, *b"45678");
+    // Missing second page must reject the WHOLE output, never expose a prefix.
+    tables.words[1537].store(0, Ordering::Release);
+    assert!(matches!(
+        portal.fence_word_write(handle, address, &words, 0),
+        Err(MmError::Fault)
+    ));
+    // A read-only/COW tail is equally unusable for an atomic output.
+    tables.words[1537].store(original | (1 << 7), Ordering::Release);
+    assert!(matches!(
+        portal.fence_word_write(handle, address, &words, 0),
+        Err(MmError::Fault)
+    ));
+    tables.words[1537].store(original, Ordering::Release);
+    assert!(matches!(
+        portal.fence_word_write(
+            handle,
+            carrick_guest_arch::UserVa::new(u64::MAX - 3),
+            &words,
+            0
+        ),
+        Err(MmError::Fault)
+    ));
+    // A foreign carrier cannot authorize this MM, even with matching numbers.
+    let foreign = MmPortal::new(NonZeroU64::new(2).unwrap(), region.table(), &spaces, &view);
+    assert!(matches!(
+        foreign.fence_word_write(handle, address, &words, 0),
+        Err(MmError::Stale)
+    ));
+    // Busy once, then success, with no polling or retained editor on refusal.
+    let editor = spaces
+        .try_begin_edit(spaces.find(77).unwrap(), 77, NonZeroU64::new(2).unwrap())
+        .unwrap();
+    assert!(matches!(
+        portal.fence_word_write(handle, address, &words, 0),
+        Err(MmError::Busy)
+    ));
+    drop(editor);
+    assert!(portal.fence_word_write(handle, address, &words, 0).is_ok());
+    let fence = portal
+        .fence_word_write(handle, carrick_guest_arch::UserVa::new(VA), &words, 0)
+        .unwrap();
+    assert_eq!(fence.pieces().len(), 1);
+    let mut bad = [0; 7];
+    // SAFETY: deliberately invalid length is refused before any slice access.
+    assert!(matches!(
+        unsafe { fence.bind(&mut bad, &mut []) },
+        Err(MmError::Invalid)
+    ));
+    assert_eq!(bad, [0; 7]);
+    let fence = portal
+        .fence_word_write(handle, carrick_guest_arch::UserVa::new(VA), &words, 0)
+        .unwrap();
+    let mut whole = [0; 8];
+    // SAFETY: fixture storage models the one retained mapping.
+    unsafe { fence.bind(&mut whole, &mut []) }
+        .unwrap()
+        .write(*b"abcdefgh");
+    assert_eq!(whole, *b"abcdefgh");
+}

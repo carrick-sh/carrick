@@ -402,6 +402,61 @@ impl<
         .map_err(MmError::from)?;
         Ok(unsafe { continuation.with_fork_sequence(fork_sequence) })
     }
+    /// Secure the whole eight-byte output after normal user-write preparation.
+    /// A refused tail exposes no prefix authority. The returned editor excludes
+    /// fork, unmap and permission changes until the output venue finishes.
+    pub fn fence_word_write<W: LiveDescriptorWords + ?Sized>(
+        &self,
+        handle: El1MmHandle,
+        address: UserVa,
+        words: &W,
+        slot: u32,
+    ) -> Result<super::WordWriteFence<'_, Context>, MmError> {
+        use super::{WordWriteFence, WordWritePiece};
+        use carrick_guest_arch::{Gpa, GuestLen};
+        let end = address.raw().checked_add(8).ok_or(MmError::Fault)?;
+        let continuation = self.begin(
+            handle,
+            GuestVa::new(address.raw()),
+            8,
+            TransferIntent::UserWrite,
+            slot,
+        )?;
+        let editor = self.editor_for(handle, slot)?;
+        let index = self.spaces.find(handle.mm().raw()).ok_or(MmError::Stale)?;
+        let gate = self.observe_wait(handle, PortalWaitCause::Gate)?;
+        let grant = self
+            .spaces
+            .grant(index, handle.mm().raw())
+            .ok_or_else(|| gate.map_or(MmError::Busy, MmError::Wait))?;
+        let root = B::root(grant.ttbr0).map_err(mmu_error)?;
+        let mut pieces = [WordWritePiece {
+            address: Gpa::new(0),
+            len: GuestLen::new(0),
+            executable: false,
+        }; 2];
+        let mut cursor = address.raw();
+        let mut count = 0;
+        while cursor < end {
+            let len = (end - cursor).min(TRANSFER_CHUNK_BYTES - cursor % TRANSFER_CHUNK_BYTES);
+            self.authorize(&continuation, cursor, len, slot)?;
+            let leaf = B::translate(words, root, UserVa::new(cursor), LeafAccess::Write, true)
+                .map_err(mmu_error)?
+                .ok_or(MmError::Fault)?;
+            pieces[count] = WordWritePiece {
+                address: Gpa::from_frame_gpa(leaf.output),
+                len: GuestLen::new(len),
+                executable: leaf.executable,
+            };
+            count += 1;
+            cursor += len;
+        }
+        Ok(WordWriteFence {
+            pieces,
+            count,
+            _editor: editor,
+        })
+    }
     pub fn observe_wait(
         &self,
         handle: El1MmHandle,
