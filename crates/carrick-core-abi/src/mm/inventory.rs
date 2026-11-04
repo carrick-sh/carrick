@@ -392,16 +392,52 @@ impl FrameInventoryRetirementReceipt {
 
 /// Inventory half of whole-MM release. This retains the exact empty-MM
 /// revision, but cannot authorize journal acknowledgement by itself.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 #[must_use = "retain the inventory half until backend custody is released"]
 pub struct InventoryReleased {
     retirement: FrameInventoryRetirementReceipt,
+    last_unmapped: Vec<FrameRetirementPermit>,
 }
 impl InventoryReleased {
+    /// Attach the permits produced atomically with this retirement revision.
+    /// A failed identity check preserves both the receipt and all permits.
+    pub fn with_retirements(
+        mut self,
+        permits: Vec<FrameRetirementPermit>,
+    ) -> Result<Self, Box<(Self, Vec<FrameRetirementPermit>)>> {
+        let mut frames: Vec<_> = self
+            .retirement
+            .mapping_set()
+            .iter()
+            .map(|(_, frame)| *frame)
+            .collect();
+        frames.sort_unstable();
+        frames.dedup();
+        if !self.last_unmapped.is_empty()
+            || permits.iter().any(|permit| {
+                !permit.issued_by(&self.retirement.apply.origin)
+                    || permit.revision() != self.revision()
+                    || frames.binary_search(&permit.frame()).is_err()
+            })
+        {
+            return Err(Box::new((self, permits)));
+        }
+        self.last_unmapped = permits;
+        Ok(self)
+    }
+    pub fn pending_retirements(&self) -> usize {
+        self.last_unmapped.len()
+    }
+    /// Transfer one linear permit to the backend's retirement owner.
+    pub fn pop_retirement(&mut self) -> Option<FrameRetirementPermit> {
+        self.last_unmapped.pop()
+    }
+
     pub fn from_retirement(retirement: FrameInventoryRetirementReceipt) -> Option<Self> {
-        retirement
-            .mm_empty_at_revision()
-            .then_some(Self { retirement })
+        retirement.mm_empty_at_revision().then_some(Self {
+            retirement,
+            last_unmapped: Vec::new(),
+        })
     }
     pub fn issued_by(&self, origin: &FrameInventoryOrigin) -> bool {
         self.retirement.apply.issued_by(origin)
@@ -459,7 +495,7 @@ impl BackendCustodyReleased {
 ///     released
 /// }
 /// ```
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 #[must_use = "deliver the joined release to journal settlement"]
 pub struct MmReleaseReceipt {
     inventory: InventoryReleased,
@@ -470,7 +506,8 @@ impl MmReleaseReceipt {
         inventory: InventoryReleased,
         backend: BackendCustodyReleased,
     ) -> Result<Self, Box<(InventoryReleased, BackendCustodyReleased)>> {
-        if inventory.issued_by(&backend.origin)
+        if inventory.last_unmapped.is_empty()
+            && inventory.issued_by(&backend.origin)
             && inventory.owner() == backend.owner
             && inventory.revision() == backend.revision
             && inventory.retirement.transaction() == backend.transaction
@@ -590,7 +627,7 @@ mod tests {
             let (retained, backend) = *MmReleaseReceipt::join(wrong, backend).unwrap_err();
             // A refused join consumes neither half: the intended inventory can
             // still join, and the wrong inventory remains owned by the caller.
-            assert_ne!(retained, expected);
+            assert_ne!(retained.retirement, expected.retirement);
             let receipt = MmReleaseReceipt::join(expected, backend).unwrap();
             assert!(receipt.issued_by(&origin));
             assert_eq!(receipt.owner(), FrameInventoryReceiptOwner::HostMm(id(7)));

@@ -789,12 +789,43 @@ impl FrameInventoryAuthority {
         self.retire_mm_with_receipt(ids, mm).map(|(count, _)| count)
     }
 
+    /// Retire an MM and retain every last physical owner until its backend
+    /// consumes the returned permits. Validation and transfer are atomic with
+    /// the existing inventory batch; physical callbacks run after unlock.
+    pub fn retire_mm_with_permits(
+        self: &std::sync::Arc<Self>,
+        ids: &ObjectIdRegistry,
+        mm: impl Into<FrameOwner>,
+    ) -> Result<(usize, carrick_hal::InventoryReleased), FrameInventoryRetireMmError> {
+        let mut output = RetirementOutput {
+            permits: Vec::new(),
+            cleanup: std::sync::Arc::new(claimed_return::RetirementCleanup(
+                std::sync::Arc::downgrade(self),
+            )),
+        };
+        let (count, receipt) = self.retire_mm_inner(ids, mm.into(), Some(&mut output))?;
+        let released = carrick_hal::InventoryReleased::from_retirement(receipt)
+            .ok_or(FrameInventoryRetireMmError::NotEmpty)?;
+        let released = released
+            .with_retirements(output.permits)
+            .map_err(|_| FrameInventoryRetireMmError::ReceiptMismatch)?;
+        Ok((count, released))
+    }
+
     pub fn retire_mm_with_receipt(
         &self,
         ids: &ObjectIdRegistry,
         mm: impl Into<FrameOwner>,
     ) -> Result<(usize, FrameInventoryRetirementReceipt), FrameInventoryRetireMmError> {
-        let mm = mm.into();
+        self.retire_mm_inner(ids, mm.into(), None)
+    }
+
+    fn retire_mm_inner(
+        &self,
+        ids: &ObjectIdRegistry,
+        mm: FrameOwner,
+        output: Option<&mut RetirementOutput>,
+    ) -> Result<(usize, FrameInventoryRetirementReceipt), FrameInventoryRetireMmError> {
         let rows: Vec<(MappingId, FrameId, MappingGeneration)> = {
             let state = self.state.lock();
             if state.mm_mapping_counts.get(&mm).copied().unwrap_or(0) == 0 {
@@ -879,7 +910,7 @@ impl FrameInventoryAuthority {
         // initial scan found it. Do not lower that contention to an apply
         // invariant merely because admission raced the scan.
         let (_, receipt) = self
-            .apply_retirement_with_receipt(mm, reservation.commit(()))
+            .apply_retirement_inner(mm, reservation.commit(()), output)
             .map_err(|error| match error {
                 FrameInventoryError::ClaimedMapping(_) => FrameInventoryRetireMmError::RetryPending,
                 error => FrameInventoryRetireMmError::Apply(error),
@@ -895,7 +926,15 @@ impl FrameInventoryAuthority {
         mm: impl Into<FrameOwner>,
         commit: FrameInventoryCommit<T>,
     ) -> Result<(T, FrameInventoryRetirementReceipt), FrameInventoryError> {
-        let mm = mm.into();
+        self.apply_retirement_inner(mm.into(), commit, None)
+    }
+
+    fn apply_retirement_inner<T>(
+        &self,
+        mm: FrameOwner,
+        commit: FrameInventoryCommit<T>,
+        output: Option<&mut RetirementOutput>,
+    ) -> Result<(T, FrameInventoryRetirementReceipt), FrameInventoryError> {
         let transaction = commit.batch().transaction();
         let state = self.state.lock();
         let provenance = state
@@ -921,7 +960,7 @@ impl FrameInventoryAuthority {
         drop(state);
         let mm_id = mm;
         let (outcome, revision, mm_empty_at_revision) =
-            self.apply_inner(mm_id, commit, None, None)?;
+            self.apply_inner_with_retirements(mm_id, commit, None, None, output)?;
         let receipt = FrameInventoryApplyReceipt::from_kernel_authority(
             self.origin.clone(),
             provenance,
@@ -942,6 +981,17 @@ impl FrameInventoryAuthority {
         commit: FrameInventoryCommit<T>,
         fail_before_event: Option<usize>,
         grant: Option<ExactMappingRow>,
+    ) -> Result<(T, u64, bool), FrameInventoryError> {
+        self.apply_inner_with_retirements(mm, commit, fail_before_event, grant, None)
+    }
+
+    fn apply_inner_with_retirements<T>(
+        &self,
+        mm: FrameOwner,
+        commit: FrameInventoryCommit<T>,
+        fail_before_event: Option<usize>,
+        grant: Option<ExactMappingRow>,
+        mut output: Option<&mut RetirementOutput>,
     ) -> Result<(T, u64, bool), FrameInventoryError> {
         let transaction = commit.batch().transaction();
         // Declare custody before the guard: on rejection or unwind, backend
@@ -1031,6 +1081,29 @@ impl FrameInventoryAuthority {
             }
         }
         let changes = candidate.into_changes();
+        // Every fallible step precedes publication. Keep the exact stable
+        // admission alive when the overlay removes the final inventory row.
+        let mut physical = BTreeMap::new();
+        if let Some(output) = output.as_mut() {
+            output
+                .permits
+                .try_reserve(changes.frames.len())
+                .map_err(|_| FrameInventoryError::RetirementAllocation)?;
+            for (&frame, entry) in &changes.frames {
+                if entry.is_none() {
+                    let cell = state
+                        .frames
+                        .get(&frame)
+                        .ok_or(FrameInventoryError::RetiredFrame(frame))?
+                        .references
+                        .lock();
+                    let backing = cell
+                        .backing
+                        .ok_or(FrameInventoryError::MissingPhysicalIdentity(frame))?;
+                    physical.insert(frame, (backing, cell.admission.clone()));
+                }
+            }
+        }
         for (frame, entry) in changes.frames {
             match entry {
                 Some(entry) => match state.frames.get_mut(&frame) {
@@ -1064,11 +1137,25 @@ impl FrameInventoryAuthority {
                     }
                 },
                 None => {
-                    if let Some(backing) = state
-                        .frames
-                        .remove(&frame)
-                        .and_then(|entry| entry.backing())
-                    {
+                    let removed = state.frames.remove(&frame);
+                    if let Some((backing, admission)) = physical.remove(&frame) {
+                        if let Some(output) = output.as_mut() {
+                            // SAFETY: the validated overlay removed the final
+                            // reference in this leaf-lock turn. Publication is
+                            // excluded by the retained physical admission.
+                            output.permits.push(unsafe {
+                                carrick_hal::FrameRetirementPermit::from_inventory(
+                                    self.origin.clone(),
+                                    frame,
+                                    backing,
+                                    next_revision,
+                                    self.abandoned_permits.clone(),
+                                    admission,
+                                    output.cleanup.clone(),
+                                )
+                            });
+                        }
+                    } else if let Some(backing) = removed.and_then(|entry| entry.backing()) {
                         state
                             .physical_frames
                             .remove(&(backing.ipa(), backing.host_owner_generation()));
@@ -1824,6 +1911,8 @@ fn prepare_mapping_reservation(
 /// Why a whole-MM inventory retirement refused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum FrameInventoryRetireMmError {
+    #[error("MM retirement receipt does not match its physical permits")]
+    ReceiptMismatch,
     #[error("MM retirement event count overflows")]
     Capacity,
     #[error("MM has an outstanding return claim; retry after its release")]
@@ -1856,6 +1945,10 @@ pub enum FrameInventoryReserveError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum FrameInventoryError {
+    #[error("frame {0:?} has no authenticated physical allocator identity")]
+    MissingPhysicalIdentity(FrameId),
+    #[error("physical retirement output allocation failed")]
+    RetirementAllocation,
     #[error("frame {0:?} physical allocator identity differs from publication")]
     PhysicalIdentityMismatch(FrameId),
     #[error("frame inventory batch is empty")]
@@ -5081,6 +5174,11 @@ mod inventory_origin_tests {
     }
 }
 
+struct RetirementOutput {
+    permits: Vec<carrick_hal::FrameRetirementPermit>,
+    cleanup: std::sync::Arc<dyn carrick_core_abi::FrameRetirementCleanup>,
+}
+
 mod claimed_return {
     use super::{
         BTreeSet, FrameId, FrameInventoryApplyReceipt, FrameInventoryAuthority,
@@ -5090,7 +5188,7 @@ mod claimed_return {
     };
 
     #[derive(Debug)]
-    struct RetirementCleanup(std::sync::Weak<FrameInventoryAuthority>);
+    pub(super) struct RetirementCleanup(pub(super) std::sync::Weak<FrameInventoryAuthority>);
     impl carrick_core_abi::FrameRetirementCleanup for RetirementCleanup {
         fn complete(&self, frame: FrameId, backing: carrick_hal::FrameBackingIdentity) {
             if let Some(inventory) = self.0.upgrade() {
@@ -5454,6 +5552,141 @@ mod claimed_return {
 mod prepared_return_tests {
     use super::*;
     use std::sync::Arc;
+    #[test]
+    fn whole_mm_permits_require_the_receipts_mapping_population() {
+        let (inventory, ids, owner, _) = fixture();
+        let (_, mut release) = inventory.retire_mm_with_permits(&ids, owner).unwrap();
+        let permit = release.pop_retirement().unwrap();
+        let other = FrameOwner::HostMm(MmId::from_raw_u64(43).unwrap());
+        let (_, empty) = inventory.retire_mm_with_permits(&ids, other).unwrap();
+        assert_eq!(release.revision(), empty.revision());
+        let (_, permits) = *empty.with_retirements(vec![permit]).unwrap_err();
+        let mut release = release.with_retirements(permits).unwrap();
+        // SAFETY: the VM-free backend has no physical custody. Join must still
+        // refuse while the inventory half retains an unconsumed permit.
+        let backend =
+            unsafe { carrick_core_abi::BackendCustodyReleased::from_backend_release(&release) };
+        let (retained, backend) =
+            *carrick_hal::MmReleaseReceipt::join(release, backend).unwrap_err();
+        release = retained;
+        let pending = release
+            .pop_retirement()
+            .unwrap()
+            .retire(|_| Ok::<_, ()>(()))
+            .unwrap();
+        // The joined receipt need not wait for pin drain.
+        assert!(carrick_hal::MmReleaseReceipt::join(release, backend).is_ok());
+        // SAFETY: all simulated pins have now drained.
+        unsafe { pending.complete() };
+    }
+
+    #[test]
+    fn whole_mm_permits_leave_a_shared_frame_with_its_live_sibling() {
+        let (inventory, ids, owner, row) = fixture();
+        let sibling = FrameOwner::HostMm(MmId::from_raw_u64(43).unwrap());
+        inventory
+            .apply(sibling, alias_commit(&inventory, &ids, row))
+            .unwrap();
+        let (_, release) = inventory.retire_mm_with_permits(&ids, owner).unwrap();
+        assert_eq!(release.pending_retirements(), 0);
+        assert_eq!(inventory.frame_mapping_count(row.frame), Some(1));
+        let (_, mut last) = inventory.retire_mm_with_permits(&ids, sibling).unwrap();
+        let permit = last.pop_retirement().unwrap();
+        assert_eq!(permit.frame(), row.frame);
+        let pending = permit.retire(|_| Ok::<_, ()>(())).unwrap();
+        // SAFETY: the fixture has no physical mappings or pins.
+        unsafe { pending.complete() };
+    }
+
+    #[test]
+    fn whole_mm_permits_refuse_missing_allocator_identity_before_mutation() {
+        let (inventory, ids, owner, row) = fixture();
+        let mut legacy = inventory
+            .reserve(&ids, 1, 1, FrameEventCapacity::for_event_count(2).unwrap())
+            .unwrap();
+        let transaction = legacy.transaction();
+        let frame = legacy.claim_frame().unwrap();
+        let mapping = legacy.claim_mapping().unwrap();
+        legacy
+            .push(FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation: row.generation,
+                gpa: Gpa::new(0x2000),
+                length: row.length,
+                permissions: MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        legacy
+            .push(FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation: row.generation,
+            })
+            .unwrap();
+        // The legacy publication API does not bind an allocator identity.
+        inventory.apply(owner, legacy.commit(())).unwrap();
+        let before = inventory.snapshot();
+        assert!(matches!(inventory.retire_mm_with_permits(&ids, owner),
+            Err(FrameInventoryRetireMmError::Apply(FrameInventoryError::MissingPhysicalIdentity(missing)))
+                if missing == frame));
+        // Neither the bound first frame nor the legacy second frame changes.
+        assert_eq!(inventory.snapshot(), before);
+        assert_eq!(inventory.abandoned_retirement_permits(), 0);
+    }
+
+    #[test]
+    fn whole_mm_release_retains_physical_admission_until_backend_completion() {
+        let (inventory, ids, owner, row) = fixture();
+        let claim = inventory.prepare_return(&ids, owner, &[row]).unwrap();
+        assert!(matches!(
+            inventory.retire_mm_with_permits(&ids, owner),
+            Err(FrameInventoryRetireMmError::RetryPending)
+        ));
+        claim.abort();
+        let (count, mut release) = inventory.retire_mm_with_permits(&ids, owner).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(release.pending_retirements(), 1);
+        let permit = release.pop_retirement().unwrap();
+        assert_eq!(permit.frame(), row.frame);
+        assert_eq!(permit.revision(), release.revision());
+        let backing = permit.backing();
+        assert!(
+            inventory
+                .claim_unused_backing(&ids, backing)
+                .unwrap()
+                .is_none()
+        );
+        let pending = permit
+            .retire(|_| {
+                assert!(inventory.state.try_lock().is_some());
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert!(
+            inventory
+                .claim_unused_backing(&ids, backing)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(inventory.retire_mm_with_permits(&ids, owner).unwrap().0, 0);
+        // SAFETY: the VM-free physical owner has completed its simulated unmap.
+        unsafe { pending.complete() };
+        let permit = inventory
+            .claim_unused_backing(&ids, backing)
+            .unwrap()
+            .unwrap();
+        let pending = permit.retire(|_| Ok::<_, ()>(())).unwrap();
+        // SAFETY: no mapping or pin was installed between the two requests.
+        unsafe { pending.complete() };
+        assert_eq!(inventory.abandoned_retirement_permits(), 0);
+    }
+
     #[test]
     fn backing_retirement_requires_inventory_absence_and_excludes_republication() {
         let (inventory, ids, owner, row) = fixture();

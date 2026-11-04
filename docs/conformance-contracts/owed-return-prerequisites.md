@@ -224,3 +224,27 @@ This does not complete C2: `retire_stage2_candidate_if_unreferenced` and the
 still need atomic whole-MM permit output and production backend consumption
 before `MmReleaseReceipt::join` can be introduced honestly. Slice 2b remains
 separate. No signed runtime or performance acceptance is claimed.
+
+### Atomic whole-MM permit output
+
+`FrameInventoryAuthority::retire_mm_with_permits` uses the existing whole-MM
+batch and transfers every last physical admission into a linear permit in
+the same inventory critical section. Missing allocator identities refuse
+before publication. The old event-based callers retain their current release
+order until their backend consumes permits; this API is a prerequisite, not
+an activated backend path.
+
+The production-entry witnesses cover a claimed row deferring teardown, a
+live sibling retaining a shared frame, missing identity leaving the inventory
+unchanged, and publication remaining excluded through pending retirement.
+A receipt rejects permits from another MM even when its origin and revision
+match, by checking the retired mapping population. Joining also refuses
+unconsumed permits. Physical completion is simulated in these VM-free tests;
+no backend unmap or pin-drain execution is claimed.
+
+The red witness failed compilation with E0599 against the preceding API.
+Whole-MM publication performs the existing batch work plus linear permit
+construction and logarithmic physical-index operations. Receipt attachment
+sorts the frame population once and uses binary searches, avoiding a quadratic
+scan for large MMs. Backend consumption and production receipt joining,
+C2's remaining candidate check and legacy ratchet, and slice 2b remain open.

@@ -459,3 +459,23 @@ bookkeeping implemented; B1–B3 physical identity transport, linear permits
 and two-half receipts remain; C1–C2 retirement gates remain; slice 2b
 settlement remains. The shared-file correction removes one concrete obstacle
 to B1, not those remaining requirements. Keep slice 2a draft.
+
+### Whole-MM permit extraction continuation
+
+The new `retire_mm_with_permits` entry composes the existing whole-MM batch
+with atomic physical admission transfer. It returns `InventoryReleased`
+carrying its last-frame permits after unlocking. It refuses an unbound legacy
+frame before changing inventory; it never substitutes a mapping generation
+for an allocator generation. A shared frame produces no permit until its
+last MM retires. The release half rejects a permit absent from its retired
+mapping population, including an unrelated empty-MM receipt at the same
+revision, and cannot join while it still contains permits.
+
+This completes the inventory output primitive, not the backend port.
+`PhysicalFrameInventory::retire_mm` and current `release_child_mm` callers
+still use the existing release order. Activating the new output there would
+abandon permits at their current boolean checks. HVF must retain the release
+through child custody drop and transfer permits to S2b. CPL0 must bind its
+allocator identities at publication, retain the release across memslot
+retirement, and consume its permits before constructing the backend half.
+Those integrations remain required before this prerequisite may land.
