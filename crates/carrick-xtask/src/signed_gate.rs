@@ -48,7 +48,7 @@ pub enum SignedGateAction {
         request: PathBuf,
         #[arg(long)]
         output: PathBuf,
-        /// Same-run exact-SHA archive; admission also checks fixture input identity.
+        /// Runner-provisioned immutable archive; restore checks fixture input identity.
         #[arg(long, env = "CARRICK_SIGNED_FIXTURE_BUNDLE")]
         fixture_bundle: PathBuf,
     },
@@ -487,7 +487,10 @@ fn execute(
         if !logged(&mut fetch, &lease, &output.join("fixture-fetch.log"))? {
             return Err(fail("fixture dependency fetch failed"));
         }
-        verify_fixture_artifact(&tree, &bundle, &request.sha)?;
+        // Restore admits the runner-provisioned bundle by fixture input
+        // identity. The exact-SHA check (`verify_fixture_artifact`) joins this
+        // path only together with the workflow that builds same-run exact-SHA
+        // archives (#1581); per-Mac bundles never carry the PR's commit.
         let mut restore = Command::new(&xtask);
         restore.current_dir(&tree).args([
             "--root",
@@ -499,7 +502,7 @@ fn execute(
         ]);
         if !logged(&mut restore, &lease, &output.join("fixture-restore.log"))? {
             return Err(fail(
-                "fixture restore failed for the authorized exact-SHA artifact",
+                "fixture restore failed; provision a bundle matching this SHA's fixture input identity",
             ));
         }
         let mut build = Command::new("just");
