@@ -1,6 +1,6 @@
 use crate::el1_zone::HostLockWait;
 use carrick_abi::*;
-use carrick_el1_abi::ipc::{IpcBacking, IpcObjectGuard, IpcObjectHandle, pipe as core_pipe};
+use carrick_el1_abi::ipc::{IpcObjectGuard, IpcObjectHandle, pipe as core_pipe};
 use carrick_guest_mem::CurrentMmMemory;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -207,59 +207,10 @@ impl PipeInner {
         capacity: usize,
     ) -> Result<Self, crate::el1_ipc::CreateError> {
         use crate::el1_ipc::CreateError;
-        let object = owner
-            .create_pipe(capacity)
+        let (object, prepared) = owner
+            .prepare_pipe(capacity, carrick_el1_abi::ipc::fd::StatusFlags::default())
             .map_err(CreateError::from_admission)?;
-        let description = |end, access| {
-            carrick_el1_abi::ipc::fd::Description::new(
-                IpcBacking::Pipe { object, end }.encode(),
-                access,
-                carrick_el1_abi::ipc::fd::StatusFlags::default(),
-            )
-        };
-        let reader = match owner.admit_description(description(
-            core_pipe::End::Reader,
-            carrick_el1_abi::ipc::fd::AccessMode::ReadOnly,
-        )) {
-            Ok(reader) => reader,
-            Err(error) => {
-                for end in [core_pipe::End::Reader, core_pipe::End::Writer] {
-                    owner
-                        .release(IpcBacking::Pipe { object, end }.encode())
-                        .unwrap_or_else(|_| {
-                            carrick_fatal::carrick_fatal!(
-                                "ipc::pipe",
-                                "reader admission rollback failed"
-                            )
-                        });
-                }
-                return Err(CreateError::from_admission(error));
-            }
-        };
-        let writer = match owner.admit_description(description(
-            core_pipe::End::Writer,
-            carrick_el1_abi::ipc::fd::AccessMode::WriteOnly,
-        )) {
-            Ok(writer) => writer,
-            Err(error) => {
-                owner
-                    .release(
-                        IpcBacking::Pipe {
-                            object,
-                            end: core_pipe::End::Writer,
-                        }
-                        .encode(),
-                    )
-                    .unwrap_or_else(|_| {
-                        carrick_fatal::carrick_fatal!(
-                            "ipc::pipe",
-                            "writer admission rollback failed"
-                        )
-                    });
-                drop(reader);
-                return Err(CreateError::from_admission(error));
-            }
-        };
+        let [reader, writer] = prepared.into_pair();
         let wait_queue = owner.wait_queue(object);
         let readiness = Arc::new(Mutex::new((false, false)));
         let read_pipe_ready = Arc::new(OnceLock::new());
@@ -1231,6 +1182,7 @@ impl<'a> FsView<'a> {
 mod tests {
     use super::*;
     use crate::dispatch::{InternalWaitKind, WaitFdAuthority};
+    use carrick_el1_abi::ipc::IpcBacking;
 
     #[test]
     fn forked_tables_final_writer_close_publishes_eof() {

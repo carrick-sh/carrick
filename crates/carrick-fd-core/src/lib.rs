@@ -18,6 +18,7 @@ use loom::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub mod exec;
 pub mod handle;
+pub mod prepared;
 pub mod reservation;
 pub mod storage;
 
