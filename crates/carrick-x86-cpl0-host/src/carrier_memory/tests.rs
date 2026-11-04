@@ -4,6 +4,21 @@ use std::sync::Mutex;
 #[derive(Default)]
 struct TestMemoryIo {
     regions: Mutex<HashMap<u32, CarrierMemoryRegion>>,
+    destruction: Mutex<carrick_hal::VmDestructionQueue>,
+}
+impl Drop for TestMemoryIo {
+    fn drop(&mut self) {
+        self.regions.get_mut().unwrap().clear();
+        let queue = self.destruction.get_mut().unwrap().take();
+        // SAFETY: this test backend has no vCPUs or hardware translations;
+        // its final owner just destroyed every modeled registration.
+        unsafe { carrick_hal::complete_vm_destruction(queue) };
+    }
+}
+impl carrick_hal::VmDestructionOwner for TestMemoryIo {
+    fn retain_until_vm_destroyed(&self, custody: Box<dyn carrick_hal::VmDestructionCustody>) {
+        custody.enqueue(&mut self.destruction.lock().unwrap());
+    }
 }
 impl CarrierMemoryIo for TestMemoryIo {
     fn carrier_slot_limit(&self) -> Result<u32, carrick_hal::OsError> {
@@ -133,6 +148,20 @@ fn custody_release_before_another_mm_unmaps_keeps_physical_registration() {
 #[test]
 fn whole_mm_permit_survives_backend_refusal() {
     test_support::whole_mm_permit_survives_backend_refusal(|| {
+        test_support::MemoryTestIo::new(TestMemoryIo::default())
+    });
+}
+
+#[test]
+fn stale_absence_preserves_successor_and_live_peer() {
+    test_support::stale_absence_preserves_successor_and_live_peer(|| {
+        test_support::MemoryTestIo::new(TestMemoryIo::default())
+    });
+}
+
+#[test]
+fn pending_permit_waits_for_final_vm_owner() {
+    test_support::pending_permit_waits_for_final_vm_owner(|| {
         test_support::MemoryTestIo::new(TestMemoryIo::default())
     });
 }

@@ -48,7 +48,10 @@ pub use trap::{
 pub mod vm_backend;
 pub use vm_backend::{ForkRamStrategy, GuestVmBackend};
 pub mod hypervisor;
-pub use hypervisor::{HvVcpu, HvVm, VcpuExit};
+pub use hypervisor::{
+    HvVcpu, HvVm, VcpuExit, VmDestructionCustody, VmDestructionOwner, VmDestructionQueue,
+    complete_vm_destruction,
+};
 pub mod kernel;
 pub use kernel::{
     BackendCustodyReleased, ForeignBackendRevision, ForeignFrameInventoryRevision,

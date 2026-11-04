@@ -44,6 +44,9 @@ vm_free = [
   "carrick-kernel::kernel::frame_inventory::prepared_return_tests (slice 2a bounded row claim, physical identity binding, linear permit custody, headroom, teardown refusal and undo boundary; no backend-release or runtime acceptance claim)",
   "carrick-core::mm::frames::frame_ref_tests (owned stable-counter unit, restore, split, counter exhaustion and Zero versus requested Last; no physical retirement permit claim)",
   "carrick-kernel::kernel::frame_inventory::tests::published_mapping_can_split_into_exact_subranges_of_the_same_frame (production fragment events preserve pending retirement through splitting and the final ordinary unmap)",
+  "carrick-x86-cpl0-host::carrier_memory::tests::{stale_absence_preserves_successor_and_live_peer,whole_mm_permit_survives_backend_refusal} (production terminal release authenticates the root before retirement, retains exact permits across refusal, and joins the backend receipt after residency and custody release; real memslot binding in carrick-vmm-kvm::carrier_memory::memslot_tests)",
+  "carrick-kernel::kernel::frame_inventory::physical_projection_tests::child_release_join_refuses_foreign_half_without_replacing_original_inventory (neutral release owner preserves the inventory half on rejected backend join)",
+  "carrick-x86-cpl0-host::carrier_memory::tests::pending_permit_waits_for_final_vm_owner (preallocated backing/retirement handoff; real KVM bindings additionally retain a live vCPU and sibling VM after outer-wrapper destruction)",
 ]
 embed = [
   "carrick-embed::el1_sched::el1_anonymous_reservations_stay_in_guest",

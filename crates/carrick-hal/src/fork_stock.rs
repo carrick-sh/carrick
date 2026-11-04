@@ -591,8 +591,36 @@ impl LifecycleWindow {
 #[must_use = "retain in the existing MM completion owner until release succeeds"]
 pub struct ChildMmRelease {
     inventory: Option<crate::InventoryReleased>,
+    receipt: Option<crate::MmReleaseReceipt>,
 }
 impl ChildMmRelease {
+    /// The exact joined release, retained by the existing completion owner.
+    pub fn receipt(&self) -> Option<&crate::MmReleaseReceipt> {
+        self.receipt.as_ref()
+    }
+
+    /// Join only a backend owner's proof. Refusal restores the original
+    /// inventory half, including any permits it still owns, without re-retiring.
+    pub fn join_backend(
+        &mut self,
+        backend: crate::BackendCustodyReleased,
+    ) -> Result<(), crate::BackendCustodyReleased> {
+        let Some(inventory) = self.inventory.take() else {
+            return Err(backend);
+        };
+        match crate::MmReleaseReceipt::join(inventory, backend) {
+            Ok(receipt) => {
+                self.receipt = Some(receipt);
+                Ok(())
+            }
+            Err(halves) => {
+                let (inventory, backend) = *halves;
+                self.inventory = Some(inventory);
+                Err(backend)
+            }
+        }
+    }
+
     /// Admit the original inventory output once. A different owner cannot use
     /// this progress, even if it recycles the numeric MM identifier.
     pub fn inventory(
@@ -601,6 +629,9 @@ impl ChildMmRelease {
         absence: &SlotAbsence,
     ) -> Option<&mut crate::InventoryReleased> {
         let owner = absence.inventory_owner()?;
+        if self.receipt.is_some() {
+            return None;
+        }
         if self.inventory.is_none() {
             self.inventory = Some(inventory.retire_mm_with_permits(owner).ok()?);
         }

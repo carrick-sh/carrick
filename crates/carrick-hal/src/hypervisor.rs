@@ -60,3 +60,35 @@ pub enum VcpuExit {
         data: Vec<u8>,
     },
 }
+
+/// The physical VM lifetime owner accepts preallocated custody without
+/// allocating, failing or completing it before the exact VM is destroyed.
+pub trait VmDestructionOwner: Send + Sync {
+    fn retain_until_vm_destroyed(&self, custody: Box<dyn VmDestructionCustody>);
+}
+
+/// Preallocated registered-memory custody transferred to its exact VM's
+/// destruction owner. A node owns its successor so enqueue requires no allocation.
+pub trait VmDestructionCustody: Send {
+    fn enqueue(self: Box<Self>, queue: &mut VmDestructionQueue);
+
+    /// # Safety
+    /// This node's exact VM and all vCPU descriptors must already be destroyed.
+    /// No backend lock may be held; completion may call the inventory owner.
+    /// Retain registered backing until its pending retirements complete.
+    unsafe fn complete_after_vm_destroyed(self: Box<Self>) -> VmDestructionQueue;
+}
+
+pub type VmDestructionQueue = Option<Box<dyn VmDestructionCustody>>;
+
+/// Complete a backend's preowned queue without recursive node destruction.
+///
+/// # Safety
+/// Every node must belong to the exact destroyed VM. All vCPU descriptors must
+/// be closed and no backend registry, queue or pool lock may be held.
+pub unsafe fn complete_vm_destruction(mut queue: VmDestructionQueue) {
+    while let Some(node) = queue {
+        // SAFETY: caller proved this queue's exact VM destruction and lock freedom.
+        queue = unsafe { node.complete_after_vm_destroyed() };
+    }
+}

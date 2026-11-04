@@ -275,3 +275,76 @@ zero-kernel-reference check to terminal candidate retirement would be wrong:
 that path publishes its own inventory unmaps after physical cleanup. Keep the
 draft incomplete. The earlier EL1 truncation and runtime failures remain failed
 evidence until attributed against admitted main with complete populations.
+
+
+### CPL0 terminal release joins its backend receipt (partial B2/B3)
+
+`CarrierMemory::release_child_mm` now composes the production terminal release:
+exact absence/root authentication, retained whole-MM inventory retirement,
+residency removal, permit transfer to the existing slot owner, root/alias/private
+slot release, and finally the backend/inventory receipt join. `ChildMmRelease`
+retains the joined receipt in the existing quarantine completion owner. A
+rejected join restores its original inventory half. Completed retry checks the
+receipt's origin and exact MM incarnation without touching a recycled root.
+The receipt does not assert physical pin drain; accepted pending permits remain
+with their exact memslot until deletion.
+
+The stale-absence witness failed before the correction: low-level
+`retire_child` ignored the proof's root incarnation and released its successor.
+It now refuses before mutation and leaves a live peer, successor root and
+shared slot intact. The real-slot refusal witness now drives the same release
+composition the production terminal caller uses, rather than manually assembling
+its inventory and backend steps. It checks retained revision, no duplicate
+permit transfer, foreign-inventory and stale-incarnation refusal, exact joined
+receipt identity, zero abandonment, and an effect-free completed retry after
+successor installation. The kernel witness exercises the neutral join owner's
+refusal with two inventory MMs. Work adds constant-time identity checks and one
+constant-time join; inventory, alias and memslot traversal bounds are unchanged.
+
+This closes neither B1 nor the issue. Unpublished rollback still needs retained
+progress in its admitted-loan owner. Final VM-destruction completion remains
+open: the outer memory owner can drop while birth-source or wake owners retain
+VM references, and outer `Arc<KvmVm>` uniqueness would not prove destruction of
+the internally shared VM descriptor or vCPUs. This change does not complete
+pending permits at that unproven boundary. HVF production joining, complete
+B2/B3 acceptance, C2 candidate admission and its falling counter, and slice 2b
+remain open. Independent review covered this bounded production diff and found
+no P0/P1 defect; runtime/signed acceptance remains director-owned. Earlier EL1
+population truncation and runtime failures remain unattributed failed evidence.
+
+
+### CPL0 final VM destruction completes accepted permits (partial B1)
+
+`CarrierMemory` now transfers all registered backing and accepted pending
+retirements into a node preallocated at creation. Its destructor links that
+node into the physical backend's destruction queue without allocating or
+completing inventory work. The ISA-neutral `carrick-hal::VmDestructionCustody` seam owns the linked queue
+and its final completion contract; the CPL0 node supplies its retained slots.
+KVM's shared lifetime owner includes every internal
+VM handle, production run context, and live vCPU slot. Parked descriptors do
+not retain that owner, avoiding a cycle. At its final drop it takes and closes
+parked vCPU descriptors, releases the pool lock, closes the VM descriptor,
+then completes pending inventory retirements and releases their backing.
+Poisoned pool contents follow the same close order. Queue insertion holds only
+the destruction-queue mutex; completion holds neither queue nor pool locks.
+
+The exact registration and permit identity remain the existing authorities;
+VM destruction supplies the physical completion already allowed by
+`PendingFrameRetirement`. No per-frame polling, new retry owner or guest
+crossing is introduced. Terminal handoff is a constant-time tree move and
+linked-node insertion. Final cleanup is linear in retained slots and accepted
+pending permits, and is outside inventory locks. The lifetime guard in the
+shared vCPU slot drops after its descriptor, so a transient reclaim wrapper
+cannot outlive destruction authority.
+
+The portable final-wrapper witness and real KVM wrapper/vCPU/sibling witnesses
+start at the production release entry, retain accepted retirement across a
+backend refusal, and destroy the outer memory owner. They require inventory
+publication to stay excluded while an independent owner remains, then require
+completion and zero abandonment after its final drop. They do not execute
+guest instructions or establish signed/runtime-ratio acceptance.
+
+This resolves the accepted-pending-permit destruction gap described above;
+unpublished rollback, unaccepted permits at final carrier destruction, HVF
+joining, full B2/B3 acceptance, C2 and slice 2b remain open. No broader B1
+completion claim follows from these witnesses.

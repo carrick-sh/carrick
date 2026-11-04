@@ -4141,6 +4141,50 @@ mod tests {
 #[cfg(test)]
 mod physical_projection_tests {
     use super::*;
+
+    #[test]
+    fn child_release_join_refuses_foreign_half_without_replacing_original_inventory() {
+        use carrick_hal::fork_stock::{ChildMmRelease, SlotAbsence};
+        let inventory = Arc::new(FrameInventoryAuthority::new());
+        let source = inventory.physical_projection(Arc::new(ObjectIdRegistry::new()));
+        let owner = carrick_hal::GuestFrameOwner {
+            native_mm: carrick_hal::MmGeneration::new(NonZeroU64::new(41).unwrap()),
+            root_generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let other = carrick_hal::GuestFrameOwner {
+            native_mm: carrick_hal::MmGeneration::new(NonZeroU64::new(42).unwrap()),
+            ..owner
+        };
+        let absence = SlotAbsence::scan(
+            carrick_el1_abi::ReservationMm::new(owner.native_mm.raw().get()).unwrap(),
+            [],
+        )
+        .unwrap()
+        .with_owner(owner)
+        .unwrap();
+        let mut progress = ChildMmRelease::default();
+        let revision = progress.inventory(&*source, &absence).unwrap().revision();
+        let foreign = source.retire_mm_with_permits(other).unwrap();
+        // SAFETY: these two VM-free MMs have no physical allocations, pins or
+        // backend registrations. Their release halves must still not cross.
+        let backend =
+            unsafe { carrick_hal::BackendCustodyReleased::from_backend_release(&foreign) };
+        let rejected = progress.join_backend(backend).unwrap_err();
+        assert!(progress.receipt().is_none());
+        let retained = progress.inventory(&*source, &absence).unwrap();
+        assert_eq!(retained.revision(), revision);
+        assert_eq!(retained.pending_retirements(), 0);
+        // SAFETY: same empty VM-free backend as above, now the exact owner.
+        let backend =
+            unsafe { carrick_hal::BackendCustodyReleased::from_backend_release(retained) };
+        progress.join_backend(backend).unwrap();
+        assert_eq!(progress.receipt().unwrap().revision(), revision);
+        assert!(progress.inventory(&*source, &absence).is_none());
+        assert!(progress.join_backend(rejected).is_err());
+        assert_eq!(progress.receipt().unwrap().revision(), revision);
+        assert_eq!(inventory.abandoned_retirement_permits(), 0);
+    }
+
     use carrick_hal::physical_grants::PhysicalGrantRelease;
     use std::sync::Arc;
 

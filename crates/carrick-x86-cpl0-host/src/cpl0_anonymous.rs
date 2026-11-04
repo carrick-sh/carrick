@@ -352,32 +352,22 @@ impl<'a> CowPause<'a> {
 /// and the memslots admitted only for it.
 fn release_retired_child<M: CarrierMemoryIo>(
     memory: &mut CarrierMemory<M>,
+    ram: &GuestRam,
     inventory: &dyn carrick_hal::PhysicalFrameInventory,
     absence: &SlotAbsence,
     progress: &mut carrick_hal::fork_stock::ChildMmRelease,
-) -> Result<crate::carrier_memory::RetiredChild, TrapError> {
-    // SAFETY: the retained aligned residency table initialized at boot.
-    let residency = unsafe {
-        memory.retained_record::<carrick_el1_abi::FrameGrantResidencyTable>(FrameGpa::new(
+) -> Result<(), TrapError> {
+    let ptr = ram
+        .host_ptr(
             KERNEL_REGION_GPA + carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET,
-        ))
-    }
-    .map_err(|e| fail(e.to_string()))?;
-    let released = progress
-        .inventory(inventory, absence)
-        .ok_or_else(|| fail("retired child inventory release"))?;
-    if !residency.retire_overlapping(absence.mm().raw(), 0, u64::MAX) {
-        return Err(fail("retired child residency release"));
-    }
-    released
-        .try_retirements(|permit| {
-            memory
-                .accept_inventory_retirement(inventory, permit)
-                .map_err(|permit| (permit, ()))
-        })
-        .map_err(|()| fail("retired child physical retirement refused"))?;
+            size_of::<carrick_el1_abi::FrameGrantResidencyTable>(),
+        )
+        .ok_or_else(|| fail("retired child residency bounds"))?;
+    // SAFETY: boot initialized this aligned atomic table in the bootstrap RAM.
+    // The separate RAM owner retains it throughout private child-slot deletion.
+    let residency = unsafe { &*ptr.cast::<carrick_el1_abi::FrameGrantResidencyTable>() };
     memory
-        .retire_child(absence, inventory)
+        .release_child_mm(inventory, residency, absence, progress)
         .map_err(|e| fail(e.to_string()))
 }
 
@@ -799,6 +789,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         let window = self.lifecycle_window();
         let inventory = Arc::clone(&self.frame_inventory);
         let memory = std::cell::RefCell::new(&mut self._vm);
+        let ram = &self.ram;
         let zero = [0u8; 4096];
         self.fork_stock
             .reclaim(
@@ -813,8 +804,14 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 },
                 |lifecycle| window.clear(lifecycle),
                 |absence, progress| {
-                    release_retired_child(&mut memory.borrow_mut(), &*inventory, absence, progress)
-                        .is_ok()
+                    release_retired_child(
+                        &mut memory.borrow_mut(),
+                        ram,
+                        &*inventory,
+                        absence,
+                        progress,
+                    )
+                    .is_ok()
                 },
             )
             .map(|_| ())

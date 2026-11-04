@@ -97,3 +97,40 @@ fn custody_release_before_another_mm_unmaps_keeps_physical_registration() {
 fn whole_mm_permit_survives_backend_refusal() {
     test_support::whole_mm_permit_survives_backend_refusal(real_memory_io);
 }
+
+#[test]
+fn stale_absence_preserves_successor_and_live_peer() {
+    test_support::stale_absence_preserves_successor_and_live_peer(real_memory_io);
+}
+
+#[test]
+fn pending_permit_waits_for_final_vm_owner() {
+    test_support::pending_permit_waits_for_final_vm_owner(real_memory_io);
+}
+
+#[test]
+fn pending_permit_waits_for_live_vcpu_after_outer_vm_drop() {
+    use carrick_hal::HvVm;
+    let cpu = std::cell::RefCell::new(None);
+    test_support::pending_permit_waits_for_independent_owner(
+        || {
+            let mut vm = crate::KvmVm::create_empty().unwrap();
+            *cpu.borrow_mut() = Some(vm.add_vcpu().unwrap());
+            test_support::MemoryTestIo::new(vm)
+        },
+        || drop(cpu.borrow_mut().take()),
+    );
+}
+
+#[test]
+fn pending_permit_waits_for_sibling_vm_after_outer_vm_drop() {
+    let sibling = std::cell::RefCell::new(None);
+    test_support::pending_permit_waits_for_independent_owner(
+        || {
+            let vm = crate::KvmVm::create_empty().unwrap();
+            *sibling.borrow_mut() = Some(crate::KvmVm::from_shared_vm(vm.vm_handle()));
+            test_support::MemoryTestIo::new(vm)
+        },
+        || drop(sibling.borrow_mut().take()),
+    );
+}

@@ -28,7 +28,7 @@ pub struct CarrierMemoryRegion {
     pub userspace_addr: u64,
 }
 
-pub trait CarrierMemoryIo: Send + Sync + 'static {
+pub trait CarrierMemoryIo: carrick_hal::VmDestructionOwner + Send + Sync + 'static {
     fn carrier_slot_limit(&self) -> Result<u32, carrick_hal::OsError>;
     /// Register a user memory region in the carrier.
     ///
@@ -323,6 +323,34 @@ struct Slot {
     drains: Vec<AddressContext<RootGpa>>,
 }
 
+/// Preallocated destruction node: registered bytes and accepted physical
+/// retirements stay together until the backend destroys their exact VM.
+/// Nodes are linked without allocating during terminal handoff.
+#[derive(::core::default::Default)]
+#[must_use = "retain registered backing until the exact VM is destroyed"]
+pub struct CarrierDestructionCustody {
+    slots: BTreeMap<u32, Slot>,
+    next: carrick_hal::VmDestructionQueue,
+}
+impl carrick_hal::VmDestructionCustody for CarrierDestructionCustody {
+    fn enqueue(mut self: Box<Self>, queue: &mut carrick_hal::VmDestructionQueue) {
+        self.next = queue.take();
+        *queue = Some(self);
+    }
+
+    unsafe fn complete_after_vm_destroyed(mut self: Box<Self>) -> carrick_hal::VmDestructionQueue {
+        let next = self.next.take();
+        for mut slot in std::mem::take(&mut self.slots).into_values() {
+            for pending in slot.inventory_retirements.drain(..) {
+                // SAFETY: the backend proved destruction of this exact VM and
+                // released its locks before calling this neutral completion.
+                unsafe { pending.complete() };
+            }
+        }
+        next
+    }
+}
+
 /// N1 supplies the real frame-inventory transaction. publish authenticates
 /// readiness before any present leaf; commit settles exact descriptor receipts.
 /// Unmap/COW commit may not retire physical owners: InventoryRetirement does
@@ -432,7 +460,7 @@ impl InventoryRetirement for AlreadyRetiredInventory {
     }
 }
 
-/// Drops VM before all registered backing. It exclusively owns its slot
+/// Retains registered backing through final VM destruction. It owns its slot
 /// namespace; legacy HvVm::map_memory is never called on this VM.
 pub struct CarrierMemory<M: CarrierMemoryIo> {
     identity: CarrierVmId,
@@ -452,6 +480,16 @@ pub struct CarrierMemory<M: CarrierMemoryIo> {
     limit: u32,
     generation: u64,
     quarantined: bool,
+    destruction: Option<Box<CarrierDestructionCustody>>,
+}
+
+impl<M: CarrierMemoryIo> Drop for CarrierMemory<M> {
+    fn drop(&mut self) {
+        if let Some(mut custody) = self.destruction.take() {
+            custody.slots = std::mem::take(&mut self.slots);
+            self.vm.retain_until_vm_destroyed(custody);
+        }
+    }
 }
 
 impl<M: CarrierMemoryIo> CarrierMemory<M> {
@@ -511,6 +549,7 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             limit,
             generation: 0,
             quarantined: false,
+            destruction: Some(Box::default()),
         })
     }
     pub fn identity(&self) -> CarrierVmId {
@@ -739,7 +778,10 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             .roots
             .get(&mm)
             .ok_or_else(|| error("retired MM has no carrier CR3 root"))?;
-        // Bind to the exact retired root incarnation, not just the MM number.
+        // An old proof for the same numeric MM cannot release its successor.
+        if absence.inventory_owner() != Some(context.into()) {
+            return Err(error("retired MM absence names another root incarnation"));
+        }
         let authority = inventory.bind(context.into());
         // Phase 1: validate, mutating nothing.
         let mut held: BTreeMap<u32, usize> = BTreeMap::new();
@@ -837,6 +879,63 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             aliases,
             revoked_slots: private.len(),
         })
+    }
+
+    /// Release one excluded MM through the neutral inventory authority and
+    /// retain the joined receipt in its existing completion owner. A refusal
+    /// preserves the original inventory output and every unaccepted permit.
+    pub(crate) fn release_child_mm(
+        &mut self,
+        inventory: &dyn carrick_hal::PhysicalFrameInventory,
+        residency: &carrick_el1_abi::FrameGrantResidencyTable,
+        absence: &carrick_hal::fork_stock::SlotAbsence,
+        progress: &mut carrick_hal::fork_stock::ChildMmRelease,
+    ) -> Result<(), MemoryError> {
+        self.admit()?;
+        let mm = NonZeroU64::new(absence.mm().raw()).ok_or_else(|| error("retired MM key"))?;
+        if let Some(receipt) = progress.receipt() {
+            return if receipt.issued_by(inventory.origin())
+                && absence.inventory_owner().is_some_and(|owner| {
+                    receipt.owner()
+                        == carrick_hal::FrameInventoryReceiptOwner::GuestMm {
+                            native_mm: owner.native_mm,
+                            root_generation: owner.root_generation,
+                        }
+                }) {
+                Ok(())
+            } else {
+                Err(error("completed child release names another owner"))
+            };
+        }
+        let context = self
+            .roots
+            .get(&mm)
+            .ok_or_else(|| error("retired MM root"))?;
+        if absence.inventory_owner() != Some((*context).into()) {
+            return Err(error("retired MM absence names another root incarnation"));
+        }
+        let released = progress
+            .inventory(inventory, absence)
+            .ok_or_else(|| error("retired child inventory release"))?;
+        if !residency.retire_overlapping(absence.mm().raw(), 0, u64::MAX) {
+            return Err(error("retired child residency release"));
+        }
+        released.try_retirements(|permit| {
+            self.accept_inventory_retirement(inventory, permit)
+                .map_err(|permit| (permit, error("retired child physical retirement refused")))
+        })?;
+        self.retire_child(absence, inventory)?;
+        // SAFETY: residency is retired, every last-frame permit was accepted
+        // into its exact slot's completion owner, and retire_child released
+        // this MM's root, aliases and private memslots. Shared slots keep their
+        // pending permits until physical deletion; the receipt does not assert
+        // that this asynchronous physical completion has already happened.
+        let backend =
+            unsafe { carrick_hal::BackendCustodyReleased::from_backend_release(released) };
+        progress
+            .join_backend(backend)
+            .map_err(|_| error("retired child backend receipt identity"))?;
+        Ok(())
     }
 
     pub fn root(&self, mm: NonZeroU64) -> Option<AddressContext<RootGpa>> {

@@ -22,6 +22,11 @@ impl MemoryTestIo {
         self.fail_at.store(usize::MAX, Ordering::Relaxed);
     }
 }
+impl carrick_hal::VmDestructionOwner for MemoryTestIo {
+    fn retain_until_vm_destroyed(&self, custody: Box<dyn carrick_hal::VmDestructionCustody>) {
+        self.io.retain_until_vm_destroyed(custody);
+    }
+}
 impl CarrierMemoryIo for MemoryTestIo {
     fn carrier_slot_limit(&self) -> Result<u32, carrick_hal::OsError> {
         self.io.carrier_slot_limit()
@@ -1046,7 +1051,7 @@ struct RetireFixture {
 
 impl RetireFixture {
     /// MMs 1..=`mms`, MM `n` rooted at `n * PAGE` in one arena slot.
-    fn new(count: u64, _make: fn() -> MemoryTestIo) -> Self {
+    fn new(count: u64, _make: impl FnOnce() -> MemoryTestIo) -> Self {
         let ids = Arc::new(carrick_kernel::kernel::ObjectIdRegistry::new());
         let mut fixture = Self {
             memory: CarrierMemory::new(_make()).unwrap(),
@@ -1141,6 +1146,8 @@ impl RetireFixture {
             carrick_el1_abi::ReservationMm::new(self.key(mm).get()).unwrap(),
             [0],
         )
+        .unwrap()
+        .with_owner(self.context(mm).into())
         .unwrap();
         let inventory = self.inventory();
         self.memory.retire_child(&absence, &*inventory)
@@ -1710,9 +1717,30 @@ pub fn inherited_inventory_edge_survives_protect_advancing_mapping_generation(
 
 /// Real slot custody and inventory, with a backend preflight refusal followed
 /// by retry while the other MM stays live. No VM execution is claimed.
-pub fn whole_mm_permit_survives_backend_refusal(_make: fn() -> MemoryTestIo) {
+pub fn whole_mm_permit_survives_backend_refusal(make: fn() -> MemoryTestIo) {
+    whole_mm_release_scenario(make, None::<fn()>, false);
+}
+
+pub fn pending_permit_waits_for_final_vm_owner(make: fn() -> MemoryTestIo) {
+    whole_mm_release_scenario(make, Some(|| {}), false);
+}
+
+/// The caller retains a real vCPU or sibling owner independently of the
+/// outer memory wrapper, then releases it only after that wrapper is gone.
+pub fn pending_permit_waits_for_independent_owner(
+    make: impl FnMut() -> MemoryTestIo,
+    release_last_owner: impl FnOnce(),
+) {
+    whole_mm_release_scenario(make, Some(release_last_owner), true);
+}
+
+fn whole_mm_release_scenario(
+    mut make: impl FnMut() -> MemoryTestIo,
+    release_last_owner: Option<impl FnOnce()>,
+    independent_owner: bool,
+) {
     use carrick_hal::fork_stock::{ChildMmRelease, SlotAbsence};
-    let mut fixture = RetireFixture::new(2, _make);
+    let mut fixture = RetireFixture::new(2, &mut make);
     let child = fixture.context(2);
     let source = fixture.inventory();
     let authority = source.bind(child.into());
@@ -1773,28 +1801,44 @@ pub fn whole_mm_permit_survives_backend_refusal(_make: fn() -> MemoryTestIo) {
     .unwrap()
     .with_owner(child.into())
     .unwrap();
+    let mut storage = Box::<carrick_el1_abi::FrameGrantResidencyTable>::new_uninit();
+    // SAFETY: unique correctly aligned heap storage for the complete table.
+    unsafe { carrick_el1_abi::FrameGrantResidencyTable::init_in_place(storage.as_mut_ptr()) };
+    // SAFETY: init_in_place initialized every field.
+    let residency = unsafe { storage.assume_init() };
     let mut progress = ChildMmRelease::default();
-    let released = progress.inventory(&*source, &absence).unwrap();
-    assert_eq!(released.pending_retirements(), 1);
-    let revision = released.revision();
-    released
-        .try_retirements(|permit| {
-            fixture
-                .memory
-                .accept_inventory_retirement(&*source, permit)
-                .map_err(|permit| (permit, ()))
-        })
-        .unwrap();
-    assert_eq!(
+    // Refuse transfer at the real physical-owner identity check. The caller
+    // must retain the unaccepted linear permit, not retire the empty MM anew.
+    fixture
+        .memory
+        .slots
+        .get_mut(&handle.slot)
+        .unwrap()
+        .backing
+        .identity
+        .frame_id = nz(frame.raw() + 1);
+    assert!(
         fixture
             .memory
-            .record(handle)
+            .release_child_mm(&*source, &residency, &absence, &mut progress)
+            .is_err()
+    );
+    assert_eq!(
+        progress
+            .inventory(&*source, &absence)
             .unwrap()
-            .inventory_retirements
-            .len(),
+            .pending_retirements(),
         1
     );
-    // A live peer's CR3 in the data extent refuses release before mutation.
+    assert_eq!(fixture.authority.abandoned_retirement_permits(), 0);
+    fixture
+        .memory
+        .slots
+        .get_mut(&handle.slot)
+        .unwrap()
+        .backing
+        .identity = identity;
+    // A live peer's CR3 in the data extent refuses release before backend mutation.
     let peer = fixture.context(1);
     let blocking = AddressContext {
         root: root(0x800000),
@@ -1805,9 +1849,67 @@ pub fn whole_mm_permit_survives_backend_refusal(_make: fn() -> MemoryTestIo) {
         .memory
         .install_root(peer.mm.raw(), blocking)
         .unwrap();
-    assert!(fixture.memory.retire_child(&absence, &*source).is_err());
+    assert!(
+        fixture
+            .memory
+            .release_child_mm(&*source, &residency, &absence, &mut progress)
+            .is_err()
+    );
+    assert!(
+        progress.receipt().is_none(),
+        "refusal cannot authorize acknowledgement"
+    );
+    let released = progress.inventory(&*source, &absence).unwrap();
+    let revision = released.revision();
+    assert_eq!(
+        released.pending_retirements(),
+        0,
+        "permit moved to existing slot owner"
+    );
+    assert_eq!(
+        fixture
+            .memory
+            .record(handle)
+            .unwrap()
+            .inventory_retirements
+            .len(),
+        1
+    );
     assert!(fixture.memory.root(child.mm.raw()).is_some());
     assert_eq!(fixture.authority.abandoned_retirement_permits(), 0);
+    if let Some(release_last_owner) = release_last_owner {
+        let backing = carrick_hal::FrameBackingIdentity::from_allocator(
+            FrameGpa::new(0x800000),
+            PhysicalOwnerGeneration::INITIAL.raw(),
+            length,
+        );
+        let vm = fixture.memory.clone_vm();
+        drop(fixture.memory);
+        assert_eq!(fixture.authority.abandoned_retirement_permits(), 0);
+        assert!(
+            source.claim_unused_backing(backing).unwrap().is_none(),
+            "outer memory drop completed a live VM's retirement"
+        );
+        drop(vm);
+        if independent_owner {
+            assert!(
+                source.claim_unused_backing(backing).unwrap().is_none(),
+                "outer VM wrapper drop completed a live vCPU/sibling retirement"
+            );
+            assert_eq!(fixture.authority.abandoned_retirement_permits(), 0);
+        }
+        release_last_owner();
+        let permit = source
+            .claim_unused_backing(backing)
+            .unwrap()
+            .expect("final VM destruction must complete its retained permit");
+        let pending = permit.retire(|_| Ok::<_, ()>(())).unwrap();
+        // SAFETY: the backend just destroyed the VM and no registration was
+        // published between this absence claim and its cleanup.
+        unsafe { pending.complete() };
+        assert_eq!(fixture.authority.abandoned_retirement_permits(), 0);
+        return;
+    }
     let stale = SlotAbsence::scan(absence.mm(), [])
         .unwrap()
         .with_owner(carrick_hal::GuestFrameOwner {
@@ -1815,22 +1917,101 @@ pub fn whole_mm_permit_survives_backend_refusal(_make: fn() -> MemoryTestIo) {
             ..child.into()
         })
         .unwrap();
-    assert!(progress.inventory(&*source, &stale).is_none());
+    assert!(
+        fixture
+            .memory
+            .release_child_mm(&*source, &residency, &stale, &mut progress)
+            .is_err()
+    );
+    let foreign_fixture = RetireFixture::new(1, &mut make);
+    let foreign = foreign_fixture.inventory();
+    assert!(
+        fixture
+            .memory
+            .release_child_mm(&*foreign, &residency, &absence, &mut progress)
+            .is_err()
+    );
+    assert_eq!(
+        progress.inventory(&*source, &absence).unwrap().revision(),
+        revision
+    );
     fixture.memory.roots.remove(&peer.mm.raw());
     fixture.memory.install_root(peer.mm.raw(), peer).unwrap();
-    let released = progress.inventory(&*source, &absence).unwrap();
-    assert_eq!(released.revision(), revision);
-    assert_eq!(released.pending_retirements(), 0);
-    let mut replayed = false;
-    let completed = released.try_retirements::<()>(|permit| {
-        replayed = true;
-        Err((permit, ()))
-    });
-    assert!(completed.is_ok());
-    assert!(!replayed, "accepted permit must not replay");
-    let retired = fixture.memory.retire_child(&absence, &*source).unwrap();
-    assert_eq!(retired.revoked_slots, 1);
+    fixture
+        .memory
+        .release_child_mm(&*source, &residency, &absence, &mut progress)
+        .unwrap();
+    let joined = progress.receipt().expect("production backend join");
+    assert!(joined.issued_by(source.origin()));
+    assert_eq!(joined.revision(), revision);
+    assert_eq!(
+        joined.owner(),
+        carrick_hal::FrameInventoryReceiptOwner::GuestMm {
+            native_mm: child.mm,
+            root_generation: child.generation,
+        }
+    );
+    assert!(
+        progress.inventory(&*source, &absence).is_none(),
+        "joined release cannot be reissued"
+    );
+    // A completed retry is effect-free even after this numeric MM has a successor.
+    let successor = AddressContext {
+        generation: ContextGeneration::new(nz(2)),
+        ..child
+    };
+    fixture
+        .memory
+        .install_root(child.mm.raw(), successor)
+        .unwrap();
+    fixture
+        .memory
+        .release_child_mm(&*source, &residency, &absence, &mut progress)
+        .unwrap();
+    assert_eq!(fixture.memory.root(child.mm.raw()), Some(successor));
+    assert!(
+        fixture
+            .memory
+            .release_child_mm(&*source, &residency, &stale, &mut progress)
+            .is_err()
+    );
     assert!(fixture.memory.record(handle).is_err());
     assert_eq!(fixture.memory.root(peer.mm.raw()), Some(peer));
     assert_eq!(fixture.authority.abandoned_retirement_permits(), 0);
+}
+
+/// A previous incarnation's absence never licenses the successor's release.
+pub fn stale_absence_preserves_successor_and_live_peer(make: fn() -> MemoryTestIo) {
+    use carrick_hal::fork_stock::SlotAbsence;
+    let mut fixture = RetireFixture::new(2, make);
+    let private = fixture.slot(0x800000, 91, &[2]);
+    let shared = fixture.slot(0x900000, 92, &[1, 2]);
+    fixture.alias(2, shared, 0x4000, Some(0x900000));
+    let child = fixture.context(2);
+    let stale = SlotAbsence::scan(
+        carrick_el1_abi::ReservationMm::new(child.mm.raw().get()).unwrap(),
+        [],
+    )
+    .unwrap()
+    .with_owner(carrick_hal::GuestFrameOwner {
+        root_generation: ContextGeneration::new(nz(2)),
+        ..child.into()
+    })
+    .unwrap();
+    let inventory = fixture.inventory();
+    assert!(
+        fixture.memory.retire_child(&stale, &*inventory).is_err(),
+        "stale absence released the successor's backend custody"
+    );
+    assert_eq!(fixture.memory.root(child.mm.raw()), Some(child));
+    assert!(fixture.memory.record(private).is_ok());
+    assert_eq!(fixture.allowed(shared).len(), 2);
+    assert!(!fixture.memory.is_quarantined());
+    assert_eq!(
+        fixture.memory.root(fixture.key(1)),
+        Some(fixture.context(1))
+    );
+    fixture.assert_admitted_exact();
+    fixture.retire(2).unwrap();
+    assert_eq!(fixture.allowed(shared), vec![fixture.key(1)]);
 }
