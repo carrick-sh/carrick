@@ -340,6 +340,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-capture"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "carrick-cli"
 version = "0.1.0"
 dependencies = [
@@ -1340,6 +1347,7 @@ name = "carrick-xtask"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "carrick-capture",
  "carrick-conformance",
  "carrick-el1-abi",
  "carrick-fatal",

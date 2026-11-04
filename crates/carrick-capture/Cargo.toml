@@ -1,0 +1,23 @@
+[package]
+name = "carrick-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Root front for reviewed bpftrace capture scripts on dispatch agent clones (#1621)."
+
+# std only, on purpose: agent templates compile src/lib.rs and src/main.rs
+# with the pinned rustc alone and install the result as the one root-run
+# capture command. Never add a dependency here; tests may use dev-dependencies.
+[lib]
+name = "carrick_capture"
+path = "src/lib.rs"
+
+[[bin]]
+name = "carrick-capture"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

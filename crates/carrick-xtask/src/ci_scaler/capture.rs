@@ -1,26 +1,25 @@
 //! Scoped capture privilege on agent clones (#1621; owner decision on #231,
-//! 2026-11-04). The dispatch worker gets passwordless sudo for exactly
-//! `bpftrace`, `dmesg` and `journalctl -k`, so a capture round can attribute
-//! SIGKILLs and OOM kills, and nothing else: no shell and no general root.
+//! 2026-11-04, narrowed by the carrick-87 review). The dispatch worker gets
+//! passwordless sudo for exactly three commands and nothing else:
 //!
-//! Raw `/usr/bin/bpftrace` as root IS general root: `-o FILE` and
-//! `--emit-elf`/`--emit-llvm` write any file (a sudoers drop-in, say),
-//! `-c CMD` runs a command, and `--unsafe` enables `system()`. Sudoers can
-//! only match whole argument strings, so the rule names [`FRONT_PATH`]
-//! instead: a root-owned copy of carrick-xtask that, under that name, only
-//! parses an allowlist of argument shapes and then runs `/usr/bin/bpftrace`
-//! with a cleared environment and sudo's own `sudo_noexec.so` preloaded, so
-//! neither bpftrace nor a child can exec. `dmesg` and `journalctl -k` take
-//! sudo's `NOEXEC` tag and exact arguments.
+//! - `/usr/local/sbin/carrick-capture <name> [--seconds N]`, which runs one
+//!   of the reviewed bpftrace scripts in the `carrick-capture` crate. There
+//!   is no free-form program: root bpftrace with `-e PROG` can read any
+//!   process's memory and files, including the loop and runner tokens and
+//!   `redaction-secrets.json`, which would erase the loop/worker uid
+//!   separation in `docs/ci/dispatch-worker.md`;
+//! - `dmesg` with no arguments and `journalctl -k`, both under sudo's
+//!   `NOEXEC` (read-only kernel log; no pager or helper can exec).
 //!
-//! [`verify_policy`] (root, through the guest agent) and [`verify`] (the
-//! worker account, `ci-scaler verify-capture`) are the template
-//! qualification checks; the builder runs the second while provisioning too.
+//! Nothing here runs as root on a clone. This module holds the drop-in text
+//! the template builder installs, the root-side checks qualification runs
+//! through the guest agent ([`verify_policy`], [`verify_root_refusals`]) and
+//! the worker-side check ([`verify`], `ci-scaler verify-capture`), which the
+//! builder also runs while provisioning.
 
 use super::{ScalerError, live};
-use std::ffi::OsString;
+use carrick_capture::{FRONT_PATH, REFUSAL, REFUSED_INSTALL, REFUSED_SHAPE, SCRIPT_DIR, SCRIPTS};
 use std::io::{BufRead, BufReader, Read};
-use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
@@ -28,131 +27,36 @@ use std::time::{Duration, Instant};
 
 /// The drop-in the builder writes; qualification compares its bytes.
 pub(crate) const SUDOERS_PATH: &str = "/etc/sudoers.d/carrick-dispatch-capture";
-/// The bpftrace argument front, first on the worker's sudo `secure_path`, so
-/// `sudo bpftrace ...` resolves here and raw `/usr/bin/bpftrace` matches no
-/// rule.
-pub(crate) const FRONT_PATH: &str = "/usr/local/sbin/bpftrace";
-/// The installed xtask the front must be a byte copy of. A copy, not a link:
-/// sudo matches a command by basename and inode, so a hard link would let a
-/// user's symlink named `bpftrace` run the general xtask CLI as root.
-const XTASK_PATH: &str = "/usr/local/bin/carrick-xtask";
-const BPFTRACE: &str = "/usr/bin/bpftrace";
-/// Sudo's `NOEXEC` mechanism: its constructor installs a seccomp filter that
-/// fails `execve`/`execveat` with `EACCES` for the process and its children.
-const NOEXEC_PRELOAD: &str = "/usr/libexec/sudo/sudo_noexec.so";
-/// The front's refusal marker; qualification requires it on refused shapes,
-/// proving sudo admitted the front and the front refused.
-const FRONT_REFUSAL: &str = "bpftrace front: refused";
-const FRONT_USAGE: &str = "allowed: bpftrace [-q] [-f text|json] [-B none|line|full] -e PROGRAM | bpftrace -l PATTERN | bpftrace --version";
+/// The reviewed script the live witness runs.
+const WITNESS_SCRIPT: &str = "signal-kill-sender";
+/// The retired design's front (a root copy of xtask named `bpftrace`); a
+/// template must not carry it.
+const RETIRED_FRONT: &str = "/usr/local/sbin/bpftrace";
 
 /// Exactly three commands, full paths, no shell, no wildcards. Tags carry
-/// forward in a sudoers command list: all three are `NOPASSWD`, and `dmesg`
-/// and `journalctl` are also `NOEXEC` (the front applies the same preload to
-/// bpftrace itself, which it must exec once). `""` admits bare `dmesg` only.
+/// forward in a sudoers command list: all three are `NOPASSWD`; `dmesg` and
+/// `journalctl` are also `NOEXEC`. `carrick-capture` cannot be, since it
+/// execs `timeout` and bpftrace; it takes only a script name and a length.
+/// `""` admits bare `dmesg` only. The worker's `secure_path` puts
+/// `/usr/local/sbin` first so `sudo carrick-capture ...` resolves there.
 pub(crate) const SUDOERS: &str = r#"# Scoped capture privilege for dispatch workers (#1621). Written by
 # scripts/ci/build-template-debian.sh from `carrick-xtask ci-scaler
 # capture-sudoers`; template qualification compares these bytes. Exactly
-# three commands with full paths, no shell and no wildcards. The bpftrace
-# path is the carrick-xtask argument front for /usr/bin/bpftrace.
+# three commands with full paths, no shell and no wildcards.
+# carrick-capture runs reviewed bpftrace scripts by name only.
 Defaults:carrick-dispatch-agent secure_path="/usr/local/sbin:/usr/sbin:/usr/bin"
-carrick-dispatch-agent ALL = (root) NOPASSWD: /usr/local/sbin/bpftrace, NOEXEC: /usr/bin/dmesg "", /usr/bin/journalctl -k
+carrick-dispatch-agent ALL = (root) NOPASSWD: /usr/local/sbin/carrick-capture, NOEXEC: /usr/bin/dmesg "", /usr/bin/journalctl -k
 "#;
 
-/// Map the caller's bpftrace arguments to the canonical argv the front runs,
-/// or the reason they fall outside the allowlist. Every option is its own
-/// argument (no clusters, no `--opt=value`), option values come from fixed
-/// sets, and nothing the caller passes can be read by bpftrace as an option.
-fn front_argv(args: &[OsString]) -> Result<Vec<OsString>, String> {
-    match args {
-        [only] if only == "--version" || only == "-V" => return Ok(vec!["--version".into()]),
-        [list, pattern] if list == "-l" => {
-            if pattern.is_empty() || pattern.as_bytes().starts_with(b"-") {
-                return Err("-l needs a probe pattern that does not start with '-'".into());
-            }
-            return Ok(vec!["-l".into(), pattern.clone()]);
-        }
-        _ => {}
-    }
-    let pick = |value: Option<&OsString>, option: &str, allowed: &[&'static str]| {
-        value
-            .and_then(|value| allowed.iter().find(|name| value == **name).copied())
-            .ok_or_else(|| format!("{option} takes one of {}", allowed.join(", ")))
-    };
-    let (mut quiet, mut format, mut buffering, mut program) = (false, None, None, None);
-    let mut rest = args.iter();
-    while let Some(arg) = rest.next() {
-        match arg.as_bytes() {
-            b"-q" if !quiet => quiet = true,
-            b"-f" if format.is_none() => format = Some(pick(rest.next(), "-f", &["text", "json"])?),
-            b"-B" if buffering.is_none() => {
-                buffering = Some(pick(rest.next(), "-B", &["none", "line", "full"])?);
-            }
-            b"-e" if program.is_none() => {
-                let text = rest
-                    .next()
-                    .filter(|text| !text.is_empty() && !text.as_bytes().starts_with(b"-"));
-                program = Some(text.ok_or("-e needs a program that does not start with '-'")?);
-            }
-            b"-q" | b"-f" | b"-B" | b"-e" => {
-                return Err(format!("{} given twice", arg.to_string_lossy()));
-            }
-            _ => {
-                return Err(format!(
-                    "{:?} is outside the capture allowlist (no output files, -c, -p, --unsafe, includes or program files)",
-                    arg.to_string_lossy()
-                ));
-            }
-        }
-    }
-    let program = program.ok_or("a capture needs -e PROGRAM")?;
-    let mut argv: Vec<OsString> = Vec::new();
-    if quiet {
-        argv.push("-q".into());
-    }
-    for (option, value) in [("-f", format), ("-B", buffering)] {
-        if let Some(value) = value {
-            argv.extend([option.into(), value.into()]);
-        }
-    }
-    argv.extend(["-e".into(), program.clone()]);
-    Ok(argv)
-}
-
-/// The exec the front performs: real bpftrace, the canonical argv, a cleared
-/// environment holding only a fixed `PATH` and the noexec preload.
-fn front_command(argv: &[OsString]) -> Command {
-    let mut command = Command::new(BPFTRACE);
-    command
-        .args(argv)
-        .env_clear()
-        .env("PATH", "/usr/sbin:/usr/bin")
-        .env("LD_PRELOAD", NOEXEC_PRELOAD);
-    command
-}
-
-/// `main` runs this, and never the general CLI, whenever the executable or
-/// argv\[0\] is named `bpftrace`. Returns the exit code when it cannot exec.
-pub fn bpftrace_front(args: &[OsString]) -> i32 {
-    use std::os::unix::process::CommandExt;
-    let argv = match front_argv(args) {
-        Ok(argv) => argv,
-        Err(reason) => {
-            eprintln!("{FRONT_REFUSAL}: {reason}\n{FRONT_USAGE}");
-            return 2;
-        }
-    };
-    if !Path::new(NOEXEC_PRELOAD).is_file() {
-        eprintln!("{FRONT_REFUSAL}: {NOEXEC_PRELOAD} is missing, so bpftrace could exec");
-        return 2;
-    }
-    let error = front_command(&argv).exec();
-    eprintln!("bpftrace front: cannot run {BPFTRACE}: {error}");
-    127
+fn script_path(name: &str) -> String {
+    format!("{SCRIPT_DIR}/{name}.bt")
 }
 
 /// Root, through the guest agent: the whole sudoers policy and the drop-in
-/// pass `visudo -c`, the drop-in holds exactly [`SUDOERS`], and the front is
-/// a root-owned byte copy of the installed xtask.
+/// pass `visudo -c`, the drop-in holds exactly [`SUDOERS`], the front and
+/// the script directory are root-owned and root-writable only, the
+/// directory holds exactly the allowlisted scripts with their reviewed
+/// bytes, bpftrace is installed and the retired front is gone.
 pub(super) fn verify_policy(
     mut run: impl FnMut(&[&str]) -> Result<live::GuestOutput, ScalerError>,
 ) -> Result<(), ScalerError> {
@@ -173,53 +77,206 @@ pub(super) fn verify_policy(
             "capture sudoers drop-in differs from ci-scaler capture-sudoers",
         ));
     }
-    let modes = passes(&[
+    let scripts: Vec<String> = SCRIPTS
+        .iter()
+        .map(|script| script_path(script.name))
+        .collect();
+    let mut stat = vec![
         "/usr/bin/stat",
         "-c",
         "%a %U %G %F",
         SUDOERS_PATH,
         FRONT_PATH,
+        SCRIPT_DIR,
+    ];
+    stat.extend(scripts.iter().map(String::as_str));
+    let mut modes = String::from(
+        "440 root root regular file\n755 root root regular file\n755 root root directory\n",
+    );
+    modes.extend(scripts.iter().map(|_| "644 root root regular file\n"));
+    if passes(&stat)?.as_deref() != Some(modes.as_str()) {
+        return Err(ScalerError::Guard(
+            "capture drop-in, front or scripts have the wrong owner, mode or type",
+        ));
+    }
+    let listed = passes(&[
+        "/usr/bin/find",
+        SCRIPT_DIR,
+        "-mindepth",
+        "1",
+        "-printf",
+        "%f\n",
     ])?;
-    if modes.as_deref() != Some("440 root root regular file\n755 root root regular file\n") {
+    let mut found: Vec<&str> = listed.as_deref().unwrap_or_default().lines().collect();
+    found.sort_unstable();
+    let mut allowed: Vec<String> = SCRIPTS
+        .iter()
+        .map(|script| format!("{}.bt", script.name))
+        .collect();
+    allowed.sort_unstable();
+    if listed.is_none() || found != allowed {
         return Err(ScalerError::Guard(
-            "capture drop-in or bpftrace front has the wrong owner, mode or type",
+            "capture script directory differs from the carrick-capture allowlist",
         ));
     }
-    if passes(&["/usr/bin/cmp", "-s", FRONT_PATH, XTASK_PATH])?.is_none() {
+    for (script, path) in SCRIPTS.iter().zip(&scripts) {
+        if passes(&["/bin/cat", path])?.as_deref() != Some(script.source) {
+            return Err(ScalerError::Guard(
+                "an installed capture script differs from its reviewed source",
+            ));
+        }
+    }
+    if passes(&["/usr/bin/test", "!", "-e", RETIRED_FRONT])?.is_none() {
         return Err(ScalerError::Guard(
-            "bpftrace front is not a copy of the installed carrick-xtask",
+            "the retired bpftrace front is still installed",
         ));
     }
-    if passes(&[BPFTRACE, "--version"])?.is_none() {
+    if passes(&[carrick_capture::BPFTRACE, "--version"])?.is_none() {
         return Err(ScalerError::Guard("bpftrace is not installed"));
     }
     Ok(())
 }
 
-/// Commands sudo itself must refuse: no shell or general command, the raw
-/// bpftrace binary, and the log commands with any other arguments.
-const SUDO_REFUSED: [&[&str]; 6] = [
+const WORKER_SUDO: [&str; 7] = [
+    "/usr/sbin/runuser",
+    "-u",
+    "carrick-dispatch-agent",
+    "--",
+    "/usr/bin/sudo",
+    "-n",
+    "carrick-capture",
+];
+
+/// Root, through the guest agent, on the disposable qualification clone
+/// only: the front refuses a root-owned script outside its allowlist (even
+/// one with reviewed content) and an allowlisted script that was made
+/// writable, given away or edited. Each tamper is undone before the next;
+/// the restored bytes are checked here, and the worker's live capture in
+/// [`verify`], run afterwards, exercises the restored script.
+pub(super) fn verify_root_refusals(
+    mut run: impl FnMut(&[&str]) -> Result<live::GuestOutput, ScalerError>,
+) -> Result<(), ScalerError> {
+    fn root(
+        run: &mut impl FnMut(&[&str]) -> Result<live::GuestOutput, ScalerError>,
+        args: &[&str],
+    ) -> Result<(), ScalerError> {
+        if run(args)?.exit != live::GuestExit(0) {
+            return Err(ScalerError::External(
+                "capture root refusal test setup failed",
+            ));
+        }
+        Ok(())
+    }
+    let reviewed = script_path(WITNESS_SCRIPT);
+    let outside = format!("{SCRIPT_DIR}/outside.bt");
+    let (reviewed, outside) = (reviewed.as_str(), outside.as_str());
+    let backup = "/run/carrick-capture-qualification.bt";
+    // (tamper as root, script the worker names, the front's exit, undo)
+    let cases: [(&[&str], &str, i32, &[&str]); 4] = [
+        (
+            &[
+                "/usr/bin/install",
+                "-m",
+                "644",
+                "-o",
+                "root",
+                "-g",
+                "root",
+                reviewed,
+                outside,
+            ],
+            "outside",
+            REFUSED_SHAPE,
+            &["/bin/rm", "-f", outside],
+        ),
+        (
+            &["/bin/chmod", "664", reviewed],
+            WITNESS_SCRIPT,
+            REFUSED_INSTALL,
+            &["/bin/chmod", "644", reviewed],
+        ),
+        (
+            &["/bin/chown", "carrick-dispatch-agent", reviewed],
+            WITNESS_SCRIPT,
+            REFUSED_INSTALL,
+            &["/bin/chown", "root", reviewed],
+        ),
+        (
+            &["/usr/bin/truncate", "-s", "-1", reviewed],
+            WITNESS_SCRIPT,
+            REFUSED_INSTALL,
+            &["/bin/cp", "-p", backup, reviewed],
+        ),
+    ];
+    root(&mut run, &["/bin/cp", "-p", reviewed, backup])?;
+    for (tamper, name, expected, undo) in cases {
+        root(&mut run, tamper)?;
+        let mut worker = WORKER_SUDO.to_vec();
+        worker.extend([name, "--seconds", "1"]);
+        let exit = run(&worker)?.exit;
+        root(&mut run, undo)?;
+        if exit != live::GuestExit(expected) {
+            return Err(ScalerError::Guard(
+                "carrick-capture ran a script outside its allowlist or a tampered script",
+            ));
+        }
+    }
+    root(&mut run, &["/bin/rm", "-f", backup])?;
+    let restored = run(&["/bin/cat", reviewed])?;
+    let source = SCRIPTS
+        .iter()
+        .find(|script| script.name == WITNESS_SCRIPT)
+        .map(|script| script.source);
+    if restored.exit != live::GuestExit(0) || Some(restored.stdout.as_str()) != source {
+        return Err(ScalerError::Guard(
+            "the tampered capture script was not restored",
+        ));
+    }
+    Ok(())
+}
+
+/// Commands sudo itself must refuse: no shell or general command, raw
+/// bpftrace by any path, and the log commands with any other arguments.
+const SUDO_REFUSED: [&[&str]; 8] = [
     &["true"],
     &["bash"],
     &["/usr/bin/bpftrace", "-e", "BEGIN { exit(); }"],
+    &["bpftrace", "-e", "BEGIN { exit(); }"],
+    &[
+        "/usr/bin/timeout",
+        "5",
+        "/usr/bin/bpftrace",
+        "-e",
+        "BEGIN { exit(); }",
+    ],
     &["dmesg", "-C"],
     &["journalctl"],
     &["journalctl", "-k", "-f"],
 ];
-/// Shapes sudo admits to the front and the front must refuse. `{out}` is a
-/// fresh path in a worker-owned directory that must still be absent after.
-const FRONT_REFUSED: [&[&str]; 5] = [
-    &["bpftrace", "-o", "{out}", "-e", "BEGIN { exit(); }"],
-    &["bpftrace", "-e", "BEGIN { exit(); }", "--emit-elf", "{out}"],
+/// Shapes sudo admits to the front and the front must refuse before running
+/// anything. `{out}` is a fresh path in a worker-owned directory that must
+/// still be absent afterwards; `{script}` is a worker-written program file
+/// that would read `/etc/shadow`.
+const FRONT_REFUSED: [&[&str]; 12] = [
+    &["carrick-capture"],
     &[
-        "bpftrace",
-        "--unsafe",
+        "carrick-capture",
         "-e",
-        "BEGIN { system(\"id\"); exit(); }",
+        "BEGIN { printf(\"%s\", cat(\"/etc/shadow\")); exit(); }",
     ],
-    &["bpftrace", "-c", "/bin/sh", "-e", "BEGIN { exit(); }"],
-    &["bpftrace", "/etc/shadow"],
+    &["carrick-capture", "{script}"],
+    &["carrick-capture", "-f", "{script}"],
+    &["carrick-capture", WITNESS_SCRIPT, "{script}"],
+    &["carrick-capture", WITNESS_SCRIPT, "-o", "{out}"],
+    &["carrick-capture", WITNESS_SCRIPT, "--unsafe"],
+    &["carrick-capture", WITNESS_SCRIPT, "--seconds", "0"],
+    &["carrick-capture", WITNESS_SCRIPT, "--seconds", "3601"],
+    &["carrick-capture", WITNESS_SCRIPT, "--seconds=5"],
+    &["carrick-capture", "outside"],
+    &["carrick-capture", "../../../tmp/x"],
 ];
+const WORKER_SCRIPT: &str =
+    "BEGIN { printf(\"%s\", cat(\"/etc/shadow\")); exit(); }\ninterval:s:1 { exit(); }\n";
 
 /// `ci-scaler verify-capture`, as `carrick-dispatch-agent`.
 pub(super) fn verify() -> Result<(), ScalerError> {
@@ -264,27 +321,39 @@ fn verify_with(sudo: &Path, mounts: &Path) -> Result<(), ScalerError> {
     }
     let dir = tempfile::tempdir()?;
     let out = dir.path().join("written-as-root");
-    let out = out
-        .to_str()
-        .ok_or(ScalerError::Guard("invalid capture probe path"))?;
+    let script = dir.path().join("worker.bt");
+    std::fs::write(&script, WORKER_SCRIPT)?;
+    let (out, script) = match (out.to_str(), script.to_str()) {
+        (Some(out), Some(script)) => (out, script),
+        _ => return Err(ScalerError::Guard("invalid capture probe path")),
+    };
     for shape in FRONT_REFUSED {
-        let args: Vec<&str> = shape
-            .iter()
-            .map(|arg| if *arg == "{out}" { out } else { arg })
-            .collect();
+        let args = substitute(shape, out, script);
         let output = sudo_probe(sudo, &args, 10)?;
-        if output.status.success()
-            || !String::from_utf8_lossy(&output.stderr).contains(FRONT_REFUSAL)
+        if output.status.code() != Some(REFUSED_SHAPE)
+            || !String::from_utf8_lossy(&output.stderr).starts_with(REFUSAL)
+            || !output.stdout.is_empty()
             || Path::new(out).exists()
         {
             report(&format!("sudo -n {}", args.join(" ")), &output);
             return Err(ScalerError::Guard(
-                "bpftrace front admitted a refused shape",
+                "carrick-capture admitted a shape outside its allowlist",
             ));
         }
     }
-    println!("capture privilege: bpftrace, dmesg and journalctl -k only");
+    println!("capture privilege: carrick-capture scripts, dmesg and journalctl -k only");
     Ok(())
+}
+
+fn substitute<'a>(shape: &[&'a str], out: &'a str, script: &'a str) -> Vec<&'a str> {
+    shape
+        .iter()
+        .map(|arg| match *arg {
+            "{out}" => out,
+            "{script}" => script,
+            other => other,
+        })
+        .collect()
 }
 
 /// One bounded non-interactive sudo call. coreutils `timeout` may signal
@@ -309,9 +378,15 @@ fn report(label: &str, output: &Output) {
     );
 }
 
-/// The owner's acceptance shape, made deterministic: trace SIGKILL generation
-/// for one victim, kill it once bpftrace reports its probes attached (`BEGIN`
-/// fires after attachment), and require the matching event.
+/// The capture length of the live witness. The script exits on its own
+/// after this many interval ticks, well inside both deadlines below.
+const WITNESS_SECONDS: &str = "10";
+
+/// The owner's acceptance shape through the reviewed script: start
+/// `sudo carrick-capture signal-kill-sender`, kill one victim once the
+/// script reports ready, and require the line naming this process as the
+/// sender and the victim as the target. Then require the script's own
+/// interval exit (status 0), not the front's hard deadline.
 fn trace_sigkill(sudo: &Path) -> Result<(), ScalerError> {
     let mut victim = Command::new("/usr/bin/sleep")
         .arg("60")
@@ -331,13 +406,16 @@ fn trace_victim(
     pid: u32,
     kill: impl FnOnce() -> std::io::Result<()>,
 ) -> Result<(), ScalerError> {
-    let program = format!(
-        "BEGIN {{ printf(\"ready\\n\"); }} tracepoint:signal:signal_generate /args->sig == 9 && args->pid == {pid}/ {{ printf(\"sigkill %d\\n\", args->pid); exit(); }} interval:s:20 {{ exit(); }}"
-    );
     let mut child = Command::new("/usr/bin/timeout")
-        .args(["-k", "2", "30"])
+        .args(["-k", "2", "60"])
         .arg(sudo)
-        .args(["-n", "bpftrace", "-B", "line", "-q", "-e", &program])
+        .args([
+            "-n",
+            "carrick-capture",
+            WITNESS_SCRIPT,
+            "--seconds",
+            WITNESS_SECONDS,
+        ])
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -358,23 +436,33 @@ fn trace_victim(
         let _ = stderr.take(16 * 1024).read_to_end(&mut bytes);
         bytes
     });
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let traced = expect_line(&lines, deadline, "ready")
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let me = std::process::id();
+    let sender = format!("sender_pid={me} ");
+    let target = format!(" target_pid={pid} ");
+    let traced = expect_line(&lines, deadline, |line| line.starts_with("capture ready: "))
         .and_then(|()| Ok(kill()?))
-        .and_then(|()| expect_line(&lines, deadline, &format!("sigkill {pid}")));
-    // Bounded by `timeout` and by the program's own interval exit.
+        .and_then(|()| {
+            expect_line(&lines, deadline, |line| {
+                line.contains("sigkill ") && line.contains(&sender) && line.contains(&target)
+            })
+        });
+    // Bounded by the script's interval exit, the front's hard deadline and
+    // the outer `timeout`.
     let status = child.wait()?;
     let _ = reader.join();
     let errors = errors.join().unwrap_or_default();
     if traced.is_err() || !status.success() {
         eprintln!(
-            "sudo -n bpftrace: {status}; stderr: {}",
+            "sudo -n carrick-capture {WITNESS_SCRIPT}: {status}; stderr: {}",
             String::from_utf8_lossy(&errors)
         );
     }
     traced?;
     if !status.success() {
-        return Err(ScalerError::Guard("sudo -n bpftrace capture failed"));
+        return Err(ScalerError::Guard(
+            "carrick-capture did not end on the script's own interval exit",
+        ));
     }
     Ok(())
 }
@@ -382,16 +470,16 @@ fn trace_victim(
 fn expect_line(
     lines: &mpsc::Receiver<std::io::Result<String>>,
     deadline: Instant,
-    want: &str,
+    want: impl Fn(&str) -> bool,
 ) -> Result<(), ScalerError> {
     loop {
         match lines.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(Ok(line)) if line == want => return Ok(()),
+            Ok(Ok(line)) if want(&line) => return Ok(()),
             Ok(Ok(_)) => {}
             Ok(Err(error)) => return Err(error.into()),
             Err(_) => {
                 return Err(ScalerError::Guard(
-                    "sudo -n bpftrace did not report the traced SIGKILL",
+                    "carrick-capture did not report the traced SIGKILL",
                 ));
             }
         }
@@ -402,107 +490,65 @@ fn expect_line(
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
     use super::*;
-
-    fn os(args: &[&str]) -> Vec<OsString> {
-        args.iter().map(OsString::from).collect()
-    }
+    use std::ffi::OsString;
 
     #[test]
-    fn front_admits_the_capture_shapes_in_canonical_form() {
-        let acceptance =
-            "tracepoint:signal:signal_generate /args->sig == 9/ { printf(\"%d\\n\", args->pid); }";
-        for (given, canonical) in [
-            (vec!["-e", acceptance], vec!["-e", acceptance]),
-            (
-                vec!["-e", acceptance, "-B", "line", "-q", "-f", "json"],
-                vec!["-q", "-f", "json", "-B", "line", "-e", acceptance],
-            ),
-            (
-                vec!["-l", "tracepoint:signal:*"],
-                vec!["-l", "tracepoint:signal:*"],
-            ),
-            (vec!["-V"], vec!["--version"]),
-            (vec!["--version"], vec!["--version"]),
-        ] {
-            assert_eq!(front_argv(&os(&given)), Ok(os(&canonical)), "{given:?}");
-        }
-    }
-
-    #[test]
-    fn front_refuses_writes_exec_unsafe_and_unknown_shapes() {
-        let program = "BEGIN { exit(); }";
-        for given in [
-            vec![],
-            vec!["-o", "/etc/sudoers.d/x", "-e", program],
-            vec!["-e", program, "-o", "/etc/sudoers.d/x"],
-            vec!["-e", program, "-o/etc/sudoers.d/x"],
-            vec!["-e", program, "--output", "/tmp/x"],
-            vec!["-e", program, "--emit-elf", "/tmp/x"],
-            vec!["-e", program, "--emit-llvm", "/tmp/x"],
-            vec!["-e", program, "--aot", "/tmp/x"],
-            vec!["-c", "/bin/sh", "-e", program],
-            vec!["-p", "1", "-e", program],
-            vec!["--unsafe", "-e", program],
-            vec!["-I", "/root", "-e", program],
-            vec!["--include", "/etc/shadow", "-e", program],
-            vec!["/etc/shadow"],
-            vec!["-e", program, "/tmp/positional"],
-            vec!["-e", program, "-e", program],
-            vec!["-e"],
-            vec!["-e", ""],
-            vec!["-e", "-o/etc/sudoers.d/x"],
-            vec!["-qe", program],
-            vec!["--format=json", "-e", program],
-            vec!["-f", "xml", "-e", program],
-            vec!["-f"],
-            vec!["-B", "bogus", "-e", program],
-            vec!["-q", "-q", "-e", program],
-            vec!["-d", "all", "-e", program],
-            vec!["-v", "-e", program],
-            vec!["-k", "-e", program],
-            vec!["--", "-e", program],
-            vec!["-l", "-o/tmp/x"],
-            vec!["-l", ""],
-            vec!["-l", "tracepoint:*", "-e", program],
-            vec!["--version", "-e", program],
-        ] {
-            assert!(front_argv(&os(&given)).is_err(), "front admitted {given:?}");
-        }
-        // Qualification's front probes are exactly shapes the parser refuses.
+    fn qualification_front_probes_are_shapes_carrick_capture_refuses() {
         for shape in FRONT_REFUSED {
-            let args: Vec<OsString> = shape[1..]
-                .iter()
-                .map(|arg| arg.replace("{out}", "/tmp/x").into())
+            let args: Vec<OsString> = substitute(&shape[1..], "/tmp/out", "/tmp/worker.bt")
+                .into_iter()
+                .map(OsString::from)
                 .collect();
-            assert!(front_argv(&args).is_err(), "{shape:?}");
+            assert!(carrick_capture::parse(&args).is_err(), "{shape:?}");
         }
+        // The live witness's own shape is admitted, and its script exists.
+        let witness: Vec<OsString> = [WITNESS_SCRIPT, "--seconds", WITNESS_SECONDS]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        assert!(carrick_capture::parse(&witness).is_ok());
+        // The root refusal test plants `outside`, which must stay unlisted.
+        assert!(SCRIPTS.iter().all(|script| script.name != "outside"));
     }
 
     #[test]
-    fn front_runs_real_bpftrace_with_noexec_and_a_fixed_environment() {
-        let command = front_command(&os(&["-e", "BEGIN { exit(); }"]));
-        assert_eq!(command.get_program(), BPFTRACE);
+    fn agent_template_builds_the_capture_front_from_reviewed_source() {
+        let builder = include_str!("../../../../scripts/ci/build-template-debian.sh");
+        let workspace = include_str!("../../../../Cargo.toml");
+        // Only the std-only crate's source and scripts are staged and built,
+        // with the workspace edition and the pinned toolchain's rustc.
+        assert!(builder.contains(
+            "cp -R \"$inputs/crates/carrick-capture/src\" \"$inputs/crates/carrick-capture/scripts\" seed/capture/"
+        ));
+        let edition = workspace
+            .lines()
+            .find_map(|line| line.strip_prefix("edition = "))
+            .expect("workspace edition")
+            .trim_matches('"');
         assert_eq!(
-            command.get_args().collect::<Vec<_>>(),
-            ["-e", "BEGIN { exit(); }"]
-        );
-        let mut envs: Vec<(OsString, Option<OsString>)> = command
-            .get_envs()
-            .map(|(name, value)| (name.to_owned(), value.map(ToOwned::to_owned)))
-            .collect();
-        envs.sort();
-        assert_eq!(
-            envs,
-            [
-                ("LD_PRELOAD".into(), Some(NOEXEC_PRELOAD.into())),
-                ("PATH".into(), Some("/usr/sbin:/usr/bin".into())),
-            ]
-        );
-        // A refused shape never reaches exec.
-        assert_eq!(
-            bpftrace_front(&os(&["-o", "/tmp/x", "-e", "BEGIN { exit(); }"])),
+            builder
+                .matches(&format!("\"$rustc\" --edition {edition} "))
+                .count(),
             2
         );
+        assert!(builder.contains(
+            "rustc=$RUSTUP_HOME/toolchains/${channel}-x86_64-unknown-linux-gnu/bin/rustc"
+        ));
+        // Installed where the front and the sudoers rule expect it.
+        assert!(builder.contains(&format!(
+            "install -m 755 -o root -g root \"$capture_build/carrick-capture\" {FRONT_PATH}\n"
+        )));
+        assert!(builder.contains(&format!("install -d -m 755 -o root -g root {SCRIPT_DIR}\n")));
+        assert!(builder.contains(&format!(
+            "install -m 644 -o root -g root capture/scripts/*.bt {SCRIPT_DIR}/\n"
+        )));
+        assert!(
+            builder.contains(
+                "ci-scaler capture-sudoers > /etc/sudoers.d/carrick-dispatch-capture.new"
+            )
+        );
+        // The retired xtask front is gone.
+        assert!(!builder.contains(RETIRED_FRONT));
     }
 
     fn visudo(text: &str) -> bool {
@@ -545,6 +591,7 @@ mod tests {
                 "/usr/bin/journalctl -k"
             ]
         );
+        assert!(!SUDOERS.contains("bpftrace,") && !SUDOERS.contains("/usr/bin/bpftrace"));
         assert_eq!(
             SUDOERS
                 .lines()
@@ -561,38 +608,169 @@ mod tests {
         }
     }
 
-    #[test]
-    fn policy_check_refuses_a_malformed_or_edited_drop_in() {
-        let check = |visudo_drop_in: i32, installed: &str, modes: &str, cmp: i32| {
+    /// A clone's root view for [`verify_policy`]; each field is one way an
+    /// install can be wrong.
+    struct Clone {
+        visudo_drop_in: i32,
+        installed: String,
+        modes: String,
+        listing: String,
+        script: String,
+        retired_front: bool,
+    }
+
+    impl Clone {
+        fn good() -> Self {
+            Self {
+                visudo_drop_in: 0,
+                installed: SUDOERS.to_owned(),
+                modes: "440 root root regular file\n755 root root regular file\n755 root root directory\n644 root root regular file\n".to_owned(),
+                listing: "signal-kill-sender.bt\n".to_owned(),
+                script: SCRIPTS[0].source.to_owned(),
+                retired_front: false,
+            }
+        }
+
+        fn check(&self) -> Result<(), ScalerError> {
             verify_policy(|args| {
                 Ok(match args {
                     ["/usr/sbin/visudo", "-c", "-q"] => guest_output(0, ""),
                     ["/usr/sbin/visudo", .., path] if *path == SUDOERS_PATH => {
-                        guest_output(visudo_drop_in, "")
+                        guest_output(self.visudo_drop_in, "")
                     }
-                    ["/bin/cat", _] => guest_output(0, installed),
-                    ["/usr/bin/stat", ..] => guest_output(0, modes),
-                    ["/usr/bin/cmp", ..] => guest_output(cmp, ""),
-                    [BPFTRACE, "--version"] => guest_output(0, "bpftrace v0.23.2\n"),
+                    ["/bin/cat", path] if *path == SUDOERS_PATH => guest_output(0, &self.installed),
+                    ["/bin/cat", _] => guest_output(0, &self.script),
+                    ["/usr/bin/stat", ..] => guest_output(0, &self.modes),
+                    ["/usr/bin/find", ..] => guest_output(0, &self.listing),
+                    ["/usr/bin/test", "!", "-e", RETIRED_FRONT] => {
+                        guest_output(i32::from(self.retired_front), "")
+                    }
+                    ["/usr/bin/bpftrace", "--version"] => guest_output(0, "bpftrace v0.23.2\n"),
                     other => panic!("unexpected guest command {other:?}"),
                 })
             })
+        }
+    }
+
+    #[test]
+    fn policy_check_refuses_a_wrong_drop_in_front_or_script_directory() {
+        Clone::good().check().expect("intended install");
+        let wrong = [
+            Clone {
+                visudo_drop_in: 1,
+                ..Clone::good()
+            },
+            Clone {
+                installed: SUDOERS.replace("/usr/bin/journalctl -k", "ALL"),
+                ..Clone::good()
+            },
+            Clone {
+                modes: Clone::good().modes.replacen(
+                    "755 root root regular",
+                    "775 root root regular",
+                    1,
+                ),
+                ..Clone::good()
+            },
+            Clone {
+                modes: Clone::good()
+                    .modes
+                    .replace("755 root root directory", "777 root root directory"),
+                ..Clone::good()
+            },
+            Clone {
+                modes: Clone::good()
+                    .modes
+                    .replace("644 root root", "664 root root"),
+                ..Clone::good()
+            },
+            Clone {
+                listing: "signal-kill-sender.bt\nextra.bt\n".to_owned(),
+                ..Clone::good()
+            },
+            Clone {
+                listing: String::new(),
+                ..Clone::good()
+            },
+            Clone {
+                script: SCRIPTS[0].source.replace("== 9", "!= 0"),
+                ..Clone::good()
+            },
+            Clone {
+                retired_front: true,
+                ..Clone::good()
+            },
+        ];
+        for (index, clone) in wrong.iter().enumerate() {
+            assert!(clone.check().is_err(), "wrong install {index} passed");
+        }
+    }
+
+    /// A fake clone for [`verify_root_refusals`]: `front` decides the exit
+    /// status of each worker run from the script name and the tamper state.
+    fn root_refusals(front: impl Fn(&str, bool) -> i32) -> (Result<(), ScalerError>, Vec<String>) {
+        let mut log = Vec::new();
+        let mut tampered = false;
+        let result = verify_root_refusals(|args| {
+            log.push(args.join(" "));
+            Ok(match args {
+                ["/bin/chmod", "664", _]
+                | ["/bin/chown", "carrick-dispatch-agent", _]
+                | ["/usr/bin/truncate", ..] => {
+                    tampered = true;
+                    guest_output(0, "")
+                }
+                ["/bin/chmod", "644", _] | ["/bin/chown", "root", _] => {
+                    tampered = false;
+                    guest_output(0, "")
+                }
+                ["/bin/cp", "-p", from, _] if from.starts_with("/run/") => {
+                    tampered = false;
+                    guest_output(0, "")
+                }
+                ["/usr/bin/install", ..] | ["/bin/cp", ..] | ["/bin/rm", ..] => guest_output(0, ""),
+                ["/bin/cat", _] => guest_output(0, if tampered { "" } else { SCRIPTS[0].source }),
+                ["/usr/sbin/runuser", .., name, "--seconds", "1"] => {
+                    guest_output(front(name, tampered), "")
+                }
+                other => panic!("unexpected guest command {other:?}"),
+            })
+        });
+        (result, log)
+    }
+
+    #[test]
+    fn root_refusal_test_passes_the_real_front_and_fails_a_permissive_one() {
+        // The real front: unknown names are shape refusals; tampered
+        // allowlisted scripts are install refusals.
+        let real = |name: &str, tampered: bool| match (name, tampered) {
+            ("outside", _) => REFUSED_SHAPE,
+            (_, true) => REFUSED_INSTALL,
+            _ => 0,
         };
-        let modes = "440 root root regular file\n755 root root regular file\n";
-        assert!(check(0, SUDOERS, modes, 0).is_ok());
-        // A malformed drop-in fails visudo; an edited one fails the byte check.
-        assert!(check(1, SUDOERS, modes, 0).is_err());
-        let widened = SUDOERS.replace("/usr/bin/journalctl -k", "ALL");
-        assert!(check(0, &widened, modes, 0).is_err());
-        let writable = "644 root root regular file\n755 root root regular file\n";
-        assert!(check(0, SUDOERS, writable, 0).is_err());
-        assert!(check(0, SUDOERS, modes, 1).is_err());
+        let (result, log) = root_refusals(real);
+        result.expect("real front");
+        // Four worker runs: the planted script and three tampers.
+        assert_eq!(
+            log.iter().filter(|line| line.contains("runuser")).count(),
+            4
+        );
+        // A front that runs any script in its directory fails.
+        let any_file = |name: &str, tampered: bool| match (name, tampered) {
+            (_, true) => REFUSED_INSTALL,
+            _ => 0,
+        };
+        assert!(root_refusals(any_file).0.is_err());
+        // A front that skips the installed-script check fails.
+        let unchecked = |name: &str, _: bool| if name == "outside" { REFUSED_SHAPE } else { 0 };
+        assert!(root_refusals(unchecked).0.is_err());
     }
 
     /// A fake `sudo` (Linux: it reads `/proc`) applying `policy`: `strict`
     /// is the intended policy, `permissive` also runs anything else,
-    /// `closed` is a host without the drop-in, and `leaky` lets the front
-    /// write `-o` files.
+    /// `closed` is a host without the drop-in, `leaky` lets the front write
+    /// `-o` files, `freeform` lets it run a worker program file, and
+    /// `anonymous` misreports the sender.
     #[cfg(target_os = "linux")]
     fn fake_sudo(dir: &Path, policy: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
@@ -606,21 +784,29 @@ refuse() {{ echo 'sudo: a password is required' >&2; exit 1; }}
 case "$*" in
   dmesg) echo '[0.000000] Linux version'; exit 0 ;;
   'journalctl -k') echo 'kernel: Linux version'; exit 0 ;;
+  'carrick-capture signal-kill-sender --seconds 10')
+    sender=$(cut -d' ' -f4 "/proc/$PPID/stat")
+    [ "$policy" = anonymous ] && sender=1
+    victim=
+    for stat in /proc/[0-9]*/stat; do
+      read -r p c _ pp _ < "$stat" 2>/dev/null || continue
+      [ "$pp" = "$(cut -d' ' -f4 "/proc/$PPID/stat")" ] && [ "$c" = '(sleep)' ] && victim=$p
+    done
+    echo 'capture ready: signal-kill-sender for 10 s'
+    for _ in $(seq 200); do
+      state=$(cut -d' ' -f3 "/proc/$victim/stat" 2>/dev/null || echo gone)
+      if [ "$state" = Z ] || [ "$state" = gone ]; then
+        echo "sigkill sender_pid=$sender sender_comm=xtask target_pid=$victim target_comm=sleep result=0"
+        exit 0
+      fi
+      sleep 0.05
+    done
+    exit 1 ;;
 esac
-if [ "$1" = bpftrace ]; then
-  if [ "$policy" = leaky ] && [ "$2" = -o ]; then : > "$3"; exit 0; fi
-  case " $* " in
-    *' -o '*|*' --emit-elf '*|*' --unsafe '*|*' -c '*|*' /etc/shadow '*)
-      echo 'bpftrace front: refused: outside the allowlist' >&2; exit 2 ;;
-  esac
-  pid=$(sed -n 's/.*args->pid == \([0-9]*\)\/.*/\1/p' <<<"${{@: -1}}")
-  echo ready
-  for _ in $(seq 200); do
-    state=$(cut -d' ' -f3 "/proc/$pid/stat" 2>/dev/null || echo gone)
-    if [ "$state" = Z ] || [ "$state" = gone ]; then echo "sigkill $pid"; exit 0; fi
-    sleep 0.05
-  done
-  exit 1
+if [ "$1" = carrick-capture ]; then
+  if [ "$policy" = leaky ] && [ "$3" = -o ]; then : > "$4"; exit 0; fi
+  if [ "$policy" = freeform ] && [ "$#" = 2 ] && [ -f "$2" ]; then exit 0; fi
+  echo 'carrick-capture: refused: outside the allowlist' >&2; exit 64
 fi
 [ "$policy" = permissive ] && exec "$@"
 refuse
@@ -646,8 +832,11 @@ refuse
         verify_with(&fake_sudo(dir.path(), "strict"), &mounts).expect("strict policy");
         // Disallowed refused: a policy that also runs `true` or `bash` fails.
         assert!(verify_with(&fake_sudo(dir.path(), "permissive"), &mounts).is_err());
-        // A front that writes `-o` files as root fails.
+        // A front that writes `-o` files or runs a worker program fails.
         assert!(verify_with(&fake_sudo(dir.path(), "leaky"), &mounts).is_err());
+        assert!(verify_with(&fake_sudo(dir.path(), "freeform"), &mounts).is_err());
+        // A capture that does not name this process as the sender fails.
+        assert!(verify_with(&fake_sudo(dir.path(), "anonymous"), &mounts).is_err());
         // A clone without the drop-in fails the allowed commands.
         assert!(verify_with(&fake_sudo(dir.path(), "closed"), &mounts).is_err());
         // So does a clone without tracefs.

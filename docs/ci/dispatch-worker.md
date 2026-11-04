@@ -493,9 +493,12 @@ PR synchronize event. Falling back does not fail the run.
 The dedicated nologin accounts `carrick-dispatch-loop` and
 `carrick-dispatch-agent` have distinct uids and groups and no runner group
 membership. Neither can sudo to root, except that `carrick-dispatch-agent`
-may run exactly `bpftrace` (through an argument front), `dmesg` and
+may run exactly `carrick-capture <name> [--seconds N]`, bare `dmesg` and
 `journalctl -k` as root for capture rounds
-([#1621](contabo-kvm.md#scoped-capture-privilege-1621)). The runner joins
+([#1621](contabo-kvm.md#scoped-capture-privilege-1621)). `carrick-capture`
+runs only reviewed bpftrace scripts compiled into it, which print tracepoint
+records and task identity and read no other memory or file, so the worker
+cannot reach the loop's or runner's secrets through it. The runner joins
 their groups and can sudo only to those accounts, so it reaches root only
 through those same three commands. Runner-owned 0700 state holds the driver, artifacts
 and `redaction-secrets.json`. Model processes get `private_environment`, no

@@ -521,8 +521,12 @@ procedure above. Portable fixtures do not establish deployed PVE acceptance.
 ### Scoped capture privilege (#1621)
 
 The owner decided on 2026-11-04 (recorded on #231) that agent clones get a
-scoped privileged path for capture rounds, and no general root. Agent
-templates built from this script therefore:
+scoped privileged path for capture rounds, and no general root. The
+carrick-87 review narrowed it further: root bpftrace with a free-form
+program (`-e PROG`) can read any process's memory and any file, including
+the loop and runner tokens and `redaction-secrets.json`, which would erase
+the loop/worker uid separation in [dispatch-worker.md](dispatch-worker.md).
+Agent templates built from this script therefore:
 
 - install Debian's `bpftrace`;
 - give `carrick-dispatch-agent` passwordless sudo for exactly three
@@ -530,41 +534,85 @@ templates built from this script therefore:
   no shell, no wildcards. The text is
   `carrick-xtask ci-scaler capture-sudoers`. `dmesg` (bare only) and
   `journalctl -k` (exactly that argument) carry sudo's `NOEXEC` tag;
-- name `/usr/local/sbin/bpftrace` in that rule, not `/usr/bin/bpftrace`.
-  Raw bpftrace as root is general root: `-o FILE` and `--emit-elf` write
-  any file, `-c` runs a command and `--unsafe` enables `system()`. The
-  sudoers path is a root-owned copy of `carrick-xtask`. Under that name it
-  admits only `[-q] [-f text|json] [-B none|line|full] -e PROGRAM`,
-  `-l PATTERN` and `--version`. It then runs `/usr/bin/bpftrace` with a
-  cleared environment and sudo's `sudo_noexec.so` preloaded. The worker's
-  sudo `secure_path` lists `/usr/local/sbin` first, so `sudo bpftrace -e ...`
-  reaches it;
+- name `/usr/local/sbin/carrick-capture` in that rule, never
+  `/usr/bin/bpftrace`. It is the `carrick-capture` crate, std only and
+  without `unsafe`, built during provisioning from the seed with the
+  pinned toolchain's `rustc` alone. It is not the xtask binary, so an
+  xtask or CLI change never becomes root-run code;
+- install the reviewed scripts from `crates/carrick-capture/scripts/`
+  under `/usr/local/lib/carrick-capture/`, root-owned, mode 644, in a 755
+  directory;
 - rely on systemd's static `sys-kernel-tracing.mount` for tracefs, which
   the qualification checks rather than mounting it a second time.
 
-Bpftrace programs can still read any file (`cat()`) and any kernel or
-process memory, which is what tracing needs. Without `--unsafe` they
-cannot write, signal or override. `runner` can sudo to the worker account
-and so reaches the same three commands.
+The worker's only bpftrace path is:
+
+```sh
+sudo carrick-capture <name> [--seconds N]   # N from 1 to 3600, default 60
+```
+
+`<name>` must be in the allowlist compiled into the binary (today only
+`signal-kill-sender`, which prints the sender and target pid and comm of
+every SIGKILL). There is no `-e`, `-f`, file argument, include path,
+output file or other option; any other shape exits 64. Before running
+anything the front requires the installed script to match the copy
+compiled into it byte for byte, and the script and each directory above
+it to be root-owned and writable by root alone, or it exits 77. It then
+execs `/usr/bin/timeout --foreground --signal=INT --kill-after=5 <N+30>
+/usr/bin/bpftrace -B line <fixed path> <N>` from `/`, with stdin closed
+and an environment holding only `PATH`. Each script exits on its own after
+`N` interval ticks; the timeout is the hard backstop.
+
+Scripts may use only `BEGIN`, `END`, `tracepoint:<category>:<name>` and
+`interval:s:<n>` probes; only `printf`, `time`, `exit` and `clear`; and
+only task identity builtins, maps, `$1` and one-level `args->FIELD`
+reads. `tests/capture.rs` enforces that over the script directory, so
+`cat()`, `system()`, `str()`, `buf()`, `kptr()`/`uptr()`, `curtask`,
+casts, `*` dereferences, `[]` indexing, `#include` and `config` blocks
+fail the build's tests. A new script is a reviewed PR that adds it to
+`scripts/` and to `SCRIPTS` together.
 
 The builder runs `ci-scaler verify-capture` as the worker while
-provisioning, and `qualify-clone` runs it again on clone 9501 after root
-checks. The root checks are: `visudo -c` for the whole policy and for the
-drop-in, the drop-in bytes equal to `capture-sudoers`, modes
-`440 root root` and `755 root root`, the front byte-identical to
-`/usr/local/bin/carrick-xtask`, and `bpftrace --version`. As the worker,
-`verify-capture` requires:
+provisioning. `qualify-clone` repeats it on clone 9501 after two root
+steps. First come the policy checks: `visudo -c` for the whole policy and
+for the drop-in, the drop-in bytes equal to `capture-sudoers`, modes
+`440`/`755`/`755`/`644` root for the drop-in, front, script directory and
+scripts, the directory holding exactly the allowlisted scripts with their
+reviewed bytes, no retired `/usr/local/sbin/bpftrace` front, and
+`bpftrace --version`. Then come the root refusal tests below.
+
+#### Root tests on the qualification clone
+
+`qualify-clone` runs these as root through the guest agent on clone 9501,
+which it destroys afterwards. The director can also run them by hand on a
+qualification clone. Each worker command is
+`runuser -u carrick-dispatch-agent -- sudo -n carrick-capture NAME --seconds 1`.
+
+| Root step | Worker runs | Required result |
+| --- | --- | --- |
+| `install -m 644 -o root -g root .../signal-kill-sender.bt .../outside.bt` (a script outside the allowlist, with reviewed content) | `outside` | exit 64; then `rm -f .../outside.bt` |
+| `chmod 664 .../signal-kill-sender.bt` | `signal-kill-sender` | exit 77; then `chmod 644` |
+| `chown carrick-dispatch-agent .../signal-kill-sender.bt` | `signal-kill-sender` | exit 77; then `chown root` |
+| `truncate -s -1 .../signal-kill-sender.bt` | `signal-kill-sender` | exit 77; then restore from a `cp -p` backup |
+
+It then requires the restored script's bytes to match the reviewed
+source. As the worker, `verify-capture` then requires:
 
 - tracefs mounted at `/sys/kernel/tracing`;
 - `sudo -n dmesg` printing the kernel log, and `sudo -n journalctl -k`
   passing;
-- a bounded live `sudo -n bpftrace` trace on
-  `tracepoint:signal:signal_generate` that reports a SIGKILL sent to a
-  victim process;
-- sudo's own refusal of `true`, `bash`, raw `/usr/bin/bpftrace`,
-  `dmesg -C`, bare `journalctl` and `journalctl -k -f`;
-- the front's refusal of `-o`, `--emit-elf`, `--unsafe`, `-c` and a
-  program file, with no `-o` file created.
+- an allowed script running:
+  `sudo -n carrick-capture signal-kill-sender --seconds 10` reports ready,
+  prints a line naming the checker as the sender and a killed victim as the
+  target, and exits 0 on the script's own interval exit;
+- sudo's own refusal of `true`, `bash`, raw `bpftrace` by name and by
+  path, `timeout ... /usr/bin/bpftrace`, `dmesg -C`, bare `journalctl` and
+  `journalctl -k -f`;
+- the front's refusal (exit 64, nothing on stdout, no `-o` file) of no
+  arguments, `-e PROG`, a worker-written program file given as the name,
+  with `-f` or as an extra argument, `-o FILE`, `--unsafe`,
+  `--seconds 0`, `--seconds 3601`, `--seconds=5`, an unlisted name and a
+  path-shaped name.
 
 A passing `clone-qualification.json` is the owner's acceptance check on
 the qualification clone.
@@ -581,17 +629,21 @@ document it:
    to drain; never bypass it.
 3. With 9000 still active, build the new template:
    `scripts/ci/build-template-debian.sh INPUT_DIR FULL_COMMIT STAGED_XTASK agent 9001`.
-   Provisioning fails on any capture check. The builder then qualifies
-   linked clone 9501 and destroys it. Keep the stderr log and
-   `clone-qualification.json` with the manifest.
+   `INPUT_DIR` must be a checkout of `FULL_COMMIT`: the capture front is
+   built from its `crates/carrick-capture`, and the manifest records the
+   staged files' hash as `capture_sha256`. Provisioning fails on any
+   capture check. The builder then qualifies linked clone 9501 and
+   destroys it. Keep the stderr log and `clone-qualification.json` with
+   the manifest.
 4. Grant 9001 its source ACLs, keep a `carrick-xtask.pre-<pr>` copy of the
    controller, and flip the Contabo site row (`agent_template` in
    `crates/carrick-xtask/src/ci_scaler/site.rs`, Blue → Green) in its own
    PR. Deploy that controller and restart it on the existing ledger.
-5. Verify a fresh dispatch round, rerun #1600's capture round unchanged,
-   then announce on #231 how the other session would notice a broken
-   template: `qualify-clone` or `verify-capture` failures, or dispatch
-   clones that never become ready.
+5. Verify a fresh dispatch round, rerun #1600's capture round with
+   `sudo carrick-capture signal-kill-sender --seconds N`, then announce on
+   #231 how the other session would notice a broken template:
+   `qualify-clone` or `verify-capture` failures, or dispatch clones that
+   never become ready.
 6. Keep 9000, its ACL grants and `/etc/pve/firewall/9000.fw` until that
    live round passes. Rollback is the controller copy above, which selects
    9000 again.
