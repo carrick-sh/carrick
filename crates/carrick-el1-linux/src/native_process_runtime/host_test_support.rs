@@ -5072,7 +5072,10 @@ fn host_takeover_before_yield_receipt_is_not_now() {
 
 /// #1467 review P1: a contended exception service yields through the
 /// exception owner checkpoint, so its next owner entry re-delivers the
-/// exception instead of re-executing a syscall at that PC.
+/// exception instead of re-executing a syscall at that PC. The parent stays
+/// parked in `wait4` while its child takes the Busy-once refusal; after the
+/// handback the refused exception completes through `resume_checkpoint` as
+/// the exception's own signal, never as a syscall return or SVC retry.
 #[cfg(test)]
 #[test]
 fn host_request_during_exception_service_park_yields_as_exception() {
@@ -5083,6 +5086,22 @@ fn host_request_during_exception_service_park_yields_as_exception() {
                 address: UserVa::new(0x4000),
             },
         ),
+        false,
+    );
+}
+
+/// #1467 review P1, fault arm: a contended fault service yields as an
+/// exception and, once supplied, resumes by re-executing the faulting
+/// instruction, not by returning from or retrying a syscall.
+#[cfg(test)]
+#[test]
+fn host_request_during_fault_service_park_yields_as_exception() {
+    host_contended_service_park(
+        carrick_core_abi::service::ServiceOperation::Fault(carrick_guest_arch::FaultInfo {
+            address: UserVa::new(0x4000),
+            access: carrick_guest_arch::Access::Read,
+            present: true,
+        }),
         false,
     );
 }
@@ -5168,6 +5187,12 @@ fn host_contended_service_park(
         ResumeDisposition::OwnerContinuation(expected_entry),
         "the yield must resume through the operation's own owner entry"
     );
+    // The scheduler's own discriminant: an exception owner never resumes
+    // through a host snapshot (which would rewind the PC to an SVC).
+    assert_eq!(
+        fixture.zone.record(record.id).requires_native_entry(),
+        expected_entry == OwnerEntry::Exception
+    );
     if takeover_before_receipt {
         assert!(matches!(
             fixture.zone.record(record.id).claim(),
@@ -5186,11 +5211,28 @@ fn host_contended_service_park(
     let ticket =
         unsafe { ServiceCell::claim_notice(&control.service, notice, NonZeroU64::MIN, identity) }
             .unwrap();
+    // The yield retained this exact operation: the record's token names this
+    // record and the claimed request's sequence, and the request is unchanged.
+    assert_eq!(ticket.request().operation, operation);
+    let census = fixture.zone.record(record.id).object_wait_census().unwrap();
+    assert_eq!(
+        (census.operation, census.operation_generation),
+        (
+            u64::from(record.id.raw()),
+            ticket.request().identity.sequence.get()
+        ),
+        "the yield must retain the exact service operation"
+    );
 
     // The stopped executor honours the request (`el1_zone::hand_back_wanted`),
     // and the native handback places the exact record back on a slot.
-    if expected_entry == OwnerEntry::Syscall && !takeover_before_receipt {
-        assert!(fixture.zone.record(record.id).needs_host());
+    if !takeover_before_receipt {
+        // Only a syscall owner may be host-resumed; an exception owner
+        // stays bound to its native entry.
+        assert_eq!(
+            fixture.zone.record(record.id).needs_host(),
+            expected_entry == OwnerEntry::Syscall
+        );
     }
     if !takeover_before_receipt {
         let mut wanted = alloc::vec::Vec::new();
@@ -5210,6 +5252,11 @@ fn host_contended_service_park(
     let reenter = |expect_left: bool| {
         let (again, address, words) = capacity.select().unwrap();
         assert_eq!(again, record);
+        assert_eq!(
+            fixture.zone.record(record.id).resume_disposition(),
+            ResumeDisposition::OwnerContinuation(expected_entry),
+            "the selected record must enter through the operation's own owner entry"
+        );
         let mut service = fixture.service();
         let mut entry = fixture
             .runtime
@@ -5232,17 +5279,33 @@ fn host_contended_service_park(
                 Claim::Parked { .. }
             ));
         } else {
-            assert!(
-                matches!(resumed, Ok(NativeResume::Returned(_))),
-                "{}",
-                match &resumed {
-                    Ok(NativeResume::NoPending) => "NoPending",
-                    Ok(NativeResume::RetrySyscall) => "RetrySyscall",
-                    Ok(NativeResume::Returned(_)) => "Returned",
-                    Ok(NativeResume::Left(_)) => "Left",
-                    Ok(NativeResume::Invalid) => "Invalid",
-                    Err(_) => "Err",
-                }
+            let observed = match &resumed {
+                Ok(NativeResume::NoPending) => "NoPending",
+                Ok(NativeResume::RetrySyscall) => "RetrySyscall",
+                Ok(NativeResume::Returned(_)) => "Returned",
+                Ok(NativeResume::Left(_)) => "Left",
+                Ok(NativeResume::Invalid) => "Invalid",
+                Err(_) => "Err",
+            };
+            if expected_entry == OwnerEntry::Exception {
+                // An exception owner resumes at its faulting instruction (or
+                // the signal it raised), never through syscall handling: no
+                // return value, no SVC retry.
+                assert!(
+                    matches!(resumed, Ok(NativeResume::NoPending)),
+                    "a completed exception service resumed as {observed}"
+                );
+            } else {
+                assert!(
+                    matches!(resumed, Ok(NativeResume::Returned(_))),
+                    "{observed}"
+                );
+            }
+            drop(entry);
+            assert_eq!(
+                fixture.zone.record(record.id).resume_disposition(),
+                ResumeDisposition::UserReturn,
+                "completion must consume the owner continuation"
             );
         }
     };
@@ -5257,14 +5320,11 @@ fn host_contended_service_park(
     assert_eq!(queue.native_service_member(record), Some(identity));
     drop(queue);
     assert!(fixture.task.service_notice.take().unwrap().is_none());
-    if expected_entry == OwnerEntry::Exception {
-        // The exception arm's contract ends at the exact repark: completion of
-        // an exception service is not a syscall return.
-        drop(ticket);
-        return;
-    }
+    // A refused exception raises its signal; a supplied fault or syscall
+    // service completes normally.
+    let refused_exception = matches!(operation, ServiceOperation::Exception(_));
     ticket
-        .complete(true)
+        .complete(!refused_exception)
         .unwrap_or_else(|_| panic!("yielded service ticket was cancelled"));
     fixture
         .zone
@@ -5276,6 +5336,34 @@ fn host_contended_service_park(
         .notify_object(fixture.slot, &mut Default::default())
         .unwrap();
     reenter(false);
+    if expected_entry == OwnerEntry::Exception {
+        let key = fixture
+            .registry
+            .state
+            .lock()
+            .members
+            .values()
+            .find(|member| member.record == record)
+            .unwrap()
+            .process;
+        let pending = fixture
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .task(key)
+            .unwrap()
+            .native()
+            .resources()
+            .signals()
+            .pending_set(record);
+        // The exception's own completion: SIGILL for the refused undefined
+        // instruction, nothing for a supplied fault that simply retries.
+        assert_eq!(
+            pending.contains(carrick_signal_core::policy::Signal::ILL),
+            refused_exception
+        );
+    }
 }
 
 /// #1467, owner-wait arm: a portal owner wait refused by a host request keeps
