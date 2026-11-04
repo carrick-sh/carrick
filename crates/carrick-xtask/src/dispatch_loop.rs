@@ -1896,6 +1896,7 @@ fn outcome_preview(contract: &Contract) -> Contract {
     let clip = |text: &str, limit| text.chars().take(limit).collect::<String>();
     let mut preview = Contract {
         loop_summary: contract.loop_summary.as_ref().map(|s| clip(s, 1024)),
+        review: contract.review,
         status: contract.status,
         summary: clip(&contract.summary, 1024),
         tests: contract
@@ -2369,6 +2370,7 @@ impl Server<'_> {
         let mut status = status;
         let mut outcome = Contract {
             loop_summary: Some(masked(summary, &self.token)),
+            review: Applied::load()?.review,
             status: status.contract(),
             summary: applied.clone(),
             tests: self.history.iter().flat_map(|c| c.tests.clone()).collect(),
@@ -3328,6 +3330,7 @@ impl Server<'_> {
                     self.history.truncate(worker_index);
                     self.history.push(Contract {
                         loop_summary: None,
+                        review: false,
                         status: ContractStatus::Failed,
                         summary: format!(
                             "Worker failed after admission: {}",
@@ -4418,6 +4421,8 @@ mod tests {
                 layer_history: None,
                 review: true,
                 review_text: String::new(),
+                closing_override: None,
+                part_of: false,
                 continuation: Continuation::Owned,
                 worker_seconds: None,
                 loop_deadline: None,
@@ -5591,6 +5596,7 @@ fi
     fn outcome_preview_is_bounded_without_changing_the_full_contract() {
         let full = Contract {
             loop_summary: None,
+            review: false,
             status: ContractStatus::Done,
             summary: "\0".repeat(8192),
             tests: vec!["🦀".repeat(1000); 64],
@@ -5690,9 +5696,11 @@ fi
                     exit_code: 0,
                     expected_tip,
                     pr_body: None,
+                    review_text: None,
                     worker: dispatch.worker.clone(),
                     contract: Contract {
                         loop_summary: None,
+                        review: false,
                         status: ContractStatus::Done,
                         summary: "first implementation".into(),
                         tests: vec!["cargo test passed".into()],
@@ -5710,6 +5718,7 @@ fi
                 package.join("contract.json"),
                 serde_json::to_vec(&Contract {
                     loop_summary: None,
+                    review: false,
                     status: ContractStatus::Done,
                     summary: "first implementation".into(),
                     tests: vec!["cargo test passed".into()],
@@ -9407,6 +9416,7 @@ exec /usr/bin/git "$@"
             let mut server = server(root);
             let forged = Contract {
                 loop_summary: None,
+                review: false,
                 status: ContractStatus::Done,
                 summary: "forged outcome".into(),
                 tests: vec![],
@@ -9735,6 +9745,7 @@ exec /usr/bin/git "$@"
     fn later_worker_handoff_contains_prior_claims() {
         let contract = Contract {
             loop_summary: None,
+            review: false,
             status: ContractStatus::Done,
             summary: "prior summary".into(),
             tests: vec!["prior test".into()],

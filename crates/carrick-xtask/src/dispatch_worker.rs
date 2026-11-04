@@ -168,6 +168,11 @@ pub struct Dispatch {
     pub layer_history: Option<LayerPublication>,
     pub review: bool,
     pub review_text: String,
+    /// Only an explicit owner trigger may replace live closing references.
+    #[serde(default)]
+    pub closing_override: Option<u64>,
+    #[serde(default)]
+    pub part_of: bool,
     pub continuation: Continuation,
     #[serde(skip)]
     pub worker_seconds: Option<u64>,
@@ -734,6 +739,20 @@ fn validate_event_with_publication(
         layer_history: None,
         review,
         review_text: String::new(),
+        closing_override: owner_closing_override(event),
+        part_of: event["issue"]["labels"].as_array().is_some_and(|labels| {
+            labels.iter().any(|label| {
+                matches!(
+                    label["name"].as_str().or_else(|| label.as_str()),
+                    Some("epic" | "bet")
+                )
+            })
+        }) || event["issue"]["title"].as_str().is_some_and(|title| {
+            let title = title.to_ascii_lowercase();
+            ["epic:", "bet:", "[epic]", "[bet]"]
+                .iter()
+                .any(|prefix| title.starts_with(prefix))
+        }),
         continuation,
         worker_seconds: None,
         loop_deadline: None,
@@ -784,11 +803,24 @@ pub(crate) fn copilot_environment(command: &mut Command, home: &Path) {
         );
 }
 
+fn owner_closing_override(event: &Value) -> Option<u64> {
+    ["comment", "review"].iter().find_map(|kind| {
+        let trigger = &event[kind];
+        if !owner_user(&trigger["user"]) {
+            return None;
+        }
+        trigger["body"].as_str()?.lines().find_map(|line| {
+            let target = line.trim().strip_prefix("Closes: #")?;
+            target.parse::<u64>().ok().filter(|n| *n > 0)
+        })
+    })
+}
+
 fn schema() -> Value {
     json!({"type":"object","additionalProperties":false,
-        "required":["status","summary","tests","risks"],"properties":{
+        "required":["status","summary","tests","risks","review"],"properties":{
             "status":{"type":"string","enum":["done","blocked","failed"]},
-            "summary":{"type":"string"},"tests":{"type":"array","items":{"type":"string"}},
+            "review":{"type":"boolean"},"summary":{"type":"string"},"tests":{"type":"array","items":{"type":"string"}},
             "risks":{"type":"array","items":{"type":"string"}}}})
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -801,6 +833,9 @@ pub struct Contract {
     /// Server-retained loop claims, separate from the applied report in summary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loop_summary: Option<String>,
+    /// Worker claim on input; server publication evidence on outcome.
+    #[serde(default)]
+    pub review: bool,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -816,8 +851,8 @@ pub enum ContractStatus {
 fn schema_fields(output: &Value) -> Value {
     let schema = schema();
     let mut kept = serde_json::Map::new();
-    if let (Some(fields), Some(required)) = (output.as_object(), schema["required"].as_array()) {
-        for name in required.iter().filter_map(Value::as_str) {
+    if let (Some(fields), Some(required)) = (output.as_object(), schema["properties"].as_object()) {
+        for name in required.keys() {
             if let Some(value) = fields.get(name) {
                 kept.insert(name.to_owned(), value.clone());
             }
@@ -842,6 +877,7 @@ fn read_result(result: &Path) -> (Contract, String) {
         .and_then(|value| serde_json::from_value(schema_fields(&value["structured_output"])).ok())
         .unwrap_or(Contract {
             loop_summary: None,
+            review: false,
             status: ContractStatus::Failed,
             summary: "No valid worker contract".into(),
             tests: vec![],
@@ -1159,7 +1195,7 @@ fn worker_prompt(dispatch: &Dispatch) -> String {
         --source-only, plus just cross-check-macos for macOS-cfg code and just check-linux for\n\
         KVM/HAL code. Leave whole-workspace just lint-domains and just test-kernel to CI.\n\
         To propose a PR body, write ../pr-body.md beside result.json (relative to the checkout root).\n\
-        Keep it at most 8 KiB, write for people, and omit closing references and dispatch footers; the server adds them.\n\
+        Keep it at most 8 KiB, write for people, and omit closing references and dispatch footers; the server adds them. Put fresh independent review text in ../review.md for the server to post as a PR comment; a claim alone does not count.\n\
         Return the requested JSON contract, stating unrun gates and blockers honestly.\n\n{}{}",
         dispatch.issue,
         dispatch.branch,
@@ -1935,6 +1971,7 @@ fn record_worker_failure(error: &ScalerError, dispatch: &Dispatch) -> Result<(),
     });
     let contract = Contract {
         loop_summary: None,
+        review: false,
         status: ContractStatus::Failed,
         summary: format!("Worker production/harvest failed: {error}"),
         tests: vec![],
@@ -3329,6 +3366,8 @@ struct Receipt {
     // The proposal belongs to the same atomic checkpoint as the tree.
     #[serde(default)]
     pr_body: Option<String>,
+    #[serde(default)]
+    review_text: Option<String>,
     worker: Worker,
     contract: Contract,
 }
@@ -4415,6 +4454,7 @@ fn produce(
     std::fs::set_permissions(&package, std::fs::Permissions::from_mode(0o700))?;
     let mut contract = Contract {
         loop_summary: None,
+        review: false,
         status: ContractStatus::Failed,
         summary: format!("Worker setup did not complete: {setup}"),
         tests: vec![],
@@ -4431,6 +4471,7 @@ fn produce(
     let mut candidate = None;
     let mut checkpointed = false;
     let mut proposed_body = None;
+    let mut review_text = None;
     let mut raw = if package.join("raw.log").is_file() {
         regular_text(&package.join("raw.log"))?
     } else {
@@ -4583,6 +4624,7 @@ fn produce(
                 .as_ref()
                 .and_then(|receipt| receipt.pr_body.clone())
         });
+        review_text = read_review(&actor)?;
         candidate = Some(staging);
     }
     if provider_filtered && contract.status != ContractStatus::Done {
@@ -4646,6 +4688,7 @@ fn produce(
                 exit_code: code,
                 expected_tip,
                 pr_body: proposed_body,
+                review_text,
                 worker: dispatch.worker.clone(),
                 contract: contract.clone(),
             },
@@ -4888,6 +4931,10 @@ struct Applied {
     #[serde(default)]
     rebase_range_diff: Option<String>,
     body: AppliedBody,
+    #[serde(default)]
+    pub(crate) review: bool,
+    #[serde(default)]
+    review_claimed: bool,
     board_changes: Vec<String>,
     #[serde(default)]
     board_left: Vec<String>,
@@ -4945,8 +4992,15 @@ impl Applied {
         Ok(())
     }
     fn report(&self) -> String {
+        let review = if self.review {
+            "review published"
+        } else if self.review_claimed {
+            "review claimed, not published"
+        } else {
+            "no review published"
+        };
         format!(
-            "{}{}{}- PR commits: {}.{}\n- PR body: {}.\n- Board status: {}.{}",
+            "{}{}{}- PR commits: {}.{}\n- PR body: {}.\n- Board status: {}.{}\n- Independent review: {review}.\n",
             self.provider_events.iter().map(|event| format!("- Provider filter: {event}.\n")).collect::<String>(),
             self.adoption_blocked
                 .as_ref()
@@ -5272,6 +5326,51 @@ fn read_pr_body(directory: &Path) -> Result<Option<String>, ScalerError> {
     }
     Ok(Some(crate::safe_copy::text(&path, 8192)?))
 }
+fn read_review(directory: &Path) -> Result<Option<String>, ScalerError> {
+    let path = directory.join("review.md");
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+        Ok(_) => Ok(Some(crate::safe_copy::text(&path, 8192)?)),
+    }
+}
+
+/// Publish review prose with the job credential, like other dispatch comments.
+/// A successful command is the evidence; worker claims cannot set this bit.
+fn publish_review(root: &Path, number: u64, text: &str, token: &str) -> Result<(), ScalerError> {
+    let cleaned = body_without_comments(text)?;
+    if !cleaned.lines().any(|line| {
+        let line = line.trim();
+        !line.is_empty()
+            && !line.starts_with('#')
+            && !line.starts_with("```")
+            && !line.starts_with("~~~")
+    }) || closing_reference(&cleaned)
+    {
+        return Err(ScalerError::Guard("empty or linked independent review"));
+    }
+    proposed_pr_body(Some(text), number, "review", token)?;
+    let body = format!(
+        "## Independent review\n\n{}",
+        neutralize_mentions(&agent_loop::masked(&cleaned, token))
+    );
+    let path = crate::agent_runner::state()?.join("review-comment.md");
+    std::fs::write(&path, body)?;
+    gh(
+        root,
+        &[
+            "issue",
+            "comment",
+            &number.to_string(),
+            "--repo",
+            REPOSITORY,
+            "--body-file",
+            path.to_str().ok_or(ScalerError::Guard("review path"))?,
+        ],
+    )?;
+    Applied::record(|a| a.review = true)
+}
+
 fn proposed_pr_body(
     proposal: Option<&str>,
     issue: u64,
@@ -5417,6 +5516,133 @@ fn template_pr_body(
         .collect::<Vec<_>>()
         .join("\n");
     Ok(final_pr_body(&text, issue, id, token))
+}
+
+/// The live PR is the authority for linkage and sections absent from this round.
+/// Proposals have already passed the worker-prose guard; only server code can
+/// transplant references from the live body or an authenticated owner trigger.
+fn initial_linkage(body: &str, dispatch: &Dispatch) -> String {
+    let reference = if let Some(issue) = dispatch.closing_override {
+        format!("Closes #{issue}")
+    } else if dispatch.part_of {
+        format!("Part of #{}", dispatch.issue)
+    } else {
+        format!("Closes #{}", dispatch.issue)
+    };
+    body.replace(
+        &format!("\n\nCloses #{}\n\n", dispatch.issue),
+        &format!("\n\n{reference}\n\n"),
+    )
+}
+
+fn regenerate_pr_body(previous: &str, proposed: &str, override_issue: Option<u64>) -> String {
+    fn linkage(line: &str) -> bool {
+        closing_reference(line) || line.trim_start().starts_with("Part of #")
+    }
+    fn sections(text: &str) -> Vec<(String, String)> {
+        let mut result = vec![(String::new(), String::new())];
+        let mut fence = None;
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                let marker = &trimmed[..3];
+                if fence == Some(marker) {
+                    fence = None;
+                } else if fence.is_none() {
+                    fence = Some(marker);
+                }
+            }
+            if linkage(line) || line.starts_with("Dispatch run:") {
+                continue;
+            }
+            if fence.is_none() && line.starts_with("## ") {
+                result.push((line.trim().to_owned(), String::new()));
+            }
+            if let Some((_, body)) = result.last_mut() {
+                body.push_str(line);
+                body.push('\n');
+            }
+        }
+        result
+    }
+    let substantive = |heading: &str, body: &str| {
+        heading == "## Publication"
+            || body
+                .lines()
+                .skip(usize::from(!heading.is_empty()))
+                .any(|line| !line.trim().is_empty() && !line.starts_with("Published tree:"))
+    };
+    let mut merged = sections(proposed);
+    merged.retain(|(heading, body)| substantive(heading, body));
+    let produced = merged
+        .iter()
+        .map(|(heading, _)| heading.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    for (heading, body) in sections(previous) {
+        if substantive(&heading, &body) && !produced.contains(&heading) {
+            merged.push((heading, body));
+        }
+    }
+    let mut result = merged
+        .into_iter()
+        .map(|(_, body)| body.trim().to_owned())
+        .filter(|body| !body.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let references = if let Some(issue) = override_issue {
+        format!("Closes #{issue}")
+    } else {
+        previous
+            .lines()
+            .filter(|line| linkage(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    if !references.is_empty() {
+        result.push_str(&format!("\n\n{references}"));
+    }
+    for line in proposed
+        .lines()
+        .filter(|line| line.starts_with("Dispatch run:"))
+    {
+        result.push_str(&format!("\n\n{line}"));
+    }
+    result.push('\n');
+    result
+}
+
+/// Review prose is published only when a nonempty review section is included
+/// in a successful server body write. A worker's boolean alone is no evidence.
+fn published_review(body: &str) -> bool {
+    let Ok(body) = body_without_comments(body) else {
+        return false;
+    };
+    let mut reviewing = false;
+    let mut fence = None;
+    for line in body.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            let marker = &trimmed[..3];
+            if fence == Some(marker) {
+                fence = None;
+            } else if fence.is_none() {
+                fence = Some(marker);
+            }
+            continue;
+        }
+        if fence.is_none() && line.starts_with("## ") {
+            reviewing = line.trim().eq_ignore_ascii_case("## Independent review");
+        } else if reviewing
+            && !line.trim().is_empty()
+            && !closing_reference(line)
+            && !line.starts_with("Dispatch run:")
+            && !line.starts_with("Published tree:")
+            && !line.trim_start().starts_with("Part of #")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn patch_pr_body(
@@ -5985,7 +6211,9 @@ fn publication_body(body: &str, source: &str, issue: u64) -> Result<String, Scal
     let (human, footer) = body.rsplit_once(&closing).ok_or(ScalerError::Guard(
         "publication body lacks canonical footer",
     ))?;
-    Ok(format!("{human}\n\n{source}{closing}{footer}"))
+    Ok(format!(
+        "{human}\n\n## Publication\n{source}{closing}{footer}"
+    ))
 }
 
 /// Publish the harvested work. A refusal never costs the commits: they are
@@ -6034,7 +6262,7 @@ fn publish_with(
     mode: PublishMode,
 ) -> Result<Option<u64>, ScalerError> {
     let mut preserve = None;
-    let result = publish_commits(
+    let mut result = publish_commits(
         root,
         dispatch,
         receipt,
@@ -6045,6 +6273,13 @@ fn publish_with(
         &mut preserve,
         mode,
     );
+    if mode == PublishMode::Full
+        && let Ok(Some(number)) = &result
+        && let Some(review) = receipt.review_text.as_deref()
+        && let Err(error) = publish_review(root, *number, review, token)
+    {
+        result = Err(error);
+    }
     let (Err(error), Some(base)) = (&result, preserve) else {
         return result;
     };
@@ -6125,6 +6360,13 @@ fn publish_commits(
     preserve: &mut Option<String>,
     mode: PublishMode,
 ) -> Result<Option<u64>, ScalerError> {
+    Applied::record(|a| {
+        a.review_claimed |= receipt.contract.review
+            || receipt.review_text.is_some()
+            || std::iter::once(&receipt.contract.summary)
+                .chain(&receipt.contract.tests)
+                .any(|claim| claim.to_ascii_lowercase().contains("independent review"));
+    })?;
     let mut credential = PublishCredential::new(token);
     let mut check = ReferenceCheck::new(reference_host());
     // Push, snapshot and write share the primary window; recovery alone may
@@ -6579,6 +6821,11 @@ fn publish_commits(
                         body.trim_end()
                     )
                 };
+                let body = regenerate_pr_body(
+                    pr["body"].as_str().unwrap_or_default(),
+                    &body,
+                    dispatch.closing_override,
+                );
                 Applied::record(|a| a.publication_pr = Some(number))?;
                 let previous = match read_closing_references(root, number) {
                     Ok(previous) => previous,
@@ -6593,9 +6840,11 @@ fn publish_commits(
                         return Err(ScalerError::Usage(reason));
                     }
                 };
-                let mut expected: ClosingIssues =
-                    previous.all.difference(&previous.body).cloned().collect();
-                expected.insert(issue_reference(dispatch.issue));
+                let mut expected: ClosingIssues = previous.all.clone();
+                if let Some(issue) = dispatch.closing_override {
+                    expected = previous.all.difference(&previous.body).cloned().collect();
+                    expected.insert(issue_reference(issue));
+                }
                 patch_pr_body(root, number, &body, &mut credential)?;
                 if let Err(error) = check.verify(root, number, &expected) {
                     if matches!(error, ReferenceFailure::Deadline) {
@@ -6605,14 +6854,17 @@ fn publish_commits(
                         root,
                         number,
                         (pr["body"].as_str().unwrap_or_default(), "previous body"),
-                        &expected,
+                        &previous.all,
                         &error.to_string(),
                         &mut credential,
                         &mut check,
                     )?;
                     return Err(ScalerError::Usage(reason));
                 }
-                Applied::record(|a| a.body = AppliedBody::Updated)?;
+                Applied::record(|a| {
+                    a.body = AppliedBody::Updated;
+                    a.review |= published_review(&body);
+                })?;
             }
             return Ok(Some(
                 pr["number"]
@@ -6628,8 +6880,9 @@ fn publish_commits(
                     dispatch.issue,
                 )?,
             };
+            let body = initial_linkage(&body, dispatch);
             let path = state.join("pr-body.md");
-            std::fs::write(&path, body)?;
+            std::fs::write(&path, &body)?;
             // A later run cannot add a publication binding to the immutable
             // creation run's artifacts. Use Actions identity for this recovery
             // create so the original run's branch remains independently owned.
@@ -6667,7 +6920,13 @@ fn publish_commits(
                 .as_u64()
                 .ok_or(ScalerError::Guard("invalid PR number"))?;
             Applied::record(|a| a.publication_pr = Some(number))?;
-            let expected = ClosingIssues::from([issue_reference(dispatch.issue)]);
+            let expected = if dispatch.part_of && dispatch.closing_override.is_none() {
+                ClosingIssues::new()
+            } else {
+                ClosingIssues::from([issue_reference(
+                    dispatch.closing_override.unwrap_or(dispatch.issue),
+                )])
+            };
             if let Err(error) = check.verify(root, number, &expected) {
                 if matches!(error, ReferenceFailure::Deadline) {
                     return Err(ScalerError::Usage(keep_unverified_body(&error, token)?));
@@ -6682,6 +6941,7 @@ fn publish_commits(
                     &source,
                     dispatch.issue,
                 )?;
+                let fallback = initial_linkage(&fallback, dispatch);
                 let reason = restore_pr_body(
                     root,
                     number,
@@ -6694,6 +6954,7 @@ fn publish_commits(
                 return Err(ScalerError::Usage(reason));
             }
             Applied::record(|a| {
+                a.review |= published_review(&body);
                 // Preserve a refused proposal even when creation used the fallback.
                 if let AppliedBody::Refused {
                     template_created, ..
@@ -7548,6 +7809,70 @@ mod tests {
         publication_fixture("closing");
     }
     #[test]
+    fn initial_epic_uses_part_of() {
+        publication_fixture("initial-epic");
+    }
+    #[test]
+    fn initial_owner_closing_override_is_applied() {
+        publication_fixture("initial-override");
+    }
+    #[test]
+    fn failed_owner_override_restores_previous_references() {
+        publication_fixture("override-rollback");
+    }
+    #[test]
+    fn empty_and_fenced_sections_are_not_review_evidence() {
+        for body in [
+            "## Independent review\n\nCloses #634\nDispatch run: run",
+            "```md\n## Independent review\nFake review\n```",
+            "## Independent review\n<!-- pending -->\n## Publication\nPublished tree: worker",
+        ] {
+            assert!(!published_review(body), "{body}");
+        }
+        let body = regenerate_pr_body(
+            "## Why\nPrior rationale\n## Independent review\nSol: reviewed\nPart of #634",
+            "## Why\n\n## Independent review\n\n## Publication\nPublished tree: worker\nCloses #634",
+            None,
+        );
+        assert!(
+            body.contains("Prior rationale") && body.contains("Sol: reviewed"),
+            "{body}"
+        );
+        assert!(!body.contains("Closes #"));
+        let body = regenerate_pr_body(
+            "## Independent review\nFirst review\n## Independent review\nSecond review\nPart of #634",
+            "## What\nUpdated explanation",
+            None,
+        );
+        assert!(
+            body.contains("First review") && body.contains("Second review"),
+            "{body}"
+        );
+    }
+    #[test]
+    fn only_an_owner_line_overrides_linkage() {
+        let mut event = review_event();
+        event["review"]["body"] = "/agent\nCloses: #999".into();
+        assert_eq!(owner_closing_override(&event), Some(999));
+        event["review"]["user"]["login"] = "writer".into();
+        assert_eq!(owner_closing_override(&event), None);
+        event["review"]["user"]["login"] = "tjfontaine".into();
+        event["review"]["body"] = "/agent\nCloses #999".into();
+        assert_eq!(owner_closing_override(&event), None);
+    }
+    #[test]
+    fn director_linkage_and_review_survive_regeneration() {
+        publication_fixture("preserved");
+    }
+    #[test]
+    fn review_text_is_posted_as_a_pr_comment() {
+        publication_fixture("review-comment");
+    }
+    #[test]
+    fn unpublished_review_claim_is_not_evidence() {
+        publication_fixture("review-claimed");
+    }
+    #[test]
     fn continuation_applies_proposed_body() {
         publication_fixture("body");
     }
@@ -7760,9 +8085,11 @@ mod tests {
             exit_code: 0,
             expected_tip: String::new(),
             pr_body: None,
+            review_text: None,
             worker: dispatch.worker.clone(),
             contract: Contract {
                 loop_summary: None,
+                review: false,
                 status: ContractStatus::Done,
                 summary: "old checkpoint".into(),
                 tests: vec![],
@@ -7862,9 +8189,11 @@ mod tests {
             exit_code: 0,
             expected_tip: String::new(),
             pr_body: None,
+            review_text: None,
             worker: Worker::default(),
             contract: Contract {
                 loop_summary: None,
+                review: false,
                 status: ContractStatus::Done,
                 summary: "old tree".into(),
                 tests: vec![],
@@ -8356,7 +8685,10 @@ w=int((r/"body-writes").read_text()) if (r/"body-writes").exists() else 0
 p=r/"phase-reads"; n=int(p.read_text())+1 if p.exists() else 1;p.write_text(str(n))
 with (r/"reference-reads.jsonl").open("a") as f:f.write(json.dumps({"write":w,"read":n})+"\n")
 all_refs=body_refs=[634]
-if (r/"two-references").exists(): all_refs=body_refs=[634,999]
+if (r/"two-references").exists() and w==2: all_refs=body_refs=[634,999]
+if m in ("preserved","initial-epic"): all_refs=body_refs=[]
+if m=="initial-override": all_refs=body_refs=[999]
+if m=="override-rollback" and w==2: all_refs=body_refs=[634,999]
 if m=="transient" and w==1 and n%2==1: sys.exit(95)
 if m=="snapshot-fail" and w==1: sys.exit(95)
 if m=="lag" and w==1 and n<=2: all_refs=body_refs=[]
@@ -8561,6 +8893,7 @@ fi
         std::fs::write(outer.join("pr.json"), json!([pr.clone()]).to_string()).unwrap();
         let mut contract = Contract {
             loop_summary: None,
+            review: false,
             status: ContractStatus::Done,
             summary: "implemented".into(),
             tests: vec![],
@@ -8574,6 +8907,7 @@ fi
             exit_code: 0,
             expected_tip: String::new(),
             pr_body: None,
+            review_text: None,
             worker: dispatch.worker.clone(),
             contract: contract.clone(),
         };
@@ -9999,6 +10333,11 @@ fi
             }
             return;
         }
+        if matches!(witness, "initial-epic" | "initial-override") {
+            dispatch.part_of = witness == "initial-epic";
+            dispatch.closing_override = (witness == "initial-override").then_some(999);
+            std::fs::write(outer.join("reference-mode"), witness).unwrap();
+        }
         assert_eq!(
             publish(
                 &work,
@@ -10024,6 +10363,18 @@ fi
             return;
         }
         let body = regular_text(&state.join("pr-body.md")).unwrap();
+        if matches!(witness, "initial-epic" | "initial-override") {
+            assert!(
+                body.contains(if witness == "initial-epic" {
+                    "Part of #634"
+                } else {
+                    "Closes #999"
+                }),
+                "{body}"
+            );
+            assert!(!body.contains("Closes #634"));
+            return;
+        }
         assert!(body.contains("Closes #634") && body.contains("Dispatch run:"));
         if witness == "failed-harvest-body" {
             assert!(
@@ -10062,7 +10413,7 @@ fi
         .unwrap()
         .unwrap();
         assert_eq!(selected["head"]["ref"], dispatch.branch);
-        let mut unowned = pr;
+        let mut unowned = pr.clone();
         unowned["user"]["login"] = "outsider".into();
         assert!(
             select_owned_pr(
@@ -10082,6 +10433,18 @@ fi
             .unwrap()
             .trim()
             .to_owned();
+        if witness == "preserved" {
+            pr["body"] = "## Why\nExisting rationale.\n\n## Independent review\nSol: no P0/P1 findings.\n\nPart of #634".into();
+            std::fs::write(outer.join("pr.json"), json!([pr.clone()]).to_string()).unwrap();
+            std::fs::write(outer.join("reference-mode"), "preserved").unwrap();
+        }
+        if witness == "review-comment" {
+            receipt.review_text =
+                Some("Sol 6.1: examined publication and preservation; no P0/P1 findings.".into());
+        }
+        if witness == "review-claimed" {
+            receipt.contract.summary = "Independent review completed".into();
+        }
         if witness == "published-closure" {
             git(&work, &["commit", "--allow-empty", "-m", "Closes #999"]).unwrap();
             receipt.expected_tip = git(&work, &["rev-parse", "HEAD"])
@@ -10159,6 +10522,9 @@ fi
         if matches!(
             witness,
             "body"
+                | "preserved"
+                | "override-rollback"
+                | "review-claimed"
                 | "summary-first"
                 | "edit-failure"
                 | "references"
@@ -10173,13 +10539,18 @@ fi
             std::fs::create_dir_all(&package).unwrap();
             std::fs::write(
                 package.join("pr-body.md"),
-                "Explain the implemented fix. fixture-token\n",
+                if witness == "preserved" {
+                    "## What\nExplain the implemented fix. fixture-token\n\n## Why\n\n## Independent review\n"
+                } else { "Explain the implemented fix. fixture-token\n" },
             )
             .unwrap();
         }
         if matches!(
             witness,
             "body"
+                | "preserved"
+                | "override-rollback"
+                | "review-claimed"
                 | "summary-first"
                 | "edit-failure"
                 | "references"
@@ -10197,6 +10568,28 @@ fi
             "manual" | "restore-fail" | "restore-html" | "snapshot-fail"
         ) {
             std::fs::write(outer.join("reference-mode"), witness).unwrap();
+        }
+        if witness == "override-rollback" {
+            dispatch.closing_override = Some(999);
+            std::fs::write(outer.join("reference-mode"), witness).unwrap();
+            let result = publish(
+                &work,
+                &dispatch,
+                &receipt,
+                &contract,
+                &report,
+                "fixture-token",
+                &mut agent_loop::RunCache::default(),
+            );
+            assert!(result.is_err());
+            let applied = Applied::load().unwrap();
+            assert!(applied.manual_repair.is_none(), "{}", applied.report());
+            let restored = regular_text(&outer.join("applied-body.md")).unwrap();
+            assert!(
+                restored.contains("Closes #634") && !restored.contains("Closes #999"),
+                "{restored}"
+            );
+            return;
         }
         if witness == "snapshot-fail" {
             let result = publish(
@@ -10524,7 +10917,10 @@ fi
         } else {
             assert_eq!(
                 applied.body == AppliedBody::Updated,
-                matches!(witness, "body" | "footer" | "manual" | "summary-first")
+                matches!(
+                    witness,
+                    "body" | "preserved" | "review-claimed" | "footer" | "manual" | "summary-first"
+                )
             );
         }
         if witness == "footer" {
@@ -10554,6 +10950,28 @@ fi
         }
         let sha = git(&work, &["rev-parse", "HEAD"]).unwrap();
         assert!(applied.report().contains(&sha[..12]));
+        if witness == "review-comment" {
+            assert!(applied.review);
+            let posted = regular_text(&outer.join("posted.md")).unwrap();
+            assert!(posted.contains("## Independent review") && posted.contains("Sol 6.1:"));
+        }
+        if witness == "preserved" {
+            let body = regular_text(&outer.join("applied-body.md")).unwrap();
+            assert!(
+                body.contains("Part of #634") && !body.contains("Closes #"),
+                "{body}"
+            );
+            assert!(
+                body.contains("## Independent review\nSol: no P0/P1 findings."),
+                "{body}"
+            );
+            assert!(body.contains("## Why\nExisting rationale."), "{body}");
+            assert!(applied.review);
+        }
+        if witness == "review-claimed" {
+            assert!(!applied.review);
+            assert!(applied.report().contains("review claimed, not published"));
+        }
         if witness == "body" {
             let applied = regular_text(&outer.join("applied-body.md"))
                 .expect("continuation did not apply proposed PR body");
@@ -10979,9 +11397,11 @@ fi
             exit_code: 0,
             expected_tip: admitted.clone(),
             pr_body: None,
+            review_text: None,
             worker: dispatch.worker.clone(),
             contract: Contract {
                 loop_summary: None,
+                review: false,
                 status: ContractStatus::Done,
                 summary: "first worker".into(),
                 tests: vec![],
@@ -11300,6 +11720,7 @@ fi
         }
         let contract = Contract {
             loop_summary: None,
+            review: false,
             status: ContractStatus::Done,
             summary: format!("Authorization: Bearer {token}"),
             tests: vec![format!("passed {token}")],
@@ -11338,6 +11759,7 @@ fi
         }
         let contract = Contract {
             loop_summary: None,
+            review: false,
             status: ContractStatus::Done,
             summary: "done".into(),
             tests: vec![],
