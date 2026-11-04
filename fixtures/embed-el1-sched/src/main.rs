@@ -126,6 +126,7 @@ mod delegated_root;
 mod host_read_gate;
 mod ipc;
 mod sample_buffer;
+mod thread_continuation;
 mod threads;
 mod tlb;
 use sample_buffer::measured_samples;
@@ -3773,6 +3774,9 @@ fn main() {
             args.get(3).is_some_and(|arg| arg == "delayed-reader"),
         ),
         "two-process" => two_process(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(20_000)),
+        "thread-continuation" => std::process::exit(thread_continuation::run(
+            args.get(2).and_then(|n| n.parse().ok()).unwrap_or(1),
+        )),
         "mm-occupancy" => mm_occupancy(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(200)),
         "first-touch" => match args.get(2) {
             None => first_touch(256),

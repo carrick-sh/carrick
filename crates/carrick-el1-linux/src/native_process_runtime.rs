@@ -939,16 +939,55 @@ fn arm_process_registry_moves_bounded_handles() {
     assert!(core::mem::size_of::<Task>() <= 64);
     assert!(core::mem::size_of::<super::process_owner::GuestRetiring<Native>>() <= 128);
 }
-/// The exact thread that parked a process-keyed continuation. Only that
-/// thread's entry may resume it; a sibling's syscall runs normally.
+/// A waiting task's logical incarnation, independent of its reusable scheduler
+/// record and the host's changing execution snapshot.
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct ContinuationTask {
+    task: carrick_core_abi::EntryTaskKey,
+    generation: carrick_core_abi::EntryThreadGeneration,
+}
+impl ContinuationTask {
+    fn of(binding: ExecutionBinding) -> Self {
+        Self {
+            task: binding.task,
+            generation: binding.thread_generation,
+        }
+    }
+    fn of_record<C: ProcessContext>(zone: &ZoneTables<C>, record: RecordRef) -> Option<Self> {
+        let identity = zone.live(record)?.identity();
+        Some(Self {
+            task: carrick_core_abi::EntryTaskKey::from_raw(identity.tid),
+            generation: carrick_core_abi::EntryThreadGeneration::from_raw(identity.serial),
+        })
+    }
+    fn of_execution(key: NativeExecutionKey) -> Self {
+        Self {
+            task: carrick_core_abi::EntryTaskKey::from_raw(key.task.id().raw() as u64),
+            generation: carrick_core_abi::EntryThreadGeneration::from_raw(key.thread_generation),
+        }
+    }
+}
+impl Ord for ContinuationTask {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        (self.task.raw(), self.generation.raw()).cmp(&(other.task.raw(), other.generation.raw()))
+    }
+}
+impl PartialOrd for ContinuationTask {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+/// Only the authenticated task and its retained control can resume its row.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ContinuationOwner {
+    task: ContinuationTask,
     control: usize,
     tid: u32,
 }
 impl ContinuationOwner {
-    fn of(control: &ThreadControlSlot, tid: u32) -> Self {
+    fn of(control: &ThreadControlSlot, tid: u32, binding: ExecutionBinding) -> Self {
         Self {
+            task: ContinuationTask::of(binding),
             control: core::ptr::from_ref(control).addr(),
             tid,
         }
@@ -1204,7 +1243,7 @@ struct MemberWaitState<'a> {
 // implementation serves process operations, terminal custody, and member waits.
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 enum PendingKey {
-    Operation(TaskKey),
+    Operation(TaskKey, ContinuationTask),
     Exit(TaskKey),
     Member(RecordRef),
 }
@@ -1226,28 +1265,70 @@ impl<'a> PendingTable<'a> {
     fn take_row(&mut self, key: &PendingKey) -> Option<PendingState<'a>> {
         self.rows.remove(key).map(|row| *row)
     }
-    fn get(&self, key: &TaskKey) -> Option<&PendingContinuation> {
-        match self.rows.get(&PendingKey::Operation(*key))?.as_ref() {
+    fn get(&self, key: &TaskKey, task: ContinuationTask) -> Option<&PendingContinuation> {
+        match self.rows.get(&PendingKey::Operation(*key, task))?.as_ref() {
             PendingState::Operation(pending) => Some(pending),
             _ => unreachable!(),
         }
     }
+    fn get_for_record<C: ProcessContext>(
+        &self,
+        key: &TaskKey,
+        zone: &ZoneTables<C>,
+        record: RecordRef,
+    ) -> Option<&PendingContinuation> {
+        self.get(key, ContinuationTask::of_record(zone, record)?)
+    }
+    #[cfg(test)]
     fn contains_key(&self, key: &TaskKey) -> bool {
-        self.get(key).is_some()
+        self.rows
+            .keys()
+            .any(|row| matches!(row, PendingKey::Operation(process, _) if process == key))
+    }
+    fn remove_process(&mut self, key: TaskKey) {
+        // Visit only this process's rows, starting before every valid task.
+        while let Some((PendingKey::Operation(process, task), _)) = self
+            .rows
+            .range(
+                PendingKey::Operation(
+                    key,
+                    ContinuationTask {
+                        task: carrick_core_abi::EntryTaskKey::from_raw(0),
+                        generation: carrick_core_abi::EntryThreadGeneration::from_raw(0),
+                    },
+                )..,
+            )
+            .next()
+        {
+            if *process != key {
+                break;
+            }
+            let task = *task;
+            self.remove(&key, task);
+        }
     }
     /// Whether `key`'s retained wait/IPC continuation belongs to this thread.
     fn parked_by(&self, key: &TaskKey, owner: ContinuationOwner) -> bool {
-        self.get(key).is_some_and(|pending| match pending {
-            PendingContinuation::Wait(wait) => wait.owner == owner,
-            PendingContinuation::Ipc(ipc) => ipc.owner == owner,
-            PendingContinuation::Vfork(vfork) => vfork.owner == owner,
-        })
+        self.get(key, owner.task)
+            .is_some_and(|pending| match pending {
+                PendingContinuation::Wait(wait) => wait.owner == owner,
+                PendingContinuation::Ipc(ipc) => ipc.owner == owner,
+                PendingContinuation::Vfork(vfork) => vfork.owner == owner,
+            })
     }
     fn insert(&mut self, key: TaskKey, pending: PendingContinuation) {
-        self.insert_row(PendingKey::Operation(key), PendingState::Operation(pending));
+        let task = match &pending {
+            PendingContinuation::Wait(wait) => wait.owner.task,
+            PendingContinuation::Ipc(ipc) => ipc.owner.task,
+            PendingContinuation::Vfork(vfork) => vfork.owner.task,
+        };
+        self.insert_row(
+            PendingKey::Operation(key, task),
+            PendingState::Operation(pending),
+        );
     }
-    fn remove(&mut self, key: &TaskKey) -> Option<PendingContinuation> {
-        match self.take_row(&PendingKey::Operation(*key))? {
+    fn remove(&mut self, key: &TaskKey, task: ContinuationTask) -> Option<PendingContinuation> {
+        match self.take_row(&PendingKey::Operation(*key, task))? {
             PendingState::Operation(pending) => Some(pending),
             _ => unreachable!(),
         }
@@ -1336,7 +1417,7 @@ impl<'a> PendingTable<'a> {
     fn len(&self) -> usize {
         self.rows
             .keys()
-            .filter(|key| matches!(key, PendingKey::Operation(_)))
+            .filter(|key| matches!(key, PendingKey::Operation(..)))
             .count()
     }
 }
@@ -1361,6 +1442,30 @@ impl<'a, M: Clone, C: ProcessContext> Graph<'a, M, C> {
         self.pending
             .member(record)
             .is_some_and(|state| state.wait.is_some())
+    }
+
+    /// Retiring an exact member cancels its wait without touching a sibling.
+    fn cancel_operation(&mut self, process: TaskKey, task: ContinuationTask) {
+        let Some(PendingContinuation::Ipc(PendingIpc {
+            payload:
+                PendingIpcPayload::Semop {
+                    semid,
+                    blocking_sem: Some((sem_num, is_zero)),
+                    ..
+                },
+            ..
+        })) = self.pending.remove(&process, task)
+        else {
+            return;
+        };
+        if let Ok(row) = self.owner.task(process) {
+            self.ipc.lock().semop_suspend_exit(
+                row.metadata().namespace_pid,
+                semid,
+                sem_num,
+                is_zero,
+            );
+        }
     }
 
     // Signal-mask restoration and external service share the same retained
@@ -1661,6 +1766,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 });
             }
         }
+        for (key, _, _) in &completed {
+            graph.cancel_operation(process, ContinuationTask::of_execution(*key));
+        }
         drop(graph);
         for (key, record, _) in completed {
             state.members.remove(&key);
@@ -1954,6 +2062,17 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 }
             }
         }
+        // A retained operation still owns native execution after its host
+        // record is replaced. Restore that custody before the runtime unhomes
+        // the record, so a live child's exec can place the parent's wake.
+        if control.visible_tid().is_some_and(|tid| {
+            graph
+                .pending
+                .parked_by(&process, ContinuationOwner::of(control, tid, binding))
+        }) && !source.zone.mark_native_owned(record)
+        {
+            return Err(NativeProcessError::Stale);
+        }
         state
             .by_process
             .get_mut(&(key.carrier, process))
@@ -1980,6 +2099,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         resources.members[member_index].record = reference;
         resources.members[member_index].thread = key.task;
         resources.members[member_index].expected_host = host_identity;
+        if ContinuationTask::of_execution(old_key) != ContinuationTask::of_execution(key) {
+            graph.cancel_operation(process, ContinuationTask::of_execution(old_key));
+        }
         state.members.remove(&old_key);
         state
             .records
@@ -2305,7 +2427,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         }
         let interrupt = signals.has_deliverable(member.record, blocked);
         let ipc_channel = if interrupt {
-            match graph.pending.get(&member.process) {
+            match graph
+                .pending
+                .get_for_record(&member.process, zone, member.record)
+            {
                 Some(PendingContinuation::Ipc(pending)) => Some(pending.channel.clone()),
                 _ => None,
             }
@@ -2566,6 +2691,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 .owner
                 .task_mut(process)
                 .map_err(|_| NativeProcessError::Stale)?;
+            let mut replaced_record = None;
             let already_owned = if let Some(issued) = host_issued {
                 let already_owned = issued.authorize_group(source, row, address, page, control)?;
                 if !page.release_adopted_host_birth(host_identity) {
@@ -2615,6 +2741,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 }
                 member.expected_host = host_identity;
                 if replaced {
+                    replaced_record = state
+                        .records
+                        .get(&Self::record_key(source.zone, old_record))
+                        .copied();
                     let resources = row.native_mut().resources_mut();
                     resources.interrupted_child_waits.remove(&old_record);
                     resources.map_stash.remove(&old_record);
@@ -2640,6 +2770,11 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 });
             }
             row.native().resources().sync_non_interrupting_signals();
+            if let Some(old_key) = replaced_record
+                && ContinuationTask::of_execution(old_key) != ContinuationTask::of_execution(key)
+            {
+                graph.cancel_operation(process, ContinuationTask::of_execution(old_key));
+            }
             graph.pending.has_exit(&process)
         };
         state.members.insert(
@@ -3623,7 +3758,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .map_err(|_| NativeProcessError::Stale)?;
         let owner_continuation = graph
             .pending
-            .parked_by(&key, ContinuationOwner::of(control, calling_tid))
+            .parked_by(&key, ContinuationOwner::of(control, calling_tid, binding))
             || graph
                 .pending
                 .exit(&key)
@@ -3789,7 +3924,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .map_err(|_| NativeProcessError::Stale)?;
         let owner_continuation = graph.pending.parked_by(
             &member.process,
-            ContinuationOwner::of(member_control, calling_tid),
+            ContinuationOwner::of(member_control, calling_tid, binding),
         ) || graph
             .pending
             .exit(&member.process)
@@ -4100,7 +4235,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         self.calling_tid
     }
     fn continuation_owner(&self) -> ContinuationOwner {
-        ContinuationOwner::of(self.control, self.calling_tid)
+        ContinuationOwner::of(self.control, self.calling_tid, self.binding)
     }
     /// Whether this entering thread parked the process's retained operation.
     pub(super) fn owns_parked_operation(&self) -> bool {
@@ -4208,7 +4343,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         );
         let interrupt = signals.has_deliverable(record, blocked);
         let ipc_channel = if interrupt {
-            match graph.pending.get(&target_key) {
+            match graph
+                .pending
+                .get_for_record(&target_key, self.source.zone, record)
+            {
                 Some(PendingContinuation::Ipc(pending)) => Some(pending.channel.clone()),
                 _ => None,
             }
@@ -4570,13 +4708,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     pid,
                 }),
             );
-            // The child exists: its clone must return its pid. A sibling
-            // thread's parked wait owns this process's one continuation row,
-            // so this thread cannot also park; it returns unsuspended.
-            let parked = match parked {
-                Err(NativeProcessError::Busy) => return Ok(returned(i64::from(pid))),
-                parked => parked?,
-            };
+            let parked = parked?;
             match parked {
                 ContinuationPark::Rescan => continue,
                 // Linux defers a non-fatal signal until the child releases
@@ -4918,7 +5050,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             {
                 return None;
             }
-            graph.pending.remove(&self.key)?
+            graph
+                .pending
+                .remove(&self.key, ContinuationTask::of(self.binding))?
         };
         match pending {
             PendingContinuation::Wait(pending) => {
@@ -4980,7 +5114,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
         {
             let graph = self.runtime.graph.lock();
-            if graph.pending.contains_key(&self.key) {
+            if graph
+                .pending
+                .get(&self.key, ContinuationTask::of(self.binding))
+                .is_some()
+            {
                 return Err(NativeProcessError::Busy);
             }
         }
@@ -5015,6 +5153,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             );
             return Ok(ContinuationPark::Interrupted);
         }
+        let committed = matches!(continuation, PendingContinuation::Vfork(_));
         let sequence = zone.next_seq(record);
         zone.enqueue(&guard, record, sequence, channel.mm, address, u32::MAX, 0)
             .map_err(|_| NativeProcessError::Exhausted)?;
@@ -5029,13 +5168,25 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .lock()
             .pending
             .insert(self.key, continuation);
-        let receipt = carrick_core::entry::publish_handoff_park(
-            start,
-            &guard,
-            carrick_el1_abi::EntryRecordGeneration(sequence),
-        );
+        let receipt = if committed {
+            carrick_core::entry::publish_owned_park(
+                start,
+                &guard,
+                carrick_el1_abi::EntryRecordGeneration(sequence),
+            )
+        } else {
+            carrick_core::entry::publish_handoff_park(
+                start,
+                &guard,
+                carrick_el1_abi::EntryRecordGeneration(sequence),
+            )
+        };
         if receipt.is_none() {
-            self.runtime.graph.lock().pending.remove(&self.key);
+            self.runtime
+                .graph
+                .lock()
+                .pending
+                .remove(&self.key, ContinuationTask::of(self.binding));
             // SAFETY: no handoff was published; this entry retains the record.
             unsafe {
                 zone.record(record).consume_owner_continuation();
@@ -5196,7 +5347,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         {
             return Err(carrick_syscall_abi::LINUX_EINTR.guest_retval());
         }
-        if graph.pending.contains_key(&self.key) {
+        if graph
+            .pending
+            .get(&self.key, ContinuationTask::of(self.binding))
+            .is_some()
+        {
             return Err(NativeProcessError::Busy.errno());
         }
         let sequence = zone.next_seq(record);
@@ -5230,7 +5385,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             carrick_el1_abi::EntryRecordGeneration(sequence),
         );
         if receipt.is_none() {
-            self.runtime.graph.lock().pending.remove(&self.key);
+            self.runtime
+                .graph
+                .lock()
+                .pending
+                .remove(&self.key, ContinuationTask::of(self.binding));
             zone.cancel_timer_admission(self.record);
             // SAFETY: no handoff was published; this entry retains the record.
             unsafe {
@@ -6414,7 +6573,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .task(self.key)
             .ok()
             .map(|t| t.metadata().namespace_pid);
-        let _ = self.runtime.graph.lock().pending.remove(&self.key);
+        self.runtime.graph.lock().pending.remove_process(self.key);
         if let Some(pid) = pid {
             let ipc = self.runtime.graph.lock().ipc.clone();
             let channels = ipc.lock().exit_process(pid);
@@ -8002,6 +8161,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .remove(record);
             }
         }
+        if !retired.is_empty() {
+            graph.cancel_operation(self.key, ContinuationTask::of(self.binding));
+        }
         drop(graph);
         if let Some(registry) = *self.runtime.registry.lock() {
             for record in retired {
@@ -9390,10 +9552,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     },
                 );
             }
-            if interrupts.len() != before
-                && let Some(PendingContinuation::Ipc(pending)) = graph.pending.get(&target_key)
-            {
-                wake_channels.push(pending.channel.clone());
+            for &record in &interrupts[before..] {
+                if let Some(PendingContinuation::Ipc(pending)) =
+                    graph
+                        .pending
+                        .get_for_record(&target_key, self.source.zone, record)
+                {
+                    wake_channels.push(pending.channel.clone());
+                }
             }
             if let Some(channel) = graph
                 .owner
@@ -11343,6 +11509,556 @@ mod tests {
                 ..
             }
         ));
+    }
+    #[test]
+    fn sibling_wait4_and_vfork_retain_independent_continuations() {
+        sibling_continuation_contract(false);
+    }
+    #[test]
+    fn sibling_vfork_host_request_retains_committed_continuation() {
+        sibling_continuation_contract(true);
+    }
+    fn sibling_continuation_contract(host_request: bool) {
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let registry = Box::leak(Box::new(NativeProcessRegistry::<
+            AddressContext<RootGpa>,
+            ParkedContextWords,
+        >::new()));
+        let page = ThreadLifecyclePage::new();
+        let leader_control = ThreadControlSlot::new();
+        let thread_control = ThreadControlSlot::new();
+        let vfork_page = ThreadLifecyclePage::new();
+        let vfork_controls = core::array::from_fn::<_, 9, _>(|_| ThreadControlSlot::new());
+        let child_page = ThreadLifecyclePage::new();
+        let child_controls = core::array::from_fn::<_, 9, _>(|_| ThreadControlSlot::new());
+        let leader = CurrentTask::new();
+        leader.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            5,
+        );
+        leader.mm.key.store(1, Ordering::Release);
+        leader.mm.thread_generation.store(101, Ordering::Release);
+        leader.publish_visible_pid(41);
+        leader.publish_lifecycle(&page as *const _ as u64, &leader_control as *const _ as u64);
+        publish_test_birth(&leader_control, &leader);
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::MIN),
+            generation: ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let slot = carrick_sched_core::SlotId::new(0);
+        let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 1).unwrap();
+        zone.current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: 1,
+                file_table: 5,
+                generation: 11,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                affinity: 1,
+                lifecycle_page: &page as *const _ as u64,
+                control_slot: &leader_control as *const _ as u64,
+            },
+        )
+        .unwrap();
+        let source = BornInZoneSource { zone: &zone, slot };
+        let thread = CurrentTask::new();
+        let runtime = Arc::new(
+            NativeProcessRuntime::admit_fixture_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &leader,
+                &page,
+                &leader_control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap(),
+        );
+        registry
+            .register_root(runtime.clone(), source, &leader, address)
+            .unwrap();
+
+        let mut service = Physical {
+            zone: &zone,
+            page: &child_page,
+            controls: &child_controls,
+            copies: Vec::new(),
+            tid_words: BTreeMap::new(),
+            tid_wakes: 0,
+            tid_writes: Vec::new(),
+            refuse_copy: false,
+            child_copy_error: None,
+            prepare_copy_error: None,
+            child_copy_error_at: None,
+            on_copy_complete: None,
+            native_ipc: None,
+            on_signal_clock: None,
+        };
+        let root = runtime.graph.lock().root_key;
+        let mut leader_entry = runtime
+            .enter(source, &leader, words(address), &mut service)
+            .unwrap();
+        let LifecycleOutcome::Returned { result, .. } =
+            leader_entry.fork(ProcessForkChildTid::NONE)
+        else {
+            panic!("other child");
+        };
+        let other_pid = result.raw() as u32;
+        let other = runtime.namespace_child_key(root, other_pid).unwrap();
+        assert!(matches!(
+            leader_entry.wait4(
+                ProcessWaitPid::from_syscall_argument(u64::from(other_pid)),
+                UserVa::new(0x8000),
+                LinuxWaitOptions::empty(),
+                UserVa::new(0)
+            ),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert!(leader_entry.take_handoff_receipt().is_some());
+        drop(leader_entry);
+        let entry = page
+            .stock(
+                0,
+                carrick_el1_abi::EntryIdentity {
+                    tid: 400,
+                    visible_tid: 400,
+                    thread_serial: 500,
+                    birth: carrick_core_abi::entry::BirthSerial::of_task(
+                        carrick_sched_core::process::TaskSerial::from_raw_u64(12).unwrap(),
+                    ),
+                    uid_credit: 0,
+                },
+            )
+            .unwrap();
+        page.bind_control_address(entry, &thread_control as *const _ as u64)
+            .unwrap();
+        thread_control
+            .reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, entry)
+            .unwrap();
+        assert!(thread_control.publish_visible_tid(400));
+        let claim = page.claim(entry).unwrap();
+        page.record_born(
+            claim,
+            carrick_el1_abi::BornRecord {
+                caller_task: 41,
+                caller_serial: 101,
+                clone_flags: 0x0001_0000,
+                clear_child_tid: 0,
+                blocked: carrick_el1_abi::BlockedMask(0),
+            },
+        )
+        .unwrap();
+        page.thread_born().unwrap();
+        page.publish(entry).unwrap();
+        let record = zone
+            .alloc_record(ThreadIdentity {
+                tid: 400,
+                serial: 500,
+                mm: 1,
+                file_table: 5,
+                generation: 13,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                affinity: 1,
+                lifecycle_page: &page as *const _ as u64,
+                control_slot: &thread_control as *const _ as u64,
+            })
+            .unwrap();
+        thread_control.bind_zone_record(zone.record_ref(record));
+        assert!(zone.mark_native_owned(record));
+        // The other child cannot finish until B returns from vfork (the pipe
+        // writer in the guest schedule). Keep it parked while B runs.
+        activate(&runtime, source, &leader, other);
+        let other_record = runtime
+            .graph
+            .lock()
+            .owner
+            .task(other)
+            .unwrap()
+            .native()
+            .resources()
+            .record;
+        let other_channel = runtime
+            .graph
+            .lock()
+            .owner
+            .task(other)
+            .unwrap()
+            .native()
+            .resources()
+            .channel
+            .clone()
+            .unwrap();
+        let address_of_wait = WaitChannel::address(&other_channel);
+        let guard = zone.short_lock(
+            ZoneTables::<ParkedContextWords>::bucket_of_with_context(
+                other_channel.mm,
+                address_of_wait,
+            ),
+            &carrick_sched_core::ShortLockSpin,
+        );
+        let sequence = zone.next_seq(other_record.id);
+        zone.enqueue(
+            &guard,
+            other_record.id,
+            sequence,
+            other_channel.mm,
+            address_of_wait,
+            u32::MAX,
+            0,
+        )
+        .unwrap();
+        zone.publish_park(other_record.id, sequence);
+        drop(guard);
+        zone.clear_current(slot);
+        zone.requeue_preempted(slot, record);
+        assert_eq!(zone.switch_in_full(slot).unwrap().record, record);
+        zone.install_space(slot, 1).unwrap();
+        thread.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(400),
+            carrick_el1_abi::SnapshotGeneration::from_raw(13),
+            5,
+        );
+        thread.mm.key.store(1, Ordering::Release);
+        thread.mm.thread_generation.store(500, Ordering::Release);
+        thread.publish_visible_pid(41);
+        thread.publish_lifecycle(&page as *const _ as u64, &thread_control as *const _ as u64);
+        publish_test_birth(&thread_control, &thread);
+        assert!(matches!(
+            registry.for_entry(source, &thread, address),
+            Err(NativeProcessError::Stale)
+        ));
+        assert!(matches!(
+            registry.register_thread(source, &thread, address, &page, &leader_control),
+            Err(NativeProcessError::Stale)
+        ));
+        assert!(
+            registry
+                .state
+                .lock()
+                .groups
+                .contains_key(&NativeProcessRegistry::<
+                    AddressContext<RootGpa>,
+                    ParkedContextWords,
+                >::group_key(&zone, address, &page, 41)),
+            "root group remains admitted"
+        );
+        assert_eq!(thread_control.zone_record(), Some(zone.record_ref(record)));
+        assert!(
+            carrick_core::entry::prepare_handoff(
+                super::super::common_entry::execution_binding(&thread),
+                source,
+                record
+            )
+            .is_some()
+        );
+        registry
+            .register_thread(source, &thread, address, &page, &thread_control)
+            .unwrap();
+        service.page = &vfork_page;
+        service.controls = &vfork_controls;
+        let mut process = runtime
+            .enter_registered(
+                registry,
+                source,
+                &thread,
+                address,
+                &words(address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(
+            process.resume_pending_wait().is_none(),
+            "B cannot consume A's wait"
+        );
+        let outcome = if host_request {
+            let pid = process
+                .fork_owned(ProcessForkChildTid::vfork(UserVa::new(0x7ffe_f000)))
+                .unwrap();
+            assert!(matches!(
+                zone.claim_for_host(
+                    process.record,
+                    None,
+                    carrick_sched_core::Handback::Control,
+                    &carrick_sched_core::ShortLockSpin
+                ),
+                carrick_sched_core::HostClaim::El1Held { .. }
+            ));
+            process.vfork_suspend(pid).unwrap()
+        } else {
+            process.fork(ProcessForkChildTid::vfork(UserVa::new(0x7ffe_f000)))
+        };
+        assert!(
+            matches!(outcome, LifecycleOutcome::Transferred { .. }),
+            "B must suspend until its own child releases it"
+        );
+        assert_eq!(process.take_run_failure(), None);
+        assert!(process.take_handoff_receipt().is_some());
+        drop(process);
+        assert_eq!(runtime.graph.lock().pending.len(), 2);
+        let record = if host_request {
+            let queued = zone.take_service_head(slot).unwrap();
+            assert_eq!(queued, zone.record_ref(record));
+            let mut identity = zone.record(record).identity();
+            assert!(matches!(
+                zone.record(record).resume_disposition(),
+                carrick_sched_core::object_wait::ResumeDisposition::OwnerContinuation(_)
+            ));
+            zone.free_record(record);
+            identity.generation += 1; // a new snapshot, the same task birth
+            let home = zone.current_or_new(slot, identity).unwrap();
+            thread.set(
+                carrick_el1_abi::El1TaskId::from_linux_tid(400),
+                carrick_el1_abi::SnapshotGeneration::from_raw(identity.generation),
+                identity.file_table,
+            );
+            thread.mm.key.store(1, Ordering::Release);
+            thread
+                .mm
+                .thread_generation
+                .store(identity.serial, Ordering::Release);
+            thread.publish_visible_pid(41);
+            thread.publish_lifecycle(identity.lifecycle_page, identity.control_slot);
+            registry
+                .rehome_entry(source, &thread, address, &page, &thread_control)
+                .unwrap()
+                .unwrap();
+            let mut resumed = runtime
+                .enter_registered(
+                    registry,
+                    source,
+                    &thread,
+                    address,
+                    &words(address),
+                    &mut service,
+                )
+                .unwrap();
+            assert!(
+                matches!(
+                    resumed.resume_pending_wait(),
+                    Some(LifecycleOutcome::Transferred { .. })
+                ),
+                "child still owns the vfork release"
+            );
+            assert!(resumed.take_handoff_receipt().is_some());
+            drop(resumed);
+            // Match the runtime's settlement: no home executor or host task
+            // remains attached while the native child executes on this slot.
+            zone.unhome(slot, home, 1);
+            zone.publish_slot(slot, 0, Some(0), 1);
+            home
+        } else {
+            record
+        };
+        let child = *runtime.graph.lock().vfork_parents.keys().next().unwrap();
+        let child_pid = runtime
+            .graph
+            .lock()
+            .owner
+            .task(child)
+            .unwrap()
+            .metadata()
+            .namespace_pid;
+        activate(&runtime, source, &thread, child);
+        let child_address = runtime
+            .graph
+            .lock()
+            .owner
+            .task(child)
+            .unwrap()
+            .native()
+            .resources()
+            .address;
+        let mut child_entry = runtime
+            .enter(source, &thread, words(child_address), &mut service)
+            .unwrap();
+        if host_request {
+            // Exec admission releases the parent while the child remains live.
+            child_entry
+                .release_vfork_parent()
+                .expect("a live exec must wake the rehomed parent on an idle native executor");
+            assert!(runtime.graph.lock().owner.task(child).is_ok());
+        }
+        assert!(matches!(
+            child_entry.exit_group(23),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert_eq!(child_entry.take_run_failure(), None);
+        assert!(child_entry.take_handoff_receipt().is_some());
+        drop(child_entry);
+        // The process channel also wakes A: it must rescan its exact child
+        // and park again, independently of B's vfork result.
+        let root_record = runtime
+            .graph
+            .lock()
+            .owner
+            .task(root)
+            .unwrap()
+            .native()
+            .resources()
+            .record;
+        let next = zone.switch_in_full(slot).map(|next| next.record);
+        let mut selected = next;
+        if selected == Some(root_record.id) {
+            zone.install_space(slot, 1).unwrap();
+            let identity = zone.record(root_record.id).identity();
+            leader.set(
+                carrick_el1_abi::El1TaskId::from_linux_tid(41),
+                carrick_el1_abi::SnapshotGeneration::from_raw(identity.generation),
+                identity.file_table,
+            );
+            leader.mm.key.store(1, Ordering::Release);
+            leader
+                .mm
+                .thread_generation
+                .store(identity.serial, Ordering::Release);
+            leader.publish_visible_pid(41);
+            leader.publish_lifecycle(identity.lifecycle_page, identity.control_slot);
+            let mut a = runtime
+                .enter_registered(
+                    registry,
+                    source,
+                    &leader,
+                    address,
+                    &words(address),
+                    &mut service,
+                )
+                .unwrap();
+            assert!(matches!(
+                a.resume_pending_wait(),
+                Some(LifecycleOutcome::Transferred { .. })
+            ));
+            assert!(a.take_handoff_receipt().is_some());
+            drop(a);
+            selected = zone.switch_in_full(slot).map(|next| next.record);
+        }
+        assert_eq!(selected, Some(record));
+        zone.install_space(slot, 1).unwrap();
+        thread.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(400),
+            carrick_el1_abi::SnapshotGeneration::from_raw(
+                zone.record(record).identity().generation,
+            ),
+            5,
+        );
+        thread.mm.key.store(1, Ordering::Release);
+        thread.mm.thread_generation.store(500, Ordering::Release);
+        thread.publish_visible_pid(41);
+        thread.publish_lifecycle(&page as *const _ as u64, &thread_control as *const _ as u64);
+        let mut process = runtime
+            .enter_registered(
+                registry,
+                source,
+                &thread,
+                address,
+                &words(address),
+                &mut service,
+            )
+            .unwrap();
+        let Some(LifecycleOutcome::Returned { result, .. }) = process.resume_pending_wait() else {
+            panic!("B resumes");
+        };
+        assert_eq!(result.raw(), i64::from(child_pid));
+        assert_eq!(
+            runtime.graph.lock().pending.len(),
+            1,
+            "A still owns its wait"
+        );
+        // B has returned: release the dependency only now, using its real
+        // enrolled scheduler channel rather than forging a runnable claim.
+        process.publish_channel(&other_channel).unwrap();
+        // Exercise IPC enrollment through the same production entry, then the
+        // exact-member retirement sink, including semaphore waiter accounting.
+        let (creds, _pid, ipc) = process.ipc_env().unwrap();
+        let semid = process.semget(0, 1, 0o600).unwrap() as i32;
+        let operation = [LinuxSembuf {
+            sem_num: 0,
+            sem_op: -1,
+            sem_flg: 0,
+        }];
+        assert!(matches!(
+            process.semop(semid, &operation, None),
+            Ok(IpcOutcome::Suspended)
+        ));
+        assert!(process.take_handoff_receipt().is_some());
+        let waiting_task = ContinuationTask::of(process.binding);
+        let owner = process.continuation_owner();
+
+        assert_eq!(ipc.lock().semctl_getncnt(&creds, semid, 0).unwrap(), 1);
+        let stale = ContinuationTask {
+            generation: carrick_core_abi::EntryThreadGeneration::from_raw(
+                waiting_task.generation.raw() + 1,
+            ),
+            ..waiting_task
+        };
+        {
+            let mut graph = runtime.graph.lock();
+            assert!(!graph.pending.parked_by(
+                &root,
+                ContinuationOwner {
+                    task: stale,
+                    ..owner
+                }
+            ));
+            graph.cancel_operation(root, stale);
+            assert!(graph.pending.parked_by(&root, owner));
+        }
+        process.retire_thread_identity(400);
+        process.retire_thread_identity(400);
+        assert_eq!(
+            runtime.graph.lock().pending.len(),
+            1,
+            "A survives B's retirement"
+        );
+        assert_eq!(ipc.lock().semctl_getncnt(&creds, semid, 0).unwrap(), 0);
+        ipc.lock().semctl_rmid(&creds, semid).unwrap();
+        drop(process);
+        // B has returned and can now release the dependency of `other`.
+        zone.clear_current(slot);
+        activate(&runtime, source, &leader, other);
+        let other_address = runtime
+            .graph
+            .lock()
+            .owner
+            .task(other)
+            .unwrap()
+            .native()
+            .resources()
+            .address;
+        let mut other_entry = runtime
+            .enter(source, &leader, words(other_address), &mut service)
+            .unwrap();
+        assert!(matches!(
+            other_entry.exit_group(7),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert_eq!(other_entry.take_run_failure(), None);
+        assert!(other_entry.take_handoff_receipt().is_some());
+        drop(other_entry);
+        activate(&runtime, source, &leader, root);
+        let mut leader_entry = runtime
+            .enter(source, &leader, words(address), &mut service)
+            .unwrap();
+        let Some(LifecycleOutcome::Returned { result, .. }) = leader_entry.resume_pending_wait()
+        else {
+            panic!("A completes wait4");
+        };
+        assert_eq!(result.raw(), i64::from(other_pid));
+        assert_eq!(runtime.graph.lock().pending.len(), 0);
     }
     #[test]
     fn actual_shared_root_admission_accepts_arm_asid_and_rejects_stale_binding() {

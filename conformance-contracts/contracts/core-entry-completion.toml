@@ -1,6 +1,9 @@
 # #1394: additional ABI bookkeeping witness only; existing semantic and
 # work-budget bindings remain authoritative. Census publication reads counters
 # after executor join and does not alter this contract's guest operation.
+# #1401: native operation custody now includes the waiting task ID and
+# thread birth generation. Retain this family's existing controls; focused native regular
+# and serial_host suites compare their results with admitted main.
 # #1044 diagnostic follow-up: preserve native-service admission/dispatch
 # error codes in the existing fatal record.
 # No service refusal or retry policy changes; signed attribution is pending.

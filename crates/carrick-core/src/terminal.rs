@@ -339,7 +339,7 @@ pub fn park_process_exit<C: carrick_core_abi::EntryContext>(
     guard: &carrick_sched_core::BucketGuard<'_, C>,
     sequence: carrick_core_abi::EntryRecordGeneration,
 ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
-    crate::entry::publish_terminal_park(start, guard, sequence)
+    crate::entry::publish_owned_park(start, guard, sequence)
 }
 
 /// Raw task membership supplied by the graph that owns its registry. Core

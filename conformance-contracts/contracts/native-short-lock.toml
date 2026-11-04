@@ -1,3 +1,6 @@
+# #1401: native operation custody now includes the waiting task ID and
+# thread birth generation. Retain this family's existing controls; focused native regular
+# and serial_host suites compare their results with admitted main.
 # #1028: type physical custody diagnostic reasons; no change to this
 # contract's semantics or work budgets. The host dispatch test
 # physical_custody_reasons_preserve_fatal_codes_and_debug_text checks

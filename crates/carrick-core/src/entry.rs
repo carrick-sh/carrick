@@ -294,17 +294,17 @@ pub fn publish_handoff_park<C: EntryContext>(
 
 enum ParkCustody {
     Interruptible,
-    Terminal,
+    Owned,
 }
 
-/// Terminal custody cannot return an interrupted park to its syscall caller.
-/// A pending host request instead receives the retained owner continuation.
-pub(crate) fn publish_terminal_park<C: EntryContext>(
+/// An already committed operation cannot return an interrupted park as an
+/// errno. A pending host request receives its retained owner continuation.
+pub fn publish_owned_park<C: EntryContext>(
     start: HandoffStart<'_, C>,
     guard: &carrick_sched_core::BucketGuard<'_, C>,
     sequence: EntryRecordGeneration,
 ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
-    publish_handoff_park_with(start, guard, sequence, ParkCustody::Terminal)
+    publish_handoff_park_with(start, guard, sequence, ParkCustody::Owned)
 }
 
 fn publish_handoff_park_with<C: EntryContext>(
@@ -323,9 +323,9 @@ fn publish_handoff_park_with<C: EntryContext>(
     let record = start.record.record;
     if !zone.publish_guest_park(guard, start.source.slot, record, sequence.0) {
         // Failed publication undid enrollment and retained the running owner.
-        // Only this exact host-request transition licenses a terminal handback;
+        // Only this exact host-request transition licenses a retained-owner handback;
         // no missing, stale, foreign-slot or cancelled record is accepted.
-        if !matches!(custody, ParkCustody::Terminal)
+        if !matches!(custody, ParkCustody::Owned)
             || zone.record(record).is_cancelled()
             || !matches!(
                 zone.record(record).resume_disposition(),

@@ -384,6 +384,11 @@ fn run_fixture_in_image(
         .pull_policy(PullPolicy::Missing)
         .command(command)
         .vfs_mount("/opt/carrick", Box::new(el1_sched_vfs()));
+    if args.first() == Some(&"thread-continuation") {
+        // Keep the default 1-bound + 2-spare pool: 32 waiters must release
+        // execution capacity so B and its vfork child can still run.
+        builder = builder.scheduler(std::sync::Arc::new(carrick_hal::GuestCpuPolicy::new(1)));
+    }
     let mut captured = None;
     if args.first() == Some(&"tlb-stale-threads")
         && (args.get(3) != Some(&"omit-first-write-ack")
@@ -5124,4 +5129,27 @@ fn el1_task_load_costs_no_host_round_trip() {
         added, 0,
         "{added_loads} added task loads cost {added} TLB-maintenance-class host round trips; a task load needs none"
     );
+}
+
+/// #1401: a sibling wait4 must not own the vfork caller's suspension row.
+/// The 32-waiter row also exceeds the default bounded executor pool.
+#[test]
+#[ignore = "boots HVF; run through just test-embed el1_sched_thread_continuation --ignored"]
+fn el1_sched_thread_continuation_wait4_vfork_pipe() {
+    let _guard = common::guest_lock();
+    for waiters in [1, 32] {
+        let carrier = carrier_or_fail();
+        let measured = run_fixture(
+            &carrier,
+            &["thread-continuation", &waiters.to_string()],
+            Duration::from_secs(30),
+        );
+        assert_eq!(measured.result.exit_code, 0);
+        assert!(
+            measured
+                .result
+                .stdout_utf8()
+                .contains(&format!("thread-continuation ok waiters={waiters}"))
+        );
+    }
 }
