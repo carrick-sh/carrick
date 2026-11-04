@@ -71,6 +71,9 @@ fault. EM takes precedence over TS and invalid memory; TS alone raises
 #NM. x87 retains its separate EM behavior. CLFLUSH uses the standard host
 intrinsic after the existing capability and guest-translation checks.
 
-The base remains main. Whichever of this slice and #1469 lands second must
-integrate the legacy SSE admission in `avx.rs` and shared FXSAVE/MMX leaf
-and CLFLUSH dispatch in `context.rs`.
+The rebase onto admitted main integrates baseline SSE with the v3 feature
+checks in `avx.rs`, preserving the shared FXSAVE/MMX leaf and CLFLUSH
+dispatch in `context.rs`. Baseline leaves check host SSE/SSE2 explicitly;
+the v3 host-feature match otherwise rejected them before execution. The
+control checks retain v3 feature gating and exempt integer MOVNTI from
+vector-state controls. Guest CPUID defaults remain unchanged.
