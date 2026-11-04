@@ -397,3 +397,56 @@ hypervisor lease, deployment or remote host operation was used.
 
 Whole-workspace domain and kernel tests remain with CI. No result here
 establishes current-main integration, live registration or rollout acceptance.
+
+
+## Authorized rebase round
+
+The director authorized rebasing admitted head `182696da10` onto admitted
+main `fc5bf7c2c7`. The rebase retains all four commits and their authors:
+
+| Original | Rebased | Disposition |
+| --- | --- | --- |
+| `aa4b63a90` | `f75ede8ad` | Ported: resolve the scaler-test conflict by retaining both sides as separate complete tests. |
+| `1ccb0f74c` | `69ee4a951` | Kept. |
+| `0d7d2bd39` | `51341e4a3` | Kept, including its historical review record above. |
+| `182696da10` | `69e04081e` | Kept: standing-only capability qualification and registration witnesses. |
+
+No commit or fix was dropped. Main's controller safety work is inherited
+from the admitted base, including its additional agent-template qualification
+test. The three named conflict witnesses have separate test attributes and
+complete bodies. This section supersedes the earlier round's instruction
+that integration remained unauthorized.
+
+The workflow/action files received no edits after rebase. The durable patch
+was regenerated from admitted main to the rebased head; its changes refresh context
+with five surrounding lines. `git apply --check` succeeds in
+the detached admitted-main checkout. `git apply --cached --check` also
+succeeds in an isolated rebased-head index with just the three protected
+paths restored to admitted main. Applying it directly to the rebased working
+tree would apply the existing workflow changes twice. The patch remains a
+director publication artifact; no workflow was deployed or published here.
+
+
+Rebase verification (logs in `target/1366-evidence/`):
+
+- Scaler library regular: 123 passed. Library serial partition: 28 passed,
+  two ignored. The latter includes all library `serial_host` tests.
+- Integration regular (`ci_cache`, `ci_changes`, `ci_receipt`, `ci_scaler`):
+  14, 17, 62 and 53 passed. Serial: 0, 0, 11 and 4 passed.
+- Registration qualification: both witnesses passed. Reintroducing the old
+  cross-lane capability requirement made the old-agent registration witness
+  fail (0 passed, 1 failed); restoring the fix makes both witnesses pass.
+- Actual pre-push clippy hook, formatting, contract-change against admitted
+  main and source authority-debt passed (1267 source counters). The
+  source-only check makes no range-delta claim.
+- On an unmodified detached admitted-main checkout, the exact
+  `agent_auth_provisions_all_worker_credentials_and_only_agy_for_loop` hook
+  fixture failed at `ci_scaler_hook.rs:326`, its `agent-runner cleanup`
+  assertion: 0 passed, 1 failed. This reproduces the earlier cleanup failure
+  on the new base; it is not a passing gate or a rebase regression.
+- No macOS-cfg, HVF, guest, KVM/HAL or host-linux implementation changed;
+  cross-check-macos and check-linux were not applicable. Docker is absent
+  and HVF unavailable. `/dev/kvm` exists, but no live KVM suite was run on
+  this worker. Whole-workspace domain/kernel gates remain with CI; the
+  signed gate and live registration/template/merge-group pilot remain with
+  the director. No deployment, Contabo operation or enqueue was performed.

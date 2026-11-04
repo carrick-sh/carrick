@@ -97,7 +97,9 @@ diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
 index 4d4b72977..7abfff649 100644
 --- a/.github/workflows/ci.yml
 +++ b/.github/workflows/ci.yml
-@@ -261,6 +261,7 @@ jobs:
+@@ -259,10 +259,11 @@ jobs:
+     permissions:
+       contents: read
        pull-requests: read
      outputs:
        heavy: ${{ steps.filter.outputs.heavy }}
@@ -105,7 +107,11 @@ index 4d4b72977..7abfff649 100644
        macos: ${{ steps.filter.outputs.macos }}
        el1_native: ${{ steps.filter.outputs.el1_native }}
        workflows: ${{ steps.filter.outputs.workflows }}
-@@ -2105,6 +2106,153 @@ jobs:
+       lower_layer: ${{ steps.filter.outputs.lower_layer }}
+       child_pr: ${{ steps.filter.outputs.child_pr }}
+@@ -2103,17 +2104,166 @@ jobs:
+         run: just cross-check-macos
+       - name: Compiler cache statistics
          if: ${{ always() }}
          run: just ci-cache-finish
 
@@ -259,7 +265,7 @@ index 4d4b72977..7abfff649 100644
    # Single ruleset check. Only a successful docs-only PR filter permits skips;
    # a failed/cancelled filter or an unexpectedly skipped dependency is red.
    ci-ok:
-@@ -2112,6 +2260,8 @@ jobs:
+     name: ci-ok
      if: always()
      needs:
        - changes
@@ -268,7 +274,11 @@ index 4d4b72977..7abfff649 100644
        - xtask-build
        - xtask-tests-build
        - actionlint
-@@ -2167,5 +2317,9 @@ jobs:
+       - linked-issue
+       - commit-trailers
+@@ -2165,7 +2315,11 @@ jobs:
+           CI_SUPERSEDED: ${{ steps.superseded.outputs.superseded }}
+           CI_EVENT: ${{ github.event_name }}
            CI_DRAFT: ${{ github.event.pull_request.draft }}
            CI_LOWER_LAYER: ${{ needs.changes.outputs.lower_layer }}
            CI_CHILD_PR: ${{ needs.changes.outputs.child_pr }}
@@ -282,7 +292,9 @@ diff --git a/.github/workflows/kernel-runtime.yml b/.github/workflows/kernel-run
 index 1c03d17f1..1f397a39f 100644
 --- a/.github/workflows/kernel-runtime.yml
 +++ b/.github/workflows/kernel-runtime.yml
-@@ -423,68 +423,12 @@ jobs:
+@@ -421,72 +421,16 @@ jobs:
+           vars.CARRICK_SELF_HOSTED_KVM == 'true' &&
+           (github.event_name != 'workflow_dispatch' || (github.ref == 'refs/heads/main' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine')) }}
      runs-on: [self-hosted, Linux, X64, willow-kvm]
      timeout-minutes: 90
      steps:
@@ -356,3 +368,5 @@ index 1c03d17f1..1f397a39f 100644
 
    # carrick-el1-linux's native-process tests are `not(target_os = "macos")`
    # (macOS refuses their EL1 metadata window), so no macOS shard runs them
+   # (#1297). This hosted Linux aarch64 lane receipts them per SHA; the
+   # `el1-native-gate` job compares against the receipted main ancestor.
