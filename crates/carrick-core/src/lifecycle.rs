@@ -286,6 +286,12 @@ impl MemberExitCustody {
     pub fn native_signal_owner(&self) -> bool {
         self.word.load(Ordering::Acquire) & NATIVE_SIGNAL_OWNER != 0
     }
+    /// Whether this exact control incarnation has ever been admitted to the
+    /// process graph. The bit remains set after its final graph reference is
+    /// returned, until the storage owner resets the control for reuse.
+    pub fn graph_registered(&self) -> bool {
+        self.word.load(Ordering::Acquire) & GRAPH_REGISTERED != 0
+    }
     pub fn unregister_receipt(&self) -> bool {
         self.word.load(Ordering::Acquire) & (GRAPH_REGISTERED | REFERENCES) == GRAPH_REGISTERED
     }
@@ -1413,6 +1419,34 @@ impl BirthRefusal {
 
 #[cfg(test)]
 mod membership_tests {
+    #[test]
+    fn graph_registration_survives_final_reference_until_control_reset() {
+        struct View<'a>(&'a MemberExitCustody);
+        impl MemberControl for View<'_> {
+            fn member_entry(&self) -> Option<EntryRef> {
+                None
+            }
+            fn exit_custody(&self) -> &MemberExitCustody {
+                self.0
+            }
+            fn host_retirement(&self) -> Option<crate::terminal::HostThreadRetirementReceipt> {
+                None
+            }
+        }
+
+        let authority = MemberControlAuthority::new();
+        let view = View(authority.custody());
+        assert!(!view.exit_custody().graph_registered());
+        let registration = MemberControlCustody::retain(&view).unwrap();
+        registration.commit_registration();
+        assert!(view.exit_custody().graph_registered());
+        drop(registration);
+        assert!(view.exit_custody().graph_registered());
+        assert!(view.exit_custody().unregister_receipt());
+        drop(authority.reserve_reset().unwrap());
+        assert!(!view.exit_custody().graph_registered());
+    }
+
     #[test]
     fn terminal_publication_preserves_final_reference_wake_debt() {
         let word = AtomicU32::new((GRAPH_REFERENCE * 2) | MEMBER_WAITER);

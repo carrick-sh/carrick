@@ -2407,6 +2407,11 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         let binding = super::common_entry::execution_binding(current);
         if selected.incarnation() != record.incarnation
             || !selected.is_native_owned()
+            // Absence from `records` is not proof of birth: final exit also
+            // unregisters an entry before its control storage is reset. Only
+            // an incarnation never admitted to the graph is a first-checkpoint
+            // newborn whose namespace projection may be restored here.
+            || carrick_core::lifecycle::MemberControl::exit_custody(control).graph_registered()
             || source.zone.slot(source.slot).current() != Some(record.id)
             || !current.owns_lifecycle_page(page)
             || !current.owns_control_slot(control)

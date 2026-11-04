@@ -59,3 +59,18 @@ nor retries admission nor scans the carrier's process population. VM-free
 coverage cannot establish the signed carrier fatal population; the director
 must rerun the affected signed fork-COW, two-process, spawn-slope, seccomp clone
 filter and allocator tests, and report zero of the #1576 EntryBinding fatals.
+
+The namespace repair is restricted to an exact control incarnation that has
+never been admitted to the process graph. `GRAPH_REGISTERED` remains set after
+the last graph reference is returned and until the storage owner resets the
+control, so a member that already ran or reached final exit cannot be
+reclassified from a missing registry index.
+The VM-free production-entry witness admits the newborn, delivers SIGPIPE, and
+then proves the now-registered member is no longer eligible for newborn
+restoration before exercising its nonfinal exit. The signed
+`el1_ipc_inherited_descriptor_lifetime` sequence preempts its child across 128
+pipe parks and final-close wakeup on shared vCPUs, but the isolated signed test
+passes and the fatal set varies across full-population runs on both revisions.
+That shared-carrier scheduling and cross-test state is not reproducible in the
+single-threaded fake CPU, so repeated full signed populations remain the
+real-carrier binding and no branch-regression attribution is claimed here.

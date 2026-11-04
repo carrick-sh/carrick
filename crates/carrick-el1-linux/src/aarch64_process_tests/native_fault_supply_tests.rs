@@ -529,6 +529,29 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
                 .record_ref(fixture.zone.slot(fixture.slot).current().unwrap());
             consume_native_sigpipe(fixture, page, control, &mut service, &mut frame);
             assert_eq!(fixture.task.visible_pid(), Some(identity.tid as u32));
+            // The production entry above registered this exact incarnation.
+            // Losing a registry index during final-close/exit must not make
+            // the already-run record eligible for newborn identity restore.
+            let address = unsafe { fixture.zone.record(worker.id).ctx_mut() }
+                .address_context()
+                .unwrap();
+            assert_eq!(
+                unsafe {
+                    registry().newborn_visible_pid(
+                        BornInZoneSource {
+                            zone: fixture.zone,
+                            slot: fixture.slot,
+                        },
+                        &fixture.task,
+                        worker,
+                        address,
+                        page,
+                        control,
+                    )
+                },
+                None,
+                "an already-entered inherited-lifecycle member is not newborn"
+            );
             // The delivered member may exit while its process leader remains
             // live. Its old entry must not be required by the next checkpoint.
             frame.x[8] = 93;
