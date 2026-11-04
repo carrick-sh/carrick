@@ -46,8 +46,12 @@ bounded-fails at the fixture's WFI trap, with no timer or retry. The control
 publishes its release target before arming MEMBER_WAITER; only the final
 reference decrement consumes that bit and notifies, then clears the target.
 Terminal publication and nonfinal decrements must preserve the wake debt.
-The exhaustive control manifest keeps the waiter at bytes 240..256 and the
-slot at 384 bytes, with the service cell still starting at byte 256.
+The member waiter participates in the exhaustive control manifest. With
+main's synchronous-fault fields, the combined control occupies 448 bytes and
+its service cell begins at byte 320. The lifecycle protocol advances once
+from 20 to 21 for this changed record; main's native-service protocol stays
+at 7, preserving the refused-crossing census. The combined image layout
+hash is `0x6d7552f6616b8763`.
 
 The managed clone copyout binding requires errno 14, rollback of unpublished
 service, object-wait and record bindings, no Born enqueue, and a successful
