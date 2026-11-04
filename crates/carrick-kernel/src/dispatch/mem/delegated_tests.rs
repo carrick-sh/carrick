@@ -1139,7 +1139,7 @@ fn post_exec_native_fork_reserves_loaded_image_source_custody() {
             },
             clean,
             |_| bytes.iter().all(|byte| *byte == 0),
-            |_| true,
+            |_, _progress| true,
         )
         .unwrap();
     assert!(stock.child_root(request.child_mm).is_none());
@@ -4768,7 +4768,7 @@ fn delegated_final_settlement_drains_owed_returns() {
     root.lock().refuse(pending).unwrap();
     // Final-MM settlement (`mm_occupancy::retire_reservation_root`): owed
     // returns never make the root Busy; every extent is released with it.
-    assert_eq!(root.lock().retire_final(), Ok(2));
+    assert_eq!(root.lock().retire_final().unwrap().released_count(), 2);
     let slot = root.carrier.slot(root.mm).unwrap();
     // The root is gone and its journal slots are free for another MM.
     assert_eq!(

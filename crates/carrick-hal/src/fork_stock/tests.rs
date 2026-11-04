@@ -10,6 +10,152 @@ use carrick_guest_arch::{ContextGeneration, FrameGpa, KernelVa, MmGeneration};
 use std::cell::RefCell;
 
 #[test]
+fn admitted_abort_retains_release_progress_and_pins_across_refusal() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct PhysicalPin(Arc<AtomicUsize>);
+    impl Drop for PhysicalPin {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let mut stock: ForkStock<UntaggedRoots, PhysicalPin> = ForkStock::new(
+        CARRIER,
+        ForkControlCapacity::exclusive(0x1_0000_0000),
+        UntaggedRoots,
+    );
+    stock
+        .install(
+            (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
+            lifecycles(1),
+        )
+        .unwrap();
+    let parent = parent();
+    let mut exchange = ForkStockExchange::new(request(parent, 302, 2, 1)).unwrap();
+    let loan = stock
+        .loan(&mut NoTableLedger, parent, &mut exchange, |_| true)
+        .unwrap();
+    let completion = PortalForkCompletion {
+        request: loan.request,
+        // SAFETY: exact admitted child fixture.
+        child: unsafe {
+            El1MmHandle::from_admitted_owner(CARRIER, loan.request.child_mm, NonZeroU64::MIN)
+        },
+        parent_generation: ReservationGeneration::INITIAL,
+        child_tables_used: 4096,
+        parent_tables_used: 0,
+    };
+    let mut reserve =
+        ForkStockSettlement::reserve(loan, completion, KernelVa::new(0xffff_8000_0001_0000), 0)
+            .unwrap();
+    stock
+        .reserve_custody(
+            parent,
+            &mut reserve,
+            |_| true,
+            |_| true,
+            |_, _, _| Ok(PhysicalPin(Arc::clone(&dropped))),
+        )
+        .unwrap();
+    let mut abort = ForkStockSettlement::abort(loan);
+    assert_eq!(
+        stock.settle(
+            &mut NoTableLedger,
+            parent,
+            &mut abort,
+            |_| true,
+            |_| true,
+            |_| true
+        ),
+        Err(ForkStockServiceError::OccupancyUnavailable),
+        "an admitted abort cannot bypass its physical release owner",
+    );
+    assert_eq!(
+        stock.release_aborted_child(parent, &abort, |_| false, |_, _| unreachable!()),
+        Err(ForkStockServiceError::ExposedDirtyTable)
+    );
+    let mut progress_address = None;
+    assert_eq!(
+        stock.release_aborted_child(
+            parent,
+            &abort,
+            |_| true,
+            |absence, progress| {
+                assert_eq!(absence.mm(), loan.request.child_mm);
+                progress_address = Some(core::ptr::from_mut(progress).addr());
+                false
+            }
+        ),
+        Err(ForkStockServiceError::OccupancyUnavailable),
+    );
+    let mut commit = ForkStockSettlement::commit_reserved(loan, completion).unwrap();
+    assert_eq!(
+        stock.commit_admitted(&mut NoTableLedger, parent, &mut commit),
+        Err(ForkStockServiceError::InvalidRecord)
+    );
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    assert!(
+        stock
+            .pending(parent.cpu)
+            .unwrap()
+            .admitted_custody()
+            .is_some()
+    );
+    let mut stale = parent;
+    stale.context.generation = ContextGeneration::new(NonZeroU64::new(99).unwrap());
+    assert_eq!(
+        stock.release_aborted_child(stale, &abort, |_| true, |_, _| unreachable!()),
+        Err(ForkStockServiceError::StaleExecution),
+    );
+    stock
+        .release_aborted_child(
+            parent,
+            &abort,
+            |_| true,
+            |_, progress| {
+                assert_eq!(Some(core::ptr::from_mut(progress).addr()), progress_address);
+                assert_eq!(dropped.load(Ordering::SeqCst), 0);
+                true
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        stock.settle(
+            &mut NoTableLedger,
+            parent,
+            &mut abort,
+            |_| true,
+            |_| true,
+            |_| false
+        ),
+        Err(ForkStockServiceError::MemoryAccessFailed)
+    );
+    assert_eq!(
+        stock.commit_admitted(&mut NoTableLedger, parent, &mut commit),
+        Err(ForkStockServiceError::InvalidRecord)
+    );
+    stock
+        .release_aborted_child(parent, &abort, |_| true, |_, _| unreachable!())
+        .unwrap();
+    stock
+        .settle(
+            &mut NoTableLedger,
+            parent,
+            &mut abort,
+            |_| true,
+            |_| true,
+            |_| true,
+        )
+        .unwrap();
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    assert!(stock.pending(parent.cpu).is_none());
+}
+
+#[test]
 fn committed_child_retains_physical_custody_through_quarantine() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -84,7 +230,7 @@ fn committed_child_retains_physical_custody_through_quarantine() {
             absent,
             |_| true,
             |_| true,
-            |_| true,
+            |_, _progress| true,
         )
         .unwrap();
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
@@ -193,7 +339,8 @@ fn exec_replacement_moves_child_owner_and_settles_predecessor_once() {
             receipt,
             wrong,
             |_| true,
-            |physical, absence| physical.id == 1 && absence.mm() == loan.request.child_mm,
+            |physical, absence, _progress| physical.id == 1
+                && absence.mm() == loan.request.child_mm,
         ),
         Err(ForkStockServiceError::StaleExecution)
     );
@@ -204,7 +351,9 @@ fn exec_replacement_moves_child_owner_and_settles_predecessor_once() {
             receipt,
             predecessor_absent,
             |_| true,
-            |physical, absence| physical.id == 1 && absence.mm() == loan.request.child_mm,
+            |physical, absence, _progress| {
+                physical.id == 1 && absence.mm() == loan.request.child_mm
+            },
         )
         .unwrap();
     assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -214,7 +363,7 @@ fn exec_replacement_moves_child_owner_and_settles_predecessor_once() {
             receipt,
             absent(loan.request.child_mm).unwrap(),
             |_| true,
-            |_, _| true,
+            |_, _, _progress| true,
         ),
         Err(ForkStockServiceError::StaleExecution),
         "the consuming predecessor receipt must reject duplicates"
@@ -250,7 +399,7 @@ fn root_exec_enters_shared_stock_and_reclaims_without_child_capacity() {
             receipt,
             absent(predecessor_mm).unwrap(),
             |_| true,
-            |_, _| {
+            |_, _, _progress| {
                 child_releases += 1;
                 false
             },
@@ -266,7 +415,7 @@ fn root_exec_enters_shared_stock_and_reclaims_without_child_capacity() {
                 absent,
                 |_| true,
                 |_| false,
-                |_| true,
+                |_, _progress| true,
             )
             .unwrap(),
         1
@@ -323,7 +472,7 @@ fn exec_replacement_absorbs_pending_descriptor_tables_with_peer_live() {
             receipt,
             absent(first.request.child_mm).unwrap(),
             |_| false,
-            |_, _| {
+            |_, _, _progress| {
                 releases += 1;
                 true
             },
@@ -339,7 +488,7 @@ fn exec_replacement_absorbs_pending_descriptor_tables_with_peer_live() {
                 cleared.extend_from_slice(pages);
                 true
             },
-            |_, _| {
+            |_, _, _progress| {
                 releases += 1;
                 true
             },
@@ -699,7 +848,7 @@ fn reclaim<T: ChildAddressTags, C>(
                 true
             },
             |_| true,
-            |_| true,
+            |_, _progress| true,
         )
         .unwrap()
 }
@@ -811,7 +960,7 @@ fn quarantined_stock_is_never_reissued_while_its_mm_is_live() {
                 absent,
                 |_| true,
                 |_| true,
-                |_| true
+                |_, _progress| true
             )
             .unwrap(),
         0
@@ -892,6 +1041,11 @@ fn abort_returns_cleared_lifecycle_and_untouched_tables() {
     let mut stock = stock(UntaggedRoots, 4, 1);
     let granted = loan(&mut stock, parent(), 302, 2, 1).unwrap();
     let mut abort = ForkStockSettlement::abort(granted);
+    // No physical owner exists before admission. Aborting such a loan must
+    // not require inventory resources or invoke an admitted-child callback.
+    stock
+        .release_aborted_child(parent(), &abort, |_| false, |_, _| unreachable!())
+        .unwrap();
     // An unclearable lifecycle record keeps the loan outstanding.
     assert_eq!(
         stock.settle(
@@ -1173,7 +1327,7 @@ fn kvm_lifecycle_window_cycles_exceed_stock_with_cleared_records() {
                     true
                 },
                 |life| window.clear(life),
-                |_| true,
+                |_, _progress| true,
             )
             .unwrap();
         assert_eq!(returned, 1);
@@ -1220,7 +1374,7 @@ fn lifecycle_window_clear_refuses_graph_referenced_control_and_defers_reclaim() 
             absent,
             |_| true,
             |life| window.clear(life),
-            |_| true,
+            |_, _progress| true,
         )
         .unwrap();
     assert_eq!(deferred, 0);
@@ -1239,7 +1393,7 @@ fn lifecycle_window_clear_refuses_graph_referenced_control_and_defers_reclaim() 
             absent,
             |_| true,
             |life| window.clear(life),
-            |_| true,
+            |_, _progress| true,
         )
         .unwrap();
     assert_eq!(returned, 1);
@@ -1274,7 +1428,7 @@ fn kvm_unclearable_lifecycle_record_is_never_reissued_dirty() {
             absent,
             |_| true,
             |_| true,
-            |_| true,
+            |_, _progress| true,
         )
         .unwrap();
     assert_eq!(
@@ -1328,7 +1482,7 @@ fn kvm_live_children_beyond_lifecycle_records_are_counted_refusals() {
             absent,
             |_| true,
             |life| window.clear(life),
-            |_| true,
+            |_, _progress| true,
         )
         .unwrap();
     assert_eq!(returned, 1);
@@ -1415,7 +1569,7 @@ fn refused_release_keeps_the_child_quarantined_and_its_stock_held() {
             absent,
             |_| true,
             |_| true,
-            |absence| {
+            |absence, _progress| {
                 released.borrow_mut().push(absence.mm());
                 false
             },
@@ -1456,7 +1610,7 @@ fn deferred_candidate_does_not_block_later_candidates() {
         absent,
         |_| true,
         |_| true,
-        |absence| absence.mm() != mm(302),
+        |absence, _progress| absence.mm() != mm(302),
     );
     assert_eq!(result, Ok(1));
     assert!(stock.is_quarantined(mm(302)));
@@ -1482,7 +1636,7 @@ fn failed_clear_after_release_is_retried_without_a_second_release() {
             absent,
             |_| clear_ok.get(),
             |_| true,
-            |_| {
+            |_, _progress| {
                 releases.set(releases.get() + 1);
                 true
             },
@@ -1511,7 +1665,7 @@ fn slot_absence_is_minted_only_when_no_slot_installs_the_mm() {
         |_| SlotAbsence::scan(mm(999), []),
         |_| true,
         |_| true,
-        |_| true,
+        |_, _progress| true,
     );
     assert_eq!(foreign, Ok(0));
     assert!(stock.is_quarantined(mm(302)));
@@ -1585,7 +1739,7 @@ fn reclaim_releases_each_child_once_across_a_retire_failure() {
             absent,
             |_| true,
             |_| true,
-            |_| {
+            |_, _progress| {
                 releases.set(releases.get() + 1);
                 true
             },
@@ -1618,7 +1772,7 @@ fn second_candidate_refusal_keeps_first_candidate_released_and_returned() {
             true
         },
         |_| true,
-        |absence| {
+        |absence, _progress| {
             order.borrow_mut().push(if absence.mm() == mm(302) {
                 "release 302"
             } else {
@@ -1955,6 +2109,9 @@ fn admitted_custody_token_drops_reserved_pins_on_abort_and_consumes_infallibly_o
     assert_eq!(dropped.load(Ordering::SeqCst), 0);
     let mut abort = ForkStockSettlement::abort(granted);
     stock
+        .release_aborted_child(exec, &abort, |_| true, |_, _| true)
+        .unwrap();
+    stock
         .settle(
             &mut NoTableLedger,
             exec,
@@ -2014,7 +2171,7 @@ fn admitted_custody_token_drops_reserved_pins_on_abort_and_consumes_infallibly_o
             absent,
             |_| true,
             |_| true,
-            |_| true,
+            |_, _progress| true,
         )
         .unwrap();
     assert_eq!(dropped.load(Ordering::SeqCst), 2);
@@ -2382,6 +2539,24 @@ struct DummyInventory;
 
 #[allow(clippy::unimplemented)]
 impl crate::PhysicalFrameInventory for DummyInventory {
+    fn origin(&self) -> &crate::FrameInventoryOrigin {
+        unimplemented!()
+    }
+    fn retire_mm_with_permits(
+        &self,
+        _owner: crate::GuestFrameOwner,
+    ) -> Result<crate::InventoryReleased, Box<dyn std::error::Error + Send + Sync>> {
+        Err("unused in test".into())
+    }
+
+    fn claim_unused_backing(
+        &self,
+        _backing: crate::FrameBackingIdentity,
+    ) -> Result<Option<crate::FrameRetirementPermit>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        Err("unused in test".into())
+    }
+
     fn bind(&self, _owner: crate::GuestFrameOwner) -> std::sync::Arc<dyn crate::FrameCowAuthority> {
         unimplemented!()
     }
@@ -2394,9 +2569,10 @@ impl crate::PhysicalFrameInventory for DummyInventory {
 
     fn retire_mm(
         &self,
-        _mm: carrick_guest_arch::MmGeneration,
-    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(0)
+        _mm: crate::GuestFrameOwner,
+    ) -> Result<crate::FrameInventoryRetirementReceipt, Box<dyn std::error::Error + Send + Sync>>
+    {
+        Err("unused in test".into())
     }
 }
 
@@ -2480,7 +2656,7 @@ fn second_root_reuses_carrier_fork_stock_after_first_root_exits() {
             absent,
             |_| true,
             |_| true,
-            |absence| {
+            |absence, _progress| {
                 released.borrow_mut().push(absence.mm());
                 true
             },

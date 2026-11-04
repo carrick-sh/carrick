@@ -555,13 +555,23 @@ impl InitialInventory {
         owner: carrick_hal::GuestFrameOwner,
     ) -> Result<(Self, Vec<X86InitialBootGrant>), TrapError> {
         let mm = owner.native_mm;
-        let staged = carrick_hal::physical_grants::StagedPhysicalGrants::stage(
+        let staged = carrick_hal::physical_grants::StagedPhysicalGrants::stage_with_permissions(
             Arc::clone(&rollback_fault),
             Arc::clone(&source),
-            gpas,
+            gpas.into_iter().map(|gpa| {
+                carrick_hal::physical_grants::PhysicalFrameAllocation::from_allocator(
+                    gpa,
+                    crate::carrier_memory::PhysicalOwnerGeneration::INITIAL.raw(),
+                )
+            }),
             table_grants,
             frame_len,
             owner,
+            carrick_hal::MemPerms {
+                read: true,
+                write: true,
+                exec: false,
+            },
         )?
         .handoff()?;
         let grants = staged

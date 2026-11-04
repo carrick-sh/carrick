@@ -6,6 +6,25 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::vec::Vec;
 
+#[test]
+fn wake_effects_iterates_sparse_words_in_slot_order_without_replaying() {
+    let mut effects = WakeEffects::default();
+    let slots = [0, 63, 64, ZONE_SLOTS - 1].map(|index| SlotId::from_index(index).unwrap());
+    for slot in slots {
+        effects.request_reschedule(slot);
+        effects.request_reschedule(slot);
+    }
+    let before = effects;
+    let mut owed = effects.sgi_slots();
+    for slot in slots {
+        assert_eq!(owed.next(), Some(slot));
+    }
+    assert_eq!(owed.next(), None);
+    assert_eq!(owed.next(), None);
+    assert_eq!(effects, before, "iteration borrows the pending bitmap");
+    assert_eq!(WakeEffects::default().sgi_slots().next(), None);
+}
+
 struct HostWait;
 
 impl LockWait for HostWait {

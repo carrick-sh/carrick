@@ -1,4 +1,5 @@
 //! Exact logical inventory identities and receipt authentication.
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::{fmt, num::NonZeroU64};
@@ -53,6 +54,161 @@ macro_rules! inventory_id {
 inventory_id!(FrameId);
 inventory_id!(MappingId);
 inventory_id!(KernelTransactionId);
+
+/// The allocator's physical owner identity, independent of mapping generations.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct FrameBackingIdentity {
+    ipa: carrick_guest_arch::FrameGpa,
+    host_owner_generation: NonZeroU64,
+    length: FrameLength,
+}
+impl FrameBackingIdentity {
+    pub const fn from_allocator(
+        ipa: carrick_guest_arch::FrameGpa,
+        host_owner_generation: NonZeroU64,
+        length: FrameLength,
+    ) -> Self {
+        Self {
+            ipa,
+            host_owner_generation,
+            length,
+        }
+    }
+    pub const fn ipa(self) -> carrick_guest_arch::FrameGpa {
+        self.ipa
+    }
+    pub const fn host_owner_generation(self) -> NonZeroU64 {
+        self.host_owner_generation
+    }
+    pub const fn length(self) -> FrameLength {
+        self.length
+    }
+}
+
+/// Inventory-side release of a physical publication exclusion. Backend callers
+/// cannot invoke this through a permit; only terminal completion exposes it.
+pub trait FrameRetirementCleanup: core::fmt::Debug + Send + Sync {
+    fn complete(&self, frame: FrameId, backing: FrameBackingIdentity);
+}
+
+/// Linear permission to request retirement of one exact physical owner.
+/// Dropping an unconsumed permit is safe but leaks retirement; the issuing
+/// inventory counts it. A permit is returned only after its inventory unlocks.
+/// ```compile_fail
+/// fn duplicate(p: carrick_core_abi::FrameRetirementPermit) { let _ = p.clone(); }
+/// ```
+#[derive(Debug)]
+#[must_use = "request physical retirement or retain the permit for retry"]
+pub struct FrameRetirementPermit {
+    origin: FrameInventoryOrigin,
+    frame: FrameId,
+    backing: FrameBackingIdentity,
+    revision: u64,
+    abandoned: Arc<core::sync::atomic::AtomicU64>,
+    admission: Option<Arc<()>>,
+    cleanup: Arc<dyn FrameRetirementCleanup>,
+}
+impl FrameRetirementPermit {
+    /// # Safety
+    /// Only the issuing inventory may call this, after irrevocably removing
+    /// the last reference to `frame`, or atomically excluding publication of
+    /// an unused allocator incarnation. `backing` must be its authenticated
+    /// allocator identity, never the mapping generation or virtual address.
+    pub unsafe fn from_inventory(
+        origin: FrameInventoryOrigin,
+        frame: FrameId,
+        backing: FrameBackingIdentity,
+        revision: u64,
+        abandoned: Arc<core::sync::atomic::AtomicU64>,
+        admission: Arc<()>,
+        cleanup: Arc<dyn FrameRetirementCleanup>,
+    ) -> Self {
+        Self {
+            origin,
+            frame,
+            backing,
+            revision,
+            abandoned,
+            admission: Some(admission),
+            cleanup,
+        }
+    }
+    pub const fn frame(&self) -> FrameId {
+        self.frame
+    }
+    pub const fn backing(&self) -> FrameBackingIdentity {
+        self.backing
+    }
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub fn issued_by(&self, origin: &FrameInventoryOrigin) -> bool {
+        self.origin == *origin
+    }
+
+    /// Consume only after the physical owner accepts the retirement request.
+    /// A failed request returns the same linear permit for a later attempt.
+    /// The consumer must check the allocator generation before touching storage;
+    /// an already pending retirement is completion, not a stale successor.
+    pub fn retire<E>(
+        mut self,
+        request: impl FnOnce(FrameBackingIdentity) -> Result<(), E>,
+    ) -> Result<PendingFrameRetirement, (Self, E)> {
+        match request(self.backing) {
+            Ok(()) => Ok(PendingFrameRetirement {
+                admission: self.admission.take(),
+                abandoned: self.abandoned.clone(),
+                cleanup: self.cleanup.clone(),
+                frame: self.frame,
+                backing: self.backing,
+            }),
+            Err(error) => Err((self, error)),
+        }
+    }
+}
+impl Drop for FrameRetirementPermit {
+    fn drop(&mut self) {
+        if let Some(admission) = self.admission.take() {
+            self.abandoned
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            // Fail closed: an abandoned retirement must never reopen physical
+            // publication. The inventory keeps only a weak admission index.
+            core::mem::forget(admission);
+        }
+    }
+}
+
+/// Physical publication stays excluded after the retirement request, until
+/// the backend proves the exact owner can no longer be reached or reissued.
+#[derive(Debug)]
+#[must_use = "retain through physical retirement completion"]
+pub struct PendingFrameRetirement {
+    admission: Option<Arc<()>>,
+    abandoned: Arc<core::sync::atomic::AtomicU64>,
+    cleanup: Arc<dyn FrameRetirementCleanup>,
+    frame: FrameId,
+    backing: FrameBackingIdentity,
+}
+impl PendingFrameRetirement {
+    /// # Safety
+    /// The backend must have completed retirement for the exact owner named
+    /// by the issuing permit, including stage-2 removal and pin drain, or
+    /// proved that the VM containing that owner was destroyed. All backend
+    /// registry locks must be released: completion calls the inventory owner.
+    pub unsafe fn complete(mut self) {
+        self.cleanup.complete(self.frame, self.backing);
+        self.admission.take();
+    }
+}
+impl Drop for PendingFrameRetirement {
+    fn drop(&mut self) {
+        if let Some(admission) = self.admission.take() {
+            self.abandoned
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            core::mem::forget(admission);
+        }
+    }
+}
 
 /// Unpredictable authority capability bound to one runtime reservation.
 ///
@@ -234,6 +390,159 @@ impl FrameInventoryRetirementReceipt {
     }
 }
 
+/// Inventory half of whole-MM release. This retains the exact empty-MM
+/// revision, but cannot authorize journal acknowledgement by itself.
+#[derive(Debug)]
+#[must_use = "retain the inventory half until backend custody is released"]
+pub struct InventoryReleased {
+    retirement: FrameInventoryRetirementReceipt,
+    last_unmapped: Vec<FrameRetirementPermit>,
+}
+impl InventoryReleased {
+    /// Attach the permits produced atomically with this retirement revision.
+    /// A failed identity check preserves both the receipt and all permits.
+    pub fn with_retirements(
+        mut self,
+        permits: Vec<FrameRetirementPermit>,
+    ) -> Result<Self, Box<(Self, Vec<FrameRetirementPermit>)>> {
+        let mut frames: Vec<_> = self
+            .retirement
+            .mapping_set()
+            .iter()
+            .map(|(_, frame)| *frame)
+            .collect();
+        frames.sort_unstable();
+        frames.dedup();
+        if !self.last_unmapped.is_empty()
+            || permits.iter().any(|permit| {
+                !permit.issued_by(&self.retirement.apply.origin)
+                    || permit.revision() != self.revision()
+                    || frames.binary_search(&permit.frame()).is_err()
+            })
+        {
+            return Err(Box::new((self, permits)));
+        }
+        self.last_unmapped = permits;
+        Ok(self)
+    }
+    pub fn pending_retirements(&self) -> usize {
+        self.last_unmapped.len()
+    }
+    /// Transfer one linear permit to the backend's retirement owner.
+    pub fn pop_retirement(&mut self) -> Option<FrameRetirementPermit> {
+        self.last_unmapped.pop()
+    }
+
+    /// Transfer each permit once. A refused transfer restores that exact
+    /// permit without allocating; earlier accepted transfers are not replayed.
+    pub fn try_retirements<E>(
+        &mut self,
+        mut retire: impl FnMut(FrameRetirementPermit) -> Result<(), (FrameRetirementPermit, E)>,
+    ) -> Result<(), E> {
+        while let Some(permit) = self.last_unmapped.pop() {
+            if let Err((permit, error)) = retire(permit) {
+                self.last_unmapped.push(permit);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn from_retirement(retirement: FrameInventoryRetirementReceipt) -> Option<Self> {
+        retirement.mm_empty_at_revision().then_some(Self {
+            retirement,
+            last_unmapped: Vec::new(),
+        })
+    }
+    pub fn issued_by(&self, origin: &FrameInventoryOrigin) -> bool {
+        self.retirement.apply.issued_by(origin)
+    }
+    pub const fn owner(&self) -> FrameInventoryReceiptOwner {
+        self.retirement.owner()
+    }
+    pub const fn revision(&self) -> u64 {
+        self.retirement.revision()
+    }
+}
+
+/// Backend half for one exact inventory release, including its transaction.
+/// The unsafe constructor is the backend implementation boundary; settlement
+/// cannot manufacture a backend release through a safe inventory operation.
+#[derive(Debug, Eq, PartialEq)]
+#[must_use = "join with the exact inventory release"]
+pub struct BackendCustodyReleased {
+    origin: FrameInventoryOrigin,
+    owner: FrameInventoryReceiptOwner,
+    revision: u64,
+    transaction: KernelTransactionId,
+}
+impl BackendCustodyReleased {
+    /// # Safety
+    /// Only the physical backend release owner may call this, after retiring
+    /// residency and releasing the exact MM's backend custody. Every last-frame
+    /// retirement must have been accepted by its physical owner, which retains
+    /// the pending retirement until stage-2 removal and pin drain complete.
+    /// Merely observing an empty inventory or dropping a receipt is insufficient.
+    pub unsafe fn from_backend_release(inventory: &InventoryReleased) -> Self {
+        Self {
+            origin: inventory.retirement.apply.origin.clone(),
+            owner: inventory.owner(),
+            revision: inventory.revision(),
+            transaction: inventory.retirement.transaction(),
+        }
+    }
+}
+
+/// Joined inventory and backend release. Pending physical retirement may
+/// outlive this receipt; the physical owner must prevent frame reuse meanwhile.
+/// Inventory emptiness alone cannot authorize whole-MM acknowledgement.
+/// ```compile_fail
+/// fn inventory_is_not_backend_release(
+///     retired: carrick_core_abi::FrameInventoryRetirementReceipt,
+/// ) -> Option<carrick_core_abi::MmReleaseReceipt> {
+///     carrick_core_abi::MmReleaseReceipt::from_retirement(retired)
+/// }
+/// ```
+/// ```compile_fail
+/// fn inventory_half_is_not_a_receipt(
+///     released: carrick_core_abi::InventoryReleased,
+/// ) -> carrick_core_abi::MmReleaseReceipt {
+///     released
+/// }
+/// ```
+#[derive(Debug)]
+#[must_use = "deliver the joined release to journal settlement"]
+pub struct MmReleaseReceipt {
+    inventory: InventoryReleased,
+}
+impl MmReleaseReceipt {
+    /// A rejected join returns both halves, preserving retry custody.
+    pub fn join(
+        inventory: InventoryReleased,
+        backend: BackendCustodyReleased,
+    ) -> Result<Self, Box<(InventoryReleased, BackendCustodyReleased)>> {
+        if inventory.last_unmapped.is_empty()
+            && inventory.issued_by(&backend.origin)
+            && inventory.owner() == backend.owner
+            && inventory.revision() == backend.revision
+            && inventory.retirement.transaction() == backend.transaction
+        {
+            Ok(Self { inventory })
+        } else {
+            Err(Box::new((inventory, backend)))
+        }
+    }
+    pub fn issued_by(&self, origin: &FrameInventoryOrigin) -> bool {
+        self.inventory.issued_by(origin)
+    }
+    pub const fn owner(&self) -> FrameInventoryReceiptOwner {
+        self.inventory.owner()
+    }
+    pub const fn revision(&self) -> u64 {
+        self.inventory.revision()
+    }
+}
+
 impl FrameInventoryReceiptChallenge {
     #[doc(hidden)]
     pub const fn from_kernel_authority(
@@ -275,6 +584,72 @@ mod tests {
     fn id(raw: u64) -> NonZeroU64 {
         NonZeroU64::new(raw).expect("nonzero test ID")
     }
+    #[test]
+    fn mm_release_requires_empty_inventory_and_preserves_exact_owner() {
+        let owner = FrameInventoryReceiptOwner::GuestMm {
+            native_mm: carrick_guest_arch::MmGeneration::new(id(7)),
+            root_generation: carrick_guest_arch::ContextGeneration::new(id(13)),
+        };
+        let make = |empty| {
+            FrameInventoryRetirementReceipt::from_kernel_authority(
+                FrameInventoryApplyReceipt::from_kernel_authority(
+                    Default::default(),
+                    FrameInventoryProvenance::from_kernel_entropy([2; 32]),
+                    KernelTransactionId::from_kernel_allocation(id(8)),
+                    owner,
+                    27,
+                    Vec::new(),
+                ),
+                empty,
+            )
+        };
+        assert!(InventoryReleased::from_retirement(make(false)).is_none());
+        let inventory = InventoryReleased::from_retirement(make(true)).expect("empty MM");
+        // SAFETY: this ABI fixture has no physical custody or residency.
+        let backend = unsafe { BackendCustodyReleased::from_backend_release(&inventory) };
+        let release = MmReleaseReceipt::join(inventory, backend).unwrap();
+        assert_eq!(release.owner(), owner);
+        assert_eq!(release.revision(), 27);
+    }
+    #[test]
+    fn mm_release_join_rejects_foreign_origin_owner_revision_and_transaction() {
+        let origin = FrameInventoryOrigin::default();
+        let make = |origin, owner, revision, transaction| {
+            InventoryReleased::from_retirement(
+                FrameInventoryRetirementReceipt::from_kernel_authority(
+                    FrameInventoryApplyReceipt::from_kernel_authority(
+                        origin,
+                        FrameInventoryProvenance::from_kernel_entropy([2; 32]),
+                        KernelTransactionId::from_kernel_allocation(id(transaction)),
+                        FrameInventoryReceiptOwner::HostMm(id(owner)),
+                        revision,
+                        Vec::new(),
+                    ),
+                    true,
+                ),
+            )
+            .unwrap()
+        };
+        for wrong in [
+            make(FrameInventoryOrigin::default(), 7, 27, 8),
+            make(origin.clone(), 9, 27, 8),
+            make(origin.clone(), 7, 28, 8),
+            make(origin.clone(), 7, 27, 9),
+        ] {
+            let expected = make(origin.clone(), 7, 27, 8);
+            // SAFETY: these ABI fixtures hold no physical custody or residency.
+            let backend = unsafe { BackendCustodyReleased::from_backend_release(&expected) };
+            let (retained, backend) = *MmReleaseReceipt::join(wrong, backend).unwrap_err();
+            // A refused join consumes neither half: the intended inventory can
+            // still join, and the wrong inventory remains owned by the caller.
+            assert_ne!(retained.retirement, expected.retirement);
+            let receipt = MmReleaseReceipt::join(expected, backend).unwrap();
+            assert!(receipt.issued_by(&origin));
+            assert_eq!(receipt.owner(), FrameInventoryReceiptOwner::HostMm(id(7)));
+            assert_eq!(receipt.revision(), 27);
+        }
+    }
+
     /// A receipt keeps its mapping set sorted however the Kernel listed it,
     /// so `authorizes` is a search, not a scan: process retirement asks it
     /// once per mapping, which made a linear scan O(n^2) in the process's

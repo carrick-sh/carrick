@@ -2585,6 +2585,20 @@ pub struct GuestFrameOwner {
     pub root_generation: carrick_guest_arch::ContextGeneration,
 }
 
+impl GuestFrameOwner {
+    /// Project an admitted root into inventory identity before taking custody.
+    /// Callers retain the resulting owner through release; settlement must not
+    /// invent an owner or terminate the carrier on a refused conversion.
+    pub fn from_admitted(owner: carrick_el1_abi::El1MmHandle) -> Option<Self> {
+        Some(Self {
+            native_mm: carrick_guest_arch::MmGeneration::new(std::num::NonZeroU64::new(
+                owner.mm().raw(),
+            )?),
+            root_generation: carrick_guest_arch::ContextGeneration::new(owner.incarnation()),
+        })
+    }
+}
+
 impl From<carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>> for GuestFrameOwner {
     fn from(context: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>) -> Self {
         Self {
@@ -2607,16 +2621,33 @@ impl PartialOrd for GuestFrameOwner {
 }
 
 pub trait PhysicalFrameInventory: Send + Sync {
+    fn origin(&self) -> &crate::FrameInventoryOrigin;
+    /// Exclude new publication of an allocator incarnation with no inventory
+    /// custody. A live mapping, claimed return or outstanding permit refuses
+    /// the request without changing that custody. Backend work runs only after
+    /// this method returns and must retain the permit through pin drain.
+    fn claim_unused_backing(
+        &self,
+        backing: crate::FrameBackingIdentity,
+    ) -> Result<Option<crate::FrameRetirementPermit>, Box<dyn std::error::Error + Send + Sync>>;
     fn bind(&self, owner: GuestFrameOwner) -> Arc<dyn FrameCowAuthority>;
     fn allocate_backing_ids(
         &self,
     ) -> Result<(crate::FrameId, crate::MappingId), Box<dyn std::error::Error + Send + Sync>>;
-    /// Unmap every published mapping of a retired MM (a fork child leaving
-    /// quarantine), retiring frames no other MM maps. Returns the count.
+    /// Atomic whole-MM output for retained physical release. Backends must
+    /// consume its linear permits outside the inventory lock before releasing
+    /// the completion owner. Receipt-only legacy callers are not upgraded by
+    /// this method.
+    fn retire_mm_with_permits(
+        &self,
+        owner: GuestFrameOwner,
+    ) -> Result<crate::InventoryReleased, Box<dyn std::error::Error + Send + Sync>>;
+    /// Retire one exact root incarnation and return the inventory owner's
+    /// empty-MM proof. Residency retirement remains with the release owner.
     fn retire_mm(
         &self,
-        mm: carrick_guest_arch::MmGeneration,
-    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>>;
+        owner: GuestFrameOwner,
+    ) -> Result<crate::FrameInventoryRetirementReceipt, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// An unpublished apply retains the exact authority that issued its receipt.
@@ -2664,6 +2695,15 @@ pub struct PhysicalMappingRow {
 }
 
 pub trait FrameCowAuthority: Send + Sync {
+    /// Claim exact published rows before clearing their retired stage-1 leaves.
+    fn prepare_return(
+        &self,
+        _rows: &[crate::prepared_return::ExactReturnMappingRow],
+    ) -> Result<crate::prepared_return::PreparedReturn, crate::prepared_return::PrepareReturnError>
+    {
+        Err(crate::prepared_return::PrepareReturnError::Unsupported)
+    }
+
     /// Bounded byte service for an owner-selected retained host source. No
     /// guest VA or permission decision crosses this physical boundary.
     /// Authenticate physical handle custody without consulting mapping policy.

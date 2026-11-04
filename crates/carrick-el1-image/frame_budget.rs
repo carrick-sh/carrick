@@ -194,10 +194,18 @@ impl Frames {
                 "::idle::",
                 "::load::",
                 "::aarch64_process::resume_production::",
+            ])
+            // Unregistered records cannot enter a native owner or service.
+            // Charge their terminal scratch as an alternative, never erase it
+            // by moving the branch out of the common IRQ resume frame.
+            + self.sum(&[
                 "::aarch64_process::resume_selected::",
                 "::resume_checkpoint::",
                 "::resume_pending_lifecycle::",
-            ]);
+            ]).max(
+                self.required("::aarch64_process::resume_unregistered::")?
+                    + self.maximum("::aarch64_process::resume_unregistered::_$u7b$$u7b$closure"),
+            );
         // Notification retirement and allocation can wake a guest while every
         // outer owner/editor frame is live. Include panic tails as well.
         let schedule = self.sum(&[
@@ -744,6 +752,7 @@ mod tests {
             "x::dispatch::arm_deliver_declined_fault_signal::h0",
             "x::dispatch::arm_signal_user_return::h0",
             "x::aarch64_process::with_process_entry::h0",
+            "x::aarch64_process::resume_unregistered::h0",
             "x::copy_signal_bytes::h0",
             "x::finish_copyout::h0",
             "x::write_user_bytes::h0",
@@ -805,6 +814,20 @@ mod tests {
             frames.0.insert(format!("x::{symbol}::h0"), 12000);
             let error = frames.check(16384, 288).unwrap_err();
             assert!(error.contains(chain), "{symbol}: {error}");
+        }
+    }
+
+    #[test]
+    fn unregistered_resume_terminal_state_remains_charged() {
+        for symbol in [
+            "x::aarch64_process::resume_unregistered::h0",
+            "x::aarch64_process::resume_unregistered::_$u7b$$u7b$closure$u7d$$u7d$::h0",
+        ] {
+            let mut frames = small_frames();
+            frames.0.insert(symbol.to_owned(), 12000);
+            let error = frames.check(16384, 288).unwrap_err();
+            assert!(error.contains("native backing reply"), "{error}");
+            assert!(error.contains("ring completed copyout"), "{error}");
         }
     }
 

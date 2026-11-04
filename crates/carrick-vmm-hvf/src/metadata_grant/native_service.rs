@@ -6,6 +6,7 @@ use carrick_core_abi::service::{
 };
 use carrick_sched_core::object_wait::ObjectWaitKey;
 use core::ops::Deref;
+use std::num::NonZeroU64;
 
 /// Counted ENOSYS for an exec request whose capability names no live service.
 const UNROUTED_EXEC: ServiceFailureCode = match ServiceFailureCode::new(38) {
@@ -836,6 +837,7 @@ impl NativeService {
                     crate::trap::hvf_mem_perms(carrick_hal::physical_grants::COW_GRANT_PERMISSIONS),
                 )?;
                 let retained = Arc::new(crate::fork_stock::NativeFrameBacking {
+                    inventory: Arc::clone(&inventory),
                     carrier: Arc::downgrade(&custody),
                     ipa,
                     generation,
@@ -850,7 +852,14 @@ impl NativeService {
                     carrick_hal::physical_grants::StagedPhysicalGrants::stage_with_permissions(
                         Arc::clone(&physical.rollback),
                         Arc::clone(&inventory),
-                        [carrick_guest_arch::FrameGpa::new(ipa)],
+                        [
+                            carrick_hal::physical_grants::PhysicalFrameAllocation::from_allocator(
+                                carrick_guest_arch::FrameGpa::new(ipa),
+                                NonZeroU64::new(generation).ok_or_else(|| {
+                                    TrapError::Hypervisor("zero physical owner generation".into())
+                                })?,
+                            ),
+                        ],
                         0,
                         carrick_el1_abi::COW_GRANT_SIZE,
                         owner,
@@ -1002,6 +1011,7 @@ impl NativeService {
         let length = data_len;
         let (host, ipa, generation) = crate::trap::allocate_grant_extent(&custody, perms, length)?;
         let retained = Arc::new(crate::fork_stock::NativeFrameBacking {
+            inventory: Arc::clone(&inventory),
             carrier: Arc::downgrade(&custody),
             ipa,
             generation,
@@ -1025,7 +1035,14 @@ impl NativeService {
             carrick_hal::physical_grants::StagedPhysicalGrants::stage_with_permissions(
                 Arc::clone(&physical.rollback),
                 inventory,
-                [carrick_guest_arch::FrameGpa::new(ipa)],
+                [
+                    carrick_hal::physical_grants::PhysicalFrameAllocation::from_allocator(
+                        carrick_guest_arch::FrameGpa::new(ipa),
+                        NonZeroU64::new(generation).ok_or_else(|| {
+                            TrapError::Hypervisor("zero physical owner generation".into())
+                        })?,
+                    ),
+                ],
                 0,
                 data_len,
                 owner,

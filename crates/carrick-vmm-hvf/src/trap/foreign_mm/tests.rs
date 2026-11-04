@@ -195,7 +195,10 @@ struct InventoryExtentFingerprint {
 struct InventoryFingerprint {
     initialized: bool,
     extents: Vec<InventoryExtentFingerprint>,
-    shared: std::collections::BTreeMap<InventoryBackingIdentity, carrick_hal::FrameId>,
+    shared: std::collections::BTreeMap<
+        super::super::frame_inventory::InventorySharedFrameKey,
+        carrick_hal::FrameId,
+    >,
     references: std::collections::BTreeMap<carrick_hal::FrameId, usize>,
     extent_references: std::collections::BTreeMap<(carrick_hal::FrameId, u64, u64), usize>,
     stage2_references: std::collections::BTreeMap<(u64, u64), usize>,
@@ -469,6 +472,13 @@ impl carrick_hal::FrameCowAuthority for TestForeignCowAuthority {
                     gpa,
                     length,
                     ..
+                }
+                | carrick_hal::FrameInventoryEvent::PrepareMappingFragment {
+                    frame,
+                    mapping,
+                    gpa,
+                    length,
+                    ..
                 } => prepared.push((mapping, frame, gpa, length.raw())),
                 _ => {}
             }
@@ -512,9 +522,10 @@ impl carrick_hal::FrameCowAuthority for TestForeignCowAuthority {
             .events()
             .iter()
             .filter_map(|event| match *event {
-                carrick_hal::FrameInventoryEvent::PrepareMapping { mapping, frame, .. } => {
-                    Some((mapping, frame))
-                }
+                carrick_hal::FrameInventoryEvent::PrepareMapping { mapping, frame, .. }
+                | carrick_hal::FrameInventoryEvent::PrepareMappingFragment {
+                    mapping, frame, ..
+                } => Some((mapping, frame)),
                 _ => None,
             })
             .collect();
@@ -8291,9 +8302,12 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
                 .events()
                 .iter()
                 .filter_map(|event| match *event {
-                    carrick_hal::FrameInventoryEvent::PrepareMapping { mapping, frame, .. } => {
-                        Some((mapping, frame))
-                    }
+                    carrick_hal::FrameInventoryEvent::PrepareMapping { mapping, frame, .. }
+                    | carrick_hal::FrameInventoryEvent::PrepareMappingFragment {
+                        mapping,
+                        frame,
+                        ..
+                    } => Some((mapping, frame)),
                     _ => None,
                 })
                 .collect();
@@ -10803,7 +10817,14 @@ fn serial_host_foreign_mm_failure_injection_at_composition_boundaries() {
         generation: 0,
     };
     let sentinel_frames = Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry {
-        shared: std::collections::BTreeMap::from([(sentinel_backing, sentinel_frame)]),
+        shared: std::collections::BTreeMap::from([(
+            super::super::frame_inventory::InventorySharedFrameKey::new(
+                sentinel_backing,
+                (sentinel_ipa, sentinel_len),
+                sentinel_owner,
+            ),
+            sentinel_frame,
+        )]),
         references: std::collections::BTreeMap::from([(sentinel_frame, 3)]),
         extent_references: std::collections::BTreeMap::from([(
             (sentinel_frame, sentinel_ipa, sentinel_len),

@@ -34,6 +34,11 @@ vm_free = [
   "carrick-core-abi::executable_publication::{tests::publication_is_bounded_and_acknowledges_cancellation_before_reuse,layout_manifest::portal_executable_publication,layout_manifest::portal_executable_slot}",
   "carrick-el1-abi::mm_portal::layout_manifest::mm_portal_slots (neutral executable-publication ownership move only: retained wire sizes, offsets, bounded single-flight acknowledgment and cancellation/reuse; existing semantic and work bindings above remain required, no broader or signed acceptance claim)",
   "carrick-el1-linux::mm_portal::tests::native_child_tid_cow::native_child_tid_copy_supplies_its_empty_cow_pool_before_writing",
+  "carrick-kernel::kernel::frame_inventory::tests::kvm_fork_retire_cycles_beyond_zone_capacity_release_child_state (1100 production fork-stock quarantines with real inventory, backend refusal once, exact-generation retention, live parent, one physical permit consumed and zero abandonment per cycle; VM-free only)",
+  "carrick-x86-cpl0-host::carrier_memory::tests::whole_mm_permit_survives_backend_refusal (real inventory and carrier slot owner, retained permit through backend preflight refusal with a live peer; VM-free memslot IO)",
+  "carrick-vmm-kvm::carrier_memory::memslot_tests::whole_mm_permit_survives_backend_refusal (same physical custody fixture through real KVM memslot registration/deletion; no guest instruction execution)",
+  "carrick-vmm-hvf::trap::global_frame::allocator_stats_tests::whole_mm_release_retains_permit_when_backend_owner_refuses_once (production whole-MM release and real inventory, exact physical owner retained across refusal and consumed once; requires macOS execution, Linux cross-check is compilation only)",
+  "carrick-kernel::kernel::frame_inventory::prepared_return_tests::whole_mm_retry_does_not_replay_accepted_permits (two real inventory frames; accept one, refuse one, retain exact suffix and consume each permit once after inventory unlock; VM-free only)",
 ]
 
 [bindings.unresolved]

@@ -114,6 +114,7 @@ struct QuarantinedChild {
     supply_indeterminate: bool,
     released: bool,
     absent: bool,
+    release: ChildMmRelease,
 }
 
 /// Bytes in one loaned page-table page.
@@ -316,6 +317,7 @@ impl ChildAddressTags for UntaggedRoots {
 #[derive(Debug, Eq, PartialEq)]
 pub struct SlotAbsence {
     mm: ReservationMm,
+    owner: Option<crate::GuestFrameOwner>,
 }
 
 impl SlotAbsence {
@@ -324,7 +326,19 @@ impl SlotAbsence {
         installed
             .into_iter()
             .all(|space| space != mm.raw())
-            .then_some(Self { mm })
+            .then_some(Self { mm, owner: None })
+    }
+
+    /// Bind the absence proof to the carrier's already authenticated root.
+    pub fn with_owner(mut self, owner: crate::GuestFrameOwner) -> Option<Self> {
+        if owner.native_mm.raw().get() != self.mm.raw() {
+            return None;
+        }
+        self.owner = Some(owner);
+        Some(self)
+    }
+    pub fn inventory_owner(&self) -> Option<crate::GuestFrameOwner> {
+        self.owner
     }
 
     pub fn mm(&self) -> ReservationMm {
@@ -570,6 +584,68 @@ impl LifecycleWindow {
     }
 }
 
+/// Retained release authority for one exact MM incarnation. Quarantine and
+/// exec-predecessor custody own this value across backend refusal; retry must
+/// never retire the now-empty inventory again and replace its original permits.
+#[derive(Debug, Default)]
+#[must_use = "retain in the existing MM completion owner until release succeeds"]
+pub struct ChildMmRelease {
+    inventory: Option<crate::InventoryReleased>,
+    receipt: Option<crate::MmReleaseReceipt>,
+}
+impl ChildMmRelease {
+    /// The exact joined release, retained by the existing completion owner.
+    pub fn receipt(&self) -> Option<&crate::MmReleaseReceipt> {
+        self.receipt.as_ref()
+    }
+
+    /// Join only a backend owner's proof. Refusal restores the original
+    /// inventory half, including any permits it still owns, without re-retiring.
+    pub fn join_backend(
+        &mut self,
+        backend: crate::BackendCustodyReleased,
+    ) -> Result<(), crate::BackendCustodyReleased> {
+        let Some(inventory) = self.inventory.take() else {
+            return Err(backend);
+        };
+        match crate::MmReleaseReceipt::join(inventory, backend) {
+            Ok(receipt) => {
+                self.receipt = Some(receipt);
+                Ok(())
+            }
+            Err(halves) => {
+                let (inventory, backend) = *halves;
+                self.inventory = Some(inventory);
+                Err(backend)
+            }
+        }
+    }
+
+    /// Admit the original inventory output once. A different owner cannot use
+    /// this progress, even if it recycles the numeric MM identifier.
+    pub fn inventory(
+        &mut self,
+        inventory: &dyn crate::PhysicalFrameInventory,
+        absence: &SlotAbsence,
+    ) -> Option<&mut crate::InventoryReleased> {
+        let owner = absence.inventory_owner()?;
+        if self.receipt.is_some() {
+            return None;
+        }
+        if self.inventory.is_none() {
+            self.inventory = Some(inventory.retire_mm_with_permits(owner).ok()?);
+        }
+        self.inventory.as_mut().filter(|released| {
+            released.issued_by(inventory.origin())
+                && released.owner()
+                    == crate::FrameInventoryReceiptOwner::GuestMm {
+                        native_mm: owner.native_mm,
+                        root_generation: owner.root_generation,
+                    }
+        })
+    }
+}
+
 /// Release the carrier-wide per-MM state a fork child held once it leaves
 /// quarantine: every frame-inventory mapping (frames no other MM maps
 /// retire) and every COW residency row keyed by the MM. Root-registry and
@@ -577,13 +653,13 @@ impl LifecycleWindow {
 pub fn release_child_mm(
     inventory: &dyn crate::PhysicalFrameInventory,
     residency: &carrick_el1_abi::FrameGrantResidencyTable,
-    mm: ReservationMm,
-) -> bool {
-    let Some(generation) = NonZeroU64::new(mm.raw()).map(carrick_guest_arch::MmGeneration::new)
-    else {
-        return false;
-    };
-    inventory.retire_mm(generation).is_ok() && residency.retire_overlapping(mm.raw(), 0, u64::MAX)
+    absence: &SlotAbsence,
+) -> Option<crate::InventoryReleased> {
+    let receipt = inventory.retire_mm(absence.inventory_owner()?).ok()?;
+    if !residency.retire_overlapping(absence.mm().raw(), 0, u64::MAX) {
+        return None;
+    }
+    crate::InventoryReleased::from_retirement(receipt)
 }
 
 /// Ordered key of one MM in carrier custody.
@@ -635,6 +711,15 @@ pub struct PendingForkLoan<T, C = ()> {
     pub control: ForkControlCapacity,
     pub tag: T,
     admitted: Option<AdmittedForkCustody<C>>,
+    abort: Option<PendingForkAbort>,
+}
+
+/// Entering this phase permanently excludes child publication. Its progress
+/// remains with the admitted loan until abort cleanup finishes.
+#[derive(Debug, Default)]
+struct PendingForkAbort {
+    release: ChildMmRelease,
+    released: bool,
 }
 
 impl<T, C> PendingForkLoan<T, C> {
@@ -662,12 +747,14 @@ struct CommittedChild<T, C> {
 /// the predecessor installed.
 #[derive(Debug)]
 struct ExecPredecessor<T, C> {
+    owner: crate::GuestFrameOwner,
     predecessor: ReservationMm,
     successor: ReservationMm,
     tag: Option<ChildTag<T>>,
     tables: Vec<RootGpa>,
     physical: ExecPredecessorPhysical<C>,
     released: bool,
+    release: ChildMmRelease,
 }
 
 #[derive(Debug)]
@@ -1581,12 +1668,14 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         let replaced = self.children.insert(successor_key, successor_child);
         debug_assert!(replaced.is_none());
         let pending = ExecPredecessor {
+            owner: execution.context.into(),
             predecessor: predecessor_mm,
             successor: successor_mm,
             tag: predecessor_tag,
             tables,
             physical: predecessor_physical,
             released: false,
+            release: ChildMmRelease::default(),
         };
         let replaced = self.exec_predecessors.insert(sequence, pending);
         debug_assert!(replaced.is_none());
@@ -1609,7 +1698,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         receipt: ExecPredecessorReceipt<T::Tag>,
         absence: SlotAbsence,
         mut clear_tables: impl FnMut(&[RootGpa]) -> bool,
-        mut release: impl FnMut(&C, &SlotAbsence) -> bool,
+        mut release: impl FnMut(&C, &SlotAbsence, &mut ChildMmRelease) -> bool,
     ) -> Result<(), ForkStockServiceError> {
         let Some(mut pending) = self.exec_predecessors.remove(&receipt.sequence) else {
             return Err(ForkStockServiceError::StaleExecution);
@@ -1625,9 +1714,12 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             self.exec_predecessors.insert(receipt.sequence, pending);
             return Err(ForkStockServiceError::StaleExecution);
         }
+        let absence = absence
+            .with_owner(pending.owner)
+            .ok_or(ForkStockServiceError::InvalidRecord)?;
         if !pending.released {
             if let ExecPredecessorPhysical::Child(physical) = &pending.physical
-                && !release(physical, &absence)
+                && !release(physical, &absence, &mut pending.release)
             {
                 self.exec_predecessors.insert(receipt.sequence, pending);
                 return Err(ForkStockServiceError::MemoryAccessFailed);
@@ -1964,6 +2056,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             control,
             tag,
             admitted: None,
+            abort: None,
         });
         Ok(loan)
     }
@@ -2187,6 +2280,12 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
     ) -> Result<(), ForkStockServiceError> {
         let loan = self.settlement_loan(execution)?;
         let index = cpu_index(execution.cpu).ok_or(ForkStockServiceError::NoPendingLoan)?;
+        if self.pending[index]
+            .as_ref()
+            .is_some_and(|pending| pending.abort.is_some())
+        {
+            return Err(ForkStockServiceError::InvalidRecord);
+        }
         let (completion, _, count) = settlement
             .request(loan)
             .ok_or(ForkStockServiceError::LoanMismatch)?;
@@ -2210,6 +2309,49 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             return Err(ForkStockServiceError::InvalidRecord);
         };
         self.consume_admitted(ledger, pending, admitted);
+        Ok(())
+    }
+
+    /// Release an admitted, unpublished child while its loan still owns all
+    /// physical pins, tables and the original inventory retirement. Refusal
+    /// leaves that exact progress in the loan; another execution cannot borrow
+    /// it. This must precede `settle` for an admitted abort.
+    pub fn release_aborted_child(
+        &mut self,
+        execution: GrantExecution,
+        settlement: &ForkStockSettlement,
+        is_clean: impl Fn(&[RootGpa]) -> bool,
+        release: impl FnOnce(&SlotAbsence, &mut ChildMmRelease) -> bool,
+    ) -> Result<(), ForkStockServiceError> {
+        let loan = self.settlement_loan(execution)?;
+        if !settlement.abort_matches(loan) {
+            return Err(ForkStockServiceError::LoanMismatch);
+        }
+        let index = cpu_index(execution.cpu).ok_or(ForkStockServiceError::NoPendingLoan)?;
+        let pending = self.pending[index]
+            .as_mut()
+            .ok_or(ForkStockServiceError::NoPendingLoan)?;
+        let Some(admitted) = pending.admitted.as_ref() else {
+            return Ok(());
+        };
+        if pending.abort.as_ref().is_some_and(|abort| abort.released) {
+            return Ok(());
+        }
+        if !is_clean(&pending.child_tables) || !is_clean(&pending.parent_tables) {
+            return Err(ForkStockServiceError::ExposedDirtyTable);
+        }
+        let owner = crate::GuestFrameOwner::from_admitted(admitted.completion.child)
+            .ok_or(ForkStockServiceError::InvalidRecord)?;
+        let absence = SlotAbsence::scan(loan.request.child_mm, [])
+            .and_then(|absence| absence.with_owner(owner))
+            .ok_or(ForkStockServiceError::InvalidRecord)?;
+        // Once any physical retirement starts this loan cannot commit, even
+        // if release or a later lifecycle/tag cleanup refuses.
+        let abort = pending.abort.get_or_insert_with(PendingForkAbort::default);
+        if !release(&absence, &mut abort.release) {
+            return Err(ForkStockServiceError::OccupancyUnavailable);
+        }
+        abort.released = true;
         Ok(())
     }
 
@@ -2239,6 +2381,11 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             return Err(ForkStockServiceError::MemoryAccessFailed);
         }
         if settlement.abort_matches(loan) {
+            if pending.admitted.is_some()
+                && !pending.abort.as_ref().is_some_and(|abort| abort.released)
+            {
+                return Err(ForkStockServiceError::OccupancyUnavailable);
+            }
             if !is_clean(&pending.child_tables) || !is_clean(&pending.parent_tables) {
                 return Err(ForkStockServiceError::ExposedDirtyTable);
             }
@@ -2326,7 +2473,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         occupancy: impl Fn(ReservationMm) -> Option<SlotAbsence>,
         mut clear_tables: impl FnMut(&[RootGpa]) -> bool,
         mut clear_lifecycle: impl FnMut(ForkLifecycleLoan) -> bool,
-        mut release: impl FnMut(&SlotAbsence) -> bool,
+        mut release: impl FnMut(&SlotAbsence, &mut ChildMmRelease) -> bool,
     ) -> Result<usize, ForkStockServiceError> {
         let active = execution.into().active.and_then(MmKey::of);
         let candidates: Vec<(MmKey, SlotAbsence)> = self
@@ -2345,7 +2492,18 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             })
             .collect();
         let mut reclaimed = 0;
-        for (key, absence) in candidates {
+        for (key, mut absence) in candidates {
+            if let Some(child) = self.children.get(&key) {
+                absence.owner = Some(crate::GuestFrameOwner {
+                    native_mm: carrick_guest_arch::MmGeneration::new(
+                        NonZeroU64::new(child.owner.mm().raw())
+                            .ok_or(ForkStockServiceError::InvalidRecord)?,
+                    ),
+                    root_generation: carrick_guest_arch::ContextGeneration::new(
+                        child.owner.incarnation(),
+                    ),
+                });
+            }
             let mm = key.mm().ok_or(ForkStockServiceError::InvalidRecord)?;
             let child = self
                 .children
@@ -2371,7 +2529,14 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
                     .quarantine
                     .get(&key)
                     .is_some_and(|state| !state.released)
-                    && !release(&absence)
+                    && !release(
+                        &absence,
+                        &mut self
+                            .quarantine
+                            .get_mut(&key)
+                            .ok_or(ForkStockServiceError::InvalidRecord)?
+                            .release,
+                    )
                 {
                     true
                 } else {

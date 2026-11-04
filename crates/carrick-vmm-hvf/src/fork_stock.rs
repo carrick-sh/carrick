@@ -13,6 +13,7 @@ use carrick_hal::fork_stock::{ForkStock, ForkTableLedger};
 #[derive(Default)]
 pub(crate) struct NativeChildPhysical {
     pub inherited: Vec<crate::trap::ForkPhysicalRetention>,
+    pub(crate) inherited_by_frame: std::collections::BTreeMap<(u64, u64), Vec<usize>>,
     pub sources: carrick_hal::fork_stock::ForkHostBackingCustody,
     pub supplied: Option<
         carrick_hal::physical_grants::NativePhysicalGrants<std::sync::Arc<NativeFrameBacking>>,
@@ -49,6 +50,19 @@ impl carrick_hal::physical_grants::NativePreparedSupplyCustody for NativeChildPh
     }
 }
 impl NativeChildPhysical {
+    /// Settlement removes inventory rows first, then releases the exact
+    /// inherited incarnation. Supplied grants retain their own typed owner.
+    #[expect(
+        dead_code,
+        reason = "approved slice 2a prerequisite consumed by slice 2b"
+    )]
+    pub(crate) fn release_inherited_frame(&mut self, ipa: u64, generation: u64) {
+        if let Some(indices) = self.inherited_by_frame.remove(&(ipa, generation)) {
+            for index in indices {
+                self.inherited[index].release_frame(ipa, generation);
+            }
+        }
+    }
     pub fn new(mut inherited: Vec<crate::trap::ForkPhysicalRetention>) -> Self {
         // Keep the physical retentions themselves ordered, rather than a
         // second VA-to-output authority. First touch finds one covering frame
@@ -57,6 +71,12 @@ impl NativeChildPhysical {
             carrick_el1_abi::PortalForkCustody::Frame { va, .. } => va,
             _ => u64::MAX,
         });
+        let mut inherited_by_frame: std::collections::BTreeMap<_, Vec<_>> = Default::default();
+        for (index, retention) in inherited.iter().enumerate() {
+            for key in retention.frame_keys() {
+                inherited_by_frame.entry(key).or_default().push(index);
+            }
+        }
         let mut sources = carrick_hal::fork_stock::ForkHostBackingCustody::default();
         for row in &inherited {
             if let Some(source) = row.retained_host_backing() {
@@ -65,6 +85,7 @@ impl NativeChildPhysical {
         }
         Self {
             inherited,
+            inherited_by_frame,
             sources,
             ..Default::default()
         }
@@ -118,14 +139,23 @@ impl core::fmt::Debug for NativeChildPhysical {
             .finish_non_exhaustive()
     }
 }
-#[derive(Debug)]
 pub(crate) struct NativeFrameBacking {
+    pub inventory: std::sync::Arc<dyn carrick_hal::PhysicalFrameInventory>,
     pub carrier: std::sync::Weak<CarrierVmCustody>,
     pub ipa: u64,
     pub generation: u64,
     pub length: u64,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub retained_owner: std::sync::OnceLock<std::sync::Arc<crate::trap::GlobalFrameHostOwner>>,
+}
+impl core::fmt::Debug for NativeFrameBacking {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("NativeFrameBacking")
+            .field("ipa", &self.ipa)
+            .field("generation", &self.generation)
+            .field("length", &self.length)
+            .finish_non_exhaustive()
+    }
 }
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl NativeFrameBacking {
@@ -187,12 +217,39 @@ impl Drop for NativeFrameBacking {
                 .native_frame_backings
                 .lock()
                 .remove(&(self.ipa, self.generation));
-            crate::trap::retire_global_frame_host_owner_if_generation_in(
-                &carrier,
-                self.ipa,
-                self.length,
-                self.generation,
+            let (Some(generation), Some(length)) = (
+                NonZeroU64::new(self.generation),
+                NonZeroU64::new(self.length),
+            ) else {
+                return;
+            };
+            let identity = carrick_hal::FrameBackingIdentity::from_allocator(
+                FrameGpa::new(self.ipa),
+                generation,
+                carrick_hal::FrameLength::from_mapping_extent(length),
             );
+            let owner = carrier
+                .global_frame_host_owners
+                .lock()
+                .get(&(self.ipa, self.length))
+                .filter(|entry| entry.owner().generation() == self.generation)
+                .map(|entry| std::sync::Arc::clone(entry.owner()));
+            let Some(owner) = owner else {
+                return;
+            };
+            let Ok(Some(permit)) = self.inventory.claim_unused_backing(identity) else {
+                // Inventory custody (including a claimed return) owns the
+                // eventual release. The global directory keeps its bytes live.
+                return;
+            };
+            if let Err(permit) =
+                crate::trap::retire_global_frame_with_inventory_permit(&carrier, owner, permit)
+            {
+                // Drop cannot retry a refused transfer. Abandonment counts the
+                // failure and retains publication exclusion in the inventory;
+                // it must never attach this authority to a successor owner.
+                drop(permit);
+            }
         }
     }
 }
@@ -619,7 +676,7 @@ mod tests {
                 |mm| SlotAbsence::scan(mm, [0]),
                 |_| true,
                 |_| true,
-                |_| true,
+                |_, _progress| true,
             )
             .unwrap();
         terminal.join().unwrap();

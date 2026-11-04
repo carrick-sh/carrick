@@ -363,3 +363,12 @@ the same continuation and terminal exit, checking that the claim is released,
 physical settlement happens once and the live parent's translation survives.
 The pre-fix allocation entered the native run-failure boundary instead of
 parking. This VM-free witness does not replace signed fault/COW execution.
+
+The IRQ resume composition treats unregistered-record cancellation as an
+alternative to registered `resume_selected`/checkpoint descent. The former
+cannot enter a native service. Its aligned terminal custody lives in the
+out-of-line `resume_unregistered` frame, so registered service resumption does
+not retain that scratch. Both alternatives share the charged interrupt,
+preemption, idle, load and production-resume prefix. The compiled checker
+requires the unregistered symbol and charges its frame and handback closure
+even though it is a cold branch; its parser test rejects an oversized terminal alternative.

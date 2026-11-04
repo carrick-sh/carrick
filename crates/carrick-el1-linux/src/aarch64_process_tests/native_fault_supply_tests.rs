@@ -2444,7 +2444,12 @@ fn composed_native_supply_with_prepared(
         let staged = carrick_hal::physical_grants::StagedPhysicalGrants::stage_with_permissions(
             std::sync::Arc::default(),
             physical.clone(),
-            [FrameGpa::new(gpa)],
+            [
+                carrick_hal::physical_grants::PhysicalFrameAllocation::from_allocator(
+                    FrameGpa::new(gpa),
+                    physical_generation,
+                ),
+            ],
             0,
             16384,
             physical_owner,

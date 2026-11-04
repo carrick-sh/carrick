@@ -15,9 +15,11 @@ use crate::MemPerms;
 pub const MAX_FRAME_INVENTORY_EVENTS_PER_BATCH: usize = 262_144;
 
 pub use carrick_core_abi::{
-    FrameId, FrameInventoryApplyReceipt, FrameInventoryOrigin, FrameInventoryProvenance,
-    FrameInventoryReceiptChallenge, FrameInventoryReceiptOwner, FrameInventoryRetirementReceipt,
-    FrameLength, KernelTransactionId, MappingGeneration, MappingId,
+    BackendCustodyReleased, FrameBackingIdentity, FrameId, FrameInventoryApplyReceipt,
+    FrameInventoryOrigin, FrameInventoryProvenance, FrameInventoryReceiptChallenge,
+    FrameInventoryReceiptOwner, FrameInventoryRetirementReceipt, FrameLength,
+    FrameRetirementPermit, InventoryReleased, KernelTransactionId, MappingGeneration, MappingId,
+    MmReleaseReceipt,
 };
 
 /// Revision of the backend MM binding observed by foreign-memory transport.
@@ -103,6 +105,19 @@ pub enum FrameInventoryEvent {
         length: FrameLength,
         permissions: MemPerms,
     },
+    /// Prepare a fragment of a still-published mapping in the same MM.
+    /// Unlike an independent alias, splitting preserves a pending retirement
+    /// request. Emit all fragments before unmapping the source in this batch.
+    PrepareMappingFragment {
+        transaction: KernelTransactionId,
+        source: MappingId,
+        frame: FrameId,
+        mapping: MappingId,
+        generation: MappingGeneration,
+        gpa: Gpa,
+        length: FrameLength,
+        permissions: MemPerms,
+    },
     PublishMapping {
         transaction: KernelTransactionId,
         mapping: MappingId,
@@ -146,6 +161,7 @@ impl FrameInventoryEvent {
     pub const fn transaction(self) -> KernelTransactionId {
         match self {
             Self::PrepareMapping { transaction, .. }
+            | Self::PrepareMappingFragment { transaction, .. }
             | Self::PublishMapping { transaction, .. }
             | Self::ProtectMapping { transaction, .. }
             | Self::UnmapMapping { transaction, .. }
@@ -157,6 +173,7 @@ impl FrameInventoryEvent {
     pub const fn generation(self) -> MappingGeneration {
         match self {
             Self::PrepareMapping { generation, .. }
+            | Self::PrepareMappingFragment { generation, .. }
             | Self::PublishMapping { generation, .. }
             | Self::ProtectMapping { generation, .. }
             | Self::UnmapMapping { generation, .. }
@@ -174,6 +191,7 @@ pub struct FrameInventoryBatch {
     transaction: KernelTransactionId,
     event_capacity: FrameEventCapacity,
     events: Vec<FrameInventoryEvent>,
+    physical_frames: Vec<(FrameId, FrameBackingIdentity)>,
 }
 
 impl FrameInventoryBatch {
@@ -192,6 +210,7 @@ impl FrameInventoryBatch {
             transaction,
             event_capacity,
             events,
+            physical_frames: Vec::new(),
         })
     }
 
@@ -233,6 +252,10 @@ impl FrameInventoryBatch {
 
     pub fn events(&self) -> &[FrameInventoryEvent] {
         &self.events
+    }
+
+    pub fn physical_frames(&self) -> &[(FrameId, FrameBackingIdentity)] {
+        &self.physical_frames
     }
 
     pub fn into_events(self) -> Vec<FrameInventoryEvent> {
@@ -302,6 +325,28 @@ impl FrameInventoryReservation {
         event: FrameInventoryEvent,
     ) -> Result<(), FrameInventoryReservationError> {
         self.batch.push(event).map_err(Into::into)
+    }
+
+    /// Bind the allocation's exact physical identity in the same transaction as
+    /// publication. Rebinding a live frame to a different owner is rejected.
+    pub fn bind_physical_frame(
+        &mut self,
+        frame: FrameId,
+        backing: FrameBackingIdentity,
+    ) -> Result<(), FrameInventoryReservationError> {
+        if self.batch.physical_frames.len() == self.batch.event_capacity.get() {
+            return Err(FrameInventoryBatchError::BatchFull {
+                capacity: self.batch.event_capacity.get(),
+            }
+            .into());
+        }
+        self.batch.physical_frames.try_reserve(1).map_err(|_| {
+            FrameInventoryBatchError::AllocationFailed {
+                requested: self.batch.physical_frames.len() + 1,
+            }
+        })?;
+        self.batch.physical_frames.push((frame, backing));
+        Ok(())
     }
 
     /// Finish backend work and carry its ordinary outcome beside the complete

@@ -483,10 +483,45 @@ pub(crate) fn sync_regs_supported() -> bool {
     SYNC_REGS_OK.get().copied().unwrap_or(false)
 }
 
+/// One lifetime for the VM descriptor, all active/parked vCPUs, run contexts
+/// and registered-memory destruction custody. No raw VM Arc escapes this owner.
+pub(crate) struct KvmVmLifetime {
+    fd: std::mem::ManuallyDrop<VmFd>,
+    pool: Arc<Mutex<Vec<ParkedVcpu>>>,
+    destruction: Mutex<carrick_hal::VmDestructionQueue>,
+}
+impl std::ops::Deref for KvmVmLifetime {
+    type Target = VmFd;
+    fn deref(&self) -> &VmFd {
+        &self.fd
+    }
+}
+impl Drop for KvmVmLifetime {
+    fn drop(&mut self) {
+        // Last lifetime: active slots, reclaim handles and run contexts are
+        // gone. Parked fds hold kernel VM references; close them first, after
+        // releasing the pool lock, including a poisoned pool's contents.
+        let parked = std::mem::take(&mut *self.pool.lock().unwrap_or_else(|e| e.into_inner()));
+        drop(parked);
+        // SAFETY: unique final owner; no method can access fd after this point.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.fd) };
+        let queue = self
+            .destruction
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        // SAFETY: every active/parked vCPU fd and the VM fd are now closed.
+        // No pool, registry or queue lock is held; backing remains in queue.
+        unsafe {
+            carrick_hal::complete_vm_destruction(queue);
+        }
+    }
+}
+
 pub struct KvmVm {
     /// `Some` for a VM this engine OWNS (it opened `/dev/kvm` itself, via
     /// [`Self::create_empty`]); `None` for a SIBLING vCPU's VM handle, which
-    /// shares the parent's already-open `/dev/kvm` through `vm: Arc<VmFd>` and
+    /// shares the parent's already-open `/dev/kvm` through `vm: Arc<KvmVmLifetime>` and
     /// must NOT carry a second `Kvm` (`fork`'s child rebuilds a fresh VM; a
     /// `clone(CLONE_THREAD)` sibling re-uses the SAME `VmFd`). The field keeps
     /// the owner's `/dev/kvm` fd alive for the VM's lifetime.
@@ -497,7 +532,7 @@ pub struct KvmVm {
     /// `set_user_memory_region` / `get_preferred_target` all take `&self`, so a
     /// shared `&VmFd` suffices for both vCPU creation and (fork-child) memory
     /// registration. See Task 5 unknown #1.
-    pub(crate) vm: Arc<VmFd>,
+    pub(crate) vm: Arc<KvmVmLifetime>,
     /// The next `KVM_CREATE_VCPU` vcpu_id to hand out, shared across every
     /// `KvmVm` handle that targets the SAME VM (the main engine + all
     /// `clone(CLONE_THREAD)` siblings). `KVM_CREATE_VCPU` REQUIRES a unique
@@ -540,13 +575,24 @@ pub struct KvmVm {
     tsc_khz: Arc<AtomicU32>,
 }
 
+impl carrick_hal::VmDestructionOwner for KvmVm {
+    fn retain_until_vm_destroyed(&self, custody: Box<dyn carrick_hal::VmDestructionCustody>) {
+        let mut queue = self
+            .vm
+            .destruction
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        custody.enqueue(&mut queue);
+    }
+}
+
 /// A `Send`-safe handle to the SHARED VM state a `clone(CLONE_THREAD)` sibling
 /// needs to add its own vCPU: the `VmFd` (vCPU creation + memory ops are
 /// `&self`) AND the shared vcpu-id allocator (so the sibling gets a UNIQUE
 /// `KVM_CREATE_VCPU` id, not a duplicate of the main vCPU's id 0).
 #[derive(Clone)]
 pub(crate) struct SharedVmHandle {
-    vm: Arc<VmFd>,
+    vm: Arc<KvmVmLifetime>,
     next_vcpu_id: Arc<AtomicU64>,
     /// Shared slot allocator (see [`KvmVm::next_slot`]) — a sibling that
     /// registers a post-spawn alias slot must draw a unique id, not slot 0.
@@ -597,6 +643,8 @@ struct KvmVcpuSlot {
     /// on reclaim (it tracks the live vCPU identity).
     #[cfg(target_arch = "x86_64")]
     sync_regs_stale: UnsafeCell<bool>,
+    // Must follow fd: the last live slot closes its fd before releasing VM lifetime.
+    _vm_lifetime: Arc<KvmVmLifetime>,
 }
 
 // SAFETY: the slot is single-thread-owned at any instant (see the type doc); the
@@ -1210,13 +1258,19 @@ impl KvmVm {
             };
             let _ = vm.enable_cap(&cap);
         }
+        let vcpu_pool = Arc::new(Mutex::new(Vec::new()));
+        let vm = Arc::new(KvmVmLifetime {
+            fd: std::mem::ManuallyDrop::new(vm),
+            pool: Arc::clone(&vcpu_pool),
+            destruction: Mutex::new(None),
+        });
         Ok(Self {
             _kvm: Some(kvm),
-            vm: Arc::new(vm),
+            vm,
             // The owning VM's main vCPU takes id 0; siblings fetch-add from here.
             next_vcpu_id: Arc::new(AtomicU64::new(0)),
             next_slot: Arc::new(AtomicU32::new(0)),
-            vcpu_pool: Arc::new(Mutex::new(Vec::new())),
+            vcpu_pool,
             counter_locked,
             #[cfg(target_arch = "x86_64")]
             cpuid_view,
@@ -1425,6 +1479,7 @@ impl KvmVm {
                 // the s.regs sync-out mirror is stale until the first run.
                 #[cfg(target_arch = "x86_64")]
                 sync_regs_stale: UnsafeCell::new(true),
+                _vm_lifetime: Arc::clone(&self.vm),
             }),
             recycle: Some(Arc::clone(&self.vcpu_pool)),
             borrowed: false,

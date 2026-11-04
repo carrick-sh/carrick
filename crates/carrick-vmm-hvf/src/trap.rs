@@ -3459,7 +3459,7 @@ impl HvpatchTaskOnlyBackendState {
         apply: impl FnOnce(
             carrick_hal::FrameInventoryCommit<()>,
         ) -> Result<carrick_hal::FrameInventoryRetirementReceipt, TrapError>,
-    ) -> Result<(), TrapError> {
+    ) -> Result<Option<carrick_hal::InventoryReleased>, TrapError> {
         self.registration
             .as_ref()
             .ok_or_else(|| TrapError::Hypervisor("retired HVPatch registration".to_owned()))?
@@ -4132,7 +4132,7 @@ impl HvpatchTaskInventoryAuthority {
         apply: impl FnOnce(
             carrick_hal::FrameInventoryCommit<()>,
         ) -> Result<carrick_hal::FrameInventoryRetirementReceipt, TrapError>,
-    ) -> Result<(), TrapError> {
+    ) -> Result<Option<carrick_hal::InventoryReleased>, TrapError> {
         let current = std::mem::replace(self, Self::Retired);
         match current {
             Self::Active {
@@ -4152,7 +4152,7 @@ impl HvpatchTaskInventoryAuthority {
                         &retired,
                     );
                     if challenge && revision_advanced && transaction_distinct && audit.ok() {
-                        return Ok(());
+                        return Ok(carrick_hal::InventoryReleased::from_retirement(retired));
                     }
                     // Abort is unrecoverable, so name the exact clause that
                     // rejected the receipt rather than only its verdict.
@@ -4430,7 +4430,7 @@ impl HvpatchTaskMmAuthority {
         apply: impl FnOnce(
             carrick_hal::FrameInventoryCommit<()>,
         ) -> Result<carrick_hal::FrameInventoryRetirementReceipt, TrapError>,
-    ) -> Result<(), TrapError> {
+    ) -> Result<Option<carrick_hal::InventoryReleased>, TrapError> {
         let mm = (*self.kernel_mm.lock()).ok_or_else(|| {
             TrapError::Hypervisor("HVPatch MM has no exact Kernel binding".to_owned())
         })?;
@@ -6025,7 +6025,7 @@ impl HvpatchTaskRegistration {
         apply: impl FnOnce(
             carrick_hal::FrameInventoryCommit<()>,
         ) -> Result<carrick_hal::FrameInventoryRetirementReceipt, TrapError>,
-    ) -> Result<(), TrapError> {
+    ) -> Result<Option<carrick_hal::InventoryReleased>, TrapError> {
         self.task_mm
             .as_ref()
             .ok_or_else(|| TrapError::Hypervisor("missing HVPatch task MM".to_owned()))?

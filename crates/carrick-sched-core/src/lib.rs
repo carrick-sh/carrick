@@ -1682,16 +1682,22 @@ impl WakeEffects {
 
     /// The slots owed a reschedule SGI.
     pub fn sgi_slots(&self) -> impl Iterator<Item = SlotId> + '_ {
-        self.sgi.iter().enumerate().flat_map(|(word, bits)| {
-            let mut bits = *bits;
-            core::iter::from_fn(move || {
-                if bits == 0 {
+        // Borrow the bitmap and retain only one word's cursor. Nested
+        // flat_map iterators retain front/back iteration state in the IRQ
+        // frame when send_sgis is inlined into interrupt.
+        let mut word = 0;
+        let mut bits = self.sgi[0];
+        core::iter::from_fn(move || {
+            while bits == 0 {
+                if word == self.sgi.len() - 1 {
                     return None;
                 }
-                let bit = bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                SlotId::from_index(word * 64 + bit)
-            })
+                word += 1;
+                bits = self.sgi[word];
+            }
+            let bit = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            SlotId::from_index(word * 64 + bit)
         })
     }
 }

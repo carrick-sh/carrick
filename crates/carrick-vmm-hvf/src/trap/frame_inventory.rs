@@ -66,6 +66,8 @@ pub(crate) enum SparseExtentBacking<'a> {
     ::core::fmt::Debug,
     ::core::cmp::Eq,
     ::core::cmp::PartialEq,
+    ::core::cmp::Ord,
+    ::core::cmp::PartialOrd,
 )]
 pub(crate) struct InventoryStage2OwnerIdentity {
     /// Base host pointer for the complete `stage2_base/stage2_length` lease.
@@ -103,6 +105,50 @@ pub(crate) struct InventoryExtent {
     /// Retirement consumes this identity instead of reconstructing authority
     /// from historical per-executor mapping rows.
     pub(crate) stage2_owner: InventoryStage2OwnerIdentity,
+}
+
+/// File sharing does not identify a physical allocation. Independent maps
+/// of the same bytes receive distinct stage-2 leases and owner incarnations;
+/// only another mapping of the exact physical owner may reuse its FrameId.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Ord,
+    ::core::cmp::PartialOrd,
+)]
+pub(crate) struct InventorySharedFrameKey {
+    backing: InventoryBackingIdentity,
+    base: carrick_guest_mem::Gpa,
+    length: carrick_guest_arch::GuestLen,
+    owner: InventoryStage2OwnerIdentity,
+}
+
+impl InventorySharedFrameKey {
+    pub(crate) fn new(
+        backing: InventoryBackingIdentity,
+        lease: (u64, u64),
+        owner: InventoryStage2OwnerIdentity,
+    ) -> Self {
+        Self {
+            backing,
+            base: carrick_guest_mem::Gpa::new(lease.0),
+            length: carrick_guest_arch::GuestLen::new(lease.1),
+            owner,
+        }
+    }
+}
+
+impl InventoryExtent {
+    pub(crate) fn shared_frame_key(self) -> InventorySharedFrameKey {
+        InventorySharedFrameKey::new(
+            self.backing,
+            (self.stage2_base, self.stage2_length),
+            self.stage2_owner,
+        )
+    }
 }
 
 /// Metadata half of lane reuse eligibility. Callers must additionally hold
@@ -416,7 +462,7 @@ pub(crate) fn increment_inventory_reference<K: Ord + Copy + std::fmt::Debug>(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(::core::fmt::Debug, ::core::default::Default)]
 pub(crate) struct InventoryFrameRegistry {
-    pub(crate) shared: std::collections::BTreeMap<InventoryBackingIdentity, carrick_hal::FrameId>,
+    pub(crate) shared: std::collections::BTreeMap<InventorySharedFrameKey, carrick_hal::FrameId>,
     pub(crate) references: std::collections::BTreeMap<carrick_hal::FrameId, usize>,
     pub(crate) extent_references:
         std::collections::BTreeMap<(carrick_hal::FrameId, u64, u64), usize>,
@@ -486,8 +532,8 @@ fn declined_lease_remainders<'e>(
 /// Kernel still counts mappings beyond its own. Those can only be unmaps
 /// other retirements decided and have not applied: any new mapping of a
 /// private frame is staged through a backend reference first. A shared-file
-/// frame stays published in the registry's `shared` map for later mappers, so
-/// it never carries one.
+/// frame stays published in the registry's `shared` map for later mappings
+/// of that same physical owner, so it never carries one.
 fn carries_conditional_retire(
     global: usize,
     local: usize,
@@ -1640,6 +1686,7 @@ impl HvfVmState {
     pub(crate) fn push_exact_mapping_events(
         reservation: &mut carrick_hal::FrameInventoryReservation,
         frame: carrick_hal::FrameId,
+        source: Option<carrick_hal::MappingId>,
         gpa: u64,
         length: u64,
         permissions: carrick_hal::MemPerms,
@@ -1651,17 +1698,31 @@ impl HvfVmState {
             TrapError::Hypervisor("HVPatch inventory received an empty mapping extent".to_owned())
         })?;
         let transaction = reservation.transaction();
-        reservation
-            .push(carrick_hal::FrameInventoryEvent::PrepareMapping {
+        let generation = Self::inventory_generation(1);
+        let gpa = carrick_guest_mem::Gpa::new(gpa);
+        let length = carrick_hal::FrameLength::from_mapping_extent(length);
+        let event = match source {
+            Some(source) => carrick_hal::FrameInventoryEvent::PrepareMappingFragment {
+                transaction,
+                source,
+                frame,
+                mapping,
+                generation,
+                gpa,
+                length,
+                permissions,
+            },
+            None => carrick_hal::FrameInventoryEvent::PrepareMapping {
                 transaction,
                 frame,
                 mapping,
-                generation: Self::inventory_generation(1),
-                gpa: carrick_guest_mem::Gpa::new(gpa),
-                length: carrick_hal::FrameLength::from_mapping_extent(length),
+                generation,
+                gpa,
+                length,
                 permissions,
-            })
-            .map_err(Self::reservation_error)?;
+            },
+        };
+        reservation.push(event).map_err(Self::reservation_error)?;
         reservation
             .push(carrick_hal::FrameInventoryEvent::PublishMapping {
                 transaction,
@@ -1902,7 +1963,7 @@ impl HvfVmState {
             if retirement.frames.contains(&extent.frame)
                 && matches!(extent.backing, InventoryBackingIdentity::SharedFile { .. })
             {
-                registry.shared.remove(&extent.backing);
+                registry.shared.remove(&extent.shared_frame_key());
             }
         }
         for frame in &retirement.frames {
@@ -2095,13 +2156,6 @@ impl HvfVmState {
         replacement: CowInventoryReplacementStage,
     ) -> Result<CowInventorySplit, TrapError> {
         let transaction = reservation.transaction();
-        reservation
-            .push(carrick_hal::FrameInventoryEvent::UnmapMapping {
-                transaction,
-                mapping: old.mapping,
-                generation: Self::inventory_generation(2),
-            })
-            .map_err(Self::reservation_error)?;
         let permissions = carrick_hal::MemPerms {
             read: true,
             write: true,
@@ -2109,14 +2163,29 @@ impl HvfVmState {
         };
         let mut fragments = Vec::with_capacity(fragment_shapes.len());
         for &(gpa, length) in fragment_shapes {
-            let mapping =
-                Self::push_exact_mapping_events(reservation, old.frame, gpa, length, permissions)?;
+            let mapping = Self::push_exact_mapping_events(
+                reservation,
+                old.frame,
+                Some(old.mapping),
+                gpa,
+                length,
+                permissions,
+            )?;
             fragments.push(CowInventoryFragment {
                 gpa,
                 length,
                 mapping,
             });
         }
+        // Keep the source reference until every surviving fragment owns a
+        // unit. A pending retirement must not observe an intermediate zero.
+        reservation
+            .push(carrick_hal::FrameInventoryEvent::UnmapMapping {
+                transaction,
+                mapping: old.mapping,
+                generation: Self::inventory_generation(2),
+            })
+            .map_err(Self::reservation_error)?;
         let (new_frame, new_mapping) = if let Some(existing) = replacement.existing {
             if existing.frame == old.frame
                 || existing.stage2_base != replacement.gpa
@@ -2134,12 +2203,27 @@ impl HvfVmState {
             let mapping = Self::push_exact_mapping_events(
                 reservation,
                 frame,
+                None,
                 replacement.gpa,
                 CowArmedRanges::COMPOUND_SIZE,
                 permissions,
             )?;
             (frame, mapping)
         };
+        if let Some(generation) = std::num::NonZeroU64::new(replacement.stage2_owner.generation) {
+            let length = std::num::NonZeroU64::new(CowArmedRanges::COMPOUND_SIZE)
+                .ok_or_else(|| TrapError::Hypervisor("empty COW compound".into()))?;
+            reservation
+                .bind_physical_frame(
+                    new_frame,
+                    carrick_hal::FrameBackingIdentity::from_allocator(
+                        carrick_guest_arch::FrameGpa::new(replacement.gpa),
+                        generation,
+                        carrick_hal::FrameLength::from_mapping_extent(length),
+                    ),
+                )
+                .map_err(Self::reservation_error)?;
+        }
         if retirement.retire_old_frame {
             reservation
                 .push(carrick_hal::FrameInventoryEvent::RetireFrame {
@@ -2170,6 +2254,7 @@ impl HvfVmState {
     pub(crate) fn commit_cow_inventory_split(
         inventory: &mut HvpatchFrameInventory,
         split: &CowInventorySplit,
+        authority: &dyn carrick_hal::FrameCowAuthority,
         retire_stage2: impl FnOnce() -> Result<(), TrapError>,
     ) -> Result<bool, TrapError> {
         if split.replacement_is_existing {
@@ -2194,6 +2279,17 @@ impl HvfVmState {
                 split.new_key, split.old_key, split.fragments,
             )));
         }
+        let mut frames = inventory.frames.lock();
+        // The plan predates the kernel commit. A sibling may still own a
+        // published or claimed row even when this registry has no references.
+        // Claims retain their counter unit until apply, so only absence from
+        // the kernel inventory permits this legacy backend retirement.
+        let kernel_retired = authority
+            .frame_mapping_count(split.old.frame)
+            .map_err(|error| {
+                TrapError::Hypervisor(format!("query COW retirement inventory: {error}"))
+            })?
+            .is_none();
         let removed = inventory.extents.remove(&split.old_key).ok_or_else(|| {
             TrapError::Hypervisor("HVPatch COW old inventory mapping disappeared".to_owned())
         })?;
@@ -2202,7 +2298,6 @@ impl HvfVmState {
                 "HVPatch COW old inventory identity drifted".to_owned(),
             ));
         }
-        let mut frames = inventory.frames.lock();
         decrement_inventory_reference(&mut frames.references, split.old.frame)?;
         decrement_inventory_reference(
             &mut frames.extent_references,
@@ -2250,12 +2345,14 @@ impl HvfVmState {
                 "HVPatch COW retired old frame retains backend mappings".to_owned(),
             ));
         }
+        let population_complete =
+            split.retirement.backend_frame_references_complete && kernel_retired;
         reconcile_carrier_stage2_authority_retention(
             &mut frames,
             (split.old.stage2_base, split.old.stage2_length),
-            split.retirement.backend_frame_references_complete,
+            population_complete,
         );
-        let retire_old_stage2 = split.retirement.backend_frame_references_complete
+        let retire_old_stage2 = population_complete
             && !frames
                 .stage2_references
                 .contains_key(&(split.old.stage2_base, split.old.stage2_length));
@@ -2337,10 +2434,12 @@ impl HvfVmState {
         let mapping = reservation
             .claim_mapping()
             .map_err(Self::reservation_error)?;
+        let stage2_lease = stage2_lease.unwrap_or((gpa, length));
+        let shared_key = InventorySharedFrameKey::new(backing, stage2_lease, stage2_owner);
         let frame = if let Some(frame) = inherited_frame {
             frame
         } else if matches!(backing, InventoryBackingIdentity::SharedFile { .. }) {
-            let existing = inventory.frames.lock().shared.get(&backing).copied();
+            let existing = inventory.frames.lock().shared.get(&shared_key).copied();
             match existing {
                 Some(frame) => frame,
                 None => reservation.claim_frame().map_err(Self::reservation_error)?,
@@ -2354,6 +2453,21 @@ impl HvfVmState {
             ));
         };
         let length_typed = carrick_hal::FrameLength::from_mapping_extent(length_value);
+        if let Some(generation) = std::num::NonZeroU64::new(stage2_owner.generation) {
+            let physical_length = std::num::NonZeroU64::new(stage2_lease.1)
+                .ok_or_else(|| TrapError::Hypervisor("empty physical backing".into()))?;
+            reservation
+                .bind_physical_frame(
+                    frame,
+                    carrick_hal::FrameBackingIdentity::from_allocator(
+                        carrick_guest_arch::FrameGpa::new(stage2_lease.0),
+                        generation,
+                        carrick_hal::FrameLength::from_mapping_extent(physical_length),
+                    ),
+                )
+                .map_err(Self::reservation_error)?;
+        }
+
         reservation
             .push(carrick_hal::FrameInventoryEvent::PrepareMapping {
                 transaction,
@@ -2396,7 +2510,6 @@ impl HvfVmState {
                     "HVPatch physical extent {extent_key:?} reference count exhausted"
                 ))
             })?;
-        let stage2_lease = stage2_lease.unwrap_or((gpa, length));
         if is_reusable_global_frame_extent(stage2_lease.0, stage2_lease.1) {
             match global_frame_host_owner_identity_in(custody, stage2_lease.0, stage2_lease.1) {
                 Some(live)
@@ -2439,15 +2552,15 @@ impl HvfVmState {
             .insert(stage2_lease, stage2_references);
         if matches!(backing, InventoryBackingIdentity::SharedFile { .. }) {
             // From this point the frame is REUSABLE by the next installer of
-            // the same file (the `existing` lookup above), and a reuser's batch
-            // names it without reserving it. The authority accepts that only
+            // the same physical owner (the `existing` lookup above). A reuser's
+            // batch names it without reserving it. The authority accepts that only
             // once this frame is published, so whoever stages a fresh shared
             // frame must publish it before releasing the frame registry guard
             // (`FrameRegistryGuard` / `frame_registry_lock()`) the staging ran
             // under (`vcpu_loop` alias-install arm). Publishing after the release
             // let a reuser publish first and aborted the carrier with
             // `UnreservedFrame` (2026-09-08).
-            frames.shared.entry(backing).or_insert(frame);
+            frames.shared.entry(shared_key).or_insert(frame);
         }
         drop(frames);
         let extent = InventoryExtent {
@@ -2502,7 +2615,7 @@ impl HvfVmState {
             if matches!(actual.backing, InventoryBackingIdentity::SharedFile { .. })
                 && !registry.references.contains_key(&actual.frame)
             {
-                registry.shared.remove(&actual.backing);
+                registry.shared.remove(&actual.shared_frame_key());
             }
         }
         Ok(())
@@ -2704,7 +2817,7 @@ impl HvfVmState {
             if retired.contains(&extent.frame)
                 && matches!(extent.backing, InventoryBackingIdentity::SharedFile { .. })
             {
-                frames.shared.remove(&extent.backing);
+                frames.shared.remove(&extent.shared_frame_key());
             }
         }
         for (&lease, &local) in &local_stage2_references {

@@ -157,7 +157,8 @@ impl GuestPreparedBacking {
                 carrick_hal::FrameInventoryEvent::UnmapMapping { mapping, .. } => {
                     unmapped_ids.push(mapping)
                 }
-                carrick_hal::FrameInventoryEvent::PrepareMapping { mapping, .. } => {
+                carrick_hal::FrameInventoryEvent::PrepareMapping { mapping, .. }
+                | carrick_hal::FrameInventoryEvent::PrepareMappingFragment { mapping, .. } => {
                     prepared_ids.push(mapping)
                 }
                 _ => {}
@@ -4321,13 +4322,18 @@ impl HvfTaskState {
         let inventory_ledger = std::sync::Arc::clone(&self.frame_inventory.ledger);
         let retired_old_stage2 = {
             let mut inventory = inventory_ledger.lock();
-            HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || {
-                self.retire_stage2_extent_for_cow(
-                    custody,
-                    split.old.stage2_base,
-                    split.old.stage2_length,
-                )
-            })
+            HvfVmState::commit_cow_inventory_split(
+                &mut inventory,
+                &split,
+                authority.as_ref(),
+                || {
+                    self.retire_stage2_extent_for_cow(
+                        custody,
+                        split.old.stage2_base,
+                        split.old.stage2_length,
+                    )
+                },
+            )
             .unwrap_or_else(|error| {
                 carrick_fatal!(
                     "hvpatch::frame_inventory",

@@ -100,6 +100,7 @@ pub struct FrameInventorySnapshot {
 #[derive(Debug, Default)]
 pub struct FrameInventoryAuthority {
     origin: FrameInventoryOrigin,
+    abandoned_permits: std::sync::Arc<std::sync::atomic::AtomicU64>,
     state: Mutex<InventoryState>,
     entropy: Mutex<ProvenanceEntropyBatch>,
 }
@@ -135,6 +136,18 @@ impl FrameInventoryAuthority {
     }
 }
 impl carrick_hal::PhysicalFrameInventory for PhysicalInventoryProjection {
+    fn origin(&self) -> &carrick_hal::FrameInventoryOrigin {
+        &self.inventory.origin
+    }
+
+    fn claim_unused_backing(
+        &self,
+        backing: carrick_hal::FrameBackingIdentity,
+    ) -> Result<Option<carrick_hal::FrameRetirementPermit>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        Ok(self.inventory.claim_unused_backing(&self.ids, backing)?)
+    }
+
     fn bind(
         &self,
         owner: carrick_hal::GuestFrameOwner,
@@ -150,27 +163,33 @@ impl carrick_hal::PhysicalFrameInventory for PhysicalInventoryProjection {
     ) -> Result<(FrameId, MappingId), Box<dyn std::error::Error + Send + Sync>> {
         Ok((self.ids.frame_id()?, self.ids.mapping_id()?))
     }
+    fn retire_mm_with_permits(
+        &self,
+        owner: carrick_hal::GuestFrameOwner,
+    ) -> Result<carrick_hal::InventoryReleased, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self
+            .inventory
+            .retire_mm_with_permits(&self.ids, FrameOwner::GuestMm(owner))?
+            .1)
+    }
     fn retire_mm(
         &self,
-        mm: carrick_hal::MmGeneration,
-    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        let owners: BTreeSet<_> = self
+        owner: carrick_hal::GuestFrameOwner,
+    ) -> Result<FrameInventoryRetirementReceipt, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self
             .inventory
-            .state
-            .lock()
-            .mm_mapping_counts
-            .keys()
-            .filter(|owner| matches!(owner, FrameOwner::GuestMm(guest) if guest.native_mm == mm))
-            .copied()
-            .collect();
-        let mut retired = 0;
-        for owner in owners {
-            retired += self.inventory.retire_mm(&self.ids, owner)?;
-        }
-        Ok(retired)
+            .retire_mm_with_receipt(&self.ids, FrameOwner::GuestMm(owner))?
+            .1)
     }
 }
 impl carrick_hal::FrameCowAuthority for PhysicalInventoryBinding {
+    fn prepare_return(
+        &self,
+        rows: &[carrick_hal::ExactReturnMappingRow],
+    ) -> Result<carrick_hal::PreparedReturn, carrick_hal::PrepareReturnError> {
+        self.inventory.prepare_return(&self.ids, self.mm, rows)
+    }
+
     fn quiesce(
         &self,
     ) -> Result<Box<dyn carrick_hal::FrameCowQuiesce>, Box<dyn std::error::Error + Send + Sync>>
@@ -298,9 +317,13 @@ impl ProvenanceEntropyBatch {
 #[derive(Debug, Default, Eq, PartialEq)]
 struct InventoryState {
     revision: u64,
+    return_claims: u64,
+    abandoned_returns: u64,
+    quarantined_returns: u64,
     reservations: BTreeMap<KernelTransactionId, ReservationRecord>,
     frames: BTreeMap<FrameId, FrameEntry>,
-    mappings: BTreeMap<MappingId, MappingEntry>,
+    physical_frames: BTreeMap<(carrick_guest_arch::FrameGpa, NonZeroU64), PhysicalAdmission>,
+    mappings: BTreeMap<MappingId, MappingSlot>,
     /// Live mapping count per address space, maintained alongside `mappings`.
     ///
     /// `apply_inner` has to report whether the committing mm still owns any
@@ -321,8 +344,64 @@ struct ReservationRecord {
     mappings: Vec<MappingId>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
+struct PhysicalAdmission {
+    frame: FrameId,
+    lease: std::sync::Weak<()>,
+}
+impl PartialEq for PhysicalAdmission {
+    fn eq(&self, other: &Self) -> bool {
+        self.frame == other.frame && self.lease.ptr_eq(&other.lease)
+    }
+}
+impl Eq for PhysicalAdmission {}
+
+#[derive(Debug)]
 struct FrameEntry {
+    length: FrameLength,
+    references: std::sync::Arc<Mutex<FrameCell>>,
+}
+/// Physical identity lives beside the reference authority, not in the hot
+/// inventory entry or in each alias. Claims retain this same cell.
+#[derive(Debug)]
+struct FrameCell {
+    admission: std::sync::Arc<()>,
+    backing: Option<carrick_hal::FrameBackingIdentity>,
+    references: carrick_core::mm::frames::FrameReferences,
+}
+impl core::ops::Deref for FrameCell {
+    type Target = carrick_core::mm::frames::FrameReferences;
+    fn deref(&self) -> &Self::Target {
+        &self.references
+    }
+}
+impl core::ops::DerefMut for FrameCell {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.references
+    }
+}
+impl PartialEq for FrameEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.snapshot() == other.snapshot()
+    }
+}
+impl Eq for FrameEntry {}
+impl FrameEntry {
+    fn backing(&self) -> Option<carrick_hal::FrameBackingIdentity> {
+        self.references.lock().backing
+    }
+    fn snapshot(&self) -> FrameSnapshot {
+        let cell = self.references.lock();
+        FrameSnapshot {
+            backing: cell.backing,
+            length: self.length,
+            references: cell.references,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FrameSnapshot {
+    backing: Option<carrick_hal::FrameBackingIdentity>,
     length: FrameLength,
     references: carrick_core::mm::frames::FrameReferences,
 }
@@ -338,10 +417,55 @@ struct MappingEntry {
     state: MappingState,
 }
 
+/// The placeholder exposes diagnostic metadata only; the claimant owns the row.
+#[derive(Debug, Eq, PartialEq)]
+enum MappingSlot {
+    Live(MappingEntry),
+    Claimed(claimed_return::ClaimMark),
+}
+impl MappingSlot {
+    fn owner(&self) -> FrameOwner {
+        match self {
+            Self::Live(entry) => entry.mm,
+            Self::Claimed(mark) => mark.row().mm,
+        }
+    }
+    fn frame(&self) -> FrameId {
+        match self {
+            Self::Live(entry) => entry.frame,
+            Self::Claimed(mark) => mark.row().frame,
+        }
+    }
+    fn snapshot(&self, mapping: MappingId) -> Option<MappingRow> {
+        match self {
+            Self::Live(entry) if entry.state.is_published() => Some(MappingRow {
+                mapping,
+                frame: entry.frame,
+                mm: entry.mm,
+                generation: entry.generation,
+                gpa: entry.gpa,
+                length: entry.length,
+                permissions: entry.permissions,
+            }),
+            Self::Live(_) => None,
+            Self::Claimed(mark) => Some(mark.row()),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MappingState {
     Prepared(KernelTransactionId),
     Published,
+}
+
+impl MappingState {
+    fn is_published(self) -> bool {
+        match self {
+            Self::Published => true,
+            Self::Prepared(_) => false,
+        }
+    }
 }
 
 /// Transaction-local copy-on-write view. Only touched mappings and frames are
@@ -358,7 +482,7 @@ enum MappingState {
 fn recomputed_mm_mapping_counts(state: &InventoryState) -> BTreeMap<FrameOwner, usize> {
     let mut counts = BTreeMap::new();
     for mapping in state.mappings.values() {
-        *counts.entry(mapping.mm).or_insert(0) += 1;
+        *counts.entry(mapping.owner()).or_insert(0) += 1;
     }
     counts
 }
@@ -374,13 +498,13 @@ fn decrement_mm_mapping_count(counts: &mut BTreeMap<FrameOwner, usize>, mm: Fram
 
 struct InventoryOverlay<'a> {
     base: &'a InventoryState,
-    frames: BTreeMap<FrameId, Option<FrameEntry>>,
+    frames: BTreeMap<FrameId, Option<FrameSnapshot>>,
     mappings: BTreeMap<MappingId, Option<MappingEntry>>,
     last_unmapped: BTreeMap<FrameId, MappingGeneration>,
 }
 
 struct InventoryChanges {
-    frames: BTreeMap<FrameId, Option<FrameEntry>>,
+    frames: BTreeMap<FrameId, Option<FrameSnapshot>>,
     mappings: BTreeMap<MappingId, Option<MappingEntry>>,
 }
 
@@ -398,13 +522,23 @@ impl<'a> InventoryOverlay<'a> {
         match self.mappings.get(&mapping) {
             Some(Some(entry)) => Some(entry),
             Some(None) => None,
-            None => self.base.mappings.get(&mapping),
+            None => self
+                .base
+                .mappings
+                .get(&mapping)
+                .and_then(|slot| match slot {
+                    MappingSlot::Live(entry) => Some(entry),
+                    MappingSlot::Claimed(_) => None,
+                }),
         }
     }
 
     fn mapping_mut(&mut self, mapping: MappingId) -> Option<&mut MappingEntry> {
         if !self.mappings.contains_key(&mapping) {
-            let entry = *self.base.mappings.get(&mapping)?;
+            let entry = match self.base.mappings.get(&mapping)? {
+                MappingSlot::Live(entry) => *entry,
+                MappingSlot::Claimed(_) => return None,
+            };
             self.mappings.insert(mapping, Some(entry));
         }
         self.mappings.get_mut(&mapping)?.as_mut()
@@ -419,23 +553,22 @@ impl<'a> InventoryOverlay<'a> {
         self.last_unmapped.insert(frame, generation);
     }
 
-    fn frame(&self, frame: FrameId) -> Option<&FrameEntry> {
+    fn frame(&self, frame: FrameId) -> Option<FrameSnapshot> {
         match self.frames.get(&frame) {
-            Some(Some(entry)) => Some(entry),
-            Some(None) => None,
-            None => self.base.frames.get(&frame),
+            Some(entry) => *entry,
+            None => self.base.frames.get(&frame).map(FrameEntry::snapshot),
         }
     }
 
-    fn frame_mut(&mut self, frame: FrameId) -> Option<&mut FrameEntry> {
+    fn frame_mut(&mut self, frame: FrameId) -> Option<&mut FrameSnapshot> {
         if !self.frames.contains_key(&frame) {
-            let entry = *self.base.frames.get(&frame)?;
+            let entry = self.base.frames.get(&frame)?.snapshot();
             self.frames.insert(frame, Some(entry));
         }
         self.frames.get_mut(&frame)?.as_mut()
     }
 
-    fn insert_frame(&mut self, frame: FrameId, entry: FrameEntry) {
+    fn insert_frame(&mut self, frame: FrameId, entry: FrameSnapshot) {
         self.frames.insert(frame, Some(entry));
     }
 
@@ -465,7 +598,7 @@ impl FrameInventoryAuthority {
         mapping_candidates: usize,
         event_capacity: FrameEventCapacity,
     ) -> Result<FrameInventoryReservation, FrameInventoryReserveError> {
-        let (reservation, record) = prepare_reservation(
+        let (reservation, record) = prepare_mapping_reservation(
             ids,
             frame_candidates,
             mapping_candidates,
@@ -549,7 +682,9 @@ impl FrameInventoryAuthority {
             .ok_or(FrameInventoryError::UnreservedTransaction(transaction))?;
         let mut mappings = Vec::new();
         for event in commit.batch().events() {
-            if let FrameInventoryEvent::PrepareMapping { mapping, frame, .. } = *event {
+            if let FrameInventoryEvent::PrepareMapping { mapping, frame, .. }
+            | FrameInventoryEvent::PrepareMappingFragment { mapping, frame, .. } = *event
+            {
                 mappings.push((mapping, frame));
             }
         }
@@ -583,10 +718,12 @@ impl FrameInventoryAuthority {
         }
         let mm = FrameOwner::from_receipt_owner(receipt.owner());
         let mut state = self.state.lock();
-        let next_revision = state
+        state
             .revision
-            .checked_add(1)
+            .checked_add(state.return_claims)
+            .and_then(|reserved| reserved.checked_add(1))
             .ok_or(FrameInventoryError::RevisionExhausted)?;
+        let next_revision = state.revision + 1;
         let mut unique = BTreeSet::new();
         for &(mapping, frame) in receipt.mapping_set() {
             if !unique.insert(mapping) {
@@ -595,15 +732,19 @@ impl FrameInventoryAuthority {
             let entry = state
                 .mappings
                 .get(&mapping)
+                .and_then(|slot| match slot {
+                    MappingSlot::Live(entry) => Some(entry),
+                    MappingSlot::Claimed(_) => None,
+                })
                 .ok_or(FrameInventoryError::RollbackReceiptMismatch(mapping))?;
-            if entry.state != MappingState::Published || entry.mm != mm || entry.frame != frame {
+            if !entry.state.is_published() || entry.mm != mm || entry.frame != frame {
                 return Err(FrameInventoryError::RollbackReceiptMismatch(mapping));
             }
             let frame_entry = state
                 .frames
                 .get(&frame)
                 .ok_or(FrameInventoryError::RollbackReceiptMismatch(mapping))?;
-            if frame_entry.references.count() == 0 {
+            if frame_entry.references.lock().count() == 0 {
                 return Err(FrameInventoryError::MappingCountUnderflow(frame));
             }
         }
@@ -613,7 +754,7 @@ impl FrameInventoryAuthority {
                 .mappings
                 .remove(&mapping)
                 .ok_or(FrameInventoryError::RollbackReceiptMismatch(mapping))?;
-            decrement_mm_mapping_count(&mut state.mm_mapping_counts, removed.mm);
+            decrement_mm_mapping_count(&mut state.mm_mapping_counts, removed.owner());
             let retire_frame = {
                 let frame_entry = state
                     .frames
@@ -621,12 +762,20 @@ impl FrameInventoryAuthority {
                     .ok_or(FrameInventoryError::RollbackReceiptMismatch(mapping))?;
                 frame_entry
                     .references
+                    .lock()
                     .unmap()
                     .map_err(|_| FrameInventoryError::MappingCountUnderflow(frame))?;
-                frame_entry.references.count() == 0
+                frame_entry.references.lock().count() == 0
             };
-            if retire_frame {
-                state.frames.remove(&frame);
+            if retire_frame
+                && let Some(backing) = state
+                    .frames
+                    .remove(&frame)
+                    .and_then(|entry| entry.backing())
+            {
+                state
+                    .physical_frames
+                    .remove(&(backing.ipa(), backing.host_owner_generation()));
             }
         }
         state.revision = next_revision;
@@ -639,7 +788,7 @@ impl FrameInventoryAuthority {
     /// Returns the number of mappings unmapped; the receipt must prove the
     /// MM empty at the produced revision.
     ///
-    /// Every committed row is `Published`: `apply_inner` refuses a batch
+    /// Return claims refuse teardown with `RetryPending`. Otherwise every committed row is `Published`: `apply_inner` refuses a batch
     /// that leaves a `Prepared` mapping (`UnpublishedMapping`) and applies
     /// nothing, so the scan takes every row of `mm` and an empty receipt
     /// follows unless a concurrent commit maps into `mm`. A fork child is
@@ -650,15 +799,94 @@ impl FrameInventoryAuthority {
         ids: &ObjectIdRegistry,
         mm: impl Into<FrameOwner>,
     ) -> Result<usize, FrameInventoryRetireMmError> {
-        let mm = mm.into();
+        self.retire_mm_with_receipt(ids, mm).map(|(count, _)| count)
+    }
+
+    /// Retire an MM and retain every last physical owner until its backend
+    /// consumes the returned permits. Validation and transfer are atomic with
+    /// the existing inventory batch; physical callbacks run after unlock.
+    pub fn retire_mm_with_permits(
+        self: &std::sync::Arc<Self>,
+        ids: &ObjectIdRegistry,
+        mm: impl Into<FrameOwner>,
+    ) -> Result<(usize, carrick_hal::InventoryReleased), FrameInventoryRetireMmError> {
+        let mut output = RetirementOutput {
+            permits: Vec::new(),
+            cleanup: std::sync::Arc::new(claimed_return::RetirementCleanup(
+                std::sync::Arc::downgrade(self),
+            )),
+        };
+        let (count, receipt) = self.retire_mm_inner(ids, mm.into(), Some(&mut output))?;
+        let released = carrick_hal::InventoryReleased::from_retirement(receipt)
+            .ok_or(FrameInventoryRetireMmError::NotEmpty)?;
+        let released = released
+            .with_retirements(output.permits)
+            .map_err(|_| FrameInventoryRetireMmError::ReceiptMismatch)?;
+        Ok((count, released))
+    }
+
+    pub fn retire_mm_with_receipt(
+        &self,
+        ids: &ObjectIdRegistry,
+        mm: impl Into<FrameOwner>,
+    ) -> Result<(usize, FrameInventoryRetirementReceipt), FrameInventoryRetireMmError> {
+        self.retire_mm_inner(ids, mm.into(), None)
+    }
+
+    fn retire_mm_inner(
+        &self,
+        ids: &ObjectIdRegistry,
+        mm: FrameOwner,
+        output: Option<&mut RetirementOutput>,
+    ) -> Result<(usize, FrameInventoryRetirementReceipt), FrameInventoryRetireMmError> {
         let rows: Vec<(MappingId, FrameId, MappingGeneration)> = {
             let state = self.state.lock();
             if state.mm_mapping_counts.get(&mm).copied().unwrap_or(0) == 0 {
-                return Ok(0);
+                drop(state);
+                let reservation = self.reserve(
+                    ids,
+                    0,
+                    0,
+                    FrameEventCapacity::for_event_count(1)
+                        .map_err(FrameInventoryReserveError::from)?,
+                )?;
+                let transaction = reservation.transaction();
+                let mut state = self.state.lock();
+                if state.mm_mapping_counts.contains_key(&mm) {
+                    state.reservations.remove(&transaction);
+                    return Err(FrameInventoryRetireMmError::RetryPending);
+                }
+                let record = state
+                    .reservations
+                    .remove(&transaction)
+                    .ok_or(FrameInventoryReserveError::DuplicateTransaction)?;
+                let apply = FrameInventoryApplyReceipt::from_kernel_authority(
+                    self.origin.clone(),
+                    record.provenance,
+                    transaction,
+                    mm.receipt_owner(),
+                    state.revision,
+                    Vec::new(),
+                );
+                return Ok((
+                    0,
+                    FrameInventoryRetirementReceipt::from_kernel_authority(apply, true),
+                ));
+            }
+            if state
+                .mappings
+                .values()
+                .any(|entry| entry.owner() == mm && matches!(entry, MappingSlot::Claimed(_)))
+            {
+                return Err(FrameInventoryRetireMmError::RetryPending);
             }
             state
                 .mappings
                 .iter()
+                .filter_map(|(id, slot)| match slot {
+                    MappingSlot::Live(entry) => Some((id, entry)),
+                    MappingSlot::Claimed(_) => None,
+                })
                 .filter(|(_, entry)| entry.mm == mm)
                 .map(|(mapping, entry)| (*mapping, entry.frame, entry.generation))
                 .collect()
@@ -690,11 +918,20 @@ impl FrameInventoryAuthority {
                 generation,
             })?;
         }
-        let (_, receipt) = self.apply_retirement_with_receipt(mm, reservation.commit(()))?;
+        // A return may claim a row after the snapshot above. Its owned
+        // operation must finish before teardown can retry, just as when the
+        // initial scan found it. Do not lower that contention to an apply
+        // invariant merely because admission raced the scan.
+        let (_, receipt) = self
+            .apply_retirement_inner(mm, reservation.commit(()), output)
+            .map_err(|error| match error {
+                FrameInventoryError::ClaimedMapping(_) => FrameInventoryRetireMmError::RetryPending,
+                error => FrameInventoryRetireMmError::Apply(error),
+            })?;
         if !receipt.mm_empty_at_revision() {
             return Err(FrameInventoryRetireMmError::NotEmpty);
         }
-        Ok(rows.len())
+        Ok((rows.len(), receipt))
     }
 
     pub fn apply_retirement_with_receipt<T>(
@@ -702,7 +939,15 @@ impl FrameInventoryAuthority {
         mm: impl Into<FrameOwner>,
         commit: FrameInventoryCommit<T>,
     ) -> Result<(T, FrameInventoryRetirementReceipt), FrameInventoryError> {
-        let mm = mm.into();
+        self.apply_retirement_inner(mm.into(), commit, None)
+    }
+
+    fn apply_retirement_inner<T>(
+        &self,
+        mm: FrameOwner,
+        commit: FrameInventoryCommit<T>,
+        output: Option<&mut RetirementOutput>,
+    ) -> Result<(T, FrameInventoryRetirementReceipt), FrameInventoryError> {
         let transaction = commit.batch().transaction();
         let state = self.state.lock();
         let provenance = state
@@ -718,7 +963,7 @@ impl FrameInventoryAuthority {
                 let frame = state
                     .mappings
                     .get(&mapping)
-                    .map(|entry| entry.frame)
+                    .map(MappingSlot::frame)
                     .ok_or(FrameInventoryError::NonliveMapping(mapping))?;
                 mappings.push((mapping, frame));
             }
@@ -728,7 +973,7 @@ impl FrameInventoryAuthority {
         drop(state);
         let mm_id = mm;
         let (outcome, revision, mm_empty_at_revision) =
-            self.apply_inner(mm_id, commit, None, None)?;
+            self.apply_inner_with_retirements(mm_id, commit, None, None, output)?;
         let receipt = FrameInventoryApplyReceipt::from_kernel_authority(
             self.origin.clone(),
             provenance,
@@ -750,7 +995,21 @@ impl FrameInventoryAuthority {
         fail_before_event: Option<usize>,
         grant: Option<ExactMappingRow>,
     ) -> Result<(T, u64, bool), FrameInventoryError> {
+        self.apply_inner_with_retirements(mm, commit, fail_before_event, grant, None)
+    }
+
+    fn apply_inner_with_retirements<T>(
+        &self,
+        mm: FrameOwner,
+        commit: FrameInventoryCommit<T>,
+        fail_before_event: Option<usize>,
+        grant: Option<ExactMappingRow>,
+        mut output: Option<&mut RetirementOutput>,
+    ) -> Result<(T, u64, bool), FrameInventoryError> {
         let transaction = commit.batch().transaction();
+        // Declare custody before the guard: on rejection or unwind, backend
+        // destructors must run after the inventory lock has been released.
+        let (outcome, batch);
         let mut state = self.state.lock();
         let reserved_provenance = state
             .reservations
@@ -764,20 +1023,52 @@ impl FrameInventoryAuthority {
             .reservations
             .remove(&transaction)
             .ok_or(FrameInventoryError::UnreservedTransaction(transaction))?;
-        let (outcome, batch) = commit.into_parts();
+        (outcome, batch) = commit.into_parts();
         if batch.events().is_empty() {
             return Err(FrameInventoryError::EmptyBatch);
         }
-        let next_revision = state
+        state
             .revision
-            .checked_add(1)
+            .checked_add(state.return_claims)
+            .and_then(|reserved| reserved.checked_add(1))
             .ok_or(FrameInventoryError::RevisionExhausted)?;
+        let next_revision = state.revision + 1;
         let mut candidate = InventoryOverlay::new(&state);
         for (index, event) in batch.events().iter().copied().enumerate() {
             if fail_before_event == Some(index) {
                 return Err(FrameInventoryError::InjectedFailure(index));
             }
             apply_event(&mut candidate, &reservation, mm, transaction, event)?;
+        }
+        let mut bound = BTreeMap::new();
+        for &(frame, backing) in batch.physical_frames() {
+            if state
+                .physical_frames
+                .get(&(backing.ipa(), backing.host_owner_generation()))
+                .is_some_and(|existing| {
+                    existing.lease.strong_count() != 0 && existing.frame != frame
+                })
+                || bound
+                    .insert((backing.ipa(), backing.host_owner_generation()), frame)
+                    .is_some_and(|existing| existing != frame)
+            {
+                return Err(FrameInventoryError::PhysicalIdentityMismatch(frame));
+            }
+            let entry = candidate
+                .frame_mut(frame)
+                .ok_or(FrameInventoryError::RetiredFrame(frame))?;
+            if (entry.backing.is_none() && reservation.frames.binary_search(&frame).is_err())
+                || entry.backing.is_some_and(|existing| existing != backing)
+                || backing.length().raw() < entry.length.raw()
+                || backing
+                    .ipa()
+                    .raw()
+                    .checked_add(backing.length().raw())
+                    .is_none()
+            {
+                return Err(FrameInventoryError::PhysicalIdentityMismatch(frame));
+            }
+            entry.backing = Some(backing);
         }
         if fail_before_event == Some(batch.events().len()) {
             return Err(FrameInventoryError::InjectedFailure(batch.events().len()));
@@ -792,7 +1083,7 @@ impl FrameInventoryAuthority {
             // overlay), exactly, in this mm.
             let exact = matches!(
                 candidate.mappings.get(&grant.mapping),
-                Some(Some(entry)) if entry.state == MappingState::Published
+                Some(Some(entry)) if entry.state.is_published()
                     && entry.mm == mm
                     && entry.frame == grant.frame
                     && entry.gpa == grant.gpa
@@ -803,13 +1094,85 @@ impl FrameInventoryAuthority {
             }
         }
         let changes = candidate.into_changes();
+        // Every fallible step precedes publication. Keep the exact stable
+        // admission alive when the overlay removes the final inventory row.
+        let mut physical = BTreeMap::new();
+        if let Some(output) = output.as_mut() {
+            output
+                .permits
+                .try_reserve(changes.frames.len())
+                .map_err(|_| FrameInventoryError::RetirementAllocation)?;
+            for (&frame, entry) in &changes.frames {
+                if entry.is_none() {
+                    let cell = state
+                        .frames
+                        .get(&frame)
+                        .ok_or(FrameInventoryError::RetiredFrame(frame))?
+                        .references
+                        .lock();
+                    let backing = cell
+                        .backing
+                        .ok_or(FrameInventoryError::MissingPhysicalIdentity(frame))?;
+                    physical.insert(frame, (backing, cell.admission.clone()));
+                }
+            }
+        }
         for (frame, entry) in changes.frames {
             match entry {
-                Some(entry) => {
-                    state.frames.insert(frame, entry);
-                }
+                Some(entry) => match state.frames.get_mut(&frame) {
+                    Some(cell) => {
+                        let mut cell = cell.references.lock();
+                        cell.backing = entry.backing;
+                        cell.references = entry.references;
+                    }
+                    None => {
+                        let admission = std::sync::Arc::new(());
+                        if let Some(backing) = entry.backing {
+                            state.physical_frames.insert(
+                                (backing.ipa(), backing.host_owner_generation()),
+                                PhysicalAdmission {
+                                    frame,
+                                    lease: std::sync::Arc::downgrade(&admission),
+                                },
+                            );
+                        }
+                        state.frames.insert(
+                            frame,
+                            FrameEntry {
+                                length: entry.length,
+                                references: std::sync::Arc::new(Mutex::new(FrameCell {
+                                    admission,
+                                    backing: entry.backing,
+                                    references: entry.references,
+                                })),
+                            },
+                        );
+                    }
+                },
                 None => {
-                    state.frames.remove(&frame);
+                    let removed = state.frames.remove(&frame);
+                    if let Some((backing, admission)) = physical.remove(&frame) {
+                        if let Some(output) = output.as_mut() {
+                            // SAFETY: the validated overlay removed the final
+                            // reference in this leaf-lock turn. Publication is
+                            // excluded by the retained physical admission.
+                            output.permits.push(unsafe {
+                                carrick_hal::FrameRetirementPermit::from_inventory(
+                                    self.origin.clone(),
+                                    frame,
+                                    backing,
+                                    next_revision,
+                                    self.abandoned_permits.clone(),
+                                    admission,
+                                    output.cleanup.clone(),
+                                )
+                            });
+                        }
+                    } else if let Some(backing) = removed.and_then(|entry| entry.backing()) {
+                        state
+                            .physical_frames
+                            .remove(&(backing.ipa(), backing.host_owner_generation()));
+                    }
                 }
             }
         }
@@ -817,14 +1180,15 @@ impl FrameInventoryAuthority {
             match entry {
                 Some(entry) => {
                     let mm_after = entry.mm;
-                    if let Some(previous) = state.mappings.insert(mapping, entry) {
-                        decrement_mm_mapping_count(&mut state.mm_mapping_counts, previous.mm);
+                    if let Some(previous) = state.mappings.insert(mapping, MappingSlot::Live(entry))
+                    {
+                        decrement_mm_mapping_count(&mut state.mm_mapping_counts, previous.owner());
                     }
                     *state.mm_mapping_counts.entry(mm_after).or_insert(0) += 1;
                 }
                 None => {
                     if let Some(previous) = state.mappings.remove(&mapping) {
-                        decrement_mm_mapping_count(&mut state.mm_mapping_counts, previous.mm);
+                        decrement_mm_mapping_count(&mut state.mm_mapping_counts, previous.owner());
                     }
                 }
             }
@@ -855,7 +1219,11 @@ impl FrameInventoryAuthority {
         let entry = state
             .mappings
             .get(&mapping)
-            .filter(|entry| entry.mm == mm && entry.state == MappingState::Published)?;
+            .and_then(|slot| match slot {
+                MappingSlot::Live(entry) => Some(entry),
+                MappingSlot::Claimed(_) => None,
+            })
+            .filter(|entry| entry.mm == mm && entry.state.is_published())?;
         Some(MappingRow {
             mapping,
             frame: entry.frame,
@@ -911,8 +1279,12 @@ impl FrameInventoryAuthority {
         state
             .mappings
             .get(&mapping)
+            .and_then(|slot| match slot {
+                MappingSlot::Live(entry) => Some(entry),
+                MappingSlot::Claimed(_) => None,
+            })
             .filter(|entry| {
-                entry.state == MappingState::Published
+                entry.state.is_published()
                     && entry.mm == mm
                     && entry.frame == frame
                     && entry.gpa == gpa
@@ -960,12 +1332,17 @@ impl FrameInventoryAuthority {
             .map(|(transaction, _)| *transaction)
     }
 
+    pub fn abandoned_retirement_permits(&self) -> u64 {
+        self.abandoned_permits
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn frame_mapping_count(&self, frame: FrameId) -> Option<usize> {
         let state = self.state.lock();
         state
             .frames
             .get(&frame)
-            .map(|entry| entry.references.count() as usize)
+            .map(|entry| entry.references.lock().count() as usize)
     }
 
     /// Query extent liveness for a batch of candidate extents and reference
@@ -981,13 +1358,20 @@ impl FrameInventoryAuthority {
         let extent_liveness = extents
             .iter()
             .map(|&(target_map, frame, gpa, length)| {
-                state.mappings.get(&target_map).is_some_and(|entry| {
-                    entry.state == MappingState::Published
-                        && entry.mm == mm
-                        && entry.frame == frame
-                        && entry.gpa == gpa
-                        && entry.length == length
-                })
+                state
+                    .mappings
+                    .get(&target_map)
+                    .and_then(|slot| match slot {
+                        MappingSlot::Live(entry) => Some(entry),
+                        MappingSlot::Claimed(_) => None,
+                    })
+                    .is_some_and(|entry| {
+                        entry.state.is_published()
+                            && entry.mm == mm
+                            && entry.frame == frame
+                            && entry.gpa == gpa
+                            && entry.length == length
+                    })
             })
             .collect();
         let frame_counts = frames
@@ -996,7 +1380,7 @@ impl FrameInventoryAuthority {
                 state
                     .frames
                     .get(&frame)
-                    .map(|entry| entry.references.count() as usize)
+                    .map(|entry| entry.references.lock().count() as usize)
             })
             .collect();
         (extent_liveness, frame_counts)
@@ -1049,6 +1433,37 @@ fn apply_event(
     if event.transaction() != transaction {
         return Err(FrameInventoryError::TransactionMismatch);
     }
+    // A claim is an owned operation, not an unpublished mapping. Refuse
+    // every mapping mutation before copying its row into the overlay.
+    let mapping = match event {
+        FrameInventoryEvent::PrepareMapping { mapping, .. }
+        | FrameInventoryEvent::PrepareMappingFragment { mapping, .. }
+        | FrameInventoryEvent::PublishMapping { mapping, .. }
+        | FrameInventoryEvent::ProtectMapping { mapping, .. }
+        | FrameInventoryEvent::UnmapMapping { mapping, .. } => Some(mapping),
+        FrameInventoryEvent::RetireFrame { .. }
+        | FrameInventoryEvent::RetireFrameIfLastUnmap { .. } => None,
+    };
+    if let Some(mapping) = mapping
+        && matches!(
+            state.base.mappings.get(&mapping),
+            Some(MappingSlot::Claimed(_))
+        )
+    {
+        return Err(FrameInventoryError::ClaimedMapping(mapping));
+    }
+    let fragment_source = match event {
+        FrameInventoryEvent::PrepareMappingFragment { source, .. } => {
+            if matches!(
+                state.base.mappings.get(&source),
+                Some(MappingSlot::Claimed(_))
+            ) {
+                return Err(FrameInventoryError::ClaimedMapping(source));
+            }
+            Some(source)
+        }
+        _ => None,
+    };
     match event {
         FrameInventoryEvent::PrepareMapping {
             frame,
@@ -1058,7 +1473,31 @@ fn apply_event(
             length,
             permissions,
             ..
+        }
+        | FrameInventoryEvent::PrepareMappingFragment {
+            frame,
+            mapping,
+            generation,
+            gpa,
+            length,
+            permissions,
+            ..
         } => {
+            if let Some(source) = fragment_source {
+                let entry = live_mapping_mut(state, mm, source)?;
+                if entry.frame != frame
+                    || gpa.raw() < entry.gpa.raw()
+                    || gpa.raw().checked_add(length.raw()).is_none_or(|end| {
+                        entry
+                            .gpa
+                            .raw()
+                            .checked_add(entry.length.raw())
+                            .is_none_or(|source_end| end > source_end)
+                    })
+                {
+                    return Err(FrameInventoryError::InvalidFragment(source));
+                }
+            }
             tracing::trace!(
                 ?mm,
                 ?transaction,
@@ -1098,7 +1537,8 @@ fn apply_event(
                 }
                 state.insert_frame(
                     frame,
-                    FrameEntry {
+                    FrameSnapshot {
+                        backing: None,
                         length,
                         references: carrick_core::mm::frames::FrameReferences::default(),
                     },
@@ -1117,10 +1557,14 @@ fn apply_event(
                     actual: length,
                 });
             }
-            frame_entry
-                .references
-                .retain()
-                .map_err(|_| FrameInventoryError::MappingCountExhausted(frame))?;
+            if fragment_source.is_some() {
+                split_overlay_reference(&mut frame_entry.references, frame)?;
+            } else {
+                frame_entry
+                    .references
+                    .retain()
+                    .map_err(|_| FrameInventoryError::MappingCountExhausted(frame))?;
+            }
             state.insert_mapping(
                 mapping,
                 MappingEntry {
@@ -1229,7 +1673,7 @@ fn apply_event(
         FrameInventoryEvent::RetireFrameIfLastUnmap {
             frame, generation, ..
         } => {
-            let outcome = match state.frame(frame).copied() {
+            let outcome = match state.frame(frame) {
                 // An earlier holder's pending retirement already ran in this
                 // batch's last unmap, or another holder's batch retired it.
                 None => ConditionalRetirement::AlreadyRetired,
@@ -1292,6 +1736,38 @@ enum ConditionalRetirement {
     AlreadyRetired,
 }
 
+/// Split one tentative reference before publishing any overlay changes. The
+/// borrowed cell cannot escape this operation: every owned unit is restored
+/// before extracting its snapshot. On failure the live inventory is untouched.
+fn split_overlay_reference(
+    references: &mut carrick_core::mm::frames::FrameReferences,
+    frame: FrameId,
+) -> Result<(), FrameInventoryError> {
+    use carrick_core::mm::frames::{FrameRef, FrameReferenceCell, FrameReferences};
+    #[derive(Clone, Copy)]
+    struct OverlayCell<'a>(&'a std::cell::RefCell<FrameReferences>);
+    impl FrameReferenceCell for OverlayCell<'_> {
+        fn with_references<R>(&self, update: impl FnOnce(&mut FrameReferences) -> R) -> R {
+            update(&mut self.0.borrow_mut())
+        }
+    }
+    let cell = std::cell::RefCell::new(*references);
+    let reference = FrameRef::claim(OverlayCell(&cell))
+        .map_err(|_| FrameInventoryError::MappingCountUnderflow(frame))?;
+    let units = match reference.split(std::num::NonZeroU32::MIN.saturating_add(1)) {
+        Ok(units) => units,
+        Err(reference) => {
+            reference.restore();
+            return Err(FrameInventoryError::MappingCountExhausted(frame));
+        }
+    };
+    for unit in units {
+        unit.restore();
+    }
+    *references = cell.into_inner();
+    Ok(())
+}
+
 fn live_mapping_mut<'a>(
     state: &'a mut InventoryOverlay<'_>,
     mm: FrameOwner,
@@ -1307,7 +1783,7 @@ fn live_mapping_mut<'a>(
             attempted: mm,
         });
     }
-    if entry.state != MappingState::Published {
+    if !entry.state.is_published() {
         return Err(FrameInventoryError::MappingNotPublished(mapping));
     }
     Ok(entry)
@@ -1360,20 +1836,14 @@ fn snapshot_state(state: &InventoryState, mm_filter: Option<FrameOwner>) -> Fram
         });
     }
     let mut mappings = Vec::with_capacity(state.mappings.len());
-    for (mapping, entry) in &state.mappings {
-        if entry.state != MappingState::Published || mm_filter.is_some_and(|mm| entry.mm != mm) {
+    for (mapping, slot) in &state.mappings {
+        let Some(row) = slot.snapshot(*mapping) else {
+            continue;
+        };
+        if mm_filter.is_some_and(|mm| row.mm != mm) {
             continue;
         }
-        let row = MappingRow {
-            mapping: *mapping,
-            frame: entry.frame,
-            mm: entry.mm,
-            generation: entry.generation,
-            gpa: entry.gpa,
-            length: entry.length,
-            permissions: entry.permissions,
-        };
-        if let Some(index) = frame_indexes.get(&entry.frame).copied() {
+        if let Some(index) = frame_indexes.get(&row.frame).copied() {
             frames[index].mappings.push(*mapping);
         }
         mappings.push(row);
@@ -1388,7 +1858,21 @@ fn snapshot_state(state: &InventoryState, mm_filter: Option<FrameOwner>) -> Fram
     }
 }
 
+/// Issue transaction identity and fork-safe provenance for both event batches
+/// and claimed returns, before either acquires the inventory lock.
 fn prepare_reservation(
+    ids: &ObjectIdRegistry,
+    entropy: &Mutex<ProvenanceEntropyBatch>,
+) -> Result<(KernelTransactionId, FrameInventoryProvenance), FrameInventoryReserveError> {
+    let transaction = ids.transaction_id()?;
+    let provenance_bytes = entropy.lock().next(std::process::id(), |bytes| {
+        getrandom::fill(bytes).map_err(|_| FrameInventoryReserveError::EntropyUnavailable)
+    })?;
+    let provenance = FrameInventoryProvenance::from_kernel_entropy(provenance_bytes);
+    Ok((transaction, provenance))
+}
+
+fn prepare_mapping_reservation(
     ids: &ObjectIdRegistry,
     frame_candidates: usize,
     mapping_candidates: usize,
@@ -1414,11 +1898,7 @@ fn prepare_reservation(
     recorded_mappings
         .try_reserve_exact(mapping_candidates)
         .map_err(|_| FrameInventoryReserveError::AllocationFailed)?;
-    let transaction = ids.transaction_id()?;
-    let provenance_bytes = entropy.lock().next(std::process::id(), |bytes| {
-        getrandom::fill(bytes).map_err(|_| FrameInventoryReserveError::EntropyUnavailable)
-    })?;
-    let provenance = FrameInventoryProvenance::from_kernel_entropy(provenance_bytes);
+    let (transaction, provenance) = prepare_reservation(ids, entropy)?;
     let batch = FrameInventoryBatch::prepare(transaction, event_capacity)?;
     for _ in 0..frame_candidates {
         let frame = ids.frame_id()?;
@@ -1444,8 +1924,12 @@ fn prepare_reservation(
 /// Why a whole-MM inventory retirement refused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum FrameInventoryRetireMmError {
+    #[error("MM retirement receipt does not match its physical permits")]
+    ReceiptMismatch,
     #[error("MM retirement event count overflows")]
     Capacity,
+    #[error("MM has an outstanding return claim; retry after its release")]
+    RetryPending,
     #[error("MM retirement left mappings live in the MM")]
     NotEmpty,
     #[error(transparent)]
@@ -1474,6 +1958,12 @@ pub enum FrameInventoryReserveError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum FrameInventoryError {
+    #[error("frame {0:?} has no authenticated physical allocator identity")]
+    MissingPhysicalIdentity(FrameId),
+    #[error("physical retirement output allocation failed")]
+    RetirementAllocation,
+    #[error("frame {0:?} physical allocator identity differs from publication")]
+    PhysicalIdentityMismatch(FrameId),
     #[error("frame inventory batch is empty")]
     EmptyBatch,
     #[error("frame inventory transaction {0:?} was not reserved by this authority")]
@@ -1496,6 +1986,8 @@ pub enum FrameInventoryError {
     },
     #[error("mapping {0:?} is not live")]
     NonliveMapping(MappingId),
+    #[error("mapping {0:?} is held by an outstanding return claim")]
+    ClaimedMapping(MappingId),
     /// The mapping EXISTS but is still `Prepared` — its publishing transaction
     /// has not committed. Distinct from [`Self::NonliveMapping`], which means no
     /// such mapping at all. They were one error for a long time, which made a
@@ -1503,6 +1995,8 @@ pub enum FrameInventoryError {
     /// double-retire (absent) from a mid-transaction one (prepared).
     #[error("mapping {0:?} exists but is not published")]
     MappingNotPublished(MappingId),
+    #[error("fragment is not part of source mapping {0:?}")]
+    InvalidFragment(MappingId),
     #[error("mapping {0:?} event is out of lifecycle order")]
     InvalidOrdering(MappingId),
     #[error("mapping {mapping:?} generation {actual} does not match expected {expected}")]
@@ -1590,8 +2084,12 @@ impl FrameInventoryAuthority {
             .lock()
             .mappings
             .get(&mapping)
+            .and_then(|slot| match slot {
+                MappingSlot::Live(entry) => Some(entry),
+                MappingSlot::Claimed(_) => None,
+            })
             .is_some_and(|entry| {
-                entry.state == MappingState::Published
+                entry.state.is_published()
                     && entry.mm == mm
                     && entry.frame == frame
                     && entry.generation == generation
@@ -2796,19 +3294,47 @@ mod tests {
             .apply(fixture.mm1, publish)
             .expect("publish original");
         let (frame, mapping) = original.expect("original IDs");
+        let retirement = fixture.batch(1, |transaction, reservation| {
+            reservation
+                .push(FrameInventoryEvent::RetireFrameIfLastUnmap {
+                    transaction,
+                    frame,
+                    generation: generation(2),
+                })
+                .expect("request retirement while original remains mapped");
+        });
+        fixture.authority.apply(fixture.mm1, retirement).unwrap();
 
         let split = fixture.batch(5, |transaction, reservation| {
+            for (gpa, len) in [(0x10000, 0x4000), (0x18000, 0x8000)] {
+                let fragment = reservation.claim_mapping().expect("fragment mapping");
+                reservation
+                    .push(FrameInventoryEvent::PrepareMappingFragment {
+                        transaction,
+                        source: mapping,
+                        frame,
+                        mapping: fragment,
+                        generation: generation(1),
+                        gpa: Gpa::new(gpa),
+                        length: length(len),
+                        permissions: perms(true),
+                    })
+                    .unwrap();
+                reservation
+                    .push(FrameInventoryEvent::PublishMapping {
+                        transaction,
+                        mapping: fragment,
+                        generation: generation(1),
+                    })
+                    .unwrap();
+            }
             reservation
                 .push(FrameInventoryEvent::UnmapMapping {
                     transaction,
                     mapping,
                     generation: generation(2),
                 })
-                .expect("unmap original");
-            for (gpa, len) in [(0x10000, 0x4000), (0x18000, 0x8000)] {
-                let fragment = reservation.claim_mapping().expect("fragment mapping");
-                prepare_publish(reservation, transaction, frame, fragment, gpa, len);
-            }
+                .expect("unmap original after preparing its fragments");
         });
         fixture
             .authority
@@ -2827,6 +3353,23 @@ mod tests {
                 .map(|mapping| (mapping.gpa.raw(), mapping.length.raw()))
                 .collect::<Vec<_>>(),
             vec![(0x10000, 0x4000), (0x18000, 0x8000)]
+        );
+        for row in snapshot.mappings {
+            let unmap = fixture.batch(1, |transaction, reservation| {
+                reservation
+                    .push(FrameInventoryEvent::UnmapMapping {
+                        transaction,
+                        mapping: row.mapping,
+                        generation: generation(2),
+                    })
+                    .unwrap();
+            });
+            fixture.authority.apply(fixture.mm1, unmap).unwrap();
+        }
+        assert_eq!(
+            fixture.authority.frame_mapping_count(frame),
+            None,
+            "fragments retain the request to retire on the last unmap"
         );
     }
 
@@ -2956,9 +3499,17 @@ mod tests {
     /// parent's frame survives every child that mapped it.
     #[test]
     fn kvm_fork_retire_cycles_beyond_zone_capacity_release_child_state() {
+        fork_release_cycles(false);
+    }
+
+    #[test]
+    fn unpublished_fork_abort_retains_real_permits_across_refusal() {
+        fork_release_cycles(true);
+    }
+
+    fn fork_release_cycles(abort_child: bool) {
         use carrick_hal::fork_stock::{
             ForkStock, LifecycleWindow, NoTableLedger, UntaggedRoots, lifecycle_slots,
-            release_child_mm,
         };
         use std::sync::Arc;
 
@@ -2986,6 +3537,16 @@ mod tests {
             0x10_0000,
             0x1000,
         );
+        reservation
+            .bind_physical_frame(
+                shared,
+                carrick_hal::FrameBackingIdentity::from_allocator(
+                    carrick_guest_arch::FrameGpa::new(0x10_0000),
+                    NonZeroU64::new(72).unwrap(),
+                    FrameLength::from_mapping_extent(NonZeroU64::new(4096).unwrap()),
+                ),
+            )
+            .unwrap();
         parent.apply(reservation.commit(())).expect("parent apply");
 
         let layout = std::alloc::Layout::new::<carrick_el1_abi::FrameGrantResidencyTable>();
@@ -3099,20 +3660,21 @@ mod tests {
                     |_, _, _| Ok(()),
                 )
                 .expect("reserve custody");
-            let mut settlement =
-                carrick_el1_abi::ForkStockSettlement::commit_reserved(loan, completion)
-                    .expect("settlement");
-            stock
-                .settle(
-                    &mut NoTableLedger,
-                    parent_execution,
-                    &mut settlement,
-                    |_| true,
-                    |_| true,
-                    |_| true,
-                )
-                .expect("commit");
-
+            if !abort_child {
+                let mut settlement =
+                    carrick_el1_abi::ForkStockSettlement::commit_reserved(loan, completion)
+                        .expect("settlement");
+                stock
+                    .settle(
+                        &mut NoTableLedger,
+                        parent_execution,
+                        &mut settlement,
+                        |_| true,
+                        |_| true,
+                        |_| true,
+                    )
+                    .expect("commit");
+            }
             // Carrier per-child state retained by KVM reservation.
             let child = inventory.bind(mm_generation(child_mm));
             let mut reservation = child.reserve(1, 2, 4).expect("child reserve");
@@ -3136,6 +3698,16 @@ mod tests {
                 0x20_0000,
                 0x1000,
             );
+            reservation
+                .bind_physical_frame(
+                    own,
+                    carrick_hal::FrameBackingIdentity::from_allocator(
+                        carrick_guest_arch::FrameGpa::new(0x20_0000),
+                        NonZeroU64::new(73 + cycle).unwrap(),
+                        FrameLength::from_mapping_extent(NonZeroU64::new(4096).unwrap()),
+                    ),
+                )
+                .unwrap();
             child.apply(reservation.commit(())).expect("child apply");
             residency
                 .publish(carrick_el1_abi::FrameGrantResidencyIdentity {
@@ -3150,31 +3722,131 @@ mod tests {
                 })
                 .expect("residency capacity");
 
-            let child_execution =
-                fork_test_execution(900 + cycle, child_mm, loan.request.child_tables.base);
-            let mut retire = carrick_el1_abi::NativeChildRetire::new(
-                child_execution.binding,
-                child_execution.context,
-            )
-            .expect("retire record");
-            stock
-                .retire_child(child_execution, &mut retire)
-                .expect("quarantine");
-            let returned = stock
-                .reclaim(
-                    &mut NoTableLedger,
-                    carrick_el1_abi::ReservationMm::new(PARENT).expect("parent"),
-                    |mm| carrick_hal::fork_stock::SlotAbsence::scan(mm, []),
-                    |_| true,
-                    |life| window.clear(life),
-                    |absence| release_child_mm(&*inventory, &residency, absence.mm()),
+            if !abort_child {
+                let child_execution =
+                    fork_test_execution(900 + cycle, child_mm, loan.request.child_tables.base);
+                let mut retire = carrick_el1_abi::NativeChildRetire::new(
+                    child_execution.binding,
+                    child_execution.context,
                 )
-                .unwrap_or_else(|error| panic!("cycle {cycle}: {error:?}"));
-            assert_eq!(returned, 1, "cycle {cycle}");
+                .expect("retire record");
+                stock
+                    .retire_child(child_execution, &mut retire)
+                    .expect("quarantine");
+            }
+            let mut abort = carrick_el1_abi::ForkStockSettlement::abort(loan);
+            let mut first_revision = None;
+            let mut accepted = 0;
+            for attempt in 0..2 {
+                let release =
+                    |absence: &carrick_hal::fork_stock::SlotAbsence,
+                     progress: &mut carrick_hal::fork_stock::ChildMmRelease| {
+                        let revision = progress.inventory(&*inventory, absence).unwrap().revision();
+                        if let Some(first) = first_revision {
+                            assert_eq!(revision, first);
+                        }
+                        first_revision = Some(revision);
+                        // Neither a live peer nor a recycled generation can steal
+                        // the retained release, even though this MM is now empty.
+                        for owner in [
+                            mm_generation(PARENT),
+                            carrick_hal::GuestFrameOwner {
+                                root_generation: carrick_guest_arch::ContextGeneration::new(
+                                    NonZeroU64::new(2).unwrap(),
+                                ),
+                                ..mm_generation(child_mm)
+                            },
+                        ] {
+                            let wrong = carrick_hal::fork_stock::SlotAbsence::scan(
+                                carrick_el1_abi::ReservationMm::new(owner.native_mm.raw().get())
+                                    .unwrap(),
+                                [],
+                            )
+                            .unwrap()
+                            .with_owner(owner)
+                            .unwrap();
+                            assert!(progress.inventory(&*inventory, &wrong).is_none());
+                        }
+                        assert!(
+                            authority
+                                .live_mapping_row(
+                                    FrameOwner::GuestMm(mm_generation(PARENT)),
+                                    parent_mapping
+                                )
+                                .is_some()
+                        );
+                        let released = progress.inventory(&*inventory, absence).unwrap();
+                        assert_eq!(released.pending_retirements(), 1);
+                        if released
+                            .try_retirements(|permit| {
+                                assert!(
+                                    authority.state.try_lock().is_some(),
+                                    "backend runs after inventory unlock"
+                                );
+                                assert_eq!(permit.frame(), own);
+                                assert_eq!(
+                                    permit.backing().host_owner_generation().get(),
+                                    73 + cycle
+                                );
+                                if attempt == 0 {
+                                    return Err((permit, ()));
+                                }
+                                let pending = permit.retire(|_| Ok::<_, ()>(())).unwrap();
+                                // SAFETY: the VM-free fixture has no physical pins or storage.
+                                unsafe { pending.complete() };
+                                accepted += 1;
+                                Ok(())
+                            })
+                            .is_err()
+                        {
+                            return false;
+                        }
+                        residency.retire_overlapping(child_mm, 0, u64::MAX)
+                    };
+                if abort_child {
+                    let result =
+                        stock.release_aborted_child(parent_execution, &abort, |_| true, release);
+                    if attempt == 0 {
+                        assert_eq!(result, Err(carrick_hal::fork_stock::ForkStockServiceError::OccupancyUnavailable));
+                        assert!(stock.pending(parent_execution.cpu).is_some());
+                    } else {
+                        result.unwrap();
+                        stock
+                            .settle(
+                                &mut NoTableLedger,
+                                parent_execution,
+                                &mut abort,
+                                |_| true,
+                                |_| true,
+                                |life| window.clear(life),
+                            )
+                            .unwrap();
+                        assert!(stock.pending(parent_execution.cpu).is_none());
+                    }
+                } else {
+                    let returned = stock
+                        .reclaim(
+                            &mut NoTableLedger,
+                            carrick_el1_abi::ReservationMm::new(PARENT).expect("parent"),
+                            |mm| carrick_hal::fork_stock::SlotAbsence::scan(mm, []),
+                            |_| true,
+                            |life| window.clear(life),
+                            release,
+                        )
+                        .unwrap_or_else(|error| panic!("cycle {cycle}: {error:?}"));
+                    assert_eq!(returned, usize::from(attempt == 1), "cycle {cycle}");
+                    assert_eq!(stock.is_quarantined(request.child_mm), attempt == 0);
+                }
+                assert_eq!(authority.abandoned_retirement_permits(), 0);
+            }
+            assert_eq!(accepted, 1, "exactly one authority consumed per child");
             assert!(residency.lookup(child_mm, 0x40_0000).is_none());
             children.push(child_mm);
         }
-        assert_eq!(stock.counters().returned_children, CYCLES);
+        assert_eq!(
+            stock.counters().returned_children,
+            if abort_child { 0 } else { CYCLES }
+        );
         assert_eq!(stock.counters().capacity_refusals, 0);
         // Only the parent's row remains; the shared frame survived.
         let live = authority.snapshot();
@@ -3507,6 +4179,50 @@ mod tests {
 #[cfg(test)]
 mod physical_projection_tests {
     use super::*;
+
+    #[test]
+    fn child_release_join_refuses_foreign_half_without_replacing_original_inventory() {
+        use carrick_hal::fork_stock::{ChildMmRelease, SlotAbsence};
+        let inventory = Arc::new(FrameInventoryAuthority::new());
+        let source = inventory.physical_projection(Arc::new(ObjectIdRegistry::new()));
+        let owner = carrick_hal::GuestFrameOwner {
+            native_mm: carrick_hal::MmGeneration::new(NonZeroU64::new(41).unwrap()),
+            root_generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let other = carrick_hal::GuestFrameOwner {
+            native_mm: carrick_hal::MmGeneration::new(NonZeroU64::new(42).unwrap()),
+            ..owner
+        };
+        let absence = SlotAbsence::scan(
+            carrick_el1_abi::ReservationMm::new(owner.native_mm.raw().get()).unwrap(),
+            [],
+        )
+        .unwrap()
+        .with_owner(owner)
+        .unwrap();
+        let mut progress = ChildMmRelease::default();
+        let revision = progress.inventory(&*source, &absence).unwrap().revision();
+        let foreign = source.retire_mm_with_permits(other).unwrap();
+        // SAFETY: these two VM-free MMs have no physical allocations, pins or
+        // backend registrations. Their release halves must still not cross.
+        let backend =
+            unsafe { carrick_hal::BackendCustodyReleased::from_backend_release(&foreign) };
+        let rejected = progress.join_backend(backend).unwrap_err();
+        assert!(progress.receipt().is_none());
+        let retained = progress.inventory(&*source, &absence).unwrap();
+        assert_eq!(retained.revision(), revision);
+        assert_eq!(retained.pending_retirements(), 0);
+        // SAFETY: same empty VM-free backend as above, now the exact owner.
+        let backend =
+            unsafe { carrick_hal::BackendCustodyReleased::from_backend_release(retained) };
+        progress.join_backend(backend).unwrap();
+        assert_eq!(progress.receipt().unwrap().revision(), revision);
+        assert!(progress.inventory(&*source, &absence).is_none());
+        assert!(progress.join_backend(rejected).is_err());
+        assert_eq!(progress.receipt().unwrap().revision(), revision);
+        assert_eq!(inventory.abandoned_retirement_permits(), 0);
+    }
+
     use carrick_hal::physical_grants::PhysicalGrantRelease;
     use std::sync::Arc;
 
@@ -4641,5 +5357,1559 @@ mod inventory_origin_tests {
         assert_eq!(second.snapshot().mappings.len(), 1);
         first.rollback_unpublished_apply(&first_receipt).unwrap();
         second.rollback_unpublished_apply(&second_receipt).unwrap();
+    }
+}
+
+struct RetirementOutput {
+    permits: Vec<carrick_hal::FrameRetirementPermit>,
+    cleanup: std::sync::Arc<dyn carrick_core_abi::FrameRetirementCleanup>,
+}
+
+mod claimed_return {
+    use super::{
+        BTreeSet, FrameId, FrameInventoryApplyReceipt, FrameInventoryAuthority,
+        FrameInventoryProvenance, FrameOwner, KernelTransactionId, MappingEntry, MappingId,
+        MappingRow, MappingSlot, MappingState, Mutex, ObjectIdRegistry, decrement_mm_mapping_count,
+        next_generation,
+    };
+
+    #[derive(Debug)]
+    pub(super) struct RetirementCleanup(pub(super) std::sync::Weak<FrameInventoryAuthority>);
+    impl carrick_core_abi::FrameRetirementCleanup for RetirementCleanup {
+        fn complete(&self, frame: FrameId, backing: carrick_hal::FrameBackingIdentity) {
+            if let Some(inventory) = self.0.upgrade() {
+                let mut state = inventory.state.lock();
+                let key = (backing.ipa(), backing.host_owner_generation());
+                if state
+                    .physical_frames
+                    .get(&key)
+                    .is_some_and(|entry| entry.frame == frame)
+                {
+                    state.physical_frames.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// Only claim preparation can replace a live row with this placeholder.
+    #[derive(Debug, Eq, PartialEq)]
+    pub(super) struct ClaimMark {
+        row: MappingRow,
+    }
+    impl ClaimMark {
+        pub(super) fn row(&self) -> MappingRow {
+            self.row
+        }
+    }
+    #[derive(Clone)]
+    struct ClaimFrameCell(std::sync::Arc<Mutex<super::FrameCell>>);
+    impl carrick_core::mm::frames::FrameReferenceCell for ClaimFrameCell {
+        fn with_references<R>(
+            &self,
+            update: impl FnOnce(&mut carrick_core::mm::frames::FrameReferences) -> R,
+        ) -> R {
+            update(&mut self.0.lock())
+        }
+    }
+    type FrameRef = carrick_core::mm::frames::FrameRef<ClaimFrameCell>;
+    struct ClaimedRow {
+        id: MappingId,
+        entry: MappingEntry,
+        reference: FrameRef,
+        backing: carrick_hal::FrameBackingIdentity,
+        admission: std::sync::Arc<()>,
+    }
+    enum ReturnDisposition {
+        Prepared,
+        Cleared(std::sync::Arc<dyn carrick_hal::ReturnQuarantine>),
+        Completed,
+    }
+    struct ClaimedReturn {
+        disposition: ReturnDisposition,
+        inventory: std::sync::Arc<FrameInventoryAuthority>,
+        mm: FrameOwner,
+        rows: Vec<ClaimedRow>,
+        transaction: KernelTransactionId,
+        provenance: FrameInventoryProvenance,
+        receipt_mappings: Vec<(MappingId, FrameId)>,
+        unmapped: Vec<carrick_hal::prepared_return::UnmappedReturnRow>,
+        last_unmapped: Vec<carrick_hal::FrameRetirementPermit>,
+        cleanup: std::sync::Arc<RetirementCleanup>,
+    }
+    impl ClaimedReturn {
+        fn restore(&mut self, abandoned: bool) {
+            let mut state = self.inventory.state.lock();
+            for row in self.rows.drain(..) {
+                row.reference.restore();
+                state.mappings.insert(row.id, MappingSlot::Live(row.entry));
+            }
+            state.return_claims -= 1;
+            if abandoned {
+                state.abandoned_returns += 1;
+            }
+            drop(state);
+            self.disposition = ReturnDisposition::Completed;
+        }
+    }
+    impl Drop for ClaimedReturn {
+        fn drop(&mut self) {
+            match std::mem::replace(&mut self.disposition, ReturnDisposition::Completed) {
+                ReturnDisposition::Prepared => self.restore(true),
+                ReturnDisposition::Cleared(quarantine) => {
+                    // The exact-MM callback runs before acquiring the inventory leaf lock.
+                    quarantine.quarantine(self.mm.receipt_owner());
+                    self.inventory.state.lock().quarantined_returns += 1;
+                }
+                ReturnDisposition::Completed => {}
+            }
+        }
+    }
+    impl carrick_hal::ReturnClaim for ClaimedReturn {
+        fn abort(mut self: Box<Self>) {
+            self.restore(false);
+        }
+        fn stage1_cleared(
+            &mut self,
+            quarantine: std::sync::Arc<dyn carrick_hal::ReturnQuarantine>,
+        ) {
+            self.disposition = ReturnDisposition::Cleared(quarantine);
+        }
+        fn apply(mut self: Box<Self>) -> carrick_hal::AppliedReturn {
+            let mut last_unmapped = std::mem::take(&mut self.last_unmapped);
+            let mut state = self.inventory.state.lock();
+            for row in self.rows.drain(..) {
+                state.mappings.remove(&row.id);
+                decrement_mm_mapping_count(&mut state.mm_mapping_counts, self.mm);
+                if row
+                    .reference
+                    .release(carrick_core::mm::frames::ReferenceReleasePolicy::RetireIfLast)
+                    == carrick_core::mm::frames::ReferenceRelease::Last
+                {
+                    state.frames.remove(&row.entry.frame);
+
+                    // SAFETY: the owned reference consumed the final unit under
+                    // this inventory lock; the exact allocator identity was
+                    // retained at prepare and cannot be rebound by an overlay.
+                    last_unmapped.push(unsafe {
+                        carrick_hal::FrameRetirementPermit::from_inventory(
+                            self.inventory.origin.clone(),
+                            row.entry.frame,
+                            row.backing,
+                            state.revision + 1,
+                            self.inventory.abandoned_permits.clone(),
+                            row.admission,
+                            self.cleanup.clone(),
+                        )
+                    });
+                }
+            }
+            state.return_claims -= 1;
+            state.revision += 1;
+            let outcome = carrick_hal::AppliedReturn {
+                revision: state.revision,
+                receipt: FrameInventoryApplyReceipt::from_kernel_authority(
+                    self.inventory.origin.clone(),
+                    self.provenance,
+                    self.transaction,
+                    self.mm.receipt_owner(),
+                    state.revision,
+                    std::mem::take(&mut self.receipt_mappings),
+                ),
+                unmapped: std::mem::take(&mut self.unmapped),
+                last_unmapped,
+                mm_empty_at_revision: !state.mm_mapping_counts.contains_key(&self.mm),
+            };
+            drop(state);
+            self.disposition = ReturnDisposition::Completed;
+            outcome
+        }
+    }
+    impl FrameInventoryAuthority {
+        /// A backing owner may outlive rollback or whole-MM inventory removal.
+        /// Absence is tested and publication excluded in one leaf-lock turn.
+        /// The fresh ID is only the retirement claim's identity; it is never a
+        /// live frame or mapping. No physical callback runs under this lock.
+        pub fn claim_unused_backing(
+            self: &std::sync::Arc<Self>,
+            ids: &ObjectIdRegistry,
+            backing: carrick_hal::FrameBackingIdentity,
+        ) -> Result<Option<carrick_hal::FrameRetirementPermit>, super::ObjectIdError> {
+            let frame = ids.frame_id()?;
+            let admission = std::sync::Arc::new(());
+            let cleanup = std::sync::Arc::new(RetirementCleanup(std::sync::Arc::downgrade(self)));
+            let key = (backing.ipa(), backing.host_owner_generation());
+            let mut state = self.state.lock();
+            if state
+                .physical_frames
+                .get(&key)
+                .is_some_and(|entry| entry.lease.strong_count() != 0)
+            {
+                return Ok(None);
+            }
+            state.physical_frames.insert(
+                key,
+                super::PhysicalAdmission {
+                    frame,
+                    lease: std::sync::Arc::downgrade(&admission),
+                },
+            );
+            let revision = state.revision;
+            drop(state);
+            // SAFETY: the inventory atomically established no published or
+            // claimed reference to this exact allocator identity and installed
+            // the exclusion retained by this permit until backend completion.
+            Ok(Some(unsafe {
+                carrick_hal::FrameRetirementPermit::from_inventory(
+                    self.origin.clone(),
+                    frame,
+                    backing,
+                    revision,
+                    self.abandoned_permits.clone(),
+                    admission,
+                    cleanup,
+                )
+            }))
+        }
+
+        /// Claim at most 512 4-KiB pages without retaining the inventory lock.
+        /// Lock audit: ID allocation happens before the leaf lock; claim, apply,
+        /// and restore touch only inventory-owned maps and arithmetic. No root,
+        /// fork-stock, stage-2, owner-directory, callback or pin wait runs inside.
+        pub fn prepare_return(
+            self: &std::sync::Arc<Self>,
+            ids: &ObjectIdRegistry,
+            mm: impl Into<FrameOwner>,
+            rows: &[carrick_hal::ExactReturnMappingRow],
+        ) -> Result<carrick_hal::PreparedReturn, carrick_hal::PrepareReturnError> {
+            use carrick_hal::PrepareReturnError as Error;
+            let bytes = rows
+                .iter()
+                .try_fold(0u64, |sum, row| sum.checked_add(row.length.raw()));
+            if rows.is_empty() || rows.len() > 512 || bytes.is_none_or(|bytes| bytes > 512 * 4096) {
+                return Err(Error::Capacity);
+            }
+            let (transaction, provenance) =
+                super::prepare_reservation(ids, &self.entropy).map_err(|_| Error::Capacity)?;
+            let mm = mm.into();
+            let mut retained_rows = Vec::new();
+            retained_rows
+                .try_reserve_exact(rows.len())
+                .map_err(|_| Error::Capacity)?;
+            let mut last_unmapped = Vec::new();
+            last_unmapped
+                .try_reserve_exact(rows.len())
+                .map_err(|_| Error::Capacity)?;
+            let mut receipt_mappings = Vec::new();
+            receipt_mappings
+                .try_reserve_exact(rows.len())
+                .map_err(|_| Error::Capacity)?;
+            let mut unmapped = Vec::new();
+            unmapped
+                .try_reserve_exact(rows.len())
+                .map_err(|_| Error::Capacity)?;
+            for row in rows {
+                receipt_mappings.push((row.mapping, row.frame));
+                unmapped.push(carrick_hal::prepared_return::UnmappedReturnRow {
+                    mapping: row.mapping,
+                    frame: row.frame,
+                    generation: next_generation(row.generation).map_err(|_| Error::RowMismatch)?,
+                });
+            }
+            let cleanup = std::sync::Arc::new(RetirementCleanup(std::sync::Arc::downgrade(self)));
+            let mut references = Vec::new();
+            references
+                .try_reserve_exact(rows.len())
+                .map_err(|_| Error::Capacity)?;
+            let mut state = self.state.lock();
+            state
+                .revision
+                .checked_add(state.return_claims)
+                .and_then(|value| value.checked_add(1))
+                .ok_or(Error::RevisionExhausted)?;
+            let mut unique = BTreeSet::new();
+            for row in rows {
+                let entry = state
+                    .mappings
+                    .get(&row.mapping)
+                    .and_then(|slot| match slot {
+                        MappingSlot::Live(entry) => Some(entry),
+                        MappingSlot::Claimed(_) => None,
+                    })
+                    .ok_or(Error::RowMismatch)?;
+                let published = match entry.state {
+                    MappingState::Published => true,
+                    MappingState::Prepared(_) => false,
+                };
+                if !unique.insert(row.mapping)
+                    || !published
+                    || entry.mm != mm
+                    || entry.frame != row.frame
+                    || entry.generation != row.generation
+                    || entry.gpa != row.gpa
+                    || entry.length != row.length
+                    || row.generation.raw() == u64::MAX
+                    || !state.frames.contains_key(&row.frame)
+                {
+                    return Err(Error::RowMismatch);
+                }
+            }
+            for row in rows {
+                let cell = state
+                    .frames
+                    .get(&row.frame)
+                    .ok_or(Error::RowMismatch)?
+                    .references
+                    .clone();
+                let Some(backing) = state
+                    .frames
+                    .get(&row.frame)
+                    .and_then(|entry| entry.backing())
+                else {
+                    for (reference, _, _) in references {
+                        FrameRef::restore(reference);
+                    }
+                    return Err(Error::MissingPhysicalIdentity);
+                };
+                let admission = state
+                    .frames
+                    .get(&row.frame)
+                    .map(|entry| entry.references.lock().admission.clone());
+                let Some(admission) = admission else {
+                    for (reference, _, _) in references {
+                        FrameRef::restore(reference);
+                    }
+                    return Err(Error::RowMismatch);
+                };
+                match FrameRef::claim(ClaimFrameCell(cell)) {
+                    Ok(reference) => references.push((reference, backing, admission)),
+                    Err(_) => {
+                        for (reference, _, _) in references {
+                            FrameRef::restore(reference);
+                        }
+                        return Err(Error::RowMismatch);
+                    }
+                }
+            }
+            for (row, (reference, backing, admission)) in rows.iter().zip(references) {
+                if let Some(slot) = state.mappings.get_mut(&row.mapping)
+                    && let MappingSlot::Live(entry) = slot
+                {
+                    let snapshot = MappingRow {
+                        mapping: row.mapping,
+                        frame: entry.frame,
+                        mm: entry.mm,
+                        generation: entry.generation,
+                        gpa: entry.gpa,
+                        length: entry.length,
+                        permissions: entry.permissions,
+                    };
+                    let entry = *entry;
+                    *slot = MappingSlot::Claimed(ClaimMark { row: snapshot });
+                    retained_rows.push(ClaimedRow {
+                        id: row.mapping,
+                        entry,
+                        reference,
+                        backing,
+                        admission,
+                    });
+                }
+            }
+            state.return_claims += 1;
+            drop(state);
+            Ok(carrick_hal::PreparedReturn::from_inventory(Box::new(
+                ClaimedReturn {
+                    disposition: ReturnDisposition::Prepared,
+                    inventory: self.clone(),
+                    mm,
+                    rows: retained_rows,
+                    transaction,
+                    provenance,
+                    receipt_mappings,
+                    unmapped,
+                    last_unmapped,
+                    cleanup,
+                },
+            )))
+        }
+    }
+}
+
+#[cfg(test)]
+mod prepared_return_tests {
+    use super::*;
+    use std::sync::Arc;
+    #[test]
+    fn whole_mm_retry_does_not_replay_accepted_permits() {
+        let (inventory, ids, owner, row) = fixture();
+        let mut reservation = inventory
+            .reserve(&ids, 1, 1, FrameEventCapacity::for_event_count(2).unwrap())
+            .unwrap();
+        let transaction = reservation.transaction();
+        let frame = reservation.claim_frame().unwrap();
+        let mapping = reservation.claim_mapping().unwrap();
+        reservation
+            .push(FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation: row.generation,
+                gpa: Gpa::new(8192),
+                length: row.length,
+                permissions: MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation: row.generation,
+            })
+            .unwrap();
+        reservation
+            .bind_physical_frame(
+                frame,
+                carrick_hal::FrameBackingIdentity::from_allocator(
+                    carrick_guest_arch::FrameGpa::new(0xa000),
+                    NonZeroU64::new(74).unwrap(),
+                    row.length,
+                ),
+            )
+            .unwrap();
+        inventory.apply(owner, reservation.commit(())).unwrap();
+        let (_, mut released) = inventory.retire_mm_with_permits(&ids, owner).unwrap();
+        assert_eq!(released.pending_retirements(), 2);
+        let mut accepted = Vec::new();
+        let mut refused = None;
+        let mut pending = Vec::new();
+        let first = released.try_retirements(|permit| {
+            assert!(inventory.state.try_lock().is_some());
+            if accepted.len() == 1 {
+                refused = Some((permit.frame(), permit.backing()));
+                return Err((permit, ()));
+            }
+            accepted.push(permit.frame());
+            pending.push(permit.retire(|_| Ok::<_, ()>(())).unwrap());
+            Ok(())
+        });
+        assert_eq!(first, Err(()));
+        assert_eq!(released.pending_retirements(), 1);
+        assert_eq!(inventory.abandoned_retirement_permits(), 0);
+        released
+            .try_retirements::<()>(|permit| {
+                assert_eq!(Some((permit.frame(), permit.backing())), refused);
+                assert!(!accepted.contains(&permit.frame()));
+                accepted.push(permit.frame());
+                pending.push(permit.retire(|_| Ok::<_, ()>(())).unwrap());
+                Ok(())
+            })
+            .unwrap();
+        released
+            .try_retirements::<()>(|_| panic!("completed release must not replay"))
+            .unwrap();
+        assert_eq!(accepted.len(), 2);
+        for completion in pending {
+            // SAFETY: this fixture has no physical storage or pins.
+            unsafe { completion.complete() };
+        }
+        assert_eq!(inventory.abandoned_retirement_permits(), 0);
+    }
+
+    #[test]
+    fn whole_mm_permits_require_the_receipts_mapping_population() {
+        let (inventory, ids, owner, _) = fixture();
+        let (_, mut release) = inventory.retire_mm_with_permits(&ids, owner).unwrap();
+        let permit = release.pop_retirement().unwrap();
+        let other = FrameOwner::HostMm(MmId::from_raw_u64(43).unwrap());
+        let (_, empty) = inventory.retire_mm_with_permits(&ids, other).unwrap();
+        assert_eq!(release.revision(), empty.revision());
+        let (_, permits) = *empty.with_retirements(vec![permit]).unwrap_err();
+        let mut release = release.with_retirements(permits).unwrap();
+        // SAFETY: the VM-free backend has no physical custody. Join must still
+        // refuse while the inventory half retains an unconsumed permit.
+        let backend =
+            unsafe { carrick_core_abi::BackendCustodyReleased::from_backend_release(&release) };
+        let (retained, backend) =
+            *carrick_hal::MmReleaseReceipt::join(release, backend).unwrap_err();
+        release = retained;
+        let pending = release
+            .pop_retirement()
+            .unwrap()
+            .retire(|_| Ok::<_, ()>(()))
+            .unwrap();
+        // The joined receipt need not wait for pin drain.
+        assert!(carrick_hal::MmReleaseReceipt::join(release, backend).is_ok());
+        // SAFETY: all simulated pins have now drained.
+        unsafe { pending.complete() };
+    }
+
+    #[test]
+    fn whole_mm_permits_leave_a_shared_frame_with_its_live_sibling() {
+        let (inventory, ids, owner, row) = fixture();
+        let sibling = FrameOwner::HostMm(MmId::from_raw_u64(43).unwrap());
+        inventory
+            .apply(sibling, alias_commit(&inventory, &ids, row))
+            .unwrap();
+        let (_, release) = inventory.retire_mm_with_permits(&ids, owner).unwrap();
+        assert_eq!(release.pending_retirements(), 0);
+        assert_eq!(inventory.frame_mapping_count(row.frame), Some(1));
+        let (_, mut last) = inventory.retire_mm_with_permits(&ids, sibling).unwrap();
+        let permit = last.pop_retirement().unwrap();
+        assert_eq!(permit.frame(), row.frame);
+        let pending = permit.retire(|_| Ok::<_, ()>(())).unwrap();
+        // SAFETY: the fixture has no physical mappings or pins.
+        unsafe { pending.complete() };
+    }
+
+    #[test]
+    fn whole_mm_permits_refuse_missing_allocator_identity_before_mutation() {
+        let (inventory, ids, owner, row) = fixture();
+        let mut legacy = inventory
+            .reserve(&ids, 1, 1, FrameEventCapacity::for_event_count(2).unwrap())
+            .unwrap();
+        let transaction = legacy.transaction();
+        let frame = legacy.claim_frame().unwrap();
+        let mapping = legacy.claim_mapping().unwrap();
+        legacy
+            .push(FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation: row.generation,
+                gpa: Gpa::new(0x2000),
+                length: row.length,
+                permissions: MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        legacy
+            .push(FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation: row.generation,
+            })
+            .unwrap();
+        // The legacy publication API does not bind an allocator identity.
+        inventory.apply(owner, legacy.commit(())).unwrap();
+        let before = inventory.snapshot();
+        assert!(matches!(inventory.retire_mm_with_permits(&ids, owner),
+            Err(FrameInventoryRetireMmError::Apply(FrameInventoryError::MissingPhysicalIdentity(missing)))
+                if missing == frame));
+        // Neither the bound first frame nor the legacy second frame changes.
+        assert_eq!(inventory.snapshot(), before);
+        assert_eq!(inventory.abandoned_retirement_permits(), 0);
+    }
+
+    #[test]
+    fn whole_mm_release_retains_physical_admission_until_backend_completion() {
+        let (inventory, ids, owner, row) = fixture();
+        let claim = inventory.prepare_return(&ids, owner, &[row]).unwrap();
+        assert!(matches!(
+            inventory.retire_mm_with_permits(&ids, owner),
+            Err(FrameInventoryRetireMmError::RetryPending)
+        ));
+        claim.abort();
+        let (count, mut release) = inventory.retire_mm_with_permits(&ids, owner).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(release.pending_retirements(), 1);
+        let permit = release.pop_retirement().unwrap();
+        assert_eq!(permit.frame(), row.frame);
+        assert_eq!(permit.revision(), release.revision());
+        let backing = permit.backing();
+        assert!(
+            inventory
+                .claim_unused_backing(&ids, backing)
+                .unwrap()
+                .is_none()
+        );
+        let pending = permit
+            .retire(|_| {
+                assert!(inventory.state.try_lock().is_some());
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert!(
+            inventory
+                .claim_unused_backing(&ids, backing)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(inventory.retire_mm_with_permits(&ids, owner).unwrap().0, 0);
+        // SAFETY: the VM-free physical owner has completed its simulated unmap.
+        unsafe { pending.complete() };
+        let permit = inventory
+            .claim_unused_backing(&ids, backing)
+            .unwrap()
+            .unwrap();
+        let pending = permit.retire(|_| Ok::<_, ()>(())).unwrap();
+        // SAFETY: no mapping or pin was installed between the two requests.
+        unsafe { pending.complete() };
+        assert_eq!(inventory.abandoned_retirement_permits(), 0);
+    }
+
+    #[test]
+    fn backing_retirement_requires_inventory_absence_and_excludes_republication() {
+        let (inventory, ids, owner, row) = fixture();
+        let backing = carrick_hal::FrameBackingIdentity::from_allocator(
+            carrick_guest_arch::FrameGpa::new(0x9000),
+            NonZeroU64::new(73).unwrap(),
+            row.length,
+        );
+        assert!(
+            inventory
+                .claim_unused_backing(&ids, backing)
+                .unwrap()
+                .is_none()
+        );
+        let claim = inventory.prepare_return(&ids, owner, &[row]).unwrap();
+        assert!(
+            inventory
+                .claim_unused_backing(&ids, backing)
+                .unwrap()
+                .is_none()
+        );
+        claim.abort();
+        inventory.retire_mm(&ids, owner).unwrap();
+        let permit = inventory
+            .claim_unused_backing(&ids, backing)
+            .unwrap()
+            .unwrap();
+        assert_eq!(permit.backing(), backing);
+        assert!(inventory.state.try_lock().is_some());
+        assert!(
+            inventory
+                .claim_unused_backing(&ids, backing)
+                .unwrap()
+                .is_none()
+        );
+        let pending = permit
+            .retire(|exact| {
+                assert_eq!(exact, backing);
+                assert!(inventory.state.try_lock().is_some());
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert!(
+            inventory
+                .claim_unused_backing(&ids, backing)
+                .unwrap()
+                .is_none()
+        );
+        // SAFETY: this VM-free physical owner has no mappings or pins.
+        unsafe { pending.complete() };
+        assert_eq!(inventory.abandoned_retirement_permits(), 0);
+        let retry = inventory
+            .claim_unused_backing(&ids, backing)
+            .unwrap()
+            .unwrap();
+        let pending = retry.retire(|_| Ok::<_, ()>(())).unwrap();
+        // SAFETY: same VM-free owner, with no intervening publication.
+        unsafe { pending.complete() };
+    }
+
+    #[test]
+    fn return_permit_preserves_physical_identity_not_mapping_generation() {
+        let (inventory, ids, owner, row) = fixture();
+        let applied = inventory
+            .prepare_return(&ids, owner, &[row])
+            .unwrap()
+            .apply();
+        let permit = applied.last_unmapped.into_iter().next().unwrap();
+        assert_eq!(permit.frame(), row.frame);
+        assert_eq!(permit.backing().ipa().raw(), 0x9000);
+        assert_eq!(permit.backing().host_owner_generation().get(), 73);
+        assert_eq!(permit.revision(), applied.revision);
+        assert!(inventory.state.try_lock().is_some());
+        let before = inventory.abandoned_retirement_permits();
+        drop(permit);
+        assert_eq!(inventory.abandoned_retirement_permits(), before + 1);
+    }
+
+    #[test]
+    fn physical_identity_binding_is_transactional_and_cannot_replace_a_live_owner() {
+        let (inventory, ids, owner, row) = fixture();
+        let before = inventory.snapshot();
+        let mut reservation = inventory
+            .reserve(&ids, 0, 0, FrameEventCapacity::for_event_count(1).unwrap())
+            .unwrap();
+        reservation
+            .push(FrameInventoryEvent::ProtectMapping {
+                transaction: reservation.transaction(),
+                mapping: row.mapping,
+                generation: MappingGeneration::from_backend_counter(NonZeroU64::new(2).unwrap()),
+                permissions: MemPerms {
+                    read: true,
+                    write: false,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .bind_physical_frame(
+                row.frame,
+                carrick_hal::FrameBackingIdentity::from_allocator(
+                    carrick_guest_arch::FrameGpa::new(0x9000),
+                    NonZeroU64::new(74).unwrap(),
+                    row.length,
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            inventory.apply(owner, reservation.commit(())).unwrap_err(),
+            FrameInventoryError::PhysicalIdentityMismatch(row.frame)
+        );
+        assert_eq!(
+            inventory.snapshot(),
+            before,
+            "failed binding must undo the protect too"
+        );
+        let permit = inventory
+            .prepare_return(&ids, owner, &[row])
+            .unwrap()
+            .apply()
+            .last_unmapped
+            .pop()
+            .unwrap();
+        assert_eq!(permit.backing().host_owner_generation().get(), 73);
+        let pending = permit.retire(|_| Ok::<_, ()>(())).unwrap();
+        // SAFETY: this VM-free fixture has no physical storage or pins.
+        unsafe { pending.complete() };
+        assert_eq!(inventory.abandoned_retirement_permits(), 0);
+    }
+
+    #[test]
+    fn failed_physical_retirement_retains_the_same_permit() {
+        let (inventory, ids, owner, row) = fixture();
+        let permit = inventory
+            .prepare_return(&ids, owner, &[row])
+            .unwrap()
+            .apply()
+            .last_unmapped
+            .pop()
+            .unwrap();
+        let (permit, ()) = permit.retire(|_| Err(())).unwrap_err();
+        assert_eq!(inventory.abandoned_retirement_permits(), 0);
+        assert_eq!(permit.frame(), row.frame);
+        let pending = permit
+            .retire(|backing| {
+                assert!(
+                    inventory.state.try_lock().is_some(),
+                    "physical callback runs unlocked"
+                );
+                assert_eq!(backing.host_owner_generation().get(), 73);
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        // SAFETY: this VM-free fixture has no physical storage or pins.
+        unsafe { pending.complete() };
+        assert_eq!(inventory.abandoned_retirement_permits(), 0);
+    }
+
+    #[test]
+    fn outstanding_and_abandoned_permits_exclude_new_frame_ids_for_the_same_owner() {
+        for (abandon, unused) in [(false, false), (true, false), (false, true), (true, true)] {
+            let (inventory, ids, owner, row) = fixture();
+            let permit = if unused {
+                inventory.retire_mm(&ids, owner).unwrap();
+                let backing = carrick_hal::FrameBackingIdentity::from_allocator(
+                    carrick_guest_arch::FrameGpa::new(0x9000),
+                    NonZeroU64::new(73).unwrap(),
+                    row.length,
+                );
+                inventory
+                    .claim_unused_backing(&ids, backing)
+                    .unwrap()
+                    .unwrap()
+            } else {
+                inventory
+                    .prepare_return(&ids, owner, &[row])
+                    .unwrap()
+                    .apply()
+                    .last_unmapped
+                    .pop()
+                    .unwrap()
+            };
+            let backing = permit.backing();
+            let pending = if abandon {
+                drop(permit);
+                None
+            } else {
+                Some(permit.retire(|_| Ok::<_, ()>(())).unwrap())
+            };
+            let mut reservation = inventory
+                .reserve(&ids, 1, 1, FrameEventCapacity::for_event_count(2).unwrap())
+                .unwrap();
+            let frame = reservation.claim_frame().unwrap();
+            let mapping = reservation.claim_mapping().unwrap();
+            let transaction = reservation.transaction();
+            reservation
+                .push(FrameInventoryEvent::PrepareMapping {
+                    transaction,
+                    frame,
+                    mapping,
+                    generation: row.generation,
+                    gpa: row.gpa,
+                    length: row.length,
+                    permissions: MemPerms {
+                        read: true,
+                        write: true,
+                        exec: false,
+                    },
+                })
+                .unwrap();
+            reservation
+                .push(FrameInventoryEvent::PublishMapping {
+                    transaction,
+                    mapping,
+                    generation: row.generation,
+                })
+                .unwrap();
+            reservation.bind_physical_frame(frame, backing).unwrap();
+            assert_eq!(
+                inventory.apply(owner, reservation.commit(())).unwrap_err(),
+                FrameInventoryError::PhysicalIdentityMismatch(frame)
+            );
+            assert!(inventory.snapshot().mappings.is_empty());
+            if let Some(pending) = pending {
+                // SAFETY: the fixture has no physical storage or pins.
+                unsafe { pending.complete() };
+            }
+        }
+    }
+    fn fixture() -> (
+        Arc<FrameInventoryAuthority>,
+        ObjectIdRegistry,
+        FrameOwner,
+        carrick_hal::ExactReturnMappingRow,
+    ) {
+        fixture_with_length(4096)
+    }
+    fn fixture_with_length(
+        bytes: u64,
+    ) -> (
+        Arc<FrameInventoryAuthority>,
+        ObjectIdRegistry,
+        FrameOwner,
+        carrick_hal::ExactReturnMappingRow,
+    ) {
+        let inventory = Arc::new(FrameInventoryAuthority::new());
+        let ids = ObjectIdRegistry::new();
+        let owner = FrameOwner::HostMm(MmId::from_raw_u64(42).unwrap());
+        let mut reservation = inventory
+            .reserve(&ids, 1, 1, FrameEventCapacity::for_event_count(2).unwrap())
+            .unwrap();
+        let transaction = reservation.transaction();
+        let row = carrick_hal::ExactReturnMappingRow {
+            frame: reservation.claim_frame().unwrap(),
+            mapping: reservation.claim_mapping().unwrap(),
+            generation: MappingGeneration::from_backend_counter(NonZeroU64::MIN),
+            gpa: Gpa::new(4096),
+            length: FrameLength::from_mapping_extent(NonZeroU64::new(bytes).unwrap()),
+        };
+        reservation
+            .push(FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame: row.frame,
+                mapping: row.mapping,
+                generation: row.generation,
+                gpa: row.gpa,
+                length: row.length,
+                permissions: MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping: row.mapping,
+                generation: row.generation,
+            })
+            .unwrap();
+        reservation
+            .bind_physical_frame(
+                row.frame,
+                carrick_hal::FrameBackingIdentity::from_allocator(
+                    carrick_guest_arch::FrameGpa::new(0x9000),
+                    NonZeroU64::new(73).unwrap(),
+                    row.length,
+                ),
+            )
+            .unwrap();
+        inventory.apply(owner, reservation.commit(())).unwrap();
+        (inventory, ids, owner, row)
+    }
+    fn alias_commit(
+        inventory: &FrameInventoryAuthority,
+        ids: &ObjectIdRegistry,
+        row: carrick_hal::ExactReturnMappingRow,
+    ) -> FrameInventoryCommit<()> {
+        let mut reservation = inventory
+            .reserve(ids, 0, 1, FrameEventCapacity::for_event_count(2).unwrap())
+            .unwrap();
+        let transaction = reservation.transaction();
+        let mapping = reservation.claim_mapping().unwrap();
+        reservation
+            .push(FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame: row.frame,
+                mapping,
+                generation: row.generation,
+                gpa: row.gpa,
+                length: row.length,
+                permissions: MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation: row.generation,
+            })
+            .unwrap();
+        reservation.commit(())
+    }
+    #[test]
+    fn overlay_alias_preserves_the_claim_cell_and_failed_prepare_returns_its_unit() {
+        let (inventory, ids, owner, row) = fixture();
+        let sibling = FrameOwner::HostMm(MmId::from_raw_u64(43).unwrap());
+        let cell = inventory
+            .state
+            .lock()
+            .frames
+            .get(&row.frame)
+            .unwrap()
+            .references
+            .clone();
+        let claim = inventory.prepare_return(&ids, owner, &[row]).unwrap();
+        let failed = alias_commit(&inventory, &ids, row);
+        assert_eq!(
+            inventory
+                .apply_inner(sibling, failed, Some(1), None)
+                .unwrap_err(),
+            FrameInventoryError::InjectedFailure(1)
+        );
+        assert_eq!(inventory.frame_mapping_count(row.frame), Some(1));
+        let alias = alias_commit(&inventory, &ids, row);
+        inventory.apply(sibling, alias).unwrap();
+        assert_eq!(inventory.frame_mapping_count(row.frame), Some(2));
+        assert!(Arc::ptr_eq(
+            &cell,
+            &inventory
+                .state
+                .lock()
+                .frames
+                .get(&row.frame)
+                .unwrap()
+                .references
+        ));
+        assert!(claim.apply().last_unmapped.is_empty());
+        assert_eq!(inventory.frame_mapping_count(row.frame), Some(1));
+        assert_eq!(inventory.retire_mm(&ids, sibling).unwrap(), 1);
+        assert_eq!(inventory.frame_mapping_count(row.frame), None);
+    }
+    fn fragment_commit(
+        inventory: &FrameInventoryAuthority,
+        ids: &ObjectIdRegistry,
+        row: carrick_hal::ExactReturnMappingRow,
+    ) -> (
+        FrameInventoryCommit<()>,
+        Vec<carrick_hal::ExactReturnMappingRow>,
+    ) {
+        let mut reservation = inventory
+            .reserve(ids, 0, 2, FrameEventCapacity::for_event_count(5).unwrap())
+            .unwrap();
+        let transaction = reservation.transaction();
+        let mut pieces = Vec::new();
+        for offset in [0, 4096] {
+            let piece = carrick_hal::ExactReturnMappingRow {
+                mapping: reservation.claim_mapping().unwrap(),
+                gpa: Gpa::new(row.gpa.raw() + offset),
+                length: FrameLength::from_mapping_extent(NonZeroU64::new(4096).unwrap()),
+                ..row
+            };
+            reservation
+                .push(FrameInventoryEvent::PrepareMappingFragment {
+                    transaction,
+                    source: row.mapping,
+                    frame: piece.frame,
+                    mapping: piece.mapping,
+                    generation: piece.generation,
+                    gpa: piece.gpa,
+                    length: piece.length,
+                    permissions: MemPerms {
+                        read: true,
+                        write: true,
+                        exec: false,
+                    },
+                })
+                .unwrap();
+            reservation
+                .push(FrameInventoryEvent::PublishMapping {
+                    transaction,
+                    mapping: piece.mapping,
+                    generation: piece.generation,
+                })
+                .unwrap();
+            pieces.push(piece);
+        }
+        reservation
+            .push(FrameInventoryEvent::UnmapMapping {
+                transaction,
+                mapping: row.mapping,
+                generation: next_generation(row.generation).unwrap(),
+            })
+            .unwrap();
+        (reservation.commit(()), pieces)
+    }
+
+    #[test]
+    fn split_then_claim_preserves_sibling_and_receipt_and_rolls_back_failed_overlay() {
+        let (inventory, ids, owner, row) = fixture_with_length(8192);
+        let before = inventory.snapshot();
+        let (failed, _) = fragment_commit(&inventory, &ids, row);
+        assert_eq!(
+            inventory
+                .apply_inner(owner, failed, Some(4), None)
+                .unwrap_err(),
+            FrameInventoryError::InjectedFailure(4)
+        );
+        assert_eq!(inventory.snapshot(), before);
+        assert_eq!(inventory.frame_mapping_count(row.frame), Some(1));
+        let (commit, pieces) = fragment_commit(&inventory, &ids, row);
+        let (_, receipt) = inventory.apply_with_receipt(owner, commit).unwrap();
+        for piece in &pieces {
+            assert!(receipt.authorizes(piece.mapping, piece.frame));
+        }
+        assert_eq!(inventory.frame_mapping_count(row.frame), Some(2));
+        let claim = inventory.prepare_return(&ids, owner, &pieces[..1]).unwrap();
+        assert!(
+            claim.apply().last_unmapped.is_empty(),
+            "sibling owns the remaining unit"
+        );
+        assert!(
+            inventory
+                .live_mapping_row(owner, pieces[1].mapping)
+                .is_some()
+        );
+        assert_eq!(inventory.frame_mapping_count(row.frame), Some(1));
+        let last = inventory
+            .prepare_return(&ids, owner, &pieces[1..])
+            .unwrap()
+            .apply();
+        assert_eq!(
+            last.last_unmapped
+                .iter()
+                .map(|permit| permit.frame())
+                .collect::<Vec<_>>(),
+            vec![row.frame]
+        );
+    }
+
+    #[test]
+    fn fragment_refuses_claimed_source_even_with_an_unclaimed_alias() {
+        let (inventory, ids, owner, row) = fixture_with_length(8192);
+        inventory
+            .apply(owner, alias_commit(&inventory, &ids, row))
+            .unwrap();
+        let claim = inventory.prepare_return(&ids, owner, &[row]).unwrap();
+        let before = inventory.snapshot();
+        let (commit, _) = fragment_commit(&inventory, &ids, row);
+        assert_eq!(
+            inventory.apply(owner, commit).unwrap_err(),
+            FrameInventoryError::ClaimedMapping(row.mapping)
+        );
+        assert_eq!(inventory.snapshot(), before);
+        assert_eq!(inventory.frame_mapping_count(row.frame), Some(2));
+        claim.abort();
+    }
+
+    #[test]
+    fn fragment_refuses_foreign_owner_and_out_of_range_source() {
+        let (inventory, ids, owner, row) = fixture_with_length(8192);
+        let before = inventory.snapshot();
+        let foreign = FrameOwner::HostMm(MmId::from_raw_u64(43).unwrap());
+        let (commit, _) = fragment_commit(&inventory, &ids, row);
+        assert!(matches!(
+            inventory.apply(foreign, commit),
+            Err(FrameInventoryError::CrossMmMappingReuse { .. })
+        ));
+        let (commit, _) = fragment_commit(
+            &inventory,
+            &ids,
+            carrick_hal::ExactReturnMappingRow {
+                gpa: Gpa::new(row.gpa.raw() + 4096),
+                ..row
+            },
+        );
+        assert_eq!(
+            inventory.apply(owner, commit).unwrap_err(),
+            FrameInventoryError::InvalidFragment(row.mapping)
+        );
+        assert_eq!(inventory.snapshot(), before);
+        assert_eq!(inventory.frame_mapping_count(row.frame), Some(1));
+    }
+
+    #[test]
+    fn alias_after_last_return_cannot_republish_the_retired_frame() {
+        let (inventory, ids, owner, row) = fixture();
+        let sibling = FrameOwner::HostMm(MmId::from_raw_u64(43).unwrap());
+        let staged_alias = alias_commit(&inventory, &ids, row);
+        let claim = inventory.prepare_return(&ids, owner, &[row]).unwrap();
+        assert_eq!(
+            claim
+                .apply()
+                .last_unmapped
+                .iter()
+                .map(|permit| permit.frame())
+                .collect::<Vec<_>>(),
+            vec![row.frame]
+        );
+        assert_eq!(
+            inventory.apply(sibling, staged_alias).unwrap_err(),
+            FrameInventoryError::UnreservedFrame(row.frame)
+        );
+        assert_eq!(inventory.frame_mapping_count(row.frame), None);
+        assert!(inventory.snapshot_for_mm(sibling).mappings.is_empty());
+    }
+    #[test]
+    fn rejected_inventory_commit_drops_backend_custody_outside_inventory_lock() {
+        struct BackendCustody {
+            inventory: Arc<FrameInventoryAuthority>,
+            unlocked: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl Drop for BackendCustody {
+            fn drop(&mut self) {
+                self.unlocked.store(
+                    self.inventory.state.try_lock().is_some(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }
+        }
+        for entry in 0..3 {
+            let (inventory, ids, owner, _) = fixture();
+            let unlocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reservation = inventory
+                .reserve(&ids, 0, 0, FrameEventCapacity::for_event_count(1).unwrap())
+                .unwrap();
+            let commit = reservation.commit(BackendCustody {
+                inventory: inventory.clone(),
+                unlocked: unlocked.clone(),
+            });
+            let result = match entry {
+                0 => inventory.apply(owner, commit).map(|_| ()),
+                1 => inventory.apply_with_receipt(owner, commit).map(|_| ()),
+                _ => inventory
+                    .apply_retirement_with_receipt(owner, commit)
+                    .map(|_| ()),
+            };
+            assert_eq!(result, Err(FrameInventoryError::EmptyBatch));
+            assert!(
+                unlocked.load(std::sync::atomic::Ordering::SeqCst),
+                "entry {entry} dropped backend custody while holding the inventory lock"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_drops_quarantine_outside_inventory_lock() {
+        struct CheckDrop {
+            inventory: Arc<FrameInventoryAuthority>,
+            observed: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl carrick_hal::ReturnQuarantine for CheckDrop {
+            fn quarantine(&self, _: FrameInventoryReceiptOwner) {
+                panic!("completed return must not quarantine");
+            }
+        }
+        impl Drop for CheckDrop {
+            fn drop(&mut self) {
+                self.observed.store(
+                    self.inventory.state.try_lock().is_some(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }
+        }
+        for abort in [false, true] {
+            let (inventory, ids, owner, row) = fixture();
+            let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let cleared = inventory
+                .prepare_return(&ids, owner, &[row])
+                .unwrap()
+                .stage1_cleared(Arc::new(CheckDrop {
+                    inventory: inventory.clone(),
+                    observed: observed.clone(),
+                }));
+            if abort {
+                cleared.undo_and_abort(|| {});
+            } else {
+                cleared.apply();
+            }
+            assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
+        }
+    }
+    #[test]
+    fn applied_claim_reports_unmap_generation_and_authenticated_provenance() {
+        let (inventory, ids, owner, row) = fixture();
+        let before = inventory.snapshot().revision;
+        let claim = inventory.prepare_return(&ids, owner, &[row]).unwrap();
+        assert_eq!(inventory.snapshot().revision, before);
+        let applied = claim.apply();
+        assert_eq!(applied.revision, before + 1);
+        assert!(applied.receipt.issued_by(&inventory.origin));
+        assert_eq!(applied.receipt.owner(), owner.receipt_owner());
+        assert_eq!(applied.receipt.revision(), applied.revision);
+        assert_eq!(applied.receipt.mapping_set(), &[(row.mapping, row.frame)]);
+        assert_eq!(applied.unmapped.len(), 1);
+        assert_eq!(applied.unmapped[0].mapping, row.mapping);
+        assert_eq!(applied.unmapped[0].frame, row.frame);
+        assert_eq!(
+            applied.unmapped[0].generation.raw(),
+            row.generation.raw() + 1
+        );
+        assert_eq!(
+            applied
+                .last_unmapped
+                .iter()
+                .map(|permit| permit.frame())
+                .collect::<Vec<_>>(),
+            vec![row.frame]
+        );
+        assert!(applied.mm_empty_at_revision);
+    }
+    #[test]
+    fn return_claim_blocks_teardown_aborts_and_retries() {
+        let (inventory, ids, owner, row) = fixture();
+        let claim = inventory.prepare_return(&ids, owner, &[row]).unwrap();
+        assert_eq!(
+            inventory.retire_mm(&ids, owner),
+            Err(FrameInventoryRetireMmError::RetryPending)
+        );
+        assert!(inventory.prepare_return(&ids, owner, &[row]).is_err());
+        claim.abort();
+        let applied = inventory
+            .prepare_return(&ids, owner, &[row])
+            .unwrap()
+            .apply();
+        assert!(applied.mm_empty_at_revision);
+        assert_eq!(
+            applied
+                .last_unmapped
+                .iter()
+                .map(|permit| permit.frame())
+                .collect::<Vec<_>>(),
+            vec![row.frame]
+        );
+        assert_eq!(inventory.retire_mm(&ids, owner).unwrap(), 0);
+    }
+    #[test]
+    fn claimed_row_refuses_every_mapping_event_without_changing_inventory() {
+        let (inventory, ids, owner, row) = fixture();
+        let claim = inventory.prepare_return(&ids, owner, &[row]).unwrap();
+        let before = inventory.snapshot();
+        for kind in 0..5 {
+            let mut reservation = inventory
+                .reserve(&ids, 0, 0, FrameEventCapacity::for_event_count(1).unwrap())
+                .unwrap();
+            let transaction = reservation.transaction();
+            let event = match kind {
+                0 => FrameInventoryEvent::PrepareMapping {
+                    transaction,
+                    frame: row.frame,
+                    mapping: row.mapping,
+                    generation: row.generation,
+                    gpa: row.gpa,
+                    length: row.length,
+                    permissions: MemPerms {
+                        read: true,
+                        write: false,
+                        exec: false,
+                    },
+                },
+                4 => FrameInventoryEvent::PrepareMappingFragment {
+                    transaction,
+                    source: row.mapping,
+                    frame: row.frame,
+                    mapping: row.mapping,
+                    generation: row.generation,
+                    gpa: row.gpa,
+                    length: row.length,
+                    permissions: MemPerms {
+                        read: true,
+                        write: false,
+                        exec: false,
+                    },
+                },
+                1 => FrameInventoryEvent::PublishMapping {
+                    transaction,
+                    mapping: row.mapping,
+                    generation: row.generation,
+                },
+                2 => FrameInventoryEvent::ProtectMapping {
+                    transaction,
+                    mapping: row.mapping,
+                    generation: next_generation(row.generation).unwrap(),
+                    permissions: MemPerms {
+                        read: true,
+                        write: false,
+                        exec: false,
+                    },
+                },
+                _ => FrameInventoryEvent::UnmapMapping {
+                    transaction,
+                    mapping: row.mapping,
+                    generation: next_generation(row.generation).unwrap(),
+                },
+            };
+            reservation.push(event).unwrap();
+            assert_eq!(
+                inventory.apply(owner, reservation.commit(())).unwrap_err(),
+                FrameInventoryError::ClaimedMapping(row.mapping)
+            );
+            assert_eq!(inventory.snapshot(), before);
+            assert_eq!(inventory.frame_mapping_count(row.frame), Some(1));
+        }
+        claim.abort();
+        assert!(inventory.live_mapping_row(owner, row.mapping).is_some());
+    }
+    #[test]
+    fn claim_placeholder_is_not_copied_into_overlay_and_restore_keeps_metadata() {
+        let (inventory, ids, owner, row) = fixture();
+        let before = inventory.snapshot();
+        let claim = inventory.prepare_return(&ids, owner, &[row]).unwrap();
+        {
+            let state = inventory.state.lock();
+            assert!(matches!(
+                state.mappings.get(&row.mapping),
+                Some(MappingSlot::Claimed(_))
+            ));
+            let mut overlay = InventoryOverlay::new(&state);
+            assert!(overlay.mapping(row.mapping).is_none());
+            assert!(overlay.mapping_mut(row.mapping).is_none());
+            assert!(overlay.mappings.is_empty());
+            assert_eq!(
+                recomputed_mm_mapping_counts(&state),
+                state.mm_mapping_counts
+            );
+        }
+        claim.abort();
+        assert_eq!(inventory.snapshot(), before);
+        assert!(matches!(
+            inventory.state.lock().mappings.get(&row.mapping),
+            Some(MappingSlot::Live(_))
+        ));
+    }
+
+    #[test]
+    fn sibling_unmaps_shared_frame_between_prepare_and_apply() {
+        let (inventory, ids, owner, row) = fixture();
+        let sibling = FrameOwner::HostMm(MmId::from_raw_u64(43).unwrap());
+        let mut reservation = inventory
+            .reserve(&ids, 0, 1, FrameEventCapacity::for_event_count(2).unwrap())
+            .unwrap();
+        let transaction = reservation.transaction();
+        let mapping = reservation.claim_mapping().unwrap();
+        reservation
+            .push(FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame: row.frame,
+                mapping,
+                generation: row.generation,
+                gpa: row.gpa,
+                length: row.length,
+                permissions: MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation: row.generation,
+            })
+            .unwrap();
+        inventory.apply(sibling, reservation.commit(())).unwrap();
+        let claim = inventory.prepare_return(&ids, owner, &[row]).unwrap();
+        assert_eq!(inventory.retire_mm(&ids, sibling).unwrap(), 1);
+        assert_eq!(inventory.frame_mapping_count(row.frame), Some(1));
+        assert_eq!(
+            claim
+                .apply()
+                .last_unmapped
+                .iter()
+                .map(|permit| permit.frame())
+                .collect::<Vec<_>>(),
+            vec![row.frame]
+        );
+    }
+    #[test]
+    fn shared_frame_stays_live_after_one_return() {
+        let (inventory, ids, owner, row) = fixture();
+        let sibling = FrameOwner::HostMm(MmId::from_raw_u64(43).unwrap());
+        let mut reservation = inventory
+            .reserve(&ids, 0, 1, FrameEventCapacity::for_event_count(2).unwrap())
+            .unwrap();
+        let transaction = reservation.transaction();
+        let mapping = reservation.claim_mapping().unwrap();
+        reservation
+            .push(FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame: row.frame,
+                mapping,
+                generation: row.generation,
+                gpa: row.gpa,
+                length: row.length,
+                permissions: MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation: row.generation,
+            })
+            .unwrap();
+        inventory.apply(sibling, reservation.commit(())).unwrap();
+        assert!(
+            inventory
+                .prepare_return(&ids, owner, &[row])
+                .unwrap()
+                .apply()
+                .last_unmapped
+                .is_empty()
+        );
+        assert!(inventory.live_mapping_row(sibling, mapping).is_some());
+        inventory.retire_mm(&ids, sibling).unwrap();
+        assert_eq!(inventory.frame_mapping_count(row.frame), None);
+    }
+    #[test]
+    fn dropped_return_restores_exact_row_and_counts_abandonment() {
+        let (inventory, ids, owner, row) = fixture();
+        drop(inventory.prepare_return(&ids, owner, &[row]).unwrap());
+        assert_eq!(inventory.state.lock().abandoned_returns, 1);
+        assert!(inventory.live_mapping_row(owner, row.mapping).is_some());
+        let stale = carrick_hal::ExactReturnMappingRow {
+            generation: MappingGeneration::from_backend_counter(NonZeroU64::new(2).unwrap()),
+            ..row
+        };
+        assert!(inventory.prepare_return(&ids, owner, &[stale]).is_err());
+        assert!(
+            inventory
+                .prepare_return(
+                    &ids,
+                    FrameOwner::HostMm(MmId::from_raw_u64(43).unwrap()),
+                    &[row]
+                )
+                .is_err()
+        );
+    }
+    #[test]
+    fn stage1_undo_finishes_before_inventory_abort_and_retry() {
+        struct NoQuarantine;
+        impl carrick_hal::ReturnQuarantine for NoQuarantine {
+            fn quarantine(&self, _: FrameInventoryReceiptOwner) {
+                panic!("explicit undo must not quarantine");
+            }
+        }
+        let (inventory, ids, owner, row) = fixture();
+        let cleared = inventory
+            .prepare_return(&ids, owner, &[row])
+            .unwrap()
+            .stage1_cleared(Arc::new(NoQuarantine));
+        let mut undo_ran = false;
+        cleared.undo_and_abort(|| {
+            // A descriptor undo runs outside the inventory lock, while its
+            // rows remain claimed. Teardown cannot steal them in this window.
+            assert_eq!(
+                inventory.retire_mm(&ids, owner),
+                Err(FrameInventoryRetireMmError::RetryPending)
+            );
+            assert_eq!(inventory.frame_mapping_count(row.frame), Some(1));
+            undo_ran = true;
+        });
+        assert!(undo_ran);
+        assert!(inventory.live_mapping_row(owner, row.mapping).is_some());
+        let applied = inventory
+            .prepare_return(&ids, owner, &[row])
+            .unwrap()
+            .stage1_cleared(Arc::new(NoQuarantine))
+            .apply();
+        assert_eq!(
+            applied
+                .last_unmapped
+                .iter()
+                .map(|permit| permit.frame())
+                .collect::<Vec<_>>(),
+            vec![row.frame]
+        );
+        assert!(applied.mm_empty_at_revision);
+        assert_eq!(inventory.state.lock().quarantined_returns, 0);
+    }
+
+    #[test]
+    fn return_claim_reserves_revision_headroom() {
+        let (inventory, ids, owner, row) = fixture();
+        inventory.state.lock().revision = u64::MAX - 1;
+        let claim = inventory.prepare_return(&ids, owner, &[row]).unwrap();
+        assert_eq!(inventory.state.lock().return_claims, 1);
+        let mut reservation = inventory
+            .reserve(&ids, 0, 0, FrameEventCapacity::for_event_count(1).unwrap())
+            .unwrap();
+        let transaction = reservation.transaction();
+        reservation
+            .push(FrameInventoryEvent::UnmapMapping {
+                transaction,
+                mapping: row.mapping,
+                generation: MappingGeneration::from_backend_counter(NonZeroU64::new(2).unwrap()),
+            })
+            .unwrap();
+        assert_eq!(
+            inventory.apply(owner, reservation.commit(())).unwrap_err(),
+            FrameInventoryError::RevisionExhausted
+        );
+        claim.apply();
+        assert_eq!(inventory.state.lock().revision, u64::MAX);
+    }
+    #[test]
+    fn cleared_drop_quarantines_exact_owner_and_retains_claim() {
+        struct Quarantine(std::sync::Mutex<Option<FrameInventoryReceiptOwner>>);
+        impl carrick_hal::ReturnQuarantine for Quarantine {
+            fn quarantine(&self, owner: FrameInventoryReceiptOwner) {
+                *self.0.lock().unwrap() = Some(owner);
+            }
+        }
+        let (inventory, ids, owner, row) = fixture();
+        let quarantine = Arc::new(Quarantine(std::sync::Mutex::new(None)));
+        drop(
+            inventory
+                .prepare_return(&ids, owner, &[row])
+                .unwrap()
+                .stage1_cleared(quarantine.clone()),
+        );
+        assert_eq!(*quarantine.0.lock().unwrap(), Some(owner.receipt_owner()));
+        assert_eq!(inventory.state.lock().quarantined_returns, 1);
+        assert_eq!(
+            inventory.retire_mm(&ids, owner),
+            Err(FrameInventoryRetireMmError::RetryPending)
+        );
     }
 }

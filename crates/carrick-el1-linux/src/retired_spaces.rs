@@ -205,7 +205,7 @@ pub fn retire_closed_space<
         .find(mm.raw())
         .ok_or(NativeProcessError::Stale)?;
     owner.spaces.close(index);
-    owner
+    let _retired_journal = owner
         .root_any(mm, worker)
         .map_err(|error| match error {
             MmError::Busy => NativeProcessError::Busy,

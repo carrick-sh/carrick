@@ -398,6 +398,12 @@ impl PreparedNativeExecSuccessor {
         let ipa = lease.key().0;
         let generation = 1;
         let backing = std::sync::Arc::new(crate::fork_stock::NativeFrameBacking {
+            inventory: std::sync::Arc::new(
+                carrick_kernel::kernel::frame_inventory::FrameInventoryAuthority::new(),
+            )
+            .physical_projection(std::sync::Arc::new(
+                carrick_kernel::kernel::ObjectIdRegistry::new(),
+            )),
             carrier: std::sync::Arc::downgrade(custody),
             ipa,
             generation,

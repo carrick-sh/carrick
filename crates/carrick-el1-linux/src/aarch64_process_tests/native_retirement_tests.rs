@@ -311,9 +311,10 @@ impl PhysicalStock {
                     true
                 },
                 |life| window.clear(life),
-                |absence| {
+                |absence, _progress| {
                     self.releases += 1;
-                    carrick_hal::fork_stock::release_child_mm(&*inventory, residency, absence.mm())
+                    carrick_hal::fork_stock::release_child_mm(&*inventory, residency, absence)
+                        .is_some()
                 },
             )
             .unwrap();

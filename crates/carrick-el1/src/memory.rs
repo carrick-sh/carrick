@@ -153,7 +153,7 @@ impl PendingReservationSyscall {
         current: &CurrentTask,
         model: &mut ReservationModel<'_, G, C>,
         completion: carrick_el1_abi::ReservationCompletion,
-        slot: reservations::ReturnSlot,
+        slot: reservations::ReturnSlot<'_>,
     ) -> Result<(), reservations::Refusal> {
         self.complete_as(frame, current, model, completion, Some(slot))
     }
@@ -163,7 +163,7 @@ impl PendingReservationSyscall {
         current: &CurrentTask,
         model: &mut ReservationModel<'_, G, C>,
         completion: carrick_el1_abi::ReservationCompletion,
-        owed_return: Option<reservations::ReturnSlot>,
+        owed_return: Option<reservations::ReturnSlot<'_>>,
     ) -> Result<(), reservations::Refusal> {
         if !self.owns_frame(frame, current) || !completion.authenticates(self.request) {
             if let Some(slot) = owed_return {

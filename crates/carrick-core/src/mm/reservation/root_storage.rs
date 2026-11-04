@@ -601,6 +601,10 @@ mod tests {
             finish(&mut model, decision);
             assert!(model.work < 64);
         }
+        let second_generation = table
+            .lock_resolved(1, b, &host, &NoRootWait)
+            .unwrap()
+            .generation();
         let mut guest = table.lock_identity_for_test(0, a).unwrap();
         let old_generation = guest.generation();
         let old = guest
@@ -637,7 +641,7 @@ mod tests {
             second.mapping(0x100000).unwrap().protection,
             ReservationProtection::READ_WRITE
         );
-        assert_eq!(second.generation(), old_generation);
+        assert_eq!(second.generation(), second_generation);
     }
 
     #[test]
@@ -671,13 +675,14 @@ mod tests {
         table.publish(1, b, layout()).unwrap();
         let model = table.lock(0, a).unwrap();
         let other = table.lock(1, b).unwrap();
+        let other_generation = other.generation();
         let mut backing = vec![0u8; 2 * 1024 * 1024];
         let allocator = MetadataStorage::new();
         allocator
             .admit_bootstrap_region(backing.as_mut_ptr() as u64, backing.len())
             .unwrap();
         model.provision_metadata(&allocator).unwrap();
-        assert_eq!(other.generation().raw(), 1);
+        assert_eq!(other.generation(), other_generation);
         assert_eq!(table.storage.capacity(), (NODES + BANK_NODES) as u32);
         // The consumed MM lock was released before provisioning.
         table.lock_identity_for_test(0, a).unwrap();

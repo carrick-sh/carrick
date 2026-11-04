@@ -48,15 +48,20 @@ pub use trap::{
 pub mod vm_backend;
 pub use vm_backend::{ForkRamStrategy, GuestVmBackend};
 pub mod hypervisor;
-pub use hypervisor::{HvVcpu, HvVm, VcpuExit};
+pub use hypervisor::{
+    HvVcpu, HvVm, VcpuExit, VmDestructionCustody, VmDestructionOwner, VmDestructionQueue,
+    complete_vm_destruction,
+};
 pub mod kernel;
 pub use kernel::{
-    ForeignBackendRevision, ForeignFrameInventoryRevision, ForeignVmaRevision, FrameEventCapacity,
-    FrameId, FrameInventoryApplyReceipt, FrameInventoryBatch, FrameInventoryBatchError,
+    BackendCustodyReleased, ForeignBackendRevision, ForeignFrameInventoryRevision,
+    ForeignVmaRevision, FrameBackingIdentity, FrameEventCapacity, FrameId,
+    FrameInventoryApplyReceipt, FrameInventoryBatch, FrameInventoryBatchError,
     FrameInventoryCommit, FrameInventoryEvent, FrameInventoryOrigin, FrameInventoryProvenance,
     FrameInventoryReceiptChallenge, FrameInventoryReceiptOwner, FrameInventoryReservation,
     FrameInventoryReservationError, FrameInventoryRetirementReceipt, FrameLength,
-    KernelTransactionId, MAX_FRAME_INVENTORY_EVENTS_PER_BATCH, MappingGeneration, MappingId,
+    FrameRetirementPermit, InventoryReleased, KernelTransactionId,
+    MAX_FRAME_INVENTORY_EVENTS_PER_BATCH, MappingGeneration, MappingId, MmReleaseReceipt,
 };
 pub mod event;
 pub use event::{EventMultiplexer, Interest, PollEvent, Readiness, TriggerMode, VnodeEvents};
@@ -148,3 +153,9 @@ pub use pre_admission::{PreAdmissionOwner, PreAdmissionPermit, PreAdmissionRecei
 pub use carrick_guest_arch::MmGeneration;
 
 pub mod diagnostic_capture;
+
+pub mod prepared_return;
+pub use prepared_return::{
+    AppliedReturn, ExactReturnMappingRow, PrepareReturnError, PreparedReturn, ReturnClaim,
+    ReturnQuarantine, Stage1Cleared,
+};

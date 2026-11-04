@@ -253,7 +253,7 @@ pub(crate) fn run_member(
 #[derive(::core::clone::Clone)]
 pub(crate) struct ProductionRunContext {
     ram: Arc<GuestRam>,
-    vm: Arc<VmFd>,
+    vm: Arc<crate::kvm::KvmVmLifetime>,
     actual_run: Arc<[AtomicU32; 2]>,
     file_execution: Arc<RwLock<()>>,
     slot: usize,

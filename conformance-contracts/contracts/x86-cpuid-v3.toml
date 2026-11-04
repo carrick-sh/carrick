@@ -47,6 +47,6 @@ vm_free = [
 [bindings.unresolved]
 procfs = "Synthetic /proc/cpuinfo flags are not derived from the installed view; follow-up under #578. CPUID isolation does not cover procfs."
 embed_structural = "KVM vCPU CPUID and XGETBV execution fixtures live in carrick-vmm-kvm::kvm::x86_tests and carrick-vmm-kvm/tests/cpuid_v3_kvm.rs (`test-kvm` lane); these do not emit an embed structural observation."
-kvm = "Merge-queue `kvm-tests` / `kvm-gate` must execute `carrick-vmm-kvm --lib` and `--test cpuid_v3_kvm` on real `/dev/kvm` with `NEW=[]`."
+kvm = "Merge-queue `kvm-tests` / `kvm-gate` must execute `carrick-vmm-kvm --lib` and `--test cpuid_v3_kvm` on real `/dev/kvm` with `NEW=[]`. The shared VM/vCPU destruction-lifetime change additionally runs the focused `kvm::x86_tests::x86_vcpu_exposes_pinned_x86_64_v3_profile` real-KVM binding; qualification and CPUID installation remain unchanged."
 signed = "macOS HVF AArch64 lane does not execute x86 CPUID; soft-lane shared-view consumption and table equality remain in the draft switch layer, blocked on #1532."
 docker = "Architectural x86-64-v3 CPUID isolation uses System V AMD64 psABI and Intel SDM authority; Docker passes host CPUID unfiltered and cannot supply the pinned-view oracle."
