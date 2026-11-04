@@ -2240,6 +2240,28 @@ jobs:
           CI_REPOSITORY: ${{ github.repository }}
           CI_EVENT: ${{ github.event_name }}
         run: just ci-superseded
+      # Report infrastructure failures without retrying inside this run.
+      # Keep the existing ci-results verdict authoritative (#1603).
+      - name: Download xtask for cancellation diagnostics
+        continue-on-error: true
+        if: github.event_name == 'merge_group' && contains(toJSON(needs), 'cancelled')
+        uses: actions/download-artifact@v4
+        with:
+          name: xtask-linux-x64
+          path: ${{ runner.temp }}/xtask
+      - name: Explain cancelled dependencies
+        continue-on-error: true
+        if: github.event_name == 'merge_group' && contains(toJSON(needs), 'cancelled')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_REPOSITORY: ${{ github.repository }}
+          CI_RUN_ID: ${{ github.run_id }}
+          CI_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$CI_REPOSITORY/actions/runs/$CI_RUN_ID/attempts/$CI_RUN_ATTEMPT/jobs?per_page=100" > "$RUNNER_TEMP/ci-jobs.json"
+          chmod +x "$RUNNER_TEMP/xtask/carrick-xtask"
+          "$RUNNER_TEMP/xtask/carrick-xtask" ci-starved-jobs --jobs "$RUNNER_TEMP/ci-jobs.json" >> "$GITHUB_STEP_SUMMARY"
       - name: Require every applicable job to succeed
         env:
           CI_SUPERSEDED: ${{ steps.superseded.outputs.superseded }}
