@@ -163,6 +163,9 @@ pub struct Dispatch {
     pub main: String,
     #[serde(default)]
     pub parent_branch: Option<String>,
+    /// Exact prior publication boundary, authenticated by the guard.
+    #[serde(default)]
+    pub layer_history: Option<LayerPublication>,
     pub review: bool,
     pub review_text: String,
     pub continuation: Continuation,
@@ -728,6 +731,7 @@ fn validate_event_with_publication(
         base: String::new(),
         main: String::new(),
         parent_branch: None,
+        layer_history: None,
         review,
         review_text: String::new(),
         continuation,
@@ -1093,6 +1097,27 @@ fn worker_prompt(dispatch: &Dispatch) -> String {
                 "Admitted main anchor: {} (refs/carrick/dispatch-main). Push only this layer.\n",
                 dispatch.main
             )
+    } else {
+        history
+    };
+    let history = if let Some(layer) = &dispatch.layer_history {
+        let boundary = format!(
+            "Historical parent boundary for child {}: {}.\n",
+            layer.head, layer.base
+        );
+        if matches!(
+            dispatch.continuation,
+            Continuation::Owned | Continuation::Adopted { rebase: true, .. }
+        ) {
+            history
+                + &boundary
+                + &format!(
+                    "Rebase only this layer with `git rebase --onto {} {}`; preserve its commits and exclude obsolete parent patches.\n",
+                    dispatch.base, layer.base
+                )
+        } else {
+            history + &boundary
+        }
     } else {
         history
     };
@@ -3032,6 +3057,16 @@ struct PublicationRecord {
     issue: u64,
     branch: String,
     publication_pr: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    layer: Option<LayerPublication>,
+}
+/// Server-owned closure: this published head includes this exact parent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LayerPublication {
+    head: String,
+    parent_branch: String,
+    base: String,
 }
 /// Created only from a successful server write or authenticated run evidence.
 pub(crate) struct PublishedPr(PublicationRecord);
@@ -3134,6 +3169,7 @@ fn require_owned_pr(root: &Path, dispatch: &Dispatch) -> Result<Value, ScalerErr
                         issue: dispatch.issue,
                         branch: dispatch.branch.clone(),
                         publication_pr: number,
+                        layer: None,
                     })
                 })
             } else {
@@ -3795,6 +3831,45 @@ fn label_trigger(root: &Path, mut event: Value) -> Value {
     event
 }
 
+/// History belongs to a particular published child, not to every commit
+/// that ever appeared on its parent's branch. In particular a parent can
+/// temporarily incorporate a child and later drop it again.
+fn layer_history_fork(
+    work: &Path,
+    dispatch: &Dispatch,
+    admitted: &str,
+) -> Result<String, ScalerError> {
+    if let Some(parent) = &dispatch.parent_branch {
+        if let Some(history) = &dispatch.layer_history {
+            if history.head != admitted
+                || history.parent_branch != *parent
+                || !sha(&history.base)
+                || git(
+                    work,
+                    &["merge-base", "--is-ancestor", &history.base, admitted],
+                )
+                .is_err()
+            {
+                return Err(ScalerError::Guard("invalid historical layer publication"));
+            }
+            return Ok(history.base.clone());
+        }
+        if git(
+            work,
+            &["merge-base", "--is-ancestor", &dispatch.base, admitted],
+        )
+        .is_err()
+        {
+            return Err(ScalerError::Guard(
+                "parent moved without a publication boundary for this child head; preserve the layer with a director rebase before dispatch",
+            ));
+        }
+    }
+    Ok(git(work, &["merge-base", admitted, &dispatch.base])?
+        .trim()
+        .to_owned())
+}
+
 fn guard_admission(
     root: &Path,
     event_path: &Path,
@@ -3835,6 +3910,14 @@ fn guard_admission(
         && let Some((branch, tip)) =
             stack_parent(&event["pull_request"], |endpoint| api(root, &endpoint))?.parent()
     {
+        dispatch.layer_history = agent_loop::RunCache::for_guard(admit).layer_publication(
+            root,
+            &event["pull_request"],
+            dispatch.issue,
+            &dispatch.branch,
+            dispatch.selected_tip.as_deref().unwrap_or_default(),
+            &branch,
+        )?;
         dispatch.parent_branch = Some(branch);
         dispatch.base = tip;
     }
@@ -4764,6 +4847,8 @@ struct Applied {
     #[serde(default)]
     publication_pr: Option<u64>,
     #[serde(default)]
+    layer: Option<LayerPublication>,
+    #[serde(default)]
     manual_repair: Option<String>,
     #[serde(default)]
     ci_requires_owner: bool,
@@ -5645,8 +5730,8 @@ struct KeptRebase {
     range_diff: String,
 }
 /// A consented rebase must keep the director's history: the director's
-/// commits from the merge-base with main to the admitted tip come first
-/// above admitted main, in order, each with the same author email and
+/// commits from the historical layer boundary to the admitted tip come first
+/// above the newly admitted base, in order, each with the same author email and
 /// subject. Commits main already has (`git cherry` `-`) count as kept. A
 /// commit replaced by an empty one, or a path the director changed that the
 /// rebased history neither changes nor already matches, is refused. A
@@ -5656,10 +5741,8 @@ fn rebase_kept_commits(
     work: &Path,
     admitted: &str,
     base: &str,
+    fork: &str,
 ) -> Result<Result<KeptRebase, String>, ScalerError> {
-    let fork = git(work, &["merge-base", admitted, base])?
-        .trim()
-        .to_owned();
     let empty = |sha: &str| -> Result<bool, ScalerError> {
         Ok(git(
             work,
@@ -5671,7 +5754,7 @@ fn rebase_kept_commits(
     // Every empty commit shares one patch-id, so an empty director commit
     // is never "already in main".
     let mut upstream = Vec::new();
-    for line in git(work, &["cherry", base, admitted, &fork])?.lines() {
+    for line in git(work, &["cherry", base, admitted, fork])?.lines() {
         if let Some(sha) = line.strip_prefix("- ")
             && !empty(sha)?
         {
@@ -5751,7 +5834,7 @@ fn rebase_kept_commits(
     // Conflict resolution only edits files the director's own commits
     // change; any other path in them would be the run's own work hidden
     // from the run's checks.
-    let director = paths(&fork, admitted)?;
+    let director = paths(fork, admitted)?;
     if let Some(path) = touched.iter().find(|p| !director.contains(p)) {
         return Ok(Err(format!(
             "changed `{path}` in the director's commits, which the director never changed"
@@ -5763,7 +5846,7 @@ fn rebase_kept_commits(
             return Ok(Err(format!("dropped the director's change to `{path}`")));
         }
     }
-    let changed = git(work, &["cherry", &director_tip, admitted, &fork])?
+    let changed = git(work, &["cherry", &director_tip, admitted, fork])?
         .lines()
         .filter_map(|line| line.strip_prefix("+ "))
         .filter(|sha| !upstream.iter().any(|u| u == sha))
@@ -6057,7 +6140,8 @@ fn publish_commits(
                         ),
                     )?);
                 }
-                match rebase_kept_commits(&work, admitted, &dispatch.base)? {
+                let fork = layer_history_fork(&work, dispatch, admitted)?;
+                match rebase_kept_commits(&work, admitted, &dispatch.base, &fork)? {
                     Err(lost) => {
                         return Err(adopted_publication_blocked(
                             number,
@@ -6096,6 +6180,17 @@ fn publish_commits(
             )
             .map_err(|_| {
                 ScalerError::Guard("worker must rebase onto admitted main before publication")
+            })?;
+        }
+        if dispatch.parent_branch.is_some() {
+            git(
+                &work,
+                &["merge-base", "--is-ancestor", &dispatch.base, "HEAD"],
+            )
+            .map_err(|_| {
+                ScalerError::Guard(
+                    "stack layer must descend from its admitted parent before publication",
+                )
             })?;
         }
         let live_main = if let Some(branch) = &dispatch.parent_branch {
@@ -6344,6 +6439,24 @@ fn publish_commits(
         }
         if !retained {
             std::fs::write(state.join("published-tip"), head.trim())?;
+            Applied::record(|a| {
+                a.layer = dispatch
+                    .parent_branch
+                    .as_ref()
+                    .map(|parent| LayerPublication {
+                        head: head.trim().to_owned(),
+                        parent_branch: parent.clone(),
+                        base: dispatch.base.clone(),
+                    });
+                if a.layer.is_some() && adopted.is_none() {
+                    // A commit-only checkpoint on an existing owned layer
+                    // must also name its PR in the outcome receipt.
+                    a.publication_pr = prs
+                        .as_array()
+                        .and_then(|prs| prs.first())
+                        .and_then(|pr| pr["number"].as_u64());
+                }
+            })?;
         }
         if let Some((number, _)) = adopted {
             // Commits only: no PR creation, body edit or draft change.
@@ -7863,6 +7976,7 @@ mod tests {
             issue: 634,
             branch: "work/dispatch-634-42".into(),
             publication_pr: 800,
+            layer: None,
         });
         pr["user"]["login"] = "carrick-workers[bot]".into();
         assert!(owned_pr(
@@ -7948,6 +8062,22 @@ mod tests {
     #[test]
     fn stacked_adopted_layer_three_pushes_only_its_layer() {
         publication_fixture("adopted-stack");
+    }
+    #[test]
+    fn stacked_adopted_layer_rebases_after_parent_rewrite() {
+        publication_fixture("adopted-stack-rewrite");
+    }
+    #[test]
+    fn stacked_adopted_rewrite_without_boundary_refuses() {
+        publication_fixture("adopted-stack-rewrite-unrecorded");
+    }
+    #[test]
+    fn stacked_adopted_rewrite_cannot_drop_child_history() {
+        publication_fixture("adopted-stack-rewrite-drop");
+    }
+    #[test]
+    fn stacked_adopted_rewrite_keeps_closing_scope() {
+        publication_fixture("adopted-stack-rewrite-closure");
     }
     #[test]
     fn stacked_adopted_layer_rebases_after_parent_moves() {
@@ -8417,7 +8547,17 @@ fi
                     .trim(),
                 parent
             );
-            assert_eq!(Applied::load().unwrap().commits.len(), 2);
+            let applied = Applied::load().unwrap();
+            assert_eq!(applied.commits.len(), 2);
+            assert_eq!(applied.publication_pr, Some(800));
+            assert_eq!(
+                applied.layer.unwrap(),
+                LayerPublication {
+                    head: receipt.head.clone(),
+                    parent_branch: "work/parent-one".into(),
+                    base: parent
+                }
+            );
             return;
         }
         if witness.starts_with("adopted") {
@@ -8429,6 +8569,18 @@ fi
                     ("work/parent-one", "main"),
                     ("work/parent-two", "work/parent-one"),
                 ] {
+                    if witness.starts_with("adopted-stack-rewrite") && branch == "work/parent-one" {
+                        continue;
+                    }
+                    let base_branch = if witness.starts_with("adopted-stack-rewrite") {
+                        "main"
+                    } else {
+                        base_branch
+                    };
+                    if witness.starts_with("adopted-stack-rewrite") {
+                        std::fs::write(work.join("parent.txt"), branch).unwrap();
+                        git(&work, &["add", "parent.txt"]).unwrap();
+                    }
                     git(
                         &work,
                         &[
@@ -8479,7 +8631,7 @@ fi
                     | "adopted-rebase-path"
                     | "adopted-rebase-hidden"
                     | "adopted-rebase-upstream"
-            );
+            ) || witness.starts_with("adopted-stack-rewrite");
             if content {
                 std::fs::write(work.join("slice.txt"), "director v1\n").unwrap();
                 git(&work, &["add", "slice.txt"]).unwrap();
@@ -8683,6 +8835,11 @@ fi
             }
             if witness == "adopted-stack-rebase" {
                 let old_parent = dispatch.base.clone();
+                dispatch.layer_history = Some(LayerPublication {
+                    head: tip.clone(),
+                    parent_branch: "work/parent-two".into(),
+                    base: old_parent.clone(),
+                });
                 let old_head = git(&work, &["rev-parse", "HEAD"])
                     .unwrap()
                     .trim()
@@ -8881,6 +9038,162 @@ fi
                         applied.report()
                     );
                 }
+                return;
+            }
+            if witness.starts_with("adopted-stack-rewrite") {
+                assert_eq!(result.unwrap(), Some(800));
+                let published = git(&work, &["rev-parse", "HEAD"])
+                    .unwrap()
+                    .trim()
+                    .to_owned();
+                let old_parent = dispatch.base.clone();
+                let anchor = Applied::load().unwrap().layer.unwrap();
+                assert_eq!(anchor.head, published);
+                assert_eq!(anchor.base, old_parent);
+                // Publish the parent too, then rewrite its patch, as a lower
+                // stack layer does after review. The child must shed the old
+                // parent's commit AND bytes while keeping its own history.
+                let remote = outer.join("live-main.git");
+                git(
+                    &work,
+                    &[
+                        "--git-dir",
+                        remote.to_str().unwrap(),
+                        "fetch",
+                        work.to_str().unwrap(),
+                        "work/parent-two:refs/heads/work/parent-two",
+                    ],
+                )
+                .unwrap();
+                if witness.ends_with("-drop") {
+                    // The parent temporarily incorporates the child, then
+                    // drops it. Its historical heads are not child authority.
+                    git(
+                        &work,
+                        &[
+                            "--git-dir",
+                            remote.to_str().unwrap(),
+                            "fetch",
+                            work.to_str().unwrap(),
+                            &format!("+{branch}:refs/heads/work/parent-two"),
+                        ],
+                    )
+                    .unwrap();
+                }
+                git(&work, &["checkout", "work/parent-two"]).unwrap();
+                std::fs::write(work.join("parent.txt"), "reviewed parent patch\n").unwrap();
+                git(&work, &["add", "parent.txt"]).unwrap();
+                git(&work, &["commit", "--amend", "--no-edit"]).unwrap();
+                let parent = git(&work, &["rev-parse", "HEAD"])
+                    .unwrap()
+                    .trim()
+                    .to_owned();
+                git(
+                    &work,
+                    &[
+                        "--git-dir",
+                        remote.to_str().unwrap(),
+                        "fetch",
+                        work.to_str().unwrap(),
+                        "+work/parent-two:refs/heads/work/parent-two",
+                    ],
+                )
+                .unwrap();
+                git(&work, &["checkout", branch]).unwrap();
+                git(&work, &["rebase", "--onto", &parent, &old_parent]).unwrap();
+                if witness.ends_with("-drop") {
+                    git(&work, &["reset", "--hard", &parent]).unwrap();
+                }
+                git(
+                    &work,
+                    &["commit", "--allow-empty", "-m", "fix(ci): continue child"],
+                )
+                .unwrap();
+                dispatch.base = parent.clone();
+                receipt.base = parent.clone();
+                receipt.expected_tip = published.clone();
+                receipt.head = git(&work, &["rev-parse", "HEAD"]).unwrap().trim().into();
+                dispatch.continuation = Continuation::Adopted {
+                    pr: 800,
+                    branch: branch.into(),
+                    tip: published.clone(),
+                    rebase: true,
+                };
+                // A new round has a new lease; it starts at the published
+                // child, never at the rewritten parent's branch.
+                std::fs::remove_file(state.join("published-tip")).unwrap();
+                std::fs::write(outer.join("push.args"), "").unwrap();
+                std::fs::write(
+                    outer.join("parent-two.json"),
+                    json!([stack_pr("work/parent-two", "main", &parent)]).to_string(),
+                )
+                .unwrap();
+                dispatch.layer_history =
+                    (witness != "adopted-stack-rewrite-unrecorded").then_some(anchor);
+                if witness == "adopted-stack-rewrite-closure" {
+                    git(
+                        &work,
+                        &[
+                            "commit",
+                            "--amend",
+                            "--allow-empty",
+                            "-m",
+                            "fix(ci): other issue\n\nCloses #999",
+                        ],
+                    )
+                    .unwrap();
+                    receipt.head = git(&work, &["rev-parse", "HEAD"]).unwrap().trim().into();
+                }
+                adopted["head"]["sha"] = published.clone().into();
+                std::fs::write(outer.join("adopted-pr.json"), adopted.to_string()).unwrap();
+                let second = publish(
+                    &work,
+                    &dispatch,
+                    &receipt,
+                    &contract,
+                    &report,
+                    "fixture-token",
+                    &mut agent_loop::RunCache::default(),
+                );
+                if witness != "adopted-stack-rewrite" {
+                    let error = second.unwrap_err().to_string();
+                    let expected = if witness.ends_with("unrecorded") {
+                        "without a publication boundary"
+                    } else if witness.ends_with("-drop") {
+                        "dropped or reordered the director's commit"
+                    } else {
+                        "closing keyword targets another issue"
+                    };
+                    assert!(error.contains(expected), "{error}");
+                    assert!(regular_text(&outer.join("push.args")).unwrap().is_empty());
+                    return;
+                }
+                assert_eq!(second.unwrap(), Some(800));
+                let push = regular_text(&outer.join("push.args")).unwrap();
+                assert!(
+                    push.contains(&format!(
+                        "--force-with-lease=refs/heads/{branch}:{published}\n"
+                    )),
+                    "{push}"
+                );
+                assert!(!push.contains("HEAD:refs/heads/work/parent"), "{push}");
+                assert!(git(&work, &["merge-base", "--is-ancestor", &old_parent, "HEAD"]).is_err());
+                assert_eq!(
+                    regular_text(&work.join("parent.txt")).unwrap(),
+                    "reviewed parent patch\n"
+                );
+                assert_eq!(
+                    regular_text(&work.join("slice.txt")).unwrap(),
+                    "director v1\n"
+                );
+                let applied = Applied::load().unwrap();
+                assert_eq!(applied.commits.len(), 1);
+                assert_eq!(applied.layer.unwrap().base, parent);
+                assert!(
+                    !git(&work, &["rev-list", &format!("{parent}..HEAD")])
+                        .unwrap()
+                        .contains(&old_parent)
+                );
                 return;
             }
             if matches!(
@@ -11310,6 +11623,7 @@ fi
                 bin.join("gh"),
                 r#"#!/bin/sh
 test "$1" = api || exit 93
+if test "$2" = --paginate; then echo '[[]]'; exit 0; fi
 if test "$2" = graphql; then
  case "$*" in *lastEditedAt*) cat "$ADOPTION_FIXTURE/issue-graphql.json" ;; *) cat "$ADOPTION_FIXTURE/graphql.json" ;; esac
  exit 0
@@ -11318,6 +11632,11 @@ file="$ADOPTION_FIXTURE/$(printf '%s' "$2" | tr '/' '_')"
 test -f "$file" || { echo "unexpected endpoint $2" >&2; exit 91; }
 cat "$file"
 "#,
+                std::fs::Permissions::from_mode(0o700),
+            );
+            crate::lock_file::tests::write_test_executable(
+                bin.join("curl"),
+                "#!/bin/sh\necho '[]'\n",
                 std::fs::Permissions::from_mode(0o700),
             );
             for (head, admission) in [

@@ -1322,6 +1322,81 @@ impl RunCache {
             ..Self::default()
         }
     }
+    /// A prior outcome's structured receipt is authenticated independently
+    /// of branch ownership, so director-owned PRs have the same boundary proof.
+    pub(super) fn layer_publication(
+        &mut self,
+        root: &Path,
+        pr: &Value,
+        issue: u64,
+        branch: &str,
+        head: &str,
+        parent: &str,
+    ) -> Result<Option<LayerPublication>, ScalerError> {
+        let number = pr["number"]
+            .as_u64()
+            .ok_or(ScalerError::Guard("layer PR lacks number"))?;
+        let mut found = None;
+        let path = format!("repos/{REPOSITORY}/issues/{number}/comments");
+        let comments = if self.public_receipts_only {
+            public_comments(root, &path)
+        } else {
+            list(root, &path)?
+        };
+        for comment in comments {
+            let body = comment["body"].as_str().unwrap_or_default();
+            if !dispatch_comment_author(&comment["user"])
+                || comment["created_at"].as_str().is_none()
+                || comment["created_at"] != comment["updated_at"]
+                || outcome_contract("pr_comment", body).is_none()
+            {
+                continue;
+            }
+            let trusted = body
+                .split("\n\nWorker contract (claims for review):")
+                .next()
+                .unwrap_or_default();
+            let marker = "Publication receipt:\n```json\n";
+            if trusted.matches(marker).count() != 1 {
+                continue;
+            }
+            let Some(text) = trusted
+                .split_once(marker)
+                .and_then(|(_, s)| s.split_once("\n```").map(|(text, _)| text))
+            else {
+                continue;
+            };
+            let Ok(record) = serde_json::from_str::<PublicationRecord>(text) else {
+                continue;
+            };
+            if record.issue != issue || record.branch != branch || record.publication_pr != number {
+                continue;
+            }
+            let Some(layer) = record.layer.filter(|l| {
+                l.head == head && l.parent_branch == parent && sha(&l.base) && sha(&l.head)
+            }) else {
+                continue;
+            };
+            let Some(id) = run_from_body(body).and_then(|s| s.parse().ok()) else {
+                continue;
+            };
+            let authenticated = self.authenticate(root, issue, RunId(id))?;
+            if authenticated.footer_issue != Some(issue)
+                && authenticated.run["event"] != "pull_request_review"
+            {
+                return Err(ScalerError::Guard(
+                    "layer publication run belongs to another issue",
+                ));
+            }
+            if found.as_ref().is_some_and(|prior| prior != &layer) {
+                return Err(ScalerError::Guard(
+                    "conflicting layer publication boundaries",
+                ));
+            }
+            found = Some(layer);
+        }
+        Ok(found)
+    }
     pub(super) fn publication(
         &mut self,
         root: &Path,
@@ -1351,6 +1426,7 @@ impl RunCache {
                 issue,
                 branch: branch.to_owned(),
                 publication_pr: number,
+                layer: None,
             });
             if publication.matches(pr, issue, branch) {
                 return Some(publication);
@@ -2304,13 +2380,19 @@ impl Server<'_> {
         let warning = manual_repair
             .map(|reason| format!("**PR body needs manual repair.** {reason}\n\n"))
             .unwrap_or_default();
-        let publication = Applied::load()?
+        let publication_applied = Applied::load()?;
+        let publication = publication_applied
             .publication_pr
+            .or_else(|| match self.dispatch.continuation {
+                Continuation::Adopted { pr, .. } if publication_applied.layer.is_some() => Some(pr),
+                _ => None,
+            })
             .map(|number| {
                 serde_json::to_string(&PublicationRecord {
                     issue: self.dispatch.issue,
                     branch: self.dispatch.branch.clone(),
                     publication_pr: number,
+                    layer: publication_applied.layer.clone(),
                 })
                 .map(|record| format!("\n\nPublication receipt:\n```json\n{record}\n```"))
             })
@@ -2599,11 +2681,26 @@ impl Server<'_> {
                 &mut self.runs,
             )?)
         };
-        let parent = if let Some(number) = target.as_ref().and_then(|t| t.pr) {
+        let (parent, layer_history) = if let Some(target) = &target
+            && let Some(number) = target.pr
+        {
             let pr = api(self.root, &format!("repos/{REPOSITORY}/pulls/{number}"))?;
-            stack_parent(&pr, |endpoint| api(self.root, &endpoint))?.parent()
+            let parent = stack_parent(&pr, |endpoint| api(self.root, &endpoint))?.parent();
+            let history = if let Some((parent, _)) = &parent {
+                self.runs.layer_publication(
+                    self.root,
+                    &pr,
+                    self.dispatch.issue,
+                    branch,
+                    &target.tip,
+                    parent,
+                )?
+            } else {
+                None
+            };
+            (parent, history)
         } else {
-            None
+            (None, None)
         };
         if self.dispatch.main.is_empty() {
             self.dispatch.main = self.dispatch.base.clone();
@@ -2613,6 +2710,7 @@ impl Server<'_> {
             .map(|(_, tip)| tip.clone())
             .unwrap_or_else(|| self.dispatch.main.clone());
         self.dispatch.parent_branch = parent.map(|(branch, _)| branch);
+        self.dispatch.layer_history = layer_history;
         self.dispatch.branch = branch.to_owned();
         self.dispatch.resume = target.is_some();
         self.dispatch.selected_tip = target.as_ref().map(|t| t.tip.clone());
@@ -4248,6 +4346,7 @@ mod tests {
                 base: "a".repeat(40),
                 main: "a".repeat(40),
                 parent_branch: None,
+                layer_history: None,
                 review: true,
                 review_text: String::new(),
                 continuation: Continuation::Owned,
@@ -5100,6 +5199,117 @@ fi
                     .publication(root, &pr, &run, 799, branch)
                     .is_none(),
                 "guard bound publication through the artifact handoff"
+            );
+        });
+    }
+    #[test]
+    fn layer_publication_authenticates_exact_child_boundary() {
+        shared_fixture(|root| {
+            let (pr, mut comment) = guard_publication_fixture(root);
+            let pr = &pr;
+            let branch = pr["head"]["ref"].as_str().unwrap();
+            let head = pr["head"]["sha"].as_str().unwrap();
+            let layer = LayerPublication {
+                head: head.into(),
+                parent_branch: "work/parent".into(),
+                base: "c".repeat(40),
+            };
+            let record = PublicationRecord {
+                issue: 799,
+                branch: branch.into(),
+                publication_pr: 800,
+                layer: Some(layer.clone()),
+            };
+            let body = comment["body"].as_str().unwrap();
+            let start = body.find("Publication receipt:\n```json\n").unwrap()
+                + "Publication receipt:\n```json\n".len();
+            let end = start + body[start..].find("\n```").unwrap();
+            comment["body"] = format!(
+                "{}{}{}",
+                &body[..start],
+                serde_json::to_string(&record).unwrap(),
+                &body[end..]
+            )
+            .into();
+            comment["created_at"] = "2026-11-04T00:00:00Z".into();
+            comment["updated_at"] = comment["created_at"].clone();
+            let lookup = |comments: Value, head: &str, branch: &str, parent: &str| {
+                std::fs::write(
+                    root.join("comments.json"),
+                    json!([comments.clone()]).to_string(),
+                )
+                .unwrap();
+                std::fs::write(
+                    root.join("layer-comments.json"),
+                    json!([comments]).to_string(),
+                )
+                .unwrap();
+                RunCache::default().layer_publication(root, pr, 799, branch, head, parent)
+            };
+            assert_eq!(
+                lookup(json!([comment.clone()]), head, branch, "work/parent").unwrap(),
+                Some(layer.clone())
+            );
+            // Issue-triggered owned continuation has a separate admission
+            // entry point: selecting its branch must load the same proof.
+            let mut stacked = pr.clone();
+            stacked["base"] = json!({"ref":"work/parent","repo":{"full_name":REPOSITORY}});
+            std::fs::write(root.join("pr.json"), stacked.to_string()).unwrap();
+            std::fs::write(root.join("prs.json"), json!([stacked]).to_string()).unwrap();
+            std::fs::write(root.join("parent-prs.json"), json!([{"number":900,"state":"open","head":{"ref":"work/parent","sha":layer.base,"repo":{"full_name":REPOSITORY}},"base":{"ref":"main","repo":{"full_name":REPOSITORY}}}]).to_string()).unwrap();
+            std::fs::write(root.join("remote-tip"), head).unwrap();
+            let mut owned = server(root);
+            owned.dispatch.review = false;
+            owned.select_branch(branch).unwrap();
+            assert_eq!(owned.dispatch.layer_history, Some(layer));
+            std::fs::write(root.join("prs.json"), "[]").unwrap();
+            owned.select_branch("work/dispatch-799-999").unwrap();
+            assert!(owned.dispatch.layer_history.is_none());
+            assert!(
+                lookup(
+                    json!([comment.clone()]),
+                    &"d".repeat(40),
+                    branch,
+                    "work/parent"
+                )
+                .unwrap()
+                .is_none()
+            );
+            assert!(
+                lookup(json!([comment.clone()]), head, "work/other", "work/parent")
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                lookup(json!([comment.clone()]), head, branch, "work/other")
+                    .unwrap()
+                    .is_none()
+            );
+            let mut edited = comment.clone();
+            edited["updated_at"] = "2026-11-04T01:00:00Z".into();
+            assert!(
+                lookup(json!([edited]), head, branch, "work/parent")
+                    .unwrap()
+                    .is_none()
+            );
+            let mut forged = comment.clone();
+            forged["user"]["login"] = "carrick-workers[bot]".into();
+            assert!(
+                lookup(json!([forged]), head, branch, "work/parent")
+                    .unwrap()
+                    .is_none()
+            );
+            let mut conflict = comment.clone();
+            conflict["body"] = conflict["body"]
+                .as_str()
+                .unwrap()
+                .replace(&"c".repeat(40), &"e".repeat(40))
+                .into();
+            assert!(
+                lookup(json!([comment, conflict]), head, branch, "work/parent")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("conflicting layer")
             );
         });
     }
@@ -7732,10 +7942,12 @@ case "$endpoint" in
  */collaborators/tjfontaine/permission) echo '{"permission":"admin","role_name":"admin"}' ;;
  */collaborators/*/permission) printf 'gh: Not Found (HTTP 404)\n' >&2; exit 1 ;;
  *'/pulls?'*'head=carrick-sh:work/dispatch-799-43') echo '[]' ;;
+ *'/pulls?state=open&head=carrick-sh:work/parent') cat "$RUNNER_TEMP/parent-prs.json" ;;
  *'/pulls?state=open'* ) if test -f "$RUNNER_TEMP/closed-only"; then echo '[]'; else cat "$RUNNER_TEMP/prs.json"; fi ;;
  *'/pulls?'*) cat "$RUNNER_TEMP/prs.json" ;;
  */pulls/800) cat "$RUNNER_TEMP/pr.json" ;;
  */issues/799) cat "$RUNNER_TEMP/issue.json" ;;
+ */issues/800/comments) if test -f "$RUNNER_TEMP/layer-comments.json"; then cat "$RUNNER_TEMP/layer-comments.json"; else echo '[[]]'; fi ;;
  */issues/799/comments) cat "$RUNNER_TEMP/comments.json" ;;
  */pulls/800/commits) cat "$RUNNER_TEMP/commits.json" ;;
  */actions/artifacts*) test ! -f "$RUNNER_TEMP/no-repo-scan" || { echo 'repository-wide artifact scan' >&2; exit 92; }; cat "$RUNNER_TEMP/repo-artifacts.json" ;;
