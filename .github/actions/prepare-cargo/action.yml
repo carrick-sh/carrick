@@ -1,0 +1,45 @@
+name: Prepare locked Cargo cache
+description: Restore dependencies before gates; classify cache preparation failures as infrastructure
+inputs:
+  root:
+    description: Checkout whose lockfile is prepared
+    default: .
+  root-only:
+    description: Prepare only the root lockfile for historical checkouts
+    default: "false"
+runs:
+  using: composite
+  steps:
+    - name: Prepare locked Cargo cache (infrastructure)
+      shell: bash
+      working-directory: ${{ inputs.root }}
+      env:
+        ROOT_ONLY: ${{ inputs.root-only }}
+      run: |
+        set -euo pipefail
+        prepare() {
+          if [ "$ROOT_ONLY" = true ]; then
+            cargo fetch --locked --offline ||
+              CARGO_NET_OFFLINE=false CARGO_NET_RETRY=0 CARGO_HTTP_TIMEOUT=30 cargo fetch --locked
+          else
+            scripts/check-fixture-lockfiles.sh --prepare
+          fi
+        }
+        export -f prepare
+        # Bound the complete fetch phase, including all nested lockfiles.
+        # Python is available on both hosted Linux and macOS runners.
+        if ! python3 - <<'PYTHON'
+        import os, signal, subprocess, sys
+        child = subprocess.Popen(["bash", "-c", "prepare"], start_new_session=True)
+        try:
+            sys.exit(child.wait(timeout=600))
+        except subprocess.TimeoutExpired:
+            os.killpg(child.pid, signal.SIGKILL)
+            child.wait()
+            sys.exit(75)
+        PYTHON
+        then
+          echo '::error title=Infrastructure::Cargo cache preparation failed; tests did not run'
+          exit 75
+        fi
+        echo 'CARGO_NET_OFFLINE=true' >> "$GITHUB_ENV"
