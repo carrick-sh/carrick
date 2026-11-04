@@ -241,10 +241,11 @@ locked fetch per workspace with retries disabled and a 30 second HTTP timeout.
 CI bounds the entire preparation step to ten minutes and reports failures with
 an `Infrastructure` annotation and exit 75. Later validation never fetches.
 
-The director workflow delta is
-[`1571-offline-cargo.patch`](ci/patches/1571-offline-cargo.patch). It may land before or after
-the recipe changes; it extends the existing rust-cache restores, then exports
-`CARGO_NET_OFFLINE=true` for subsequent steps. Historical baseline and selector
+The workflows run the `prepare-cargo` composite action
+(`.github/actions/prepare-cargo`) before every offline gate. It fetches the
+locked dependencies, then exports `CARGO_NET_OFFLINE=true` for subsequent
+steps; it adds no cache writer, so only `cache-warm` publishes shared
+caches. Historical baseline and selector
 checkouts prepare their own root lockfile in their own directory, without
 requiring new preparation tooling in an old commit. Tool installation uses
 binary downloads rather than Cargo compilation against an unrelated lockfile.
