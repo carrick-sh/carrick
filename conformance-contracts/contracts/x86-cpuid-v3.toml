@@ -1,3 +1,7 @@
+# #1580 derives KVM lifecycle sidecar placement from the shared guest layout.
+# cpl0_lifecycle::x5_shared_clone_exit and cpl0_fork_e2e are the real-KVM
+# red/green controls; this contract's guest semantics and budgets are unchanged.
+# See docs/conformance-contracts/kvm-lifecycle-sidecars.md for the scoped proof.
 schema_version = 1
 # The progress witness lays out its scheduler table, observation record and
 # second root from their sizes. Compile-time bounds prevent overlap before

@@ -18,14 +18,20 @@ use std::sync::atomic::Ordering;
 
 const FIRST_ROOT: u64 = 0x60_0000;
 const PROGRESS_ZONE_GPA: u64 = 0x100_0000;
+// The guest and host must name the same retained sidecars when the shared
+// lifecycle layout moves. Boot publication and stopped observation use this
+// translation, rather than keeping a second physical placement constant.
+pub(crate) const LIFECYCLE_LANES_GPA: FrameGpa = FrameGpa::new(
+    PROGRESS_ZONE_GPA
+        + (carrick_x86::cpl0_lifecycle::LIFECYCLE_LANE
+            - carrick_x86::cpl0_lifecycle::LIFECYCLE_ZONE),
+);
 // boot_lifecycle shares this mapping, including its two fixed sidecars.
 const SUPERVISOR_BYTES: u64 = 0x100_0000;
 const PROGRESS_STATE_GPA: u64 = PROGRESS_ZONE_GPA + (PROGRESS_STATE - PROGRESS_ZONE);
 pub const SECOND_ROOT: u64 = PROGRESS_ZONE_GPA + PROGRESS_SUPERVISOR_BYTES;
 const _: () = {
-    use carrick_x86::cpl0_lifecycle::{
-        LIFECYCLE_LANE, LIFECYCLE_STRIDE, LIFECYCLE_ZONE, LifecycleLane,
-    };
+    use carrick_x86::cpl0_lifecycle::{LIFECYCLE_STRIDE, LIFECYCLE_ZONE, LifecycleLane};
 
     assert!(FIRST_ROOT + carrick_x86::X86_PML4_CAPACITY <= PROGRESS_ZONE_GPA);
     assert!(
@@ -35,8 +41,10 @@ const _: () = {
     assert!(PROGRESS_STATE_GPA + size_of::<ProgressState>() as u64 <= SECOND_ROOT);
     assert!(SECOND_ROOT.is_multiple_of(4096));
     assert!(LIFECYCLE_ZONE == PROGRESS_ZONE);
-    let lanes_gpa = PROGRESS_ZONE_GPA + (LIFECYCLE_LANE - LIFECYCLE_ZONE);
+    let lanes_gpa = LIFECYCLE_LANES_GPA.raw();
     assert!(SECOND_ROOT + carrick_x86::X86_PML4_CAPACITY <= lanes_gpa);
+    assert!(lanes_gpa.is_multiple_of(align_of::<LifecycleLane>() as u64));
+    assert!(LIFECYCLE_STRIDE.is_multiple_of(align_of::<LifecycleLane>() as u64));
     assert!(size_of::<LifecycleLane>() as u64 <= LIFECYCLE_STRIDE);
     assert!(
         lanes_gpa + LIFECYCLE_STRIDE + size_of::<LifecycleLane>() as u64

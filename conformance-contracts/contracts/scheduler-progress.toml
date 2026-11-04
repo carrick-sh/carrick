@@ -1,3 +1,7 @@
+# #1580 derives KVM lifecycle sidecar placement from the shared guest layout.
+# cpl0_lifecycle::x5_shared_clone_exit and cpl0_fork_e2e are the real-KVM
+# red/green controls; this contract's guest semantics and budgets are unchanged.
+# See docs/conformance-contracts/kvm-lifecycle-sidecars.md for the scoped proof.
 # #1394: additional ABI bookkeeping witness only; existing semantic and
 # work-budget bindings remain authoritative. Census publication reads counters
 # after executor join and does not alter this contract's guest operation.

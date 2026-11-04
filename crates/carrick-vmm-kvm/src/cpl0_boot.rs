@@ -3574,7 +3574,8 @@ impl Cpl0Carrier {
                     .custody
                     .ram()
                     .host_ptr(
-                        0x190_0000 + index as u64 * LIFECYCLE_STRIDE,
+                        crate::carrier_interrupts::LIFECYCLE_LANES_GPA.raw()
+                            + index as u64 * LIFECYCLE_STRIDE,
                         size_of::<LifecycleLane>(),
                     )
                     .ok_or_else(|| fail("native lifecycle sidecar"))?
@@ -3678,7 +3679,8 @@ impl Cpl0Carrier {
                 .custody
                 .ram()
                 .host_ptr(
-                    0x190_0000 + index as u64 * LIFECYCLE_STRIDE,
+                    crate::carrier_interrupts::LIFECYCLE_LANES_GPA.raw()
+                        + index as u64 * LIFECYCLE_STRIDE,
                     size_of::<LifecycleLane>(),
                 )
                 .ok_or_else(|| fail("lane observation"))?
