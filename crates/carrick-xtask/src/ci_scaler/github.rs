@@ -112,10 +112,18 @@ impl Github {
         } else {
             vec![]
         };
-        let output = execute_with_failure(&mut cmd, &input, Duration::from_secs(60), |bytes| {
-            let body: Value = serde_json::from_slice(bytes).ok()?;
-            (body["status"] == "404" || body["status"] == 404).then_some(ScalerError::GithubGone)
-        })?;
+        let mut invoke = || {
+            execute_with_failure(&mut cmd, &input, Duration::from_secs(60), |bytes| {
+                let body: Value = serde_json::from_slice(bytes).ok()?;
+                (body["status"] == "404" || body["status"] == 404)
+                    .then_some(ScalerError::GithubGone)
+            })
+        };
+        let output = if method == "GET" {
+            retry_transport(invoke)
+        } else {
+            invoke()
+        }?;
         if method == "DELETE"
             || (method == "POST" && endpoint.ends_with("/cancel") && output.is_empty())
         {
@@ -851,6 +859,27 @@ impl Github {
         // process is gone before destroying anything.
         Ok(Assignment::Unknown)
     }
+    pub(super) fn registration_exists(&self, row: &Record) -> Result<bool, ScalerError> {
+        let runners = self.request(
+            "GET",
+            &format!("repos/{REPOSITORY}/actions/runners?per_page=100"),
+            None,
+            true,
+        )?;
+        let Ok(runners) = pages(&runners, "runners") else {
+            return Ok(true);
+        };
+        if runners
+            .iter()
+            .any(|runner| runner["name"].as_str().is_none() || runner["id"].as_u64().is_none())
+        {
+            return Ok(true);
+        }
+        // Duplicate or malformed registration evidence is unresolved, never
+        // authority to close this row or to stop unrelated admission.
+        Ok(!matches!(recover_registration(row, &runners), Ok(None)))
+    }
+
     pub(super) fn remove_runner(&self, row: &impl RunnerRegistration) -> Result<(), ScalerError> {
         let runners = self.request(
             "GET",

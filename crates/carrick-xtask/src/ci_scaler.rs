@@ -56,6 +56,16 @@ pub const KERNEL_RUNTIME_WORKFLOW: &str = ".github/workflows/kernel-runtime.yml"
 pub const PILOT_WORKFLOW: &str = ".github/workflows/willow-pilot.yml";
 const PILOT_BRANCH: &str = "work/willow-pilot";
 
+/// Transport failures are uncertainty, never evidence that a clone is absent.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum TransientFailure {
+    Curl,
+    Timeout,
+    Connection,
+    SshConnect,
+    PveServer,
+}
+
 #[derive(Debug, Error)]
 pub enum ScalerError {
     #[error("projected clone CPU {projected:.1}% exceeds the 80% admission ceiling")]
@@ -92,6 +102,8 @@ pub enum ScalerError {
     #[error("external command failed: {0}")]
     CommandFailed(String),
     // Contains only a validated HTTP status and parameter names, never values.
+    #[error("transient transport failure: {0:?}")]
+    Transient(TransientFailure),
     #[error("PVE rejected request: {0}")]
     PveRejected(String),
 }
@@ -180,6 +192,9 @@ pub struct Record {
     pub assigned: Option<JobId>,
     pub ip: Option<std::net::Ipv4Addr>,
     pub failure: Option<String>,
+    /// Current recovery verdict, separate from the retained failure history.
+    #[serde(default)]
+    pub quarantined: bool,
     /// The true run/attempt/job a re-vetted hook request named; the
     /// reservation `key` remains demand provenance.
     #[serde(default)]
@@ -294,6 +309,7 @@ impl Ledger {
             assigned: None,
             ip: None,
             failure: None,
+            quarantined: false,
             assigned_key: None,
             approved: false,
             mints: Vec::new(),
@@ -1512,11 +1528,86 @@ fn now() -> Result<u64, ScalerError> {
 
 // Capture output in memory, never in a command log or a tempfile. Bounds apply
 // to every external command (including gh and ssh), not just guest readiness.
+/// Retry only operations whose caller has established replay safety. In
+/// particular, never replay a clone POST after losing its response.
+fn retry_transport<T>(mut call: impl FnMut() -> Result<T, ScalerError>) -> Result<T, ScalerError> {
+    for delay in [100, 400] {
+        match call() {
+            Err(ScalerError::Transient(_)) => std::thread::sleep(Duration::from_millis(delay)),
+            result => return result,
+        }
+    }
+    call()
+}
+
+fn transport_failure(
+    program: &str,
+    status: &Result<std::io::Result<std::process::ExitStatus>, std::sync::mpsc::RecvTimeoutError>,
+    stderr: Option<&str>,
+    reason: &str,
+) -> Option<TransientFailure> {
+    if matches!(program, "curl" | "gh" | "ssh") && reason.contains("timed out") {
+        return Some(TransientFailure::Timeout);
+    }
+    let code = status
+        .as_ref()
+        .ok()
+        .and_then(|s| s.as_ref().ok())
+        .and_then(|s| s.code());
+    if program == "curl" && matches!(code, Some(7 | 18 | 28 | 52 | 55 | 56)) {
+        return Some(TransientFailure::Curl);
+    }
+    if program == "ssh"
+        && stderr.is_some_and(|text| {
+            text.contains("connect to host") && text.contains("Connection timed out")
+        })
+    {
+        return Some(TransientFailure::SshConnect);
+    }
+    if matches!(program, "ssh" | "gh")
+        && stderr.is_some_and(|text| {
+            [
+                "Connection timed out",
+                "Connection reset",
+                "connection reset",
+                "i/o timeout",
+                "Send failure: Broken pipe",
+            ]
+            .iter()
+            .any(|needle| text.contains(needle))
+        })
+    {
+        return Some(TransientFailure::Connection);
+    }
+    None
+}
+
 pub(crate) fn execute(
     command: &mut Command,
     input: &[u8],
     limit: Duration,
 ) -> Result<Vec<u8>, ScalerError> {
+    if Path::new(command.get_program())
+        .file_name()
+        .is_some_and(|name| name == "ssh")
+    {
+        let deadline = Instant::now() + limit;
+        for delay in [100, 400] {
+            let attempt_limit = deadline.saturating_duration_since(Instant::now());
+            match execute_with_failure(command, input, attempt_limit, |_| None) {
+                Err(ScalerError::Transient(TransientFailure::SshConnect)) => {
+                    std::thread::sleep(Duration::from_millis(delay))
+                }
+                result => return result,
+            }
+        }
+        return execute_with_failure(
+            command,
+            input,
+            deadline.saturating_duration_since(Instant::now()),
+            |_| None,
+        );
+    }
     execute_with_failure(command, input, limit, |_| None)
 }
 
@@ -1717,6 +1808,14 @@ where
                 format!("{http}{}", crate::dispatch_redaction::redact(bytes))
             })
             .unwrap_or_default();
+        let text = stderr
+            .as_ref()
+            .ok()
+            .and_then(|result| result.as_ref().ok())
+            .map(|bytes| String::from_utf8_lossy(bytes));
+        if let Some(class) = transport_failure(&program, &status, text.as_deref(), &reason) {
+            return ScalerError::Transient(class);
+        }
         ScalerError::CommandFailed(if diagnostic.is_empty() {
             reason
         } else {
