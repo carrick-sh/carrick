@@ -10,13 +10,8 @@ use carrick_el1::isa::x86::X86Backend;
 #[cfg(target_os = "none")]
 use carrick_el1::isa::x86::context::native::NativeFrame;
 
-// Compile the production frame record and codec in the VM-free suite too.
 #[cfg(test)]
-#[path = "../../carrick-x86/src/cpl0_entry.rs"]
-#[allow(dead_code)]
-mod native_test_frame;
-#[cfg(test)]
-use native_test_frame::NativeFrame;
+use carrick_x86::cpl0_entry::NativeFrame;
 
 use carrick_syscall_abi::{
     LinuxSiginfo as Siginfo, X8664Rtsigframe as RtSigframe, X8664Ucontext as Ucontext,
@@ -359,19 +354,38 @@ mod tests {
 
     fn xstate() -> [u8; FP_BYTES] {
         let mut state = [0; FP_BYTES];
-        state[..2].copy_from_slice(&0x027fu16.to_le_bytes());
-        state[2..4].copy_from_slice(&0x2800u16.to_le_bytes());
-        state[4] = 0xff;
-        state[24..28].copy_from_slice(&0x5f80u32.to_le_bytes());
-        state[28..32].copy_from_slice(&0xffffu32.to_le_bytes());
+        let mut st_space = [0; 32];
+        let mut xmm_space = [0; 64];
         for slot in 0..8 {
-            state[32 + slot * 16..42 + slot * 16].fill(0x10 + slot as u8);
+            let word = u32::from(0x10 + slot as u8) * 0x0101_0101;
+            st_space[slot * 4] = word;
+            st_space[slot * 4 + 1] = word;
+            st_space[slot * 4 + 2] = word & 0xffff;
         }
         for register in 0..16 {
-            state[160 + register * 16..176 + register * 16].fill(0x40 + register as u8);
-            state[576 + register * 16..592 + register * 16].fill(0x80 + register as u8);
+            xmm_space[register * 4..register * 4 + 4]
+                .fill(u32::from(0x40 + register as u8) * 0x0101_0101);
+            let avx_start = carrick_syscall_abi::X8664_XSAVE_MIN_LEN + register * 16;
+            state[avx_start..avx_start + 16].fill(0x80 + register as u8);
         }
-        state[512..520].copy_from_slice(&7u64.to_le_bytes());
+        let legacy = carrick_syscall_abi::X8664Fpstate {
+            cwd: 0x027f,
+            swd: 0x2800,
+            ftw: 0xff,
+            mxcsr: 0x5f80,
+            mxcr_mask: 0xffff,
+            st_space,
+            xmm_space,
+            ..carrick_syscall_abi::X8664Fpstate::empty()
+        };
+        state[..core::mem::size_of_val(&legacy)].copy_from_slice(legacy.as_bytes());
+        let xsave = carrick_syscall_abi::X8664XsaveHeader {
+            xstate_bv: 7,
+            ..carrick_syscall_abi::X8664XsaveHeader::empty()
+        };
+        let header_start = carrick_syscall_abi::X8664_XSAVE_LEGACY_LEN;
+        state[header_start..header_start + core::mem::size_of_val(&xsave)]
+            .copy_from_slice(xsave.as_bytes());
         state
     }
 
