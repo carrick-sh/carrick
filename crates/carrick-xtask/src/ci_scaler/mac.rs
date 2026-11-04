@@ -781,6 +781,10 @@ pub fn prepare_run_once(
     let state = state_root.join(name);
     // mkdir is the one-use admission: a replayed name loses here.
     std::fs::DirBuilder::new().mode(0o755).create(&state)?;
+    // Creation modes are masked by the caller's umask. The run user must be
+    // able to traverse the directory and read the policy and hook, so state
+    // the modes exactly instead of inheriting whatever sudo handed us.
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755))?;
     let write = |file: &str, mode: u32, contents: &[u8]| -> Result<File, ScalerError> {
         let mut out = OpenOptions::new()
             .create_new(true)
@@ -788,6 +792,7 @@ pub fn prepare_run_once(
             .mode(mode)
             .custom_flags(libc::O_NOFOLLOW)
             .open(state.join(file))?;
+        out.set_permissions(std::fs::Permissions::from_mode(mode))?;
         out.write_all(contents)?;
         out.sync_all()?;
         Ok(out)
