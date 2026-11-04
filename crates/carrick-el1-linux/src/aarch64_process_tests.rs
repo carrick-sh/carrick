@@ -11640,3 +11640,121 @@ fn arm_classified_fault_rejects_non_fault_returns_without_clobbering_syndrome() 
         assert_eq!((frame.esr, frame.far), (esr, 0xabc));
     }
 }
+
+/// #1575 (ported from #1386): a sibling that enters a native service after its process's
+/// terminal close has closed the lifecycle gate is not contended. The close is
+/// a terminal state: two live threads of one native process, the leader in
+/// `exit_group(7)` and the sibling (tid 42) entering a host crossing through
+/// the production `with_process_entry` -> `begin_service` ->
+/// `settle_service_exit` sequence that `arm_native_service_exit` drives.
+/// Red before the fix: `begin_service` refused `Busy`, which dispatch turns
+/// into the carrier fatal `NativeServiceBusy` (signed `cleartid_tid_reuse`
+/// and `fork_cow`). Green: the sibling retires with the close status in the
+/// same entry (no host work published, no EL0 return), and the group ends 7.
+#[test]
+fn arm_closed_gate_service_entry_retires_the_sibling_instead_of_busy() {
+    use crate::native_process_runtime::{NativeResume, NativeServiceExit};
+    use carrick_core_abi::service::ServiceOperation;
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let (control, record) = imported_thread_with_identity(fixture, |_| {});
+    let mut service = fixture.process_service();
+    let ttbr0 = fixture_ttbr0(fixture);
+    fixture
+        .enter(fixture.control, ttbr0, &mut service, |_| ())
+        .unwrap();
+    // The sibling runs and registers its member before the close.
+    run_as(fixture, 42, 12, 102, control);
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        record.id
+    );
+    fixture
+        .enter(control, ttbr0, &mut service, |process| {
+            assert!(process.has_thread(41) && process.has_thread(42))
+        })
+        .unwrap();
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, record.id)
+            .is_queued()
+    );
+    fixture.zone.clear_current(fixture.slot);
+    assert!(leader_sees_thread(fixture, &mut service, 42));
+    // The leader's exit_group closes the gate and waits for the sibling.
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[0] = 7;
+    frame.x[8] = 94;
+    assert_eq!(
+        arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap(),
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended
+    );
+    assert_eq!(
+        carrick_el1_abi::Lifecycle::gate(fixture.page),
+        carrick_el1_abi::GateState::Closed
+    );
+    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 1);
+    // The sibling, still running, enters a host crossing.
+    run_as(fixture, 42, 12, 102, control);
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        record.id
+    );
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let entered = with_process_entry(
+        source,
+        &fixture.task,
+        &ThreadCtx::ZERO,
+        ttbr0,
+        fixture.page,
+        control,
+        &mut service,
+        |entry| {
+            let result = entry.begin_service(
+                ServiceOperation::Crossing {
+                    ordinal: carrick_guest_arch::NativeOrdinal::new(115),
+                },
+                None,
+            );
+            assert!(
+                !matches!(result, Err(NativeProcessError::Busy)),
+                "a closed gate is terminal, not contention"
+            );
+            entry.settle_service_exit(result, NativeServiceExit::Bridge)
+        },
+    )
+    .expect("the sibling's admission precedes its service");
+    assert!(
+        matches!(entered, Ok(NativeResume::Left(None))),
+        "the sibling leaves its lane for the terminal checkpoint: {:?}",
+        entered.as_ref().err()
+    );
+    assert!(
+        fixture.task.service_notice.take().unwrap().is_none(),
+        "no host work is published into a closed process"
+    );
+    assert_eq!(
+        carrick_el1_abi::Lifecycle::claimed_count(fixture.page),
+        0,
+        "the service claim is released"
+    );
+    assert!(
+        fixture.zone.slot(fixture.slot).current().is_none(),
+        "the sibling's lane is released, not resumed at EL0"
+    );
+    assert!(
+        fixture.zone.live(record).is_none(),
+        "the sibling's record retired"
+    );
+    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 0);
+    // The sibling's retirement woke the closing owner; it completes the close.
+    assert!(matches!(
+        resume_closing_root(fixture, &mut service),
+        crate::sched::ResumeAction::Left
+    ));
+    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
+    assert_eq!(service.crossing.root_exit_status.load(Ordering::Acquire), 7);
+}
