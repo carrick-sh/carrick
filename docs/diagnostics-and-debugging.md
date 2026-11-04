@@ -494,6 +494,24 @@ failures, or a low-memory hypothesis does not establish a cause or justify an
 admission bound. Preserve missing provenance until a reproducer distinguishes
 the compiler deadline, OOM and other external kills.
 
+Before attempting a sender-attribution run, verify that the runner has
+`bpftrace`, access to `tracepoint:signal:signal_generate`, and permission to
+read the kernel log. KVM device access alone does not grant these permissions.
+Capture signal generation with `args->sig == 9`, recording the sender's
+`pid`/`comm` and the target's `args->pid`/`args->comm`, together with monotonic
+timestamps. Start capture before the test binary and bound its lifetime;
+stop it on every exit path and verify `pgrep -x bpftrace` is empty afterwards.
+Correlate each killed compiler PID with its test key, compiler start time and
+concurrent compiler population. A signal from the test process at roughly
+15 seconds supports the harness-deadline diagnosis; kernel OOM records are
+needed to identify OOM, rather than inferring it from SIGKILL alone.
+
+If these capture permissions are unavailable, report sender attribution as
+blocked before spending a reproduction run. Source inspection establishes
+that the deadline can kill `cc`, but does not establish who killed any of
+the original 16 compilers. Do not assign one observed sender to uncaptured
+test keys or treat a passing rerun as attribution.
+
 ### Loading the plugin and reading the ring
 
 ```sh
