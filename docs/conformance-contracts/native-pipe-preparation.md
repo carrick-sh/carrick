@@ -36,3 +36,24 @@ signed `carrick run` witness, tracing, signed promotion and Docker differential
 remain unrun on this Linux worker. #1506 can instantiate the same neutral owner
 with one input and add single-description publication; no eventfd, epoll or
 timerfd object types are added here.
+
+## Whole-output fence continuation
+
+The next checkpoint adds `MmPortal::fence_word_write`: a bounded eight-byte
+output can span two noncontiguous physical pages. Both translations and user
+write permissions are checked under one exact-MM editor before any output
+capability escapes. A missing, read-only or COW tail refuses the entire word.
+No supply, growth or suspension runs under that editor. A Busy refusal drops
+all temporary custody and preserves the existing owner-wait result.
+
+The output venue binds both retained physical mappings before descriptor
+publication. `WordWriteOutput::write` then consumes that authority with no
+fallible copy; the editor stays live until both pieces are written. The unsafe
+binding requires exact physical custody and any executable-cache maintenance.
+The VM-free binding uses separate byte arrays for physical mappings and does
+not claim a production physical-map venue exists.
+
+Native operation retention, canonical service growth, owner-wait/cancellation
+integration, production physical output binding and shared native pipe2
+routing are still required. The two native-child witnesses are still expected
+to fail; this checkpoint does not satisfy the signed CLI acceptance criterion.

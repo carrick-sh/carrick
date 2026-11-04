@@ -11748,9 +11748,12 @@ fn native_child_pipe_creation(flags: u64) {
     });
 
     let parent_binding = runtime.task_binding(parent).unwrap();
-    fixture
-        .zone
-        .requeue_preempted(fixture.slot, parent_binding.record.id);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, parent_binding.record.id)
+            .is_queued()
+    );
 
     let tables = crate::ipc::MapTables(map);
     let venue = crate::ipc::IpcVenue {
@@ -11885,9 +11888,12 @@ fn native_child_pipe_creation(flags: u64) {
         .1,
         1
     );
-    fixture
-        .zone
-        .requeue_preempted(fixture.slot, child_bindings[0].record.id);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, child_bindings[0].record.id)
+            .is_queued()
+    );
     activate_target(source, &task, &grandchild);
     let received = carrick_test_support::GuestUserBuffer::zeroed(1);
     assert_eq!(
