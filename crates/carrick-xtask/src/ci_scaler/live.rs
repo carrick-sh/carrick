@@ -2237,9 +2237,13 @@ pub(super) fn controller(
     group: u64,
     one_job: bool,
     budget: CloneBudget,
+    intake: Intake,
 ) -> Result<(), ScalerError> {
     if matches!(admission, Admission::Pilot { .. }) && budget.kvm != Concurrency::ONE {
         return Err(ScalerError::Guard("the pilot admission is one clone only"));
+    }
+    if !intake.admits() && !matches!(admission, Admission::Standing) {
+        return Err(ScalerError::Guard("only a standing controller drains"));
     }
     let pve = Pve::local()?;
     let _lock = super::acquire_controller_lock(dir)?;
@@ -2267,6 +2271,8 @@ pub(super) fn controller(
     let mut backoff = Backoff::default();
     let mut admit_after = Instant::now();
     let provisioners = Provisioners::new();
+    // The last live-row count a drain reported, so it logs only changes.
+    let mut drained_from = None;
     let publication = assignment::Publication::new(ledger.clone());
     ledger.publication = Some(publication.clone());
     let _assignments = if matches!(admission, Admission::Standing) {
@@ -2326,6 +2332,22 @@ pub(super) fn controller(
                 None => false,
             };
             reconcile = Instant::now();
+        }
+        if !intake.admits() {
+            let live = ledger
+                .rows
+                .iter()
+                .filter(|r| r.state != State::Destroyed)
+                .count();
+            if intake.finished(live) {
+                println!("drain complete: no live clones remain");
+                return Ok(());
+            }
+            if drained_from.replace(live) != Some(live) {
+                println!("draining: {live} live clone(s)");
+            }
+            std::thread::sleep(POLL);
+            continue;
         }
         let demand = if matches!(admission, Admission::Standing) {
             gh.coalesced_demand(&mut ledger, &path, &LABELS)

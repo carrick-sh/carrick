@@ -552,6 +552,27 @@ impl std::str::FromStr for AgentClones {
     }
 }
 
+/// Whether a standing controller takes new work (#1599).
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum Intake {
+    /// Read demand and admit clones within the budget.
+    Open,
+    /// Admit nothing and read no demand (so a superseded run is never
+    /// cancelled here), but keep reconciling, serving assignments, token
+    /// mints and reaping for the ledger's live rows. Ends when none remain,
+    /// so another host's controller can take over without stranding a clone.
+    Drain,
+}
+impl Intake {
+    pub fn admits(self) -> bool {
+        matches!(self, Self::Open)
+    }
+    /// A drain is finished once the ledger has no live (non-destroyed) row.
+    pub fn finished(self, live_rows: usize) -> bool {
+        matches!(self, Self::Drain) && live_rows == 0
+    }
+}
+
 /// Per-lane clone budgets: KVM clones and dispatch-agent clones.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct CloneBudget {
@@ -1087,9 +1108,13 @@ pub enum ScalerAction {
         /// Concurrent clones, 1 (default) or 2.
         #[arg(long, default_value = "1")]
         max_concurrency: Concurrency,
-        /// Concurrent dispatch-agent clones (Contabo only), 1 to 8.
+        /// Concurrent dispatch-agent clones (agent sites only), 1 to 8.
         #[arg(long, default_value = "4")]
         max_agent_clones: AgentClones,
+        /// Take no new work: keep serving this ledger's live clones (mints,
+        /// assignments, reaping) and exit 0 once none remain (#1599).
+        #[arg(long)]
+        drain: bool,
     },
     /// Director-Mac controller for cloudmac: mint one JIT config per queued
     /// carrick-hvf job and feed it to one runner over SSH stdin.
@@ -1341,12 +1366,14 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
                 kvm: Concurrency::ONE,
                 agents: AgentClones::DEFAULT,
             },
+            Intake::Open,
         ),
         ScalerAction::Standing {
             state_dir,
             runner_group_id,
             max_concurrency,
             max_agent_clones,
+            drain,
         } => live::controller(
             &Admission::Standing,
             &state_dir,
@@ -1356,6 +1383,7 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
                 kvm: max_concurrency,
                 agents: max_agent_clones,
             },
+            if drain { Intake::Drain } else { Intake::Open },
         ),
         ScalerAction::MacJit {
             host,
@@ -1788,5 +1816,48 @@ mod timeout_tests {
             immediate,
             "unrelated pre-exec child retained dropped controller.lock despite CLOEXEC"
         );
+    }
+}
+
+#[cfg(test)]
+mod intake_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(subcommand)]
+        action: ScalerAction,
+    }
+
+    #[test]
+    fn a_drain_admits_nothing_and_ends_only_when_the_ledger_is_empty() {
+        assert!(Intake::Open.admits());
+        assert!(!Intake::Drain.admits());
+        assert!(!Intake::Drain.finished(1));
+        assert!(Intake::Drain.finished(0));
+        // An open controller never "finishes" for lack of clones.
+        assert!(!Intake::Open.finished(0));
+    }
+
+    #[test]
+    fn standing_drain_is_an_explicit_flag_and_off_by_default() {
+        let drain = |argv: &[&str]| match Cli::try_parse_from(argv).unwrap().action {
+            ScalerAction::Standing { drain, .. } => drain,
+            _ => panic!("not standing"),
+        };
+        assert!(!drain(&["x", "standing"]));
+        assert!(drain(&["x", "standing", "--drain"]));
+        assert!(drain(&[
+            "x",
+            "standing",
+            "--runner-group-id",
+            "1",
+            "--max-concurrency",
+            "2",
+            "--max-agent-clones",
+            "6",
+            "--drain"
+        ]));
     }
 }
