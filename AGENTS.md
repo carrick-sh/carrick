@@ -700,7 +700,10 @@ SendMessage.
   runners (a non-admin `ci` user on carrick-m4 and on cloudmac; #650), forks on hosted
   `macos-15`.
   Merge groups run `macos-build`, `macos-clippy` and `macos-authority`
-  on hosted macOS as skew and compiler-authority checks;
+  as skew and compiler-authority checks, on the self-hosted
+  `carrick-macos-ci` runners for now (owner, 2026-11-04, #231: hosted
+  `macos-15` gave them no runner and cancelled them after about 20 minutes,
+  ejecting every group; revisit when #1603 explains why);
   the nightly schedule reruns the full suite on hosted macOS. Since 137a177a22
   (2026-10-11), `ci.yml` has no push trigger. `kernel-runtime.yml` adds
   the self-hosted HVF lane (cloudmac, push to main and owner dispatch) and the

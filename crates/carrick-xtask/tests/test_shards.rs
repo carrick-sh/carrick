@@ -94,15 +94,21 @@ fn every_shard_is_required_in_hosted_ci_and_union_check_runs_on_linux() {
             .count(),
         shards.len()
     );
-    // Only same-repo pull_request jobs may reach the self-hosted macOS
-    // runner; forks, merge groups and cache-saving push/schedule stay hosted
-    // (#650).
+    // Only same-repo pull_request jobs and merge groups (whose code is
+    // already same-repo) may reach the self-hosted macOS runner; forks and
+    // cache-saving push/schedule stay hosted (#650; merge groups moved by the
+    // owner on 2026-11-04, #231, while hosted macos-15 starved them, #1603).
     let runner = jobs["changes"]["outputs"]["macos_runner"].as_str().unwrap();
     assert!(
-        runner.starts_with("${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && ")
+        runner.starts_with("${{ ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || github.event_name == 'merge_group') && ")
             && runner.contains("carrick-macos-ci")
             && runner.ends_with("|| '\"macos-15\"' }}"),
-        "changes.outputs.macos_runner must route only same-repo PRs to carrick-macos-ci: {runner}"
+        "changes.outputs.macos_runner must route only same-repo PRs and merge groups to carrick-macos-ci: {runner}"
+    );
+    assert_eq!(
+        jobs["macos-authority"]["runs-on"].as_str(),
+        Some("${{ fromJSON(needs.changes.outputs.macos_runner) }}"),
+        "macos-authority follows the same runner choice"
     );
     let job = "lint-gates";
     assert!(
@@ -188,7 +194,10 @@ fn every_shard_is_required_in_hosted_ci_and_union_check_runs_on_linux() {
         Some("${{ !cancelled() && github.event_name != 'merge_group' }}")
     );
     assert!(
-        runs("macos-authority", "just xtask authority-debt"),
+        runs(
+            "macos-authority",
+            "just lease carrick just xtask authority-debt"
+        ),
         "compiled macOS authority profiles cannot be replaced by Linux discovery"
     );
 }
