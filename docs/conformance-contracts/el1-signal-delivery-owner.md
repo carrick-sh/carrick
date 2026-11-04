@@ -36,3 +36,26 @@ for that changed input. Signed probe/frame execution and the existing
 HVF is available on ctb-w1. CPL0 already delivers MAPERR through the shared
 owner; missing file-backed classification and host-to-native checkpoint wiring
 are tracked by #1084 (related cancellation seam #1078).
+
+## Native newborn namespace ownership (#1576)
+
+A selected native newborn does not yet have a registered process entry. Its
+namespace PID must come from its retained process lifecycle, rather than the
+CPU slot's previous process. The scheduler restores the exact execution, MM
+and lifecycle identity; the Linux resume owner restores this namespace
+projection before any user-return signal checkpoint can admit delivery.
+Cancellation retains the existing terminal owner and does not require a new
+signal entry.
+
+`native_child_thread_signal_at_first_user_return` keeps the original parent
+and native child live, births a native child worker, and seeds the slot's prior
+namespace projection with the parent's PID. It drives the production scheduler,
+production native resume, process-entry admission and signal-delivery policy.
+SIGPIPE is imported and consumed once, then the worker exits while its leader
+remains live. On main the entry is refused with `Stale`: the group lookup uses
+the parent's PID with the child's MM/page. The correction uses a bounded group
+index range and exact birth/control/address authentication; it neither polls
+nor retries admission nor scans the carrier's process population. VM-free
+coverage cannot establish the signed carrier fatal population; the director
+must rerun the affected signed fork-COW, two-process, spawn-slope, seccomp clone
+filter and allocator tests, and report zero of the #1576 EntryBinding fatals.

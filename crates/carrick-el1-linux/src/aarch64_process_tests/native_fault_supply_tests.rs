@@ -245,6 +245,12 @@ fn native_fork_child_exiting_sibling_wakes_parked_clone() {
     child_thread_admission(7, 1, ChildStockCase::Exiting);
 }
 
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn native_child_thread_signal_at_first_user_return() {
+    child_thread_admission(1, 1, ChildStockCase::SignalBirth);
+}
+
 /// #1100 two-live-thread exit: a native child's ring-born worker has run its
 /// first syscall and is still live when the leader calls `exit_group`. The
 /// group exit must settle both threads in ring and return every identity,
@@ -274,6 +280,7 @@ enum GroupExitCaller {
 #[derive(Clone, Copy, PartialEq)]
 enum ChildStockCase {
     FirstBirth,
+    SignalBirth,
     Reuse,
     Pinned,
     Claimed,
@@ -405,6 +412,37 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
     // The first clone lazily reserves four distinct standing identities.
     baseline_claims.reserved_numbers += 4;
     baseline_claims.thread_claims += 4;
+    if case == ChildStockCase::SignalBirth {
+        // SAFETY: this fixture exclusively owns the selected child leader.
+        let selected = unsafe { *fixture.zone.record(child).ctx_mut() };
+        with_process_entry(
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            &fixture.task,
+            &selected.native,
+            selected.address_context().unwrap().root.address().raw(),
+            page,
+            fixture.task.lifecycle_refs().unwrap().1,
+            &mut service,
+            |process| {
+                use carrick_personality_linux::signal::ProcessSignals;
+                process
+                    .rt_sigaction(
+                        carrick_signal_core::policy::Signal::PIPE,
+                        Some(carrick_signal_core::policy::Action {
+                            disposition: carrick_signal_core::policy::Disposition::Handler(
+                                carrick_signal_core::policy::HandlerAddress(VA + 0x100),
+                            ),
+                            ..Default::default()
+                        }),
+                    )
+                    .unwrap();
+            },
+        )
+        .unwrap();
+    }
     let mut group_sibling = None;
     for _round in 0..rounds {
         let mut tids = Vec::new();
@@ -440,6 +478,84 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
                 "child leader and newborns are live"
             );
             tids.push(frame.x[0] as u32);
+        }
+        if case == ChildStockCase::SignalBirth {
+            // This lane previously ran the still-live parent. The scheduler
+            // replaces execution/MM/lifecycle words; the Linux resume owner
+            // must also replace the namespace projection for a newborn.
+            fixture.task.publish_visible_pid(fixture.leader.tid as u32);
+            let mut found = false;
+            for _ in 0..2 {
+                let mut handoff = None;
+                let mut zone = crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &crate::sched::HardwareUserWord,
+                };
+                assert!(
+                    crate::dispatch::native_scheduler(
+                        &mut zone,
+                        &fixture.task,
+                        &counters,
+                        fixture.slot,
+                        &mut handoff
+                    )
+                    .yield_queued(&mut frame)
+                    .is_some()
+                );
+                let current = fixture.zone.slot(fixture.slot).current().unwrap();
+                if fixture.zone.record(current).identity().tid == u64::from(tids[0]) {
+                    assert_eq!(
+                        super::super::aarch64_process::resume_production_with_service(
+                            fixture.zone,
+                            &fixture.task,
+                            fixture.slot,
+                            current,
+                            &mut service
+                        ),
+                        crate::sched::ResumeAction::NoPending
+                    );
+                    found = true;
+                    break;
+                }
+            }
+            assert!(found, "scheduler must select the newborn");
+            let (_, control) = fixture.task.lifecycle_refs().unwrap();
+            control
+                .post_in_zone_standard_signal(carrick_signal_core::policy::Signal::PIPE)
+                .unwrap();
+            let worker = fixture
+                .zone
+                .record_ref(fixture.zone.slot(fixture.slot).current().unwrap());
+            consume_native_sigpipe(fixture, page, control, &mut service, &mut frame);
+            assert_eq!(fixture.task.visible_pid(), Some(identity.tid as u32));
+            // The delivered member may exit while its process leader remains
+            // live. Its old entry must not be required by the next checkpoint.
+            frame.x[8] = 93;
+            frame.x[..6].fill(0);
+            assert_ne!(
+                loan_call(fixture, &mut frame, &mut cpu, &mut service, &counters),
+                carrick_personality_linux::dispatch::CompletionRoute::Forward
+            );
+            assert_eq!(page.live(), 1);
+            assert!(fixture.zone.live(worker).is_none());
+            assert!(registry().for_record(fixture.zone, worker).is_none());
+            let leader = fixture.zone.slot(fixture.slot).current().unwrap();
+            assert_eq!(fixture.zone.record(leader).identity().tid, identity.tid);
+            super::super::aarch64_process::resume_production_with_service(
+                fixture.zone,
+                &fixture.task,
+                fixture.slot,
+                leader,
+                &mut service,
+            );
+            let (_, leader_control) = fixture.task.lifecycle_refs().unwrap();
+            leader_control
+                .post_in_zone_standard_signal(carrick_signal_core::policy::Signal::PIPE)
+                .unwrap();
+            consume_native_sigpipe(fixture, page, leader_control, &mut service, &mut frame);
+            assert_eq!(fixture.task.visible_pid(), Some(identity.tid as u32));
+            return;
         }
         if case == ChildStockCase::FirstBirth {
             return;
@@ -1030,6 +1146,60 @@ impl crate::thread_setup::LifecycleVenue for LoanLifecycle {
         // SAFETY: only this fixture's retained fork loan publishes controls.
         Some(unsafe { &*(address as *const ThreadControlSlot) })
     }
+}
+
+/// Both checkpoints go through production admission and user-return policy.
+#[cfg(not(target_os = "macos"))]
+fn consume_native_sigpipe(
+    fixture: &'static Fixture,
+    page: &'static ThreadLifecyclePage,
+    control: &'static ThreadControlSlot,
+    service: &mut Aarch64NativeProcessService<'static, &'static TestStockCrossing>,
+    frame: &mut carrick_el1_abi::TrapFrame,
+) {
+    let stack = carrick_test_support::GuestUserBuffer::zeroed(16384);
+    // SAFETY: this fixture exclusively owns the scheduler-selected record.
+    let saved = unsafe {
+        *fixture
+            .zone
+            .record(fixture.zone.slot(fixture.slot).current().unwrap())
+            .ctx_mut()
+    };
+    with_process_entry(
+        BornInZoneSource {
+            zone: fixture.zone,
+            slot: fixture.slot,
+        },
+        &fixture.task,
+        &saved.native,
+        saved.address_context().unwrap().root.address().raw(),
+        page,
+        control,
+        service,
+        |process| {
+            assert!(process.signal_checkpoint_needed());
+            assert!(!control.has_in_zone_standard_signal());
+            use zerocopy::IntoBytes;
+            assert_eq!(
+                super::super::arm_signal::deliver_on_user_return_with(
+                    &fixture.task,
+                    control,
+                    process,
+                    frame,
+                    carrick_syscall_abi::LinuxFpsimdContext::empty().as_bytes(),
+                    &mut ArmWaitSignalMachine {
+                        user_sp: stack.va_at(stack.len()),
+                        backend: ArmWaitSignalBackend,
+                    },
+                ),
+                None
+            );
+            assert_eq!(frame.elr, VA + 0x100);
+            assert_eq!(frame.x[0], 13);
+            assert!(!process.signal_checkpoint_needed(), "signal consumed once");
+        },
+    )
+    .expect("newborn signal checkpoint must own its process entry");
 }
 
 #[cfg(not(target_os = "macos"))]

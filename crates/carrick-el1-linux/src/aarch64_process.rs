@@ -450,6 +450,29 @@ fn resume_production_with(
             task.linux.mark_pending_host_work();
             return crate::sched::ResumeAction::Left;
         }
+        // A native newborn has no registered entry until its first call.
+        // Its namespace nevertheless belongs to the retained birth lifecycle,
+        // never to whichever process last ran on this CPU slot. Cancellation
+        // above keeps terminal custody and does not admit a new entry.
+        // SAFETY: this selected record's context is exclusively owned here.
+        let address = unsafe { rec.ctx_mut() }.address_context();
+        if let (Some((page, control)), Some(address)) = (lifecycle, address) {
+            // SAFETY: the scheduler selected this exact record and retains
+            // its lifecycle backing until this resume checkpoint completes.
+            if let Some(pid) = unsafe {
+                registry().newborn_visible_pid(
+                    BornInZoneSource { zone, slot },
+                    task,
+                    zone.record_ref(record),
+                    address,
+                    page,
+                    control,
+                )
+            } {
+                task.publish_visible_pid(pid);
+                task.publish_root_generation(address.generation);
+            }
+        }
         return crate::sched::ResumeAction::NoPending;
     };
     let source = BornInZoneSource { zone, slot };

@@ -2382,6 +2382,68 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         runtime.task_binding(process).map(|binding| binding.address)
     }
 
+    /// Resolve a selected native newborn's namespace from its retained
+    /// lifecycle group, before its first process entry exists. The CPU slot's
+    /// namespace PID still belongs to the previously running process.
+    ///
+    /// # Safety
+    /// The caller owns the selected record and its published lifecycle backing.
+    #[cfg(any(
+        test,
+        feature = "host-test",
+        all(target_os = "none", target_arch = "aarch64")
+    ))]
+    pub(super) unsafe fn newborn_visible_pid(
+        &self,
+        source: BornInZoneSource<'_, C>,
+        current: &CurrentTask,
+        record: RecordRef,
+        address: AddressContext<RootGpa>,
+        page: &ThreadLifecyclePage,
+        control: &ThreadControlSlot,
+    ) -> Option<u32> {
+        let selected = source.zone.record(record.id);
+        let identity = selected.identity();
+        let binding = super::common_entry::execution_binding(current);
+        if selected.incarnation() != record.incarnation
+            || !selected.is_native_owned()
+            || source.zone.slot(source.slot).current() != Some(record.id)
+            || !current.owns_lifecycle_page(page)
+            || !current.owns_control_slot(control)
+            || control.zone_record() != Some(record)
+        {
+            return None;
+        }
+        carrick_core::entry::prepare_handoff(binding, source, record.id)?;
+        let entry = control.entry()?;
+        let born = page.identity(entry)?;
+        if u64::from(born.tid) != identity.tid || born.thread_serial != identity.serial {
+            return None;
+        }
+        // SAFETY: the selected execution exclusively owns this context.
+        if !unsafe { selected.ctx_mut() }.authenticates(address) {
+            return None;
+        }
+        let lower = Self::group_key(source.zone, address, page, 0);
+        let upper = Self::group_key(source.zone, address, page, u32::MAX);
+        let (runtime, process) = {
+            let state = self.state.lock();
+            let mut groups = state.groups.range(lower..=upper);
+            let (_, owner) = groups.next()?;
+            if groups.next().is_some() {
+                return None;
+            }
+            owner.clone()
+        };
+        let graph = runtime.graph.lock();
+        let row = graph.owner.task(process).ok()?;
+        let resources = row.native().resources();
+        (resources.address == address
+            && core::ptr::eq(resources.page, page)
+            && row.has_thread(born.visible_tid))
+        .then_some(row.metadata().namespace_pid)
+    }
+
     /// Classify the admitted thread group at whatever address incarnation.
     /// Root and fork-child groups have distinct exec authority until native
     /// child exec is implemented.
