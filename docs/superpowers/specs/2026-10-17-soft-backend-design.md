@@ -197,9 +197,13 @@ memory trait (`cflow.rs`), the pure FXSAVE/x87/XSAVE emulators, the
 (`carrick-dsr/src/cache.rs`), the W^X seam, and about 40 tiny static x86_64 ELF
 fixtures with sources and a loader harness.
 
-`iced-x86`, `bad64` and `dynasmrt` are declared in the root `Cargo.toml` but
-absent from `Cargo.lock`: no crate uses them, so they are fresh dependencies on
-the build graph (all license-allowed by `deny.toml`).
+The x86 decoder remains `iced-x86`. For A64, the November
+[design amendment](2026-11-04-aarch64-soft-backend-design.md#decoder-and-emitter-provenance)
+supersedes decoder/emitter dependency and salvage proposals here: use a
+Carrick-written generator from Arm machine-readable specification data, subject
+to input-license admission. No third-party A64 decoder or assembler is selected.
+The clean-room restriction excludes all copyleft, including file-level copyleft;
+a workspace declaration or allowlist is not a whole-source provenance audit.
 
 Measured lessons that carry over:
 
