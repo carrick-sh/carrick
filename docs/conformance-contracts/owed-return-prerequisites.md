@@ -390,22 +390,42 @@ partial-admission rollback, HVF backend receipt joining, B1–B3/C2 acceptance,
 slice 2b and the earlier unattributed EL1/runtime failures remain open.
 
 
-### Continuation admission: rebase verification is blocked
+### Continuation admission: stack-envelope regression
 
 The continuation preserves all 28 prerequisite commits. The two contract
 binding conflicts were additive: keep both the new refusal-census binding
 and the existing physical-retirement witnesses. No implementation was
 removed to resolve them.
 
-The first post-rebase focused build fails the EL1 stack gate before tests
-start: the native backing reply envelope is 10,302 bytes, while the retained
-11,311-byte ceiling requires 1,024 bytes of reserve (effective maximum
-10,287). Matching `allocator-test-control` image builds fail identically
-on admitted main and this branch. Default image builds pass at 10,270 bytes
-on both trees. The default build is not evidence for the test-control
-configuration. This is a baseline gate failure, not a demonstrated rebase
-regression. Do not weaken either the ceiling or the reserve, or report a
-zero-failure population for binaries that did not build.
+The earlier claim that main also failed the stack gate was incorrect. The
+matching default and `allocator-test-control` image builds on admitted main
+both pass at 10,270 bytes. Before the correction below, both branch builds
+fail at 10,302 bytes. The retained 11,311-byte ceiling requires 1,024 bytes
+of reserve (effective maximum 10,287); neither limit changes.
+
+Comparing the emitted frames with the production frame-budget parser isolates
+the 32-byte increase in this envelope to `Sched::interrupt` (128 → 160 bytes).
+In main's image, the SGI bitmap loop calls `send_sgis`; in this branch's image,
+LLVM inlines it into `interrupt`, retaining the nested `flat_map` iterator's
+front/back state and extra registers across the target lookup. The descriptor,
+grant and retained service frames in this envelope are unchanged. This is a
+compiled-image regression, not growth of the backing-reply wire record.
+An image-build bisection of the inherited commits identifies
+`feat(core): carry physical identity in claimed retirement permits` as the
+first failing change: its immediate predecessor builds at 10,270 bytes and
+that change builds at 10,302 bytes with `allocator-test-control`. The physical
+identity and permit custody changes are preserved; the fix reduces the
+iterator storage exposed by that change's compiled closure.
+
+`WakeEffects::sgi_slots` now borrows the bitmap with one word cursor and one
+remaining-bits word. It still visits only set bits, in slot order, without
+consuming or copying the bitmap. The loop remains inlined, so its storage is
+charged directly to the IRQ frame rather than hidden in an uncharged helper.
+The IRQ frame falls to 144 bytes and both image configurations pass at 10,286
+bytes. `wake_effects_iterates_sparse_words_in_slot_order_without_replaying`
+covers word boundaries, sparse words, duplicate requests, exhaustion and
+preservation of the borrowed bitmap. The existing compiled image gate is the
+red-first structural witness; no budget, reserve or timeout changes.
 
 Rebase verification must become green before this continuation adds either
 HVF backend receipt joining or the unpublished-abort continuation. Both remain
