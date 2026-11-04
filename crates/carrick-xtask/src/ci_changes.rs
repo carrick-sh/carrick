@@ -1145,6 +1145,8 @@ struct ActionJob {
     conclusion: Option<String>,
     // Missing metadata is unknown, never evidence of runner starvation.
     runner_name: Option<String>,
+    created_at: Option<String>,
+    completed_at: Option<String>,
     steps: Option<Vec<ActionStep>>,
 }
 
@@ -1182,15 +1184,21 @@ pub fn starved_jobs<W: Write>(args: StarvedJobsArgs, writer: &mut W) -> Result<(
     for job in page.jobs {
         if matches!(job.conclusion.as_deref(), Some("cancelled" | "failure")) {
             let disposition = if job.never_assigned_cancelled() {
-                "retry-eligible: cancelled before runner assignment; retry once after run completion"
+                "infrastructure-failure candidate: cancelled before runner assignment; cause unverified; no in-run retry"
             } else {
                 "fail: started, failed, or assignment metadata unknown"
             };
-            writeln!(writer, "{} ({}): {disposition}", job.name, job.id).map_err(|source| {
-                CiChangesError::Io {
-                    path: PathBuf::from("stdout"),
-                    source,
-                }
+            writeln!(
+                writer,
+                "{} ({}): {disposition}; job interval {} to {}",
+                job.name,
+                job.id,
+                job.created_at.as_deref().unwrap_or("unknown"),
+                job.completed_at.as_deref().unwrap_or("unknown")
+            )
+            .map_err(|source| CiChangesError::Io {
+                path: PathBuf::from("stdout"),
+                source,
             })?;
         }
     }
@@ -1209,7 +1217,7 @@ mod starved_job_tests {
     }
 
     #[test]
-    fn never_assigned_cancelled_is_retry_eligible() {
+    fn never_assigned_cancelled_is_infrastructure_failure() {
         assert!(classify(
             serde_json::json!({"id": 1, "name": "macos-clippy", "status": "completed",
             "conclusion": "cancelled", "runner_name": "", "steps": []})
