@@ -30,6 +30,9 @@ vm_free = [
   "carrick-sched-core::tests::{drain_handback_identity_survives_reuse_before_the_consumer_runs,host_wake_batch_keeps_identity_after_return_and_reuse,service_take_keeps_identity_after_return_and_reuse} (identity captured before host publication, including consumer preemption and returned batches)",
   "carrick-sched-core::tests::{host_claim_is_not_published_before_queue_cleanup,host_claim_cleanup_does_not_unlink_a_replacement_waiter,host_wake_transfer_owns_waitv_cleanup_until_completion,a_host_request_during_transfer_prevents_guest_relocation} (owned transfer, cancellation, waitv cleanup and deferred host requests)",
   "carrick-sched-core::tests::{host_request_wins_against_enrolled_guest_park,host_request_after_guest_park_claims_the_published_wait,requested_running_records_survive_preemption_and_unswitch} (request lifetime through park and queue transitions; VM-free only)",
+  "carrick-sched-core::object_wait::host_tests::host_request_after_admission_refuses_the_park (#1467: an OnCpuRequested request landing after object-wait admission refuses the park by claim CAS, keeps host_wanted, leaves no enrollment or operation, then reparks after release; VM-free only)",
+  "carrick-sched-core::tests::host_request_after_observation_refuses_the_object_park (#1467: the object-park publication CASes from the observed OnCpu claim; a later host request of any kind refuses it with host_wanted kept and the current handback honoured; VM-free only)",
+  "carrick-el1-linux::native_process_runtime::host_test_support::{host_request_during_service_park_yields_then_reparks,host_request_during_owner_wait_park_yields_then_reparks} (#1467: two live processes; a host request on the running child refuses its service or owner-wait park, which yields through the owner checkpoint with the exact operation retained instead of NativeServiceQuarantined; the honoured request reparks and the ticket ACK returns; VM-free only)",
 ]
 
 [bindings.unresolved]

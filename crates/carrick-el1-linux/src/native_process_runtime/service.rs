@@ -368,13 +368,6 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             }
             return Ok(());
         };
-        #[cfg(test)]
-        {
-            let hook = self.service_cancel_snapshot_hook.lock().take();
-            if let Some(hook) = hook {
-                hook();
-            }
-        }
         let key = ObjectWaitKey::native_service(record).ok_or(NativeProcessError::Stale)?;
         let guard = self
             .zone
@@ -1429,14 +1422,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let parked = match parked {
             Ok(parked) => Some(parked),
             Err((error, operation)) => {
-                if adapter {
-                    carrick_core::wait::restore_object_operation(
-                        zone,
-                        self.source.slot,
-                        zone.record(self.record.id).identity(),
-                        operation,
-                    )
-                    .map_err(|_| NativeProcessError::Quarantined)?;
+                // A host request closed park admission for this running
+                // record (#1467). That is contention, not a broken invariant:
+                // retain the exact service operation on the record and leave
+                // through the owner checkpoint, so the slot's exit honours the
+                // request and the next owner entry reparks.
+                let host_contended = error == ObjectWaitError::Occupied
+                    && failure.is_none()
+                    && completion.is_none()
+                    && !deferred
+                    && self.host_requested_current();
+                if adapter || host_contended {
+                    self.retain_record_operation(operation)?;
+                }
+                if host_contended {
+                    return self.yield_service_checkpoint_as(entry);
                 }
                 if error != ObjectWaitError::Changed && failure.is_none() {
                     return Err(NativeProcessError::Quarantined);
@@ -1465,17 +1465,50 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         Ok(NativeResume::Left(None))
     }
 
+    /// Keep a refused park's exact service operation on the running record,
+    /// where `resume_service` authenticates it at the next owner entry.
+    fn retain_record_operation(&self, operation: OperationToken) -> Result<(), NativeProcessError> {
+        carrick_core::wait::restore_object_operation(
+            self.source.zone,
+            self.source.slot,
+            self.source.zone.record(self.record.id).identity(),
+            operation,
+        )
+        .map_err(|_| NativeProcessError::Quarantined)
+    }
+
+    /// Whether a host requester holds this lane's exact running record: its
+    /// OnCpuRequested claim on this slot refuses every new park.
+    fn host_requested_current(&self) -> bool {
+        let zone = self.source.zone;
+        zone.slot(self.source.slot).current() == Some(self.record.id)
+            && zone.live(self.record).is_some_and(|record| {
+                matches!(record.claim(),
+                    carrick_sched_core::Claim::OnCpuRequested { slot, .. }
+                        if slot == self.source.slot)
+            })
+    }
+
     /// A supply that won before enrollment is ready work, not a reason to
     /// finish under the IPC dispatch stack. The exact record keeps its token.
     #[inline(never)]
     pub(super) fn yield_service_checkpoint(&mut self) -> Result<NativeResume, NativeProcessError> {
+        self.yield_service_checkpoint_as(OwnerEntry::Syscall)
+    }
+
+    /// Leave through the owner checkpoint that resumes `entry`'s service.
+    #[inline(never)]
+    fn yield_service_checkpoint_as(
+        &mut self,
+        entry: OwnerEntry,
+    ) -> Result<NativeResume, NativeProcessError> {
         let start = carrick_core::entry::prepare_handoff(self.binding, self.source, self.record.id)
             .ok_or(NativeProcessError::Stale)?;
         // SAFETY: this exact admitted record is still held by this lane.
         unsafe {
             let record = self.source.zone.record(self.record.id);
             *record.ctx_mut() = *self.words;
-            record.publish_owner_continuation(OwnerEntry::Syscall);
+            record.publish_owner_continuation(entry);
         }
         if self.source.zone.record(self.record.id).claim() == carrick_sched_core::Claim::Free {
             // The root's first entry has a retained, unqueued host-loaded
@@ -1617,6 +1650,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             Err((ObjectWaitError::Changed, operation)) => {
                 self.restore_preparation_operation(operation)?;
                 self.finish_owner_wait(request)
+            }
+            Err((ObjectWaitError::Occupied, operation)) if self.host_requested_current() => {
+                // Host contention, as in `park_service` (#1467): the retained
+                // owner wait resumes at this record's next owner entry.
+                self.retain_record_operation(operation)?;
+                self.yield_service_checkpoint()
             }
             Err((_, operation)) => {
                 self.restore_preparation_operation(operation)?;

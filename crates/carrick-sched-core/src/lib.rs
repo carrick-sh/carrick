@@ -2910,6 +2910,40 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         }
     }
 
+    /// Publish an object-queue park from the exact claim its enrollment
+    /// observed. A host request may move a running record OnCpu ->
+    /// OnCpuRequested without the queue lock; that request closes park
+    /// admission, so a lost CAS publishes nothing and the caller withdraws.
+    #[must_use]
+    pub(crate) fn publish_object_park(&self, record: RecordId, seq: u32, from: Claim) -> bool {
+        let rec = self.record(record);
+        if !matches!(from, Claim::Free | Claim::OnCpu { .. }) {
+            return false;
+        }
+        let timer = rec.deadline().and_then(|deadline| {
+            self.timers
+                .admission(self.record_ref(record), seq, deadline)
+        });
+        let previous_seq = rec.last_seq.load(Ordering::Relaxed);
+        let previous_handback = rec.handback.load(Ordering::Relaxed);
+        rec.last_seq.store(seq, Ordering::Relaxed);
+        rec.handback.store(0, Ordering::Relaxed);
+        if !rec.cas(from, Claim::Parked { seq }) {
+            // The requester published its intent before its CAS; keep it for
+            // the running owner's exit, exactly as `publish_guest_park` does.
+            rec.last_seq.store(previous_seq, Ordering::Relaxed);
+            rec.handback.store(previous_handback, Ordering::Relaxed);
+            return false;
+        }
+        // A request satisfied before this park is consumed by it. A host
+        // claiming the new Parked state stores its own handback reason.
+        rec.host_wanted.clear();
+        if let Some(timer) = timer {
+            self.timers.activate(timer);
+        }
+        true
+    }
+
     /// Publish a single-entry guest park, or undo its enrollment when a
     /// host request won OnCpu first. The caller owns the running context
     /// and the entry's bucket lock. No record access follows a successful CAS.

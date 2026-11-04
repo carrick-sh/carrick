@@ -1384,10 +1384,11 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'a, C> {
             return Err((ObjectWaitError::Changed, operation));
         }
         let rec = self.zone.record(record);
+        let observed = rec.claim();
         if rec.has_object_operation()
             || rec.object.queue.load(Ordering::Relaxed) != 0
             || rec.entry_count() != 0
-            || !matches!(rec.claim(), Claim::Free | Claim::OnCpu { .. })
+            || !matches!(observed, Claim::Free | Claim::OnCpu { .. })
         {
             return Err((ObjectWaitError::Occupied, operation));
         }
@@ -1422,7 +1423,8 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'a, C> {
         if !still_blocked() || snapshot.epoch != self.queue().epoch.load(Ordering::SeqCst) {
             return Err((ObjectWaitError::Changed, operation));
         }
-        rollback.armed = false;
+        let previous_expired = rec.object.expired.load(Ordering::Relaxed);
+        let previous_deadline = rec.deadline.load(Ordering::Relaxed);
         rec.object.expired.store(
             match destination {
                 OperationDestination::Guest => 0,
@@ -1435,7 +1437,20 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'a, C> {
             Ordering::Relaxed,
         );
         self.zone.set_deadline(record, deadline);
-        self.zone.publish_park(record, self.zone.next_seq(record));
+        // A host request that won OnCpu after the admission check above
+        // closes this park: withdraw it and leave the running owner, with
+        // its operation, to honour that request at its exit.
+        if !self
+            .zone
+            .publish_object_park(record, self.zone.next_seq(record), observed)
+        {
+            rec.object
+                .expired
+                .store(previous_expired, Ordering::Relaxed);
+            self.zone.set_deadline(record, previous_deadline);
+            return Err((ObjectWaitError::Occupied, operation));
+        }
+        rollback.armed = false;
         Ok(())
     }
 
@@ -2370,6 +2385,62 @@ mod host_tests {
             assert_eq!(completed.generation(), 19);
             assert!(zone.record(record).take_object_operation().is_none());
         }
+    }
+
+    /// #1467: a host request may win a running record (OnCpu ->
+    /// OnCpuRequested, no queue lock) after enrollment checked its claim.
+    /// The park must refuse and withdraw, not overwrite that request.
+    #[test]
+    fn host_request_after_admission_refuses_the_park() {
+        let zone = fixture(true);
+        let record = allocate(&zone, 101);
+        let record_ref = zone.record_ref(record);
+        zone.requeue_preempted(SLOT, record);
+        assert_eq!(zone.switch_in(SLOT), Some(record));
+        let key = ObjectWaitKey::native_service(record_ref).unwrap();
+        zone.bind_object_wait(key, &SpinForever).unwrap();
+        let operation = OperationToken::new(u64::from(record.raw()), 23).unwrap();
+        let queue = zone.object_wait(key, &SpinForever).unwrap();
+        let refused = queue.park_rechecked(queue.snapshot(), record, operation, || {
+            assert_eq!(
+                zone.claim_for_host(record_ref, None, Handback::Control, &SpinForever),
+                HostClaim::El1Held { slot: SLOT }
+            );
+            true
+        });
+        let (error, returned) = refused.unwrap_err();
+        assert_eq!(error, ObjectWaitError::Occupied);
+        assert_eq!(returned.generation(), 23);
+        drop(queue);
+        // The running owner still holds the requested record, unenrolled and
+        // with no operation, so its exit can hand it to the host requester.
+        assert!(matches!(
+            zone.record(record).claim(),
+            Claim::OnCpuRequested { slot, .. } if slot == SLOT
+        ));
+        assert!(zone.record(record).host_wanted());
+        assert!(!zone.record(record).has_object_operation());
+        let queue = zone.object_wait(key, &SpinForever).unwrap();
+        let report = queue
+            .notify_object(SLOT, &mut crate::WakeEffects::default())
+            .unwrap();
+        assert_eq!(report.visited, 0);
+        drop(queue);
+        // Busy once, then success: the owner leaves, the host takes it, and a
+        // later park from a fresh OnCpu custody enrolls normally.
+        assert!(zone.unswitch(SLOT, record));
+        assert_eq!(
+            zone.claim_for_host(record_ref, None, Handback::Control, &SpinForever),
+            HostClaim::Claimed
+        );
+        assert!(zone.requeue_on(SLOT, record).is_some());
+        assert_eq!(zone.switch_in(SLOT), Some(record));
+        let queue = zone.object_wait(key, &SpinForever).unwrap();
+        queue
+            .park_owner_until(queue.snapshot(), record, returned, 0, OwnerEntry::Syscall)
+            .unwrap();
+        drop(queue);
+        assert!(matches!(zone.record(record).claim(), Claim::Parked { .. }));
     }
 
     #[test]
