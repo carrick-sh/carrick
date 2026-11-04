@@ -182,6 +182,14 @@ fn baseline_workflow_provenance_and_receipt_admission_fail_closed() {
 fn admitted(head: &str) -> AcceptReceipt {
     let mut value = serde_json::to_value(base()).unwrap();
     value["head"] = json!(head);
+    // Match accept --profile no-docker --phase signed, independently of
+    // the production declaration so this witnesses the real receipt shape.
+    value["skipped_steps"] = json!([
+        "conformance-probes-retained",
+        "ltp",
+        "inotify09-el1",
+        "inotify09-el0"
+    ]);
     value["artifact"] = json!({"path":"target/release/carrick","sha256":"1".repeat(64),"cdhash":"2".repeat(40),"lc_uuid":"some-uuid","hypervisor_entitlement":true,"dof_present":true});
     value["fixture_validation"] = json!({"validation_method":"input_identity","elf_hash_verification":"recomputed","checkout_head":head,"checkout_tree":"3".repeat(40),"bundle_source_head":"a".repeat(40),"checkout_dirty":false,"manifest_sha256":"4".repeat(64),"inputs_sha256":"5".repeat(64)});
     let names = [
@@ -214,6 +222,65 @@ fn admitted(head: &str) -> AcceptReceipt {
             .collect::<Vec<_>>()
     );
     serde_json::from_value(value).unwrap()
+}
+
+#[test]
+fn no_docker_receipt_admits_exactly_the_declared_skips() {
+    let sha = "a".repeat(40);
+    let valid = admitted(&sha);
+    validate_receipt(&valid, &sha).unwrap();
+    // Skips describe a set; serialization order carries no authority.
+    let mut reordered = valid.clone();
+    reordered.skipped_steps.reverse();
+    validate_receipt(&reordered, &sha).unwrap();
+}
+
+#[test]
+fn no_docker_receipt_rejects_extra_missing_and_duplicate_skips() {
+    let sha = "a".repeat(40);
+    let valid = admitted(&sha);
+    let mut extra = valid.clone();
+    extra.skipped_steps.push("probe-cases".into());
+    let mut missing = valid.clone();
+    missing.skipped_steps.pop();
+    let mut duplicate = valid.clone();
+    duplicate.skipped_steps.push("ltp".into());
+    let mut empty = valid;
+    empty.skipped_steps.clear();
+    for receipt in [extra, missing, duplicate, empty] {
+        let error = validate_receipt(&receipt, &sha).unwrap_err().to_string();
+        assert!(error.contains("receipt skipped_steps mismatch"), "{error}");
+    }
+}
+
+#[test]
+fn no_docker_receipt_names_each_mismatched_admission_field() {
+    let sha = "a".repeat(40);
+    let valid = admitted(&sha);
+    for (field, replacement) in [
+        ("head", json!("b".repeat(40))),
+        ("clean_tree", json!(false)),
+        ("phase", json!("host")),
+        ("profile", json!("linux-portable")),
+    ] {
+        let mut value = serde_json::to_value(&valid).unwrap();
+        value[field] = replacement;
+        let receipt = serde_json::from_value(value).unwrap();
+        let error = validate_receipt(&receipt, &sha).unwrap_err().to_string();
+        assert!(
+            error.contains(&format!("receipt {field} mismatch")),
+            "{field}: {error}"
+        );
+    }
+    for step in &valid.steps {
+        let mut missing = valid.clone();
+        missing.steps.retain(|s| s.name != step.name);
+        let error = validate_receipt(&missing, &sha).unwrap_err().to_string();
+        assert!(
+            error.contains("step") && error.contains(&step.name),
+            "{error}"
+        );
+    }
 }
 
 #[test]

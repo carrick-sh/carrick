@@ -1043,6 +1043,7 @@ pub fn evaluate_el1_step(
 }
 
 /// Steps intentionally outside the no-Docker profile's scope.
+/// Shared by receipt production, signed-gate admission and receipt comparison.
 pub const NO_DOCKER_EXCLUSIONS: &[&str] = &[
     "conformance-probes-retained",
     "ltp",
