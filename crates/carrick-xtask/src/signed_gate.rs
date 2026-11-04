@@ -1,6 +1,7 @@
 //! Actions plumbing for the signed lane. Only the authorized execution job runs PR code.
 use crate::accept::{
-    AcceptReceipt, ArtifactIdentity, CleanupCount, inspect_artifact, parse_cleanup_count,
+    AcceptReceipt, ArtifactIdentity, CleanupCount, NO_DOCKER_EXCLUSIONS, inspect_artifact,
+    parse_cleanup_count,
 };
 use crate::ci_receipt::{ReceiptError, load};
 use crate::ci_scaler::REPOSITORY;
@@ -328,15 +329,32 @@ fn download_baseline(base: &str, output: &Path) -> Result<u64, ReceiptError> {
 
 /// An empty, truncated or unsigned receipt can never seed a baseline or stand for a gate.
 pub fn validate_receipt(receipt: &AcceptReceipt, expected: &str) -> Result<(), ReceiptError> {
-    if receipt.head != expected
-        || receipt.phase != "signed"
-        || receipt.profile != "no-docker"
-        || !receipt.clean_tree
-        || !receipt.skipped_steps.is_empty()
-    {
+    for (field, actual, expected) in [
+        ("head", receipt.head.as_str(), expected),
+        ("phase", receipt.phase.as_str(), "signed"),
+        ("profile", receipt.profile.as_str(), "no-docker"),
+    ] {
+        if actual != expected {
+            return Err(fail(format!(
+                "receipt {field} mismatch: expected {expected:?}, got {actual:?}"
+            )));
+        }
+    }
+    if !receipt.clean_tree {
         return Err(fail(
-            "receipt SHA, phase, profile or checkout admission mismatch",
+            "receipt clean_tree mismatch: expected true, got false",
         ));
+    }
+    // Compare the complete lists as unordered sets without discarding duplicate
+    // entries: only the profile's declared exclusions may be skipped.
+    let mut actual_skips: Vec<_> = receipt.skipped_steps.iter().map(String::as_str).collect();
+    let mut expected_skips = NO_DOCKER_EXCLUSIONS.to_vec();
+    actual_skips.sort_unstable();
+    expected_skips.sort_unstable();
+    if actual_skips != expected_skips {
+        return Err(fail(format!(
+            "receipt skipped_steps mismatch: expected {expected_skips:?}, got {actual_skips:?}"
+        )));
     }
     let identity = receipt
         .artifact
