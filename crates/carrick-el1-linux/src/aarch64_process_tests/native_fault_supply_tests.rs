@@ -245,6 +245,31 @@ fn native_fork_child_exiting_sibling_wakes_parked_clone() {
     child_thread_admission(7, 1, ChildStockCase::Exiting);
 }
 
+/// #1100 two-live-thread exit: a native child's ring-born worker has run its
+/// first syscall and is still live when the leader calls `exit_group`. The
+/// group exit must settle both threads in ring and return every identity,
+/// lifecycle extent and root, never forward or leave the worker behind.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn native_fork_child_leader_exit_group_with_a_live_worker() {
+    child_thread_admission(1, 1, ChildStockCase::GroupExit(GroupExitCaller::Leader));
+}
+
+/// #1100 two-live-thread exit: the ring-born worker itself calls
+/// `exit_group` while the leader is still live and queued.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn native_fork_child_worker_exit_group_with_a_live_leader() {
+    child_thread_admission(1, 1, ChildStockCase::GroupExit(GroupExitCaller::Worker));
+}
+
+#[cfg(not(target_os = "macos"))]
+#[derive(Clone, Copy, PartialEq)]
+enum GroupExitCaller {
+    Leader,
+    Worker,
+}
+
 #[cfg(not(target_os = "macos"))]
 #[derive(Clone, Copy, PartialEq)]
 enum ChildStockCase {
@@ -253,6 +278,7 @@ enum ChildStockCase {
     Pinned,
     Claimed,
     Exiting,
+    GroupExit(GroupExitCaller),
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -379,6 +405,7 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
     // The first clone lazily reserves four distinct standing identities.
     baseline_claims.reserved_numbers += 4;
     baseline_claims.thread_claims += 4;
+    let mut group_sibling = None;
     for _round in 0..rounds {
         let mut tids = Vec::new();
         for admitted in 0..count {
@@ -416,6 +443,70 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
         }
         if case == ChildStockCase::FirstBirth {
             return;
+        }
+        if let ChildStockCase::GroupExit(caller) = case {
+            let worker_tid = tids[0];
+            // The leader stays live while the scheduler switches the ring-born
+            // worker in for its first syscall.
+            for _ in 0..page.live() {
+                let current = fixture.zone.slot(fixture.slot).current().unwrap();
+                if fixture.zone.record(current).identity().tid != identity.tid {
+                    break;
+                }
+                let mut handoff = None;
+                let mut zone = crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &crate::sched::HardwareUserWord,
+                };
+                assert!(
+                    crate::dispatch::native_scheduler(
+                        &mut zone,
+                        &fixture.task,
+                        &counters,
+                        fixture.slot,
+                        &mut handoff
+                    )
+                    .yield_queued(&mut frame)
+                    .is_some()
+                );
+            }
+            let worker = fixture.zone.slot(fixture.slot).current().unwrap();
+            assert_eq!(
+                fixture.zone.record(worker).identity().tid,
+                u64::from(worker_tid)
+            );
+            frame.x[8] = 178;
+            assert_ne!(
+                loan_call(fixture, &mut frame, &mut cpu, &mut service, &counters),
+                carrick_personality_linux::dispatch::CompletionRoute::Forward,
+                "the ring-born worker's first syscall is served in ring"
+            );
+            assert_eq!(frame.x[0], u64::from(worker_tid));
+            assert_eq!(page.live(), 2, "leader and worker are both live");
+            group_sibling = Some(fixture.zone.record_ref(worker));
+            if caller == GroupExitCaller::Leader {
+                let mut handoff = None;
+                let mut zone = crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &crate::sched::HardwareUserWord,
+                };
+                assert!(
+                    crate::dispatch::native_scheduler(
+                        &mut zone,
+                        &fixture.task,
+                        &counters,
+                        fixture.slot,
+                        &mut handoff
+                    )
+                    .yield_queued(&mut frame)
+                    .is_some()
+                );
+                let leader = fixture.zone.slot(fixture.slot).current().unwrap();
+                assert_eq!(fixture.zone.record(leader).identity().tid, identity.tid);
+            }
+            break;
         }
         if case == ChildStockCase::Claimed {
             use carrick_personality_linux::lifecycle::{ProcessNative, ThreadBirthAdmission};
@@ -831,12 +922,76 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
         crate::common_entry::execution_binding(&fixture.task),
         observed,
     ));
+    let caller = fixture.zone.record_ref(current);
+    let live_before = page.live();
     frame.x[8] = 94;
     frame.x[0] = 0;
     assert_ne!(
         loan_call(fixture, &mut frame, &mut cpu, &mut service, &counters),
         carrick_personality_linux::dispatch::CompletionRoute::Forward
     );
+    if let ChildStockCase::GroupExit(_) = case {
+        assert_eq!(
+            fixture.zone.live(caller).map(|record| record.claim()),
+            Some(carrick_sched_core::Claim::Parked { seq: 2 }),
+            "the exit_group caller parks until the live sibling retires"
+        );
+        // Drive the vCPU like production: an idle entry that owes host work
+        // leaves for the executor, which consumes the doorbell and re-enters;
+        // every record the scheduler selects goes through the production
+        // resume checkpoint. Nothing may return to EL0 after exit_group.
+        let mut selections = 0;
+        loop {
+            let _ = fixture.task.linux.take_host_work_doorbell();
+            if fixture.zone.slot(fixture.slot).queued() == 0 {
+                break;
+            }
+            let mut handoff = None;
+            let mut zone = crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            };
+            let _ = crate::dispatch::native_scheduler(
+                &mut zone,
+                &fixture.task,
+                &counters,
+                fixture.slot,
+                &mut handoff,
+            )
+            .idle_entry(&mut frame, 0);
+            let selected = fixture
+                .zone
+                .slot(fixture.slot)
+                .current()
+                .expect("an idle entry with a queued record selects it");
+            selections += 1;
+            assert!(selections <= 2, "each closing thread is selected once");
+            assert!(
+                matches!(
+                    crate::aarch64_process::resume_production_with_service(
+                        fixture.zone,
+                        &fixture.task,
+                        fixture.slot,
+                        selected,
+                        &mut service,
+                    ),
+                    crate::sched::ResumeAction::Left
+                ),
+                "a closing thread's selection retires it instead of returning to EL0"
+            );
+            assert_eq!(fixture.zone.slot(fixture.slot).current(), None);
+        }
+        assert_eq!(selections, 2, "the sibling and then the caller retire");
+        assert_eq!(fixture.zone.slot(fixture.slot).queued(), 0);
+        assert!(group_sibling.is_some_and(|sibling| fixture.zone.live(sibling).is_none()));
+        assert_eq!(live_before, 2);
+        assert!(
+            fixture.zone.live(caller).is_none(),
+            "exit_group releases the calling thread's record"
+        );
+        assert_eq!(page.live(), 0, "exit_group ends the live sibling too");
+    }
     assert_eq!(
         crate::native_process_runtime::thread_stock::claim_counts(&owner).thread_claims,
         1,
