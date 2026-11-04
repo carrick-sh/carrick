@@ -632,3 +632,42 @@ channels so none can be inferred complete from the inventory witnesses or from
 a green compile check. The PR's continuation report carries source locations
 and verification populations; this note retains the ownership relationships
 without adding a line-pinned source inventory.
+
+### Retained-abort retry: executed stop condition
+
+The carrick-87 continuation stopped at the review's explicit ISA-ordering
+condition. Merely adding a retained preparation to `PendingContinuation`
+cannot make the existing service's abort entry resumable. Both services finish
+portal rollback and free the child space before physical stock return. The
+portal's abort entry requires that child space even when rollback has already
+finished. Retrying the retained preparation therefore returns `Stale` before
+it can try physical return again.
+
+A temporary fault-injection patch to
+`aarch64_process_tests::test_abort_after_stock_loan_returns_every_page_once`
+used the real `Aarch64NativeProcessService::prepare_mm` and `abort_mm`, the
+real portal rollback and the existing test stock transport. The transport
+returned `NativeProcessError::Busy` on its first Abort crossing without taking
+the loan. The first abort returned the preparation, and an assertion confirmed
+that its original child MM no longer had a space entry. The second abort failed
+at this assertion:
+
+```text
+retained abort must resume physical return without replaying rollback
+against the retired child
+ForkRefused(NativeForkRefusal { stage: Abort, cause: Mm(Stale) })
+```
+
+Exactly one test ran and failed (exit 101). This is a service-entry ordering
+reduction, **not** the requested complete production fork-entry witness:
+partial publication, notification-backed suspension, successor protection and
+exactly-once completion remain unproved. No physical-return success, successor
+quarantine, or runtime recovery is inferred from it. The temporary patch was
+removed after saving it with the dispatch evidence; no failing or ignored test
+was added to the suite.
+
+No runtime workaround was implemented. The correction must retain the completed
+rollback phase and the original loan identity, and supply the exact physical
+release notification before a production fork continuation can demonstrate
+Busy once followed by success. Keep this prerequisite draft; slice 2b and the
+other acceptance blockers above remain open.
