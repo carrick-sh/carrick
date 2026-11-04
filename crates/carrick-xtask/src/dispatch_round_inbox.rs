@@ -25,6 +25,8 @@ struct Watch {
     /// The trigger's URL: never delivered as a new comment.
     trigger: Option<String>,
     since: String,
+    /// Current trigger time, independent of the replay window.
+    trigger_at: String,
     last: Option<Instant>,
     /// Delivered items by URL (comments and reviews share no id space).
     seen: Vec<String>,
@@ -54,6 +56,7 @@ pub(crate) fn start(
     since: &str,
     handled: Vec<String>,
     also: Vec<String>,
+    trigger_at: &str,
 ) {
     WATCH.with(|w| {
         *w.borrow_mut() = Some(Watch {
@@ -61,6 +64,7 @@ pub(crate) fn start(
             threads,
             trigger,
             since: since.to_owned(),
+            trigger_at: trigger_at.to_owned(),
             seen: handled,
             also,
             ..Watch::default()
@@ -186,6 +190,12 @@ pub(crate) fn receive(mut comments: Vec<Value>) {
             {
                 continue;
             }
+            // Stops target only rounds already triggered when posted. Older
+            // unseen input is replayed, but replay must not resurrect a stop
+            // superseded by this trigger (#1636), including across issue/PR.
+            if body.trim() == STOP && !stop_follows_trigger(w, &c) {
+                continue;
+            }
             w.seen.push(url.clone());
             if body.trim() == STOP && w.stop.is_none() {
                 w.stop = Some(url.clone());
@@ -200,6 +210,30 @@ pub(crate) fn receive(mut comments: Vec<Value>) {
             append_worker_file(file, &fresh);
         }
     });
+}
+
+/// GitHub timestamps have one-second resolution. Issue comments share a
+/// global id space, including across the issue and its PR; reviews and label
+/// events do not. At equal times in different id spaces, keep stop effective.
+fn stop_follows_trigger(w: &Watch, comment: &Value) -> bool {
+    let Some(at) = comment["created_at"].as_str() else {
+        return false;
+    };
+    match at.cmp(w.trigger_at.as_str()) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => {
+            let trigger_id = w
+                .trigger
+                .as_deref()
+                .and_then(|url| url.rsplit_once("#issuecomment-"))
+                .and_then(|(_, id)| id.parse::<u64>().ok());
+            match (comment["id"].as_u64(), trigger_id) {
+                (Some(stop), Some(trigger)) => stop > trigger,
+                _ => true,
+            }
+        }
+    }
 }
 
 /// New comments for the coordinator's next tool reply; marks them received.
@@ -335,6 +369,7 @@ mod tests {
             "2026-10-31T10:00:00Z",
             Vec::new(),
             Vec::new(),
+            "2026-10-31T10:00:00Z",
         );
         super::set_worker_file(Some(&inbox));
         super::receive(vec![

@@ -4004,6 +4004,8 @@ fn label_trigger(root: &Path, mut event: Value) -> Value {
     });
     if let Some(item) = found.and_then(|e| round_inbox::label_item(issue, &e)) {
         event["label"]["html_url"] = item["html_url"].clone();
+        // Stop ordering follows the label event, not the later workflow run.
+        event["label"]["created_at"] = item["created_at"].clone();
     }
     event
 }
@@ -12594,6 +12596,66 @@ fi
             json!("outsider"),
             "tjfontaine"
         ));
+    }
+    #[test]
+    fn label_trigger_preserves_event_time_for_stop_ordering() {
+        const CHILD: &str = "CARRICK_TEST_LABEL_TRIGGER_TIME";
+        if std::env::var_os(CHILD).is_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let bin = temp.path().join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            crate::lock_file::tests::write_test_executable(
+                bin.join("gh"),
+                r#"#!/bin/sh
+test "$1 $2" = 'api repos/carrick-sh/carrick/issues/799/timeline?per_page=100&page=1' || exit 91
+cat "$LABEL_TRIGGER_FIXTURE/timeline.json"
+"#,
+                std::fs::Permissions::from_mode(0o700),
+            );
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    std::thread::current().name().unwrap(),
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("LABEL_TRIGGER_FIXTURE", temp.path())
+                .env("GH_TOKEN", "fixture-token")
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let fixture = PathBuf::from(std::env::var_os("LABEL_TRIGGER_FIXTURE").unwrap());
+        std::fs::write(
+            fixture.join("timeline.json"),
+            json!([
+                {"id":61,"event":"labeled","label":{"name":"dispatch"},
+                    "actor":{"login":"tjfontaine","type":"User"},"created_at":"2026-11-04T18:00:00Z"},
+                {"id":62,"event":"labeled","label":{"name":"dispatch:strong"},
+                    "actor":{"login":"tjfontaine","type":"User"},"created_at":"2026-11-04T18:01:00Z"},
+                {"id":63,"event":"labeled","label":{"name":"dispatch"},
+                    "actor":{"login":"someone","type":"User"},"created_at":"2026-11-04T18:02:00Z"}
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        let event = label_trigger(
+            &fixture,
+            json!({"issue":{"number":799},"label":{"name":"dispatch"},
+                "sender":{"login":"tjfontaine","type":"User"}}),
+        );
+        assert_eq!(event["label"]["created_at"], "2026-11-04T18:00:00Z");
+        assert_eq!(
+            event["label"]["html_url"],
+            "https://github.com/carrick-sh/carrick/issues/799#event-61"
+        );
     }
     #[test]
     fn agent_comment_on_an_unowned_pr_is_refused() {
