@@ -629,6 +629,120 @@ mod allocator_stats_tests {
     }
 
     #[test]
+    fn whole_mm_release_retains_permit_when_backend_owner_refuses_once() {
+        use carrick_hal::fork_stock::{ChildMmRelease, SlotAbsence};
+        use carrick_hal::{FrameEventCapacity, FrameInventoryEvent, MappingGeneration};
+        use carrick_kernel::kernel::{ObjectIdRegistry, frame_inventory::FrameInventoryAuthority};
+        let _guard = global_frame_allocator_test_lock().lock();
+        let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+        let (base, owner) = grant_owned_for_mm(&custody, El1FrameGrantMm::new(41).unwrap());
+        let (_, peer) = grant_owned_for_mm(&custody, El1FrameGrantMm::new(42).unwrap());
+        let inventory = std::sync::Arc::new(FrameInventoryAuthority::new());
+        let ids = std::sync::Arc::new(ObjectIdRegistry::new());
+        let source = inventory.physical_projection(ids.clone());
+        let guest = carrick_hal::GuestFrameOwner {
+            native_mm: carrick_hal::MmGeneration::new(core::num::NonZeroU64::new(41).unwrap()),
+            root_generation: carrick_guest_arch::ContextGeneration::new(core::num::NonZeroU64::MIN),
+        };
+        let backing = carrick_hal::FrameBackingIdentity::from_allocator(
+            carrick_guest_arch::FrameGpa::new(base),
+            core::num::NonZeroU64::new(owner.generation()).unwrap(),
+            carrick_hal::FrameLength::from_mapping_extent(
+                core::num::NonZeroU64::new(owner.length()).unwrap(),
+            ),
+        );
+        let mut reservation = source
+            .bind(guest)
+            .reserve(1, 1, FrameEventCapacity::for_event_count(2).unwrap().get())
+            .unwrap();
+        let transaction = reservation.transaction();
+        let frame = reservation.claim_frame().unwrap();
+        let mapping = reservation.claim_mapping().unwrap();
+        let generation = MappingGeneration::from_backend_counter(core::num::NonZeroU64::MIN);
+        reservation
+            .push(FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation,
+                gpa: carrick_guest_mem::Gpa::new(0x1000),
+                length: backing.length(),
+                permissions: carrick_hal::physical_grants::COW_GRANT_PERMISSIONS,
+            })
+            .unwrap();
+        reservation
+            .push(FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation,
+            })
+            .unwrap();
+        reservation.bind_physical_frame(frame, backing).unwrap();
+        source.bind(guest).apply(reservation.commit(())).unwrap();
+        let absence = SlotAbsence::scan(carrick_el1_abi::ReservationMm::new(41).unwrap(), [])
+            .unwrap()
+            .with_owner(guest)
+            .unwrap();
+        let mut progress = ChildMmRelease::default();
+        let mut region = carrick_test_support::TestEl1Region::zeroed();
+        // SAFETY: aligned ABI test storage, initialized before the shared borrow.
+        let residency = unsafe {
+            let pointer = region
+                .as_mut_ptr()
+                .add(carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET as usize)
+                .cast::<carrick_el1_abi::FrameGrantResidencyTable>();
+            carrick_el1_abi::FrameGrantResidencyTable::init_in_place(pointer);
+            &*pointer
+        };
+        let key = (base, owner.length());
+        let registered = custody
+            .global_frame_host_owners
+            .lock()
+            .remove(&key)
+            .unwrap();
+        assert!(!crate::metadata_grant::release_native_child_mm(
+            &custody,
+            &*source,
+            residency,
+            &absence,
+            &mut progress
+        ));
+        let released = progress.inventory(&*source, &absence).unwrap();
+        let revision = released.revision();
+        assert_eq!(released.pending_retirements(), 1);
+        assert_eq!(inventory.abandoned_retirement_permits(), 0);
+        assert!(!peer.snapshot().unwrap().retirement_requested);
+        custody
+            .global_frame_host_owners
+            .lock()
+            .insert(key, registered);
+        let pin = owner.pin().unwrap();
+        assert!(crate::metadata_grant::release_native_child_mm(
+            &custody,
+            &*source,
+            residency,
+            &absence,
+            &mut progress
+        ));
+        let released = progress.inventory(&*source, &absence).unwrap();
+        assert_eq!(released.revision(), revision);
+        assert_eq!(released.pending_retirements(), 0);
+        assert!(owner.inventory_retirement.lock().is_some());
+        assert!(crate::metadata_grant::release_native_child_mm(
+            &custody,
+            &*source,
+            residency,
+            &absence,
+            &mut progress
+        ));
+        assert!(!peer.snapshot().unwrap().retirement_requested);
+        drop(pin);
+        retry_pending_global_frame_retirements_at_idle_in_using(&custody, &mut |_, _| Ok(()));
+        assert!(owner.inventory_retirement.lock().is_none());
+        assert_eq!(inventory.abandoned_retirement_permits(), 0);
+    }
+
+    #[test]
     fn inventory_permit_rejects_foreign_completion_owner_without_consuming_authority() {
         use carrick_kernel::kernel::{ObjectIdRegistry, frame_inventory::FrameInventoryAuthority};
         let _guard = global_frame_allocator_test_lock().lock();

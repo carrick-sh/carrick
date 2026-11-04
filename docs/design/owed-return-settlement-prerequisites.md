@@ -16,19 +16,28 @@ summarizes the current code rather than the earlier checkpoints.
 | Requirement | Implemented | Still required |
 |---|---|---|
 | Owned return claims (A1–A4) | Stable reference custody outside copied overlays, prepare/abort accounting, production fragment splitting, shared/zero/last outcomes, and infallible claimed unmap bookkeeping. | Integration with slice 2b's physical settlement sequence. |
-| Physical permits and release receipts (B1–B3) | Exact allocator identity, claimed-return permits, atomic whole-MM permit output, two distinct release halves, and authenticated join. | Production callers still use receipt-only whole-MM retirement. Neither `MmReleaseReceipt::join` nor `BackendCustodyReleased::from_backend_release` has a production caller. HVF and CPL0 must consume the permits through actual backend custody release before joining. |
+| Physical permits and release receipts (B1–B3) | Exact allocator identity, claimed-return permits, atomic whole-MM permit output, retained quarantine/exec-predecessor release progress, and HVF/CPL0 terminal permit consumption. | Two-half receipt construction/joining is still not a production operation. Unpublished fork rollback keeps its inherited receipt-only release. VM destruction of retained CPL0 memslot completions is not integrated; dropping such a slot still uses fail-closed abandonment. Full physical execution also remains unaccepted. |
 | Native backing drop (C1) | `NativeFrameBacking::drop` requests an inventory permit; the existing S2b owner retains it through physical completion. | Execute its macOS witnesses, including pin drain and concurrent idle cleanup. Linux cross-compilation cannot prove those behaviors. |
 | Legacy retirement checks (C2) | `commit_cow_inventory_split` consults kernel inventory. | `retire_stage2_candidate_if_unreferenced` still checks only the backend registry. Its kernel-inventory check and the falling `RetirementAuthority::LegacyRegistry` counter are absent. |
 | Original six review changes | Typed post-clear custody, claim/headroom handling, journal identity, an inventory-lock destructor witness, and the named CPL0 retirement path. | Physical backend integration and execution remain open; journal identity tests still observe eager clearing and do not prove delayed acknowledgement. |
 | Slice 2b | Not implemented in this prerequisite. | Neutral owed-return routine, `SettlementGuard`, slot-epoch chunk acknowledgement, COW-before-return exclusion hook, whole-MM settlement and minimal host reconciler port. |
 
-The whole-MM output is exercised through `retire_mm_with_permits` by tests,
-but `PhysicalInventoryProjection::retire_mm` still calls
-`retire_mm_with_receipt`. `release_child_mm` returns an inventory half before
-the backend finishes releasing its custody. Adopting the permit output at
-that call alone would abandon permits; each backend must carry it through
-its existing completion owner. CPL0 additionally needs allocator identity
-before inventory publication and must preserve slots shared by live frames.
+The terminal production path now obtains `retire_mm_with_permits` through
+`ChildMmRelease`, held by the existing fork quarantine or exec-predecessor
+owner. Backend refusal retains the original inventory revision and permits.
+HVF transfers accepted permits to the existing S2b physical completion owner;
+CPL0 transfers them to the existing memslot owner, completing them only after
+successful context drain and memslot deletion. A shared slot keeps pending
+completions until its final context releases the slot. CPL0 staging supplies
+its allocator's typed `PhysicalOwnerGeneration::INITIAL`, independently of
+mapping generations.
+
+`PhysicalFrameInventory::retire_mm` and unpublished rollback retain their
+inherited receipt-only behavior. They are not a second implementation of the
+new settlement routine: slice 2b is still absent. Neither
+`MmReleaseReceipt::join` nor `BackendCustodyReleased::from_backend_release`
+has a production caller. Accepting the physical request is not a joined
+whole-MM receipt and does not authorize journal acknowledgement.
 
 A focused independent source review found no additional P0/P1 in the atomic
 whole-MM permit primitive. It confirmed the missing backend integration and
@@ -511,3 +520,46 @@ through child custody drop and transfer permits to S2b. CPL0 must bind its
 allocator identities at publication, retain the release across memslot
 retirement, and consume its permits before constructing the backend half.
 Those integrations remain required before this prerequisite may land.
+
+## B1 production continuation
+
+This round is limited to retained whole-MM release progress and its terminal
+backend consumers. It changes no settlement doorbell, revival policy, wait
+budget, concurrency or C2 retirement authority. The original issue remains
+draft and incomplete.
+
+The extended production fork-stock witness performs 1100 child retirements
+with a real inventory and a still-live parent. Each first backend request
+refuses; the next drain consumes the same permit exactly once. The original
+release revision survives; a live peer and a stale root generation cannot
+borrow the progress. Physical callbacks can acquire the inventory lock, and
+the abandonment counter remains zero. These are VM-free operations, not two
+executing guest processes.
+
+The CPL0 physical fixture calls the real permit consumer and `retire_child`.
+A live peer root temporarily prevents slot release; retry keeps the accepted
+completion with that same slot, does not replay its permit, and deletes the
+slot after the peer releases it. The fixture has both a VM-free adapter and a
+real KVM memslot binding. The macOS test
+`whole_mm_release_retains_permit_when_backend_owner_refuses_once` drives the
+HVF terminal release entry, restores the exact temporarily unavailable owner,
+and checks physical pin-drain completion. Its execution remains director-owned.
+
+Open work remains explicit:
+
+- B1: carry retained permits through unpublished rollback's admitted-loan
+  owner, and integrate terminal VM-destruction completion for CPL0 slots that
+  still retain pending retirements. Dropping such a slot currently invokes
+  fail-closed abandonment; it is not successful physical release.
+- B2: complete and witness production backend receipt construction and joining,
+  including every shared-slot and already-pending outcome required by review.
+- B3: the portable callback proves post-inventory-lock consumption; backend
+  execution and the complete joined release path remain to be accepted.
+- C2: the legacy candidate kernel-inventory gate and falling authority counter
+  remain unchanged and incomplete.
+- Slice 2b: owed-return settlement, guard, slot epochs/chunk acknowledgement,
+  COW-before-return exclusion settlement and host reconciler port remain absent.
+
+All 24 inherited commits are kept; the admitted-main rebase was already
+satisfied, with no conflicts, ported commits or dropped commits. No earlier
+failed or unavailable gate is promoted by these component witnesses.

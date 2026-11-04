@@ -354,6 +354,7 @@ fn release_retired_child<M: CarrierMemoryIo>(
     memory: &mut CarrierMemory<M>,
     inventory: &dyn carrick_hal::PhysicalFrameInventory,
     absence: &SlotAbsence,
+    progress: &mut carrick_hal::fork_stock::ChildMmRelease,
 ) -> Result<crate::carrier_memory::RetiredChild, TrapError> {
     // SAFETY: the retained aligned residency table initialized at boot.
     let residency = unsafe {
@@ -362,12 +363,45 @@ fn release_retired_child<M: CarrierMemoryIo>(
         ))
     }
     .map_err(|e| fail(e.to_string()))?;
-    if carrick_hal::fork_stock::release_child_mm(inventory, residency, absence).is_none() {
-        return Err(fail("retired child inventory or residency release"));
+    let released = progress
+        .inventory(inventory, absence)
+        .ok_or_else(|| fail("retired child inventory release"))?;
+    if !residency.retire_overlapping(absence.mm().raw(), 0, u64::MAX) {
+        return Err(fail("retired child residency release"));
     }
+    released
+        .try_retirements(|permit| {
+            memory
+                .accept_inventory_retirement(inventory, permit)
+                .map_err(|permit| (permit, ()))
+        })
+        .map_err(|()| fail("retired child physical retirement refused"))?;
     memory
         .retire_child(absence, inventory)
         .map_err(|e| fail(e.to_string()))
+}
+
+// Unpublished rollback retains the pre-existing receipt-only release order.
+// Its admitted-loan continuation is separate from terminal quarantine.
+fn release_unpublished_child<M: CarrierMemoryIo>(
+    memory: &mut CarrierMemory<M>,
+    inventory: &dyn carrick_hal::PhysicalFrameInventory,
+    absence: &SlotAbsence,
+) -> Result<(), TrapError> {
+    let residency = unsafe {
+        // SAFETY: initialized atomic table in the retained carrier mapping.
+        memory.retained_record::<carrick_el1_abi::FrameGrantResidencyTable>(FrameGpa::new(
+            KERNEL_REGION_GPA + carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET,
+        ))
+    }
+    .map_err(|e| fail(e.to_string()))?;
+    let release = carrick_hal::fork_stock::release_child_mm(inventory, residency, absence)
+        .ok_or_else(|| fail("unpublished child inventory rollback"))?;
+    memory
+        .retire_child(absence, inventory)
+        .map_err(|e| fail(e.to_string()))?;
+    drop(release);
+    Ok(())
 }
 
 fn rollback_fork_parent_residency(
@@ -778,8 +812,9 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                         .all(|page| memory.write(page.address(), &zero).is_ok())
                 },
                 |lifecycle| window.clear(lifecycle),
-                |absence| {
-                    release_retired_child(&mut memory.borrow_mut(), &*inventory, absence).is_ok()
+                |absence, progress| {
+                    release_retired_child(&mut memory.borrow_mut(), &*inventory, absence, progress)
+                        .is_ok()
                 },
             )
             .map(|_| ())
@@ -1310,7 +1345,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                         )?)
                     })
                     .ok_or_else(|| fail("unpublished child MM slot absence"))?;
-                release_retired_child(&mut self._vm, &*frame_inventory, &absence)?;
+                release_unpublished_child(&mut self._vm, &*frame_inventory, &absence)?;
             } else if carrick_hal::fork_stock::release_child_mm(
                 &*frame_inventory,
                 self.cow_residency()?,
@@ -1401,7 +1436,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                     )?)
                 })
                 .ok_or_else(|| fail("aborted child MM slot absence"))?;
-            release_retired_child(&mut self._vm, &*self.frame_inventory, &absence)?;
+            release_unpublished_child(&mut self._vm, &*self.frame_inventory, &absence)?;
         }
         // SAFETY: settlement is a fully initialized array of sixteen u64 words.
         let bytes = unsafe {

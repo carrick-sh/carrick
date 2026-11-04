@@ -84,7 +84,7 @@ fn committed_child_retains_physical_custody_through_quarantine() {
             absent,
             |_| true,
             |_| true,
-            |_| true,
+            |_, _progress| true,
         )
         .unwrap();
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
@@ -193,7 +193,8 @@ fn exec_replacement_moves_child_owner_and_settles_predecessor_once() {
             receipt,
             wrong,
             |_| true,
-            |physical, absence| physical.id == 1 && absence.mm() == loan.request.child_mm,
+            |physical, absence, _progress| physical.id == 1
+                && absence.mm() == loan.request.child_mm,
         ),
         Err(ForkStockServiceError::StaleExecution)
     );
@@ -204,7 +205,9 @@ fn exec_replacement_moves_child_owner_and_settles_predecessor_once() {
             receipt,
             predecessor_absent,
             |_| true,
-            |physical, absence| physical.id == 1 && absence.mm() == loan.request.child_mm,
+            |physical, absence, _progress| {
+                physical.id == 1 && absence.mm() == loan.request.child_mm
+            },
         )
         .unwrap();
     assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -214,7 +217,7 @@ fn exec_replacement_moves_child_owner_and_settles_predecessor_once() {
             receipt,
             absent(loan.request.child_mm).unwrap(),
             |_| true,
-            |_, _| true,
+            |_, _, _progress| true,
         ),
         Err(ForkStockServiceError::StaleExecution),
         "the consuming predecessor receipt must reject duplicates"
@@ -250,7 +253,7 @@ fn root_exec_enters_shared_stock_and_reclaims_without_child_capacity() {
             receipt,
             absent(predecessor_mm).unwrap(),
             |_| true,
-            |_, _| {
+            |_, _, _progress| {
                 child_releases += 1;
                 false
             },
@@ -266,7 +269,7 @@ fn root_exec_enters_shared_stock_and_reclaims_without_child_capacity() {
                 absent,
                 |_| true,
                 |_| false,
-                |_| true,
+                |_, _progress| true,
             )
             .unwrap(),
         1
@@ -323,7 +326,7 @@ fn exec_replacement_absorbs_pending_descriptor_tables_with_peer_live() {
             receipt,
             absent(first.request.child_mm).unwrap(),
             |_| false,
-            |_, _| {
+            |_, _, _progress| {
                 releases += 1;
                 true
             },
@@ -339,7 +342,7 @@ fn exec_replacement_absorbs_pending_descriptor_tables_with_peer_live() {
                 cleared.extend_from_slice(pages);
                 true
             },
-            |_, _| {
+            |_, _, _progress| {
                 releases += 1;
                 true
             },
@@ -699,7 +702,7 @@ fn reclaim<T: ChildAddressTags, C>(
                 true
             },
             |_| true,
-            |_| true,
+            |_, _progress| true,
         )
         .unwrap()
 }
@@ -811,7 +814,7 @@ fn quarantined_stock_is_never_reissued_while_its_mm_is_live() {
                 absent,
                 |_| true,
                 |_| true,
-                |_| true
+                |_, _progress| true
             )
             .unwrap(),
         0
@@ -1173,7 +1176,7 @@ fn kvm_lifecycle_window_cycles_exceed_stock_with_cleared_records() {
                     true
                 },
                 |life| window.clear(life),
-                |_| true,
+                |_, _progress| true,
             )
             .unwrap();
         assert_eq!(returned, 1);
@@ -1220,7 +1223,7 @@ fn lifecycle_window_clear_refuses_graph_referenced_control_and_defers_reclaim() 
             absent,
             |_| true,
             |life| window.clear(life),
-            |_| true,
+            |_, _progress| true,
         )
         .unwrap();
     assert_eq!(deferred, 0);
@@ -1239,7 +1242,7 @@ fn lifecycle_window_clear_refuses_graph_referenced_control_and_defers_reclaim() 
             absent,
             |_| true,
             |life| window.clear(life),
-            |_| true,
+            |_, _progress| true,
         )
         .unwrap();
     assert_eq!(returned, 1);
@@ -1274,7 +1277,7 @@ fn kvm_unclearable_lifecycle_record_is_never_reissued_dirty() {
             absent,
             |_| true,
             |_| true,
-            |_| true,
+            |_, _progress| true,
         )
         .unwrap();
     assert_eq!(
@@ -1328,7 +1331,7 @@ fn kvm_live_children_beyond_lifecycle_records_are_counted_refusals() {
             absent,
             |_| true,
             |life| window.clear(life),
-            |_| true,
+            |_, _progress| true,
         )
         .unwrap();
     assert_eq!(returned, 1);
@@ -1415,7 +1418,7 @@ fn refused_release_keeps_the_child_quarantined_and_its_stock_held() {
             absent,
             |_| true,
             |_| true,
-            |absence| {
+            |absence, _progress| {
                 released.borrow_mut().push(absence.mm());
                 false
             },
@@ -1456,7 +1459,7 @@ fn deferred_candidate_does_not_block_later_candidates() {
         absent,
         |_| true,
         |_| true,
-        |absence| absence.mm() != mm(302),
+        |absence, _progress| absence.mm() != mm(302),
     );
     assert_eq!(result, Ok(1));
     assert!(stock.is_quarantined(mm(302)));
@@ -1482,7 +1485,7 @@ fn failed_clear_after_release_is_retried_without_a_second_release() {
             absent,
             |_| clear_ok.get(),
             |_| true,
-            |_| {
+            |_, _progress| {
                 releases.set(releases.get() + 1);
                 true
             },
@@ -1511,7 +1514,7 @@ fn slot_absence_is_minted_only_when_no_slot_installs_the_mm() {
         |_| SlotAbsence::scan(mm(999), []),
         |_| true,
         |_| true,
-        |_| true,
+        |_, _progress| true,
     );
     assert_eq!(foreign, Ok(0));
     assert!(stock.is_quarantined(mm(302)));
@@ -1585,7 +1588,7 @@ fn reclaim_releases_each_child_once_across_a_retire_failure() {
             absent,
             |_| true,
             |_| true,
-            |_| {
+            |_, _progress| {
                 releases.set(releases.get() + 1);
                 true
             },
@@ -1618,7 +1621,7 @@ fn second_candidate_refusal_keeps_first_candidate_released_and_returned() {
             true
         },
         |_| true,
-        |absence| {
+        |absence, _progress| {
             order.borrow_mut().push(if absence.mm() == mm(302) {
                 "release 302"
             } else {
@@ -2014,7 +2017,7 @@ fn admitted_custody_token_drops_reserved_pins_on_abort_and_consumes_infallibly_o
             absent,
             |_| true,
             |_| true,
-            |_| true,
+            |_, _progress| true,
         )
         .unwrap();
     assert_eq!(dropped.load(Ordering::SeqCst), 2);
@@ -2382,6 +2385,16 @@ struct DummyInventory;
 
 #[allow(clippy::unimplemented)]
 impl crate::PhysicalFrameInventory for DummyInventory {
+    fn origin(&self) -> &crate::FrameInventoryOrigin {
+        unimplemented!()
+    }
+    fn retire_mm_with_permits(
+        &self,
+        _owner: crate::GuestFrameOwner,
+    ) -> Result<crate::InventoryReleased, Box<dyn std::error::Error + Send + Sync>> {
+        Err("unused in test".into())
+    }
+
     fn claim_unused_backing(
         &self,
         _backing: crate::FrameBackingIdentity,
@@ -2489,7 +2502,7 @@ fn second_root_reuses_carrier_fork_stock_after_first_root_exits() {
             absent,
             |_| true,
             |_| true,
-            |absence| {
+            |absence, _progress| {
                 released.borrow_mut().push(absence.mm());
                 true
             },

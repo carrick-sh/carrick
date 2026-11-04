@@ -2621,6 +2621,7 @@ impl PartialOrd for GuestFrameOwner {
 }
 
 pub trait PhysicalFrameInventory: Send + Sync {
+    fn origin(&self) -> &crate::FrameInventoryOrigin;
     /// Exclude new publication of an allocator incarnation with no inventory
     /// custody. A live mapping, claimed return or outstanding permit refuses
     /// the request without changing that custody. Backend work runs only after
@@ -2633,6 +2634,14 @@ pub trait PhysicalFrameInventory: Send + Sync {
     fn allocate_backing_ids(
         &self,
     ) -> Result<(crate::FrameId, crate::MappingId), Box<dyn std::error::Error + Send + Sync>>;
+    /// Atomic whole-MM output for retained physical release. Backends must
+    /// consume its linear permits outside the inventory lock before releasing
+    /// the completion owner. Receipt-only legacy callers are not upgraded by
+    /// this method.
+    fn retire_mm_with_permits(
+        &self,
+        owner: GuestFrameOwner,
+    ) -> Result<crate::InventoryReleased, Box<dyn std::error::Error + Send + Sync>>;
     /// Retire one exact root incarnation and return the inventory owner's
     /// empty-MM proof. Residency retirement remains with the release owner.
     fn retire_mm(

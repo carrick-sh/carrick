@@ -316,6 +316,7 @@ struct Slot {
     backing: PreparedBacking,
     frame_identities: BTreeMap<u64, BackingIdentity>,
     inherited_identities: BTreeMap<(NonZeroU64, u64), BackingIdentity>,
+    inventory_retirements: Vec<carrick_core_abi::PendingFrameRetirement>,
     bootstrap: bool,
     alias_count: usize,
     allowed: Vec<NonZeroU64>,
@@ -629,6 +630,7 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                     backing: b.clone(),
                     frame_identities: BTreeMap::new(),
                     inherited_identities: BTreeMap::new(),
+                    inventory_retirements: Vec::new(),
                     bootstrap: false,
                     alias_count: 0,
                     allowed: Vec::new(),
@@ -670,6 +672,47 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         self.roots.insert(mm, context);
         Ok(())
     }
+    /// Transfer a last-frame permit into this exact registration's existing
+    /// custody. Shared memslots retain it until their final context releases
+    /// the slot; accepting it does not claim that stage-2 is already unmapped.
+    pub(crate) fn accept_inventory_retirement(
+        &mut self,
+        inventory: &dyn carrick_hal::PhysicalFrameInventory,
+        permit: carrick_hal::FrameRetirementPermit,
+    ) -> Result<(), carrick_hal::FrameRetirementPermit> {
+        if !permit.issued_by(inventory.origin()) || self.admit().is_err() {
+            return Err(permit);
+        }
+        let backing = permit.backing();
+        let Some(slot) = self.locate(backing.ipa(), backing.length().raw() as usize) else {
+            return Err(permit);
+        };
+        let identity = if slot.frame_identities.is_empty() {
+            (backing.ipa() == slot.backing.extent.base).then_some(slot.backing.identity)
+        } else {
+            slot.frame_identities.get(&backing.ipa().raw()).copied()
+        };
+        if identity.is_none_or(|identity| identity.frame_id.get() != permit.frame().raw())
+            || backing.host_owner_generation() != PhysicalOwnerGeneration::INITIAL.raw()
+        {
+            return Err(permit);
+        }
+        let index = slot.handle.slot;
+        let Some(slot) = self.slots.get_mut(&index) else {
+            return Err(permit);
+        };
+        if slot.inventory_retirements.try_reserve(1).is_err() {
+            return Err(permit);
+        }
+        match permit.retire(|_| Ok::<_, ()>(())) {
+            Ok(pending) => {
+                slot.inventory_retirements.push(pending);
+                Ok(())
+            }
+            Err((permit, ())) => Err(permit),
+        }
+    }
+
     /// A retired fork child left quarantine (`absence` proves no slot runs
     /// it, and every CPU that ran it reloaded CR3 since). Drop its CR3
     /// registration and every descriptor alias it held (inherited frame
@@ -1543,6 +1586,11 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                 if let Some(slots) = self.admitted.get_mut(mm) {
                     slots.remove(&handle.slot);
                 }
+            }
+            for pending in slot.inventory_retirements {
+                // SAFETY: exact-context drains and memslot deletion completed
+                // above; no carrier registry lock is held during inventory cleanup.
+                unsafe { pending.complete() };
             }
         }
         self.free.insert(handle.slot);

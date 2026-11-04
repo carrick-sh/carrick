@@ -129,3 +129,10 @@ fn custody_release_before_another_mm_unmaps_keeps_physical_registration() {
         test_support::MemoryTestIo::new(TestMemoryIo::default())
     });
 }
+
+#[test]
+fn whole_mm_permit_survives_backend_refusal() {
+    test_support::whole_mm_permit_survives_backend_refusal(|| {
+        test_support::MemoryTestIo::new(TestMemoryIo::default())
+    });
+}

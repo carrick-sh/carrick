@@ -136,6 +136,10 @@ impl FrameInventoryAuthority {
     }
 }
 impl carrick_hal::PhysicalFrameInventory for PhysicalInventoryProjection {
+    fn origin(&self) -> &carrick_hal::FrameInventoryOrigin {
+        &self.inventory.origin
+    }
+
     fn claim_unused_backing(
         &self,
         backing: carrick_hal::FrameBackingIdentity,
@@ -158,6 +162,15 @@ impl carrick_hal::PhysicalFrameInventory for PhysicalInventoryProjection {
         &self,
     ) -> Result<(FrameId, MappingId), Box<dyn std::error::Error + Send + Sync>> {
         Ok((self.ids.frame_id()?, self.ids.mapping_id()?))
+    }
+    fn retire_mm_with_permits(
+        &self,
+        owner: carrick_hal::GuestFrameOwner,
+    ) -> Result<carrick_hal::InventoryReleased, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self
+            .inventory
+            .retire_mm_with_permits(&self.ids, FrameOwner::GuestMm(owner))?
+            .1)
     }
     fn retire_mm(
         &self,
@@ -3488,7 +3501,6 @@ mod tests {
     fn kvm_fork_retire_cycles_beyond_zone_capacity_release_child_state() {
         use carrick_hal::fork_stock::{
             ForkStock, LifecycleWindow, NoTableLedger, UntaggedRoots, lifecycle_slots,
-            release_child_mm,
         };
         use std::sync::Arc;
 
@@ -3516,6 +3528,16 @@ mod tests {
             0x10_0000,
             0x1000,
         );
+        reservation
+            .bind_physical_frame(
+                shared,
+                carrick_hal::FrameBackingIdentity::from_allocator(
+                    carrick_guest_arch::FrameGpa::new(0x10_0000),
+                    NonZeroU64::new(72).unwrap(),
+                    FrameLength::from_mapping_extent(NonZeroU64::new(4096).unwrap()),
+                ),
+            )
+            .unwrap();
         parent.apply(reservation.commit(())).expect("parent apply");
 
         let layout = std::alloc::Layout::new::<carrick_el1_abi::FrameGrantResidencyTable>();
@@ -3666,6 +3688,16 @@ mod tests {
                 0x20_0000,
                 0x1000,
             );
+            reservation
+                .bind_physical_frame(
+                    own,
+                    carrick_hal::FrameBackingIdentity::from_allocator(
+                        carrick_guest_arch::FrameGpa::new(0x20_0000),
+                        NonZeroU64::new(73 + cycle).unwrap(),
+                        FrameLength::from_mapping_extent(NonZeroU64::new(4096).unwrap()),
+                    ),
+                )
+                .unwrap();
             child.apply(reservation.commit(())).expect("child apply");
             residency
                 .publish(carrick_el1_abi::FrameGrantResidencyIdentity {
@@ -3690,17 +3722,89 @@ mod tests {
             stock
                 .retire_child(child_execution, &mut retire)
                 .expect("quarantine");
-            let returned = stock
-                .reclaim(
-                    &mut NoTableLedger,
-                    carrick_el1_abi::ReservationMm::new(PARENT).expect("parent"),
-                    |mm| carrick_hal::fork_stock::SlotAbsence::scan(mm, []),
-                    |_| true,
-                    |life| window.clear(life),
-                    |absence| release_child_mm(&*inventory, &residency, absence).is_some(),
-                )
-                .unwrap_or_else(|error| panic!("cycle {cycle}: {error:?}"));
-            assert_eq!(returned, 1, "cycle {cycle}");
+            let mut first_revision = None;
+            let mut accepted = 0;
+            for attempt in 0..2 {
+                let returned = stock
+                    .reclaim(
+                        &mut NoTableLedger,
+                        carrick_el1_abi::ReservationMm::new(PARENT).expect("parent"),
+                        |mm| carrick_hal::fork_stock::SlotAbsence::scan(mm, []),
+                        |_| true,
+                        |life| window.clear(life),
+                        |absence, progress| {
+                            let revision =
+                                progress.inventory(&*inventory, absence).unwrap().revision();
+                            if let Some(first) = first_revision {
+                                assert_eq!(revision, first);
+                            }
+                            first_revision = Some(revision);
+                            // Neither a live peer nor a recycled generation can steal
+                            // the retained release, even though this MM is now empty.
+                            for owner in [
+                                mm_generation(PARENT),
+                                carrick_hal::GuestFrameOwner {
+                                    root_generation: carrick_guest_arch::ContextGeneration::new(
+                                        NonZeroU64::new(2).unwrap(),
+                                    ),
+                                    ..mm_generation(child_mm)
+                                },
+                            ] {
+                                let wrong = carrick_hal::fork_stock::SlotAbsence::scan(
+                                    carrick_el1_abi::ReservationMm::new(
+                                        owner.native_mm.raw().get(),
+                                    )
+                                    .unwrap(),
+                                    [],
+                                )
+                                .unwrap()
+                                .with_owner(owner)
+                                .unwrap();
+                                assert!(progress.inventory(&*inventory, &wrong).is_none());
+                            }
+                            assert!(
+                                authority
+                                    .live_mapping_row(
+                                        FrameOwner::GuestMm(mm_generation(PARENT)),
+                                        parent_mapping
+                                    )
+                                    .is_some()
+                            );
+                            let released = progress.inventory(&*inventory, absence).unwrap();
+                            assert_eq!(released.pending_retirements(), 1);
+                            if released
+                                .try_retirements(|permit| {
+                                    assert!(
+                                        authority.state.try_lock().is_some(),
+                                        "backend runs after inventory unlock"
+                                    );
+                                    assert_eq!(permit.frame(), own);
+                                    assert_eq!(
+                                        permit.backing().host_owner_generation().get(),
+                                        73 + cycle
+                                    );
+                                    if attempt == 0 {
+                                        return Err((permit, ()));
+                                    }
+                                    let pending = permit.retire(|_| Ok::<_, ()>(())).unwrap();
+                                    // SAFETY: the VM-free fixture has no physical pins or storage.
+                                    unsafe { pending.complete() };
+                                    accepted += 1;
+                                    Ok(())
+                                })
+                                .is_err()
+                            {
+                                return false;
+                            }
+                            residency.retire_overlapping(child_mm, 0, u64::MAX)
+                        },
+                    )
+                    .unwrap_or_else(|error| panic!("cycle {cycle}: {error:?}"));
+                assert_eq!(returned, usize::from(attempt == 1), "cycle {cycle}");
+                assert_eq!(stock.is_quarantined(request.child_mm), attempt == 0);
+                assert_eq!(authority.abandoned_retirement_permits(), 0);
+            }
+            assert_eq!(accepted, 1, "exactly one authority consumed per child");
             assert!(residency.lookup(child_mm, 0x40_0000).is_none());
             children.push(child_mm);
         }
@@ -5552,6 +5656,86 @@ mod claimed_return {
 mod prepared_return_tests {
     use super::*;
     use std::sync::Arc;
+    #[test]
+    fn whole_mm_retry_does_not_replay_accepted_permits() {
+        let (inventory, ids, owner, row) = fixture();
+        let mut reservation = inventory
+            .reserve(&ids, 1, 1, FrameEventCapacity::for_event_count(2).unwrap())
+            .unwrap();
+        let transaction = reservation.transaction();
+        let frame = reservation.claim_frame().unwrap();
+        let mapping = reservation.claim_mapping().unwrap();
+        reservation
+            .push(FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation: row.generation,
+                gpa: Gpa::new(8192),
+                length: row.length,
+                permissions: MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation: row.generation,
+            })
+            .unwrap();
+        reservation
+            .bind_physical_frame(
+                frame,
+                carrick_hal::FrameBackingIdentity::from_allocator(
+                    carrick_guest_arch::FrameGpa::new(0xa000),
+                    NonZeroU64::new(74).unwrap(),
+                    row.length,
+                ),
+            )
+            .unwrap();
+        inventory.apply(owner, reservation.commit(())).unwrap();
+        let (_, mut released) = inventory.retire_mm_with_permits(&ids, owner).unwrap();
+        assert_eq!(released.pending_retirements(), 2);
+        let mut accepted = Vec::new();
+        let mut refused = None;
+        let mut pending = Vec::new();
+        let first = released.try_retirements(|permit| {
+            assert!(inventory.state.try_lock().is_some());
+            if accepted.len() == 1 {
+                refused = Some((permit.frame(), permit.backing()));
+                return Err((permit, ()));
+            }
+            accepted.push(permit.frame());
+            pending.push(permit.retire(|_| Ok::<_, ()>(())).unwrap());
+            Ok(())
+        });
+        assert_eq!(first, Err(()));
+        assert_eq!(released.pending_retirements(), 1);
+        assert_eq!(inventory.abandoned_retirement_permits(), 0);
+        released
+            .try_retirements::<()>(|permit| {
+                assert_eq!(Some((permit.frame(), permit.backing())), refused);
+                assert!(!accepted.contains(&permit.frame()));
+                accepted.push(permit.frame());
+                pending.push(permit.retire(|_| Ok::<_, ()>(())).unwrap());
+                Ok(())
+            })
+            .unwrap();
+        released
+            .try_retirements::<()>(|_| panic!("completed release must not replay"))
+            .unwrap();
+        assert_eq!(accepted.len(), 2);
+        for completion in pending {
+            // SAFETY: this fixture has no physical storage or pins.
+            unsafe { completion.complete() };
+        }
+        assert_eq!(inventory.abandoned_retirement_permits(), 0);
+    }
+
     #[test]
     fn whole_mm_permits_require_the_receipts_mapping_population() {
         let (inventory, ids, owner, _) = fixture();

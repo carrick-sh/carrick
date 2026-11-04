@@ -1139,7 +1139,7 @@ fn post_exec_native_fork_reserves_loaded_image_source_custody() {
             },
             clean,
             |_| bytes.iter().all(|byte| *byte == 0),
-            |_| true,
+            |_, _progress| true,
         )
         .unwrap();
     assert!(stock.child_root(request.child_mm).is_none());

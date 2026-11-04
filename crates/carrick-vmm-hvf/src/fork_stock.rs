@@ -676,7 +676,7 @@ mod tests {
                 |mm| SlotAbsence::scan(mm, [0]),
                 |_| true,
                 |_| true,
-                |_| true,
+                |_, _progress| true,
             )
             .unwrap();
         terminal.join().unwrap();

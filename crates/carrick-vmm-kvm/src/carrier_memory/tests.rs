@@ -92,3 +92,8 @@ fn custody_release_before_another_mm_unmaps_keeps_physical_registration() {
         real_memory_io,
     );
 }
+
+#[test]
+fn whole_mm_permit_survives_backend_refusal() {
+    test_support::whole_mm_permit_survives_backend_refusal(real_memory_io);
+}

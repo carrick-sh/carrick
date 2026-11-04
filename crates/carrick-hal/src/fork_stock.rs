@@ -114,6 +114,7 @@ struct QuarantinedChild {
     supply_indeterminate: bool,
     released: bool,
     absent: bool,
+    release: ChildMmRelease,
 }
 
 /// Bytes in one loaned page-table page.
@@ -583,6 +584,37 @@ impl LifecycleWindow {
     }
 }
 
+/// Retained release authority for one exact MM incarnation. Quarantine and
+/// exec-predecessor custody own this value across backend refusal; retry must
+/// never retire the now-empty inventory again and replace its original permits.
+#[derive(Debug, Default)]
+#[must_use = "retain in the existing MM completion owner until release succeeds"]
+pub struct ChildMmRelease {
+    inventory: Option<crate::InventoryReleased>,
+}
+impl ChildMmRelease {
+    /// Admit the original inventory output once. A different owner cannot use
+    /// this progress, even if it recycles the numeric MM identifier.
+    pub fn inventory(
+        &mut self,
+        inventory: &dyn crate::PhysicalFrameInventory,
+        absence: &SlotAbsence,
+    ) -> Option<&mut crate::InventoryReleased> {
+        let owner = absence.inventory_owner()?;
+        if self.inventory.is_none() {
+            self.inventory = Some(inventory.retire_mm_with_permits(owner).ok()?);
+        }
+        self.inventory.as_mut().filter(|released| {
+            released.issued_by(inventory.origin())
+                && released.owner()
+                    == crate::FrameInventoryReceiptOwner::GuestMm {
+                        native_mm: owner.native_mm,
+                        root_generation: owner.root_generation,
+                    }
+        })
+    }
+}
+
 /// Release the carrier-wide per-MM state a fork child held once it leaves
 /// quarantine: every frame-inventory mapping (frames no other MM maps
 /// retire) and every COW residency row keyed by the MM. Root-registry and
@@ -682,6 +714,7 @@ struct ExecPredecessor<T, C> {
     tables: Vec<RootGpa>,
     physical: ExecPredecessorPhysical<C>,
     released: bool,
+    release: ChildMmRelease,
 }
 
 #[derive(Debug)]
@@ -1602,6 +1635,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             tables,
             physical: predecessor_physical,
             released: false,
+            release: ChildMmRelease::default(),
         };
         let replaced = self.exec_predecessors.insert(sequence, pending);
         debug_assert!(replaced.is_none());
@@ -1624,7 +1658,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         receipt: ExecPredecessorReceipt<T::Tag>,
         absence: SlotAbsence,
         mut clear_tables: impl FnMut(&[RootGpa]) -> bool,
-        mut release: impl FnMut(&C, &SlotAbsence) -> bool,
+        mut release: impl FnMut(&C, &SlotAbsence, &mut ChildMmRelease) -> bool,
     ) -> Result<(), ForkStockServiceError> {
         let Some(mut pending) = self.exec_predecessors.remove(&receipt.sequence) else {
             return Err(ForkStockServiceError::StaleExecution);
@@ -1645,7 +1679,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             .ok_or(ForkStockServiceError::InvalidRecord)?;
         if !pending.released {
             if let ExecPredecessorPhysical::Child(physical) = &pending.physical
-                && !release(physical, &absence)
+                && !release(physical, &absence, &mut pending.release)
             {
                 self.exec_predecessors.insert(receipt.sequence, pending);
                 return Err(ForkStockServiceError::MemoryAccessFailed);
@@ -2344,7 +2378,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         occupancy: impl Fn(ReservationMm) -> Option<SlotAbsence>,
         mut clear_tables: impl FnMut(&[RootGpa]) -> bool,
         mut clear_lifecycle: impl FnMut(ForkLifecycleLoan) -> bool,
-        mut release: impl FnMut(&SlotAbsence) -> bool,
+        mut release: impl FnMut(&SlotAbsence, &mut ChildMmRelease) -> bool,
     ) -> Result<usize, ForkStockServiceError> {
         let active = execution.into().active.and_then(MmKey::of);
         let candidates: Vec<(MmKey, SlotAbsence)> = self
@@ -2400,7 +2434,14 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
                     .quarantine
                     .get(&key)
                     .is_some_and(|state| !state.released)
-                    && !release(&absence)
+                    && !release(
+                        &absence,
+                        &mut self
+                            .quarantine
+                            .get_mut(&key)
+                            .ok_or(ForkStockServiceError::InvalidRecord)?
+                            .release,
+                    )
                 {
                     true
                 } else {

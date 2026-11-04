@@ -433,6 +433,21 @@ impl InventoryReleased {
         self.last_unmapped.pop()
     }
 
+    /// Transfer each permit once. A refused transfer restores that exact
+    /// permit without allocating; earlier accepted transfers are not replayed.
+    pub fn try_retirements<E>(
+        &mut self,
+        mut retire: impl FnMut(FrameRetirementPermit) -> Result<(), (FrameRetirementPermit, E)>,
+    ) -> Result<(), E> {
+        while let Some(permit) = self.last_unmapped.pop() {
+            if let Err((permit, error)) = retire(permit) {
+                self.last_unmapped.push(permit);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     pub fn from_retirement(retirement: FrameInventoryRetirementReceipt) -> Option<Self> {
         retirement.mm_empty_at_revision().then_some(Self {
             retirement,

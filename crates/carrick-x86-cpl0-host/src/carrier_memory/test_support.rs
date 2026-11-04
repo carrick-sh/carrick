@@ -1707,3 +1707,130 @@ pub fn inherited_inventory_edge_survives_protect_advancing_mapping_generation(
         })?;
     Ok(())
 }
+
+/// Real slot custody and inventory, with a backend preflight refusal followed
+/// by retry while the other MM stays live. No VM execution is claimed.
+pub fn whole_mm_permit_survives_backend_refusal(_make: fn() -> MemoryTestIo) {
+    use carrick_hal::fork_stock::{ChildMmRelease, SlotAbsence};
+    let mut fixture = RetireFixture::new(2, _make);
+    let child = fixture.context(2);
+    let source = fixture.inventory();
+    let authority = source.bind(child.into());
+    let mut reservation = authority.reserve(1, 1, 2).unwrap();
+    let transaction = reservation.transaction();
+    let frame = reservation.claim_frame().unwrap();
+    let mapping = reservation.claim_mapping().unwrap();
+    let generation = carrick_hal::MappingGeneration::from_backend_counter(nz(1));
+    let length = carrick_hal::FrameLength::from_mapping_extent(nz(PAGE));
+    reservation
+        .push(carrick_hal::FrameInventoryEvent::PrepareMapping {
+            transaction,
+            frame,
+            mapping,
+            generation,
+            gpa: carrick_guest_mem::Gpa::new(0x800000),
+            length,
+            permissions: carrick_hal::MemPerms {
+                read: true,
+                write: true,
+                exec: false,
+            },
+        })
+        .unwrap();
+    reservation
+        .push(carrick_hal::FrameInventoryEvent::PublishMapping {
+            transaction,
+            mapping,
+            generation,
+        })
+        .unwrap();
+    reservation
+        .bind_physical_frame(
+            frame,
+            carrick_hal::FrameBackingIdentity::from_allocator(
+                FrameGpa::new(0x800000),
+                PhysicalOwnerGeneration::INITIAL.raw(),
+                length,
+            ),
+        )
+        .unwrap();
+    let receipt = authority
+        .apply_with_receipt(reservation.commit(()))
+        .unwrap();
+    let identity = BackingIdentity {
+        frame_id: nz(frame.raw()),
+        mapping_id: nz(mapping.raw()),
+        owner_generation: PhysicalOwnerGeneration::INITIAL.raw(),
+        inventory_revision: nz(receipt.revision()),
+    };
+    let mut prepared = backing(0x800000, PAGE as usize, 91);
+    prepared.identity = identity;
+    let handle = fixture.slot_with(prepared, &[2]);
+    let absence = SlotAbsence::scan(
+        carrick_el1_abi::ReservationMm::new(child.mm.raw().get()).unwrap(),
+        [],
+    )
+    .unwrap()
+    .with_owner(child.into())
+    .unwrap();
+    let mut progress = ChildMmRelease::default();
+    let released = progress.inventory(&*source, &absence).unwrap();
+    assert_eq!(released.pending_retirements(), 1);
+    let revision = released.revision();
+    released
+        .try_retirements(|permit| {
+            fixture
+                .memory
+                .accept_inventory_retirement(&*source, permit)
+                .map_err(|permit| (permit, ()))
+        })
+        .unwrap();
+    assert_eq!(
+        fixture
+            .memory
+            .record(handle)
+            .unwrap()
+            .inventory_retirements
+            .len(),
+        1
+    );
+    // A live peer's CR3 in the data extent refuses release before mutation.
+    let peer = fixture.context(1);
+    let blocking = AddressContext {
+        root: root(0x800000),
+        ..peer
+    };
+    fixture.memory.roots.remove(&peer.mm.raw());
+    fixture
+        .memory
+        .install_root(peer.mm.raw(), blocking)
+        .unwrap();
+    assert!(fixture.memory.retire_child(&absence, &*source).is_err());
+    assert!(fixture.memory.root(child.mm.raw()).is_some());
+    assert_eq!(fixture.authority.abandoned_retirement_permits(), 0);
+    let stale = SlotAbsence::scan(absence.mm(), [])
+        .unwrap()
+        .with_owner(carrick_hal::GuestFrameOwner {
+            root_generation: ContextGeneration::new(nz(2)),
+            ..child.into()
+        })
+        .unwrap();
+    assert!(progress.inventory(&*source, &stale).is_none());
+    fixture.memory.roots.remove(&peer.mm.raw());
+    fixture.memory.install_root(peer.mm.raw(), peer).unwrap();
+    let released = progress.inventory(&*source, &absence).unwrap();
+    assert_eq!(released.revision(), revision);
+    assert_eq!(released.pending_retirements(), 0);
+    let mut replayed = false;
+    let completed = released.try_retirements::<()>(|permit| {
+        replayed = true;
+        Err((permit, ()))
+    });
+    assert!(completed.is_ok());
+    assert!(!replayed, "accepted permit must not replay");
+    let retired = fixture.memory.retire_child(&absence, &*source).unwrap();
+    assert_eq!(retired.revoked_slots, 1);
+    assert!(fixture.memory.record(handle).is_err());
+    assert_eq!(fixture.memory.root(peer.mm.raw()), Some(peer));
+    assert_eq!(fixture.authority.abandoned_retirement_permits(), 0);
+}

@@ -342,8 +342,8 @@ fn settle_native_exec_predecessor(
             receipt,
             absence,
             |pages| crate::fork_stock::ForkStockHostCustody::clear_tables(custody, pages),
-            |_, absence| {
-                carrick_hal::fork_stock::release_child_mm(&*inventory, residency, absence).is_some()
+            |_, absence, progress| {
+                release_native_child_mm(custody, &*inventory, residency, absence, progress)
             },
         )
     };
@@ -1625,6 +1625,41 @@ fn retain_fork_custody_rows(
     Ok(retained)
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn release_native_child_mm(
+    custody: &crate::trap::CarrierVmCustody,
+    inventory: &dyn carrick_hal::PhysicalFrameInventory,
+    residency: &carrick_el1_abi::FrameGrantResidencyTable,
+    absence: &carrick_hal::fork_stock::SlotAbsence,
+    progress: &mut carrick_hal::fork_stock::ChildMmRelease,
+) -> bool {
+    let Some(released) = progress.inventory(inventory, absence) else {
+        return false;
+    };
+    if released
+        .try_retirements(|permit| {
+            let identity = permit.backing();
+            let owner = custody
+                .global_frame_host_owners
+                .lock()
+                .get(&(identity.ipa().raw(), identity.length().raw()))
+                .filter(|entry| {
+                    entry.owner().generation() == identity.host_owner_generation().get()
+                })
+                .map(|entry| std::sync::Arc::clone(entry.owner()));
+            let Some(owner) = owner else {
+                return Err((permit, ()));
+            };
+            crate::trap::retire_global_frame_with_inventory_permit(custody, owner, permit)
+                .map_err(|permit| (permit, ()))
+        })
+        .is_err()
+    {
+        return false;
+    }
+    residency.retire_overlapping(absence.mm().raw(), 0, u64::MAX)
+}
+
 /// Apply the neutral stock owner's verdicts in either a live loan venue or
 /// an authenticated terminal maintenance-root venue. This supplies mechanics;
 /// release-once, hygiene, tag retirement and pin disposal stay with ForkStock.
@@ -1669,8 +1704,8 @@ fn reclaim_fork_stock(
         },
         |pages| crate::fork_stock::ForkStockHostCustody::clear_tables(custody, pages),
         |life| lifecycle_window(custody, life).is_some_and(|window| window.clear(life)),
-        |absence| {
-            carrick_hal::fork_stock::release_child_mm(&*inventory, residency, absence).is_some()
+        |absence, progress| {
+            release_native_child_mm(custody, &*inventory, residency, absence, progress)
         },
     )
 }
