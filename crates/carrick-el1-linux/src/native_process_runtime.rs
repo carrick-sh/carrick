@@ -11725,7 +11725,12 @@ mod tests {
         zone.publish_park(other_record.id, sequence);
         drop(guard);
         zone.clear_current(slot);
-        zone.requeue_preempted(slot, record);
+        // This fresh sibling record has no competing owner: refusal is a
+        // fixture invariant failure, not contention that can be waited out.
+        assert_eq!(
+            zone.requeue_preempted(slot, record),
+            carrick_sched_core::Requeue::Queued
+        );
         assert_eq!(zone.switch_in_full(slot).unwrap().record, record);
         zone.install_space(slot, 1).unwrap();
         thread.set(
