@@ -1293,18 +1293,44 @@ mod serial_host {
         let spawn = |dir: &Path| {
             fs::create_dir(dir).expect("run dir");
             fs::write(dir.join(".stress-capture-run"), "test").expect("marker");
-            let program = dir.join("tool");
+            // Multicall coreutils selects the applet from argv[0]. Keep
+            // `sleep` while retaining the literal run directory in argv.
+            let program = dir.join("sleep");
             symlink("/bin/sleep", &program).expect("tool path");
             let mut command = Command::new(program);
+            let log = File::create(dir.join("fixture.log")).expect("fixture log");
             command
                 .arg("60")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
+                .stdout(log.try_clone().expect("fixture stdout"))
+                .stderr(log);
             detached(&mut command);
             TestChild(command.spawn().expect("fake tool"))
         };
         let mut target = spawn(&run);
         let mut survivor = spawn(&sibling);
+        let diagnostics = || {
+            format!(
+                "target: {}; sibling: {}",
+                fs::read_to_string(run.join("fixture.log")).expect("target log"),
+                fs::read_to_string(sibling.join("fixture.log")).expect("sibling log")
+            )
+        };
+        assert!(
+            tool_pids(&run)
+                .expect("target argv")
+                .contains(&target.0.id()),
+            "target status {:?}; {}",
+            target.0.try_wait(),
+            diagnostics()
+        );
+        assert!(
+            tool_pids(&sibling)
+                .expect("sibling argv")
+                .contains(&survivor.0.id()),
+            "sibling status {:?}; {}",
+            survivor.0.try_wait(),
+            diagnostics()
+        );
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         bounded(
             Command::new(root.join("scripts/sudo/kill-capture.sh")).arg(&run),
@@ -1312,14 +1338,20 @@ mod serial_host {
             10,
         )
         .expect("scoped helper");
+        let target_status = wait_bounded(&mut target.0, Duration::from_secs(5)).expect("reap");
         assert!(
-            wait_bounded(&mut target.0, Duration::from_secs(5))
-                .expect("reap")
-                .is_some()
+            target_status.is_some_and(|status| status.signal() == Some(libc::SIGKILL)),
+            "target status {target_status:?}; {}",
+            diagnostics()
         );
-        assert!(survivor.0.try_wait().expect("sibling status").is_none());
+        let sibling_status = survivor.0.try_wait().expect("sibling status");
+        assert!(
+            sibling_status.is_none(),
+            "sibling status {sibling_status:?}; {}",
+            diagnostics()
+        );
         assert!(tool_pids(&run).expect("scope verification").is_empty());
-        assert!(!scoped_argv(&sibling.join("tool").to_string_lossy(), &run));
+        assert!(!scoped_argv(&sibling.join("sleep").to_string_lossy(), &run));
         assert!(scoped_argv(
             &run.join("commands with spaces").to_string_lossy(),
             &run
@@ -1366,7 +1398,8 @@ mod serial_host {
         use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().expect("directory");
         fs::write(dir.path().join(".stress-capture-run"), "test").expect("marker");
-        let program = dir.path().join("fake-lldb");
+        // A renamed uutils applet exits before the deadline being tested.
+        let program = dir.path().join("sleep");
         symlink("/bin/sleep", &program).expect("tool path");
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let error = privileged_bounded(
@@ -1377,7 +1410,15 @@ mod serial_host {
             Duration::from_millis(10),
         )
         .expect_err("capture deadline");
-        assert!(error.to_string().contains("Ok(None)"));
+        let log = fs::read_to_string(dir.path().join("capture.log")).expect("capture log");
+        assert!(
+            error.to_string().contains("Ok(None)"),
+            "{error}; output: {log}"
+        );
+        assert!(
+            error.to_string().contains("cleanup Ok(())"),
+            "{error}; output: {log}"
+        );
         assert!(
             tool_pids(dir.path())
                 .expect("scoped verification")
