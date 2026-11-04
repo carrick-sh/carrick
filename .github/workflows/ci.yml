@@ -1740,10 +1740,18 @@ jobs:
           cache-targets: false
           save-if: false
       - name: Prepare locked Cargo cache (infrastructure)
-        uses: ./selector/.github/actions/prepare-cargo
-        with:
-          root: selector
-          root-only: "true"
+        # Trusted-tree checkouts (selector/baseline) may predate the
+        # prepare-cargo action (#1571), so their root-only preparation is
+        # inline: one bounded locked fetch, exit 75 as infrastructure.
+        working-directory: selector
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! timeout 600 bash -c 'cargo fetch --locked --offline || CARGO_NET_OFFLINE=false CARGO_NET_RETRY=0 CARGO_HTTP_TIMEOUT=30 cargo fetch --locked'; then
+            echo '::error title=Infrastructure::Cargo cache preparation failed; tests did not run'
+            exit 75
+          fi
+          echo 'CARGO_NET_OFFLINE=true' >> "$GITHUB_ENV"
       - name: Build the trusted selector
         working-directory: selector
         run: |
@@ -1784,10 +1792,18 @@ jobs:
           save-if: false
       - name: Prepare locked Cargo cache (infrastructure)
         if: ${{ steps.baseline.outputs.sha != steps.ancestor.outputs.selector_sha }}
-        uses: ./selector/.github/actions/prepare-cargo
-        with:
-          root: baseline
-          root-only: "true"
+        # Trusted-tree checkouts (selector/baseline) may predate the
+        # prepare-cargo action (#1571), so their root-only preparation is
+        # inline: one bounded locked fetch, exit 75 as infrastructure.
+        working-directory: baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! timeout 600 bash -c 'cargo fetch --locked --offline || CARGO_NET_OFFLINE=false CARGO_NET_RETRY=0 CARGO_HTTP_TIMEOUT=30 cargo fetch --locked'; then
+            echo '::error title=Infrastructure::Cargo cache preparation failed; tests did not run'
+            exit 75
+          fi
+          echo 'CARGO_NET_OFFLINE=true' >> "$GITHUB_ENV"
       - name: Build the selected baseline xtask with its own lockfile
         if: ${{ steps.baseline.outputs.sha != steps.ancestor.outputs.selector_sha }}
         working-directory: baseline
