@@ -11640,3 +11640,272 @@ fn arm_classified_fault_rejects_non_fault_returns_without_clobbering_syndrome() 
         assert_eq!((frame.esr, frame.far), (esr, 0xabc));
     }
 }
+
+#[cfg(all(test, not(target_os = "macos")))]
+fn native_child_pipe_creation(flags: u64) {
+    use carrick_el1_abi::ipc::{IpcBacking, fd, pipe::End};
+    use carrick_kernel::el1_ipc::{HostIpc, HostTable, IpcLimits};
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use std::sync::Arc;
+
+    let fixture = Fixture::new(0x10000, asid(1));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let words = fixture.tables.live(&fixture.maintenance);
+    let task = CurrentTask::new();
+    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+        source,
+        &fixture.task,
+        fixture.page,
+        fixture.control,
+        fixture.address,
+        fixture.address,
+        parked,
+    )
+    .unwrap();
+    let owner = Arc::new(
+        HostIpc::with_limits(
+            1 << 20,
+            IpcLimits {
+                descriptions: carrick_el1_abi::ipc::IPC_OFD_SEGMENT,
+                ..IpcLimits::ZONE
+            },
+        )
+        .unwrap(),
+    );
+    let table = HostTable::create(Arc::clone(&owner), 64, 64).unwrap();
+    let object = owner.create_pipe(65536).unwrap();
+    let nonblock_flags = fd::StatusFlags {
+        nonblock: true,
+        ..fd::StatusFlags::default()
+    };
+    let reader = owner
+        .admit_description(fd::Description::new(
+            IpcBacking::Pipe {
+                object,
+                end: End::Reader,
+            }
+            .encode(),
+            fd::AccessMode::ReadOnly,
+            nonblock_flags,
+        ))
+        .unwrap();
+    let writer = owner
+        .admit_description(fd::Description::new(
+            IpcBacking::Pipe {
+                object,
+                end: End::Writer,
+            }
+            .encode(),
+            fd::AccessMode::WriteOnly,
+            nonblock_flags,
+        ))
+        .unwrap();
+    reader.install(table.id(), fd::Fd(3), false).unwrap();
+    writer.install(table.id(), fd::Fd(4), false).unwrap();
+
+    let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    let map = unsafe {
+        &*region
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_IPC_TABLE_MAP_OFFSET as usize)
+            .cast::<carrick_el1_abi::ipc_tables::IpcTableMap>()
+    };
+    map.publish(5, table.id().to_raw()).unwrap();
+    let pages: Vec<_> = (0..32).map(|n| 0x20000 + n * 0x1000).collect();
+    let mut crossing = TestStockCrossing::new(&pages);
+    crossing.metadata_in_el1_window = true;
+    crossing.ipc = Some((Arc::clone(&owner), map));
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &crossing,
+    )
+    .with_words(&words);
+    let parent = TaskKey {
+        id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
+        serial: TaskSerial::from_raw_u64(11).unwrap(),
+    };
+    let child_bindings: [_; 1] = core::array::from_fn(|_| {
+        let mut entry = runtime
+            .enter(source, &fixture.task, parked, &mut service)
+            .unwrap();
+        let LifecycleOutcome::Returned { result, .. } = entry.fork(ProcessForkChildTid::NONE)
+        else {
+            panic!("native fork must return");
+        };
+        assert!(result.raw() > 0, "fork errno number: {}", -result.raw());
+        let child = runtime
+            .namespace_child_key(parent, result.raw() as u32)
+            .unwrap();
+        runtime.task_binding(child).unwrap()
+    });
+
+    let parent_binding = runtime.task_binding(parent).unwrap();
+    fixture
+        .zone
+        .requeue_preempted(fixture.slot, parent_binding.record.id);
+
+    let tables = crate::ipc::MapTables(map);
+    let venue = crate::ipc::IpcVenue {
+        region: owner.region(),
+        tables: &tables,
+    };
+    let counters = Box::new(carrick_el1_abi::Counters::new());
+    let names = Box::new(carrick_el1_abi::InotifyNameCache::new());
+
+    let run_in_child = |address, nr: u64, args: [u64; 3]| -> (CompletionRoute, i64) {
+        let mut cpu = crate::sched::FakeCpu::default();
+        let mut svc = Aarch64NativeProcessService::with_crossing(
+            &task,
+            fixture.slot,
+            fixture.zone,
+            fixture.region.table(),
+            NonZeroU64::MIN,
+            &crossing,
+        )
+        .with_words(&words);
+        let child_ctx = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, address);
+        let mut entry = runtime.enter(source, &task, child_ctx, &mut svc).unwrap();
+        let mut frame = carrick_el1_abi::TrapFrame {
+            slot: fixture.slot.index() as u64,
+            elr: 0x4004,
+            ..Default::default()
+        };
+        frame.x[8] = nr;
+        frame.x[0] = args[0];
+        frame.x[1] = args[1];
+        frame.x[2] = args[2];
+        carrick_test_support::assert_guest_args(&args);
+        let route = super::dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&task),
+            crossing.fd_map(),
+            &[],
+            crossing.open_table(),
+            &[],
+            &names,
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            }),
+            Some(&venue),
+            Some(&fixture),
+            Some(&mut entry),
+            Some(source),
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        (route, frame.x[0] as i64)
+    };
+
+    activate_target(source, &task, &child_bindings[0]);
+    let output = carrick_test_support::GuestUserBuffer::zeroed(8);
+    let (route, result) = run_in_child(
+        child_bindings[0].address,
+        carrick_personality_linux::crossing::nr::PIPE2.raw(),
+        [output.arg(), flags, 0],
+    );
+    assert_eq!(
+        (route, result),
+        (CompletionRoute::Served, 0),
+        "native child pipe2 flags={flags:#x}: route={route:?}, register0={result}; Forward retains argument0 and returns no errno",
+    );
+    let pair: Vec<_> = output
+        .as_bytes()
+        .chunks_exact(4)
+        .map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap()))
+        .collect();
+    assert_eq!(pair, [0, 1]);
+    let [authority_id, index, generation] = crate::ipc::native_table(&venue, &task).unwrap();
+    let child_table = fd::TableId::from_raw(fd::RawTableId {
+        authority: authority_id,
+        index,
+        generation,
+    });
+    let authority = venue.region.fd(carrick_sched_core::ShortLockSpin);
+    for number in &pair {
+        assert_eq!(
+            authority.getfd(child_table, fd::Fd(*number)),
+            Ok(flags & carrick_abi::LINUX_O_CLOEXEC != 0)
+        );
+        assert_eq!(
+            authority
+                .getfl(child_table, fd::Fd(*number))
+                .unwrap()
+                .1
+                .nonblock,
+            flags & carrick_abi::LINUX_O_NONBLOCK != 0
+        );
+        assert_eq!(
+            authority.getfd(table.id(), fd::Fd(*number)),
+            Err(fd::Error::BadFd),
+            "child creation must not install into the live parent's table"
+        );
+    }
+    // Fork from the creator so both live processes inherit the NEW pair.
+    // The original root stays alive and must never acquire those descriptors.
+    let grandchild = {
+        let mut svc = Aarch64NativeProcessService::with_crossing(
+            &task,
+            fixture.slot,
+            fixture.zone,
+            fixture.region.table(),
+            NonZeroU64::MIN,
+            &crossing,
+        )
+        .with_words(&words);
+        let ctx = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, child_bindings[0].address);
+        let mut entry = runtime.enter(source, &task, ctx, &mut svc).unwrap();
+        let LifecycleOutcome::Returned { result, .. } = entry.fork(ProcessForkChildTid::NONE)
+        else {
+            panic!("creator must fork the pipeline reader");
+        };
+        assert!(result.raw() > 0, "second fork errno: {}", -result.raw());
+        let key = runtime
+            .namespace_child_key(child_bindings[0].key, result.raw() as u32)
+            .unwrap();
+        runtime.task_binding(key).unwrap()
+    };
+    let bytes = carrick_test_support::GuestUserBuffer::from_bytes(b"a");
+    assert_eq!(
+        run_in_child(
+            child_bindings[0].address,
+            64,
+            [pair[1] as u64, bytes.arg(), 1]
+        )
+        .1,
+        1
+    );
+    fixture
+        .zone
+        .requeue_preempted(fixture.slot, child_bindings[0].record.id);
+    activate_target(source, &task, &grandchild);
+    let received = carrick_test_support::GuestUserBuffer::zeroed(1);
+    assert_eq!(
+        run_in_child(grandchild.address, 63, [pair[0] as u64, received.arg(), 1]).1,
+        1
+    );
+    assert_eq!(received.as_bytes(), b"a");
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+#[test]
+fn serial_host_native_child_pipe_libc_zero_flags() {
+    // AArch64 libc pipe() uses pipe2(..., 0); there is no separate pipe ordinal.
+    native_child_pipe_creation(0);
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+#[test]
+fn serial_host_native_child_pipe2_nonblock_cloexec() {
+    native_child_pipe_creation(carrick_abi::LINUX_O_NONBLOCK | carrick_abi::LINUX_O_CLOEXEC);
+}
