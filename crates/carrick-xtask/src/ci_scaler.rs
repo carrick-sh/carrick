@@ -573,6 +573,51 @@ impl Intake {
     }
 }
 
+/// The clone lanes a controller admits. Each lane has an exact `=0` opt-out
+/// (`CARRICK_KVM_CLONES`, `CARRICK_AGENT_CLONES`), so two hosts can split the
+/// lanes between them (#1590): KVM and agent jobs carry different runner
+/// labels, so hosts serving disjoint lanes never claim the same job. Agents
+/// additionally need a standing controller on an agent site.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct Lanes {
+    pub kvm: bool,
+    pub agents: bool,
+}
+impl Lanes {
+    pub fn select(
+        serves_agents: bool,
+        standing: bool,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, ScalerError> {
+        let off = |name: &str| env(name).as_deref() == Some("0");
+        let lanes = Self {
+            kvm: !off("CARRICK_KVM_CLONES"),
+            agents: serves_agents && standing && !off("CARRICK_AGENT_CLONES"),
+        };
+        if !lanes.kvm && !lanes.agents {
+            return Err(ScalerError::Guard("no clone lane is enabled"));
+        }
+        Ok(lanes)
+    }
+    pub fn admits(self, lane: CloneLane) -> bool {
+        match lane {
+            CloneLane::Kvm => self.kvm,
+            CloneLane::Agent => self.agents,
+        }
+    }
+    /// Enabled lanes in admission order (KVM first).
+    pub fn list(self) -> Vec<CloneLane> {
+        [CloneLane::Kvm, CloneLane::Agent]
+            .into_iter()
+            .filter(|lane| self.admits(*lane))
+            .collect()
+    }
+    /// The combined clone budget of the enabled lanes.
+    pub fn cap(self, budget: CloneBudget) -> usize {
+        self.list().into_iter().map(|lane| budget.of(lane)).sum()
+    }
+}
+
 /// Per-lane clone budgets: KVM clones and dispatch-agent clones.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct CloneBudget {
@@ -1859,5 +1904,89 @@ mod intake_tests {
             "6",
             "--drain"
         ]));
+    }
+}
+
+#[cfg(test)]
+mod lane_tests {
+    use super::*;
+
+    fn env(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        }
+    }
+
+    #[test]
+    fn both_lanes_are_on_by_default_on_a_standing_agent_site() {
+        let lanes = Lanes::select(true, true, env(&[])).unwrap();
+        assert_eq!(lanes.list(), vec![CloneLane::Kvm, CloneLane::Agent]);
+        let budget = CloneBudget {
+            kvm: Concurrency::try_from(2).unwrap(),
+            agents: AgentClones::try_from(6).unwrap(),
+        };
+        assert_eq!(lanes.cap(budget), 8);
+    }
+
+    #[test]
+    fn each_lane_has_an_exact_zero_opt_out_for_a_two_host_split() {
+        let budget = CloneBudget {
+            kvm: Concurrency::try_from(2).unwrap(),
+            agents: AgentClones::try_from(6).unwrap(),
+        };
+        // The KVM host (carrick-hz in the #1590 split).
+        let kvm_host = Lanes::select(true, true, env(&[("CARRICK_AGENT_CLONES", "0")])).unwrap();
+        assert_eq!(kvm_host.list(), vec![CloneLane::Kvm]);
+        assert_eq!(kvm_host.cap(budget), 2);
+        // The agent host (ctb in the #1590 split).
+        let agent_host = Lanes::select(true, true, env(&[("CARRICK_KVM_CLONES", "0")])).unwrap();
+        assert_eq!(agent_host.list(), vec![CloneLane::Agent]);
+        assert!(!agent_host.admits(CloneLane::Kvm));
+        assert_eq!(agent_host.cap(budget), 6);
+        // Only the exact string "0" opts out.
+        for value in ["", "false", "00", "no"] {
+            let pairs: &'static [(&'static str, &'static str)] =
+                Box::leak(vec![("CARRICK_KVM_CLONES", value)].into_boxed_slice());
+            assert!(
+                Lanes::select(true, true, env(pairs)).unwrap().kvm,
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn agents_need_a_standing_controller_on_an_agent_site() {
+        assert_eq!(
+            Lanes::select(false, true, env(&[])).unwrap().list(),
+            vec![CloneLane::Kvm]
+        );
+        assert_eq!(
+            Lanes::select(true, false, env(&[])).unwrap().list(),
+            vec![CloneLane::Kvm]
+        );
+    }
+
+    #[test]
+    fn a_controller_with_no_lane_left_refuses_to_start() {
+        for (serves_agents, standing, pairs) in [
+            (
+                true,
+                true,
+                &[("CARRICK_KVM_CLONES", "0"), ("CARRICK_AGENT_CLONES", "0")][..],
+            ),
+            // Willow (no agent site) or the pilot with KVM switched off.
+            (false, true, &[("CARRICK_KVM_CLONES", "0")][..]),
+            (true, false, &[("CARRICK_KVM_CLONES", "0")][..]),
+        ] {
+            let pairs: &'static [(&'static str, &'static str)] =
+                Box::leak(pairs.to_vec().into_boxed_slice());
+            assert!(matches!(
+                Lanes::select(serves_agents, standing, env(pairs)),
+                Err(ScalerError::Guard("no clone lane is enabled"))
+            ));
+        }
     }
 }
