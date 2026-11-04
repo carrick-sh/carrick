@@ -487,7 +487,10 @@ The file is owner-only, like the ledger.
 A missing VM with a `Cloning` row and no recorded task is closed only after
 successful queries show no source-template `qmclone` task since reservation,
 no VM config, no volume on any listed node storage, and no runner registration
-or ledger assignment. The failure history retains the reason. A source task
+or ledger assignment on two consecutive reconciliation passes at least 60
+seconds apart. The ledger records the first complete observation; any
+conflicting evidence or failed query clears it. Two immediate passes do not
+close the row. The failure history retains the reason. A source task
 whose destination cannot be established, a leftover volume, or incomplete
 evidence quarantines that row and retains its reservation. Other rows can
 still be reconciled and admitted within the remaining capacity.

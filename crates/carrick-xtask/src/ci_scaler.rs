@@ -195,6 +195,9 @@ pub struct Record {
     /// Current recovery verdict, separate from the retained failure history.
     #[serde(default)]
     pub quarantined: bool,
+    /// First complete absence observation; a second pass must be one poll later.
+    #[serde(default)]
+    pub clone_absent_since: Option<u64>,
     /// The true run/attempt/job a re-vetted hook request named; the
     /// reservation `key` remains demand provenance.
     #[serde(default)]
@@ -310,6 +313,7 @@ impl Ledger {
             ip: None,
             failure: None,
             quarantined: false,
+            clone_absent_since: None,
             assigned_key: None,
             approved: false,
             mints: Vec::new(),
