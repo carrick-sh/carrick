@@ -1088,6 +1088,83 @@ file for the template's Python (3.13, x86_64) and rebuild the agent template.
 The test `agent_template_prebuilds_the_hash_locked_codex_sdk_the_driver_uses`
 ties the builder, the lock file and the driver together.
 
+### Daybreak Blue after a provider access refusal (#1584)
+
+Dispatch treats the specific “approved for Daybreak Blue” / “not authenticated
+with one of your authorized hardware keys” refusal as a **provider-filter
+event**, not a worker failure. It reads terminal assistant/provider evidence,
+not tool output; a completed `done` contract is never replaced by a quoted
+refusal. The existing harvest retires the worker and retains its changes and
+commits in the checkpoint before another worker is admitted.
+
+The server then invokes the same brief once on Codex with
+`gpt-daybreak-blue-latest`. This consumes an ordinary worker admission and a
+fresh capacity report, with the existing time, quota and harvest limits. There
+is no unbounded retry and no weaker-backend fallback. A second access refusal
+ends Blocked. The outcome's server-owned Provider filter records explain the
+switch and any remaining authentication blocker, independently of the worker's
+claims. An unavailable catalog or exhausted budget leaves the checkpoint for
+a later round.
+
+An authorized owner's trigger may include the exact standalone line
+`Daybreak: allowed` to select that model on the first worker. Quoted lines do
+not count. The server still applies the round's ordinary admission checks.
+This is for defensive work on the owner's repository.
+
+The pinned agy-director launcher already implements OpenAI's
+[app-server protocol](https://help.openai.com/en/articles/20001607-using-daybreak-in-codex-cli)
+(runtime 0.163.0+): `--daybreak` selects `cyberAccessProgram: "daybreakBlue"`
+on every `turn/start`; other Codex turns explicitly select `"standard"`.
+It initializes with `experimentalApi`. Dispatch retains the live `models`
+output's `daybreak` tags (derived from `model/list`'s
+`availableAccessPrograms.cyber`) and admits the default Blue model only when
+that tag is present. A model ID alone is insufficient. The worker receives
+`CODEX_MODELS` and the admitted Blue model as `CODEX_DAYBREAK_MODELS`, so the
+existing launcher resolves it without a second app-server on its home.
+Sol 6.1's presence alone does not establish Blue support.
+
+#### Authentication on a dispatch clone
+
+The workflow passes repository secret `CODEX_AUTH_JSON` to `agent-runner auth`,
+which writes the selected worker's private `.codex/auth.json`. The existing
+owner secret sync supplies that secret from the owner's Mac; the template does
+not authenticate a user or contain a physical security key. The #1584 clone's
+credential structure was `auth_mode: chatgpt` with access, ID and refresh
+tokens, not an API key. No credential values were recorded or moved.
+
+[OpenAI's troubleshooting guidance](https://help.openai.com/en/articles/20001259-troubleshooting-openai-daybreak)
+requires the approved account/workspace, supported client and enabled access;
+individual access also requires Advanced Account Security and a qualifying
+physical FIDO2 key. The public guidance does **not** establish that exporting
+an OAuth session preserves hardware-key authentication assurance on another
+machine. A catalog listing proves model/program availability, not successful
+authentication for a turn.
+
+The remaining owner verification is a fresh dispatch with the exact line
+`Daybreak: allowed`, using the existing secret first. No credential change is
+known to be necessary until an actual Blue turn tests it. Record the selected
+model/program and result without tokens. The current worker already owns an
+app-server home; do not start a second app-server on it for this check.
+
+If that Blue turn still reports the hardware-key refusal, the owner must:
+
+1. Check eligibility at `chatgpt.com/cyber` and Daybreak access in the intended
+   workspace. Resolve any account-security or verification requirement shown.
+2. Sign in to Codex using that approved account/workspace and the registered
+   physical hardware key, following the authentication method in the approval.
+   Refresh `CODEX_AUTH_JSON` through the existing owner-managed secret sync;
+   workers must never copy credentials or enroll a key themselves.
+3. Verify another fresh clone turn. Refreshing the secret alone is not proof.
+4. If the newly authenticated exported session is still refused, contact
+   OpenAI Support with the exact error, timestamp, client version, model,
+   sign-in method and workspace identifier, asking whether this headless clone
+   flow supports hardware-key assurance. Do not send credentials. No local
+   dispatch flag can supply an authentication guarantee the provider rejects.
+
+A live Daybreak turn was not established by the portable witnesses. Until the
+fresh clone check succeeds, exported-session hardware-key assurance remains
+unproven; the protocol change alone does not establish it.
+
 ### Copilot: a strong-tier peer backend billed to the owner (#1474)
 
 Copilot is a third worker backend. Owner decisions (#231): it bills the owner
