@@ -1,0 +1,230 @@
+--- a/.github/workflows/signed-gate.yml
++++ b/.github/workflows/signed-gate.yml
+@@ -29,6 +29,11 @@
+       sha: ${{ steps.request.outputs.sha }}
+       base: ${{ steps.request.outputs.base }}
+       main: ${{ steps.request.outputs.main }}
++      request-id: ${{ steps.request-upload.outputs.artifact-id }}
++      request-digest: ${{ steps.request-upload.outputs.artifact-digest }}
++      fixture-run: ${{ steps.fixture.outputs.run }}
++      fixture-id: ${{ steps.fixture.outputs.id }}
++      fixture-digest: ${{ steps.fixture.outputs.digest }}
+     steps:
+       - name: Refuse unauthorized actors before checking out code
+         env:
+@@ -38,7 +43,7 @@
+           # Owner only: the carrick-workers App is agent-held (#654).
+           case "$ACTOR" in tjfontaine) ;; *) exit 1 ;; esac
+           case "$TRIGGERING_ACTOR" in tjfontaine) ;; *) exit 1 ;; esac
+-      - uses: actions/checkout@v4
++      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+         with:
+           ref: main
+           persist-credentials: false
+@@ -49,7 +54,30 @@
+         run: >-
+           cargo run --locked -p carrick-xtask -- signed-gate prepare
+           --event "$GITHUB_EVENT_PATH" --output "$RUNNER_TEMP/request"
+-      - uses: actions/upload-artifact@v4
++      - name: Select successful PR-scoped fixture producer for the admitted head
++        id: fixture
++        env:
++          GH_TOKEN: ${{ github.token }}
++          SHA: ${{ steps.request.outputs.sha }}
++          MAIN: ${{ steps.request.outputs.main }}
++        run: |
++          set -euo pipefail
++          workflow=signed-fixtures-pr.yml
++          event=pull_request
++          job=fixtures
++          if [ "$MAIN" = true ]; then
++            workflow=kernel-runtime.yml
++            event=push
++            job="Linux ARM64 · exact-SHA signed fixtures"
++          fi
++          run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/runs?event=$event&head_sha=$SHA&status=completed&per_page=100" | jq -r --arg sha "$SHA" --arg event "$event" '.workflow_runs | map(select(.head_sha == $sha and .event == $event)) | max_by(.id).id')
++          [[ "$run" =~ ^[1-9][0-9]*$ ]]
++          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run/jobs?filter=latest&per_page=100" | jq -e --arg name "$job" '.jobs | map(select(.name == $name and .conclusion == "success")) | length == 1' > /dev/null
++          artifacts=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run/artifacts?per_page=100")
++          row=$(jq -cer --arg name "signed-fixtures-$SHA" '[.artifacts[] | select(.name == $name and .expired == false)] | if length == 1 then .[0] else error("ambiguous or missing fixtures") end' <<< "$artifacts")
++          printf 'run=%s\nid=%s\ndigest=%s\n' "$run" "$(jq -r .id <<< "$row")" "$(jq -r .digest <<< "$row")" >> "$GITHUB_OUTPUT"
++      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
++        id: request-upload
+         with:
+           name: signed-request-${{ github.run_attempt }}
+           path: ${{ runner.temp }}/request/
+@@ -66,30 +94,55 @@
+     concurrency:
+       group: signed-gate-${{ needs.authorize.outputs.sha }}
+       cancel-in-progress: false
++    outputs:
++      result-id: ${{ steps.result-upload.outputs.artifact-id }}
++      result-digest: ${{ steps.result-upload.outputs.artifact-digest }}
+     permissions:
+       contents: read
+       actions: read
+     steps:
+-      - uses: actions/checkout@v4
++      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+         with:
+           ref: main
+           persist-credentials: false
+-      - uses: actions/download-artifact@v4
+-        with:
+-          name: signed-request-${{ github.run_attempt }}
+-          path: ${{ runner.temp }}/request
++      - name: Fetch request by trusted immutable binding
++        env:
++          GH_TOKEN: ${{ github.token }}
++          ARTIFACT_ID: ${{ needs.authorize.outputs.request-id }}
++          DIGEST: sha256:${{ needs.authorize.outputs.request-digest }}
++        run: >-
++          cargo run --locked -p carrick-xtask -- signed-gate fetch-artifact
++          --artifact-id "$ARTIFACT_ID" --run-id "$GITHUB_RUN_ID" --digest "$DIGEST"
++          --output "$RUNNER_TEMP/request"
++      - name: Fetch isolated fixture producer archive
++        env:
++          GH_TOKEN: ${{ github.token }}
++          ARTIFACT_ID: ${{ needs.authorize.outputs.fixture-id }}
++          PRODUCING_RUN: ${{ needs.authorize.outputs.fixture-run }}
++          DIGEST: ${{ needs.authorize.outputs.fixture-digest }}
++        run: >-
++          cargo run --locked -p carrick-xtask -- signed-gate fetch-artifact
++          --artifact-id "$ARTIFACT_ID" --run-id "$PRODUCING_RUN" --digest "$DIGEST"
++          --output "$RUNNER_TEMP/fixtures"
++      - name: Select unique fixture archive
++        id: bundle
++        shell: bash
++        run: |
++          shopt -s nullglob
++          bundles=("$RUNNER_TEMP"/fixtures/*.tar.gz)
++          test "${#bundles[@]}" -eq 1
++          printf 'path=%s\n' "${bundles[0]}" >> "$GITHUB_OUTPUT"
+       - name: Execute approved SHA in a fresh detached worktree
+         env:
+           CARRICK_RUN_ID: signed-gate-${{ github.run_id }}-${{ github.run_attempt }}
+-          # Local immutable bundle path, configured separately on each Mac.
+-          # No API credential is passed to candidate code.
+-          CARRICK_SIGNED_FIXTURE_BUNDLE: ${{ vars.CARRICK_SIGNED_FIXTURE_BUNDLE }}
++          CARRICK_SIGNED_FIXTURE_BUNDLE: ${{ steps.bundle.outputs.path }}
+         run: >-
+           cargo run --locked -p carrick-xtask -- signed-gate execute
+           --request "$RUNNER_TEMP/request/request.json" --output "$RUNNER_TEMP/signed-result"
+       - name: Upload receipt, artifact identity and step logs
++        id: result-upload
+         if: always()
+-        uses: actions/upload-artifact@v4
++        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+         with:
+           name: signed-result-${{ github.run_attempt }}
+           path: ${{ runner.temp }}/signed-result/
+@@ -107,20 +160,29 @@
+       pull-requests: write
+       statuses: write
+     steps:
+-      - uses: actions/checkout@v4
++      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+         with:
+           ref: main
+           persist-credentials: false
+-      - uses: actions/download-artifact@v4
+-        with:
+-          name: signed-request-${{ github.run_attempt }}
+-          path: ${{ runner.temp }}/request
+-      - name: Download execution evidence when available
+-        continue-on-error: true
+-        uses: actions/download-artifact@v4
+-        with:
+-          name: signed-result-${{ github.run_attempt }}
+-          path: ${{ runner.temp }}/signed-result
++      - name: Fetch request by trusted immutable binding
++        env:
++          GH_TOKEN: ${{ github.token }}
++          ARTIFACT_ID: ${{ needs.authorize.outputs.request-id }}
++          DIGEST: sha256:${{ needs.authorize.outputs.request-digest }}
++        run: >-
++          cargo run --locked -p carrick-xtask -- signed-gate fetch-artifact
++          --artifact-id "$ARTIFACT_ID" --run-id "$GITHUB_RUN_ID" --digest "$DIGEST"
++          --output "$RUNNER_TEMP/request"
++      - name: Fetch only the gate upload step's immutable evidence
++        if: needs.gate.outputs.result-id != ''
++        env:
++          GH_TOKEN: ${{ github.token }}
++          ARTIFACT_ID: ${{ needs.gate.outputs.result-id }}
++          DIGEST: sha256:${{ needs.gate.outputs.result-digest }}
++        run: >-
++          cargo run --locked -p carrick-xtask -- signed-gate fetch-artifact
++          --artifact-id "$ARTIFACT_ID" --run-id "$GITHUB_RUN_ID" --digest "$DIGEST"
++          --output "$RUNNER_TEMP/signed-result"
+       - name: Compare typed receipts and publish verdict
+         id: verdict
+         env:
+@@ -134,7 +196,7 @@
+             --run-url "$RUN_URL" --execution-result "$EXECUTION_RESULT"
+       - name: Publish admitted main baseline
+         if: needs.authorize.outputs.main == 'true' && steps.verdict.outcome == 'success'
+-        uses: actions/upload-artifact@v4
++        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+         with:
+           name: signed-baseline-${{ needs.authorize.outputs.sha }}-${{ github.run_attempt }}
+           path: ${{ runner.temp }}/signed-result/candidate.json
+@@ -142,7 +204,7 @@
+           retention-days: 90
+       - name: Upload comparison and publication log
+         if: always()
+-        uses: actions/upload-artifact@v4
++        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+         with:
+           name: signed-verdict-${{ github.run_attempt }}
+           path: |
+--- /dev/null
++++ b/.github/workflows/signed-fixtures-pr.yml
+@@ -0,0 +1,48 @@
++name: PR signed fixtures
++on:
++  pull_request:
++    types: [opened, synchronize, reopened]
++permissions:
++  contents: read
++jobs:
++  fixtures:
++    runs-on: ubuntu-24.04-arm
++    timeout-minutes: 60
++    env:
++      FIXTURE_SHA: ${{ github.event.pull_request.head.sha }}
++      CARRICK_SCCACHE: "0"
++    steps:
++      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
++        with:
++          ref: ${{ github.event.pull_request.head.sha }}
++          persist-credentials: false
++      - name: Verify native ARM Linux publisher
++        run: |
++          test "$(uname -s)" = Linux
++          test "$(uname -m)" = aarch64
++
++      - name: Test fixture relay transport and fallback
++        run: scripts/ci/test-fixture-relay.sh
++
++      - name: Install pinned Rust toolchain and guest targets
++        run: rustup show active-toolchain
++
++      - name: Install just
++        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0
++        with:
++          tool: just
++
++      - name: Install per-user compiler cache
++        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
++        with:
++          tool: sccache@0.18.0
++
++      - name: Publish exact-SHA fixture bundle
++        run: just fixtures-publish "$FIXTURE_SHA"
++
++      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
++        with:
++          name: signed-fixtures-${{ github.event.pull_request.head.sha }}
++          path: target/fixtures/published/${{ github.event.pull_request.head.sha }}/*.tar.gz
++          if-no-files-found: error
++          compression-level: 0

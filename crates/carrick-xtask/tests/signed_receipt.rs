@@ -831,3 +831,141 @@ fn historical_fixture_evidence_does_not_invent_hash_work_status() {
         "not_recorded"
     );
 }
+
+#[test]
+fn artifact_transport_binds_run_id_and_digest() {
+    use carrick_xtask::ci_scaler::RunId;
+    use carrick_xtask::signed_gate::{ArtifactId, verify_artifact_binding};
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("artifact.zip");
+    std::fs::write(&archive, b"immutable archive").unwrap();
+    let digest = format!("sha256:{:x}", Sha256::digest(b"immutable archive"));
+    let metadata = serde_json::json!({"id": 42, "workflow_run": {"id": 123}, "expired": false, "digest": digest});
+    verify_artifact_binding(&metadata, ArtifactId(42), RunId(123), &digest, &archive).unwrap();
+    assert!(
+        verify_artifact_binding(&metadata, ArtifactId(42), RunId(124), &digest, &archive)
+            .unwrap_err()
+            .to_string()
+            .contains("run mismatch")
+    );
+    assert!(
+        verify_artifact_binding(&metadata, ArtifactId(43), RunId(123), &digest, &archive).is_err()
+    );
+    assert!(
+        verify_artifact_binding(
+            &metadata,
+            ArtifactId(42),
+            RunId(123),
+            &format!("sha256:{}", "0".repeat(64)),
+            &archive
+        )
+        .is_err()
+    );
+    std::fs::write(&archive, b"substituted archive").unwrap();
+    assert!(
+        verify_artifact_binding(&metadata, ArtifactId(42), RunId(123), &digest, &archive)
+            .unwrap_err()
+            .to_string()
+            .contains("downloaded artifact digest mismatch")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn serial_host_fetch_artifact_cli_refuses_substitution_before_extracting() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let archive = dir.path().join("archive.zip");
+    // ZIP containing one payload file, made by the real zip tool.
+    std::fs::write(dir.path().join("proof"), b"verified payload").unwrap();
+    assert!(
+        Command::new("zip")
+            .current_dir(dir.path())
+            .args(["-q", "archive.zip", "proof"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(std::fs::read(&archive).unwrap())
+    );
+    std::fs::write(
+        dir.path().join("metadata.json"),
+        serde_json::to_vec(
+            &json!({"id":42,"workflow_run":{"id":123},"expired":false,"digest":digest}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let gh = bin.join("gh");
+    std::fs::write(&gh, "#!/bin/sh\nfor endpoint do :; done\ncase \"$endpoint\" in\n repos/carrick-sh/carrick/actions/artifacts/42) cat \"$TEST_DATA/metadata.json\";;\n repos/carrick-sh/carrick/actions/artifacts/42/zip) cat \"$TEST_DATA/archive.zip\";;\n *) exit 19;;\nesac\n").unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for (label, run, expected_digest, accepted) in [
+        ("wrong-run", "124", digest.clone(), false),
+        (
+            "wrong-digest",
+            "123",
+            format!("sha256:{}", "0".repeat(64)),
+            false,
+        ),
+        ("right", "123", digest.clone(), true),
+    ] {
+        let output_dir = dir.path().join(label);
+        let result = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .args([
+                "signed-gate",
+                "fetch-artifact",
+                "--artifact-id",
+                "42",
+                "--run-id",
+                run,
+                "--digest",
+                &expected_digest,
+                "--output",
+            ])
+            .arg(&output_dir)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("TEST_DATA", dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            result.status.success(),
+            accepted,
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(output_dir.join("proof").exists(), accepted);
+    }
+    std::fs::write(&archive, b"substitution").unwrap();
+    let output_dir = dir.path().join("corrupt");
+    let result = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .args([
+            "signed-gate",
+            "fetch-artifact",
+            "--artifact-id",
+            "42",
+            "--run-id",
+            "123",
+            "--digest",
+            &digest,
+            "--output",
+        ])
+        .arg(&output_dir)
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("TEST_DATA", dir.path())
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(!output_dir.exists());
+}

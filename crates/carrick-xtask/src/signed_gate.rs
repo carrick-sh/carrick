@@ -4,7 +4,7 @@ use crate::accept::{
     parse_cleanup_count,
 };
 use crate::ci_receipt::{ReceiptError, load};
-use crate::ci_scaler::REPOSITORY;
+use crate::ci_scaler::{REPOSITORY, RunId};
 use crate::command::run_checked;
 use crate::host_lease::{HostLease, HostLeaseMode};
 use crate::signed_receipt;
@@ -48,9 +48,20 @@ pub enum SignedGateAction {
         request: PathBuf,
         #[arg(long)]
         output: PathBuf,
-        /// Same-run exact-SHA archive; admission also checks fixture input identity.
+        /// Exact-SHA archive; admission also checks fixture input identity.
         #[arg(long, env = "CARRICK_SIGNED_FIXTURE_BUNDLE")]
         fixture_bundle: PathBuf,
+    },
+    /// Download an immutable artifact, bound to a producing run and archive digest.
+    FetchArtifact {
+        #[arg(long)]
+        artifact_id: u64,
+        #[arg(long)]
+        run_id: u64,
+        #[arg(long)]
+        digest: String,
+        #[arg(long)]
+        output: PathBuf,
     },
     /// Compare on a hosted runner and publish a PR comment and commit status.
     Publish {
@@ -420,7 +431,89 @@ fn logged(command: &mut Command, lease: &HostLease, log: &Path) -> Result<bool, 
         .map_err(|e| fail(e.to_string()))?;
     Ok(status.success())
 }
-/// Admit the same-run fixture archive before any installation or guest work.
+/// Immutable GitHub artifact identity, distinct from its producing workflow run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtifactId(pub u64);
+
+/// Admission uses immutable API identity, never an artifact name. The expected
+/// binding must come from a trusted job, not from the downloaded artifact.
+pub fn verify_artifact_binding(
+    metadata: &Value,
+    artifact_id: ArtifactId,
+    run_id: RunId,
+    digest: &str,
+    archive: &Path,
+) -> Result<(), ReceiptError> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    if run_id.0 == 0
+        || artifact_id.0 == 0
+        || metadata["id"].as_u64() != Some(artifact_id.0)
+        || metadata["workflow_run"]["id"].as_u64() != Some(run_id.0)
+        || metadata["expired"] != false
+    {
+        return Err(fail("artifact ID or producing run mismatch"));
+    }
+    let hex = digest.strip_prefix("sha256:").unwrap_or_default();
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        || metadata["digest"] != digest
+    {
+        return Err(fail("artifact digest mismatch"));
+    }
+    let mut file = fs::File::open(archive).map_err(|e| fail(e.to_string()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        let count = file.read(&mut buffer).map_err(|e| fail(e.to_string()))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    if format!("{:x}", hasher.finalize()) != hex {
+        return Err(fail("downloaded artifact digest mismatch"));
+    }
+    Ok(())
+}
+
+fn fetch_artifact(
+    artifact_id: ArtifactId,
+    run_id: RunId,
+    digest: &str,
+    output: &Path,
+) -> Result<(), ReceiptError> {
+    let endpoint = format!("repos/{REPOSITORY}/actions/artifacts/{}", artifact_id.0);
+    let metadata = api(&endpoint)?;
+    let temp = tempfile::tempdir().map_err(|e| fail(e.to_string()))?;
+    let archive = temp.path().join("artifact.zip");
+    let file = fs::File::create(&archive).map_err(|e| fail(e.to_string()))?;
+    let status = Command::new("gh")
+        .args(["api", &format!("{endpoint}/zip")])
+        .stdout(file)
+        .status()
+        .map_err(|e| fail(e.to_string()))?;
+    if !status.success() {
+        return Err(fail("artifact download failed"));
+    }
+    verify_artifact_binding(&metadata, artifact_id, run_id, digest, &archive)?;
+    fs::create_dir_all(output).map_err(|e| fail(e.to_string()))?;
+    checked(
+        "unzip",
+        &[
+            "-q",
+            &archive.to_string_lossy(),
+            "-d",
+            &output.to_string_lossy(),
+        ],
+        None,
+    )?;
+    Ok(())
+}
+
+/// Admit the exact-SHA fixture archive before any installation or guest work.
 /// General fixture reuse permits equal inputs across commits; this Actions
 /// lane additionally requires the authorized publisher's exact commit.
 pub fn verify_fixture_artifact(
@@ -706,6 +799,12 @@ fn publish(
 pub fn run(root: &Path, args: SignedGateArgs) -> Result<(), ReceiptError> {
     match args.action {
         SignedGateAction::Prepare { event, output } => prepare(&event, &output),
+        SignedGateAction::FetchArtifact {
+            artifact_id,
+            run_id,
+            digest,
+            output,
+        } => fetch_artifact(ArtifactId(artifact_id), RunId(run_id), &digest, &output),
         SignedGateAction::Execute {
             request,
             output,
