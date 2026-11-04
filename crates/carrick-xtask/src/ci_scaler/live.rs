@@ -2248,16 +2248,15 @@ pub(super) fn controller(
     let pve = Pve::local()?;
     let _lock = super::acquire_controller_lock(dir)?;
     let inventory = pve.inventory()?;
-    let agent_standing = pve.site.serves_agents() && matches!(admission, Admission::Standing);
-    let agents = agent_standing && std::env::var("CARRICK_AGENT_CLONES").as_deref() != Ok("0");
-    let lanes = if agents {
-        vec![CloneLane::Kvm, CloneLane::Agent]
-    } else {
-        vec![CloneLane::Kvm]
-    };
+    let enabled = Lanes::select(
+        pve.site.serves_agents(),
+        matches!(admission, Admission::Standing),
+        |name| std::env::var(name).ok(),
+    )?;
+    let agents = enabled.agents;
     verify_startup(
         pve.site,
-        &lanes,
+        &enabled.list(),
         &inventory,
         |path| pve.request(PveCall::Get, path),
         |vm| pve.verify_vm_firewall(vm),
@@ -2348,7 +2347,11 @@ pub(super) fn controller(
             std::thread::sleep(POLL);
             continue;
         }
-        let demand = if matches!(admission, Admission::Standing) {
+        // A host with the KVM lane off never reads (or coalesces, which
+        // cancels superseded runs) KVM demand: the KVM host owns it.
+        let demand = if !enabled.kvm {
+            Ok(Vec::new())
+        } else if matches!(admission, Admission::Standing) {
             gh.coalesced_demand(&mut ledger, &path, &LABELS)
         } else {
             gh.demand(admission, &LABELS)
@@ -2356,10 +2359,12 @@ pub(super) fn controller(
         if let Err(error) = &demand {
             eprintln!("queued push coalescing failed: {error}");
         }
+        // Only enabled lanes count against the cap: rows a disabled lane
+        // still finishes after a restart don't block the lanes left on.
         let active = ledger
             .rows
             .iter()
-            .filter(|r| r.state != State::Destroyed)
+            .filter(|r| r.state != State::Destroyed && enabled.admits(r.lane))
             .count();
         // A failed provisioning worker freezes admission exactly as a failed
         // in-line provision did.
@@ -2379,12 +2384,7 @@ pub(super) fn controller(
             backoff.grow();
             admit_after = Instant::now() + backoff.delay();
         }
-        let cap = budget.of(CloneLane::Kvm)
-            + if agents {
-                budget.of(CloneLane::Agent)
-            } else {
-                0
-            };
+        let cap = enabled.cap(budget);
         if !frozen && active < cap && Instant::now() >= admit_after {
             // Admit until demand or the budget runs out; each worker boots
             // its clone while the next is reserved.
@@ -2398,7 +2398,7 @@ pub(super) fn controller(
                         dir,
                         &path,
                         (group, admission, demand.clone()),
-                        (budget, &provisioners),
+                        (budget, enabled, &provisioners),
                     )?
                 {
                     admitted += 1;
@@ -2474,17 +2474,11 @@ fn admit_one(
     dir: &Path,
     path: &Path,
     demand: (u64, &Admission, Vec<JobKey>),
-    (budget, provisioners): (CloneBudget, &Provisioners),
+    (budget, enabled, provisioners): (CloneBudget, Lanes, &Provisioners),
 ) -> Result<bool, ScalerError> {
     let (group, original_admission, kvm_demand) = demand;
-    let agents = pve.site.serves_agents()
-        && matches!(original_admission, Admission::Standing)
-        && std::env::var("CARRICK_AGENT_CLONES").as_deref() != Ok("0");
     let mut selected = None;
-    for lane in [CloneLane::Kvm, CloneLane::Agent] {
-        if lane == CloneLane::Agent && !agents {
-            continue;
-        }
+    for lane in enabled.list() {
         let cap = budget.of(lane);
         if ledger
             .rows

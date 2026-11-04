@@ -87,7 +87,12 @@ DNS to the public resolver and NAT to the internet still work.
 
 The `kvm-tests-willow` job and its `willow-kvm` runner labels are served from
 Contabo; there is no separate workflow arm. Only one standing controller may
-serve those labels, so Willow's stays stopped. The lane runs when
+serve each label set, so Willow's stays stopped. Two hosts may split the
+lanes (#1590): KVM and agent jobs carry different labels, so a host started
+with `CARRICK_AGENT_CLONES=0` (KVM only) and another started with
+`CARRICK_KVM_CLONES=0` (agents only) never claim the same job. The KVM-off
+host reads no KVM demand, so it never cancels a superseded run the KVM host
+serves. Sharing one lane across hosts needs the per-job claim in #1597. The lane runs when
 `CARRICK_SELF_HOSTED_KVM=true`.
 
 ## Events and receipts
