@@ -3854,16 +3854,9 @@ fn layer_history_fork(
             }
             return Ok(history.base.clone());
         }
-        if git(
-            work,
-            &["merge-base", "--is-ancestor", &dispatch.base, admitted],
-        )
-        .is_err()
-        {
-            return Err(ScalerError::Guard(
-                "parent moved without a publication boundary for this child head; preserve the layer with a director rebase before dispatch",
-            ));
-        }
+        return Err(ScalerError::Guard(
+            "parent moved without a publication boundary for this child head; preserve the layer with a director rebase before dispatch",
+        ));
     }
     Ok(git(work, &["merge-base", admitted, &dispatch.base])?
         .trim()
@@ -5878,6 +5871,36 @@ fn rebase_kept_commits(
         range_diff,
     }))
 }
+/// Authenticate the old layer boundary and preserve the trusted published
+/// prefix. The same check serves adopted and owned parent rewrites. Commits
+/// above the returned tip remain this round's work and keep its fixing scope.
+fn preserve_rebased_layer(
+    work: &Path,
+    dispatch: &Dispatch,
+    admitted: &str,
+    adopted_pr: Option<u64>,
+) -> Result<String, ScalerError> {
+    let fork = layer_history_fork(work, dispatch, admitted)?;
+    let kept = match rebase_kept_commits(work, admitted, &dispatch.base, &fork)? {
+        Ok(kept) => kept,
+        Err(lost) => {
+            let reason = format!("the rebase {lost}. Nothing was pushed");
+            return Err(match adopted_pr {
+                Some(number) => adopted_publication_blocked(number, &reason)?,
+                None => ScalerError::Usage(reason),
+            });
+        }
+    };
+    Applied::record(|a| {
+        a.rebased_onto = Some(dispatch.base.clone());
+        a.rebase_parent = dispatch.parent_branch.clone();
+        a.rebase_tip = Some(kept.director_tip.clone());
+        a.rebase_changed = kept.changed;
+        a.rebase_range_diff = Some(kept.range_diff);
+    })?;
+    Ok(kept.director_tip)
+}
+
 fn adopted_publication_blocked(number: u64, why: &str) -> Result<ScalerError, ScalerError> {
     let reason = format!("Adopted PR #{number}: {why}");
     Applied::record(|a| a.adoption_blocked = Some(reason.clone()))?;
@@ -6140,25 +6163,12 @@ fn publish_commits(
                         ),
                     )?);
                 }
-                let fork = layer_history_fork(&work, dispatch, admitted)?;
-                match rebase_kept_commits(&work, admitted, &dispatch.base, &fork)? {
-                    Err(lost) => {
-                        return Err(adopted_publication_blocked(
-                            number,
-                            &format!("the rebase {lost}. Nothing was pushed"),
-                        )?);
-                    }
-                    Ok(kept) => {
-                        Applied::record(|a| {
-                            a.rebased_onto = Some(dispatch.base.clone());
-                            a.rebase_parent = dispatch.parent_branch.clone();
-                            a.rebase_tip = Some(kept.director_tip.clone());
-                            a.rebase_changed = kept.changed;
-                            a.rebase_range_diff = Some(kept.range_diff);
-                        })?;
-                        rebased_director_tip = Some(kept.director_tip);
-                    }
-                }
+                rebased_director_tip = Some(preserve_rebased_layer(
+                    &work,
+                    dispatch,
+                    admitted,
+                    Some(number),
+                )?);
             }
             // Fast-forward only, also over this run's own earlier pushes.
             if let Some(pushed) = &lease.pushed
@@ -6181,6 +6191,31 @@ fn publish_commits(
             .map_err(|_| {
                 ScalerError::Guard("worker must rebase onto admitted main before publication")
             })?;
+        }
+        // Owned fixing authority covers this round's work, but a parent
+        // rewrite must not erase the child's already published history.
+        // With an unchanged parent, owned rounds can still amend their work.
+        if adopted.is_none()
+            && dispatch.parent_branch.is_some()
+            && !receipt.expected_tip.is_empty()
+            && git(
+                &work,
+                &["merge-base", "--is-ancestor", &receipt.expected_tip, "HEAD"],
+            )
+            .is_err()
+        {
+            // Only an authenticated unchanged parent permits ordinary owned
+            // amendments. A guessed merge-base cannot distinguish a rollback
+            // of the parent from an unchanged parent.
+            let fork = layer_history_fork(&work, dispatch, &receipt.expected_tip)?;
+            if fork != dispatch.base {
+                rebased_director_tip = Some(preserve_rebased_layer(
+                    &work,
+                    dispatch,
+                    &receipt.expected_tip,
+                    None,
+                )?);
+            }
         }
         if dispatch.parent_branch.is_some() {
             git(
@@ -6213,9 +6248,12 @@ fn publish_commits(
             Some((_, admitted)) => rebased_director_tip
                 .clone()
                 .unwrap_or_else(|| admitted.to_owned()),
-            None => git(&work, &["merge-base", &live_main, "HEAD"])?
-                .trim()
-                .to_owned(),
+            None => match &rebased_director_tip {
+                Some(tip) => tip.clone(),
+                None => git(&work, &["merge-base", &live_main, "HEAD"])?
+                    .trim()
+                    .to_owned(),
+            },
         };
         *preserve = Some(base.clone());
         // Main and the branch tip admitted before this run are trusted history.
@@ -6431,7 +6469,7 @@ fn publish_commits(
                 a.published_checkpoint = receipt.checkpointed;
                 // An adopted round records its own consented rebase above;
                 // the owned-branch rebase detection does not apply to it.
-                if adopted.is_none() {
+                if adopted.is_none() && rebased_director_tip.is_none() {
                     a.rebased_onto = rebased_onto;
                     a.rebase_parent = dispatch.parent_branch.clone();
                 }
@@ -8060,6 +8098,34 @@ mod tests {
         publication_fixture("stack-owned-retarget");
     }
     #[test]
+    fn stacked_owned_can_fix_its_work_on_unchanged_parent() {
+        publication_fixture("stack-owned-amend");
+    }
+    #[test]
+    fn stacked_owned_rewrite_preserves_published_history() {
+        publication_fixture("stack-owned-rewrite");
+    }
+    #[test]
+    fn stacked_owned_rewrite_refuses_dropped_history() {
+        publication_fixture("stack-owned-rewrite-drop");
+    }
+    #[test]
+    fn stacked_owned_rewrite_refuses_missing_boundary() {
+        publication_fixture("stack-owned-rewrite-unrecorded");
+    }
+    #[test]
+    fn stacked_owned_rewrite_refuses_unrecorded_parent_rollback() {
+        publication_fixture("stack-owned-rewrite-rollback");
+    }
+    #[test]
+    fn stacked_owned_rewrite_refuses_wrong_child_boundary() {
+        publication_fixture("stack-owned-rewrite-wrong-head");
+    }
+    #[test]
+    fn stacked_owned_rewrite_refuses_parent_absorbing_then_dropping_child() {
+        publication_fixture("stack-owned-rewrite-absorbed");
+    }
+    #[test]
     fn stacked_adopted_layer_three_pushes_only_its_layer() {
         publication_fixture("adopted-stack");
     }
@@ -8449,6 +8515,8 @@ fi
             // Parent has its own closing scope; only this layer is charged.
             let main = dispatch.base.clone();
             git(&work, &["checkout", "-b", "work/parent-one", &main]).unwrap();
+            std::fs::write(work.join("parent.txt"), "original parent patch\n").unwrap();
+            git(&work, &["add", "parent.txt"]).unwrap();
             git(
                 &work,
                 &[
@@ -8464,6 +8532,8 @@ fi
                 .trim()
                 .to_owned();
             git(&work, &["checkout", "-B", &dispatch.branch]).unwrap();
+            std::fs::write(work.join("child.txt"), "published child bytes\n").unwrap();
+            git(&work, &["add", "child.txt"]).unwrap();
             git(
                 &work,
                 &["commit", "--allow-empty", "-m", "fix(ci): owned layer two"],
@@ -8555,9 +8625,162 @@ fi
                 LayerPublication {
                     head: receipt.head.clone(),
                     parent_branch: "work/parent-one".into(),
-                    base: parent
+                    base: parent.clone()
                 }
             );
+            if witness == "stack-owned-amend" {
+                let anchor = Applied::load().unwrap().layer.unwrap();
+                receipt.expected_tip = anchor.head.clone();
+                dispatch.layer_history = Some(anchor);
+                std::fs::remove_file(state.join("published-tip")).unwrap();
+                git(&work, &["reset", "--hard", &parent]).unwrap();
+                std::fs::write(work.join("child.txt"), "fixed child bytes\n").unwrap();
+                git(&work, &["add", "child.txt"]).unwrap();
+                git(&work, &["commit", "-m", "fix(ci): correct owned child"]).unwrap();
+                receipt.head = git(&work, &["rev-parse", "HEAD"]).unwrap().trim().into();
+                assert_eq!(
+                    publish(
+                        &work,
+                        &dispatch,
+                        &receipt,
+                        &contract,
+                        &report,
+                        "fixture-token",
+                        &mut agent_loop::RunCache::default()
+                    )
+                    .unwrap(),
+                    Some(800)
+                );
+                assert_eq!(
+                    regular_text(&work.join("child.txt")).unwrap(),
+                    "fixed child bytes\n"
+                );
+                return;
+            }
+            if witness.starts_with("stack-owned-rewrite") {
+                let anchor = Applied::load().unwrap().layer.unwrap();
+                let published = anchor.head.clone();
+                // A later round starts at the exact child publication, while
+                // the parent has rewritten its own patch after review.
+                let remote = outer.join("live-main.git");
+                if witness.ends_with("-absorbed") {
+                    git(
+                        &work,
+                        &[
+                            "--git-dir",
+                            remote.to_str().unwrap(),
+                            "fetch",
+                            work.to_str().unwrap(),
+                            &format!("+{}:refs/heads/work/parent-one", dispatch.branch),
+                        ],
+                    )
+                    .unwrap();
+                }
+                git(&work, &["checkout", "work/parent-one"]).unwrap();
+                std::fs::write(work.join("parent.txt"), "reviewed parent patch\n").unwrap();
+                git(&work, &["add", "parent.txt"]).unwrap();
+                git(&work, &["commit", "--amend", "--no-edit"]).unwrap();
+                if witness.ends_with("-rollback") {
+                    git(&work, &["reset", "--hard", &dispatch.main]).unwrap();
+                }
+                let new_parent = git(&work, &["rev-parse", "HEAD"])
+                    .unwrap()
+                    .trim()
+                    .to_owned();
+                git(
+                    &work,
+                    &[
+                        "--git-dir",
+                        remote.to_str().unwrap(),
+                        "fetch",
+                        work.to_str().unwrap(),
+                        "+work/parent-one:refs/heads/work/parent-one",
+                    ],
+                )
+                .unwrap();
+                git(&work, &["checkout", &dispatch.branch]).unwrap();
+                git(&work, &["rebase", "--onto", &new_parent, &parent]).unwrap();
+                if witness.ends_with("-drop") || witness.ends_with("-absorbed") {
+                    git(&work, &["reset", "--hard", &new_parent]).unwrap();
+                }
+                git(
+                    &work,
+                    &[
+                        "commit",
+                        "--allow-empty",
+                        "-m",
+                        "fix(ci): continue owned child",
+                    ],
+                )
+                .unwrap();
+                dispatch.base = new_parent.clone();
+                dispatch.layer_history = (!witness.ends_with("-unrecorded")
+                    && !witness.ends_with("-rollback"))
+                .then_some(anchor);
+                if witness.ends_with("-wrong-head") {
+                    dispatch.layer_history.as_mut().unwrap().head = tip.clone();
+                }
+                receipt.base = new_parent.clone();
+                receipt.expected_tip = published.clone();
+                receipt.head = git(&work, &["rev-parse", "HEAD"]).unwrap().trim().into();
+                std::fs::remove_file(state.join("published-tip")).unwrap();
+                std::fs::write(outer.join("push.args"), "").unwrap();
+                std::fs::write(
+                    outer.join("parent-one.json"),
+                    json!([stack_pr("work/parent-one", "main", &new_parent)]).to_string(),
+                )
+                .unwrap();
+                let result = publish(
+                    &work,
+                    &dispatch,
+                    &receipt,
+                    &contract,
+                    &report,
+                    "fixture-token",
+                    &mut agent_loop::RunCache::default(),
+                );
+                if witness != "stack-owned-rewrite" {
+                    let error = result.unwrap_err().to_string();
+                    let expected =
+                        if witness.ends_with("-unrecorded") || witness.ends_with("-rollback") {
+                            "without a publication boundary"
+                        } else if witness.ends_with("-wrong-head") {
+                            "invalid historical layer publication"
+                        } else {
+                            "dropped or reordered"
+                        };
+                    assert!(error.contains(expected), "{error}");
+                    assert!(regular_text(&outer.join("push.args")).unwrap().is_empty());
+                    return;
+                }
+                assert_eq!(result.unwrap(), Some(800));
+                let push = regular_text(&outer.join("push.args")).unwrap();
+                assert!(
+                    push.contains(&format!(
+                        "--force-with-lease=refs/heads/{}:{published}\n",
+                        dispatch.branch
+                    )),
+                    "{push}"
+                );
+                assert_eq!(
+                    push.lines()
+                        .filter(|l| l.starts_with("HEAD:"))
+                        .collect::<Vec<_>>(),
+                    [format!("HEAD:refs/heads/{}", dispatch.branch)]
+                );
+                assert!(git(&work, &["merge-base", "--is-ancestor", &parent, "HEAD"]).is_err());
+                assert_eq!(
+                    regular_text(&work.join("parent.txt")).unwrap(),
+                    "reviewed parent patch\n"
+                );
+                assert_eq!(
+                    regular_text(&work.join("child.txt")).unwrap(),
+                    "published child bytes\n"
+                );
+                let applied = Applied::load().unwrap();
+                assert_eq!(applied.layer.unwrap().base, new_parent);
+                assert_eq!(applied.commits.len(), 1);
+            }
             return;
         }
         if witness.starts_with("adopted") {
