@@ -118,7 +118,19 @@ counterpart). The existing owner `Rebase: allowed` consent is required for an
 adopted layer's rebase.
 
 When a parent moves before admission, the next round admits its new head and
-can rebase this layer onto it, with the same consent rules. If the immediate
+can rebase this layer onto it, with the same consent rules. Every successful
+stack publication records its exact child head, parent branch and parent head
+in the server's structured publication receipt. The next admission authenticates
+that outcome and its dispatch run and binds the receipt to this exact PR,
+branch and child head. Publication uses that historical parent boundary to
+preserve this layer's own commits separately from its new rebase target.
+A parent's all-time force-push history cannot supply that authority: it might
+have temporarily incorporated and then dropped child commits.
+
+If the parent moved and this exact child head has no authenticated publication
+boundary, dispatch refuses the rewrite. The director must first rebase the
+layer while preserving its history, then start a new round. Dispatch never
+invents an old boundary from the new parent's merge-base. If the immediate
 parent moves or the layer is retargeted during a round, publication refuses;
 start another round to admit the new parent. This keeps an in-flight round
 from silently changing its rebase target. A live dispatch round on a real
