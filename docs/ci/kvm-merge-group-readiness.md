@@ -3,8 +3,9 @@
 PR [#1380](https://github.com/carrick-sh/carrick/pull/1380) remains a draft.
 The existing implementation is worth preserving, but must not be deployed
 from its stale head. Main still has no pre-landing KVM job. This audit adds
-documentation and a durable workflow patch; it does not integrate main,
-change controller code, deploy infrastructure, or establish live acceptance.
+documentation and a durable workflow patch. Its continuation narrows the
+controller's capability qualification with a registration-boundary witness;
+it does not integrate main, deploy infrastructure or establish live acceptance.
 
 Review scope: issue [#1366](https://github.com/carrick-sh/carrick/issues/1366),
 admitted PR head `1ccb0f74c09c6859f8ff089d9e656a93a5ab65f1`, fetched GitHub
@@ -47,8 +48,9 @@ path: an otherwise qualified agent with the old capabilities command must
 reach registration, an old KVM clone must be refused before registration,
 and a qualified new KVM clone must proceed. The current helper-only
 `stale_template_admission_is_refused_before_minting_with_a_rebuild_reason`
-test does not prove which lane calls the helper. This audit leaves the
-production fix to the director's integration step.
+test does not prove which lane calls the helper. The continuation extracts
+the production qualification and its registration continuation, and checks
+the lane at that boundary. Re-prove it after director-owned integration.
 
 **P1 — stale controller deployment would discard newer safety work.** Main
 contains linked-clone qualification, typed agent-template selection and
@@ -91,6 +93,15 @@ check refusing a NEW failure as one chain. Require the live pilot below.
 Disposition describes the director's proposed integration. No production
 fix has been dropped or ported in this audit commit.
 
+The continuation worker adds commits after admitted head `0d7d2bd39` and
+does not rebase, merge main or rewrite director commits. For that slice:
+all existing classifier, receipt, assignment, mint and cleanup changes are
+**kept**; the capability qualification is **ported** to a registration
+boundary that distinguishes standing KVM from agents; no existing fix is
+**dropped**. The main integration, its three separate conflict-resolution
+tests and newer controller safety authorities remain director work. This
+inventory does not claim those main changes exist in this stale branch.
+
 | Existing change | Disposition and integration instruction |
 | --- | --- |
 | `ci_changes::collect_changed_paths` / `run` | **Kept:** cumulative merge-group base-to-head diff and `kvm` output; missing history must require hardware. Preserve current main's unrelated classification behavior. |
@@ -116,6 +127,12 @@ binary-capable Git diff of the admitted PR against its common ancestor,
 restricted to the three action/workflow files. It applies cleanly to the
 reviewed main using an isolated index. It is a review artifact, not a
 published workflow or a claim that the rest of the PR integrates cleanly.
+The continuation refreshed this diff against reviewed main in an isolated
+index: it still applies and produces all three admitted blobs exactly, so
+the patch's content is unchanged. The worker has not changed protected
+workflow/action files. Refresh again after the director integrates main;
+applying the patch to this branch, which already contains those blobs,
+would attempt to apply the same changes twice.
 
 ## Gate and admission semantics to preserve
 
@@ -237,6 +254,50 @@ No new capability may mint dispatch credentials for a merge-group job.
   do not remove another lane's clone. Confirm agent source, assignment,
   token mint/revocation and budgets were preserved.
 
+## Proposed KVM template cutover (director approval and execution pending)
+
+Build beside template 300; do not rebuild it while linked clones reference
+its disks. The director must first reserve an unused KVM source VMID and a
+separate disposable qualification VMID after inspecting the live inventory,
+storage and controller reservations. Neither agent source 9000/9001 nor
+agent qualification slot 9501 is a KVM slot. No slot number in this proposal
+authorizes an infrastructure change.
+
+The existing selector must gain typed KVM source selection in a separately
+reviewed controller change before cutover. Today `Site::template` selects
+300; the agent blue/green selector does not select KVM sources. Extend that
+authority rather than adding an environment variable, wrapper or second
+selector. Both builder admission and clone provisioning must consume the
+same selected source, with inventory and retirement retaining every source
+still referenced by a linked clone. Until that change is reviewed and
+qualified, deployment remains blocked; this worker does not implement it.
+
+Using the integrated builder and controller, build the new source from a
+recorded commit and artifact identity, retain the current source, and
+qualify an actual linked clone of the new source. Verify non-root access to
+KVM API 12, installed job hook, `admit-job --controller`, and capabilities
+including `merge-group-v1`. Exercise registration, actual assignment,
+receipt upload and scoped teardown through the existing ledger. Also prove
+a new dispatch-agent clone still registers without merge-group capability.
+The clone must shut down and clean up successfully before qualification is
+accepted. Do not use an existing running clone as a template witness.
+
+Announce the change and drain old KVM registrations before publishing the
+merge-group workflow: old hooks must not accept those jobs. Change the
+single selected KVM source through the reviewed selector, restart the
+integrated controller through its normal deployment procedure, and record
+the source VMID actually used by the first new clone. Run the live pilot
+above before removing the queue hold. Retain template 300 and all referenced
+disks throughout the observation period.
+
+Rollback stops new KVM admission and drains registrations, restores the
+previous selected source and matching controller artifact through the same
+authority, and verifies clone teardown. If the old source lacks
+`merge-group-v1`, keep merge-group KVM admission disabled and the queue held;
+restoring 300 cannot restore pre-landing evidence. Any break-glass use must
+be recorded explicitly as no KVM evidence. Retire a source only after the
+existing inventory proves no linked clones or orphan volumes reference it.
+
 ## Local verification of the audit
 
 All builds and test commands reused the dispatch job's VM-local gate lease
@@ -268,3 +329,71 @@ No macOS-cfg, KVM/HAL or guest production source was changed in this audit,
 so macOS cross-check, `just check-linux` and KVM crate checks were not added
 to its scope. Whole-workspace domain/kernel gates remain with CI. None of
 these local results establishes main integration or deployment acceptance.
+
+## Continuation: cleanup attribution
+
+The cleanup failure is reproduced on unmodified main
+`a4750d355f9b4b5563cf71d0740d2a782fe4e4fb` in a detached checkout on this
+runner. Under the inherited VM-local gate lease, run:
+
+```sh
+cargo test -p carrick-xtask --test ci_scaler_hook \
+  agent_auth_provisions_all_worker_credentials_and_only_agy_for_loop \
+  -- --exact --nocapture
+```
+
+Result: 0 passed, 1 failed, 11 filtered; the failure is the cleanup
+assertion at `tests/ci_scaler_hook.rs:326`. A direct cleanup diagnostic
+reports `sudo exited with code 1; stderr: sudo: a password is required`.
+This runner is the dispatch-agent uid; the separate dispatch-loop account
+exists. `agent_runner::run(Action::Cleanup)` and
+`dispatch_worker::cleanup_dispatch_users` on that main already request both
+account retirements before removing fixture state. This slice changes
+neither authority. The failure remains unresolved on this host, attributed
+to main rather than reported as a passing fixture or skipped gate. Logs are
+in `target/1366-evidence/main-cleanup-repro.log` and
+`target/1366-evidence/cleanup-diagnostic.log` for the workflow to harvest.
+
+## Independent continuation review
+
+GPT-6.1 Sol reviewed the final production and documentation diff without
+authoring it and found no blocking source defect. The review checked the
+standing-only capability requirement, shared controller qualification,
+agent-runner check, unchanged guest exit handling, and refusal before the
+production registration continuation. It also read the red witness and
+main cleanup reproduction. The continuation witness exercises that
+production authority using recorded guest responses and a registration
+callback; it does not boot a VM or register with GitHub.
+
+This is a review of the scoped continuation, not the still-pending main
+integration. The reviewer did not run builds or independently certify
+green test results. Re-review the integrated controller and protected
+workflow application before deployment. The director retains the PR body;
+this report is available here for its integration record.
+
+## Continuation verification
+
+All builds and tests reused the dispatch job's VM-local gate lease; no
+hypervisor lease, deployment or remote host operation was used.
+
+- Red-first registration witness: 0 passed, 1 failed on the original
+  broad qualification. Its agent case reached the capabilities probe and
+  failed to enter registration. With the fix, scaler library regular tests
+  passed 106 and the exact scaler `serial_host` population passed 12.
+- Integration regular partitions passed: `ci_cache` 13, `ci_changes` 17,
+  `ci_receipt` 42, `ci_scaler` 48. Serial partitions passed 23 total:
+  receipt 11, scaler 4, hook 8; cache and changes have no serial cases.
+- Hook regular partition: 3 passed, 1 failed. The failed cleanup fixture
+  and its main reproduction are documented above; this is not an all-green
+  focused gate.
+- `just fmt-check`, the actual pre-push clippy hook and source-only
+  authority-debt ceilings passed. The latter checked 1212 source counters
+  and makes no range-delta claim. Logs are in `target/1366-evidence/`.
+- No macOS-cfg, HVF, KVM/HAL or guest source changed. Their cross-checks
+  and live guest gates were not run for this scoped controller fix. HVF is
+  unavailable on Linux; Docker and actionlint executables are absent.
+  `/dev/kvm` is present, but this slice does not claim live KVM evidence.
+  The controller/template/merge-group pilot remains director work.
+
+Whole-workspace domain and kernel tests remain with CI. No result here
+establishes current-main integration, live registration or rollout acceptance.

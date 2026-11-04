@@ -721,7 +721,11 @@ SendMessage.
   device+inode: never copy or cross-volume move an admitted checkout; remove
   and re-add it.
 - **KVM evidence comes from the merge queue** (owner decision 2026-11-01,
-  #231, #1366). `ci.yml` runs `kvm-tests` on a disposable self-hosted KVM
+  #231, #1366). This is the candidate wiring in PR #1380; deployed main at
+  the reviewed integration base still runs KVM only after landing. Keep the
+  queue hold until the [readiness pilot](docs/ci/kvm-merge-group-readiness.md)
+  proves pre-landing refusal. In this candidate, `ci.yml` runs `kvm-tests`
+  on a disposable self-hosted KVM
   clone (Contabo, `willow-kvm` label) for every merge group whose diff
   touches the KVM closure: kvm-lane packages, x86/CPL0 and soft-CPU crates,
   their Linux dependency closure, or shared build/CI inputs. When the
@@ -735,8 +739,11 @@ SendMessage.
   repo variable `CARRICK_MERGE_GROUP_KVM=false` skips the lane and `ci-ok`
   then requires it skipped. Queued code runs on the Contabo clones. The
   job-start hook runs the template's xtask, so an admission change needs a
-  template 300 rebuild; the controller refuses a template missing an
-  `ADMIT_JOB_CAPABILITIES` entry ([Contabo setup](docs/ci/contabo-kvm.md)).
+  qualified KVM template built beside 300 and a reviewed source cutover;
+  the controller refuses a standing KVM template missing an
+  `ADMIT_JOB_CAPABILITIES` entry. Agent admission retains its separate
+  qualification and does not require merge-group capability
+  ([Contabo setup](docs/ci/contabo-kvm.md)).
   Do not run `just test-kvm`
   on the shared worker VMs; a targeted KVM test to debug a specific defect
   runs under `just lease gate`.

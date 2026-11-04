@@ -1,8 +1,10 @@
 # Contabo self-hosted KVM lane
 
 The KVM lane runs on a throwaway JIT clone on the dedicated Contabo host
-(issue #287): after landing for main pushes, and before landing for merge
-groups in the KVM closure (#1366). The design,
+(issue #287): after landing for main pushes. PR #1380 adds before-landing
+merge groups in the KVM closure (#1366); deployment and the
+[live readiness pilot](kvm-merge-group-readiness.md) remain prerequisites.
+The design,
 admission and teardown are the Willow standing controller's, unchanged
 ([willow-pilot.md](willow-pilot.md)). Only the clone placement differs, and
 it comes from the typed site table in `crates/carrick-xtask/src/ci_scaler/site.rs`.
@@ -13,14 +15,17 @@ the controller binary in `/root/carrick-ci/bin` carries that re-vet.
 
 The job-start hook, though, authorizes with the **template's own**
 `/usr/local/bin/carrick-xtask`, so a change to job admission needs a template
-300 rebuild as well as a controller restart. The admission that merge groups
+qualified KVM source built beside 300 as well as a controller restart and
+reviewed source cutover. The admission that merge groups
 need (#1366) is one such change. Before minting a runner, the controller runs
 `carrick-xtask ci-scaler capabilities` on the template binary and refuses a
 template that lacks any entry of `ADMIT_JOB_CAPABILITIES`
 (`ci_scaler.rs`), naming "rebuild template 300". It checks every standing
-clone, whatever job it was minted for, because GitHub can hand any clone with
-the `willow-kvm` labels a merge-group job. Rebuild the template from the same
-commit as the controller, then restart the controller.
+KVM clone, whatever job it was minted for, because GitHub can hand any clone with
+the `willow-kvm` labels a merge-group job. Agent admission does not require
+merge-group capability; both lanes still require `admit-job --controller`,
+and agents retain their `agent-runner` qualification. Follow the proposed
+cutover procedure in the readiness document; do not rebuild 300 in place.
 
 The same standing service also serves issue-label agent clones from the
 active agent template (9000/9001); see [dispatch-worker.md](dispatch-worker.md) for the four-clone budget,

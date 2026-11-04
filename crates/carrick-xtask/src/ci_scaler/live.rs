@@ -111,6 +111,63 @@ fn template_capabilities_verdict(probe: &GuestOutput) -> Result<(), ScalerError>
         ))
     }
 }
+/// Qualify the ready clone before invoking its registration continuation.
+/// Keeping the continuation here makes every failed command precede JIT minting.
+fn qualify_registration<T>(
+    admission: &Admission,
+    mut guest: impl FnMut(&[&str]) -> Result<GuestOutput, ScalerError>,
+    register: impl FnOnce() -> Result<T, ScalerError>,
+) -> Result<T, ScalerError> {
+    let standing = matches!(admission, Admission::Standing | Admission::Agent);
+    if standing {
+        // The re-vet half of the hook runs the template's own xtask; refuse a
+        // template whose xtask predates it rather than fail a job at set-up.
+        let help = checked_guest(
+            &mut guest,
+            &[
+                "/usr/local/bin/carrick-xtask",
+                "ci-scaler",
+                "admit-job",
+                "--help",
+            ],
+        )?;
+        if !help.contains("--controller") {
+            return Err(ScalerError::Guard(
+                "template xtask lacks admit-job --controller; rebuild template 300",
+            ));
+        }
+    }
+    if matches!(admission, Admission::Standing) {
+        // GitHub hands a standing clone any job with its labels, including a
+        // ci.yml merge-group job, whatever job it was minted for; the hook
+        // then authorizes with the template's xtask. Refuse a template whose
+        // admission predates what this controller serves (#1366).
+        template_capabilities_verdict(&guest(&[
+            "/usr/local/bin/carrick-xtask",
+            "ci-scaler",
+            "capabilities",
+        ])?)?;
+    }
+    if matches!(admission, Admission::Agent) {
+        // Agent policy parsing and assignment authorization shipped with this
+        // command. Old template binaries must fail before minting a runner.
+        checked_guest(
+            &mut guest,
+            &["/usr/local/bin/carrick-xtask", "agent-runner", "--help"],
+        )?;
+    }
+    register()
+}
+fn checked_guest(
+    guest: &mut impl FnMut(&[&str]) -> Result<GuestOutput, ScalerError>,
+    command: &[&str],
+) -> Result<String, ScalerError> {
+    let output = guest(command)?;
+    if output.exit != GuestExit(0) {
+        return Err(ScalerError::External("guest qualification"));
+    }
+    Ok(output.stdout)
+}
 fn script_install_command(path: &str, source: &str) -> String {
     format!(
         "umask 077; printf '%s' {} > {} && chmod 755 {}",
@@ -719,11 +776,7 @@ impl Pve {
         Err(ScalerError::External("PVE task five-minute deadline"))
     }
     fn agent(&self, row: &Record, command: &[&str]) -> Result<String, ScalerError> {
-        let output = self.agent_output(row, command)?;
-        if output.exit != GuestExit(0) {
-            return Err(ScalerError::External("guest qualification"));
-        }
-        Ok(output.stdout)
+        checked_guest(&mut |command| self.agent_output(row, command), command)
     }
     fn agent_output(&self, row: &Record, command: &[&str]) -> Result<GuestOutput, ScalerError> {
         self.agent_output_input(row, command, None)
@@ -1294,90 +1347,65 @@ fn boot_and_register(
         &["/bin/sh", "-c", "rm -f /usr/local/bin/carrick-ci-admit-job"],
     )?;
     let standing = matches!(admission, Admission::Standing | Admission::Agent);
-    if standing {
-        // The re-vet half of the hook runs the template's own xtask; refuse a
-        // template whose xtask predates it rather than fail a job at set-up.
-        let help = pve.agent(
-            row,
-            &[
-                "/usr/local/bin/carrick-xtask",
-                "ci-scaler",
-                "admit-job",
-                "--help",
-            ],
-        )?;
-        if !help.contains("--controller") {
-            return Err(ScalerError::Guard(
-                "template xtask lacks admit-job --controller; rebuild template 300",
-            ));
-        }
-        // GitHub hands a standing clone any job with its labels, including a
-        // ci.yml merge-group job, whatever job it was minted for; the hook
-        // then authorizes with the template's xtask. Refuse a template whose
-        // admission predates what this controller serves (#1366).
-        template_capabilities_verdict(&pve.agent_output(
-            row,
-            &["/usr/local/bin/carrick-xtask", "ci-scaler", "capabilities"],
-        )?)?;
-    }
-    if matches!(admission, Admission::Agent) {
-        // Agent policy parsing and assignment authorization shipped with this
-        // command. Old template binaries must fail before minting a runner.
-        pve.agent(
-            row,
-            &["/usr/local/bin/carrick-xtask", "agent-runner", "--help"],
-        )?;
-    }
-    // Re-vet the reserved run now and bind the runner to it: the hook admits
-    // this run, attempt, SHA and owner-only dispatch actors. A standing clone that
-    // GitHub assigns another job asks the controller to re-vet that one.
-    let policy = gh.vet(admission, row.key)?;
-    // The job-start hook reads this root-owned policy; jobs cannot write it.
-    // Only the runner-owned rendezvous request is writable by the hook.
-    let mut rendezvous = if standing {
-        format!(" && install -m 600 -o runner -g runner /dev/null {GUEST_STATE}/assignment.json")
-    } else {
-        String::new()
-    };
-    if matches!(admission, Admission::Agent) {
-        // On-demand dispatch tokens (#1012): runner-owned request and
-        // response files in the root-owned state directory.
-        for file in [mint::REQUEST_FILE, mint::RESPONSE_FILE] {
-            rendezvous.push_str(&format!(
-                " && install -m 600 -o runner -g runner /dev/null {GUEST_STATE}/{file}"
-            ));
-        }
-    }
-    pve.agent(
-        row,
-        &[
-            "/bin/sh",
-            "-c",
-            &format!(
-                "install -d -m 755 /etc/carrick-ci; printf '%s\\n' {} > /etc/carrick-ci/policy; chmod 644 /etc/carrick-ci/policy{rendezvous}",
-                crate::remote_accept::shell_quote(&policy.render())
-            ),
-        ],
-    )?;
-    println!("vm={} ready; non-root KVM API 12 verified", row.vm.get());
-    drop(shared_deadline);
-    // Write registration intent before asking GitHub. No JIT material in ledger.
-    row.state = State::Registered;
-    update(ledger, row, path)?;
-    let (runner, jit) = gh.generate_jit(&row.name, group, row.lane.labels())?;
-    row.runner = Some(runner);
-    update(ledger, row, path)?;
-    let mut input = jit.into_bytes();
-    input.push(b'\n');
-    ssh(dir, row, &input, "/usr/local/bin/carrick-ci-run-once", None)?;
-    row.state = State::Running;
-    update(ledger, row, path)?;
-    println!(
-        "vm={} runner={} one-job JIT delivered",
-        row.vm.get(),
-        row.name
-    );
-    Ok(())
+    let guest_row = row.clone();
+    qualify_registration(
+        admission,
+        |command| pve.agent_output(&guest_row, command),
+        || {
+            // Re-vet the reserved run now and bind the runner to it: the hook admits
+            // this run, attempt, SHA and owner-only dispatch actors. A standing clone that
+            // GitHub assigns another job asks the controller to re-vet that one.
+            let policy = gh.vet(admission, row.key)?;
+            // The job-start hook reads this root-owned policy; jobs cannot write it.
+            // Only the runner-owned rendezvous request is writable by the hook.
+            let mut rendezvous = if standing {
+                format!(
+                    " && install -m 600 -o runner -g runner /dev/null {GUEST_STATE}/assignment.json"
+                )
+            } else {
+                String::new()
+            };
+            if matches!(admission, Admission::Agent) {
+                // On-demand dispatch tokens (#1012): runner-owned request and
+                // response files in the root-owned state directory.
+                for file in [mint::REQUEST_FILE, mint::RESPONSE_FILE] {
+                    rendezvous.push_str(&format!(
+                        " && install -m 600 -o runner -g runner /dev/null {GUEST_STATE}/{file}"
+                    ));
+                }
+            }
+            pve.agent(
+                row,
+                &[
+                    "/bin/sh",
+                    "-c",
+                    &format!(
+                        "install -d -m 755 /etc/carrick-ci; printf '%s\\n' {} > /etc/carrick-ci/policy; chmod 644 /etc/carrick-ci/policy{rendezvous}",
+                        crate::remote_accept::shell_quote(&policy.render())
+                    ),
+                ],
+            )?;
+            println!("vm={} ready; non-root KVM API 12 verified", row.vm.get());
+            drop(shared_deadline);
+            // Write registration intent before asking GitHub. No JIT material in ledger.
+            row.state = State::Registered;
+            update(ledger, row, path)?;
+            let (runner, jit) = gh.generate_jit(&row.name, group, row.lane.labels())?;
+            row.runner = Some(runner);
+            update(ledger, row, path)?;
+            let mut input = jit.into_bytes();
+            input.push(b'\n');
+            ssh(dir, row, &input, "/usr/local/bin/carrick-ci-run-once", None)?;
+            row.state = State::Running;
+            update(ledger, row, path)?;
+            println!(
+                "vm={} runner={} one-job JIT delivered",
+                row.vm.get(),
+                row.name
+            );
+            Ok(())
+        },
+    )
 }
 
 // Reaping is durable authorization obtained after the admission/drain checks.
@@ -3751,6 +3779,88 @@ mod tests {
             recover_registration(&row, &[json!({"id":99,"name":"someone-else"})]).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn registration_qualification_preserves_agents_and_refuses_old_kvm_templates() {
+        for (admission, capability_exit, capability_text, expected) in [
+            (Admission::Agent, 1, "", true),
+            (Admission::Standing, 1, "", false),
+            (Admission::Standing, 0, "admit-job-controller\n", false),
+            (
+                Admission::Standing,
+                0,
+                "admit-job-controller\nmerge-group-v1\n",
+                true,
+            ),
+        ] {
+            let mut commands = Vec::new();
+            let mut registered = false;
+            let result = qualify_registration(
+                &admission,
+                |command| {
+                    commands.push(command.join(" "));
+                    let (exit, stdout) = if command.ends_with(&["capabilities"]) {
+                        (capability_exit, capability_text.into())
+                    } else if command.ends_with(&["admit-job", "--help"]) {
+                        (0, "--controller".into())
+                    } else {
+                        assert!(command.ends_with(&["agent-runner", "--help"]));
+                        (0, String::new())
+                    };
+                    Ok(GuestOutput {
+                        exit: GuestExit(exit),
+                        stdout,
+                    })
+                },
+                || {
+                    registered = true;
+                    Ok(())
+                },
+            );
+            assert_eq!(registered, expected, "{commands:?}");
+            assert_eq!(result.is_ok(), expected);
+            assert!(commands.iter().any(|c| c.ends_with("admit-job --help")));
+            if matches!(admission, Admission::Agent) {
+                assert!(commands.iter().any(|c| c.ends_with("agent-runner --help")));
+                assert!(!commands.iter().any(|c| c.ends_with("capabilities")));
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::panic)]
+    fn registration_qualification_retains_controller_and_agent_runner_checks() {
+        for admission in [Admission::Agent, Admission::Standing] {
+            for (exit, stdout) in [(1, "--controller"), (0, "old help")] {
+                let result: Result<(), ScalerError> = qualify_registration(
+                    &admission,
+                    |_| {
+                        Ok(GuestOutput {
+                            exit: GuestExit(exit),
+                            stdout: stdout.into(),
+                        })
+                    },
+                    || panic!("unqualified controller reached registration"),
+                );
+                assert!(result.is_err());
+            }
+        }
+        let result: Result<(), ScalerError> = qualify_registration(
+            &Admission::Agent,
+            |command| {
+                Ok(GuestOutput {
+                    exit: GuestExit(if command.ends_with(&["agent-runner", "--help"]) {
+                        1
+                    } else {
+                        0
+                    }),
+                    stdout: "--controller".into(),
+                })
+            },
+            || panic!("unqualified agent runner reached registration"),
+        );
+        assert!(result.is_err());
     }
 
     /// #1366: a stale template 300 passes the `--controller` help check but
