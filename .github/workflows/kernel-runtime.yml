@@ -60,7 +60,6 @@ jobs:
         with:
           tool: sccache@0.18.0
 
-      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
       - name: Prepare locked Cargo cache (infrastructure)
         uses: ./.github/actions/prepare-cargo
       - name: Publish exact-SHA fixture bundle
