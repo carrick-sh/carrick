@@ -1,3 +1,4 @@
+# Dated provenance snapshot from the 2026-09-21 syscall-floor native DSR campaign (retained for historical audit; see #1632).
 [workspace]
 resolver = "2"
 members = ["carrick-dsr", "carrick-dsr-aarch64", "text-audit"]

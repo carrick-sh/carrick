@@ -1,10 +1,8 @@
 # Same-ISA Dynamic Syscall Rewriter Implementation Plan
 
 > **Historical plan, superseded:** This document records the opt-in DSR
-> bring-up and its dated evidence. Darwin-native execution is now DSR-only; the
-> former execution-mode selection surface and legacy trap executor have been
-> removed. Current architecture and command policy are defined by the
-> [approved DSR-only backend design](superpowers/specs/2026-07-12-native-dsr-only-backend-comparison-design.md).
+> bring-up and its dated evidence. The native lane was removed in `f9933c9da`;
+> any future A64 decoder follows #1623's licence-admitted generator.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > `superpowers:subagent-driven-development` (recommended) or

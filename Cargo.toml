@@ -130,11 +130,9 @@ carrick-fatal = { path = "crates/carrick-fatal" }
 arc-swap = "1.7.1"
 chrono = "0.4.44"
 anyhow = "1.0.100"
-bad64 = "0.12.0"
 bincode = { version = "2.0.1", features = ["serde"] }
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "encoder", "instr_info"] }
 bitflags = "2.10.0"
-dynasmrt = "5.0.0"
 libc = "0.2"
 mach2 = "0.6.0"
 camino = { version = "1.2.1", features = ["serde1"] }
