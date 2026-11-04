@@ -1898,6 +1898,45 @@ mod tests {
         }
     }
     #[test]
+    fn serial_host_github_422_on_an_existing_ref_alone_is_a_claim_conflict() {
+        // #1597: the cross-host claim relies on exactly this response shape,
+        // which `gh api` printed verbatim for a duplicate `POST /git/refs`
+        // in a live probe (2026-11-04). Any other 422 stays a plain failure.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let gh = dir.path().join("gh");
+        for (body, conflict) in [
+            (
+                r#"{"message":"Reference already exists","documentation_url":"https://docs.github.com/rest/git/refs#create-a-reference","status":"422"}"#,
+                true,
+            ),
+            (r#"{"message":"Validation Failed","status":"422"}"#, false),
+            (
+                r#"{"message":"Reference already exists","status":"409"}"#,
+                false,
+            ),
+        ] {
+            crate::lock_file::tests::write_test_executable(
+                &gh,
+                format!("#!/bin/sh\nprintf '%s' '{body}'\nexit 1\n"),
+                std::fs::Permissions::from_mode(0o755),
+            );
+            let result = Github::request_command(
+                Command::new(&gh),
+                "POST",
+                "repos/carrick-sh/carrick/git/refs",
+                Some(json!({"ref": "refs/ci-claims/job/1-1-1/g0", "sha": "0".repeat(40)})),
+                false,
+            );
+            assert_eq!(
+                matches!(result, Err(ScalerError::GithubConflict)),
+                conflict,
+                "{body}: {result:?}"
+            );
+            assert!(result.is_err());
+        }
+    }
+    #[test]
     fn serial_host_github_404_settles_cleanup_as_gone_without_leaking_response_body() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();

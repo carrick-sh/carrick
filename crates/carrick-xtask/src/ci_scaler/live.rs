@@ -2435,6 +2435,8 @@ pub(super) fn controller(
         return Err(ScalerError::Guard("a follower needs cross-host job claims"));
     }
     if claims.is_some() {
+        // Fail at start, loudly, if this credential can't write claims.
+        super::claim::probe(&mut super::claim::github_api(), pve.site.node, now()?)?;
         super::claim::activate(pve.site.node);
     }
     verify_startup(
@@ -2590,7 +2592,7 @@ pub(super) fn controller(
                 Ok(())
             });
             if let Some(claims) = claims.as_mut() {
-                claims.end_pass();
+                claims.forget_stale(Instant::now());
             }
             match admitted {
                 Ok(()) => backoff.reset(),
@@ -2704,16 +2706,27 @@ fn admit_one(
                 }
                 gh.vet(&policy, job)?;
                 // Claim only a vetted job, before any reservation, so two
-                // hosts never both boot a clone for it.
-                if let Some(claims) = claims.as_deref_mut()
-                    && super::claim::claim(
+                // hosts never both boot a clone for it. A claim error (GitHub
+                // degraded) defers this job only, so it never freezes the pass.
+                if let Some(claims) = claims.as_deref_mut() {
+                    match super::claim::claim(
                         &mut super::claim::github_api(),
                         job,
                         claims.host,
                         now()?,
-                    )? == super::claim::Outcome::HeldElsewhere
-                {
-                    return Err(ScalerError::Deferred("claimed by another host"));
+                    ) {
+                        Ok(super::claim::Outcome::Won) => {}
+                        Ok(super::claim::Outcome::HeldElsewhere) => {
+                            return Err(ScalerError::Deferred("claimed by another host"));
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "run={} attempt={} job={} claim failed: {error}; deferred",
+                                job.run.0, job.attempt, job.job.0
+                            );
+                            return Err(ScalerError::Deferred("claim failed"));
+                        }
+                    }
                 }
                 Ok(job)
             },
@@ -2746,8 +2759,15 @@ fn admit_one(
     );
     // A claimed job this host won't serve after all goes back at once,
     // rather than blocking the other host until the claim expires.
-    if claims.is_some() && !matches!(reserved, Ok(Some(_))) {
-        super::claim::release_on_close(job);
+    if let Some(claims) = claims.as_deref() {
+        let served = ledger.served(job);
+        super::claim::settle_unreserved(
+            &mut super::claim::github_api(),
+            job,
+            claims.host,
+            matches!(reserved, Ok(Some(_))),
+            served,
+        );
     }
     let Some(row) = reserved? else {
         return Ok(false);
