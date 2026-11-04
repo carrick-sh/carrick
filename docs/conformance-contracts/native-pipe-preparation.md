@@ -17,6 +17,15 @@ Admission and settlement visit each input once per attempt; pipe2 has exactly
 two inputs. No new scanning allocator or guest-memory work runs under the
 transaction.
 
+Successful pair publication consumes the preparation's publication authority.
+A resumed creator cannot install the same pair again into its own or another
+table, even while it still owns the settlement pins. The red-first witness
+observed an unwanted second success returning descriptors 2 and 3; it now
+requires refusal with no additional descriptors. A bounded table-lock refusal
+keeps both pins in the same preparation: after release it can either publish
+once or cancel and return both backings exactly once. These are preparation
+protocol proofs, not native runtime continuation or cancellation proofs.
+
 `HostIpc::prepare_pipe` supplies the existing canonical object creation,
 retired-ring reclamation, ring stock and description growth policy. The
 production host pipe now uses this preparation instead of separate manual
