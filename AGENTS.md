@@ -690,10 +690,10 @@ SendMessage.
   with their issues. When the collapsed head is rebased on the current main
   tip and `ci-ok` is green on that exact head, admin-merge it with
   `gh pr merge <top> --admin --rebase`. That skips the merge-group-only
-  jobs (`macos-build`, `macos-clippy`, `macos-authority`) and the KVM gate,
-  which PRs never run. So admin-merge only stacks that touch no x86, KVM,
-  HAL or CPL0 code; enqueue those stacks instead, or attach a `kvm-tests`
-  run on the exact head.
+  jobs (`macos-build`, `macos-clippy`, `macos-authority`), which PRs never
+  run; KVM hardware runs post-landing on `main`, so admin-merge only stacks
+  that touch no x86, KVM, HAL or CPL0 code, or attach pre-merge KVM evidence
+  on the exact head.
   Workflow: [`.agents/skills/carrick-stacked-prs`](.agents/skills/carrick-stacked-prs/SKILL.md).
 - **Lanes:** hosted Linux/macOS jobs in `ci.yml`. Heavy pull requests run the
   full macOS suite; same-repo PRs run it on the self-hosted `carrick-macos-ci`

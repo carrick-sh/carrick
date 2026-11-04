@@ -88,10 +88,10 @@ gh stack view                                 # layers, PRs and their state
       ```
    5. When `ci-ok` is green on that exact head, admin-merge it:
       `gh pr merge <top> --admin --rebase`. That skips the merge-group-only
-      jobs (`macos-build`, `macos-clippy`, `macos-authority`) and the KVM
-      gate, which PRs never run. Admin-merge only stacks that touch no x86,
-      KVM, HAL or CPL0 code; enqueue those stacks instead, or attach a
-      `kvm-tests` run on the exact head. Without the proof, enqueue the top
+      jobs (`macos-build`, `macos-clippy`, `macos-authority`), which PRs never
+      run; KVM hardware runs post-landing on `main`, so admin-merge only
+      stacks that touch no x86, KVM, HAL or CPL0 code, or attach pre-merge
+      KVM evidence on the exact head. Without the proof, enqueue the top
       PR as an ordinary PR.
    6. Close the lower PRs with "landed via #top", and close their issues.
 

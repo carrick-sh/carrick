@@ -930,7 +930,7 @@ The dispatch job takes its VM-local host lease in exclusive `gate` mode
 before starting the loop and hands that same custody to the worker account.
 Nested `just lease carrick` builds and `just test-kvm` reuse the held lease;
 they do not upgrade, downgrade or reacquire the lock. There is no physical
-hypervisor lease. The merge queue's `kvm-gate` remains the landing authority.
+hypervisor lease. Post-landing `kvm-gate` on `main` remains the KVM baseline authority.
 
 The account handoff carries only the socket and lock paths. The holder
 admits the worker uid using authenticated Unix-socket peer credentials;

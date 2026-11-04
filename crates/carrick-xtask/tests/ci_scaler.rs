@@ -719,7 +719,7 @@ fn workflow_runner_labels_are_the_controller_label_constants() {
     let dispatch = include_str!("../../../.github/workflows/dispatch-worker.yml");
     // Contabo standing clones serve the post-landing KVM and dispatch-agent lanes.
     assert_eq!(runs_on(kernel, "kvm-tests"), LABELS);
-    assert_eq!(runs_on(dispatch, "work"), AGENT_LABELS);
+    assert_eq!(runs_on(dispatch, "worker"), AGENT_LABELS);
     assert_eq!(runs_on(kernel, "hvf-kernel"), HVF_LABELS);
     // The closure job never takes the merge-queue runner.
     assert_eq!(runs_on(kernel, "hvf-closure"), HVF_CLOSURE_LABELS);

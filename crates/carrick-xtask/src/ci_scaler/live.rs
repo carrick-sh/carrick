@@ -3278,7 +3278,7 @@ mod tests {
         assert!(matches!(
             admit_for_policy(
                 &pilot,
-                admission_verdict(&busy_ctb, (2, 4096), Pending::default()),
+                admission_verdict(&busy_ctb, (8, 16_384), Pending::default()),
             ),
             Err(ScalerError::CpuCeiling { .. })
         ));
@@ -3286,7 +3286,7 @@ mod tests {
             await_pre_boot_admission(
                 &pilot,
                 PreBoot::Defer,
-                || admission_verdict(&busy_ctb, (2, 4096), Pending::default()),
+                || admission_verdict(&busy_ctb, (8, 16_384), Pending::default()),
                 |_| panic!("pilot must stop immediately on CpuCeiling"),
             ),
             Err(ScalerError::CpuCeiling { .. })
