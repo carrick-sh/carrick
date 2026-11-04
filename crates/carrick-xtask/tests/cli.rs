@@ -470,6 +470,21 @@ fn workflow_patches_require_application_in_the_same_tree() {
     assert!(!failed.status.success());
     assert!(String::from_utf8_lossy(&failed.stderr).contains(
         "workflow patch not applied: docs/ci/patches/example.patch; the director applies it on this branch before landing"));
+    // Exercise the aggregate CI entry point as well as the focused command.
+    let lint_source = || {
+        Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .arg("--root")
+            .arg(fixture.path())
+            .arg("lint-source")
+            .output()
+            .unwrap()
+    };
+    let lint_failed = lint_source();
+    assert!(!lint_failed.status.success());
+    assert!(
+        String::from_utf8_lossy(&lint_failed.stdout)
+            .contains("lint-source: workflow-patches: FAIL")
+    );
     command::run_checked(
         "git",
         ["apply", "docs/ci/patches/example.patch"],
@@ -477,6 +492,10 @@ fn workflow_patches_require_application_in_the_same_tree() {
     )
     .unwrap();
     assert!(run().status.success(), "applied patch passes");
+    assert!(
+        String::from_utf8_lossy(&lint_source().stdout)
+            .contains("lint-source: workflow-patches: ok")
+    );
     std::fs::write(&workflow, "drift\n").unwrap();
     assert!(!run().status.success(), "subsequent workflow drift fails");
 }
