@@ -444,18 +444,31 @@ impl Github {
         key: JobKey,
         reason: &str,
     ) -> Result<(), ScalerError> {
-        let run = self.request(
-            "GET",
-            &format!("repos/{REPOSITORY}/actions/runs/{}", key.run.0),
-            None,
-            false,
-        )?;
-        if run["path"] == DISPATCH_WORKFLOW {
-            Self::report_refusal(key, reason, &mut |method, endpoint, body, paginate| {
-                self.request(method, endpoint, body, paginate)
-            })?;
-        }
-        Ok(())
+        Self::report_assignment_refusal_with(
+            key,
+            reason,
+            &mut |method, endpoint, body, paginate| self.request(method, endpoint, body, paginate),
+        )
+    }
+
+    fn report_assignment_refusal_with(
+        key: JobKey,
+        reason: &str,
+        request: &mut impl FnMut(&str, &str, Option<Value>, bool) -> Result<Value, ScalerError>,
+    ) -> Result<(), ScalerError> {
+        let result = (|| {
+            let run = request(
+                "GET",
+                &format!("repos/{REPOSITORY}/actions/runs/{}", key.run.0),
+                None,
+                false,
+            )?;
+            if run["path"] == DISPATCH_WORKFLOW {
+                Self::publish_refusal(key, reason, request)?;
+            }
+            Ok(())
+        })();
+        Self::refusal_report_result(key, reason, result)
     }
 
     /// issue_comment runs use main, so their REST run has no issue/PR mapping.
@@ -823,8 +836,9 @@ impl Github {
         Ok(admitted)
     }
 
-    /// Publish before committing a terminal refusal. If publication is
-    /// unavailable, the reservation remains pending and the next poll retries.
+    /// Publish before committing a terminal refusal. Transport failures leave
+    /// the reservation pending; permanent reporting failures are logged and
+    /// must not prevent settlement.
     fn vet_reported(
         admission: &Admission,
         key: JobKey,
@@ -841,6 +855,32 @@ impl Github {
     }
 
     fn report_refusal(
+        key: JobKey,
+        reason: &str,
+        request: &mut impl FnMut(&str, &str, Option<Value>, bool) -> Result<Value, ScalerError>,
+    ) -> Result<(), ScalerError> {
+        Self::refusal_report_result(key, reason, Self::publish_refusal(key, reason, request))
+    }
+
+    fn refusal_report_result(
+        key: JobKey,
+        reason: &str,
+        result: Result<(), ScalerError>,
+    ) -> Result<(), ScalerError> {
+        match result {
+            Err(error @ ScalerError::Transient(_)) => Err(error),
+            Err(error) => {
+                eprintln!(
+                    "run={} attempt={} job={} refused: {reason}; outcome reporting failed: {error}; settling refusal",
+                    key.run.0, key.attempt, key.job.0
+                );
+                Ok(())
+            }
+            Ok(()) => Ok(()),
+        }
+    }
+
+    fn publish_refusal(
         key: JobKey,
         reason: &str,
         request: &mut impl FnMut(&str, &str, Option<Value>, bool) -> Result<Value, ScalerError>,
@@ -1133,6 +1173,10 @@ mod tests {
     struct RevetFixture {
         unavailable: std::cell::Cell<bool>,
         denied: bool,
+        ambiguous_guard: std::cell::Cell<bool>,
+        permanent_reporting_failure: std::cell::Cell<bool>,
+        run_lookup_count: std::cell::Cell<usize>,
+        fail_reporting_run_lookup: std::cell::Cell<bool>,
         outcome_unavailable: std::cell::Cell<bool>,
         comments: std::cell::RefCell<Vec<Value>>,
     }
@@ -1141,6 +1185,10 @@ mod tests {
             Self {
                 unavailable: std::cell::Cell::new(unavailable),
                 denied,
+                ambiguous_guard: Default::default(),
+                permanent_reporting_failure: Default::default(),
+                run_lookup_count: Default::default(),
+                fail_reporting_run_lookup: Default::default(),
                 outcome_unavailable: std::cell::Cell::new(outcome_unavailable),
                 comments: Default::default(),
             }
@@ -1166,6 +1214,11 @@ mod tests {
                 return Ok(json!({"permission": if self.denied {"read"} else {"write"}}));
             }
             if endpoint.ends_with("/runs/42") {
+                let count = self.run_lookup_count.get();
+                self.run_lookup_count.set(count + 1);
+                if count > 0 && self.fail_reporting_run_lookup.get() {
+                    return Err(ScalerError::External("GitHub HTTP 403"));
+                }
                 return Ok(
                     json!({"id":42,"run_attempt":1,"event":"issues","head_sha":"a".repeat(40),
                     "created_at":"2026-01-01T00:00:00Z", "head_branch":"main","path":DISPATCH_WORKFLOW,
@@ -1174,6 +1227,14 @@ mod tests {
                 );
             }
             if endpoint.contains("/jobs?") {
+                if self.ambiguous_guard.get() {
+                    return Ok(
+                        json!([{"jobs":[{"id":43,"runner_id":700,"labels":AGENT_LABELS},
+                        {"name":"guard","conclusion":"success","steps":[
+                            {"name":"Dispatch issue 1605","conclusion":"success"},
+                            {"name":"Dispatch issue 1606","conclusion":"success"}]}]}]),
+                    );
+                }
                 return Ok(
                     json!([{"jobs":[{"id":43,"runner_id":700,"labels":AGENT_LABELS},
                     {"name":"guard","status":"completed","conclusion":"success","steps":[
@@ -1181,6 +1242,9 @@ mod tests {
                 );
             }
             assert!(endpoint.contains("/issues/1605/comments"), "{endpoint}");
+            if self.permanent_reporting_failure.get() {
+                return Err(ScalerError::External("GitHub HTTP 403"));
+            }
             if method == "GET" {
                 return Ok(json!([self.comments.borrow().clone()]));
             }
@@ -1196,9 +1260,13 @@ mod tests {
     }
     impl assignment::AssignmentApi for RevetFixture {
         fn report_refusal(&self, key: JobKey, reason: &str) -> Result<(), ScalerError> {
-            Github::report_refusal(key, reason, &mut |method, endpoint, body, paginate| {
-                self.request(method, endpoint, body, paginate)
-            })
+            Github::report_assignment_refusal_with(
+                key,
+                reason,
+                &mut |method, endpoint, body, paginate| {
+                    self.request(method, endpoint, body, paginate)
+                },
+            )
         }
 
         fn run_jobs(&self, _: RunId, _: u32) -> Result<Vec<Value>, ScalerError> {
@@ -1327,6 +1395,76 @@ mod tests {
         assert!(assignment::AssignmentApi::revet(&api, RevetFixture::key()).is_err());
         assert_eq!(api.comments.borrow().len(), 1);
     }
+    #[test]
+    fn revet_ambiguous_guard_settles_refusal_without_publishing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let mut ledger = revet_ledger();
+        let mut guest = RevetGuest {
+            approvals: 0,
+            stale_sha: false,
+        };
+        let api = RevetFixture::new(false, true, false);
+        api.ambiguous_guard.set(true);
+        assert_eq!(
+            revet_poll(&api, &mut guest, &mut ledger, &path).unwrap(),
+            assignment::Revetted::Refused(RevetFixture::key())
+        );
+        assert_eq!(
+            Ledger::load(&path).unwrap().refused,
+            vec![RevetFixture::key()]
+        );
+        assert_eq!(guest.approvals, 0);
+        assert!(api.comments.borrow().is_empty());
+    }
+
+    #[test]
+    fn revet_permanent_reporting_failure_settles_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let mut ledger = revet_ledger();
+        let mut guest = RevetGuest {
+            approvals: 0,
+            stale_sha: false,
+        };
+        let api = RevetFixture::new(false, true, false);
+        api.permanent_reporting_failure.set(true);
+        assert_eq!(
+            revet_poll(&api, &mut guest, &mut ledger, &path).unwrap(),
+            assignment::Revetted::Refused(RevetFixture::key())
+        );
+        assert_eq!(
+            Ledger::load(&path).unwrap().refused,
+            vec![RevetFixture::key()]
+        );
+        assert_eq!(guest.approvals, 0);
+        assert!(api.comments.borrow().is_empty());
+    }
+
+    #[test]
+    fn revet_permanent_reporting_run_lookup_failure_settles_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let mut ledger = revet_ledger();
+        let mut guest = RevetGuest {
+            approvals: 0,
+            stale_sha: true,
+        };
+        let api = RevetFixture::new(false, false, false);
+        api.fail_reporting_run_lookup.set(true);
+        assert_eq!(
+            revet_poll(&api, &mut guest, &mut ledger, &path).unwrap(),
+            assignment::Revetted::Refused(RevetFixture::key())
+        );
+        assert_eq!(
+            Ledger::load(&path).unwrap().refused,
+            vec![RevetFixture::key()]
+        );
+        assert_eq!(api.run_lookup_count.get(), 2);
+        assert_eq!(guest.approvals, 0);
+        assert!(api.comments.borrow().is_empty());
+    }
+
     #[test]
     fn queued_chain_refusal_retries_outcome_before_leaving_demand() {
         let api = RevetFixture::new(false, false, true);
