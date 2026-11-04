@@ -1905,15 +1905,27 @@ fn run_mounted_binary_with_capture(
     // Teardown may remove the debug endpoint before the child exits. The
     // unreaped child handle still identifies that exact process.
     #[cfg(target_os = "linux")]
-    for (tool, args) in [
-        ("eu-stack", vec!["-s", "-p"]),
+    for (tool, args, capture_budget) in [
+        ("eu-stack", vec!["-s", "-p"], Duration::from_secs(5)),
         (
             "gdb",
-            vec!["-nx", "-batch", "-ex", "thread apply all bt", "-p"],
+            // eu-stack supplies source locations; GDB's minimal symbols
+            // cross-check every thread without loading the full test debuginfo.
+            vec![
+                "-nx",
+                "-batch",
+                "--readnever",
+                "-iex",
+                "set auto-load off",
+                "-ex",
+                "thread apply all bt",
+                "-p",
+            ],
+            Duration::from_secs(30),
         ),
     ] {
         let result = Command::new(tool)
-            .timeout(Duration::from_secs(3))
+            .timeout(capture_budget)
             .args(args)
             .arg(child.id().to_string())
             .output();
