@@ -285,17 +285,15 @@ impl<const N: usize> Drop for HostPreparedDescriptions<N> {
                     self.owner
                         .release(description.backing)
                         .unwrap_or_else(|error| {
-                            carrick_fatal::carrick_fatal!(
-                                "ipc::preparation",
+                            self.owner.description_invariant(format_args!(
                                 "backing release failed: {error:?}"
-                            )
+                            ))
                         });
                 }
                 Ok(None) => break,
-                Err(error) => carrick_fatal::carrick_fatal!(
-                    "ipc::preparation",
-                    "invalid description custody: {error:?}"
-                ),
+                Err(error) => self
+                    .owner
+                    .description_invariant(format_args!("invalid description custody: {error:?}")),
             }
         }
     }
@@ -320,7 +318,8 @@ impl HostPreparedDescriptions<2> {
     /// Move the same OFDs to the host pipe's functional endpoint owners.
     pub fn into_pair(mut self) -> [HostDescription; 2] {
         let pins = self.prepared.take_pair().unwrap_or_else(|_| {
-            carrick_fatal::carrick_fatal!("ipc::preparation", "unadmitted pair transfer")
+            self.owner
+                .description_invariant(format_args!("unadmitted pair transfer"))
         });
         pins.map(|pin| self.owner.own_description(pin))
     }
@@ -456,15 +455,21 @@ impl Drop for HostDescription {
             let region = self.flags.owner.region();
             let authority = region.fd(HostLockWait);
             let terminal = authority.pinned(pin).unwrap_or_else(|_| {
-                carrick_fatal::carrick_fatal!("ipc::description", "invalid closing description")
+                self.flags
+                    .owner
+                    .description_invariant(format_args!("invalid closing description"))
             });
             let HostDescriptionState::Live(pin) =
                 std::mem::replace(&mut *state, HostDescriptionState::Retired(terminal))
             else {
-                carrick_fatal::carrick_fatal!("ipc::description", "description retired twice")
+                self.flags
+                    .owner
+                    .description_invariant(format_args!("description retired twice"))
             };
             authority.unpin(pin).unwrap_or_else(|_| {
-                carrick_fatal::carrick_fatal!("ipc::description", "invalid owned description pin")
+                self.flags
+                    .owner
+                    .description_invariant(format_args!("invalid owned description pin"))
             })
         };
         // Backing release can call host readiness callbacks: leave the
@@ -474,10 +479,9 @@ impl Drop for HostDescription {
                 .owner
                 .release(description.backing)
                 .unwrap_or_else(|_| {
-                    carrick_fatal::carrick_fatal!(
-                        "ipc::description",
-                        "invalid final description backing"
-                    )
+                    self.flags
+                        .owner
+                        .description_invariant(format_args!("invalid final description backing"))
                 });
         }
     }
@@ -601,6 +605,12 @@ impl HostIpc {
             )?;
         }
         Ok(owner)
+    }
+
+    /// One invariant owner for admitted and partially prepared description
+    /// custody. Physical finalization remains outside table/description locks.
+    fn description_invariant(&self, reason: std::fmt::Arguments<'_>) -> ! {
+        carrick_fatal::carrick_fatal!("ipc::description", "{reason}")
     }
 
     /// The zone-wide ceilings this authority grows its stores to.
