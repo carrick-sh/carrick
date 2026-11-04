@@ -348,3 +348,43 @@ This resolves the accepted-pending-permit destruction gap described above;
 unpublished rollback, unaccepted permits at final carrier destruction, HVF
 joining, full B2/B3 acceptance, C2 and slice 2b remain open. No broader B1
 completion claim follows from these witnesses.
+
+### Pending-loan abort retains release progress (partial B1)
+
+An admitted, unpublished fork now enters an abort phase in `PendingForkLoan`
+before it releases physical backing. That phase owns the original
+`ChildMmRelease`; a refused backend transfer leaves its linear permits and
+all admitted physical pins in the same loan. `settle` cannot return the
+loan's tables, lifecycle or tag before release succeeds. Once physical
+release starts, `commit_admitted` refuses the loan permanently, including
+after successful release followed by refused lifecycle cleanup. Child and
+parent tables must be clean before any physical release begins.
+
+CPL0 invokes this phase before abort settlement instead of dropping admitted
+custody and then invoking the receipt-only unpublished release. HVF invokes
+the same phase before its abort settlement. Partial admission that fails
+before an admitted token exists still uses its older rollback path; this
+change does not close that part of B1.
+
+The HAL witness covers refused release, stale execution, unchanged physical
+pin lifetime, exact progress identity, commit exclusion, failed lifecycle
+cleanup and release-once settlement. The real-inventory witness uses the
+existing 1100-cycle production fork-stock fixture in both committed and
+unpublished-abort modes. Every abort retains one exact permit through refusal,
+rejects a live peer and a recycled incarnation, consumes it once after inventory
+unlock and leaves the live parent's shared mapping intact. These are VM-free
+ownership witnesses, not a completed guest abort under contention.
+
+Independent review identified an unresolved P1 at the production retry venue:
+`abort_loan` has no owned notification-backed continuation. AArch64 denies then
+quarantines/fatals the prepared child; CPL0 currently propagates the release
+refusal as a trap failure. Retaining the loan prevents early custody disposal,
+but does not make either path resume. Closure requires an owned aborted-loan
+phase in the existing fork continuation, a release-owner notification, and
+idempotent phase advancement after `abort_mm` has freed the child's portal
+space. Re-running all of `abort_mm`, polling, returning an errno or claiming
+that a host DENIED response supplies a continuation would be incorrect.
+
+Keep this checkpoint draft. Unaccepted-permit final destruction, complete
+partial-admission rollback, HVF backend receipt joining, B1–B3/C2 acceptance,
+slice 2b and the earlier unattributed EL1/runtime failures remain open.

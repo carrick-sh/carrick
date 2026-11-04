@@ -3499,6 +3499,15 @@ mod tests {
     /// parent's frame survives every child that mapped it.
     #[test]
     fn kvm_fork_retire_cycles_beyond_zone_capacity_release_child_state() {
+        fork_release_cycles(false);
+    }
+
+    #[test]
+    fn unpublished_fork_abort_retains_real_permits_across_refusal() {
+        fork_release_cycles(true);
+    }
+
+    fn fork_release_cycles(abort_child: bool) {
         use carrick_hal::fork_stock::{
             ForkStock, LifecycleWindow, NoTableLedger, UntaggedRoots, lifecycle_slots,
         };
@@ -3651,20 +3660,21 @@ mod tests {
                     |_, _, _| Ok(()),
                 )
                 .expect("reserve custody");
-            let mut settlement =
-                carrick_el1_abi::ForkStockSettlement::commit_reserved(loan, completion)
-                    .expect("settlement");
-            stock
-                .settle(
-                    &mut NoTableLedger,
-                    parent_execution,
-                    &mut settlement,
-                    |_| true,
-                    |_| true,
-                    |_| true,
-                )
-                .expect("commit");
-
+            if !abort_child {
+                let mut settlement =
+                    carrick_el1_abi::ForkStockSettlement::commit_reserved(loan, completion)
+                        .expect("settlement");
+                stock
+                    .settle(
+                        &mut NoTableLedger,
+                        parent_execution,
+                        &mut settlement,
+                        |_| true,
+                        |_| true,
+                        |_| true,
+                    )
+                    .expect("commit");
+            }
             // Carrier per-child state retained by KVM reservation.
             let child = inventory.bind(mm_generation(child_mm));
             let mut reservation = child.reserve(1, 2, 4).expect("child reserve");
@@ -3712,103 +3722,131 @@ mod tests {
                 })
                 .expect("residency capacity");
 
-            let child_execution =
-                fork_test_execution(900 + cycle, child_mm, loan.request.child_tables.base);
-            let mut retire = carrick_el1_abi::NativeChildRetire::new(
-                child_execution.binding,
-                child_execution.context,
-            )
-            .expect("retire record");
-            stock
-                .retire_child(child_execution, &mut retire)
-                .expect("quarantine");
+            if !abort_child {
+                let child_execution =
+                    fork_test_execution(900 + cycle, child_mm, loan.request.child_tables.base);
+                let mut retire = carrick_el1_abi::NativeChildRetire::new(
+                    child_execution.binding,
+                    child_execution.context,
+                )
+                .expect("retire record");
+                stock
+                    .retire_child(child_execution, &mut retire)
+                    .expect("quarantine");
+            }
+            let mut abort = carrick_el1_abi::ForkStockSettlement::abort(loan);
             let mut first_revision = None;
             let mut accepted = 0;
             for attempt in 0..2 {
-                let returned = stock
-                    .reclaim(
-                        &mut NoTableLedger,
-                        carrick_el1_abi::ReservationMm::new(PARENT).expect("parent"),
-                        |mm| carrick_hal::fork_stock::SlotAbsence::scan(mm, []),
-                        |_| true,
-                        |life| window.clear(life),
-                        |absence, progress| {
-                            let revision =
-                                progress.inventory(&*inventory, absence).unwrap().revision();
-                            if let Some(first) = first_revision {
-                                assert_eq!(revision, first);
-                            }
-                            first_revision = Some(revision);
-                            // Neither a live peer nor a recycled generation can steal
-                            // the retained release, even though this MM is now empty.
-                            for owner in [
-                                mm_generation(PARENT),
-                                carrick_hal::GuestFrameOwner {
-                                    root_generation: carrick_guest_arch::ContextGeneration::new(
-                                        NonZeroU64::new(2).unwrap(),
-                                    ),
-                                    ..mm_generation(child_mm)
-                                },
-                            ] {
-                                let wrong = carrick_hal::fork_stock::SlotAbsence::scan(
-                                    carrick_el1_abi::ReservationMm::new(
-                                        owner.native_mm.raw().get(),
-                                    )
+                let release =
+                    |absence: &carrick_hal::fork_stock::SlotAbsence,
+                     progress: &mut carrick_hal::fork_stock::ChildMmRelease| {
+                        let revision = progress.inventory(&*inventory, absence).unwrap().revision();
+                        if let Some(first) = first_revision {
+                            assert_eq!(revision, first);
+                        }
+                        first_revision = Some(revision);
+                        // Neither a live peer nor a recycled generation can steal
+                        // the retained release, even though this MM is now empty.
+                        for owner in [
+                            mm_generation(PARENT),
+                            carrick_hal::GuestFrameOwner {
+                                root_generation: carrick_guest_arch::ContextGeneration::new(
+                                    NonZeroU64::new(2).unwrap(),
+                                ),
+                                ..mm_generation(child_mm)
+                            },
+                        ] {
+                            let wrong = carrick_hal::fork_stock::SlotAbsence::scan(
+                                carrick_el1_abi::ReservationMm::new(owner.native_mm.raw().get())
                                     .unwrap(),
-                                    [],
+                                [],
+                            )
+                            .unwrap()
+                            .with_owner(owner)
+                            .unwrap();
+                            assert!(progress.inventory(&*inventory, &wrong).is_none());
+                        }
+                        assert!(
+                            authority
+                                .live_mapping_row(
+                                    FrameOwner::GuestMm(mm_generation(PARENT)),
+                                    parent_mapping
                                 )
-                                .unwrap()
-                                .with_owner(owner)
-                                .unwrap();
-                                assert!(progress.inventory(&*inventory, &wrong).is_none());
-                            }
-                            assert!(
-                                authority
-                                    .live_mapping_row(
-                                        FrameOwner::GuestMm(mm_generation(PARENT)),
-                                        parent_mapping
-                                    )
-                                    .is_some()
-                            );
-                            let released = progress.inventory(&*inventory, absence).unwrap();
-                            assert_eq!(released.pending_retirements(), 1);
-                            if released
-                                .try_retirements(|permit| {
-                                    assert!(
-                                        authority.state.try_lock().is_some(),
-                                        "backend runs after inventory unlock"
-                                    );
-                                    assert_eq!(permit.frame(), own);
-                                    assert_eq!(
-                                        permit.backing().host_owner_generation().get(),
-                                        73 + cycle
-                                    );
-                                    if attempt == 0 {
-                                        return Err((permit, ()));
-                                    }
-                                    let pending = permit.retire(|_| Ok::<_, ()>(())).unwrap();
-                                    // SAFETY: the VM-free fixture has no physical pins or storage.
-                                    unsafe { pending.complete() };
-                                    accepted += 1;
-                                    Ok(())
-                                })
-                                .is_err()
-                            {
-                                return false;
-                            }
-                            residency.retire_overlapping(child_mm, 0, u64::MAX)
-                        },
-                    )
-                    .unwrap_or_else(|error| panic!("cycle {cycle}: {error:?}"));
-                assert_eq!(returned, usize::from(attempt == 1), "cycle {cycle}");
-                assert_eq!(stock.is_quarantined(request.child_mm), attempt == 0);
+                                .is_some()
+                        );
+                        let released = progress.inventory(&*inventory, absence).unwrap();
+                        assert_eq!(released.pending_retirements(), 1);
+                        if released
+                            .try_retirements(|permit| {
+                                assert!(
+                                    authority.state.try_lock().is_some(),
+                                    "backend runs after inventory unlock"
+                                );
+                                assert_eq!(permit.frame(), own);
+                                assert_eq!(
+                                    permit.backing().host_owner_generation().get(),
+                                    73 + cycle
+                                );
+                                if attempt == 0 {
+                                    return Err((permit, ()));
+                                }
+                                let pending = permit.retire(|_| Ok::<_, ()>(())).unwrap();
+                                // SAFETY: the VM-free fixture has no physical pins or storage.
+                                unsafe { pending.complete() };
+                                accepted += 1;
+                                Ok(())
+                            })
+                            .is_err()
+                        {
+                            return false;
+                        }
+                        residency.retire_overlapping(child_mm, 0, u64::MAX)
+                    };
+                if abort_child {
+                    let result =
+                        stock.release_aborted_child(parent_execution, &abort, |_| true, release);
+                    if attempt == 0 {
+                        assert_eq!(result, Err(carrick_hal::fork_stock::ForkStockServiceError::OccupancyUnavailable));
+                        assert!(stock.pending(parent_execution.cpu).is_some());
+                    } else {
+                        result.unwrap();
+                        stock
+                            .settle(
+                                &mut NoTableLedger,
+                                parent_execution,
+                                &mut abort,
+                                |_| true,
+                                |_| true,
+                                |life| window.clear(life),
+                            )
+                            .unwrap();
+                        assert!(stock.pending(parent_execution.cpu).is_none());
+                    }
+                } else {
+                    let returned = stock
+                        .reclaim(
+                            &mut NoTableLedger,
+                            carrick_el1_abi::ReservationMm::new(PARENT).expect("parent"),
+                            |mm| carrick_hal::fork_stock::SlotAbsence::scan(mm, []),
+                            |_| true,
+                            |life| window.clear(life),
+                            release,
+                        )
+                        .unwrap_or_else(|error| panic!("cycle {cycle}: {error:?}"));
+                    assert_eq!(returned, usize::from(attempt == 1), "cycle {cycle}");
+                    assert_eq!(stock.is_quarantined(request.child_mm), attempt == 0);
+                }
                 assert_eq!(authority.abandoned_retirement_permits(), 0);
             }
             assert_eq!(accepted, 1, "exactly one authority consumed per child");
             assert!(residency.lookup(child_mm, 0x40_0000).is_none());
             children.push(child_mm);
         }
-        assert_eq!(stock.counters().returned_children, CYCLES);
+        assert_eq!(
+            stock.counters().returned_children,
+            if abort_child { 0 } else { CYCLES }
+        );
         assert_eq!(stock.counters().capacity_refusals, 0);
         // Only the parent's row remains; the shared frame survived.
         let live = authority.snapshot();

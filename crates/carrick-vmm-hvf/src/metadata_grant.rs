@@ -1854,6 +1854,44 @@ pub(crate) fn service_native_fork_stock(
                 }
                 result.is_ok()
             } else {
+                if kind == Some(ForkStockKind::Abort) {
+                    // An unadmitted loan has no physical inventory release.
+                    // Resolve optional resources only when its owner invokes
+                    // the admitted-child callback below.
+                    let inventory = stock.inventory();
+                    let pointer = region
+                        .record_ptr::<carrick_el1_abi::FrameGrantResidencyTable>(
+                            carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET as usize,
+                        )
+                        .ok_or_else(|| {
+                            TrapError::Hypervisor("fork abort residency bounds".into())
+                        })?;
+                    // SAFETY: initialized aligned atomic table in the retained region.
+                    let residency = unsafe { &*pointer };
+                    if stock
+                        .owner
+                        .release_aborted_child(
+                            execution,
+                            settlement,
+                            |pages| ForkStockHostCustody::tables_clean(custody, pages),
+                            |absence, progress| {
+                                let Some(inventory) = inventory.as_ref() else {
+                                    return false;
+                                };
+                                release_native_child_mm(
+                                    custody,
+                                    &**inventory,
+                                    residency,
+                                    absence,
+                                    progress,
+                                )
+                            },
+                        )
+                        .is_err()
+                    {
+                        return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+                    }
+                }
                 let mut ledger = crate::fork_stock::fork_table_accounting(custody);
                 match stock.owner.settle(
                     &mut ledger,

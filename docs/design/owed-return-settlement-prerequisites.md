@@ -16,7 +16,7 @@ summarizes the current code rather than the earlier checkpoints.
 | Requirement | Implemented | Still required |
 |---|---|---|
 | Owned return claims (A1–A4) | Stable reference custody outside copied overlays, prepare/abort accounting, production fragment splitting, shared/zero/last outcomes, and infallible claimed unmap bookkeeping. | Integration with slice 2b's physical settlement sequence. |
-| Physical permits and release receipts (B1–B3) | Exact allocator identity, claimed-return permits, atomic whole-MM permit output, retained quarantine/exec-predecessor release progress, HVF/CPL0 terminal permit consumption, and CPL0 terminal backend receipt joining after exact-root authentication and custody release. | HVF production receipt joining and whole-MM journal acknowledgement remain open. Unpublished fork rollback keeps its inherited receipt-only release and needs admitted-loan release progress. CPL0 VM destruction now retains accepted pending completions through the last VM/vCPU owner. Full physical execution also remains unaccepted. |
+| Physical permits and release receipts (B1–B3) | Exact allocator identity, claimed-return permits, atomic whole-MM permit output, retained quarantine/exec-predecessor release progress, HVF/CPL0 terminal permit consumption, and CPL0 terminal backend receipt joining after exact-root authentication and custody release. | HVF production receipt joining and whole-MM journal acknowledgement remain open. Admitted unpublished aborts now retain loan-owned release progress; partial pre-admission rollback, runtime abort continuation and unaccepted-permit final destruction remain open. CPL0 VM destruction now retains accepted pending completions through the last VM/vCPU owner. Full physical execution also remains unaccepted. |
 | Native backing drop (C1) | `NativeFrameBacking::drop` requests an inventory permit; the existing S2b owner retains it through physical completion. | Execute its macOS witnesses, including pin drain and concurrent idle cleanup. Linux cross-compilation cannot prove those behaviors. |
 | Legacy retirement checks (C2) | `commit_cow_inventory_split` consults kernel inventory. | `retire_stage2_candidate_if_unreferenced` still checks only the backend registry. Its kernel-inventory check and the falling `RetirementAuthority::LegacyRegistry` counter are absent. |
 | Original six review changes | Typed post-clear custody, claim/headroom handling, journal identity, an inventory-lock destructor witness, and the named CPL0 retirement path. | Physical backend integration and execution remain open; journal identity tests still observe eager clearing and do not prove delayed acknowledgement. |
@@ -32,8 +32,11 @@ completions until its final context releases the slot. CPL0 staging supplies
 its allocator's typed `PhysicalOwnerGeneration::INITIAL`, independently of
 mapping generations.
 
-`PhysicalFrameInventory::retire_mm` and unpublished rollback retain their
-inherited receipt-only behavior. They are not a second implementation of the
+`PhysicalFrameInventory::retire_mm` and partial rollback before an admitted
+loan token exists retain their inherited receipt-only behavior. Admitted aborts
+retain `ChildMmRelease` in the pending loan before either backend releases it.
+The missing runtime abort continuation remains a P1 blocker; the ownership
+witnesses do not establish completion under contention. They are not a second implementation of the
 new settlement routine: slice 2b is still absent. CPL0 terminal release now constructs the backend half only after residency and
 backend custody release, joins it through `ChildMmRelease`, and retains the
 joined receipt in that existing completion owner. A completed retry authenticates

@@ -711,6 +711,15 @@ pub struct PendingForkLoan<T, C = ()> {
     pub control: ForkControlCapacity,
     pub tag: T,
     admitted: Option<AdmittedForkCustody<C>>,
+    abort: Option<PendingForkAbort>,
+}
+
+/// Entering this phase permanently excludes child publication. Its progress
+/// remains with the admitted loan until abort cleanup finishes.
+#[derive(Debug, Default)]
+struct PendingForkAbort {
+    release: ChildMmRelease,
+    released: bool,
 }
 
 impl<T, C> PendingForkLoan<T, C> {
@@ -2047,6 +2056,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             control,
             tag,
             admitted: None,
+            abort: None,
         });
         Ok(loan)
     }
@@ -2270,6 +2280,12 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
     ) -> Result<(), ForkStockServiceError> {
         let loan = self.settlement_loan(execution)?;
         let index = cpu_index(execution.cpu).ok_or(ForkStockServiceError::NoPendingLoan)?;
+        if self.pending[index]
+            .as_ref()
+            .is_some_and(|pending| pending.abort.is_some())
+        {
+            return Err(ForkStockServiceError::InvalidRecord);
+        }
         let (completion, _, count) = settlement
             .request(loan)
             .ok_or(ForkStockServiceError::LoanMismatch)?;
@@ -2293,6 +2309,49 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             return Err(ForkStockServiceError::InvalidRecord);
         };
         self.consume_admitted(ledger, pending, admitted);
+        Ok(())
+    }
+
+    /// Release an admitted, unpublished child while its loan still owns all
+    /// physical pins, tables and the original inventory retirement. Refusal
+    /// leaves that exact progress in the loan; another execution cannot borrow
+    /// it. This must precede `settle` for an admitted abort.
+    pub fn release_aborted_child(
+        &mut self,
+        execution: GrantExecution,
+        settlement: &ForkStockSettlement,
+        is_clean: impl Fn(&[RootGpa]) -> bool,
+        release: impl FnOnce(&SlotAbsence, &mut ChildMmRelease) -> bool,
+    ) -> Result<(), ForkStockServiceError> {
+        let loan = self.settlement_loan(execution)?;
+        if !settlement.abort_matches(loan) {
+            return Err(ForkStockServiceError::LoanMismatch);
+        }
+        let index = cpu_index(execution.cpu).ok_or(ForkStockServiceError::NoPendingLoan)?;
+        let pending = self.pending[index]
+            .as_mut()
+            .ok_or(ForkStockServiceError::NoPendingLoan)?;
+        let Some(admitted) = pending.admitted.as_ref() else {
+            return Ok(());
+        };
+        if pending.abort.as_ref().is_some_and(|abort| abort.released) {
+            return Ok(());
+        }
+        if !is_clean(&pending.child_tables) || !is_clean(&pending.parent_tables) {
+            return Err(ForkStockServiceError::ExposedDirtyTable);
+        }
+        let owner = crate::GuestFrameOwner::from_admitted(admitted.completion.child)
+            .ok_or(ForkStockServiceError::InvalidRecord)?;
+        let absence = SlotAbsence::scan(loan.request.child_mm, [])
+            .and_then(|absence| absence.with_owner(owner))
+            .ok_or(ForkStockServiceError::InvalidRecord)?;
+        // Once any physical retirement starts this loan cannot commit, even
+        // if release or a later lifecycle/tag cleanup refuses.
+        let abort = pending.abort.get_or_insert_with(PendingForkAbort::default);
+        if !release(&absence, &mut abort.release) {
+            return Err(ForkStockServiceError::OccupancyUnavailable);
+        }
+        abort.released = true;
         Ok(())
     }
 
@@ -2322,6 +2381,11 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             return Err(ForkStockServiceError::MemoryAccessFailed);
         }
         if settlement.abort_matches(loan) {
+            if pending.admitted.is_some()
+                && !pending.abort.as_ref().is_some_and(|abort| abort.released)
+            {
+                return Err(ForkStockServiceError::OccupancyUnavailable);
+            }
             if !is_clean(&pending.child_tables) || !is_clean(&pending.parent_tables) {
                 return Err(ForkStockServiceError::ExposedDirtyTable);
             }

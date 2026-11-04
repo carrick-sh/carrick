@@ -49,6 +49,8 @@ vm_free = [
   "carrick-el1-abi::image_layout_tests::enlarged_image_and_shared_arm_x86_regions_do_not_overlap",
   "carrick-mem::memory::stage1_tests::enlarged_el1_image_and_metadata_are_disjoint_from_guest_ram (owner-approved 1.5 MiB image reservation: shared ARM/CPL0 control, stack and metadata non-overlap plus ARM guest-RAM boundary permissions; existing semantic and runtime bindings remain required)",
   "carrick-el1-abi::refusal_census_tests::refusal_snapshot_preserves_caller_populations_without_changing_service_counts",
+  "carrick-hal::fork_stock::tests::admitted_abort_retains_release_progress_and_pins_across_refusal (admitted abort owns exact release progress, excludes commit after partial release, retains physical pins through refusal, rejects stale execution, and settles once; VM-free only)",
+  "carrick-kernel::kernel::frame_inventory::tests::unpublished_fork_abort_retains_real_permits_across_refusal (1100 unpublished aborts through production fork stock and real inventory, a live parent, refused transfer then exact retry, same inventory revision, one consumed permit and zero abandonment; no runtime abort continuation claim)",
 ]
 embed = [
   "carrick-embed::el1_inotify::el1_inotify09_contract",

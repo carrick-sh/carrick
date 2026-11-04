@@ -10,6 +10,152 @@ use carrick_guest_arch::{ContextGeneration, FrameGpa, KernelVa, MmGeneration};
 use std::cell::RefCell;
 
 #[test]
+fn admitted_abort_retains_release_progress_and_pins_across_refusal() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct PhysicalPin(Arc<AtomicUsize>);
+    impl Drop for PhysicalPin {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let mut stock: ForkStock<UntaggedRoots, PhysicalPin> = ForkStock::new(
+        CARRIER,
+        ForkControlCapacity::exclusive(0x1_0000_0000),
+        UntaggedRoots,
+    );
+    stock
+        .install(
+            (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
+            lifecycles(1),
+        )
+        .unwrap();
+    let parent = parent();
+    let mut exchange = ForkStockExchange::new(request(parent, 302, 2, 1)).unwrap();
+    let loan = stock
+        .loan(&mut NoTableLedger, parent, &mut exchange, |_| true)
+        .unwrap();
+    let completion = PortalForkCompletion {
+        request: loan.request,
+        // SAFETY: exact admitted child fixture.
+        child: unsafe {
+            El1MmHandle::from_admitted_owner(CARRIER, loan.request.child_mm, NonZeroU64::MIN)
+        },
+        parent_generation: ReservationGeneration::INITIAL,
+        child_tables_used: 4096,
+        parent_tables_used: 0,
+    };
+    let mut reserve =
+        ForkStockSettlement::reserve(loan, completion, KernelVa::new(0xffff_8000_0001_0000), 0)
+            .unwrap();
+    stock
+        .reserve_custody(
+            parent,
+            &mut reserve,
+            |_| true,
+            |_| true,
+            |_, _, _| Ok(PhysicalPin(Arc::clone(&dropped))),
+        )
+        .unwrap();
+    let mut abort = ForkStockSettlement::abort(loan);
+    assert_eq!(
+        stock.settle(
+            &mut NoTableLedger,
+            parent,
+            &mut abort,
+            |_| true,
+            |_| true,
+            |_| true
+        ),
+        Err(ForkStockServiceError::OccupancyUnavailable),
+        "an admitted abort cannot bypass its physical release owner",
+    );
+    assert_eq!(
+        stock.release_aborted_child(parent, &abort, |_| false, |_, _| unreachable!()),
+        Err(ForkStockServiceError::ExposedDirtyTable)
+    );
+    let mut progress_address = None;
+    assert_eq!(
+        stock.release_aborted_child(
+            parent,
+            &abort,
+            |_| true,
+            |absence, progress| {
+                assert_eq!(absence.mm(), loan.request.child_mm);
+                progress_address = Some(core::ptr::from_mut(progress).addr());
+                false
+            }
+        ),
+        Err(ForkStockServiceError::OccupancyUnavailable),
+    );
+    let mut commit = ForkStockSettlement::commit_reserved(loan, completion).unwrap();
+    assert_eq!(
+        stock.commit_admitted(&mut NoTableLedger, parent, &mut commit),
+        Err(ForkStockServiceError::InvalidRecord)
+    );
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    assert!(
+        stock
+            .pending(parent.cpu)
+            .unwrap()
+            .admitted_custody()
+            .is_some()
+    );
+    let mut stale = parent;
+    stale.context.generation = ContextGeneration::new(NonZeroU64::new(99).unwrap());
+    assert_eq!(
+        stock.release_aborted_child(stale, &abort, |_| true, |_, _| unreachable!()),
+        Err(ForkStockServiceError::StaleExecution),
+    );
+    stock
+        .release_aborted_child(
+            parent,
+            &abort,
+            |_| true,
+            |_, progress| {
+                assert_eq!(Some(core::ptr::from_mut(progress).addr()), progress_address);
+                assert_eq!(dropped.load(Ordering::SeqCst), 0);
+                true
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        stock.settle(
+            &mut NoTableLedger,
+            parent,
+            &mut abort,
+            |_| true,
+            |_| true,
+            |_| false
+        ),
+        Err(ForkStockServiceError::MemoryAccessFailed)
+    );
+    assert_eq!(
+        stock.commit_admitted(&mut NoTableLedger, parent, &mut commit),
+        Err(ForkStockServiceError::InvalidRecord)
+    );
+    stock
+        .release_aborted_child(parent, &abort, |_| true, |_, _| unreachable!())
+        .unwrap();
+    stock
+        .settle(
+            &mut NoTableLedger,
+            parent,
+            &mut abort,
+            |_| true,
+            |_| true,
+            |_| true,
+        )
+        .unwrap();
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    assert!(stock.pending(parent.cpu).is_none());
+}
+
+#[test]
 fn committed_child_retains_physical_custody_through_quarantine() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -895,6 +1041,11 @@ fn abort_returns_cleared_lifecycle_and_untouched_tables() {
     let mut stock = stock(UntaggedRoots, 4, 1);
     let granted = loan(&mut stock, parent(), 302, 2, 1).unwrap();
     let mut abort = ForkStockSettlement::abort(granted);
+    // No physical owner exists before admission. Aborting such a loan must
+    // not require inventory resources or invoke an admitted-child callback.
+    stock
+        .release_aborted_child(parent(), &abort, |_| false, |_, _| unreachable!())
+        .unwrap();
     // An unclearable lifecycle record keeps the loan outstanding.
     assert_eq!(
         stock.settle(
@@ -1957,6 +2108,9 @@ fn admitted_custody_token_drops_reserved_pins_on_abort_and_consumes_infallibly_o
     assert_eq!(reserve.take(granted), Some(Ok(())));
     assert_eq!(dropped.load(Ordering::SeqCst), 0);
     let mut abort = ForkStockSettlement::abort(granted);
+    stock
+        .release_aborted_child(exec, &abort, |_| true, |_, _| true)
+        .unwrap();
     stock
         .settle(
             &mut NoTableLedger,

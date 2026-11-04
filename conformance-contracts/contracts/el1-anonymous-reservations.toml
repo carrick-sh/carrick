@@ -47,6 +47,8 @@ vm_free = [
   "carrick-x86-cpl0-host::carrier_memory::tests::{stale_absence_preserves_successor_and_live_peer,whole_mm_permit_survives_backend_refusal} (production terminal release authenticates the root before retirement, retains exact permits across refusal, and joins the backend receipt after residency and custody release; real memslot binding in carrick-vmm-kvm::carrier_memory::memslot_tests)",
   "carrick-kernel::kernel::frame_inventory::physical_projection_tests::child_release_join_refuses_foreign_half_without_replacing_original_inventory (neutral release owner preserves the inventory half on rejected backend join)",
   "carrick-x86-cpl0-host::carrier_memory::tests::pending_permit_waits_for_final_vm_owner (preallocated backing/retirement handoff; real KVM bindings additionally retain a live vCPU and sibling VM after outer-wrapper destruction)",
+  "carrick-hal::fork_stock::tests::admitted_abort_retains_release_progress_and_pins_across_refusal (admitted abort owns exact release progress, excludes commit after partial release, retains physical pins through refusal, rejects stale execution, and settles once; VM-free only)",
+  "carrick-kernel::kernel::frame_inventory::tests::unpublished_fork_abort_retains_real_permits_across_refusal (1100 unpublished aborts through production fork stock and real inventory, a live parent, refused transfer then exact retry, same inventory revision, one consumed permit and zero abandonment; no runtime abort continuation claim)",
 ]
 embed = [
   "carrick-embed::el1_sched::el1_anonymous_reservations_stay_in_guest",

@@ -371,8 +371,8 @@ fn release_retired_child<M: CarrierMemoryIo>(
         .map_err(|e| fail(e.to_string()))
 }
 
-// Unpublished rollback retains the pre-existing receipt-only release order.
-// Its admitted-loan continuation is separate from terminal quarantine.
+// Partial admission before an admitted loan token exists retains the old
+// receipt-only rollback. Admitted aborts use the loan-owned release phase.
 fn release_unpublished_child<M: CarrierMemoryIo>(
     memory: &mut CarrierMemory<M>,
     inventory: &dyn carrick_hal::PhysicalFrameInventory,
@@ -1388,12 +1388,6 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         let (physical, mut record) = unsafe {
             self.read_stack_record::<ForkStockSettlement, I>(lease, execution.context, address)
         }?;
-        let admitted_owner = self
-            .fork_stock
-            .pending(execution.cpu)
-            .and_then(|pending| pending.admitted_custody())
-            .map(|admitted| admitted.completion().child);
-        let had_admitted = admitted_owner.is_some();
         let is_abort = record.abort_matches(loan);
         let committed_child = if !is_abort {
             let (completion, _custody, _count) = record
@@ -1413,6 +1407,27 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         } else {
             None
         };
+        if is_abort {
+            let ram = Arc::clone(&self.ram);
+            let pending = self
+                .fork_stock
+                .pending(execution.cpu)
+                .ok_or_else(|| fail("physical fork abort loan"))?;
+            let clean = tables_are_zero(&self._vm, &pending.child_tables)
+                && tables_are_zero(&self._vm, &pending.parent_tables);
+            let memory = &mut self._vm;
+            let inventory = &*self.frame_inventory;
+            self.fork_stock
+                .release_aborted_child(
+                    execution,
+                    &record,
+                    |_| clean,
+                    |absence, progress| {
+                        release_retired_child(memory, &ram, inventory, absence, progress).is_ok()
+                    },
+                )
+                .map_err(|e| fail(format!("physical fork abort release: {e:?}")))?;
+        }
         let window = self.lifecycle_window();
         let memory = &self._vm;
         self.fork_stock
@@ -1425,16 +1440,6 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 |lifecycle| window.clear(lifecycle),
             )
             .map_err(|e: ForkStockServiceError| fail(format!("physical fork settlement: {e:?}")))?;
-        if is_abort && had_admitted {
-            let absence = SlotAbsence::scan(loan.request.child_mm, [])
-                .and_then(|absence| {
-                    absence.with_owner(carrick_hal::GuestFrameOwner::from_admitted(
-                        admitted_owner?,
-                    )?)
-                })
-                .ok_or_else(|| fail("aborted child MM slot absence"))?;
-            release_unpublished_child(&mut self._vm, &*self.frame_inventory, &absence)?;
-        }
         // SAFETY: settlement is a fully initialized array of sixteen u64 words.
         let bytes = unsafe {
             std::slice::from_raw_parts(
