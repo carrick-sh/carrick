@@ -126,6 +126,12 @@ branch and child head. Publication uses that historical parent boundary to
 preserve this layer's own commits separately from its new rebase target.
 A parent's all-time force-push history cannot supply that authority: it might
 have temporarily incorporated and then dropped child commits.
+This preservation check applies to both owned and adopted layers. On an owned
+parent rewrite, the authenticated published child prefix is trusted history;
+only commits above its preserved rebased counterpart belong to the new round.
+Owned rounds retain their normal authority to amend work when the parent has
+not changed. A missing or mismatched exact-child boundary fails closed before
+any push; parent ancestry alone does not prove child history survived.
 
 If the parent moved and this exact child head has no authenticated publication
 boundary, dispatch refuses the rewrite. The director must first rebase the
@@ -135,6 +141,17 @@ parent moves or the layer is retargeted during a round, publication refuses;
 start another round to admit the new parent. This keeps an in-flight round
 from silently changing its rebase target. A live dispatch round on a real
 stack remains a deployment acceptance check after these changes are published.
+
+The first post-deployment check must use a disposable real stack layer: record
+both remote heads, dispatch the child, rewrite the parent, then continue the
+child with the required consent. Verify the child alone advances under its
+lease, its earlier commits and bytes survive, and obsolete parent content is
+gone. Before landing the disposable stack, also exercise a missing-boundary
+refusal and a parent-moved-after-admission refusal. Record both remote heads
+before each refusal attempt and confirm both remain at those recorded values. If any check fails, stop further dispatch rounds on the stack,
+keep its PRs draft, and retain the run receipts and remote-head evidence for
+investigation. Do not deploy infrastructure or bypass trusted-main admission
+to manufacture this acceptance result.
 
 ### Adopting a director PR (#1175)
 
