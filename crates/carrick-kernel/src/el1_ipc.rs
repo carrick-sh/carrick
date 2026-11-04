@@ -305,7 +305,7 @@ impl HostPreparedDescriptions<2> {
     /// output, and requests canonical table growth before preparing output
     /// again. This method can then be retried as the bounded final commit.
     pub fn install_pair(
-        &self,
+        &mut self,
         table: fd::TableId,
         cloexec: bool,
     ) -> Result<[fd::Fd; 2], AdmissionError> {
@@ -1379,7 +1379,7 @@ mod tests {
             ..Default::default()
         };
         for _ in 0..256 {
-            let (object, prepared) = owner.prepare_pipe(65536, flags).unwrap();
+            let (object, mut prepared) = owner.prepare_pipe(65536, flags).unwrap();
             assert_eq!(
                 prepared.install_pair(peer, true),
                 Err(AdmissionError::Shared(IpcError::Fd(
@@ -1402,6 +1402,11 @@ mod tests {
                 result => result.unwrap(),
             };
             assert_eq!(pair, [fd::Fd(0), fd::Fd(1)]);
+            assert_eq!(
+                prepared.install_pair(table, true),
+                Err(AdmissionError::Shared(IpcError::Fd(fd::Error::StalePin)))
+            );
+            assert_eq!(authority.get(table, fd::Fd(2)), Err(fd::Error::BadFd));
             drop(prepared);
             for number in [fd::Fd(0), fd::Fd(1)] {
                 assert_eq!(authority.getfd(table, number), Ok(true));

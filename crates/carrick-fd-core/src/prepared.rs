@@ -21,6 +21,7 @@ enum State {
 pub struct PreparedDescriptions<const N: usize> {
     authority: Option<u64>,
     states: [State; N],
+    published: bool,
 }
 
 impl<const N: usize> PreparedDescriptions<N> {
@@ -29,6 +30,7 @@ impl<const N: usize> PreparedDescriptions<N> {
         Self {
             authority: None,
             states: descriptions.map(State::Backing),
+            published: false,
         }
     }
 
@@ -38,6 +40,9 @@ impl<const N: usize> PreparedDescriptions<N> {
         &mut self,
         authority: &Authority<'_, B, W, T>,
     ) -> Result<(), Error> {
+        if self.published {
+            return Err(Error::StalePin);
+        }
         self.authenticate(authority)?;
         for state in &mut self.states {
             match state {
@@ -95,21 +100,28 @@ impl<const N: usize> PreparedDescriptions<N> {
 impl PreparedDescriptions<2> {
     /// Publish the prepared pair through the single fd-core transaction. A
     /// refusal publishes neither slot and leaves both pins in this owner.
+    /// Success consumes publication authority: subsequent attempts refuse,
+    /// even in another table. The remaining pins are settlement custody only.
     /// Provision slots and secure final output before entering this method;
     /// no guest copy or provisioning runs under its table lock.
     pub fn install_pair<B: SlotBacking, W: LockWait, const T: usize>(
-        &self,
+        &mut self,
         authority: &Authority<'_, B, W, T>,
         table: TableId,
         min: Fd,
         cloexec: bool,
     ) -> Result<[Fd; 2], Error> {
+        if self.published {
+            return Err(Error::StalePin);
+        }
         let [State::Pinned(reader), State::Pinned(writer)] = &self.states else {
             return Err(Error::StalePin);
         };
-        authority
+        let pair = authority
             .transaction(table)?
-            .install_pair(min, [reader, writer], cloexec)
+            .install_pair(min, [reader, writer], cloexec)?;
+        self.published = true;
+        Ok(pair)
     }
 
     /// Transfer a fully admitted pair to another explicit description owner.

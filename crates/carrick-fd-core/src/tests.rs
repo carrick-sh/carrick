@@ -57,6 +57,71 @@ fn prepared_pair_refused_publication_and_growth_preserve_exact_custody() {
 }
 
 #[test]
+fn prepared_pair_contended_publication_retains_retry_and_cancellation_custody() {
+    let (core, arena) = core_with::<2>(2);
+    let host = core.bind(arena, Spin);
+    let bounded = core.bind(arena, BoundedSpin(1));
+    let creator = host.create_table(4, &mut storage(4)).unwrap();
+    let peer = host.create_table(4, &mut storage(4)).unwrap();
+    for cancel in [true, false] {
+        let mut pair = prepared::PreparedDescriptions::new([description(60), description(61)]);
+        pair.admit(&bounded).unwrap();
+        core.tables[0].lock.store(1, Ordering::Release);
+        assert_eq!(
+            pair.install_pair(&bounded, creator, Fd(0), true),
+            Err(Error::Contended)
+        );
+        assert_eq!(host.get(creator, Fd(0)), Err(Error::BadFd));
+        assert_eq!(host.get(peer, Fd(0)), Err(Error::BadFd));
+        core.tables[0].lock.store(0, Ordering::Release);
+        if cancel {
+            assert_eq!(pair.release_next(&bounded), Ok(Some(description(60))));
+            assert_eq!(pair.release_next(&bounded), Ok(Some(description(61))));
+        } else {
+            assert_eq!(
+                pair.install_pair(&bounded, creator, Fd(0), true),
+                Ok([Fd(0), Fd(1)])
+            );
+        }
+        assert_eq!(pair.release_next(&bounded), Ok(None));
+        if !cancel {
+            assert_eq!(host.close(creator, Fd(0)), Ok(Some(description(60))));
+            assert_eq!(host.close(creator, Fd(1)), Ok(Some(description(61))));
+        }
+    }
+    host.destroy_table(creator, |_| {}).unwrap();
+    host.destroy_table(peer, |_| {}).unwrap();
+}
+
+#[test]
+fn prepared_pair_success_cannot_publish_again_after_creator_resumes() {
+    let c = authority::<2, 2>();
+    let creator = c.create_table(8, &mut storage(8)).unwrap();
+    let peer = c.create_table(8, &mut storage(8)).unwrap();
+    let mut pair = prepared::PreparedDescriptions::new([description(50), description(51)]);
+    pair.admit(&c).unwrap();
+    assert_eq!(
+        pair.install_pair(&c, creator, Fd(0), false),
+        Ok([Fd(0), Fd(1)])
+    );
+    assert_eq!(
+        pair.install_pair(&c, creator, Fd(0), false),
+        Err(Error::StalePin)
+    );
+    assert_eq!(
+        pair.install_pair(&c, peer, Fd(0), false),
+        Err(Error::StalePin)
+    );
+    assert_eq!(c.get(creator, Fd(2)), Err(Error::BadFd));
+    assert_eq!(c.get(peer, Fd(0)), Err(Error::BadFd));
+    assert_eq!(pair.release_next(&c), Ok(None));
+    assert_eq!(c.close(creator, Fd(0)), Ok(Some(description(50))));
+    assert_eq!(c.close(creator, Fd(1)), Ok(Some(description(51))));
+    c.destroy_table(creator, |_| {}).unwrap();
+    c.destroy_table(peer, |_| {}).unwrap();
+}
+
+#[test]
 fn prepared_pair_admission_resumes_after_description_growth() {
     let core = Core::<1>::new().unwrap();
     let arena = TestArena::with_ofds(2);
