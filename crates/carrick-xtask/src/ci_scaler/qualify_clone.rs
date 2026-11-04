@@ -1,6 +1,6 @@
 //! Root-only qualification on the template's PVE node. Never uses controller
 //! identities, VMIDs, registration credentials, or the runner pool.
-use super::{CloneLane, ScalerError, execute, live, site};
+use super::{CloneLane, ScalerError, capture, execute, live, site};
 use serde_json::Value;
 use std::{
     path::Path,
@@ -38,7 +38,15 @@ fn command(args: &[&str], deadline: Instant) -> Result<String, ScalerError> {
         .map_err(|_| ScalerError::Guard("non UTF-8 qualification output"))
 }
 fn guest(args: &[&str], deadline: Instant) -> Result<live::GuestOutput, ScalerError> {
-    let mut cmd = vec!["qm", "guest", "exec", VM, "--timeout", "25", "--"];
+    guest_within(args, "25", deadline)
+}
+/// `seconds` bounds the guest agent's wait for the command itself.
+fn guest_within(
+    args: &[&str],
+    seconds: &str,
+    deadline: Instant,
+) -> Result<live::GuestOutput, ScalerError> {
+    let mut cmd = vec!["qm", "guest", "exec", VM, "--timeout", seconds, "--"];
     cmd.extend_from_slice(args);
     let value: Value = serde_json::from_str(&command(&cmd, deadline)?)?;
     if value["exited"] != 1 && value["exited"] != true {
@@ -208,6 +216,29 @@ pub(super) fn run(template: u16) -> Result<(), ScalerError> {
             ],
             deadline,
         )?;
+        // Scoped capture privilege (#1621), on its own deadline so a slow but
+        // valid boot cannot starve the live bpftrace witness: root checks the
+        // installed policy, then the worker account exercises it.
+        let capture = Instant::now() + Duration::from_secs(150);
+        capture::verify_policy(|args| guest(args, capture))?;
+        let worker = guest_within(
+            &[
+                "/usr/sbin/runuser",
+                "-u",
+                "carrick-dispatch-agent",
+                "--",
+                "/usr/local/bin/carrick-xtask",
+                "ci-scaler",
+                "verify-capture",
+            ],
+            "120",
+            capture,
+        )?;
+        if worker.exit != live::GuestExit(0) {
+            return Err(ScalerError::External(
+                "scoped capture privilege check failed",
+            ));
+        }
         let manifest: Value = serde_json::from_str(&checked_guest(
             &["/bin/cat", "/var/lib/carrick-ci/qualification.json"],
             deadline,

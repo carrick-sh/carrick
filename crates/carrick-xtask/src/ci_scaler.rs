@@ -13,6 +13,8 @@ use thiserror::Error;
 
 mod assignment;
 mod claim;
+mod capture;
+pub use capture::bpftrace_front;
 mod github;
 pub(crate) use github::dispatch_workflow_unchanged;
 mod live;
@@ -1282,6 +1284,11 @@ pub enum ScalerAction {
     },
     /// Fail unless the calling (non-root runner) user can open KVM API 12.
     VerifyKvm,
+    /// Print the agent template's scoped capture sudoers drop-in (#1621).
+    CaptureSudoers,
+    /// As the dispatch worker: fail unless sudo admits exactly the scoped
+    /// capture commands (bpftrace, dmesg, journalctl -k) and nothing else.
+    VerifyCapture,
     /// Runner job-start hook: authorize before any workflow step executes.
     AdmitJob {
         /// Ask the credential-holding controller to re-vet the assigned run.
@@ -1374,6 +1381,11 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
         ScalerAction::SweepCloneVolumes { state_dir } => live::sweep_clone_volumes(&state_dir),
         ScalerAction::CheckTemplateRetirement { template } => template_retirement::check(template),
         ScalerAction::VerifyKvm => verify_kvm(),
+        ScalerAction::CaptureSudoers => {
+            print!("{}", capture::SUDOERS);
+            Ok(())
+        }
+        ScalerAction::VerifyCapture => capture::verify(),
         ScalerAction::AdmitJob {
             policy_file,
             state_dir,

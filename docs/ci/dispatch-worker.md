@@ -491,9 +491,13 @@ creation already triggered CI. A push before a PR exists does not count as a
 PR synchronize event. Falling back does not fail the run.
 
 The dedicated nologin accounts `carrick-dispatch-loop` and
-`carrick-dispatch-agent` have distinct uids and groups, no sudo rights and no
-runner group membership. The runner joins their groups and can sudo only to
-those accounts, never root. Runner-owned 0700 state holds the driver, artifacts
+`carrick-dispatch-agent` have distinct uids and groups and no runner group
+membership. Neither can sudo to root, except that `carrick-dispatch-agent`
+may run exactly `bpftrace` (through an argument front), `dmesg` and
+`journalctl -k` as root for capture rounds
+([#1621](contabo-kvm.md#scoped-capture-privilege-1621)). The runner joins
+their groups and can sudo only to those accounts, so it reaches root only
+through those same three commands. Runner-owned 0700 state holds the driver, artifacts
 and `redaction-secrets.json`. Model processes get `private_environment`, no
 GitHub tokens, Actions command files or runner environment. The Unix tool socket
 accepts only the loop uid through Linux `SO_PEERCRED`, refusing the worker uid.
