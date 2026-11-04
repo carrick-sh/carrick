@@ -275,7 +275,12 @@ jobs:
       # Fork PRs, merge groups (which may queue fork code) and the
       # cache-saving schedule events stay hosted, so no trusted or
       # cache-publishing job shares that persistent host with PR code.
-      macos_runner: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","macOS","ARM64","carrick-macos-ci"]' || '"macos-15"' }}
+      # Same-repo PRs and merge groups (whose code is already same-repo) run on
+      # the self-hosted carrick-macos-ci runners; forks and the nightly
+      # schedule stay hosted. Merge groups moved off hosted macos-15 because
+      # its jobs got no runner and were cancelled after ~20 min, ejecting
+      # every group (owner, 2026-11-04, #231; cause tracked in #1603).
+      macos_runner: ${{ ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || github.event_name == 'merge_group') && '["self-hosted","macOS","ARM64","carrick-macos-ci"]' || '"macos-15"' }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -1126,12 +1131,12 @@ jobs:
   macos-authority:
     needs: changes
     if: github.event_name == 'merge_group' && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
-    runs-on: macos-15
+    runs-on: ${{ fromJSON(needs.changes.outputs.macos_runner) }}
     timeout-minutes: 60
     env:
-      # R2 reader for the compiler cache (#858).
-      AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
+      # R2 reader for the compiler cache (#858), hosted runners only.
+      AWS_ACCESS_KEY_ID: ${{ needs.changes.outputs.macos_runner == '"macos-15"' && secrets.SCCACHE_R2_ACCESS_KEY_ID || '' }}
+      AWS_SECRET_ACCESS_KEY: ${{ needs.changes.outputs.macos_runner == '"macos-15"' && secrets.SCCACHE_R2_SECRET_ACCESS_KEY || '' }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -1182,7 +1187,7 @@ jobs:
         run: just ci-prebuild-xtask
       - name: Live host-authority compiler census
         if: ${{ !cancelled() }}
-        run: just xtask authority-debt
+        run: just lease carrick just xtask authority-debt
 
       - name: Compiler cache statistics
         if: ${{ always() }}

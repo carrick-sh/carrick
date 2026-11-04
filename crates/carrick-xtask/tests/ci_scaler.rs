@@ -1893,6 +1893,7 @@ fn cloudmac_ci_macos_runner_jobs_serialize_builds_and_tests_under_carrick_lease(
     assert_eq!(
         macos_runner_jobs,
         vec![
+            "macos-authority",
             "macos-build",
             "macos-clippy",
             "macos-integration",
