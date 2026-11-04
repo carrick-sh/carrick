@@ -1899,10 +1899,12 @@ fn whole_mm_release_scenario(
             assert_eq!(fixture.authority.abandoned_retirement_permits(), 0);
         }
         release_last_owner();
-        let permit = source
-            .claim_unused_backing(backing)
-            .unwrap()
-            .expect("final VM destruction must complete its retained permit");
+        let permit = source.claim_unused_backing(backing).unwrap();
+        assert!(
+            permit.is_some(),
+            "final VM destruction must complete its retained permit"
+        );
+        let permit = permit.unwrap();
         let pending = permit.retire(|_| Ok::<_, ()>(())).unwrap();
         // SAFETY: the backend just destroyed the VM and no registration was
         // published between this absence claim and its cleanup.
@@ -1941,7 +1943,8 @@ fn whole_mm_release_scenario(
         .memory
         .release_child_mm(&*source, &residency, &absence, &mut progress)
         .unwrap();
-    let joined = progress.receipt().expect("production backend join");
+    assert!(progress.receipt().is_some(), "production backend join");
+    let joined = progress.receipt().unwrap();
     assert!(joined.issued_by(source.origin()));
     assert_eq!(joined.revision(), revision);
     assert_eq!(
