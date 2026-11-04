@@ -6868,8 +6868,7 @@ fi
             );
         });
     }
-    #[test]
-    fn stop_only_targets_rounds_triggered_before_it() {
+    fn stop_scenario(selected: &str) {
         shared_fixture(|root| {
             let comment = |thread: u64, id: u64, at: &str, body: &str| {
                 json!({"id":id,"user":{"login":"tjfontaine","type":"User"},
@@ -6925,12 +6924,72 @@ fi
                     1,
                     false,
                 ),
+                (
+                    "same second review stays stopped",
+                    800,
+                    "2026-11-04T18:33:38Z",
+                    3,
+                    1,
+                    true,
+                ),
+                (
+                    "later second review runs",
+                    800,
+                    "2026-11-04T18:33:39Z",
+                    3,
+                    1,
+                    false,
+                ),
+                (
+                    "same second label stays stopped",
+                    800,
+                    "2026-11-04T18:33:38Z",
+                    3,
+                    1,
+                    true,
+                ),
+                (
+                    "later second label runs",
+                    800,
+                    "2026-11-04T18:33:39Z",
+                    3,
+                    1,
+                    false,
+                ),
+                (
+                    "review stop ties comment trigger",
+                    800,
+                    "2026-11-04T18:33:38Z",
+                    3,
+                    1,
+                    true,
+                ),
+                (
+                    "review stop above comment trigger",
+                    800,
+                    "2026-11-04T18:33:38Z",
+                    3,
+                    1,
+                    true,
+                ),
             ] {
+                if name != selected {
+                    continue;
+                }
                 let mut items = vec![comment(799, 1, "2026-11-04T18:33:38Z", "/agent stop")];
                 if stops == 2 {
                     items.push(comment(799, 2, "2026-11-04T22:00:00Z", "/agent stop"));
                 }
-                let trigger = comment(thread, trigger_id, trigger_at, "/agent");
+                let mut trigger = comment(thread, trigger_id, trigger_at, "/agent");
+                if name.ends_with("review stays stopped") || name.ends_with("review runs") {
+                    trigger["html_url"] = json!(format!(
+                        "https://github.com/{REPOSITORY}/pull/800#pullrequestreview-3"
+                    ));
+                } else if name.contains("label") {
+                    trigger["html_url"] = json!(format!(
+                        "https://github.com/{REPOSITORY}/issues/800#event-3"
+                    ));
+                }
                 items.push(trigger.clone());
                 items.push(comment(
                     799,
@@ -6938,6 +6997,26 @@ fi
                     "2026-11-04T18:33:38Z",
                     "keep earlier instructions",
                 ));
+                if name.starts_with("review stop") {
+                    items[0]["html_url"] = json!(format!(
+                        "https://github.com/{REPOSITORY}/pull/800#pullrequestreview-1"
+                    ));
+                    if name == "review stop above comment trigger" {
+                        items[0]["id"] = json!(5);
+                        items[0]["html_url"] = json!(format!(
+                            "https://github.com/{REPOSITORY}/pull/800#pullrequestreview-5"
+                        ));
+                    }
+                    items[0]["submitted_at"] = items[0]["created_at"].clone();
+                }
+                let (reviews, items): (Vec<_>, Vec<_>) = items.into_iter().partition(|c| {
+                    c["html_url"]
+                        .as_str()
+                        .unwrap()
+                        .contains("#pullrequestreview-")
+                });
+                std::fs::write(root.join("stop-reviews.json"), json!([reviews]).to_string())
+                    .unwrap();
                 // The closing PR and issue are read as separate threads.
                 let (pr_items, issue_items): (Vec<_>, Vec<_>) = items
                     .into_iter()
@@ -6975,6 +7054,54 @@ fi
                 }
             }
         });
+    }
+    #[test]
+    fn stop_cancels_target() {
+        stop_scenario("stop cancels its round");
+    }
+    #[test]
+    fn stop_later_issue_trigger_runs() {
+        stop_scenario("later issue trigger");
+    }
+    #[test]
+    fn stop_issue_then_closing_pr_trigger_runs() {
+        stop_scenario("issue stop then closing PR trigger");
+    }
+    #[test]
+    fn stop_twice_then_trigger_runs() {
+        stop_scenario("two stops then trigger");
+    }
+    #[test]
+    fn stop_same_second_after_trigger() {
+        stop_scenario("same second stop after trigger");
+    }
+    #[test]
+    fn stop_same_second_before_comment_trigger() {
+        stop_scenario("same second trigger after stop");
+    }
+    #[test]
+    fn stop_same_second_review_stays_stopped() {
+        stop_scenario("same second review stays stopped");
+    }
+    #[test]
+    fn stop_later_second_review_runs() {
+        stop_scenario("later second review runs");
+    }
+    #[test]
+    fn stop_same_second_label_stays_stopped() {
+        stop_scenario("same second label stays stopped");
+    }
+    #[test]
+    fn stop_later_second_label_runs() {
+        stop_scenario("later second label runs");
+    }
+    #[test]
+    fn stop_review_same_second_as_comment_trigger_stays_stopped() {
+        stop_scenario("review stop ties comment trigger");
+    }
+    #[test]
+    fn stop_review_above_comment_id_stays_stopped() {
+        stop_scenario("review stop above comment trigger");
     }
     /// #1241: a trigger queued behind a round that took it in (its outcome
     /// lists it as seen) collapses; one it didn't see, or only a stranger's
@@ -8256,6 +8383,7 @@ case "$endpoint" in
  */issues/799) cat "$RUNNER_TEMP/issue.json" ;;
  */issues/800/comments) if test -f "$RUNNER_TEMP/layer-comments.json"; then cat "$RUNNER_TEMP/layer-comments.json"; else echo '[[]]'; fi ;;
  */issues/799/comments) cat "$RUNNER_TEMP/comments.json" ;;
+ */pulls/800/reviews) if test -f "$RUNNER_TEMP/stop-reviews.json"; then cat "$RUNNER_TEMP/stop-reviews.json"; else echo '[[]]'; fi ;;
  */pulls/800/commits) cat "$RUNNER_TEMP/commits.json" ;;
  */actions/artifacts*) test ! -f "$RUNNER_TEMP/no-repo-scan" || { echo 'repository-wide artifact scan' >&2; exit 92; }; cat "$RUNNER_TEMP/repo-artifacts.json" ;;
  */workflows/dispatch-worker.yml/runs*) cat "$RUNNER_TEMP/workflow-runs.json" ;;

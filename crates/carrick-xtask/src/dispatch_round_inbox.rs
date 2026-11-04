@@ -223,12 +223,13 @@ fn stop_follows_trigger(w: &Watch, comment: &Value) -> bool {
         std::cmp::Ordering::Greater => true,
         std::cmp::Ordering::Less => false,
         std::cmp::Ordering::Equal => {
-            let trigger_id = w
-                .trigger
-                .as_deref()
-                .and_then(|url| url.rsplit_once("#issuecomment-"))
-                .and_then(|(_, id)| id.parse::<u64>().ok());
-            match (comment["id"].as_u64(), trigger_id) {
+            let issue_comment_id = |url: &str| {
+                url.rsplit_once("#issuecomment-")
+                    .and_then(|(_, id)| id.parse::<u64>().ok())
+            };
+            let trigger_id = w.trigger.as_deref().and_then(issue_comment_id);
+            let stop_id = comment["html_url"].as_str().and_then(issue_comment_id);
+            match (stop_id, trigger_id) {
                 (Some(stop), Some(trigger)) => stop > trigger,
                 _ => true,
             }
