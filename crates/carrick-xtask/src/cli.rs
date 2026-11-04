@@ -66,6 +66,8 @@ pub enum Commands {
     SmokeSigned(crate::smoke_signed::SmokeSignedArgs),
     #[command(about = "Classify CI diff paths and derive referenced doc/agent dependencies")]
     CiChanges(crate::ci_changes::CiChangesArgs),
+    /// Release Hosted CI capacity held by runs that cannot land.
+    CiFairness(crate::ci_fairness::FairnessArgs),
     #[command(about = "Census clean landed worktrees; dry-run unless --apply")]
     WorktreeGc(crate::worktree_gc::WorktreeGcArgs),
 
@@ -243,6 +245,8 @@ pub enum CliError {
     Process(#[from] crate::process_helper::ProcessError),
     #[error("ci-receipt: {0}")]
     CiReceipt(#[from] crate::ci_receipt::ReceiptError),
+    #[error("ci-fairness: {0}")]
+    CiFairness(String),
     #[error("ci-changes: {0}")]
     CiChanges(#[from] crate::ci_changes::CiChangesError),
     #[error("worktree gc: {0}")]
@@ -529,6 +533,8 @@ where
             crate::ci_receipt::run(args)?;
             Ok(())
         }
+        Commands::CiFairness(args) => crate::ci_fairness::run(args, writer)
+            .map_err(|err| CliError::CiFairness(err.to_string())),
         Commands::CiChanges(args) => {
             let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
             crate::ci_changes::run(&root, args, writer)?;

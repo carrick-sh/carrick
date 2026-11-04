@@ -8,6 +8,7 @@ mod authority_dialect;
 mod authority_macro;
 pub mod authority_source;
 pub mod ci_changes;
+pub mod ci_fairness;
 pub mod ci_receipt;
 pub mod ci_scaler;
 pub mod claims;
