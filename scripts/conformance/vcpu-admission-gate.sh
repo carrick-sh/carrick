@@ -77,7 +77,7 @@ done
 # gate's exit status is unambiguous regardless of unrelated harness exit-code
 # semantics (e.g. --max-gating early-abort).
 set +e
-cargo run -p carrick-conformance -- \
+cargo run --locked --offline -p carrick-conformance -- \
     --tier full --workers 1 --flake-retries 0 \
     "${SUITE_ARGS[@]}" \
     --jsonl "$OUT"

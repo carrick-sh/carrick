@@ -32,6 +32,20 @@ fn snapshot_xtask(directory: &Path) -> Result<std::path::PathBuf> {
 const CAPTURE: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
 
+locked=0
+offline=0
+for arg in "$@"; do
+    [ "$arg" != "--" ] || break
+    case "$arg" in
+        --locked) locked=1 ;;
+        --offline) offline=1 ;;
+        --frozen) locked=1; offline=1 ;;
+    esac
+done
+if [ "$locked" != 1 ] || [ "$offline" != 1 ]; then
+    echo "refusing cargo spawn: require --locked and --offline (or --frozen)" >&2
+    exit 1
+fi
 subcmd=""
 prev=""
 for arg in "$@"; do
@@ -153,7 +167,14 @@ fn load_workspace_metadata(root: &Path, real_cargo: &Path) -> Result<Option<Valu
         return Ok(None);
     }
     let out = Command::new(real_cargo)
-        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .args([
+            "metadata",
+            "--locked",
+            "--offline",
+            "--no-deps",
+            "--format-version",
+            "1",
+        ])
         .current_dir(root)
         .output()?;
     if !out.status.success() {

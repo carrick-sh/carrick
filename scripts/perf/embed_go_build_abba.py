@@ -273,8 +273,8 @@ def prepare_arm(
         build_command = [
             "cargo",
             "build",
+            "--locked", "--offline",
             "--release",
-            "--locked",
             "--manifest-path",
             str(manifest_path),
             "--target-dir",
@@ -515,8 +515,8 @@ def _load_payload(path: pathlib.Path) -> tuple[pathlib.Path, dict[str, object]]:
     expected_build_command = [
         "cargo",
         "build",
+        "--locked", "--offline",
         "--release",
-        "--locked",
         "--manifest-path",
         str(manifest_path),
         "--target-dir",

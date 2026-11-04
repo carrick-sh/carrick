@@ -7,7 +7,7 @@ fn check(shards: &str) -> std::process::Output {
     std::fs::write(
         dir.path().join("justfile"),
         format!(
-            "test:\n    cargo test -p one --lib -- --skip serial_host\n    env RUST_TEST_THREADS=1 cargo test -p one --lib serial_host\n{shards}"
+            "test:\n    cargo --locked --offline test -p one --lib -- --skip serial_host\n    env RUST_TEST_THREADS=1 cargo --locked --offline test -p one --lib serial_host\n{shards}"
         ),
     )
     .unwrap();
@@ -20,7 +20,7 @@ fn check(shards: &str) -> std::process::Output {
 #[test]
 fn reordered_shards_preserve_exact_commands_and_serial_environment() {
     let result = check(
-        "test-shard-a:\n    env RUST_TEST_THREADS=1 cargo test -p one --lib serial_host\ntest-shard-b:\n    cargo test -p one --lib -- --skip serial_host\n",
+        "test-shard-a:\n    env RUST_TEST_THREADS=1 cargo --locked --offline test -p one --lib serial_host\ntest-shard-b:\n    cargo --locked --offline test -p one --lib -- --skip serial_host\n",
     );
     assert!(
         result.status.success(),
@@ -31,16 +31,19 @@ fn reordered_shards_preserve_exact_commands_and_serial_environment() {
 
 #[test]
 fn missing_duplicate_filtered_or_unserialized_tests_are_rejected() {
-    let parallel = "    cargo test -p one --lib -- --skip serial_host\n";
-    let serial = "    env RUST_TEST_THREADS=1 cargo test -p one --lib serial_host\n";
+    let parallel = "    cargo --locked --offline test -p one --lib -- --skip serial_host\n";
+    let serial =
+        "    env RUST_TEST_THREADS=1 cargo --locked --offline test -p one --lib serial_host\n";
     for body in [
         parallel.to_string(),
         format!("{parallel}{serial}{serial}"),
         format!(
-            "{parallel}    env RUST_TEST_THREADS=1 cargo test -p one --lib serial_host -- --skip lost_test\n"
+            "{parallel}    env RUST_TEST_THREADS=1 cargo --locked --offline test -p one --lib serial_host -- --skip lost_test\n"
         ),
-        format!("{parallel}    cargo test -p one --lib serial_host\n"),
-        format!("{parallel}    env RUST_TEST_THREADS=2 cargo test -p one --lib serial_host\n"),
+        format!("{parallel}    cargo --locked --offline test -p one --lib serial_host\n"),
+        format!(
+            "{parallel}    env RUST_TEST_THREADS=2 cargo --locked --offline test -p one --lib serial_host\n"
+        ),
     ] {
         let result = check(&format!("test-shard-a:\n{body}"));
         assert!(!result.status.success());
@@ -203,12 +206,12 @@ host := env("CARRICK_TEST_CAPTURE_HOST", os())
 test:
     #!/usr/bin/env bash
     if [ "{{host}}" = "macos" ]; then
-        cargo test -p macos-only --lib
+        cargo --locked --offline test -p macos-only --lib
     else
-        cargo test -p linux-only --lib
+        cargo --locked --offline test -p linux-only --lib
     fi
 test-shard-a:
-    cargo test -p linux-only --lib
+    cargo --locked --offline test -p linux-only --lib
 "#,
     )
     .unwrap();
@@ -235,7 +238,7 @@ fn capture_owns_its_helper_when_a_build_replaces_the_running_binary() {
         .unwrap();
     let executable = dir.path().join("xtask");
     std::fs::hard_link(binary, &executable).unwrap();
-    std::fs::write(dir.path().join("justfile"), "test:\n    rm -f \"$CARRICK_TEST_EXECUTABLE\"\n    cargo test -p one --lib\nlanes:\n    cargo test -p one --lib\ntest-shard-a:\n    cargo run -p carrick-xtask -- test-batch lanes\n").unwrap();
+    std::fs::write(dir.path().join("justfile"), "test:\n    rm -f \"$CARRICK_TEST_EXECUTABLE\"\n    cargo --locked --offline test -p one --lib\nlanes:\n    cargo --locked --offline test -p one --lib\ntest-shard-a:\n    cargo --locked --offline run -p carrick-xtask -- test-batch lanes\n").unwrap();
     let output = Command::new(&executable)
         .current_dir(dir.path())
         .args(["check-test-shards"])
@@ -275,15 +278,15 @@ fn merging_shards_into_test_batch_with_differing_features_is_rejected() {
         dir.path().join("justfile"),
         r#"
 test:
-    cargo test -p alpha --lib
-    cargo test -p beta --lib
+    cargo --locked --offline test -p alpha --lib
+    cargo --locked --offline test -p beta --lib
 
 batched:
-    cargo test -p alpha --lib
-    cargo test -p beta --lib
+    cargo --locked --offline test -p alpha --lib
+    cargo --locked --offline test -p beta --lib
 
 test-shard-a:
-    cargo run -p carrick-xtask -- test-batch batched
+    cargo --locked --offline run -p carrick-xtask -- test-batch batched
 "#,
     )
     .unwrap();
@@ -335,4 +338,102 @@ fn workspace_capture_with_artifact_and_no_cargo_environment() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn capture_refuses_unlocked_or_online_cargo_before_execution() {
+    for invocation in [
+        "cargo test",
+        "cargo test --locked",
+        "cargo test --offline",
+        "cargo test -- --locked --offline",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("justfile"),
+            format!("test:\n    {invocation}\ntest-shard-a:\n    {invocation}\n"),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .args(["--root", dir.path().to_str().unwrap(), "check-test-shards"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "accepted {invocation}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("refusing cargo spawn"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn cache_preparation_failure_is_infrastructure_and_offline_gate_never_fetches() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    let fixture = root.join("fixtures/probe");
+    std::fs::create_dir_all(&fixture).unwrap();
+    std::fs::write(fixture.join("Cargo.toml"), "[workspace]\n").unwrap();
+    std::fs::write(fixture.join("Cargo.lock"), "version = 4\n").unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let cargo = bin.join("cargo");
+    let log = dir.path().join("calls");
+    std::fs::write(&cargo, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CALL_LOG\"\necho 'missing registry cache' >&2\nexit 101\n").unwrap();
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // The fixture-only fake repository needs a real index for --prepare's scan.
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .arg(&root)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/check-fixture-lockfiles.sh");
+    let path = std::env::join_paths(
+        std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let run = |prepare: bool| {
+        let mut command = Command::new("bash");
+        command.arg(&script);
+        if prepare {
+            command.arg("--prepare");
+        }
+        command
+            .arg(&root)
+            .env("PATH", &path)
+            .env("CALL_LOG", &log)
+            .output()
+            .unwrap()
+    };
+    let preparation = run(true);
+    assert_eq!(preparation.status.code(), Some(75));
+    assert!(
+        String::from_utf8_lossy(&preparation.stderr).contains("::error title=Infrastructure::")
+    );
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(calls.lines().count(), 2);
+    assert!(
+        calls
+            .lines()
+            .next()
+            .unwrap()
+            .starts_with("fetch --locked --offline")
+    );
+    assert!(
+        calls
+            .lines()
+            .nth(1)
+            .unwrap()
+            .starts_with("fetch --locked --manifest-path")
+    );
+    std::fs::write(&log, "").unwrap();
+    assert!(!run(false).status.success());
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(calls.lines().count(), 1);
+    assert!(calls.starts_with("metadata --locked --offline"));
 }

@@ -135,7 +135,7 @@ pub fn summary(binary: &Path, results: &[(String, Outcome)], elapsed_secs: f64) 
 }
 
 fn compile(root: &Path, args: &TestIsolatedArgs) -> Result<PathBuf> {
-    let mut cmd = Command::new("cargo");
+    let mut cmd = crate::command::offline_cargo();
     for config in &args.cargo_config {
         cmd.args(["--config", config]);
     }

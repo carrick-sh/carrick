@@ -606,7 +606,7 @@ impl El1NativeClosure {
         if !repo_root.join("Cargo.toml").is_file() {
             return None;
         }
-        let output = Command::new("cargo")
+        let output = crate::command::offline_cargo()
             .current_dir(repo_root)
             .args([
                 "metadata",

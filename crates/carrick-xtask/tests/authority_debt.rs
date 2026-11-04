@@ -23,14 +23,14 @@ fn fixture_manifests(root: &std::path::Path) {
         format!("[workspace]\nmembers = {members:?}\nresolver = \"3\"\n"),
     )
     .unwrap();
-    assert!(
-        std::process::Command::new("cargo")
-            .args(["generate-lockfile", "--offline"])
-            .current_dir(root)
-            .status()
-            .unwrap()
-            .success()
-    );
+    let mut lock = String::from("version = 4\n");
+    for member in &members {
+        let name = member.strip_prefix("crates/").unwrap();
+        lock.push_str(&format!(
+            "\n[[package]]\nname = {name:?}\nversion = \"0.1.0\"\n"
+        ));
+    }
+    std::fs::write(root.join("Cargo.lock"), lock).unwrap();
 }
 fn load_census(
     root: &std::path::Path,
@@ -3192,14 +3192,11 @@ fn build_program_fixture(build: &str, production: &str) -> tempfile::TempDir {
         production,
     )
     .unwrap();
-    assert!(
-        std::process::Command::new("cargo")
-            .args(["generate-lockfile", "--offline"])
-            .current_dir(root.path())
-            .status()
-            .unwrap()
-            .success()
-    );
+    std::fs::write(
+        root.path().join("Cargo.lock"),
+        "version = 4\n[[package]]\nname = \"carrick-build-fixture\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
     root
 }
 

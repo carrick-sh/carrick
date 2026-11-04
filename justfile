@@ -20,8 +20,8 @@ export CARRICK_SCCACHE_REQUEST := replace_regex(_build_env, _build_env_fields, '
 export CARRICK_SCCACHE_SEARCH_PATH := replace_regex(_build_env, _build_env_fields, '$6')
 
 # Shared checkout admission spans foreground commands or complete recipes.
-_cargo := "cargo --config " + quote(CARRICK_CARGO_CACHE_CONFIG)
-_xtask := if env("CARRICK_XTASK_BIN", "") != "" { quote(env("CARRICK_XTASK_BIN")) } else { _cargo + " run --locked -p carrick-xtask --" }
+_cargo := "cargo --locked --offline --config " + quote(CARRICK_CARGO_CACHE_CONFIG)
+_xtask := if env("CARRICK_XTASK_BIN", "") != "" { quote(env("CARRICK_XTASK_BIN")) } else { _cargo + " run --locked --offline -p carrick-xtask --" }
 _admit := _xtask + " worktree-run --"
 # Only xtask test recipes opt into the exact, extracted CI test build.
 _xtask_test_artifacts := if env("CARRICK_XTASK_TEST_MANIFEST", "") != "" { "--artifacts " + quote(env("CARRICK_XTASK_TEST_MANIFEST")) } else { "" }
@@ -318,10 +318,8 @@ _lint-domains-source:
     python3 -m unittest scripts/tests/test_host_authority_transitions.py scripts/tests/test_runtime_aborts.py scripts/tests/test_runtime_global_state.py scripts/tests/test_authority_debt_retirement.py scripts/tests/test_authority_dialect.py
     python3 -m unittest scripts/tests/test_conformance_contract_policy.py
     {{_cargo}} run -p carrick-conformance-contract --bin check-contracts -- --root .
-    # All-feature metadata includes dependencies for other hosts and optional
-    # features that this host's build never fetched. Populate the locked cache
-    # before the offline personality-boundary graph check on fresh runners.
-    {{_cargo}} fetch --locked
+    # Resolve every optional/host dependency from the cache prepared before
+    # the gate, without turning a registry outage into a source failure.
     {{_cargo}} metadata --locked --offline --all-features --format-version 1 > target/cargo-metadata.json
     # Nested fixture workspaces (fixtures/*/Cargo.lock) sit outside the root
     # workspace, so the --locked gates above never resolve them; without this
@@ -331,8 +329,7 @@ _lint-domains-source:
     # Every checkout crate a signed fixture reaches is a bundle input; only
     # dependency-free leaf crates may be reached, so kernel-only commits keep
     # the published fixture bundle valid (#891). The closure resolves offline,
-    # so populate every fixture lock (including conformance-probes, which the
-    # lockfile gate above does not fetch) on fresh runners first.
+    # so check every fixture lock against the already prepared cache.
     {{_xtask}} fixtures fetch
     {{_xtask}} fixtures leaf-closure
     {{_cargo}} run -p carrick-conformance-contract --bin check-personality-boundary -- --root . --metadata-file target/cargo-metadata.json
@@ -1197,13 +1194,13 @@ build-cpl0:
     set -euo pipefail
     case "$(uname -s):$(uname -m)" in
         Linux:x86_64|Linux:amd64)
-            cargo build -p carrick-x86-cpl0 --release --target x86_64-unknown-none
+            cargo --locked --offline build -p carrick-x86-cpl0 --release --target x86_64-unknown-none
             ;;
     esac
 
 # Run KVM VMM unit and integration tests, building the CPL0 image on x86_64 first.
 kvm-tests *ARGS: build-cpl0
-    cargo test -p carrick-vmm-kvm {{ARGS}}
+    cargo --locked --offline test -p carrick-vmm-kvm {{ARGS}}
 
 # L1 cross-check: our owned crates compile for aarch64-linux AND the
 # platform-linux closure links no HVF/applevisor (the C4-decouple proof).

@@ -121,6 +121,7 @@ EXPECTED_COMMANDS = {
     "macos-cli-default": [
         "cargo",
         "clippy",
+        "--locked", "--offline",
         "-p",
         "carrick-cli",
         "--target",
@@ -135,6 +136,7 @@ EXPECTED_COMMANDS = {
     "macos-runtime-default": [
         "cargo",
         "clippy",
+        "--locked", "--offline",
         "-p",
         "carrick-runtime",
         "--target",
@@ -148,6 +150,7 @@ EXPECTED_COMMANDS = {
     "macos-hvf-default": [
         "cargo",
         "clippy",
+        "--locked", "--offline",
         "-p",
         "carrick-vmm-hvf",
         "--target",
@@ -188,6 +191,7 @@ for host, features in (
         EXPECTED_COMMANDS[f"{host}-{target}"] = [
             "cargo",
             "clippy",
+            "--locked", "--offline",
             "-p",
             package,
             "--no-default-features",
@@ -1524,6 +1528,7 @@ class MatrixOrchestrationTest(unittest.TestCase):
             (
                 "cargo",
                 "clippy",
+                "--locked", "--offline",
                 "-p",
                 "attacker-package",
                 "--target",

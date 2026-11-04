@@ -448,9 +448,9 @@ class InteractiveSshTests(unittest.TestCase):
 
     def test_remote_command_carries_the_guest_env_prefix(self) -> None:
         vm = BSDVM.VMS["freebsd-arm64"]
-        argv = self._argv("freebsd-arm64", ["cargo", "build", "-p", "carrick-mem"])
+        argv = self._argv("freebsd-arm64", ["cargo", "build", "--locked", "--offline", "-p", "carrick-mem"])
         self.assertTrue(argv[-1].startswith(vm.remote_env_prefix))
-        self.assertTrue(argv[-1].endswith("cargo build -p carrick-mem"))
+        self.assertTrue(argv[-1].endswith("cargo build --locked --offline -p carrick-mem"))
 
     def test_remote_command_is_quoted_not_concatenated(self) -> None:
         argv = self._argv("netbsd-arm64", ["sh", "-c", "echo a b"])
@@ -1392,7 +1392,7 @@ class GateTests(unittest.TestCase):
             BSDVM.STAGES["stage1"].cmds[0].replace(
                 "{platform_feature}", BSDVM.VMS["netbsd-arm64"].platform_feature
             ),
-            "cd /root/carrick && cargo build -p carrick-cli "
+            "cd /root/carrick && cargo build --locked --offline -p carrick-cli "
             "--no-default-features --features platform-netbsd",
         )
 

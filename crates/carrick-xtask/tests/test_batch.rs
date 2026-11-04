@@ -52,15 +52,12 @@ fn batch_fixture(isolated: bool) {
         #[test] #[ignore] fn intentionally_ignored() { panic!("ignore lost"); }
         "#.as_bytes()).unwrap();
     }
-    std::fs::write(dir.path().join("justfile"), "lanes:\n    env RUST_MIN_STACK=8388608 cargo test --lib --features left -- --skip serial_host --skip excluded\n    env RUST_TEST_THREADS=1 cargo test --lib --features right serial_host\ndocs:\n    cargo test documented\nred:\n    cargo test --lib excluded\nsingle:\n    env RUST_MIN_STACK=8388608 cargo test --lib --features left,right -- --skip excluded --skip serial_host --test-threads=1\n").unwrap();
-    assert!(
-        Command::new("cargo")
-            .args(["generate-lockfile", "--offline"])
-            .current_dir(dir.path())
-            .status()
-            .unwrap()
-            .success()
-    );
+    std::fs::write(dir.path().join("justfile"), "lanes:\n    env RUST_MIN_STACK=8388608 cargo --locked --offline test --lib --features left -- --skip serial_host --skip excluded\n    env RUST_TEST_THREADS=1 cargo --locked --offline test --lib --features right serial_host\ndocs:\n    cargo --locked --offline test documented\nred:\n    cargo --locked --offline test --lib excluded\nsingle:\n    env RUST_MIN_STACK=8388608 cargo --locked --offline test --lib --features left,right -- --skip excluded --skip serial_host --test-threads=1\n").unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.lock"),
+        "version = 4\n[[package]]\nname = \"batch-fixture\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
     let run = |recipe| {
         Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
             .args(["--root", dir.path().to_str().unwrap(), "test-batch", recipe])
@@ -160,15 +157,12 @@ fn exported_batch_fixture(symlinked: bool) {
         assert!(out.status.success());
         assert_eq!(out.stdout, b"fixture CLI\n");
     }"#).unwrap();
-    std::fs::write(root.join("justfile"), "lanes:\n    cargo test --all-features --lib --test smoke -- --skip red\nred:\n    cargo test --all-features --lib -- red\nchanged:\n    cargo test --lib\n").unwrap();
-    assert!(
-        Command::new("cargo")
-            .args(["generate-lockfile", "--offline"])
-            .current_dir(root)
-            .status()
-            .unwrap()
-            .success()
-    );
+    std::fs::write(root.join("justfile"), "lanes:\n    cargo --locked --offline test --all-features --lib --test smoke -- --skip red\nred:\n    cargo --locked --offline test --all-features --lib -- red\nchanged:\n    cargo --locked --offline test --lib\n").unwrap();
+    std::fs::write(
+        root.join("Cargo.lock"),
+        "version = 4\n[[package]]\nname = \"archived-batch\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
     let run = |extra: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
             .args(["--root", root.to_str().unwrap(), "test-batch"])

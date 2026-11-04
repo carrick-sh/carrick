@@ -50,5 +50,5 @@ export CARRICK_SCCACHE_REQUEST CARRICK_SCCACHE_SEARCH_PATH
 # Direct signed entry points source this file; just uses the same option in
 # its Cargo command prefix. exec callers must pass the option explicitly.
 cargo() {
-    command cargo --config "$CARRICK_CARGO_CACHE_CONFIG" "$@"
+    command cargo --locked --offline --config "$CARRICK_CARGO_CACHE_CONFIG" "$@"
 }

@@ -42,7 +42,7 @@ struct Lane {
 }
 
 fn metadata(root: &Path) -> Result<Value> {
-    let out = Command::new("cargo")
+    let out = crate::command::offline_cargo()
         .args(["metadata", "--no-deps", "--format-version", "1"])
         .current_dir(root)
         .output()?;
@@ -353,8 +353,9 @@ pub fn run(root: &Path, args: TestBatchArgs) -> Result<()> {
         }
         if lane.doc {
             // rustdoc has no --no-run mode; preserve its separate contract.
-            let mut doc = Command::new("cargo");
-            doc.current_dir(&lane.record[2]).args(&lane.record[3..]);
+            let mut doc = crate::command::offline_cargo();
+            doc.current_dir(&lane.record[2])
+                .args(crate::command::cargo_replay_args(&lane.record[3..]));
             if !doc.status()?.success() {
                 red.push("doctest".to_owned());
             }
@@ -406,9 +407,9 @@ pub fn run(root: &Path, args: TestBatchArgs) -> Result<()> {
             }
         }
         if lane.implicit_doc {
-            let mut doc = Command::new("cargo");
+            let mut doc = crate::command::offline_cargo();
             doc.current_dir(&lane.record[2])
-                .args(&lane.record[3..])
+                .args(crate::command::cargo_replay_args(&lane.record[3..]))
                 .arg("--doc");
             if !doc.status()?.success() {
                 red.push("implicit doctest".to_owned());
@@ -445,7 +446,7 @@ fn compile(
     features: &BTreeSet<String>,
     targets: &BTreeSet<(String, String)>,
 ) -> Result<(Binaries, BTreeSet<PathBuf>)> {
-    let mut cmd = Command::new("cargo");
+    let mut cmd = crate::command::offline_cargo();
     let first = lanes.first().ok_or("missing lanes")?;
     let test_index = first
         .record
@@ -454,7 +455,11 @@ fn compile(
         .position(|s| s == "test")
         .ok_or("missing cargo test")?
         + 3;
-    cmd.args(&first.record[3..test_index]);
+    cmd.args(
+        first.record[3..test_index]
+            .iter()
+            .filter(|arg| !matches!(arg.as_str(), "--locked" | "--offline" | "--frozen")),
+    );
     for lane in lanes {
         let index = lane
             .record

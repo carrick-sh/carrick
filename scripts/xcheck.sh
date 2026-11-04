@@ -19,11 +19,11 @@ run() {
 }
 
 ok=0
-check_macos()     { run macos     cargo check -p carrick-cli; }
-check_linux_arm() { run linux-arm cargo check --target aarch64-unknown-linux-gnu -p carrick-hal -p carrick-vmm-kvm; }
-check_linux_x86() { run linux-x86 cargo check --target x86_64-unknown-linux-gnu  -p carrick-vmm-kvm -p carrick-x86; }
-check_freebsd()   { run freebsd   cargo check --target x86_64-unknown-freebsd    -p carrick-vmm-bhyve -p carrick-x86; }
-check_netbsd()    { run netbsd    cargo check --target x86_64-unknown-netbsd      -p carrick-vmm-nvmm -p carrick-x86; }
+check_macos()     { run macos     cargo check --locked --offline -p carrick-cli; }
+check_linux_arm() { run linux-arm cargo check --locked --offline --target aarch64-unknown-linux-gnu -p carrick-hal -p carrick-vmm-kvm; }
+check_linux_x86() { run linux-x86 cargo check --locked --offline --target x86_64-unknown-linux-gnu  -p carrick-vmm-kvm -p carrick-x86; }
+check_freebsd()   { run freebsd   cargo check --locked --offline --target x86_64-unknown-freebsd    -p carrick-vmm-bhyve -p carrick-x86; }
+check_netbsd()    { run netbsd    cargo check --locked --offline --target x86_64-unknown-netbsd      -p carrick-vmm-nvmm -p carrick-x86; }
 
 case "${1:-all}" in
   macos)     check_macos ;;

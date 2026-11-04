@@ -30,7 +30,10 @@ def census_json(root):
         (root / "Cargo.toml").write_text(
             f'[workspace]\nmembers = {json.dumps(members)}\nresolver = "3"\n'
         )
-        subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=root, check=True, capture_output=True)
+        (root / "Cargo.lock").write_text("version = 4\n" + "".join(
+            f'\n[[package]]\nname = {json.dumps(member.split("/")[-1])}\nversion = "0.1.0"\n'
+            for member in members
+        ))
     result = subprocess.run(
         [
             str(ROOT / "target/debug/carrick-xtask"),

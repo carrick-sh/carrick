@@ -507,7 +507,7 @@ fn execute(
         if !logged(&mut build, &lease, &output.join("build.log"))? {
             return Err(fail("just build failed"));
         }
-        let mut accept = Command::new("cargo");
+        let mut accept = crate::command::offline_cargo();
         accept.current_dir(&tree).args([
             "run",
             "--locked",

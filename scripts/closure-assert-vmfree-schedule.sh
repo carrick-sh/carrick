@@ -6,7 +6,7 @@ if ! command -v grep >/dev/null 2>&1; then
     exit 1
 fi
 cd "$(dirname "$0")/.."
-cargo_tree="$(cargo tree -p carrick-cli --edges normal --prefix none --format '{p} [{f}]')"
+cargo_tree="$(cargo tree --locked --offline -p carrick-cli --edges normal --prefix none --format '{p} [{f}]')"
 if grep -Eq '^carrick-kernel-example v' <<<"$cargo_tree"; then
     echo 'vmfree schedule leaked into the product dependency closure' >&2
     exit 1

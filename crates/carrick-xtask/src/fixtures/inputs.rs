@@ -111,29 +111,22 @@ pub fn fetch_plan(root: &Path) -> Result<Vec<PathBuf>> {
         .collect()
 }
 
-/// Explicit network preparation, separate from the offline resolution and
+/// Verify explicit preparation, separate from offline resolution and
 /// builds: `cargo fetch --locked` every fixture lockfile into the host Cargo
 /// cache, which the controlled build environment then shares read-only by
 /// symlink. Contents are pinned by each lockfile's checksums; a warm cache
-/// is used offline first and needs no network. Returns the fetch count.
+/// is used offline and needs no network. Returns the fetch count.
 pub fn fetch_dependencies(root: &Path) -> Result<usize> {
     let manifests = fetch_plan(root)?;
     for manifest in &manifests {
         let directory = manifest
             .parent()
             .ok_or_else(|| fail("fixture manifest without directory"))?;
-        let fetch = |offline: bool| -> Result<std::process::Output> {
-            let mut command = Command::new("cargo");
-            command.current_dir(directory).args(["fetch", "--locked"]);
-            if offline {
-                command.arg("--offline");
-            }
-            Ok(command.arg("--manifest-path").arg(manifest).output()?)
-        };
-        if fetch(true)?.status.success() {
-            continue;
-        }
-        let output = fetch(false)?;
+        let output = crate::command::offline_cargo()
+            .current_dir(directory)
+            .args(["fetch", "--manifest-path"])
+            .arg(manifest)
+            .output()?;
         if !output.status.success() {
             return Err(fail(format!(
                 "cargo fetch --locked failed for {} ({}): {}",
