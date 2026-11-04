@@ -4,11 +4,20 @@ use std::process::Command;
 
 #[test]
 fn batch_builds_once_and_preserves_filters_serial_environment_and_failures() {
+    batch_fixture(false);
+}
+
+#[test]
+fn el1_batch_releases_fixture_memory_without_changing_population() {
+    batch_fixture(true);
+}
+
+fn batch_fixture(isolated: bool) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("src")).unwrap();
     std::fs::write(
         dir.path().join("Cargo.toml"),
-        "[package]\nname = 'batch-fixture'\nversion = '0.1.0'\nedition = '2021'\n[features]\nleft = []\nright = []\n",
+        format!("[package]\nname = '{}'\nversion = '0.1.0'\nedition = '2021'\n[features]\nleft = []\nright = []\n", if isolated { "carrick-el1-linux" } else { "batch-fixture" }),
     )
     .unwrap();
     std::fs::write(
@@ -20,6 +29,7 @@ fn batch_builds_once_and_preserves_filters_serial_environment_and_failures() {
         pub fn documented() {}
         #[test] fn parallel() {
             assert!(std::path::Path::new("Cargo.toml").exists());
+            assert_eq!(std::env::var("RUST_MIN_STACK").unwrap(), "8388608");
             assert!(cfg!(feature = "left") && cfg!(feature = "right"));
         }
         #[test] fn serial_host() {
@@ -29,7 +39,20 @@ fn batch_builds_once_and_preserves_filters_serial_environment_and_failures() {
     "#,
     )
     .unwrap();
-    std::fs::write(dir.path().join("justfile"), "lanes:\n    cargo test --lib --features left -- --skip serial_host --skip excluded\n    env RUST_TEST_THREADS=1 cargo test --lib --features right serial_host\ndocs:\n    cargo test documented\nred:\n    cargo test --lib excluded\n").unwrap();
+    if isolated {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.path().join("src/lib.rs"))
+            .unwrap();
+        file.write_all(r#"
+        static RETAINED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        #[test] fn retained_one() { assert_eq!(RETAINED.fetch_add(1, std::sync::atomic::Ordering::SeqCst), 0); }
+        #[test] fn retained_two() { assert_eq!(RETAINED.fetch_add(1, std::sync::atomic::Ordering::SeqCst), 0); }
+        #[test] #[ignore] fn intentionally_ignored() { panic!("ignore lost"); }
+        "#.as_bytes()).unwrap();
+    }
+    std::fs::write(dir.path().join("justfile"), "lanes:\n    env RUST_MIN_STACK=8388608 cargo test --lib --features left -- --skip serial_host --skip excluded\n    env RUST_TEST_THREADS=1 cargo test --lib --features right serial_host\ndocs:\n    cargo test documented\nred:\n    cargo test --lib excluded\nsingle:\n    env RUST_MIN_STACK=8388608 cargo test --lib --features left,right -- --skip excluded --skip serial_host --test-threads=1\n").unwrap();
     assert!(
         Command::new("cargo")
             .args(["generate-lockfile", "--offline"])
@@ -53,6 +76,19 @@ fn batch_builds_once_and_preserves_filters_serial_environment_and_failures() {
         String::from_utf8_lossy(&green.stderr)
     );
     assert!(String::from_utf8_lossy(&green.stderr).contains("test-batch: one compile"));
+    if isolated {
+        let text = String::from_utf8_lossy(&green.stdout);
+        assert!(text.contains("3 passed; 0 failed; 1 ignored;"), "{text}");
+        assert!(text.contains("1 passed; 0 failed; 0 ignored;"), "{text}");
+        assert!(String::from_utf8_lossy(&green.stderr).contains("test-isolated:"));
+        let single = run("single");
+        assert!(
+            single.status.success(),
+            "{}",
+            String::from_utf8_lossy(&single.stderr)
+        );
+        assert!(String::from_utf8_lossy(&single.stderr).contains("jobs=1 selected=4"));
+    }
     let docs = run("docs");
     assert!(
         docs.status.success(),
