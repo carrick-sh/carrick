@@ -12,7 +12,7 @@ entitlements="./scripts/entitlements.plist"
 trace_log="docs/last-tier-b.trace"
 max_traps="${CARRICK_TIER_B_MAX_TRAPS:-30}"
 
-cargo build --locked --offline --release --bin carrick --message-format short >&2
+cargo build --locked --release --bin carrick --message-format short >&2
 codesign --force --sign - --entitlements "$entitlements" "$binary" >&2
 
 mkdir -p "$(dirname "$trace_log")"

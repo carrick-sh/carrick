@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Resolve locked workspaces offline. --prepare is the sole CI network phase,
+# Resolve locked workspaces using the caller's Cargo network policy.
+# --prepare is the sole CI network phase,
 # run after rust-cache restore and bounded by the CI step's timeout-minutes.
 # A failed preparation is infrastructure (exit 75), never a test verdict.
 set -euo pipefail
@@ -34,9 +35,9 @@ for manifest in "${manifests[@]}"; do
             echo "::error title=Infrastructure::Cargo cache preparation failed: $manifest" >&2
             exit 75
         fi
-    elif ! cargo metadata --locked --offline --format-version 1 \
+    elif ! cargo metadata --locked --format-version 1 \
         --manifest-path "$manifest" >/dev/null; then
-        echo "fixture lockfile gate: offline resolution failed: $manifest" >&2
+        echo "fixture lockfile gate: locked resolution failed: $manifest" >&2
         exit 1
     fi
 done

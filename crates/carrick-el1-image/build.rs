@@ -309,7 +309,7 @@ fn main() {
     let mut build_cmd = Command::new(&cargo);
     build_cmd
         .arg("build")
-        .args(["--locked", "--offline"])
+        .arg("--locked")
         .arg("-p")
         .arg("carrick-el1-linux")
         .arg("--target")

@@ -64,14 +64,14 @@ if [[ "$mode" == "hvf-mailbox" ]]; then
   echo "==> signed identity"
   codesign -dv --verbose=2 target/release/carrick 2>&1 | grep -E '^(Identifier|TeamIdentifier|Signature)='
   echo "==> running hvf_mailbox_report (profile=$profile warmup_blocks=$CARRICK_HVF_MAILBOX_WARMUP_BLOCKS sample_blocks=$CARRICK_HVF_MAILBOX_SAMPLE_BLOCKS)"
-  cargo test --locked --offline -p carrick-cli --test perf_runner hvf_mailbox_report -- --nocapture --ignored
+  cargo test --locked -p carrick-cli --test perf_runner hvf_mailbox_report -- --nocapture --ignored
   echo "==> mailbox report: $CARRICK_HVF_MAILBOX_REPORT"
   tail -n 4 "$CARRICK_HVF_MAILBOX_REPORT"
   exit 0
 fi
 ./scripts/build-probes.sh >/dev/null
 echo "==> running perf_gate (profile=$profile reps=$CARRICK_PERF_REPS)"
-cargo test --locked --offline -p carrick-cli --test perf_runner perf_gate -- --nocapture --include-ignored
+cargo test --locked -p carrick-cli --test perf_runner perf_gate -- --nocapture --include-ignored
 
 echo "==> latest result rows:"
 latest="$(ls -t docs/perf-results/*.jsonl 2>/dev/null | head -1 || true)"

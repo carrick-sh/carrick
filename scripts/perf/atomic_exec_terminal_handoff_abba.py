@@ -546,7 +546,7 @@ def build_and_run_arm(
     census = [clean_census("before_build", {os.getpid()})]
     arm_power_before = power_state(repo)
     build_command = [
-        "cargo", "test", "--locked", "--offline", "--release", "-p", "carrick-runtime", "--lib", "--no-run", "--message-format=json",
+        "cargo", "test", "--locked", "--release", "-p", "carrick-runtime", "--lib", "--no-run", "--message-format=json",
     ]
     build, build_census = monitored_command(
         build_command, cwd=worktree, env=None, phase="build"

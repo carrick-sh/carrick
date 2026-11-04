@@ -53,7 +53,7 @@ fn serial_host_fetch_requires_prepared_cache_without_network_fallback() {
     std::fs::write(
         &cargo,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+            "#!/bin/sh\nprintf '%s %s\\n' \"$CARGO_NET_OFFLINE\" \"$*\" >> '{}'\nexit 0\n",
             log.display()
         ),
     )
@@ -63,7 +63,15 @@ fn serial_host_fetch_requires_prepared_cache_without_network_fallback() {
     let mut paths = vec![bin.path().to_path_buf()];
     paths.extend(std::env::split_paths(&old));
     unsafe { std::env::set_var("PATH", std::env::join_paths(paths).unwrap()) };
+    let old_offline = std::env::var_os("CARGO_NET_OFFLINE");
+    unsafe { std::env::set_var("CARGO_NET_OFFLINE", "true") };
     let result = carrick_xtask::fixtures::fetch_dependencies(fake.path());
+    unsafe {
+        match &old_offline {
+            Some(value) => std::env::set_var("CARGO_NET_OFFLINE", value),
+            None => std::env::remove_var("CARGO_NET_OFFLINE"),
+        }
+    }
     unsafe { std::env::set_var("PATH", &old) };
     assert_eq!(result.unwrap(), plan.len());
     let calls: Vec<String> = std::fs::read_to_string(&log)
@@ -73,14 +81,14 @@ fn serial_host_fetch_requires_prepared_cache_without_network_fallback() {
         .collect();
     assert_eq!(calls.len(), plan.len());
     for call in calls {
-        assert!(call.starts_with("--locked --offline fetch --manifest-path "));
+        assert!(call.starts_with("true --locked fetch --manifest-path "));
     }
     // A missing cache is an explicit error; no online retry may follow.
     std::fs::write(&log, "").unwrap();
     std::fs::write(
         &cargo,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\necho 'missing cache' >&2\nexit 101\n",
+            "#!/bin/sh\nprintf '%s %s\\n' \"$CARGO_NET_OFFLINE\" \"$*\" >> '{}'\necho 'missing cache' >&2\nexit 101\n",
             log.display()
         ),
     )
@@ -88,7 +96,14 @@ fn serial_host_fetch_requires_prepared_cache_without_network_fallback() {
     let mut paths = vec![bin.path().to_path_buf()];
     paths.extend(std::env::split_paths(&old));
     unsafe { std::env::set_var("PATH", std::env::join_paths(paths).unwrap()) };
+    unsafe { std::env::set_var("CARGO_NET_OFFLINE", "true") };
     let error = carrick_xtask::fixtures::fetch_dependencies(fake.path()).unwrap_err();
+    unsafe {
+        match &old_offline {
+            Some(value) => std::env::set_var("CARGO_NET_OFFLINE", value),
+            None => std::env::remove_var("CARGO_NET_OFFLINE"),
+        }
+    }
     unsafe { std::env::set_var("PATH", &old) };
     assert!(error.to_string().contains("cargo fetch --locked failed"));
     assert!(error.to_string().contains("missing cache"));

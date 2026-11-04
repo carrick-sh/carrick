@@ -568,7 +568,6 @@ fn handle_write_seek(args: &[String]) -> Result<(), String> {
         .args([
             "build",
             "--locked",
-            "--offline",
             "-p",
             "carrick-kernel-example",
             "--features",

@@ -237,7 +237,7 @@ def harness_dry_run_lines(
     """The conformance harness's own planned argv for one suite."""
     result = subprocess.run(
         [
-            "cargo", "run", "--locked", "--offline", "-q", "-p", "carrick-conformance", "--",
+            "cargo", "run", "--locked", "-q", "-p", "carrick-conformance", "--",
             "--dry-run", "--manifest", str(manifest), "--tier", "full",
             "--suite", suite_name, "--carrick-bin", str(binary),
         ],

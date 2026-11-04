@@ -479,7 +479,7 @@ pub fn package_guest_image(
         .unwrap_or_else(|| PathBuf::from("cargo"));
 
     let mut cmd = Command::new(&cargo);
-    cmd.args(["build", "--locked", "--offline"]);
+    cmd.args(["build", "--locked"]);
     cmd.arg("--manifest-path").arg(&manifest_path);
     if let Some(pkg) = &config.package {
         cmd.arg("-p").arg(pkg);

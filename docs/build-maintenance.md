@@ -231,7 +231,8 @@ honors the existing `CARRICK_HOST_LEASE_PATH` environment plumbing.
 
 ### Prepare Cargo dependencies before gates
 
-Recipes and test harness Cargo children use `--locked --offline`. Restore the
+Recipes use `--locked` and inherit `CARGO_NET_OFFLINE=true` after CI cache
+preparation. Test harness children always require locked, offline resolution. Restore the
 existing Rust dependency cache, then run
 `scripts/check-fixture-lockfiles.sh --prepare` once before building or testing.
 This extends the fixture lockfile preparation to the root and active nested
@@ -241,8 +242,8 @@ CI bounds the entire preparation step to ten minutes and reports failures with
 an `Infrastructure` annotation and exit 75. Later validation never fetches.
 
 The director workflow delta is
-[`1571-offline-cargo.patch`](ci/patches/1571-offline-cargo.patch). Publish it with
-the code change; it extends the existing rust-cache restores, then exports
+[`1571-offline-cargo.patch`](ci/patches/1571-offline-cargo.patch). It may land before or after
+the recipe changes; it extends the existing rust-cache restores, then exports
 `CARGO_NET_OFFLINE=true` for subsequent steps. Historical baseline and selector
 checkouts prepare their own root lockfile in their own directory, without
 requiring new preparation tooling in an old commit. Tool installation uses

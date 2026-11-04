@@ -20,8 +20,8 @@ export CARRICK_SCCACHE_REQUEST := replace_regex(_build_env, _build_env_fields, '
 export CARRICK_SCCACHE_SEARCH_PATH := replace_regex(_build_env, _build_env_fields, '$6')
 
 # Shared checkout admission spans foreground commands or complete recipes.
-_cargo := "cargo --locked --offline --config " + quote(CARRICK_CARGO_CACHE_CONFIG)
-_xtask := if env("CARRICK_XTASK_BIN", "") != "" { quote(env("CARRICK_XTASK_BIN")) } else { _cargo + " run --locked --offline -p carrick-xtask --" }
+_cargo := "cargo --locked --config " + quote(CARRICK_CARGO_CACHE_CONFIG)
+_xtask := if env("CARRICK_XTASK_BIN", "") != "" { quote(env("CARRICK_XTASK_BIN")) } else { _cargo + " run --locked -p carrick-xtask --" }
 _admit := _xtask + " worktree-run --"
 # Only xtask test recipes opt into the exact, extracted CI test build.
 _xtask_test_artifacts := if env("CARRICK_XTASK_TEST_MANIFEST", "") != "" { "--artifacts " + quote(env("CARRICK_XTASK_TEST_MANIFEST")) } else { "" }
@@ -320,7 +320,7 @@ _lint-domains-source:
     {{_cargo}} run -p carrick-conformance-contract --bin check-contracts -- --root .
     # Resolve every optional/host dependency from the cache prepared before
     # the gate, without turning a registry outage into a source failure.
-    {{_cargo}} metadata --locked --offline --all-features --format-version 1 > target/cargo-metadata.json
+    {{_cargo}} metadata --locked --all-features --format-version 1 > target/cargo-metadata.json
     # Nested fixture workspaces (fixtures/*/Cargo.lock) sit outside the root
     # workspace, so the --locked gates above never resolve them; without this
     # step lock drift surfaced only at `just fixtures-publish`. No compile, so it
@@ -1194,13 +1194,13 @@ build-cpl0:
     set -euo pipefail
     case "$(uname -s):$(uname -m)" in
         Linux:x86_64|Linux:amd64)
-            cargo --locked --offline build -p carrick-x86-cpl0 --release --target x86_64-unknown-none
+            cargo --locked build -p carrick-x86-cpl0 --release --target x86_64-unknown-none
             ;;
     esac
 
 # Run KVM VMM unit and integration tests, building the CPL0 image on x86_64 first.
 kvm-tests *ARGS: build-cpl0
-    cargo --locked --offline test -p carrick-vmm-kvm {{ARGS}}
+    cargo --locked test -p carrick-vmm-kvm {{ARGS}}
 
 # L1 cross-check: our owned crates compile for aarch64-linux AND the
 # platform-linux closure links no HVF/applevisor (the C4-decouple proof).

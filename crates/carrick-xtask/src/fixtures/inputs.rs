@@ -111,18 +111,18 @@ pub fn fetch_plan(root: &Path) -> Result<Vec<PathBuf>> {
         .collect()
 }
 
-/// Verify explicit preparation, separate from offline resolution and
+/// Explicit preparation, separate from offline resolution and
 /// builds: `cargo fetch --locked` every fixture lockfile into the host Cargo
 /// cache, which the controlled build environment then shares read-only by
 /// symlink. Contents are pinned by each lockfile's checksums; a warm cache
-/// is used offline and needs no network. Returns the fetch count.
+/// inherits offline mode after CI preparation. Returns the fetch count.
 pub fn fetch_dependencies(root: &Path) -> Result<usize> {
     let manifests = fetch_plan(root)?;
     for manifest in &manifests {
         let directory = manifest
             .parent()
             .ok_or_else(|| fail("fixture manifest without directory"))?;
-        let output = crate::command::offline_cargo()
+        let output = crate::command::locked_cargo()
             .current_dir(directory)
             .args(["fetch", "--manifest-path"])
             .arg(manifest)
