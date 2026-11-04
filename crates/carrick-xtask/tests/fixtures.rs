@@ -3224,3 +3224,34 @@ fn restore_refuses_a_shared_lease() {
         "{error}"
     );
 }
+
+#[test]
+fn signed_gate_artifact_requires_exact_sha_and_matching_inputs() {
+    let mut f = Fixture::new();
+    let output = CanonicalTempDir::new();
+    let sha = git(f.repo.path(), &["rev-parse", "HEAD"]);
+    let artifact = fixtures::archive::pack(&f.path, output.path()).unwrap();
+    carrick_xtask::signed_gate::verify_fixture_artifact(f.repo.path(), &artifact, &sha).unwrap();
+    fixtures::archive::restore(f.repo.path(), &artifact, Some(&sha), &private_gate().lease)
+        .unwrap();
+    fixtures::verify_installed(f.repo.path()).unwrap();
+
+    // Equal input identity does not authorize an archive from another SHA
+    // in this Actions lane, although general fixture reuse permits it.
+    f.manifest.source_head = "a".repeat(40).try_into().unwrap();
+    f.republish();
+    let wrong_sha = fixtures::archive::pack(&f.path, output.path()).unwrap();
+    let error =
+        carrick_xtask::signed_gate::verify_fixture_artifact(f.repo.path(), &wrong_sha, &sha)
+            .unwrap_err();
+    assert!(error.to_string().contains("source SHA differs"), "{error}");
+
+    f.manifest.source_head = sha.clone().try_into().unwrap();
+    *f.manifest.sources.values_mut().next().unwrap() = hash(b"different inputs");
+    f.republish();
+    let wrong_inputs = fixtures::archive::pack(&f.path, output.path()).unwrap();
+    let error =
+        carrick_xtask::signed_gate::verify_fixture_artifact(f.repo.path(), &wrong_inputs, &sha)
+            .unwrap_err();
+    assert!(error.to_string().contains("input identity"), "{error}");
+}
