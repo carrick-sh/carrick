@@ -55,7 +55,14 @@ fn batch_fixture(isolated: bool) {
     std::fs::write(dir.path().join("justfile"), "lanes:\n    env RUST_MIN_STACK=8388608 cargo --locked --offline test --lib --features left -- --skip serial_host --skip excluded\n    env RUST_TEST_THREADS=1 cargo --locked --offline test --lib --features right serial_host\ndocs:\n    cargo --locked --offline test documented\nred:\n    cargo --locked --offline test --lib excluded\nsingle:\n    env RUST_MIN_STACK=8388608 cargo --locked --offline test --lib --features left,right -- --skip excluded --skip serial_host --test-threads=1\n").unwrap();
     std::fs::write(
         dir.path().join("Cargo.lock"),
-        "version = 4\n[[package]]\nname = \"batch-fixture\"\nversion = \"0.1.0\"\n",
+        format!(
+            "version = 4\n[[package]]\nname = \"{}\"\nversion = \"0.1.0\"\n",
+            if isolated {
+                "carrick-el1-linux"
+            } else {
+                "batch-fixture"
+            }
+        ),
     )
     .unwrap();
     let run = |recipe| {

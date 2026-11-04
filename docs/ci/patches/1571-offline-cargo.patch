@@ -1,6 +1,6 @@
 diff --git a/.github/actions/prepare-cargo/action.yml b/.github/actions/prepare-cargo/action.yml
 new file mode 100644
-index 0000000..8e1077f
+index 000000000..8e1077f2b
 --- /dev/null
 +++ b/.github/actions/prepare-cargo/action.yml
 @@ -0,0 +1,45 @@
@@ -50,7 +50,7 @@ index 0000000..8e1077f
 +        fi
 +        echo 'CARGO_NET_OFFLINE=true' >> "$GITHUB_ENV"
 diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
-index 4d4b729..576e97f 100644
+index 4d4b72977..576e97f59 100644
 --- a/.github/workflows/ci.yml
 +++ b/.github/workflows/ci.yml
 @@ -79,6 +79,9 @@ jobs:
@@ -370,7 +370,7 @@ index 4d4b729..576e97f 100644
          id: superseded
          env:
 diff --git a/.github/workflows/kernel-runtime.yml b/.github/workflows/kernel-runtime.yml
-index 1c03d17..5e94b50 100644
+index 1c03d17f1..5e94b50b9 100644
 --- a/.github/workflows/kernel-runtime.yml
 +++ b/.github/workflows/kernel-runtime.yml
 @@ -60,6 +60,9 @@ jobs:
