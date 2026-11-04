@@ -98,7 +98,8 @@ pub(crate) fn legacy_feature_mask(insn: &Instruction) -> u32 {
 pub(crate) fn supported(insn: &Instruction) -> bool {
     let features = insn.cpuid_features();
     !matches!(insn.mnemonic(), Mnemonic::Tzcnt | Mnemonic::Lzcnt)
-        && (baseline_sse(insn) || legacy_feature_mask(insn) != 0
+        && (baseline_sse(insn)
+            || legacy_feature_mask(insn) != 0
             || (matches!(insn.encoding(), EncodingKind::Legacy | EncodingKind::VEX)
                 && !features.is_empty()
                 && features.iter().all(|f| {
@@ -240,7 +241,7 @@ fn slot(offset: usize) -> MemoryOperand {
 /// the leaf's context pointer. AVX GPR operands are explicit and remapped.
 pub(crate) fn image(insn: &Instruction) -> Result<Vec<u8>, String> {
     let legacy = insn.encoding() == EncodingKind::Legacy;
-    if legacy
+    if legacy_feature_mask(insn) != 0
         && !(std::is_x86_feature_detected!("sse3")
             && std::is_x86_feature_detected!("ssse3")
             && std::is_x86_feature_detected!("sse4.1")
@@ -253,6 +254,8 @@ pub(crate) fn image(insn: &Instruction) -> Result<Vec<u8>, String> {
     }
     for feature in insn.cpuid_features() {
         let available = match feature {
+            CpuidFeature::SSE => std::is_x86_feature_detected!("sse"),
+            CpuidFeature::SSE2 => std::is_x86_feature_detected!("sse2"),
             CpuidFeature::BMI1 => std::is_x86_feature_detected!("bmi1"),
             CpuidFeature::BMI2 => std::is_x86_feature_detected!("bmi2"),
             CpuidFeature::FMA => std::is_x86_feature_detected!("fma"),
@@ -464,7 +467,7 @@ pub(crate) fn step(
             if size > 32 {
                 return Err(X86Exception::invalid_opcode(ip));
             }
-            let legacy_aligned = legacy(insn)
+            let legacy_aligned = insn.encoding() == EncodingKind::Legacy
                 && size == 16
                 && !matches!(
                     insn.mnemonic(),

@@ -5070,7 +5070,8 @@ fn advertised_mmx_uses_virtual_x87_image() {
         0x0f, 0x6f, 0x07, 0x0f, 0xfc, 0xc0, 0x0f, 0x7f, 0x06, 0x0f, 0x77, 0x0f, 0x05,
     ];
     let (mut cpu, mut mem, va) = setup_snippet(&code);
-    cpu.set_cpuid_view(Box::new(carrick_x86::GuestCpuidView::default()));
+    cpu.set_cpuid_view(Box::new(carrick_x86::GuestCpuidView::default()))
+        .unwrap();
     cpu.context_mut().gpr[reg::RDI] = 0x800000;
     cpu.context_mut().gpr[reg::RSI] = 0x800010;
     mem.write_direct(0x800000, &[0x81; 8]);
@@ -5084,7 +5085,8 @@ fn advertised_mmx_em_precedes_ts_and_operand_faults() {
     for bytes in [&[0x0f, 0x6f, 0x07][..], &[0x0f, 0xfc, 0xc0], &[0x0f, 0x77]] {
         for (controls, invalid) in [(4, true), (8, false), (12, true)] {
             let (mut cpu, mut mem, va) = setup_snippet(&[bytes, &[0x0f, 0x05]].concat());
-            cpu.set_cpuid_view(Box::new(carrick_x86::GuestCpuidView::default()));
+            cpu.set_cpuid_view(Box::new(carrick_x86::GuestCpuidView::default()))
+                .unwrap();
             cpu.context_mut().gpr[reg::RDI] = 0xdead0000;
             cpu.context_mut().cr0 |= controls;
             let before = cpu.context().fxsave.0;
@@ -5103,7 +5105,8 @@ fn advertised_mmx_em_precedes_ts_and_operand_faults() {
 #[test]
 fn advertised_clflush_checks_guest_translation() {
     let (mut cpu, mut mem, va) = setup_snippet(&[0x0f, 0xae, 0x3f, 0x0f, 0x05]);
-    cpu.set_cpuid_view(Box::new(carrick_x86::GuestCpuidView::default()));
+    cpu.set_cpuid_view(Box::new(carrick_x86::GuestCpuidView::default()))
+        .unwrap();
     cpu.context_mut().gpr[reg::RDI] = 0x800001;
     step_ok(&mut cpu, &mut mem, sys(va + 3, va + 5));
     cpu.context_mut().rip = va;
@@ -5139,7 +5142,8 @@ fn advertised_baseline_faults_and_feature_revocation() {
     step_ok(&mut cpu, &mut mem, pf(va, PF_ERR_USER, 0xdead0000));
     // MMX cross-page load must retain both virtual register file and RIP.
     let (mut cpu, mut mem, va) = setup_snippet(&[0x0f, 0x6f, 0x07, 0x0f, 0x05]);
-    cpu.set_cpuid_view(Box::new(carrick_x86::GuestCpuidView::default()));
+    cpu.set_cpuid_view(Box::new(carrick_x86::GuestCpuidView::default()))
+        .unwrap();
     cpu.context_mut().gpr[reg::RDI] = 0x801ffc;
     let before = cpu.context().fxsave.0;
     step_ok(&mut cpu, &mut mem, pf(va, PF_ERR_USER, 0x802000));
@@ -5147,14 +5151,16 @@ fn advertised_baseline_faults_and_feature_revocation() {
     // Replacing the authority revokes already prepared MMX and CLFLUSH code.
     for bytes in [&[0x0f, 0x6f, 0x07][..], &[0x0f, 0xae, 0x3f], &[0x0f, 0x77]] {
         let (mut cpu, mut mem, va) = setup_snippet(&[bytes, &[0x0f, 0x05]].concat());
-        cpu.set_cpuid_view(Box::new(carrick_x86::GuestCpuidView::default()));
+        cpu.set_cpuid_view(Box::new(carrick_x86::GuestCpuidView::default()))
+            .unwrap();
         cpu.context_mut().gpr[reg::RDI] = 0x800000;
         step_ok(
             &mut cpu,
             &mut mem,
             sys(va + bytes.len() as u64, va + bytes.len() as u64 + 2),
         );
-        cpu.set_cpuid_view(Box::new(carrick_softcpu_x86::Level0CpuidView));
+        cpu.set_cpuid_view(Box::new(carrick_softcpu_x86::Level0CpuidView))
+            .unwrap();
         cpu.context_mut().rip = va;
         cpu.context_mut().gpr[reg::RDI] = 0xdead0000;
         let before = cpu.context().fxsave.0;
@@ -5282,7 +5288,8 @@ fn advertised_bit_allowlist_executes_through_step_block() {
                     .into_iter()
                     .map(|(l, s)| (l, s, view.cpuid(l, s)))
                     .collect(),
-                )));
+                )))
+                .unwrap();
                 cpu.context_mut().cpl = 0;
                 cpu.context_mut().cr4 &= !((1 << 20) | (1 << 21));
                 cpu.context_mut().cr4 |= 1 << 18;
