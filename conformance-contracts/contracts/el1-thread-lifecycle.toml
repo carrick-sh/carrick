@@ -66,6 +66,8 @@ rationale = "EL1 thread lifecycle stage L0 (docs/superpowers/plans/2026-09-30-el
 # cover the changed completion path; no thread birth or exit path changed.
 embed = [
   "carrick-embed::el1_sched::{el1_thread_lifecycle_spawn_slope,el1_thread_lifecycle_tgkill_right_after_clone,el1_thread_lifecycle_mask_storm_exactly_once,el1_thread_lifecycle_cleartid_tid_reuse,el1_thread_lifecycle_rlimit_nproc_exact,el1_thread_lifecycle_fork_during_clone_storm,el1_thread_lifecycle_exit_group_and_exec_during_clone_storm,el1_thread_lifecycle_ptrace_traceclone,el1_thread_lifecycle_seccomp_clone_filter,el1_thread_lifecycle_parked_threads_beyond_executor_pool}",
+  "carrick-vmm-kvm::cpl0_lifecycle::x5_shared_clone_exit (real KVM; two live MMs, clone/exit/clear-tid wake, 16/64/256 births per MM; host and guest use the same sidecar)",
+  "carrick-vmm-kvm::cpl0_fork_e2e (real KVM; fork/COW/wait4/rusage and issued child PID; lifecycle sidecar placement red/green)",
 ]
 
 # Post-exec process forks use a distinct child lifecycle page and require no
