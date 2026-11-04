@@ -18,7 +18,10 @@
 //! builder also runs while provisioning.
 
 use super::{ScalerError, live};
-use carrick_capture::{FRONT_PATH, REFUSAL, REFUSED_INSTALL, REFUSED_SHAPE, SCRIPT_DIR, SCRIPTS};
+use carrick_capture::{
+    FRONT_PATH, PathMode, REFUSAL, REFUSED_INSTALL, REFUSED_SHAPE, SCRIPT_DIR, SCRIPTS,
+    verify_directory_chain,
+};
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -52,9 +55,26 @@ fn script_path(name: &str) -> String {
     format!("{SCRIPT_DIR}/{name}.bt")
 }
 
+/// Parse `stat -c '%f %u'` (raw `st_mode` in hex, then the numeric uid)
+/// for one path; `stat` without `-L` reports a symlink itself.
+fn parse_lstat(stdout: &str) -> Option<PathMode> {
+    let (mode, uid) = stdout.strip_suffix('\n')?.split_once(' ')?;
+    let hex = |text: &str| text.bytes().all(|byte| byte.is_ascii_hexdigit());
+    let decimal = |text: &str| text.bytes().all(|byte| byte.is_ascii_digit());
+    if !hex(mode) || !decimal(uid) {
+        return None;
+    }
+    Some(PathMode {
+        mode: u32::from_str_radix(mode, 16).ok()?,
+        uid: uid.parse().ok()?,
+    })
+}
+
 /// Root, through the guest agent: the whole sudoers policy and the drop-in
 /// pass `visudo -c`, the drop-in holds exactly [`SUDOERS`], the front and
-/// the script directory are root-owned and root-writable only, the
+/// the script directory are root-owned and root-writable only, every
+/// directory above each of them up to `/` is a real directory with the same
+/// rule ([`verify_directory_chain`], the walk the front runs), the
 /// directory holds exactly the allowlisted scripts with their reviewed
 /// bytes, bpftrace is installed and the retired front is gone.
 pub(super) fn verify_policy(
@@ -98,6 +118,43 @@ pub(super) fn verify_policy(
         return Err(ScalerError::Guard(
             "capture drop-in, front or scripts have the wrong owner, mode or type",
         ));
+    }
+    // A file is only as root-only as the directories above it: a symlinked
+    // or worker-writable parent would let the worker swap the front sudo
+    // runs, or a script, after this check (TOCTOU). The walk is the one the
+    // front itself runs over the script directory.
+    let front_dir = Path::new(FRONT_PATH)
+        .parent()
+        .ok_or(ScalerError::Guard("the capture front path has no parent"))?;
+    for (dir, refusal) in [
+        (
+            front_dir,
+            "a directory above the capture front is a symlink, not a directory, or not root-owned and root-writable only",
+        ),
+        (
+            Path::new(SCRIPT_DIR),
+            "a directory above the capture scripts is a symlink, not a directory, or not root-owned and root-writable only",
+        ),
+    ] {
+        let mut transport = None;
+        let chain = verify_directory_chain(dir, Path::new("/"), 0, |path| {
+            let shown = path.display().to_string();
+            let stdout =
+                passes(&["/usr/bin/stat", "-c", "%f %u", &shown]).unwrap_or_else(|error| {
+                    transport = Some(error);
+                    None
+                });
+            stdout
+                .as_deref()
+                .and_then(parse_lstat)
+                .ok_or_else(|| format!("cannot lstat {shown}"))
+        });
+        if let Some(error) = transport {
+            return Err(error);
+        }
+        if chain.is_err() {
+            return Err(ScalerError::Guard(refusal));
+        }
     }
     let listed = passes(&[
         "/usr/bin/find",
@@ -614,10 +671,15 @@ mod tests {
         visudo_drop_in: i32,
         installed: String,
         modes: String,
+        /// `stat -c '%f %u'` output per walked directory; absent = missing.
+        parents: Vec<(&'static str, &'static str)>,
         listing: String,
         script: String,
         retired_front: bool,
     }
+
+    /// Root-owned 0755 directory, as `stat -c '%f %u'` prints it.
+    const ROOT_DIR: &str = "41ed 0\n";
 
     impl Clone {
         fn good() -> Self {
@@ -625,31 +687,122 @@ mod tests {
                 visudo_drop_in: 0,
                 installed: SUDOERS.to_owned(),
                 modes: "440 root root regular file\n755 root root regular file\n755 root root directory\n644 root root regular file\n".to_owned(),
+                parents: [
+                    "/",
+                    "/usr",
+                    "/usr/local",
+                    "/usr/local/sbin",
+                    "/usr/local/lib",
+                    SCRIPT_DIR,
+                ]
+                .map(|path| (path, ROOT_DIR))
+                .to_vec(),
                 listing: "signal-kill-sender.bt\n".to_owned(),
                 script: SCRIPTS[0].source.to_owned(),
                 retired_front: false,
             }
         }
 
-        fn check(&self) -> Result<(), ScalerError> {
-            verify_policy(|args| {
-                Ok(match args {
-                    ["/usr/sbin/visudo", "-c", "-q"] => guest_output(0, ""),
-                    ["/usr/sbin/visudo", .., path] if *path == SUDOERS_PATH => {
-                        guest_output(self.visudo_drop_in, "")
-                    }
-                    ["/bin/cat", path] if *path == SUDOERS_PATH => guest_output(0, &self.installed),
-                    ["/bin/cat", _] => guest_output(0, &self.script),
-                    ["/usr/bin/stat", ..] => guest_output(0, &self.modes),
-                    ["/usr/bin/find", ..] => guest_output(0, &self.listing),
-                    ["/usr/bin/test", "!", "-e", RETIRED_FRONT] => {
-                        guest_output(i32::from(self.retired_front), "")
-                    }
-                    ["/usr/bin/bpftrace", "--version"] => guest_output(0, "bpftrace v0.23.2\n"),
-                    other => panic!("unexpected guest command {other:?}"),
-                })
-            })
+        /// The good clone with `path`'s lstat answer replaced.
+        fn parent(path: &str, stat: &'static str) -> Self {
+            let mut clone = Self::good();
+            for entry in &mut clone.parents {
+                if entry.0 == path {
+                    entry.1 = stat;
+                }
+            }
+            clone
         }
+
+        fn answer(&self, args: &[&str]) -> live::GuestOutput {
+            match args {
+                ["/usr/sbin/visudo", "-c", "-q"] => guest_output(0, ""),
+                ["/usr/sbin/visudo", .., path] if *path == SUDOERS_PATH => {
+                    guest_output(self.visudo_drop_in, "")
+                }
+                ["/bin/cat", path] if *path == SUDOERS_PATH => guest_output(0, &self.installed),
+                ["/bin/cat", _] => guest_output(0, &self.script),
+                ["/usr/bin/stat", "-c", "%f %u", path] => self
+                    .parents
+                    .iter()
+                    .find(|(known, _)| known == path)
+                    .map_or_else(|| guest_output(1, ""), |(_, stat)| guest_output(0, stat)),
+                ["/usr/bin/stat", ..] => guest_output(0, &self.modes),
+                ["/usr/bin/find", ..] => guest_output(0, &self.listing),
+                ["/usr/bin/test", "!", "-e", RETIRED_FRONT] => {
+                    guest_output(i32::from(self.retired_front), "")
+                }
+                ["/usr/bin/bpftrace", "--version"] => guest_output(0, "bpftrace v0.23.2\n"),
+                other => panic!("unexpected guest command {other:?}"),
+            }
+        }
+
+        fn check(&self) -> Result<(), ScalerError> {
+            verify_policy(|args| Ok(self.answer(args)))
+        }
+    }
+
+    #[test]
+    fn policy_check_walks_every_parent_of_the_front_and_the_scripts() {
+        let clone = Clone::good();
+        let mut walked = Vec::new();
+        verify_policy(|args| {
+            if let ["/usr/bin/stat", "-c", "%f %u", path] = args {
+                walked.push((*path).to_owned());
+            }
+            Ok(clone.answer(args))
+        })
+        .expect("intended install");
+        assert_eq!(
+            walked,
+            [
+                "/usr/local/sbin",
+                "/usr/local",
+                "/usr",
+                "/",
+                SCRIPT_DIR,
+                "/usr/local/lib",
+                "/usr/local",
+                "/usr",
+                "/",
+            ]
+        );
+    }
+
+    #[test]
+    fn policy_check_refuses_a_symlinked_shared_or_foreign_parent_of_the_front_or_scripts() {
+        // (path, `stat -c '%f %u'`): wrong owner, group-writable,
+        // world-writable, symlink, regular file, missing.
+        let wrong = [
+            ("/usr/local/sbin", "41ed 1000\n"),
+            ("/usr/local", "41fd 0\n"),
+            ("/usr", "41ef 0\n"),
+            ("/", "43ff 0\n"),
+            ("/usr/local/sbin", "a1ff 0\n"),
+            ("/usr/local", "81ed 0\n"),
+            ("/usr/local/lib", "41ed 1000\n"),
+            ("/usr/local/lib", "41fd 0\n"),
+            ("/usr/local/lib", "41ef 0\n"),
+            ("/usr/local/lib", "a1ff 0\n"),
+            ("/usr/local/lib", "81ed 0\n"),
+            ("/usr/local/lib", "garbage\n"),
+            ("/usr/local/sbin", "41ed 0"),
+        ];
+        for (path, stat) in wrong {
+            let refused = Clone::parent(path, stat).check();
+            assert!(
+                matches!(refused, Err(ScalerError::Guard(reason)) if reason.starts_with("a directory above the capture")),
+                "{path} as {stat:?} gave {refused:?}"
+            );
+        }
+        let mut missing = Clone::good();
+        missing
+            .parents
+            .retain(|(path, _)| *path != "/usr/local/sbin");
+        assert!(
+            missing.check().is_err(),
+            "admitted a missing front directory"
+        );
     }
 
     #[test]

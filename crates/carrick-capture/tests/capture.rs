@@ -4,8 +4,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use carrick_capture::{
-    BPFTRACE, DEFAULT_SECONDS, GRACE_SECONDS, MAX_SECONDS, REFUSAL, REFUSED_SHAPE, Request,
-    SCRIPTS, Script, TIMEOUT, command, parse, verify_installed,
+    BPFTRACE, DEFAULT_SECONDS, GRACE_SECONDS, MAX_SECONDS, PathMode, REFUSAL, REFUSED_SHAPE,
+    Request, SCRIPTS, Script, TIMEOUT, command, parse, verify_directory_chain, verify_installed,
 };
 use std::ffi::OsString;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
@@ -580,6 +580,83 @@ fn verify_installed_admits_only_the_reviewed_root_only_copy() {
     std::fs::rename(&linked.dir, &real).expect("move");
     symlink(&real, &linked.dir).expect("symlink dir");
     assert!(check(&linked).is_err(), "admitted a symlinked directory");
+}
+
+/// A fake `lstat` over `(path, st_mode, uid)` rows; unknown paths fail.
+fn fake_lstat(
+    rows: &[(&'static str, u32, u32)],
+    walked: &mut Vec<String>,
+) -> impl FnMut(&Path) -> Result<PathMode, String> {
+    let rows = rows.to_vec();
+    move |path: &Path| {
+        walked.push(path.display().to_string());
+        rows.iter()
+            .find(|(known, _, _)| Path::new(known) == path)
+            .map(|&(_, mode, uid)| PathMode { mode, uid })
+            .ok_or_else(|| format!("{}: no such file", path.display()))
+    }
+}
+
+#[test]
+fn directory_chain_walks_to_the_trusted_root_and_refuses_any_untrusted_parent() {
+    const DIR: u32 = 0o040_755;
+    let good = [
+        ("/", DIR, 0),
+        ("/usr", DIR, 0),
+        ("/usr/local", DIR, 0),
+        ("/usr/local/sbin", DIR, 0),
+    ];
+    let chain = |rows: &[(&'static str, u32, u32)], walked: &mut Vec<String>| {
+        verify_directory_chain(
+            Path::new("/usr/local/sbin"),
+            Path::new("/"),
+            0,
+            fake_lstat(rows, walked),
+        )
+    };
+    let mut walked = Vec::new();
+    assert_eq!(chain(&good, &mut walked), Ok(()));
+    assert_eq!(walked, ["/usr/local/sbin", "/usr/local", "/usr", "/"]);
+
+    // Each row replaces one parent: wrong owner, group-writable,
+    // world-writable (also sticky), symlinked, a regular file, a socket.
+    for (path, mode, uid) in [
+        ("/usr/local/sbin", DIR, 1000),
+        ("/usr/local", 0o040_775, 0),
+        ("/usr", 0o040_757, 0),
+        ("/", 0o041_777, 0),
+        ("/usr/local/sbin", 0o120_777, 0),
+        ("/usr/local", 0o120_755, 0),
+        ("/usr", 0o100_755, 0),
+        ("/usr/local", 0o140_755, 0),
+    ] {
+        let rows = good.map(|row| {
+            if row.0 == path {
+                (path, mode, uid)
+            } else {
+                row
+            }
+        });
+        let refused = chain(&rows, &mut Vec::new());
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|reason| reason.starts_with(path)),
+            "{path} at {mode:o} uid {uid} gave {refused:?}"
+        );
+    }
+
+    // A missing parent, and a directory outside the trusted root.
+    assert!(chain(&good[1..], &mut Vec::new()).is_err());
+    assert!(
+        verify_directory_chain(
+            Path::new("/usr/local/sbin"),
+            Path::new("/opt"),
+            0,
+            fake_lstat(&good, &mut Vec::new()),
+        )
+        .is_err()
+    );
 }
 
 // ---- Exec shape -----------------------------------------------------------

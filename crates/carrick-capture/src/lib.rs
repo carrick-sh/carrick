@@ -115,33 +115,76 @@ fn parse_seconds(value: &OsStr) -> Result<u32, String> {
     Ok(seconds)
 }
 
+/// The two fields of an `lstat` result the directory walk reads. Callers
+/// fill it without following a final symlink, so a symlink reports its own
+/// type and never its target's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathMode {
+    /// `st_mode`, file type bits included.
+    pub mode: u32,
+    pub uid: u32,
+}
+
+const S_IFMT: u32 = 0o170_000;
+const S_IFDIR: u32 = 0o040_000;
+const S_IFLNK: u32 = 0o120_000;
+
+impl PathMode {
+    fn of(meta: &Metadata) -> Self {
+        Self {
+            mode: meta.mode(),
+            uid: meta.uid(),
+        }
+    }
+}
+
+/// The one root-trust path walk, for this binary's own script check and
+/// for qualification's check of the installed front and script directory
+/// (`carrick-xtask ci-scaler qualify-clone`). `dir` and each ancestor up to
+/// and including `trusted_root` must be a real directory, never a symlink,
+/// owned by `owner` and writable by nobody else. `lstat` reports one path
+/// without following it; production passes `/` and uid 0.
+pub fn verify_directory_chain(
+    dir: &Path,
+    trusted_root: &Path,
+    owner: u32,
+    mut lstat: impl FnMut(&Path) -> Result<PathMode, String>,
+) -> Result<(), String> {
+    let mut current = dir;
+    loop {
+        let meta = lstat(current)?;
+        if meta.mode & S_IFMT == S_IFLNK {
+            return Err(format!("{} is a symlink", current.display()));
+        }
+        if meta.mode & S_IFMT != S_IFDIR {
+            return Err(format!("{} is not a directory", current.display()));
+        }
+        owner_only(current, meta, owner)?;
+        if current == trusted_root {
+            return Ok(());
+        }
+        current = current
+            .parent()
+            .ok_or_else(|| format!("{} is outside {}", dir.display(), trusted_root.display()))?;
+    }
+}
+
 /// Check the installed copy of `script` under `dir` and return its path.
-/// `dir` and each ancestor up to and including `trusted_root` must be a real
-/// directory owned by `owner` that nobody else can write; the script must be
-/// a regular file with the same owner and write rule, byte-identical to the
-/// compiled-in source. Production passes [`SCRIPT_DIR`], `/` and uid 0.
+/// `dir` must pass [`verify_directory_chain`] up to `trusted_root`; the
+/// script must be a regular file with the same owner and write rule,
+/// byte-identical to the compiled-in source. Production passes
+/// [`SCRIPT_DIR`], `/` and uid 0.
 pub fn verify_installed(
     dir: &Path,
     trusted_root: &Path,
     owner: u32,
     script: &Script,
 ) -> Result<PathBuf, String> {
-    let mut current = dir;
-    loop {
-        let meta = current
-            .symlink_metadata()
-            .map_err(|error| format!("{}: {error}", current.display()))?;
-        if !meta.file_type().is_dir() {
-            return Err(format!("{} is not a directory", current.display()));
-        }
-        owner_only(current, &meta, owner)?;
-        if current == trusted_root {
-            break;
-        }
-        current = current
-            .parent()
-            .ok_or_else(|| format!("{} is outside {}", dir.display(), trusted_root.display()))?;
-    }
+    verify_directory_chain(dir, trusted_root, owner, |path| {
+        path.symlink_metadata()
+            .map(|meta| PathMode::of(&meta))
+            .map_err(|error| format!("{}: {error}", path.display()))
+    })?;
     let path = dir.join(format!("{}.bt", script.name));
     let link = path
         .symlink_metadata()
@@ -153,7 +196,7 @@ pub fn verify_installed(
     if !link.file_type().is_file() || (link.dev(), link.ino()) != (meta.dev(), meta.ino()) {
         return Err(format!("{} is not a regular file", path.display()));
     }
-    owner_only(&path, &meta, owner)?;
+    owner_only(&path, PathMode::of(&meta), owner)?;
     let limit = script.source.len() as u64 + 1;
     let mut bytes = Vec::new();
     file.by_ref()
@@ -169,8 +212,8 @@ pub fn verify_installed(
     Ok(path)
 }
 
-fn owner_only(path: &Path, meta: &Metadata, owner: u32) -> Result<(), String> {
-    if meta.uid() != owner || meta.mode() & 0o022 != 0 {
+fn owner_only(path: &Path, meta: PathMode, owner: u32) -> Result<(), String> {
+    if meta.uid != owner || meta.mode & 0o022 != 0 {
         return Err(format!(
             "{} must be owned by uid {owner} and writable by it alone",
             path.display()

@@ -12,8 +12,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 mod assignment;
-mod claim;
 mod capture;
+mod claim;
 mod github;
 pub(crate) use github::dispatch_workflow_unchanged;
 mod live;

@@ -577,15 +577,25 @@ provisioning. `qualify-clone` repeats it on clone 9501 after two root
 steps. First come the policy checks: `visudo -c` for the whole policy and
 for the drop-in, the drop-in bytes equal to `capture-sudoers`, modes
 `440`/`755`/`755`/`644` root for the drop-in, front, script directory and
-scripts, the directory holding exactly the allowlisted scripts with their
-reviewed bytes, no retired `/usr/local/sbin/bpftrace` front, and
-`bpftrace --version`. Then come the root refusal tests below.
+scripts, every directory above the front (`/usr/local/sbin`,
+`/usr/local`, `/usr`, `/`) and above the scripts
+(`/usr/local/lib/carrick-capture`, `/usr/local/lib`, `/usr/local`, `/usr`,
+`/`) a real directory, not a symlink, owned by root and neither group- nor
+world-writable (`stat -c '%f %u'` on each, through the same walk the front
+runs over its script directory), the directory holding exactly the
+allowlisted scripts with their reviewed bytes, no retired
+`/usr/local/sbin/bpftrace` front, and `bpftrace --version`. Then come the
+root refusal tests below.
 
 #### Root tests on the qualification clone
 
 `qualify-clone` runs these as root through the guest agent on clone 9501,
 which it destroys afterwards. The director can also run them by hand on a
-qualification clone. Each worker command is
+qualification clone. By hand, first repeat the parent check as root:
+`stat -c '%A %U %F %n' / /usr /usr/local /usr/local/sbin /usr/local/lib /usr/local/lib/carrick-capture`
+must print `directory` (not `symbolic link`) and owner `root` on every
+line, with no `w` in the group or other positions of `%A`. Each worker
+command is
 `runuser -u carrick-dispatch-agent -- sudo -n carrick-capture NAME --seconds 1`.
 
 | Root step | Worker runs | Required result |
