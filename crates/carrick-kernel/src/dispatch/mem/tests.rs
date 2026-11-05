@@ -4864,6 +4864,97 @@ fn fresh_private_anonymous_mmap_skips_zero_write() {
     );
 }
 
+/// #1670: both host-served shapes need owned backing publication, not
+/// protection or UserWrite against an unbacked sparse arena reservation.
+#[test]
+fn sparse_owner_droppable_mmap_uses_transactional_backing() {
+    sparse_owner_snapshot_mmap(false);
+}
+
+#[test]
+fn sparse_owner_readonly_shared_snapshot_uses_transactional_backing() {
+    sparse_owner_snapshot_mmap(true);
+}
+
+fn sparse_owner_snapshot_mmap(file: bool) {
+    let dispatcher = SyscallDispatcher::new();
+    let _root = super::delegated_tests::Root::admit(&dispatcher);
+    let registry =
+        crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1001));
+    let reporter = CompatReporter::default();
+    let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, 32768).with_defer_anon(true);
+    memory.fail_protect_non_zero.set(true);
+    let contents = vec![0x5a; 0x6994];
+    if file {
+        dispatcher
+            .captured_file_table()
+            .write_open_files(None)
+            .insert(
+                40,
+                OpenFile::from_open_description_with_status_flags(
+                    Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {
+                        base: OpenDescriptionBase::new(0),
+                        path: "/snapshot".into(),
+                        contents: contents.clone(),
+                        offset: 0,
+                    })),
+                    0,
+                    0,
+                ),
+            );
+    }
+    let outcome = threaded_memory_call(
+        &dispatcher,
+        &mut memory,
+        &registry,
+        &reporter,
+        SyscallRequest::new(
+            222,
+            SyscallArgs([
+                0,
+                if file { 0x6994 } else { 4096 },
+                if file {
+                    LINUX_PROT_READ
+                } else {
+                    LINUX_PROT_READ | LINUX_PROT_WRITE
+                },
+                if file { LINUX_MAP_SHARED } else { 0x28 },
+                if file { 40 } else { u64::MAX },
+                0,
+            ]),
+        ),
+    );
+    let DispatchOutcome::MapHostAlias {
+        va,
+        len,
+        payload,
+        backing,
+        transaction,
+        ..
+    } = outcome
+    else {
+        panic!("owned snapshot publication required, file={file}: {outcome:?}");
+    };
+    assert_eq!(va.raw(), LINUX_MMAP_BASE);
+    assert_eq!(len, if file { 0x7000 } else { 4096 });
+    assert!(matches!(backing, HostAliasBacking::Anonymous { .. }));
+    if file {
+        assert_eq!(&payload[..contents.len()], contents);
+        assert!(payload[contents.len()..].iter().all(|byte| *byte == 0));
+    } else {
+        assert!(
+            payload.is_empty(),
+            "anonymous publisher supplies zero backing"
+        );
+    }
+    assert_eq!(memory.protect_calls.get(), 0);
+    assert_eq!(memory.write_calls.get(), 0);
+    assert_eq!(memory.zero_backing_calls.get(), 0);
+    assert!(dispatcher.mem().lock().dynamic_maps.is_empty());
+    drop(transaction); // Failed installation must leave no committed VMA.
+    assert!(dispatcher.mem().lock().dynamic_maps.is_empty());
+}
+
 /// #1663: placement below the arena's dirty watermark is conservative even
 /// for a fresh hint. Sparse backing must retire frames, not eagerly scrub VA.
 #[test]
