@@ -259,15 +259,23 @@ fn x86_sysv_ipc_routes_to_ring_and_zeroes_abi_padding_bytes() {
         venue: &'v mut RouteVenue,
     }
     impl UserCopy for X86IpcEnv<'_> {
-        fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> bool {
-            let off = (src.raw() - self.base) as usize;
-            dst.copy_from_slice(&self.buf[off..off + dst.len()]);
-            true
+        fn copy_in(
+            &mut self,
+            dst: &mut [u8],
+            src: UserVa,
+        ) -> carrick_core::personality::CopyOutcome {
+            carrick_core::personality::CopyOutcome::from_completed({
+                let off = (src.raw() - self.base) as usize;
+                dst.copy_from_slice(&self.buf[off..off + dst.len()]);
+                true
+            })
         }
-        fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> bool {
-            let off = (dst.raw() - self.base) as usize;
-            self.buf[off..off + src.len()].copy_from_slice(src);
-            true
+        fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> carrick_core::personality::CopyOutcome {
+            carrick_core::personality::CopyOutcome::from_completed({
+                let off = (dst.raw() - self.base) as usize;
+                self.buf[off..off + src.len()].copy_from_slice(src);
+                true
+            })
         }
     }
     impl<'a> IpcNative<'a> for X86IpcEnv<'_> {

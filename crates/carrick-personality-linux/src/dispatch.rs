@@ -432,7 +432,7 @@ fn serve_family<'a, C: EntryContext + 'a>(
             .and_then(|native| crate::lifecycle::invoke(call, native))
             .map_or(FamilyCompletion::Forward.into(), |outcome| {
                 let returned = match outcome {
-                    LifecycleOutcome::HostCustody => None,
+                    LifecycleOutcome::Redispatch | LifecycleOutcome::HostCustody => None,
                     LifecycleOutcome::Returned { result, .. } => Some((result, original)),
                     LifecycleOutcome::Transferred { .. } => None,
                 };
@@ -1210,7 +1210,9 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
         };
         let returned = match outcome {
             LifecycleOutcome::Returned { result, .. } => Some((result, original_argument0)),
-            LifecycleOutcome::HostCustody | LifecycleOutcome::Transferred { .. } => None,
+            LifecycleOutcome::Redispatch
+            | LifecycleOutcome::HostCustody
+            | LifecycleOutcome::Transferred { .. } => None,
         };
         return finish(
             ordinal,
@@ -1579,15 +1581,49 @@ mod ring_first_tests {
     }
 
     impl crate::lifecycle::UserCopy for CarrierOwned<'_> {
-        fn copy_in(&mut self, _dst: &mut [u8], _src: carrick_guest_arch::UserVa) -> bool {
-            false
+        fn copy_in(
+            &mut self,
+            _dst: &mut [u8],
+            _src: carrick_guest_arch::UserVa,
+        ) -> carrick_core::personality::CopyOutcome {
+            carrick_core::personality::CopyOutcome::from_completed(false)
         }
-        fn copy_out(&mut self, _dst: carrick_guest_arch::UserVa, _src: &[u8]) -> bool {
-            false
+        fn copy_out(
+            &mut self,
+            _dst: carrick_guest_arch::UserVa,
+            _src: &[u8],
+        ) -> carrick_core::personality::CopyOutcome {
+            carrick_core::personality::CopyOutcome::from_completed(false)
         }
     }
 
     impl<'a> crate::signal::SignalNative<'a> for CarrierOwned<'a> {
+        #[allow(clippy::panic)]
+        fn wait_guest_copy(
+            &mut self,
+            _: carrick_core::personality::GuestCopyRequest,
+        ) -> crate::signal::SignalOutcome {
+            panic!("eager test venue cannot suspend guest memory")
+        }
+        #[allow(clippy::panic)]
+        fn finish_signal_output(
+            &mut self,
+            address: carrick_guest_arch::UserVa,
+            bytes: alloc::vec::Vec<u8>,
+        ) -> crate::signal::SignalOutcome {
+            let result = match crate::lifecycle::UserCopy::copy_out(self, address, &bytes) {
+                carrick_core::personality::CopyOutcome::Done => 0,
+                carrick_core::personality::CopyOutcome::Fault => -14,
+                carrick_core::personality::CopyOutcome::NotYet(_) => {
+                    panic!("eager test venue refused output")
+                }
+            };
+            crate::signal::SignalOutcome::Returned {
+                result: crate::abi::entry::SyscallResult::new(result),
+                work: false,
+            }
+        }
+
         fn arguments(&self) -> [u64; 6] {
             [0; 6]
         }
@@ -1619,6 +1655,33 @@ mod ring_first_tests {
     }
 
     impl<'a> crate::lifecycle::LifecycleNative<'a> for CarrierOwned<'a> {
+        #[allow(clippy::panic)]
+        fn wait_guest_copy(
+            &mut self,
+            _: carrick_core::personality::GuestCopyRequest,
+        ) -> crate::lifecycle::LifecycleOutcome {
+            panic!("eager test venue cannot suspend guest memory")
+        }
+        #[allow(clippy::panic)]
+        fn finish_signal_output(
+            &mut self,
+            address: carrick_guest_arch::UserVa,
+            bytes: alloc::vec::Vec<u8>,
+            work: bool,
+        ) -> crate::lifecycle::LifecycleOutcome {
+            let result = match crate::lifecycle::UserCopy::copy_out(self, address, &bytes) {
+                carrick_core::personality::CopyOutcome::Done => 0,
+                carrick_core::personality::CopyOutcome::Fault => -14,
+                carrick_core::personality::CopyOutcome::NotYet(_) => {
+                    panic!("eager test venue refused output")
+                }
+            };
+            crate::lifecycle::LifecycleOutcome::Returned {
+                result: crate::abi::entry::SyscallResult::new(result),
+                work,
+            }
+        }
+
         fn guest_isa(&self) -> carrick_guest_arch::GuestIsa {
             carrick_guest_arch::GuestIsa::X86_64
         }

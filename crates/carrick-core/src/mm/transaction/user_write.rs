@@ -134,7 +134,13 @@ impl<
             len: carrick_guest_arch::GuestLen::new(request.bytes.len() as u64),
             slot: request.slot,
         };
-        self.write_user_target(target, Some(request), words, venue)
+        self.write_user_target(
+            target,
+            Some(request),
+            PortalTransferIntent::UserWrite,
+            words,
+            venue,
+        )
     }
 
     pub fn prepare_user_write<W: LiveDescriptorWords + ?Sized, V: UserWriteVenue<Context>>(
@@ -143,13 +149,26 @@ impl<
         words: &W,
         venue: &mut V,
     ) -> Result<(), UserWriteError<V::Error>> {
-        self.write_user_target(target, None, words, venue)
+        self.write_user_target(target, None, PortalTransferIntent::UserWrite, words, venue)
+    }
+
+    /// Materialize readable memory using the same exact-owner transfer and
+    /// physical supply protocol as output preparation. Read-only mappings
+    /// remain read-only and never enter COW write preparation.
+    pub fn prepare_user_read<W: LiveDescriptorWords + ?Sized, V: UserWriteVenue<Context>>(
+        &self,
+        target: UserWriteTarget,
+        words: &W,
+        venue: &mut V,
+    ) -> Result<(), UserWriteError<V::Error>> {
+        self.write_user_target(target, None, PortalTransferIntent::UserRead, words, venue)
     }
 
     fn write_user_target<W: LiveDescriptorWords + ?Sized, V: UserWriteVenue<Context>>(
         &self,
         target: UserWriteTarget,
         request: Option<UserWriteRequest<'_>>,
+        intent: PortalTransferIntent,
         words: &W,
         venue: &mut V,
     ) -> Result<(), UserWriteError<V::Error>> {
@@ -158,7 +177,7 @@ impl<
             target.handle,
             GuestVa::new(target.address.raw()),
             target.len.raw(),
-            PortalTransferIntent::UserWrite,
+            intent,
             slot,
         )?;
         // One successful supply must make the next selection advance this

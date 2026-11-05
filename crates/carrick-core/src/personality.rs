@@ -296,10 +296,41 @@ where
     }
 }
 
-/// Unified user memory copy trait for personality lifecycle and call servicing.
+/// A bounded user transfer. NotYet retains the exact access for the memory
+/// owner's wait protocol; it is never an errno or permission to poll.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use]
+pub enum CopyOutcome {
+    Done,
+    Fault,
+    NotYet(GuestCopyRequest),
+}
+
+/// The access that must become available before a refused copy can resume.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuestCopyRequest {
+    pub address: UserVa,
+    pub len: GuestLen,
+    pub access: Access,
+}
+
+impl CopyOutcome {
+    pub const fn from_completed(done: bool) -> Self {
+        if done { Self::Done } else { Self::Fault }
+    }
+    pub const fn is_done(self) -> bool {
+        matches!(self, Self::Done)
+    }
+}
+
+/// The neutral guest-copy interface for personality lifecycle and call servicing.
+///
+/// A refused transfer must retain its owning operation before leaving the lane.
+/// `Fault` means the address or access is invalid; `NotYet` means the memory
+/// owner must make the exact access available before redispatch or completion.
 pub trait UserCopy {
-    fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> bool;
-    fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> bool;
+    fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> CopyOutcome;
+    fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> CopyOutcome;
 
     /// Read a padding-free typed ABI record from guest memory.
     ///
@@ -365,7 +396,9 @@ pub trait UserCopy {
         Self: Sized,
     {
         let mut val = T::new_zeroed();
-        self.copy_in(val.as_mut_bytes(), src).then_some(val)
+        self.copy_in(val.as_mut_bytes(), src)
+            .is_done()
+            .then_some(val)
     }
 
     /// Write a padding-free typed ABI record to guest memory.
@@ -435,18 +468,18 @@ pub trait UserCopy {
     where
         Self: Sized,
     {
-        self.copy_out(dst, val.as_bytes())
+        self.copy_out(dst, val.as_bytes()).is_done()
     }
 }
 
 impl<U: UserCopy + ?Sized> UserCopy for &mut U {
     #[inline]
-    fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> bool {
+    fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> CopyOutcome {
         (**self).copy_in(dst, src)
     }
 
     #[inline]
-    fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> bool {
+    fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> CopyOutcome {
         (**self).copy_out(dst, src)
     }
 }
@@ -455,12 +488,12 @@ impl<'a, A: MmuArch + DefaultMmOwner> UserCopy for UserMemory<'a, A>
 where
     ServiceError: From<A::Error>,
 {
-    fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> bool {
-        self.copy_in_bytes(src, dst).is_ok()
+    fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> CopyOutcome {
+        CopyOutcome::from_completed(self.copy_in_bytes(src, dst).is_ok())
     }
 
-    fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> bool {
-        self.copy_out_bytes(dst, src).is_ok()
+    fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> CopyOutcome {
+        CopyOutcome::from_completed(self.copy_out_bytes(dst, src).is_ok())
     }
 }
 
