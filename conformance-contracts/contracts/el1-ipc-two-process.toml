@@ -28,6 +28,7 @@ rationale = "Request/response IPC between forked processes (`pairs` concurrent p
 
 [bindings]
 vm_free = [
+  "carrick-kernel::dispatch::fs::tests::serial_host_pipemass_fd_limit_preserves_wait_domains_and_incarnations (production pipe2/close at an 8193-fd limit, two fill/drain rounds with a live metadata queue; queue domains stay disjoint and recycled IPC incarnations rebind)",
   "carrick-el1-linux::native_process_runtime::host_test_support::portal_wait_cancellation_resumes_exact_native_service_waiter (existing portal service cancellation component: cancel detaches its exact enrolled queue key, resumes the waiter and preserves completed result 65; outside the scalar IPC fence)",
   "carrick-el1-linux::ipc::tests::{ipc_operation_slot_native_finish_and_retire_publish,ipc_operation_slot_epoll_retry_publishes} (independent production native completion, exec/exit retirement and epoll Retry release publications)",
   "carrick-kernel::kernel::continuation::ipc::tests::serial_host_zone_operation_slot_release_reaches_bound_source (carrier source binding followed by production host finish and ZoneHostServices release; exact epoch and stale retry)",
