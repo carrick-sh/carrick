@@ -829,13 +829,42 @@ fn check_workflow_patches(root: &Path) -> Result<(), CliError> {
         let relative = patch
             .strip_prefix(root)
             .map_err(|error| CliError::WorkflowPatches(error.to_string()))?;
+        // A filtered reverse check also succeeds when Git selects no files.
+        // Require workflow content, then reverse-check the entire patch below.
+        // Filtering the reverse check could silently omit a rename's old path.
+        match command::run_checked(
+            "git",
+            [
+                std::ffi::OsStr::new("apply"),
+                std::ffi::OsStr::new("--numstat"),
+                std::ffi::OsStr::new("-z"),
+                std::ffi::OsStr::new("--include=.github/**"),
+                relative.as_os_str(),
+            ],
+            Some(root),
+        ) {
+            Ok(output) if output.stdout.is_empty() => {
+                failures.push(format!(
+                    "{}: patch touches no workflow files; it doesnt belong in docs/ci/patches",
+                    relative.display()
+                ));
+                continue;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                failures.push(format!(
+                    "cannot inspect workflow patch: {}\n{error}",
+                    relative.display()
+                ));
+                continue;
+            }
+        }
         if let Err(error) = command::run_checked(
             "git",
             [
                 std::ffi::OsStr::new("apply"),
                 std::ffi::OsStr::new("--check"),
                 std::ffi::OsStr::new("-R"),
-                std::ffi::OsStr::new("--include=.github/**"),
                 relative.as_os_str(),
             ],
             Some(root),
