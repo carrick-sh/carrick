@@ -499,3 +499,72 @@ fn workflow_patches_require_application_in_the_same_tree() {
     std::fs::write(&workflow, "drift\n").unwrap();
     assert!(!run().status.success(), "subsequent workflow drift fails");
 }
+
+#[test]
+fn workflow_patches_reject_patches_without_workflow_files() {
+    let fixture = tempfile::tempdir().unwrap();
+    init_git_repo(fixture.path());
+    std::fs::create_dir_all(fixture.path().join("docs/ci/patches")).unwrap();
+    std::fs::write(fixture.path().join("README.md"), "new\n").unwrap();
+    std::fs::write(
+        fixture.path().join("docs/ci/patches/readme.patch"),
+        "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-old\n+new\n",
+    )
+    .unwrap();
+    for command in ["workflow-patches", "lint-source"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .arg("--root")
+            .arg(fixture.path())
+            .arg(command)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{command} accepted a non-workflow patch"
+        );
+        let diagnostic = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            diagnostic
+                .contains("patch touches no workflow files; it doesnt belong in docs/ci/patches"),
+            "{diagnostic}"
+        );
+    }
+}
+
+#[test]
+fn workflow_patches_check_cross_boundary_renames() {
+    let fixture = tempfile::tempdir().unwrap();
+    init_git_repo(fixture.path());
+    std::fs::create_dir_all(fixture.path().join("docs/ci/patches")).unwrap();
+    std::fs::write(fixture.path().join("docs/ci/patches/rename.patch"),
+        "diff --git a/outside.yml b/.github/workflows/in.yml\nsimilarity index 100%\nrename from outside.yml\nrename to .github/workflows/in.yml\ndiff --git a/.github/other.yml b/.github/other.yml\n--- a/.github/other.yml\n+++ b/.github/other.yml\n@@ -1 +1 @@\n-old\n+new\n").unwrap();
+    std::fs::create_dir_all(fixture.path().join(".github/workflows")).unwrap();
+    std::fs::write(fixture.path().join(".github/other.yml"), "new\n").unwrap();
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .arg("--root")
+            .arg(fixture.path())
+            .arg("workflow-patches")
+            .output()
+            .unwrap()
+    };
+    let output = run();
+    assert!(
+        !output.status.success(),
+        "accepted an unapplied cross-boundary rename"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("workflow patch not applied"));
+    std::fs::write(
+        fixture.path().join(".github/workflows/in.yml"),
+        "contents\n",
+    )
+    .unwrap();
+    assert!(
+        run().status.success(),
+        "applied cross-boundary rename passes"
+    );
+}
