@@ -7798,6 +7798,89 @@ fi
             );
         });
     }
+    /// #1688: a coordinator can act on admitted facts even when its first
+    /// state request times out. The fixture coordinator only launches when
+    /// the actual opening prompt supplies the target, tier and trigger.
+    #[test]
+    fn opening_facts_start_worker_after_state_timeout() {
+        shared_fixture(|temporary| {
+            let root = temporary.join("base");
+            std::fs::create_dir(&root).unwrap();
+            git(&root, &["init", "-b", "main"]).unwrap();
+            git(&root, &["commit", "--allow-empty", "-m", "base"]).unwrap();
+            let mut server = server(&root);
+            server.dispatch.base = git(&root, &["rev-parse", "HEAD"]).unwrap().trim().into();
+            server.dispatch.resume = false;
+            server.dispatch.review = false;
+            let brief = "Fix carrick-kernel dispatch/mm.rs; preserve the exact brief.";
+            server.trigger =
+                json!({"id":77,"body":brief,"user":{"login":"tjfontaine","type":"User"}});
+            server.tier = super::super::worker_tier::decide("fixture", "", brief, &[]);
+            server.policy = server.policy.for_tier(server.tier.tier);
+            let record = install_fixture_launcher(&mut server, live_capacity());
+            let actor = tempfile::tempdir().unwrap();
+            isolated_loop(
+                actor.path(),
+                Path::new("/socket"),
+                &server.policy,
+                Duration::from_secs(60),
+                None,
+            )
+            .unwrap();
+            let prompt = regular_text(&actor.path().join("prompt.md")).unwrap();
+            std::fs::write(temporary.join("state-timeout"), "").unwrap();
+            let error = server
+                .execute(Request::ReadState(Empty {}))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("timed out"), "{error}");
+            let facts = prompt
+                .lines()
+                .find_map(|line| line.strip_prefix("Round opening facts: "))
+                .and_then(|line| serde_json::from_str::<Value>(line).ok());
+            if let Some(facts) = facts {
+                assert_eq!(facts["target"]["issue"], 799);
+                assert_eq!(facts["target"]["branch"], server.dispatch.branch);
+                assert_eq!(facts["worker_tier"]["tier"], "strong");
+                assert_eq!(facts["trigger"]["data"]["body"], brief);
+                server
+                    .execute(Request::InvokeWorker(Notes {
+                        notes: facts["trigger"]["data"]["body"].as_str().unwrap().into(),
+                        backend: "codex".into(),
+                        model: "gpt-6.1-sol".into(),
+                    }))
+                    .unwrap();
+            } else {
+                // Today's coordinator spends its remaining read, then refuses
+                // to guess the missing request and ends Blocked without work.
+                assert!(server.execute(Request::ReadState(Empty {})).is_err());
+                std::fs::remove_file(temporary.join("state-timeout")).unwrap();
+                server
+                    .outcome(
+                        ContractStatus::Blocked,
+                        "state reads timed out; request unknown",
+                    )
+                    .unwrap();
+                let posted = regular_text(&temporary.join("posted.md")).unwrap();
+                assert!(posted.contains("Dispatch outcome: Blocked"), "{posted}");
+                assert!(posted.contains("Workers this round: none"), "{posted}");
+            }
+            assert_eq!(
+                server.used.workers, 1,
+                "state timeouts ended Blocked with no worker"
+            );
+            assert_eq!(server.used.reads, 1);
+            let record = record.borrow();
+            assert_eq!(record.prompts.len(), 1);
+            assert!(
+                record.prompts[0].contains(brief),
+                "worker lost the trigger brief"
+            );
+            assert_eq!(server.dispatch.worker.backend, "codex");
+            assert_eq!(server.dispatch.worker.model, "gpt-6.1-sol");
+        });
+    }
+
     #[test]
     fn second_worker_sees_commits_handoff_and_shares_total_time() {
         shared_fixture(|temporary| {
@@ -8430,6 +8513,9 @@ fi
 slurp=0
 for arg do test "$arg" != --slurp || slurp=1; endpoint=$arg; done
 printf '%s\n' "$endpoint" >> "$RUNNER_TEMP/api-endpoints"
+if test -f "$RUNNER_TEMP/state-timeout"; then
+ case "$endpoint" in */issues/799) printf 'gh: request timed out\n' >&2; exit 1 ;; esac
+fi
 if test -f "$RUNNER_TEMP/fail-next-endpoint"; then
  case "$endpoint" in *"$(cat "$RUNNER_TEMP/fail-next-endpoint")"*) rm "$RUNNER_TEMP/fail-next-endpoint"; exit 95 ;; esac
 fi
