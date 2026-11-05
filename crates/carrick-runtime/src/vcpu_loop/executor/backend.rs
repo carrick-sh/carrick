@@ -38,6 +38,118 @@ use carrick_kernel::kernel::objects::{
 use carrick_kernel::kernel::{Scheduler, SchedulerError};
 pub use residency::{ResidencyGeneration, TaskCpuResidency};
 
+/// Signed witnesses observe the real save, with no substitute executor or MM.
+#[cfg(all(feature = "test-support", target_os = "macos", target_arch = "aarch64"))]
+pub mod terminal_save_test_control {
+    use super::*;
+    use carrick_aarch64::Aarch64Vcpu;
+    use carrick_hal::SysReg;
+
+    static ARMED: Mutex<Option<Arc<Probe>>> = Mutex::new(None);
+
+    #[derive(Clone, Debug, Default)]
+    pub struct Observation {
+        pub roots_before_publication: Option<[u64; 2]>,
+        pub maintenance_root: u64,
+        pub process_root: u64,
+        pub cleanup_failed: bool,
+        pub backend_unpublished: bool,
+        pub backend_retained: bool,
+        pub worker_retained: bool,
+    }
+
+    pub(crate) struct Probe {
+        fail_second_write: bool,
+        observation: Mutex<Observation>,
+    }
+
+    impl Probe {
+        /// Caller holds the signed suite's guest lock through guard destruction.
+        fn arm(fail_second_write: bool) -> Guard {
+            let probe = Arc::new(Self {
+                fail_second_write,
+                observation: Mutex::new(Observation::default()),
+            });
+            *ARMED.lock() = Some(probe.clone());
+            Guard(probe)
+        }
+
+        fn observation(&self) -> Observation {
+            self.observation.lock().clone()
+        }
+
+        pub(crate) fn take() -> Option<Arc<Self>> {
+            ARMED.lock().take()
+        }
+
+        pub(crate) fn prepare(
+            &self,
+            lifecycle: &carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Vmm,
+            vcpu: &mut carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Vcpu,
+            binding: &crate::vcpu_loop::continuation::HvpatchTaskBinding,
+        ) -> Result<(), TrapError> {
+            let process_root = binding.stage1_ttbr0().ok_or_else(|| {
+                TrapError::Hypervisor("terminal save probe lacks process root".into())
+            })?;
+            let maintenance_root =
+                carrick_vmm_hvf::hvf_aarch64_engine::carrier_maintenance_ttbr(lifecycle)?;
+            // EL1 may already have vacated them. Install the still-owned task
+            // root so omitting either production cleanup write is observable.
+            vcpu.set_sys_reg(SysReg::Ttbr0, process_root)?;
+            vcpu.set_sys_reg(SysReg::Ttbr1, process_root)?;
+            let mut observation = self.observation.lock();
+            observation.process_root = process_root;
+            observation.maintenance_root = maintenance_root;
+            if self.fail_second_write {
+                carrick_vmm_hvf::hvf_aarch64_engine::fail_terminal_save_second_write_for_test();
+            }
+            Ok(())
+        }
+
+        pub(crate) fn before_publication(
+            &self,
+            vcpu: &carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Vcpu,
+            failed: bool,
+            binding: &crate::vcpu_loop::continuation::HvpatchTaskBinding,
+        ) {
+            let mut observation = self.observation.lock();
+            observation.roots_before_publication = vcpu
+                .get_sys_reg(SysReg::Ttbr0)
+                .ok()
+                .zip(vcpu.get_sys_reg(SysReg::Ttbr1).ok())
+                .map(|(a, b)| [a, b]);
+            observation.cleanup_failed = failed;
+            observation.backend_unpublished = binding
+                .inspect_backend::<HvpatchTaskEngineBindingState, _>(|_| Ok(()))
+                .is_err();
+        }
+
+        pub(crate) fn after_publication(&self, backend_retained: bool, worker_retained: bool) {
+            let mut observation = self.observation.lock();
+            observation.backend_retained = backend_retained;
+            observation.worker_retained = worker_retained;
+        }
+    }
+
+    pub struct Guard(Arc<Probe>);
+
+    impl Guard {
+        pub fn observation(&self) -> Observation {
+            self.0.observation()
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ARMED.lock().take();
+        }
+    }
+
+    pub fn arm(fail_second_write: bool) -> Guard {
+        Probe::arm(fail_second_write)
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct HvpatchPersistentExecutorFactory {
     authority: carrick_vmm_hvf::hvf_aarch64_engine::HvpatchPersistentExecutorFactoryAuthority,
@@ -1509,7 +1621,11 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 });
             }
         }
-        if let Err(error) = restore_worker_vcpu_before_binding_publication(
+        #[cfg(all(feature = "test-support", target_os = "macos", target_arch = "aarch64"))]
+        let probe = terminal_save
+            .then(terminal_save_test_control::Probe::take)
+            .flatten();
+        let publication = restore_worker_vcpu_before_binding_publication(
             &mut self.vcpu,
             vcpu,
             backend,
@@ -1517,6 +1633,14 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 // A materialized terminal has no resident record left to
                 // vacate later, including when it migrates to another worker.
                 // Clear both hardware roots before publishing that state.
+                #[cfg(all(feature = "test-support", target_os = "macos", target_arch = "aarch64"))]
+                if let Some(probe) = &probe {
+                    let lifecycle = self
+                        .lifecycle
+                        .as_ref()
+                        .ok_or_else(|| TrapError::Hypervisor("test save lost lifecycle".into()))?;
+                    probe.prepare(lifecycle, worker_vcpu, &binding)?;
+                }
                 let vacated = if terminal_save {
                     self.lifecycle
                         .as_ref()
@@ -1534,10 +1658,34 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 };
                 // Even a failed register write must retain the detached MM
                 // and worker ownership for executor-failure settlement.
+                #[cfg(all(feature = "test-support", target_os = "macos", target_arch = "aarch64"))]
+                if let Some(probe) = &probe {
+                    probe.before_publication(worker_vcpu, vacated.is_err(), &binding);
+                }
                 binding.put_backend(backend)?;
                 vacated
             },
-        ) {
+        );
+        #[cfg(all(feature = "test-support", target_os = "macos", target_arch = "aarch64"))]
+        if let Some(probe) = probe {
+            probe.after_publication(
+                binding
+                    .inspect_backend::<HvpatchTaskEngineBindingState, _>(|backend| {
+                        let Some(TaskCpuResidency::Materialized(cpu)) = backend.residency() else {
+                            return Err(TrapError::Hypervisor(
+                                "terminal save lost materialized CPU".into(),
+                            ));
+                        };
+                        backend.preflight_runtime_projection(&cpu)
+                    })
+                    .is_ok(),
+                self.vcpu.as_ref().is_some_and(|vcpu| {
+                    carrick_vmm_hvf::hvf_aarch64_engine::persistent_vcpu_identity(vcpu)
+                        == self.raw_vcpu_id
+                }),
+            );
+        }
+        if let Err(error) = publication {
             return Err(ExecutorSaveError::new(error, lease));
         }
         Ok(SavedRunnable::new(lease))
