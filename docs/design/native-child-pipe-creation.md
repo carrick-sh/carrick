@@ -142,3 +142,45 @@ enabling the descriptor classifier and crossing entry would not provide any
 of these owners. The route must remain unaccepted until the production
 transaction makes both native-child witnesses Served and the signed CLI
 witness prints `a`.
+
+## Production connection after the retained transaction (#1620)
+
+The retained `NativePipeCreation` added by #1563 closes the host-side
+preparation/publication ownership gap. It does not yet connect native syscall
+dispatch to that owner. Its constructor, `HostIpc::begin_native_pipe_creation`,
+has only three kernel unit-test callers. `NativePipeCreation` retains
+`HostPreparedDescriptions<2>`, which owns an `Arc<HostIpc>` in the host kernel
+crate. That crate is only a development dependency of `carrick-el1-linux`;
+the freestanding ring image cannot invoke this constructor.
+
+The production `IpcVenue` supplies shared region and table views, not canonical
+creation authority. `ForkStockCrossing` has no pipe preparation, creation
+cancellation or descriptor-growth operation. Its descriptor stock crossing
+completes backing descriptors, rather than creating IPC endpoints. Likewise,
+the generic native service operation set has no retained IPC creation request.
+The existing whole-word fence still needs a production physical-memory binding;
+the host publication tests use the private `publish_with` test venue.
+
+The next implementation must connect these owners before changing routing:
+
+- Make the retained transaction available to ring execution, either by
+  extracting its ownership protocol into shared code with canonical service
+  hooks, or by designing a service protocol that transfers preparation custody
+  and leaves the bounded publication/output commit in ring.
+- Authenticate the caller's exact table and MM through preparation, growth,
+  output supply and cancellation. Retain the same endpoints across refusal.
+- Bind both physical output pieces only after all supply and waits finish.
+  Release the fence before any further crossing or park, and preserve the
+  existing atomic pair install followed by infallible output.
+- Route both ISAs through that shared owner and drive the two unchanged
+  production-dispatch witnesses to `Served` with zero result. Compare complete
+  native parallel and serial populations against main before acceptance.
+
+A fresh independent Codex review rated the missing production connection P1.
+It found no existing callable path from the ring to this transaction. Injecting
+`HostIpc` only into the witness would hide the production gap; calling raw
+`IpcRegion::create_pipe` would introduce a second creation path and bypass the
+canonical growth, reclamation and stock owners. This review establishes an
+unfinished prerequisite, not an accepted implementation or an infeasibility
+claim. No routing change is supplied by this note, and #1620's acceptance
+criterion remains unmet.
