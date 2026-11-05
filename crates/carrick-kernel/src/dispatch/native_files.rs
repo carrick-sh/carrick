@@ -489,9 +489,9 @@ impl SyscallDispatcher {
             return Some(self.description_poll_ready_events(&file.description, events));
         }
         let description = published_host_description(resource)?;
-        Some(match stdio_stream_of(&description) {
+        Some(match stdio_stream_of(description.description()) {
             Some(stream) => self.bare_stdio_poll_ready_events(stream, events),
-            None => self.description_poll_ready_events(&description, events),
+            None => self.description_poll_ready_events(description.description(), events),
         })
     }
 
@@ -513,9 +513,11 @@ impl SyscallDispatcher {
         // for its offset, flags and sink. A duplicate of a stdio stream is
         // that stream, served exactly as the implicit one.
         if let Some(description) = published_host_description(resource) {
-            return match stdio_stream_of(&description) {
+            return match stdio_stream_of(description.description()) {
                 Some(stream) => self.serve_native_stdio(header, stream, input),
-                None => self.serve_native_open_file(header, &description, input, capacity),
+                None => {
+                    self.serve_native_open_file(header, description.description(), input, capacity)
+                }
             };
         }
         Served::Refused
@@ -781,9 +783,9 @@ impl SyscallDispatcher {
 /// (nothing to read, write or stat) stays unserved.
 fn published_host_description(
     resource: &HostResource,
-) -> Option<Arc<crate::kernel::FileDescription>> {
+) -> Option<crate::kernel::objects::FileDescriptionFdLease> {
     crate::kernel::objects::published_description(resource)
-        .filter(|description| description.inspect_kind(|_| ()).is_some())
+        .filter(|lease| lease.description().inspect_kind(|_| ()).is_some())
 }
 
 /// The run stream (0 stdin, 1 stdout, 2 stderr) a description duplicates:
@@ -1101,10 +1103,23 @@ mod tests {
         assert!(saved >= 3, "dup(1): {saved}");
         let target = root_openat(root, b"/tmp/f\0", CREATE);
         assert!(target >= 3, "open: {target}");
-        assert_eq!(root_syscall(root, 24, [target as u64, 1, 0, 0, 0, 0], &[]), 1);
-        assert_eq!(root_syscall(root, 24, [saved as u64, 1, 0, 0, 0, 0], &[]), 1);
-        assert_eq!(root_syscall(root, 57, [saved as u64, 0, 0, 0, 0, 0], &[]), 0);
-        assert_eq!(root_syscall(root, 57, [target as u64, 0, 0, 0, 0, 0], &[]), 0);
+        assert_eq!(
+            root_syscall(root, 24, [target as u64, 1, 0, 0, 0, 0], &[]),
+            1
+        );
+        assert_eq!(root_syscall(root, 64, [1, 0x4_0000, 2, 0, 0, 0], b"x\n"), 2);
+        assert_eq!(
+            root_syscall(root, 24, [saved as u64, 1, 0, 0, 0, 0], &[]),
+            1
+        );
+        assert_eq!(
+            root_syscall(root, 57, [saved as u64, 0, 0, 0, 0, 0], &[]),
+            0
+        );
+        assert_eq!(
+            root_syscall(root, 57, [target as u64, 0, 0, 0, 0, 0], &[]),
+            0
+        );
 
         let child = fixture.fork_table(fixture.table);
         let write = record(child, HostFileOp::Write, 1, [UNLIMITED, 0, 0, 0], b"y\n", 0);
@@ -1123,7 +1138,7 @@ mod tests {
         assert_eq!(ready, 1);
         // The redirect target never saw the child's byte: it wrote stdout.
         let authority = authority_of(&fixture.dispatcher);
-        assert!(fixture.venue_contents(&authority, b"/tmp/f").is_empty());
+        assert_eq!(fixture.venue_contents(&authority, b"/tmp/f"), b"x\n");
     }
 
     /// #1410: `exec >file` leaves the root's fd 1 on a host file. A forked
@@ -1135,8 +1150,14 @@ mod tests {
         let root = &mut fixture.dispatcher;
         let target = root_openat(root, b"/tmp/f\0", CREATE);
         assert!(target >= 3, "open: {target}");
-        assert_eq!(root_syscall(root, 24, [target as u64, 1, 0, 0, 0, 0], &[]), 1);
-        assert_eq!(root_syscall(root, 57, [target as u64, 0, 0, 0, 0, 0], &[]), 0);
+        assert_eq!(
+            root_syscall(root, 24, [target as u64, 1, 0, 0, 0, 0], &[]),
+            1
+        );
+        assert_eq!(
+            root_syscall(root, 57, [target as u64, 0, 0, 0, 0, 0], &[]),
+            0
+        );
 
         let child = fixture.fork_table(fixture.table);
         let write = record(child, HostFileOp::Write, 1, [UNLIMITED, 0, 0, 0], b"y\n", 0);
@@ -1147,20 +1168,156 @@ mod tests {
         assert_eq!(fixture.venue_contents(&authority, b"/tmp/f"), b"y\n");
     }
 
-    /// #1410: once the host has closed its last descriptor for an inherited
-    /// description there is nothing live to serve through. The carrier
-    /// refuses (a counted ENOSYS) rather than answer a guessed EBADF.
     #[test]
-    fn native_inherited_description_is_refused_after_the_host_closes_it() {
+    fn native_inherited_file_observes_ring_append_after_parent_close() {
+        let mut fixture = writable_fixture(Upper::Memory);
+        let target = root_openat(&mut fixture.dispatcher, b"/tmp/append\0", CREATE);
+        assert_eq!(
+            root_syscall(
+                &mut fixture.dispatcher,
+                24,
+                [target as u64, 1, 0, 0, 0, 0],
+                &[]
+            ),
+            1
+        );
+        assert_eq!(
+            root_syscall(
+                &mut fixture.dispatcher,
+                57,
+                [target as u64, 0, 0, 0, 0, 0],
+                &[]
+            ),
+            0
+        );
+        let child = fixture.fork_table(fixture.table);
+        let write = |fixture: &Fixture, bytes: &[u8]| {
+            fixture
+                .result(
+                    None,
+                    record(child, HostFileOp::Write, 1, [UNLIMITED, 0, 0, 0], bytes, 0),
+                )
+                .0
+        };
+        assert_eq!(write(&fixture, b"first"), 5);
+        // Production fd-core F_SETFL entry, shared by the native fcntl route.
+        let table = fd::TableId::from_raw(fd::RawTableId {
+            authority: child[0],
+            index: child[1],
+            generation: child[2],
+        });
+        fixture
+            .owner
+            .region()
+            .fd(crate::el1_zone::HostLockWait)
+            .setfl(
+                table,
+                fd::Fd(1),
+                fd::StatusFlags {
+                    append: true,
+                    ..fd::StatusFlags::default()
+                },
+            )
+            .unwrap();
+        let host_flags = root_syscall(&mut fixture.dispatcher, 25, [1, 3, 0, 0, 0, 0], &[]);
+        assert_ne!(host_flags as u64 & carrick_abi::LINUX_O_APPEND, 0);
+        assert_eq!(
+            root_syscall(&mut fixture.dispatcher, 57, [1, 0, 0, 0, 0, 0], &[]),
+            0
+        );
+        let seek = record(child, HostFileOp::Lseek, 1, [0, 0, 0, 0], &[], 0);
+        assert_eq!(fixture.result(None, seek).0, 0);
+        assert_eq!(write(&fixture, b"second"), 6);
+        let authority = authority_of(&fixture.dispatcher);
+        assert_eq!(
+            fixture.venue_contents(&authority, b"/tmp/append"),
+            b"firstsecond"
+        );
+    }
+
+    #[test]
+    fn native_inherited_path_descriptor_keeps_path_access() {
+        let mut fixture = writable_fixture(Upper::Memory);
+        let target = root_openat(
+            &mut fixture.dispatcher,
+            b"/etc/ld.so.cache\0",
+            carrick_abi::LINUX_O_PATH,
+        );
+        assert!(target >= 3);
+        let child = fixture.fork_table(fixture.table);
+        let table = fd::TableId::from_raw(fd::RawTableId {
+            authority: child[0],
+            index: child[1],
+            generation: child[2],
+        });
+        assert_eq!(
+            fixture
+                .owner
+                .region()
+                .fd(crate::el1_zone::HostLockWait)
+                .getfl(table, fd::Fd(target as i32))
+                .unwrap()
+                .0,
+            fd::AccessMode::Path
+        );
+        let read = record(child, HostFileOp::Read, target as i32, [0; 4], &[], 16);
+        assert_eq!(
+            fixture.result(None, read).0,
+            carrick_abi::LINUX_EBADF.guest_retval()
+        );
+    }
+
+    /// #1410: a child's inherited descriptor survives the last host close.
+    #[test]
+    fn native_inherited_description_survives_the_last_host_close() {
         let mut fixture = writable_fixture(Upper::Memory);
         let root = &mut fixture.dispatcher;
         let target = root_openat(root, b"/tmp/f\0", CREATE);
-        assert_eq!(root_syscall(root, 24, [target as u64, 1, 0, 0, 0, 0], &[]), 1);
-        assert_eq!(root_syscall(root, 57, [target as u64, 0, 0, 0, 0, 0], &[]), 0);
+        assert_eq!(
+            root_syscall(root, 24, [target as u64, 1, 0, 0, 0, 0], &[]),
+            1
+        );
+        assert_eq!(
+            root_syscall(root, 57, [target as u64, 0, 0, 0, 0, 0], &[]),
+            0
+        );
+        let context = fixture.dispatcher.capture_one_task_context().unwrap();
+        let description = context
+            .resources()
+            .files()
+            .slot(FileSlotNumber::for_open_fd(1).unwrap())
+            .unwrap()
+            .description;
+        let weak = Arc::downgrade(&description);
+        drop(description);
         let child = fixture.fork_table(fixture.table);
-        assert_eq!(root_syscall(root, 57, [1, 0, 0, 0, 0, 0], &[]), 0);
-        let mut write = record(child, HostFileOp::Write, 1, [UNLIMITED, 0, 0, 0], b"y\n", 0);
-        assert_eq!(fixture.serve(None, &mut write), Err(NativeHostFileRefusal));
+        assert_eq!(
+            root_syscall(&mut fixture.dispatcher, 57, [1, 0, 0, 0, 0, 0], &[]),
+            0
+        );
+        let write = record(child, HostFileOp::Write, 1, [UNLIMITED, 0, 0, 0], b"y\n", 0);
+        assert_eq!(fixture.result(None, write).0, 2);
+        let authority = authority_of(&fixture.dispatcher);
+        assert_eq!(fixture.venue_contents(&authority, b"/tmp/f"), b"y\n");
+        assert!(weak.upgrade().is_some(), "child retains service authority");
+        let retained = fixture.owner.retained_host_resources();
+        let child = fd::TableId::from_raw(fd::RawTableId {
+            authority: child[0],
+            index: child[1],
+            generation: child[2],
+        });
+        carrick_el1_linux::ipc::retire_namespace(
+            &fixture.owner.region(),
+            child,
+            &carrick_el1_abi::CurrentTask::new(),
+        )
+        .unwrap();
+        fixture.owner.drain_retired_tables().unwrap();
+        assert_eq!(fixture.owner.retained_host_resources(), retained - 1);
+        assert!(
+            weak.upgrade().is_none(),
+            "final ring close releases the publication backlink"
+        );
     }
 
     #[test]

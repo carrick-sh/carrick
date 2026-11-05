@@ -280,7 +280,51 @@ enum HostDescriptionState {
     Retired(fd::Description),
 }
 
+/// Non-owning mode observation, independent of the host publication pin.
+/// Ring slots can outlive that pin; this never keeps HostIpc alive itself.
+#[derive(Debug)]
+pub(crate) struct HostModeObservation {
+    owner: std::sync::Weak<HostIpc>,
+    key: fd::OfdKey,
+}
+
+impl HostModeObservation {
+    pub(crate) fn linux_flags(&self) -> Option<u64> {
+        let owner = self.owner.upgrade()?;
+        let (access, flags) = owner
+            .region()
+            .fd(HostLockWait)
+            .observe_flags(self.key)
+            .ok()?;
+        Some(linux_mode_flags(access, flags))
+    }
+}
+
+fn linux_mode_flags(access: fd::AccessMode, flags: fd::StatusFlags) -> u64 {
+    let access = match access {
+        fd::AccessMode::ReadOnly => carrick_abi::LINUX_O_RDONLY,
+        fd::AccessMode::WriteOnly => carrick_abi::LINUX_O_WRONLY,
+        fd::AccessMode::ReadWrite => carrick_abi::LINUX_O_RDWR,
+        fd::AccessMode::Path => carrick_abi::LINUX_O_PATH,
+    };
+    access
+        | (u64::from(flags.append) * carrick_abi::LINUX_O_APPEND)
+        | (u64::from(flags.nonblock) * carrick_abi::LINUX_O_NONBLOCK)
+        | (u64::from(flags.asynchronous) * carrick_abi::LINUX_O_ASYNC)
+}
+
 impl HostDescriptionFlags {
+    pub(crate) fn mode_observation(&self) -> Option<HostModeObservation> {
+        let state = self.state.lock();
+        let HostDescriptionState::Live(pin) = &*state else {
+            return None;
+        };
+        Some(HostModeObservation {
+            owner: std::sync::Arc::downgrade(&self.owner),
+            key: pin.key(),
+        })
+    }
+
     pub(crate) fn belongs_to(&self, owner: &std::sync::Arc<HostIpc>) -> bool {
         std::sync::Arc::ptr_eq(&self.owner, owner)
     }
@@ -301,17 +345,7 @@ impl HostDescriptionFlags {
                 }),
             HostDescriptionState::Retired(description) => *description,
         };
-        let flags = description.flags;
-        let access = match description.access {
-            fd::AccessMode::ReadOnly => carrick_abi::LINUX_O_RDONLY,
-            fd::AccessMode::WriteOnly => carrick_abi::LINUX_O_WRONLY,
-            fd::AccessMode::ReadWrite => carrick_abi::LINUX_O_RDWR,
-            fd::AccessMode::Path => carrick_abi::LINUX_O_PATH,
-        };
-        access
-            | (u64::from(flags.append) * carrick_abi::LINUX_O_APPEND)
-            | (u64::from(flags.nonblock) * carrick_abi::LINUX_O_NONBLOCK)
-            | (u64::from(flags.asynchronous) * carrick_abi::LINUX_O_ASYNC)
+        linux_mode_flags(description.access, description.flags)
     }
 
     /// The shared open file description's identity (index and generation,

@@ -823,6 +823,7 @@ pub struct DescriptionCommon {
     /// A shared routing record for descriptions whose effects remain host-owned.
     /// This pin ends with functional fd ownership, never diagnostic Arc lifetime.
     ipc_forwarding: Mutex<Option<crate::el1_ipc::HostDescription>>,
+    ipc_forwarded_mode: std::sync::OnceLock<crate::el1_ipc::HostModeObservation>,
     /// Physical lifetime shared by host functional references, mappings, and
     /// shared OFD backing capsules. Observational Rust Arcs do not own a
     /// functional reference or decide when to close the backing.
@@ -861,6 +862,7 @@ impl DescriptionCommon {
             close_effects: AtomicU64::new(0),
             ipc_status_flags: std::sync::OnceLock::new(),
             ipc_forwarding: Mutex::new(None),
+            ipc_forwarded_mode: std::sync::OnceLock::new(),
             physical: Arc::new(DescriptionPhysicalLifetime::default()),
             lease: AtomicI32::new(crate::linux_abi::LINUX_F_UNLCK),
             async_sig: AtomicI32::new(0),
@@ -885,6 +887,7 @@ impl DescriptionCommon {
             close_effects: AtomicU64::new(0),
             ipc_status_flags: std::sync::OnceLock::new(),
             ipc_forwarding: Mutex::new(None),
+            ipc_forwarded_mode: std::sync::OnceLock::new(),
             physical: Arc::new(DescriptionPhysicalLifetime::default()),
             lease: AtomicI32::new(crate::linux_abi::LINUX_F_UNLCK),
             async_sig: AtomicI32::new(0),
@@ -954,6 +957,16 @@ impl DescriptionCommon {
 
     pub(crate) fn status_flags(&self) -> u64 {
         let base = self.status_flags.load(Ordering::Relaxed);
+        if let Some(flags) = self
+            .ipc_forwarded_mode
+            .get()
+            .and_then(|mode| mode.linux_flags())
+        {
+            return (base
+                & !(crate::el1_ipc::HostDescriptionFlags::MUTABLE_MASK
+                    | carrick_abi::LINUX_O_ACCMODE))
+                | flags;
+        }
         self.ipc_status_flags
             .get()
             .map_or(base, |flags| base | flags.linux_flags())
@@ -964,6 +977,11 @@ impl DescriptionCommon {
             flags.set_linux_flags(Some(next), carrick_el1_abi::ipc::fd::CloseEffects::NONE);
         } else {
             self.status_flags.store(next, Ordering::Relaxed);
+            if let Some(forwarded) = &*self.ipc_forwarding.lock() {
+                forwarded
+                    .flags()
+                    .set_linux_flags(Some(next), carrick_el1_abi::ipc::fd::CloseEffects::NONE);
+            }
         }
     }
 
@@ -1178,27 +1196,29 @@ struct IpcPhysicalHold {
     physical: Arc<DescriptionPhysicalLifetime>,
     backing: Option<OpaqueFileDescriptionBacking>,
     admitted: Arc<AtomicBool>,
-    /// The published description itself, weakly, so the carrier can serve a
-    /// ring process's inherited host descriptor through the host's own
-    /// description cores. Weak on purpose: the description's common record
-    /// owns this capsule's admission (`ipc_forwarding`), and a strong edge
-    /// back would keep both alive after the host's last close.
-    view: Weak<FileDescription>,
+    /// Service authority survives the host slots. This is not a host fd
+    /// reference: the final host close takes `ipc_forwarding` before dropping
+    /// its publication pin, breaking the backlink even while ring slots live.
+    view: Arc<FileDescription>,
 }
 
-/// The host description a pinned ring resource stands for, while the host
-/// still holds it open: the one a ring process inherited from a host-served
-/// task (a shell's redirected-and-restored stdout, `exec >file`). `None` for
-/// any other resource, and once the host's last descriptor is closed (the
-/// capsule then only keeps the backing from finishing).
+/// Borrow functional service authority from an authenticated, pinned IPC
+/// resource. The capsule's physical hold keeps the backing live even after
+/// the last host slot closes; only this boundary may acquire a lease then.
 pub(crate) fn published_description(
     resource: &crate::el1_ipc::HostResource,
-) -> Option<Arc<FileDescription>> {
-    resource
-        .downcast_ref::<IpcPhysicalHold>()?
-        .view
-        .upgrade()
-        .filter(|description| description.fd_ref_count() > 0)
+) -> Option<FileDescriptionFdLease> {
+    let capsule = resource.downcast_ref::<IpcPhysicalHold>()?;
+    let description = &capsule.view;
+    let _guard = capsule.physical.transition.lock();
+    if !capsule.admitted.load(Ordering::Acquire) {
+        return None;
+    }
+    // No on_first_fd_ref: IPC custody has never allowed physical close.
+    description.common.retain_fd_ref();
+    Some(FileDescriptionFdLease {
+        description: Arc::clone(description),
+    })
 }
 
 fn finish_description(
@@ -1311,9 +1331,8 @@ impl FileDescription {
                 Err(fd::Error::StalePin.into())
             };
         }
-        // The capsule owns the real backing, not a diagnostic FileDescription
-        // or a host fd lease. Neither the common publication pin nor HostIpc
-        // is reachable through its physical lifetime record.
+        // The capsule owns physical and service custody, not a host fd lease.
+        // Final host close explicitly releases the forwarding publication.
         let admitted = Arc::new(AtomicBool::new(false));
         let backing = match &self.kind {
             FileDescriptionKind::Concrete(backing) => Some(backing.clone()),
@@ -1323,13 +1342,27 @@ impl FileDescription {
             physical: Arc::clone(&self.common.physical),
             backing,
             admitted: Arc::clone(&admitted),
-            view: Arc::downgrade(self),
+            view: Arc::clone(self),
         }))?;
         let backing = IpcBacking::Host(token).encode();
+        let initial_flags = self.common.status_flags();
+        let access = match initial_flags {
+            flags if flags & carrick_abi::LINUX_O_PATH != 0 => fd::AccessMode::Path,
+            flags => match flags & carrick_abi::LINUX_O_ACCMODE {
+                carrick_abi::LINUX_O_WRONLY => fd::AccessMode::WriteOnly,
+                carrick_abi::LINUX_O_RDWR => fd::AccessMode::ReadWrite,
+                _ => fd::AccessMode::ReadOnly,
+            },
+        };
         let description = match owner.admit_description(fd::Description::new(
             backing,
-            fd::AccessMode::ReadWrite,
-            fd::StatusFlags::default(),
+            access,
+            fd::StatusFlags {
+                append: initial_flags & carrick_abi::LINUX_O_APPEND != 0,
+                nonblock: initial_flags & carrick_abi::LINUX_O_NONBLOCK != 0,
+                asynchronous: initial_flags & carrick_abi::LINUX_O_ASYNC != 0,
+                ..fd::StatusFlags::default()
+            },
         )) {
             Ok(description) => description,
             Err(error) => {
@@ -1342,6 +1375,9 @@ impl FileDescription {
         lifecycle.ipc_holds += 1;
         admitted.store(true, Ordering::Release);
         let flags = description.flags();
+        if let Some(mode) = flags.mode_observation() {
+            let _ = self.common.ipc_forwarded_mode.set(mode);
+        }
         flags.require_close_effects(fd::CloseEffects::from_bits(
             self.common.close_effects.load(Ordering::Acquire),
         ));

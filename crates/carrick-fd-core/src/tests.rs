@@ -2803,3 +2803,24 @@ fn filtered_live_close_and_dup_replace_defer_host_release_once() {
     c.destroy_table(peer, |_| panic!("all descriptions already released"))
         .unwrap();
 }
+
+#[test]
+fn mode_observation_tracks_flags_without_retaining_a_reused_incarnation() {
+    let c = authority::<2, 1>();
+    let table = c.create_table(4, &mut storage(4)).unwrap();
+    let number = c.open(table, Fd(0), description(1), false).unwrap();
+    let (pin, _) = c.pin(table, number).unwrap();
+    let key = pin.key();
+    c.unpin(pin).unwrap();
+    let flags = StatusFlags {
+        append: true,
+        nonblock: true,
+        ..StatusFlags::default()
+    };
+    c.setfl(table, number, flags).unwrap();
+    assert_eq!(c.observe_flags(key).unwrap().1, flags);
+    assert!(c.close(table, number).unwrap().is_some());
+    assert_eq!(c.observe_flags(key), Err(Error::StalePin));
+    c.open(table, Fd(0), description(2), false).unwrap();
+    assert_eq!(c.observe_flags(key), Err(Error::StalePin));
+}

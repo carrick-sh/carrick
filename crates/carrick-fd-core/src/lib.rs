@@ -1375,7 +1375,9 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
             .store(description.flags.immutable, Ordering::Relaxed);
         ofd.mode.store(
             encode_mode(description.access, description.flags),
-            Ordering::Relaxed,
+            // Publish the generation transition before an observer can read
+            // the newly allocated mode and recheck the generation.
+            Ordering::Release,
         );
         ofd.close_effects.store(0, Ordering::Relaxed);
         ofd.holds.store(REF, Ordering::Release);
@@ -2320,6 +2322,26 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
             return Err(Error::StalePin);
         }
         Ok(())
+    }
+
+    /// Observe only the atomic mode word of an exact incarnation, without
+    /// acquiring custody. Rechecking the generation prevents recycled OFDs
+    /// from lending flags to a stale host observation. Resource operations
+    /// must still hold their own pin.
+    pub fn observe_flags(&self, key: OfdKey) -> Result<(AccessMode, StatusFlags), Error> {
+        let ofd = self.ofd(key.index)?;
+        if ofd.generation.load(Ordering::Acquire) != key.generation {
+            return Err(Error::StalePin);
+        }
+        let mode = ofd.mode.load(Ordering::Acquire);
+        if ofd.holds.load(Ordering::Acquire) == 0
+            || ofd.generation.load(Ordering::Acquire) != key.generation
+        {
+            return Err(Error::StalePin);
+        }
+        // Immutable flags belong to the retained host description; this
+        // observation is deliberately limited to one atomic mode word.
+        Ok(decode_mode(mode, 0))
     }
 
     /// Current state of a pinned description (status flags may change while

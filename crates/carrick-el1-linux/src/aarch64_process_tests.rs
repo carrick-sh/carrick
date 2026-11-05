@@ -11856,3 +11856,142 @@ fn closed_gate_service_entry(retained_ipc: bool) {
     assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
     assert_eq!(service.crossing.root_exit_status.load(Ordering::Acquire), 7);
 }
+
+/// #1410: root redirection/restore must preserve stdout in the production
+/// native fork's inherited namespace, including after the root closes it.
+#[test]
+fn native_fork_after_root_stdout_restore_serves_the_inherited_stream() {
+    use carrick_core_abi::host_file::{self, HostFileHeader, HostFileOp};
+    use carrick_kernel::dispatch::{
+        DispatchOutcome, LinearMemory, SyscallDispatcher, SyscallRequest,
+    };
+    use std::sync::Arc;
+
+    let mut dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let owner = context.kernel().ipc().unwrap();
+    let files = context.resources().files();
+    let fixture = Fixture::with_file_table(0x10000, asid(1), files.id().raw());
+    let storage = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    // SAFETY: aligned ABI allocation lives for the complete native runtime.
+    let map = unsafe {
+        &*storage
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_IPC_TABLE_MAP_OFFSET as usize)
+            .cast::<carrick_el1_abi::ipc_tables::IpcTableMap>()
+    };
+    files.publish_ipc(Arc::clone(&owner), map).unwrap();
+    let mut call = |nr, args| {
+        let mut bytes = vec![0; 4096];
+        bytes[..10].copy_from_slice(b"/dev/null\0");
+        bytes[128..130].copy_from_slice(b"x\n");
+        let mut memory = LinearMemory::new(0x40000, bytes);
+        match dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(nr, carrick_kernel::compat::SyscallArgs(args)),
+                &mut memory,
+                &carrick_kernel::compat::CompatReporter::default(),
+            )
+            .unwrap()
+        {
+            DispatchOutcome::Returned { value } => value,
+            other => panic!("root syscall {nr}: {other:?}"),
+        }
+    };
+    let saved = call(23, [1, 0, 0, 0, 0, 0]);
+    let target = call(
+        56,
+        [
+            (-100i64) as u64,
+            0x40000,
+            carrick_abi::LINUX_O_WRONLY | carrick_abi::LINUX_O_CREAT | carrick_abi::LINUX_O_TRUNC,
+            0o644,
+            0,
+            0,
+        ],
+    );
+    assert!(target >= 3);
+    assert_eq!(call(24, [target as u64, 1, 0, 0, 0, 0]), 1);
+    assert_eq!(call(64, [1, 0x40080, 2, 0, 0, 0]), 2);
+    assert_eq!(call(24, [saved as u64, 1, 0, 0, 0, 0]), 1);
+    assert_eq!(call(57, [saved as u64, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(call(57, [target as u64, 0, 0, 0, 0, 0]), 0);
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let words = fixture.tables.live(&fixture.maintenance);
+    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+        source,
+        &fixture.task,
+        fixture.page,
+        fixture.control,
+        fixture.address,
+        fixture.address,
+        parked,
+    )
+    .unwrap();
+    let pages: Vec<_> = (0..32).map(|n| 0x20000 + n * 0x1000).collect();
+    let mut crossing = TestStockCrossing::new(&pages);
+    crossing.ipc = Some((Arc::clone(&owner), map));
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &crossing,
+    )
+    .with_words(&words);
+    let parent = TaskKey {
+        id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
+        serial: TaskSerial::from_raw_u64(11).unwrap(),
+    };
+    let mut entry = runtime
+        .enter(source, &fixture.task, parked, &mut service)
+        .unwrap();
+    let LifecycleOutcome::Returned { result, .. } = entry.fork(ProcessForkChildTid::NONE) else {
+        panic!("fork must return")
+    };
+    assert!(result.raw() > 0, "fork: {}", result.raw());
+    drop(entry);
+    let child = runtime
+        .namespace_child_key(parent, result.raw() as u32)
+        .unwrap();
+    let binding = runtime.task_binding(child).unwrap();
+    let child_files = fixture.zone.record(binding.record.id).identity().file_table;
+    let table = map.lookup(child_files).unwrap();
+    assert_ne!(map.lookup(files.id().raw()).unwrap(), table);
+    // Parent closure cannot revoke the child's description or sink.
+    assert_eq!(call(57, [1, 0, 0, 0, 0, 0]), 0);
+    drop(call);
+    let mut record = vec![0; host_file::record_len(2, 0).unwrap()];
+    host_file::encode(
+        &mut record,
+        HostFileHeader {
+            op: HostFileOp::Write,
+            table: [table.authority, table.index, table.generation],
+            fd: 1,
+            flags: 0,
+            args: [u64::MAX, 0, 0, 0],
+        },
+        b"y\n",
+        0,
+    )
+    .unwrap();
+    assert!(
+        dispatcher.serve_native_host_file(&mut record).is_ok(),
+        "inherited stdout must not be a venue refusal (errno 38)"
+    );
+    assert_eq!(host_file::reply(&record).unwrap().result, 2);
+    assert_eq!(dispatcher.stdout(), b"y\n");
+    super::ipc::retire_namespace(
+        &owner.region(),
+        carrick_el1_abi::ipc::fd::TableId::from_raw(table),
+        &fixture.task,
+    )
+    .unwrap();
+    owner.drain_retired_tables().unwrap();
+}

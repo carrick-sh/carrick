@@ -24,6 +24,8 @@ dispatcher's syscalls byte for byte and prove the in-zone routing.
 
 [bindings]
 vm_free = [
+  "carrick-el1-linux::aarch64_process_tests::native_fork_after_root_stdout_restore_serves_the_inherited_stream",
+  "carrick-kernel::dispatch::native_files::tests::{native_child_writes_through_the_roots_restored_stdout,native_child_writes_through_the_roots_redirected_stdout_file,native_inherited_description_survives_the_last_host_close,native_inherited_file_observes_ring_append_after_parent_close,native_inherited_path_descriptor_keeps_path_access}",
   "carrick-el1-linux::aarch64_process_tests::native_child_handoff_tests::{arm_native_fork_child_stdout_retains_capability_after_root_exit_publication,arm_native_fork_tree_releases_capability_after_last_exit}",
   "carrick-kernel::dispatch::native_files::tests::native_reads_equal_the_dispatchers_own_syscalls",
   "carrick-el1-linux::dispatch::tests::native_host_file_stage_keeps_in_zone_writes_in_ring_and_stages_host_stdout",

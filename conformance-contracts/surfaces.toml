@@ -593,6 +593,7 @@ surfaces = [
   { path = "crates/carrick-kernel/src/kernel/mm_occupancy/tests.rs", contract = "kernel.mm.executor-admission" },
   { path = "crates/carrick-kernel/src/kernel/objects.rs", contract = "core.personality.files" },
   { path = "crates/carrick-kernel/src/kernel/objects.rs", contract = "kernel.el1.ipc-fd-authority" },
+  { path = "crates/carrick-kernel/src/kernel/objects.rs", contract = "kernel.native.host-file-venue" },
   { path = "crates/carrick-kernel/src/kernel/objects.rs", contract = "kernel.el1.open-lifetime" },
   { path = "crates/carrick-kernel/src/kernel/objects.rs", contract = "kernel.fork.filetable" },
   { path = "crates/carrick-kernel/src/kernel/objects/ipc.rs", contract = "kernel.el1.fd-single-owner" },
