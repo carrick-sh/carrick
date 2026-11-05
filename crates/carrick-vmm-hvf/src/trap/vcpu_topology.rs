@@ -337,6 +337,46 @@ mod tests {
     ];
 
     #[test]
+    fn admitted_run_seals_topology_before_entering_the_hypervisor() {
+        let topology = std::cell::RefCell::new(VcpuTopology::VACANT);
+        topology.borrow_mut().begin_generation(7);
+        topology.borrow().admit_create().unwrap();
+        let mut ran = false;
+        let mut entries = 0;
+        run_admitted(
+            &mut ran,
+            || topology.borrow_mut().admit_first_run().unwrap(),
+            || {
+                assert_eq!(topology.borrow().phase(), TopologyPhase::Running);
+                assert_eq!(
+                    topology.borrow().admit_create(),
+                    Err(VcpuTopologyViolation::CreateAfterFirstRun { generation: 7 })
+                );
+                assert!(
+                    topology
+                        .borrow()
+                        .admit_destroy(VcpuDestroySite::WorkerExit)
+                        .is_err()
+                );
+                entries += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(ran);
+        run_admitted(
+            &mut ran,
+            || panic!("a subsequent run must not repeat first-run admission"),
+            || {
+                entries += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(entries, 2);
+    }
+
+    #[test]
     #[cfg(feature = "foreign-cow-test-support")]
     fn created_vcpu_first_entry_during_teardown_never_runs_and_can_destroy() {
         for sibling_ran in [false, true] {

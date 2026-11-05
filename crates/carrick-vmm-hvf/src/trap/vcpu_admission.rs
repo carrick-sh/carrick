@@ -1635,7 +1635,10 @@ mod vcpu_lifetime_tests {
             .and_then(|tail| tail.split(concat!("run_to_", "exit(")).next())
             .expect("HvfAarch64Vcpu::run reaches run_to_exit");
         assert!(
-            run.contains(concat!("admit_vcpu_", "first_run()")),
+            run.contains(concat!(
+                "crate::trap::run_admitted(&mut live.ran, ",
+                "crate::trap::admit_vcpu_first_run, || {"
+            )),
             "a vCPU's first run seals the topology before `run_to_exit`"
         );
 
