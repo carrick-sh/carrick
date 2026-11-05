@@ -3,13 +3,15 @@
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod native_service;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) use native_service::NativeExecServiceDirectory;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use native_service::settle_native_cow;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use native_service::{
     NativeExecHostService, NativeExecParts, NativeExecPreparation, NativeExecRegistrationError,
     NativeExecServiceRegistration, NativeHostFileRefused, NativeService,
+};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use native_service::{
+    NativeExecServiceDirectory, NativeRootReplyLedger, NativeRootWaitLedger,
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn take_native_service(
@@ -87,6 +89,9 @@ pub trait NativeWaitChannelWake: std::fmt::Debug + Send + Sync {
             carrick_el1_abi::Aarch64ParkedContext,
         >,
     );
+    /// Publish an enrolled physical producer's exact owner release through
+    /// the runtime's retained zone venue, including release-before-park.
+    fn complete_physical_release(&self, handle: carrick_el1_abi::El1MmHandle) -> bool;
     fn wake(&self, mm: carrick_el1_abi::EntryMmKey, address: core::num::NonZeroU64) -> Option<u32>;
 }
 

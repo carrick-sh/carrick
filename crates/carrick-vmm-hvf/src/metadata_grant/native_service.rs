@@ -300,6 +300,59 @@ impl Deref for ServicePin {
     }
 }
 
+mod root_wait;
+pub(crate) use root_wait::NativeRootWaitLedger;
+
+/// One root service owns one reply until its exact descriptor receipt settles.
+/// At most one service exists per zone record, so this directory is bounded by
+/// the admitted record population, independently of mappings and faults.
+pub(crate) struct NativeRootReplyLedger {
+    entries: Vec<NativeRootReply>,
+}
+impl Default for NativeRootReplyLedger {
+    fn default() -> Self {
+        Self {
+            // Admission bounds every later push, including the one beneath
+            // the service queue: no allocator or directory growth there.
+            entries: Vec::with_capacity(carrick_sched_core::ZONE_RECORDS),
+        }
+    }
+}
+impl core::fmt::Debug for NativeRootReplyLedger {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("NativeRootReplyLedger")
+            .field("pending", &self.entries.len())
+            .finish()
+    }
+}
+struct NativeRootReply {
+    identity: carrick_core_abi::service::ServiceIdentity,
+    root: carrick_guest_arch::RootGpa,
+    reply: carrick_guest_arch::KernelVa,
+    window: carrick_el1_abi::PortalGrantWindow,
+    grant: Box<dyn carrick_aarch64::user_transfer::TransferGrant>,
+    _pin: Option<Arc<MetadataBacking>>,
+}
+impl NativeRootReplyLedger {
+    fn admits(&self, entry: &NativeRootReply) -> bool {
+        self.entries.len() < carrick_sched_core::ZONE_RECORDS
+            && !self.entries.iter().any(|held| {
+                held.identity.birth.record.id == entry.identity.birth.record.id
+                    || held.reply == entry.reply
+            })
+    }
+    /// Called only after the carrier's successful backend destruction. Each
+    /// grant independently authenticates its terminal physical owner before
+    /// abandoning descriptor visibility; failed destruction never reaches here.
+    pub(crate) fn release_destroyed_vm(&mut self) -> Result<(), TrapError> {
+        for entry in &mut self.entries {
+            entry.grant.release_destroyed_vm()?;
+        }
+        self.entries.clear();
+        Ok(())
+    }
+}
+
 /// A unique physical service ticket. The ring retains its continuation, MM,
 /// and member; this host object retains only backing and carrier observation.
 #[must_use]
@@ -876,6 +929,12 @@ impl NativeService {
         let custody = Arc::clone(&self.custody);
         let handle = self.request().identity.birth.mm;
         let mut stock = custody.fork_stock.lock();
+        if stock.owner.child_owner(handle.mm()).is_none()
+            && !stock.owner.is_quarantined(handle.mm())
+        {
+            drop(stock);
+            return self.supply_root(window);
+        }
         if stock.owner.child_owner(handle.mm()) != Some(handle)
             || stock.owner.is_quarantined(handle.mm())
         {
@@ -899,6 +958,154 @@ impl NativeService {
         self.finish_backing_supply(handle, root, reply, &txn)
     }
 
+    /// Root MMs retain their existing exact host transfer authority. Fork
+    /// children continue through ForkStock; neither authority substitutes for
+    /// the other and this service never borrows a running engine.
+    fn supply_root(
+        mut self,
+        window: carrick_el1_abi::PortalGrantWindow,
+    ) -> Result<carrick_sched_core::WakeEffects, TrapError> {
+        use carrick_aarch64::user_transfer::{TransferPreparation, TransferTarget};
+        let custody = Arc::clone(&self.custody);
+        let request = self.request();
+        let handle = request.identity.birth.mm;
+        let Some(NativeServiceReply::Fault(pointer)) = self.reply else {
+            return self.refuse();
+        };
+        let address = self.ticket.reply_address().ok_or_else(stale)?;
+        let state = custody
+            .guest_cow_state(handle.mm().raw())
+            .map_err(|_| stale())?
+            .ok_or_else(stale)?;
+        let root = state
+            .page_tables_authority()
+            .root_base()
+            .ok_or_else(stale)?;
+        let asid = state
+            .cow_runtime
+            .read()
+            .as_ref()
+            .ok_or_else(stale)?
+            .identity
+            .asid;
+        let target = TransferTarget::from_handle(handle, root | (u64::from(asid) << 48));
+        let context = crate::trap::RootTransferContext::for_transfer(
+            state,
+            Arc::clone(&custody),
+            target,
+            window,
+        )?;
+        let region = retained_abi_region(&custody).ok_or_else(stale)?;
+        let (_, zone) = stopped_records(
+            region,
+            carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
+        )
+        .ok_or_else(stale)?;
+        custody.native_root_waits.clear_admitted(request, zone)?;
+        let sample = NativeRootWaitLedger::sample(request, zone)?;
+        let preparation = match self.cow {
+            Some(carrick_core_abi::service::ServiceFaultSupply::Prepared(_)) => {
+                context.prepare_resident_transfer(window)
+            }
+            Some(carrick_core_abi::service::ServiceFaultSupply::Backing(_)) => {
+                context.prepare_transfer(window)
+            }
+            _ => return Err(stale()),
+        };
+        let grant = match preparation {
+            Ok(TransferPreparation::Grant(grant)) => grant,
+            Ok(TransferPreparation::Pending(wait)) => {
+                let wait = custody
+                    .native_root_waits
+                    .enroll(&custody, request, sample, wait)?;
+                return self.complete_wait(wait);
+            }
+            Ok(TransferPreparation::PeerResident) => return self.complete(true),
+            Ok(TransferPreparation::Declined) => return self.refuse(),
+            Err(TrapError::HostBackingEof) => return self.finish(None, false, true),
+            Err(error) => return Err(error),
+        };
+        // Physical I/O and table preparation finish before this bounded
+        // directory/queue cutover. One exact service per record owns a row.
+        let txn = *grant.transaction();
+        let mut prepared = Some(NativeRootReply {
+            identity: request.identity,
+            root: carrick_guest_arch::RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(
+                root,
+            ))
+            .ok_or_else(stale)?,
+            reply: address,
+            window,
+            grant,
+            _pin: self._reply_pin.take().map(|pin| pin._backing),
+        });
+        let region = retained_abi_region(&custody).ok_or_else(stale)?;
+        let (_, zone) = stopped_records(
+            region,
+            carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
+        )
+        .ok_or_else(stale)?;
+        let key = ObjectWaitKey::native_service(request.identity.birth.record).ok_or_else(stale)?;
+        let mut ledger = custody.native_root_replies.lock();
+        if !prepared.as_ref().is_some_and(|entry| ledger.admits(entry)) {
+            drop(ledger);
+            drop(prepared);
+            return Err(stale());
+        }
+        let queue = zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .map_err(|_| stale())?;
+        // SAFETY: the request and prepared entry retain the exact aligned slot.
+        let reply = unsafe { pointer.as_ref() };
+        let mut offered = false;
+        let delivery = self.ticket.publish_prepared((), |()| {
+            let entry = prepared.take().ok_or(())?;
+            if !reply.submit(window, &txn) {
+                prepared = Some(entry);
+                return Err(());
+            }
+            // No fallible action follows descriptor exposure. Its exact grant
+            // enters the bounded ledger before ServiceCell ACK can wake EL1.
+            ledger.entries.push(entry);
+            offered = true;
+            Ok(())
+        });
+        let queue = match delivery {
+            Ok(()) => {
+                drop(ledger);
+                queue
+            }
+            Err((_, ticket, ())) => {
+                drop(queue);
+                drop(ledger);
+                // Cancellation before delivery returns the never-exposed
+                // prepared grant. Its sole Drop rolls back outside the queue.
+                drop(prepared);
+                let queue = zone
+                    .object_wait(key, &carrick_sched_core::ShortLockSpin)
+                    .map_err(|_| stale())?;
+                ticket.complete(false).map_err(|_| stale())?;
+                queue
+            }
+        };
+        let mut effects = carrick_sched_core::WakeEffects::default();
+        queue
+            .notify_object(self.slot, &mut effects)
+            .map_err(|_| stale())?;
+        drop(queue);
+        carrick_observability::probes::hvpatch_native_fault_supply(
+            handle.mm().raw(),
+            request.identity.sequence.get(),
+            if offered {
+                carrick_observability::probes::HvpatchNativeFaultPhase::Supplied
+            } else {
+                carrick_observability::probes::HvpatchNativeFaultPhase::Refused
+            },
+            0,
+            0,
+        );
+        Ok(effects)
+    }
     fn supply_backing(
         self,
         window: carrick_el1_abi::PortalGrantWindow,
@@ -913,6 +1120,12 @@ impl NativeService {
         let custody = Arc::clone(&self.custody);
         let handle = self.request().identity.birth.mm;
         let mut stock = custody.fork_stock.lock();
+        if stock.owner.child_owner(handle.mm()).is_none()
+            && !stock.owner.is_quarantined(handle.mm())
+        {
+            drop(stock);
+            return self.supply_root(window);
+        }
         if stock.owner.child_owner(handle.mm()) != Some(handle)
             || stock.owner.is_quarantined(handle.mm())
         {
@@ -1687,6 +1900,44 @@ pub(super) fn settle_native_descriptor_reply(
         {
             return Ok(false);
         }
+        // A root publication belongs to the exact same producer as synchronous
+        // transfer. Match its retained window, reply and root before consulting
+        // child stock; an unknown receipt never releases physical custody.
+        let mut ledger = custody.native_root_replies.lock();
+        if let Some(index) = ledger.entries.iter().position(|entry| {
+            entry.identity.birth.mm == owner
+                && entry.root == execution.context.root
+                && entry.reply == reply_address
+                && entry.window == window
+                && entry.identity.birth.thread == execution.binding.thread_generation
+        }) {
+            let entry = &mut ledger.entries[index];
+            let txn = *entry.grant.transaction();
+            let Some(receipt) = reply.inspect_receipt(window, &txn) else {
+                // Terminal cancellation may skip applying a delivered reply.
+                // Only confirmed withdrawal proves no descriptor was claimed;
+                // unknown visibility keeps the complete grant in this ledger.
+                if !reply.withdraw(window, &txn) {
+                    return Ok(false);
+                }
+                let unpublished = ledger.entries.swap_remove(index);
+                drop(ledger);
+                drop(unpublished);
+                return Ok(true);
+            };
+            // settle validates the full transaction digest and refuses unknown
+            // visibility. Keep the row through physical/table settlement and
+            // reply acknowledgment; no bare generation can retire its grant.
+            entry.grant.settle(&receipt)?;
+            if reply.take_receipt(window, &txn) != Some(receipt) {
+                return Err(stale());
+            }
+            let settled = ledger.entries.swap_remove(index);
+            drop(ledger);
+            drop(settled);
+            return Ok(true);
+        }
+        drop(ledger);
         let mut stock = custody.fork_stock.lock();
         if stock.owner.child_owner(owner.mm()) != Some(owner)
             || stock.owner.child_root(owner.mm()) != Some(execution.context.root)
@@ -1829,6 +2080,300 @@ mod intake_tests {
                 )
             },
         }
+    }
+
+    /// Protocol-only double: actual descriptor transport and production
+    /// settlement own its lifetime; no physical allocation is fabricated.
+    struct RootReplyDropWitness {
+        txn: carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        custody: std::sync::Weak<crate::trap::CarrierVmCustody>,
+        drops: Arc<std::sync::atomic::AtomicUsize>,
+        outside_ledger: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl carrick_aarch64::user_transfer::TransferGrant for RootReplyDropWitness {
+        fn transaction(&self) -> &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn {
+            &self.txn
+        }
+        fn settle(
+            &mut self,
+            _: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+        ) -> Result<bool, TrapError> {
+            panic!("unclaimed or unknown descriptor cannot manufacture a receipt")
+        }
+    }
+    impl Drop for RootReplyDropWitness {
+        fn drop(&mut self) {
+            use std::sync::atomic::Ordering;
+            let outside = self
+                .custody
+                .upgrade()
+                .is_none_or(|custody| custody.native_root_replies.try_lock().is_some());
+            self.outside_ledger.store(outside, Ordering::Release);
+            self.drops.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    struct RootReplyFixture {
+        region: Box<carrick_test_support::TestEl1Region>,
+        custody: Arc<crate::trap::CarrierVmCustody>,
+        owner: carrick_el1_abi::El1MmHandle,
+        window: carrick_el1_abi::PortalGrantWindow,
+        txn: carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        execution: carrick_hal::fork_stock::GrantExecution,
+        address: carrick_guest_arch::KernelVa,
+        drops: Arc<std::sync::atomic::AtomicUsize>,
+        outside_ledger: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl RootReplyFixture {
+        fn new() -> Self {
+            use carrick_mmu_core::aarch64::descriptor_txn::{
+                DescriptorOp, DescriptorTxn, DescriptorTxnId, PageSpan, TableGrants,
+            };
+            let mut region = carrick_test_support::TestEl1Region::zeroed();
+            let custody = Arc::new(crate::trap::CarrierVmCustody::new_live_fixture());
+            let mut birth = birth();
+            // SAFETY: this tests transport custody only, never physical access.
+            birth.mm = unsafe {
+                carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                    custody.transfer_carrier,
+                    birth.mm.mm(),
+                    birth.mm.incarnation(),
+                )
+            };
+            let window = carrick_el1_abi::PortalGrantWindow::decode([
+                custody.transfer_carrier.get(),
+                1,
+                1,
+                7,
+                1,
+                0x4000,
+                0x5000,
+                1,
+                0x4000,
+                0,
+                0,
+                0,
+                0,
+            ])
+            .unwrap();
+            let root = carrick_guest_arch::RootGpa::page_aligned(
+                carrick_guest_arch::FrameGpa::new(0x1000),
+            )
+            .unwrap();
+            let txn = DescriptorTxn {
+                id: DescriptorTxnId {
+                    mm_key: NonZeroU64::MIN,
+                    generation: NonZeroU64::new(23).unwrap(),
+                },
+                root: carrick_mmu_core::aarch64::SubstrateGpa(root.address().raw()),
+                tables: TableGrants::NONE,
+                op: DescriptorOp::Publish {
+                    span: PageSpan::new(0x4000, 4096),
+                    expected_ipa: carrick_mmu_core::aarch64::SubstrateGpa(0xa000),
+                    access: carrick_mmu_core::aarch64::LeafAccess::Read,
+                },
+            };
+            let address =
+                carrick_guest_arch::KernelVa::new(carrick_el1_abi::EL1_BOOTSTRAP_METADATA_BASE);
+            // SAFETY: TestEl1Region owns aligned complete ABI storage and
+            // bootstrap metadata admits this retained reply allocation.
+            let reply = unsafe {
+                let pointer = region
+                    .as_mut_ptr()
+                    .add(carrick_el1_abi::EL1_BOOTSTRAP_METADATA_OFFSET as usize)
+                    .cast::<carrick_el1_abi::PortalGrantSlot>();
+                pointer.write(carrick_el1_abi::PortalGrantSlot::new());
+                &*pointer
+            };
+            assert!(reply.submit(window, &txn));
+            let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let outside_ledger = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            custody
+                .native_root_replies
+                .lock()
+                .entries
+                .push(NativeRootReply {
+                    identity: carrick_core_abi::service::ServiceIdentity {
+                        birth,
+                        execution: SnapshotGeneration::INITIAL,
+                        sequence: NonZeroU64::new(2).unwrap(),
+                    },
+                    root,
+                    reply: address,
+                    window,
+                    grant: Box::new(RootReplyDropWitness {
+                        txn,
+                        custody: Arc::downgrade(&custody),
+                        drops: drops.clone(),
+                        outside_ledger: outside_ledger.clone(),
+                    }),
+                    _pin: None,
+                });
+            let execution = carrick_hal::fork_stock::GrantExecution::new(
+                carrick_guest_arch::CpuId::new(0),
+                carrick_core_abi::ExecutionBinding {
+                    task: carrick_core_abi::EntryTaskKey::from_raw(1),
+                    generation: SnapshotGeneration::INITIAL,
+                    mm: carrick_core_abi::EntryMmKey::from_raw(1),
+                    thread_generation: birth.thread,
+                },
+                carrick_guest_arch::AddressContext {
+                    root,
+                    mm: carrick_guest_arch::MmGeneration::new(NonZeroU64::MIN),
+                    generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::MIN),
+                },
+            );
+            Self {
+                region,
+                custody,
+                owner: birth.mm,
+                window,
+                txn,
+                execution,
+                address,
+                drops,
+                outside_ledger,
+            }
+        }
+
+        fn reply(&self) -> &carrick_el1_abi::PortalGrantSlot {
+            // SAFETY: complete initialized aligned slot retained by this fixture.
+            unsafe {
+                &*self
+                    .region
+                    .as_ptr()
+                    .add(carrick_el1_abi::EL1_BOOTSTRAP_METADATA_OFFSET as usize)
+                    .cast::<carrick_el1_abi::PortalGrantSlot>()
+            }
+        }
+
+        fn settle(
+            &self,
+            owner: carrick_el1_abi::El1MmHandle,
+            address: carrick_guest_arch::KernelVa,
+        ) -> bool {
+            let mut settlement = carrick_el1_abi::NativeDescriptorSettlement::EMPTY;
+            settlement
+                .initialize(owner, self.window.operation.sequence, address)
+                .unwrap();
+            // SAFETY: this fixture retains the aligned entire region across
+            // the production settlement entry and its atomic reply accesses.
+            let region = unsafe {
+                RetainedAbiRegion::new(
+                    self.region.as_ptr().cast_mut(),
+                    carrick_el1_abi::EL1_REGION_SIZE as usize,
+                )
+                .unwrap()
+            };
+            let accepted = settle_native_descriptor_reply(
+                &self.custody,
+                region,
+                self.execution,
+                &mut settlement,
+            )
+            .unwrap();
+            assert_eq!(
+                settlement.take(owner, self.window.operation.sequence, address),
+                Some(if accepted { Ok(()) } else { Err(()) })
+            );
+            accepted
+        }
+    }
+    impl Drop for RootReplyFixture {
+        fn drop(&mut self) {
+            let entries = std::mem::take(&mut self.custody.native_root_replies.lock().entries);
+            drop(entries);
+        }
+    }
+
+    #[test]
+    fn root_grant_destroy_proof_failure_retains_custody_and_blocks_reuse() {
+        use std::sync::atomic::Ordering;
+        let fixture = RootReplyFixture::new();
+        let destroys = core::cell::Cell::new(0);
+        let releases = core::cell::Cell::new(0);
+        // The test grant has no destroyed-VM proof. The production destroy
+        // entry must retain it after successful raw destruction, not publish
+        // release or permit a second raw destroy against a successor.
+        for _ in 0..2 {
+            let result = crate::trap::destroy_vm_with_custody_using(
+                &fixture.custody,
+                "root grant proof failure",
+                || {
+                    destroys.set(destroys.get() + 1);
+                    0
+                },
+                || releases.set(releases.get() + 1),
+            );
+            assert!(result.is_err());
+            assert_eq!(destroys.get(), 1);
+            assert_eq!(releases.get(), 0);
+            assert_eq!(fixture.drops.load(Ordering::Acquire), 0);
+            assert_eq!(fixture.custody.native_root_replies.lock().entries.len(), 1);
+            assert_eq!(fixture.custody.live_generation(), None);
+            assert!(fixture.custody.begin_create().is_err());
+            assert!(matches!(
+                fixture.custody.state.lock().lifecycle,
+                crate::trap::CarrierVmLifecycle::Destroying(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn root_descriptor_cancel_withdraws_unclaimed_reply_and_drops_once() {
+        use std::sync::atomic::Ordering;
+        let fixture = RootReplyFixture::new();
+        assert!(fixture.settle(fixture.owner, fixture.address));
+        assert_eq!(fixture.drops.load(Ordering::Acquire), 1);
+        assert!(fixture.outside_ledger.load(Ordering::Acquire));
+        assert!(
+            fixture
+                .custody
+                .native_root_replies
+                .lock()
+                .entries
+                .is_empty()
+        );
+        assert!(fixture.reply().window().is_none());
+        assert!(
+            !fixture.settle(fixture.owner, fixture.address),
+            "no second settlement"
+        );
+        assert_eq!(fixture.drops.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn root_descriptor_cancel_retains_claimed_unknown_visibility() {
+        use std::sync::atomic::Ordering;
+        let fixture = RootReplyFixture::new();
+        let _claimed = fixture.reply().descriptor().claim_for_mm(1).unwrap();
+        assert!(!fixture.settle(fixture.owner, fixture.address));
+        assert_eq!(fixture.drops.load(Ordering::Acquire), 0);
+        assert_eq!(fixture.custody.native_root_replies.lock().entries.len(), 1);
+        assert_eq!(fixture.reply().window(), Some(fixture.window));
+    }
+
+    #[test]
+    fn root_descriptor_cancel_refuses_foreign_owner_or_reply() {
+        use std::sync::atomic::Ordering;
+        let fixture = RootReplyFixture::new();
+        // SAFETY: a forged candidate grants no authority to this fixture.
+        let foreign = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                fixture.owner.carrier(),
+                fixture.owner.mm(),
+                NonZeroU64::new(2).unwrap(),
+            )
+        };
+        assert!(!fixture.settle(foreign, fixture.address));
+        assert!(!fixture.settle(
+            fixture.owner,
+            carrick_guest_arch::KernelVa::new(fixture.address.raw() + 4096)
+        ));
+        assert_eq!(fixture.drops.load(Ordering::Acquire), 0);
+        assert_eq!(fixture.custody.native_root_replies.lock().entries.len(), 1);
+        assert_eq!(fixture.reply().window(), Some(fixture.window));
+        assert!(fixture.reply().withdraw(fixture.window, &fixture.txn));
     }
 
     #[test]

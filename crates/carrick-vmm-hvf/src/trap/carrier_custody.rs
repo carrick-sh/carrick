@@ -338,6 +338,7 @@ pub(crate) enum CarrierVmCustodyError {
     LifecycleConflict,
     StaleGeneration,
     GenerationExhausted,
+    UnsettledPhysicalGrants,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -464,6 +465,9 @@ pub struct CarrierVmCustody {
         parking_lot::Mutex<std::collections::HashMap<u64, std::sync::Weak<MmAccessState>>>,
     pub(crate) native_exec_services:
         std::sync::Arc<crate::metadata_grant::NativeExecServiceDirectory>,
+    pub(crate) native_root_replies:
+        parking_lot::Mutex<crate::metadata_grant::NativeRootReplyLedger>,
+    pub(crate) native_root_waits: crate::metadata_grant::NativeRootWaitLedger,
     pub(crate) native_exec_preparations: parking_lot::Mutex<Vec<RetainedNativeExecPreparation>>,
     pub(crate) native_exec_predecessors: parking_lot::Mutex<
         Vec<carrick_hal::fork_stock::ExecPredecessorReceipt<carrick_hal::asid::AsidGeneration>>,
@@ -808,6 +812,8 @@ impl CarrierVmCustody {
             native_exec_services: std::sync::Arc::new(
                 crate::metadata_grant::NativeExecServiceDirectory::default(),
             ),
+            native_root_replies: parking_lot::Mutex::new(Default::default()),
+            native_root_waits: Default::default(),
             native_exec_preparations: parking_lot::Mutex::new(Vec::new()),
             native_exec_predecessors: parking_lot::Mutex::new(Vec::new()),
             native_exec_receipt_sequence: std::sync::atomic::AtomicU64::new(0),
@@ -858,6 +864,7 @@ impl CarrierVmCustody {
             state.next_generation = 2;
             state.lifecycle = CarrierVmLifecycle::Live(CarrierVmGeneration(1));
         }
+        custody.native_root_waits.reset_for_new_vm();
         custody
     }
 
@@ -883,6 +890,7 @@ impl CarrierVmCustody {
         let mut state = self.state.lock();
         match state.lifecycle {
             CarrierVmLifecycle::Creating(current) if current == generation => {
+                self.native_root_waits.reset_for_new_vm();
                 state.lifecycle = CarrierVmLifecycle::Live(generation);
                 Ok(())
             }
@@ -980,6 +988,21 @@ impl CarrierVmCustody {
         &self,
         generation: CarrierVmGeneration,
     ) -> Result<(), CarrierVmCustodyError> {
+        {
+            let state = self.state.lock();
+            match state.lifecycle {
+                CarrierVmLifecycle::Destroying(current) if current == generation => {}
+                CarrierVmLifecycle::Destroying(_) | CarrierVmLifecycle::Live(_) => {
+                    return Err(CarrierVmCustodyError::StaleGeneration);
+                }
+                CarrierVmLifecycle::Vacant | CarrierVmLifecycle::Creating(_) => {
+                    return Err(CarrierVmCustodyError::LifecycleConflict);
+                }
+            }
+        }
+        // Join physical callbacks before publishing Vacant: a successor VM
+        // must never race an old callback through the process-global ABI view.
+        self.native_root_waits.clear_all_before_mapping_release();
         let destroyed_stock = {
             // Match grant publication/return: aperture precedes lifecycle state.
             let mut metadata = self.metadata_aperture.lock();
@@ -1008,7 +1031,6 @@ impl CarrierVmCustody {
                     metadata.release_destroyed_vm(generation.0, |identity| {
                         let _ = state.remove_record(identity.record_id);
                     });
-                    state.lifecycle = CarrierVmLifecycle::Vacant;
                     std::mem::replace(
                         &mut *self.fork_stock.lock(),
                         crate::fork_stock::ForkStockHostCustody::with_asids(
@@ -1025,8 +1047,21 @@ impl CarrierVmCustody {
                 }
             }
         };
+        // Failed physical proof retains the exact grants and Destroying
+        // generation. It cannot admit a successor or free unknown backing.
+        self.native_root_replies
+            .lock()
+            .release_destroyed_vm()
+            .map_err(|_| CarrierVmCustodyError::UnsettledPhysicalGrants)?;
         drop(destroyed_stock);
-        Ok(())
+        let mut state = self.state.lock();
+        match state.lifecycle {
+            CarrierVmLifecycle::Destroying(current) if current == generation => {
+                state.lifecycle = CarrierVmLifecycle::Vacant;
+                Ok(())
+            }
+            _ => Err(CarrierVmCustodyError::StaleGeneration),
+        }
     }
 
     pub(crate) fn frame_pool(
