@@ -458,6 +458,16 @@ pub trait ProcessSignals {
 }
 
 pub trait SignalNative<'a>: crate::lifecycle::UserCopy {
+    fn wait_guest_copy(
+        &mut self,
+        request: carrick_core::personality::GuestCopyRequest,
+    ) -> SignalOutcome;
+    fn finish_signal_output(
+        &mut self,
+        address: carrick_guest_arch::UserVa,
+        bytes: alloc::vec::Vec<u8>,
+    ) -> SignalOutcome;
+
     fn arguments(&self) -> [u64; 6];
     fn process_signals(&mut self) -> Option<&mut dyn ProcessSignals>;
     fn current_blocked(&self) -> carrick_signal_core::policy::SigBlockMask;
@@ -514,8 +524,14 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
             }
             let new_action = if act_ptr != 0 {
                 let mut bytes = [0u8; core::mem::size_of::<LinuxSigaction>()];
-                if !native.copy_in(&mut bytes, carrick_guest_arch::UserVa::new(act_ptr)) {
-                    return returned(LINUX_EFAULT.guest_retval(), false);
+                match native.copy_in(&mut bytes, carrick_guest_arch::UserVa::new(act_ptr)) {
+                    carrick_core::personality::CopyOutcome::Done => {}
+                    carrick_core::personality::CopyOutcome::Fault => {
+                        return returned(LINUX_EFAULT.guest_retval(), false);
+                    }
+                    carrick_core::personality::CopyOutcome::NotYet(request) => {
+                        return Some(native.wait_guest_copy(request));
+                    }
                 }
                 let Ok(newact) = LinuxSigaction::ref_from_bytes(&bytes) else {
                     return returned(LINUX_EFAULT.guest_retval(), false);
@@ -601,9 +617,10 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                 oldact.sa_flags = flags;
                 oldact.sa_mask = [current.mask.bits()];
                 let bytes = IntoBytes::as_bytes(&oldact);
-                if !native.copy_out(carrick_guest_arch::UserVa::new(oldact_ptr), bytes) {
-                    return returned(LINUX_EFAULT.guest_retval(), false);
-                }
+                return Some(native.finish_signal_output(
+                    carrick_guest_arch::UserVa::new(oldact_ptr),
+                    bytes.to_vec(),
+                ));
             }
             returned(0, false)
         }
@@ -620,10 +637,13 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                 let signals = native.process_signals()?;
                 signals.rt_sigpending(blocked)
             };
-            if !native.copy_out(
-                carrick_guest_arch::UserVa::new(set_ptr),
-                &pending.to_le_bytes(),
-            ) {
+            if !native
+                .copy_out(
+                    carrick_guest_arch::UserVa::new(set_ptr),
+                    &pending.to_le_bytes(),
+                )
+                .is_done()
+            {
                 return returned(LINUX_EFAULT.guest_retval(), false);
             }
             returned(0, false)
@@ -729,7 +749,10 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                 return returned(LINUX_ESRCH.guest_retval(), false);
             }
             let mut bytes = [0u8; core::mem::size_of::<LinuxSiginfo>()];
-            if !native.copy_in(&mut bytes, carrick_guest_arch::UserVa::new(uinfo_ptr)) {
+            if !native
+                .copy_in(&mut bytes, carrick_guest_arch::UserVa::new(uinfo_ptr))
+                .is_done()
+            {
                 return returned(LINUX_EFAULT.guest_retval(), false);
             }
             let Ok(info) = LinuxSiginfo::ref_from_bytes(&bytes) else {
@@ -753,7 +776,10 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                 Err(errno) => return returned(errno.guest_retval(), false),
             };
             let mut bytes = [0u8; core::mem::size_of::<LinuxSiginfo>()];
-            if !native.copy_in(&mut bytes, carrick_guest_arch::UserVa::new(uinfo_ptr)) {
+            if !native
+                .copy_in(&mut bytes, carrick_guest_arch::UserVa::new(uinfo_ptr))
+                .is_done()
+            {
                 return returned(LINUX_EFAULT.guest_retval(), false);
             }
             let Ok(info) = LinuxSiginfo::ref_from_bytes(&bytes) else {
@@ -774,8 +800,14 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                 return returned(LINUX_EINVAL.guest_retval(), false);
             }
             let mut bytes = [0u8; 8];
-            if !native.copy_in(&mut bytes, carrick_guest_arch::UserVa::new(mask_ptr)) {
-                return returned(LINUX_EFAULT.guest_retval(), false);
+            match native.copy_in(&mut bytes, carrick_guest_arch::UserVa::new(mask_ptr)) {
+                carrick_core::personality::CopyOutcome::Done => {}
+                carrick_core::personality::CopyOutcome::Fault => {
+                    return returned(LINUX_EFAULT.guest_retval(), false);
+                }
+                carrick_core::personality::CopyOutcome::NotYet(request) => {
+                    return Some(native.wait_guest_copy(request));
+                }
             }
             let mask_bits = u64::from_le_bytes(bytes);
             let mask = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
@@ -803,7 +835,10 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                 return returned(LINUX_EINVAL.guest_retval(), false);
             }
             let mut bytes = [0u8; 8];
-            if !native.copy_in(&mut bytes, carrick_guest_arch::UserVa::new(uthese_ptr)) {
+            if !native
+                .copy_in(&mut bytes, carrick_guest_arch::UserVa::new(uthese_ptr))
+                .is_done()
+            {
                 return returned(LINUX_EFAULT.guest_retval(), false);
             }
             let set = carrick_signal_core::SignalSet::from_bits(u64::from_le_bytes(bytes))
@@ -811,7 +846,10 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                 .without(carrick_signal_core::policy::Signal::STOP);
             let timeout_ns = if uts_ptr != 0 {
                 let mut ts_bytes = [0u8; 16];
-                if !native.copy_in(&mut ts_bytes, carrick_guest_arch::UserVa::new(uts_ptr)) {
+                if !native
+                    .copy_in(&mut ts_bytes, carrick_guest_arch::UserVa::new(uts_ptr))
+                    .is_done()
+                {
                     return returned(LINUX_EFAULT.guest_retval(), false);
                 }
                 let mut sec_bytes = [0u8; 8];
@@ -846,7 +884,10 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                             LinuxSiginfo::kill(sig.number(), LINUX_SI_USER, 0, 0)
                         });
                         let bytes = IntoBytes::as_bytes(&info);
-                        if !native.copy_out(carrick_guest_arch::UserVa::new(uinfo_ptr), bytes) {
+                        if !native
+                            .copy_out(carrick_guest_arch::UserVa::new(uinfo_ptr), bytes)
+                            .is_done()
+                        {
                             return returned(LINUX_EFAULT.guest_retval(), false);
                         }
                     }

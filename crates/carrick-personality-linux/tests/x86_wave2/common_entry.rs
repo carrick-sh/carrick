@@ -659,6 +659,13 @@ fn common_linux_entry_calls_native_process_custody() {
         idle: bool,
     }
     impl ProcessNative for Process {
+        fn wait_guest_copy(
+            &mut self,
+            _: carrick_core::personality::GuestCopyRequest,
+        ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
+            panic!("eager test venue cannot suspend guest memory")
+        }
+
         fn is_root_process(&self) -> bool {
             true
         }
@@ -924,6 +931,13 @@ fn compact_common_entry_suspends_only_after_authenticated_park() {
         visits: usize,
     }
     impl ProcessNative<ParkedContextWords> for Process<'_> {
+        fn wait_guest_copy(
+            &mut self,
+            _: carrick_core::personality::GuestCopyRequest,
+        ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
+            panic!("eager test venue cannot suspend guest memory")
+        }
+
         fn is_root_process(&self) -> bool {
             true
         }

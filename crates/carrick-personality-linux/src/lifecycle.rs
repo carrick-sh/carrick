@@ -174,6 +174,7 @@ pub enum LifecycleCall {
 
 /// A primitive returns data, never an entry completion or a final frame write.
 pub enum LifecycleOutcome {
+    Redispatch,
     HostCustody,
     Returned {
         result: SyscallResult,
@@ -188,6 +189,7 @@ pub enum LifecycleOutcome {
 pub fn lifecycle_effect(outcome: &LifecycleOutcome) -> crate::dispatch::FamilyCompletion {
     use crate::dispatch::FamilyCompletion;
     match *outcome {
+        LifecycleOutcome::Redispatch => FamilyCompletion::FrameRestored,
         LifecycleOutcome::HostCustody => FamilyCompletion::HostCustody,
         LifecycleOutcome::Returned { result, work: true } => {
             FamilyCompletion::CompleteWithWork(result.raw())
@@ -266,6 +268,8 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
     fn take_run_failure(&mut self) -> Option<NativeRunFailureReason> {
         None
     }
+    /// Prepare an unavailable input and retain its exact syscall until ready.
+    fn wait_guest_copy(&mut self, request: GuestCopyRequest) -> LifecycleOutcome;
     /// An admitted process may retain an exact-MM write authority (including COW).
     /// None means this venue does not own user transfers.
     fn copy_out_owned(
@@ -405,7 +409,7 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
     }
 }
 
-pub use carrick_core::personality::UserCopy;
+pub use carrick_core::personality::{CopyOutcome, GuestCopyRequest, UserCopy};
 
 pub struct ChildContext {
     pub result: SyscallResult,
@@ -477,6 +481,16 @@ impl From<carrick_sched_core::Requeue> for BornEnqueue {
 /// ISA hooks acquire retained metadata and move real native context. They do
 /// not route, validate clone flags, lower errno or publish entry completion.
 pub trait LifecycleNative<'a>: UserCopy {
+    /// Resume an input before any syscall effect has been committed.
+    fn wait_guest_copy(&mut self, request: GuestCopyRequest) -> LifecycleOutcome;
+    /// Retain a completed setup operation's original output across memory waits.
+    fn finish_signal_output(
+        &mut self,
+        address: UserVa,
+        bytes: alloc::vec::Vec<u8>,
+        work: bool,
+    ) -> LifecycleOutcome;
+
     /// Terminal custody loss must never become a guest errno or leave exit parked.
     fn fail_lifecycle(&mut self, reason: NativeRunFailureReason) -> !;
     fn prepare_thread_birth(&mut self) -> ThreadBirthAdmission {
@@ -837,14 +851,14 @@ pub fn invoke<'a>(
         }
         LifecycleCall::SigProcMask => Some(match serve_sigprocmask(args, thread, native)? {
             Ok(work) => returned(SyscallResult::new(0), work),
-            Err((errno, work)) => returned(SyscallResult::new(errno.guest_retval()), work),
+            Err(error) => settle_setup_error(error, native),
         }),
         LifecycleCall::SigAltStack => {
             let sp = native.user_sp().map(UserVa::raw);
             let isa = native.guest_isa();
             Some(match serve_sigaltstack(args, thread, native, sp, isa)? {
                 Ok(()) => returned(SyscallResult::new(0), false),
-                Err(errno) => returned(SyscallResult::new(errno.guest_retval()), false),
+                Err(error) => settle_setup_error(error, native),
             })
         }
         LifecycleCall::Clone => serve_clone(args, thread, native),
@@ -880,6 +894,34 @@ pub fn invoke<'a>(
     }
 }
 
+/// Refusal keeps input redispatch separate from an already committed answer.
+#[derive(Debug)]
+pub enum SignalSetupError {
+    Errno(carrick_syscall_abi::LinuxErrno, bool),
+    Input(GuestCopyRequest),
+    Output {
+        address: UserVa,
+        bytes: alloc::vec::Vec<u8>,
+        work: bool,
+    },
+}
+fn settle_setup_error<'a>(
+    error: SignalSetupError,
+    native: &mut dyn LifecycleNative<'a>,
+) -> LifecycleOutcome {
+    match error {
+        SignalSetupError::Errno(errno, work) => {
+            returned(SyscallResult::new(errno.guest_retval()), work)
+        }
+        SignalSetupError::Input(request) => native.wait_guest_copy(request),
+        SignalSetupError::Output {
+            address,
+            bytes,
+            work,
+        } => native.finish_signal_output(address, bytes, work),
+    }
+}
+
 /// `rt_sigprocmask(how, set, oldset, sigsetsize)`. `Some(work)`: served
 /// (result 0); `work` when a pending signal may now be deliverable to this
 /// thread, or must move to a sibling because this thread just blocked it.
@@ -887,27 +929,42 @@ pub fn serve_sigprocmask(
     args: [u64; 6],
     thread: LifecycleThread<'_>,
     user: &mut (impl UserCopy + ?Sized),
-) -> Option<Result<bool, (carrick_syscall_abi::LinuxErrno, bool)>> {
+) -> Option<Result<bool, SignalSetupError>> {
     let [how, set, oldset, size] = [args[0], args[1], args[2], args[3]];
     if !setup_open(thread.page) {
         return None;
     }
     if size != RT_SIGSET_SIZE {
-        return Some(Err((carrick_syscall_abi::LINUX_EINVAL, false)));
+        return Some(Err(SignalSetupError::Errno(
+            carrick_syscall_abi::LINUX_EINVAL,
+            false,
+        )));
     }
     // The owning thread is the only writer of its mask.
     let old = thread.slot.blocked();
     let new = if set != 0 {
         let mut bytes = [0u8; 8];
-        if !user.copy_in(&mut bytes, UserVa::new(set)) {
-            return Some(Err((carrick_syscall_abi::LINUX_EFAULT, false)));
+        match user.copy_in(&mut bytes, UserVa::new(set)) {
+            CopyOutcome::Done => {}
+            CopyOutcome::Fault => {
+                return Some(Err(SignalSetupError::Errno(
+                    carrick_syscall_abi::LINUX_EFAULT,
+                    false,
+                )));
+            }
+            CopyOutcome::NotYet(request) => return Some(Err(SignalSetupError::Input(request))),
         }
         let bits = u64::from_le_bytes(bytes);
         let mask = match how {
             SIG_BLOCK => old.0 | bits,
             SIG_UNBLOCK => old.0 & !bits,
             SIG_SETMASK => bits,
-            _ => return Some(Err((carrick_syscall_abi::LINUX_EINVAL, false))),
+            _ => {
+                return Some(Err(SignalSetupError::Errno(
+                    carrick_syscall_abi::LINUX_EINVAL,
+                    false,
+                )));
+            }
         };
         Some(BlockedMask(mask & !UNBLOCKABLE))
     } else {
@@ -924,8 +981,12 @@ pub fn serve_sigprocmask(
     } else {
         false
     };
-    if oldset != 0 && !user.copy_out(UserVa::new(oldset), &old.0.to_le_bytes()) {
-        return Some(Err((carrick_syscall_abi::LINUX_EFAULT, work)));
+    if oldset != 0 {
+        return Some(Err(SignalSetupError::Output {
+            address: UserVa::new(oldset),
+            bytes: old.0.to_le_bytes().to_vec(),
+            work,
+        }));
     }
     Some(Ok(work))
 }
@@ -942,7 +1003,7 @@ fn serve_sigaltstack(
     user: &mut (impl UserCopy + ?Sized),
     sp: Option<u64>,
     isa: carrick_guest_arch::GuestIsa,
-) -> Option<Result<(), carrick_syscall_abi::LinuxErrno>> {
+) -> Option<Result<(), SignalSetupError>> {
     let [ss, old_ss] = [args[0], args[1]];
     if !setup_open(thread.page) {
         return None;
@@ -957,18 +1018,31 @@ fn serve_sigaltstack(
     };
     let replacement = if ss != 0 {
         let mut bytes = [0u8; STACK_T_SIZE];
-        if !user.copy_in(&mut bytes, UserVa::new(ss)) {
-            return Some(Err(carrick_syscall_abi::LINUX_EFAULT));
+        match user.copy_in(&mut bytes, UserVa::new(ss)) {
+            CopyOutcome::Done => {}
+            CopyOutcome::Fault => {
+                return Some(Err(SignalSetupError::Errno(
+                    carrick_syscall_abi::LINUX_EFAULT,
+                    false,
+                )));
+            }
+            CopyOutcome::NotYet(request) => return Some(Err(SignalSetupError::Input(request))),
         }
         if on_stack {
-            return Some(Err(carrick_syscall_abi::LINUX_EPERM));
+            return Some(Err(SignalSetupError::Errno(
+                carrick_syscall_abi::LINUX_EPERM,
+                false,
+            )));
         }
         let [sp, flags, size] = stack_t_words(&bytes);
         let flags = flags as u32;
         let accepted = SS_ONSTACK | SS_DISABLE | carrick_syscall_abi::LINUX_SS_AUTODISARM as u32;
         if flags & !accepted != 0 || flags & (SS_DISABLE | SS_ONSTACK) == (SS_DISABLE | SS_ONSTACK)
         {
-            return Some(Err(carrick_syscall_abi::LINUX_EINVAL));
+            return Some(Err(SignalSetupError::Errno(
+                carrick_syscall_abi::LINUX_EINVAL,
+                false,
+            )));
         }
         if flags & SS_DISABLE != 0 {
             Some(AltStack::DISABLED)
@@ -979,7 +1053,10 @@ fn serve_sigaltstack(
                 flags: flags & !SS_ONSTACK,
             };
             if stack.size < crate::signal::minimum_signal_stack_size(isa) {
-                return Some(Err(carrick_syscall_abi::LINUX_ENOMEM));
+                return Some(Err(SignalSetupError::Errno(
+                    carrick_syscall_abi::LINUX_ENOMEM,
+                    false,
+                )));
             }
             Some(stack)
         }
@@ -999,12 +1076,11 @@ fn serve_sigaltstack(
                 current.size,
             )
         };
-        if !user.copy_out(
-            UserVa::new(old_ss),
-            &stack_t_bytes([sp, u64::from(flags), size]),
-        ) {
-            return Some(Err(carrick_syscall_abi::LINUX_EFAULT));
-        }
+        return Some(Err(SignalSetupError::Output {
+            address: UserVa::new(old_ss),
+            bytes: stack_t_bytes([sp, u64::from(flags), size]).to_vec(),
+            work: false,
+        }));
     }
     Some(Ok(()))
 }
@@ -1023,6 +1099,7 @@ impl TidOutput {
         }
         let mut preimage = [0u8; 4];
         user.copy_in(&mut preimage, UserVa::new(address))
+            .is_done()
             .then_some(Some(Self { address, preimage }))
     }
 }
@@ -1042,25 +1119,29 @@ impl TidOutputs {
         let Some(parent) = &self.parent else {
             return self.publish_child(&bytes, user);
         };
-        if !user.copy_out(UserVa::new(parent.address), &bytes) {
+        if !user.copy_out(UserVa::new(parent.address), &bytes).is_done() {
             return false;
         }
         if self.publish_child(&bytes, user) {
             return true;
         }
-        let _ = user.copy_out(UserVa::new(parent.address), &parent.preimage);
+        let _ = user
+            .copy_out(UserVa::new(parent.address), &parent.preimage)
+            .is_done();
         false
     }
 
     fn publish_child(&self, bytes: &[u8; 4], user: &mut (impl UserCopy + ?Sized)) -> bool {
         self.child
             .as_ref()
-            .is_none_or(|child| user.copy_out(UserVa::new(child.address), bytes))
+            .is_none_or(|child| user.copy_out(UserVa::new(child.address), bytes).is_done())
     }
 
     fn rollback(&self, user: &mut (impl UserCopy + ?Sized)) {
         for output in [&self.parent, &self.child].into_iter().flatten() {
-            let _ = user.copy_out(UserVa::new(output.address), &output.preimage);
+            let _ = user
+                .copy_out(UserVa::new(output.address), &output.preimage)
+                .is_done();
         }
     }
 }
@@ -1413,7 +1494,9 @@ fn serve_exit<'a>(
     let clear_child_tid = slot.clear_child_tid();
     if clear_child_tid != 0 {
         let status = native.result();
-        let copied = native.copy_out(UserVa::new(clear_child_tid), &CHILD_TID_CLEAR);
+        let copied = native
+            .copy_out(UserVa::new(clear_child_tid), &CHILD_TID_CLEAR)
+            .is_done();
         let woken =
             copied && native.wake_child_tid(EntryMmKey::from_raw(mm), UserVa::new(clear_child_tid));
         if !woken {

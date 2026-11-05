@@ -1,4 +1,5 @@
 //! ARM native context and mapping hooks for the shared Linux lifecycle owner.
+extern crate alloc;
 use super::dispatch::{El1PendingFamilies, GuestDispatchFrame, native_scheduler};
 use super::sched::{ThreadCpu, UserWord};
 pub use super::thread_setup::{GuestLifecycleVenue, LifecycleVenue, guest_venue};
@@ -82,46 +83,78 @@ impl<
     Context: super::dispatch::DispatchContext,
 > UserCopy for El1PendingFamilies<'_, F, C, U, G, Context>
 {
-    fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> bool {
+    fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> CopyOutcome {
         #[cfg(test)]
         if let Some(user) = &mut self.lifecycle_user {
-            return user.copy_in(dst, src.raw());
+            return CopyOutcome::from_completed(user.copy_in(dst, src.raw()));
         }
         let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
-            return false;
+            return CopyOutcome::Fault;
         };
-        crate::file::UserCopy::copy_in(
+        let done = crate::file::UserCopy::copy_in(
             &mut crate::file::ValidatedCopy {
                 task,
                 validator: &crate::file::HardwareValidator,
             },
             dst,
             src.raw(),
-        )
+        );
+        if done {
+            CopyOutcome::Done
+        } else if self.process_venue().is_some() {
+            CopyOutcome::NotYet(GuestCopyRequest {
+                address: src,
+                len: carrick_guest_arch::GuestLen::new(dst.len() as u64),
+                access: carrick_guest_arch::Access::Read,
+            })
+        } else {
+            CopyOutcome::Fault
+        }
     }
-    fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> bool {
+    fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> CopyOutcome {
         #[cfg(test)]
         if let Some(user) = &mut self.lifecycle_user {
-            return user.copy_out(dst.raw(), src);
+            return CopyOutcome::from_completed(user.copy_out(dst.raw(), src));
         }
         if !self.frame.arm_scheduler()
             && let Some(result) = self
                 .process_venue()
                 .and_then(|venue| venue.copy_out_owned(dst, src))
         {
-            return result.is_ok();
+            return match result {
+                Ok(()) => CopyOutcome::Done,
+                Err(OwnedCopyError::Fault) => CopyOutcome::Fault,
+                Err(OwnedCopyError::Wait(_) | OwnedCopyError::Unavailable) => {
+                    CopyOutcome::NotYet(GuestCopyRequest {
+                        address: dst,
+                        len: carrick_guest_arch::GuestLen::new(src.len() as u64),
+                        access: carrick_guest_arch::Access::Write,
+                    })
+                }
+            };
         }
         let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
-            return false;
+            return CopyOutcome::Fault;
         };
-        crate::file::UserCopy::copy_out(
+        let done = crate::file::UserCopy::copy_out(
             &mut crate::file::ValidatedCopy {
                 task,
                 validator: &crate::file::HardwareValidator,
             },
             dst.raw(),
             src,
-        )
+        );
+        if done {
+            CopyOutcome::Done
+        } else if self.process_venue().is_some() {
+            CopyOutcome::NotYet(GuestCopyRequest {
+                address: dst,
+                len: carrick_guest_arch::GuestLen::new(src.len() as u64),
+                access: carrick_guest_arch::Access::Write,
+            })
+        } else {
+            CopyOutcome::Fault
+        }
     }
 }
 
@@ -134,6 +167,51 @@ impl<
     Context: super::dispatch::DispatchContext,
 > LifecycleNative<'a> for El1PendingFamilies<'a, F, C, U, G, Context>
 {
+    fn wait_guest_copy(&mut self, request: GuestCopyRequest) -> LifecycleOutcome {
+        let venue = self.process_venue().unwrap_or_else(|| {
+            super::dispatch::invalid_completion(super::dispatch::NativeInvariant::EntryBinding)
+        });
+        let mut outcome = venue.wait_guest_copy(request);
+        if matches!(outcome, LifecycleOutcome::Redispatch) {
+            let frame = self.frame.arm_frame().unwrap_or_else(|| {
+                super::dispatch::invalid_completion(super::dispatch::NativeInvariant::EntryBinding)
+            });
+            frame.elr = frame.elr.wrapping_sub(4);
+        }
+        self.run_ready_after_native_transfer(&mut outcome);
+        outcome
+    }
+    fn finish_signal_output(
+        &mut self,
+        address: UserVa,
+        bytes: alloc::vec::Vec<u8>,
+        work: bool,
+    ) -> LifecycleOutcome {
+        match UserCopy::copy_out(self, address, &bytes) {
+            CopyOutcome::Done => {
+                return LifecycleOutcome::Returned {
+                    result: SyscallResult::new(0),
+                    work,
+                };
+            }
+            CopyOutcome::Fault => {
+                return LifecycleOutcome::Returned {
+                    result: SyscallResult::new(-14),
+                    work,
+                };
+            }
+            CopyOutcome::NotYet(_) => {}
+        }
+        let venue = self.process_venue().unwrap_or_else(|| {
+            super::dispatch::invalid_completion(super::dispatch::NativeInvariant::EntryBinding)
+        });
+        let mut outcome = venue.complete_copyout(address, bytes, SyscallResult::new(0));
+        if let LifecycleOutcome::Returned { work: owed, .. } = &mut outcome {
+            *owed |= work;
+        }
+        self.run_ready_after_native_transfer(&mut outcome);
+        outcome
+    }
     fn guest_isa(&self) -> carrick_guest_arch::GuestIsa {
         match self.frame.crossing_set() {
             carrick_personality_linux::crossing::HostCrossingSet::Aarch64 => {
@@ -809,6 +887,21 @@ impl<
 > carrick_personality_linux::signal::SignalNative<'a>
     for El1PendingFamilies<'a, F, C, U, G, Context>
 {
+    fn wait_guest_copy(
+        &mut self,
+        request: GuestCopyRequest,
+    ) -> carrick_personality_linux::signal::SignalOutcome {
+        signal_copy_outcome(LifecycleNative::wait_guest_copy(self, request))
+    }
+    fn finish_signal_output(
+        &mut self,
+        address: UserVa,
+        bytes: alloc::vec::Vec<u8>,
+    ) -> carrick_personality_linux::signal::SignalOutcome {
+        signal_copy_outcome(LifecycleNative::finish_signal_output(
+            self, address, bytes, false,
+        ))
+    }
     fn arguments(&self) -> [u64; 6] {
         [
             self.frame.argument(0).unwrap_or(0),
@@ -870,11 +963,23 @@ impl<
         if let Some(user) = &mut self.lifecycle_user {
             struct Adapter<'u>(&'u mut (dyn crate::file::UserCopy + 'u));
             impl carrick_personality_linux::lifecycle::UserCopy for Adapter<'_> {
-                fn copy_out(&mut self, dst: carrick_guest_arch::UserVa, src: &[u8]) -> bool {
-                    self.0.copy_out(dst.raw(), src)
+                fn copy_out(
+                    &mut self,
+                    dst: carrick_guest_arch::UserVa,
+                    src: &[u8],
+                ) -> carrick_core::personality::CopyOutcome {
+                    carrick_core::personality::CopyOutcome::from_completed(
+                        self.0.copy_out(dst.raw(), src),
+                    )
                 }
-                fn copy_in(&mut self, dst: &mut [u8], src: carrick_guest_arch::UserVa) -> bool {
-                    self.0.copy_in(dst, src.raw())
+                fn copy_in(
+                    &mut self,
+                    dst: &mut [u8],
+                    src: carrick_guest_arch::UserVa,
+                ) -> carrick_core::personality::CopyOutcome {
+                    carrick_core::personality::CopyOutcome::from_completed(
+                        self.0.copy_in(dst, src.raw()),
+                    )
                 }
             }
             let mut adapter = Adapter(*user);
@@ -891,16 +996,48 @@ impl<
     }
 }
 
+fn signal_copy_outcome(
+    outcome: LifecycleOutcome,
+) -> carrick_personality_linux::signal::SignalOutcome {
+    use carrick_personality_linux::signal::SignalOutcome;
+    match outcome {
+        LifecycleOutcome::Redispatch => SignalOutcome::Restored,
+        LifecycleOutcome::Returned { result, work } => SignalOutcome::Returned { result, work },
+        LifecycleOutcome::Transferred { progress, result } => {
+            SignalOutcome::Transferred { progress, result }
+        }
+        LifecycleOutcome::HostCustody => {
+            super::dispatch::invalid_completion(super::dispatch::NativeInvariant::EntryBinding)
+        }
+    }
+}
+
 /// The Linux lifecycle user-copy interface over a neutral validated copy.
 pub struct LinuxUserCopy<T>(pub T);
 
 impl<T: crate::file::UserCopy> carrick_personality_linux::lifecycle::UserCopy for LinuxUserCopy<T> {
-    fn copy_out(&mut self, dst: carrick_guest_arch::UserVa, src: &[u8]) -> bool {
-        crate::file::UserCopy::copy_out(&mut self.0, dst.raw(), src)
+    fn copy_out(
+        &mut self,
+        dst: carrick_guest_arch::UserVa,
+        src: &[u8],
+    ) -> carrick_core::personality::CopyOutcome {
+        carrick_core::personality::CopyOutcome::from_completed(crate::file::UserCopy::copy_out(
+            &mut self.0,
+            dst.raw(),
+            src,
+        ))
     }
 
-    fn copy_in(&mut self, dst: &mut [u8], src: carrick_guest_arch::UserVa) -> bool {
-        crate::file::UserCopy::copy_in(&mut self.0, dst, src.raw())
+    fn copy_in(
+        &mut self,
+        dst: &mut [u8],
+        src: carrick_guest_arch::UserVa,
+    ) -> carrick_core::personality::CopyOutcome {
+        carrick_core::personality::CopyOutcome::from_completed(crate::file::UserCopy::copy_in(
+            &mut self.0,
+            dst,
+            src.raw(),
+        ))
     }
 }
 
