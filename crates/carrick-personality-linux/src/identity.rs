@@ -562,8 +562,8 @@ pub fn invoke<'a>(
             } else {
                 len as u64
             };
-            if !native.copy_out(head_ptr, &head.to_ne_bytes())
-                || !native.copy_out(len_ptr, &len_u64.to_ne_bytes())
+            if !native.copy_out(head_ptr, &head.to_ne_bytes()).is_done()
+                || !native.copy_out(len_ptr, &len_u64.to_ne_bytes()).is_done()
             {
                 return Some(SyscallResult::new(EFAULT));
             }
@@ -610,13 +610,25 @@ pub fn invoke<'a>(
                 };
                 (r, e, s)
             };
-            if args[0] != 0 && !native.copy_out(UserVa::new(args[0]), &ruid.to_ne_bytes()) {
+            if args[0] != 0
+                && !native
+                    .copy_out(UserVa::new(args[0]), &ruid.to_ne_bytes())
+                    .is_done()
+            {
                 return Some(SyscallResult::new(EFAULT));
             }
-            if args[1] != 0 && !native.copy_out(UserVa::new(args[1]), &euid.to_ne_bytes()) {
+            if args[1] != 0
+                && !native
+                    .copy_out(UserVa::new(args[1]), &euid.to_ne_bytes())
+                    .is_done()
+            {
                 return Some(SyscallResult::new(EFAULT));
             }
-            if args[2] != 0 && !native.copy_out(UserVa::new(args[2]), &suid.to_ne_bytes()) {
+            if args[2] != 0
+                && !native
+                    .copy_out(UserVa::new(args[2]), &suid.to_ne_bytes())
+                    .is_done()
+            {
                 return Some(SyscallResult::new(EFAULT));
             }
             Some(SyscallResult::new(0))
@@ -630,13 +642,25 @@ pub fn invoke<'a>(
                 };
                 (r, e, s)
             };
-            if args[0] != 0 && !native.copy_out(UserVa::new(args[0]), &rgid.to_ne_bytes()) {
+            if args[0] != 0
+                && !native
+                    .copy_out(UserVa::new(args[0]), &rgid.to_ne_bytes())
+                    .is_done()
+            {
                 return Some(SyscallResult::new(EFAULT));
             }
-            if args[1] != 0 && !native.copy_out(UserVa::new(args[1]), &egid.to_ne_bytes()) {
+            if args[1] != 0
+                && !native
+                    .copy_out(UserVa::new(args[1]), &egid.to_ne_bytes())
+                    .is_done()
+            {
                 return Some(SyscallResult::new(EFAULT));
             }
-            if args[2] != 0 && !native.copy_out(UserVa::new(args[2]), &sgid.to_ne_bytes()) {
+            if args[2] != 0
+                && !native
+                    .copy_out(UserVa::new(args[2]), &sgid.to_ne_bytes())
+                    .is_done()
+            {
                 return Some(SyscallResult::new(EFAULT));
             }
             Some(SyscallResult::new(0))
@@ -728,7 +752,10 @@ pub fn invoke<'a>(
             };
             let mut cur_addr = list_ptr.raw();
             for &gid in groups.iter().take(count) {
-                if !native.copy_out(UserVa::new(cur_addr), &gid.to_ne_bytes()) {
+                if !native
+                    .copy_out(UserVa::new(cur_addr), &gid.to_ne_bytes())
+                    .is_done()
+                {
                     return Some(SyscallResult::new(EFAULT));
                 }
                 cur_addr = cur_addr.wrapping_add(4);
@@ -751,7 +778,7 @@ pub fn invoke<'a>(
             let mut cur_addr = list_ptr.raw();
             for _ in 0..size {
                 let mut bytes = [0u8; 4];
-                if !native.copy_in(&mut bytes, UserVa::new(cur_addr)) {
+                if !native.copy_in(&mut bytes, UserVa::new(cur_addr)).is_done() {
                     return Some(SyscallResult::new(EFAULT));
                 }
                 groups.push(u32::from_ne_bytes(bytes));
@@ -767,7 +794,7 @@ pub fn invoke<'a>(
             let hdr_ptr = UserVa::new(args[0]);
             let data_ptr = UserVa::new(args[1]);
             let mut hdr_bytes = [0u8; 8];
-            if !native.copy_in(&mut hdr_bytes, hdr_ptr) {
+            if !native.copy_in(&mut hdr_bytes, hdr_ptr).is_done() {
                 return Some(SyscallResult::new(EFAULT));
             }
             let version = u32::from_ne_bytes(hdr_bytes[0..4].try_into().unwrap_or([0; 4]));
@@ -779,7 +806,7 @@ pub fn invoke<'a>(
                     | LINUX_CAPABILITY_VERSION_3
             ) {
                 let pref = LINUX_CAPABILITY_VERSION_3.to_ne_bytes();
-                let _ = native.copy_out(hdr_ptr, &pref);
+                let _ = native.copy_out(hdr_ptr, &pref).is_done();
                 return Some(SyscallResult::new(EINVAL));
             }
             if pid < 0 {
@@ -800,7 +827,7 @@ pub fn invoke<'a>(
                 data[0..4].copy_from_slice(&(caps.effective.bits() as u32).to_ne_bytes());
                 data[4..8].copy_from_slice(&(caps.permitted.bits() as u32).to_ne_bytes());
                 data[8..12].copy_from_slice(&(caps.inheritable.bits() as u32).to_ne_bytes());
-                if !native.copy_out(data_ptr, &data) {
+                if !native.copy_out(data_ptr, &data).is_done() {
                     return Some(SyscallResult::new(EFAULT));
                 }
             } else {
@@ -814,7 +841,7 @@ pub fn invoke<'a>(
                 data[12..16].copy_from_slice(&((eff >> 32) as u32).to_ne_bytes());
                 data[16..20].copy_from_slice(&((prm >> 32) as u32).to_ne_bytes());
                 data[20..24].copy_from_slice(&((inh >> 32) as u32).to_ne_bytes());
-                if !native.copy_out(data_ptr, &data) {
+                if !native.copy_out(data_ptr, &data).is_done() {
                     return Some(SyscallResult::new(EFAULT));
                 }
             }
@@ -824,7 +851,7 @@ pub fn invoke<'a>(
             let hdr_ptr = UserVa::new(args[0]);
             let data_ptr = UserVa::new(args[1]);
             let mut hdr_bytes = [0u8; 8];
-            if !native.copy_in(&mut hdr_bytes, hdr_ptr) {
+            if !native.copy_in(&mut hdr_bytes, hdr_ptr).is_done() {
                 return Some(SyscallResult::new(EFAULT));
             }
             let version = u32::from_ne_bytes(hdr_bytes[0..4].try_into().unwrap_or([0; 4]));
@@ -836,7 +863,7 @@ pub fn invoke<'a>(
                     | LINUX_CAPABILITY_VERSION_3
             ) {
                 let pref = LINUX_CAPABILITY_VERSION_3.to_ne_bytes();
-                let _ = native.copy_out(hdr_ptr, &pref);
+                let _ = native.copy_out(hdr_ptr, &pref).is_done();
                 return Some(SyscallResult::new(EINVAL));
             }
             if pid < 0 {
@@ -844,7 +871,7 @@ pub fn invoke<'a>(
             }
             let (eff_raw, prm_raw, inh_raw) = if version == LINUX_CAPABILITY_VERSION_1 {
                 let mut data = [0u8; 12];
-                if !native.copy_in(&mut data, data_ptr) {
+                if !native.copy_in(&mut data, data_ptr).is_done() {
                     return Some(SyscallResult::new(EFAULT));
                 }
                 (
@@ -854,7 +881,7 @@ pub fn invoke<'a>(
                 )
             } else {
                 let mut data = [0u8; 24];
-                if !native.copy_in(&mut data, data_ptr) {
+                if !native.copy_in(&mut data, data_ptr).is_done() {
                     return Some(SyscallResult::new(EFAULT));
                 }
                 let e_lo = u32::from_ne_bytes(data[0..4].try_into().unwrap_or([0; 4])) as u64;
@@ -945,7 +972,7 @@ pub fn invoke<'a>(
                     let mut cur_addr = arg2;
                     for slot in name.iter_mut() {
                         let mut b = [0u8; 1];
-                        if !native.copy_in(&mut b, UserVa::new(cur_addr)) {
+                        if !native.copy_in(&mut b, UserVa::new(cur_addr)).is_done() {
                             return Some(SyscallResult::new(EFAULT));
                         }
                         *slot = b[0];
@@ -967,7 +994,7 @@ pub fn invoke<'a>(
                             return Some(SyscallResult::new(error.errno()));
                         }
                     }
-                    if !native.copy_out(UserVa::new(arg2), &name) {
+                    if !native.copy_out(UserVa::new(arg2), &name).is_done() {
                         return Some(SyscallResult::new(EFAULT));
                     }
                     Some(SyscallResult::new(0))
@@ -987,7 +1014,10 @@ pub fn invoke<'a>(
                         let venue = native.process_identity()?;
                         venue.prctl_get_pdeathsig() as i32
                     };
-                    if !native.copy_out(UserVa::new(arg2), &sig.to_ne_bytes()) {
+                    if !native
+                        .copy_out(UserVa::new(arg2), &sig.to_ne_bytes())
+                        .is_done()
+                    {
                         return Some(SyscallResult::new(EFAULT));
                     }
                     Some(SyscallResult::new(0))
@@ -1043,7 +1073,10 @@ pub fn invoke<'a>(
                             0
                         }
                     };
-                    if !native.copy_out(UserVa::new(arg2), &val.to_ne_bytes()) {
+                    if !native
+                        .copy_out(UserVa::new(arg2), &val.to_ne_bytes())
+                        .is_done()
+                    {
                         return Some(SyscallResult::new(EFAULT));
                     }
                     Some(SyscallResult::new(0))
@@ -1092,32 +1125,36 @@ mod tests {
     }
 
     impl UserCopy for MockNative {
-        fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> bool {
+        fn copy_in(
+            &mut self,
+            dst: &mut [u8],
+            src: UserVa,
+        ) -> carrick_core::personality::CopyOutcome {
             let addr = src.raw();
             for (i, byte) in dst.iter_mut().enumerate() {
                 let target = addr + i as u64;
                 if self.write_only.contains(&target) || self.unmapped.contains(&target) {
-                    return false;
+                    return carrick_core::personality::CopyOutcome::Fault;
                 }
                 if let Some(&b) = self.memory.get(&target) {
                     *byte = b;
                 } else {
-                    return false;
+                    return carrick_core::personality::CopyOutcome::Fault;
                 }
             }
-            true
+            carrick_core::personality::CopyOutcome::Done
         }
 
-        fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> bool {
+        fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> carrick_core::personality::CopyOutcome {
             let addr = dst.raw();
             for (i, &byte) in src.iter().enumerate() {
                 let target = addr + i as u64;
                 if self.unmapped.contains(&target) {
-                    return false;
+                    return carrick_core::personality::CopyOutcome::Fault;
                 }
                 self.memory.insert(target, byte);
             }
-            true
+            carrick_core::personality::CopyOutcome::Done
         }
     }
 

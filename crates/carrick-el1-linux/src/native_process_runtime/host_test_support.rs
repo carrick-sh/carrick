@@ -317,6 +317,14 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         }
         Ok(())
     }
+    fn prepare_owned_read(
+        &mut self,
+        _: &Self::Mm,
+        request: carrick_core::personality::GuestCopyRequest,
+    ) -> Result<(), NativeProcessError> {
+        assert_eq!(request.access, carrick_guest_arch::Access::Read);
+        self.prepare_copy_error.map_or(Ok(()), Err)
+    }
     fn prepare_owned_write(
         &mut self,
         _: &Self::Mm,
@@ -5413,12 +5421,9 @@ fn host_contended_service_park(
         ResumeDisposition::OwnerContinuation(expected_entry),
         "the yield must resume through the operation's own owner entry"
     );
-    // The scheduler's own discriminant: an exception owner never resumes
-    // through a host snapshot (which would rewind the PC to an SVC).
-    assert_eq!(
-        fixture.zone.record(record.id).requires_native_entry(),
-        expected_entry == OwnerEntry::Exception
-    );
+    // Neither retained owner has a host completion yet. The ring checkpoint
+    // consumes it before an exception PC or a syscall result can be handed back.
+    assert!(fixture.zone.record(record.id).requires_native_entry());
     if takeover_before_receipt {
         assert!(matches!(
             fixture.zone.record(record.id).claim(),
@@ -5453,12 +5458,7 @@ fn host_contended_service_park(
     // The stopped executor honours the request (`el1_zone::hand_back_wanted`),
     // and the native handback places the exact record back on a slot.
     if !takeover_before_receipt {
-        // Only a syscall owner may be host-resumed; an exception owner
-        // stays bound to its native entry.
-        assert_eq!(
-            fixture.zone.record(record.id).needs_host(),
-            expected_entry == OwnerEntry::Syscall
-        );
+        assert!(!fixture.zone.record(record.id).needs_host());
     }
     if !takeover_before_receipt {
         let mut wanted = alloc::vec::Vec::new();
@@ -5722,4 +5722,513 @@ fn host_request_during_owner_wait_park_yields_then_reparks() {
             .lock()
             .has_member_wait(&fixture.record)
     );
+}
+
+/// Production signal setup retains the pre-change mask while its output waits.
+#[cfg(test)]
+#[test]
+fn sigprocmask_oldset_owner_wait_commits_mask_and_output_once() {
+    use crate::thread_setup::{LifecycleThread, LifecycleVenue};
+    struct Venue {
+        page: &'static ThreadLifecyclePage,
+        control: &'static ThreadControlSlot,
+    }
+    impl LifecycleVenue for Venue {
+        fn thread<'a>(&'a self, _: &'a CurrentTask) -> Option<LifecycleThread<'a>> {
+            Some(LifecycleThread {
+                page: self.page,
+                slot: self.control,
+            })
+        }
+        fn born_slot(&self, _: &ThreadLifecyclePage, _: EntryRef) -> Option<&ThreadControlSlot> {
+            None
+        }
+    }
+    let fixture = native_exec_fixture();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let venue = Venue {
+        page: fixture.page,
+        control: fixture.control,
+    };
+    let mut service = fixture.service();
+    let handle = service.service_mm_handle(&fixture.address).unwrap();
+    let space = fixture
+        .zone
+        .space_entry(NonZeroU64::new(handle.mm().raw()).unwrap())
+        .unwrap();
+    space
+        .admit_notifications(
+            handle.incarnation(),
+            &carrick_sched_core::BoundedSpin(0),
+            &|effects| {
+                let _ = effects.defer_handbacks();
+            },
+        )
+        .unwrap();
+    let notifications = space.notifications(handle.incarnation()).unwrap();
+    let observed =
+        notifications.observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Gate);
+    let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
+    access.raise(space.index());
+    // SAFETY: the fixture retains this exact owner's live Gate observation.
+    let wait = unsafe {
+        carrick_core_abi::PortalOwnerWait::from_owner(
+            handle,
+            carrick_core_abi::PortalWaitCause::Gate,
+            observed.revision(),
+        )
+    };
+    service.child_copy_error = Some(NativeProcessError::OwnerWait(wait));
+    let set = carrick_test_support::GuestUserBuffer::from_value(u64::MAX);
+    let old = carrick_test_support::GuestUserBuffer::from_value(0xdead_beef_u64);
+    take_signal_copies();
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        frame.x[8] = 135;
+        frame.x[..4].copy_from_slice(&[0, set.arg(), old.arg(), 8]);
+        crate::file::SIMULATE_COPYOUT_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
+        let route = crate::dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            &carrick_el1_abi::Counters::new(),
+            core::slice::from_ref(fixture.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &carrick_el1_abi::InotifyNameCache::new(),
+            None::<crate::dispatch::Zone<'_, crate::sched::FakeCpu, crate::sched::HardwareUserWord>>,
+            None,
+            Some(&venue),
+            Some(&mut *entry),
+            Some(source),
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        crate::file::SIMULATE_COPYOUT_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
+        assert_eq!(
+            route,
+            carrick_personality_linux::dispatch::CompletionRoute::Suspended
+        );
+    }
+    assert_eq!(fixture.control.blocked().0, !0x0004_0100_u64);
+    assert!(take_signal_copies().is_empty());
+    // Detect any replay of the already committed mask operation on resume.
+    let _ = fixture.control.store_blocked_then_read_pending(
+        carrick_el1_abi::BlockedMask(0x80),
+        fixture.control.pending(),
+    );
+    service.child_copy_error = None;
+    access.lower(space.index());
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture.record.id
+    );
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    assert!(
+        matches!(entry.resume_checkpoint().unwrap(), NativeResume::Returned(result) if result.raw() == 0)
+    );
+    assert_eq!(fixture.control.blocked().0, 0x80);
+    assert_eq!(
+        take_signal_copies(),
+        [(UserVa::new(old.arg()), 0_u64.to_le_bytes().to_vec())]
+    );
+    assert!(matches!(
+        entry.resume_checkpoint().unwrap(),
+        NativeResume::NoPending
+    ));
+    assert!(take_signal_copies().is_empty());
+}
+
+#[cfg(test)]
+#[test]
+fn rehomed_signal_copy_service_keeps_native_intake_custody() {
+    rehomed_signal_copy_service(false);
+}
+
+#[cfg(test)]
+#[test]
+fn rehomed_signal_input_service_returns_original_syscall_to_host() {
+    rehomed_signal_copy_service(true);
+}
+
+#[cfg(test)]
+fn rehomed_signal_copy_service(input: bool) {
+    let fixture = native_exec_fixture();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let identity = fixture.zone.record(fixture.record.id).identity();
+    // A prior completed in-ring operation leaves the same live member's
+    // service cell idle but bound to its previous scheduler record.
+    let process = fixture.runtime.graph.lock().root_key;
+    let handle = fixture
+        .service()
+        .service_mm_handle(&fixture.address)
+        .unwrap();
+    service::bind_member_service(
+        fixture.zone,
+        process,
+        carrick_core_abi::service::ServiceOrigin::Initial,
+        fixture.record,
+        carrick_core_abi::EntryThreadGeneration::from_raw(identity.serial),
+        fixture.control,
+        handle,
+    )
+    .unwrap();
+    // A completed host-boundary call discards its unpublished home. The next
+    // SVC allocates and rehomes the same live thread onto another incarnation.
+    fixture
+        .zone
+        .discard_unpublished(fixture.slot, fixture.record.id);
+    let record = fixture.zone.current_or_new(fixture.slot, identity).unwrap();
+    let reference = fixture.zone.record_ref(record);
+    assert_ne!(reference, fixture.record);
+    assert!(!fixture.zone.record(record).is_native_owned());
+    // SAFETY: this test owns the unpublished home and its saved context.
+    unsafe {
+        *fixture.zone.record(record).ctx_mut() = words(fixture.address);
+    }
+    fixture.control.bind_zone_record(reference);
+    fixture
+        .registry
+        .rehome_entry(
+            source,
+            fixture.task,
+            fixture.address,
+            fixture.page,
+            fixture.control,
+        )
+        .unwrap()
+        .unwrap();
+    let mut service = fixture.service();
+    if input {
+        service.prepare_copy_error = Some(NativeProcessError::Busy);
+    } else {
+        service.child_copy_error = Some(NativeProcessError::Busy);
+    }
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &words(fixture.address),
+            &mut service,
+        )
+        .unwrap();
+    let outcome = if input {
+        entry.wait_guest_copy(carrick_core::personality::GuestCopyRequest {
+            address: UserVa::new(0x10000),
+            len: carrick_guest_arch::GuestLen::new(8),
+            access: carrick_guest_arch::Access::Read,
+        })
+    } else {
+        entry.complete_copyout(
+            UserVa::new(0x10000),
+            0_u64.to_le_bytes().to_vec(),
+            SyscallResult::new(0),
+        )
+    };
+    assert!(matches!(
+        outcome,
+        LifecycleOutcome::Transferred {
+            progress: carrick_core::Served::Idle,
+            ..
+        }
+    ));
+    assert!(entry.take_handoff_receipt().is_some());
+    let notice = fixture.task.service_notice.take().unwrap().unwrap();
+    assert_eq!(notice.record, reference);
+    assert!(
+        !fixture.zone.record(record).is_native_owned(),
+        "a temporary ring continuation must preserve the host execution owner"
+    );
+    let queue = fixture
+        .zone
+        .object_wait(
+            carrick_sched_core::object_wait::ObjectWaitKey::native_service(reference).unwrap(),
+            &carrick_sched_core::ShortLockSpin,
+        )
+        .unwrap();
+    assert_eq!(
+        queue.native_service_member(reference),
+        Some(identity),
+        "the exact service intake must retain its native member after host-record rehome"
+    );
+    // SAFETY: the fixture retains this exact record and authenticates its
+    // notice while holding the same service queue as production intake.
+    let ticket = unsafe {
+        carrick_core_abi::service::ServiceCell::claim_notice(
+            &fixture.control.service,
+            notice,
+            NonZeroU64::MIN,
+            identity,
+        )
+    }
+    .unwrap();
+    drop(queue);
+    drop(entry);
+    service.child_copy_error = None;
+    service.prepare_copy_error = None;
+    take_signal_copies();
+    ticket
+        .complete(true)
+        .unwrap_or_else(|_| panic!("copy service ticket was cancelled"));
+    fixture
+        .zone
+        .object_wait(
+            carrick_sched_core::object_wait::ObjectWaitKey::native_service(reference).unwrap(),
+            &carrick_sched_core::ShortLockSpin,
+        )
+        .unwrap()
+        .notify_object(fixture.slot, &mut Default::default())
+        .unwrap();
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        record
+    );
+    let saved = unsafe { fixture.runtime.record_binding(reference) }
+        .unwrap()
+        .words;
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    assert!(
+        matches!(entry.resume_checkpoint(), Ok(NativeResume::Left(None))),
+        "a host-owned member must return its completed context to its host executor"
+    );
+    assert!(!fixture.zone.record(record).is_native_owned());
+    assert_eq!(
+        fixture.zone.record(record).resume_disposition(),
+        carrick_sched_core::object_wait::ResumeDisposition::UserReturn
+    );
+    let mut expected = saved;
+    if input {
+        expected.restart_syscall();
+        assert!(take_signal_copies().is_empty());
+    } else {
+        expected.set_syscall_return(0);
+        assert_eq!(
+            take_signal_copies(),
+            [(UserVa::new(0x10000), 0_u64.to_le_bytes().to_vec())]
+        );
+    }
+    // Every saved word is checked: retry preserves arguments; completion
+    // changes only the syscall result. The host receives this exact context.
+    let actual = unsafe { *fixture.zone.record(record).ctx_mut() };
+    assert_eq!(actual, expected);
+    assert!(fixture.zone.record(record).needs_host());
+}
+
+#[cfg(test)]
+#[test]
+fn sigprocmask_set_owner_wait_redispatches_before_effects() {
+    use crate::thread_setup::{LifecycleThread, LifecycleVenue};
+    struct Venue {
+        page: &'static ThreadLifecyclePage,
+        control: &'static ThreadControlSlot,
+    }
+    impl LifecycleVenue for Venue {
+        fn thread<'a>(&'a self, _: &'a CurrentTask) -> Option<LifecycleThread<'a>> {
+            Some(LifecycleThread {
+                page: self.page,
+                slot: self.control,
+            })
+        }
+        fn born_slot(&self, _: &ThreadLifecyclePage, _: EntryRef) -> Option<&ThreadControlSlot> {
+            None
+        }
+    }
+    let fixture = native_exec_fixture();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let venue = Venue {
+        page: fixture.page,
+        control: fixture.control,
+    };
+    let mut service = fixture.service();
+    let handle = service.service_mm_handle(&fixture.address).unwrap();
+    let space = fixture
+        .zone
+        .space_entry(NonZeroU64::new(handle.mm().raw()).unwrap())
+        .unwrap();
+    space
+        .admit_notifications(
+            handle.incarnation(),
+            &carrick_sched_core::BoundedSpin(0),
+            &|effects| {
+                let _ = effects.defer_handbacks();
+            },
+        )
+        .unwrap();
+    let notifications = space.notifications(handle.incarnation()).unwrap();
+    let observed =
+        notifications.observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Gate);
+    let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
+    access.raise(space.index());
+    // SAFETY: the fixture retains this exact owner's live Gate observation.
+    let wait = unsafe {
+        carrick_core_abi::PortalOwnerWait::from_owner(
+            handle,
+            carrick_core_abi::PortalWaitCause::Gate,
+            observed.revision(),
+        )
+    };
+    service.prepare_copy_error = Some(NativeProcessError::OwnerWait(wait));
+    let set = carrick_test_support::GuestUserBuffer::from_value(u64::MAX);
+    let old = carrick_test_support::GuestUserBuffer::from_value(0xdead_beef_u64);
+    take_signal_copies();
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        frame.x[8] = 135;
+        frame.x[..4].copy_from_slice(&[0, set.arg(), old.arg(), 8]);
+        crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
+        let route = crate::dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            &carrick_el1_abi::Counters::new(),
+            core::slice::from_ref(fixture.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &carrick_el1_abi::InotifyNameCache::new(),
+            None::<crate::dispatch::Zone<'_, crate::sched::FakeCpu, crate::sched::HardwareUserWord>>,
+            None,
+            Some(&venue),
+            Some(&mut *entry),
+            Some(source),
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
+        assert_eq!(
+            route,
+            carrick_personality_linux::dispatch::CompletionRoute::Suspended
+        );
+    }
+    assert_eq!(fixture.control.blocked().0, 0);
+    assert_eq!(old.get::<u64>(0), 0xdead_beef);
+    assert!(take_signal_copies().is_empty());
+    fixture
+        .runtime
+        .cancel_service(fixture.record, fixture.slot, &mut service)
+        .unwrap();
+    assert!(
+        fixture
+            .runtime
+            .graph
+            .lock()
+            .service_wait(&fixture.record)
+            .is_some(),
+        "a handled signal cannot cancel input preparation"
+    );
+    service.prepare_copy_error = None;
+    access.lower(space.index());
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture.record.id
+    );
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    assert!(matches!(
+        entry.resume_checkpoint().unwrap(),
+        NativeResume::RetrySyscall
+    ));
+    assert_eq!(fixture.control.blocked().0, 0);
+    assert!(take_signal_copies().is_empty());
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[8] = 135;
+    frame.x[..4].copy_from_slice(&[0, set.arg(), old.arg(), 8]);
+    let route = crate::dispatch::dispatch_syscall_with_native(
+        &mut frame,
+        &carrick_el1_abi::Counters::new(),
+        core::slice::from_ref(fixture.task),
+        &[],
+        &[],
+        &[],
+        &[],
+        &carrick_el1_abi::InotifyNameCache::new(),
+        None::<crate::dispatch::Zone<'_, crate::sched::FakeCpu, crate::sched::HardwareUserWord>>,
+        None,
+        Some(&venue),
+        Some(&mut *entry),
+        Some(source),
+        None,
+        |_| core::ptr::null_mut(),
+    );
+    assert_eq!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::WithWork
+    );
+    assert_eq!(frame.x[0], 0);
+    assert_eq!(fixture.control.blocked().0, !0x0004_0100_u64);
+    assert_eq!(old.read::<u64>(0), 0);
+    assert!(take_signal_copies().is_empty());
+    assert!(matches!(
+        entry.resume_checkpoint().unwrap(),
+        NativeResume::NoPending
+    ));
+    assert!(take_signal_copies().is_empty());
 }

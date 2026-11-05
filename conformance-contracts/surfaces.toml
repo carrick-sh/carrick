@@ -103,7 +103,7 @@ surfaces = [
   { path = "crates/carrick-core/src/mm/transaction/user_write.rs", contract = "kernel.el1.fork-cow" },
   { path = "crates/carrick-core/src/mm/transaction/user_write.rs", contract = "kernel.el1.mm-exclusive-owner" },
   { path = "crates/carrick-core/src/mm/transaction/user_write.rs", contract = "kernel.memory.owner-wait" },
-  { path = "crates/carrick-core/src/personality.rs", contracts = [] },
+  { path = "crates/carrick-core/src/personality.rs", contract = "kernel.memory.owner-wait" },
   { path = "crates/carrick-core/src/terminal.rs", contract = "kernel.el1.thread-lifecycle" },
   { path = "crates/carrick-core/src/terminal.rs", contract = "kernel.memory.owner-wait" },
   { path = "crates/carrick-core/src/terminal.rs", contract = "kernel.vcpu.shutdown-entry" },
@@ -161,6 +161,7 @@ surfaces = [
   { path = "crates/carrick-el1-linux/src/aarch64_process.rs", contract = "kernel.el1.mm-exclusive-owner" },
   { path = "crates/carrick-el1-linux/src/aarch64_process.rs", contract = "kernel.el1.signal-delivery-owner" },
   { path = "crates/carrick-el1-linux/src/aarch64_process.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process.rs", contract = "kernel.memory.owner-wait" },
   { path = "crates/carrick-el1-linux/src/aarch64_process.rs", contract = "kernel.scheduler.runnable-progress" },
   { path = "crates/carrick-el1-linux/src/aarch64_process.rs", contract = "kernel.wait.child-rusage" },
   { path = "crates/carrick-el1-linux/src/aarch64_process.rs", contract = "kernel.wait.process-group" },
@@ -222,6 +223,7 @@ surfaces = [
   { path = "crates/carrick-el1-linux/src/ipc.rs", contract = "kernel.el1.ipc-two-process" },
   { path = "crates/carrick-el1-linux/src/ipc.rs", contract = "process.native.short-lock" },
   { path = "crates/carrick-el1-linux/src/ipc/epoll.rs", contract = "kernel.el1.ipc-two-process" },
+  { path = "crates/carrick-el1-linux/src/lifecycle.rs", contract = "kernel.memory.owner-wait" },
   { path = "crates/carrick-el1-linux/src/lifecycle.rs", contract = "kernel.scheduler.runnable-progress" },
   { path = "crates/carrick-el1-linux/src/mm_portal/mod.rs", contract = "kernel.el1.elastic-frame-extents" },
   { path = "crates/carrick-el1-linux/src/mm_portal/mod.rs", contract = "kernel.el1.mm-exclusive-owner" },
@@ -255,6 +257,7 @@ surfaces = [
   { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs", contract = "kernel.el1.signal-delivery-owner" },
   { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs", contract = "kernel.el1.thread-lifecycle" },
   { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs", contract = "kernel.native.namespace-mutation" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs", contract = "kernel.memory.owner-wait" },
   { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs", contract = "kernel.vcpu.shutdown-entry" },
   { path = "crates/carrick-el1-linux/src/native_process_runtime/service.rs", contract = "diagnostics.syscall-refusal" },
   { path = "crates/carrick-el1-linux/src/native_process_runtime/service.rs", contract = "kernel.el1.deferred-handback-identity" },
@@ -393,10 +396,10 @@ surfaces = [
   { path = "crates/carrick-hal/src/asid.rs", contract = "kernel.mm.address-space-occupancy" },
   { path = "crates/carrick-hal/src/birth_serial.rs", contract = "core.lifecycle.publication" },
   { path = "crates/carrick-hal/src/birth_serial.rs", contract = "kernel.el1.address-space-switch" },
+  # Preservation evidence for the unsolicited-exit hook, not guest semantic proof.
   { path = "crates/carrick-hal/src/birth_serial.rs", contract = "kernel.el1.signal-delivery-owner" },
   { path = "crates/carrick-hal/src/birth_serial.rs", contract = "kernel.el1.thread-lifecycle" },
   { path = "crates/carrick-hal/src/diagnostic_capture.rs", contracts = [] },
-  # Preservation evidence for the unsolicited-exit hook, not guest semantic proof.
   { path = "crates/carrick-hal/src/diagnostic_capture_tests.rs", contract = "kernel.el1.gic" },
   { path = "crates/carrick-hal/src/diagnostic_capture_tests.rs", contract = "kernel.el1.guest-run-queue" },
   { path = "crates/carrick-hal/src/diagnostic_capture_tests.rs", contract = "kernel.el1.guest-scheduler" },
@@ -561,10 +564,10 @@ surfaces = [
   { path = "crates/carrick-kernel/src/el1_zone.rs", contract = "kernel.el1.guest-scheduler" },
   { path = "crates/carrick-kernel/src/el1_zone.rs", contract = "kernel.el1.ipc-two-process" },
   { path = "crates/carrick-kernel/src/el1_zone.rs", contract = "kernel.scheduler.runnable-progress" },
+  # Native process custody and Linux identity/exit/wait policy retain the shared lifecycle contracts.
   { path = "crates/carrick-kernel/src/inotify.rs", contract = "kernel.inotify.mark-race-hotpath" },
   { path = "crates/carrick-kernel/src/inotify.rs", contract = "kernel.inotify.readiness" },
   { path = "crates/carrick-kernel/src/inotify.rs", contract = "kernel.inotify.watch" },
-  # Native process custody and Linux identity/exit/wait policy retain the shared lifecycle contracts.
   { path = "crates/carrick-kernel/src/kernel/boot_launch.rs", contract = "kernel.el1.thread-lifecycle" },
   { path = "crates/carrick-kernel/src/kernel/continuation.rs", contract = "kernel.fs.directory-copyout" },
   { path = "crates/carrick-kernel/src/kernel/continuation.rs", contract = "kernel.futex.contention" },
@@ -671,10 +674,10 @@ surfaces = [
   { path = "crates/carrick-mmu-core/src/aarch64.rs", contract = "kernel.el1.gic" },
   { path = "crates/carrick-mmu-core/src/aarch64.rs", contract = "kernel.el1.stage1-publication" },
   { path = "crates/carrick-mmu-core/src/aarch64.rs", contract = "kernel.exec.stage1-image" },
+  # Native MM adapters supply descriptor and physical custody venues to the existing owner.
   { path = "crates/carrick-mmu-core/src/aarch64.rs", contract = "kernel.fork.stage1-image" },
   { path = "crates/carrick-mmu-core/src/aarch64.rs", contract = "kernel.mm.image-page-permissions" },
   { path = "crates/carrick-mmu-core/src/aarch64.rs", contract = "kernel.mm.metadata-refusal" },
-  # Native MM adapters supply descriptor and physical custody venues to the existing owner.
   { path = "crates/carrick-mmu-core/src/live_descriptor_words.rs", contract = "kernel.el1.mm-exclusive-owner" },
   { path = "crates/carrick-mmu-core/src/x86/copy_window.rs", contract = "kernel.el1.fork-cow" },
   { path = "crates/carrick-mmu-core/src/x86/copy_window.rs", contract = "kernel.el1.mm-exclusive-owner" },
@@ -720,11 +723,12 @@ surfaces = [
   { path = "crates/carrick-personality-linux/src/pending_anonymous.rs", contract = "kernel.el1.anonymous-reservations" },
   { path = "crates/carrick-personality-linux/src/pending_file.rs", contract = "core.entry.completion" },
   { path = "crates/carrick-personality-linux/src/pending_file.rs", contract = "kernel.el1.files" },
+  # Linux pending-signal policy and its unchanged VM-free owner contracts.
   { path = "crates/carrick-personality-linux/src/pending_file.rs", contract = "kernel.el1.inotify" },
   { path = "crates/carrick-personality-linux/src/sched.rs", contract = "core.entry.completion" },
   { path = "crates/carrick-personality-linux/src/sched.rs", contract = "kernel.el1.futex-handoff" },
-  # Linux pending-signal policy and its unchanged VM-free owner contracts.
   { path = "crates/carrick-personality-linux/src/signal.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-personality-linux/src/signal.rs", contract = "kernel.memory.owner-wait" },
   { path = "crates/carrick-personality-linux/src/signal/arm.rs", contract = "kernel.el1.signal-delivery-owner" },
   { path = "crates/carrick-personality-linux/src/sysinfo.rs", contract = "kernel.el1.thread-lifecycle" },
   { path = "crates/carrick-personality-linux/src/task_fs.rs", contract = "kernel.native.host-file-venue" },
@@ -750,11 +754,11 @@ surfaces = [
   { path = "crates/carrick-runtime/src/runtime.rs", contract = "diagnostics.syscall-refusal" },
   { path = "crates/carrick-runtime/src/runtime.rs", contract = "kernel.el1.gic" },
   { path = "crates/carrick-runtime/src/runtime.rs", contract = "kernel.el1.signal-delivery-owner" },
+  # Fixture-only injection ownership for executor activation and rollback tests.
   { path = "crates/carrick-runtime/src/runtime.rs", contract = "kernel.fs.directory-copyout" },
   { path = "crates/carrick-runtime/src/runtime.rs", contract = "kernel.memory.owner-wait" },
   { path = "crates/carrick-runtime/src/runtime.rs", contract = "kernel.mm.syscall-code-write" },
   { path = "crates/carrick-runtime/src/runtime/exec.rs", contract = "process.exec.files" },
-  # Fixture-only injection ownership for executor activation and rollback tests.
   { path = "crates/carrick-runtime/src/test_hooks.rs", contract = "kernel.vcpu.vm-lifetime" },
   { path = "crates/carrick-runtime/src/vcpu_loop/binding.rs", contract = "diagnostics.syscall-refusal" },
   { path = "crates/carrick-runtime/src/vcpu_loop/binding.rs", contract = "kernel.copyout.owner-refusal" },
@@ -889,11 +893,11 @@ surfaces = [
   { path = "crates/carrick-sched-core/src/tests.rs", contract = "kernel.el1.guest-run-queue" },
   { path = "crates/carrick-sched-core/src/tests.rs", contract = "kernel.el1.guest-scheduler" },
   { path = "crates/carrick-sched-core/src/tests.rs", contract = "kernel.el1.ipc-two-process" },
+  # Concurrent owned deadlines belong to the shared guest scheduler.
   { path = "crates/carrick-sched-core/src/tests.rs", contract = "kernel.el1.thread-lifecycle" },
   { path = "crates/carrick-sched-core/src/tests.rs", contract = "kernel.scheduler.runnable-progress" },
   { path = "crates/carrick-sched-core/src/tests.rs", contract = "process.native.short-lock" },
   { path = "crates/carrick-sched-core/src/tests.rs", contract = "process.native.terminal-child" },
-  # Concurrent owned deadlines belong to the shared guest scheduler.
   { path = "crates/carrick-sched-core/src/timer_index.rs", contract = "kernel.el1.guest-run-queue" },
   { path = "crates/carrick-signal-core/src/policy.rs", contract = "kernel.el1.signal-delivery-owner" },
   { path = "crates/carrick-signal-core/src/wait.rs", contract = "kernel.signal.socket-restart" },
@@ -962,11 +966,11 @@ surfaces = [
   { path = "crates/carrick-softmmu/test-support/retirement_unit.rs", contract = "softmmu.x86.physical-retirement" },
   { path = "crates/carrick-softmmu/tests/softmmu_contract.rs", contract = "softmmu.x86.tlb-walker" },
   { path = "crates/carrick-spec/src/syscall_census.rs", contracts = [] },
+  # Canonical signal records and architecture frames retain the shared delivery owner.
   { path = "crates/carrick-syscall-abi/src/capability.rs", contract = "kernel.el1.thread-lifecycle" },
   { path = "crates/carrick-syscall-abi/src/errno.rs", contract = "core.entry.completion" },
   { path = "crates/carrick-syscall-abi/src/ipc.rs", contract = "core.entry.completion" },
   { path = "crates/carrick-syscall-abi/src/lib.rs", contract = "core.entry.completion" },
-  # Canonical signal records and architecture frames retain the shared delivery owner.
   { path = "crates/carrick-syscall-abi/src/signal.rs", contract = "kernel.el1.signal-delivery-owner" },
   { path = "crates/carrick-syscall-abi/src/stat.rs", contract = "kernel.native.host-file-venue" },
   { path = "crates/carrick-thread/src/fork_quiesce.rs", contract = "kernel.mm.address-space-occupancy" },
@@ -991,11 +995,11 @@ surfaces = [
   { path = "crates/carrick-vmm-hvf/src/fork_stock.rs", contract = "process.native.terminal-child" },
   { path = "crates/carrick-vmm-hvf/src/gic.rs", contract = "kernel.el1.gic" },
   { path = "crates/carrick-vmm-hvf/src/gic.rs", contract = "kernel.el1.guest-run-queue" },
+  # Explicit host diagnostics. No guest policy or ABI is defined here.
   { path = "crates/carrick-vmm-hvf/src/gic.rs", contract = "kernel.el1.guest-scheduler" },
   { path = "crates/carrick-vmm-hvf/src/gic.rs", contract = "kernel.scheduler.runnable-progress" },
   { path = "crates/carrick-vmm-hvf/src/gic.rs", contract = "kernel.vcpu.kick-el0-boundary" },
   { path = "crates/carrick-vmm-hvf/src/gic.rs", contract = "kernel.vcpu.shutdown-entry" },
-  # Explicit host diagnostics. No guest policy or ABI is defined here.
   { path = "crates/carrick-vmm-hvf/src/guest_capture.rs", contracts = [] },
   { path = "crates/carrick-vmm-hvf/src/hatch.rs", contract = "kernel.el1.arm-ring-first-crossing" },
   { path = "crates/carrick-vmm-hvf/src/host_signal.rs", contract = "kernel.el1.signal-delivery-owner" },
@@ -1183,6 +1187,7 @@ surfaces = [
   { path = "crates/carrick-x86/src/bringup_fns.rs", contract = "x86.vmx.segment-entry" },
   { path = "crates/carrick-x86/src/bringup_fns/poll_tests.rs", contract = "x86.run-elf.poll" },
   { path = "crates/carrick-x86/src/cpl0_entry.rs", contract = "kernel.x86.file-region" },
+  { path = "crates/carrick-x86/src/cpl0_lifecycle.rs", contract = "kernel.memory.owner-wait" },
   { path = "crates/carrick-x86/src/cpl0_scheduler.rs", contract = "kernel.scheduler.runnable-progress" },
   { path = "crates/carrick-x86/src/cpuid.rs", contract = "x86.cpuid.v3" },
   { path = "crates/carrick-x86/src/engine.rs", contract = "kernel.el1.signal-delivery-owner" },

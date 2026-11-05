@@ -18,9 +18,7 @@ pub(super) fn bind_member_service<C: ProcessContext>(
     control: &ThreadControlSlot,
     mm: carrick_el1_abi::El1MmHandle,
 ) -> Result<(), NativeProcessError> {
-    let wait = ObjectWaitKey::native_service(record).ok_or(NativeProcessError::Stale)?;
-    zone.bind_object_wait(wait, &carrick_sched_core::ShortLockSpin)
-        .map_err(|_| NativeProcessError::Quarantined)?;
+    bind_member_service_queue(zone, record)?;
     control.bind_zone_record(record);
     control
         .service
@@ -32,6 +30,21 @@ pub(super) fn bind_member_service<C: ProcessContext>(
             mm,
         })
         .map_err(service_protocol_error)
+}
+
+fn bind_member_service_queue<C: ProcessContext>(
+    zone: &ZoneTables<C>,
+    record: RecordRef,
+) -> Result<(), NativeProcessError> {
+    let wait = ObjectWaitKey::native_service(record).ok_or(NativeProcessError::Stale)?;
+    if zone
+        .object_wait(wait, &carrick_sched_core::ShortLockSpin)
+        .is_ok()
+    {
+        return Ok(());
+    }
+    zone.bind_object_wait(wait, &carrick_sched_core::ShortLockSpin)
+        .map_err(|_| NativeProcessError::Quarantined)
 }
 
 fn native_exception_signal(
@@ -136,6 +149,7 @@ pub(super) struct AdapterPreparation {
 
 enum ServicePayload<'a> {
     None,
+    Copyin,
     Copyout(OwnedCopyout),
     Adapter,
     Exec(Box<[u8]>),
@@ -150,6 +164,7 @@ pub(super) struct PendingService<'a> {
     /// The same custody for a host-file record, which the carrier also writes.
     host_file: Option<PendingHostFile<'a>>,
     copyout: Option<Box<OwnedCopyout>>,
+    copyin: bool,
     adapter: bool,
     exec_successor: Option<Box<dyn ExecSuccessorSlot + 'a>>,
     retry_syscall_after_supply: bool,
@@ -306,7 +321,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .lock()
             .service_wait(&record)
             .filter(|pending| {
-                (pending.copyout.is_none() && !pending.adapter)
+                (pending.copyout.is_none() && !pending.copyin && !pending.adapter)
                     || pending.claim.cancellation().is_some()
             })
             .map(|pending| (pending.request, pending.control.clone(), pending.adapter));
@@ -714,9 +729,69 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
         self.begin_service_inner(operation, sequence, None, ServicePayload::Adapter, true)
     }
-    /// Supply one nonresident user page needed to stage an exec request, then
-    /// retry the exact SVC. A refused supply remains an ordinary `EFAULT` from
-    /// exec rather than becoming a user data-abort signal.
+    /// Supply readable memory for a guest-copy input, then
+    /// retry the exact SVC before any setup effect. A refused supply becomes
+    /// `EFAULT` from the copy rather than a user data-abort signal.
+    pub(super) fn prepare_guest_input(
+        &mut self,
+        request: carrick_core::personality::GuestCopyRequest,
+    ) -> Result<LifecycleOutcome, NativeProcessError> {
+        let mm = self
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .task(self.key)
+            .map_err(|_| NativeProcessError::Stale)?
+            .native()
+            .resources()
+            .mm
+            .clone();
+        let (operation, sequence, wait) = match self.service.prepare_owned_read(&mm, request) {
+            Ok(()) => return Ok(LifecycleOutcome::Redispatch),
+            Err(NativeProcessError::Fault) => {
+                return Ok(returned(carrick_syscall_abi::LINUX_EFAULT.guest_retval()));
+            }
+            Err(NativeProcessError::OwnerWait(wait)) => (
+                ServiceOperation::CarrierWork {
+                    entry: OwnerEntry::Syscall,
+                },
+                None,
+                Some(wait),
+            ),
+            Err(NativeProcessError::Busy) => (
+                ServiceOperation::CarrierWork {
+                    entry: OwnerEntry::Syscall,
+                },
+                None,
+                None,
+            ),
+            Err(NativeProcessError::Unsupported) => {
+                let (mut fault, sequence) = self
+                    .service
+                    .copyout_fault(request.address)
+                    .ok_or(NativeProcessError::Unsupported)?;
+                fault.access = request.access;
+                (ServiceOperation::Fault(fault), Some(sequence), None)
+            }
+            Err(error) => return Err(error),
+        };
+        let result =
+            self.begin_service_inner(operation, sequence, wait, ServicePayload::Copyin, true)?;
+        match result {
+            NativeResume::RetrySyscall => Ok(LifecycleOutcome::Redispatch),
+            NativeResume::Returned(result) => Ok(LifecycleOutcome::Returned {
+                result,
+                work: false,
+            }),
+            NativeResume::Left(None) => Ok(LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                result: SyscallResult::new(0),
+            }),
+            _ => Err(NativeProcessError::Quarantined),
+        }
+    }
+
     pub fn begin_exec_stage_fault_service(
         &mut self,
         fault: carrick_guest_arch::FaultInfo,
@@ -1001,7 +1076,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         retry_syscall_after_supply: bool,
     ) -> Result<PreparedService, NativeProcessError> {
         self.service_phase = NativeServicePhase::Payload;
+        let copyin = matches!(&payload, ServicePayload::Copyin);
         let (payload, copyout, adapter) = match payload {
+            ServicePayload::Copyin => (ServicePayload::None, None, false),
             ServicePayload::Copyout(output) => {
                 (ServicePayload::None, Some(Box::new(output)), false)
             }
@@ -1018,7 +1095,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 return Err(NativeProcessError::Stale);
             }
             (_, ServicePayload::None) => (None, None),
-            (_, ServicePayload::Copyout(_) | ServicePayload::Adapter) => {
+            (_, ServicePayload::Copyout(_) | ServicePayload::Copyin | ServicePayload::Adapter) => {
                 return Err(NativeProcessError::Stale);
             }
         };
@@ -1062,7 +1139,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .service
                 .bound_birth(self.key, self.binding.thread_generation, self.record)
             {
-                Ok(birth) => birth,
+                Ok(birth) => {
+                    // Rehome moves an idle birth to a new exact record. Bind
+                    // its quiescent queue after releasing the graph guard,
+                    // preserving the existing service-queue -> graph order.
+                    bind_member_service_queue(self.source.zone, self.record)?;
+                    birth
+                }
                 Err(ServiceError::Busy) => {
                     // Fork binds a child's service cell at publication. The root
                     // and an authenticated unbound member use this same owner. Its first exact
@@ -1220,6 +1303,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 _exec_payload: exec_payload,
                 host_file,
                 copyout,
+                copyin,
                 adapter,
                 exec_successor,
                 retry_syscall_after_supply,
@@ -1231,6 +1315,28 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             })),
         );
         drop(owner_queue);
+        // Intake can run before park enrollment. Publish the exact temporary
+        // continuation before its notice, preserving a host member's permanent
+        // execution ownership. The service cell authenticates this record/MM.
+        let entry = if retry_syscall_after_supply {
+            OwnerEntry::Syscall
+        } else {
+            match operation {
+                ServiceOperation::Fault(_) | ServiceOperation::Exception(_) => {
+                    OwnerEntry::Exception
+                }
+                ServiceOperation::CarrierWork { entry } => entry,
+                _ => OwnerEntry::Syscall,
+            }
+        };
+        // SAFETY: this admitted lane owns the exact running record, and its
+        // retained service has been published before exposing the notice.
+        unsafe {
+            self.source
+                .zone
+                .record(self.record.id)
+                .publish_owner_continuation(entry);
+        }
         if owner_wait.is_some() {
             return Ok(PreparedService::Request(request, adapter));
         }
@@ -1369,7 +1475,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ),
             &|_| {},
             || {
-                if ((!adapter && self.signal_interrupts_current())
+                let internal_copy = self
+                    .runtime
+                    .graph
+                    .lock()
+                    .service_wait(&self.record)
+                    .is_some_and(|pending| pending.copyin || pending.copyout.is_some());
+                if ((!adapter && !internal_copy && self.signal_interrupts_current())
                     || self.runtime.graph.lock().pending.has_exit(&self.key))
                     && let Err(error) = self.control.service.cancel(request.identity)
                 {
@@ -1618,8 +1730,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         (true, false),
                         |pending| {
                             (
-                                pending.copyout.is_none() && !pending.adapter,
-                                pending.copyout.is_some() && pending.claim.cancellation().is_some(),
+                                pending.copyout.is_none() && !pending.copyin && !pending.adapter,
+                                (pending.copyout.is_some() || pending.copyin)
+                                    && pending.claim.cancellation().is_some(),
                             )
                         },
                     );
@@ -1702,7 +1815,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     fn commit_exec_successor(
         &mut self,
         successor: NativeExecSuccessor<M, C>,
-        service_rebind: carrick_core_abi::service::PreparedExecServiceRebind<'_>,
+        service_rebind: carrick_core_abi::service::PreparedServiceRebind<'_>,
         comm: [u8; 16],
         validated: Box<ValidatedExecSuccessor<'a>>,
     ) -> Result<(), NativeProcessError> {
@@ -2321,7 +2434,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
         let retry_syscall_after_supply = pending.retry_syscall_after_supply;
         let exiting = self.runtime.graph.lock().pending.has_exit(&self.key)
-            || (pending.copyout.is_some() && pending.claim.cancellation().is_some());
+            || ((pending.copyout.is_some() || pending.copyin)
+                && pending.claim.cancellation().is_some());
         if (exiting || result == ServiceResult::Cancelled)
             && let Some(PendingServiceReply::Fault(reply)) = &pending.reply
         {
@@ -2733,7 +2847,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         completed
     }
 }
-fn service_protocol_error(error: ServiceError) -> NativeProcessError {
+pub(super) fn service_protocol_error(error: ServiceError) -> NativeProcessError {
     match error {
         // All callers either own the exact executing member before transport
         // publication, or hold its native-service queue. The transport takes

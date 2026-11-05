@@ -12,19 +12,47 @@ struct Native {
     fail: bool,
 }
 impl UserCopy for Native {
-    fn copy_in(&mut self, bytes: &mut [u8], _: UserVa) -> bool {
-        bytes.fill(0);
-        if bytes.len() == core::mem::size_of::<carrick_syscall_abi::LinuxSiginfo>() {
-            let info = carrick_syscall_abi::LinuxSiginfo::kill(10, -1, 1, 0);
-            bytes.copy_from_slice(zerocopy::IntoBytes::as_bytes(&info));
-        }
-        true
+    fn copy_in(&mut self, bytes: &mut [u8], _: UserVa) -> carrick_core::personality::CopyOutcome {
+        carrick_core::personality::CopyOutcome::from_completed({
+            bytes.fill(0);
+            if bytes.len() == core::mem::size_of::<carrick_syscall_abi::LinuxSiginfo>() {
+                let info = carrick_syscall_abi::LinuxSiginfo::kill(10, -1, 1, 0);
+                bytes.copy_from_slice(zerocopy::IntoBytes::as_bytes(&info));
+            }
+            true
+        })
     }
-    fn copy_out(&mut self, _: UserVa, _: &[u8]) -> bool {
-        true
+    fn copy_out(&mut self, _: UserVa, _: &[u8]) -> carrick_core::personality::CopyOutcome {
+        carrick_core::personality::CopyOutcome::from_completed(true)
     }
 }
 impl<'a> SignalNative<'a> for Native {
+    #[allow(clippy::panic)]
+    fn wait_guest_copy(
+        &mut self,
+        _: carrick_core::personality::GuestCopyRequest,
+    ) -> carrick_personality_linux::signal::SignalOutcome {
+        panic!("eager test venue cannot suspend guest memory")
+    }
+    #[allow(clippy::panic)]
+    fn finish_signal_output(
+        &mut self,
+        address: carrick_guest_arch::UserVa,
+        bytes: Vec<u8>,
+    ) -> carrick_personality_linux::signal::SignalOutcome {
+        let result = match self.copy_out(address, &bytes) {
+            carrick_core::personality::CopyOutcome::Done => 0,
+            carrick_core::personality::CopyOutcome::Fault => -14,
+            carrick_core::personality::CopyOutcome::NotYet(_) => {
+                panic!("eager test venue refused output")
+            }
+        };
+        carrick_personality_linux::signal::SignalOutcome::Returned {
+            result: carrick_personality_linux::abi::entry::SyscallResult::new(result),
+            work: false,
+        }
+    }
+
     fn arguments(&self) -> [u64; 6] {
         self.args
     }

@@ -262,7 +262,7 @@ pub(crate) fn restore_live_arm_signal_frame(
     fp.fpcr = saved.native.fpcr as u32;
     let mask = LinuxAarch64Backend
         .restore_signal_frame(frame, fp.as_mut_bytes(), &mut |dst, src| {
-            copy_in.copy_in(dst, src)
+            copy_in.copy_in(dst, src).is_done()
         })
         .map_err(|_| carrick_syscall_abi::LINUX_EFAULT)?;
     // restore_signal_frame validates and then publishes SP_EL0. Re-read it
