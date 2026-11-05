@@ -3609,21 +3609,14 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                     }
                     carrick_abi::LINUX_F_SETFD => {
                         let cloexec = arg & carrick_abi::LINUX_FD_CLOEXEC != 0;
-                        if let Err(err) = venue.region.fd(NativeFdWait).setfd(table, old, cloexec) {
+                        if let Err(err) = super::file_table::with_host_binding_setfd(
+                            self.fd_map,
+                            file_table,
+                            old.0,
+                            cloexec,
+                            || venue.region.fd(NativeFdWait).setfd(table, old, cloexec),
+                        ) {
                             return map_fd_error(err);
-                        }
-                        if let Some((_, index)) = fd_map_lookup(self.fd_map, file_table, old.0) {
-                            if cloexec {
-                                self.fd_map[index].fd_flags.fetch_or(
-                                    super::file_table::GUEST_FD_CLOEXEC,
-                                    Ordering::Release,
-                                );
-                            } else {
-                                self.fd_map[index].fd_flags.fetch_and(
-                                    !super::file_table::GUEST_FD_CLOEXEC,
-                                    Ordering::Release,
-                                );
-                            }
                         }
                         FamilyCompletion::Complete(0)
                     }

@@ -195,6 +195,31 @@ pub fn with_host_binding_cloexec_range<E>(
     Ok(())
 }
 
+/// Update one descriptor and its host-binding projection under the same guard
+/// used by range updates and descriptor replacement.
+pub fn with_host_binding_setfd<E>(
+    fd_map: &[FdMapSlot],
+    file_table: u64,
+    fd: i32,
+    cloexec: bool,
+    operation: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E> {
+    let _guard = lock_fd_map(fd_map);
+    operation()?;
+    if let Some((_, index)) = fd_map_lookup(fd_map, file_table, fd) {
+        if cloexec {
+            fd_map[index]
+                .fd_flags
+                .fetch_or(GUEST_FD_CLOEXEC, Ordering::Release);
+        } else {
+            fd_map[index]
+                .fd_flags
+                .fetch_and(!GUEST_FD_CLOEXEC, Ordering::Release);
+        }
+    }
+    Ok(())
+}
+
 /// Linux dup2 on an in-ring host-bound description. A live target is replaced
 /// under the descriptor lock, preserving the source description and clearing
 /// the new descriptor's close-on-exec flag.
