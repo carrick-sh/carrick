@@ -1946,6 +1946,14 @@ fn sigprocmask_copyout_into_untouched_sparse_mmap() {
     );
     let mask = 1u64 << 9;
     memory.write_bytes(BASE, &mask.to_le_bytes()).unwrap();
+    // First write an unrelated record to the untouched first page. The
+    // distant oldset page below must still have no initialized bytes.
+    assert_eq!(
+        call(&mut memory, nr::CLOCK_GETTIME.raw(), [1, arena, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_ne!(memory.read_bytes(arena, 16).unwrap(), [0; 16]);
+    assert!(memory.regions()[1].shared_initialized_bytes().1.len() < 0x7ff000);
     let oldset = arena + 0x7ff000;
     assert_eq!(
         call(
@@ -1956,13 +1964,6 @@ fn sigprocmask_copyout_into_untouched_sparse_mmap() {
         DispatchOutcome::Returned { value: 0 }
     );
     assert_eq!(memory.read_bytes(oldset, 8).unwrap(), [0; 8]);
-    // An unrelated record copyout into a second untouched page follows the
-    // same GuestMemory path, rather than a signal-specific workaround.
-    assert_eq!(
-        call(&mut memory, nr::CLOCK_GETTIME.raw(), [1, arena, 0, 0, 0, 0]),
-        DispatchOutcome::Returned { value: 0 }
-    );
-    assert_ne!(memory.read_bytes(arena, 16).unwrap(), [0; 16]);
 }
 
 #[test]
