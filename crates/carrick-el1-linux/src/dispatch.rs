@@ -2146,42 +2146,68 @@ impl core::fmt::Debug for NativeInvariant {
 }
 
 impl NativeInvariant {
-    /// Target-independent mapping keeps fatal reason selection exhaustive and
-    /// testable without entering the terminal transport.
-    pub fn fatal_reason(&self) -> carrick_el1_abi::EntryBindingFatalReason {
+    /// Target-independent mapping keeps fatal cause selection exhaustive and
+    /// testable without entering the terminal transport. The cause names the
+    /// variant as well as its inner reason (#1642).
+    pub fn fatal_cause(&self) -> carrick_el1_abi::EntryBindingFatalCause {
+        use carrick_el1_abi::EntryBindingFatalCause as Cause;
+        use carrick_el1_abi::EntryBindingFatalOrigin as Origin;
         use carrick_el1_abi::EntryBindingFatalReason as Fatal;
         match self {
-            NativeInvariant::EntryBinding => Fatal::EntryBinding,
-            NativeInvariant::NativeService(reason) => *reason,
+            NativeInvariant::EntryBinding => {
+                Cause::invariant(Origin::EntryBinding, Fatal::EntryBinding)
+            }
+            NativeInvariant::NativeService(reason) => {
+                Cause::invariant(Origin::NativeService, *reason)
+            }
             NativeInvariant::PhysicalCustody(reason) => match reason {
-                PhysicalCustodyInvariant::RootExitRefused => Fatal::RootExitRefused,
-                PhysicalCustodyInvariant::ForkCustodyRefused => Fatal::ForkCustodyRefused,
-                PhysicalCustodyInvariant::AffinityTopologyMissing => Fatal::AffinityTopologyMissing,
-                PhysicalCustodyInvariant::InventoryRollbackFailed
-                | PhysicalCustodyInvariant::NativeRunFailure(_) => Fatal::PhysicalCustody,
+                PhysicalCustodyInvariant::NativeRunFailure(run) => Cause::native_run_failure(*run),
+                PhysicalCustodyInvariant::RootExitRefused => {
+                    Cause::invariant(Origin::PhysicalCustody, Fatal::RootExitRefused)
+                }
+                PhysicalCustodyInvariant::ForkCustodyRefused => {
+                    Cause::invariant(Origin::PhysicalCustody, Fatal::ForkCustodyRefused)
+                }
+                PhysicalCustodyInvariant::AffinityTopologyMissing => {
+                    Cause::invariant(Origin::PhysicalCustody, Fatal::AffinityTopologyMissing)
+                }
+                PhysicalCustodyInvariant::InventoryRollbackFailed => {
+                    Cause::invariant(Origin::PhysicalCustody, Fatal::InventoryRollbackFailed)
+                }
             },
-            NativeInvariant::MissingNativeFrame => Fatal::MissingNativeFrame,
-            NativeInvariant::RevisionCredit => Fatal::RevisionCredit,
-            NativeInvariant::SignalNumber => Fatal::SignalNumber,
+            NativeInvariant::MissingNativeFrame => {
+                Cause::invariant(Origin::MissingNativeFrame, Fatal::MissingNativeFrame)
+            }
+            NativeInvariant::RevisionCredit => {
+                Cause::invariant(Origin::RevisionCredit, Fatal::RevisionCredit)
+            }
+            NativeInvariant::SignalNumber => {
+                Cause::invariant(Origin::SignalNumber, Fatal::SignalNumber)
+            }
             NativeInvariant::ProcessGraph(invariant) => {
                 use super::process_owner::GuestProcessInvariant as Graph;
                 use carrick_sched_core::process::registry::RegistryInvariant as Registry;
-                match invariant {
-                    Graph::NamespaceInternalIdentityOutOfRange(_) => Fatal::NamespaceIdentityRange,
-                    Graph::NamespaceVisibleIdentityLost(_) => Fatal::NamespaceIdentityLost,
-                    Graph::ExitCustodyLost(_) => Fatal::ExitCustodyLost,
-                    Graph::ExitPublicationLost(_) => Fatal::ExitPublicationLost,
-                    Graph::ExitReleaseLost(_) => Fatal::ExitReleaseLost,
-                    Graph::Registry(invariant) => match invariant {
-                        Registry::EpochExhausted => Fatal::RegistryEpochExhausted,
-                        Registry::BirthPayloadMismatch => Fatal::BirthPayloadMismatch,
-                        Registry::ProcessGroupCollision => Fatal::ProcessGroupCollision,
-                        Registry::ProcessGroupIndexLost => Fatal::ProcessGroupIndexLost,
-                        Registry::SessionCollision => Fatal::SessionCollision,
-                        Registry::SessionIndexLost => Fatal::SessionIndexLost,
-                        Registry::AutoreapAccountingLost => Fatal::AutoreapAccountingLost,
+                Cause::invariant(
+                    Origin::ProcessGraph,
+                    match invariant {
+                        Graph::NamespaceInternalIdentityOutOfRange(_) => {
+                            Fatal::NamespaceIdentityRange
+                        }
+                        Graph::NamespaceVisibleIdentityLost(_) => Fatal::NamespaceIdentityLost,
+                        Graph::ExitCustodyLost(_) => Fatal::ExitCustodyLost,
+                        Graph::ExitPublicationLost(_) => Fatal::ExitPublicationLost,
+                        Graph::ExitReleaseLost(_) => Fatal::ExitReleaseLost,
+                        Graph::Registry(invariant) => match invariant {
+                            Registry::EpochExhausted => Fatal::RegistryEpochExhausted,
+                            Registry::BirthPayloadMismatch => Fatal::BirthPayloadMismatch,
+                            Registry::ProcessGroupCollision => Fatal::ProcessGroupCollision,
+                            Registry::ProcessGroupIndexLost => Fatal::ProcessGroupIndexLost,
+                            Registry::SessionCollision => Fatal::SessionCollision,
+                            Registry::SessionIndexLost => Fatal::SessionIndexLost,
+                            Registry::AutoreapAccountingLost => Fatal::AutoreapAccountingLost,
+                        },
                     },
-                }
+                )
             }
         }
     }
@@ -2246,14 +2272,20 @@ fn native_service_fatal_reason(
     }
 }
 
+/// Fail-stop for a broken native invariant. `#[track_caller]` names the
+/// refusing call site: twenty sites share `EntryBinding`, and the PC of this
+/// cold body cannot say which caller reached it (#1642).
+#[cold]
+#[inline(never)]
 #[track_caller]
 pub fn invalid_completion(reason: NativeInvariant) -> ! {
     #[cfg(target_os = "none")]
-    carrick_el1::substrate::sched::hw::fatal_entry_binding(reason.fatal_reason());
+    carrick_el1::substrate::sched::hw::fatal_entry_binding_cause(reason.fatal_cause());
     #[cfg(not(target_os = "none"))]
     carrick_fatal::carrick_fatal!(
         "el1::entry_completion",
-        "native entry invariant: {reason:?}"
+        "native entry invariant: {reason:?} {}",
+        carrick_el1_abi::EntryBindingFatalDetail::at_caller(reason.fatal_cause())
     )
 }
 
@@ -4194,8 +4226,13 @@ mod tests {
             (Error::NoChild, Fatal::NativeServiceNoChild),
         ] {
             let invariant = native_service_invariant(error);
-            let reason = invariant.fatal_reason();
+            let cause = invariant.fatal_cause();
+            let reason = cause.reason;
             assert_eq!(reason, expected);
+            assert_eq!(
+                cause.origin,
+                carrick_el1_abi::EntryBindingFatalOrigin::NativeService
+            );
             assert_eq!(Fatal::from_raw(reason as u64), Some(expected));
             assert_eq!(
                 std::format!("{invariant:?}"),
@@ -4224,11 +4261,15 @@ mod tests {
             (Phase::Completion, Fatal::NativeServiceCompleteStale),
             (Phase::Settlement, Fatal::NativeServiceSettleStale),
         ] {
-            let reason = native_service_invariant_at(Error::Stale, phase).fatal_reason();
+            let reason = native_service_invariant_at(Error::Stale, phase)
+                .fatal_cause()
+                .reason;
             assert_eq!(reason, expected);
             assert_eq!(Fatal::from_raw(reason as u64), Some(expected));
             assert_eq!(
-                native_service_invariant_at(Error::Busy, phase).fatal_reason(),
+                native_service_invariant_at(Error::Busy, phase)
+                    .fatal_cause()
+                    .reason,
                 Fatal::NativeServiceBusy,
                 "diagnostic provenance cannot turn contention into stale identity"
             );
@@ -4257,13 +4298,19 @@ mod tests {
             ),
             (
                 Custody::InventoryRollbackFailed,
-                Fatal::PhysicalCustody,
+                Fatal::InventoryRollbackFailed,
                 "unexposed physical inventory rollback failed",
             ),
         ];
         for (reason, expected, text) in cases {
             let invariant = NativeInvariant::PhysicalCustody(reason);
-            assert_eq!(invariant.fatal_reason(), expected);
+            assert_eq!(
+                invariant.fatal_cause(),
+                carrick_el1_abi::EntryBindingFatalCause::invariant(
+                    carrick_el1_abi::EntryBindingFatalOrigin::PhysicalCustody,
+                    expected
+                )
+            );
             assert_eq!(reason.as_str(), text);
             assert_eq!(
                 std::format!("{invariant:?}"),
@@ -4287,12 +4334,120 @@ mod tests {
         ] {
             let custody = Custody::NativeRunFailure(reason);
             let invariant = NativeInvariant::PhysicalCustody(custody);
-            assert_eq!(invariant.fatal_reason(), Fatal::PhysicalCustody);
+            // Each run failure keeps its own reason (#1642), not a shared code.
+            assert_eq!(
+                invariant.fatal_cause(),
+                carrick_el1_abi::EntryBindingFatalCause::native_run_failure(reason)
+            );
+            assert_eq!(invariant.fatal_cause().reason, Fatal::NativeRunFailure);
             assert_eq!(custody.as_str(), reason.as_str());
             assert_eq!(
                 std::format!("{invariant:?}"),
                 std::format!("PhysicalCustody({:?})", reason.as_str())
             );
+        }
+    }
+
+    /// #1642: twenty sites raise `EntryBinding`; the fatal line must say
+    /// which one. Drives the production `invalid_completion` in a bounded
+    /// child process, because its fatal sink ends the process.
+    mod serial_host {
+        use super::*;
+
+        const CHILD: &str = "CARRICK_EL1_INVALID_COMPLETION_SITE_CHILD";
+        const TEST: &str =
+            "dispatch::tests::serial_host::invalid_completion_names_the_raising_call_site";
+        const SITES_BEGIN: u32 = line!();
+        fn raise_at(site: &str) -> ! {
+            match site {
+                "first" => invalid_completion(NativeInvariant::EntryBinding),
+                "second" => invalid_completion(NativeInvariant::EntryBinding),
+                _ => invalid_completion(NativeInvariant::PhysicalCustody(
+                    PhysicalCustodyInvariant::NativeRunFailure(
+                        carrick_core_abi::NativeRunFailureReason::BornEnqueueRefused,
+                    ),
+                )),
+            }
+        }
+        const SITES_END: u32 = line!();
+
+        fn fatal_line(site: &str) -> std::string::String {
+            use wait_timeout::ChildExt;
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, site)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let timed_out = child
+                .wait_timeout(std::time::Duration::from_secs(10))
+                .unwrap()
+                .is_none();
+            if timed_out {
+                child.kill().unwrap();
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                !timed_out,
+                "fatal-site child exceeded 10 seconds and was killed"
+            );
+            let stderr = std::string::String::from_utf8_lossy(&output.stderr).into_owned();
+            assert_eq!(output.status.code(), Some(86), "{stderr}");
+            let mut lines = stderr
+                .lines()
+                .filter(|line| line.starts_with("carrick fatal [el1::entry_completion]: "));
+            let line = lines.next().unwrap_or_default().to_owned();
+            assert!(!line.is_empty(), "no fatal line: {stderr}");
+            assert_eq!(lines.next(), None, "{stderr}");
+            line
+        }
+
+        fn site_line(fatal: &str) -> u32 {
+            let file = "at=crates/carrick-el1-linux/src/dispatch.rs:";
+            let start = fatal
+                .find(file)
+                .map(|at| at + file.len())
+                .unwrap_or_default();
+            assert!(start > 0, "no call-site file: {fatal}");
+            let digits = fatal.get(start..).unwrap_or_default();
+            let end = digits.find(':').unwrap_or_default();
+            digits.get(..end).unwrap_or_default().parse().unwrap()
+        }
+
+        #[test]
+        fn invalid_completion_names_the_raising_call_site() {
+            if let Ok(site) = std::env::var(CHILD) {
+                carrick_fatal::set_hook(|domain, _| {
+                    assert_eq!(domain, "el1::entry_completion");
+                    std::process::exit(86);
+                });
+                raise_at(&site);
+            }
+            let first = fatal_line("first");
+            let second = fatal_line("second");
+            let run = fatal_line("run-failure");
+            assert_ne!(first, second, "two call sites printed one fatal line");
+            for line in [&first, &second] {
+                assert!(
+                    line.contains(
+                        "native entry invariant: EntryBinding reason=EntryBinding \
+                         invariant=EntryBinding at="
+                    ),
+                    "{line}"
+                );
+            }
+            assert!(
+                run.contains(
+                    "reason=NativeRunFailure invariant=PhysicalCustody(BornEnqueueRefused) at="
+                ),
+                "{run}"
+            );
+            let lines = [site_line(&first), site_line(&second), site_line(&run)];
+            assert_eq!(lines[1], lines[0] + 1, "{first}\n{second}");
+            for line in lines {
+                assert!(SITES_BEGIN < line && line < SITES_END, "{line}");
+            }
         }
     }
 

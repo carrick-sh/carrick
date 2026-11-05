@@ -592,10 +592,10 @@ violation (e.g. lost wake, dead child, poisoned lock, generation mismatch), it i
 #### Format of `CARRICK_LAST_FATAL`
 The record is stored in a static global `CARRICK_LAST_FATAL` (crate `carrick-fatal`):
 - `magic: u64`: `0x4341_5252_4641_544c` (ASCII `'CARRFATL'`).
-- `length: u32`: byte length of the message written into `message` (up to 1024).
+- `length: u32`: byte length of the message written into `message` (up to 1536).
 - `domain_len: u32`: byte length of the domain string written into `domain` (up to 64).
 - `domain: [u8; 64]`: ASCII domain name (e.g. `"fork_quiesce"`, `"thread"`).
-- `message: [u8; 1024]`: UTF-8 diagnostic message, truncated if longer than 1024 bytes.
+- `message: [u8; 1536]`: UTF-8 diagnostic message, truncated if longer than 1536 bytes.
 
 #### Reading `CARRICK_LAST_FATAL` from lldb
 When examining a core dump or live process under `lldb`:

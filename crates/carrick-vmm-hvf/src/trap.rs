@@ -8553,6 +8553,33 @@ impl HvfInner {
                             carrick_el1_abi::ArmEntryFatalRegisters {
                                 reason: vcpu.get_reg(Reg::X2).ok(),
                                 source_location: vcpu.get_reg(Reg::X3).ok(),
+                                origin: vcpu.get_reg(Reg::X4).ok(),
+                                source_file: {
+                                    // One unreadable word makes the file
+                                    // unavailable, never a partial path.
+                                    let mut words =
+                                        [0u64; carrick_el1_abi::FATAL_SOURCE_FILE_WORDS];
+                                    let file_regs = [
+                                        Reg::X5,
+                                        Reg::X6,
+                                        Reg::X7,
+                                        Reg::X8,
+                                        Reg::X9,
+                                        Reg::X10,
+                                        Reg::X11,
+                                        Reg::X12,
+                                    ];
+                                    words
+                                        .iter_mut()
+                                        .zip(file_regs)
+                                        .try_for_each(|(word, reg)| {
+                                            *word = vcpu.get_reg(reg).ok()?;
+                                            Some(())
+                                        })
+                                        .map(|()| {
+                                            carrick_el1_abi::FatalSourceFile::from_words(words)
+                                        })
+                                },
                                 pc: Some(pc),
                                 lr: vcpu.get_reg(Reg::X30).ok(),
                                 fp: vcpu.get_reg(Reg::X29).ok(),
