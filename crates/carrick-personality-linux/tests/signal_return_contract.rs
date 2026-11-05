@@ -246,7 +246,9 @@ fn frame_masks_cross_as_blocked_domains() {
     fn frame_mask(params: carrick_personality_linux::signal::SignalFrameParams) -> SigBlockMask {
         params.mask
     }
-    fn restored_mask(native: &mut Native) -> Result<SigBlockMask, carrick_syscall_abi::LinuxErrno> {
+    fn restored_mask(
+        native: &mut Native,
+    ) -> Result<SigBlockMask, carrick_core::personality::CopyOutcome> {
         Ok(native.restore_signal_frame()?.mask)
     }
     let mask = SigBlockMask::blocking_all_of(carrick_signal_core::SignalSet::from_bits(1 << 9));

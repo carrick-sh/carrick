@@ -219,9 +219,12 @@ fn signal_owner_admits_validated_requests_and_selectors() {
     assert_eq!(result.unwrap_err().get(), 22);
     let restored: Result<
         carrick_personality_linux::signal::RestoredSignalFrame,
-        carrick_syscall_abi::LinuxErrno,
+        carrick_core::personality::CopyOutcome,
     > = native.restore_signal_frame();
-    assert_eq!(restored.unwrap_err().get(), 14);
+    assert_eq!(
+        restored.unwrap_err(),
+        carrick_core::personality::CopyOutcome::Fault
+    );
 }
 
 #[test]
