@@ -19,8 +19,17 @@ runs:
         set -euo pipefail
         prepare() {
           if [ "$ROOT_ONLY" = true ]; then
-            cargo fetch --locked --offline ||
-              CARGO_NET_OFFLINE=false CARGO_NET_RETRY=0 CARGO_HTTP_TIMEOUT=30 cargo fetch --locked
+            # A cache miss is expected: show the offline attempt only if the
+            # online fetch fails too (see scripts/check-fixture-lockfiles.sh).
+            offline_log=$(mktemp)
+            if ! cargo fetch --locked --offline 2>"$offline_log" &&
+               ! CARGO_NET_OFFLINE=false CARGO_NET_RETRY=0 CARGO_HTTP_TIMEOUT=30 cargo fetch --locked; then
+              echo "offline attempt (restored cache):" >&2
+              cat "$offline_log" >&2
+              rm -f "$offline_log"
+              return 1
+            fi
+            rm -f "$offline_log"
           else
             scripts/check-fixture-lockfiles.sh --prepare
           fi

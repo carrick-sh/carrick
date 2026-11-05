@@ -29,12 +29,21 @@ for manifest in "${manifests[@]}"; do
     if [ "$prepare" = 1 ]; then
         # Check the restored cache first. No retry loop or hidden online fallback
         # is permitted after this explicit preparation step.
-        if ! cargo fetch --locked --offline --manifest-path "$manifest" &&
+        # A cache miss is expected here, so the offline attempt's output is held
+        # back and shown only if the online fetch fails too: its "error: no
+        # matching package" lines otherwise read as the step's failure (misread
+        # on 2026-11-05 as an infrastructure flake while the step had passed).
+        offline_log=$(mktemp)
+        if ! cargo fetch --locked --offline --manifest-path "$manifest" 2>"$offline_log" &&
            ! CARGO_NET_OFFLINE=false CARGO_NET_RETRY=0 CARGO_HTTP_TIMEOUT=30 \
                cargo fetch --locked --manifest-path "$manifest"; then
+            echo "offline attempt (restored cache) for $manifest:" >&2
+            cat "$offline_log" >&2
+            rm -f "$offline_log"
             echo "::error title=Infrastructure::Cargo cache preparation failed: $manifest" >&2
             exit 75
         fi
+        rm -f "$offline_log"
     elif ! cargo metadata --locked --format-version 1 \
         --manifest-path "$manifest" >/dev/null; then
         echo "fixture lockfile gate: locked resolution failed: $manifest" >&2
