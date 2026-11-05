@@ -10615,6 +10615,18 @@ fn serial_host_native_subshell_self_filled_pipe_on_stdin_reaches_eof() {
         .each_ref()
         .map(|binding| fixture.zone.record(binding.record.id).identity().file_table);
 
+    // `pipe2` is host-served after the subshell becomes a native process. Its
+    // writer therefore has both the shared-table slot and a carrier projection.
+    // Closing the shared slot must replay the host projection even though a
+    // pipe has no record-lock/inotify close-effect bits; otherwise the carrier
+    // FileTable keeps a functional writer and the EOF read parks forever.
+    assert!(crossing.open_table[0].lifetime.initialize(1, true));
+    crossing.open_table[0]
+        .state
+        .store(carrick_el1_abi::DELEGATED_STATE_GUEST, Ordering::Release);
+    assert!(crossing.fd_map[0].try_claim());
+    crossing.fd_map[0].set(children[0], 4, 1, 1);
+
     // Fork inherited host stdin and the endpoints. The parent relinquishes
     // all three; the child now owns the exact descriptor population used by
     // dash for a heredoc in a subshell.
@@ -10704,7 +10716,14 @@ fn serial_host_native_subshell_self_filled_pipe_on_stdin_reaches_eof() {
     assert_eq!(call(close, [0, 0, 0]), 0);
     let write = carrick_personality_linux::crossing::nr::WRITE.raw();
     assert_eq!(call(write, [4, payload.arg(), 11]), 11);
-    assert_eq!(call(close, [4, 0, 0]), 0);
+    let (writer_close_route, writer_close_result) = run_in_child(0, close, [4, 0, 0]);
+    assert_eq!(writer_close_result, 0);
+    assert_eq!(writer_close_route, CompletionRoute::WithWork);
+    assert_eq!(
+        task.linux.take_served_boundary(),
+        Some(carrick_el1_abi::ServedBoundary::ReplayOriginal { x0: 4 }),
+        "a host-served pipe projection must be removed before EOF can be observed"
+    );
     assert_eq!(
         call(carrick_syscall_abi::CARRICK_PRIVATE_X86_DUP2, [3, 0, 0]),
         0

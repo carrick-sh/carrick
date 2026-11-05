@@ -3499,6 +3499,7 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                     file_table,
                     old.0,
                 );
+                let projection_removed = change.is_some();
                 if let Err(err) = Self::settle_delegated_release(
                     self.frame,
                     self.open_table,
@@ -3507,13 +3508,14 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                 ) {
                     return err;
                 }
-                if close_effects.is_empty() {
+                if close_effects.is_empty() && !projection_removed {
                     FamilyCompletion::Complete(0)
                 } else {
                     // The numeric fd is already gone from the one shared
-                    // authority. Replay only the host-owned close effects:
-                    // the host FileTable observes the shared BadFd as an
-                    // idempotent projection and runs its canonical record-lock,
+                    // authority. Replay the host projection removal and any
+                    // host-owned close effects: the host FileTable observes
+                    // the shared BadFd as an idempotent projection, drops its
+                    // functional reference, and runs canonical record-lock,
                     // epoll and inotify teardown exactly once.
                     FamilyCompletion::CommitOwed(0)
                 }
