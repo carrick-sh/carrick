@@ -188,8 +188,12 @@ pub fn object_wait_key(
     object: IpcObjectHandle,
     direction: pipe::WaitFor,
 ) -> Option<carrick_sched_core::object_wait::ObjectWaitKey> {
+    let base = object.index().checked_mul(2)?.checked_add(1)?;
+    if base.checked_add(1)? as usize >= carrick_sched_core::ZONE_RECORDS {
+        return None;
+    }
     let lane = u32::from(direction == pipe::WaitFor::Writable);
-    let index = object.index().checked_mul(2)?.checked_add(1 + lane)?;
+    let index = base + lane;
     carrick_sched_core::object_wait::ObjectWaitKey::new(index, u64::from(object.generation()) + 1)
 }
 

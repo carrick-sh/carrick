@@ -1127,6 +1127,27 @@ fn el1_ipc_wait_census_names_each_waiter_object_and_its_readiness() {
     drop(held);
 }
 
+#[test]
+fn ipc_wait_keys_end_before_the_metadata_queue_domain() {
+    let last = IpcObjectHandle::from_raw(RawIpcObject {
+        index: (carrick_sched_core::ZONE_RECORDS as u32 - 3) / 2,
+        generation: 7,
+    });
+    let readable = object_wait_key(last, pipe::WaitFor::Readable).unwrap();
+    let writable = object_wait_key(last, pipe::WaitFor::Writable).unwrap();
+    assert_eq!(readable.index(), carrick_sched_core::ZONE_RECORDS as u32 - 3);
+    assert_eq!(writable.index(), carrick_sched_core::ZONE_RECORDS as u32 - 2);
+    assert_eq!(readable.generation(), 8);
+    assert_eq!(writable.generation(), 8);
+
+    let outside = IpcObjectHandle::from_raw(RawIpcObject {
+        index: last.index() + 1,
+        generation: 7,
+    });
+    assert!(object_wait_key(outside, pipe::WaitFor::Readable).is_none());
+    assert!(object_wait_key(outside, pipe::WaitFor::Writable).is_none());
+}
+
 /// The object and description stores are elastic: a region starts with one
 /// published segment of each, an exhausted free list asks the growth venue
 /// for more (`NoObjects` / `NeedsOfds`, never an errno by themselves), a
