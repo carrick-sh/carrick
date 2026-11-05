@@ -208,7 +208,11 @@ impl<
                 TransferStep::Selected(selected) => {
                     let fence = self
                         .revalidate(&continuation, selected, words, slot)?
-                        .ok_or(UserWriteError::Busy)?;
+                        .ok_or_else(|| {
+                            selected.retry().map_or(UserWriteError::Busy, |wait| {
+                                UserWriteError::Owner(MmError::Wait(wait))
+                            })
+                        })?;
                     if let Some(request) = request.as_ref() {
                         let offset = usize::try_from(continuation.offset())
                             .map_err(|_| UserWriteError::InvalidSource)?;
