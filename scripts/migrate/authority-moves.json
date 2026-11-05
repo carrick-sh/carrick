@@ -75,6 +75,11 @@
       "from": "carrick_runtime::el1_census::snapshot",
       "to": "carrick_runtime::el1_census::snapshot_counters",
       "issue": 1394
+    },
+    {
+      "from": "carrick_vmm_hvf::trap::sparse_materialization::<PendingTransferGrant as Drop>::drop",
+      "to": "carrick_vmm_hvf::trap::sparse_materialization::PendingTransferGrant::rollback",
+      "issue": 1677
     }
   ],
   "terminal_custody": []
