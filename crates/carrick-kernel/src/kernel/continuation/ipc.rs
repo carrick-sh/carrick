@@ -665,14 +665,45 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
         prefetch: Vec::new(),
         pending: Vec::new(),
     };
+    let vector_input = region.has_vectors(&token)?;
     if op.kind == IpcOpKind::PipeWrite {
-        let va = op.buf.0.wrapping_add(op.progress.written);
-        user.prefetch(va, (op.progress.remaining() as u64).min(HOST_STEP_BYTES));
+        let length = (op.progress.remaining() as u64).min(HOST_STEP_BYTES);
+        if vector_input {
+            // Gather the imported source before acquiring the pipe lock. The
+            // logical prefix is independent of descriptor reuse or mutation.
+            let mut bytes = vec![0; length as usize];
+            let copied = region.copy_vector_input(
+                &token,
+                op.progress.written,
+                &mut bytes,
+                |dst, address| {
+                    user.prefetch(address.0, dst.len() as u64);
+                    let available = user.prefetch.len().min(dst.len());
+                    dst[..available].copy_from_slice(&user.prefetch[..available]);
+                    available
+                },
+            )?;
+            bytes.truncate(copied);
+            user.prefetch = bytes;
+            user.prefetch_va = op.progress.written;
+        } else {
+            let va = op.buf.0.wrapping_add(op.progress.written);
+            user.prefetch(va, length);
+        }
     }
     let (status, published) = {
         let mut guard = region.lock(object, &HostIpcWait)?;
         let mut copy = PrefixCopy::new(&mut user);
-        let (status, wake_set) = transfer(&mut guard, &mut op, &mut copy)?;
+        let (status, wake_set) = if vector_input {
+            carrick_el1::substrate::ipc::transfer_with_input(
+                &mut guard,
+                &mut op,
+                &mut copy,
+                |copy, at, dst| copy.copy_in(dst, at),
+            )?
+        } else {
+            transfer(&mut guard, &mut op, &mut copy)?
+        };
         (status, guard.publish(wake_set))
     };
     let (landed, effect) = user.land();

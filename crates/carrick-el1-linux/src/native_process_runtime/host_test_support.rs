@@ -211,7 +211,17 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
             .ok_or(NativeProcessError::Stale)?;
         self.zone.spaces.close(old);
         self.zone.release_space(slot);
-        self.zone.spaces.free(old);
+        // Production forks publish MM notification sources. Retire that exact
+        // source through its release venue before recycling the predecessor;
+        // source-free fixtures follow the same terminal entry transition.
+        self.zone
+            .space_entry(predecessor.mm.raw())
+            .ok_or(NativeProcessError::Stale)?
+            .retire_entry(
+                crate::sched::object_wait::space_access(self.zone, slot)
+                    .venue()
+                    .ok_or(NativeProcessError::Stale)?,
+            );
         self.zone.spaces.open(new);
         self.zone
             .install_space(slot, successor.mm.raw().get())

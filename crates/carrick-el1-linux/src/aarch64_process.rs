@@ -312,150 +312,162 @@ fn resume_production_with(
     ) -> crate::sched::ResumeAction,
 ) -> crate::sched::ResumeAction {
     let Some(runtime) = registry().for_record(zone, zone.record_ref(record)) else {
-        let rec = zone.record(record);
-        if matches!(
-            rec.resume_disposition(),
-            carrick_sched_core::object_wait::ResumeDisposition::OwnerContinuation(_)
-        ) {
-            // SAFETY: this exact record is selected by the execution owner.
-            unsafe {
-                rec.consume_owner_continuation();
-            }
-            let _ = zone.release_current(slot, record, &carrick_sched_core::ShortLockSpin);
-            return crate::sched::ResumeAction::Left;
-        }
-        let lifecycle = {
-            #[cfg(target_os = "none")]
-            {
-                task.lifecycle_refs()
-            }
-            #[cfg(not(target_os = "none"))]
-            {
-                let id = rec.identity();
-                (id.lifecycle_page != 0 && id.control_slot != 0).then(|| {
-                    // SAFETY: a live zone record in host tests retains its
-                    // published lifecycle page and control slot.
-                    unsafe {
-                        (
-                            &*(id.lifecycle_page as *const ThreadLifecyclePage),
-                            &*(id.control_slot as *const ThreadControlSlot),
-                        )
-                    }
-                })
-            }
-        };
-        let cancelled_on_slot = rec.is_cancelled()
-            || (!rec.has_adapter_operation()
-                && lifecycle.is_some_and(|(page, control)| {
-                    control.host_exit_requested()
-                        || control
-                            .host_birth_identity()
-                            .is_some_and(|birth| page.host_birth_requested(birth))
-                }));
-        // SAFETY: this exact record is selected by the execution owner.
-        unsafe {
-            rec.consume_metadata_operation();
-        }
-        if cancelled_on_slot {
-            let binding = common_entry::execution_binding(task);
-            let source = BornInZoneSource { zone, slot };
-            let hand_back = || {
-                if carrick_core::entry::yield_current_to_host(binding, source, record).is_none() {
-                    // An adapter operation cannot be released by the lifecycle
-                    // owner. Keep its exact token and queue it for host service.
-                    let _ = zone.unswitch(slot, record);
-                }
-            };
-            let Some((page, control)) = lifecycle else {
-                // An unregistered cancelled record can predate lifecycle
-                // publication. Preserve it for its host owner without minting
-                // terminal authority from missing lifecycle references.
-                hand_back();
-                task.linux.mark_pending_host_work();
-                return crate::sched::ResumeAction::Left;
-            };
-            let identity = carrick_core::terminal::ThreadTerminalIdentity::from_exit(
-                binding,
-                control.entry(),
-                // This custody only orders membership and record release; it
-                // never publishes a status verdict. The host retains status.
-                carrick_sched_core::process::TerminationStatus::SUCCESS,
-            )
-            .unwrap_or_else(|| fatal());
-            let custody = carrick_core::terminal::TerminalCustody::<
-                carrick_core::terminal::Thread,
-                carrick_core::terminal::Live,
-            >::admitted(identity)
-            .begin();
-            match custody.reserve_member(page, control) {
-                Ok((custody, mut membership)) => {
-                    // The neutral owner commits exact terminal intent at the
-                    // physical release seam, before a queued DirectLoad can
-                    // observe the saved record's absence.
-                    match custody.retire_zone_current(
-                        control,
-                        &mut membership,
-                        binding,
-                        source,
-                        record,
-                    ) {
-                        Ok(_) => {
-                            if let Some(entry) = control.entry() {
-                                carrick_core::lifecycle::retire_cancelled_pool_member(
-                                    page, entry, control, membership,
-                                )
-                                .unwrap_or_else(|_| fatal());
-                            } else {
-                                membership.publish();
-                            }
-                            task.linux.mark_native_terminal_work(slot);
-                        }
-                        Err(_) => hand_back(),
-                    }
-                    // Refusal includes CurrentRelease::Requeued (#685): no
-                    // terminal commit ran. Drop restores the reserved unit;
-                    // the adapter operation and its record stay host-owned.
-                }
-                Err((_, error)) => {
-                    use carrick_core::lifecycle::MemberMembershipError;
-                    use carrick_core::terminal::LosingMemberSettlement;
-                    match error {
-                        MemberMembershipError::AlreadyTerminal => {
-                            match carrick_core::terminal::settle_losing_zone_current(
-                                control, binding, source, record,
-                            ) {
-                                Some(LosingMemberSettlement::Released(_)) => {
-                                    task.linux.mark_native_terminal_work(slot);
-                                }
-                                None => {}
-                                Some(LosingMemberSettlement::HostCustody) => {
-                                    // Defensive against terminal evidence
-                                    // disappearing between admission and
-                                    // settlement. Production raw exit commits
-                                    // ZoneRetirement before ABI publication,
-                                    // so its ABI rollback cannot remove that
-                                    // evidence. Never free on this fallback.
-                                    hand_back();
-                                }
-                            }
-                        }
-                        // A preparing host owner or final process member owns
-                        // the next transition. Preserve its record for host
-                        // service rather than releasing without terminal proof.
-                        MemberMembershipError::InFlight | MemberMembershipError::Floor => {
-                            hand_back();
-                        }
-                        MemberMembershipError::InvalidMember => fatal(),
-                    }
-                }
-            }
-            task.linux.mark_pending_host_work();
-            return crate::sched::ResumeAction::Left;
-        }
-        return crate::sched::ResumeAction::NoPending;
+        return resume_unregistered(zone, task, slot, record);
     };
     let source = BornInZoneSource { zone, slot };
     run_registered(&runtime, source)
+}
+
+// A registry miss has terminal membership custody; registered service resume
+// must not retain that branch's aggregate locals through physical application.
+#[cfg(any(
+    test,
+    feature = "host-test",
+    all(target_os = "none", target_arch = "aarch64")
+))]
+#[inline(never)]
+fn resume_unregistered(
+    zone: &'static ZoneTables<Aarch64ParkedContext>,
+    task: &'static CurrentTask,
+    slot: SlotId,
+    record: RecordId,
+) -> crate::sched::ResumeAction {
+    let rec = zone.record(record);
+    if matches!(
+        rec.resume_disposition(),
+        carrick_sched_core::object_wait::ResumeDisposition::OwnerContinuation(_)
+    ) {
+        // SAFETY: this exact record is selected by the execution owner.
+        unsafe {
+            rec.consume_owner_continuation();
+        }
+        let _ = zone.release_current(slot, record, &carrick_sched_core::ShortLockSpin);
+        return crate::sched::ResumeAction::Left;
+    }
+    let lifecycle = {
+        #[cfg(target_os = "none")]
+        {
+            task.lifecycle_refs()
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            let id = rec.identity();
+            (id.lifecycle_page != 0 && id.control_slot != 0).then(|| {
+                // SAFETY: a live zone record in host tests retains its
+                // published lifecycle page and control slot.
+                unsafe {
+                    (
+                        &*(id.lifecycle_page as *const ThreadLifecyclePage),
+                        &*(id.control_slot as *const ThreadControlSlot),
+                    )
+                }
+            })
+        }
+    };
+    let cancelled_on_slot = rec.is_cancelled()
+        || (!rec.has_adapter_operation()
+            && lifecycle.is_some_and(|(page, control)| {
+                control.host_exit_requested()
+                    || control
+                        .host_birth_identity()
+                        .is_some_and(|birth| page.host_birth_requested(birth))
+            }));
+    // SAFETY: this exact record is selected by the execution owner.
+    unsafe {
+        rec.consume_metadata_operation();
+    }
+    if cancelled_on_slot {
+        let binding = common_entry::execution_binding(task);
+        let source = BornInZoneSource { zone, slot };
+        let hand_back = || {
+            if carrick_core::entry::yield_current_to_host(binding, source, record).is_none() {
+                // An adapter operation cannot be released by the lifecycle
+                // owner. Keep its exact token and queue it for host service.
+                let _ = zone.unswitch(slot, record);
+            }
+        };
+        let Some((page, control)) = lifecycle else {
+            // An unregistered cancelled record can predate lifecycle
+            // publication. Preserve it for its host owner without minting
+            // terminal authority from missing lifecycle references.
+            hand_back();
+            task.linux.mark_pending_host_work();
+            return crate::sched::ResumeAction::Left;
+        };
+        let identity = carrick_core::terminal::ThreadTerminalIdentity::from_exit(
+            binding,
+            control.entry(),
+            // This custody only orders membership and record release; it
+            // never publishes a status verdict. The host retains status.
+            carrick_sched_core::process::TerminationStatus::SUCCESS,
+        )
+        .unwrap_or_else(|| fatal());
+        let custody = carrick_core::terminal::TerminalCustody::<
+            carrick_core::terminal::Thread,
+            carrick_core::terminal::Live,
+        >::admitted(identity)
+        .begin();
+        match custody.reserve_member(page, control) {
+            Ok((custody, mut membership)) => {
+                // The neutral owner commits exact terminal intent at the
+                // physical release seam, before a queued DirectLoad can
+                // observe the saved record's absence.
+                match custody.retire_zone_current(control, &mut membership, binding, source, record)
+                {
+                    Ok(_) => {
+                        if let Some(entry) = control.entry() {
+                            carrick_core::lifecycle::retire_cancelled_pool_member(
+                                page, entry, control, membership,
+                            )
+                            .unwrap_or_else(|_| fatal());
+                        } else {
+                            membership.publish();
+                        }
+                        task.linux.mark_native_terminal_work(slot);
+                    }
+                    Err(_) => hand_back(),
+                }
+                // Refusal includes CurrentRelease::Requeued (#685): no
+                // terminal commit ran. Drop restores the reserved unit;
+                // the adapter operation and its record stay host-owned.
+            }
+            Err((_, error)) => {
+                use carrick_core::lifecycle::MemberMembershipError;
+                use carrick_core::terminal::LosingMemberSettlement;
+                match error {
+                    MemberMembershipError::AlreadyTerminal => {
+                        match carrick_core::terminal::settle_losing_zone_current(
+                            control, binding, source, record,
+                        ) {
+                            Some(LosingMemberSettlement::Released(_)) => {
+                                task.linux.mark_native_terminal_work(slot);
+                            }
+                            None => {}
+                            Some(LosingMemberSettlement::HostCustody) => {
+                                // Defensive against terminal evidence
+                                // disappearing between admission and
+                                // settlement. Production raw exit commits
+                                // ZoneRetirement before ABI publication,
+                                // so its ABI rollback cannot remove that
+                                // evidence. Never free on this fallback.
+                                hand_back();
+                            }
+                        }
+                    }
+                    // A preparing host owner or final process member owns
+                    // the next transition. Preserve its record for host
+                    // service rather than releasing without terminal proof.
+                    MemberMembershipError::InFlight | MemberMembershipError::Floor => {
+                        hand_back();
+                    }
+                    MemberMembershipError::InvalidMember => fatal(),
+                }
+            }
+        }
+        task.linux.mark_pending_host_work();
+        return crate::sched::ResumeAction::Left;
+    }
+    crate::sched::ResumeAction::NoPending
 }
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]

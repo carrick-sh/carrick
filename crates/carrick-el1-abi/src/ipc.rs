@@ -86,6 +86,9 @@
 //! Guest page size for pipe accounting is [`IPC_PIPE_PAGE_SIZE`] (Linux
 //! aarch64 4 KiB pages, `carrick_abi::LINUX_PAGE_SIZE`).
 
+mod vectors;
+pub use vectors::{IPC_MAX_IOVECS, VectorImportError};
+
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -130,9 +133,9 @@ pub const IPC_PIPE_PAGE_SIZE: usize = 4096;
 /// Alignment of every pool extent (a pipe ring starts on a guest page).
 pub const IPC_POOL_ALIGN: u64 = IPC_PIPE_PAGE_SIZE as u64;
 const IPC_DESCRIPTOR_STORAGE_NODES: usize = (crate::EL1_IPC_POOL_SPAN / IPC_POOL_ALIGN) as usize;
-/// Region magic: "CRKIPC" + ABI version 5 (elastic object and description
-/// stores, three-level host wake index, zone epoll records).
-pub const IPC_MAGIC: u64 = u64::from_le_bytes(*b"CRKIPC\x00\x05");
+/// Region magic: "CRKIPC" + ABI version 6 (operation-owned vector input
+/// receipts alongside elastic object/description stores and zone epoll).
+pub const IPC_MAGIC: u64 = u64::from_le_bytes(*b"CRKIPC\x00\x06");
 const IPC_READY: u64 = 1;
 /// Leaf words of the owed-host-wake index: one bit per object.
 const HOST_WAKE_LEAF_WORDS: usize = IPC_MAX_OBJECTS / 64;
@@ -576,6 +579,7 @@ const LAYOUT_FACTS: &[u64] = &[
     HOST_WAKE_MID_WORDS as u64,
     HOST_WAKE_LEAF_WORDS as u64,
     core::mem::offset_of!(IpcOperationSlot, op) as u64,
+    core::mem::offset_of!(IpcOperationSlot, custody) as u64,
     IPC_RING_STOCK as u64,
     IPC_POOL_AREAS,
     IPC_STOCK_RING_BYTES,
@@ -598,12 +602,14 @@ const LAYOUT_FACTS: &[u64] = &[
 pub const IPC_LAYOUT_HASH: u64 = {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let mut i = 0;
-    let n = LAYOUT_FACTS.len() + fd::LAYOUT_FACTS.len();
+    let n = LAYOUT_FACTS.len() + fd::LAYOUT_FACTS.len() + vectors::VECTOR_LAYOUT.len();
     while i < n {
         let mut word = if i < LAYOUT_FACTS.len() {
             LAYOUT_FACTS[i]
-        } else {
+        } else if i < LAYOUT_FACTS.len() + fd::LAYOUT_FACTS.len() {
             fd::LAYOUT_FACTS[i - LAYOUT_FACTS.len()]
+        } else {
+            vectors::VECTOR_LAYOUT[i - LAYOUT_FACTS.len() - fd::LAYOUT_FACTS.len()]
         };
         let mut b = 0;
         while b < 8 {
@@ -815,7 +821,7 @@ impl IpcOpToken {
 pub struct IpcOperationSlot {
     generation: AtomicU32,
     live: AtomicU32,
-    next_free: AtomicU64,
+    custody: vectors::SlotCustody,
     op: UnsafeCell<IpcOperation>,
 }
 /// One provisioned ring waiting in the stock (pool extent of a default
@@ -980,7 +986,7 @@ impl<'a> IpcRegion<'a> {
             push(&d.ring_stock_empty, i, &d.ring_stock[i].next_free);
         }
         for i in (0..IPC_OPERATIONS).rev() {
-            push(&d.free_operations, i, &d.operations[i].next_free);
+            push(&d.free_operations, i, d.operations[i].custody.free_link());
         }
         for i in (0..epoll::IPC_EPOLL_ITEMS).rev() {
             let item = region.epoll_item_at(i).ok_or(IpcError::Corrupt)?;
@@ -1825,13 +1831,15 @@ impl<'a> IpcRegion<'a> {
     pub fn begin_operation(&self, op: IpcOperation) -> Result<IpcOpToken, IpcError> {
         let ops = &self.dir.operations;
         let index = pop(&self.dir.free_operations, |i| {
-            ops.get(i).map(|o| o.next_free.load(Ordering::Relaxed))
+            ops.get(i)
+                .map(|o| o.custody.free_link().load(Ordering::Relaxed))
         })
         .ok_or(IpcError::NoOperations)?;
         let slot = &ops[index];
         // SAFETY: the slot was just popped from the free list: no token
         // names it, so this caller is its only accessor.
         unsafe { *slot.op.get() = op };
+        slot.custody.clear_live();
         slot.live.store(1, Ordering::Release);
         Ok(IpcOpToken {
             index: index as u32,
@@ -1865,6 +1873,7 @@ impl<'a> IpcRegion<'a> {
         let slot = self.op_slot(&token)?;
         // SAFETY: the token's owner is the slot's only accessor.
         let op = unsafe { *slot.op.get() };
+        self.reclaim_vectors(slot)?;
         slot.live.store(0, Ordering::Relaxed);
         let next = token.generation.wrapping_add(1);
         slot.generation.store(next, Ordering::Release);
@@ -1872,7 +1881,7 @@ impl<'a> IpcRegion<'a> {
             push(
                 &self.dir.free_operations,
                 token.index as usize,
-                &slot.next_free,
+                slot.custody.free_link(),
             );
             // The slot is visible before the release revision advances. Every
             // venue must publish through its exact carrier completion owner.

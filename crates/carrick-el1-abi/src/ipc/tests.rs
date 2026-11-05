@@ -1382,3 +1382,56 @@ fn el1_ipc_pool_areas_are_type_stable() {
         Err(IpcError::BadStorage)
     );
 }
+
+#[test]
+fn imported_vectors_scale_and_reclaim_with_the_operation_slot() {
+    for count in [1, 8, IPC_MAX_IOVECS] {
+        let fx = fixture(1 << 20);
+        let token = fx.region.begin_operation(IpcOperation::EMPTY).unwrap();
+        let mut reads = 0;
+        let mut expected = Vec::new();
+        for index in 0..count {
+            expected.extend(core::iter::repeat_n(index as u8, index % 4));
+        }
+        let total = fx
+            .region
+            .import_vectors(&token, count, |index, header| {
+                reads += 1;
+                header[..8].copy_from_slice(&(index as u64 * 4096).to_ne_bytes());
+                header[8..].copy_from_slice(&((index % 4) as u64).to_ne_bytes());
+                true
+            })
+            .unwrap();
+        assert_eq!(reads, count, "one import per header");
+        assert_eq!(total as usize, expected.len());
+        assert_eq!(fx.region.descriptor_allocations(), 1);
+        let mut actual = std::vec![0; expected.len()];
+        let mut copies = 0;
+        let copied = fx
+            .region
+            .copy_vector_input(&token, 0, &mut actual, |dst, address| {
+                copies += 1;
+                dst.fill((address.0 / 4096) as u8);
+                dst.len()
+            })
+            .unwrap();
+        assert_eq!(copied, expected.len());
+        assert_eq!(actual, expected);
+        assert!(copies <= count, "linear payload pieces");
+        if !expected.is_empty() {
+            let mut suffix = std::vec![0; expected.len() - 1];
+            fx.region
+                .copy_vector_input(&token, 1, &mut suffix, |dst, address| {
+                    dst.fill((address.0 / 4096) as u8);
+                    dst.len()
+                })
+                .unwrap();
+            assert_eq!(suffix, expected[1..]);
+        }
+        fx.region.finish_operation(token, || {}).unwrap();
+        assert_eq!(fx.region.descriptor_allocations(), 0);
+        let reused = fx.region.begin_operation(IpcOperation::EMPTY).unwrap();
+        assert!(!fx.region.has_vectors(&reused).unwrap());
+        fx.region.finish_operation(reused, || {}).unwrap();
+    }
+}

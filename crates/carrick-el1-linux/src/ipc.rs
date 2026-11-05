@@ -38,7 +38,7 @@
 use super::sched::{Sched, Served, ThreadCpu, UserWord};
 use carrick_el1::substrate::file::UserCopy;
 use carrick_el1::substrate::ipc::{
-    PrefixCopy, StepStatus, from_sched_token, to_sched_token, transfer, wait_key,
+    PrefixCopy, StepStatus, from_sched_token, to_sched_token, wait_key,
 };
 use carrick_el1::substrate::sched::object_wait::OperationResumePc;
 pub use carrick_el1_abi::ipc::IPC_HANDBACK_NR;
@@ -376,7 +376,7 @@ pub fn serve_ipc_with_signals<C: ThreadCpu, U: UserWord, M: UserCopy>(
     interrupt: &mut dyn FnMut() -> bool,
 ) -> (IpcServed, bool) {
     let nr = frame.x[8] as usize;
-    if nr != SYS_READ && nr != SYS_WRITE && nr != SYS_EPOLL_PWAIT {
+    if nr != SYS_READ && nr != SYS_WRITE && nr != 66 && nr != SYS_EPOLL_PWAIT {
         return (IpcServed::Forward, false);
     }
     let (token, op, resumed) = match sched.take_object_operation() {
@@ -648,7 +648,20 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
         AccessMode::WriteOnly => !reading,
         AccessMode::Path => false,
     };
-    let count = frame.x[2].min(linux::MAX_RW_COUNT);
+    let vectored = frame.x[8] == 66;
+    if vectored && kind != IpcOpKind::PipeWrite {
+        release_pin(sched, OfdPin::from_raw(op.pin), region);
+        return Admission::Forward;
+    }
+    if vectored && frame.x[2] > carrick_el1_abi::ipc::IPC_MAX_IOVECS as u64 {
+        release_pin(sched, OfdPin::from_raw(op.pin), region);
+        return Admission::Immediate(linux::EINVAL);
+    }
+    let count = if vectored {
+        1
+    } else {
+        frame.x[2].min(linux::MAX_RW_COUNT)
+    };
     let eventfd = matches!(kind, IpcOpKind::EventFdRead | IpcOpKind::EventFdWrite);
     let immediate = if !permitted {
         Some(linux::EBADF)
@@ -677,7 +690,48 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
     op.progress = WriteProgress::new(if eventfd { linux::EVENTFD_WORD } else { count });
     op.value = IpcEventValue(u64::from_ne_bytes(value));
     match region.begin_operation(op) {
-        Ok(token) => Admission::Admitted(token, op),
+        Ok(token) => {
+            if vectored {
+                let imported =
+                    region.import_vectors(&token, frame.x[2] as usize, |index, header| {
+                        frame.x[1]
+                            .checked_add(index as u64 * 16)
+                            .is_some_and(|address| {
+                                PrefixCopy::new(user).copy_in(header, address) == header.len()
+                            })
+                    });
+                let total = match imported {
+                    Ok(total) => total.min(linux::MAX_RW_COUNT),
+                    Err(error) => {
+                        finish(sched, token, region);
+                        return Admission::Immediate(match error {
+                            carrick_el1_abi::ipc::VectorImportError::Invalid => linux::EINVAL,
+                            carrick_el1_abi::ipc::VectorImportError::Fault => {
+                                carrick_syscall_abi::LINUX_EFAULT.guest_retval()
+                            }
+                            carrick_el1_abi::ipc::VectorImportError::NoMemory => {
+                                carrick_syscall_abi::LINUX_ENOMEM.guest_retval()
+                            }
+                            carrick_el1_abi::ipc::VectorImportError::Storage(_) => {
+                                crate::dispatch::invalid_completion(
+                                    crate::dispatch::NativeInvariant::EntryBinding,
+                                )
+                            }
+                        });
+                    }
+                };
+                if total == 0 {
+                    finish(sched, token, region);
+                    return Admission::Immediate(0);
+                }
+                op.progress = WriteProgress::new(total);
+                if region.update_operation(&token, op).is_err() {
+                    finish(sched, token, region);
+                    return Admission::Immediate(carrick_syscall_abi::LINUX_EFAULT.guest_retval());
+                }
+            }
+            Admission::Admitted(token, op)
+        }
         Err(_) => {
             release_pin(sched, OfdPin::from_raw(op.pin), region);
             refuse(sched, IpcLeave::NoOperationRecord)
@@ -806,7 +860,32 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                 );
             }
         };
-        let (status, wake) = match transfer(&mut guard, &mut op, &mut copy) {
+        let vector_input = venue.region.has_vectors(&token).unwrap_or_else(|_| {
+            crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+        });
+        let buf = op.buf.0;
+        let transferred = carrick_el1::substrate::ipc::transfer_with_input(
+            &mut guard,
+            &mut op,
+            &mut copy,
+            |copy, at, dst| {
+                if vector_input {
+                    venue
+                        .region
+                        .copy_vector_input(&token, at, dst, |bytes, address| {
+                            copy.copy_in(bytes, address.0)
+                        })
+                        .unwrap_or_else(|_| {
+                            crate::dispatch::invalid_completion(
+                                crate::dispatch::NativeInvariant::EntryBinding,
+                            )
+                        })
+                } else {
+                    copy.copy_in(dst, buf.wrapping_add(at))
+                }
+            },
+        );
+        let (status, wake) = match transferred {
             Ok(step) => step,
             Err(_) => {
                 drop(guard);
@@ -1564,7 +1643,6 @@ mod tests {
     use carrick_el1_abi::ipc::fd::{Description, StatusFlags};
     use carrick_el1_abi::ipc::{
         End, EventMode, Extent, IPC_POOL_ALIGN, IpcDirectory, IpcPipeStorage, LockWait,
-        descriptor_extent_bytes,
     };
     use carrick_el1_abi::{Counters, El1TaskId, SlotId, ThreadCtx, ThreadIdentity, ZoneTables};
     use core::cell::{Cell, RefCell};
@@ -1751,7 +1829,6 @@ mod tests {
         region: &'static IpcRegion<'static>,
         /// Next free byte of the pool's ring area and descriptor area.
         next: Cell<u64>,
-        next_descriptor: Cell<u64>,
         zone: TestZone,
         task: CurrentTask,
         cpu: FakeCpu,
@@ -1839,9 +1916,6 @@ mod tests {
         cpu.sgis.reserve(4096);
         cpu.asid_invalidations.reserve(4096);
         World {
-            next_descriptor: Cell::new(
-                carrick_el1_abi::ipc::ipc_descriptor_area(pool_len as u64).start,
-            ),
             region: Box::leak(Box::new(region)),
             next: Cell::new(0),
             zone,
@@ -1864,14 +1938,11 @@ mod tests {
         }
         /// A descriptor extent of `capacity` slots, in the descriptor area.
         fn descriptor_extent(&self, capacity: usize) -> Extent {
-            let at = self.next_descriptor.get();
-            self.next_descriptor
-                .set((at + descriptor_extent_bytes(capacity)).next_multiple_of(IPC_POOL_ALIGN));
-            Extent {
-                token: at,
-                capacity: capacity as u64,
-            }
+            self.region
+                .provision_descriptors(capacity, &HostWait)
+                .unwrap()
         }
+
         fn host(&self) -> carrick_el1_abi::ipc::IpcFdAuthority<'static, HostWait> {
             self.region.fd(HostWait)
         }
@@ -2709,6 +2780,78 @@ mod tests {
         let mut f = syscall(SYS_WRITE, wfd, 0x100000, 10000, A_SVC);
         assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 4096));
         assert_eq!(host_calls(&w), 0);
+    }
+
+    #[test]
+    fn el1_ipc_writev_preserves_vector_order_on_a_pipe() {
+        let mut w = world();
+        let t = w.table(w.a_tid);
+        let (r, writer, _) = w.pipe(t, NONBLOCK);
+        w.mem.map(MM, 0x100000, PAGE);
+        w.mem.write(MM, 0x100100, b"1");
+        w.mem.write(MM, 0x100200, b"\n2\n3\n");
+        let headers = [0x100100u64, 1, 0x100200, 5]
+            .into_iter()
+            .flat_map(u64::to_ne_bytes)
+            .collect::<Vec<_>>();
+        w.mem.write(MM, 0x100000, &headers);
+        let mut f = syscall(66, writer, 0x100000, 2, A_SVC);
+        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 6));
+        let mut f = syscall(SYS_READ, r, 0x100300, 6, A_SVC);
+        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 6));
+        assert_eq!(w.mem.read(MM, 0x100300, 6), b"1\n2\n3\n");
+        assert_eq!(host_calls(&w), 0);
+    }
+
+    #[test]
+    fn el1_ipc_writev_atomic_admission_and_import_failure_reclaim_storage() {
+        let mut w = world();
+        let t = w.table(w.a_tid);
+        let (reader, writer, _) = w.pipe(t, NONBLOCK);
+        w.mem.write(MM, 0x100000, &[7; 65535]);
+        let mut fill = syscall(SYS_WRITE, writer, 0x100000, 65535, A_SVC);
+        assert_eq!((w.call(&mut fill), fill.x[0]), (RETURNED, 65535));
+        let baseline = w.region.descriptor_allocations();
+        let headers = [0x100000u64, 1, 0x100000, 1]
+            .into_iter()
+            .flat_map(u64::to_ne_bytes)
+            .collect::<Vec<_>>();
+        w.mem.write(MM, 0x90000, &headers);
+        let mut vector = syscall(66, writer, 0x90000, 2, A_SVC);
+        assert_eq!(
+            (w.call(&mut vector), vector.x[0] as i64),
+            (RETURNED, linux::EAGAIN)
+        );
+        assert_eq!(w.region.descriptor_allocations(), baseline);
+        // The aggregate two-byte write cannot publish a one-byte prefix.
+        w.mem.map(MM, 0x200000, 65536);
+        let mut read = syscall(SYS_READ, reader, 0x200000, 65536, A_SVC);
+        assert_eq!((w.call(&mut read), read.x[0]), (RETURNED, 65535));
+        w.mem.write(MM, 0x90ff0, &headers[..16]);
+        for (address, count, errno) in [
+            (0xdead0000, 1, -14),
+            (0x90ff0, 2, -14),
+            (0x90000, 1025, -22),
+        ] {
+            let mut f = syscall(66, writer, address, count, A_SVC);
+            assert_eq!((w.call(&mut f), f.x[0] as i64), (RETURNED, errno));
+            assert_eq!(w.region.descriptor_allocations(), baseline);
+        }
+        let overflow = [0u64, i64::MAX as u64, 0, 1]
+            .into_iter()
+            .flat_map(u64::to_ne_bytes)
+            .collect::<Vec<_>>();
+        w.mem.write(MM, 0x90000, &overflow);
+        let mut f = syscall(66, writer, 0x90000, 2, A_SVC);
+        assert_eq!((w.call(&mut f), f.x[0] as i64), (RETURNED, -22));
+        assert_eq!(w.region.descriptor_allocations(), baseline);
+        w.host_close(t, writer);
+        let mut f = syscall(SYS_READ, reader, 0x200000, 1, A_SVC);
+        assert_eq!(
+            (w.call(&mut f), f.x[0]),
+            (RETURNED, 0),
+            "no leaked pin keeps the writer alive"
+        );
     }
 
     #[test]
@@ -4020,6 +4163,15 @@ mod tests {
     /// resumes from it: B reads every byte exactly once, all in the guest.
     #[test]
     fn el1_ipc_io_large_write_suspends_without_replay() {
+        large_pipe_write(false);
+    }
+
+    #[test]
+    fn el1_ipc_writev_park_retains_imported_headers_and_exact_progress() {
+        large_pipe_write(true);
+    }
+
+    fn large_pipe_write(vectored: bool) {
         let mut w = world();
         let a = w.table(w.a_tid);
         let (r, wfd, _) = w.pipe(a, BLOCK);
@@ -4036,8 +4188,24 @@ mod tests {
         // Harness statics allocate on first lock (macOS); not kernel work.
         carrick_test_support::guest_user::warm();
         let allocs = allocations();
-        let mut f = syscall(SYS_WRITE, wfd, 0x100000, total as u64, A_SVC);
+        let baseline_storage = w.region.descriptor_allocations();
+        let mut f = if vectored {
+            let headers = [0x100000u64, 65537, 0, 0, 0x110001, total as u64 - 65537]
+                .into_iter()
+                .flat_map(u64::to_ne_bytes)
+                .collect::<Vec<_>>();
+            w.mem.write(MM, 0x90000, &headers);
+            syscall(66, wfd, 0x90000, 3, A_SVC)
+        } else {
+            syscall(SYS_WRITE, wfd, 0x100000, total as u64, A_SVC)
+        };
         assert_eq!(w.call(&mut f), SWITCHED, "A writes 64 KiB and parks");
+        if vectored {
+            assert_eq!(w.region.descriptor_allocations(), baseline_storage + 1);
+            // A sibling can mutate the user array while the writer is asleep.
+            // The retained operation must never import this replacement.
+            w.mem.write(MM, 0x90000, &[0; 48]);
+        }
         assert_eq!(f.elr, B_SVC);
         f = b_read;
         let mut a_result = None;
@@ -4077,10 +4245,13 @@ mod tests {
                 }
             }
         }
+        assert_eq!(w.region.descriptor_allocations(), baseline_storage);
         assert_eq!(received, source, "no byte replayed or lost");
         assert_eq!(a_result, Some(total as u64), "write returns its full count");
         assert!(b_turns >= 3);
-        assert_eq!(allocations() - allocs, 0);
+        if !vectored {
+            assert_eq!(allocations() - allocs, 0);
+        }
         assert_eq!(host_calls(&w), 0);
     }
 
