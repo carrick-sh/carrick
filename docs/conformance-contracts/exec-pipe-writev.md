@@ -34,3 +34,12 @@ Signed Alpine command substitution, same-source native ARM Docker comparison,
 and signed artifact promotion remain higher-layer acceptance requirements.
 Eventfd vector I/O and vector reads retain their existing routing; this slice
 implements pipe vector writes.
+
+Vector import rejects nonempty payload ranges that overflow, exceed the
+48-bit guest address envelope, or overlap the reserved EL1 window before
+transferring any pipe bytes. This is address-range admission, not a page
+presence probe: an unmapped but representable later segment still permits
+the ordinary delivered prefix. Empty segments never dereference their base.
+The production dispatcher witness
+`el1_ipc_writev_invalid_payload_range_has_no_pipe_effects` requires errno 14,
+an empty nonblocking pipe and exact storage reclamation after each rejection.

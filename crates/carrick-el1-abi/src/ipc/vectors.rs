@@ -168,6 +168,16 @@ impl IpcRegion<'_> {
                 .checked_add(len)
                 .filter(|sum| *sum <= i64::MAX as u64)
                 .ok_or(VectorImportError::Invalid)?;
+            // Range admission precedes every pipe effect, including effects
+            // from earlier vectors. This does not probe page presence: a
+            // representable unmapped segment still faults during transfer and
+            // preserves the delivered prefix. Empty vectors ignore their base.
+            if len != 0
+                && (base.checked_add(len).is_none_or(|end| end > (1u64 << 48))
+                    || crate::user_range_overlaps_el1_kernel(base, len as usize))
+            {
+                return Err(VectorImportError::Fault);
+            }
             let vector = Vector {
                 base: IpcUserVa(base),
                 len,
