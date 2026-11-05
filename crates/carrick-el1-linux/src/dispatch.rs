@@ -733,10 +733,16 @@ fn unclaimed_native_syscall(
 /// Answer an unclaimed native syscall with a counted ENOSYS in ring.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 fn refuse_unclaimed_native_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
-    let nr = frame.x[8] as usize;
-    if nr < 512 {
-        counters.refused[nr].fetch_add(1, Ordering::Relaxed);
-        counters.served[nr].fetch_add(1, Ordering::Relaxed);
+    let ordinal = carrick_guest_arch::NativeOrdinal::new(frame.x[8]);
+    // Only CountedEnosys reaches this boundary: its admitted owner is a
+    // fork child, including an exec successor with the same lineage.
+    counters.record_refusal(
+        ordinal,
+        carrick_core_abi::service::ServiceOrigin::Descendant,
+        carrick_el1_abi::RefusalVenue::Ring,
+    );
+    if let Some(served) = counters.served.get(ordinal.raw() as usize) {
+        served.fetch_add(1, Ordering::Relaxed);
     }
     frame.x[0] = carrick_syscall_abi::LINUX_ENOSYS.guest_retval() as u64;
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -4768,6 +4774,8 @@ mod tests {
         );
         assert_eq!(frame.x[0] as i64, -38);
         assert_eq!(counters.refused[451].load(Ordering::Relaxed), 1);
+        assert_eq!(counters.refused_child[451].load(Ordering::Relaxed), 1);
+        assert_eq!(counters.venue_refused[451].load(Ordering::Relaxed), 0);
         assert_eq!(counters.served[451].load(Ordering::Relaxed), 1);
 
         // A root or unadmitted task keeps its crossing; nothing is counted.

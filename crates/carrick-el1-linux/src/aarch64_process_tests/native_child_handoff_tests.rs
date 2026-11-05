@@ -1808,6 +1808,18 @@ fn namespace_baseline(
             );
         }
         assert_eq!(counters.refused[nr as usize].load(Ordering::Relaxed), 2);
+        assert_eq!(
+            counters.refused_child[nr as usize].load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            counters.venue_refused[nr as usize].load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            counters.venue_refused_child[nr as usize].load(Ordering::Relaxed),
+            0
+        );
         assert_eq!(counters.served[nr as usize].load(Ordering::Relaxed), 2);
     }
 }

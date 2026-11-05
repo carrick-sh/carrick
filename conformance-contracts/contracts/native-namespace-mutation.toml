@@ -6,7 +6,7 @@ semantic_authority = ["man 2 mkdirat", "man 2 unlinkat", "man 2 renameat", "man 
 fixture = "unit:native_namespace_mutation_baseline_two_live_children"
 scale_points = [1, 2]
 structural_budgets = []
-rationale = "A native child has no host task. Typed operations must retain its exact task, execution, file-table generation, fs context and credentials. One admitted operation may commit at most one mutation and one terminal reply, with zero effects before admission. Busy retains that same operation on the existing release notification. Slice 1 measures the missing service: each of two real fork children receives errno 38 once per ordinal, counted once as served and refused, with no carrier notice. Those assertions describe a defect baseline, not Linux conformance or a numerical budget for a future implementation."
+rationale = "A native child has no host task. Typed operations must retain its exact task, execution, file-table generation, fs context and credentials. One admitted operation may commit at most one mutation and one terminal reply, with zero effects before admission. Busy retains that same operation on the existing release notification. Slice 1 measures the missing service: each of two real fork children receives errno 38 once per ordinal, counted once as served and refused in the descendant ring population, with zero carrier refusals and no carrier notice. Those assertions describe a defect baseline, not Linux conformance or a numerical budget for a future implementation."
 
 [bindings]
 vm_free = [

@@ -22,6 +22,9 @@ vm_free = [
   "carrick-el1-linux::native_process_runtime::host_test_support::root_exec_access_refusal_is_counted_before_service_publication",
   "carrick-el1-linux::dispatch::tests::native_host_file_staging_refusal_is_counted_once",
   "carrick-el1-linux::native_process_runtime::host_test_support::{host_request_during_service_park_yields_then_reparks,host_request_during_owner_wait_park_yields_then_reparks} (#1467: a park refused by a concurrent host request is contention, not a refusal: no NativeServiceQuarantined fatal and no new service notice; the existing notice completes after the repark; VM-free only)",
+  "carrick-el1-linux::aarch64_process_tests::native_child_handoff_tests::native_namespace_mutation_baseline_two_live_children",
+  "carrick-el1-linux::native_process_runtime::host_test_support::native_namespace_mutation_baseline_exec_successor",
+  "carrick-el1-linux::dispatch::tests::native_fork_child_unclaimed_syscall_is_refused_before_any_crossing",
 ]
 embed = [
   "carrick-embed::smoke_signed::smoke_terminal_census_precedes_pool_shutdown_for_two_carriers",

@@ -3424,11 +3424,13 @@ fn native_parent_reaps_then_execs_a_child_after_slot_reuse() {
     parent_reaps_then_execs_child(false);
 }
 
+#[cfg(test)]
 #[test]
 fn native_namespace_mutation_baseline_exec_successor() {
     parent_reaps_then_execs_child(true);
 }
 
+#[cfg(test)]
 fn parent_reaps_then_execs_child(namespace_census: bool) {
     let capacity = NativeServiceCapacityFixture::new(1);
     let fixture = &capacity.fixture;
@@ -3576,6 +3578,18 @@ fn parent_reaps_then_execs_child(namespace_census: bool) {
             );
             assert_eq!(frame.x[0] as i64, -38, "exec successor ordinal {nr}");
             assert_eq!(counters.refused[nr as usize].load(Ordering::Relaxed), 1);
+            assert_eq!(
+                counters.refused_child[nr as usize].load(Ordering::Relaxed),
+                1
+            );
+            assert_eq!(
+                counters.venue_refused[nr as usize].load(Ordering::Relaxed),
+                0
+            );
+            assert_eq!(
+                counters.venue_refused_child[nr as usize].load(Ordering::Relaxed),
+                0
+            );
             assert_eq!(counters.served[nr as usize].load(Ordering::Relaxed), 1);
             assert!(fixture.task.service_notice.take().unwrap().is_none());
         }
