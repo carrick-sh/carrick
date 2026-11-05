@@ -307,3 +307,41 @@ not admission because effects may be added through an OFD pin outside the
 table lock. Review this receipt interface and UNSHARE's resource publication
 before coding them. The full #1678 allowlist promotion and signed population
 comparison remain blocked on those owners and backed-pipe resizing.
+
+### Capacity-read entry and completion review (#1678)
+
+Review of the proposed read-only operation found an additional integration
+constraint: `El1PendingFamilies::ipc_transfer` currently asks for
+`frame.arm_frame()` and explicitly forwards an x86 frame. Adding fcntl to
+`serve_ipc_with_signals` would therefore leave one ISA behind. The descriptor
+family itself is generic over the guest frame; keep the capacity operation in
+that shared owner and supply its retained scheduling adapter for both clients
+before claiming service. Do not introduce an ARM-only metadata handler as a
+shortcut to the generic descriptor owner.
+
+The reviewed read-only extension may append `PipeCapacityRead = 6` to
+`IpcOpKind` without changing existing discriminants or `IpcOperation` layout.
+The shared substrate's transfer result needs an explicit scalar alternative,
+such as `StepStatus::Value(u64)`. Both the ring and host-continuation settlement
+must return that value directly. `progress.written` must remain zero: otherwise
+signal or cancellation settlement can mistake pipe capacity for delivered bytes.
+
+Two admission details are prerequisites, not optional test coverage:
+
+- `admit` currently derives direction from SYS_READ, validates read/write
+  access and byte count, and releases its pin and forwards on operation-slot
+  exhaustion. Capacity admission must bypass transfer-only checks, retain its
+  exact description through slot exhaustion, and use the attached slot-release
+  source (`admit_operation_wait`). A missing slot cannot become ENOSYS.
+- Resumed IPC operations currently settle signal handback using byte-transfer
+  interruption rules. A metadata operation waiting only for an internal holder
+  must not acquire an EINTR result or a fabricated short transfer. Fatal
+  cancellation still retires its retained operation and pin exactly once.
+
+Independent review accepts these read-only interface principles with no new
+lock order. It does not approve a new wire layout, a resize service, a plain
+range-close receipt, or a completed implementation. Required production-entry
+witnesses remain host-held contention followed by numeric fd reuse, slot
+exhaustion followed by release, both pipe ends, two live children, signal
+arrival during the internal wait, and both ISA adapters. No capacity-read
+runtime implementation or Forward-policy promotion is claimed here.
