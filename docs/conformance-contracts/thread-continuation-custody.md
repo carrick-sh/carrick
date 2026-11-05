@@ -45,3 +45,36 @@ wake authentication uses the same identity lookup. The core
 `continuation_identity_refuses_retired_and_reused_record` witness requires a
 retired reference to stay absent after its slot is reused with a new thread
 birth generation. This adds no scan, park, retry or alternate liveness rule.
+
+## Inotify attribution from the signed review
+
+The reported `inotify_lifecycle::case_inotify_watch_churn` failure in signed
+run [41957499054](https://github.com/carrick-sh/carrick/actions/runs/41957499054)
+does not exercise continuation custody. In its `signed-result-1` artifact,
+`steps/0af17cd/probe-cases.log:105-106` records the panic at
+`tests/common/mod.rs:531`: `container: container run failed: image resolution
+failed: failed to resolve image: OCI registry operation failed: error sending
+request for url`, followed by the HTTPS localhost:5050 cpython-test manifest
+URL. The test failed in 0.05 seconds while pulling the pinned image.
+
+`carrick-embed/src/builder.rs`, in `Container::prepare`, propagates
+`Engine::resolve` failure as `EmbedError::Image` before preparing or executing
+the guest. The continuation changes therefore cannot be on this failure's
+path. The fixture also creates nonblocking inotify descriptors and drains
+queued records or accepts EAGAIN; it does not wait for an inotify wake. This
+does not claim that all blocking notification operations are independent of
+native task ownership.
+
+The baseline run
+[41950033849](https://github.com/carrick-sh/carrick/actions/runs/41950033849)
+passed the test (`steps/a35575eb/probe-cases.log:414-416`). The same registry
+request failure appears in another recent run,
+[41957509332](https://github.com/carrick-sh/carrick/actions/runs/41957509332),
+at `steps/8f26024/probe-cases.log:72-73`. Runs
+[41957504287](https://github.com/carrick-sh/carrick/actions/runs/41957504287)
+and [41957513818](https://github.com/carrick-sh/carrick/actions/runs/41957513818)
+passed it (`steps/3b2e1e70/probe-cases.log:751` and
+`steps/0f555702/probe-cases.log:772`). This is an image-resolution failure,
+not evidence of a guest wait/wake regression. No continuation workaround or
+new VM-free guest witness is justified by this panic; signed acceptance
+still requires its own complete comparison.
