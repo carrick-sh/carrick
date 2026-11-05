@@ -5822,9 +5822,11 @@ pub(crate) mod tests {
                         .unwrap()
                         .expect("owner wake must reach the registered host executor");
                     if !physical && !fault_wait {
-                        let saved = binding
-                            .take_zone_save()
-                            .expect("owner park saves residency");
+                        let continuation::quantum::TaskCpuSave::Zone(saved) =
+                            binding.take_cpu_save().expect("owner park saves residency")
+                        else {
+                            panic!("owner park must retain its guest record");
+                        };
                         let mut residency = executor::residency::TaskCpuResidency::Zone {
                             base: saved.base,
                             record: saved.record,

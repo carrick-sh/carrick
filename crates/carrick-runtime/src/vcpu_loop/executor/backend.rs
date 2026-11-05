@@ -1376,17 +1376,42 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 ));
             }
         };
-        // A task its job parked in the in-guest zone keeps its registers in
-        // the zone record: never leave it resident on this vCPU (whose
-        // registers may be another thread's by now).
-        let zone_save = self
+        // Zone records and host terminal continuations have explicit save
+        // authority. Neither may remain lazily resident on hardware that EL1
+        // can have switched to another task or the carrier maintenance root.
+        let saved_residency = match self
             .binding
             .as_ref()
-            .and_then(|binding| binding.take_zone_save());
+            .and_then(|binding| {
+                binding.take_cpu_save().map(|save| {
+                    save.into_residency(binding, || engine.snapshot_guest_state_for_publication())
+                })
+            })
+            .transpose()
+        {
+            Ok(saved) => saved,
+            Err(error) => return Err(ExecutorSaveError::new(error, lease)),
+        };
+        if let Some(TaskCpuResidency::Materialized(cpu)) = &saved_residency
+            && let Err(error) = lease.replace_task_state(MigratableTaskState {
+                cpu: cpu.clone(),
+                mm,
+                asid_generation,
+            })
+        {
+            return Err(ExecutorSaveError::new(
+                TrapError::Hypervisor(error.to_string()),
+                lease,
+            ));
+        }
         let metadata = match engine.extract_resident_task_metadata_for_lazy_save() {
             Ok(metadata) => metadata,
             Err(error) => {
-                let cpu = match engine.snapshot_task_state_from_live_executor() {
+                let captured = match &saved_residency {
+                    Some(TaskCpuResidency::Materialized(cpu)) => Ok(cpu.clone()),
+                    _ => engine.snapshot_task_state_from_live_executor(),
+                };
+                let cpu = match captured {
                     Ok(cpu) => cpu,
                     Err(_) => return Err(ExecutorSaveError::new(error, lease)),
                 };
@@ -1406,7 +1431,7 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         // A zone-saved task may resume through the EL1 scheduler, never
         // through this vCPU's syscall return: issue its owed invalidation
         // now. A resident one keeps it for its return here.
-        let owed_invalidation = if zone_save.is_some() {
+        let owed_invalidation = if saved_residency.is_some() {
             if let Err(error) = engine.settle_owed_resume_invalidation() {
                 return Err(ExecutorSaveError::new(error, lease));
             }
@@ -1460,26 +1485,24 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 carrick_vmm_hvf::hvf_aarch64_engine::detach_task_engine(engine, lifecycle);
             (HvpatchTaskEngineBindingState::initial(state), vcpu)
         };
-        if let Some(zone_save) = zone_save {
-            let _ = metadata;
-            backend.set_residency(TaskCpuResidency::Zone {
-                base: zone_save.base,
-                record: zone_save.record,
-                origin: zone_save.origin,
-            });
-            self.resident_task = None;
-            self.residency_generation = self.residency_generation.next();
-        } else {
-            backend.set_residency(TaskCpuResidency::Resident {
-                executor: self.executor_id,
-                generation: self.residency_generation,
-            });
-            self.resident_task = Some(HvpatchResidentTaskRecord {
-                thread: lease.thread_key(),
-                binding: Arc::downgrade(&binding),
-                metadata,
-                owed_invalidation,
-            });
+        match saved_residency {
+            Some(residency) => {
+                backend.set_residency(residency);
+                self.resident_task = None;
+                self.residency_generation = self.residency_generation.next();
+            }
+            None => {
+                backend.set_residency(TaskCpuResidency::Resident {
+                    executor: self.executor_id,
+                    generation: self.residency_generation,
+                });
+                self.resident_task = Some(HvpatchResidentTaskRecord {
+                    thread: lease.thread_key(),
+                    binding: Arc::downgrade(&binding),
+                    metadata,
+                    owed_invalidation,
+                });
+            }
         }
         if let Err(error) = restore_worker_vcpu_before_binding_publication(
             &mut self.vcpu,
