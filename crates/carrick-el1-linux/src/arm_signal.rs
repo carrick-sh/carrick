@@ -352,11 +352,11 @@ impl carrick_guest_arch::ArchTypes for LinuxAarch64Backend {
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl carrick_personality_linux::signal::SignalBackend for LinuxAarch64Backend {
-    fn setup_signal_frame<'a>(
+    fn setup_signal_frame(
         &mut self,
         frame: &mut TrapFrame,
         params: carrick_personality_linux::signal::SignalFrameParams,
-        siginfo: Option<&'a [u8]>,
+        siginfo: Option<&[u8]>,
         _fpstate: &[u8],
         copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
     ) -> Result<UserVa, Self::Error> {
