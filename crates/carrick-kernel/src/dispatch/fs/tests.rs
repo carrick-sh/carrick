@@ -6,6 +6,67 @@ use crate::dispatch::dispatcher::FsCrossSubsystem;
 use std::sync::Arc;
 
 #[test]
+fn proc_self_status_fits_executor_stack() {
+    // Executor workers use Builder::spawn's default 2 MiB stack. Pin that
+    // budget so RUST_MIN_STACK cannot conceal a regression in this witness.
+    std::thread::Builder::new()
+        .name("proc-status-executor".into())
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            let mut dispatcher = SyscallDispatcher::new();
+            let scratch = tempfile::tempdir().unwrap();
+            dispatcher.set_fs_backend(Box::new(
+                carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap(),
+            ));
+            let _root = crate::dispatch::mem::delegated_tests::Root::admit(&dispatcher);
+            let mut memory = LinearMemory::new(0x4000, vec![0; 0x4000]);
+            let reporter = CompatReporter::default();
+            let context = dispatcher.capture_one_task_context().unwrap();
+            let tid = context.thread().registry_id();
+            let registry = crate::thread::ThreadRegistry::new(tid);
+            let futex = crate::thread::FutexTable::new();
+            memory.write_bytes(0x4000, b"/proc/self/status\0").unwrap();
+            let mut call = |nr, args| match dispatcher
+                .dispatch_threaded(
+                    &context,
+                    SyscallRequest::new(nr, SyscallArgs::from(args)),
+                    &mut memory,
+                    &reporter,
+                    ThreadCtx::new(tid, &registry, &futex),
+                )
+                .unwrap()
+            {
+                DispatchOutcome::Returned { value } => value,
+                other => panic!("status syscall {nr}: {other:?}"),
+            };
+            let fd = call(56, [LINUX_AT_FDCWD, 0x4000, LINUX_O_RDONLY, 0, 0, 0]);
+            assert_eq!(call(80, [fd as u64, 0x4800, 0, 0, 0, 0]), 0);
+            let len = call(63, [fd as u64, 0x5000, 0x2000, 0, 0, 0]);
+            assert!(len > 0);
+            assert_eq!(call(57, [fd as u64, 0, 0, 0, 0, 0]), 0);
+            let bytes = memory.read_bytes(0x5000, len as usize).unwrap();
+            let status = String::from_utf8(bytes).unwrap();
+            for line in [
+                "Uid:\t0\t0\t0\t0",
+                "Gid:\t0\t0\t0\t0",
+                "CapInh:\t0000000000000000",
+                "CapPrm:\t00000000a80425fb",
+                "CapEff:\t00000000a80425fb",
+                "CapBnd:\t00000000a80425fb",
+                "CapAmb:\t0000000000000000",
+            ] {
+                assert!(
+                    status.lines().any(|actual| actual == line),
+                    "missing {line}: {status}"
+                );
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn rename_open_descriptions_visits_only_matching_recorded_paths() {
     let dispatcher = SyscallDispatcher::new();
     for i in 0..256 {
