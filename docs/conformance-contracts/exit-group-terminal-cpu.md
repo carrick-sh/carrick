@@ -22,9 +22,11 @@ executor reload is also unsafe: reaffirmation does not restore translation.
 The process terminal now explicitly requests a nonresident save. The binding
 checks the captured MM and strong ASID generation, then obtains both TTBRs
 from its current Stage1MmLease. The executor stores Materialized state and
-replaces the lease's CPU image before detaching. It cannot use the resident
-reaffirmation path. Metadata extraction failure preserves that canonical
-image. Ordinary guest snapshots and both existing load audits are unchanged.
+replaces the lease's CPU image before detaching. Both hardware roots are
+vacated with the existing terminal-root helper before publishing detached
+state: there is no resident record left to perform that retirement later.
+It cannot use the resident reaffirmation path. Metadata extraction failure
+preserves that canonical image. Ordinary guest snapshots and both existing load audits are unchanged.
 Exec drains keep their separate successor path.
 
 The VM-free witness parks the live leader, runs a second real kernel thread,
