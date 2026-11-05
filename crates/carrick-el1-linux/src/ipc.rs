@@ -2804,6 +2804,45 @@ mod tests {
     }
 
     #[test]
+    fn el1_ipc_writev_invalid_payload_range_has_no_pipe_effects() {
+        let mut w = world();
+        let t = w.table(w.a_tid);
+        let (reader, writer, _) = w.pipe(t, NONBLOCK);
+        w.mem.write(MM, 0x100000, b"a");
+        let baseline = w.region.descriptor_allocations();
+        for (base, len) in [
+            (1 << 48, 1),
+            (u64::MAX, 2),
+            ((1 << 48) - 1, 2),
+            (carrick_el1_abi::EL1_REGION_BASE, 1),
+        ] {
+            let headers = [0x100000u64, 1, base, len]
+                .into_iter()
+                .flat_map(u64::to_ne_bytes)
+                .collect::<Vec<_>>();
+            w.mem.write(MM, 0x90000, &headers);
+            let mut f = syscall(66, writer, 0x90000, 2, A_SVC);
+            assert_eq!((w.call(&mut f), f.x[0] as i64), (RETURNED, -14));
+            assert_eq!(w.region.descriptor_allocations(), baseline);
+            let mut f = syscall(SYS_READ, reader, 0x100100, 1, A_SVC);
+            assert_eq!((w.call(&mut f), f.x[0] as i64), (RETURNED, linux::EAGAIN));
+        }
+        // Empty segments ignore even an invalid base.
+        let headers = [0x100000u64, 1, u64::MAX, 0]
+            .into_iter()
+            .flat_map(u64::to_ne_bytes)
+            .collect::<Vec<_>>();
+        w.mem.write(MM, 0x90000, &headers);
+        let mut f = syscall(66, writer, 0x90000, 2, A_SVC);
+        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 1));
+        let mut f = syscall(SYS_READ, reader, 0x100100, 1, A_SVC);
+        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 1));
+        assert_eq!(w.mem.read(MM, 0x100100, 1), b"a");
+        assert_eq!(w.region.descriptor_allocations(), baseline);
+        assert_eq!(host_calls(&w), 0);
+    }
+
+    #[test]
     fn el1_ipc_writev_atomic_admission_and_import_failure_reclaim_storage() {
         let mut w = world();
         let t = w.table(w.a_tid);
@@ -2841,13 +2880,21 @@ mod tests {
             assert_eq!((w.call(&mut f), f.x[0] as i64), (RETURNED, errno));
             assert_eq!(w.region.descriptor_allocations(), baseline);
         }
+        let invalid_length = [0u64, 1u64 << 63]
+            .into_iter()
+            .flat_map(u64::to_ne_bytes)
+            .collect::<Vec<_>>();
+        w.mem.write(MM, 0x90000, &invalid_length);
+        let mut f = syscall(66, writer, 0x90000, 1, A_SVC);
+        assert_eq!((w.call(&mut f), f.x[0] as i64), (RETURNED, -22));
+        assert_eq!(w.region.descriptor_allocations(), baseline);
         let overflow = [0u64, i64::MAX as u64, 0, 1]
             .into_iter()
             .flat_map(u64::to_ne_bytes)
             .collect::<Vec<_>>();
         w.mem.write(MM, 0x90000, &overflow);
         let mut f = syscall(66, writer, 0x90000, 2, A_SVC);
-        assert_eq!((w.call(&mut f), f.x[0] as i64), (RETURNED, -22));
+        assert_eq!((w.call(&mut f), f.x[0] as i64), (RETURNED, -14));
         assert_eq!(w.region.descriptor_allocations(), baseline);
         w.host_close(t, writer);
         let mut f = syscall(SYS_READ, reader, 0x200000, 1, A_SVC);
