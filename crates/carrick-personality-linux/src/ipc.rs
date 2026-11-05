@@ -236,7 +236,7 @@ fn invoke_msg<'a>(
             }
             let text_va = UserVa::new(msgp.raw().wrapping_add(8));
             let mut mtext = alloc::vec![0u8; msgsz];
-            if msgsz > 0 && !native.copy_in(&mut mtext, text_va) {
+            if msgsz > 0 && !native.copy_in(&mut mtext, text_va).is_done() {
                 return ret_errno(LINUX_EFAULT);
             }
             let Some(venue) = native.process_ipc() else {
@@ -270,7 +270,7 @@ fn invoke_msg<'a>(
                 Ok((outcome, Some((original_idx, mtype, data)))) => {
                     let text_va = UserVa::new(msgp.raw().wrapping_add(8));
                     let copy_ok = (&mut native).write_val(msgp, &mtype)
-                        && (data.is_empty() || native.copy_out(text_va, &data));
+                        && (data.is_empty() || native.copy_out(text_va, &data).is_done());
                     if !copy_ok {
                         // Restore message to original position in queue so it is not lost!
                         if let Some(venue) = native.process_ipc() {
@@ -469,6 +469,7 @@ fn invoke_sem<'a>(
                         Ok(val) => {
                             if !native
                                 .copy_out(arg_ptr, zerocopy::IntoBytes::as_bytes(vals.as_slice()))
+                                .is_done()
                             {
                                 return ret_errno(LINUX_EFAULT);
                             }
@@ -493,7 +494,7 @@ fn invoke_sem<'a>(
                     };
                     let byte_len = nsems * core::mem::size_of::<u16>();
                     let mut bytes = alloc::vec![0u8; byte_len];
-                    if !native.copy_in(&mut bytes, arg_ptr) {
+                    if !native.copy_in(&mut bytes, arg_ptr).is_done() {
                         return ret_errno(LINUX_EFAULT);
                     }
                     let vals: Vec<u16> = bytes
@@ -529,7 +530,7 @@ fn invoke_sem<'a>(
             }
             let byte_len = nsops * core::mem::size_of::<LinuxSembuf>();
             let mut bytes = alloc::vec![0u8; byte_len];
-            if !native.copy_in(&mut bytes, sops_ptr) {
+            if !native.copy_in(&mut bytes, sops_ptr).is_done() {
                 return ret_errno(LINUX_EFAULT);
             }
             let Ok(sops) = <[LinuxSembuf] as zerocopy::FromBytes>::ref_from_bytes(&bytes) else {
@@ -801,34 +802,38 @@ mod tests {
     }
 
     impl UserCopy for TestNative<'_> {
-        fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> bool {
+        fn copy_in(
+            &mut self,
+            dst: &mut [u8],
+            src: UserVa,
+        ) -> carrick_core::personality::CopyOutcome {
             let Some(off) = src.raw().checked_sub(self.base_va) else {
-                return false;
+                return carrick_core::personality::CopyOutcome::Fault;
             };
             let off = off as usize;
             let Some(end) = off.checked_add(dst.len()) else {
-                return false;
+                return carrick_core::personality::CopyOutcome::Fault;
             };
             if end > self.guest_mem.len() {
-                return false;
+                return carrick_core::personality::CopyOutcome::Fault;
             }
             dst.copy_from_slice(&self.guest_mem[off..end]);
-            true
+            carrick_core::personality::CopyOutcome::Done
         }
 
-        fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> bool {
+        fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> carrick_core::personality::CopyOutcome {
             let Some(off) = dst.raw().checked_sub(self.base_va) else {
-                return false;
+                return carrick_core::personality::CopyOutcome::Fault;
             };
             let off = off as usize;
             let Some(end) = off.checked_add(src.len()) else {
-                return false;
+                return carrick_core::personality::CopyOutcome::Fault;
             };
             if end > self.guest_mem.len() {
-                return false;
+                return carrick_core::personality::CopyOutcome::Fault;
             }
             self.guest_mem[off..end].copy_from_slice(src);
-            true
+            carrick_core::personality::CopyOutcome::Done
         }
     }
 

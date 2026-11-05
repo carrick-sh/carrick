@@ -172,37 +172,68 @@ impl<'a> Turn<'a> {
     }
 }
 impl UserCopy for Turn<'_> {
-    fn copy_in(&mut self, dst: &mut [u8], address: UserVa) -> bool {
+    fn copy_in(
+        &mut self,
+        dst: &mut [u8],
+        address: UserVa,
+    ) -> carrick_core::personality::CopyOutcome {
         let index = match address.raw() {
             0x1000 => 0,
             0x1004 => 1,
-            _ => return false,
+            _ => return carrick_core::personality::CopyOutcome::Fault,
         };
         if dst.len() != 4 {
-            return false;
+            return carrick_core::personality::CopyOutcome::Fault;
         }
         dst.copy_from_slice(&self.words[index].to_le_bytes());
-        true
+        carrick_core::personality::CopyOutcome::Done
     }
-    fn copy_out(&mut self, address: UserVa, src: &[u8]) -> bool {
+    fn copy_out(&mut self, address: UserVa, src: &[u8]) -> carrick_core::personality::CopyOutcome {
         if self.fail_copy == Some(address.raw()) {
             self.fail_copy = None;
-            return false;
+            return carrick_core::personality::CopyOutcome::Fault;
         }
         let index = match address.raw() {
             0x1000 => 0,
             0x1004 => 1,
-            _ => return false,
+            _ => return carrick_core::personality::CopyOutcome::Fault,
         };
         if src.len() != 4 {
-            return false;
+            return carrick_core::personality::CopyOutcome::Fault;
         }
         self.words[index] = u32::from_le_bytes(src.try_into().unwrap());
         self.clears += u64::from(index == 1);
-        true
+        carrick_core::personality::CopyOutcome::Done
     }
 }
 impl<'a> LifecycleNative<'a> for Turn<'a> {
+    #[allow(clippy::panic)]
+    fn wait_guest_copy(
+        &mut self,
+        _: carrick_core::personality::GuestCopyRequest,
+    ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
+        panic!("eager test venue cannot suspend guest memory")
+    }
+    #[allow(clippy::panic)]
+    fn finish_signal_output(
+        &mut self,
+        address: carrick_guest_arch::UserVa,
+        bytes: Vec<u8>,
+        work: bool,
+    ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
+        let result = match self.copy_out(address, &bytes) {
+            carrick_core::personality::CopyOutcome::Done => 0,
+            carrick_core::personality::CopyOutcome::Fault => -14,
+            carrick_core::personality::CopyOutcome::NotYet(_) => {
+                panic!("eager test venue refused output")
+            }
+        };
+        carrick_personality_linux::lifecycle::LifecycleOutcome::Returned {
+            result: carrick_personality_linux::abi::entry::SyscallResult::new(result),
+            work,
+        }
+    }
+
     fn guest_isa(&self) -> carrick_guest_arch::GuestIsa {
         carrick_guest_arch::GuestIsa::X86_64
     }

@@ -833,6 +833,8 @@ pub trait ProcessContext: Copy + Send + Sync + zerocopy::FromZeros {
     /// stack argument); every other register keeps the parent's value.
     fn set_user_stack(&mut self, stack: u64);
     fn set_syscall_return(&mut self, value: u64);
+    /// Restore the syscall instruction PC while preserving all arguments.
+    fn restart_syscall(&mut self);
     fn with_syscall_return(mut self, value: u64) -> Self {
         self.set_syscall_return(value);
         self
