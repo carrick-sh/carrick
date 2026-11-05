@@ -184,6 +184,9 @@ impl IpcObjectHandle {
 }
 
 /// The shared queue identity for one readiness direction of an IPC incarnation.
+/// Admit both lanes together below the metadata/MM queue domains. The generic
+/// scheduler key constructor also accepts those domains, so it cannot enforce
+/// IPC's bound. Slot reuse advances the object generation and hence this key.
 pub fn object_wait_key(
     object: IpcObjectHandle,
     direction: pipe::WaitFor,
