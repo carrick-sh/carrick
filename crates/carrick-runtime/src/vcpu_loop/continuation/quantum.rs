@@ -197,12 +197,42 @@ pub(crate) struct ZoneSave {
     pub(crate) origin: crate::vcpu_loop::executor::residency::ZoneResumeOrigin,
 }
 
+/// A nonresident save has an explicit register owner. Terminal host work
+/// cannot retain hardware residency after EL1 vacates the process root.
+pub(crate) enum TaskCpuSave {
+    Zone(ZoneSave),
+    Terminal,
+}
+
+impl TaskCpuSave {
+    /// The same save decision is used by the hardware executor and VM-free
+    /// termination witness. Terminal work always forces a full future load.
+    pub(crate) fn into_residency(
+        self,
+        binding: &HvpatchTaskBinding,
+        snapshot: impl FnOnce() -> Result<carrick_hal::threaded::GuestCpuState, crate::trap::TrapError>,
+    ) -> Result<crate::vcpu_loop::executor::residency::TaskCpuResidency, crate::trap::TrapError>
+    {
+        use crate::vcpu_loop::executor::residency::TaskCpuResidency;
+        match self {
+            Self::Zone(save) => Ok(TaskCpuResidency::Zone {
+                base: save.base,
+                record: save.record,
+                origin: save.origin,
+            }),
+            Self::Terminal => Ok(TaskCpuResidency::Materialized(
+                binding.terminal_cpu_state(snapshot()?)?,
+            )),
+        }
+    }
+}
+
 pub(crate) struct HvpatchTaskBinding {
     identity: crate::vcpu_loop::executor::TaskLoadIdentity,
     backend: Mutex<Option<Box<dyn std::any::Any + Send>>>,
-    /// Set by the thread's job right before it settles into the zone; taken
-    /// by the executor's save.
-    zone_save: Mutex<Option<ZoneSave>>,
+    /// Nonresident register authority selected by the job at suspension;
+    /// consumed by the executor's save before it detaches the live engine.
+    cpu_save: Mutex<Option<TaskCpuSave>>,
     stage1_mm: Option<Arc<crate::hvpatch::Stage1MmLease>>,
     terminal_generation: Mutex<HvpatchBindingTerminalGeneration>,
     // Last by construction: the quantum's drop receipt may become visible
@@ -228,7 +258,7 @@ impl HvpatchTaskBinding {
             identity,
             quantum,
             backend: Mutex::new(Some(backend)),
-            zone_save: Mutex::new(None),
+            cpu_save: Mutex::new(None),
             stage1_mm: None,
             terminal_generation: Mutex::new(HvpatchBindingTerminalGeneration::Active),
         }
@@ -249,7 +279,7 @@ impl HvpatchTaskBinding {
             identity,
             quantum,
             backend: Mutex::new(Some(backend)),
-            zone_save: Mutex::new(None),
+            cpu_save: Mutex::new(None),
             stage1_mm: Some(stage1_mm),
             terminal_generation: Mutex::new(HvpatchBindingTerminalGeneration::Active),
         })
@@ -262,11 +292,41 @@ impl HvpatchTaskBinding {
     /// The thread's job parked it in the in-guest zone: the next save keeps
     /// its registers in the zone record, not on the vCPU.
     pub(crate) fn set_zone_save(&self, save: ZoneSave) {
-        *self.zone_save.lock() = Some(save);
+        *self.cpu_save.lock() = Some(TaskCpuSave::Zone(save));
     }
 
-    pub(crate) fn take_zone_save(&self) -> Option<ZoneSave> {
-        self.zone_save.lock().take()
+    pub(crate) fn set_terminal_save(&self) {
+        *self.cpu_save.lock() = Some(TaskCpuSave::Terminal);
+    }
+
+    /// Terminal execution belongs to the host, so live TTBRs may already
+    /// name the carrier maintenance root. The MM lease is the sole source
+    /// of both the process root and its current ASID; never tag the idle root.
+    fn terminal_cpu_state(
+        &self,
+        mut cpu: carrick_hal::threaded::GuestCpuState,
+    ) -> Result<carrick_hal::threaded::GuestCpuState, crate::trap::TrapError> {
+        if cpu.task_identity() != (self.identity.mm.raw(), self.identity.asid_generation) {
+            return Err(crate::trap::TrapError::Hypervisor(
+                "terminal CPU save lost its exact MM/ASID generation".into(),
+            ));
+        }
+        let ttbr = self.stage1_ttbr0().ok_or_else(|| {
+            crate::trap::TrapError::Hypervisor("terminal CPU save has no stage-1 lease".into())
+        })?;
+        let carrick_hal::threaded::GuestCpuState::Aarch64V1(registers) = &mut cpu else {
+            return Err(crate::trap::TrapError::Hypervisor(
+                "HVPatch terminal save requires AArch64 state".into(),
+            ));
+        };
+        let registers = Arc::make_mut(registers);
+        registers.ttbr0 = ttbr;
+        registers.ttbr1 = ttbr;
+        Ok(cpu)
+    }
+
+    pub(crate) fn take_cpu_save(&self) -> Option<TaskCpuSave> {
+        self.cpu_save.lock().take()
     }
 
     #[cfg(test)]
@@ -278,7 +338,7 @@ impl HvpatchTaskBinding {
             identity,
             quantum: Arc::clone(&self.quantum),
             backend: Mutex::new(None),
-            zone_save: Mutex::new(None),
+            cpu_save: Mutex::new(None),
             stage1_mm: self.stage1_mm.clone(),
             terminal_generation: Mutex::new(HvpatchBindingTerminalGeneration::Active),
         }
@@ -298,7 +358,7 @@ impl HvpatchTaskBinding {
             identity,
             quantum: Arc::clone(&self.quantum),
             backend: Mutex::new(None),
-            zone_save: Mutex::new(None),
+            cpu_save: Mutex::new(None),
             stage1_mm: Some(stage1_mm),
             terminal_generation: Mutex::new(HvpatchBindingTerminalGeneration::Active),
         })

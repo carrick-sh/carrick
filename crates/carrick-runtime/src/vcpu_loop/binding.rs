@@ -501,6 +501,25 @@ impl HvpatchProductionPhase {
         )
     }
 
+    /// These suspensions perform host termination work only. EL1 may have
+    /// vacated the process translations already, so they cannot keep lazy
+    /// hardware residency. Exec drains retain their separate successor path.
+    fn needs_terminal_cpu_save(&self) -> bool {
+        match self {
+            Self::TerminalProcessDrain { .. }
+            | Self::TerminalClaimRetry { .. }
+            | Self::TerminalRetireRetry { .. } => true,
+            Self::ResumeRetainedOwner { action }
+            | Self::ResumeRetainedPhysical { action, .. }
+            | Self::RetainedMemoryRetry { action } => matches!(
+                action.as_ref(),
+                RetainedMemoryAction::ProcessFinish { .. }
+                    | RetainedMemoryAction::ThreadExit { .. }
+            ),
+            _ => false,
+        }
+    }
+
     /// Stable ordinal for the `hvpatch-thread-terminal` probe's `detail`
     /// (reason `ExternallySettledWithoutResult`): which phase a job was
     /// parked in when the executor settled its terminal for it.
@@ -5944,7 +5963,7 @@ where
         let Some(engine) = engine.downcast_mut::<E>() else {
             return executor::ExecutorExit::InvalidState;
         };
-        match self.poll_with_engine_typed(engine, control) {
+        let exit = match self.poll_with_engine_typed(engine, control) {
             Ok(exit) => exit,
             Err(ProductionHvpatchPollError::Exec(pending)) => {
                 let PendingExecTerminalError { error, pending } = *pending;
@@ -5973,7 +5992,13 @@ where
                     context,
                 )
             }
+        };
+        if self.phase.needs_terminal_cpu_save()
+            && let Some(binding) = control.binding
+        {
+            binding.set_terminal_save();
         }
+        exit
     }
 
     fn end_residency(&mut self) {
@@ -7832,6 +7857,241 @@ mod tests {
             )
             .unwrap();
         scheduler.unregister_executor(&executor).unwrap();
+        scheduler.close();
+    }
+
+    /// #1666: a sibling owns exit_group while the leader is parked. The
+    /// stopped backend exposes the carrier root left by EL1's leave-space;
+    /// the host terminal must survive its save/load boundary with its MM.
+    #[test]
+    fn sibling_exit_group_terminal_save_keeps_process_translation() {
+        use executor::TaskBindingResolver;
+        struct NeverPolled;
+        impl continuation::PersistentQuantumJob for NeverPolled {
+            fn poll_quantum_with_engine(
+                &mut self,
+                _: &mut dyn std::any::Any,
+                _: &mut executor::HvpatchQuantumControl<'_, '_>,
+            ) -> executor::ExecutorExit {
+                unreachable!()
+            }
+        }
+        let dispatcher = SyscallDispatcher::new();
+        let (runtime, scheduler, kernel, root, process, generation) =
+            test_carrier_graph_with_dispatcher!(72_466, dispatcher);
+        root.thread().set_affinity(carrick_hal::CpuAffinity::all(1));
+        let sibling = root
+            .kernel()
+            .reserve_thread_clone(
+                &root,
+                carrick_kernel::kernel::ClonePlan::from_flags(
+                    carrick_abi::LinuxCloneFlags::THREAD
+                        | carrick_abi::LinuxCloneFlags::SIGHAND
+                        | carrick_abi::LinuxCloneFlags::VM,
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap()
+            .prepare(ThreadId::synthetic_for_tests(72_467))
+            .unwrap()
+            .commit()
+            .unwrap()
+            .start_thread()
+            .unwrap()
+            .into_context();
+        let directory = runtime.persistent_bindings();
+        let authority = directory
+            .take_submission_authority(root.thread().key(), generation)
+            .unwrap();
+        let mut cpu = executor::tests::task_state(&sibling, 466);
+        cpu.asid_generation = process.asid_generation();
+        let carrick_hal::threaded::GuestCpuState::Aarch64V1(registers) = &mut cpu.cpu else {
+            unreachable!()
+        };
+        Arc::make_mut(registers).asid_generation = process.asid_generation();
+        let sibling_generation = sibling
+            .thread()
+            .publish_initial_task_state(cpu.clone())
+            .unwrap();
+        let sibling_binding = executor::tests::hvpatch_test_binding(&sibling, &cpu, 466);
+        let dormant = directory
+            .prepare_submission(
+                &scheduler,
+                executor::TaskSubmissionShape::SameTaskSibling {
+                    grant: (root.thread().key(), generation),
+                },
+                Some(&authority),
+                Arc::clone(sibling.thread()),
+                sibling_generation,
+                Arc::clone(&sibling_binding),
+            )
+            .unwrap();
+        executor::tests::activate_hvpatch_test_submission(
+            dormant,
+            &scheduler,
+            &sibling,
+            &cpu,
+            sibling_generation,
+            &sibling_binding,
+        );
+        let registration = scheduler
+            .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
+            .unwrap();
+        let leader = scheduler.take(&registration).unwrap();
+        assert_eq!(leader.thread().key(), root.thread().key());
+        scheduler
+            .settle_blocked(
+                leader,
+                carrick_kernel::kernel::objects::BlockedReason::HostWait,
+            )
+            .unwrap();
+        let mut running = scheduler.take(&registration).unwrap();
+        assert_eq!(running.thread().key(), sibling.thread().key());
+        assert!(root.exact_thread_is_live());
+
+        let tid = sibling.thread().registry_id();
+        let registry = Arc::new(ThreadRegistry::new(root.thread().registry_id()));
+        registry.register_child_with_tid(tid, 0);
+        let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+            registry,
+            Arc::new(FutexTable::new()),
+            Arc::new(NoopPlatformFutex),
+            Arc::new(|_| Arc::new(NoopPlatformFutex)),
+            kernel.process_fork_barrier.clone(),
+            kernel.crash_capture.clone(),
+            Some(Arc::clone(sibling.thread())),
+            Some(process.pid()),
+            sibling.thread().key().tid,
+            kernel.fatal_signal.current_generation(),
+            tid,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(carrick_hal::GenericVcpuRegistry::new()),
+            carrick_hal::InGuestFlag::for_guest_thread(),
+            1_000,
+        );
+        state.service_kernel_context = Some(sibling.retain_exact());
+        let mut job =
+            suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, None);
+        let binding = continuation::HvpatchTaskBinding::new_with_stage1_mm(
+            executor::TaskLoadIdentity {
+                abi: cpu.cpu.guest_abi(),
+                version: cpu.cpu.version(),
+                mm: cpu.mm,
+                asid_generation: cpu.asid_generation,
+            },
+            Arc::new(continuation::HvpatchTaskQuantum::new(
+                Box::new(NeverPolled),
+                job.completion.clone(),
+            )),
+            Box::new(()),
+            process.stage1_mm_lease().unwrap(),
+        )
+        .unwrap();
+        let binding = Arc::new(binding);
+        let expected = binding.stage1_ttbr0().unwrap();
+        let carrick_hal::threaded::GuestCpuState::Aarch64V1(registers) = &mut cpu.cpu else {
+            unreachable!()
+        };
+        let registers = Arc::make_mut(registers);
+        registers.ttbr0 = carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE;
+        registers.ttbr1 = registers.ttbr0;
+        let mut engine = CrashCaptureTestEngine {
+            exec_support: true,
+            snapshot_cpu: Some(cpu.cpu.clone()),
+            next_syscall: Some(carrick_hal::RawSyscall {
+                current_guest_sp: None,
+                number: carrick_abi::syscall::nr::EXIT_GROUP,
+                native_number: carrick_abi::NativeNr(carrick_abi::syscall::nr::EXIT_GROUP.raw()),
+                guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+                args: [23, 0, 0, 0, 0, 0],
+            }),
+            ..Default::default()
+        };
+        let reject_descendant = |_, _| unreachable!();
+        let mut submission = executor::ExecutorSubmissionContext {
+            registration: Some(&registration),
+            scheduler: &scheduler,
+            publish_test_descendant: &reject_descendant,
+            current: Some(&authority),
+            authority: executor::ExecutionLeaseAuthoritySlot::from(Some(running.take_lease())),
+            exec_replacement: None,
+        };
+        let need_resched = std::sync::atomic::AtomicBool::new(false);
+        let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+        control.binding = Some(&binding);
+        assert!(sibling.exact_thread_is_live());
+        kernel
+            .dispatcher
+            .capture_kernel_context(sibling.thread().key().tid)
+            .expect("live sibling before production poll");
+        let exit = job.poll(&mut engine, &mut control);
+        assert!(
+            matches!(
+                exit,
+                executor::ExecutorExit::Yielded | executor::ExecutorExit::Blocked(_)
+            ),
+            "{exit:?}"
+        );
+        let terminal = match &job.phase {
+            HvpatchProductionPhase::TerminalProcessDrain { terminal, .. } => terminal,
+            HvpatchProductionPhase::RetainedMemoryRetry { action } => match action.as_ref() {
+                RetainedMemoryAction::ProcessFinish { terminal, .. } => terminal,
+                _ => panic!("unexpected retained action"),
+            },
+            phase => panic!("unexpected phase {}", phase.probe_ordinal()),
+        };
+        match terminal {
+            PersistentTerminal::Outcome {
+                outcome: VcpuLoopOutcome::ProcessExit(run),
+                ..
+            } => assert_eq!(run.exit_code, 23),
+            PersistentTerminal::Error(error) => panic!("exit_group failed: {error}"),
+            _ => panic!("exit_group did not retain its process result"),
+        }
+        // Consume the production save authority before the next load. Main
+        // has none and snapshots the maintenance-root hardware instead.
+        let snapshots = std::cell::Cell::new(0);
+        let residency = binding.take_cpu_save().map(|save| {
+            save.into_residency(&binding, || {
+                snapshots.set(snapshots.get() + 1);
+                engine.snapshot_guest_state_for_publication()
+            })
+            .unwrap()
+        });
+        let saved = match residency {
+            Some(executor::residency::TaskCpuResidency::Materialized(saved)) => saved,
+            None => engine.snapshot_guest_state_for_publication().unwrap(),
+            _ => panic!("terminal save must force materialization, even on the same executor"),
+        };
+        let loaded = carrick_kernel::kernel::objects::MigratableTaskState { cpu: saved, ..cpu };
+        binding
+            .validate_state(&loaded)
+            .expect("terminal load must retain its process TTBR pair");
+        let carrick_hal::threaded::GuestCpuState::Aarch64V1(registers) = &loaded.cpu else {
+            unreachable!()
+        };
+        assert_eq!((registers.ttbr0, registers.ttbr1), (expected, expected));
+        assert_eq!(
+            snapshots.get(),
+            1,
+            "one full snapshot per terminal suspension"
+        );
+        let mut stale = loaded.cpu.clone();
+        let carrick_hal::threaded::GuestCpuState::Aarch64V1(registers) = &mut stale else {
+            unreachable!()
+        };
+        Arc::make_mut(registers).asid_generation += 1;
+        assert!(
+            continuation::quantum::TaskCpuSave::Terminal
+                .into_residency(&binding, || Ok(stale))
+                .is_err(),
+            "MM composition must not launder a stale saved generation"
+        );
+        let lease = control.submission.take_execution_lease().unwrap();
+        running.restore_lease(lease).unwrap();
+        scheduler.settle_exited(running).unwrap();
+        scheduler.unregister_executor(&registration).unwrap();
         scheduler.close();
     }
 
