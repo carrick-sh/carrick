@@ -10074,7 +10074,7 @@ fn serial_host_native_child_close_range_lacks_ring_handler() {
     native_child_descriptor_family(NativeDescriptorScenario::CloseRange);
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(test, not(target_os = "macos")))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NativeDescriptorScenario {
     Mutations,
@@ -10082,7 +10082,7 @@ enum NativeDescriptorScenario {
     CloseRange,
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(test, not(target_os = "macos")))]
 fn native_child_descriptor_family(scenario: NativeDescriptorScenario) {
     use carrick_abi::{
         LINUX_F_DUPFD, LINUX_F_DUPFD_CLOEXEC, LINUX_F_GETFD, LINUX_F_GETFL, LINUX_F_SETFD,
