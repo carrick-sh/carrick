@@ -2122,6 +2122,17 @@ pub fn carrier_maintenance_ttbr(vmm: &HvfAarch64Vmm) -> Result<u64, TrapError> {
     Ok(vmm.state.carrier_maintenance_root()?.raw())
 }
 
+#[cfg(feature = "terminal-save-test-support")]
+thread_local! {
+    static TERMINAL_SAVE_FAIL_SECOND_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Fail the second terminal-root write on this executor thread only.
+#[cfg(feature = "terminal-save-test-support")]
+pub fn fail_terminal_save_second_write_for_test() {
+    TERMINAL_SAVE_FAIL_SECOND_WRITE.with(|armed| armed.set(true));
+}
+
 /// After a terminal entry, no task CPU snapshot is meaningful. Remove its
 /// exact stage-1 root from the idle worker vCPU before the root-slot owner can
 /// retire and reuse that physical slot.
@@ -2131,6 +2142,12 @@ pub fn retire_terminal_resident_vcpu_root(
 ) -> Result<(), TrapError> {
     let neutral = carrier_maintenance_ttbr(vmm)?;
     vcpu.set_sys_reg(SysReg::Ttbr0, neutral)?;
+    #[cfg(feature = "terminal-save-test-support")]
+    if TERMINAL_SAVE_FAIL_SECOND_WRITE.with(|armed| armed.replace(false)) {
+        return Err(TrapError::Hypervisor(
+            "injected terminal TTBR1 write failure".into(),
+        ));
+    }
     vcpu.set_sys_reg(SysReg::Ttbr1, neutral)
 }
 

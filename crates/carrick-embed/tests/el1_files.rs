@@ -441,6 +441,67 @@ fn el1_files_exit_group_stress() {
     }
 }
 
+/// Exercise the hardware cleanup in HvpatchPersistentExecutor::save, rather
+/// than the save selector or a source-text ordering assertion.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn terminal_save_vacates_both_roots_before_publication() {
+    let _guard = common::guest_lock();
+    let probe = carrick_runtime::vcpu_loop::executor::terminal_save_test_control::arm(false);
+    let watchdog = common::Watchdog::start(std::time::Duration::from_secs(30));
+    let result =
+        common::run_or_fail(common::interceptor_probe_builder("exit-group-stress").run_blocking());
+    watchdog.disarm();
+    assert!(result.success(), "exit_code={}", result.exit_code);
+    let observed = probe.observation();
+    assert_ne!(observed.process_root, observed.maintenance_root);
+    assert_ne!(observed.process_root, 0, "production save was not reached");
+    assert_eq!(
+        observed.roots_before_publication,
+        Some([observed.maintenance_root; 2]),
+        "{observed:?}"
+    );
+    assert!(observed.backend_unpublished, "{observed:?}");
+    assert!(!observed.cleanup_failed, "{observed:?}");
+    assert!(
+        observed.backend_retained && observed.worker_retained,
+        "{observed:?}"
+    );
+}
+
+/// A partial hardware write must return the original error with the detached
+/// MM back in the binding and the exact vCPU back in the failing executor.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn terminal_save_second_root_write_failure_retains_ownership() {
+    let _guard = common::guest_lock();
+    let probe = carrick_runtime::vcpu_loop::executor::terminal_save_test_control::arm(true);
+    let watchdog = common::Watchdog::start(std::time::Duration::from_secs(30));
+    let result = common::interceptor_probe_builder("exit-group-stress").run_blocking();
+    watchdog.disarm();
+    let error = result.expect_err("injected save failure must remain visible");
+    assert!(
+        error
+            .to_string()
+            .contains("injected terminal TTBR1 write failure"),
+        "{error}"
+    );
+    let observed = probe.observation();
+    assert_ne!(observed.process_root, observed.maintenance_root);
+    assert_ne!(observed.process_root, 0, "production save was not reached");
+    assert_eq!(
+        observed.roots_before_publication,
+        Some([observed.maintenance_root, observed.process_root]),
+        "{observed:?}"
+    );
+    assert!(observed.backend_unpublished, "{observed:?}");
+    assert!(observed.cleanup_failed, "{observed:?}");
+    assert!(
+        observed.backend_retained && observed.worker_retained,
+        "{observed:?}"
+    );
+}
+
 /// Signal stress test: a thread in a tight EL1-served write/lseek loop receives
 /// SIGUSR1 from another thread and its handler runs within 1 s; run 20 times.
 #[test]

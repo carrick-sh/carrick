@@ -25,6 +25,8 @@ debug-stats = []
 foreign-cow-test-support = []
 # Deterministic signed metadata request owner/participant interleaving.
 metadata-grant-test-support = []
+# Signed production-save fault injection; absent from product builds.
+terminal-save-test-support = []
 
 [dependencies]
 carrick-core = { path = "../carrick-core" }

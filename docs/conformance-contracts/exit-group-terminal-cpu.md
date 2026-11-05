@@ -40,7 +40,24 @@ per terminal suspension; normal guest quanta request no additional snapshot.
 
 Red evidence on admitted main with the witness scaffolding: the load audit
 rejected `0x2d001f8000/0x2d001f8000`, expecting `0x1000000004000`.
-The fixed witness passes. The director retains native capture and ten signed
+The fixed witness passes. The director still owns the native failure capture and ten signed
 passes on one artifact, including the original el1_files exit-group stress
-binding. This VM-free reduction does not claim those signed results, Docker
+binding; neither is verified here. This VM-free reduction does not claim those signed results, Docker
 timing, or a runtime ratio.
+
+The fix-round signed witnesses in `carrick-embed::el1_files` now drive the
+actual `HvpatchPersistentExecutor::save` with the existing exit-group guest
+fixture. A test-support-only probe seeds both stopped hardware roots with the
+still-owned process root, so an already-vacated EL1 root cannot conceal a
+missing cleanup write. It reads both roots immediately before backend
+publication. The failure row injects the second register-write refusal after
+the first real hardware write, then checks that the original binding again
+owns its detached backend and the failing executor retains its vCPU. No
+replacement executor, synthetic MM or hand-built terminal record is used.
+The old source-text ordering test is removed.
+
+These new signed witnesses have not run on this Linux worker. Their red-first
+mutation check (omit the cleanup call, and separately omit backend publication
+on failure) and green signed runs remain required on the Mac. Part of #1666;
+keep the PR draft until the failure capture and ten passes on one artifact
+are attached. The VM-free selector witness remains only a lower-layer proof.

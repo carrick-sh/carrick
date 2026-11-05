@@ -4863,40 +4863,6 @@ fn terminal_settlement_retires_the_exact_binding_before_worker_destroy() {
 }
 
 #[test]
-fn persistent_save_restores_worker_controls_after_task_snapshot_before_detach() {
-    let source = include_str!("backend.rs");
-    let save = source
-        .split("fn save(\n        &mut self")
-        .nth(1)
-        .and_then(|tail| tail.split("fn take_pending_retirement").next())
-        .expect("persistent executor save body");
-    let snapshot = save
-        .find("snapshot_guest_state_for_publication")
-        .expect("terminal task snapshot before canonical publication");
-    let metadata = save
-        .find("engine.extract_resident_task_metadata_for_lazy_save")
-        .expect("continuation export before worker detach");
-    let publication = save
-        .find("lease.replace_task_state")
-        .expect("saved task state publication");
-    let neutralize = save
-        .find("engine.restore_persistent_executor_invariants")
-        .expect("worker control restore");
-    let detach = save.find("self.current.take()").expect("engine detach");
-    assert!(snapshot < publication);
-    assert!(publication < neutralize);
-    assert!(metadata < neutralize);
-    assert!(neutralize < detach);
-    let vacate = save
-        .find("retire_terminal_resident_vcpu_root")
-        .expect("terminal save vacates both hardware roots");
-    let detached_publication = save
-        .find("binding.put_backend(backend)")
-        .expect("detached backend publication");
-    assert!(detach < vacate && vacate < detached_publication);
-}
-
-#[test]
 fn task_migrates_between_workers_only_after_complete_save_and_unbind() {
     let (kernel, context) = bootstrap(14_015);
     let scheduler = Arc::new(Scheduler::new_with_policy(

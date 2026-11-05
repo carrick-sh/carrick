@@ -1003,6 +1003,7 @@ surfaces = [
   { path = "crates/carrick-vmm-hvf/src/hatch.rs", contract = "kernel.el1.arm-ring-first-crossing" },
   { path = "crates/carrick-vmm-hvf/src/host_signal.rs", contract = "kernel.el1.signal-delivery-owner" },
   { path = "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs", contract = "kernel.el1.stage1-publication" },
+  { path = "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs", contract = "kernel.el1.thread-lifecycle" },
   { path = "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs", contract = "kernel.fork.stage1-image" },
   { path = "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs", contract = "kernel.memory.owner-wait" },
   { path = "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs", contract = "kernel.mm.syscall-code-write" },
