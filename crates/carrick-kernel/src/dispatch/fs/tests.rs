@@ -5236,9 +5236,12 @@ fn serial_host_pipemass_fd_limit_preserves_wait_domains_and_incarnations() {
             DispatchOutcome::Returned { value: 0 }
         );
         let initial = h.dispatcher.captured_file_table().slot_count();
+        // Bare stdio occupies fd numbers 0..3 without open_files entries.
+        // slot_count counts only explicit entries, not those three numbers.
+        const BARE_STDIO: usize = 3;
         for round in 0..2 {
             let mut pairs = Vec::new();
-            for pair in 0..(LIMIT - initial) / 2 {
+            for pair in 0..(LIMIT - BARE_STDIO - initial) / 2 {
                 let outcome = h.run(SpliceTestRig::SYS_PIPE2, [0x4000, 0, 0, 0, 0, 0]);
                 assert_eq!(
                     outcome,
@@ -5255,7 +5258,10 @@ fn serial_host_pipemass_fd_limit_preserves_wait_domains_and_incarnations() {
                 h.run(SpliceTestRig::SYS_PIPE2, [0x4000, 0, 0, 0, 0, 0]),
                 DispatchOutcome::errno(carrick_abi::LINUX_EMFILE)
             );
-            assert_eq!(h.dispatcher.captured_file_table().slot_count(), LIMIT);
+            assert_eq!(
+                h.dispatcher.captured_file_table().slot_count(),
+                LIMIT - BARE_STDIO
+            );
             for (reader, writer) in pairs {
                 h.close(reader);
                 h.close(writer);
