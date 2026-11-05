@@ -1391,7 +1391,7 @@ mod ring_first_tests {
     fn writev_dispatches_through_the_ipc_writer_without_scalar_file_fallback() {
         struct Writer {
             calls: usize,
-            result: i64,
+            completion: FamilyCompletion,
         }
         impl<'a> PendingFamilies<'a> for Writer {
             fn binding(&self) -> Option<ExecutionBinding> {
@@ -1408,29 +1408,34 @@ mod ring_first_tests {
             fn original_argument0(&self) -> u64 {
                 1
             }
-            fn install_result(&mut self, result: SyscallResult) {
-                self.result = result.raw();
+            fn install_result(&mut self, _: SyscallResult) {
+                panic!("the IPC writer owns its frame result")
             }
             fn ipc_available(&self) -> bool {
                 true
             }
             fn write(&mut self) -> FamilyCompletion {
                 self.calls += 1;
-                FamilyCompletion::Complete(6)
+                self.completion
             }
             fn file_write(&mut self) -> FamilyCompletion {
                 panic!("a vector is never a scalar file buffer")
             }
         }
-        let mut writer = Writer {
-            calls: 0,
-            result: 0,
-        };
-        assert_eq!(
-            dispatch(crate::crossing::nr::WRITEV.raw(), u64::MAX, &mut writer),
-            CompletionRoute::Served
-        );
-        assert_eq!((writer.calls, writer.result), (1, 6));
+        for (completion, route) in [
+            (FamilyCompletion::Complete(6), CompletionRoute::Served),
+            (FamilyCompletion::Forward, CompletionRoute::Forward),
+        ] {
+            let mut writer = Writer {
+                calls: 0,
+                completion,
+            };
+            assert_eq!(
+                dispatch(crate::crossing::nr::WRITEV.raw(), u64::MAX, &mut writer),
+                route
+            );
+            assert_eq!(writer.calls, 1);
+        }
     }
 
     #[test]
