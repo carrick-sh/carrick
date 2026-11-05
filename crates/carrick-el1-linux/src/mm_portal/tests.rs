@@ -6091,3 +6091,225 @@ fn owner_munmap_then_mmap_null_places_outside_owed_return_in_ring() {
     );
     let _ = (owner, peer);
 }
+
+#[test]
+fn copyin_mapping_change_retains_selected_owner_retry_and_redispatches_once() {
+    use carrick_core::mm::transaction::{
+        SelectionVenues, UserWriteError, UserWriteRequest, UserWriteTarget, UserWriteVenue,
+    };
+    use carrick_el1_abi::{Aarch64ParkedContext, PortalGrantWindow, PortalWaitCause};
+    use carrick_sched_core::object_wait::{OperationToken, OwnedObjectWakeEffects};
+    use carrick_sched_core::spaces::notification::SpaceWaitCause;
+    use carrick_sched_core::{BoundedSpin, ThreadIdentity};
+
+    struct ChangeVenue<'a> {
+        prepared: NoopPreparedResolver,
+        cow: NoopCowResolver,
+        residency: &'a FrameGrantResidencyTable,
+        change: &'a mut dyn FnMut(),
+        observe: &'a dyn Fn() -> u64,
+        sampled_revision: Option<u64>,
+        selections: usize,
+    }
+    impl UserWriteVenue<Aarch64ParkedContext> for ChangeVenue<'_> {
+        type Prepared = NoopPreparedResolver;
+        type Cow = NoopCowResolver;
+        type Error = ();
+        fn selection_venues(&mut self) -> SelectionVenues<'_, Self::Prepared, Self::Cow> {
+            self.sampled_revision = Some((self.observe)());
+            self.selections += 1;
+            SelectionVenues {
+                prepared: &mut self.prepared,
+                cow: &mut self.cow,
+                residency: self.residency,
+                slot: 0,
+            }
+        }
+        fn settle_completions(&mut self, _: &UserWriteRequest<'_>) -> Result<(), ()> {
+            panic!("read preparation has no output completion")
+        }
+        fn settle_preparation(&mut self, _: &UserWriteTarget) -> Result<(), ()> {
+            if self.selections == 1 {
+                (self.change)();
+            }
+            Ok(())
+        }
+        fn supply_cow(&mut self, _: PortalGrantWindow) -> Result<(), ()> {
+            panic!("resident readable input needs no supply")
+        }
+        fn copy(
+            &mut self,
+            _: &carrick_core::mm::transfer::ValidatedChunk<'_, Aarch64ParkedContext>,
+            _: &[u8],
+        ) -> bool {
+            panic!("read preparation cannot copy output")
+        }
+    }
+    let region = Region::new();
+    let zone = region.zone();
+    let mm = admit_notified(&region, 77, ROOT, 1, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::MIN, region.table(), &zone.spaces, &view)
+        .with_zone(zone)
+        .unwrap();
+    let handle = portal.admitted_handle(mm, 0).unwrap();
+    let source = zone
+        .space_entry(NonZeroU64::new(mm.raw()).unwrap())
+        .unwrap()
+        .notifications(handle.incarnation())
+        .unwrap();
+    let observe = || source.observe(SpaceWaitCause::Reservations).revision();
+    let mut change = || {
+        // A real reservation publication advances the mapping generation
+        // between SELECT and REVALIDATE, while leaving the input readable.
+        portal
+            .root(mm, 1)
+            .unwrap()
+            .insert_opaque_backed(
+                ReservationRange::new(VA + 8192, VA + 12288).unwrap(),
+                ReservationProtection::READ_WRITE,
+                ReservationNodeFlags::PRIVATE,
+                None,
+            )
+            .unwrap();
+    };
+    let residency = residency();
+    let mut venue = ChangeVenue {
+        prepared: NoopPreparedResolver,
+        cow: NoopCowResolver,
+        residency: &residency,
+        change: &mut change,
+        observe: &observe,
+        sampled_revision: None,
+        selections: 0,
+    };
+    let tables = Tables::new(ROOT, IPA, 1);
+    let words = tables.live(&CallerInvalidatesAsid);
+    let target = UserWriteTarget {
+        handle,
+        address: carrick_guest_arch::UserVa::new(VA),
+        len: carrick_guest_arch::GuestLen::new(8),
+        slot: carrick_guest_arch::SlotId::new(0),
+    };
+    let result = portal.prepare_user_read(target, &words, &mut venue);
+    let Err(UserWriteError::Owner(MmError::Wait(wait))) = result else {
+        panic!("mapping change must retain selected owner notification, got {result:?}");
+    };
+    assert_eq!(wait.handle(), handle);
+    assert_eq!(wait.cause(), PortalWaitCause::Reservations);
+    let revision = venue.sampled_revision.unwrap();
+    assert_eq!(wait.revision(), revision);
+    assert_eq!(venue.selections, 1, "no local retry loop");
+    assert!(source.observe(SpaceWaitCause::Reservations).revision() > revision);
+    let slots = region.portal_slots();
+    assert!(slots.bind_carrier(handle.carrier()));
+    let enrollment = slots.authenticate_wait(zone, wait).unwrap();
+    let record = zone
+        .alloc_record(ThreadIdentity {
+            tid: 101,
+            serial: 1001,
+            mm: mm.raw(),
+            file_table: 1,
+            generation: 1,
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            affinity: 0,
+            lifecycle_page: 0,
+            control_slot: 0,
+        })
+        .unwrap();
+    let delivered = core::cell::RefCell::new(Vec::new());
+    let complete = |owned: OwnedObjectWakeEffects<'_, Aarch64ParkedContext>| {
+        let _ = owned.deliver_handbacks(&mut |r| delivered.borrow_mut().push(r));
+    };
+    // Delay queue admission, so the changed pre-selection observation must
+    // retain its owned operation until admission releases and probes it once.
+    let queue = zone
+        .object_wait_with_completion(
+            source.key(SpaceWaitCause::Reservations),
+            &BoundedSpin(0),
+            &complete,
+        )
+        .unwrap();
+    enrollment
+        .park_host(record, OperationToken::new(701, 11).unwrap(), &complete)
+        .unwrap();
+    assert!(delivered.borrow().is_empty());
+    drop(queue);
+    assert_eq!(*delivered.borrow(), [zone.record_ref(record)]);
+    let operation = unsafe { zone.record(record).take_object_operation() }.unwrap();
+    assert_eq!(operation.index(), 701);
+    assert_eq!(portal.prepare_user_read(target, &words, &mut venue), Ok(()));
+    assert_eq!(venue.selections, 2, "one wake and one redispatch");
+    assert_eq!(delivered.borrow().len(), 1, "no duplicate wake");
+    zone.free_record(record);
+
+    // This time the real owner publication happens after queue enrollment.
+    // The held reservation root is the producer, rather than queue admission.
+    delivered.borrow_mut().clear();
+    let mut held = portal.root(mm, 1).unwrap();
+    let revision = source.observe(SpaceWaitCause::Reservations).revision();
+    let result = portal.prepare_user_read(target, &words, &mut venue);
+    let Err(UserWriteError::Owner(MmError::Wait(wait))) = result else {
+        panic!("held reservation root must supply its real owner wait, got {result:?}");
+    };
+    assert_eq!(wait.handle(), handle);
+    assert_eq!(wait.cause(), PortalWaitCause::Reservations);
+    assert_eq!(wait.revision(), revision);
+    assert_eq!(venue.selections, 2, "root refusal precedes selection");
+    let record = zone
+        .alloc_record(ThreadIdentity {
+            tid: 102,
+            serial: 1002,
+            mm: mm.raw(),
+            file_table: 1,
+            generation: 1,
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            affinity: 0,
+            lifecycle_page: 0,
+            control_slot: 0,
+        })
+        .unwrap();
+    slots
+        .authenticate_wait(zone, wait)
+        .unwrap()
+        .park_host(record, OperationToken::new(702, 12).unwrap(), &complete)
+        .unwrap();
+    assert!(
+        delivered.borrow().is_empty(),
+        "a free queue cannot manufacture readiness"
+    );
+    held.insert_opaque_backed(
+        ReservationRange::new(VA + 16384, VA + 20480).unwrap(),
+        ReservationProtection::READ,
+        ReservationNodeFlags::PRIVATE,
+        None,
+    )
+    .unwrap();
+    assert!(
+        delivered.borrow().is_empty(),
+        "publication retains exclusion until owner release"
+    );
+    drop(held);
+    zone.take_completion_handbacks(&BoundedSpin(0), &mut |record| {
+        delivered.borrow_mut().push(record)
+    });
+    assert_eq!(*delivered.borrow(), [zone.record_ref(record)]);
+    assert_eq!(
+        unsafe { zone.record(record).take_object_operation() }
+            .unwrap()
+            .index(),
+        702,
+    );
+    assert_eq!(portal.prepare_user_read(target, &words, &mut venue), Ok(()));
+    assert_eq!(
+        venue.selections, 3,
+        "release permits one successful redispatch"
+    );
+    assert_eq!(
+        delivered.borrow().len(),
+        1,
+        "owner release wakes exactly once"
+    );
+    zone.take_completion_handbacks(&BoundedSpin(0), &mut |_| panic!("duplicate handback"));
+    zone.free_record(record);
+}
