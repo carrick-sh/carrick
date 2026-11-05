@@ -162,6 +162,17 @@ pub enum Commands {
     CommitTrailers(crate::commit_trailers::CommitTrailersArgs),
 
     #[command(
+        name = "guest-copy-debt",
+        about = "Ratchet guest-copy error collapses and bool copy trait methods"
+    )]
+    GuestCopyDebt {
+        #[arg(long)]
+        list: bool,
+        #[arg(long)]
+        base: Option<String>,
+    },
+
+    #[command(
         name = "copyout-debt",
         about = "Ratchet direct user-memory writes in the syscall dispatcher"
     )]
@@ -709,6 +720,15 @@ where
             crate::test_lanes::run(&info.repository_root, args, writer)?;
             Ok(())
         }
+        Commands::GuestCopyDebt { list, base } => {
+            let info = resolve_repo_info(cli.root.as_deref())?;
+            if list {
+                crate::guest_copy_debt::list(&info.repository_root, writer)
+            } else {
+                crate::guest_copy_debt::check(&info.repository_root, base.as_deref())
+            }
+            .map_err(CliError::Impact)
+        }
         Commands::CopyoutDebt { list, base } => {
             let info = resolve_repo_info(cli.root.as_deref())?;
             if list {
@@ -756,10 +776,11 @@ where
 }
 
 fn run_lint_source<W: Write>(root: Option<PathBuf>, writer: &mut W) -> Result<(), CliError> {
-    let checks: [&[&str]; 7] = [
+    let checks: [&[&str]; 8] = [
         &["workflow-patches"],
         &["terminal-custody"],
         &["copyout-debt"],
+        &["guest-copy-debt"],
         &["test-lanes", "check"],
         &["probe-coverage"],
         &["probe-emitters", "check"],

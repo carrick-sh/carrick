@@ -21,6 +21,7 @@ mod dispatch_mint;
 mod dispatch_redaction;
 pub mod dispatch_worker;
 pub mod fixtures;
+pub mod guest_copy_debt;
 pub mod guest_image;
 pub mod host_lease;
 pub mod host_load;

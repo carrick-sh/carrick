@@ -259,7 +259,7 @@ fn production_file(path: &Path) -> bool {
         })
 }
 
-fn files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+pub(crate) fn files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     for entry in fs::read_dir(dir).map_err(|error| format!("{}: {error}", dir.display()))? {
         let path = entry.map_err(|error| error.to_string())?.path();
         if path.is_dir() {

@@ -360,6 +360,7 @@ fn lint_source_reports_later_checks_after_a_ratchet_failure() {
             "lint-source: workflow-patches: ok",
             "lint-source: terminal-custody: FAIL",
             "lint-source: copyout-debt: ok",
+            "lint-source: guest-copy-debt: ok",
             "lint-source: test-lanes check: ok",
             "lint-source: probe-coverage: ok",
             "lint-source: probe-emitters check: ok",
@@ -567,4 +568,50 @@ fn workflow_patches_check_cross_boundary_renames() {
         run().status.success(),
         "applied cross-boundary rename passes"
     );
+}
+
+#[test]
+fn guest_copy_debt_cli_rejects_new_bool_trait_and_existing_call_collapse() {
+    let temp = tempfile::tempdir().unwrap();
+    init_git_repo(temp.path());
+    for name in [
+        "carrick-core",
+        "carrick-el1",
+        "carrick-el1-linux",
+        "carrick-personality-linux",
+        "carrick-kernel",
+        "carrick-x86",
+    ] {
+        std::fs::create_dir_all(temp.path().join("crates").join(name).join("src")).unwrap();
+    }
+    std::fs::create_dir(temp.path().join("scripts")).unwrap();
+    std::fs::write(
+        temp.path().join("scripts/guest-copy-debt-ceilings.json"),
+        "{}",
+    )
+    .unwrap();
+    let source = temp.path().join("crates/carrick-kernel/src/lib.rs");
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .args(["--root", temp.path().to_str().unwrap(), "guest-copy-debt"])
+            .env_remove("CARRICK_AUTHORITY_BASE")
+            .output()
+            .unwrap()
+    };
+    std::fs::write(&source, "fn f() { m.read_bytes(a,n)?; }").unwrap();
+    let clean = run();
+    assert!(
+        clean.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+    for mutation in [
+        "trait NewCopy { fn copy_from_user(&mut self, dst: &mut [u8], address: u64) -> bool; }",
+        "fn f() { match m.read_bytes(a,n) { Ok(v) => v, Err(_) => return LINUX_EFAULT }; }",
+    ] {
+        std::fs::write(&source, mutation).unwrap();
+        let refused = run();
+        assert!(!refused.status.success());
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("guest-copy debt differs"));
+    }
 }

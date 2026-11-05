@@ -572,7 +572,7 @@ _test-xtask-shards:
 
 [private]
 _test-xtask-domain-unit:
-    {{_cargo}} test --locked -p carrick-xtask --all-features --lib -- terminal_custody copyout_debt fixture_leaf_closure
+    {{_cargo}} test --locked -p carrick-xtask --all-features --lib -- terminal_custody copyout_debt guest_copy_debt fixture_leaf_closure
 
 [private]
 _test-xtask-domain-integration:
