@@ -67,6 +67,7 @@ fn locked_ranges_insert_keeps_the_set_sorted_and_merged() {
 }
 
 pub struct CountingMmapMemory {
+    sparse_frame_backing: bool,
     shared_scrub_calls: Cell<usize>,
     pub(crate) refuse_shared_scrub: bool,
     pub(crate) write_refusal: Cell<Option<carrick_el1_abi::PortalOwnerWait>>,
@@ -132,6 +133,7 @@ fn hvpatch_sparse_semantic_arena_stays_identity_while_low_fixed_hole_aliases() {
 impl CountingMmapMemory {
     pub(crate) fn new(base: u64, len: usize) -> Self {
         Self {
+            sparse_frame_backing: false,
             shared_scrub_calls: Cell::new(0),
             refuse_shared_scrub: false,
             write_refusal: Cell::new(None),
@@ -357,6 +359,9 @@ impl GuestMemory for CountingMmapMemory {
         len: usize,
         sharing: carrick_guest_mem::MappingSharing,
     ) -> Result<(), MemoryError> {
+        if self.sparse_frame_backing {
+            return Err(MemoryError::Unsupported);
+        }
         // Model the admitted ARM owner's refusal of unauthenticated shared
         // backing maintenance, without weakening ordinary anonymous tests.
         if sharing == carrick_guest_mem::MappingSharing::Shared {
@@ -383,6 +388,11 @@ impl GuestMemory for CountingMmapMemory {
             return Err(MemoryError::HostMap(format!(
                 "injected unmap failure at {address:#x}"
             )));
+        }
+        if self.sparse_frame_backing {
+            // Model retirement of private frames and pristine supply on touch.
+            let offset = self.range_offset(address, len)?;
+            self.bytes[offset..offset + len].fill(0);
         }
         self.unmap_log.borrow_mut().push((address, len));
         Ok(())
@@ -4852,6 +4862,98 @@ fn fresh_private_anonymous_mmap_skips_zero_write() {
          first-touch residency fault (the second call, PROT_NONE) so `mincore` \
          can tell a written page from an untouched one"
     );
+}
+
+/// #1663: placement below the arena's dirty watermark is conservative even
+/// for a fresh hint. Sparse backing must retire frames, not eagerly scrub VA.
+#[test]
+fn sparse_gap_hint_and_freed_prot_none_reuse_read_zero() {
+    for (address, length, sparse) in [
+        (0x4000000000, 64 << 20, true),
+        (LINUX_MMAP_BASE, 16 << 20, true),
+        (LINUX_MMAP_BASE, 16 << 20, false),
+    ] {
+        let dispatcher = SyscallDispatcher::new();
+        let _root = super::delegated_tests::Root::admit(&dispatcher);
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1001));
+        let reporter = CompatReporter::default();
+        let mut memory = CountingMmapMemory::new(address, length as usize).with_defer_anon(sparse);
+        memory.sparse_frame_backing = sparse;
+        let call = |memory: &mut CountingMmapMemory, nr, args| {
+            let outcome = threaded_memory_call(
+                &dispatcher,
+                memory,
+                &registry,
+                &reporter,
+                SyscallRequest::new(nr, SyscallArgs(args)),
+            );
+            assert!(
+                !matches!(outcome, DispatchOutcome::Errno { .. }),
+                "nr={nr} address={address:#x} sparse={sparse}: {outcome:?}"
+            );
+            returned(outcome)
+        };
+        for round in 0..2 {
+            assert_eq!(
+                call(
+                    &mut memory,
+                    222,
+                    [
+                        address,
+                        length,
+                        0,
+                        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                        u64::MAX,
+                        0
+                    ]
+                ),
+                address as i64,
+                "PROT_NONE hint must succeed, round {round}"
+            );
+            assert_eq!(
+                call(
+                    &mut memory,
+                    226,
+                    [address, length, LINUX_PROT_READ | LINUX_PROT_WRITE, 0, 0, 0]
+                ),
+                0
+            );
+            assert!(
+                memory
+                    .read_bytes(address, length as usize)
+                    .unwrap()
+                    .iter()
+                    .all(|b| *b == 0)
+            );
+            memory
+                .write_bytes(address, &vec![0x58; length as usize])
+                .unwrap();
+            if address != LINUX_MMAP_BASE {
+                // The gap witness covers reserve/protect/touch. Freed-buffer
+                // reuse below exercises the arena's munmap retirement route.
+                break;
+            }
+            assert_eq!(call(&mut memory, 215, [address, length, 0, 0, 0, 0]), 0);
+        }
+        if sparse {
+            assert_eq!(
+                memory.zero_backing_calls.get(),
+                0,
+                "sparse reservations must do no eager zero-fill work"
+            );
+            assert_eq!(
+                memory.unmap_calls.get(),
+                if address == LINUX_MMAP_BASE { 4 } else { 1 },
+                "each sparse publication and arena unmap must retire predecessor frames"
+            );
+        } else {
+            assert!(
+                memory.zero_backing_calls.get() >= 1,
+                "eager backing must still scrub reused PROT_NONE mappings"
+            );
+        }
+    }
 }
 
 #[test]

@@ -1532,7 +1532,17 @@ impl<'a> MemView<'a> {
             // A shared file snapshot initializes the entire rounded range,
             // including its zero tail. It owns that initialization; anonymous
             // maintenance has no authority over an admitted owner's file map.
-            let reuse_scrub_needed = (reused || fixed_anonymous) && !address_uses_alias
+            let sparse_anonymous_backing = memory.supports_lazy_anonymous_mmap();
+            // Private sparse mappings retire predecessor frames below, then
+            // reserve fresh-zero first-touch backing. The VA watermark is only
+            // an eager-backing heuristic (even a fresh low hint is below it).
+            // Do not scrub a guest VA with no physical backing. Eager backends
+            // still need the permission-independent scrub for PROT_NONE reuse.
+            let private_sparse_anonymous = sparse_anonymous_backing
+                && map_flags.contains(LinuxMmapFlags::ANONYMOUS)
+                && map_sharing == MmapSharing::Private;
+            let reuse_scrub_needed = !private_sparse_anonymous
+                && (reused || fixed_anonymous) && !address_uses_alias
                 && (map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                     || map_sharing == MmapSharing::Private);
             if reuse_scrub_needed && !lowering_candidate && !owner_file_backed {
@@ -1562,7 +1572,6 @@ impl<'a> MemView<'a> {
             // page reclaimed from a prior munmap (which invalidated it) must be
             // valid+RW again, and a PROT_NONE mmap must actually fault. No-op
             // (no TLBI) when the page is already at the target protection.
-            let sparse_anonymous_backing = memory.supports_lazy_anonymous_mmap();
             let defer_anonymous = sparse_anonymous_backing
                 && this.linux_page_size() == 4096
                 && map_flags.contains(LinuxMmapFlags::PRIVATE)
