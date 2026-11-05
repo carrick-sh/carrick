@@ -502,6 +502,12 @@ fn el1_ipc_stale_object_generations_are_rejected() {
     let (_, new) = fx.eventfd(t, 5, EventMode::Counter);
     assert_eq!(new.index(), old.index(), "the record is reused");
     assert_ne!(new.generation(), old.generation());
+    for lane in [pipe::WaitFor::Readable, pipe::WaitFor::Writable] {
+        let old_key = object_wait_key(old, lane).unwrap();
+        let new_key = object_wait_key(new, lane).unwrap();
+        assert_eq!(old_key.index(), new_key.index());
+        assert!(new_key.generation() > old_key.generation());
+    }
     assert_eq!(fx.region.lock(old, &Spin).err(), Some(IpcError::Stale));
     assert_eq!(fx.region.observe(old), Err(IpcError::Stale));
     assert_eq!(

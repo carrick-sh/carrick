@@ -20,6 +20,14 @@ remain host-served, as before; no new queue allocation or population scan is
 introduced. Each admitted IPC lane retains object generation + 1, so slot
 reuse advances its exact incarnation without entering another owner's domain.
 
+Restoring admitted main's shared constructor while retaining the production
+dispatcher witness reproduces `ipc::admission: object wait generation
+collision` and SIGABRT. This is a queue-domain collision, rather than a missing
+object-generation increment: the generic scheduler constructor accepts indices
+reserved for metadata and MM owners. The ABI stale-object witness additionally
+checks that both lane keys keep their indices and strictly advance their
+generations when the production object allocator reuses a slot.
+
 The director retains signed PID-1 pipemass and Linux output comparison on
 macOS. This VM-free witness proves admission, close and identity isolation,
 not guest instruction execution or end-to-end runtime ratios.
