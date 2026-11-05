@@ -12,7 +12,7 @@ use carrick_core_abi::{SeqAtomic, SeqLockAtomic};
 
 #[repr(transparent)]
 #[derive(Debug, Default)]
-struct LoomNameCacheAtomic(AtomicU64);
+pub(crate) struct LoomNameCacheAtomic(AtomicU64);
 
 impl SeqAtomic for LoomNameCacheAtomic {
     #[inline]

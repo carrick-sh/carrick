@@ -514,6 +514,24 @@ impl<M: carrick_guest_mem::CurrentMmMemory> UserCopy for HostCopy<'_, M> {
 }
 
 impl<M: carrick_guest_mem::CurrentMmMemory> HostCopy<'_, M> {
+    /// Imported vectors can end their readable prefix between logical page
+    /// boundaries. Preserve that exact prefix rather than asking the boolean
+    /// user-copy interface to accept an entire logical page.
+    fn copy_prefetched_prefix(&mut self, dst: &mut [u8], at: u64) -> usize {
+        let Some(start) = at
+            .checked_sub(self.prefetch_va)
+            .and_then(|offset| usize::try_from(offset).ok())
+        else {
+            return 0;
+        };
+        let Some(remaining) = self.prefetch.get(start..) else {
+            return 0;
+        };
+        let count = remaining.len().min(dst.len());
+        dst[..count].copy_from_slice(&remaining[..count]);
+        count
+    }
+
     /// Read the longest readable prefix of `[va, va+len)` before any lock.
     fn prefetch(&mut self, va: u64, len: u64) {
         let HostOutput::Legacy(memory) = &self.output else {
@@ -699,7 +717,7 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
                 &mut guard,
                 &mut op,
                 &mut copy,
-                |copy, at, dst| copy.copy_in(dst, at),
+                |copy, at, dst| copy.user.copy_prefetched_prefix(dst, at),
             )?
         } else {
             transfer(&mut guard, &mut op, &mut copy)?
