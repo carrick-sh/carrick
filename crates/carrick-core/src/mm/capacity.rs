@@ -114,7 +114,7 @@ pub struct MetadataAllocatorCore {
     active_extents_count: usize,
     total_capacity_bytes: usize,
     allocated_bytes: usize,
-    #[cfg(target_os = "none")]
+    #[cfg(any(target_os = "none", test, feature = "host-test"))]
     grant_denied_pending: bool,
 }
 
@@ -138,17 +138,17 @@ impl MetadataAllocatorCore {
             active_extents_count: 0,
             total_capacity_bytes: 0,
             allocated_bytes: 0,
-            #[cfg(target_os = "none")]
+            #[cfg(any(target_os = "none", test, feature = "host-test"))]
             grant_denied_pending: false,
         }
     }
 
-    #[cfg(target_os = "none")]
+    #[cfg(any(target_os = "none", test, feature = "host-test"))]
     pub fn note_grant_denied(&mut self) {
         self.grant_denied_pending = true;
     }
 
-    #[cfg(target_os = "none")]
+    #[cfg(any(target_os = "none", test, feature = "host-test"))]
     pub fn take_grant_denied(&mut self) -> bool {
         core::mem::replace(&mut self.grant_denied_pending, false)
     }
@@ -611,41 +611,51 @@ impl MetadataAllocatorCore {
         self.prepare_deallocate_extent(ptr, align)
     }
 
-    #[cfg(target_os = "none")]
-    pub fn next_pending_return(&self) -> Option<ExtentToReturn> {
-        self.extents
-            .iter()
-            .enumerate()
-            .find_map(|(slot_idx, extent)| {
-                if extent.state != ExtentState::PendingReturn {
-                    return None;
-                }
-                let ExtentKind::Dynamic { token } = extent.kind else {
-                    return None;
-                };
-                Some(ExtentToReturn {
-                    base_va: extent.base_va,
-                    size: extent.size,
-                    token,
-                    slot_idx,
-                })
-            })
+    /// Select one exact return, including a grant admitted after its demand
+    /// disappeared. Selection is bounded by the existing 128-descriptor table.
+    /// The caller must give its allocation attempt first use of a new grant.
+    #[cfg(any(target_os = "none", test, feature = "host-test"))]
+    pub fn next_pending_return(&mut self) -> Option<ExtentToReturn> {
+        let slot_idx = self.extents.iter().position(|extent| {
+            matches!(extent.kind, ExtentKind::Dynamic { .. })
+                && (extent.state == ExtentState::PendingReturn
+                    || (extent.state == ExtentState::Active && extent.live_allocations == 0))
+        })?;
+        let extent = self.extents[slot_idx];
+        let ExtentKind::Dynamic { token } = extent.kind else {
+            return None;
+        };
+        if extent.state == ExtentState::Active {
+            // An admitted but never used extent is one complete free block.
+            // Remove it before publishing FREE so another participant cannot
+            // allocate from bytes whose host return is already in flight.
+            self.unlink_free_block(extent.base_va as *mut BlockHeader);
+            self.extents[slot_idx].state = ExtentState::PendingReturn;
+        }
+        Some(ExtentToReturn {
+            base_va: extent.base_va,
+            size: extent.size,
+            token,
+            slot_idx,
+        })
     }
 
-    #[cfg(target_os = "none")]
+    #[cfg(any(target_os = "none", test, feature = "host-test"))]
     pub fn mark_return_requested(&mut self, slot_idx: usize) {
         if slot_idx < MAX_EXTENTS && self.extents[slot_idx].state == ExtentState::PendingReturn {
             self.extents[slot_idx].state = ExtentState::ReturnRequested;
         }
     }
 
-    #[cfg(target_os = "none")]
+    #[cfg(any(target_os = "none", test, feature = "host-test"))]
     pub fn has_pending_return(&self) -> bool {
         self.extents.iter().any(|extent| {
             matches!(
                 extent.state,
                 ExtentState::PendingReturn | ExtentState::ReturnRequested
-            )
+            ) || (extent.state == ExtentState::Active
+                && extent.live_allocations == 0
+                && matches!(extent.kind, ExtentKind::Dynamic { .. }))
         })
     }
 
@@ -881,6 +891,81 @@ mod tests {
             alloc.admit_extent(base + 2048, 4096, ExtentKind::Bootstrap),
             Err(ExtentAdmissionError::OverlapWithExisting)
         );
+    }
+
+    #[test]
+    fn return_selection_preserves_bootstrap_and_live_grants() {
+        let mut bootstrap = vec![0u128; 1024];
+        let mut granted = vec![0u128; 2048];
+        let mut allocator = MetadataAllocatorCore::new();
+        allocator
+            .admit_extent(bootstrap.as_mut_ptr() as u64, 16384, ExtentKind::Bootstrap)
+            .unwrap();
+        allocator
+            .admit_extent(
+                granted.as_mut_ptr() as u64,
+                32768,
+                ExtentKind::Dynamic { token: 43 },
+            )
+            .unwrap();
+        // As in MetadataStorage::allocate, first use precedes return selection.
+        let pointer = allocator.allocate(24000, 16).unwrap();
+        assert!(allocator.next_pending_return().is_none());
+        assert!(!allocator.has_pending_return());
+        let receipt = allocator.deallocate(pointer, 16).unwrap();
+        assert_eq!(allocator.next_pending_return(), Some(receipt));
+        allocator.mark_return_requested(receipt.slot_idx);
+        assert!(allocator.next_pending_return().is_none());
+        assert!(allocator.complete_extent_return(receipt));
+        assert!(allocator.next_pending_return().is_none());
+        assert_eq!(allocator.diagnostics().active_extents, 1);
+    }
+
+    #[test]
+    fn delayed_grant_after_last_deallocation_is_returned_exactly_once() {
+        // A misses while B owns the usable extent. A's host grant is delayed
+        // until B frees its last allocation. B/drain then admits A's response,
+        // but nobody needs to allocate from it: it still owes a host return.
+        let mut first = vec![0u128; 1024];
+        let mut delayed = vec![0u128; 1024];
+        let mut allocator = MetadataAllocatorCore::new();
+        allocator
+            .admit_extent(
+                first.as_mut_ptr() as u64,
+                16384,
+                ExtentKind::Dynamic { token: 41 },
+            )
+            .unwrap();
+        let pointer = allocator.allocate(12000, 16).unwrap();
+        assert!(allocator.allocate(12000, 16).is_none());
+        let first_return = allocator.deallocate(pointer, 16).unwrap();
+        allocator
+            .admit_extent(
+                delayed.as_mut_ptr() as u64,
+                16384,
+                ExtentKind::Dynamic { token: 42 },
+            )
+            .unwrap();
+        assert!(allocator.complete_extent_return(first_return));
+        assert!(
+            allocator.has_pending_return(),
+            "unused delayed grant lost its return"
+        );
+        let receipt = allocator
+            .next_pending_return()
+            .expect("delayed grant return");
+        assert_eq!(receipt.token, 42);
+        assert_eq!(receipt.base_va, delayed.as_mut_ptr() as u64);
+        allocator.mark_return_requested(receipt.slot_idx);
+        assert!(allocator.next_pending_return().is_none());
+        assert!(
+            allocator.allocate(12000, 16).is_none(),
+            "returning bytes remain allocatable"
+        );
+        assert!(allocator.complete_extent_return(receipt));
+        assert!(!allocator.complete_extent_return(receipt));
+        assert!(!allocator.has_pending_return());
+        assert_eq!(allocator.diagnostics().active_extents, 0);
     }
 
     #[test]

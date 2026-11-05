@@ -1,3 +1,10 @@
+# #1572: metadata allocation consumes a response before allocation and
+# selects empty dynamic grants for return afterwards. The allocator lock
+# remains held across those bounded operations; request publication keeps
+# the same ShortLockSpin queue admission and pending-host-work mark. No
+# scheduler bucket acquisition, contention refusal, IRQ custody or guest
+# redispatch policy changes. Retain bucket_contention_msgrcv as the existing
+# short-lock control; allocator lifetime evidence is in the metadata contract.
 # #1028: type physical custody diagnostic reasons; no change to this
 # contract's semantics or work budgets. The host dispatch test
 # physical_custody_reasons_preserve_fatal_codes_and_debug_text checks

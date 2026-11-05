@@ -41,9 +41,11 @@ fn current_el1_slot() -> Option<usize> {
 /// Safe thread-safe wrapper around `MetadataAllocatorCore` with IRQ save/restore spinlock.
 pub struct MetadataStorage {
     lock: SpinLock<MetadataAllocatorCore>,
+    #[cfg(test)]
+    mailbox: Option<carrick_el1_abi::MetadataGrantMailbox>,
 }
 
-#[cfg(target_os = "none")]
+#[cfg(any(target_os = "none", test))]
 #[derive(
     ::core::clone::Clone,
     ::core::marker::Copy,
@@ -79,6 +81,8 @@ impl MetadataStorage {
     pub const fn new() -> Self {
         Self {
             lock: SpinLock::new(MetadataAllocatorCore::new()),
+            #[cfg(test)]
+            mailbox: None,
         }
     }
 
@@ -111,18 +115,42 @@ impl MetadataStorage {
         res
     }
 
-    #[cfg(target_os = "none")]
-    fn mark_pending_host_work(slot: usize) {
-        if let Some(task) = carrick_el1_abi::current_task_guest(slot) {
-            task.linux.mark_pending_host_work();
+    #[cfg(any(target_os = "none", test))]
+    fn mailbox_context(&self) -> Option<(&carrick_el1_abi::MetadataGrantMailbox, usize)> {
+        #[cfg(target_os = "none")]
+        {
+            current_el1_slot().map(|slot| (carrick_el1_abi::metadata_mailbox_guest(), slot))
+        }
+        #[cfg(all(test, not(target_os = "none")))]
+        {
+            self.mailbox.as_ref().map(|mailbox| (mailbox, 0))
         }
     }
 
-    #[cfg(target_os = "none")]
-    fn publish_request(slot: usize, request: carrick_el1_abi::MetadataGrantRequest) -> bool {
-        if !carrick_el1_abi::metadata_mailbox_guest().try_publish_request_prepared(
-            request,
-            |generation| {
+    #[cfg(any(target_os = "none", test))]
+    fn mark_pending_host_work(slot: usize) {
+        #[cfg(target_os = "none")]
+        if let Some(task) = carrick_el1_abi::current_task_guest(slot) {
+            task.linux.mark_pending_host_work();
+        }
+        #[cfg(not(target_os = "none"))]
+        let _ = slot;
+    }
+
+    #[cfg(any(target_os = "none", test))]
+    fn publish_request(
+        mailbox: &carrick_el1_abi::MetadataGrantMailbox,
+        slot: usize,
+        request: carrick_el1_abi::MetadataGrantRequest,
+    ) -> bool {
+        if !mailbox.try_publish_request_prepared(request, |generation| {
+            #[cfg(not(target_os = "none"))]
+            {
+                let _ = generation;
+                true
+            }
+            #[cfg(target_os = "none")]
+            {
                 // SAFETY: the carrier maps the zone for the complete EL1 lifetime.
                 let zone = unsafe { metadata_zone_at(carrick_el1_abi::EL1_ZONE_BASE as *const u8) };
                 let Some(key) =
@@ -132,17 +160,20 @@ impl MetadataStorage {
                 };
                 zone.bind_object_wait(key, &carrick_sched_core::ShortLockSpin)
                     .is_ok()
-            },
-        ) {
+            }
+        }) {
             return false;
         }
         Self::mark_pending_host_work(slot);
         true
     }
 
-    #[cfg(target_os = "none")]
-    fn synchronize_response(core: &mut MetadataAllocatorCore, slot: usize) -> MailboxSync {
-        let mailbox = carrick_el1_abi::metadata_mailbox_guest();
+    #[cfg(any(target_os = "none", test))]
+    fn synchronize_response(
+        mailbox: &carrick_el1_abi::MetadataGrantMailbox,
+        core: &mut MetadataAllocatorCore,
+        slot: usize,
+    ) -> MailboxSync {
         let Some(response) = mailbox.claim_response() else {
             return MailboxSync::None;
         };
@@ -173,6 +204,7 @@ impl MetadataStorage {
                         core.note_grant_denied();
                         mailbox.finish_response();
                         if Self::publish_request(
+                            mailbox,
                             slot,
                             carrick_el1_abi::MetadataGrantRequest {
                                 op: carrick_el1_abi::METADATA_GRANT_OP_FREE,
@@ -212,12 +244,17 @@ impl MetadataStorage {
         outcome
     }
 
-    #[cfg(target_os = "none")]
-    fn publish_pending_return(core: &mut MetadataAllocatorCore, slot: usize) -> bool {
+    #[cfg(any(target_os = "none", test))]
+    fn publish_pending_return(
+        mailbox: &carrick_el1_abi::MetadataGrantMailbox,
+        core: &mut MetadataAllocatorCore,
+        slot: usize,
+    ) -> bool {
         let Some(to_return) = core.next_pending_return() else {
             return false;
         };
         if !Self::publish_request(
+            mailbox,
             slot,
             carrick_el1_abi::MetadataGrantRequest {
                 op: carrick_el1_abi::METADATA_GRANT_OP_FREE,
@@ -233,24 +270,40 @@ impl MetadataStorage {
         true
     }
 
-    #[cfg(target_os = "none")]
-    fn service_mailbox(core: &mut MetadataAllocatorCore, slot: usize) -> MailboxSync {
-        let outcome = Self::synchronize_response(core, slot);
-        Self::publish_pending_return(core, slot);
+    #[cfg(any(target_os = "none", test))]
+    fn service_mailbox(
+        mailbox: &carrick_el1_abi::MetadataGrantMailbox,
+        core: &mut MetadataAllocatorCore,
+        slot: usize,
+    ) -> MailboxSync {
+        let outcome = Self::synchronize_response(mailbox, core, slot);
+        Self::flush_pending_returns(mailbox, core, slot);
+        outcome
+    }
+
+    #[cfg(any(target_os = "none", test))]
+    fn flush_pending_returns(
+        mailbox: &carrick_el1_abi::MetadataGrantMailbox,
+        core: &mut MetadataAllocatorCore,
+        slot: usize,
+    ) {
+        Self::publish_pending_return(mailbox, core, slot);
         // The mailbox is carrier-wide. A participant that lost publication
         // to another vCPU must still leave through a host boundary; otherwise
         // it can consume its entire bounded retry budget in EL1 before the
         // request owner is scheduled. Any participant may service the exact
         // single-flight request once its allocator stack has unwound.
-        if Self::host_work_pending(core) {
+        if Self::host_work_pending(mailbox, core) {
             Self::mark_pending_host_work(slot);
         }
-        outcome
     }
 
-    #[cfg(target_os = "none")]
-    fn host_work_pending(core: &MetadataAllocatorCore) -> bool {
-        core.has_pending_return() || carrick_el1_abi::metadata_mailbox_guest().has_guest_work()
+    #[cfg(any(target_os = "none", test))]
+    fn host_work_pending(
+        mailbox: &carrick_el1_abi::MetadataGrantMailbox,
+        core: &MetadataAllocatorCore,
+    ) -> bool {
+        core.has_pending_return() || mailbox.has_guest_work()
     }
 
     pub fn allocate(&self, layout: Layout) -> Option<*mut u8> {
@@ -268,18 +321,27 @@ impl MetadataStorage {
                 ExtentKind::Bootstrap,
             );
         }
-        #[cfg(target_os = "none")]
-        let _mailbox_sync = current_el1_slot()
-            .map(|slot| Self::service_mailbox(&mut core, slot))
+        #[cfg(any(target_os = "none", test))]
+        let _mailbox_sync = self
+            .mailbox_context()
+            .map(|(mailbox, slot)| Self::synchronize_response(mailbox, &mut core, slot))
             .unwrap_or(MailboxSync::None);
         let p = core.allocate(size, align);
+        // Give this attempt first use of an admitted grant. Afterwards every
+        // empty dynamic extent, including an unused delayed response, owes a
+        // return. Selecting returns before this attempt would discard the
+        // capacity that this allocation just requested.
+        #[cfg(any(target_os = "none", test))]
+        if let Some((mailbox, slot)) = self.mailbox_context() {
+            Self::flush_pending_returns(mailbox, &mut core, slot);
+        }
         if p.is_some() {
             core::mem::drop(core);
             restore_irq(guard);
             return p;
         }
 
-        #[cfg(target_os = "none")]
+        #[cfg(any(target_os = "none", test))]
         {
             // A refusal belongs to the capacity miss that required a grant,
             // not to an unrelated smaller allocation that happened to consume
@@ -290,8 +352,11 @@ impl MetadataStorage {
                 return None;
             }
             let needed_size = core.needed_grant_size(size, align);
-            if let (Some(slot), Some(needed_size)) = (current_el1_slot(), needed_size) {
+            if let (Some((mailbox, slot)), Some(needed_size)) =
+                (self.mailbox_context(), needed_size)
+            {
                 Self::publish_request(
+                    mailbox,
                     slot,
                     carrick_el1_abi::MetadataGrantRequest {
                         op: carrick_el1_abi::METADATA_GRANT_OP_ALLOC,
@@ -330,14 +395,14 @@ impl MetadataStorage {
         let align = layout.align().max(16);
         let guard = disable_irq_save();
         let mut core = self.lock.lock();
-        #[cfg(target_os = "none")]
-        if let Some(slot) = current_el1_slot() {
-            Self::service_mailbox(&mut core, slot);
+        #[cfg(any(target_os = "none", test))]
+        if let Some((mailbox, slot)) = self.mailbox_context() {
+            Self::service_mailbox(mailbox, &mut core, slot);
         }
         core.prepare_deallocate_extent(ptr, align);
-        #[cfg(target_os = "none")]
-        if let Some(slot) = current_el1_slot() {
-            Self::publish_pending_return(&mut core, slot);
+        #[cfg(any(target_os = "none", test))]
+        if let Some((mailbox, slot)) = self.mailbox_context() {
+            Self::publish_pending_return(mailbox, &mut core, slot);
         }
         core::mem::drop(core);
         restore_irq(guard);
@@ -345,13 +410,13 @@ impl MetadataStorage {
 
     #[cfg(all(feature = "allocator-test-control", target_os = "none"))]
     fn service_test_host_work(&self) -> bool {
-        let Some(slot) = current_el1_slot() else {
+        let Some((mailbox, slot)) = self.mailbox_context() else {
             return false;
         };
         let guard = disable_irq_save();
         let mut core = self.lock.lock();
-        Self::service_mailbox(&mut core, slot);
-        let pending = Self::host_work_pending(&core);
+        Self::service_mailbox(mailbox, &mut core, slot);
+        let pending = Self::host_work_pending(mailbox, &core);
         core::mem::drop(core);
         restore_irq(guard);
         pending
@@ -605,6 +670,96 @@ unsafe impl carrick_core::mm::reservation::ReservationMetadataAllocator for Meta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn storage_with_mailbox() -> MetadataStorage {
+        MetadataStorage {
+            lock: SpinLock::new(MetadataAllocatorCore::new()),
+            mailbox: Some(carrick_el1_abi::MetadataGrantMailbox::new()),
+        }
+    }
+
+    #[test]
+    fn delayed_grant_consumed_by_last_deallocation_returns_both_extents() {
+        let storage = storage_with_mailbox();
+        let mailbox = storage.mailbox.as_ref().unwrap();
+        let mut occupied = vec![0u128; 1024];
+        let mut delayed = vec![0u128; 1024];
+        storage
+            .lock
+            .lock()
+            .admit_extent(
+                occupied.as_mut_ptr() as u64,
+                16384,
+                ExtentKind::Dynamic { token: 71 },
+            )
+            .unwrap();
+        let layout = Layout::from_size_align(12000, 16).unwrap();
+        let pointer = storage.allocate(layout).unwrap();
+        // Participant A misses while B holds the only usable allocation.
+        assert!(storage.allocate(layout).is_none());
+        let request = mailbox.claim_request().unwrap();
+        assert_eq!(request.op, carrick_el1_abi::METADATA_GRANT_OP_ALLOC);
+        // Hold A's host owner until B is about to perform its final free.
+        mailbox.publish_response(
+            carrick_el1_abi::METADATA_GRANT_SUCCESS,
+            delayed.as_mut_ptr() as u64,
+            16384,
+            72,
+        );
+        storage.deallocate(pointer, layout);
+        let returned = mailbox
+            .claim_request()
+            .expect("unused delayed grant must return");
+        assert_eq!(returned.op, carrick_el1_abi::METADATA_GRANT_OP_FREE);
+        let first_token = returned.arg3;
+        mailbox.publish_response(carrick_el1_abi::METADATA_GRANT_SUCCESS, 0, 0, 0);
+        // The ordinary production drain follows the remaining exact receipt.
+        {
+            let mut core = storage.lock.lock();
+            MetadataStorage::service_mailbox(mailbox, &mut core, 0);
+        }
+        let returned = mailbox
+            .claim_request()
+            .expect("both grants must return, including the never-allocated response");
+        assert_eq!(returned.op, carrick_el1_abi::METADATA_GRANT_OP_FREE);
+        let mut tokens = [first_token, returned.arg3];
+        tokens.sort_unstable();
+        assert_eq!(tokens, [71, 72], "each exact grant must return once");
+        mailbox.publish_response(carrick_el1_abi::METADATA_GRANT_SUCCESS, 0, 0, 0);
+        {
+            let mut core = storage.lock.lock();
+            MetadataStorage::service_mailbox(mailbox, &mut core, 0);
+        }
+        assert!(!mailbox.has_guest_work());
+        assert_eq!(storage.diagnostics().active_extents, 0);
+    }
+
+    #[test]
+    fn allocation_uses_fresh_grant_before_return_selection() {
+        let storage = storage_with_mailbox();
+        let mailbox = storage.mailbox.as_ref().unwrap();
+        let layout = Layout::from_size_align(12000, 16).unwrap();
+        assert!(storage.allocate(layout).is_none());
+        assert_eq!(
+            mailbox.claim_request().unwrap().op,
+            carrick_el1_abi::METADATA_GRANT_OP_ALLOC
+        );
+        let mut backing = vec![0u128; 1024];
+        mailbox.publish_response(
+            carrick_el1_abi::METADATA_GRANT_SUCCESS,
+            backing.as_mut_ptr() as u64,
+            16384,
+            73,
+        );
+        let pointer = storage
+            .allocate(layout)
+            .expect("requesting attempt must get first use");
+        assert!(!mailbox.has_guest_work(), "live grant cannot be returned");
+        storage.deallocate(pointer, layout);
+        let returned = mailbox.claim_request().unwrap();
+        assert_eq!(returned.op, carrick_el1_abi::METADATA_GRANT_OP_FREE);
+        assert_eq!(returned.arg3, 73);
+    }
 
     #[test]
     fn metadata_wait_view_reaches_arm_zone_tables_after_parked_records() {
