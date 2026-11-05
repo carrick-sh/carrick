@@ -6325,6 +6325,14 @@ mod real {
         /// (0 on success). Lets `carrick trace` see WHY a host-backed fs
         /// syscall returned an errno — the internal reason invisible to the guest.
         fn fs__op(_: u32, _: &str, _: &str, _: i32) {}
+        /// rt-sigprocmask-copy-refusal: which=0 new_set read, 1 old_set write;
+        /// va is a guest VA (never a host pointer). Read variant codes:
+        /// 1 OwnerRetired, 2 ReadSuspended, 3 Physical, 4 OwnerWait,
+        /// 5 Supply, 6 OutOfBounds, 7 Unsupported, 8 HostMap,
+        /// 9 MetadataAllocation. Write code 10 is a terminal copyout EFAULT;
+        /// retryable copyout outcomes are propagated and do not fire here.
+        fn rt__sigprocmask__copy__refusal(_: u32, _: u64, _: u32) {}
+
         /// Fires when a guest signal handler frame is injected. `signum` is the
         /// Linux signal, `saved_pc` the pre-signal PC stored in the sigframe (the
         /// PC the eventual rt_sigreturn must restore), `new_sp` the SP_EL0 the
@@ -8724,6 +8732,10 @@ mod real {
         carrick_usdt::fork__post!(|| (pid, pc, elr));
     }
 
+    pub fn rt_sigprocmask_copy_refusal(which: u32, va: u64, variant: u32) {
+        carrick_usdt::rt__sigprocmask__copy__refusal!(|| (which, va, variant));
+    }
+
     pub fn signal_inject(signum: i32, saved_pc: u64, new_sp: u64, handler: u64) {
         carrick_usdt::signal__inject!(|| (signum, saved_pc, new_sp, handler));
     }
@@ -9950,6 +9962,7 @@ mod stub {
     stub!(fork_footprint(phase: i32, vm_region_count: u64, arena_high_water: u64, resident_bytes: u64, virtual_bytes: u64));
     stub!(fork_footprint_class(class_id: i32, region_count: u64, scan_bytes: u64, resident_bytes: u64, flags: u64));
     stub!(fork_post(pid: i32, pc: u64, elr: u64));
+    stub!(rt_sigprocmask_copy_refusal(which: u32, va: u64, variant: u32));
     stub!(signal_inject(signum: i32, saved_pc: u64, new_sp: u64, handler: u64));
     stub!(guest_internal_write_fault(address: u64, length: u64, phase: u32, error: &str));
     stub!(hvpatch_exec_publication(output: u64, len: u64, invalidations: u32));

@@ -2241,7 +2241,19 @@ impl<'a> SignalView<'a> {
             let new_mask = if new_set != 0 {
                 let bytes = match memory.read_bytes(new_set, LINUX_RT_SIGSET_SIZE as usize) {
                     Ok(bytes) => bytes,
-                    Err(_) => {
+                    Err(error) => {
+                        let variant = match &error {
+                            MemoryError::OwnerRetired(_) => 1,
+                            MemoryError::ReadSuspended(_) => 2,
+                            MemoryError::Physical(_) => 3,
+                            MemoryError::OwnerWait(_) => 4,
+                            MemoryError::Supply(_) => 5,
+                            MemoryError::OutOfBounds { .. } => 6,
+                            MemoryError::Unsupported => 7,
+                            MemoryError::HostMap(_) => 8,
+                            MemoryError::MetadataAllocation => 9,
+                        };
+                        crate::probes::rt_sigprocmask_copy_refusal(0, new_set, variant);
                         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                     }
                 };
@@ -2261,6 +2273,9 @@ impl<'a> SignalView<'a> {
             if old_set != 0 {
                 let outcome = crate::dispatch::copyout::copyout_bytes(cx.kernel, memory, carrick_guest_mem::GuestVa::new(old_set),
                     &previous_mask.raw().to_le_bytes(), DispatchOutcome::Returned { value: 0 });
+                if matches!(outcome, DispatchOutcome::Errno { errno } if errno == LINUX_EFAULT) {
+                    crate::probes::rt_sigprocmask_copy_refusal(1, old_set, 10);
+                }
                 if !matches!(outcome, DispatchOutcome::Returned { .. }) { return Ok(outcome); }
             }
             if let Some(mask) = new_mask {
