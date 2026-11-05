@@ -9748,7 +9748,7 @@ fn serial_host_native_fork_unpublished_parent_ipc_table_succeeds_without_einval(
     );
 }
 
-#[cfg(all(test, not(target_os = "macos")))]
+#[cfg(test)]
 fn activate_target(
     source: BornInZoneSource<'_, Aarch64ParkedContext>,
     task: &CurrentTask,

@@ -3421,6 +3421,15 @@ fn native_child_exec_after_ring_setuid_carries_the_new_credentials() {
 #[cfg(test)]
 #[test]
 fn native_parent_reaps_then_execs_a_child_after_slot_reuse() {
+    parent_reaps_then_execs_child(false);
+}
+
+#[test]
+fn native_namespace_mutation_baseline_exec_successor() {
+    parent_reaps_then_execs_child(true);
+}
+
+fn parent_reaps_then_execs_child(namespace_census: bool) {
     let capacity = NativeServiceCapacityFixture::new(1);
     let fixture = &capacity.fixture;
     let (child_record, child_address, child_words) = capacity.select().unwrap();
@@ -3492,8 +3501,86 @@ fn native_parent_reaps_then_execs_a_child_after_slot_reuse() {
         fixture.task.mm.key.load(Ordering::Acquire),
         successor_mm.raw()
     );
-    // This is the successor's first completed syscall boundary. It then exits
-    // with status 7, which must wake the already-parked parent wait4 owner.
+    if namespace_census {
+        // #1335 slice 1: successful exec changes the MM incarnation but cannot
+        // manufacture a host task for a fork child. Drive the shared production
+        // dispatcher before the shipping final-capture policy on that successor.
+        // Physical performs this fixture's exec retirement and wake delivery
+        // synchronously; acknowledge its host boundary before the next syscall.
+        if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
+            work.settled();
+        }
+        assert!(!child.is_root_process());
+        let path = carrick_test_support::GuestUserBuffer::from_bytes(b"successor-name\0");
+        let other = carrick_test_support::GuestUserBuffer::from_bytes(b"successor-target\0");
+        let output = carrick_test_support::GuestUserBuffer::from_bytes(&[0u8; 128]);
+        let counters = carrick_el1_abi::Counters::new();
+        let names = carrick_el1_abi::InotifyNameCache::new();
+        for (nr, args) in [
+            (34, [(-100i64) as u64, path.arg(), 0o777, 0]),
+            (35, [(-100i64) as u64, path.arg(), 0, 0]),
+            (
+                38,
+                [(-100i64) as u64, path.arg(), (-100i64) as u64, other.arg()],
+            ),
+            (36, [other.arg(), (-100i64) as u64, path.arg(), 0]),
+            (78, [(-100i64) as u64, path.arg(), output.arg(), 128]),
+            (53, [(-100i64) as u64, path.arg(), 0o700, 0]),
+        ] {
+            let mut frame = carrick_el1_abi::TrapFrame {
+                esr: 0x15 << 26,
+                ..Default::default()
+            };
+            frame.x[8] = nr;
+            frame.x[..4].copy_from_slice(&args);
+            let route = crate::dispatch::dispatch_syscall_with_native::<
+                _,
+                crate::sched::FakeCpu,
+                crate::sched::HardwareUserWord,
+                _,
+                ParkedContextWords,
+            >(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(fixture.task),
+                &[],
+                &[],
+                &[],
+                &[],
+                &names,
+                None,
+                None,
+                None,
+                Some(&mut *child),
+                Some(source),
+                None,
+                |_| core::ptr::null_mut(),
+            );
+            assert_eq!(
+                route,
+                carrick_personality_linux::dispatch::CompletionRoute::Forward
+            );
+            assert_eq!(
+                crate::dispatch::native_unstaged_exit(
+                    &mut frame,
+                    &fixture.task.linux,
+                    carrick_el1_abi::Action::Forward,
+                    || if child.is_root_process() {
+                        NativeThreadGroupOwner::Root
+                    } else {
+                        NativeThreadGroupOwner::ForkChild
+                    },
+                    &counters,
+                ),
+                crate::dispatch::NativeUnstagedExit::Refused(carrick_el1_abi::Action::Served),
+            );
+            assert_eq!(frame.x[0] as i64, -38, "exec successor ordinal {nr}");
+            assert_eq!(counters.refused[nr as usize].load(Ordering::Relaxed), 1);
+            assert_eq!(counters.served[nr as usize].load(Ordering::Relaxed), 1);
+            assert!(fixture.task.service_notice.take().unwrap().is_none());
+        }
+    }
+    // The successor exits with status 7, which must wake the already-parked parent wait4 owner.
     assert!(matches!(
         child.exit_group(7),
         LifecycleOutcome::Transferred { .. }

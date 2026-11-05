@@ -21,7 +21,11 @@ The new contract does not weaken any of their budgets.
 The director's signed reference reports six missing calls (mkdirat, unlinkat,
 renameat, symlinkat, readlinkat, fchmodat), with statx, getdents64, openat
 O_CREAT and write working. VM-free routing alone cannot repeat those host
-venue results. Successful child exec, signed population/venue attribution,
+venue results. The existing successful child-exec/adoption/exit/reap/slot-reuse fixture now
+dispatches the same six calls after adoption, retaining one counted refusal
+and no carrier notice per call. Its process context is the shared VM-free x86
+owner with an ARM syscall frame; it does not execute an ELF or install ARM
+hardware page tables. Signed population/venue attribution,
 image/artifact identity and original CLI regression remain open evidence.
 
 Slice 2 must settle wire layout review, both ISA bindings, VFS mutation
@@ -32,3 +36,14 @@ EEXIST/EFAULT and both filesystem venues. No raw syscall fallback or carrier
 ambient credentials are licensed. Cancellation after a committed mutation
 must settle once without replay. Budgets for staging and resolution must be
 chosen from the existing owner algorithm, before measuring a candidate.
+
+The measured VM-free baseline is two attempts, two completions and two ring
+refusals per ordinal in the two-child fixture; the exec successor adds one
+attempt, completion and ring refusal per ordinal. Both require zero carrier
+notices. This covers 18 completed calls, not a signed workload population.
+No mutation, carrier venue success or runtime ratio was measured.
+
+Red-first semantic check: temporarily requiring mkdirat success in the same
+production-entry fixture fails at child 0, ordinal 34: actual -38, required 0.
+The committed assertion restores the explicit defect baseline. This red result
+is not a CLI witness and does not replace slice 4's process-boundary check.

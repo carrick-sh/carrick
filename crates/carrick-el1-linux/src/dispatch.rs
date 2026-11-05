@@ -752,7 +752,7 @@ fn refuse_unclaimed_native_syscall(frame: &mut TrapFrame, counters: &Counters) -
 /// How an owned native entry that no ring stage served leaves the ring.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 #[derive(Debug, Eq, PartialEq)]
-enum NativeUnstagedExit {
+pub(super) enum NativeUnstagedExit {
     /// Answered in ring ([`refuse_unclaimed_native_syscall`]); return to EL0.
     Refused(Action),
     /// Park on this operation for the carrier.
@@ -766,7 +766,7 @@ enum NativeUnstagedExit {
 /// crossing, so the in-ring refusal is the single exit for a fork child's
 /// unclaimed call and is counted once, never also as a carrier refusal.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-fn native_unstaged_exit(
+pub(super) fn native_unstaged_exit(
     frame: &mut TrapFrame,
     state: &carrick_el1_abi::LinuxTaskState,
     action: Action,

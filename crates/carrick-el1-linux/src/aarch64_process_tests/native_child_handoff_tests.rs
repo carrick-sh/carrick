@@ -1540,7 +1540,6 @@ fn arm_root_fork_seeds_each_childs_row_with_the_roots_live_cwd() {
     root_fork_fs_baseline(false);
 }
 
-#[cfg(not(target_os = "macos"))]
 #[test]
 fn native_namespace_mutation_baseline_two_live_children() {
     root_fork_fs_baseline(true);
@@ -1668,12 +1667,15 @@ fn root_fork_fs_baseline(measure_namespace: bool) {
         None,
         "an unseeded child's cwd is unknown, never guessed"
     );
-    #[cfg(not(target_os = "macos"))]
     if measure_namespace {
-        namespace_baseline(fixture, &runtime, &mut service, [first, second]);
+        namespace_baseline(
+            fixture,
+            &runtime,
+            &mut service,
+            first_record,
+            [first, second],
+        );
     }
-    #[cfg(target_os = "macos")]
-    let _ = measure_namespace;
     assert_eq!(
         runtime.task_fs_for_test(None).unwrap(),
         None,
@@ -1683,11 +1685,11 @@ fn root_fork_fs_baseline(measure_namespace: bool) {
 
 // This is a baseline, not an expected Linux result. Slice 2 replaces each
 // refusal with a typed mutation and must change its own row red first.
-#[cfg(not(target_os = "macos"))]
 fn namespace_baseline(
     fixture: &'static Fixture,
     runtime: &NativeProcessRuntime<'static, Mm, Aarch64ParkedContext>,
     service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+    first_record: RecordId,
     children: [u32; 2],
 ) {
     use carrick_personality_linux::dispatch::CompletionRoute;
@@ -1695,17 +1697,9 @@ fn namespace_baseline(
         zone: fixture.zone,
         slot: fixture.slot,
     };
-    let parent = with_process_entry(
-        source,
-        &fixture.task,
-        &ThreadCtx::ZERO,
-        fixture_ttbr0(fixture),
-        fixture.page,
-        fixture.control,
-        service,
-        |entry| entry.key,
-    )
-    .unwrap();
+    // SAFETY: the real fork publication retained this live child's record.
+    let first = unsafe { runtime.record_binding(fixture.zone.record_ref(first_record)) }.unwrap();
+    let parent = runtime.task_parent(first.key).unwrap().unwrap();
     let bindings = children.map(|pid| {
         runtime
             .task_binding(runtime.namespace_child_key(parent, pid).unwrap())
@@ -1716,13 +1710,9 @@ fn namespace_baseline(
         .each_ref()
         .map(|binding| fixture.zone.record(binding.record.id).identity().file_table);
     assert_ne!(tables[0], tables[1], "fork copies descriptor tables");
-    let parent_record = fixture.zone.slot(fixture.slot).current().unwrap();
-    assert!(
-        fixture
-            .zone
-            .requeue_preempted(fixture.slot, parent_record)
-            .is_queued()
-    );
+    // The root has returned to its host continuation after fork. It is
+    // detached from this executor; only the real native children are queued.
+    assert!(fixture.zone.slot(fixture.slot).current().is_none());
     let path = carrick_test_support::GuestUserBuffer::from_bytes(b"baseline-name\0");
     let other = carrick_test_support::GuestUserBuffer::from_bytes(b"baseline-target\0");
     let output = carrick_test_support::GuestUserBuffer::from_bytes(&[0u8; 128]);
@@ -1786,10 +1776,22 @@ fn namespace_baseline(
                 |_| core::ptr::null_mut(),
             )
             .unwrap();
-            assert!(matches!(
-                route,
-                CompletionRoute::Served | CompletionRoute::WithWork
-            ));
+            assert_eq!(route, CompletionRoute::Forward);
+            // The vector calls this shipping final-capture policy after
+            // dispatch and descriptor drain. It is separate from syscall
+            // dispatch, and must see the admitted child's real ownership.
+            assert_eq!(
+                super::super::dispatch::native_unstaged_exit(
+                    &mut frame,
+                    &task.linux,
+                    carrick_el1_abi::Action::Forward,
+                    || super::super::dispatch::arm_thread_group_owner(fixture.zone, task, page),
+                    &counters,
+                ),
+                super::super::dispatch::NativeUnstagedExit::Refused(
+                    carrick_el1_abi::Action::Served
+                ),
+            );
             assert_eq!(
                 frame.x[0] as i64, -38,
                 "baseline child {index} ordinal {nr}"
