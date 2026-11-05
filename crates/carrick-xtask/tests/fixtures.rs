@@ -150,9 +150,26 @@ fn restore_reuses_inherited_gate_and_rejects_shared_upgrade() {
         let lease = HostLease::acquire_path(&lock, mode).unwrap();
         let mut command = restore_command(&f, &lock);
         lease.configure_command(&mut command).unwrap();
+        // The refusal is this test's expected result. Left on the inherited
+        // stderr it printed `cannot nest gate under carrick` into every
+        // `just lease carrick` shard log, where it read as a shard failure
+        // (#1640). A file, not a pipe, so the child never blocks on a full
+        // buffer while `finish` polls.
+        let log = f.store.path().join(format!("restore-under-{mode}.stderr"));
+        command
+            .stdout(std::process::Stdio::null())
+            .stderr(fs::File::create(&log).unwrap());
         let mut child = RestoreChild(command.spawn().unwrap());
         let status = child.finish();
-        assert_eq!(status.success(), mode == HostLeaseMode::Gate);
+        let stderr = fs::read_to_string(&log).unwrap();
+        assert_eq!(status.success(), mode == HostLeaseMode::Gate, "{stderr}");
+        // Witness the reason, not just a non-zero exit: the shared lease is
+        // refused before any upgrade, and the gate lease is reused.
+        assert_eq!(
+            stderr.contains("cannot nest gate under carrick; no lock upgrades"),
+            mode == HostLeaseMode::Carrick,
+            "{stderr}"
+        );
         assert_eq!(
             f.repo.path().join(fixtures::INSTALLED_MANIFEST).exists(),
             mode == HostLeaseMode::Gate
