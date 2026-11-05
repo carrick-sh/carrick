@@ -1702,11 +1702,19 @@ fn exit_forwards_unless_a_switched_in_non_last_thread_may_leave() {
 }
 
 impl UserCopy for FaultingUser {
-    fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> bool {
-        crate::file::UserCopy::copy_in(self, dst, src.raw())
+    fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> carrick_core::personality::CopyOutcome {
+        carrick_core::personality::CopyOutcome::from_completed(crate::file::UserCopy::copy_in(
+            self,
+            dst,
+            src.raw(),
+        ))
     }
-    fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> bool {
-        crate::file::UserCopy::copy_out(self, dst.raw(), src)
+    fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> carrick_core::personality::CopyOutcome {
+        carrick_core::personality::CopyOutcome::from_completed(crate::file::UserCopy::copy_out(
+            self,
+            dst.raw(),
+            src,
+        ))
     }
 }
 
@@ -1717,6 +1725,13 @@ fn process_native_hooks_require_every_execution_identity_component() {
         calls: usize,
     }
     impl ProcessNative for Probe {
+        fn wait_guest_copy(
+            &mut self,
+            _: carrick_core::personality::GuestCopyRequest,
+        ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
+            panic!("eager test venue cannot suspend guest memory")
+        }
+
         fn is_root_process(&self) -> bool {
             true
         }
@@ -1945,6 +1960,13 @@ fn clone_uses_the_exact_stamped_dispatch_identity() {
         binding: carrick_el1_abi::ExecutionBinding,
     }
     impl ProcessNative for BirthProbe {
+        fn wait_guest_copy(
+            &mut self,
+            _: carrick_core::personality::GuestCopyRequest,
+        ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
+            panic!("eager test venue cannot suspend guest memory")
+        }
+
         fn is_root_process(&self) -> bool {
             true
         }
@@ -2028,6 +2050,13 @@ fn clone_refuses_missing_dispatch_identity_without_registering() {
         binding: carrick_el1_abi::ExecutionBinding,
     }
     impl ProcessNative for BirthProbe {
+        fn wait_guest_copy(
+            &mut self,
+            _: carrick_core::personality::GuestCopyRequest,
+        ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
+            panic!("eager test venue cannot suspend guest memory")
+        }
+
         fn is_root_process(&self) -> bool {
             true
         }
@@ -2108,6 +2137,13 @@ fn clone_missing_nonleader_identity_cannot_inherit_leader() {
         binding: carrick_el1_abi::ExecutionBinding,
     }
     impl ProcessNative for BirthProbe {
+        fn wait_guest_copy(
+            &mut self,
+            _: carrick_core::personality::GuestCopyRequest,
+        ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
+            panic!("eager test venue cannot suspend guest memory")
+        }
+
         fn is_root_process(&self) -> bool {
             true
         }
@@ -2202,6 +2238,13 @@ fn clone_stamped_nonleader_inherits_the_calling_thread() {
         binding: carrick_el1_abi::ExecutionBinding,
     }
     impl ProcessNative for BirthProbe {
+        fn wait_guest_copy(
+            &mut self,
+            _: carrick_core::personality::GuestCopyRequest,
+        ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
+            panic!("eager test venue cannot suspend guest memory")
+        }
+
         fn is_root_process(&self) -> bool {
             true
         }
@@ -2296,6 +2339,13 @@ fn clone_stamped_nonleader_inherits_the_calling_thread() {
 }
 struct IdentityOwner(carrick_el1_abi::ExecutionBinding);
 impl<C: carrick_el1_abi::EntryContext> ProcessNative<C> for IdentityOwner {
+    fn wait_guest_copy(
+        &mut self,
+        _: carrick_core::personality::GuestCopyRequest,
+    ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
+        panic!("eager test venue cannot suspend guest memory")
+    }
+
     fn is_root_process(&self) -> bool {
         true
     }
@@ -2550,6 +2600,13 @@ fn clone_terminal_close_rolls_back_before_owned_exit_settlement() {
         refuse_birth: bool,
     }
     impl ProcessNative for GraphOwner<'_> {
+        fn wait_guest_copy(
+            &mut self,
+            _: carrick_core::personality::GuestCopyRequest,
+        ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
+            panic!("eager test venue cannot suspend guest memory")
+        }
+
         fn is_root_process(&self) -> bool {
             true
         }
@@ -2688,6 +2745,13 @@ fn clone_queue_publication_can_reenter_the_process_graph_after_unlock() {
         refuse_birth: bool,
     }
     impl ProcessNative for GraphOwner<'_> {
+        fn wait_guest_copy(
+            &mut self,
+            _: carrick_core::personality::GuestCopyRequest,
+        ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
+            panic!("eager test venue cannot suspend guest memory")
+        }
+
         fn is_root_process(&self) -> bool {
             true
         }
@@ -2889,6 +2953,13 @@ fn clone_terminal_failure_witness(mode: u8) {
         mode: u8,
     }
     impl ProcessNative for GraphOwner<'_> {
+        fn wait_guest_copy(
+            &mut self,
+            _: carrick_core::personality::GuestCopyRequest,
+        ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
+            panic!("eager test venue cannot suspend guest memory")
+        }
+
         fn is_root_process(&self) -> bool {
             true
         }
@@ -3091,6 +3162,13 @@ fn native_exit_group_leaves_the_woken_successor_to_the_scheduler() {
         binding: carrick_el1_abi::ExecutionBinding,
     }
     impl ProcessNative for Exiting {
+        fn wait_guest_copy(
+            &mut self,
+            _: carrick_core::personality::GuestCopyRequest,
+        ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
+            panic!("eager test venue cannot suspend guest memory")
+        }
+
         fn is_root_process(&self) -> bool {
             true
         }
@@ -3184,6 +3262,13 @@ fn arm_dispatch_consumes_native_run_failure_before_return() {
         binding: carrick_el1_abi::ExecutionBinding,
     }
     impl ProcessNative for Failed {
+        fn wait_guest_copy(
+            &mut self,
+            _: carrick_core::personality::GuestCopyRequest,
+        ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
+            panic!("eager test venue cannot suspend guest memory")
+        }
+
         fn is_root_process(&self) -> bool {
             true
         }
@@ -3262,6 +3347,13 @@ fn managed_clone_copyout_fault_unbinds_birth_before_retry() {
         zone: *const ZoneTables,
     }
     impl ProcessNative for Owner {
+        fn wait_guest_copy(
+            &mut self,
+            _: carrick_core::personality::GuestCopyRequest,
+        ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
+            panic!("eager test venue cannot suspend guest memory")
+        }
+
         fn is_root_process(&self) -> bool {
             false
         }

@@ -6,11 +6,14 @@ use crate::cpl0_entry::{CpuBinding, NativeFrame};
 use crate::cpl0_scheduler::XsaveArea;
 #[cfg(target_os = "none")]
 use crate::cpl0_scheduler::{NativeTlsRegister, read_tls, write_tls};
+#[cfg(target_os = "none")]
+use alloc::vec::Vec;
+#[cfg(not(target_os = "none"))]
+use carrick_abi::LINUX_EFAULT;
 use carrick_core_abi::EntryMmKey;
 use carrick_el1_abi::{Counters, CurrentTask, EntryRef, ThreadControlSlot, ThreadLifecyclePage};
 use carrick_guest_arch::{RootGpa, UserVa};
 use carrick_personality_linux::abi::entry::SyscallResult;
-#[cfg(target_os = "none")]
 use carrick_personality_linux::lifecycle::LifecycleOutcome;
 use carrick_personality_linux::{
     abi::thread::LifecycleDecline,
@@ -22,6 +25,8 @@ use carrick_personality_linux::{
 use carrick_sched_core::{
     BoundedSpin, Claim, RecordRef, SlotId, ThreadIdentity, WakeEffects, Waker, ZoneTables,
 };
+#[cfg(target_os = "none")]
+use carrick_syscall_abi::LINUX_EFAULT;
 use core::sync::atomic::{AtomicU16, Ordering};
 
 /// Terminal native-custody failures after guest mutation. These are kernel
@@ -665,30 +670,60 @@ impl NativeLane<'_> {
     }
 }
 impl UserCopy for NativeLane<'_> {
-    fn copy_in(&mut self, dst: &mut [u8], address: UserVa) -> bool {
+    fn copy_in(
+        &mut self,
+        dst: &mut [u8],
+        address: UserVa,
+    ) -> carrick_core::personality::CopyOutcome {
         if !self.valid_user_range(address.raw(), dst.len()) {
-            return false;
+            return carrick_core::personality::CopyOutcome::Fault;
         }
         // SAFETY: stopped-host provisioned user aperture, selected by this
         // exact lane/MM; the current native root retains its private backing.
         unsafe {
             core::ptr::copy_nonoverlapping(address.raw() as *const u8, dst.as_mut_ptr(), dst.len());
         }
-        true
+        carrick_core::personality::CopyOutcome::Done
     }
-    fn copy_out(&mut self, address: UserVa, src: &[u8]) -> bool {
+    fn copy_out(&mut self, address: UserVa, src: &[u8]) -> carrick_core::personality::CopyOutcome {
         if !self.valid_user_range(address.raw(), src.len()) {
-            return false;
+            return carrick_core::personality::CopyOutcome::Fault;
         }
         // SAFETY: same retained writable exact-MM aperture as copy_in; fixture
         // copy buffers are supervisor stack storage and cannot alias it.
         unsafe {
             core::ptr::copy_nonoverlapping(src.as_ptr(), address.raw() as *mut u8, src.len());
         }
-        true
+        carrick_core::personality::CopyOutcome::Done
     }
 }
 impl<'a> LifecycleNative<'a> for NativeLane<'a> {
+    fn wait_guest_copy(
+        &mut self,
+        _: carrick_core::personality::GuestCopyRequest,
+    ) -> LifecycleOutcome {
+        // This lane's stopped-host aperture is eagerly provisioned. Its copy
+        // adapter can return Done or Fault, never a materialization request.
+        self.fail_lifecycle(carrick_core_abi::NativeRunFailureReason::NativeQuarantined)
+    }
+    fn finish_signal_output(
+        &mut self,
+        address: UserVa,
+        bytes: Vec<u8>,
+        work: bool,
+    ) -> LifecycleOutcome {
+        let result = match self.copy_out(address, &bytes) {
+            carrick_core::personality::CopyOutcome::Done => 0,
+            carrick_core::personality::CopyOutcome::Fault => LINUX_EFAULT.guest_retval(),
+            carrick_core::personality::CopyOutcome::NotYet(request) => {
+                return self.wait_guest_copy(request);
+            }
+        };
+        LifecycleOutcome::Returned {
+            result: SyscallResult::new(result),
+            work,
+        }
+    }
     fn guest_isa(&self) -> carrick_guest_arch::GuestIsa {
         carrick_guest_arch::GuestIsa::X86_64
     }

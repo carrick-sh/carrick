@@ -296,7 +296,7 @@ fn set_uts_string<'a>(
         return Some(SyscallResult::new(EINVAL));
     }
     let mut buf = [0u8; 64];
-    if len > 0 && (ptr.raw() == 0 || !native.copy_in(&mut buf[..len], ptr)) {
+    if len > 0 && (ptr.raw() == 0 || !native.copy_in(&mut buf[..len], ptr).is_done()) {
         return Some(SyscallResult::new(EFAULT));
     }
     let venue = native.process_sysinfo()?;
@@ -321,7 +321,7 @@ pub fn invoke<'a>(call: SysinfoCall, native: &mut dyn SysinfoNative<'a>) -> Opti
                 let venue = native.process_sysinfo()?;
                 venue.get_uts()
             };
-            if !native.copy_out(ptr, &uts.to_bytes()) {
+            if !native.copy_out(ptr, &uts.to_bytes()).is_done() {
                 return Some(SyscallResult::new(EFAULT));
             }
             Some(SyscallResult::new(0))
@@ -351,7 +351,7 @@ pub fn invoke<'a>(call: SysinfoCall, native: &mut dyn SysinfoNative<'a>) -> Opti
             let mut bytes = [0u8; 16];
             bytes[0..8].copy_from_slice(&lim.rlim_cur.to_ne_bytes());
             bytes[8..16].copy_from_slice(&lim.rlim_max.to_ne_bytes());
-            if !native.copy_out(ptr, &bytes) {
+            if !native.copy_out(ptr, &bytes).is_done() {
                 return Some(SyscallResult::new(EFAULT));
             }
             Some(SyscallResult::new(0))
@@ -366,7 +366,7 @@ pub fn invoke<'a>(call: SysinfoCall, native: &mut dyn SysinfoNative<'a>) -> Opti
                 return Some(SyscallResult::new(EFAULT));
             }
             let mut bytes = [0u8; 16];
-            if !native.copy_in(&mut bytes, ptr) {
+            if !native.copy_in(&mut bytes, ptr).is_done() {
                 return Some(SyscallResult::new(EFAULT));
             }
             let cur = u64::from_ne_bytes(bytes[0..8].try_into().unwrap_or([0; 8]));
@@ -387,7 +387,7 @@ pub fn invoke<'a>(call: SysinfoCall, native: &mut dyn SysinfoNative<'a>) -> Opti
             }
             let new_limit = if new_limit_ptr.raw() != 0 {
                 let mut bytes = [0u8; 16];
-                if !native.copy_in(&mut bytes, new_limit_ptr) {
+                if !native.copy_in(&mut bytes, new_limit_ptr).is_done() {
                     return Some(SyscallResult::new(EFAULT));
                 }
                 let cur = u64::from_ne_bytes(bytes[0..8].try_into().unwrap_or([0; 8]));
@@ -407,7 +407,7 @@ pub fn invoke<'a>(call: SysinfoCall, native: &mut dyn SysinfoNative<'a>) -> Opti
                 let mut bytes = [0u8; 16];
                 bytes[0..8].copy_from_slice(&old.rlim_cur.to_ne_bytes());
                 bytes[8..16].copy_from_slice(&old.rlim_max.to_ne_bytes());
-                if !native.copy_out(old_limit_ptr, &bytes) {
+                if !native.copy_out(old_limit_ptr, &bytes).is_done() {
                     return Some(SyscallResult::new(EFAULT));
                 }
             }
@@ -432,7 +432,7 @@ pub fn invoke<'a>(call: SysinfoCall, native: &mut dyn SysinfoNative<'a>) -> Opti
                     Err(e) => return Some(SyscallResult::new(e)),
                 }
             };
-            if !native.copy_out(ptr, &rusage.to_bytes()) {
+            if !native.copy_out(ptr, &rusage.to_bytes()).is_done() {
                 return Some(SyscallResult::new(EFAULT));
             }
             Some(SyscallResult::new(0))
@@ -450,7 +450,7 @@ pub fn invoke<'a>(call: SysinfoCall, native: &mut dyn SysinfoNative<'a>) -> Opti
             if visible.len() as u64 > size {
                 return Some(SyscallResult::new(ERANGE));
             }
-            if !native.copy_out(ptr, &visible) {
+            if !native.copy_out(ptr, &visible).is_done() {
                 return Some(SyscallResult::new(EFAULT));
             }
             Some(SyscallResult::new(visible.len() as i64))
@@ -464,7 +464,7 @@ pub fn invoke<'a>(call: SysinfoCall, native: &mut dyn SysinfoNative<'a>) -> Opti
                 let venue = native.process_sysinfo()?;
                 venue.sysinfo()
             };
-            if !native.copy_out(ptr, &info.to_bytes()) {
+            if !native.copy_out(ptr, &info.to_bytes()).is_done() {
                 return Some(SyscallResult::new(EFAULT));
             }
             Some(SyscallResult::new(0))
@@ -494,24 +494,30 @@ mod tests {
     }
 
     impl UserCopy for MockNative {
-        fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> bool {
+        fn copy_in(
+            &mut self,
+            dst: &mut [u8],
+            src: UserVa,
+        ) -> carrick_core::personality::CopyOutcome {
             let addr = src.raw();
             for (i, byte) in dst.iter_mut().enumerate() {
                 if let Some(&b) = self.memory.get(&(addr + i as u64)) {
                     *byte = b;
                 } else {
-                    return false;
+                    return carrick_core::personality::CopyOutcome::Fault;
                 }
             }
-            true
+            carrick_core::personality::CopyOutcome::Done
         }
 
-        fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> bool {
-            let addr = dst.raw();
-            for (i, &byte) in src.iter().enumerate() {
-                self.memory.insert(addr + i as u64, byte);
-            }
-            true
+        fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> carrick_core::personality::CopyOutcome {
+            carrick_core::personality::CopyOutcome::from_completed({
+                let addr = dst.raw();
+                for (i, &byte) in src.iter().enumerate() {
+                    self.memory.insert(addr + i as u64, byte);
+                }
+                true
+            })
         }
     }
 
