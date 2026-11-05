@@ -100,6 +100,18 @@ carrick*:::hvpatch-syscall-service-clear
     self->ltid = 0;
 }
 
+/* New ABI from source; requires live qualification on the director Mac.
+ * nr is canonical and does not depend on self->nr or executor migration.
+ * Input carries MemoryError; output carries DispatchOutcome. The existing
+ * phase-29 probe retains the backend preparation reason before lowering.
+ */
+carrick*:::guest-syscall-copy-refused
+/(pid == $target || progenyof($target))/
+{
+    printf("GSF1|syscall-copy-refused|ts=%llu|host_tid=%d|nr=%llu|va=0x%llx|len=%llu|reason=%s\n",
+        timestamp, tid, (uint64_t)arg0, (uint64_t)arg1, (uint64_t)arg2, copyinstr(arg3));
+}
+
 carrick*:::guest-internal-write-fault
 /(pid == $target || progenyof($target))/
 {

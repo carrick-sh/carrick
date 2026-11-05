@@ -6337,6 +6337,9 @@ mod real {
         /// 7 mapping permission), and the original error or refusal context.
         /// Emitted before signal-frame callers lower the error to SIGSEGV.
         fn guest__internal__write__fault(_: u64, _: u64, _: u32, _: &str) {}
+        /// Refused syscall copy: canonical number, guest VA, length, reason.
+        /// Number is carried directly, independent of executor-local pairing.
+        fn guest__syscall__copy__refused(_: u64, _: u64, _: u64, _: &str) {}
         /// One EL0-executable publication through the instruction-cache
         /// authority: guest-physical output, bytes, and how many
         /// invalidations it issued (0 when every page was already clean).
@@ -8732,6 +8735,16 @@ mod real {
         carrick_usdt::guest__internal__write__fault!(|| (address, length, phase, error));
     }
 
+    /// Format refusal context only when a trace consumer enabled the probe.
+    pub fn guest_syscall_copy_refused(
+        number: u64,
+        address: u64,
+        length: u64,
+        reason: impl FnOnce() -> String,
+    ) {
+        carrick_usdt::guest__syscall__copy__refused!(|| (number, address, length, reason()));
+    }
+
     pub fn hvpatch_exec_publication(output: u64, len: u64, invalidations: u32) {
         carrick_usdt::hvpatch__exec__publication!(|| (output, len, invalidations));
     }
@@ -9952,6 +9965,13 @@ mod stub {
     stub!(fork_post(pid: i32, pc: u64, elr: u64));
     stub!(signal_inject(signum: i32, saved_pc: u64, new_sp: u64, handler: u64));
     stub!(guest_internal_write_fault(address: u64, length: u64, phase: u32, error: &str));
+    pub fn guest_syscall_copy_refused(
+        _number: u64,
+        _address: u64,
+        _length: u64,
+        _reason: impl FnOnce() -> String,
+    ) {
+    }
     stub!(hvpatch_exec_publication(output: u64, len: u64, invalidations: u32));
     stub!(guest_internal_read_fault(page: u64, length: u64, phase: u32, live_descriptor: u64));
     pub fn el1_mapping_leaf(emit: impl FnOnce() -> (u32, u64, u64, u64, u64)) {

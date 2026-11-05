@@ -1992,3 +1992,27 @@ fn sigprocmask_input_supply_preserves_mask_and_oldset() {
         mask.to_le_bytes()
     );
 }
+
+// Invalid user memory remains a genuine fault, independent of the typed
+// owner dependencies tested above. Failed input/output cannot install a mask.
+#[test]
+fn sigprocmask_bad_pointers_fault_without_changing_mask() {
+    let mut g = Guest::new();
+    let mask = 1u64 << 9;
+    g.memory.seed(PATH, &mask.to_le_bytes());
+    for args in [
+        [0, 1, OUT, 8, 0, 0],
+        [0, PATH, 1, 8, 0, 0],
+        [0, u64::MAX - 3, OUT, 8, 0, 0],
+        [0, PATH, u64::MAX - 3, 8, 0, 0],
+    ] {
+        assert_eq!(
+            g.call(nr::RT_SIGPROCMASK.raw(), args),
+            DispatchOutcome::errno(carrick_abi::LINUX_EFAULT)
+        );
+        assert!(g.memory.commits.is_empty());
+        assert_eq!(g.memory.inner.read_bytes(OUT, 8).unwrap(), [FILL; 8]);
+    }
+    assert_eq!(g.ok(nr::RT_SIGPROCMASK.raw(), [0, 0, OUT2, 8, 0, 0]), 0);
+    assert_eq!(g.memory.inner.read_bytes(OUT2, 8).unwrap(), [0; 8]);
+}

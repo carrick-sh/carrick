@@ -100,3 +100,28 @@ a matching active service as `ret-unpaired` with host tid, rather than
 inventing a Linux identity. Constructor validation still rejects zero Linux
 identity. This corrects diagnostic attribution only; guest GETPID/GETTID and
 the glibc crashes remain unverified until the director's signed capture.
+
+## Third-attempt diagnostic boundary
+
+`guest-syscall-copy-refused` carries the canonical syscall number, address,
+length and reason directly from `rt_sigprocmask`. Input keeps the original
+`MemoryError`; output reports the resulting `DispatchOutcome`, including
+owner/supply/physical dependencies. The existing phase-29 preparation probe
+still carries the underlying output error before lowering. These two output
+events have different roles; an EFAULT outcome alone does not identify its
+backend cause. The flow script consumes the new event without relying on a
+host-thread-local syscall number. Its provider ABI still needs live Mac
+qualification. Reason formatting for the new probe runs only when enabled.
+
+`sigprocmask_bad_pointers_fault_without_changing_mask` checks invalid and
+wrapping input/output pointers through production dispatch, requiring errno
+14, untouched oldset and unchanged mask. This is a control, not a red-first
+reproduction. Existing injected wait/supply witnesses and the Legacy sparse
+control remain reduced tests: they do not establish an untouched private-file
+owner copy or a real mm-editor park/release/resume schedule.
+
+The reported glibc `altstacktid` abort is still unattributed. The last inherited
+commit added diagnostics; source inspection cannot establish which earlier
+change caused the abort. No arbitrary removal is justified as its fix.
+Keep this change draft until the real-owner file input and mm-edit witnesses,
+regression attribution and director's exact-artifact signed census are proved.

@@ -2230,6 +2230,7 @@ impl<'a> SignalView<'a> {
 
         /// rt_sigprocmask(how, new_set, old_set, sigset_size): configure blocked mask.
         fn rt_sigprocmask(this, cx, how: u64, new_set: GuestPtr, old_set: GuestPtr, sigset_size: u64) {
+            let number = cx.number();
             let new_set = new_set.0;
             let old_set = old_set.0;
             let tid = Self::ctx_tid(cx);
@@ -2242,8 +2243,8 @@ impl<'a> SignalView<'a> {
                 let bytes = match memory.read_bytes(new_set, LINUX_RT_SIGSET_SIZE as usize) {
                     Ok(bytes) => bytes,
                     Err(error) => {
-                        crate::probes::guest_internal_write_fault(new_set, LINUX_RT_SIGSET_SIZE,
-                            28, &format!("sigprocmask set read: {error:?}"));
+                        crate::probes::guest_syscall_copy_refused(number, new_set, LINUX_RT_SIGSET_SIZE,
+                            || format!("input: {error:?}"));
                         // Input may need the same owner arbitration or sparse
                         // first-touch supply as output. Nothing has changed yet;
                         // let the runtime serve it and redispatch before saving
@@ -2268,7 +2269,11 @@ impl<'a> SignalView<'a> {
             if old_set != 0 {
                 let outcome = crate::dispatch::copyout::copyout_bytes(cx.kernel, memory, carrick_guest_mem::GuestVa::new(old_set),
                     &previous_mask.raw().to_le_bytes(), DispatchOutcome::Returned { value: 0 });
-                if !matches!(outcome, DispatchOutcome::Returned { .. }) { return Ok(outcome); }
+                if !matches!(outcome, DispatchOutcome::Returned { .. }) {
+                    crate::probes::guest_syscall_copy_refused(number, old_set, LINUX_RT_SIGSET_SIZE,
+                        || format!("output: {outcome:?}"));
+                    return Ok(outcome);
+                }
             }
             if let Some(mask) = new_mask {
                 this.restore_signal_mask(cx.kernel, tid, mask);
