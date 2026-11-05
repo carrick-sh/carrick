@@ -1537,6 +1537,16 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
 /// forked after it: each child keeps the value it was born with.
 #[test]
 fn arm_root_fork_seeds_each_childs_row_with_the_roots_live_cwd() {
+    root_fork_fs_baseline(false);
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn native_namespace_mutation_baseline_two_live_children() {
+    root_fork_fs_baseline(true);
+}
+
+fn root_fork_fs_baseline(measure_namespace: bool) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     fixture.zone.spaces.set_idle_ttbr(0x30000);
     let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
@@ -1658,9 +1668,144 @@ fn arm_root_fork_seeds_each_childs_row_with_the_roots_live_cwd() {
         None,
         "an unseeded child's cwd is unknown, never guessed"
     );
+    #[cfg(not(target_os = "macos"))]
+    if measure_namespace {
+        namespace_baseline(fixture, &runtime, &mut service, [first, second]);
+    }
+    #[cfg(target_os = "macos")]
+    let _ = measure_namespace;
     assert_eq!(
         runtime.task_fs_for_test(None).unwrap(),
         None,
         "the host-served root's own row never mirrors its host cwd"
     );
+}
+
+// This is a baseline, not an expected Linux result. Slice 2 replaces each
+// refusal with a typed mutation and must change its own row red first.
+#[cfg(not(target_os = "macos"))]
+fn namespace_baseline(
+    fixture: &'static Fixture,
+    runtime: &NativeProcessRuntime<'static, Mm, Aarch64ParkedContext>,
+    service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+    children: [u32; 2],
+) {
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let parent = with_process_entry(
+        source,
+        &fixture.task,
+        &ThreadCtx::ZERO,
+        fixture_ttbr0(fixture),
+        fixture.page,
+        fixture.control,
+        service,
+        |entry| entry.key,
+    )
+    .unwrap();
+    let bindings = children.map(|pid| {
+        runtime
+            .task_binding(runtime.namespace_child_key(parent, pid).unwrap())
+            .unwrap()
+    });
+    assert_ne!(bindings[0].record, bindings[1].record);
+    let tables = bindings
+        .each_ref()
+        .map(|binding| fixture.zone.record(binding.record.id).identity().file_table);
+    assert_ne!(tables[0], tables[1], "fork copies descriptor tables");
+    let parent_record = fixture.zone.slot(fixture.slot).current().unwrap();
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, parent_record)
+            .is_queued()
+    );
+    let path = carrick_test_support::GuestUserBuffer::from_bytes(b"baseline-name\0");
+    let other = carrick_test_support::GuestUserBuffer::from_bytes(b"baseline-target\0");
+    let output = carrick_test_support::GuestUserBuffer::from_bytes(&[0u8; 128]);
+    let counters = carrick_el1_abi::Counters::new();
+    let names = carrick_el1_abi::InotifyNameCache::new();
+    let task = Box::leak(Box::new(CurrentTask::new()));
+    service.task = task;
+    // AArch64 Linux ordinals, through the production ARM entry (including
+    // native_unstaged_exit), not a decoder or an inner staging helper.
+    for (nr, args) in [
+        (34, [(-100i64) as u64, path.arg(), 0o777, 0]),
+        (35, [(-100i64) as u64, path.arg(), 0, 0]),
+        (
+            38,
+            [(-100i64) as u64, path.arg(), (-100i64) as u64, other.arg()],
+        ),
+        (36, [other.arg(), (-100i64) as u64, path.arg(), 0]),
+        (78, [(-100i64) as u64, path.arg(), output.arg(), 128]),
+        (53, [(-100i64) as u64, path.arg(), 0o700, 0]),
+    ] {
+        for (index, binding) in bindings.iter().enumerate() {
+            activate_target(source, task, binding);
+            let identity = fixture.zone.record(binding.record.id).identity();
+            // SAFETY: the real fork owner retains both lifecycle allocations.
+            let page = unsafe { &*(identity.lifecycle_page as *const ThreadLifecyclePage) };
+            let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
+            let mut frame = carrick_el1_abi::TrapFrame {
+                esr: 0x15 << 26,
+                slot: fixture.slot.index() as u64,
+                ..Default::default()
+            };
+            frame.x[8] = nr;
+            frame.x[..4].copy_from_slice(&args);
+            let mut cpu = crate::sched::FakeCpu::default();
+            let grant = fixture
+                .zone
+                .spaces
+                .grant(fixture.zone.spaces.find(identity.mm).unwrap(), identity.mm)
+                .unwrap();
+            let route = super::super::dispatch::dispatch_arm_syscall_with_native_process(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(task),
+                &[],
+                &[],
+                &[],
+                &[],
+                &names,
+                Some(crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &crate::sched::HardwareUserWord,
+                }),
+                None,
+                Some(fixture),
+                page,
+                control,
+                &ThreadCtx::ZERO,
+                grant.ttbr0,
+                service,
+                |_| core::ptr::null_mut(),
+            )
+            .unwrap();
+            assert!(matches!(
+                route,
+                CompletionRoute::Served | CompletionRoute::WithWork
+            ));
+            assert_eq!(
+                frame.x[0] as i64, -38,
+                "baseline child {index} ordinal {nr}"
+            );
+            assert!(
+                task.service_notice.take().unwrap().is_none(),
+                "ring refusal creates no carrier request"
+            );
+            assert!(
+                fixture
+                    .zone
+                    .requeue_preempted(fixture.slot, binding.record.id)
+                    .is_queued()
+            );
+        }
+        assert_eq!(counters.refused[nr as usize].load(Ordering::Relaxed), 2);
+        assert_eq!(counters.served[nr as usize].load(Ordering::Relaxed), 2);
+    }
 }
