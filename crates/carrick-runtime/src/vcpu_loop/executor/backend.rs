@@ -940,15 +940,16 @@ pub(crate) fn restore_worker_vcpu_before_binding_publication<V, B>(
     worker_vcpu: &mut Option<V>,
     vcpu: V,
     backend: B,
-    publish: impl FnOnce(B, &Option<V>) -> Result<(), TrapError>,
+    publish: impl FnOnce(B, &mut V) -> Result<(), TrapError>,
 ) -> Result<(), TrapError> {
-    if worker_vcpu.replace(vcpu).is_some() {
+    if worker_vcpu.is_some() {
         carrick_fatal!(
             "vcpu_loop::executor_lease",
             "worker vCPU slot unexpectedly occupied prior to binding publication"
         );
     }
-    publish(backend, worker_vcpu)
+    // Exclusive access to the slot spans admission, insertion and callback.
+    publish(backend, worker_vcpu.insert(vcpu))
 }
 
 /// What a clone rollback found when it went to retire the child's exact
@@ -1407,6 +1408,7 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 lease,
             ));
         }
+        let terminal_save = matches!(&saved_residency, Some(TaskCpuResidency::Materialized(_)));
         let metadata = match engine.extract_resident_task_metadata_for_lazy_save() {
             Ok(metadata) => metadata,
             Err(error) => {
@@ -1511,7 +1513,30 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             &mut self.vcpu,
             vcpu,
             backend,
-            |backend, _| binding.put_backend(backend),
+            |backend, worker_vcpu| {
+                // A materialized terminal has no resident record left to
+                // vacate later, including when it migrates to another worker.
+                // Clear both hardware roots before publishing that state.
+                let vacated = if terminal_save {
+                    self.lifecycle
+                        .as_ref()
+                        .ok_or_else(|| {
+                            TrapError::Hypervisor("terminal save lost worker lifecycle".into())
+                        })
+                        .and_then(|lifecycle| {
+                            carrick_vmm_hvf::hvf_aarch64_engine::retire_terminal_resident_vcpu_root(
+                                lifecycle,
+                                worker_vcpu,
+                            )
+                        })
+                } else {
+                    Ok(())
+                };
+                // Even a failed register write must retain the detached MM
+                // and worker ownership for executor-failure settlement.
+                binding.put_backend(backend)?;
+                vacated
+            },
         ) {
             return Err(ExecutorSaveError::new(error, lease));
         }

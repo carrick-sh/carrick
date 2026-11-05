@@ -2774,7 +2774,7 @@ fn task_only_save_restores_worker_vcpu_before_binding_publication_can_fail() {
         0xfeed_u64,
         (),
         |(), worker_vcpu| {
-            assert_eq!(*worker_vcpu, Some(0xfeed));
+            assert_eq!(*worker_vcpu, 0xfeed);
             Err(TrapError::Hypervisor(
                 "injected binding publication failure".to_owned(),
             ))
@@ -4887,6 +4887,13 @@ fn persistent_save_restores_worker_controls_after_task_snapshot_before_detach() 
     assert!(publication < neutralize);
     assert!(metadata < neutralize);
     assert!(neutralize < detach);
+    let vacate = save
+        .find("retire_terminal_resident_vcpu_root")
+        .expect("terminal save vacates both hardware roots");
+    let detached_publication = save
+        .find("binding.put_backend(backend)")
+        .expect("detached backend publication");
+    assert!(detach < vacate && vacate < detached_publication);
 }
 
 #[test]
