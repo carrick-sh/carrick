@@ -284,7 +284,8 @@ pub struct HostPreparedDescriptions<const N: usize> {
 /// IPC lock. [`Self::publish`] accepts only a whole-word physical output whose
 /// mappings and exact-MM editor are already held. It therefore has exactly two
 /// effects, neither of which can suspend: publish both descriptors, then write
-/// their numbers. A refused publication returns this same transaction.
+/// their numbers. A refused publication boxes this same transaction, keeping
+/// the error return small while preserving endpoint custody.
 #[derive(Debug)]
 #[must_use = "retain native pipe creation until publication or cancellation"]
 pub struct NativePipeCreation {
@@ -308,10 +309,10 @@ impl NativePipeCreation {
         mut self,
         cloexec: bool,
         write: impl FnOnce([u8; 8]),
-    ) -> Result<[fd::Fd; 2], (AdmissionError, Self)> {
+    ) -> Result<[fd::Fd; 2], (AdmissionError, Box<Self>)> {
         let pair = match self.prepared.install_pair(self.table, cloexec) {
             Ok(pair) => pair,
-            Err(error) => return Err((error, self)),
+            Err(error) => return Err((error, Box::new(self))),
         };
         let mut bytes = [0; 8];
         bytes[..4].copy_from_slice(&pair[0].0.to_ne_bytes());
@@ -327,7 +328,7 @@ impl NativePipeCreation {
         self,
         cloexec: bool,
         output: carrick_core::mm::transaction::WordWriteOutput<'_, '_, Context>,
-    ) -> Result<[fd::Fd; 2], (AdmissionError, Self)>
+    ) -> Result<[fd::Fd; 2], (AdmissionError, Box<Self>)>
     where
         Context: Copy + Send + Sync + zerocopy::FromZeros,
     {
