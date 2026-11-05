@@ -185,7 +185,16 @@ impl TransferPin for Box<dyn TransferPin> {
         (**self).copy_out(request, bytes)
     }
 }
-pub trait TransferGrant {
+/// Retained physical ownership may move from synchronous preparation into
+/// a service ledger. Exclusion guards and executor loans stay at preparation.
+pub trait TransferGrant: Send {
+    /// Release retained ownership only after authenticating that its exact VM
+    /// generation was destroyed. A live or unknown generation must refuse.
+    fn release_destroyed_vm(&mut self) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "grant has no destroyed-VM proof".into(),
+        ))
+    }
     fn transaction(&self) -> &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn;
     /// Return true only when exact receipt settlement permits a fresh owner
     /// selection: either the grant applied or EL1 refused a stale root before

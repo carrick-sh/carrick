@@ -2335,7 +2335,7 @@
     {
       "family": "fatal_carrier_fault",
       "operation": "fatal:hvpatch::user_transfer",
-      "owner": "carrick_vmm_hvf::trap::sparse_materialization::<PendingTransferGrant as Drop>::drop",
+      "owner": "carrick_vmm_hvf::trap::sparse_materialization::PendingTransferGrant::rollback",
       "lane": "hvf",
       "ceiling": 7
     },
