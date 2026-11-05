@@ -503,6 +503,7 @@ surfaces = [
   { path = "crates/carrick-kernel/src/dispatch/mem/anonymous.rs", contract = "kernel.mm.private-file-fixed-replacement" },
   { path = "crates/carrick-kernel/src/dispatch/mem/anonymous.rs", contract = "kernel.mm.user-va-ceiling" },
   { path = "crates/carrick-kernel/src/dispatch/mem/fault.rs", contract = "kernel.el1.stage1-publication" },
+  { path = "crates/carrick-kernel/src/dispatch/mem/mmap.rs", contract = "kernel.el1.anonymous-retirement" },
   { path = "crates/carrick-kernel/src/dispatch/mem/mmap.rs", contract = "kernel.mm.private-file-fixed-replacement" },
   { path = "crates/carrick-kernel/src/dispatch/mem/mmap.rs", contract = "kernel.mm.shared-file-reuse" },
   { path = "crates/carrick-kernel/src/dispatch/mem/mmap.rs", contract = "kernel.mm.user-va-ceiling" },
