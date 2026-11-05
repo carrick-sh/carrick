@@ -24,6 +24,7 @@ structural_budgets = []
 [bindings]
 vm_free = [
   "carrick-vmm-hvf::trap::frame_inventory::tests::process_retirement_does_not_combine_counts_from_different_populations (one deterministic sibling publication/retirement attempt, no stale RetireFrame)",
+  "carrick-kernel::dispatch::mem::tests::sparse_owner_droppable_mmap_uses_transactional_backing",
   "carrick-kernel::dispatch::mem::tests::lazy_fixed_anonymous_replacement_rearms_first_touch_after_retirement",
   "carrick-kernel::dispatch::mem::tests::sparse_gap_hint_and_freed_prot_none_reuse_read_zero",
   "carrick-mmu-core::aarch64::tests::owned_host_image_reuse_clears_live_descriptors_written_by_an_el1_editor",
