@@ -62,3 +62,10 @@ venue. Both fixtures require all refusals in that descendant population and
 zero carrier refusals. The existing unclaimed-ordinal negative control keeps
 its errno and total count and now checks the lineage too. This diagnostic
 correction changes neither routing nor the six missing namespace services.
+
+Refusal accounting excludes service contention. The shared
+`diagnostics.syscall-refusal` contract also retains the host-request-during-park
+witnesses: a concurrent host request yields and then reparks the same operation,
+without a quarantine fatal or a second service notice. Those witnesses and the
+namespace refusal bindings are complementary; neither replaces the other when
+rebasing this slice.
