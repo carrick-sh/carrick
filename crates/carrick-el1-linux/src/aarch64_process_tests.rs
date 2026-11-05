@@ -11966,7 +11966,6 @@ fn native_fork_after_root_stdout_restore_serves_the_inherited_stream() {
     assert_ne!(map.lookup(files.id().raw()).unwrap(), table);
     // Parent closure cannot revoke the child's description or sink.
     assert_eq!(call(57, [1, 0, 0, 0, 0, 0]), 0);
-    drop(call);
     let mut record = vec![0; host_file::record_len(2, 0).unwrap()];
     host_file::encode(
         &mut record,
