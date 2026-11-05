@@ -48,6 +48,12 @@
  *     had 3,656 mapping events, no errors and no drops. Phase 25 remains
  *     unqualified; owner waits/supply do not emit these probes. They are
  *     needed when the embed syscall-return observer is disabled.
+ *     Phase 28 names rt_sigprocmask set-read failure (despite the historical
+ *     write-fault probe name); its text preserves the MemoryError variant.
+ *     Phase 29 names copyout preparation refusal or guest-range overflow;
+ *     the address is the admitted prefix's last slot, not necessarily the
+ *     failing slot of a multi-output operation. Phase 30 names legacy write
+ *     commit failure. These three phases are not yet live-qualified.
  *     el1-mapping-leaf(phase, MM key, VA, span length, live descriptor)
  *     samples a focus page and its neighbour: phases 0 preparation,
  *     1 submitted, 2 host publication, 3 applied receipt before backend

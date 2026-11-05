@@ -303,6 +303,12 @@ fn prepare_memory<M: CurrentMmMemory, const N: usize>(
             break;
         }
         let Some(range) = GuestWriteRange::new(GuestVa::new(slot.address), slot.capacity) else {
+            crate::probes::guest_internal_write_fault(
+                slot.address,
+                slot.capacity as u64,
+                29,
+                "copyout range overflow",
+            );
             faulted = true;
             break;
         };
@@ -346,13 +352,27 @@ fn prepare_memory<M: CurrentMmMemory, const N: usize>(
                     },
                 });
             }
-            Err(error) => match crate::el1_delegation::owner_prepare_refusal(error) {
-                outcome if outcome == DispatchOutcome::errno(LINUX_EFAULT) => {
-                    faulted = true;
-                    prefix -= 1;
+            Err(error) => {
+                // The final range identifies the prefix being admitted. Preserve
+                // the typed backend refusal before lowering genuine faults to
+                // the copyout protocol's deferred EFAULT.
+                let slot = slots.iter().flatten().nth(prefix - 1);
+                if let Some(slot) = slot {
+                    crate::probes::guest_internal_write_fault(
+                        slot.address,
+                        slot.capacity as u64,
+                        29,
+                        &format!("{error:?}"),
+                    );
                 }
-                outcome => return Err(CopyoutRefusal(Box::new(outcome))),
-            },
+                match crate::el1_delegation::owner_prepare_refusal(error) {
+                    outcome if outcome == DispatchOutcome::errno(LINUX_EFAULT) => {
+                        faulted = true;
+                        prefix -= 1;
+                    }
+                    outcome => return Err(CopyoutRefusal(Box::new(outcome))),
+                }
+            }
         }
     }
     Ok(PreparedCopyout {
@@ -454,9 +474,15 @@ impl<M: CurrentMmMemory, const N: usize> PreparedCopyout<'_, M, N> {
                     if let Some(slot) = slot
                         && !output.is_empty()
                     {
-                        memory
-                            .write_bytes(slot.address, output)
-                            .map_err(|_| CopyoutFault)?;
+                        memory.write_bytes(slot.address, output).map_err(|error| {
+                            crate::probes::guest_internal_write_fault(
+                                slot.address,
+                                output.len() as u64,
+                                30,
+                                &format!("{error:?}"),
+                            );
+                            CopyoutFault
+                        })?;
                     }
                 }
                 Ok(())

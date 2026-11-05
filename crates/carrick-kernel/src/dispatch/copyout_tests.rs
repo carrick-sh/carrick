@@ -1944,7 +1944,7 @@ fn sigprocmask_copyout_into_untouched_sparse_mmap() {
         memory.regions()[1].shared_initialized_bytes().1.is_empty(),
         "mmap and mprotect must leave the output sparse"
     );
-    let mask = 1u64 << 9;
+    let mask = u64::MAX;
     memory.write_bytes(BASE, &mask.to_le_bytes()).unwrap();
     // First write an unrelated record to the untouched first page. The
     // distant oldset page below must still have no initialized bytes.
@@ -1954,7 +1954,8 @@ fn sigprocmask_copyout_into_untouched_sparse_mmap() {
     );
     assert_ne!(memory.read_bytes(arena, 16).unwrap(), [0; 16]);
     assert!(memory.regions()[1].shared_initialized_bytes().1.len() < 0x7ff000);
-    let oldset = arena + 0x7ff000;
+    // Descriptor area immediately below the top of glibc's thread stack.
+    let oldset = arena + 0x800000 - 0x1600;
     assert_eq!(
         call(
             &mut memory,

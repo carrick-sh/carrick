@@ -17,8 +17,15 @@
  * - hvpatch-syscall-args: arg0 u64 syscall number, arg1..arg4 guest args
  *   0..3; fires right after service-begin on the same host thread.
  * - syscall-return: arg0 u64 number, arg1 name, arg2 signed retval,
- *   arg3 errno. Same host thread as the matching service-begin (HVPatch runs
- *   one host pthread per logical guest thread), so `self->` pairing is sound.
+ *   arg3 errno. Only paired service returns have an attributed identity;
+ *   executor migration and unguarded returns invalidate unconditional self->
+ *   pairing. An unpaired return is explicitly labelled, never pid/tid 0/0.
+ * - guest-internal-write-fault: arg0 guest VA, arg1 length, arg2 phase,
+ *   arg3 typed backend error text. Phases 28=set read, 29=copyout prepare,
+ *   30=legacy copyout commit require live qualification on the director Mac.
+ *   Zero events is not proof of access. The historical probe name includes
+ *   phase 28's input refusal so the existing refusal profile sees it too.
+ *   Failure-only formatting adds overhead on refusals, not successful copies.
  * - hvpatch-guest-lifecycle: arg0 phase (0 root, 1 fork, 2 exec, 3
  *   thread-start, 4 thread-exit, 5 process-exit, 6 exec-begin), arg1 Linux
  *   pid, arg2 Linux ppid, arg3 Linux tid, arg4 ASID.
@@ -57,6 +64,7 @@ carrick*:::hvpatch-syscall-service-begin
     self->lpid = (int32_t)arg0;
     self->ltid = (int32_t)arg1;
     self->nr = (uint64_t)arg3;
+    self->in_service = 1;
 }
 
 carrick*:::hvpatch-syscall-args
@@ -68,12 +76,35 @@ carrick*:::hvpatch-syscall-args
 }
 
 carrick*:::syscall-return
-/(pid == $target || progenyof($target))/
+/(pid == $target || progenyof($target)) && self->in_service && (uint64_t)arg0 == self->nr/
 {
     returns++;
     printf("GSF1|ret|ts=%llu|lpid=%d|ltid=%d|nr=%llu|name=%s|ret=%lld|errno=%d\n",
         timestamp, self->lpid, self->ltid, (uint64_t)arg0, copyinstr(arg1),
         (int64_t)arg2, (int32_t)arg3);
+}
+
+carrick*:::syscall-return
+/(pid == $target || progenyof($target)) && (!self->in_service || (uint64_t)arg0 != self->nr)/
+{
+    returns++;
+    printf("GSF1|ret-unpaired|ts=%llu|host_tid=%d|nr=%llu|name=%s|ret=%lld|errno=%d\n",
+        timestamp, tid, (uint64_t)arg0, copyinstr(arg1), (int64_t)arg2, (int32_t)arg3);
+}
+
+carrick*:::hvpatch-syscall-service-clear
+/(pid == $target || progenyof($target))/
+{
+    self->in_service = 0;
+    self->lpid = 0;
+    self->ltid = 0;
+}
+
+carrick*:::guest-internal-write-fault
+/(pid == $target || progenyof($target))/
+{
+    printf("GSF1|copy-refused|ts=%llu|host_tid=%d|va=0x%llx|len=%llu|phase=%u|reason=%s\n",
+        timestamp, tid, (uint64_t)arg0, (uint64_t)arg1, (uint32_t)arg2, copyinstr(arg3));
 }
 
 carrick*:::hvpatch-guest-lifecycle

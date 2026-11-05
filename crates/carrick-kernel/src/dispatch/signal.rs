@@ -2242,6 +2242,8 @@ impl<'a> SignalView<'a> {
                 let bytes = match memory.read_bytes(new_set, LINUX_RT_SIGSET_SIZE as usize) {
                     Ok(bytes) => bytes,
                     Err(error) => {
+                        crate::probes::guest_internal_write_fault(new_set, LINUX_RT_SIGSET_SIZE,
+                            28, &format!("sigprocmask set read: {error:?}"));
                         // Input may need the same owner arbitration or sparse
                         // first-touch supply as output. Nothing has changed yet;
                         // let the runtime serve it and redispatch before saving

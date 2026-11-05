@@ -60,3 +60,43 @@ Keep the work draft until the director captures the failing memory dependency
 on the Mac and reruns the glibc census and Go/CPython workloads against the
 exact rebuilt signed artifact. No signed or Docker acceptance is implied by
 these VM-free controls.
+
+## Re-brief: diagnose the remaining native refusal
+
+The glibc-shaped sparse control now blocks an all-bits set and places oldset
+0x1600 bytes below the end of the 8 MiB PROT_NONE-to-RW mapping. It remains a
+Legacy-venue control, not a native-owner reproduction. No new materializer is
+justified by this passing control.
+
+The host handler's size check returns EINVAL (22), not EFAULT. Its set read
+returns EFAULT only when `from_owner_memory_error` cannot retain a dependency.
+Its oldset write uses `copyout_bytes`: owner preparation faults become deferred
+EFAULT, while waits and supply remain typed; a Legacy write failure becomes
+EFAULT at commit. The fixed eight-byte output cannot exceed the permit budget,
+but a pointer whose range overflows is a genuine fault. Owner permits commit
+without a fallible memory operation after successful preparation.
+
+The shared AArch64 engine selects `read_owner_bytes` for an admitted owner.
+Incarnation mismatch, absent custody/portal, service transport errors, a
+retired owner, or a refused selection can all reach the set-read boundary as
+MemoryError. SELECT errno 14 becomes OutOfBounds; other missing-receipt errors
+retain HostMap text. Supply failures also propagate through this boundary.
+The write path selects every output page through the same owner portal before
+preparing the permit. The existing SELECT/PREPARE and owner-lowering probes
+remain available to distinguish these lower boundaries.
+
+`guest-internal-write-fault` now preserves the failing set pointer and debug
+MemoryError at phase 28 (historical probe name includes this input diagnostic).
+Phase 29 preserves the copyout admission error before lowering, including
+range overflow; phase 30 preserves Legacy commit failure. For a multi-slot
+copyout phase 29 identifies the attempted prefix's final slot, not necessarily
+the offending slot. Sigprocmask has exactly one output slot. These are
+failure-only probes; formatting can perturb repeated refusals. They are not
+performance evidence and need live qualification on the Mac.
+
+The durable syscall-flow script consumes these existing probes and clears
+its attribution on `hvpatch-syscall-service-clear`. It prints returns without
+a matching active service as `ret-unpaired` with host tid, rather than
+inventing a Linux identity. Constructor validation still rejects zero Linux
+identity. This corrects diagnostic attribution only; guest GETPID/GETTID and
+the glibc crashes remain unverified until the director's signed capture.
