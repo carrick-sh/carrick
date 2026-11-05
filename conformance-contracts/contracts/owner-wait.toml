@@ -20,6 +20,7 @@ rationale = "Owner waits are killable-only: handled signals and stops never comp
 
 [bindings]
 vm_free = [
+  "carrick-kernel::dispatch::signal::tests::rt_sigprocmask_copyin_owner_wait_is_not_efault (dispatch refusal and bounded clean redispatch only; not sparse backing or scheduler settlement)",
   "carrick-sched-core::refusal::queue_witnesses",
   "carrick-core-abi::wait::ticket_tests",
   "carrick-kernel::kernel::continuation::output::tests::fd_wait_initial_publication_authenticates_before_preparing",

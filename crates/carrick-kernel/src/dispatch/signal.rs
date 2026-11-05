@@ -2253,6 +2253,11 @@ impl<'a> SignalView<'a> {
                             MemoryError::HostMap(_) => 8,
                             MemoryError::MetadataAllocation => 9,
                         };
+                        // This bounded input is read before either output or mask mutation.
+                        // A dependency can redispatch the whole syscall without replaying effects.
+                        if let Some(outcome) = DispatchOutcome::from_owner_memory_error(error) {
+                            return Ok(outcome);
+                        }
                         crate::probes::rt_sigprocmask_copy_refusal(0, new_set, variant);
                         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                     }
@@ -6755,6 +6760,86 @@ mod tests {
             DispatchOutcome::errno(LINUX_EINTR),
             "redispatch after a sibling wake completes instead of waiting again"
         );
+    }
+
+    #[test]
+    fn rt_sigprocmask_copyin_owner_wait_is_not_efault() {
+        use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+        use carrick_guest_mem::{MemoryReadSuspension, MemoryReadWait, OwnedReadContinuation};
+        use std::{cell::Cell, num::NonZeroU64};
+
+        struct SuspendsOnce {
+            wait: PortalOwnerWait,
+            reads: Cell<usize>,
+            writes: usize,
+            old_mask: u64,
+        }
+        impl GuestMemory for SuspendsOnce {
+            fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+                assert_eq!((address, length), (0x100, 8));
+                let reads = self.reads.get();
+                self.reads.set(reads + 1);
+                if reads == 0 {
+                    return Err(MemoryError::ReadSuspended(Box::new(MemoryReadSuspension {
+                        wait: MemoryReadWait::Owner(self.wait),
+                        continuation: OwnedReadContinuation::new(Vec::<u8>::new()),
+                    })));
+                }
+                Ok(0x20u64.to_le_bytes().to_vec())
+            }
+            fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+                assert_eq!(address, 0x108);
+                self.writes += 1;
+                self.old_mask = u64::from_le_bytes(bytes.try_into().unwrap());
+                Ok(())
+            }
+        }
+        impl CurrentMmMemory for SuspendsOnce {}
+
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.exact_signal_context_for_test();
+        let tid = context.thread().registry_id();
+        dispatcher.restore_signal_mask(&context, tid, SigSet::from_raw(0x10));
+        let wait = unsafe {
+            PortalOwnerWait::from_owner(
+                El1MmHandle::from_admitted_owner(
+                    NonZeroU64::new(1).unwrap(),
+                    ReservationMm::new(context.shared().mm().id().raw()).unwrap(),
+                    NonZeroU64::new(3).unwrap(),
+                ),
+                PortalWaitCause::Reservations,
+                7,
+            )
+        };
+        let mut memory = SuspendsOnce {
+            wait,
+            reads: Cell::new(0),
+            writes: 0,
+            old_mask: 0,
+        };
+        let reporter = crate::compat::CompatReporter::default();
+        let request = SyscallRequest::new(
+            nr::RT_SIGPROCMASK.raw(),
+            SyscallArgs::from([LINUX_SIG_BLOCK, 0x100, 0x108, LINUX_RT_SIGSET_SIZE, 0, 0]),
+        );
+        let outcome = dispatcher
+            .dispatch(&context, request, &mut memory, &reporter)
+            .unwrap();
+        assert_eq!(
+            outcome,
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+        );
+        assert_eq!(memory.writes, 0);
+        assert_eq!(dispatcher.signal_mask_for(&context, tid).raw(), 0x10);
+        let outcome = dispatcher
+            .dispatch(&context, request, &mut memory, &reporter)
+            .unwrap();
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+        assert_eq!(
+            (memory.reads.get(), memory.writes, memory.old_mask),
+            (2, 1, 0x10)
+        );
+        assert_eq!(dispatcher.signal_mask_for(&context, tid).raw(), 0x30);
     }
 
     #[test]
