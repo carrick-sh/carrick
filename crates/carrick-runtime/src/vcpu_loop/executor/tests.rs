@@ -1633,6 +1633,10 @@ impl PersistentExecutor for FakeExecutor {
         if let Some(cleanup) = self.owner_dirty_cleanup.take() {
             cleanup();
         }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let Some(topology) = &self.factory.topology {
+            topology.destroy_worker().map_err(TrapError::Hypervisor)?;
+        }
         self.factory
             .record(BackendEventKind::Destroy, self.id, None);
         match self.factory.destroy_mode.load(Ordering::SeqCst) {
@@ -10676,4 +10680,56 @@ fn host_birth_without_a_host_thread_fails_closed_not_dropped() {
         matches!(outcome, Err(super::NextError::Fatal(ref why)) if why.contains("no host thread")),
         "a host birth with no host thread must fail closed"
     );
+}
+
+#[test]
+fn serial_host_created_executor_first_run_after_teardown_retires_cleanly() {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let topology = Arc::new(carrick_vmm_hvf::trap::VcpuTopologyTestFixture::default());
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    topology.begin_vm().unwrap();
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let entry: NativeTerminalIdleEntry = {
+        let topology = Arc::clone(&topology);
+        Box::new(move || {
+            topology.begin_teardown();
+            topology.run(&mut false, || panic!("physical first entry after teardown"))
+        })
+    };
+    // Linux can prove the executor's handling of the typed outcome; the
+    // macOS binding above also drives production HVF first-entry admission.
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let entry: NativeTerminalIdleEntry = Box::new(|| Err(TrapError::CarrierClosing));
+    let (kernel, _root) = bootstrap(19_903);
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
+    let factory = Arc::new(FakeFactory {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        topology: Some(Arc::clone(&topology)),
+        native_terminal_entry: Some(Arc::new(parking_lot::Mutex::new(Some(entry)))),
+        ..FakeFactory::default()
+    });
+    let pool = start_pool(scheduler, Arc::clone(&factory), 1);
+    pool.wait_for_event(
+        |event| matches!(event, ExecutorPoolEvent::Destroyed),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let report = pool
+        .shutdown()
+        .expect("closing carrier is not an executor failure");
+    assert_eq!(report.created(), 1);
+    assert_eq!(report.destroyed(), 1);
+    assert_eq!(report.joined(), 1);
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    topology.end_vm().unwrap();
+    let events = factory.events.lock();
+    let created = events
+        .iter()
+        .find(|event| event.kind == BackendEventKind::Create)
+        .unwrap();
+    let destroyed = events
+        .iter()
+        .find(|event| event.kind == BackendEventKind::Destroy)
+        .unwrap();
+    assert_eq!(created.host_thread, destroyed.host_thread);
 }

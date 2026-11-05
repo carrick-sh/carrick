@@ -14,8 +14,6 @@
 //! `hv_vcpu_run` funnel (`HvfAarch64Vcpu::run`) and the only raw
 //! `hv_vcpu_destroy` ([`destroy_raw_vcpu`]); a violation is a carrier fault.
 
-#![cfg(all(target_os = "macos", target_arch = "aarch64"))]
-
 use carrick_fatal::carrick_fatal;
 
 /// Why a vCPU is being destroyed. Every site is a teardown-class destroy.
@@ -55,9 +53,6 @@ pub(crate) enum VcpuTopologyViolation {
         generation: u64,
     },
     RunWithoutVm,
-    FirstRunDuringTeardown {
-        generation: u64,
-    },
     DestroyWithoutVm {
         site: VcpuDestroySite,
     },
@@ -65,6 +60,31 @@ pub(crate) enum VcpuTopologyViolation {
         generation: u64,
         site: VcpuDestroySite,
     },
+}
+
+/// A created executor may wake for the first time after carrier shutdown.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FirstRunAdmission {
+    Run,
+    CarrierClosing,
+}
+
+/// Shared by the physical run path and its VM-free fixture. Never marks a
+/// refused entry as run, and never calls into the hypervisor after refusal.
+pub(crate) fn run_admitted<T>(
+    ran: &mut bool,
+    admit: impl FnOnce() -> FirstRunAdmission,
+    run: impl FnOnce() -> Result<T, carrick_hal::TrapError>,
+) -> Result<T, carrick_hal::TrapError> {
+    if !*ran {
+        match admit() {
+            FirstRunAdmission::Run => *ran = true,
+            FirstRunAdmission::CarrierClosing => {
+                return Err(carrick_hal::TrapError::CarrierClosing);
+            }
+        }
+    }
+    run()
 }
 
 /// One VM generation's topology lifetime.
@@ -114,18 +134,15 @@ impl VcpuTopology {
 
     /// A vCPU is about to run for the first time; the first one seals the
     /// generation's topology.
-    pub(crate) fn admit_first_run(&mut self) -> Result<(), VcpuTopologyViolation> {
-        let generation = self.generation;
+    pub(crate) fn admit_first_run(&mut self) -> Result<FirstRunAdmission, VcpuTopologyViolation> {
         match self.phase {
             TopologyPhase::Assembling => {
                 self.phase = TopologyPhase::Running;
-                Ok(())
+                Ok(FirstRunAdmission::Run)
             }
-            TopologyPhase::Running => Ok(()),
+            TopologyPhase::Running => Ok(FirstRunAdmission::Run),
             TopologyPhase::Vacant => Err(VcpuTopologyViolation::RunWithoutVm),
-            TopologyPhase::TearingDown => {
-                Err(VcpuTopologyViolation::FirstRunDuringTeardown { generation })
-            }
+            TopologyPhase::TearingDown => Ok(FirstRunAdmission::CarrierClosing),
         }
     }
 
@@ -237,6 +254,33 @@ impl VcpuTopologyTestFixture {
             .lock()
             .0
             .admit_first_run()
+            .map(|_| ())
+            .map_err(|error| format!("{error:?}"))
+    }
+
+    pub fn run<T>(
+        &self,
+        ran: &mut bool,
+        run: impl FnOnce() -> Result<T, carrick_hal::TrapError>,
+    ) -> Result<T, carrick_hal::TrapError> {
+        run_admitted(
+            ran,
+            || {
+                self.state
+                    .lock()
+                    .0
+                    .admit_first_run()
+                    .unwrap_or_else(|error| topology_fault(error))
+            },
+            run,
+        )
+    }
+
+    pub fn destroy_worker(&self) -> Result<(), String> {
+        self.state
+            .lock()
+            .0
+            .admit_destroy(VcpuDestroySite::WorkerExit)
             .map_err(|error| format!("{error:?}"))
     }
 
@@ -254,15 +298,17 @@ impl VcpuTopologyTestFixture {
     }
 }
 
-pub(crate) fn admit_vcpu_first_run() {
-    if let Err(violation) = carrier_vcpu_topology().lock().admit_first_run() {
-        topology_fault(violation);
-    }
+pub(crate) fn admit_vcpu_first_run() -> FirstRunAdmission {
+    carrier_vcpu_topology()
+        .lock()
+        .admit_first_run()
+        .unwrap_or_else(|violation| topology_fault(violation))
 }
 
 /// The only raw `hv_vcpu_destroy` in the crate. Owning thread only; the
 /// caller forgets its handle so applevisor's `Drop` never runs on it. A
 /// successful destroy is reported through `vcpu_destroyed`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn destroy_raw_vcpu(
     vcpu_id: applevisor_sys::hv_vcpu_t,
     site: VcpuDestroySite,
@@ -289,6 +335,30 @@ mod tests {
         VcpuDestroySite::CreationError,
         VcpuDestroySite::ExecveRebuild,
     ];
+
+    #[test]
+    #[cfg(feature = "foreign-cow-test-support")]
+    fn created_vcpu_first_entry_during_teardown_never_runs_and_can_destroy() {
+        for sibling_ran in [false, true] {
+            let fixture = VcpuTopologyTestFixture::default();
+            fixture.begin_vm().unwrap();
+            fixture.admit_create().unwrap();
+            if sibling_ran {
+                fixture.first_run().unwrap();
+            }
+            fixture.begin_teardown();
+            let mut ran = false;
+            let result: Result<(), _> =
+                fixture.run(&mut ran, || panic!("entered HVF during teardown"));
+            assert!(matches!(
+                result,
+                Err(carrick_hal::TrapError::CarrierClosing)
+            ));
+            assert!(!ran);
+            fixture.destroy_worker().unwrap();
+            fixture.end_vm().unwrap();
+        }
+    }
 
     #[test]
     fn a_generation_creates_before_its_first_run_and_destroys_at_teardown() {
@@ -323,7 +393,7 @@ mod tests {
         );
         assert_eq!(
             topology.admit_first_run(),
-            Err(VcpuTopologyViolation::FirstRunDuringTeardown { generation: 3 })
+            Ok(FirstRunAdmission::CarrierClosing)
         );
     }
 

@@ -27,9 +27,14 @@ scale_points = [1, 2]
 rationale = "EL1 plan 1a adopts the in-kernel GIC, whose topology must be final once a vCPU runs. Carrick destroyed and recreated vCPUs mid-life: every container root created a boot vCPU only to hold its first registers, ran the bring-up TLB maintenance trampoline on it (so the executor pool's vCPUs were created after the VM's first run), snapshotted it and destroyed it; a second root in a reused carrier did this while executor vCPUs ran; a faulted executor destroyed its vCPU at once; and an unreached M:N reclaim/shared-wait machinery destroyed and recreated vCPUs around blocking waits. Roots now boot from a CPU state staged as data (`StagedCpu`), as clone children already did; stage-1 maintenance a never-run staged CPU is asked for is owed to its first executor load and discharged there before the first instruction; the reclaim/shared-wait/initial-runner paths and the CARRICK_HVF_VCPU_RECLAIM hatch are deleted; a faulted executor keeps its idle vCPU until pool shutdown. `vcpu_topology::VcpuTopology` makes the rule structural: the only hv_vcpu_create, first hv_vcpu_run and raw hv_vcpu_destroy consult it, and a create after the generation's first run or a destroy before teardown is a carrier fault."
 structural_budgets = []
 
+# #1662: a created executor whose first entry meets carrier teardown must
+# return CarrierClosing without entering HVF, then destroy on its owner thread.
+# No retries or additional physical entries are permitted.
 [bindings]
 vm_free = [
   "carrick-vmm-hvf::trap::vcpu_admission::vcpu_lifetime_tests::vcpus_live_for_the_vm_lifetime",
+  "carrick-vmm-hvf::trap::vcpu_topology::tests::created_vcpu_first_entry_during_teardown_never_runs_and_can_destroy",
+  "carrick-runtime::vcpu_loop::executor::tests::serial_host_created_executor_first_run_after_teardown_retires_cleanly",
   "carrick-vmm-hvf::trap::vcpu_topology::tests::a_create_after_the_first_run_is_a_violation",
   "carrick-vmm-hvf::trap::vcpu_topology::tests::a_destroy_while_the_topology_runs_is_a_violation_at_every_site",
   "carrick-vmm-hvf::trap::vcpu_topology::tests::the_retired_initial_runner_hand_off_violates_the_topology",
