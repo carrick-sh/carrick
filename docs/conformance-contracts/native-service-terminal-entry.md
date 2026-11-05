@@ -74,3 +74,38 @@ fatals, on one artifact. The witness does not establish which fatal caused
 #1578's mixed-venue, bounded-reap or bigread failures; their signed outputs
 must be attributed separately. HVF and Docker evidence is not supplied by
 the VM-free binding.
+
+## Signed TLB attribution round
+
+Run `41943862428`, artifact `13379623470` (`signed-result-1`), tested
+`6f661d4c05cb4c7b06c3ab58676279d8b911c65a`. Its
+`steps/6f661d4/el1-embed.log:1411` prints the TLB fork/exec test as
+`FAILED`, but line 1412 explicitly records `NOT-RUN` because the binary's
+600-second budget was spent. There is no invocation, watchdog, exit 137,
+or fatal attributable to that test. The preceding tgkill test did reach a
+watchdog and exit 137 (lines 1385 and 1394). These are different outcomes;
+the missing TLB invocation cannot establish an exec regression.
+
+The test is nevertheless on shared paths touched by this fix. In
+`crates/carrick-embed/tests/el1_sched.rs:3415` it runs `tlb-fork-stale`
+and then `tlb-exec-stale`. Native service admission and settlement in
+`native_process_runtime/service.rs` are shared by exec and other service
+operations. This change adds retirement when admission observes a closed
+gate with a pending close, including exec close; `pending_close_status`
+already assigns SIGKILL to an exec loser. The new `retire_closing_entry`
+calls existing member retirement and preserves its handoff receipt. It also
+cancels an installed IPC operation before retiring, and classifies service
+protocol custody violations at their source. Thus this is not a claim that
+the PR is outside the TLB test's possible execution path.
+
+The diff does not change `commit_exec_successor`, exec close/adoption,
+`Kernel::commit_exec_transition`, host exec commit, `reserve_host_birth`,
+the `AwaitingExecBinding` transitions, or the existing
+`retire_closing_member` transaction. There is no `commit_exec_inner` symbol
+in this admitted tree; the relevant commit implementations are
+`commit_exec_successor` and `Kernel::commit_exec_transition`. The changed
+terminal-entry path feeds those existing retirement authorities rather than
+changing their eligibility rules. No runtime change is justified by this
+missing invocation. Signed confirmation of the TLB test and the original
+issue's acceptance remains outstanding; earlier actual watchdogs and
+`EntryBinding` fatals require their own attribution.
