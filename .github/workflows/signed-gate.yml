@@ -120,6 +120,29 @@ jobs:
         with:
           ref: main
           persist-credentials: false
+      - name: Install repository Rust toolchain (infrastructure)
+        shell: bash
+        run: |
+          set -euo pipefail
+          install_toolchain() {
+            rustup show active-toolchain
+          }
+          export -f install_toolchain
+          if ! python3 - <<'PYTHON'
+          import os, signal, subprocess, sys
+          child = subprocess.Popen(["bash", "-c", "install_toolchain"], start_new_session=True)
+          try:
+              sys.exit(child.wait(timeout=600))
+          except subprocess.TimeoutExpired:
+              os.killpg(child.pid, signal.SIGKILL)
+              child.wait()
+              sys.exit(75)
+          PYTHON
+          then
+            echo '::error title=Infrastructure::Rust toolchain installation failed; tests did not run'
+            exit 75
+          fi
+          echo 'RUSTUP_AUTO_INSTALL=0' >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v4
         with:
           name: signed-request-${{ github.run_attempt }}
