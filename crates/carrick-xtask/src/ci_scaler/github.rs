@@ -1630,6 +1630,87 @@ mod tests {
     }
 
     #[test]
+    fn serial_host_revet_crash_replays_outcome_exactly_once() {
+        const CHILD_PATH: &str = "CARRICK_REVET_CRASH_LEDGER";
+        // The child exits at the external delivery boundary. All preceding
+        // admission and outbox writes execute through serve_assignment.
+        struct CrashBeforeDelivery<'a> {
+            api: &'a RevetFixture,
+            path: &'a Path,
+        }
+        impl assignment::AssignmentApi for CrashBeforeDelivery<'_> {
+            fn run_jobs(&self, run: RunId, attempt: u32) -> Result<Vec<Value>, ScalerError> {
+                assignment::AssignmentApi::run_jobs(self.api, run, attempt)
+            }
+            fn revet(&self, key: JobKey) -> Result<JobPolicy, ScalerError> {
+                assignment::AssignmentApi::revet(self.api, key)
+            }
+            fn report_refusal(&self, _: JobKey, _: &str) -> Result<(), ScalerError> {
+                assert!(self.path.with_extension("refusal-outcomes.json").exists());
+                std::process::exit(86);
+            }
+        }
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let path = std::path::PathBuf::from(path);
+            let api = RevetFixture::new(false, true, false);
+            let mut ledger = revet_ledger();
+            let mut guest = RevetGuest {
+                approvals: 0,
+                stale_sha: false,
+            };
+            assignment::serve_assignment(
+                &CrashBeforeDelivery {
+                    api: &api,
+                    path: &path,
+                },
+                &mut guest,
+                &AGENT_LABELS,
+                Some(RunnerId(700)),
+                &mut ledger,
+                &path,
+                |_, _| Ok(()),
+            )
+            .unwrap();
+            panic!("refusal must reach the crash boundary");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ci_scaler::github::tests::serial_host_revet_crash_replays_outcome_exactly_once",
+                "--nocapture",
+            ])
+            .env(CHILD_PATH, &path)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(86));
+        let outbox = path.with_extension("refusal-outcomes.json");
+        let pending = std::fs::read(&outbox).unwrap();
+        let api = RevetFixture::new(false, true, false);
+        let mut restarted = Ledger::load(&path).unwrap();
+        assignment::retry_refusal_outcomes(&api, &mut restarted, &path).unwrap();
+        assert_eq!(api.comments.borrow().len(), 1);
+        assert!(
+            api.comments.borrow()[0]["body"]
+                .as_str()
+                .unwrap()
+                .contains("actor")
+        );
+        // Also replay an already delivered entry: this is the on-disk state
+        // if a second crash follows POST success but precedes outbox removal.
+        std::fs::write(&outbox, pending).unwrap();
+        assignment::retry_refusal_outcomes(&api, &mut restarted, &path).unwrap();
+        assignment::retry_refusal_outcomes(&api, &mut restarted, &path).unwrap();
+        assert_eq!(api.comments.borrow().len(), 1);
+        assert!(
+            serde_json::from_slice::<Vec<Value>>(&std::fs::read(outbox).unwrap())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn revet_reporting_recovery_cannot_reverse_a_refusal() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ledger.json");
