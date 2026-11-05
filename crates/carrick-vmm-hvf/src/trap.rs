@@ -427,7 +427,7 @@ pub use vcpu_topology::begin_carrier_vcpu_teardown;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use vcpu_topology::{
     VcpuDestroySite, admit_vcpu_first_run, begin_vcpu_topology_generation, create_admitted,
-    destroy_raw_vcpu, end_vcpu_topology_generation,
+    destroy_raw_vcpu, end_vcpu_topology_generation, run_admitted,
 };
 mod persistent_executor;
 pub use persistent_executor::*;

@@ -1076,16 +1076,14 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
             HvfVcpuBacking::Live(live) => live,
             HvfVcpuBacking::Staged(_) => return Err(staged_error("hv_vcpu_run")),
         };
-        if !live.ran {
-            crate::trap::admit_vcpu_first_run();
-            live.ran = true;
-        }
-        HvfInner::run_to_exit(
-            &mut live.inner,
-            &mut live.mailbox,
-            &live.custody,
-            live.vm_generation,
-        )
+        crate::trap::run_admitted(&mut live.ran, crate::trap::admit_vcpu_first_run, || {
+            HvfInner::run_to_exit(
+                &mut live.inner,
+                &mut live.mailbox,
+                &live.custody,
+                live.vm_generation,
+            )
+        })
     }
 
     fn kick(&self) -> Result<(), TrapError> {

@@ -430,6 +430,11 @@ pub enum ZoneRestoreSite {
 
 #[derive(Debug, ::thiserror::Error)]
 pub enum TrapError {
+    /// A created vCPU reached its first entry after carrier teardown began.
+    /// The executor must retire through its ordinary owner-thread cleanup.
+    #[error("carrier is closing before the vCPU's first run")]
+    CarrierClosing,
+
     /// An authenticated native owner retired its root; never resume the guest.
     #[error("native root exited: {status:?}")]
     NativeRootExit {

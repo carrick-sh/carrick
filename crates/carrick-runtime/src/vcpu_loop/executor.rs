@@ -4,7 +4,6 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, mpsc};
 
-#[cfg(test)]
 use crate::trap::TrapError;
 use carrick_fatal::carrick_fatal;
 use carrick_kernel::kernel::objects::{
@@ -306,6 +305,7 @@ where
         }
         let taken = match next_runnable(scheduler, backend, registration, kick) {
             Ok(taken) => Ok(taken),
+            Err(NextError::CarrierClosing) => return Ok(()),
             Err(NextError::Queue(error)) => Err(error),
             Err(NextError::Fatal(error)) => {
                 #[cfg(any(test, feature = "test-support"))]
@@ -1577,6 +1577,16 @@ where
 enum NextError {
     Queue(carrick_kernel::kernel::RunQueueError),
     Fatal(String),
+    CarrierClosing,
+}
+
+impl NextError {
+    fn from_idle_error(error: TrapError) -> Self {
+        match error {
+            TrapError::CarrierClosing => Self::CarrierClosing,
+            other => Self::Fatal(other.to_string()),
+        }
+    }
 }
 
 impl From<carrick_kernel::kernel::RunQueueError> for NextError {
@@ -1711,7 +1721,7 @@ fn next_runnable<F: PersistentExecutor>(
             let waited = backend.wait_in_guest();
             backend.disarm_guest_idle();
             drop(idle_wait);
-            match waited.map_err(|error| NextError::Fatal(error.to_string()))? {
+            match waited.map_err(NextError::from_idle_error)? {
                 GuestIdleExit::Idle(_settled) => return Ok(None),
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 GuestIdleExit::Service(service) => {
@@ -1745,7 +1755,7 @@ fn next_runnable<F: PersistentExecutor>(
     backend.note_bound_cpu(registration.bound_cpu().map(|cpu| cpu.as_u32()));
     let waited = backend.wait_in_guest();
     drop(idle_wait);
-    match waited.map_err(|error| NextError::Fatal(error.to_string()))? {
+    match waited.map_err(NextError::from_idle_error)? {
         GuestIdleExit::Idle(_settled) => Ok(None),
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         GuestIdleExit::Service(service) => {
