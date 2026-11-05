@@ -33,6 +33,7 @@ structural_budgets = []
 [bindings]
 vm_free = [
   "carrick-vmm-hvf::trap::vcpu_admission::vcpu_lifetime_tests::vcpus_live_for_the_vm_lifetime",
+  "carrick-vmm-hvf::trap::vcpu_topology::tests::admitted_run_seals_topology_before_entering_the_hypervisor",
   "carrick-vmm-hvf::trap::vcpu_topology::tests::created_vcpu_first_entry_during_teardown_never_runs_and_can_destroy",
   "carrick-runtime::vcpu_loop::executor::tests::serial_host_created_executor_first_run_after_teardown_retires_cleanly",
   "carrick-vmm-hvf::trap::vcpu_topology::tests::a_create_after_the_first_run_is_a_violation",
