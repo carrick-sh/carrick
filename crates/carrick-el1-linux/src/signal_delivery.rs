@@ -185,26 +185,88 @@ where
                     )
                 }
             });
-            let setup = machine.backend().setup_signal_frame(
-                frame,
-                params,
-                info_bytes,
-                fpstate,
-                &mut |va, bytes| process.copy_signal_frame(va, bytes).is_ok(),
-            );
-            if setup.is_err() {
-                return force_delivery_fault(
-                    task,
-                    slot,
-                    process,
-                    frame,
-                    fpstate,
-                    machine,
-                    SignalDeliveryFailure {
-                        original: sig,
-                        blocked: thread_blocked,
-                    },
-                );
+            struct SignalFrameCopy<'p, 'r, 'a, M, C, S>(
+                &'p mut NativeProcessEntry<'r, 'a, M, C, S>,
+            )
+            where
+                M: Clone,
+                C: ProcessContext,
+                S: NativeProcessService<'a, C, Mm = M>;
+
+            impl<'a, M, C, S> carrick_personality_linux::lifecycle::UserCopy
+                for SignalFrameCopy<'_, '_, 'a, M, C, S>
+            where
+                M: Clone,
+                C: ProcessContext,
+                S: NativeProcessService<'a, C, Mm = M>,
+            {
+                fn copy_in(
+                    &mut self,
+                    _dst: &mut [u8],
+                    _src: UserVa,
+                ) -> carrick_core::personality::CopyOutcome {
+                    carrick_core::personality::CopyOutcome::Fault
+                }
+
+                fn copy_out(
+                    &mut self,
+                    dst: UserVa,
+                    src: &[u8],
+                ) -> carrick_core::personality::CopyOutcome {
+                    self.0.copy_signal_frame(dst, src)
+                }
+            }
+
+            let setup = {
+                let mut copy = SignalFrameCopy(process);
+                machine
+                    .backend()
+                    .setup_signal_frame(frame, params, info_bytes, fpstate, &mut copy)
+            };
+            match setup {
+                Ok(_) => {}
+                Err(carrick_core::personality::CopyOutcome::NotYet(request)) => {
+                    slot.init_blocked(BlockedMask(thread_blocked.signals().bits()));
+                    process.requeue_deliverable(sig, info, action);
+                    use carrick_personality_linux::lifecycle::{LifecycleOutcome, ProcessNative};
+                    match ProcessNative::wait_guest_copy(process, request) {
+                        LifecycleOutcome::Redispatch => return Some(CompletionRoute::Served),
+                        LifecycleOutcome::Transferred {
+                            progress: carrick_core::Served::Idle,
+                            ..
+                        } => return Some(CompletionRoute::Suspended),
+                        LifecycleOutcome::Returned { .. } => {
+                            let _ = process.take_deliverable(thread_blocked);
+                            return force_delivery_fault(
+                                task,
+                                slot,
+                                process,
+                                frame,
+                                fpstate,
+                                machine,
+                                SignalDeliveryFailure {
+                                    original: sig,
+                                    blocked: thread_blocked,
+                                },
+                            );
+                        }
+                        _ => return Some(CompletionRoute::InvalidCompletion),
+                    }
+                }
+                Err(_) => {
+                    return force_delivery_fault(
+                        task,
+                        slot,
+                        process,
+                        frame,
+                        fpstate,
+                        machine,
+                        SignalDeliveryFailure {
+                            original: sig,
+                            blocked: thread_blocked,
+                        },
+                    );
+                }
             }
             if let Ok(sp) = setup {
                 machine.published_stack(sp);

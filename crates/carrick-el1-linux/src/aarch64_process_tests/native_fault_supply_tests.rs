@@ -4424,16 +4424,18 @@ fn arm_clone_tid_output_waits_for_sibling_in_flight_grant_publication() {
     clone_frame.x[8] = 220; // SYS_clone
 
     // 1. Before the 2 MiB stack block page `VA + 4096` is resident in Stage-1,
-    // EL1 `serve_clone` faults in `TidOutput::capture` and forwards `clone` to
-    // the host.
+    // EL1 `serve_clone` observes `NotYet` in `TidOutput::capture`, prepares
+    // the read through the owner-memory wait path, and rewinds PC to redispatch.
     crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
-    let forwarded = arm_call(fixture, fixture.control, &mut service, &mut clone_frame);
+    let redispatched = arm_call(fixture, fixture.control, &mut service, &mut clone_frame);
     crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
     assert_eq!(
-        forwarded.unwrap(),
-        carrick_personality_linux::dispatch::CompletionRoute::Forward,
-        "non-resident clone TID output in a valid VMA must forward to the host owner path"
+        redispatched.unwrap(),
+        carrick_personality_linux::dispatch::CompletionRoute::Served,
+        "non-resident clone TID output in a valid VMA must prepare and redispatch"
     );
+    assert_eq!(clone_frame.elr, 0x401ffc);
+    clone_frame.elr = 0x402000;
 
     // 2. On the host, `CloneTidOutputTransaction::capture` reads the TID output
     // address through `MmPortal::select`. When sibling B acquires the

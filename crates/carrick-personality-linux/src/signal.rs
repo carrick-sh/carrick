@@ -482,7 +482,7 @@ pub trait SignalNative<'a>: crate::lifecycle::UserCopy {
     }
     fn restore_signal_frame(
         &mut self,
-    ) -> Result<RestoredSignalFrame, carrick_syscall_abi::LinuxErrno>;
+    ) -> Result<RestoredSignalFrame, carrick_core::personality::CopyOutcome>;
     fn force_sigsegv(&mut self) -> bool {
         let blocked = self.current_blocked();
         let forced = self
@@ -650,16 +650,19 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                 let signals = native.process_signals()?;
                 signals.rt_sigpending(blocked)
             };
-            if !native
-                .copy_out(
-                    carrick_guest_arch::UserVa::new(set_ptr),
-                    &pending.to_le_bytes(),
-                )
-                .is_done()
-            {
-                return returned(LINUX_EFAULT.guest_retval(), false);
+            let copy_outcome = native.copy_out(
+                carrick_guest_arch::UserVa::new(set_ptr),
+                &pending.to_le_bytes(),
+            );
+            match copy_outcome {
+                carrick_core::personality::CopyOutcome::Done => returned(0, false),
+                carrick_core::personality::CopyOutcome::Fault => {
+                    returned(LINUX_EFAULT.guest_retval(), false)
+                }
+                carrick_core::personality::CopyOutcome::NotYet(request) => {
+                    Some(native.wait_guest_copy(request))
+                }
             }
-            returned(0, false)
         }
         SignalCall::RtSigreturn => {
             let res = native.restore_signal_frame();
@@ -669,7 +672,13 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                     native.set_current_blocked(restored.mask);
                     Some(SignalOutcome::Restored)
                 }
-                Err(_) => native.force_sigsegv().then_some(SignalOutcome::Restored),
+                Err(carrick_core::personality::CopyOutcome::NotYet(request)) => {
+                    Some(native.wait_guest_copy(request))
+                }
+                Err(
+                    carrick_core::personality::CopyOutcome::Fault
+                    | carrick_core::personality::CopyOutcome::Done,
+                ) => native.force_sigsegv().then_some(SignalOutcome::Restored),
             }
         }
         SignalCall::Kill => {
@@ -762,11 +771,16 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                 return returned(LINUX_ESRCH.guest_retval(), false);
             }
             let mut bytes = [0u8; core::mem::size_of::<LinuxSiginfo>()];
-            if !native
-                .copy_in(&mut bytes, carrick_guest_arch::UserVa::new(uinfo_ptr))
-                .is_done()
-            {
-                return returned(LINUX_EFAULT.guest_retval(), false);
+            let copy_outcome =
+                native.copy_in(&mut bytes, carrick_guest_arch::UserVa::new(uinfo_ptr));
+            match copy_outcome {
+                carrick_core::personality::CopyOutcome::Done => {}
+                carrick_core::personality::CopyOutcome::Fault => {
+                    return returned(LINUX_EFAULT.guest_retval(), false);
+                }
+                carrick_core::personality::CopyOutcome::NotYet(request) => {
+                    return Some(native.wait_guest_copy(request));
+                }
             }
             let Ok(info) = LinuxSiginfo::ref_from_bytes(&bytes) else {
                 return returned(LINUX_EFAULT.guest_retval(), false);
@@ -789,11 +803,16 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                 Err(errno) => return returned(errno.guest_retval(), false),
             };
             let mut bytes = [0u8; core::mem::size_of::<LinuxSiginfo>()];
-            if !native
-                .copy_in(&mut bytes, carrick_guest_arch::UserVa::new(uinfo_ptr))
-                .is_done()
-            {
-                return returned(LINUX_EFAULT.guest_retval(), false);
+            let copy_outcome =
+                native.copy_in(&mut bytes, carrick_guest_arch::UserVa::new(uinfo_ptr));
+            match copy_outcome {
+                carrick_core::personality::CopyOutcome::Done => {}
+                carrick_core::personality::CopyOutcome::Fault => {
+                    return returned(LINUX_EFAULT.guest_retval(), false);
+                }
+                carrick_core::personality::CopyOutcome::NotYet(request) => {
+                    return Some(native.wait_guest_copy(request));
+                }
             }
             let Ok(info) = LinuxSiginfo::ref_from_bytes(&bytes) else {
                 return returned(LINUX_EFAULT.guest_retval(), false);
@@ -848,22 +867,32 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                 return returned(LINUX_EINVAL.guest_retval(), false);
             }
             let mut bytes = [0u8; 8];
-            if !native
-                .copy_in(&mut bytes, carrick_guest_arch::UserVa::new(uthese_ptr))
-                .is_done()
-            {
-                return returned(LINUX_EFAULT.guest_retval(), false);
+            let these_copy =
+                native.copy_in(&mut bytes, carrick_guest_arch::UserVa::new(uthese_ptr));
+            match these_copy {
+                carrick_core::personality::CopyOutcome::Done => {}
+                carrick_core::personality::CopyOutcome::Fault => {
+                    return returned(LINUX_EFAULT.guest_retval(), false);
+                }
+                carrick_core::personality::CopyOutcome::NotYet(request) => {
+                    return Some(native.wait_guest_copy(request));
+                }
             }
             let set = carrick_signal_core::SignalSet::from_bits(u64::from_le_bytes(bytes))
                 .without(carrick_signal_core::policy::Signal::KILL)
                 .without(carrick_signal_core::policy::Signal::STOP);
             let timeout_ns = if uts_ptr != 0 {
                 let mut ts_bytes = [0u8; 16];
-                if !native
-                    .copy_in(&mut ts_bytes, carrick_guest_arch::UserVa::new(uts_ptr))
-                    .is_done()
-                {
-                    return returned(LINUX_EFAULT.guest_retval(), false);
+                let ts_copy =
+                    native.copy_in(&mut ts_bytes, carrick_guest_arch::UserVa::new(uts_ptr));
+                match ts_copy {
+                    carrick_core::personality::CopyOutcome::Done => {}
+                    carrick_core::personality::CopyOutcome::Fault => {
+                        return returned(LINUX_EFAULT.guest_retval(), false);
+                    }
+                    carrick_core::personality::CopyOutcome::NotYet(request) => {
+                        return Some(native.wait_guest_copy(request));
+                    }
                 }
                 let mut sec_bytes = [0u8; 8];
                 sec_bytes.copy_from_slice(&ts_bytes[0..8]);
@@ -977,21 +1006,21 @@ pub struct SignalFrameParams {
 }
 
 pub trait SignalBackend: carrick_guest_arch::ArchTypes {
-    fn setup_signal_frame<'a>(
+    fn setup_signal_frame(
         &mut self,
         frame: &mut Self::NativeFrame,
         params: SignalFrameParams,
-        siginfo: Option<&'a [u8]>,
+        siginfo: Option<&[u8]>,
         fpstate: &[u8],
-        copy_out: &mut dyn FnMut(carrick_guest_arch::UserVa, &[u8]) -> bool,
-    ) -> Result<carrick_guest_arch::UserVa, Self::Error>;
+        copy_out: &mut dyn crate::lifecycle::UserCopy,
+    ) -> Result<carrick_guest_arch::UserVa, carrick_core::personality::CopyOutcome>;
 
     fn restore_signal_frame(
         &mut self,
         frame: &mut Self::NativeFrame,
         fpstate: &mut [u8],
-        copy_in: &mut dyn FnMut(&mut [u8], carrick_guest_arch::UserVa) -> bool,
-    ) -> Result<RestoredSignalFrame, Self::Error>;
+        copy_in: &mut dyn crate::lifecycle::UserCopy,
+    ) -> Result<RestoredSignalFrame, carrick_core::personality::CopyOutcome>;
 }
 
 /// The validated public frame's two thread-level signal settings. ISA

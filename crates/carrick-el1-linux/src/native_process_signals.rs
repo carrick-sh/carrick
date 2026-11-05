@@ -606,6 +606,21 @@ impl<'a, T> NativeProcessSignals<'a, T> {
             return Some((signal, delivery.entry.info, action));
         }
     }
+    pub fn requeue_deliverable(
+        &self,
+        tid: carrick_sched_core::RecordRef,
+        signal: Signal,
+        info: Option<T>,
+        action: Action,
+    ) {
+        let mut resources = self.resources.lock();
+        if action.flags.reset_hand {
+            let _ = resources.actions.install(signal, action);
+        }
+        let _ = resources.thread_pending_mut(tid).enqueue(signal, info);
+        self.resources
+            .refresh_summary(&resources, ProjectionUpdate::Member(tid));
+    }
     pub fn take_timedwait(
         &self,
         tid: carrick_sched_core::RecordRef,

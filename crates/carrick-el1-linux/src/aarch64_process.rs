@@ -1679,9 +1679,10 @@ impl<'a, X: ForkStockCrossing> Aarch64NativeProcessService<'a, X> {
         }
         #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         {
+            let validator = &crate::file::HardwareValidator;
             let mut copy = crate::lifecycle::LinuxUserCopy(crate::file::ValidatedCopy {
                 task: self.task,
-                validator: &crate::file::HardwareValidator,
+                validator,
             });
             if let Some(bytes) = bytes {
                 if !carrick_personality_linux::lifecycle::UserCopy::copy_out(
@@ -1689,6 +1690,14 @@ impl<'a, X: ForkStockCrossing> Aarch64NativeProcessService<'a, X> {
                 )
                 .is_done()
                 {
+                    if crate::file::MemoryValidator::writable_bytes(
+                        validator,
+                        address.raw(),
+                        bytes.len(),
+                    ) == bytes.len()
+                    {
+                        return Err(NativeProcessError::Busy);
+                    }
                     return Err(NativeProcessError::Fault);
                 }
                 #[cfg(test)]
@@ -2732,13 +2741,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         mm: &Self::Mm,
         request: carrick_core::personality::GuestCopyRequest,
     ) -> Result<(), NativeProcessError> {
-        self.access_user_target(
-            mm,
-            request.address,
-            request.len,
-            None,
-            carrick_guest_arch::Access::Read,
-        )
+        self.access_user_target(mm, request.address, request.len, None, request.access)
     }
     fn copyout_fault(
         &self,

@@ -613,10 +613,6 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         bytes: &[u8],
     ) -> Result<(), NativeProcessError> {
         self.copy_user_bytes(mm, address, bytes)
-            .map_err(|error| match error {
-                NativeProcessError::OwnerWait(_) => NativeProcessError::Busy,
-                other => other,
-            })
     }
     fn copy_owned_bytes(
         &mut self,
@@ -625,6 +621,20 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         bytes: &[u8],
     ) -> Result<(), NativeProcessError> {
         self.copy_user_bytes(mm, address, bytes)
+    }
+    fn prepare_owned_write(
+        &mut self,
+        mm: &Self::Mm,
+        request: carrick_core::personality::GuestCopyRequest,
+    ) -> Result<(), NativeProcessError> {
+        self.prepare_user_bytes(mm, request)
+    }
+    fn prepare_owned_read(
+        &mut self,
+        mm: &Self::Mm,
+        request: carrick_core::personality::GuestCopyRequest,
+    ) -> Result<(), NativeProcessError> {
+        self.prepare_user_bytes(mm, request)
     }
     fn quarantine_prepared(&mut self, p: Prepared) {
         core::mem::forget(p);

@@ -37,30 +37,27 @@ impl LinuxX86Backend {
         resume: UserReturn,
         siginfo: Option<&'a [u8]>,
         fpstate: &[u8],
-        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
-    ) -> Result<UserVa, ArchError> {
+        copy_out: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
+    ) -> Result<UserVa, carrick_core::personality::CopyOutcome> {
+        use carrick_core::personality::CopyOutcome;
         // 1. Determine stack location
         // On x86_64, user stack has a 128-byte red zone:
         const FP_BYTES: usize = carrick_sched_core::X86_XSAVE_BYTES;
         if fpstate.len() != FP_BYTES {
-            return Err(ArchError::InvalidFrame);
+            return Err(CopyOutcome::Fault);
         }
-        let sp = params
-            .sp
-            .raw()
-            .checked_sub(128)
-            .ok_or(ArchError::InvalidFrame)?;
+        let sp = params.sp.raw().checked_sub(128).ok_or(CopyOutcome::Fault)?;
         let fp_address = sp
             .checked_sub((FP_BYTES + 4) as u64)
-            .ok_or(ArchError::InvalidFrame)?
+            .ok_or(CopyOutcome::Fault)?
             & !63;
         let frame_size = core::mem::size_of::<RtSigframe>() as u64;
         let new_sp = (fp_address
             .checked_sub(frame_size)
-            .ok_or(ArchError::InvalidFrame)?
+            .ok_or(CopyOutcome::Fault)?
             & !15)
             .checked_sub(8)
-            .ok_or(ArchError::InvalidFrame)?;
+            .ok_or(CopyOutcome::Fault)?;
         // Both syscall and page-fault delivery use this codec. Reject a guest
         // target before copying or publishing return words: the final return
         // validator protects supervisor invariants and must never see this fault.
@@ -69,7 +66,7 @@ impl LinuxX86Backend {
             new_sp,
             resume.flags.raw() & !((1 << 10) | (1 << 8)),
         ) {
-            return Err(ArchError::InvalidFrame);
+            return Err(CopyOutcome::Fault);
         }
         let mut fp_image = [0u8; FP_BYTES + 4];
         fp_image[..FP_BYTES].copy_from_slice(fpstate);
@@ -136,10 +133,15 @@ impl LinuxX86Backend {
 
         // 3. Write frame to user stack
         let frame_bytes = rtsigframe.as_bytes();
-        if !copy_out(UserVa::new(fp_address), &fp_image)
-            || !copy_out(UserVa::new(new_sp), frame_bytes)
-        {
-            return Err(ArchError::InvalidFrame);
+        let fp_outcome = copy_out.copy_out(UserVa::new(fp_address), &fp_image);
+        match fp_outcome {
+            CopyOutcome::Done => {}
+            CopyOutcome::Fault | CopyOutcome::NotYet(_) => return Err(fp_outcome),
+        }
+        let frame_outcome = copy_out.copy_out(UserVa::new(new_sp), frame_bytes);
+        match frame_outcome {
+            CopyOutcome::Done => {}
+            CopyOutcome::Fault | CopyOutcome::NotYet(_) => return Err(frame_outcome),
         }
 
         // 4. Set up registers for handler invocation
@@ -165,8 +167,8 @@ impl SignalBackend for LinuxX86Backend {
         params: SignalFrameParams,
         siginfo: Option<&[u8]>,
         fpstate: &[u8],
-        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
-    ) -> Result<UserVa, Self::Error> {
+        copy_out: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
+    ) -> Result<UserVa, carrick_core::personality::CopyOutcome> {
         self.setup_signal_frame_with_resume(
             frame,
             params,
@@ -187,21 +189,27 @@ impl SignalBackend for LinuxX86Backend {
         &mut self,
         frame: &mut NativeFrame,
         fpstate: &mut [u8],
-        copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> bool,
-    ) -> Result<carrick_personality_linux::signal::RestoredSignalFrame, Self::Error> {
+        copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
+    ) -> Result<
+        carrick_personality_linux::signal::RestoredSignalFrame,
+        carrick_core::personality::CopyOutcome,
+    > {
+        use carrick_core::personality::CopyOutcome;
         let uc_addr = UserVa::new(frame.rsp);
         let mut uc_bytes = [0u8; core::mem::size_of::<Ucontext>()];
-        if !copy_in(&mut uc_bytes, uc_addr) {
-            return Err(ArchError::InvalidFrame);
+        let uc_outcome = copy_in.copy_in(&mut uc_bytes, uc_addr);
+        match uc_outcome {
+            CopyOutcome::Done => {}
+            CopyOutcome::Fault | CopyOutcome::NotYet(_) => return Err(uc_outcome),
         }
         let Ok(uc) = Ucontext::read_from_bytes(&uc_bytes) else {
-            return Err(ArchError::InvalidFrame);
+            return Err(CopyOutcome::Fault);
         };
         let stack = carrick_personality_linux::signal::restored_altstack(
             uc.uc_stack,
             carrick_guest_arch::GuestIsa::X86_64,
         )
-        .ok_or(ArchError::InvalidFrame)?;
+        .ok_or(CopyOutcome::Fault)?;
 
         let flags = carrick_sched_core::signal_return_flags(frame.r11, uc.uc_mcontext.eflags);
         if !carrick_sched_core::valid_user_return_words(
@@ -209,12 +217,12 @@ impl SignalBackend for LinuxX86Backend {
             uc.uc_mcontext.rsp,
             flags,
         ) {
-            return Err(ArchError::InvalidFrame);
+            return Err(CopyOutcome::Fault);
         }
 
         const FP_BYTES: usize = carrick_sched_core::X86_XSAVE_BYTES;
         if fpstate.len() != FP_BYTES {
-            return Err(ArchError::InvalidFrame);
+            return Err(CopyOutcome::Fault);
         }
         let mut restored_fp = [0u8; FP_BYTES];
         let fp_address = uc.uc_mcontext.fpstate;
@@ -224,26 +232,32 @@ impl SignalBackend for LinuxX86Backend {
             restored_fp[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
             restored_fp[512..520].copy_from_slice(&3u64.to_le_bytes());
         } else {
-            if !copy_in(&mut restored_fp[..512], UserVa::new(fp_address)) {
-                return Err(ArchError::InvalidFrame);
+            let fp_outcome = copy_in.copy_in(&mut restored_fp[..512], UserVa::new(fp_address));
+            match fp_outcome {
+                CopyOutcome::Done => {}
+                CopyOutcome::Fault | CopyOutcome::NotYet(_) => return Err(fp_outcome),
             }
             let descriptor =
                 carrick_syscall_abi::X8664FpxSwBytes::read_from_bytes(&restored_fp[464..512])
-                    .map_err(|_| ArchError::InvalidFrame)?;
+                    .map_err(|_| CopyOutcome::Fault)?;
             if descriptor.magic1 == carrick_syscall_abi::X8664_FP_XSTATE_MAGIC1 {
                 if descriptor.xstate_size != FP_BYTES as u32
                     || descriptor.extended_size != (FP_BYTES + 4) as u32
                     || descriptor.xfeatures & !7 != 0
                 {
-                    return Err(ArchError::InvalidFrame);
+                    return Err(CopyOutcome::Fault);
                 }
-                let tail = fp_address.checked_add(512).ok_or(ArchError::InvalidFrame)?;
+                let tail = fp_address.checked_add(512).ok_or(CopyOutcome::Fault)?;
                 let mut extended = [0u8; FP_BYTES - 512 + 4];
-                if !copy_in(&mut extended, UserVa::new(tail))
-                    || extended[FP_BYTES - 512..]
-                        != carrick_syscall_abi::X8664_FP_XSTATE_MAGIC2.to_le_bytes()
+                let ext_outcome = copy_in.copy_in(&mut extended, UserVa::new(tail));
+                match ext_outcome {
+                    CopyOutcome::Done => {}
+                    CopyOutcome::Fault | CopyOutcome::NotYet(_) => return Err(ext_outcome),
+                }
+                if extended[FP_BYTES - 512..]
+                    != carrick_syscall_abi::X8664_FP_XSTATE_MAGIC2.to_le_bytes()
                 {
-                    return Err(ArchError::InvalidFrame);
+                    return Err(CopyOutcome::Fault);
                 }
                 restored_fp[512..].copy_from_slice(&extended[..FP_BYTES - 512]);
                 let mut feature_bytes = [0; 8];
@@ -251,12 +265,12 @@ impl SignalBackend for LinuxX86Backend {
                 if u64::from_le_bytes(feature_bytes) & !7 != 0
                     || restored_fp[520..576].iter().any(|byte| *byte != 0)
                 {
-                    return Err(ArchError::InvalidFrame);
+                    return Err(CopyOutcome::Fault);
                 }
             } else if descriptor.magic1 == 0 {
                 restored_fp[512..520].copy_from_slice(&3u64.to_le_bytes());
             } else {
-                return Err(ArchError::InvalidFrame);
+                return Err(CopyOutcome::Fault);
             }
             let mut mxcsr_bytes = [0; 4];
             mxcsr_bytes.copy_from_slice(&restored_fp[24..28]);
@@ -265,7 +279,7 @@ impl SignalBackend for LinuxX86Backend {
             let mask = u32::from_le_bytes(mask_bytes);
             let mask = if mask == 0 { 0xffbf } else { mask };
             if u32::from_le_bytes(mxcsr_bytes) & !mask != 0 {
-                return Err(ArchError::InvalidFrame);
+                return Err(CopyOutcome::Fault);
             }
         }
         fpstate.copy_from_slice(&restored_fp);

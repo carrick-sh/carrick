@@ -166,6 +166,7 @@ pub enum LifecycleCall {
     GetPid,
     GetTid,
     Clone,
+    Clone3,
     Fork,
     Wait4,
     WaitId,
@@ -603,6 +604,9 @@ pub trait LifecycleNative<'a>: UserCopy {
     ) -> bool {
         false
     }
+    fn has_process_venue(&self) -> bool {
+        false
+    }
 }
 /// Linux aarch64 syscall numbers served here (`SYS_SET_ROBUST_LIST` is the
 /// shared canonical number from [`crate::thread`]).
@@ -612,6 +616,7 @@ pub const SYS_RT_SIGPROCMASK: usize = 135;
 pub const SYS_GETTID: usize = 178;
 pub const SYS_GETPID: usize = 172;
 pub const SYS_CLONE: usize = 220;
+pub const SYS_CLONE3: usize = 435;
 
 // clone(2) flags.
 const CLONE_VM: u64 = 0x0000_0100;
@@ -740,6 +745,7 @@ pub const fn is_lifecycle_syscall(nr: usize) -> bool {
             | SYS_GETTID
             | SYS_GETPID
             | SYS_CLONE
+            | SYS_CLONE3
     )
 }
 
@@ -863,32 +869,35 @@ pub fn invoke<'a>(
             })
         }
         LifecycleCall::Clone => serve_clone(args, thread, native),
+        LifecycleCall::Clone3 => serve_clone3(args, thread, native),
         LifecycleCall::Exit => {
             if !native.has_scheduler() {
                 native.record_decline(LifecycleDecline::ExitScheduler);
                 return None;
             }
-            if let Some((progress, result)) = serve_exit(thread, native) {
-                Some(LifecycleOutcome::Transferred {
+            match serve_exit(thread, native) {
+                Ok((progress, result)) => Some(LifecycleOutcome::Transferred {
                     progress,
                     result: SyscallResult::new(result),
-                })
-            } else {
-                let binding = native.binding()?;
-                let identity = carrick_core::terminal::ThreadTerminalIdentity::from_exit(
-                    binding,
-                    thread.slot.entry(),
-                    TerminationStatus::exited(args[0] as u32),
-                )?;
-                let verdict = carrick_core::terminal::TerminalCustody::<
-                    carrick_core::terminal::Thread,
-                    carrick_core::terminal::Live,
-                >::admitted(identity)
-                .begin()
-                .route_to_host();
-                native
-                    .route_host_thread_exit(verdict)
-                    .then_some(LifecycleOutcome::HostCustody)
+                }),
+                Err(Some(outcome)) => Some(outcome),
+                Err(None) => {
+                    let binding = native.binding()?;
+                    let identity = carrick_core::terminal::ThreadTerminalIdentity::from_exit(
+                        binding,
+                        thread.slot.entry(),
+                        TerminationStatus::exited(args[0] as u32),
+                    )?;
+                    let verdict = carrick_core::terminal::TerminalCustody::<
+                        carrick_core::terminal::Thread,
+                        carrick_core::terminal::Live,
+                    >::admitted(identity)
+                    .begin()
+                    .route_to_host();
+                    native
+                        .route_host_thread_exit(verdict)
+                        .then_some(LifecycleOutcome::HostCustody)
+                }
             }
         }
         _ => None,
@@ -1116,14 +1125,19 @@ struct TidOutput {
 }
 
 impl TidOutput {
-    fn capture(address: u64, user: &mut (impl UserCopy + ?Sized)) -> Option<Option<Self>> {
+    fn capture(
+        address: u64,
+        user: &mut (impl UserCopy + ?Sized),
+    ) -> Result<Option<Self>, CopyOutcome> {
         if address == 0 {
-            return Some(None);
+            return Ok(None);
         }
         let mut preimage = [0u8; 4];
-        user.copy_in(&mut preimage, UserVa::new(address))
-            .is_done()
-            .then_some(Some(Self { address, preimage }))
+        let outcome = user.copy_in(&mut preimage, UserVa::new(address));
+        match outcome {
+            CopyOutcome::Done => Ok(Some(Self { address, preimage })),
+            CopyOutcome::Fault | CopyOutcome::NotYet(_) => Err(outcome),
+        }
     }
 }
 
@@ -1137,27 +1151,30 @@ struct TidOutputs {
 }
 
 impl TidOutputs {
-    fn publish(&self, visible_tid: u32, user: &mut (impl UserCopy + ?Sized)) -> bool {
+    fn publish(&self, visible_tid: u32, user: &mut (impl UserCopy + ?Sized)) -> CopyOutcome {
         let bytes = visible_tid.to_le_bytes();
         let Some(parent) = &self.parent else {
             return self.publish_child(&bytes, user);
         };
-        if !user.copy_out(UserVa::new(parent.address), &bytes).is_done() {
-            return false;
+        let parent_outcome = user.copy_out(UserVa::new(parent.address), &bytes);
+        if !parent_outcome.is_done() {
+            return parent_outcome;
         }
-        if self.publish_child(&bytes, user) {
-            return true;
+        let child_outcome = self.publish_child(&bytes, user);
+        if child_outcome.is_done() {
+            return CopyOutcome::Done;
         }
         let _ = user
             .copy_out(UserVa::new(parent.address), &parent.preimage)
             .is_done();
-        false
+        child_outcome
     }
 
-    fn publish_child(&self, bytes: &[u8; 4], user: &mut (impl UserCopy + ?Sized)) -> bool {
-        self.child
-            .as_ref()
-            .is_none_or(|child| user.copy_out(UserVa::new(child.address), bytes).is_done())
+    fn publish_child(&self, bytes: &[u8; 4], user: &mut (impl UserCopy + ?Sized)) -> CopyOutcome {
+        let Some(child) = &self.child else {
+            return CopyOutcome::Done;
+        };
+        user.copy_out(UserVa::new(child.address), bytes)
     }
 
     fn rollback(&self, user: &mut (impl UserCopy + ?Sized)) {
@@ -1189,8 +1206,213 @@ fn serve_clone<'a>(
     {
         return None;
     }
+    let flag = |bit: u64, address: u64| if flags & bit != 0 { address } else { 0 };
+    serve_thread_clone_common(
+        flags,
+        stack,
+        flag(CLONE_PARENT_SETTID, parent_tid),
+        (flags & CLONE_SETTLS != 0).then_some(UserVa::new(tls)),
+        flag(CLONE_CHILD_SETTID, child_tid),
+        flag(CLONE_CHILD_CLEARTID, child_tid),
+        thread,
+        native,
+    )
+}
+
+const CLONE_ARGS_SIZE_VER0: u64 = 64;
+const CLONE_ARGS_SIZE_VER1: u64 = 80;
+const CLONE_ARGS_SIZE_VER2: u64 = 88;
+const CLONE_PIDFD: u64 = 0x0000_1000;
+const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
+const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
+
+/// `clone3(uargs, size)` creating a thread when the clone3 argument struct
+/// requests a thread-group member with the supported flag set.
+fn serve_clone3<'a>(
+    args: [u64; 6],
+    thread: LifecycleThread<'a>,
+    native: &mut dyn LifecycleNative<'a>,
+) -> Option<LifecycleOutcome> {
+    if !native.has_scheduler() || !native.has_process_venue() {
+        return None;
+    }
+    let [uargs_ptr, size] = [args[0], args[1]];
+    let page = thread.page;
+    if !page.serves_threads() {
+        return None;
+    }
+    if !(CLONE_ARGS_SIZE_VER0..=4096).contains(&size) {
+        return Some(returned(
+            SyscallResult::from_errno(carrick_syscall_abi::LINUX_EINVAL),
+            false,
+        ));
+    }
+    if uargs_ptr == 0 {
+        return Some(returned(
+            SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
+            false,
+        ));
+    }
+    let mut ver0 = [0u8; CLONE_ARGS_SIZE_VER0 as usize];
+    let ver0_copy = native.copy_in(&mut ver0, UserVa::new(uargs_ptr));
+    match ver0_copy {
+        CopyOutcome::Done => {}
+        CopyOutcome::NotYet(req) => return Some(native.wait_guest_copy(req)),
+        CopyOutcome::Fault => {
+            return Some(returned(
+                SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
+                false,
+            ));
+        }
+    }
+    let word = |idx: usize| -> u64 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&ver0[idx * 8..(idx + 1) * 8]);
+        u64::from_le_bytes(bytes)
+    };
+    let flags = word(0);
+    let pidfd = word(1);
+    let child_tid = word(2);
+    let parent_tid = word(3);
+    let exit_signal = word(4);
+    let stack = word(5);
+    let stack_size = word(6);
+    let tls = word(7);
+
+    let mut set_tid = 0u64;
+    let mut set_tid_size = 0u64;
+    if size >= CLONE_ARGS_SIZE_VER1 {
+        let mut ver1_tail = [0u8; (CLONE_ARGS_SIZE_VER1 - CLONE_ARGS_SIZE_VER0) as usize];
+        let ver1_copy = native.copy_in(
+            &mut ver1_tail,
+            UserVa::new(uargs_ptr.wrapping_add(CLONE_ARGS_SIZE_VER0)),
+        );
+        match ver1_copy {
+            CopyOutcome::Done => {}
+            CopyOutcome::NotYet(req) => return Some(native.wait_guest_copy(req)),
+            CopyOutcome::Fault => {
+                return Some(returned(
+                    SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
+                    false,
+                ));
+            }
+        }
+        let mut b0 = [0u8; 8];
+        b0.copy_from_slice(&ver1_tail[0..8]);
+        set_tid = u64::from_le_bytes(b0);
+        let mut b1 = [0u8; 8];
+        b1.copy_from_slice(&ver1_tail[8..16]);
+        set_tid_size = u64::from_le_bytes(b1);
+    }
+    let mut cgroup = 0u64;
+    if size >= CLONE_ARGS_SIZE_VER2 {
+        let mut ver2_tail = [0u8; (CLONE_ARGS_SIZE_VER2 - CLONE_ARGS_SIZE_VER1) as usize];
+        let ver2_copy = native.copy_in(
+            &mut ver2_tail,
+            UserVa::new(uargs_ptr.wrapping_add(CLONE_ARGS_SIZE_VER1)),
+        );
+        match ver2_copy {
+            CopyOutcome::Done => {}
+            CopyOutcome::NotYet(req) => return Some(native.wait_guest_copy(req)),
+            CopyOutcome::Fault => {
+                return Some(returned(
+                    SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
+                    false,
+                ));
+            }
+        }
+        cgroup = u64::from_le_bytes(ver2_tail);
+    }
+    if size > CLONE_ARGS_SIZE_VER2 {
+        let extra_len = (size - CLONE_ARGS_SIZE_VER2) as usize;
+        let mut extra = alloc::vec![0u8; extra_len];
+        let extra_copy = native.copy_in(
+            &mut extra,
+            UserVa::new(uargs_ptr.wrapping_add(CLONE_ARGS_SIZE_VER2)),
+        );
+        match extra_copy {
+            CopyOutcome::Done => {}
+            CopyOutcome::NotYet(req) => return Some(native.wait_guest_copy(req)),
+            CopyOutcome::Fault => {
+                return Some(returned(
+                    SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
+                    false,
+                ));
+            }
+        }
+        if extra.iter().any(|&b| b != 0) {
+            return Some(returned(
+                SyscallResult::from_errno(carrick_syscall_abi::LINUX_E2BIG),
+                false,
+            ));
+        }
+    }
+
+    if (flags & CSIGNAL) != 0
+        || (exit_signal & !CSIGNAL) != 0
+        || (flags & (CLONE_PARENT_SETTID | CLONE_PIDFD)) == (CLONE_PARENT_SETTID | CLONE_PIDFD)
+        || (set_tid == 0 && set_tid_size != 0)
+        || (set_tid != 0 && set_tid_size == 0)
+        || (stack == 0 && stack_size != 0)
+        || (stack != 0 && stack_size == 0)
+    {
+        return Some(returned(
+            SyscallResult::from_errno(carrick_syscall_abi::LINUX_EINVAL),
+            false,
+        ));
+    }
+    if (flags & (CLONE_CLEAR_SIGHAND | CLONE_INTO_CGROUP | CLONE_PIDFD)) != 0
+        || pidfd != 0
+        || set_tid != 0
+        || set_tid_size != 0
+        || cgroup != 0
+    {
+        return None;
+    }
+    if flags & THREAD_CLONE_REQUIRED != THREAD_CLONE_REQUIRED {
+        return None;
+    }
+    if exit_signal != 0
+        || flags & !(THREAD_CLONE_REQUIRED | THREAD_CLONE_OPTIONAL) != 0
+        || stack == 0
+    {
+        return Some(returned(
+            SyscallResult::from_errno(carrick_syscall_abi::LINUX_EINVAL),
+            false,
+        ));
+    }
+    let Some(stack_top) = stack.checked_add(stack_size) else {
+        return Some(returned(
+            SyscallResult::from_errno(carrick_syscall_abi::LINUX_EINVAL),
+            false,
+        ));
+    };
+    let flag = |bit: u64, address: u64| if flags & bit != 0 { address } else { 0 };
+    serve_thread_clone_common(
+        flags,
+        stack_top,
+        flag(CLONE_PARENT_SETTID, parent_tid),
+        (flags & CLONE_SETTLS != 0).then_some(UserVa::new(tls)),
+        flag(CLONE_CHILD_SETTID, child_tid),
+        flag(CLONE_CHILD_CLEARTID, child_tid),
+        thread,
+        native,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serve_thread_clone_common<'a>(
+    flags: u64,
+    stack: u64,
+    parent_settid_addr: u64,
+    placement_tls: Option<UserVa>,
+    child_settid_addr: u64,
+    clear_child_tid: u64,
+    thread: LifecycleThread<'a>,
+    native: &mut dyn LifecycleNative<'a>,
+) -> Option<LifecycleOutcome> {
+    let page = thread.page;
     let placement_stack = UserVa::new(stack);
-    let placement_tls = (flags & CLONE_SETTLS != 0).then_some(UserVa::new(tls));
     if !native.can_prepare_child(placement_stack, placement_tls) {
         return None;
     }
@@ -1200,12 +1422,32 @@ fn serve_clone<'a>(
     if mm == 0 {
         return None;
     }
-    let flag = |bit: u64, address: u64| if flags & bit != 0 { address } else { 0 };
-    let clear_child_tid = flag(CLONE_CHILD_CLEARTID, child_tid);
-    let outputs = TidOutputs {
-        parent: TidOutput::capture(flag(CLONE_PARENT_SETTID, parent_tid), native)?,
-        child: TidOutput::capture(flag(CLONE_CHILD_SETTID, child_tid), native)?,
+    let has_venue = native.has_process_venue();
+    let parent = match TidOutput::capture(parent_settid_addr, native) {
+        Ok(parent) => parent,
+        Err(CopyOutcome::NotYet(req)) => return Some(native.wait_guest_copy(req)),
+        Err(CopyOutcome::Fault | CopyOutcome::Done) => {
+            return has_venue.then(|| {
+                returned(
+                    SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
+                    false,
+                )
+            });
+        }
     };
+    let child = match TidOutput::capture(child_settid_addr, native) {
+        Ok(child) => child,
+        Err(CopyOutcome::NotYet(req)) => return Some(native.wait_guest_copy(req)),
+        Err(CopyOutcome::Fault | CopyOutcome::Done) => {
+            return has_venue.then(|| {
+                returned(
+                    SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
+                    false,
+                )
+            });
+        }
+    };
+    let outputs = TidOutputs { parent, child };
 
     let state = native.task_state()?;
     let affinity = native.affinity()?;
@@ -1332,7 +1574,8 @@ fn serve_clone<'a>(
     if managed && !native.retain_native_birth(record, child_slot) {
         native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
     }
-    if !outputs.publish(identity.visible_tid, native) {
+    let publish_outcome = outputs.publish(identity.visible_tid, native);
+    if !publish_outcome.is_done() {
         if managed && !native.release_native_birth(record, child_slot) {
             native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
         }
@@ -1343,12 +1586,15 @@ fn serve_clone<'a>(
         if native.lifecycle_admission_settled().is_err() {
             native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
         }
-        return managed.then(|| {
-            returned(
-                SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
-                false,
-            )
-        });
+        return match publish_outcome {
+            CopyOutcome::NotYet(req) => Some(native.wait_guest_copy(req)),
+            CopyOutcome::Fault | CopyOutcome::Done => managed.then(|| {
+                returned(
+                    SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
+                    false,
+                )
+            }),
+        };
     }
 
     if page.thread_born().is_none() {
@@ -1417,17 +1663,117 @@ fn serve_clone<'a>(
     Some(returned(SyscallResult::new(visible as i64), false))
 }
 
+const ROBUST_LIST_LIMIT: usize = 2048;
+const FUTEX_WAITERS: u32 = 0x8000_0000;
+const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
+
+fn handle_exit_robust_futex<'a>(
+    node_addr: u64,
+    futex_offset: i64,
+    current_tid: u32,
+    mm_key: EntryMmKey,
+    native: &mut dyn LifecycleNative<'a>,
+) -> Result<(), Option<LifecycleOutcome>> {
+    let futex_addr = (node_addr as i64).wrapping_add(futex_offset) as u64;
+    let mut futex_bytes = [0u8; 4];
+    let read_outcome = native.copy_in(&mut futex_bytes, UserVa::new(futex_addr));
+    match read_outcome {
+        CopyOutcome::Done => {}
+        CopyOutcome::NotYet(req) => return Err(Some(native.wait_guest_copy(req))),
+        CopyOutcome::Fault => return Ok(()),
+    }
+    let futex_word = u32::from_le_bytes(futex_bytes);
+    if (futex_word & FUTEX_TID_MASK) == current_tid {
+        let new_val = (futex_word & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
+        let write_outcome = native.copy_out(UserVa::new(futex_addr), &new_val.to_le_bytes());
+        match write_outcome {
+            CopyOutcome::Done => {}
+            CopyOutcome::NotYet(req) => return Err(Some(native.wait_guest_copy(req))),
+            CopyOutcome::Fault => return Ok(()),
+        }
+        if (futex_word & FUTEX_WAITERS) != 0
+            && !native.wake_child_tid(mm_key, UserVa::new(futex_addr))
+        {
+            let _ = native.copy_out(UserVa::new(futex_addr), &futex_word.to_le_bytes());
+            native.record_decline(LifecycleDecline::ExitRobust);
+            return Err(None);
+        }
+    }
+    Ok(())
+}
+
+fn walk_exit_robust_list<'a>(
+    slot: &ThreadControlSlot,
+    mm_key: EntryMmKey,
+    native: &mut dyn LifecycleNative<'a>,
+) -> Result<(), Option<LifecycleOutcome>> {
+    let (head, _len) = slot.robust_list();
+    if head == 0 {
+        return Ok(());
+    }
+    if !native.has_process_venue() {
+        native.record_decline(LifecycleDecline::ExitRobust);
+        return Err(None);
+    }
+    let Some(current_tid) = slot.visible_tid() else {
+        native.record_decline(LifecycleDecline::ExitRobust);
+        return Err(None);
+    };
+    let mut head_bytes = [0u8; 24];
+    let head_copy = native.copy_in(&mut head_bytes, UserVa::new(head));
+    match head_copy {
+        CopyOutcome::Done => {}
+        CopyOutcome::NotYet(req) => return Err(Some(native.wait_guest_copy(req))),
+        CopyOutcome::Fault => {
+            slot.set_robust_list(0, 0);
+            return Ok(());
+        }
+    }
+    let mut b0 = [0u8; 8];
+    b0.copy_from_slice(&head_bytes[0..8]);
+    let mut entry = u64::from_le_bytes(b0);
+    let mut b1 = [0u8; 8];
+    b1.copy_from_slice(&head_bytes[8..16]);
+    let futex_offset = i64::from_le_bytes(b1);
+    let mut b2 = [0u8; 8];
+    b2.copy_from_slice(&head_bytes[16..24]);
+    let pending = u64::from_le_bytes(b2);
+
+    let mut count = 0usize;
+    while entry != head && entry != 0 && count < ROBUST_LIST_LIMIT {
+        let mut next_bytes = [0u8; 8];
+        let next_copy = native.copy_in(&mut next_bytes, UserVa::new(entry));
+        let next_entry = match next_copy {
+            CopyOutcome::Done => u64::from_le_bytes(next_bytes),
+            CopyOutcome::NotYet(req) => return Err(Some(native.wait_guest_copy(req))),
+            CopyOutcome::Fault => break,
+        };
+        if entry != pending {
+            handle_exit_robust_futex(entry, futex_offset, current_tid, mm_key, native)?;
+        }
+        entry = next_entry;
+        count += 1;
+    }
+    if pending != 0 {
+        handle_exit_robust_futex(pending, futex_offset, current_tid, mm_key, native)?;
+    }
+    slot.set_robust_list(0, 0);
+    Ok(())
+}
+
 /// `exit(status)` of a non-leader thread that EL1 switched in, when it is
-/// not the last thread: `Some` with how the vCPU goes on.
+/// not the last thread: `Ok` with how the vCPU goes on, `Err(Some(outcome))`
+/// when parked on a non-resident user copy, or `Err(None)` to decline to host.
 fn serve_exit<'a>(
     thread: LifecycleThread<'a>,
     native: &mut dyn LifecycleNative<'a>,
-) -> Option<(Served, i64)> {
+) -> Result<(Served, i64), Option<LifecycleOutcome>> {
     let (page, slot) = (thread.page, thread.slot);
     macro_rules! decline {
         ($reason:expr) => {{
             native.record_decline($reason);
-            None
+            Err(None)
         }};
     }
     if !page.serves_threads() {
@@ -1437,7 +1783,7 @@ fn serve_exit<'a>(
         return decline!(LifecycleDecline::ExitGate);
     }
     // The leader holds no pool entry.
-    let entry = slot.entry().or_else(|| {
+    let entry = slot.entry().ok_or_else(|| {
         native.record_decline(LifecycleDecline::ExitNoEntry);
         None
     })?;
@@ -1448,18 +1794,13 @@ fn serve_exit<'a>(
     ) {
         return decline!(LifecycleDecline::ExitEntryState);
     }
-    // No robust-list walker exists yet (it will live in sched-core, shared
-    // with the host lane): a registered list is walked by nobody here.
-    if slot.robust_list().0 != 0 {
-        return decline!(LifecycleDecline::ExitRobust);
-    }
     // A pending signal is delivered (or re-targeted) by the host.
     if page.pending().load().0 != 0 || slot.pending().load().0 != 0 {
         return decline!(LifecycleDecline::ExitPending);
     }
-    let binding = native.binding()?;
+    let binding = native.binding().ok_or(None)?;
     let mm = binding.mm.raw();
-    let record = native.exit_record().or_else(|| {
+    let record = native.exit_record().ok_or_else(|| {
         native.record_decline(LifecycleDecline::ExitNoCurrent);
         None
     })?;
@@ -1488,11 +1829,18 @@ fn serve_exit<'a>(
     if record.identity.tid != binding.task.raw() {
         return decline!(LifecycleDecline::ExitIdentity);
     }
+    if slot.robust_list().0 != 0 {
+        if !record.unadopted {
+            return decline!(LifecycleDecline::ExitRobust);
+        }
+        walk_exit_robust_list(slot, EntryMmKey::from_raw(mm), native)?;
+    }
     let identity = carrick_core::terminal::ThreadTerminalIdentity::from_exit(
         binding,
         Some(entry),
         carrick_sched_core::process::TerminationStatus::exited(native.arguments()[0] as u32),
-    )?;
+    )
+    .ok_or(None)?;
     let custody = carrick_core::terminal::TerminalCustody::<
         carrick_core::terminal::Thread,
         carrick_core::terminal::Live,
@@ -1500,12 +1848,10 @@ fn serve_exit<'a>(
     .begin();
     // Core reserves the page's nonfinal membership before the native
     // handoff; a declined handoff restores that membership on drop.
-    let (custody, mut membership) = custody
-        .reserve_member(page, slot)
-        .map_err(|_| {
-            native.record_decline(LifecycleDecline::ExitLast);
-        })
-        .ok()?;
+    let (custody, mut membership) = custody.reserve_member(page, slot).map_err(|_| {
+        native.record_decline(LifecycleDecline::ExitLast);
+        None
+    })?;
     // The member claim precedes ABI admission, so a host retirement which
     // already owns the live unit never encounters a new Exiting state.
     let mut admission = page
@@ -1513,13 +1859,19 @@ fn serve_exit<'a>(
         .inspect_err(|_| {
             native.record_decline(LifecycleDecline::ExitAdmission);
         })
-        .ok()?;
+        .map_err(|_| None)?;
     let clear_child_tid = slot.clear_child_tid();
     if clear_child_tid != 0 {
         let status = native.result();
-        let copied = native
-            .copy_out(UserVa::new(clear_child_tid), &CHILD_TID_CLEAR)
-            .is_done();
+        let copy_outcome = native.copy_out(UserVa::new(clear_child_tid), &CHILD_TID_CLEAR);
+        if record.unadopted
+            && let CopyOutcome::NotYet(req) = copy_outcome
+        {
+            drop(admission);
+            drop(membership);
+            return Err(Some(native.wait_guest_copy(req)));
+        }
+        let copied = copy_outcome.is_done();
         let woken =
             copied && native.wake_child_tid(EntryMmKey::from_raw(mm), UserVa::new(clear_child_tid));
         if !woken {
@@ -1537,11 +1889,13 @@ fn serve_exit<'a>(
         // exact-address CAS preserves a newer set_tid_address if one won.
         slot.mark_child_tid_cleared_in_zone(clear_child_tid);
     }
-    let retirement = custody.zone_retirement(slot, &mut membership, Some(&mut admission))?;
+    let retirement = custody
+        .zone_retirement(slot, &mut membership, Some(&mut admission))
+        .ok_or(None)?;
     if !native.release_current(record.reference, retirement) {
         // Requeue/refusal retains the progress already published above, so
         // the next lane cannot clear and wake the joiner a second time.
-        return None;
+        return Err(None);
     }
     if admission.commit_with_member(slot).is_err() {
         // Unreachable (checked above; only this thread leaves Born or
@@ -1553,9 +1907,9 @@ fn serve_exit<'a>(
     if !record.unadopted {
         // The retained runtime consumes this exact terminal handoff; another
         // guest task must not execute on the exiting job's host lease.
-        return Some((Served::Idle, 0));
+        return Ok((Served::Idle, 0));
     }
-    Some(native.run_next(SyscallResult::new(crate::sched::ETIMEDOUT_RESULT as i64)))
+    Ok(native.run_next(SyscallResult::new(crate::sched::ETIMEDOUT_RESULT as i64)))
         .map(|(served, result)| (served, result.raw()))
 }
 

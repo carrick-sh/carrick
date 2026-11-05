@@ -167,7 +167,7 @@ impl LifecycleWorkCounters<'_> {
     pub fn declined(&self, ordinal: u64) {
         let counter = match ordinal {
             93 => self.exit,
-            220 => self.clone,
+            220 | 435 => self.clone,
             _ => return,
         };
         counter.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -430,24 +430,35 @@ fn serve_family<'a, C: EntryContext + 'a>(
         return pending
             .lifecycle_native()
             .and_then(|native| crate::lifecycle::invoke(call, native))
-            .map_or(FamilyCompletion::Forward.into(), |outcome| {
-                let returned = match outcome {
-                    LifecycleOutcome::Redispatch | LifecycleOutcome::HostCustody => None,
-                    LifecycleOutcome::Returned { result, .. } => Some((result, original)),
-                    LifecycleOutcome::Transferred { .. } => None,
-                };
+            .map_or(
                 FamilyRun {
-                    completion: crate::lifecycle::lifecycle_effect(&outcome),
-                    returned,
-                    forward_reason: ForwardReason::FamilyFallback,
-                }
-            });
+                    completion: FamilyCompletion::Forward,
+                    returned: None,
+                    forward_reason: if call == LifecycleCall::Clone3 {
+                        ForwardReason::Unported
+                    } else {
+                        ForwardReason::FamilyFallback
+                    },
+                },
+                |outcome| {
+                    let returned = match outcome {
+                        LifecycleOutcome::Redispatch | LifecycleOutcome::HostCustody => None,
+                        LifecycleOutcome::Returned { result, .. } => Some((result, original)),
+                        LifecycleOutcome::Transferred { .. } => None,
+                    };
+                    FamilyRun {
+                        completion: crate::lifecycle::lifecycle_effect(&outcome),
+                        returned,
+                        forward_reason: ForwardReason::FamilyFallback,
+                    }
+                },
+            );
     }
     if let Family::Identity(call) = family {
         let original = pending.original_argument0();
         return pending
             .identity_native()
-            .and_then(|native| crate::identity::invoke(call, native))
+            .and_then(|native| crate::identity::invoke_outcome(call, native))
             .map_or(
                 FamilyRun {
                     completion: FamilyCompletion::Forward,
@@ -455,10 +466,17 @@ fn serve_family<'a, C: EntryContext + 'a>(
                     // An absent/unported owner must still enter crossing policy.
                     forward_reason: ForwardReason::Unported,
                 },
-                |result| FamilyRun {
-                    completion: FamilyCompletion::Complete(result.raw()),
-                    returned: Some((result, original)),
-                    forward_reason: ForwardReason::FamilyFallback,
+                |outcome| {
+                    let returned = match outcome {
+                        LifecycleOutcome::Redispatch | LifecycleOutcome::HostCustody => None,
+                        LifecycleOutcome::Returned { result, .. } => Some((result, original)),
+                        LifecycleOutcome::Transferred { .. } => None,
+                    };
+                    FamilyRun {
+                        completion: crate::lifecycle::lifecycle_effect(&outcome),
+                        returned,
+                        forward_reason: ForwardReason::FamilyFallback,
+                    }
                 },
             );
     }
@@ -618,6 +636,8 @@ fn serve_family<'a, C: EntryContext + 'a>(
         forward_reason: if family == Family::Unported
             || (matches!(family, Family::Sched(_)) && completion == FamilyCompletion::Forward)
             || (matches!(family, Family::Ipc(_)) && completion == FamilyCompletion::Forward)
+            || (family == Family::Lifecycle(LifecycleCall::Clone3)
+                && completion == FamilyCompletion::Forward)
         {
             ForwardReason::Unported
         } else {
@@ -680,6 +700,7 @@ const fn route_shared(ordinal: u64, allocator_control: u64) -> Family {
         178 => Family::Lifecycle(LifecycleCall::GetTid),
         172 => Family::Lifecycle(LifecycleCall::GetPid),
         220 => Family::Lifecycle(LifecycleCall::Clone),
+        435 => Family::Lifecycle(LifecycleCall::Clone3),
         nr if nr == carrick_syscall_abi::nr::WAIT4.raw() => Family::Lifecycle(LifecycleCall::Wait4),
         nr if nr == carrick_syscall_abi::nr::WAITID.raw() => {
             Family::Lifecycle(LifecycleCall::WaitId)
@@ -1636,7 +1657,8 @@ mod ring_first_tests {
         }
         fn restore_signal_frame(
             &mut self,
-        ) -> Result<crate::signal::RestoredSignalFrame, carrick_syscall_abi::LinuxErrno> {
+        ) -> Result<crate::signal::RestoredSignalFrame, carrick_core::personality::CopyOutcome>
+        {
             self.signal_restore_calls += 1;
             Ok(crate::signal::RestoredSignalFrame {
                 mask: self.current_blocked(),

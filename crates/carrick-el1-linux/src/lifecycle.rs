@@ -462,6 +462,9 @@ impl<
     fn has_scheduler(&self) -> bool {
         self.frame.arm_scheduler() && self.zone.is_some() && self.frame.slot().is_some()
     }
+    fn has_process_venue(&self) -> bool {
+        self.process.is_some()
+    }
     fn can_prepare_child(&self, _: UserVa, _: Option<UserVa>) -> bool {
         if self.frame.arm_frame_ref().is_some() {
             true
@@ -737,6 +740,9 @@ impl<
 > carrick_personality_linux::identity::IdentityNative<'a>
     for El1PendingFamilies<'a, F, C, U, G, Context>
 {
+    fn wait_guest_copy(&mut self, request: GuestCopyRequest) -> LifecycleOutcome {
+        LifecycleNative::wait_guest_copy(self, request)
+    }
     fn arguments(&self) -> [u64; 6] {
         [
             self.frame.argument(0).unwrap_or(0),
@@ -952,10 +958,7 @@ impl<
 
     fn restore_signal_frame(
         &mut self,
-    ) -> Result<
-        carrick_personality_linux::signal::RestoredSignalFrame,
-        carrick_syscall_abi::LinuxErrno,
-    > {
+    ) -> Result<carrick_personality_linux::signal::RestoredSignalFrame, CopyOutcome> {
         let task_idx = self.frame.task_index();
         #[cfg(test)]
         if let Some(user) = &mut self.lifecycle_user {
@@ -983,13 +986,67 @@ impl<
             let mut adapter = Adapter(*user);
             return self.frame.restore_signal_frame(&mut adapter);
         }
+        let has_venue = self.process_venue().is_some();
         let Some(task) = self.current_tasks.get(task_idx) else {
-            return Err(carrick_personality_linux::abi::signal::LINUX_EFAULT);
+            return Err(CopyOutcome::Fault);
         };
-        let mut copy = LinuxUserCopy(crate::file::ValidatedCopy {
-            task,
-            validator: &crate::file::HardwareValidator,
-        });
+        struct SignalRestoreCopy<'t> {
+            task: &'t carrick_el1_abi::CurrentTask,
+            has_venue: bool,
+        }
+        impl carrick_personality_linux::lifecycle::UserCopy for SignalRestoreCopy<'_> {
+            fn copy_out(
+                &mut self,
+                dst: carrick_guest_arch::UserVa,
+                src: &[u8],
+            ) -> carrick_core::personality::CopyOutcome {
+                let done = crate::file::UserCopy::copy_out(
+                    &mut crate::file::ValidatedCopy {
+                        task: self.task,
+                        validator: &crate::file::HardwareValidator,
+                    },
+                    dst.raw(),
+                    src,
+                );
+                if done {
+                    CopyOutcome::Done
+                } else if self.has_venue {
+                    CopyOutcome::NotYet(GuestCopyRequest {
+                        address: dst,
+                        len: carrick_guest_arch::GuestLen::new(src.len() as u64),
+                        access: carrick_guest_arch::Access::Write,
+                    })
+                } else {
+                    CopyOutcome::Fault
+                }
+            }
+            fn copy_in(
+                &mut self,
+                dst: &mut [u8],
+                src: carrick_guest_arch::UserVa,
+            ) -> carrick_core::personality::CopyOutcome {
+                let done = crate::file::UserCopy::copy_in(
+                    &mut crate::file::ValidatedCopy {
+                        task: self.task,
+                        validator: &crate::file::HardwareValidator,
+                    },
+                    dst,
+                    src.raw(),
+                );
+                if done {
+                    CopyOutcome::Done
+                } else if self.has_venue {
+                    CopyOutcome::NotYet(GuestCopyRequest {
+                        address: src,
+                        len: carrick_guest_arch::GuestLen::new(dst.len() as u64),
+                        access: carrick_guest_arch::Access::Read,
+                    })
+                } else {
+                    CopyOutcome::Fault
+                }
+            }
+        }
+        let mut copy = SignalRestoreCopy { task, has_venue };
         self.frame.restore_signal_frame(&mut copy)
     }
 }

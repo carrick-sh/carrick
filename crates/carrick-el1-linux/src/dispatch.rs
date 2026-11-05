@@ -88,19 +88,19 @@ pub trait GuestDispatchFrame: SyscallFrame {
         copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
     ) -> Result<
         carrick_personality_linux::signal::RestoredSignalFrame,
-        carrick_syscall_abi::LinuxErrno,
+        carrick_core::personality::CopyOutcome,
     > {
         let _ = copy_in;
-        Err(carrick_personality_linux::abi::signal::LINUX_ENOSYS)
+        Err(carrick_core::personality::CopyOutcome::Fault)
     }
     fn setup_signal_frame(
         &mut self,
         params: carrick_personality_linux::signal::SignalFrameParams,
         siginfo: Option<&[u8]>,
         copy_out: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
-    ) -> Result<carrick_guest_arch::UserVa, carrick_syscall_abi::LinuxErrno> {
+    ) -> Result<carrick_guest_arch::UserVa, carrick_core::personality::CopyOutcome> {
         let _ = (params, siginfo, copy_out);
-        Err(carrick_personality_linux::abi::signal::LINUX_ENOSYS)
+        Err(carrick_core::personality::CopyOutcome::Fault)
     }
     /// Query exact host-bound descriptions through the carrier. A blocking
     /// adapter suspends inside this call and resumes the same guest poll.
@@ -152,13 +152,13 @@ impl GuestDispatchFrame for TrapFrame {
     fn arm_frame_ref(&self) -> Option<&TrapFrame> {
         Some(self)
     }
-    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
     fn restore_signal_frame(
         &mut self,
         copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
     ) -> Result<
         carrick_personality_linux::signal::RestoredSignalFrame,
-        carrick_syscall_abi::LinuxErrno,
+        carrick_core::personality::CopyOutcome,
     > {
         super::arm_signal::restore_live_arm_signal_frame(self, copy_in)
     }

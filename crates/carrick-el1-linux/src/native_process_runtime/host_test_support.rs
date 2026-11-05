@@ -910,8 +910,8 @@ impl carrick_personality_linux::signal::SignalBackend for HostArmBackend {
         params: carrick_personality_linux::signal::SignalFrameParams,
         siginfo: Option<&[u8]>,
         fpstate: &[u8],
-        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
-    ) -> Result<UserVa, Self::Error> {
+        copy_out: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
+    ) -> Result<UserVa, carrick_core::personality::CopyOutcome> {
         crate::arm_signal::setup_arm_signal_frame(frame, params, siginfo, fpstate, copy_out)
     }
 
@@ -919,9 +919,12 @@ impl carrick_personality_linux::signal::SignalBackend for HostArmBackend {
         &mut self,
         _frame: &mut carrick_el1_abi::TrapFrame,
         _fpstate: &mut [u8],
-        _copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> bool,
-    ) -> Result<carrick_personality_linux::signal::RestoredSignalFrame, Self::Error> {
-        Err(carrick_el1::isa::ArchError::Unbound)
+        _copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
+    ) -> Result<
+        carrick_personality_linux::signal::RestoredSignalFrame,
+        carrick_core::personality::CopyOutcome,
+    > {
+        Err(carrick_core::personality::CopyOutcome::Fault)
     }
 }
 

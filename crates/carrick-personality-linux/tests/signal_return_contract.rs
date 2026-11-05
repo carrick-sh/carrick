@@ -65,21 +65,25 @@ impl<'a> SignalNative<'a> for Native {
     }
     fn restore_signal_frame(
         &mut self,
-    ) -> Result<RestoredSignalFrame, carrick_syscall_abi::LinuxErrno> {
+    ) -> Result<RestoredSignalFrame, carrick_core::personality::CopyOutcome> {
         if let Some(frame) = &self.arm_frame {
             use zerocopy::IntoBytes;
-            let resume = arm::decode(frame.as_bytes(), UserVa::new(0x40000), true)
-                .map_err(|_| carrick_syscall_abi::LinuxErrno::new(14))?;
+            let Ok(resume) = arm::decode(frame.as_bytes(), UserVa::new(0x40000), true) else {
+                return Err(carrick_core::personality::CopyOutcome::Fault);
+            };
             self.accumulator = resume.regs[0];
-            let stack = restored_altstack(resume.stack, carrick_guest_arch::GuestIsa::Aarch64)
-                .ok_or(carrick_syscall_abi::LinuxErrno::new(14))?;
+            let Some(stack) =
+                restored_altstack(resume.stack, carrick_guest_arch::GuestIsa::Aarch64)
+            else {
+                return Err(carrick_core::personality::CopyOutcome::Fault);
+            };
             return Ok(RestoredSignalFrame {
                 mask: resume.mask,
                 stack,
             });
         }
         if self.invalid {
-            return Err(carrick_syscall_abi::LinuxErrno::new(14));
+            return Err(carrick_core::personality::CopyOutcome::Fault);
         }
         self.accumulator = 0x1234_5678;
         Ok(RestoredSignalFrame {

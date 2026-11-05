@@ -266,15 +266,17 @@ impl GuestDispatchFrame for NativeDispatch<'_> {
     fn restore_signal_frame(
         &mut self,
         copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
-    ) -> Result<carrick_personality_linux::signal::RestoredSignalFrame, LinuxErrno> {
+    ) -> Result<
+        carrick_personality_linux::signal::RestoredSignalFrame,
+        carrick_core::personality::CopyOutcome,
+    > {
         let mut backend = carrick_el1_linux::x86_signal::LinuxX86Backend;
         carrick_personality_linux::signal::SignalBackend::restore_signal_frame(
             &mut backend,
             self.frame,
             &mut self.fpstate.0,
-            &mut |dst, va| copy_in.copy_in(dst, va).is_done(),
+            copy_in,
         )
-        .map_err(|_| carrick_personality_linux::abi::signal::LINUX_EFAULT)
     }
 
     fn setup_signal_frame(
@@ -282,7 +284,7 @@ impl GuestDispatchFrame for NativeDispatch<'_> {
         params: carrick_personality_linux::signal::SignalFrameParams,
         siginfo: Option<&[u8]>,
         copy_out: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
-    ) -> Result<UserVa, LinuxErrno> {
+    ) -> Result<UserVa, carrick_core::personality::CopyOutcome> {
         let mut backend = carrick_el1_linux::x86_signal::LinuxX86Backend;
         carrick_personality_linux::signal::SignalBackend::setup_signal_frame(
             &mut backend,
@@ -290,9 +292,8 @@ impl GuestDispatchFrame for NativeDispatch<'_> {
             params,
             siginfo,
             &self.fpstate.0,
-            &mut |va, src| copy_out.copy_out(va, src).is_done(),
+            copy_out,
         )
-        .map_err(|_| carrick_personality_linux::abi::signal::LINUX_EFAULT)
     }
 }
 

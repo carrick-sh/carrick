@@ -9,7 +9,6 @@
   "bool-trait:crates/carrick-personality-linux/src/sched.rs:SchedVenue::copy_out": 1,
   "error-collapse:crates/carrick-core/src/file.rs": 2,
   "error-collapse:crates/carrick-core/src/personality.rs": 2,
-  "error-collapse:crates/carrick-el1-linux/src/arm_signal.rs": 1,
   "error-collapse:crates/carrick-el1-linux/src/mm_portal/maintenance.rs": 2,
   "error-collapse:crates/carrick-el1/src/isa/x86/user_access.rs": 5,
   "error-collapse:crates/carrick-kernel/src/dispatch/bpf.rs": 2,

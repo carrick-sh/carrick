@@ -515,6 +515,12 @@ pub trait ProcessIdentityVenue {
 }
 
 pub trait IdentityNative<'a>: UserCopy {
+    fn wait_guest_copy(
+        &mut self,
+        _request: crate::lifecycle::GuestCopyRequest,
+    ) -> crate::lifecycle::LifecycleOutcome {
+        crate::lifecycle::LifecycleOutcome::HostCustody
+    }
     fn arguments(&self) -> [u64; 6];
     fn visible_tid(&self) -> Option<u32>;
     fn set_clear_child_tid(&mut self, address: u64) -> bool;
@@ -527,15 +533,63 @@ fn keep_or_id(raw: u64) -> Option<u32> {
     if id == u32::MAX { None } else { Some(id) }
 }
 
+const fn identity_returned(value: i64) -> crate::lifecycle::LifecycleOutcome {
+    crate::lifecycle::LifecycleOutcome::Returned {
+        result: SyscallResult::new(value),
+        work: false,
+    }
+}
+
+fn copy_in_or_wait<'a>(
+    native: &mut dyn IdentityNative<'a>,
+    dst: &mut [u8],
+    src: UserVa,
+) -> Result<(), crate::lifecycle::LifecycleOutcome> {
+    match native.copy_in(dst, src) {
+        carrick_core::personality::CopyOutcome::Done => Ok(()),
+        carrick_core::personality::CopyOutcome::Fault => Err(identity_returned(EFAULT)),
+        carrick_core::personality::CopyOutcome::NotYet(request) => {
+            Err(native.wait_guest_copy(request))
+        }
+    }
+}
+
+fn copy_out_or_wait<'a>(
+    native: &mut dyn IdentityNative<'a>,
+    dst: UserVa,
+    src: &[u8],
+) -> Result<(), crate::lifecycle::LifecycleOutcome> {
+    match native.copy_out(dst, src) {
+        carrick_core::personality::CopyOutcome::Done => Ok(()),
+        carrick_core::personality::CopyOutcome::Fault => Err(identity_returned(EFAULT)),
+        carrick_core::personality::CopyOutcome::NotYet(request) => {
+            Err(native.wait_guest_copy(request))
+        }
+    }
+}
+
 #[inline(never)]
 pub fn invoke<'a>(
     call: IdentityCall,
     native: &mut dyn IdentityNative<'a>,
 ) -> Option<SyscallResult> {
+    match invoke_outcome(call, native)? {
+        crate::lifecycle::LifecycleOutcome::Returned { result, .. } => Some(result),
+        crate::lifecycle::LifecycleOutcome::Redispatch
+        | crate::lifecycle::LifecycleOutcome::HostCustody
+        | crate::lifecycle::LifecycleOutcome::Transferred { .. } => None,
+    }
+}
+
+#[inline(never)]
+pub fn invoke_outcome<'a>(
+    call: IdentityCall,
+    native: &mut dyn IdentityNative<'a>,
+) -> Option<crate::lifecycle::LifecycleOutcome> {
     // Missing or exec-retired identity must never expose an old shared owner.
     // A replacement needs an independently authenticated control slot/owner.
     if native.visible_tid().is_none() {
-        return Some(SyscallResult::new(ESRCH));
+        return Some(identity_returned(ESRCH));
     }
     let args = native.arguments();
     match call {
@@ -545,7 +599,7 @@ pub fn invoke<'a>(
             if !native.set_clear_child_tid(addr) {
                 return None;
             }
-            Some(SyscallResult::new(i64::from(tid)))
+            Some(identity_returned(i64::from(tid)))
         }
         IdentityCall::GetRobustList => {
             let pid = args[0] as i32;
@@ -554,7 +608,7 @@ pub fn invoke<'a>(
 
             let (head, len) = match native.robust_list_for(pid) {
                 Ok(pair) => pair,
-                Err(e) => return Some(SyscallResult::new(e)),
+                Err(e) => return Some(identity_returned(e)),
             };
 
             let len_u64 = if len == 0 {
@@ -562,135 +616,130 @@ pub fn invoke<'a>(
             } else {
                 len as u64
             };
-            if !native.copy_out(head_ptr, &head.to_ne_bytes()).is_done()
-                || !native.copy_out(len_ptr, &len_u64.to_ne_bytes()).is_done()
-            {
-                return Some(SyscallResult::new(EFAULT));
+            if let Err(outcome) = copy_out_or_wait(native, head_ptr, &head.to_ne_bytes()) {
+                return Some(outcome);
             }
-            Some(SyscallResult::new(0))
+            if let Err(outcome) = copy_out_or_wait(native, len_ptr, &len_u64.to_ne_bytes()) {
+                return Some(outcome);
+            }
+            Some(identity_returned(0))
         }
         IdentityCall::GetUid => {
             let venue = native.process_identity()?;
             let (ruid, _, _, _) = match venue.get_uids() {
                 Ok(value) => value,
-                Err(error) => return Some(SyscallResult::new(error.errno())),
+                Err(error) => return Some(identity_returned(error.errno())),
             };
-            Some(SyscallResult::new(i64::from(ruid)))
+            Some(identity_returned(i64::from(ruid)))
         }
         IdentityCall::GetEuid => {
             let venue = native.process_identity()?;
             let (_, euid, _, _) = match venue.get_uids() {
                 Ok(value) => value,
-                Err(error) => return Some(SyscallResult::new(error.errno())),
+                Err(error) => return Some(identity_returned(error.errno())),
             };
-            Some(SyscallResult::new(i64::from(euid)))
+            Some(identity_returned(i64::from(euid)))
         }
         IdentityCall::GetGid => {
             let venue = native.process_identity()?;
             let (rgid, _, _, _) = match venue.get_gids() {
                 Ok(value) => value,
-                Err(error) => return Some(SyscallResult::new(error.errno())),
+                Err(error) => return Some(identity_returned(error.errno())),
             };
-            Some(SyscallResult::new(i64::from(rgid)))
+            Some(identity_returned(i64::from(rgid)))
         }
         IdentityCall::GetEgid => {
             let venue = native.process_identity()?;
             let (_, egid, _, _) = match venue.get_gids() {
                 Ok(value) => value,
-                Err(error) => return Some(SyscallResult::new(error.errno())),
+                Err(error) => return Some(identity_returned(error.errno())),
             };
-            Some(SyscallResult::new(i64::from(egid)))
+            Some(identity_returned(i64::from(egid)))
         }
         IdentityCall::GetResUid => {
             let (ruid, euid, suid) = {
                 let venue = native.process_identity()?;
                 let (r, e, s, _) = match venue.get_uids() {
                     Ok(value) => value,
-                    Err(error) => return Some(SyscallResult::new(error.errno())),
+                    Err(error) => return Some(identity_returned(error.errno())),
                 };
                 (r, e, s)
             };
             if args[0] != 0
-                && !native
-                    .copy_out(UserVa::new(args[0]), &ruid.to_ne_bytes())
-                    .is_done()
+                && let Err(outcome) =
+                    copy_out_or_wait(native, UserVa::new(args[0]), &ruid.to_ne_bytes())
             {
-                return Some(SyscallResult::new(EFAULT));
+                return Some(outcome);
             }
             if args[1] != 0
-                && !native
-                    .copy_out(UserVa::new(args[1]), &euid.to_ne_bytes())
-                    .is_done()
+                && let Err(outcome) =
+                    copy_out_or_wait(native, UserVa::new(args[1]), &euid.to_ne_bytes())
             {
-                return Some(SyscallResult::new(EFAULT));
+                return Some(outcome);
             }
             if args[2] != 0
-                && !native
-                    .copy_out(UserVa::new(args[2]), &suid.to_ne_bytes())
-                    .is_done()
+                && let Err(outcome) =
+                    copy_out_or_wait(native, UserVa::new(args[2]), &suid.to_ne_bytes())
             {
-                return Some(SyscallResult::new(EFAULT));
+                return Some(outcome);
             }
-            Some(SyscallResult::new(0))
+            Some(identity_returned(0))
         }
         IdentityCall::GetResGid => {
             let (rgid, egid, sgid) = {
                 let venue = native.process_identity()?;
                 let (r, e, s, _) = match venue.get_gids() {
                     Ok(value) => value,
-                    Err(error) => return Some(SyscallResult::new(error.errno())),
+                    Err(error) => return Some(identity_returned(error.errno())),
                 };
                 (r, e, s)
             };
             if args[0] != 0
-                && !native
-                    .copy_out(UserVa::new(args[0]), &rgid.to_ne_bytes())
-                    .is_done()
+                && let Err(outcome) =
+                    copy_out_or_wait(native, UserVa::new(args[0]), &rgid.to_ne_bytes())
             {
-                return Some(SyscallResult::new(EFAULT));
+                return Some(outcome);
             }
             if args[1] != 0
-                && !native
-                    .copy_out(UserVa::new(args[1]), &egid.to_ne_bytes())
-                    .is_done()
+                && let Err(outcome) =
+                    copy_out_or_wait(native, UserVa::new(args[1]), &egid.to_ne_bytes())
             {
-                return Some(SyscallResult::new(EFAULT));
+                return Some(outcome);
             }
             if args[2] != 0
-                && !native
-                    .copy_out(UserVa::new(args[2]), &sgid.to_ne_bytes())
-                    .is_done()
+                && let Err(outcome) =
+                    copy_out_or_wait(native, UserVa::new(args[2]), &sgid.to_ne_bytes())
             {
-                return Some(SyscallResult::new(EFAULT));
+                return Some(outcome);
             }
-            Some(SyscallResult::new(0))
+            Some(identity_returned(0))
         }
         IdentityCall::SetUid => {
             let venue = native.process_identity()?;
             match venue.set_uid(args[0] as u32) {
-                Ok(()) => Some(SyscallResult::new(0)),
-                Err(err) => Some(SyscallResult::new(err)),
+                Ok(()) => Some(identity_returned(0)),
+                Err(err) => Some(identity_returned(err)),
             }
         }
         IdentityCall::SetGid => {
             let venue = native.process_identity()?;
             match venue.set_gid(args[0] as u32) {
-                Ok(()) => Some(SyscallResult::new(0)),
-                Err(err) => Some(SyscallResult::new(err)),
+                Ok(()) => Some(identity_returned(0)),
+                Err(err) => Some(identity_returned(err)),
             }
         }
         IdentityCall::SetReUid => {
             let venue = native.process_identity()?;
             match venue.set_reuid(keep_or_id(args[0]), keep_or_id(args[1])) {
-                Ok(()) => Some(SyscallResult::new(0)),
-                Err(err) => Some(SyscallResult::new(err)),
+                Ok(()) => Some(identity_returned(0)),
+                Err(err) => Some(identity_returned(err)),
             }
         }
         IdentityCall::SetReGid => {
             let venue = native.process_identity()?;
             match venue.set_regid(keep_or_id(args[0]), keep_or_id(args[1])) {
-                Ok(()) => Some(SyscallResult::new(0)),
-                Err(err) => Some(SyscallResult::new(err)),
+                Ok(()) => Some(identity_returned(0)),
+                Err(err) => Some(identity_returned(err)),
             }
         }
         IdentityCall::SetResUid => {
@@ -700,8 +749,8 @@ pub fn invoke<'a>(
                 keep_or_id(args[1]),
                 keep_or_id(args[2]),
             ) {
-                Ok(()) => Some(SyscallResult::new(0)),
-                Err(err) => Some(SyscallResult::new(err)),
+                Ok(()) => Some(identity_returned(0)),
+                Err(err) => Some(identity_returned(err)),
             }
         }
         IdentityCall::SetResGid => {
@@ -711,25 +760,25 @@ pub fn invoke<'a>(
                 keep_or_id(args[1]),
                 keep_or_id(args[2]),
             ) {
-                Ok(()) => Some(SyscallResult::new(0)),
-                Err(err) => Some(SyscallResult::new(err)),
+                Ok(()) => Some(identity_returned(0)),
+                Err(err) => Some(identity_returned(err)),
             }
         }
         IdentityCall::SetFsUid => {
             let venue = native.process_identity()?;
             let old = match venue.set_fsuid(args[0] as u32) {
                 Ok(value) => value,
-                Err(error) => return Some(SyscallResult::new(error.errno())),
+                Err(error) => return Some(identity_returned(error.errno())),
             };
-            Some(SyscallResult::new(i64::from(old)))
+            Some(identity_returned(i64::from(old)))
         }
         IdentityCall::SetFsGid => {
             let venue = native.process_identity()?;
             let old = match venue.set_fsgid(args[0] as u32) {
                 Ok(value) => value,
-                Err(error) => return Some(SyscallResult::new(error.errno())),
+                Err(error) => return Some(identity_returned(error.errno())),
             };
-            Some(SyscallResult::new(i64::from(old)))
+            Some(identity_returned(i64::from(old)))
         }
         IdentityCall::GetGroups => {
             let size = args[0] as usize;
@@ -737,40 +786,39 @@ pub fn invoke<'a>(
             let venue = native.process_identity()?;
             let count = match venue.get_groups_count() {
                 Ok(value) => value,
-                Err(error) => return Some(SyscallResult::new(error.errno())),
+                Err(error) => return Some(identity_returned(error.errno())),
             };
             if size == 0 {
-                return Some(SyscallResult::new(count as i64));
+                return Some(identity_returned(count as i64));
             }
             if size < count {
-                return Some(SyscallResult::new(EINVAL));
+                return Some(identity_returned(EINVAL));
             }
             let mut groups = alloc::vec::Vec::new();
             match venue.get_groups(&mut groups) {
                 Ok(value) => value,
-                Err(error) => return Some(SyscallResult::new(error.errno())),
+                Err(error) => return Some(identity_returned(error.errno())),
             };
             let mut cur_addr = list_ptr.raw();
             for &gid in groups.iter().take(count) {
-                if !native
-                    .copy_out(UserVa::new(cur_addr), &gid.to_ne_bytes())
-                    .is_done()
+                if let Err(outcome) =
+                    copy_out_or_wait(native, UserVa::new(cur_addr), &gid.to_ne_bytes())
                 {
-                    return Some(SyscallResult::new(EFAULT));
+                    return Some(outcome);
                 }
                 cur_addr = cur_addr.wrapping_add(4);
             }
-            Some(SyscallResult::new(count as i64))
+            Some(identity_returned(count as i64))
         }
         IdentityCall::SetGroups => {
             let size = args[0] as usize;
             if size > LINUX_NGROUPS_MAX {
-                return Some(SyscallResult::new(EINVAL));
+                return Some(identity_returned(EINVAL));
             }
             {
                 let venue = native.process_identity()?;
                 if let Err(e) = venue.can_set_groups() {
-                    return Some(SyscallResult::new(e));
+                    return Some(identity_returned(e));
                 }
             }
             let list_ptr = UserVa::new(args[1]);
@@ -778,24 +826,24 @@ pub fn invoke<'a>(
             let mut cur_addr = list_ptr.raw();
             for _ in 0..size {
                 let mut bytes = [0u8; 4];
-                if !native.copy_in(&mut bytes, UserVa::new(cur_addr)).is_done() {
-                    return Some(SyscallResult::new(EFAULT));
+                if let Err(outcome) = copy_in_or_wait(native, &mut bytes, UserVa::new(cur_addr)) {
+                    return Some(outcome);
                 }
                 groups.push(u32::from_ne_bytes(bytes));
                 cur_addr = cur_addr.wrapping_add(4);
             }
             let venue = native.process_identity()?;
             match venue.set_groups(&groups) {
-                Ok(()) => Some(SyscallResult::new(0)),
-                Err(e) => Some(SyscallResult::new(e)),
+                Ok(()) => Some(identity_returned(0)),
+                Err(e) => Some(identity_returned(e)),
             }
         }
         IdentityCall::CapGet => {
             let hdr_ptr = UserVa::new(args[0]);
             let data_ptr = UserVa::new(args[1]);
             let mut hdr_bytes = [0u8; 8];
-            if !native.copy_in(&mut hdr_bytes, hdr_ptr).is_done() {
-                return Some(SyscallResult::new(EFAULT));
+            if let Err(outcome) = copy_in_or_wait(native, &mut hdr_bytes, hdr_ptr) {
+                return Some(outcome);
             }
             let version = u32::from_ne_bytes(hdr_bytes[0..4].try_into().unwrap_or([0; 4]));
             let pid = i32::from_ne_bytes(hdr_bytes[4..8].try_into().unwrap_or([0; 4]));
@@ -807,28 +855,28 @@ pub fn invoke<'a>(
             ) {
                 let pref = LINUX_CAPABILITY_VERSION_3.to_ne_bytes();
                 let _ = native.copy_out(hdr_ptr, &pref).is_done();
-                return Some(SyscallResult::new(EINVAL));
+                return Some(identity_returned(EINVAL));
             }
             if pid < 0 {
-                return Some(SyscallResult::new(EINVAL));
+                return Some(identity_returned(EINVAL));
             }
             let caps = {
                 let venue = native.process_identity()?;
                 match venue.capget(pid) {
                     Ok(c) => c,
-                    Err(e) => return Some(SyscallResult::new(e)),
+                    Err(e) => return Some(identity_returned(e)),
                 }
             };
             if data_ptr.raw() == 0 {
-                return Some(SyscallResult::new(0));
+                return Some(identity_returned(0));
             }
             if version == LINUX_CAPABILITY_VERSION_1 {
                 let mut data = [0u8; 12];
                 data[0..4].copy_from_slice(&(caps.effective.bits() as u32).to_ne_bytes());
                 data[4..8].copy_from_slice(&(caps.permitted.bits() as u32).to_ne_bytes());
                 data[8..12].copy_from_slice(&(caps.inheritable.bits() as u32).to_ne_bytes());
-                if !native.copy_out(data_ptr, &data).is_done() {
-                    return Some(SyscallResult::new(EFAULT));
+                if let Err(outcome) = copy_out_or_wait(native, data_ptr, &data) {
+                    return Some(outcome);
                 }
             } else {
                 let mut data = [0u8; 24];
@@ -841,18 +889,18 @@ pub fn invoke<'a>(
                 data[12..16].copy_from_slice(&((eff >> 32) as u32).to_ne_bytes());
                 data[16..20].copy_from_slice(&((prm >> 32) as u32).to_ne_bytes());
                 data[20..24].copy_from_slice(&((inh >> 32) as u32).to_ne_bytes());
-                if !native.copy_out(data_ptr, &data).is_done() {
-                    return Some(SyscallResult::new(EFAULT));
+                if let Err(outcome) = copy_out_or_wait(native, data_ptr, &data) {
+                    return Some(outcome);
                 }
             }
-            Some(SyscallResult::new(0))
+            Some(identity_returned(0))
         }
         IdentityCall::CapSet => {
             let hdr_ptr = UserVa::new(args[0]);
             let data_ptr = UserVa::new(args[1]);
             let mut hdr_bytes = [0u8; 8];
-            if !native.copy_in(&mut hdr_bytes, hdr_ptr).is_done() {
-                return Some(SyscallResult::new(EFAULT));
+            if let Err(outcome) = copy_in_or_wait(native, &mut hdr_bytes, hdr_ptr) {
+                return Some(outcome);
             }
             let version = u32::from_ne_bytes(hdr_bytes[0..4].try_into().unwrap_or([0; 4]));
             let pid = i32::from_ne_bytes(hdr_bytes[4..8].try_into().unwrap_or([0; 4]));
@@ -864,15 +912,15 @@ pub fn invoke<'a>(
             ) {
                 let pref = LINUX_CAPABILITY_VERSION_3.to_ne_bytes();
                 let _ = native.copy_out(hdr_ptr, &pref).is_done();
-                return Some(SyscallResult::new(EINVAL));
+                return Some(identity_returned(EINVAL));
             }
             if pid < 0 {
-                return Some(SyscallResult::new(ESRCH));
+                return Some(identity_returned(ESRCH));
             }
             let (eff_raw, prm_raw, inh_raw) = if version == LINUX_CAPABILITY_VERSION_1 {
                 let mut data = [0u8; 12];
-                if !native.copy_in(&mut data, data_ptr).is_done() {
-                    return Some(SyscallResult::new(EFAULT));
+                if let Err(outcome) = copy_in_or_wait(native, &mut data, data_ptr) {
+                    return Some(outcome);
                 }
                 (
                     u32::from_ne_bytes(data[0..4].try_into().unwrap_or([0; 4])) as u64,
@@ -881,8 +929,8 @@ pub fn invoke<'a>(
                 )
             } else {
                 let mut data = [0u8; 24];
-                if !native.copy_in(&mut data, data_ptr).is_done() {
-                    return Some(SyscallResult::new(EFAULT));
+                if let Err(outcome) = copy_in_or_wait(native, &mut data, data_ptr) {
+                    return Some(outcome);
                 }
                 let e_lo = u32::from_ne_bytes(data[0..4].try_into().unwrap_or([0; 4])) as u64;
                 let p_lo = u32::from_ne_bytes(data[4..8].try_into().unwrap_or([0; 4])) as u64;
@@ -897,13 +945,13 @@ pub fn invoke<'a>(
                 )
             };
             if ((eff_raw | prm_raw | inh_raw) & !LinuxCapabilitySet::ALL_CAPS_MASK) != 0 {
-                return Some(SyscallResult::new(EINVAL));
+                return Some(identity_returned(EINVAL));
             }
             let eff = LinuxCapabilitySet::from_bits_retain(eff_raw);
             let prm = LinuxCapabilitySet::from_bits_retain(prm_raw);
             let inh = LinuxCapabilitySet::from_bits_retain(inh_raw);
             if !prm.contains(eff) {
-                return Some(SyscallResult::new(EPERM));
+                return Some(identity_returned(EPERM));
             }
             let venue = native.process_identity()?;
             match venue.capset(
@@ -914,20 +962,20 @@ pub fn invoke<'a>(
                     inheritable: inh,
                 },
             ) {
-                Ok(()) => Some(SyscallResult::new(0)),
-                Err(e) => Some(SyscallResult::new(e)),
+                Ok(()) => Some(identity_returned(0)),
+                Err(e) => Some(identity_returned(e)),
             }
         }
         IdentityCall::GetPpid => {
             let venue = native.process_identity()?;
-            Some(SyscallResult::new(i64::from(venue.get_ppid())))
+            Some(identity_returned(i64::from(venue.get_ppid())))
         }
         IdentityCall::GetPgid => {
             let pid = args[0] as i32;
             let venue = native.process_identity()?;
             match venue.get_pgid(pid) {
-                Ok(pgid) => Some(SyscallResult::new(i64::from(pgid))),
-                Err(e) => Some(SyscallResult::new(e)),
+                Ok(pgid) => Some(identity_returned(i64::from(pgid))),
+                Err(e) => Some(identity_returned(e)),
             }
         }
         IdentityCall::SetPgid => {
@@ -935,30 +983,30 @@ pub fn invoke<'a>(
             let pgid = args[1] as i32;
             let venue = native.process_identity()?;
             match venue.set_pgid(pid, pgid) {
-                Ok(()) => Some(SyscallResult::new(0)),
-                Err(e) => Some(SyscallResult::new(e)),
+                Ok(()) => Some(identity_returned(0)),
+                Err(e) => Some(identity_returned(e)),
             }
         }
         IdentityCall::GetSid => {
             let pid = args[0] as i32;
             let venue = native.process_identity()?;
             match venue.get_sid(pid) {
-                Ok(sid) => Some(SyscallResult::new(i64::from(sid))),
-                Err(e) => Some(SyscallResult::new(e)),
+                Ok(sid) => Some(identity_returned(i64::from(sid))),
+                Err(e) => Some(identity_returned(e)),
             }
         }
         IdentityCall::SetSid => {
             let venue = native.process_identity()?;
             match venue.set_sid() {
-                Ok(sid) => Some(SyscallResult::new(i64::from(sid))),
-                Err(e) => Some(SyscallResult::new(e)),
+                Ok(sid) => Some(identity_returned(i64::from(sid))),
+                Err(e) => Some(identity_returned(e)),
             }
         }
         IdentityCall::Personality => {
             let persona = args[0];
             let venue = native.process_identity()?;
             let old = venue.personality(persona);
-            Some(SyscallResult::new(old as i64))
+            Some(identity_returned(old as i64))
         }
         IdentityCall::Prctl => {
             let option = args[0];
@@ -972,8 +1020,9 @@ pub fn invoke<'a>(
                     let mut cur_addr = arg2;
                     for slot in name.iter_mut() {
                         let mut b = [0u8; 1];
-                        if !native.copy_in(&mut b, UserVa::new(cur_addr)).is_done() {
-                            return Some(SyscallResult::new(EFAULT));
+                        if let Err(outcome) = copy_in_or_wait(native, &mut b, UserVa::new(cur_addr))
+                        {
+                            return Some(outcome);
                         }
                         *slot = b[0];
                         if b[0] == 0 {
@@ -984,29 +1033,29 @@ pub fn invoke<'a>(
                     name[15] = 0;
                     let venue = native.process_identity()?;
                     venue.prctl_set_name(&name);
-                    Some(SyscallResult::new(0))
+                    Some(identity_returned(0))
                 }
                 LINUX_PR_GET_NAME => {
                     let mut name = [0u8; 16];
                     {
                         let venue = native.process_identity()?;
                         if let Err(error) = venue.prctl_get_name(&mut name) {
-                            return Some(SyscallResult::new(error.errno()));
+                            return Some(identity_returned(error.errno()));
                         }
                     }
-                    if !native.copy_out(UserVa::new(arg2), &name).is_done() {
-                        return Some(SyscallResult::new(EFAULT));
+                    if let Err(outcome) = copy_out_or_wait(native, UserVa::new(arg2), &name) {
+                        return Some(outcome);
                     }
-                    Some(SyscallResult::new(0))
+                    Some(identity_returned(0))
                 }
                 LINUX_PR_SET_PDEATHSIG => {
                     if arg2 > 64 {
-                        return Some(SyscallResult::new(EINVAL));
+                        return Some(identity_returned(EINVAL));
                     }
                     let venue = native.process_identity()?;
                     match venue.prctl_set_pdeathsig(arg2 as u8) {
-                        Ok(()) => Some(SyscallResult::new(0)),
-                        Err(e) => Some(SyscallResult::new(e)),
+                        Ok(()) => Some(identity_returned(0)),
+                        Err(e) => Some(identity_returned(e)),
                     }
                 }
                 LINUX_PR_GET_PDEATHSIG => {
@@ -1014,55 +1063,54 @@ pub fn invoke<'a>(
                         let venue = native.process_identity()?;
                         venue.prctl_get_pdeathsig() as i32
                     };
-                    if !native
-                        .copy_out(UserVa::new(arg2), &sig.to_ne_bytes())
-                        .is_done()
+                    if let Err(outcome) =
+                        copy_out_or_wait(native, UserVa::new(arg2), &sig.to_ne_bytes())
                     {
-                        return Some(SyscallResult::new(EFAULT));
+                        return Some(outcome);
                     }
-                    Some(SyscallResult::new(0))
+                    Some(identity_returned(0))
                 }
                 LINUX_PR_GET_DUMPABLE => {
                     let d = {
                         let venue = native.process_identity()?;
                         venue.prctl_get_dumpable()
                     };
-                    Some(SyscallResult::new(i64::from(d)))
+                    Some(identity_returned(i64::from(d)))
                 }
                 LINUX_PR_SET_DUMPABLE => {
                     if arg2 > 1 {
-                        return Some(SyscallResult::new(EINVAL));
+                        return Some(identity_returned(EINVAL));
                     }
                     let venue = native.process_identity()?;
                     match venue.prctl_set_dumpable(arg2 as u32) {
-                        Ok(()) => Some(SyscallResult::new(0)),
-                        Err(e) => Some(SyscallResult::new(e)),
+                        Ok(()) => Some(identity_returned(0)),
+                        Err(e) => Some(identity_returned(e)),
                     }
                 }
                 LINUX_PR_SET_NO_NEW_PRIVS => {
                     if arg2 != 1 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
-                        return Some(SyscallResult::new(EINVAL));
+                        return Some(identity_returned(EINVAL));
                     }
                     let venue = native.process_identity()?;
                     match venue.prctl_set_no_new_privs(true) {
-                        Ok(()) => Some(SyscallResult::new(0)),
-                        Err(e) => Some(SyscallResult::new(e)),
+                        Ok(()) => Some(identity_returned(0)),
+                        Err(e) => Some(identity_returned(e)),
                     }
                 }
                 LINUX_PR_GET_NO_NEW_PRIVS => {
                     if arg2 != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
-                        return Some(SyscallResult::new(EINVAL));
+                        return Some(identity_returned(EINVAL));
                     }
                     let nnp = {
                         let venue = native.process_identity()?;
                         venue.prctl_get_no_new_privs()
                     };
-                    Some(SyscallResult::new(if nnp { 1 } else { 0 }))
+                    Some(identity_returned(if nnp { 1 } else { 0 }))
                 }
                 LINUX_PR_SET_CHILD_SUBREAPER => {
                     let venue = native.process_identity()?;
                     venue.prctl_set_child_subreaper(arg2 != 0);
-                    Some(SyscallResult::new(0))
+                    Some(identity_returned(0))
                 }
                 LINUX_PR_GET_CHILD_SUBREAPER => {
                     let val: i32 = {
@@ -1073,13 +1121,12 @@ pub fn invoke<'a>(
                             0
                         }
                     };
-                    if !native
-                        .copy_out(UserVa::new(arg2), &val.to_ne_bytes())
-                        .is_done()
+                    if let Err(outcome) =
+                        copy_out_or_wait(native, UserVa::new(arg2), &val.to_ne_bytes())
                     {
-                        return Some(SyscallResult::new(EFAULT));
+                        return Some(outcome);
                     }
-                    Some(SyscallResult::new(0))
+                    Some(identity_returned(0))
                 }
                 _ => None,
             }

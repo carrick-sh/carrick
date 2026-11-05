@@ -65,9 +65,9 @@ impl<'a> SignalNative<'a> for Native {
         &mut self,
     ) -> Result<
         carrick_personality_linux::signal::RestoredSignalFrame,
-        carrick_syscall_abi::LinuxErrno,
+        carrick_core::personality::CopyOutcome,
     > {
-        Err(carrick_syscall_abi::LinuxErrno::new(14))
+        Err(carrick_core::personality::CopyOutcome::Fault)
     }
 }
 impl ProcessSignals for Native {

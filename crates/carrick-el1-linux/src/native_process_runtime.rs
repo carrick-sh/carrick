@@ -4159,6 +4159,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     pub fn calling_tid(&self) -> u32 {
         self.calling_tid
     }
+    pub fn control(&self) -> &'a ThreadControlSlot {
+        self.control
+    }
     fn continuation_owner(&self) -> ContinuationOwner {
         ContinuationOwner::of(self.control, self.calling_tid)
     }
@@ -4753,28 +4756,55 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .clone();
         self.service.copy_syscall_output(&mm, address, bytes)
     }
+    pub fn requeue_deliverable(
+        &mut self,
+        signal: carrick_signal_core::policy::Signal,
+        info: Option<carrick_personality_linux::abi::signal::LinuxSiginfo>,
+        action: carrick_signal_core::policy::Action,
+    ) {
+        let graph = self.runtime.graph.lock();
+        if let Ok(row) = graph.owner.task(self.key) {
+            row.native().resources().signals().requeue_deliverable(
+                self.record,
+                signal,
+                info,
+                action,
+            );
+        }
+    }
     pub fn copy_signal_frame(
         &mut self,
         address: UserVa,
         bytes: &[u8],
-    ) -> Result<(), NativeProcessError> {
-        let mm = self
+    ) -> carrick_core::personality::CopyOutcome {
+        let request = carrick_core::personality::GuestCopyRequest {
+            address,
+            len: carrick_guest_arch::GuestLen::new(bytes.len() as u64),
+            access: carrick_guest_arch::Access::Write,
+        };
+        #[cfg(test)]
+        if crate::file::SIMULATE_COPYOUT_FAULT.with(|f| f.load(Ordering::Relaxed)) {
+            return carrick_core::personality::CopyOutcome::NotYet(request);
+        }
+        let Ok(mm) = self
             .runtime
             .graph
             .lock()
             .owner
             .task(self.key)
-            .map_err(|_| NativeProcessError::Stale)?
-            .native()
-            .resources()
-            .mm
-            .clone();
-        self.service
-            .copy_signal_bytes(&mm, address, bytes)
-            .map_err(|error| match error {
-                NativeProcessError::OwnerWait(_) => NativeProcessError::Fault,
-                other => other,
-            })
+            .map(|row| row.native().resources().mm.clone())
+        else {
+            return carrick_core::personality::CopyOutcome::Fault;
+        };
+        match self.service.copy_signal_bytes(&mm, address, bytes) {
+            Ok(()) => carrick_core::personality::CopyOutcome::Done,
+            Err(
+                NativeProcessError::OwnerWait(_)
+                | NativeProcessError::Busy
+                | NativeProcessError::Unsupported,
+            ) => carrick_core::personality::CopyOutcome::NotYet(request),
+            Err(_) => carrick_core::personality::CopyOutcome::Fault,
+        }
     }
     #[inline(never)]
     fn suspend_adapter_operation(
