@@ -550,6 +550,13 @@ impl SyscallDispatcher {
         input: &[u8],
         capacity: usize,
     ) -> Served {
+        // Match the dispatcher admission guard: O_PATH grants metadata
+        // access, never data I/O, seeking, directory iteration or mmap.
+        if description.common().status_flags() & carrick_abi::LINUX_O_PATH != 0
+            && !matches!(header.op, HostFileOp::Fstat | HostFileOp::Statx)
+        {
+            return Served::errno(carrick_abi::LINUX_EBADF);
+        }
         match header.op {
             HostFileOp::Fstat | HostFileOp::Statx => {
                 match self.fs_view().description_stat_record(description, None) {
