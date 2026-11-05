@@ -10,6 +10,9 @@
 # contract's semantics or work budgets. The host dispatch test
 # physical_custody_reasons_preserve_fatal_codes_and_debug_text checks
 # reason codes and unchanged text; retain the existing execution controls.
+# #1447 diagnostic slice: publish_cow reports the excluded MM and both owner
+# identities on admission failure. Exclusion, admission and rollback semantics
+# and successful-path work are unchanged; existing bindings remain required.
 schema_version = 1
 id = "kernel.el1.mm-exclusive-owner"
 title = "An admitted MM has one semantic owner and generation-pinned readers"

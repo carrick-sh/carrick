@@ -9,6 +9,9 @@
 # contract's semantics or work budgets. The host dispatch test
 # physical_custody_reasons_preserve_fatal_codes_and_debug_text checks
 # reason codes and unchanged text; retain the existing execution controls.
+# #1447 diagnostic slice: shared physical-grant admission errors carry their
+# rejection phase and metadata. File-region behavior, publication predicates,
+# successful-path work and all existing contract obligations are unchanged.
 schema_version = 1
 id = "kernel.x86.file-region"
 title = "CPL0 file records belong to one retained carrier region"

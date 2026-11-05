@@ -789,7 +789,11 @@ impl<R: Send + 'static> NativePhysicalGrants<R> {
     where
         R: Send + 'static,
     {
-        let fail = || TrapError::Hypervisor("native physical grant admission mismatch".into());
+        let fail = |reason: &str| {
+            TrapError::Hypervisor(format!(
+                "native physical grant admission mismatch: {reason}"
+            ))
+        };
         let staged = &unpublished.staged;
         if self.failed
             || excluded.key() != self.owner.native_mm.raw().get()
@@ -799,13 +803,27 @@ impl<R: Send + 'static> NativePhysicalGrants<R> {
             || staged.permissions != COW_GRANT_PERMISSIONS
             || pool.ready(excluded.key()).count() >= Self::REFILL_GRANTS
         {
+            let error = fail(&format!(
+                "failed={} excluded_mm={} owner={:?} staged_owner={:?} grants={} length={} permissions={:?} ready={}",
+                self.failed,
+                excluded.key(),
+                self.owner,
+                staged.owner,
+                staged.grants.len(),
+                staged.length.raw(),
+                staged.permissions,
+                pool.ready(excluded.key()).count(),
+            ));
             unpublished.abort_inventory()?;
-            return Err(fail());
+            return Err(error);
         }
         let grant = staged.grants[0];
         if self.grants.contains_key(&grant.gpa.raw()) {
             unpublished.abort_inventory()?;
-            return Err(fail());
+            return Err(fail(&format!(
+                "physical IPA {:#x} already retained by this MM",
+                grant.gpa.raw(),
+            )));
         }
         let (custody, retained) = unpublished.handoff()?;
         let entry = self.grants.entry(grant.gpa.raw()).or_insert(NativeGrant {
@@ -815,7 +833,13 @@ impl<R: Send + 'static> NativePhysicalGrants<R> {
         });
         let published = pool
             .publish(excluded.key(), grant.gpa.raw(), grant.identity)
-            .ok_or_else(fail)?;
+            .ok_or_else(|| {
+                fail(&format!(
+                    "pool rejected publication after custody handoff: mm={} ipa={:#x}",
+                    excluded.key(),
+                    grant.gpa.raw(),
+                ))
+            })?;
         entry.published = Some(published);
         Ok(())
     }

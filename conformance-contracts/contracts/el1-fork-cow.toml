@@ -13,6 +13,10 @@
 # contract's semantics or work budgets. The host dispatch test
 # physical_custody_reasons_preserve_fatal_codes_and_debug_text checks
 # reason codes and unchanged text; retain the existing execution controls.
+# #1447 diagnostic slice: publish_cow retains its admission predicates,
+# rollback order, custody handoff and work on successful publications. Only
+# the existing fatal error carries rejected metadata or the publication phase.
+# Existing bindings and budgets remain required; no regression fix is claimed.
 schema_version = 1
 id = "kernel.el1.fork-cow"
 title = "Guest EL1 fork copy-on-write resolution and leaf repointing"
