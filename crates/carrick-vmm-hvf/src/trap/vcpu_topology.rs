@@ -395,6 +395,7 @@ mod tests {
                 Err(carrick_hal::TrapError::CarrierClosing)
             ));
             assert!(!ran);
+            assert_eq!(fixture.state.lock().0.phase(), TopologyPhase::TearingDown);
             fixture.destroy_worker().unwrap();
             fixture.end_vm().unwrap();
         }
