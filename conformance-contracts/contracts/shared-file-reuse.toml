@@ -10,6 +10,7 @@ rationale = "A read-only shared file mapping over a retired anonymous arena gran
 [bindings]
 vm_free = [
   "carrick-kernel::dispatch::mem::tests::shared_file_reuse_after_affinity_change_needs_no_anonymous_scrub; actual anonymous mmap/munmap and sched_setaffinity dispatch, a dense file description, and counted shared-file initialization at 1/7/32 pages",
+  "carrick-kernel::dispatch::mem::tests::sparse_owner_readonly_shared_snapshot_uses_transactional_backing",
 ]
 
 [bindings.unresolved]
