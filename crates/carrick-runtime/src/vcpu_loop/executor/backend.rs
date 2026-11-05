@@ -16,6 +16,9 @@ use std::sync::atomic::AtomicBool;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use parking_lot::Mutex;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use carrick_hal::ThreadedEngine;
+
 use carrick_fatal::carrick_fatal;
 
 #[path = "residency.rs"]
