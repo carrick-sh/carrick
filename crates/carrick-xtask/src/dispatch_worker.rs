@@ -5615,6 +5615,13 @@ fn final_pr_body(text: &str, issue: u64, id: &str, token: &str) -> String {
         neutralize_mentions(&agent_loop::masked(text, token)).trim()
     )
 }
+/// Raw and server-rendered receipt placeholders describe the same unfilled
+/// template. Use one normalization for rendering and section admission.
+fn unfilled_receipts(text: &str) -> String {
+    text.replace("NEW: none / FIXED: none", "Not compared")
+        .replace("NEW: / FIXED:", "Not compared")
+        .replace("HEAD, SHA-256, CDHash", "Not collected")
+}
 fn template_pr_body(
     contract: &Contract,
     issue: u64,
@@ -5629,15 +5636,12 @@ fn template_pr_body(
     } else {
         contract.summary.chars().take(4_000).collect::<String>()
     };
-    let template = include_str!("../../../.github/pull_request_template.md")
+    let template = unfilled_receipts(include_str!("../../../.github/pull_request_template.md"))
         .replace("Closes #\n", "")
         .replace(
             "<!-- Approach and any candid divergence from Linux. -->",
             &summary,
-        )
-        .replace("NEW: none / FIXED: none", "Not compared")
-        .replace("NEW: / FIXED:", "Not compared")
-        .replace("HEAD, SHA-256, CDHash", "Not collected");
+        );
     // Claims can contain closing syntax too; never promote them into linkage.
     let text = body_without_comments(&template)?
         .lines()
@@ -5694,7 +5698,21 @@ fn regenerate_pr_body(previous: &str, proposed: &str, override_issue: Option<u64
         }
         result
     }
+    let scaffold = sections(
+        &body_without_comments(include_str!("../../../.github/pull_request_template.md"))
+            .unwrap_or_default(),
+    );
+    let canonical = |body: &str| {
+        unfilled_receipts(body)
+            .split_whitespace()
+            .collect::<String>()
+    };
     let substantive = |heading: &str, body: &str| {
+        if scaffold.iter().any(|(template_heading, template_body)| {
+            template_heading == heading && canonical(template_body) == canonical(body)
+        }) {
+            return false;
+        }
         heading == "## Publication"
             || body
                 .lines()
@@ -7966,6 +7984,14 @@ mod tests {
         assert_eq!(owner_closing_override(&event), None);
     }
     #[test]
+    fn untouched_server_template_preserves_prior_gate_receipts() {
+        publication_fixture("preserved-server-scaffold");
+    }
+    #[test]
+    fn untouched_template_preserves_prior_gate_receipts() {
+        publication_fixture("preserved-scaffold");
+    }
+    #[test]
     fn director_linkage_and_review_survive_regeneration() {
         publication_fixture("preserved");
     }
@@ -8743,7 +8769,9 @@ mod tests {
     }
     pub(super) fn publication_fixture_outcome(witness: &str, outcome: impl Fn(&Path, &Dispatch)) {
         let review_case = witness;
-        let witness = if witness.starts_with("review-invalid-") {
+        let witness = if matches!(witness, "preserved-scaffold" | "preserved-server-scaffold") {
+            "preserved"
+        } else if witness.starts_with("review-invalid-") {
             "review-comment"
         } else if witness == "review-nonclaim" {
             "body"
@@ -10583,7 +10611,7 @@ fi
             .trim()
             .to_owned();
         if witness == "preserved" {
-            pr["body"] = "## Why\nExisting rationale.\n\n## Independent review\nSol: no P0/P1 findings.\n\nPart of #634".into();
+            pr["body"] = "## Why\nExisting rationale.\n\n## Independent review\nSol: no P0/P1 findings.\n\n## Gate receipts\n| Focused xtask | published-run | NEW=[] |\n\n## Out-of-fence changes\n- [x] Confirmed scope.\n\nPart of #634".into();
             std::fs::write(outer.join("pr.json"), json!([pr.clone()]).to_string()).unwrap();
             std::fs::write(outer.join("reference-mode"), "preserved").unwrap();
         }
@@ -10946,6 +10974,22 @@ fi
             );
             return;
         }
+        if matches!(
+            review_case,
+            "preserved-scaffold" | "preserved-server-scaffold"
+        ) {
+            receipt.pr_body = Some(
+                include_str!("../../../.github/pull_request_template.md")
+                    .replace("Closes #\n", "")
+                    .replace(
+                        "<!-- Approach and any candid divergence from Linux. -->",
+                        "Updated implementation.",
+                    ),
+            );
+        }
+        if review_case == "preserved-server-scaffold" {
+            receipt.pr_body = receipt.pr_body.as_deref().map(unfilled_receipts);
+        }
         let before_normalization = git(&work, &["rev-parse", "HEAD^{tree}"]).unwrap();
         if witness == "copilot-trailer" {
             dispatch.worker.coauthor = "Claude Opus 5.5 <noreply@anthropic.com>".into();
@@ -11195,6 +11239,11 @@ fi
                 "{body}"
             );
             assert!(body.contains("## Why\nExisting rationale."), "{body}");
+            assert!(
+                body.contains("| Focused xtask | published-run | NEW=[] |"),
+                "{body}"
+            );
+            assert!(body.contains("- [x] Confirmed scope."), "{body}");
             assert!(!applied.review);
         }
         if witness == "review-claimed" {
