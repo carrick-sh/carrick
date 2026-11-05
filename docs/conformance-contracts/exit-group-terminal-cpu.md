@@ -61,3 +61,32 @@ mutation check (omit the cleanup call, and separately omit backend publication
 on failure) and green signed runs remain required on the Mac. Part of #1666;
 keep the PR draft until the failure capture and ten passes on one artifact
 are attached. The VM-free selector witness remains only a lower-layer proof.
+
+
+## carrick-87 investigation remains incomplete
+
+The forwarded host-syscall witness above is not a reduction of the native
+EL1 process-entry path. A temporary diagnostic using the existing
+`vcpu_loop::zone::affinity_tests::with_pair` native graph exercised two live
+threads: `exit_group(23)` parked the owner, requested the sibling's exit,
+and the production `El1Exit::seal` vacated the slot to both maintenance roots.
+Host materialization preserved a supplied process TTBR pair and rewound the
+retained native syscall. That diagnostic passed without a new runtime fix.
+
+It supplied the canonical base explicitly and bypassed production zone
+reconciliation and executor save. It therefore could not establish the bad
+save or satisfy the required red-on-head witness, and was not retained as a
+regression test. The existing terminal-save changes remain unqualified
+against the continuing signed failure. No additional runtime fix or root
+cause is claimed by this investigation.
+
+One candidate is `RetryThreadExit`, which is absent from
+`HvpatchProductionPhase::needs_terminal_cpu_save`. Native cancellation can
+enter `drive_thread_exit` before phase dispatch, and Busy retirement parks
+that phase. However, no schedule has shown that Busy transition with
+maintenance-root hardware under this native close. It is a hypothesis, not
+a reason to change the selector. The next witness must drive the native
+close through production reconciliation and save, retaining the sibling's
+actual base and MM/ASID identity, rather than supplying canonical registers.
+The director's named fatal/call-site capture and ten signed passes on one
+artifact remain outstanding.
