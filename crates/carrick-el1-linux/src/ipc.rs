@@ -653,7 +653,7 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
         release_pin(sched, OfdPin::from_raw(op.pin), region);
         return Admission::Forward;
     }
-    if vectored && frame.x[2] > carrick_el1_abi::ipc::IPC_MAX_IOVECS as u64 {
+    if vectored && permitted && frame.x[2] > carrick_el1_abi::ipc::IPC_MAX_IOVECS as u64 {
         release_pin(sched, OfdPin::from_raw(op.pin), region);
         return Admission::Immediate(linux::EINVAL);
     }
@@ -2812,6 +2812,10 @@ mod tests {
         let mut fill = syscall(SYS_WRITE, writer, 0x100000, 65535, A_SVC);
         assert_eq!((w.call(&mut fill), fill.x[0]), (RETURNED, 65535));
         let baseline = w.region.descriptor_allocations();
+        // Linux checks descriptor write access before importing the array:
+        // EBADF (9) on a read end wins over invalid iovcnt (EINVAL, 22).
+        let mut denied = syscall(66, reader, 0xdead0000, 1025, A_SVC);
+        assert_eq!((w.call(&mut denied), denied.x[0] as i64), (RETURNED, -9));
         let headers = [0x100000u64, 1, 0x100000, 1]
             .into_iter()
             .flat_map(u64::to_ne_bytes)

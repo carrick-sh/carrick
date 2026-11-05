@@ -42,6 +42,7 @@ vm_free = [
   "carrick-el1-abi::refusal_census_tests::refusal_snapshot_preserves_caller_populations_without_changing_service_counts",
   "carrick-el1-linux::ipc::tests::{el1_ipc_writev_preserves_vector_order_on_a_pipe,el1_ipc_writev_park_retains_imported_headers_and_exact_progress,el1_ipc_writev_atomic_admission_and_import_failure_reclaim_storage}",
   "carrick-el1-abi::ipc::tests::imported_vectors_scale_and_reclaim_with_the_operation_slot",
+  "carrick-kernel::kernel::continuation::ipc::tests::el1_ipc_vector_handback_prefetch_preserves_imported_order_and_reclaims_storage",
   "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_fork_exec_pipe_writer_reaches_its_parent",
   "carrick-personality-linux::dispatch::ring_first_tests::writev_dispatches_through_the_ipc_writer_without_scalar_file_fallback",
 ]
