@@ -3821,6 +3821,88 @@ fn arm_signal_setup_then_plain_fork_returns_one_child() {
 }
 
 #[test]
+fn arm_sigprocmask_nonresident_input_is_not_efault() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let crossing = Box::leak(Box::new(TestStockCrossing::new(&[
+        0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
+    ])));
+    let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &*crossing,
+    )
+    .with_words(&*words);
+    let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
+    let counters = carrick_el1_abi::Counters::new();
+    let cache = carrick_el1_abi::InotifyNameCache::new();
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    let mask = carrick_test_support::GuestUserBuffer::from_value(u64::MAX);
+    let old_mask = carrick_test_support::GuestUserBuffer::from_value(0xdead_beef_u64);
+    // The physical user-copy boundary refuses the first read, as it does
+    // for an absent stage-1 leaf. Both addresses remain valid user buffers.
+    for attempt in 0..2 {
+        crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(attempt == 0, Ordering::Relaxed));
+        let (nr, args) = (135, [0, mask.arg(), old_mask.arg(), 8, 0, 0]);
+        let pc = frame.elr;
+        frame.x[..6].copy_from_slice(&args);
+        frame.x[8] = nr;
+        carrick_test_support::assert_guest_args(&frame.x[..6]);
+        let route =
+            super::dispatch::dispatch_arm_syscall_with_native_process(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                &[],
+                &[],
+                &[],
+                &[],
+                &cache,
+                None::<
+                    crate::dispatch::Zone<
+                        '_,
+                        crate::sched::FakeCpu,
+                        crate::sched::HardwareUserWord,
+                    >,
+                >,
+                None,
+                Some(&*fixture),
+                fixture.page,
+                fixture.control,
+                &ThreadCtx::ZERO,
+                ttbr0,
+                &mut service,
+                |_| core::ptr::null_mut(),
+            )
+            .unwrap();
+        crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
+        assert_eq!(
+            route,
+            if attempt == 0 {
+                carrick_personality_linux::dispatch::CompletionRoute::Served
+            } else {
+                carrick_personality_linux::dispatch::CompletionRoute::WithWork
+            }
+        );
+        assert_eq!(frame.x[0] as i64, 0, "syscall {nr}");
+        if attempt == 0 {
+            assert_eq!(
+                frame.elr,
+                pc.wrapping_sub(4),
+                "redispatch the input before effects"
+            );
+            assert_eq!(old_mask.get::<u64>(0), 0xdead_beef);
+            assert_eq!(fixture.control.blocked().0, 0);
+        }
+    }
+    assert_eq!(old_mask.get::<u64>(0), 0);
+    assert_eq!(service.crossing.loans_requested.load(Ordering::Acquire), 0);
+}
+
+#[test]
 fn arm_returned_process_call_is_not_a_zone_park() {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let source = BornInZoneSource {
@@ -11855,4 +11937,72 @@ fn closed_gate_service_entry(retained_ipc: bool) {
     ));
     assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
     assert_eq!(service.crossing.root_exit_status.load(Ordering::Acquire), 7);
+}
+
+#[test]
+fn arm_sigaction_nonresident_input_redispatches() {
+    signal_setup_nonresident_input(134);
+}
+
+#[test]
+fn arm_sigaltstack_nonresident_input_redispatches() {
+    signal_setup_nonresident_input(132);
+}
+
+#[test]
+fn arm_sigsuspend_nonresident_input_redispatches_before_installing_mask() {
+    signal_setup_nonresident_input(133);
+}
+
+#[cfg(test)]
+fn signal_setup_nonresident_input(nr: u64) {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    let mut input = [0_u64; 4];
+    match nr {
+        134 => input[0] = 1, // SIG_IGN
+        132 => input[1] = 2, // SS_DISABLE
+        _ => {}
+    }
+    let input = carrick_test_support::GuestUserBuffer::from_value(input);
+    let old = carrick_test_support::GuestUserBuffer::from_value([0x55_u8; 32]);
+    let args = match nr {
+        134 => [10, input.arg(), old.arg(), 8, 0, 0],
+        132 => [input.arg(), old.arg(), 0, 0, 0, 0],
+        _ => [input.arg(), 8, 0, 0, 0, 0],
+    };
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[8] = nr;
+    frame.x[..6].copy_from_slice(&args);
+    let pc = frame.elr;
+    crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
+    let first = arm_call(fixture, fixture.control, &mut service, &mut frame);
+    crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
+    assert_eq!(
+        first.unwrap(),
+        carrick_personality_linux::dispatch::CompletionRoute::Served
+    );
+    assert_eq!(frame.elr, pc.wrapping_sub(4));
+    assert_eq!(&frame.x[..6], &args);
+    assert_eq!(fixture.control.blocked().0, 0);
+    assert_eq!(old.get::<[u8; 32]>(0), [0x55; 32]);
+    frame.x[..6].copy_from_slice(&args);
+    let second = arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap();
+    if nr == 133 {
+        assert_eq!(
+            second,
+            carrick_personality_linux::dispatch::CompletionRoute::Suspended
+        );
+    } else {
+        assert_eq!(
+            second,
+            carrick_personality_linux::dispatch::CompletionRoute::WithWork
+        );
+        assert_eq!(frame.x[0], 0);
+        if nr == 134 {
+            assert_eq!(old.get::<[u8; 32]>(0), [0; 32]);
+        } else {
+            assert_eq!(old.get::<[u64; 3]>(0), [0, 2, 0]);
+        }
+    }
 }

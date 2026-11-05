@@ -5821,6 +5821,15 @@ mod native_child_tid_cow {
 
 #[test]
 fn untouched_copyout_selects_backing_supply_without_copying() {
+    copy_preparation_selects_backing(false);
+}
+
+#[test]
+fn readonly_copyin_preparation_selects_once_then_accepts_resident_input() {
+    copy_preparation_selects_backing(true);
+}
+
+fn copy_preparation_selects_backing(read: bool) {
     use carrick_core::mm::transaction::{
         SelectionVenues, UserWriteError, UserWriteRequest, UserWriteTarget, UserWriteVenue,
     };
@@ -5882,16 +5891,29 @@ fn untouched_copyout_selects_backing_supply_without_copying() {
         residency: &residency,
         window: None,
     };
-    let result = portal.prepare_user_write(
-        UserWriteTarget {
-            handle: portal.admitted_handle(mm, 0).unwrap(),
-            address: carrick_guest_arch::UserVa::new(VA),
-            len: carrick_guest_arch::GuestLen::new(8),
-            slot: carrick_guest_arch::SlotId::new(0),
-        },
-        &tables.live(&CallerInvalidatesAsid),
-        &mut venue,
-    );
+    let result = if read {
+        portal.prepare_user_read(
+            UserWriteTarget {
+                handle: portal.admitted_handle(mm, 0).unwrap(),
+                address: carrick_guest_arch::UserVa::new(VA),
+                len: carrick_guest_arch::GuestLen::new(8),
+                slot: carrick_guest_arch::SlotId::new(0),
+            },
+            &tables.live(&CallerInvalidatesAsid),
+            &mut venue,
+        )
+    } else {
+        portal.prepare_user_write(
+            UserWriteTarget {
+                handle: portal.admitted_handle(mm, 0).unwrap(),
+                address: carrick_guest_arch::UserVa::new(VA),
+                len: carrick_guest_arch::GuestLen::new(8),
+                slot: carrick_guest_arch::SlotId::new(0),
+            },
+            &tables.live(&CallerInvalidatesAsid),
+            &mut venue,
+        )
+    };
     assert_eq!(
         result,
         Err(UserWriteError::Mechanics(())),
@@ -5900,6 +5922,30 @@ fn untouched_copyout_selects_backing_supply_without_copying() {
     let window = venue.window.unwrap();
     assert_eq!(window.operation.mm, mm);
     assert_eq!(window.fault_page, VA);
+    if !read {
+        return;
+    }
+    // Complete the one physical supply by publishing a readable, nonwritable
+    // leaf through the fixture's retained primary-table storage. Preparation
+    // must subsequently select it with UserRead, without COW or guest writes.
+    let resident = Tables::new(ROOT, IPA, 1);
+    tables.words[1536].store(
+        resident.words[1536].load(Ordering::Relaxed) | (1 << 7),
+        Ordering::Relaxed,
+    );
+    assert_eq!(
+        portal.prepare_user_read(
+            UserWriteTarget {
+                handle: portal.admitted_handle(mm, 0).unwrap(),
+                address: carrick_guest_arch::UserVa::new(VA),
+                len: carrick_guest_arch::GuestLen::new(8),
+                slot: carrick_guest_arch::SlotId::new(0),
+            },
+            &tables.live(&CallerInvalidatesAsid),
+            &mut venue,
+        ),
+        Ok(()),
+    );
 }
 
 /// #1478 (slice 1 of #1369), through the production in-ring entry: an

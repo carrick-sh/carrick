@@ -4047,3 +4047,49 @@ fn requeue_refusal_reports_the_observed_claim() {
     assert_eq!(zone.runnable_head(SLOT), None);
     assert_eq!(zone.record(parked).claim(), claim);
 }
+
+/// An in-ring syscall's memory wait has no host dispatcher continuation.
+#[test]
+fn host_owned_syscall_memory_wait_requires_ring_resume() {
+    use crate::object_wait::{ObjectWaitKey, OperationToken, OwnerEntry, ResumeDisposition};
+    let zone = zone();
+    host_publish(&zone, SLOT, MM, None, 0);
+    zone.enter_guest(SLOT);
+    let record = zone.alloc_record(identity(101)).unwrap();
+    let record_ref = zone.record_ref(record);
+    let key = ObjectWaitKey::native_service(record_ref).unwrap();
+    zone.bind_object_wait(key, &HostWait).unwrap();
+    let operation = OperationToken::new(u64::from(record.raw()), 19).unwrap();
+    {
+        let queue = zone.object_wait(key, &HostWait).unwrap();
+        queue
+            .park_owner_until(queue.snapshot(), record, operation, 0, OwnerEntry::Syscall)
+            .unwrap();
+    }
+    assert!(!zone.record(record).is_native_owned());
+    assert!(
+        zone.record(record).requires_native_entry(),
+        "an in-ring syscall continuation has no host dispatcher result"
+    );
+    assert_eq!(
+        zone.record(record).resume_disposition(),
+        ResumeDisposition::OwnerContinuation(OwnerEntry::Syscall)
+    );
+    let queue = zone.object_wait(key, &HostWait).unwrap();
+    let mut effects = crate::WakeEffects::default();
+    let report = queue.notify_object(SLOT, &mut effects).unwrap();
+    assert_eq!(report.visited, 1);
+    drop(queue);
+    assert_eq!(zone.switch_in(SLOT), Some(record));
+    assert_eq!(
+        zone.record(record).resume_disposition(),
+        ResumeDisposition::OwnerContinuation(OwnerEntry::Syscall)
+    );
+    // SAFETY: switch_in gave this fixture exclusive OnCpu custody.
+    unsafe {
+        let completed = zone.record(record).take_object_operation().unwrap();
+        assert_eq!(completed.index(), u64::from(record.raw()));
+        assert_eq!(completed.generation(), 19);
+        assert!(zone.record(record).take_object_operation().is_none());
+    }
+}

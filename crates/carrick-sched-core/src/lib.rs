@@ -899,11 +899,19 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         self.native_owned.load(Ordering::Acquire) != 0
     }
 
-    /// Exception owners resume through their retained native fault operation,
-    /// never through a host CPU snapshot, even while physically host-owned.
+    /// Exception owners and retained native object operations require their
+    /// ring checkpoint. A syscall continuation without such an operation can
+    /// still belong to the existing host wait/terminal owner.
     pub fn requires_native_entry(&self) -> bool {
-        self.resume_disposition()
-            == object_wait::ResumeDisposition::OwnerContinuation(object_wait::OwnerEntry::Exception)
+        match self.resume_disposition() {
+            object_wait::ResumeDisposition::OwnerContinuation(
+                object_wait::OwnerEntry::Exception,
+            ) => true,
+            object_wait::ResumeDisposition::OwnerContinuation(object_wait::OwnerEntry::Syscall) => {
+                self.has_object_operation()
+            }
+            object_wait::ResumeDisposition::UserReturn => false,
+        }
     }
 
     /// Physical host custody is insufficient to make a host continuation ready.
