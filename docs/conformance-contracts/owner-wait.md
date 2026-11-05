@@ -167,3 +167,53 @@ These bindings exercise the production dispatcher and completion fold. They
 do not establish signed scheduler/VMM or Docker differential acceptance.
 Those gates remain director-owned. Immediate ppoll publication and the other
 operation families still listed on #986 remain outside this slice.
+
+## Enrollment release races (#1337)
+
+Owner enrollment distinguishes a producer release (`Changed`) from an invalid
+owner incarnation (`Stale`). A release schedules one retry through the existing
+executor loop, retaining the syscall completion and sampling the exact producer
+before probing again. A refusal without a newer producer revision enrolls at
+that sample and parks; it cannot recursively redispatch the syscall. Successful
+memory supply also returns to the execution loop before redispatch. Stale
+syscall and retained-action receipts return `StaleOwnerMemoryWait`; retirement
+of a fault's receipt retains its existing group-exit cancellation behavior.
+
+The VM-free production-park bindings use a live shared-MM sibling editor and
+1024 release/reacquire cycles, then require parking without another release.
+The stale binding rejects a foreign-carrier receipt with the typed failure.
+These are enrollment-policy witnesses, not a reproduction of grep or an
+instruction-executing native-process fixture. The preserved dispatcher witness
+`proc_self_status_fits_executor_stack` checks Uid, Gid and all five capability
+lines on a 2 MiB host stack. It passes before this correction too. The signed
+Mac command and attribution of its reservation-root holder remain higher-layer
+obligations; the policy witnesses alone do not certify that command.
+
+### Reservation-root release completion reduction
+
+`serial_host_owner_memory_reservations_release_completes_parked_syscall`
+uses a real bound reservation guard on a peer thread. A production portal root
+acquisition returns Busy while that guard lives. The fixture's copyout adapter
+returns the sampled Reservations receipt; the production
+`park_owner_memory_action` enrolls it, the carrier wait service parks the
+continuation, and dropping the guard advances the source. The scheduler wakes
+the continuation, residency is reloaded, and the retained FSTAT completes once.
+No editor release participates in this schedule.
+
+The owner sampled by `DelegatedRoot::observe_probe` is the admitted MM root;
+its receipt contains that MM's carrier identity, incarnation and Reservations
+revision. `Reservations::drop` is the release producer, through
+`SpaceNotificationLease::release_resource`. The host provider binds that drop
+to `HostLockWait` in `vcpu_loop/reservations.rs`; the fixture uses the same core
+release with its peer slot's venue. The mapping dispatcher reconciles before
+all mutation handlers, including mincore and mlock2. An ordinary proc status
+read is not itself a mutation handler; grep's startup mapping or fcntl calls
+can reach this boundary. This is a source-level route explanation, not a trace
+of the failing Mac run.
+
+This reduction passes without changing production code. It does not reproduce
+the director's permanent park, identify its live root holder, or establish the
+numeric revision in that capture. A capture of the exact refusal's `holder`
+and `wait` plus the holder's execution state remains necessary before choosing
+a production correction. The signed grep/mincore/mlock2 acceptance remains
+open; a green reduction must not be reported as fixing their hangs.

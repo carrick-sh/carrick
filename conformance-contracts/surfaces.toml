@@ -637,6 +637,7 @@ surfaces = [
   { path = "crates/carrick-kernel/src/kernel/scheduler/preemption.rs", contract = "kernel.scheduler.runnable-progress" },
   { path = "crates/carrick-kernel/src/kernel/thread_ledger.rs", contract = "kernel.scheduler.runnable-progress" },
   { path = "crates/carrick-kernel/src/kernel/thread_ledger.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-kernel/src/run_result.rs", contract = "kernel.memory.owner-wait" },
   { path = "crates/carrick-kernel/tests/integration/syscall_fs_rw.rs", contract = "kernel.mm.syscall-code-write" },
   { path = "crates/carrick-mem/src/elf.rs", contract = "kernel.mm.image-page-permissions" },
   { path = "crates/carrick-mem/src/memory.rs", contract = "hvpatch.syscall.portal" },
