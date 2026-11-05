@@ -4868,15 +4868,19 @@ fn fresh_private_anonymous_mmap_skips_zero_write() {
 /// protection or UserWrite against an unbacked sparse arena reservation.
 #[test]
 fn sparse_owner_droppable_mmap_uses_transactional_backing() {
-    sparse_owner_snapshot_mmap(false);
+    for commit in [false, true] {
+        sparse_owner_snapshot_mmap(false, commit);
+    }
 }
 
 #[test]
 fn sparse_owner_readonly_shared_snapshot_uses_transactional_backing() {
-    sparse_owner_snapshot_mmap(true);
+    for commit in [false, true] {
+        sparse_owner_snapshot_mmap(true, commit);
+    }
 }
 
-fn sparse_owner_snapshot_mmap(file: bool) {
+fn sparse_owner_snapshot_mmap(file: bool, commit: bool) {
     let dispatcher = SyscallDispatcher::new();
     let _root = super::delegated_tests::Root::admit(&dispatcher);
     let registry =
@@ -4886,22 +4890,28 @@ fn sparse_owner_snapshot_mmap(file: bool) {
     memory.fail_protect_non_zero.set(true);
     let contents = vec![0x5a; 0x6994];
     if file {
+        let open = OpenFile::from_open_description_with_status_flags(
+            Arc::new(parking_lot::RwLock::new(OpenDescription::File {
+                base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
+                path: "/snapshot".into(),
+                metadata: RootFsMetadata {
+                    path: "/snapshot".into(),
+                    kind: RootFsEntryKind::File,
+                    mode: 0o444,
+                    size: contents.len(),
+                },
+                contents: FileContents::dense(contents.clone()),
+                offset: 0,
+                writable: false,
+            })),
+            crate::linux_abi::LINUX_O_RDONLY,
+            0,
+        );
+        open.description.retain_fd_ref();
         dispatcher
             .captured_file_table()
             .write_open_files(None)
-            .insert(
-                40,
-                OpenFile::from_open_description_with_status_flags(
-                    Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {
-                        base: OpenDescriptionBase::new(0),
-                        path: "/snapshot".into(),
-                        contents: contents.clone(),
-                        offset: 0,
-                    })),
-                    0,
-                    0,
-                ),
-            );
+            .insert(40, open);
     }
     let outcome = threaded_memory_call(
         &dispatcher,
@@ -4951,8 +4961,22 @@ fn sparse_owner_snapshot_mmap(file: bool) {
     assert_eq!(memory.write_calls.get(), 0);
     assert_eq!(memory.zero_backing_calls.get(), 0);
     assert!(dispatcher.mem().lock().dynamic_maps.is_empty());
-    drop(transaction); // Failed installation must leave no committed VMA.
-    assert!(dispatcher.mem().lock().dynamic_maps.is_empty());
+    assert_eq!(backing.is_shared(), file);
+    if commit {
+        transaction
+            .with_claim_for_test(|install| {
+                dispatcher.commit_host_alias_install(install).unwrap();
+            })
+            .unwrap();
+        assert!(dispatcher.range_has_host_alias_backing(va.raw(), len));
+        let mem_authority = dispatcher.mem();
+        let mem = mem_authority.lock();
+        assert_eq!(mem.dynamic_maps.len(), 1);
+        assert_eq!(mem.semantic_vmas.iter().any(|vma| vma.droppable), !file);
+    } else {
+        drop(transaction); // Failed installation must leave no committed VMA.
+        assert!(dispatcher.mem().lock().dynamic_maps.is_empty());
+    }
 }
 
 /// #1663: placement below the arena's dirty watermark is conservative even
