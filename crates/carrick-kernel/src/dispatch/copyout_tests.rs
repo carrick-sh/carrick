@@ -1828,3 +1828,139 @@ fn retained_poll_sparse_output_keeps_prefix_across_owner_supply_and_physical() {
         }
     }
 }
+
+// #1677: pthread_create must not receive EFAULT for temporary memory
+// arbitration while saving its signal mask. Output supply already uses the
+// shared copyout protocol; input arbitration must preserve that protocol too.
+#[test]
+fn sigprocmask_input_owner_wait_preserves_mask_and_oldset() {
+    let mut g = Guest::new();
+    let mask = 1u64 << 9;
+    g.memory.seed(PATH, &mask.to_le_bytes());
+    let wait = g.memory.refuse_next_read();
+    assert_eq!(
+        g.call(nr::RT_SIGPROCMASK.raw(), [0, PATH, OUT, 8, 0, 0]),
+        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+    );
+    assert!(g.memory.commits.is_empty());
+    assert_eq!(g.memory.inner.read_bytes(OUT, 8).unwrap(), [FILL; 8]);
+    assert_eq!(g.ok(nr::RT_SIGPROCMASK.raw(), [0, PATH, OUT, 8, 0, 0]), 0);
+    assert_eq!(g.memory.inner.read_bytes(OUT, 8).unwrap(), [0; 8]);
+    assert_eq!(g.ok(nr::RT_SIGPROCMASK.raw(), [0, 0, OUT2, 8, 0, 0]), 0);
+    assert_eq!(
+        g.memory.inner.read_bytes(OUT2, 8).unwrap(),
+        mask.to_le_bytes()
+    );
+}
+
+#[test]
+fn sigprocmask_output_supply_preserves_mask_until_copyout_completes() {
+    let mut g = Guest::new();
+    let mask = 1u64 << 9;
+    g.memory.seed(PATH, &mask.to_le_bytes());
+    let request = g.memory.refuse_next_supply_grant();
+    assert_eq!(
+        g.call(nr::RT_SIGPROCMASK.raw(), [0, PATH, OUT, 8, 0, 0]),
+        DispatchOutcome::OwnerMemorySupply {
+            request,
+            committed: 0
+        },
+    );
+    assert!(g.memory.commits.is_empty());
+    assert_eq!(g.ok(nr::RT_SIGPROCMASK.raw(), [0, 0, OUT2, 8, 0, 0]), 0);
+    assert_eq!(g.memory.inner.read_bytes(OUT2, 8).unwrap(), [0; 8]);
+    assert_eq!(g.ok(nr::RT_SIGPROCMASK.raw(), [0, PATH, OUT, 8, 0, 0]), 0);
+    assert_eq!(g.memory.inner.read_bytes(OUT, 8).unwrap(), [0; 8]);
+    assert_eq!(g.ok(nr::RT_SIGPROCMASK.raw(), [0, 0, OUT2, 8, 0, 0]), 0);
+    assert_eq!(
+        g.memory.inner.read_bytes(OUT2, 8).unwrap(),
+        mask.to_le_bytes()
+    );
+}
+
+#[test]
+fn sigprocmask_copyout_into_untouched_sparse_mmap() {
+    use carrick_guest_mem::GuestVa;
+    use carrick_mem::elf::SegmentPerms;
+    use carrick_mem::memory::{AddressSpace, AddressSpaceMetadata, MemoryRegionMetadata};
+    let mut dispatcher = SyscallDispatcher::new();
+    let arena = carrick_mem::memory::LINUX_MMAP_BASE;
+    let mut memory = AddressSpace::from_metadata(AddressSpaceMetadata {
+        entry: GuestVa::new(BASE),
+        initial_stack_pointer: GuestVa::new(BASE),
+        linux_auxv_image: Vec::new(),
+        regions: [BASE, arena]
+            .map(|start| MemoryRegionMetadata {
+                start: GuestVa::new(start),
+                end: GuestVa::new(start + 0x800000),
+                perms: SegmentPerms {
+                    read: true,
+                    write: true,
+                    execute: false,
+                },
+                shared: false,
+            })
+            .to_vec(),
+        ro_spans: Vec::new(),
+    })
+    .unwrap();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let mut call = |memory: &mut AddressSpace, number, args| {
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(number, SyscallArgs::from(args)),
+                memory,
+                &CompatReporter::default(),
+            )
+            .unwrap()
+    };
+    assert_eq!(
+        call(
+            &mut memory,
+            nr::MMAP.raw(),
+            [
+                0,
+                0x800000,
+                0,
+                carrick_abi::LINUX_MAP_PRIVATE | carrick_abi::LINUX_MAP_ANONYMOUS,
+                u64::MAX,
+                0
+            ]
+        ),
+        DispatchOutcome::Returned {
+            value: arena as i64
+        }
+    );
+    assert_eq!(
+        call(
+            &mut memory,
+            nr::MPROTECT.raw(),
+            [arena, 0x800000, 3, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert!(
+        memory.regions()[1].shared_initialized_bytes().1.is_empty(),
+        "mmap and mprotect must leave the output sparse"
+    );
+    let mask = 1u64 << 9;
+    memory.write_bytes(BASE, &mask.to_le_bytes()).unwrap();
+    let oldset = arena + 0x7ff000;
+    assert_eq!(
+        call(
+            &mut memory,
+            nr::RT_SIGPROCMASK.raw(),
+            [0, BASE, oldset, 8, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(memory.read_bytes(oldset, 8).unwrap(), [0; 8]);
+    // An unrelated record copyout into a second untouched page follows the
+    // same GuestMemory path, rather than a signal-specific workaround.
+    assert_eq!(
+        call(&mut memory, nr::CLOCK_GETTIME.raw(), [1, arena, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_ne!(memory.read_bytes(arena, 16).unwrap(), [0; 16]);
+}
