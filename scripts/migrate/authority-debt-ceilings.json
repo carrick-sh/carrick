@@ -2433,9 +2433,9 @@
     {
       "family": "fatal_carrier_fault",
       "operation": "fatal:ipc::description",
-      "owner": "carrick_kernel::el1_ipc::<HostDescription as Drop>::drop",
+      "owner": "carrick_kernel::el1_ipc::HostIpc::description_invariant",
       "lane": "shared",
-      "ceiling": 4
+      "ceiling": 1
     },
     {
       "family": "fatal_carrier_fault",
