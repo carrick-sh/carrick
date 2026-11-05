@@ -820,7 +820,7 @@ fn schema() -> Value {
     json!({"type":"object","additionalProperties":false,
         "required":["status","summary","tests","risks","review"],"properties":{
             "status":{"type":"string","enum":["done","blocked","failed"]},
-            "review":{"type":"boolean"},"summary":{"type":"string"},"tests":{"type":"array","items":{"type":"string"}},
+            "review":{"anyOf":[{"type":"boolean"},{"type":"object","additionalProperties":false,"required":["reviewer_model","session_id","author_session_id","verdict","head"],"properties":{"reviewer_model":{"type":"string"},"session_id":{"type":"string"},"author_session_id":{"type":"string"},"verdict":{"type":"string"},"head":{"type":"string"}}}]},"summary":{"type":"string"},"tests":{"type":"array","items":{"type":"string"}},
             "risks":{"type":"array","items":{"type":"string"}}}})
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -835,7 +835,101 @@ pub struct Contract {
     pub loop_summary: Option<String>,
     /// Worker claim on input; server publication evidence on outcome.
     #[serde(default)]
-    pub review: bool,
+    pub review: Review,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewClaim {
+    pub reviewer_model: String,
+    pub session_id: String,
+    pub author_session_id: String,
+    pub verdict: String,
+    pub head: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Review {
+    Claim(ReviewClaim),
+    Published(bool),
+}
+impl Default for Review {
+    fn default() -> Self {
+        Self::Published(false)
+    }
+}
+impl Review {
+    fn claimed(&self) -> bool {
+        !matches!(self, Self::Published(false))
+    }
+}
+
+fn review_prose_claim(text: &str) -> bool {
+    let mut review_section = false;
+    text.lines().any(|line| {
+        if line.trim().starts_with("## ") {
+            review_section = line.trim().eq_ignore_ascii_case("## Independent review");
+            if review_section {
+                return false;
+            }
+        }
+        let lower = line.to_ascii_lowercase();
+        let words: Vec<_> = lower
+            .split(|c: char| !c.is_alphanumeric() && c != '-')
+            .filter(|word| !word.is_empty())
+            .collect();
+        if review_section
+            && !words.is_empty()
+            && words.first() != Some(&"no")
+            && !words.iter().any(|word| matches!(*word, "not" | "pending"))
+        {
+            return true;
+        }
+        words.iter().enumerate().any(|(index, word)| {
+            if !matches!(*word, "review" | "reviewed") {
+                return false;
+            }
+            let before = &words[index.saturating_sub(3)..index];
+            let after = &words[index + 1..];
+            let denied = before.iter().any(|word| matches!(*word, "no" | "not"))
+                || after
+                    .iter()
+                    .take(2)
+                    .any(|word| matches!(*word, "not" | "pending"));
+            let qualified = before.iter().any(|word| {
+                matches!(
+                    *word,
+                    "independent" | "sol" | "opus" | "claude" | "gemini" | "codex"
+                ) || word.starts_with("gpt-")
+            });
+            let affirmative = after.iter().take(3).any(|word| {
+                matches!(
+                    *word,
+                    "completed"
+                        | "approved"
+                        | "passed"
+                        | "published"
+                        | "performed"
+                        | "done"
+                        | "finished"
+                        | "found"
+                )
+            });
+            !denied && (qualified || affirmative)
+        })
+    })
+}
+
+impl Contract {
+    pub(crate) fn review_claimed(&self) -> bool {
+        self.review.claimed()
+            || std::iter::once(&self.summary)
+                .chain(&self.tests)
+                .chain(&self.risks)
+                .chain(self.loop_summary.iter())
+                .any(|text| review_prose_claim(text))
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -877,7 +971,7 @@ fn read_result(result: &Path) -> (Contract, String) {
         .and_then(|value| serde_json::from_value(schema_fields(&value["structured_output"])).ok())
         .unwrap_or(Contract {
             loop_summary: None,
-            review: false,
+            review: Review::Published(false),
             status: ContractStatus::Failed,
             summary: "No valid worker contract".into(),
             tests: vec![],
@@ -1195,7 +1289,7 @@ fn worker_prompt(dispatch: &Dispatch) -> String {
         --source-only, plus just cross-check-macos for macOS-cfg code and just check-linux for\n\
         KVM/HAL code. Leave whole-workspace just lint-domains and just test-kernel to CI.\n\
         To propose a PR body, write ../pr-body.md beside result.json (relative to the checkout root).\n\
-        Keep it at most 8 KiB, write for people, and omit closing references and dispatch footers; the server adds them. Put fresh independent review text in ../review.md for the server to post as a PR comment; a claim alone does not count.\n\
+        Keep it at most 8 KiB, write for people, and omit closing references and dispatch footers; the server adds them. Put fresh independent review text in ../review.md and a typed review object (reviewer_model, session_id, author_session_id, verdict, head) in the contract. The server posts the sole evidence as an Independent review PR comment for that exact head; distinct worker-reported session IDs cannot establish separate people.\n\
         Return the requested JSON contract, stating unrun gates and blockers honestly.\n\n{}{}",
         dispatch.issue,
         dispatch.branch,
@@ -1971,7 +2065,7 @@ fn record_worker_failure(error: &ScalerError, dispatch: &Dispatch) -> Result<(),
     });
     let contract = Contract {
         loop_summary: None,
-        review: false,
+        review: Review::Published(false),
         status: ContractStatus::Failed,
         summary: format!("Worker production/harvest failed: {error}"),
         tests: vec![],
@@ -4454,7 +4548,7 @@ fn produce(
     std::fs::set_permissions(&package, std::fs::Permissions::from_mode(0o700))?;
     let mut contract = Contract {
         loop_summary: None,
-        review: false,
+        review: Review::Published(false),
         status: ContractStatus::Failed,
         summary: format!("Worker setup did not complete: {setup}"),
         tests: vec![],
@@ -4934,7 +5028,9 @@ struct Applied {
     #[serde(default)]
     pub(crate) review: bool,
     #[serde(default)]
-    review_claimed: bool,
+    pub(crate) review_claimed: bool,
+    #[serde(default)]
+    review_head: Option<String>,
     board_changes: Vec<String>,
     #[serde(default)]
     board_left: Vec<String>,
@@ -5337,7 +5433,30 @@ fn read_review(directory: &Path) -> Result<Option<String>, ScalerError> {
 
 /// Publish review prose with the job credential, like other dispatch comments.
 /// A successful command is the evidence; worker claims cannot set this bit.
-fn publish_review(root: &Path, number: u64, text: &str, token: &str) -> Result<(), ScalerError> {
+fn publish_review(
+    root: &Path,
+    number: u64,
+    text: &str,
+    claim: &Review,
+    head: &str,
+    token: &str,
+) -> Result<(), ScalerError> {
+    let Review::Claim(claim) = claim else {
+        return Err(ScalerError::Guard(
+            "review claimed, not published: typed review required",
+        ));
+    };
+    if claim.session_id.trim().is_empty()
+        || claim.author_session_id.trim().is_empty()
+        || claim.session_id.trim() == claim.author_session_id.trim()
+        || claim.reviewer_model.trim().is_empty()
+        || claim.verdict.trim().is_empty()
+        || claim.head != head
+    {
+        return Err(ScalerError::Guard(
+            "review claimed, not published: invalid session or stale head",
+        ));
+    }
     let cleaned = body_without_comments(text)?;
     if !cleaned.lines().any(|line| {
         let line = line.trim();
@@ -5351,11 +5470,18 @@ fn publish_review(root: &Path, number: u64, text: &str, token: &str) -> Result<(
     }
     proposed_pr_body(Some(text), number, "review", token)?;
     let body = format!(
-        "## Independent review\n\n{}",
+        "## Independent review\n\nReviewed head: {head}\nReviewer: {}\nReviewer session: {}\nAuthor session: {}\nVerdict: {}\n\nSession IDs are worker-reported; distinct IDs exclude the same recorded session, but do not prove separate people or model independence.\n\n{}",
+        claim.reviewer_model,
+        claim.session_id,
+        claim.author_session_id,
+        claim.verdict,
         neutralize_mentions(&agent_loop::masked(&cleaned, token))
     );
     let path = crate::agent_runner::state()?.join("review-comment.md");
-    std::fs::write(&path, body)?;
+    std::fs::write(
+        &path,
+        neutralize_mentions(&agent_loop::masked(&body, token)),
+    )?;
     gh(
         root,
         &[
@@ -5368,7 +5494,10 @@ fn publish_review(root: &Path, number: u64, text: &str, token: &str) -> Result<(
             path.to_str().ok_or(ScalerError::Guard("review path"))?,
         ],
     )?;
-    Applied::record(|a| a.review = true)
+    Applied::record(|a| {
+        a.review = true;
+        a.review_head = Some(head.to_owned());
+    })
 }
 
 fn proposed_pr_body(
@@ -5609,40 +5738,6 @@ fn regenerate_pr_body(previous: &str, proposed: &str, override_issue: Option<u64
     }
     result.push('\n');
     result
-}
-
-/// Review prose is published only when a nonempty review section is included
-/// in a successful server body write. A worker's boolean alone is no evidence.
-fn published_review(body: &str) -> bool {
-    let Ok(body) = body_without_comments(body) else {
-        return false;
-    };
-    let mut reviewing = false;
-    let mut fence = None;
-    for line in body.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            let marker = &trimmed[..3];
-            if fence == Some(marker) {
-                fence = None;
-            } else if fence.is_none() {
-                fence = Some(marker);
-            }
-            continue;
-        }
-        if fence.is_none() && line.starts_with("## ") {
-            reviewing = line.trim().eq_ignore_ascii_case("## Independent review");
-        } else if reviewing
-            && !line.trim().is_empty()
-            && !closing_reference(line)
-            && !line.starts_with("Dispatch run:")
-            && !line.starts_with("Published tree:")
-            && !line.trim_start().starts_with("Part of #")
-        {
-            return true;
-        }
-    }
-    false
 }
 
 fn patch_pr_body(
@@ -6276,9 +6371,28 @@ fn publish_with(
     if mode == PublishMode::Full
         && let Ok(Some(number)) = &result
         && let Some(review) = receipt.review_text.as_deref()
-        && let Err(error) = publish_review(root, *number, review, token)
+        && let Err(error) = publish_review(
+            root,
+            *number,
+            review,
+            &receipt.contract.review,
+            live_branch_tip(
+                &crate::agent_runner::state()?.join("work"),
+                &dispatch.branch,
+            )?
+            .split_whitespace()
+            .next()
+            .unwrap_or_default(),
+            token,
+        )
     {
         result = Err(error);
+    }
+    if mode == PublishMode::Full {
+        let applied = Applied::load()?;
+        if applied.review_claimed && !applied.review && result.is_ok() {
+            result = Err(ScalerError::Guard("review claimed, not published"));
+        }
     }
     let (Err(error), Some(base)) = (&result, preserve) else {
         return result;
@@ -6361,11 +6475,11 @@ fn publish_commits(
     mode: PublishMode,
 ) -> Result<Option<u64>, ScalerError> {
     Applied::record(|a| {
-        a.review_claimed |= receipt.contract.review
+        a.review = false;
+        a.review_head = None;
+        a.review_claimed = receipt.contract.review_claimed()
             || receipt.review_text.is_some()
-            || std::iter::once(&receipt.contract.summary)
-                .chain(&receipt.contract.tests)
-                .any(|claim| claim.to_ascii_lowercase().contains("independent review"));
+            || receipt.pr_body.as_deref().is_some_and(review_prose_claim);
     })?;
     let mut credential = PublishCredential::new(token);
     let mut check = ReferenceCheck::new(reference_host());
@@ -6863,7 +6977,6 @@ fn publish_commits(
                 }
                 Applied::record(|a| {
                     a.body = AppliedBody::Updated;
-                    a.review |= published_review(&body);
                 })?;
             }
             return Ok(Some(
@@ -6954,7 +7067,6 @@ fn publish_commits(
                 return Err(ScalerError::Usage(reason));
             }
             Applied::record(|a| {
-                a.review |= published_review(&body);
                 // Preserve a refused proposal even when creation used the fallback.
                 if let AppliedBody::Refused {
                     template_created, ..
@@ -7821,14 +7933,7 @@ mod tests {
         publication_fixture("override-rollback");
     }
     #[test]
-    fn empty_and_fenced_sections_are_not_review_evidence() {
-        for body in [
-            "## Independent review\n\nCloses #634\nDispatch run: run",
-            "```md\n## Independent review\nFake review\n```",
-            "## Independent review\n<!-- pending -->\n## Publication\nPublished tree: worker",
-        ] {
-            assert!(!published_review(body), "{body}");
-        }
+    fn regeneration_retains_absent_and_empty_sections() {
         let body = regenerate_pr_body(
             "## Why\nPrior rationale\n## Independent review\nSol: reviewed\nPart of #634",
             "## Why\n\n## Independent review\n\n## Publication\nPublished tree: worker\nCloses #634",
@@ -7871,6 +7976,42 @@ mod tests {
     #[test]
     fn unpublished_review_claim_is_not_evidence() {
         publication_fixture("review-claimed");
+    }
+    #[test]
+    fn review_requires_typed_metadata() {
+        publication_fixture("review-invalid-untyped");
+    }
+    #[test]
+    fn review_requires_text() {
+        publication_fixture("review-invalid-missing-text");
+    }
+    #[test]
+    fn review_requires_distinct_sessions() {
+        publication_fixture("review-invalid-same-session");
+    }
+    #[test]
+    fn review_requires_current_head() {
+        publication_fixture("review-invalid-stale");
+    }
+    #[test]
+    fn review_of_unpublished_local_tree_is_blocked() {
+        publication_fixture("review-invalid-retained");
+    }
+    #[test]
+    fn review_claim_in_heading_is_blocked() {
+        publication_fixture("review-invalid-heading");
+    }
+    #[test]
+    fn review_body_prose_is_a_claim_without_evidence() {
+        publication_fixture("review-invalid-body");
+    }
+    #[test]
+    fn ordinary_review_mentions_are_not_claims() {
+        publication_fixture("review-nonclaim");
+    }
+    #[test]
+    fn review_claim_in_risks_is_blocked() {
+        publication_fixture("review-invalid-risk");
     }
     #[test]
     fn continuation_applies_proposed_body() {
@@ -8089,7 +8230,7 @@ mod tests {
             worker: dispatch.worker.clone(),
             contract: Contract {
                 loop_summary: None,
-                review: false,
+                review: Review::Published(false),
                 status: ContractStatus::Done,
                 summary: "old checkpoint".into(),
                 tests: vec![],
@@ -8193,7 +8334,7 @@ mod tests {
             worker: Worker::default(),
             contract: Contract {
                 loop_summary: None,
-                review: false,
+                review: Review::Published(false),
                 status: ContractStatus::Done,
                 summary: "old tree".into(),
                 tests: vec![],
@@ -8601,6 +8742,14 @@ mod tests {
         publication_fixture_outcome(witness, |_, _| {});
     }
     pub(super) fn publication_fixture_outcome(witness: &str, outcome: impl Fn(&Path, &Dispatch)) {
+        let review_case = witness;
+        let witness = if witness.starts_with("review-invalid-") {
+            "review-comment"
+        } else if witness == "review-nonclaim" {
+            "body"
+        } else {
+            witness
+        };
         const CHILD: &str = "CARRICK_TEST_DISPATCH_PUBLICATION";
         if std::env::var_os(CHILD).is_none() {
             let temp = tempfile::tempdir().unwrap();
@@ -8893,7 +9042,7 @@ fi
         std::fs::write(outer.join("pr.json"), json!([pr.clone()]).to_string()).unwrap();
         let mut contract = Contract {
             loop_summary: None,
-            review: false,
+            review: Review::Published(false),
             status: ContractStatus::Done,
             summary: "implemented".into(),
             tests: vec![],
@@ -10438,12 +10587,12 @@ fi
             std::fs::write(outer.join("pr.json"), json!([pr.clone()]).to_string()).unwrap();
             std::fs::write(outer.join("reference-mode"), "preserved").unwrap();
         }
-        if witness == "review-comment" {
-            receipt.review_text =
-                Some("Sol 6.1: examined publication and preservation; no P0/P1 findings.".into());
-        }
-        if witness == "review-claimed" {
-            receipt.contract.summary = "Independent review completed".into();
+        if review_case == "review-nonclaim" {
+            receipt.contract.summary = "Addressed director review findings".into();
+            receipt
+                .contract
+                .risks
+                .push("No independent review performed".into());
         }
         if witness == "published-closure" {
             git(&work, &["commit", "--allow-empty", "-m", "Closes #999"]).unwrap();
@@ -10519,6 +10668,73 @@ fi
             ],
         )
         .unwrap();
+        if witness == "review-comment" {
+            normalize_publication_trailers(
+                &work,
+                &receipt.base,
+                Some(&receipt.expected_tip),
+                &dispatch.worker.coauthor,
+            )
+            .unwrap();
+            receipt.contract.review = Review::Claim(ReviewClaim {
+                reviewer_model: "Sol 6.1".into(),
+                session_id: "reviewer-session".into(),
+                author_session_id: "author-session".into(),
+                verdict: "no P0/P1".into(),
+                head: git(&work, &["rev-parse", "HEAD"]).unwrap().trim().into(),
+            });
+            let result = outer.join("review-result.json");
+            std::fs::write(
+                &result,
+                json!({"structured_output": receipt.contract}).to_string(),
+            )
+            .unwrap();
+            receipt.contract = read_result(&result).0;
+            assert!(matches!(receipt.contract.review, Review::Claim(_)));
+            receipt.review_text =
+                Some("Sol 6.1: examined publication and preservation; no P0/P1 findings.".into());
+        }
+        if witness == "review-claimed" {
+            receipt.contract.summary = "Sol review completed".into();
+        }
+        if review_case.starts_with("review-invalid-") {
+            match review_case {
+                "review-invalid-untyped" => receipt.contract.review = Review::Published(true),
+                "review-invalid-missing-text" => receipt.review_text = None,
+                "review-invalid-same-session" => {
+                    if let Review::Claim(claim) = &mut receipt.contract.review {
+                        claim.session_id = format!(" {} ", claim.author_session_id);
+                    }
+                }
+                "review-invalid-stale" => {
+                    git(
+                        &work,
+                        &["commit", "--allow-empty", "-m", "fix(ci): newer head"],
+                    )
+                    .unwrap();
+                }
+                "review-invalid-retained" => {
+                    dispatch.resume = false;
+                    receipt.expected_tip.clear();
+                }
+                "review-invalid-heading" => {
+                    receipt.contract.review = Review::Published(false);
+                    receipt.review_text = None;
+                    receipt.pr_body = Some("## Sol review completed".into());
+                }
+                "review-invalid-body" => {
+                    receipt.contract.review = Review::Published(false);
+                    receipt.review_text = None;
+                    receipt.pr_body = Some("## Independent review\nSol: no P0/P1 findings.".into());
+                }
+                "review-invalid-risk" => {
+                    receipt.contract.review = Review::Published(false);
+                    receipt.review_text = None;
+                    receipt.contract.risks.push("Sol review completed".into());
+                }
+                _ => unreachable!(),
+            }
+        }
         if matches!(
             witness,
             "body"
@@ -10764,20 +10980,29 @@ fi
             )
             .unwrap();
         }
-        assert_eq!(
-            publish(
-                &work,
-                &dispatch,
-                &receipt,
-                &contract,
-                &report,
-                "fixture-token",
-                &mut agent_loop::RunCache::default(),
-            )
-            .unwrap(),
-            Some(800),
-            "publication blamed live main workflow changes on the worker"
+        let publication = publish(
+            &work,
+            &dispatch,
+            &receipt,
+            &contract,
+            &report,
+            "fixture-token",
+            &mut agent_loop::RunCache::default(),
         );
+        if witness == "review-claimed" || review_case.starts_with("review-invalid-") {
+            assert!(
+                publication
+                    .unwrap_err()
+                    .to_string()
+                    .contains("review claimed, not published")
+            );
+            let applied = Applied::load().unwrap();
+            assert!(!applied.review);
+            assert!(applied.review_claimed);
+            outcome(&work, &dispatch);
+            return;
+        }
+        assert_eq!(publication.unwrap(), Some(800));
         if witness == "copilot-trailer" {
             assert_eq!(
                 git(&work, &["show", "-s", "--format=%s", "HEAD"])
@@ -10954,6 +11179,10 @@ fi
             assert!(applied.review);
             let posted = regular_text(&outer.join("posted.md")).unwrap();
             assert!(posted.contains("## Independent review") && posted.contains("Sol 6.1:"));
+            assert!(posted.contains(&format!("Reviewed head: {}", sha.trim())));
+            assert!(posted.contains("Reviewer session: reviewer-session"));
+            assert!(posted.contains("Author session: author-session"));
+            outcome(&work, &dispatch);
         }
         if witness == "preserved" {
             let body = regular_text(&outer.join("applied-body.md")).unwrap();
@@ -10966,7 +11195,7 @@ fi
                 "{body}"
             );
             assert!(body.contains("## Why\nExisting rationale."), "{body}");
-            assert!(applied.review);
+            assert!(!applied.review);
         }
         if witness == "review-claimed" {
             assert!(!applied.review);
@@ -11401,7 +11630,7 @@ fi
             worker: dispatch.worker.clone(),
             contract: Contract {
                 loop_summary: None,
-                review: false,
+                review: Review::Published(false),
                 status: ContractStatus::Done,
                 summary: "first worker".into(),
                 tests: vec![],
@@ -11720,7 +11949,7 @@ fi
         }
         let contract = Contract {
             loop_summary: None,
-            review: false,
+            review: Review::Published(false),
             status: ContractStatus::Done,
             summary: format!("Authorization: Bearer {token}"),
             tests: vec![format!("passed {token}")],
@@ -11759,7 +11988,7 @@ fi
         }
         let contract = Contract {
             loop_summary: None,
-            review: false,
+            review: Review::Published(false),
             status: ContractStatus::Done,
             summary: "done".into(),
             tests: vec![],

@@ -1896,7 +1896,7 @@ fn outcome_preview(contract: &Contract) -> Contract {
     let clip = |text: &str, limit| text.chars().take(limit).collect::<String>();
     let mut preview = Contract {
         loop_summary: contract.loop_summary.as_ref().map(|s| clip(s, 1024)),
-        review: contract.review,
+        review: contract.review.clone(),
         status: contract.status,
         summary: clip(&contract.summary, 1024),
         tests: contract
@@ -2123,7 +2123,18 @@ impl Server<'_> {
         } else {
             "Worker was not invoked.".into()
         };
-        let applied = Applied::load()?;
+        let mut applied = Applied::load()?;
+        applied.review_claimed |= self.history.iter().any(Contract::review_claimed);
+        if applied.review {
+            let work = crate::agent_runner::state()?.join("work");
+            let live = super::live_branch_tip(&work, &self.dispatch.branch).ok();
+            applied.review = applied.review_head.as_deref().is_some_and(|reviewed| {
+                live.as_deref()
+                    .and_then(|tip| tip.split_whitespace().next())
+                    == Some(reviewed)
+            });
+        }
+        let review_published = applied.review;
         self.pr = applied.publication_pr.or(self.pr);
         let manual_repair = applied.manual_repair.clone();
         let mut observations = Vec::new();
@@ -2243,7 +2254,8 @@ impl Server<'_> {
                     self.tier.reason
                 )
             });
-        let status = if applied.last_provider_filter {
+        let status = if (applied.review_claimed && !applied.review) || applied.last_provider_filter
+        {
             RoundStatus::Blocked
         } else if !observations.is_empty() {
             RoundStatus::Failed
@@ -2370,7 +2382,7 @@ impl Server<'_> {
         let mut status = status;
         let mut outcome = Contract {
             loop_summary: Some(masked(summary, &self.token)),
-            review: Applied::load()?.review,
+            review: crate::dispatch_worker::Review::Published(review_published),
             status: status.contract(),
             summary: applied.clone(),
             tests: self.history.iter().flat_map(|c| c.tests.clone()).collect(),
@@ -3330,7 +3342,7 @@ impl Server<'_> {
                     self.history.truncate(worker_index);
                     self.history.push(Contract {
                         loop_summary: None,
-                        review: false,
+                        review: crate::dispatch_worker::Review::Published(false),
                         status: ContractStatus::Failed,
                         summary: format!(
                             "Worker failed after admission: {}",
@@ -4511,6 +4523,49 @@ mod tests {
         });
     }
     #[test]
+    fn published_review_is_current_head_evidence() {
+        super::super::tests::publication_fixture_outcome("review-comment", |root, dispatch| {
+            let mut s = server(root);
+            s.dispatch = dispatch.clone();
+            s.pr = Some(800);
+            s.outcome(ContractStatus::Done, "Work finished").unwrap();
+            let outer = PathBuf::from(std::env::var_os("RUNNER_TEMP").unwrap());
+            let contract: Value = serde_json::from_str(
+                &regular_text(&outer.join("dispatch-output/contract.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(contract["review"], true);
+            // An external update after comment publication invalidates evidence.
+            std::fs::write(outer.join("remote-tip"), "f".repeat(40)).unwrap();
+            s.outcome(ContractStatus::Done, "Work finished").unwrap();
+            let contract: Value = serde_json::from_str(
+                &regular_text(&outer.join("dispatch-output/contract.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(contract["review"], false);
+            assert_eq!(contract["status"], "blocked");
+            assert!(
+                contract["summary"]
+                    .as_str()
+                    .unwrap()
+                    .contains("review claimed, not published")
+            );
+        });
+    }
+    #[test]
+    fn unpublished_review_claim_blocks_round() {
+        super::super::tests::publication_fixture_outcome("review-claimed", |root, dispatch| {
+            let mut s = server(root);
+            s.dispatch = dispatch.clone();
+            s.pr = Some(800);
+            s.outcome(ContractStatus::Done, "Work finished").unwrap();
+            let outer = PathBuf::from(std::env::var_os("RUNNER_TEMP").unwrap());
+            let posted = regular_text(&outer.join("posted.md")).unwrap();
+            assert!(posted.contains("Dispatch outcome: Blocked"), "{posted}");
+            assert!(posted.contains("review claimed, not published"), "{posted}");
+        });
+    }
+    #[test]
     fn rev3_failed_create_posts_its_outcome_on_the_pr() {
         super::super::tests::publication_fixture_outcome("create-repair", |root, dispatch| {
             let mut s = server(root);
@@ -5596,7 +5651,7 @@ fi
     fn outcome_preview_is_bounded_without_changing_the_full_contract() {
         let full = Contract {
             loop_summary: None,
-            review: false,
+            review: crate::dispatch_worker::Review::Published(false),
             status: ContractStatus::Done,
             summary: "\0".repeat(8192),
             tests: vec!["🦀".repeat(1000); 64],
@@ -5700,7 +5755,7 @@ fi
                     worker: dispatch.worker.clone(),
                     contract: Contract {
                         loop_summary: None,
-                        review: false,
+                        review: crate::dispatch_worker::Review::Published(false),
                         status: ContractStatus::Done,
                         summary: "first implementation".into(),
                         tests: vec!["cargo test passed".into()],
@@ -5718,7 +5773,7 @@ fi
                 package.join("contract.json"),
                 serde_json::to_vec(&Contract {
                     loop_summary: None,
-                    review: false,
+                    review: crate::dispatch_worker::Review::Published(false),
                     status: ContractStatus::Done,
                     summary: "first implementation".into(),
                     tests: vec!["cargo test passed".into()],
@@ -9416,7 +9471,7 @@ exec /usr/bin/git "$@"
             let mut server = server(root);
             let forged = Contract {
                 loop_summary: None,
-                review: false,
+                review: crate::dispatch_worker::Review::Published(false),
                 status: ContractStatus::Done,
                 summary: "forged outcome".into(),
                 tests: vec![],
@@ -9745,7 +9800,7 @@ exec /usr/bin/git "$@"
     fn later_worker_handoff_contains_prior_claims() {
         let contract = Contract {
             loop_summary: None,
-            review: false,
+            review: crate::dispatch_worker::Review::Published(false),
             status: ContractStatus::Done,
             summary: "prior summary".into(),
             tests: vec!["prior test".into()],
