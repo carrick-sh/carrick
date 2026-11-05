@@ -5212,6 +5212,53 @@ fn watched_file_close_marks_ring_replay_and_emits_inotify_close() {
     assert_ne!(mask & carrick_abi::LINUX_IN_CLOSE_WRITE, 0);
 }
 
+/// pipemass as PID 1: fill the descriptor table, close, and reuse slots.
+#[test]
+fn serial_host_pipemass_fd_limit_preserves_wait_domains_and_incarnations() {
+    use crate::el1_zone::HostLockWait;
+    // SAFETY: zero is the valid empty scheduler state; use aligned heap
+    // storage because the complete zone is too large for a test stack.
+    let zone = unsafe {
+        let ptr =
+            std::alloc::alloc_zeroed(std::alloc::Layout::new::<carrick_el1_abi::ZoneTables>());
+        assert!(!ptr.is_null());
+        Box::leak(Box::from_raw(ptr.cast::<carrick_el1_abi::ZoneTables>()))
+    };
+    crate::el1_zone::with_test_zone(zone, || {
+        let metadata = carrick_sched_core::object_wait::ObjectWaitKey::metadata_request(1).unwrap();
+        zone.bind_object_wait(metadata, &HostLockWait).unwrap();
+        let mut h = SpliceTestRig::new(4096);
+        const LIMIT: usize = 8193;
+        let limit = (LIMIT as u64).to_ne_bytes().repeat(2);
+        h.memory.write_bytes(0x4100, &limit).unwrap();
+        assert_eq!(
+            h.run(261, [0, 7, 0x4100, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let initial = h.dispatcher.captured_file_table().slot_count();
+        for _ in 0..2 {
+            let mut pairs = Vec::new();
+            for _ in 0..(LIMIT - initial) / 2 {
+                pairs.push(h.pipe2(0x4000));
+            }
+            assert_eq!(
+                h.run(SpliceTestRig::SYS_PIPE2, [0x4000, 0, 0, 0, 0, 0]),
+                DispatchOutcome::errno(carrick_abi::LINUX_EMFILE)
+            );
+            assert_eq!(h.dispatcher.captured_file_table().slot_count(), LIMIT);
+            for (reader, writer) in pairs {
+                h.close(reader);
+                h.close(writer);
+            }
+            assert_eq!(h.dispatcher.captured_file_table().slot_count(), initial);
+            assert!(
+                zone.object_wait(metadata, &HostLockWait).is_ok(),
+                "IPC must not overwrite metadata's queue generation"
+            );
+        }
+    });
+}
+
 #[test]
 fn m1_failed_pair_copyout_leaves_no_descriptors_or_reserved_holes() {
     let mut h = SpliceTestRig::new(4096);
