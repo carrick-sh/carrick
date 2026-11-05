@@ -37,3 +37,6 @@ pub use user_write::{
 };
 
 pub use crate::mm::frames::{GrantTarget, grant_target};
+
+mod word_write;
+pub use word_write::{WordWriteFence, WordWriteOutput, WordWritePiece};

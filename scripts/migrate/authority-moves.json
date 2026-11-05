@@ -75,6 +75,11 @@
       "from": "carrick_runtime::el1_census::snapshot",
       "to": "carrick_runtime::el1_census::snapshot_counters",
       "issue": 1394
+    },
+    {
+      "from": "carrick_kernel::el1_ipc::<HostDescription as Drop>::drop",
+      "to": "carrick_kernel::el1_ipc::HostIpc::description_invariant",
+      "issue": 1346
     }
   ],
   "terminal_custody": []

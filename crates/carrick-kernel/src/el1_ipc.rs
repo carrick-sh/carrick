@@ -266,6 +266,126 @@ pub struct HostDescription {
     flags: std::sync::Arc<HostDescriptionFlags>,
 }
 
+/// Venue custody for unpublished descriptions. The neutral preparation owns
+/// raw backings as well as admitted pins; this wrapper supplies canonical
+/// growth and releases every remaining backing on cancellation or refusal.
+#[derive(Debug)]
+pub struct HostPreparedDescriptions<const N: usize> {
+    owner: std::sync::Arc<HostIpc>,
+    prepared: fd::prepared::PreparedDescriptions<N>,
+}
+
+/// One retained native pipe creation, from canonical endpoint preparation to
+/// atomic descriptor publication. The exact table incarnation is captured at
+/// admission; dropping this value before publication cancels both endpoint
+/// descriptions through [`HostPreparedDescriptions`]'s settlement owner.
+///
+/// Output preparation happens while this value is retained, but outside every
+/// IPC lock. [`Self::publish`] accepts only a whole-word physical output whose
+/// mappings and exact-MM editor are already held. It therefore has exactly two
+/// effects, neither of which can suspend: publish both descriptors, then write
+/// their numbers. A refused publication boxes this same transaction, keeping
+/// the error return small while preserving endpoint custody.
+#[derive(Debug)]
+#[must_use = "retain native pipe creation until publication or cancellation"]
+pub struct NativePipeCreation {
+    table: fd::TableId,
+    object: IpcObjectHandle,
+    prepared: HostPreparedDescriptions<2>,
+}
+
+impl NativePipeCreation {
+    /// The exact descriptor-table incarnation captured by this transaction.
+    pub fn table(&self) -> fd::TableId {
+        self.table
+    }
+
+    /// The exact pipe incarnation retained by both unpublished endpoints.
+    pub fn object(&self) -> IpcObjectHandle {
+        self.object
+    }
+
+    fn publish_with(
+        mut self,
+        cloexec: bool,
+        write: impl FnOnce([u8; 8]),
+    ) -> Result<[fd::Fd; 2], (AdmissionError, Box<Self>)> {
+        let pair = match self.prepared.install_pair(self.table, cloexec) {
+            Ok(pair) => pair,
+            Err(error) => return Err((error, Box::new(self))),
+        };
+        let mut bytes = [0; 8];
+        bytes[..4].copy_from_slice(&pair[0].0.to_ne_bytes());
+        bytes[4..].copy_from_slice(&pair[1].0.to_ne_bytes());
+        write(bytes);
+        Ok(pair)
+    }
+
+    /// Publish the pair and consume an already-bound, infallible whole-word
+    /// output. On refusal, physical output custody is released before the
+    /// retained transaction is returned to its owner for growth or waiting.
+    pub fn publish<Context>(
+        self,
+        cloexec: bool,
+        output: carrick_core::mm::transaction::WordWriteOutput<'_, '_, Context>,
+    ) -> Result<[fd::Fd; 2], (AdmissionError, Box<Self>)>
+    where
+        Context: Copy + Send + Sync + zerocopy::FromZeros,
+    {
+        self.publish_with(cloexec, |bytes| output.write(bytes))
+    }
+}
+
+impl<const N: usize> Drop for HostPreparedDescriptions<N> {
+    fn drop(&mut self) {
+        let region = self.owner.region();
+        let authority = region.fd(HostLockWait);
+        loop {
+            match self.prepared.release_next(&authority) {
+                Ok(Some(description)) => {
+                    self.owner
+                        .release(description.backing)
+                        .unwrap_or_else(|error| {
+                            self.owner.description_invariant(format_args!(
+                                "backing release failed: {error:?}"
+                            ))
+                        });
+                }
+                Ok(None) => break,
+                Err(error) => self
+                    .owner
+                    .description_invariant(format_args!("invalid description custody: {error:?}")),
+            }
+        }
+    }
+}
+
+impl HostPreparedDescriptions<2> {
+    /// Atomic numeric publication, with no allocation, growth or user copy.
+    /// On NeedsBacking the caller retains this owner, releases any secured
+    /// output, and requests canonical table growth before preparing output
+    /// again. This method can then be retried as the bounded final commit.
+    pub fn install_pair(
+        &mut self,
+        table: fd::TableId,
+        cloexec: bool,
+    ) -> Result<[fd::Fd; 2], AdmissionError> {
+        let region = self.owner.region();
+        self.prepared
+            .install_pair(&region.fd(HostLockWait), table, fd::Fd(0), cloexec)
+            .map_err(Into::into)
+    }
+
+    /// Move the same OFDs to the host pipe's functional endpoint owners.
+    pub fn into_pair(mut self) -> [HostDescription; 2] {
+        let pins = self.prepared.take_pair().unwrap_or_else(|_| {
+            self.owner
+                .description_invariant(format_args!("unadmitted pair transfer"))
+        });
+        pins.map(|pin| self.owner.own_description(pin))
+    }
+}
+
 /// Non-owning observation of a host description's shared mutable flags.
 /// Holding this view never retains an OFD pin. After host retirement it reads
 /// a terminal snapshot, without touching a potentially recycled shared slot.
@@ -396,15 +516,21 @@ impl Drop for HostDescription {
             let region = self.flags.owner.region();
             let authority = region.fd(HostLockWait);
             let terminal = authority.pinned(pin).unwrap_or_else(|_| {
-                carrick_fatal::carrick_fatal!("ipc::description", "invalid closing description")
+                self.flags
+                    .owner
+                    .description_invariant(format_args!("invalid closing description"))
             });
             let HostDescriptionState::Live(pin) =
                 std::mem::replace(&mut *state, HostDescriptionState::Retired(terminal))
             else {
-                carrick_fatal::carrick_fatal!("ipc::description", "description retired twice")
+                self.flags
+                    .owner
+                    .description_invariant(format_args!("description retired twice"))
             };
             authority.unpin(pin).unwrap_or_else(|_| {
-                carrick_fatal::carrick_fatal!("ipc::description", "invalid owned description pin")
+                self.flags
+                    .owner
+                    .description_invariant(format_args!("invalid owned description pin"))
             })
         };
         // Backing release can call host readiness callbacks: leave the
@@ -414,10 +540,9 @@ impl Drop for HostDescription {
                 .owner
                 .release(description.backing)
                 .unwrap_or_else(|_| {
-                    carrick_fatal::carrick_fatal!(
-                        "ipc::description",
-                        "invalid final description backing"
-                    )
+                    self.flags
+                        .owner
+                        .description_invariant(format_args!("invalid final description backing"))
                 });
         }
     }
@@ -541,6 +666,12 @@ impl HostIpc {
             )?;
         }
         Ok(owner)
+    }
+
+    /// One invariant owner for admitted and partially prepared description
+    /// custody. Physical finalization remains outside table/description locks.
+    fn description_invariant(&self, reason: std::fmt::Arguments<'_>) -> ! {
+        carrick_fatal::carrick_fatal!("ipc::description", "{reason}")
     }
 
     /// The zone-wide ceilings this authority grows its stores to.
@@ -973,11 +1104,76 @@ impl HostIpc {
                 result => break result?,
             }
         };
-        Ok(HostDescription {
+        Ok(self.own_description(pin))
+    }
+
+    fn own_description(self: &std::sync::Arc<Self>, pin: fd::OfdPin) -> HostDescription {
+        HostDescription {
             flags: std::sync::Arc::new(HostDescriptionFlags {
                 owner: std::sync::Arc::clone(self),
                 state: Mutex::new(HostDescriptionState::Live(pin)),
             }),
+        }
+    }
+
+    /// Own every input backing before trying the first description. Partial
+    /// admission retains its prefix across canonical growth and aborts through
+    /// the same release path when the configured description ceiling is hit.
+    pub fn prepare_descriptions<const N: usize>(
+        self: &std::sync::Arc<Self>,
+        descriptions: [fd::Description; N],
+    ) -> Result<HostPreparedDescriptions<N>, AdmissionError> {
+        let mut prepared = HostPreparedDescriptions {
+            owner: std::sync::Arc::clone(self),
+            prepared: fd::prepared::PreparedDescriptions::new(descriptions),
+        };
+        loop {
+            let region = self.region();
+            let seen = region.ofd_count();
+            match prepared.prepared.admit(&region.fd(HostLockWait)) {
+                Err(fd::Error::NeedsOfds) => self.grow_descriptions(seen)?,
+                Ok(()) => return Ok(prepared),
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    /// Prepare both endpoints using the canonical object and description
+    /// growth owners. Ring retirement and first-write stock remain owned by
+    /// create_pipe; neither a growth refusal nor cancellation leaks an end.
+    pub fn prepare_pipe(
+        self: &std::sync::Arc<Self>,
+        capacity: usize,
+        flags: fd::StatusFlags,
+    ) -> Result<(IpcObjectHandle, HostPreparedDescriptions<2>), AdmissionError> {
+        use carrick_el1_abi::ipc::IpcBacking;
+        let object = self.create_pipe(capacity)?;
+        let descriptions = [
+            (pipe::End::Reader, fd::AccessMode::ReadOnly),
+            (pipe::End::Writer, fd::AccessMode::WriteOnly),
+        ]
+        .map(|(end, access)| {
+            fd::Description::new(IpcBacking::Pipe { object, end }.encode(), access, flags)
+        });
+        self.prepare_descriptions(descriptions)
+            .map(|prepared| (object, prepared))
+    }
+
+    /// Begin one native pipe creation before any descriptor or user output is
+    /// published. Canonical object/description growth, retired-ring reclaim,
+    /// wait binding and stock replenishment all run through `prepare_pipe`;
+    /// the returned owner then survives output preparation and publication.
+    pub fn begin_native_pipe_creation(
+        self: &std::sync::Arc<Self>,
+        table: fd::TableId,
+        capacity: usize,
+        flags: fd::StatusFlags,
+    ) -> Result<NativePipeCreation, AdmissionError> {
+        let (object, prepared) = self.prepare_pipe(capacity, flags)?;
+        Ok(NativePipeCreation {
+            table,
+            object,
+            prepared,
         })
     }
 
@@ -1201,6 +1397,203 @@ impl HostIpc {
 mod tests {
     use super::*;
     use carrick_el1_abi::ipc::{IpcBacking, fd, pipe};
+
+    #[test]
+    fn serial_host_prepared_pipe_second_description_ceiling_releases_both_ends() {
+        let owner = std::sync::Arc::new(
+            HostIpc::with_limits(
+                1 << 20,
+                IpcLimits {
+                    objects: 2 * IPC_OBJECT_SEGMENT,
+                    descriptions: IPC_OFD_SEGMENT,
+                },
+            )
+            .unwrap(),
+        );
+        let mut held = Vec::new();
+        // Leave exactly one OFD for the reader. The writer requests growth,
+        // hits the canonical ceiling and must release its still-raw endpoint.
+        for _ in 0..IPC_OFD_SEGMENT - 1 {
+            let object = owner.create_eventfd(0, pipe::EventMode::Counter).unwrap();
+            held.push(
+                owner
+                    .admit_description(fd::Description::new(
+                        IpcBacking::EventFd { object }.encode(),
+                        fd::AccessMode::ReadWrite,
+                        fd::StatusFlags::default(),
+                    ))
+                    .unwrap(),
+            );
+        }
+        let initial_growth = owner.growth();
+        for _ in 0..2 * IPC_OBJECT_SEGMENT {
+            assert!(matches!(
+                owner.prepare_pipe(65536, fd::StatusFlags::default()),
+                Err(AdmissionError::Shared(IpcError::ZoneLimit))
+            ));
+        }
+        assert_eq!(
+            owner.growth(),
+            initial_growth,
+            "no growth beyond configured ceilings"
+        );
+        drop(held);
+        let (object, prepared) = owner
+            .prepare_pipe(65536, fd::StatusFlags::default())
+            .unwrap();
+        drop(prepared);
+        assert!(matches!(
+            owner.region().lock(object, &HostLockWait),
+            Err(IpcError::Stale)
+        ));
+    }
+
+    #[test]
+    fn serial_host_prepared_pipe_pair_refusal_growth_and_repeated_reuse() {
+        let owner = std::sync::Arc::new(HostIpc::new(1 << 20).unwrap());
+        let table = owner.create_table(4, 1).unwrap();
+        let peer = owner.create_table(1, 1).unwrap();
+        let flags = fd::StatusFlags {
+            nonblock: true,
+            ..Default::default()
+        };
+        for _ in 0..256 {
+            let (object, mut prepared) = owner.prepare_pipe(65536, flags).unwrap();
+            assert_eq!(
+                prepared.install_pair(peer, true),
+                Err(AdmissionError::Shared(IpcError::Fd(
+                    fd::Error::TooManyFiles
+                )))
+            );
+            let region = owner.region();
+            let authority = region.fd(HostLockWait);
+            assert_eq!(authority.get(peer, fd::Fd(0)), Err(fd::Error::BadFd));
+            let pair = match prepared.install_pair(table, true) {
+                Err(AdmissionError::Shared(IpcError::Fd(fd::Error::NeedsBacking {
+                    descriptors,
+                }))) => {
+                    assert_eq!(authority.get(table, fd::Fd(0)), Err(fd::Error::BadFd));
+                    region
+                        .ensure_table_capacity(table, descriptors, &HostLockWait)
+                        .unwrap();
+                    prepared.install_pair(table, true).unwrap()
+                }
+                result => result.unwrap(),
+            };
+            assert_eq!(pair, [fd::Fd(0), fd::Fd(1)]);
+            assert_eq!(
+                prepared.install_pair(table, true),
+                Err(AdmissionError::Shared(IpcError::Fd(fd::Error::StalePin)))
+            );
+            assert_eq!(authority.get(table, fd::Fd(2)), Err(fd::Error::BadFd));
+            drop(prepared);
+            for number in [fd::Fd(0), fd::Fd(1)] {
+                assert_eq!(authority.getfd(table, number), Ok(true));
+                assert!(authority.getfl(table, number).unwrap().1.nonblock);
+                owner
+                    .release(authority.close(table, number).unwrap().unwrap().backing)
+                    .unwrap();
+            }
+            assert!(matches!(
+                region.lock(object, &HostLockWait),
+                Err(IpcError::Stale)
+            ));
+        }
+        assert_eq!(owner.growth(), IpcGrowth::default());
+        assert!(
+            owner.rings.lock().allocated.len() <= 4,
+            "bounded ring stock reuse"
+        );
+        for table in [table, peer] {
+            let storage = owner
+                .region()
+                .fd(HostLockWait)
+                .destroy_table(table, |_| unreachable!())
+                .unwrap();
+            owner.reclaim_descriptors(storage).unwrap();
+        }
+    }
+
+    #[test]
+    fn serial_host_native_pipe_copyout_fault_cancels_both_descriptors_once() {
+        let owner = std::sync::Arc::new(HostIpc::new(1 << 20).unwrap());
+        let table = owner.create_table(8, 8).unwrap();
+        let creation = owner
+            .begin_native_pipe_creation(table, 65536, fd::StatusFlags::default())
+            .unwrap();
+        let object = creation.object();
+
+        // Production prepares and binds the whole output before publish. A
+        // genuine fault at that checkpoint drops the retained transaction.
+        drop(creation);
+
+        let region = owner.region();
+        let authority = region.fd(HostLockWait);
+        assert_eq!(authority.get(table, fd::Fd(0)), Err(fd::Error::BadFd));
+        assert_eq!(authority.get(table, fd::Fd(1)), Err(fd::Error::BadFd));
+        assert!(matches!(
+            owner.region().lock(object, &HostLockWait),
+            Err(IpcError::Stale)
+        ));
+    }
+
+    #[test]
+    fn serial_host_native_pipe_growth_refusal_retains_then_publishes_exact_pair() {
+        let owner = std::sync::Arc::new(HostIpc::new(1 << 20).unwrap());
+        let table = owner.create_table(8, 1).unwrap();
+        let creation = owner
+            .begin_native_pipe_creation(table, 65536, fd::StatusFlags::default())
+            .unwrap();
+        let object = creation.object();
+        let (error, creation) = creation
+            .publish_with(false, |_| panic!("refused publication cannot write output"))
+            .unwrap_err();
+        let descriptors = match error {
+            AdmissionError::Shared(IpcError::Fd(fd::Error::NeedsBacking { descriptors })) => {
+                descriptors
+            }
+            error => panic!("unexpected refusal: {error:?}"),
+        };
+        assert_eq!(creation.object(), object);
+        assert_eq!(creation.table(), table);
+        let region = owner.region();
+        let authority = region.fd(HostLockWait);
+        assert_eq!(authority.get(table, fd::Fd(0)), Err(fd::Error::BadFd));
+        owner.ensure_capacity(table, descriptors).unwrap();
+        let mut output = None;
+        let pair = creation
+            .publish_with(true, |bytes| output = Some(bytes))
+            .unwrap();
+        assert_eq!(pair, [fd::Fd(0), fd::Fd(1)]);
+        assert_eq!(output.unwrap(), [0, 0, 0, 0, 1, 0, 0, 0]);
+        assert_eq!(authority.getfd(table, fd::Fd(0)), Ok(true));
+        assert_eq!(authority.getfd(table, fd::Fd(1)), Ok(true));
+    }
+
+    #[test]
+    fn serial_host_native_pipe_fatal_cancel_releases_stock_and_descriptors() {
+        let owner = std::sync::Arc::new(HostIpc::new(1 << 20).unwrap());
+        let table = owner.create_table(8, 8).unwrap();
+        let before = owner.rings.lock().allocated.len();
+        let creation = owner
+            .begin_native_pipe_creation(table, 65536, fd::StatusFlags::default())
+            .unwrap();
+        let object = creation.object();
+        // Fatal native cancellation owns this drop; no numeric close is used.
+        drop(creation);
+        assert!(matches!(
+            owner.region().lock(object, &HostLockWait),
+            Err(IpcError::Stale)
+        ));
+        let region = owner.region();
+        let authority = region.fd(HostLockWait);
+        assert_eq!(authority.get(table, fd::Fd(0)), Err(fd::Error::BadFd));
+        assert_eq!(authority.get(table, fd::Fd(1)), Err(fd::Error::BadFd));
+        assert!(
+            owner.rings.lock().allocated.len() <= before + 1,
+            "bounded first-write stock must remain reusable"
+        );
+    }
 
     #[test]
     fn serial_host_el1_ipc_host_subscription_lifetime_is_exact() {

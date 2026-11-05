@@ -4,6 +4,138 @@ use super::*;
 use std::sync::{Mutex, OnceLock};
 use std::{boxed::Box, vec, vec::Vec};
 
+#[test]
+fn prepared_pair_second_admission_refusal_releases_wrapped_and_raw_backings() {
+    let c = authority::<1, 1>();
+    let mut pair = prepared::PreparedDescriptions::new([description(10), description(11)]);
+    assert_eq!(pair.admit(&c), Err(Error::NeedsOfds));
+    // Neither refusal nor a retry allocates a second description for the
+    // already prepared reader. The raw writer still belongs to this owner.
+    assert_eq!(pair.admit(&c), Err(Error::NeedsOfds));
+    let foreign = authority::<1, 1>();
+    assert_eq!(pair.release_next(&foreign), Err(Error::StalePin));
+    assert_eq!(pair.release_next(&c), Ok(Some(description(10))));
+    assert_eq!(pair.release_next(&c), Ok(Some(description(11))));
+    assert_eq!(pair.release_next(&c), Ok(None));
+    let pin = c.create_pinned(description(12)).unwrap();
+    assert_eq!(c.unpin(pin), Ok(Some(description(12))));
+}
+
+#[test]
+fn prepared_pair_refused_publication_and_growth_preserve_exact_custody() {
+    let c = authority::<2, 2>();
+    let parent = c.create_table(4, &mut storage(1)).unwrap();
+    let peer = c.create_table(1, &mut storage(1)).unwrap();
+    let mut pair = prepared::PreparedDescriptions::new([description(20), description(21)]);
+    pair.admit(&c).unwrap();
+    assert_eq!(
+        pair.install_pair(&c, peer, Fd(0), true),
+        Err(Error::TooManyFiles)
+    );
+    assert_eq!(c.get(peer, Fd(0)), Err(Error::BadFd));
+    assert_eq!(
+        pair.install_pair(&c, parent, Fd(0), true),
+        Err(Error::NeedsBacking { descriptors: 2 })
+    );
+    assert_eq!(c.get(parent, Fd(0)), Err(Error::BadFd));
+    c.grow_table(parent, &mut storage(4)).unwrap();
+    assert_eq!(
+        pair.install_pair(&c, parent, Fd(0), true),
+        Ok([Fd(0), Fd(1)])
+    );
+    assert_eq!(
+        pair.release_next(&c),
+        Ok(None),
+        "slots now own both descriptions"
+    );
+    assert_eq!(c.getfd(parent, Fd(0)), Ok(true));
+    assert_eq!(c.getfd(parent, Fd(1)), Ok(true));
+    assert_eq!(c.close(parent, Fd(0)), Ok(Some(description(20))));
+    assert_eq!(c.close(parent, Fd(1)), Ok(Some(description(21))));
+    c.destroy_table(parent, |_| {}).unwrap();
+    c.destroy_table(peer, |_| {}).unwrap();
+}
+
+#[test]
+fn prepared_pair_contended_publication_retains_retry_and_cancellation_custody() {
+    let (core, arena) = core_with::<2>(2);
+    let host = core.bind(arena, Spin);
+    let bounded = core.bind(arena, BoundedSpin(1));
+    let creator = host.create_table(4, &mut storage(4)).unwrap();
+    let peer = host.create_table(4, &mut storage(4)).unwrap();
+    for cancel in [true, false] {
+        let mut pair = prepared::PreparedDescriptions::new([description(60), description(61)]);
+        pair.admit(&bounded).unwrap();
+        core.tables[0].lock.store(1, Ordering::Release);
+        assert_eq!(
+            pair.install_pair(&bounded, creator, Fd(0), true),
+            Err(Error::Contended)
+        );
+        assert_eq!(host.get(creator, Fd(0)), Err(Error::BadFd));
+        assert_eq!(host.get(peer, Fd(0)), Err(Error::BadFd));
+        core.tables[0].lock.store(0, Ordering::Release);
+        if cancel {
+            assert_eq!(pair.release_next(&bounded), Ok(Some(description(60))));
+            assert_eq!(pair.release_next(&bounded), Ok(Some(description(61))));
+        } else {
+            assert_eq!(
+                pair.install_pair(&bounded, creator, Fd(0), true),
+                Ok([Fd(0), Fd(1)])
+            );
+        }
+        assert_eq!(pair.release_next(&bounded), Ok(None));
+        if !cancel {
+            assert_eq!(host.close(creator, Fd(0)), Ok(Some(description(60))));
+            assert_eq!(host.close(creator, Fd(1)), Ok(Some(description(61))));
+        }
+    }
+    host.destroy_table(creator, |_| {}).unwrap();
+    host.destroy_table(peer, |_| {}).unwrap();
+}
+
+#[test]
+fn prepared_pair_success_cannot_publish_again_after_creator_resumes() {
+    let c = authority::<2, 2>();
+    let creator = c.create_table(8, &mut storage(8)).unwrap();
+    let peer = c.create_table(8, &mut storage(8)).unwrap();
+    let mut pair = prepared::PreparedDescriptions::new([description(50), description(51)]);
+    pair.admit(&c).unwrap();
+    assert_eq!(
+        pair.install_pair(&c, creator, Fd(0), false),
+        Ok([Fd(0), Fd(1)])
+    );
+    assert_eq!(
+        pair.install_pair(&c, creator, Fd(0), false),
+        Err(Error::StalePin)
+    );
+    assert_eq!(
+        pair.install_pair(&c, peer, Fd(0), false),
+        Err(Error::StalePin)
+    );
+    assert_eq!(c.get(creator, Fd(2)), Err(Error::BadFd));
+    assert_eq!(c.get(peer, Fd(0)), Err(Error::BadFd));
+    assert_eq!(pair.release_next(&c), Ok(None));
+    assert_eq!(c.close(creator, Fd(0)), Ok(Some(description(50))));
+    assert_eq!(c.close(creator, Fd(1)), Ok(Some(description(51))));
+    c.destroy_table(creator, |_| {}).unwrap();
+    c.destroy_table(peer, |_| {}).unwrap();
+}
+
+#[test]
+fn prepared_pair_admission_resumes_after_description_growth() {
+    let core = Core::<1>::new().unwrap();
+    let arena = TestArena::with_ofds(2);
+    let c = core.bind(arena, Spin);
+    c.publish_ofds(1).unwrap();
+    let mut pair = prepared::PreparedDescriptions::new([description(30), description(31)]);
+    assert_eq!(pair.admit(&c), Err(Error::NeedsOfds));
+    c.publish_ofds(1).unwrap();
+    pair.admit(&c).unwrap();
+    assert_eq!(pair.release_next(&c), Ok(Some(description(30))));
+    assert_eq!(pair.release_next(&c), Ok(Some(description(31))));
+    assert_eq!(pair.release_next(&c), Ok(None));
+}
+
 // Reservation custody stays in one authority, including across backing growth.
 #[test]
 fn owned_reservations_two_live_tables_keep_targets_and_fork_private() {
