@@ -6,7 +6,7 @@ use super::*;
 use crate::dispatch::LinearMemory;
 use carrick_el1_abi::ipc::fd::{AccessMode, Description, Fd, StatusFlags, TableId};
 use carrick_el1_abi::ipc::{
-    End, Extent, IPC_POOL_ALIGN, IpcBacking, IpcDirectory, IpcPipeStorage, IpcTaskKey, IpcUserVa,
+    End, IPC_POOL_ALIGN, IpcBacking, IpcDirectory, IpcPipeStorage, IpcTaskKey, IpcUserVa,
     WriteProgress,
 };
 use carrick_guest_mem::GuestMemory;
@@ -254,10 +254,7 @@ fn world() -> World {
         next: Cell::new(0),
         table: TableId::from_raw(Default::default()),
     };
-    let mut extent = Extent {
-        token: carrick_el1_abi::ipc::ipc_descriptor_area(pool_len as u64).start,
-        capacity: 64,
-    };
+    let mut extent = region.provision_descriptors(64, &HostIpcWait).unwrap();
     let table = region
         .fd(HostIpcWait)
         .create_table(1024, &mut extent)
@@ -643,10 +640,43 @@ fn el1_ipc_sigpipe_after_partial_write_completes_exactly_once() {
 
 #[test]
 fn el1_ipc_continue_resumes_a_write_without_replay() {
+    continue_pipe_write(false);
+}
+
+#[test]
+fn el1_ipc_vector_handback_prefetch_preserves_imported_order_and_reclaims_storage() {
+    continue_pipe_write(true);
+}
+
+fn continue_pipe_write(vectored: bool) {
     let w = world();
     let (r, wfd, object) = w.pipe();
     let source: Vec<u8> = (0..70_000u32).map(|n| (n % 251) as u8).collect();
-    let token = w.operation(wfd, IpcOpKind::PipeWrite, source.len() as u64, 64);
+    let baseline_storage = w.region.descriptor_allocations();
+    let token = w.operation(
+        wfd,
+        IpcOpKind::PipeWrite,
+        source.len() as u64,
+        if vectored { 66 } else { 64 },
+    );
+    if vectored {
+        let headers = [
+            (BUF, 1001),
+            (0, 0),
+            (BUF + 1001, source.len() as u64 - 1001),
+        ];
+        assert_eq!(
+            w.region
+                .import_vectors(&token, headers.len(), |index, header| {
+                    header[..8].copy_from_slice(&headers[index].0.to_ne_bytes());
+                    header[8..].copy_from_slice(&headers[index].1.to_ne_bytes());
+                    true
+                })
+                .unwrap(),
+            source.len() as u64
+        );
+        assert_eq!(w.region.descriptor_allocations(), baseline_storage + 1);
+    }
     // EL1 wrote the first 1000 bytes, then handed the continuation back.
     {
         let mut g = w.region.lock(object, &HostIpcWait).unwrap();
@@ -667,7 +697,14 @@ fn el1_ipc_continue_resumes_a_write_without_replay() {
     else {
         panic!("a full pipe blocks: {outcome:?}");
     };
-    assert_eq!((lane, x0, nr), (WaitFor::Writable, wfd.0 as u64, 64));
+    assert_eq!(
+        (lane, x0, nr),
+        (
+            WaitFor::Writable,
+            wfd.0 as u64,
+            if vectored { 66 } else { 64 }
+        )
+    );
     let progress = w.region.operation(&token).unwrap().progress.written;
     assert_eq!(
         w.unread(object) as u64,
@@ -697,6 +734,7 @@ fn el1_ipc_continue_resumes_a_write_without_replay() {
     };
     out.extend_from_slice(&rest[..n]);
     assert_eq!(out, source, "every byte once, in order");
+    assert_eq!(w.region.descriptor_allocations(), baseline_storage);
     assert_eq!(w.holds(wfd), 1);
     let _ = r;
 }
