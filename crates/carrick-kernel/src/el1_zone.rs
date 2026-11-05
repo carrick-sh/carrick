@@ -538,6 +538,59 @@ pub fn wake_exit_wait_channel(
     Some(woken.count)
 }
 
+/// Publish one actual physical producer's release through the exact carrier
+/// owner's notification source. This uses the existing static zone mapping
+/// contract; it does not extend that mapping's lifetime.
+pub fn publish_owner_physical_release(
+    handle: carrick_el1_abi::El1MmHandle,
+    complete: impl Fn(
+        &ZoneTables,
+        carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_el1_abi::Aarch64ParkedContext,
+        >,
+    ),
+) -> bool {
+    use carrick_sched_core::spaces::notification::SpaceWaitCause;
+    let Some(zone) = zone() else {
+        return false;
+    };
+    // The existing runtime zone venue owns this carrier mapping. Match
+    // its adjacent portal identity too: numeric MM/incarnation values
+    // alone must never let an old carrier wake its successor.
+    let region = carrick_el1_abi::get_el1_region_host_ptr();
+    if region == 0
+        || region.checked_add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+            != Some(zone as *const _ as usize)
+    {
+        return false;
+    }
+    let Some(portal) = region.checked_add(carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize) else {
+        return false;
+    };
+    // SAFETY: zone() returned the initialized retained ABI mapping; the
+    // fixed adjacent portal shares that mapping's runtime lifetime.
+    let portal = unsafe { &*(portal as *const carrick_el1_abi::MmPortalSlots) };
+    if portal.carrier() != Some(handle.carrier()) {
+        return false;
+    }
+    let Some(mm) = std::num::NonZeroU64::new(handle.mm().raw()) else {
+        return false;
+    };
+    let Some(entry) = zone.space_entry(mm) else {
+        return false;
+    };
+    let Ok(source) = entry.notifications(handle.incarnation()) else {
+        return false;
+    };
+    source
+        .reserve(SpaceWaitCause::PendingEdit)
+        .publish(carrick_sched_core::Waker::Host, &|effects| {
+            complete(zone, effects)
+        });
+    true
+}
+
 /// Host `FUTEX_WAKE(_BITSET)` on a zone process: wake up to `count` waiters
 /// of `(mm, uaddr)` matching `bitset`. Guest futexes reach it only through
 /// [`ZoneFutexQueue::wake`].

@@ -566,6 +566,12 @@ unsafe impl Sync for PersistentCarrierMappings {}
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl Drop for PersistentCarrierMappings {
     fn drop(&mut self) {
+        // Enrollment removal alone does not join a callback snapshot already
+        // taken by its physical producer. Join before inspecting or freeing
+        // any byte of the carrier ABI, including live-map teardown.
+        self.custody
+            .native_root_waits
+            .clear_all_before_mapping_release();
         if let Some(el1) = self
             .mappings
             .iter()
