@@ -1117,6 +1117,7 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// syscall still owns its single terminal return; redispatch uses only
     /// the remaining destination/count (and positioned source offset).
     pub(super) owner_read_progress: u64,
+    pub(super) owner_retry_observation: Option<carrick_el1_abi::PortalOwnerWait>,
     pub(super) continuation_restart: Option<carrick_kernel::kernel::continuation::RestartDecision>,
     pub(super) native_restart_eligible: Option<bool>,
     /// Consecutive identical (FAR, ESR) COW faults "successfully" resolved.
@@ -1230,6 +1231,7 @@ where
             committed_exec_context_for_test: None,
             syscall_completion: SyscallCompletionOwnership::Idle,
             owner_read_progress: 0,
+            owner_retry_observation: None,
             continuation_restart: None,
             native_restart_eligible: None,
             cow_refault_watch: None,
@@ -4825,6 +4827,53 @@ pub(crate) mod tests {
         completion_copyout: bool,
         schedule: (Option<bool>, Option<bool>),
     ) {
+        exercise_owner_wait_completion_enrollment(
+            nr,
+            signum,
+            native,
+            release_wins,
+            physical,
+            completion_copyout,
+            (schedule, None),
+        );
+    }
+
+    #[test]
+    fn serial_host_owner_memory_changed_is_iterative_and_same_revision_parks() {
+        exercise_owner_wait_completion_enrollment(
+            carrick_abi::syscall::nr::FSTAT,
+            None,
+            false,
+            false,
+            false,
+            false,
+            ((None, None), Some(false)),
+        );
+    }
+
+    #[test]
+    fn serial_host_owner_memory_stale_is_typed_failure() {
+        exercise_owner_wait_completion_enrollment(
+            carrick_abi::syscall::nr::FSTAT,
+            None,
+            false,
+            false,
+            false,
+            false,
+            ((None, None), Some(true)),
+        );
+    }
+
+    fn exercise_owner_wait_completion_enrollment(
+        nr: carrick_abi::CanonicalNr,
+        signum: Option<i32>,
+        native: bool,
+        release_wins: bool,
+        physical: bool,
+        completion_copyout: bool,
+        schedule: ((Option<bool>, Option<bool>), Option<bool>),
+    ) {
+        let (schedule, enrollment_schedule) = schedule;
         let (saved_output_schedule, fault_wait) = schedule;
         let retire_receipt = fault_wait == Some(true);
         let fault_wait = fault_wait.is_some();
@@ -5259,21 +5308,24 @@ pub(crate) mod tests {
                             .unwrap();
                         entered_tx.send(()).unwrap();
                         release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                        let editor = if release_wins {
+                        let mut editor = editor;
+                        let renewals = if enrollment_schedule == Some(false) {
+                            1024
+                        } else {
+                            usize::from(release_wins)
+                        };
+                        for generation in 0..renewals {
                             drop(editor);
-                            let editor = access
+                            editor = access
                                 .try_begin_edit(
                                     zone.spaces.find(sibling.shared().mm().id().raw()).unwrap(),
                                     mm.raw(),
-                                    NonZeroU64::new(3).unwrap(),
+                                    NonZeroU64::new(3 + generation as u64).unwrap(),
                                 )
                                 .unwrap();
                             entered_tx.send(()).unwrap();
                             release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                            editor
-                        } else {
-                            editor
-                        };
+                        }
                         if std::env::var_os("CARRICK_TEST_FORGET_OWNER_EDITOR").is_some() {
                             std::mem::forget(editor);
                         } else {
@@ -5610,6 +5662,79 @@ pub(crate) mod tests {
                         carrick_kernel::kernel::continuation::CarrierWaitService::new(Arc::clone(
                             &scheduler,
                         ));
+                    if let Some(stale) = enrollment_schedule {
+                        if stale {
+                            // An unbound carrier cannot authenticate this live MM.
+                            // SAFETY: deliberately malformed wire receipt, used only
+                            // to verify that production authentication fails closed.
+                            let bad = unsafe {
+                                carrick_el1_abi::PortalOwnerWait::from_owner(
+                                    carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                                        NonZeroU64::new(999).unwrap(),
+                                        handle.mm(),
+                                        handle.incarnation(),
+                                    ),
+                                    wait.cause(),
+                                    wait.revision(),
+                                )
+                            };
+                            let result = job.park_owner_memory_action(
+                                &mut engine,
+                                &mut control,
+                                zone::OwnerMemoryAction::Syscall { frame, resume },
+                                bad,
+                            );
+                            assert!(matches!(result,
+                                Err(exec::ProductionHvpatchPollError::Runtime(
+                                    RuntimeError::StaleOwnerMemoryWait(receipt))) if receipt == bad));
+                        } else {
+                            for _ in 0..1024 {
+                                release_tx.send(()).unwrap();
+                                entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                                // The resource has been acquired again, but this
+                                // refusal still carries its pre-release revision.
+                                assert!(
+                                    portal.observe_wait(handle, wait.cause()).unwrap().is_some()
+                                );
+                                let result = job
+                                    .park_owner_memory_action(
+                                        &mut engine,
+                                        &mut control,
+                                        zone::OwnerMemoryAction::Syscall {
+                                            frame,
+                                            resume: binding::OwnedSyscallResume::CopyoutRedispatch,
+                                        },
+                                        wait,
+                                    )
+                                    .unwrap();
+                                assert!(matches!(result, executor::ExecutorExit::Syscall));
+                                assert!(matches!(
+                                    job.phase,
+                                    HvpatchProductionPhase::RetryOwnerReady { .. }
+                                ));
+                                assert!(engine.completed_syscalls.is_empty());
+                            }
+                            let parked = job
+                                .park_owner_memory_action(
+                                    &mut engine,
+                                    &mut control,
+                                    zone::OwnerMemoryAction::Syscall { frame, resume },
+                                    wait,
+                                )
+                                .unwrap();
+                            let executor::ExecutorExit::BlockedContinuation {
+                                continuation, ..
+                            } = parked
+                            else {
+                                panic!("same producer revision must park");
+                            };
+                            drop(continuation);
+                        }
+                        release_tx.send(()).unwrap();
+                        peer.take().unwrap().join().unwrap();
+                        return;
+                    }
+
                     if physical {
                         let first = match resume {
                             binding::OwnedSyscallResume::Ipc(pending) => {

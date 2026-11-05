@@ -26,6 +26,8 @@ pub enum TerminalReason {
 /// the HVF loops and the KVM single-threaded loop.
 #[derive(Debug, ::thiserror::Error)]
 pub enum RuntimeError {
+    #[error("owner memory wait names a stale producer: {0:?}")]
+    StaleOwnerMemoryWait(carrick_el1_abi::PortalOwnerWait),
     #[error("an independent carrier is already active in this host process")]
     CarrierAlreadyActive,
     #[error(

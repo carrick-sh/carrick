@@ -167,3 +167,24 @@ These bindings exercise the production dispatcher and completion fold. They
 do not establish signed scheduler/VMM or Docker differential acceptance.
 Those gates remain director-owned. Immediate ppoll publication and the other
 operation families still listed on #986 remain outside this slice.
+
+## Enrollment release races (#1337)
+
+Owner enrollment distinguishes a producer release (`Changed`) from an invalid
+owner incarnation (`Stale`). A release schedules one retry through the existing
+executor loop, retaining the syscall completion and sampling the exact producer
+before probing again. A refusal without a newer producer revision enrolls at
+that sample and parks; it cannot recursively redispatch the syscall. Successful
+memory supply also returns to the execution loop before redispatch. Stale
+syscall and retained-action receipts return `StaleOwnerMemoryWait`; retirement
+of a fault's receipt retains its existing group-exit cancellation behavior.
+
+The VM-free production-park bindings use a live shared-MM sibling editor and
+1024 release/reacquire cycles, then require parking without another release.
+The stale binding rejects a foreign-carrier receipt with the typed failure.
+These are enrollment-policy witnesses, not a reproduction of grep or an
+instruction-executing native-process fixture. The preserved dispatcher witness
+`proc_self_status_fits_executor_stack` checks Uid, Gid and all five capability
+lines on a 2 MiB host stack. It passes before this correction too. The signed
+Mac command and attribution of its reservation-root holder remain higher-layer
+obligations; the policy witnesses alone do not certify that command.

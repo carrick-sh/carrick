@@ -822,6 +822,20 @@ where
             lifecycle_page: 0,
             control_slot: 0,
         };
+        // A Changed enrollment sampled this exact source before the retry's
+        // resource probe. Reusing the old refusal receipt must not manufacture
+        // another ready edge: enroll at that observation when no newer receipt
+        // was produced. This closes the release/probe/enroll race without polling.
+        let wait = match self.state.owner_retry_observation.take() {
+            Some(observed)
+                if observed.handle() == wait.handle()
+                    && observed.cause() == wait.cause()
+                    && observed.revision() > wait.revision() =>
+            {
+                observed
+            }
+            _ => wait,
+        };
         let enrollment = match slots.authenticate_wait(zone, wait) {
             Ok(enrollment) => enrollment,
             Err(ObjectWaitError::Stale) if matches!(action, OwnerMemoryAction::Fault) => {
@@ -830,6 +844,9 @@ where
                     control,
                     Some(carrick_kernel::kernel::continuation::OwnerWaitCancellation::GroupExit),
                 );
+            }
+            Err(ObjectWaitError::Stale) => {
+                return Err(RuntimeError::StaleOwnerMemoryWait(wait).into());
             }
             Err(error) => {
                 return Err(RuntimeError::Configuration(format!(
@@ -854,6 +871,7 @@ where
         >| {
             carrick_sched_core::LockWait::complete_object_wake(&HostLockWait, zone, effects)
         };
+        let cause = enrollment.cause();
         match enrollment.park_host(record, token, &complete) {
             Ok(()) => {
                 zone.counters
@@ -941,23 +959,58 @@ where
                     }
                 }
             }
-            Err((error @ (ObjectWaitError::Changed | ObjectWaitError::Stale), _token)) => {
+            Err((ObjectWaitError::Changed, _token)) => {
                 zone.free_record(record);
+                // Observe before the next resource probe. The execution loop
+                // owns the retry, so repeated release races never nest dispatch
+                // frames. A repeated refusal at this revision enrolls and parks.
+                let source = std::num::NonZeroU64::new(wait.handle().mm().raw())
+                    .and_then(|mm| zone.space_entry(mm))
+                    .and_then(|entry| entry.notifications(wait.handle().incarnation()).ok());
+                let Some(source) = source else {
+                    if matches!(action, OwnerMemoryAction::Fault) {
+                        return self.resume_fault_owner_ready(engine, control, Some(
+                            carrick_kernel::kernel::continuation::OwnerWaitCancellation::GroupExit,
+                        ));
+                    }
+                    return Err(RuntimeError::StaleOwnerMemoryWait(wait).into());
+                };
+                let revision = source.observe(cause).revision();
+                // SAFETY: authenticate_wait joined this exact owner and source;
+                // no resource probe has run since this observation.
+                self.state.owner_retry_observation = Some(unsafe {
+                    carrick_el1_abi::PortalOwnerWait::from_owner(
+                        wait.handle(),
+                        wait.cause(),
+                        revision,
+                    )
+                });
                 match action {
                     OwnerMemoryAction::Syscall { frame, resume } => {
-                        self.resume_owner_ready(engine, control, frame, resume)
+                        self.phase = HvpatchProductionPhase::RetryOwnerReady { frame, resume };
+                        Ok(executor::ExecutorExit::Syscall)
                     }
                     OwnerMemoryAction::Retained => {
-                        let action = self.take_retained_memory_action()?;
-                        self.drive_retained_memory(engine, control, action)
+                        // The retained action already lives in RetainedMemoryRetry.
+                        Ok(executor::ExecutorExit::Syscall)
                     }
-                    OwnerMemoryAction::Fault => self.resume_fault_owner_ready(
+                    OwnerMemoryAction::Fault => {
+                        self.resume_fault_owner_ready(engine, control, None)
+                    }
+                }
+            }
+            Err((ObjectWaitError::Stale, _token)) => {
+                zone.free_record(record);
+                if matches!(action, OwnerMemoryAction::Fault) {
+                    self.resume_fault_owner_ready(
                         engine,
                         control,
-                        matches!(error, ObjectWaitError::Stale).then_some(
+                        Some(
                             carrick_kernel::kernel::continuation::OwnerWaitCancellation::GroupExit,
                         ),
-                    ),
+                    )
+                } else {
+                    Err(RuntimeError::StaleOwnerMemoryWait(wait).into())
                 }
             }
             Err((error, _token)) => {

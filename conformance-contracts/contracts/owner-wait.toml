@@ -20,6 +20,7 @@ rationale = "Owner waits are killable-only: handled signals and stops never comp
 
 [bindings]
 vm_free = [
+  "carrick-runtime::vcpu_loop::tests::{serial_host_owner_memory_changed_is_iterative_and_same_revision_parks,serial_host_owner_memory_stale_is_typed_failure}",
   "carrick-sched-core::refusal::queue_witnesses",
   "carrick-core-abi::wait::ticket_tests",
   "carrick-kernel::kernel::continuation::output::tests::fd_wait_initial_publication_authenticates_before_preparing",

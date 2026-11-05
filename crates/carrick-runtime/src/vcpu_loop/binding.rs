@@ -341,6 +341,10 @@ pub(super) enum HvpatchProductionPhase {
         resume: OwnedSyscallResume,
         origin: carrick_hal::threaded::NativeOwnerWaitOrigin,
     },
+    RetryOwnerReady {
+        frame: carrick_hal::RawSyscall,
+        resume: OwnedSyscallResume,
+    },
     ResumeFaultOwner {
         wait: carrick_el1_abi::PortalOwnerWait,
     },
@@ -530,6 +534,7 @@ impl HvpatchProductionPhase {
             Self::RetainedMemoryRetry { .. } => 21,
             Self::ResumeFaultPhysical { .. } => 22,
             Self::ResumeFaultOwner { .. } => 23,
+            Self::RetryOwnerReady { .. } => 24,
         }
     }
 }
@@ -1670,8 +1675,10 @@ where
                     };
                     return self.wait_for_owned_memory_action(engine, control, wait);
                 }
-                let action = self.take_retained_memory_action()?;
-                self.drive_retained_memory(engine, control, action)
+                // RetainedMemoryRetry already owns the action. Successful
+                // supply must unwind before another preparation, just like a
+                // raced owner release; a long sequence cannot nest frames.
+                Ok(executor::ExecutorExit::Syscall)
             }
             MemoryPrepareError::Physical(wait) => {
                 let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
@@ -3554,12 +3561,11 @@ where
                 };
                 return self.service_outcome(engine, control, frame, outcome, resume);
             }
-            return self.resume_owner_ready(
-                engine,
-                control,
+            self.phase = HvpatchProductionPhase::RetryOwnerReady {
                 frame,
-                resume.unwrap_or(OwnedSyscallResume::CopyoutRedispatch),
-            );
+                resume: resume.unwrap_or(OwnedSyscallResume::CopyoutRedispatch),
+            };
+            return Ok(executor::ExecutorExit::Syscall);
         }
         if let DispatchOutcome::OwnerMemoryWait { wait, committed } = outcome {
             self.state.owner_read_progress = self
@@ -4784,6 +4790,9 @@ where
             let phase = std::mem::replace(&mut self.phase, HvpatchProductionPhase::Resident);
             match phase {
                 HvpatchProductionPhase::ResumeZone => return self.resume_zone(engine, control),
+                HvpatchProductionPhase::RetryOwnerReady { frame, resume } => {
+                    return self.resume_owner_ready(engine, control, frame, resume);
+                }
                 HvpatchProductionPhase::ResumeOwnerZone {
                     frame,
                     resume,
