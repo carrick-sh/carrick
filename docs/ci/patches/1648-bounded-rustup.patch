@@ -1,0 +1,301 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index f347f26..4bedd32 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -1081,8 +1081,29 @@ jobs:
+         env:
+           CI_EVENT: ${{ github.event_name }}
+         run: just ci-probe-coverage-base
+-      - name: Install repository Rust toolchain
+-        run: just ci-toolchain
++      - name: Install repository Rust toolchain (infrastructure)
++        shell: bash
++        run: |
++          set -euo pipefail
++          install_toolchain() {
++            rustup show active-toolchain
++          }
++          export -f install_toolchain
++          if ! python3 - <<'PYTHON'
++          import os, signal, subprocess, sys
++          child = subprocess.Popen(["bash", "-c", "install_toolchain"], start_new_session=True)
++          try:
++              sys.exit(child.wait(timeout=600))
++          except subprocess.TimeoutExpired:
++              os.killpg(child.pid, signal.SIGKILL)
++              child.wait()
++              sys.exit(75)
++          PYTHON
++          then
++            echo '::error title=Infrastructure::Rust toolchain installation failed; tests did not run'
++            exit 75
++          fi
++          echo 'RUSTUP_AUTO_INSTALL=0' >> "$GITHUB_ENV"
+       - name: Configure persisted compiler cache
+         id: compiler-cache
+         env:
+@@ -1149,8 +1170,29 @@ jobs:
+         env:
+           CI_EVENT: ${{ github.event_name }}
+         run: just ci-probe-coverage-base
+-      - name: Install repository Rust toolchain
+-        run: just ci-toolchain
++      - name: Install repository Rust toolchain (infrastructure)
++        shell: bash
++        run: |
++          set -euo pipefail
++          install_toolchain() {
++            rustup show active-toolchain
++          }
++          export -f install_toolchain
++          if ! python3 - <<'PYTHON'
++          import os, signal, subprocess, sys
++          child = subprocess.Popen(["bash", "-c", "install_toolchain"], start_new_session=True)
++          try:
++              sys.exit(child.wait(timeout=600))
++          except subprocess.TimeoutExpired:
++              os.killpg(child.pid, signal.SIGKILL)
++              child.wait()
++              sys.exit(75)
++          PYTHON
++          then
++            echo '::error title=Infrastructure::Rust toolchain installation failed; tests did not run'
++            exit 75
++          fi
++          echo 'RUSTUP_AUTO_INSTALL=0' >> "$GITHUB_ENV"
+       - name: Configure persisted compiler cache
+         id: compiler-cache
+         env:
+@@ -1210,8 +1252,29 @@ jobs:
+       - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+         with:
+           tool: just
+-      - name: Install repository Rust toolchain
+-        run: just ci-toolchain
++      - name: Install repository Rust toolchain (infrastructure)
++        shell: bash
++        run: |
++          set -euo pipefail
++          install_toolchain() {
++            rustup show active-toolchain
++          }
++          export -f install_toolchain
++          if ! python3 - <<'PYTHON'
++          import os, signal, subprocess, sys
++          child = subprocess.Popen(["bash", "-c", "install_toolchain"], start_new_session=True)
++          try:
++              sys.exit(child.wait(timeout=600))
++          except subprocess.TimeoutExpired:
++              os.killpg(child.pid, signal.SIGKILL)
++              child.wait()
++              sys.exit(75)
++          PYTHON
++          then
++            echo '::error title=Infrastructure::Rust toolchain installation failed; tests did not run'
++            exit 75
++          fi
++          echo 'RUSTUP_AUTO_INSTALL=0' >> "$GITHUB_ENV"
+       - name: Configure persisted compiler cache
+         id: compiler-cache
+         env:
+@@ -1276,8 +1339,29 @@ jobs:
+       - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+         with:
+           tool: just
+-      - name: Install repository Rust toolchain
+-        run: just ci-toolchain
++      - name: Install repository Rust toolchain (infrastructure)
++        shell: bash
++        run: |
++          set -euo pipefail
++          install_toolchain() {
++            rustup show active-toolchain
++          }
++          export -f install_toolchain
++          if ! python3 - <<'PYTHON'
++          import os, signal, subprocess, sys
++          child = subprocess.Popen(["bash", "-c", "install_toolchain"], start_new_session=True)
++          try:
++              sys.exit(child.wait(timeout=600))
++          except subprocess.TimeoutExpired:
++              os.killpg(child.pid, signal.SIGKILL)
++              child.wait()
++              sys.exit(75)
++          PYTHON
++          then
++            echo '::error title=Infrastructure::Rust toolchain installation failed; tests did not run'
++            exit 75
++          fi
++          echo 'RUSTUP_AUTO_INSTALL=0' >> "$GITHUB_ENV"
+       - name: Configure persisted compiler cache
+         id: compiler-cache
+         env:
+@@ -1337,8 +1421,29 @@ jobs:
+       - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+         with:
+           tool: just
+-      - name: Install repository Rust toolchain
+-        run: just ci-toolchain
++      - name: Install repository Rust toolchain (infrastructure)
++        shell: bash
++        run: |
++          set -euo pipefail
++          install_toolchain() {
++            rustup show active-toolchain
++          }
++          export -f install_toolchain
++          if ! python3 - <<'PYTHON'
++          import os, signal, subprocess, sys
++          child = subprocess.Popen(["bash", "-c", "install_toolchain"], start_new_session=True)
++          try:
++              sys.exit(child.wait(timeout=600))
++          except subprocess.TimeoutExpired:
++              os.killpg(child.pid, signal.SIGKILL)
++              child.wait()
++              sys.exit(75)
++          PYTHON
++          then
++            echo '::error title=Infrastructure::Rust toolchain installation failed; tests did not run'
++            exit 75
++          fi
++          echo 'RUSTUP_AUTO_INSTALL=0' >> "$GITHUB_ENV"
+       - name: Configure persisted compiler cache
+         id: compiler-cache
+         env:
+@@ -1398,8 +1503,29 @@ jobs:
+       - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+         with:
+           tool: just
+-      - name: Install repository Rust toolchain
+-        run: just ci-toolchain
++      - name: Install repository Rust toolchain (infrastructure)
++        shell: bash
++        run: |
++          set -euo pipefail
++          install_toolchain() {
++            rustup show active-toolchain
++          }
++          export -f install_toolchain
++          if ! python3 - <<'PYTHON'
++          import os, signal, subprocess, sys
++          child = subprocess.Popen(["bash", "-c", "install_toolchain"], start_new_session=True)
++          try:
++              sys.exit(child.wait(timeout=600))
++          except subprocess.TimeoutExpired:
++              os.killpg(child.pid, signal.SIGKILL)
++              child.wait()
++              sys.exit(75)
++          PYTHON
++          then
++            echo '::error title=Infrastructure::Rust toolchain installation failed; tests did not run'
++            exit 75
++          fi
++          echo 'RUSTUP_AUTO_INSTALL=0' >> "$GITHUB_ENV"
+       - name: Configure persisted compiler cache
+         id: compiler-cache
+         env:
+diff --git a/.github/workflows/kernel-runtime.yml b/.github/workflows/kernel-runtime.yml
+index 98f17c8..fd552c5 100644
+--- a/.github/workflows/kernel-runtime.yml
++++ b/.github/workflows/kernel-runtime.yml
+@@ -155,12 +155,32 @@ jobs:
+       # cloudmac provides a root-owned, read-only rustup toolchain (pinned by
+       # rust-toolchain.toml, with sccache) and a runner-private CARGO_HOME;
+       # jobs never install or update toolchains there (docs/ci/mac-hvf-runner.md).
+-      - name: Verify the read-only toolchain
++      - name: Verify the read-only toolchain (infrastructure)
++        shell: bash
+         run: |
++          set -euo pipefail
+           test -n "$RUSTUP_HOME"
+           test ! -w "$RUSTUP_HOME"
+-          rustup show active-toolchain
+           command -v sccache
++          verify_toolchain() {
++            rustup show active-toolchain
++          }
++          export -f verify_toolchain
++          if ! python3 - <<'PYTHON'
++          import os, signal, subprocess, sys
++          child = subprocess.Popen(["bash", "-c", "verify_toolchain"], start_new_session=True)
++          try:
++              sys.exit(child.wait(timeout=600))
++          except subprocess.TimeoutExpired:
++              os.killpg(child.pid, signal.SIGKILL)
++              child.wait()
++              sys.exit(75)
++          PYTHON
++          then
++            echo '::error title=Infrastructure::Rust toolchain verification failed; tests did not run'
++            exit 75
++          fi
++          echo 'RUSTUP_AUTO_INSTALL=0' >> "$GITHUB_ENV"
+ 
+       - uses: Swatinem/rust-cache@v2
+         with:
+@@ -386,8 +406,29 @@ jobs:
+           command -v docker
+           docker version
+ 
+-      - name: Install Rust toolchain
+-        uses: dtolnay/rust-toolchain@stable
++      - name: Install repository Rust toolchain (infrastructure)
++        shell: bash
++        run: |
++          set -euo pipefail
++          install_toolchain() {
++            rustup show active-toolchain
++          }
++          export -f install_toolchain
++          if ! python3 - <<'PYTHON'
++          import os, signal, subprocess, sys
++          child = subprocess.Popen(["bash", "-c", "install_toolchain"], start_new_session=True)
++          try:
++              sys.exit(child.wait(timeout=600))
++          except subprocess.TimeoutExpired:
++              os.killpg(child.pid, signal.SIGKILL)
++              child.wait()
++              sys.exit(75)
++          PYTHON
++          then
++            echo '::error title=Infrastructure::Rust toolchain installation failed; tests did not run'
++            exit 75
++          fi
++          echo 'RUSTUP_AUTO_INSTALL=0' >> "$GITHUB_ENV"
+ 
+       - uses: Swatinem/rust-cache@v2
+ 
+diff --git a/.github/workflows/signed-gate.yml b/.github/workflows/signed-gate.yml
+index 88b8c12..637c143 100644
+--- a/.github/workflows/signed-gate.yml
++++ b/.github/workflows/signed-gate.yml
+@@ -120,6 +120,29 @@ jobs:
+         with:
+           ref: main
+           persist-credentials: false
++      - name: Install repository Rust toolchain (infrastructure)
++        shell: bash
++        run: |
++          set -euo pipefail
++          install_toolchain() {
++            rustup show active-toolchain
++          }
++          export -f install_toolchain
++          if ! python3 - <<'PYTHON'
++          import os, signal, subprocess, sys
++          child = subprocess.Popen(["bash", "-c", "install_toolchain"], start_new_session=True)
++          try:
++              sys.exit(child.wait(timeout=600))
++          except subprocess.TimeoutExpired:
++              os.killpg(child.pid, signal.SIGKILL)
++              child.wait()
++              sys.exit(75)
++          PYTHON
++          then
++            echo '::error title=Infrastructure::Rust toolchain installation failed; tests did not run'
++            exit 75
++          fi
++          echo 'RUSTUP_AUTO_INSTALL=0' >> "$GITHUB_ENV"
+       - uses: actions/download-artifact@v4
+         with:
+           name: signed-request-${{ github.run_attempt }}
