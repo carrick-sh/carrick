@@ -1121,10 +1121,14 @@ mod tests {
         use carrick_personality_linux::lifecycle::UserCopy;
         struct Predecessor<'a>(&'a carrick_el1_abi::ThreadControlSlot);
         impl UserCopy for Predecessor<'_> {
-            fn copy_in(&mut self, _: &mut [u8], _: UserVa) -> bool {
+            fn copy_in(
+                &mut self,
+                _: &mut [u8],
+                _: UserVa,
+            ) -> carrick_core::personality::CopyOutcome {
                 panic!("stale identity read user memory")
             }
-            fn copy_out(&mut self, _: UserVa, _: &[u8]) -> bool {
+            fn copy_out(&mut self, _: UserVa, _: &[u8]) -> carrick_core::personality::CopyOutcome {
                 panic!("stale identity wrote user memory")
             }
         }

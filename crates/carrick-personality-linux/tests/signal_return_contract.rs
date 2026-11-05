@@ -13,14 +13,40 @@ struct Native {
     arm_frame: Option<arm::RtSigframe>,
 }
 impl UserCopy for Native {
-    fn copy_in(&mut self, _: &mut [u8], _: UserVa) -> bool {
-        false
+    fn copy_in(&mut self, _: &mut [u8], _: UserVa) -> carrick_core::personality::CopyOutcome {
+        carrick_core::personality::CopyOutcome::from_completed(false)
     }
-    fn copy_out(&mut self, _: UserVa, _: &[u8]) -> bool {
-        false
+    fn copy_out(&mut self, _: UserVa, _: &[u8]) -> carrick_core::personality::CopyOutcome {
+        carrick_core::personality::CopyOutcome::from_completed(false)
     }
 }
 impl<'a> SignalNative<'a> for Native {
+    #[allow(clippy::panic)]
+    fn wait_guest_copy(
+        &mut self,
+        _: carrick_core::personality::GuestCopyRequest,
+    ) -> carrick_personality_linux::signal::SignalOutcome {
+        panic!("eager test venue cannot suspend guest memory")
+    }
+    #[allow(clippy::panic)]
+    fn finish_signal_output(
+        &mut self,
+        address: carrick_guest_arch::UserVa,
+        bytes: Vec<u8>,
+    ) -> carrick_personality_linux::signal::SignalOutcome {
+        let result = match self.copy_out(address, &bytes) {
+            carrick_core::personality::CopyOutcome::Done => 0,
+            carrick_core::personality::CopyOutcome::Fault => -14,
+            carrick_core::personality::CopyOutcome::NotYet(_) => {
+                panic!("eager test venue refused output")
+            }
+        };
+        carrick_personality_linux::signal::SignalOutcome::Returned {
+            result: carrick_personality_linux::abi::entry::SyscallResult::new(result),
+            work: false,
+        }
+    }
+
     fn arguments(&self) -> [u64; 6] {
         [0; 6]
     }

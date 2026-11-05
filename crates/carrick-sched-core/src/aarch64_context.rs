@@ -150,6 +150,9 @@ impl carrick_guest_arch::ProcessContext for Aarch64ParkedContext {
     fn syscall_return(&self) -> u64 {
         Aarch64ParkedContext::syscall_return(self)
     }
+    fn restart_syscall(&mut self) {
+        self.native.pc = self.native.pc.wrapping_sub(4);
+    }
 }
 
 impl carrick_guest_arch::ThreadContext for Aarch64ParkedContext {

@@ -605,6 +605,13 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     ) -> Result<(), NativeProcessError> {
         Err(NativeProcessError::Unsupported)
     }
+    fn prepare_owned_read(
+        &mut self,
+        _mm: &Self::Mm,
+        _request: carrick_core::personality::GuestCopyRequest,
+    ) -> Result<(), NativeProcessError> {
+        Err(NativeProcessError::Unsupported)
+    }
     fn copyout_fault(
         &self,
         _address: UserVa,
@@ -1934,6 +1941,14 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             .cloned()
             .ok_or(NativeProcessError::Stale)?;
         member.record = reference;
+        let service_rebind = if old_record != reference {
+            control
+                .service
+                .prepare_record_rebind(process, binding.thread_generation, old_record, reference)
+                .map_err(service::service_protocol_error)?
+        } else {
+            None
+        };
         // Every refusing check precedes publication under both owner guards.
         // An adopted receipt is the slot's birth identity: renewing the
         // execution binding leaves the receipt Closing owes unchanged.
@@ -1988,6 +2003,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             .remove(&Self::record_key(source.zone, old_record));
         state.members.insert(key, member);
         state.records.insert(record_key, key);
+        if let Some(rebind) = service_rebind {
+            rebind.commit();
+        }
         drop(graph);
         Ok(Some(runtime))
     }
@@ -5630,6 +5648,50 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     pub fn resume_checkpoint(
         &mut self,
     ) -> Result<NativeResume, carrick_core_abi::NativeRunFailureReason> {
+        let record = self.source.zone.record(self.record.id);
+        let host_owned = !record.is_native_owned() && record.requires_native_entry();
+        let resumed = self.resume_owned_checkpoint()?;
+        // A borrowed ring continuation must return its completed context to
+        // the host executor. Returning it directly to EL0 would leave the next
+        // host syscall on a hostless vCPU. Native births keep their ring lane.
+        if host_owned
+            && !record.requires_native_entry()
+            && !record.has_object_operation()
+            && matches!(
+                resumed,
+                NativeResume::Returned(_) | NativeResume::RetrySyscall | NativeResume::NoPending
+            )
+        {
+            match resumed {
+                NativeResume::Returned(result) => {
+                    self.words.set_syscall_return(result.raw() as u64)
+                }
+                NativeResume::RetrySyscall => self.words.restart_syscall(),
+                _ => {}
+            }
+            // SAFETY: this admitted lane still owns this exact OnCpu record.
+            // Publish the final words before handing its custody to the host.
+            unsafe {
+                *record.ctx_mut() = *self.words;
+            }
+            self.handoff = carrick_core::entry::yield_current_to_host(
+                self.binding,
+                self.source,
+                self.record.id,
+            );
+            if self.take_handoff_receipt().is_none() {
+                return Err(NativeProcessError::Quarantined.run_failure_reason());
+            }
+            self.current.linux.mark_pending_host_work();
+            return Ok(NativeResume::Left(None));
+        }
+        Ok(resumed)
+    }
+
+    #[inline(never)]
+    fn resume_owned_checkpoint(
+        &mut self,
+    ) -> Result<NativeResume, carrick_core_abi::NativeRunFailureReason> {
         if let Some(result) = self.resume_exec_closing() {
             return result.map_err(NativeProcessError::run_failure_reason);
         }
@@ -7377,6 +7439,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     }
     fn take_run_failure(&mut self) -> Option<carrick_core_abi::NativeRunFailureReason> {
         self.run_failure.take()
+    }
+    fn wait_guest_copy(
+        &mut self,
+        request: carrick_core::personality::GuestCopyRequest,
+    ) -> LifecycleOutcome {
+        self.prepare_guest_input(request)
+            .unwrap_or_else(|error| self.run_failed(error.run_failure_reason()))
     }
     fn copy_out_owned(
         &mut self,

@@ -1050,7 +1050,15 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'_, C> {
             return None;
         }
         let member = self.zone.live(record)?;
-        member.is_native_owned().then(|| member.identity())
+        // The retained service may expose its notice before park enrollment
+        // installs the operation token. Its cell authenticates the request;
+        // this observation never grants MM or execution ownership.
+        (member.is_native_owned()
+            || matches!(
+                member.resume_disposition(),
+                ResumeDisposition::OwnerContinuation(_)
+            ))
+        .then(|| member.identity())
     }
 
     fn release_with(&self, mut before_unlock: impl FnMut()) {

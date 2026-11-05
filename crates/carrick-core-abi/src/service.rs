@@ -690,28 +690,24 @@ pub struct ServiceCell {
     wait_revision: AtomicU64,
 }
 
-pub struct PreparedExecServiceRebind<'a> {
+pub struct PreparedServiceRebind<'a> {
     cell: &'a ServiceCell,
-    predecessor: ServiceBirth,
-    successor: El1MmHandle,
+    successor: ServiceBirth,
     armed: bool,
 }
 
-impl PreparedExecServiceRebind<'_> {
+impl PreparedServiceRebind<'_> {
     pub fn commit(mut self) -> ServiceBirth {
-        self.cell.words[6].store(self.successor.mm().raw(), Ordering::Relaxed);
-        self.cell.words[7].store(self.successor.incarnation().get(), Ordering::Relaxed);
-        let rebound = ServiceBirth {
-            mm: self.successor,
-            ..self.predecessor
-        };
+        for (word, value) in self.cell.words.iter().zip(self.successor.words()) {
+            word.store(value, Ordering::Relaxed);
+        }
         self.cell.state.store(IDLE, Ordering::Release);
         self.armed = false;
-        rebound
+        self.successor
     }
 }
 
-impl Drop for PreparedExecServiceRebind<'_> {
+impl Drop for PreparedServiceRebind<'_> {
     fn drop(&mut self) {
         if self.armed {
             self.cell.state.store(IDLE, Ordering::Release);
@@ -1139,7 +1135,51 @@ impl ServiceCell {
         &self,
         predecessor: ServiceBirth,
         successor: El1MmHandle,
-    ) -> Result<PreparedExecServiceRebind<'_>, ServiceError> {
+    ) -> Result<PreparedServiceRebind<'_>, ServiceError> {
+        self.prepare_birth_rebind(
+            predecessor,
+            ServiceBirth {
+                mm: successor,
+                ..predecessor
+            },
+        )
+    }
+
+    /// The live member's owner moves an idle service capability with its exact
+    /// scheduler record. Outstanding requests refuse rehome; the MM, lineage
+    /// and monotone operation sequence survive it. An unbound cell needs no move.
+    pub fn prepare_record_rebind(
+        &self,
+        process: TaskKey,
+        thread: EntryThreadGeneration,
+        predecessor: RecordRef,
+        successor: RecordRef,
+    ) -> Result<Option<PreparedServiceRebind<'_>>, ServiceError> {
+        if successor.incarnation == 0 {
+            return Err(ServiceError::Stale);
+        }
+        if self.state.load(Ordering::Acquire) == UNBOUND {
+            return Ok(None);
+        }
+        let birth = self.bound_birth(process, thread, predecessor)?;
+        self.prepare_birth_rebind(
+            birth,
+            ServiceBirth {
+                record: successor,
+                ..birth
+            },
+        )
+        .map(Some)
+    }
+
+    fn prepare_birth_rebind(
+        &self,
+        predecessor: ServiceBirth,
+        successor: ServiceBirth,
+    ) -> Result<PreparedServiceRebind<'_>, ServiceError> {
+        if successor.mm.carrier() != predecessor.mm.carrier() {
+            return Err(ServiceError::Stale);
+        }
         self.state
             .compare_exchange(IDLE, WRITING, Ordering::Acquire, Ordering::Relaxed)
             .map_err(|_| ServiceError::Busy)?;
@@ -1147,9 +1187,8 @@ impl ServiceCell {
             self.state.store(IDLE, Ordering::Release);
             return Err(ServiceError::Stale);
         }
-        Ok(PreparedExecServiceRebind {
+        Ok(PreparedServiceRebind {
             cell: self,
-            predecessor,
             successor,
             armed: true,
         })
@@ -1930,6 +1969,60 @@ mod tests {
     }
     fn exec_capability() -> ExecCapabilityId {
         ExecCapabilityId::new(NonZeroU64::new(17).unwrap())
+    }
+
+    #[test]
+    fn record_rehome_preserves_birth_sequence_and_rejects_old_selectors() {
+        let cell = ServiceCell::new();
+        let owner = birth(7, 7);
+        let record = RecordRef {
+            incarnation: owner.record.incarnation + 1,
+            ..owner.record
+        };
+        assert!(
+            cell.prepare_record_rebind(owner.process, owner.thread, owner.record, record)
+                .unwrap()
+                .is_none()
+        );
+        cell.bind(owner).unwrap();
+        let first = cell
+            .publish(owner, SnapshotGeneration::INITIAL, fault(), None)
+            .unwrap();
+        assert!(matches!(
+            cell.prepare_record_rebind(owner.process, owner.thread, owner.record, record),
+            Err(ServiceError::Busy)
+        ));
+        assert!(cell.claim(first).unwrap().complete(false).is_ok());
+        assert_eq!(cell.consume(first.identity), Ok(ServiceResult::Refused));
+        let prepared = cell
+            .prepare_record_rebind(owner.process, owner.thread, owner.record, record)
+            .unwrap()
+            .unwrap();
+        drop(prepared);
+        assert_eq!(
+            cell.bound_birth(owner.process, owner.thread, owner.record),
+            Ok(owner)
+        );
+        let rebound = cell
+            .prepare_record_rebind(owner.process, owner.thread, owner.record, record)
+            .unwrap()
+            .unwrap()
+            .commit();
+        assert_eq!(rebound, ServiceBirth { record, ..owner });
+        assert_eq!(
+            cell.bound_birth(owner.process, owner.thread, owner.record),
+            Err(ServiceError::Stale)
+        );
+        let second = cell
+            .publish(rebound, SnapshotGeneration::INITIAL, fault(), None)
+            .unwrap();
+        assert_eq!(
+            second.identity.sequence.get(),
+            first.identity.sequence.get() + 1
+        );
+        assert!(cell.claim(first).is_err());
+        assert!(cell.claim(second).unwrap().complete(false).is_ok());
+        assert_eq!(cell.consume(second.identity), Ok(ServiceResult::Refused));
     }
 
     #[test]
