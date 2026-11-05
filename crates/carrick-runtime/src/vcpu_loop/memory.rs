@@ -895,6 +895,10 @@ mod tests {
             registers: carrick_el1_abi::ArmEntryFatalRegisters {
                 reason: Some(carrick_el1_abi::EntryBindingFatalReason::EntryBinding as u64),
                 source_location: Some((1646 << 32) | 9),
+                origin: Some(carrick_el1_abi::EntryBindingFatalOrigin::EntryBinding as u64),
+                source_file: Some(carrick_el1_abi::FatalSourceFile::from_path(
+                    "crates/carrick-el1-linux/src/dispatch.rs",
+                )),
                 pc: Some(0x1010),
                 lr: Some(0x2020),
                 fp: Some(0x3030),
@@ -922,9 +926,13 @@ mod tests {
             record: None,
         };
         let expected = format!("{diagnostic}");
+        assert!(expected.starts_with(
+            "entry_binding reason=EntryBinding invariant=EntryBinding \
+             at=crates/carrick-el1-linux/src/dispatch.rs:1646:9 "
+        ));
         let report = carrick_el1_abi::ArmEl1FatalReport::Entry(&diagnostic);
         let mut message = [0; carrick_fatal::MAX_MESSAGE_LEN];
-        let mut line = [0; 1280];
+        let mut line = [0; carrick_fatal::MAX_LINE_LEN];
         let (message_len, line_len) = carrick_fatal::format_fatal_parts(
             "el1",
             format_args!("{report}"),

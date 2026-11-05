@@ -9,7 +9,11 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
 pub const CARRICK_FATAL_MAGIC: u64 = 0x4341_5252_4641_544c; // "CARRFATL"
 pub const MAX_DOMAIN_LEN: usize = 64;
-pub const MAX_MESSAGE_LEN: usize = 1024;
+/// Sized for the widest EL1 entry-binding report, which names its cause and
+/// call site (#1642) besides every register and custody field.
+pub const MAX_MESSAGE_LEN: usize = 1536;
+/// The stderr line: `carrick fatal [<domain>]: ` + message + newline.
+pub const MAX_LINE_LEN: usize = MAX_MESSAGE_LEN + MAX_DOMAIN_LEN + 32;
 
 /// A fixed-size record preserved in `.data` so post-mortem debuggers (`lldb`)
 /// can read the failure reason out of a core dump even with no debug symbols.
@@ -184,7 +188,7 @@ pub fn format_fatal_parts(
     domain: &'static str,
     args: core::fmt::Arguments<'_>,
     msg_buf: &mut [u8; MAX_MESSAGE_LEN],
-    line_buf: &mut [u8; 1280],
+    line_buf: &mut [u8; MAX_LINE_LEN],
 ) -> (usize, usize) {
     let mut msg_writer = SliceWriter::new(msg_buf);
     let _ = core::fmt::write(&mut msg_writer, args);
@@ -235,7 +239,7 @@ pub fn fatal(domain: &'static str, args: core::fmt::Arguments<'_>) -> ! {
     }
 
     let mut msg_buf = [0u8; MAX_MESSAGE_LEN];
-    let mut line_buf = [0u8; 1280];
+    let mut line_buf = [0u8; MAX_LINE_LEN];
     let (msg_len, line_len) = format_fatal_parts(domain, args, &mut msg_buf, &mut line_buf);
 
     write_stderr(&line_buf[..line_len]);
@@ -308,7 +312,7 @@ mod tests {
     #[test]
     fn formatting_never_allocates() {
         let mut msg_buf = [0u8; MAX_MESSAGE_LEN];
-        let mut line_buf = [0u8; 1280];
+        let mut line_buf = [0u8; MAX_LINE_LEN];
 
         let before = thread_allocations();
         let (msg_len, line_len) = format_fatal_parts(
@@ -330,9 +334,9 @@ mod tests {
     #[test]
     fn overlong_message_is_truncated_not_panicked() {
         let mut msg_buf = [0u8; MAX_MESSAGE_LEN];
-        let mut line_buf = [0u8; 1280];
+        let mut line_buf = [0u8; MAX_LINE_LEN];
 
-        let long_str = "x".repeat(3000);
+        let long_str = "x".repeat(MAX_MESSAGE_LEN * 3);
         let before = thread_allocations();
         let (msg_len, line_len) = format_fatal_parts(
             "trunc_domain",
@@ -348,7 +352,7 @@ mod tests {
         let msg = core::str::from_utf8(&msg_buf[..msg_len]).unwrap();
         assert_eq!(msg.len(), MAX_MESSAGE_LEN);
         assert!(msg.starts_with("prefix: xxxx"));
-        assert!(line_len <= 1280);
+        assert!(line_len <= MAX_LINE_LEN);
         assert_eq!(line_buf[line_len - 1], b'\n');
     }
 

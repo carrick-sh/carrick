@@ -1,0 +1,34 @@
+schema = "carrick.conformance-exemption.v1"
+base = "f4af66f76aee1dd437d98f5564ec9ab91618cf63"
+head = "3a69ff3913d270f42822c797d76480a7ea5f1b9b"
+contracts = [
+  "core.entry.completion",
+  "core.personality.files",
+  "diagnostics.syscall-refusal",
+  "kernel.el1.futex-handoff",
+  "kernel.el1.gic",
+  "kernel.el1.guest-run-queue",
+  "kernel.el1.guest-scheduler",
+  "kernel.el1.ipc-fd-authority",
+  "kernel.el1.ipc-two-process",
+  "kernel.el1.signal-delivery-owner",
+  "kernel.el1.stage1-publication",
+  "kernel.el1.thread-lifecycle",
+  "kernel.fork.stage1-image",
+  "kernel.mm.native-code-content",
+  "kernel.mm.native-code-drain",
+  "kernel.transport.exit-overhead",
+  "kernel.vcpu.kick-el0-boundary",
+  "kernel.vcpu.shutdown-entry",
+  "kernel.vcpu.vm-lifetime",
+  "process.exec.custody",
+  "process.native.arm-admission",
+]
+paths = [
+  "crates/carrick-el1-abi/src/entry_binding_fatal.rs",
+  "crates/carrick-el1-linux/src/dispatch.rs",
+  "crates/carrick-el1/src/sched/hw.rs",
+  "crates/carrick-runtime/src/vcpu_loop/memory.rs",
+  "crates/carrick-vmm-hvf/src/trap.rs",
+]
+rationale = "The exact product diff widens the fail-stop EL1 entry-binding fatal diagnostic (#1642): the terminal HVC #3 now also carries the raising NativeInvariant variant (x4) and the caller's source-file tail (x5..x12), HVF reads those registers only inside the existing PANIC_SENTINEL fatal branch and renders them into the same fatal record, and NativeInvariant::fatal_reason becomes fatal_cause with two new fatal codes for previously merged physical-custody refusals. Every changed line runs only after an invariant has already failed and the run is terminating; no refusal policy, dispatch route, errno, scheduling, custody, fork, exec, IPC, signal or vCPU decision changes, and no hot path gains work (invalid_completion and the HVC body are cold and never inlined, with a 0x70-byte frame in the built image). memory.rs changes only its fatal-record unit test. The red-first serial_host invalid_completion witness, the carrick-el1-abi round-trip and width tests, the EL1 image frame-budget build, warning-denied Clippy and cross-check-macos cover the changed boundary."

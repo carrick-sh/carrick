@@ -459,19 +459,35 @@ pub fn restore_irq(guard: IrqGuard) {
     }
 }
 
-/// Non-returning native fatal transport after an entry loses its exact binding.
-/// Guest syscall replay or a return through another task is forbidden.
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+/// Fatal for a scheduler or ISA refusal raised without a `NativeInvariant`.
+#[cfg(target_os = "none")]
+#[inline]
 #[track_caller]
 pub fn fatal_entry_binding(reason: carrick_el1_abi::EntryBindingFatalReason) -> ! {
-    let [reason, location] = carrick_el1_abi::EntryBindingFatalDetail::at_caller(reason).encode();
+    fatal_entry_binding_cause(carrick_el1_abi::EntryBindingFatalCause::substrate(reason))
+}
+
+/// Non-returning native fatal transport after an entry loses its exact binding.
+/// Guest syscall replay or a return through another task is forbidden.
+/// The caller's `Location` arrives as the implicit `#[track_caller]`
+/// pointer; the encoded payload lives only in this cold frame, never in a
+/// caller's (`frame_budget.rs`).
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[cold]
+#[inline(never)]
+#[track_caller]
+pub fn fatal_entry_binding_cause(cause: carrick_el1_abi::EntryBindingFatalCause) -> ! {
+    let words = carrick_el1_abi::EntryBindingFatalDetail::at_caller(cause).encode();
+    let [f0, f1, f2, f3, f4, f5, f6, f7] = words.file.words();
     // SAFETY: this runs at EL1. HVC #3 is the image's fatal boundary, with
     // the established panic sentinel and no guest return/result publication.
     unsafe {
         core::arch::asm!("hvc #3",
             in("x0") carrick_el1_abi::PANIC_SENTINEL,
             in("x1") carrick_el1_abi::ENTRY_BINDING_FATAL_TAG,
-            in("x2") reason, in("x3") location,
+            in("x2") words.reason, in("x3") words.location, in("x4") words.origin,
+            in("x5") f0, in("x6") f1, in("x7") f2, in("x8") f3,
+            in("x9") f4, in("x10") f5, in("x11") f6, in("x12") f7,
             options(nostack));
     }
     loop {
@@ -481,7 +497,7 @@ pub fn fatal_entry_binding(reason: carrick_el1_abi::EntryBindingFatalReason) -> 
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[track_caller]
-pub fn fatal_entry_binding(reason: carrick_el1_abi::EntryBindingFatalReason) -> ! {
-    let _ = reason;
+pub fn fatal_entry_binding_cause(cause: carrick_el1_abi::EntryBindingFatalCause) -> ! {
+    let _ = cause;
     crate::isa::x86::fatal_entry_binding()
 }

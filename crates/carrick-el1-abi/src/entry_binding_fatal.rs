@@ -74,6 +74,11 @@ pub enum EntryBindingFatalReason {
     /// claim was neither this slot's `OnCpu*` nor `Free` (#1100). Leaving it
     /// on no run queue would strand the thread.
     RequeueRefused = 61,
+    /// Rolling back an unexposed physical inventory failed (#1642: once
+    /// folded into `PhysicalCustody` with every native run failure).
+    InventoryRollbackFailed = 62,
+    /// An authenticated native run failure; the origin word names which.
+    NativeRunFailure = 63,
 }
 impl EntryBindingFatalReason {
     pub const fn from_raw(raw: u64) -> Option<Self> {
@@ -128,60 +133,283 @@ impl EntryBindingFatalReason {
             48 => Some(Self::NativeServiceCompleteStale),
             60 => Some(Self::SwitchInStaleRoot),
             61 => Some(Self::RequeueRefused),
-
+            62 => Some(Self::InventoryRollbackFailed),
+            63 => Some(Self::NativeRunFailure),
             _ => None,
         }
     }
 }
 
-/// Two-register fatal payload. The caller's source coordinates occupy x3;
-/// no pointers or aggregate stack records cross this diagnostic boundary.
+/// Which `NativeInvariant` variant raised the fatal (origin word bits 0..8).
+/// `Substrate` is a scheduler or ISA fatal raised without one, so one shared
+/// reason code (`EntryBinding`) still says which layer refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum EntryBindingFatalOrigin {
+    Substrate = 0,
+    EntryBinding = 1,
+    NativeService = 2,
+    PhysicalCustody = 3,
+    MissingNativeFrame = 4,
+    RevisionCredit = 5,
+    SignalNumber = 6,
+    ProcessGraph = 7,
+}
+impl EntryBindingFatalOrigin {
+    pub const fn from_raw(raw: u8) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Substrate),
+            1 => Some(Self::EntryBinding),
+            2 => Some(Self::NativeService),
+            3 => Some(Self::PhysicalCustody),
+            4 => Some(Self::MissingNativeFrame),
+            5 => Some(Self::RevisionCredit),
+            6 => Some(Self::SignalNumber),
+            7 => Some(Self::ProcessGraph),
+            _ => None,
+        }
+    }
+}
+
+/// What failed: the transport reason, the raising variant and, for an
+/// authenticated native run failure, its exact reason (origin bits 8..16).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EntryBindingFatalCause {
+    pub reason: EntryBindingFatalReason,
+    pub origin: EntryBindingFatalOrigin,
+    pub run_failure: Option<carrick_core_abi::NativeRunFailureReason>,
+}
+impl EntryBindingFatalCause {
+    /// A scheduler or ISA refusal that no `NativeInvariant` carried.
+    pub const fn substrate(reason: EntryBindingFatalReason) -> Self {
+        Self::invariant(EntryBindingFatalOrigin::Substrate, reason)
+    }
+    pub const fn invariant(
+        origin: EntryBindingFatalOrigin,
+        reason: EntryBindingFatalReason,
+    ) -> Self {
+        Self {
+            reason,
+            origin,
+            run_failure: None,
+        }
+    }
+    pub const fn native_run_failure(reason: carrick_core_abi::NativeRunFailureReason) -> Self {
+        Self {
+            reason: EntryBindingFatalReason::NativeRunFailure,
+            origin: EntryBindingFatalOrigin::PhysicalCustody,
+            run_failure: Some(reason),
+        }
+    }
+    const fn origin_word(self) -> u64 {
+        let run = match self.run_failure {
+            Some(reason) => reason as u64,
+            None => 0,
+        };
+        (self.origin as u64) | (run << 8)
+    }
+}
+
+/// Bytes of `Location::file()` the transport keeps: a header byte, then up
+/// to 63 trailing path bytes, so `crates/<crate>/src/<file>.rs` survives.
+pub const FATAL_SOURCE_FILE_WORDS: usize = 8;
+const FATAL_SOURCE_FILE_BYTES: usize = FATAL_SOURCE_FILE_WORDS * 8 - 1;
+const FATAL_SOURCE_FILE_TRUNCATED: u8 = 0x80;
+
+/// The caller's source file, carried by value in eight registers: the EL1
+/// image's string pointer is meaningless to the host. Byte 0 holds the kept
+/// length and a truncation flag; bytes 1.. the path's last bytes.
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+pub struct FatalSourceFile {
+    words: [u64; FATAL_SOURCE_FILE_WORDS],
+}
+impl FatalSourceFile {
+    pub fn from_path(path: &str) -> Self {
+        let bytes = path.as_bytes();
+        let kept = bytes.len().min(FATAL_SOURCE_FILE_BYTES);
+        let mut header = kept as u8;
+        if bytes.len() > kept {
+            header |= FATAL_SOURCE_FILE_TRUNCATED;
+        }
+        let tail = bytes.get(bytes.len() - kept..).unwrap_or_default();
+        let mut words = [0u64; FATAL_SOURCE_FILE_WORDS];
+        for (index, byte) in core::iter::once(&header).chain(tail).enumerate() {
+            if let Some(word) = words.get_mut(index / 8) {
+                *word |= u64::from(*byte) << (8 * (index % 8));
+            }
+        }
+        Self { words }
+    }
+    pub const fn from_words(words: [u64; FATAL_SOURCE_FILE_WORDS]) -> Self {
+        Self { words }
+    }
+    pub const fn words(self) -> [u64; FATAL_SOURCE_FILE_WORDS] {
+        self.words
+    }
+    fn byte(&self, index: usize) -> u8 {
+        self.words
+            .get(index / 8)
+            .map_or(0, |word| (word >> (8 * (index % 8))) as u8)
+    }
+}
+/// Printable ASCII only: a corrupt register must not inject a line break
+/// into the single fatal line. Other bytes render as `?`.
+impl fmt::Display for FatalSourceFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let header = self.byte(0);
+        let kept = usize::from(header & !FATAL_SOURCE_FILE_TRUNCATED).min(FATAL_SOURCE_FILE_BYTES);
+        if kept == 0 {
+            return f.write_str("unknown");
+        }
+        if header & FATAL_SOURCE_FILE_TRUNCATED != 0 {
+            f.write_str("...")?;
+        }
+        for index in 1..=kept {
+            let byte = self.byte(index);
+            let shown = if byte.is_ascii_graphic() { byte } else { b'?' };
+            fmt::Write::write_char(f, char::from(shown))?;
+        }
+        Ok(())
+    }
+}
+impl fmt::Debug for FatalSourceFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "\"{self}\"")
+    }
+}
+
+/// Register payload of one fatal: reason in x2, the caller's line and column
+/// in x3, origin in x4 and the caller's file in x5..x12. No pointers or
+/// aggregate stack records cross this diagnostic boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EntryBindingFatalWords {
+    pub reason: u64,
+    pub location: u64,
+    pub origin: u64,
+    pub file: FatalSourceFile,
+}
+
+/// A fatal's cause and call site. Two call sites never print the same line.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EntryBindingFatalDetail {
-    pub reason: EntryBindingFatalReason,
+    pub cause: EntryBindingFatalCause,
     pub line: u32,
     pub column: u32,
+    pub file: FatalSourceFile,
 }
 impl EntryBindingFatalDetail {
     #[track_caller]
-    pub fn at_caller(reason: EntryBindingFatalReason) -> Self {
+    pub fn at_caller(cause: EntryBindingFatalCause) -> Self {
         let caller = core::panic::Location::caller();
         Self {
-            reason,
+            cause,
             line: caller.line(),
             column: caller.column(),
+            file: FatalSourceFile::from_path(caller.file()),
         }
     }
-    pub const fn encode(self) -> [u64; 2] {
-        [
-            self.reason as u64,
-            ((self.line as u64) << 32) | self.column as u64,
-        ]
+    pub const fn encode(self) -> EntryBindingFatalWords {
+        EntryBindingFatalWords {
+            reason: self.cause.reason as u64,
+            location: ((self.line as u64) << 32) | self.column as u64,
+            origin: self.cause.origin_word(),
+            file: self.file,
+        }
     }
-    pub const fn decode(reason: u64, location: u64) -> Option<Self> {
-        let Some(reason) = EntryBindingFatalReason::from_raw(reason) else {
+    pub const fn decode(words: EntryBindingFatalWords) -> Option<Self> {
+        let Some(reason) = EntryBindingFatalReason::from_raw(words.reason) else {
             return None;
         };
+        let Some(origin) = EntryBindingFatalOrigin::from_raw(words.origin as u8) else {
+            return None;
+        };
+        if words.origin >> 16 != 0 {
+            return None;
+        }
+        let run_failure = match (words.origin >> 8) as u8 {
+            0 => None,
+            raw => match carrick_core_abi::NativeRunFailureReason::from_raw(raw as u64) {
+                Some(reason) => Some(reason),
+                None => return None,
+            },
+        };
         Some(Self {
-            reason,
-            line: (location >> 32) as u32,
-            column: location as u32,
+            cause: EntryBindingFatalCause {
+                reason,
+                origin,
+                run_failure,
+            },
+            line: (words.location >> 32) as u32,
+            column: words.location as u32,
+            file: words.file,
         })
     }
 }
-struct FatalDetail(Option<u64>, Option<u64>);
+/// The one renderer for both the EL1 register payload and the hosted
+/// `invalid_completion` line, so both name the same fields.
+impl fmt::Display for EntryBindingFatalDetail {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let words = self.encode();
+        FatalDetail {
+            reason: Some(words.reason),
+            origin: Some(words.origin),
+            location: Some(words.location),
+            file: Some(words.file),
+        }
+        .fmt(f)
+    }
+}
+struct FatalDetail {
+    reason: Option<u64>,
+    origin: Option<u64>,
+    location: Option<u64>,
+    file: Option<FatalSourceFile>,
+}
+impl FatalDetail {
+    fn of(registers: &ArmEntryFatalRegisters) -> Self {
+        Self {
+            reason: registers.reason,
+            origin: registers.origin,
+            location: registers.source_location,
+            file: registers.source_file,
+        }
+    }
+}
 impl fmt::Display for FatalDetail {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.0 {
+        match self.reason {
             Some(raw) => match EntryBindingFatalReason::from_raw(raw) {
                 Some(reason) => write!(f, "reason={reason:?} ")?,
                 None => write!(f, "reason=unknown({raw:#x}) ")?,
             },
             None => f.write_str("reason=unavailable ")?,
         }
-        match self.1 {
-            Some(location) => write!(f, "at={}:{}", location >> 32, location as u32),
-            None => f.write_str("at=unavailable"),
+        match self.origin {
+            Some(raw) => {
+                match EntryBindingFatalOrigin::from_raw(raw as u8) {
+                    Some(EntryBindingFatalOrigin::Substrate) => f.write_str("invariant=none")?,
+                    Some(origin) => write!(f, "invariant={origin:?}")?,
+                    None => write!(f, "invariant=unknown({:#x})", raw as u8)?,
+                }
+                match (raw >> 8) as u8 {
+                    0 => {}
+                    run => match carrick_core_abi::NativeRunFailureReason::from_raw(run as u64) {
+                        Some(reason) => write!(f, "({reason:?})")?,
+                        None => write!(f, "(unknown({run:#x}))")?,
+                    },
+                }
+                f.write_str(" ")?;
+            }
+            None => f.write_str("invariant=unavailable ")?,
+        }
+        f.write_str("at=")?;
+        match self.file {
+            Some(file) => write!(f, "{file}:")?,
+            None => f.write_str("unavailable:")?,
+        }
+        match self.location {
+            Some(location) => write!(f, "{}:{}", location >> 32, location as u32),
+            None => f.write_str("unavailable"),
         }
     }
 }
@@ -192,6 +420,8 @@ impl fmt::Display for FatalDetail {
 pub struct ArmEntryFatalRegisters {
     pub reason: Option<u64>,
     pub source_location: Option<u64>,
+    pub origin: Option<u64>,
+    pub source_file: Option<FatalSourceFile>,
     pub pc: Option<u64>,
     pub lr: Option<u64>,
     pub fp: Option<u64>,
@@ -260,7 +490,7 @@ impl fmt::Display for ArmEl1FatalReport<'_> {
             Self::EntryUnavailable(registers) => write!(
                 f,
                 "entry_binding retained_entry=unavailable {} registers={registers:?}",
-                FatalDetail(registers.reason, registers.source_location)
+                FatalDetail::of(registers)
             ),
             Self::Panic {
                 sentinel,
@@ -328,7 +558,8 @@ impl ArmEntryBindingFatal {
         }
     }
 }
-// Keep every custody field in the fixed 1024-byte sink. Flags are 0/1;
+// Keep every custody field in the fixed 1536-byte sink
+// (`carrick_fatal::MAX_MESSAGE_LEN`). Flags are 0/1;
 // long variants avoid Debug's whitespace, slot wrappers and boolean words.
 // `host_req` is the complete host_requested flag, not omitted custody state.
 struct CompactClaim(Claim);
@@ -385,9 +616,12 @@ impl fmt::Display for Register {
 impl fmt::Display for ArmEntryBindingFatal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let r = &self.registers;
+        // Cause and call site lead: they name the refusing site (#1642),
+        // and a clipped paste of the line still carries them.
         write!(
             f,
-            "entry_binding cpu={} pc={} lr={} fp={} sp_el1={} esr_el1={} far_el1={} elr_el1={} spsr_el1={} sp_el0={} ",
+            "entry_binding {} cpu={} pc={} lr={} fp={} sp_el1={} esr_el1={} far_el1={} elr_el1={} spsr_el1={} sp_el0={} ",
+            FatalDetail::of(r),
             self.slot.raw(),
             Register(r.pc),
             Register(r.lr),
@@ -421,7 +655,6 @@ impl fmt::Display for ArmEntryBindingFatal {
             self.loaded.mm.raw(),
             self.loaded.thread_generation.raw()
         )?;
-        write!(f, "{} ", FatalDetail(r.reason, r.source_location))?;
         match self.record {
             None => f.write_str("record=none"),
             Some(record) => write!(
@@ -448,37 +681,121 @@ mod tests {
     use super::*;
     use std::{boxed::Box, format};
 
+    const ORIGINS: [EntryBindingFatalOrigin; 8] = [
+        EntryBindingFatalOrigin::Substrate,
+        EntryBindingFatalOrigin::EntryBinding,
+        EntryBindingFatalOrigin::NativeService,
+        EntryBindingFatalOrigin::PhysicalCustody,
+        EntryBindingFatalOrigin::MissingNativeFrame,
+        EntryBindingFatalOrigin::RevisionCredit,
+        EntryBindingFatalOrigin::SignalNumber,
+        EntryBindingFatalOrigin::ProcessGraph,
+    ];
+
     #[test]
     fn fatal_detail_round_trip_and_formatter() {
-        for raw in (1..=48).chain(60..=61) {
+        let path = "crates/carrick-el1-linux/src/aarch64_process.rs";
+        for raw in (1..=48).chain(60..=63) {
             let reason = EntryBindingFatalReason::from_raw(raw).unwrap();
-            for (line, column) in [(0, 0), (1646, 9), (u32::MAX, u32::MAX)] {
-                let detail = EntryBindingFatalDetail {
-                    reason,
-                    line,
-                    column,
-                };
-                let [r, l] = detail.encode();
-                assert_eq!(EntryBindingFatalDetail::decode(r, l), Some(detail));
+            for origin in ORIGINS {
+                for (line, column) in [(0, 0), (1646, 9), (u32::MAX, u32::MAX)] {
+                    let detail = EntryBindingFatalDetail {
+                        cause: EntryBindingFatalCause::invariant(origin, reason),
+                        line,
+                        column,
+                        file: FatalSourceFile::from_path(path),
+                    };
+                    assert_eq!(
+                        EntryBindingFatalDetail::decode(detail.encode()),
+                        Some(detail)
+                    );
+                }
             }
         }
-        assert_eq!(EntryBindingFatalDetail::decode(0, 0), None);
-        assert_eq!(EntryBindingFatalDetail::decode(u64::MAX, 0), None);
+        for raw in 1..=12 {
+            let run = carrick_core_abi::NativeRunFailureReason::from_raw(raw).unwrap();
+            let detail = EntryBindingFatalDetail {
+                cause: EntryBindingFatalCause::native_run_failure(run),
+                line: 716,
+                column: 13,
+                file: FatalSourceFile::from_path(path),
+            };
+            assert_eq!(
+                EntryBindingFatalDetail::decode(detail.encode()),
+                Some(detail)
+            );
+        }
+        let words = |reason, origin| EntryBindingFatalWords {
+            reason,
+            location: 0,
+            origin,
+            file: FatalSourceFile::default(),
+        };
+        assert_eq!(EntryBindingFatalDetail::decode(words(0, 0)), None);
+        assert_eq!(EntryBindingFatalDetail::decode(words(u64::MAX, 0)), None);
+        assert_eq!(EntryBindingFatalDetail::decode(words(1, 8)), None);
+        assert_eq!(EntryBindingFatalDetail::decode(words(1, 99 << 8)), None);
+        assert_eq!(EntryBindingFatalDetail::decode(words(1, 1 << 16)), None);
+        let file = Some(FatalSourceFile::from_path("src/dispatch.rs"));
         assert_eq!(
-            format!("{}", FatalDetail(Some(3), Some((1646 << 32) | 9))),
-            "reason=MissingNativeFrame at=1646:9"
+            format!(
+                "{}",
+                FatalDetail {
+                    reason: Some(3),
+                    origin: Some(4),
+                    location: Some((1646 << 32) | 9),
+                    file,
+                }
+            ),
+            "reason=MissingNativeFrame invariant=MissingNativeFrame at=src/dispatch.rs:1646:9"
         );
         assert_eq!(
-            format!("{}", FatalDetail(Some(99), Some(0))),
-            "reason=unknown(0x63) at=0:0"
+            format!(
+                "{}",
+                FatalDetail {
+                    reason: Some(63),
+                    origin: Some(3 | (12 << 8)),
+                    location: Some(0),
+                    file,
+                }
+            ),
+            "reason=NativeRunFailure invariant=PhysicalCustody(BornEnqueueRefused) at=src/dispatch.rs:0:0"
         );
         assert_eq!(
-            format!("{}", FatalDetail(None, None)),
-            "reason=unavailable at=unavailable"
+            format!(
+                "{}",
+                FatalDetail {
+                    reason: Some(99),
+                    origin: Some(0x9900 | 0x42),
+                    location: Some(0),
+                    file: Some(FatalSourceFile::default()),
+                }
+            ),
+            "reason=unknown(0x63) invariant=unknown(0x42)(unknown(0x99)) at=unknown:0:0"
         );
         assert_eq!(
-            format!("{}", FatalDetail(Some(3), None)),
-            "reason=MissingNativeFrame at=unavailable"
+            format!(
+                "{}",
+                FatalDetail {
+                    reason: None,
+                    origin: None,
+                    location: None,
+                    file: None,
+                }
+            ),
+            "reason=unavailable invariant=unavailable at=unavailable:unavailable"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                FatalDetail {
+                    reason: Some(1),
+                    origin: Some(0),
+                    location: None,
+                    file: None,
+                }
+            ),
+            "reason=EntryBinding invariant=none at=unavailable:unavailable"
         );
         assert_eq!(
             format!(
@@ -502,11 +819,20 @@ mod tests {
             "Placing{incarnation:0x9,host_req:1}"
         );
         let line = line!() + 1;
-        let detail = EntryBindingFatalDetail::at_caller(EntryBindingFatalReason::EntryBinding);
+        let detail = EntryBindingFatalDetail::at_caller(EntryBindingFatalCause::substrate(
+            EntryBindingFatalReason::EntryBinding,
+        ));
         assert_eq!(detail.line, line);
+        assert_eq!(
+            format!("{}", detail.file),
+            "crates/carrick-el1-abi/src/entry_binding_fatal.rs"
+        );
+        let words = detail.encode();
         let registers = ArmEntryFatalRegisters {
             reason: Some(3),
             source_location: Some((1646 << 32) | 9),
+            origin: Some(4),
+            source_file: Some(words.file),
             ..Default::default()
         };
         let capture = ArmEntryBindingFatal::capture(
@@ -520,8 +846,45 @@ mod tests {
             format!("{capture}"),
             format!("{}", ArmEl1FatalReport::EntryUnavailable(&registers)),
         ] {
-            assert!(text.contains("reason=MissingNativeFrame at=1646:9"));
+            assert!(text.contains(
+                "reason=MissingNativeFrame invariant=MissingNativeFrame \
+                 at=crates/carrick-el1-abi/src/entry_binding_fatal.rs:1646:9"
+            ));
         }
+    }
+
+    /// #1642: a shared reason code from two call sites used to print the
+    /// same `entry_binding` line. The site now distinguishes them, both in
+    /// file and in line, and the raising layer is named.
+    #[test]
+    fn two_call_sites_render_two_fatal_lines() {
+        #[track_caller]
+        fn raise(cause: EntryBindingFatalCause) -> std::string::String {
+            format!("{}", EntryBindingFatalDetail::at_caller(cause))
+        }
+        let reason = EntryBindingFatalReason::EntryBinding;
+        let first = raise(EntryBindingFatalCause::invariant(
+            EntryBindingFatalOrigin::EntryBinding,
+            reason,
+        ));
+        let second = raise(EntryBindingFatalCause::invariant(
+            EntryBindingFatalOrigin::EntryBinding,
+            reason,
+        ));
+        let substrate = raise(EntryBindingFatalCause::substrate(reason));
+        assert_ne!(first, second);
+        assert!(first.starts_with("reason=EntryBinding invariant=EntryBinding at="));
+        assert!(substrate.starts_with("reason=EntryBinding invariant=none at="));
+        let long = FatalSourceFile::from_path(
+            "crates/a-very-long-crate-name-for-truncation/src/deeply/nested/module/file.rs",
+        );
+        let shown = format!("{long}");
+        assert!(shown.starts_with("..."), "{shown}");
+        assert!(shown.ends_with("/nested/module/file.rs"), "{shown}");
+        assert_eq!(shown.len(), 3 + FATAL_SOURCE_FILE_BYTES);
+        let mut corrupt = FatalSourceFile::from_path("a\nb").words();
+        corrupt[0] |= 0x7f;
+        assert!(!format!("{}", FatalSourceFile::from_words(corrupt)).contains('\n'));
     }
 
     fn zone() -> Box<crate::ZoneTables> {
@@ -701,6 +1064,10 @@ mod tests {
         let registers = ArmEntryFatalRegisters {
             reason: Some(u64::MAX),
             source_location: Some(u64::MAX),
+            origin: Some(u64::MAX),
+            source_file: Some(FatalSourceFile::from_path(
+                "crates/a-crate-name-longer-than-the-transport/src/deeply/nested/module/file.rs",
+            )),
             pc: Some(u64::MAX),
             lr: Some(u64::MAX),
             fp: Some(u64::MAX),
@@ -769,11 +1136,11 @@ mod tests {
             let observed = capture.record.as_mut().unwrap();
             observed.claim = claim;
             observed.claim_after = claim;
-            for reason in (1..=48).chain([60, u64::MAX]) {
+            for reason in (1..=48).chain([60, 63, u64::MAX]) {
                 capture.registers.reason = Some(reason);
                 let text = format!("{capture}");
                 assert!(
-                    text.len() <= 1024,
+                    text.len() <= 1536,
                     "fatal sink truncates {} bytes: {text}",
                     text.len()
                 );
