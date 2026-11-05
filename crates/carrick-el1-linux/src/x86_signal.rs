@@ -30,12 +30,12 @@ impl carrick_guest_arch::ArchTypes for LinuxX86Backend {
 
 impl LinuxX86Backend {
     #[inline(never)]
-    pub fn setup_signal_frame_with_resume<'a>(
+    pub fn setup_signal_frame_with_resume(
         &mut self,
         frame: &mut NativeFrame,
         params: SignalFrameParams,
         resume: UserReturn,
-        siginfo: Option<&'a [u8]>,
+        siginfo: Option<&[u8]>,
         fpstate: &[u8],
         copy_out: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
     ) -> Result<UserVa, carrick_core::personality::CopyOutcome> {

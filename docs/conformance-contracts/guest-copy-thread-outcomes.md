@@ -64,3 +64,29 @@ Passing the focused schedules does not settle them.
   may remain published. Retain rollback custody until it completes.
 
 The slice must remain a draft until these are corrected and witnessed.
+
+## Host verification
+
+The completed native suite reports 685 passed, zero failed and one ignored.
+The personality-linux package reports 232 ordinary tests plus two compile-fail
+doctests passed; its serial-host selection contains zero tests. Workspace
+all-target clippy, check-linux, the host-target KVM compile check and the
+macOS closure check/clippy pass. The contract-change check passes with the
+installed Python 3.13 (the default Python 3.9 cannot import tomllib).
+
+The guest-copy ratchet falls from the base's 247 sites in 59 counters to
+246 in 58 counters. Its check explicitly compares against the supplied
+stack base. Authority source ceilings pass at 1266 sites.
+
+The host-target KVM check and aarch64 Linux check skip the freestanding
+x86 image. A direct x86_64-unknown-none check exposed the inherited
+prepare_owned_write signature mismatch and an Option pattern on GuestLen.
+The adapter now uses its existing CopyoutRequest contract and constructs
+one shared GuestCopyRequest with write access. Empty writes remain a
+no-op. Freestanding clippy also exposed the same elidable lifetime that
+had already been corrected for ARM; the x86 signature is corrected too.
+
+Both freestanding x86 images pass clippy with warnings denied. The fixture
+also needed its existing allocator alias (`rust_alloc`) used consistently
+by the included lifecycle source; no fixture behavior changes. These
+compile fixes are separate from the open ownership findings above.

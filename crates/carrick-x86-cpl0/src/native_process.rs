@@ -625,9 +625,16 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
     fn prepare_owned_write(
         &mut self,
         mm: &Self::Mm,
-        request: carrick_core::personality::GuestCopyRequest,
+        request: carrick_core::mm::transaction::CopyoutRequest,
     ) -> Result<(), NativeProcessError> {
-        self.prepare_user_bytes(mm, request)
+        self.prepare_user_bytes(
+            mm,
+            carrick_core::personality::GuestCopyRequest {
+                address: request.address,
+                len: request.len,
+                access: carrick_guest_arch::Access::Write,
+            },
+        )
     }
     fn prepare_owned_read(
         &mut self,

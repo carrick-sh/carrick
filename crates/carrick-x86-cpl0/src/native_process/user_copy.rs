@@ -104,9 +104,10 @@ impl Service {
         address: UserVa,
         bytes: &[u8],
     ) -> Result<(), NativeProcessError> {
-        let Some(len) = carrick_guest_arch::GuestLen::new(bytes.len() as u64) else {
+        if bytes.is_empty() {
             return Ok(());
-        };
+        }
+        let len = carrick_guest_arch::GuestLen::new(bytes.len() as u64);
         self.access_user_target(
             mm,
             address,

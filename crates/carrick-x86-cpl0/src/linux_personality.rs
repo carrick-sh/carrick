@@ -2,7 +2,7 @@
 
 #![cfg(all(target_os = "none", target_arch = "x86_64"))]
 
-use carrick_abi::{LINUX_SEGV_ACCERR, LINUX_SEGV_MAPERR, LINUX_SIGSEGV, LinuxErrno, LinuxSiginfo};
+use carrick_abi::{LINUX_SEGV_ACCERR, LINUX_SEGV_MAPERR, LINUX_SIGSEGV, LinuxSiginfo};
 use carrick_el1::isa::x86::context::native::{CpuBinding, NativeFrame, checked_scheduler_slot};
 use carrick_el1::isa::x86::context::scheduler::XsaveArea;
 use carrick_el1_abi::{
