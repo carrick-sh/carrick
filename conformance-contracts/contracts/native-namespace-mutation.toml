@@ -19,6 +19,7 @@ vm_free = [
 semantics = "Baseline only: all six ordinals return errno 38. Slice 2 must first assert successful mkdirat through this production entry and retain its red result, then add the typed service. No mutation is implemented by slice 1."
 exec_successor = "The successful exec binding uses the shared VM-free x86 process owner and production dispatcher with an ARM syscall frame; real ELF execution and ARM hardware MM installation remain signed evidence."
 embed = "Director Mac reference: fork-child mkdirat, unlinkat, renameat, symlinkat, readlinkat and fchmodat return ENOSYS; statx, getdents64, openat O_CREAT and write work. This worker has not repeated the signed observation."
+embed_structural = "No registered signed WorkObservation binding measures namespace mutation work yet. The VM-free refusal census is a defect baseline, not signed structural evidence; exact-artifact signed population and venue attribution remain director-owned."
 docker = "Native ARM Docker differential and pinned image identity remain director-owned."
 ecosystem = "The production carrick run MKDIR-OK/LS-OK regression and smoke/full promotion remain slice 4 and director work."
 observation = "The VM-free counters prove attempted/completed/refused populations for this fixture only, not the signed workload census or carrier service success."
