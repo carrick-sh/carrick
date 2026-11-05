@@ -11,12 +11,13 @@ rationale = "A native child has no host task. Typed operations must retain its e
 [bindings]
 vm_free = [
   "carrick-el1-linux::aarch64_process_tests::native_child_handoff_tests::native_namespace_mutation_baseline_two_live_children",
+  "carrick-el1-linux::native_process_runtime::host_test_support::native_namespace_mutation_baseline_exec_successor (six namespace refusals after successful real owner exec adoption, then exit/reap and slot reuse)",
   "carrick-el1-linux::dispatch::tests::native_fork_child_unclaimed_syscall_is_refused_before_any_crossing (negative control remains authoritative for genuinely unclaimed calls)",
 ]
 
 [bindings.unresolved]
 semantics = "Baseline only: all six ordinals return errno 38. Slice 2 must first assert successful mkdirat through this production entry and retain its red result, then add the typed service. No mutation is implemented by slice 1."
-exec_successor = "A child after successful exec is not yet covered by this baseline fixture."
+exec_successor = "The successful exec binding uses the shared VM-free x86 process owner and production dispatcher with an ARM syscall frame; real ELF execution and ARM hardware MM installation remain signed evidence."
 embed = "Director Mac reference: fork-child mkdirat, unlinkat, renameat, symlinkat, readlinkat and fchmodat return ENOSYS; statx, getdents64, openat O_CREAT and write work. This worker has not repeated the signed observation."
 docker = "Native ARM Docker differential and pinned image identity remain director-owned."
 ecosystem = "The production carrick run MKDIR-OK/LS-OK regression and smoke/full promotion remain slice 4 and director work."
