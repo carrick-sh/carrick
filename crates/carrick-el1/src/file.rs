@@ -11,6 +11,8 @@ use core::sync::atomic::Ordering;
 std::thread_local! {
     pub static SIMULATE_COPY_FAULT: core::sync::atomic::AtomicBool =
         const { core::sync::atomic::AtomicBool::new(false) };
+    pub static SIMULATE_COPYOUT_FAULT: core::sync::atomic::AtomicBool =
+        const { core::sync::atomic::AtomicBool::new(false) };
 }
 
 /// Copy `len` bytes from `src` to `dest` (user virtual address), guarded by EL1 exception fixup.
@@ -70,7 +72,9 @@ pub unsafe fn copy_to_user_guarded(
     {
         let _ = cur_task;
         #[cfg(any(test, feature = "host-test"))]
-        if SIMULATE_COPY_FAULT.with(|f| f.load(Ordering::Relaxed)) {
+        if SIMULATE_COPY_FAULT.with(|f| f.load(Ordering::Relaxed))
+            || SIMULATE_COPYOUT_FAULT.with(|f| f.load(Ordering::Relaxed))
+        {
             return false;
         }
         unsafe {

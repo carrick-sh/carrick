@@ -140,6 +140,9 @@ impl carrick_guest_arch::ProcessContext for ParkedContextWords {
     fn syscall_return(&self) -> u64 {
         ParkedContextWords::syscall_return(self)
     }
+    fn restart_syscall(&mut self) {
+        self.frame[15] = self.frame[15].wrapping_sub(2);
+    }
 }
 
 impl carrick_guest_arch::ThreadContext for ParkedContextWords {
