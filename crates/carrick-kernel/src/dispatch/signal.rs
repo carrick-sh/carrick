@@ -6770,6 +6770,7 @@ mod tests {
 
         struct SuspendsOnce {
             wait: PortalOwnerWait,
+            retain_read: bool,
             reads: Cell<usize>,
             writes: usize,
             old_mask: u64,
@@ -6780,6 +6781,9 @@ mod tests {
                 let reads = self.reads.get();
                 self.reads.set(reads + 1);
                 if reads == 0 {
+                    if !self.retain_read {
+                        return Err(MemoryError::OwnerWait(self.wait));
+                    }
                     return Err(MemoryError::ReadSuspended(Box::new(MemoryReadSuspension {
                         wait: MemoryReadWait::Owner(self.wait),
                         continuation: OwnedReadContinuation::new(Vec::<u8>::new()),
@@ -6796,50 +6800,53 @@ mod tests {
         }
         impl CurrentMmMemory for SuspendsOnce {}
 
-        let mut dispatcher = SyscallDispatcher::new();
-        let context = dispatcher.exact_signal_context_for_test();
-        let tid = context.thread().registry_id();
-        dispatcher.restore_signal_mask(&context, tid, SigSet::from_raw(0x10));
-        let wait = unsafe {
-            PortalOwnerWait::from_owner(
-                El1MmHandle::from_admitted_owner(
-                    NonZeroU64::new(1).unwrap(),
-                    ReservationMm::new(context.shared().mm().id().raw()).unwrap(),
-                    NonZeroU64::new(3).unwrap(),
-                ),
-                PortalWaitCause::Reservations,
-                7,
-            )
-        };
-        let mut memory = SuspendsOnce {
-            wait,
-            reads: Cell::new(0),
-            writes: 0,
-            old_mask: 0,
-        };
-        let reporter = crate::compat::CompatReporter::default();
-        let request = SyscallRequest::new(
-            nr::RT_SIGPROCMASK.raw(),
-            SyscallArgs::from([LINUX_SIG_BLOCK, 0x100, 0x108, LINUX_RT_SIGSET_SIZE, 0, 0]),
-        );
-        let outcome = dispatcher
-            .dispatch(&context, request, &mut memory, &reporter)
-            .unwrap();
-        assert_eq!(
-            outcome,
-            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
-        );
-        assert_eq!(memory.writes, 0);
-        assert_eq!(dispatcher.signal_mask_for(&context, tid).raw(), 0x10);
-        let outcome = dispatcher
-            .dispatch(&context, request, &mut memory, &reporter)
-            .unwrap();
-        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
-        assert_eq!(
-            (memory.reads.get(), memory.writes, memory.old_mask),
-            (2, 1, 0x10)
-        );
-        assert_eq!(dispatcher.signal_mask_for(&context, tid).raw(), 0x30);
+        for retain_read in [false, true] {
+            let mut dispatcher = SyscallDispatcher::new();
+            let context = dispatcher.exact_signal_context_for_test();
+            let tid = context.thread().registry_id();
+            dispatcher.restore_signal_mask(&context, tid, SigSet::from_raw(0x10));
+            let wait = unsafe {
+                PortalOwnerWait::from_owner(
+                    El1MmHandle::from_admitted_owner(
+                        NonZeroU64::new(1).unwrap(),
+                        ReservationMm::new(context.shared().mm().id().raw()).unwrap(),
+                        NonZeroU64::new(3).unwrap(),
+                    ),
+                    PortalWaitCause::Reservations,
+                    7,
+                )
+            };
+            let mut memory = SuspendsOnce {
+                wait,
+                retain_read,
+                reads: Cell::new(0),
+                writes: 0,
+                old_mask: 0,
+            };
+            let reporter = crate::compat::CompatReporter::default();
+            let request = SyscallRequest::new(
+                nr::RT_SIGPROCMASK.raw(),
+                SyscallArgs::from([LINUX_SIG_BLOCK, 0x100, 0x108, LINUX_RT_SIGSET_SIZE, 0, 0]),
+            );
+            let outcome = dispatcher
+                .dispatch(&context, request, &mut memory, &reporter)
+                .unwrap();
+            assert_eq!(
+                outcome,
+                DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+            );
+            assert_eq!(memory.writes, 0);
+            assert_eq!(dispatcher.signal_mask_for(&context, tid).raw(), 0x10);
+            let outcome = dispatcher
+                .dispatch(&context, request, &mut memory, &reporter)
+                .unwrap();
+            assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+            assert_eq!(
+                (memory.reads.get(), memory.writes, memory.old_mask),
+                (2, 1, 0x10)
+            );
+            assert_eq!(dispatcher.signal_mask_for(&context, tid).raw(), 0x30);
+        }
     }
 
     #[test]

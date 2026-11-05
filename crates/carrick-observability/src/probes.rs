@@ -6330,7 +6330,8 @@ mod real {
         /// 1 OwnerRetired, 2 ReadSuspended, 3 Physical, 4 OwnerWait,
         /// 5 Supply, 6 OutOfBounds, 7 Unsupported, 8 HostMap,
         /// 9 MetadataAllocation. Write code 10 is a terminal copyout EFAULT;
-        /// retryable copyout outcomes are propagated and do not fire here.
+        /// Retryable input and output outcomes are propagated and do not fire
+        /// here. Read codes 2-5 remain reserved for comparing pre-fix traces.
         fn rt__sigprocmask__copy__refusal(_: u32, _: u64, _: u32) {}
 
         /// Fires when a guest signal handler frame is injected. `signum` is the

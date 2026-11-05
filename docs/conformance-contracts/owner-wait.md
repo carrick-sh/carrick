@@ -171,7 +171,8 @@ operation families still listed on #986 remain outside this slice.
 ## Signal-mask input dependency (#1677)
 
 `rt_sigprocmask_copyin_owner_wait_is_not_efault` drives the public dispatcher
-with a read dependency once, then an available eight-byte signal set. The
+with either a direct owner wait or an owned read suspension once, then an
+available eight-byte signal set. The
 first call must preserve the owner wait with zero committed bytes, no old-mask
 write and no mask change. One redispatch reads eight bytes, writes the previous
 mask once and applies the new mask. Linux `rt_sigprocmask(2)` permits errno 14
@@ -183,3 +184,8 @@ This is a dispatch classification witness using a test memory implementation.
 It does not prove untouched sparse-page materialization, scheduler settlement,
 glibc thread identity, or the reported Go/CPython failures. Signed glibc census,
 native ARM64 oracle comparison and exact-artifact promotion remain Mac work.
+
+The red control restores the admitted main handler at `3478f3b9b` while
+keeping the witness: it returns `Errno(14)` instead of `OwnerMemoryWait`
+with zero committed bytes. The fix uses the existing canonical dependency
+conversion before any externally visible effect; it adds no eager population.
