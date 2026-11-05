@@ -43,3 +43,39 @@ the ordinary delivered prefix. Empty segments never dereference their base.
 The production dispatcher witness
 `el1_ipc_writev_invalid_payload_range_has_no_pipe_effects` requires errno 14,
 an empty nonblocking pipe and exact storage reclamation after each rejection.
+
+## Review corrections
+
+Vector custody publishes initialized headers with Release and reads them with
+Acquire before either transfer or reclamation. The Loom binding calls those
+production custody methods and rejects observing published metadata with stale
+header bytes. Token ownership continues to exclude concurrent mutation.
+
+Header copy refusal follows EventFdWrite admission: release the operation and
+pin before `refuse(... CopyInFault)`, with no pipe effect. Admitted main has
+only boolean `carrick_core::UserCopy`, so the done/fault/not-yet outcome from
+#1677 is not available here. This path must migrate with that shared outcome;
+it does not introduce another copy outcome type. Invalid imported payload
+ranges still return EFAULT immediately. The production dispatcher binding
+refuses an unavailable header, then supplies it and completes exactly one byte.
+
+The host handback gathers physical page prefixes before locking the pipe.
+An imported vector can fault between logical page boundaries; its transfer
+therefore consumes the exact gathered prefix, rather than losing it through
+a boolean whole-page copy. The handback binding requires one delivered byte
+when the first three-byte vector begins at the final byte of a backed page.
+
+The fork/exec witness now enters `dispatch_syscall_with_ipc` with registered
+user buffers for the child's scalar/vector writes and the parent's read.
+It no longer calls the IPC adapter directly.
+
+X86's existing strict crossing set excludes writev (canonical 66/native 20),
+and its IPC venue has no ARM frame. The reported P0 regression is refuted:
+on admitted main, `route_shared` (dispatch.rs:658) does not claim 66,
+`route_x86` (dispatch.rs:790) falls through to that route, and the unchanged
+crossing census (crossing.rs:508) permits only 22, 62, 63, 64, 67, 68, 93 and
+94. Both before and after this change, strict x86 therefore returns counted
+ENOSYS. The production dispatch binding now witnesses errno 38, exactly one
+native-20 refusal, and zero forwards. The shared route remains; no crossing
+allowlist or ISA wiring-gap ceiling changes. This slice does not claim x86
+pipe writev support.

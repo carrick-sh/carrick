@@ -1820,6 +1820,36 @@ mod ring_first_tests {
     }
 
     #[test]
+    fn x86_writev_remains_counted_enosys_under_strict_ring_first() {
+        let refused = [const { AtomicU64::new(0) }; 513];
+        let mut pending = CarrierOwned {
+            set: HostCrossingSet::X86,
+            mutate_forward: false,
+            strict: true,
+            state: crate::abi::entry::LinuxTaskState::new(),
+            native: carrick_syscall_abi::NativeNr(20),
+            admitted: true,
+            result: 42,
+            work: false,
+            handback: false,
+            signal_restore_calls: 0,
+            refused: &refused,
+            forwarded: [const { AtomicU64::new(0) }; 512],
+        };
+        // Main already excludes writev from the strict x86 crossing set.
+        // A claimed family without an x86 IPC venue must still settle as
+        // counted ENOSYS, never leak an unauthorized host replay.
+        assert!(!HostCrossingSet::X86.is_allowed(CanonicalNr::new(66)));
+        assert_eq!(
+            dispatch(66, u64::MAX, &mut pending),
+            CompletionRoute::Served
+        );
+        assert_eq!(pending.result, -38);
+        assert_eq!(pending.forwarded[66].load(Ordering::Relaxed), 0);
+        assert_eq!(refused[20].load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn x86_owned_wait4_survives_pending_host_work() {
         let refused = [const { AtomicU64::new(0) }; 513];
         let mut pending = CarrierOwned {

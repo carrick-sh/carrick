@@ -5,32 +5,10 @@ use carrick_core_abi::service::{
     ExecAdoptionReceipt, ExecSuccessorBacking, ExecSuccessorEntry, ExecSuccessorManifest,
     ServiceCell,
 };
-use carrick_el1::substrate::file::UserCopy;
 use carrick_el1_abi::ipc::{IpcBacking, fd, pipe::End};
 use carrick_kernel::el1_ipc::{HostIpc, HostTable, IpcLimits};
 use carrick_sched_core::{ShortLockSpin, WakeEffects};
 use std::{collections::BTreeMap, sync::Arc};
-
-struct Memory(Vec<u8>);
-impl UserCopy for Memory {
-    fn copy_in(&mut self, dst: &mut [u8], address: u64) -> bool {
-        let Some(src) = self.0.get(address as usize..address as usize + dst.len()) else {
-            return false;
-        };
-        dst.copy_from_slice(src);
-        true
-    }
-    fn copy_out(&mut self, address: u64, src: &[u8]) -> bool {
-        let Some(dst) = self
-            .0
-            .get_mut(address as usize..address as usize + src.len())
-        else {
-            return false;
-        };
-        dst.copy_from_slice(src);
-        true
-    }
-}
 
 #[test]
 fn serial_host_native_fork_exec_pipe_writer_reaches_its_parent() {
@@ -270,14 +248,23 @@ fn serial_host_native_fork_exec_pipe_writer_reaches_its_parent() {
         region: owner.region(),
         tables: &tables,
     };
-    let mut memory = Memory(vec![0; 1024]);
-    memory.0[128..130].copy_from_slice(b"1\n");
-    memory.0[256..260].copy_from_slice(b"2\n3\n");
-    for (index, word) in [128u64, 2, 256, 4].into_iter().enumerate() {
-        memory.0[index * 8..index * 8 + 8].copy_from_slice(&word.to_ne_bytes());
+    let mut memory = carrick_test_support::GuestUserBuffer::zeroed(1024);
+    memory.as_mut_bytes()[128..130].copy_from_slice(b"1\n");
+    memory.as_mut_bytes()[256..260].copy_from_slice(b"2\n3\n");
+    for (index, word) in [memory.arg() + 128, 2, memory.arg() + 256, 4]
+        .into_iter()
+        .enumerate()
+    {
+        memory.as_mut_bytes()[index * 8..index * 8 + 8].copy_from_slice(&word.to_ne_bytes());
     }
     let mut cpu = crate::sched::FakeCpu::default();
-    let mut call = |nr, fd, address, count, memory: &mut Memory| {
+    assert_eq!(fixture.slot.raw(), 0);
+    // SAFETY: zero is the valid empty name-cache state; retained by fixture.
+    let names = unsafe {
+        &*std::alloc::alloc_zeroed(std::alloc::Layout::new::<carrick_el1_abi::InotifyNameCache>())
+            .cast::<carrick_el1_abi::InotifyNameCache>()
+    };
+    let mut call = |nr, fd, address, count| {
         let mut frame = carrick_el1_abi::TrapFrame {
             elr: 0x400004,
             slot: u64::from(fixture.slot.raw()),
@@ -287,36 +274,39 @@ fn serial_host_native_fork_exec_pipe_writer_reaches_its_parent() {
         frame.x[0] = fd;
         frame.x[1] = address;
         frame.x[2] = count;
-        let mut sched = crate::sched::Sched {
-            handoff: None,
-            zone: fixture.zone,
-            slot: fixture.slot,
-            task: &fixture.task,
-            cpu: &mut cpu,
-            user: &crate::sched::HardwareUserWord,
-            counters: &counters,
-        };
-        assert_eq!(
-            crate::ipc::serve_ipc_with_signals(
-                &mut sched,
-                &mut frame,
-                &venue,
-                memory,
-                true,
-                &mut || false
-            )
-            .0,
-            crate::ipc::IpcServed::Returned { switched: false }
+        let action = crate::dispatch::dispatch_syscall_with_ipc(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            names,
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            }),
+            Some(&venue),
+            |_| core::ptr::null_mut(),
+        );
+        assert!(
+            matches!(
+                action,
+                carrick_el1_abi::Action::Served | carrick_el1_abi::Action::ServedWithWork
+            ),
+            "production IPC dispatch: {action:?}"
         );
         frame.x[0]
     };
     assert_eq!(
-        call(64, 4, 128, 2, &mut memory),
+        call(64, 4, memory.arg() + 128, 2),
         2,
         "exec successor's scalar write"
     );
     assert_eq!(
-        call(66, 4, 0, 2, &mut memory),
+        call(66, 4, memory.arg(), 2),
         6,
         "exec successor's vector write"
     );
@@ -327,7 +317,7 @@ fn serial_host_native_fork_exec_pipe_writer_reaches_its_parent() {
             .is_queued()
     );
     activate_target(source, &fixture.task, &parent_binding);
-    assert_eq!(call(63, 3, 512, 8, &mut memory), 8);
-    assert_eq!(&memory.0[512..520], b"1\n1\n2\n3\n");
+    assert_eq!(call(63, 3, memory.arg() + 512, 8), 8);
+    assert_eq!(&memory.as_mut_bytes()[512..520], b"1\n1\n2\n3\n");
     registry.unregister_root_for_test(&runtime);
 }

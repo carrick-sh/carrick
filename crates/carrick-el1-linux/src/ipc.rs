@@ -692,18 +692,28 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
     match region.begin_operation(op) {
         Ok(token) => {
             if vectored {
+                let mut header_copy_refused = false;
                 let imported =
                     region.import_vectors(&token, frame.x[2] as usize, |index, header| {
-                        frame.x[1]
-                            .checked_add(index as u64 * 16)
-                            .is_some_and(|address| {
-                                PrefixCopy::new(user).copy_in(header, address) == header.len()
-                            })
+                        let copied =
+                            frame.x[1]
+                                .checked_add(index as u64 * 16)
+                                .is_some_and(|address| {
+                                    PrefixCopy::new(user).copy_in(header, address) == header.len()
+                                });
+                        header_copy_refused |= !copied;
+                        copied
                     });
                 let total = match imported {
                     Ok(total) => total.min(linux::MAX_RW_COUNT),
                     Err(error) => {
                         finish(sched, token, region);
+                        if header_copy_refused {
+                            // As with EventFdWrite, a refused copy may need
+                            // first-touch backing. No effect has occurred:
+                            // let the existing fault owner resolve it.
+                            return refuse(sched, IpcLeave::CopyInFault);
+                        }
                         return Admission::Immediate(match error {
                             carrick_el1_abi::ipc::VectorImportError::Invalid => linux::EINVAL,
                             carrick_el1_abi::ipc::VectorImportError::Fault => {
@@ -2877,7 +2887,14 @@ mod tests {
             (0x90000, 1025, -22),
         ] {
             let mut f = syscall(66, writer, address, count, A_SVC);
-            assert_eq!((w.call(&mut f), f.x[0] as i64), (RETURNED, errno));
+            if count <= 1024 {
+                assert_eq!(
+                    (w.call(&mut f), f.x[0]),
+                    (IpcServed::Forward, writer as u64)
+                );
+            } else {
+                assert_eq!((w.call(&mut f), f.x[0] as i64), (RETURNED, errno));
+            }
             assert_eq!(w.region.descriptor_allocations(), baseline);
         }
         let invalid_length = [0u64, 1u64 << 63]
@@ -4435,6 +4452,93 @@ mod tests {
         assert_eq!(frame.x[0], 1);
         assert_eq!(w.counters.served[SYS_WRITE].load(Ordering::Relaxed), 1);
         assert_eq!(host_calls(&w), 0);
+    }
+
+    #[test]
+    fn el1_ipc_writev_header_first_touch_retries_through_dispatch() {
+        let w = world();
+        let t = w.table(w.a_tid);
+        let (_r, wfd, object) = w.pipe(t, BLOCK);
+        let baseline = w.region.descriptor_allocations();
+        let tasks: Vec<CurrentTask> = (0..=SLOT.raw() as usize)
+            .map(|_| CurrentTask::new())
+            .collect();
+        let task = &tasks[SLOT.raw() as usize];
+        task.set(
+            El1TaskId::from_linux_tid(101),
+            carrick_el1_abi::SnapshotGeneration::from_raw(1),
+            5,
+        );
+        task.mm.key.store(MM, Ordering::Relaxed);
+        let venue = w.venue();
+        // SAFETY: all-zero is a valid empty name cache.
+        let names: &carrick_el1_abi::InotifyNameCache = unsafe {
+            &*std::alloc::alloc_zeroed(Layout::new::<carrick_el1_abi::InotifyNameCache>()).cast()
+        };
+        let mut cpu = FakeCpu::default();
+        // The dispatcher copies through EL1's validated user copy, which in a
+        // host test reads process memory directly at a guest user VA.
+        let byte = carrick_test_support::GuestUserBuffer::from_bytes(b"x");
+        let headers = carrick_test_support::GuestUserBuffer::from_values(&[byte.arg(), 1u64]);
+        let mut frame = syscall(66, wfd, headers.arg(), 1, A_SVC);
+        crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
+        let action = crate::dispatch::dispatch_syscall_with_ipc(
+            &mut frame,
+            w.counters,
+            &tasks,
+            &[],
+            &[],
+            &[],
+            &[],
+            names,
+            Some(crate::dispatch::Zone {
+                tables: &w.zone,
+                cpu: &mut cpu,
+                user: &HardwareUserWord,
+            }),
+            Some(&venue),
+            |_| core::ptr::null_mut(),
+        );
+        crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
+        assert_eq!(action, carrick_el1_abi::Action::Forward);
+        assert_eq!(frame.x[0], wfd as u64);
+        assert_eq!(w.region.descriptor_allocations(), baseline);
+        assert_eq!(
+            w.region
+                .lock(object, &HostWait)
+                .unwrap()
+                .pipe()
+                .unwrap()
+                .unread_bytes(),
+            0
+        );
+        let action = crate::dispatch::dispatch_syscall_with_ipc(
+            &mut frame,
+            w.counters,
+            &tasks,
+            &[],
+            &[],
+            &[],
+            &[],
+            names,
+            Some(crate::dispatch::Zone {
+                tables: &w.zone,
+                cpu: &mut cpu,
+                user: &HardwareUserWord,
+            }),
+            Some(&venue),
+            |_| core::ptr::null_mut(),
+        );
+        assert_eq!(action, carrick_el1_abi::Action::Served);
+        assert_eq!(frame.x[0], 1);
+        assert_eq!(w.counters.served[66].load(Ordering::Relaxed), 1);
+        assert_eq!(w.region.descriptor_allocations(), baseline);
+        assert_eq!(w.counters.forwarded[66].load(Ordering::Relaxed), 1);
+        assert_eq!(
+            host_calls(&w),
+            1,
+            "only the refused first-touch call forwards"
+        );
     }
 
     /// The slot's task table as EL1 publishes it for the thread `w.task`

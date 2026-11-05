@@ -1437,3 +1437,38 @@ fn el1_ipc_empty_owner_read_does_not_touch_invalid_destination() {
         assert_eq!(memory.inner.read_bytes(BUF, 6).unwrap(), [0xa5; 6]);
     }
 }
+
+#[test]
+fn el1_ipc_vector_handback_preserves_short_prefix_at_vector_boundary() {
+    let w = world();
+    let (_reader, writer, object) = w.pipe();
+    let token = w.operation(writer, IpcOpKind::PipeWrite, 6, 66);
+    w.region
+        .import_vectors(&token, 2, |index, header| {
+            let base = if index == 0 { BUF + 4095 } else { BUF + 8192 };
+            header[..8].copy_from_slice(&base.to_ne_bytes());
+            header[8..].copy_from_slice(&3u64.to_ne_bytes());
+            true
+        })
+        .unwrap();
+    w.hand_back(&token, IpcHandback::Continue, 0, 0);
+    let mut memory = LinearMemory::new(BUF, vec![b'x'; 4096]);
+    let result = complete_handback(
+        &caller(),
+        w.region,
+        token,
+        MM,
+        &mut memory,
+        None,
+        &Wakes::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        result,
+        IpcHostOutcome::Complete {
+            result: 1,
+            sigpipe: false
+        }
+    );
+    assert_eq!(w.unread(object), 1);
+}

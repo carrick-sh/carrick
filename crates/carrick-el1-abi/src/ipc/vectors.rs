@@ -25,18 +25,23 @@ pub(super) struct VectorStorage {
 /// The word is a free-list link only while the slot is free, and a typed
 /// allocation receipt only while its generation-authenticated token is live.
 #[repr(transparent)]
-pub(super) struct SlotCustody(AtomicU64);
+pub(super) struct SlotCustody<A = AtomicU64>(A);
 const COUNT_BITS: u32 = 11;
 const OFFSET_SHIFT: u32 = 16;
 impl SlotCustody {
     pub(super) fn free_link(&self) -> &AtomicU64 {
         &self.0
     }
+}
+// Header bytes are written before custody is published; a receiving lane
+// acquires that publication before dereferencing the allocation. Token
+// ownership still excludes concurrent mutation and reclamation.
+impl<A: carrick_core_abi::SeqAtomic> SlotCustody<A> {
     pub(super) fn clear_live(&self) {
-        self.0.store(0, Ordering::Relaxed);
+        self.0.store(0, Ordering::Release);
     }
     fn live_vectors(&self) -> Result<VectorStorage, IpcError> {
-        let raw = self.0.load(Ordering::Relaxed);
+        let raw = self.0.load(Ordering::Acquire);
         if raw == 0 {
             return Ok(VectorStorage::default());
         }
@@ -73,7 +78,7 @@ impl SlotCustody {
         let order = storage.bytes.ilog2() - IPC_POOL_ALIGN.ilog2();
         self.0.store(
             (page << OFFSET_SHIFT) | (u64::from(order) << COUNT_BITS) | storage.count,
-            Ordering::Relaxed,
+            Ordering::Release,
         );
         Ok(())
     }
@@ -268,5 +273,41 @@ impl IpcRegion<'_> {
             slot.custody.clear_live();
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "loom"))]
+mod publication_tests {
+    use super::*;
+    use crate::loom_models::LoomNameCacheAtomic;
+    use loom::{sync::Arc, sync::atomic::AtomicU64, thread};
+
+    #[test]
+    fn vector_custody_publishes_initialized_headers() {
+        loom::model(|| {
+            let custody = Arc::new(SlotCustody(LoomNameCacheAtomic::default()));
+            let header = Arc::new(AtomicU64::new(0));
+            let writer = {
+                let custody = custody.clone();
+                let header = header.clone();
+                thread::spawn(move || {
+                    header.store(91, Ordering::Relaxed);
+                    assert_eq!(
+                        custody.publish_vectors(VectorStorage {
+                            offset: 0,
+                            bytes: IPC_POOL_ALIGN,
+                            count: 1,
+                        }),
+                        Ok(())
+                    );
+                })
+            };
+            let observed = custody.live_vectors().map(|storage| storage.count);
+            assert!(observed.is_ok());
+            if observed == Ok(1) {
+                assert_eq!(header.load(Ordering::Relaxed), 91);
+            }
+            assert!(writer.join().is_ok());
+        });
     }
 }
