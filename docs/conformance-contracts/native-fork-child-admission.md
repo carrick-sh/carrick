@@ -83,3 +83,11 @@ The Linux adapter retains namespace allocation, control reset and scheduler
 wiring. No lifecycle ceiling, concurrency, wait policy or work budget changes.
 The existing two-live-process allocation, reuse, final-pin, Claimed-sibling
 and ExitingBorn-sibling bindings exercise this owner through native dispatch.
+
+The #1504 binding `native_fork_child_altstacktid_two_live_threads` follows
+`altstacktid`'s actual B-set/A-set/B-read sequence through native dispatch.
+A native fork child creates its worker through clone while its parent stays
+live. Exactly three scheduler yields select worker, leader, worker; every
+sigaltstack call must be served and the worker must retain its own stack.
+There is no polling wait or signal delivery in this scenario. This VM-free
+witness cannot establish guest libc execution or signed probe completion.

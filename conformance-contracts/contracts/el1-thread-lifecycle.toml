@@ -78,6 +78,7 @@ embed = [
 # zone admission record has already been released. One control-wake batch is
 # applied per retained lifecycle page; this does not complete guest waits.
 vm_free = [
+  "carrick-el1-linux::aarch64_process_tests::native_fault_supply_tests::native_fork_child_altstacktid_two_live_threads (production native fork and clone, two live threads, B-set/A-set/B-read sigaltstack isolation with exactly three scheduler yields; no guest instructions or signal delivery)",
   "carrick-el1-linux::dispatch::tests::native_service_refusals_keep_the_error_in_the_fatal_transport",
   "carrick-el1-abi::entry_binding_fatal::tests::{fatal_detail_round_trip_and_formatter,entry_binding_fatal_capture_keeps_two_slot_identities_and_saved_registers}",
   "carrick-el1-linux::aarch64_process_tests::native_child_handoff_tests::{arm_native_fork_child_stdout_service_keeps_exact_entry,arm_native_fork_child_stdout_retains_capability_after_root_exit_publication,arm_native_fork_tree_releases_capability_after_last_exit} (real fork-child host-file bridge across root exit_group publication and final tree release)",

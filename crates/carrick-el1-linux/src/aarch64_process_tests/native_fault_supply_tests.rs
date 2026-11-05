@@ -212,6 +212,15 @@ fn native_fork_child_first_allocation_and_thread_admission() {
     child_thread_admission(1, 1, ChildStockCase::FirstBirth);
 }
 
+/// #1504: altstacktid's actual operation is B-set, A-set, B-read, with
+/// no signal delivery. Bound scheduling to three yields rather than spinning
+/// forever if the native child cannot create or select its second thread.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn native_fork_child_altstacktid_two_live_threads() {
+    child_thread_admission(1, 1, ChildStockCase::Altstack);
+}
+
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn native_fork_child_refills_retires_and_reuses_thread_stock() {
@@ -273,6 +282,7 @@ enum GroupExitCaller {
 #[cfg(not(target_os = "macos"))]
 #[derive(Clone, Copy, PartialEq)]
 enum ChildStockCase {
+    Altstack,
     FirstBirth,
     Reuse,
     Pinned,
@@ -442,6 +452,49 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
             tids.push(frame.x[0] as u32);
         }
         if case == ChildStockCase::FirstBirth {
+            return;
+        }
+        if case == ChildStockCase::Altstack {
+            use carrick_test_support::GuestUserBuffer;
+            let stack_b = GuestUserBuffer::from_value([0x6000_0000u64, 0, 65536]);
+            let stack_a = GuestUserBuffer::from_value([0x7000_0000u64, 0, 65536]);
+            let readback = GuestUserBuffer::zeroed(24);
+            // B sets its stack, A sets a different stack, B reads its own.
+            for (expected_tid, input, output) in [
+                (u64::from(tids[0]), stack_b.arg(), 0),
+                (identity.tid, stack_a.arg(), 0),
+                (u64::from(tids[0]), 0, readback.arg()),
+            ] {
+                let mut handoff = None;
+                let mut zone = crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &crate::sched::HardwareUserWord,
+                };
+                assert!(
+                    crate::dispatch::native_scheduler(
+                        &mut zone,
+                        &fixture.task,
+                        &counters,
+                        fixture.slot,
+                        &mut handoff,
+                    )
+                    .yield_queued(&mut frame)
+                    .is_some()
+                );
+                let selected = fixture.zone.slot(fixture.slot).current().unwrap();
+                assert_eq!(fixture.zone.record(selected).identity().tid, expected_tid);
+                frame.x[8] = 132; // sigaltstack
+                frame.x[..6].copy_from_slice(&[input, output, 0, 0, 0, 0]);
+                assert!(matches!(
+                    loan_call(fixture, &mut frame, &mut cpu, &mut service, &counters),
+                    carrick_personality_linux::dispatch::CompletionRoute::Served
+                        | carrick_personality_linux::dispatch::CompletionRoute::WithWork
+                ));
+                assert_eq!(frame.x[0] as i64, 0);
+                assert_eq!(page.live(), 2, "leader and worker remain live");
+            }
+            assert_eq!(readback.read::<[u64; 3]>(0), [0x6000_0000, 0, 65536]);
             return;
         }
         if let ChildStockCase::GroupExit(caller) = case {
