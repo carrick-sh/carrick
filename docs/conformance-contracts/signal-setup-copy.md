@@ -47,6 +47,29 @@ the original arguments for redispatch, preserve the old-value sentinel until
 completion, and publish the pre-change mask once. This physical-boundary
 injection is not an instruction-execution or live libc witness.
 
+A root MM's lazy file backing is supplied by its existing exact transfer
+publication authority, authenticated by carrier, MM incarnation, root and ASID.
+Fork children retain their separate existing stock custody checks. Both root
+service supply and synchronous transfer consume the same owned physical grant;
+preparation keeps registry and invocation guards local. An exact service/reply
+ledger, bounded by the admitted record population, retains the grant through
+publication and descriptor settlement. Cancellation withdraws an unclaimed
+submission before rollback; claimed or uncertain visibility retains custody.
+Prepared pages pin their authenticated existing backing and publish its exact
+IPA instead of allocating a replacement.
+
+Physical producer waits enroll before probing and publish one edge on the
+owner's existing notification source. VM teardown closes enrollment and joins
+both enrollment turns and callback snapshots before releasing the ABI mapping.
+Only the lifecycle owner opens admission for a new VM. A reservation change
+between selection and revalidation retains the original selected wait source;
+it cannot become a source-free Busy redispatch.
+
+The signed root witness generates an ARM ELF that maps a readonly mask file
+without touching it before in-ring `rt_sigprocmask`. It checks the old, applied
+and restored masks and forbids forwarding. This exercises the actual physical
+root supply that the VM-free guarded-copy witness cannot execute.
+
 Signed evidence uses the restored, input-identity-verified GNU and musl thread
 probes on HVF. The committed probe oracle and director supply Linux authority;
 Docker is unavailable on this worker. No runtime-ratio acceptance is inferred

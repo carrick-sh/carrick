@@ -1,5 +1,6 @@
 //! Physical first-touch readiness shared by the backend producer and owner
-//! memory waiters. The sole completion stays on the serving executor's stack.
+//! memory waiters. Preparation retains the sole producer on its stack, or
+//! transfers it into the exact descriptor-receipt owner.
 
 use crate::completion::CompletionCallbacks;
 use std::marker::PhantomData;
@@ -38,7 +39,8 @@ impl Drop for PhysicalGrantProducer {
 }
 
 /// Last producer release signals readiness. This token is neither `Clone`
-/// nor `Send`, so an MM ledger or owned continuation cannot retain it.
+/// nor `Send`. An exact-receipt owner may consume it with `into_owned` after
+/// preparation exclusion ends; ordinary continuations retain only the waiter.
 ///
 /// ```compile_fail
 /// fn require_send<T: Send>() {}
@@ -56,6 +58,14 @@ impl PhysicalGrantCompletion {
             )),
             PhantomData,
         )
+    }
+
+    /// Transfer the sole producer to an exact-receipt owner. Preparation
+    /// exclusion remains local; that owner retains readiness until its
+    /// descriptor settlement or physical rollback completes. This consumes
+    /// the stack token without publishing or creating another producer.
+    pub fn into_owned(self) -> OwnedPhysicalGrantCompletion {
+        OwnedPhysicalGrantCompletion { _producer: self.0 }
     }
 
     pub fn wait_weak(&self) -> Weak<PhysicalGrantWait> {
@@ -76,3 +86,35 @@ impl PartialEq for PhysicalGrantCompletion {
 }
 
 impl Eq for PhysicalGrantCompletion {}
+
+/// The same sole readiness producer, retained by an owned physical grant.
+/// There is no cloning API; its last release preserves the stack token's
+/// publication ordering while permitting an authenticated service handoff.
+#[derive(Debug)]
+#[must_use = "retain custody through descriptor settlement or physical rollback"]
+pub struct OwnedPhysicalGrantCompletion {
+    _producer: Arc<PhysicalGrantProducer>,
+}
+
+#[cfg(test)]
+mod owned_tests {
+    use super::*;
+    use carrick_guest_mem::PhysicalMemoryWait;
+
+    #[test]
+    fn owned_handoff_keeps_same_producer_until_cross_thread_release() {
+        let completion = PhysicalGrantCompletion::new();
+        let wait = completion.wait_weak().upgrade().unwrap();
+        let owned = completion.into_owned();
+        assert!(!wait.is_ready(), "handoff cannot signal physical readiness");
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_wakes = wakes.clone();
+        let (_subscription, ready) = wait.enroll(Arc::new(move || {
+            callback_wakes.fetch_add(1, Ordering::AcqRel);
+        }));
+        assert!(!ready);
+        std::thread::spawn(move || drop(owned)).join().unwrap();
+        assert!(wait.is_ready());
+        assert_eq!(wakes.load(Ordering::Acquire), 1);
+    }
+}
