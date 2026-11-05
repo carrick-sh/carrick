@@ -13,6 +13,9 @@
 
 mod common;
 
+#[path = "common/root_signal_copy.rs"]
+mod root_signal_copy;
+
 use carrick_embed::ContainerBuilder;
 use carrick_image::PullPolicy;
 

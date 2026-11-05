@@ -944,7 +944,7 @@ impl MmAccessState {
 
 /// Exact-MM local publication permit. Only this constructor acquires exclusion;
 /// callers cannot substitute an arbitrary FrameCowQuiesce implementation.
-pub(super) struct PublicationContext<'a> {
+pub(crate) struct PublicationContext<'a> {
     mm_key: std::num::NonZeroU64,
     state: std::sync::Arc<MmAccessState>,
     custody: std::sync::Arc<CarrierVmCustody>,
@@ -960,7 +960,7 @@ impl<'a> PublicationContext<'a> {
     /// A physical grant selected by the target EL1 owner. No host policy
     /// snapshot or caller-vCPU identity can authorize this constructor. The
     /// guest revalidates the generation and window before exposing leaves.
-    pub(super) fn for_transfer(
+    pub(crate) fn for_transfer(
         state: std::sync::Arc<MmAccessState>,
         custody: std::sync::Arc<CarrierVmCustody>,
         target: carrick_aarch64::user_transfer::TransferTarget,
@@ -2437,16 +2437,65 @@ mod arena_pin_tests {
 
 /// A target-selected grant owns its exact physical and inventory receipts
 /// before a descriptor can name it. Drop settles only those identities.
+struct TransferGrantAuthorities {
+    state: std::sync::Arc<MmAccessState>,
+    custody: std::sync::Arc<CarrierVmCustody>,
+    authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
+}
+
+struct OwnedTransferPublication {
+    _completion: carrick_thread::physical_grant::OwnedPhysicalGrantCompletion,
+    alias: AliasBacking,
+    ready: carrick_hal::El1FrameGrantReady,
+    receipt: carrick_hal::FrameInventoryApplyReceipt,
+    inventory_entry: ((u64, u64), InventoryExtent),
+}
+impl From<PublishedFrameGrant> for OwnedTransferPublication {
+    fn from(publication: PublishedFrameGrant) -> Self {
+        let PublishedFrameGrant {
+            completion,
+            region,
+            alias,
+            ready,
+            receipt,
+            inventory_entry,
+        } = publication;
+        // Dynamic publication regions carry no independent mapping custody;
+        // retained stage-2 owners and the exact receipt own these bytes.
+        debug_assert!(region.memory.is_none() && region.host_mapping.is_none());
+        drop(region);
+        Self {
+            _completion: completion.into_owned(),
+            alias,
+            ready,
+            receipt,
+            inventory_entry,
+        }
+    }
+}
+
 pub(super) struct PendingTransferGrant {
-    context: PublicationContext<'static>,
-    // Failed preparation rolls back under the guard already held by its owner.
-    registry: Option<crate::fork_quiesce::FrameRegistryGuard<'static>>,
-    publication: Option<PublishedFrameGrant>,
+    context: TransferGrantAuthorities,
+    publication: Option<OwnedTransferPublication>,
     pin: Option<CarrierStage2Pin>,
     record: Option<CarrierStage2RecordIdentity>,
     txn: Option<carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn>,
     descriptor_settled: bool,
 }
+// Only preparation owns the registry exclusion. A refused preparation must
+// roll back before releasing it; the returned grant must never retain it.
+struct TransferGrantPreparation {
+    pending: Option<PendingTransferGrant>,
+    registry: crate::fork_quiesce::FrameRegistryGuard<'static>,
+}
+impl Drop for TransferGrantPreparation {
+    fn drop(&mut self) {
+        if let Some(pending) = self.pending.as_mut() {
+            pending.rollback(Some(&self.registry));
+        }
+    }
+}
+
 impl PublicationContext<'static> {
     pub(super) fn finish_maintenance(&self) -> Result<(), TrapError> {
         self.authority
@@ -2472,7 +2521,141 @@ impl PublicationContext<'static> {
         // inventory only; do not reclassify through the host table mirror.
         Ok(super::guest_cow::provision_guest_cow_grants(&self.state, &self.custody, pool, 1)? != 0)
     }
-    pub(super) fn prepare_transfer(
+    /// Publish an already prepared page without allocating replacement backing.
+    /// Residency, inventory, alias and physical owner must agree under the same
+    /// registry exclusion before retaining the exact stage-2 pin.
+    pub(crate) fn prepare_resident_transfer(
+        self,
+        window: carrick_el1_abi::PortalGrantWindow,
+    ) -> Result<carrick_aarch64::user_transfer::TransferPreparation, TrapError> {
+        use carrick_aarch64::user_transfer::TransferPreparation;
+        use carrick_mmu_core::aarch64::descriptor_txn::{DescriptorOp, PageSpan};
+        use carrick_mmu_core::aarch64::{LeafAccess, SubstrateGpa};
+        let invalid =
+            || TrapError::Hypervisor("prepared transfer physical authority mismatch".into());
+        if !window.valid()
+            || window.range.start() != window.fault_page
+            || window.range.len() != 4096
+            || window.operation.mm.raw() != self.mm_key.get()
+            || window.operation.carrier != self.custody.transfer_carrier
+        {
+            return Err(invalid());
+        }
+        let binding = self.state.cow_runtime.read().clone().ok_or_else(invalid)?;
+        let _registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+            carrick_observability::probes::HvpatchTopologyOperation::SiblingMaterialize,
+            binding.identity.linux_pid,
+            binding.identity.linux_tid,
+        );
+        let page = carrick_el1_abi::frame_grant_residency_host()
+            .and_then(|table| table.lookup(window.operation.mm.raw(), window.fault_page))
+            .ok_or_else(invalid)?;
+        let identity = page.identity;
+        let aliases = alias_registry().lock().overlapping_process_aliases(
+            window.fault_page,
+            4096,
+            self.mm_root_slot,
+            self.container_root,
+        );
+        let alias = aliases
+            .iter()
+            .map(|(_, alias)| alias)
+            .find(|alias| {
+                window.fault_page >= alias.start
+                    && window
+                        .fault_page
+                        .checked_add(4096)
+                        .is_some_and(|end| end <= alias.start.saturating_add(alias.size as u64))
+                    && alias.ipa.checked_add(window.fault_page - alias.start)
+                        == Some(page.expected_ipa)
+                    && alias.owner_generation == identity.owner_generation
+            })
+            .ok_or_else(invalid)?;
+        let key = (alias.physical_ipa, alias.physical_size as u64);
+        let owner = self
+            .custody
+            .global_frame_host_owners
+            .lock()
+            .get(&key)
+            .and_then(GlobalFrameOwnerEntry::live_owner)
+            .cloned()
+            .ok_or_else(invalid)?;
+        if owner.generation() != identity.owner_generation
+            || owner.host_addr() != alias.physical_host_addr
+        {
+            return Err(invalid());
+        }
+        if let Some(wait) = owner.pending_grant() {
+            return Ok(TransferPreparation::Pending(wait));
+        }
+        let inventory = self.state.frame_inventory.ledger.lock();
+        let extent = inventory.extents.get(&key).ok_or_else(invalid)?;
+        if identity.mm_key != window.operation.mm.raw()
+            || extent.frame.raw() != identity.frame_id
+            || extent.mapping.raw() != identity.mapping_id
+            || page.expected_ipa
+                != identity
+                    .physical_ipa
+                    .checked_add(
+                        window
+                            .fault_page
+                            .checked_sub(identity.semantic_base)
+                            .ok_or_else(invalid)?,
+                    )
+                    .ok_or_else(invalid)?
+            || !self.authority.mapping_is_live_exact_generation(
+                extent.mapping,
+                extent.frame,
+                carrick_hal::MappingGeneration::from_backend_counter(
+                    std::num::NonZeroU64::new(identity.owner_generation).ok_or_else(invalid)?,
+                ),
+                carrick_guest_mem::Gpa::new(key.0),
+                carrick_hal::FrameLength::from_mapping_extent(
+                    std::num::NonZeroU64::new(key.1).ok_or_else(invalid)?,
+                ),
+            )
+        {
+            return Err(invalid());
+        }
+        let pin = self
+            .custody
+            .pin_stage2_record(owner.record_identity)
+            .map_err(|_| invalid())?;
+        drop(inventory);
+        let access = if window.protection.bits() & 3 != 0 {
+            LeafAccess::Read
+        } else {
+            LeafAccess::Execute
+        };
+        let txn = self
+            .state
+            .page_tables_authority()
+            .prepare_guest_descriptor_txn(
+                std::num::NonZeroU64::new(window.operation.mm.raw()).ok_or_else(invalid)?,
+                DescriptorOp::Publish {
+                    span: PageSpan::new(window.fault_page, 4096),
+                    expected_ipa: SubstrateGpa(page.expected_ipa),
+                    access,
+                },
+            )
+            .map_err(|error| {
+                TrapError::Hypervisor(format!("prepared descriptor transaction: {error:?}"))
+            })?;
+        Ok(TransferPreparation::Grant(Box::new(PendingTransferGrant {
+            context: TransferGrantAuthorities {
+                state: self.state,
+                custody: self.custody,
+                authority: self.authority,
+            },
+            publication: None,
+            pin: Some(pin),
+            record: Some(owner.record_identity),
+            txn: Some(txn),
+            descriptor_settled: false,
+        })))
+    }
+
+    pub(crate) fn prepare_transfer(
         self,
         window: carrick_el1_abi::PortalGrantWindow,
     ) -> Result<carrick_aarch64::user_transfer::TransferPreparation, TrapError> {
@@ -2618,15 +2801,26 @@ impl PublicationContext<'static> {
             },
             &registry,
         )?;
-        let mut pending = PendingTransferGrant {
-            context: self,
-            registry: Some(registry),
-            publication: Some(publication),
+        let pending = PendingTransferGrant {
+            context: TransferGrantAuthorities {
+                state: self.state.clone(),
+                custody: self.custody.clone(),
+                authority: self.authority.clone(),
+            },
+            publication: Some(publication.into()),
             pin: None,
             record: None,
             txn: None,
             descriptor_settled: false,
         };
+        let mut preparation = TransferGrantPreparation {
+            pending: Some(pending),
+            registry,
+        };
+        let pending = preparation
+            .pending
+            .as_mut()
+            .ok_or_else(|| failure("preparation lost pending grant".into()))?;
         let publication = pending.publication.as_ref().unwrap_or_else(|| {
             carrick_fatal!(
                 "hvpatch::user_transfer",
@@ -2703,16 +2897,47 @@ impl PublicationContext<'static> {
         }
         if !global_frame::register_shared_alias_if_vacant(
             publication.alias,
-            pending.context.mm_root_slot,
-            pending.context.container_root,
+            self.mm_root_slot,
+            self.container_root,
         ) {
             return Ok(TransferPreparation::Declined);
         }
-        drop(pending.registry.take());
+        let pending = preparation
+            .pending
+            .take()
+            .ok_or_else(|| failure("preparation lost pending grant".into()))?;
+        drop(preparation);
         Ok(TransferPreparation::Grant(Box::new(pending)))
     }
 }
 impl carrick_aarch64::user_transfer::TransferGrant for PendingTransferGrant {
+    fn release_destroyed_vm(&mut self) -> Result<(), TrapError> {
+        let identity = self
+            .record
+            .ok_or_else(|| TrapError::Hypervisor("grant has no retained VM record".into()))?;
+        let record = self
+            .context
+            .custody
+            .stage2_record_snapshot(identity.record_id)
+            .ok_or_else(|| TrapError::Hypervisor("grant destroyed-VM record missing".into()))?;
+        if record.vm_generation != identity.vm_generation
+            || record.logical_owner != identity.logical_owner
+            || !record.terminalized_by_vm_destroy
+            || record.mapped
+        {
+            return Err(TrapError::Hypervisor(
+                "grant VM remains live or changed".into(),
+            ));
+        }
+        // No descriptor can remain visible in this destroyed generation.
+        // Teardown owns the tables and backing; do not run live rollback.
+        self.descriptor_settled = true;
+        self.txn.take();
+        drop(self.pin.take());
+        self.publication.take();
+        Ok(())
+    }
+
     fn transaction(&self) -> &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn {
         self.txn.as_ref().unwrap_or_else(|| {
             carrick_fatal!(
@@ -2789,15 +3014,15 @@ impl carrick_aarch64::user_transfer::TransferGrant for PendingTransferGrant {
         Ok(applied || stale_root)
     }
 }
-impl Drop for PendingTransferGrant {
-    fn drop(&mut self) {
+impl PendingTransferGrant {
+    fn rollback(&mut self, registry: Option<&crate::fork_quiesce::FrameRegistryGuard<'_>>) {
         if !self.descriptor_settled
-            && let Some(txn) = self.txn.as_ref()
+            && let Some(txn) = self.txn.take()
         {
             self.context
                 .state
                 .page_tables_authority()
-                .abandon_guest_descriptor_txn(txn)
+                .abandon_guest_descriptor_txn(&txn)
                 .unwrap_or_else(|error| {
                     carrick_fatal!(
                         "hvpatch::user_transfer",
@@ -2820,7 +3045,7 @@ impl Drop for PendingTransferGrant {
                     "pending target lost physical authority"
                 )
             });
-        let _registry = self.registry.take().unwrap_or_else(|| {
+        let _registry = registry.is_none().then(|| {
             crate::fork_quiesce::FrameRegistryGuard::acquire(
                 carrick_observability::probes::HvpatchTopologyOperation::AliasUnmap,
                 binding.identity.linux_pid,
@@ -2915,6 +3140,22 @@ impl Drop for PendingTransferGrant {
         // The local publication retains completion through rollback, physical
         // pin release and every registry/inventory guard. It drops last.
         drop(self.pin.take());
+    }
+}
+
+impl Drop for PendingTransferGrant {
+    fn drop(&mut self) {
+        self.rollback(None);
+    }
+}
+
+#[cfg(test)]
+mod transfer_grant_ownership_tests {
+    #[test]
+    fn pending_transfer_grant_is_owned_and_send() {
+        fn assert_owned_send<T: Send + 'static>() {}
+        assert_owned_send::<super::PendingTransferGrant>();
+        assert_owned_send::<Box<dyn carrick_aarch64::user_transfer::TransferGrant>>();
     }
 }
 
@@ -3171,15 +3412,23 @@ impl PublicationContext<'static> {
         )?;
         // From the first successful publication, every fallible step has an
         // exact rollback owner, including the already-held registry guard.
-        let mut pending = PendingTransferGrant {
-            context: self,
-            registry: Some(registry),
-            publication: Some(publication),
+        let pending = PendingTransferGrant {
+            context: TransferGrantAuthorities {
+                state: self.state.clone(),
+                custody: self.custody.clone(),
+                authority: self.authority.clone(),
+            },
+            publication: Some(publication.into()),
             pin: None,
             record: None,
             txn: None,
             descriptor_settled: false,
         };
+        let mut preparation = TransferGrantPreparation {
+            pending: Some(pending),
+            registry,
+        };
+        let pending = preparation.pending.as_mut().ok_or_else(invalid)?;
         let publication = pending.publication.as_ref().unwrap_or_else(|| {
             carrick_fatal!(
                 "hvpatch::user_transfer",
@@ -3205,8 +3454,8 @@ impl PublicationContext<'static> {
         );
         if !global_frame::register_shared_alias_if_vacant(
             publication.alias,
-            pending.context.mm_root_slot,
-            pending.context.container_root,
+            self.mm_root_slot,
+            self.container_root,
         ) {
             return Err(invalid());
         }
@@ -3224,7 +3473,8 @@ impl PublicationContext<'static> {
                     TrapError::Hypervisor(format!("import executable publication: {error:?}"))
                 })?;
         }
-        drop(pending.registry.take());
+        let pending = preparation.pending.take().ok_or_else(invalid)?;
+        drop(preparation);
         let import = PendingImport {
             permit,
             pending,
