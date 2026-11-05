@@ -26,6 +26,12 @@ The committed assertions restore that measured defect baseline. They do not
 call the final native unclaimed-capture policy or assert errno 38. No carrier
 service, capacity result or full acceptance is proved by this baseline.
 
+The fixture explicitly seeds the shared HostIpc table before real fork
+admission. Its existing dup/flags/close success does not reproduce or explain
+the director's Mac `dupclosestdin` setup failure. Production carrier table
+seeding and inherited stdio must still be compared with this fixture; removing
+Forward entries alone is not evidence that the Mac child can reach the owner.
+
 Backed-pipe growth, range CLOEXEC/UNSHARE, cancellation, concurrent close/reuse,
 and signed execution remain unproved. The implementation is unfinished; keep
 this branch draft and do not promote its allowlist.
