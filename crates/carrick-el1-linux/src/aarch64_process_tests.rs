@@ -10070,7 +10070,7 @@ fn serial_host_native_child_pipe_size_commands_lack_ring_handler() {
 
 #[cfg(not(target_os = "macos"))]
 #[test]
-fn serial_host_native_child_close_range_lacks_ring_handler() {
+fn serial_host_native_child_close_range_cloexec_is_served() {
     native_child_descriptor_family(NativeDescriptorScenario::CloseRange);
 }
 
@@ -10310,17 +10310,47 @@ fn native_child_descriptor_family(scenario: NativeDescriptorScenario) {
         return;
     }
     if scenario == NativeDescriptorScenario::CloseRange {
-        let (route, result) = run_in_child(
-            0,
-            carrick_personality_linux::crossing::nr::CLOSE_RANGE.raw(),
-            [0, 4, 0],
+        let close_range = carrick_personality_linux::crossing::nr::CLOSE_RANGE.raw();
+        assert_eq!(run_in_child(0, sys_fcntl, [1, LINUX_F_SETFD, 0]).1, 0);
+        // A sparse, enormous range is bounded by allocated descriptor storage.
+        assert_eq!(
+            run_in_child(
+                0,
+                close_range,
+                [
+                    3,
+                    u64::from(u32::MAX),
+                    u64::from(carrick_abi::LINUX_CLOSE_RANGE_CLOEXEC)
+                ]
+            ),
+            (CompletionRoute::Served, 0)
         );
-        // Defect baseline: the red-first target requires Served and fd 4
-        // absent only in this child. Current dispatch leaves it unclaimed.
-        assert_eq!(route, CompletionRoute::Forward, "native child close_range");
-        assert_eq!(result, 0);
+        assert_eq!(run_in_child(0, sys_fcntl, [3, LINUX_F_GETFD, 0]).1, 1);
         assert_eq!(run_in_child(0, sys_fcntl, [4, LINUX_F_GETFD, 0]).1, 1);
-        // Fork copied the descriptor table: child 1 retains its writer.
+        assert_eq!(run_in_child(0, sys_fcntl, [5, LINUX_F_GETFD, 0]).1, 1);
+        assert_eq!(run_in_child(0, sys_fcntl, [1, LINUX_F_GETFD, 0]).1, 0);
+        for args in [[4, 3, 0], [0, 4, 1]] {
+            assert_eq!(
+                run_in_child(0, close_range, args),
+                (CompletionRoute::Served, -22)
+            );
+        }
+        // Plain close and UNSHARE remain effect-free refusals pending their
+        // retained-effects and resource-publication owners.
+        for flags in [
+            0,
+            u64::from(carrick_abi::LINUX_CLOSE_RANGE_UNSHARE),
+            u64::from(
+                carrick_abi::LINUX_CLOSE_RANGE_UNSHARE | carrick_abi::LINUX_CLOSE_RANGE_CLOEXEC,
+            ),
+        ] {
+            assert_eq!(
+                run_in_child(0, close_range, [0, 4, flags]).0,
+                CompletionRoute::Forward
+            );
+        }
+        assert_eq!(run_in_child(0, sys_fcntl, [4, LINUX_F_GETFD, 0]).1, 1);
+        assert_eq!(run_in_child(0, sys_fcntl, [1, LINUX_F_GETFD, 0]).1, 0);
         assert!(
             fixture
                 .zone
@@ -10328,7 +10358,9 @@ fn native_child_descriptor_family(scenario: NativeDescriptorScenario) {
                 .is_queued()
         );
         activate_target(source, &task, &child_bindings[1]);
+        assert_eq!(run_in_child(1, sys_fcntl, [3, LINUX_F_GETFD, 0]).1, 0);
         assert_eq!(run_in_child(1, sys_fcntl, [4, LINUX_F_GETFD, 0]).1, 1);
+        assert_eq!(run_in_child(1, sys_fcntl, [5, LINUX_F_GETFD, 0]).1, 0);
         return;
     }
 

@@ -6,25 +6,29 @@ slots and descriptor flags while sharing open descriptions and pipe state.
 Carrick must keep one descriptor namespace and settle each mutation once.
 
 The production-entry two-child fixture already exercises dup, dup3 with
-O_CLOEXEC, F_DUPFD, F_GETFD/F_SETFD, F_GETFL/F_SETFL and close. This slice
-extracts its setup for two additional defect-baseline witnesses:
+O_CLOEXEC, F_DUPFD, F_GETFD/F_SETFD, F_GETFL/F_SETFL and close. Its shared
+setup also drives the following witnesses:
 
 - `serial_host_native_child_pipe_size_commands_lack_ring_handler` calls
   F_GETPIPE_SZ and F_SETPIPE_SZ with 12288 and 131072. Each currently returns
   Forward without changing the input fd. Acceptance must instead serve them,
   with Linux capacities 65536, 16384 and 131072 respectively.
-- `serial_host_native_child_close_range_lacks_ring_handler` calls close_range
-  for descriptors 0..4. It currently returns Forward and leaves fd 4 live in
-  both children. Acceptance must instead serve it, removing fd 4 in only the
-  calling child's table.
+- `serial_host_native_child_close_range_cloexec_is_served` now requires
+  CLOSE_RANGE_CLOEXEC to be Served, including a sparse range ending at
+  UINT_MAX, an in-zone pipe and a host-backed descriptor. Both fork children
+  remain live: only the caller's descriptor flags change. Invalid flags and
+  reversed ranges return errno 22. Plain close and UNSHARE retain the measured
+  effect-free Forward baseline; their selected descriptors remain live.
 
-The successful targets were run before implementation on admitted main
+The original plain-close and pipe-size acceptance targets were run red on admitted main
 `81c091aef5e8aaff3e5e770127c6e31c2b7a03f1` with only the fixture extension:
 `just test-el1-native --only serial_host_native_child`. Both failed with
 `left: Forward`, `right: Served` (GETPIPE_SZ command 1032 and close_range).
-The committed assertions restore that measured defect baseline. They do not
-call the final native unclaimed-capture policy or assert errno 38. No carrier
-service, capacity result or full acceptance is proved by this baseline.
+Previous commits retained that measured defect baseline. This slice serves
+only the additional CLOEXEC case; plain close and pipe sizing remain Forward.
+These direct dispatch fixtures do not call the final native unclaimed-capture
+policy or assert errno 38. No carrier service, capacity result or full-family
+acceptance is proved by the remaining baseline.
 
 The fixture explicitly seeds the shared HostIpc table before real fork
 admission. Its existing dup/flags/close success does not reproduce or explain
@@ -32,7 +36,7 @@ the director's Mac `dupclosestdin` setup failure. Production carrier table
 seeding and inherited stdio must still be compared with this fixture; removing
 Forward entries alone is not evidence that the Mac child can reach the owner.
 
-Backed-pipe growth, range CLOEXEC/UNSHARE, cancellation, concurrent close/reuse,
+Backed-pipe growth, plain range close/UNSHARE, cancellation, concurrent close/reuse,
 and signed execution remain unproved. The implementation is unfinished; keep
 this branch draft and do not promote its allowlist.
 
@@ -79,3 +83,44 @@ lock-order change is implemented here.
 Director-owned signed smoke, complete EL1 population comparison, and the Mac
 `dupclosestdin`/`fcntlpipesz` root-versus-child census and Linux oracle remain
 required. This Linux fixture cannot substitute for them.
+
+## CLOEXEC implementation and plain-close stop
+
+CLOSE_RANGE_CLOEXEC uses the existing fd-core range operation. It holds the
+existing fd-map mutation guard across fd-core flag publication and projection,
+following the same fd-map → fd-core acquisition order as descriptor duplication.
+The projection visits at most FD_MAP_CAPACITY entries once. The core visits at
+most the selected allocated descriptor extent, independent of the numeric upper
+bound; UINT_MAX does not cause UINT_MAX iterations. No object is closed, no
+host service is replayed and no lock survives a park. No new wire record or
+second descriptor namespace is introduced.
+
+Independent review rejected the first plain-close implementation before commit.
+It accumulated CommitOwed after per-fd removal, but CommitOwed replays the
+original numeric syscall. A CLONE_FILES sibling can reuse a removed fd before
+that replay; the host range would then target a different description. A
+later settlement error could also discard an already committed prefix's
+obligations. The VM-free WithWork assertion did not exercise this host cleanup.
+The implementation was removed, rather than asserting it safe from that pass.
+
+A zero-effects preflight is insufficient: effects can be added on pinned open
+descriptions outside the descriptor-table lock. Plain close needs retained
+per-description close-effect receipts in the crossing owner, with exact
+incarnation and caller identity, admission before mutation, cancellation and
+settlement after releasing the table lock. The existing numeric replay cannot
+be used as that receipt. UNSHARE additionally needs the reviewed process-resource
+publication transaction described above. These remain design blockers for the
+full family; the Forward allowlist stays unchanged.
+
+Pipe-capacity reads also need their operation-record exhaustion admission and
+signal policy resolved. Internal object-lock contention must not introduce
+EINTR for this nonblocking metadata operation. The reviewed scalar completion
+must not be placed in byte-transfer progress. No pipe-capacity runtime change
+is included in this slice.
+
+The CLOEXEC production target was also run red with only its harness change
+against the preceding implementation: it returned Forward rather than Served.
+The separate projection witness uses admitted stdio bindings at incarnation 1,
+checks authority refusal leaves flags unchanged, and checks only selected slots
+in the caller's table acquire CLOEXEC. This catches an incorrect `incarnation >
+1` live-slot predicate that would pass core-only F_GETFD assertions.

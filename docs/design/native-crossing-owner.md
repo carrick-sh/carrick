@@ -287,3 +287,23 @@ UNSHARE additionally needs an admitted process-resource transition publishing
 all graph, fd-map and IPC-table identities together. Their wire and publication
 interfaces remain unresolved. This plan does not authorize an independent fd
 namespace, raw syscall fallback or a partial mutation before forwarding.
+
+### Descriptor-family implementation review stop (#1678)
+
+CLOSE_RANGE_CLOEXEC can reuse the existing fd-core range owner and update the
+fd-map projection under its existing mutation guard, in the established
+fd-map → fd-core order. It does not release descriptions or need host close
+effects. Plain close_range is still unserved: an implementation that removes
+slots then replays the numeric range through CommitOwed is unsafe when a
+CLONE_FILES peer reuses a freed number before replay. A failed later removal
+must not discard the already committed prefix's effects either.
+
+Extend the crossing owner's retained close-effect custody before serving plain
+ranges: bind each removed description's exact incarnation and caller, reserve
+settlement storage before mutation, publish the removal and its effects once,
+then settle outside table/map locks. Do not create a second fd path or infer
+cleanup authority from a reused numeric fd. A zero-effects preflight alone is
+not admission because effects may be added through an OFD pin outside the
+table lock. Review this receipt interface and UNSHARE's resource publication
+before coding them. The full #1678 allowlist promotion and signed population
+comparison remain blocked on those owners and backed-pipe resizing.
