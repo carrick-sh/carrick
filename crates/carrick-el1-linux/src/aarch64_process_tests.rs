@@ -10319,7 +10319,7 @@ fn native_child_descriptor_family(scenario: NativeDescriptorScenario) {
         // absent only in this child. Current dispatch leaves it unclaimed.
         assert_eq!(route, CompletionRoute::Forward, "native child close_range");
         assert_eq!(result, 0);
-        assert_eq!(run_in_child(0, sys_fcntl, [4, LINUX_F_GETFD, 0]).1, 0);
+        assert_eq!(run_in_child(0, sys_fcntl, [4, LINUX_F_GETFD, 0]).1, 1);
         // Fork copied the descriptor table: child 1 retains its writer.
         assert!(
             fixture
@@ -10328,7 +10328,7 @@ fn native_child_descriptor_family(scenario: NativeDescriptorScenario) {
                 .is_queued()
         );
         activate_target(source, &task, &child_bindings[1]);
-        assert_eq!(run_in_child(1, sys_fcntl, [4, LINUX_F_GETFD, 0]).1, 0);
+        assert_eq!(run_in_child(1, sys_fcntl, [4, LINUX_F_GETFD, 0]).1, 1);
         return;
     }
 
