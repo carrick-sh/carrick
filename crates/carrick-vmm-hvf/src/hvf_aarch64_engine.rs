@@ -569,6 +569,8 @@ enum HvfVcpuBacking {
 /// executor. A staged vCPU cannot run, be kicked into, or carry a syscall.
 pub struct HvfAarch64Vcpu {
     backing: HvfVcpuBacking,
+    #[cfg(feature = "terminal-save-test-support")]
+    terminal_save_fail_second_write: bool,
 }
 
 fn staged_error(operation: &str) -> TrapError {
@@ -584,6 +586,8 @@ impl HvfAarch64Vcpu {
         custody: Arc<crate::trap::CarrierVmCustody>,
     ) -> Self {
         Self {
+            #[cfg(feature = "terminal-save-test-support")]
+            terminal_save_fail_second_write: false,
             backing: HvfVcpuBacking::Live(LiveHvfVcpu {
                 vm_generation: custody.setup_generation(),
                 custody,
@@ -596,6 +600,8 @@ impl HvfAarch64Vcpu {
 
     pub(crate) fn staged(cpu: crate::staged_cpu::StagedCpu) -> Self {
         Self {
+            #[cfg(feature = "terminal-save-test-support")]
+            terminal_save_fail_second_write: false,
             backing: HvfVcpuBacking::Staged(Box::new(parking_lot::Mutex::new(cpu))),
         }
     }
@@ -2122,15 +2128,10 @@ pub fn carrier_maintenance_ttbr(vmm: &HvfAarch64Vmm) -> Result<u64, TrapError> {
     Ok(vmm.state.carrier_maintenance_root()?.raw())
 }
 
+/// Fail the second terminal-root write on this vCPU only.
 #[cfg(feature = "terminal-save-test-support")]
-thread_local! {
-    static TERMINAL_SAVE_FAIL_SECOND_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Fail the second terminal-root write on this executor thread only.
-#[cfg(feature = "terminal-save-test-support")]
-pub fn fail_terminal_save_second_write_for_test() {
-    TERMINAL_SAVE_FAIL_SECOND_WRITE.with(|armed| armed.set(true));
+pub fn fail_terminal_save_second_write_for_test(vcpu: &mut HvfAarch64Vcpu) {
+    vcpu.terminal_save_fail_second_write = true;
 }
 
 /// After a terminal entry, no task CPU snapshot is meaningful. Remove its
@@ -2143,7 +2144,7 @@ pub fn retire_terminal_resident_vcpu_root(
     let neutral = carrier_maintenance_ttbr(vmm)?;
     vcpu.set_sys_reg(SysReg::Ttbr0, neutral)?;
     #[cfg(feature = "terminal-save-test-support")]
-    if TERMINAL_SAVE_FAIL_SECOND_WRITE.with(|armed| armed.replace(false)) {
+    if std::mem::take(&mut vcpu.terminal_save_fail_second_write) {
         return Err(TrapError::Hypervisor(
             "injected terminal TTBR1 write failure".into(),
         ));
