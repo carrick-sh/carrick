@@ -611,27 +611,35 @@ impl MetadataAllocatorCore {
         self.prepare_deallocate_extent(ptr, align)
     }
 
-    /// Select one exact return, including a grant admitted after its demand
-    /// disappeared. Selection is bounded by the existing 128-descriptor table.
-    /// The caller must give its allocation attempt first use of a new grant.
+    /// Retire unused grants only when allocation transactions have quiesced.
+    /// An empty new grant may still serve a suspended allocation; ordinary
+    /// allocation/deallocation and progress checks must leave it available.
+    /// The caller holds the allocator lock across drain and return selection.
     #[cfg(any(target_os = "none", test, feature = "host-test"))]
-    pub fn next_pending_return(&mut self) -> Option<ExtentToReturn> {
+    pub fn prepare_unused_extent_returns(&mut self) {
+        for slot_idx in 0..MAX_EXTENTS {
+            let extent = self.extents[slot_idx];
+            if extent.state == ExtentState::Active
+                && extent.live_allocations == 0
+                && matches!(extent.kind, ExtentKind::Dynamic { .. })
+            {
+                self.unlink_free_block(extent.base_va as *mut BlockHeader);
+                self.extents[slot_idx].state = ExtentState::PendingReturn;
+            }
+        }
+    }
+
+    /// Select one exact return in the fixed 128-descriptor table.
+    #[cfg(any(target_os = "none", test, feature = "host-test"))]
+    pub fn next_pending_return(&self) -> Option<ExtentToReturn> {
         let slot_idx = self.extents.iter().position(|extent| {
             matches!(extent.kind, ExtentKind::Dynamic { .. })
-                && (extent.state == ExtentState::PendingReturn
-                    || (extent.state == ExtentState::Active && extent.live_allocations == 0))
+                && extent.state == ExtentState::PendingReturn
         })?;
         let extent = self.extents[slot_idx];
         let ExtentKind::Dynamic { token } = extent.kind else {
             return None;
         };
-        if extent.state == ExtentState::Active {
-            // An admitted but never used extent is one complete free block.
-            // Remove it before publishing FREE so another participant cannot
-            // allocate from bytes whose host return is already in flight.
-            self.unlink_free_block(extent.base_va as *mut BlockHeader);
-            self.extents[slot_idx].state = ExtentState::PendingReturn;
-        }
         Some(ExtentToReturn {
             base_va: extent.base_va,
             size: extent.size,
@@ -653,9 +661,7 @@ impl MetadataAllocatorCore {
             matches!(
                 extent.state,
                 ExtentState::PendingReturn | ExtentState::ReturnRequested
-            ) || (extent.state == ExtentState::Active
-                && extent.live_allocations == 0
-                && matches!(extent.kind, ExtentKind::Dynamic { .. }))
+            )
         })
     }
 
@@ -910,6 +916,7 @@ mod tests {
             .unwrap();
         // As in MetadataStorage::allocate, first use precedes return selection.
         let pointer = allocator.allocate(24000, 16).unwrap();
+        allocator.prepare_unused_extent_returns();
         assert!(allocator.next_pending_return().is_none());
         assert!(!allocator.has_pending_return());
         let receipt = allocator.deallocate(pointer, 16).unwrap();
@@ -947,6 +954,11 @@ mod tests {
             )
             .unwrap();
         assert!(allocator.complete_extent_return(first_return));
+        assert!(
+            !allocator.has_pending_return(),
+            "fresh capacity remains available until drain"
+        );
+        allocator.prepare_unused_extent_returns();
         assert!(
             allocator.has_pending_return(),
             "unused delayed grant lost its return"

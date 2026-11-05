@@ -10,43 +10,59 @@ a missing return without a wrong-participant FREE or a lost host completion.
 It is an ordering-dependent allocator lifetime defect; this reduction does
 not establish which historical signed change first exposed it.
 
-Return selection now includes empty Active dynamic extents. It removes the
-whole free block from the segregated bins before changing it to PendingReturn;
-mailbox contention retains that state for the next ordinary boundary. Exact
-base, size, token and descriptor identity still authenticate completion. Live
-grants and bootstrap storage are excluded. Selection scans the same fixed
-128-descriptor table as the previous pending-return selector, with one
-constant-time free-list unlink for an unused grant. No retry, wait budget or
-concurrency change is required.
+The first correction returned every empty Active dynamic extent during
+ordinary mailbox servicing. That was too early: zero live allocations does
+not mean the suspended allocation transaction has finished. Another
+participant's deallocation, a small allocation served from bootstrap, or the
+requester's own progress check can consume the grant before its large
+allocation retries. Returning that capacity restarts the allocation/return
+cycle instead of completing the transaction.
 
-`MetadataStorage::allocate` consumes the response, attempts allocation, then
-selects returns. This gives newly requested capacity first use. Deallocation
-and drain have no such demand and can immediately select an unused grant.
-The native tests inject only a mailbox and omit the unavailable EL1 zone
-mapping and pending-host-work mark; allocation, response consumption,
-deallocation, return selection and wire request identity use production code.
+Ordinary return selection now handles only PendingReturn extents, which have
+been completely deallocated. Fresh, unused grants stay allocatable through
+ordinary mailbox progress. The explicit test-control drain retires unused
+Active grants after allocation transactions finish, before publishing their
+exact returns. The concurrent fixture already calls this drain after its
+round-completion barrier; sequential fixtures call it after success. This is
+an internal test-control operation, not an inferred global quiescence test.
+Normal allocation paths may retain newly supplied capacity for later use.
 
-The deterministic production-path witness
-`delayed_grant_consumed_by_last_deallocation_returns_both_extents` holds one
-extent live, publishes a second capacity request, delays its response until
-the first allocation's final deallocation, and requires FREE for both tokens.
-`allocation_uses_fresh_grant_before_return_selection` requires a capacity miss
-to succeed on its delivered grant before any FREE can be published. Core
-bindings additionally require exact-once return, removal from allocatable
-bins and preservation of live and bootstrap extents.
+Drain scans the fixed 128-descriptor table and unlinks each empty dynamic
+extent's complete free block before changing it to PendingReturn. Bootstrap
+and live extents remain resident. Mailbox contention retains the return for
+the next ordinary boundary. Exact base, size, token and descriptor identity
+still authenticate completion. No timeout, retry budget, concurrency or
+parking assertion changes.
+
+The production-path witness
+`delayed_grant_consumed_by_last_deallocation_returns_both_extents` still
+requires both tokens to return, now through the explicit drain. The new
+`unrelated_deallocation_preserves_grant_for_waiting_allocation` witnesses a
+capacity miss, host response, unrelated free and successful requesting retry.
+`progress_check_and_small_allocation_preserve_waiting_capacity` additionally
+checks response consumption by the production progress checker and a small
+allocation from bootstrap. Both use real MetadataStorage entry points with
+an injected mailbox; only zone mapping and pending-host-work marking are
+omitted on the native host. Core witnesses still require exact-once return,
+removal from allocatable bins, and preservation of bootstrap and live grants.
 
 This VM-free reduction cannot prove vCPU parking, stage-2 unmapping or signed
 fixture completion. Final acceptance still requires the original signed HVF
 test and two consecutive main signed runs. There is no Docker comparison for
 this internal allocator operation.
 
-On the admitted main's return-selection implementation, the production-path
-witness fails deterministically at its second request claim: `both grants must
-return, including the never-allocated response`. It first returns token 71;
-token 72 remains Active and empty. With the correction it returns both tokens
-and ends with zero active extents. Restoring the old service-before-allocation
-ordering with the new selector fails `requesting attempt must get first use`.
-The unchanged admitted-main suites pass 174 core and 114 native EL1 tests;
-the candidate passes 176 and 116 respectively, with no failures and no tests
-in either serial-host partition. These are native observations, not signed
-acceptance receipts.
+Signed run 41957513818's `signed-result-1`,
+`steps/0f555702/el1-embed.log`, records 30-second watchdog failures for
+`el1_metadata_allocator_delayed_owner_parks_participants`,
+`el1_metadata_allocator_grows_and_returns_extents`, and
+`el1_metadata_allocator_host_wait_requires_unmasked_irq` (also concurrent
+growth). Each reports `kernel aborted: kernel abort requested for run` and
+exit status 137, rather than a double-return assertion. The artifact does
+not contain the referenced post-mortem directories, so it cannot establish
+the precise signed blocked stacks. The native ordering witnesses are red on
+the rejected head at `unrelated free returned a demanded grant` and
+`progress check returned waiting capacity`. Both pass with the correction. This
+attributes a real capacity-reclamation regression to the eager-return
+correction; it does not establish that every NEW signed failure shares it.
+The original historical attribution and two consecutive main signed passes
+remain director-owned acceptance work.

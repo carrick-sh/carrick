@@ -281,6 +281,19 @@ impl MetadataStorage {
         outcome
     }
 
+    /// Called only by the test-control drain after allocation transactions
+    /// finish. Ordinary progress must preserve capacity owed to a retry.
+    #[cfg(any(all(feature = "allocator-test-control", target_os = "none"), test))]
+    fn drain_mailbox(
+        mailbox: &carrick_el1_abi::MetadataGrantMailbox,
+        core: &mut MetadataAllocatorCore,
+        slot: usize,
+    ) {
+        Self::synchronize_response(mailbox, core, slot);
+        core.prepare_unused_extent_returns();
+        Self::flush_pending_returns(mailbox, core, slot);
+    }
+
     #[cfg(any(target_os = "none", test))]
     fn flush_pending_returns(
         mailbox: &carrick_el1_abi::MetadataGrantMailbox,
@@ -327,10 +340,8 @@ impl MetadataStorage {
             .map(|(mailbox, slot)| Self::synchronize_response(mailbox, &mut core, slot))
             .unwrap_or(MailboxSync::None);
         let p = core.allocate(size, align);
-        // Give this attempt first use of an admitted grant. Afterwards every
-        // empty dynamic extent, including an unused delayed response, owes a
-        // return. Selecting returns before this attempt would discard the
-        // capacity that this allocation just requested.
+        // Return extents freed by completed allocations, while preserving
+        // unused grants that another suspended allocation may still need.
         #[cfg(any(target_os = "none", test))]
         if let Some((mailbox, slot)) = self.mailbox_context() {
             Self::flush_pending_returns(mailbox, &mut core, slot);
@@ -408,7 +419,7 @@ impl MetadataStorage {
         restore_irq(guard);
     }
 
-    #[cfg(all(feature = "allocator-test-control", target_os = "none"))]
+    #[cfg(any(all(feature = "allocator-test-control", target_os = "none"), test))]
     fn service_test_host_work(&self) -> bool {
         let Some((mailbox, slot)) = self.mailbox_context() else {
             return false;
@@ -422,8 +433,27 @@ impl MetadataStorage {
         pending
     }
 
-    #[cfg(all(feature = "allocator-test-control", not(target_os = "none")))]
+    #[cfg(all(feature = "allocator-test-control", not(target_os = "none"), not(test)))]
     fn service_test_host_work(&self) -> bool {
+        false
+    }
+
+    #[cfg(any(all(feature = "allocator-test-control", target_os = "none"), test))]
+    fn drain_test_host_work(&self) -> bool {
+        let Some((mailbox, slot)) = self.mailbox_context() else {
+            return false;
+        };
+        let guard = disable_irq_save();
+        let mut core = self.lock.lock();
+        Self::drain_mailbox(mailbox, &mut core, slot);
+        let pending = Self::host_work_pending(mailbox, &core);
+        core::mem::drop(core);
+        restore_irq(guard);
+        pending
+    }
+
+    #[cfg(all(feature = "allocator-test-control", not(target_os = "none"), not(test)))]
+    fn drain_test_host_work(&self) -> bool {
         false
     }
 
@@ -479,7 +509,7 @@ pub fn run_guest_allocator_test(subtest: u64, _arg: u64) -> u64 {
     match subtest {
         4 => run_guest_allocator_test(2, 0),
         5 => {
-            if GLOBAL_ALLOCATOR.service_test_host_work() {
+            if GLOBAL_ALLOCATOR.drain_test_host_work() {
                 carrick_el1_abi::METADATA_GRANT_PENDING
             } else {
                 0
@@ -713,11 +743,8 @@ mod tests {
         assert_eq!(returned.op, carrick_el1_abi::METADATA_GRANT_OP_FREE);
         let first_token = returned.arg3;
         mailbox.publish_response(carrick_el1_abi::METADATA_GRANT_SUCCESS, 0, 0, 0);
-        // The ordinary production drain follows the remaining exact receipt.
-        {
-            let mut core = storage.lock.lock();
-            MetadataStorage::service_mailbox(mailbox, &mut core, 0);
-        }
+        // The explicit quiescent drain follows the remaining exact receipt.
+        storage.drain_test_host_work();
         let returned = mailbox
             .claim_request()
             .expect("both grants must return, including the never-allocated response");
@@ -726,12 +753,89 @@ mod tests {
         tokens.sort_unstable();
         assert_eq!(tokens, [71, 72], "each exact grant must return once");
         mailbox.publish_response(carrick_el1_abi::METADATA_GRANT_SUCCESS, 0, 0, 0);
-        {
-            let mut core = storage.lock.lock();
-            MetadataStorage::service_mailbox(mailbox, &mut core, 0);
-        }
+        storage.drain_test_host_work();
         assert!(!mailbox.has_guest_work());
         assert_eq!(storage.diagnostics().active_extents, 0);
+    }
+
+    #[test]
+    fn unrelated_deallocation_preserves_grant_for_waiting_allocation() {
+        let storage = storage_with_mailbox();
+        let mailbox = storage.mailbox.as_ref().unwrap();
+        let mut bootstrap = vec![0u128; 1024];
+        storage
+            .admit_bootstrap_region(bootstrap.as_mut_ptr() as u64, 16384)
+            .unwrap();
+        let small = Layout::from_size_align(128, 16).unwrap();
+        let large = Layout::from_size_align(24000, 64).unwrap();
+        let unrelated = storage.allocate(small).unwrap();
+        assert!(storage.allocate(large).is_none());
+        assert_eq!(
+            mailbox.claim_request().unwrap().op,
+            carrick_el1_abi::METADATA_GRANT_OP_ALLOC
+        );
+        let mut granted = vec![0u128; 2048];
+        mailbox.publish_response(
+            carrick_el1_abi::METADATA_GRANT_SUCCESS,
+            granted.as_mut_ptr() as u64,
+            32768,
+            74,
+        );
+        // Another participant consumes the response before the suspended
+        // large allocation retries. Its free cannot cancel the live demand.
+        storage.deallocate(unrelated, small);
+        assert!(
+            !mailbox.has_guest_work(),
+            "unrelated free returned a demanded grant"
+        );
+        let pointer = storage
+            .allocate(large)
+            .expect("waiting allocation must use its grant");
+        storage.deallocate(pointer, large);
+        let returned = mailbox.claim_request().unwrap();
+        assert_eq!(returned.op, carrick_el1_abi::METADATA_GRANT_OP_FREE);
+        assert_eq!(returned.arg3, 74);
+    }
+
+    #[test]
+    fn progress_check_and_small_allocation_preserve_waiting_capacity() {
+        let storage = storage_with_mailbox();
+        let mailbox = storage.mailbox.as_ref().unwrap();
+        let mut bootstrap = vec![0u128; 1024];
+        storage
+            .admit_bootstrap_region(bootstrap.as_mut_ptr() as u64, 16384)
+            .unwrap();
+        let small = Layout::from_size_align(128, 16).unwrap();
+        let large = Layout::from_size_align(24000, 64).unwrap();
+        assert!(storage.allocate(large).is_none());
+        mailbox.claim_request().unwrap();
+        let mut granted = vec![0u128; 2048];
+        mailbox.publish_response(
+            carrick_el1_abi::METADATA_GRANT_SUCCESS,
+            granted.as_mut_ptr() as u64,
+            32768,
+            75,
+        );
+        assert!(
+            !storage.service_test_host_work(),
+            "progress check returned waiting capacity"
+        );
+        let unrelated = storage.allocate(small).unwrap();
+        assert!(
+            !mailbox.has_guest_work(),
+            "small allocation returned waiting capacity"
+        );
+        let pointer = storage
+            .allocate(large)
+            .expect("waiting allocation must use its grant");
+        storage.deallocate(unrelated, small);
+        storage.deallocate(pointer, large);
+        let returned = mailbox.claim_request().unwrap();
+        assert_eq!(returned.op, carrick_el1_abi::METADATA_GRANT_OP_FREE);
+        assert_eq!(returned.arg3, 75);
+        mailbox.publish_response(carrick_el1_abi::METADATA_GRANT_SUCCESS, 0, 0, 0);
+        assert!(!storage.drain_test_host_work());
+        assert_eq!(storage.diagnostics().active_extents, 1);
     }
 
     #[test]
