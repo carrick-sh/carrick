@@ -12017,150 +12017,173 @@ fn signal_setup_nonresident_input(nr: u64) {
 }
 
 #[test]
-fn arm_clone_and_clone3_nonresident_tid_destination_publishes_once() {
-    for is_clone3 in [false, true] {
-        let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
-        let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
-        let mut service = Aarch64NativeProcessService::with_crossing(
-            &fixture.task,
-            fixture.slot,
-            fixture.zone,
-            fixture.region.table(),
-            NonZeroU64::MIN,
-            TestStockCrossing::new(&[
-                0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
-            ]),
+fn arm_clone_nonresident_tid_destination_publishes_once() {
+    clone_nonresident_tid_destination(false);
+}
+
+#[test]
+fn arm_clone3_nonresident_tid_destination_publishes_once() {
+    clone_nonresident_tid_destination(true);
+}
+
+#[cfg(test)]
+fn clone_nonresident_tid_destination(is_clone3: bool) {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let (_peer_control, _peer_record) = imported_thread(fixture);
+    let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        TestStockCrossing::new(&[
+            0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
+        ]),
+    )
+    .with_words(&*words);
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
         )
-        .with_words(&*words);
-        fixture
-            .enter(
-                fixture.control,
-                fixture_ttbr0(fixture),
-                &mut service,
-                |_| (),
-            )
-            .unwrap();
+        .unwrap();
 
-        let child_control = Box::leak(Box::new(ThreadControlSlot::new()));
-        let entry = fixture
-            .page
-            .stock(
-                0,
-                carrick_el1_abi::EntryIdentity {
-                    tid: 42,
-                    visible_tid: 42,
-                    thread_serial: 102,
-                    birth: carrick_core_abi::entry::BirthSerial::of_task(
-                        carrick_sched_core::process::TaskSerial::from_raw_u64(12).unwrap(),
-                    ),
-                    uid_credit: 0,
-                },
-            )
-            .unwrap();
-        fixture
-            .page
-            .bind_control_address(entry, child_control as *const _ as u64)
-            .unwrap();
-
-        let tid_words =
-            carrick_test_support::GuestUserBuffer::from_values(&[0x1111_1111_u32, 0x2222_2222_u32]);
-        let parent_tid_va = tid_words.arg_at(0);
-        let child_tid_va = tid_words.arg_at(4);
-        let child_stack_top = VA + 0x1000;
-        // CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD |
-        // CLONE_SYSVSEM | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID
-        let thread_flags: u64 = 0x0135_0f00;
-
-        #[repr(C)]
-        #[derive(Clone, Copy, zerocopy::IntoBytes, zerocopy::FromBytes, zerocopy::Immutable)]
-        struct CloneArgs {
-            flags: u64,
-            pidfd: u64,
-            child_tid: u64,
-            parent_tid: u64,
-            exit_signal: u64,
-            stack: u64,
-            stack_size: u64,
-            tls: u64,
-        }
-        let clone3_args = carrick_test_support::GuestUserBuffer::from_value(CloneArgs {
-            flags: thread_flags,
-            pidfd: 0,
-            child_tid: child_tid_va,
-            parent_tid: parent_tid_va,
-            exit_signal: 0,
-            stack: VA,
-            stack_size: 0x1000,
-            tls: 0,
-        });
-
-        let set_args = |frame: &mut carrick_el1_abi::TrapFrame| {
-            frame.elr = 0x40_2000;
-            if is_clone3 {
-                frame.x[0] = clone3_args.arg();
-                frame.x[1] = core::mem::size_of::<CloneArgs>() as u64;
-                frame.x[2] = 0;
-                frame.x[3] = 0;
-                frame.x[4] = 0;
-                frame.x[8] = 435; // SYS_clone3
-            } else {
-                frame.x[0] = thread_flags;
-                frame.x[1] = child_stack_top;
-                frame.x[2] = parent_tid_va;
-                frame.x[3] = 0;
-                frame.x[4] = child_tid_va;
-                frame.x[8] = 220; // SYS_clone
-            }
-        };
-
-        let mut frame = carrick_el1_abi::TrapFrame::default();
-        set_args(&mut frame);
-
-        // 1. NotYet once on TID destination page during publication: parks/prepares
-        // and rewinds PC for redispatch without publishing TID or leaking the pool entry.
-        crate::file::SIMULATE_COPYOUT_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
-        let first = arm_call(fixture, fixture.control, &mut service, &mut frame);
-        crate::file::SIMULATE_COPYOUT_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
-        assert_eq!(
-            first.unwrap(),
-            carrick_personality_linux::dispatch::CompletionRoute::Served,
-            "is_clone3={is_clone3}: NotYet on TID destination must prepare and redispatch"
-        );
-        assert_eq!(frame.elr, 0x40_2000 - 4, "is_clone3={is_clone3}");
-        assert_eq!(
-            carrick_el1_abi::Lifecycle::live(fixture.page),
+    let child_control = Box::leak(Box::new(ThreadControlSlot::new()));
+    let entry = fixture
+        .page
+        .stock(
             1,
-            "is_clone3={is_clone3}: rolled-back NotYet must not leave child live"
-        );
-        assert_eq!(
-            tid_words.get::<[u32; 2]>(0),
-            [0x1111_1111, 0x2222_2222],
-            "is_clone3={is_clone3}: rolled-back NotYet must restore preimage"
-        );
-        assert!(!leader_sees_thread(fixture, &mut service, 42));
+            carrick_el1_abi::EntryIdentity {
+                tid: 43,
+                visible_tid: 43,
+                thread_serial: 103,
+                birth: carrick_core_abi::entry::BirthSerial::of_task(
+                    carrick_sched_core::process::TaskSerial::from_raw_u64(13).unwrap(),
+                ),
+                uid_credit: 0,
+            },
+        )
+        .unwrap();
+    fixture
+        .page
+        .bind_control_address(entry, child_control as *const _ as u64)
+        .unwrap();
 
-        // 2. Rerun after page is backed: succeeds and publishes TID 42 to both addresses once.
-        set_args(&mut frame);
-        let second = arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap();
-        assert_eq!(
-            second,
-            carrick_personality_linux::dispatch::CompletionRoute::WithWork,
-            "is_clone3={is_clone3}"
-        );
-        assert_eq!(frame.x[0], 42, "is_clone3={is_clone3}");
-        assert_eq!(
-            tid_words.get::<[u32; 2]>(0),
-            [42, 42],
-            "is_clone3={is_clone3}: parent_tid and child_tid must both be published once"
-        );
-        assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
-        assert!(leader_sees_thread(fixture, &mut service, 41));
-        assert!(leader_sees_thread(fixture, &mut service, 42));
+    let tid_words =
+        carrick_test_support::GuestUserBuffer::from_values(&[0x1111_1111_u32, 0x2222_2222_u32]);
+    let parent_tid_va = tid_words.arg_at(0);
+    let child_tid_va = tid_words.arg_at(4);
+    let child_stack_top = VA + 0x1000;
+    // CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD |
+    // CLONE_SYSVSEM | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID
+    let thread_flags: u64 = 0x0135_0f00;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, zerocopy::IntoBytes, zerocopy::FromBytes, zerocopy::Immutable)]
+    struct CloneArgs {
+        flags: u64,
+        pidfd: u64,
+        child_tid: u64,
+        parent_tid: u64,
+        exit_signal: u64,
+        stack: u64,
+        stack_size: u64,
+        tls: u64,
     }
+    let clone3_args = carrick_test_support::GuestUserBuffer::from_value(CloneArgs {
+        flags: thread_flags,
+        pidfd: 0,
+        child_tid: child_tid_va,
+        parent_tid: parent_tid_va,
+        exit_signal: 0,
+        stack: VA,
+        stack_size: 0x1000,
+        tls: 0,
+    });
+
+    let set_args = |frame: &mut carrick_el1_abi::TrapFrame| {
+        frame.elr = 0x40_2000;
+        if is_clone3 {
+            frame.x[0] = clone3_args.arg();
+            frame.x[1] = core::mem::size_of::<CloneArgs>() as u64;
+            frame.x[2] = 0;
+            frame.x[3] = 0;
+            frame.x[4] = 0;
+            frame.x[8] = 435; // SYS_clone3
+        } else {
+            frame.x[0] = thread_flags;
+            frame.x[1] = child_stack_top;
+            frame.x[2] = parent_tid_va;
+            frame.x[3] = 0;
+            frame.x[4] = child_tid_va;
+            frame.x[8] = 220; // SYS_clone
+        }
+    };
+
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    set_args(&mut frame);
+
+    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
+    assert!(leader_sees_thread(fixture, &mut service, 42));
+
+    // 1. NotYet once on TID destination page during publication: parks/prepares
+    // and rewinds PC for redispatch without publishing TID or leaking the pool entry.
+    crate::lifecycle::COPYOUT_NOT_YET_AT.with(|address| address.set(Some(child_tid_va)));
+    let first = arm_call(fixture, fixture.control, &mut service, &mut frame);
+    crate::lifecycle::COPYOUT_NOT_YET_AT.with(|address| address.set(None));
+    assert_eq!(
+        first.unwrap(),
+        carrick_personality_linux::dispatch::CompletionRoute::Served,
+        "is_clone3={is_clone3}: NotYet on TID destination must prepare and redispatch"
+    );
+    assert_eq!(frame.elr, 0x40_2000 - 4, "is_clone3={is_clone3}");
+    assert_eq!(
+        carrick_el1_abi::Lifecycle::live(fixture.page),
+        2,
+        "is_clone3={is_clone3}: rolled-back NotYet must not leave child live"
+    );
+    assert_eq!(
+        tid_words.get::<[u32; 2]>(0),
+        [0x1111_1111, 0x2222_2222],
+        "is_clone3={is_clone3}: rolled-back NotYet must restore preimage"
+    );
+    assert!(!leader_sees_thread(fixture, &mut service, 43));
+
+    // 2. Rerun after page is backed: succeeds and publishes TID 43 to both addresses once.
+    set_args(&mut frame);
+    let second = arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap();
+    assert_eq!(
+        second,
+        carrick_personality_linux::dispatch::CompletionRoute::WithWork,
+        "is_clone3={is_clone3}"
+    );
+    assert_eq!(frame.x[0], 43, "is_clone3={is_clone3}");
+    assert_eq!(
+        tid_words.get::<[u32; 2]>(0),
+        [43, 43],
+        "is_clone3={is_clone3}: parent_tid and child_tid must both be published once"
+    );
+    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 3);
+    assert!(leader_sees_thread(fixture, &mut service, 41));
+    assert!(leader_sees_thread(fixture, &mut service, 43));
 }
 
 #[test]
 fn arm_non_last_thread_exit_nonresident_clear_tid_and_robust_list_wakes_once() {
+    exit_nonresident_pages(false);
+}
+
+#[test]
+fn arm_non_last_thread_exit_nonresident_clear_tid_wakes_once() {
+    exit_nonresident_pages(true);
+}
+
+#[cfg(test)]
+fn exit_nonresident_pages(clear_only: bool) {
+    crate::lifecycle::CHILD_TID_WAKE_CALLS.with(|calls| calls.borrow_mut().clear());
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
     let mut service = Aarch64NativeProcessService::with_crossing(
@@ -12281,7 +12304,7 @@ fn arm_non_last_thread_exit_nonresident_clear_tid_and_robust_list_wakes_once() {
     );
 
     frame.x = [0; 31];
-    frame.x[0] = robust_head.arg();
+    frame.x[0] = if clear_only { 0 } else { robust_head.arg() };
     frame.x[1] = 24;
     frame.x[8] = 99; // SYS_set_robust_list
     assert_eq!(
@@ -12290,37 +12313,38 @@ fn arm_non_last_thread_exit_nonresident_clear_tid_and_robust_list_wakes_once() {
     );
     assert_eq!(frame.x[0], 0);
 
-    // 1. Exit when robust-list head is not yet backed: NotYet rewinds and prepares.
-    frame.x = [0; 31];
-    frame.x[0] = 0;
-    frame.x[8] = 93; // SYS_exit
-    frame.elr = 0x40_3000;
-    crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
-    let exit_first = arm_call(fixture, sibling_control, &mut service, &mut frame);
-    crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
-    assert_eq!(
-        exit_first.unwrap(),
-        carrick_personality_linux::dispatch::CompletionRoute::Served,
-        "NotYet on robust_list head must prepare and redispatch in ring"
-    );
-    assert_eq!(frame.elr, 0x40_3000 - 4);
-    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
-    assert_eq!(clear_tid_word.get::<u32>(0), 42);
-    assert!(!matches!(
-        fixture.zone.record(leader_record).claim(),
-        carrick_sched_core::Claim::Queued { .. }
-    ));
+    if !clear_only {
+        // 1. Exit when robust-list head is not yet backed: NotYet rewinds and prepares.
+        frame.x = [0; 31];
+        frame.x[0] = 0;
+        frame.x[8] = 93; // SYS_exit
+        frame.elr = 0x40_3000;
+        crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
+        let exit_first = arm_call(fixture, sibling_control, &mut service, &mut frame);
+        crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
+        assert_eq!(
+            exit_first.unwrap(),
+            carrick_personality_linux::dispatch::CompletionRoute::Served,
+            "NotYet on robust_list head must prepare and redispatch in ring"
+        );
+        assert_eq!(frame.elr, 0x40_3000 - 4);
+        assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
+        assert_eq!(clear_tid_word.get::<u32>(0), 42);
+        assert!(!matches!(
+            fixture.zone.record(leader_record).claim(),
+            carrick_sched_core::Claim::Queued { .. }
+        ));
+    }
 
     // 2. Exit when clear_child_tid page is not yet backed for copyout:
     // NotYet rewinds and prepares without losing membership or wake.
-    sibling_control.set_robust_list(0, 0);
     frame.x = [0; 31];
     frame.x[0] = 0;
     frame.x[8] = 93; // SYS_exit
     frame.elr = 0x40_3000;
-    crate::file::SIMULATE_COPYOUT_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
+    crate::lifecycle::COPYOUT_NOT_YET_AT.with(|address| address.set(Some(clear_tid_word.arg())));
     let exit_second = arm_call(fixture, sibling_control, &mut service, &mut frame);
-    crate::file::SIMULATE_COPYOUT_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
+    crate::lifecycle::COPYOUT_NOT_YET_AT.with(|address| address.set(None));
     assert_eq!(
         exit_second.unwrap(),
         carrick_personality_linux::dispatch::CompletionRoute::Served,
@@ -12334,9 +12358,16 @@ fn arm_non_last_thread_exit_nonresident_clear_tid_and_robust_list_wakes_once() {
         carrick_sched_core::Claim::Queued { .. }
     ));
 
+    assert_eq!(sibling_control.robust_list().0, 0);
+    if !clear_only {
+        assert_eq!(robust_node.get::<RobustNode>(0).futex, 0xc000_0000);
+        crate::lifecycle::CHILD_TID_WAKE_CALLS.with(|calls| {
+            assert_eq!(&*calls.borrow(), &[robust_node.arg_at(8)]);
+        });
+    }
+
     // 3. Rerun exit with both pages backed: completes in ring, marks robust mutex
     // FUTEX_OWNER_DIED, zeroes clear_child_tid, and wakes leader once!
-    sibling_control.set_robust_list(robust_head.va().raw(), 24);
     frame.x = [0; 31];
     frame.x[0] = 0;
     frame.x[8] = 93; // SYS_exit
@@ -12348,11 +12379,13 @@ fn arm_non_last_thread_exit_nonresident_clear_tid_and_robust_list_wakes_once() {
     );
     assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 1);
     assert_eq!(clear_tid_word.get::<u32>(0), 0);
-    assert_eq!(
-        robust_node.get::<RobustNode>(0).futex,
-        0x8000_0000 | 0x4000_0000,
-        "robust mutex must be marked FUTEX_OWNER_DIED"
-    );
+    if !clear_only {
+        assert_eq!(
+            robust_node.get::<RobustNode>(0).futex,
+            0x8000_0000 | 0x4000_0000,
+            "robust mutex must be marked FUTEX_OWNER_DIED"
+        );
+    }
     assert!(
         matches!(
             fixture.zone.record(leader_record).claim(),
@@ -12360,10 +12393,32 @@ fn arm_non_last_thread_exit_nonresident_clear_tid_and_robust_list_wakes_once() {
         ),
         "futex waiter on clear_child_tid must be woken exactly once"
     );
+    crate::lifecycle::CHILD_TID_WAKE_CALLS.with(|calls| {
+        assert_eq!(
+            &*calls.borrow(),
+            if clear_only {
+                vec![clear_tid_word.arg()]
+            } else {
+                vec![robust_node.arg_at(8), clear_tid_word.arg()]
+            }
+            .as_slice(),
+            "one robust wake and one clear-child-TID wake, without replay"
+        );
+    });
 }
 
 #[test]
 fn arm_signal_frame_push_onto_nonresident_stack_delivers_once_and_sigreturn_restores() {
+    signal_frame_nonresident_stack(true);
+}
+
+#[test]
+fn arm_signal_frame_pop_from_nonresident_stack_restores_once() {
+    signal_frame_nonresident_stack(false);
+}
+
+#[cfg(test)]
+fn signal_frame_nonresident_stack(refuse_push: bool) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
     let mut service = Aarch64NativeProcessService::with_crossing(
@@ -12433,31 +12488,40 @@ fn arm_signal_frame_push_onto_nonresident_stack_delivers_once_and_sigreturn_rest
     tkill_frame.x[2] = 0xabcd;
     tkill_frame.x[8] = 130; // SYS_tkill
 
-    crate::file::SIMULATE_COPYOUT_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
-    let first_delivery = arm_call(fixture, fixture.control, &mut service, &mut tkill_frame);
-    crate::file::SIMULATE_COPYOUT_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
-    assert_eq!(
-        first_delivery.unwrap(),
-        carrick_personality_linux::dispatch::CompletionRoute::Served,
-        "NotYet on signal stack frame push must prepare stack without forcing SIGSEGV"
-    );
-    assert_eq!(
-        tkill_frame.elr, 0x40_0500,
-        "handler must not be entered before signal frame is written"
-    );
-    assert_eq!(super::arm_signal::test_arm_signal_stack(), initial_sp);
+    let deliver_frame = if refuse_push {
+        crate::file::SIMULATE_COPYOUT_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
+        let first_delivery = arm_call(fixture, fixture.control, &mut service, &mut tkill_frame);
+        crate::file::SIMULATE_COPYOUT_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
+        assert_eq!(
+            first_delivery.unwrap(),
+            carrick_personality_linux::dispatch::CompletionRoute::Served,
+            "NotYet on signal stack frame push must prepare stack without forcing SIGSEGV"
+        );
+        assert_eq!(
+            tkill_frame.elr, 0x40_0500,
+            "handler must not be entered before signal frame is written"
+        );
+        assert_eq!(super::arm_signal::test_arm_signal_stack(), initial_sp);
 
-    // 3. Next syscall boundary (e.g. getpid = 172, or return checkpoint) with stack page backed
-    // delivers the requeued SIGUSR1 exactly once.
-    let mut deliver_frame = tkill_frame;
-    deliver_frame.x[0] = 41;
-    deliver_frame.x[8] = 172; // SYS_getpid
-    let second_delivery =
-        arm_call(fixture, fixture.control, &mut service, &mut deliver_frame).unwrap();
-    assert_eq!(
-        second_delivery,
-        carrick_personality_linux::dispatch::CompletionRoute::Served
-    );
+        // 3. Next syscall boundary (e.g. getpid = 172, or return checkpoint) with stack page backed
+        // delivers the requeued SIGUSR1 exactly once.
+        let mut deliver_frame = tkill_frame;
+        deliver_frame.x[0] = 41;
+        deliver_frame.x[8] = 172; // SYS_getpid
+        let second_delivery =
+            arm_call(fixture, fixture.control, &mut service, &mut deliver_frame).unwrap();
+        assert_eq!(
+            second_delivery,
+            carrick_personality_linux::dispatch::CompletionRoute::Served
+        );
+        deliver_frame
+    } else {
+        assert_eq!(
+            arm_call(fixture, fixture.control, &mut service, &mut tkill_frame).unwrap(),
+            carrick_personality_linux::dispatch::CompletionRoute::Served
+        );
+        tkill_frame
+    };
     assert_eq!(deliver_frame.elr, 0x40_0100, "entered SIGUSR1 handler");
     assert_eq!(deliver_frame.x[0], 10, "x0 = signum");
     assert_eq!(deliver_frame.x[30], 0x40_0200, "x30 = sa_restorer");

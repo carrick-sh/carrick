@@ -16,6 +16,16 @@ pub use carrick_personality_linux::lifecycle::*;
 pub use carrick_personality_linux::thread::{LifecycleThread, SYS_SET_ROBUST_LIST};
 
 #[cfg(test)]
+std::thread_local! {
+    pub(super) static COPYOUT_NOT_YET_AT: core::cell::Cell<Option<u64>> = const {
+        core::cell::Cell::new(None)
+    };
+    pub(super) static CHILD_TID_WAKE_CALLS: core::cell::RefCell<std::vec::Vec<u64>> = const {
+        core::cell::RefCell::new(std::vec::Vec::new())
+    };
+}
+
+#[cfg(test)]
 type RawExitBeforeCommitHook = std::vec::Vec<(usize, std::boxed::Box<dyn FnOnce() + Send>)>;
 #[cfg(test)]
 static RAW_EXIT_BEFORE_COMMIT_HOOK: carrick_el1::lock::SpinLock<RawExitBeforeCommitHook> =
@@ -112,6 +122,14 @@ impl<
         }
     }
     fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> CopyOutcome {
+        #[cfg(test)]
+        if COPYOUT_NOT_YET_AT.with(|address| address.get() == Some(dst.raw())) {
+            return CopyOutcome::NotYet(GuestCopyRequest {
+                address: dst,
+                len: carrick_guest_arch::GuestLen::new(src.len() as u64),
+                access: carrick_guest_arch::Access::Write,
+            });
+        }
         #[cfg(test)]
         if let Some(user) = &mut self.lifecycle_user {
             return CopyOutcome::from_completed(user.copy_out(dst.raw(), src));
@@ -623,6 +641,8 @@ impl<
         })
     }
     fn wake_child_tid(&mut self, mm: EntryMmKey, address: UserVa) -> bool {
+        #[cfg(test)]
+        CHILD_TID_WAKE_CALLS.with(|calls| calls.borrow_mut().push(address.raw()));
         let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return false;
         };
