@@ -10505,6 +10505,7 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_subshell_self_filled_pipe_on_stdin_reaches_eof() {
+    use carrick_abi::LINUX_F_DUPFD;
     use carrick_el1_abi::ipc::{IpcBacking, fd, pipe::End};
     use carrick_kernel::el1_ipc::{HostIpc, HostTable, IpcLimits};
     use carrick_personality_linux::dispatch::CompletionRoute;
@@ -10541,6 +10542,8 @@ fn serial_host_native_subshell_self_filled_pipe_on_stdin_reaches_eof() {
     // Initial extent capacity 8 with soft limit 64 forces in-ring table growth
     // when native children dup3/F_DUPFD above descriptor 7.
     let table = HostTable::create(Arc::clone(&owner), 64, 8).unwrap();
+    let mut host_stdin = carrick_kernel::dispatch::NativeFileWitness::new(&table, fd::Fd(0))
+        .expect("host-backed stdin");
     let object = owner.create_pipe(65536).unwrap();
     let reader = owner
         .admit_description(fd::Description::new(
@@ -10612,8 +10615,11 @@ fn serial_host_native_subshell_self_filled_pipe_on_stdin_reaches_eof() {
         .each_ref()
         .map(|binding| fixture.zone.record(binding.record.id).identity().file_table);
 
-    // Fork inherited the endpoints; the parent holds no writer while its
-    // child constructs and consumes its own small heredoc-like pipe.
+    // Fork inherited host stdin and the endpoints. The parent relinquishes
+    // all three; the child now owns the exact descriptor population used by
+    // dash for a heredoc in a subshell.
+    table.close(fd::Fd(0)).unwrap();
+    host_stdin.close_parent();
     drop(writer);
     table.close(fd::Fd(4)).unwrap();
 
@@ -10682,7 +10688,7 @@ fn serial_host_native_subshell_self_filled_pipe_on_stdin_reaches_eof() {
     };
 
     activate_target(source, &task, &child_bindings[0]);
-    let payload = carrick_test_support::GuestUserBuffer::from_bytes(b"alpha\nbeta\ngamma\n");
+    let payload = carrick_test_support::GuestUserBuffer::from_bytes(b"alpha\nbeta\n");
     let read_buf = carrick_test_support::GuestUserBuffer::zeroed(1);
     let call = |nr, args| {
         let (route, result) = run_in_child(0, nr, args);
@@ -10692,30 +10698,33 @@ fn serial_host_native_subshell_self_filled_pipe_on_stdin_reaches_eof() {
         );
         result
     };
-    let nr = carrick_personality_linux::crossing::nr::WRITE.raw();
-    assert_eq!(call(nr, [4, payload.arg(), 17]), 17);
-    // AArch64 shells use dup3; x86 dup2 uses the same descriptor transaction.
+    let fcntl = carrick_personality_linux::crossing::nr::FCNTL.raw();
+    assert_eq!(call(fcntl, [0, LINUX_F_DUPFD, 10]), 10);
+    let close = carrick_personality_linux::crossing::nr::CLOSE.raw();
+    assert_eq!(call(close, [0, 0, 0]), 0);
+    let write = carrick_personality_linux::crossing::nr::WRITE.raw();
+    assert_eq!(call(write, [4, payload.arg(), 11]), 11);
+    assert_eq!(call(close, [4, 0, 0]), 0);
     assert_eq!(
-        call(
-            carrick_personality_linux::crossing::nr::DUP3.raw(),
-            [3, 0, 0]
-        ),
+        call(carrick_syscall_abi::CARRICK_PRIVATE_X86_DUP2, [3, 0, 0]),
         0
     );
-    let close = carrick_personality_linux::crossing::nr::CLOSE.raw();
     assert_eq!(call(close, [3, 0, 0]), 0);
-    assert_eq!(call(close, [4, 0, 0]), 0);
     let read = carrick_personality_linux::crossing::nr::READ.raw();
     let mut output = Vec::new();
     // Fixed operation budget: one read per byte, then EOF. A broken EOF is
     // an Idle/park assertion failure, not an unbounded test wait.
-    for _ in 0..17 {
+    for _ in 0..11 {
         assert_eq!(call(read, [0, read_buf.arg(), 1]), 1);
         output.push(read_buf.as_bytes()[0]);
     }
-    assert_eq!(&output, b"alpha\nbeta\ngamma\n");
+    assert_eq!(&output, b"alpha\nbeta\n");
     assert_eq!(call(read, [0, read_buf.arg(), 1]), 0);
-    assert_eq!(call(close, [0, 0, 0]), 0);
+    assert_eq!(
+        call(carrick_syscall_abi::CARRICK_PRIVATE_X86_DUP2, [10, 0, 0]),
+        0
+    );
+    assert_eq!(call(close, [10, 0, 0]), 0);
     service.retire_fd_table(children[0]);
     assert_eq!(owner.drain_retired_tables().unwrap(), 1);
     table.close(fd::Fd(3)).unwrap();
