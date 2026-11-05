@@ -1964,3 +1964,29 @@ fn sigprocmask_copyout_into_untouched_sparse_mmap() {
     );
     assert_ne!(memory.read_bytes(arena, 16).unwrap(), [0; 16]);
 }
+
+#[test]
+fn sigprocmask_input_supply_preserves_mask_and_oldset() {
+    let mut g = Guest::new();
+    let mask = 1u64 << 9;
+    g.memory.seed(PATH, &mask.to_le_bytes());
+    let request = g.memory.refuse_next_read_supply_grant();
+    assert_eq!(
+        g.call(nr::RT_SIGPROCMASK.raw(), [0, PATH, OUT, 8, 0, 0]),
+        DispatchOutcome::OwnerMemorySupply {
+            request,
+            committed: 0
+        },
+    );
+    assert!(g.memory.commits.is_empty());
+    assert_eq!(g.memory.inner.read_bytes(OUT, 8).unwrap(), [FILL; 8]);
+    assert_eq!(g.ok(nr::RT_SIGPROCMASK.raw(), [0, 0, OUT2, 8, 0, 0]), 0);
+    assert_eq!(g.memory.inner.read_bytes(OUT2, 8).unwrap(), [0; 8]);
+    assert_eq!(g.ok(nr::RT_SIGPROCMASK.raw(), [0, PATH, OUT, 8, 0, 0]), 0);
+    assert_eq!(g.memory.inner.read_bytes(OUT, 8).unwrap(), [0; 8]);
+    assert_eq!(g.ok(nr::RT_SIGPROCMASK.raw(), [0, 0, OUT2, 8, 0, 0]), 0);
+    assert_eq!(
+        g.memory.inner.read_bytes(OUT2, 8).unwrap(),
+        mask.to_le_bytes()
+    );
+}

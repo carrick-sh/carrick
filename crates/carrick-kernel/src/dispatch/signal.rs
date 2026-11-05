@@ -2241,8 +2241,13 @@ impl<'a> SignalView<'a> {
             let new_mask = if new_set != 0 {
                 let bytes = match memory.read_bytes(new_set, LINUX_RT_SIGSET_SIZE as usize) {
                     Ok(bytes) => bytes,
-                    Err(_) => {
-                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                    Err(error) => {
+                        // Input may need the same owner arbitration or sparse
+                        // first-touch supply as output. Nothing has changed yet;
+                        // let the runtime serve it and redispatch before saving
+                        // oldset or publishing the new blocked mask.
+                        return Ok(DispatchOutcome::from_owner_memory_error(error)
+                            .unwrap_or_else(|| DispatchOutcome::errno(LINUX_EFAULT)));
                     }
                 };
                 let set = SigSet::from_raw(u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8])));

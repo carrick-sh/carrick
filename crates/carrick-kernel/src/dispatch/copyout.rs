@@ -658,7 +658,7 @@ pub(crate) mod owner_fixture {
         refuse: Option<PortalOwnerWait>,
         refuse_after: usize,
         supply: Option<carrick_guest_mem::MemorySupplyRequest>,
-        refuse_read: std::cell::Cell<Option<PortalOwnerWait>>,
+        refuse_read: std::cell::Cell<Option<carrick_guest_mem::MemoryReadWait>>,
         readonly: Vec<(u64, usize)>,
         pub(crate) prepares: usize,
         pub(crate) reads: std::cell::Cell<usize>,
@@ -713,8 +713,20 @@ pub(crate) mod owner_fixture {
         /// Refuse the next guest read with an Editor wait.
         pub(crate) fn refuse_next_read(&self) -> PortalOwnerWait {
             let wait = editor_wait();
-            self.refuse_read.set(Some(wait));
+            self.refuse_read
+                .set(Some(carrick_guest_mem::MemoryReadWait::Owner(wait)));
             wait
+        }
+
+        /// Model first-touch supply during copyin, before any syscall effects.
+        pub(crate) fn refuse_next_read_supply_grant(
+            &mut self,
+        ) -> carrick_guest_mem::MemorySupplyRequest {
+            let request = self.refuse_next_supply_grant();
+            self.supply = None;
+            self.refuse_read
+                .set(Some(carrick_guest_mem::MemoryReadWait::Supply(request)));
+            request
         }
 
         /// Mark `[address, address + len)` readable but not writable (`PROT_READ`).
@@ -798,7 +810,7 @@ pub(crate) mod owner_fixture {
             if let Some(wait) = self.refuse_read.take() {
                 return Err(MemoryError::ReadSuspended(Box::new(
                     carrick_guest_mem::MemoryReadSuspension {
-                        wait: carrick_guest_mem::MemoryReadWait::Owner(wait),
+                        wait,
                         continuation: carrick_guest_mem::OwnedReadContinuation::new((
                             address, length,
                         )),
