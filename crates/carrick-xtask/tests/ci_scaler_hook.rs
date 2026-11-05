@@ -323,12 +323,34 @@ esac
                 .status
                 .success()
         );
-        // `agent-runner cleanup` retires the host's real dispatch accounts,
-        // so this binary-level fixture can't drive it hermetically (#1626).
-        // Its state removal is witnessed by `agent_runner::tests::cleanup_*`
-        // with an injected `cfg(test)` retirement double, and full account
-        // retirement by the privileged runner-only witness
+        // `agent-runner cleanup` retires the host's real dispatch accounts, so
+        // the fixture drives the same `cleanup` in process with an injected
+        // retirement double (#1626), on the state the real `auth` left. Full
+        // account retirement has the privileged runner-only witness
         // `serial_host_cleanup_retires_both_dispatch_accounts_then_removes_state`.
+        let mut accounts = FixtureAccounts {
+            state: state.clone(),
+            state_present_at_retirement: Vec::new(),
+        };
+        carrick_xtask::agent_runner::cleanup(&mut accounts, Ok(state.clone())).unwrap();
+        assert!(!state.exists());
+        carrick_xtask::agent_runner::cleanup(&mut accounts, Ok(state.clone())).unwrap();
+        assert_eq!(accounts.state_present_at_retirement, [true, false]);
+    }
+}
+
+/// Test-only retirement double for the auth fixture: it signals no account
+/// and records whether the job state still existed when retirement ran.
+struct FixtureAccounts {
+    state: std::path::PathBuf,
+    state_present_at_retirement: Vec<bool>,
+}
+
+impl carrick_xtask::agent_runner::AccountRetirement for FixtureAccounts {
+    fn retire_dispatch_accounts(&mut self) -> Result<(), carrick_xtask::ci_scaler::ScalerError> {
+        self.state_present_at_retirement
+            .push(self.state.try_exists().unwrap());
+        Ok(())
     }
 }
 

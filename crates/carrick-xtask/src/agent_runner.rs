@@ -679,9 +679,12 @@ fn agy_auth(home: &Path, raw: &str) -> Result<(), ScalerError> {
 
 /// The authority that retires every process the dispatch accounts still own
 /// before `cleanup` removes their job state (#1626). Production retires the
-/// host's pre-created accounts; fixtures inject a `cfg(test)` double so a
-/// test never censuses or signals a real host's dispatch accounts.
-pub(crate) trait AccountRetirement {
+/// host's pre-created accounts; fixtures inject a test-only double (unit
+/// tests behind `cfg(test)`, the `ci_scaler_hook` fixture in its own test
+/// crate) so a test never censuses or signals a real host's dispatch
+/// accounts. There is no production switch that skips retirement.
+pub trait AccountRetirement {
+    /// Retire every process the dispatch accounts own, or name why not.
     fn retire_dispatch_accounts(&mut self) -> Result<(), ScalerError>;
 }
 
@@ -699,7 +702,7 @@ impl AccountRetirement for HostDispatchAccounts {
 /// retirement's verdict: the state holds the provider credentials, and a
 /// failed census must not leave them behind (#1626). A retirement failure
 /// is still the step's verdict, reported after the state is gone.
-pub(crate) fn cleanup(
+pub fn cleanup(
     accounts: &mut impl AccountRetirement,
     state: Result<PathBuf, ScalerError>,
 ) -> Result<(), ScalerError> {

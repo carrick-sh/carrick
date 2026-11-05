@@ -545,8 +545,10 @@ agent hooks, filters or scripts. The clone is destroyed after the job.
 `agent-runner cleanup` retires both accounts, then removes the job state
 (homes, provider credentials, launcher state) even when retirement fails, so
 a failed census never leaves credentials behind; the step still fails and
-names the retirement error (#1626). Its account authority is injected: unit
-tests use a `cfg(test)` double and never touch a host's real accounts. The
+names the retirement error (#1626). Its account authority is injected and
+the command has no flag that skips retirement: the `agent_runner` unit tests
+and the `ci_scaler_hook` auth fixture inject test-only doubles and never touch
+a host's real accounts. The
 full-retirement witness,
 `dispatch_worker::tests::serial_host_cleanup_retires_both_dispatch_accounts_then_removes_state`,
 is `#[ignore]`d and runs in no CI lane: hosted runners lack the pre-created
