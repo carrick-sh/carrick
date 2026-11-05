@@ -488,7 +488,11 @@ impl SyscallDispatcher {
         if let Some(file) = resource.downcast_ref::<NativeOpenFile>() {
             return Some(self.description_poll_ready_events(&file.description, events));
         }
-        None
+        let description = published_host_description(resource)?;
+        Some(match stdio_stream_of(&description) {
+            Some(stream) => self.bare_stdio_poll_ready_events(stream, events),
+            None => self.description_poll_ready_events(&description, events),
+        })
     }
 
     fn serve_native_resource(
@@ -503,6 +507,16 @@ impl SyscallDispatcher {
         }
         if let Some(file) = resource.downcast_ref::<NativeOpenFile>() {
             return self.serve_native_open_file(header, &file.description, input, capacity);
+        }
+        // A descriptor the ring process inherited from a host-served task
+        // (#1410): the host's own description, which stays the one authority
+        // for its offset, flags and sink. A duplicate of a stdio stream is
+        // that stream, served exactly as the implicit one.
+        if let Some(description) = published_host_description(resource) {
+            return match stdio_stream_of(&description) {
+                Some(stream) => self.serve_native_stdio(header, stream, input),
+                None => self.serve_native_open_file(header, &description, input, capacity),
+            };
         }
         Served::Refused
     }
@@ -760,6 +774,28 @@ impl SyscallDispatcher {
             Err(_) => Served::Refused,
         }
     }
+}
+
+/// The host description a ring process inherited, when it is a concrete
+/// open description the host cores can serve. A bare marker with no backing
+/// (nothing to read, write or stat) stays unserved.
+fn published_host_description(
+    resource: &HostResource,
+) -> Option<Arc<crate::kernel::FileDescription>> {
+    crate::kernel::objects::published_description(resource)
+        .filter(|description| description.inspect_kind(|_| ()).is_some())
+}
+
+/// The run stream (0 stdin, 1 stdout, 2 stderr) a description duplicates:
+/// `dup`/`fcntl(F_DUPFD)` of a bare stdio descriptor, which is how a shell
+/// saves and restores a redirected stream.
+fn stdio_stream_of(description: &Arc<crate::kernel::FileDescription>) -> Option<i32> {
+    description
+        .inspect_kind(|open| match open {
+            crate::dispatch::OpenDescription::HostPipe { stdio_stream, .. } => *stdio_stream,
+            _ => None,
+        })
+        .flatten()
 }
 
 /// Where a carrier buffer sits in the description cores' notional address
@@ -1030,6 +1066,103 @@ mod tests {
         assert_eq!(fixture.dispatcher.stdout(), b"bin\nboot\n");
     }
 
+    impl Fixture {
+        /// The ring fork of `parent`'s namespace, as the native fork
+        /// service publishes it: the child's own table, sharing every
+        /// description the parent's names.
+        fn fork_table(&self, parent: [u64; 3]) -> [u64; 3] {
+            let parent = fd::TableId::from_raw(fd::RawTableId {
+                authority: parent[0],
+                index: parent[1],
+                generation: parent[2],
+            });
+            let child = self
+                .owner
+                .region()
+                .fork_descriptors(parent, &crate::el1_zone::HostLockWait, |_| Ok(()))
+                .unwrap()
+                .to_raw();
+            [child.authority, child.index, child.generation]
+        }
+    }
+
+    /// #1410: the root shell redirects a builtin's stdout with `dup`/`dup3`
+    /// and restores it, then forks a child that writes to stdout. The child
+    /// inherits the root's explicit fd 1 (a duplicate of the run's stdout
+    /// stream), which the carrier must serve as the run's stdout, not refuse
+    /// as an unserved host description (a counted ENOSYS in the child).
+    #[test]
+    fn native_child_writes_through_the_roots_restored_stdout() {
+        let mut fixture = writable_fixture(Upper::Memory);
+        let root = &mut fixture.dispatcher;
+        // Shell shape for `echo x > /tmp/f`: save stdout, open the target,
+        // point fd 1 at it, run the builtin, restore fd 1, close the temps.
+        let saved = root_syscall(root, 23, [1, 0, 0, 0, 0, 0], &[]);
+        assert!(saved >= 3, "dup(1): {saved}");
+        let target = root_openat(root, b"/tmp/f\0", CREATE);
+        assert!(target >= 3, "open: {target}");
+        assert_eq!(root_syscall(root, 24, [target as u64, 1, 0, 0, 0, 0], &[]), 1);
+        assert_eq!(root_syscall(root, 24, [saved as u64, 1, 0, 0, 0, 0], &[]), 1);
+        assert_eq!(root_syscall(root, 57, [saved as u64, 0, 0, 0, 0, 0], &[]), 0);
+        assert_eq!(root_syscall(root, 57, [target as u64, 0, 0, 0, 0, 0], &[]), 0);
+
+        let child = fixture.fork_table(fixture.table);
+        let write = record(child, HostFileOp::Write, 1, [UNLIMITED, 0, 0, 0], b"y\n", 0);
+        let (written, _) = fixture.result(None, write);
+        assert_eq!(written, 2, "the child's stdout write is served");
+        assert_eq!(fixture.dispatcher.stdout(), b"y\n");
+        // `ppoll` on the inherited stdout reads the same stream's readiness.
+        let (ready, _) = fixture.result(
+            None,
+            poll_record(
+                child,
+                host_file::PollWait::Snapshot.raw(),
+                &[(1, carrick_abi::LINUX_POLLOUT, 0)],
+            ),
+        );
+        assert_eq!(ready, 1);
+        // The redirect target never saw the child's byte: it wrote stdout.
+        let authority = authority_of(&fixture.dispatcher);
+        assert!(fixture.venue_contents(&authority, b"/tmp/f").is_empty());
+    }
+
+    /// #1410: `exec >file` leaves the root's fd 1 on a host file. A forked
+    /// child inherits that very description (one offset, one file), so its
+    /// stdout write lands in the file, as on Linux, not in a counted ENOSYS.
+    #[test]
+    fn native_child_writes_through_the_roots_redirected_stdout_file() {
+        let mut fixture = writable_fixture(Upper::Memory);
+        let root = &mut fixture.dispatcher;
+        let target = root_openat(root, b"/tmp/f\0", CREATE);
+        assert!(target >= 3, "open: {target}");
+        assert_eq!(root_syscall(root, 24, [target as u64, 1, 0, 0, 0, 0], &[]), 1);
+        assert_eq!(root_syscall(root, 57, [target as u64, 0, 0, 0, 0, 0], &[]), 0);
+
+        let child = fixture.fork_table(fixture.table);
+        let write = record(child, HostFileOp::Write, 1, [UNLIMITED, 0, 0, 0], b"y\n", 0);
+        let (written, _) = fixture.result(None, write);
+        assert_eq!(written, 2);
+        assert!(fixture.dispatcher.stdout().is_empty());
+        let authority = authority_of(&fixture.dispatcher);
+        assert_eq!(fixture.venue_contents(&authority, b"/tmp/f"), b"y\n");
+    }
+
+    /// #1410: once the host has closed its last descriptor for an inherited
+    /// description there is nothing live to serve through. The carrier
+    /// refuses (a counted ENOSYS) rather than answer a guessed EBADF.
+    #[test]
+    fn native_inherited_description_is_refused_after_the_host_closes_it() {
+        let mut fixture = writable_fixture(Upper::Memory);
+        let root = &mut fixture.dispatcher;
+        let target = root_openat(root, b"/tmp/f\0", CREATE);
+        assert_eq!(root_syscall(root, 24, [target as u64, 1, 0, 0, 0, 0], &[]), 1);
+        assert_eq!(root_syscall(root, 57, [target as u64, 0, 0, 0, 0, 0], &[]), 0);
+        let child = fixture.fork_table(fixture.table);
+        assert_eq!(root_syscall(root, 57, [1, 0, 0, 0, 0, 0], &[]), 0);
+        let mut write = record(child, HostFileOp::Write, 1, [UNLIMITED, 0, 0, 0], b"y\n", 0);
+        assert_eq!(fixture.serve(None, &mut write), Err(NativeHostFileRefusal));
+    }
+
     #[test]
     fn native_stdio_fstat_is_the_dispatchers_implicit_stdio_record() {
         let fixture = fixture();
@@ -1057,7 +1190,7 @@ mod tests {
             fixture.result(None, closed).0,
             carrick_abi::LINUX_EBADF.guest_retval()
         );
-        // An inherited explicit host description is a later slice.
+        // A published description with no open backing has nothing to serve.
         let mut regular = record(fixture.table, HostFileOp::Write, 3, [0; 4], b"x", 0);
         assert_eq!(
             fixture.serve(None, &mut regular),

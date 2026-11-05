@@ -1178,6 +1178,27 @@ struct IpcPhysicalHold {
     physical: Arc<DescriptionPhysicalLifetime>,
     backing: Option<OpaqueFileDescriptionBacking>,
     admitted: Arc<AtomicBool>,
+    /// The published description itself, weakly, so the carrier can serve a
+    /// ring process's inherited host descriptor through the host's own
+    /// description cores. Weak on purpose: the description's common record
+    /// owns this capsule's admission (`ipc_forwarding`), and a strong edge
+    /// back would keep both alive after the host's last close.
+    view: Weak<FileDescription>,
+}
+
+/// The host description a pinned ring resource stands for, while the host
+/// still holds it open: the one a ring process inherited from a host-served
+/// task (a shell's redirected-and-restored stdout, `exec >file`). `None` for
+/// any other resource, and once the host's last descriptor is closed (the
+/// capsule then only keeps the backing from finishing).
+pub(crate) fn published_description(
+    resource: &crate::el1_ipc::HostResource,
+) -> Option<Arc<FileDescription>> {
+    resource
+        .downcast_ref::<IpcPhysicalHold>()?
+        .view
+        .upgrade()
+        .filter(|description| description.fd_ref_count() > 0)
 }
 
 fn finish_description(
@@ -1262,7 +1283,7 @@ pub struct FileDescription {
 
 impl FileDescription {
     pub(crate) fn ipc_description(
-        &self,
+        self: &Arc<Self>,
         owner: &Arc<crate::el1_ipc::HostIpc>,
     ) -> Result<Arc<crate::el1_ipc::HostDescriptionFlags>, crate::el1_ipc::AdmissionError> {
         use carrick_el1_abi::ipc::{IpcBacking, fd};
@@ -1302,6 +1323,7 @@ impl FileDescription {
             physical: Arc::clone(&self.common.physical),
             backing,
             admitted: Arc::clone(&admitted),
+            view: Arc::downgrade(self),
         }))?;
         let backing = IpcBacking::Host(token).encode();
         let description = match owner.admit_description(fd::Description::new(
