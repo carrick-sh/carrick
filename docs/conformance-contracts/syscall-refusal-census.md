@@ -283,3 +283,14 @@ creation mask. The conformance runner requests `0700` on its census temporary
 directory, and the signed smoke fixture uses private directory creation. The
 successive-carrier unit binding lets the production publisher create its census
 subdirectory and then reuses that same directory for both publications.
+
+## Final unclaimed-child capture (#1335, slice 1)
+
+The real-fork namespace baseline exposed a later gap in final capture:
+`refused[34]` was 2 but `refused_child[34]` was 0. The same production
+boundary now uses the existing typed recorder with descendant/ring identity.
+Two live children and a successful exec successor require all six namespace
+refusals in the descendant population, zero carrier refusals and no carrier
+notices. The unclaimed-ordinal negative control retains one errno-38 result
+and one total refusal. No syscall routing or namespace service was added.
+Signed image/CLI and Docker evidence remain open.
