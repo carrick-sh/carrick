@@ -5236,10 +5236,20 @@ fn serial_host_pipemass_fd_limit_preserves_wait_domains_and_incarnations() {
             DispatchOutcome::Returned { value: 0 }
         );
         let initial = h.dispatcher.captured_file_table().slot_count();
-        for _ in 0..2 {
+        for round in 0..2 {
             let mut pairs = Vec::new();
-            for _ in 0..(LIMIT - initial) / 2 {
-                pairs.push(h.pipe2(0x4000));
+            for pair in 0..(LIMIT - initial) / 2 {
+                let outcome = h.run(SpliceTestRig::SYS_PIPE2, [0x4000, 0, 0, 0, 0, 0]);
+                assert_eq!(
+                    outcome,
+                    DispatchOutcome::Returned { value: 0 },
+                    "round {round} pair {pair}"
+                );
+                let fds = h.memory.read_bytes(0x4000, 8).unwrap();
+                pairs.push((
+                    i32::from_ne_bytes(fds[0..4].try_into().unwrap()) as u64,
+                    i32::from_ne_bytes(fds[4..8].try_into().unwrap()) as u64,
+                ));
             }
             assert_eq!(
                 h.run(SpliceTestRig::SYS_PIPE2, [0x4000, 0, 0, 0, 0, 0]),
