@@ -101,7 +101,7 @@ pub mod terminal_save_test_control {
             observation.process_root = process_root;
             observation.maintenance_root = maintenance_root;
             if self.fail_second_write {
-                carrick_vmm_hvf::hvf_aarch64_engine::fail_terminal_save_second_write_for_test();
+                carrick_vmm_hvf::hvf_aarch64_engine::fail_terminal_save_second_write_for_test(vcpu);
             }
             Ok(())
         }
