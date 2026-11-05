@@ -1563,6 +1563,15 @@ fn kernel_only_write_denial_is_a_fault_without_supply() {
 
 #[test]
 fn untouched_private_file_selects_only_owner_retained_source() {
+    untouched_private_file_selects_source(ReservationProtection::READ_WRITE);
+}
+
+#[test]
+fn untouched_readonly_private_file_selects_only_owner_retained_source() {
+    untouched_private_file_selects_source(ReservationProtection::READ);
+}
+
+fn untouched_private_file_selects_source(protection: ReservationProtection) {
     use carrick_el1::memory::reservations::Layout;
     let region = Region::new();
     let spaces = AddressSpaces::new();
@@ -1596,7 +1605,7 @@ fn untouched_private_file_selects_only_owner_retained_source() {
         .unwrap();
     root.import_with_backing(
         ReservationRange::new(VA, VA + 8192).unwrap(),
-        ReservationProtection::READ_WRITE,
+        protection,
         carrick_el1_abi::ReservationNodeFlags::PRIVATE,
         source,
     )
@@ -1618,6 +1627,7 @@ fn untouched_private_file_selects_only_owner_retained_source() {
     let TransferStep::Supply(window) = select(&portal, &transfer, &tables) else {
         panic!("no retained file supply")
     };
+    assert_eq!(window.protection, protection);
     assert_eq!(window.host_backing, source.advance(4096));
     assert_eq!(
         window.range,

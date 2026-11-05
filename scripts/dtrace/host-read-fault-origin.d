@@ -16,7 +16,10 @@
  * (b) Provider ABI: `guest-internal-read-fault(u64 page, u64 length,
  *     u32 phase, u64 live_descriptor)`; phase 0 = an EL1-private leaf
  *     denies the read, 1 = no host translation and not fresh zero, 2 = the
- *     backend read failed. Descriptor bits: 0 valid, 55 SW_RETIRED,
+ *     backend read failed, 3 = owner admission/selection/supply/copy refused,
+ *     4 = resumed owner transfer refused. Owner waits and supply suspensions
+ *     are progress, not read faults; use hvpatch-el1-host-read-progress to
+ *     distinguish a dispatcher lowering a suspension to EFAULT. Descriptor bits: 0 valid, 55 SW_RETIRED,
  *     56 SW_EL1_PRIVATE, output address [47:12]. `syscall-return` arg0 =
  *     Linux nr, arg2 = retval. Not yet live-qualified (added 2026-10-01).
  *

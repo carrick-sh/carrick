@@ -9,6 +9,7 @@ rationale = "A file-backed PROT_NONE reservation of 0x65ee48 bytes, fixed RX tex
 
 [bindings]
 vm_free = [
+  "carrick-el1-linux::mm_portal::tests::untouched_readonly_private_file_selects_only_owner_retained_source (selection-only regression check: readable private file pages request their retained source without eager bytes; already passes on admitted main, not a red-first dispatch witness for #1677)",
   "carrick-kernel::dispatch::mem::delegated_tests::admitted_private_host_file_populate_self_held_gate_is_not_fatal (POPULATE/LOCKED regression preservation only; success remains #1141)",
   "carrick-kernel::dispatch::mem::delegated_tests::admitted_proc_executable_private_mmap_avoids_its_own_gate",
   "carrick-kernel::dispatch::mem::delegated_tests::{libpython_fixed_file_segments_use_owner_source_without_eager_copy,libpython_old_deferred_recipe_and_owner_copy_refusals,remap_file_pages_on_shared_mapping_wait_for_owner_refused_copyout_leaving_private_file_mappings_intact}; real file, production AddressSpace, root, deferred registry and bounded PREPARE admission. RED: eager file copy and premature predecessor retirement. Component reproduction: overlapping deferred file recipe -> InvalidRange -> whole-map owner copy exceeds 4096 -> ENOMEM lowering. Retirement classification: carrick-aarch64::descriptor_drain::retirement_tests::retirement_refusals_are_clean_only_before_any_chunk_commits. Signed branch confirmation remains open.",

@@ -3353,6 +3353,40 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         length: usize,
         intent: carrick_el1_abi::PortalTransferIntent,
     ) -> Result<Vec<u8>, MemoryError> {
+        let result = self.start_owner_read(address, length, intent);
+        self.observe_owner_read(result, address, length, 3)
+    }
+
+    /// Owner admission and SELECT use a different venue from legacy backing.
+    /// Keep their terminal failures visible to the same read-fault tracer.
+    /// Suspension is progress, not EFAULT, and keeps its existing receipt.
+    fn observe_owner_read(
+        &self,
+        result: Result<Vec<u8>, MemoryError>,
+        address: u64,
+        length: usize,
+        phase: u32,
+    ) -> Result<Vec<u8>, MemoryError> {
+        if let Err(error) = &result
+            && !matches!(
+                error,
+                MemoryError::ReadSuspended(_)
+                    | MemoryError::OwnerWait(_)
+                    | MemoryError::Physical(_)
+                    | MemoryError::Supply(_)
+            )
+        {
+            self.trace_read_fault(address, length, phase);
+        }
+        result
+    }
+
+    fn start_owner_read(
+        &self,
+        address: u64,
+        length: usize,
+        intent: carrick_el1_abi::PortalTransferIntent,
+    ) -> Result<Vec<u8>, MemoryError> {
         let handle = self.protections.owner().ok_or(MemoryError::Unsupported)?;
         if handle.mm().raw() != self.mm_generation {
             return Err(MemoryError::HostMap(
@@ -3749,7 +3783,10 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
                     "read continuation already consumed or belongs to another backend".into(),
                 )
             })?;
-        self.continue_owner_read(transfer)
+        let address = transfer.address();
+        let length = transfer.len();
+        let result = self.continue_owner_read(transfer);
+        self.observe_owner_read(result, address, length, 4)
     }
 
     fn caller_el1_call(&mut self) -> Option<&mut dyn carrick_guest_mem::CallerEl1Call> {
