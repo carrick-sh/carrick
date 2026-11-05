@@ -4871,8 +4871,11 @@ fn persistent_save_restores_worker_controls_after_task_snapshot_before_detach() 
         .and_then(|tail| tail.split("fn take_pending_retirement").next())
         .expect("persistent executor save body");
     let snapshot = save
-        .find("snapshot_task_state_from_live_executor")
-        .expect("task snapshot and continuation export");
+        .find("snapshot_guest_state_for_publication")
+        .expect("terminal task snapshot before canonical publication");
+    let metadata = save
+        .find("engine.extract_resident_task_metadata_for_lazy_save")
+        .expect("continuation export before worker detach");
     let publication = save
         .find("lease.replace_task_state")
         .expect("saved task state publication");
@@ -4882,6 +4885,7 @@ fn persistent_save_restores_worker_controls_after_task_snapshot_before_detach() 
     let detach = save.find("self.current.take()").expect("engine detach");
     assert!(snapshot < publication);
     assert!(publication < neutralize);
+    assert!(metadata < neutralize);
     assert!(neutralize < detach);
 }
 

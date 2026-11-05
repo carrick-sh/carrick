@@ -1,3 +1,11 @@
+# #1666: terminal-only CPU saves now materialize from the current MM lease.
+# The two-live-thread production exit_group binding in
+# carrick-runtime::vcpu_loop::binding::tests::
+# sibling_exit_group_terminal_save_keeps_process_translation checks the shared
+# save selector and unchanged exact-MM load audit, with one snapshot per
+# terminal suspension. Zone saves retain their existing context/origin;
+# ordinary guest dispatch, exec drains and this contract's budgets and primary
+# bindings are unchanged. Native signed stress qualification remains required.
 # #1580 derives KVM lifecycle sidecar placement from the shared guest layout.
 # cpl0_lifecycle::x5_shared_clone_exit and cpl0_fork_e2e are the real-KVM
 # red/green controls; this contract's guest semantics and budgets are unchanged.
