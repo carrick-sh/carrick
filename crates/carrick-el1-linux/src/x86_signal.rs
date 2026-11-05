@@ -159,11 +159,11 @@ impl LinuxX86Backend {
 }
 
 impl SignalBackend for LinuxX86Backend {
-    fn setup_signal_frame<'a>(
+    fn setup_signal_frame(
         &mut self,
         frame: &mut NativeFrame,
         params: SignalFrameParams,
-        siginfo: Option<&'a [u8]>,
+        siginfo: Option<&[u8]>,
         fpstate: &[u8],
         copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
     ) -> Result<UserVa, Self::Error> {
