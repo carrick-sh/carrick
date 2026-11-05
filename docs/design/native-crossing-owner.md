@@ -232,3 +232,58 @@ binaries or signed receipts blocks implementation acceptance. A docs review
 can approve an approach with those measurements pending; it cannot declare
 #1335 fixed or conformance restored. Keep the design PR draft until independent
 review and the director's implementation ordering are recorded.
+
+## Descriptor-family continuation design (#1678)
+
+The fd-table fixture already serves dup, dup3, the descriptor/status fcntl
+commands and close through the existing descriptor owner. That seeded fixture
+is not evidence that production inherited stdio reaches this owner. Pipe
+capacity and range-close remain implementation work; do not remove their
+Forward policy based on the seeded fixture alone.
+
+An independent prerequisite review of a capacity-read extension identified the
+following shared-owner design. This is an implementation plan, not a claim of
+service or signed acceptance:
+
+- Append an explicitly numbered pipe-capacity-read kind to `IpcOpKind`, keeping
+  the existing discriminants and `IpcOperation` layout. Keep the exact OFD pin,
+  object generation, caller and operation token in the existing record.
+- Admit F_GETPIPE_SZ through the existing IPC operation owner. Both pipe ends
+  support it; skip read/write direction checks, buffer preparation and
+  zero-length transfer shortcuts. Invalid and non-pipe descriptors return
+  errno 9. No user bytes are copied.
+- Read capacity only under the existing object guard. Add a value-bearing
+  completion to the shared transfer result; capacity is a syscall result,
+  never transferred-byte progress. Update both the ring result settlement and
+  `carrick-kernel/src/kernel/continuation/ipc.rs` settlement.
+- Preserve holder-aware acquisition. `NativeFdWait` is suitable for existing
+  short fd-table sections, but using its unbounded spin for the object lock
+  can deadlock: a host holder may wait for this vCPU to stop. Mapping bounded
+  contention through `map_ipc_error` instead returns EIO and is also wrong.
+- Native contention uses `user.yield_owned_operation` and its retained token;
+  it must not use the host-only handback ABI. Resume the pinned object without
+  resolving the numeric fd again. Audit operation-slot exhaustion and signal
+  settlement too: the new operation cannot turn transient refusal into ENOSYS
+  or a fabricated partial byte count.
+
+This read extension introduces no new lock order: fd admission retains the
+pin, releases table access, acquires the object, releases the object, then
+settles the pin and any final release through the existing owner. No lock
+survives a park. A production-entry witness must force a host-held object lock
+once, retain the operation, close and reuse its numeric fd, then release the
+holder and require the original pipe's capacity. Also cover both ends,
+non-pipes, two live children and operation-record exhaustion. Preserve the
+unclaimed-call negative control. The ARM-frame IPC adapter is not a shared ISA
+binding by itself; explicitly resolve the x86 adapter before claiming both
+clients work.
+
+F_SETPIPE_SZ must extend that same retained operation with the existing
+`HostIpc::resize_pipe` provisioning authority. Its allocation, object-lock,
+wake-delivery and reclamation ordering remains as documented in the
+[descriptor-family contract note](../conformance-contracts/native-child-fd-family.md).
+Do not duplicate resizing in the ring or substitute unbacked-only support.
+Plain close_range must preserve filtered release and host close effects;
+UNSHARE additionally needs an admitted process-resource transition publishing
+all graph, fd-map and IPC-table identities together. Their wire and publication
+interfaces remain unresolved. This plan does not authorize an independent fd
+namespace, raw syscall fallback or a partial mutation before forwarding.
