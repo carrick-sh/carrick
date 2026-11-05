@@ -89,6 +89,7 @@ vm_free = [
   "carrick-kernel::dispatch::native_files::tests::native_poll_never_waits_or_answers_part_of_a_set (#1503: the native host-file venue never parks the carrier or owner-waits; it runs under the native fs scope guard, which fails on any escape to a host MM or file table as production does)",
   "carrick-el1-abi::refusal_census_tests::refusal_snapshot_preserves_caller_populations_without_changing_service_counts",
   "carrick-el1-linux::native_process_runtime::host_test_support::{host_request_during_service_park_yields_then_reparks,host_request_during_owner_wait_park_yields_then_reparks} (#1467: an owner-wait park refused by a concurrent host request retains its operation on the record, yields, and re-evaluates on return instead of quarantining; VM-free only)",
+  "carrick-runtime::vcpu_loop::tests::serial_host_owner_memory_reservations_release_completes_parked_syscall",
 ]
 
 [bindings.unresolved]

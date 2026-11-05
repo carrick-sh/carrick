@@ -188,3 +188,32 @@ instruction-executing native-process fixture. The preserved dispatcher witness
 lines on a 2 MiB host stack. It passes before this correction too. The signed
 Mac command and attribution of its reservation-root holder remain higher-layer
 obligations; the policy witnesses alone do not certify that command.
+
+### Reservation-root release completion reduction
+
+`serial_host_owner_memory_reservations_release_completes_parked_syscall`
+uses a real bound reservation guard on a peer thread. A production portal root
+acquisition returns Busy while that guard lives. The fixture's copyout adapter
+returns the sampled Reservations receipt; the production
+`park_owner_memory_action` enrolls it, the carrier wait service parks the
+continuation, and dropping the guard advances the source. The scheduler wakes
+the continuation, residency is reloaded, and the retained FSTAT completes once.
+No editor release participates in this schedule.
+
+The owner sampled by `DelegatedRoot::observe_probe` is the admitted MM root;
+its receipt contains that MM's carrier identity, incarnation and Reservations
+revision. `Reservations::drop` is the release producer, through
+`SpaceNotificationLease::release_resource`. The host provider binds that drop
+to `HostLockWait` in `vcpu_loop/reservations.rs`; the fixture uses the same core
+release with its peer slot's venue. The mapping dispatcher reconciles before
+all mutation handlers, including mincore and mlock2. An ordinary proc status
+read is not itself a mutation handler; grep's startup mapping or fcntl calls
+can reach this boundary. This is a source-level route explanation, not a trace
+of the failing Mac run.
+
+This reduction passes without changing production code. It does not reproduce
+the director's permanent park, identify its live root holder, or establish the
+numeric revision in that capture. A capture of the exact refusal's `holder`
+and `wait` plus the holder's execution state remains necessary before choosing
+a production correction. The signed grep/mincore/mlock2 acceptance remains
+open; a green reduction must not be reported as fixing their hangs.
