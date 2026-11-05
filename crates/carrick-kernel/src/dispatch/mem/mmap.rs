@@ -1476,7 +1476,18 @@ impl<'a> MemView<'a> {
                 && map_flags.contains(LinuxMmapFlags::FIXED)
                 && !in_arena
                 && memory.read_bytes_raw(address, 1).is_ok();
-            let address_uses_alias = mmap_request_uses_alias(
+            // Attributed anonymous mappings and shared file snapshots remain
+            // host-served in an admitted root. Their sparse arena VA is not
+            // physical backing: use the existing alias transaction to install
+            // initialized backing and permissions together, even at a low VA.
+            // Plain anonymous mappings retain #1663's sparse owner path.
+            let owner_host_snapshot = memory.supports_lazy_anonymous_mmap()
+                && this.mem().lock().delegated_root().is_some()
+                && ((map_sharing == MmapSharing::Private
+                    && map_flags.contains(LinuxMmapFlags::ANONYMOUS | LinuxMmapFlags::DROPPABLE))
+                    || (map_sharing == MmapSharing::Shared
+                        && !map_flags.contains(LinuxMmapFlags::ANONYMOUS)));
+            let address_uses_alias = owner_host_snapshot || mmap_request_uses_alias(
                 map_flags.contains(LinuxMmapFlags::FIXED),
                 address_uses_alias_layout,
                 has_identity_backing,
@@ -1573,6 +1584,7 @@ impl<'a> MemView<'a> {
             // valid+RW again, and a PROT_NONE mmap must actually fault. No-op
             // (no TLBI) when the page is already at the target protection.
             let defer_anonymous = sparse_anonymous_backing
+                && !owner_host_snapshot
                 && this.linux_page_size() == 4096
                 && map_flags.contains(LinuxMmapFlags::PRIVATE)
                 && !map_flags.intersects(LinuxMmapFlags::POPULATE | LinuxMmapFlags::LOCKED)
