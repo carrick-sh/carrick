@@ -6,7 +6,7 @@ This round changes documentation only. It does not claim a lifecycle fix.
 ## Scope and evidence
 
 The source anchors below describe admitted main
-`371d59eb8edd2b475da13b1fa63e57b488fa7ddc`. They are a review snapshot,
+`04deeb00729d48ec881eec6ecac8716d64161492`. They are a review snapshot,
 not a new machine-enforced line inventory; delete this snapshot when the
 migration reaches zero. The authoritative inventory remains
 `just xtask terminal-custody --list`, run with `just xtask lint-source`.
@@ -43,7 +43,7 @@ the raw decision, its current purpose, and the proposed owner operation.
 | `native_process_runtime.rs:6927` / `fork_publish` | child starts with one live member | admit fresh child |
 | `native_process_runtime.rs:6932` / `fork_publish` | all pool entries Vacant before publication | admit fresh child stock |
 | `lifecycle.rs:583` / `release_current` | absent zone record refuses retirement | consume existing ZoneRetirement capability |
-| `dispatch.rs:277` / `dispatch_syscall` | live census chooses whether SYS_EXIT stays in the thread path | owner supplies exit scope admission |
+| `dispatch.rs:277` / `dispatch_syscall` | live census feeds `arm_owner_must_serve` in the refusal closure: non-last-thread SYS_EXIT permits ordinary fallback when the process call is unserved; this does not choose initial routing | owner supplies refusal-policy capability preserving that distinction |
 | `aarch64_process.rs:2595` / `retire_mm` | PendingRetirement authenticates terminal execution before crossing | consume phase-specific retirement capability |
 
 These are all 18 live scanner sites. No ceiling increase or scanner exemption
@@ -119,14 +119,15 @@ a census read.
 ## Composition and ordering
 
 These are integration requirements, not claims that open branches have landed.
-Public GitHub issue/PR bodies were read on 2026-11-04; recheck their heads and
-witnesses before dispatching implementation.
+The #1653 review and #1589 body and patch were read on 2026-11-05; #1589
+was still open. These are integration requirements, not runtime acceptance.
+Recheck every prerequisite head, landing and witness before implementation.
 
 | Lane | Interaction and prerequisite |
 |---|---|
 | #1569 | Exact observed scheduler claim and yield receipt fix. Land before slice 1; reuse its neutral host-request verdict. Do not restore a claim re-read after a successful requeue. |
 | #1575 | Service exit Busy during group close. Land before slice 1 and preserve its production two-thread red witness; closing participant handling becomes an owner client, never a competing fatal/errno path. |
-| #1576 | Signal delivery binding around native birth/exit. Land before recipient migration; it can proceed independently of design and exit slice, but slice 1 must preserve its witness if landed. The issue's proposed diagnosis remains unproven. |
+| #1576 / #1589 | Signal delivery binding around native birth/exit is an explicit prerequisite of slice 1, alongside #1569, #1575/#1585 and #1566. Preserve exact-incarnation first admission versus absence after unregister; exit changes the same member/graph lifetimes. Require the production signal witness and signed acceptance below before starting. |
 | #1566 | Per-waiting-task continuations. Land before slice 1 so pending close/wait integration retains the calling task's continuation rather than a process-wide slot. |
 | #1485 | Owed-return claims and linear retirement permits. Exit slice may land without completing its MM work, but must leave its existing retirement boundary intact. Any shared API overlap is resolved with that lane first; later MM retirement integration depends on its reviewed permits, never a duplicate return path. |
 
@@ -134,9 +135,24 @@ No lane should wait for this design to fix a current fatal. Rebase each slice,
 map every affected fix as kept/ported/dropped, and re-prove its production red
 witness after code moves. The director owns the final ordering and signed gate.
 
+The #1589 prerequisite includes
+`aarch64_process_tests::native_fault_supply_tests::native_child_thread_signal_at_first_user_return`
+and core's `lifecycle::membership_tests::graph_registration_survives_final_reference_until_control_reset`.
+The first must preserve newborn admission, once-only signal delivery and
+rejection of newborn restoration after first admission; preserve the retained
+`GRAPH_REGISTERED` distinction through final unregister until control reset.
+The director must also complete repeated full signed `el1_sched` populations
+with zero #1576 `EntryBinding at=1795` fatals, including the affected fork-COW,
+two-process, spawn-slope, seccomp clone-filter and allocator witnesses.
+VM-free results on #1589 do not satisfy that signed prerequisite. Current main
+still authenticates signal return with `with_process_entry` and fails closed
+at `dispatch.rs:1785` and `:1795`; the exit slice must preserve that boundary.
+
 ## First slice: exit and import
 
-After independent approval, move the eligibility in `exit_with_status`,
+After fresh independent approval of this revision and accepted landing of
+#1569, #1585 (for #1575), #1589 (for #1576) and #1566, move the eligibility
+in `exit_with_status`,
 `begin_closing` and `imported_members` behind the existing neutral owner.
 The Linux adapter supplies retained member observations and applies returned
 capabilities; core alone filters states and validates membership/claim floors.
@@ -152,6 +168,91 @@ slice. Later independently reviewable slices migrate fork/adoption, recipient
 and execution binding, then remaining lifecycle adapters/diagnostic policy to
 zero. Merely renaming a raw read or moving it to another non-owner crate does
 not count. Delete the zero ceiling entry when the final client migrates.
+
+### Retained receipt progress
+
+Slice 1 also changes `PendingExit::{observations,readiness,ready_or_record,
+completed_receipts}` and their `park_pending_exit` / `exit_with_status` callers.
+On admitted main, `observations` (`native_process_runtime.rs:1039`) scans all
+outstanding members; `readiness` (`:1093`) rebuilds both vectors each time.
+Core's `observe_members_verdict` (`terminal.rs:786`) starts at pool member zero
+and drops its completed prefix on the first missing receipt. Moving only the
+five predicates leaves quadratic work under staggered completion and does not
+meet this slice's acceptance criterion.
+
+Propose a neutral, non-Clone `MemberReceiptProgress` in `carrick-core::terminal`,
+minted once by Closing custody from its authenticated `MemberSet`. It owns the
+boxed exact expected receipt sequence, a next-uncompleted cursor and the
+already authenticated prefix. This evolves the existing member/receipt storage;
+it is not a second census or lifecycle state machine. Linux `PendingExit` owns
+this value alongside Closing custody and retained control-storage handles;
+Linux cannot construct it, reset its cursor or mark a receipt complete.
+The owner binds it to the exact process close operation and member-set identity.
+Large storage remains boxed, outside the bounded EL1/CPL0 stack.
+
+The proposed `advance` operation borrows only the next exact retained member
+observation, authenticates the existing pool/adopted/host-born receipt, records
+success once and advances. A Pending result returns an exact release dependency
+for that cursor without discarding progress. `ready_or_record` reports this
+cached verdict; `completed_receipts` consumes the finished progress into the
+existing `CompletedMemberReceipts`, without another whole-set check. Evolve the
+existing `observe_members_verdict` implementation into this protocol, replacing
+its native close call path rather than keeping a parallel scanner. Final
+`can_settle` still applies the owner's live/claimed floors; a floor wait retains
+the completed proof and does not revisit members.
+
+To park, enroll on the selected member's existing release notification under
+its wait-bucket guard, then re-probe that same exact dependency once. If already
+returned, cancel enrollment and advance; otherwise retain progress, dependency
+and control lifetimes in the calling task's continuation and release execution
+capacity. Wake resumes that cursor, never member zero. No borrowed observation,
+registry guard or scheduler claim survives parking. Arm the existing process
+membership-release dependency similarly when only the final floor remains.
+This is enrollment against an authoritative receipt, not periodic polling.
+
+Completion may arrive out of order: it remains in the existing member's durable
+receipt storage until the cursor reaches it. An earlier pending member is the
+only armed dependency; later completions need no separate wake or scan. When
+the earlier member returns, the cursor consumes already-returned successors.
+The post-enrollment re-probe closes the lost-wakeup window even if the next
+member completed before enrollment. A spurious wake rechecks only the selected
+dependency and cannot invalidate the authenticated prefix.
+
+Close admission still orders the birth snapshot (`terminal.rs:723` and `:737`)
+and holds the existing registry/graph admission boundary. Capture pre-live
+obligations in that one bounded snapshot before sealing progress; late Born or
+ExitedInZone publication completes the same reserved exact identity, not a
+newly discovered member requiring a rescan. If capture is still pending, retain
+its bounded traversal cursor and admission obligation before receipt advancement.
+No success is minted until that snapshot is sealed. Retained control custody
+prevents reset/reuse while its receipt is owed; authenticate record incarnation,
+entry identity and host birth serial at each advancement. A mismatched recycled
+record cannot satisfy the cursor. After authentication, the retained prefix
+proves that exact old obligation even if storage is later reused; it does not
+license access to the replacement record. Exec-to-exit upgrade transfers this
+same progress and accounts once for exec's retained caller/service obligations;
+it cannot restart the sequence or discard an owed receipt.
+
+Require production-entry schedules at N = 2, 8 and 32 members, with both
+one-at-a-time ordered completion and reverse/out-of-order completion, late
+publication, reuse refusal and an enrollment race. Count snapshot slots S,
+receipt observations R and pending dependency episodes W per close operation.
+Assert one snapshot traversal, no observation of an authenticated prefix, and
+`total_member_visits <= S + N + 2*W`: each successful receipt costs at most one
+visit and each pending episode at most its initial check plus enrollment
+re-probe. Count floor probes separately, at most one initial probe plus one per
+floor release/enrollment event; they cannot traverse members. W counts only
+actual selected-dependency episodes (including spurious wakes), is bounded by
+the fixture schedule, and cannot be inflated by hidden full-set work. Total
+member visits include R and snapshot/authentication work. Restoring whole-vector
+rebuilding or resetting the cursor on wake must fail this assertion under
+staggered completion at these scales.
+Authenticate each member once, including exact cardinality at sealing; do not
+use the current repeated per-element set searches in `MemberSet::completed`
+(`terminal.rs:464`) as an uncounted quadratic final validation. Snapshot
+deduplication and member lookup must also fit the bound; retain stable indexed
+slots for exact obligations rather than nested identity searches. The red-first
+work witness is required before slice 1 can claim this interface is implemented.
 
 Before moving production code, extend production-entry native witnesses to
 exercise two live threads, pre-live claims, late Born/ExitedInZone publication,
