@@ -556,6 +556,15 @@ The loop runs Gemini Flash via `agy --model high`. It calls
 newline-delimited protocol rejects unknown fields in envelopes and arguments.
 There are no tool arguments for issue, PR, repository or scope. Only `select_branch` accepts a branch, checked against issue linkage.
 
+The opening prompt includes the already admitted issue/PR target and issue
+brief, the full trigger with its collaborator provenance, and the server's
+worker tier and reason. These facts require no GitHub read. `read_state` is
+optional for additional context: a timeout does not erase the opening facts
+or require another read before invoking a worker. The coordinator reports the
+timeout in its outcome and can proceed when the admitted facts suffice. The
+two-read budget and server checks on worker choice and publication remain
+unchanged (#1688).
+
 | Tool | Policy |
 | --- | --- |
 | `read_state {}` | Full issue and linked dispatch PRs (including closed state), reviews, inline comments, commits, issue/PR comments, earlier verified runs with URLs, conclusions, artifact names and outcome contracts. Includes their outcome comments and available branch candidates; includes project-1 status for this issue and its current owned dispatch PR when present. Board reads use the separate on-demand board token, are tagged `github-api(project-1)` and untrusted, and degrade to `unavailable` on missing credentials or API failure. The query caps fields and each item’s project memberships at 100 and rejects truncated connections; responses are capped at 64 KiB. Includes the label/comment/review trigger verbatim and provenance. Optional sources degrade individually to `unavailable` with endpoint, HTTP status when available, and bounded redacted stderr; unverifiable authors remain `unverified`. Errors are request-scoped, deduplicated and tagged `github-api(error)` with `untrusted:true`. `sources` is a fixed response field retained when chronological context is clipped; `sources_omitted` reports overflow of its half-response budget. Only trigger/issue reads are mandatory. Two reads, bounded to 64 KiB; oldest items are dropped with a count, keeping the trigger. |
