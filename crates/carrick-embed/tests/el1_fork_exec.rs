@@ -142,3 +142,32 @@ fn native_exec_successor_blocks_on_pipe_until_parent_writes_round() {
     assert!(result.success(), "stderr={}", result.stderr_utf8());
     assert_eq!(result.stdout_utf8(), "got:URI-REQUEST\n");
 }
+
+/// #1410: execute the shell's real save/redirect/restore sequence, then a
+/// forked external command. The trailing exit keeps the shell alive so it
+/// cannot replace itself with echo and bypass inherited descriptor routing.
+#[test]
+fn native_child_stdout_after_root_builtin_redirection() {
+    let _guard = common::guest_lock();
+    let _watchdog = common::Watchdog::start(Duration::from_secs(90));
+    reset_el1_counters();
+    let result = common::run_or_fail(
+        ContainerBuilder::from_image(common::SMOKE_IMAGE)
+            .pull_policy(PullPolicy::Missing)
+            .command(["/bin/sh", "-c", "echo x > /tmp/f; /bin/echo y; exit $?"])
+            .run_blocking(),
+    );
+    let counters = read_el1_counters().expect("missing EL1 counters");
+    let refused = counters.refused_child[64].load(Ordering::Relaxed);
+    let venue_refused = counters.venue_refused_child[64].load(Ordering::Relaxed);
+    assert!(
+        result.success(),
+        "exit {} signal {:?} stdout {:?} stderr {:?}; child write refused={refused} venue_refused={venue_refused}",
+        result.exit_code,
+        result.signal,
+        result.stdout_utf8(),
+        result.stderr_utf8()
+    );
+    assert_eq!(result.stdout_utf8(), "y\n");
+    assert_eq!((refused, venue_refused), (0, 0), "child write refusal");
+}

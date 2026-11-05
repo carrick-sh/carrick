@@ -35,3 +35,15 @@ a weak host owner, with generation checks around the atomic mode read. It
 neither selects an fd nor extends resource lifetime. Thus child `F_SETFL`
 changes remain visible after parent close without creating an owner cycle.
 The core reuse witness rejects a retired or recycled incarnation.
+
+The signed binding `el1_fork_exec::native_child_stdout_after_root_builtin_redirection`
+runs `/bin/sh -c 'echo x > /tmp/f; /bin/echo y; exit $?'` through
+`ContainerBuilder::run_blocking`, requiring exit zero and exactly `y\n`. It reports and rejects child write
+policy and venue refusal counters, so a signed red run can distinguish the
+refusal populations.
+The trailing `exit` prevents a last-command exec optimization from bypassing
+fork inheritance. It constructs no carrier write records. Run it with
+`CARRICK_TEST_TARGET=el1_fork_exec just test-embed native_child_stdout_after_root_builtin_redirection`.
+This binding is added but has not been run on this Linux worker. Signed
+red-first execution, refusal attribution and native ARM Docker parity remain
+blocking acceptance evidence; this change is **Part of #1410** and stays draft.
