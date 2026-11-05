@@ -892,9 +892,12 @@ impl Github {
             return Ok(());
         };
         if let Some(runner) = runners.into_iter().find(|r| r["id"].as_u64() == Some(id.0)) {
-            if runner["name"] != row.name() || runner["busy"] != false {
-                return Err(ScalerError::Guard(
-                    "runner identity changed or still busy; defer removal",
+            if runner["name"] != row.name() {
+                return Err(ScalerError::Guard("runner identity changed; defer removal"));
+            }
+            if runner["busy"] != false {
+                return Err(ScalerError::Transient(
+                    super::TransientFailure::CleanupPending,
                 ));
             }
             self.request(

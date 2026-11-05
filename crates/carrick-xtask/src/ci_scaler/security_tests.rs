@@ -1425,9 +1425,7 @@ fn vmid_lock_timeout_fails_closed_and_frees_nothing() {
     let mut busy = true;
     let mut lock = |_: CloneId| {
         if std::mem::take(&mut busy) {
-            Err(ScalerError::External(
-                "PVE VMID lock busy; retry cleanup next reconcile",
-            ))
+            Err(ScalerError::Transient(TransientFailure::CleanupPending))
         } else {
             Ok(())
         }
@@ -1451,7 +1449,7 @@ fn pve_vmid_lock_files_exclude_a_holder_and_time_out() {
     // flock binds open file descriptions, so a second open contends like qm.
     assert!(matches!(
         lock_files_within(&paths[1..], Duration::from_millis(100)),
-        Err(ScalerError::External(_))
+        Err(ScalerError::Transient(TransientFailure::CleanupPending))
     ));
     drop(held);
     lock_files_within(&paths, Duration::ZERO).unwrap();

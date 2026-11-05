@@ -56,7 +56,7 @@ pub const KERNEL_RUNTIME_WORKFLOW: &str = ".github/workflows/kernel-runtime.yml"
 pub const PILOT_WORKFLOW: &str = ".github/workflows/willow-pilot.yml";
 const PILOT_BRANCH: &str = "work/willow-pilot";
 
-/// Transport failures are uncertainty, never evidence that a clone is absent.
+/// Retryable external failures are uncertainty, never evidence of clone absence.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum TransientFailure {
     Curl,
@@ -64,6 +64,8 @@ pub enum TransientFailure {
     Connection,
     SshConnect,
     PveServer,
+    PveTask,
+    CleanupPending,
 }
 
 #[derive(Debug, Error)]
@@ -102,7 +104,7 @@ pub enum ScalerError {
     #[error("external command failed: {0}")]
     CommandFailed(String),
     // Contains only a validated HTTP status and parameter names, never values.
-    #[error("transient transport failure: {0:?}")]
+    #[error("transient external failure: {0:?}")]
     Transient(TransientFailure),
     #[error("PVE rejected request: {0}")]
     PveRejected(String),

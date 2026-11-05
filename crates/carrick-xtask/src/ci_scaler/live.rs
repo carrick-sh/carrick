@@ -563,6 +563,14 @@ fn vmid_configured(
 /// writes its config under one of them before allocating any disk, so while
 /// both are held "no config" stays true and no new volume can appear.
 fn pve_vmid_lock_paths(id: CloneId) -> [PathBuf; 2] {
+    #[cfg(test)]
+    if let Some(root) = std::env::var_os("CARRICK_TEST_PVE_LOCK_DIR") {
+        let root = PathBuf::from(root);
+        return [
+            root.join(format!("qm-{}", id.get())),
+            root.join(format!("pct-{}", id.get())),
+        ];
+    }
     [
         PathBuf::from(format!("/var/lock/qemu-server/lock-{}.conf", id.get())),
         PathBuf::from(format!("/run/lock/lxc/pve-config-{}.lock", id.get())),
@@ -600,9 +608,7 @@ pub(super) fn lock_files_within(
                 return Err(error.into());
             }
             if Instant::now() >= deadline {
-                return Err(ScalerError::External(
-                    "PVE VMID lock busy; retry cleanup next reconcile",
-                ));
+                return Err(ScalerError::Transient(TransientFailure::CleanupPending));
             }
             // PVE's holder is another process and flock has no release
             // notification, so poll the external lock until the deadline.
@@ -652,9 +658,7 @@ fn clear_clone_volumes<G>(
         volumes.len().saturating_sub(remaining.len())
     );
     if !remaining.is_empty() {
-        return Err(ScalerError::External(
-            "clone volumes remain; retry cleanup next reconcile",
-        ));
+        return Err(ScalerError::Transient(TransientFailure::CleanupPending));
     }
     Ok(())
 }
@@ -757,7 +761,7 @@ impl Pve {
     fn task_done(&self, task: &str) -> Result<bool, ScalerError> {
         match self.task_state(task)? {
             TaskState::Succeeded => Ok(true),
-            TaskState::Failed => Err(ScalerError::External("PVE task failed")),
+            TaskState::Failed => Err(ScalerError::Transient(TransientFailure::PveTask)),
             _ => Ok(false),
         }
     }
@@ -1502,6 +1506,19 @@ impl TeardownApi for LiveTeardown<'_> {
         self.gh.remove_runner(row)
     }
 }
+// Operational retirement failures retain the row for another pass. Ownership
+// guards and ledger/storage errors remain fail-closed, through the same pass
+// handler as every other invariant or persistence failure.
+fn cleanup_error(error: ScalerError) -> ScalerError {
+    match error {
+        ScalerError::External(_)
+        | ScalerError::CommandFailed(_)
+        | ScalerError::PveRejected(_)
+        | ScalerError::GithubGone => ScalerError::Transient(TransientFailure::CleanupPending),
+        other => other,
+    }
+}
+
 fn continue_teardown(
     api: &mut impl TeardownApi,
     ledger: &mut Ledger,
@@ -1533,7 +1550,7 @@ fn continue_teardown(
                 .ok_or(ScalerError::Guard("destroy task missing"))?,
         )?;
         if api.present(row)? {
-            return Err(ScalerError::Guard("clone still exists after deletion"));
+            return Err(ScalerError::Transient(TransientFailure::CleanupPending));
         }
     }
     // Removing registration cannot strand a running VM: the VM is absent first.
@@ -1585,7 +1602,7 @@ fn cleanup(
 /// One reconciliation pass over every active clone.
 struct Pass {
     finished: usize,
-    /// Reconciliation failures freeze admission; quarantined rows retain only their own reservation.
+    /// Invariant/persistence failures freeze admission; transient rows keep their reservation.
     frozen: Option<ScalerError>,
 }
 /// Reconcile every active clone. One row's error does not starve the others.
@@ -1609,11 +1626,43 @@ fn reconcile_all(
     let mut first_error = None;
     for row in active {
         let lane = row.lane;
-        match reconcile_one(pve, gh, ledger, dir, path, approval, row) {
+        let name = row.name.clone();
+        let result = reconcile_one(pve, gh, ledger, dir, path, approval, row);
+        // Include the initial inventory/task queries for an already-retiring
+        // row, and a cleanup license persisted during this step. All these
+        // operational failures use the same transient quarantine arm below.
+        let result = if ledger
+            .rows
+            .iter()
+            .any(|row| row.name == name && row.state == State::Reaping)
+        {
+            result.map_err(cleanup_error)
+        } else {
+            result
+        };
+        match result {
             Ok(true) => finished += 1,
             Ok(false) => {}
             Err(error @ ScalerError::CpuCeiling { .. }) if lane == CloneLane::Kvm => {
                 return Err(error);
+            }
+            Err(ScalerError::Transient(cause)) => {
+                // Re-read: teardown may already have persisted a task or its
+                // Reaping license. Never overwrite it with the pass snapshot.
+                if let Some(mut current) = reconcile_target(ledger, &name)? {
+                    current.quarantined = true;
+                    let note = if current.state == State::Reaping
+                        || matches!(
+                            cause,
+                            TransientFailure::CleanupPending | TransientFailure::PveTask
+                        ) {
+                        "cleanup pending"
+                    } else {
+                        "quarantined: transient failure"
+                    };
+                    recovery_note(&mut current, &format!("{note}: {cause:?}"));
+                    update(ledger, &current, path)?;
+                }
             }
             Err(error) => {
                 first_error.get_or_insert(error);
@@ -1774,8 +1823,8 @@ fn reconcile_one(
             }
             // Removal recovers a POST whose ID save was interrupted by name;
             // never query job assignment after the VM has disappeared.
-            pve.clear_volumes(row.vm)?;
-            gh.remove_runner(&row)?;
+            pve.clear_volumes(row.vm).map_err(cleanup_error)?;
+            gh.remove_runner(&row).map_err(cleanup_error)?;
             finish_destroyed(ledger, &mut row, dir, path)?;
             return Ok(true);
         }
@@ -4041,9 +4090,9 @@ printf '{"data":%s}\n200' "$body"
             pass
         };
         if case == "persistent" {
-            assert!(pass.frozen.is_some());
+            assert!(pass.frozen.is_none(), "{:?}", pass.frozen);
             assert_eq!(ledger.rows[0].state, State::Cloning);
-            assert!(ledger.rows[0].failure.is_none());
+            assert!(ledger.rows[0].quarantined);
             let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
             assert_eq!(calls.lines().count(), 3);
             return;
@@ -4131,6 +4180,207 @@ printf '{"data":%s}\n200' "$body"
             status["quarantined"].as_array().unwrap().len(),
             usize::from(matches!(case, "task" | "volume" | "incomplete" | "appears"))
         );
+    }
+    #[test]
+    fn serial_host_reconcile_cleanup_task() {
+        cleanup_fixture("task");
+    }
+    #[test]
+    fn serial_host_reconcile_cleanup_volumes() {
+        cleanup_fixture("volumes");
+    }
+    #[test]
+    fn serial_host_reconcile_cleanup_free() {
+        cleanup_fixture("free");
+    }
+    #[test]
+    fn serial_host_reconcile_cleanup_busy() {
+        cleanup_fixture("busy");
+    }
+    #[test]
+    fn serial_host_reconcile_cleanup_status() {
+        cleanup_fixture("status");
+    }
+    #[test]
+    fn serial_host_reconcile_cleanup_invariant() {
+        cleanup_fixture("invariant");
+    }
+
+    fn cleanup_fixture(case: &str) {
+        const CHILD: &str = "CARRICK_CLEANUP_1645";
+        if std::env::var(CHILD).as_deref() != Ok(case) {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    &format!("ci_scaler::live::tests::serial_host_reconcile_cleanup_{case}"),
+                    "--nocapture",
+                ])
+                .env(CHILD, case)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        let script = r#"#!/bin/sh
+case "$(basename "$0")" in
+ gh)
+  if [ "$CARRICK_CLEANUP_1645" = busy ] && [ ! -f "$CARRICK_FIXTURE_DIR/healed" ]; then
+   printf '[{"runners":[{"id":99,"name":"%s","busy":true}]}]' "$CARRICK_ROW_NAME"
+  else printf '[{"runners":[]}]'
+  fi
+  exit 0 ;;
+ pvesm)
+  if [ "$CARRICK_CLEANUP_1645" = free ] && [ ! -f "$CARRICK_FIXTURE_DIR/healed" ]; then exit 1; fi
+  exit 0 ;;
+ pvesh)
+  case "$*" in
+   *cluster/resources*) printf '[]' ;;
+   *content*)
+    if [ -f "$CARRICK_FIXTURE_DIR/healed" ] || [ "$CARRICK_CLEANUP_1645" = busy ]; then printf '[]'; else
+      printf '[{"content":"images","vmid":308,"volid":"local-lvm:vm-308-disk-0"}]'
+    fi ;;
+   *) exit 93 ;;
+  esac
+  exit 0 ;;
+esac
+cat >/dev/null
+for arg do url=$arg; done
+case "$url" in
+ */pools/carrick-ci)
+  if [ "$CARRICK_CLEANUP_1645" != volumes ] && [ "$CARRICK_CLEANUP_1645" != free ] && [ "$CARRICK_CLEANUP_1645" != busy ] && [ ! -f "$CARRICK_FIXTURE_DIR/healed" ]; then
+   body='{"poolid":"carrick-ci","members":[{"type":"qemu","node":"willow","vmid":308}]}'
+  else body='{"poolid":"carrick-ci","members":[]}'
+  fi ;;
+ */config)
+  if [ "$CARRICK_CLEANUP_1645" = invariant ]; then body='{"name":"not-our-clone"}'
+  else body="{\"name\":\"$CARRICK_ROW_NAME\"}"
+  fi ;;
+ */status/current) body='{"status":"stopped"}' ;;
+ */tasks/*running/status) body='{"status":"running"}' ;;
+ */tasks/*/status)
+  if [ "$CARRICK_CLEANUP_1645" = status ] && [ ! -f "$CARRICK_FIXTURE_DIR/healed" ]; then
+   printf '{"errors":{}}\n400'; exit 0
+  fi
+  body='{"status":"stopped","exitstatus":"failed"}' ;;
+ */qemu/308) body='"UPID:willow:fixture"' ;;
+ *) exit 92 ;;
+esac
+printf '{"data":%s}\n200' "$body"
+"#;
+        for name in ["curl", "gh", "pvesh", "pvesm"] {
+            let path = dir.join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut row = row();
+        row.state = State::Reaping;
+        if case == "status" {
+            row.task = Some("UPID:willow:fixture".into());
+        }
+        if case == "busy" {
+            row.runner = Some(RunnerId(99));
+        }
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!("{}:{}", dir.display(), std::env::var("PATH").unwrap()),
+            );
+            std::env::set_var("CARRICK_FIXTURE_DIR", dir);
+            std::env::set_var("CARRICK_TEST_PVE_LOCK_DIR", dir);
+            std::env::set_var("CARRICK_ROW_NAME", &row.name);
+        }
+        let pve = Pve {
+            site: site::WILLOW,
+            token: Token {
+                id: "fixture".into(),
+                secret: "synthetic".into(),
+            },
+            deadline: std::cell::Cell::new(None),
+        };
+        let path = dir.join("ledger.json");
+        let mut ledger = Ledger::default();
+        ledger.rows.push(row.clone());
+        ledger.save(&path).unwrap();
+        let pass = reconcile_all(
+            &pve,
+            &Github,
+            &mut ledger,
+            dir,
+            &path,
+            (1, &Admission::Standing),
+        )
+        .unwrap();
+        assert_eq!(pass.finished, 0);
+        if case == "invariant" {
+            assert!(matches!(pass.frozen, Some(ScalerError::Guard(_))));
+            return;
+        }
+        assert!(pass.frozen.is_none(), "{:?}", pass.frozen);
+        let saved = Ledger::load(&path).unwrap();
+        assert_eq!(saved.rows[0].state, State::Reaping);
+        assert!(saved.rows[0].quarantined);
+        assert!(
+            saved.rows[0]
+                .failure
+                .as_deref()
+                .unwrap()
+                .starts_with("cleanup pending:")
+        );
+        if matches!(case, "task" | "status") {
+            assert!(saved.rows[0].task.is_some(), "keep persisted destroy task");
+        }
+        let admitted = reserve_admitted_clone(
+            &mut ledger,
+            &path,
+            JobKey {
+                run: RunId(7),
+                attempt: 1,
+                job: JobId(8),
+            },
+            (
+                CloneBudget {
+                    kvm: Concurrency::try_from(2).unwrap(),
+                    agents: "4".parse().unwrap(),
+                },
+                CloneLane::Kvm,
+            ),
+            || Ok(true),
+            || Ok(vec![]),
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(admitted.vm, row.vm);
+        let mut other = admitted;
+        other.state = State::Cloning;
+        other.task = Some("UPID:willow:running".into());
+        update(&mut ledger, &other, &path).unwrap();
+        let status: Value =
+            serde_json::from_slice(&std::fs::read(dir.join("reconcile-status.json")).unwrap())
+                .unwrap();
+        assert_eq!(status["admission_frozen"], false);
+        assert_eq!(status["quarantined"].as_array().unwrap().len(), 1);
+        // The next pass retries the same reservation and releases it only
+        // after both storage and registration retirement complete.
+        std::fs::write(dir.join("healed"), "").unwrap();
+        let pass = reconcile_all(
+            &pve,
+            &Github,
+            &mut ledger,
+            dir,
+            &path,
+            (1, &Admission::Standing),
+        )
+        .unwrap();
+        assert!(pass.frozen.is_none(), "{:?}", pass.frozen);
+        assert_eq!(pass.finished, 1);
+        assert_eq!(ledger.rows[0].state, State::Destroyed);
     }
     #[test]
     fn serial_host_reconcile_absent() {
