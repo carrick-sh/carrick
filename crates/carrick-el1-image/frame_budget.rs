@@ -187,13 +187,16 @@ impl Frames {
                 .required("::dispatch::dispatch_syscall::")?
                 .max(self.required("::dispatch::arm_signal_user_return::")?)
             + self.required("::aarch64_process::with_process_entry::")?;
-        let resume = entry
+        let resume_entry = entry
             + self.sum(&[
                 "::interrupt::",
                 "::preempt_record::",
                 "::idle::",
                 "::load::",
                 "::aarch64_process::resume_production::",
+            ]);
+        let resume = resume_entry
+            + self.sum(&[
                 "::aarch64_process::resume_selected::",
                 "::resume_checkpoint::",
                 "::resume_pending_lifecycle::",
@@ -385,6 +388,26 @@ impl Frames {
             + self.maximum("::aarch64_process::deliver_declined_fault_signal_with::")
             + self.required("::aarch64_process::with_process_entry::")?;
         let chains = [
+            (
+                "unregistered native retirement",
+                resume_entry
+                    + self.required("::aarch64_process::resume_unregistered::")?
+                    + self.sum(&[
+                        "::reserve_member::", "::retire_zone_current::",
+                        "::retire_current::", "::retire_cancelled_pool_member::",
+                        "::settle_losing_zone_current::",
+                    ])
+                    + allocation + schedule,
+            ),
+            (
+                "ring vector input",
+                native + self.sum(&[
+                    "::ipc_transfer::", "::ipc::serve_ipc_with_signals::",
+                    "::ipc::admit::", "::ipc::run::",
+                    "::substrate::ipc::transfer_with_input::",
+                    "::copy_vector_input::", "::import_vectors::",
+                ]) + self.qualified("PrefixCopy", "::copy_in::") + fd_storage,
+            ),
             (
                 "native admission",
                 native
@@ -810,6 +833,7 @@ mod tests {
             "x::dispatch::arm_deliver_declined_fault_signal::h0",
             "x::dispatch::arm_signal_user_return::h0",
             "x::aarch64_process::with_process_entry::h0",
+            "x::aarch64_process::resume_unregistered::h0",
             "x::copy_signal_bytes::h0",
             "x::finish_copyout::h0",
             "x::write_user_bytes::h0",
@@ -873,6 +897,17 @@ mod tests {
             let error = frames.check(16384, 288).unwrap_err();
             assert!(error.contains(chain), "{symbol}: {error}");
         }
+    }
+
+    #[test]
+    fn unregistered_resume_outline_remains_charged_to_retirement() {
+        let mut frames = small_frames();
+        frames.0.insert(
+            "x::aarch64_process::resume_unregistered::h0".to_owned(),
+            12000,
+        );
+        let error = frames.check(16384, 288).unwrap_err();
+        assert!(error.contains("unregistered native retirement"));
     }
 
     #[test]

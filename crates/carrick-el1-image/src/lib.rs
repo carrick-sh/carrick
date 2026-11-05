@@ -25,3 +25,7 @@ mod tests {
         assert_eq!(carrick_el1_abi::check_image_abi(IMAGE), Ok(header));
     }
 }
+
+#[cfg(test)]
+#[path = "../frame_budget.rs"]
+mod frame_budget;

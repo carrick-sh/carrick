@@ -655,7 +655,7 @@ const fn route_shared(ordinal: u64, allocator_control: u64) -> Family {
         222 => Family::Anonymous(AnonymousCall::Mmap),
         226 => Family::Anonymous(AnonymousCall::Mprotect),
         63 => Family::Read,
-        64 => Family::Write,
+        64 | 66 => Family::Write,
         22 => Family::EpollWait,
         62 => Family::FileSeek,
         67 | 68 => Family::FilePositioned,
@@ -1330,7 +1330,9 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
     // retained operation's handback or completion.
     result = match family {
         Family::Read => pending.file_read().into(),
-        Family::Write => pending.file_write().into(),
+        Family::Write if ordinal != crate::crossing::nr::WRITEV.raw() => {
+            pending.file_write().into()
+        }
         _ => result,
     };
     finish(ordinal, original_argument0, result, pending, completion)
@@ -1383,6 +1385,52 @@ mod ring_first_tests {
             route_aarch64(123, u64::MAX),
             Family::Sched(SchedCall::GetAffinity)
         );
+    }
+
+    #[test]
+    fn writev_dispatches_through_the_ipc_writer_without_scalar_file_fallback() {
+        struct Writer {
+            calls: usize,
+            result: i64,
+        }
+        impl<'a> PendingFamilies<'a> for Writer {
+            fn binding(&self) -> Option<ExecutionBinding> {
+                Some(ExecutionBinding {
+                    task: EntryTaskKey::from_raw(1),
+                    generation: SnapshotGeneration::from_raw(1),
+                    mm: EntryMmKey::from_raw(1),
+                    thread_generation: EntryThreadGeneration::from_raw(1),
+                })
+            }
+            fn crossing_set(&self) -> HostCrossingSet {
+                HostCrossingSet::Aarch64
+            }
+            fn original_argument0(&self) -> u64 {
+                1
+            }
+            fn install_result(&mut self, result: SyscallResult) {
+                self.result = result.raw();
+            }
+            fn ipc_available(&self) -> bool {
+                true
+            }
+            fn write(&mut self) -> FamilyCompletion {
+                self.calls += 1;
+                FamilyCompletion::Complete(6)
+            }
+            fn file_write(&mut self) -> FamilyCompletion {
+                panic!("a vector is never a scalar file buffer")
+            }
+        }
+        let mut writer = Writer {
+            calls: 0,
+            result: 0,
+        };
+        assert_eq!(
+            dispatch(crate::crossing::nr::WRITEV.raw(), u64::MAX, &mut writer),
+            CompletionRoute::Served
+        );
+        assert_eq!((writer.calls, writer.result), (1, 6));
     }
 
     #[test]

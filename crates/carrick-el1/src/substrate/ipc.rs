@@ -129,6 +129,20 @@ pub fn transfer<U: UserCopy>(
     copy: &mut PrefixCopy<'_, U>,
 ) -> Result<(StepStatus, WakeSet), IpcError> {
     let buf = op.buf.0;
+    transfer_with_input(guard, op, copy, |copy, at, dst| {
+        copy.copy_in(dst, buf.wrapping_add(at))
+    })
+}
+
+/// The same pipe transaction with an imported input source. The aggregate
+/// progress still controls atomic admission and every blocked continuation.
+pub fn transfer_with_input<U: UserCopy>(
+    guard: &mut IpcObjectGuard<'_>,
+    op: &mut IpcOperation,
+    copy: &mut PrefixCopy<'_, U>,
+    mut input: impl FnMut(&mut PrefixCopy<'_, U>, u64, &mut [u8]) -> usize,
+) -> Result<(StepStatus, WakeSet), IpcError> {
+    let buf = op.buf.0;
     let mut wake = WakeSet::default();
     let mut owe = |w: WakeSet| {
         wake.readers |= w.readers;
@@ -161,9 +175,8 @@ pub fn transfer<U: UserCopy>(
             guard.provide_ring_from_stock()?;
             let mut p = guard.pipe()?;
             loop {
-                let step = p.write_progress(&mut op.progress, |at, dst| {
-                    copy.copy_in(dst, buf.wrapping_add(at as u64))
-                });
+                let step =
+                    p.write_progress(&mut op.progress, |at, dst| input(copy, at as u64, dst));
                 owe(step.wake);
                 match step.result {
                     Ok(_) if op.progress.is_complete() => break StepStatus::Complete,
