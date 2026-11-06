@@ -3191,7 +3191,12 @@ impl HvfTaskState {
                     HvfVmState::refresh_stage1_exclusivity(manager.manager);
                     let mut page_va = span_start;
                     while page_va < span_end {
-                        if source_guest_writable && !self.protections.legacy().is_none_or(|protections| protections.range_write_denied(page_va, 1))
+                        if source_guest_writable
+                            && carrick_mmu_core::aarch64::terminal_descriptor_may_write(
+                                carrick_mmu_core::aarch64::terminal_descriptor(
+                                    manager.debug_walk(page_va),
+                                ),
+                            )
                         {
                             manager
                                 .set_writable_preserving_attributes(page_va, PAGE_SIZE as usize)
@@ -3237,7 +3242,11 @@ impl HvfTaskState {
                         }
                         let leaf = live[3];
                         let expected_ap = if source_guest_writable
-                            && !self.protections.legacy().is_none_or(|protections| protections.range_write_denied(page_va, 1))
+                            && carrick_mmu_core::aarch64::terminal_descriptor_may_write(
+                                carrick_mmu_core::aarch64::terminal_descriptor(
+                                    manager.debug_walk(page_va),
+                                ),
+                            )
                         {
                             AP_USER_RW
                         } else {
@@ -3359,10 +3368,11 @@ impl HvfTaskState {
         };
         let Some(span) = span else {
             let mapping = self.mapping_for_range_in(custody, fault_va, 1);
-            let write_denied = self
-                .protections
-                .legacy()
-                .is_none_or(|protections| protections.range_write_denied(fault_va, 1));
+            let write_denied = !self.frame_cow_page_writable(
+                fault_va,
+                mapping.is_some_and(|mapping| mapping.guest_writable),
+                guest_lane,
+            );
             let private_writable_mapping = mapping.is_some_and(|mapping| {
                 mapping.guest_writable && mapping.sharing == GuestMappingSharing::Private
             });
@@ -3438,9 +3448,7 @@ impl HvfTaskState {
             })?
             .guest_writable;
         if frame_cow_write_is_denied(
-            self.protections
-                .legacy()
-                .is_none_or(|protections| protections.range_write_denied(fault_va, 1)),
+            !self.frame_cow_page_writable(fault_va, source_guest_writable, guest_lane),
             source_guest_writable,
             intent,
         ) {
@@ -4014,11 +4022,11 @@ impl HvfTaskState {
                 } else {
                     let mut writable_pages = 0_u8;
                     for index in 0..(span.len as u64 / PAGE_SIZE) {
-                        if source_guest_writable
-                            && !self.protections.legacy().is_none_or(|protections| {
-                                protections.range_write_denied(span.va + index * PAGE_SIZE, 1)
-                            })
-                        {
+                        if self.frame_cow_page_writable(
+                            span.va + index * PAGE_SIZE,
+                            source_guest_writable,
+                            guest_lane,
+                        ) {
                             writable_pages |= 1 << index;
                         }
                     }
@@ -4169,7 +4177,13 @@ impl HvfTaskState {
                             let span_end = span.va.saturating_add(span.len as u64);
                             let mut page_va = span.va & !(PAGE_SIZE - 1);
                             while page_va < span_end {
-                                if source_guest_writable && !self.protections.legacy().is_none_or(|protections| protections.range_write_denied(page_va, 1)) {
+                                if source_guest_writable
+                                    && carrick_mmu_core::aarch64::terminal_descriptor_may_write(
+                                        carrick_mmu_core::aarch64::terminal_descriptor(
+                                            manager.debug_walk(page_va),
+                                        ),
+                                    )
+                                {
                                     manager
                                         .set_writable_preserving_attributes(page_va, PAGE_SIZE as usize)
                                         .map_err(|error| {
@@ -4220,7 +4234,11 @@ impl HvfTaskState {
                             let expected_ap = if span.kernel_only {
                                 0
                             } else if source_guest_writable
-                                && !self.protections.legacy().is_none_or(|protections| protections.range_write_denied(page_va, 1))
+                                && carrick_mmu_core::aarch64::terminal_descriptor_may_write(
+                                    carrick_mmu_core::aarch64::terminal_descriptor(
+                                        manager.debug_walk(page_va),
+                                    ),
+                                )
                             {
                                 AP_USER_RW
                             } else {
@@ -7410,6 +7428,32 @@ impl HvfTaskState {
             .flatten()
     }
 
+    fn frame_cow_page_writable(
+        &self,
+        va: u64,
+        source_guest_writable: bool,
+        guest_lane: bool,
+    ) -> bool {
+        let owner_write_intent = guest_lane
+            .then(|| {
+                self.page_tables_authority().with_manager(|manager| {
+                    carrick_mmu_core::aarch64::terminal_descriptor_may_write(
+                        carrick_mmu_core::aarch64::terminal_descriptor(manager.debug_walk(va)),
+                    )
+                })
+            })
+            .flatten();
+        let legacy_write_denied = self
+            .protections
+            .legacy()
+            .map(|protections| protections.range_write_denied(va, 1));
+        frame_cow_page_write_authority(
+            source_guest_writable,
+            owner_write_intent,
+            legacy_write_denied,
+        )
+    }
+
     pub(crate) fn translate_va_for_cow(&self, va: u64) -> Option<u64> {
         self.page_tables_authority()
             .with_manager(|m| m.translate(va))
@@ -8021,6 +8065,18 @@ pub(crate) fn frame_cow_write_is_denied(
 ) -> bool {
     intent == carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible
         && (protection_denied || !guest_writable)
+}
+
+pub(crate) fn frame_cow_page_write_authority(
+    source_guest_writable: bool,
+    owner_write_intent: Option<bool>,
+    legacy_write_denied: Option<bool>,
+) -> bool {
+    source_guest_writable
+        && match owner_write_intent {
+            Some(may_write) => may_write,
+            None => matches!(legacy_write_denied, Some(false)),
+        }
 }
 
 pub(crate) fn frame_cow_preserves_guest_protection(

@@ -6952,6 +6952,17 @@ fn cow_intents_preserve_guest_write_authority_while_internal_writes_bypass_it() 
 }
 
 #[test]
+fn owner_cow_write_authority_comes_from_the_live_leaf_not_a_legacy_mirror() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+
+    assert!(frame_cow_page_write_authority(true, Some(true), None));
+    assert!(!frame_cow_page_write_authority(true, Some(false), None));
+    assert!(frame_cow_page_write_authority(true, None, Some(false)));
+    assert!(!frame_cow_page_write_authority(true, None, None));
+    assert!(!frame_cow_page_write_authority(false, Some(true), None));
+}
+
+#[test]
 fn concurrent_cow_loser_retries_only_an_exact_live_writable_winner() {
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     assert_eq!(
