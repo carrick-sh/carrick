@@ -17,6 +17,7 @@ rationale = "Delivery of N retired incarnations must publish zero wakes for repl
 [bindings]
 vm_free = [
   "carrick-sched-core::tests::{cancelled_metadata_wait_releases_record_without_resume,cancelled_deferred_metadata_wait_releases_record_without_resume} (metadata receipts: one retirement, zero orphan completion publications, no resume, stale delivery cannot retire a replacement)",
+  "carrick-sched-core::spaces::notification::tests::actual_gate_refusal_during_final_release_cannot_park_after_it (#1773: shared notification publication preserves exact operation custody and prevents a stranded scheduler record after final release; no change to queue delivery, IPC semantics or handback identity)",
   "carrick-el1-linux::sched::tests::{cancelled_on_cpu_thread_is_not_stranded_by_repark,signal_requested_on_cpu_is_not_lost_by_repark}",
   "carrick-kernel::el1_zone::tests::deferred_slot_handback_does_not_wake_a_reused_record",
   "carrick-kernel::el1_zone::tests::{deferred_capture_precedes_filter_and_releases_queue_authority,serial_host::deferred_capture_does_not_hold_publisher_registration} (capture hook before filtering; released slot and registration locks, replacement stays parked; measurement infrastructure only)",
