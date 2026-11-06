@@ -90,3 +90,17 @@ close through production reconciliation and save, retaining the sibling's
 actual base and MM/ASID identity, rather than supplying canonical registers.
 The director's named fatal/call-site capture and ten signed passes on one
 artifact remain outstanding.
+
+## Local native witness qualification (2026-11-05)
+
+At `89b350622a`, leased signed run `fix1673-native-a` passed the native
+pipe-handoff witness and the native file-stress diagnostic. Both use real
+HVF execution and passive register observations. The selected terminal
+save and reload retained process roots `0x1009a00000000`; earlier saves
+also observed maintenance roots `0x2d001f8000`. The initial maintenance
+root is therefore not itself a failed reload. This run does not establish
+red-first coverage: qualification against merge-base
+`41ad31b5ff1ec28dbc23b84f2f08ad61c9bc6ca4` is the next experiment.
+The signed runner's negative control passed and scoped cleanup reported
+zero survivors. The durable log is
+`/Volumes/CaseSensitive/carrick-evidence/fix1673-native-a.log`.
