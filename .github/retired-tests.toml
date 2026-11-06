@@ -5,3 +5,9 @@ test = "carrick_el1_linux::native_process_runtime::host_test_support::native_chi
 reason = "#1392: a child's exec after a ring setuid is now served with the child's own credentials instead of refused, so the refusal witness became a credential-carrying witness."
 replaced_by = "carrick_el1_linux::native_process_runtime::host_test_support::native_child_exec_after_ring_setuid_carries_the_new_credentials"
 pr = 1409
+
+[[retired]]
+test = "carrick_el1_linux::native_process_runtime::host_test_support::portal_wait_cancellation_resumes_exact_native_service_waiter"
+reason = "#1691: carrier-work cancellation and terminal cancellation now resume a parked native service waiter differently (nonterminal interruption leaves CarrierWork parked), so the witness was split and renamed to name the terminal case it proves (d0ddf25d2e)."
+replaced_by = "carrick_el1_linux::native_process_runtime::host_test_support::portal_wait_terminal_cancellation_resumes_exact_native_service_waiter"
+pr = 1701
