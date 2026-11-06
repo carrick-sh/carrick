@@ -4391,6 +4391,10 @@ where
                     RuntimeError::Configuration(format!("capture native terminal context: {error}"))
                 })?,
         );
+        #[cfg(all(feature = "test-support", target_os = "macos", target_arch = "aarch64"))]
+        if let Some(context) = &self.state.service_kernel_context {
+            executor::native_terminal_test_control::terminal(context.thread().key());
+        }
         let code = i32::try_from(status.code()).map_err(|_| {
             RuntimeError::Configuration("native terminal status exceeds result domain".into())
         })?;
@@ -5993,12 +5997,6 @@ where
                 )
             }
         };
-        #[cfg(all(feature = "test-support", target_os = "macos", target_arch = "aarch64"))]
-        if self.phase.needs_terminal_cpu_save()
-            && let Some(context) = &self.state.service_kernel_context
-        {
-            executor::native_terminal_test_control::terminal(context.thread().key());
-        }
         if self.phase.needs_terminal_cpu_save()
             && let Some(binding) = control.binding
         {
