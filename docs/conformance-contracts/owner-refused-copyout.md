@@ -39,3 +39,21 @@ task callbacks for N subscriptions: each exact TaskKey is notified once,
 regardless of its eligible waiter population. The budget counts callback
 invocations, including redundant invocations hidden by runnable latches.
 Signed HVF and Docker promotion remain director-owned.
+
+### Host epoll event input (#1704)
+
+`epoll_ctl_read_refusal_redispatches_before_add` drives the host dispatcher
+with two live kernel threads sharing an MM. A one-time typed read suspension
+must return the existing owner-memory wait before ADD mutates membership;
+redispatch returns 0 and duplicate ADD returns EEXIST (17). Both the 16-byte
+AArch64 and packed 12-byte x86 event layouts participate. The same fixture
+checks temporary-mask input for both wait variants and backing-supply refusal
+before one-shot event output: untouched bytes on refusal, one delivered event,
+then zero events and exactly one commit. Existing edge, pipe and host-backed
+output refusal bindings remain authoritative. No new ring routing is added.
+
+Linux authority is epoll_ctl(2) and epoll_wait(2): EFAULT means invalid user
+memory, not internal ownership contention. The structural invariant is no
+membership mutation or readiness consumption before copy admission. This
+injected-memory dispatcher fixture does not prove native-process parking,
+page-table supply or a signed ecosystem result; those remain higher gates.

@@ -3493,6 +3493,26 @@ mod nested_epoll_readiness_tests {
                     .unwrap(),
                 DispatchOutcome::errno(LINUX_EEXIST)
             );
+            // Both wait variants read the temporary mask before fd lookup.
+            for nr in [22, 441] {
+                let request =
+                    SyscallRequest::new(nr, SyscallArgs::from([u64::MAX, 0x1100, 1, 0, 0x1200, 8]))
+                        .with_guest_abi(abi);
+                memory.seed(0x1200, &[0; 8]);
+                let wait = memory.refuse_next_read();
+                assert_eq!(
+                    dispatcher
+                        .dispatch(&kernel, request, &mut memory, &reporter)
+                        .unwrap(),
+                    DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+                );
+                assert_eq!(
+                    dispatcher
+                        .dispatch(&kernel, request, &mut memory, &reporter)
+                        .unwrap(),
+                    DispatchOutcome::errno(LINUX_EBADF)
+                );
+            }
             // Output supply is admitted before consuming or disarming readiness.
             let request =
                 SyscallRequest::new(22, SyscallArgs::from([epfd as u64, 0x1100, 1, 0, 0, 0]))
@@ -3517,6 +3537,7 @@ mod nested_epoll_readiness_tests {
                     .unwrap(),
                 DispatchOutcome::Returned { value: 1 }
             );
+            bytes[..4].copy_from_slice(&LINUX_EPOLLIN.to_le_bytes());
             assert_eq!(memory.inner.read_bytes(0x1100, bytes.len()).unwrap(), bytes);
             assert_eq!(
                 dispatcher
@@ -4349,7 +4370,11 @@ impl<'a> NetView<'a> {
                 use super::epoll_zone::ZoneCtl;
                 let zone_result = match operation {
                     LINUX_EPOLL_CTL_ADD => {
-                        let event = read_epoll_event(memory, event_address, cx.guest_abi())?;
+                        let event = match read_epoll_event(memory, event_address, cx.guest_abi()) {
+                            Ok(event) => event,
+                            Err(error) => return Ok(DispatchOutcome::from_owner_memory_error(error)
+                                .unwrap_or_else(|| DispatchOutcome::errno(LINUX_EFAULT))),
+                        };
                         // The exact (fd, file) already lives in the host half
                         // (a placement refusal earlier): one item per pair.
                         let in_host_half = epoll_description
@@ -4372,7 +4397,11 @@ impl<'a> NetView<'a> {
                         }
                     }
                     LINUX_EPOLL_CTL_MOD => {
-                        let event = read_epoll_event(memory, event_address, cx.guest_abi())?;
+                        let event = match read_epoll_event(memory, event_address, cx.guest_abi()) {
+                            Ok(event) => event,
+                            Err(error) => return Ok(DispatchOutcome::from_owner_memory_error(error)
+                                .unwrap_or_else(|| DispatchOutcome::errno(LINUX_EFAULT))),
+                        };
                         zone.modify(fd, member.file_key, event.events, event.data)
                     }
                     LINUX_EPOLL_CTL_DEL => zone.delete(fd, member.file_key),
@@ -4416,7 +4445,11 @@ impl<'a> NetView<'a> {
 
             match operation {
                 LINUX_EPOLL_CTL_ADD => {
-                    let event = read_epoll_event(memory, event_address, cx.guest_abi())?;
+                    let event = match read_epoll_event(memory, event_address, cx.guest_abi()) {
+                            Ok(event) => event,
+                            Err(error) => return Ok(DispatchOutcome::from_owner_memory_error(error)
+                                .unwrap_or_else(|| DispatchOutcome::errno(LINUX_EFAULT))),
+                        };
                     // The kernel rejects ADD of a target that has no ->poll support
                     // (regular files, directories) with EPERM. (LTP epoll_ctl02/05.)
                     if !this.fd_is_epollable(fd) {
@@ -4557,7 +4590,11 @@ impl<'a> NetView<'a> {
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 LINUX_EPOLL_CTL_MOD => {
-                    let event = read_epoll_event(memory, event_address, cx.guest_abi())?;
+                    let event = match read_epoll_event(memory, event_address, cx.guest_abi()) {
+                            Ok(event) => event,
+                            Err(error) => return Ok(DispatchOutcome::from_owner_memory_error(error)
+                                .unwrap_or_else(|| DispatchOutcome::errno(LINUX_EFAULT))),
+                        };
                     let Some(slot) = interest
                         .get_mut(&fd)
                         .filter(|slot| epoll_slot_names_current_file(slot, &target_file.description))
@@ -4759,13 +4796,10 @@ impl<'a> NetView<'a> {
                 if sigsetsize != crate::linux_abi::LINUX_RT_SIGSET_SIZE {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
-                match memory.read_bytes(sigmask_ptr, crate::linux_abi::LINUX_RT_SIGSET_SIZE as usize) {
-                    Ok(bytes) => {
-                        let mut le = [0u8; 8];
-                        le.copy_from_slice(&bytes[..8]);
-                        carrick_abi::SigSet::from_raw(u64::from_le_bytes(le))
-                    }
-                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                match read_epoll_sigmask(memory, sigmask_ptr) {
+                    Ok(mask) => mask,
+                    Err(error) => return Ok(DispatchOutcome::from_owner_memory_error(error)
+                        .unwrap_or_else(|| DispatchOutcome::errno(LINUX_EFAULT))),
                 }
             } else {
                 carrick_abi::SigSet::EMPTY
@@ -4845,13 +4879,10 @@ impl<'a> NetView<'a> {
                 if sigsetsize != crate::linux_abi::LINUX_RT_SIGSET_SIZE {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
-                match memory.read_bytes(sigmask_ptr, crate::linux_abi::LINUX_RT_SIGSET_SIZE as usize) {
-                    Ok(bytes) => {
-                        let mut le = [0u8; 8];
-                        le.copy_from_slice(&bytes[..8]);
-                        carrick_abi::SigSet::from_raw(u64::from_le_bytes(le))
-                    }
-                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                match read_epoll_sigmask(memory, sigmask_ptr) {
+                    Ok(mask) => mask,
+                    Err(error) => return Ok(DispatchOutcome::from_owner_memory_error(error)
+                        .unwrap_or_else(|| DispatchOutcome::errno(LINUX_EFAULT))),
                 }
             } else {
                 carrick_abi::SigSet::EMPTY

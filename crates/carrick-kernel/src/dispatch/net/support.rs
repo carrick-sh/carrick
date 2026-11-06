@@ -94,11 +94,14 @@ pub(super) fn read_epoll_event(
     memory: &impl CurrentMmMemory,
     address: u64,
     guest_abi: LinuxGuestAbi,
-) -> Result<LinuxEpollEvent, LinuxErrno> {
+) -> Result<LinuxEpollEvent, MemoryError> {
+    if address == 0 {
+        return Err(MemoryError::OutOfBounds { address, length: 1 });
+    }
     match guest_abi {
-        LinuxGuestAbi::Aarch64 => read_kernel_struct(memory, address),
+        LinuxGuestAbi::Aarch64 => memory.read_struct(address),
         LinuxGuestAbi::X86_64 => {
-            let event: LinuxX8664EpollEvent = read_kernel_struct(memory, address)?;
+            let event: LinuxX8664EpollEvent = memory.read_struct(address)?;
             let events = event.events;
             let data = event.data;
             Ok(LinuxEpollEvent {
@@ -108,6 +111,18 @@ pub(super) fn read_epoll_event(
             })
         }
     }
+}
+
+/// Decode the identical epoll_pwait/epoll_pwait2 mask without erasing an
+/// owner-memory dependency before readiness has been consumed.
+pub(super) fn read_epoll_sigmask(
+    memory: &impl CurrentMmMemory,
+    address: u64,
+) -> Result<carrick_abi::SigSet, MemoryError> {
+    let bytes = memory.read_bytes(address, 8)?;
+    let mut le = [0u8; 8];
+    le.copy_from_slice(&bytes);
+    Ok(carrick_abi::SigSet::from_raw(u64::from_le_bytes(le)))
 }
 
 /// Translate the epoll interest mask into the [`carrick_hal::event::Interest`] the multiplexer
