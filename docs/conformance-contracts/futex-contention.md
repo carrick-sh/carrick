@@ -137,3 +137,25 @@ WAIT also needs separate treatment: Linux WAIT only reads its operand, so a
 mandatory writeback must not introduce a write-permission requirement. These
 constraints apply to the existing host paths; they do not justify a new
 fallback, owner polling loop, outcome type, or an early debt-ceiling decrease.
+
+### Neutral copy ownership (#1726 boundary repair)
+
+The copy interface, `CopyOutcome`, `GuestCopyRequest`, and atomic refusal
+helper live in `carrick_core::user_copy`. They describe neutral guest-memory
+access and memory-owner preparation, rather than personality policy. Moving
+the existing definitions (option b) preserves one outcome type for substrate,
+Linux, ARM and x86 callers; a substrate-specific outcome would duplicate the
+same protocol and require conversions. The old personality path has no
+re-export shim. The existing substrate byte-copy trait remains unchanged.
+
+This repair moves the definitions verbatim and updates imports and qualified
+paths only. It changes no guest-visible semantics or work for
+`kernel.futex.contention` or `kernel.memory.owner-wait`: Done completes, Fault
+is authoritative, and NotYet retains the exact request for owner parking.
+The boundary checker is unchanged. Existing futex refusal and atomic-copy
+witnesses remain the behavioral checks.
+
+The unchanged `check-personality-boundary --root . --metadata-file
+target/cargo-metadata.json` reports 12 source violations with the original
+EL1 file and scheduler sources restored, and exits 1. Restoring their neutral
+copy paths makes the same checker exit 0 with 11 substrate crates clean.
