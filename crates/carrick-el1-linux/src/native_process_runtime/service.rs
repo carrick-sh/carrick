@@ -2740,9 +2740,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     ServiceResult::Refused
                     | ServiceResult::BackingFault
                     | ServiceResult::Cancelled
-                    | ServiceResult::Failed(_) => Ok(NativeResume::Returned(SyscallResult::new(
-                        carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
-                    ))),
+                    | ServiceResult::Failed(_) => Ok(NativeResume::RetrySyscall),
                     ServiceResult::Wait(_) | ServiceResult::ExecPrepared(_) => {
                         Err(NativeProcessError::Quarantined)
                     }

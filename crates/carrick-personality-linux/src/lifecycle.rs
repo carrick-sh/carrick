@@ -1791,6 +1791,21 @@ const FUTEX_WAITERS: u32 = 0x8000_0000;
 const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
 const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
 
+fn wait_exit_copy<'a>(
+    native: &mut dyn LifecycleNative<'a>,
+    request: GuestCopyRequest,
+) -> Result<bool, LifecycleOutcome> {
+    match native.wait_guest_copy(request) {
+        LifecycleOutcome::Returned { result, .. }
+            if result.raw() == carrick_syscall_abi::LINUX_EFAULT.guest_retval() =>
+        {
+            Ok(false)
+        }
+        LifecycleOutcome::Redispatch => Ok(true),
+        outcome => Err(outcome),
+    }
+}
+
 fn walk_exit_robust_list<'a>(
     slot: &ThreadControlSlot,
     mm_key: EntryMmKey,
@@ -1815,7 +1830,14 @@ fn walk_exit_robust_list<'a>(
         let mut bytes = [0u8; 24];
         match native.copy_in(&mut bytes, UserVa::new(head)) {
             CopyOutcome::Done => {}
-            CopyOutcome::NotYet(req) => return Err(Some(native.wait_guest_copy(req))),
+            CopyOutcome::NotYet(req) => match wait_exit_copy(native, req) {
+                Ok(true) => return Err(Some(LifecycleOutcome::Redispatch)),
+                Ok(false) => {
+                    slot.set_robust_list(0, 0);
+                    return Ok(());
+                }
+                Err(outcome) => return Err(Some(outcome)),
+            },
             CopyOutcome::Fault => {
                 slot.set_robust_list(0, 0);
                 return Ok(());
@@ -1858,7 +1880,14 @@ fn walk_exit_robust_list<'a>(
                 let mut bytes = [0; 8];
                 match native.copy_in(&mut bytes, UserVa::new(cursor.entry)) {
                     CopyOutcome::Done => cursor.next = u64::from_le_bytes(bytes),
-                    CopyOutcome::NotYet(req) => return Err(Some(native.wait_guest_copy(req))),
+                    CopyOutcome::NotYet(req) => match wait_exit_copy(native, req) {
+                        Ok(true) => return Err(Some(LifecycleOutcome::Redispatch)),
+                        Ok(false) => {
+                            cursor.entry = 0;
+                            continue;
+                        }
+                        Err(outcome) => return Err(Some(outcome)),
+                    },
                     CopyOutcome::Fault => {
                         cursor.entry = 0;
                         continue;
@@ -1875,7 +1904,16 @@ fn walk_exit_robust_list<'a>(
                 let mut bytes = [0; 4];
                 match native.copy_in(&mut bytes, address) {
                     CopyOutcome::Done => cursor.word = u32::from_le_bytes(bytes),
-                    CopyOutcome::NotYet(req) => return Err(Some(native.wait_guest_copy(req))),
+                    CopyOutcome::NotYet(req) => match wait_exit_copy(native, req) {
+                        Ok(true) => return Err(Some(LifecycleOutcome::Redispatch)),
+                        Ok(false) => {
+                            cursor.entry = cursor.next;
+                            cursor.count += 1;
+                            cursor.phase = RobustExitPhase::Next;
+                            continue;
+                        }
+                        Err(outcome) => return Err(Some(outcome)),
+                    },
                     CopyOutcome::Fault => {
                         cursor.entry = cursor.next;
                         cursor.count += 1;
@@ -1908,7 +1946,15 @@ fn walk_exit_robust_list<'a>(
                             cursor.phase = RobustExitPhase::Next;
                         }
                     }
-                    CopyOutcome::NotYet(req) => return Err(Some(native.wait_guest_copy(req))),
+                    CopyOutcome::NotYet(req) => match wait_exit_copy(native, req) {
+                        Ok(true) => return Err(Some(LifecycleOutcome::Redispatch)),
+                        Ok(false) => {
+                            cursor.entry = cursor.next;
+                            cursor.count += 1;
+                            cursor.phase = RobustExitPhase::Next;
+                        }
+                        Err(outcome) => return Err(Some(outcome)),
+                    },
                     CopyOutcome::Fault => {
                         cursor.entry = cursor.next;
                         cursor.count += 1;
@@ -1934,7 +1980,11 @@ fn walk_exit_robust_list<'a>(
                     cursor.word,
                     &mut observed,
                 ) {
-                    CopyOutcome::NotYet(req) => return Err(Some(native.wait_guest_copy(req))),
+                    CopyOutcome::NotYet(req) => match wait_exit_copy(native, req) {
+                        Ok(true) => return Err(Some(LifecycleOutcome::Redispatch)),
+                        Ok(false) => {}
+                        Err(outcome) => return Err(Some(outcome)),
+                    },
                     CopyOutcome::Done | CopyOutcome::Fault => {}
                 }
                 native.record_decline(LifecycleDecline::ExitRobust);
@@ -2049,9 +2099,19 @@ fn serve_exit<'a>(
         if record.unadopted
             && let CopyOutcome::NotYet(req) = copy_outcome
         {
-            drop(admission);
-            drop(membership);
-            return Err(Some(native.wait_guest_copy(req)));
+            match wait_exit_copy(native, req) {
+                Ok(true) => {
+                    drop(admission);
+                    drop(membership);
+                    return Err(Some(LifecycleOutcome::Redispatch));
+                }
+                Ok(false) => {}
+                Err(outcome) => {
+                    drop(admission);
+                    drop(membership);
+                    return Err(Some(outcome));
+                }
+            }
         }
         let copied = copy_outcome.is_done();
         let woken =
