@@ -711,11 +711,7 @@ impl SyscallDispatcher {
             Some(Some(None)) => return Served::errno(carrick_abi::LINUX_ENODEV),
             _ => return Served::Refused,
         };
-        match self
-            .mem()
-            .lock()
-            .retain_native_private_source(reference, label)
-        {
+        match self.mem().retain_native_private_source(reference, label) {
             Some((source, identity)) => Served::Source(
                 source,
                 carrick_core_abi::host_file::MapSourceReply {

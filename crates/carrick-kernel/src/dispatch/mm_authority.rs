@@ -146,6 +146,18 @@ impl DispatchMmAuthority {
         self.mem.fork_projection_with_revision()
     }
 
+    /// Retain one private source under this exact MM's metadata authority.
+    pub(crate) fn retain_native_private_source(
+        &self,
+        reference: Arc<crate::kernel::objects::MappedFileReference>,
+        label: String,
+    ) -> Option<(
+        Arc<dyn carrick_hal::fork_stock::HostBackingRetention>,
+        carrick_el1_abi::HostBackingIdentity,
+    )> {
+        self.lock().retain_native_private_source(reference, label)
+    }
+
     pub(in crate::dispatch) fn lock(&self) -> parking_lot::MutexGuard<'_, mem::MemState> {
         self.mem.lock()
     }
