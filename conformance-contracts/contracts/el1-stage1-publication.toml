@@ -39,6 +39,7 @@ structural_budgets = []
 
 [bindings]
 vm_free = [
+  "carrick-sched-core::spaces::notification::tests::actual_editor_refusal_during_final_release_cannot_park_after_it (#847: editor release unlocks before revision advancement; delayed enrollment returns Changed and retains the operation; stage-1 publication and invalidation budgets unchanged)",
   "carrick-kernel::dispatch::mem::delegated_tests::delegated_private_stock_policy_keeps_two_live_mms_independent (Slice 1 selection policy extraction only; existing physical publication and rollback bindings remain required)",
   "carrick-sched-core::spaces::tests::{one_exact_guest_editor_owns_a_space_at_a_time,a_host_pause_closes_the_gate_before_waiting_for_the_guest_editor,a_closed_space_refuses_an_editor_without_leaking_the_claim}",
   "carrick-kernel::kernel::mm_occupancy::tests::a_published_fence_waits_for_the_exact_guest_editor",
