@@ -71,6 +71,62 @@ pub fn missing_zone_continuation(
     }
 }
 
+/// Memory contention while finishing a retained terminal action belongs to
+/// that action's captured MM, even before its first ordinary execution entry.
+/// A cached executor/zone key is not terminal ownership. This ticket binds the
+/// owner-issued receipt to the retained MM; the carrier must still authenticate
+/// the receipt's carrier and root incarnation before enrolling the wait.
+#[derive(Debug)]
+#[must_use]
+pub struct TerminalMemoryWait {
+    receipt: carrick_core_abi::PortalOwnerWait,
+}
+
+impl TerminalMemoryWait {
+    pub fn for_mm(
+        retained_mm: EntryMmKey,
+        receipt: carrick_core_abi::PortalOwnerWait,
+    ) -> Option<Self> {
+        (retained_mm.raw() == receipt.handle().mm().raw()).then_some(Self { receipt })
+    }
+
+    pub fn mm(&self) -> EntryMmKey {
+        EntryMmKey::from_raw(self.receipt.handle().mm().raw())
+    }
+
+    pub fn receipt(&self) -> carrick_core_abi::PortalOwnerWait {
+        self.receipt
+    }
+}
+
+#[cfg(test)]
+mod terminal_memory_wait_tests {
+    use super::*;
+    use carrick_core_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+
+    #[test]
+    fn terminal_memory_wait_keeps_exact_mm_and_owner_incarnation() {
+        let mm = EntryMmKey::from_raw(17);
+        // SAFETY: synthetic owner receipt for the scope-selection test; live
+        // carrier/root authentication is separately required before enrollment.
+        let receipt = unsafe {
+            PortalOwnerWait::from_owner(
+                El1MmHandle::from_admitted_owner(
+                    NonZeroU64::new(3).unwrap(),
+                    ReservationMm::new(mm.raw()).unwrap(),
+                    NonZeroU64::new(5).unwrap(),
+                ),
+                PortalWaitCause::Gate,
+                11,
+            )
+        };
+        let wait = TerminalMemoryWait::for_mm(mm, receipt).unwrap();
+        assert_eq!(wait.mm(), mm);
+        assert_eq!(wait.receipt(), receipt);
+        assert!(TerminalMemoryWait::for_mm(EntryMmKey::from_raw(18), receipt).is_none());
+    }
+}
+
 pub struct PoolMemberObservation<'a> {
     pub entry: EntryRef,
     /// The control slot retained by this member, even if its shared pool

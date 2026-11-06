@@ -857,7 +857,29 @@ where
         wait: carrick_el1_abi::PortalOwnerWait,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
         use carrick_sched_core::object_wait::{ObjectWaitError, OperationToken};
-        let Some((zone, mm)) = zone_for(self.state.zone_mm) else {
+        let terminal_wait = if matches!(action, OwnerMemoryAction::Retained) {
+            let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
+                RuntimeError::Configuration("terminal memory wait lost its exact context".into())
+            })?;
+            Some(
+                carrick_core::terminal::TerminalMemoryWait::for_mm(
+                    context.shared().mm().id().entry_key(),
+                    wait,
+                )
+                .ok_or_else(|| {
+                    RuntimeError::Configuration(
+                        "terminal memory wait differs from its retained MM".into(),
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
+        let zone_mm = terminal_wait
+            .as_ref()
+            .map_or(self.state.zone_mm, |wait| Some(wait.mm().raw()));
+        let wait = terminal_wait.as_ref().map_or(wait, |wait| wait.receipt());
+        let Some((zone, mm)) = zone_for(zone_mm) else {
             return Err(RuntimeError::Configuration(
                 "owner memory wait has no exact carrier zone".to_owned(),
             )
