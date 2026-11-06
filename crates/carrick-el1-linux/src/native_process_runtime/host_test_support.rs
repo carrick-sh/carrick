@@ -434,8 +434,10 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         let task = CurrentTask::new();
         crate::ipc::retire_native_operation(
             region,
-            self.zone,
-            SlotId::from_index(0).unwrap(),
+            carrick_el1_abi::BornInZoneSource {
+                zone: self.zone,
+                slot: SlotId::from_index(0).unwrap(),
+            },
             &task,
             binding,
             operation,
