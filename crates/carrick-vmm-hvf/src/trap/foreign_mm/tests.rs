@@ -11787,6 +11787,20 @@ fn live_resolver_cached_retirement_and_extension_removal_fail_closed() {
         .state
         .install_structural_mapping_authority(Some(root_slot), Arc::clone(&root_owner))
         .expect("install root structural authority");
+    assert_eq!(
+        installed
+            .state
+            .mm_root_stage2_host_ptr(root, carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,),
+        Some(original_host),
+        "the MM-root authority must resolve its live table backing without a mapping row",
+    );
+    assert!(
+        installed
+            .state
+            .mm_root_stage2_host_ptr(root + root_slot.1, 1)
+            .is_none(),
+        "the MM-root authority must reject bytes beyond its exact extent",
+    );
     installed
         .state
         .frame_inventory
