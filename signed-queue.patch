@@ -1,0 +1,81 @@
+diff --git a/.github/workflows/signed-gate.yml b/.github/workflows/signed-gate.yml
+index 637c14398..389174f3d 100644
+--- a/.github/workflows/signed-gate.yml
++++ b/.github/workflows/signed-gate.yml
+@@ -1,6 +1,10 @@
+ name: Signed gate
+ 
+ on:
++  merge_group:
++    types: [checks_requested]
++  push:
++    branches: [main]
+   workflow_dispatch:
+     inputs:
+       pr:
+@@ -18,9 +22,10 @@ permissions: {}
+ 
+ jobs:
+   authorize:
+-    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'gate:signed'
++    if: github.repository == 'carrick-sh/carrick' && (github.event_name == 'merge_group' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.label.name == 'gate:signed')
+     runs-on: ubuntu-latest
+-    timeout-minutes: 15
++    # May wait for the exact base push baseline to finish on the Mac.
++    timeout-minutes: 300
+     permissions:
+       contents: read
+       pull-requests: read
+@@ -34,8 +39,11 @@ jobs:
+         env:
+           ACTOR: ${{ github.actor }}
+           TRIGGERING_ACTOR: ${{ github.triggering_actor }}
++          EVENT_NAME: ${{ github.event_name }}
+         run: |
+-          # Owner only: the carrick-workers App is agent-held (#654).
++          # Automatic main/queue events are authorized by exact event identity
++          # in Rust below. Manual requests remain owner-only (#654).
++          case "$EVENT_NAME" in merge_group|push) exit 0 ;; esac
+           case "$ACTOR" in tjfontaine) ;; *) exit 1 ;; esac
+           case "$TRIGGERING_ACTOR" in tjfontaine) ;; *) exit 1 ;; esac
+       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+@@ -232,3 +240,24 @@ jobs:
+             ${{ runner.temp }}/signed-result/comment.md
+           if-no-files-found: warn
+           retention-days: 30
++
++  # Require this check in main's ruleset, with the PR-only placeholder in
++  # trusted-hardware-pr.yml. Never allow skipped authorization to pass a group.
++  signed-queue-gate:
++    name: Signed queue gate
++    needs: [authorize, signed-fixtures, gate, publish]
++    if: always() && github.event_name == 'merge_group'
++    runs-on: ubuntu-latest
++    timeout-minutes: 2
++    steps:
++      - name: Require a published PASS for this merge group
++        env:
++          AUTHORIZE: ${{ needs.authorize.result }}
++          FIXTURES: ${{ needs.signed-fixtures.result }}
++          GATE: ${{ needs.gate.result }}
++          PUBLISH: ${{ needs.publish.result }}
++        run: |
++          test "$AUTHORIZE" = success
++          test "$FIXTURES" = success
++          test "$GATE" = success
++          test "$PUBLISH" = success
+diff --git a/.github/workflows/trusted-hardware-pr.yml b/.github/workflows/trusted-hardware-pr.yml
+index d7d5599c2..35598e0f3 100644
+--- a/.github/workflows/trusted-hardware-pr.yml
++++ b/.github/workflows/trusted-hardware-pr.yml
+@@ -22,3 +22,10 @@ jobs:
+     steps:
+       - run: |
+           echo "Trusted hardware lanes (HVF signed + KVM) run only in the merge queue: .github/workflows/kernel-runtime.yml. This placeholder lets a pull request satisfy the required check name; the merge group re-evaluates it on real hardware."
++
++  signed-queue-gate:
++    name: Signed queue gate
++    runs-on: ubuntu-latest
++    timeout-minutes: 2
++    steps:
++      - run: echo "Signed acceptance runs on the merge group; PR gates are available on request."
