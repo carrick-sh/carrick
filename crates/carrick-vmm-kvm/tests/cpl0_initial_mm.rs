@@ -1770,6 +1770,11 @@ fn private_file_write_only_mapping_returns_eacces() {
 }
 
 #[test]
+fn private_file_path_only_mapping_returns_ebadf() {
+    private_file_fixture_with(false, &["-DEXPECT_PATH_FAILURE"], carrick_abi::LINUX_O_PATH);
+}
+
+#[test]
 fn private_file_child_first_touch_after_parent_unmap() {
     private_file_fixture_with(true, &["-DCHILD_FIRST_TOUCH"], 0);
 }

@@ -8,6 +8,8 @@ _start:
     lea name(%rip), %rsi
 #ifdef EXPECT_ACCESS_FAILURE
     mov $1, %edx
+#elif defined(EXPECT_PATH_FAILURE)
+    mov $0x200000, %edx
 #else
     xor %edx, %edx
 #endif
@@ -38,6 +40,12 @@ _start:
     syscall
 #ifdef EXPECT_ACCESS_FAILURE
     cmp $-13, %rax
+    jne bytes_failed
+    xor %edi, %edi
+    jmp exit
+#endif
+#ifdef EXPECT_PATH_FAILURE
+    cmp $-9, %rax
     jne bytes_failed
     xor %edi, %edi
     jmp exit
