@@ -8681,6 +8681,12 @@ esac
                 (
                     "git",
                     r#"#!/bin/sh
+if test -f "$RUNNER_TEMP/replay-head"; then
+ case "$*" in
+ *' rev-parse HEAD') cat "$RUNNER_TEMP/replay-head"; exit 0 ;;
+ *' rev-list --count '*) cat "$RUNNER_TEMP/replay-commits"; exit 0 ;;
+ esac
+fi
 authenticated=0
 for arg do
  case "$arg" in
@@ -11281,6 +11287,15 @@ exec /usr/bin/git "$@"
                 std::fs::create_dir_all(crate::agent_runner::state().unwrap().join("work"))
                     .unwrap();
                 std::fs::write(root.join("remote-tip"), head).unwrap();
+                std::fs::write(root.join("replay-head"), head).unwrap();
+                let commits = body
+                    .split("Server checked: commits pushed this round: ")
+                    .nth(1)
+                    .unwrap()
+                    .split(';')
+                    .next()
+                    .unwrap();
+                std::fs::write(root.join("replay-commits"), commits).unwrap();
                 let package = root.join("dispatch-output");
                 std::fs::create_dir_all(&package).unwrap();
                 std::fs::write(package.join("contract.json"), raw).unwrap();
@@ -11298,11 +11313,33 @@ exec /usr/bin/git "$@"
                 let mut server = server(root);
                 server.used.workers = 1;
                 server.history.push(serde_json::from_str(raw).unwrap());
+                let receipt = super::super::Receipt {
+                    head: head.into(),
+                    checkpointed: false,
+                    base: server.dispatch.base.clone(),
+                    branch: server.dispatch.branch.clone(),
+                    exit_code: 0,
+                    expected_tip: server.dispatch.base.clone(),
+                    pr_body: None,
+                    review_text: None,
+                    worker: server.dispatch.worker.clone(),
+                    contract: server.history[0].clone(),
+                };
+                std::fs::write(
+                    crate::agent_runner::state().unwrap().join("receipt.json"),
+                    serde_json::to_vec(&receipt).unwrap(),
+                )
+                .unwrap();
                 assert_eq!(server.history[0].status, ContractStatus::Failed);
+                assert_eq!(server.unpushed_head(), None);
                 server
                     .round_outcome(FinishStatus::Blocked, &summary, None)
                     .unwrap();
                 let posted = regular_text(&root.join("posted.md")).unwrap();
+                assert!(
+                    posted.contains("Published: the worker's commits are on the branch"),
+                    "{posted}"
+                );
                 assert_eq!(
                     outcome_status(&posted),
                     Some("Continuing"),
