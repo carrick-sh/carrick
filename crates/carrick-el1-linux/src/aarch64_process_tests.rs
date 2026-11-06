@@ -8780,7 +8780,7 @@ impl carrick_personality_linux::signal::SignalBackend for ArmWaitSignalBackend {
         params: carrick_personality_linux::signal::SignalFrameParams,
         siginfo: Option<&[u8]>,
         fpstate: &[u8],
-        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
+        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> carrick_core::personality::CopyOutcome,
     ) -> Result<UserVa, Self::Error> {
         crate::arm_signal::setup_arm_signal_frame(frame, params, siginfo, fpstate, copy_out)
     }

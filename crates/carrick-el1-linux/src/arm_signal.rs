@@ -439,7 +439,7 @@ impl carrick_personality_linux::signal::SignalBackend for LinuxAarch64Backend {
         params: carrick_personality_linux::signal::SignalFrameParams,
         siginfo: Option<&[u8]>,
         _fpstate: &[u8],
-        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
+        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> carrick_core::personality::CopyOutcome,
     ) -> Result<UserVa, Self::Error> {
         setup_arm_signal_frame(frame, params, siginfo, _fpstate, copy_out)
     }
@@ -498,13 +498,16 @@ pub(crate) fn setup_arm_signal_frame(
     params: carrick_personality_linux::signal::SignalFrameParams,
     siginfo: Option<&[u8]>,
     fpstate: &[u8],
-    copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
+    copy_out: &mut dyn FnMut(UserVa, &[u8]) -> carrick_core::personality::CopyOutcome,
 ) -> Result<UserVa, ArchError> {
+    use carrick_core::personality::CopyOutcome;
+
     let (sp, sigframe) = build(frame, params, siginfo, fpstate)?;
     let new_sp = sp.raw();
 
-    if !copy_out(UserVa::new(new_sp), &sigframe) {
-        return Err(ArchError::InvalidFrame);
+    match copy_out(UserVa::new(new_sp), &sigframe) {
+        CopyOutcome::Done => {}
+        CopyOutcome::Fault | CopyOutcome::NotYet(_) => return Err(ArchError::InvalidFrame),
     }
 
     let info_addr = new_sp;
@@ -1033,7 +1036,7 @@ mod tests {
                 fp.as_bytes(),
                 &mut |va, bytes| {
                     written = Some((va, bytes.to_vec()));
-                    true
+                    carrick_core::personality::CopyOutcome::Done
                 },
             )
             .expect("setup_arm_signal_frame must succeed");

@@ -4757,24 +4757,41 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         address: UserVa,
         bytes: &[u8],
-    ) -> Result<(), NativeProcessError> {
-        let mm = self
+    ) -> carrick_core::personality::CopyOutcome {
+        use carrick_core::personality::{CopyOutcome, GuestCopyRequest};
+
+        let Ok(mm) = self
             .runtime
             .graph
             .lock()
             .owner
             .task(self.key)
-            .map_err(|_| NativeProcessError::Stale)?
-            .native()
-            .resources()
-            .mm
-            .clone();
-        self.service
-            .copy_signal_bytes(&mm, address, bytes)
-            .map_err(|error| match error {
-                NativeProcessError::OwnerWait(_) => NativeProcessError::Fault,
-                other => other,
-            })
+            .map(|task| task.native().resources().mm.clone())
+        else {
+            return CopyOutcome::Fault;
+        };
+        match self.service.copy_signal_bytes(&mm, address, bytes) {
+            Ok(()) => CopyOutcome::Done,
+            Err(
+                NativeProcessError::OwnerWait(_)
+                | NativeProcessError::Busy
+                | NativeProcessError::Unsupported,
+            ) => CopyOutcome::NotYet(GuestCopyRequest {
+                address,
+                len: carrick_guest_arch::GuestLen::new(bytes.len() as u64),
+                access: carrick_guest_arch::Access::Write,
+            }),
+            Err(
+                NativeProcessError::Invalid
+                | NativeProcessError::Stale
+                | NativeProcessError::Exhausted
+                | NativeProcessError::Fault
+                | NativeProcessError::ForkRefused(_)
+                | NativeProcessError::GroupExitCustody
+                | NativeProcessError::Quarantined
+                | NativeProcessError::NoChild,
+            ) => CopyOutcome::Fault,
+        }
     }
     #[inline(never)]
     fn suspend_adapter_operation(

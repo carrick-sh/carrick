@@ -38,7 +38,7 @@ pub mod thread_setup;
     all(target_os = "none", target_arch = "aarch64")
 ))]
 pub mod arm_signal;
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
 pub mod x86_signal;
 
 #[cfg(test)]

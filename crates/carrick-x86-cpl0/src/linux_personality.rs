@@ -290,7 +290,7 @@ impl GuestDispatchFrame for NativeDispatch<'_> {
             params,
             siginfo,
             &self.fpstate.0,
-            &mut |va, src| copy_out.copy_out(va, src).is_done(),
+            &mut |va, src| copy_out.copy_out(va, src),
         )
         .map_err(|_| carrick_personality_linux::abi::signal::LINUX_EFAULT)
     }

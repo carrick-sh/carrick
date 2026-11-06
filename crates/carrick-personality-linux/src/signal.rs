@@ -983,7 +983,10 @@ pub trait SignalBackend: carrick_guest_arch::ArchTypes {
         params: SignalFrameParams,
         siginfo: Option<&'a [u8]>,
         fpstate: &[u8],
-        copy_out: &mut dyn FnMut(carrick_guest_arch::UserVa, &[u8]) -> bool,
+        copy_out: &mut dyn FnMut(
+            carrick_guest_arch::UserVa,
+            &[u8],
+        ) -> carrick_core::personality::CopyOutcome,
     ) -> Result<carrick_guest_arch::UserVa, Self::Error>;
 
     fn restore_signal_frame(

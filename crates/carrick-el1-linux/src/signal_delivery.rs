@@ -190,7 +190,7 @@ where
                 params,
                 info_bytes,
                 fpstate,
-                &mut |va, bytes| process.copy_signal_frame(va, bytes).is_ok(),
+                &mut |va, bytes| process.copy_signal_frame(va, bytes),
             );
             if setup.is_err() {
                 return force_delivery_fault(
