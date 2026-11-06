@@ -12089,6 +12089,7 @@ fn futex_owner_wait(timed: bool, synchronous: bool, interrupted: bool) {
         assert_eq!(gettid.x[0], 42);
         assert!(leader_sees_thread(fixture, &mut native_service, 42));
     }
+    run_as_leader(fixture);
     assert_eq!(fixture.page.live(), 2);
     let record = process_record_for_call(
         source,

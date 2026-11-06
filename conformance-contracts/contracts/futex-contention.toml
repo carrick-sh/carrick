@@ -25,6 +25,7 @@ rationale = "Blocking futex operations must park without redispatch and wake wit
 # budgets, and waiter enrollment invariants remain intact.
 vm_free = [
   "carrick-kernel-example::futex_contention_contract",
+  "carrick-runtime::vcpu_loop::binding::tests::fatal_signal_settlement_cancels_the_owned_futex_before_owner_readiness",
   "carrick-el1-linux::aarch64_process_tests::futex_relative_deadline_survives_synchronous_redispatch_with_two_live_threads",
   "carrick-el1-linux::aarch64_process_tests::signal_during_futex_owner_park_releases_the_operation_before_an_identical_wait",
   "carrick-kernel::dispatch::overlay_dispatch_tests::cancelled_futex_owner_operation_cannot_supply_a_later_deadline",

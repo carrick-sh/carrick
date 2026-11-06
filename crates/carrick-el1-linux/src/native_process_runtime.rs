@@ -4067,6 +4067,9 @@ pub struct NativeProcessEntry<
     // Captured by native admission under its existing graph guard. Ordinary
     // syscall dispatch does not acquire another graph lock for this checkpoint.
     owner_continuation: bool,
+    // Admission captures absence while already holding the graph lock. The
+    // operation itself stays in the member row, never in this cheap hint.
+    relative_futex_pending: bool,
     // A shared return checkpoint observed real work before a concurrent host
     // could drain its doorbell. Keep that refusal with this admitted owner.
     signal_work_deferred: bool,

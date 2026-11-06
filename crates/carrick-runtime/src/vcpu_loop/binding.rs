@@ -7424,7 +7424,9 @@ mod tests {
             El1MmHandle, Lifecycle, PortalOwnerWait, PortalWaitCause, ReservationMm,
         };
         use carrick_guest_mem::{CurrentMmMemory, MemoryError};
-        use carrick_kernel::dispatch::{SyscallArgs, SyscallRequest, ThreadCtx};
+        use carrick_kernel::compat::SyscallArgs;
+        use carrick_kernel::dispatch::{SyscallRequest, ThreadCtx};
+        use carrick_kernel::kernel::continuation::OwnerWaitCancellation;
         struct Word(PortalOwnerWait);
         impl GuestMemory for Word {
             fn read_bytes_raw(&self, _: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
@@ -7444,18 +7446,8 @@ mod tests {
         let context = dispatcher.capture_one_task_context().unwrap();
         let tid = crate::thread::ThreadId::synthetic_for_tests(1745);
         let registry = crate::thread::ThreadRegistry::new(tid);
-        let peer = crate::thread::ThreadId::synthetic_for_tests(1746);
-        let plan = carrick_kernel::kernel::ClonePlan::from_flags(
-            carrick_abi::LinuxCloneFlags::THREAD
-                | carrick_abi::LinuxCloneFlags::SIGHAND
-                | carrick_abi::LinuxCloneFlags::VM,
-        )
-        .unwrap();
-        let sibling = context
-            .kernel()
-            .clone_thread(&context, plan, peer, None)
-            .unwrap();
-        assert!(context.task().thread(sibling.thread().key().tid).is_some());
+        let sibling = registry.register_child(0);
+        assert!(registry.is_live(tid) && registry.is_live(sibling));
         let wait = unsafe {
             PortalOwnerWait::from_owner(
                 El1MmHandle::from_admitted_owner(
