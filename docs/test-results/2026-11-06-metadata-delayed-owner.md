@@ -91,3 +91,11 @@ the exact thread's pre-publication event. It fails on three real records,
 each still Activating (`publication-red2.log`). The first draft inspected
 an absent control-slot reference; its failure is not counted as evidence.
 No sleep or scheduler barrier is used by this witness.
+
+At e7a621204, the signed publication witness passes and the fresh population
+is 16/20. Runs 2 and 18 refuse 64 root uname calls each (complete census:
+960 served, 64 refused). Run 6 completes the guest correctly but observes
+owner=false, parked=3. Run 7 completes the guest but reports one denied
+grant, with all 123 successful grants returned. No hangs or aborts occurred;
+all 20 binaries finished and all run-scoped cleanup checks passed. This is
+not closure; raw evidence is retained under `head2/`.
