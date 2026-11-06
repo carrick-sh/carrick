@@ -47,14 +47,6 @@ pub(crate) fn read_u64(memory: &impl CurrentMmMemory, address: u64) -> Result<u6
     Ok(u64::from_ne_bytes(buf))
 }
 
-pub(crate) fn read_u32(memory: &impl CurrentMmMemory, address: u64) -> Result<u32, LinuxErrno> {
-    let mut buf = [0u8; 4];
-    memory
-        .read_into(address, &mut buf)
-        .map_err(|_| LINUX_EFAULT)?;
-    Ok(u32::from_ne_bytes(buf))
-}
-
 pub(crate) fn write_u32(
     memory: &mut impl CurrentMmMemory,
     address: u64,

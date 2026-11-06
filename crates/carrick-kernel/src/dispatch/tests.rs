@@ -4420,7 +4420,7 @@ mod overlay_dispatch_tests {
         // No shared mapping -> EFAULT propagates unchanged (no regression for
         // a genuinely bad private/anon address).
         let lin = LinearMemory::new(0x1000, vec![0u8; 8]);
-        assert_eq!(read_futex_word(&lin, 0x9_9999_9999), Err(LINUX_EFAULT));
+        assert_eq!(read_futex_word(&lin, 0x9_9999_9999), Err(Box::new(DispatchOutcome::Errno { errno: LINUX_EFAULT })));
     }
 
     struct CountingMemory {
@@ -5542,7 +5542,7 @@ mod hvpatch_in_process_fork_tests {
 
         assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
         assert_eq!(
-            read_u32(&memory, address).unwrap(),
+            read_futex_word(&memory, address).unwrap(),
             u32::try_from(child_context.thread().key().tid.raw()).unwrap()
         );
     }
