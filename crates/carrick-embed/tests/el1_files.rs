@@ -441,6 +441,126 @@ fn el1_files_exit_group_stress() {
     }
 }
 
+/// Build a test-only ELF with no libc, compiler or optional image packages.
+/// These AArch64 instructions create exactly one sibling and two pipes. A
+/// successful clone and pipe handoff order exit_group against a live leader;
+/// neither task exits or writes a reply before the sibling closes the group.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn native_terminal_guest() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let code: &[u32] = &[
+        0xd10083ff, // sub sp, sp, #32
+        0x910003f3, // mov x19, sp
+        0xaa1303e0, // mov x0, x19
+        0xd2800001, // mov x1, #0
+        0xd2800768, // mov x8, #59 // pipe2(start)
+        0xd4000001, // svc #0
+        0xb5000480, // cbnz x0, fail
+        0x91002260, // add x0, x19, #8
+        0xd2800768, // mov x8, #59 // pipe2(reply)
+        0xd4000001, // svc #0
+        0xb5000400, // cbnz x0, fail
+        0xd281e000, // mov x0, #0x0f00
+        0xf2a00020, // movk x0, #1, lsl #16 // CLONE_VM|FS|FILES|SIGHAND|THREAD
+        0xd14007e1, // sub x1, sp, #1, lsl #12
+        0xd2800002, // mov x2, #0
+        0xd2800003, // mov x3, #0
+        0xd2800004, // mov x4, #0
+        0xd2801b88, // mov x8, #220 // clone
+        0xd4000001, // svc #0
+        0xb40001a0, // cbz x0, sibling
+        0xb7f802c0, // tbnz x0, #63, fail
+        0xb9400660, // ldr w0, [x19, #4] // leader writes start_w
+        0x91004261, // add x1, x19, #16
+        0xd2800022, // mov x2, #1
+        0xd2800808, // mov x8, #64 // write
+        0xd4000001, // svc #0
+        0xf100041f, // cmp x0, #1
+        0x540001e1, // b.ne fail
+        0xb9400a60, // ldr w0, [x19, #8] // leader blocks on reply_r
+        0xd28007e8, // mov x8, #63 // read
+        0xd4000001, // svc #0
+        0x1400000b, // b fail
+        0xb9400260, // ldr w0, [x19] // sibling waits on start_r
+        0x91004261, // add x1, x19, #16
+        0xd2800022, // mov x2, #1
+        0xd28007e8, // mov x8, #63 // read
+        0xd4000001, // svc #0
+        0xf100041f, // cmp x0, #1
+        0x54000081, // b.ne fail
+        0xd28002e0, // mov x0, #23
+        0xd2800bc8, // mov x8, #94 // exit_group
+        0xd4000001, // svc #0
+        0xd2800c60, // mov x0, #99
+        0xd2800bc8, // mov x8, #94
+        0xd4000001, // svc #0
+        0xd4200000, // brk #0
+    ];
+    let mut elf = vec![0u8; 120];
+    elf[..16].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    elf[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+    elf[18..20].copy_from_slice(&183u16.to_le_bytes()); // EM_AARCH64
+    elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+    elf[24..32].copy_from_slice(&0x0040_0078u64.to_le_bytes()); // entry
+    elf[32..40].copy_from_slice(&64u64.to_le_bytes()); // phoff
+    elf[52..54].copy_from_slice(&64u16.to_le_bytes()); // ehsize
+    elf[54..56].copy_from_slice(&56u16.to_le_bytes()); // phentsize
+    elf[56..58].copy_from_slice(&1u16.to_le_bytes()); // phnum
+    elf[64..68].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    elf[68..72].copy_from_slice(&5u32.to_le_bytes()); // PF_R | PF_X
+    elf[80..88].copy_from_slice(&0x0040_0000u64.to_le_bytes());
+    elf[88..96].copy_from_slice(&0x0040_0000u64.to_le_bytes());
+    let size = 120 + std::mem::size_of_val(code) as u64;
+    elf[96..104].copy_from_slice(&size.to_le_bytes());
+    elf[104..112].copy_from_slice(&size.to_le_bytes());
+    elf[112..120].copy_from_slice(&4096u64.to_le_bytes());
+    for word in code {
+        elf.extend_from_slice(&word.to_le_bytes());
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("native-terminal");
+    std::fs::write(&path, elf).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    dir
+}
+
+/// Observe the real native leave_space and the same task's production reload.
+/// No test engine, supplied register image, register writes or timed ordering.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn native_sibling_exit_group_reloads_process_roots() {
+    let _guard = common::guest_lock();
+    let fixture = native_terminal_guest();
+    let probe = carrick_runtime::vcpu_loop::executor::native_terminal_test_control::arm();
+    let watchdog = common::Watchdog::start(std::time::Duration::from_secs(30));
+    let result = common::run_or_fail(
+        ContainerBuilder::from_image(common::SMOKE_IMAGE)
+            .pull_policy(PullPolicy::Missing)
+            .mount_readonly(fixture.path().to_string_lossy(), "/witness")
+            .command(["/witness/native-terminal"])
+            .run_blocking(),
+    );
+    watchdog.disarm();
+    let observed = probe.observation();
+    println!("native-terminal {observed:?}");
+    assert_eq!(result.exit_code, 23, "{}", result.stderr_utf8());
+    assert!(
+        observed.thread.is_some(),
+        "native_save_observed=false: {observed:?}"
+    );
+    assert_eq!(
+        observed.hardware_roots,
+        Some([carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE; 2]),
+        "native_leave_space=false: {observed:?}"
+    );
+    assert!(observed.process_root.is_some_and(|root| root >> 48 != 0));
+    assert_eq!(
+        observed.reloaded_roots,
+        observed.process_root.map(|root| [root; 2]),
+        "native_reload_process_roots=false: {observed:?}"
+    );
+}
+
 /// Exercise the hardware cleanup in HvpatchPersistentExecutor::save, rather
 /// than the save selector or a source-text ordering assertion.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

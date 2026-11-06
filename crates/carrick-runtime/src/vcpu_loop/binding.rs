@@ -5993,6 +5993,12 @@ where
                 )
             }
         };
+        #[cfg(all(feature = "test-support", target_os = "macos", target_arch = "aarch64"))]
+        if self.phase.needs_terminal_cpu_save()
+            && let Some(context) = &self.state.service_kernel_context
+        {
+            executor::native_terminal_test_control::terminal(context.thread().key());
+        }
         if self.phase.needs_terminal_cpu_save()
             && let Some(binding) = control.binding
         {
