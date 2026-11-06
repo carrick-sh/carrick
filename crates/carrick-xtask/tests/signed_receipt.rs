@@ -501,6 +501,9 @@ else:
     wrong = queue_payload.clone();
     wrong["merge_group"]["head_sha"] = json!("c".repeat(40));
     assert!(!queue(&wrong).status.success());
+    wrong = queue_payload.clone();
+    wrong["merge_group"]["base_sha"] = json!("c".repeat(40));
+    assert!(!queue(&wrong).status.success());
     let mut wrong = queue_payload.clone();
     wrong["repository"]["full_name"] = json!("someone/fork");
     assert!(!queue(&wrong).status.success());

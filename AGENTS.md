@@ -590,9 +590,9 @@ acceptance.
   reviewed before code, is kept only for ABI or wire-protocol layouts,
   lock orders that span crates, and multi-slice stacks whose workers need
   a shared interface first. The director
-  runs `just accept --profile linux-portable` and the signed gate once per
-  stack or batch, at the top SHA, in a dedicated detached worktree, never in
-  a worker's live worktree.
+  runs `just accept --profile linux-portable` once per stack or batch in a
+  dedicated detached worktree. Signed acceptance runs on the merge group;
+  optional diagnostic runs use a detached worktree, never a worker's live one.
 - **Run `just build-cpl0` (`carrick-x86-cpl0 --target x86_64-unknown-none`)
   for shared personality, lifecycle or guest-copy changes before claiming x86
   is green.** `carrick-vmm-kvm`'s build script builds the freestanding x86
@@ -692,6 +692,14 @@ SendMessage.
 
 ## Landing and personalities
 
+- **Signed acceptance runs on the merge group** (owner, 2026-11-06, #1750).
+  The required **Signed queue gate** check builds the exact `main` queue head
+  and compares against its event `base_sha`; a NEW failure ejects the group.
+  Main pushes publish baselines automatically. PR-time signed runs are
+  optional requests via the owner's `gate:signed` label or dispatch, never
+  a draft → gate → ready prerequisite. Do not seed a baseline per PR or
+  require a separate PR signed receipt before enqueueing. Details and rollout
+  requirements: [`docs/ci/signed-gate.md`](docs/ci/signed-gate.md).
 - **Land through the merge queue** (`main-merge-queue`: rebase, all-green,
   `ci-ok` required). Cancel PR runs that won't land before enqueueing;
   hosted macOS capacity is scarce. The one exception is the admin merge of
@@ -701,16 +709,18 @@ SendMessage.
   PR per independently reviewable layer, each under the size cap, with its
   own witness and issue link, and each PR based on the layer below. Fix a
   lower layer on its own branch, then `gh stack rebase` and `gh stack push`
-  (force-with-lease). The director reviews every layer and runs the signed
-  gate once at the top of the stack.
+  (force-with-lease). The director reviews every layer; signed acceptance
+  runs on the collapsed stack in the merge queue.
 - **A stack lands as one PR, and never with a merge commit** (owner,
   2026-10-31, #231). Our merge queue takes a stack one layer per pass
   (`gh stack merge` leaves the upper layers `UNMERGEABLE`, then drops and
   rebases them), so collapse it first: run `gh stack unstack <stack number>`,
   retarget the top PR to `main` so it carries every layer's commits, and
   land that PR alone. Then close the lower PRs as "landed via #top", along
-  with their issues. When the collapsed head is rebased on the current main
-  tip and `ci-ok` is green on that exact head, admin-merge it with
+  with their issues. Queue the collapsed stack for signed acceptance. The
+  historical admin-merge exception below requires explicit owner direction
+  to bypass the Signed queue gate. When the collapsed head is rebased on the
+  current main tip and `ci-ok` is green on that exact head, admin-merge it with
   `gh pr merge <top> --admin --rebase`. That skips the merge-group-only
   jobs (`macos-build`, `macos-clippy`, `macos-authority`) and the KVM gate,
   which PRs never run. So admin-merge only stacks that touch no x86, KVM,

@@ -132,6 +132,26 @@ fn signed_queue_workflow_requires_published_group_pass_and_seeds_main() {
     for dependency in ["AUTHORIZE", "FIXTURES", "GATE", "PUBLISH"] {
         assert!(command.contains(&format!("test \"${dependency}\" = success")));
     }
+    // Run the workflow's actual shell with GitHub's fail-fast behavior.
+    // A failure in any dependency must not be hidden by a later success.
+    let dependencies = ["AUTHORIZE", "FIXTURES", "GATE", "PUBLISH"];
+    let run_check = |refused: Option<(&str, &str)>| {
+        let mut shell = std::process::Command::new("bash");
+        shell.args(["-e", "-c", command]);
+        for name in dependencies {
+            shell.env(name, "success");
+        }
+        if let Some((name, result)) = refused {
+            shell.env(name, result);
+        }
+        shell.output().unwrap().status.success()
+    };
+    assert!(run_check(None));
+    for name in dependencies {
+        for result in ["failure", "cancelled", "skipped"] {
+            assert!(!run_check(Some((name, result))), "accepted {name}={result}");
+        }
+    }
     let placeholder = load_workflow(&root, ".github/workflows/trusted-hardware-pr.yml");
     let placeholder = yaml_rust2::YamlLoader::load_from_str(&placeholder).unwrap();
     assert!(placeholder[0]["on"]["merge_group"].is_badvalue());
