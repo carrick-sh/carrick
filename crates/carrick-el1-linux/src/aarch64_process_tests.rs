@@ -12008,3 +12008,288 @@ fn signal_setup_nonresident_input(nr: u64) {
         }
     }
 }
+
+#[test]
+fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
+    use crate::native_process_runtime::host_test_support::Physical;
+    use crate::sched::{LinuxSchedEntry, UserWord};
+    use carrick_el1_abi::Lifecycle;
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    struct Word {
+        missing: core::cell::Cell<bool>,
+        value: core::cell::Cell<u32>,
+        reads: core::cell::Cell<u32>,
+    }
+    impl UserWord for Word {
+        fn read_u32(&self, _: &CurrentTask, address: u64) -> Option<u32> {
+            assert_eq!(address, VA);
+            self.reads.set(self.reads.get() + 1);
+            (!self.missing.replace(false)).then_some(self.value.get())
+        }
+        fn read_u64(&self, _: &CurrentTask, _: u64) -> Option<u64> {
+            panic!("untimed wait")
+        }
+    }
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut native_service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut native_service,
+            |_| (),
+        )
+        .unwrap();
+    let runtime = registry()
+        .for_entry(source, &fixture.task, fixture.address)
+        .unwrap();
+    let sibling = host_born_sibling(fixture, 42);
+    let mut gettid = carrick_el1_abi::TrapFrame::default();
+    gettid.x[8] = 178;
+    arm_call(fixture, sibling, &mut native_service, &mut gettid).unwrap();
+    assert_eq!(gettid.x[0], 42);
+    assert!(leader_sees_thread(fixture, &mut native_service, 42));
+    assert_eq!(fixture.page.live(), 2);
+    let record = process_record_for_call(
+        source,
+        &fixture.task,
+        &ThreadCtx::ZERO,
+        fixture_ttbr0(fixture),
+        fixture.control,
+    )
+    .unwrap();
+    registry()
+        .rehome_entry(
+            source,
+            &fixture.task,
+            fixture.address,
+            fixture.page,
+            fixture.control,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(fixture.zone.mark_native_owned(record));
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let mut service = Physical {
+        zone: fixture.zone,
+        page: fixture.page,
+        controls: core::slice::from_ref(fixture.control),
+        copies: Vec::new(),
+        tid_words: Default::default(),
+        tid_wakes: 0,
+        tid_writes: Vec::new(),
+        child_copy_error: None,
+        prepare_copy_error: None,
+        child_copy_error_at: None,
+        on_copy_complete: None,
+        native_ipc: None,
+        refuse_copy: false,
+        on_signal_clock: None,
+    };
+    let handle = service.service_mm_handle(&fixture.address).unwrap();
+    let space = fixture
+        .zone
+        .space_entry(NonZeroU64::new(1).unwrap())
+        .unwrap();
+    let observed = space
+        .notifications(handle.incarnation())
+        .unwrap()
+        .observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Gate);
+    let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
+    access.raise(space.index());
+    // SAFETY: the fixture retains this exact owner and its observed closed gate.
+    let wait = unsafe {
+        carrick_core_abi::PortalOwnerWait::from_owner(
+            handle,
+            carrick_core_abi::PortalWaitCause::Gate,
+            observed.revision(),
+        )
+    };
+    service.prepare_copy_error = Some(NativeProcessError::OwnerWait(wait));
+    let word = Word {
+        missing: core::cell::Cell::new(true),
+        value: core::cell::Cell::new(0x12345678),
+        reads: core::cell::Cell::new(0),
+    };
+    let counters = carrick_el1_abi::Counters::new();
+    let cache = carrick_el1_abi::InotifyNameCache::new();
+    fixture.zone.spaces.set_idle_ttbr(0x30000);
+    let mut cpu = crate::sched::FakeCpu {
+        ttbr: (fixture_ttbr0(fixture), fixture_ttbr0(fixture)),
+        ..Default::default()
+    };
+    let mut frame = carrick_el1_abi::TrapFrame {
+        elr: 0x4004,
+        ..Default::default()
+    };
+    frame.x[8] = crate::sched::SYS_FUTEX as u64;
+    frame.x[0] = VA;
+    frame.x[1] = crate::sched::FUTEX_WAIT_PRIVATE;
+    frame.x[2] = 0x12345678;
+    let mut parked = parked;
+    crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut parked);
+    {
+        let mut entry = runtime
+            .enter_registered(
+                registry(),
+                source,
+                &fixture.task,
+                fixture.address,
+                &parked,
+                &mut service,
+            )
+            .unwrap();
+        let route = crate::dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &cache,
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &word,
+            }),
+            None,
+            Some(fixture),
+            Some(&mut *entry),
+            Some(source),
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        assert_eq!(
+            route,
+            CompletionRoute::Suspended,
+            "missing backing must park on the owner, never forward an unexpected errno"
+        );
+        assert!(fixture.zone.slot(fixture.slot).current().is_none());
+        assert_eq!(fixture.zone.counters.el1_parks.load(Ordering::Relaxed), 1);
+    }
+    service.prepare_copy_error = None;
+    access.lower(space.index());
+    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    assert_eq!(selected.record, fixture.control.zone_record().unwrap().id);
+    let mut entry = runtime
+        .enter_registered(
+            registry(),
+            source,
+            &fixture.task,
+            fixture.address,
+            &parked,
+            &mut service,
+        )
+        .unwrap();
+    let resumed = entry.resume_checkpoint().unwrap();
+    assert!(matches!(
+        resumed,
+        crate::native_process_runtime::NativeResume::RetrySyscall
+    ));
+    drop(entry);
+    // A fresh comparison uses the original syscall arguments retained by
+    // the owner continuation, even if a sibling changed the word meanwhile.
+    let retained = unsafe { *fixture.zone.record(record).ctx_mut() };
+    assert_eq!(retained.native.x[0], VA);
+    assert_eq!(retained.native.x[2], 0x12345678);
+    crate::sched::ThreadCpu::load(&mut cpu, &mut frame, &retained);
+    word.value.set(0);
+    let served = crate::sched::Sched {
+        handoff: None,
+        zone: fixture.zone,
+        slot: fixture.slot,
+        task: &fixture.task,
+        cpu: &mut cpu,
+        user: &word,
+        counters: &counters,
+    }
+    .serve_futex(&mut frame);
+    assert_eq!(
+        served,
+        Some(crate::sched::Served::Returned { switched: false })
+    );
+    assert_eq!(frame.x[0] as i64, -11);
+    crate::sched::ThreadCpu::load(&mut cpu, &mut frame, &retained);
+    word.value.set(0x12345678);
+    // Bound the real matching futex park at the existing host-kick boundary.
+    cpu.pending.push_back(carrick_el1_abi::GIC_KICK_INTID);
+    assert_eq!(
+        crate::sched::Sched {
+            handoff: None,
+            zone: fixture.zone,
+            slot: fixture.slot,
+            task: &fixture.task,
+            cpu: &mut cpu,
+            user: &word,
+            counters: &counters,
+        }
+        .serve_futex(&mut frame),
+        Some(crate::sched::Served::Idle)
+    );
+    if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
+        work.settled();
+    }
+    // The adopted sibling executes the production futex dispatcher. WAKE must
+    // be address-only: HardwareUserWord cannot dereference this synthetic VA.
+    run_as(fixture, 42, 12, 102, sibling);
+    let mut wake = carrick_el1_abi::TrapFrame::default();
+    wake.x[8] = crate::sched::SYS_FUTEX as u64;
+    wake.x[0] = VA;
+    wake.x[1] = crate::sched::FUTEX_WAKE_PRIVATE;
+    wake.x[2] = 1;
+    let waker_slot = SlotId::new(1);
+    fixture.zone.drive(waker_slot, 2);
+    fixture.zone.publish_slot(waker_slot, 1, Some(0), 1);
+    fixture.zone.enter_guest(waker_slot);
+    fixture.zone.install_space(waker_slot, 1).unwrap();
+    let mut wake_cpu = crate::sched::FakeCpu::default();
+    for expected in [1, 0] {
+        wake.x[0] = VA;
+        assert_eq!(
+            crate::sched::Sched {
+                handoff: None,
+                zone: fixture.zone,
+                slot: waker_slot,
+                task: &fixture.task,
+                cpu: &mut wake_cpu,
+                user: &word,
+                counters: &counters,
+            }
+            .serve_futex(&mut wake),
+            Some(crate::sched::Served::Returned { switched: false })
+        );
+        assert_eq!(wake.x[0], expected);
+    }
+    run_as_leader(fixture);
+    assert_eq!(
+        wake.x[0], 0,
+        "one futex waiter requires exactly one counted wake"
+    );
+    let completed = crate::sched::Sched {
+        handoff: None,
+        zone: fixture.zone,
+        slot: fixture.slot,
+        task: &fixture.task,
+        cpu: &mut cpu,
+        user: &word,
+        counters: &counters,
+    }
+    .run_ready(&mut frame);
+    assert_eq!(
+        completed,
+        Some(crate::sched::Served::Returned { switched: true })
+    );
+    assert_eq!(frame.x[0], 0, "successful FUTEX_WAIT must return zero");
+    assert_eq!(fixture.page.live(), 2);
+    assert_eq!(
+        word.reads.get(),
+        3,
+        "one refusal, one mismatch, one enrollment compare"
+    );
+    registry().unregister_root_for_test(&runtime);
+}
