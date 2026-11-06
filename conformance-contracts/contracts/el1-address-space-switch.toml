@@ -30,6 +30,7 @@ structural_budgets = []
 
 [bindings]
 vm_free = [
+  "carrick-sched-core::spaces::notification::tests::actual_editor_refusal_during_final_release_cannot_park_after_it (#847: production edit admission and destructor; a refused owner cannot park after the final editor unlock; address-space installation, identity and switching budgets unchanged)",
   "carrick-sched-core::spaces::tests (a_published_space_is_granted_only_while_its_gate_is_open, colliding_keys_probe_and_freed_entries_are_skipped_then_reused, a_cow_publication_is_owed_until_an_install_covers_it)",
   "carrick-sched-core::occupancy::tests::a_switch_in_authenticates_the_live_root_and_never_vacates_under_a_space (an unreadable live root reinstalls through the gate)",
   "carrick-el1-linux::sched::tests (a_futex_wait_switches_the_vcpu_to_another_process_in_guest, a_raised_gate_sends_the_thread_to_its_executor, an_owed_cow_invalidation_runs_before_the_install, a_vcpu_in_wfi_holds_no_address_space, the_idle_entry_runs_no_thread_itself)",
