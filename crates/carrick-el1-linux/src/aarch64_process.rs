@@ -2718,6 +2718,10 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         address: UserVa,
         bytes: &[u8],
     ) -> Result<(), NativeProcessError> {
+        #[cfg(test)]
+        if super::aarch64_process_tests::SIGNAL_FRAME_NOT_YET.with(|flag| flag.replace(false)) {
+            return Err(NativeProcessError::Unsupported);
+        }
         self.access_user_target(
             mm,
             address,

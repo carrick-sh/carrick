@@ -8801,21 +8801,35 @@ impl carrick_personality_linux::signal::SignalBackend for ArmWaitSignalBackend {
 // the signal frame lands on a guest user stack.
 #[test]
 fn arm_parked_wait4_signal_wake_sa_restart_saves_original_context_across_fresh_checkpoint() {
-    arm_parked_wait4_signal_wake_case(true, false, true);
+    arm_parked_wait4_signal_wake_case(true, false, true, false);
 }
 
 #[test]
 fn arm_parked_wait4_signal_wake_without_sa_restart_retains_eintr() {
-    arm_parked_wait4_signal_wake_case(false, false, false);
+    arm_parked_wait4_signal_wake_case(false, false, false, false);
 }
 
 #[test]
 fn arm_parked_wait4_signal_wake_replaced_record_discards_restart_context() {
-    arm_parked_wait4_signal_wake_case(true, true, false);
+    arm_parked_wait4_signal_wake_case(true, true, false, false);
+}
+
+std::thread_local! {
+    pub(super) static SIGNAL_FRAME_NOT_YET: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+#[test]
+fn arm_signal_frame_not_yet_in_ring_keeps_two_thread_wait_restart() {
+    arm_parked_wait4_signal_wake_case(true, false, true, true);
 }
 
 #[cfg(test)]
-fn arm_parked_wait4_signal_wake_case(restart: bool, replace: bool, check_member: bool) {
+fn arm_parked_wait4_signal_wake_case(
+    restart: bool,
+    replace: bool,
+    check_member: bool,
+    refuse_frame: bool,
+) {
     use carrick_personality_linux::signal::{
         ProcessSignals, SignalInfo, SignalProcessSelector, SignalRequest,
     };
@@ -9149,6 +9163,7 @@ fn arm_parked_wait4_signal_wake_case(restart: bool, replace: bool, check_member:
             "a replacement record cannot inherit the retired record's restart"
         );
     }
+    SIGNAL_FRAME_NOT_YET.with(|flag| flag.set(refuse_frame));
     let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
     let delivered = {
         let mut process = runtime
@@ -9185,6 +9200,10 @@ fn arm_parked_wait4_signal_wake_case(restart: bool, replace: bool, check_member:
             },
         )
     };
+    assert!(
+        !SIGNAL_FRAME_NOT_YET.with(|flag| flag.get()),
+        "frame copy refusal must execute at the production return checkpoint"
+    );
     assert_eq!(delivered, None);
     assert_eq!(
         frame.elr, 0x700000,
