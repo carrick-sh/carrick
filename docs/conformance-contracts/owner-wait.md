@@ -181,3 +181,32 @@ places an eight-byte old mask three bytes before a page boundary, writes those
 three bytes, waits on the second page's exact owner, and requires only the
 remaining five bytes on resume. No initial copy or completion hook may replay
 the committed first page or the already committed mask update.
+# Final release versus owner enrollment (#847)
+
+An owner that observes a revision and then receives a resource refusal must
+either enroll before that resource's release or observe a changed revision
+when it enrolls afterward. Advancing the revision before unlocking violates
+this contract: a contender can sample the advanced revision while the
+resource is still held, miss delivery, then park with no future producer.
+The release must unlock before advancing the notification revision, and
+callbacks must run only after unlocking. Counted source custody remains held
+through revision advancement and delivery; no polling or extra work loop is
+needed.
+
+The VM-free `actual_editor_refusal_during_final_release_cannot_park_after_it`
+drives the production editor destructor and production editor admission.
+Its deterministic hook schedules a second owner's observation and refusal
+immediately before unlock, then uses real host notification enrollment after
+delivery. The corresponding resource-release witness drives
+`SpaceNotificationLease::release_resource` for all six causes. Both must
+return `Changed` with the owned operation and leave no object operation.
+The existing held-queue and unwind witnesses retain the separate guarantee
+that notification callbacks never run while the resource is held. Work
+remains constant per release cause and bounded by the enrolled population.
+
+Signed integration is
+`el1_sched_host_blocked_read_resumes_by_guest_scheduling`; its existing
+1,000/6,000-round workloads, scheduling budgets and 120-second watchdog
+remain unchanged. The Linux authority is that a blocked read resumes when
+its byte arrives; internal memory contention cannot strand the completion.
+

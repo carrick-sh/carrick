@@ -167,12 +167,22 @@ pub struct SpaceGrant {
 pub(super) mod editor_test_hook {
     std::thread_local! {
         static AFTER_CAS: std::cell::RefCell<Option<std::boxed::Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+        static BEFORE_RELEASE: std::cell::RefCell<Option<std::boxed::Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     }
     pub fn install(hook: impl FnOnce() + 'static) {
         AFTER_CAS.with(|slot| *slot.borrow_mut() = Some(std::boxed::Box::new(hook)));
     }
     pub fn run() {
         let hook = AFTER_CAS.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+    pub fn install_before_release(hook: impl FnOnce() + 'static) {
+        BEFORE_RELEASE.with(|slot| *slot.borrow_mut() = Some(std::boxed::Box::new(hook)));
+    }
+    pub fn before_release() {
+        let hook = BEFORE_RELEASE.with(|slot| slot.borrow_mut().take());
         if let Some(hook) = hook {
             hook();
         }
@@ -289,6 +299,8 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceEditor<'a, C> {
 
 impl<C: Copy + Send + Sync + zerocopy::FromZeros> SpaceEditor<'_, C> {
     fn release_editor(&self) {
+        #[cfg(test)]
+        editor_test_hook::before_release();
         let released = self.entry.active_editor.compare_exchange(
             self.owner.get(),
             0,

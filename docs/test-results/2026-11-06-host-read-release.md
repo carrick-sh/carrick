@@ -30,3 +30,22 @@ No code was changed in the baseline executable. No runtime concurrency,
 timeout or scheduling parameters were changed. A bounded host sample was
 taken during run 10. Separate diagnostic runs use a debuggable signed copy
 and do not enter the population above.
+
+Diagnostic run `847-diag-2` reproduced a stranded Editor wait on queue
+5186 (MM 2), with four idle vCPU executors and all spare executors asleep.
+The matching modified-memory core shows `key=2`, `gate=0`, and
+`active_editor=0`: no editor remains to release it. Both ring captures
+reported zero errors. The coherent kernel snapshot refused with an explicit
+busy-authority result; the degraded result and later watchdog census are
+retained alongside the core, rather than treated as a coherent snapshot.
+
+The production editor destructor advances its Editor notification revision
+before releasing `active_editor`. A contender can observe that new revision,
+receive an Editor refusal, and enroll after delivery has already drained the
+queue. Its snapshot is then current forever. The generic resource release
+has the same ordering defect.
+
+The two deterministic production-path witnesses fail on the baseline with
+`owner parked after the final editor release with no producer` and
+`owner parked after the final PreparedOverlap release with no producer`.
+The raw failures are in `editor-red.log` and `release-red.log`.
