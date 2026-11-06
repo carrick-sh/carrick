@@ -135,11 +135,22 @@ The added `private_file_source_limit_returns_enomem` binding attempts 1,024
 untouched mappings, checks errno 12 on the next admission, unmaps one source
 and requires a new first-touch mapping to read the original bytes. Native
 Linux runs the bounded control with successful mappings (it has no Carrick
-source limit). The Carrick binding is currently RED earlier: mmap returns
-errno 38 with 506 host-file crossings recorded, before the source-limit
-reply can be exercised. This is not evidence that the source cap aborts the
-carrier, and no cap pass is claimed. Owned admission and metadata suspension
-must be completed before this higher-population witness can reach the bound.
+source limit). On the rebased pre-fix tree, this binding returned errno 38 with 506
+host-file crossings recorded. Each private mapping consumes both a VMA node
+and a source-index node, exhausting the 1,024-node bootstrap pool before the
+source bound. The shared mapping handler now consumes the root guard to
+provision an elastic bank through the existing metadata allocator, reacquires
+the exact MM and redecides with the original frame and retained source. It
+does not repeat the host-file request. One bank supplies 4,096 nodes; the
+proposal needs at most five spare nodes. There is one capacity provision
+attempt, with no polling or syscall replay. Both ISAs use this same path.
+
+The real KVM binding now passes all 1,024 admissions, exact errno 12, release
+and readmission, and first-touch bytes. Its execution witness requires exactly
+1,026 host-file crossings and no guest refusals or trap-limit truncation. The
+seven private-file KVM cases pass together. General owned admission waits,
+metadata grant suspension after allocator exhaustion, and loader acceptance
+remain outside this population correction.
 
 `published_private_mapping_waits_for_recall_before_source_read` exercises the
 production host-file service with a published IPC projection while its
@@ -176,3 +187,18 @@ writeback is held, and return the updated bytes and zero tail after release.
 This is distinct from the older mapping-admission witness. The source-retention
 operation now has a narrow MM-authority method shared by production host-file
 admission and this test; it retains the original metadata-lock scope.
+
+
+### Elastic bank review boundary
+
+The cross-crate ordering for node growth is reservation root release, metadata
+allocator lock and bank publication, then exact-MM root reacquisition and
+descriptor editing. No MM guard or descriptor edit survives allocation.
+Unused retained sources still retire through the shared mapping wrapper.
+
+Independent review identified an adjacent P2 diagnostic gap: the stopped-host
+`ProductionCpuFactory::initial_reservation_census` uses an unresolved host
+root view and returns `MetadataRequired` once an elastic bank exists. Its
+consumers are diagnostic tests; production guest fork uses identity-bank
+access. A retained host bank resolver is a separate follow-up, not evidence
+of a guest fork failure or a reason to change this source-limit witness.

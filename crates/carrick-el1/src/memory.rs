@@ -1010,7 +1010,40 @@ pub fn serve_delegated_anonymous<
     ) else {
         return forward(Leave::RootBusy);
     };
-    let mut pending = match decide_reservation_syscall(frame, current, &mut model, file) {
+    let decision = decide_reservation_syscall(frame, current, &mut model, file);
+    // Node exhaustion is a metadata-capacity request, not a refusal of the
+    // Linux operation. Both ISAs use the same allocator and reservation bank
+    // publisher. Drop MM custody before allocating, then decide against the
+    // newly published bank with the original frame and retained file source.
+    // One bank supplies more than the maximum nodes any one proposal needs;
+    // a further refusal follows the existing host-service path, without a
+    // retry loop or a second file-source staging operation.
+    #[cfg(target_os = "none")]
+    let decision = if matches!(
+        decision,
+        ReservationDisposition::Unavailable(reservations::Refusal::MetadataRequired)
+    ) {
+        if let Err(refusal) = model.provision_metadata(&crate::alloc::GLOBAL_ALLOCATOR) {
+            return forward(match refusal {
+                reservations::Refusal::Busy => Leave::RootUnavailableBusy,
+                reservations::Refusal::MetadataRequired => Leave::RootUnavailableMetadataRequired,
+                _ => Leave::RootUnavailableStale,
+            });
+        }
+        model = match table.lock_in(
+            spaces,
+            index.index(),
+            mm,
+            frame.slot().map_or(u32::MAX, |slot| slot.index() as u32),
+        ) {
+            Ok(model) => model,
+            Err(_) => return forward(Leave::RootBusy),
+        };
+        decide_reservation_syscall(frame, current, &mut model, file)
+    } else {
+        decision
+    };
+    let mut pending = match decision {
         ReservationDisposition::Return(value) => {
             frame.set_result(carrick_guest_arch::NativeReturnWord(value as u64));
             return DelegatedAnonymous::Served;
