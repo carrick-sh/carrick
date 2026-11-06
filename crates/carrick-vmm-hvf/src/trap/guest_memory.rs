@@ -277,6 +277,34 @@ impl HvfVmState {
         let _legacy = authority.legacy().ok_or_else(|| {
             MemoryError::HostMap("admitted owner MM requires owner-selected user transfer".into())
         })?;
+        self.read_guest_bytes_into_selected(address, dst)
+    }
+
+    pub(crate) fn read_guest_bytes_excluded(
+        &self,
+        address: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, MemoryError> {
+        let handle = self.protections.owner().ok_or_else(|| {
+            MemoryError::HostMap("excluded owner read has no admitted owner".into())
+        })?;
+        carrick_hal::el1_editor_exclusion::with_held_exclusion(handle.mm().raw(), |excluded| {
+            if excluded.is_none() {
+                return Err(MemoryError::HostMap(
+                    "excluded owner read has no matching EL1-editor exclusion".into(),
+                ));
+            }
+            let mut bytes = vec![0_u8; length];
+            self.read_guest_bytes_into_selected(address, &mut bytes)?;
+            Ok(bytes)
+        })
+    }
+
+    fn read_guest_bytes_into_selected(
+        &self,
+        address: u64,
+        dst: &mut [u8],
+    ) -> Result<(), MemoryError> {
         let length = dst.len();
         // PROT_NONE gated once in the default `GuestMemory::read_bytes`/`read_into`.
         let custody = self.carrier_vm_custody();
