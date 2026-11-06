@@ -116,7 +116,7 @@ enum ExtentStorage {
 }
 
 /// Which allocation of the original IPC authority this extent retains.
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 pub enum IpcWindowPart {
     Directory,
     Pool,
