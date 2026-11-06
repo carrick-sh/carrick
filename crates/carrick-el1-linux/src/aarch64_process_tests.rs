@@ -12172,8 +12172,7 @@ fn clone_nonresident_tid_destination(is_clone3: bool, refusal: CloneRefusal) {
             frame.x[0], 43,
             "aliased TID outputs publish one clone result"
         );
-        assert_eq!(tid_words.get::<u32>(0), 43);
-        assert_eq!(tid_words.get::<u32>(4), 0x2222_2222);
+        assert_eq!(tid_words.get::<[u32; 2]>(0), [43, 0x2222_2222]);
         assert!(leader_sees_thread(fixture, &mut service, 43));
         return;
     }
@@ -12198,11 +12197,20 @@ fn clone_nonresident_tid_destination(is_clone3: bool, refusal: CloneRefusal) {
     );
     crate::lifecycle::GUEST_COPY_PREPARATION_FAULT_AT.with(|address| address.set(None));
     let first = first.unwrap();
-    assert_eq!(
-        first,
-        carrick_personality_linux::dispatch::CompletionRoute::Forward,
-        "is_clone3={is_clone3}: main declines a TID-copy refusal without parking"
-    );
+    if is_clone3 {
+        assert_eq!(
+            first,
+            carrick_personality_linux::dispatch::CompletionRoute::WithWork,
+            "clone3 retains its existing immediate refusal without parking"
+        );
+        assert_eq!(frame.x[0] as i64, -38);
+    } else {
+        assert_eq!(
+            first,
+            carrick_personality_linux::dispatch::CompletionRoute::Forward,
+            "main declines a clone TID-copy refusal without parking"
+        );
+    }
     assert!(!leader_sees_thread(fixture, &mut service, 43));
     assert_eq!(child_control.visible_tid(), None);
     crate::lifecycle::COPYOUT_NOT_YET_AT.with(|address| address.set(None));

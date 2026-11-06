@@ -1470,45 +1470,23 @@ fn serve_thread_clone_common<'a>(
     if mm == 0 {
         return None;
     }
-    let has_venue = native.has_process_venue();
     let parent = match TidOutput::capture(parent_settid_addr, native) {
         Ok(parent) => parent,
-        Err(CopyOutcome::NotYet(_)) => {
-            return has_venue.then(|| {
-                returned(
-                    SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
-                    false,
-                )
-            });
-        }
-        Err(CopyOutcome::Fault | CopyOutcome::Done) => {
-            return has_venue.then(|| {
-                returned(
-                    SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
-                    false,
-                )
-            });
-        }
+        Err(CopyOutcome::NotYet(_) | CopyOutcome::Fault) => return None,
+        Err(CopyOutcome::Done) => unreachable!(),
     };
-    let child = match TidOutput::capture(child_settid_addr, native) {
+    let mut child = match TidOutput::capture(child_settid_addr, native) {
         Ok(child) => child,
-        Err(CopyOutcome::NotYet(_)) => {
-            return has_venue.then(|| {
-                returned(
-                    SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
-                    false,
-                )
-            });
-        }
-        Err(CopyOutcome::Fault | CopyOutcome::Done) => {
-            return has_venue.then(|| {
-                returned(
-                    SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
-                    false,
-                )
-            });
-        }
+        Err(CopyOutcome::NotYet(_) | CopyOutcome::Fault) => return None,
+        Err(CopyOutcome::Done) => unreachable!(),
     };
+    if parent
+        .as_ref()
+        .zip(child.as_ref())
+        .is_some_and(|(parent, child)| parent.address == child.address)
+    {
+        child = None;
+    }
     let mut outputs = TidOutputs { parent, child };
 
     let state = native.task_state()?;
@@ -1655,12 +1633,7 @@ fn serve_thread_clone_common<'a>(
             native.fail_lifecycle(NativeRunFailureReason::ClaimRollback);
         }
         return match publish_outcome {
-            CopyOutcome::Fault | CopyOutcome::NotYet(_) => managed.then(|| {
-                returned(
-                    SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
-                    false,
-                )
-            }),
+            CopyOutcome::Fault | CopyOutcome::NotYet(_) => None,
             CopyOutcome::Done => unreachable!(),
         };
     }
