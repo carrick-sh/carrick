@@ -12177,6 +12177,13 @@ fn clone_nonresident_tid_destination(is_clone3: bool, refusal: CloneRefusal) {
     );
     assert!(!leader_sees_thread(fixture, &mut service, 43));
     assert_eq!(child_control.visible_tid(), None);
+    if !refuse_parent {
+        assert_eq!(
+            tid_words.get::<[u32; 2]>(0),
+            [0x1111_1111, 0x2222_2222],
+            "is_clone3={is_clone3}: an unborn tid must not remain visible while copy preparation owns the syscall"
+        );
+    }
     let parent_preimage = if preparation_fault {
         assert_eq!(frame.x[0] as i64, -14);
         // The failed syscall has returned. A peer's subsequent write may
