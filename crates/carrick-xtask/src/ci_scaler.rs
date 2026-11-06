@@ -27,11 +27,11 @@ pub use assignment::{
     admit_assigned, assigned_job_key, pending_assignment, publish_assignment, standing_hook_script,
 };
 pub use mac::{
-    EXEMPT_AGENTS, JOB_HOME, MacLedger, MacRecord, MacState, MacStep, MacTarget, ProcessFacts,
-    SCCACHE_CACHE_SIZE, SCCACHE_DIR, SCCACHE_SOCKET, apply_job_env, clone_runner_tree, denies_user,
-    ensure_run_user_dir, exempt_agent, hand_clone_to_run_user, listener_command, mac_hook_script,
-    mac_step, prepare_run_once, process_facts, remove_run_root, reset_job_area, run_root_path,
-    runner_manifest_for, verify_runner_tree, verify_toolchain,
+    EXEMPT_AGENTS, JOB_HOME, JobAreaReset, MacLedger, MacRecord, MacState, MacStep, MacTarget,
+    ProcessFacts, SCCACHE_CACHE_SIZE, SCCACHE_DIR, SCCACHE_SOCKET, apply_job_env,
+    clone_runner_tree, denies_user, ensure_run_user_dir, exempt_agent, hand_clone_to_run_user,
+    listener_command, mac_hook_script, mac_step, prepare_run_once, process_facts, remove_run_root,
+    reset_job_area, run_root_path, runner_manifest_for, verify_runner_tree, verify_toolchain,
 };
 
 pub const POOL: &str = "carrick-ci";
@@ -1217,6 +1217,9 @@ pub enum ScalerAction {
         #[arg(long)]
         one_job: bool,
     },
+    /// Internal filesystem reset worker, always launched under a deadline.
+    #[command(hide = true)]
+    MacResetJobArea { request: String },
     /// ON cloudmac as root (one fixed sudoers entry): verify the runner tree,
     /// write the bound root-owned policy, read one JIT config from stdin and
     /// run one ephemeral runner as the unprivileged runner user. All paths
@@ -1491,6 +1494,7 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
             runner_group_id,
             one_job,
         ),
+        ScalerAction::MacResetJobArea { request } => mac::reset_job_area_child(&request),
         ScalerAction::MacRunOnce {
             name,
             run_id,

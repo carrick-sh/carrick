@@ -2,6 +2,98 @@
 use carrick_xtask::ci_scaler::*;
 use std::os::unix::fs::PermissionsExt;
 
+fn reset_job_area(
+    skeleton: &std::path::Path,
+    home: &std::path::Path,
+    work: &[std::path::PathBuf],
+    owner: u32,
+    uid: u32,
+    gid: u32,
+) -> Result<(), ScalerError> {
+    carrick_xtask::ci_scaler::reset_job_area(
+        std::path::Path::new(env!("CARGO_BIN_EXE_carrick-xtask")),
+        &JobAreaReset {
+            skeleton: skeleton.into(),
+            home: home.into(),
+            work: work.into(),
+            owner,
+            uid,
+            gid,
+        },
+        std::time::Duration::from_secs(60),
+    )
+}
+
+#[test]
+fn serial_host_reset_cannot_mutate_home_while_an_earlier_helper_holds_lock() {
+    let root = tempfile::tempdir().unwrap();
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+    let skel = root.path().join("skel");
+    let home = root.path().join("home");
+    mkdir_mode(&skel, 0o755);
+    mkdir_mode(&home, 0o700);
+    write_skeleton_entry(home.join("keep"), "prior contents", 0o600);
+    let lock_path = root.path().join(".home.reset.lock");
+    write_skeleton_entry(&lock_path, "", 0o600);
+    let lock = std::fs::File::open(lock_path).unwrap();
+    lock.lock().unwrap();
+    let request = JobAreaReset {
+        skeleton: skel,
+        home: home.clone(),
+        work: vec![],
+        owner: uid,
+        uid,
+        gid,
+    };
+    let start = std::time::Instant::now();
+    let error = carrick_xtask::ci_scaler::reset_job_area(
+        std::path::Path::new(env!("CARGO_BIN_EXE_carrick-xtask")),
+        &request,
+        std::time::Duration::from_millis(200),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "{error}"
+    );
+    assert!(error.contains(home.to_str().unwrap()), "{error}");
+    assert!(error.contains("reaped=true"), "{error}");
+    let pid: i32 = error
+        .split("helper pid=")
+        .nth(1)
+        .unwrap()
+        .split(',')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(home.join("keep")).unwrap(),
+        "prior contents"
+    );
+    drop(lock);
+    // The same production request succeeds once the previous owner releases.
+    carrick_xtask::ci_scaler::reset_job_area(
+        std::path::Path::new(env!("CARGO_BIN_EXE_carrick-xtask")),
+        &request,
+        std::time::Duration::from_secs(5),
+    )
+    .unwrap();
+    assert!(!home.join("keep").exists());
+}
+
 fn job(id: u64) -> JobKey {
     JobKey {
         run: RunId(10),
@@ -381,7 +473,10 @@ fn job_home_and_work_are_recreated_from_the_skeleton_before_every_job() {
     drop(socket);
     reset_job_area(&skel, &home, &[work.clone(), diag.clone()], uid, uid, gid).unwrap();
     use std::os::unix::fs::MetadataExt;
-    assert_eq!(before.ino(), std::fs::symlink_metadata(&home).unwrap().ino());
+    assert_eq!(
+        before.ino(),
+        std::fs::symlink_metadata(&home).unwrap().ino()
+    );
     assert!(!home.join(".sccache.sock").exists());
     assert_eq!(
         std::fs::read_to_string(home.join(".zshrc")).unwrap(),

@@ -32,7 +32,7 @@ pub const STATE_ROOT: &str = "/Volumes/carrick-build/carrick-ci/run";
 pub const MANIFEST: &str = "/Volumes/carrick-build/carrick-ci/runner-manifest.txt";
 /// The unprivileged account jobs run as.
 pub const RUN_USER: &str = "carrick-ci";
-/// The job home, recreated from the root-owned skeleton (`SKELETON`) before every job.
+/// The job home, reset in place from the root-owned skeleton (`SKELETON`) before every job.
 pub const JOB_HOME: &str = "/Volumes/carrick-build/carrick-ci/job-home";
 /// Root-owned skeleton for [`JOB_HOME`] (dotfiles only; no toolchains).
 pub const SKELETON: &str = "/Volumes/carrick-build/carrick-ci/skel";
@@ -1048,14 +1048,98 @@ fn copy_tree(from: &Path, to: &Path, created: &mut Vec<PathBuf>) -> Result<(), S
     Ok(())
 }
 
-/// Before every job (all runner-account processes already gone): build a
-/// new job home entirely root-only under a fresh temporary name next to it,
-/// hand it to the runner account at the very end (contents first, the home
-/// itself last), then swap it into place by rename. The previous home is
-/// moved aside and deleted without following symlinks; every runner-writable
-/// work directory is emptied. Nothing a previous job wrote (caches, launch
-/// agents, rc files, planted symlinks) survives or redirects a root write.
+/// A reset has one wall-clock budget, including guards, recursive deletion,
+/// copying, ownership changes and syncs. Run it in an exec'd child: a blocked
+/// filesystem syscall must not hold the controller slot or survive as a
+/// detached thread that could overwrite the next job's home.
+const RESET_LIMIT: Duration = Duration::from_secs(60);
+
+/// Paths and ownership for one job-area reset, sent only to our own helper.
+#[derive(Serialize, Deserialize)]
+pub struct JobAreaReset {
+    pub skeleton: PathBuf,
+    pub home: PathBuf,
+    pub work: Vec<PathBuf>,
+    pub owner: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// Reset in a supervised instance of this xtask binary. The executable and
+/// budget are explicit so tests exercise the production process boundary.
 pub fn reset_job_area(
+    executable: &Path,
+    request: &JobAreaReset,
+    limit: Duration,
+) -> Result<(), ScalerError> {
+    let mut command = Command::new(executable);
+    command.args([
+        "ci-scaler",
+        "mac-reset-job-area",
+        &serde_json::to_string(request)?,
+    ]);
+    let context = format!(
+        "job-area reset: home={}, skeleton={}, work={:?}",
+        request.home.display(),
+        request.skeleton.display(),
+        request.work
+    );
+    bounded_reset(&mut command, limit, &context)
+}
+
+fn bounded_reset(command: &mut Command, limit: Duration, context: &str) -> Result<(), ScalerError> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let pid = child.id();
+    let deadline = Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                return Err(ScalerError::CommandFailed(format!("{context}: {status}")));
+            }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            result => {
+                // Never turn timeout cleanup into another unbounded wait.
+                // The helper does not fork; SIGKILL targets exactly its PID.
+                let _ = child.kill();
+                let reap_deadline = Instant::now() + Duration::from_secs(1);
+                let mut reaped = false;
+                while Instant::now() < reap_deadline {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        reaped = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                return Err(ScalerError::CommandFailed(format!(
+                    "{context}: reset exceeded {limit:?} or wait failed ({result:?}); helper pid={pid}, reaped={reaped}"
+                )));
+            }
+        }
+    }
+}
+
+pub(super) fn reset_job_area_child(request: &str) -> Result<(), ScalerError> {
+    let JobAreaReset {
+        skeleton,
+        home,
+        work,
+        owner,
+        uid,
+        gid,
+    } = serde_json::from_str(request)?;
+    reset_job_area_in_place(&skeleton, &home, &work, owner, uid, gid)
+}
+
+/// All account processes must already be gone. Keep the account's home inode
+/// in place: renaming it can wait indefinitely for macOS sandbox approval.
+/// Root custody while resetting prevents job-writable symlinks redirecting
+/// writes. On failure the next pass clears the partial contents again.
+fn reset_job_area_in_place(
     skeleton: &Path,
     home: &Path,
     work: &[PathBuf],
@@ -1079,23 +1163,49 @@ pub fn reset_job_area(
             "job home's parent must be root-owned and not group/other writable",
         ));
     }
-    let fresh = parent.join(format!(".{name}.new"));
-    let stale = parent.join(format!(".{name}.old"));
-    wipe(&fresh)?;
-    wipe(&stale)?;
-    std::fs::DirBuilder::new().mode(0o700).create(&fresh)?;
+    // The helper owns this lock until it exits, including when a timed-out
+    // syscall has not yet delivered SIGKILL. A later pass cannot mutate the
+    // same home while that syscall is still in flight. Lock acquisition is
+    // inside the supervised budget too; never unlink this persistent lock.
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(parent.join(format!(".{name}.reset.lock")))?;
+    let lock_meta = lock.metadata()?;
+    if !lock_meta.is_file() || !owner_only(&lock_meta, owner) {
+        return Err(ScalerError::Guard("job-home reset lock must be owner-only"));
+    }
+    lock.lock()?;
+    let _lock = crate::lock_file::OwnedFileLock::from_locked(lock);
+    // Retire debris from the former rename-based reset without following links.
+    wipe(&parent.join(format!(".{name}.new")))?;
+    wipe(&parent.join(format!(".{name}.old")))?;
+    match std::fs::symlink_metadata(home) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            wipe(home)?;
+            std::fs::DirBuilder::new().mode(0o700).create(home)?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::DirBuilder::new().mode(0o700).create(home)?;
+        }
+        Err(e) => return Err(e.into()),
+    }
+    lchown(home, owner, unsafe { libc::getegid() })?;
+    std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700))?;
+    for entry in std::fs::read_dir(home)? {
+        wipe(&entry?.path())?;
+    }
     let mut created = Vec::new();
-    copy_tree(skeleton, &fresh, &mut created)?;
-    // Children before parents, the new home itself last.
+    copy_tree(skeleton, home, &mut created)?;
     for path in created.iter().rev() {
         lchown(path, uid, gid)?;
     }
-    lchown(&fresh, uid, gid)?;
-    if std::fs::symlink_metadata(home).is_ok() {
-        std::fs::rename(home, &stale)?;
-    }
-    std::fs::rename(&fresh, home)?;
-    wipe(&stale)?;
+    lchown(home, uid, gid)?;
     for dir in work {
         wipe(dir)?;
         std::fs::DirBuilder::new().mode(0o700).create(dir)?;
@@ -1278,12 +1388,16 @@ pub(super) fn run_once(name: &str, binding: &RunBinding, pin: &str) -> Result<()
     // remain: kill every runner-account process and recreate its areas.
     kill_all_as(&user)?;
     reset_job_area(
-        Path::new(SKELETON),
-        Path::new(JOB_HOME),
-        &[],
-        0,
-        user.uid,
-        user.gid,
+        &std::env::current_exe()?,
+        &JobAreaReset {
+            skeleton: SKELETON.into(),
+            home: JOB_HOME.into(),
+            work: Vec::new(),
+            owner: 0,
+            uid: user.uid,
+            gid: user.gid,
+        },
+        RESET_LIMIT,
     )?;
     ensure_run_user_dir(Path::new(SCCACHE_DIR), user.uid, user.gid)?;
     let exe = std::env::current_exe()?;
