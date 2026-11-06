@@ -16,8 +16,9 @@ transactions are follow-ups #1719 (clone TIDs), #1723 (signal frames), and
 - A robust-list or clear-child-TID `NotYet` or `Fault` declines the nonfinal
   thread exit to host custody. `SYS_exit` never returns `EFAULT`.
 - A clone TID `NotYet` or `Fault` declines the in-ring clone. Clone3 keeps its
-  existing immediate personality refusal. Neither path parks or exposes a
-  partial TID publication.
+  existing immediate personality refusal. Neither path parks. As on main,
+  rollback after a later output refusal is best effort: a faulting undo is
+  ignored rather than turning the carrier failure into a new result.
 - Equal parent and child TID addresses form one output, so publication and
   rollback touch the guest word once.
 
@@ -33,6 +34,7 @@ The witnesses call `dispatch_arm_syscall_with_native_process` through
 - `arm_clone_nonresident_tid_destination_publishes_once`
 - `arm_clone3_nonresident_tid_destination_publishes_once`
 - `arm_clone_aliased_parent_and_child_tid_publishes_once`
+- `arm_clone_rollback_refusal_matches_main_decline`
 
 The typed `Done` paths still improve on main: successful in-ring robust owner
 death and clear-child-TID cleanup remain available, and guarded clone output
