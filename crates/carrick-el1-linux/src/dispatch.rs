@@ -435,7 +435,6 @@ where
         zone: service.zone,
         slot: service.slot,
     };
-    let task = service.task;
     super::aarch64_process::with_process_entry(
         source,
         service.task,
@@ -445,7 +444,10 @@ where
         control,
         service,
         |process| {
-            let route = dispatch_syscall_with_native(
+            // Dispatch may park this owner and install a peer's frame. The
+            // final EL0 checkpoint re-enters that selected owner only after
+            // this pre-dispatch entry has released its borrow.
+            dispatch_syscall_with_native(
                 frame,
                 counters,
                 current_tasks,
@@ -461,17 +463,7 @@ where
                 Some(source),
                 None,
                 cache_lookup,
-            );
-            #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-            if route == carrick_personality_linux::dispatch::CompletionRoute::Served
-                && let Some(delivery) =
-                    super::arm_signal::deliver_on_user_return(task, process, frame)
-            {
-                return delivery;
-            }
-            #[cfg(test)]
-            let _ = task;
-            route
+            )
         },
     )
 }
@@ -674,10 +666,22 @@ pub fn dispatch_entry(
         }
     };
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    return final_user_return(frame, action, arm_signal_user_return);
+    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+    action
+}
+
+/// Re-enter the selected owner after dispatch and scheduler continuation settle.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub(super) fn final_user_return(
+    frame: &mut TrapFrame,
+    action: Action,
+    checkpoint: impl FnOnce(&mut TrapFrame) -> Action,
+) -> Action {
     if action == Action::Served
-        && (frame.esr == 0 || matches!((frame.esr >> 26) & 0x3f, 0x20 | 0x24))
+        && (frame.esr == 0 || matches!((frame.esr >> 26) & 0x3f, 0x15 | 0x20 | 0x24))
     {
-        return arm_signal_user_return(frame);
+        return checkpoint(frame);
     }
     action
 }
