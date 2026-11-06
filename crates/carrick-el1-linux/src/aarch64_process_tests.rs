@@ -10619,6 +10619,35 @@ fn native_descriptor_witness(
                     "root descriptor must close through its ring owner"
                 );
             }
+            if nr == sys::EVENTFD2.raw() {
+                let invalid = run_in_child(0, nr, [7, 2, 0]);
+                assert!(matches!(
+                    invalid.0,
+                    CompletionRoute::Served | CompletionRoute::WithWork
+                ));
+                assert_eq!(invalid.1, -22, "unknown eventfd flag");
+                let (_, semaphore) = run_in_child(0, nr, [2, flags | 1, 0]);
+                assert_eq!(
+                    semaphore, created[0] as i64,
+                    "invalid flags cannot consume an fd"
+                );
+                let value = carrick_test_support::GuestUserBuffer::zeroed(8);
+                for _ in 0..2 {
+                    assert_eq!(
+                        run_in_child(0, sys::READ.raw(), [semaphore as u64, value.arg(), 8]).1,
+                        8
+                    );
+                    assert_eq!(u64::from_ne_bytes(value.as_bytes().try_into().unwrap()), 1);
+                }
+                assert_eq!(
+                    run_in_child(0, sys::READ.raw(), [semaphore as u64, value.arg(), 8]).1,
+                    -11
+                );
+                assert_eq!(
+                    run_in_child(0, sys::CLOSE.raw(), [semaphore as u64, 0, 0]).1,
+                    0
+                );
+            }
             if nr == sys::PIPE2.raw() {
                 // A failed exact-MM output must cancel both numeric claims.
                 let (route, result) =

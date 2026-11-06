@@ -327,6 +327,44 @@ fn serial_host_native_fork_exec_pipe_writer_reaches_its_parent() {
         );
         frame.x[0]
     };
+    // Constructors must use the successor's native table after exec, just
+    // as they do before exec. Check a usable counter and empty epoll wait.
+    use carrick_personality_linux::crossing::nr as sys;
+    let event = call(
+        sys::EVENTFD2.raw(),
+        7,
+        carrick_syscall_abi::LINUX_O_CLOEXEC | carrick_abi::LINUX_O_NONBLOCK,
+        0,
+    );
+    assert!(
+        (event as i64) >= 0,
+        "post-exec eventfd errno {}",
+        -(event as i64)
+    );
+    let epoll = call(
+        sys::EPOLL_CREATE1.raw(),
+        carrick_syscall_abi::LINUX_O_CLOEXEC,
+        0,
+        0,
+    );
+    assert!(
+        (epoll as i64) >= 0,
+        "post-exec epoll errno {}",
+        -(epoll as i64)
+    );
+    assert_eq!(call(sys::READ.raw(), event, memory.arg() + 768, 8), 8);
+    assert_eq!(
+        u64::from_ne_bytes(memory.as_mut_bytes()[768..776].try_into().unwrap()),
+        7
+    );
+    assert_eq!(
+        call(sys::EPOLL_PWAIT.raw(), epoll, memory.arg() + 800, 1),
+        0
+    );
+    assert_eq!(call(sys::FCNTL.raw(), event, 1, 0), 1);
+    assert_eq!(call(sys::FCNTL.raw(), epoll, 1, 0), 1);
+    assert_eq!(call(sys::CLOSE.raw(), event, 0, 0), 0);
+    assert_eq!(call(sys::CLOSE.raw(), epoll, 0, 0), 0);
     assert_eq!(
         call(64, 4, memory.arg() + 128, 2),
         2,
