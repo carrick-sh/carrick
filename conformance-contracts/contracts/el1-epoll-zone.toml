@@ -44,6 +44,8 @@ an epoll costs no host exit in steady state.
 [bindings]
 # VM-free component evidence; signed execution and exit budgets stay unchanged.
 vm_free = [
+  "carrick-el1-abi::ipc::epoll::tests::duplicate_add_at_member_capacity_preserves_registration_and_allows_mod",
+  "carrick-kernel::dispatch::tests::overlay_dispatch_tests::zone_epoll_duplicate_add_at_capacity_is_eexist_then_mod_after_fork",
   "carrick-el1-abi::ipc::epoll::tests::{bounded_ready_count_preserves_edges_and_oneshots,ready_count_survives_cursor_replacement_between_batches,ready_count_requires_shared_zone_only_proof}",
   "carrick-kernel::dispatch::net::epoll_ops::nested_epoll_readiness_tests::{s1_empty_epoll_skips_owner_preparation,s1_host_epoll_refusals_preserve_edge_and_empty_host_policy}",
 ]
