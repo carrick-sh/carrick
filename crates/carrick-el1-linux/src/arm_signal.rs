@@ -22,13 +22,13 @@ pub(crate) fn test_arm_signal_stack() -> u64 {
     TEST_ARM_SIGNAL_STACK.with(core::cell::Cell::get)
 }
 
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 struct ArmSignalMachine {
     backend: LinuxAarch64Backend,
     user_sp: carrick_guest_arch::UserVa,
 }
 
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedContext>
     for ArmSignalMachine
 {
@@ -101,7 +101,7 @@ fn rewind_forwarded_frame(frame: &mut TrapFrame) -> Option<bool> {
     Some(true)
 }
 
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[inline(never)]
 pub(crate) fn deliver_on_user_return<X: super::aarch64_process::ForkStockCrossing>(
     task: &carrick_el1_abi::CurrentTask,
@@ -130,18 +130,12 @@ pub(crate) fn deliver_on_user_return<X: super::aarch64_process::ForkStockCrossin
         return None;
     }
     let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
-    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     crate::sched::HardwareCpu.save(frame, &mut saved);
-    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
-    crate::sched::FakeCpu::default().save(frame, &mut saved);
     let mut fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
     fp.vregs = saved.native.v;
     fp.fpsr = saved.native.fpsr as u32;
     fp.fpcr = saved.native.fpcr as u32;
-    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     let sp = unsafe { carrick_el1::isa::aarch64::signal_stack() };
-    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
-    let sp = carrick_guest_arch::UserVa::new(test_arm_signal_stack());
     let control = process.control();
     deliver_on_user_return_with(
         task,
