@@ -75,7 +75,47 @@ pub fn schedule(slot: SlotId) -> ! {
                     .enter(source, current, words, &mut service)
                     .unwrap_or_else(|_| fatal_boot());
                 match entry
-                    .resume_checkpoint()
+                    .resume_checkpoint(|entry| {
+                        use carrick_el1_linux::native_process_runtime::{
+                            NativeProcessError, NativeResume,
+                        };
+                        let native = context::context_words::into_native(
+                            *entry.resume_context(),
+                            state.address,
+                        )
+                        .map_err(|_| NativeProcessError::Quarantined.run_failure_reason())?;
+                        let mut frame = context::context_words::syscall_frame_from_native(
+                            &native,
+                            state.address,
+                        )
+                        .map_err(|_| NativeProcessError::Quarantined.run_failure_reason())?;
+                        match deliver_signal_on_syscall_return(
+                            current,
+                            entry,
+                            &mut frame,
+                            &native.xsave,
+                        ) {
+                            None => {
+                                *entry.resume_context_mut() = context::context_words::from_native(
+                                    &context::context_words::from_syscall(
+                                        &frame,
+                                        state.address,
+                                        native.fs_base,
+                                        native.gs_base,
+                                        &native.xsave,
+                                    )
+                                    .map_err(|_| {
+                                        NativeProcessError::Quarantined.run_failure_reason()
+                                    })?,
+                                );
+                                Ok(None)
+                            }
+                            Some(
+                                carrick_personality_linux::dispatch::CompletionRoute::Suspended,
+                            ) => Ok(Some(NativeResume::Left(entry.take_root_exit()))),
+                            Some(_) => Err(NativeProcessError::Quarantined.run_failure_reason()),
+                        }
+                    })
                     .unwrap_or_else(|reason| complete_run_failure(current, reason))
                 {
                     carrick_el1_linux::native_process_runtime::NativeResume::Returned(result) => {
