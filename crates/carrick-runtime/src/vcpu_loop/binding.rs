@@ -5611,6 +5611,16 @@ where
                     }
                     None => None,
                 };
+                if let Some(carrick_hal::OwnerFileFaultOutcome::PendingOwner(wait)) =
+                    owner_file_fault
+                {
+                    return self.park_owner_memory_action(
+                        engine,
+                        control,
+                        crate::vcpu_loop::zone::OwnerMemoryAction::Fault,
+                        wait,
+                    );
+                }
                 if let Some(carrick_hal::OwnerFileFaultOutcome::Pending(wait)) = &owner_file_fault {
                     let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
                         RuntimeError::Configuration("physical fault wait lost context".to_owned())

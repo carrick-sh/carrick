@@ -488,6 +488,10 @@ pub(super) fn resolve_owner_file_fault(
         .ok_or_else(|| TrapError::Hypervisor("owner file fault selection was displaced".into()))?;
     if completed == carrick_hal::OwnerFileFaultOutcome::Resolved
         || matches!(completed, carrick_hal::OwnerFileFaultOutcome::Pending(_))
+        || matches!(
+            completed,
+            carrick_hal::OwnerFileFaultOutcome::PendingOwner(_)
+        )
     {
         crate::probes::hvpatch_el1_file_fault_handoff(
             address,

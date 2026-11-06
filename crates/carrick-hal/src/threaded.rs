@@ -2572,6 +2572,8 @@ pub enum OwnerFileFaultOutcome {
     Resolved,
     /// Reselect only after the exact predecessor publishes or rolls back.
     Pending(carrick_guest_mem::OwnedMemoryWait),
+    /// Reselect only after the exact MM owner releases its contended authority.
+    PendingOwner(carrick_el1_abi::PortalOwnerWait),
     Refused,
     BusFault,
 }
