@@ -2254,6 +2254,27 @@ fn a_closed_space_is_never_installed_again() {
     assert_eq!(zone.installed_space(SLOT), 0);
 }
 
+#[test]
+fn each_vcpu_covers_a_foreign_cow_publication_for_itself() {
+    let zone = zone();
+    zone.spaces.set_idle_ttbr(0x4000_0000);
+    let index = zone.spaces.publish_closed(MM, 0x7000, 0x7000).unwrap();
+    zone.spaces.open(index);
+    zone.spaces.note_cow(index);
+
+    let first = zone.install_space(SLOT, MM).unwrap();
+    let published = first.cow_owed.expect("first vCPU owes the publication");
+    zone.spaces.cover_cow(index, published);
+
+    let other = SlotId::new(SLOT.raw() + 1);
+    let second = zone.install_space(other, MM).unwrap();
+    assert_eq!(
+        second.cow_owed,
+        Some(published),
+        "one vCPU's local invalidation cannot cover another vCPU"
+    );
+}
+
 /// A synthetic EL1 save area for a thread EL1 parked (a private futex wait,
 /// exactly as `park` above does it), with a distinctive, fully populated
 /// [`ThreadCtx`] so a reader must round-trip every field, not just prove
