@@ -1573,7 +1573,9 @@ impl Cpl0Carrier {
     }
 
     /// Acquire stopped-carrier proof and authenticate the retained registration.
-    pub fn ipc_table_map(&self) -> Arc<dyn carrick_el1_abi::ipc_tables::IpcTableMapBacking> {
+    pub fn ipc_table_map(
+        &self,
+    ) -> Result<Arc<dyn carrick_el1_abi::ipc_tables::IpcTableMapBacking>, TrapError> {
         self.custody.ipc_table_map()
     }
 

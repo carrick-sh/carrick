@@ -1541,7 +1541,7 @@ impl PreparedRun {
                             .publish_ipc(
                                 owner,
                                 carrick_kernel::kernel::objects::IpcTableMapBinding::Retained(
-                                    machine.ipc_table_map(),
+                                    machine.ipc_table_map()?,
                                 ),
                             )
                             .map_err(|e| {
