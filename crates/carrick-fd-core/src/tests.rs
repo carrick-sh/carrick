@@ -2829,7 +2829,8 @@ fn owned_pipe_pair_copyout_cancel_preserves_two_live_tables() {
 
 #[test]
 fn owned_pipe_pair_busy_once_and_second_retain_refusal_keep_custody() {
-    let c = authority::<1, 2>();
+    let (core, arena) = core_with::<1>(2);
+    let c = core.bind(arena, BoundedSpin(0));
     let table = c.create_table(4, &mut storage(4)).unwrap();
     let pair = c.reserve_pair(table, Fd(0)).unwrap();
     let reader = c.create_pinned(description(10)).unwrap();
@@ -2884,4 +2885,33 @@ fn owned_pipe_pair_reservation_refusal_and_retirement_leave_no_new_claim() {
     assert_eq!(c.cancel_pair(pair).unwrap_err().error(), Error::StaleTable);
     assert_eq!(c.open(reused, Fd(0), description(3), false), Ok(Fd(1)));
     c.destroy_table(reused, |_| {}).unwrap();
+}
+
+#[test]
+fn owned_pipe_pair_search_is_two_bitmap_descents_and_commit_does_not_search() {
+    for capacity in [64, 4096, 65536] {
+        let c = authority::<1, 3>();
+        let table = c.create_table(capacity, &mut storage(capacity)).unwrap();
+        let source = c.open(table, Fd(0), description(1), false).unwrap();
+        for fd in 1..capacity - 2 {
+            assert_eq!(c.dup2(table, source, Fd(fd as i32)), Ok(None));
+        }
+        let levels = c.lock(table).unwrap().1.storage.levels;
+        let before = BITMAP_READS.with(|n| n.get());
+        let pair = c.reserve_pair(table, Fd(0)).unwrap();
+        let reads = BITMAP_READS.with(|n| n.get()) - before;
+        assert!(reads <= 2 * (2 * levels - 1), "{reads} at {capacity}");
+        assert_eq!(
+            pair.fds(),
+            [Fd(capacity as i32 - 2), Fd(capacity as i32 - 1)]
+        );
+        let reader = c.create_pinned(description(2)).unwrap();
+        let writer = c.create_pinned(description(3)).unwrap();
+        let before = BITMAP_READS.with(|n| n.get());
+        c.commit_pair(pair, [&reader, &writer], false).unwrap();
+        assert_eq!(BITMAP_READS.with(|n| n.get()) - before, 0);
+        c.unpin(reader).unwrap();
+        c.unpin(writer).unwrap();
+        c.destroy_table(table, |_| {}).unwrap();
+    }
 }

@@ -1,5 +1,30 @@
 # x86 IPC venue (#1756): red witness and remaining implementation
 
+## Owned descriptor-pair admission
+
+The shared fd core can now reserve both empty pipe descriptors in one table
+lock scope, release the lock for user copy, then commit or cancel the owned
+pair. Neither endpoint is visible before commit. Copyout failure therefore
+cancels claims instead of closing numeric descriptors that a sibling might
+have reused. Fork copies live entries without inheriting these claims.
+Contended settlement returns both claims to the operation owner. Table
+retirement and generation reuse cannot redirect a stale claim, and lowering
+the descriptor limit after admission does not revoke it.
+
+Immediate and reserved pair publication share one implementation and one
+sequence write. The VM-free contract checks two-live-table cancellation,
+Busy once then success, second-retain rollback, retirement/reuse, and two
+bitmap descents at capacities 64, 4096 and 65536 with no search on commit.
+The initial compile-red witness fails because the pair admission API is
+absent. An initial contention fixture used an unbounded Spin policy while
+holding its own lock; it was stopped and corrected to BoundedSpin(0).
+
+This is the descriptor admission prerequisite, not a wired pipe2 syscall.
+The production x86 mapping, complete root namespace and execution adapter
+remain missing. The KVM served fixture and refusal invariant must remain
+unchanged until those paths are implemented and verified. No external issue
+or PR blocks this remaining implementation.
+
 ## Backed object construction prerequisite
 
 `IpcRegion::create_backed_pipe` now shares object creation with the host
