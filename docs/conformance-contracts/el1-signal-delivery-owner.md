@@ -36,3 +36,14 @@ for that changed input. Signed probe/frame execution and the existing
 HVF is available on ctb-w1. CPL0 already delivers MAPERR through the shared
 owner; missing file-backed classification and host-to-native checkpoint wiring
 are tracked by #1084 (related cancellation seam #1078).
+
+Signal setup may park its exact owner and select a runnable peer on the same
+slot. Signal dequeue, mask restoration and frame publication must authenticate
+the currently selected task, member control and execution binding together.
+The pre-dispatch native entry cannot accompany its successor's registers.
+The final EL0 checkpoint re-enters the selected owner after dispatch and
+continuation settlement, including SVC returns from retained copyout.
+Unblocking a pending signal before an old-mask output wait delivers it once
+before that thread returns to EL0; it never redirects its runnable peer.
+The two-live-thread witnesses in `native_signal_resume_tests` cover input and
+output parks, peer-frame preservation and the resumed SVC checkpoint.
