@@ -2288,6 +2288,15 @@ fn slot_cow_coverage_survives_rebinding_and_rejects_retired_asid_identity() {
     );
     zone.cover_cow(SLOT, MM, publication);
     assert_eq!(zone.install_space(SLOT, MM).unwrap().cow_owed, None);
+    zone.release_space(SLOT);
+    assert!(zone.reset_slot(SLOT));
+    zone.publish_slot(SLOT, MM, Some(1), u64::MAX);
+    assert_eq!(
+        zone.install_space(SLOT, MM).unwrap().cow_owed,
+        Some(publication),
+        "a replacement vCPU must not inherit the old vCPU's completion",
+    );
+    zone.cover_cow(SLOT, MM, publication);
 
     let sibling = SlotId::new(SLOT.raw() + 1);
     assert_eq!(
