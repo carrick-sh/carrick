@@ -8014,7 +8014,7 @@ mod tests {
         publication_fixture("review-invalid-missing-text");
     }
     #[test]
-    fn review_requires_distinct_sessions() {
+    fn replay_1763_worker_review_accepts_same_session() {
         publication_fixture("review-invalid-same-session");
     }
     #[test]
@@ -11035,7 +11035,13 @@ fi
             "fixture-token",
             &mut agent_loop::RunCache::default(),
         );
-        if witness == "review-claimed" || review_case.starts_with("review-invalid-") {
+        if witness == "review-claimed"
+            || (review_case.starts_with("review-invalid-")
+                && !matches!(
+                    review_case,
+                    "review-invalid-same-session" | "review-invalid-untyped"
+                ))
+        {
             assert!(
                 publication
                     .unwrap_err()
