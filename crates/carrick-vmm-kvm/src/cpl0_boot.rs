@@ -1284,8 +1284,7 @@ impl Cpl0Carrier {
                     .ok_or_else(|| fail("initial table receipt overflow"))?;
             }
             self.publish_production_reservations(
-                mm,
-                root,
+                context,
                 reply.result_initial_break,
                 reply.stack_top,
                 image,
@@ -1347,14 +1346,15 @@ impl Cpl0Carrier {
 
     fn publish_production_reservations(
         &mut self,
-        mm_key: NonZeroU64,
-        root: RootGpa,
+        context: AddressContext<RootGpa>,
         initial_break: u64,
         stack_top: u64,
         image: &carrick_mem::x86_initial_image::X86InitialImage<'_>,
         sources: &[X86InitialBootRegion],
         limits: InitialReservationLimits,
     ) -> Result<(), TrapError> {
+        let mm_key = context.mm.raw();
+        let root = context.root;
         let mut identities = Vec::with_capacity(sources.len());
         for source in sources {
             identities.push(self.custody.retain_initial_source(source)?);
