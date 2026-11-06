@@ -164,3 +164,15 @@ fault-in fallback, eager ELF population, or a larger carrier aperture would
 not satisfy this requirement. The freestanding CPL0 image builds, but that
 compile result does not resolve these live failures. No runtime fix is
 claimed by this audit.
+
+The native x86 Linux oracle exits 7 for both lazy-output fixtures and the
+`BAD_RUSAGE` control. On the rebuilt Linux CLI, Node 22 slim with entrypoint
+`/usr/local/bin/node` and `-e 'console.log(1)'` passes carrier boot, then exits
+127 with no stdout or stderr. Its existing terminal syscall census identifies
+the loader's `openat` refusal (native x86 ordinal 257, 41 refusals, zero host
+services). It also records one `writev` refusal (ordinal 20) and 41 refusals in
+the unknown-ordinal overflow bucket. This population census does not establish
+temporal syscall order. The JSON execution witness records 85 guest entries,
+16 owner-grant crossings and one root-exit crossing, with no host forwards.
+The next demonstrated blocker is loader service coverage, tracked separately
+by #1722; exit 127 is not a Node execution pass.
