@@ -369,14 +369,16 @@ where
             // would try to reacquire our own Gate. AddressSpaces gates are
             // counted; this nested guard lowers before `_snapshot_pause` and
             // therefore cannot reopen the MM early.
+            // No published address-space entry means guest EL1 cannot edit
+            // this MM, so there is no editor to exclude. The exact-MM pause
+            // above still freezes host executors, and an owner read may retain
+            // its continuation on an independent Gate until that owner
+            // releases. When the MM is published, retaining this optional
+            // guard registers the typed exclusion witness the HVPatch backing
+            // reader requires.
             let _snapshot_exclusion = carrick_kernel::kernel::mm_occupancy::exclude_el1_editor(
                 context.shared().mm().id(),
-            )
-            .ok_or_else(|| {
-                RuntimeError::Configuration(
-                    "core capture paused an MM with no published EL1 exclusion".to_owned(),
-                )
-            })?;
+            );
             lifecycle(1, 0);
 
             engine.prepare_core_snapshot().map_err(|error| {
