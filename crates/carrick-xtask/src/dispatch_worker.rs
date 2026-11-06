@@ -3861,7 +3861,33 @@ fn select_issue_branch(
     mut run: impl FnMut(&Value, &str) -> Result<(Value, Option<PublishedPr>), ScalerError>,
     trusted: &mut dyn FnMut(&str) -> bool,
 ) -> Result<(), ScalerError> {
-    let _ = (event, prs, &mut run, trusted);
+    let issue = event["issue"]["number"]
+        .as_u64()
+        .ok_or(ScalerError::Guard("missing issue number"))?;
+    let fresh = event["comment"]["body"]
+        .as_str()
+        .is_some_and(|body| body.lines().any(|line| line.trim() == "Fresh start: yes"));
+    if fresh {
+        let mut superseded = Vec::new();
+        for pr in prs {
+            if let Some(pr) = select_owned_pr(issue, std::slice::from_ref(pr), &mut run, trusted)? {
+                superseded.push(
+                    pr["number"]
+                        .as_u64()
+                        .ok_or(ScalerError::Guard("missing PR number"))?,
+                );
+            }
+        }
+        event["superseded_prs"] = json!(superseded);
+    } else if let Some(pr) = select_owned_pr(issue, prs, run, trusted)? {
+        event["pull_request"] = pr;
+    } else if prs.iter().any(|pr| {
+        pr["state"] == "open" && pr["head"]["ref"].as_str().and_then(dispatch_branch) == Some(issue)
+    }) {
+        return Err(ScalerError::Guard(
+            "open dispatch PR could not be authenticated; resolve its ownership or explicitly request Fresh start: yes",
+        ));
+    }
     Ok(())
 }
 
@@ -6490,6 +6516,12 @@ fn publish_with(
     );
     if mode == PublishMode::Full
         && let Ok(Some(number)) = &result
+        && let Err(error) = close_superseded(root, dispatch, *number)
+    {
+        result = Err(error);
+    }
+    if mode == PublishMode::Full
+        && let Ok(Some(number)) = &result
         && let Some(review) = receipt.review_text.as_deref()
         && let Err(error) = publish_review(
             root,
@@ -6532,6 +6564,41 @@ fn publish_with(
             "{error}; harvested commits could not be kept: {saving}"
         ))),
     }
+}
+
+/// Retire only the PRs authenticated at fresh-start admission, after the
+/// replacement exists. Recheck live ownership; a close error must be visible.
+fn close_superseded(root: &Path, dispatch: &Dispatch, replacement: u64) -> Result<(), ScalerError> {
+    for number in &dispatch.superseded_prs {
+        if *number == replacement {
+            return Err(ScalerError::Guard("replacement cannot supersede itself"));
+        }
+        let live = api(root, &format!("repos/{REPOSITORY}/pulls/{number}"))?;
+        if live["state"] == "closed" {
+            continue;
+        }
+        let mut previous = dispatch.clone();
+        previous.branch = live["head"]["ref"].as_str().unwrap_or_default().to_owned();
+        let verified = require_owned_pr(root, &previous)?;
+        if verified["number"].as_u64() != Some(*number) {
+            return Err(ScalerError::Guard("superseded PR ownership changed"));
+        }
+        gh(
+            root,
+            &[
+                "pr",
+                "close",
+                &number.to_string(),
+                "--repo",
+                REPOSITORY,
+                "--comment",
+                &format!(
+                    "Superseded by fresh dispatch run PR https://github.com/{REPOSITORY}/pull/{replacement}."
+                ),
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 const HARVEST_PATCH: &str = "harvest.patch";
@@ -8990,12 +9057,17 @@ REFS
  ;;
  */collaborators/tjfontaine/permission) echo '{"permission":"admin","role_name":"admin"}' ;;
  */issues/comments/77) cat "$RUNNER_TEMP/trigger-comment.json" ;;
+ */pulls/1778) cat "$RUNNER_TEMP/superseded.json" ;;
+ */actions/runs/41) cat "$RUNNER_TEMP/superseded-run.json" ;;
+ *'/pulls?state=open&head=carrick-sh:work/dispatch-634-41') cat "$RUNNER_TEMP/superseded-list.json" ;;
  */pulls/800) cat "$RUNNER_TEMP/adopted-pr.json" ;;
  */issues/634) cat "$RUNNER_TEMP/adopted-issue.json" ;;
  */actions/runs/42) cat "$RUNNER_TEMP/original.json" ;;
  */actions/runs/42/jobs*) echo '{"jobs":[{"name":"worker","status":"completed","runner_name":"carrick-agent-123","steps":[{"name":"Run actions/upload-artifact@v4","status":"completed","conclusion":"success"}]}]}' ;;
  *'/pulls?state=open&head=carrick-sh:work/parent-two') cat "$RUNNER_TEMP/parent-two.json" ;;
  *'/pulls?state=open&head=carrick-sh:work/parent-one') cat "$RUNNER_TEMP/parent-one.json" ;;
+ *'/pulls?state=open&per_page='*)
+ if test -f "$RUNNER_TEMP/superseded-list.json"; then cat "$RUNNER_TEMP/superseded-list.json"; elif test -f "$RUNNER_TEMP/created"; then cat "$RUNNER_TEMP/pr.json"; else echo '[]'; fi ;;
  *'/pulls?'*) if test -f "$RUNNER_TEMP/created"; then cat "$RUNNER_TEMP/pr.json"; else echo '[]'; fi ;;
  *) exit 91 ;;
  esac
@@ -9007,6 +9079,8 @@ elif test "$1 $2" = 'pr edit'; then
  test ! -f "$RUNNER_TEMP/fail-edit" || exit 94
  while test "$1" != --body-file; do shift; done
  cp "$2" "$RUNNER_TEMP/applied-body.md"
+elif test "$1 $2" = 'pr close'; then
+ printf '%s\n' "$@" > "$RUNNER_TEMP/close.args"
 elif test "$1 $2" = 'pr create'; then
  test ! -f "$RUNNER_TEMP/created" || exit 92
  touch "$RUNNER_TEMP/created"
@@ -9179,6 +9253,33 @@ fi
         run["status"] = "completed".into();
         std::fs::write(outer.join("original.json"), run.to_string()).unwrap();
         std::fs::write(outer.join("pr.json"), json!([pr.clone()]).to_string()).unwrap();
+        if witness.starts_with("fresh-supersedes") {
+            let mut old = pr.clone();
+            old["number"] = json!(1778);
+            old["head"]["ref"] = json!("work/dispatch-634-41");
+            let mut old_run = run.clone();
+            old_run["id"] = json!(41);
+            std::fs::write(outer.join("superseded.json"), old.to_string()).unwrap();
+            std::fs::write(outer.join("superseded-list.json"), json!([old]).to_string()).unwrap();
+            std::fs::write(outer.join("superseded-run.json"), old_run.to_string()).unwrap();
+            let mut trigger = event.clone();
+            trigger["issue"]["state"] = json!("open");
+            trigger["action"] = json!("created");
+            trigger["comment"] = json!({"id":77,"body":"/agent\nFresh start: yes", "user":{"login":"tjfontaine","type":"User"},"created_at":"now","updated_at":"now"});
+            std::fs::write(
+                outer.join("trigger-comment.json"),
+                trigger["comment"].to_string(),
+            )
+            .unwrap();
+            let path = outer.join("fresh-event.json");
+            std::fs::write(&path, trigger.to_string()).unwrap();
+            let (resolved, _, _) = resolve_event(&work, &path, &mut owner_collaborator()).unwrap();
+            let selected =
+                validate_event(&resolved, "tjfontaine", &mut owner_collaborator()).unwrap();
+            assert!(!selected.resume);
+            assert_eq!(selected.superseded_prs, vec![1778]);
+            dispatch.superseded_prs = selected.superseded_prs;
+        }
         let mut contract = Contract {
             loop_summary: None,
             review: Review::Published(false),
@@ -9206,6 +9307,25 @@ fi
         }
         let report = state.join("report.md");
         std::fs::write(&report, "").unwrap();
+        if witness == "fresh-supersedes-push-failure" {
+            std::fs::write(outer.join("refuse-push"), "").unwrap();
+            assert!(
+                publish(
+                    &work,
+                    &dispatch,
+                    &receipt,
+                    &contract,
+                    &report,
+                    "fixture-token",
+                    &mut agent_loop::RunCache::default()
+                )
+                .is_err()
+            );
+            assert!(!outer.join("created").exists());
+            assert!(!outer.join("close.args").exists());
+            return;
+        }
+
         if witness.starts_with("stack-owned") {
             // Parent has its own closing scope; only this layer is charged.
             let main = dispatch.base.clone();
@@ -10652,6 +10772,7 @@ fi
         }
         if witness == "issue-retrigger" {
             let mut trigger = event.clone();
+            trigger["issue"]["state"] = json!("open");
             trigger["action"] = json!("created");
             trigger["comment"] = json!({"id":77,"body":"/agent\ncontinue on this issue's run branch", "user":{"login":"tjfontaine","type":"User"},"created_at":"now","updated_at":"now"});
             pr["head"]["sha"] = json!(receipt.head);
@@ -10709,6 +10830,15 @@ fi
             assert_eq!(calls.matches("pr\ncreate\n").count(), 1, "{calls}");
             assert!(
                 calls.contains("api\n-X\nPATCH\nrepos/carrick-sh/carrick/pulls/800"),
+                "{calls}"
+            );
+            return;
+        }
+        if witness == "fresh-supersedes" {
+            let calls = regular_text(&outer.join("close.args")).unwrap();
+            assert!(calls.contains("close\n1778\n"), "{calls}");
+            assert!(
+                calls.contains("https://github.com/carrick-sh/carrick/pull/800"),
                 "{calls}"
             );
             return;
@@ -12702,6 +12832,16 @@ fi
     }
 
     #[test]
+    fn failed_fresh_start_publication_leaves_the_earlier_pr_open() {
+        publication_fixture("fresh-supersedes-push-failure");
+    }
+
+    #[test]
+    fn fresh_start_closes_superseded_run_pr_with_replacement_pointer() {
+        publication_fixture("fresh-supersedes");
+    }
+
+    #[test]
     fn issue_1750_retrigger_continues_1778_and_fresh_start_supersedes_it() {
         let mut original = review_event();
         original["issue"]["number"] = json!(1750);
@@ -12713,6 +12853,7 @@ fi
         let run = original["dispatch_run"].clone();
         let mut trigger = event();
         trigger["issue"]["number"] = json!(1750);
+        trigger["issue"]["state"] = json!("open");
         trigger["action"] = json!("created");
         trigger["comment"] = json!({"body":"/agent\ncontinue on this issue's run branch", "user":{"login":"tjfontaine","type":"User"},"created_at":"now","updated_at":"now"});
         // First trigger has no PR; the next sees the PR published by that run.
@@ -13733,6 +13874,7 @@ if test "$2" = graphql; then
  case "$*" in *lastEditedAt*) cat "$BRIEF_FIXTURE/issue-graphql.json" ;; *) cat "$BRIEF_FIXTURE/graphql.json" ;; esac
  exit 0
 fi
+case "$2" in *'/pulls?state=open&per_page=100&page=1') echo '[]'; exit 0 ;; esac
 file="$BRIEF_FIXTURE/$(printf '%s' "$2" | tr '/' '_')"
 test -f "$file" || { echo "unexpected endpoint $2" >&2; exit 91; }
 cat "$file"
