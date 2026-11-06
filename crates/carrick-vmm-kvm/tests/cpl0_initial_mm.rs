@@ -1654,3 +1654,88 @@ fn in_zone_child_pipe2_and_unfaulted_cow_read_matches_native_oracle() {
     assert_eq!(outcome.run.stdout, b"P");
     assert!(outcome.run.stderr.is_empty());
 }
+
+fn private_file_fixture(cow: bool) {
+    let dir = tempfile::tempdir().expect("private source directory");
+    let path = dir.path().join("source");
+    let mut bytes = vec![0x37; 4096];
+    bytes[0] = 0x41;
+    bytes[4095] = 0x5a;
+    std::fs::write(&path, &bytes).expect("private source file");
+    let define = format!("-DFILE_PATH=\"{}\"", path.display());
+    let mut flags = vec![define.as_str()];
+    if cow {
+        flags.push("-DCOW_WRITE");
+    }
+    let elf = native_exit_fixture_with_flags("native_private_file.S", &flags);
+    let oracle = dir.path().join("oracle");
+    std::fs::write(&oracle, &elf).expect("native oracle ELF");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&oracle, std::fs::Permissions::from_mode(0o700))
+        .expect("executable oracle");
+    let native = std::process::Command::new("timeout")
+        .arg("10")
+        .arg(&oracle)
+        .output()
+        .expect("bounded native oracle");
+    assert!(
+        native.status.success(),
+        "native oracle: {:?}",
+        native.status
+    );
+    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    dispatcher.set_fs_backend(Box::new(
+        carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
+            .expect("host filesystem"),
+    ));
+    // File opening has a separate native-service binding. Seed this exact
+    // task's real descriptor through production dispatch before guest entry,
+    // so the witness isolates mmap and its physical fault service.
+    let root = dispatcher.capture_one_task_context().expect("source task");
+    let mut path_bytes = path.as_os_str().as_encoded_bytes().to_vec();
+    path_bytes.push(0);
+    let mut setup_memory = carrick_kernel::dispatch::LinearMemory::new(0x4000, path_bytes);
+    let opened = dispatcher
+        .dispatch(
+            &root,
+            carrick_kernel::dispatch::SyscallRequest::new(
+                56,
+                carrick_kernel::compat::SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+            ),
+            &mut setup_memory,
+            &carrick_kernel::compat::CompatReporter::default(),
+        )
+        .expect("production source open");
+    let carrick_kernel::dispatch::DispatchOutcome::Returned { value: fd } = opened else {
+        panic!("source open failed: {opened:?}");
+    };
+    assert_eq!(fd, 3);
+    let preopened = format!("-DPREOPENED_FD={fd}");
+    flags.push(&preopened);
+    let elf = native_exit_fixture_with_flags("native_private_file.S", &flags);
+    let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("ELF program");
+    let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
+        &program,
+        128,
+        ROOT_AFFINITY_LOADED,
+        |_| {},
+        dispatcher,
+    )
+    .expect("private mapping production runtime");
+    assert_eq!(
+        outcome.run.exit_code, 0,
+        "31=open, 32=mmap, 33=bytes; stdout={:?}; stderr={:?}",
+        outcome.run.stdout, outcome.run.stderr
+    );
+    assert_eq!(std::fs::read(&path).expect("source after guest"), bytes);
+}
+
+#[test]
+fn private_file_read_only_faults_in_source_bytes() {
+    private_file_fixture(false);
+}
+
+#[test]
+fn private_file_write_preserves_source_bytes() {
+    private_file_fixture(true);
+}

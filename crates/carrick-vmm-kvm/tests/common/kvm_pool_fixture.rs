@@ -68,12 +68,30 @@ pub fn try_run_program_with_root_affinity_typed(
     carrick_runtime::prepare::PreparedKvmPoolOutcome,
     carrick_runtime::prepare::PreparedKvmPoolFailure,
 > {
+    try_run_program_with_dispatcher(
+        program,
+        max_exits,
+        affinity,
+        configure,
+        carrick_kernel::dispatch::SyscallDispatcher::default(),
+    )
+}
+
+pub fn try_run_program_with_dispatcher(
+    program: &carrick_mem::elf::ElfProgram<'_>,
+    max_exits: usize,
+    affinity: u64,
+    configure: impl FnOnce(&mut Cpl0Carrier),
+    dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
+) -> Result<
+    carrick_runtime::prepare::PreparedKvmPoolOutcome,
+    carrick_runtime::prepare::PreparedKvmPoolFailure,
+> {
     let image = prepare_x86_elf(program).expect("x86 ELF program");
     let extent =
         Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("bounded initial extent");
     let mut carrier =
         Cpl0Carrier::boot_production(physical_inventory(), extent).expect("production KVM image");
-    let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
     let root = dispatcher.capture_one_task_context().expect("issued root");
     root.kernel()
         .object_ids()

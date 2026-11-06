@@ -16,6 +16,7 @@ vm_free = [
 ]
 
 [bindings.unresolved]
+kvm = "#1722 red-first production CPL0 witnesses: carrick-vmm-kvm::cpl0_initial_mm::{private_file_read_only_faults_in_source_bytes,private_file_write_preserves_source_bytes}. Both native static fixtures exit 0. KVM reaches mmap after production-dispatch file opening, returns errno 38, and exits 32. No file-fault or private-write success claim yet. Guest openat separately returns errno 38 in this runner. Source supply and echo acceptance remain unimplemented."
 embed_structural = "case_libpython_private_fixed_file_segments is a registered signed-hvf target, with an automatically rebuilt static fixture. Execution remains open: HVF is unavailable on ctb-w4."
 docker = "Director must bless the exact fixture source and native ARM64 output; no Docker is available on ctb-w4."
 embed_timing = "Paired uninstrumented same-image Docker ratio and final signed promotion remain director-owned."
