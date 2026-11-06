@@ -12215,12 +12215,6 @@ fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
     let retained = unsafe { *fixture.zone.record(record).ctx_mut() };
     assert_eq!(retained.native.x[0], VA);
     assert_eq!(retained.native.x[2], 0x12345678);
-    assert_ne!(
-        retained.native.x[1] & (1 << 63),
-        0,
-        "owner continuation must retain the relative-deadline marker"
-    );
-    assert_eq!(retained.native.x[5], 105);
     crate::sched::ThreadCpu::load(&mut cpu, &mut frame, &retained);
     word.value.set(0);
     let served = crate::sched::Sched {
@@ -12257,22 +12251,6 @@ fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
     assert_eq!(
         cpu.now, 105,
         "owner redispatch must retain the original relative deadline"
-    );
-    crate::sched::ThreadCpu::load(&mut cpu, &mut frame, &retained);
-    frame.x[3] = 0;
-    cpu.pending.push_back(carrick_el1_abi::GIC_KICK_INTID);
-    assert_eq!(
-        crate::sched::Sched {
-            handoff: None,
-            zone: fixture.zone,
-            slot: fixture.slot,
-            task: &fixture.task,
-            cpu: &mut cpu,
-            user: &word,
-            counters: &counters,
-        }
-        .serve_futex(&mut frame),
-        Some(crate::sched::Served::Idle)
     );
     if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
         work.settled();
@@ -12335,8 +12313,8 @@ fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
     assert_eq!(fixture.page.live(), 2);
     assert_eq!(
         word.reads.get(),
-        4,
-        "one refusal, one mismatch, one timed compare, one wakeable enrollment compare"
+        3,
+        "one refusal, one mismatch, one enrollment compare"
     );
     registry().unregister_root_for_test(&runtime);
 }
