@@ -52,6 +52,8 @@ embed = [
   "carrick-vmm-kvm::cpl0_initial_mm::production_initial_image_extent_excludes_untouched_data_grants",
   "carrick-vmm-kvm::cpl0_initial_mm::production_large_initialized_elf_retains_first_fork_table_capacity",
   "carrick-vmm-kvm::cpl0_initial_mm::production_wait_prepares_untouched_initial_elf_output",
+  "carrick-vmm-kvm::cpl0_initial_mm::production_wait_retains_reaped_child_across_untouched_rusage_output",
+  "carrick-vmm-kvm::cpl0_initial_mm::production_wait_bad_rusage_reports_fault_after_reaping",
 ]
 docker = [
   "Native x86 Linux static-ELF behavior is asserted by the exact exit status; Docker oracle and runtime ratio remain director-owned.",

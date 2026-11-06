@@ -101,3 +101,30 @@ forwarding. It must preserve the syscall and transfer continuation across
 API has no owned suspension venue. A direct retained-source fallback would make
 a second copy authority; lowering contention to EFAULT or spinning would be
 incorrect. Independent review requests changes for this P0 regression.
+
+## Wait output has two distinct completion stages
+
+The production `production_wait_retains_reaped_child_across_untouched_rusage_output`
+binding forks a real child, keeps status resident, and leaves the page-aligned
+rusage BSS page untouched. Native Linux exits 7; the candidate exits 92. A
+paired `BAD_RUSAGE` control uses address 1 instead and passes on both: wait4
+returns errno 14, the resident status is delivered, and a second wait returns
+errno 10 because the child was already reaped. The successful-output binding
+also requires that second wait to return errno 10.
+
+These are different stages of the same operation. In the shared native runtime,
+`wait_query` copies status through `copy_status` before `CopiedWait::consume`,
+then copies rusage through `copy_signal_bytes` after consumption. Neither copy
+uses the retained `OwnedCopyout` path. Retrying the whole wait after rusage
+supply would report ECHILD instead of the already-completed child's PID. The
+continuation must retain the selected status/reap/rusage stage, not only the
+original syscall words. Preflighting invalid rusage before reaping would also
+change the Linux result demonstrated by the control.
+
+The x86 native service still lacks the `prepare_owned_write` and `copyout_fault`
+mechanics used by ARM's retained copyout service. Its `NativeWriteVenue` uses
+the default unsupported backing-supply method. Adding a synchronous physical
+crossing alone is insufficient: `grant_target` can refuse with an owner wait
+after physical supply, while the local generic `error` mapper collapses that
+wait into Fault. Physical custody and the exact transfer must survive that
+refusal. No runtime correction is claimed by these additional witnesses.
