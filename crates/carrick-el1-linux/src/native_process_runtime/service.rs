@@ -1543,6 +1543,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 return Err(error);
             }
         }
+        if signal_push {
+            // Return-time signal preparation has no enclosing syscall work
+            // publication. This real notice must ring before the lane parks.
+            self.current.linux.mark_pending_host_work();
+        }
         #[cfg(test)]
         super::host_test_support::run_service_published_hook(self.runtime as *const _ as usize);
         Ok(PreparedService::Request(request, adapter))

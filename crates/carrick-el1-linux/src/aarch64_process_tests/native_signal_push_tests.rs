@@ -339,13 +339,8 @@ fn parked_signal_push(synchronous: bool, refused_fault: bool, partial: bool, bus
     if synchronous {
         assert!(control.synchronous_fault().is_some());
     }
-    assert_eq!(fixture.zone.slot(fixture.slot).current(), None);
-    assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
-        peer.id
-    );
-    run_as(fixture, 42, 12, 102, peer_control);
-    let peer_before = unsafe { *fixture.zone.record(peer.id).ctx_mut() };
+    // Intake consumes the owner's actual work doorbell before the CPU slot
+    // is rebound to its peer, as the production scheduler does.
     if refused_fault || busy {
         use carrick_core_abi::service::{ServiceCell, ServiceOperation};
         let notice = fixture.task.service_notice.take().unwrap().unwrap();
@@ -387,6 +382,13 @@ fn parked_signal_push(synchronous: bool, refused_fault: bool, partial: bool, bus
             )
             .unwrap();
     }
+    assert_eq!(fixture.zone.slot(fixture.slot).current(), None);
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        peer.id
+    );
+    run_as(fixture, 42, 12, 102, peer_control);
+    let peer_before = unsafe { *fixture.zone.record(peer.id).ctx_mut() };
     drop(editor);
     physical.child_copy_error = None;
     assert!(
