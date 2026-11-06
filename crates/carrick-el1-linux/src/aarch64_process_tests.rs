@@ -2585,7 +2585,7 @@ fn arm_child_wait_wake_with_stock(in_ring: bool, sibling: bool, physical: bool) 
                 .page
                 .publish_host_birth(host_slot, control.host_birth_identity().unwrap())
         );
-        run_as(&fixture, 43, 13, 103, control);
+        run_as(fixture, 43, 13, 103, control);
         let record = fixture
             .zone
             .current_or_new(
