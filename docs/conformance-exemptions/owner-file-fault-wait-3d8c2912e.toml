@@ -1,0 +1,31 @@
+schema = "carrick.conformance-exemption.v1"
+base = "f9c55762a180feb26d319737ada24f8c2b14f80e"
+head = "3d8c2912ec6e014a69086bb3bb7161a5e2de0e2d"
+contracts = [
+  "diagnostics.syscall-refusal",
+  "kernel.copyout.owner-refusal",
+  "kernel.el1.signal-delivery-owner",
+  "kernel.el1.stage1-publication",
+  "kernel.el1.task-load-entry",
+  "kernel.fork.stage1-image",
+  "kernel.fs.directory-copyout",
+  "kernel.mm.carrier-window-isolation",
+  "kernel.mm.image-page-permissions",
+  "kernel.mm.private-file-fixed-replacement",
+  "kernel.mm.pt-pause-drain-acknowledgement",
+  "kernel.mm.syscall-code-write",
+  "kernel.scheduler.runnable-progress",
+  "kernel.signal.temporary-wait-mask",
+  "kernel.vcpu.vm-lifetime",
+  "process.native.arm-admission",
+  "process.native.terminal-child",
+]
+paths = [
+  "crates/carrick-aarch64/src/engine.rs",
+  "crates/carrick-aarch64/src/user_transfer/staging.rs",
+  "crates/carrick-hal/src/threaded.rs",
+  "crates/carrick-runtime/src/vcpu_loop/binding.rs",
+  "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+  "crates/carrick-runtime/src/vcpu_loop/signal.rs",
+]
+rationale = "The exact product diff changes only authenticated owner-contention handling after an unclaimed file-grant withdrawal: one decoder recognizes the existing EL1 wait tags, the HAL carries PendingOwner, and the runtime releases the frame mailbox before parking and rerunning the faulting fetch. Non-wait outcomes and the existing signal, stage-1, fork-image, copyout, directory, scheduler, process-admission, terminal-child, image-permission, mapping, syscall-write and VM-lifetime branches in these shared files are unchanged. The kernel.memory.owner-wait descriptor binds both red-first production-path witnesses; focused regular and serial_host suites cover the preserved shared boundaries."
