@@ -1,4 +1,4 @@
-# Thread exit cleanup (#1724): terminal clear-TID faults
+# Thread exit cleanup (#1724): terminal copy faults
 
 Contract: `kernel.el1.thread-lifecycle`.
 
@@ -29,8 +29,18 @@ handback witness remains in the suite as a preservation control.
 ## Still required for #1724
 
 This slice does **not** implement parking. NotYet still takes main's handback,
-and a registered robust list still declines before any in-ring mutation.
+and a readable registered robust list still declines before any in-ring mutation.
 Consequently this slice does not satisfy the issue's full acceptance criteria.
+
+The next slice consumes a terminal fault reading the robust-list head and
+continues to clear-TID and retirement. Both adopted and native-owned production
+ARM records must retire on a noncanonical head. A shared ARM/x86 policy witness
+also refuses scheduler release after the clear-TID wake, then re-enters exit:
+the terminal head fault must not prevent retirement or replay that wake. The
+head read is bounded to the 24-byte Linux ABI header; no robust futex update is
+attempted when that header faults. ARM/common copy-in now classifies non-user
+ranges as terminal faults, matching copy-out. Canonical unavailable memory
+continues to need the retained owner described below.
 
 A parked exit needs an exact-thread owned terminal continuation, not generic
 `wait_guest_copy`/syscall redispatch. That owner must retain the original exit

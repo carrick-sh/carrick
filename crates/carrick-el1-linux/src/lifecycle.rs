@@ -84,6 +84,11 @@ impl<
 > UserCopy for El1PendingFamilies<'_, F, C, U, G, Context>
 {
     fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> CopyOutcome {
+        // A non-user range cannot become readable after backing supply.
+        // Terminal cleanup must consume this fault rather than redispatch it.
+        if !carrick_guest_arch::lower_half_range(src.raw(), dst.len() as u64) {
+            return CopyOutcome::Fault;
+        }
         #[cfg(test)]
         if let Some(user) = &mut self.lifecycle_user {
             return CopyOutcome::from_completed(user.copy_in(dst, src.raw()));

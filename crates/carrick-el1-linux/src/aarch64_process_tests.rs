@@ -6037,8 +6037,12 @@ fn arm_two_live_threads_robust_exit_routes_host_custody_without_abort() {
         record.id
     );
     // Every glibc/musl thread registers a robust list at start.
+    // This preservation control needs a readable head: a terminal head
+    // fault now completes cleanup instead of requesting host custody.
+    let robust_head = [0_u64; 3];
+    let robust_address = core::ptr::from_ref(&robust_head).addr() as u64;
     let mut frame = carrick_el1_abi::TrapFrame::default();
-    frame.x[0] = 0x2000;
+    frame.x[0] = robust_address;
     frame.x[1] = 24;
     frame.x[8] = 99; // set_robust_list
     let route = arm_call(fixture, control, &mut service, &mut frame).unwrap();
@@ -6047,7 +6051,7 @@ fn arm_two_live_threads_robust_exit_routes_host_custody_without_abort() {
         carrick_personality_linux::dispatch::CompletionRoute::WithWork
     );
     assert_eq!(frame.x[0], 0);
-    assert_eq!(control.robust_list().0, 0x2000);
+    assert_eq!(control.robust_list().0, robust_address);
     // The in-ring exit declines (no robust-list walker here) with a live
     // sibling: the host walks the list and retires the thread.
     frame.x = [0; 31];

@@ -1655,32 +1655,33 @@ fn exit_keeps_a_migrated_host_job_while_the_other_process_exits_in_zone() {
 #[test]
 fn exit_forwards_unless_a_switched_in_non_last_thread_may_leave() {
     // (label, setup applied after the child is switched in)
-    type Setup = fn(&World);
+    type Setup = fn(&World, u64);
     let cases: [(&str, Setup); 5] = [
-        ("last thread (n == 1)", |w| {
+        ("last thread (n == 1)", |w, _| {
             w.page().try_exit().unwrap();
         }),
-        ("robust list registered", |w| {
-            w.venue.child_slot(0).set_robust_list(0x9000, 24);
+        ("robust list registered", |w, head| {
+            w.venue.child_slot(0).set_robust_list(head, 24);
         }),
-        ("pending signal", |w| {
+        ("pending signal", |w, _| {
             let _ = w
                 .page()
                 .pending()
                 .post_then_read_blocked(PendingSignals(SIGUSR1_BIT), w.venue.child_slot(0));
         }),
-        ("gate closing for a fork", |w| {
+        ("gate closing for a fork", |w, _| {
             w.page().close_for_fork().unwrap();
         }),
-        ("host work pending", |w| {
+        ("host work pending", |w, _| {
             w.task().linux.mark_pending_host_work();
         }),
     ];
     for (label, setup) in cases {
         let mut w = World::new(LifecycleHatches::ON);
         let word = GuestUserValue::new(0_u32);
+        let robust_head = GuestUserValue::new([0_u64; 3]);
         let mut frame = clone_then_join(&mut w, &word);
-        setup(&w);
+        setup(&w, robust_head.arg());
         let live = w.page().live();
         let action = w.call(&mut frame, SYS_EXIT, &[3]);
         assert_eq!(

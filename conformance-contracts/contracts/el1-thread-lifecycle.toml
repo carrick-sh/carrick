@@ -79,7 +79,8 @@ embed = [
 # zone admission record has already been released. One control-wake batch is
 # applied per retained lifecycle page; this does not complete guest waits.
 vm_free = [
-  "carrick-el1-linux::aarch64_process_tests::{arm_raw_exit_faulting_robust_head_retires_adopted_thread,arm_raw_exit_faulting_robust_head_retires_unadopted_thread} (red-first #1724: terminal invalid robust-list head must not hand a nonfinal pooled exit to host custody; implementation pending)",
+  "carrick-el1-linux::aarch64_process_tests::{arm_raw_exit_faulting_robust_head_retires_adopted_thread,arm_raw_exit_faulting_robust_head_retires_unadopted_thread} (terminal invalid robust-list head does not hand a nonfinal pooled exit to host custody; no parked-walker claim)",
+  "carrick-personality-linux::x86_wave2::x5_exit_faulting_robust_head_requeued_wakes_once (terminal robust-head fault followed by release refusal preserves one clear-TID store and wake in shared ARM/x86 policy)",
   "carrick-el1-linux::aarch64_process_tests::arm_raw_exit_faulting_clear_tid_still_retires_adopted_and_unadopted",
   "carrick-el1-linux::lifecycle::tests::exit_clear_tid_fault_wakes_the_queued_joiner_once",
   "carrick-el1-linux::aarch64_process_tests::arm_closed_gate_service_entry_retires_the_sibling_instead_of_busy",

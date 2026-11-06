@@ -1448,10 +1448,17 @@ fn serve_exit<'a>(
     ) {
         return decline!(LifecycleDecline::ExitEntryState);
     }
-    // No robust-list walker exists yet (it will live in sched-core, shared
-    // with the host lane): a registered list is walked by nobody here.
     if slot.robust_list().0 != 0 {
-        return decline!(LifecycleDecline::ExitRobust);
+        // Linux abandons a list whose head cannot be read, but still exits.
+        // Keep readable and unavailable lists on the existing owner path
+        // until their walk and memory wait have retained terminal custody.
+        let mut head = [0; crate::thread::ROBUST_LIST_HEAD_SIZE as usize];
+        if !matches!(
+            native.copy_in(&mut head, UserVa::new(slot.robust_list().0)),
+            CopyOutcome::Fault
+        ) {
+            return decline!(LifecycleDecline::ExitRobust);
+        }
     }
     // A pending signal is delivered (or re-targeted) by the host.
     if page.pending().load().0 != 0 || slot.pending().load().0 != 0 {
