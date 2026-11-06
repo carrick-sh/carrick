@@ -164,9 +164,14 @@ carrick's bug. Skills: [`.agents/skills/ltp-conformance`](.agents/skills/ltp-con
   lease and never downgrade or reacquire it. Supervisor custody, cleanup
   deadlines and known escape limits:
   [`docs/host-lease-containment-follow-up.md`](docs/host-lease-containment-follow-up.md).
-- **Never pipe a gate through `tail`/`grep`/`head`** — the pipeline's status
-  is the last stage's. Redirect or `tee` to a durable file with absolute
-  paths and check the gate's own exit status.
+- **Write gate and harness outputs to durable files, never piped through
+  `tail`/`grep`/`head`.** A pipeline's status is its last stage's and `tail`
+  hides earlier failures; redirect or `tee` to an absolute path and check both
+  the exit status and the file for errors (#1560).
+- **New or changed test and gate tooling must pass a known-answer run first.**
+  Trust an A/B harness, waiter or gate runner only after one run proves it did
+  the real work: fixtures restored and the test executed, the waiter actually
+  waiting, the exact SHA gated (#1560).
 - **Deliberate load and tracing clean up after themselves:** load runs inside
   the script that kills it (trap EXIT; receipts show `pgrep -x yes` empty);
   every `dtrace -Z` session is bounded and ends with `pgrep dtrace` empty.
@@ -534,11 +539,22 @@ acceptance.
   `follow-up` issues, filed by the reviewer or the fixing round, never
   scope added to the PR and never a reason to hold it. Rate with judgement,
   not by keyword. A disputed rating goes to the director as tie-breaker.
+- **Every fix round on a reviewed PR gets a confirming independent re-review,
+  and flaky or crash fixes need paired signed proof before landing.** Re-review
+  the fix commits (#1691's P0 fix introduced a P0); land a flaky or
+  timing-dependent target only on population evidence — 10 runs base vs head,
+  one signed artifact each, fixtures restored, counted on the test's own
+  verdict line, never one gate pass (#1673 regressed 6/10 to 1/10); and prove
+  a claimed signed-crash fix with a signed A/B showing the crash gone on that
+  head (#1699's fix wasn't the cause).
 - **Grep diffs for out-of-fence changes** — a page-table worker flipped
   `pwrite64` on a pipe read end ESPIPE→EBADF, broke main for a day, and a later
   worker "fixed" the test to match. Out-of-fence changes need an oracle line.
-- **Transport-timeout deaths may leave clean diffs** — check `cargo check` and
-  tests; commit with the worker's trailer. Long conversations die: brief narrowly; start fresh
+- **Commit after each step (red witness, fix, signed proof), and require it in
+  worker briefs.** Long turns hit time limits — two hit the three-hour cap in
+  one day, one stranding 1,749 uncommitted lines (#1560).
+- **Transport-timeout deaths may leave clean diffs** — run `cargo check` and
+  tests, then commit with the worker's trailer. Brief narrowly and start fresh
   conversations on the same worktree.
 - **Workers base on GitHub main only** (`fetch https://github.com/carrick-sh/carrick`),
   never a host mirror (which lags). Rebase onto GitHub main at dispatch and
@@ -577,6 +593,12 @@ acceptance.
   runs `just accept --profile linux-portable` and the signed gate once per
   stack or batch, at the top SHA, in a dedicated detached worktree, never in
   a worker's live worktree.
+- **Run `just build-cpl0` (`carrick-x86-cpl0 --target x86_64-unknown-none`)
+  for shared personality, lifecycle or guest-copy changes before claiming x86
+  is green.** `carrick-vmm-kvm`'s build script builds the freestanding x86
+  CPL0 image only on Linux x86_64, so `cargo check -p carrick-vmm-kvm`
+  elsewhere skips it — twice a worker reported x86 green while the image
+  didn't compile (#1691, #1697).
 - **Routing:** a strong design-capable worker for shared-kernel, mm, fork,
   signal, carrier and seam work; a fast instruction-following worker for
   precisely specified mechanical work. A lane refused by one provider's
