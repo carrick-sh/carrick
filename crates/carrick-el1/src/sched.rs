@@ -4,7 +4,6 @@ use carrick_el1_abi::{
     GIC_SPURIOUS_INTID, GIC_VTIMER_INTID, RecordId, SlotId, ThreadIdentity, TrapFrame, Waker,
     ZoneTables,
 };
-use carrick_guest_arch::ProcessContext;
 use carrick_sched_core::{IDLE_SPIN_NS, PREEMPT_SLICE_NS, ShortLockSpin, SwitchedIn, WakeEffects};
 use core::sync::atomic::Ordering;
 
@@ -197,11 +196,6 @@ pub trait ThreadCpu {
     fn spin(&mut self);
     /// This vCPU's `ICC_SGI1R_EL1` routing bits, from `MPIDR_EL1`.
     fn own_sgi_target(&self) -> u64;
-}
-
-/// Restore retry-only syscall metadata that is not architectural EL0 state.
-pub fn restore_retry_metadata(frame: &mut TrapFrame, ctx: &Aarch64ParkedContext) {
-    frame.far = ctx.relative_futex_deadline().unwrap_or(0);
 }
 
 /// Scheduler effect of the native owner resume checkpoint.
@@ -668,7 +662,6 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             }
         };
         self.cpu.load(frame, ctx);
-        restore_retry_metadata(frame, ctx);
         if retry_syscall {
             // The typed continuation is created only while handling an AArch64
             // SVC, whose saved ELR names the following aligned instruction.
