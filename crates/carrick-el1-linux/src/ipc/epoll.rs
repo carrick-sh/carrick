@@ -285,7 +285,9 @@ fn serve_with<E: IpcExecution, M: UserCopy>(
             // Readiness moved before the park: retire the record (the pin
             // stays with `op`) and harvest again.
             Parked::Retry(token) => match region.finish_operation(token, || {
-                notify_operation_release(region, sched.zone(), sched.slot())
+                notify_operation_release(region, sched.zone(), sched.slot(), &|owned| {
+                    sched.deliver_completion(owned)
+                })
             }) {
                 Ok(back) => op = back,
                 Err(_) => return leave(sched, IpcLeave::StaleOperation, IpcServed::Forward),
