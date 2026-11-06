@@ -241,7 +241,8 @@ fn split_at_last_paren(s: &str) -> (&str, &str) {
 
 /// Where should `HostFsBackend` place its per-run scratch dir? An explicit
 /// `CARRICK_HOME` places scratch at `$CARRICK_HOME/scratch`, checking it without touching
-/// the conventional mount. Prefer
+/// the conventional mount. GitHub CI otherwise uses its admitted internal checkout
+/// at `$GITHUB_WORKSPACE/target/carrick-home/scratch`. Outside CI, prefer
 /// the dedicated carrick APFS volume (always case-sensitive, isolated,
 /// throw-away-able). Fall back to `~/.carrick/scratch` for hosts where
 /// the volume hasn't been laid down yet.
@@ -315,6 +316,19 @@ fn resolve_scratch_root(
 ) -> ScratchRoot {
     if let Some(home) = std::env::var_os("CARRICK_HOME").filter(|s| !s.is_empty()) {
         return checked_scratch_root(PathBuf::from(home).join("scratch"), true, probe);
+    }
+    // CI checkouts are admitted on internal storage. Ordinary host tests must
+    // follow the same policy as acceptance and signed wrappers, without relying
+    // on each workflow step to export an override before opening the USB mount.
+    if std::env::var_os("GITHUB_ACTIONS").is_some_and(|value| value == "true")
+        && let Some(workspace) =
+            std::env::var_os("GITHUB_WORKSPACE").filter(|value| !value.is_empty())
+    {
+        return checked_scratch_root(
+            PathBuf::from(workspace).join("target/carrick-home/scratch"),
+            true,
+            probe,
+        );
     }
     let conventional = checked_scratch_root(conventional.to_owned(), false, probe.clone());
     if conventional.case_sensitive {
