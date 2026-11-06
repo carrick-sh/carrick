@@ -690,17 +690,14 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
             // Gather the imported source before acquiring the pipe lock. The
             // logical prefix is independent of descriptor reuse or mutation.
             let mut bytes = vec![0; length as usize];
-            let copied = region.copy_vector_input(
-                &token,
-                op.progress.written,
-                &mut bytes,
-                |dst, address| {
+            let copied = region
+                .copy_vector_input(&token, op.progress.written, &mut bytes, |dst, address| {
                     user.prefetch(address.0, dst.len() as u64);
                     let available = user.prefetch.len().min(dst.len());
                     dst[..available].copy_from_slice(&user.prefetch[..available]);
                     available
-                },
-            )?;
+                })
+                .map_err(IpcError::from)?;
             bytes.truncate(copied);
             user.prefetch = bytes;
             user.prefetch_va = op.progress.written;

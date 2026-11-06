@@ -83,3 +83,15 @@ ENOSYS. The production dispatch binding now witnesses errno 38, exactly one
 native-20 refusal, and zero forwards. The shared route remains; no crossing
 allowlist or ISA wiring-gap ceiling changes. This slice does not claim x86
 pipe writev support.
+
+## Vector payload invariant classification (#1684 ratchet)
+
+`copy_vector_input` returns `VectorInputInvariant` only for operation-token,
+header-custody or logical-range corruption. Guest copy refusal remains
+`Ok(delivered_prefix)`, including zero bytes. The native adapter matches each
+invariant explicitly and retains its existing fatal entry-binding disposition;
+the host handback converts the invariant back to its original `IpcError`.
+No guest errno, copy order, allocation, cursor or work budget changes.
+`vector_input_copy_fault_is_a_prefix_not_an_invariant` checks zero, partial and
+full delivery and rejects an invalid token before invoking the copy callback.
+The guest-copy debt scanner and its ceilings are unchanged.

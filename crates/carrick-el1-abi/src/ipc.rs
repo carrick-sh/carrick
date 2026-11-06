@@ -87,7 +87,7 @@
 //! aarch64 4 KiB pages, `carrick_abi::LINUX_PAGE_SIZE`).
 
 mod vectors;
-pub use vectors::{IPC_MAX_IOVECS, VectorImportError};
+pub use vectors::{IPC_MAX_IOVECS, VectorImportError, VectorInputInvariant};
 
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
