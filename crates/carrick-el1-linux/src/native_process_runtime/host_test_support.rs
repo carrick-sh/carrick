@@ -4092,7 +4092,7 @@ fn native_exec_successor_reaps_its_fork_child() {
 
 #[cfg(test)]
 #[test]
-fn portal_wait_cancellation_resumes_exact_native_service_waiter() {
+fn portal_wait_terminal_cancellation_resumes_exact_native_service_waiter() {
     use carrick_guest_arch::ProcessContext;
     let fixture = native_exec_fixture();
     let mut service = fixture.service();
@@ -4157,6 +4157,30 @@ fn portal_wait_cancellation_resumes_exact_native_service_waiter() {
         fixture.zone.record(fixture.record.id).claim(),
         carrick_sched_core::Claim::Parked { .. }
     ));
+    fixture
+        .runtime
+        .cancel_service(fixture.record, fixture.slot, &mut service)
+        .unwrap();
+    assert_eq!(
+        fixture
+            .zone
+            .object_queue_census(enrollment.key().index())
+            .unwrap()
+            .waiters,
+        1,
+        "an interrupt cannot cancel a committed CarrierWork wait",
+    );
+    assert!(
+        matches!(
+            fixture.zone.record(fixture.record.id).claim(),
+            carrick_sched_core::Claim::Parked { .. }
+        ),
+        "the committed service must not become runnable before terminal cancellation"
+    );
+    fixture
+        .page
+        .process_exit_custody()
+        .publish_cancellation(carrick_core::terminal::ProcessCancellation::FatalSignal);
     fixture
         .runtime
         .cancel_service(fixture.record, fixture.slot, &mut service)
