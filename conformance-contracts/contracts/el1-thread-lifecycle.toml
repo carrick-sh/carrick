@@ -79,6 +79,8 @@ embed = [
 # zone admission record has already been released. One control-wake batch is
 # applied per retained lifecycle page; this does not complete guest waits.
 vm_free = [
+  "carrick-el1-linux::aarch64_process_tests::arm_raw_exit_faulting_clear_tid_still_retires_adopted_and_unadopted",
+  "carrick-el1-linux::lifecycle::tests::exit_clear_tid_fault_wakes_the_queued_joiner_once",
   "carrick-el1-linux::aarch64_process_tests::arm_closed_gate_service_entry_retires_the_sibling_instead_of_busy",
   "carrick-el1-linux::aarch64_process_tests::arm_closed_gate_service_entry_cancels_retained_ipc_before_retirement",
   "carrick-el1-linux::native_process_runtime::host_test_support::native_service_duplicate_custody_is_an_invariant_at_bridge_settlement",

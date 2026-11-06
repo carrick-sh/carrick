@@ -6141,6 +6141,49 @@ fn arm_raw_exit_decline_after_membership_reservation_restores_live() {
 }
 
 #[test]
+fn arm_raw_exit_faulting_clear_tid_still_retires_adopted_and_unadopted() {
+    use carrick_el1_abi::Lifecycle;
+    for unadopted in [false, true] {
+        let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+        let (control, record) = imported_thread_with_identity(fixture, |_| {});
+        let mut service = fixture.process_service();
+        fixture
+            .enter(
+                fixture.control,
+                fixture_ttbr0(fixture),
+                &mut service,
+                |_| (),
+            )
+            .unwrap();
+        if unadopted {
+            assert!(fixture.zone.mark_native_owned(record.id));
+        }
+        run_as(fixture, 42, 12, 102, control);
+        assert_eq!(
+            fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+            record.id
+        );
+        control.set_clear_child_tid(u64::MAX);
+        let entry = control.entry().unwrap();
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        frame.x[8] = 93;
+        // A noncanonical user range is permanently invalid, not demand backing.
+        let route = arm_call(fixture, control, &mut service, &mut frame);
+        assert_eq!(
+            route.unwrap(),
+            carrick_personality_linux::dispatch::CompletionRoute::Suspended
+        );
+        assert_eq!(fixture.page.live(), 1, "unadopted={unadopted}");
+        assert_eq!(control.clear_child_tid(), 0);
+        assert!(matches!(
+            fixture.page.state(entry.index()),
+            Some((_, carrick_el1_abi::EntryState::ExitedInZone))
+        ));
+        assert!(!control.host_exit_requested());
+    }
+}
+
+#[test]
 fn arm_two_live_threads_exit_group_ends_group_with_status() {
     use carrick_el1_abi::Lifecycle;
     #[derive(Clone, Copy, Debug)]

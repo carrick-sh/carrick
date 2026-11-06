@@ -1562,6 +1562,38 @@ fn exit_of_a_born_thread_clears_cleartid_wakes_the_joiner_and_runs_it() {
 }
 
 #[test]
+fn exit_clear_tid_fault_wakes_the_queued_joiner_once() {
+    let mut w = World::new(LifecycleHatches::ON);
+    let word = GuestUserValue::new(0_u32);
+    let mut frame = clone_then_join(&mut w, &word);
+    let mut user = FaultingUser {
+        deny_out: vec![word.arg()],
+        ..Default::default()
+    };
+    let wakes = w.zone.counters.el1_wakes.load(Ordering::Relaxed);
+    frame.x[8] = SYS_EXIT as u64;
+    frame.x[0] = 3;
+    assert_eq!(
+        serve_directly(&mut w, &mut frame, &mut user),
+        Some(Action::Served)
+    );
+    assert_eq!(
+        word.get(),
+        CHILD_VISIBLE,
+        "failed clear leaves user bytes alone"
+    );
+    assert_eq!(w.page().live(), 1);
+    assert_eq!(w.venue.child_slot(0).clear_child_tid(), 0);
+    assert_eq!(w.task().execution.task.load(Ordering::Relaxed), PARENT_TID);
+    assert_eq!(frame.x[0], 0, "the queued joiner was woken");
+    assert_eq!(
+        w.zone.slot(SLOT).queued(),
+        0,
+        "joiner is selected exactly once"
+    );
+}
+
+#[test]
 fn exit_keeps_a_migrated_host_job_while_the_other_process_exits_in_zone() {
     let mut hosted = World::new(LifecycleHatches::ON);
     let mut peer = World::new(LifecycleHatches::ON);
