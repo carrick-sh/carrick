@@ -16,7 +16,12 @@ pub fn decode_x86_64(native: u64, mut args: [u64; 6], stack: u64) -> CanonicalCa
     if native == 56 {
         args.swap(3, 4);
     }
-    let canonical = if native == 33 {
+    let canonical = if native == 21 {
+        // Legacy access has no asm-generic ordinal or matching argument shape.
+        let (canonical, normalized) = carrick_syscall_abi::syscall_x86_64::normalize_access(args);
+        args = normalized;
+        canonical.raw()
+    } else if native == 33 {
         // dup2 has no canonical Linux ordinal: preserve its no-flags and
         // oldfd == newfd semantics under the existing private x86 ordinal.
         args = [args[0], args[1], 0, 0, 0, 0];
@@ -135,6 +140,14 @@ mod decode_tests {
         assert_eq!(call.canonical.raw(), crate::lifecycle::SYS_CLONE as u64);
         assert_eq!(call.args, [17, 0, 0, 0, 0, 0]);
         assert_eq!(call.native.raw(), 57);
+    }
+
+    #[test]
+    fn x86_access_normalizes_to_faccessat_without_flags() {
+        let call = decode_x86_64(21, [0x1234, 4, 91, 92, 93, 94], 0x8000);
+        assert_eq!(call.canonical, crate::crossing::nr::FACCESSAT);
+        assert_eq!(call.args, [(-100_i64) as u64, 0x1234, 4, 0, 0, 0]);
+        assert_eq!(call.native.raw(), 21);
     }
 
     #[test]

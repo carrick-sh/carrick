@@ -2913,7 +2913,7 @@ pub fn errno_name(e: LinuxErrno) -> Option<&'static str> {
         .find(|(value, _)| *value == e)
         .map(|(_, name)| *name)
 }
-pub const LINUX_AT_FDCWD: u64 = (-100_i64) as u64;
+pub use carrick_syscall_abi::LINUX_AT_FDCWD;
 pub const LINUX_AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 pub const LINUX_AT_SYMLINK_FOLLOW: u64 = 0x400;
 /// Request an identity-only file handle that need not be decodable by

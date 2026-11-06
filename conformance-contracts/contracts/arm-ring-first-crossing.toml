@@ -5,7 +5,7 @@
 schema_version = 1
 id = "kernel.el1.arm-ring-first-crossing"
 title = "Ring-first refusal preserves ISA policy, family work and completion transport"
-guest_surfaces = ["syscall:getuid", "syscall:getpid", "syscall:clock_gettime", "syscall:exit", "syscall:exit_group", "syscall:mmap", "syscall:clone", "syscall:wait4", "syscall:rt_sigreturn", "vmm:hvf", "entry:x86"]
+guest_surfaces = ["syscall:openat", "syscall:faccessat", "syscall:writev", "syscall:getuid", "syscall:getpid", "syscall:clock_gettime", "syscall:exit", "syscall:exit_group", "syscall:mmap", "syscall:clone", "syscall:wait4", "syscall:rt_sigreturn", "vmm:hvf", "entry:x86"]
 semantic_authority = ["man 2 _exit", "man 2 exit_group", "man 2 mmap", "man 2 waitpid", "https://man7.org/linux/man-pages/man2/signalfd.2.html", "docs/design/arm-ring-first-flip.md"]
 fixture = "fixtures/linux-aarch64-hello/src/ring_first.rs"
 scale_points = [1]
@@ -25,7 +25,10 @@ unported calls; family fallback, owed work and completion handback preserve
 existing authority. x86 policy never reads an ARM aperture and counts native
 ordinals. Zero aperture storage enforces strict; explicit opt-out, persistence
 and the typed runtime API retain policy. One classified constant-time crossing
-table agrees with both exhaustive 0..=512 ISA checks. Aperture
+table agrees with both exhaustive 0..=512 ISA checks. x86 loader file
+crossings openat, faccessat (including legacy access) and writev use the same
+shared host dispatcher as ARM. Legacy access normalization preserves its
+native ordinal and clears flags and unused operands. Aperture
 control geometry is compile-time disjoint from service-copy descriptors and
 the MM portal, and included in the image layout hash. The aligned VM-free
 hatch fixture toggles control with slot-zero idle descriptors populated and
