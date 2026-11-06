@@ -654,7 +654,7 @@ const fn route_shared(ordinal: u64, allocator_control: u64) -> Family {
         216 => Family::Anonymous(AnonymousCall::Mremap),
         222 => Family::Anonymous(AnonymousCall::Mmap),
         226 => Family::Anonymous(AnonymousCall::Mprotect),
-        63 => Family::Read,
+        63 | 65 => Family::Read,
         64 | 66 => Family::Write,
         22 => Family::EpollWait,
         62 => Family::FileSeek,
@@ -1329,7 +1329,7 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
     // File fallback follows the IPC authority's explicit decline, never a
     // retained operation's handback or completion.
     result = match family {
-        Family::Read => pending.file_read().into(),
+        Family::Read if ordinal != crate::crossing::nr::READV.raw() => pending.file_read().into(),
         Family::Write if ordinal != crate::crossing::nr::WRITEV.raw() => {
             pending.file_write().into()
         }
@@ -1385,6 +1385,56 @@ mod ring_first_tests {
             route_aarch64(123, u64::MAX),
             Family::Sched(SchedCall::GetAffinity)
         );
+    }
+
+    #[test]
+    fn readv_dispatches_through_ipc_without_scalar_file_fallback() {
+        struct Reader {
+            calls: usize,
+            completion: FamilyCompletion,
+        }
+        impl<'a> PendingFamilies<'a> for Reader {
+            fn binding(&self) -> Option<ExecutionBinding> {
+                Some(ExecutionBinding {
+                    task: EntryTaskKey::from_raw(1),
+                    generation: SnapshotGeneration::from_raw(1),
+                    mm: EntryMmKey::from_raw(1),
+                    thread_generation: EntryThreadGeneration::from_raw(1),
+                })
+            }
+            fn crossing_set(&self) -> HostCrossingSet {
+                HostCrossingSet::Aarch64
+            }
+            fn original_argument0(&self) -> u64 {
+                1
+            }
+            fn install_result(&mut self, _: SyscallResult) {
+                panic!("the IPC reader owns its frame result")
+            }
+            fn ipc_available(&self) -> bool {
+                true
+            }
+            fn read(&mut self) -> FamilyCompletion {
+                self.calls += 1;
+                self.completion
+            }
+            fn file_read(&mut self) -> FamilyCompletion {
+                panic!("a vector array is never a scalar file buffer")
+            }
+        }
+        for (completion, expected) in [
+            (FamilyCompletion::Complete(6), CompletionRoute::Served),
+            (FamilyCompletion::Forward, CompletionRoute::Forward),
+        ] {
+            let mut reader = Reader {
+                calls: 0,
+                completion,
+            };
+            // Classifier and fallback are exercised through the public entry.
+            let route = dispatch(crate::crossing::nr::READV.raw(), u64::MAX, &mut reader);
+            assert_eq!(route, expected);
+            assert_eq!(reader.calls, 1);
+        }
     }
 
     #[test]

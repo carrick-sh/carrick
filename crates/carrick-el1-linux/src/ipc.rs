@@ -376,7 +376,13 @@ pub fn serve_ipc_with_signals<C: ThreadCpu, U: UserWord, M: UserCopy>(
     interrupt: &mut dyn FnMut() -> bool,
 ) -> (IpcServed, bool) {
     let nr = frame.x[8] as usize;
-    if nr != SYS_READ && nr != SYS_WRITE && nr != 66 && nr != SYS_EPOLL_PWAIT {
+    if nr != SYS_READ && nr != SYS_WRITE && nr != 65 && nr != 66 && nr != SYS_EPOLL_PWAIT {
+        return (IpcServed::Forward, false);
+    }
+    // Legacy handback prepares a contiguous output at op.buf, which for
+    // readv names the header array. Scatter output needs the native owner's
+    // retained in-ring continuation; decline before lookup, pins or effects.
+    if nr == 65 && !native_signals {
         return (IpcServed::Forward, false);
     }
     let (token, op, resumed) = match sched.take_object_operation() {
@@ -601,7 +607,7 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
     };
     let table = TableId::from_raw(table);
     let fd = Fd(frame.x[0] as i32);
-    let reading = frame.x[8] as usize == SYS_READ;
+    let reading = frame.x[8] as usize == SYS_READ || frame.x[8] == 65;
     let fda = region.fd(EL1_WAIT);
     // A snapshot first (no retention): host-backed descriptions are never
     // pinned in EL1, so EL1 never holds a hold it could not release.
@@ -659,8 +665,8 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
         AccessMode::WriteOnly => !reading,
         AccessMode::Path => false,
     };
-    let vectored = frame.x[8] == 66;
-    if vectored && kind != IpcOpKind::PipeWrite {
+    let vectored = frame.x[8] == 65 || frame.x[8] == 66;
+    if vectored && !matches!(kind, IpcOpKind::PipeRead | IpcOpKind::PipeWrite) {
         release_pin(sched, OfdPin::from_raw(op.pin), region);
         return Admission::Forward;
     }
@@ -882,16 +888,16 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                 );
             }
         };
-        let vector_input = venue.region.has_vectors(&token).unwrap_or_else(|_| {
+        let vectored = venue.region.has_vectors(&token).unwrap_or_else(|_| {
             crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
         });
         let buf = op.buf.0;
-        let transferred = carrick_el1::substrate::ipc::transfer_with_input(
+        let transferred = carrick_el1::substrate::ipc::transfer_with_io(
             &mut guard,
             &mut op,
             &mut copy,
             |copy, at, dst| {
-                if vector_input {
+                if vectored {
                     match venue
                         .region
                         .copy_vector_input(&token, at, dst, |bytes, address| {
@@ -908,6 +914,27 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                     }
                 } else {
                     copy.copy_in(dst, buf.wrapping_add(at))
+                }
+            },
+            |copy, at, src| {
+                if vectored {
+                    let copied = venue
+                        .region
+                        .copy_vector_output(&token, at, src, |address, bytes| {
+                            copy.copy_out(address.0, bytes)
+                        })
+                        .unwrap_or_else(|_| {
+                            crate::dispatch::invalid_completion(
+                                crate::dispatch::NativeInvariant::EntryBinding,
+                            )
+                        });
+                    // Linux commits a pipe buffer only after its scatter
+                    // copy completes. A fault may have modified a preceding
+                    // vector, but that incomplete source buffer stays unread.
+                    // Earlier complete buffers retain their committed cursor.
+                    if copied == src.len() { copied } else { 0 }
+                } else {
+                    copy.copy_out(buf.wrapping_add(at), src)
                 }
             },
         );
@@ -2809,13 +2836,44 @@ mod tests {
     }
 
     #[test]
+    fn el1_ipc_readv_without_native_custody_declines_before_effects() {
+        let mut w = world();
+        let t = w.table(w.a_tid);
+        let (reader, writer, object) = w.pipe(t, NONBLOCK);
+        w.mem.write(MM, 0x100000, b"abcdef");
+        let mut f = syscall(SYS_WRITE, writer, 0x100000, 6, A_SVC);
+        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 6));
+        let headers = [0x100100u64, 2, 0x100200, 4]
+            .into_iter()
+            .flat_map(u64::to_ne_bytes)
+            .collect::<Vec<_>>();
+        w.mem.write(MM, 0x100300, &headers);
+        let storage = w.region.descriptor_allocations();
+        let mut f = syscall(65, reader, 0x100300, 2, A_SVC);
+        let before = f;
+        assert_eq!(w.call(&mut f), IpcServed::Forward);
+        assert_eq!((f.x, f.elr), (before.x, before.elr));
+        assert_eq!(w.mem.read(MM, 0x100300, headers.len()), headers);
+        assert_eq!(w.region.descriptor_allocations(), storage);
+        assert_eq!(
+            w.region
+                .lock(object, &HostWait)
+                .unwrap()
+                .pipe()
+                .unwrap()
+                .unread_bytes(),
+            6
+        );
+    }
+
+    #[test]
     fn el1_ipc_readv_scatters_and_consumes_each_byte_once() {
         let mut w = world();
         let t = w.table(w.a_tid);
         let (reader, writer, _) = w.pipe(t, NONBLOCK);
         w.mem.write(MM, 0x100000, b"abcdef");
         let mut f = syscall(SYS_WRITE, writer, 0x100000, 6, A_SVC);
-        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 6));
+        assert_eq!((w.call_with_owner(&mut f, true), f.x[0]), (RETURNED, 6));
         let headers = [0x100100u64, 2, 0, 0, 0x100200, 4]
             .into_iter()
             .flat_map(u64::to_ne_bytes)
@@ -2823,13 +2881,45 @@ mod tests {
         w.mem.write(MM, 0x100300, &headers);
         let storage = w.region.descriptor_allocations();
         let mut f = syscall(65, reader, 0x100300, 3, A_SVC);
-        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 6));
+        assert_eq!((w.call_with_owner(&mut f, true), f.x[0]), (RETURNED, 6));
         assert_eq!(w.mem.read(MM, 0x100100, 2), b"ab");
         assert_eq!(w.mem.read(MM, 0x100200, 4), b"cdef");
         assert_eq!(w.region.descriptor_allocations(), storage);
         let mut f = syscall(SYS_READ, reader, 0x100100, 1, A_SVC);
         assert_eq!((w.call(&mut f), f.x[0] as i64), (RETURNED, linux::EAGAIN));
         assert_eq!(host_calls(&w), 0);
+    }
+
+    #[test]
+    fn el1_ipc_readv_payload_fault_preserves_the_incomplete_pipe_buffer() {
+        // Native x86 Linux oracle: a fault in the second vector may modify
+        // the first destination, but consumes only complete pipe buffers.
+        for prefix in [0usize, 4096] {
+            let mut w = world();
+            let t = w.table(w.a_tid);
+            let (reader, writer, _) = w.pipe(t, NONBLOCK);
+            let mut payload = std::vec![b'x'; prefix];
+            payload.extend_from_slice(b"abcdef");
+            w.mem.write(MM, 0x100000, &payload);
+            let mut f = syscall(SYS_WRITE, writer, 0x100000, payload.len() as u64, A_SVC);
+            assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, payload.len() as u64));
+            w.mem.map(MM, 0x200000, 8192);
+            let headers = [0x200000u64, prefix as u64 + 2, 0x400000, 4]
+                .into_iter()
+                .flat_map(u64::to_ne_bytes)
+                .collect::<Vec<_>>();
+            w.mem.write(MM, 0x100000, &headers);
+            let storage = w.region.descriptor_allocations();
+            let mut f = syscall(65, reader, 0x100000, 2, A_SVC);
+            assert_eq!(w.call_with_owner(&mut f, true), RETURNED);
+            assert_eq!(f.x[0] as i64, if prefix == 0 { -14 } else { prefix as i64 });
+            assert_eq!(w.mem.read(MM, 0x200000, prefix + 2), payload[..prefix + 2]);
+            let mut f = syscall(SYS_READ, reader, 0x100200, 6, A_SVC);
+            assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 6));
+            assert_eq!(w.mem.read(MM, 0x100200, 6), b"abcdef");
+            assert_eq!(w.region.descriptor_allocations(), storage);
+            assert_eq!(host_calls(&w), 0);
+        }
     }
 
     #[test]
@@ -3203,15 +3293,25 @@ mod tests {
 
     #[test]
     fn two_live_process_pipe_owner_wait_retains_exact_bytes_and_cursor() {
-        pipe_owner_wait_with_peer(false);
+        pipe_owner_wait_with_peer(false, false);
     }
 
     #[test]
     fn two_live_process_pipe_owner_wait_returns_delivered_prefix_if_peer_drains() {
-        pipe_owner_wait_with_peer(true);
+        pipe_owner_wait_with_peer(true, false);
     }
 
-    fn pipe_owner_wait_with_peer(peer_drains: bool) {
+    #[test]
+    fn two_live_process_pipe_readv_owner_wait_retains_headers_and_cursor() {
+        pipe_owner_wait_with_peer(false, true);
+    }
+
+    #[test]
+    fn two_live_process_pipe_readv_owner_wait_returns_prefix_if_peer_drains() {
+        pipe_owner_wait_with_peer(true, true);
+    }
+
+    fn pipe_owner_wait_with_peer(peer_drains: bool, vectored: bool) {
         use crate::mm_portal::test_support::{IPA, Region, Tables, VA, nodes, residency};
         use crate::mm_portal::{GuestVa, MmError, MmPortal, TransferIntent};
         use carrick_core_abi::{
@@ -3308,7 +3408,16 @@ mod tests {
                 self.wait.take()
             }
         }
-        let mut frame = syscall(SYS_READ, read, VA, 8192, A_SVC);
+        let mut frame = if vectored {
+            let headers = [VA, 4096, 0, 0, VA + 4096, 4096]
+                .into_iter()
+                .flat_map(u64::to_ne_bytes)
+                .collect::<Vec<_>>();
+            w.mem.write(MM, 0x90000, &headers);
+            syscall(65, read, 0x90000, 3, A_SVC)
+        } else {
+            syscall(SYS_READ, read, VA, 8192, A_SVC)
+        };
         {
             let mut check = |at, len| {
                 if at == VA + 4096 && !raised {
@@ -3370,12 +3479,25 @@ mod tests {
                 tables: &w.tables,
             };
             assert_eq!(
-                serve_ipc(&mut sched, &mut frame, &venue, &mut user),
+                serve_ipc_with_signals(
+                    &mut sched,
+                    &mut frame,
+                    &venue,
+                    &mut user,
+                    vectored,
+                    &mut || false
+                )
+                .0,
                 SWITCHED,
                 "an owner refusal after a delivered page must park with its cursor"
             );
         }
         drop(view);
+        if vectored {
+            // The sibling changes the guest array while output waits. Resume
+            // must keep the imported headers and the delivered-byte cursor.
+            w.mem.write(MM, 0x90000, &[0; 48]);
+        }
         assert_eq!(w.mem.read(MM, VA, 4096), pattern[..4096]);
         assert_eq!(
             w.region
@@ -3399,7 +3521,10 @@ mod tests {
         assert_eq!(w.call(&mut frame), SWITCHED);
         reenter(&mut frame, A_SVC);
         let delivered = if peer_drains { 4096 } else { 8192 };
-        assert_eq!((w.call(&mut frame), frame.x[0]), (RETURNED, delivered));
+        assert_eq!(
+            (w.call_with_owner(&mut frame, vectored), frame.x[0]),
+            (RETURNED, delivered)
+        );
         assert_eq!(
             w.mem.read(MM, VA, delivered as usize),
             pattern[..delivered as usize]

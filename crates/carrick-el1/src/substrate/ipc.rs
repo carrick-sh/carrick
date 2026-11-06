@@ -140,7 +140,22 @@ pub fn transfer_with_input<U: UserCopy>(
     guard: &mut IpcObjectGuard<'_>,
     op: &mut IpcOperation,
     copy: &mut PrefixCopy<'_, U>,
+    input: impl FnMut(&mut PrefixCopy<'_, U>, u64, &mut [u8]) -> usize,
+) -> Result<(StepStatus, WakeSet), IpcError> {
+    let buf = op.buf.0;
+    transfer_with_io(guard, op, copy, input, |copy, at, src| {
+        copy.copy_out(buf.wrapping_add(at), src)
+    })
+}
+
+/// One transfer transaction with retained logical input and output ranges.
+/// Both directions commit only the prefix delivered by their guarded copier.
+pub fn transfer_with_io<U: UserCopy>(
+    guard: &mut IpcObjectGuard<'_>,
+    op: &mut IpcOperation,
+    copy: &mut PrefixCopy<'_, U>,
     mut input: impl FnMut(&mut PrefixCopy<'_, U>, u64, &mut [u8]) -> usize,
+    mut output: impl FnMut(&mut PrefixCopy<'_, U>, u64, &[u8]) -> usize,
 ) -> Result<(StepStatus, WakeSet), IpcError> {
     let buf = op.buf.0;
     let mut wake = WakeSet::default();
@@ -151,10 +166,10 @@ pub fn transfer_with_input<U: UserCopy>(
     let status = match op.kind {
         IpcOpKind::PipeRead => {
             let mut p = guard.pipe()?;
-            let base = buf.wrapping_add(op.progress.written);
+            let base = op.progress.written;
             let mut at = 0u64;
             let step = p.read_with(op.progress.remaining(), |chunk| {
-                let n = copy.copy_out(base.wrapping_add(at), chunk);
+                let n = output(copy, base + at, chunk);
                 at += n as u64;
                 n
             });
