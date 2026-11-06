@@ -132,3 +132,27 @@ execution capability. In particular, x86's `ipc: None` is an explicit remaining
 admission gap, not a second IPC authority or a claim of pipe support. The real
 KVM witness and counted-writev invariant remain unchanged until those parts
 are implemented.
+
+## Execution-owned queue completion
+
+The generic execution capability also owns detached queue completion delivery.
+`IpcExecution::deliver_completion` is required: the shared observation and
+operation-slot release paths cannot silently choose the ARM task aperture.
+ARM's execution implementation retains its existing completion transport.
+Native operation retirement receives that callback explicitly from its service
+owner, including cancellation after retained copyout. Object state, release
+revision publication and queue membership remain with the shared owners.
+
+`ipc_operation_completion_uses_execution_transport` drives the production
+transfer entry against an eventfd and an exhausted operation arena with a real
+release waiter. Before wiring the callback, the call returns eight bytes and
+wakes its waiter but fails `retirement bypassed the execution transport`.
+This is a VM-free transport witness, not x86 venue acceptance. Its initial
+unmapped simulated output failed with errno 14; that fixture error was
+corrected before recording the transport red result.
+
+This step does not supply the x86 execution adapter, IPC mapping or descriptor
+admission. Native final-description release still uses the existing shared
+scheduler wake helper, whose task publication must be bound to x86's layout
+when the x86 venue is integrated. Pipe creation and the real-KVM served
+fixture remain unresolved; no x86 pipe-service claim is made.

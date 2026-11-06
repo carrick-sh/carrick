@@ -1448,18 +1448,21 @@ fn notify_operation_release<C: carrick_el1_abi::EntryContext>(
     region: &IpcRegion<'_>,
     zone: &carrick_sched_core::ZoneTables<C>,
     slot: carrick_el1_abi::SlotId,
+    completion: &dyn Fn(carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>),
 ) {
     zone.notify_ipc_operation_slot_release(
         region.operation_slot_generation(),
         carrick_sched_core::Waker::El1 { slot },
-        &|owned| crate::sched::object_wait::deliver_completion(zone, slot, owned),
+        completion,
     );
 }
 
 /// Retire the operation record and drop its pin.
 fn finish<E: IpcExecution>(sched: &mut E, token: IpcOpToken, region: &IpcRegion<'_>) {
     if let Ok(op) = region.finish_operation(token, || {
-        notify_operation_release(region, sched.zone(), sched.slot())
+        notify_operation_release(region, sched.zone(), sched.slot(), &|owned| {
+            sched.deliver_completion(owned)
+        })
     }) {
         release_pin(sched, OfdPin::from_raw(op.pin), region);
     }
@@ -1474,6 +1477,7 @@ pub(crate) fn retire_native_operation<C: carrick_el1_abi::EntryContext>(
     task: &CurrentTask,
     binding: carrick_el1_abi::ExecutionBinding,
     operation: carrick_sched_core::object_wait::OperationToken,
+    completion: &dyn Fn(carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>),
 ) -> Result<usize, crate::native_process_runtime::NativeProcessError> {
     use crate::native_process_runtime::NativeProcessError;
     let token = from_sched_token(operation).ok_or(NativeProcessError::Quarantined)?;
@@ -1484,7 +1488,9 @@ pub(crate) fn retire_native_operation<C: carrick_el1_abi::EntryContext>(
         return Err(NativeProcessError::Quarantined);
     }
     let op = region
-        .finish_operation(token, || notify_operation_release(region, zone, slot))
+        .finish_operation(token, || {
+            notify_operation_release(region, zone, slot, completion)
+        })
         .map_err(|_| NativeProcessError::Stale)?;
     let release = region
         .fd(EL1_WAIT)
@@ -1613,7 +1619,9 @@ fn retain_native_operation<E: IpcExecution>(sched: &E, token: IpcOpToken) {
 fn finish_native<E: IpcExecution>(sched: &mut E, token: IpcOpToken, region: &IpcRegion<'_>) {
     let op = region
         .finish_operation(token, || {
-            notify_operation_release(region, sched.zone(), sched.slot())
+            notify_operation_release(region, sched.zone(), sched.slot(), &|owned| {
+                sched.deliver_completion(owned)
+            })
         })
         .unwrap_or_else(|_| {
             crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
@@ -2540,6 +2548,7 @@ mod tests {
                     &w.task,
                     binding,
                     to_sched_token(token).unwrap(),
+                    &|owned| sched.deliver_completion(owned),
                 )
                 .unwrap();
             } else {
