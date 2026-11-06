@@ -228,14 +228,18 @@ where
                 Err(carrick_core::personality::CopyOutcome::NotYet(request)) => {
                     slot.init_blocked(BlockedMask(thread_blocked.signals().bits()));
                     process.requeue_deliverable(sig, info, action);
-                    use carrick_personality_linux::lifecycle::{LifecycleOutcome, ProcessNative};
-                    match ProcessNative::wait_guest_copy(process, request) {
-                        LifecycleOutcome::Redispatch => return Some(CompletionRoute::Served),
-                        LifecycleOutcome::Transferred {
+                    use carrick_personality_linux::lifecycle::LifecycleOutcome;
+                    match process.wait_signal_frame_copy(request) {
+                        Ok(LifecycleOutcome::Redispatch) => {
+                            return deliver_signal_on_syscall_return(
+                                task, slot, process, frame, fpstate, machine,
+                            );
+                        }
+                        Ok(LifecycleOutcome::Transferred {
                             progress: carrick_core::Served::Idle,
                             ..
-                        } => return Some(CompletionRoute::Suspended),
-                        LifecycleOutcome::Returned { .. } => {
+                        }) => return Some(CompletionRoute::Suspended),
+                        Ok(LifecycleOutcome::Returned { .. }) => {
                             let _ = process.take_deliverable(thread_blocked);
                             return force_delivery_fault(
                                 task,
@@ -250,7 +254,7 @@ where
                                 },
                             );
                         }
-                        _ => return Some(CompletionRoute::InvalidCompletion),
+                        Ok(_) | Err(_) => return Some(CompletionRoute::InvalidCompletion),
                     }
                 }
                 Err(_) => {

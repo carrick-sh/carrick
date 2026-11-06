@@ -4783,7 +4783,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             access: carrick_guest_arch::Access::Write,
         };
         #[cfg(test)]
-        if crate::file::SIMULATE_COPYOUT_FAULT.with(|f| f.load(Ordering::Relaxed)) {
+        if crate::file::SIMULATE_COPYOUT_FAULT.with(|f| f.swap(false, Ordering::Relaxed)) {
             return carrick_core::personality::CopyOutcome::NotYet(request);
         }
         let Ok(mm) = self
@@ -4805,6 +4805,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ) => carrick_core::personality::CopyOutcome::NotYet(request),
             Err(_) => carrick_core::personality::CopyOutcome::Fault,
         }
+    }
+
+    pub fn wait_signal_frame_copy(
+        &mut self,
+        request: carrick_core::personality::GuestCopyRequest,
+    ) -> Result<carrick_personality_linux::lifecycle::LifecycleOutcome, NativeProcessError> {
+        self.prepare_user_return_copy(request)
     }
     #[inline(never)]
     fn suspend_adapter_operation(

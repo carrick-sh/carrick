@@ -854,6 +854,74 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
     }
 
+    /// Prepare memory needed by the final user-return checkpoint. Unlike a
+    /// syscall input, completion returns to the selected owner checkpoint and
+    /// must never replay the syscall whose result is already committed.
+    pub(super) fn prepare_user_return_copy(
+        &mut self,
+        request: carrick_core::personality::GuestCopyRequest,
+    ) -> Result<LifecycleOutcome, NativeProcessError> {
+        let mm = self
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .task(self.key)
+            .map_err(|_| NativeProcessError::Stale)?
+            .native()
+            .resources()
+            .mm
+            .clone();
+        let (operation, sequence, wait) = match self.service.prepare_owned_read(&mm, request) {
+            Ok(()) => return Ok(LifecycleOutcome::Redispatch),
+            Err(NativeProcessError::Fault) => {
+                return Ok(returned(carrick_syscall_abi::LINUX_EFAULT.guest_retval()));
+            }
+            Err(NativeProcessError::OwnerWait(wait)) => (
+                ServiceOperation::CarrierWork {
+                    entry: OwnerEntry::Syscall,
+                },
+                None,
+                Some(wait),
+            ),
+            Err(NativeProcessError::Busy) => (
+                ServiceOperation::CarrierWork {
+                    entry: OwnerEntry::Syscall,
+                },
+                None,
+                None,
+            ),
+            Err(NativeProcessError::Unsupported) => {
+                let (mut fault, sequence) = self
+                    .service
+                    .copyout_fault(request.address)
+                    .ok_or(NativeProcessError::Unsupported)?;
+                fault.access = request.access;
+                (ServiceOperation::Fault(fault), Some(sequence), None)
+            }
+            Err(error) => return Err(error),
+        };
+        let result = self.begin_service_inner(
+            operation,
+            sequence,
+            wait,
+            ServicePayload::Copyin,
+            ServiceCompletion::OwnerCheckpoint,
+        )?;
+        match result {
+            NativeResume::NoPending => Ok(LifecycleOutcome::Redispatch),
+            NativeResume::Returned(result) => Ok(LifecycleOutcome::Returned {
+                result,
+                work: false,
+            }),
+            NativeResume::Left(None) => Ok(LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                result: SyscallResult::new(0),
+            }),
+            _ => Err(NativeProcessError::Quarantined),
+        }
+    }
+
     pub fn begin_exec_stage_fault_service(
         &mut self,
         fault: carrick_guest_arch::FaultInfo,
