@@ -12,15 +12,13 @@ use carrick_abi::{
     LINUX_FUTEX_CMP_REQUEUE, LINUX_FUTEX_LOCK_PI, LINUX_FUTEX_PRIVATE_FLAG, LINUX_FUTEX_REQUEUE,
     LINUX_FUTEX_TID_MASK, LINUX_FUTEX_TRYLOCK_PI, LINUX_FUTEX_UNLOCK_PI, LINUX_FUTEX_WAIT,
     LINUX_FUTEX_WAIT_BITSET, LINUX_FUTEX_WAITV_MAX, LINUX_FUTEX_WAKE, LINUX_FUTEX_WAKE_BITSET,
-    LinuxErrno, LinuxFutexFlags,
+    LinuxFutexFlags,
 };
 use carrick_guest_mem::CurrentMmMemory;
 
 use super::outcome::{DispatchOutcome, SharedFutexTarget};
 use super::request::SyscallRequest;
-use super::{
-    duration_from_linux_timespec, linux_timeout_timespec_is_valid, read_timespec, read_u32,
-};
+use super::{duration_from_linux_timespec, linux_timeout_timespec_is_valid, read_timespec};
 use crate::compat::CompatReporter;
 
 /// Convert an ABSOLUTE futex deadline (FUTEX_WAIT_BITSET) to the remaining
@@ -232,11 +230,13 @@ pub(crate) fn dispatch_threaded_futex(
             | LINUX_FUTEX_UNLOCK_PI
             | LINUX_FUTEX_CMP_REQUEUE
     );
-    let word = match read_futex_word(memory, address) {
-        Ok(word) => word,
-        Err(errno) if needs_word => return DispatchOutcome::Errno { errno },
-        // WAKE / plain REQUEUE: the value is unused; proceed address-keyed.
-        Err(_) => 0,
+    let word = if needs_word {
+        match read_futex_word(memory, address) {
+            Ok(word) => word,
+            Err(refusal) => return *refusal,
+        }
+    } else {
+        0
     };
 
     if matches!(
@@ -333,7 +333,10 @@ pub(crate) fn dispatch_threaded_futex(
                 // `SharedFutexLocation::Mirror` and, when it IS needed, read the
                 // word FRESH (not the stale top-of-handler `word`).
                 if location.is_mirror() {
-                    let fresh = read_futex_word(memory, address).unwrap_or(word);
+                    let fresh = match read_futex_word(memory, address) {
+                        Ok(fresh) => fresh,
+                        Err(refusal) => return *refusal,
+                    };
                     // SAFETY: the wait address is a live 4-byte-aligned host mirror word.
                     unsafe {
                         (*(location.wait_addr().raw() as *const std::sync::atomic::AtomicU32))
@@ -468,14 +471,14 @@ pub(crate) fn dispatch_threaded_futex(
             // re-read mismatches → EAGAIN, no stale park). High-frequency Go
             // scheduler M park/unpark hit this window and intermittently hung.
             let wait = futex.prepare_wait(address);
-            match read_u32(memory, address) {
+            match read_futex_word(memory, address) {
                 Ok(reread) if reread != value => {
                     return DispatchOutcome::Errno {
                         errno: LINUX_EAGAIN,
                     };
                 }
                 Ok(_) => {}
-                Err(errno) => return DispatchOutcome::Errno { errno },
+                Err(refusal) => return *refusal,
             }
             DispatchOutcome::FutexWait { wait, timeout }
         }
@@ -642,8 +645,10 @@ pub(crate) fn dispatch_zone_futex(
                 // waiter can enqueue between the check and the requeue.
                 match read_futex_word(memory, address) {
                     Ok(current) if current == val3 => Ok(()),
-                    Ok(_) => Err(LINUX_EAGAIN),
-                    Err(errno) => Err(errno),
+                    Ok(_) => Err(Box::new(DispatchOutcome::Errno {
+                        errno: LINUX_EAGAIN,
+                    })),
+                    Err(refusal) => Err(refusal),
                 }
             });
             match result {
@@ -651,7 +656,7 @@ pub(crate) fn dispatch_zone_futex(
                     value: woken.len() as i64 + i64::from(moved),
                     woken,
                 },
-                Err(errno) => DispatchOutcome::Errno { errno },
+                Err(refusal) => *refusal,
             }
         }
         _ => DispatchOutcome::Errno {
@@ -767,7 +772,7 @@ pub(crate) fn dispatch_futex_waitv_args(
                     errno: LINUX_EAGAIN,
                 };
             }
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(refusal) => return *refusal,
         }
         entries.push(FutexWaitvEntry {
             address,
@@ -812,7 +817,7 @@ pub(crate) fn dispatch_futex_waitv_args(
                     return DispatchOutcome::returned_len_or_errno(index);
                 }
                 Ok(_) => {}
-                Err(errno) => return DispatchOutcome::Errno { errno },
+                Err(refusal) => return *refusal,
             }
             return DispatchOutcome::FutexWaitv {
                 wait,
@@ -828,7 +833,7 @@ pub(crate) fn dispatch_futex_waitv_args(
                 return DispatchOutcome::returned_len_or_errno(index);
             }
             Ok(_) => {}
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(refusal) => return *refusal,
         }
     }
     if let Some(timeout) = timeout {
@@ -856,19 +861,34 @@ pub(crate) fn dispatch_futex_waitv_args(
 pub(crate) fn read_futex_word(
     memory: &impl CurrentMmMemory,
     address: u64,
-) -> Result<u32, LinuxErrno> {
-    match read_u32(memory, address) {
-        Ok(word) => Ok(word),
-        Err(errno) => match memory.shared_futex_location(address) {
-            // SAFETY: a resolved shared host addr points into a live MAP_SHARED
-            // region in THIS process — the identical pointer `shared_futex_wait`
-            // reads at the wait site. `read_unaligned` avoids assuming stricter
-            // alignment than the guest futex ABI's 4-byte guarantee.
-            Some(location) => {
-                Ok(unsafe { (location.wait_addr().raw() as *const u32).read_unaligned() })
+) -> Result<u32, Box<DispatchOutcome>> {
+    let mut bytes = [0; 4];
+    match memory.read_into(address, &mut bytes) {
+        Ok(()) => Ok(u32::from_ne_bytes(bytes)),
+        Err(error) => {
+            // A pending exact-owner transfer is not evidence of a bad address.
+            // This read has no side effects: release its transfer and redispatch
+            // the original syscall after the existing owner dependency settles.
+            if let Some(refusal) = DispatchOutcome::from_owner_memory_error(error) {
+                return Err(Box::new(refusal));
             }
-            None => Err(errno),
-        },
+            match memory.shared_futex_location(address) {
+                Some(location) if location.wait_addr().raw().is_multiple_of(4) => {
+                    // SAFETY: the resolved location is a live aligned shared
+                    // word, as required by the existing shared wait/wake seam.
+                    // Atomic access avoids tearing against a guest update.
+                    let word = unsafe {
+                        std::sync::atomic::AtomicU32::from_ptr(
+                            location.wait_addr().raw() as *mut u32
+                        )
+                    };
+                    Ok(word.load(std::sync::atomic::Ordering::Acquire))
+                }
+                _ => Err(Box::new(DispatchOutcome::Errno {
+                    errno: LINUX_EFAULT,
+                })),
+            }
+        }
     }
 }
 
