@@ -2911,9 +2911,25 @@ impl<
         {
             let orig_x0 = frame.x[0];
             let mut sched = native_scheduler(zone, task, counters, zslot, &mut self.handoff);
-            let disposition = sched
-                .serve_futex(frame)
-                .map_or(ipc::IpcServed::Forward, ipc::IpcServed::from);
+            let served = sched.serve_futex_typed(frame);
+            let disposition = match served {
+                Ok(served) => served.map_or(ipc::IpcServed::Forward, ipc::IpcServed::from),
+                Err(carrick_core::personality::CopyOutcome::Fault) => {
+                    return FamilyCompletion::Complete(
+                        carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
+                    );
+                }
+                Err(carrick_core::personality::CopyOutcome::NotYet(request)) => {
+                    if self.process.is_none() {
+                        return FamilyCompletion::Forward;
+                    }
+                    let outcome = lifecycle::LifecycleNative::wait_guest_copy(self, request);
+                    return carrick_personality_linux::lifecycle::lifecycle_effect(&outcome);
+                }
+                Err(carrick_core::personality::CopyOutcome::Done) => {
+                    invalid_completion(NativeInvariant::EntryBinding)
+                }
+            };
             return carrick_personality_linux::dispatch::transfer_effect(
                 &task.linux,
                 orig_x0,

@@ -365,22 +365,69 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             carrick_sched_core::RecordRef,
         ) -> Option<carrick_guest_arch::NativeReturnWord>,
     ) -> Option<Served> {
+        self.wait_word_with(
+            frame,
+            mm,
+            uaddr,
+            bitset,
+            expected,
+            deadline,
+            mismatch_result,
+            timeout_result,
+            interrupt,
+            |user, task, address| {
+                user.read_u32(task, address)
+                    .ok_or(carrick_core::personality::atomic_word_refusal(
+                        carrick_guest_arch::UserVa::new(address),
+                        carrick_guest_arch::Access::Read,
+                    ))
+            },
+        )
+        .ok()
+        .flatten()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn wait_word_with(
+        &mut self,
+        frame: &mut TrapFrame,
+        mm: u64,
+        uaddr: u64,
+        bitset: u32,
+        expected: u32,
+        deadline: Option<u64>,
+        mismatch_result: u64,
+        timeout_result: u64,
+        interrupt: impl FnOnce(
+            carrick_sched_core::RecordRef,
+        ) -> Option<carrick_guest_arch::NativeReturnWord>,
+        read_word: impl FnOnce(
+            &U,
+            &CurrentTask,
+            u64,
+        ) -> Result<u32, carrick_core::personality::CopyOutcome>,
+    ) -> Result<Option<Served>, carrick_core::personality::CopyOutcome> {
         let (zone, slot) = (self.zone, self.slot);
         let guard = zone.short_lock(
             ZoneTables::bucket_of_with_context(mm, uaddr),
             &ShortLockSpin,
         );
-        let Some(word) = self.user.read_u32(self.task, uaddr) else {
-            drop(guard);
-            return None;
+        let word = match read_word(self.user, self.task, uaddr) {
+            Ok(word) => word,
+            Err(refusal) => {
+                drop(guard);
+                return Err(refusal);
+            }
         };
         if word != expected {
             drop(guard);
             frame.x[0] = mismatch_result;
-            return Some(Served::Returned { switched: false });
+            return Ok(Some(Served::Returned { switched: false }));
         }
         let fresh = zone.slot(slot).current().is_none();
-        let record = self.current_record().ok()?;
+        let Ok(record) = self.current_record() else {
+            return Ok(None);
+        };
         let Some(start) = carrick_core::entry::prepare_handoff(
             carrick_core::entry::binding(&self.task.execution, &self.task.mm),
             carrick_el1_abi::BornInZoneSource { zone, slot },
@@ -390,7 +437,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             if fresh {
                 zone.discard_unpublished(slot, record);
             }
-            return None;
+            return Ok(None);
         };
         // SAFETY: this vCPU runs the thread `record` holds (a fresh home
         // record, or the switched-in `OnCpu` one); nobody else may touch it
@@ -404,7 +451,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             if fresh {
                 zone.discard_unpublished(slot, record);
             }
-            return None;
+            return Ok(None);
         }
         if zone
             .enqueue(&guard, record, seq, mm, uaddr, bitset, 0)
@@ -415,7 +462,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             if fresh {
                 zone.discard_unpublished(slot, record);
             }
-            return None;
+            return Ok(None);
         }
         #[cfg(any(test, feature = "host-test"))]
         self.cpu.after_wait_enqueue();
@@ -425,7 +472,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             zone.withdraw_guest_park(&guard, record);
             drop(guard);
             frame.x[0] = result.0;
-            return Some(Served::Returned { switched: false });
+            return Ok(Some(Served::Returned { switched: false }));
         }
         zone.set_deadline(record, deadline.unwrap_or(0));
         let receipt = carrick_core::entry::publish_handoff_park(
@@ -438,13 +485,13 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             if fresh {
                 zone.discard_unpublished(slot, record);
             }
-            return None;
+            return Ok(None);
         }
         drop(guard);
         self.record_handoff(receipt);
         zone.clear_current(slot);
         zone.counters.el1_parks.fetch_add(1, Ordering::Relaxed);
-        Some(self.run_next(frame, timeout_result))
+        Ok(Some(self.run_next(frame, timeout_result)))
     }
 
     /// The running thread parked (or exited in the zone): run the next

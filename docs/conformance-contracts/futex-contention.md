@@ -49,32 +49,43 @@ equivalent or stronger failure detection.
 
 ## Futex word copy migration (#1703)
 
-The typed `carrick_core::personality::UserCopy` byte-transfer interface from
-#1691 does not guarantee single-copy atomic word access. Its ARM adapter uses
-`file::ValidatedCopy`, whose guarded transfers loop over individual bytes.
-Those transfers cannot replace `HardwareUserWord::read_u32`, which uses one
-guarded 32-bit load: another live thread may change the futex word concurrently.
-Four independently loaded bytes can form a value that neither thread stored.
+Futex operands require aligned atomic word access. The neutral `UserCopy`
+interface therefore has `atomic_load_u32` and `atomic_compare_exchange_u32`,
+both returning the existing `CopyOutcome`. Loads acquire; successful exchanges
+acquire/release, while mismatches acquire and report the observed value as
+`Done`. A refusal changes neither the output argument nor the futex word.
+Byte-only providers defer atomic operands to the exact memory owner; they must
+never synthesize a word from independent byte transfers.
 
-The director's carrick-87 decision authorizes extending that same `UserCopy`
-interface with an aligned 32-bit atomic load and compare-exchange, both
-returning the existing `CopyOutcome`. This resolves the interface-design
-blocker recorded by the initial WIP; it does not require another outcome type
-or another approval before implementation. ARM and x86 must
-retain their ISA word accesses; no second refusal type or byte-copy wrapper
-can substitute for that guarantee. A `NotYet` result must leave the bucket
-lock before entering the existing owner-memory wait, then repeat the value
-comparison and enrollment together under that lock. Only a proven fault may
-return errno 14. Address-only wake operations must not acquire a word-read
-requirement.
+`ValidatedCopy` implements these operations with permission checks and guarded
+ISA instructions on ARM and x86. ARM exclusive accesses temporarily lower PAN
+only around the guarded operand and restore it on success and fault. x86 uses
+LOCK CMPXCHG with the existing task-local fixup and SMAP cleanup. Host-native
+fixtures use Rust atomics, including the scheduler's hardware-word adapter.
+The stopped-host x86 lane uses atomics on its retained eager aperture.
 
-The x86 stopped-host `NativeLane` currently treats `wait_guest_copy` as an
-invariant failure because its aperture is eagerly provisioned. It needs an
-owner-memory suspension adapter before it can accept `NotYet`. Shared futex,
-requeue and PI word accesses also use host dispatch rather than the private
-in-ring scheduler; migrating only that scheduler does not cover those calls
-or retire the host futex copy-debt entry.
+The ARM private WAIT/WAIT_BITSET path compares under the futex bucket lock.
+A typed refusal releases that lock before entering the existing native
+owner-memory wait. Resumption retains the original syscall arguments and
+repeats comparison and enrollment under the bucket lock. Only a proven fault
+may return errno 14. Address-only wakes acquire no word-read requirement.
 
-This analysis supplies no red/green execution witness. The
-two-live-thread, unbacked-word witness and signed acceptance remain required;
-the futex word migration is not implemented by this note.
+`futex_unbacked_word_waits_for_owner_with_two_live_threads` adopts a sibling
+through its first real native syscall, then withholds the waiter's physical
+word once. The production dispatcher must suspend on the exact owner's Gate
+notification rather than forward. After release, a changed word must fail the
+original comparison with errno 11; a matching word enrolls once, one counted
+sibling wake completes it with zero, and a second wake returns zero. The
+fixture retains both live members throughout. Physical word availability and
+the physical preparation refusal are controlled; the process graph, owner
+notification, continuation and futex scheduler run their production code.
+`atomic_copy_tests` additionally checks output preservation, mismatch and
+successful exchange, and invalid ranges without touching an operand.
+
+This is still a partial migration. Shared futex, host requeue and PI word
+accesses remain on host dispatch and have not moved to this interface. The
+stopped-host x86 lane still has no owner-memory suspension venue because its
+aperture is eagerly provisioned. The futex copy-debt counter has not been
+retired. Robust-futex updates remain outside this slice (#1697). Signed
+execution, Docker comparison and the director's scoreboard rerun remain
+required before the whole slice can be accepted.
