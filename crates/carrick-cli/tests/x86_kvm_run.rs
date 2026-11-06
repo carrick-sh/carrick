@@ -45,14 +45,86 @@ fn empty_image_archive() -> Vec<u8> {
     archive
 }
 
-// This exercises image config, PATH lookup and shebang argv rewriting through
-// the production CLI boundary, without depending on a registry or libc startup.
+fn compile_dynamic_assembly(
+    fixture: &str,
+    elf: &std::path::Path,
+    interp_and_dep: Option<(&str, &std::path::Path)>,
+) {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(fixture);
+    let mut cmd = Command::new("cc");
+    cmd.timeout(Duration::from_secs(15));
+    if let Some((interp, dep)) = interp_and_dep {
+        cmd.args([
+            "-nostdlib",
+            "-no-pie",
+            &format!("-Wl,--dynamic-linker={interp}"),
+            "-Wl,--no-as-needed",
+            "-Wl,--build-id=none",
+            "-o",
+        ])
+        .arg(elf)
+        .arg(&source)
+        .arg(dep);
+    } else {
+        cmd.args([
+            "-nostdlib",
+            "-shared",
+            "-Wl,-e,_start",
+            "-Wl,--build-id=none",
+            "-o",
+        ])
+        .arg(elf)
+        .arg(&source);
+    }
+    let compile = cmd.output().expect("compile dynamic x86 assembly fixture");
+    assert!(
+        compile.status.success(),
+        "compile dynamic x86 assembly fixture {}: cc status: {}; stdout: {}; stderr: {}",
+        source.display(),
+        compile.status,
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    if let Some((interp, _)) = interp_and_dep {
+        let bytes = std::fs::read(elf).unwrap();
+        assert!(
+            bytes.windows(interp.len()).any(|w| w == interp.as_bytes()),
+            "linked ELF must carry PT_INTERP {interp}"
+        );
+    }
+}
+
+// This exercises image config, PATH lookup, shebang argv rewriting, PT_INTERP
+// loading, and Docker 126/127 entrypoint error classification through the
+// production CLI boundary, without depending on a registry or libc startup.
 #[test]
 fn image_path_and_shebang_entrypoints_use_the_shared_resolver() {
     assert!(std::path::Path::new("/dev/kvm").exists(), "requires KVM");
     let dir = tempfile::tempdir().unwrap();
     let elf = dir.path().join("hello");
     compile_assembly("x86_entrypoint_argv.S", &elf);
+    let ld_test = dir.path().join("ld-test.so");
+    compile_dynamic_assembly("x86_entrypoint_argv.S", &ld_test, None);
+    let interp_ok = dir.path().join("interp-ok");
+    compile_dynamic_assembly(
+        "x86_entrypoint_argv.S",
+        &interp_ok,
+        Some(("/opt/image/lib/ld-link.so", &ld_test)),
+    );
+    let missing_interp = dir.path().join("missing-interp");
+    compile_dynamic_assembly(
+        "x86_entrypoint_argv.S",
+        &missing_interp,
+        Some(("/opt/image/lib/missing-ld-linux.so.2", &ld_test)),
+    );
+    let bad_interp = dir.path().join("bad-interp");
+    compile_dynamic_assembly(
+        "x86_entrypoint_argv.S",
+        &bad_interp,
+        Some(("/opt/image/bin/not-elf", &ld_test)),
+    );
     let native = Command::new(&elf)
         .timeout(Duration::from_secs(5))
         .args([
@@ -68,6 +140,10 @@ fn image_path_and_shebang_entrypoints_use_the_shared_resolver() {
     );
     assert_eq!(native.status.code(), Some(7));
     let bytes = std::fs::read(&elf).unwrap();
+    let ld_test_bytes = std::fs::read(&ld_test).unwrap();
+    let interp_ok_bytes = std::fs::read(&interp_ok).unwrap();
+    let missing_interp_bytes = std::fs::read(&missing_interp).unwrap();
+    let bad_interp_bytes = std::fs::read(&bad_interp).unwrap();
     let mut layer = Vec::new();
     {
         let mut tar = tar::Builder::new(&mut layer);
@@ -78,6 +154,17 @@ fn image_path_and_shebang_entrypoints_use_the_shared_resolver() {
                 "opt/image/bin/docker-entrypoint.sh",
                 b"#!/opt/image/bin/python3 script-option\n".as_slice(),
             ),
+            (
+                "opt/image/bin/not-elf",
+                b"plain text without shebang\n".as_slice(),
+            ),
+            ("opt/image/bin/interp-ok", interp_ok_bytes.as_slice()),
+            (
+                "opt/image/bin/missing-interp",
+                missing_interp_bytes.as_slice(),
+            ),
+            ("opt/image/bin/bad-interp", bad_interp_bytes.as_slice()),
+            ("opt/image/lib/ld-test.so", ld_test_bytes.as_slice()),
         ] {
             let mut header = tar::Header::new_gnu();
             header.set_size(contents.len() as u64);
@@ -85,6 +172,20 @@ fn image_path_and_shebang_entrypoints_use_the_shared_resolver() {
             header.set_cksum();
             tar.append_data(&mut header, name, contents).unwrap();
         }
+        let mut link_header = tar::Header::new_gnu();
+        link_header.set_entry_type(tar::EntryType::Symlink);
+        link_header.set_size(0);
+        link_header.set_mode(0o777);
+        link_header
+            .set_link_name("/opt/image/lib/ld-test.so")
+            .unwrap();
+        link_header.set_cksum();
+        tar.append_data(
+            &mut link_header,
+            "opt/image/lib/ld-link.so",
+            std::io::empty(),
+        )
+        .unwrap();
         tar.finish().unwrap();
     }
     let config = br#"{"architecture":"amd64","os":"linux","config":{"Env":["PATH=/missing:/opt/image/bin"],"Entrypoint":["docker-entrypoint.sh"],"Cmd":["argument"]}}"#;
@@ -109,7 +210,7 @@ fn image_path_and_shebang_entrypoints_use_the_shared_resolver() {
         .output()
         .unwrap();
     assert!(load.status.success(), "load: {:?}", load);
-    for command in [None, Some("python3"), Some("go")] {
+    for command in [None, Some("python3"), Some("go"), Some("interp-ok")] {
         let mut run = Command::new(&cli);
         run.timeout(Duration::from_secs(10))
             .env("CARRICK_HOME", &home)
@@ -127,6 +228,54 @@ fn image_path_and_shebang_entrypoints_use_the_shared_resolver() {
         assert_eq!(output.stdout, expected, "{command:?}: {output:?}");
         assert_eq!(output.status.code(), Some(7), "{command:?}: {output:?}");
     }
+    // Names containing `/` (`./python3` from cwd `/` when only
+    // `/opt/image/bin/python3` exists) must NOT search PATH and exit 127;
+    // missing bare commands and missing PT_INTERP loaders exit 127; existing
+    // non-executables (directory, non-ELF, bad PT_INTERP) exit 126 — never 125
+    // `RuntimeError::Unsupported`.
+    let mut failures = Vec::new();
+    for (entrypoint, expected_exit) in [
+        ("./python3", 127),
+        ("missing-command", 127),
+        ("missing-interp", 127),
+        ("/opt/image/bin", 126),
+        ("not-elf", 126),
+        ("bad-interp", 126),
+    ] {
+        let output = Command::new(&cli)
+            .timeout(Duration::from_secs(10))
+            .env("CARRICK_HOME", &home)
+            .env("CARRICK_RUN_ID", "issue-1713-image-path-err")
+            .args([
+                "run",
+                "--platform",
+                "linux/amd64",
+                "--pull",
+                "never",
+                "--entrypoint",
+                entrypoint,
+                "x86-path:latest",
+            ])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.code() != Some(expected_exit)
+            || stderr.contains("unsupported in this backend")
+            || !output.stdout.is_empty()
+        {
+            failures.push(format!(
+                "{entrypoint}: expected exit {expected_exit}, got {:?}; stdout={:?}; stderr={}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                stderr.trim()
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "entrypoint error classification mismatches:\n{}",
+        failures.join("\n")
+    );
 }
 
 #[test]
