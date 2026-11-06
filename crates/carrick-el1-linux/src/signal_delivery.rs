@@ -27,6 +27,8 @@ pub trait SignalMachine<C> {
         None
     }
     fn group_exit_custody(&self, task: &CurrentTask) -> CompletionRoute;
+    /// Reflect the successfully published frame in a saved execution context.
+    fn published_stack(&mut self, _sp: UserVa) {}
 }
 
 pub fn deliver_signal_on_syscall_return<'a, M, C, S, A>(
@@ -50,6 +52,7 @@ where
         CompletionRoute::Served,
         &task.linux,
     ) {
+        process.defer_signal_return_for_work();
         return None;
     }
 
@@ -202,6 +205,9 @@ where
                         blocked: thread_blocked,
                     },
                 );
+            }
+            if let Ok(sp) = setup {
+                machine.published_stack(sp);
             }
             if slot
                 .synchronous_fault()

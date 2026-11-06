@@ -3680,6 +3680,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             calling_tid,
             slot,
             owner_continuation,
+            signal_work_deferred: false,
             copyout_ready: None,
             adapter_ready: None,
             service_phase: NativeServicePhase::Unspecified,
@@ -3725,6 +3726,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             calling_tid,
             slot: Some(member_control),
             owner_continuation,
+            signal_work_deferred: false,
             copyout_ready: None,
             adapter_ready: None,
             service_phase: NativeServicePhase::Unspecified,
@@ -4030,6 +4032,9 @@ pub struct NativeProcessEntry<
     // Captured by native admission under its existing graph guard. Ordinary
     // syscall dispatch does not acquire another graph lock for this checkpoint.
     owner_continuation: bool,
+    // A shared return checkpoint observed real work before a concurrent host
+    // could drain its doorbell. Keep that refusal with this admitted owner.
+    signal_work_deferred: bool,
     copyout_ready: Option<Box<service::OwnedCopyout>>,
     adapter_ready: Option<Box<service::AdapterPreparation>>,
     service_phase: NativeServicePhase,
@@ -4038,6 +4043,17 @@ pub struct NativeProcessEntry<
 impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     NativeProcessEntry<'r, 'a, M, C, S>
 {
+    /// Saved words owned by this admitted member, before executor handback.
+    pub fn resume_context(&self) -> &C {
+        &self.words
+    }
+    pub fn resume_context_mut(&mut self) -> &mut C {
+        &mut self.words
+    }
+    pub fn resume_signal_control(&self) -> &'a ThreadControlSlot {
+        self.control
+    }
+
     /// Refusal provenance for the existing terminal diagnostic transport.
     pub fn native_service_phase(&self) -> NativeServicePhase {
         self.service_phase
@@ -4079,6 +4095,12 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
     ) -> bool {
         self.binding == crate::common_entry::execution_binding(task)
             && core::ptr::eq(self.control, control)
+    }
+
+    /// Record an actual refusal by this signal owner. Final return consumes
+    /// the observation when its obligation transfers to the service token.
+    pub(crate) fn defer_signal_return_for_work(&mut self) {
+        self.signal_work_deferred = true;
     }
 
     /// Test pending native work before the ISA saves FP/SIMD for delivery.
@@ -5659,10 +5681,34 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     #[inline(never)]
     pub fn resume_checkpoint(
         &mut self,
+        checkpoint: impl FnOnce(
+            &mut Self,
+        ) -> Result<
+            Option<NativeResume>,
+            carrick_core_abi::NativeRunFailureReason,
+        >,
     ) -> Result<NativeResume, carrick_core_abi::NativeRunFailureReason> {
         let record = self.source.zone.record(self.record.id);
         let host_owned = !record.is_native_owned() && record.requires_native_entry();
         let resumed = self.resume_owned_checkpoint()?;
+        self.finish_host_resume(resumed, host_owned, checkpoint)
+    }
+
+    // Physical reply application has returned before final signal/service
+    // publication descends. Keep those stage-local values off its stack.
+    #[inline(never)]
+    fn finish_host_resume(
+        &mut self,
+        resumed: NativeResume,
+        host_owned: bool,
+        checkpoint: impl FnOnce(
+            &mut Self,
+        ) -> Result<
+            Option<NativeResume>,
+            carrick_core_abi::NativeRunFailureReason,
+        >,
+    ) -> Result<NativeResume, carrick_core_abi::NativeRunFailureReason> {
+        let record = self.source.zone.record(self.record.id);
         // A borrowed ring continuation must return its completed context to
         // the host executor. Returning it directly to EL0 would leave the next
         // host syscall on a hostless vCPU. Native births keep their ring lane.
@@ -5680,6 +5726,29 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }
                 NativeResume::RetrySyscall => self.words.restart_syscall(),
                 _ => {}
+            }
+            if self.current.linux.has_pending_host_work() {
+                // The completed syscall remains authoritative while real
+                // carrier work drains. Its ACK re-enters this same member's
+                // signal checkpoint; UserReturn would bypass that owner.
+                return self
+                    .begin_return_work()
+                    .map_err(NativeProcessError::run_failure_reason);
+            }
+            // A host executor excludes this native SignalOwner from its own
+            // delivery pass. Settle the exact member's return before publishing
+            // UserReturn; signal parking/termination retains its own handoff.
+            if let Some(outcome) = checkpoint(self)? {
+                return Ok(outcome);
+            }
+            let signal_work_deferred = core::mem::take(&mut self.signal_work_deferred);
+            if signal_work_deferred || self.current.linux.has_pending_host_work() {
+                // A producer may publish real work while the signal owner
+                // checks its return. Keep this exact completed context until
+                // that work's ACK permits the native checkpoint again.
+                return self
+                    .begin_return_work()
+                    .map_err(NativeProcessError::run_failure_reason);
             }
             // SAFETY: this admitted lane still owns this exact OnCpu record.
             // Publish the final words before handing its custody to the host.
@@ -9915,7 +9984,7 @@ mod tests {
                 .enter(source, &task, child_words, &mut service)
                 .unwrap();
             assert!(matches!(
-                child.resume_checkpoint(),
+                child.resume_checkpoint(|_| Ok(None)),
                 Ok(NativeResume::NoPending)
             ));
             assert_eq!(child.service.tid_words[&(1, tid_va.raw())], 0xaaaa);

@@ -7,13 +7,13 @@ use carrick_personality_linux::signal::arm;
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 use carrick_personality_linux::signal::arm::RtSigframe;
 
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 struct ArmSignalMachine {
     backend: LinuxAarch64Backend,
     user_sp: carrick_guest_arch::UserVa,
 }
 
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedContext>
     for ArmSignalMachine
 {
@@ -43,6 +43,10 @@ impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedCont
 
     fn restart_forwarded(&self, frame: &mut TrapFrame) -> Option<bool> {
         restart_forwarded_frame(frame)
+    }
+
+    fn published_stack(&mut self, sp: carrick_guest_arch::UserVa) {
+        self.user_sp = sp;
     }
 
     fn group_exit_custody(
@@ -131,17 +135,79 @@ pub(crate) fn deliver_on_user_return<X: super::aarch64_process::ForkStockCrossin
     )
 }
 
+/// Settle the native signal owner before its completed words cross back to
+/// a host executor, whose signal pass excludes the native signal owner.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[inline(never)]
+pub(crate) fn checkpoint_saved_user_return<'a, X: super::aarch64_process::ForkStockCrossing>(
+    task: &carrick_el1_abi::CurrentTask,
+    process: &mut super::native_process_runtime::NativeProcessEntry<
+        '_,
+        'a,
+        super::aarch64_process::Mm,
+        carrick_sched_core::Aarch64ParkedContext,
+        super::aarch64_process::Aarch64NativeProcessService<'a, X>,
+    >,
+) -> Result<
+    Option<super::native_process_runtime::NativeResume>,
+    carrick_core_abi::NativeRunFailureReason,
+> {
+    use zerocopy::IntoBytes;
+    if !process.signal_checkpoint_needed() {
+        return Ok(None);
+    }
+    let saved = process.resume_context();
+    let mut frame = alloc::boxed::Box::new(TrapFrame::default());
+    frame.x = saved.native.x;
+    frame.elr = saved.native.pc;
+    frame.spsr = saved.native.pstate;
+    frame.esr = 0x54000000;
+    let mut fp = alloc::boxed::Box::new(carrick_syscall_abi::LinuxFpsimdContext::empty());
+    fp.vregs = saved.native.v;
+    fp.fpsr = saved.native.fpsr as u32;
+    fp.fpcr = saved.native.fpcr as u32;
+    let mut machine = ArmSignalMachine {
+        backend: LinuxAarch64Backend,
+        user_sp: carrick_guest_arch::UserVa::new(saved.native.sp_el0),
+    };
+    let control = process.resume_signal_control();
+    let route = deliver_on_user_return_with(
+        task,
+        control,
+        process,
+        &mut frame,
+        fp.as_bytes(),
+        &mut machine,
+    );
+    match route {
+        None => {
+            let saved = process.resume_context_mut();
+            saved.native.x = frame.x;
+            saved.native.pc = frame.elr;
+            saved.native.pstate = frame.spsr;
+            saved.native.sp_el0 = machine.user_sp.raw();
+            Ok(None)
+        }
+        Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended) => Ok(Some(
+            super::native_process_runtime::NativeResume::Left(process.take_root_exit()),
+        )),
+        Some(_) => {
+            Err(super::native_process_runtime::NativeProcessError::Quarantined.run_failure_reason())
+        }
+    }
+}
+
 /// Native user-return policy shared by the hardware adapter and VM-free witnesses.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-pub(crate) fn deliver_on_user_return_with<X, A>(
+pub(crate) fn deliver_on_user_return_with<'a, X, A>(
     task: &carrick_el1_abi::CurrentTask,
     control: &carrick_el1_abi::ThreadControlSlot,
     process: &mut super::native_process_runtime::NativeProcessEntry<
         '_,
-        'static,
+        'a,
         super::aarch64_process::Mm,
         carrick_sched_core::Aarch64ParkedContext,
-        super::aarch64_process::Aarch64NativeProcessService<'static, X>,
+        super::aarch64_process::Aarch64NativeProcessService<'a, X>,
     >,
     frame: &mut TrapFrame,
     fpstate: &[u8],
@@ -323,7 +389,7 @@ use carrick_guest_arch::UserVa;
 use zerocopy::FromBytes;
 
 /// The Linux signal-frame codec over the neutral ARM backend's types.
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 pub struct LinuxAarch64Backend;
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -350,7 +416,22 @@ impl carrick_guest_arch::ArchTypes for LinuxAarch64Backend {
         <carrick_el1::isa::aarch64::Aarch64Backend as carrick_guest_arch::ArchTypes>::InterruptMask;
 }
 
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[cfg(test)]
+impl carrick_guest_arch::ArchTypes for LinuxAarch64Backend {
+    type Error = ArchError;
+    type NativeFrame = TrapFrame;
+    type SavedContext = carrick_el1_abi::ThreadCtx;
+    type Context = carrick_el1_abi::ThreadCtx;
+    type Root = carrick_guest_arch::RootGpa;
+    type MmOwner = carrick_el1_abi::CurrentTask;
+    type DrainTicket = ();
+    type DrainReceipt = ();
+    type UserTransfer = ();
+    type HardwareInterrupt = ();
+    type InterruptMask = ();
+}
+
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 impl carrick_personality_linux::signal::SignalBackend for LinuxAarch64Backend {
     fn setup_signal_frame(
         &mut self,
@@ -369,31 +450,39 @@ impl carrick_personality_linux::signal::SignalBackend for LinuxAarch64Backend {
         _fpstate: &mut [u8],
         copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> bool,
     ) -> Result<carrick_personality_linux::signal::RestoredSignalFrame, Self::Error> {
-        let sp_val = unsafe { carrick_el1::isa::aarch64::signal_stack().raw() };
-        let sp = UserVa::new(sp_val);
-        // A public frame is over 4 KiB. Keep the admitted copy off the 16 KiB
-        // EL1 stack and borrow it throughout decode.
-        let mut bytes = frame_copy_buffer(arm::PUBLIC_FRAME_LEN)?;
-        if !copy_in(&mut bytes, sp) {
-            return Err(ArchError::InvalidFrame);
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+        {
+            let _ = (frame, _fpstate, copy_in);
+            Err(ArchError::Unbound)
         }
-        let Some(sigframe) = RtSigframe::ref_from_bytes(&bytes).ok() else {
-            return Err(ArchError::InvalidFrame);
-        };
-
-        let (mask, saved_sp, stack) = restore(frame, sigframe, _fpstate, sp)?;
-
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-        unsafe {
-            carrick_el1::isa::aarch64::set_signal_stack(UserVa::new(saved_sp));
-        }
+        {
+            let sp_val = unsafe { carrick_el1::isa::aarch64::signal_stack().raw() };
+            let sp = UserVa::new(sp_val);
+            // A public frame is over 4 KiB. Keep the admitted copy off the 16 KiB
+            // EL1 stack and borrow it throughout decode.
+            let mut bytes = frame_copy_buffer(arm::PUBLIC_FRAME_LEN)?;
+            if !copy_in(&mut bytes, sp) {
+                return Err(ArchError::InvalidFrame);
+            }
+            let Some(sigframe) = RtSigframe::ref_from_bytes(&bytes).ok() else {
+                return Err(ArchError::InvalidFrame);
+            };
 
-        Ok(carrick_personality_linux::signal::RestoredSignalFrame {
-            mask: carrick_signal_core::policy::SigBlockMask::blocking_all_of(
-                carrick_signal_core::SignalSet::from_bits(mask),
-            ),
-            stack,
-        })
+            let (mask, saved_sp, stack) = restore(frame, sigframe, _fpstate, sp)?;
+
+            #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+            unsafe {
+                carrick_el1::isa::aarch64::set_signal_stack(UserVa::new(saved_sp));
+            }
+
+            Ok(carrick_personality_linux::signal::RestoredSignalFrame {
+                mask: carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                    carrick_signal_core::SignalSet::from_bits(mask),
+                ),
+                stack,
+            })
+        }
     }
 }
 

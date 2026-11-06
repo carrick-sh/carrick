@@ -320,6 +320,13 @@ mod exec_comm_tests {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ServiceCompletion {
+    Inline,
+    RetrySyscall,
+    OwnerCheckpoint,
+}
+
 impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
     pub(crate) fn cancel_service<S: NativeProcessService<'a, C>>(
         &self,
@@ -549,7 +556,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         None,
                         Some(wait),
                         ServicePayload::Copyout(output),
-                        false,
+                        ServiceCompletion::Inline,
                     );
                 }
                 Err(NativeProcessError::Busy) => {
@@ -560,7 +567,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         None,
                         None,
                         ServicePayload::Copyout(output),
-                        false,
+                        ServiceCompletion::Inline,
                     );
                 }
                 Err(NativeProcessError::Unsupported) => {
@@ -585,7 +592,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                                 None,
                                 Some(wait),
                                 ServicePayload::Copyout(output),
-                                false,
+                                ServiceCompletion::Inline,
                             );
                         }
                         Err(NativeProcessError::Busy) => {
@@ -596,7 +603,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                                 None,
                                 None,
                                 ServicePayload::Copyout(output),
-                                false,
+                                ServiceCompletion::Inline,
                             );
                         }
                         Err(NativeProcessError::Unsupported) => {
@@ -609,7 +616,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                                 Some(sequence),
                                 None,
                                 ServicePayload::Copyout(output),
-                                true,
+                                ServiceCompletion::RetrySyscall,
                             );
                         }
                         Err(error) => return Err(error),
@@ -718,8 +725,33 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         operation: ServiceOperation,
         fault_sequence: Option<core::num::NonZeroU64>,
     ) -> Result<NativeResume, NativeProcessError> {
-        self.begin_service_inner(operation, fault_sequence, None, ServicePayload::None, false)
+        self.begin_service_inner(
+            operation,
+            fault_sequence,
+            None,
+            ServicePayload::None,
+            ServiceCompletion::Inline,
+        )
     }
+    /// A completed host member must retain its exact native return owner even
+    /// when carrier intake ACKs before the service wait can enroll.
+    #[inline(never)]
+    pub(super) fn begin_return_work(&mut self) -> Result<NativeResume, NativeProcessError> {
+        let outcome = self.begin_service_inner(
+            ServiceOperation::CarrierWork {
+                entry: OwnerEntry::Syscall,
+            },
+            None,
+            None,
+            ServicePayload::None,
+            ServiceCompletion::OwnerCheckpoint,
+        )?;
+        if matches!(outcome, NativeResume::Left(_)) && self.take_handoff_receipt().is_none() {
+            return Err(NativeProcessError::Quarantined);
+        }
+        Ok(outcome)
+    }
+
     pub(super) fn begin_adapter_service(
         &mut self,
         operation: ServiceOperation,
@@ -737,7 +769,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if installed.identity() != identity {
             return Err(NativeProcessError::Quarantined);
         }
-        self.begin_service_inner(operation, sequence, None, ServicePayload::Adapter, true)
+        self.begin_service_inner(
+            operation,
+            sequence,
+            None,
+            ServicePayload::Adapter,
+            ServiceCompletion::RetrySyscall,
+        )
     }
     /// Supply readable memory for a guest-copy input, then
     /// retry the exact SVC before any setup effect. A refused supply becomes
@@ -786,8 +824,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
             Err(error) => return Err(error),
         };
-        let result =
-            self.begin_service_inner(operation, sequence, wait, ServicePayload::Copyin, true)?;
+        let result = self.begin_service_inner(
+            operation,
+            sequence,
+            wait,
+            ServicePayload::Copyin,
+            ServiceCompletion::RetrySyscall,
+        )?;
         match result {
             NativeResume::RetrySyscall => Ok(LifecycleOutcome::Redispatch),
             NativeResume::Returned(result) => Ok(LifecycleOutcome::Returned {
@@ -813,7 +856,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             fault_sequence,
             owner_wait,
             ServicePayload::None,
-            true,
+            ServiceCompletion::RetrySyscall,
         )
     }
     pub fn begin_exec_service(
@@ -867,7 +910,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             None,
             None,
             ServicePayload::Exec(payload),
-            false,
+            ServiceCompletion::Inline,
         )
     }
     /// Keep a carrier-retained private-mapping source for this record:
@@ -957,7 +1000,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 map,
                 chdir,
             }),
-            false,
+            ServiceCompletion::Inline,
         )
     }
     /// The caller's own `RLIMIT_FSIZE` soft limit, which the ring owns.
@@ -1044,7 +1087,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         operation: ServiceOperation,
         wait: carrick_core_abi::PortalOwnerWait,
     ) -> Result<NativeResume, NativeProcessError> {
-        self.begin_service_inner(operation, None, Some(wait), ServicePayload::None, false)
+        self.begin_service_inner(
+            operation,
+            None,
+            Some(wait),
+            ServicePayload::None,
+            ServiceCompletion::Inline,
+        )
     }
     #[inline(never)]
     fn begin_service_inner(
@@ -1053,7 +1102,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         fault_sequence: Option<core::num::NonZeroU64>,
         owner_wait: Option<carrick_core_abi::PortalOwnerWait>,
         payload: ServicePayload<'a>,
-        retry_syscall_after_supply: bool,
+        completion: ServiceCompletion,
     ) -> Result<NativeResume, NativeProcessError> {
         // Publish into the existing boxed pending owner before descending into
         // completion. Admission's payload/manifests and rollback locals must
@@ -1063,7 +1112,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             fault_sequence,
             owner_wait,
             payload,
-            retry_syscall_after_supply,
+            completion == ServiceCompletion::RetrySyscall,
         )?;
         let (request, adapter) = match prepared {
             PreparedService::Request(request, adapter) => (request, adapter),
@@ -1072,7 +1121,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if let Some(wait) = owner_wait {
             self.park_owner_wait(&request, wait)
         } else {
-            self.park_service(&request, adapter)
+            self.park_service(
+                &request,
+                adapter || completion == ServiceCompletion::OwnerCheckpoint,
+            )
         }
     }
 
@@ -1441,7 +1493,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     pub(super) fn park_service(
         &mut self,
         request: &ServiceRequest,
-        defer_adapter: bool,
+        defer_completion: bool,
     ) -> Result<NativeResume, NativeProcessError> {
         self.service_phase = NativeServicePhase::Park;
         use carrick_sched_core::object_wait::ObjectWaitError;
@@ -1500,7 +1552,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     failure = Some(service_protocol_error(error));
                     return Err(ObjectWaitError::Stale);
                 }
-                if defer_adapter {
+                if defer_completion {
                     match self.control.service.completion_ready(request.identity) {
                         Ok(true) => {
                             deferred = true;
@@ -1556,7 +1608,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     && completion.is_none()
                     && !deferred
                     && self.host_requested_current();
-                if adapter || host_contended {
+                if adapter || host_contended || deferred {
                     self.retain_record_operation(operation)?;
                 }
                 if host_contended {

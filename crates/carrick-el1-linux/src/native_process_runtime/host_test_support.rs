@@ -38,6 +38,30 @@ pub(super) fn run_service_published_hook(runtime: usize) {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static RETURN_COPYOUTS: std::cell::RefCell<Option<Vec<(UserVa, usize)>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn observe_return_copyouts() {
+    RETURN_COPYOUTS.with(|copies| assert!(copies.borrow_mut().replace(Vec::new()).is_none()));
+}
+
+#[cfg(test)]
+pub(crate) fn record_return_copyout(address: UserVa, len: usize) {
+    RETURN_COPYOUTS.with(|copies| {
+        if let Some(copies) = copies.borrow_mut().as_mut() {
+            copies.push((address, len));
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn take_return_copyouts() -> Vec<(UserVa, usize)> {
+    RETURN_COPYOUTS.with(|copies| copies.borrow_mut().take().unwrap())
+}
+
 pub fn take_signal_copies() -> Vec<(UserVa, Vec<u8>)> {
     SIGNAL_COPIES.with(|copies| core::mem::take(&mut *copies.borrow_mut()))
 }
@@ -1402,7 +1426,7 @@ impl NativeServiceCapacityFixture {
             )
             .unwrap();
         assert!(matches!(
-            root.resume_checkpoint(),
+            root.resume_checkpoint(|_| Ok(None)),
             Ok(NativeResume::NoPending)
         ));
         drop(root);
@@ -1488,7 +1512,7 @@ impl NativeServiceCapacityFixture {
             )
             .unwrap();
         assert!(matches!(
-            entry.resume_checkpoint().unwrap(),
+            entry.resume_checkpoint(|_| Ok(None)).unwrap(),
             NativeResume::NoPending
         ));
         assert!(matches!(
@@ -1565,7 +1589,7 @@ impl NativeServiceCapacityFixture {
                 )
                 .unwrap();
             assert!(matches!(
-                entry.resume_checkpoint().unwrap(),
+                entry.resume_checkpoint(|_| Ok(None)).unwrap(),
                 NativeResume::Returned(result)
                     if result.raw() == words.syscall_return() as i64
             ));
@@ -1807,7 +1831,7 @@ fn carrier_work_wake_preserves_the_completed_syscall_result() {
         )
         .unwrap();
     assert!(matches!(
-        resumed.resume_checkpoint(),
+        resumed.resume_checkpoint(|_| Ok(None)),
         Ok(NativeResume::Returned(result)) if result.raw() == COMPLETED as i64
     ));
 }
@@ -1982,7 +2006,7 @@ fn refused_exec_preparation_is_cancelled_exactly_once() {
         )
         .unwrap();
     assert!(matches!(
-        entry.resume_checkpoint(),
+        entry.resume_checkpoint(|_| Ok(None)),
         Ok(NativeResume::Left(None))
     ));
     assert!(entry.take_run_failure().is_none());
@@ -2317,7 +2341,7 @@ fn exit_group_cancels_exception_service_before_publishing_host_wakes() {
                 )
                 .unwrap();
             assert!(matches!(
-                member.resume_checkpoint(),
+                member.resume_checkpoint(|_| Ok(None)),
                 Ok(NativeResume::Left(None))
             ));
             assert!(member.take_run_failure().is_none());
@@ -2348,7 +2372,7 @@ fn exit_group_cancels_exception_service_before_publishing_host_wakes() {
                 &mut service,
             )
             .unwrap();
-        assert!(matches!(root.resume_checkpoint(),
+        assert!(matches!(root.resume_checkpoint(|_| Ok(None)),
             Ok(NativeResume::Left(Some(status))) if status == LinuxWaitStatus::exited(7)));
         assert!(root.take_run_failure().is_none());
     }
@@ -2453,7 +2477,7 @@ fn native_exec_successor_retracts_exec_cancellation_before_owner_wait() {
             &mut service,
         )
         .unwrap();
-    let resumed = entry.resume_checkpoint();
+    let resumed = entry.resume_checkpoint(|_| Ok(None));
     if let Err(reason) = &resumed {
         panic!("exec owner caused run failure after sibling drain: {reason:?}");
     }
@@ -2597,7 +2621,7 @@ fn sole_member_exec_closes_admission_before_adopting_successor() {
         )
         .unwrap();
     assert!(matches!(
-        entry.resume_checkpoint(),
+        entry.resume_checkpoint(|_| Ok(None)),
         Ok(NativeResume::Left(None))
     ));
     assert_eq!(fixture.task.mm.key.load(Ordering::Acquire), 1);
@@ -2664,7 +2688,7 @@ fn exec_closes_over_predecessor_gate(gate: carrick_el1_abi::GateState) {
         )
         .unwrap();
     assert!(matches!(
-        entry.resume_checkpoint(),
+        entry.resume_checkpoint(|_| Ok(None)),
         Ok(NativeResume::NoPending)
     ));
     assert!(entry.take_run_failure().is_none());
@@ -2743,7 +2767,7 @@ fn exec_after_sibling_drain(parked_read: bool) {
             )
             .unwrap();
         assert!(matches!(
-            entry.resume_checkpoint(),
+            entry.resume_checkpoint(|_| Ok(None)),
             Ok(NativeResume::Left(None))
         ));
         assert!(entry.take_handoff_receipt().is_none());
@@ -2868,7 +2892,7 @@ fn exec_after_sibling_drain(parked_read: bool) {
             &mut service,
         )
         .unwrap();
-    let resumed = entry.resume_checkpoint();
+    let resumed = entry.resume_checkpoint(|_| Ok(None));
     let resumed_kind = match &resumed {
         Ok(NativeResume::NoPending) => "no-pending",
         Ok(NativeResume::RetrySyscall) => "retry-syscall",
@@ -3014,7 +3038,7 @@ fn concurrent_native_exec_loser_is_killed_without_a_run_failure() {
             )
             .unwrap();
         assert!(matches!(
-            root.resume_checkpoint(),
+            root.resume_checkpoint(|_| Ok(None)),
             Ok(NativeResume::Left(None))
         ));
         let failure = root.take_run_failure();
@@ -3077,7 +3101,7 @@ fn concurrent_native_exec_loser_is_killed_without_a_run_failure() {
         )
         .unwrap();
     assert!(matches!(
-        root.resume_checkpoint(),
+        root.resume_checkpoint(|_| Ok(None)),
         Ok(NativeResume::NoPending)
     ));
     assert!(root.take_run_failure().is_none());
@@ -3142,7 +3166,7 @@ fn exec_drain_is_upgraded_by_terminal_sibling(signal: Option<u8>) {
             )
             .unwrap();
         assert!(matches!(
-            root.resume_checkpoint(),
+            root.resume_checkpoint(|_| Ok(None)),
             Ok(NativeResume::Left(None))
         ));
         assert!(root.take_run_failure().is_none());
@@ -3382,7 +3406,7 @@ fn native_child_exec_after_ring_setuid_carries_the_new_credentials() {
         )
         .unwrap();
     assert!(matches!(
-        child.resume_checkpoint(),
+        child.resume_checkpoint(|_| Ok(None)),
         Ok(NativeResume::NoPending)
     ));
     let decoded = |bytes: &[u8]| {
@@ -3497,7 +3521,7 @@ fn native_parent_reaps_then_execs_a_child_after_slot_reuse() {
             )
             .unwrap();
         assert!(matches!(
-            child.resume_checkpoint(),
+            child.resume_checkpoint(|_| Ok(None)),
             Ok(NativeResume::NoPending)
         ));
         assert!(matches!(
@@ -3533,7 +3557,7 @@ fn native_parent_reaps_then_execs_a_child_after_slot_reuse() {
         )
         .unwrap();
     assert!(matches!(
-        child.resume_checkpoint(),
+        child.resume_checkpoint(|_| Ok(None)),
         Ok(NativeResume::NoPending)
     ));
     assert_eq!(child.calling_tid(), child_pid);
@@ -3563,7 +3587,7 @@ fn native_parent_reaps_then_execs_a_child_after_slot_reuse() {
             &mut parent_service,
         )
         .unwrap();
-    match parent.resume_checkpoint() {
+    match parent.resume_checkpoint(|_| Ok(None)) {
         Ok(NativeResume::Returned(result)) => {
             assert_eq!(result.raw(), i64::from(child_pid));
         }
@@ -3610,7 +3634,7 @@ fn native_parent_reaps_then_execs_a_child_after_slot_reuse() {
         )
         .unwrap();
     assert!(matches!(
-        reused.resume_checkpoint(),
+        reused.resume_checkpoint(|_| Ok(None)),
         Ok(NativeResume::NoPending)
     ));
     assert!(matches!(
@@ -3787,7 +3811,7 @@ fn carrier_work_redrives_parked_wait4(cancel: bool) {
             )
             .unwrap();
         assert!(matches!(
-            child.resume_checkpoint(),
+            child.resume_checkpoint(|_| Ok(None)),
             Ok(NativeResume::NoPending)
         ));
         assert!(matches!(
@@ -3888,7 +3912,7 @@ fn carrier_work_redrives_parked_wait4(cancel: bool) {
         "service readiness must re-drive wait4 and return the child's pid"
     );
     assert!(matches!(
-        parent.resume_checkpoint(),
+        parent.resume_checkpoint(|_| Ok(None)),
         Ok(NativeResume::NoPending)
     ));
     assert!(matches!(
@@ -3932,7 +3956,7 @@ fn native_exec_successor_reaps_its_fork_child() {
         )
         .unwrap();
     assert!(matches!(
-        child.resume_checkpoint(),
+        child.resume_checkpoint(|_| Ok(None)),
         Ok(NativeResume::NoPending)
     ));
     assert_eq!(child.calling_tid(), child_pid);
@@ -3959,7 +3983,7 @@ fn native_exec_successor_reaps_its_fork_child() {
         )
         .unwrap();
     assert!(matches!(
-        parent.resume_checkpoint(),
+        parent.resume_checkpoint(|_| Ok(None)),
         Ok(NativeResume::Returned(result)) if result.raw() == i64::from(child_pid)
     ));
     assert_eq!(parent_service.copies, vec![LinuxWaitStatus::exited(0)]);
@@ -4074,7 +4098,7 @@ fn portal_wait_cancellation_resumes_exact_native_service_waiter() {
         )
         .unwrap();
     assert!(
-        matches!(entry.resume_checkpoint().unwrap(), NativeResume::Returned(result) if result.raw() == 0x41),
+        matches!(entry.resume_checkpoint(|_| Ok(None)).unwrap(), NativeResume::Returned(result) if result.raw() == 0x41),
         "cancellation resumes the service and preserves its committed result"
     );
 }
@@ -4290,7 +4314,7 @@ fn completed_output_busy_yields(in_preparation: bool) {
         )
         .unwrap();
     assert!(
-        matches!(entry.resume_checkpoint().unwrap(), NativeResume::Returned(result) if result.raw() == 37)
+        matches!(entry.resume_checkpoint(|_| Ok(None)).unwrap(), NativeResume::Returned(result) if result.raw() == 37)
     );
     assert_eq!(
         take_signal_copies(),
@@ -4516,7 +4540,7 @@ fn retained_poll_output_owner_wait(cancel: bool, during_enrollment: bool, produc
             &mut service,
         )
         .unwrap();
-    let resumed = entry.resume_checkpoint().unwrap();
+    let resumed = entry.resume_checkpoint(|_| Ok(None)).unwrap();
     if cancel {
         assert!(!matches!(resumed, NativeResume::Returned(_)));
         assert!(
@@ -4919,7 +4943,7 @@ fn retained_ipc_supply(
                 )
                 .unwrap();
             assert!(matches!(
-                entry.resume_checkpoint().unwrap(),
+                entry.resume_checkpoint(|_| Ok(None)).unwrap(),
                 NativeResume::RetrySyscall
             ));
             let retained = carrick_core::wait::take_object_operation(
@@ -5020,7 +5044,7 @@ fn retained_ipc_supply(
             )
             .unwrap();
     }
-    let resumed = entry.resume_checkpoint().unwrap();
+    let resumed = entry.resume_checkpoint(|_| Ok(None)).unwrap();
     if supplied {
         assert!(matches!(resumed, NativeResume::RetrySyscall));
         let token = carrick_core::wait::take_object_operation(
@@ -5318,7 +5342,7 @@ fn host_contended_service_park(
         )
         .unwrap();
     assert!(matches!(
-        entry.resume_checkpoint().unwrap(),
+        entry.resume_checkpoint(|_| Ok(None)).unwrap(),
         NativeResume::NoPending
     ));
     if takeover_before_receipt {
@@ -5435,7 +5459,7 @@ fn host_contended_service_park(
                 &mut service,
             )
             .unwrap();
-        let resumed = entry.resume_checkpoint();
+        let resumed = entry.resume_checkpoint(|_| Ok(None));
         if expect_left {
             assert!(matches!(resumed, Ok(NativeResume::Left(None))));
             drop(entry);
@@ -5651,7 +5675,7 @@ fn host_request_during_owner_wait_park_yields_then_reparks() {
         // As for a parked owner wait the host claimed: the owner wait's
         // next entry finishes it and re-evaluates the waiting operation.
         assert!(matches!(
-            entry.resume_checkpoint(),
+            entry.resume_checkpoint(|_| Ok(None)),
             Ok(NativeResume::Returned(_))
         ));
     }
@@ -5877,7 +5901,7 @@ fn signal_setup_output_owner_wait(cross_page: bool) {
         )
         .unwrap();
     assert!(
-        matches!(entry.resume_checkpoint().unwrap(), NativeResume::Returned(result) if result.raw() == 0)
+        matches!(entry.resume_checkpoint(|_| Ok(None)).unwrap(), NativeResume::Returned(result) if result.raw() == 0)
     );
     assert_eq!(fixture.control.blocked().0, 0x80);
     assert_eq!(
@@ -5889,7 +5913,7 @@ fn signal_setup_output_owner_wait(cross_page: bool) {
         }
     );
     assert!(matches!(
-        entry.resume_checkpoint().unwrap(),
+        entry.resume_checkpoint(|_| Ok(None)).unwrap(),
         NativeResume::NoPending
     ));
     assert!(take_signal_copies().is_empty());
@@ -6060,7 +6084,10 @@ fn rehomed_signal_copy_service(input: bool) {
         )
         .unwrap();
     assert!(
-        matches!(entry.resume_checkpoint(), Ok(NativeResume::Left(None))),
+        matches!(
+            entry.resume_checkpoint(|_| Ok(None)),
+            Ok(NativeResume::Left(None))
+        ),
         "a host-owned member must return its completed context to its host executor"
     );
     assert!(!fixture.zone.record(record).is_native_owned());
@@ -6222,7 +6249,7 @@ fn sigprocmask_set_owner_wait_redispatches_before_effects() {
         )
         .unwrap();
     assert!(matches!(
-        entry.resume_checkpoint().unwrap(),
+        entry.resume_checkpoint(|_| Ok(None)).unwrap(),
         NativeResume::RetrySyscall
     ));
     assert_eq!(fixture.control.blocked().0, 0);
@@ -6256,7 +6283,7 @@ fn sigprocmask_set_owner_wait_redispatches_before_effects() {
     assert_eq!(old.read::<u64>(0), 0);
     assert!(take_signal_copies().is_empty());
     assert!(matches!(
-        entry.resume_checkpoint().unwrap(),
+        entry.resume_checkpoint(|_| Ok(None)).unwrap(),
         NativeResume::NoPending
     ));
     assert!(take_signal_copies().is_empty());

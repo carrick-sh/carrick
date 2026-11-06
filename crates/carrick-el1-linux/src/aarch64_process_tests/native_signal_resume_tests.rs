@@ -369,7 +369,7 @@ fn retained_signal_copy(input_wait: bool, check_stale: bool) {
             )
             .unwrap();
         assert!(
-            matches!(entry.resume_checkpoint().unwrap(), crate::native_process_runtime::NativeResume::Returned(result) if result.raw() == 0)
+            matches!(entry.resume_checkpoint(|_| Ok(None)).unwrap(), crate::native_process_runtime::NativeResume::Returned(result) if result.raw() == 0)
         );
     }
     let outputs = take_signal_copies();

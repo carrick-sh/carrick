@@ -184,12 +184,13 @@ pub fn run() -> Result<LinuxWaitStatus, NativeTerminalFailure> {
             &mut service,
         )
         .unwrap();
-    let resumed = owner
-        .resume_checkpoint()
-        .map_err(|reason| NativeTerminalFailure {
-            binding: owner.binding,
-            reason,
-        })?;
+    let resumed =
+        owner
+            .resume_checkpoint(|_| Ok(None))
+            .map_err(|reason| NativeTerminalFailure {
+                binding: owner.binding,
+                reason,
+            })?;
     assert_eq!(owner.take_run_failure(), None);
     let NativeResume::Left(Some(status)) = resumed else {
         panic!("terminal owner did not publish its status");
