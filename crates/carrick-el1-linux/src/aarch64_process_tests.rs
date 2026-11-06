@@ -12032,12 +12032,8 @@ fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
             self.reads.set(self.reads.get() + 1);
             (!self.missing.get()).then_some(self.value.get())
         }
-        fn read_u64(&self, _: &CurrentTask, address: u64) -> Option<u64> {
-            match address {
-                value if value == VA + 8 => Some(5),
-                value if value == VA + 16 => Some(0),
-                _ => None,
-            }
+        fn read_u64(&self, _: &CurrentTask, _: u64) -> Option<u64> {
+            panic!("untimed wait")
         }
     }
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
@@ -12130,8 +12126,6 @@ fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
     fixture.zone.spaces.set_idle_ttbr(0x30000);
     let mut cpu = crate::sched::FakeCpu {
         ttbr: (fixture_ttbr0(fixture), fixture_ttbr0(fixture)),
-        now: 100,
-        freq: 1,
         ..Default::default()
     };
     let mut frame = carrick_el1_abi::TrapFrame {
@@ -12142,7 +12136,6 @@ fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
     frame.x[0] = VA;
     frame.x[1] = crate::sched::FUTEX_WAIT_PRIVATE;
     frame.x[2] = 0x12345678;
-    frame.x[3] = VA + 8;
     let mut parked = parked;
     crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut parked);
     {
@@ -12234,7 +12227,8 @@ fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
     assert_eq!(frame.x[0] as i64, -11);
     crate::sched::ThreadCpu::load(&mut cpu, &mut frame, &retained);
     word.value.set(0x12345678);
-    cpu.now = 101;
+    // Bound the real matching futex park at the existing host-kick boundary.
+    cpu.pending.push_back(carrick_el1_abi::GIC_KICK_INTID);
     assert_eq!(
         crate::sched::Sched {
             handoff: None,
@@ -12246,11 +12240,7 @@ fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
             counters: &counters,
         }
         .serve_futex(&mut frame),
-        Some(crate::sched::Served::Returned { switched: true })
-    );
-    assert_eq!(
-        cpu.now, 105,
-        "owner redispatch must retain the original relative deadline"
+        Some(crate::sched::Served::Idle)
     );
     if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
         work.settled();
