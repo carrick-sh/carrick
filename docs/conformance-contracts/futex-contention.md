@@ -92,3 +92,13 @@ aperture is eagerly provisioned. The futex copy-debt counter has not been
 retired. Robust-futex updates remain outside this slice (#1697). Signed
 execution, Docker comparison and the director's scoreboard rerun remain
 required before the whole slice can be accepted.
+
+The supplemental host-dispatch witness
+`futex_wait_preserves_owner_memory_refusal_before_comparison` injects an exact
+owner refusal through the production syscall entry. It was red at errno 14;
+the helper now preserves the existing owner wait and redispatch compares the
+available word, returning errno 11 for a mismatch. Host address-only operations
+skip the unused read, while a separate shared mirror wake obtains a fresh word
+before publication. The shared-pointer fallback uses an acquire atomic load.
+This supplemental test proves refusal propagation, not atomicity of the direct
+host read or scheduler enrollment; those remain incomplete in this slice.
