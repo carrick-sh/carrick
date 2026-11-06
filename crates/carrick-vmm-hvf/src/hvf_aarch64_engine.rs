@@ -2960,6 +2960,15 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.read_guest_bytes(va, len)
     }
 
+    fn translated_read_excluded(
+        &self,
+        va: u64,
+        _ipa: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, MemoryError> {
+        self.state.read_guest_bytes_excluded(va, len)
+    }
+
     fn translated_read_into(&self, va: u64, _ipa: u64, dst: &mut [u8]) -> Result<(), MemoryError> {
         // No-alloc `volatile`-copy straight into `dst` (the read_u32/u64/header path).
         self.state.read_guest_bytes_into(va, dst)
