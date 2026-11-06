@@ -11274,8 +11274,32 @@ exec /usr/bin/git "$@"
             );
             shared_fixture(|root| {
                 current_pr(root);
-                pushed_checkpoint(contract["review"]["head"].as_str().unwrap());
-                server(root)
+                let head = contract["review"]["head"].as_str().unwrap();
+                // Replay the failed worker contract and WIP publication, not
+                // just its prose. Reviews now publish through the separately
+                // exercised publisher; bind that receipt to this live head.
+                std::fs::create_dir_all(crate::agent_runner::state().unwrap().join("work"))
+                    .unwrap();
+                std::fs::write(root.join("remote-tip"), head).unwrap();
+                let package = root.join("dispatch-output");
+                std::fs::create_dir_all(&package).unwrap();
+                std::fs::write(package.join("contract.json"), raw).unwrap();
+                Applied::record(|applied| {
+                    applied.wip_pushed = Some(head.into());
+                    applied.wip_exit = Some(LauncherExit::Clean);
+                    applied.review = true;
+                    applied.review_head = Some(head.into());
+                    applied.review_url = Some(
+                        "https://github.com/carrick-sh/carrick/pull/800#pullrequestreview-123"
+                            .into(),
+                    );
+                })
+                .unwrap();
+                let mut server = server(root);
+                server.used.workers = 1;
+                server.history.push(serde_json::from_str(raw).unwrap());
+                assert_eq!(server.history[0].status, ContractStatus::Failed);
+                server
                     .round_outcome(FinishStatus::Blocked, &summary, None)
                     .unwrap();
                 let posted = regular_text(&root.join("posted.md")).unwrap();
