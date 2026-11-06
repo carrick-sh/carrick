@@ -1133,7 +1133,7 @@ fn serve_sigaltstack(
 struct TidOutput {
     address: u64,
     preimage: [u8; 4],
-    attempted: bool,
+    committed: bool,
 }
 
 impl TidOutput {
@@ -1150,7 +1150,7 @@ impl TidOutput {
             CopyOutcome::Done => Ok(Some(Self {
                 address,
                 preimage,
-                attempted: false,
+                committed: false,
             })),
             CopyOutcome::Fault | CopyOutcome::NotYet(_) => Err(outcome),
         }
@@ -1174,11 +1174,11 @@ impl TidOutputs {
         };
         // A guarded copy can fault after a prefix, so retain undo before
         // attempting it, but never claim an output that was not reached.
-        parent.attempted = true;
         let parent_outcome = user.copy_out(UserVa::new(parent.address), &bytes);
         if !parent_outcome.is_done() {
             return parent_outcome;
         }
+        parent.committed = true;
         self.publish_child(&bytes, user)
     }
 
@@ -1190,99 +1190,20 @@ impl TidOutputs {
         let Some(child) = &mut self.child else {
             return CopyOutcome::Done;
         };
-        child.attempted = true;
-        user.copy_out(UserVa::new(child.address), bytes)
+        let outcome = user.copy_out(UserVa::new(child.address), bytes);
+        child.committed = outcome.is_done();
+        outcome
     }
 
-    fn retain_rollback(
-        &self,
-        slot: &ThreadControlSlot,
-        completion: crate::abi::thread::CloneRollbackCompletion,
-    ) {
-        let output = |value: &Option<TidOutput>| {
-            value
-                .as_ref()
-                .filter(|value| value.attempted)
-                .map_or((UserVa::new(0), [0; 4]), |value| {
-                    (UserVa::new(value.address), value.preimage)
-                })
-        };
-        slot.retain_clone_tid_rollback(crate::abi::thread::CloneTidRollback {
-            outputs: [output(&self.parent), output(&self.child)],
-            completion,
-        });
-    }
-}
-
-/// Finish an owned undo before recapturing user bytes or admitting another birth.
-/// Refusal keeps the original preimage and cursor. A true fault can retire
-/// an undo only if the destination is unreadable or already has its preimage;
-/// a readable changed word with refused write access is a broken rollback.
-fn resume_clone_tid_rollback<'a>(
-    slot: &ThreadControlSlot,
-    native: &mut dyn LifecycleNative<'a>,
-) -> Option<LifecycleOutcome> {
-    use crate::abi::thread::CloneRollbackCompletion;
-    let mut undo = slot.clone_tid_rollback()?;
-    for i in 0..undo.outputs.len() {
-        let (address, bytes) = undo.outputs[i];
-        if address.raw() == 0 {
-            continue;
-        }
-        let check_preimage = match native.copy_out(address, &bytes) {
-            CopyOutcome::Done => false,
-            CopyOutcome::Fault => true,
-            CopyOutcome::NotYet(request) => match native.wait_guest_copy(request) {
-                LifecycleOutcome::Returned { result, .. } if result.raw() < 0 => {
-                    // Preparation found a true fault. The syscall cannot
-                    // return while its undo still owns a user word.
-                    if matches!(undo.completion, CloneRollbackCompletion::Retry) {
-                        undo.completion = CloneRollbackCompletion::Returned(result);
-                        slot.retain_clone_tid_rollback(undo);
-                    }
-                    true
-                }
-                LifecycleOutcome::Returned { .. } => {
-                    native.fail_lifecycle(NativeRunFailureReason::ClaimRollback)
-                }
-                outcome => return Some(outcome),
-            },
-        };
-        if check_preimage {
-            let mut observed = [0; 4];
-            match native.copy_in(&mut observed, address) {
-                CopyOutcome::Done if observed != bytes => {
-                    native.fail_lifecycle(NativeRunFailureReason::ClaimRollback)
-                }
-                CopyOutcome::Done | CopyOutcome::Fault => {}
-                CopyOutcome::NotYet(request) => match native.wait_guest_copy(request) {
-                    LifecycleOutcome::Returned { result, .. }
-                        if result.raw() == carrick_syscall_abi::LINUX_EFAULT.guest_retval() =>
-                    {
-                        // This destination is no longer readable. Retire
-                        // its undo, rather than returning with stale custody.
-                        if matches!(undo.completion, CloneRollbackCompletion::Retry) {
-                            undo.completion = CloneRollbackCompletion::Returned(result);
-                            slot.retain_clone_tid_rollback(undo);
-                        }
-                    }
-                    LifecycleOutcome::Returned { .. } => {
-                        native.fail_lifecycle(NativeRunFailureReason::ClaimRollback)
-                    }
-                    outcome => return Some(outcome),
-                },
-            }
-        }
-        undo.outputs[i].0 = UserVa::new(0);
-        slot.retain_clone_tid_rollback(undo);
-    }
-    slot.clear_clone_tid_rollback();
-    match undo.completion {
-        CloneRollbackCompletion::Retry => None,
-        CloneRollbackCompletion::Returned(result) => Some(returned(result, false)),
-        CloneRollbackCompletion::BirthSettlementFailure => {
-            native.fail_lifecycle(NativeRunFailureReason::BirthSettlement)
-        }
+    fn rollback(&self, user: &mut (impl UserCopy + ?Sized)) -> bool {
+        [&self.parent, &self.child]
+            .into_iter()
+            .flatten()
+            .filter(|output| output.committed)
+            .all(|output| {
+                user.copy_out(UserVa::new(output.address), &output.preimage)
+                    .is_done()
+            })
     }
 }
 
@@ -1511,10 +1432,6 @@ fn serve_thread_clone_common<'a>(
     thread: LifecycleThread<'a>,
     native: &mut dyn LifecycleNative<'a>,
 ) -> Option<LifecycleOutcome> {
-    use crate::abi::thread::CloneRollbackCompletion;
-    if let Some(outcome) = resume_clone_tid_rollback(thread.slot, native) {
-        return Some(outcome);
-    }
     let page = thread.page;
     let placement_stack = UserVa::new(stack);
     if !native.can_prepare_child(placement_stack, placement_tls) {
@@ -1529,7 +1446,14 @@ fn serve_thread_clone_common<'a>(
     let has_venue = native.has_process_venue();
     let parent = match TidOutput::capture(parent_settid_addr, native) {
         Ok(parent) => parent,
-        Err(CopyOutcome::NotYet(req)) => return Some(native.wait_guest_copy(req)),
+        Err(CopyOutcome::NotYet(_)) => {
+            return has_venue.then(|| {
+                returned(
+                    SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
+                    false,
+                )
+            });
+        }
         Err(CopyOutcome::Fault | CopyOutcome::Done) => {
             return has_venue.then(|| {
                 returned(
@@ -1541,7 +1465,14 @@ fn serve_thread_clone_common<'a>(
     };
     let child = match TidOutput::capture(child_settid_addr, native) {
         Ok(child) => child,
-        Err(CopyOutcome::NotYet(req)) => return Some(native.wait_guest_copy(req)),
+        Err(CopyOutcome::NotYet(_)) => {
+            return has_venue.then(|| {
+                returned(
+                    SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
+                    false,
+                )
+            });
+        }
         Err(CopyOutcome::Fault | CopyOutcome::Done) => {
             return has_venue.then(|| {
                 returned(
@@ -1693,28 +1624,17 @@ fn serve_thread_clone_common<'a>(
         if native.lifecycle_admission_settled().is_err() {
             native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
         }
-        let completion = match publish_outcome {
-            CopyOutcome::Fault if managed => CloneRollbackCompletion::Returned(
-                SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
-            ),
-            // Eager unmanaged venues have no owner wait; keep their existing
-            // decline after undo instead of inventing an in-ring errno route.
-            CopyOutcome::Fault | CopyOutcome::NotYet(_) | CopyOutcome::Done => {
-                CloneRollbackCompletion::Retry
-            }
-        };
-        outputs.retain_rollback(thread.slot, completion);
-        if let Some(outcome) = resume_clone_tid_rollback(thread.slot, native) {
-            return Some(outcome);
+        if !outputs.rollback(native) {
+            native.fail_lifecycle(NativeRunFailureReason::ClaimRollback);
         }
         return match publish_outcome {
-            CopyOutcome::NotYet(req) => Some(native.wait_guest_copy(req)),
-            CopyOutcome::Fault | CopyOutcome::Done => managed.then(|| {
+            CopyOutcome::Fault | CopyOutcome::NotYet(_) => managed.then(|| {
                 returned(
                     SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
                     false,
                 )
             }),
+            CopyOutcome::Done => unreachable!(),
         };
     }
 
@@ -1730,8 +1650,10 @@ fn serve_thread_clone_common<'a>(
         if native.lifecycle_admission_settled().is_err() {
             native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
         }
-        outputs.retain_rollback(thread.slot, CloneRollbackCompletion::BirthSettlementFailure);
-        return resume_clone_tid_rollback(thread.slot, native);
+        if !outputs.rollback(native) {
+            native.fail_lifecycle(NativeRunFailureReason::ClaimRollback);
+        }
+        native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
     }
 
     // Native context installation happens only while the new record is unpublished.
@@ -1774,11 +1696,10 @@ fn serve_thread_clone_common<'a>(
         if native.lifecycle_admission_settled().is_err() {
             native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
         }
-        outputs.retain_rollback(
-            thread.slot,
-            CloneRollbackCompletion::Returned(SyscallResult::new(error)),
-        );
-        return resume_clone_tid_rollback(thread.slot, native);
+        if !outputs.rollback(native) {
+            native.fail_lifecycle(NativeRunFailureReason::ClaimRollback);
+        }
+        return Some(returned(SyscallResult::new(error), false));
     }
     if native.lifecycle_admission_settled().is_err() {
         native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);

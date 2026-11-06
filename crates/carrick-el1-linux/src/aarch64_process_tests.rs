@@ -12107,7 +12107,7 @@ fn clone_nonresident_tid_destination(is_clone3: bool, refusal: CloneRefusal) {
         .bind_control_address(entry, child_control as *const _ as u64)
         .unwrap();
 
-    let mut tid_words =
+    let tid_words =
         carrick_test_support::GuestUserBuffer::from_values(&[0x1111_1111_u32, 0x2222_2222_u32]);
     let parent_tid_va = tid_words.arg_at(0);
     let child_tid_va = tid_words.arg_at(4);
@@ -12173,7 +12173,6 @@ fn clone_nonresident_tid_destination(is_clone3: bool, refusal: CloneRefusal) {
             child_tid_va
         }))
     });
-    crate::lifecycle::COPYOUT_REFUSE_RESTORE_AT.with(|address| address.set(Some(parent_tid_va)));
     if preparation_fault {
         crate::lifecycle::GUEST_COPY_PREPARATION_FAULT_AT
             .with(|address| address.set(Some(parent_tid_va)));
@@ -12184,58 +12183,28 @@ fn clone_nonresident_tid_destination(is_clone3: bool, refusal: CloneRefusal) {
         [0x1111_1111, 0x2222_2222],
         "is_clone3={is_clone3}: a refused child TID copy must not expose an unborn TID to the live peer"
     );
-    crate::lifecycle::COPYOUT_REFUSE_RESTORE_AT.with(|address| address.set(None));
     crate::lifecycle::GUEST_COPY_PREPARATION_FAULT_AT.with(|address| address.set(None));
-    assert_eq!(
-        first.unwrap(),
-        if preparation_fault {
-            carrick_personality_linux::dispatch::CompletionRoute::WithWork
-        } else {
-            carrick_personality_linux::dispatch::CompletionRoute::Served
-        }
+    let first = first.unwrap();
+    assert!(
+        matches!(
+            first,
+            carrick_personality_linux::dispatch::CompletionRoute::Forward
+                | carrick_personality_linux::dispatch::CompletionRoute::WithWork
+        ),
+        "is_clone3={is_clone3}: TID output refusal completes without parking: {first:?}"
     );
     assert!(!leader_sees_thread(fixture, &mut service, 43));
     assert_eq!(child_control.visible_tid(), None);
-    let parent_preimage = if preparation_fault {
-        assert_eq!(frame.x[0] as i64, -14);
-        // The failed syscall has returned. A peer's subsequent write may
-        // never be consumed by undo retained from that completed call.
-        tid_words.set(0, 0x4444_4444_u32);
-        0x4444_4444
-    } else {
-        0x1111_1111
-    };
-    let child_preimage = if refuse_parent {
-        // Publication never reached this destination. A live peer's update
-        // while parent undo waits must survive; it belongs to no clone undo.
-        tid_words.set(1, 0x3333_3333_u32);
-        crate::lifecycle::COPYOUT_NOT_YET_AT.with(|address| address.set(None));
-        crate::lifecycle::COPYOUT_REFUSE_PUBLISH_AT.with(|address| address.set(Some(child_tid_va)));
-        0x3333_3333
-    } else {
-        0x2222_2222
-    };
-    // The rollback destination is now available, while child output still
-    // refuses. Restore the original preimage before any new birth attempt.
-    set_args(&mut frame);
-    let first = arm_call(fixture, fixture.control, &mut service, &mut frame);
     crate::lifecycle::COPYOUT_NOT_YET_AT.with(|address| address.set(None));
-    crate::lifecycle::COPYOUT_REFUSE_PUBLISH_AT.with(|address| address.set(None));
-    assert_eq!(
-        first.unwrap(),
-        carrick_personality_linux::dispatch::CompletionRoute::Served,
-        "is_clone3={is_clone3}: NotYet on TID destination must prepare and redispatch"
-    );
-    assert_eq!(frame.elr, 0x40_2000 - 4, "is_clone3={is_clone3}");
     assert_eq!(
         carrick_el1_abi::Lifecycle::live(fixture.page),
         2,
-        "is_clone3={is_clone3}: rolled-back NotYet must not leave child live"
+        "is_clone3={is_clone3}: refused TID output must not leave child live"
     );
     assert_eq!(
         tid_words.get::<[u32; 2]>(0),
-        [parent_preimage, child_preimage],
-        "is_clone3={is_clone3}: rollback restores only attempted output preimages"
+        [0x1111_1111, 0x2222_2222],
+        "is_clone3={is_clone3}: refusal restores every attempted output"
     );
     assert!(!leader_sees_thread(fixture, &mut service, 43));
 

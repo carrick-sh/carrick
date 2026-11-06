@@ -565,7 +565,9 @@ pub struct ThreadControlSlot {
     /// Exact native service custody survives execution-slot reuse.
     pub service: carrick_core_abi::service::ServiceCell,
     robust_cursor: [AtomicU64; 7],
-    clone_rollback: [AtomicU64; 6],
+    /// Reserved by the typed-copy slice; clone TID output no longer retains
+    /// rollback state because that operation is deliberately non-parking.
+    _clone_rollback: [AtomicU64; 6],
 }
 
 /// Quiescent initialization was attempted on a live execution authority.
@@ -577,19 +579,6 @@ pub struct ThreadControlSlot {
     ::core::cmp::PartialEq,
 )]
 pub struct AffinitySeedRefused;
-
-/// Undo for the two clone output words, retained until restoration finishes.
-#[derive(::core::clone::Clone, ::core::marker::Copy)]
-pub(crate) struct CloneTidRollback {
-    pub outputs: [(carrick_guest_arch::UserVa, [u8; 4]); 2],
-    pub completion: CloneRollbackCompletion,
-}
-#[derive(::core::clone::Clone, ::core::marker::Copy)]
-pub(crate) enum CloneRollbackCompletion {
-    Retry,
-    Returned(crate::abi::entry::SyscallResult),
-    BirthSettlementFailure,
-}
 
 /// Exact exit-walk progress, owned by the stopped/running member, never by a CPU.
 #[derive(::core::clone::Clone, ::core::marker::Copy)]
@@ -743,7 +732,7 @@ impl ThreadControlSlot {
             in_zone_standard_pending: InZoneStandardPending::new(),
             service: carrick_core_abi::service::ServiceCell::new(),
             robust_cursor: [const { AtomicU64::new(0) }; 7],
-            clone_rollback: [const { AtomicU64::new(0) }; 6],
+            _clone_rollback: [const { AtomicU64::new(0) }; 6],
         }
     }
 
@@ -898,7 +887,7 @@ impl ThreadControlSlot {
         self.alt_sp.store(0, Ordering::Relaxed);
         self.alt_size.store(0, Ordering::Relaxed);
         self.alt_flags.store(0, Ordering::Relaxed);
-        self.clone_rollback[5].store(0, Ordering::Relaxed);
+        self._clone_rollback[5].store(0, Ordering::Relaxed);
         self.robust_cursor[6].store(0, Ordering::Relaxed);
         self.robust_head.store(0, Ordering::Relaxed);
         self.robust_len.store(0, Ordering::Relaxed);
@@ -1092,50 +1081,6 @@ impl ThreadControlSlot {
         self.robust_cursor[6].store(0, Ordering::Relaxed);
         self.robust_head.store(head, Ordering::Relaxed);
         self.robust_len.store(len, Ordering::Release);
-    }
-    pub(crate) fn clone_tid_rollback(&self) -> Option<CloneTidRollback> {
-        let mode = self.clone_rollback[5].load(Ordering::Acquire);
-        let load = |i: usize| self.clone_rollback[i].load(Ordering::Relaxed);
-        let completion = match mode {
-            1 => CloneRollbackCompletion::Retry,
-            2 => CloneRollbackCompletion::Returned(crate::abi::entry::SyscallResult::new(
-                load(4) as i64
-            )),
-            3 => CloneRollbackCompletion::BirthSettlementFailure,
-            _ => return None,
-        };
-        Some(CloneTidRollback {
-            outputs: [
-                (
-                    carrick_guest_arch::UserVa::new(load(0)),
-                    (load(1) as u32).to_le_bytes(),
-                ),
-                (
-                    carrick_guest_arch::UserVa::new(load(2)),
-                    (load(3) as u32).to_le_bytes(),
-                ),
-            ],
-            completion,
-        })
-    }
-    pub(crate) fn retain_clone_tid_rollback(&self, undo: CloneTidRollback) {
-        for (i, (address, bytes)) in undo.outputs.into_iter().enumerate() {
-            self.clone_rollback[i * 2].store(address.raw(), Ordering::Relaxed);
-            self.clone_rollback[i * 2 + 1]
-                .store(u64::from(u32::from_le_bytes(bytes)), Ordering::Relaxed);
-        }
-        let mode = match undo.completion {
-            CloneRollbackCompletion::Retry => 1,
-            CloneRollbackCompletion::Returned(result) => {
-                self.clone_rollback[4].store(result.raw() as u64, Ordering::Relaxed);
-                2
-            }
-            CloneRollbackCompletion::BirthSettlementFailure => 3,
-        };
-        self.clone_rollback[5].store(mode, Ordering::Release);
-    }
-    pub(crate) fn clear_clone_tid_rollback(&self) {
-        self.clone_rollback[5].store(0, Ordering::Release);
     }
     /// Only the exact member's execution owner reads or publishes this cursor.
     pub(crate) fn robust_exit_cursor(&self) -> Option<RobustExitCursor> {
