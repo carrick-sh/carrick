@@ -5616,8 +5616,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             carrick_observability::probes::hvpatch_el1_file_fault_handoff(window.fault_page, 0, 8);
             let frame = outcome?;
             drop(grant);
-            if frame.x[0] == 11 && frame.x[14] == 3 {
-                let wait = crate::user_transfer::authenticated_owner_wait(target, &frame)?;
+            if let Some(wait) = crate::user_transfer::authenticated_owner_wait(target, &frame)? {
                 Ok(Some(carrick_hal::OwnerFileFaultOutcome::PendingOwner(wait)))
             } else {
                 Ok(Some(carrick_hal::OwnerFileFaultOutcome::Refused))
