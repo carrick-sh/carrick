@@ -12241,21 +12241,26 @@ fn clone_nonresident_tid_destination(is_clone3: bool, refusal: CloneRefusal) {
 
 #[test]
 fn arm_non_last_thread_exit_nonresident_clear_tid_and_robust_list_wakes_once() {
-    exit_nonresident_pages(false, true);
+    exit_nonresident_pages(false, true, false);
 }
 
 #[test]
 fn arm_non_last_thread_exit_nonresident_clear_tid_wakes_once() {
-    exit_nonresident_pages(true, true);
+    exit_nonresident_pages(true, true, false);
+}
+
+#[test]
+fn arm_non_last_thread_exit_unmapped_clear_tid_still_exits() {
+    exit_nonresident_pages(true, true, true);
 }
 
 #[test]
 fn arm_robust_owner_death_preserves_waiters_published_during_update() {
-    exit_nonresident_pages(false, false);
+    exit_nonresident_pages(false, false, false);
 }
 
 #[cfg(test)]
-fn exit_nonresident_pages(clear_only: bool, park_output: bool) {
+fn exit_nonresident_pages(clear_only: bool, park_output: bool, fault_clear: bool) {
     crate::lifecycle::CHILD_TID_WAKE_CALLS.with(|calls| calls.borrow_mut().clear());
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
@@ -12486,8 +12491,23 @@ fn exit_nonresident_pages(clear_only: bool, park_output: bool) {
     frame.x[8] = 93; // SYS_exit
     frame.elr = 0x40_3000;
     crate::lifecycle::COPYOUT_NOT_YET_AT.with(|address| address.set(Some(clear_tid_word.arg())));
+    if fault_clear {
+        crate::lifecycle::GUEST_COPY_PREPARATION_FAULT_AT
+            .with(|address| address.set(Some(clear_tid_word.arg())));
+    }
     let exit_second = arm_call(fixture, sibling_control, &mut service, &mut frame);
     crate::lifecycle::COPYOUT_NOT_YET_AT.with(|address| address.set(None));
+    crate::lifecycle::GUEST_COPY_PREPARATION_FAULT_AT.with(|address| address.set(None));
+    if fault_clear {
+        assert_eq!(
+            exit_second.unwrap(),
+            carrick_personality_linux::dispatch::CompletionRoute::HostCustody,
+            "a faulting clear_child_tid is ignored and SYS_exit retains terminal custody"
+        );
+        assert_ne!(frame.x[0] as i64, -14, "SYS_exit must never return EFAULT");
+        assert!(sibling_control.robust_exit_cursor().is_none());
+        return;
+    }
     assert_eq!(
         exit_second.unwrap(),
         carrick_personality_linux::dispatch::CompletionRoute::Served,
