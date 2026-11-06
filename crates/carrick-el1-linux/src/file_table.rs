@@ -276,7 +276,10 @@ pub fn with_host_binding_dup<T, E>(
     cloexec: bool,
     operation: impl FnOnce() -> Result<T, E>,
 ) -> Result<(T, Option<ReleasedDescription>), HostBindingDupError<E>> {
-    if !(0..GUEST_FD_LIMIT).contains(&new_fd) {
+    // The shared authority has already selected and reserved this number
+    // against RLIMIT_NOFILE. The projection has bounded slot storage, not
+    // a numeric fd ceiling: high sparse descriptors need only one slot.
+    if new_fd < 0 {
         return Err(HostBindingDupError::Invalid);
     }
     let _guard = lock_fd_map(fd_map).ok_or(HostBindingDupError::Invalid)?;

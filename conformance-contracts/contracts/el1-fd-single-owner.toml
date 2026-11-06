@@ -15,6 +15,7 @@ structural_budgets = []
 [bindings]
 vm_free = [
   "carrick-kernel::kernel::objects::ipc::tests::{one_table_writer,no_host_slot_selection}",
+  "carrick-el1-linux::aarch64_process_tests::serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof",
 ]
 
 [bindings.unresolved]
