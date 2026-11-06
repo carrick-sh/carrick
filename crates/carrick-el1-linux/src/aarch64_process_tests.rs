@@ -10762,6 +10762,42 @@ fn native_descriptor_witness(
                     0
                 );
                 assert_eq!(events.as_bytes(), &[0xa5; 16]);
+                // A newly constructed epoll uses the same member owner as
+                // an inherited one; register a newly constructed eventfd.
+                let eventfd = completed(sys::EVENTFD2.raw(), [1, LINUX_O_NONBLOCK, 0]);
+                assert!(eventfd >= 0);
+                let mut member_bytes = [0; 16];
+                member_bytes[..4].copy_from_slice(&1u32.to_ne_bytes());
+                member_bytes[8..].copy_from_slice(&0x1506u64.to_ne_bytes());
+                let member = carrick_test_support::GuestUserBuffer::from_bytes(&member_bytes);
+                let (route, added) = run_in_child_full(
+                    idx,
+                    sys::EPOLL_CTL.raw(),
+                    [result as u64, 1, eventfd as u64, member.arg()],
+                );
+                assert!(matches!(
+                    route,
+                    CompletionRoute::Served | CompletionRoute::WithWork
+                ));
+                assert_eq!(added, 0);
+                assert_eq!(
+                    completed(sys::EPOLL_PWAIT.raw(), [result as u64, events.arg(), 1]),
+                    1
+                );
+                assert_eq!(
+                    u64::from_ne_bytes(events.as_bytes()[8..16].try_into().unwrap()),
+                    0x1506
+                );
+                let counter = carrick_test_support::GuestUserBuffer::zeroed(8);
+                assert_eq!(
+                    completed(sys::READ.raw(), [eventfd as u64, counter.arg(), 8]),
+                    8
+                );
+                assert_eq!(
+                    completed(sys::EPOLL_PWAIT.raw(), [result as u64, events.arg(), 1]),
+                    0
+                );
+                assert_eq!(completed(sys::CLOSE.raw(), [eventfd as u64, 0, 0]), 0);
             } else {
                 // A timer constructor must publish a usable, disarmed timer,
                 // not just an fd. This does not prove arming or clock identity.

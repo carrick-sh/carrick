@@ -2409,6 +2409,7 @@ impl<
         self.ipc.zip(self.task()).is_some_and(|(venue, task)| {
             let nr = self.frame.canonical_ordinal().raw();
             if nr == carrick_personality_linux::crossing::nr::PIPE2.raw()
+                || nr == carrick_personality_linux::crossing::nr::EVENTFD2.raw()
                 || nr == carrick_personality_linux::crossing::nr::EPOLL_CREATE1.raw()
                 || nr == carrick_personality_linux::crossing::nr::EPOLL_CTL.raw()
                 || venue.tables.is_owned_table(task)
@@ -2434,6 +2435,7 @@ impl<
         if self.native_descriptor_owner() {
             if [
                 carrick_personality_linux::crossing::nr::PIPE2,
+                carrick_personality_linux::crossing::nr::EVENTFD2,
                 carrick_personality_linux::crossing::nr::EPOLL_CREATE1,
                 carrick_personality_linux::crossing::nr::EPOLL_CTL,
                 carrick_personality_linux::crossing::nr::DUP,
@@ -3667,16 +3669,40 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                     alloc::boxed::Box::new(output),
                 ))
             }
-            nr if nr == carrick_personality_linux::crossing::nr::EPOLL_CREATE1.raw() => {
-                let flags = self.frame.argument(0).unwrap_or(0) as u32 as u64;
-                if flags & !carrick_syscall_abi::LINUX_O_CLOEXEC != 0 {
+            nr if nr == carrick_personality_linux::crossing::nr::EPOLL_CREATE1.raw()
+                || nr == carrick_personality_linux::crossing::nr::EVENTFD2.raw() =>
+            {
+                use carrick_el1_abi::ipc::{EventMode, IpcBacking};
+                let eventfd = nr == carrick_personality_linux::crossing::nr::EVENTFD2.raw();
+                let flags = self.frame.argument(usize::from(eventfd)).unwrap_or(0) as u32 as u64;
+                let allowed = carrick_syscall_abi::LINUX_O_CLOEXEC
+                    | if eventfd {
+                        carrick_abi::LINUX_O_NONBLOCK | carrick_abi::LINUX_EFD_SEMAPHORE
+                    } else {
+                        0
+                    };
+                if flags & !allowed != 0 {
                     return FamilyCompletion::Complete(
                         carrick_syscall_abi::LINUX_EINVAL.guest_retval(),
                     );
                 }
                 let object = loop {
                     let seen = venue.region.object_count();
-                    match venue.region.create_epoll(&NativeFdWait) {
+                    let created = if eventfd {
+                        let mode = if flags & carrick_abi::LINUX_EFD_SEMAPHORE != 0 {
+                            EventMode::Semaphore
+                        } else {
+                            EventMode::Counter
+                        };
+                        venue.region.create_eventfd(
+                            self.frame.argument(0).unwrap_or(0) as u32,
+                            mode,
+                            &NativeFdWait,
+                        )
+                    } else {
+                        venue.region.create_epoll(&NativeFdWait)
+                    };
+                    match created {
                         Ok(object) => break object,
                         Err(carrick_el1_abi::ipc::IpcError::NoObjects) => {
                             if let Err(error) = venue
@@ -3689,6 +3715,12 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                         Err(error) => return map_ipc_error(error),
                     }
                 };
+                let backing = if eventfd {
+                    IpcBacking::EventFd { object }
+                } else {
+                    IpcBacking::Epoll { object }
+                }
+                .encode();
                 if let Some((zone, _)) = zone {
                     for lane in [
                         carrick_el1_abi::ipc::pipe::WaitFor::Readable,
@@ -3699,7 +3731,10 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                                 .bind_object_wait(key, &carrick_sched_core::ShortLockSpin)
                                 .is_err()
                         {
-                            let _ = venue.region.epoll_destroy(object, &NativeFdWait);
+                            if let Err(error) = venue.region.release_backing(backing, &NativeFdWait)
+                            {
+                                return map_ipc_error(error);
+                            }
                             return FamilyCompletion::Complete(
                                 carrick_syscall_abi::LINUX_EIO.guest_retval(),
                             );
@@ -3707,17 +3742,25 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                     }
                 }
                 let description = carrick_el1_abi::ipc::fd::Description::new(
-                    carrick_el1_abi::ipc::IpcBacking::Epoll { object }.encode(),
+                    backing,
                     AccessMode::ReadWrite,
-                    carrick_el1_abi::ipc::fd::StatusFlags::default(),
+                    carrick_el1_abi::ipc::fd::StatusFlags {
+                        nonblock: eventfd && flags & carrick_abi::LINUX_O_NONBLOCK != 0,
+                        ..Default::default()
+                    },
                 );
                 let result = run_with_table_growth(&venue.region, table, |auth| {
-                    auth.open(table, Fd(0), description, flags != 0)
+                    auth.open(
+                        table,
+                        Fd(0),
+                        description,
+                        flags & carrick_syscall_abi::LINUX_O_CLOEXEC != 0,
+                    )
                 });
                 match result {
                     Ok(fd) => FamilyCompletion::Complete(i64::from(fd.0)),
                     Err(error) => {
-                        if let Err(release) = venue.region.epoll_destroy(object, &NativeFdWait) {
+                        if let Err(release) = venue.region.release_backing(backing, &NativeFdWait) {
                             return map_ipc_error(release);
                         }
                         error

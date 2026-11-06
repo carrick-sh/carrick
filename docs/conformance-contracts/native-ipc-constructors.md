@@ -1,8 +1,8 @@
 # Native child IPC constructors (#1506)
 
 `kernel.el1.ipc-fd-authority` covers the constructor ownership work below.
-The epoll and pipe constructors now serve the VM-free native witnesses;
-eventfd and timerfd remain unimplemented. No signed acceptance is claimed.
+The epoll, pipe and eventfd constructors now serve the VM-free native witnesses;
+timerfd remains unimplemented. No signed acceptance is claimed.
 The four
 `serial_host_native_fork_children_create_*_in_their_own_tables` bindings
 fork two children through `NativeProcessRuntime` and call the production
@@ -11,7 +11,7 @@ children and their parent remain live. Each binding requires a ring answer,
 CLOEXEC on the allocated descriptors, no publication into the parent table,
 and distinct backing identities for the two children's newly created objects.
 The pipe result is copied from the user buffer separately after each call.
-The eventfd and timerfd bindings remain red until their ring services exist.
+The timerfd bindings remain red until its ring service exists.
 
 The `serial_host_native_root_creates_*_with_live_children` bindings use the
 same real-fork fixture and production entry, switch back to the root while
@@ -236,3 +236,22 @@ exhaustion reported as errno 12. Mid-publication probes require admission to
 observe the old completed inventory until the segment is fully linked. The
 new locks cover one fixed record segment or one logarithmic buddy operation;
 no syscall retries, timeouts or concurrency budgets are widened.
+
+## Eventfd continuation
+
+Eventfd2 now selects the existing shared descriptor constructor owner for
+both the borrowed root and native child tables. It shares epoll construction's
+object-growth, readiness-key binding, numeric publication and failure cleanup;
+it allocates the existing shared eventfd record rather than a second counter.
+Flags are checked before allocation; semaphore mode, O_NONBLOCK and FD_CLOEXEC
+remain distinct. No user copy or suspension occurs while the constructor owns
+an unpublished object, and failed numeric publication releases it once.
+
+The production two-child witness checks independent counters, initial-value
+read, empty EAGAIN, write/read and flags. The root witness adds invalid flags,
+lowest-hole reuse, two semaphore reads and close. The production fork/exec
+successor constructs both an eventfd and an epoll, reads the initial counter,
+performs a zero-timeout empty epoll wait, checks CLOEXEC and closes both.
+These controls do not prove blocking wake delivery or signed guest execution.
+The earlier epoll host-member and native-wait findings remain landing blockers;
+this continuation reuses that owner and does not replace the work in #1765.
