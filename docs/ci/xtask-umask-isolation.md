@@ -36,3 +36,21 @@ With this change, the same 50 exact runs and 50 complete integration runs
 with 16 threads all passed (100 target passes). The ordinary parallel partition
 and the `RUST_TEST_THREADS=1` serial-host partition also passed separately.
 This is Linux evidence for the reproduced race, not a claim of macOS execution.
+
+## Checkpoint verification on the dispatch runner
+
+A fresh Linux run reproduced the dependence again: the baseline passed 50/50
+exact selections, but only 37/50 complete integration runs with 16 test threads.
+The 13 target failures included `PermissionDenied` from recursive fixture
+creation and from resetting the job area. The fixed binary passed 50/50 exact
+selections and 50/50 complete integration runs with the same 16-thread setting.
+Every fixed complete run exited successfully, so sibling tests passed too.
+
+These are new measurements, independent of the earlier population above.
+The earlier worker's `/var/tmp/1682-evidence` directory was not present in this
+ephemeral checkout. Fresh raw logs, per-run exit statuses and counted verdicts
+are in the dispatch job's `agent/evidence/` directory beside the checkout.
+Before counting, one exact run confirmed the harness selected and completed
+one target test. Both binaries were built from this checkout, temporarily
+restoring the baseline test source for the baseline build, then restoring the
+committed isolation fix. No production source changed.
