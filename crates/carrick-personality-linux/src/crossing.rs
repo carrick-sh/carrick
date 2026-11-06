@@ -212,7 +212,7 @@ host_crossings! {
     Truncate = nr::TRUNCATE, false, Permanent;
     Ftruncate = nr::FTRUNCATE, false, Permanent;
     Fallocate = nr::FALLOCATE, false, Permanent;
-    Faccessat = nr::FACCESSAT, false, Permanent;
+    Faccessat = nr::FACCESSAT, true, Permanent;
     Chdir = nr::CHDIR, false, Permanent;
     Fchdir = nr::FCHDIR, false, Permanent;
     Chroot = nr::CHROOT, false, Permanent;
@@ -220,13 +220,13 @@ host_crossings! {
     Fchmodat = nr::FCHMODAT, false, Permanent;
     Fchownat = nr::FCHOWNAT, false, Permanent;
     Fchown = nr::FCHOWN, false, Permanent;
-    Openat = nr::OPENAT, false, Permanent;
+    Openat = nr::OPENAT, true, Permanent;
     Getdents64 = nr::GETDENTS64, false, Permanent;
     Lseek = nr::LSEEK, true, Permanent;
     Read = nr::READ, true, Permanent;
     Write = nr::WRITE, true, Permanent;
     Readv = nr::READV, false, Permanent;
-    Writev = nr::WRITEV, false, Permanent;
+    Writev = nr::WRITEV, true, Permanent;
     Pread64 = nr::PREAD64, true, Permanent;
     Pwrite64 = nr::PWRITE64, true, Permanent;
     Preadv = nr::PREADV, false, Permanent;
@@ -506,7 +506,10 @@ mod tests {
             );
             assert_eq!(
                 HostCrossingSet::X86.is_allowed(canonical),
-                matches!(ordinal, 22 | 62 | 63 | 64 | 67 | 68 | 93 | 94),
+                matches!(
+                    ordinal,
+                    22 | 48 | 56 | 62 | 63 | 64 | 66 | 67 | 68 | 93 | 94
+                ),
                 "x86 canonical={ordinal}"
             );
         }
@@ -520,7 +523,7 @@ mod tests {
                 .flatten()
                 .filter(|(_, x86, _)| *x86)
                 .count(),
-            8
+            11
         );
         for (crossing, _, _) in HOST_CROSSINGS.iter().flatten().filter(|(_, x86, _)| *x86) {
             let nr = crossing.canonical();
@@ -533,8 +536,6 @@ mod tests {
         for non_crossing in [
             CanonicalNr(0),   // io_setup
             CanonicalNr(17),  // getcwd
-            CanonicalNr(48),  // faccessat
-            CanonicalNr(56),  // openat
             CanonicalNr(113), // clock_gettime
             CanonicalNr(148), // getresuid
             CanonicalNr(174), // getuid

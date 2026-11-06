@@ -99,6 +99,15 @@ pub fn canonical_x86_64(number: crate::NativeNr) -> Option<crate::CanonicalNr> {
     }
 }
 
+/// Normalize legacy x86 `access(path, mode)` to asm-generic `faccessat`.
+/// Both ring admission and host dispatch consume this exact operand shape.
+pub fn normalize_access(args: [u64; 6]) -> (crate::CanonicalNr, [u64; 6]) {
+    (
+        crate::CanonicalNr(48),
+        [crate::LINUX_AT_FDCWD, args[0], args[1], 0, 0, 0],
+    )
+}
+
 /// The full x86_64 syscall table — the WHOLE x86_64 Linux ABI (numbers 0..454).
 ///
 /// Sources for x86_64 numbers (cited per-entry in inline comments):
@@ -166,7 +175,7 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // x86_64=20 (syscalls(2)/filippo) → canonical writev=66
     direct(20, "writev", 66),
     // x86_64=21 access: LEGACY (asm-generic has faccessat=48). Normalized in
-    // x8664_arch::normalize_syscall to faccessat(AT_FDCWD, path, mode, flags=0).
+    // normalize_access by both ring entry and x8664_arch::normalize_syscall.
     // x86_64=22 pipe: LEGACY (asm-generic has pipe2=59). Handled in
     // x8664_arch::normalize_syscall as pipe2(fd, flags=0).
     // x86_64=23 select: LEGACY (asm-generic has pselect6=72). DIFFERENT shape →
