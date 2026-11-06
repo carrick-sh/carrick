@@ -240,7 +240,8 @@ fn split_at_last_paren(s: &str) -> (&str, &str) {
 }
 
 /// Where should `HostFsBackend` place its per-run scratch dir? An explicit
-/// `CARRICK_SCRATCH_ROOT` wins without touching the conventional mount. Prefer
+/// `CARRICK_HOME` places scratch at `$CARRICK_HOME/scratch` without touching
+/// the conventional mount. Prefer
 /// the dedicated carrick APFS volume (always case-sensitive, isolated,
 /// throw-away-able). Fall back to `~/.carrick/scratch` for hosts where
 /// the volume hasn't been laid down yet.
@@ -257,33 +258,25 @@ fn split_at_last_paren(s: &str) -> (&str, &str) {
 pub fn preferred_scratch_root() -> std::io::Result<PathBuf> {
     // Cached once per process; the scratch root cannot change while we run.
     static CACHE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    Ok(CACHE.get_or_init(resolve_scratch_root).clone())
+    Ok(CACHE
+        .get_or_init(|| resolve_scratch_root(&Path::new("/Volumes").join(DEFAULT_VOLUME_NAME)))
+        .clone())
 }
 
-fn resolve_scratch_root() -> PathBuf {
-    if let Some(root) = std::env::var_os("CARRICK_SCRATCH_ROOT").filter(|s| !s.is_empty()) {
-        return PathBuf::from(root);
+fn resolve_scratch_root(conventional: &Path) -> PathBuf {
+    if let Some(home) = std::env::var_os("CARRICK_HOME").filter(|s| !s.is_empty()) {
+        return PathBuf::from(home).join("scratch");
     }
     // Fast path: the conventional mount point of the carrick volume. Verify
     // it's actually case-sensitive (a Linux ABI requirement) so a coincidental
     // dir at that path on a case-insensitive boot volume can't be mistaken for
     // our volume.
-    let conventional = Path::new("/Volumes").join(DEFAULT_VOLUME_NAME);
-    if probe_case_sensitive(&conventional) {
-        return conventional;
+    if probe_case_sensitive(conventional) {
+        return conventional.to_owned();
     }
-    // Fallback: honour the user's $CARRICK_HOME, else $HOME/.carrick. (No
-    // diskutil: a host without the conventional mount almost certainly has no
-    // carrick volume, and an exotic mount can be pointed at via $CARRICK_HOME.)
-    let home = std::env::var_os("CARRICK_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| {
-                let mut p = PathBuf::from(h);
-                p.push(".carrick");
-                p
-            })
-        })
+    // No explicit home and no usable conventional mount: use the user's home.
+    let home = std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join(".carrick"))
         .unwrap_or_else(|| PathBuf::from("/tmp/carrick"));
     home.join("scratch")
 }
@@ -413,17 +406,19 @@ mod tests {
     fn serial_host_scratch_root_override_wins() {
         let root = tempfile::tempdir().unwrap();
         let chosen = root.path().join("internal-scratch");
-        let previous = std::env::var_os("CARRICK_SCRATCH_ROOT");
+        let previous = std::env::var_os("CARRICK_HOME");
         // SAFETY: this test runs in the serial_host partition.
-        unsafe { std::env::set_var("CARRICK_SCRATCH_ROOT", &chosen) };
-        let actual = resolve_scratch_root();
+        unsafe { std::env::set_var("CARRICK_HOME", &chosen) };
+        // The supplied conventional root is available. Even an otherwise
+        // usable conventional mount must lose to the explicit override.
+        let actual = resolve_scratch_root(root.path());
         unsafe {
             match previous {
-                Some(value) => std::env::set_var("CARRICK_SCRATCH_ROOT", value),
-                None => std::env::remove_var("CARRICK_SCRATCH_ROOT"),
+                Some(value) => std::env::set_var("CARRICK_HOME", value),
+                None => std::env::remove_var("CARRICK_HOME"),
             }
         }
-        assert_eq!(actual, chosen);
+        assert_eq!(actual, chosen.join("scratch"));
         assert!(
             !chosen.exists(),
             "override selection must not touch the disk"
