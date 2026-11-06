@@ -96,11 +96,6 @@ pub mod native_terminal_test_control {
             vcpu.get_sys_reg(carrick_hal::SysReg::Ttbr0)?,
             vcpu.get_sys_reg(carrick_hal::SysReg::Ttbr1)?,
         ];
-        // Native leave_space, rather than a forwarded exit_group, must have
-        // installed the maintenance root on the actual stopped hardware.
-        if roots[0] != carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE {
-            return Ok(());
-        }
         let mut observation = probe.lock();
         if observation.hardware_roots.is_none() {
             observation.hardware_roots = Some(roots);
