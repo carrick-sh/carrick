@@ -45,6 +45,71 @@ fn empty_image_archive() -> Vec<u8> {
     archive
 }
 
+// This exercises image config, PATH lookup and shebang argv rewriting through
+// the production CLI boundary, without depending on a registry or libc startup.
+#[test]
+fn image_path_and_shebang_entrypoints_use_the_shared_resolver() {
+    assert!(std::path::Path::new("/dev/kvm").exists(), "requires KVM");
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("hello");
+    compile_assembly("x86_hello.S", &elf);
+    let bytes = std::fs::read(&elf).unwrap();
+    let mut layer = Vec::new();
+    {
+        let mut tar = tar::Builder::new(&mut layer);
+        for (name, contents) in [
+            ("opt/image/bin/python3", bytes.as_slice()),
+            ("opt/image/bin/go", bytes.as_slice()),
+            (
+                "opt/image/bin/docker-entrypoint.sh",
+                b"#!/opt/image/bin/python3\n".as_slice(),
+            ),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            tar.append_data(&mut header, name, contents).unwrap();
+        }
+        tar.finish().unwrap();
+    }
+    let config = br#"{"architecture":"amd64","os":"linux","config":{"Env":["PATH=/missing:/opt/image/bin"],"Entrypoint":["docker-entrypoint.sh"],"Cmd":["argument"]}}"#;
+    let manifest =
+        br#"[{"Config":"config.json","RepoTags":["x86-path:latest"],"Layers":["layer.tar"]}]"#;
+    let mut archive = Vec::new();
+    {
+        let mut tar = tar::Builder::new(&mut archive);
+        append_tar(&mut tar, "manifest.json", manifest);
+        append_tar(&mut tar, "config.json", config);
+        append_tar(&mut tar, "layer.tar", &layer);
+        tar.finish().unwrap();
+    }
+    let archive_path = dir.path().join("image.tar");
+    std::fs::write(&archive_path, archive).unwrap();
+    let cli = assert_cmd::cargo::cargo_bin("carrick");
+    let home = dir.path().join("home");
+    let load = Command::new(&cli)
+        .timeout(Duration::from_secs(10))
+        .env("CARRICK_HOME", &home)
+        .args(["load", "--input", archive_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(load.status.success(), "load: {:?}", load);
+    for command in [None, Some("python3"), Some("go")] {
+        let mut run = Command::new(&cli);
+        run.timeout(Duration::from_secs(10))
+            .env("CARRICK_HOME", &home)
+            .env("CARRICK_RUN_ID", "issue-1713-image-path")
+            .args(["run", "--platform", "linux/amd64", "--pull", "never"]);
+        if let Some(command) = command {
+            run.args(["--entrypoint", command]);
+        }
+        let output = run.arg("x86-path:latest").output().unwrap();
+        assert_eq!(output.stdout, b"hello\n", "{command:?}: {output:?}");
+        assert_eq!(output.status.code(), Some(7), "{command:?}: {output:?}");
+    }
+}
+
 #[test]
 fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
     let present = std::path::Path::new("/dev/kvm").exists();

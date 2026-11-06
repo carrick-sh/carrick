@@ -1,0 +1,22 @@
+schema_version = 1
+id = "runtime.image-entrypoint"
+title = "Image entrypoints share PATH and shebang resolution across execution lanes"
+guest_surfaces = ["cli:run", "image:entrypoint", "image:PATH"]
+semantic_authority = [
+  "OCI image Env supplies PATH for bare entrypoints; Entrypoint precedes Cmd arguments",
+  "execve(2): a shebang substitutes its interpreter and inserts the script pathname before the remaining arguments",
+]
+fixture = "Local amd64 image with PATH=/missing:/opt/image/bin, bare python3/go and a docker-entrypoint.sh shebang"
+scale_points = [1, 3]
+structural_budgets = []
+rationale = "Both ARM/HVF and x86/KVM must call the existing ISA-neutral entrypoint resolver. PATH is searched once in declaration order; shebang recursion remains bounded by the shared four-level resolver. The tiny static executable isolates initial image resolution from language-runtime syscall coverage. This routing change claims no runtime ratio or new algorithmic budget."
+
+[bindings]
+ecosystem = [
+  "carrick-cli::x86_kvm_run::image_path_and_shebang_entrypoints_use_the_shared_resolver",
+]
+
+[bindings.unresolved]
+vm_free = "Image config and backend routing require the production CLI binding; existing resolver unit tests cover the lower-level policy."
+embed_structural = "ARM/HVF signed execution is unavailable on this Linux KVM worker."
+docker = "Docker is unavailable on this worker; the static payload's native Linux output and exit status are covered by x86.carrier.cli-run."
