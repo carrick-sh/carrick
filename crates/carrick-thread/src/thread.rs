@@ -1330,6 +1330,10 @@ pub struct FutexTable {
     /// Continuation-model wait queues sharded by futex address.
     queues: Box<[Arc<ParkingMutex<FutexQueue>>; FUTEX_SHARDS]>,
     next_ticket: AtomicU64,
+    /// Absolute guest-monotonic deadlines retained while a relative wait is
+    /// redispatched through an owner-memory dependency. One Linux thread can
+    /// own at most one syscall continuation at a time.
+    retry_deadlines: ParkingMutex<HashMap<ThreadId, ([u64; 4], std::time::Duration)>>,
     /// Exact shared-word identities belong to this queue owner. Two kernel
     /// instances may use the same file word without sharing a wait queue.
     shared_buckets: Arc<SharedBucketMap>,
@@ -1348,12 +1352,36 @@ impl FutexTable {
                 Arc::new(ParkingMutex::new(FutexQueue::default()))
             })),
             next_ticket: AtomicU64::new(0),
+            retry_deadlines: ParkingMutex::new(HashMap::new()),
             shared_buckets: Arc::new(SharedBucketMap {
                 shards: Box::new(std::array::from_fn(|_| ParkingMutex::new(HashMap::new()))),
             }),
             #[cfg(any(test, feature = "test-support"))]
             word_wait_enrollment_observer: ParkingMutex::new(None),
         }
+    }
+
+    pub fn relative_wait_remaining(
+        &self,
+        tid: ThreadId,
+        signature: [u64; 4],
+        now: std::time::Duration,
+        requested: std::time::Duration,
+    ) -> std::time::Duration {
+        let mut deadlines = self.retry_deadlines.lock();
+        let deadline = match deadlines.get(&tid) {
+            Some((saved, deadline)) if *saved == signature => *deadline,
+            _ => {
+                let deadline = now.saturating_add(requested);
+                deadlines.insert(tid, (signature, deadline));
+                deadline
+            }
+        };
+        deadline.saturating_sub(now)
+    }
+
+    pub fn finish_relative_wait(&self, tid: ThreadId) {
+        self.retry_deadlines.lock().remove(&tid);
     }
 
     /// Observe successful blocking word-wait enrollment on this table only.
