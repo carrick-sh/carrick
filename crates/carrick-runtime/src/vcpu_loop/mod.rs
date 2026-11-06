@@ -2038,6 +2038,27 @@ where
             binding::OwnedSyscallResume::Io(pending) => {
                 self.resume_owned_io(kernel, engine, pending, host_wait)
             }
+            binding::OwnedSyscallResume::Futex(pending) => {
+                let context = self.service_kernel_context.as_ref().ok_or_else(|| {
+                    RuntimeError::Configuration(
+                        "futex continuation lost its exact context".to_owned(),
+                    )
+                })?;
+                let tid = u32::try_from(context.thread().key().tid.raw())
+                    .ok()
+                    .and_then(|tid| carrick_kernel::namespace::pid::kernel_to_ns_for(context, tid));
+                Ok(pending.resume(
+                    context,
+                    context.task().container().clock(),
+                    engine,
+                    &kernel.reporter,
+                    &self.futex,
+                    self.this_tid,
+                    &self.registry,
+                    tid,
+                    kernel.dispatcher.work_scope().as_ref(),
+                ))
+            }
             binding::OwnedSyscallResume::Sleep(pending) => Ok(pending.resume(engine)),
             binding::OwnedSyscallResume::Ipc(pending) => {
                 self.resume_ipc_copyout(kernel, engine, pending)

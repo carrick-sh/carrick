@@ -245,6 +245,7 @@ pub(super) enum OwnerSupplyWait {
 /// The syscall operation to resume after an owner-memory dependency.
 /// A retained transfer cannot fall through to numeric syscall redispatch.
 pub(super) enum OwnedSyscallResume {
+    Futex(Box<carrick_kernel::dispatch::OwnedFutexWait>),
     Output(Box<carrick_kernel::kernel::continuation::output::RetainedOutputCompletion>),
     CopyoutRedispatch,
     Ipc(carrick_kernel::kernel::continuation::ipc::RetainedIpcOperation),
@@ -273,6 +274,9 @@ pub(super) fn owner_copyin_route(
             pending.wait().clone(),
             OwnedSyscallResume::Io(OwnedIoResume::PipeRead(pending)),
         ),
+        DispatchOutcome::FutexOwnerSuspended(pending) => {
+            (pending.wait().clone(), OwnedSyscallResume::Futex(pending))
+        }
         DispatchOutcome::SleepCopyInSuspended(pending) => {
             (pending.wait().clone(), OwnedSyscallResume::Sleep(pending))
         }
@@ -3703,6 +3707,7 @@ where
 
         let outcome = match outcome {
             DispatchOutcome::ZoneFutexWait {
+                relative,
                 queue,
                 uaddr,
                 value,
@@ -3711,7 +3716,7 @@ where
                 index,
             } => {
                 return self.zone_park(
-                    engine, control, frame, queue, uaddr, value, bitset, timeout, index,
+                    engine, control, frame, queue, uaddr, value, bitset, timeout, index, relative,
                 );
             }
             DispatchOutcome::ZoneFutexWoken { value, woken } => {
@@ -7409,6 +7414,95 @@ mod tests {
                     |_| false
                 ),
             super::super::owner_wait::Settlement::Cancelled(OwnerWaitCancellation::GroupExit)
+        ));
+    }
+
+    #[test]
+    fn fatal_signal_settlement_cancels_the_owned_futex_before_owner_readiness() {
+        use super::super::owner_wait::{OwnerWait, Settlement};
+        use carrick_el1_abi::{
+            El1MmHandle, Lifecycle, PortalOwnerWait, PortalWaitCause, ReservationMm,
+        };
+        use carrick_guest_mem::{CurrentMmMemory, MemoryError};
+        use carrick_kernel::dispatch::{SyscallArgs, SyscallRequest, ThreadCtx};
+        struct Word(PortalOwnerWait);
+        impl GuestMemory for Word {
+            fn read_bytes_raw(&self, _: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+                let mut timespec = [0_u8; 16];
+                timespec[..8].copy_from_slice(&5_i64.to_ne_bytes());
+                Ok(timespec[..length].to_vec())
+            }
+            fn atomic_load_user_u32(&self, _: u64) -> Result<u32, MemoryError> {
+                Err(MemoryError::OwnerWait(self.0))
+            }
+            fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+                unreachable!()
+            }
+        }
+        impl CurrentMmMemory for Word {}
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let tid = crate::thread::ThreadId::synthetic_for_tests(1745);
+        let registry = crate::thread::ThreadRegistry::new(tid);
+        let peer = crate::thread::ThreadId::synthetic_for_tests(1746);
+        let plan = carrick_kernel::kernel::ClonePlan::from_flags(
+            carrick_abi::LinuxCloneFlags::THREAD
+                | carrick_abi::LinuxCloneFlags::SIGHAND
+                | carrick_abi::LinuxCloneFlags::VM,
+        )
+        .unwrap();
+        let sibling = context
+            .kernel()
+            .clone_thread(&context, plan, peer, None)
+            .unwrap();
+        assert!(context.task().thread(sibling.thread().key().tid).is_some());
+        let wait = unsafe {
+            PortalOwnerWait::from_owner(
+                El1MmHandle::from_admitted_owner(
+                    NonZeroU64::MIN,
+                    ReservationMm::new(context.shared().mm_id().raw()).unwrap(),
+                    NonZeroU64::MIN,
+                ),
+                PortalWaitCause::Reservations,
+                7,
+            )
+        };
+        let futex = crate::thread::FutexTable::new();
+        let outcome = dispatcher
+            .dispatch_threaded(
+                &context,
+                SyscallRequest::new(98, SyscallArgs::from([0x200000, 128, 7, 0x200100, 0, 0])),
+                &mut Word(wait),
+                &carrick_kernel::compat::CompatReporter::default(),
+                ThreadCtx::new(tid, &registry, &futex),
+            )
+            .unwrap();
+        let (outcome, resume) = owner_copyin_route(outcome);
+        assert_eq!(
+            outcome,
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+        );
+        let Some(resume @ OwnedSyscallResume::Futex(_)) = resume else {
+            panic!("lost futex owner")
+        };
+        let Settlement::Waiting(parked) = OwnerWait::new((), resume).settle(|| None, |_| false)
+        else {
+            panic!("owner must still be closed")
+        };
+        context
+            .lifecycle_page()
+            .process_exit_custody()
+            .cancellation_authority()
+            .publish(
+                carrick_core::cancellation::ProcessCancellation::FatalSignal,
+                || panic!("no effects"),
+            );
+        assert!(matches!(
+            parked.settle(
+                || carrick_kernel::kernel::continuation::owner_wait_cancellation(&context),
+                |_| panic!("fatal cancellation precedes owner readiness")
+            ),
+            Settlement::Cancelled(OwnerWaitCancellation::Carrier)
         ));
     }
 

@@ -1881,6 +1881,97 @@ mod futex_queue_authority {
     /// reaches the other venue's waiter because both venues resolve the
     /// mm's one queue.
     #[test]
+    fn relative_futex_deadline_survives_final_zone_owner_recheck() {
+        use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+        use std::num::NonZeroU64;
+        use std::time::{Duration, SystemTime};
+        let mut f = Fixture::new(9341);
+        f.clock = crate::kernel::container::ClockDomain::deterministic(SystemTime::UNIX_EPOCH);
+        f.write_word(7);
+        f.memory
+            .write_bytes(WORD + 16, &5_i64.to_ne_bytes())
+            .unwrap();
+        let request = SyscallRequest::new(
+            98,
+            SyscallArgs::from([
+                WORD,
+                LINUX_FUTEX_WAIT | LinuxFutexFlags::PRIVATE.bits(),
+                7,
+                WORD + 16,
+                0,
+                0,
+            ]),
+        );
+        crate::el1_zone::with_test_zone(f.zone, || {
+            f.assert_two_live_threads();
+            let first = crate::dispatch::futex::dispatch_threaded_futex(
+                &f.root,
+                &f.clock,
+                &f.shared,
+                request,
+                &mut f.memory,
+                &f.reporter,
+                &f.futex,
+                f.root_tid,
+                &f.registry,
+                None,
+                None,
+                FutexQueueAuthority::of_context(&f.root),
+            );
+            let DispatchOutcome::ZoneFutexWait {
+                relative: Some(operation),
+                timeout,
+                ..
+            } = first
+            else {
+                panic!("zone admission lost its operation: {first:?}");
+            };
+            assert_eq!(timeout, Some(Duration::from_secs(5)));
+            // This is the same typed transfer zone_park performs if its final
+            // atomic load under the bucket refuses the owner interval.
+            let wait = unsafe {
+                PortalOwnerWait::from_owner(
+                    El1MmHandle::from_admitted_owner(
+                        NonZeroU64::MIN,
+                        ReservationMm::new(f.root.shared().mm_id().raw()).unwrap(),
+                        NonZeroU64::MIN,
+                    ),
+                    PortalWaitCause::Reservations,
+                    7,
+                )
+            };
+            let suspended =
+                operation.retain(DispatchOutcome::OwnerMemoryWait { wait, committed: 0 });
+            let DispatchOutcome::FutexOwnerSuspended(pending) = suspended else {
+                panic!("lost zone retry")
+            };
+            f.clock.advance(Duration::from_secs(1)).unwrap();
+            let second = pending.resume(
+                &f.root,
+                &f.clock,
+                &mut f.memory,
+                &f.reporter,
+                &f.futex,
+                f.root_tid,
+                &f.registry,
+                None,
+                None,
+            );
+            let DispatchOutcome::ZoneFutexWait {
+                relative: Some(operation),
+                timeout,
+                ..
+            } = second
+            else {
+                panic!("zone retry lost its operation: {second:?}");
+            };
+            assert_eq!(timeout, Some(Duration::from_secs(4)));
+            f.clock.advance(Duration::from_secs(4)).unwrap();
+            assert_eq!(operation.remaining(&f.clock), Duration::ZERO);
+        });
+    }
+
+    #[test]
     fn two_live_threads_meet_in_one_queue_across_venues() {
         let mut f = Fixture::new(9311);
         crate::el1_zone::with_test_zone(f.zone, || {

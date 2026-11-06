@@ -2514,6 +2514,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .map_err(|_| NativeProcessError::Quarantined)?;
         }
         if exiting {
+            self.take_relative_futex();
             if let (ServiceOperation::Exec { .. }, ServiceResult::ExecPrepared(receipt)) =
                 (request.operation, result)
             {
@@ -2556,6 +2557,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }
                 Err(_) => result = ServiceResult::Refused,
             }
+        }
+        if result != ServiceResult::Supplied {
+            self.take_relative_futex();
         }
         self.finish_service_result(request, result, pending, retry_syscall_after_supply)
     }

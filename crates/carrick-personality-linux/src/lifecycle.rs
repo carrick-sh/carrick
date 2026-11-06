@@ -269,6 +269,10 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
         None
     }
     /// Prepare an unavailable input and retain its exact syscall until ready.
+    fn take_futex_operation(&mut self) -> Option<crate::sched::FutexOperation> {
+        None
+    }
+    fn retain_futex_operation(&mut self, _operation: crate::sched::FutexOperation) {}
     fn wait_guest_copy(&mut self, request: GuestCopyRequest) -> LifecycleOutcome;
     /// An admitted process may retain an exact-MM write authority (including COW).
     /// None means this venue does not own user transfers.

@@ -180,6 +180,177 @@ pub(crate) fn dispatch_threaded_futex(
     work_scope: Option<&carrick_observability::work_meter::WorkScope>,
     queue: crate::el1_zone::FutexQueueAuthority,
 ) -> DispatchOutcome {
+    let relative = if request.arg(1) & LINUX_FUTEX_CMD_MASK == LINUX_FUTEX_WAIT
+        && request.arg(1) & !(LINUX_FUTEX_CMD_MASK | LinuxFutexFlags::SUPPORTED_MASK) == 0
+        && request.arg(0).is_multiple_of(4)
+        && request.arg(3) != 0
+    {
+        let timespec = match read_futex_timespec(memory, request.arg(3)) {
+            Ok(timespec) => timespec,
+            Err(outcome) => return outcome,
+        };
+        let interval = match duration_from_linux_timespec(timespec) {
+            Ok(duration) => duration.unwrap_or(Duration::ZERO),
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        Some(RelativeFutexWait {
+            request,
+            deadline: clock.monotonic_now().saturating_add(interval),
+        })
+    } else {
+        None
+    };
+    dispatch_relative_futex(
+        context,
+        clock,
+        shared,
+        request,
+        memory,
+        reporter,
+        futex,
+        _tid,
+        registry,
+        hvpatch_linux_tid,
+        work_scope,
+        queue,
+        relative,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_relative_futex(
+    context: &crate::kernel::KernelContext,
+    clock: &crate::kernel::container::ClockDomain,
+    shared: &carrick_thread::platform_futex::SharedFutexTable,
+    request: SyscallRequest,
+    memory: &mut impl CurrentMmMemory,
+    reporter: &CompatReporter,
+    futex: &crate::thread::FutexTable,
+    tid: crate::thread::ThreadId,
+    registry: &crate::thread::ThreadRegistry,
+    hvpatch_linux_tid: Option<u32>,
+    work_scope: Option<&carrick_observability::work_meter::WorkScope>,
+    queue: crate::el1_zone::FutexQueueAuthority,
+    relative: Option<RelativeFutexWait>,
+) -> DispatchOutcome {
+    let outcome = dispatch_threaded_futex_inner(
+        context,
+        clock,
+        shared,
+        request,
+        memory,
+        reporter,
+        futex,
+        tid,
+        registry,
+        hvpatch_linux_tid,
+        work_scope,
+        queue,
+        relative.as_ref(),
+    );
+    match relative {
+        Some(operation) => operation.retain(outcome),
+        None => outcome,
+    }
+}
+
+/// A single relative WAIT operation, moved between owner service and queue
+/// admission. Neither a numeric tid nor a later identical syscall can find it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RelativeFutexWait {
+    request: SyscallRequest,
+    deadline: Duration,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct OwnedFutexWait {
+    operation: RelativeFutexWait,
+    wait: carrick_guest_mem::MemoryReadWait,
+}
+impl OwnedFutexWait {
+    pub fn wait(&self) -> &carrick_guest_mem::MemoryReadWait {
+        &self.wait
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn resume(
+        self,
+        context: &crate::kernel::KernelContext,
+        clock: &crate::kernel::container::ClockDomain,
+        memory: &mut impl CurrentMmMemory,
+        reporter: &CompatReporter,
+        futex: &crate::thread::FutexTable,
+        tid: crate::thread::ThreadId,
+        registry: &crate::thread::ThreadRegistry,
+        hvpatch_linux_tid: Option<u32>,
+        work_scope: Option<&carrick_observability::work_meter::WorkScope>,
+    ) -> DispatchOutcome {
+        let request = self.operation.request;
+        dispatch_relative_futex(
+            context,
+            clock,
+            context.kernel().shared_futex(),
+            request,
+            memory,
+            reporter,
+            futex,
+            tid,
+            registry,
+            hvpatch_linux_tid,
+            work_scope,
+            crate::el1_zone::FutexQueueAuthority::of_context(context),
+            Some(self.operation),
+        )
+    }
+}
+impl RelativeFutexWait {
+    pub fn remaining(&self, clock: &crate::kernel::container::ClockDomain) -> Duration {
+        clock.scale_timeout(self.deadline.saturating_sub(clock.monotonic_now()))
+    }
+    /// Transfer custody through the last zone comparison as well as dispatcher
+    /// copies. A terminal result drops this operation instead of caching it.
+    pub fn retain(self, mut outcome: DispatchOutcome) -> DispatchOutcome {
+        use carrick_guest_mem::MemoryReadWait;
+        let wait = match outcome {
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 } => MemoryReadWait::Owner(wait),
+            DispatchOutcome::OwnerMemorySupply {
+                request,
+                committed: 0,
+            } => MemoryReadWait::Supply(request),
+            DispatchOutcome::OwnerPhysicalWait { wait, committed: 0 } => {
+                MemoryReadWait::Physical(wait)
+            }
+            DispatchOutcome::ZoneFutexWait {
+                ref mut relative, ..
+            } => {
+                *relative = Some(self);
+                return outcome;
+            }
+            other => return other,
+        };
+        DispatchOutcome::FutexOwnerSuspended(Box::new(OwnedFutexWait {
+            operation: self,
+            wait,
+        }))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_threaded_futex_inner(
+    context: &crate::kernel::KernelContext,
+    clock: &crate::kernel::container::ClockDomain,
+    shared: &carrick_thread::platform_futex::SharedFutexTable,
+    request: SyscallRequest,
+    memory: &mut impl CurrentMmMemory,
+    reporter: &CompatReporter,
+    futex: &crate::thread::FutexTable,
+    _tid: crate::thread::ThreadId,
+    registry: &crate::thread::ThreadRegistry,
+    hvpatch_linux_tid: Option<u32>,
+    work_scope: Option<&carrick_observability::work_meter::WorkScope>,
+    queue: crate::el1_zone::FutexQueueAuthority,
+    relative: Option<&RelativeFutexWait>,
+) -> DispatchOutcome {
     let address = request.arg(0);
     let operation = request.arg(1);
     let value = request.arg(2) as u32;
@@ -315,7 +486,7 @@ pub(crate) fn dispatch_threaded_futex(
     if shared_location.is_none()
         && let Some(queue) = queue.zone()
     {
-        return dispatch_zone_futex(
+        return dispatch_zone_futex_inner(
             clock,
             request,
             memory,
@@ -324,6 +495,7 @@ pub(crate) fn dispatch_threaded_futex(
             futex_flags,
             word,
             queue,
+            relative.map(|operation| operation.remaining(clock)),
         );
     }
 
@@ -422,7 +594,9 @@ pub(crate) fn dispatch_threaded_futex(
                     errno: LINUX_EAGAIN,
                 };
             }
-            let timeout = if timeout_address == 0 {
+            let timeout = if let Some(relative) = relative {
+                Some(relative.remaining(clock))
+            } else if timeout_address == 0 {
                 None
             } else {
                 let timespec = match read_futex_timespec(memory, timeout_address) {
@@ -579,6 +753,31 @@ pub(crate) fn dispatch_zone_futex(
     word: u32,
     queue: crate::el1_zone::ZoneFutexQueue,
 ) -> DispatchOutcome {
+    dispatch_zone_futex_inner(
+        clock,
+        request,
+        memory,
+        raw_command,
+        command,
+        futex_flags,
+        word,
+        queue,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_zone_futex_inner(
+    clock: &crate::kernel::container::ClockDomain,
+    request: SyscallRequest,
+    memory: &mut impl CurrentMmMemory,
+    raw_command: u64,
+    command: u64,
+    futex_flags: LinuxFutexFlags,
+    word: u32,
+    queue: crate::el1_zone::ZoneFutexQueue,
+    relative_remaining: Option<Duration>,
+) -> DispatchOutcome {
     let address = request.arg(0);
     let value = request.arg(2) as u32;
     let timeout_address = request.arg(3);
@@ -604,7 +803,9 @@ pub(crate) fn dispatch_zone_futex(
                     errno: LINUX_EAGAIN,
                 };
             }
-            let timeout = if timeout_address == 0 {
+            let timeout = if let Some(remaining) = relative_remaining {
+                Some(remaining)
+            } else if timeout_address == 0 {
                 None
             } else {
                 let timespec = match read_futex_timespec(memory, timeout_address) {
@@ -626,6 +827,7 @@ pub(crate) fn dispatch_zone_futex(
                 }
             };
             DispatchOutcome::ZoneFutexWait {
+                relative: None,
                 queue,
                 uaddr: address,
                 value,
@@ -812,6 +1014,7 @@ pub(crate) fn dispatch_futex_waitv_args(
         // As on the table path below, the wait parks on the last entry only.
         if let Some(queue) = queue.zone() {
             return DispatchOutcome::ZoneFutexWait {
+                relative: None,
                 queue,
                 uaddr: entry.address,
                 value: entry.value,

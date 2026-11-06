@@ -121,6 +121,9 @@ where
             }
         }
         policy::Disposition::Handler(handler) => {
+            // The handler may issue an identical futex or park copying its
+            // frame. Neither operation owns the interrupted wait's deadline.
+            process.take_relative_futex();
             let restarted = if carrick_signal_core::wait::interrupted_wait(
                 carrick_signal_core::wait::RestartClass::IfSaRestart,
                 carrick_signal_core::wait::WaitProgress::Blocked,

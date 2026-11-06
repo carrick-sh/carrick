@@ -1634,6 +1634,7 @@ impl BlockedContinuation {
             | DispatchOutcome::Errno { .. }
             | DispatchOutcome::WriteCopyInSuspended(_)
             | DispatchOutcome::SleepCopyInSuspended(_)
+            | DispatchOutcome::FutexOwnerSuspended(_)
             | DispatchOutcome::OwnerCancelled(_)
             | DispatchOutcome::PipeReadSuspended(_)
             | DispatchOutcome::OutputSuspended(_)

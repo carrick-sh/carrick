@@ -675,6 +675,7 @@ pub(crate) use fs::directory::DirectoryReadOutput;
 pub use fs::pipe::{OwnedPipeRead, SuspendedPipeRead};
 pub use fs::rw::OwnedWriteCopyIn;
 pub use fs::state::{PipedOutput, StdioReadiness};
+pub use futex::{OwnedFutexWait, RelativeFutexWait};
 pub use time::OwnedSleepCopyIn;
 mod keys;
 pub use fs::MountRetirement;

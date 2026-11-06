@@ -57,7 +57,8 @@ impl ZoneWaitPolicy {
             | OwnedSyscallResume::CopyoutRedispatch
             | OwnedSyscallResume::Ipc(_)
             | OwnedSyscallResume::Io(_)
-            | OwnedSyscallResume::Sleep(_) => Self::KillableOwnerMemory,
+            | OwnedSyscallResume::Sleep(_)
+            | OwnedSyscallResume::Futex(_) => Self::KillableOwnerMemory,
         }
     }
 }
@@ -702,6 +703,7 @@ where
         bitset: u32,
         timeout: Option<std::time::Duration>,
         index: u32,
+        relative: Option<carrick_kernel::dispatch::RelativeFutexWait>,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
         let (zone, mm) = (queue.tables(), queue.key());
         let state = engine.snapshot_guest_state_for_publication()?;
@@ -773,9 +775,17 @@ where
                 },
             }
         };
+        let timeout = match relative.as_ref() {
+            Some(operation) => Some(operation.remaining(context.task().container().clock())),
+            None => timeout,
+        };
         let (record, seq) = match parked {
             Ok(parked) => parked,
             Err(outcome) => {
+                let outcome = match relative {
+                    Some(operation) => operation.retain(outcome),
+                    None => outcome,
+                };
                 return self.route_outcome(engine, control, frame, outcome);
             }
         };

@@ -137,3 +137,28 @@ WAIT also needs separate treatment: Linux WAIT only reads its operand, so a
 mandatory writeback must not introduce a write-permission requirement. These
 constraints apply to the existing host paths; they do not justify a new
 fallback, owner polling loop, outcome type, or an early debt-ceiling decrease.
+
+
+Relative `FUTEX_WAIT` owns its deadline after the timeout input is admitted.
+An owner refusal on the word does not admit a new interval. The host moves a
+`RelativeFutexWait` through its memory-service continuation and the final zone
+comparison; successful queue admission consumes it into the timed wait.
+EL1 keeps `FutexOperation` in the exact native member continuation row. This
+row survives both an owner-service park and synchronous `Redispatch`, without
+using saved register words, `TrapFrame.far`, or a numeric-tid deadline cache.
+Completion, forwarding, copy faults, caught signals and terminal retirement
+consume the operation. A later identical syscall receives a fresh deadline.
+
+The VM-free two-thread reductions use a five-second interval at tick 100 and
+advance one tick during owner service: completion must occur at 105, not 106.
+The EL1 retry overwrites FAR as the SVC vector does, and the host retry mutates
+the timespec to ensure it uses captured input. The zone binding retains the
+operation past dispatcher return through the same owner-refusal transfer used
+by `zone_park`. A caught signal sent during native owner service remains
+pending through that internal dependency. The resumed futex returns errno 4;
+real handler delivery releases the old operation and allows a new identical
+wait to expire at 106.
+There is one owned deadline, one dependency enrollment per actual refusal, and
+no polling, timeout extension or per-tid search. Signed execution and Docker
+runtime-ratio evidence remain required higher-layer evidence; these clocked
+reductions do not establish those results.

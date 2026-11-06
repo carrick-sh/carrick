@@ -497,6 +497,9 @@ pub enum FdWaitCompletion {
 #[derive(Debug, PartialEq, Eq, ::serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DispatchOutcome {
+    /// An admitted relative futex wait retains its original deadline while
+    /// memory ownership is serviced. Cancellation drops the sole operation.
+    FutexOwnerSuspended(#[serde(skip_serializing)] Box<super::futex::OwnedFutexWait>),
     /// A retained output operation transfers its single memory dependency.
     OutputSuspended(
         #[serde(skip_serializing)]
@@ -773,6 +776,8 @@ pub enum DispatchOutcome {
     /// suspend on its zone continuation; complete with `index` when woken,
     /// `-ETIMEDOUT` at `timeout`, `-EINTR` for a signal.
     ZoneFutexWait {
+        #[serde(skip)]
+        relative: Option<super::futex::RelativeFutexWait>,
         /// The waiting address space's one queue, resolved by the
         /// dispatcher from its mm: the backend parks there and nowhere else.
         #[serde(skip)]

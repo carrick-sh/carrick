@@ -12017,20 +12017,34 @@ fn signal_setup_nonresident_input(nr: u64) {
 
 #[test]
 fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
-    futex_owner_wait(false);
+    futex_owner_wait(false, false, false);
 }
 
 #[test]
 fn futex_relative_deadline_survives_owner_wait_with_two_live_threads() {
-    futex_owner_wait(true);
+    futex_owner_wait(true, false, false);
+}
+
+#[test]
+fn futex_relative_deadline_survives_synchronous_redispatch_with_two_live_threads() {
+    futex_owner_wait(true, true, false);
+}
+
+#[test]
+fn signal_during_futex_owner_park_releases_the_operation_before_an_identical_wait() {
+    futex_owner_wait(true, false, true);
 }
 
 #[cfg(test)]
-fn futex_owner_wait(timed: bool) {
+fn futex_owner_wait(timed: bool, synchronous: bool, interrupted: bool) {
     use crate::native_process_runtime::host_test_support::Physical;
     use crate::sched::{LinuxSchedEntry, UserWord};
     use carrick_el1_abi::Lifecycle;
     use carrick_personality_linux::dispatch::CompletionRoute;
+    use carrick_personality_linux::signal::{
+        ProcessSignals, SignalInfo, SignalRequest, SignalThreadSelector,
+    };
+    use carrick_signal_core::policy::{Action, Disposition, HandlerAddress, Signal};
     struct Word {
         missing: core::cell::Cell<bool>,
         value: core::cell::Cell<u32>,
@@ -12068,11 +12082,13 @@ fn futex_owner_wait(timed: bool) {
         .for_entry(source, &fixture.task, fixture.address)
         .unwrap();
     let sibling = host_born_sibling(fixture, 42);
-    let mut gettid = carrick_el1_abi::TrapFrame::default();
-    gettid.x[8] = 178;
-    arm_call(fixture, sibling, &mut native_service, &mut gettid).unwrap();
-    assert_eq!(gettid.x[0], 42);
-    assert!(leader_sees_thread(fixture, &mut native_service, 42));
+    if !interrupted {
+        let mut gettid = carrick_el1_abi::TrapFrame::default();
+        gettid.x[8] = 178;
+        arm_call(fixture, sibling, &mut native_service, &mut gettid).unwrap();
+        assert_eq!(gettid.x[0], 42);
+        assert!(leader_sees_thread(fixture, &mut native_service, 42));
+    }
     assert_eq!(fixture.page.live(), 2);
     let record = process_record_for_call(
         source,
@@ -12120,6 +12136,15 @@ fn futex_owner_wait(timed: bool) {
         .unwrap()
         .observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Gate);
     let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
+    if interrupted {
+        // Admit the signal sender before the owner gate closes. A new
+        // execution lane cannot enter this MM while the gate is raised.
+        let sender_slot = SlotId::new(1);
+        fixture.zone.drive(sender_slot, 2);
+        fixture.zone.publish_slot(sender_slot, 1, Some(0), 1);
+        fixture.zone.enter_guest(sender_slot);
+        fixture.zone.install_space(sender_slot, 1).unwrap();
+    }
     access.raise(space.index());
     // SAFETY: the fixture retains this exact owner and its observed closed gate.
     let wait = unsafe {
@@ -12129,7 +12154,7 @@ fn futex_owner_wait(timed: bool) {
             observed.revision(),
         )
     };
-    service.prepare_copy_error = Some(NativeProcessError::OwnerWait(wait));
+    service.prepare_copy_error = (!synchronous).then_some(NativeProcessError::OwnerWait(wait));
     let word = Word {
         missing: core::cell::Cell::new(true),
         value: core::cell::Cell::new(0x12345678),
@@ -12166,6 +12191,17 @@ fn futex_owner_wait(timed: bool) {
                 &mut service,
             )
             .unwrap();
+        if interrupted {
+            entry
+                .rt_sigaction(
+                    Signal::from_number(10).unwrap(),
+                    Some(Action {
+                        disposition: Disposition::Handler(HandlerAddress(0x700000)),
+                        ..Default::default()
+                    }),
+                )
+                .unwrap();
+        }
         let route = crate::dispatch::dispatch_syscall_with_native(
             &mut frame,
             &counters,
@@ -12189,40 +12225,129 @@ fn futex_owner_wait(timed: bool) {
         );
         assert_eq!(
             route,
-            CompletionRoute::Suspended,
+            if synchronous {
+                CompletionRoute::Served
+            } else {
+                CompletionRoute::Suspended
+            },
             "missing backing must park on the owner, never forward an unexpected errno"
         );
         assert!(fixture.zone.slot(fixture.slot).current().is_none());
-        assert_eq!(fixture.zone.counters.el1_parks.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            fixture.zone.counters.el1_parks.load(Ordering::Relaxed),
+            u64::from(!synchronous)
+        );
     }
     assert!(
         word.missing.get(),
         "a refused load cannot supply its own backing"
     );
+    if interrupted {
+        // A second live guest thread sends through the production signal entry.
+        let sender_task = Box::leak(Box::new(CurrentTask::new()));
+        sender_task.set(
+            El1TaskId::from_linux_tid(42),
+            carrick_el1_abi::SnapshotGeneration::from_raw(12),
+            5,
+        );
+        sender_task.mm.key.store(1, Ordering::Release);
+        sender_task
+            .mm
+            .thread_generation
+            .store(102, Ordering::Release);
+        sender_task.publish_visible_pid(41);
+        sender_task.publish_root_generation(fixture.address.generation);
+        sender_task.publish_lifecycle(fixture.page as *const _ as u64, sibling as *const _ as u64);
+        let sender_slot = SlotId::new(1);
+
+        let sender_record = fixture
+            .zone
+            .current_or_new(
+                sender_slot,
+                ThreadIdentity {
+                    tid: 42,
+                    serial: 102,
+                    mm: 1,
+                    file_table: 5,
+                    generation: 12,
+                    affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                    affinity: 1,
+                    lifecycle_page: fixture.page as *const _ as u64,
+                    control_slot: sibling as *const _ as u64,
+                },
+            )
+            .unwrap();
+        sibling.bind_zone_record(fixture.zone.record_ref(sender_record));
+        let sender_source = BornInZoneSource {
+            zone: fixture.zone,
+            slot: sender_slot,
+        };
+        registry()
+            .register_thread(
+                sender_source,
+                sender_task,
+                fixture.address,
+                fixture.page,
+                sibling,
+            )
+            .unwrap();
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(sender_slot, sender_record)
+                .is_queued()
+        );
+        assert_eq!(
+            fixture.zone.switch_in_full(sender_slot).unwrap().record,
+            sender_record
+        );
+        let mut sender = runtime
+            .enter_registered(
+                registry(),
+                sender_source,
+                sender_task,
+                fixture.address,
+                &parked,
+                &mut service,
+            )
+            .unwrap();
+        sender
+            .tgkill(
+                SignalThreadSelector::from_abi(41),
+                SignalThreadSelector::from_abi(41),
+                SignalRequest::Deliver(Signal::from_number(10).unwrap()),
+                SignalInfo::Generated(None),
+            )
+            .unwrap();
+    }
     word.missing.set(false);
     service.prepare_copy_error = None;
     access.lower(space.index());
-    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
-    assert_eq!(selected.record, fixture.control.zone_record().unwrap().id);
-    let mut entry = runtime
-        .enter_registered(
-            registry(),
-            source,
-            &fixture.task,
-            fixture.address,
-            &parked,
-            &mut service,
-        )
-        .unwrap();
-    let resumed = entry.resume_checkpoint(|_| Ok(None)).unwrap();
-    assert!(matches!(
-        resumed,
-        crate::native_process_runtime::NativeResume::RetrySyscall
-    ));
-    drop(entry);
-    // A fresh comparison uses the original syscall arguments retained by
-    // the owner continuation, even if a sibling changed the word meanwhile.
-    let retained = unsafe { *fixture.zone.record(record).ctx_mut() };
+    let retained = if synchronous {
+        parked
+    } else {
+        let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+        assert_eq!(selected.record, fixture.control.zone_record().unwrap().id);
+        let mut entry = runtime
+            .enter_registered(
+                registry(),
+                source,
+                &fixture.task,
+                fixture.address,
+                &parked,
+                &mut service,
+            )
+            .unwrap();
+        let resumed = entry.resume_checkpoint(|_| Ok(None)).unwrap();
+        assert!(matches!(
+            resumed,
+            crate::native_process_runtime::NativeResume::RetrySyscall
+        ));
+        drop(entry);
+        // A fresh comparison uses the original syscall arguments retained by
+        // the owner continuation, even if a sibling changed the word meanwhile.
+        unsafe { *fixture.zone.record(record).ctx_mut() }
+    };
     assert_eq!(retained.native.x[0], VA);
     assert_eq!(retained.native.x[2], 0x12345678);
     crate::sched::ThreadCpu::load(&mut cpu, &mut frame, &retained);
@@ -12261,8 +12386,59 @@ fn futex_owner_wait(timed: bool) {
             None,
             |_| core::ptr::null_mut(),
         );
+        if interrupted {
+            assert_eq!(cpu.now, 101);
+            assert_eq!(frame.x[0] as i64, -4);
+            assert!(
+                carrick_personality_linux::lifecycle::ProcessNative::take_futex_operation(
+                    &mut *entry
+                )
+                .is_none()
+            );
+            use zerocopy::IntoBytes;
+            let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+            assert_eq!(
+                crate::signal_delivery::deliver_signal_on_syscall_return(
+                    &fixture.task,
+                    fixture.control,
+                    &mut *entry,
+                    &mut frame,
+                    fp.as_bytes(),
+                    &mut ArmWaitSignalMachine {
+                        user_sp: UserVa::new(0x800000),
+                        backend: ArmWaitSignalBackend
+                    },
+                ),
+                None
+            );
+            assert_eq!(frame.elr, 0x700000, "the real handler must be selected");
+            crate::sched::ThreadCpu::load(&mut cpu, &mut frame, &parked);
+            frame.far = 0xfeed_bad;
+            let _route_after_signal = crate::dispatch::dispatch_syscall_with_native(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                &[],
+                &[],
+                &[],
+                &[],
+                &cache,
+                Some(crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &word,
+                }),
+                None,
+                Some(fixture),
+                Some(&mut *entry),
+                Some(source),
+                None,
+                |_| core::ptr::null_mut(),
+            );
+        }
         assert_eq!(
-            cpu.now, 105,
+            cpu.now,
+            if interrupted { 106 } else { 105 },
             "owner park must not restart the five-second interval"
         );
         assert_eq!(frame.x[0] as i64, -110);

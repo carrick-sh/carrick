@@ -4391,6 +4391,15 @@ mod overlay_dispatch_tests {
 
     #[test]
     fn threaded_futex_relative_deadline_survives_owner_redispatch() {
+        threaded_relative_futex(false);
+    }
+
+    #[test]
+    fn cancelled_futex_owner_operation_cannot_supply_a_later_deadline() {
+        threaded_relative_futex(true);
+    }
+
+    fn threaded_relative_futex(cancel: bool) {
         use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
         use std::num::NonZeroU64;
         use std::time::{Duration, SystemTime};
@@ -4471,13 +4480,32 @@ mod overlay_dispatch_tests {
             None,
             host_table_futex_queue(),
         );
-        assert_eq!(first, DispatchOutcome::OwnerMemoryWait { wait, committed: 0 });
+        let DispatchOutcome::FutexOwnerSuspended(pending) = first else {
+            panic!("relative owner wait must retain its operation: {first:?}");
+        };
+        assert_eq!(pending.wait(), &carrick_guest_mem::MemoryReadWait::Owner(wait));
         clock.advance(Duration::from_secs(1)).unwrap();
-        let second = dispatch_threaded_futex(
+        if cancel {
+            // OwnerWait cancellation consumes and drops its resume operation.
+            // An identical syscall must create a new interval, never find it
+            // through the old tid/address/timespec identity.
+            drop(pending);
+            let next = dispatch_threaded_futex(
+                &context, &clock, &carrick_thread::platform_futex::SharedFutexTable::new(),
+                request, &mut memory, &reporter, &futex, tid, &registry, None, None,
+                host_table_futex_queue(),
+            );
+            let DispatchOutcome::FutexWait { timeout, .. } = next else {
+                panic!("expected fresh wait: {next:?}");
+            };
+            assert_eq!(timeout, Some(Duration::from_secs(5)));
+            return;
+        }
+        // Changing the guest timespec cannot replace already-owned input.
+        memory.bytes[..8].copy_from_slice(&30_i64.to_ne_bytes());
+        let second = pending.resume(
             &context,
             &clock,
-            &carrick_thread::platform_futex::SharedFutexTable::new(),
-            request,
             &mut memory,
             &reporter,
             &futex,
@@ -4485,7 +4513,6 @@ mod overlay_dispatch_tests {
             &registry,
             None,
             None,
-            host_table_futex_queue(),
         );
         match second {
             DispatchOutcome::FutexWait { timeout, .. } => {

@@ -56,6 +56,9 @@ pub trait FutexVenue {
     fn read_u64(&self, address: UserVa) -> Option<u64>;
     fn frequency(&self) -> FutexFrequency;
     fn now(&self) -> CounterTick;
+    fn retained_deadline(&self) -> Option<CounterTick> {
+        None
+    }
     fn wake(
         &mut self,
         mm: ReservationMm,
@@ -64,6 +67,13 @@ pub trait FutexVenue {
         limit: u32,
     ) -> Option<Self::Served>;
     fn wait(&mut self, wait: FutexWait) -> Option<Self::Served>;
+}
+
+/// Linear custody of one relative futex operation across memory service. This
+/// is operation state, never ISA context or guest register scratch.
+pub struct FutexOperation {
+    pub call: FutexCall,
+    pub deadline: CounterTick,
 }
 
 pub struct FutexWait {
@@ -91,7 +101,9 @@ pub fn serve_futex<V: FutexVenue>(call: FutexCall, venue: &mut V) -> Option<V::S
     if matches!(op, FUTEX_WAKE_PRIVATE | FUTEX_WAKE_BITSET_PRIVATE) {
         return venue.wake(mm, address, bitset, expected as i32 as u32);
     }
-    let deadline = if timeout != 0 {
+    let deadline = if let Some(deadline) = venue.retained_deadline() {
+        Some(deadline)
+    } else if timeout != 0 {
         if !venue.timed_wait_allowed() {
             return None;
         }
