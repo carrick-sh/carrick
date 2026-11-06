@@ -6417,3 +6417,161 @@ fn sigprocmask_set_owner_wait_redispatches_before_effects() {
     ));
     assert!(take_signal_copies().is_empty());
 }
+
+#[cfg(test)]
+#[test]
+fn wait4_rusage_busy_retains_consumed_child_result() {
+    use carrick_core_abi::service::ServiceCell;
+
+    // The real fork fixture has already parked the parent's blocking wait4.
+    let capacity = NativeServiceCapacityFixture::new(1);
+    let fixture = &capacity.fixture;
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let (_, child_address, child_words) = capacity.select().unwrap();
+    let child_pid = fixture.task.visible_pid().unwrap();
+    let mut child_service = fixture.service();
+    {
+        let mut child = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                child_address,
+                &child_words,
+                &mut child_service,
+            )
+            .unwrap();
+        assert!(matches!(
+            child.resume_checkpoint(|_| Ok(None)),
+            Ok(NativeResume::NoPending)
+        ));
+        assert!(matches!(
+            child.exit_group(0),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert!(child.take_run_failure().is_none());
+    }
+
+    // Resume the real wait with one transient refusal of rusage output.
+    // The child must already be reaped when the output service parks.
+    let (parent_record, parent_address, parent_words) = capacity.select().unwrap();
+    assert_eq!(fixture.task.visible_pid(), Some(7001));
+    let parent_identity = fixture.zone.record(parent_record.id).identity();
+    // SAFETY: the selected parent retains this exact control through the ACK.
+    let parent_control = unsafe { &*(parent_identity.control_slot as *const ThreadControlSlot) };
+    let mut parent_service = fixture.service();
+    parent_service.child_copy_error = Some(NativeProcessError::Busy);
+    {
+        let mut graph = fixture.runtime.graph.lock();
+        let parent_key = graph.root_key;
+        let Some(PendingContinuation::Wait(mut wait)) = graph.pending.remove(&parent_key) else {
+            panic!("parent owns its blocking wait");
+        };
+        wait.output = PendingWaitOutput::Wait4 {
+            rusage: UserVa::new(0x10000),
+        };
+        graph
+            .pending
+            .insert(parent_key, PendingContinuation::Wait(wait));
+    }
+    take_signal_copies();
+    {
+        let mut parent = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                parent_address,
+                &parent_words,
+                &mut parent_service,
+            )
+            .unwrap();
+        assert!(
+            fixture
+                .runtime
+                .graph
+                .lock()
+                .pending
+                .contains_key(&parent.key)
+        );
+        assert!(
+            matches!(
+                parent.resume_pending_wait(),
+                Some(LifecycleOutcome::Transferred { .. })
+            ),
+            "rusage Busy retains the completed wait"
+        );
+        assert!(parent.take_handoff_receipt().is_some());
+    }
+    assert_eq!(parent_service.copies, vec![LinuxWaitStatus::exited(0)]);
+    let parent_key = fixture.runtime.graph.lock().root_key;
+    assert!(
+        fixture
+            .runtime
+            .namespace_child_key(parent_key, child_pid)
+            .is_none()
+    );
+    let notice = fixture.task.service_notice.take().unwrap().unwrap();
+    let queue = fixture
+        .zone
+        .object_wait(
+            carrick_sched_core::object_wait::ObjectWaitKey::native_service(parent_record).unwrap(),
+            &carrick_sched_core::ShortLockSpin,
+        )
+        .unwrap();
+    // SAFETY: the service queue authenticates the retained parent's notice.
+    let ticket = unsafe {
+        ServiceCell::claim_notice(
+            &parent_control.service,
+            notice,
+            NonZeroU64::MIN,
+            parent_identity,
+        )
+    }
+    .unwrap();
+    assert!(ticket.complete(true).is_ok());
+    queue
+        .notify_object(fixture.slot, &mut WakeEffects::default())
+        .unwrap();
+    drop(queue);
+
+    parent_service.child_copy_error = None;
+    let (selected, address, saved) = capacity.select().unwrap();
+    assert_eq!(selected, parent_record);
+    let mut parent = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            address,
+            &saved,
+            &mut parent_service,
+        )
+        .unwrap();
+    assert!(
+        matches!(parent.resume_checkpoint(|_| Ok(None)), Ok(NativeResume::Returned(result)) if result.raw() == i64::from(child_pid))
+    );
+    let output = take_signal_copies();
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].0, UserVa::new(0x10000));
+    assert_eq!(output[0].1.len(), carrick_syscall_abi::LINUX_RUSAGE_BYTES);
+    assert!(matches!(
+        parent.wait4(
+            ProcessWaitPid::from_syscall_argument(u64::from(child_pid)),
+            UserVa::new(0x1000),
+            LinuxWaitOptions::empty(),
+            UserVa::new(0),
+        ),
+        LifecycleOutcome::Returned { result, .. }
+            if result.raw() == carrick_syscall_abi::LINUX_ECHILD.guest_retval()
+    ));
+    drop(parent);
+    assert_eq!(parent_service.copies, vec![LinuxWaitStatus::exited(0)]);
+    assert!(capacity.select().is_none());
+}
