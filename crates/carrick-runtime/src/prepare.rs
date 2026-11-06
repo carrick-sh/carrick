@@ -1531,10 +1531,9 @@ impl PreparedRun {
                         carrick_kernel::kernel::continuation::ipc::host_window_backing(&dispatcher),
                     )?;
                     {
-                        let owner = root_context
-                            .kernel()
-                            .ipc()
-                            .map_err(|e| RuntimeError::Unsupported(format!("x86 IPC authority: {e:?}")))?;
+                        let owner = root_context.kernel().ipc().map_err(|e| {
+                            RuntimeError::Unsupported(format!("x86 IPC authority: {e:?}"))
+                        })?;
                         root_context
                             .resources()
                             .files()

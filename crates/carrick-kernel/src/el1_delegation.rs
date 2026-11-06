@@ -3782,6 +3782,77 @@ mod tests {
         }
 
         #[test]
+        fn published_private_mapping_waits_for_recall_before_source_read() {
+            use carrick_core_abi::host_file::{self, HostFileHeader, HostFileOp, MapSourceReply};
+            use carrick_el1_abi::ipc::fd;
+            use carrick_hal::fork_stock::HostBackingRead;
+            let _region = Region::new();
+            let tmp = temp_with(b"before");
+            let open = open_host(&tmp);
+            let handle = delegate_default(&open, 3).unwrap();
+            guest_write(handle, 0, b"after!");
+            assert_eq!(host_bytes(&tmp), b"before", "dirty bytes are still in ring");
+
+            let dispatcher = crate::dispatch::SyscallDispatcher::default();
+            let context = dispatcher.capture_one_task_context().unwrap();
+            let owner = context.kernel().ipc().unwrap();
+            let table = crate::el1_ipc::HostTable::create(Arc::clone(&owner), 64, 4).unwrap();
+            let slot = crate::kernel::objects::FileSlot::new(Arc::clone(&open.description), 0);
+            table.replace_slot(fd::Fd(3), &slot).unwrap();
+            let raw = table.id().to_raw();
+            let mut record = vec![0; host_file::record_len(0, MapSourceReply::BYTES).unwrap()];
+            host_file::encode(
+                &mut record,
+                HostFileHeader {
+                    op: HostFileOp::MapPrivate,
+                    table: [raw.authority, raw.index, raw.generation],
+                    fd: 3,
+                    flags: 0,
+                    args: [0; 4],
+                },
+                &[],
+                MapSourceReply::BYTES,
+            )
+            .unwrap();
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            *WRITEBACK_HOOK.lock() = Some(Box::new(move || {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            }));
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let served = dispatcher.serve_native_host_file(&mut record);
+                done_tx.send(()).unwrap();
+                served.unwrap().retained_source.unwrap()
+            });
+            let entered = entered_rx.recv_timeout(std::time::Duration::from_secs(5));
+            let completed_before_writeback = done_rx.try_recv().is_ok();
+            // Always release the worker before asserting, including a bad
+            // implementation that skipped recall and never entered the hook.
+            let _ = release_tx.send(());
+            let source = worker.join().unwrap();
+            assert!(
+                entered.is_ok(),
+                "mapping admission must recall its original description"
+            );
+            assert!(
+                !completed_before_writeback,
+                "no source reply before recall completes"
+            );
+            assert_eq!(open.description.delegation_handle(), 0);
+            let bytes = source
+                .read(HostBackingRead::new(source.identity(), 4096).unwrap())
+                .unwrap();
+            assert_eq!(&bytes[..6], b"after!");
+            assert!(bytes[6..].iter().all(|byte| *byte == 0));
+            assert!(open.description.has_active_mappings());
+            assert_eq!(host_bytes(&tmp), b"after!");
+        }
+
+        #[test]
         fn mapping_recalls_and_blocks_delegation() {
             let _region = Region::new();
             let tmp = temp_with(b"map");
