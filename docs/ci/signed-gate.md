@@ -40,7 +40,22 @@ remain in the baseline; the candidate must preserve its populations and may
 not add to those failure sets. Missing required suite populations cannot
 seed a baseline.
 
-If no baseline exists, authorization fails with an instruction to seed it:
+Every push to `main` triggers `.github/workflows/signed-baseline.yml`, which
+serializes push events, checks via `GITHUB_TOKEN` (`contents: read`) that the
+pushed commit is still the live `refs/heads/main` tip, and dispatches
+`signed-gate.yml` on `main` (`pr=main`, `sha=<main-sha>`) using the
+`SIGNED_GATE_DISPATCH_TOKEN` repository secret (#1729). Provision
+`SIGNED_GATE_DISPATCH_TOKEN` as an owner (`tjfontaine`) fine-grained personal
+access token scoped to `carrick-sh/carrick` with **Actions: Read and write**
+only, so `authorize` and baseline provenance checks admit the run without
+broadening `GITHUB_TOKEN` or `carrick-workers` App trust (#654). Authorized
+`pr=main` runs share the workflow-level `signed-gate-main` concurrency group
+with `cancel-in-progress: true`, cancelling superseded in-flight baselines when
+`main` advances again.
+
+If no baseline exists yet (for example, while the automatic baseline is still
+running, after a failed run, or for an older `main` ancestor), authorization
+fails with an instruction to seed it manually:
 
 ```sh
 gh workflow run signed-gate.yml --ref main -f pr=main -f sha=<merge-base-sha>
@@ -48,8 +63,8 @@ gh workflow run signed-gate.yml --ref main -f pr=main -f sha=<merge-base-sha>
 
 `pr=main` accepts only a main ancestor, runs the same signed phase and uploads
 the admitted baseline (90-day retention). Rerun the PR request afterward.
-There is no fallback to a nearby SHA or stored failure-name list. Main can be
-seeded on demand; this workflow does not install a nightly schedule.
+There is no fallback to a nearby SHA or stored failure-name list; this
+workflow does not install a nightly schedule.
 
 ## Runners and prerequisites
 
@@ -79,8 +94,11 @@ the physical host's exclusive `gate` lease across fixture restore, `just
 build`, `cargo run -p carrick-xtask -- accept --profile no-docker --phase
 signed`, and independent artifact inspection. Nested acceptance reuses that
 lease. Both runners must share their local lease path with all other gate
-participants on that host. A per-SHA Actions concurrency group with
-`cancel-in-progress: false` queues duplicate requests. GitHub does not expose
+participants on that host. PR and `gate:signed` runs keep isolated workflow
+concurrency groups while a per-SHA `gate` job concurrency group with
+`cancel-in-progress: false` queues duplicate requests (`pr=main` baselines
+instead coalesce at workflow level under `signed-gate-main` with
+`cancel-in-progress: true`). GitHub does not expose
 `runner.name` when job concurrency is evaluated, so host serialization uses
 the lease rather than an invalid runner-name expression (director ruling on
 #634).
