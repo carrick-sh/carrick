@@ -22,12 +22,6 @@ permissions:
 
 jobs:
   guard:
-    # Trusted-main guard posts scope refusals to the triggering issue or PR.
-    # It never checks out candidate code and keeps repository contents read-only.
-    permissions:
-      contents: read
-      issues: write
-      pull-requests: write
     # Cheap pre-filter only (#1214). Comments and reviews need an OWNER, MEMBER or
     # COLLABORATOR association; applying a label already needs triage access. The
     # guard's live collaborator-permission check (write or higher) is authoritative.
@@ -81,10 +75,9 @@ jobs:
         id: validate
         env:
           CARRICK_DISPATCH_BASE: ${{ steps.base.outputs.base }}
-          # Reads authenticate the live collaborator check; writes are limited
-          # to refusal comments on that collaborator's triggering thread.
-          # Without --admit the guard still binds publication through public
-          # comment receipts, never the artifact handoff.
+          # Read-only (the job has contents: read) and used only for the API
+          # rate limit. Without --admit the guard still binds publication
+          # through public comment receipts, never the artifact handoff.
           GH_TOKEN: ${{ github.token }}
         run: cargo run --locked --release -p carrick-xtask -- dispatch-worker guard --event "$GITHUB_EVENT_PATH"
 
