@@ -70,3 +70,17 @@ file it, with a production open/final-lower red-first witness and signed
 integration as its acceptance criterion. No follow-up issue URL is yet
 available. The reviewer also noted two adjacent ordering comments for that
 follow-up.
+
+The remaining requested checks pass: scheduler regular suite (268), its
+empty `serial_host` partition, `just test-el1-native` (708 passed, one
+existing ignored case), workspace/all-target clippy with `-D warnings`,
+formatting, conformance contract coverage against the original main base,
+and both source-only authority-debt ceilings and the PR-base ratchet. The
+freestanding `carrick-x86-cpl0` release image also cross-builds for
+`x86_64-unknown-none`; this is compile evidence, not an x86 runtime verdict.
+Full logs use the corresponding names in the external evidence directory.
+
+Signed smoke is the final check after this evidence commit. Its exact-HEAD
+receipt is retained externally as `smoke-signed/receipt.json`, together
+with `smoke-signed.log`. No Docker oracle or full signed acceptance gate
+was run on this worker; neither is claimed by this focused fix evidence.
