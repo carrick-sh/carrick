@@ -189,3 +189,12 @@ The production ARM non-last-thread exit witness parks on the second list entry
 and its output, then on clear-child-TID: each owned mutex becomes 0xc0000000,
 each gets one wake, and completed entries have one next-pointer read each.
 No cursor or write permit is held by an execution slot while parked.
+
+Clone output rollback also belongs to the exact calling member. An unborn
+record and control identity are withdrawn before parking, but output undo is
+not reported complete until its preimages have been restored. A refused undo
+retains its byte preimages and output cursor; redispatch must drain it before
+capturing another clone's inputs or returning the original clone error. The
+clone/clone3 production witnesses refuse child output and then parent undo.
+Once parent access is available, neither TID word nor the thread table may
+publish the unborn TID, and a subsequent successful birth publishes it once.

@@ -19,6 +19,7 @@ pub use carrick_personality_linux::thread::{LifecycleThread, SYS_SET_ROBUST_LIST
 std::thread_local! {
     pub(super) static COPYIN_NOT_YET_AT: core::cell::Cell<Option<u64>> = const { core::cell::Cell::new(None) };
     pub(super) static COPYIN_CALLS: core::cell::RefCell<std::vec::Vec<u64>> = const { core::cell::RefCell::new(std::vec::Vec::new()) };
+    pub(super) static COPYOUT_REFUSE_RESTORE_AT: core::cell::Cell<Option<u64>> = const { core::cell::Cell::new(None) };
     pub(super) static COPYOUT_NOT_YET_AT: core::cell::Cell<Option<u64>> = const {
         core::cell::Cell::new(None)
     };
@@ -136,7 +137,10 @@ impl<
     }
     fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> CopyOutcome {
         #[cfg(test)]
-        if COPYOUT_NOT_YET_AT.with(|address| address.get() == Some(dst.raw())) {
+        if COPYOUT_NOT_YET_AT.with(|address| address.get() == Some(dst.raw()))
+            || (COPYOUT_REFUSE_RESTORE_AT.with(|address| address.get() == Some(dst.raw()))
+                && src != 43_u32.to_le_bytes())
+        {
             return CopyOutcome::NotYet(GuestCopyRequest {
                 address: dst,
                 len: carrick_guest_arch::GuestLen::new(src.len() as u64),

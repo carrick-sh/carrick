@@ -12132,6 +12132,18 @@ fn clone_nonresident_tid_destination(is_clone3: bool) {
     // 1. NotYet once on TID destination page during publication: parks/prepares
     // and rewinds PC for redispatch without publishing TID or leaking the pool entry.
     crate::lifecycle::COPYOUT_NOT_YET_AT.with(|address| address.set(Some(child_tid_va)));
+    crate::lifecycle::COPYOUT_REFUSE_RESTORE_AT.with(|address| address.set(Some(parent_tid_va)));
+    let first = arm_call(fixture, fixture.control, &mut service, &mut frame);
+    crate::lifecycle::COPYOUT_REFUSE_RESTORE_AT.with(|address| address.set(None));
+    assert_eq!(
+        first.unwrap(),
+        carrick_personality_linux::dispatch::CompletionRoute::Served
+    );
+    assert!(!leader_sees_thread(fixture, &mut service, 43));
+    assert_eq!(child_control.visible_tid(), None);
+    // The rollback destination is now available, while child output still
+    // refuses. Restore the original preimage before any new birth attempt.
+    set_args(&mut frame);
     let first = arm_call(fixture, fixture.control, &mut service, &mut frame);
     crate::lifecycle::COPYOUT_NOT_YET_AT.with(|address| address.set(None));
     assert_eq!(
