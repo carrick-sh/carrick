@@ -471,6 +471,13 @@ pub fn serve_ipc_with_signals<C: ThreadCpu, U: UserWord, M: UserCopy>(
                 return (IpcServed::Returned { switched: false }, false);
             }
             Admission::Forward => return (IpcServed::Forward, false),
+            Admission::CopyInFault => {
+                if native_signals {
+                    frame.x[0] = carrick_syscall_abi::LINUX_EFAULT.guest_retval() as u64;
+                    return (IpcServed::Returned { switched: false }, false);
+                }
+                return (IpcServed::Forward, false);
+            }
             Admission::Restart(token, op) => {
                 if native_signals {
                     finish_native(sched, token, &venue.region);
@@ -506,6 +513,10 @@ enum Admission {
     Admitted(IpcOpToken, IpcOperation),
     Immediate(i64),
     Forward,
+    /// Input was unavailable before any IPC effect. Host-owned callers leave
+    /// through the existing first-touch venue; a native child has no host
+    /// syscall venue, so a genuine refusal settles EFAULT in ring.
+    CopyInFault,
     /// The pinned description is not one EL1 serves (the fd changed between
     /// the snapshot and the pin): the host drops the pin and runs the call.
     Restart(IpcOpToken, IpcOperation),
@@ -712,7 +723,8 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
                             // As with EventFdWrite, a refused copy may need
                             // first-touch backing. No effect has occurred:
                             // let the existing fault owner resolve it.
-                            return refuse(sched, IpcLeave::CopyInFault);
+                            let _ = refuse(sched, IpcLeave::CopyInFault);
+                            return Admission::CopyInFault;
                         }
                         return Admission::Immediate(match error {
                             carrick_el1_abi::ipc::VectorImportError::Invalid => linux::EINVAL,
@@ -4538,6 +4550,30 @@ mod tests {
             host_calls(&w),
             1,
             "only the refused first-touch call forwards"
+        );
+    }
+
+    #[test]
+    fn native_pipe_writev_bad_header_settles_efault_without_forwarding() {
+        let mut w = world();
+        let table = w.table(w.a_tid);
+        let (_read, write, object) = w.pipe(table, BLOCK);
+        let baseline = w.region.descriptor_allocations();
+        let mut frame = syscall(66, write, 0x6000_0000, 1, A_SVC);
+        crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
+        let served = w.call_with_owner(&mut frame, true);
+        crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
+        assert_eq!(served, IpcServed::Returned { switched: false });
+        assert_eq!(frame.x[0] as i64, -14);
+        assert_eq!(w.region.descriptor_allocations(), baseline);
+        assert_eq!(
+            w.region
+                .lock(object, &HostWait)
+                .unwrap()
+                .pipe()
+                .unwrap()
+                .unread_bytes(),
+            0
         );
     }
 
