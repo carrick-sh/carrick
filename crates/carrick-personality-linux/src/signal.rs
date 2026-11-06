@@ -460,7 +460,7 @@ pub trait ProcessSignals {
 pub trait SignalNative<'a>: crate::lifecycle::UserCopy {
     fn wait_guest_copy(
         &mut self,
-        request: carrick_core::personality::GuestCopyRequest,
+        request: carrick_core::user_copy::GuestCopyRequest,
     ) -> SignalOutcome;
     /// Retain an already attempted output after `NotYet`, without retrying
     /// the user copy before transferring it to the continuation owner.
@@ -527,11 +527,11 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
             let new_action = if act_ptr != 0 {
                 let mut bytes = [0u8; core::mem::size_of::<LinuxSigaction>()];
                 match native.copy_in(&mut bytes, carrick_guest_arch::UserVa::new(act_ptr)) {
-                    carrick_core::personality::CopyOutcome::Done => {}
-                    carrick_core::personality::CopyOutcome::Fault => {
+                    carrick_core::user_copy::CopyOutcome::Done => {}
+                    carrick_core::user_copy::CopyOutcome::Fault => {
                         return returned(LINUX_EFAULT.guest_retval(), false);
                     }
-                    carrick_core::personality::CopyOutcome::NotYet(request) => {
+                    carrick_core::user_copy::CopyOutcome::NotYet(request) => {
                         return Some(native.wait_guest_copy(request));
                     }
                 }
@@ -814,11 +814,11 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
             }
             let mut bytes = [0u8; 8];
             match native.copy_in(&mut bytes, carrick_guest_arch::UserVa::new(mask_ptr)) {
-                carrick_core::personality::CopyOutcome::Done => {}
-                carrick_core::personality::CopyOutcome::Fault => {
+                carrick_core::user_copy::CopyOutcome::Done => {}
+                carrick_core::user_copy::CopyOutcome::Fault => {
                     return returned(LINUX_EFAULT.guest_retval(), false);
                 }
-                carrick_core::personality::CopyOutcome::NotYet(request) => {
+                carrick_core::user_copy::CopyOutcome::NotYet(request) => {
                     return Some(native.wait_guest_copy(request));
                 }
             }

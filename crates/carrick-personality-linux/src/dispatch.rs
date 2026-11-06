@@ -1638,15 +1638,15 @@ mod ring_first_tests {
             &mut self,
             _dst: &mut [u8],
             _src: carrick_guest_arch::UserVa,
-        ) -> carrick_core::personality::CopyOutcome {
-            carrick_core::personality::CopyOutcome::from_completed(false)
+        ) -> carrick_core::user_copy::CopyOutcome {
+            carrick_core::user_copy::CopyOutcome::from_completed(false)
         }
         fn copy_out(
             &mut self,
             _dst: carrick_guest_arch::UserVa,
             _src: &[u8],
-        ) -> carrick_core::personality::CopyOutcome {
-            carrick_core::personality::CopyOutcome::from_completed(false)
+        ) -> carrick_core::user_copy::CopyOutcome {
+            carrick_core::user_copy::CopyOutcome::from_completed(false)
         }
     }
 
@@ -1654,7 +1654,7 @@ mod ring_first_tests {
         #[allow(clippy::panic)]
         fn wait_guest_copy(
             &mut self,
-            _: carrick_core::personality::GuestCopyRequest,
+            _: carrick_core::user_copy::GuestCopyRequest,
         ) -> crate::signal::SignalOutcome {
             panic!("eager test venue cannot suspend guest memory")
         }
@@ -1702,7 +1702,7 @@ mod ring_first_tests {
         #[allow(clippy::panic)]
         fn wait_guest_copy(
             &mut self,
-            _: carrick_core::personality::GuestCopyRequest,
+            _: carrick_core::user_copy::GuestCopyRequest,
         ) -> crate::lifecycle::LifecycleOutcome {
             panic!("eager test venue cannot suspend guest memory")
         }

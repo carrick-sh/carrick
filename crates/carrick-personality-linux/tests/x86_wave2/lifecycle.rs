@@ -172,45 +172,41 @@ impl<'a> Turn<'a> {
     }
 }
 impl UserCopy for Turn<'_> {
-    fn copy_in(
-        &mut self,
-        dst: &mut [u8],
-        address: UserVa,
-    ) -> carrick_core::personality::CopyOutcome {
+    fn copy_in(&mut self, dst: &mut [u8], address: UserVa) -> carrick_core::user_copy::CopyOutcome {
         let index = match address.raw() {
             0x1000 => 0,
             0x1004 => 1,
-            _ => return carrick_core::personality::CopyOutcome::Fault,
+            _ => return carrick_core::user_copy::CopyOutcome::Fault,
         };
         if dst.len() != 4 {
-            return carrick_core::personality::CopyOutcome::Fault;
+            return carrick_core::user_copy::CopyOutcome::Fault;
         }
         dst.copy_from_slice(&self.words[index].to_le_bytes());
-        carrick_core::personality::CopyOutcome::Done
+        carrick_core::user_copy::CopyOutcome::Done
     }
-    fn copy_out(&mut self, address: UserVa, src: &[u8]) -> carrick_core::personality::CopyOutcome {
+    fn copy_out(&mut self, address: UserVa, src: &[u8]) -> carrick_core::user_copy::CopyOutcome {
         if self.fail_copy == Some(address.raw()) {
             self.fail_copy = None;
-            return carrick_core::personality::CopyOutcome::Fault;
+            return carrick_core::user_copy::CopyOutcome::Fault;
         }
         let index = match address.raw() {
             0x1000 => 0,
             0x1004 => 1,
-            _ => return carrick_core::personality::CopyOutcome::Fault,
+            _ => return carrick_core::user_copy::CopyOutcome::Fault,
         };
         if src.len() != 4 {
-            return carrick_core::personality::CopyOutcome::Fault;
+            return carrick_core::user_copy::CopyOutcome::Fault;
         }
         self.words[index] = u32::from_le_bytes(src.try_into().unwrap());
         self.clears += u64::from(index == 1);
-        carrick_core::personality::CopyOutcome::Done
+        carrick_core::user_copy::CopyOutcome::Done
     }
 }
 impl<'a> LifecycleNative<'a> for Turn<'a> {
     #[allow(clippy::panic)]
     fn wait_guest_copy(
         &mut self,
-        _: carrick_core::personality::GuestCopyRequest,
+        _: carrick_core::user_copy::GuestCopyRequest,
     ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
         panic!("eager test venue cannot suspend guest memory")
     }

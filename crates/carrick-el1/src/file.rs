@@ -376,13 +376,13 @@ impl<V: MemoryValidator> UserCopy for ValidatedCopy<'_, V> {
 
 /// The typed interface preserves a refused access for exact-MM owner
 /// preparation. Atomic operands use ISA word instructions, never byte copies.
-impl<V: MemoryValidator> carrick_core::personality::UserCopy for ValidatedCopy<'_, V> {
+impl<V: MemoryValidator> carrick_core::user_copy::UserCopy for ValidatedCopy<'_, V> {
     fn copy_in(
         &mut self,
         dst: &mut [u8],
         src: carrick_guest_arch::UserVa,
-    ) -> carrick_core::personality::CopyOutcome {
-        use carrick_core::personality::{CopyOutcome, GuestCopyRequest};
+    ) -> carrick_core::user_copy::CopyOutcome {
+        use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest};
         if !valid_lower_half_range(src.raw(), dst.len()) {
             return CopyOutcome::Fault;
         }
@@ -401,8 +401,8 @@ impl<V: MemoryValidator> carrick_core::personality::UserCopy for ValidatedCopy<'
         &mut self,
         dst: carrick_guest_arch::UserVa,
         src: &[u8],
-    ) -> carrick_core::personality::CopyOutcome {
-        use carrick_core::personality::{CopyOutcome, GuestCopyRequest};
+    ) -> carrick_core::user_copy::CopyOutcome {
+        use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest};
         if !valid_lower_half_range(dst.raw(), src.len()) {
             return CopyOutcome::Fault;
         }
@@ -421,8 +421,8 @@ impl<V: MemoryValidator> carrick_core::personality::UserCopy for ValidatedCopy<'
         &mut self,
         address: carrick_guest_arch::UserVa,
         value: &mut u32,
-    ) -> carrick_core::personality::CopyOutcome {
-        use carrick_core::personality::{CopyOutcome, atomic_word_refusal};
+    ) -> carrick_core::user_copy::CopyOutcome {
+        use carrick_core::user_copy::{CopyOutcome, atomic_word_refusal};
         let refusal = atomic_word_refusal(address, carrick_guest_arch::Access::Read);
         if refusal == CopyOutcome::Fault || self.validator.readable_bytes(address.raw(), 4) != 4 {
             return refusal;
@@ -441,8 +441,8 @@ impl<V: MemoryValidator> carrick_core::personality::UserCopy for ValidatedCopy<'
         expected: u32,
         desired: u32,
         observed: &mut u32,
-    ) -> carrick_core::personality::CopyOutcome {
-        use carrick_core::personality::{CopyOutcome, atomic_word_refusal};
+    ) -> carrick_core::user_copy::CopyOutcome {
+        use carrick_core::user_copy::{CopyOutcome, atomic_word_refusal};
         let refusal = atomic_word_refusal(address, carrick_guest_arch::Access::Write);
         if refusal == CopyOutcome::Fault
             || self.validator.readable_bytes(address.raw(), 4) != 4
@@ -909,7 +909,7 @@ pub fn with_data_marks<T, E: Copy>(
 #[cfg(test)]
 mod atomic_copy_tests {
     use super::*;
-    use carrick_core::personality::{CopyOutcome, UserCopy as TypedCopy};
+    use carrick_core::user_copy::{CopyOutcome, UserCopy as TypedCopy};
     use carrick_guest_arch::{Access, UserVa};
     use core::cell::Cell;
     use core::sync::atomic::AtomicU32;

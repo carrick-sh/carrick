@@ -802,38 +802,34 @@ mod tests {
     }
 
     impl UserCopy for TestNative<'_> {
-        fn copy_in(
-            &mut self,
-            dst: &mut [u8],
-            src: UserVa,
-        ) -> carrick_core::personality::CopyOutcome {
+        fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> carrick_core::user_copy::CopyOutcome {
             let Some(off) = src.raw().checked_sub(self.base_va) else {
-                return carrick_core::personality::CopyOutcome::Fault;
+                return carrick_core::user_copy::CopyOutcome::Fault;
             };
             let off = off as usize;
             let Some(end) = off.checked_add(dst.len()) else {
-                return carrick_core::personality::CopyOutcome::Fault;
+                return carrick_core::user_copy::CopyOutcome::Fault;
             };
             if end > self.guest_mem.len() {
-                return carrick_core::personality::CopyOutcome::Fault;
+                return carrick_core::user_copy::CopyOutcome::Fault;
             }
             dst.copy_from_slice(&self.guest_mem[off..end]);
-            carrick_core::personality::CopyOutcome::Done
+            carrick_core::user_copy::CopyOutcome::Done
         }
 
-        fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> carrick_core::personality::CopyOutcome {
+        fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> carrick_core::user_copy::CopyOutcome {
             let Some(off) = dst.raw().checked_sub(self.base_va) else {
-                return carrick_core::personality::CopyOutcome::Fault;
+                return carrick_core::user_copy::CopyOutcome::Fault;
             };
             let off = off as usize;
             let Some(end) = off.checked_add(src.len()) else {
-                return carrick_core::personality::CopyOutcome::Fault;
+                return carrick_core::user_copy::CopyOutcome::Fault;
             };
             if end > self.guest_mem.len() {
-                return carrick_core::personality::CopyOutcome::Fault;
+                return carrick_core::user_copy::CopyOutcome::Fault;
             }
             self.guest_mem[off..end].copy_from_slice(src);
-            carrick_core::personality::CopyOutcome::Done
+            carrick_core::user_copy::CopyOutcome::Done
         }
     }
 

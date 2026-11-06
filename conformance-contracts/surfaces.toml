@@ -113,6 +113,8 @@ surfaces = [
   { path = "crates/carrick-core/src/terminal.rs", contract = "kernel.memory.owner-wait" },
   { path = "crates/carrick-core/src/terminal.rs", contract = "kernel.vcpu.shutdown-entry" },
   { path = "crates/carrick-core/src/terminal.rs", contract = "process.native.terminal-child" },
+  { path = "crates/carrick-core/src/user_copy.rs", contract = "kernel.futex.contention" },
+  { path = "crates/carrick-core/src/user_copy.rs", contract = "kernel.memory.owner-wait" },
   { path = "crates/carrick-core/src/wait.rs", contract = "process.native.short-lock" },
   { path = "crates/carrick-core/tests/aarch64_fork_geometry.rs", contract = "kernel.el1.fork-cow" },
   { path = "crates/carrick-core/tests/aarch64_fork_geometry.rs", contract = "kernel.el1.mm-exclusive-owner" },

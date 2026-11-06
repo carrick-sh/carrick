@@ -1702,15 +1702,15 @@ fn exit_forwards_unless_a_switched_in_non_last_thread_may_leave() {
 }
 
 impl UserCopy for FaultingUser {
-    fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> carrick_core::personality::CopyOutcome {
-        carrick_core::personality::CopyOutcome::from_completed(crate::file::UserCopy::copy_in(
+    fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> carrick_core::user_copy::CopyOutcome {
+        carrick_core::user_copy::CopyOutcome::from_completed(crate::file::UserCopy::copy_in(
             self,
             dst,
             src.raw(),
         ))
     }
-    fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> carrick_core::personality::CopyOutcome {
-        carrick_core::personality::CopyOutcome::from_completed(crate::file::UserCopy::copy_out(
+    fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> carrick_core::user_copy::CopyOutcome {
+        carrick_core::user_copy::CopyOutcome::from_completed(crate::file::UserCopy::copy_out(
             self,
             dst.raw(),
             src,
@@ -1727,7 +1727,7 @@ fn process_native_hooks_require_every_execution_identity_component() {
     impl ProcessNative for Probe {
         fn wait_guest_copy(
             &mut self,
-            _: carrick_core::personality::GuestCopyRequest,
+            _: carrick_core::user_copy::GuestCopyRequest,
         ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
             panic!("eager test venue cannot suspend guest memory")
         }
@@ -1962,7 +1962,7 @@ fn clone_uses_the_exact_stamped_dispatch_identity() {
     impl ProcessNative for BirthProbe {
         fn wait_guest_copy(
             &mut self,
-            _: carrick_core::personality::GuestCopyRequest,
+            _: carrick_core::user_copy::GuestCopyRequest,
         ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
             panic!("eager test venue cannot suspend guest memory")
         }
@@ -2052,7 +2052,7 @@ fn clone_refuses_missing_dispatch_identity_without_registering() {
     impl ProcessNative for BirthProbe {
         fn wait_guest_copy(
             &mut self,
-            _: carrick_core::personality::GuestCopyRequest,
+            _: carrick_core::user_copy::GuestCopyRequest,
         ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
             panic!("eager test venue cannot suspend guest memory")
         }
@@ -2139,7 +2139,7 @@ fn clone_missing_nonleader_identity_cannot_inherit_leader() {
     impl ProcessNative for BirthProbe {
         fn wait_guest_copy(
             &mut self,
-            _: carrick_core::personality::GuestCopyRequest,
+            _: carrick_core::user_copy::GuestCopyRequest,
         ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
             panic!("eager test venue cannot suspend guest memory")
         }
@@ -2240,7 +2240,7 @@ fn clone_stamped_nonleader_inherits_the_calling_thread() {
     impl ProcessNative for BirthProbe {
         fn wait_guest_copy(
             &mut self,
-            _: carrick_core::personality::GuestCopyRequest,
+            _: carrick_core::user_copy::GuestCopyRequest,
         ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
             panic!("eager test venue cannot suspend guest memory")
         }
@@ -2341,7 +2341,7 @@ struct IdentityOwner(carrick_el1_abi::ExecutionBinding);
 impl<C: carrick_el1_abi::EntryContext> ProcessNative<C> for IdentityOwner {
     fn wait_guest_copy(
         &mut self,
-        _: carrick_core::personality::GuestCopyRequest,
+        _: carrick_core::user_copy::GuestCopyRequest,
     ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
         panic!("eager test venue cannot suspend guest memory")
     }
@@ -2602,7 +2602,7 @@ fn clone_terminal_close_rolls_back_before_owned_exit_settlement() {
     impl ProcessNative for GraphOwner<'_> {
         fn wait_guest_copy(
             &mut self,
-            _: carrick_core::personality::GuestCopyRequest,
+            _: carrick_core::user_copy::GuestCopyRequest,
         ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
             panic!("eager test venue cannot suspend guest memory")
         }
@@ -2747,7 +2747,7 @@ fn clone_queue_publication_can_reenter_the_process_graph_after_unlock() {
     impl ProcessNative for GraphOwner<'_> {
         fn wait_guest_copy(
             &mut self,
-            _: carrick_core::personality::GuestCopyRequest,
+            _: carrick_core::user_copy::GuestCopyRequest,
         ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
             panic!("eager test venue cannot suspend guest memory")
         }
@@ -2955,7 +2955,7 @@ fn clone_terminal_failure_witness(mode: u8) {
     impl ProcessNative for GraphOwner<'_> {
         fn wait_guest_copy(
             &mut self,
-            _: carrick_core::personality::GuestCopyRequest,
+            _: carrick_core::user_copy::GuestCopyRequest,
         ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
             panic!("eager test venue cannot suspend guest memory")
         }
@@ -3164,7 +3164,7 @@ fn native_exit_group_leaves_the_woken_successor_to_the_scheduler() {
     impl ProcessNative for Exiting {
         fn wait_guest_copy(
             &mut self,
-            _: carrick_core::personality::GuestCopyRequest,
+            _: carrick_core::user_copy::GuestCopyRequest,
         ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
             panic!("eager test venue cannot suspend guest memory")
         }
@@ -3264,7 +3264,7 @@ fn arm_dispatch_consumes_native_run_failure_before_return() {
     impl ProcessNative for Failed {
         fn wait_guest_copy(
             &mut self,
-            _: carrick_core::personality::GuestCopyRequest,
+            _: carrick_core::user_copy::GuestCopyRequest,
         ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
             panic!("eager test venue cannot suspend guest memory")
         }
@@ -3349,7 +3349,7 @@ fn managed_clone_copyout_fault_unbinds_birth_before_retry() {
     impl ProcessNative for Owner {
         fn wait_guest_copy(
             &mut self,
-            _: carrick_core::personality::GuestCopyRequest,
+            _: carrick_core::user_copy::GuestCopyRequest,
         ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
             panic!("eager test venue cannot suspend guest memory")
         }
