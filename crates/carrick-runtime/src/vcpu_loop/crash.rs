@@ -361,6 +361,21 @@ where
                         "core capture could not pause its address space: {error:?}"
                     ))
                 })?;
+            // `pause_current_mm_for_capture` freezes every executor of this MM
+            // and raises its published EL1 gate. Register the matching editor
+            // exclusion on this thread as well: core reads are host-owned
+            // snapshot work, so routing them back through the owner portal
+            // would try to reacquire our own Gate. AddressSpaces gates are
+            // counted; this nested guard lowers before `_snapshot_pause` and
+            // therefore cannot reopen the MM early.
+            let _snapshot_exclusion = carrick_kernel::kernel::mm_occupancy::exclude_el1_editor(
+                context.shared().mm().id(),
+            )
+            .ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "core capture paused an MM with no published EL1 exclusion".to_owned(),
+                )
+            })?;
             lifecycle(1, 0);
 
             engine.prepare_core_snapshot().map_err(|error| {
