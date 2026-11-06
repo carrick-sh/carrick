@@ -31,6 +31,7 @@ rationale = "Request/response IPC between forked processes (`pairs` concurrent p
 [bindings]
 vm_free = [
   "carrick-el1-linux::native_process_runtime::host_test_support::portal_wait_terminal_cancellation_resumes_exact_native_service_waiter (portal service cancellation component: caught-signal interruption retains committed CarrierWork; typed terminal cancellation detaches its exact enrolled portal queue, resumes the waiter and preserves completed result 65; outside the scalar IPC fence)",
+  "carrick-sched-core::spaces::notification::tests::actual_gate_refusal_during_final_release_cannot_park_after_it (#1773: shared notification publication preserves exact operation custody and prevents a stranded scheduler record after final release; no change to queue delivery, IPC semantics or handback identity)",
   "carrick-el1-linux::ipc::tests::{ipc_operation_slot_native_finish_and_retire_publish,ipc_operation_slot_epoll_retry_publishes} (independent production native completion, exec/exit retirement and epoll Retry release publications)",
   "carrick-kernel::kernel::continuation::ipc::tests::serial_host_zone_operation_slot_release_reaches_bound_source (carrier source binding followed by production host finish and ZoneHostServices release; exact epoch and stale retry)",
   "carrick-el1-linux::ipc::tests::ipc_operation_slot_busy_once_then_success (full shared operation arena; real retirement wakes an enrolled scheduler record and admits the unchanged operation)",
