@@ -1,6 +1,34 @@
 #![allow(clippy::unwrap_used)]
 use std::{fs, path::Path};
 
+// Dispatch publication refuses workflow files. Exercise the exact director
+// handoff until it is applied, then exercise the live workflows.
+fn load_workflow(root: &Path, file: &str) -> String {
+    let live = fs::read_to_string(root.join(".github/workflows/signed-gate.yml")).unwrap();
+    if live.contains("  merge_group:") {
+        return fs::read_to_string(root.join(file)).unwrap();
+    }
+    let tree = tempfile::tempdir().unwrap();
+    fs::create_dir_all(tree.path().join(".github/workflows")).unwrap();
+    for name in ["signed-gate.yml", "trusted-hardware-pr.yml"] {
+        let path = Path::new(".github/workflows").join(name);
+        fs::copy(root.join(&path), tree.path().join(path)).unwrap();
+    }
+    let patch = root.join("signed-queue.patch");
+    let applied = std::process::Command::new("git")
+        .current_dir(tree.path())
+        .arg("apply")
+        .arg(patch)
+        .output()
+        .unwrap();
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    fs::read_to_string(tree.path().join(file)).unwrap()
+}
+
 /// The Signed gate builds its fixtures for the exact authorized SHA in the
 /// same run and hands that archive to the Mac gate (#1581). The workflow half
 /// landed as #1602, so this checks the live workflow; the director's patch
@@ -8,7 +36,7 @@ use std::{fs, path::Path};
 #[test]
 fn signed_gate_wires_same_run_authorized_fixture_artifact() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let text = fs::read_to_string(root.join(".github/workflows/signed-gate.yml")).unwrap();
+    let text = load_workflow(&root, ".github/workflows/signed-gate.yml");
     let docs = yaml_rust2::YamlLoader::load_from_str(&text).unwrap();
     let jobs = &docs[0]["jobs"];
     let publisher = &jobs["signed-fixtures"];
@@ -74,4 +102,46 @@ fn signed_gate_wires_same_run_authorized_fixture_artifact() {
                 .replace("$GITHUB_SHA", "$FIXTURE_SHA")
         );
     }
+}
+
+/// The required check must fail on any skipped or failed dependency, while
+/// PRs receive a cheap placeholder rather than an automatic signed run.
+#[test]
+fn signed_queue_workflow_requires_published_group_pass_and_seeds_main() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let text = load_workflow(&root, ".github/workflows/signed-gate.yml");
+    let docs = yaml_rust2::YamlLoader::load_from_str(&text).unwrap();
+    let workflow = &docs[0];
+    assert_eq!(
+        workflow["on"]["merge_group"]["types"][0].as_str(),
+        Some("checks_requested")
+    );
+    assert_eq!(workflow["on"]["push"]["branches"][0].as_str(), Some("main"));
+    let jobs = &workflow["jobs"];
+    let check = &jobs["signed-queue-gate"];
+    assert_eq!(check["name"].as_str(), Some("Signed queue gate"));
+    assert_eq!(
+        check["if"].as_str(),
+        Some("always() && github.event_name == 'merge_group'")
+    );
+    let required = check["needs"].as_vec().unwrap();
+    for job in ["authorize", "signed-fixtures", "gate", "publish"] {
+        assert!(required.iter().any(|j| j.as_str() == Some(job)));
+    }
+    let command = check["steps"][0]["run"].as_str().unwrap();
+    for dependency in ["AUTHORIZE", "FIXTURES", "GATE", "PUBLISH"] {
+        assert!(command.contains(&format!("test \"${dependency}\" = success")));
+    }
+    let placeholder = load_workflow(&root, ".github/workflows/trusted-hardware-pr.yml");
+    let placeholder = yaml_rust2::YamlLoader::load_from_str(&placeholder).unwrap();
+    assert!(placeholder[0]["on"]["merge_group"].is_badvalue());
+    assert_eq!(
+        placeholder[0]["jobs"]["signed-queue-gate"]["name"].as_str(),
+        Some("Signed queue gate")
+    );
+    assert!(workflow["on"]["pull_request"].is_badvalue());
+    assert_eq!(
+        workflow["on"]["pull_request_target"]["types"][0].as_str(),
+        Some("labeled")
+    );
 }

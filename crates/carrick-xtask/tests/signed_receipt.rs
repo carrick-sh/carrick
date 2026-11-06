@@ -167,6 +167,13 @@ fn owner_only_and_latest_label_transition_is_authority() {
 fn baseline_workflow_provenance_and_receipt_admission_fail_closed() {
     let run = json!({"path":".github/workflows/signed-gate.yml","head_branch":"main","event":"workflow_dispatch","status":"completed","repository":{"full_name":"carrick-sh/carrick"},"head_repository":{"full_name":"carrick-sh/carrick"},"actor":{"login":"tjfontaine"},"triggering_actor":{"login":"tjfontaine"}});
     assert!(trusted_run(&run));
+    let mut pushed = run.clone();
+    pushed["event"] = json!("push");
+    pushed["actor"]["login"] = json!("github-merge-queue[bot]");
+    pushed["triggering_actor"]["login"] = json!("github-merge-queue[bot]");
+    assert!(trusted_run(&pushed));
+    pushed["head_repository"]["full_name"] = json!("someone/fork");
+    assert!(!trusted_run(&pushed));
     let mut bot = run.clone();
     bot["triggering_actor"]["login"] = json!("carrick-workers[bot]");
     assert!(!trusted_run(&bot));
@@ -321,8 +328,11 @@ fn actions_prepare_download_and_publish_use_exact_baseline_and_fail_closed() {
     std::fs::write(&gh, r#"#!/usr/bin/env python3
 import json, os, pathlib, shutil, sys
 args = sys.argv[1:]
-base, head = 'a'*40, 'b'*40
-if args[:2] == ['run', 'download']:
+base, head = os.environ.get('TEST_BASE_CHAR','a')*40, os.environ.get('TEST_HEAD_CHAR','b')*40
+if args[:2] == ['run', 'watch']:
+    assert args[2] == '100'
+    pathlib.Path(os.environ['TEST_POSTS']+'.waited').touch()
+elif args[:2] == ['run', 'download']:
     assert args[2] == '100' and args[args.index('--name')+1] == 'signed-baseline-'+base+'-2'
     shutil.copyfile(os.environ['TEST_BASE'], pathlib.Path(args[args.index('--dir')+1])/'candidate.json')
 elif '--method' in args and args[args.index('--method')+1] == 'POST':
@@ -334,10 +344,27 @@ elif args[0] == 'api':
     if '/pulls/' in endpoint:
         print(json.dumps({'state':'open','head':{'sha':head},'base':{'ref':'main'}}))
     elif '/compare/' in endpoint:
-        print(json.dumps({'merge_base_commit':{'sha':base}}))
+        if '?per_page=' in endpoint:
+            assert endpoint.split('/compare/')[1].startswith(base+'...'+head)
+            print(json.dumps([{'commits':[{'sha':head}]}]))
+        else:
+            print(json.dumps({'merge_base_commit':{'sha':base}}))
+    elif '/commits/' in endpoint and '/pulls?' in endpoint:
+        print(json.dumps([[{'number':n,'base':{'ref':'main','repo':{'full_name':'carrick-sh/carrick'}}} for n in [123,124,123]]]))
+    elif '/actions/runs/100' == endpoint[-17:]:
+        print(json.dumps({'id':100,'path':'.github/workflows/signed-gate.yml','head_branch':'main','event':'push','head_sha':base,'status':'completed','repository':{'full_name':'carrick-sh/carrick'},'head_repository':{'full_name':'carrick-sh/carrick'}}))
     elif '/workflows/signed-gate.yml/runs' in endpoint:
         run = {'id':100,'path':'.github/workflows/signed-gate.yml','head_branch':'main','event':'workflow_dispatch','status':'completed','repository':{'full_name':'carrick-sh/carrick'},'head_repository':{'full_name':'carrick-sh/carrick'},'actor':{'login':'tjfontaine'},'triggering_actor':{'login':'tjfontaine'}}
-        print(json.dumps([{'workflow_runs':[run]}]))
+        if os.environ.get('TEST_AUTOMATIC_BASE'):
+            run.update(event='push', head_sha=base)
+        if os.environ.get('TEST_PENDING_BASE'):
+            run.update(event='push', head_sha=base, status='in_progress')
+        discovery = pathlib.Path(os.environ['TEST_POSTS']+'.discovered')
+        if os.environ.get('TEST_PENDING_BASE') and not discovery.exists():
+            discovery.touch()
+            print(json.dumps([{'workflow_runs':[]}]))
+        else:
+            print(json.dumps([{'workflow_runs':[run]}]))
     elif '/events?' in endpoint:
         print(json.dumps([[{'id':1,'event':'labeled','label':{'name':'gate:signed'},'actor':{'login':os.environ.get('TEST_LABEL_ACTOR','tjfontaine')}}]]))
     elif '/artifacts?' in endpoint:
@@ -424,6 +451,60 @@ else:
     assert!(label("tjfontaine").status.success());
     assert!(!label("someone-else").status.success());
 
+    let queue_ref = "refs/heads/gh-readonly-queue/main/pr-123-test";
+    let queue_event = dir.path().join("queue.json");
+    let queue_payload = json!({"repository":{"full_name":"carrick-sh/carrick"},"action":"checks_requested","merge_group":{"base_ref":"refs/heads/main","head_ref":queue_ref,"head_sha":"b".repeat(40),"base_sha":"a".repeat(40)}});
+    std::fs::write(&queue_event, queue_payload.to_string()).unwrap();
+    let queue_dir = dir.path().join("queue-request");
+    let queue = |payload: &serde_json::Value| {
+        std::fs::write(&queue_event, payload.to_string()).unwrap();
+        child()
+            .env("GITHUB_EVENT_NAME", "merge_group")
+            .env("GITHUB_ACTOR", "github-merge-queue[bot]")
+            .env("GITHUB_TRIGGERING_ACTOR", "github-merge-queue[bot]")
+            .env("GITHUB_REF", queue_ref)
+            .env("GITHUB_SHA", "b".repeat(40))
+            .env("TEST_PENDING_BASE", "1")
+            .args(["signed-gate", "prepare", "--event"])
+            .arg(&queue_event)
+            .arg("--output")
+            .arg(&queue_dir)
+            .output()
+            .unwrap()
+    };
+    let queued = queue(&queue_payload);
+    assert!(
+        queued.status.success(),
+        "{}",
+        String::from_utf8_lossy(&queued.stderr)
+    );
+    assert!(posts.with_extension("jsonl.waited").exists());
+    let queue_request: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(queue_dir.join("request.json")).unwrap()).unwrap();
+    assert_eq!(queue_request["kind"], "MergeGroup");
+    assert_eq!(queue_request["base"], "a".repeat(40));
+    assert_eq!(queue_request["sha"], "b".repeat(40));
+    assert_eq!(queue_request["prs"], json!([123, 124]));
+    for (field, bad) in [
+        ("base_ref", "refs/heads/other"),
+        ("head_ref", "refs/heads/feature"),
+        ("head_sha", "c"),
+        ("base_sha", "invalid"),
+    ] {
+        let mut wrong = queue_payload.clone();
+        wrong["merge_group"][field] = json!(bad);
+        assert!(!queue(&wrong).status.success(), "accepted {field}");
+    }
+    let mut wrong = queue_payload.clone();
+    wrong["action"] = json!("destroyed");
+    assert!(!queue(&wrong).status.success());
+    wrong = queue_payload.clone();
+    wrong["merge_group"]["head_sha"] = json!("c".repeat(40));
+    assert!(!queue(&wrong).status.success());
+    let mut wrong = queue_payload.clone();
+    wrong["repository"]["full_name"] = json!("someone/fork");
+    assert!(!queue(&wrong).status.success());
+
     let results = dir.path().join("results");
     std::fs::create_dir(&results).unwrap();
     let candidate = admitted(&"b".repeat(40));
@@ -474,6 +555,55 @@ else:
             .contains("Started base → candidate")
     );
 
+    let publish_queue = || {
+        child()
+            .args(["signed-gate", "publish", "--request"])
+            .arg(queue_dir.join("request.json"))
+            .arg("--results")
+            .arg(&results)
+            .args([
+                "--run-url",
+                "https://github.com/carrick-sh/carrick/actions/runs/202",
+                "--execution-result",
+                "success",
+            ])
+            .output()
+            .unwrap()
+    };
+    assert!(publish_queue().status.success());
+    let mut regression = candidate.clone();
+    regression.steps[2]
+        .failed_tests
+        .push("new_queue_failure".into());
+    std::fs::write(&candidate_path, serde_json::to_vec(&regression).unwrap()).unwrap();
+    assert!(!publish_queue().status.success());
+    let queue_posts: Vec<serde_json::Value> = std::fs::read_to_string(&posts)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let last = &queue_posts[queue_posts.len() - 3..];
+    assert_eq!(last[0]["body"]["state"], "failure");
+    assert!(
+        last[1]["endpoint"]
+            .as_str()
+            .unwrap()
+            .ends_with("/123/comments")
+    );
+    assert!(
+        last[2]["endpoint"]
+            .as_str()
+            .unwrap()
+            .ends_with("/124/comments")
+    );
+    assert!(
+        last[2]["body"]["body"]
+            .as_str()
+            .unwrap()
+            .contains("new_queue_failure")
+    );
+    std::fs::write(&candidate_path, serde_json::to_vec(&candidate).unwrap()).unwrap();
+
     // A valid receipt cannot hide a failed execution job, nor can an unrelated
     // identity file stand in for independently inspected artifact identity.
     assert!(!publish("failure").status.success());
@@ -495,9 +625,13 @@ else:
     );
 
     // The main reseed path uses the same gate, without needing a previous base.
-    std::fs::write(&event, json!({"repository":{"full_name":"carrick-sh/carrick"},"inputs":{"pr":"main","sha":"a".repeat(40)}}).to_string()).unwrap();
+    std::fs::write(&event, json!({"repository":{"full_name":"carrick-sh/carrick"},"ref":"refs/heads/main","deleted":false,"after":"a".repeat(40)}).to_string()).unwrap();
     let main_dir = dir.path().join("main-request");
     let main = child()
+        .env("GITHUB_EVENT_NAME", "push")
+        .env("GITHUB_SHA", "a".repeat(40))
+        .env("GITHUB_ACTOR", "merge-bot")
+        .env("GITHUB_TRIGGERING_ACTOR", "merge-bot")
         .env("TEST_NO_BASE", "1")
         .args(["signed-gate", "prepare", "--event"])
         .arg(&event)
@@ -539,6 +673,63 @@ else:
         "{}",
         String::from_utf8_lossy(&main.stderr)
     );
+    // Next landing: main B seeds its own baseline automatically, and group C
+    // uses B rather than A or a PR merge base, without manual dispatch.
+    let next_main = json!({"repository":{"full_name":"carrick-sh/carrick"},"ref":"refs/heads/main","deleted":false,"after":"b".repeat(40)});
+    std::fs::write(&event, next_main.to_string()).unwrap();
+    let next_child = || {
+        let mut cmd = child();
+        cmd.env("TEST_BASE_CHAR", "b")
+            .env("TEST_HEAD_CHAR", "c")
+            .env("TEST_AUTOMATIC_BASE", "1");
+        cmd
+    };
+    let main = next_child()
+        .env("GITHUB_EVENT_NAME", "push")
+        .env("GITHUB_SHA", "b".repeat(40))
+        .env("GITHUB_ACTOR", "merge-bot")
+        .env("GITHUB_TRIGGERING_ACTOR", "merge-bot")
+        .args(["signed-gate", "prepare", "--event"])
+        .arg(&event)
+        .arg("--output")
+        .arg(&main_dir)
+        .output()
+        .unwrap();
+    assert!(
+        main.status.success(),
+        "{}",
+        String::from_utf8_lossy(&main.stderr)
+    );
+    std::fs::write(
+        &baseline_path,
+        serde_json::to_vec(&admitted(&"b".repeat(40))).unwrap(),
+    )
+    .unwrap();
+    let mut next_queue = queue_payload;
+    next_queue["merge_group"]["head_sha"] = json!("c".repeat(40));
+    next_queue["merge_group"]["base_sha"] = json!("b".repeat(40));
+    std::fs::write(&queue_event, next_queue.to_string()).unwrap();
+    let queued = next_child()
+        .env("GITHUB_EVENT_NAME", "merge_group")
+        .env("GITHUB_REF", queue_ref)
+        .env("GITHUB_SHA", "c".repeat(40))
+        .env("GITHUB_ACTOR", "merge-bot")
+        .env("GITHUB_TRIGGERING_ACTOR", "merge-bot")
+        .args(["signed-gate", "prepare", "--event"])
+        .arg(&queue_event)
+        .arg("--output")
+        .arg(&queue_dir)
+        .output()
+        .unwrap();
+    assert!(
+        queued.status.success(),
+        "{}",
+        String::from_utf8_lossy(&queued.stderr)
+    );
+    let next: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(queue_dir.join("request.json")).unwrap()).unwrap();
+    assert_eq!(next["base"], "b".repeat(40));
+    assert_eq!(next["sha"], "c".repeat(40));
 }
 
 #[test]
