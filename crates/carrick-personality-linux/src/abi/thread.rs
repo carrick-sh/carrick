@@ -3334,7 +3334,7 @@ mod layout_manifest {
                      release_waiter: _,
                      service: _,
                      robust_cursor: _,
-                     clone_rollback: _,
+                     _clone_rollback: _,
                  }: ThreadControlSlot| {};
         field!(ThreadControlSlot, visible_tid, AtomicU32, 0, 4, 4);
         field!(ThreadControlSlot, fault_address, AtomicU64, 8, 8, 8);
@@ -3437,7 +3437,7 @@ mod layout_manifest {
         field!(ThreadControlSlot, robust_cursor, [AtomicU64; 7], 448, 56, 8);
         field!(
             ThreadControlSlot,
-            clone_rollback,
+            _clone_rollback,
             [AtomicU64; 6],
             504,
             48,
