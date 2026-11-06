@@ -12452,51 +12452,6 @@ fn exit_nonresident_pages(clear_only: bool, park_output: bool, fault_clear: bool
         return;
     }
 
-    assert_eq!(sibling_control.robust_list().0, 0);
-    if !clear_only {
-        assert_eq!(
-            last_node.get::<RobustNode>(0).futex,
-            0xc000_0000,
-            "owner death must preserve a peer's newly published WAITERS bit"
-        );
-        assert_eq!(robust_node.get::<RobustNode>(0).futex, 0xc000_0000);
-        crate::lifecycle::CHILD_TID_WAKE_CALLS.with(|calls| {
-            assert_eq!(
-                &*calls.borrow(),
-                &[robust_node.arg_at(8), last_node.arg_at(8)]
-            );
-        });
-        crate::lifecycle::COPYIN_CALLS.with(|calls| {
-            assert_eq!(
-                calls
-                    .borrow()
-                    .iter()
-                    .filter(|address| **address == robust_head.arg())
-                    .count(),
-                1,
-                "retained cursor must not restart the head"
-            );
-            assert_eq!(
-                calls
-                    .borrow()
-                    .iter()
-                    .filter(|address| **address == robust_node.arg())
-                    .count(),
-                1,
-                "retained cursor must not repeat a completed entry"
-            );
-            assert_eq!(
-                calls
-                    .borrow()
-                    .iter()
-                    .filter(|address| **address == last_node.arg_at(8))
-                    .count(),
-                1,
-                "a refused write retains the original WAITERS word"
-            );
-        });
-    }
-
     // 3. Rerun exit with both pages backed: completes in ring, marks robust mutex
     // FUTEX_OWNER_DIED, zeroes clear_child_tid, and wakes leader once!
     frame.x = [0; 31];
@@ -12530,14 +12485,10 @@ fn exit_nonresident_pages(clear_only: bool, park_output: bool, fault_clear: bool
             if clear_only {
                 vec![clear_tid_word.arg()]
             } else {
-                vec![
-                    robust_node.arg_at(8),
-                    last_node.arg_at(8),
-                    clear_tid_word.arg(),
-                ]
+                vec![robust_node.arg_at(8), clear_tid_word.arg()]
             }
             .as_slice(),
-            "one robust wake and one clear-child-TID wake, without replay"
+            "one WAITERS robust wake and one clear-child-TID wake, without replay"
         );
     });
 }

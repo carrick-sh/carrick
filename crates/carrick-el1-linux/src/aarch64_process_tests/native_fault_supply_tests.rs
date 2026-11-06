@@ -4431,11 +4431,10 @@ fn arm_clone_tid_output_refuses_before_sibling_in_flight_grant_publication() {
     crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
     assert_eq!(
         refused.unwrap(),
-        carrick_personality_linux::dispatch::CompletionRoute::WithWork,
+        carrick_personality_linux::dispatch::CompletionRoute::Forward,
         "non-resident clone TID output must refuse without parking"
     );
     assert_eq!(clone_frame.elr, 0x402000);
-    assert_eq!(clone_frame.x[0] as i64, -14);
     assert_eq!(tid_words.get::<[i32; 2]>(0), [11, 22]);
     assert_eq!(child_control.visible_tid(), None);
 

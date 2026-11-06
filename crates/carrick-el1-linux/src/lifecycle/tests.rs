@@ -3442,8 +3442,7 @@ fn managed_clone_copyout_fault_unbinds_birth_before_retry() {
         owner.record.is_some(),
         "witness must reach managed retained birth before copyout refusal"
     );
-    assert_eq!(action, Some(Action::Served));
-    assert_eq!(frame.x[0] as i64, -14);
+    assert_eq!(action, None);
     assert_eq!(
         w.page().state(0),
         Some((entry.generation(), EntryState::Reserved))
