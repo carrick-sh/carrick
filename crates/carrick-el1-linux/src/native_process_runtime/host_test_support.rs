@@ -439,6 +439,13 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
             &task,
             binding,
             operation,
+            &|owned| {
+                crate::sched::object_wait::deliver_completion(
+                    self.zone,
+                    SlotId::from_index(0).unwrap(),
+                    owned,
+                )
+            },
         )
     }
     fn signal_deadline(
