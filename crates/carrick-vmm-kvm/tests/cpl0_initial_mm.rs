@@ -1755,6 +1755,27 @@ fn private_file_fixture_with(cow: bool, scenario: &[&str], open_flags: u64) {
         "31=open, 32=mmap, 33=bytes; run={:?}",
         outcome.run
     );
+    if scenario.contains(&"-DEXPECT_SOURCE_LIMIT") {
+        let witness = outcome
+            .run
+            .report
+            .execution_witness
+            .as_ref()
+            .expect("source-bound execution population");
+        let crossings = witness
+            .host_forward_families
+            .iter()
+            .find(|row| row.family == "host-file")
+            .expect("private-source host service");
+        // 1,024 admitted sources, one errno-12 request, then one request
+        // releasing the unmapped source and admitting its replacement.
+        // Metadata growth must retain its original source, not stage again.
+        assert_eq!(crossings.count, 1026);
+        assert!(witness.guest_refusal_families.is_empty());
+        assert!(!outcome.run.trap_limit_hit);
+        assert!(outcome.run.stdout.is_empty());
+        assert!(outcome.run.stderr.is_empty());
+    }
     assert_eq!(std::fs::read(&path).expect("source after guest"), bytes);
 }
 
