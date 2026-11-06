@@ -5233,3 +5233,259 @@ fn unmanaged_thread_birth_reusing_freed_record_does_not_observe_stale_mm() {
         "reused record must carry caller MM, never a freed predecessor's MM"
     );
 }
+
+/// #1719's first admission boundary: unlike the atomic-word reduction, both
+/// actors enter the registered production process owner. The VM-free hardware
+/// fault switch stands in for an AT fault; the real table leaves are absent.
+/// This deliberately remains red until clone retains its copy request.
+#[test]
+fn clone_tid_not_yet_retains_birth_with_a_registered_mapping_editor() {
+    use carrick_core::personality::GuestCopyRequest;
+    use carrick_guest_arch::{Access, GuestLen};
+    use carrick_personality_linux::lifecycle::{CopyOutcome, UserCopy};
+
+    let fixture = Box::leak(Box::new(Fixture::with_page(
+        0x10000,
+        asid(1),
+        5,
+        Box::leak(Box::new(ThreadLifecyclePage::with_hatches(
+            carrick_el1_abi::LifecycleHatches::ON,
+        ))),
+    )));
+    fixture.tables.words[1536].store(0, Ordering::Release);
+    fixture.tables.words[1537].store(0, Ordering::Release);
+    let leader_id = fixture.zone.slot(fixture.slot).host_record().unwrap();
+    assert!(fixture.zone.mark_native_owned(leader_id));
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, leader_id)
+            .is_queued()
+    );
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        leader_id
+    );
+    let (sibling, sibling_record) = imported_thread(fixture);
+    sibling
+        .set_affinity(carrick_core::affinity::CpuAffinity::single(0))
+        .unwrap();
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, leader_id)
+            .is_queued()
+    );
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        sibling_record.id
+    );
+    assert!(fixture.zone.mark_native_owned(sibling_record.id));
+    run_as(fixture, 42, 12, 102, sibling);
+    let mut gettid = carrick_el1_abi::TrapFrame::default();
+    gettid.x[8] = 178;
+    arm_call(fixture, sibling, &mut service, &mut gettid).unwrap();
+    assert_eq!(gettid.x[0], 42);
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let sibling_binding = crate::common_entry::execution_binding(&fixture.task);
+    let owner = registry()
+        .for_entry(source, &fixture.task, fixture.address)
+        .unwrap();
+    let sibling_record = sibling.zone_record().unwrap();
+    assert!(fixture.zone.live(sibling_record).is_some());
+    assert_eq!(fixture.page.live(), 2);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, sibling_record.id)
+            .is_queued()
+    );
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        leader_id
+    );
+    run_as_leader(fixture);
+    fixture
+        .control
+        .set_affinity(carrick_core::affinity::CpuAffinity::single(0))
+        .unwrap();
+    let portal = crate::aarch64_process::Portal::for_zone(
+        NonZeroU64::MIN,
+        fixture.region.table(),
+        fixture.zone,
+    );
+    let mm = ReservationMm::new(1).unwrap();
+    // Authenticate the two distinct destinations against the production VMA
+    // owner, and prove both leaves are really missing before attempting copy.
+    for address in [VA, VA + 4096] {
+        assert_eq!(
+            leaf(
+                &fixture.tables.live(&fixture.maintenance),
+                fixture.address.root.address().raw(),
+                address
+            ),
+            0
+        );
+        let transfer = portal
+            .begin(
+                portal.admitted_handle(mm, 0).unwrap(),
+                crate::mm_portal::GuestVa::new(address),
+                4,
+                crate::mm_portal::TransferIntent::UserRead,
+                0,
+            )
+            .unwrap();
+        let residency = crate::mm_portal::test_support::residency();
+        assert!(matches!(
+            portal.select(
+                &transfer,
+                &fixture.tables.live(&fixture.maintenance),
+                crate::mm_portal::SelectionVenues {
+                    prepared: &mut carrick_el1::fault::NoopPreparedResolver,
+                    cow: &mut carrick_el1::fault::NoopCowResolver,
+                    residency: &residency,
+                    slot: 0,
+                },
+            ),
+            Ok(crate::mm_portal::TransferStep::Supply(_))
+        ));
+    }
+    let mut frame = carrick_el1_abi::TrapFrame {
+        elr: 0x402000,
+        ..Default::default()
+    };
+    frame.x[..5].copy_from_slice(&[0x0135_0f00, VA + 8192, VA, 0, VA + 4096]);
+    frame.x[8] = 220;
+    // Always restore the thread-local fault injection before any assertion.
+    struct HardwareFault;
+    impl Drop for HardwareFault {
+        fn drop(&mut self) {
+            crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
+        }
+    }
+    crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
+    let fault = HardwareFault;
+    let (copy_result, route) = fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |process| {
+                assert_ne!(process.binding(), sibling_binding);
+                let counters = carrick_el1_abi::Counters::new();
+                let names = carrick_el1_abi::InotifyNameCache::new();
+                let mut cpu = crate::sched::FakeCpu::default();
+                let mut pending = crate::dispatch::El1PendingFamilies {
+                    handoff: None,
+                    lifecycle_user: None,
+                    frame: &mut frame,
+                    counters: &counters,
+                    current_tasks: core::slice::from_ref(&fixture.task),
+                    fd_map: &[],
+                    object_table: &[],
+                    open_table: &[],
+                    inotify_table: &[],
+                    name_cache: &names,
+                    zone: Some(crate::dispatch::Zone {
+                        tables: fixture.zone,
+                        cpu: &mut cpu,
+                        user: &crate::sched::HardwareUserWord,
+                    }),
+                    ipc: None,
+                    lifecycle: Some(&*fixture),
+                    process: Some(process),
+                    source: Some(source),
+                    anonymous: None,
+                    cache_lookup: |_| core::ptr::null_mut(),
+                };
+                let copy = UserCopy::copy_in(&mut pending, &mut [0; 4], UserVa::new(VA));
+                let route =
+                    carrick_personality_linux::dispatch::dispatch(220, u64::MAX, &mut pending);
+                (copy, route)
+            },
+        )
+        .unwrap();
+    drop(fault);
+    let leader_record = fixture.control.zone_record().unwrap();
+    let leader_released = fixture.zone.slot(fixture.slot).current() != Some(leader_record.id);
+
+    // Run mapping changes while the sibling's authenticated production entry
+    // is live. The handler owns reservation admission and descriptor settlement.
+    if fixture.zone.slot(fixture.slot).current() == Some(leader_id) {
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(fixture.slot, leader_id)
+                .is_queued()
+        );
+    }
+    if fixture.zone.slot(fixture.slot).current() != Some(sibling_record.id) {
+        assert_eq!(
+            fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+            sibling_record.id
+        );
+    }
+    run_as(fixture, 42, 12, 102, sibling);
+    fixture
+        .enter(sibling, fixture_ttbr0(fixture), &mut service, |process| {
+            assert_eq!(process.binding(), sibling_binding);
+            assert!(process.has_thread(41));
+            assert!(process.has_thread(42));
+            for protection in [1, 3] {
+                let mut frame = carrick_el1_abi::TrapFrame::default();
+                frame.x[..3].copy_from_slice(&[VA + 4096, 4096, protection]);
+                frame.x[8] = 226; // mprotect
+                let residency = crate::mm_portal::test_support::residency();
+                let mut mapping = FixtureMapping {
+                    words: &fixture.tables.live(&fixture.maintenance),
+                    residency: &residency,
+                };
+                assert_eq!(
+                    carrick_el1::memory::serve_delegated_anonymous(
+                        &mut frame,
+                        &carrick_el1_abi::Counters::new(),
+                        &fixture.task,
+                        crate::sched::object_wait::space_access(fixture.zone, fixture.slot),
+                        fixture.region.table(),
+                        &mut mapping,
+                        None,
+                    ),
+                    carrick_el1::memory::DelegatedAnonymous::Served,
+                );
+                assert_eq!(frame.x[0], 0);
+            }
+        })
+        .unwrap();
+    assert!(std::sync::Arc::ptr_eq(
+        &owner,
+        &registry()
+            .for_entry(source, &fixture.task, fixture.address)
+            .unwrap()
+    ));
+    assert!(
+        matches!(copy_result, CopyOutcome::NotYet(GuestCopyRequest { address, len, access })
+        if address == UserVa::new(VA) && len == GuestLen::new(4) && access == Access::Read)
+    );
+    assert_eq!(fixture.page.live(), 2, "no birth before memory admission");
+    assert_eq!(fixture.page.claimed_count(), 0);
+    assert_eq!(
+        (route, leader_released),
+        (
+            carrick_personality_linux::dispatch::CompletionRoute::Suspended,
+            true
+        ),
+        "clone must retain NotYet and release execution capacity, not forward the original call"
+    );
+}

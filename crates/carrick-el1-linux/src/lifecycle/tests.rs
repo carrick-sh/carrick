@@ -353,7 +353,11 @@ impl crate::file::UserCopy for FaultingUser {
     }
 }
 
-fn serve_directly(w: &mut World, frame: &mut TrapFrame, user: &mut FaultingUser) -> Option<Action> {
+fn serve_directly(
+    w: &mut World,
+    frame: &mut TrapFrame,
+    user: &mut dyn crate::file::UserCopy,
+) -> Option<Action> {
     let task = &w.tasks[SLOT_IDX];
     let name_cache = InotifyNameCache::new();
     let ordinal = frame.x[8];
@@ -779,6 +783,101 @@ fn clone_tid_copy_faults_restore_the_preimages_and_forward() {
         free += 1;
     }
     assert_eq!(free, carrick_sched_core::ZONE_RECORDS - 1);
+}
+
+/// Reduce #1719's publication window through the production clone owner.
+/// Atomic fixture storage lets the second actor model a guest's ordinary
+/// loads/stores without introducing a Rust data race in the test itself.
+#[test]
+fn clone_tid_refusal_does_not_erase_a_live_siblings_store() {
+    use std::sync::{Arc, atomic::AtomicU32, mpsc};
+    use std::time::Duration;
+
+    const PARENT: u64 = 0x1000;
+    const CHILD: u64 = 0x2000;
+    const SIBLING_VALUE: u32 = 0xcccc;
+    struct Copy {
+        words: Arc<[AtomicU32; 2]>,
+        published: Option<mpsc::SyncSender<()>>,
+        observed: mpsc::Receiver<[u32; 2]>,
+        observation: Option<[u32; 2]>,
+    }
+    impl crate::file::UserCopy for Copy {
+        fn copy_in(&mut self, dst: &mut [u8], address: u64) -> bool {
+            let index = match address {
+                PARENT => 0,
+                CHILD => 1,
+                _ => panic!("unexpected input address"),
+            };
+            dst.copy_from_slice(&self.words[index].load(Ordering::SeqCst).to_le_bytes());
+            true
+        }
+        fn copy_out(&mut self, address: u64, bytes: &[u8]) -> bool {
+            // The sibling revokes the second destination's write access
+            // after observing the first publication. This models the copy
+            // boundary refusal, not production mprotect or page supply.
+            if address == CHILD {
+                return false;
+            }
+            assert_eq!(address, PARENT);
+            let value = u32::from_le_bytes(bytes.try_into().unwrap());
+            self.words[0].store(value, Ordering::SeqCst);
+            if let Some(published) = self.published.take() {
+                published.send(()).unwrap();
+                self.observation =
+                    Some(self.observed.recv_timeout(Duration::from_secs(5)).unwrap());
+            }
+            true
+        }
+    }
+
+    let mut w = World::new(LifecycleHatches::ON);
+    // First create a real live sibling through clone; the second clone is
+    // the attempted birth whose TID outputs are observed by that sibling.
+    w.venue.stock(1, 51, 8);
+    assert_eq!(
+        w.syscall(SYS_CLONE, &clone_args(GO_FLAGS, 0, 0)).0,
+        Action::Served
+    );
+    assert_eq!(w.page().live(), 2);
+    let entry = w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
+    let words = Arc::new([AtomicU32::new(0xaaaa), AtomicU32::new(0xbbbb)]);
+    let (published_tx, published_rx) = mpsc::sync_channel(1);
+    let (observed_tx, observed_rx) = mpsc::sync_channel(1);
+    let sibling_words = Arc::clone(&words);
+    std::thread::scope(|scope| {
+        let sibling = scope.spawn(move || {
+            published_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let observed = core::array::from_fn(|i| sibling_words[i].load(Ordering::SeqCst));
+            sibling_words[0].store(SIBLING_VALUE, Ordering::SeqCst);
+            observed_tx.send(observed).unwrap();
+        });
+        let mut copy = Copy {
+            words,
+            published: Some(published_tx),
+            observed: observed_rx,
+            observation: None,
+        };
+        let mut frame = TrapFrame {
+            slot: SLOT_IDX as u64,
+            ..TrapFrame::default()
+        };
+        frame.x[..5].copy_from_slice(&clone_args(GLIBC_FLAGS | CLONE_CHILD_SETTID, PARENT, CHILD));
+        frame.x[8] = SYS_CLONE as u64;
+        assert_eq!(serve_directly(&mut w, &mut frame, &mut copy), None);
+        sibling.join().unwrap();
+        assert_eq!(w.page().live(), 2);
+        assert_eq!(
+            w.page().state(0).unwrap(),
+            (entry.generation(), EntryState::Reserved)
+        );
+        assert_eq!(copy.words[1].load(Ordering::SeqCst), 0xbbbb);
+        assert_eq!(
+            (copy.observation, copy.words[0].load(Ordering::SeqCst)),
+            (Some([0xaaaa, 0xbbbb]), SIBLING_VALUE),
+            "a refused birth must neither expose its TID nor erase a sibling's store"
+        );
+    });
 }
 
 // ---- rt_sigprocmask ----
