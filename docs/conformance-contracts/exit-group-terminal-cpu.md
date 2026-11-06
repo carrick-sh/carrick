@@ -1,106 +1,79 @@
 # exit_group terminal CPU custody (#1666)
 
-`kernel.el1.thread-lifecycle` requires exit_group to retire every sibling
-without corrupting the terminating owner's continuation. Linux authority is
-exit_group(2); the Carrick invariant is that a task snapshot retains the
+`kernel.el1.thread-lifecycle` requires `exit_group` to retire every sibling
+without corrupting a terminating task's continuation. Linux authority is
+`exit_group(2)`; the Carrick invariant is that a task snapshot retains the
 current MM's complete translation root and ASID, even while host teardown
-waits for another member or a physical owner.
+waits for another member, a task-graph reservation, or a physical owner.
 
-The director's capture named TTBR0/TTBR1 `0x2d001f8000`, the carrier
-maintenance root, under a process projection with ASID 1. The raw saved-state
-writer is `aarch64_task_state_from_snapshot` in `carrick-aarch64/src/engine.rs`:
-it copies the hardware TTBR pair. The lazy path reaches it through
-`Aarch64ResidentTaskMetadata::snapshot_guest_cpu` and the runtime executor's
-`flush_resident_task`. That is correct only while hardware still represents
-the saved task. EL1's `sched::vacate::leave_space` installs the maintenance
-root before releasing the slot. Native root exit bypasses ordinary zone
-reconciliation; the process terminal then suspends for host teardown, including
-an unconditional yield when its sibling drain is already ready. Saving that
-terminal as Resident lets the later flush sample the maintenance root. A same
-executor reload is also unsafe: reaffirmation does not restore translation.
+## Mechanism
 
-The process terminal now explicitly requests a nonresident save. The binding
-checks the captured MM and strong ASID generation, then obtains both TTBRs
-from its current Stage1MmLease. The executor stores Materialized state and
-replaces the lease's CPU image before detaching. Both hardware roots are
-vacated with the existing terminal-root helper before publishing detached
-state: there is no resident record left to perform that retirement later.
-It cannot use the resident reaffirmation path. Metadata extraction failure
-preserves that canonical image. Ordinary guest snapshots and both existing load audits are unchanged.
-Exec drains keep their separate successor path.
+The raw saved-state writer `aarch64_task_state_from_snapshot` in
+`carrick-aarch64/src/engine.rs` copies the hardware TTBR pair, reached lazily
+through `Aarch64ResidentTaskMetadata::snapshot_guest_cpu` and
+`flush_resident_task`. That lazy path is valid only while hardware still
+represents the saved task. EL1's `sched::vacate::leave_space` installs the
+carrier maintenance root (`0x2d001f8000`) and clears the slot's installed
+space (`0`) before releasing the slot. When a process terminal or cancelled
+sibling suspends on the host after EL1 has vacated hardware roots, saving it
+as `Resident` lets a later flush sample `0x2d001f8000/0x2d001f8000`, and a
+same-executor resident reaffirmation does not restore process translation.
 
-The VM-free witness parks the live leader, runs a second real kernel thread,
-and dispatches exit_group(23) through ProductionHvpatchLoopPoll. Its test
-backend supplies the captured maintenance-root state; it does not emulate
-EL1 instruction execution or independently reproduce when EL1 vacates roots.
-The executor's shared save selector must produce Materialized state, and the
-production binding load audit must accept the exact process root and ASID.
-A stale generation must still fail. The structural bound is one full snapshot
-per terminal suspension; normal guest quanta request no additional snapshot.
+1. **Terminal CPU materialization and hardware-root cleanup.** Host-only
+   termination suspensions in `HvpatchProductionPhase::needs_terminal_cpu_save`
+   (`TerminalProcessDrain`, `TerminalClaimRetry`, `TerminalRetireRetry`,
+   `RetainedMemoryAction::{ProcessFinish, ThreadExit}` waits/retries, and
+   `RetryThreadExit`) explicitly request `TaskCpuSave::Terminal`. The binding
+   verifies the captured MM and strong `AsidGeneration`, then composes both
+   TTBRs from its live `Stage1MmLease`. `HvpatchPersistentExecutor::save`
+   stores `Materialized` state, updates the lease's CPU image, and vacates
+   both stopped worker hardware roots via `retire_terminal_resident_vcpu_root`
+   before publishing the detached backend; if a hardware root write fails, the
+   binding retains its detached backend and the worker retains its vCPU.
+   Member thread-exit phases (`RetainedMemoryAction::ThreadExit` and
+   `RetryThreadExit`) remain `false` in `is_terminal_transition` so a peer's
+   process or exec drain can still overtake and settle them as losing members.
+   Ordinary guest snapshots, load audits, and exec successor drains are
+   unchanged, and terminal suspension takes one full snapshot.
+2. **Vacated EL1 zone-slot authentication.** Because terminal materialization
+   and native cancellation (`El1Exit::seal` -> `leave_space`) vacate the zone
+   slot to maintenance space zero, `owns_installed_space` /
+   `own_space_installed` (`carrick-runtime/src/vcpu_loop/zone.rs`) accepts
+   `installed == 0` when the local continuation is in
+   `is_terminal_transition()` or the loaded thread's exact `ThreadControlSlot`
+   has `host_exit_requested()`, while rejecting ordinary runnable
+   maintenance-space returns and every foreign nonzero process space.
 
-Red evidence on admitted main with the witness scaffolding: the load audit
-rejected `0x2d001f8000/0x2d001f8000`, expecting `0x1000000004000`.
-The fixed witness passes. The director still owns the native failure capture and ten signed
-passes on one artifact, including the original el1_files exit-group stress
-binding; neither is verified here. This VM-free reduction does not claim those signed results, Docker
-timing, or a runtime ratio.
+## Witnesses
 
-The fix-round signed witnesses in `carrick-embed::el1_files` now drive the
-actual `HvpatchPersistentExecutor::save` with the existing exit-group guest
-fixture. A test-support-only probe seeds both stopped hardware roots with the
-still-owned process root, so an already-vacated EL1 root cannot conceal a
-missing cleanup write. It reads both roots immediately before backend
-publication. The failure row injects the second register-write refusal after
-the first real hardware write, then checks that the original binding again
-owns its detached backend and the failing executor retains its vCPU. No
-replacement executor, synthetic MM or hand-built terminal record is used.
-The old source-text ordering test is removed.
-
-These new signed witnesses have not run on this Linux worker. Their red-first
-mutation check (omit the cleanup call, and separately omit backend publication
-on failure) and green signed runs remain required on the Mac. Part of #1666;
-keep the PR draft until the failure capture and ten passes on one artifact
-are attached. The VM-free selector witness remains only a lower-layer proof.
-
-
-## carrick-87 investigation remains incomplete
-
-The forwarded host-syscall witness above is not a reduction of the native
-EL1 process-entry path. A temporary diagnostic using the existing
-`vcpu_loop::zone::affinity_tests::with_pair` native graph exercised two live
-threads: `exit_group(23)` parked the owner, requested the sibling's exit,
-and the production `El1Exit::seal` vacated the slot to both maintenance roots.
-Host materialization preserved a supplied process TTBR pair and rewound the
-retained native syscall. That diagnostic passed without a new runtime fix.
-
-It supplied the canonical base explicitly and bypassed production zone
-reconciliation and executor save. It therefore could not establish the bad
-save or satisfy the required red-on-head witness, and was not retained as a
-regression test. The existing terminal-save changes remain unqualified
-against the continuing signed failure. No additional runtime fix or root
-cause is claimed by this investigation.
-
-One candidate is `RetryThreadExit`, which is absent from
-`HvpatchProductionPhase::needs_terminal_cpu_save`. Native cancellation can
-enter `drive_thread_exit` before phase dispatch, and Busy retirement parks
-that phase. However, no schedule has shown that Busy transition with
-maintenance-root hardware under this native close. It is a hypothesis, not
-a reason to change the selector. The next witness must drive the native
-close through production reconciliation and save, retaining the sibling's
-actual base and MM/ASID identity, rather than supplying canonical registers.
-The director's named fatal/call-site capture and ten signed passes on one
-artifact remain outstanding.
-
-## Local native witness qualification (2026-11-05)
-
-At `89b350622a`, leased signed run `fix1673-native-a` passed the native
-pipe-handoff witness and the native file-stress diagnostic. Both use real
-HVF execution and passive register observations. The selected terminal
-save and reload retained process roots `0x1009a00000000`; earlier saves
-also observed maintenance roots `0x2d001f8000`. The initial maintenance
-root is therefore not itself a failed reload. This run does not establish
-red-first coverage: qualification against merge-base
-`41ad31b5ff1ec28dbc23b84f2f08ad61c9bc6ca4` is the next experiment.
-The signed runner's negative control passed and scoped cleanup reported
-zero survivors. The durable log is
-`/Volumes/CaseSensitive/carrick-evidence/fix1673-native-a.log`.
+- **VM-free (`carrick-runtime`):**
+  - `vcpu_loop::binding::tests::sibling_exit_group_terminal_save_keeps_process_translation`
+    parks the leader, dispatches `exit_group(23)` on a live sibling through
+    `ProductionHvpatchLoopJob::poll` over maintenance-root hardware, and
+    verifies `Materialized` state, exact process TTBR/ASID load validation,
+    stale-generation rejection, and one snapshot per terminal suspension (red
+    before the fix: rejected `0x2d001f8000/0x2d001f8000`, expected
+    `0x1000000004000`).
+  - `vcpu_loop::binding::tests::retry_thread_exit_terminal_save_keeps_process_translation`
+    and `retry_thread_exit_remains_non_terminal_transition_for_peer_drain`
+    cancel a live sibling under native `Closing` while an exclusive
+    `reserve_fork` task reservation forces `TaskBusy` -> `RetryThreadExit`
+    before `process_exiting()` is published, verifying terminal TTBR
+    materialization, `ThreadDone` completion once the reservation drops, and
+    non-terminal losing-member settlement under peer drains (red before
+    including `RetryThreadExit`: rejected `0x2d001f8000/0x2d001f8000`,
+    expected `0x1000000004000`).
+  - `vcpu_loop::zone::terminal_space_tests::sibling_owned_terminal_accepts_its_vacated_zone_slot`
+    verifies vacated-slot (`0`) acceptance under `host_exit_requested()` and
+    rejection of foreign nonzero spaces and unrequested maintenance returns.
+- **Signed HVF (`carrick-embed::el1_files`):**
+  - `native_sibling_exit_group_reloads_process_roots` and
+    `native_exit_group_save_diagnostic` exercise native EL1 `leave_space`,
+    sibling cancellation, and production process-root reload on HVF without
+    synthetic register images.
+  - `terminal_save_vacates_both_roots_before_publication` and
+    `terminal_save_second_root_write_failure_retains_ownership` drive
+    `HvpatchPersistentExecutor::save` on the `exit-group-stress` guest,
+    verifying both hardware roots are vacated before detached backend
+    publication and that a second-root write failure retains detached backend
+    and worker vCPU ownership.
