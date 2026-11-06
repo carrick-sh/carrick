@@ -3455,8 +3455,12 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                     let release = authority
                         .unpin_filtered(pin, ipc::is_zone_releasable_backing)
                         .map_err(map_fd_error)?;
-                    ipc::settle_native_release(&venue.region, release, zone, task)
-                        .map_err(map_ipc_error)?;
+                    ipc::settle_native_release(&venue.region, release, zone, task, &|effects| {
+                        if let Some((zone, slot)) = zone {
+                            crate::sched::object_wait::deliver_wake_effects(zone, slot, effects);
+                        }
+                    })
+                    .map_err(map_ipc_error)?;
                     return Err(error);
                 }
             };
@@ -3501,11 +3505,20 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
         let pin_release = authority
             .unpin_filtered(pin, ipc::is_zone_releasable_backing)
             .map_err(map_fd_error)?;
-        ipc::settle_native_release(&venue.region, pin_release, zone, task)
-            .map_err(map_ipc_error)?;
+        ipc::settle_native_release(&venue.region, pin_release, zone, task, &|effects| {
+            if let Some((zone, slot)) = zone {
+                crate::sched::object_wait::deliver_wake_effects(zone, slot, effects);
+            }
+        })
+        .map_err(map_ipc_error)?;
 
         let (release, delegated_release) = projected?;
-        ipc::settle_native_release(&venue.region, release, zone, task).map_err(map_ipc_error)?;
+        ipc::settle_native_release(&venue.region, release, zone, task, &|effects| {
+            if let Some((zone, slot)) = zone {
+                crate::sched::object_wait::deliver_wake_effects(zone, slot, effects);
+            }
+        })
+        .map_err(map_ipc_error)?;
         Self::settle_delegated_release(self.frame, self.open_table, task, delegated_release)?;
         Ok(new_fd)
     }
@@ -3615,7 +3628,13 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                     Ok(rel) => rel,
                     Err(err) => return map_fd_error(err),
                 };
-                if let Err(err) = ipc::settle_native_release(&venue.region, released, zone, task) {
+                if let Err(err) =
+                    ipc::settle_native_release(&venue.region, released, zone, task, &|effects| {
+                        if let Some((zone, slot)) = zone {
+                            crate::sched::object_wait::deliver_wake_effects(zone, slot, effects);
+                        }
+                    })
+                {
                     return map_ipc_error(err);
                 }
                 let change = super::file_table::close_host_binding(

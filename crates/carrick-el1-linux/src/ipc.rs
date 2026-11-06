@@ -127,6 +127,7 @@ fn release_native_description<C: carrick_el1_abi::EntryContext>(
     zone: &carrick_sched_core::ZoneTables<C>,
     slot: carrick_el1_abi::SlotId,
     task: &CurrentTask,
+    wake: &dyn Fn(WakeEffects),
 ) -> Result<(), carrick_el1_abi::ipc::IpcError> {
     use carrick_el1_abi::ipc::IpcError;
     match region.release_backing(description.backing, &Finish)? {
@@ -161,6 +162,7 @@ fn release_native_description<C: carrick_el1_abi::EntryContext>(
                     task.linux.mark_pending_host_work();
                 }
                 crate::sched::object_wait::deliver_wake_effects(zone, slot, effects);
+                let _ = wake;
             }
         }
         IpcReleased::Epoll => {}
@@ -183,6 +185,7 @@ pub(crate) fn settle_native_release<C: carrick_el1_abi::EntryContext>(
     release: carrick_el1_abi::ipc::fd::DeferredRelease,
     zone: Option<(&carrick_sched_core::ZoneTables<C>, carrick_el1_abi::SlotId)>,
     task: &CurrentTask,
+    wake: &dyn Fn(WakeEffects),
 ) -> Result<(), carrick_el1_abi::ipc::IpcError> {
     use carrick_el1_abi::ipc::fd::DeferredRelease;
     match release {
@@ -193,7 +196,7 @@ pub(crate) fn settle_native_release<C: carrick_el1_abi::EntryContext>(
         }
         DeferredRelease::Now(description) => {
             if let Some((zone, slot)) = zone {
-                release_native_description(region, description, zone, slot, task)
+                release_native_description(region, description, zone, slot, task, wake)
             } else {
                 match region.release_backing(description.backing, &Finish)? {
                     IpcReleased::Object { wake, .. } => {
@@ -1478,6 +1481,7 @@ pub(crate) fn retire_native_operation<C: carrick_el1_abi::EntryContext>(
     binding: carrick_el1_abi::ExecutionBinding,
     operation: carrick_sched_core::object_wait::OperationToken,
     completion: &dyn Fn(carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>),
+    wake: &dyn Fn(WakeEffects),
 ) -> Result<usize, crate::native_process_runtime::NativeProcessError> {
     use crate::native_process_runtime::NativeProcessError;
     let token = from_sched_token(operation).ok_or(NativeProcessError::Quarantined)?;
@@ -1496,7 +1500,7 @@ pub(crate) fn retire_native_operation<C: carrick_el1_abi::EntryContext>(
         .fd(EL1_WAIT)
         .unpin_filtered(OfdPin::from_raw(op.pin), is_zone_releasable_backing)
         .map_err(|_| NativeProcessError::Quarantined)?;
-    settle_native_release(region, release, Some((zone, slot)), task)
+    settle_native_release(region, release, Some((zone, slot)), task, wake)
         .map_err(|_| NativeProcessError::Quarantined)?;
     usize::try_from(op.progress.written).map_err(|_| NativeProcessError::Quarantined)
 }
@@ -1637,6 +1641,7 @@ fn finish_native<E: IpcExecution>(sched: &mut E, token: IpcOpToken, region: &Ipc
         release,
         Some((sched.zone(), sched.slot())),
         sched.task(),
+        &|effects| sched.deliver_release_wake(effects),
     )
     .unwrap_or_else(|_| {
         crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
@@ -2375,6 +2380,8 @@ mod tests {
     struct CompletionTransport<'a, C: ThreadCpu, U: UserWord> {
         inner: Sched<'a, C, U>,
         delivered: &'a core::cell::Cell<usize>,
+        refuse_park: Option<&'a dyn Fn()>,
+        release_delivered: core::cell::Cell<usize>,
     }
 
     impl<C: ThreadCpu, U: UserWord> IpcExecution for CompletionTransport<'_, C, U> {
@@ -2407,6 +2414,10 @@ mod tests {
         fn finish_object_wake(&mut self, effects: WakeEffects) {
             self.inner.finish_object_wake(effects);
         }
+        fn deliver_release_wake(&self, effects: WakeEffects) {
+            self.release_delivered.set(self.release_delivered.get() + 1);
+            self.inner.deliver_release_wake(effects);
+        }
         fn deliver_completion(
             &self,
             owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, Self::Context>,
@@ -2429,6 +2440,10 @@ mod tests {
                 carrick_sched_core::object_wait::OperationToken,
             ),
         > {
+            if let Some(refuse) = self.refuse_park {
+                refuse();
+                return Err((ObjectWaitError::Stale, operation));
+            }
             IpcExecution::park(
                 &mut self.inner,
                 frame,
@@ -2456,6 +2471,73 @@ mod tests {
     }
 
     #[test]
+    fn native_final_pipe_pin_release_uses_execution_transport() {
+        let w = world();
+        let table = w.table(w.a_tid);
+        let (read, _write, object) = w.pipe(table, BLOCK);
+        w.mem.map(MM, 0x10000, PAGE);
+        let mut frame = syscall(SYS_READ, read, 0x10000, 1, A_SVC);
+        // Native notification authenticates the selected record, as the
+        // production executor does before dispatching a blocked operation.
+        w.queue(w.a_tid, MM, &frame, A_SVC);
+        assert!(w.zone.switch_in_full(SLOT).is_some());
+        w.task.linux.file_table.store(w.a_tid, Ordering::Relaxed);
+        w.map.publish(w.a_tid, table.to_raw()).unwrap();
+        let venue = w.venue();
+        // Bind the writer notification lane without inventing a blocked
+        // writer: this test observes transport, not peer scheduling.
+        w.zone
+            .bind_object_wait(wait_key(object, WaitFor::Writable).unwrap(), &HostWait)
+            .unwrap();
+        let mut cpu = FakeCpu::default();
+        let delivered = core::cell::Cell::new(0);
+        let close_before_refusal = || {
+            // The public transfer entry has pinned the endpoint and released
+            // the object lock before asking its execution venue to park.
+            assert_eq!(w.host().close(table, Fd(read)), Ok(None));
+        };
+        let mut sched = CompletionTransport {
+            inner: Sched {
+                handoff: None,
+                zone: &w.zone,
+                slot: SLOT,
+                task: &w.task,
+                cpu: &mut cpu,
+                user: &HardwareUserWord,
+                counters: w.counters,
+            },
+            delivered: &delivered,
+            refuse_park: Some(&close_before_refusal),
+            release_delivered: core::cell::Cell::new(0),
+        };
+        let mut user = User {
+            task: &w.task,
+            mem: &w.mem,
+        };
+        assert_eq!(
+            serve_ipc_with_signals(&mut sched, &mut frame, &venue, &mut user, true, &mut || {
+                false
+            })
+            .0,
+            IpcServed::Returned { switched: false }
+        );
+        assert_eq!(frame.x[0] as i64, -38);
+        assert_eq!(
+            w.region
+                .lock(object, &HostWait)
+                .unwrap()
+                .pipe()
+                .unwrap()
+                .references(End::Reader),
+            0
+        );
+        assert!(
+            sched.release_delivered.get() > 0,
+            "final endpoint release bypassed execution transport"
+        );
+    }
+
+    #[test]
     fn ipc_operation_completion_uses_execution_transport() {
         let w = world();
         w.mem.map(MM, 0x10000, PAGE);
@@ -2476,6 +2558,8 @@ mod tests {
                 counters: w.counters,
             },
             delivered: &delivered,
+            refuse_park: None,
+            release_delivered: core::cell::Cell::new(0),
         };
         // Bind the real release source before completion. Keep one arena
         // slot free for the call's production admission and retain a waiter
@@ -2549,6 +2633,7 @@ mod tests {
                     binding,
                     to_sched_token(token).unwrap(),
                     &|owned| sched.deliver_completion(owned),
+                    &|effects| sched.deliver_release_wake(effects),
                 )
                 .unwrap();
             } else {
