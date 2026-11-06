@@ -43,6 +43,9 @@ where
     S: NativeProcessService<'a, C, Mm = M>,
     A: SignalMachine<C>,
 {
+    if !process.matches_signal_return(task, slot) {
+        return None;
+    }
     if !carrick_personality_linux::signal::signal_delivery_before_work(
         CompletionRoute::Served,
         &task.linux,
