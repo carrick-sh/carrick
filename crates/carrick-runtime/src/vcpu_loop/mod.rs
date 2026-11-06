@@ -3618,8 +3618,8 @@ pub(crate) mod tests {
 
     #[derive(Clone, Copy)]
     pub(crate) struct CopyoutOwnerProbe {
-        wait: carrick_el1_abi::PortalOwnerWait,
-        zone: usize,
+        pub(crate) wait: carrick_el1_abi::PortalOwnerWait,
+        pub(crate) zone: usize,
     }
 
     impl CopyoutOwnerProbe {
@@ -3683,6 +3683,7 @@ pub(crate) mod tests {
         pub(crate) installed_table_arena_sources: usize,
         pub(crate) guest_memory: std::collections::BTreeMap<u64, Vec<u8>>,
         pub(crate) read_tracker: Option<CrashReadTracker>,
+        pub(crate) read_refusal_tx: Option<std::sync::mpsc::SyncSender<()>>,
         pub(crate) fail_read_at: Option<u64>,
         pub(crate) atomic_word: Option<AtomicWordLoad>,
         pub(crate) fail_execve_into: Option<String>,
@@ -3846,6 +3847,9 @@ pub(crate) mod tests {
                 && !self.uncontended_reads
                 && let Some(wait) = probe.wait_if_busy()
             {
+                if let Some(tx) = &self.read_refusal_tx {
+                    let _ = tx.send(());
+                }
                 return Err(carrick_guest_mem::MemoryError::ReadSuspended(Box::new(
                     carrick_guest_mem::MemoryReadSuspension {
                         wait: carrick_guest_mem::MemoryReadWait::Owner(wait),
