@@ -237,7 +237,7 @@ fn serial_host_native_fork_exec_pipe_writer_reaches_its_parent() {
             )
             .unwrap();
         assert!(matches!(
-            entry.resume_checkpoint(),
+            entry.resume_checkpoint(|_| Ok(None)),
             Ok(NativeResume::NoPending)
         ));
     }
