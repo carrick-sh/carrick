@@ -504,6 +504,14 @@ impl SyscallDispatcher {
         if let Some(file) = resource.downcast_ref::<NativeOpenFile>() {
             return self.serve_native_open_file(header, &file.description, input, capacity);
         }
+        if header.op == HostFileOp::MapPrivate
+            && let Some(file) = resource.downcast_ref::<crate::kernel::objects::IpcPhysicalHold>()
+        {
+            return match file.retain_mapping() {
+                Some(reference) => self.native_map_reference(reference),
+                None => Served::Refused,
+            };
+        }
         Served::Refused
     }
 
@@ -670,6 +678,22 @@ impl SyscallDispatcher {
     /// Retain a carrier-opened regular file as a private-mapping byte source.
     /// A directory has no mmap operation (ENODEV, as Linux).
     fn native_map_source(&self, description: &Arc<crate::kernel::FileDescription>) -> Served {
+        let Some(reference) = description.retain_mapping() else {
+            return Served::errno(carrick_abi::LINUX_EBADF);
+        };
+        self.native_map_reference(reference)
+    }
+
+    fn native_map_reference(
+        &self,
+        reference: Arc<crate::kernel::objects::MappedFileReference>,
+    ) -> Served {
+        let description = reference.description();
+        if description.common().status_flags() & carrick_abi::LINUX_O_ACCMODE
+            == carrick_abi::LINUX_O_WRONLY
+        {
+            return Served::errno(carrick_abi::LINUX_EACCES);
+        }
         let label = match description.inspect_kind(|open| match open {
             crate::dispatch::OpenDescription::File { path, .. } => Some(Some(path.clone())),
             crate::dispatch::OpenDescription::HostFile { metadata, .. } => {
@@ -681,9 +705,6 @@ impl SyscallDispatcher {
             Some(Some(Some(label))) => label,
             Some(Some(None)) => return Served::errno(carrick_abi::LINUX_ENODEV),
             _ => return Served::Refused,
-        };
-        let Some(reference) = description.retain_mapping() else {
-            return Served::errno(carrick_abi::LINUX_EBADF);
         };
         match self
             .mem()
@@ -2494,6 +2515,73 @@ mod tests {
     /// A private file mapping's byte source: the reply names the identity
     /// the ring maps with, and the retained source reads the file's bytes
     /// at the mapping's offset as its pages fault in.
+    #[test]
+    fn published_private_map_source_survives_host_close_without_a_publication_cycle() {
+        use carrick_hal::fork_stock::HostBackingRead;
+        let mut fixture = rootfs_fixture();
+        let context = fixture.dispatcher.capture_one_task_context().unwrap();
+        let mut memory =
+            super::super::outcome::LinearMemory::new(0x4000, b"/lib/libc.so.6\0".to_vec());
+        let opened = fixture
+            .dispatcher
+            .dispatch(
+                &context,
+                super::super::SyscallRequest::new(
+                    56,
+                    crate::compat::SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &crate::compat::CompatReporter::default(),
+            )
+            .unwrap();
+        let DispatchOutcome::Returned { value: number } = opened else {
+            panic!("host open: {opened:?}");
+        };
+        let slot = context
+            .resources()
+            .files()
+            .slot(FileSlotNumber::for_open_fd(number as i32).unwrap())
+            .unwrap();
+        let original = Arc::downgrade(&slot.description());
+        drop(slot);
+        let mut map = record(
+            fixture.table,
+            HostFileOp::MapPrivate,
+            number as i32,
+            [0; 4],
+            &[],
+            carrick_core_abi::host_file::MapSourceReply::BYTES,
+        );
+        let source = fixture
+            .dispatcher
+            .serve_native_host_file_in(&fixture.owner, &mut map)
+            .unwrap()
+            .retained_source
+            .expect("published physical source");
+        let closed = fixture
+            .dispatcher
+            .dispatch(
+                &context,
+                super::super::SyscallRequest::new(
+                    57,
+                    crate::compat::SyscallArgs::from([number as u64, 0, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &crate::compat::CompatReporter::default(),
+            )
+            .unwrap();
+        assert!(matches!(closed, DispatchOutcome::Returned { value: 0 }));
+        assert!(
+            original.upgrade().is_none(),
+            "mapping does not own the publication description"
+        );
+        let bytes = source
+            .read(HostBackingRead::new(source.identity(), 4096).unwrap())
+            .unwrap();
+        assert_eq!(&bytes[..15], b"\x7fELF-libc-bytes");
+        assert!(bytes[15..].iter().all(|byte| *byte == 0));
+    }
+
     #[test]
     fn native_private_map_source_reads_the_opened_file() {
         use carrick_hal::fork_stock::HostBackingRead;
