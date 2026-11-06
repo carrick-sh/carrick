@@ -128,3 +128,39 @@ crossing alone is insufficient: `grant_target` can refuse with an owner wait
 after physical supply, while the local generic `error` mapper collapses that
 wait into Fault. Physical custody and the exact transfer must survive that
 refusal. No runtime correction is claimed by these additional witnesses.
+
+## Admitted-base suspension audit
+
+Fresh real-KVM execution of `cpl0_initial_mm` reproduces ten failures, with
+23 passes and one existing ignored test. The 100 MiB carrier-boot, distant
+fork-source and 4/32/100 MiB allocation bindings pass. The untouched status
+binding exits 91 and the post-reap rusage binding exits 92; the invalid-rusage
+control passes. These are current failures, not a green acceptance result.
+
+The instruction to reuse the shared valid-but-unbacked suspension mechanism
+requires a consumer in the CPL0 lane as well as a producer in the copy adapter.
+The admitted tree has the following boundaries:
+
+- `ForwardVenue` converts every failed `translate_leaf` into `OutOfBounds`.
+  It inherits `GuestMemory::supply_memory`, whose default is `Unsupported`.
+- `DispatchOutcome::from_owner_memory_error` can represent owner waits and
+  supply requests. The HVPatch binding consumes those outcomes before ordinary
+  continuation construction; the CPL0 executor does not.
+- `Cpl0PersistentExecutor::block_forward` calls
+  `prepare_blocked_continuation`. Its builder explicitly rejects
+  `OwnerMemoryWait`, `OwnerMemorySupply`, and retained copy outcomes with
+  `ContinuationBuildError::NonBlockingOutcome`. Emitting `ReadSuspended`
+  alone therefore changes the failure venue without completing the copy.
+- The cited typed `UserCopy` / `CopyOutcome::NotYet` prerequisite is absent:
+  both existing `UserCopy` traits still return bool, and the tree has no
+  `CopyOutcome` definition. The native wait witnesses use
+  `NativeProcessService::copy_status` / `copy_signal_bytes`, rather than the
+  forwarded host `GuestMemory` adapter. Their post-reap stage must survive
+  independently of a saved syscall's redispatch.
+
+The next integration needs the shared owner transfer and its suspension
+consumer in both affected venues. A second x86 source lookup, synchronous
+fault-in fallback, eager ELF population, or a larger carrier aperture would
+not satisfy this requirement. The freestanding CPL0 image builds, but that
+compile result does not resolve these live failures. No runtime fix is
+claimed by this audit.
