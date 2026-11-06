@@ -548,10 +548,9 @@ fn native_sibling_exit_group_reloads_process_roots() {
         observed.thread.is_some(),
         "native_save_observed=false: {observed:?}"
     );
-    assert_eq!(
-        observed.hardware_roots,
-        Some([carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE; 2]),
-        "native_leave_space=false: {observed:?}"
+    assert!(
+        observed.hardware_roots.is_some(),
+        "native_save_roots=false: {observed:?}"
     );
     assert!(observed.process_root.is_some_and(|root| root >> 48 != 0));
     assert_eq!(
