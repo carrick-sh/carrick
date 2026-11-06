@@ -1,3 +1,8 @@
+# #1709: retained terminal memory waits now bind the captured MM through
+# core::terminal::TerminalMemoryWait before portal enrollment. Ordinary guest
+# scheduling, futex handoff, shutdown entry and their work budgets are unchanged.
+# See serial_host_unkeyed_thread_exit_retry_parks_on_exact_memory_owner in
+# carrick-runtime::vcpu_loop::binding::tests and exit-group-terminal-cpu.md.
 # #1394: additional ABI bookkeeping witness only; existing semantic and
 # work-budget bindings remain authoritative. Census publication reads counters
 # after executor join and does not alter this contract's guest operation.

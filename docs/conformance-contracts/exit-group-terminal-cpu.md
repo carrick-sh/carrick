@@ -44,6 +44,18 @@ same-executor resident reaffirmation does not restore process translation.
    has `host_exit_requested()`, while rejecting ordinary runnable
    maintenance-space returns and every foreign nonzero process space.
 
+3. **Terminal memory-owner identity.** Cancellation may call `drive_thread_exit`
+   before the first ordinary poll reaches `refresh_zone_key`, including while
+   retrying a task-graph reservation. `state.zone_mm` can therefore be absent
+   while the carrier zone and exact kernel context are live. The neutral
+   `carrick_core::terminal::TerminalMemoryWait` binds the owner-issued receipt
+   to that retained context's MM. Retained terminal memory actions use this
+   binding instead of the ordinary execution cache. The existing portal
+   authentication still checks the carrier and root incarnation before a wait
+   record is allocated; a foreign MM or stale owner remains refused. The clear
+   intent survives the wait and the member remains live until clear preparation
+   and exact graph retirement succeed. There is no polling or additional wait.
+
 ## Witnesses
 
 - **VM-free (`carrick-runtime`):**
@@ -63,6 +75,18 @@ same-executor resident reaffirmation does not restore process translation.
     non-terminal losing-member settlement under peer drains (red before
     including `RetryThreadExit`: rejected `0x2d001f8000/0x2d001f8000`,
     expected `0x1000000004000`).
+  - `vcpu_loop::binding::tests::serial_host_unkeyed_thread_exit_retry_parks_on_exact_memory_owner`
+    extends the two-live-thread retry schedule with a real portal Gate receipt.
+    Before first zone-key refresh, the cancelled member must enroll on its
+    retained MM, keep its child-TID word and graph membership while parked,
+    and finish `ThreadDone` after owner release with one committed clear.
+    Red before the fix: `owner memory wait has no exact carrier zone`.
+    This drives the production host poll and neutral native Closing custody;
+    physical bytes and guest instructions remain supplied by the test engine.
+    It does not reproduce the full EL1 native-process crossing schedule or
+    the signed failure population. In particular it does not move an MM/root
+    generation across physical stock crossings, which the native fixture
+    cannot yet re-authenticate as described in #1758.
   - `vcpu_loop::zone::terminal_space_tests::sibling_owned_terminal_accepts_its_vacated_zone_slot`
     verifies vacated-slot (`0`) acceptance under `host_exit_requested()` and
     rejection of foreign nonzero spaces and unrequested maintenance returns.
@@ -77,3 +101,8 @@ same-executor resident reaffirmation does not restore process translation.
     verifying both hardware roots are vacated before detached backend
     publication and that a second-root write failure retains detached backend
     and worker vCPU ownership.
+
+The missing-cache schedule is proven VM-free. The reported signed population
+(10/10 base, 9/10 candidate on PR #1739) still requires a fresh paired signed
+run on this fix; this Linux worker does not establish a signed pass rate or
+attribute every preceding `ProcessExit` diagnostic to the missing-cache defect.
