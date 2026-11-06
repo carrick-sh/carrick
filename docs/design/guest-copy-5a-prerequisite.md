@@ -24,9 +24,10 @@ Consequently, changing those existing host copy sites cannot demonstrate the
 requested native-process witness. The next implementation needs one explicit
 choice: extend the native service/ring implementation to serve sendfile, or
 use a production `SyscallDispatcher` witness for the existing host operation.
-The former introduces a service interface and needs the separate interface
-design review required by AGENTS.md for wire layouts. Neither choice has been
-made in this slice. A test-only dispatch bridge would hide the missing
+Adding a host-file wire operation needs the separate interface design review
+required by AGENTS.md for wire layouts; a wholly in-ring implementation need
+not introduce a wire layout. Neither choice has been made in this slice.
+A test-only dispatch bridge would hide the missing
 production route and would not prove the claim.
 
 `getdents64` has a native service path already. Its carrier invokes
