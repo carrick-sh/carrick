@@ -333,7 +333,6 @@ impl carrick_el1_linux::signal_delivery::SignalMachine<carrick_sched_core::Parke
     for X86SignalMachine
 {
     type Backend = carrick_el1_linux::x86_signal::LinuxX86Backend;
-    type RestartCheckpoint = (u64, u64);
 
     fn backend(&mut self) -> &mut Self::Backend {
         &mut self.backend
@@ -355,19 +354,6 @@ impl carrick_el1_linux::signal_delivery::SignalMachine<carrick_sched_core::Parke
         } else {
             false
         }
-    }
-
-    fn restart_checkpoint(&self, frame: &NativeFrame) -> Self::RestartCheckpoint {
-        (frame.rax, frame.rcx)
-    }
-
-    fn restore_restart_checkpoint(
-        &self,
-        frame: &mut NativeFrame,
-        (rax, rcx): Self::RestartCheckpoint,
-    ) {
-        frame.rax = rax;
-        frame.rcx = rcx;
     }
 
     fn group_exit_custody(&self, task: &CurrentTask) -> CompletionRoute {

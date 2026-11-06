@@ -10,7 +10,6 @@ use carrick_signal_core::policy::{self, SigBlockMask, Signal};
 /// Machine-specific register operations surrounding the shared selection.
 pub trait SignalMachine<C> {
     type Backend: SignalBackend;
-    type RestartCheckpoint: Copy;
     fn backend(&mut self) -> &mut Self::Backend;
     fn user_sp(
         &self,
@@ -21,15 +20,6 @@ pub trait SignalMachine<C> {
         frame: &mut <Self::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
         original: &C,
     ) -> bool;
-    fn restart_checkpoint(
-        &self,
-        frame: &<Self::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
-    ) -> Self::RestartCheckpoint;
-    fn restore_restart_checkpoint(
-        &self,
-        frame: &mut <Self::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
-        checkpoint: Self::RestartCheckpoint,
-    );
     fn restart_forwarded(
         &self,
         _frame: &mut <Self::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
@@ -132,7 +122,6 @@ where
             }
         }
         policy::Disposition::Handler(handler) => {
-            let restart_checkpoint = machine.restart_checkpoint(frame);
             let restarted = if carrick_signal_core::wait::interrupted_wait(
                 carrick_signal_core::wait::RestartClass::IfSaRestart,
                 carrick_signal_core::wait::WaitProgress::Blocked,
@@ -237,45 +226,6 @@ where
             };
             match setup {
                 Ok(_) => {}
-                Err(carrick_core::personality::CopyOutcome::NotYet(request)) => {
-                    machine.restore_restart_checkpoint(frame, restart_checkpoint);
-                    slot.init_blocked(BlockedMask(thread_blocked.signals().bits()));
-                    if let Some(mask) = suspend_mask {
-                        process.restore_suspend_mask(mask);
-                    }
-                    if let Some(original) = interrupted_child_wait.take() {
-                        process.restore_interrupted_child_wait(original);
-                    }
-                    process.requeue_deliverable(sig, info, action);
-                    use carrick_personality_linux::lifecycle::LifecycleOutcome;
-                    match process.wait_signal_frame_copy(request) {
-                        Ok(LifecycleOutcome::Redispatch) => {
-                            return deliver_signal_on_syscall_return(
-                                task, slot, process, frame, fpstate, machine,
-                            );
-                        }
-                        Ok(LifecycleOutcome::Transferred {
-                            progress: carrick_core::Served::Idle,
-                            ..
-                        }) => return Some(CompletionRoute::Suspended),
-                        Ok(LifecycleOutcome::Returned { .. }) => {
-                            let _ = process.take_deliverable(thread_blocked);
-                            return force_delivery_fault(
-                                task,
-                                slot,
-                                process,
-                                frame,
-                                fpstate,
-                                machine,
-                                SignalDeliveryFailure {
-                                    original: sig,
-                                    blocked: thread_blocked,
-                                },
-                            );
-                        }
-                        Ok(_) | Err(_) => return Some(CompletionRoute::InvalidCompletion),
-                    }
-                }
                 Err(_) => {
                     return force_delivery_fault(
                         task,

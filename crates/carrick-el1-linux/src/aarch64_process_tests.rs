@@ -8717,7 +8717,6 @@ struct ArmWaitSignalMachine {
 #[cfg(test)]
 impl crate::signal_delivery::SignalMachine<Aarch64ParkedContext> for ArmWaitSignalMachine {
     type Backend = ArmWaitSignalBackend;
-    type RestartCheckpoint = (u64, u64);
 
     fn backend(&mut self) -> &mut Self::Backend {
         &mut self.backend
@@ -8739,19 +8738,6 @@ impl crate::signal_delivery::SignalMachine<Aarch64ParkedContext> for ArmWaitSign
         } else {
             false
         }
-    }
-
-    fn restart_checkpoint(&self, frame: &carrick_el1_abi::TrapFrame) -> Self::RestartCheckpoint {
-        (frame.x[0], frame.elr)
-    }
-
-    fn restore_restart_checkpoint(
-        &self,
-        frame: &mut carrick_el1_abi::TrapFrame,
-        (x0, elr): Self::RestartCheckpoint,
-    ) {
-        frame.x[0] = x0;
-        frame.elr = elr;
     }
 
     fn restart_forwarded(&self, frame: &mut carrick_el1_abi::TrapFrame) -> Option<bool> {
@@ -12727,12 +12713,12 @@ fn signal_frame_nonresident_stack(refuse_push: bool) {
     if refuse_push {
         crate::file::SIMULATE_COPYOUT_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
     }
-    assert_eq!(
-        final_checkpoint.unwrap(),
-        None,
-        "the final user-return checkpoint owns signal-frame failure"
-    );
     if refuse_push {
+        assert_eq!(
+            final_checkpoint.unwrap(),
+            Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended),
+            "main forces terminal SIGSEGV when signal-frame publication fails"
+        );
         assert_eq!(
             deliver_frame.elr, 0x40_0500,
             "main does not enter the original handler after a signal-frame copy refusal"
@@ -12741,6 +12727,7 @@ fn signal_frame_nonresident_stack(refuse_push: bool) {
         super::arm_signal::set_test_arm_signal_stack(0);
         return;
     }
+    assert_eq!(final_checkpoint.unwrap(), None);
     assert_eq!(deliver_frame.elr, 0x40_0100, "entered SIGUSR1 handler");
     assert_eq!(deliver_frame.x[0], 10, "x0 = signum");
     assert_eq!(deliver_frame.x[30], 0x40_0200, "x30 = sa_restorer");
