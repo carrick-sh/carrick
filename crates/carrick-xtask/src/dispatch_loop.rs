@@ -4510,6 +4510,7 @@ mod tests {
                 body: "fixture".into(),
                 branch: "work/dispatch-799-42".into(),
                 resume: true,
+                superseded_prs: Vec::new(),
                 selected_tip: None,
                 worker: Worker {
                     backend: "agy".into(),
