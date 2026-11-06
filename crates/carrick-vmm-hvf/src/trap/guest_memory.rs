@@ -277,7 +277,7 @@ impl HvfVmState {
         let _legacy = authority.legacy().ok_or_else(|| {
             MemoryError::HostMap("admitted owner MM requires owner-selected user transfer".into())
         })?;
-        self.read_guest_bytes_into_selected(address, dst)
+        self.read_guest_bytes_into_selected(address, dst, false)
     }
 
     pub(crate) fn read_guest_bytes_excluded(
@@ -295,7 +295,7 @@ impl HvfVmState {
                 ));
             }
             let mut bytes = vec![0_u8; length];
-            self.read_guest_bytes_into_selected(address, &mut bytes)?;
+            self.read_guest_bytes_into_selected(address, &mut bytes, true)?;
             Ok(bytes)
         })
     }
@@ -304,6 +304,7 @@ impl HvfVmState {
         &self,
         address: u64,
         dst: &mut [u8],
+        absent_is_zero: bool,
     ) -> Result<(), MemoryError> {
         let length = dst.len();
         // PROT_NONE gated once in the default `GuestMemory::read_bytes`/`read_into`.
@@ -385,6 +386,23 @@ impl HvfVmState {
                                 .iter()
                                 .any(|mapping| Self::region_owns_ipa(mapping, ipa))
                         });
+                        if absent_is_zero
+                            && stage1.is_none()
+                            && !semantic_mapping
+                            && !stage1_mapping
+                        {
+                            // Core capture has already admitted this range
+                            // from the authoritative Linux VMA snapshot. With
+                            // no stage-1 output, semantic mapping, deferred
+                            // backing, or global owner, the page has never
+                            // acquired storage and therefore reads as its
+                            // pristine zero fill. Ordinary guest copies remain
+                            // fail-closed because they do not carry that VMA
+                            // admission.
+                            dst[copied..copied + chunk_len].fill(0);
+                            copied += chunk_len;
+                            continue;
+                        }
                         let owner_count = self.custody().global_frame_host_owners.lock().len();
                         return Err(MemoryError::HostMap(format!(
                             "live core read has no current backing: va=0x{chunk_address:x} len={chunk_len} hot_lookup=0x{translated_lookup:x} stage1={stage1:x?} mappings={} semantic_mapping={semantic_mapping} stage1_mapping={stage1_mapping} global_owners={owner_count} persistent={}",
