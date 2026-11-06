@@ -12039,6 +12039,11 @@ fn arm_clone_preparation_fault_retires_completed_undo() {
 }
 
 #[test]
+fn arm_clone_rollback_refusal_matches_main_decline() {
+    clone_nonresident_tid_destination(false, CloneRefusal::RollbackRefusal);
+}
+
+#[test]
 fn arm_clone_aliased_parent_and_child_tid_publishes_once() {
     clone_nonresident_tid_destination(false, CloneRefusal::Aliased);
     clone_nonresident_tid_destination(true, CloneRefusal::Aliased);
@@ -12049,14 +12054,16 @@ enum CloneRefusal {
     Child,
     Parent,
     ParentPreparationFault,
+    RollbackRefusal,
     Aliased,
 }
 
 #[cfg(test)]
 fn clone_nonresident_tid_destination(is_clone3: bool, refusal: CloneRefusal) {
     let aliased = matches!(refusal, CloneRefusal::Aliased);
-    let refuse_parent = !matches!(refusal, CloneRefusal::Child);
+    let refuse_parent = !matches!(refusal, CloneRefusal::Child | CloneRefusal::RollbackRefusal);
     let preparation_fault = matches!(refusal, CloneRefusal::ParentPreparationFault);
+    let rollback_refusal = matches!(refusal, CloneRefusal::RollbackRefusal);
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let (_peer_control, _peer_record) = imported_thread(fixture);
     let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
@@ -12185,11 +12192,16 @@ fn clone_nonresident_tid_destination(is_clone3: bool, refusal: CloneRefusal) {
             child_tid_va
         }))
     });
+    if rollback_refusal {
+        crate::lifecycle::COPYOUT_REFUSE_RESTORE_AT
+            .with(|address| address.set(Some(parent_tid_va)));
+    }
     if preparation_fault {
         crate::lifecycle::GUEST_COPY_PREPARATION_FAULT_AT
             .with(|address| address.set(Some(parent_tid_va)));
     }
     let first = arm_call(fixture, fixture.control, &mut service, &mut frame);
+    crate::lifecycle::COPYOUT_REFUSE_RESTORE_AT.with(|address| address.set(None));
     assert_eq!(
         tid_words.get::<[u32; 2]>(0),
         [0x1111_1111, 0x2222_2222],
