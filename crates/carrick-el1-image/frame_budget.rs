@@ -244,9 +244,24 @@ impl Frames {
             + root;
         // A failed caught signal can force SIGSEGV once; a failed SIGSEGV
         // delivery terminates, so two delivery frames is the maximum nesting.
-        let delivery = self.required("::arm_signal::deliver_on_user_return::")?
-            + 2 * self.required("::signal_delivery::deliver_signal_on_syscall_return::")?
+        let shared_delivery = 2 * self
+            .required("::signal_delivery::deliver_signal_on_syscall_return::")?
             + self.maximum("::signal_delivery::force_delivery_fault::");
+        let delivery = self.required("::arm_signal::deliver_on_user_return::")? + shared_delivery;
+        // Host-owned records must publish their signal frame before host
+        // handback. Their scheduler/owner resume frames remain live here.
+        let resumed_signal = resume
+            + self.maximum("::arm_signal::checkpoint_saved_user_return::")
+            + self.maximum("::arm_signal::deliver_on_user_return_with::")
+            + shared_delivery;
+        // A service cancelled in ring returns after dispatch_entry has
+        // unwound, but retains the service-exit adapter across delivery.
+        let service_signal = entry
+            + self.required("::dispatch::arm_native_service_exit::")?
+            + self.maximum("::dispatch::native_service_user_return::")
+            + self.required("::dispatch::arm_signal_user_return::")?
+            + self.required("::aarch64_process::with_process_entry::")?
+            + delivery;
         let _copyout = self.required("::finish_copyout::")?;
         let service = (entry
             + self.required("::dispatch::arm_native_service_exit::")?
@@ -254,9 +269,13 @@ impl Frames {
             + self.maximum("::begin_service::")
             + self.required("::begin_service_inner::")?)
         .max(resume + self.maximum("::resume_service::"))
-            + self
-                .required("::park_service::")?
-                .max(self.required("::park_owner_wait::")? + self.maximum("::finish_owner_wait::"))
+        .max(
+            resume
+                + self.maximum("::begin_service::")
+                + self.required("::begin_service_inner::")?,
+        ) + self
+            .required("::park_service::")?
+            .max(self.required("::park_owner_wait::")? + self.maximum("::finish_owner_wait::"))
             + self
                 .maximum("::finish_service::")
                 .max(self.maximum("::take_preparation_operation::"))
@@ -567,11 +586,29 @@ impl Frames {
                     )
                     + write,
             ),
-            // Resume checkpoints service pending exit directly. Delivery runs
-            // after scheduler return, with that resume entry already dropped.
+            (
+                "native service signal delivery",
+                service_signal
+                    + self.required("::setup_arm_signal_frame::")?
+                    + self.maximum(
+                        "::signal_delivery::deliver_signal_on_syscall_return::_$u7b$$u7b$closure",
+                    )
+                    + write,
+            ),
+            (
+                "resumed signal delivery copy",
+                resumed_signal
+                    + self.required("::setup_arm_signal_frame::")?
+                    + self.maximum(
+                        "::signal_delivery::deliver_signal_on_syscall_return::_$u7b$$u7b$closure",
+                    )
+                    + write,
+            ),
+            // Both ordinary returns and host-owned resume checkpoints can
+            // select terminal delivery while their respective owners are live.
             (
                 "signal terminal exit",
-                (native + delivery).max(resume)
+                (native + delivery).max(service_signal).max(resumed_signal)
                     + self.sum(&[
                         "::exit_with_signal::",
                         "::exit_with_status::",
@@ -828,6 +865,28 @@ mod tests {
         let error = frames.check(16384, 288).unwrap_err();
         assert!(error.contains("ring completed copyout"));
         assert!(error.contains("ring pipe copyout"));
+    }
+
+    #[test]
+    fn native_service_return_charges_its_signal_checkpoint() {
+        let mut frames = small_frames();
+        frames.0.insert(
+            "x::dispatch::native_service_user_return::h0".to_owned(),
+            11000,
+        );
+        let error = frames.check(16384, 288).unwrap_err();
+        assert!(error.contains("native service signal delivery"));
+    }
+
+    #[test]
+    fn host_owned_resume_charges_its_saved_signal_checkpoint() {
+        let mut frames = small_frames();
+        frames.0.insert(
+            "x::arm_signal::checkpoint_saved_user_return::h0".to_owned(),
+            11000,
+        );
+        let error = frames.check(16384, 288).unwrap_err();
+        assert!(error.contains("resumed signal delivery copy"));
     }
 
     #[test]

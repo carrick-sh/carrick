@@ -13,6 +13,31 @@ std::thread_local! {
     };
 }
 
+type ServicePublishedHook = Option<(usize, Box<dyn FnOnce()>)>;
+
+std::thread_local! {
+    static SERVICE_PUBLISHED_HOOK: std::cell::RefCell<ServicePublishedHook> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn set_service_published_hook(runtime: usize, hook: Box<dyn FnOnce()>) {
+    SERVICE_PUBLISHED_HOOK
+        .with(|slot| assert!(slot.borrow_mut().replace((runtime, hook)).is_none()));
+}
+
+pub(super) fn run_service_published_hook(runtime: usize) {
+    let hook = SERVICE_PUBLISHED_HOOK.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_some_and(|(owner, _)| *owner == runtime) {
+            slot.take().map(|(_, hook)| hook)
+        } else {
+            None
+        }
+    });
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 pub fn take_signal_copies() -> Vec<(UserVa, Vec<u8>)> {
     SIGNAL_COPIES.with(|copies| core::mem::take(&mut *copies.borrow_mut()))
 }
