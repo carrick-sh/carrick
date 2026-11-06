@@ -258,7 +258,12 @@ fn split_at_last_paren(s: &str) -> (&str, &str) {
 pub fn preferred_scratch_root() -> &'static ScratchRoot {
     // One process configuration authority owns both immutable decisions.
     static CACHE: std::sync::OnceLock<ScratchRoot> = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| resolve_scratch_root(&Path::new("/Volumes").join(DEFAULT_VOLUME_NAME)))
+    CACHE.get_or_init(|| {
+        resolve_scratch_root(
+            &Path::new("/Volumes").join(DEFAULT_VOLUME_NAME),
+            probe_scratch_root,
+        )
+    })
 }
 
 /// The selected scratch path and its case-sensitivity decision, checked once.
@@ -285,33 +290,40 @@ impl ScratchRoot {
     }
 }
 
-fn checked_scratch_root(path: PathBuf) -> ScratchRoot {
-    let case_sensitive = std::fs::create_dir_all(&path).is_ok() && probe_case_sensitive(&path);
+fn checked_scratch_root(
+    path: PathBuf,
+    create: bool,
+    probe: impl FnOnce(&Path, bool) -> bool + Send + 'static,
+) -> ScratchRoot {
+    let candidate = path.clone();
+    let case_sensitive = bounded_probe(std::time::Duration::from_secs(2), move || {
+        probe(&candidate, create)
+    });
     ScratchRoot {
         path,
         case_sensitive,
     }
 }
 
-fn resolve_scratch_root(conventional: &Path) -> ScratchRoot {
+fn probe_scratch_root(path: &Path, create: bool) -> bool {
+    (!create || std::fs::create_dir_all(path).is_ok()) && probe_case_sensitive_unbounded(path)
+}
+
+fn resolve_scratch_root(
+    conventional: &Path,
+    probe: impl Fn(&Path, bool) -> bool + Clone + Send + 'static,
+) -> ScratchRoot {
     if let Some(home) = std::env::var_os("CARRICK_HOME").filter(|s| !s.is_empty()) {
-        return checked_scratch_root(PathBuf::from(home).join("scratch"));
+        return checked_scratch_root(PathBuf::from(home).join("scratch"), true, probe);
     }
-    // Fast path: the conventional mount point of the carrick volume. Verify
-    // it's actually case-sensitive (a Linux ABI requirement) so a coincidental
-    // dir at that path on a case-insensitive boot volume can't be mistaken for
-    // our volume.
-    if probe_case_sensitive(conventional) {
-        return ScratchRoot {
-            path: conventional.to_owned(),
-            case_sensitive: true,
-        };
+    let conventional = checked_scratch_root(conventional.to_owned(), false, probe.clone());
+    if conventional.case_sensitive {
+        return conventional;
     }
-    // No explicit home and no usable conventional mount: use the user's home.
     let home = std::env::var_os("HOME")
         .map(|h| PathBuf::from(h).join(".carrick"))
         .unwrap_or_else(|| PathBuf::from("/tmp/carrick"));
-    checked_scratch_root(home.join("scratch"))
+    checked_scratch_root(home.join("scratch"), true, probe)
 }
 
 /// The default writable-layer backend when the user passes no `--fs`.
@@ -339,8 +351,35 @@ pub fn default_writable_backend_kind() -> carrick_spec::FsBackendKind {
 /// Probe with exclusive nonblocking creation. Existing files (including FIFOs,
 /// devices and symlinks) are unusable and must never be opened or removed.
 /// O_NONBLOCK prevents FIFO rendezvous; it does not bound filesystem device I/O.
-/// Gate hosts must select an internal root with CARRICK_HOME to avoid USB stalls.
+/// The caller waits at most two seconds, including directory creation and cleanup.
+/// A stalled filesystem worker is detached; the process-wide ScratchRoot cache
+/// prevents repeated workers on subsequent backend construction. Gate hosts still
+/// select an internal root with CARRICK_HOME to avoid touching cold storage.
+fn bounded_probe(
+    timeout: std::time::Duration,
+    probe: impl FnOnce() -> bool + Send + 'static,
+) -> bool {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let Ok(_worker) = std::thread::Builder::new()
+        .name("scratch-case-probe".into())
+        .spawn(move || {
+            let _ = sender.send(probe());
+        })
+    else {
+        return false;
+    };
+    receiver.recv_timeout(timeout).unwrap_or(false)
+}
+
+#[cfg(test)]
 fn probe_case_sensitive(path: &Path) -> bool {
+    let path = path.to_owned();
+    bounded_probe(std::time::Duration::from_secs(2), move || {
+        probe_case_sensitive_unbounded(&path)
+    })
+}
+
+fn probe_case_sensitive_unbounded(path: &Path) -> bool {
     // A private namespace prevents simultaneous startups from treating each
     // other's live sentinel as an unusable filesystem.
     let Ok(directory) = tempfile::Builder::new()
@@ -394,6 +433,38 @@ mod serial_host {
     use super::*;
 
     #[test]
+    fn stalled_probe_returns_failure_before_worker_finishes() {
+        let root = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("CARRICK_HOME");
+        // SAFETY: this module runs in the serial_host partition.
+        unsafe { std::env::set_var("CARRICK_HOME", root.path()) };
+        let (release, stalled) = std::sync::mpsc::sync_channel(1);
+        let stalled = std::sync::Arc::new(std::sync::Mutex::new(stalled));
+        let (finished, completion) = std::sync::mpsc::sync_channel(1);
+        let actual = resolve_scratch_root(root.path(), move |_, _| {
+            // Stall the I/O operation behind the production resolver's deadline.
+            let _ = stalled
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(5));
+            let _ = finished.send(());
+            true
+        });
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("CARRICK_HOME", value),
+                None => std::env::remove_var("CARRICK_HOME"),
+            }
+        }
+        let _ = release.send(());
+        completion
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(actual.path(), root.path().join("scratch"));
+        assert!(actual.host_path().is_err(), "stalled root must fail closed");
+    }
+
+    #[test]
     fn serial_host_scratch_root_override_wins() {
         let root = tempfile::tempdir().unwrap();
         let chosen = root.path().join("internal-scratch");
@@ -402,13 +473,27 @@ mod serial_host {
         unsafe { std::env::set_var("CARRICK_HOME", &chosen) };
         // The supplied conventional root is available. Even an otherwise
         // usable conventional mount must lose to the explicit override.
-        let actual = resolve_scratch_root(root.path());
+        let conventional = root.path().to_owned();
+        let accesses = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = accesses.clone();
+        let actual = resolve_scratch_root(root.path(), move |path, create| {
+            if path == conventional {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            (!create || std::fs::create_dir_all(path).is_ok())
+                && probe_case_sensitive_unbounded(path)
+        });
         unsafe {
             match previous {
                 Some(value) => std::env::set_var("CARRICK_HOME", value),
                 None => std::env::remove_var("CARRICK_HOME"),
             }
         }
+        assert_eq!(
+            accesses.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "override must bypass conventional I/O"
+        );
         assert_eq!(actual.path(), chosen.join("scratch"));
         assert!(
             chosen.join("scratch").is_dir(),
@@ -441,7 +526,7 @@ mod serial_host {
         let previous = std::env::var_os("CARRICK_HOME");
         // SAFETY: environment changes run only in the serial_host partition.
         unsafe { std::env::set_var("CARRICK_HOME", root.path()) };
-        let actual = resolve_scratch_root(root.path());
+        let actual = resolve_scratch_root(root.path(), probe_scratch_root);
         unsafe {
             match previous {
                 Some(value) => std::env::set_var("CARRICK_HOME", value),
