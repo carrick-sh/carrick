@@ -8717,6 +8717,7 @@ struct ArmWaitSignalMachine {
 #[cfg(test)]
 impl crate::signal_delivery::SignalMachine<Aarch64ParkedContext> for ArmWaitSignalMachine {
     type Backend = ArmWaitSignalBackend;
+    type RestartCheckpoint = (u64, u64);
 
     fn backend(&mut self) -> &mut Self::Backend {
         &mut self.backend
@@ -8738,6 +8739,19 @@ impl crate::signal_delivery::SignalMachine<Aarch64ParkedContext> for ArmWaitSign
         } else {
             false
         }
+    }
+
+    fn restart_checkpoint(&self, frame: &carrick_el1_abi::TrapFrame) -> Self::RestartCheckpoint {
+        (frame.x[0], frame.elr)
+    }
+
+    fn restore_restart_checkpoint(
+        &self,
+        frame: &mut carrick_el1_abi::TrapFrame,
+        (x0, elr): Self::RestartCheckpoint,
+    ) {
+        frame.x[0] = x0;
+        frame.elr = elr;
     }
 
     fn restart_forwarded(&self, frame: &mut carrick_el1_abi::TrapFrame) -> Option<bool> {

@@ -5519,6 +5519,40 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             None
         }
     }
+
+    pub fn restore_interrupted_child_wait(&mut self, words: Box<C>) {
+        let Ok(thread) = NativeThreadIdentity::from_binding(self.binding) else {
+            return;
+        };
+        let mut graph = self.runtime.graph.lock();
+        let Ok(row) = graph.owner.task_mut(self.key) else {
+            return;
+        };
+        let resources = row.native_mut().resources_mut();
+        if resources.interrupted_child_waits.contains_key(&self.record) {
+            return;
+        }
+        NATIVE_SIGNAL_CONTINUATIONS.fetch_add(1, Ordering::Release);
+        resources.interrupted_child_waits.insert(
+            self.record,
+            InterruptedChildWait {
+                thread,
+                words: Some(words),
+            },
+        );
+    }
+
+    pub fn restore_suspend_mask(&mut self, mask: carrick_signal_core::policy::SigBlockMask) {
+        if self
+            .runtime
+            .graph
+            .lock()
+            .insert_suspend_mask(self.record, mask)
+            .is_none()
+        {
+            NATIVE_SIGNAL_CONTINUATIONS.fetch_add(1, Ordering::Release);
+        }
+    }
     fn publish_channel(&mut self, channel: &Arc<WaitChannel>) -> Result<(), NativeProcessError> {
         publish_signal_channel(
             self.source.zone,

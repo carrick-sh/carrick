@@ -33,6 +33,7 @@ impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedCont
     for ArmSignalMachine
 {
     type Backend = LinuxAarch64Backend;
+    type RestartCheckpoint = (u64, u64);
 
     fn backend(&mut self) -> &mut Self::Backend {
         &mut self.backend
@@ -54,6 +55,19 @@ impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedCont
         } else {
             false
         }
+    }
+
+    fn restart_checkpoint(&self, frame: &TrapFrame) -> Self::RestartCheckpoint {
+        (frame.x[0], frame.elr)
+    }
+
+    fn restore_restart_checkpoint(
+        &self,
+        frame: &mut TrapFrame,
+        (x0, elr): Self::RestartCheckpoint,
+    ) {
+        frame.x[0] = x0;
+        frame.elr = elr;
     }
 
     fn restart_forwarded(&self, frame: &mut TrapFrame) -> Option<bool> {

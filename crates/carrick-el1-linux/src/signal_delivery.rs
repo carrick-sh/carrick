@@ -10,6 +10,7 @@ use carrick_signal_core::policy::{self, SigBlockMask, Signal};
 /// Machine-specific register operations surrounding the shared selection.
 pub trait SignalMachine<C> {
     type Backend: SignalBackend;
+    type RestartCheckpoint: Copy;
     fn backend(&mut self) -> &mut Self::Backend;
     fn user_sp(
         &self,
@@ -20,6 +21,15 @@ pub trait SignalMachine<C> {
         frame: &mut <Self::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
         original: &C,
     ) -> bool;
+    fn restart_checkpoint(
+        &self,
+        frame: &<Self::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
+    ) -> Self::RestartCheckpoint;
+    fn restore_restart_checkpoint(
+        &self,
+        frame: &mut <Self::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
+        checkpoint: Self::RestartCheckpoint,
+    );
     fn restart_forwarded(
         &self,
         _frame: &mut <Self::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
@@ -58,7 +68,8 @@ where
 
     let mut thread_blocked =
         SigBlockMask::blocking_all_of(carrick_signal_core::SignalSet::from_bits(slot.blocked().0));
-    let saved_mask = process.take_suspend_mask().unwrap_or(thread_blocked);
+    let suspend_mask = process.take_suspend_mask();
+    let saved_mask = suspend_mask.unwrap_or(thread_blocked);
     slot.init_blocked(BlockedMask(saved_mask.signals().bits()));
     // Every completed checkpoint consumes this exact member's interrupted wait,
     // including a handler without SA_RESTART. It cannot leak into a later SVC.
@@ -121,6 +132,7 @@ where
             }
         }
         policy::Disposition::Handler(handler) => {
+            let restart_checkpoint = machine.restart_checkpoint(frame);
             let restarted = if carrick_signal_core::wait::interrupted_wait(
                 carrick_signal_core::wait::RestartClass::IfSaRestart,
                 carrick_signal_core::wait::WaitProgress::Blocked,
@@ -226,7 +238,14 @@ where
             match setup {
                 Ok(_) => {}
                 Err(carrick_core::personality::CopyOutcome::NotYet(request)) => {
+                    machine.restore_restart_checkpoint(frame, restart_checkpoint);
                     slot.init_blocked(BlockedMask(thread_blocked.signals().bits()));
+                    if let Some(mask) = suspend_mask {
+                        process.restore_suspend_mask(mask);
+                    }
+                    if let Some(original) = interrupted_child_wait.take() {
+                        process.restore_interrupted_child_wait(original);
+                    }
                     process.requeue_deliverable(sig, info, action);
                     use carrick_personality_linux::lifecycle::LifecycleOutcome;
                     match process.wait_signal_frame_copy(request) {
