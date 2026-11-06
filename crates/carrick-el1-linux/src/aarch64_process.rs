@@ -2789,7 +2789,13 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             .ipc_binding()
             .ok_or(NativeProcessError::Stale)?;
         crate::ipc::retire_native_operation(
-            &region, self.zone, self.slot, self.task, binding, operation,
+            &region,
+            self.zone,
+            self.slot,
+            self.task,
+            binding,
+            operation,
+            &|owned| crate::sched::object_wait::deliver_completion(self.zone, self.slot, owned),
         )
     }
     fn copy_syscall_output(

@@ -86,13 +86,11 @@ pub trait IpcExecution {
     fn deliver_completion(
         &self,
         owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, Self::Context>,
-    ) {
-        crate::sched::object_wait::deliver_completion(self.zone(), self.slot(), owned);
-    }
+    );
 
     fn observe_object(&self, key: ObjectWaitKey) -> Result<ObjectWaitSnapshot, ObjectWaitError> {
         carrick_core::wait::observe_object(self.zone(), self.slot(), key, &|owned| {
-            crate::sched::object_wait::deliver_completion(self.zone(), self.slot(), owned)
+            self.deliver_completion(owned)
         })
     }
     fn notify_object(
@@ -135,6 +133,12 @@ impl<C: ThreadCpu, U: UserWord> IpcExecution for Sched<'_, C, U> {
     }
     fn finish_object_wake(&mut self, effects: WakeEffects) {
         self.finish_object_wake(effects);
+    }
+    fn deliver_completion(
+        &self,
+        owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, Self::Context>,
+    ) {
+        crate::sched::object_wait::deliver_completion(self.zone, self.slot, owned);
     }
     fn park_owner(
         &mut self,
