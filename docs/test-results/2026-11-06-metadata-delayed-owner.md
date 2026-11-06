@@ -267,3 +267,48 @@ of each native-process fixture crossing against live execution/MM/root
 generations; fixing that gap alone would not make the fixture call the
 runtime's host-park producer. No helper-only zero-alias test is claimed as
 reproduction, and no speculative runtime fix is included here.
+
+## Admitted-main continuation: stage-2 refusal has no lock waiter
+
+The continuation rebased all 14 preceding commits onto admitted main
+`49ab5c89cceaf23fc7af00e4dbb137308ef691d0` without conflicts. No preceding
+implementation or witness was dropped.
+
+The stage-2 publication boundary can be classified more precisely.
+`CarrierVmCustody::publish_stage2_record_using` takes the custody mutex with
+`lock()`, registers the record, and invokes the backend map while retaining
+that lock. Its admission does not return a mutex-contention result.
+`register_stage2_record_locked` can refuse an invalid extent, a mismatched
+or absent live VM generation, or exhaustion of the monotone record ID.
+Backend failure removes the newly registered record before returning its
+error. Both admission errors and the backend status are converted into
+`TrapError::Hypervisor` text, then `publish_backing_using` converts that
+error into `MetadataResolutionError::Busy`. Finally,
+`install_backing_using` unreserves its aperture slots and converts even its
+publisher's typed error into `Busy` again.
+
+There is therefore no custody-mutex holder whose unlock can resume this
+reported publication refusal. A future continuation cannot use that mutex
+as its release dependency. The aperture-capacity case is separate: it needs
+an actual mapping retirement or dynamic extent return. Token or record-ID
+exhaustion has no releasing producer. Preserving the publisher's typed
+reason is necessary before deciding whether a refusal can wait; merely
+changing the final `Busy` arm into a sleep would conceal these distinctions.
+This is source classification, not evidence that any of these errors
+occurred in the signed failing run.
+
+The fixture also explains the granularity of the refusal counts without
+attributing their cause. `metadata_allocator_concurrent` performs 16 rounds;
+the coordinator executes 64 uname calls between its two barrier waits in
+each round. Thus 64 or 128 failed calls are consistent with one or two
+whole coordinator intervals lacking authority. They do not distinguish a
+host-park identity from an in-ring park that copied an already cleared
+`CurrentTask`: `carrick_el1::sched::identity_of` copies both lifecycle words
+from that task into the new record. Seeing the same zero pair in the record
+and task is consequently insufficient to select the producer.
+
+No structural lifecycle repair is claimed by this continuation. The missing
+production witness and retained publication operation remain implementation
+work, not an external blocker. Signed HVF attribution, the paired population
+and two consecutive main signed passes additionally require a Mac lane;
+this Linux x86_64 runner cannot supply those acceptance results.
