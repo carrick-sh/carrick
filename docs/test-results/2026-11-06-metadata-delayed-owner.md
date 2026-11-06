@@ -1,0 +1,38 @@
+# Signed delayed metadata owner population (#1572)
+
+Current-main baseline: `0d5dfaa508e5b92edbe2b18404cd2c7d4230f719`.
+On carrick-m4, one signed release executable ran the exact
+`el1_metadata_allocator_delayed_owner_parks_participants` test 20 times.
+There were **15 passes and five failures**, with no deadline failures.
+
+| Runs | Count | Result |
+| --- | ---: | --- |
+| 1, 4–7, 10–13, 15–20 | 15 | Pass |
+| 2 | 1 | Exit 1, `host_failures=960`, allocator `failures=0` |
+| 8, 9 | 2 | Exit 1, `host_failures=64`, allocator `failures=0` |
+| 14 | 1 | Exit 1, `host_failures=128`, allocator `failures=0` |
+| 3 | 1 | Abort, `entry_binding`, `reason=EntryBinding`, `record=none` |
+
+Every run started exactly one test. Nineteen completed libtest; the abort
+did not. Every run's scoped cleanup reported zero remaining processes, and
+the executable SHA-256 remained unchanged throughout the population.
+No failure reached the final grant/return assertions in this sample.
+
+Fixtures were verified and restored under the exclusive restore lease from
+`/tmp/fx-3478.tar.gz`, built at `3478f3b9bf3ad5705c985b7ec6c6480095b394fe`.
+The checkout input identity matched
+`1e769b2a8667733a568d456e233f99ea3369f46da83f8a036d78a86a6ffe16b1`.
+Build and signed execution used the shared `just lease carrick` lease.
+The standard signed runner first passed the exact test and entitlement
+negative control. A one-run known-answer check then established that the
+population capture executed the real test and recorded its terminal result.
+Each population run used `CARRICK_RUN_ID=fix1572-base-N` and scoped cleanup
+through `scripts/sudo/kill.sh`. The test's existing 20-second observation
+and 30-second workload bounds were unchanged; a 90-second outer alarm was
+failure-only containment and did not fire.
+
+Durable host evidence is in
+`/Users/administrator/m4-host/evidence/1572/`: the fixture restore log,
+standard signed artifact receipt, build log, population runner, and `base/`
+with full per-run output, cleanup logs, artifact identities and population
+rows. This is baseline evidence, not a fix or signed acceptance claim.
