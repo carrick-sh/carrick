@@ -12,7 +12,7 @@ use carrick_abi::{
     LINUX_FUTEX_CMP_REQUEUE, LINUX_FUTEX_LOCK_PI, LINUX_FUTEX_PRIVATE_FLAG, LINUX_FUTEX_REQUEUE,
     LINUX_FUTEX_TID_MASK, LINUX_FUTEX_TRYLOCK_PI, LINUX_FUTEX_UNLOCK_PI, LINUX_FUTEX_WAIT,
     LINUX_FUTEX_WAIT_BITSET, LINUX_FUTEX_WAITV_MAX, LINUX_FUTEX_WAKE, LINUX_FUTEX_WAKE_BITSET,
-    LinuxFutexFlags,
+    LinuxFutexFlags, LinuxTimespec,
 };
 use carrick_core::personality::{
     Access, CopyOutcome, GuestCopyRequest, GuestLen, UserCopy, UserVa,
@@ -21,7 +21,7 @@ use carrick_guest_mem::CurrentMmMemory;
 
 use super::outcome::{DispatchOutcome, SharedFutexTarget};
 use super::request::SyscallRequest;
-use super::{duration_from_linux_timespec, linux_timeout_timespec_is_valid, read_timespec};
+use super::{duration_from_linux_timespec, linux_timeout_timespec_is_valid};
 use crate::compat::CompatReporter;
 
 /// Convert an ABSOLUTE futex deadline (FUTEX_WAIT_BITSET) to the remaining
@@ -222,7 +222,7 @@ pub(crate) fn dispatch_threaded_futex(
     }
     if timeout_address != 0
         && matches!(raw_command, LINUX_FUTEX_WAIT | LINUX_FUTEX_WAIT_BITSET)
-        && let Ok(timespec) = read_timespec(memory, timeout_address)
+        && let Ok(timespec) = read_futex_timespec(memory, timeout_address)
         && !linux_timeout_timespec_is_valid(timespec)
     {
         return DispatchOutcome::Errno {
@@ -435,9 +435,9 @@ pub(crate) fn dispatch_threaded_futex(
             let timeout = if timeout_address == 0 {
                 None
             } else {
-                let timespec = match read_timespec(memory, timeout_address) {
+                let timespec = match read_futex_timespec(memory, timeout_address) {
                     Ok(t) => t,
-                    Err(errno) => return DispatchOutcome::Errno { errno },
+                    Err(outcome) => return outcome,
                 };
                 // FUTEX_WAIT uses a RELATIVE timeout; FUTEX_WAIT_BITSET uses an
                 // ABSOLUTE deadline (CLOCK_MONOTONIC, or CLOCK_REALTIME if
@@ -617,9 +617,9 @@ pub(crate) fn dispatch_zone_futex(
             let timeout = if timeout_address == 0 {
                 None
             } else {
-                let timespec = match read_timespec(memory, timeout_address) {
+                let timespec = match read_futex_timespec(memory, timeout_address) {
                     Ok(t) => t,
-                    Err(errno) => return DispatchOutcome::Errno { errno },
+                    Err(outcome) => return outcome,
                 };
                 if raw_command == LINUX_FUTEX_WAIT_BITSET {
                     Some(relative_from_absolute_timespec(
@@ -719,9 +719,9 @@ pub(crate) fn dispatch_futex_waitv_args(
     let timeout = if timeout_address == 0 {
         None
     } else {
-        let timespec = match read_timespec(memory, timeout_address) {
+        let timespec = match read_futex_timespec(memory, timeout_address) {
             Ok(timespec) => timespec,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(outcome) => return outcome,
         };
         Some(relative_from_absolute_timespec(
             clock,
@@ -908,6 +908,29 @@ pub(crate) fn read_futex_word(
     }
 }
 
+fn read_futex_timespec(
+    memory: &mut impl CurrentMmMemory,
+    address: u64,
+) -> Result<LinuxTimespec, DispatchOutcome> {
+    let mut copy = HostFutexCopy::new(memory);
+    let mut bytes = [0u8; core::mem::size_of::<LinuxTimespec>()];
+    match copy.copy_in(&mut bytes, UserVa::new(address)) {
+        CopyOutcome::Done => Ok(LinuxTimespec {
+            tv_sec: i64::from_ne_bytes(bytes[..8].try_into().unwrap()),
+            tv_nsec: i64::from_ne_bytes(bytes[8..].try_into().unwrap()),
+        }),
+        CopyOutcome::NotYet(_) => Err(copy
+            .take_refusal()
+            .and_then(DispatchOutcome::from_owner_memory_error)
+            .unwrap_or(DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            })),
+        CopyOutcome::Fault => Err(DispatchOutcome::Errno {
+            errno: LINUX_EFAULT,
+        }),
+    }
+}
+
 struct HostFutexCopy<'a, M: CurrentMmMemory> {
     memory: &'a mut M,
     refusal: Option<carrick_guest_mem::MemoryError>,
@@ -928,7 +951,10 @@ impl<'a, M: CurrentMmMemory> HostFutexCopy<'a, M> {
 
 impl<M: CurrentMmMemory> UserCopy for HostFutexCopy<'_, M> {
     fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> CopyOutcome {
-        CopyOutcome::from_completed(self.memory.read_into(src.raw(), dst).is_ok())
+        match self.memory.read_into(src.raw(), dst) {
+            Ok(()) => CopyOutcome::Done,
+            Err(error) => self.refusal_outcome(error, src, dst.len(), Access::Read),
+        }
     }
 
     fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> CopyOutcome {
@@ -997,6 +1023,34 @@ impl<M: CurrentMmMemory> UserCopy for HostFutexCopy<'_, M> {
                     CopyOutcome::Fault
                 }
             }
+        }
+    }
+}
+
+impl<M: CurrentMmMemory> HostFutexCopy<'_, M> {
+    fn refusal_outcome(
+        &mut self,
+        error: carrick_guest_mem::MemoryError,
+        address: UserVa,
+        len: usize,
+        access: Access,
+    ) -> CopyOutcome {
+        let retryable = matches!(
+            &error,
+            carrick_guest_mem::MemoryError::ReadSuspended(_)
+                | carrick_guest_mem::MemoryError::OwnerWait(_)
+                | carrick_guest_mem::MemoryError::Physical(_)
+                | carrick_guest_mem::MemoryError::Supply(_)
+        );
+        self.refusal = Some(error);
+        if retryable {
+            CopyOutcome::NotYet(GuestCopyRequest {
+                address,
+                len: GuestLen::new(len as u64),
+                access,
+            })
+        } else {
+            CopyOutcome::Fault
         }
     }
 }
