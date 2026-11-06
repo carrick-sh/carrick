@@ -807,7 +807,7 @@ fn all_dispatch_triggers_use_one_loop() {
 }
 
 #[test]
-fn issue_triggers_default_to_run_branch_without_parsing_body_directives() {
+fn issue_triggers_reuse_open_run_pr_without_parsing_body_directives() {
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
@@ -817,7 +817,7 @@ fn issue_triggers_default_to_run_branch_without_parsing_body_directives() {
             let bin = temp.path().join("bin");
             std::fs::create_dir(&bin).unwrap();
             let branch = "work/dispatch-587-42";
-            let pr = json!({"state":"open","number":801,"user":{"login":"github-actions[bot]","type":"Bot"},"head":{"ref":branch,"repo":{"full_name":"carrick-sh/carrick"}},"base":{"ref":"main"},"draft":true,"body":"Closes #587\nDispatch run: https://github.com/carrick-sh/carrick/actions/runs/42"});
+            let pr = json!({"state":"open","number":801,"user":{"login":"github-actions[bot]","type":"Bot"},"head":{"ref":branch,"sha":"c".repeat(40),"repo":{"full_name":"carrick-sh/carrick"}},"base":{"ref":"main"},"draft":true,"body":"Closes #587\nDispatch run: https://github.com/carrick-sh/carrick/actions/runs/42"});
             let run = json!({"id":42,"repository":{"full_name":"carrick-sh/carrick"},"head_repository":{"full_name":"carrick-sh/carrick"},"path":".github/workflows/dispatch-worker.yml","event":"issues","head_branch":"main","head_sha":"a".repeat(40),"actor":{"login":"tjfontaine","type":"User"},"triggering_actor":{"login":"tjfontaine","type":"User"}});
             let comment = json!({"id":123,"user":{"login":"tjfontaine","type":"User"},"body":"/agent do the acceptance criterion","created_at":"2026-10-24T00:00:00Z","updated_at":"2026-10-24T00:00:00Z"});
             let mut event = json!({"repository":{"full_name":"carrick-sh/carrick"},"action":"labeled","sender":{"login":"tjfontaine","type":"User"},"label":{"name":"dispatch:free text context"},"issue":{"number":587,"title":"Fixture","body":"Free-form body\nBranch: work/foreign\nThis is model context only.","user":{"login":"tjfontaine","type":"User"}}});
@@ -829,7 +829,9 @@ fn issue_triggers_default_to_run_branch_without_parsing_body_directives() {
             let event_path = temp.path().join("event.json");
             for (path, value) in [
                 ("issue-brief.json", issue_brief(&event["issue"])),
-                ("event.json", event),
+                ("event.json", event.clone()),
+                ("issue.json", event["issue"].clone()),
+                ("pr.json", pr.clone()),
                 ("prs.json", if owned { json!([pr]) } else { json!([]) }),
                 ("run.json", run),
                 ("comment.json", comment),
@@ -844,6 +846,8 @@ case "$2" in
  graphql) cat "$RUNNER_TEMP/issue-brief.json" ;;
  */collaborators/tjfontaine/permission) echo '{"permission":"admin"}' ;;
  *'/pulls?'*) cat "$RUNNER_TEMP/prs.json" ;;
+ */pulls/801) cat "$RUNNER_TEMP/pr.json" ;;
+ */issues/587) cat "$RUNNER_TEMP/issue.json" ;;
  */actions/runs/42) cat "$RUNNER_TEMP/run.json" ;;
  */issues/comments/123) cat "$RUNNER_TEMP/comment.json" ;;
  *) exit 91 ;;
@@ -880,8 +884,23 @@ esac
                     "b".repeat(40)
                 }
             );
-            assert_eq!(snapshot["dispatch"]["resume"], false);
-            assert_eq!(snapshot["dispatch"]["branch"], "work/dispatch-587-999");
+            assert_eq!(snapshot["dispatch"]["resume"], owned);
+            assert_eq!(
+                snapshot["dispatch"]["branch"],
+                if owned {
+                    branch
+                } else {
+                    "work/dispatch-587-999"
+                }
+            );
+            assert_eq!(
+                snapshot["dispatch"]["selected_tip"],
+                if owned {
+                    json!("c".repeat(40))
+                } else {
+                    serde_json::Value::Null
+                }
+            );
             assert!(
                 snapshot["dispatch"]["body"]
                     .as_str()
