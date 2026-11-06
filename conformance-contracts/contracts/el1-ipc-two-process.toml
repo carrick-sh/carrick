@@ -62,7 +62,7 @@ embed = [
 
 [bindings.unresolved]
 docker = "Linux semantics of pipe and eventfd blocking are fixed by man pages; the fixture checks the completed round count itself. Same-source Docker differential binding remains open."
-x86_kvm = "#1756 red-first fixture: carrick-vmm-kvm::cpl0_initial_mm::in_zone_two_process_pipe_vectors_move_bytes_exactly_once is ignored until the shared venue is wired. Native Linux runs the same native_pipe_vectors.S and returns exit 0 with pipe-vectors=once. This is not x86 acceptance: it still needs served/refusal census assertions and a production venue. Native assembly tests aggregate vector order, EAGAIN (11) after exactly one transfer and EOF after last writer close."
+x86_kvm = "#1756 red-first fixture: carrick-vmm-kvm::cpl0_initial_mm::in_zone_two_process_pipe_vectors_move_bytes_exactly_once is ignored until the shared venue is wired. Native Linux runs the same native_pipe_vectors.S and returns exit 0 with pipe-vectors=once. The fixture now asserts served/refusal census and has an independent non-venue writev refusal witness; the production venue and a passing served witness are still absent. Native assembly tests aggregate vector order, EAGAIN (11) after exactly one transfer and EOF after last writer close."
 embed_structural = "Not yet a registered WorkObservation binding: the signed test asserts served[63]/[64] >= 2*pairs*rounds, zero-fallback parks >= pairs*rounds, and forwarded read[63] < pairs*rounds outside the contract evaluator. Native scalar pipe signal/SA_RESTART execution and timed-epoll signal integration remain director-owned signed acceptance; the VM-free signal-frame witness does not execute guest handler instructions."
 
 # Integer-expressible form of "forwarded reads < rounds per pair": every scale
