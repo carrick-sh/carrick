@@ -845,37 +845,39 @@ fn clone_tid_refusal_does_not_erase_a_live_siblings_store() {
     let (published_tx, published_rx) = mpsc::sync_channel(1);
     let (observed_tx, observed_rx) = mpsc::sync_channel(1);
     let sibling_words = Arc::clone(&words);
-    let sibling = std::thread::spawn(move || {
-        published_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        let observed = core::array::from_fn(|i| sibling_words[i].load(Ordering::SeqCst));
-        sibling_words[0].store(SIBLING_VALUE, Ordering::SeqCst);
-        observed_tx.send(observed).unwrap();
+    std::thread::scope(|scope| {
+        let sibling = scope.spawn(move || {
+            published_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let observed = core::array::from_fn(|i| sibling_words[i].load(Ordering::SeqCst));
+            sibling_words[0].store(SIBLING_VALUE, Ordering::SeqCst);
+            observed_tx.send(observed).unwrap();
+        });
+        let mut copy = Copy {
+            words,
+            published: Some(published_tx),
+            observed: observed_rx,
+            observation: None,
+        };
+        let mut frame = TrapFrame {
+            slot: SLOT_IDX as u64,
+            ..TrapFrame::default()
+        };
+        frame.x[..5].copy_from_slice(&clone_args(GLIBC_FLAGS | CLONE_CHILD_SETTID, PARENT, CHILD));
+        frame.x[8] = SYS_CLONE as u64;
+        assert_eq!(serve_directly(&mut w, &mut frame, &mut copy), None);
+        sibling.join().unwrap();
+        assert_eq!(w.page().live(), 2);
+        assert_eq!(
+            w.page().state(0).unwrap(),
+            (entry.generation(), EntryState::Reserved)
+        );
+        assert_eq!(copy.words[1].load(Ordering::SeqCst), 0xbbbb);
+        assert_eq!(
+            (copy.observation, copy.words[0].load(Ordering::SeqCst)),
+            (Some([0xaaaa, 0xbbbb]), SIBLING_VALUE),
+            "a refused birth must neither expose its TID nor erase a sibling's store"
+        );
     });
-    let mut copy = Copy {
-        words,
-        published: Some(published_tx),
-        observed: observed_rx,
-        observation: None,
-    };
-    let mut frame = TrapFrame {
-        slot: SLOT_IDX as u64,
-        ..TrapFrame::default()
-    };
-    frame.x[..5].copy_from_slice(&clone_args(GLIBC_FLAGS | CLONE_CHILD_SETTID, PARENT, CHILD));
-    frame.x[8] = SYS_CLONE as u64;
-    assert_eq!(serve_directly(&mut w, &mut frame, &mut copy), None);
-    sibling.join().unwrap();
-    assert_eq!(w.page().live(), 2);
-    assert_eq!(
-        w.page().state(0).unwrap(),
-        (entry.generation(), EntryState::Reserved)
-    );
-    assert_eq!(copy.words[1].load(Ordering::SeqCst), 0xbbbb);
-    assert_eq!(
-        (copy.observation, copy.words[0].load(Ordering::SeqCst)),
-        (Some([0xaaaa, 0xbbbb]), SIBLING_VALUE),
-        "a refused birth must neither expose its TID nor erase a sibling's store"
-    );
 }
 
 // ---- rt_sigprocmask ----
