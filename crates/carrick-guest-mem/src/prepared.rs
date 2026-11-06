@@ -152,6 +152,14 @@ pub enum MemoryPrepareError {
 /// Dropping an unused capability cancels every page through the same executor.
 pub trait PreparedGuestWrite {
     fn commit(self: Box<Self>, outputs: &[&[u8]]);
+
+    fn atomic_compare_exchange_u32(
+        self: Box<Self>,
+        _expected: u32,
+        _desired: u32,
+    ) -> Result<u32, crate::MemoryError> {
+        Err(crate::MemoryError::Unsupported)
+    }
 }
 
 /// Root-shared authority. Admission drops the legacy mirror in every existing
