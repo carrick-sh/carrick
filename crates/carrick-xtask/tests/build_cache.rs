@@ -709,7 +709,9 @@ fn build_environment_never_looks_up_conventional_volumes() {
             .unwrap();
         assert!(output.status.success());
         let trace = String::from_utf8(output.stderr).unwrap();
-        assert!(!trace.contains("/Volumes/"), "{trace}");
+        // The checkout or PATH may itself live on an internal /Volumes mount.
+        // Reject filesystem predicates, rather than ordinary path strings.
+        assert!(!trace.contains("[ -d /Volumes/"), "{trace}");
     }
 }
 
