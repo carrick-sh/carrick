@@ -1,3 +1,8 @@
+# #1709: HvpatchProductionPhase::RetryThreadExit now selects terminal CPU
+# materialization in needs_terminal_cpu_save while remaining non-terminal in
+# is_terminal_transition (carrick-runtime::vcpu_loop::binding::tests::
+# retry_thread_exit_terminal_save_keeps_process_translation); directory stream
+# batching, owner-wait settlement and budgets are unchanged.
 # #1666: terminal-only CPU saves now materialize from the current MM lease.
 # The two-live-thread production exit_group binding in
 # carrick-runtime::vcpu_loop::binding::tests::
