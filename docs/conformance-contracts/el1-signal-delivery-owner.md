@@ -47,3 +47,17 @@ Unblocking a pending signal before an old-mask output wait delivers it once
 before that thread returns to EL0; it never redirects its runnable peer.
 The two-live-thread witnesses in `native_signal_resume_tests` cover input and
 output parks, peer-frame preservation and the resumed SVC checkpoint.
+
+Completed entries with owed work also checkpoint the selected signal owner.
+Successful signal publication preserves the existing work ledger; it cannot
+erase a committed result or manufacture the vector's host-work doorbell.
+CarrierWork is internal completion custody, so caught signals cannot cancel
+it through any service-wait enrollment or cross-thread cancellation path.
+Terminal cancellation remains authoritative. An in-ring service completion
+checkpoints before its first user return, including a reply acknowledged
+before park enrollment. Only an interrupted Crossing uses the ARM restart
+marker; a committed CarrierWork result of EINTR is never replayed.
+The two-live-thread `native_signal_work_return_tests` cover both mask operations,
+null and resident oldset, exact service acknowledgment before park, restart
+and no-restart frames, and preservation of genuine host work. Compiled stack
+envelopes include service-return and saved-resume delivery and terminal tails.

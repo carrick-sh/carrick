@@ -678,10 +678,15 @@ pub(super) fn final_user_return(
     action: Action,
     checkpoint: impl FnOnce(&mut TrapFrame) -> Action,
 ) -> Action {
-    if action == Action::Served
+    if matches!(action, Action::Served | Action::ServedWithWork)
         && (frame.esr == 0 || matches!((frame.esr >> 26) & 0x3f, 0x15 | 0x20 | 0x24))
     {
-        return checkpoint(frame);
+        return match checkpoint(frame) {
+            // Signal publication must not erase an already committed entry's
+            // remaining work. The capture boundary still owns that ledger.
+            Action::Served => action,
+            outcome => outcome,
+        };
     }
     action
 }
@@ -841,7 +846,9 @@ pub(super) fn native_service_operation(
             }
             carrick_el1_abi::ServedBoundary::ReplayOriginal { .. } => return None,
         }
-        state.mark_pending_host_work();
+        // This operation owns the work until its exact carrier reply. Do not
+        // manufacture the vector's independent host-work doorbell: a reply
+        // consumed in ring would otherwise leave that doorbell armed forever.
         return Some(ServiceOperation::CarrierWork { entry });
     }
     if action != Action::Forward {
@@ -1454,14 +1461,41 @@ fn arm_native_service_exit(
         .unwrap_or_else(|reason| invalid_completion(reason));
     Some(match result {
         NativeResume::Left(None) => native_service_idle(zone, slot, &mut sched::HardwareCpu),
-        NativeResume::NoPending => arm_signal_user_return(frame),
-        NativeResume::RetrySyscall => invalid_completion(NativeInvariant::EntryBinding),
+        result => native_service_user_return(frame, operation, result, arm_signal_user_return),
+    })
+}
+
+/// Publish an in-ring service completion before the final selected-owner
+/// checkpoint. A parked service has no user-return boundary here.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[inline(never)]
+pub(super) fn native_service_user_return(
+    frame: &mut TrapFrame,
+    operation: Option<carrick_core_abi::service::ServiceOperation>,
+    result: super::native_process_runtime::NativeResume,
+    checkpoint: impl FnOnce(&mut TrapFrame) -> Action,
+) -> Action {
+    use super::native_process_runtime::NativeResume;
+    match result {
+        NativeResume::NoPending => checkpoint(frame),
         NativeResume::Returned(result) => {
+            // Only an interrupted, uncommitted crossing may request restart.
+            // Reuse the authenticated ARM return marker: FAR retains original
+            // arg0 while the result word carries EINTR into shared policy.
+            if result.raw() == carrick_syscall_abi::LINUX_EINTR.guest_retval()
+                && matches!(operation,
+                    Some(carrick_core_abi::service::ServiceOperation::Crossing { ordinal })
+                    if ordinal.raw() == frame.x[8]
+                        && carrick_signal_core::is_native_restartable_syscall(ordinal.raw()))
+            {
+                frame.far = frame.x[0];
+                frame.esr = 0xfffe;
+            }
             frame.x[0] = result.raw() as u64;
-            Action::Served
+            checkpoint(frame)
         }
         _ => invalid_completion(NativeInvariant::EntryBinding),
-    })
+    }
 }
 
 /// Finish the native service park before handing the executor to the host.
