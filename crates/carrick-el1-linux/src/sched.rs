@@ -3,14 +3,13 @@ pub use carrick_el1::substrate::sched::*;
 use carrick_el1_abi::TrapFrame;
 use carrick_el1_abi::{ReservationMm, UserVa};
 use carrick_guest_arch::CounterTick;
+use carrick_guest_arch::ProcessContext;
 pub use carrick_personality_linux::sched::{
     EAGAIN, ETIMEDOUT_RESULT, FUTEX_WAIT_BITSET_PRIVATE, FUTEX_WAIT_PRIVATE,
     FUTEX_WAKE_BITSET_PRIVATE, FUTEX_WAKE_PRIVATE, SYS_FUTEX,
 };
 use carrick_personality_linux::sched::{FutexCall, FutexFrequency, FutexVenue, FutexWait};
 use core::sync::atomic::Ordering;
-
-pub(crate) const RETAINED_RELATIVE_DEADLINE: u64 = 1 << 63;
 
 /// ARM's Linux execution entry: the substrate moves registers, then this
 /// adapter re-enters the admitted native process owner before EL0 resumes.
@@ -96,11 +95,9 @@ pub fn is_served_futex_op(frame: &TrapFrame) -> bool {
     ::carrick_personality_linux::sched::is_served_futex_op(frame.x[8], crate::sched::args(frame))
 }
 fn args(frame: &TrapFrame) -> [u64; 6] {
-    let mut args = [
+    [
         frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5],
-    ];
-    args[1] &= !RETAINED_RELATIVE_DEADLINE;
-    args
+    ]
 }
 struct Adapter<'a, 's, C: ThreadCpu, U: UserWord> {
     sched: &'a mut Sched<'s, C, U>,
@@ -126,15 +123,50 @@ impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, C, U> {
         CounterTick::new(self.sched.cpu.now())
     }
     fn relative_deadline(&mut self, _key: u64, proposed: CounterTick) -> CounterTick {
-        if self.frame.x[1] & RETAINED_RELATIVE_DEADLINE != 0 {
-            return CounterTick::new(self.frame.x[5]);
+        if let Some(deadline) = core::num::NonZeroU64::new(self.frame.far) {
+            return CounterTick::new(deadline.get());
         }
-        self.frame.x[1] |= RETAINED_RELATIVE_DEADLINE;
-        self.frame.x[5] = proposed.raw();
+        let record = self
+            .sched
+            .zone
+            .slot(self.sched.slot)
+            .current()
+            .or_else(|| self.sched.zone.slot(self.sched.slot).host_record());
+        let deadline = record.and_then(|record| {
+            // SAFETY: the executing slot owns this current/host record.
+            unsafe {
+                self.sched
+                    .zone
+                    .record(record)
+                    .ctx_mut()
+                    .relative_futex_deadline()
+            }
+        });
+        if let Some(deadline) = deadline {
+            self.frame.far = deadline;
+            return CounterTick::new(deadline);
+        }
+        self.frame.far = proposed.raw();
         proposed
     }
     fn finish_relative_wait(&mut self) {
-        self.frame.x[1] &= !RETAINED_RELATIVE_DEADLINE;
+        if let Some(record) = self
+            .sched
+            .zone
+            .slot(self.sched.slot)
+            .current()
+            .or_else(|| self.sched.zone.slot(self.sched.slot).host_record())
+        {
+            // SAFETY: the executing slot owns this current/host record.
+            unsafe {
+                self.sched
+                    .zone
+                    .record(record)
+                    .ctx_mut()
+                    .clear_relative_futex_deadline();
+            }
+        }
+        self.frame.far = 0;
     }
     fn wake(
         &mut self,
