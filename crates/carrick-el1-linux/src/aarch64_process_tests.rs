@@ -10184,6 +10184,48 @@ fn serial_host_native_fork_children_create_timerfd_in_their_own_tables() {
 
 #[cfg(all(test, not(target_os = "macos")))]
 fn native_fork_descriptor_calls(constructor: Option<u64>) {
+    native_descriptor_calls(constructor, false);
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_root_creates_epoll_with_live_children() {
+    native_descriptor_calls(
+        Some(carrick_personality_linux::crossing::nr::EPOLL_CREATE1.raw()),
+        true,
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_root_creates_pipe_with_live_children() {
+    native_descriptor_calls(
+        Some(carrick_personality_linux::crossing::nr::PIPE2.raw()),
+        true,
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_root_creates_eventfd_with_live_children() {
+    native_descriptor_calls(
+        Some(carrick_personality_linux::crossing::nr::EVENTFD2.raw()),
+        true,
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_root_creates_timerfd_with_live_children() {
+    native_descriptor_calls(
+        Some(carrick_personality_linux::crossing::nr::TIMERFD_CREATE.raw()),
+        true,
+    );
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+fn native_descriptor_calls(constructor: Option<u64>, root_constructor: bool) {
+    use crate::ipc::IpcTables;
     use carrick_abi::{
         LINUX_F_DUPFD, LINUX_F_DUPFD_CLOEXEC, LINUX_F_GETFD, LINUX_F_GETFL, LINUX_F_SETFD,
         LINUX_F_SETFL, LINUX_O_NONBLOCK, LINUX_O_WRONLY,
@@ -10347,8 +10389,12 @@ fn native_fork_descriptor_calls(constructor: Option<u64>) {
             &crossing,
         )
         .with_words(&words);
-        let child_ctx =
-            Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, child_bindings[idx].address);
+        let binding = if root_constructor {
+            &parent_binding
+        } else {
+            &child_bindings[idx]
+        };
+        let child_ctx = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, binding.address);
         let mut entry = runtime.enter(source, &task, child_ctx, &mut svc).unwrap();
         let mut frame = carrick_el1_abi::TrapFrame {
             slot: fixture.slot.index() as u64,
@@ -10390,7 +10436,15 @@ fn native_fork_descriptor_calls(constructor: Option<u64>) {
     let sys_close = carrick_personality_linux::crossing::nr::CLOSE.raw();
     let sys_read = carrick_personality_linux::crossing::nr::READ.raw();
     let sys_write = carrick_personality_linux::crossing::nr::WRITE.raw();
-    activate_target(source, &task, &child_bindings[0]);
+    activate_target(
+        source,
+        &task,
+        if root_constructor {
+            &parent_binding
+        } else {
+            &child_bindings[0]
+        },
+    );
     for binding in &child_bindings {
         assert!(runtime.task_binding(binding.key).is_some());
     }
@@ -10415,6 +10469,44 @@ fn native_fork_descriptor_calls(constructor: Option<u64>) {
         } else {
             [flags, 0, 0]
         };
+        if root_constructor {
+            assert_eq!(tables.table_of(&task), Some(table.id().to_raw()));
+            assert!(tables.owned_table_of(&task).is_none());
+            let (route, result) = run_in_child(0, nr, args);
+            assert!(
+                matches!(route, CompletionRoute::Served | CompletionRoute::WithWork),
+                "root constructor {nr} must share the children's ring path, got {route:?} ({result})"
+            );
+            assert!(result >= 0, "root constructor {nr} errno {}", -result);
+            let created = if nr == sys::PIPE2.raw() {
+                assert_eq!(result, 0);
+                output
+                    .as_bytes()
+                    .chunks_exact(4)
+                    .map(|bytes| u64::from(u32::from_ne_bytes(bytes.try_into().unwrap())))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![result as u64]
+            };
+            for fd in created {
+                let (route, result) = run_in_child(0, sys::FCNTL.raw(), [fd, LINUX_F_GETFD, 0]);
+                assert!(matches!(
+                    route,
+                    CompletionRoute::Served | CompletionRoute::WithWork
+                ));
+                assert_eq!(result, 1, "root descriptor must expose FD_CLOEXEC in ring");
+                let (route, result) = run_in_child(0, sys::CLOSE.raw(), [fd, 0, 0]);
+                assert!(matches!(
+                    route,
+                    CompletionRoute::Served | CompletionRoute::WithWork
+                ));
+                assert_eq!(
+                    result, 0,
+                    "root descriptor must close through its ring owner"
+                );
+            }
+            return;
+        }
         let mut results = Vec::new();
         for idx in 0..2 {
             if idx != 0 {

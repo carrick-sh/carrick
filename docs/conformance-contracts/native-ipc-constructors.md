@@ -11,6 +11,14 @@ and distinct backing identities for the two children's newly created objects.
 The pipe result is copied from the user buffer separately after each call.
 These tests deliberately remain red until the corresponding ring service exists.
 
+The `serial_host_native_root_creates_*_with_live_children` bindings use the
+same real-fork fixture and production entry, switch back to the root while
+both children remain live, and authenticate its borrowed table identity.
+They require creation, FD_CLOEXEC lookup and close to complete in ring.
+They deliberately remain red too: root success through the host crossing
+does not satisfy the one-path contract. These root bindings complement the
+child bindings; neither population substitutes for the other.
+
 ## Root cause
 
 `serve_ipc_with_signals` admits read, write and epoll wait, not constructors.
@@ -29,6 +37,21 @@ objects underneath those host wrappers. Timerfd instead owns host
 `TimerFdState`, including the creating container's clock domain. The root
 therefore succeeds through a service the native child cannot use; it does
 not already have an in-ring constructor.
+
+The borrowed root namespace also has a host `FileTable` and descriptor
+projections. `El1PendingFamilies::descriptor` uses the native IPC mutation
+owner only for an owned table; the borrowed root takes the host-binding
+mutation path instead. A direct `IpcRegion` constructor plus an IPC table
+slot is therefore insufficient: it would publish an fd without the root's
+functional host metadata. Removing Temporary crossings at that point can
+regress root fcntl/close and mixed epoll operations. Constructor publication
+must establish one descriptor owner for these consumers rather than leave
+the root forwarding beside a child-only implementation.
+
+`HostIpc` also binds the object's Readable and Writable scheduler wait keys
+after creating the shared record. A ring constructor must retain that
+initialization guarantee before publishing a usable fd. Calling only the
+record allocator does not prove scheduler wake delivery.
 
 ## Required implementation
 
