@@ -120,6 +120,8 @@ pub(crate) struct Memory {
     #[serde(default)]
     unattended_rounds: u32,
     seen: Vec<String>,
+    #[serde(default)]
+    waiting_on: Option<String>,
 }
 
 /// What the rule layer knows about one PR when executing a decision.
@@ -196,6 +198,47 @@ pub(crate) fn enforce(decision: &Decision, gate: &Gate) -> Effect {
         Act::Round if text.is_empty() || text.contains(MARKER) => Effect::Refused("invalid brief"),
         Act::Round if text.chars().count() > BRIEF_LIMIT => Effect::Refused("brief too long"),
         Act::Round => Effect::Post(format!("/agent {text}\n\n{MARKER}")),
+    }
+}
+
+/// A repeated named prerequisite is a wait, rather than another worker round.
+/// Only the server section of trusted outcome comments is considered.
+pub(super) fn repeated_blocker<'a>(bodies: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let mut previous: Option<String> = None;
+    let mut waiting = None;
+    for body in bodies {
+        let blocker = (super::agent_loop::outcome_status(body) == Some("Blocked"))
+            .then(|| {
+                super::agent_loop::server_part(body)
+                    .lines()
+                    .find_map(|line| line.strip_prefix("External blocker: "))
+                    .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+            })
+            .flatten();
+        waiting = blocker
+            .as_ref()
+            .filter(|blocker| previous.as_ref() == Some(*blocker))
+            .cloned();
+        previous = blocker;
+    }
+    waiting
+}
+
+#[cfg(test)]
+mod blocker_replay_tests {
+    #[test]
+    fn replay_1763_1737_waits_on_1755() {
+        let body = "Dispatch outcome: Blocked\n\nExternal blocker: #1755 robust-list walker\n";
+        assert_eq!(super::repeated_blocker([body]), None);
+        assert_eq!(
+            super::repeated_blocker([body, body]),
+            Some("#1755 robust-list walker".into())
+        );
+        assert_eq!(super::repeated_blocker([body, body, ""]), None);
+        assert_eq!(
+            super::repeated_blocker([body, "Dispatch outcome: Continuing", body]),
+            None
+        );
     }
 }
 
@@ -523,6 +566,28 @@ pub(crate) fn cycle(
                 clip(&e.body)
             ));
         }
+        let waiting = repeated_blocker(
+            node["comments"]["nodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|c| outcome_bot(&c["author"]) || trusted_owner(&c["author"]))
+                .filter_map(|c| {
+                    if trusted_owner(&c["author"]) {
+                        Some("")
+                    } else {
+                        c["body"].as_str()
+                    }
+                }),
+        );
+        if let Some(blocker) = waiting {
+            memory.waiting_on = Some(blocker.clone());
+            log.push(format!(
+                "#{number}: waiting on {blocker}; repeated external blocker"
+            ));
+            continue;
+        }
+        memory.waiting_on = None;
         let decision = agent.decide(&context)?;
         log.push(format!(
             "#{number}: decision {:?}: {}",

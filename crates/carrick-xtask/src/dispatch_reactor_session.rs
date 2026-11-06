@@ -423,6 +423,8 @@ struct RoundMemory {
     /// When the reactor last replied; a reply needs an owner event after it.
     #[serde(default)]
     last_reply_at: Option<String>,
+    #[serde(default)]
+    waiting_on: Option<String>,
 }
 
 pub(super) struct Server<'a> {
@@ -820,6 +822,31 @@ impl Server<'_> {
                 text: arg_str(args, "brief")?.into(),
                 reason: String::new(),
             };
+            let comments = self
+                .remote
+                .list(&format!(
+                    "repos/{REPOSITORY}/issues/{n}/comments?per_page=100"
+                ))
+                .map_err(fail)?;
+            if let Some(blocker) = super::repeated_blocker(
+                comments
+                    .iter()
+                    .filter(|c| outcome_bot(&c["user"]) || trusted_owner(&c["user"]))
+                    .filter_map(|c| {
+                        if trusted_owner(&c["user"]) {
+                            Some("")
+                        } else {
+                            c["body"].as_str()
+                        }
+                    }),
+            ) {
+                state.prs.entry(n).or_default().waiting_on = Some(blocker.clone());
+                if !self.dry_run {
+                    save(&self.state, &state).map_err(fail)?;
+                }
+                return Err(format!("waiting on {blocker}; repeated external blocker"));
+            }
+            state.prs.entry(n).or_default().waiting_on = None;
             let (owned, adoptable) = eligible(self.remote, &pr).map_err(fail)?;
             let active: Vec<Value> = self
                 .remote
@@ -1833,6 +1860,44 @@ mod tests {
         let (err, text) = call(&mut fake, &state, "request_round", brief);
         assert!(!err, "{text}");
         assert_eq!(fake.posted.len(), 2);
+    }
+
+    #[test]
+    fn replay_1763_1737_records_wait_in_request_round() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("s.json");
+        let mut fake = remote();
+        let body = "Dispatch outcome: Blocked\n\nExternal blocker: #1755 robust-list walker\n";
+        fake.comments = (1..=2)
+            .map(|id| {
+                json!({
+                    "id":id,"user":{"login":"carrick-workers[bot]","type":"Bot"},
+                    "created_at":format!("2026-10-30T00:0{id}:00Z"),"body":body
+                })
+            })
+            .collect();
+        let (err, text) = call(
+            &mut fake,
+            &state,
+            "request_round",
+            json!({"pr":30,"brief":"finish the robust-list witness"}),
+        );
+        assert!(err && text.contains("waiting on #1755"), "{text}");
+        assert!(fake.posted.is_empty());
+        let saved: ToolState = load(&state).unwrap();
+        assert_eq!(
+            saved.prs[&30].waiting_on.as_deref(),
+            Some("#1755 robust-list walker")
+        );
+        fake.comments.push(json!({"user":{"login":"tjfontaine","type":"User"},"created_at":"2026-10-30T00:03:00Z","body":"#1755 has landed; continue"}));
+        let (err, text) = call(
+            &mut fake,
+            &state,
+            "request_round",
+            json!({"pr":30,"brief":"finish the robust-list witness"}),
+        );
+        assert!(!err, "{text}");
+        assert_eq!(fake.posted.len(), 1);
     }
 
     #[test]
