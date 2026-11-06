@@ -320,6 +320,9 @@ pub fn default_writable_backend_kind() -> carrick_spec::FsBackendKind {
     }
 }
 
+static CASE_PROBE_ACTIVE: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+static CASE_PROBE_RELEASED: std::sync::Condvar = std::sync::Condvar::new();
+
 /// Probe whether `path` resides on a case-sensitive filesystem.
 /// Tries to round-trip a sentinel file through opposite case spellings;
 /// on a case-insensitive volume the two open the same inode. Returns
@@ -328,34 +331,40 @@ pub fn default_writable_backend_kind() -> carrick_spec::FsBackendKind {
 /// stuck in the host kernel may outlive that deadline; further probes then
 /// fail closed instead of accumulating blocked threads.
 pub fn probe_case_sensitive(path: &Path) -> bool {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     // A stalled filesystem syscall cannot be cancelled safely in-process. Keep
     // at most one outstanding worker, including after its caller times out.
     // Further probes fail closed while that worker owns the slot. Do not join
     // it on timeout: even stat, close and unlink may stall on a sick volume.
-    static ACTIVE: AtomicBool = AtomicBool::new(false);
     struct Slot;
     impl Drop for Slot {
         fn drop(&mut self) {
-            ACTIVE.store(false, Ordering::Release);
+            if let Ok(mut active) = CASE_PROBE_ACTIVE.lock() {
+                *active = false;
+                CASE_PROBE_RELEASED.notify_all();
+            }
         }
     }
-    if ACTIVE
-        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
+    let Ok(mut active) = CASE_PROBE_ACTIVE.lock() else {
+        return false;
+    };
+    if *active {
         return false;
     }
+    *active = true;
+    drop(active);
     let slot = Slot;
     let path = path.to_owned();
     let (send, recv) = std::sync::mpsc::sync_channel(1);
     if std::thread::Builder::new()
         .name("carrick-case-probe".into())
         .spawn(move || {
-            let _slot = slot;
+            let slot = slot;
             let result = probe_case_sensitive_inner(&path);
+            // Publish completion only after releasing admission, so an immediate
+            // subsequent probe cannot mistake this completed probe for a stall.
+            drop(slot);
             let _ = send.send(result);
         })
         .is_err()
@@ -442,11 +451,26 @@ mod tests {
             .open(&fifo)
             .unwrap();
         thread.join().unwrap();
+        let (active, timed_out) = CASE_PROBE_RELEASED
+            .wait_timeout_while(
+                CASE_PROBE_ACTIVE.lock().unwrap(),
+                std::time::Duration::from_secs(1),
+                |active| *active,
+            )
+            .unwrap();
+        assert!(!timed_out.timed_out(), "released FIFO worker must finish");
+        assert!(!*active);
+        drop(active);
         drop(reader);
         assert_eq!(
             result,
             Ok(false),
             "stalled probe must fail closed within one second"
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            probe_case_sensitive(root.path()),
+            "probe must recover after FIFO release"
         );
     }
 
