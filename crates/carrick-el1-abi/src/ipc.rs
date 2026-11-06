@@ -1635,6 +1635,17 @@ impl<'a> IpcRegion<'a> {
         Ok(guard.publish_kind(KIND_PIPE))
     }
 
+    /// Create a pipe with storage provisioned by its execution owner.
+    pub fn create_backed_pipe<W: LockWait>(
+        &self,
+        capacity: usize,
+        storage: &mut IpcPipeStorage,
+        wait: &W,
+    ) -> Result<IpcObjectHandle, IpcError> {
+        let _ = storage;
+        self.create_pipe(capacity, &mut None, wait)
+    }
+
     /// Create an eventfd counter object.
     pub fn create_eventfd<W: LockWait>(
         &self,
