@@ -374,6 +374,95 @@ impl<V: MemoryValidator> UserCopy for ValidatedCopy<'_, V> {
     }
 }
 
+/// The typed interface preserves a refused access for exact-MM owner
+/// preparation. Atomic operands use ISA word instructions, never byte copies.
+impl<V: MemoryValidator> carrick_core::personality::UserCopy for ValidatedCopy<'_, V> {
+    fn copy_in(
+        &mut self,
+        dst: &mut [u8],
+        src: carrick_guest_arch::UserVa,
+    ) -> carrick_core::personality::CopyOutcome {
+        use carrick_core::personality::{CopyOutcome, GuestCopyRequest};
+        if !valid_lower_half_range(src.raw(), dst.len()) {
+            return CopyOutcome::Fault;
+        }
+        if UserCopy::copy_in(self, dst, src.raw()) {
+            CopyOutcome::Done
+        } else {
+            CopyOutcome::NotYet(GuestCopyRequest {
+                address: src,
+                len: carrick_guest_arch::GuestLen::new(dst.len() as u64),
+                access: carrick_guest_arch::Access::Read,
+            })
+        }
+    }
+
+    fn copy_out(
+        &mut self,
+        dst: carrick_guest_arch::UserVa,
+        src: &[u8],
+    ) -> carrick_core::personality::CopyOutcome {
+        use carrick_core::personality::{CopyOutcome, GuestCopyRequest};
+        if !valid_lower_half_range(dst.raw(), src.len()) {
+            return CopyOutcome::Fault;
+        }
+        if UserCopy::copy_out(self, dst.raw(), src) {
+            CopyOutcome::Done
+        } else {
+            CopyOutcome::NotYet(GuestCopyRequest {
+                address: dst,
+                len: carrick_guest_arch::GuestLen::new(src.len() as u64),
+                access: carrick_guest_arch::Access::Write,
+            })
+        }
+    }
+
+    fn atomic_load_u32(
+        &mut self,
+        address: carrick_guest_arch::UserVa,
+        value: &mut u32,
+    ) -> carrick_core::personality::CopyOutcome {
+        use carrick_core::personality::{CopyOutcome, atomic_word_refusal};
+        let refusal = atomic_word_refusal(address, carrick_guest_arch::Access::Read);
+        if refusal == CopyOutcome::Fault || self.validator.readable_bytes(address.raw(), 4) != 4 {
+            return refusal;
+        }
+        let Some(word) = crate::substrate::sched::hw::atomic_load_u32(self.task, address.raw())
+        else {
+            return refusal;
+        };
+        *value = word;
+        CopyOutcome::Done
+    }
+
+    fn atomic_compare_exchange_u32(
+        &mut self,
+        address: carrick_guest_arch::UserVa,
+        expected: u32,
+        desired: u32,
+        observed: &mut u32,
+    ) -> carrick_core::personality::CopyOutcome {
+        use carrick_core::personality::{CopyOutcome, atomic_word_refusal};
+        let refusal = atomic_word_refusal(address, carrick_guest_arch::Access::Write);
+        if refusal == CopyOutcome::Fault
+            || self.validator.readable_bytes(address.raw(), 4) != 4
+            || self.validator.writable_bytes(address.raw(), 4) != 4
+        {
+            return refusal;
+        }
+        let Some(word) = crate::substrate::sched::hw::atomic_compare_exchange_u32(
+            self.task,
+            address.raw(),
+            expected,
+            desired,
+        ) else {
+            return refusal;
+        };
+        *observed = word;
+        CopyOutcome::Done
+    }
+}
+
 /// One open description of an in-zone inode, as the file operations see it:
 /// the inode's bytes, size and dirty state, and this description's offset and
 /// access flags (open(2): each open file description has its own offset; all
@@ -815,4 +904,91 @@ pub fn with_data_marks<T, E: Copy>(
     }
     release(&locked[..num_locked]);
     outcome
+}
+
+#[cfg(test)]
+mod atomic_copy_tests {
+    use super::*;
+    use carrick_core::personality::{CopyOutcome, UserCopy as TypedCopy};
+    use carrick_guest_arch::{Access, UserVa};
+    use core::cell::Cell;
+    use core::sync::atomic::AtomicU32;
+
+    struct Backing(Cell<bool>);
+    impl MemoryValidator for Backing {
+        fn readable_bytes(&self, _: u64, len: usize) -> usize {
+            if self.0.get() { len } else { 0 }
+        }
+        fn writable_bytes(&self, address: u64, len: usize) -> usize {
+            self.readable_bytes(address, len)
+        }
+    }
+
+    #[test]
+    fn typed_atomic_word_defers_without_changing_memory_or_output() {
+        let task = CurrentTask::new();
+        let word = AtomicU32::new(0x12345678);
+        let address = UserVa::new(word.as_ptr() as u64);
+        let backing = Backing(Cell::new(false));
+        let mut copy = ValidatedCopy {
+            task: &task,
+            validator: &backing,
+        };
+        let mut observed = 0xfeed;
+        assert!(matches!(copy.atomic_load_u32(address, &mut observed),
+            CopyOutcome::NotYet(request) if request.address == address
+                && request.len.raw() == 4 && request.access == Access::Read));
+        assert_eq!(observed, 0xfeed);
+        assert!(
+            matches!(copy.atomic_compare_exchange_u32(address, 0x12345678, 7, &mut observed),
+            CopyOutcome::NotYet(request) if request.access == Access::Write)
+        );
+        assert_eq!(observed, 0xfeed);
+        assert_eq!(word.load(Ordering::Acquire), 0x12345678);
+        backing.0.set(true);
+        // Exercise the blanket &mut adapter as well as the native adapter.
+        let mut borrowed = &mut copy;
+        assert_eq!(
+            TypedCopy::atomic_load_u32(&mut borrowed, address, &mut observed),
+            CopyOutcome::Done
+        );
+        assert_eq!(observed, 0x12345678);
+        assert_eq!(
+            borrowed.atomic_compare_exchange_u32(address, 3, 7, &mut observed),
+            CopyOutcome::Done
+        );
+        assert_eq!(observed, 0x12345678);
+        assert_eq!(word.load(Ordering::Acquire), 0x12345678);
+        assert_eq!(
+            borrowed.atomic_compare_exchange_u32(address, observed, 7, &mut observed),
+            CopyOutcome::Done
+        );
+        assert_eq!(observed, 0x12345678);
+        assert_eq!(word.load(Ordering::Acquire), 7);
+    }
+
+    #[test]
+    fn typed_atomic_word_rejects_alignment_and_upper_half_before_access() {
+        let task = CurrentTask::new();
+        let mut copy = ValidatedCopy {
+            task: &task,
+            validator: &HardwareValidator,
+        };
+        for address in [
+            UserVa::new(1),
+            UserVa::new(u64::MAX - 3),
+            UserVa::new(1 << 63),
+        ] {
+            let mut observed = 31;
+            assert_eq!(
+                copy.atomic_load_u32(address, &mut observed),
+                CopyOutcome::Fault
+            );
+            assert_eq!(
+                copy.atomic_compare_exchange_u32(address, 31, 1, &mut observed),
+                CopyOutcome::Fault
+            );
+            assert_eq!(observed, 31);
+        }
+    }
 }
