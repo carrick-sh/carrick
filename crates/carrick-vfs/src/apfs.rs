@@ -406,7 +406,7 @@ mod fs_default_tests {
 }
 
 #[cfg(test)]
-mod tests {
+mod serial_host {
     use super::*;
 
     #[test]
@@ -427,8 +427,8 @@ mod tests {
         }
         assert_eq!(actual, chosen.join("scratch"));
         assert!(
-            !chosen.exists(),
-            "override selection must not touch the disk"
+            chosen.join("scratch").is_dir(),
+            "override must be created and checked for case sensitivity"
         );
     }
 
@@ -455,6 +455,7 @@ mod tests {
             .unwrap();
         probe._worker.join().unwrap();
         drop(reader);
+        assert!(fifo.exists(), "probe must not remove an existing special file");
         assert!(!result, "stalled probe must fail closed within 250 ms");
         #[cfg(target_os = "linux")]
         assert!(
