@@ -853,8 +853,6 @@ const X86_NR_TIME: u64 = 201;
 /// x86-64 `access(2)` (syscalls(2)). Desugars to canonical `faccessat(2)` with
 /// `AT_FDCWD` and flags=0 because asm-generic only exposes `faccessat`.
 const X86_NR_ACCESS: u64 = 21;
-/// Canonical (asm-generic / aarch64) `faccessat` number.
-const CANONICAL_FACCESSAT: u64 = 48;
 /// x86-64 `stat(2)` (syscalls(2)). It follows paths like
 /// `newfstatat(AT_FDCWD, path, flags=0)` but writes x86_64's legacy stat
 /// layout, so it normalizes to a private dispatcher shim.
@@ -1220,12 +1218,13 @@ impl X8664GuestArch {
             });
         }
         if x86_number == X86_NR_ACCESS {
+            let (number, args) = carrick_abi::syscall_x86_64::normalize_access(args);
             return SyscallNorm::Plain(RawSyscall {
                 current_guest_sp: None,
                 guest_abi: carrick_abi::LinuxGuestAbi::X86_64,
                 native_number: NativeNr(x86_number),
-                number: CanonicalNr(CANONICAL_FACCESSAT),
-                args: [carrick_abi::LINUX_AT_FDCWD, args[0], args[1], 0, 0, 0],
+                number,
+                args,
             });
         }
         if x86_number == X86_NR_STAT {
