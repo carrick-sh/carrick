@@ -9492,6 +9492,7 @@ mod transfer_service_tests {
         };
         assert_eq!(wait.handle().carrier(), carrier);
         assert_eq!(wait.handle().mm(), mm);
+        assert_eq!(wait.handle().incarnation(), nz(3));
         assert_eq!(wait.cause(), carrick_el1_abi::PortalWaitCause::Editor);
         assert_eq!(wait.revision(), 19);
         assert!(!retained.load(Ordering::Acquire));
