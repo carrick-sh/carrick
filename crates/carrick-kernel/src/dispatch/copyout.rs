@@ -748,6 +748,41 @@ pub(crate) mod owner_fixture {
     }
 
     impl GuestMemory for OwnerRefusingMemory {
+        fn atomic_load_user_u32(&self, address: u64) -> Result<u32, MemoryError> {
+            self.reads.set(self.reads.get() + 1);
+            if let Some(wait) = self.refuse_read.take() {
+                return Err(MemoryError::ReadSuspended(Box::new(
+                    carrick_guest_mem::MemoryReadSuspension {
+                        wait: carrick_guest_mem::MemoryReadWait::Owner(wait),
+                        continuation: carrick_guest_mem::OwnedReadContinuation::new((address, 4)),
+                    },
+                )));
+            }
+            self.inner.atomic_load_user_u32(address)
+        }
+
+        fn atomic_compare_exchange_user_u32(
+            &mut self,
+            address: u64,
+            expected: u32,
+            desired: u32,
+        ) -> Result<u32, MemoryError> {
+            self.prepares += 1;
+            if self.refuse_after != 0 {
+                self.refuse_after -= 1;
+            } else if let Some(wait) = self.refuse.take() {
+                return Err(MemoryError::OwnerWait(wait));
+            }
+            if let Some(request) = self.supply.take() {
+                return Err(MemoryError::Supply(Box::new(request)));
+            }
+            if !self.guest_range_is_writable(address, 4) {
+                return Err(MemoryError::OutOfBounds { address, length: 4 });
+            }
+            self.inner
+                .atomic_compare_exchange_user_u32(address, expected, desired)
+        }
+
         fn user_memory_venue(&self) -> UserMemoryVenue {
             UserMemoryVenue::Owner
         }
