@@ -376,7 +376,13 @@ fn job_home_and_work_are_recreated_from_the_skeleton_before_every_job() {
     mkdir_mode(&outside, 0o755);
     write_skeleton_entry(outside.join("keep"), "x", 0o644);
     std::os::unix::fs::symlink(&outside, &diag).unwrap();
+    let before = std::fs::symlink_metadata(&home).unwrap();
+    let socket = std::os::unix::net::UnixListener::bind(home.join(".sccache.sock")).unwrap();
+    drop(socket);
     reset_job_area(&skel, &home, &[work.clone(), diag.clone()], uid, uid, gid).unwrap();
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(before.ino(), std::fs::symlink_metadata(&home).unwrap().ino());
+    assert!(!home.join(".sccache.sock").exists());
     assert_eq!(
         std::fs::read_to_string(home.join(".zshrc")).unwrap(),
         "export SKEL=1\n"
