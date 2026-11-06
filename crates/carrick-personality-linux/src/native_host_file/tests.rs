@@ -8,17 +8,17 @@ struct Memory {
     writable: bool,
 }
 impl HostFileUser for Memory {
-    fn copy_in(&mut self, dst: &mut [u8], src: u64) -> bool {
+    fn copy_in(&mut self, dst: &mut [u8], src: u64) -> CopyOutcome {
         let Some(start) = src.checked_sub(self.base) else {
-            return false;
+            return CopyOutcome::Fault;
         };
         let start = start as usize;
         match self.bytes.get(start..start + dst.len()) {
             Some(bytes) => {
                 dst.copy_from_slice(bytes);
-                true
+                CopyOutcome::Done
             }
-            None => false,
+            None => CopyOutcome::Fault,
         }
     }
     fn writable(&mut self, dst: u64, len: usize) -> usize {
@@ -420,7 +420,7 @@ fn empty_path_stat_names_the_descriptor() {
 }
 
 #[test]
-fn unreadable_input_requests_fault_supply_first_and_long_paths_fail() {
+fn invalid_input_faults_and_long_paths_fail() {
     let mut user = memory(b"");
     assert_eq!(
         run(
@@ -431,10 +431,7 @@ fn unreadable_input_requests_fault_supply_first_and_long_paths_fail() {
             },
             &mut user
         ),
-        Some(HostFileStage::Fault {
-            address: 0x9000,
-            access: Access::Read
-        })
+        returned(carrick_syscall_abi::LINUX_EFAULT)
     );
     let mut long = memory(&vec![b'a'; LINUX_PATH_MAX + 8]);
     assert_eq!(
@@ -959,5 +956,83 @@ fn file_staging_true_input_fault_does_not_request_backing() {
             run(call, &mut user),
             returned(carrick_syscall_abi::LINUX_EFAULT)
         );
+    }
+}
+
+#[test]
+fn file_staging_not_yet_input_builds_no_request_before_supply() {
+    use carrick_core::personality::GuestCopyRequest;
+    use carrick_guest_arch::{GuestLen, UserVa};
+
+    struct LazyInput {
+        memory: Memory,
+        pending: Option<u64>,
+        refused: usize,
+    }
+    impl HostFileUser for LazyInput {
+        fn copy_in(&mut self, dst: &mut [u8], src: u64) -> CopyOutcome {
+            if self.pending == Some(src) {
+                self.pending = None;
+                self.refused += 1;
+                return CopyOutcome::NotYet(GuestCopyRequest {
+                    address: UserVa::new(src),
+                    len: GuestLen::new(dst.len() as u64),
+                    access: Access::Read,
+                });
+            }
+            self.memory.copy_in(dst, src)
+        }
+        fn writable(&mut self, _: u64, _: usize) -> usize {
+            panic!("write input may be read-only");
+        }
+    }
+
+    for vector in [false, true] {
+        let mut bytes = vec![0; 64];
+        bytes[32..38].copy_from_slice(b"abcdef");
+        bytes[..8].copy_from_slice(&(BASE + 32).to_le_bytes());
+        bytes[8..16].copy_from_slice(&3u64.to_le_bytes());
+        bytes[16..24].copy_from_slice(&(BASE + 35).to_le_bytes());
+        bytes[24..32].copy_from_slice(&3u64.to_le_bytes());
+        let refused_address = BASE + if vector { 35 } else { 32 };
+        let mut user = LazyInput {
+            memory: memory(&bytes),
+            pending: Some(refused_address),
+            refused: 0,
+        };
+        let call = if vector {
+            HostFileCall::Writev {
+                fd: 1,
+                iov: BASE,
+                iovcnt: 2,
+            }
+        } else {
+            HostFileCall::Write {
+                fd: 1,
+                buf: BASE + 32,
+                count: 6,
+            }
+        };
+        let mut resolve = caller;
+        let mut releases = |_: &mut [host_file::MapSourceReply]| 0;
+        let mut namespace = NativeNamespace {
+            table: TABLE,
+            resolve: &mut resolve,
+            releases: &mut releases,
+        };
+        assert_eq!(
+            stage(call, &mut namespace, &mut user),
+            Some(HostFileStage::Fault {
+                address: refused_address,
+                access: Access::Read,
+            })
+        );
+        let (mut record, output, _) = request(stage(call, &mut namespace, &mut user));
+        assert!(output.is_none());
+        assert_eq!(
+            HostFileRequestView::parse(&mut record).unwrap().input(),
+            b"abcdef"
+        );
+        assert_eq!(user.refused, 1);
     }
 }

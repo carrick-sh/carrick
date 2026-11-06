@@ -1000,8 +1000,17 @@ struct HostFileCopy<'a, V: file::MemoryValidator>(file::ValidatedCopy<'a, V>);
 impl<V: file::MemoryValidator> carrick_personality_linux::native_host_file::HostFileUser
     for HostFileCopy<'_, V>
 {
-    fn copy_in(&mut self, dst: &mut [u8], src: u64) -> bool {
-        file::UserCopy::copy_in(&mut self.0, dst, src)
+    fn copy_in(&mut self, dst: &mut [u8], src: u64) -> carrick_core::personality::CopyOutcome {
+        use carrick_core::personality::{CopyOutcome, GuestCopyRequest};
+        if file::UserCopy::copy_in(&mut self.0, dst, src) {
+            CopyOutcome::Done
+        } else {
+            CopyOutcome::NotYet(GuestCopyRequest {
+                address: carrick_guest_arch::UserVa::new(src),
+                len: carrick_guest_arch::GuestLen::new(dst.len() as u64),
+                access: carrick_guest_arch::Access::Read,
+            })
+        }
     }
     fn writable(&mut self, dst: u64, len: usize) -> usize {
         self.0.validator.writable_bytes(dst, len)
