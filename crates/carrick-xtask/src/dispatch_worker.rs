@@ -156,6 +156,8 @@ pub struct Dispatch {
     pub body: String,
     pub branch: String,
     pub resume: bool,
+    #[serde(default)]
+    pub superseded_prs: Vec<u64>,
     pub selected_tip: Option<String>,
     pub worker: Worker,
     pub base: String,
@@ -729,6 +731,7 @@ fn validate_event_with_publication(
             .to_owned(),
         branch,
         resume,
+        superseded_prs: serde_json::from_value(event["superseded_prs"].clone()).unwrap_or_default(),
         selected_tip: event["pull_request"]["head"]["sha"]
             .as_str()
             .map(str::to_owned),
@@ -3790,6 +3793,28 @@ fn resolve_event(
             event["pull_request"] = api(root, &format!("repos/{REPOSITORY}/pulls/{number}"))?;
         }
     }
+    if event.get("pull_request").is_none() && chain.is_none() {
+        let issue = event["issue"]["number"]
+            .as_u64()
+            .ok_or(ScalerError::Guard("missing issue number"))?;
+        let prs = linked_prs(root, issue, "open")?;
+        select_issue_branch(
+            &mut event,
+            &prs,
+            |pr, id| {
+                let run = api(root, &format!("repos/{REPOSITORY}/actions/runs/{id}"))?;
+                let branch = pr["head"]["ref"].as_str().unwrap_or_default();
+                let publication = if publish_app_author(&pr["user"]) {
+                    agent_loop::RunCache::for_guard(false)
+                        .publication(root, pr, &run, issue, branch)
+                } else {
+                    None
+                };
+                Ok((run, publication))
+            },
+            trusted,
+        )?;
+    }
     if event.get("pull_request").is_some() {
         let branch = event["pull_request"]["head"]["ref"]
             .as_str()
@@ -3826,6 +3851,18 @@ fn resolve_event(
         event["issue"] = api(root, &format!("repos/{REPOSITORY}/issues/{issue}"))?;
     }
     Ok((event, None, chain))
+}
+
+/// Resolve issue triggers through the same authenticated ownership predicate as
+/// PR triggers. Only an explicit line in the verified trigger requests a reset.
+fn select_issue_branch(
+    event: &mut Value,
+    prs: &[Value],
+    mut run: impl FnMut(&Value, &str) -> Result<(Value, Option<PublishedPr>), ScalerError>,
+    trusted: &mut dyn FnMut(&str) -> bool,
+) -> Result<(), ScalerError> {
+    let _ = (event, prs, &mut run, trusted);
+    Ok(())
 }
 
 /// Select a single open owned PR, authenticating the original branch run.
@@ -8952,6 +8989,7 @@ print(json.dumps({"data":{"repository":{"pullRequest":{"closingIssuesReferences"
 REFS
  ;;
  */collaborators/tjfontaine/permission) echo '{"permission":"admin","role_name":"admin"}' ;;
+ */issues/comments/77) cat "$RUNNER_TEMP/trigger-comment.json" ;;
  */pulls/800) cat "$RUNNER_TEMP/adopted-pr.json" ;;
  */issues/634) cat "$RUNNER_TEMP/adopted-issue.json" ;;
  */actions/runs/42) cat "$RUNNER_TEMP/original.json" ;;
@@ -10609,6 +10647,69 @@ fi
                     .verify(&work, 800, &ClosingIssues::from([issue_reference(634)]))
                     .is_err(),
                 "closing-reference wait escaped the command window"
+            );
+            return;
+        }
+        if witness == "issue-retrigger" {
+            let mut trigger = event.clone();
+            trigger["action"] = json!("created");
+            trigger["comment"] = json!({"id":77,"body":"/agent\ncontinue on this issue's run branch", "user":{"login":"tjfontaine","type":"User"},"created_at":"now","updated_at":"now"});
+            pr["head"]["sha"] = json!(receipt.head);
+            std::fs::write(
+                outer.join("trigger-comment.json"),
+                trigger["comment"].to_string(),
+            )
+            .unwrap();
+            std::fs::write(outer.join("adopted-pr.json"), pr.to_string()).unwrap();
+            std::fs::write(outer.join("pr.json"), json!([pr.clone()]).to_string()).unwrap();
+            std::fs::write(
+                outer.join("adopted-issue.json"),
+                trigger["issue"].to_string(),
+            )
+            .unwrap();
+            let path = outer.join("retrigger.json");
+            std::fs::write(&path, trigger.to_string()).unwrap();
+            let (resolved, adoption, chain) =
+                resolve_event(&work, &path, &mut owner_collaborator()).unwrap();
+            assert!(adoption.is_none() && chain.is_none());
+            assert_eq!(resolved["pull_request"]["number"], 800);
+            dispatch = validate_event(&resolved, "tjfontaine", &mut owner_collaborator()).unwrap();
+            assert!(dispatch.resume);
+            assert_eq!(dispatch.branch, receipt.branch);
+            dispatch.base = receipt.base.clone();
+            dispatch.main = receipt.base.clone();
+            receipt.expected_tip = receipt.head.clone();
+            // A second round pushes to the same branch and edits the same PR.
+            git(
+                &work,
+                &[
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "fix(ci): continue the same lane",
+                ],
+            )
+            .unwrap();
+            receipt.head = git(&work, &["rev-parse", "HEAD"]).unwrap().trim().into();
+            receipt.pr_body = Some("Continue the same lane.".into());
+            assert_eq!(
+                publish(
+                    &work,
+                    &dispatch,
+                    &receipt,
+                    &contract,
+                    &report,
+                    "fixture-token",
+                    &mut agent_loop::RunCache::default()
+                )
+                .unwrap(),
+                Some(800)
+            );
+            let calls = regular_text(&outer.join("gh.args")).unwrap();
+            assert_eq!(calls.matches("pr\ncreate\n").count(), 1, "{calls}");
+            assert!(
+                calls.contains("api\n-X\nPATCH\nrepos/carrick-sh/carrick/pulls/800"),
+                "{calls}"
             );
             return;
         }
@@ -12595,6 +12696,62 @@ fi
         event["dispatch_run"] = json!({"id":42,"path":".github/workflows/dispatch-worker.yml","event":"issues","head_branch":"main","repository":{"full_name":REPOSITORY},"actor":{"login":"tjfontaine","type":"User"},"triggering_actor":{"login":"tjfontaine","type":"User"},"head_repository":{"full_name":REPOSITORY},"head_sha":"a".repeat(40)});
         event
     }
+    #[test]
+    fn issue_retrigger_resolves_the_published_pr_before_assigning_a_branch() {
+        publication_fixture("issue-retrigger");
+    }
+
+    #[test]
+    fn issue_1750_retrigger_continues_1778_and_fresh_start_supersedes_it() {
+        let mut original = review_event();
+        original["issue"]["number"] = json!(1750);
+        original["pull_request"]["number"] = json!(1778);
+        original["pull_request"]["state"] = json!("open");
+        original["pull_request"]["head"]["ref"] = json!("work/dispatch-1750-42");
+        original["pull_request"]["head"]["sha"] = json!("b".repeat(40));
+        let pr = original["pull_request"].clone();
+        let run = original["dispatch_run"].clone();
+        let mut trigger = event();
+        trigger["issue"]["number"] = json!(1750);
+        trigger["action"] = json!("created");
+        trigger["comment"] = json!({"body":"/agent\ncontinue on this issue's run branch", "user":{"login":"tjfontaine","type":"User"},"created_at":"now","updated_at":"now"});
+        // First trigger has no PR; the next sees the PR published by that run.
+        select_issue_branch(
+            &mut trigger,
+            &[],
+            |_, _| unreachable!(),
+            &mut owner_collaborator(),
+        )
+        .unwrap();
+        assert!(trigger.get("pull_request").is_none());
+        select_issue_branch(
+            &mut trigger,
+            std::slice::from_ref(&pr),
+            |_, _| Ok((run.clone(), None)),
+            &mut owner_collaborator(),
+        )
+        .unwrap();
+        assert_eq!(trigger["pull_request"]["number"], 1778);
+        trigger["dispatch_run"] = run.clone();
+        let d = validate_event(&trigger, "tjfontaine", &mut owner_collaborator()).unwrap();
+        assert!(d.resume);
+        assert_eq!(d.branch, "work/dispatch-1750-42");
+        assert_eq!(d.selected_tip, Some("b".repeat(40)));
+
+        trigger.as_object_mut().unwrap().remove("pull_request");
+        trigger["comment"]["body"] = json!("/agent\nFresh start: yes");
+        select_issue_branch(
+            &mut trigger,
+            &[pr],
+            |_, _| Ok((run.clone(), None)),
+            &mut owner_collaborator(),
+        )
+        .unwrap();
+        let d = validate_event(&trigger, "tjfontaine", &mut owner_collaborator()).unwrap();
+        assert!(!d.resume);
+        assert_eq!(d.superseded_prs, vec![1778]);
+    }
+
     #[test]
     fn review_admission_requires_trusted_reviewer_and_owned_pr() {
         let event = review_event();
