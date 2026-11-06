@@ -2519,8 +2519,18 @@ pub struct ForwardVenue<'a, M: CarrierCpuIo, Mem: CarrierMemoryIo = M> {
 }
 
 impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
-    pub fn ipc_table_map(&self) -> Arc<dyn carrick_el1_abi::ipc_tables::IpcTableMapBacking> {
-        Arc::new(RetainedIpcTableMap(Arc::clone(&self.files._backing)))
+    pub fn ipc_table_map(
+        &self,
+    ) -> Result<Arc<dyn carrick_el1_abi::ipc_tables::IpcTableMapBacking>, TrapError> {
+        let base = self
+            .files
+            ._backing
+            .host_base()
+            .map_err(|e| fail(e.to_string()))?;
+        Ok(Arc::new(RetainedIpcTableMap {
+            _backing: Arc::clone(&self.files._backing),
+            base,
+        }))
     }
 
     pub fn file_tables(
@@ -3626,16 +3636,16 @@ mod cpl0_layout_tests {
 
 pub use crate::cpl0_private_witness::PrivateAnonymousMmEvidence;
 
-struct RetainedIpcTableMap(Arc<BackingExtent>);
+struct RetainedIpcTableMap {
+    _backing: Arc<BackingExtent>,
+    base: carrick_guest_mem::HostVa,
+}
 impl carrick_el1_abi::ipc_tables::IpcTableMapBacking for RetainedIpcTableMap {
     fn table_map(&self) -> &carrick_el1_abi::ipc_tables::IpcTableMap {
-        let base = self.0.host_base().unwrap_or_else(|_| {
-            carrick_fatal::carrick_fatal!("cpl0::ipc_map", "retained map backing vanished")
-        });
         // SAFETY: constructed only from the complete authenticated file extent;
         // the Arc owns its storage independently of carrier registration.
         unsafe {
-            &*((base.raw() + carrick_el1_abi::EL1_IPC_TABLE_MAP_OFFSET as usize)
+            &*((self.base.raw() + carrick_el1_abi::EL1_IPC_TABLE_MAP_OFFSET as usize)
                 as *const carrick_el1_abi::ipc_tables::IpcTableMap)
         }
     }
@@ -3955,7 +3965,9 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
     pub fn file_region_binding(&self) -> carrick_el1_abi::FileRegionBinding {
         self.0.files.registration.binding()
     }
-    pub fn ipc_table_map(&self) -> Arc<dyn carrick_el1_abi::ipc_tables::IpcTableMapBacking> {
+    pub fn ipc_table_map(
+        &self,
+    ) -> Result<Arc<dyn carrick_el1_abi::ipc_tables::IpcTableMapBacking>, TrapError> {
         self.0.ipc_table_map()
     }
 
