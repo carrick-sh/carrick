@@ -80,6 +80,16 @@ pub trait IpcExecution {
         operation: OperationToken,
     ) -> Result<IpcServed, (ObjectWaitError, OperationToken)>;
 
+    /// Deliver a detached queue completion through this execution venue.
+    /// Task lookup and boundary-work publication belong to the transport:
+    /// a context-generic engine cannot use ARM's fixed current-task aperture.
+    fn deliver_completion(
+        &self,
+        owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, Self::Context>,
+    ) {
+        crate::sched::object_wait::deliver_completion(self.zone(), self.slot(), owned);
+    }
+
     fn observe_object(&self, key: ObjectWaitKey) -> Result<ObjectWaitSnapshot, ObjectWaitError> {
         carrick_core::wait::observe_object(self.zone(), self.slot(), key, &|owned| {
             crate::sched::object_wait::deliver_completion(self.zone(), self.slot(), owned)
