@@ -2967,26 +2967,20 @@ impl<
                     );
                 }
                 Err(carrick_core::user_copy::CopyOutcome::NotYet(request)) => {
-                    if self.process.is_none() {
+                    let Some(process) = self.process.as_deref_mut() else {
                         return FamilyCompletion::Forward;
-                    }
+                    };
                     if let Some(operation) = operation {
-                        self.process
-                            .as_deref_mut()
-                            .unwrap()
-                            .retain_relative_futex_wait(operation);
+                        process.retain_relative_futex_wait(operation);
                     }
                     let outcome = lifecycle::LifecycleNative::wait_guest_copy(self, request);
                     if !matches!(
                         outcome,
                         lifecycle::LifecycleOutcome::Redispatch
                             | lifecycle::LifecycleOutcome::Transferred { .. }
-                    ) {
-                        let _ = self
-                            .process
-                            .as_deref_mut()
-                            .unwrap()
-                            .take_relative_futex_wait();
+                    ) && let Some(process) = self.process.as_deref_mut()
+                    {
+                        let _ = process.take_relative_futex_wait();
                     }
                     return carrick_personality_linux::lifecycle::lifecycle_effect(&outcome);
                 }
