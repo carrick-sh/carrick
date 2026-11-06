@@ -1132,7 +1132,8 @@ fn serve_sigaltstack(
 /// word the copyout replaces, restored if the clone backs out.
 struct TidOutput {
     address: u64,
-    preimage: [u8; 4],
+    preimage: u32,
+    published: u32,
     committed: bool,
 }
 
@@ -1149,7 +1150,8 @@ impl TidOutput {
         match outcome {
             CopyOutcome::Done => Ok(Some(Self {
                 address,
-                preimage,
+                preimage: u32::from_le_bytes(preimage),
+                published: 0,
                 committed: false,
             })),
             CopyOutcome::Fault | CopyOutcome::NotYet(_) => Err(outcome),
@@ -1167,43 +1169,68 @@ struct TidOutputs {
 }
 
 impl TidOutputs {
-    fn publish(&mut self, visible_tid: u32, user: &mut (impl UserCopy + ?Sized)) -> CopyOutcome {
-        let bytes = visible_tid.to_le_bytes();
+    fn publish(&mut self, visible_tid: u32, user: &mut dyn LifecycleNative<'_>) -> CopyOutcome {
         let Some(parent) = &mut self.parent else {
-            return self.publish_child(&bytes, user);
+            return self.publish_child(visible_tid, user);
         };
-        // A guarded copy can fault after a prefix, so retain undo before
-        // attempting it, but never claim an output that was not reached.
-        let parent_outcome = user.copy_out(UserVa::new(parent.address), &bytes);
+        let mut observed = 0;
+        let parent_outcome = user.compare_exchange_user_u32(
+            UserVa::new(parent.address),
+            parent.preimage,
+            visible_tid,
+            &mut observed,
+        );
         if !parent_outcome.is_done() {
             return parent_outcome;
         }
+        if observed != parent.preimage {
+            return CopyOutcome::Fault;
+        }
+        parent.published = visible_tid;
         parent.committed = true;
-        self.publish_child(&bytes, user)
+        self.publish_child(visible_tid, user)
     }
 
     fn publish_child(
         &mut self,
-        bytes: &[u8; 4],
-        user: &mut (impl UserCopy + ?Sized),
+        visible_tid: u32,
+        user: &mut dyn LifecycleNative<'_>,
     ) -> CopyOutcome {
         let Some(child) = &mut self.child else {
             return CopyOutcome::Done;
         };
-        let outcome = user.copy_out(UserVa::new(child.address), bytes);
+        let mut observed = 0;
+        let outcome = user.compare_exchange_user_u32(
+            UserVa::new(child.address),
+            child.preimage,
+            visible_tid,
+            &mut observed,
+        );
+        if outcome.is_done() && observed != child.preimage {
+            return CopyOutcome::Fault;
+        }
+        child.published = visible_tid;
         child.committed = outcome.is_done();
         outcome
     }
 
-    fn rollback(&self, user: &mut (impl UserCopy + ?Sized)) -> bool {
-        [&self.parent, &self.child]
+    fn rollback(&self, user: &mut dyn LifecycleNative<'_>) -> bool {
+        let mut complete = true;
+        for output in [&self.parent, &self.child]
             .into_iter()
             .flatten()
             .filter(|output| output.committed)
-            .all(|output| {
-                user.copy_out(UserVa::new(output.address), &output.preimage)
-                    .is_done()
-            })
+        {
+            let mut observed = 0;
+            let outcome = user.compare_exchange_user_u32(
+                UserVa::new(output.address),
+                output.published,
+                output.preimage,
+                &mut observed,
+            );
+            complete &= outcome.is_done();
+        }
+        complete
     }
 }
 
