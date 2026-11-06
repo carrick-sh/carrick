@@ -1201,9 +1201,52 @@ enum MemberWait<'a> {
     Service(Box<service::PendingService<'a>>),
 }
 
+/// One selected handler, retained outside the pending-signal queue until its
+/// frame commits. Dropping terminal/member custody releases the obligation.
+pub(crate) struct SignalPush {
+    pub signal: carrick_signal_core::policy::Signal,
+    pub info: Option<carrick_personality_linux::abi::signal::LinuxSiginfo>,
+    pub action: carrick_signal_core::policy::Action,
+    pub blocked: carrick_signal_core::policy::SigBlockMask,
+    pub saved_mask: carrick_signal_core::policy::SigBlockMask,
+    pub copied: Vec<(UserVa, Vec<u8>)>,
+    pub failed: bool,
+    pub forwarded_restart: Option<u64>,
+}
+impl Drop for SignalPush {
+    fn drop(&mut self) {
+        NATIVE_SIGNAL_CONTINUATIONS.fetch_sub(1, Ordering::Release);
+    }
+}
+impl SignalPush {
+    #[inline(never)]
+    pub(crate) fn new(
+        selected: (
+            carrick_signal_core::policy::Signal,
+            Option<carrick_personality_linux::abi::signal::LinuxSiginfo>,
+            carrick_signal_core::policy::Action,
+        ),
+        blocked: carrick_signal_core::policy::SigBlockMask,
+        saved_mask: carrick_signal_core::policy::SigBlockMask,
+    ) -> Box<Self> {
+        NATIVE_SIGNAL_CONTINUATIONS.fetch_add(1, Ordering::Release);
+        Box::new(Self {
+            signal: selected.0,
+            info: selected.1,
+            action: selected.2,
+            blocked,
+            saved_mask,
+            copied: Vec::new(),
+            failed: false,
+            forwarded_restart: None,
+        })
+    }
+}
+
 #[derive(Default)]
 struct MemberWaitState<'a> {
     wait: Option<MemberWait<'a>>,
+    signal_push: Option<Box<SignalPush>>,
     suspend_mask: Option<carrick_signal_core::policy::SigBlockMask>,
 }
 
@@ -1386,7 +1429,7 @@ impl<'a, M: Clone, C: ProcessContext> Graph<'a, M, C> {
     fn take_member_wait(&mut self, record: &RecordRef) -> Option<MemberWait<'a>> {
         let state = self.pending.member_mut(record)?;
         let wait = state.wait.take();
-        if state.suspend_mask.is_none() {
+        if state.suspend_mask.is_none() && state.signal_push.is_none() {
             self.pending.remove_member(record);
         }
         wait
@@ -1414,7 +1457,7 @@ impl<'a, M: Clone, C: ProcessContext> Graph<'a, M, C> {
     ) -> Option<carrick_signal_core::policy::SigBlockMask> {
         let state = self.pending.member_mut(record)?;
         let mask = state.suspend_mask.take();
-        if state.wait.is_none() {
+        if state.wait.is_none() && state.signal_push.is_none() {
             self.pending.remove_member(record);
         }
         mask
@@ -2118,7 +2161,11 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         let Ok(row) = graph.owner.task(member.process) else {
             return true;
         };
-        if graph.has_suspend_mask(&record)
+        if graph
+            .pending
+            .member(&record)
+            .is_some_and(|state| state.signal_push.is_some())
+            || graph.has_suspend_mask(&record)
             || row
                 .native()
                 .resources()
@@ -3681,6 +3728,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             slot,
             owner_continuation,
             signal_work_deferred: false,
+            signal_copy_refusal: None,
             copyout_ready: None,
             adapter_ready: None,
             service_phase: NativeServicePhase::Unspecified,
@@ -3727,6 +3775,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             slot: Some(member_control),
             owner_continuation,
             signal_work_deferred: false,
+            signal_copy_refusal: None,
             copyout_ready: None,
             adapter_ready: None,
             service_phase: NativeServicePhase::Unspecified,
@@ -4035,6 +4084,7 @@ pub struct NativeProcessEntry<
     // A shared return checkpoint observed real work before a concurrent host
     // could drain its doorbell. Keep that refusal with this admitted owner.
     signal_work_deferred: bool,
+    signal_copy_refusal: Option<NativeProcessError>,
     copyout_ready: Option<Box<service::OwnedCopyout>>,
     adapter_ready: Option<Box<service::AdapterPreparation>>,
     service_phase: NativeServicePhase,
@@ -4113,7 +4163,11 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         let Ok(row) = graph.owner.task(self.key) else {
             return true;
         };
-        if graph.has_suspend_mask(&self.record)
+        if graph
+            .pending
+            .member(&self.record)
+            .is_some_and(|state| state.signal_push.is_some())
+            || graph.has_suspend_mask(&self.record)
             || row
                 .native()
                 .resources()
@@ -4770,7 +4824,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         else {
             return CopyOutcome::Fault;
         };
-        match self.service.copy_signal_bytes(&mm, address, bytes) {
+        let result = self.service.copy_signal_bytes(&mm, address, bytes);
+        self.signal_copy_refusal = result.err();
+        match result {
             Ok(()) => CopyOutcome::Done,
             Err(
                 NativeProcessError::OwnerWait(_)
@@ -4792,6 +4848,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 | NativeProcessError::NoChild,
             ) => CopyOutcome::Fault,
         }
+    }
+    pub(crate) fn signal_copy_needs_backing(&self) -> bool {
+        matches!(
+            self.signal_copy_refusal,
+            Some(NativeProcessError::Unsupported)
+        )
     }
     #[inline(never)]
     fn suspend_adapter_operation(
@@ -5474,6 +5536,71 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
         }
     }
+    pub(crate) fn peek_suspend_mask(&self) -> Option<carrick_signal_core::policy::SigBlockMask> {
+        self.runtime
+            .graph
+            .lock()
+            .pending
+            .member(&self.record)
+            .and_then(|state| state.suspend_mask)
+            .or_else(|| {
+                self.control.forwarded_wait_mask().map(|saved| {
+                    carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                        carrick_signal_core::SignalSet::from_bits(saved.0),
+                    )
+                })
+            })
+    }
+
+    pub(crate) fn take_signal_push(&mut self) -> Option<Box<SignalPush>> {
+        let mut graph = self.runtime.graph.lock();
+        let state = graph.pending.member_mut(&self.record)?;
+        let selected = state.signal_push.take();
+        if state.wait.is_none() && state.suspend_mask.is_none() {
+            graph.pending.remove_member(&self.record);
+        }
+        selected
+    }
+
+    pub(crate) fn retain_signal_push(&mut self, selected: Box<SignalPush>) {
+        let mut graph = self.runtime.graph.lock();
+        let previous = graph
+            .member_wait_state(self.record)
+            .signal_push
+            .replace(selected);
+        if previous.is_some() {
+            crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding);
+        }
+    }
+
+    pub(crate) fn fail_signal_push(&mut self) -> Result<(), NativeProcessError> {
+        let mut graph = self.runtime.graph.lock();
+        let selected = graph
+            .pending
+            .member_mut(&self.record)
+            .and_then(|state| state.signal_push.as_mut())
+            .ok_or(NativeProcessError::Quarantined)?;
+        selected.failed = true;
+        Ok(())
+    }
+
+    #[inline(never)]
+    pub(crate) fn peek_interrupted_child_wait(&self) -> Option<Box<C>> {
+        let thread = NativeThreadIdentity::from_binding(self.binding).ok()?;
+        let graph = self.runtime.graph.lock();
+        let resources = graph.owner.task(self.key).ok()?.native().resources();
+        let interrupted = resources.interrupted_child_waits.get(&self.record)?;
+        (interrupted.thread == thread
+            && signal_record_exists(self.source.zone, self.record)
+            && resources.members.iter().any(|member| {
+                member.thread == thread
+                    && member.record == self.record
+                    && core::ptr::eq(member.control.control(), self.control)
+            }))
+        .then(|| interrupted.words.as_ref().map(|words| Box::new(**words)))
+        .flatten()
+    }
+
     /// Original context of an interrupted, unconsumed child-wait query.
     /// Only this owned operation may be restarted after a caught handler.
     pub fn take_interrupted_child_wait(&mut self) -> Option<Box<C>> {
@@ -6647,6 +6774,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 Ok(published) => published,
                 Err(_) => return Err(NativeProcessError::Quarantined),
             };
+            for member in &published.retiring.native.resources().members {
+                if let Some(state) = graph.pending.member_mut(&member.record) {
+                    state.signal_push.take();
+                }
+            }
             graph.pending.remove_exit(&self.key);
             (page, file_table, resources, published)
         };
@@ -8208,6 +8340,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .resources_mut()
                     .interrupted_child_waits
                     .remove(record);
+            }
+        }
+        for record in &retired {
+            if let Some(state) = graph.pending.member_mut(record) {
+                state.signal_push.take();
             }
         }
         drop(graph);

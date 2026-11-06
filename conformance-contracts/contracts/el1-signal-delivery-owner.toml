@@ -24,6 +24,7 @@ structural_budgets = []
 
 [bindings]
 vm_free = [
+  "carrick-el1-linux::aarch64_process_tests::native_signal_push_tests::*",
   "carrick-el1-linux::aarch64_process_tests::arm_signal_frame_not_yet_in_ring_keeps_two_thread_wait_restart",
   "carrick-el1-linux::aarch64_process_tests::native_signal_resume_tests::{arm_retained_sigprocmask_copyout_delivers_before_svc_user_return,arm_parked_signal_copyout_rejects_stale_owner_after_peer_selection,arm_parked_signal_input_rejects_stale_owner_after_peer_selection}",
   "carrick-el1-linux::aarch64_process_tests::native_signal_work_return_tests::*",
@@ -40,7 +41,7 @@ vm_free = [
   "carrick-el1-linux::native_process_runtime::host_test_support::{tgkill_reaches_a_futex_parked_host_issued_sibling,terminal_park_tests::retiring_host_issued_sibling_refuses_tgkill_with_esrch}",
   "carrick-el1-linux::native_process_runtime::tests::{delayed_child_exit_notifies_adopter_when_selected_parent_exits_on_peer,delayed_child_exit_uses_adopter_interest_when_old_parent_ignored_default,delayed_child_exit_does_not_inherit_departed_parents_signal_interest}",
   "carrick-el1-linux::native_process_signals::tests::{thread_signal_projection_work_is_bounded_by_lookup_depth,process_projection_updates_cover_late_members_and_rehomes,native_pending_projection_keeps_exact_member_and_rehomed_queue}",
-  "carrick-el1-linux::signal_delivery::altstack_tests::{caught_onstack_handler_disarms_only_after_switching_stacks,production_deliver_signal_on_syscall_return_preserves_interrupted_sp_and_masks_daif,production_signal_frame_refusal_keeps_main_fault_branch}",
+  "carrick-el1-linux::signal_delivery::altstack_tests::{caught_onstack_handler_disarms_only_after_switching_stacks,production_deliver_signal_on_syscall_return_preserves_interrupted_sp_and_masks_daif,production_signal_frame_fault_keeps_terminal_branch}",
   "carrick-hal::aarch64_arch::tests::arm_public_signal_frame_carrier_validates_before_publication",
   "carrick-hal::timer_delivery::tests::fallback_posix_timer_wake_can_claim_and_consume_full_payload",
   "carrick-kernel::dispatch::signal::tests::{m5_two_process_exact_thread_routing_isolated_at_four_populations,m5_peer_tgkill_targets_root_group,m5_peer_tkill_targets_root_group,m5_peer_rt_tgsigqueueinfo_targets_root_group,serial_host::m5_peer_kill_targets_root_group,serial_host::m5_peer_rt_sigqueueinfo_targets_root_group,serial_host::m5_peer_rt_tgsigqueueinfo_rejects_forged_code_targets_root_group,serial_host::m5_peer_rt_tgsigqueueinfo_rejects_forged_code_targets_root_group}",

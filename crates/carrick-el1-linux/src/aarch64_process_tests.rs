@@ -14,6 +14,8 @@ mod native_ipc_wake_tests;
 #[cfg(test)]
 mod native_retirement_tests;
 #[cfg(test)]
+mod native_signal_push_tests;
+#[cfg(test)]
 mod native_signal_resume_tests;
 #[cfg(test)]
 mod native_signal_work_return_tests;
@@ -8740,6 +8742,32 @@ impl crate::signal_delivery::SignalMachine<Aarch64ParkedContext> for ArmWaitSign
         } else {
             false
         }
+    }
+
+    fn restart_from_argument(&self, frame: &mut carrick_el1_abi::TrapFrame, argument: u64) -> bool {
+        let Some(pc) = frame.elr.checked_sub(4) else {
+            return false;
+        };
+        frame.elr = pc;
+        frame.x[0] = argument;
+        true
+    }
+
+    fn save_return(
+        &self,
+        frame: &carrick_el1_abi::TrapFrame,
+        _fpstate: &[u8],
+        context: &mut Aarch64ParkedContext,
+    ) -> bool {
+        context.native.x = frame.x;
+        context.native.pc = frame.elr;
+        context.native.pstate = frame.spsr;
+        context.native.sp_el0 = self.user_sp.raw();
+        true
+    }
+
+    fn forwarded_restart_argument(&self, frame: &carrick_el1_abi::TrapFrame) -> Option<u64> {
+        Some(frame.far)
     }
 
     fn restart_forwarded(&self, frame: &mut carrick_el1_abi::TrapFrame) -> Option<bool> {

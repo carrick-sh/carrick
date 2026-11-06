@@ -1,5 +1,7 @@
 use super::*;
-use crate::native_process_runtime::host_test_support::{Physical, take_signal_copies};
+use crate::native_process_runtime::host_test_support::{
+    Physical, take_signal_frames as take_signal_copies,
+};
 use carrick_el1_abi::Lifecycle;
 use carrick_personality_linux::signal::{
     ProcessSignals, SignalInfo, SignalRequest, SignalThreadSelector,

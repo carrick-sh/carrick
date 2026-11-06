@@ -5,6 +5,7 @@ use carrick_guest_arch::{ContextGeneration, FrameGpa};
 use carrick_sched_core::ParkedContextWords;
 
 std::thread_local! {
+    pub(crate) static SIGNAL_PUSH_FAULT: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
     static SIGNAL_COPY_ATTEMPTS: std::cell::RefCell<Vec<(UserVa, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
     static SIGNAL_COPIES: std::cell::RefCell<Vec<(UserVa, Vec<u8>)>> = const {
         std::cell::RefCell::new(Vec::new())
@@ -73,6 +74,23 @@ pub fn take_signal_copy_attempts() -> Vec<(UserVa, usize)> {
 
 pub fn take_signal_copies() -> Vec<(UserVa, Vec<u8>)> {
     SIGNAL_COPIES.with(|copies| core::mem::take(&mut *copies.borrow_mut()))
+}
+
+/// Reassemble adjacent page pieces for signal codec assertions. Raw attempt
+/// and copy observations remain separate for structural/cursor assertions.
+pub fn take_signal_frames() -> Vec<(UserVa, Vec<u8>)> {
+    let pieces = SIGNAL_COPIES.with(|copies| core::mem::take(&mut *copies.borrow_mut()));
+    let mut frames: Vec<(UserVa, Vec<u8>)> = Vec::new();
+    for (address, bytes) in pieces {
+        if let Some((base, previous)) = frames.last_mut()
+            && base.raw().checked_add(previous.len() as u64) == Some(address.raw())
+        {
+            previous.extend_from_slice(&bytes);
+        } else {
+            frames.push((address, bytes));
+        }
+    }
+    frames
 }
 
 #[cfg(test)]
@@ -426,6 +444,19 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
             hook(request.address);
         }
         Ok(())
+    }
+    fn copyout_fault(
+        &self,
+        address: UserVa,
+    ) -> Option<(carrick_guest_arch::FaultInfo, NonZeroU64)> {
+        SIGNAL_PUSH_FAULT.with(|flag| flag.get()).then_some((
+            carrick_guest_arch::FaultInfo {
+                address,
+                access: carrick_guest_arch::Access::Write,
+                present: false,
+            },
+            NonZeroU64::MIN,
+        ))
     }
     fn retire_adapter_operation(
         &mut self,
@@ -907,6 +938,29 @@ impl crate::signal_delivery::SignalMachine<ParkedContextWords> for HostArmSignal
     fn restart(&self, _: &mut carrick_el1_abi::TrapFrame, _: &ParkedContextWords) -> bool {
         false
     }
+    fn restart_from_argument(&self, frame: &mut carrick_el1_abi::TrapFrame, argument: u64) -> bool {
+        let Some(pc) = frame.elr.checked_sub(4) else {
+            return false;
+        };
+        frame.elr = pc;
+        frame.x[0] = argument;
+        true
+    }
+
+    fn save_return(
+        &self,
+        _frame: &carrick_el1_abi::TrapFrame,
+        _fpstate: &[u8],
+        _context: &mut ParkedContextWords,
+    ) -> bool {
+        // This codec-only fixture cannot encode an ARM context into x86 words.
+        false
+    }
+
+    fn forwarded_restart_argument(&self, frame: &carrick_el1_abi::TrapFrame) -> Option<u64> {
+        Some(frame.far)
+    }
+
     fn restart_forwarded(&self, frame: &mut carrick_el1_abi::TrapFrame) -> Option<bool> {
         crate::arm_signal::restart_forwarded_frame(frame)
     }

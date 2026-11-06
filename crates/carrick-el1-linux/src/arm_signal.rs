@@ -41,6 +41,32 @@ impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedCont
         }
     }
 
+    fn restart_from_argument(&self, frame: &mut carrick_el1_abi::TrapFrame, argument: u64) -> bool {
+        let Some(pc) = frame.elr.checked_sub(4) else {
+            return false;
+        };
+        frame.elr = pc;
+        frame.x[0] = argument;
+        true
+    }
+
+    fn save_return(
+        &self,
+        frame: &carrick_el1_abi::TrapFrame,
+        _fpstate: &[u8],
+        context: &mut carrick_sched_core::Aarch64ParkedContext,
+    ) -> bool {
+        context.native.x = frame.x;
+        context.native.pc = frame.elr;
+        context.native.pstate = frame.spsr;
+        context.native.sp_el0 = self.user_sp.raw();
+        true
+    }
+
+    fn forwarded_restart_argument(&self, frame: &carrick_el1_abi::TrapFrame) -> Option<u64> {
+        Some(frame.far)
+    }
+
     fn restart_forwarded(&self, frame: &mut TrapFrame) -> Option<bool> {
         restart_forwarded_frame(frame)
     }

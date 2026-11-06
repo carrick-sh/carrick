@@ -8,6 +8,7 @@ use carrick_el1_abi::KernelFaultVenues;
 /// Physical crossings and ISA byte access for the shared native-write protocol.
 struct NativeWriteVenue<'a> {
     task: &'a CurrentTask,
+    allow_backing: bool,
     address: UserVa,
     slot: SlotId,
     pool: &'a carrick_el1_abi::CowGrantPool,
@@ -56,6 +57,24 @@ impl<'a> UserWriteVenue<ParkedContextWords> for NativeWriteVenue<'a> {
         );
         Ok(())
     }
+    fn supply_backing(
+        &mut self,
+        window: carrick_el1_abi::PortalGrantWindow,
+    ) -> Option<Result<(), Self::Error>> {
+        if !self.allow_backing {
+            return None;
+        }
+        let Some(slot) = self.slots.grant(usize::from(self.slot.raw())) else {
+            return Some(Err(NativeProcessError::Stale));
+        };
+        Some(
+            if slot.publish_fault_selection(window.operation.sequence.get(), window) {
+                Err(NativeProcessError::Unsupported)
+            } else {
+                Err(NativeProcessError::Busy)
+            },
+        )
+    }
     fn copy(
         &mut self,
         fence: &carrick_core::mm::transfer::ValidatedChunk<'_, ParkedContextWords>,
@@ -84,6 +103,27 @@ impl Service {
         address: UserVa,
         bytes: &[u8],
     ) -> Result<(), NativeProcessError> {
+        self.access_user_bytes(
+            mm,
+            address,
+            carrick_guest_arch::GuestLen::new(bytes.len() as u64),
+            Some(bytes),
+        )
+    }
+    pub(super) fn prepare_user_write(
+        &mut self,
+        mm: &Mm,
+        request: carrick_core::mm::transaction::CopyoutRequest,
+    ) -> Result<(), NativeProcessError> {
+        self.access_user_bytes(mm, request.address, request.len, None)
+    }
+    fn access_user_bytes(
+        &mut self,
+        mm: &Mm,
+        address: UserVa,
+        len: carrick_guest_arch::GuestLen,
+        bytes: Option<&[u8]>,
+    ) -> Result<(), NativeProcessError> {
         if carrick_el1::isa::x86::hardware_live_root().map_err(error)? != mm.root {
             return Err(NativeProcessError::Stale);
         }
@@ -111,6 +151,7 @@ impl Service {
             unsafe { carrick_el1::fault::X86PreparedResolver::under_editor(mm.mm.raw(), &words) };
         let mut venue = NativeWriteVenue {
             task: self.task,
+            allow_backing: bytes.is_none(),
             address,
             slot: self.slot,
             pool,
@@ -123,8 +164,8 @@ impl Service {
                 completion: None,
             },
         };
-        owner
-            .write_user_bytes(
+        let result = if let Some(bytes) = bytes {
+            owner.write_user_bytes(
                 UserWriteRequest {
                     handle,
                     address,
@@ -134,16 +175,28 @@ impl Service {
                 &words,
                 &mut venue,
             )
-            .map_err(|failure| match failure {
-                UserWriteError::Owner(carrick_core::mm::transaction::MmError::Wait(wait)) => {
-                    NativeProcessError::OwnerWait(wait)
-                }
-                UserWriteError::Owner(owner) => error(owner),
-                UserWriteError::Mechanics(error) => error,
-                UserWriteError::Busy => NativeProcessError::Busy,
-                UserWriteError::InvalidSource => NativeProcessError::Invalid,
-                UserWriteError::Fault => NativeProcessError::Fault,
-                UserWriteError::UnsupportedSupply => NativeProcessError::Unsupported,
-            })
+        } else {
+            owner.prepare_user_write(
+                carrick_core::mm::transaction::UserWriteTarget {
+                    handle,
+                    address,
+                    len,
+                    slot: self.slot,
+                },
+                &words,
+                &mut venue,
+            )
+        };
+        result.map_err(|failure| match failure {
+            UserWriteError::Owner(carrick_core::mm::transaction::MmError::Wait(wait)) => {
+                NativeProcessError::OwnerWait(wait)
+            }
+            UserWriteError::Owner(owner) => error(owner),
+            UserWriteError::Mechanics(error) => error,
+            UserWriteError::Busy => NativeProcessError::Busy,
+            UserWriteError::InvalidSource => NativeProcessError::Invalid,
+            UserWriteError::Fault => NativeProcessError::Fault,
+            UserWriteError::UnsupportedSupply => NativeProcessError::Unsupported,
+        })
     }
 }
