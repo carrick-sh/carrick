@@ -261,7 +261,7 @@ impl<S: PreparedService, P: TransferPin> Drop for PreparedWrite<'_, S, P> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use std::{cell::RefCell, rc::Rc};
+    use std::{cell::Cell, cell::RefCell, rc::Rc};
     #[derive(Default)]
     struct State {
         events: RefCell<Vec<(&'static str, u64)>>,
@@ -336,6 +336,7 @@ mod tests {
         state: Rc<State>,
         identity: PortalRetainedData,
         sequence: u64,
+        word: Option<Rc<Cell<u32>>>,
     }
     impl TransferPin for Pin {
         fn identity(&self) -> PortalRetainedData {
@@ -355,6 +356,23 @@ mod tests {
             assert_eq!(request.range.len(), bytes.len() as u64);
             self.state.copied.borrow_mut().extend_from_slice(bytes);
             true
+        }
+        fn atomic_compare_exchange_u32(
+            &mut self,
+            authorization: carrick_el1_abi::PortalCopyRequest<'_>,
+            expected: u32,
+            desired: u32,
+        ) -> Option<u32> {
+            let request = authorization.request();
+            assert_eq!(request.operation.sequence.get(), self.sequence);
+            assert_eq!(request.retained, self.identity);
+            assert_eq!(request.range.len(), 4);
+            let word = self.word.as_ref()?;
+            let observed = word.get();
+            if observed == expected {
+                word.set(desired);
+            }
+            Some(observed)
         }
     }
     fn pages(state: &Rc<State>) -> Vec<RetainedWritePage<Pin>> {
@@ -391,12 +409,40 @@ mod tests {
                         state: state.clone(),
                         identity,
                         sequence,
+                        word: None,
                     },
                     output: 0,
                     offset: index as usize * 4096,
                 }
             })
             .collect()
+    }
+    #[test]
+    fn owner_prepared_atomic_exchange_executes_inside_exact_authorization() {
+        let slots = MmPortalSlots::new();
+        let state = Rc::new(State::default());
+        let word = Rc::new(Cell::new(7));
+        let mut retained = pages(&state).remove(0);
+        retained.request.range = PortalByteRange::new(0x40000, 4).unwrap();
+        retained.pin.word = Some(word.clone());
+        let prepared = PreparedWrite::prepare(
+            Service {
+                slots: &slots,
+                state: state.clone(),
+                fail: None,
+            },
+            &slots,
+            vec![GuestWriteRange::new(carrick_guest_mem::GuestVa::new(0x40000), 4).unwrap()],
+            vec![retained],
+        )
+        .unwrap();
+
+        assert_eq!(Box::new(prepared).atomic_compare_exchange_u32(7, 11), 7);
+        assert_eq!(word.get(), 11);
+        assert_eq!(
+            *state.events.borrow(),
+            [("prepare", 1), ("commit", 1), ("loan returned", 0)]
+        );
     }
     #[test]
     fn aggregate_prepares_every_page_before_consumption_and_commits_short_prefix() {
