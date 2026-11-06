@@ -47,7 +47,7 @@ separate uninstrumented release run compares the pinned futex distribution with
 same-image Docker. The existing tests remain until the contract has demonstrated
 equivalent or stronger failure detection.
 
-## Futex word copy prerequisite (#1703)
+## Futex word copy migration (#1703)
 
 The typed `carrick_core::personality::UserCopy` byte-transfer interface from
 #1691 does not guarantee single-copy atomic word access. Its ARM adapter uses
@@ -56,8 +56,11 @@ Those transfers cannot replace `HardwareUserWord::read_u32`, which uses one
 guarded 32-bit load: another live thread may change the futex word concurrently.
 Four independently loaded bytes can form a value that neither thread stored.
 
-Before migrating futex words, the shared copy contract needs explicit aligned
-32-bit atomic access returning the existing `CopyOutcome`. ARM and x86 must
+The director's carrick-87 decision authorizes extending that same `UserCopy`
+interface with an aligned 32-bit atomic load and compare-exchange, both
+returning the existing `CopyOutcome`. This resolves the interface-design
+blocker recorded by the initial WIP; it does not require another outcome type
+or another approval before implementation. ARM and x86 must
 retain their ISA word accesses; no second refusal type or byte-copy wrapper
 can substitute for that guarantee. A `NotYet` result must leave the bucket
 lock before entering the existing owner-memory wait, then repeat the value
@@ -72,6 +75,6 @@ requeue and PI word accesses also use host dispatch rather than the private
 in-ring scheduler; migrating only that scheduler does not cover those calls
 or retire the host futex copy-debt entry.
 
-This prerequisite analysis supplies no red/green execution witness. The
+This analysis supplies no red/green execution witness. The
 two-live-thread, unbacked-word witness and signed acceptance remain required;
 the futex word migration is not implemented by this note.
