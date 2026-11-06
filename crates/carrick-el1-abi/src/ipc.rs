@@ -1598,6 +1598,16 @@ impl<'a> IpcRegion<'a> {
         retired: &mut Option<IpcPipeStorage>,
         wait: &W,
     ) -> Result<IpcObjectHandle, IpcError> {
+        self.create_pipe_prepared(capacity, retired, None, wait)
+    }
+
+    fn create_pipe_prepared<W: LockWait>(
+        &self,
+        capacity: usize,
+        retired: &mut Option<IpcPipeStorage>,
+        mut supplied: Option<&mut IpcPipeStorage>,
+        wait: &W,
+    ) -> Result<IpcObjectHandle, IpcError> {
         if retired.is_some() {
             return Err(IpcError::BadStorage);
         }
@@ -1606,11 +1616,43 @@ impl<'a> IpcRegion<'a> {
         let (index, record) = self.pop_object()?;
         let mut guard = self.lock_fresh(index, record, wait)?;
         let existing = guard.storage();
-        let initialized = if existing.fits(capacity) {
-            guard.pipe_parts().and_then(|(state, bytes, slots)| {
-                Pipe::init(&mut state.pipe, bytes, slots, IPC_PIPE_PAGE_SIZE, capacity)
-                    .map(|_| ())
-                    .map_err(IpcError::Object)
+        let replacement = if existing.fits(capacity) {
+            existing
+        } else if let Some(storage) = supplied.as_deref() {
+            // Validate before touching the record or the caller's ownership.
+            // The extent is independently owned, just as for
+            // provide_pipe_storage; never overwrite retained object storage.
+            let footprint = storage
+                .pages
+                .checked_mul(core::mem::size_of::<Page>() as u64)
+                .and_then(|n| storage.ring_bytes.checked_add(n));
+            let valid = footprint
+                .and_then(|n| storage.offset.checked_add(n).map(|end| (n, end)))
+                .zip(existing.offset.checked_add(existing.footprint()))
+                .is_some_and(|((n, end), old_end)| {
+                    storage.fits(capacity)
+                        && storage.ring_bytes.is_multiple_of(IPC_PIPE_PAGE_SIZE as u64)
+                        && self.ring_range(storage.offset, n).is_some()
+                        && (existing == IpcPipeStorage::default()
+                            || storage.offset >= old_end
+                            || existing.offset >= end)
+                });
+            if !valid {
+                drop(guard);
+                push(&self.dir.free_objects, index as usize, &record.next_free);
+                return Err(IpcError::BadStorage);
+            }
+            *storage
+        } else {
+            IpcPipeStorage::default()
+        };
+        let initialized = if replacement.fits(capacity) {
+            guard.set_storage(replacement).and_then(|()| {
+                guard.pipe_parts().and_then(|(state, bytes, slots)| {
+                    Pipe::init(&mut state.pipe, bytes, slots, IPC_PIPE_PAGE_SIZE, capacity)
+                        .map(|_| ())
+                        .map_err(IpcError::Object)
+                })
             })
         } else {
             PipeRecord::unbacked(IPC_PIPE_PAGE_SIZE, capacity)
@@ -1629,21 +1671,32 @@ impl<'a> IpcRegion<'a> {
             push(&self.dir.free_objects, index as usize, &record.next_free);
             return Err(e);
         }
-        if guard.storage() != existing {
-            *retired = Some(existing);
+        if replacement != existing {
+            if let Some(storage) = supplied.as_deref_mut() {
+                *storage = existing;
+            } else {
+                *retired = Some(existing);
+            }
         }
         Ok(guard.publish_kind(KIND_PIPE))
     }
 
-    /// Create a pipe with storage provisioned by its execution owner.
+    /// Create a backed pipe using an independently owned, provisioned extent.
+    /// Either venue may call this: there is no allocation or first-write host
+    /// provisioning. The caller must exclusively own `storage`, disjoint from
+    /// every live object, as for `IpcObjectGuard::provide_pipe_storage`.
+    ///
+    /// A fitting retained extent is reused and `storage` stays with the caller.
+    /// Otherwise the supplied extent is installed before publication, and
+    /// `storage` receives the displaced extent (empty for a fresh record), for
+    /// its owner to reclaim. On failure the supplied extent stays unchanged.
     pub fn create_backed_pipe<W: LockWait>(
         &self,
         capacity: usize,
         storage: &mut IpcPipeStorage,
         wait: &W,
     ) -> Result<IpcObjectHandle, IpcError> {
-        let _ = storage;
-        self.create_pipe(capacity, &mut None, wait)
+        self.create_pipe_prepared(capacity, &mut None, Some(storage), wait)
     }
 
     /// Create an eventfd counter object.

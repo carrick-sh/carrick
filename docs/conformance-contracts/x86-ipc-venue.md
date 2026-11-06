@@ -1,5 +1,21 @@
 # x86 IPC venue (#1756): red witness and remaining implementation
 
+## Backed object construction prerequisite
+
+`IpcRegion::create_backed_pipe` now shares object creation with the host
+constructor and installs a provisioned extent before publishing the object.
+It reuses fitting retained storage without consuming the caller's extent,
+or returns displaced storage to that caller. Invalid, overflowing or
+overlapping replacement storage leaves both ownership and the free record
+intact. The production-entry VM-free witness was red because the original
+constructor left a fresh pipe unbacked. It now transfers bytes immediately
+without first-write host provisioning, then observes an empty live pipe.
+
+This is object construction only. The execution owner must still provision
+storage, install both descriptions transactionally, and roll back a failed
+descriptor-pair copyout. The x86 IPC window, namespace and execution adapter
+remain unwired; no real-KVM pipe-service acceptance is claimed.
+
 ## Continuation status
 
 The earlier prerequisite commits have been preserved and rebased onto the
