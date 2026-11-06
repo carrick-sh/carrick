@@ -2042,14 +2042,21 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         prepared: PreparedClose,
     ) -> Result<Option<Description>, (Error, PreparedClose)> {
         let result = (|| {
-            let (_guard, t) = self.lock(prepared.table)?;
             self.check_pin(&prepared.pin)?;
-            if !t.storage.reserved(prepared.fd.0 as usize) {
-                return Err(Error::InvalidArgument);
+            match self.lock(prepared.table) {
+                Ok((_guard, t)) => {
+                    if !t.storage.reserved(prepared.fd.0 as usize) {
+                        return Err(Error::InvalidArgument);
+                    }
+                    t.storage.unreserve(prepared.fd.0 as usize);
+                    self.drop_hold(prepared.pin.key.index, PIN)
+                }
+                // Revocation transfers slot and extent custody to the table
+                // retirement owner. Only the exact OFD pin remains ours; do
+                // not touch storage that may now belong to a successor.
+                Err(Error::StaleTable) => self.drop_hold(prepared.pin.key.index, PIN),
+                Err(error) => Err(error),
             }
-            t.storage.unreserve(prepared.fd.0 as usize);
-            // Checked above: pin settlement cannot be stale here.
-            self.drop_hold(prepared.pin.key.index, PIN)
         })();
         result.map_err(|error| (error, prepared))
     }

@@ -2921,3 +2921,36 @@ fn close_receipts_retain_each_original_range_member_after_reuse() {
         );
     }
 }
+
+#[test]
+fn cancelled_close_after_table_retirement_releases_original_and_preserves_reuse() {
+    for deferred in [false, true] {
+        let c = authority::<1, 2>();
+        let table = c.create_table(4, &mut storage(4)).unwrap();
+        let fd = c.open(table, Fd(0), description(131), false).unwrap();
+        let prepared = c.prepare_close(table, fd).unwrap();
+        let mut extent = if deferred {
+            c.retire_table(table, |_| false, |_| panic!("preparation retains backing"))
+                .unwrap();
+            let mut custody = c.take_retired_table().unwrap();
+            custody
+                .finish(|_| panic!("preparation retains backing"))
+                .unwrap()
+        } else {
+            c.destroy_table(table, |_| panic!("preparation retains backing"))
+                .unwrap()
+        };
+        let successor = c.create_table(4, &mut extent).unwrap();
+        assert_ne!(successor, table);
+        assert_eq!(c.open(successor, Fd(0), description(132), false), Ok(fd));
+        assert_eq!(
+            c.cancel_close(prepared).unwrap().unwrap().backing,
+            BackingToken(131)
+        );
+        assert_eq!(c.get(successor, fd).unwrap().backing, BackingToken(132));
+        assert_eq!(
+            c.close(successor, fd).unwrap().unwrap().backing,
+            BackingToken(132)
+        );
+    }
+}
