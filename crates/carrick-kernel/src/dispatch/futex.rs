@@ -68,7 +68,6 @@ impl<'a> PiFutexWake<'a> {
 }
 
 pub(crate) fn dispatch_futex_pi(
-    context: &crate::kernel::KernelContext,
     memory: &mut impl CurrentMmMemory,
     address: u64,
     command: u64,
@@ -92,9 +91,9 @@ pub(crate) fn dispatch_futex_pi(
                 return match compare_exchange_futex_word(memory, address, word, desired) {
                     Ok(observed) if observed == word => DispatchOutcome::Returned { value: 0 },
                     Ok(observed) => {
-                        dispatch_futex_pi(context, memory, address, command, observed, tid, wake)
+                        dispatch_futex_pi(memory, address, command, observed, tid, wake)
                     }
-                    Err(refusal) => refusal,
+                    Err(refusal) => *refusal,
                 };
             }
             if owner == tid {
@@ -114,11 +113,9 @@ pub(crate) fn dispatch_futex_pi(
             match compare_exchange_futex_word(memory, address, word, desired) {
                 Ok(observed) if observed == word => {}
                 Ok(observed) => {
-                    return dispatch_futex_pi(
-                        context, memory, address, command, observed, tid, wake,
-                    );
+                    return dispatch_futex_pi(memory, address, command, observed, tid, wake);
                 }
-                Err(refusal) => return refusal,
+                Err(refusal) => return *refusal,
             }
             if let Some(wake) = wake {
                 let woken = wake.table.wake(address, 1);
@@ -147,20 +144,21 @@ fn compare_exchange_futex_word(
     address: u64,
     expected: u32,
     desired: u32,
-) -> Result<u32, DispatchOutcome> {
+) -> Result<u32, Box<DispatchOutcome>> {
     let mut copy = HostFutexCopy::new(memory);
     let mut observed = 0;
     match copy.atomic_compare_exchange_u32(UserVa::new(address), expected, desired, &mut observed) {
         CopyOutcome::Done => Ok(observed),
-        CopyOutcome::NotYet(_) => Err(copy
-            .take_refusal()
-            .and_then(DispatchOutcome::from_owner_memory_error)
-            .unwrap_or(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            })),
-        CopyOutcome::Fault => Err(DispatchOutcome::Errno {
+        CopyOutcome::NotYet(_) => Err(Box::new(
+            copy.take_refusal()
+                .and_then(DispatchOutcome::from_owner_memory_error)
+                .unwrap_or(DispatchOutcome::Errno {
+                    errno: LINUX_EFAULT,
+                }),
+        )),
+        CopyOutcome::Fault => Err(Box::new(DispatchOutcome::Errno {
             errno: LINUX_EFAULT,
-        }),
+        })),
     }
 }
 
@@ -259,7 +257,6 @@ pub(crate) fn dispatch_threaded_futex(
             };
         };
         return dispatch_futex_pi(
-            context,
             memory,
             address,
             command,
@@ -427,7 +424,7 @@ pub(crate) fn dispatch_threaded_futex(
             } else {
                 let timespec = match read_futex_timespec(memory, timeout_address) {
                     Ok(t) => t,
-                    Err(outcome) => return outcome,
+                    Err(outcome) => return *outcome,
                 };
                 // FUTEX_WAIT uses a RELATIVE timeout; FUTEX_WAIT_BITSET uses an
                 // ABSOLUTE deadline (CLOCK_MONOTONIC, or CLOCK_REALTIME if
@@ -609,7 +606,7 @@ pub(crate) fn dispatch_zone_futex(
             } else {
                 let timespec = match read_futex_timespec(memory, timeout_address) {
                     Ok(t) => t,
-                    Err(outcome) => return outcome,
+                    Err(outcome) => return *outcome,
                 };
                 if raw_command == LINUX_FUTEX_WAIT_BITSET {
                     Some(relative_from_absolute_timespec(
@@ -711,7 +708,7 @@ pub(crate) fn dispatch_futex_waitv_args(
     } else {
         let timespec = match read_futex_timespec(memory, timeout_address) {
             Ok(timespec) => timespec,
-            Err(outcome) => return outcome,
+            Err(outcome) => return *outcome,
         };
         Some(relative_from_absolute_timespec(
             clock,
@@ -901,32 +898,39 @@ pub(crate) fn read_futex_word(
 fn read_futex_timespec(
     memory: &mut impl CurrentMmMemory,
     address: u64,
-) -> Result<LinuxTimespec, DispatchOutcome> {
+) -> Result<LinuxTimespec, Box<DispatchOutcome>> {
     let mut copy = HostFutexCopy::new(memory);
     let mut bytes = [0u8; core::mem::size_of::<LinuxTimespec>()];
     match copy.copy_in(&mut bytes, UserVa::new(address)) {
-        CopyOutcome::Done => Ok(LinuxTimespec {
-            tv_sec: i64::from_ne_bytes(bytes[..8].try_into().unwrap()),
-            tv_nsec: i64::from_ne_bytes(bytes[8..].try_into().unwrap()),
-        })
+        CopyOutcome::Done => {
+            let mut sec = [0; 8];
+            let mut nsec = [0; 8];
+            sec.copy_from_slice(&bytes[..8]);
+            nsec.copy_from_slice(&bytes[8..]);
+            Ok(LinuxTimespec {
+                tv_sec: i64::from_ne_bytes(sec),
+                tv_nsec: i64::from_ne_bytes(nsec),
+            })
+        }
         .and_then(|timespec| {
             if linux_timeout_timespec_is_valid(timespec) {
                 Ok(timespec)
             } else {
-                Err(DispatchOutcome::Errno {
+                Err(Box::new(DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
-                })
+                }))
             }
         }),
-        CopyOutcome::NotYet(_) => Err(copy
-            .take_refusal()
-            .and_then(DispatchOutcome::from_owner_memory_error)
-            .unwrap_or(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            })),
-        CopyOutcome::Fault => Err(DispatchOutcome::Errno {
+        CopyOutcome::NotYet(_) => Err(Box::new(
+            copy.take_refusal()
+                .and_then(DispatchOutcome::from_owner_memory_error)
+                .unwrap_or(DispatchOutcome::Errno {
+                    errno: LINUX_EFAULT,
+                }),
+        )),
+        CopyOutcome::Fault => Err(Box::new(DispatchOutcome::Errno {
             errno: LINUX_EFAULT,
-        }),
+        })),
     }
 }
 
