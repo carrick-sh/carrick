@@ -1605,7 +1605,7 @@ impl<'a> IpcRegion<'a> {
         &self,
         capacity: usize,
         retired: &mut Option<IpcPipeStorage>,
-        mut supplied: Option<&mut IpcPipeStorage>,
+        supplied: Option<&mut IpcPipeStorage>,
         wait: &W,
     ) -> Result<IpcObjectHandle, IpcError> {
         if retired.is_some() {
@@ -1672,7 +1672,7 @@ impl<'a> IpcRegion<'a> {
             return Err(e);
         }
         if replacement != existing {
-            if let Some(storage) = supplied.as_deref_mut() {
+            if let Some(storage) = supplied {
                 *storage = existing;
             } else {
                 *retired = Some(existing);
