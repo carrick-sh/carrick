@@ -537,7 +537,7 @@ impl NativeLane<'_> {
             // CPL0 installs only published spaces and has no host-installed
             // words, so an unpublished space is refused here, as the
             // install below would refuse it.
-            let authority = match self.zone.spaces.kept_authority(identity.mm) {
+            let authority = match self.zone.kept_space_authority(self.lane.slot, identity.mm) {
                 carrick_sched_core::KeptAuthority::Open(grant) => {
                     carrick_sched_core::KeptAuthority::Open(carrick_sched_core::KeptGrant {
                         root: grant.root & !0xfff,
@@ -598,6 +598,9 @@ impl NativeLane<'_> {
                     generation: ContextGeneration::new(generation),
                 })
                 .ok()?;
+            if let Some(published) = grant.cow_owed {
+                self.zone.cover_cow(self.lane.slot, identity.mm, published);
+            }
         }
         #[cfg(not(target_os = "none"))]
         let _ = (grant, keep);

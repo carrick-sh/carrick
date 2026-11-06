@@ -677,7 +677,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         };
         if let Some(published) = grant.cow_owed {
             self.cpu.invalidate_asid(grant.ttbr0);
-            zone.spaces.cover_cow(grant.index, published);
+            zone.cover_cow(slot, mm, published);
             zone.counters
                 .el1_cow_invalidations
                 .fetch_add(1, Ordering::Relaxed);
@@ -1203,7 +1203,7 @@ fn idle_exit_without_slot() -> ! {
 #[inline(never)]
 fn keeps_installed_root(zone: &ZoneTables, slot: SlotId, mm: u64, live: Option<u64>) -> bool {
     const TTBR_BADDR: u64 = 0x0000_ffff_ffff_fffe;
-    let published = zone.spaces.kept_authority(mm);
+    let published = zone.kept_space_authority(slot, mm);
     let authority = match published {
         carrick_sched_core::KeptAuthority::Open(grant) => {
             carrick_sched_core::KeptAuthority::Open(carrick_sched_core::KeptGrant {

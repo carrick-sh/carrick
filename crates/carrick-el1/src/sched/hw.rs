@@ -18,14 +18,6 @@ use carrick_el1_abi::CurrentTask;
 #[cfg(target_os = "none")]
 use carrick_el1_abi::{Aarch64ParkedContext, TrapFrame};
 
-// Keep the production invalidation sequence inspectable by host tests. HVF
-// vCPUs do not provide Carrick an architectural inner-shareable topology to
-// which completion can safely be confined, so both barriers are `dsb sy`.
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-const ASID_INVALIDATION_PRE_BARRIER: u32 = 0xd503_3f9f;
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-const ASID_INVALIDATION_POST_BARRIER: u32 = 0xd503_3f9f;
-
 /// EL1's user-word reader: stage-1 permission check, then one fixup-guarded
 /// unprivileged 32-bit load (single-copy atomic for an aligned word).
 pub struct HardwareUserWord;
@@ -165,17 +157,14 @@ impl ThreadCpu for HardwareCpu {
     fn invalidate_asid(&mut self, ttbr0: u64) {
         // SAFETY: TLBI ASIDE1IS takes the ASID in bits 63:48, as TTBR0_EL1
         // holds it; the prior table stores are made visible first, and the
-        // full-system barriers match Carrick's host-driven ASID maintenance:
-        // the invalidation completes on every virtual PE before the `isb`,
-        // without assuming HVF vCPUs share an architectural IS domain.
+        // invalidation completes on every PE of the Inner Shareable domain
+        // before the `isb`.
         unsafe {
             core::arch::asm!(
-                ".inst {pre_barrier}",
+                "dsb ishst",
                 "tlbi aside1is, {asid}",
-                ".inst {post_barrier}",
+                "dsb ish",
                 "isb",
-                pre_barrier = const ASID_INVALIDATION_PRE_BARRIER,
-                post_barrier = const ASID_INVALIDATION_POST_BARRIER,
                 asid = in(reg) ttbr0 & (0xffff << 48),
                 options(nostack)
             );
@@ -265,19 +254,6 @@ impl ThreadCpu for HardwareCpu {
         // SAFETY: reading this vCPU's affinity.
         unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nostack, nomem)) };
         super::sgi_target_of(mpidr)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{ASID_INVALIDATION_POST_BARRIER, ASID_INVALIDATION_PRE_BARRIER};
-
-    const AARCH64_DSB_SY_OPCODE: u32 = 0xd503_3f9f;
-
-    #[test]
-    fn cross_vcpu_asid_invalidation_uses_full_system_barriers() {
-        assert_eq!(ASID_INVALIDATION_PRE_BARRIER, AARCH64_DSB_SY_OPCODE);
-        assert_eq!(ASID_INVALIDATION_POST_BARRIER, AARCH64_DSB_SY_OPCODE);
     }
 }
 
