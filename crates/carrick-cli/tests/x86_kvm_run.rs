@@ -52,7 +52,21 @@ fn image_path_and_shebang_entrypoints_use_the_shared_resolver() {
     assert!(std::path::Path::new("/dev/kvm").exists(), "requires KVM");
     let dir = tempfile::tempdir().unwrap();
     let elf = dir.path().join("hello");
-    compile_assembly("x86_hello.S", &elf);
+    compile_assembly("x86_entrypoint_argv.S", &elf);
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(5))
+        .args([
+            "script-option",
+            "/opt/image/bin/docker-entrypoint.sh",
+            "argument",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        native.stdout,
+        b"script-option\n/opt/image/bin/docker-entrypoint.sh\nargument\n"
+    );
+    assert_eq!(native.status.code(), Some(7));
     let bytes = std::fs::read(&elf).unwrap();
     let mut layer = Vec::new();
     {
@@ -62,7 +76,7 @@ fn image_path_and_shebang_entrypoints_use_the_shared_resolver() {
             ("opt/image/bin/go", bytes.as_slice()),
             (
                 "opt/image/bin/docker-entrypoint.sh",
-                b"#!/opt/image/bin/python3\n".as_slice(),
+                b"#!/opt/image/bin/python3 script-option\n".as_slice(),
             ),
         ] {
             let mut header = tar::Header::new_gnu();
@@ -105,7 +119,12 @@ fn image_path_and_shebang_entrypoints_use_the_shared_resolver() {
             run.args(["--entrypoint", command]);
         }
         let output = run.arg("x86-path:latest").output().unwrap();
-        assert_eq!(output.stdout, b"hello\n", "{command:?}: {output:?}");
+        let expected: &[u8] = if command.is_none() {
+            b"script-option\n/opt/image/bin/docker-entrypoint.sh\nargument\n"
+        } else {
+            b"argument\n"
+        };
+        assert_eq!(output.stdout, expected, "{command:?}: {output:?}");
         assert_eq!(output.status.code(), Some(7), "{command:?}: {output:?}");
     }
 }

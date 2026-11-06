@@ -19,4 +19,4 @@ ecosystem = [
 [bindings.unresolved]
 vm_free = "Image config and backend routing require the production CLI binding; existing resolver unit tests cover the lower-level policy."
 embed_structural = "ARM/HVF signed execution is unavailable on this Linux KVM worker."
-docker = "Docker is unavailable on this worker; the static payload's native Linux output and exit status are covered by x86.carrier.cli-run."
+docker = "Docker is unavailable on this worker; the CLI binding checks exact argv output and exit status from a static payload."
