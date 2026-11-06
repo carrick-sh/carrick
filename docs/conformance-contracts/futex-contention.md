@@ -76,7 +76,10 @@ word once. The production dispatcher must suspend on the exact owner's Gate
 notification rather than forward. After release, a changed word must fail the
 original comparison with errno 11; a matching word enrolls once, one counted
 sibling wake completes it with zero, and a second wake returns zero. The
-fixture retains both live members throughout. Physical word availability and
+fixture retains both live members throughout. The word remains unavailable until
+the test explicitly supplies it after the owner refusal. Both sibling WAKE calls
+also start with backing unavailable and must perform zero word reads. Physical
+word availability and
 the physical preparation refusal are controlled; the process graph, owner
 notification, continuation and futex scheduler run their production code.
 `atomic_copy_tests` additionally checks output preservation, mismatch and
