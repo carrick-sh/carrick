@@ -17,8 +17,6 @@ permissions:
   actions: read
 
 env:
-  # CI checkouts live on internal storage; /Volumes/carrick is cold cache.
-  CARRICK_HOME: ${{ github.workspace }}/target/carrick-home
   CARGO_TERM_COLOR: always
   # Harden registry transport against intermittent network errors without retrying tests.
   CARGO_HTTP_MULTIPLEXING: "false"   # avoid HTTP/2 framing failures against the crates.io index
