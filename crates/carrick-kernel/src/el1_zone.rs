@@ -1407,6 +1407,7 @@ pub mod first_entry_test_control {
         ClosingFinished,
         ExecutorTaken(RecordRef),
         Adopted(RecordRef),
+        BeforePublish(crate::kernel::ThreadKey),
         BeforeRetire(RecordRef),
         Retired(RecordRef),
         NextFatal,
