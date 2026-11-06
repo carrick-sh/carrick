@@ -17,6 +17,15 @@ use carrick_mmu_core::aarch64::descriptor_txn::{
 use carrick_mmu_core::aarch64::{GuestLeafPublication, SubstrateGpa};
 use carrick_mmu_core::x86::owner_mmu::X86Mmu;
 
+fn decode_fork_custody(bytes: &[u8]) -> Option<carrick_el1_abi::PortalForkCustody> {
+    if bytes.len() != 32 {
+        return None;
+    }
+    carrick_el1_abi::PortalForkCustody::decode(std::array::from_fn(|i| {
+        u64::from_ne_bytes(std::array::from_fn(|byte| bytes[i * 8 + byte]))
+    }))
+}
+
 /// Every I/O port this CPL0 carrier decodes from one VM; each must be
 /// distinct. `carrick_x86::FP_STUB_DOORBELL_PORT` (0xc6) is deliberately
 /// absent: only the legacy no-FP-getter x86 engine in a bhyve VM decodes
@@ -1067,7 +1076,18 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         let inventory_published = std::cell::Cell::new(false);
         let root_installed = std::cell::Cell::new(false);
         let mut parent_residency = Vec::new();
-        let parent_sources = self.sources_mut(execution.context)?.clone();
+        // Frame-only forks (including the raw hardware bootstrap fixture)
+        // have no byte-source authority to authenticate or retain.
+        let parent_sources = if wire.chunks_exact(32).any(|row| {
+            matches!(
+                decode_fork_custody(row),
+                Some(PortalForkCustody::HostBacking { .. })
+            )
+        }) {
+            self.sources_mut(execution.context)?.clone()
+        } else {
+            Default::default()
+        };
         let refused = {
             let vm = std::cell::RefCell::new(&mut self._vm);
             self.fork_stock
@@ -1100,10 +1120,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                         let mut edges = Vec::new();
                         let mut spans = std::collections::BTreeSet::new();
                         for words in wire.chunks_exact(32) {
-                            let words = std::array::from_fn(|i| {
-                                u64::from_ne_bytes(std::array::from_fn(|byte| words[i * 8 + byte]))
-                            });
-                            let selected = PortalForkCustody::decode(words).ok_or_else(|| {
+                            let selected = decode_fork_custody(words).ok_or_else(|| {
                                 trap_error = Some(fail("physical fork custody encoding"));
                                 ForkStockRefusal::Invalid
                             })?;
@@ -2084,6 +2101,138 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
     }
 }
 
+impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ForwardVenue<'_, I, M> {
+    /// Only retained supervisor POD is admitted; a guest user pointer never
+    /// becomes authority to name a ring descriptor table.
+    pub fn capture_host_file(
+        &mut self,
+        address: carrick_guest_arch::KernelVa,
+        len: usize,
+    ) -> Result<Vec<u8>, TrapError> {
+        if len > carrick_core_abi::host_file::MAX_HOST_FILE_RECORD_BYTES as usize {
+            return Err(fail("host file record length"));
+        }
+        let mut bytes =
+            self.custody
+                .read_kernel_pod_bytes(self.execution.context, address, len, 1)?;
+        let view = carrick_core_abi::host_file::HostFileRequestView::parse(&mut bytes)
+            .map_err(|_| fail("host file record encoding"))?;
+        if view.header().op != carrick_core_abi::host_file::HostFileOp::MapPrivate {
+            return Err(fail("unsupported synchronous host file operation"));
+        }
+        let releases = carrick_core_abi::host_file::MapSourceReply::decode_releases(view.input())
+            .ok_or_else(|| fail("host file releases"))?;
+        let sources = self.custody.sources_mut(self.execution.context)?;
+        for release in releases {
+            sources.release(release.handle, release.generation);
+        }
+        if sources.len() >= 1024 {
+            carrick_core_abi::host_file::HostFileRequestView::parse(&mut bytes)
+                .and_then(|view| view.reply(-12, &[]))
+                .map_err(|_| fail("host file limit reply"))?;
+        }
+        Ok(bytes)
+    }
+
+    /// Retain the source before making its reply visible in the exact caller MM.
+    pub fn complete_host_file(
+        &mut self,
+        address: carrick_guest_arch::KernelVa,
+        bytes: &[u8],
+        source: Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>,
+    ) -> Result<(), TrapError> {
+        // Reauthenticate the entire retained output after the host service ran.
+        self.custody
+            .read_kernel_pod_bytes(self.execution.context, address, bytes.len(), 1)?;
+        if let Some(source) = source {
+            self.custody
+                .sources_mut(self.execution.context)?
+                .inherit(source);
+        }
+        let physical =
+            kernel_pod_physical(&self.custody.kernel_pod_storage, address, bytes.len(), 1)
+                .ok_or_else(|| fail("host file reply storage"))?;
+        self.custody
+            ._vm
+            .write(physical, bytes)
+            .map_err(|error| fail(error.to_string()))
+    }
+}
+
+struct FileSupplyRequest {
+    execution: GrantExecution,
+    window: PortalGrantWindow,
+    source: Arc<dyn carrick_hal::fork_stock::HostBackingRetention>,
+}
+pub(super) struct FileSupply {
+    execution: GrantExecution,
+    window: PortalGrantWindow,
+    bytes: Option<Vec<u8>>,
+}
+impl FileSupplyRequest {
+    fn read(self) -> Result<FileSupply, TrapError> {
+        let identity = self
+            .window
+            .host_backing
+            .ok_or_else(|| fail("file source absent"))?;
+        let request = carrick_hal::fork_stock::HostBackingRead::new(
+            identity,
+            self.window.range.len() as usize,
+        )
+        .ok_or_else(|| fail("file supply read length"))?;
+        let bytes = match self.source.read(request) {
+            Ok(bytes) => Some(bytes),
+            Err(
+                carrick_hal::fork_stock::HostBackingReadError::Inaccessible
+                | carrick_hal::fork_stock::HostBackingReadError::Unavailable,
+            ) => None,
+            Err(error) => return Err(fail(format!("file supply read: {error:?}"))),
+        };
+        if bytes
+            .as_ref()
+            .is_some_and(|bytes| bytes.len() > request.length())
+        {
+            return Err(fail("file source returned oversized prefix"));
+        }
+        Ok(FileSupply {
+            execution: self.execution,
+            window: self.window,
+            bytes,
+        })
+    }
+}
+
+impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ProductionCpuLease<I, M> {
+    pub(super) fn read_owner_file(
+        &mut self,
+        task: Option<carrick_guest_arch::TaskIdentity>,
+    ) -> Result<Option<FileSupply>, TrapError> {
+        let request = {
+            let mut custody = self
+                ._custody
+                .lock()
+                .map_err(|_| fail("physical custody poisoned"))?;
+            if let Some(task) = task {
+                let cpu = self
+                    .physical_slot()
+                    .ok_or_else(|| fail("file supply CPU slot"))?;
+                self.cpu.with_stopped_io(task, |io| {
+                    custody.file_supply_request(&StoppedCpuLease { cpu, io })
+                })?
+            } else {
+                self.cpu.with_idle_peer_io(|io| {
+                    custody.file_supply_request(&StoppedCpuLease {
+                        cpu: carrick_guest_arch::CpuId::new(1),
+                        io,
+                    })
+                })?
+            }
+        };
+        // No carrier custody, CPU-I/O borrow or MM editor survives file I/O.
+        request.map(|request| request.read()).transpose()
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod custody_tests {
@@ -2755,137 +2904,5 @@ mod custody_tests {
             existing
         );
         assert!(residency.publish(added).is_some());
-    }
-}
-
-impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ForwardVenue<'_, I, M> {
-    /// Only retained supervisor POD is admitted; a guest user pointer never
-    /// becomes authority to name a ring descriptor table.
-    pub fn capture_host_file(
-        &mut self,
-        address: carrick_guest_arch::KernelVa,
-        len: usize,
-    ) -> Result<Vec<u8>, TrapError> {
-        if len > carrick_core_abi::host_file::MAX_HOST_FILE_RECORD_BYTES as usize {
-            return Err(fail("host file record length"));
-        }
-        let mut bytes =
-            self.custody
-                .read_kernel_pod_bytes(self.execution.context, address, len, 1)?;
-        let view = carrick_core_abi::host_file::HostFileRequestView::parse(&mut bytes)
-            .map_err(|_| fail("host file record encoding"))?;
-        if view.header().op != carrick_core_abi::host_file::HostFileOp::MapPrivate {
-            return Err(fail("unsupported synchronous host file operation"));
-        }
-        let releases = carrick_core_abi::host_file::MapSourceReply::decode_releases(view.input())
-            .ok_or_else(|| fail("host file releases"))?;
-        let sources = self.custody.sources_mut(self.execution.context)?;
-        for release in releases {
-            sources.release(release.handle, release.generation);
-        }
-        if sources.len() >= 1024 {
-            carrick_core_abi::host_file::HostFileRequestView::parse(&mut bytes)
-                .and_then(|view| view.reply(-12, &[]))
-                .map_err(|_| fail("host file limit reply"))?;
-        }
-        Ok(bytes)
-    }
-
-    /// Retain the source before making its reply visible in the exact caller MM.
-    pub fn complete_host_file(
-        &mut self,
-        address: carrick_guest_arch::KernelVa,
-        bytes: &[u8],
-        source: Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>,
-    ) -> Result<(), TrapError> {
-        // Reauthenticate the entire retained output after the host service ran.
-        self.custody
-            .read_kernel_pod_bytes(self.execution.context, address, bytes.len(), 1)?;
-        if let Some(source) = source {
-            self.custody
-                .sources_mut(self.execution.context)?
-                .inherit(source);
-        }
-        let physical =
-            kernel_pod_physical(&self.custody.kernel_pod_storage, address, bytes.len(), 1)
-                .ok_or_else(|| fail("host file reply storage"))?;
-        self.custody
-            ._vm
-            .write(physical, bytes)
-            .map_err(|error| fail(error.to_string()))
-    }
-}
-
-struct FileSupplyRequest {
-    execution: GrantExecution,
-    window: PortalGrantWindow,
-    source: Arc<dyn carrick_hal::fork_stock::HostBackingRetention>,
-}
-pub(super) struct FileSupply {
-    execution: GrantExecution,
-    window: PortalGrantWindow,
-    bytes: Option<Vec<u8>>,
-}
-impl FileSupplyRequest {
-    fn read(self) -> Result<FileSupply, TrapError> {
-        let identity = self
-            .window
-            .host_backing
-            .ok_or_else(|| fail("file source absent"))?;
-        let request = carrick_hal::fork_stock::HostBackingRead::new(
-            identity,
-            self.window.range.len() as usize,
-        )
-        .ok_or_else(|| fail("file supply read length"))?;
-        let bytes = match self.source.read(request) {
-            Ok(bytes) => Some(bytes),
-            Err(
-                carrick_hal::fork_stock::HostBackingReadError::Inaccessible
-                | carrick_hal::fork_stock::HostBackingReadError::Unavailable,
-            ) => None,
-            Err(error) => return Err(fail(format!("file supply read: {error:?}"))),
-        };
-        if bytes
-            .as_ref()
-            .is_some_and(|bytes| bytes.len() > request.length())
-        {
-            return Err(fail("file source returned oversized prefix"));
-        }
-        Ok(FileSupply {
-            execution: self.execution,
-            window: self.window,
-            bytes,
-        })
-    }
-}
-
-impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ProductionCpuLease<I, M> {
-    pub(super) fn read_owner_file(
-        &mut self,
-        task: Option<carrick_guest_arch::TaskIdentity>,
-    ) -> Result<Option<FileSupply>, TrapError> {
-        let request = {
-            let mut custody = self
-                ._custody
-                .lock()
-                .map_err(|_| fail("physical custody poisoned"))?;
-            if let Some(task) = task {
-                let cpu = self
-                    .physical_slot()
-                    .ok_or_else(|| fail("file supply CPU slot"))?;
-                self.cpu.with_stopped_io(task, |io| {
-                    custody.file_supply_request(&StoppedCpuLease { cpu, io })
-                })?
-            } else {
-                self.cpu.with_idle_peer_io(|io| {
-                    custody.file_supply_request(&StoppedCpuLease {
-                        cpu: carrick_guest_arch::CpuId::new(1),
-                        io,
-                    })
-                })?
-            }
-        };
-        // No carrier custody, CPU-I/O borrow or MM editor survives file I/O.
-        request.map(FileSupplyRequest::read).transpose()
     }
 }
