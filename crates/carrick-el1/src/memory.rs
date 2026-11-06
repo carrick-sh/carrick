@@ -1503,6 +1503,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn admitted_mprotect_publishes_through_pause_then_next_edit_succeeds() {
+        struct PausingEditor<'a>(&'a AddressSpaces);
+        impl AnonymousPermissionEditor for PausingEditor<'_> {
+            fn protect_and_invalidate(
+                &mut self,
+                _: carrick_guest_arch::AddressSpaceRegister,
+                _: GuestPermissionEdit,
+            ) -> Result<(), GuestPermissionEditError> {
+                let index = self.0.find(17).unwrap();
+                assert!(self.0.active_editor(index).is_some());
+                self.0.raise(index);
+                assert!(self.0.grant(index, 17).is_none());
+                Ok(())
+            }
+        }
+        let (frame, tasks, spaces, _) = fixture(PROT_READ);
+        let index = spaces.find(17).unwrap();
+        let before = spaces.grant(index, 17).unwrap().cow_published;
+        assert_eq!(
+            try_serve_mprotect(
+                &frame,
+                &tasks,
+                SpaceAccess::source_free(&spaces),
+                &mut PausingEditor(&spaces)
+            ),
+            MprotectDisposition::Return(0),
+        );
+        assert!(spaces.active_editor(index).is_none());
+        spaces.lower(index);
+        assert_eq!(spaces.grant(index, 17).unwrap().cow_published, before + 1);
+        assert_eq!(
+            try_serve_mprotect(
+                &frame,
+                &tasks,
+                SpaceAccess::source_free(&spaces),
+                &mut RecordingEditor::default()
+            ),
+            MprotectDisposition::Return(0),
+        );
+        assert_eq!(spaces.grant(index, 17).unwrap().cow_published, before + 2);
+    }
+
     fn fixture(prot: u64) -> (TrapFrame, [CurrentTask; 1], AddressSpaces, u64) {
         let mm = 17;
         let ttbr0 = (9_u64 << 48) | 0x8800_0000_0000;

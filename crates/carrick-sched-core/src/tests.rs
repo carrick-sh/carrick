@@ -2275,6 +2275,79 @@ fn each_vcpu_covers_a_foreign_cow_publication_for_itself() {
     );
 }
 
+#[test]
+fn slot_cow_coverage_survives_rebinding_and_rejects_retired_asid_identity() {
+    let zone = zone();
+    let root = (9_u64 << 48) | 0x7000;
+    let first = zone.spaces.publish_closed(MM, root, root).unwrap();
+    zone.spaces.open(first);
+    let publication = zone.spaces.note_cow(first);
+    assert_eq!(
+        zone.install_space(SLOT, MM).unwrap().cow_owed,
+        Some(publication)
+    );
+    zone.cover_cow(SLOT, MM, publication);
+    assert_eq!(zone.install_space(SLOT, MM).unwrap().cow_owed, None);
+
+    let sibling = SlotId::new(SLOT.raw() + 1);
+    assert_eq!(
+        zone.install_space(sibling, MM).unwrap().cow_owed,
+        Some(publication)
+    );
+    zone.cover_cow(sibling, MM, publication);
+    zone.release_space(sibling);
+
+    let peer_mm = MM + 1;
+    let peer = zone
+        .spaces
+        .publish_closed(peer_mm, root + 0x1000, root + 0x1000)
+        .unwrap();
+    zone.spaces.open(peer);
+    let peer_publication = zone.spaces.note_cow(peer);
+    zone.release_space(SLOT);
+    assert_eq!(
+        zone.install_space(SLOT, peer_mm).unwrap().cow_owed,
+        Some(peer_publication)
+    );
+    zone.cover_cow(SLOT, peer_mm, peer_publication);
+    zone.release_space(SLOT);
+    assert_eq!(
+        zone.install_space(SLOT, MM).unwrap().cow_owed,
+        Some(publication)
+    );
+    zone.cover_cow(SLOT, MM, publication);
+    zone.release_space(SLOT);
+
+    zone.spaces.close(first);
+    zone.spaces.free(first);
+    let replacement_mm = MM + 2;
+    let replacement = zone
+        .spaces
+        .publish_closed(replacement_mm, root, root)
+        .unwrap();
+    zone.spaces.open(replacement);
+    let replacement_publication = zone.spaces.note_cow(replacement);
+    assert_eq!(
+        replacement_publication, publication,
+        "generation numbers may repeat across MMs"
+    );
+    assert_eq!(
+        zone.install_space(SLOT, replacement_mm).unwrap().cow_owed,
+        Some(replacement_publication)
+    );
+    zone.cover_cow(SLOT, replacement_mm, replacement_publication);
+    assert_eq!(
+        zone.install_space(SLOT, replacement_mm).unwrap().cow_owed,
+        None
+    );
+    assert_eq!(
+        zone.install_space(sibling, replacement_mm)
+            .unwrap()
+            .cow_owed,
+        Some(replacement_publication)
+    );
+}
+
 /// A synthetic EL1 save area for a thread EL1 parked (a private futex wait,
 /// exactly as `park` above does it), with a distinctive, fully populated
 /// [`ThreadCtx`] so a reader must round-trip every field, not just prove
