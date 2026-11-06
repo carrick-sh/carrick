@@ -1035,6 +1035,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         let root_installed = std::cell::Cell::new(false);
         let mut parent_residency = Vec::new();
         let refused = {
+            let sources = &self.initial_sources;
             let vm = std::cell::RefCell::new(&mut self._vm);
             self.fork_stock
                 .reserve_custody(
@@ -1072,6 +1073,16 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                                 trap_error = Some(fail("physical fork custody encoding"));
                                 ForkStockRefusal::Invalid
                             })?;
+                            if let PortalForkCustody::HostBacking { handle, generation } = selected {
+                                let identity = carrick_el1_abi::HostBackingIdentity::new(handle, generation, 0);
+                                if sources.retain(identity, || None).is_none() {
+                                    trap_error = Some(fail("physical fork image source custody"));
+                                    return Err(ForkStockRefusal::Invalid);
+                                }
+                                // The physical aperture and its immutable sources belong
+                                // to the carrier, and outlive both fork participants.
+                                continue;
+                            }
                             let selected_edges = vm
                                 .select_inherited_frames(
                                     execution.context,
@@ -1445,7 +1456,6 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             || window.operation.mm.raw() != mm.get()
             || window.range.len() != 4096
             || window.range.start() != window.fault_page
-            || window.host_backing.is_some()
         {
             return Err(fail("owner COW selection identity"));
         }
@@ -1758,23 +1768,28 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .map_err(|error| fail(format!("owner grant projection: {error:?}")))?
             .map_err(|error| fail(error.to_string()))?;
             pending.inventory.finish()?;
-            self.private_anonymous_witness.record_settled(
-                crate::cpl0_private_witness::SettledPrivateGrant {
-                    memory: &self._vm,
-                    inventory: &*self.frame_inventory,
-                    binding: pending.execution.binding,
-                    cpu: pending.execution.cpu,
-                    context: pending.execution.context,
-                    window: pending.window,
-                    txn: &pending.txn,
-                    publication,
-                    peer: pending
-                        .peer
-                        .combine(crate::cpl0_private_witness::PeerActivity::observe(
-                            &self.actual_run[1 - index],
-                        )),
-                },
-            )?;
+            // This witness measures anonymous-private grants. File sources
+            // are authenticated by the same physical receipt above, and have
+            // their own initialized-byte and fork bindings.
+            if pending.window.host_backing.is_none() {
+                self.private_anonymous_witness.record_settled(
+                    crate::cpl0_private_witness::SettledPrivateGrant {
+                        memory: &self._vm,
+                        inventory: &*self.frame_inventory,
+                        binding: pending.execution.binding,
+                        cpu: pending.execution.cpu,
+                        context: pending.execution.context,
+                        window: pending.window,
+                        txn: &pending.txn,
+                        publication,
+                        peer: pending.peer.combine(
+                            crate::cpl0_private_witness::PeerActivity::observe(
+                                &self.actual_run[1 - index],
+                            ),
+                        ),
+                    },
+                )?;
+            }
             let used = publication.tables_linked as usize;
             if pending.txn.tables.len() != pending.tables.len() || used > pending.tables.len() {
                 return Err(fail("owner grant table receipt"));
@@ -1805,7 +1820,6 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .pending_fault_selection(mm.get(), far)
             .ok_or_else(|| fail("owner fault selection absent"))?;
         if self.grant_portal()?.carrier() != Some(window.operation.carrier)
-            || window.host_backing.is_some()
             || window.range.len() > carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE
         {
             return Err(fail("owner grant selection identity"));
@@ -1813,6 +1827,23 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         if self.prepare_table_stock.is_none() {
             return Err(fail("Prepare table stock absent"));
         }
+        let source_bytes = window
+            .host_backing
+            .map(|identity| {
+                let source = self
+                    .initial_sources
+                    .retain(identity, || None)
+                    .ok_or_else(|| fail("owner image source custody"))?;
+                let request = carrick_hal::fork_stock::HostBackingRead::new(
+                    identity,
+                    window.range.len() as usize,
+                )
+                .ok_or_else(|| fail("owner image source read range"))?;
+                source
+                    .read(request)
+                    .map_err(|error| fail(format!("owner image source read: {error:?}")))
+            })
+            .transpose()?;
         let root = context.root;
         let gpa = self.anonymous_next_gpa;
         let len = window.range.len();
@@ -1847,6 +1878,14 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             )
             .map_err(|error| fail(error.to_string()))?;
         let handle = handles[0];
+        if let Some(bytes) = &source_bytes {
+            if bytes.len() != len as usize {
+                return Err(fail("owner image source short read"));
+            }
+            self._vm
+                .write(gpa, bytes)
+                .map_err(|error| fail(error.to_string()))?;
+        }
         let grant = grants[0];
         let tables: Vec<_> = self
             .prepare_table_stock
@@ -2117,19 +2156,37 @@ mod custody_tests {
         );
     }
 
-    /// The real carrier boot stock, in the worst case the credits are sized for
-    /// (the initial MM used its whole worst-case tables and its own COW
-    /// branch), still serves the first fork's COW branch after the
-    /// maintenance root is taken. Without the dedicated credit this loan
-    /// was refused for capacity.
+    /// Topology-sized carrier stock retains the first fork's COW branch after
+    /// the initial MM and maintenance root have consumed their grants. This
+    /// isolates the branch credits; the large-image KVM witness exercises the
+    /// complete first fork hierarchy.
     #[test]
     fn real_boot_stock_serves_the_first_fork_after_the_maintenance_root() {
         use carrick_el1_abi::{
             ForkStockExchange, ForkStockRequest, PortalOperation, ReservationGeneration,
         };
         use carrick_hal::fork_stock::{ForkStock, UntaggedRoots};
-        let data_pages = 2;
-        let table_grants = super::initial_table_grant_count(data_pages).unwrap();
+        let image = carrick_mem::x86_initial_image::X86InitialImage {
+            entry: 0x400000,
+            executable_entry: 0x400000,
+            interpreter_base: 0,
+            phdr: 0x400040,
+            phent: 56,
+            phnum: 1,
+            regions: vec![carrick_mem::x86_initial_image::X86InitialRegion {
+                start: 0x400000,
+                end: 0x402000,
+                initialized_offset: 0,
+                file_bytes: &[],
+                perms: carrick_mem::elf::SegmentPerms {
+                    read: true,
+                    write: false,
+                    execute: true,
+                },
+            }],
+            executable_region_count: 1,
+        };
+        let table_grants = super::initial_table_grant_count(&image).unwrap();
         let first_fork_branch = carrick_mmu_core::x86::copy_window::COW_COPY_TABLE_PAGES;
         let used = table_grants - first_fork_branch - super::MAINTENANCE_ROOT_TABLE_CREDITS;
         let frame_offset = 0x3000;

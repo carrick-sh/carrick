@@ -16,6 +16,7 @@ rationale = "The exact-generation zombie is the single reap authority. A consumi
 vm_free = [
   "carrick-kernel::dispatch::proc::kernel_process_dispatch_tests::wait4_preserves_subtree_usage_and_charges_children_once",
   "carrick-el1-linux::native_process_runtime::tests::wait4::native_wait4_nonnull_rusage_reaps_child",
+  "carrick-el1-linux::native_process_runtime::host_test_support::wait4_rusage_busy_retains_consumed_child_result",
   "carrick-el1-linux::native_process_runtime::tests::wait4::native_wait4_rusage_fault_consumes_child_after_status",
   "carrick-el1-linux::native_process_runtime::tests::wait4::native_wait4_untraced_continued_reaps_child",
   "carrick-el1-linux::process_owner::tests::pending_reparented_child_charges_adopter_once_and_never_departed_parent",

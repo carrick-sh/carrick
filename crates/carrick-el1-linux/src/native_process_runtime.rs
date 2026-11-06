@@ -4530,8 +4530,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                                 // Linux consumes the child before copying rusage.
                                 // A bad rusage address reports EFAULT after reap,
                                 // while a status-copy refusal above retains it.
-                                self.service
-                                    .copy_signal_bytes(&mm, rusage, usage.abi_bytes())?;
+                                return Ok(self.complete_copyout(
+                                    rusage,
+                                    usage.abi_bytes().to_vec(),
+                                    SyscallResult::new(i64::from(zombie.namespace_pid)),
+                                ));
                             }
                             i64::from(zombie.namespace_pid)
                         }

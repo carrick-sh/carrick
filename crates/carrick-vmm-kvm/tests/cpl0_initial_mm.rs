@@ -7,6 +7,7 @@ use carrick_vmm_kvm::cpl0_boot::{Cpl0Carrier, InitialReservationLimits, InitialT
 #[path = "common/kvm_pool_fixture.rs"]
 mod kvm_pool_fixture;
 use carrick_x86::cpl0_entry::OBSERVE_INITIAL_MM;
+use carrick_x86_cpl0_host::cpl0_boot::initial_table_grant_count;
 use kvm_pool_fixture::{physical_inventory, run_pool_fixture, run_pool_fixture_with};
 use std::path::PathBuf;
 
@@ -996,6 +997,97 @@ fn tiny_elf() -> Vec<u8> {
         0x0b,
     ]);
     bytes
+}
+
+#[test]
+fn production_large_initialized_elf_boots_without_per_page_table_stock() {
+    // Node's initialized PT_LOAD population is about 100 MiB. A dense span
+    // shares page tables; it must not require three table frames per page.
+    let mut elf = tiny_elf();
+    let size = 100 * 1024 * 1024u64;
+    elf.resize(size as usize, 0);
+    elf[96..104].copy_from_slice(&size.to_le_bytes());
+    elf[104..112].copy_from_slice(&size.to_le_bytes());
+    let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("large ELF");
+    let plan = prepare_x86_elf(&program).expect("large image");
+    let extent = Cpl0Carrier::initial_extent_bytes_for(&plan, &[], &[])
+        .expect("dense image must fit the unchanged carrier aperture");
+    assert!(
+        extent < 256 * 1024 * 1024,
+        "table stock must follow topology"
+    );
+    let outcome = run_pool_fixture(&elf, 8);
+    assert_eq!(outcome.run.exit_code, 7);
+}
+
+#[test]
+fn production_initial_image_extent_excludes_untouched_data_grants() {
+    // Staged input bytes may follow file size. Private output frames and
+    // publication records must follow faults, not the untouched PT_LOAD
+    // population. Table stock is accounted separately using its production
+    // geometry authority, so this detects eager data even with shared tables.
+    let small = tiny_elf();
+    let program = carrick_mem::elf::ElfProgram::load(&small, 62, &|_| None).expect("small ELF");
+    let plan = prepare_x86_elf(&program).expect("small image");
+    let baseline = Cpl0Carrier::initial_extent_bytes_for(&plan, &[], &[]).expect("small extent");
+    let baseline_tables = initial_table_grant_count(&plan).expect("small table stock");
+    for mib in [4, 32, 100] {
+        let mut elf = tiny_elf();
+        let size = mib * 1024 * 1024u64;
+        elf.resize(size as usize, 0);
+        elf[96..104].copy_from_slice(&size.to_le_bytes());
+        elf[104..112].copy_from_slice(&size.to_le_bytes());
+        let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("dense ELF");
+        let plan = prepare_x86_elf(&program).expect("dense image");
+        let tables = initial_table_grant_count(&plan).expect("dense table stock");
+        let table_growth = (tables - baseline_tables)
+            * (4096 + size_of::<carrick_core_abi::X86InitialBootGrant>());
+        // One staged copy is allowed. Eight pages cover metadata alignment;
+        // no per-leaf output frame or publication credit is licensed here.
+        let budget = baseline + elf.len() + table_growth + 8 * 4096;
+        let extent = Cpl0Carrier::initial_extent_bytes_for(&plan, &[], &[])
+            .expect("image extent without eager data population");
+        assert!(
+            extent <= budget,
+            "{mib} MiB untouched image reserves data eagerly: {extent} > {budget}"
+        );
+        let outcome = run_pool_fixture(&elf, 8);
+        assert_eq!(outcome.run.exit_code, 7);
+    }
+}
+
+#[test]
+fn production_large_initialized_elf_retains_first_fork_table_capacity() {
+    let elf = native_exit_fixture("large_initial_fork.S");
+    let outcome = run_pool_fixture(&elf, 32);
+    assert_eq!(
+        outcome.run.exit_code,
+        7,
+        "fork refusal {:?}; stock {:?}",
+        outcome.physical.fork_admission_refusal(),
+        outcome.physical.fork_stock_counters()
+    );
+}
+
+#[test]
+fn production_wait_prepares_untouched_initial_elf_output() {
+    let elf = native_exit_fixture("lazy_wait_output.S");
+    let outcome = run_pool_fixture(&elf, 32);
+    assert_eq!(outcome.run.exit_code, 7);
+}
+
+#[test]
+fn production_wait_retains_reaped_child_across_untouched_rusage_output() {
+    let elf = native_exit_fixture("lazy_wait_rusage.S");
+    let outcome = run_pool_fixture(&elf, 32);
+    assert_eq!(outcome.run.exit_code, 7);
+}
+
+#[test]
+fn production_wait_bad_rusage_reports_fault_after_reaping() {
+    let elf = native_exit_fixture_with_flags("lazy_wait_rusage.S", &["-DBAD_RUSAGE"]);
+    let outcome = run_pool_fixture(&elf, 32);
+    assert_eq!(outcome.run.exit_code, 7);
 }
 
 fn write_then_exit_elf(pointer: u64, count: u32) -> Vec<u8> {
