@@ -3782,6 +3782,80 @@ mod tests {
         }
 
         #[test]
+        fn published_private_source_fault_joins_late_delegation_recall() {
+            use carrick_el1_abi::ipc::fd;
+            use carrick_hal::fork_stock::HostBackingRead;
+            let _region = Region::new();
+            let tmp = temp_with(b"before");
+            let open = open_host(&tmp);
+            let dispatcher = crate::dispatch::SyscallDispatcher::default();
+            let context = dispatcher.capture_one_task_context().unwrap();
+            let owner = context.kernel().ipc().unwrap();
+            let table = crate::el1_ipc::HostTable::create(Arc::clone(&owner), 64, 4).unwrap();
+            let slot = crate::kernel::objects::FileSlot::new(Arc::clone(&open.description), 0);
+            table.replace_slot(fd::Fd(3), &slot).unwrap();
+            let (mapped_tx, mapped_rx) = std::sync::mpsc::channel();
+            let table_id = table.id();
+            // Mapping admission can race an already eligible initial entry.
+            // Pause that real entry before its handle is published; retain the
+            // exact IPC projection while both views still observe zero.
+            *PAUSE_HOOK.lock() = Some(Box::new(move || {
+                let reference = owner
+                    .with_pinned_host_resource(table_id, fd::Fd(3), |resource| {
+                        resource
+                            .downcast_ref::<crate::kernel::objects::IpcPhysicalHold>()
+                            .unwrap()
+                            .retain_mapping()
+                            .unwrap()
+                    })
+                    .unwrap();
+                mapped_tx.send(reference).unwrap();
+            }));
+            let handle = delegate_default(&open, 3).unwrap();
+            let reference = mapped_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let (source, _) = dispatcher
+                .mem()
+                .retain_native_private_source(reference, "/late-entry".into())
+                .unwrap();
+            guest_write(handle, 0, b"after!");
+            assert_eq!(host_bytes(&tmp), b"before");
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            *WRITEBACK_HOOK.lock() = Some(Box::new(move || {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            }));
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                let bytes = source.read(HostBackingRead::new(source.identity(), 4096).unwrap());
+                done_tx.send(()).unwrap();
+                bytes.unwrap()
+            });
+            let entered = entered_rx.recv_timeout(std::time::Duration::from_secs(5));
+            let completed_early = done_rx.try_recv().is_ok();
+            let _ = release_tx.send(());
+            let bytes = reader.join().unwrap();
+            // Clean up even the old zero-handle projection, which returns stale
+            // host bytes without ever entering the recall hook.
+            *WRITEBACK_HOOK.lock() = None;
+            recall(&open.description).unwrap();
+            assert!(
+                entered.is_ok(),
+                "the in-flight source fault must join recall"
+            );
+            assert!(
+                !completed_early,
+                "no bytes may be supplied before writeback"
+            );
+            assert_eq!(&bytes[..6], b"after!");
+            assert!(bytes[6..].iter().all(|byte| *byte == 0));
+        }
+
+        #[test]
         fn published_private_mapping_waits_for_recall_before_source_read() {
             use carrick_core_abi::host_file::{self, HostFileHeader, HostFileOp, MapSourceReply};
             use carrick_el1_abi::ipc::fd;
