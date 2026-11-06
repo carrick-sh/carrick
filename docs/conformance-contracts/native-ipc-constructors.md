@@ -178,3 +178,35 @@ constructor witnesses remain red. Pair publication must still retain both
 endpoint descriptions across output preparation, owner waits, genuine copy
 fault rollback, table/OFD/object growth and scheduler wait-key admission.
 A completed-answer copyout alone cannot own those constructor resources.
+
+## Shared constructor storage design (pipe continuation)
+
+Pipe output retains two fd-core numeric claims and two prepared descriptions
+until the exact-MM copyout completes. Its owned completion publishes the pair
+under one table sequence; cancellation drops both claims and endpoint pins.
+The mapping lifetime is distinct from a single dispatch borrow so a service
+wait cannot outlive its IPC authority.
+
+The existing constructor witnesses expose two remaining single-venue allocator
+assumptions. Concurrent count publication can report contention as an errno,
+and a second native pipe write exhausts the stock and has no ring backing
+supplier. The correction uses the existing shared storage owner:
+
+- Each record store has one shared short publication lock. Growth takes the
+  observed count, reprobes after another publisher advanced it, and checks the
+  ceiling inside the lock. Count and the complete free-list segment publish
+  before unlock. No table/object lock, allocation, copy or callback is held.
+- Pipe extents use a second `carrick_fd_core::storage::Storage` over the ring
+  half of the pool. Delete the host-private buddy allocator. Stock, live and
+  retained rings share this authority. A first write takes stock or allocates
+  through that same owner, preserving lazy idle pipes.
+- Allocation/reclamation is bounded by the buddy tree height. It releases its
+  short lock before returning; no allocator holder acquires an object lock.
+  Replacement returns the old extent once, authenticated by offset and rounded
+  footprint. True pool exhaustion is ENOMEM, never Forward or ENOSYS.
+
+Independent design review accepted these lock and layout changes before code,
+with the requirements to preserve observed-count admission at the final segment,
+initialize metadata before publication, and exercise two native children without
+assuming stock supply. Signed execution and the existing broader epoll review
+remain separate acceptance obligations.
