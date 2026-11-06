@@ -3427,6 +3427,108 @@ mod nested_epoll_readiness_tests {
     }
 
     #[test]
+    fn epoll_ctl_read_refusal_redispatches_before_add() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        for abi in [LinuxGuestAbi::Aarch64, LinuxGuestAbi::X86_64] {
+            let mut dispatcher = SyscallDispatcher::new();
+            let kernel = dispatcher.capture_one_task_context().unwrap();
+            let sibling = kernel
+                .kernel()
+                .clone_thread(
+                    &kernel,
+                    crate::kernel::ClonePlan::from_flags(
+                        carrick_abi::LinuxCloneFlags::VM
+                            | carrick_abi::LinuxCloneFlags::SIGHAND
+                            | carrick_abi::LinuxCloneFlags::THREAD,
+                    )
+                    .unwrap(),
+                    carrick_hal::ThreadId::synthetic_for_tests(1704),
+                    None,
+                )
+                .unwrap();
+            let kernel = kernel
+                .kernel()
+                .context(kernel.task().key().id, kernel.thread().key().tid)
+                .unwrap();
+            assert!(kernel.exact_thread_is_live() && sibling.exact_thread_is_live());
+            assert_eq!(kernel.shared().mm().id(), sibling.shared().mm().id());
+            let reporter = CompatReporter::default();
+            let mut setup = LinearMemory::new(0x1000, vec![0; 0x2000]);
+            let efd = create_eventfd(&mut dispatcher, &kernel, &mut setup, &reporter, 1);
+            let epfd = create_epoll(&mut dispatcher, &kernel, &mut setup, &reporter);
+            let mut memory = OwnerRefusingMemory::new(0x1000, 0x2000, 0xa5);
+            let mut bytes = vec![
+                0;
+                if abi == LinuxGuestAbi::Aarch64 {
+                    16
+                } else {
+                    12
+                }
+            ];
+            bytes[..4].copy_from_slice(&(LINUX_EPOLLIN | LINUX_EPOLLONESHOT).to_le_bytes());
+            let offset = bytes.len() - 8;
+            bytes[offset..].copy_from_slice(&1704u64.to_le_bytes());
+            memory.seed(0x1000, &bytes);
+            let request = SyscallRequest::new(
+                21,
+                SyscallArgs::from([epfd as u64, LINUX_EPOLL_CTL_ADD, efd as u64, 0x1000, 0, 0]),
+            )
+            .with_guest_abi(abi);
+            let wait = memory.refuse_next_read();
+            assert_eq!(
+                dispatcher
+                    .dispatch(&kernel, request, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+            );
+            assert_eq!(
+                dispatcher
+                    .dispatch(&kernel, request, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::Returned { value: 0 }
+            );
+            assert_eq!(
+                dispatcher
+                    .dispatch(&kernel, request, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::errno(LINUX_EEXIST)
+            );
+            // Output supply is admitted before consuming or disarming readiness.
+            let request =
+                SyscallRequest::new(22, SyscallArgs::from([epfd as u64, 0x1100, 1, 0, 0, 0]))
+                    .with_guest_abi(abi);
+            let supply = memory.refuse_next_supply_grant();
+            assert_eq!(
+                dispatcher
+                    .dispatch(&kernel, request, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::OwnerMemorySupply {
+                    request: supply,
+                    committed: 0
+                }
+            );
+            assert_eq!(
+                memory.inner.read_bytes(0x1100, bytes.len()).unwrap(),
+                vec![0xa5; bytes.len()]
+            );
+            assert_eq!(
+                dispatcher
+                    .dispatch(&kernel, request, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::Returned { value: 1 }
+            );
+            assert_eq!(memory.inner.read_bytes(0x1100, bytes.len()).unwrap(), bytes);
+            assert_eq!(
+                dispatcher
+                    .dispatch(&kernel, request, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::Returned { value: 0 }
+            );
+            assert_eq!(memory.commits.len(), 1);
+        }
+    }
+
+    #[test]
     fn s1_empty_epoll_skips_owner_preparation() {
         use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
         let mut dispatcher = SyscallDispatcher::new();
