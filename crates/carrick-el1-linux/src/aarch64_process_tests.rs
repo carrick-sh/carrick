@@ -12038,15 +12038,23 @@ fn arm_clone_preparation_fault_retires_completed_undo() {
     clone_nonresident_tid_destination(true, CloneRefusal::ParentPreparationFault);
 }
 
+#[test]
+fn arm_clone_aliased_parent_and_child_tid_publishes_once() {
+    clone_nonresident_tid_destination(false, CloneRefusal::Aliased);
+    clone_nonresident_tid_destination(true, CloneRefusal::Aliased);
+}
+
 #[cfg(test)]
 enum CloneRefusal {
     Child,
     Parent,
     ParentPreparationFault,
+    Aliased,
 }
 
 #[cfg(test)]
 fn clone_nonresident_tid_destination(is_clone3: bool, refusal: CloneRefusal) {
+    let aliased = matches!(refusal, CloneRefusal::Aliased);
     let refuse_parent = !matches!(refusal, CloneRefusal::Child);
     let preparation_fault = matches!(refusal, CloneRefusal::ParentPreparationFault);
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
@@ -12096,7 +12104,11 @@ fn clone_nonresident_tid_destination(is_clone3: bool, refusal: CloneRefusal) {
     let tid_words =
         carrick_test_support::GuestUserBuffer::from_values(&[0x1111_1111_u32, 0x2222_2222_u32]);
     let parent_tid_va = tid_words.arg_at(0);
-    let child_tid_va = tid_words.arg_at(4);
+    let child_tid_va = if aliased {
+        parent_tid_va
+    } else {
+        tid_words.arg_at(4)
+    };
     let child_stack_top = VA + 0x1000;
     // CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD |
     // CLONE_SYSVSEM | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID
@@ -12149,6 +12161,22 @@ fn clone_nonresident_tid_destination(is_clone3: bool, refusal: CloneRefusal) {
 
     assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
     assert!(leader_sees_thread(fixture, &mut service, 42));
+
+    if aliased {
+        let route = arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap();
+        assert_eq!(
+            route,
+            carrick_personality_linux::dispatch::CompletionRoute::WithWork
+        );
+        assert_eq!(
+            frame.x[0], 43,
+            "aliased TID outputs publish one clone result"
+        );
+        assert_eq!(tid_words.get::<u32>(0), 43);
+        assert_eq!(tid_words.get::<u32>(4), 0x2222_2222);
+        assert!(leader_sees_thread(fixture, &mut service, 43));
+        return;
+    }
 
     // Main declines an in-ring clone when either TID destination is not ready.
     crate::lifecycle::COPYOUT_NOT_YET_AT.with(|address| {
