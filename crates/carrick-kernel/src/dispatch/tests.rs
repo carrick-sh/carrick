@@ -4447,6 +4447,25 @@ mod overlay_dispatch_tests {
     }
 
     impl GuestMemory for CountingMemory {
+        fn atomic_load_user_u32(&self, address: u64) -> Result<u32, MemoryError> {
+            self.reads.set(self.reads.get() + 1);
+            let bytes = self.read_bytes_raw(address, 4)?;
+            Ok(u32::from_ne_bytes(bytes.try_into().unwrap()))
+        }
+
+        fn atomic_compare_exchange_user_u32(
+            &mut self,
+            address: u64,
+            expected: u32,
+            desired: u32,
+        ) -> Result<u32, MemoryError> {
+            let observed = self.atomic_load_user_u32(address)?;
+            if observed == expected {
+                self.write_bytes_raw(address, &desired.to_ne_bytes())?;
+            }
+            Ok(observed)
+        }
+
         fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
             self.reads.set(self.reads.get() + 1);
             let offset = address

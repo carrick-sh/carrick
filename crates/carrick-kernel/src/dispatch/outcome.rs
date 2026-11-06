@@ -1055,6 +1055,31 @@ impl LinearMemory {
 }
 
 impl GuestMemory for LinearMemory {
+    fn atomic_load_user_u32(&self, address: u64) -> Result<u32, MemoryError> {
+        let offset = address
+            .checked_sub(self.base)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .filter(|offset| address.is_multiple_of(4) && *offset + 4 <= self.bytes.len())
+            .ok_or(MemoryError::OutOfBounds { address, length: 4 })?;
+        Ok(u32::from_ne_bytes(
+            self.bytes[offset..offset + 4].try_into().unwrap(),
+        ))
+    }
+
+    fn atomic_compare_exchange_user_u32(
+        &mut self,
+        address: u64,
+        expected: u32,
+        desired: u32,
+    ) -> Result<u32, MemoryError> {
+        let observed = self.atomic_load_user_u32(address)?;
+        if observed == expected {
+            let offset = usize::try_from(address - self.base).unwrap();
+            self.bytes[offset..offset + 4].copy_from_slice(&desired.to_ne_bytes());
+        }
+        Ok(observed)
+    }
+
     /// Writable means inside the linear backing: it models no protections,
     /// but nothing outside it is mapped at all.
     fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
