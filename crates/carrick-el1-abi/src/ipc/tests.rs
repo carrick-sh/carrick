@@ -1266,12 +1266,11 @@ fn el1_ipc_host_wake_index_spans_every_segment_without_scanning() {
     );
 }
 
-/// A reused record whose retained ring is too small for the new pipe starts
-/// the pipe unbacked and hands the old ring back for reclamation, rather
-/// than asking for storage at creation.
+/// Construction in ring must not detach storage owned by the host allocator.
+/// A too-small extent remains with the object until the host replaces it.
 #[test]
-fn el1_ipc_too_small_retained_ring_is_retired_at_creation() {
-    let fx = fixture(1 << 20);
+fn el1_ipc_too_small_retained_ring_stays_owned_until_replacement() {
+    let fx = fixture(4 << 20);
     let t = fx.table();
     let (r, w, object) = fx.pipe(t);
     let kept = fx.region.lock(object, &Spin).unwrap().storage();
@@ -1280,15 +1279,29 @@ fn el1_ipc_too_small_retained_ring_is_retired_at_creation() {
     let mut retired = None;
     let big = fx.region.create_pipe(1 << 20, &mut retired, &Spin).unwrap();
     assert_eq!(big.index(), object.index());
-    assert_eq!(retired, Some(kept));
+    assert_eq!(
+        retired, None,
+        "construction cannot hand storage to a host allocator"
+    );
     let mut g = fx.region.lock(big, &Spin).unwrap();
+    assert_eq!(g.storage(), kept);
     assert_eq!(g.pipe().unwrap().capacity(), 1 << 20);
     assert!(!g.pipe().unwrap().is_backed());
     assert_eq!(
-        fx.region.create_pipe(4096, &mut retired, &Spin),
-        Err(IpcError::BadStorage),
-        "retired storage must be collected before the next creation"
+        g.pipe().unwrap().try_write(b"x").result,
+        Err(pipe::Error::Storage)
     );
+    let mut replacement = IpcPipeStorage {
+        offset: fx.next.get(),
+        ring_bytes: 1 << 20,
+        pages: (1 << 20) / IPC_PIPE_PAGE_SIZE as u64,
+    };
+    assert_eq!(g.provide_pipe_storage(&mut replacement), Ok(true));
+    assert_eq!(
+        replacement, kept,
+        "replacement transfers the old extent exactly once"
+    );
+    assert_eq!(g.pipe().unwrap().try_write(b"x").result, Ok(1));
 }
 
 /// The ring stock holds only default-capacity rings inside the pool, is
