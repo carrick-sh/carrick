@@ -1614,7 +1614,11 @@ fn fork_child_pipe_copyout_selects_owner_preparation_with_two_live_mms() {
         root: RootGpa,
     }
     impl<W: LiveDescriptorWords> HostFileUser for ChildCopy<'_, W> {
-        fn copy_in(&mut self, _: &mut [u8], _: u64) -> bool {
+        fn copy_in(
+            &mut self,
+            _: &mut [u8],
+            _: u64,
+        ) -> carrick_personality_linux::lifecycle::CopyOutcome {
             panic!("a pipe read has no user input");
         }
         fn writable(&mut self, address: u64, len: usize) -> usize {
