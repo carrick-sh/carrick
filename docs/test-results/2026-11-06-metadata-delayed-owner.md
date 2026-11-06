@@ -173,3 +173,41 @@ or reduced concurrency is an acceptable substitute.
 This Linux clone cannot run signed HVF. Original historical attribution,
 paired signed population evidence and two consecutive main signed passes
 remain outstanding. The diagnostic removal alone does not satisfy #1572.
+
+## Dispatch continuation: carrier-gate comparison
+
+The branch was already rebased onto the admitted main. The carrier-gate
+fixture and its `ProcessCarrierTestGuard` are byte-identical to admitted
+main; this lane does not change `prepare.rs` or `carrier.rs`.
+
+The repository runtime recipe (`just _test-unit-runtime`) passes on this
+Linux x86_64 worker: 737 passed, zero failed, six ignored. The separately
+executed regular and `serial_host` partitions pass with 644 and 93 tests,
+respectively (five and one ignored). Both use `RUST_TEST_THREADS=1`, as the
+recipe requires for process-wide carrier lifecycle state. In particular,
+`process_carrier_test_guard_isolates_leaked_and_concurrent_prepare_leases`
+passes. This does not explain the preceding worker's reported failure:
+without that invocation and failure output, neither a lane regression nor
+test interference has been established. No fixture assertion was weakened.
+The exact carrier-gate test also passes on admitted main in a detached
+comparison checkout, with the same Linux feature selection and one test
+thread. This comparison establishes no current differential failure.
+
+The lifecycle investigation still distinguishes a publication defect from
+an attributed cause. A stopped host-park constructor supplies zero aliases;
+a subsequent ordinary futex wake can select that record in ring because
+`ZoneRecord::needs_host` does not require a host handback for `Woken` without
+an object operation. `Sched::load` then publishes the stored identity.
+Separately, the loaded-task backend calls `publish_current_task` before
+mapping lifecycle backing, and ignores the successful `HostServed` outcome
+of a contended mapping. Either path can therefore reach execution without
+the lifecycle pair. The observed core does not distinguish them.
+
+Preserving arbitrary values from a vCPU's `CurrentTask` would be unsafe:
+an in-ring switch can change its owner. A correction must authenticate the
+exact thread and execution generation, retain the guest mapping owners,
+and handle first publication as well as resumption. The native-process
+fixture's direct record allocation bypasses the production host-park
+constructors; injecting a zero identity there would demonstrate only the
+consumer, not the publication defect's causal path. No such synthetic
+fixture is presented as a red witness or a fix.
