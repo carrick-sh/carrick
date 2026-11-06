@@ -22,6 +22,10 @@ _start:
 #else
     mov $PREOPENED_FD, %r12d
 #endif
+#ifdef EXPECT_SOURCE_LIMIT
+    mov $1024, %r14d
+map_again:
+#endif
     xor %edi, %edi
 #ifdef EXPECT_BUS
     mov $8192, %esi
@@ -49,6 +53,34 @@ _start:
     jne bytes_failed
     xor %edi, %edi
     jmp exit
+#endif
+#ifdef EXPECT_SOURCE_LIMIT
+    cmp $-1, %r14d
+    je source_recovered
+    test %r14d, %r14d
+    jz source_limit
+    test %rax, %rax
+    js map_failed
+    mov %rax, %r15
+    dec %r14d
+    jmp map_again
+source_limit:
+#ifdef NATIVE_SOURCE_LIMIT_CONTROL
+    test %rax, %rax
+    js bytes_failed
+#else
+    cmp $-12, %rax
+    jne bytes_failed
+#endif
+    mov %r15, %rdi
+    mov $4096, %esi
+    mov $11, %eax
+    syscall
+    test %rax, %rax
+    jnz unmap_failed
+    mov $-1, %r14d
+    jmp map_again
+source_recovered:
 #endif
     test %rax, %rax
     js map_failed

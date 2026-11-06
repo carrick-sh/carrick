@@ -1673,7 +1673,11 @@ fn private_file_fixture_with(cow: bool, scenario: &[&str], open_flags: u64) {
     if cow {
         flags.push("-DCOW_WRITE");
     }
-    let elf = native_exit_fixture_with_flags("native_private_file.S", &flags);
+    let mut oracle_flags = flags.clone();
+    if scenario.contains(&"-DEXPECT_SOURCE_LIMIT") {
+        oracle_flags.push("-DNATIVE_SOURCE_LIMIT_CONTROL");
+    }
+    let elf = native_exit_fixture_with_flags("native_private_file.S", &oracle_flags);
     let oracle = dir.path().join("oracle");
     std::fs::write(&oracle, &elf).expect("native oracle ELF");
     use std::os::unix::fs::PermissionsExt;
@@ -1735,7 +1739,11 @@ fn private_file_fixture_with(cow: bool, scenario: &[&str], open_flags: u64) {
     let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("ELF program");
     let outcome = kvm_pool_fixture::try_run_program_with_dispatcher(
         &program,
-        128,
+        if scenario.contains(&"-DEXPECT_SOURCE_LIMIT") {
+            4096
+        } else {
+            128
+        },
         ROOT_AFFINITY_LOADED,
         |_| {},
         dispatcher,
@@ -1782,4 +1790,12 @@ fn private_file_child_first_touch_after_parent_unmap() {
 #[test]
 fn private_file_page_beyond_eof_delivers_sigbus() {
     private_file_fixture_with(false, &["-DEXPECT_BUS"], 0);
+}
+
+/// Reach the retained-source bound through production mmap admission, report
+/// ENOMEM, then reclaim a source and admit another mapping. An earlier
+/// metadata/admission failure must remain visible rather than skipping the bound.
+#[test]
+fn private_file_source_limit_returns_enomem() {
+    private_file_fixture_with(false, &["-DEXPECT_SOURCE_LIMIT"], 0);
 }

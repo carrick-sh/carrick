@@ -128,3 +128,15 @@ Mapping admission now uses one physical-reference owner with typed evidence
 for an owned descriptor or the exact pinned IPC projection. Both paths use
 the existing checked mapping-reference increment; the authority-debt ceiling
 is unchanged.
+
+### Rebased review witnesses
+
+The added `private_file_source_limit_returns_enomem` binding attempts 1,024
+untouched mappings, checks errno 12 on the next admission, unmaps one source
+and requires a new first-touch mapping to read the original bytes. Native
+Linux runs the bounded control with successful mappings (it has no Carrick
+source limit). The Carrick binding is currently RED earlier: mmap returns
+errno 38 with 506 host-file crossings recorded, before the source-limit
+reply can be exercised. This is not evidence that the source cap aborts the
+carrier, and no cap pass is claimed. Owned admission and metadata suspension
+must be completed before this higher-population witness can reach the bound.
