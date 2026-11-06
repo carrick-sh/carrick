@@ -443,8 +443,8 @@ fn el1_files_exit_group_stress() {
 
 /// Build a test-only ELF with no libc, compiler or optional image packages.
 /// These AArch64 instructions create exactly one sibling and two pipes. A
-/// successful clone and pipe handoff order exit_group against a live leader;
-/// neither task exits or writes a reply before the sibling closes the group.
+/// successful clone and pipe handoff order exit_group against a live sibling;
+/// neither task exits or writes a reply before the leader closes the group.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn native_terminal_guest() -> tempfile::TempDir {
     use std::os::unix::fs::PermissionsExt;
@@ -453,43 +453,43 @@ fn native_terminal_guest() -> tempfile::TempDir {
         0x910003f3, // mov x19, sp
         0xaa1303e0, // mov x0, x19
         0xd2800001, // mov x1, #0
-        0xd2800768, // mov x8, #59 // pipe2(start)
+        0xd2800768, // mov x8, #59
         0xd4000001, // svc #0
         0xb5000480, // cbnz x0, fail
         0x91002260, // add x0, x19, #8
-        0xd2800768, // mov x8, #59 // pipe2(reply)
+        0xd2800768, // mov x8, #59
         0xd4000001, // svc #0
         0xb5000400, // cbnz x0, fail
         0xd281e000, // mov x0, #0x0f00
-        0xf2a00020, // movk x0, #1, lsl #16 // CLONE_VM|FS|FILES|SIGHAND|THREAD
+        0xf2a00020, // movk x0, #1, lsl #16
         0xd14007e1, // sub x1, sp, #1, lsl #12
         0xd2800002, // mov x2, #0
         0xd2800003, // mov x3, #0
         0xd2800004, // mov x4, #0
-        0xd2801b88, // mov x8, #220 // clone
+        0xd2801b88, // mov x8, #220
         0xd4000001, // svc #0
         0xb40001a0, // cbz x0, sibling
         0xb7f802c0, // tbnz x0, #63, fail
-        0xb9400660, // ldr w0, [x19, #4] // leader writes start_w
+        0xb9400260, // ldr w0, [x19]
         0x91004261, // add x1, x19, #16
         0xd2800022, // mov x2, #1
-        0xd2800808, // mov x8, #64 // write
+        0xd28007e8, // mov x8, #63
         0xd4000001, // svc #0
         0xf100041f, // cmp x0, #1
         0x540001e1, // b.ne fail
-        0xb9400a60, // ldr w0, [x19, #8] // leader blocks on reply_r
-        0xd28007e8, // mov x8, #63 // read
+        0xd28002e0, // mov x0, #23
+        0xd2800bc8, // mov x8, #94
         0xd4000001, // svc #0
         0x1400000b, // b fail
-        0xb9400260, // ldr w0, [x19] // sibling waits on start_r
+        0xb9400660, // ldr w0, [x19, #4]
         0x91004261, // add x1, x19, #16
         0xd2800022, // mov x2, #1
-        0xd28007e8, // mov x8, #63 // read
+        0xd2800808, // mov x8, #64
         0xd4000001, // svc #0
         0xf100041f, // cmp x0, #1
         0x54000081, // b.ne fail
-        0xd28002e0, // mov x0, #23
-        0xd2800bc8, // mov x8, #94 // exit_group
+        0xb9400a60, // ldr w0, [x19, #8]
+        0xd28007e8, // mov x8, #63
         0xd4000001, // svc #0
         0xd2800c60, // mov x0, #99
         0xd2800bc8, // mov x8, #94
