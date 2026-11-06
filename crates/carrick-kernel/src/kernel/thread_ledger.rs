@@ -1321,6 +1321,7 @@ impl Kernel {
         self: &Arc<Self>,
         key: ThreadKey,
         frame: &carrick_el1_abi::ThreadCtx,
+        before_publish: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<FirstEntryAdoption, String> {
         let Some(thread) = self.exact_thread_for_scheduler(key) else {
             return Ok(FirstEntryAdoption::NoHostThread);
@@ -1345,7 +1346,7 @@ impl Kernel {
         let factory = task
             .thread_adoption_factory()
             .ok_or("born thread lost adoption factory")?;
-        factory.adopt_first_host_entry(&context, reservation, frame)?;
+        factory.adopt_first_host_entry(&context, reservation, frame, before_publish)?;
         crate::schedule_point!(
             self.schedule_hooks(),
             super::schedule::Event::thread(&context, super::schedule::Point::FirstEntryFinished)
