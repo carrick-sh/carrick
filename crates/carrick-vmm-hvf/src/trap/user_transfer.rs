@@ -181,7 +181,16 @@ impl RetainedUserData {
         unsafe {
             match bytes {
                 TransferBytes::Read(bytes) => {
-                    core::ptr::copy_nonoverlapping(self.pointer, bytes.as_mut_ptr(), len)
+                    if len == core::mem::size_of::<u32>()
+                        && (self.pointer as usize).is_multiple_of(4)
+                    {
+                        let word =
+                            std::sync::atomic::AtomicU32::from_ptr(self.pointer.cast::<u32>())
+                                .load(std::sync::atomic::Ordering::Acquire);
+                        bytes.copy_from_slice(&word.to_ne_bytes());
+                    } else {
+                        core::ptr::copy_nonoverlapping(self.pointer, bytes.as_mut_ptr(), len)
+                    }
                 }
                 TransferBytes::Write(bytes) => {
                     core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.pointer, len)
