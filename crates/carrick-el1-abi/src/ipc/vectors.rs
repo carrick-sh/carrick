@@ -97,11 +97,10 @@ pub(super) const VECTOR_LAYOUT: &[u64] = &[
 // Each imported header includes its exclusive prefix, allowing bounded binary
 // search on resume instead of rescanning a potentially huge vector prefix.
 #[repr(C)]
-#[derive(Clone, Copy)]
 struct Vector {
-    base: IpcUserVa,
-    len: u64,
-    prefix: u64,
+    base: AtomicU64,
+    len: AtomicU64,
+    prefix: AtomicU64,
 }
 
 impl IpcRegion<'_> {
@@ -183,20 +182,18 @@ impl IpcRegion<'_> {
             {
                 return Err(VectorImportError::Fault);
             }
-            let vector = Vector {
-                base: IpcUserVa(base),
-                len,
-                prefix,
-            };
-            // SAFETY: this exclusively owned aligned allocation covers every
-            // initialized header; no reference escapes the token's lifetime.
-            unsafe {
-                self.pool
+            // SAFETY: descriptor-pool words remain AtomicU64 for the mapping's
+            // entire lifetime, including while retired descriptor readers run.
+            let vector = unsafe {
+                &*self
+                    .pool
                     .add(storage.offset as usize)
                     .cast::<Vector>()
                     .add(index)
-                    .write(vector);
-            }
+            };
+            vector.base.store(base, Ordering::Relaxed);
+            vector.len.store(len, Ordering::Relaxed);
+            vector.prefix.store(prefix, Ordering::Relaxed);
             storage.count += 1;
             slot.custody
                 .publish_vectors(storage)
@@ -230,21 +227,27 @@ impl IpcRegion<'_> {
                 storage.count as usize,
             )
         };
-        let mut index = vectors.partition_point(|v| v.prefix.saturating_add(v.len) <= at);
+        let mut index = vectors.partition_point(|v| {
+            v.prefix
+                .load(Ordering::Relaxed)
+                .saturating_add(v.len.load(Ordering::Relaxed))
+                <= at
+        });
         let mut done = 0;
         while done < dst.len() {
             let Some(vector) = vectors.get(index) else {
                 break;
             };
             let offset = (at + done as u64)
-                .checked_sub(vector.prefix)
+                .checked_sub(vector.prefix.load(Ordering::Relaxed))
                 .ok_or(IpcError::Corrupt)?;
-            let len = (vector.len.saturating_sub(offset)).min((dst.len() - done) as u64) as usize;
+            let len = (vector.len.load(Ordering::Relaxed).saturating_sub(offset))
+                .min((dst.len() - done) as u64) as usize;
             if len == 0 {
                 index += 1;
                 continue;
             }
-            let Some(address) = vector.base.0.checked_add(offset) else {
+            let Some(address) = vector.base.load(Ordering::Relaxed).checked_add(offset) else {
                 break;
             };
             let copied = copy(&mut dst[done..done + len], IpcUserVa(address)).min(len);
@@ -309,5 +312,25 @@ mod publication_tests {
             }
             assert!(writer.join().is_ok());
         });
+    }
+}
+
+#[cfg(test)]
+mod type_stability_tests {
+    use super::*;
+    #[test]
+    fn vector_pool_words_are_atomic() {
+        // Retired descriptor readers may still load these exact words.
+        assert_eq!(
+            core::any::type_name_of_val(
+                &Vector {
+                    base: AtomicU64::new(0),
+                    len: AtomicU64::new(0),
+                    prefix: AtomicU64::new(0)
+                }
+                .len
+            ),
+            core::any::type_name::<AtomicU64>()
+        );
     }
 }
