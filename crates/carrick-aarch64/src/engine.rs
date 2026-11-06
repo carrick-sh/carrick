@@ -3386,7 +3386,11 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     continue;
                 }
             };
-            let bytes = match self.vm.translated_read(va, ipa.raw(), chunk_len) {
+            // The live stage-1 walk above selected the exact IPA while the
+            // matching MM exclusion is held. Read that authenticated output
+            // directly: `translated_read` is the ordinary syscall-buffer seam
+            // and deliberately refuses an admitted owner MM back to its portal.
+            let bytes = match self.vm.read_gpa(ipa.raw(), chunk_len) {
                 Ok(bytes) => bytes,
                 Err(error) => {
                     let deferred = match self.vm.deferred_anonymous_state() {
@@ -3407,7 +3411,9 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                         continue;
                     }
                     self.trace_read_fault(va, length, 2);
-                    return Err(error);
+                    return Err(MemoryError::HostMap(format!(
+                        "read excluded core backing at {ipa:?}: {error}"
+                    )));
                 }
             };
             if bytes.len() != chunk_len {
