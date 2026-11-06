@@ -25,6 +25,7 @@ structural_budgets = []
 
 [bindings]
 vm_free = [
+  "carrick-el1-linux::aarch64_process_tests::native_fd_shell_tests::{serial_host_native_child_redirect_restore_stdout_1410,serial_host_native_subshell_reads_parent_duplicated_heredoc_1399} (in-zone pipe compositions; no host-backed stdout or signed shell claim)",
   "carrick-kernel::kernel::objects::ipc::tests::{one_table_writer,no_host_slot_selection}",
   "carrick-el1-abi::ipc_tables::tests::directory_custody_cannot_replace_or_retire_a_borrowed_binding",
   "carrick-el1-linux::aarch64_process_tests::{serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof,serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe}",

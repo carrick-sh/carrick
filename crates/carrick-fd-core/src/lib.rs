@@ -219,8 +219,8 @@ pub struct PreparedClose {
 }
 
 impl PreparedClose {
-    /// Effects captured while the descriptor admission lock was held. A
-    /// venue without cleanup custody can cancel before changing the slot.
+    /// Admission snapshot only: effect registration may race this read.
+    /// This does not authorize a venue to omit retained cleanup custody.
     pub fn effects(&self) -> CloseEffects {
         self.effects
     }
