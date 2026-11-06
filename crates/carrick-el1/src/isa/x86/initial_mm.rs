@@ -345,24 +345,6 @@ fn checked_region(region: &MappedRegion<'_>) -> Result<u64, InitialMmError> {
     Ok(end)
 }
 
-fn table_count(regions: &[MappedRegion<'_>]) -> Result<usize, InitialMmError> {
-    let mut pml4 = BTreeSet::new();
-    let mut pdpt = BTreeSet::new();
-    let mut pd = BTreeSet::new();
-    for region in regions {
-        let end = checked_region(region)?;
-        for va in (region.start..end).step_by(PAGE as usize) {
-            pml4.insert(va >> 39);
-            pdpt.insert(va >> 30);
-            pd.insert(va >> 21);
-        }
-    }
-    pml4.len()
-        .checked_add(pdpt.len())
-        .and_then(|total| total.checked_add(pd.len()))
-        .ok_or(InitialMmError::InvalidRange)
-}
-
 /// Build a fresh x86 address space under the closed exact-MM editor.
 ///
 /// # Safety
@@ -463,18 +445,11 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
             .store_unlinked(root.address().raw() + index * 8, word)
             .map_err(|_| InitialMmError::DescriptorRefused)?;
     }
-    let count = table_count(&spans)?;
-    let mut tables = Vec::with_capacity(count);
-    for _ in 0..count {
-        let table = source
-            .take_zeroed_table()
-            .ok_or(InitialMmError::FrameUnavailable)?;
-        if !valid_page(table.address()) || !seen.insert(table.address().raw()) {
-            return Err(InitialMmError::FrameUnavailable);
-        }
-        tables.push(table);
-    }
-    let mut used_tables = 0;
+    // The lower half starts empty and this owner installs only 4 KiB
+    // leaves. Each new VA prefix therefore needs exactly one table. Acquire
+    // those tables at the page that first uses them, rather than lending the
+    // entire image's stock to a single bounded descriptor transaction.
+    let mut prefixes = [BTreeSet::new(), BTreeSet::new(), BTreeSet::new()];
     let mut publications = Vec::new();
     for region in spans {
         let end = region.start + region.len;
@@ -515,6 +490,18 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
             let owner = unsafe { EditOwner::issue(root, mm_key, generation) };
             let range = UserRange::checked(UserVa::new(va), GuestLen::new(PAGE))
                 .ok_or(InitialMmError::InvalidRange)?;
+            let mut tables = Vec::with_capacity(3);
+            for (prefixes, shift) in prefixes.iter_mut().zip([39, 30, 21]) {
+                if prefixes.insert(va >> shift) {
+                    let table = source
+                        .take_zeroed_table()
+                        .ok_or(InitialMmError::FrameUnavailable)?;
+                    if !valid_page(table.address()) || !seen.insert(table.address().raw()) {
+                        return Err(InitialMmError::FrameUnavailable);
+                    }
+                    tables.push(table);
+                }
+            }
             let intent = EditIntent::checked(
                 owner,
                 range,
@@ -524,7 +511,7 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
                     resident: range,
                     backing: grant.backing,
                 },
-                &tables[used_tables..],
+                &tables,
             )
             .ok_or(InitialMmError::InvalidRange)?;
             let txn = DescriptorTxn::from_intent(&intent)
@@ -535,7 +522,9 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
             };
             let publication = GuestMmuPublication::from_x86_receipt(&txn, &receipt)
                 .ok_or(InitialMmError::PublicationRefused)?;
-            used_tables += tables_linked;
+            if tables_linked != tables.len() {
+                return Err(InitialMmError::DescriptorRefused);
+            }
             publications.push(publication);
         }
     }
@@ -699,15 +688,22 @@ mod tests {
 
     #[test]
     fn fresh_owner_maps_static_text_data_and_stack_with_publications() {
-        check_fresh_owner(false);
+        check_fresh_owner(false, 0);
     }
 
     #[test]
     fn fresh_owner_enters_interpreter_but_break_and_auxv_belong_to_executable() {
-        check_fresh_owner(true);
+        check_fresh_owner(true, 0);
     }
 
-    fn check_fresh_owner(interpreted: bool) {
+    #[test]
+    fn fresh_owner_allocates_sparse_tables_on_demand() {
+        for extra in [3, 6, 9] {
+            check_fresh_owner(false, extra);
+        }
+    }
+
+    fn check_fresh_owner(interpreted: bool, extra: u64) {
         use carrick_guest_arch::EditPermissions;
         let mut regions = image_alloc::vec![
             InitialImageRegion {
@@ -741,6 +737,19 @@ mod tests {
                 },
             },
         ];
+        for index in 0..extra {
+            regions.push(InitialImageRegion {
+                start: UserVa::new(0x200_0000 + index * 0x20_0000),
+                len: GuestLen::new(PAGE),
+                initialized_offset: GuestLen::new(0),
+                initialized: InitialSourceRange {
+                    start: FrameGpa::new(0x11_000),
+                    len: GuestLen::new(0),
+                },
+                perms: regions[1].perms,
+            });
+        }
+        let expected_break = regions.last().unwrap().start.raw() + PAGE;
         let interpreter_base = if interpreted { 0x8c_0000_0000 } else { 0 };
         if interpreted {
             regions.push(InitialImageRegion {
@@ -783,7 +792,7 @@ mod tests {
         }
         let image = InitialImageSpec {
             regions: &regions,
-            executable_region_count: 2,
+            executable_region_count: 2 + extra as usize,
             entry: UserVa::new(entry),
             stack,
         };
@@ -859,8 +868,11 @@ mod tests {
             0,
             "initial ELF data is private Linux mapping custody too"
         );
-        assert_eq!(loaded.publications.len(), 6 + usize::from(interpreted));
-        assert_eq!(loaded.initial_break.raw(), 0x403000);
+        assert_eq!(
+            loaded.publications.len(),
+            6 + usize::from(interpreted) + extra as usize
+        );
+        assert_eq!(loaded.initial_break.raw(), expected_break);
         assert_eq!(loaded.context.frame[15], entry);
         assert_eq!(loaded.context.frame[16], 0x23);
         assert_eq!(loaded.context.frame[17], 0x202);
@@ -910,12 +922,12 @@ mod tests {
         );
         assert_eq!(
             frames.next_data,
-            0x90_6000 + PAGE * u64::from(interpreted),
+            0x90_6000 + PAGE * (u64::from(interpreted) + extra),
             "one data grant per user page"
         );
         assert_eq!(
             frames.next_table,
-            0x80_9000 + 3 * PAGE * u64::from(interpreted),
+            0x80_9000 + 3 * PAGE * u64::from(interpreted) + PAGE * extra,
             "one root, five user tables and three private copy tables"
         );
         assert_ne!(loaded.address.root.address().raw(), 0x60_0000);

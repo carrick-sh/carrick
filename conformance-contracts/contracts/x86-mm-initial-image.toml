@@ -37,6 +37,7 @@ path; those belong to the x86-run milestone and director acceptance.
 
 [bindings]
 vm_free = [
+  "carrick-el1::isa::x86_initial_mm::tests::fresh_owner_allocates_sparse_tables_on_demand",
   "carrick-el1::isa::x86_initial_mm::tests::fresh_owner_maps_static_text_data_and_stack_with_publications",
   "carrick-el1::isa::x86_initial_mm::tests::guest_stack_has_sysv_order_and_exact_auxv_addresses",
   "carrick-el1::isa::x86_initial_mm::tests::fresh_owner_enters_interpreter_but_break_and_auxv_belong_to_executable",

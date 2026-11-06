@@ -1272,8 +1272,15 @@ impl Cpl0Carrier {
                         resident: PageSpan::new(publication.span_va, 4096),
                         backing: identity,
                     },
+                    // The guest grants only the tables linked by this page,
+                    // not the unused stock for the rest of the image.
                     tables: tables
-                        .get(used_tables..)
+                        .get(
+                            used_tables
+                                ..used_tables
+                                    .checked_add(publication.tables_linked as usize)
+                                    .ok_or_else(|| fail("initial table receipt overflow"))?,
+                        )
                         .ok_or_else(|| fail("initial table receipt count"))?,
                 };
                 self.custody
