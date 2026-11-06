@@ -88,7 +88,28 @@ fn signed_queue_workflow_requires_published_group_pass_and_seeds_main() {
         Some("checks_requested")
     );
     assert_eq!(workflow["on"]["push"]["branches"][0].as_str(), Some("main"));
+    // Every main push must retain its admitted receipt, including when another
+    // push arrives. Coalescing these runs would strand a queue's exact base.
+    assert!(workflow["concurrency"].is_badvalue());
     let jobs = &workflow["jobs"];
+    let baseline = jobs["publish"]["steps"]
+        .as_vec()
+        .unwrap()
+        .iter()
+        .find(|step| step["name"].as_str() == Some("Publish admitted main baseline"))
+        .unwrap();
+    assert_eq!(
+        baseline["if"].as_str(),
+        Some("needs.authorize.outputs.main == 'true' && steps.verdict.outcome == 'success'")
+    );
+    assert_eq!(
+        baseline["with"]["name"].as_str(),
+        Some("signed-baseline-${{ needs.authorize.outputs.sha }}-${{ github.run_attempt }}")
+    );
+    assert_eq!(
+        baseline["with"]["path"].as_str(),
+        Some("${{ runner.temp }}/signed-result/candidate.json")
+    );
     let check = &jobs["signed-queue-gate"];
     assert_eq!(check["name"].as_str(), Some("Signed queue gate"));
     assert_eq!(
@@ -146,6 +167,16 @@ fn signed_workflow_keeps_manual_requests_owner_only() {
     let text = fs::read_to_string(root.join(".github/workflows/signed-gate.yml")).unwrap();
     let docs = yaml_rust2::YamlLoader::load_from_str(&text).unwrap();
     let authorize = &docs[0]["jobs"]["authorize"];
+    for (name, expression) in [
+        ("EVENT_NAME", "${{ github.event_name }}"),
+        ("ACTOR", "${{ github.actor }}"),
+        ("TRIGGERING_ACTOR", "${{ github.triggering_actor }}"),
+    ] {
+        assert_eq!(
+            authorize["steps"][0]["env"][name].as_str(),
+            Some(expression)
+        );
+    }
     let guard = authorize["steps"][0]["run"].as_str().unwrap();
     let run_guard = |event: &str, actor: &str, triggering: &str| {
         std::process::Command::new("bash")
