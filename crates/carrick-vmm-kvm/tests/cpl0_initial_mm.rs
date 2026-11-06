@@ -998,6 +998,24 @@ fn tiny_elf() -> Vec<u8> {
     bytes
 }
 
+#[test]
+fn production_large_initialized_elf_boots_without_per_page_table_stock() {
+    // Node's initialized PT_LOAD population is about 100 MiB. A dense span
+    // shares page tables; it must not require three table frames per page.
+    let mut elf = tiny_elf();
+    let size = 100 * 1024 * 1024u64;
+    elf.resize(size as usize, 0);
+    elf[96..104].copy_from_slice(&size.to_le_bytes());
+    elf[104..112].copy_from_slice(&size.to_le_bytes());
+    let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("large ELF");
+    let plan = prepare_x86_elf(&program).expect("large image");
+    let extent = Cpl0Carrier::initial_extent_bytes_for(&plan, &[], &[])
+        .expect("dense image must fit the unchanged carrier aperture");
+    assert!(extent < 256 * 1024 * 1024, "table stock must follow topology");
+    let outcome = run_pool_fixture(&elf, 8);
+    assert_eq!(outcome.run.exit_code, 7);
+}
+
 fn write_then_exit_elf(pointer: u64, count: u32) -> Vec<u8> {
     let mut bytes = tiny_elf();
     let mut code = vec![0xb8, X86_SYS_WRITE, 0, 0, 0, 0xbf, 1, 0, 0, 0];
