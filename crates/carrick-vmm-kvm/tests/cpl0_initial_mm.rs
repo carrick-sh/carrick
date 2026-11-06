@@ -7,6 +7,7 @@ use carrick_vmm_kvm::cpl0_boot::{Cpl0Carrier, InitialReservationLimits, InitialT
 #[path = "common/kvm_pool_fixture.rs"]
 mod kvm_pool_fixture;
 use carrick_x86::cpl0_entry::OBSERVE_INITIAL_MM;
+use carrick_x86_cpl0_host::cpl0_boot::initial_table_grant_count;
 use kvm_pool_fixture::{physical_inventory, run_pool_fixture, run_pool_fixture_with};
 use std::path::PathBuf;
 
@@ -1017,6 +1018,42 @@ fn production_large_initialized_elf_boots_without_per_page_table_stock() {
     );
     let outcome = run_pool_fixture(&elf, 8);
     assert_eq!(outcome.run.exit_code, 7);
+}
+
+#[test]
+fn production_initial_image_extent_excludes_untouched_data_grants() {
+    // Staged input bytes may follow file size. Private output frames and
+    // publication records must follow faults, not the untouched PT_LOAD
+    // population. Table stock is accounted separately using its production
+    // geometry authority, so this detects eager data even with shared tables.
+    let small = tiny_elf();
+    let program = carrick_mem::elf::ElfProgram::load(&small, 62, &|_| None).expect("small ELF");
+    let plan = prepare_x86_elf(&program).expect("small image");
+    let baseline = Cpl0Carrier::initial_extent_bytes_for(&plan, &[], &[]).expect("small extent");
+    let baseline_tables = initial_table_grant_count(&plan).expect("small table stock");
+    for mib in [4, 32, 100] {
+        let mut elf = tiny_elf();
+        let size = mib * 1024 * 1024u64;
+        elf.resize(size as usize, 0);
+        elf[96..104].copy_from_slice(&size.to_le_bytes());
+        elf[104..112].copy_from_slice(&size.to_le_bytes());
+        let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("dense ELF");
+        let plan = prepare_x86_elf(&program).expect("dense image");
+        let tables = initial_table_grant_count(&plan).expect("dense table stock");
+        let table_growth = (tables - baseline_tables)
+            * (4096 + size_of::<carrick_core_abi::X86InitialBootGrant>());
+        // One staged copy is allowed. Eight pages cover metadata alignment;
+        // no per-leaf output frame or publication credit is licensed here.
+        let budget = baseline + elf.len() + table_growth + 8 * 4096;
+        let extent = Cpl0Carrier::initial_extent_bytes_for(&plan, &[], &[])
+            .expect("image extent without eager data population");
+        assert!(
+            extent <= budget,
+            "{mib} MiB untouched image reserves data eagerly: {extent} > {budget}"
+        );
+        let outcome = run_pool_fixture(&elf, 8);
+        assert_eq!(outcome.run.exit_code, 7);
+    }
 }
 
 #[test]

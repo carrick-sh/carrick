@@ -50,6 +50,7 @@ embed = [
   "KVM-only carrier fixture: carrick-vmm-kvm::cpl0_initial_mm::shared_guest_owner_loads_static_elf_and_exits_seven",
   "carrick-vmm-kvm::cpl0_initial_mm::production_enters_pt_interp_instead_of_executable_entry",
   "carrick-vmm-kvm::cpl0_initial_mm::production_large_initialized_elf_boots_without_per_page_table_stock",
+  "carrick-vmm-kvm::cpl0_initial_mm::production_initial_image_extent_excludes_untouched_data_grants",
   "carrick-vmm-kvm::cpl0_initial_mm::production_large_initialized_elf_retains_first_fork_table_capacity",
 ]
 docker = [

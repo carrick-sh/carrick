@@ -32,3 +32,37 @@ every PT_LOAD page before entry. KVM host windows already use anonymous
 MAP_NORESERVE backing; that is distinct from guest demand loading. ARM's
 AddressSpace keeps initialized prefixes and permits demand-zero tails rather
 than charging worst-case per-leaf table stock to this x86 aperture.
+
+## Demand-allocation witness
+
+`production_initial_image_extent_excludes_untouched_data_grants` tightens the
+allocation requirement at 4, 32 and 100 MiB. It permits one staged copy of the
+initialized ELF, the production table-stock geometry, and eight alignment
+pages. Private output frames and publication records for untouched ELF pages
+must not be charged at boot. Each scale then enters the production carrier
+and checks exit(7); an allocation failure prevents that runtime assertion.
+This is separate from the earlier 256 MiB table-stock bound, which admits
+two full copies of the 100 MiB payload and therefore cannot prove demand
+allocation.
+
+On the topology-sized implementation, the first scale is red before entering
+KVM: `4 MiB untouched image reserves data eagerly: 9056256 > 4792680`.
+The existing real-KVM large-fork witness is also red; a fresh run reports
+`physical fork source residency capacity`, rather than the child-side
+capacity named in the earlier handoff. The fallback source publication in
+`cpl0_anonymous.rs` consumes one residency record per 4 KiB leaf. A 100 MiB
+population needs 25,600 such records, exceeding the shared 4,096-slot table.
+Increasing either capacity would leave the allocation shape wrong.
+
+The remaining integration is not a new anonymous-fault path. The shared
+reservation owner already supports `insert_opaque_backed` and
+`select_fault_window` retains its `HostBackingIdentity`. The kernel's retained
+`PrivateFileBacking::LoadedImage` source already supplies initialized bytes
+and zero padding. CPL0's physical grant service currently explicitly rejects
+windows with `host_backing`; its boot publisher imports ELF regions without
+source identities. These two boundaries need to consume the existing retained
+source authority, while the guest initial editor stops allocating ELF output
+frames before entry. Source custody must survive fork, parent exit and exec;
+partial pages, BSS, protection changes and kernel user-copy materialization
+must use that same authority. No such implementation or acceptance is claimed
+by this witness commit.
