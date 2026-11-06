@@ -9,7 +9,7 @@ permissions: {}
 
 # Serialize push-to-main dispatches so out-of-order runner scheduling cannot
 # dispatch an older main commit after a newer tip has already been dispatched,
-# which would cancel the newer baseline in signed-gate-main (#1729).
+# which would cancel the newer baseline in signed-gate-main-tip (#1729).
 concurrency:
   group: signed-baseline-dispatch-main
   cancel-in-progress: false
@@ -86,7 +86,7 @@ jobs:
             echo "::error::SIGNED_GATE_DISPATCH_TOKEN secret is not configured; cannot dispatch signed-gate.yml as owner" >&2
             exit 1
           fi
-          jq -cn --arg sha "$MAIN_SHA" '{ref: "main", inputs: {pr: "main", sha: $sha}}' \
+          jq -cn --arg sha "$MAIN_SHA" '{ref: "main", inputs: {pr: "main", sha: $sha, coalesce: true}}' \
             | gh api \
                 --method POST \
                 -H "Accept: application/vnd.github+json" \

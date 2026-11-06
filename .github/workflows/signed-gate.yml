@@ -11,17 +11,18 @@ on:
         description: Exact full commit SHA (current PR head or a main ancestor)
         required: true
         type: string
+      coalesce:
+        description: Coalesce automatic main tip baselines (set by signed-baseline.yml)
+        type: boolean
+        default: false
   pull_request_target:
     types: [labeled]
 
 permissions: {}
 
-# Coalesce main baseline runs under one group so a burst of landings cancels
-# superseded in-flight baselines and runs only the newest main SHA (#1729).
-# Guard with the owner actor and main ref so unauthorized dispatches cannot
-# cancel a live baseline before authorize rejects them (#654). PR dispatches
-# and gate:signed label events keep distinct run-scoped groups here and
-# serialize per-SHA in the gate job below.
+# Only automatic tip baselines cancel older tips. Explicit backfills have
+# per-SHA groups and never cancel an in-progress run. Keep the owner/ref
+# guards so rejected requests cannot cancel authorized baselines (#654).
 concurrency:
   group: >-
     ${{
@@ -31,7 +32,8 @@ concurrency:
       github.triggering_actor == 'tjfontaine' &&
       inputs.pr == 'main' &&
       inputs.sha != '' &&
-      'signed-gate-main' ||
+      (inputs.coalesce && 'signed-gate-main-tip' ||
+       format('signed-gate-main-backfill-{0}', inputs.sha)) ||
       format('signed-gate-run-{0}', github.run_id)
     }}
   cancel-in-progress: >-
@@ -41,7 +43,8 @@ concurrency:
       github.actor == 'tjfontaine' &&
       github.triggering_actor == 'tjfontaine' &&
       inputs.pr == 'main' &&
-      inputs.sha != ''
+      inputs.sha != '' &&
+      inputs.coalesce
     }}
 
 jobs:

@@ -48,8 +48,8 @@ pushed commit is still the live `refs/heads/main` tip, and dispatches
 `SIGNED_GATE_DISPATCH_TOKEN` as an owner (`tjfontaine`) fine-grained personal
 access token scoped to `carrick-sh/carrick` with **Actions: Read and write**
 only, so `authorize` and baseline provenance checks admit the run without
-broadening `GITHUB_TOKEN` or `carrick-workers` App trust (#654). Authorized
-`pr=main` runs share the workflow-level `signed-gate-main` concurrency group
+broadening `GITHUB_TOKEN` or `carrick-workers` App trust (#654). Automatic dispatches set `coalesce=true`. Authorized
+automatic tip runs share the workflow-level `signed-gate-main-tip` concurrency group
 with `cancel-in-progress: true`, cancelling superseded in-flight baselines when
 `main` advances again.
 
@@ -60,6 +60,12 @@ fails with an instruction to seed it manually:
 ```sh
 gh workflow run signed-gate.yml --ref main -f pr=main -f sha=<merge-base-sha>
 ```
+
+Manual dispatches omit `coalesce` (default `false`) and use the per-SHA
+`signed-gate-main-backfill-<sha>` workflow concurrency group with
+`cancel-in-progress: false`. They neither cancel automatic tip baselines nor
+get cancelled by them, even when another landing advances main. GitHub may
+replace a pending duplicate for the same SHA; the running backfill survives.
 
 `pr=main` accepts only a main ancestor, runs the same signed phase and uploads
 the admitted baseline (90-day retention). Rerun the PR request afterward.
@@ -96,9 +102,10 @@ signed`, and independent artifact inspection. Nested acceptance reuses that
 lease. Both runners must share their local lease path with all other gate
 participants on that host. PR and `gate:signed` runs keep isolated workflow
 concurrency groups while a per-SHA `gate` job concurrency group with
-`cancel-in-progress: false` queues duplicate requests (`pr=main` baselines
-instead coalesce at workflow level under `signed-gate-main` with
-`cancel-in-progress: true`). GitHub does not expose
+`cancel-in-progress: false` queues duplicate requests (automatic tip baselines
+also coalesce at workflow level under `signed-gate-main-tip` with
+`cancel-in-progress: true`; manual backfills retain their per-SHA workflow
+groups with cancellation disabled). GitHub does not expose
 `runner.name` when job concurrency is evaluated, so host serialization uses
 the lease rather than an invalid runner-name expression (director ruling on
 #634).
