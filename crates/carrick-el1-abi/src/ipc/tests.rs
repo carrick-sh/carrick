@@ -1403,6 +1403,128 @@ fn ring_pipe_creation_is_backed_before_publication() {
         guard.pipe().unwrap().is_backed(),
         "no first-write host provisioning"
     );
+    assert_eq!(guard.pipe().unwrap().try_write(b"once").result, Ok(4));
+    let mut output = [0; 4];
+    assert_eq!(guard.pipe().unwrap().try_read(&mut output).result, Ok(4));
+    assert_eq!(&output, b"once");
+    assert_eq!(
+        guard.pipe().unwrap().try_read(&mut output).result,
+        Err(pipe::Error::WouldBlock(pipe::WaitFor::Readable))
+    );
+}
+
+#[test]
+fn ring_pipe_creation_reuses_or_returns_retained_storage() {
+    let fx = fixture(1 << 20);
+    let mut storage = fx.pipe_storage();
+    let original = storage;
+    let object = fx
+        .region
+        .create_backed_pipe(4096, &mut storage, &EL1)
+        .unwrap();
+    fx.region.lock(object, &EL1).unwrap().free();
+
+    let mut spare = fx.pipe_storage();
+    let unused = spare;
+    let reused = fx
+        .region
+        .create_backed_pipe(65536, &mut spare, &EL1)
+        .unwrap();
+    assert_eq!(reused.index(), object.index());
+    assert_ne!(reused.generation(), object.generation());
+    assert_eq!(
+        spare, unused,
+        "fitting retained storage needs no new extent"
+    );
+    assert_eq!(fx.region.lock(reused, &EL1).unwrap().storage(), original);
+    fx.region.lock(reused, &EL1).unwrap().free();
+
+    // Grow beyond the retained extent: displaced storage returns to the owner.
+    let mut larger = IpcPipeStorage {
+        ring_bytes: 131072,
+        pages: 32,
+        offset: 0,
+    };
+    larger.offset = fx.bump(larger.footprint());
+    let installed = larger;
+    let grown = fx
+        .region
+        .create_backed_pipe(131072, &mut larger, &EL1)
+        .unwrap();
+    assert_eq!(grown.index(), object.index());
+    assert_eq!(larger, original);
+    assert_eq!(fx.region.lock(grown, &EL1).unwrap().storage(), installed);
+}
+
+#[test]
+fn ring_pipe_creation_rejects_bad_storage_without_spending_the_record() {
+    let fx = fixture(1 << 20);
+    let valid = fx.pipe_storage();
+    for invalid in [
+        IpcPipeStorage::default(),
+        IpcPipeStorage {
+            offset: fx.pool_len,
+            ..valid
+        },
+        IpcPipeStorage {
+            pages: u64::MAX,
+            ..valid
+        },
+        IpcPipeStorage {
+            ring_bytes: 4096,
+            pages: 1,
+            ..valid
+        },
+    ] {
+        let mut storage = invalid;
+        assert_eq!(
+            fx.region.create_backed_pipe(65536, &mut storage, &EL1),
+            Err(IpcError::BadStorage)
+        );
+        assert_eq!(storage, invalid);
+    }
+    let mut storage = valid;
+    let object = fx
+        .region
+        .create_backed_pipe(65536, &mut storage, &EL1)
+        .unwrap();
+    assert_eq!(
+        object.generation(),
+        0,
+        "failed creation never publishes a generation"
+    );
+    assert_eq!(fx.region.lock(object, &EL1).unwrap().storage(), valid);
+}
+
+#[test]
+fn ring_pipe_creation_refuses_overlap_and_preserves_retained_storage() {
+    let fx = fixture(1 << 20);
+    let mut storage = fx.pipe_storage();
+    let retained = storage;
+    let object = fx
+        .region
+        .create_backed_pipe(65536, &mut storage, &EL1)
+        .unwrap();
+    fx.region.lock(object, &EL1).unwrap().free();
+    let mut overlap = IpcPipeStorage {
+        ring_bytes: 131072,
+        pages: 32,
+        ..retained
+    };
+    let unchanged = overlap;
+    assert_eq!(
+        fx.region.create_backed_pipe(131072, &mut overlap, &EL1),
+        Err(IpcError::BadStorage)
+    );
+    assert_eq!(overlap, unchanged);
+    let mut none = IpcPipeStorage::default();
+    let reused = fx
+        .region
+        .create_backed_pipe(65536, &mut none, &EL1)
+        .unwrap();
+    assert_eq!(reused.index(), object.index());
+    assert_eq!(reused.generation(), object.generation() + 1);
+    assert_eq!(fx.region.lock(reused, &EL1).unwrap().storage(), retained);
 }
 
 #[test]
