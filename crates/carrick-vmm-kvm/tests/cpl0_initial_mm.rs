@@ -1654,3 +1654,17 @@ fn in_zone_child_pipe2_and_unfaulted_cow_read_matches_native_oracle() {
     assert_eq!(outcome.run.stdout, b"P");
     assert!(outcome.run.stderr.is_empty());
 }
+
+/// Native x86_64 Linux oracle (same assembly, `timeout 10`): exit 0 and
+/// `pipe-vectors=once\n`. The second read requires EAGAIN (11), detecting
+/// duplicate publication; after closing the last writer the next read is EOF.
+#[test]
+#[ignore = "#1756: x86 shared ring IPC venue is not wired yet"]
+fn in_zone_two_process_pipe_vectors_move_bytes_exactly_once() {
+    let elf = native_exit_fixture("native_pipe_vectors.S");
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 128, ROOT_AFFINITY_IDLE_PEER)
+        .expect("two-process pipe vector run");
+    assert_eq!(outcome.run.exit_code, 0);
+    assert_eq!(outcome.run.stdout, b"pipe-vectors=once\n");
+    assert!(outcome.run.stderr.is_empty());
+}
