@@ -1455,6 +1455,11 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         let CarrierRunExit::PhysicalDoorbell { port, .. } = exit else {
             return Err(fail("idle peer service requires physical doorbell"));
         };
+        let file = if *port == OWNER_GRANT_PORT {
+            self.read_owner_file(None)?
+        } else {
+            None
+        };
         let mut custody = self
             ._custody
             .lock()
@@ -1471,7 +1476,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                         .owner_grant_crossings
                         .checked_add(1)
                         .ok_or_else(|| fail("physical crossing counter exhausted"))?;
-                    custody.service_anonymous_grant(&lease)?;
+                    custody.service_anonymous_grant(&lease, file)?;
                     Ok((None, None, None))
                 }
                 carrick_el1_abi::FORK_STOCK_PORT => {
@@ -1681,6 +1686,11 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         let slot = self
             .physical_slot()
             .ok_or_else(|| fail("production CPU has no physical slot"))?;
+        let file = if matches!(production_port(*port), Some(ProductionPort::OwnerGrant)) {
+            self.read_owner_file(Some(task))?
+        } else {
+            None
+        };
         let mut custody = self
             ._custody
             .lock()
@@ -1694,7 +1704,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
                         .owner_grant_crossings
                         .checked_add(1)
                         .ok_or_else(|| fail("physical crossing counter exhausted"))?;
-                    custody.service_anonymous_grant(&lease)?;
+                    custody.service_anonymous_grant(&lease, file)?;
                     Ok((None, None, None))
                 }
                 Some(ProductionPort::ForkStock) => {
@@ -2450,7 +2460,14 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
     initial_task: Option<InitialTaskBinding>,
     prepare_table_stock: Option<anonymous_owner::PrepareTableStock>,
     /// The ISA-neutral fork stock, loans and child quarantine.
-    fork_stock: carrick_hal::fork_stock::ForkStock<carrick_hal::fork_stock::UntaggedRoots>,
+    fork_stock: carrick_hal::fork_stock::ForkStock<
+        carrick_hal::fork_stock::UntaggedRoots,
+        carrick_hal::fork_stock::ForkHostBackingCustody,
+    >,
+    initial_sources: Option<(
+        AddressContext<RootGpa>,
+        carrick_hal::fork_stock::ForkHostBackingCustody,
+    )>,
     maintenance_root: Option<RootGpa>,
     anonymous_next_gpa: FrameGpa,
     anonymous_pending: [Option<anonymous_owner::PendingGrant>; 2],
@@ -3808,6 +3825,7 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             child_retire_crossings: 0,
             run_failure_crossings: 0,
             metadata_base,
+            initial_sources: None,
             host_forwards: 0,
             idle_peer_forwards: 0,
             host_yields: 0,

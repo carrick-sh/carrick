@@ -441,6 +441,10 @@ enum HostReadinessStep {
 }
 
 enum ForwardDecision {
+    HostFile {
+        address: carrick_guest_arch::KernelVa,
+        record: Vec<u8>,
+    },
     Immediate(InitialSyscallDisposition),
     Blocked(ForwardRequest, Box<DispatchOutcome>),
 }
@@ -656,6 +660,19 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
             .lock()
             .map_err(|_| TrapError::Hypervisor("KVM dispatcher poisoned".into()))?;
         let (decision, token) = self.physical.capture_forward(task, |venue, frame| {
+            if frame.rax == carrick_el1_abi::HostFileCrossing::NUMBER {
+                if frame.rcx != carrick_el1_abi::HostFileCrossing::FRAME_TAG {
+                    return Err(TrapError::Hypervisor("host file crossing tag".into()));
+                }
+                let address = carrick_guest_arch::KernelVa::new(frame.rdi);
+                let len = usize::try_from(frame.rsi)
+                    .map_err(|_| TrapError::Hypervisor("host file crossing length".into()))?;
+                return Ok(ForwardDecision::HostFile {
+                    address,
+                    record: venue.capture_host_file(address, len)?,
+                });
+            }
+
             if frame.rax == carrick_el1_abi::HostObjectReleaseCrossing::NUMBER
                 && frame.rcx == carrick_el1_abi::HostObjectReleaseCrossing::FRAME_TAG
             {
@@ -919,8 +936,42 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                 )),
             }
         })?;
+        let decision = match decision {
+            ForwardDecision::HostFile {
+                address,
+                mut record,
+            } => {
+                // Capture released physical custody. The shared host-file owner
+                // resolves the caller's ring descriptor, never a host task fd.
+                let source = if carrick_core_abi::host_file::reply(&record).is_some() {
+                    None
+                } else {
+                    match dispatcher.serve_native_host_file(&mut record) {
+                        Ok(served) => served.retained_source,
+                        Err(_) => {
+                            carrick_core_abi::host_file::HostFileRequestView::parse(&mut record)
+                                .and_then(|view| {
+                                    view.reply(carrick_abi::LINUX_ENOSYS.guest_retval(), &[])
+                                })
+                                .map_err(|_| {
+                                    TrapError::Hypervisor("host file refusal reply".into())
+                                })?;
+                            None
+                        }
+                    }
+                };
+                self.physical.with_retained_forward(task, &token, |venue| {
+                    venue.complete_host_file(address, &record, source)
+                })?;
+                ForwardDecision::Immediate(InitialSyscallDisposition::Return(0))
+            }
+            decision => decision,
+        };
         drop(dispatcher);
         match decision {
+            ForwardDecision::HostFile { .. } => {
+                return Err(TrapError::Hypervisor("unsettled host file record".into()));
+            }
             ForwardDecision::Blocked(request, outcome) => {
                 let submission = submission.ok_or_else(|| {
                     TrapError::Hypervisor(ForwardAuthorityRefusal::BlockingWait.to_string())
