@@ -5585,7 +5585,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             ));
         }
         carrick_observability::probes::hvpatch_el1_file_fault_handoff(window.fault_page, 0, 6);
-        let outcome = self.run_owner_fork_service(
+        let outcome = self.run_user_transfer_service(
             carrick_el1_abi::TrapFrame {
                 esr: carrick_el1_abi::MM_PORTAL_GRANT_ESR,
                 ..carrick_el1_abi::TrapFrame::default()
