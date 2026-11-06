@@ -2803,3 +2803,85 @@ fn filtered_live_close_and_dup_replace_defer_host_release_once() {
     c.destroy_table(peer, |_| panic!("all descriptions already released"))
         .unwrap();
 }
+
+/// pipe2 can copy its reserved numbers without holding the table lock or
+/// exposing either endpoint. A copy fault cancels both claims, not live fds.
+#[test]
+fn owned_pipe_pair_copyout_cancel_preserves_two_live_tables() {
+    let c = authority::<3, 8>();
+    let parent = c.create_table(8, &mut storage(8)).unwrap();
+    c.open(parent, Fd(0), description(1), false).unwrap();
+    let pair = c.reserve_pair(parent, Fd(0)).unwrap();
+    assert_eq!(pair.fds(), [Fd(1), Fd(2)]);
+    for fd in pair.fds() {
+        assert_eq!(c.get(parent, fd), Err(Error::BadFd));
+        assert_eq!(c.reserve_exact(parent, fd).unwrap_err(), Error::Busy);
+    }
+    let child = c.fork(parent, &mut storage(8)).unwrap();
+    assert_eq!(c.open(child, Fd(0), description(2), false), Ok(Fd(1)));
+    assert_eq!(c.open(parent, Fd(0), description(3), false), Ok(Fd(3)));
+    c.cancel_pair(pair).unwrap();
+    assert_eq!(c.open(parent, Fd(0), description(4), false), Ok(Fd(1)));
+    assert_eq!(c.get(child, Fd(1)).unwrap().backing, BackingToken(2));
+    c.destroy_table(parent, |_| {}).unwrap();
+    c.destroy_table(child, |_| {}).unwrap();
+}
+
+#[test]
+fn owned_pipe_pair_busy_once_and_second_retain_refusal_keep_custody() {
+    let c = authority::<1, 2>();
+    let table = c.create_table(4, &mut storage(4)).unwrap();
+    let pair = c.reserve_pair(table, Fd(0)).unwrap();
+    let reader = c.create_pinned(description(10)).unwrap();
+    let writer = c.create_pinned(description(11)).unwrap();
+    let lock = c.transaction(table).unwrap();
+    let refusal = c.commit_pair(pair, [&reader, &writer], true).unwrap_err();
+    assert_eq!(refusal.error(), Error::Contended);
+    drop(lock);
+    let ofd = c.ofd(writer.key().index).unwrap();
+    ofd.holds.store((FREE_INDEX << 32) | PIN, Ordering::Relaxed);
+    let refusal = c
+        .commit_pair(refusal.into_reservation(), [&reader, &writer], true)
+        .unwrap_err();
+    assert_eq!(refusal.error(), Error::NoMemory);
+    assert_eq!(c.get(table, Fd(0)), Err(Error::BadFd));
+    assert_eq!(c.get(table, Fd(1)), Err(Error::BadFd));
+    assert_eq!(c.holds(&reader), Ok((0, 1)));
+    ofd.holds.store(PIN, Ordering::Relaxed);
+    // An already admitted pair survives a lower descriptor limit.
+    c.set_limit(table, 0).unwrap();
+    assert_eq!(
+        c.commit_pair(refusal.into_reservation(), [&reader, &writer], true)
+            .unwrap(),
+        [Fd(0), Fd(1)]
+    );
+    c.set_limit(table, 4).unwrap();
+    for (fd, backing) in [(Fd(0), 10), (Fd(1), 11)] {
+        assert_eq!(c.get(table, fd).unwrap().backing, BackingToken(backing));
+        assert_eq!(c.getfd(table, fd), Ok(true));
+    }
+    c.unpin(reader).unwrap();
+    c.unpin(writer).unwrap();
+    let mut released = 0;
+    c.destroy_table(table, |_| released += 1).unwrap();
+    assert_eq!(released, 2);
+}
+
+#[test]
+fn owned_pipe_pair_reservation_refusal_and_retirement_leave_no_new_claim() {
+    let c = authority::<1, 2>();
+    let table = c.create_table(1, &mut storage(4)).unwrap();
+    assert_eq!(
+        c.reserve_pair(table, Fd(0)).unwrap_err(),
+        Error::TooManyFiles
+    );
+    assert_eq!(c.open(table, Fd(0), description(1), false), Ok(Fd(0)));
+    c.set_limit(table, 4).unwrap();
+    let pair = c.reserve_pair(table, Fd(0)).unwrap();
+    c.destroy_table(table, |_| {}).unwrap();
+    let reused = c.create_table(4, &mut storage(4)).unwrap();
+    assert_eq!(c.open(reused, Fd(0), description(2), false), Ok(Fd(0)));
+    assert_eq!(c.cancel_pair(pair).unwrap_err().error(), Error::StaleTable);
+    assert_eq!(c.open(reused, Fd(0), description(3), false), Ok(Fd(1)));
+    c.destroy_table(reused, |_| {}).unwrap();
+}
