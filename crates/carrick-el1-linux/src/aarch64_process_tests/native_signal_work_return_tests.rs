@@ -433,13 +433,14 @@ fn resident_signal_work_return(
                 result,
                 checkpoint,
             );
-            assert_eq!(
-                frame.elr, 0x700000,
-                "actual service completion must publish its handler before any later user-return checkpoint"
-            );
         } else {
             crate::dispatch::final_user_return(&mut frame, action, checkpoint);
         }
+        assert_eq!(
+            frame.elr, 0x700000,
+            "each actual return must publish its handler before any later checkpoint"
+        );
+        assert_eq!(publications, 1, "the first return publishes exactly once");
     }
     assert_eq!(
         frame.elr, 0x700000,

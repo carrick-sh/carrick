@@ -227,12 +227,14 @@ pub(super) fn resume_selected<'a, X: ForkStockCrossing>(
     entry
         .import_in_zone_standard_signals()
         .unwrap_or_else(|_| fatal());
-    let outcome = entry.resume_checkpoint().unwrap_or_else(|reason| {
-        super::native_run_failure::complete_native_run_failure(
-            common_entry::execution_binding(task),
-            reason,
-        )
-    });
+    let outcome = entry
+        .resume_checkpoint(|entry| super::arm_signal::checkpoint_saved_user_return(task, entry))
+        .unwrap_or_else(|reason| {
+            super::native_run_failure::complete_native_run_failure(
+                common_entry::execution_binding(task),
+                reason,
+            )
+        });
     if matches!(outcome, NativeResume::NoPending) {
         // SAFETY: this exact record is selected by the execution owner.
         unsafe {
@@ -1689,6 +1691,11 @@ impl<'a, X: ForkStockCrossing> Aarch64NativeProcessService<'a, X> {
                 {
                     return Err(NativeProcessError::Fault);
                 }
+                #[cfg(test)]
+                super::native_process_runtime::host_test_support::record_return_copyout(
+                    address,
+                    bytes.len(),
+                );
             } else {
                 let validator = &crate::file::HardwareValidator;
                 let available = match access {

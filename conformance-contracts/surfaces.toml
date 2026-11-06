@@ -189,6 +189,7 @@ surfaces = [
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_fault_supply_tests.rs", contract = "kernel.el1.fork-cow" },
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_fault_supply_tests.rs", contract = "kernel.el1.mm-exclusive-owner" },
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_fault_supply_tests.rs", contract = "process.native.terminal-child" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_host_owned_signal_resume_tests.rs", contract = "kernel.el1.signal-delivery-owner" },
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_ipc_wake_tests.rs", contract = "kernel.el1.ipc-two-process" },
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_retirement_tests.rs", contract = "process.native.terminal-child" },
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_signal_resume_tests.rs", contract = "kernel.el1.signal-delivery-owner" },

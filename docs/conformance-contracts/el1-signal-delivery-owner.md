@@ -61,3 +61,16 @@ The two-live-thread `native_signal_work_return_tests` cover both mask operations
 null and resident oldset, exact service acknowledgment before park, restart
 and no-restart frames, and preservation of genuine host work. Compiled stack
 envelopes include service-return and saved-resume delivery and terminal tails.
+
+A host-owned SignalOwner borrows the ring lane only for its retained operation.
+After output completes, it checkpoints the exact saved context before publishing
+UserReturn to the host executor. The required callback uses the shared delivery
+policy on ARM and x86 and preserves the allocated signal-frame stack pointer.
+Real pending carrier work keeps this native continuation until its exact reply
+is consumed. Even a reply acknowledged before park is deferred to that owned
+checkpoint; it cannot return a host-owned member directly to EL0 in ring.
+The two-live-thread `native_host_owned_signal_resume_tests` use the production
+scheduler load and resume_production path for a rehomed host-owned root, with
+no work, a parked carrier reply and an inline carrier acknowledgment. A
+shared-policy refusal observed before a concurrent work drain remains owned
+until its exact checkpoint; clearing the doorbell cannot erase that obligation.

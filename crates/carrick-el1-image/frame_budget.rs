@@ -251,6 +251,7 @@ impl Frames {
         // Host-owned records must publish their signal frame before host
         // handback. Their scheduler/owner resume frames remain live here.
         let resumed_signal = resume
+            + self.maximum("::finish_host_resume::")
             + self.maximum("::arm_signal::checkpoint_saved_user_return::")
             + self.maximum("::arm_signal::deliver_on_user_return_with::")
             + shared_delivery;
@@ -455,6 +456,34 @@ impl Frames {
                     + self.maximum("::begin_service::")
                     + self.required("::begin_service_inner::")?
                     + self.required("::prepare_service_inner::")?
+                    + self.maximum("::release_service_claim::")
+                    + allocation,
+            ),
+            // Return-work staging always defers a ready reply to the next
+            // owner checkpoint. Admission and yield retain these frames;
+            // backing reply application cannot nest beneath begin_return_work.
+            (
+                "host-owned return work",
+                resume
+                    + self.maximum("::finish_host_resume::")
+                    + self.required("::begin_return_work::")?
+                    + self.required("::begin_service_inner::")?
+                    + (self.required("::prepare_service_inner::")?
+                        + self.sum(&[
+                            "::retire_closing_entry::",
+                            "::retire_closing_member::",
+                            "::retire_cancelled_pool_member::",
+                            "::retire_thread_verdict::",
+                            "::retire_thread_identity::",
+                            "::lifecycle_admission_settled::",
+                        ]))
+                    .max(
+                        self.required("::park_service::")?
+                            + self.sum(&[
+                                "::yield_service_checkpoint::",
+                                "::yield_service_checkpoint_as::",
+                            ]),
+                    )
                     + self.maximum("::release_service_claim::")
                     + allocation,
             ),
@@ -802,6 +831,7 @@ mod tests {
             "x::finish_service_result::h0",
             "x::prepare_fault_repark::h0",
             "x::settle_service_exit::h0",
+            "x::begin_return_work::h0",
             "x::park_owner_wait::h0",
             "x::apply_fault_reply::h0",
             "x::settle_native_descriptor_reply::h0",
@@ -876,6 +906,27 @@ mod tests {
         );
         let error = frames.check(16384, 288).unwrap_err();
         assert!(error.contains("native service signal delivery"));
+    }
+
+    #[test]
+    fn host_owned_work_keeps_admission_and_yield_frames_charged() {
+        let mut missing = Vec::new();
+        for method in [
+            "begin_return_work",
+            "finish_host_resume",
+            "yield_service_checkpoint",
+            "yield_service_checkpoint_as",
+            "retire_closing_entry",
+            "retire_closing_member",
+        ] {
+            let mut frames = small_frames();
+            frames.0.insert(format!("x::{method}::h0"), 12000);
+            let error = frames.check(16384, 288).unwrap_err();
+            if !error.contains("host-owned return work") {
+                missing.push(format!("{method}: {error}"));
+            }
+        }
+        assert!(missing.is_empty(), "{}", missing.join("\n"));
     }
 
     #[test]
