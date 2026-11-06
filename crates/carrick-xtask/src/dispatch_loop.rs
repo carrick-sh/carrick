@@ -11151,6 +11151,39 @@ exec /usr/bin/git "$@"
             assert!(!outputs.contains("worker_failed=true"), "{outputs}");
         });
     }
+    #[test]
+    fn replay_1763_published_incomplete_rounds_continue() {
+        for issue in [1755, 1735, 1740] {
+            shared_fixture(|root| {
+                current_pr(root);
+                pushed_checkpoint(&"c".repeat(40));
+                server(root).round_outcome(
+                    FinishStatus::Blocked,
+                    &format!("#{issue}: implementation remains incomplete; next: finish the production witness"),
+                    None,
+                ).unwrap();
+                let posted = regular_text(&root.join("posted.md")).unwrap();
+                assert_eq!(outcome_status(&posted), Some("Continuing"), "{posted}");
+                assert!(
+                    posted.contains("chain=true")
+                        || regular_text(&root.join("outputs"))
+                            .unwrap()
+                            .contains("chain=true")
+                );
+                assert!(posted.contains("finish the production witness"));
+            });
+        }
+    }
+    #[test]
+    fn replay_1763_unnamed_blocker_is_contract_violation() {
+        shared_fixture(|root| {
+            let error = server(root)
+                .round_outcome(FinishStatus::Blocked, "implementation incomplete", None)
+                .unwrap_err();
+            assert!(error.to_string().contains("named external blocker"));
+            assert!(!root.join("posted.md").exists());
+        });
+    }
     fn chained(round: u32) -> ChainFacts {
         ChainFacts {
             round,
