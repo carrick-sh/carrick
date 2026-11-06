@@ -67,12 +67,14 @@ x86 ordinals. This assertion remains behind the same ignored red fixture
 until the production venue exists.
 
 `non_venue_writev_is_counted_without_host_crossing` independently calls
-native ordinal 20 on descriptor -1, without requiring pipe creation first.
+native ordinal 20 on host-backed stdout, without requiring pipe creation first.
 It requires one root ring refusal, no carrier refusal, no served vector
 write and no host forward. Its same-source native Linux oracle is compiled
-with `-DNATIVE_ORACLE` and requires EBADF (9); Carrick intentionally returns
-ENOSYS (38) for the absent venue under strict ring-first. Both variants
-exit 0 with empty output when their own contract holds. This independent
+with `-DNATIVE_ORACLE` and requires result 1 and stdout `!`; Carrick requires
+ENOSYS (38) with empty output for the non-pipe venue under strict ring-first.
+Both variants exit 0 when their own contract holds. An invalid fd would not
+prove this boundary: a complete namespace must settle it as EBADF (9).
+This independent
 refusal witness does not demonstrate pipe service.
 
 ## Shared scatter copyout prerequisite
