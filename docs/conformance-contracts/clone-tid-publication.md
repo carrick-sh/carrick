@@ -68,27 +68,161 @@ publication and runnable enqueue. An observer must not see either TID until
 this succeeds; the new child must not run before both words are ready.
 Release exact-MM exclusion after settlement, then deliver deferred wakes.
 
-## Cross-crate lock order requiring review
+## Revised borrowed admission (review prerequisite)
 
-The proposed nesting is exact-MM execution exclusion, exact-MM mapping/copy
-admission, then process-graph birth publication. Birth's scheduler enqueue
-must remain after release of the process graph guard, as it is today.
-Runnable execution stays barred until aggregate settlement.
+This is a proposed interface, not an existing capability. The aggregate owner
+belongs in the neutral memory transaction layer; Linux retains the clone
+arguments and birth operation. ISA adapters provide exclusion acknowledgments
+and guarded byte-access mechanics, not a separate publication algorithm.
 
-This order is a proposal, not a verified lock order. In particular,
-`publish_born` may acquire process-owner and scheduler authorities, whereas
-the memory owner has reservation-root/editor and completion authorities.
-Neither memory supply nor graph admission may wait for a peer while holding
-a lock that peer needs to acknowledge exclusion. A Busy admission retains the
-owned operation and enrolls on the existing release source before probing;
-it must not spin, return errno or enlarge the executor pool.
+`AggregateCopyOwner` owns the exact carrier, MM key, MM incarnation, root
+generation, execution binding, a unique operation identity, execution-exclusion
+custody, mapping/editor custody, and the admitted union of destination bytes.
+Its constructor is private to the memory owner. It cannot be cloned or rebuilt
+from numeric identities. Acquiring it requires draining existing user execution
+and in-flight kernel copies before acquiring the mapping editor. A raised
+installation gate alone is not an execution-drain acknowledgment. The caller
+must release its own execution occupancy before waiting for the drain.
 
-The existing host exact-MM pause in
-`carrick-kernel/src/dispatch/mm_quiesce.rs` drains occupancy and holds its
-fence, but is not an in-ring aggregate-copy capability. Wiring a host-only
-pause into the clone owner would create another execution path. The neutral
-owner needs an ISA-independent protocol with ARM and CPL0 mechanics before
-this design can be claimed implemented.
+The owner lends `BorrowedCopyAdmission<'owner>` for one access, including its
+intent and checked byte subrange. The borrow cannot outlive, consume, release,
+or reopen the aggregate. It is neither `Copy` nor `Clone`, has private fields,
+and authenticates the exact owner identity and live editor, not simply a slot
+number, matching MM key, or a boolean "already locked" flag. Capturing
+preimages, publishing either output and restoring bytes all require this same
+borrow. The union contains at most eight bytes across at most four pages;
+range construction uses checked arithmetic and merges overlap before capture.
+
+Extend the existing neutral `UserCopy` admission context with an optional
+borrowed admission. A scoped adapter borrows both the existing copier and the
+aggregate, then implements the same `UserCopy::copy_in` / `copy_out` methods,
+returning the same `CopyOutcome`. It is not another memory implementation:
+selection, permission checks, translation, physical-owner authentication,
+guarded byte access and cursor advancement remain in the current transfer
+machinery. The ordinary and borrowed cases join before those checks. The
+ordinary case acquires per-copy admission; the borrowed case validates the
+loan and borrows the aggregate's existing editor instead of acquiring it again.
+The existing owning `ValidatedChunk` must accept a lifetime-bound borrowed
+editor custody variant; completing a borrowed chunk cannot release the editor.
+This change must cover reads as well as writes, including preimage reads.
+
+The borrowed selector accepts only the gate raise owned by that aggregate.
+Another host pause, terminal close or retirement is not bypassed. Authenticate
+this with owned gate custody and its generation, never by ignoring all raised
+gates or subtracting a raw pause count. A foreign exclusion discovered before
+the first store releases aggregate admission and waits on that producer. Once
+commit starts, competing exclusions wait for this aggregate's settlement;
+terminal cancellation also settles through this owner. No borrowed access may
+supply backing, reacquire an editor, enroll a waiter, or return `NotYet` after
+the first store. Such a result means the admission invariant is broken and
+terminates the run; it is not EFAULT and must not attempt best-effort rollback.
+
+Preparation remains interruptible and uses ordinary `UserCopy` admission. A
+`NotYet` retains the original decoded clone/clone3 operation and exact memory
+request; before enrollment it releases every aggregate, editor, root, graph
+and physical fence. It enrolls on the existing owner dependency and probes
+once. On wake it revalidates all ranges and permissions; it never trusts a
+pre-park preimage. To avoid waiting on its own gate, final admission either
+finds every page already prepared or releases the aggregate before requesting
+supply. Mapping contention similarly retains this operation rather than
+returning errno. A genuine permission refusal before stores leaves both
+outputs untouched.
+
+## Release order, including notification queues
+
+Thread-stock admission is done before aggregate admission and without an
+aggregate or process graph guard. Its production `park_object_record` save
+closure takes the graph while the member-release object queue is held (in
+`native_process_runtime/thread_stock.rs`). Therefore **object queue -> graph**
+is an existing lock edge. No transaction path may introduce graph -> object
+queue, including a destructor or a notification revision reservation.
+
+After preparation and execution drain, the commit nesting is execution
+exclusion -> mapping/copy admission -> graph birth publication. None of those
+steps waits while holding a lock needed by a draining peer. Acquisition Busy
+releases earlier admission and retains the owned operation on the actual
+release source. Birth must reserve all fallible resources before the first
+store. The new child can be enqueued only while its execution remains barred.
+
+Settlement, on both success and refusal, has this order:
+
+1. Finish the graph mutation or unwind its unpublished birth, then drop the
+   graph guard. No scheduler queue, memory release source, thread-stock
+   notification or completion callback runs under that guard.
+2. With both exclusions retained, finish output settlement (restore the merged
+   byte preimage on refusal) and birth settlement (return the claim/control
+   reservation on refusal, or finish Born and runnable enqueue on success).
+   Split `lifecycle_admission_settled` into state settlement and owned deferred
+   notification custody; its current immediate publication cannot be called
+   unchanged. Settle graph-owned state in a fresh short graph scope if needed,
+   return its notification intents, and drop that guard before doing queue work.
+3. Release mapping/copy admission and its editor without delivering callbacks.
+   Return owned release receipts to the aggregate instead. Source revision
+   reservation and queue enrollment also happen outside every graph scope.
+   Preserve each source's enroll/reprobe ordering: advance its revision before
+   the resource becomes available, then release the resource, retaining the
+   publish receipt. Do not wake first and hope the waiter retries.
+4. Release execution exclusion, preserving other owners' gate raises. Retain
+   its release receipt too. At this point peers and the child may execute and
+   all final output and birth state is settled.
+5. Deliver the deferred memory, execution, stock, exit and runnable wake
+   notifications through their existing queues. Callbacks can now reenter the
+   graph or request memory admission. Consume every receipt exactly once;
+   dropping the transaction cannot silently discard a promised wake.
+
+`SpaceEditor::drop` currently reserves an Editor notification and publishes
+it, and `SpaceExclusion::drop` lowers the gate with notification custody.
+Neither destructor provides the above split. Add explicit consuming deferred
+release operations to these existing owners; do not suppress notification by
+using a source-free venue. The aggregate's unwind path must use the same
+settlement state machine and order. Before the first store it may unwind
+without output restoration; after that point loss of settlement authority is
+a typed terminal invariant failure, never a normal clone result.
+
+The host exact-MM pause in `dispatch/mm_quiesce.rs` is evidence for the needed
+drain semantics, not an in-ring capability to import. ARM and CPL0 must share
+the neutral aggregate owner and differ only in stop/acknowledgment mechanics.
+
+## Required replacement witness (not yet implemented)
+
+The current reduction below is insufficient for the revised design. Its
+replacement must admit both actors through `NativeProcessRuntime` and its
+registry with distinct live thread records, control slots and execution
+bindings in the same process/MM. Both syscall entries must carry
+`process: Some` with authenticated production venues; a `ProcessNative` fake
+or a host thread that merely reads fixture atomics does not establish this.
+Set both actors' affinity explicitly and bound coordination waits.
+
+Use the production reservation root, live page tables and physical owner
+service. Map two writable output pages but leave their backing absent. Drive
+clone with both TID flags through normal dispatch and observe the actual
+`CopyOutcome::NotYet`, retained clone operation, queue enrollment and released
+execution capacity. While it is parked, admit the sibling to read both words
+and issue real mprotect and munmap through normal dispatch. The reader's own
+fault may materialize backing: record that supply and do not claim both pages
+remain unbacked afterward. Protect or replace the selected child mapping,
+then restore writable mappings through the production edit completion path.
+Resumption must reselect that incarnation rather than reuse a stale grant.
+
+At final aggregate admission, hold a sibling edit attempt on the production
+release dependency and verify it cannot complete until output and birth
+settlement. The sibling's loads must execute through admitted execution, not
+through the test driver's unguarded physical-memory view. After notification
+delivery, require successful child birth and both TIDs, exactly one birth,
+no replayed output, and no observation of a refused child's TID. A separate
+schedule refuses birth after admission and verifies both preimages unchanged,
+then admits the waiting edit and a sibling store to prove no stale restoration
+can overwrite it. Observe all actor and queue progress before asserting the
+expected red result so an early refusal cannot masquerade as contention proof.
+
+A VM-free test can control physical supply and execution acknowledgments but
+must use real admission and mapping-edit owners. Signed guest execution must
+additionally prove ordinary sibling loads cannot escape exclusion. The test
+must fail on the current code because clone refuses `NotYet` instead of
+retaining and resuming; it must also distinguish publication escape and lost
+sibling stores. No new test is claimed here: constructing this witness is
+still a prerequisite before implementation, along with independent review of
+this cross-crate lock order.
 
 ## Current red reduction and remaining acceptance
 
