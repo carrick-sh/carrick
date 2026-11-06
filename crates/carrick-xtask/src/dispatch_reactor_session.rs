@@ -831,7 +831,9 @@ impl Server<'_> {
             if let Some(blocker) = super::repeated_blocker(
                 comments
                     .iter()
-                    .filter(|c| outcome_bot(&c["user"]) || trusted_owner(&c["user"]))
+                    .filter(|c| {
+                        classify(&c["user"], c["body"].as_str().unwrap_or_default()).is_some()
+                    })
                     .filter_map(|c| {
                         if trusted_owner(&c["user"]) {
                             Some("")
@@ -1876,6 +1878,16 @@ mod tests {
                 })
             })
             .collect();
+        // Automatic rounds use the owner account too. Their marker keeps
+        // them from masquerading as owner intervention between outcomes.
+        fake.comments.insert(
+            1,
+            json!({"id":3,
+                "user":{"login":"tjfontaine","type":"User"},
+                "created_at":"2026-10-30T00:01:30Z",
+                "body":format!("/agent continue the witness\n\n{MARKER}")
+            }),
+        );
         let (err, text) = call(
             &mut fake,
             &state,
