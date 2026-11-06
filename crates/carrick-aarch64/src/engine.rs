@@ -6294,6 +6294,20 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         }
     }
 
+    fn resume_core_read(
+        &self,
+        continuation: carrick_guest_mem::OwnedReadContinuation,
+        address: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
+        if let Some(read) = self.read_excluded_owner_bytes(address, length) {
+            drop(continuation);
+            read
+        } else {
+            <Self as GuestMemory>::resume_read(self, continuation)
+        }
+    }
+
     fn diagnostic_fault_page_tables(&self, far: u64) -> Option<(u64, [u64; 4])> {
         const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
         let ttbr = self.vcpu.borrow().get_sys_reg(SysReg::Ttbr0).ok()?;
