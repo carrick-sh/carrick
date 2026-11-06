@@ -67,4 +67,5 @@ pub use carrick_host_linux::host_to_linux_errno;
 // Exercise portable scratch policy on hosts without APFS.
 #[cfg(all(test, not(target_os = "macos")))]
 #[path = "apfs.rs"]
+#[allow(dead_code)] // Operator-only APFS APIs are not used on this test host.
 mod apfs_host_tests;
