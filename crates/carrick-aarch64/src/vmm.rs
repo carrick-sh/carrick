@@ -1344,6 +1344,21 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         Ok(())
     }
 
+    fn atomic_load_user_u32(&self, va: u64) -> Result<u32, MemoryError> {
+        let _ = va;
+        Err(MemoryError::Unsupported)
+    }
+
+    fn atomic_compare_exchange_user_u32(
+        &mut self,
+        va: u64,
+        expected: u32,
+        desired: u32,
+    ) -> Result<u32, MemoryError> {
+        let _ = (va, expected, desired);
+        Err(MemoryError::Unsupported)
+    }
+
     /// Backing WRITE that bypasses the guest-visible WRITE permission (a
     /// carrick-INTERNAL frame the guest must receive even into a guest-read-only
     /// mapping: vdso vvar, the signal frame, bootstrap). The host page is writable;
