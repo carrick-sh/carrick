@@ -12215,10 +12215,30 @@ fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
     let retained = unsafe { *fixture.zone.record(record).ctx_mut() };
     assert_eq!(retained.native.x[0], VA);
     assert_eq!(retained.native.x[2], 0x12345678);
-    assert_eq!(retained.native.x[1], crate::sched::FUTEX_WAIT_PRIVATE);
-    assert_eq!(retained.native.x[5], 0);
+    assert_ne!(
+        retained.native.x[1] & (1 << 63),
+        0,
+        "owner continuation must retain the relative-deadline marker"
+    );
+    assert_eq!(retained.native.x[5], 105);
     crate::sched::ThreadCpu::load(&mut cpu, &mut frame, &retained);
-    carrick_el1::substrate::sched::restore_retry_metadata(&mut frame, &retained);
+    word.value.set(0);
+    let served = crate::sched::Sched {
+        handoff: None,
+        zone: fixture.zone,
+        slot: fixture.slot,
+        task: &fixture.task,
+        cpu: &mut cpu,
+        user: &word,
+        counters: &counters,
+    }
+    .serve_futex(&mut frame);
+    assert_eq!(
+        served,
+        Some(crate::sched::Served::Returned { switched: false })
+    );
+    assert_eq!(frame.x[0] as i64, -11);
+    crate::sched::ThreadCpu::load(&mut cpu, &mut frame, &retained);
     word.value.set(0x12345678);
     cpu.now = 101;
     assert_eq!(
@@ -12240,25 +12260,6 @@ fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
     );
     crate::sched::ThreadCpu::load(&mut cpu, &mut frame, &retained);
     frame.x[3] = 0;
-    word.value.set(0);
-    let served = crate::sched::Sched {
-        handoff: None,
-        zone: fixture.zone,
-        slot: fixture.slot,
-        task: &fixture.task,
-        cpu: &mut cpu,
-        user: &word,
-        counters: &counters,
-    }
-    .serve_futex(&mut frame);
-    assert_eq!(
-        served,
-        Some(crate::sched::Served::Returned { switched: false })
-    );
-    assert_eq!(frame.x[0] as i64, -11);
-    crate::sched::ThreadCpu::load(&mut cpu, &mut frame, &retained);
-    frame.x[3] = 0;
-    word.value.set(0x12345678);
     cpu.pending.push_back(carrick_el1_abi::GIC_KICK_INTID);
     assert_eq!(
         crate::sched::Sched {
