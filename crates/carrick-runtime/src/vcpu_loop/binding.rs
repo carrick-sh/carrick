@@ -2055,7 +2055,7 @@ where
                     .capture_core_for_publication(&self.kernel, engine, fatal)
                 {
                     Ok(super::crash::CoreCaptureAttempt::Complete(publication)) => {
-                        *prepared_core = publication.map(Box::new);
+                        *prepared_core = publication;
                     }
                     Ok(super::crash::CoreCaptureAttempt::OwnerWait(wait)) => {
                         self.phase = HvpatchProductionPhase::EnrollRetainedOwner {

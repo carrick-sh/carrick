@@ -6,7 +6,8 @@
 use super::*;
 
 pub(crate) enum CoreCaptureAttempt {
-    Complete(Option<PreparedCorePublication>),
+    // Boxed: the prepared publication is ~312 bytes, the owner wait ~40.
+    Complete(Option<Box<PreparedCorePublication>>),
     OwnerWait(carrick_el1_abi::PortalOwnerWait),
 }
 
@@ -746,10 +747,9 @@ where
                             consumed += to_read;
                             continue;
                         }
-                        let read = if pending.as_ref().is_some_and(|pending| {
+                        let read = if let Some(pending) = pending.take_if(|pending| {
                             pending.address == address && pending.length == to_read
                         }) {
-                            let pending = pending.take().expect("matched pending core read");
                             engine.resume_core_read(
                                 pending.continuation,
                                 pending.address,
@@ -841,7 +841,7 @@ where
             );
             crate::probes::hvpatch_core_hash(generation.get(), hash_words);
             lifecycle(3, 0);
-            Ok(CoreCaptureAttempt::Complete(Some(
+            Ok(CoreCaptureAttempt::Complete(Some(Box::new(
                 PreparedCorePublication {
                     snapshot: process,
                     payload,
@@ -849,7 +849,7 @@ where
                     fatal_tid: fatal.tid.raw(),
                     publication: None,
                 },
-            )))
+            ))))
         })();
         if result.is_err()
             || matches!(
