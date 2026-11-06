@@ -26,6 +26,7 @@ structural_budgets = []
 [bindings]
 vm_free = [
   "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_fork_exec_pipe_writer_reaches_its_parent (#1506: production fork/exec successor constructs eventfd and epoll, counter read, empty wait, flags and close)",
+  "carrick-timer-core::timerfd::tests (expiry arithmetic prerequisite only; no ring clock, scheduler or constructor acceptance)",
   "carrick-el1-abi::ipc::tests::el1_ipc_too_small_retained_ring_stays_owned_until_replacement (#1506: retained extent identity, no stock consumption on refusal, exactly one replacement transfer; constructor syscall remains unserved)",
   "carrick-el1-linux::aarch64_process_tests::serial_host_native_fork_epoll_ctl_observes_peer_pipe_write (#1506 red-first: pre-admitted inherited epoll, native child ADD, peer child pipe write, zero-timeout readiness/data and drain; no constructor or signed execution claim)",
   "carrick-el1-linux::aarch64_process_tests::{serial_host_native_fork_children_create_eventfd_in_their_own_tables,serial_host_native_fork_children_create_epoll_in_their_own_tables,serial_host_native_fork_children_create_pipe_in_their_own_tables,serial_host_native_fork_children_create_timerfd_in_their_own_tables} (#1506 red-first: real forks, two live children, production dispatch, independent backing and private descriptor publication; no signed instruction or complete constructor work-budget claim)",

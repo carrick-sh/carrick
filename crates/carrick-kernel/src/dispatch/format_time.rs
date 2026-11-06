@@ -913,32 +913,11 @@ pub(super) fn timerfd_expirations(
     deadline: Option<Duration>,
     expirations: u64,
 ) -> (u64, Option<Duration>) {
-    let Some(deadline) = deadline else {
-        return (expirations, None);
-    };
-    let Some(now) = linux_clock_duration(clock, clock_id) else {
-        return (expirations, Some(deadline));
-    };
-    if now < deadline {
-        return (expirations, Some(deadline));
-    }
-    let Some(interval) = interval else {
-        return (expirations.saturating_add(1), None);
-    };
-    if interval.is_zero() {
-        return (expirations.saturating_add(1), None);
-    }
-
-    let now_nanos = duration_to_nanos(now);
-    let deadline_nanos = duration_to_nanos(deadline);
-    let interval_nanos = duration_to_nanos(interval);
-    let elapsed_periods = ((now_nanos - deadline_nanos) / interval_nanos).saturating_add(1);
-    let count = u64::try_from(elapsed_periods).unwrap_or(u64::MAX);
-    let next_deadline_nanos =
-        deadline_nanos.saturating_add(interval_nanos.saturating_mul(elapsed_periods));
-    (
-        expirations.saturating_add(count),
-        Some(duration_from_nanos_saturating(next_deadline_nanos)),
+    carrick_timer_core::timerfd::expirations(
+        deadline.and_then(|_| linux_clock_duration(clock, clock_id)),
+        interval,
+        deadline,
+        expirations,
     )
 }
 
@@ -974,15 +953,6 @@ pub(super) fn linux_timespec_from_optional_duration(duration: Option<Duration>) 
 pub(super) fn duration_to_nanos(duration: Duration) -> u128 {
     const NANOS_PER_SEC: u128 = 1_000_000_000;
     u128::from(duration.as_secs()) * NANOS_PER_SEC + u128::from(duration.subsec_nanos())
-}
-
-pub(super) fn duration_from_nanos_saturating(nanos: u128) -> Duration {
-    const NANOS_PER_SEC: u128 = 1_000_000_000;
-    let seconds = nanos / NANOS_PER_SEC;
-    if seconds > u128::from(u64::MAX) {
-        return Duration::new(u64::MAX, 999_999_999);
-    }
-    Duration::new(seconds as u64, (nanos % NANOS_PER_SEC) as u32)
 }
 
 pub(super) fn read_itimerspec(

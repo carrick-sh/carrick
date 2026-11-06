@@ -255,3 +255,38 @@ performs a zero-timeout empty epoll wait, checks CLOEXEC and closes both.
 These controls do not prove blocking wake delivery or signed guest execution.
 The earlier epoll host-member and native-wait findings remain landing blockers;
 this continuation reuses that owner and does not replace the work in #1765.
+
+
+## Timerfd arithmetic prerequisite
+
+The continuation rebased onto the admitted main and found that
+`carrick-timer-core` had no timerfd implementation: its modules covered only
+interval and POSIX signal timers. The existing timerfd expiry calculation now
+lives in `carrick_timer_core::timerfd::expirations`, and the host dispatcher
+uses it. The host wrapper still samples the creating `ClockDomain`, only for
+an armed timer. The moved calculation preserves unavailable/early samples,
+one-shot disarming, zero-interval handling, missed-period accumulation and
+count/deadline saturation. It does constant arithmetic work, including for a
+one-nanosecond period spanning `Duration::MAX`.
+
+This is a behavior-preserving arithmetic extraction from
+`crates/carrick-kernel/src/dispatch/format_time.rs` into
+`crates/carrick-timer-core/src/timerfd.rs`; it changes neither IPC layout,
+clock-domain identity nor lock ordering. The host consumes the extracted
+function immediately. The new core unit bindings cover its edge conditions;
+they are not a substitute for the two production constructor witnesses.
+
+The remaining migration requires a separately reviewed shared ABI and clock
+interface. In particular, IPC currently has no timerfd kind, no creator clock
+domain handle and no expiry/rearm enrollment. The timer must retain its
+creator's domain across fork/exec and fd transfer, and both host and ring
+must mutate the same timer record. Clock samples and deadline translation
+must respect deterministic, frozen and scaled domains; a current-task or
+raw-counter clock substitution would change Linux-visible behavior. Expiry
+publication must retain member-before-epoll locking, post-unlock notification,
+and exact-object cancellation at final release. A constructor added before
+those consumers exist would create unusable descriptors.
+
+The Temporary timerfd crossings remain, and the native constructor target is
+still open. No ARM, x86, signed execution or full #1506 acceptance is claimed
+by the arithmetic prerequisite. Earlier epoll review blockers remain open.
