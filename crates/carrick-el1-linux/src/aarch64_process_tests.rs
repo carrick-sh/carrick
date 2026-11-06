@@ -12017,6 +12017,16 @@ fn signal_setup_nonresident_input(nr: u64) {
 
 #[test]
 fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
+    futex_owner_wait(false);
+}
+
+#[test]
+fn futex_relative_deadline_survives_owner_wait_with_two_live_threads() {
+    futex_owner_wait(true);
+}
+
+#[cfg(test)]
+fn futex_owner_wait(timed: bool) {
     use crate::native_process_runtime::host_test_support::Physical;
     use crate::sched::{LinuxSchedEntry, UserWord};
     use carrick_el1_abi::Lifecycle;
@@ -12032,8 +12042,12 @@ fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
             self.reads.set(self.reads.get() + 1);
             (!self.missing.get()).then_some(self.value.get())
         }
-        fn read_u64(&self, _: &CurrentTask, _: u64) -> Option<u64> {
-            panic!("untimed wait")
+        fn read_u64(&self, _: &CurrentTask, address: u64) -> Option<u64> {
+            match address {
+                a if a == VA + 8 => Some(5),
+                a if a == VA + 16 => Some(0),
+                _ => None,
+            }
         }
     }
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
@@ -12126,6 +12140,8 @@ fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
     fixture.zone.spaces.set_idle_ttbr(0x30000);
     let mut cpu = crate::sched::FakeCpu {
         ttbr: (fixture_ttbr0(fixture), fixture_ttbr0(fixture)),
+        now: 100,
+        freq: 1,
         ..Default::default()
     };
     let mut frame = carrick_el1_abi::TrapFrame {
@@ -12136,6 +12152,7 @@ fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
     frame.x[0] = VA;
     frame.x[1] = crate::sched::FUTEX_WAIT_PRIVATE;
     frame.x[2] = 0x12345678;
+    frame.x[3] = if timed { VA + 8 } else { 0 };
     let mut parked = parked;
     crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut parked);
     {
@@ -12209,6 +12226,51 @@ fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
     assert_eq!(retained.native.x[0], VA);
     assert_eq!(retained.native.x[2], 0x12345678);
     crate::sched::ThreadCpu::load(&mut cpu, &mut frame, &retained);
+    if timed {
+        // The SVC entry overwrites FAR. A retry may only use operation custody.
+        frame.far = 0xfeed_bad;
+        cpu.now = 101;
+        let mut entry = runtime
+            .enter_registered(
+                registry(),
+                source,
+                &fixture.task,
+                fixture.address,
+                &retained,
+                &mut service,
+            )
+            .unwrap();
+        let _route = crate::dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &cache,
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &word,
+            }),
+            None,
+            Some(fixture),
+            Some(&mut *entry),
+            Some(source),
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        assert_eq!(
+            cpu.now, 105,
+            "owner park must not restart the five-second interval"
+        );
+        assert_eq!(frame.x[0] as i64, -110);
+        drop(entry);
+        assert_eq!(fixture.page.live(), 2);
+        registry().unregister_root_for_test(&runtime);
+        return;
+    }
     word.value.set(0);
     let served = crate::sched::Sched {
         handoff: None,
