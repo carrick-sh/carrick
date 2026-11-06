@@ -185,31 +185,30 @@ impl TransferPin for RetainedUserData {
             Ok(value) | Err(value) => value,
         };
         if observed == expected {
-            self.publish_completed_write(4);
+            if !self.publish_completed_write(4) {
+                return None;
+            }
         }
         Some(observed)
     }
 }
 impl RetainedUserData {
-    fn publish_completed_write(&self, len: usize) {
-        let mapping = self._mapping.as_ref().unwrap_or_else(|| {
-            carrick_fatal!(
-                "hvpatch::user_transfer",
-                "write lost retained content owner"
-            )
-        });
+    fn publish_completed_write(&self, len: usize) -> bool {
+        let Some(mapping) = self._mapping.as_ref() else {
+            return false;
+        };
         let offset = self.pointer as usize - mapping.host_base() as usize;
         mapping.code_content.mark_icache_dirty(offset, len);
         if self.selected.executable {
-            self.custody
+            if self
+                .custody
                 .publish_user_executable(self.selected.ipa, len as u64, |_, _| None, |_, _| None)
-                .unwrap_or_else(|error| {
-                    carrick_fatal!(
-                        "hvpatch::user_transfer",
-                        "executable write publication failed: {error:?}"
-                    )
-                });
+                .is_err()
+            {
+                return false;
+            }
         }
+        true
     }
     fn copy_bytes(
         &mut self,
@@ -257,7 +256,12 @@ impl RetainedUserData {
         if self.intent.is_write() {
             // A peer MM may have consumed admission dirtiness before this
             // memcpy. Publish the completed write, then await I2 completion.
-            self.publish_completed_write(len);
+            if !self.publish_completed_write(len) {
+                carrick_fatal!(
+                    "hvpatch::user_transfer",
+                    "completed write publication failed"
+                );
+            }
         }
         true
     }
