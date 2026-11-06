@@ -35,13 +35,10 @@ fi
 CARRICK_SCCACHE_RESOLVED=${CARRICK_SCCACHE_RESOLVED:-}
 CARRICK_SCCACHE_SEARCH_PATH=$PATH
 if [ -z "${SCCACHE_DIR:-}" ]; then
-    if [ -d /Volumes/carrick/dev ]; then
-        SCCACHE_DIR=/Volumes/carrick/dev/.sccache
-    elif [ -d /Volumes/CaseSensitive/carrick ]; then
-        SCCACHE_DIR=/Volumes/CaseSensitive/carrick/.sccache
-    else
-        SCCACHE_DIR="$HOME/dev/.sccache"
-    fi
+    # Do not stat conventional mounts during startup: a cold USB volume can
+    # stall even when the compiler cache is disabled. Hosts that keep a cache
+    # elsewhere select it explicitly through SCCACHE_DIR.
+    SCCACHE_DIR="$HOME/dev/.sccache"
 fi
 SCCACHE_CACHE_SIZE="${SCCACHE_CACHE_SIZE:-10G}"
 export CARRICK_CARGO_CACHE_CONFIG CARRICK_SCCACHE_RESOLVED SCCACHE_DIR SCCACHE_CACHE_SIZE

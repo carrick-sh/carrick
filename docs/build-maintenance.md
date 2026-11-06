@@ -70,12 +70,12 @@ macOS still uses Apple ld64 and the existing post-link signing path.
 | Host | Default `SCCACHE_DIR` | Default `SCCACHE_CACHE_SIZE` |
 |---|---|---|
 | carrick-vm | `~/dev/.sccache` | `10G` |
-| cloudmac | `/Volumes/carrick/dev/.sccache` | `10G` |
-| director Mac | `/Volumes/CaseSensitive/carrick/.sccache` | `10G` |
+| cloudmac | `~/dev/.sccache` | `10G` |
+| director Mac | `~/dev/.sccache` | `10G` |
 
 Both variables can be overridden in the host environment (`env.sh` on cloudmac).
-The volume defaults are selected by directory presence, preferring cloudmac's
-volume when both exist. Restart your own idle sccache server after changing its
+Startup does not inspect conventional volumes. Select cold-storage caches
+explicitly with `SCCACHE_DIR`; even a directory lookup can stall on USB. Restart your own idle sccache server after changing its
 storage configuration; a running server retains its previous configuration.
 `just build-cache` reports the effective server location, cap, hits and misses.
 Do not stop a server while other workers are building.

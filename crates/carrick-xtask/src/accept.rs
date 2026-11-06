@@ -1420,12 +1420,14 @@ fn run_command_redirect(
     cmd.stdout(log_file);
     cmd.stderr(err_file);
 
+    // Gate checkouts are internal. Supply a default without replacing an
+    // operator's inherited home; explicit per-command configuration wins.
+    if std::env::var_os("CARRICK_HOME").is_none() {
+        cmd.env("CARRICK_HOME", cwd.join("target/carrick-home"));
+    }
     for (k, v) in env {
         cmd.env(k, v);
     }
-    // Gate checkouts are admitted on the host's internal volume. Keep runtime
-    // scratch there rather than probing the conventional cold-storage mount.
-    cmd.env("CARRICK_HOME", cwd.join("target/carrick-home"));
     // A focused local build override must never narrow an acceptance gate.
     cmd.env_remove("CARRICK_TEST_TARGET");
 

@@ -73,8 +73,9 @@ The conventional `/Volumes/carrick` mount is cold USB storage on cloudmac.
 Runtime scratch must instead use the admitted internal checkout. The shared
 `prepare-cargo` action exports `CARRICK_HOME=$GITHUB_WORKSPACE/target/carrick-home`
 when no override is set; signed test scripts use `$PWD/target/carrick-home`
-under the same condition. Acceptance commands always set their child processes'
-`CARRICK_HOME` to `<checkout>/target/carrick-home`. Any explicit CI override must
+under the same condition. Acceptance commands default their child processes'
+`CARRICK_HOME` to `<checkout>/target/carrick-home`, preserving inherited and
+per-command operator overrides. Any explicit CI override must
 also point to internal storage.
 
 The shared VFS resolver checks `$CARRICK_HOME/scratch` before touching the
