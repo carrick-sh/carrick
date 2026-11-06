@@ -1397,6 +1397,9 @@ mod delayed_owner {
             return false;
         };
         let request_generation = mailbox.request_generation();
+        // Once the observer sees this owner it may release and drop the probe.
+        // Keep teardown behind publication of the worker it must join.
+        let mut owner_slot = gate.owner.lock();
         let _ = gate.events.send(Observation::OwnerClaimed);
         loser(mailbox);
         // Test-only custody: defer completion without holding an executor or
@@ -1425,7 +1428,7 @@ mod delayed_owner {
                 );
             }
         });
-        *gate.owner.lock() = Some(owner);
+        *owner_slot = Some(owner);
         true
     }
     pub(super) fn loser(mailbox: &carrick_el1_abi::MetadataGrantMailbox) {
