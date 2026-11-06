@@ -274,7 +274,20 @@ fn serial_host_native_fork_exec_pipe_writer_reaches_its_parent() {
         frame.x[0] = fd;
         frame.x[1] = address;
         frame.x[2] = count;
-        let action = crate::dispatch::dispatch_syscall_with_ipc(
+        let selected = fixture.zone.slot(fixture.slot).current().unwrap();
+        // SAFETY: fixture retains this selected live record.
+        let binding = unsafe { runtime.record_binding(fixture.zone.record_ref(selected)) }.unwrap();
+        let mut entry = runtime
+            .enter_registered(
+                registry,
+                source,
+                &fixture.task,
+                binding.address,
+                &binding.words,
+                &mut service,
+            )
+            .unwrap();
+        let route = crate::dispatch::dispatch_syscall_with_native(
             &mut frame,
             &counters,
             core::slice::from_ref(&fixture.task),
@@ -289,14 +302,16 @@ fn serial_host_native_fork_exec_pipe_writer_reaches_its_parent() {
                 user: &crate::sched::HardwareUserWord,
             }),
             Some(&venue),
+            None,
+            Some(&mut *entry),
+            Some(source),
+            None,
             |_| core::ptr::null_mut(),
         );
-        assert!(
-            matches!(
-                action,
-                carrick_el1_abi::Action::Served | carrick_el1_abi::Action::ServedWithWork
-            ),
-            "production IPC dispatch: {action:?}"
+        assert_eq!(
+            route,
+            carrick_personality_linux::dispatch::CompletionRoute::Served,
+            "production native IPC dispatch"
         );
         frame.x[0]
     };
@@ -310,6 +325,15 @@ fn serial_host_native_fork_exec_pipe_writer_reaches_its_parent() {
         6,
         "exec successor's vector write"
     );
+    crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
+    for bad in [0, 1u64 << 48, 0x6000_0000] {
+        assert_eq!(
+            call(66, 4, bad, 1) as i64,
+            -14,
+            "native child bad iovec {bad:#x} must settle EFAULT in ring"
+        );
+    }
+    crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
     assert!(
         fixture
             .zone

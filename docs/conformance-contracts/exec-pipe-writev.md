@@ -58,6 +58,10 @@ only boolean `carrick_core::UserCopy`, so the done/fault/not-yet outcome from
 it does not introduce another copy outcome type. Invalid imported payload
 ranges still return EFAULT immediately. The production dispatcher binding
 refuses an unavailable header, then supplies it and completes exactly one byte.
+A native child has no host syscall venue: a refused header therefore settles
+EFAULT in ring instead of becoming counted ENOSYS. The two-process production
+dispatch witness checks NULL, non-canonical and unavailable headers without a
+pipe effect.
 
 The host handback gathers physical page prefixes before locking the pipe.
 An imported vector can fault between logical page boundaries; its transfer
