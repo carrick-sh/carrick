@@ -1,6 +1,6 @@
 {
   "bool-trait:crates/carrick-core/src/mm/transaction/user_write.rs:UserWriteVenue::copy": 1,
-  "bool-trait:crates/carrick-core/src/personality.rs:UserCopy::write_val": 1,
+  "bool-trait:crates/carrick-core/src/user_copy.rs:UserCopy::write_val": 1,
   "bool-trait:crates/carrick-el1/src/file.rs:UserCopy::copy_in": 1,
   "bool-trait:crates/carrick-el1/src/file.rs:UserCopy::copy_out": 1,
   "bool-trait:crates/carrick-el1/src/isa/x86/initial_mm.rs:InitialFrameSource::copy_guest_data": 1,
