@@ -116,3 +116,15 @@ which remains a P1 acceptance blocker.
 Add production Busy-once/then-success and prepared-conflict witnesses before
 claiming concurrency acceptance. Full signed ARM gates and loader acceptance
 remain outstanding.
+
+### Suspension consumer dependency
+
+The owner noted on PR #1735 that #1728 needs this same CPL0 suspension
+consumer for host copyouts into lazy ELF pages. The remaining supply path
+must have one consumer with guest-fault and host-copy callers. The current
+focused private-file witnesses do not establish either continuation contract.
+
+Mapping admission now uses one physical-reference owner with typed evidence
+for an owned descriptor or the exact pinned IPC projection. Both paths use
+the existing checked mapping-reference increment; the authority-debt ceiling
+is unchanged.

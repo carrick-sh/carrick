@@ -678,7 +678,9 @@ impl SyscallDispatcher {
     /// Retain a carrier-opened regular file as a private-mapping byte source.
     /// A directory has no mmap operation (ENODEV, as Linux).
     fn native_map_source(&self, description: &Arc<crate::kernel::FileDescription>) -> Served {
-        let Some(reference) = description.retain_mapping() else {
+        let Some(reference) =
+            description.retain_mapping(crate::kernel::objects::MappingAdmission::Descriptor)
+        else {
             return Served::errno(carrick_abi::LINUX_EBADF);
         };
         self.native_map_reference(reference)

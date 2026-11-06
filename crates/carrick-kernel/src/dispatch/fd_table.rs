@@ -2110,7 +2110,9 @@ impl NativeFileWitness {
     }
 
     pub fn mapping(&self) -> Option<Arc<crate::kernel::objects::MappedFileReference>> {
-        self.parent.as_ref()?.retain_mapping()
+        self.parent
+            .as_ref()?
+            .retain_mapping(crate::kernel::objects::MappingAdmission::Descriptor)
     }
 
     pub fn registered_opens(&self) -> usize {
@@ -4480,11 +4482,17 @@ mod tests {
         }));
         let description = kernel_file_description(Arc::clone(&backing), 0);
         description.retain_fd_ref();
-        let mapping = description.retain_mapping().unwrap();
+        let mapping = description
+            .retain_mapping(crate::kernel::objects::MappingAdmission::Descriptor)
+            .unwrap();
         let fragment = Arc::clone(&mapping);
         description.release_fd_ref();
         assert_eq!(description.fd_ref_count(), 0);
-        assert!(description.retain_mapping().is_none());
+        assert!(
+            description
+                .retain_mapping(crate::kernel::objects::MappingAdmission::Descriptor)
+                .is_none()
+        );
         assert!(matches!(
             &*backing.read(),
             OpenDescription::InMemoryFile { .. }
@@ -4508,7 +4516,9 @@ mod tests {
         }));
         let description = kernel_file_description(Arc::clone(&backing), 0);
         description.retain_fd_ref();
-        let mapping = description.retain_mapping().unwrap();
+        let mapping = description
+            .retain_mapping(crate::kernel::objects::MappingAdmission::Descriptor)
+            .unwrap();
         drop(mapping);
         assert_eq!(description.fd_ref_count(), 1);
         assert!(matches!(

@@ -3754,7 +3754,11 @@ mod tests {
             let handle = delegate_default(&open, 3).expect("enters at open");
             guest_write(handle, 3, b"def");
             // Demotion: a shared mapping takes the inode out of the zone.
-            drop(open.description.retain_mapping().expect("fd owns backing"));
+            drop(
+                open.description
+                    .retain_mapping(crate::kernel::objects::MappingAdmission::Descriptor)
+                    .expect("fd owns backing"),
+            );
             assert_eq!(open.description.delegation_handle(), 0);
             assert_eq!(host_bytes(&tmp), b"abcdef");
             for attempt in 0..1024 {
@@ -3784,7 +3788,10 @@ mod tests {
             let open = open_host(&tmp);
             let handle = delegate_default(&open, 3).unwrap();
             guest_write(handle, 3, b"ped");
-            let mapping = open.description.retain_mapping().expect("fd owns backing");
+            let mapping = open
+                .description
+                .retain_mapping(crate::kernel::objects::MappingAdmission::Descriptor)
+                .expect("fd owns backing");
             assert_eq!(open.description.delegation_handle(), 0);
             assert_eq!(host_bytes(&tmp), b"mapped");
             drop(mapping);
@@ -3794,7 +3801,7 @@ mod tests {
             let mapped = open_host(&tmp);
             let mapping = mapped
                 .description
-                .retain_mapping()
+                .retain_mapping(crate::kernel::objects::MappingAdmission::Descriptor)
                 .expect("fd owns backing");
             assert_eq!(delegate_default(&mapped, 3), Err(NotEligible::Mapped));
             drop(mapping);

@@ -412,7 +412,7 @@ impl<'a> MemView<'a> {
             };
             let file_mapping_reference = if !map_flags.contains(LinuxMmapFlags::ANONYMOUS) {
                 this.open_file(fd.0).and_then(|open| {
-                    open.description.retain_mapping()
+                    open.description.retain_mapping(crate::kernel::objects::MappingAdmission::Descriptor)
                 })
             } else {
                 None

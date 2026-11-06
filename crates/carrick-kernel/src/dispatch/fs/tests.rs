@@ -4900,7 +4900,9 @@ fn m1_close_releases_posix_locks_before_last_alias_or_mapping() {
         panic!("install file: {opened:?}")
     };
     let description = h.dispatcher.open_file(fd as i32).unwrap().description;
-    let mapping = description.retain_mapping().unwrap();
+    let mapping = description
+        .retain_mapping(crate::kernel::objects::MappingAdmission::Descriptor)
+        .unwrap();
     assert_eq!(
         h.run(23, [fd as u64, 0, 0, 0, 0, 0]),
         DispatchOutcome::Returned { value: 4 }
