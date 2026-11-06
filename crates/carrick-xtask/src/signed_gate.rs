@@ -67,11 +67,70 @@ pub enum SignedGateAction {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
-    pub pr: Option<u64>,
+    pub kind: RequestKind,
+    pub prs: Vec<u64>,
     pub sha: String,
     pub base: String,
     pub baseline_run: Option<u64>,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RequestKind {
+    Main,
+    PullRequest,
+    MergeGroup,
+}
+
+/// Automatic authorization is tied to GitHub's event identity, never its actor.
+/// Manual requests and label events retain the owner-only policy.
+fn automatic_request(
+    event: &Value,
+    name: &str,
+    git_ref: &str,
+    head: &str,
+) -> Result<(String, String), ReceiptError> {
+    if event["repository"]["full_name"] != REPOSITORY {
+        return Err(fail("automatic signed gate requires this repository"));
+    }
+    let (candidate, base) = match name {
+        "merge_group"
+            if event["action"] == "checks_requested"
+                && event["merge_group"]["base_ref"] == "refs/heads/main"
+                && git_ref.starts_with("refs/heads/gh-readonly-queue/main/")
+                && event["merge_group"]["head_ref"] == git_ref =>
+        {
+            (
+                event["merge_group"]["head_sha"]
+                    .as_str()
+                    .unwrap_or_default(),
+                event["merge_group"]["base_sha"]
+                    .as_str()
+                    .unwrap_or_default(),
+            )
+        }
+        "push"
+            if git_ref == "refs/heads/main"
+                && event["ref"] == git_ref
+                && event["deleted"] == false =>
+        {
+            (
+                event["after"].as_str().unwrap_or_default(),
+                event["after"].as_str().unwrap_or_default(),
+            )
+        }
+        _ => {
+            return Err(fail(
+                "automatic signed gate must target the main queue or main push",
+            ));
+        }
+    };
+    let candidate = sha(candidate)?;
+    let base = sha(base)?;
+    if candidate != head {
+        return Err(fail("event SHA differs from Actions head"));
+    }
+    Ok((candidate, base))
+}
+
 fn fail(message: impl Into<String>) -> ReceiptError {
     ReceiptError::Baseline(message.into())
 }
@@ -157,13 +216,34 @@ fn prepare(event_path: &Path, output: &Path) -> Result<(), ReceiptError> {
     let event = read_json(event_path)?;
     let actor = std::env::var("GITHUB_ACTOR").map_err(|e| fail(e.to_string()))?;
     let triggering = std::env::var("GITHUB_TRIGGERING_ACTOR").unwrap_or_else(|_| actor.clone());
-    if !allowed(&actor) || !allowed(&triggering) || event["repository"]["full_name"] != REPOSITORY {
+    let event_name = std::env::var("GITHUB_EVENT_NAME").map_err(|e| fail(e.to_string()))?;
+    let automatic = matches!(event_name.as_str(), "merge_group" | "push");
+    if (!automatic && (!allowed(&actor) || !allowed(&triggering)))
+        || event["repository"]["full_name"] != REPOSITORY
+    {
         return Err(fail(
             "only the owner (tjfontaine) may start or rerun signed gates",
         ));
     }
-    let event_name = std::env::var("GITHUB_EVENT_NAME").map_err(|e| fail(e.to_string()))?;
+    let automatic_pair = if automatic {
+        Some(automatic_request(
+            &event,
+            &event_name,
+            &std::env::var("GITHUB_REF").unwrap_or_default(),
+            &std::env::var("GITHUB_SHA").unwrap_or_default(),
+        )?)
+    } else {
+        None
+    };
     let (pr, requested_sha) = match event_name.as_str() {
+        "merge_group" | "push" => (
+            None,
+            automatic_pair
+                .as_ref()
+                .ok_or_else(|| fail("missing automatic identity"))?
+                .0
+                .clone(),
+        ),
         "workflow_dispatch" => {
             if std::env::var("GITHUB_REF").unwrap_or_default() != "refs/heads/main" {
                 return Err(fail("dispatch the trusted workflow from main"));
@@ -222,24 +302,65 @@ fn prepare(event_path: &Path, output: &Path) -> Result<(), ReceiptError> {
             ));
         }
     }
+    let comparison_sha = automatic_pair
+        .as_ref()
+        .map_or(requested_sha.as_str(), |pair| pair.1.as_str());
     let comparison = api(&format!(
-        "repos/{REPOSITORY}/compare/main...{requested_sha}"
+        "repos/{REPOSITORY}/compare/main...{comparison_sha}"
     ))?;
     let base = sha(comparison["merge_base_commit"]["sha"]
         .as_str()
         .unwrap_or_default())?;
-    if pr.is_none() && base != requested_sha {
+    if pr.is_none() && base != comparison_sha {
         return Err(fail("main baseline SHA must be on main"));
     }
     fs::create_dir_all(output).map_err(|e| fail(e.to_string()))?;
+    let kind = if event_name == "merge_group" {
+        RequestKind::MergeGroup
+    } else if pr.is_some() {
+        RequestKind::PullRequest
+    } else {
+        RequestKind::Main
+    };
+    let prs = if kind == RequestKind::MergeGroup {
+        // GitHub associates each original commit with its PR. Enumerate all
+        // commits so batched groups notify every participating author.
+        let commits = pages(
+            &format!("repos/{REPOSITORY}/compare/{base}...{requested_sha}?per_page=100"),
+            Some("commits"),
+        )?;
+        let mut prs = std::collections::BTreeSet::new();
+        for commit in commits {
+            let commit_sha = sha(commit["sha"].as_str().unwrap_or_default())?;
+            for pull in pages(
+                &format!("repos/{REPOSITORY}/commits/{commit_sha}/pulls?per_page=100"),
+                None,
+            )? {
+                if pull["base"]["ref"] == "main" && pull["base"]["repo"]["full_name"] == REPOSITORY
+                {
+                    if let Some(number) = pull["number"].as_u64() {
+                        prs.insert(number);
+                    }
+                }
+            }
+        }
+        prs.into_iter().collect()
+    } else {
+        pr.into_iter().collect()
+    };
     let mut request = Request {
-        pr,
+        kind,
+        prs,
         sha: requested_sha,
         base,
         baseline_run: None,
     };
-    if request.pr.is_some() {
-        request.baseline_run = Some(download_baseline(&request.base, output)?);
+    if request.kind != RequestKind::Main {
+        request.baseline_run = Some(download_baseline(
+            &request.base,
+            output,
+            request.kind == RequestKind::MergeGroup,
+        )?);
         validate_receipt(&load(&output.join("base.json"))?, &request.base)?;
     }
     write(
@@ -257,7 +378,7 @@ fn prepare(event_path: &Path, output: &Path) -> Result<(), ReceiptError> {
             "sha={}\nbase={}\nmain={}",
             request.sha,
             request.base,
-            request.pr.is_none()
+            request.kind == RequestKind::Main
         )
         .map_err(|e| fail(e.to_string()))?;
     }
@@ -267,59 +388,124 @@ fn prepare(event_path: &Path, output: &Path) -> Result<(), ReceiptError> {
 pub fn trusted_run(run: &Value) -> bool {
     run["path"] == WORKFLOW
         && run["head_branch"] == "main"
-        && run["event"] == "workflow_dispatch"
+        && (run["event"] == "push" || run["event"] == "workflow_dispatch")
         && run["status"] == "completed"
         && run["repository"]["full_name"] == REPOSITORY
         && run["head_repository"]["full_name"] == REPOSITORY
-        && run["actor"]["login"].as_str().is_some_and(allowed)
-        && run["triggering_actor"]["login"]
-            .as_str()
-            .is_some_and(allowed)
+        && (run["event"] == "push"
+            || (run["actor"]["login"].as_str().is_some_and(allowed)
+                && run["triggering_actor"]["login"]
+                    .as_str()
+                    .is_some_and(allowed)))
 }
-fn download_baseline(base: &str, output: &Path) -> Result<u64, ReceiptError> {
+fn baseline_runs() -> Result<Vec<Value>, ReceiptError> {
     let mut runs = pages(
         &format!(
-            "repos/{REPOSITORY}/actions/workflows/signed-gate.yml/runs?event=workflow_dispatch&branch=main&per_page=100"
+            "repos/{REPOSITORY}/actions/workflows/signed-gate.yml/runs?branch=main&per_page=100"
         ),
         Some("workflow_runs"),
     )?;
     runs.sort_by_key(|r| std::cmp::Reverse(r["id"].as_u64().unwrap_or(0)));
+    Ok(runs)
+}
+
+fn download_run_baseline(
+    run: &Value,
+    base: &str,
+    output: &Path,
+) -> Result<Option<u64>, ReceiptError> {
+    if !trusted_run(run) || (run["event"] == "push" && run["head_sha"] != base) {
+        return Ok(None);
+    }
+    let id = run["id"].as_u64().ok_or_else(|| fail("missing run ID"))?;
+    let artifacts = pages(
+        &format!("repos/{REPOSITORY}/actions/runs/{id}/artifacts?per_page=100"),
+        Some("artifacts"),
+    )?;
     let prefix = format!("signed-baseline-{base}-");
-    for run in runs.iter().filter(|r| trusted_run(r)) {
-        let id = run["id"].as_u64().ok_or_else(|| fail("missing run ID"))?;
-        let artifacts = pages(
-            &format!("repos/{REPOSITORY}/actions/runs/{id}/artifacts?per_page=100"),
-            Some("artifacts"),
+    let artifact = artifacts
+        .iter()
+        .filter(|a| a["expired"] == false)
+        .filter_map(|a| {
+            let name = a["name"].as_str()?;
+            let attempt = name.strip_prefix(&prefix)?.parse::<u64>().ok()?;
+            Some((attempt, name))
+        })
+        .max();
+    if let Some((_, name)) = artifact {
+        let dir = tempfile::tempdir().map_err(|e| fail(e.to_string()))?;
+        checked(
+            "gh",
+            &[
+                "run",
+                "download",
+                &id.to_string(),
+                "--repo",
+                REPOSITORY,
+                "--name",
+                name,
+                "--dir",
+                &dir.path().to_string_lossy(),
+            ],
+            None,
         )?;
-        let artifact = artifacts
-            .iter()
-            .filter(|a| a["expired"] == false)
-            .filter_map(|a| {
-                let name = a["name"].as_str()?;
-                let attempt = name.strip_prefix(&prefix)?.parse::<u64>().ok()?;
-                Some((attempt, name))
-            })
-            .max();
-        if let Some((_, name)) = artifact {
-            let dir = tempfile::tempdir().map_err(|e| fail(e.to_string()))?;
-            checked(
-                "gh",
-                &[
-                    "run",
-                    "download",
-                    &id.to_string(),
-                    "--repo",
-                    REPOSITORY,
-                    "--name",
-                    name,
-                    "--dir",
-                    &dir.path().to_string_lossy(),
-                ],
-                None,
-            )?;
-            fs::copy(dir.path().join("candidate.json"), output.join("base.json"))
-                .map_err(|e| fail(e.to_string()))?;
+        fs::copy(dir.path().join("candidate.json"), output.join("base.json"))
+            .map_err(|e| fail(e.to_string()))?;
+        return Ok(Some(id));
+    }
+    Ok(None)
+}
+
+fn exact_base_push(run: &Value, base: &str) -> bool {
+    run["path"] == WORKFLOW
+        && run["event"] == "push"
+        && run["head_branch"] == "main"
+        && run["head_sha"] == base
+        && run["repository"]["full_name"] == REPOSITORY
+        && run["head_repository"]["full_name"] == REPOSITORY
+}
+
+fn download_baseline(base: &str, output: &Path, wait_for_push: bool) -> Result<u64, ReceiptError> {
+    let runs = baseline_runs()?;
+    for run in &runs {
+        if let Some(id) = download_run_baseline(run, base, output)? {
             return Ok(id);
+        }
+    }
+    if wait_for_push {
+        // The queue event may precede registration of the base's push workflow.
+        // Bound discovery of that exact run; never rerun tests or build a second
+        // baseline. Authorization's workflow timeout also bounds `gh run watch`.
+        let mut pending = runs.into_iter().find(|r| exact_base_push(r, base));
+        for _ in 0..60 {
+            if pending.is_some() {
+                break;
+            }
+            pending = baseline_runs()?
+                .into_iter()
+                .find(|r| exact_base_push(r, base));
+            if pending.is_none() {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
+        }
+        if let Some(run) = pending {
+            let id = run["id"]
+                .as_u64()
+                .ok_or_else(|| fail("missing baseline run ID"))?;
+            if run["status"] != "completed" {
+                checked(
+                    "gh",
+                    &["run", "watch", &id.to_string(), "--repo", REPOSITORY],
+                    None,
+                )?;
+            }
+            let terminal = api(&format!("repos/{REPOSITORY}/actions/runs/{id}"))?;
+            if !exact_base_push(&terminal, base) {
+                return Err(fail("base push identity changed while waiting"));
+            }
+            if let Some(id) = download_run_baseline(&terminal, base, output)? {
+                return Ok(id);
+            }
         }
     }
     Err(fail(format!(
@@ -601,7 +787,7 @@ fn publish(
         serde_json::from_value(read_json(request_path)?).map_err(|e| fail(e.to_string()))?;
     let comparison = (|| {
         let candidate = load(&results.join("candidate.json"))?;
-        let base = if request.pr.is_none() {
+        let base = if request.kind == RequestKind::Main {
             candidate.clone()
         } else {
             load(&request_path.with_file_name("base.json"))?
@@ -682,19 +868,20 @@ fn publish(
     ));
     write(&results.join("comment.md"), &body)?;
     println!("{body}");
+    if let Ok(summary) = std::env::var("GITHUB_STEP_SUMMARY") {
+        write(Path::new(&summary), &body)?;
+    }
     // Status is written even if comment publication fails.
     let status = post(
         &format!("repos/{REPOSITORY}/statuses/{}", request.sha),
         json!({"state": if passed {"success"} else {"failure"}, "context": "signed-gate", "description": if passed {"No new failures; populations and completion preserved"} else {"Signed receipt regression or incomplete gate"}, "target_url": run_url}),
     );
-    let comment = if let Some(pr) = request.pr {
+    let comment = request.prs.iter().try_for_each(|pr| {
         post(
             &format!("repos/{REPOSITORY}/issues/{pr}/comments"),
             json!({"body": body}),
         )
-    } else {
-        Ok(())
-    };
+    });
     status?;
     comment?;
     if !passed {
