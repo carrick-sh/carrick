@@ -6039,8 +6039,8 @@ fn arm_two_live_threads_robust_exit_routes_host_custody_without_abort() {
     // Every glibc/musl thread registers a robust list at start.
     // This preservation control needs a readable head: a terminal head
     // fault now completes cleanup instead of requesting host custody.
-    let robust_head = [0_u64; 3];
-    let robust_address = core::ptr::from_ref(&robust_head).addr() as u64;
+    let robust_head = carrick_test_support::GuestUserBuffer::from_values(&[0_u64; 3]);
+    let robust_address = robust_head.arg();
     let mut frame = carrick_el1_abi::TrapFrame::default();
     frame.x[0] = robust_address;
     frame.x[1] = 24;
