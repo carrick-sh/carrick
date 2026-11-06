@@ -4332,6 +4332,61 @@ mod overlay_dispatch_tests {
     /// Regression for the CPython multiprocessing SyncManager SIGABRT (a forked
     /// child's timed wait on a shared semaphore at the high mmap aperture).
     #[test]
+    fn futex_wait_preserves_owner_memory_refusal_before_comparison() {
+        use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+        use std::num::NonZeroU64;
+
+        struct Word {
+            wait: PortalOwnerWait,
+            unavailable: bool,
+        }
+        impl GuestMemory for Word {
+            fn read_bytes_raw(&self, _: u64, _: usize) -> Result<Vec<u8>, MemoryError> {
+                if self.unavailable {
+                    Err(MemoryError::OwnerWait(self.wait))
+                } else {
+                    Ok(7u32.to_ne_bytes().to_vec())
+                }
+            }
+            fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+                unreachable!("WAIT must not write the word")
+            }
+        }
+        impl CurrentMmMemory for Word {}
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        // SAFETY: this VM-free fixture retains the exact owner identity for
+        // both dispatches; it tests propagation, without enrolling this token.
+        let wait = unsafe {
+            PortalOwnerWait::from_owner(
+                El1MmHandle::from_admitted_owner(
+                    NonZeroU64::new(1).unwrap(),
+                    ReservationMm::new(context.shared().mm().id().raw()).unwrap(),
+                    NonZeroU64::new(3).unwrap(),
+                ),
+                PortalWaitCause::Reservations,
+                7,
+            )
+        };
+        let mut memory = Word { wait, unavailable: true };
+        let request = SyscallRequest::new(98, SyscallArgs::from([
+            MEM_BASE, LINUX_FUTEX_WAIT | LinuxFutexFlags::PRIVATE.bits(), 8, 0, 0, 0,
+        ]));
+        let reporter = CompatReporter::default();
+        assert_eq!(
+            dispatcher.dispatch(&context, request, &mut memory, &reporter).unwrap(),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+            "unavailable backing must not become EFAULT"
+        );
+        memory.unavailable = false;
+        assert_eq!(
+            dispatcher.dispatch(&context, request, &mut memory, &reporter).unwrap(),
+            DispatchOutcome::Errno { errno: LINUX_EAGAIN },
+            "redispatch must compare the now available value"
+        );
+    }
+
+    #[test]
     fn read_futex_word_falls_back_to_shared_mapping() {
         struct SharedOnly {
             word: u32,
