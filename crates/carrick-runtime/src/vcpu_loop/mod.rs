@@ -4852,6 +4852,7 @@ pub(crate) mod tests {
         let (saved_output_schedule, fault_wait) = schedule;
         let retire_receipt = fault_wait == Some(true);
         let fault_wait = fault_wait.is_some();
+        let production_file_fault_wait = fault_wait && signum.is_none() && !retire_receipt;
         let immediate = saved_output_schedule.unwrap_or(false);
         let recvfrom = nr == carrick_abi::syscall::nr::RECVFROM;
         let interrupted_sleep = saved_output_schedule.is_some() && !recvfrom;
@@ -5310,7 +5311,7 @@ pub(crate) mod tests {
                         .unwrap()
                         .unwrap();
                     let mut fault_owner_wait = None;
-                    if fault_wait {
+                    if production_file_fault_wait {
                         let nz = |value| NonZeroU64::new(value).unwrap();
                         let fault_va = 0x6000_a5000;
                         let request_generation = 77;
@@ -5738,14 +5739,23 @@ pub(crate) mod tests {
                             .unwrap();
                     } else {
                         let parked = if fault_wait {
-                            job.park_pending_owner_file_fault(
-                                &mut engine,
-                                &mut control,
-                                Some(carrick_hal::OwnerFileFaultOutcome::PendingOwner(
-                                    fault_owner_wait.expect("resolved fault wait"),
-                                )),
-                            )
-                            .map(|exit| exit.expect("pending owner fault routes to park"))
+                            if production_file_fault_wait {
+                                job.park_pending_owner_file_fault(
+                                    &mut engine,
+                                    &mut control,
+                                    Some(carrick_hal::OwnerFileFaultOutcome::PendingOwner(
+                                        fault_owner_wait.expect("resolved fault wait"),
+                                    )),
+                                )
+                                .map(|exit| exit.expect("pending owner fault routes to park"))
+                            } else {
+                                job.park_owner_memory_action(
+                                    &mut engine,
+                                    &mut control,
+                                    zone::OwnerMemoryAction::Fault,
+                                    wait,
+                                )
+                            }
                         } else {
                             job.owner_memory_park(&mut engine, &mut control, frame, wait, resume)
                         }
@@ -6036,7 +6046,7 @@ pub(crate) mod tests {
                         )
                         .unwrap()
                     };
-                    if fault_wait && !retire_receipt && signum.is_none() {
+                    if production_file_fault_wait {
                         assert!(matches!(completed, executor::ExecutorExit::Syscall));
                         assert!(matches!(job.phase, HvpatchProductionPhase::Resident));
                         assert_eq!(
@@ -6167,7 +6177,7 @@ pub(crate) mod tests {
                         } else {
                             0
                         };
-                        if ipc_read || fault_wait {
+                        if ipc_read || production_file_fault_wait {
                             assert!(
                                 engine.completed_syscalls.is_empty(),
                                 "EL0 IPC return and fault retry have no syscall to complete"
