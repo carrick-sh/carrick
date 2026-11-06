@@ -5585,7 +5585,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             ));
         }
         carrick_observability::probes::hvpatch_el1_file_fault_handoff(window.fault_page, 0, 6);
-        let outcome = self.run_user_transfer_service(
+        let outcome = self.run_owner_fork_service(
             carrick_el1_abi::TrapFrame {
                 esr: carrick_el1_abi::MM_PORTAL_GRANT_ESR,
                 ..carrick_el1_abi::TrapFrame::default()
@@ -5614,8 +5614,26 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             }))
         } else if slot.withdraw(window, grant.transaction()) {
             carrick_observability::probes::hvpatch_el1_file_fault_handoff(window.fault_page, 0, 8);
-            outcome?;
-            Ok(Some(carrick_hal::OwnerFileFaultOutcome::Refused))
+            let frame = outcome?;
+            drop(grant);
+            if frame.x[0] == 11 && frame.x[14] == 3 {
+                let cause =
+                    carrick_el1_abi::PortalWaitCause::decode(frame.x[16]).ok_or_else(|| {
+                        TrapError::Hypervisor("file grant returned invalid owner wait".into())
+                    })?;
+                // SAFETY: the exact carrier service authenticated this target's
+                // notification source before testing its admission condition.
+                let wait = unsafe {
+                    carrick_el1_abi::PortalOwnerWait::from_owner(
+                        target.handle(),
+                        cause,
+                        frame.x[17],
+                    )
+                };
+                Ok(Some(carrick_hal::OwnerFileFaultOutcome::PendingOwner(wait)))
+            } else {
+                Ok(Some(carrick_hal::OwnerFileFaultOutcome::Refused))
+            }
         } else {
             carrick_fatal::carrick_fatal!(
                 "aarch64::user_transfer",
