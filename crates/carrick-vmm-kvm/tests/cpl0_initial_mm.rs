@@ -1822,7 +1822,8 @@ fn private_file_source_limit_returns_enomem() {
 }
 
 /// Native x86_64 Linux oracle (same assembly, `timeout 10`): exit 0 and
-/// `pipe-vectors=once\n`. The second read requires EAGAIN (11), detecting
+/// `pipe-vectors=once\n`. Scalar write/read verifies a one-byte prefix before
+/// vector I/O; the next read requires EAGAIN (11), detecting
 /// duplicate publication; after closing the last writer the next read is EOF.
 #[test]
 #[ignore = "#1756: x86 shared ring IPC venue is not wired yet"]
