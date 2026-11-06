@@ -121,7 +121,7 @@ impl sched::ThreadCpu for NoCpu {
 }
 
 #[test]
-fn production_x86_family_absences_obey_eight_crossings_without_user_memory() {
+fn production_x86_family_absences_obey_crossings_without_user_memory() {
     let tasks = [CurrentTask::new()];
     tasks[0].set(
         El1TaskId::from_linux_tid(41),
@@ -143,6 +143,9 @@ fn production_x86_family_absences_obey_eight_crossings_without_user_memory() {
         ("IPC write", 1),
         ("IPC epoll_pwait", 281),
         ("futex", 202),
+        ("loader openat", 257),
+        ("loader legacy access", 21),
+        ("loader writev", 20),
         ("file seek", 8),
         ("file pread", 17),
         ("file pwrite", 18),
@@ -192,7 +195,7 @@ fn production_x86_family_absences_obey_eight_crossings_without_user_memory() {
                 None,
                 |_| core::ptr::null_mut(),
             );
-            let allowed = matches!(native, 0 | 1 | 8 | 17 | 18 | 281);
+            let allowed = matches!(native, 0 | 1 | 8 | 17 | 18 | 20 | 21 | 257 | 281);
             assert_eq!(
                 action,
                 if allowed {
