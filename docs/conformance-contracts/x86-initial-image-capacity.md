@@ -176,3 +176,34 @@ temporal syscall order. The JSON execution witness records 85 guest entries,
 16 owner-grant crossings and one root-exit crossing, with no host forwards.
 The next demonstrated blocker is loader service coverage, tracked separately
 by #1722; exit 127 is not a Node execution pass.
+
+## Rebase over prefix-driven acquisition and retained rusage
+
+The rebase onto the admitted main keeps #1720's per-leaf prefix-driven table
+acquisition and its exact linked-table receipt reconstruction. The older
+three-grant offer helper and eager table acquisition are not restored.
+The fresh real-KVM initial-MM run executes 35 tests: 24 pass, 10 fail and
+one remains ignored. Both lazy wait witnesses fail (status 91 and 92), while
+the invalid-rusage control, 100 MiB boot, distant fork-source and allocation
+witnesses pass. This is not acceptance.
+
+The shared wait runtime now sends the already-consumed child's rusage and PID
+to the existing completed-copyout owner. Its VM-free production-entry witness
+`wait4_rusage_busy_retains_consumed_child_result` reaps a real fixture child,
+refuses the output once, acknowledges the retained service, and requires the
+original PID, one status copy, the rusage bytes and ECHILD on a second wait.
+The test is red before the correction at `rusage Busy retains the completed
+wait`. This is preparation for the required suspension integration, not proof
+of a working KVM supply consumer.
+
+A producer-only x86 native suspension experiment was discarded: publishing a
+backing selection and entering the native service parks the task, but the
+CPL0 executor has no native service-ticket intake. The production consumer in
+`vcpu_loop/executor/backend.rs` is guarded by macOS/aarch64 configuration.
+The experiment's waiting test process was terminated explicitly; it is not a
+passing test or a reason to increase timeouts. Adding only `ReadSuspended` to
+`ForwardVenue` likewise cannot work because CPL0's continuation builder rejects
+owner-memory outcomes. Completing this integration needs a shared suspension
+consumer and retained physical/copy custody; an x86 synchronous fault-in
+fallback would violate the selected design. Neither incomplete producer is
+included in the tree.
