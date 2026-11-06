@@ -3375,12 +3375,23 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         let mut out = vec![0u8; length];
         let mut copied = 0usize;
         while copied < length {
-            let (va, ipa, chunk_len) = match self.syscall_buffer_chunk(address, copied, length) {
-                Ok(chunk) => chunk,
-                Err(error) => {
+            let offset =
+                u64::try_from(copied).map_err(|_| MemoryError::OutOfBounds { address, length })?;
+            let va = address
+                .checked_add(offset)
+                .ok_or(MemoryError::OutOfBounds { address, length })?;
+            let chunk_len = (length - copied).min((0x1000 - (va & 0xfff)) as usize);
+            let ipa = match self
+                .page_tables
+                .with_manager(|manager| manager.translate(va))
+                .flatten()
+                .map(Gpa::new)
+            {
+                Some(ipa) => ipa,
+                None => {
                     let Some(zero) = self.fresh_zero_chunk(address, copied, length) else {
                         self.trace_read_fault(address.wrapping_add(copied as u64), length, 1);
-                        return Err(error);
+                        return Err(MemoryError::OutOfBounds { address, length });
                     };
                     copied += zero;
                     continue;
