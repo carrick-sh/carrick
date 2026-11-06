@@ -5,7 +5,9 @@ copyout for `kernel.el1.ipc-two-process`. It does **not** implement the
 x86 execution venue.
 The native x86_64 Linux oracle runs the same `native_pipe_vectors.S`:
 exit 0, stdout `pipe-vectors=once\n`, no stderr. Child `writev` publishes
-three vectors; parent `readv` scatters them into two vectors. A subsequent
+three vectors after a one-byte scalar `write`; parent `read` consumes that
+prefix and `readv` scatters the six vector bytes into two vectors. All four
+transfer entry points therefore belong to the same witness. A subsequent
 nonblocking scalar read must return EAGAIN (11), then closing the parent's
 last writer must expose EOF. All I/O is nonblocking and the child is finite.
 
