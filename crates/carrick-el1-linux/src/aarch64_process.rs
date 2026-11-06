@@ -2843,22 +2843,20 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         parent_table: u64,
         child_table: u64,
     ) -> Result<(), NativeProcessError> {
-        super::file_table::fork_native_namespace(
-            self.crossing.fd_map(),
-            self.crossing.open_table(),
-            self.crossing.ipc_binding(),
-            parent_table,
-            child_table,
-        )
+        super::file_table::DescriptorNamespace {
+            fd_map: self.crossing.fd_map(),
+            open_table: self.crossing.open_table(),
+            ipc: self.crossing.ipc_binding(),
+        }
+        .fork(parent_table, child_table)
     }
     fn retire_fd_table(&mut self, table: u64) {
-        super::file_table::retire_native_namespace(
-            self.crossing.fd_map(),
-            self.crossing.open_table(),
-            self.crossing.ipc_binding(),
-            table,
-            self.task,
-        )
+        super::file_table::DescriptorNamespace {
+            fd_map: self.crossing.fd_map(),
+            open_table: self.crossing.open_table(),
+            ipc: self.crossing.ipc_binding(),
+        }
+        .retire(table, self.task)
         .unwrap_or_else(|_| fatal());
     }
 }

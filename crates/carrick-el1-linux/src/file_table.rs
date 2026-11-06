@@ -599,70 +599,71 @@ pub fn admit_host_fd(
     Some(handle)
 }
 
-/// Fork the one complete descriptor namespace and its delegated projection.
-/// A failed shared admission rolls back the unpublished delegated child.
-// Keep the service adapter's existing measured stack envelope intact.
-#[inline(always)]
-pub fn fork_native_namespace(
-    fd_map: &[FdMapSlot],
-    open_table: &[DelegatedOpenFile],
-    ipc: Option<(
-        carrick_el1_abi::ipc::IpcRegion<'_>,
-        &carrick_el1_abi::ipc_tables::IpcTableMap,
+/// Descriptor custody shared by native execution venues. The delegated map
+/// and the optional complete ring namespace are one fork/exit operation.
+/// Neither authority's lock spans an operation on the other authority.
+pub struct DescriptorNamespace<'a> {
+    pub fd_map: &'a [FdMapSlot],
+    pub open_table: &'a [DelegatedOpenFile],
+    pub ipc: Option<(
+        carrick_el1_abi::ipc::IpcRegion<'a>,
+        &'a carrick_el1_abi::ipc_tables::IpcTableMap,
     )>,
-    parent_table: u64,
-    child_table: u64,
-) -> Result<(), crate::native_process_runtime::NativeProcessError> {
-    use crate::native_process_runtime::NativeProcessError;
-    if !fork_fd_map(fd_map, open_table, parent_table, child_table) {
-        return Err(NativeProcessError::Exhausted);
-    }
-    if let Some((region, map)) = ipc
-        && let Some(parent) = map.lookup_authoritative(parent_table)
-    {
-        let result = region
-            .fork_descriptors(
-                carrick_el1_abi::ipc::fd::TableId::from_raw(parent),
-                &carrick_sched_core::ShortLockSpin,
-                |child| {
-                    map.publish_owned(child_table, child.to_raw())
-                        .map_err(|_| carrick_el1_abi::ipc::fd::Error::NoMemory)
-                },
-            )
-            .map_err(|_| NativeProcessError::Exhausted);
-        if let Err(error) = result {
-            retire_fd_map(fd_map, open_table, child_table);
-            return Err(error);
-        }
-    }
-    Ok(())
 }
 
-/// Retire shared descriptors through their existing deferred host release
-/// owner before withdrawing the delegated projection.
-#[inline(always)]
-pub fn retire_native_namespace(
-    fd_map: &[FdMapSlot],
-    open_table: &[DelegatedOpenFile],
-    ipc: Option<(
-        carrick_el1_abi::ipc::IpcRegion<'_>,
-        &carrick_el1_abi::ipc_tables::IpcTableMap,
-    )>,
-    table: u64,
-    task: &carrick_el1_abi::CurrentTask,
-) -> Result<(), carrick_el1_abi::ipc::IpcError> {
-    if let Some((region, map)) = ipc
-        && let Some(raw) = map.take_owned(table)
-    {
-        crate::ipc::retire_namespace(
-            &region,
-            carrick_el1_abi::ipc::fd::TableId::from_raw(raw),
-            task,
-        )?;
+impl DescriptorNamespace<'_> {
+    // Keep lifecycle stack accounting at the service entry, as before this
+    // extraction; no extra out-of-line frame may hide below its envelope.
+    #[inline(always)]
+    pub fn fork(
+        &self,
+        parent_table: u64,
+        child_table: u64,
+    ) -> Result<(), crate::native_process_runtime::NativeProcessError> {
+        use crate::native_process_runtime::NativeProcessError;
+        if !fork_fd_map(self.fd_map, self.open_table, parent_table, child_table) {
+            return Err(NativeProcessError::Exhausted);
+        }
+        if let Some((region, map)) = self.ipc
+            && let Some(parent) = map.lookup_authoritative(parent_table)
+        {
+            let result = region
+                .fork_descriptors(
+                    carrick_el1_abi::ipc::fd::TableId::from_raw(parent),
+                    &carrick_sched_core::ShortLockSpin,
+                    |child| {
+                        map.publish_owned(child_table, child.to_raw())
+                            .map_err(|_| carrick_el1_abi::ipc::fd::Error::NoMemory)
+                    },
+                )
+                .map_err(|_| NativeProcessError::Exhausted);
+            if let Err(error) = result {
+                retire_fd_map(self.fd_map, self.open_table, child_table);
+                return Err(error);
+            }
+        }
+        Ok(())
     }
-    retire_fd_map(fd_map, open_table, table);
-    task.linux.mark_pending_host_work();
-    Ok(())
+
+    #[inline(always)]
+    pub fn retire(
+        &self,
+        table: u64,
+        task: &carrick_el1_abi::CurrentTask,
+    ) -> Result<(), carrick_el1_abi::ipc::IpcError> {
+        if let Some((region, map)) = self.ipc
+            && let Some(raw) = map.take_owned(table)
+        {
+            crate::ipc::retire_namespace(
+                &region,
+                carrick_el1_abi::ipc::fd::TableId::from_raw(raw),
+                task,
+            )?;
+        }
+        retire_fd_map(self.fd_map, self.open_table, table);
+        task.linux.mark_pending_host_work();
+        Ok(())
+    }
 }
 
 /// Inherits descriptors across fork according to the shared file-table policy.
