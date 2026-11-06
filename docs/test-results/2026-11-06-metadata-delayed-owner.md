@@ -312,3 +312,27 @@ production witness and retained publication operation remain implementation
 work, not an external blocker. Signed HVF attribution, the paired population
 and two consecutive main signed passes additionally require a Mac lane;
 this Linux x86_64 runner cannot supply those acceptance results.
+
+## Independent continuation review
+
+The next continuation found the branch already based on admitted main and
+preserved all preceding commits. Independent source review requested changes:
+the zero-alias host-park producers and successful publication refusal remain
+an unresolved P0, and the missing production witness remains P1. Passing the
+existing allocator and carrier-gate tests cannot discharge either finding.
+
+The retained carrier mapping owner is a stronger source for parked lifecycle
+aliases than the current vCPU slot. It already owns both backing mappings and
+the exact control lease. A future park binding should be issued by that owner
+after authenticating the execution, rather than copying raw aliases from
+CurrentTask. Exact tid, serial, MM and generation checks alone cannot recover
+an alias pair already cleared by publication refusal or establish arbitrary
+alias values' relationship to the retained mapping. The current mapping owner
+is held by the executor backend; the host park producers receive the engine
+and borrowed quantum authority instead. That ownership boundary still needs
+an explicit binding before a safe production-path witness can be written.
+
+No new runtime repair or reproduction is claimed by this continuation. This
+is unfinished implementation work, independently of the unavailable signed
+HVF acceptance lane. In particular, a host-park-only correction would leave
+first publication refusal open and would not satisfy this issue.
