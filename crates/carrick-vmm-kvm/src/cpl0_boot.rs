@@ -668,6 +668,7 @@ impl Cpl0Carrier {
     pub fn boot_production(
         frame_inventory: Arc<dyn PhysicalFrameInventory>,
         initial_extent_bytes: usize,
+        ipc: Option<Arc<dyn carrick_el1_abi::IpcWindowBacking>>,
     ) -> Result<Self, TrapError> {
         const IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/carrick-x86-cpl0"));
         if initial_extent_bytes == 0
@@ -683,6 +684,7 @@ impl Cpl0Carrier {
             false,
             Some(initial_extent_bytes),
             false,
+            ipc,
         )
     }
 
@@ -1571,6 +1573,10 @@ impl Cpl0Carrier {
     }
 
     /// Acquire stopped-carrier proof and authenticate the retained registration.
+    pub fn ipc_table_map(&self) -> Arc<dyn carrick_el1_abi::ipc_tables::IpcTableMapBacking> {
+        self.custody.ipc_table_map()
+    }
+
     pub fn file_tables(
         &self,
         binding: carrick_el1_abi::FileRegionBinding,
@@ -1668,6 +1674,7 @@ impl Cpl0Carrier {
             interrupts,
             None,
             fixture_image,
+            None,
         )
     }
 
@@ -1678,6 +1685,7 @@ impl Cpl0Carrier {
         interrupts: bool,
         initial_extent_bytes: Option<usize>,
         fixture_image: bool,
+        ipc: Option<Arc<dyn carrick_el1_abi::IpcWindowBacking>>,
     ) -> Result<Self, TrapError> {
         let hardware_interrupts = interrupts || initial_extent_bytes.is_some();
         let plan = carrick_mem::elf::plan_elf_load_bytes_for(bytes, 62)
@@ -1819,6 +1827,58 @@ impl Cpl0Carrier {
             write: true,
             exec: false,
         });
+
+        // These aliases map the authority's original allocations, never a copy.
+        const IPC_GPA: u64 = carrick_x86_cpl0_host::cpl0_boot::IPC_WINDOW_GPA;
+        let mut ipc_backings = Vec::new();
+        let mut ipc_generation = None;
+        if let Some(owner) = ipc {
+            use carrick_x86_cpl0_host::carrier_memory::IpcWindowPart;
+            let window = unsafe {
+                carrick_el1_abi::IpcWindow::new(
+                    owner.directory_ptr() as usize,
+                    owner.directory_len(),
+                    owner.pool_ptr() as usize,
+                    owner.pool_len(),
+                )
+            }
+            .ok_or_else(|| fail("invalid IPC window geometry"))?;
+            ipc_generation = Some(
+                window
+                    .attach()
+                    .map_err(|e| fail(format!("IPC window attachment: {e:?}")))?
+                    .operation_slot_generation(),
+            );
+            for (part, va, gpa) in [
+                (
+                    IpcWindowPart::Directory,
+                    carrick_el1_abi::X86_CPL0_IPC_BASE,
+                    IPC_GPA,
+                ),
+                (
+                    IpcWindowPart::Pool,
+                    carrick_el1_abi::X86_CPL0_IPC_POOL_BASE,
+                    IPC_GPA + carrick_el1_abi::EL1_IPC_DIRECTORY_SPAN,
+                ),
+            ] {
+                let extent = Arc::new(
+                    BackingExtent::ipc_window(FrameGpa::new(gpa), Arc::clone(&owner), part)
+                        .map_err(|e| fail(e.to_string()))?,
+                );
+                maps.push(Pml4MapSpec {
+                    va,
+                    gpa,
+                    len: extent.len as u64,
+                    user: false,
+                    write: true,
+                    exec: false,
+                });
+                ipc_backings.push(PreparedBacking {
+                    extent,
+                    identity: backing_identity(&*frame_inventory)?,
+                });
+            }
+        }
 
         for (index, program) in programs.iter().enumerate() {
             if program.is_empty() {
@@ -2116,6 +2176,28 @@ impl Cpl0Carrier {
         memory
             .install_bootstrap(Arc::clone(&ram))
             .map_err(|e| fail(e.to_string()))?;
+        if !ipc_backings.is_empty() {
+            memory
+                .install(&ipc_backings)
+                .map_err(|e| fail(e.to_string()))?;
+            let zone = ram
+                .host_ptr(
+                    PRODUCTION_METADATA_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
+                    size_of::<X86Cpl0Zone>(),
+                )
+                .ok_or_else(|| fail("IPC operation slot zone"))?;
+            // SAFETY: the production zone was initialized above and remains
+            // retained; no vCPU has been created or entered.
+            let zone = unsafe { &*zone.cast::<X86Cpl0Zone>() };
+            zone.bind_ipc_operation_slots(
+                ipc_generation.ok_or_else(|| fail("IPC slot generation missing"))?,
+                &carrick_sched_core::BoundedSpin(0),
+                &|owned| {
+                    let _ = owned.into_parts();
+                },
+            )
+            .map_err(|e| fail(format!("IPC slot binding: {e:?}")))?;
+        }
         if fixture_copy {
             let mut roots = vec![LAYOUT.pml4_base];
             if interrupts {
@@ -2160,6 +2242,9 @@ impl Cpl0Carrier {
         // has no guest, registration or table users yet. RetainedFileRegion
         // keeps the same mapping alive through registration destruction.
         let files = unsafe { BootstrapFileRegion::initialize(Arc::clone(&extent), file_binding) }?;
+        if !ipc_backings.is_empty() {
+            files.publish_ipc_window()?;
+        }
         let handles = memory
             .install(&[PreparedBacking { extent, identity }])
             .map_err(|e| fail(e.to_string()))?;
@@ -3987,7 +4072,7 @@ mod cpl0_layout_tests {
         let inventory = Arc::new(FrameInventoryAuthority::new())
             .physical_projection(Arc::new(ObjectIdRegistry::new()));
         let carrier =
-            Cpl0Carrier::boot_production(inventory, 0x20_000).expect("production carrier");
+            Cpl0Carrier::boot_production(inventory, 0x20_000, None).expect("production carrier");
         // Reserved tail of the shared open-table allocation: publication
         // must name this VM, not a process-global host mapping.
         let header_offset = carrick_el1_abi::EL1_FILE_REGION_HEADER_OFFSET;

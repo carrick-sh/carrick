@@ -45,8 +45,8 @@ fn try_run_pool_fixture_with_loaded_pre_entry_hook(
     let image = prepare_x86_elf(&program).expect("x86 ELF program");
     let extent =
         Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("bounded initial extent");
-    let mut carrier =
-        Cpl0Carrier::boot_production(physical_inventory(), extent).expect("production KVM image");
+    let mut carrier = Cpl0Carrier::boot_production(physical_inventory(), extent, None)
+        .expect("production KVM image");
     let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
     let root = dispatcher.capture_one_task_context().expect("issued root");
     root.kernel()
@@ -172,7 +172,8 @@ fn native_exit_workers(
         .expect("ELF program");
     let image = prepare_x86_elf(&program).expect("static ELF");
     let extent = Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("extent");
-    let mut carrier = Cpl0Carrier::boot_production(physical_inventory(), extent).expect("real KVM");
+    let mut carrier =
+        Cpl0Carrier::boot_production(physical_inventory(), extent, None).expect("real KVM");
     let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
     let issued = dispatcher.capture_one_task_context().expect("issued root");
     issued
@@ -857,8 +858,8 @@ fn initial_root_uses_issued_thread_and_file_table_identity() {
     let image = prepare_x86_elf(&program).expect("static ELF");
     let extent =
         Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("initial grant extent");
-    let mut carrier =
-        Cpl0Carrier::boot_production(physical_inventory(), extent).expect("production KVM boot");
+    let mut carrier = Cpl0Carrier::boot_production(physical_inventory(), extent, None)
+        .expect("production KVM boot");
     // These identities are fixture-supplied, with no host registry issuing
     // later MMs. The dispatcher-backed fixtures above bind the stopped source.
     carrier
@@ -1128,7 +1129,7 @@ fn production_extent_cannot_alias_kernel_metadata() {
     use carrick_el1_abi::{EL1_DYNAMIC_METADATA_SIZE, X86_CPL0_DYNAMIC_METADATA_BASE};
 
     let extent_bytes = 192 * 1024 * 1024 + 4096;
-    let mut carrier = Cpl0Carrier::boot_production(physical_inventory(), extent_bytes)
+    let mut carrier = Cpl0Carrier::boot_production(physical_inventory(), extent_bytes, None)
         .expect("production KVM image");
     let elf = tiny_elf();
     let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("ELF program");
@@ -1148,8 +1149,8 @@ fn production_extent_cannot_alias_kernel_metadata() {
 
 #[test]
 fn production_boot_binds_both_kvm_local_apics() {
-    let carrier =
-        Cpl0Carrier::boot_production(physical_inventory(), 0x20_000).expect("production KVM boot");
+    let carrier = Cpl0Carrier::boot_production(physical_inventory(), 0x20_000, None)
+        .expect("production KVM boot");
     assert!(
         carrier
             .bootstrap_lapic_mapped()
@@ -1190,8 +1191,8 @@ fn production_initial_mm_admits_one_shared_reservation_root() {
     let argv = vec!["/tiny".to_owned()];
     let extent =
         Cpl0Carrier::initial_extent_bytes_for(&plan, &argv, &[]).expect("typed initial extent");
-    let mut carrier =
-        Cpl0Carrier::boot_production(physical_inventory(), extent).expect("production CPL0 image");
+    let mut carrier = Cpl0Carrier::boot_production(physical_inventory(), extent, None)
+        .expect("production CPL0 image");
     carrier
         .load_guest_mm(&plan, &argv, &[], InitialReservationLimits::UNLIMITED)
         .expect("guest initial MM publication");
@@ -1724,8 +1725,8 @@ fn private_file_fixture(cow: bool) {
     .expect("private mapping production runtime");
     assert_eq!(
         outcome.run.exit_code, 0,
-        "31=open, 32=mmap, 33=bytes; stdout={:?}; stderr={:?}",
-        outcome.run.stdout, outcome.run.stderr
+        "31=open, 32=mmap, 33=bytes; run={:?}",
+        outcome.run
     );
     assert_eq!(std::fs::read(&path).expect("source after guest"), bytes);
 }

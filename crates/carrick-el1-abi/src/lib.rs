@@ -543,6 +543,9 @@ pub fn x86_cpl0_kernel_stack_guards() -> impl Iterator<Item = (u64, u64)> {
     })
 }
 pub const X86_CPL0_REGION_BASE: u64 = 0xffff_ffff_c000_0000;
+/// Supervisor-only alias of the original shared descriptor authority.
+pub const X86_CPL0_IPC_BASE: u64 = 0xffff_fffc_0000_0000;
+pub const X86_CPL0_IPC_POOL_BASE: u64 = X86_CPL0_IPC_BASE + EL1_IPC_DIRECTORY_SPAN;
 /// MM-private temporary supervisor copy pair.
 pub const X86_CPL0_COW_COPY_BASE: u64 = carrick_mmu_core::x86::copy_window::COW_COPY_WINDOW_BASE;
 pub const X86_CPL0_COW_COPY_SIZE: u64 = carrick_mmu_core::x86::copy_window::COW_COPY_WINDOW_LEN;
@@ -593,7 +596,7 @@ const _: () = {
     // Every fixed x86 supervisor alias, including the full initial-image
     // capacity, must be disjoint. This is checked at compile time for both
     // guest and host builds so a new map cannot silently replace another PTE.
-    const WINDOWS: [(u64, u64); 9] = [
+    const WINDOWS: [(u64, u64); 10] = [
         (
             X86_CPL0_SUPERVISOR_IMAGE_BASE,
             X86_CPL0_SUPERVISOR_IMAGE_SIZE,
@@ -607,6 +610,7 @@ const _: () = {
         ),
         (0xffff_ffff_b000_0000, 0x100_0000), // progress aliases
         (X86_CPL0_REGION_BASE, EL1_REGION_SIZE),
+        (X86_CPL0_IPC_BASE, EL1_IPC_SIZE),
         (0xffff_ffff_d000_0000, 0x1000), // local APIC
         (
             carrick_core_abi::X86_CPL0_INITIAL_EXTENT_VA,
@@ -3414,11 +3418,15 @@ pub fn ipc_window_host() -> Option<IpcWindow> {
 pub fn ipc_window_guest() -> Option<IpcWindow> {
     // SAFETY: the window is mapped in every EL1 translation regime; an
     // unmapped window never has a published header, so attach fails.
+    #[cfg(target_arch = "aarch64")]
+    let (directory, pool) = (EL1_IPC_BASE, EL1_IPC_POOL_BASE);
+    #[cfg(target_arch = "x86_64")]
+    let (directory, pool) = (X86_CPL0_IPC_BASE, X86_CPL0_IPC_POOL_BASE);
     unsafe {
         IpcWindow::new(
-            EL1_IPC_BASE as usize,
+            directory as usize,
             EL1_IPC_DIRECTORY_SPAN as usize,
-            EL1_IPC_POOL_BASE as usize,
+            pool as usize,
             EL1_IPC_POOL_SPAN as usize,
         )
     }
