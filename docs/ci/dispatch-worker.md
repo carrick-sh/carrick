@@ -872,10 +872,10 @@ Copilot; `invoke_worker` refuses it there. Copilot's Sonnet ids carry no
 effort and its GPT roster mixes small models with Codex ones, so neither is
 admitted on a strong round either. The coordinator
 reads the tier as the `worker_tier` state item. A strong round that runs no
-worker because its capacity report offered no strong-tier model ends
-Blocked with "no strong-tier worker had capacity", rather than on a weaker
-model. Every outcome's server section records `Worker tier:` and
-`Workers this round:`.
+worker because its capacity report offered no strong-tier model fails
+with "no strong-tier worker had capacity", rather than running on a weaker
+model. A Blocked classification needs a named external prerequisite (#1763).
+Every outcome's server section records `Worker tier:` and `Workers this round:`.
 
 Fallback outcome contracts come only from authenticated server outcome comments,
 never from PR bodies. `Outcome contract:` is reserved for those reports; body
