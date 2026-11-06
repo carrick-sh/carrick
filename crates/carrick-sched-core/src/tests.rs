@@ -3685,6 +3685,49 @@ fn cancelled_metadata_wait_releases_record_without_resume() {
 }
 
 #[test]
+fn adopted_first_entry_settles_detached_metadata_receipt() {
+    use crate::object_wait::{ObjectWaitKey, OperationToken};
+    let zone = zone();
+    let key = ObjectWaitKey::metadata_request(17).unwrap();
+    zone.bind_object_wait(key, &HostWait).unwrap();
+    let id = zone
+        .alloc_record(ThreadIdentity {
+            generation: 0,
+            lifecycle_page: 1,
+            control_slot: 1,
+            ..identity(1572)
+        })
+        .unwrap();
+    let record = zone.record_ref(id);
+    let queue = zone.object_wait(key, &HostWait).unwrap();
+    queue
+        .park_rechecked(
+            queue.snapshot(),
+            id,
+            OperationToken::metadata_request(17).unwrap(),
+            || true,
+        )
+        .unwrap();
+    let mut handed = Vec::new();
+    queue
+        .notify_object_host(&mut |record| handed.push(record), &mut |_| {})
+        .unwrap();
+    drop(queue);
+    assert_eq!(handed, [record]);
+    assert!(zone.record(id).has_object_operation());
+    let activation = zone.claim_current_first_entry_activation(record).unwrap();
+    // The host adoption has retained the saved retry context. This receipt
+    // has no endpoint pin and no adapter that could ever resume the old record.
+    assert!(zone.free_first_entry_activation(activation));
+    assert!(
+        zone.live(record).is_none(),
+        "adopted metadata receipt stranded a retiring first entry"
+    );
+    assert!(!zone.record(id).has_object_operation());
+    assert_ne!(zone.record(id).incarnation(), record.incarnation);
+}
+
+#[test]
 fn cancelled_deferred_metadata_wait_releases_record_without_resume() {
     cancelled_metadata_wait(true);
 }
