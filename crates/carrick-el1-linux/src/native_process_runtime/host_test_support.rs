@@ -13,17 +13,21 @@ std::thread_local! {
     };
 }
 
+#[cfg(test)]
 type ServicePublishedHook = Option<(usize, Box<dyn FnOnce()>)>;
 
+#[cfg(test)]
 std::thread_local! {
     static SERVICE_PUBLISHED_HOOK: std::cell::RefCell<ServicePublishedHook> = const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(test)]
 pub(crate) fn set_service_published_hook(runtime: usize, hook: Box<dyn FnOnce()>) {
     SERVICE_PUBLISHED_HOOK
         .with(|slot| assert!(slot.borrow_mut().replace((runtime, hook)).is_none()));
 }
 
+#[cfg(test)]
 pub(super) fn run_service_published_hook(runtime: usize) {
     let hook = SERVICE_PUBLISHED_HOOK.with(|slot| {
         let mut slot = slot.borrow_mut();
