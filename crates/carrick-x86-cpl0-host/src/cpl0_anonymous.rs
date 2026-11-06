@@ -1848,23 +1848,27 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .map_err(|error| fail(format!("owner grant projection: {error:?}")))?
             .map_err(|error| fail(error.to_string()))?;
             pending.inventory.finish()?;
-            self.private_anonymous_witness.record_settled(
-                crate::cpl0_private_witness::SettledPrivateGrant {
-                    memory: &self._vm,
-                    inventory: &*self.frame_inventory,
-                    binding: pending.execution.binding,
-                    cpu: pending.execution.cpu,
-                    context: pending.execution.context,
-                    window: pending.window,
-                    txn: &pending.txn,
-                    publication,
-                    peer: pending
-                        .peer
-                        .combine(crate::cpl0_private_witness::PeerActivity::observe(
-                            &self.actual_run[1 - index],
-                        )),
-                },
-            )?;
+            // File grants settle through the same publisher, but are outside
+            // the anonymous-leaf evidence population.
+            if pending.window.host_backing.is_none() {
+                self.private_anonymous_witness.record_settled(
+                    crate::cpl0_private_witness::SettledPrivateGrant {
+                        memory: &self._vm,
+                        inventory: &*self.frame_inventory,
+                        binding: pending.execution.binding,
+                        cpu: pending.execution.cpu,
+                        context: pending.execution.context,
+                        window: pending.window,
+                        txn: &pending.txn,
+                        publication,
+                        peer: pending.peer.combine(
+                            crate::cpl0_private_witness::PeerActivity::observe(
+                                &self.actual_run[1 - index],
+                            ),
+                        ),
+                    },
+                )?;
+            }
             let used = publication.tables_linked as usize;
             if pending.txn.tables.len() != pending.tables.len() || used > pending.tables.len() {
                 return Err(fail("owner grant table receipt"));

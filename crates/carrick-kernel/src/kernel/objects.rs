@@ -1175,10 +1175,37 @@ struct DescriptionPhysicalLifetime {
     transition: Mutex<DescriptionLifecycle>,
 }
 
-struct IpcPhysicalHold {
+pub(crate) struct IpcPhysicalHold {
     physical: Arc<DescriptionPhysicalLifetime>,
     backing: Option<OpaqueFileDescriptionBacking>,
     admitted: Arc<AtomicBool>,
+    mapping_description: Option<Arc<FileDescription>>,
+    original: Weak<FileDescription>,
+}
+
+impl IpcPhysicalHold {
+    /// Project only the physical byte source. The projection cannot reach the
+    /// publication pin, so retaining it never keeps its own IPC resource alive.
+    /// The caller owns a pinned resource for the entire admission.
+    pub(crate) fn retain_mapping(&self) -> Option<Arc<MappedFileReference>> {
+        let description = self.mapping_description.as_ref()?;
+        if let Some(original) = self.original.upgrade() {
+            crate::el1_delegation::recall_if_delegated(&original);
+        }
+        let mut lifecycle = self.physical.transition.lock();
+        if !self.admitted.load(Ordering::Acquire) || lifecycle.ipc_holds == 0 {
+            return None;
+        }
+        lifecycle.mapping_refs = lifecycle.mapping_refs.checked_add(1).unwrap_or_else(|| {
+            carrick_fatal!(
+                "kernel::file_description_refs",
+                "mapped file reference count overflow"
+            )
+        });
+        Some(Arc::new(MappedFileReference {
+            description: Arc::clone(description),
+        }))
+    }
 }
 
 fn finish_description(
@@ -1263,7 +1290,7 @@ pub struct FileDescription {
 
 impl FileDescription {
     pub(crate) fn ipc_description(
-        &self,
+        self: &Arc<Self>,
         owner: &Arc<crate::el1_ipc::HostIpc>,
     ) -> Result<Arc<crate::el1_ipc::HostDescriptionFlags>, crate::el1_ipc::AdmissionError> {
         use carrick_el1_abi::ipc::{IpcBacking, fd};
@@ -1299,10 +1326,30 @@ impl FileDescription {
             FileDescriptionKind::Concrete(backing) => Some(backing.clone()),
             _ => None,
         };
+        // Mapping I/O uses positional reads and the original physical lifetime,
+        // never a second fd/cursor or a strong backlink to publication custody.
+        let mapping_description = backing.as_ref().map(|backing| {
+            let mut common = DescriptionCommon::new_with_seals(
+                self.common.status_flags(),
+                self.common.shared_seals(),
+            );
+            common.physical = Arc::clone(&self.common.physical);
+            common.zone_entry.store(false, Ordering::Release);
+            Arc::new(Self {
+                id: self.id,
+                kind: FileDescriptionKind::Concrete(backing.clone()),
+                common: Arc::new(common),
+                epoll_registrations: Mutex::new(BTreeMap::new()),
+                revision: ObjectRevision::new(),
+                delegation_handle: std::sync::atomic::AtomicU32::new(0),
+            })
+        });
         let token = owner.retain_host_resource(Box::new(IpcPhysicalHold {
             physical: Arc::clone(&self.common.physical),
             backing,
             admitted: Arc::clone(&admitted),
+            mapping_description,
+            original: Arc::downgrade(self),
         }))?;
         let backing = IpcBacking::Host(token).encode();
         let description = match owner.admit_description(fd::Description::new(
