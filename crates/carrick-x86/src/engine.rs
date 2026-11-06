@@ -439,6 +439,60 @@ fn host_run_len<V: X86Vmm>(vm: &V, va: GuestVa, gpa: Gpa, max: usize) -> usize {
 }
 
 impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
+    fn atomic_load_user_u32(&self, address: u64) -> Result<u32, MemoryError> {
+        if !address.is_multiple_of(4)
+            || address < LINUX_NULL_GUARD_END
+            || self.protections.range_no_access(address, 4)
+        {
+            return Err(MemoryError::OutOfBounds { address, length: 4 });
+        }
+        let (va, gpa, len) = self.syscall_buffer_chunk(address, 0, 4)?;
+        if len != 4 {
+            return Err(MemoryError::OutOfBounds { address, length: 4 });
+        }
+        let pointer = self
+            .vm
+            .syscall_buffer_host_ptr(GuestVa::new(va), gpa, 4)
+            .ok_or(MemoryError::OutOfBounds { address, length: 4 })?;
+        // SAFETY: the VMM retained one aligned live word for this engine call.
+        let word = unsafe { &*(pointer.cast::<std::sync::atomic::AtomicU32>()) };
+        Ok(word.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    fn atomic_compare_exchange_user_u32(
+        &mut self,
+        address: u64,
+        expected: u32,
+        desired: u32,
+    ) -> Result<u32, MemoryError> {
+        if !address.is_multiple_of(4)
+            || address < LINUX_NULL_GUARD_END
+            || self.protections.range_write_denied(address, 4)
+        {
+            return Err(MemoryError::OutOfBounds { address, length: 4 });
+        }
+        let (va, gpa, len) = self.syscall_buffer_chunk(address, 0, 4)?;
+        if len != 4 {
+            return Err(MemoryError::OutOfBounds { address, length: 4 });
+        }
+        let pointer = self
+            .vm
+            .syscall_buffer_host_ptr_mut(GuestVa::new(va), gpa, 4)
+            .ok_or(MemoryError::OutOfBounds { address, length: 4 })?;
+        // SAFETY: the VMM retained one aligned writable word for this engine call.
+        let word = unsafe { &*(pointer.cast::<std::sync::atomic::AtomicU32>()) };
+        Ok(
+            match word.compare_exchange(
+                expected,
+                desired,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(value) | Err(value) => value,
+            },
+        )
+    }
+
     /// The engine-owned PROT_NONE set, shared by every x86 backend (KVM, bhyve,
     /// NVMM) — the default `read_bytes`/`write_bytes` run it before the raw copy
     /// below, so bhyve/NVMM get the EFAULT gate with zero backend code.

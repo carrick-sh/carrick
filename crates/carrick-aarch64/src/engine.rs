@@ -3664,6 +3664,20 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
 }
 
 impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
+    fn atomic_load_user_u32(&self, address: u64) -> Result<u32, MemoryError> {
+        self.vm.atomic_load_user_u32(address)
+    }
+
+    fn atomic_compare_exchange_user_u32(
+        &mut self,
+        address: u64,
+        expected: u32,
+        desired: u32,
+    ) -> Result<u32, MemoryError> {
+        self.vm
+            .atomic_compare_exchange_user_u32(address, expected, desired)
+    }
+
     fn supply_memory(
         &self,
         request: carrick_guest_mem::MemorySupplyRequest,

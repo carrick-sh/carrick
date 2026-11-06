@@ -2965,6 +2965,22 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.read_guest_bytes_into(va, dst)
     }
 
+    fn atomic_load_user_u32(&self, va: u64) -> Result<u32, MemoryError> {
+        let custody = self.state.carrier_vm_custody();
+        self.state.atomic_load_user_u32(&custody, va)
+    }
+
+    fn atomic_compare_exchange_user_u32(
+        &mut self,
+        va: u64,
+        expected: u32,
+        desired: u32,
+    ) -> Result<u32, MemoryError> {
+        let custody = self.state.carrier_vm_custody();
+        self.state
+            .atomic_compare_exchange_user_u32(&custody, va, expected, desired)
+    }
+
     fn translated_write(&mut self, va: u64, _ipa: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         // The PERMISSION-CHECKED syscall write: a write into a non-writable mapping
         // returns EFAULT (audit M1). PROT_NONE was gated in the default `write_bytes`.
