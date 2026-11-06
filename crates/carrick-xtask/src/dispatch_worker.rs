@@ -2769,7 +2769,7 @@ pub(crate) fn branch_run(issue: u64, branch: &str) -> Result<&str, ScalerError> 
         .strip_prefix(&format!("work/dispatch-{issue}-"))
         .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
         .ok_or(ScalerError::Guard(
-            "branch is not derived from this issue's run",
+            "branch is not derived from this issue's run; trigger on the issue, and base the run branch on that PR's head",
         ))
 }
 
@@ -4114,6 +4114,37 @@ fn guard_admission(
     Ok((event, dispatch))
 }
 
+/// Admission refusals must reach the triggering thread, not only an Actions log.
+/// Only these two scope failures have the same safe recovery instruction.
+fn publish_scope_refusal(
+    event: &Value,
+    error: &ScalerError,
+    trusted: &mut dyn FnMut(&str) -> bool,
+    post: &mut dyn FnMut(u64, &str) -> Result<(), ScalerError>,
+) -> Result<(), ScalerError> {
+    let reason = match error {
+        ScalerError::Guard(reason)
+            if *reason == "trigger requires an open issue and owned dispatch PR"
+                || reason.starts_with("branch is not derived from this issue's run") =>
+        {
+            *reason
+        }
+        _ => return Ok(()),
+    };
+    if event["repository"]["full_name"] != REPOSITORY || !trusted_user(&event["sender"], trusted) {
+        return Ok(());
+    }
+    let Some(thread) = event["issue"]["number"].as_u64().filter(|n| *n > 0) else {
+        return Ok(());
+    };
+    post(
+        thread,
+        &format!(
+            "Dispatch refused: {reason}.\n\nTrigger on the issue, and base the run branch on that PR's head."
+        ),
+    )
+}
+
 pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
     let args = match args.action {
         DispatchAction::Reactor { mode } => return reactor::run(root, mode),
@@ -4143,7 +4174,30 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
         } => return agent_loop::run(&root, &event, &setup_status),
         DispatchAction::Guard { event, admit, .. } => (event, admit),
     };
-    let (event, dispatch) = guard_admission(&root, &event_path, admit, cleanup_agent_user)?;
+    let (event, dispatch) = match guard_admission(&root, &event_path, admit, cleanup_agent_user) {
+        Ok(admission) => admission,
+        Err(error) => {
+            // The original event retains the director's thread even when
+            // resolution replaced its issue with the dispatch issue.
+            let event: Value = serde_json::from_slice(&std::fs::read(&event_path)?)?;
+            let mut trusted = collaborators(|endpoint| authenticated_api(&root, endpoint));
+            publish_scope_refusal(&event, &error, &mut trusted, &mut |thread, body| {
+                gh(
+                    &root,
+                    &[
+                        "api",
+                        "-X",
+                        "POST",
+                        &format!("repos/{REPOSITORY}/issues/{thread}/comments"),
+                        "-f",
+                        &format!("body={body}"),
+                    ],
+                )?;
+                Ok(())
+            })?;
+            return Err(error);
+        }
+    };
     // `/agent stop` acts only on a running round, whose mailbox reads it
     // (#1241); it never starts or queues a round of its own.
     if event["comment"]["body"]
@@ -12196,6 +12250,49 @@ fi
             "worker homes leaked other backend credentials: {leaked:?}"
         );
     }
+    #[test]
+    fn scope_refusals_reach_the_directors_thread_with_recovery() {
+        for reason in [
+            "trigger requires an open issue and owned dispatch PR",
+            "branch is not derived from this issue's run",
+        ] {
+            let mut posted = Vec::new();
+            publish_scope_refusal(
+                &event(),
+                &ScalerError::Guard(reason),
+                &mut owner_collaborator(),
+                &mut |thread, body| {
+                    posted.push((thread, body.to_owned()));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(posted.len(), 1);
+            assert_eq!(posted[0].0, 634);
+            assert!(posted[0].1.contains(reason));
+            assert!(posted[0].1.contains("Trigger on the issue"));
+            assert!(
+                posted[0]
+                    .1
+                    .contains("base the run branch on that PR's head")
+            );
+            publish_scope_refusal(
+                &event(),
+                &ScalerError::Guard(reason),
+                &mut |_| false,
+                &mut |_, _| panic!("untrusted trigger posted"),
+            )
+            .unwrap();
+        }
+        publish_scope_refusal(
+            &event(),
+            &ScalerError::Guard("untrusted event actor"),
+            &mut owner_collaborator(),
+            &mut |_, _| panic!("unrelated refusal posted"),
+        )
+        .unwrap();
+    }
+
     fn event() -> Value {
         json!({"repository":{"full_name":REPOSITORY},"action":"labeled",
             "sender":{"login":"tjfontaine","type":"User"},"label":{"name":"dispatch:sol-high"},
