@@ -16,6 +16,34 @@ on:
 
 permissions: {}
 
+# Coalesce main baseline runs under one group so a burst of landings cancels
+# superseded in-flight baselines and runs only the newest main SHA (#1729).
+# Guard with the owner actor and main ref so unauthorized dispatches cannot
+# cancel a live baseline before authorize rejects them (#654). PR dispatches
+# and gate:signed label events keep distinct run-scoped groups here and
+# serialize per-SHA in the gate job below.
+concurrency:
+  group: >-
+    ${{
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main' &&
+      github.actor == 'tjfontaine' &&
+      github.triggering_actor == 'tjfontaine' &&
+      inputs.pr == 'main' &&
+      inputs.sha != '' &&
+      'signed-gate-main' ||
+      format('signed-gate-run-{0}', github.run_id)
+    }}
+  cancel-in-progress: >-
+    ${{
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main' &&
+      github.actor == 'tjfontaine' &&
+      github.triggering_actor == 'tjfontaine' &&
+      inputs.pr == 'main' &&
+      inputs.sha != ''
+    }}
+
 jobs:
   authorize:
     if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'gate:signed'
@@ -179,7 +207,9 @@ jobs:
 
   publish:
     needs: [authorize, gate]
-    if: always() && needs.authorize.result == 'success'
+    # Skip publication when superseded/cancelled so cancel-in-progress does not
+    # post a false signed-gate failure status on an older main SHA (#1729).
+    if: ${{ !cancelled() && needs.authorize.result == 'success' && needs.gate.result != 'cancelled' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
