@@ -107,8 +107,23 @@ fn error(message: impl Into<String>) -> MemoryError {
 /// An unpublished private extent. It can cover many frames/MM aliases; no
 /// carrier-wide shared-zero source exists. Bytes are mutable only before Arc
 /// custody or through the exclusively stopped carrier.
+enum ExtentStorage {
+    Ram(Arc<GuestRam>),
+    Ipc {
+        owner: Arc<dyn carrick_el1_abi::IpcWindowBacking>,
+        part: IpcWindowPart,
+    },
+}
+
+/// Which allocation of the original IPC authority this extent retains.
+#[derive(Clone, Copy)]
+pub enum IpcWindowPart {
+    Directory,
+    Pool,
+}
+
 pub struct BackingExtent {
-    pub ram: Arc<GuestRam>,
+    storage: ExtentStorage,
     pub base: FrameGpa,
     pub len: usize,
 }
@@ -128,11 +143,42 @@ impl BackingExtent {
         ram.add_window(base.raw(), len, WindowKind::Private)
             .map_err(|e| error(e.to_string()))?;
         Ok(Self {
-            ram: Arc::new(ram),
+            storage: ExtentStorage::Ram(Arc::new(ram)),
             base,
             len,
         })
     }
+    /// Retain the original IPC allocation without copying it or assuming
+    /// ownership of its deallocator. The authority must retain stable writable
+    /// pointers, as required by `IpcWindowBacking`'s carrier mapping contract.
+    pub fn ipc_window(
+        base: FrameGpa,
+        owner: Arc<dyn carrick_el1_abi::IpcWindowBacking>,
+        part: IpcWindowPart,
+    ) -> Result<Self, MemoryError> {
+        let (ptr, len) = match part {
+            IpcWindowPart::Directory => (owner.directory_ptr(), owner.directory_len()),
+            IpcWindowPart::Pool => (owner.pool_ptr(), owner.pool_len()),
+        };
+        if ptr.is_null()
+            || !(ptr as usize).is_multiple_of(PAGE as usize)
+            || len == 0
+            || !(len as u64).is_multiple_of(PAGE)
+            || base.raw() & !ADDRESS != 0
+            || base
+                .raw()
+                .checked_add(len as u64)
+                .is_none_or(|end| end > 1 << 52)
+        {
+            return Err(error("invalid retained IPC extent"));
+        }
+        Ok(Self {
+            storage: ExtentStorage::Ipc { owner, part },
+            base,
+            len,
+        })
+    }
+
     pub fn initialize(&mut self, offset: usize, bytes: &[u8]) -> Result<(), MemoryError> {
         if offset
             .checked_add(bytes.len())
@@ -140,7 +186,10 @@ impl BackingExtent {
         {
             return Err(error("extent initialization bounds"));
         }
-        Arc::get_mut(&mut self.ram)
+        let ExtentStorage::Ram(ram) = &mut self.storage else {
+            return Err(error("IPC authority cannot be initialized as private RAM"));
+        };
+        Arc::get_mut(ram)
             .ok_or_else(|| error("extent already shared"))?
             .write_gpa(self.base.raw() + offset as u64, bytes)
             .map_err(|e| error(e.to_string()))
@@ -154,7 +203,7 @@ impl BackingExtent {
             return Err(error("bootstrap window is not retained"));
         }
         Ok(Self {
-            ram,
+            storage: ExtentStorage::Ram(ram),
             base: FrameGpa::new(base),
             len,
         })
@@ -165,7 +214,18 @@ impl BackingExtent {
         {
             return None;
         }
-        self.ram.host_ptr(pa, len)
+        match &self.storage {
+            ExtentStorage::Ram(ram) => ram.host_ptr(pa, len),
+            ExtentStorage::Ipc { owner, part } => {
+                let ptr = match part {
+                    IpcWindowPart::Directory => owner.directory_ptr(),
+                    IpcWindowPart::Pool => owner.pool_ptr(),
+                };
+                // SAFETY: the retained authority owns this complete allocation;
+                // the extent bounds were checked above.
+                Some(unsafe { ptr.add((pa - self.base.raw()) as usize) })
+            }
+        }
     }
 
     /// Host view of this retained extent; never a guest VA or a GPA.

@@ -337,6 +337,18 @@ impl<'a> FileTables<'a> {
         unsafe { Self::attach(mapped, expected) }
     }
 
+    /// Descriptor namespace belonging to this exact retained carrier.
+    pub fn ipc_table_map(&self) -> &'a crate::ipc_tables::IpcTableMap {
+        // SAFETY: the map is aligned and contained in the authenticated region.
+        unsafe {
+            &*self
+                .mapped
+                .as_ptr()
+                .add(crate::EL1_IPC_TABLE_MAP_OFFSET as usize)
+                .cast()
+        }
+    }
+
     pub fn objects(&self) -> &[DelegatedFile; MAX_DELEGATED_FILES] {
         // SAFETY: attached initialized venue; fixed ABI extent/alignment.
         unsafe {

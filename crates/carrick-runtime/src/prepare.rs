@@ -1528,7 +1528,26 @@ impl PreparedRun {
                                 carrick_kernel::kernel::ObjectIdRegistry::new(),
                             )),
                         extent_bytes,
+                        carrick_kernel::kernel::continuation::ipc::host_window_backing(&dispatcher),
                     )?;
+                    {
+                        let owner = root_context
+                            .kernel()
+                            .ipc()
+                            .map_err(|e| RuntimeError::Unsupported(format!("x86 IPC authority: {e:?}")))?;
+                        root_context
+                            .resources()
+                            .files()
+                            .publish_ipc(
+                                owner,
+                                carrick_kernel::kernel::objects::IpcTableMapBinding::Retained(
+                                    machine.ipc_table_map(),
+                                ),
+                            )
+                            .map_err(|e| {
+                                RuntimeError::Unsupported(format!("x86 IPC publication: {e:?}"))
+                            })?;
+                    }
                     root_context
                         .kernel()
                         .object_ids()

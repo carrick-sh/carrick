@@ -661,6 +661,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
             .map_err(|_| TrapError::Hypervisor("KVM dispatcher poisoned".into()))?;
         let (decision, token) = self.physical.capture_forward(task, |venue, frame| {
             if frame.rax == carrick_el1_abi::HostFileCrossing::NUMBER {
+                stats.record(crate::prepare::InitialForwardClass::Host("host-file"))?;
                 if frame.rcx != carrick_el1_abi::HostFileCrossing::FRAME_TAG {
                     return Err(TrapError::Hypervisor("host file crossing tag".into()));
                 }

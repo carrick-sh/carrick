@@ -47,6 +47,9 @@ pub const PRODUCTION_METADATA_GPA: u64 = META_GPA;
 pub const ALLOCATOR_GPA: u64 = 0x20_00000;
 pub const INITIAL_EXTENT_GPA: u64 = X86_CPL0_INITIAL_EXTENT_GPA;
 pub const KERNEL_REGION_GPA: u64 = 0x1_0000_0000;
+/// Reserved before dynamic grants, including carriers with no IPC authority.
+pub const IPC_WINDOW_GPA: u64 = 0x2_0000_0000;
+pub const DYNAMIC_GRANT_GPA: u64 = IPC_WINDOW_GPA + carrick_el1_abi::EL1_IPC_SIZE;
 pub const INITIAL_MM_KEY: u64 = 301;
 pub const INITIAL_STACK_TOP: u64 = 0x7fff_0000;
 pub const INITIAL_STACK_SIZE: u64 = 0x1_0000;
@@ -2516,6 +2519,10 @@ pub struct ForwardVenue<'a, M: CarrierCpuIo, Mem: CarrierMemoryIo = M> {
 }
 
 impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
+    pub fn ipc_table_map(&self) -> Arc<dyn carrick_el1_abi::ipc_tables::IpcTableMapBacking> {
+        Arc::new(RetainedIpcTableMap(Arc::clone(&self.files._backing)))
+    }
+
     pub fn file_tables(
         &self,
         binding: carrick_el1_abi::FileRegionBinding,
@@ -3619,8 +3626,34 @@ mod cpl0_layout_tests {
 
 pub use crate::cpl0_private_witness::PrivateAnonymousMmEvidence;
 
+struct RetainedIpcTableMap(Arc<BackingExtent>);
+impl carrick_el1_abi::ipc_tables::IpcTableMapBacking for RetainedIpcTableMap {
+    fn table_map(&self) -> &carrick_el1_abi::ipc_tables::IpcTableMap {
+        let base = self.0.host_base().unwrap_or_else(|_| {
+            carrick_fatal::carrick_fatal!("cpl0::ipc_map", "retained map backing vanished")
+        });
+        // SAFETY: constructed only from the complete authenticated file extent;
+        // the Arc owns its storage independently of carrier registration.
+        unsafe {
+            &*((base.raw() + carrick_el1_abi::EL1_IPC_TABLE_MAP_OFFSET as usize)
+                as *const carrick_el1_abi::ipc_tables::IpcTableMap)
+        }
+    }
+}
+
 pub struct BootstrapFileRegion(RetainedFileRegion);
 impl BootstrapFileRegion {
+    /// Publish only after the original IPC allocations and slot source are mapped.
+    pub fn publish_ipc_window(&self) -> Result<(), TrapError> {
+        let tables = self
+            .0
+            .registration
+            .tables(self.0.registration.binding())
+            .map_err(|e| fail(format!("IPC table map: {e:?}")))?;
+        tables.ipc_table_map().publish_window();
+        Ok(())
+    }
+
     /// # Safety
     /// `backing` must cover the entire writable binding extent and remain
     /// exclusively unpublished during initialization: no other registration,
@@ -3818,7 +3851,7 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             prepare_table_stock: None,
             fork_stock,
             maintenance_root: None,
-            anonymous_next_gpa: FrameGpa::new(0x2_0000_0000),
+            anonymous_next_gpa: FrameGpa::new(DYNAMIC_GRANT_GPA),
             anonymous_pending: [None, None],
             owner_grant_crossings: 0,
             root_exit_crossings: 0,
@@ -3922,6 +3955,10 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
     pub fn file_region_binding(&self) -> carrick_el1_abi::FileRegionBinding {
         self.0.files.registration.binding()
     }
+    pub fn ipc_table_map(&self) -> Arc<dyn carrick_el1_abi::ipc_tables::IpcTableMapBacking> {
+        self.0.ipc_table_map()
+    }
+
     pub fn file_tables(
         &self,
         binding: carrick_el1_abi::FileRegionBinding,

@@ -148,7 +148,7 @@ fn production_cpl0_boot_retains_separate_supervisor_and_initial_extents() {
         + 4095)
         & !4095;
     for initial_bytes in [0x20_000, 0x40_000, 0x80_000] {
-        let carrier = Cpl0Carrier::boot_production(physical_inventory(), initial_bytes)
+        let carrier = Cpl0Carrier::boot_production(physical_inventory(), initial_bytes, None)
             .expect("production image on one KVM carrier VM");
         // Bootstrap RAM, dynamic metadata, allocator, supervisor region,
         // and the exact requested initial MM extent each retain one slot.
@@ -172,8 +172,8 @@ fn production_cpl0_boot_retains_separate_supervisor_and_initial_extents() {
 
 #[test]
 fn production_cpl0_boot_requires_smep_and_smap_on_both_cpus() {
-    let carrier =
-        Cpl0Carrier::boot_production(physical_inventory(), 0x20_000).expect("production KVM boot");
+    let carrier = Cpl0Carrier::boot_production(physical_inventory(), 0x20_000, None)
+        .expect("production KVM boot");
     for slot in 0..2 {
         let cr4 = carrier.supervisor_cr4(slot).expect("stopped CPU state");
         assert_eq!(cr4 & ((1 << 20) | (1 << 21)), (1 << 20) | (1 << 21));
@@ -189,7 +189,8 @@ fn cpl0_supervisor_stub_is_rx_while_tables_and_idt_are_rw_nx() {
     };
     for carrier in [
         Cpl0Carrier::boot(physical_inventory(), &image(), [&[], &[]]).expect("fixture KVM boot"),
-        Cpl0Carrier::boot_production(physical_inventory(), 0x20_000).expect("production KVM boot"),
+        Cpl0Carrier::boot_production(physical_inventory(), 0x20_000, None)
+            .expect("production KVM boot"),
     ] {
         let idt = carrick_x86::fault_idt_base(layout);
         let stub = carrick_x86::fault_stub_base(layout);

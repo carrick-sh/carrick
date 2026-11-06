@@ -461,3 +461,9 @@ mod tests {
         });
     }
 }
+
+/// Owns a carrier's descriptor map storage for host publication lifetime.
+/// Implementations return the same map for their complete lifetime.
+pub trait IpcTableMapBacking: Send + Sync {
+    fn table_map(&self) -> &IpcTableMap;
+}

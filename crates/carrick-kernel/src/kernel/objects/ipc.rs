@@ -4,6 +4,27 @@ use crate::el1_ipc::{AdmissionError, HostDescription, HostIpc, HostTable};
 use carrick_el1_abi::ipc::{IpcBacking, fd};
 use carrick_el1_abi::ipc_tables::IpcTableMap;
 
+/// Retains dynamically allocated carrier storage instead of forging a static
+/// reference when a file table outlives its carrier.
+pub enum IpcTableMapBinding {
+    Static(&'static IpcTableMap),
+    Retained(Arc<dyn carrick_el1_abi::ipc_tables::IpcTableMapBacking>),
+}
+impl From<&'static IpcTableMap> for IpcTableMapBinding {
+    fn from(map: &'static IpcTableMap) -> Self {
+        Self::Static(map)
+    }
+}
+impl core::ops::Deref for IpcTableMapBinding {
+    type Target = IpcTableMap;
+    fn deref(&self) -> &IpcTableMap {
+        match self {
+            Self::Static(map) => map,
+            Self::Retained(owner) => owner.table_map(),
+        }
+    }
+}
+
 /// The host slot map and stdio markers serialize publication. This binding
 /// owns only their shared projection; pipe/eventfd descriptions and flags
 /// already use the same OFD authority in both venues.
@@ -11,7 +32,7 @@ pub(super) struct Binding {
     reservations: HashMap<i32, (u64, crate::el1_ipc::HostSlotReservation)>,
     table: HostTable,
     owner: Arc<HostIpc>,
-    map: &'static IpcTableMap,
+    map: IpcTableMapBinding,
     file_table: FileTableId,
     stdio: Vec<HostDescription>,
     explicit_stdio: [bool; 3],
@@ -45,7 +66,7 @@ pub struct ImplicitHostStdio {
 impl Binding {
     fn new(
         owner: Arc<HostIpc>,
-        map: &'static IpcTableMap,
+        map: IpcTableMapBinding,
         file_table: FileTableId,
         slots: &FileSlotMap,
         reserved_slots: &HashMap<i32, u64>,
@@ -111,7 +132,9 @@ impl Binding {
         }
         // No guest can observe a partial namespace. Publish only after every
         // real descriptor and implicit host stream has been represented.
-        map.publish(file_table.raw(), binding.table.id().to_raw())
+        binding
+            .map
+            .publish(file_table.raw(), binding.table.id().to_raw())
             .map_err(|_| AdmissionError::NoMemory)?;
         Ok(binding)
     }
@@ -322,8 +345,9 @@ impl FileTable {
     pub fn publish_ipc(
         &self,
         owner: Arc<HostIpc>,
-        map: &'static IpcTableMap,
+        map: impl Into<IpcTableMapBinding>,
     ) -> Result<(), AdmissionError> {
+        let map = map.into();
         if !self.functional_refs_active() {
             return Err(fd::Error::StaleTable.into());
         }
@@ -333,7 +357,7 @@ impl FileTable {
                 return match binding {
                     Ok(binding)
                         if Arc::ptr_eq(&owner, &binding.owner)
-                            && core::ptr::eq(map, binding.map) =>
+                            && core::ptr::eq(&*map, &*binding.map) =>
                     {
                         Ok(())
                     }
@@ -355,7 +379,8 @@ impl FileTable {
         if let Some(binding) = &*ipc {
             return match binding {
                 Ok(binding)
-                    if Arc::ptr_eq(&owner, &binding.owner) && core::ptr::eq(map, binding.map) =>
+                    if Arc::ptr_eq(&owner, &binding.owner)
+                        && core::ptr::eq(&*map, &*binding.map) =>
                 {
                     Ok(())
                 }
@@ -570,6 +595,39 @@ mod tests {
             &*std::alloc::alloc_zeroed(std::alloc::Layout::new::<IpcTableMap>())
                 .cast::<IpcTableMap>()
         }
+    }
+
+    #[test]
+    fn published_table_retains_dynamic_carrier_map_until_withdrawal() {
+        struct MapOwner(Box<IpcTableMap>);
+        impl carrick_el1_abi::ipc_tables::IpcTableMapBacking for MapOwner {
+            fn table_map(&self) -> &IpcTableMap {
+                &self.0
+            }
+        }
+        // SAFETY: zero is the empty atomic map; allocation has its ABI alignment.
+        let map = Arc::new(MapOwner(unsafe {
+            Box::from_raw(std::alloc::alloc_zeroed(std::alloc::Layout::new::<IpcTableMap>()).cast())
+        }));
+        let weak = Arc::downgrade(&map);
+        let ids = ObjectIdRegistry::new();
+        let owner = Arc::new(HostIpc::new(1 << 20).unwrap());
+        let table = FileTable::new(ids.file_table_id().unwrap());
+        let key = table.id().raw();
+        table
+            .publish_ipc(owner, IpcTableMapBinding::Retained(map.clone()))
+            .unwrap();
+        assert!(map.0.lookup(key).is_some());
+        drop(map);
+        let observer = weak.upgrade().expect("file table owns the map storage");
+        drop(table);
+        assert_eq!(
+            observer.0.lookup(key),
+            None,
+            "withdraw before releasing storage"
+        );
+        drop(observer);
+        assert!(weak.upgrade().is_none());
     }
 
     // No host fd, fork, environment mutation or global counter: VM-free

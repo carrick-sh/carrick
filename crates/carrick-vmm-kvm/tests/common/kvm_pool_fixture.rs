@@ -90,9 +90,25 @@ pub fn try_run_program_with_dispatcher(
     let image = prepare_x86_elf(program).expect("x86 ELF program");
     let extent =
         Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("bounded initial extent");
-    let mut carrier =
-        Cpl0Carrier::boot_production(physical_inventory(), extent).expect("production KVM image");
+    let mut carrier = Cpl0Carrier::boot_production(
+        physical_inventory(),
+        extent,
+        carrick_kernel::kernel::continuation::ipc::host_window_backing(&dispatcher),
+    )
+    .expect("production KVM image");
     let root = dispatcher.capture_one_task_context().expect("issued root");
+    {
+        let owner = root.kernel().ipc().expect("IPC owner");
+        root.resources()
+            .files()
+            .publish_ipc(
+                owner,
+                carrick_kernel::kernel::objects::IpcTableMapBinding::Retained(
+                    carrier.ipc_table_map(),
+                ),
+            )
+            .expect("publish exact table");
+    }
     root.kernel()
         .object_ids()
         .bind_initial_birth_source(

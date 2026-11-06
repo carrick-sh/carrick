@@ -57,3 +57,35 @@ x86 anonymous adapter forwards `PreparedConflict` and has no `park_prepared`
 implementation. A real child must also fault an untouched file page after its
 parent unmaps/exits, then write privately without changing the source. The
 single-MM read-only and private-write cases cannot prove that fork lifetime.
+
+## Descriptor-window integration checkpoint
+
+The carrier now retains the original `HostIpc` directory and pool through
+`BackingExtent::ipc_window`, using the existing batch memslot rollback owner.
+It maps supervisor writable NX aliases at `X86_CPL0_IPC_BASE` and
+`X86_CPL0_IPC_POOL_BASE`, binds the operation-slot generation, and publishes
+its root namespace. Dynamic grants start beyond the reserved physical IPC
+window. The shared guest attachment selects the ISA's alias addresses.
+
+`IpcTableMapBinding::Retained` keeps the descriptor-map allocation alive until
+the host file table withdraws its publication; it does not manufacture a static
+reference to carrier-owned storage. VM-free tests check original allocation
+pointer identity, authority retention through memslot lifetime, and map
+withdrawal before storage release.
+
+The two real KVM witnesses still return mmap errno 38 (exit 32). Their
+execution witnesses now count one `host-file` crossing each, proving staging
+and the synchronous transport are reached. They do not reach a physical
+file-page grant. The remaining refusal is in the shared host-file resource
+service: `FileTable::publish_ipc` exports preopened host slots as
+`IpcPhysicalHold`, whereas `serve_native_resource` accepts `NativeOpenFile`
+(and implicit stdio). The x86 forwarded open path also installs host slots;
+ARM native opens install `NativeOpenFile` through `NativeOpenSink`.
+
+Do not fix this with a numeric host-fd lookup, a copied namespace, a strong
+FileDescription backlink in IpcPhysicalHold (which cycles through publication),
+or by changing the witnesses to bypass the x86 open authority. The integration
+needs a shared physical resource/source projection or the shared native-open
+service admission, with the same functional lifetime and delegation recall
+rules. This checkpoint does not claim loader, echo, Python, fork-source, EOF,
+or prepared-edit contention acceptance.

@@ -122,3 +122,51 @@ fn inherited_inventory_edge_survives_protect_advancing_mapping_generation() {
     })
     .unwrap();
 }
+
+#[test]
+fn ipc_memslots_retain_original_authority_without_copying() {
+    use carrick_el1_abi::IpcWindowBacking;
+    use carrick_kernel::el1_ipc::HostIpc;
+    let owner = Arc::new(HostIpc::new(HostIpc::DEFAULT_POOL_BYTES).unwrap());
+    let weak = Arc::downgrade(&owner);
+    let directory = IpcWindowBacking::directory_ptr(&*owner) as u64;
+    let pool = IpcWindowBacking::pool_ptr(&*owner) as u64;
+    let mut memory = CarrierMemory::new(TestMemoryIo::default()).unwrap();
+    let backings: Vec<_> = [
+        (IpcWindowPart::Directory, 0x2_0000_0000),
+        (IpcWindowPart::Pool, 0x2_0800_0000),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, (part, base))| {
+        let serial = NonZeroU64::new(index as u64 + 1).unwrap();
+        PreparedBacking {
+            extent: Arc::new(
+                BackingExtent::ipc_window(FrameGpa::new(base), owner.clone(), part).unwrap(),
+            ),
+            identity: BackingIdentity {
+                frame_id: serial,
+                mapping_id: serial,
+                owner_generation: serial,
+                inventory_revision: serial,
+            },
+        }
+    })
+    .collect();
+    memory.install(&backings).unwrap();
+    let regions = memory.vm.regions.lock().unwrap();
+    assert_eq!(regions[&0].userspace_addr, directory);
+    assert_eq!(regions[&1].userspace_addr, pool);
+    drop(regions);
+    drop(backings);
+    drop(owner);
+    assert!(
+        weak.upgrade().is_some(),
+        "registered bytes retain their authority"
+    );
+    drop(memory);
+    assert!(
+        weak.upgrade().is_none(),
+        "VM destruction releases authority"
+    );
+}
