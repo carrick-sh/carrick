@@ -159,7 +159,7 @@ The signed core's `Woken` handback does not prove which path produced it.
 Neither source is attributed as the captured failure's cause in this round.
 The native-process harness allocates scheduler records directly and bypasses
 these production host-park entry points; a helper-only identity test would not
-close the missing witness tracked by #1758. No new reproduction or signed
+close the missing production witness. No new reproduction or signed
 population is claimed.
 
 The structural repair remains open: authenticate the exact task ID, serial,
@@ -211,3 +211,59 @@ fixture's direct record allocation bypasses the production host-park
 constructors; injecting a zero identity there would demonstrate only the
 consumer, not the publication defect's causal path. No such synthetic
 fixture is presented as a red witness or a fix.
+
+## Publication refusal classification and repair boundary
+
+Further source inspection narrows what a publication continuation must own.
+`CarrierMetadataAccess::map_retained` reaches
+`HostApertureState::install_retained_using`, which delegates to
+`install_backing_using`. Its `Busy` is not a typed lock dependency:
+
+- `reserve_metadata_token` refuses a zero or exhausted monotone token counter;
+  no holder can release that counter to make the same request succeed.
+- `find_and_reserve_slots` can refuse aperture capacity. Progress requires
+  actual retirement of a retained mapping or return of a dynamic grant.
+- `publish_backing_using` collapses a stage-2/inventory publication error to
+  `Busy`; `install_backing_using` releases its reservation on that failure.
+  The resulting error has lost the underlying reason and dependency.
+
+Consequently, enrolling every `MetadataResolutionError::Busy` on a generic
+metadata completion wake is not yet a structural repair. A completion wake
+does not establish that the failed publication has a producer capable of
+releasing its particular dependency. This classification is source evidence;
+it does not identify which, if any, refusal occurred in the signed core.
+
+The neutral publication owner needs to distinguish a retained wait dependency
+from terminal identity/resource failures before the runtime can suspend the
+operation correctly. A retained publication operation must own the exact
+thread/control leases, carrier generation, requested aliases and any partial
+mapping custody. It must enroll on that dependency's release venue, probe once
+after enrollment, and release execution capacity while waiting. Neither
+`HostServed` success nor a carrier abort represents that suspended operation.
+Partial mappings must remain owned through retry or roll back before dropping
+their backing; the existing stage-2/inventory transaction remains authoritative.
+
+For an already published thread, the owner must authenticate the complete
+execution identity before lending the retained guest aliases to a parked
+record. An arbitrary current vCPU slot is not an authority: an in-ring switch
+can replace its thread. First publication has no aliases to preserve and must
+complete or suspend before guest execution. The same neutral admission rule
+must cover both instruction sets; backend code only installs its mappings.
+
+The missing production witness has two distinct schedules. One must drive a
+real host futex park, wake and in-ring reload with two live threads and verify
+that each retains its own aliases. The other must refuse the real mapping
+publication once, release the named dependency, and complete the same owned
+publication without entering EL0 early. Cancellation must release retained
+custody. Exhausted tokens and permanent mapping failures need separate results,
+not a wait with no possible producer.
+
+The native-process suite does not call the runtime's `zone_park`; the runtime
+`zone_park_wake_loads_on_second_executor` fixture also allocates its record
+directly and scripts the backend save/load. Both can validate consumers but
+neither currently drives the suspected publication producer. This is the
+production-entry-point gap. Issue #1758 separately tracks reauthentication
+of each native-process fixture crossing against live execution/MM/root
+generations; fixing that gap alone would not make the fixture call the
+runtime's host-park producer. No helper-only zero-alias test is claimed as
+reproduction, and no speculative runtime fix is included here.
