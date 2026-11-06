@@ -159,3 +159,16 @@ The unchanged `check-personality-boundary --root . --metadata-file
 target/cargo-metadata.json` reports 12 source violations with the original
 EL1 file and scheduler sources restored, and exits 1. Restoring their neutral
 copy paths makes the same checker exit 0 with 11 substrate crates clean.
+
+### Typed record writes (#1703 debt retirement)
+
+`UserCopy::write_val` now preserves the underlying `CopyOutcome`, including
+an exact `NotYet` owner request. The helper no longer collapses refusal to a
+boolean, and its bool-trait debt entry is deleted. The six existing System V
+IPC consumers explicitly retain their previous `is_done` policy; this repair
+does not claim to add owner suspension to those IPC operations. Their later
+migration must retain operation state before waiting, especially a dequeued
+message. The futex word paths and their owner-wait protocol are unchanged.
+`typed_record_write_preserves_every_copy_outcome` checks the typed helper's
+Done, Fault and exact NotYet propagation; the existing two-live-thread futex
+witness remains the production-entry behavioral proof.
