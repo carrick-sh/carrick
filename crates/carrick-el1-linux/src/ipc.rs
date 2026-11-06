@@ -2364,6 +2364,142 @@ mod tests {
         (held, record)
     }
 
+    struct CompletionTransport<'a, C: ThreadCpu, U: UserWord> {
+        inner: Sched<'a, C, U>,
+        delivered: &'a core::cell::Cell<usize>,
+    }
+
+    impl<C: ThreadCpu, U: UserWord> IpcExecution for CompletionTransport<'_, C, U> {
+        type Context = carrick_el1_abi::Aarch64ParkedContext;
+        type Frame = TrapFrame;
+        fn zone(&self) -> &ZoneTables {
+            self.inner.zone
+        }
+        fn slot(&self) -> carrick_el1_abi::SlotId {
+            self.inner.slot
+        }
+        fn task(&self) -> &CurrentTask {
+            self.inner.task
+        }
+        fn counters(&self) -> &carrick_el1_abi::Counters {
+            self.inner.counters
+        }
+        fn now(&self) -> u64 {
+            self.inner.cpu.now()
+        }
+        fn ticks(&self, ns: u64) -> u64 {
+            self.inner.ticks(ns)
+        }
+        fn take_object_operation(
+            &self,
+        ) -> Result<Option<carrick_sched_core::object_wait::OperationToken>, ObjectWaitError>
+        {
+            self.inner.take_object_operation()
+        }
+        fn finish_object_wake(&mut self, effects: WakeEffects) {
+            self.inner.finish_object_wake(effects);
+        }
+        fn deliver_completion(
+            &self,
+            owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, Self::Context>,
+        ) {
+            self.delivered.set(self.delivered.get() + 1);
+            self.inner.deliver_completion(owned);
+        }
+        fn park(
+            &mut self,
+            frame: &mut TrapFrame,
+            key: carrick_sched_core::object_wait::ObjectWaitKey,
+            snapshot: ObjectStateSnapshot,
+            operation: carrick_sched_core::object_wait::OperationToken,
+            deadline: Option<u64>,
+            interrupt: Option<&mut dyn FnMut() -> bool>,
+        ) -> Result<
+            IpcServed,
+            (
+                ObjectWaitError,
+                carrick_sched_core::object_wait::OperationToken,
+            ),
+        > {
+            IpcExecution::park(
+                &mut self.inner,
+                frame,
+                key,
+                snapshot,
+                operation,
+                deadline,
+                interrupt,
+            )
+        }
+        fn park_owner(
+            &mut self,
+            frame: &mut TrapFrame,
+            wait: carrick_core_abi::PortalOwnerWait,
+            operation: carrick_sched_core::object_wait::OperationToken,
+        ) -> Result<
+            IpcServed,
+            (
+                ObjectWaitError,
+                carrick_sched_core::object_wait::OperationToken,
+            ),
+        > {
+            IpcExecution::park_owner(&mut self.inner, frame, wait, operation)
+        }
+    }
+
+    #[test]
+    fn ipc_operation_completion_uses_execution_transport() {
+        let w = world();
+        w.mem.map(MM, 0x10000, PAGE);
+        let table = w.table(w.a_tid);
+        let fd = w.eventfd(table, 1, EventMode::Counter, BLOCK);
+        let mut frame = syscall(SYS_READ, fd, 0x10000, 8, A_SVC);
+        let venue = w.venue();
+        let mut cpu = FakeCpu::default();
+        let delivered = core::cell::Cell::new(0);
+        let mut sched = CompletionTransport {
+            inner: Sched {
+                handoff: None,
+                zone: &w.zone,
+                slot: SLOT,
+                task: &w.task,
+                cpu: &mut cpu,
+                user: &HardwareUserWord,
+                counters: w.counters,
+            },
+            delivered: &delivered,
+        };
+        // Bind the real release source before completion. Keep one arena
+        // slot free for the call's production admission and retain a waiter
+        // on the existing release queue.
+        let (mut held, waiter) = slot_release_waiter(&w);
+        let free = held.pop().unwrap();
+        w.region.finish_operation(free, || {}).unwrap();
+        let mut user = User {
+            task: &w.task,
+            mem: &w.mem,
+        };
+        assert_eq!(
+            serve_ipc_with_signals(&mut sched, &mut frame, &venue, &mut user, true, &mut || {
+                false
+            })
+            .0,
+            IpcServed::Returned { switched: false },
+        );
+        assert_eq!(frame.x[0], 8);
+        assert!(matches!(
+            w.zone.record(waiter).claim(),
+            carrick_sched_core::Claim::Queued { .. }
+        ));
+        assert!(
+            delivered.get() > 0,
+            "retirement bypassed the execution transport"
+        );
+        for token in held {
+            finish(&mut sched, token, w.region);
+        }
+    }
+
     #[test]
     fn ipc_operation_slot_native_finish_and_retire_publish() {
         for retiring in [false, true] {
