@@ -41,6 +41,7 @@
   "error-collapse:crates/carrick-kernel/src/dispatch/mount_api.rs": 11,
   "error-collapse:crates/carrick-kernel/src/dispatch/mqueue.rs": 10,
   "error-collapse:crates/carrick-kernel/src/dispatch/net.rs": 6,
+  "error-collapse:crates/carrick-kernel/src/dispatch/net/epoll_ops.rs": 1,
   "error-collapse:crates/carrick-kernel/src/dispatch/net/lifecycle.rs": 6,
   "error-collapse:crates/carrick-kernel/src/dispatch/net/netlink.rs": 1,
   "error-collapse:crates/carrick-kernel/src/dispatch/net/packet.rs": 6,

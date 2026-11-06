@@ -70,5 +70,8 @@ supply still require the native and signed integration layers.
 input through the same dispatcher for both ABIs. A suspended timespec read
 returns the existing owner wait and redispatch with a zero timeout completes
 normally. A genuinely invalid address still returns EFAULT (14), and a
-negative timespec still returns EINVAL (22). This retires the remaining
-error-collapse debt in the epoll handler without adding a second outcome.
+negative timespec still returns EINVAL (22). This preserves timeout ownership without adding a second outcome. The
+syntactic guest-copy census still counts the direct read match because its
+Err binding is unclassified syntactically; it does not inspect the owner
+mapper in that arm. Its exact ceiling remains one (down from three on the
+admitted base), rather than hiding the read behind a census-opaque helper.
