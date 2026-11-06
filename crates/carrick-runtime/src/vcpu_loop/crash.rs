@@ -735,7 +735,11 @@ where
                             pending.address == address && pending.length == to_read
                         }) {
                             let pending = pending.take().expect("matched pending core read");
-                            engine.resume_read(pending.continuation)
+                            engine.resume_core_read(
+                                pending.continuation,
+                                pending.address,
+                                pending.length,
+                            )
                         } else if let Some(pending) = pending.as_ref() {
                             return Err(RuntimeError::Configuration(format!(
                                 "core mapping layout changed before retained read {:#x}..{:#x}; next range is {address:#x}..{:#x}",
