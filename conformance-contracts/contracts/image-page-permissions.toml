@@ -1,3 +1,7 @@
+# #1709: vcpu_loop/mod.rs adds only the cfg(test) CopyoutOwnerProbe
+# constructor used by the terminal memory-wait witness. Image permissions,
+# temporary signal-mask behavior and their existing bindings/budgets are
+# unchanged; production wait selection is bound under kernel.memory.owner-wait.
 # #1666: terminal-only CPU saves now materialize from the current MM lease.
 # The two-live-thread production exit_group binding in
 # carrick-runtime::vcpu_loop::binding::tests::
