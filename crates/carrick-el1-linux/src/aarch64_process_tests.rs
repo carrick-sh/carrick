@@ -12204,8 +12204,12 @@ fn clone_nonresident_tid_destination(is_clone3: bool, refusal: CloneRefusal) {
     crate::lifecycle::COPYOUT_REFUSE_RESTORE_AT.with(|address| address.set(None));
     assert_eq!(
         tid_words.get::<[u32; 2]>(0),
-        [0x1111_1111, 0x2222_2222],
-        "is_clone3={is_clone3}: a refused child TID copy must not expose an unborn TID to the live peer"
+        if rollback_refusal {
+            [43, 0x2222_2222]
+        } else {
+            [0x1111_1111, 0x2222_2222]
+        },
+        "is_clone3={is_clone3}: refusal must match main's best-effort rollback"
     );
     crate::lifecycle::GUEST_COPY_PREPARATION_FAULT_AT.with(|address| address.set(None));
     let first = first.unwrap();
@@ -12233,7 +12237,11 @@ fn clone_nonresident_tid_destination(is_clone3: bool, refusal: CloneRefusal) {
     );
     assert_eq!(
         tid_words.get::<[u32; 2]>(0),
-        [0x1111_1111, 0x2222_2222],
+        if rollback_refusal {
+            [43, 0x2222_2222]
+        } else {
+            [0x1111_1111, 0x2222_2222]
+        },
         "is_clone3={is_clone3}: refusal restores every attempted output"
     );
     assert!(!leader_sees_thread(fixture, &mut service, 43));

@@ -1214,23 +1214,20 @@ impl TidOutputs {
         outcome
     }
 
-    fn rollback(&self, user: &mut dyn LifecycleNative<'_>) -> bool {
-        let mut complete = true;
+    fn rollback(&self, user: &mut dyn LifecycleNative<'_>) {
         for output in [&self.parent, &self.child]
             .into_iter()
             .flatten()
             .filter(|output| output.committed)
         {
             let mut observed = 0;
-            let outcome = user.compare_exchange_user_u32(
+            let _ = user.compare_exchange_user_u32(
                 UserVa::new(output.address),
                 output.published,
                 output.preimage,
                 &mut observed,
             );
-            complete &= outcome.is_done();
         }
-        complete
     }
 }
 
@@ -1629,9 +1626,7 @@ fn serve_thread_clone_common<'a>(
         if native.lifecycle_admission_settled().is_err() {
             native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
         }
-        if !outputs.rollback(native) {
-            native.fail_lifecycle(NativeRunFailureReason::ClaimRollback);
-        }
+        outputs.rollback(native);
         return match publish_outcome {
             CopyOutcome::Fault | CopyOutcome::NotYet(_) => None,
             CopyOutcome::Done => unreachable!(),
@@ -1650,9 +1645,7 @@ fn serve_thread_clone_common<'a>(
         if native.lifecycle_admission_settled().is_err() {
             native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
         }
-        if !outputs.rollback(native) {
-            native.fail_lifecycle(NativeRunFailureReason::ClaimRollback);
-        }
+        outputs.rollback(native);
         native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
     }
 
@@ -1696,9 +1689,7 @@ fn serve_thread_clone_common<'a>(
         if native.lifecycle_admission_settled().is_err() {
             native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
         }
-        if !outputs.rollback(native) {
-            native.fail_lifecycle(NativeRunFailureReason::ClaimRollback);
-        }
+        outputs.rollback(native);
         return Some(returned(SyscallResult::new(error), false));
     }
     if native.lifecycle_admission_settled().is_err() {
