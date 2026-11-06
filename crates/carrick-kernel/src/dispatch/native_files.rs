@@ -2512,16 +2512,13 @@ mod tests {
         );
     }
 
-    /// A private file mapping's byte source: the reply names the identity
-    /// the ring maps with, and the retained source reads the file's bytes
-    /// at the mapping's offset as its pages fault in.
-    #[test]
-    fn published_private_map_source_survives_host_close_without_a_publication_cycle() {
-        use carrick_hal::fork_stock::HostBackingRead;
-        let mut fixture = rootfs_fixture();
+    fn published_private_source(
+        fixture: &mut Fixture,
+        path: &str,
+    ) -> Arc<dyn carrick_hal::fork_stock::HostBackingRetention> {
         let context = fixture.dispatcher.capture_one_task_context().unwrap();
         let mut memory =
-            super::super::outcome::LinearMemory::new(0x4000, b"/lib/libc.so.6\0".to_vec());
+            super::super::outcome::LinearMemory::new(0x4000, [path.as_bytes(), &[0]].concat());
         let opened = fixture
             .dispatcher
             .dispatch(
@@ -2575,11 +2572,58 @@ mod tests {
             original.upgrade().is_none(),
             "mapping does not own the publication description"
         );
+        source
+    }
+
+    #[test]
+    fn published_private_map_source_survives_host_close_without_a_publication_cycle() {
+        use carrick_hal::fork_stock::HostBackingRead;
+        let source = published_private_source(&mut rootfs_fixture(), "/lib/libc.so.6");
         let bytes = source
             .read(HostBackingRead::new(source.identity(), 4096).unwrap())
             .unwrap();
         assert_eq!(&bytes[..15], b"\x7fELF-libc-bytes");
         assert!(bytes[15..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn published_private_source_rechecks_eof_after_truncation() {
+        use carrick_hal::fork_stock::HostBackingRead;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source");
+        std::fs::write(&path, vec![0x41; 4097]).unwrap();
+        let mut dispatcher = SyscallDispatcher::default();
+        dispatcher.set_fs_backend(Box::new(
+            carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/")).unwrap(),
+        ));
+        let mut fixture = fixture_with(dispatcher, None);
+        let source = published_private_source(&mut fixture, path.to_str().unwrap());
+        let second_page =
+            HostBackingRead::new(source.identity().advance(4096).unwrap(), 4096).unwrap();
+        let bytes = source.read(second_page).unwrap();
+        assert_eq!(bytes[0], 0x41);
+        assert!(bytes[1..].iter().all(|byte| *byte == 0));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(4096)
+            .unwrap();
+        assert_eq!(
+            source.read(second_page),
+            Err(carrick_hal::fork_stock::HostBackingReadError::Inaccessible),
+            "no supply past the new EOF"
+        );
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        assert_eq!(
+            source.read(HostBackingRead::new(source.identity(), 4096).unwrap()),
+            Err(carrick_hal::fork_stock::HostBackingReadError::Inaccessible),
+        );
     }
 
     #[test]
