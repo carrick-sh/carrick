@@ -68,6 +68,41 @@ mod owner_copyout_policy_tests {
     }
 }
 
+#[cfg(test)]
+mod futex_word_tests {
+    use super::load_zone_futex_word;
+    use carrick_guest_mem::{GuestMemory, MemoryError};
+
+    struct OwnerWord;
+
+    impl GuestMemory for OwnerWord {
+        fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            Err(MemoryError::OutOfBounds { address, length })
+        }
+
+        fn write_bytes(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            unreachable!()
+        }
+
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            Err(MemoryError::OutOfBounds { address, length })
+        }
+
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            unreachable!()
+        }
+
+        fn atomic_load_user_u32(&self, _: u64) -> Result<u32, MemoryError> {
+            Ok(7)
+        }
+    }
+
+    #[test]
+    fn zone_futex_recheck_uses_owner_aware_atomic_word_load() {
+        assert_eq!(load_zone_futex_word(&OwnerWord, 0x4000).unwrap(), 7);
+    }
+}
+
 thread_local! {
     /// The zone thread this executor thread took off its vCPU at the last
     /// exit (EL1 plan 1d): it claims that thread itself next, rather than
