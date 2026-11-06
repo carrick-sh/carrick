@@ -79,6 +79,7 @@ vm_free = [
   "carrick-sched-core::object_wait::host_tests::metadata_completion_follows_parked_record_after_slot_switch",
   "carrick-sched-core::object_wait::host_tests::metadata_wait_cancellation_unlinks_its_reserved_queue",
   "carrick-sched-core::tests::adopted_first_entry_settles_detached_metadata_receipt",
+  "carrick-sched-core::tests::first_entry_retirement_preserves_detached_adapter_receipt",
   "carrick-el1-abi::tests::metadata_mailbox_admits_wait_identity_before_host_claim",
   "carrick-el1::alloc::tests::test_arbitrary_alignments_and_memory_writes",
   "carrick-el1::alloc::tests::test_fragmentation_coalescing_and_reuse",

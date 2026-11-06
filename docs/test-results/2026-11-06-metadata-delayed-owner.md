@@ -67,3 +67,12 @@ The latter fired service-entry probes but zero syscall-return probes and
 is not accepted as syscall-result evidence. The diagnosis uses the core;
 the core's counters show uname is served in ring on this main (64 served,
 zero forwarded), despite the historical fixture's `host_calls` label.
+
+The correction settles a detached metadata operation under the first-entry
+retirement owner's exact terminal claim. Existing cancellation owners keep
+their prior claim checks, and queued metadata is not detached by this path.
+Adapter operation tokens remain attached: the companion native witness
+`first_entry_retirement_preserves_detached_adapter_receipt` requires its
+record and incarnation to remain pinned. The metadata witness is green,
+and the scheduler regular library suite passes all 268 tests. Its
+`serial_host` partition has no tests. Signed proof remains pending.
