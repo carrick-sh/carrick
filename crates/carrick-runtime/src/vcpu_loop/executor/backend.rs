@@ -38,6 +38,90 @@ use carrick_kernel::kernel::objects::{
 use carrick_kernel::kernel::{Scheduler, SchedulerError};
 pub use residency::{ResidencyGeneration, TaskCpuResidency};
 
+/// Passive native terminal witness: never writes registers or supplies a CPU image.
+#[cfg(all(feature = "test-support", target_os = "macos", target_arch = "aarch64"))]
+pub mod native_terminal_test_control {
+    use super::*;
+
+    static ARMED: Mutex<Option<Arc<Mutex<Observation>>>> = Mutex::new(None);
+
+    #[derive(Clone, Debug, Default)]
+    pub struct Observation {
+        pub thread: Option<ThreadKey>,
+        pub hardware_roots: Option<[u64; 2]>,
+        pub process_root: Option<u64>,
+        pub reloaded_roots: Option<[u64; 2]>,
+    }
+
+    pub struct Guard(Arc<Mutex<Observation>>);
+
+    pub fn arm() -> Guard {
+        let observation = Arc::new(Mutex::new(Observation::default()));
+        assert!(ARMED.lock().replace(observation.clone()).is_none());
+        Guard(observation)
+    }
+
+    impl Guard {
+        pub fn observation(&self) -> Observation {
+            self.0.lock().clone()
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ARMED.lock().take();
+        }
+    }
+
+    pub(crate) fn terminal(thread: ThreadKey) {
+        if let Some(probe) = ARMED.lock().as_ref() {
+            probe.lock().thread.get_or_insert(thread);
+        }
+    }
+
+    pub(super) fn saved(
+        thread: ThreadKey,
+        binding: &crate::vcpu_loop::continuation::HvpatchTaskBinding,
+        engine: &mut carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Engine,
+    ) -> Result<(), TrapError> {
+        let Some(probe) = ARMED.lock().clone() else {
+            return Ok(());
+        };
+        if probe.lock().thread != Some(thread) {
+            return Ok(());
+        }
+        use carrick_aarch64::Aarch64Vcpu;
+        let vcpu = engine.vcpu();
+        let roots = [
+            vcpu.get_sys_reg(carrick_hal::SysReg::Ttbr0)?,
+            vcpu.get_sys_reg(carrick_hal::SysReg::Ttbr1)?,
+        ];
+        // Native leave_space, rather than a forwarded exit_group, must have
+        // installed the maintenance root on the actual stopped hardware.
+        if roots[0] != carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE {
+            return Ok(());
+        }
+        let mut observation = probe.lock();
+        if observation.hardware_roots.is_none() {
+            observation.hardware_roots = Some(roots);
+            observation.process_root = binding.stage1_ttbr0();
+        }
+        Ok(())
+    }
+
+    pub(super) fn loaded(thread: ThreadKey, cpu: &carrick_hal::threaded::GuestCpuState) {
+        let Some(probe) = ARMED.lock().clone() else {
+            return;
+        };
+        let mut observation = probe.lock();
+        if observation.thread == Some(thread)
+            && let carrick_hal::threaded::GuestCpuState::Aarch64V1(cpu) = cpu
+        {
+            observation.reloaded_roots = Some([cpu.ttbr0, cpu.ttbr1]);
+        }
+    }
+}
+
 /// Signed witnesses observe the real save, with no substitute executor or MM.
 #[cfg(all(feature = "test-support", target_os = "macos", target_arch = "aarch64"))]
 pub mod terminal_save_test_control {
@@ -1176,6 +1260,8 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             _ => None,
         };
         let cpu = materialized_cpu.as_ref().unwrap_or(initial_cpu);
+        #[cfg(all(feature = "test-support", target_os = "macos", target_arch = "aarch64"))]
+        native_terminal_test_control::loaded(task.thread_key(), cpu);
         task.binding()
             .inspect_backend::<HvpatchTaskEngineBindingState, _>(|state| {
                 state.preflight_runtime_projection(cpu)
@@ -1492,6 +1578,13 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 ));
             }
         };
+        #[cfg(all(feature = "test-support", target_os = "macos", target_arch = "aarch64"))]
+        if let Some(binding) = &self.binding
+            && let Err(error) =
+                native_terminal_test_control::saved(lease.thread_key(), binding, engine)
+        {
+            return Err(ExecutorSaveError::new(error, lease));
+        }
         // Zone records and host terminal continuations have explicit save
         // authority. Neither may remain lazily resident on hardware that EL1
         // can have switched to another task or the carrier maintenance root.
