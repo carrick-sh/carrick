@@ -12324,7 +12324,7 @@ fn exit_nonresident_pages(clear_only: bool) {
         0,
         RobustNode {
             next: robust_head.arg(),
-            futex: 42 | 0x8000_0000,
+            futex: 42,
             pad: 0,
         },
     );
@@ -12379,6 +12379,8 @@ fn exit_nonresident_pages(clear_only: bool) {
     }
 
     if !clear_only {
+        crate::lifecycle::COPYOUT_PUBLISH_WAITERS_AT
+            .with(|address| address.set(Some(last_node.arg_at(8))));
         crate::lifecycle::COPYOUT_NOT_YET_AT.with(|address| address.set(Some(last_node.arg_at(8))));
         frame.x = [0; 31];
         frame.x[8] = 93;
@@ -12418,6 +12420,11 @@ fn exit_nonresident_pages(clear_only: bool) {
 
     assert_eq!(sibling_control.robust_list().0, 0);
     if !clear_only {
+        assert_eq!(
+            last_node.get::<RobustNode>(0).futex,
+            0xc000_0000,
+            "owner death must preserve a peer's newly published WAITERS bit"
+        );
         assert_eq!(robust_node.get::<RobustNode>(0).futex, 0xc000_0000);
         crate::lifecycle::CHILD_TID_WAKE_CALLS.with(|calls| {
             assert_eq!(

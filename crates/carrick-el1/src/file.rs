@@ -162,6 +162,104 @@ pub unsafe fn copy_from_user_guarded(
     }
 }
 
+/// One guarded atomic user-word comparison. `Some` is the observed word,
+/// whether or not it matched; `None` means the user access faulted.
+///
+/// # Safety
+/// The caller must validate a writable, readable, 4-byte aligned user word
+/// in this task's live address space. The task-local fixup owns faults.
+#[inline(never)]
+pub unsafe fn compare_exchange_user_u32_guarded(
+    task: &CurrentTask,
+    address: u64,
+    expected: u32,
+    replacement: u32,
+) -> Option<u32> {
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = task;
+        #[cfg(any(test, feature = "host-test"))]
+        if SIMULATE_COPY_FAULT.with(|f| f.load(Ordering::Relaxed))
+            || SIMULATE_COPYOUT_FAULT.with(|f| f.load(Ordering::Relaxed))
+        {
+            return None;
+        }
+        // SAFETY: the caller retained and aligned this exact user word.
+        let word = unsafe { core::sync::atomic::AtomicU32::from_ptr(address as *mut u32) };
+        Some(
+            word.compare_exchange(expected, replacement, Ordering::AcqRel, Ordering::Acquire)
+                .unwrap_or_else(|observed| observed),
+        )
+    }
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    {
+        let observed: u32;
+        let success: u64;
+        // PAN has no unprivileged atomic instruction counterpart. Validate
+        // EL0 permissions above this mechanical boundary, open PAN only for
+        // the exclusive access, and restore it on both fixup and success.
+        unsafe {
+            core::arch::asm!(
+                "mrs {saved_pan}, S3_0_C4_C2_3",
+                "adr {tmp}, 2f",
+                "str {tmp}, [{fixup}]",
+                "msr S3_0_C4_C2_3, xzr",
+                "0:",
+                "ldaxr {observed:w}, [{address}]",
+                "cmp {observed:w}, {expected:w}",
+                "b.ne 1f",
+                "stlxr {status:w}, {replacement:w}, [{address}]",
+                "cbnz {status:w}, 0b",
+                "1:",
+                "clrex",
+                "mov {success}, #1",
+                "b 3f",
+                "2:",
+                "clrex",
+                "mov {success}, #0",
+                "3:",
+                "msr S3_0_C4_C2_3, {saved_pan}",
+                "str xzr, [{fixup}]",
+                fixup = in(reg) core::ptr::from_ref(&task.linux.fixup_pc),
+                address = in(reg) address,
+                expected = in(reg) expected,
+                replacement = in(reg) replacement,
+                observed = out(reg) observed,
+                success = out(reg) success,
+                tmp = out(reg) _, saved_pan = out(reg) _, status = out(reg) _,
+                options(nostack),
+            );
+        }
+        (success != 0).then_some(observed)
+    }
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    {
+        let observed: u32;
+        let success: u64;
+        unsafe {
+            core::arch::asm!(
+                "lea {tmp}, [rip + 2f]",
+                "mov [{fixup}], {tmp}",
+                "lock cmpxchg dword ptr [{address}], {replacement:e}",
+                "mov {success}, 1",
+                "jmp 3f",
+                "2:",
+                "mov {success}, 0",
+                "3:",
+                "mov qword ptr [{fixup}], 0",
+                fixup = in(reg) core::ptr::from_ref(&task.linux.fixup_pc),
+                address = in(reg) address,
+                replacement = in(reg) replacement,
+                inout("eax") expected => observed,
+                success = out(reg) success,
+                tmp = out(reg) _,
+                options(nostack),
+            );
+        }
+        (success != 0).then_some(observed)
+    }
+}
+
 /// Abstraction for validating user memory permissions before access.
 pub trait MemoryValidator {
     /// Return the number of contiguous bytes from `user_va` that EL0 can write.

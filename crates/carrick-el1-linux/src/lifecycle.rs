@@ -19,6 +19,7 @@ pub use carrick_personality_linux::thread::{LifecycleThread, SYS_SET_ROBUST_LIST
 std::thread_local! {
     pub(super) static COPYIN_NOT_YET_AT: core::cell::Cell<Option<u64>> = const { core::cell::Cell::new(None) };
     pub(super) static COPYIN_CALLS: core::cell::RefCell<std::vec::Vec<u64>> = const { core::cell::RefCell::new(std::vec::Vec::new()) };
+    pub(super) static COPYOUT_PUBLISH_WAITERS_AT: core::cell::Cell<Option<u64>> = const { core::cell::Cell::new(None) };
     pub(super) static COPYOUT_REFUSE_RESTORE_AT: core::cell::Cell<Option<u64>> = const { core::cell::Cell::new(None) };
     pub(super) static COPYOUT_NOT_YET_AT: core::cell::Cell<Option<u64>> = const {
         core::cell::Cell::new(None)
@@ -26,6 +27,19 @@ std::thread_local! {
     pub(super) static CHILD_TID_WAKE_CALLS: core::cell::RefCell<std::vec::Vec<u64>> = const {
         core::cell::RefCell::new(std::vec::Vec::new())
     };
+}
+
+#[cfg(test)]
+fn test_output_refused(dst: UserVa, src: &[u8]) -> bool {
+    if COPYOUT_PUBLISH_WAITERS_AT.with(|address| address.get() == Some(dst.raw())) {
+        COPYOUT_PUBLISH_WAITERS_AT.with(|address| address.set(None));
+        // The live peer publishes WAITERS after the exiting owner's read.
+        unsafe { core::sync::atomic::AtomicU32::from_ptr(dst.raw() as *mut u32) }
+            .fetch_or(0x8000_0000, core::sync::atomic::Ordering::AcqRel);
+    }
+    COPYOUT_NOT_YET_AT.with(|address| address.get() == Some(dst.raw()))
+        || (COPYOUT_REFUSE_RESTORE_AT.with(|address| address.get() == Some(dst.raw()))
+            && src != 43_u32.to_le_bytes())
 }
 
 #[cfg(test)]
@@ -137,10 +151,7 @@ impl<
     }
     fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> CopyOutcome {
         #[cfg(test)]
-        if COPYOUT_NOT_YET_AT.with(|address| address.get() == Some(dst.raw()))
-            || (COPYOUT_REFUSE_RESTORE_AT.with(|address| address.get() == Some(dst.raw()))
-                && src != 43_u32.to_le_bytes())
-        {
+        if test_output_refused(dst, src) {
             return CopyOutcome::NotYet(GuestCopyRequest {
                 address: dst,
                 len: carrick_guest_arch::GuestLen::new(src.len() as u64),
@@ -215,6 +226,77 @@ impl<
     Context: super::dispatch::DispatchContext,
 > LifecycleNative<'a> for El1PendingFamilies<'a, F, C, U, G, Context>
 {
+    fn compare_exchange_user_u32(
+        &mut self,
+        address: UserVa,
+        expected: u32,
+        replacement: u32,
+        observed: &mut u32,
+    ) -> CopyOutcome {
+        if !address.raw().is_multiple_of(4) {
+            return CopyOutcome::Fault;
+        }
+        #[cfg(test)]
+        if test_output_refused(address, &replacement.to_le_bytes()) {
+            return CopyOutcome::NotYet(GuestCopyRequest {
+                address,
+                len: carrick_guest_arch::GuestLen::new(4),
+                access: carrick_guest_arch::Access::Write,
+            });
+        }
+        #[cfg(test)]
+        if self.lifecycle_user.is_some() {
+            let mut bytes = [0; 4];
+            let outcome = UserCopy::copy_in(self, &mut bytes, address);
+            if !outcome.is_done() {
+                return outcome;
+            }
+            *observed = u32::from_le_bytes(bytes);
+            return if *observed == expected {
+                UserCopy::copy_out(self, address, &replacement.to_le_bytes())
+            } else {
+                CopyOutcome::Done
+            };
+        }
+        let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
+            return CopyOutcome::Fault;
+        };
+        let valid = crate::file::MemoryValidator::writable_bytes(
+            &crate::file::HardwareValidator,
+            address.raw(),
+            4,
+        ) == 4
+            && crate::file::MemoryValidator::readable_bytes(
+                &crate::file::HardwareValidator,
+                address.raw(),
+                4,
+            ) == 4;
+        if valid {
+            // SAFETY: aligned readable/writable EL0 access in this exact running task;
+            // the ISA primitive retains the task-local exception fixup.
+            if let Some(word) = unsafe {
+                carrick_el1::substrate::file::compare_exchange_user_u32_guarded(
+                    task,
+                    address.raw(),
+                    expected,
+                    replacement,
+                )
+            } {
+                *observed = word;
+                return CopyOutcome::Done;
+            }
+        }
+        if self.process_venue().is_some() {
+            CopyOutcome::NotYet(GuestCopyRequest {
+                address,
+                len: carrick_guest_arch::GuestLen::new(4),
+                access: carrick_guest_arch::Access::Write,
+            })
+        } else {
+            CopyOutcome::Fault
+        }
+    }
+
     fn wait_guest_copy(&mut self, request: GuestCopyRequest) -> LifecycleOutcome {
         let venue = self.process_venue().unwrap_or_else(|| {
             super::dispatch::invalid_completion(super::dispatch::NativeInvariant::EntryBinding)

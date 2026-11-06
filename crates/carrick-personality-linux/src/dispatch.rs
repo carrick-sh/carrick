@@ -1668,6 +1668,16 @@ mod ring_first_tests {
     }
 
     impl<'a> crate::lifecycle::LifecycleNative<'a> for CarrierOwned<'a> {
+        fn compare_exchange_user_u32(
+            &mut self,
+            _: carrick_guest_arch::UserVa,
+            _: u32,
+            _: u32,
+            _: &mut u32,
+        ) -> carrick_core::personality::CopyOutcome {
+            carrick_core::personality::CopyOutcome::Fault
+        }
+
         #[allow(clippy::panic)]
         fn wait_guest_copy(
             &mut self,

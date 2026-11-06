@@ -198,3 +198,18 @@ capturing another clone's inputs or returning the original clone error. The
 clone/clone3 production witnesses refuse child output and then parent undo.
 Once parent access is available, neither TID word nor the thread table may
 publish the unborn TID, and a subsequent successful birth publishes it once.
+
+The robust owner-died update is a user-word compare-exchange, not a byte
+copy. A live peer can publish FUTEX_WAITERS between the read and update;
+masking the earlier snapshot alone loses that publication. A mismatch writes
+nothing and re-evaluates ownership and WAITERS from the observed word. Only
+the successful owner-died comparison grants wake authority. The ordinary
+monotonic waiter publication needs at most two comparisons; the witness adds
+WAITERS at the refused-output boundary and requires 0xc0000000 and one wake.
+The atomic access returns the same typed CopyOutcome as other user accesses,
+so a backing refusal retains the Write phase and uses the existing owner wait.
+Declined-wake restoration also compares the exact owner-died value, so it
+cannot overwrite a successor owner. The ISA adapters contain only guarded
+atomic mechanics; the ownership and wake decisions stay in the shared owner.
+BSD reference: FreeBSD's `handle_futex_death` uses `casueword32` before waking
+([source](https://github.com/freebsd/freebsd-src/blob/main/sys/compat/linux/linux_futex.c)).

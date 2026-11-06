@@ -207,6 +207,26 @@ impl UserCopy for Turn<'_> {
     }
 }
 impl<'a> LifecycleNative<'a> for Turn<'a> {
+    fn compare_exchange_user_u32(
+        &mut self,
+        address: UserVa,
+        expected: u32,
+        replacement: u32,
+        observed: &mut u32,
+    ) -> carrick_core::personality::CopyOutcome {
+        let mut bytes = [0; 4];
+        let outcome = UserCopy::copy_in(self, &mut bytes, address);
+        if !outcome.is_done() {
+            return outcome;
+        }
+        *observed = u32::from_le_bytes(bytes);
+        if *observed == expected {
+            UserCopy::copy_out(self, address, &replacement.to_le_bytes())
+        } else {
+            carrick_core::personality::CopyOutcome::Done
+        }
+    }
+
     #[allow(clippy::panic)]
     fn wait_guest_copy(
         &mut self,

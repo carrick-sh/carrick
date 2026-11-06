@@ -482,6 +482,17 @@ impl From<carrick_sched_core::Requeue> for BornEnqueue {
 /// ISA hooks acquire retained metadata and move real native context. They do
 /// not route, validate clone flags, lower errno or publish entry completion.
 pub trait LifecycleNative<'a>: UserCopy {
+    /// Atomic user-word update with the same typed access refusal as a copy.
+    /// On Done, `observed` is the word at the comparison; a mismatch writes
+    /// nothing. Alignment and user permissions are checked by the adapter.
+    fn compare_exchange_user_u32(
+        &mut self,
+        address: UserVa,
+        expected: u32,
+        replacement: u32,
+        observed: &mut u32,
+    ) -> CopyOutcome;
+
     /// Resume an input before any syscall effect has been committed.
     fn wait_guest_copy(&mut self, request: GuestCopyRequest) -> LifecycleOutcome;
     /// Retain a completed setup operation's original output after `NotYet`.
@@ -1637,10 +1648,14 @@ fn serve_thread_clone_common<'a>(
             native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
         }
         let completion = match publish_outcome {
-            CopyOutcome::Fault => CloneRollbackCompletion::Returned(SyscallResult::from_errno(
-                carrick_syscall_abi::LINUX_EFAULT,
-            )),
-            CopyOutcome::NotYet(_) | CopyOutcome::Done => CloneRollbackCompletion::Retry,
+            CopyOutcome::Fault if managed => CloneRollbackCompletion::Returned(
+                SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
+            ),
+            // Eager unmanaged venues have no owner wait; keep their existing
+            // decline after undo instead of inventing an in-ring errno route.
+            CopyOutcome::Fault | CopyOutcome::NotYet(_) | CopyOutcome::Done => {
+                CloneRollbackCompletion::Retry
+            }
         };
         outputs.retain_rollback(thread.slot, completion);
         if let Some(outcome) = resume_clone_tid_rollback(thread.slot, native) {
@@ -1834,8 +1849,19 @@ fn walk_exit_robust_list<'a>(
                 // Retain the original word across a partial/refused copy; never
                 // derive WAITERS or wake authority from our own modified output.
                 let value = (cursor.word & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
-                match native.copy_out(address, &value.to_le_bytes()) {
-                    CopyOutcome::Done => cursor.phase = RobustExitPhase::Wake,
+                let mut observed = 0;
+                match native.compare_exchange_user_u32(address, cursor.word, value, &mut observed) {
+                    CopyOutcome::Done if observed == cursor.word => {
+                        cursor.phase = RobustExitPhase::Wake
+                    }
+                    CopyOutcome::Done => {
+                        cursor.word = observed;
+                        if observed & FUTEX_TID_MASK != current_tid {
+                            cursor.entry = cursor.next;
+                            cursor.count += 1;
+                            cursor.phase = RobustExitPhase::Next;
+                        }
+                    }
                     CopyOutcome::NotYet(req) => return Err(Some(native.wait_guest_copy(req))),
                     CopyOutcome::Fault => {
                         cursor.entry = cursor.next;
@@ -1854,7 +1880,14 @@ fn walk_exit_robust_list<'a>(
                 cursor.phase = RobustExitPhase::Next;
             }
             RobustExitPhase::Restore => {
-                match native.copy_out(address, &cursor.word.to_le_bytes()) {
+                let mut observed = 0;
+                let owner_died = (cursor.word & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
+                match native.compare_exchange_user_u32(
+                    address,
+                    owner_died,
+                    cursor.word,
+                    &mut observed,
+                ) {
                     CopyOutcome::NotYet(req) => return Err(Some(native.wait_guest_copy(req))),
                     CopyOutcome::Done | CopyOutcome::Fault => {}
                 }

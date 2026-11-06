@@ -21,7 +21,7 @@ use carrick_personality_linux::{
 use carrick_sched_core::{
     BoundedSpin, Claim, RecordRef, SlotId, ThreadIdentity, WakeEffects, Waker, ZoneTables,
 };
-use core::sync::atomic::{AtomicU16, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 #[cfg(target_os = "none")]
 use rust_alloc::vec::Vec;
 
@@ -694,6 +694,24 @@ impl UserCopy for NativeLane<'_> {
     }
 }
 impl<'a> LifecycleNative<'a> for NativeLane<'a> {
+    fn compare_exchange_user_u32(
+        &mut self,
+        address: UserVa,
+        expected: u32,
+        replacement: u32,
+        observed: &mut u32,
+    ) -> carrick_core::personality::CopyOutcome {
+        if !address.raw().is_multiple_of(4) || !self.valid_user_range(address.raw(), 4) {
+            return carrick_core::personality::CopyOutcome::Fault;
+        }
+        // SAFETY: this lane retains the aligned, writable exact-MM aperture.
+        let word = unsafe { AtomicU32::from_ptr(address.raw() as *mut u32) };
+        *observed = word
+            .compare_exchange(expected, replacement, Ordering::AcqRel, Ordering::Acquire)
+            .unwrap_or_else(|current| current);
+        carrick_core::personality::CopyOutcome::Done
+    }
+
     fn wait_guest_copy(
         &mut self,
         _: carrick_core::personality::GuestCopyRequest,
