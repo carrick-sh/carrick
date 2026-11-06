@@ -33,6 +33,7 @@ surfaces = [
   { path = "crates/carrick-aarch64/src/vmm.rs", contract = "kernel.vcpu.vm-lifetime" },
   { path = "crates/carrick-aarch64/src/vmm.rs", contract = "process.native.arm-admission" },
   { path = "crates/carrick-abi/src/x86_syscall_crosscheck.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-cli/tests/fixtures/x86_entrypoint_argv.S", contract = "runtime.image-entrypoint" },
   { path = "crates/carrick-cli/tests/x86_kvm_run.rs", contract = "diagnostics.syscall-refusal" },
   { path = "crates/carrick-cli/tests/x86_kvm_run.rs", contract = "runtime.image-entrypoint" },
   { path = "crates/carrick-cli/tests/x86_kvm_run.rs", contract = "x86.carrier.cli-run" },

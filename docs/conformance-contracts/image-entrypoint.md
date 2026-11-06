@@ -7,9 +7,9 @@ task's credentials. Guest `execve` keeps its separate full-path ABI semantics.
 
 The local-image KVM witness uses a deliberately nonstandard image PATH with a
 missing first directory, two bare executable names and an image ENTRYPOINT
-script plus CMD. Its static payload prints `hello` and exits seven, so language
-runtime defects cannot mask initial resolution. Existing x86 CLI tests compare
-that same payload with native Linux.
+script plus CMD. Its static payload prints the trailing argv and exits seven,
+so language runtime defects cannot mask initial resolution. The witness checks
+the interpreter option, script pathname and CMD order against native Linux.
 
 The implementation retains the existing linear PATH search and four-level
 shebang bound. No timing claim is made. Signed ARM/HVF and Docker remain

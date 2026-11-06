@@ -1471,9 +1471,51 @@ impl PreparedRun {
                 &carrier_lease,
                 &arm_ring_first,
             );
-            let bytes = dispatcher.read_exec_file(&executable).ok_or_else(|| {
-                RuntimeError::Unsupported(format!("guest executable not found: {executable}"))
+            let root_context = dispatcher.capture_one_task_context().map_err(|error| {
+                RuntimeError::Unsupported(format!("capture x86 root identity: {error}"))
             })?;
+            // Initial image commands use the same PATH and shebang policy as
+            // ARM/HVF. Only the ELF machine and carrier construction below are
+            // ISA-specific; guest execve retains its full-path semantics.
+            let argv_for_cmdline = argv.clone();
+            let (executable, argv) = dispatcher
+                .with_kernel_credentials(&root_context, || {
+                    carrick_kernel::exec_helpers::resolve_entrypoint_program(
+                        &executable,
+                        &env,
+                        argv.into_iter().map(String::into_bytes).collect(),
+                        &dispatcher,
+                    )
+                })
+                .map_err(|errno| {
+                    RuntimeError::Unsupported(format!(
+                        "resolve guest executable {executable}: errno {}",
+                        errno.get()
+                    ))
+                })?;
+            // The initial-image API takes UTF-8 strings. Inputs and the shared
+            // shebang parser produce UTF-8; reject a broken boundary explicitly.
+            let argv: Vec<String> = argv
+                .into_iter()
+                .map(String::from_utf8)
+                .collect::<Result<_, _>>()
+                .map_err(|error| RuntimeError::Unsupported(format!("entrypoint argv: {error}")))?;
+            let executable_source = dispatcher
+                .with_kernel_credentials(&root_context, || {
+                    dispatcher.acquire_exec_source(&root_context, &executable)
+                })
+                .map_err(|error| {
+                    RuntimeError::Unsupported(format!("guest executable {executable}: {error:?}"))
+                })?;
+            let bytes = executable_source.read_all().map_err(|error| {
+                RuntimeError::Unsupported(format!("read guest executable {executable}: {error}"))
+            })?;
+            dispatcher.set_executable_identity_with_source(
+                executable,
+                argv_for_cmdline,
+                env.iter().map(|entry| entry.as_bytes().to_vec()).collect(),
+                executable_source,
+            );
             let program = carrick_mem::elf::ElfProgram::load(&bytes, 62, &|path| {
                 dispatcher.read_exec_file(path)
             })
@@ -1490,9 +1532,6 @@ impl PreparedRun {
                     .physical_projection(Arc::new(carrick_kernel::kernel::ObjectIdRegistry::new())),
                 extent_bytes,
             )?;
-            let root_context = dispatcher.capture_one_task_context().map_err(|error| {
-                RuntimeError::Unsupported(format!("capture x86 root identity: {error}"))
-            })?;
             root_context
                 .kernel()
                 .object_ids()
