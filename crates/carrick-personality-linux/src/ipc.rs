@@ -787,6 +787,7 @@ mod tests {
         guest_mem: Vec<u8>,
         base_va: u64,
         venue: &'v mut TestVenue,
+        refuse_output: bool,
     }
 
     impl<'v> TestNative<'v> {
@@ -797,6 +798,7 @@ mod tests {
                 guest_mem: alloc::vec![0xff_u8; mem_len],
                 base_va: GUEST_BUF_VA,
                 venue,
+                refuse_output: false,
             }
         }
     }
@@ -818,6 +820,15 @@ mod tests {
         }
 
         fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> carrick_core::user_copy::CopyOutcome {
+            if core::mem::take(&mut self.refuse_output) {
+                return carrick_core::user_copy::CopyOutcome::NotYet(
+                    carrick_core::user_copy::GuestCopyRequest {
+                        address: dst,
+                        len: carrick_guest_arch::GuestLen::new(src.len() as u64),
+                        access: carrick_guest_arch::Access::Write,
+                    },
+                );
+            }
             let Some(off) = dst.raw().checked_sub(self.base_va) else {
                 return carrick_core::user_copy::CopyOutcome::Fault;
             };
@@ -845,6 +856,20 @@ mod tests {
         fn guest_isa(&self) -> GuestIsa {
             self.isa
         }
+    }
+
+    #[test]
+    fn ipc_output_owner_refusal_is_not_efault() {
+        let mut venue = TestVenue::new();
+        let id = venue.msgget(0x1234, IPC_CREAT | 0o644).unwrap();
+        let mut native = TestNative::new(
+            &mut venue,
+            GuestIsa::X86_64,
+            [id as u64, IPC_STAT as u64, GUEST_BUF_VA, 0, 0, 0],
+            120,
+        );
+        native.refuse_output = true;
+        assert_eq!(invoke(IpcCall::MsgCtl, &mut native), IpcOutcome::Suspended);
     }
 
     #[test]
