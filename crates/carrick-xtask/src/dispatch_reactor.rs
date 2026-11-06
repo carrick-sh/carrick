@@ -571,7 +571,9 @@ pub(crate) fn cycle(
                 .as_array()
                 .into_iter()
                 .flatten()
-                .filter(|c| outcome_bot(&c["author"]) || trusted_owner(&c["author"]))
+                .filter(|c| {
+                    classify(&c["author"], c["body"].as_str().unwrap_or_default()).is_some()
+                })
                 .filter_map(|c| {
                     if trusted_owner(&c["author"]) {
                         Some("")
