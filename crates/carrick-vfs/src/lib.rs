@@ -63,3 +63,8 @@ pub use carrick_observability::probes;
 pub use carrick_host_bsd::bsd_to_linux_errno as host_to_linux_errno;
 #[cfg(target_os = "linux")]
 pub use carrick_host_linux::host_to_linux_errno;
+
+// Exercise portable scratch policy on hosts without APFS.
+#[cfg(all(test, not(target_os = "macos")))]
+#[path = "apfs.rs"]
+mod apfs_host_tests;
