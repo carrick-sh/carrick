@@ -835,9 +835,6 @@ pub trait ProcessContext: Copy + Send + Sync + zerocopy::FromZeros {
     fn set_syscall_return(&mut self, value: u64);
     /// Restore the syscall instruction PC while preserving all arguments.
     fn restart_syscall(&mut self);
-    /// Retain retry-only state for a relative futex wait in ISA-defined
-    /// syscall argument storage. ISAs without an in-guest futex venue ignore it.
-    fn retain_relative_futex_deadline(&mut self, _marker: u64, _deadline: u64) {}
     fn with_syscall_return(mut self, value: u64) -> Self {
         self.set_syscall_return(value);
         self
