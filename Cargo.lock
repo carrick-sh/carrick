@@ -1234,6 +1234,7 @@ dependencies = [
  "carrick-signal-linux",
  "carrick-thread",
  "carrick-timer-core",
+ "carrick-vfs",
  "carrick-x86",
  "carrick-x86-cpl0-host",
  "carrick-xtask",
