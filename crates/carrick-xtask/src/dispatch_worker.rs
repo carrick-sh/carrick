@@ -1289,7 +1289,7 @@ fn worker_prompt(dispatch: &Dispatch) -> String {
         --source-only, plus just cross-check-macos for macOS-cfg code and just check-linux for\n\
         KVM/HAL code. Leave whole-workspace just lint-domains and just test-kernel to CI.\n\
         To propose a PR body, write ../pr-body.md beside result.json (relative to the checkout root).\n\
-        Keep it at most 8 KiB, write for people, and omit closing references and dispatch footers; the server adds them. Put fresh independent review text in ../review.md and a typed review object (reviewer_model, session_id, author_session_id, verdict, head) in the contract. The server posts the sole evidence as an Independent review PR comment for that exact head; distinct worker-reported session IDs cannot establish separate people.\n\
+        Keep it at most 8 KiB, write for people, and omit closing references and dispatch footers; the server adds them. Put worker review text in ../review.md; the publisher posts it as a PR review explicitly marked as the worker’s own review and links it in the outcome. Typed review metadata (reviewer_model, session_id, author_session_id, verdict, head) may bind the exact head but never proves independence.\n\
         Return the requested JSON contract, stating unrun gates and blockers honestly.\n\n{}{}",
         dispatch.issue,
         dispatch.branch,
@@ -5033,6 +5033,8 @@ struct Applied {
     pub(crate) review_claimed: bool,
     #[serde(default)]
     review_head: Option<String>,
+    #[serde(default)]
+    review_url: Option<String>,
     board_changes: Vec<String>,
     #[serde(default)]
     board_left: Vec<String>,
@@ -5090,15 +5092,20 @@ impl Applied {
         Ok(())
     }
     fn report(&self) -> String {
+        let review_link = self
+            .review_url
+            .as_ref()
+            .map(|url| format!(" ([review]({url}))"))
+            .unwrap_or_default();
         let review = if self.review {
-            "review published"
+            "worker review published"
         } else if self.review_claimed {
             "review claimed, not published"
         } else {
             "no review published"
         };
         format!(
-            "{}{}{}- PR commits: {}.{}\n- PR body: {}.\n- Board status: {}.{}\n- Independent review: {review}.\n",
+            "{}{}{}- PR commits: {}.{}\n- PR body: {}.\n- Board status: {}.{}\n- Worker review: {review}{review_link}.\n",
             self.provider_events.iter().map(|event| format!("- Provider filter: {event}.\n")).collect::<String>(),
             self.adoption_blocked
                 .as_ref()
@@ -5443,20 +5450,13 @@ fn publish_review(
     head: &str,
     token: &str,
 ) -> Result<(), ScalerError> {
-    let Review::Claim(claim) = claim else {
-        return Err(ScalerError::Guard(
-            "review claimed, not published: typed review required",
-        ));
-    };
-    if claim.session_id.trim().is_empty()
-        || claim.author_session_id.trim().is_empty()
-        || claim.session_id.trim() == claim.author_session_id.trim()
-        || claim.reviewer_model.trim().is_empty()
-        || claim.verdict.trim().is_empty()
-        || claim.head != head
+    // A worker review is publishable without pretending session metadata
+    // establishes independent authorship. Typed metadata still binds a head.
+    if let Review::Claim(claim) = claim
+        && claim.head != head
     {
         return Err(ScalerError::Guard(
-            "review claimed, not published: invalid session or stale head",
+            "review claimed, not published: stale head",
         ));
     }
     let cleaned = body_without_comments(text)?;
@@ -5472,33 +5472,42 @@ fn publish_review(
     }
     proposed_pr_body(Some(text), number, "review", token)?;
     let body = format!(
-        "## Independent review\n\nReviewed head: {head}\nReviewer: {}\nReviewer session: {}\nAuthor session: {}\nVerdict: {}\n\nSession IDs are worker-reported; distinct IDs exclude the same recorded session, but do not prove separate people or model independence.\n\n{}",
-        claim.reviewer_model,
-        claim.session_id,
-        claim.author_session_id,
-        claim.verdict,
+        "## Worker review\n\nReviewed head: {head}\n\nThis is the worker's own review; it is not an independent review.\n\n{}",
         neutralize_mentions(&agent_loop::masked(&cleaned, token))
     );
-    let path = crate::agent_runner::state()?.join("review-comment.md");
+    let path = crate::agent_runner::state()?.join("review-request.json");
     std::fs::write(
         &path,
-        neutralize_mentions(&agent_loop::masked(&body, token)),
+        serde_json::to_vec(&json!({
+            "body": body, "commit_id": head, "event": "COMMENT"
+        }))?,
     )?;
-    gh(
+    let response = gh(
         root,
         &[
-            "issue",
-            "comment",
-            &number.to_string(),
-            "--repo",
-            REPOSITORY,
-            "--body-file",
+            "api",
+            "-X",
+            "POST",
+            &format!("repos/{REPOSITORY}/pulls/{number}/reviews"),
+            "--input",
             path.to_str().ok_or(ScalerError::Guard("review path"))?,
         ],
     )?;
+    let response: Value = serde_json::from_str(&response)?;
+    let url = response["html_url"]
+        .as_str()
+        .filter(|url| {
+            url.starts_with(&format!(
+                "https://github.com/{REPOSITORY}/pull/{number}#pullrequestreview-"
+            ))
+        })
+        .ok_or(ScalerError::Guard(
+            "review publication returned no review URL",
+        ))?;
     Applied::record(|a| {
         a.review = true;
         a.review_head = Some(head.to_owned());
+        a.review_url = Some(url.to_owned());
     })
 }
 
@@ -8841,6 +8850,14 @@ if test "$1 $2" = 'pr create' && test -f "$RUNNER_TEMP/publish-mode"; then
  if test "$(cat "$RUNNER_TEMP/publish-mode")" = publish-token-auth-create && test "$kind" = app; then touch "$RUNNER_TEMP/publish-fallback"; echo 'gh: Bad credentials (HTTP 401)' >&2; exit 84; fi
 fi
 test "$GH_TOKEN" = "$expected" || { echo 'GitHub call used wrong credential' >&2; exit 89; }
+if test "$1 $2 $3" = 'api -X POST' && test "$4" = repos/carrick-sh/carrick/pulls/800/reviews; then
+ /usr/bin/python3 - "$6" "$RUNNER_TEMP/posted.md" <<'REVIEW'
+import json,pathlib,sys
+pathlib.Path(sys.argv[2]).write_text(json.loads(pathlib.Path(sys.argv[1]).read_text())["body"])
+print(json.dumps({"html_url":"https://github.com/carrick-sh/carrick/pull/800#pullrequestreview-123"}))
+REVIEW
+ exit 0
+fi
 if test "$1" = api; then
  case "$2" in
  -X)
@@ -11230,10 +11247,10 @@ fi
         if witness == "review-comment" {
             assert!(applied.review);
             let posted = regular_text(&outer.join("posted.md")).unwrap();
-            assert!(posted.contains("## Independent review") && posted.contains("Sol 6.1:"));
+            assert!(posted.contains("## Worker review") && posted.contains("Sol 6.1:"));
             assert!(posted.contains(&format!("Reviewed head: {}", sha.trim())));
-            assert!(posted.contains("Reviewer session: reviewer-session"));
-            assert!(posted.contains("Author session: author-session"));
+            assert!(posted.contains("not an independent review"));
+            assert!(applied.report().contains("#pullrequestreview-123"));
             outcome(&work, &dispatch);
         }
         if witness == "preserved" {

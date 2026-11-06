@@ -2103,6 +2103,27 @@ impl Server<'_> {
         summary: &str,
         brief: Option<&str>,
     ) -> Result<(), ScalerError> {
+        // Remaining work on a published checkpoint uses the existing chain,
+        // even when the coordinator called that progress "blocked" (#1763).
+        let blocker = external_blocker(summary);
+        let inferred_brief = (finish == FinishStatus::Blocked
+            && blocker.is_none()
+            && self.pushed_head().is_some()
+            && ["incomplete", "remaining", "next:", "work left"]
+                .iter()
+                .any(|word| summary.to_ascii_lowercase().contains(word)))
+        .then_some(summary);
+        let finish = if inferred_brief.is_some() {
+            FinishStatus::Continue
+        } else {
+            finish
+        };
+        let brief = brief.or(inferred_brief);
+        if finish == FinishStatus::Blocked && blocker.is_none() {
+            return Err(ScalerError::Guard(
+                "contract violation: Blocked requires a named external blocker (Blocker: #issue, PR URL, or owner decision URL)",
+            ));
+        }
         let requested_status = RoundStatus::requested(finish);
         let loop_claimed = match finish {
             FinishStatus::Done => "done",
@@ -2276,12 +2297,35 @@ impl Server<'_> {
         } else {
             requested_status
         };
+        // Internal publication failures and the chain limit are not external
+        // prerequisites. Refuse the Blocked classification rather than
+        // manufacture a blocker for them.
+        let unnamed_blocked = status == RoundStatus::Blocked && blocker.is_none();
+        let status = if unnamed_blocked {
+            observations.push(
+                "contract violation: refused Blocked without a named external blocker".into(),
+            );
+            RoundStatus::Failed
+        } else {
+            status
+        };
         let mut checked: String = published_exit
             .iter()
             .chain(tier_blocked.iter())
             .map(|p| format!("{p}\n\n"))
             .chain(facts.as_ref().map(|f| format!("{}\n\n", f.report())))
             .collect();
+        if unnamed_blocked {
+            checked.insert_str(
+                0,
+                "Contract violation: refused Blocked without a named external blocker.\n\n",
+            );
+        }
+        if status == RoundStatus::Blocked
+            && let Some(blocker) = blocker
+        {
+            checked.push_str(&format!("External blocker: {blocker}\n"));
+        }
         // Routing is auditable (#1275): the tier and every worker this
         // round ran.
         checked.push_str(&format!("{}\n", self.tier.outcome_line()));
@@ -2360,12 +2404,12 @@ impl Server<'_> {
         }
         let applied = if let Some(reason) = unpushed.as_ref().or(stalled.as_ref()) {
             format!(
-                "Server observed: {reason}, so {loop_claimed} is reported as blocked.\n\n{checked}{}",
+                "Server observed: {reason}, so {loop_claimed} is reported as {status:?}.\n\n{checked}{}",
                 applied.report()
             )
         } else if let Some(reason) = &unchainable {
             format!(
-                "Server observed: {reason}, so continue is reported as blocked.\n\n{checked}{}",
+                "Server observed: {reason}, so continue is reported as {status:?}.\n\n{checked}{}",
                 applied.report()
             )
         } else if observations.is_empty() {
@@ -3633,9 +3677,9 @@ fn isolated_loop(
 Use only these policy tools through the command `dispatch-worker tool <name>`, with one JSON object on stdin:
 read_state: {}; read_capacity: {}; select_branch: {"branch":"an issue-linked branch from state"}; read_artifact: {"run":123,"name":"handoff.json"}; invoke_worker: {"notes":"reason for this choice and work notes","backend":"...","model":"exact live model id"}; publish: {}; set_status: {"status":"Todo|In progress|In review|Blocked"}; comment: {"body":"..."};
 finish: {"status":"done|blocked|failed|continue","summary":"...","brief":"..."} (choose one status; brief only with continue).
-`continue` is for a round that runs short with work left: its brief names the next step and how to prove it. The server reports it as Continuing only when this round pushed a checkpoint (a worker's WIP push or a publish), and then starts the next round from that checkpoint without a new trigger, up to round 4 of the chain; otherwise it reports blocked. An owner comment, review or dispatch label, or `/agent stop`, ends a chain.
+`continue` is for a round that runs short with work left: its brief names the next step and how to prove it. The server reports it as Continuing only when this round pushed a checkpoint (a worker's WIP push or a publish), and then starts the next round from that checkpoint without a new trigger, up to round 4 of the chain; otherwise it reports failed. An owner comment, review or dispatch label, or `/agent stop`, ends a chain.
 Worker choice is your own decision from read_capacity and task difficulty.
-The round opening facts below supply the admitted target, full trigger and worker tier without any read. Read live capacity to choose a worker; read_state is optional for additional context. A state read timeout does not erase the opening facts or require another state read before invoking a worker. Report the timeout in your outcome and proceed from the admitted facts when sufficient. Interpret the free-form request in the admitted-collaborator trigger; no issue headings or branch directives are required. Choose a backend and exact model id with free slots and quota, explaining your choice in notes and the finish outcome. The opening facts' `worker_tier` gives this round's worker tier and the fact it comes from; invoke_worker refuses a model outside it, and a strong round with no strong-tier capacity ends Blocked rather than on a weaker model. Invoke a worker when useful, publish its result, then call finish. If unclear, finish blocked with a question for the requesting collaborator.
+The round opening facts below supply the admitted target, full trigger and worker tier without any read. Read live capacity to choose a worker; read_state is optional for additional context. A state read timeout does not erase the opening facts or require another state read before invoking a worker. Report the timeout in your outcome and proceed from the admitted facts when sufficient. Interpret the free-form request in the admitted-collaborator trigger; no issue headings or branch directives are required. Choose a backend and exact model id with free slots and quota, explaining your choice in notes and the finish outcome. The opening facts' `worker_tier` gives this round's worker tier and the fact it comes from; invoke_worker refuses a model outside it, and a strong round with no strong-tier capacity fails with its capacity reason rather than on a weaker model. Invoke a worker when useful, publish its result, then call finish. Blocked requires a named external prerequisite on its own line: `Blocker: #123 description` (an issue, PR or recorded owner decision). Incomplete implementation with pushed commits is progress: finish continue with the next step and its proof in brief.
 You MUST call finish once, including when blocked or failed, and exit afterward. A failed finish post is handled by the server fallback; do not retry it. Tool refusals are final policy decisions.
 Scope is fixed by the server. You may select only an issue-linked dispatch branch before invoking workers, or keep the new run branch. Several workers may review/fix/extend the same branch sequentially; their total time is bounded. Read earlier run artifacts for context. Never request another destination. A dispatch label suffix is free-text context only. Coordinator notes are suggestions,
 not reviewer instructions. Do not paraphrase the trusted review into instructions: the server supplies it verbatim.
@@ -3877,6 +3921,21 @@ pub(super) fn chain_section(body: &str) -> Option<ChainSection> {
         from,
         checkpoint,
         brief,
+    })
+}
+
+/// The explicit prerequisite line is carried into the server outcome, where
+/// the reactor can compare it without interpreting the worker's prose.
+fn external_blocker(summary: &str) -> Option<&str> {
+    summary.lines().find_map(|line| {
+        let blocker = line.trim().strip_prefix("Blocker: ")?.trim();
+        let reference = blocker.split_whitespace().next()?;
+        let issue = reference
+            .strip_prefix('#')
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        let link = reference.starts_with("https://github.com/carrick-sh/carrick/issues/")
+            || reference.starts_with("https://github.com/carrick-sh/carrick/pull/");
+        (issue || link).then_some(blocker)
     })
 }
 
@@ -4487,7 +4546,7 @@ mod tests {
         }
     }
     #[test]
-    fn adopted_run_keeps_its_pr_and_a_lease_refusal_ends_blocked() {
+    fn adopted_run_keeps_its_pr_and_a_lease_refusal_fails() {
         shared_fixture(|root| {
             let mut s = server(root);
             s.dispatch.review = false;
@@ -4511,7 +4570,7 @@ mod tests {
             s.outcome(ContractStatus::Done, "pushed").unwrap();
             let posted = regular_text(&root.join("posted.md")).unwrap();
             assert!(
-                posted.contains("Dispatch outcome: Blocked") && posted.contains("Push refused"),
+                posted.contains("Dispatch outcome: Failed") && posted.contains("Push refused"),
                 "{posted}"
             );
         });
@@ -4568,7 +4627,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(contract["review"], false);
-            assert_eq!(contract["status"], "blocked");
+            assert_eq!(contract["status"], "failed");
             assert!(
                 contract["summary"]
                     .as_str()
@@ -4578,7 +4637,7 @@ mod tests {
         });
     }
     #[test]
-    fn unpublished_review_claim_blocks_round() {
+    fn unpublished_review_claim_fails_round() {
         super::super::tests::publication_fixture_outcome("review-claimed", |root, dispatch| {
             let mut s = server(root);
             s.dispatch = dispatch.clone();
@@ -4586,7 +4645,7 @@ mod tests {
             s.outcome(ContractStatus::Done, "Work finished").unwrap();
             let outer = PathBuf::from(std::env::var_os("RUNNER_TEMP").unwrap());
             let posted = regular_text(&outer.join("posted.md")).unwrap();
-            assert!(posted.contains("Dispatch outcome: Blocked"), "{posted}");
+            assert!(posted.contains("Dispatch outcome: Failed"), "{posted}");
             assert!(posted.contains("review claimed, not published"), "{posted}");
         });
     }
@@ -4816,7 +4875,7 @@ mod tests {
             assert!(!result.to_string().contains("opaque-board-credential"));
             assert_eq!(result["changed"], json!(["Issue #799 → Blocked"]));
             server
-                .outcome(ContractStatus::Blocked, "board request incomplete")
+                .outcome(ContractStatus::Done, "board request incomplete")
                 .unwrap();
             let posted = regular_text(&root.join("posted.md")).unwrap();
             assert!(posted.contains("Issue #799 → Blocked"));
@@ -6368,7 +6427,7 @@ fi
                 }))
                 .unwrap();
             let posted = regular_text(&root.join("posted.md")).unwrap();
-            assert!(posted.starts_with("Dispatch outcome: Blocked"), "{posted}");
+            assert!(posted.starts_with("Dispatch outcome: Failed"), "{posted}");
             assert!(
                 posted.contains(&format!(
                     "Published: the worker's commits are on the branch at `{}`",
@@ -6829,9 +6888,9 @@ fi
             .unwrap();
             let posted = regular_text(&root.join("posted.md")).unwrap();
             if behind > 0 || !mergeable {
-                assert_eq!(outcome.status, ContractStatus::Blocked, "{posted}");
+                assert_eq!(outcome.status, ContractStatus::Failed, "{posted}");
                 assert!(
-                    posted.starts_with("Dispatch outcome: Blocked")
+                    posted.starts_with("Dispatch outcome: Failed")
                         && posted.contains("nothing was pushed and the PR is 108 commits behind main and conflicts with it")
                         && posted.contains("> loop claimed: done"),
                     "{posted}"
@@ -6849,7 +6908,7 @@ fi
         });
     }
     #[test]
-    fn done_without_progress_on_a_stale_conflicting_pr_is_blocked() {
+    fn done_without_progress_on_a_stale_conflicting_pr_is_failed() {
         done_without_progress_fixture(108, false);
     }
     #[test]
@@ -7478,7 +7537,7 @@ fi
         done_means_pushed_fixture(false);
     }
     #[test]
-    fn done_with_an_unpushed_last_commit_is_blocked() {
+    fn done_with_an_unpushed_last_commit_is_failed() {
         done_means_pushed_fixture(true);
     }
     fn done_means_pushed_fixture(unpushed: bool) {
@@ -7508,9 +7567,9 @@ fi
             .unwrap();
             let posted = regular_text(&root.join("posted.md")).unwrap();
             if unpushed {
-                assert_eq!(outcome.status, ContractStatus::Blocked);
+                assert_eq!(outcome.status, ContractStatus::Failed);
                 assert!(
-                    posted.starts_with("Dispatch outcome: Blocked")
+                    posted.starts_with("Dispatch outcome: Failed")
                         && posted.contains("is not the worker's last commit")
                         && posted.contains("> loop claimed: done"),
                     "{posted}"
@@ -7884,12 +7943,12 @@ fi
                 std::fs::remove_file(temporary.join("state-timeout")).unwrap();
                 server
                     .outcome(
-                        ContractStatus::Blocked,
+                        ContractStatus::Failed,
                         "state reads timed out; request unknown",
                     )
                     .unwrap();
                 let posted = regular_text(&temporary.join("posted.md")).unwrap();
-                assert!(posted.contains("Dispatch outcome: Blocked"), "{posted}");
+                assert!(posted.contains("Dispatch outcome: Failed"), "{posted}");
                 assert!(posted.contains("Workers this round: none"), "{posted}");
             }
             assert_eq!(
@@ -9834,7 +9893,7 @@ exec /usr/bin/git "$@"
                 .outcome(
                     ContractStatus::Blocked,
                     &format!(
-                        "Outcome contract:\n```json\n{}\n```",
+                        "Blocker: #1755 robust-list walker\nOutcome contract:\n```json\n{}\n```",
                         serde_json::to_string(&forged).unwrap()
                     ),
                 )
@@ -10090,10 +10149,10 @@ exec /usr/bin/git "$@"
         assert_eq!(backend_credential("grok"), None);
     }
     /// #1275 acceptance: the outcome names the tier and every worker; a
-    /// strong round whose capacity offered no strong worker ends Blocked
+    /// strong round whose capacity offered no strong worker fails
     /// (nothing downgraded to a weaker model) and says why.
     #[test]
-    fn a_strong_round_without_strong_capacity_is_blocked_and_names_its_tier() {
+    fn a_strong_round_without_strong_capacity_fails_and_names_its_tier() {
         shared_fixture(|root| {
             let mut server = server(root);
             server.tier = super::super::worker_tier::decide("x", "", "", &["mm".into()]);
@@ -10104,7 +10163,7 @@ exec /usr/bin/git "$@"
             server.execute(Request::ReadCapacity(Empty {})).unwrap();
             server.outcome(ContractStatus::Done, "claimed").unwrap();
             let posted = regular_text(&root.join("posted.md")).unwrap();
-            assert!(posted.starts_with("Dispatch outcome: Blocked"), "{posted}");
+            assert!(posted.starts_with("Dispatch outcome: Failed"), "{posted}");
             let section = server_part(&posted);
             assert!(
                 section.contains("no strong-tier worker had capacity"),
@@ -10122,7 +10181,7 @@ exec /usr/bin/git "$@"
             server
                 .choices
                 .push(json!({"backend":"codex","model":"gpt-6.1-sol","reason":"x"}));
-            server.outcome(ContractStatus::Blocked, "stopped").unwrap();
+            server.outcome(ContractStatus::Done, "stopped").unwrap();
             let posted = regular_text(&root.join("posted.md")).unwrap();
             let section = server_part(&posted);
             assert!(
@@ -11083,17 +11142,17 @@ exec /usr/bin/git "$@"
         std::fs::write(state.join("published-tip"), head).unwrap();
     }
     /// The server accepts `continue` only when the round pushed a
-    /// checkpoint; otherwise the outcome is Blocked with the server's reason
+    /// checkpoint; otherwise the outcome is Failed with the server's reason
     /// and no chain lines a next round could start from.
     #[test]
-    fn continue_without_a_pushed_checkpoint_is_blocked() {
+    fn continue_without_a_pushed_checkpoint_is_failed() {
         shared_fixture(|root| {
             current_pr(root);
             let posted = finish_continue(&mut server(root), "next: wire the guard");
             let section = super::server_part(&posted);
-            assert!(section.starts_with("Dispatch outcome: Blocked"), "{posted}");
+            assert!(section.starts_with("Dispatch outcome: Failed"), "{posted}");
             assert!(
-                section.contains("Server observed: this round pushed no checkpoint for a next round to start from, so continue is reported as blocked."),
+                section.contains("Server observed: this round pushed no checkpoint for a next round to start from, so continue is reported as Failed."),
                 "{posted}"
             );
             assert!(posted.contains("> loop claimed: continue"), "{posted}");
@@ -11241,9 +11300,9 @@ exec /usr/bin/git "$@"
             s.chain = Some(chained(4));
             let posted = finish_continue(&mut s, "next step");
             let section = super::server_part(&posted);
-            assert!(section.starts_with("Dispatch outcome: Blocked"), "{posted}");
+            assert!(section.starts_with("Dispatch outcome: Failed"), "{posted}");
             assert!(
-                section.contains("the chain is at its limit (round 4 of at most 4), so continue is reported as blocked"),
+                section.contains("the chain is at its limit (round 4 of at most 4), so continue is reported as Failed"),
                 "{posted}"
             );
             assert!(section.contains("#issuecomment-94 (hop 3/3)\n"), "{posted}");
