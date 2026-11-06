@@ -493,6 +493,43 @@ fn job_home_and_work_are_recreated_from_the_skeleton_before_every_job() {
     assert!(reset_job_area(&skel, &home, &[], uid, uid, gid).is_err());
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn reset_clears_inheritable_home_acl_without_replacing_inode() {
+    use std::os::unix::fs::MetadataExt;
+    use std::process::Command;
+
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+    let skel = root.path().join("skel");
+    let home = root.path().join("home");
+    mkdir_mode(&skel, 0o700);
+    mkdir_mode(&home, 0o700);
+    mkdir_mode(&skel.join("config"), 0o700);
+    write_skeleton_entry(skel.join("config/clean"), "clean", 0o600);
+    // An allow entry remains visible despite chmod 0700, and is inherited by
+    // new children. This uses only a caller-owned temporary tree, without sudo.
+    assert!(Command::new("/bin/chmod")
+        .args(["+a", "everyone allow read,readattr,readextattr,readsecurity,file_inherit,directory_inherit"])
+        .arg(&home).status().unwrap().success());
+    let listing = |path: &std::path::Path| {
+        let out = Command::new("/bin/ls").args(["-lde"]).arg(path).output().unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert!(listing(&home).contains("everyone allow"));
+    let inode = std::fs::metadata(&home).unwrap().ino();
+    reset_job_area(&skel, &home, &[], uid, uid, gid).unwrap();
+    assert_eq!(std::fs::metadata(&home).unwrap().ino(), inode);
+    for path in [&home, &home.join("config"), &home.join("config/clean")] {
+        let acl = listing(path);
+        assert!(!acl.contains("everyone allow"), "{}: {acl}", path.display());
+    }
+    assert_eq!(std::fs::read_to_string(home.join("config/clean")).unwrap(), "clean");
+}
+
 #[test]
 fn failed_reset_can_be_repeated_in_place_without_privileged_paths() {
     use std::os::unix::fs::MetadataExt;
