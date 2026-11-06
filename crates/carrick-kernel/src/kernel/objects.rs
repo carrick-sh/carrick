@@ -1183,28 +1183,19 @@ pub(crate) struct IpcPhysicalHold {
     original: Weak<FileDescription>,
 }
 
+pub(crate) enum MappingAdmission<'a> {
+    Descriptor,
+    PinnedIpc(&'a IpcPhysicalHold),
+}
+
 impl IpcPhysicalHold {
     /// Project only the physical byte source. The projection cannot reach the
     /// publication pin, so retaining it never keeps its own IPC resource alive.
     /// The caller owns a pinned resource for the entire admission.
     pub(crate) fn retain_mapping(&self) -> Option<Arc<MappedFileReference>> {
-        let description = self.mapping_description.as_ref()?;
-        if let Some(original) = self.original.upgrade() {
-            crate::el1_delegation::recall_if_delegated(&original);
-        }
-        let mut lifecycle = self.physical.transition.lock();
-        if !self.admitted.load(Ordering::Acquire) || lifecycle.ipc_holds == 0 {
-            return None;
-        }
-        lifecycle.mapping_refs = lifecycle.mapping_refs.checked_add(1).unwrap_or_else(|| {
-            carrick_fatal!(
-                "kernel::file_description_refs",
-                "mapped file reference count overflow"
-            )
-        });
-        Some(Arc::new(MappedFileReference {
-            description: Arc::clone(description),
-        }))
+        self.mapping_description
+            .as_ref()?
+            .retain_mapping(MappingAdmission::PinnedIpc(self))
     }
 }
 
@@ -1796,13 +1787,34 @@ impl FileDescription {
         self.revision.publish();
     }
 
-    /// Acquire while an fd still owns the backing, serialized with final close.
+    /// Acquire from an owned descriptor or pinned IPC resource, serialized with
+    /// final close and physical-resource release.
     /// A mapping and an EL1 delegation never coexist: the delegation is
     /// recalled first, and a mapped description is never delegated.
-    pub(crate) fn retain_mapping(self: &Arc<Self>) -> Option<Arc<MappedFileReference>> {
-        crate::el1_delegation::recall_if_delegated(self);
+    pub(crate) fn retain_mapping(
+        self: &Arc<Self>,
+        admission: MappingAdmission<'_>,
+    ) -> Option<Arc<MappedFileReference>> {
+        match admission {
+            MappingAdmission::Descriptor => crate::el1_delegation::recall_if_delegated(self),
+            MappingAdmission::PinnedIpc(hold) => {
+                if !hold.admitted.load(Ordering::Acquire)
+                    || !Arc::ptr_eq(hold.mapping_description.as_ref()?, self)
+                    || !Arc::ptr_eq(&hold.physical, &self.common.physical)
+                {
+                    return None;
+                }
+                if let Some(original) = hold.original.upgrade() {
+                    crate::el1_delegation::recall_if_delegated(&original);
+                }
+            }
+        }
         let mut lifecycle = self.common.physical.transition.lock();
-        if self.common.fd_refs() == 0 {
+        let admitted = match admission {
+            MappingAdmission::Descriptor => self.common.fd_refs() > 0,
+            MappingAdmission::PinnedIpc(_) => lifecycle.ipc_holds > 0,
+        };
+        if !admitted {
             return None;
         }
         lifecycle.mapping_refs = lifecycle.mapping_refs.checked_add(1).unwrap_or_else(|| {

@@ -6090,7 +6090,8 @@ fn shared_file_fixed_mremap_moves_page_and_preserves_file_offset() {
         private_file: None,
         shared_file_alias: Some(SharedFileAliasCommit {
             description: Arc::clone(&description),
-            mapping: description.retain_mapping(),
+            mapping: description
+                .retain_mapping(crate::kernel::objects::MappingAdmission::Descriptor),
             extent_base: carrick_guest_mem::Gpa::new(base),
             row_file_offset: 0,
         }),
@@ -6279,7 +6280,8 @@ fn shared_file_fixed_mremap_repoint_failure_lowers_to_enomem() {
         private_file: None,
         shared_file_alias: Some(SharedFileAliasCommit {
             description: Arc::clone(&description),
-            mapping: description.retain_mapping(),
+            mapping: description
+                .retain_mapping(crate::kernel::objects::MappingAdmission::Descriptor),
             extent_base: carrick_guest_mem::Gpa::new(base),
             row_file_offset: 0,
         }),
@@ -6359,7 +6361,8 @@ fn shared_file_fixed_mremap_rejects_missing_maymove_or_overlapping_ranges() {
         private_file: None,
         shared_file_alias: Some(SharedFileAliasCommit {
             description: Arc::clone(&description),
-            mapping: description.retain_mapping(),
+            mapping: description
+                .retain_mapping(crate::kernel::objects::MappingAdmission::Descriptor),
             extent_base: carrick_guest_mem::Gpa::new(base),
             row_file_offset: 0,
         }),

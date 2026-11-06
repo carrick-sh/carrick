@@ -306,7 +306,7 @@ impl ExecSource {
         // custody before the backing lock. This also recalls a delegated file
         // before duplicating its descriptor. No host I/O runs under inspection.
         let retained = description
-            .retain_mapping()
+            .retain_mapping(crate::kernel::objects::MappingAdmission::Descriptor)
             .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?;
         let opened = description
             .inspect_kind(|open| match open {
