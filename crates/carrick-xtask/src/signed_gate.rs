@@ -336,11 +336,11 @@ fn prepare(event_path: &Path, output: &Path) -> Result<(), ReceiptError> {
                 &format!("repos/{REPOSITORY}/commits/{commit_sha}/pulls?per_page=100"),
                 None,
             )? {
-                if pull["base"]["ref"] == "main" && pull["base"]["repo"]["full_name"] == REPOSITORY
+                if pull["base"]["ref"] == "main"
+                    && pull["base"]["repo"]["full_name"] == REPOSITORY
+                    && let Some(number) = pull["number"].as_u64()
                 {
-                    if let Some(number) = pull["number"].as_u64() {
-                        prs.insert(number);
-                    }
+                    prs.insert(number);
                 }
             }
         }
