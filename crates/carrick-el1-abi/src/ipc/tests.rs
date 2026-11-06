@@ -1384,6 +1384,36 @@ fn el1_ipc_pool_areas_are_type_stable() {
 }
 
 #[test]
+fn vector_input_copy_fault_is_a_prefix_not_an_invariant() {
+    let fx = fixture(1 << 20);
+    let token = fx.region.begin_operation(IpcOperation::EMPTY).unwrap();
+    fx.region
+        .import_vectors(&token, 1, |_, header| {
+            header[..8].copy_from_slice(&4096u64.to_ne_bytes());
+            header[8..].copy_from_slice(&4u64.to_ne_bytes());
+            true
+        })
+        .unwrap();
+    let mut bytes = [0; 4];
+    for delivered in [0, 2, 4] {
+        let result: Result<usize, VectorInputInvariant> =
+            fx.region
+                .copy_vector_input(&token, 0, &mut bytes, |_, _| delivered);
+        assert_eq!(result, Ok(delivered));
+    }
+    let foreign = fixture(1 << 20);
+    assert_eq!(
+        foreign
+            .region
+            .copy_vector_input(&token, 0, &mut bytes, |_, _| panic!(
+                "invalid authority must not copy"
+            )),
+        Err(VectorInputInvariant::Token(IpcError::Stale)),
+    );
+    fx.region.finish_operation(token, || {}).unwrap();
+}
+
+#[test]
 fn imported_vectors_scale_and_reclaim_with_the_operation_slot() {
     for count in [1, 8, IPC_MAX_IOVECS] {
         let fx = fixture(1 << 20);

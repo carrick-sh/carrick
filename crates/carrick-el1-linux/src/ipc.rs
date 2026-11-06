@@ -892,16 +892,20 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
             &mut copy,
             |copy, at, dst| {
                 if vector_input {
-                    venue
+                    match venue
                         .region
                         .copy_vector_input(&token, at, dst, |bytes, address| {
                             copy.copy_in(bytes, address.0)
-                        })
-                        .unwrap_or_else(|_| {
-                            crate::dispatch::invalid_completion(
-                                crate::dispatch::NativeInvariant::EntryBinding,
-                            )
-                        })
+                        }) {
+                        Ok(copied) => copied,
+                        Err(
+                            carrick_el1_abi::ipc::VectorInputInvariant::Token(_)
+                            | carrick_el1_abi::ipc::VectorInputInvariant::Custody(_)
+                            | carrick_el1_abi::ipc::VectorInputInvariant::CorruptRange,
+                        ) => crate::dispatch::invalid_completion(
+                            crate::dispatch::NativeInvariant::EntryBinding,
+                        ),
+                    }
                 } else {
                     copy.copy_in(dst, buf.wrapping_add(at))
                 }

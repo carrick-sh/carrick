@@ -14,6 +14,24 @@ pub enum VectorImportError {
     Storage(IpcError),
 }
 
+/// Failures of operation authority or imported-header integrity. Guest copy
+/// faults are represented only by the successful delivered prefix count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VectorInputInvariant {
+    Token(IpcError),
+    Custody(IpcError),
+    CorruptRange,
+}
+
+impl From<VectorInputInvariant> for IpcError {
+    fn from(error: VectorInputInvariant) -> Self {
+        match error {
+            VectorInputInvariant::Token(error) | VectorInputInvariant::Custody(error) => error,
+            VectorInputInvariant::CorruptRange => Self::Corrupt,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(super) struct VectorStorage {
@@ -216,11 +234,14 @@ impl IpcRegion<'_> {
         at: u64,
         dst: &mut [u8],
         mut copy: impl FnMut(&mut [u8], IpcUserVa) -> usize,
-    ) -> Result<usize, IpcError> {
-        let slot = self.op_slot(token)?;
+    ) -> Result<usize, VectorInputInvariant> {
+        let slot = self.op_slot(token).map_err(VectorInputInvariant::Token)?;
         // SAFETY: the token retains the allocation, fully initialized before
         // transfer. Import failures are finished without attempting transfer.
-        let storage = slot.custody.live_vectors()?;
+        let storage = slot
+            .custody
+            .live_vectors()
+            .map_err(VectorInputInvariant::Custody)?;
         let vectors = unsafe {
             core::slice::from_raw_parts(
                 self.pool.add(storage.offset as usize).cast::<Vector>(),
@@ -240,7 +261,7 @@ impl IpcRegion<'_> {
             };
             let offset = (at + done as u64)
                 .checked_sub(vector.prefix.load(Ordering::Relaxed))
-                .ok_or(IpcError::Corrupt)?;
+                .ok_or(VectorInputInvariant::CorruptRange)?;
             let len = (vector.len.load(Ordering::Relaxed).saturating_sub(offset))
                 .min((dst.len() - done) as u64) as usize;
             if len == 0 {
