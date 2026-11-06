@@ -10,11 +10,15 @@ pub trait ThreadBirthAdoptionFactory: fmt::Debug + Send + Sync {
     fn executable_births(&self) -> bool {
         false
     }
+    /// Consume stopped first-entry custody exactly once via `before_publish`
+    /// after preparation and before making the successor runnable. Successful
+    /// terminal adoption also consumes custody, even when nothing is published.
     fn adopt_first_host_entry(
         &self,
         _context: &super::KernelContext,
         _reservation: ThreadBirthAdoptionReservation,
         _frame: &carrick_el1_abi::ThreadCtx,
+        _before_publish: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<(), String> {
         Err("execution lane has no born-thread adoption binding".into())
     }

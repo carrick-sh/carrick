@@ -671,6 +671,7 @@ fn exec_publication_retires_late_ledger_entry() {
                                 .adopt_born_thread_at_first_entry(
                                     born,
                                     &carrick_el1_abi::ThreadCtx::ZERO,
+                                    &mut || Ok(()),
                                 )
                                 .unwrap(),
                         );
