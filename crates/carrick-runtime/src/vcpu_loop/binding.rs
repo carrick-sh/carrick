@@ -485,7 +485,7 @@ pub(crate) fn registration_wake_callback(
 }
 
 impl HvpatchProductionPhase {
-    fn is_terminal_transition(&self) -> bool {
+    pub(super) fn is_terminal_transition(&self) -> bool {
         if let Self::ResumeRetainedOwner { action }
         | Self::ResumeRetainedPhysical { action, .. }
         | Self::RetainedMemoryRetry { action } = self
