@@ -7154,7 +7154,9 @@ pub fn default_scratch_root() -> std::io::Result<PathBuf> {
     // dispatcher's case-sensitivity probe to demote us to MemoryBackend.
     #[cfg(target_os = "macos")]
     {
-        return Ok(crate::apfs::preferred_scratch_root().path().to_owned());
+        return Ok(crate::apfs::preferred_scratch_root()
+            .host_path()?
+            .to_owned());
     }
     #[allow(unreachable_code)]
     {
