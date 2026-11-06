@@ -10415,11 +10415,25 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
         run_in_child(0, sys_fcntl, [4096, LINUX_F_SETFL, LINUX_O_NONBLOCK]).1,
         0
     );
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, child_bindings[0].record.id)
+            .is_queued()
+    );
+    activate_target(source, &task, &child_bindings[1]);
     assert_eq!(
         run_in_child(1, sys_fcntl, [4, LINUX_F_GETFL, 0]).1,
         (LINUX_O_WRONLY | LINUX_O_NONBLOCK) as i64,
         "high duplicate retains the inherited shared open description"
     );
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, child_bindings[1].record.id)
+            .is_queued()
+    );
+    activate_target(source, &task, &child_bindings[0]);
     assert_eq!(run_in_child(0, sys_fcntl, [4096, LINUX_F_SETFL, 0]).1, 0);
     assert_eq!(run_in_child(0, sys_close, [4096, 0, 0]).1, 0);
     assert_eq!(
