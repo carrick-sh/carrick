@@ -1869,9 +1869,45 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("s.json");
         let mut fake = remote();
-        let body = "Dispatch outcome: Blocked\n\nExternal blocker: #1755 robust-list walker\n";
-        fake.comments = (1..=2)
-            .map(|id| {
+        let records: Vec<Value> = serde_json::from_str(include_str!(
+            "../tests/fixtures/dispatch-1763-outcomes.json"
+        ))
+        .unwrap();
+        let outcomes: Vec<_> = records
+            .iter()
+            .filter(|r| {
+                r["source"].as_str().unwrap().contains("/issues/1737#")
+                    && r["body"].as_str().unwrap().starts_with("Dispatch outcome:")
+            })
+            .collect();
+        let decision = records
+            .iter()
+            .find(|r| r["source"].as_str().unwrap().ends_with("6690585316"))
+            .unwrap()["body"]
+            .as_str()
+            .unwrap();
+        assert!(decision.contains("Waiting on #1755"));
+        // Historical outcomes predate the explicit prerequisite field. The
+        // owner's recorded decision supplies its identity; retain each
+        // round's own wording to exercise reworded blockers end to end.
+        fake.comments = outcomes
+            .iter()
+            .enumerate()
+            .map(|(index, record)| {
+                let id = index + 1;
+                let original = record["body"].as_str().unwrap();
+                let raw = original
+                    .split("Worker contract (claims for review):\n\n```text\n")
+                    .nth(1)
+                    .unwrap()
+                    .split("\n```")
+                    .next()
+                    .unwrap();
+                let contract: Value = serde_json::from_str(raw).unwrap();
+                let body = format!(
+                    "Dispatch outcome: Blocked\n\nExternal blocker: #1755 {}\n",
+                    contract["summary"].as_str().unwrap()
+                );
                 json!({
                     "id":id,"user":{"login":"carrick-workers[bot]","type":"Bot"},
                     "created_at":format!("2026-10-30T00:0{id}:00Z"),"body":body
@@ -1897,9 +1933,12 @@ mod tests {
         assert!(err && text.contains("waiting on #1755"), "{text}");
         assert!(fake.posted.is_empty());
         let saved: ToolState = load(&state).unwrap();
-        assert_eq!(
-            saved.prs[&30].waiting_on.as_deref(),
-            Some("#1755 robust-list walker")
+        assert!(
+            saved.prs[&30]
+                .waiting_on
+                .as_deref()
+                .unwrap()
+                .starts_with("#1755 Rebased cleanly onto admitted main.")
         );
         fake.comments.push(json!({"user":{"login":"tjfontaine","type":"User"},"created_at":"2026-10-30T00:03:00Z","body":"#1755 has landed; continue"}));
         let (err, text) = call(

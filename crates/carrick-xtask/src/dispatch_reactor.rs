@@ -215,13 +215,31 @@ pub(super) fn repeated_blocker<'a>(bodies: impl IntoIterator<Item = &'a str>) ->
                     .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
             })
             .flatten();
-        waiting = blocker
-            .as_ref()
-            .filter(|blocker| previous.as_ref() == Some(*blocker))
-            .cloned();
-        previous = blocker;
+        let identity = blocker.as_deref().map(blocker_identity);
+        waiting = blocker.filter(|_| identity == previous && identity.is_some());
+        previous = identity;
     }
     waiting
+}
+
+// Issue and PR URLs share GitHub's repository-wide number namespace. A
+// comment fragment identifies an owner decision on that thread, so keep it.
+fn blocker_identity(blocker: &str) -> String {
+    let reference = blocker.split_whitespace().next().unwrap_or_default();
+    for prefix in [
+        "https://github.com/carrick-sh/carrick/issues/",
+        "https://github.com/carrick-sh/carrick/pull/",
+        "#",
+    ] {
+        if let Some(number) = reference.strip_prefix(prefix) {
+            return format!("#{}", number.trim_end_matches('/'));
+        }
+    }
+    blocker
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 #[cfg(test)]
@@ -230,6 +248,16 @@ mod blocker_replay_tests {
     fn replay_1763_1737_waits_on_1755() {
         let body = "Dispatch outcome: Blocked\n\nExternal blocker: #1755 robust-list walker\n";
         assert_eq!(super::repeated_blocker([body]), None);
+        let reworded = "Dispatch outcome: Blocked\n\nExternal blocker: https://github.com/carrick-sh/carrick/pull/1755 waiting for exit cleanup to land\n";
+        assert_eq!(
+            super::repeated_blocker([body, reworded]),
+            Some(
+                "https://github.com/carrick-sh/carrick/pull/1755 waiting for exit cleanup to land"
+                    .into()
+            )
+        );
+        let other = "Dispatch outcome: Blocked\n\nExternal blocker: #1754 different dependency\n";
+        assert_eq!(super::repeated_blocker([body, other]), None);
         assert_eq!(
             super::repeated_blocker([body, body]),
             Some("#1755 robust-list walker".into())
