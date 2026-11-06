@@ -3448,6 +3448,24 @@ where
         }
     }
 
+    pub(super) fn park_pending_owner_file_fault(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        outcome: Option<carrick_hal::OwnerFileFaultOutcome>,
+    ) -> Result<Option<executor::ExecutorExit>, ProductionHvpatchPollError> {
+        let Some(carrick_hal::OwnerFileFaultOutcome::PendingOwner(wait)) = outcome else {
+            return Ok(None);
+        };
+        self.park_owner_memory_action(
+            engine,
+            control,
+            crate::vcpu_loop::zone::OwnerMemoryAction::Fault,
+            wait,
+        )
+        .map(Some)
+    }
+
     pub(super) fn resume_owner_ready(
         &mut self,
         engine: &mut E,
@@ -5611,15 +5629,10 @@ where
                     }
                     None => None,
                 };
-                if let Some(carrick_hal::OwnerFileFaultOutcome::PendingOwner(wait)) =
-                    owner_file_fault
+                if let Some(exit) =
+                    self.park_pending_owner_file_fault(engine, control, owner_file_fault.clone())?
                 {
-                    return self.park_owner_memory_action(
-                        engine,
-                        control,
-                        crate::vcpu_loop::zone::OwnerMemoryAction::Fault,
-                        wait,
-                    );
+                    return Ok(exit);
                 }
                 if let Some(carrick_hal::OwnerFileFaultOutcome::Pending(wait)) = &owner_file_fault {
                     let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {

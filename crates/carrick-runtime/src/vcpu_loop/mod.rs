@@ -3669,6 +3669,8 @@ pub(crate) mod tests {
         pub(crate) fail_execve_into: Option<String>,
         pub(crate) terminal_continuation_discards: usize,
         pub(crate) mailbox_slot: Option<usize>,
+        pub(crate) owner_file_fault_outcome: Option<carrick_hal::OwnerFileFaultOutcome>,
+        pub(crate) owner_file_fault_services: usize,
         pub(crate) copyout_prepare: Option<Box<dyn FnMut() -> Option<carrick_guest_mem::OwnedMemoryWait> + Send>>,
         pub(crate) prepare_dependency: Option<carrick_guest_mem::OwnedMemoryWait>,
         pub(crate) prepared_write_context: Option<carrick_kernel::kernel::KernelContext>,
@@ -4077,6 +4079,15 @@ pub(crate) mod tests {
             self.mailbox_slot
         }
 
+        fn service_owner_file_fault(
+            &mut self,
+            _mm_key: u64,
+            _request_generation: u64,
+        ) -> Result<Option<carrick_hal::OwnerFileFaultOutcome>, TrapError> {
+            self.owner_file_fault_services += 1;
+            Ok(self.owner_file_fault_outcome.take())
+        }
+
         fn frame_cow_owner_inventory(
             &self,
         ) -> Option<Arc<dyn carrick_hal::FrameCowOwnerInventory>> {
@@ -4423,6 +4434,19 @@ pub(crate) mod tests {
             carrick_abi::syscall::nr::FSTAT,
             Some(carrick_abi::LINUX_SIGKILL),
             true,
+            false,
+            false,
+            false,
+            (None, Some(false)),
+        );
+    }
+
+    #[test]
+    fn serial_host_file_fault_owner_wait_parks_then_reruns_fetch() {
+        exercise_owner_wait_completion_at_fault(
+            carrick_abi::syscall::nr::FSTAT,
+            None,
+            false,
             false,
             false,
             false,
@@ -5285,6 +5309,78 @@ pub(crate) mod tests {
                         .observe_wait(handle, carrick_el1_abi::PortalWaitCause::Editor)
                         .unwrap()
                         .unwrap();
+                    let mut fault_owner_wait = None;
+                    if fault_wait {
+                        let nz = |value| NonZeroU64::new(value).unwrap();
+                        let fault_va = 0x6000_a5000;
+                        let request_generation = 77;
+                        let mapping_incarnation =
+                            carrick_el1_abi::ReservationIncarnation::new(5).unwrap();
+                        let window = carrick_el1_abi::PortalGrantWindow {
+                            operation: carrick_el1_abi::PortalOperation {
+                                carrier: nz(712),
+                                mm,
+                                incarnation: handle.incarnation(),
+                                sequence: nz(900),
+                            },
+                            mapping_incarnation,
+                            range: carrick_el1_abi::ReservationRange::new(
+                                fault_va,
+                                fault_va + 4096,
+                            )
+                            .unwrap(),
+                            protection: carrick_el1_abi::ReservationProtection::READ_WRITE_EXECUTE,
+                            fault_page: fault_va,
+                            host_backing: Some(carrick_el1_abi::HostBackingIdentity::new(
+                                nz(6),
+                                nz(7),
+                                0,
+                            )),
+                            fork_sequence: None,
+                        };
+                        assert!(
+                            region
+                                .portal_slots()
+                                .grant(0)
+                                .unwrap()
+                                .publish_fault_selection(request_generation, window)
+                        );
+                        let mailbox = carrick_el1_abi::frame_grant_mailbox_host_for_slot(0)
+                            .expect("test region has frame mailbox zero");
+                        assert!(
+                            mailbox.try_publish_request(carrick_el1_abi::FrameGrantRequest {
+                                mm_key: mm.raw(),
+                                reservation_incarnation: mapping_incarnation,
+                                request_generation,
+                                fault_va,
+                                requested_len: 4096,
+                                access: crate::linux_abi::LINUX_PROT_EXEC,
+                            })
+                        );
+                        engine.mailbox_slot = Some(0);
+                        engine.owner_file_fault_outcome =
+                            Some(carrick_hal::OwnerFileFaultOutcome::PendingOwner(wait));
+                        let resolved = signal::resolve_owner_file_fault(
+                            &mut engine,
+                            mm.raw(),
+                            fault_va,
+                            Some(carrick_mmu_core::aarch64::LeafAccess::Execute),
+                        )
+                        .unwrap();
+                        let Some(carrick_hal::OwnerFileFaultOutcome::PendingOwner(resolved_wait)) =
+                            resolved
+                        else {
+                            panic!("file-fault contention did not retain its owner wait")
+                        };
+                        assert_eq!(resolved_wait, wait);
+                        assert_eq!(engine.owner_file_fault_services, 1);
+                        assert_eq!(
+                            mailbox.state.load(std::sync::atomic::Ordering::Acquire),
+                            carrick_el1_abi::FRAME_GRANT_MAILBOX_IDLE,
+                            "runtime must release the mailbox before parking"
+                        );
+                        fault_owner_wait = Some(resolved_wait);
+                    }
                     engine.copyout_owner_probe = Some(CopyoutOwnerProbe {
                         wait,
                         zone: zone as *const _ as usize,
@@ -5642,12 +5738,14 @@ pub(crate) mod tests {
                             .unwrap();
                     } else {
                         let parked = if fault_wait {
-                            job.park_owner_memory_action(
+                            job.park_pending_owner_file_fault(
                                 &mut engine,
                                 &mut control,
-                                zone::OwnerMemoryAction::Fault,
-                                wait,
+                                Some(carrick_hal::OwnerFileFaultOutcome::PendingOwner(
+                                    fault_owner_wait.expect("resolved fault wait"),
+                                )),
                             )
+                            .map(|exit| exit.expect("pending owner fault routes to park"))
                         } else {
                             job.owner_memory_park(&mut engine, &mut control, frame, wait, resume)
                         }
@@ -5938,6 +6036,14 @@ pub(crate) mod tests {
                         )
                         .unwrap()
                     };
+                    if fault_wait && !retire_receipt && signum.is_none() {
+                        assert!(matches!(completed, executor::ExecutorExit::Syscall));
+                        assert!(matches!(job.phase, HvpatchProductionPhase::Resident));
+                        assert_eq!(
+                            engine.owner_file_fault_services, 1,
+                            "wake reruns the faulting fetch instead of replaying host service"
+                        );
+                    }
                     if physical_after_owner && !immediate {
                         assert!(matches!(completed, executor::ExecutorExit::Blocked(_)));
                         assert_eq!(engine.prepared_attempts, 2 + usize::from(recvfrom));
@@ -6061,23 +6167,25 @@ pub(crate) mod tests {
                         } else {
                             0
                         };
-                        if ipc_read {
+                        if ipc_read || fault_wait {
                             assert!(
                                 engine.completed_syscalls.is_empty(),
-                                "EL0 IPC return has no trap to complete"
+                                "EL0 IPC return and fault retry have no syscall to complete"
                             );
-                            assert!(
-                                engine
-                                    .written_registers
-                                    .contains(&(carrick_hal::Reg::X(0), 6))
-                            );
-                            assert!(
-                                engine
-                                    .written_registers
-                                    .contains(&(carrick_hal::Reg::Pc, 0x4004)),
-                                "the direct EL0 syscall returns exactly once past its SVC"
-                            );
-                            assert_eq!(engine.guest_memory[&0x71_1020], b"retain");
+                            if ipc_read {
+                                assert!(
+                                    engine
+                                        .written_registers
+                                        .contains(&(carrick_hal::Reg::X(0), 6))
+                                );
+                                assert!(
+                                    engine
+                                        .written_registers
+                                        .contains(&(carrick_hal::Reg::Pc, 0x4004)),
+                                    "the direct EL0 syscall returns exactly once past its SVC"
+                                );
+                                assert_eq!(engine.guest_memory[&0x71_1020], b"retain");
+                            }
                         } else {
                             assert_eq!(engine.completed_syscalls, [result]);
                         }
@@ -6128,7 +6236,7 @@ pub(crate) mod tests {
                     } else {
                         scheduler.settle_runnable_successor(resumed).unwrap();
                     }
-                    if !killing && !retire_receipt {
+                    if !killing && !retire_receipt && !fault_wait {
                         assert_eq!(
                             engine.prepared_commits,
                             usize::from(recvfrom)
