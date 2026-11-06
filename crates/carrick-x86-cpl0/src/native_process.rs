@@ -742,21 +742,24 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
             carrick_el1::isa::x86::context::current_cpu_binding()
                 .ok_or(NativeProcessError::Stale)?,
         );
-        carrick_el1_linux::file_table::fork_fd_map(
-            files.fd_map(),
-            files.opens(),
-            parent_table,
-            child_table,
-        )
-        .then_some(())
-        .ok_or(NativeProcessError::Exhausted)
+        carrick_el1_linux::file_table::DescriptorNamespace {
+            fd_map: files.fd_map(),
+            open_table: files.opens(),
+            ipc: None,
+        }
+        .fork(parent_table, child_table)
     }
     fn retire_fd_table(&mut self, table: u64) {
         let binding =
             carrick_el1::isa::x86::context::current_cpu_binding().unwrap_or_else(|| fatal());
         let files = crate::linux_personality::file_tables(binding);
-        carrick_el1_linux::file_table::retire_fd_map(files.fd_map(), files.opens(), table);
-        self.task.linux.mark_pending_host_work();
+        carrick_el1_linux::file_table::DescriptorNamespace {
+            fd_map: files.fd_map(),
+            open_table: files.opens(),
+            ipc: None,
+        }
+        .retire(table, self.task)
+        .unwrap_or_else(|_| fatal());
     }
 }
 

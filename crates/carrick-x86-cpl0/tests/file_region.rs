@@ -4,7 +4,7 @@
 
 use carrick_el1_abi::*;
 use carrick_el1_linux::file_table::{
-    admit_host_fd, admit_stdio, close_host_binding, dup_host_binding, fork_fd_map, retire_fd_map,
+    DescriptorNamespace, admit_host_fd, admit_stdio, close_host_binding, dup_host_binding,
 };
 use carrick_guest_arch::{FrameGpa, GuestLen, KernelVa};
 use carrick_test_support::TestEl1Region;
@@ -232,7 +232,12 @@ fn file_region_fork_dup_lookup_and_retire_preserve_live_parent() {
     let shared_open = &tables.opens()[stdout as usize - 1];
     let incarnation = shared_open.generation.load(Ordering::Acquire);
     assert_eq!(shared_open.lifetime.ring_references(incarnation), Some(1));
-    assert!(fork_fd_map(tables.fd_map(), tables.opens(), 51, 52));
+    let namespace = DescriptorNamespace {
+        fd_map: tables.fd_map(),
+        open_table: tables.opens(),
+        ipc: None,
+    };
+    namespace.fork(51, 52).expect("child namespace");
     assert_eq!(shared_open.lifetime.ring_references(incarnation), Some(2));
     for table in [51, 52] {
         assert_eq!(
@@ -251,7 +256,9 @@ fn file_region_fork_dup_lookup_and_retire_preserve_live_parent() {
     assert!(
         open.is_bound_to(&tables.objects()[open.inode_handle.load(Ordering::Acquire) as usize - 1])
     );
-    retire_fd_map(tables.fd_map(), tables.opens(), 52);
+    let task = CurrentTask::new();
+    namespace.retire(52, &task).expect("retire child namespace");
+    assert!(task.linux.has_pending_host_work());
     assert_eq!(shared_open.lifetime.ring_references(incarnation), Some(2));
     assert_eq!(
         tables.fd_map()[child.1].incarnation.load(Ordering::Acquire),
