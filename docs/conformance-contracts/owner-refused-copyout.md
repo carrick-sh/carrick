@@ -65,3 +65,10 @@ redispatch MOD successfully and deliver only the new readable event once.
 The two live shared-MM kernel threads remain present throughout. This is a
 production dispatcher reduction; scheduler parking and physical backing
 supply still require the native and signed integration layers.
+
+`epoll_pwait2_timeout_read_refusal_redispatches_before_wait` covers timeout
+input through the same dispatcher for both ABIs. A suspended timespec read
+returns the existing owner wait and redispatch with a zero timeout completes
+normally. A genuinely invalid address still returns EFAULT (14), and a
+negative timespec still returns EINVAL (22). This retires the remaining
+error-collapse debt in the epoll handler without adding a second outcome.
