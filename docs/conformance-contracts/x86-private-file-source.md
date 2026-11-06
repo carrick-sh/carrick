@@ -175,8 +175,9 @@ sources, and writes errno 12 at 1,024 retained sources before host service.
 Its VM-free binding fills the actual custody to that bound, checks the error
 reply, and releases one source through the next request before readmission.
 The existing thousand-cycle release witness moves from HVF to this shared
-owner. This component witness does not resolve the real-KVM reservation
-population failure or the suspension consumer dependency described above.
+owner. The subsequent elastic-bank correction resolves the real-KVM
+reservation population failure described above; this component witness alone
+does not prove that correction or the suspension consumer dependency.
 
 The fault-specific binding
 `published_private_source_fault_joins_late_delegation_recall` admits the pinned
@@ -202,3 +203,12 @@ root view and returns `MetadataRequired` once an elastic bank exists. Its
 consumers are diagnostic tests; production guest fork uses identity-bank
 access. A retained host bank resolver is a separate follow-up, not evidence
 of a guest fork failure or a reason to change this source-limit witness.
+
+### Resumed worker verification
+
+The resumed dispatch checkout already contains both requested review fixes
+and their witnesses; rebasing onto the admitted main preserves those commits
+without conflicts. Fresh execution of the four `published_private` kernel
+tests passes, including admission-time and late-publication fault-time recall.
+The CPL0 release image also rebuilds successfully. These are scoped results,
+not proof of CLI loader startup or the outstanding suspension contract.
