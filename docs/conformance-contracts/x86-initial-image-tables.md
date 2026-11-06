@@ -27,3 +27,24 @@ large contiguous PT_LOAD crosses enough 2 MiB leaf-table boundaries to hit
 this refusal; sparse layouts can hit it with very few data pages too.
 ARM's initial mapping uses `PageTableManager` and its `alloc_table` path
 on demand, rather than submitting the whole image as one edit's grants.
+
+## Issue 1716 evidence
+
+The new production KVM witness was red with `production initial MM refused:
+status 2`, then green with exit status 7 after on-demand allocation and exact
+host publication-grant reconstruction. The focused initial-MM suite passes
+28 tests with one existing ignored test. The VM-free suite passes 119 tests;
+its sparse rows add 3, 6 and 9 disjoint leaf-table prefixes and retain exact
+frame and table counts. The separate serial-host partitions contain no tests.
+
+The pulled `golang:1.23` amd64 executable has load regions spanning
+`0x400000..0xff8600`. Six leaf tables plus two directory tables and one
+PDPT table (including the independent 64 KiB stack at `0x7fff0000`) make
+nine user tables, exceeding the old first edit's eight-grant limit.
+The root and three private copy-window tables are separate allocations.
+
+The release CLI now enters Go's runtime rather than refusing its initial MM.
+It next exits 2 at `runtime.checkfds` with `errno=38` on descriptor 0 and
+`fatal error: cannot open standard fds`. Thus the table-allocation witness
+is green, but the issue's full `go version` output acceptance remains open.
+No unrelated syscall routing is changed to conceal that next failure.
