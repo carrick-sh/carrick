@@ -2803,3 +2803,121 @@ fn filtered_live_close_and_dup_replace_defer_host_release_once() {
     c.destroy_table(peer, |_| panic!("all descriptions already released"))
         .unwrap();
 }
+
+#[test]
+fn close_receipt_retains_original_description_across_numeric_reuse() {
+    let c = authority::<1, 4>();
+    let table = c.create_table(4, &mut storage(4)).unwrap();
+    let fd = c.open(table, Fd(0), description(71), false).unwrap();
+    let prepared = c.prepare_close(table, fd).unwrap();
+    let receipt = c.commit_close(prepared).unwrap();
+    assert_eq!(c.open(table, Fd(0), description(72), false), Ok(fd));
+    assert_eq!(
+        c.close_receipt_description(&receipt).unwrap().backing,
+        BackingToken(71)
+    );
+    assert_eq!(
+        c.settle_close(receipt).unwrap().unwrap().backing,
+        BackingToken(71)
+    );
+    assert_eq!(c.get(table, fd).unwrap().backing, BackingToken(72));
+}
+
+#[test]
+fn cancelled_close_preparation_preserves_slot_and_releases_custody() {
+    let c = authority::<1, 2>();
+    let table = c.create_table(4, &mut storage(4)).unwrap();
+    let fd = c.open(table, Fd(0), description(81), false).unwrap();
+    let prepared = c.prepare_close(table, fd).unwrap();
+    assert_eq!(c.cancel_close(prepared).unwrap(), None);
+    assert_eq!(c.get(table, fd).unwrap().backing, BackingToken(81));
+    assert_eq!(
+        c.close(table, fd).unwrap().unwrap().backing,
+        BackingToken(81)
+    );
+}
+
+#[test]
+fn prepared_close_claim_prevents_same_description_numeric_reuse() {
+    let c = authority::<1, 4>();
+    let table = c.create_table(4, &mut storage(4)).unwrap();
+    let fd = c.open(table, Fd(0), description(91), false).unwrap();
+    let alias = c.dup(table, fd).unwrap();
+    let prepared = c.prepare_close(table, fd).unwrap();
+    assert_eq!(c.close(table, fd), Ok(None));
+    assert_eq!(c.dup2(table, alias, fd), Err(Error::Busy));
+    let (error, prepared) = c.commit_close(prepared).unwrap_err();
+    assert_eq!(error, Error::BadFd);
+    assert_eq!(c.cancel_close(prepared).unwrap(), None);
+    assert_eq!(c.dup2(table, alias, fd), Ok(None));
+    assert_eq!(c.get(table, fd).unwrap().backing, BackingToken(91));
+}
+
+#[test]
+fn close_receipt_contention_returns_custody_then_commits_once() {
+    let (core, arena) = core_with::<1>(2);
+    let host = core.bind(arena, Spin);
+    let ring = core.bind(arena, BoundedSpin(16));
+    let table = host.create_table(4, &mut storage(4)).unwrap();
+    let fd = host.open(table, Fd(0), description(101), false).unwrap();
+    let prepared = ring.prepare_close(table, fd).unwrap();
+    core.tables[0].lock.store(1, Ordering::Release);
+    let (error, prepared) = ring.commit_close(prepared).unwrap_err();
+    assert_eq!(error, Error::Contended);
+    assert_eq!(ring.get(table, fd).unwrap().backing, BackingToken(101));
+    let (error, prepared) = ring.cancel_close(prepared).unwrap_err();
+    assert_eq!(error, Error::Contended);
+    core.tables[0].lock.store(0, Ordering::Release);
+    let receipt = ring.commit_close(prepared).unwrap();
+    assert_eq!(ring.get(table, fd), Err(Error::BadFd));
+    assert_eq!(
+        ring.settle_close_filtered(receipt, |_| false),
+        Ok(DeferredRelease::Deferred)
+    );
+    assert_eq!(
+        host.take_retired_ofd().unwrap().unwrap().backing,
+        BackingToken(101)
+    );
+    assert_eq!(host.take_retired_ofd().unwrap(), None);
+}
+
+#[test]
+fn close_receipts_retain_each_original_range_member_after_reuse() {
+    let c = authority::<1, 8>();
+    let table = c.create_table(4, &mut storage(4)).unwrap();
+    let mut receipts = Vec::new();
+    for i in 0..4 {
+        let fd = c.open(table, Fd(0), description(110 + i), false).unwrap();
+        let (pin, _) = c.pin(table, fd).unwrap();
+        c.require_pinned_close_effects(&pin, CloseEffects::INOTIFY_CLOSE)
+            .unwrap();
+        c.unpin(pin).unwrap();
+    }
+    for i in 0..4 {
+        receipts.push(
+            c.commit_close(c.prepare_close(table, Fd(i)).unwrap())
+                .unwrap(),
+        );
+    }
+    for i in 0..4 {
+        assert_eq!(
+            c.open(table, Fd(0), description(120 + i), false),
+            Ok(Fd(i as i32))
+        );
+    }
+    for (i, receipt) in receipts.into_iter().enumerate() {
+        assert_eq!(receipt.effects(), CloseEffects::INOTIFY_CLOSE);
+        assert_eq!(
+            c.close_receipt_description(&receipt).unwrap().backing,
+            BackingToken(110 + i as u64)
+        );
+        assert_eq!(
+            c.settle_close(receipt).unwrap().unwrap().backing,
+            BackingToken(110 + i as u64)
+        );
+        assert_eq!(
+            c.get(table, Fd(i as i32)).unwrap().backing,
+            BackingToken(120 + i as u64)
+        );
+    }
+}
