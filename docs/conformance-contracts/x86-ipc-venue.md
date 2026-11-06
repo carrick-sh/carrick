@@ -92,3 +92,25 @@ number for the original refusal census index. No x86 transfer implementation,
 window mapping, descriptor namespace admission or creation path is claimed by
 this prerequisite. Existing shared IPC and two-live-process owner-wait tests
 remain the lower-layer witnesses; the real-KVM acceptance remains red.
+
+## Shared descriptor lifecycle prerequisite
+
+`file_table::DescriptorNamespace` now owns the fork and retirement sequence
+for both native execution services. ARM supplies its existing IPC binding;
+x86 currently supplies no IPC binding. Delegated-map inheritance, ring-table
+fork/publication, delegated rollback on publication failure, owned ring-table
+retirement and boundary-work publication have one implementation. This moves
+the existing ARM policy without changing its authority or lock order: the
+map snapshot releases its mutation guard before the fd-core fork, publication
+and rollback. Retirement releases directory custody before retiring the ring
+table, then retires delegated descriptions. Neither lock spans the other
+operation. The x86 file-region lifecycle witness now calls this production
+owner and verifies child retirement preserves the live parent's descriptions.
+The existing ARM native-fork witnesses still exercise complete ring namespace
+inheritance, publication failure rollback and last-writer EOF through this owner.
+
+This prerequisite does not install x86's IPC mapping or wire its transfer
+execution capability. In particular, x86's `ipc: None` is an explicit remaining
+admission gap, not a second IPC authority or a claim of pipe support. The real
+KVM witness and counted-writev invariant remain unchanged until those parts
+are implemented.
