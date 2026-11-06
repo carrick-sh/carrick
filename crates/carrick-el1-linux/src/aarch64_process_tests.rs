@@ -12241,16 +12241,21 @@ fn clone_nonresident_tid_destination(is_clone3: bool, refusal: CloneRefusal) {
 
 #[test]
 fn arm_non_last_thread_exit_nonresident_clear_tid_and_robust_list_wakes_once() {
-    exit_nonresident_pages(false);
+    exit_nonresident_pages(false, true);
 }
 
 #[test]
 fn arm_non_last_thread_exit_nonresident_clear_tid_wakes_once() {
-    exit_nonresident_pages(true);
+    exit_nonresident_pages(true, true);
+}
+
+#[test]
+fn arm_robust_owner_death_preserves_waiters_published_during_update() {
+    exit_nonresident_pages(false, false);
 }
 
 #[cfg(test)]
-fn exit_nonresident_pages(clear_only: bool) {
+fn exit_nonresident_pages(clear_only: bool, park_output: bool) {
     crate::lifecycle::CHILD_TID_WAKE_CALLS.with(|calls| calls.borrow_mut().clear());
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
@@ -12437,7 +12442,13 @@ fn exit_nonresident_pages(clear_only: bool) {
     if !clear_only {
         crate::lifecycle::COPYOUT_PUBLISH_WAITERS_AT
             .with(|address| address.set(Some(last_node.arg_at(8))));
-        crate::lifecycle::COPYOUT_NOT_YET_AT.with(|address| address.set(Some(last_node.arg_at(8))));
+        crate::lifecycle::COPYOUT_NOT_YET_AT.with(|address| {
+            address.set(Some(if park_output {
+                last_node.arg_at(8)
+            } else {
+                clear_tid_word.arg()
+            }))
+        });
         frame.x = [0; 31];
         frame.x[8] = 93;
         frame.elr = 0x40_3000;
@@ -12447,9 +12458,25 @@ fn exit_nonresident_pages(clear_only: bool) {
             parked.unwrap(),
             carrick_personality_linux::dispatch::CompletionRoute::Served
         );
-        assert_eq!(last_node.get::<RobustNode>(0).futex, 42 | 0x8000_0000);
-        crate::lifecycle::CHILD_TID_WAKE_CALLS
-            .with(|calls| assert_eq!(&*calls.borrow(), &[robust_node.arg_at(8)]));
+        assert_eq!(
+            last_node.get::<RobustNode>(0).futex,
+            if park_output {
+                42 | 0x8000_0000
+            } else {
+                0xc000_0000
+            }
+        );
+        crate::lifecycle::CHILD_TID_WAKE_CALLS.with(|calls| {
+            assert_eq!(
+                &*calls.borrow(),
+                if park_output {
+                    vec![robust_node.arg_at(8)]
+                } else {
+                    vec![robust_node.arg_at(8), last_node.arg_at(8)]
+                }
+                .as_slice()
+            );
+        });
     }
 
     // 2. Exit when clear_child_tid page is not yet backed for copyout:

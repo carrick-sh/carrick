@@ -27,7 +27,8 @@ injected at the user-copy boundary, not by calling a lifecycle helper.
   also registers a real user-memory list through set_robust_list. Refusing
   the head leaves it intact. Refusing the later clear-child-TID write
   occurs after robust cleanup; resumption does not repeat that cleanup.
-  The wake log must contain exactly the robust address and clear address.
+  The wake log must contain each of the two robust addresses once and the
+  clear address once. The completed prefix has one head/next-pointer read.
 - `arm_signal_frame_push_onto_nonresident_stack_delivers_once_and_sigreturn_restores`
   and `arm_signal_frame_pop_from_nonresident_stack_restores_once` install
   an action and queue a signal through syscall entry. Push refusal keeps
@@ -47,46 +48,24 @@ These VM-free refusal schedules do not qualify ARM hardware fixup,
 x86 execution, or a real blocked owner's release. The existing owner-wait
 bindings and signed gates remain independently necessary.
 
-## Review findings still requiring production correction
+## Review corrections
 
-These findings concern the inherited WIP, not the test instrumentation.
-Passing the focused schedules does not settle them.
+The clone and clone3 production entries now retain output undo in the exact
+calling member until restoration completes. Refused restoration cannot become
+another clone's captured preimage. Unreached child output is excluded from
+undo, and terminal preparation errors retire verified undo before returning;
+peer writes made after a failed syscall survive later clone attempts.
 
-- P0: `handle_exit_robust_futex` reads and writes the futex word separately.
-  A concurrent waiter can set FUTEX_WAITERS between them and lose that bit.
-  An atomic compare/exchange against guarded guest memory is required;
-  byte copies cannot supply that contract.
-- P1: `walk_exit_robust_list` starts at the head after every NotYet. A lazy
-  list can revisit its completed prefix quadratically. Retain the exact
-  walk cursor and pending-entry phase in the existing operation owner.
-- P0: `TidOutputs::publish` and `TidOutputs::rollback` ignore the result of
-  restoring a preimage. If rollback itself refuses, the unborn child's TID
-  may remain published. Retain rollback custody until it completes.
+The robust exit walker retains its current entry, prefetched successor,
+original futex word, and read/write/wake phase. A refusal at a later list
+entry does not reread the completed prefix. Owner death uses guarded atomic
+compare-exchange, so a peer's concurrent FUTEX_WAITERS publication survives.
+The no-write-park production witness reproduces 0x40000000 with the former
+read/write update and requires 0xc0000000 plus one wake with the correction.
+The separate output-park schedule proves retained-cursor resumption as well.
 
-The slice must remain a draft until these are corrected and witnessed.
-
-## Host verification
-
-The completed native suite reports 685 passed, zero failed and one ignored.
-The personality-linux package reports 232 ordinary tests plus two compile-fail
-doctests passed; its serial-host selection contains zero tests. Workspace
-all-target clippy, check-linux, the host-target KVM compile check and the
-macOS closure check/clippy pass. The contract-change check passes with the
-installed Python 3.13 (the default Python 3.9 cannot import tomllib).
-
-The guest-copy ratchet falls from the base's 247 sites in 59 counters to
-246 in 58 counters. Its check explicitly compares against the supplied
-stack base. Authority source ceilings pass at 1266 sites.
-
-The host-target KVM check and aarch64 Linux check skip the freestanding
-x86 image. A direct x86_64-unknown-none check exposed the inherited
-prepare_owned_write signature mismatch and an Option pattern on GuestLen.
-The adapter now uses its existing CopyoutRequest contract and constructs
-one shared GuestCopyRequest with write access. Empty writes remain a
-no-op. Freestanding clippy also exposed the same elidable lifetime that
-had already been corrected for ARM; the x86 signature is corrected too.
-
-Both freestanding x86 images pass clippy with warnings denied. The fixture
-also needed its existing allocator alias (`rust_alloc`) used consistently
-by the included lifecycle source; no fixture behavior changes. These
-compile fixes are separate from the open ownership findings above.
+These controls supplement the eleven original refusal cases above. They
+remain VM-free evidence; the signed smoke receipt and the director's full
+signed population gate retain their separate scopes. Signal delivery now
+uses #1691's selected-return-owner checkpoint, without the former slice-local
+after-dispatch delivery hook.

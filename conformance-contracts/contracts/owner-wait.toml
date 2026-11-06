@@ -29,6 +29,7 @@ rationale = "Owner waits are killable-only: handled signals and stops never comp
 [bindings]
 vm_free = [
   "carrick-vmm-hvf::metadata_grant::native_service::root_wait::tests::physical_bridge_preserves_sample_and_publishes_once_before_or_after_enrollment (#1677: exact owner observation, actual physical producer, one wake, retired record reuse and delayed callback teardown)",
+  "carrick-el1-linux::aarch64_process_tests::{arm_clone_refused_parent_preserves_unattempted_child_output,arm_clone_preparation_fault_retires_completed_undo,arm_robust_owner_death_preserves_waiters_published_during_update}",
   "carrick-vmm-hvf::metadata_grant::native_service::intake_tests::{root_descriptor_cancel_withdraws_unclaimed_reply_and_drops_once,root_descriptor_cancel_retains_claimed_unknown_visibility,root_descriptor_cancel_refuses_foreign_owner_or_reply,root_grant_destroy_proof_failure_retains_custody_and_blocks_reuse}",
   "carrick-thread::physical_grant::owned_tests::owned_handoff_keeps_same_producer_until_cross_thread_release",
 
