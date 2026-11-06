@@ -1070,6 +1070,7 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// `Some` only for a process multiplexed in the shared HvPatch VM.
     pub(super) process_fork_barrier: Option<Arc<crate::fork_quiesce::QuiesceBarrier>>,
     pub(super) crash_capture: Option<Arc<carrick_kernel::kernel::CrashCaptureAuthority>>,
+    pub(super) pending_core_read: Option<crash::PendingCoreRead>,
     #[cfg(test)]
     pub(super) crash_lease_drain_budget: CrashLeaseDrainBudget,
     pub(super) kernel_thread: Option<carrick_kernel::kernel::ThreadRef>,
@@ -1211,6 +1212,7 @@ where
             platform_futex_factory,
             process_fork_barrier,
             crash_capture,
+            pending_core_read: None,
             kernel_thread,
             guest_execution: None,
             execution_lease: ExecutionLeaseCell::owned(),
@@ -3684,6 +3686,7 @@ pub(crate) mod tests {
         pub(crate) guest_memory: std::collections::BTreeMap<u64, Vec<u8>>,
         pub(crate) read_tracker: Option<CrashReadTracker>,
         pub(crate) read_refusal_tx: Option<std::sync::mpsc::SyncSender<()>>,
+        pub(crate) owner_read_refusal_at: Option<u64>,
         pub(crate) fail_read_at: Option<u64>,
         pub(crate) atomic_word: Option<AtomicWordLoad>,
         pub(crate) fail_execve_into: Option<String>,
@@ -3845,6 +3848,9 @@ pub(crate) mod tests {
         ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
             if let Some(probe) = self.copyout_owner_probe
                 && !self.uncontended_reads
+                && self
+                    .owner_read_refusal_at
+                    .is_none_or(|target| target == address)
                 && let Some(wait) = probe.wait_if_busy()
             {
                 if let Some(tx) = &self.read_refusal_tx {
