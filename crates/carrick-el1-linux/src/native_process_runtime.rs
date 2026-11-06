@@ -5380,14 +5380,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 Ok((IpcOutcome::Returned(r), Some((original_idx, mtype, data)))) => {
                     let mut bytes = mtype.to_ne_bytes().to_vec();
                     bytes.extend_from_slice(&data);
-                    self.complete_owned_copyout(service::OwnedCopyout {
+                    self.complete_output(carrick_personality_linux::ipc::IpcOutput {
                         address: msgp,
                         bytes,
                         offset: 0,
                         result: r,
-                        custody: service::CopyoutCustody::Ipc {
-                            message: Some((msqid, original_idx, mtype)),
-                        },
+                        message: Some((msqid, original_idx, mtype)),
                     })
                 }
                 Ok((IpcOutcome::Returned(r), None)) => returned(r.raw()),
@@ -8947,6 +8945,10 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         &mut self,
         output: carrick_personality_linux::ipc::IpcOutput,
     ) -> LifecycleOutcome {
+        if output.range().is_none() {
+            output.restore(self);
+            return returned(carrick_syscall_abi::LINUX_EFAULT.guest_retval());
+        }
         self.complete_owned_copyout(service::OwnedCopyout {
             address: output.address,
             bytes: output.bytes,

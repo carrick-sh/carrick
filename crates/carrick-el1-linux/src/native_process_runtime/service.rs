@@ -2703,10 +2703,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let output = pending.copyout.take();
         if matches!(request.operation, ServiceOperation::Fault(_))
             && result != ServiceResult::Supplied
+            && let Some(output) = &output
         {
-            if let Some(output) = &output {
-                self.restore_copyout_message(output);
-            }
+            self.restore_copyout_message(output);
         }
 
         if pending.adapter {

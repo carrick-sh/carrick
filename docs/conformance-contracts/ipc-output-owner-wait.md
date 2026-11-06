@@ -23,3 +23,9 @@ both wire layouts, Done, Fault, and NotYet once followed by success.
 These VM-free witnesses do not prove signed guest execution or an end-to-end
 runtime ratio. HVF and Docker promotion remain separate acceptance evidence.
 Existing IPC input-copy consumers are outside this output-custody slice.
+
+The guest-copy debt gate now counts direct `.is_done()` consumers as a
+source-derived monotone total. Its first comparison measures base source with
+the same scanner; subsequent comparisons use the committed ceiling. Existing
+per-file error and bool-interface ceilings retain their previous limits. A
+new typed consumer cannot borrow unmeasured headroom from this introduction.

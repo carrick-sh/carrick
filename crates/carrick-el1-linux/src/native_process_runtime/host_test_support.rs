@@ -6527,28 +6527,30 @@ fn ipc_receive_fault_restores_dequeued_message() {
         )
         .unwrap();
     let queue = entry.msgget(0, 0o600).unwrap();
-    entry.msgsnd(queue, 7, &[1, 2, 3], 0).unwrap();
-    let (_, Some((index, kind, data))) =
-        entry.msgrcv(queue, UserVa::new(0x10000), 0, 0, 3).unwrap()
-    else {
-        panic!("message must be dequeued")
-    };
-    let mut bytes = kind.to_ne_bytes().to_vec();
-    bytes.extend_from_slice(&data);
-    let result = entry.complete_output(ipc::IpcOutput {
-        address: UserVa::new(0x10000),
-        bytes,
-        offset: 0,
-        result: SyscallResult::new(3),
-        message: Some((queue, index, kind)),
-    });
-    assert!(matches!(result, LifecycleOutcome::Returned { result, .. } if result.raw() == -14));
-    let (_, Some((_, restored_kind, restored_data))) = entry
-        .msgrcv(queue, UserVa::new(0x10000), 0, ipc::IPC_NOWAIT, 3)
-        .unwrap()
-    else {
-        panic!("fault must restore message")
-    };
-    assert_eq!(restored_kind, 7);
-    assert_eq!(restored_data, [1, 2, 3]);
+    for address in [0x10000, u64::MAX - 3, carrick_guest_arch::USER_CEILING - 4] {
+        entry.msgsnd(queue, 7, &[1, 2, 3], 0).unwrap();
+        let (_, Some((index, kind, data))) =
+            entry.msgrcv(queue, UserVa::new(0x10000), 0, 0, 3).unwrap()
+        else {
+            panic!("message must be dequeued")
+        };
+        let mut bytes = kind.to_ne_bytes().to_vec();
+        bytes.extend_from_slice(&data);
+        let result = entry.complete_output(ipc::IpcOutput {
+            address: UserVa::new(address),
+            bytes,
+            offset: 0,
+            result: SyscallResult::new(3),
+            message: Some((queue, index, kind)),
+        });
+        assert!(matches!(result, LifecycleOutcome::Returned { result, .. } if result.raw() == -14));
+        let (_, Some((_, restored_kind, restored_data))) = entry
+            .msgrcv(queue, UserVa::new(0x10000), 0, ipc::IPC_NOWAIT, 3)
+            .unwrap()
+        else {
+            panic!("fault must restore message")
+        };
+        assert_eq!(restored_kind, 7);
+        assert_eq!(restored_data, [1, 2, 3]);
+    }
 }

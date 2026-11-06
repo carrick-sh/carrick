@@ -121,6 +121,14 @@ impl IpcOutput {
         }
     }
 
+    pub fn range(&self) -> Option<carrick_guest_arch::UserRange> {
+        carrick_guest_arch::UserRange::checked(
+            self.address,
+            carrick_guest_arch::GuestLen::new(self.bytes.len() as u64),
+        )
+        .filter(|range| range.in_lower_half())
+    }
+
     pub fn restore(&self, venue: &mut dyn ProcessIpcVenue) {
         if let Some((id, index, kind)) = self.message {
             let _ = venue.msgrcv_restore(id, index, kind, self.bytes[8..].to_vec());
@@ -131,6 +139,13 @@ impl IpcOutput {
 /// Copy only page-bounded pieces: a successful prefix belongs to this answer,
 /// and a refusal transfers its cursor to the memory owner's continuation.
 pub fn finish_output<'a>(native: &mut dyn IpcNative<'a>, mut output: IpcOutput) -> IpcOutcome {
+    if output.range().is_none() {
+        if let Some(venue) = native.process_ipc() {
+            output.restore(venue);
+        }
+        return ret_errno(LINUX_EFAULT);
+    }
+
     while output.offset < output.bytes.len() {
         let Some(address) = output.address.raw().checked_add(output.offset as u64) else {
             if let Some(venue) = native.process_ipc() {

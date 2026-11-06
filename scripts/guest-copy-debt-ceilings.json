@@ -56,5 +56,6 @@
   "error-collapse:crates/carrick-kernel/src/kernel/continuation/ipc.rs": 2,
   "error-collapse:crates/carrick-personality-linux/src/arch_prctl.rs": 2,
   "error-collapse:crates/carrick-x86/src/bringup_fns.rs": 6,
-  "error-collapse:crates/carrick-x86/src/engine.rs": 1
+  "error-collapse:crates/carrick-x86/src/engine.rs": 1,
+  "typed-collapse": 51
 }
