@@ -45,6 +45,7 @@ vm_free = [
   "carrick-mem::x86_initial_image::dynamic_x86_image_enters_interpreter_with_executable_auxv",
 ]
 embed = [
+  "carrick-vmm-kvm::cpl0_initial_mm::production_initial_image_spans_more_than_one_edit_table_budget",
   "KVM-only carrier fixture: carrick-vmm-kvm::cpl0_initial_mm::shared_guest_owner_loads_static_elf_and_exits_seven",
   "carrick-vmm-kvm::cpl0_initial_mm::production_enters_pt_interp_instead_of_executable_entry",
 ]
