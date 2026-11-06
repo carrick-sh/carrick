@@ -36,7 +36,7 @@ changing either live policy.
 
 [bindings]
 vm_free = [
-  "carrick-el1-linux::production_x86_family_absences_obey_eight_crossings_without_user_memory",
+  "carrick-el1-linux::production_x86_family_absences_obey_crossings_without_user_memory",
   "carrick-personality-linux::dispatch::service_owner_tests::service_owner_agrees_with_tsv_crossings_and_retains_wired_families",
   "carrick-personality-linux::dispatch::service_owner_tests::temporary_crossings_are_owed_to_ring",
   "carrick-el1-abi::tests::aperture_control_is_disjoint_from_service_copy_descriptors",
