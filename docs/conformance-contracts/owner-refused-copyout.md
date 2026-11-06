@@ -57,3 +57,11 @@ memory, not internal ownership contention. The structural invariant is no
 membership mutation or readiness consumption before copy admission. This
 injected-memory dispatcher fixture does not prove native-process parking,
 page-table supply or a signed ecosystem result; those remain higher gates.
+
+The MOD binding `epoll_ctl_mod_read_refusal_redispatches_before_replacing_mask`
+registers writable interest, then suspends once while reading replacement
+readable one-shot interest. Both ABI layouts must return the owner wait,
+redispatch MOD successfully and deliver only the new readable event once.
+The two live shared-MM kernel threads remain present throughout. This is a
+production dispatcher reduction; scheduler parking and physical backing
+supply still require the native and signed integration layers.

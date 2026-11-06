@@ -65,6 +65,7 @@ vm_free = [
   "carrick-kernel::dispatch::mem::delegated_tests::remap_file_pages_on_shared_mapping_wait_for_owner_refused_copyout_leaving_private_file_mappings_intact",
   "carrick-kernel::dispatch::mem::tests::remap_file_pages_and_mincore_wait_for_owner_refused_copyout_without_mutating_snapshots",
   "carrick-kernel::dispatch::mqueue::tests::{s5_mqueue_dispatch_refusal_preserves_message,s5_mqueue_completion_refusal_preserves_message,s5_mqueue_attributes_snapshot_input_and_refuse_before_mutation} (explicit-context completion with a stale wait clone, deadline copyin refusal, priority/payload admission together, zero-payload output and overlapping attribute input/output)",
+  "carrick-kernel::dispatch::net::epoll_ops::nested_epoll_readiness_tests::epoll_ctl_mod_read_refusal_redispatches_before_replacing_mask",
   "carrick-kernel::dispatch::net::epoll_ops::nested_epoll_readiness_tests::epoll_ctl_read_refusal_redispatches_before_add (two live shared-MM kernel threads, both wire layouts, read suspension before ADD, duplicate EEXIST, wait mask input and backing-supply refusal before exactly-once one-shot output)",
   "carrick-kernel::dispatch::net::epoll_ops::nested_epoll_readiness_tests::s1_empty_epoll_skips_owner_preparation",
   "carrick-kernel::dispatch::net::epoll_ops::nested_epoll_readiness_tests::s1_epoll_copyout_encodes_both_guest_layouts",
