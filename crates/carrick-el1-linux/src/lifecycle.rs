@@ -965,8 +965,8 @@ impl<
                     &mut self,
                     dst: carrick_guest_arch::UserVa,
                     src: &[u8],
-                ) -> carrick_core::personality::CopyOutcome {
-                    carrick_core::personality::CopyOutcome::from_completed(
+                ) -> carrick_core::user_copy::CopyOutcome {
+                    carrick_core::user_copy::CopyOutcome::from_completed(
                         self.0.copy_out(dst.raw(), src),
                     )
                 }
@@ -974,8 +974,8 @@ impl<
                     &mut self,
                     dst: &mut [u8],
                     src: carrick_guest_arch::UserVa,
-                ) -> carrick_core::personality::CopyOutcome {
-                    carrick_core::personality::CopyOutcome::from_completed(
+                ) -> carrick_core::user_copy::CopyOutcome {
+                    carrick_core::user_copy::CopyOutcome::from_completed(
                         self.0.copy_in(dst, src.raw()),
                     )
                 }
@@ -1018,8 +1018,8 @@ impl<T: crate::file::UserCopy> carrick_personality_linux::lifecycle::UserCopy fo
         &mut self,
         dst: carrick_guest_arch::UserVa,
         src: &[u8],
-    ) -> carrick_core::personality::CopyOutcome {
-        carrick_core::personality::CopyOutcome::from_completed(crate::file::UserCopy::copy_out(
+    ) -> carrick_core::user_copy::CopyOutcome {
+        carrick_core::user_copy::CopyOutcome::from_completed(crate::file::UserCopy::copy_out(
             &mut self.0,
             dst.raw(),
             src,
@@ -1030,8 +1030,8 @@ impl<T: crate::file::UserCopy> carrick_personality_linux::lifecycle::UserCopy fo
         &mut self,
         dst: &mut [u8],
         src: carrick_guest_arch::UserVa,
-    ) -> carrick_core::personality::CopyOutcome {
-        carrick_core::personality::CopyOutcome::from_completed(crate::file::UserCopy::copy_in(
+    ) -> carrick_core::user_copy::CopyOutcome {
+        carrick_core::user_copy::CopyOutcome::from_completed(crate::file::UserCopy::copy_in(
             &mut self.0,
             dst,
             src.raw(),

@@ -14,9 +14,8 @@ use carrick_abi::{
     LINUX_FUTEX_WAIT_BITSET, LINUX_FUTEX_WAITV_MAX, LINUX_FUTEX_WAKE, LINUX_FUTEX_WAKE_BITSET,
     LinuxFutexFlags, LinuxTimespec,
 };
-use carrick_core::personality::{
-    Access, CopyOutcome, GuestCopyRequest, GuestLen, UserCopy, UserVa,
-};
+use carrick_core::personality::{Access, GuestLen, UserVa};
+use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest, UserCopy};
 use carrick_guest_mem::CurrentMmMemory;
 
 use super::outcome::{DispatchOutcome, SharedFutexTarget};

@@ -13,18 +13,18 @@ struct Native {
     arm_frame: Option<arm::RtSigframe>,
 }
 impl UserCopy for Native {
-    fn copy_in(&mut self, _: &mut [u8], _: UserVa) -> carrick_core::personality::CopyOutcome {
-        carrick_core::personality::CopyOutcome::from_completed(false)
+    fn copy_in(&mut self, _: &mut [u8], _: UserVa) -> carrick_core::user_copy::CopyOutcome {
+        carrick_core::user_copy::CopyOutcome::from_completed(false)
     }
-    fn copy_out(&mut self, _: UserVa, _: &[u8]) -> carrick_core::personality::CopyOutcome {
-        carrick_core::personality::CopyOutcome::from_completed(false)
+    fn copy_out(&mut self, _: UserVa, _: &[u8]) -> carrick_core::user_copy::CopyOutcome {
+        carrick_core::user_copy::CopyOutcome::from_completed(false)
     }
 }
 impl<'a> SignalNative<'a> for Native {
     #[allow(clippy::panic)]
     fn wait_guest_copy(
         &mut self,
-        _: carrick_core::personality::GuestCopyRequest,
+        _: carrick_core::user_copy::GuestCopyRequest,
     ) -> carrick_personality_linux::signal::SignalOutcome {
         panic!("eager test venue cannot suspend guest memory")
     }

@@ -2742,7 +2742,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     fn prepare_owned_read(
         &mut self,
         mm: &Self::Mm,
-        request: carrick_core::personality::GuestCopyRequest,
+        request: carrick_core::user_copy::GuestCopyRequest,
     ) -> Result<(), NativeProcessError> {
         self.access_user_target(
             mm,

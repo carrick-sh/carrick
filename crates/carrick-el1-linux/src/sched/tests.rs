@@ -19,7 +19,7 @@ use std::boxed::Box;
 
 #[test]
 fn host_futex_fixture_accepts_aligned_pointers_outside_guest_va_range() {
-    use carrick_core::personality::CopyOutcome;
+    use carrick_core::user_copy::CopyOutcome;
 
     let host_pointer = UserVa::new(0xffff_0000_0000_0000);
     assert!(matches!(

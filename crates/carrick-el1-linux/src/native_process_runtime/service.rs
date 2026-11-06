@@ -791,7 +791,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     /// `EFAULT` from the copy rather than a user data-abort signal.
     pub(super) fn prepare_guest_input(
         &mut self,
-        request: carrick_core::personality::GuestCopyRequest,
+        request: carrick_core::user_copy::GuestCopyRequest,
     ) -> Result<LifecycleOutcome, NativeProcessError> {
         let mm = self
             .runtime

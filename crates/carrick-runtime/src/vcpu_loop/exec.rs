@@ -7287,7 +7287,7 @@ pub(crate) mod tests {
         impl ProcessNative<carrick_el1_abi::Aarch64ParkedContext> for Owner {
             fn wait_guest_copy(
                 &mut self,
-                _: carrick_core::personality::GuestCopyRequest,
+                _: carrick_core::user_copy::GuestCopyRequest,
             ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
                 panic!("eager test venue cannot suspend guest memory")
             }

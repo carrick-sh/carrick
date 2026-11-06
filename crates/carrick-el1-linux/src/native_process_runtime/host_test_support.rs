@@ -399,7 +399,7 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
     fn prepare_owned_read(
         &mut self,
         _: &Self::Mm,
-        request: carrick_core::personality::GuestCopyRequest,
+        request: carrick_core::user_copy::GuestCopyRequest,
     ) -> Result<(), NativeProcessError> {
         assert_eq!(request.access, carrick_guest_arch::Access::Read);
         self.prepare_copy_error.map_or(Ok(()), Err)
@@ -6138,7 +6138,7 @@ fn rehomed_signal_copy_service(input: bool) {
         )
         .unwrap();
     let outcome = if input {
-        entry.wait_guest_copy(carrick_core::personality::GuestCopyRequest {
+        entry.wait_guest_copy(carrick_core::user_copy::GuestCopyRequest {
             address: UserVa::new(0x10000),
             len: carrick_guest_arch::GuestLen::new(8),
             access: carrick_guest_arch::Access::Read,

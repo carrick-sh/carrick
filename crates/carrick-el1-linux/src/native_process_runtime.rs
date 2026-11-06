@@ -608,7 +608,7 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     fn prepare_owned_read(
         &mut self,
         _mm: &Self::Mm,
-        _request: carrick_core::personality::GuestCopyRequest,
+        _request: carrick_core::user_copy::GuestCopyRequest,
     ) -> Result<(), NativeProcessError> {
         Err(NativeProcessError::Unsupported)
     }
@@ -7523,7 +7523,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     }
     fn wait_guest_copy(
         &mut self,
-        request: carrick_core::personality::GuestCopyRequest,
+        request: carrick_core::user_copy::GuestCopyRequest,
     ) -> LifecycleOutcome {
         self.prepare_guest_input(request)
             .unwrap_or_else(|error| self.run_failed(error.run_failure_reason()))

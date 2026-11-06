@@ -409,7 +409,7 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
     }
 }
 
-pub use carrick_core::personality::{CopyOutcome, GuestCopyRequest, UserCopy};
+pub use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest, UserCopy};
 
 pub struct ChildContext {
     pub result: SyscallResult,
