@@ -628,7 +628,7 @@ pub fn handle_user_page_fault_prepared(
             residency,
             resolver: &mut prepared,
             roots: Some(roots),
-            file_slots: None,
+            file_slots: Some(portal),
         }),
         &mut cow,
     );
@@ -643,62 +643,17 @@ pub fn handle_user_page_fault_prepared(
     }
     use carrick_el1::fault::OwnerFaultSupplyOutcome;
     match supply.outcome() {
-        OwnerFaultSupplyOutcome::PolicyDeclined => {
-            let mut native_frame = NativeFrame {
-                r15: frame.saved_gprs[0],
-                r14: frame.saved_gprs[1],
-                r13: frame.saved_gprs[2],
-                r12: frame.saved_gprs[3],
-                rbp: frame.saved_gprs[4],
-                rbx: frame.saved_gprs[5],
-                r11: frame.rflags,
-                r10: frame.saved_gprs[7],
-                r9: frame.saved_gprs[8],
-                r8: frame.saved_gprs[9],
-                rax: frame.saved_gprs[10],
-                rcx: frame.rip,
-                rdx: frame.saved_gprs[12],
-                rsi: frame.saved_gprs[13],
-                rdi: frame.saved_gprs[14],
-                rsp: frame.rsp,
-                user_rcx: frame.saved_gprs[11],
-                user_r11: frame.saved_gprs[6],
-            };
-            let info = LinuxSiginfo {
-                si_signo: LINUX_SIGSEGV,
-                si_code: if fault.present {
-                    LINUX_SEGV_ACCERR
-                } else {
-                    LINUX_SEGV_MAPERR
-                },
-                si_addr: fault.address.raw(),
-                ..LinuxSiginfo::empty()
-            };
-            if !signal_user_return(&mut native_frame, fpstate, Some(info)) {
-                return 6;
-            }
-            frame.rip = native_frame.rcx;
-            frame.rflags = native_frame.r11;
-            frame.rsp = native_frame.rsp;
-            frame.saved_gprs = [
-                native_frame.r15,
-                native_frame.r14,
-                native_frame.r13,
-                native_frame.r12,
-                native_frame.rbp,
-                native_frame.rbx,
-                native_frame.user_r11,
-                native_frame.r10,
-                native_frame.r9,
-                native_frame.r8,
-                native_frame.rax,
-                native_frame.user_rcx,
-                native_frame.rdx,
-                native_frame.rsi,
-                native_frame.rdi,
-            ];
-            0
-        }
+        OwnerFaultSupplyOutcome::PolicyDeclined => deliver_page_fault_signal(
+            frame,
+            fpstate,
+            LINUX_SIGSEGV,
+            if fault.present {
+                LINUX_SEGV_ACCERR
+            } else {
+                LINUX_SEGV_MAPERR
+            },
+            fault.address,
+        ),
         // This lane has no native-service birth handle, so it cannot mint
         // an owner wait. Refuse any such mismatched outcome at the boundary.
         OwnerFaultSupplyOutcome::Wait(_) | OwnerFaultSupplyOutcome::Unavailable => 9,
@@ -725,7 +680,7 @@ pub fn handle_user_page_fault_prepared(
                     residency,
                     resolver: &mut prepared,
                     roots: Some(roots),
-                    file_slots: None,
+                    file_slots: Some(portal),
                 }),
                 &mut cow,
             );
@@ -747,6 +702,21 @@ pub fn handle_user_page_fault_prepared(
                 return 9;
             };
             let Some(window) = grant_slot.window() else {
+                // No physical backing for a still-authenticated file selection:
+                // EOF/truncation follows Linux backing-fault signal policy.
+                if let Some((generation, selected)) =
+                    grant_slot.pending_fault_selection(mm_key, fault.address.raw())
+                    && selected.host_backing.is_some()
+                    && grant_slot.cancel_fault_selection(selected, generation)
+                {
+                    return deliver_page_fault_signal(
+                        frame,
+                        fpstate,
+                        carrick_syscall_abi::LINUX_SIGBUS,
+                        carrick_syscall_abi::LINUX_BUS_ADRERR,
+                        fault.address,
+                    );
+                }
                 return 9;
             };
             let Some(index) = spaces.find(mm_key) else {
@@ -787,6 +757,65 @@ pub fn handle_user_page_fault_prepared(
             if applied { 0 } else { 9 }
         }
     }
+}
+
+fn deliver_page_fault_signal(
+    frame: &mut PageFaultStack,
+    fpstate: &XsaveArea,
+    signum: i32,
+    code: i32,
+    address: UserVa,
+) -> u64 {
+    let mut native_frame = NativeFrame {
+        r15: frame.saved_gprs[0],
+        r14: frame.saved_gprs[1],
+        r13: frame.saved_gprs[2],
+        r12: frame.saved_gprs[3],
+        rbp: frame.saved_gprs[4],
+        rbx: frame.saved_gprs[5],
+        r11: frame.rflags,
+        r10: frame.saved_gprs[7],
+        r9: frame.saved_gprs[8],
+        r8: frame.saved_gprs[9],
+        rax: frame.saved_gprs[10],
+        rcx: frame.rip,
+        rdx: frame.saved_gprs[12],
+        rsi: frame.saved_gprs[13],
+        rdi: frame.saved_gprs[14],
+        rsp: frame.rsp,
+        user_rcx: frame.saved_gprs[11],
+        user_r11: frame.saved_gprs[6],
+    };
+    let info = LinuxSiginfo {
+        si_signo: signum,
+        si_code: code,
+        si_addr: address.raw(),
+        ..LinuxSiginfo::empty()
+    };
+    if !signal_user_return(&mut native_frame, fpstate, Some(info)) {
+        return 6;
+    }
+    frame.rip = native_frame.rcx;
+    frame.rflags = native_frame.r11;
+    frame.rsp = native_frame.rsp;
+    frame.saved_gprs = [
+        native_frame.r15,
+        native_frame.r14,
+        native_frame.r13,
+        native_frame.r12,
+        native_frame.rbp,
+        native_frame.rbx,
+        native_frame.user_r11,
+        native_frame.r10,
+        native_frame.r9,
+        native_frame.r8,
+        native_frame.rax,
+        native_frame.user_rcx,
+        native_frame.rdx,
+        native_frame.rsi,
+        native_frame.rdi,
+    ];
+    0
 }
 
 #[derive(Default)]

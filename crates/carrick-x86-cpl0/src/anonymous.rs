@@ -47,6 +47,94 @@ impl<'a> X86AnonymousVenue<'a> {
     }
 }
 
+// MapPrivate stages no user bytes. Keep all validation and descriptor policy in
+// the shared host-file staging owner, rather than a second mmap decoder.
+struct MappingUser;
+impl carrick_personality_linux::native_host_file::HostFileUser for MappingUser {
+    fn copy_in(&mut self, _: &mut [u8], _: u64) -> bool {
+        false
+    }
+    fn writable(&mut self, _: u64, _: usize) -> usize {
+        0
+    }
+}
+
+impl X86AnonymousVenue<'_> {
+    fn source(
+        &self,
+        zone: &X86Cpl0Zone,
+    ) -> Result<Option<carrick_el1_abi::HostBackingIdentity>, SyscallResult> {
+        use carrick_personality_linux::native_host_file::{
+            self, HostFileCall, HostFileStage, NativeMapKey, NativeNamespace,
+        };
+        let Some(HostFileCall::MapPrivate(key)) = HostFileCall::decode(
+            carrick_syscall_abi::CanonicalNr::new(self.frame.canonical().raw()),
+            &self.frame.arguments(),
+        ) else {
+            return Ok(None);
+        };
+        let slot = self.frame.slot();
+        let venue = carrick_el1_linux::ipc::guest_venue(slot.index() as u32)
+            .ok_or(SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOSYS))?;
+        let table = carrick_el1_linux::ipc::native_table(&venue, self.task)
+            .ok_or(SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOSYS))?;
+        let mut resolve = |fd| carrick_el1_linux::ipc::native_descriptor(&venue, table, fd);
+        let mut releases = |out: &mut [carrick_core_abi::host_file::MapSourceReply]| {
+            let mut rows = [(core::num::NonZeroU64::MIN, core::num::NonZeroU64::MIN);
+                carrick_core_abi::host_file::MAX_MAP_RELEASES];
+            let limit = out.len().min(rows.len());
+            let count = carrick_el1::memory::take_native_source_releases(
+                self.task,
+                carrick_core::wait::space_access(zone, slot, initial_release),
+                shared_x86_cpl0_guest(),
+                slot.index() as u32,
+                &mut rows[..limit],
+            );
+            for (dst, (handle, generation)) in out.iter_mut().zip(&rows[..count]) {
+                *dst = carrick_core_abi::host_file::MapSourceReply {
+                    handle: *handle,
+                    generation: *generation,
+                };
+            }
+            count
+        };
+        let staged = native_host_file::stage(
+            HostFileCall::MapPrivate(key),
+            &mut NativeNamespace {
+                table,
+                resolve: &mut resolve,
+                releases: &mut releases,
+            },
+            &mut MappingUser,
+        );
+        match staged {
+            Some(HostFileStage::Request {
+                record,
+                map: Some(staged_key),
+                ..
+            }) if staged_key == NativeMapKey::of(&self.frame.arguments()) => {
+                let frame = carrick_el1::isa::x86::context::native::NativeFrame {
+                    rax: carrick_el1_abi::HostFileCrossing::NUMBER,
+                    rcx: carrick_el1_abi::HostFileCrossing::FRAME_TAG,
+                    rdi: record.as_ptr() as u64,
+                    rsi: record.len() as u64,
+                    ..Default::default()
+                };
+                carrick_x86_carrier::entry::forward_to_host(&frame);
+                native_host_file::map_source(&record).map(|reply| {
+                    Some(carrick_el1_abi::HostBackingIdentity::new(
+                        reply.handle,
+                        reply.generation,
+                        0,
+                    ))
+                })
+            }
+            Some(HostFileStage::Returned(result)) => Err(result),
+            _ => Err(SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOSYS)),
+        }
+    }
+}
+
 impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
     fn original_argument0(&self) -> u64 {
         self.frame.arguments()[0]
@@ -64,19 +152,26 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
         };
         // SAFETY: this CPU's binding retains its initialized atomic counters.
         let counters = unsafe { &*(binding.counters_address as *const carrick_el1_abi::Counters) };
-        match carrick_el1::memory::serve_delegated_anonymous(
+        let file = match self.source(zone) {
+            Ok(file) => file,
+            Err(result) => return DelegatedStep::Served(result),
+        };
+        match carrick_el1::memory::serve_delegated_mapping(
             &mut self.frame,
             counters,
             self.task,
             carrick_core::wait::space_access(zone, slot, initial_release),
             shared_x86_cpl0_guest(),
             &mut editor,
-            None,
+            file,
         ) {
             carrick_el1::memory::DelegatedAnonymous::Served => {
                 DelegatedStep::Served(SyscallResult::new(self.frame.result().0 as i64))
             }
             carrick_el1::memory::DelegatedAnonymous::NotDelegated => DelegatedStep::NotDelegated,
+            carrick_el1::memory::DelegatedAnonymous::Forward if file.is_some() => {
+                DelegatedStep::Served(SyscallResult::from_errno(carrick_syscall_abi::LINUX_ENOSYS))
+            }
             _ => DelegatedStep::Forward,
         }
     }

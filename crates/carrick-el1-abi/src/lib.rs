@@ -927,6 +927,15 @@ impl HostObjectWriteCrossing {
     pub const FRAME_TAG: u64 = 0x574f_424a_4543_5431;
 }
 
+/// Synchronous transport of the existing ring-owned host-file record.
+/// RDI is retained kernel storage, RSI its checked byte length. The carrier
+/// authenticates supervisor storage before parsing; user pointers confer no authority.
+pub struct HostFileCrossing;
+impl HostFileCrossing {
+    pub const NUMBER: u64 = 0x4341_5252_4846_494c;
+    pub const FRAME_TAG: u64 = 0x484f_5354_4649_4c45;
+}
+
 /// Last guest reference to one host object description. RDI carries the
 /// binding, RSI the description handle, RDX its incarnation.
 pub struct HostObjectReleaseCrossing;
@@ -3430,7 +3439,11 @@ pub fn ipc_table_map_host() -> Option<&'static ipc_tables::IpcTableMap> {
 #[cfg(target_os = "none")]
 pub fn ipc_table_map_guest() -> &'static ipc_tables::IpcTableMap {
     // SAFETY: the EL1 region is mapped for EL1's lifetime.
-    unsafe { &*((EL1_REGION_BASE + EL1_IPC_TABLE_MAP_OFFSET) as *const ipc_tables::IpcTableMap) }
+    #[cfg(target_arch = "aarch64")]
+    let base = EL1_REGION_BASE;
+    #[cfg(target_arch = "x86_64")]
+    let base = X86_CPL0_REGION_BASE;
+    unsafe { &*((base + EL1_IPC_TABLE_MAP_OFFSET) as *const ipc_tables::IpcTableMap) }
 }
 
 /// Host view of the shared metadata mailbox, if an EL1 region is installed.
