@@ -181,15 +181,9 @@ impl<
 > LifecycleNative<'a> for El1PendingFamilies<'a, F, C, U, G, Context>
 {
     fn wait_guest_copy(&mut self, request: GuestCopyRequest) -> LifecycleOutcome {
-        let deadline = self.frame.arm_frame_ref().and_then(|frame| {
-            (frame.x[1] & crate::sched::RETAINED_RELATIVE_DEADLINE != 0).then_some(frame.x[5])
-        });
         let venue = self.process_venue().unwrap_or_else(|| {
             super::dispatch::invalid_completion(super::dispatch::NativeInvariant::EntryBinding)
         });
-        if let Some(deadline) = deadline {
-            venue.retain_relative_futex_deadline(deadline);
-        }
         let mut outcome = venue.wait_guest_copy(request);
         if matches!(outcome, LifecycleOutcome::Redispatch) {
             let frame = self.frame.arm_frame().unwrap_or_else(|| {

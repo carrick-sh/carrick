@@ -174,7 +174,7 @@ pub(crate) fn dispatch_threaded_futex(
     memory: &mut impl CurrentMmMemory,
     reporter: &CompatReporter,
     futex: &crate::thread::FutexTable,
-    tid: crate::thread::ThreadId,
+    _tid: crate::thread::ThreadId,
     registry: &crate::thread::ThreadRegistry,
     hvpatch_linux_tid: Option<u32>,
     work_scope: Option<&carrick_observability::work_meter::WorkScope>,
@@ -221,25 +221,6 @@ pub(crate) fn dispatch_threaded_futex(
             errno: LINUX_EINVAL,
         };
     }
-    let relative_wait_timeout = if raw_command == LINUX_FUTEX_WAIT && timeout_address != 0 {
-        let timespec = match read_futex_timespec(memory, timeout_address) {
-            Ok(timespec) => timespec,
-            Err(outcome) => return outcome,
-        };
-        let requested = match duration_from_linux_timespec(timespec) {
-            Ok(duration) => duration.unwrap_or(Duration::ZERO),
-            Err(errno) => return DispatchOutcome::Errno { errno },
-        };
-        let signature = [address, timeout_address, u64::from(value), operation];
-        Some(clock.scale_timeout(futex.relative_wait_remaining(
-            tid,
-            signature,
-            clock.monotonic_now(),
-            requested,
-        )))
-    } else {
-        None
-    };
     // Only WAIT / CMP_REQUEUE / PI ops consult the futex VALUE; WAKE and plain
     // REQUEUE are keyed purely on the guest address (the parking-lot table keys
     // on the VA, which is identical across the shared guest address space). Real
@@ -263,17 +244,7 @@ pub(crate) fn dispatch_threaded_futex(
     let word = if needs_word {
         match read_futex_word(memory, address) {
             Ok(word) => word,
-            Err(refusal) => {
-                if !matches!(
-                    *refusal,
-                    DispatchOutcome::OwnerMemoryWait { .. }
-                        | DispatchOutcome::OwnerPhysicalWait { .. }
-                        | DispatchOutcome::OwnerMemorySupply { .. }
-                ) {
-                    futex.finish_relative_wait(tid);
-                }
-                return *refusal;
-            }
+            Err(refusal) => return *refusal,
         }
     } else {
         0
@@ -344,7 +315,7 @@ pub(crate) fn dispatch_threaded_futex(
     if shared_location.is_none()
         && let Some(queue) = queue.zone()
     {
-        let outcome = dispatch_zone_futex(
+        return dispatch_zone_futex(
             clock,
             request,
             memory,
@@ -353,17 +324,7 @@ pub(crate) fn dispatch_threaded_futex(
             futex_flags,
             word,
             queue,
-            relative_wait_timeout,
         );
-        if !matches!(
-            outcome,
-            DispatchOutcome::OwnerMemoryWait { .. }
-                | DispatchOutcome::OwnerPhysicalWait { .. }
-                | DispatchOutcome::OwnerMemorySupply { .. }
-        ) {
-            futex.finish_relative_wait(tid);
-        }
-        return outcome;
     }
 
     match command {
@@ -457,14 +418,13 @@ pub(crate) fn dispatch_threaded_futex(
                 word
             };
             if current != value {
-                futex.finish_relative_wait(tid);
                 return DispatchOutcome::Errno {
                     errno: LINUX_EAGAIN,
                 };
             }
             let timeout = if timeout_address == 0 {
                 None
-            } else if raw_command == LINUX_FUTEX_WAIT_BITSET {
+            } else {
                 let timespec = match read_futex_timespec(memory, timeout_address) {
                     Ok(t) => t,
                     Err(outcome) => return outcome,
@@ -473,26 +433,26 @@ pub(crate) fn dispatch_threaded_futex(
                 // ABSOLUTE deadline (CLOCK_MONOTONIC, or CLOCK_REALTIME if
                 // FUTEX_CLOCK_REALTIME) — convert it to the remaining duration,
                 // else the wait would block until now+deadline ≈ forever.
-                Some(relative_from_absolute_timespec(
-                    clock,
-                    timespec.tv_sec,
-                    timespec.tv_nsec,
-                    futex_flags.contains(LinuxFutexFlags::CLOCK_REALTIME),
-                ))
-            } else {
-                match relative_wait_timeout {
-                    Some(timeout) => Some(timeout),
-                    None => {
-                        let timespec = match read_futex_timespec(memory, timeout_address) {
-                            Ok(t) => t,
-                            Err(outcome) => return outcome,
-                        };
-                        match duration_from_linux_timespec(timespec) {
-                            Ok(timeout) => {
-                                Some(clock.scale_timeout(timeout.unwrap_or(Duration::ZERO)))
-                            }
-                            Err(errno) => return DispatchOutcome::Errno { errno },
-                        }
+                if raw_command == LINUX_FUTEX_WAIT_BITSET {
+                    Some(relative_from_absolute_timespec(
+                        clock,
+                        timespec.tv_sec,
+                        timespec.tv_nsec,
+                        futex_flags.contains(LinuxFutexFlags::CLOCK_REALTIME),
+                    ))
+                } else {
+                    // A present (non-NULL) relative timespec ALWAYS specifies a
+                    // deadline — even {0,0}, which means "expire IMMEDIATELY"
+                    // (ETIMEDOUT now), NOT "infinite". duration_from_linux_timespec
+                    // maps {0,0} to None ("no duration"); collapsing that to the
+                    // `timeout_address == 0` None (block forever) made the threaded
+                    // park (FutexWait) compute no deadline and spin forever on a
+                    // zero-timeout WAIT that Linux returns ETIMEDOUT from at once.
+                    // Force the zero case to a ZERO duration so the park deadline is
+                    // `now` and fires immediately (mirrors the proc.rs fix 519dd40f).
+                    match duration_from_linux_timespec(timespec) {
+                        Ok(t) => Some(clock.scale_timeout(t.unwrap_or(std::time::Duration::ZERO))),
+                        Err(errno) => return DispatchOutcome::Errno { errno },
                     }
                 }
             };
@@ -500,7 +460,6 @@ pub(crate) fn dispatch_threaded_futex(
                 // The shared path's compare-and-wait is atomic in the kernel
                 // (__ulock UL_COMPARE_AND_WAIT re-checks the word), so no
                 // generation snapshot is needed here.
-                futex.finish_relative_wait(tid);
                 return DispatchOutcome::SharedFutexWait {
                     target: SharedFutexTarget::new(location, location.waiter_key()),
                     generation: shared.table().prepare_wait(
@@ -524,25 +483,13 @@ pub(crate) fn dispatch_threaded_futex(
             let wait = futex.prepare_wait(address);
             match read_futex_word(memory, address) {
                 Ok(reread) if reread != value => {
-                    futex.finish_relative_wait(tid);
                     return DispatchOutcome::Errno {
                         errno: LINUX_EAGAIN,
                     };
                 }
                 Ok(_) => {}
-                Err(refusal) => {
-                    if !matches!(
-                        *refusal,
-                        DispatchOutcome::OwnerMemoryWait { .. }
-                            | DispatchOutcome::OwnerPhysicalWait { .. }
-                            | DispatchOutcome::OwnerMemorySupply { .. }
-                    ) {
-                        futex.finish_relative_wait(tid);
-                    }
-                    return *refusal;
-                }
+                Err(refusal) => return *refusal,
             }
-            futex.finish_relative_wait(tid);
             DispatchOutcome::FutexWait { wait, timeout }
         }
         LINUX_FUTEX_REQUEUE | LINUX_FUTEX_CMP_REQUEUE => {
@@ -631,7 +578,6 @@ pub(crate) fn dispatch_zone_futex(
     futex_flags: LinuxFutexFlags,
     word: u32,
     queue: crate::el1_zone::ZoneFutexQueue,
-    relative_wait_timeout: Option<Duration>,
 ) -> DispatchOutcome {
     let address = request.arg(0);
     let value = request.arg(2) as u32;
@@ -660,31 +606,22 @@ pub(crate) fn dispatch_zone_futex(
             }
             let timeout = if timeout_address == 0 {
                 None
-            } else if raw_command == LINUX_FUTEX_WAIT_BITSET {
+            } else {
                 let timespec = match read_futex_timespec(memory, timeout_address) {
                     Ok(t) => t,
                     Err(outcome) => return outcome,
                 };
-                Some(relative_from_absolute_timespec(
-                    clock,
-                    timespec.tv_sec,
-                    timespec.tv_nsec,
-                    futex_flags.contains(LinuxFutexFlags::CLOCK_REALTIME),
-                ))
-            } else {
-                match relative_wait_timeout {
-                    Some(timeout) => Some(timeout),
-                    None => {
-                        let timespec = match read_futex_timespec(memory, timeout_address) {
-                            Ok(t) => t,
-                            Err(outcome) => return outcome,
-                        };
-                        match duration_from_linux_timespec(timespec) {
-                            Ok(timeout) => {
-                                Some(clock.scale_timeout(timeout.unwrap_or(Duration::ZERO)))
-                            }
-                            Err(errno) => return DispatchOutcome::Errno { errno },
-                        }
+                if raw_command == LINUX_FUTEX_WAIT_BITSET {
+                    Some(relative_from_absolute_timespec(
+                        clock,
+                        timespec.tv_sec,
+                        timespec.tv_nsec,
+                        futex_flags.contains(LinuxFutexFlags::CLOCK_REALTIME),
+                    ))
+                } else {
+                    match duration_from_linux_timespec(timespec) {
+                        Ok(t) => Some(clock.scale_timeout(t.unwrap_or(Duration::ZERO))),
+                        Err(errno) => return DispatchOutcome::Errno { errno },
                     }
                 }
             };
