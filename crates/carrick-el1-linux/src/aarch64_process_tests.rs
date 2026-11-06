@@ -12197,7 +12197,7 @@ fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
             &mut service,
         )
         .unwrap();
-    let resumed = entry.resume_checkpoint().unwrap();
+    let resumed = entry.resume_checkpoint(|_| Ok(None)).unwrap();
     assert!(matches!(
         resumed,
         crate::native_process_runtime::NativeResume::RetrySyscall
