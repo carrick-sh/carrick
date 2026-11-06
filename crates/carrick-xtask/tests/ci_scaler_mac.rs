@@ -27,6 +27,7 @@ fn reset_job_area(
 #[test]
 fn serial_host_reset_cannot_mutate_home_while_an_earlier_helper_holds_lock() {
     let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let uid = unsafe { libc::geteuid() };
     let gid = unsafe { libc::getegid() };
     let skel = root.path().join("skel");
@@ -490,6 +491,35 @@ fn job_home_and_work_are_recreated_from_the_skeleton_before_every_job() {
     // A skeleton the runner account could write is refused.
     std::fs::set_permissions(&skel, std::fs::Permissions::from_mode(0o777)).unwrap();
     assert!(reset_job_area(&skel, &home, &[], uid, uid, gid).is_err());
+}
+
+#[test]
+fn failed_reset_can_be_repeated_in_place_without_privileged_paths() {
+    use std::os::unix::fs::MetadataExt;
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+    let skel = root.path().join("skel");
+    let home = root.path().join("home");
+    mkdir_mode(&skel, 0o755);
+    mkdir_mode(&home, 0o700);
+    let inode = std::fs::metadata(&home).unwrap().ino();
+    // Sorted copying writes a partial home before rejecting a special file.
+    write_skeleton_entry(skel.join("a-config"), "clean", 0o600);
+    let socket = std::os::unix::net::UnixListener::bind(skel.join("z-socket")).unwrap();
+    let error = reset_job_area(&skel, &home, &[], uid, uid, gid)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(home.to_str().unwrap()), "{error}");
+    assert_eq!(std::fs::read(home.join("a-config")).unwrap(), b"clean");
+    drop(socket);
+    std::fs::remove_file(skel.join("z-socket")).unwrap();
+    write_skeleton_entry(home.join("a-config"), "partial job data", 0o600);
+    reset_job_area(&skel, &home, &[], uid, uid, gid).unwrap();
+    assert_eq!(std::fs::metadata(&home).unwrap().ino(), inode);
+    assert_eq!(std::fs::read(home.join("a-config")).unwrap(), b"clean");
+    assert_eq!(std::fs::read_dir(&home).unwrap().count(), 1);
 }
 
 #[test]
