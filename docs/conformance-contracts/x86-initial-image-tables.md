@@ -38,9 +38,9 @@ its sparse rows add 3, 6 and 9 disjoint leaf-table prefixes and retain exact
 frame and table counts. The separate serial-host partitions contain no tests.
 
 The pulled `golang:1.23` amd64 executable has load regions spanning
-`0x400000..0xff8600`. Six leaf tables plus two directory tables and one
-PDPT table (including the independent 64 KiB stack at `0x7fff0000`) make
-nine user tables, exceeding the old first edit's eight-grant limit.
+`0x400000..0xff8600`. Six executable leaf tables plus one stack leaf table,
+two directory tables and one PDPT table (including the independent 64 KiB
+stack at `0x7fff0000`) make ten user tables, exceeding the old first edit's eight-grant limit.
 The root and three private copy-window tables are separate allocations.
 
 The release CLI now enters Go's runtime rather than refusing its initial MM.
