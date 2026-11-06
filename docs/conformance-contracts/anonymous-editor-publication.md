@@ -110,3 +110,28 @@ normal executor capacity. Releasing both acknowledgments must complete the
 original edit once, without replaying it. This schedule and its production
 continuation integration remain unimplemented; the existing tests do not
 establish this property.
+
+## What a red witness may conclude
+
+The remaining P1 is a missing completion witness, not a demonstrated failure
+of HVF's broadcast invalidation. `ThreadCpu::invalidate_asid` already requires
+all-PE completion. Its AArch64 implementation issues `DSB ISHST`,
+`TLBI ASIDE1IS`, `DSB ISH`, then `ISB`; the missing evidence concerns that
+sequence's effect on virtual CPUs running or entering through HVF.
+
+A VM-free editor that returns success after invalidating only its own modeled
+CPU cannot disprove this backend guarantee: it has substituted a weaker
+implementation. Likewise, an old per-slot coverage word after a broadcast is
+not evidence that the hardware translation survived. Do not make either
+assertion a red-first regression test for a guest-visible stale translation.
+The existing generation tests establish entry obligations only.
+
+There are two distinct admissible proof routes. A backend witness must retain
+the real hardware editor, warm a sibling translation, control the sibling's
+entry or continued user execution, and distinguish a denied access from a
+timeout or an incidental scheduler re-entry. An explicit rendezvous instead
+needs the production continuation schedule above, including delayed exact-MM
+acknowledgments and progress by an unrelated task. Its red assertion concerns
+premature syscall completion, not just a missing coverage counter. Neither
+route has been executed for the current head on the Linux dispatch runner;
+the signed population and core/event-ring acceptance remain outstanding.
