@@ -13,6 +13,7 @@ vm_free = [
   "carrick-kernel::dispatch::mem::delegated_tests::admitted_proc_executable_private_mmap_avoids_its_own_gate",
   "carrick-kernel::dispatch::mem::delegated_tests::{libpython_fixed_file_segments_use_owner_source_without_eager_copy,libpython_old_deferred_recipe_and_owner_copy_refusals,remap_file_pages_on_shared_mapping_wait_for_owner_refused_copyout_leaving_private_file_mappings_intact}; real file, production AddressSpace, root, deferred registry and bounded PREPARE admission. RED: eager file copy and premature predecessor retirement. Component reproduction: overlapping deferred file recipe -> InvalidRange -> whole-map owner copy exceeds 4096 -> ENOMEM lowering. Retirement classification: carrick-aarch64::descriptor_drain::retirement_tests::retirement_refusals_are_clean_only_before_any_chunk_commits. Signed branch confirmation remains open.",
   "carrick-kernel::dispatch::mem::tests::private_file_mmap_self_held_gate_is_an_invariant_only_with_custody",
+  "carrick-kernel::el1_delegation::tests::serial_host::published_private_mapping_waits_for_recall_before_source_read (production host-file service, IPC projection, in-flight recall and retained source bytes)",
   "carrick-kernel::dispatch::native_files::tests::{published_private_map_source_survives_host_close_without_a_publication_cycle,published_private_source_rechecks_eof_after_truncation}; production exported physical resource, mapping-only lifetime and live EOF revalidation",
 ]
 

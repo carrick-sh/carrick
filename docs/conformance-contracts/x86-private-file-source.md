@@ -140,3 +140,10 @@ errno 38 with 506 host-file crossings recorded, before the source-limit
 reply can be exercised. This is not evidence that the source cap aborts the
 carrier, and no cap pass is claimed. Owned admission and metadata suspension
 must be completed before this higher-population witness can reach the bound.
+
+`published_private_mapping_waits_for_recall_before_source_read` exercises the
+production host-file service with a published IPC projection while its
+original description has dirty delegated bytes. The writeback hook holds
+recall in flight; the source reply must wait for release. Reading the retained
+source then requires the new bytes and a zero-filled page tail. This witness
+passes on the rebased base layer without changing delegation policy.
