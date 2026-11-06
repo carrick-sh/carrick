@@ -2398,6 +2398,18 @@ impl<M: CurrentMmMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
     fn user_memory_venue(&self) -> carrick_guest_mem::UserMemoryVenue {
         self.mem.user_memory_venue()
     }
+    fn atomic_load_user_u32(&self, address: u64) -> Result<u32, MemoryError> {
+        self.mem.atomic_load_user_u32(address)
+    }
+    fn atomic_compare_exchange_user_u32(
+        &mut self,
+        address: u64,
+        expected: u32,
+        desired: u32,
+    ) -> Result<u32, MemoryError> {
+        self.mem
+            .atomic_compare_exchange_user_u32(address, expected, desired)
+    }
     fn prepare_write(
         &mut self,
         ranges: &[carrick_guest_mem::GuestWriteRange],
@@ -2692,6 +2704,27 @@ mod tests {
     }
 
     impl carrick_guest_mem::GuestMemory for RetryCompletionTrap {
+        fn atomic_load_user_u32(
+            &self,
+            address: u64,
+        ) -> Result<u32, carrick_guest_mem::MemoryError> {
+            let bytes = self.read_bytes_raw(address, 4)?;
+            Ok(u32::from_ne_bytes(bytes.try_into().unwrap()))
+        }
+
+        fn atomic_compare_exchange_user_u32(
+            &mut self,
+            address: u64,
+            expected: u32,
+            desired: u32,
+        ) -> Result<u32, carrick_guest_mem::MemoryError> {
+            let observed = self.atomic_load_user_u32(address)?;
+            if observed == expected {
+                self.write_bytes_raw(address, &desired.to_ne_bytes())?;
+            }
+            Ok(observed)
+        }
+
         fn read_bytes_raw(
             &self,
             address: u64,
@@ -2780,6 +2813,28 @@ mod tests {
             assert_eq!(view.enter_native_fault_signal().unwrap(), entry);
             assert_eq!(trap.native_fault_entries, 1);
         }
+    }
+
+    #[test]
+    fn split_view_preserves_atomic_user_copy_operations() {
+        let address = 0x4000;
+        let mut memory = RetryCompletionTrap::default();
+        memory
+            .write_bytes_raw(address, &7u32.to_ne_bytes())
+            .unwrap();
+        let mut trap = RetryCompletionTrap::default();
+        let mut view = SplitView {
+            mem: &mut memory,
+            trap: &mut trap,
+        };
+
+        assert_eq!(view.atomic_load_user_u32(address).unwrap(), 7);
+        assert_eq!(
+            view.atomic_compare_exchange_user_u32(address, 7, 11)
+                .unwrap(),
+            7
+        );
+        assert_eq!(view.atomic_load_user_u32(address).unwrap(), 11);
     }
 
     fn scripted_syscall(number: u64, args: [u64; 6]) -> carrick_hal::RawSyscall {
