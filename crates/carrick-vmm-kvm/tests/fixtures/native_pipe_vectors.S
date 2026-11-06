@@ -69,9 +69,9 @@ _start:
     mov $1, %eax
     mov $1, %edi
     lea success(%rip), %rsi
-    mov $17, %edx
+    mov $(success_end-success), %edx
     syscall
-    cmp $17, %rax
+    cmp $(success_end-success), %rax
     jne failure
     xor %edi, %edi
     jmp exit
@@ -102,6 +102,7 @@ first: .ascii "a"
 second: .ascii "bc"
 third: .ascii "def"
 success: .ascii "pipe-vectors=once\n"
+success_end:
 .bss
 .balign 4096
 pipe_fds: .skip 8
