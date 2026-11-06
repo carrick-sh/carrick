@@ -101,7 +101,9 @@ fn compile_dynamic_assembly(
 // production CLI boundary, without depending on a registry or libc startup.
 #[test]
 fn image_path_and_shebang_entrypoints_use_the_shared_resolver() {
-    assert!(std::path::Path::new("/dev/kvm").exists(), "requires KVM");
+    if skip_without_kvm() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let elf = dir.path().join("hello");
     compile_assembly("x86_entrypoint_argv.S", &elf);
