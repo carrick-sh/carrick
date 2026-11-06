@@ -565,6 +565,12 @@ Two consecutive outcomes naming the same blocker record a reactor wait and
 refuse another round. An owner message or intervening nonblocked outcome
 resets that sequence.
 
+Scope refusals are posted on the triggering thread. A trigger on an unowned
+PR reports `trigger requires an open issue and owned dispatch PR`; selecting
+a foreign branch reports `branch is not derived from this issue's run`.
+Both direct the caller to trigger on the issue and base its run branch on
+that PR's head. Refusal does not grant authority to the requested branch.
+
 ## Policy tools and budgets
 
 The loop runs Gemini Flash via `agy --model high`. It calls

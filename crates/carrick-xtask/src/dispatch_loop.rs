@@ -2761,6 +2761,12 @@ impl Server<'_> {
         if self.used.workers != 0 || self.used.publishes != 0 {
             return Err(ScalerError::Guard("select branch before invoking workers"));
         }
+        if let Err(error) = branch_run(self.dispatch.issue, branch) {
+            // A tool refusal otherwise stays private to the coordinator.
+            // Keep the admitted destination and show the director how to resume.
+            self.post(&format!("Dispatch refused: {error}"))?;
+            return Err(error);
+        }
         let fresh = format!("work/dispatch-{}-{}", self.dispatch.issue, run_id()?);
         let target = if branch == fresh
             && branch_prs(self.root, branch, "all")?
@@ -4589,6 +4595,31 @@ mod tests {
             );
         });
     }
+    #[test]
+    fn foreign_branch_refusal_is_posted_with_recovery() {
+        shared_fixture(|root| {
+            let mut s = server(root);
+            s.dispatch.review = false;
+            let original = s.dispatch.branch.clone();
+            let error = s
+                .execute(Request::SelectBranch(Branch {
+                    branch: "work/director-pr".into(),
+                }))
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("branch is not derived from this issue's run")
+            );
+            let posted = regular_text(&root.join("posted.md")).unwrap();
+            assert!(posted.contains("branch is not derived from this issue's run"));
+            assert!(posted.contains("trigger on the issue"));
+            assert!(posted.contains("base the run branch on that PR's head"));
+            assert_eq!(s.dispatch.branch, original);
+            assert_eq!(s.used.workers, 0);
+        });
+    }
+
     #[test]
     fn rev3_comment_tool_cannot_forge_an_outcome() {
         shared_fixture(|root| {
