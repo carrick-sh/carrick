@@ -3651,6 +3651,8 @@ pub(crate) mod tests {
         }
     }
 
+    type AtomicWordLoad = Box<dyn Fn(u64) -> Result<u32, carrick_guest_mem::MemoryError> + Send>;
+
     #[derive(Default)]
     pub(crate) struct CrashCaptureTestEngine {
         pub(crate) next_syscall: Option<carrick_hal::RawSyscall>,
@@ -3673,7 +3675,7 @@ pub(crate) mod tests {
         pub(crate) guest_memory: std::collections::BTreeMap<u64, Vec<u8>>,
         pub(crate) read_tracker: Option<CrashReadTracker>,
         pub(crate) fail_read_at: Option<u64>,
-        pub(crate) atomic_word: Option<Box<dyn Fn(u64) -> Result<u32, carrick_guest_mem::MemoryError> + Send>>,
+        pub(crate) atomic_word: Option<AtomicWordLoad>,
         pub(crate) fail_execve_into: Option<String>,
         pub(crate) terminal_continuation_discards: usize,
         pub(crate) mailbox_slot: Option<usize>,
