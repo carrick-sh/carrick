@@ -229,11 +229,9 @@ impl<U: UserWord> carrick_core::personality::UserCopy for FutexCopy<'_, U> {
         }
         match self.user.read_u32(self.task, address.raw()) {
             Some(word) => {
-                #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-                // SAFETY: acquire ordering after the guarded unprivileged load.
-                unsafe {
-                    core::arch::asm!("dmb ishld", options(nostack, preserves_flags));
-                }
+                // Acquire ordering after the guarded unprivileged load; lowers to
+                // `dmb ishld` on aarch64 without unreviewed inline assembly.
+                core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
                 *value = word;
                 CopyOutcome::Done
             }
