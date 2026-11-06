@@ -1011,9 +1011,25 @@ fn production_large_initialized_elf_boots_without_per_page_table_stock() {
     let plan = prepare_x86_elf(&program).expect("large image");
     let extent = Cpl0Carrier::initial_extent_bytes_for(&plan, &[], &[])
         .expect("dense image must fit the unchanged carrier aperture");
-    assert!(extent < 256 * 1024 * 1024, "table stock must follow topology");
+    assert!(
+        extent < 256 * 1024 * 1024,
+        "table stock must follow topology"
+    );
     let outcome = run_pool_fixture(&elf, 8);
     assert_eq!(outcome.run.exit_code, 7);
+}
+
+#[test]
+fn production_large_initialized_elf_retains_first_fork_table_capacity() {
+    let elf = native_exit_fixture("large_initial_fork.S");
+    let outcome = run_pool_fixture(&elf, 32);
+    assert_eq!(
+        outcome.run.exit_code,
+        7,
+        "fork refusal {:?}; stock {:?}",
+        outcome.physical.fork_admission_refusal(),
+        outcome.physical.fork_stock_counters()
+    );
 }
 
 fn write_then_exit_elf(pointer: u64, count: u32) -> Vec<u8> {

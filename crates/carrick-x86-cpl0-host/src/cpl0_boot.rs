@@ -112,28 +112,43 @@ const _: () = {
 };
 pub const USER_CODE: u64 = 0x1_0000;
 pub use carrick_x86::cpl0_entry::DIRECT_VA;
-// Startup stocks one initial MM and its first fork child's private COW branch.
-// Later population admission remains bounded by actual available table grants.
-const fn initial_copy_branch_table_credits() -> usize {
-    2 * carrick_mmu_core::x86::copy_window::COW_COPY_TABLE_PAGES
-}
 /// The carrier's maintenance root is one dedicated initial table grant. It
 /// is counted on top of the copy-branch credits so taking it never shrinks
 /// the fork table stock the first fork was sized against.
 pub const MAINTENANCE_ROOT_TABLE_CREDITS: usize = 1;
-const fn initial_carrier_table_credits() -> usize {
-    initial_copy_branch_table_credits() + MAINTENANCE_ROOT_TABLE_CREDITS
-}
-/// Initial table grants for `data_pages` user pages: the initial MM's worst
-/// case (three tables per page plus its root) and the carrier credits.
-pub const fn initial_table_grant_count(data_pages: usize) -> Option<usize> {
-    let Some(tables) = data_pages.checked_mul(3) else {
-        return None;
-    };
-    let Some(tables) = tables.checked_add(1) else {
-        return None;
-    };
-    tables.checked_add(initial_carrier_table_credits())
+/// Grant actual user table paths for the initial MM and admitted child slots,
+/// including their roots. Dense leaves share paths; reserving three frames
+/// per leaf makes executable size consume fictitious page-table capacity.
+pub fn initial_table_grant_count(
+    image: &carrick_mem::x86_initial_image::X86InitialImage<'_>,
+) -> Option<usize> {
+    use carrick_guest_arch::{GuestLen, UserRange, UserVa};
+    let mut ranges = image
+        .regions
+        .iter()
+        .map(|region| {
+            UserRange::checked(
+                UserVa::new(region.start),
+                GuestLen::new(region.end.checked_sub(region.start)?),
+            )
+        })
+        .collect::<Option<Vec<_>>>()?;
+    ranges.push(UserRange::checked(
+        UserVa::new(INITIAL_STACK_TOP.checked_sub(INITIAL_STACK_SIZE)?),
+        GuestLen::new(INITIAL_STACK_SIZE),
+    )?);
+    let paths = carrick_el1::isa::x86_initial_mm::initial_user_table_count(ranges).ok()?;
+    let initial = paths.checked_add(1)?;
+    // Fork admission lends a nonempty parent scratch run even when there are
+    // no block leaves to split. Each lifecycle slot needs a complete child
+    // hierarchy and private copy branch; unused loans return to this stock.
+    let child = initial
+        .checked_add(carrick_mmu_core::x86::copy_window::COW_COPY_TABLE_PAGES)?
+        .checked_add(1)?;
+    initial
+        .checked_add(child.checked_mul(FORK_LIFECYCLE_SLOTS as usize)?)?
+        .checked_add(carrick_mmu_core::x86::copy_window::COW_COPY_TABLE_PAGES)?
+        .checked_add(MAINTENANCE_ROOT_TABLE_CREDITS)
 }
 
 /// Fixed physical base of the initial GDT (0x50_0000), immediately following the

@@ -329,8 +329,13 @@ impl Cpl0Carrier {
         let user_pages = image_pages
             .checked_add(initial_stack_pages(image, argv, env)?)
             .ok_or_else(|| fail("initial user pages"))?;
-        let table_pages = initial_table_grant_count(user_pages)
-            .ok_or_else(|| fail("initial table grant count"))?;
+        // This loader still owns resident data grants for the entire image.
+        // Reject impossible populations before walking their table geometry.
+        if user_pages > MAX_BYTES / PAGE {
+            return Err(fail("initial image exceeds carrier memory budget"));
+        }
+        let table_pages =
+            initial_table_grant_count(image).ok_or_else(|| fail("initial table grant count"))?;
         let grants = table_pages
             .checked_add(user_pages)
             .ok_or_else(|| fail("initial grant count"))?;
@@ -862,7 +867,7 @@ impl Cpl0Carrier {
             .checked_add(initial_stack_pages(image, argv, env)?)
             .ok_or_else(|| fail("initial data grants"))?;
         let table_grants =
-            initial_table_grant_count(data_grants).ok_or_else(|| fail("initial table grants"))?;
+            initial_table_grant_count(image).ok_or_else(|| fail("initial table grants"))?;
         let grant_count = table_grants
             .checked_add(data_grants)
             .ok_or_else(|| fail("initial grants"))?;

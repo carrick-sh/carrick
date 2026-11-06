@@ -2117,19 +2117,37 @@ mod custody_tests {
         );
     }
 
-    /// The real carrier boot stock, in the worst case the credits are sized for
-    /// (the initial MM used its whole worst-case tables and its own COW
-    /// branch), still serves the first fork's COW branch after the
-    /// maintenance root is taken. Without the dedicated credit this loan
-    /// was refused for capacity.
+    /// Topology-sized carrier stock retains the first fork's COW branch after
+    /// the initial MM and maintenance root have consumed their grants. This
+    /// isolates the branch credits; the large-image KVM witness exercises the
+    /// complete first fork hierarchy.
     #[test]
     fn real_boot_stock_serves_the_first_fork_after_the_maintenance_root() {
         use carrick_el1_abi::{
             ForkStockExchange, ForkStockRequest, PortalOperation, ReservationGeneration,
         };
         use carrick_hal::fork_stock::{ForkStock, UntaggedRoots};
-        let data_pages = 2;
-        let table_grants = super::initial_table_grant_count(data_pages).unwrap();
+        let image = carrick_mem::x86_initial_image::X86InitialImage {
+            entry: 0x400000,
+            executable_entry: 0x400000,
+            interpreter_base: 0,
+            phdr: 0x400040,
+            phent: 56,
+            phnum: 1,
+            regions: vec![carrick_mem::x86_initial_image::X86InitialRegion {
+                start: 0x400000,
+                end: 0x402000,
+                initialized_offset: 0,
+                file_bytes: &[],
+                perms: carrick_mem::elf::SegmentPerms {
+                    read: true,
+                    write: false,
+                    execute: true,
+                },
+            }],
+            executable_region_count: 1,
+        };
+        let table_grants = super::initial_table_grant_count(&image).unwrap();
         let first_fork_branch = carrick_mmu_core::x86::copy_window::COW_COPY_TABLE_PAGES;
         let used = table_grants - first_fork_branch - super::MAINTENANCE_ROOT_TABLE_CREDITS;
         let frame_offset = 0x3000;

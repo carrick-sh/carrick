@@ -345,6 +345,37 @@ fn checked_region(region: &MappedRegion<'_>) -> Result<u64, InitialMmError> {
     Ok(end)
 }
 
+/// Count the unique lower-half table paths required by these page-aligned
+/// spans, excluding the root and private supervisor copy branch. Both the
+/// carrier's physical grants and the guest editor use this geometry authority.
+/// Work follows table buckets, rather than individual 4 KiB leaves.
+pub fn initial_user_table_count(
+    ranges: impl IntoIterator<Item = UserRange>,
+) -> Result<usize, InitialMmError> {
+    let mut pml4 = BTreeSet::new();
+    let mut pdpt = BTreeSet::new();
+    let mut pd = BTreeSet::new();
+    for range in ranges {
+        let start = range.start().raw();
+        let end = start + range.len().raw();
+        if start < PAGE
+            || start & (PAGE - 1) != 0
+            || range.is_empty()
+            || range.len().raw() & (PAGE - 1) != 0
+            || end > USER_END
+        {
+            return Err(InitialMmError::InvalidRange);
+        }
+        pml4.extend((start >> 39)..=((end - 1) >> 39));
+        pdpt.extend((start >> 30)..=((end - 1) >> 30));
+        pd.extend((start >> 21)..=((end - 1) >> 21));
+    }
+    pml4.len()
+        .checked_add(pdpt.len())
+        .and_then(|total| total.checked_add(pd.len()))
+        .ok_or(InitialMmError::InvalidRange)
+}
+
 /// Build a fresh x86 address space under the closed exact-MM editor.
 ///
 /// # Safety
@@ -571,6 +602,34 @@ mod tests {
     use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
     use carrick_mmu_core::x86::descriptor_txn::{Access, translate_leaf};
     use std::{boxed::Box, collections::BTreeMap, sync::Mutex};
+
+    #[test]
+    fn initial_table_geometry_counts_shared_buckets_and_boundaries() {
+        let span = |start, len| UserRange::checked(UserVa::new(start), GuestLen::new(len)).unwrap();
+        for mib in [1, 10, 100] {
+            let bytes = mib * 1024 * 1024;
+            assert_eq!(
+                initial_user_table_count([span(0x400000, bytes)]).unwrap(),
+                2 + bytes.div_ceil(1 << 21) as usize
+            );
+        }
+        assert_eq!(
+            initial_user_table_count([span(0x400000, PAGE), span(0x401000, PAGE),]).unwrap(),
+            3,
+            "disjoint leaves can share every table"
+        );
+        for shift in [21, 30, 39] {
+            let boundary = 1 << shift;
+            assert_eq!(
+                initial_user_table_count([span(boundary - PAGE, 2 * PAGE)]).unwrap(),
+                3 + (shift - 21) as usize / 9 + 1
+            );
+        }
+        assert_eq!(
+            initial_user_table_count([span(PAGE, USER_END)]),
+            Err(InitialMmError::InvalidRange)
+        );
+    }
 
     struct TestWords(Mutex<BTreeMap<u64, u64>>);
     impl TestWords {
