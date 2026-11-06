@@ -446,6 +446,13 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
                     owned,
                 )
             },
+            &|effects| {
+                crate::sched::object_wait::deliver_wake_effects(
+                    self.zone,
+                    SlotId::from_index(0).unwrap(),
+                    effects,
+                )
+            },
         )
     }
     fn signal_deadline(
@@ -5246,6 +5253,9 @@ fn retained_ipc_supply(
             release,
             Some((fixture.zone, fixture.slot)),
             fixture.task,
+            &|effects| {
+                crate::sched::object_wait::deliver_wake_effects(fixture.zone, fixture.slot, effects)
+            },
         )
         .unwrap();
     } else {
