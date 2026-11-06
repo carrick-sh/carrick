@@ -208,6 +208,9 @@ fn run_once_state_is_one_use_and_bound_to_the_vetted_run() {
 /// the umask `sudo` happened to pass down (a developer's 0007 gave 0640).
 #[test]
 fn serial_host_run_once_state_modes_do_not_depend_on_the_callers_umask() {
+    if !isolated_umask_case("serial_host_run_once_state_modes_do_not_depend_on_the_callers_umask") {
+        return;
+    }
     for mask in [0o000, 0o007, 0o027, 0o077, 0o277] {
         let _umask = UmaskGuard::new(mask);
         let (root, exe, uid) = fixture();
@@ -463,12 +466,36 @@ fn reset_never_writes_through_a_symlink_planted_in_the_job_home() {
     assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1);
 }
 
+// Umask is process-wide. A mutex between the two mutators would still expose
+// unrelated filesystem tests to their temporary masks. Re-exec exactly one case
+// instead, so even an unpartitioned parallel libtest run is safe.
+fn isolated_umask_case(name: &str) -> bool {
+    const CHILD: &str = "CARRICK_XTASK_UMASK_CASE";
+    if std::env::var(CHILD).as_deref() == Ok(name) {
+        return true;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env(CHILD, name)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+        "isolated umask case {name}: {}\n{stdout}\n{stderr}",
+        output.status
+    );
+    false
+}
+
 struct UmaskGuard {
     prev: libc::mode_t,
 }
 
 impl UmaskGuard {
     fn new(mask: libc::mode_t) -> Self {
+        assert!(std::env::var_os("CARRICK_XTASK_UMASK_CASE").is_some());
         let prev = unsafe { libc::umask(mask) };
         Self { prev }
     }
@@ -484,6 +511,11 @@ impl Drop for UmaskGuard {
 
 #[test]
 fn serial_host_runner_tree_and_skeleton_reset_succeed_under_group_writable_umask() {
+    if !isolated_umask_case(
+        "serial_host_runner_tree_and_skeleton_reset_succeed_under_group_writable_umask",
+    ) {
+        return;
+    }
     for mask in [0o002, 0o022] {
         let _umask = UmaskGuard::new(mask);
         let root = tempfile::tempdir().unwrap();

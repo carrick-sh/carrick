@@ -23,3 +23,16 @@ verdict was counted, rather than inferring execution from a zero exit code.
 This reproduces the process-state dependence without macOS, a guest, deliberate
 host load, retries, sleeps or a timeout change. Raw per-run logs and the counted
 population are retained by the worker under `/var/tmp/1682-evidence`.
+
+## Isolation and verification
+
+Both umask cases now re-execute their exact test name in a child process.
+Only the child changes umask, and it runs no sibling cases. The parent checks
+both the child exit status and the one-test pass summary, preventing an empty
+selection from masquerading as success. Other tests remain parallel; no retry,
+sleep, larger timeout or global serialization was added.
+
+With this change, the same 50 exact runs and 50 complete integration runs
+with 16 threads all passed (100 target passes). The ordinary parallel partition
+and the `RUST_TEST_THREADS=1` serial-host partition also passed separately.
+This is Linux evidence for the reproduced race, not a claim of macOS execution.
