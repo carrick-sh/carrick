@@ -25,3 +25,16 @@ The real KVM acceptance is a dynamically linked `/bin/echo ok` and glibc
 `/usr/local/bin/python3 -c pass`, using the same image and rebuilt release
 artifact before and after the fix. A passing routing test alone does not prove
 those workload results or change the conformance scoreboard.
+
+Live verification exposed another loader prerequisite: native `fstat` and
+`newfstatat` lacked private-ABI entries at ring admission. The existing host
+handlers already write the x86 144-byte stat layout. The shared table now
+resolves those native numbers to their existing private identities, and the
+single crossing declaration admits those aliases only on x86. It does not
+admit the ARM-layout canonical stat calls on x86 or private IDs on ARM.
+
+The resulting KVM run still does not satisfy workload acceptance. Echo reaches
+library mapping and fails there: its complete refusal census contains two
+native `mmap` (9) refusals. The requested loader calls have zero refusals.
+Python still exits 127. This is evidence of a remaining file-backed mapping
+crossing gap, not a passing ecosystem row; no scoreboard baseline is updated.

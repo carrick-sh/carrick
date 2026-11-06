@@ -72,6 +72,14 @@ const fn direct(number: u64, name: &'static str, canonical: u64) -> X8664Syscall
     }
 }
 
+const fn private(number: u64, name: &'static str, canonical: u64) -> X8664Syscall {
+    X8664Syscall {
+        number,
+        name,
+        remap: SyscallRemap::Private(crate::CanonicalNr(canonical)),
+    }
+}
+
 const fn native(number: u64, name: &'static str) -> X8664Syscall {
     X8664Syscall {
         number,
@@ -137,6 +145,7 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // to a private dispatcher shim that writes LinuxX8664Stat.
     // x86_64=5 fstat: LEGACY. Normalized in x8664_arch::normalize_syscall to a
     // private dispatcher shim that writes LinuxX8664Stat.
+    private(5, "fstat", crate::CARRICK_PRIVATE_X86_FSTAT),
     // x86_64=6 lstat: LEGACY. Normalized in x8664_arch::normalize_syscall to a
     // private dispatcher shim that writes LinuxX8664Stat with AT_SYMLINK_NOFOLLOW.
     // x86_64=7 (syscalls(2)/filippo) → canonical ppoll=73.
@@ -659,6 +668,7 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // x86_64=262 newfstatat: same argument shape as canonical newfstatat=79,
     // but it writes x86_64's 144-byte struct stat layout. Normalized in
     // x8664_arch::normalize_syscall to a private dispatcher shim.
+    private(262, "newfstatat", crate::CARRICK_PRIVATE_X86_NEWFSTATAT),
     // x86_64=263 unlinkat → canonical unlinkat=35 (SAME name+shape)
     direct(263, "unlinkat", 35),
     // x86_64=264 renameat → canonical renameat=38 (SAME name+shape)
