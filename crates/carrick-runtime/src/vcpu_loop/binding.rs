@@ -490,6 +490,10 @@ pub(crate) fn registration_wake_callback(
 }
 
 impl HvpatchProductionPhase {
+    /// Process-terminal and exec-drain owners only. Member thread exits
+    /// (`RetainedMemoryAction::ThreadExit` and `Self::RetryThreadExit`) stay
+    /// false so a peer's process or exec drain can overtake and settle them as
+    /// losing members without triggering the terminal-owner `carrick_fatal!`.
     pub(super) fn is_terminal_transition(&self) -> bool {
         if let Self::ResumeRetainedOwner { action }
         | Self::ResumeRetainedPhysical { action, .. }
@@ -513,7 +517,8 @@ impl HvpatchProductionPhase {
         match self {
             Self::TerminalProcessDrain { .. }
             | Self::TerminalClaimRetry { .. }
-            | Self::TerminalRetireRetry { .. } => true,
+            | Self::TerminalRetireRetry { .. }
+            | Self::RetryThreadExit { .. } => true,
             Self::ResumeRetainedOwner { action }
             | Self::ResumeRetainedPhysical { action, .. }
             | Self::RetainedMemoryRetry { action } => matches!(
@@ -8127,6 +8132,396 @@ mod tests {
         scheduler.close();
     }
 
+    /// #1709: native `exit_group` cancels a sibling (`host_exit_requested` +
+    /// `caller_reserved`) before crossing `NativeRootExit`, so
+    /// `kernel.process_exiting()` is still false on the host. When an
+    /// in-flight task reservation (`reserve_fork`) makes `exit_exact_thread`
+    /// return `TaskBusy`, `settle_persistent_thread_exit` parks the sibling in
+    /// `HvpatchProductionPhase::RetryThreadExit` over the maintenance root
+    /// left by EL1's `leave_space`. That phase must materialize terminal CPU
+    /// state from its `Stage1MmLease`, then finish `ThreadDone` once the
+    /// reservation drops.
+    #[test]
+    fn retry_thread_exit_terminal_save_keeps_process_translation() {
+        use carrick_core::terminal::{Live, Process, RetirementVerdict, TerminalCustody};
+        use carrick_guest_arch::{
+            AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa,
+        };
+        use executor::TaskBindingResolver;
+        use std::num::NonZeroU64;
+
+        struct NeverPolled;
+        impl continuation::PersistentQuantumJob for NeverPolled {
+            fn poll_quantum_with_engine(
+                &mut self,
+                _: &mut dyn std::any::Any,
+                _: &mut executor::HvpatchQuantumControl<'_, '_>,
+            ) -> executor::ExecutorExit {
+                unreachable!()
+            }
+        }
+
+        let dispatcher = SyscallDispatcher::new();
+        let (runtime, scheduler, kernel, root, process, generation) =
+            test_carrier_graph_with_dispatcher!(72_468, dispatcher);
+        root.thread().set_affinity(carrick_hal::CpuAffinity::all(1));
+        let sibling = root
+            .kernel()
+            .reserve_thread_clone(
+                &root,
+                carrick_kernel::kernel::ClonePlan::from_flags(
+                    carrick_abi::LinuxCloneFlags::THREAD
+                        | carrick_abi::LinuxCloneFlags::SIGHAND
+                        | carrick_abi::LinuxCloneFlags::VM,
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap()
+            .prepare(ThreadId::synthetic_for_tests(72_469))
+            .unwrap()
+            .commit()
+            .unwrap()
+            .start_thread()
+            .unwrap()
+            .into_context();
+
+        let directory = runtime.persistent_bindings();
+        let authority = directory
+            .take_submission_authority(root.thread().key(), generation)
+            .unwrap();
+        let mut cpu = executor::tests::task_state(&sibling, 468);
+        cpu.asid_generation = process.asid_generation();
+        let carrick_hal::threaded::GuestCpuState::Aarch64V1(registers) = &mut cpu.cpu else {
+            unreachable!()
+        };
+        Arc::make_mut(registers).asid_generation = process.asid_generation();
+        let sibling_generation = sibling
+            .thread()
+            .publish_initial_task_state(cpu.clone())
+            .unwrap();
+        let sibling_binding = executor::tests::hvpatch_test_binding(&sibling, &cpu, 468);
+        let dormant = directory
+            .prepare_submission(
+                &scheduler,
+                executor::TaskSubmissionShape::SameTaskSibling {
+                    grant: (root.thread().key(), generation),
+                },
+                Some(&authority),
+                Arc::clone(sibling.thread()),
+                sibling_generation,
+                Arc::clone(&sibling_binding),
+            )
+            .unwrap();
+        executor::tests::activate_hvpatch_test_submission(
+            dormant,
+            &scheduler,
+            &sibling,
+            &cpu,
+            sibling_generation,
+            &sibling_binding,
+        );
+        let registration = scheduler
+            .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
+            .unwrap();
+        let leader = scheduler.take(&registration).unwrap();
+        assert_eq!(leader.thread().key(), root.thread().key());
+        scheduler
+            .settle_blocked(
+                leader,
+                carrick_kernel::kernel::objects::BlockedReason::HostWait,
+            )
+            .unwrap();
+        let mut running = scheduler.take(&registration).unwrap();
+        assert_eq!(running.thread().key(), sibling.thread().key());
+
+        // Hold an exclusive task-graph reservation so nonfinal thread
+        // retirement returns `TaskBusy` while `process_exiting()` is false.
+        let reserved_fork =
+            root.kernel()
+                .reserve_fork(
+                    &root,
+                    carrick_kernel::kernel::ClonePlan::from_flags(
+                        carrick_abi::LinuxCloneFlags::empty(),
+                    )
+                    .unwrap(),
+                    "in-flight fork".to_owned(),
+                    None,
+                )
+                .unwrap();
+
+        let page = root.lifecycle_page();
+        let member = sibling.thread().control_slot();
+        let birth = member.host_birth_identity().unwrap();
+        let closing = TerminalCustody::<Process, Live>::begin_exit(
+            TerminalCustody::<Process, Live>::close_admission(&*page),
+            root.task().key(),
+            AddressContext {
+                root: RootGpa::page_aligned(FrameGpa::new(0x10000)).unwrap(),
+                mm: MmGeneration::new(NonZeroU64::new(root.shared().mm().id().raw()).unwrap()),
+                generation: ContextGeneration::new(NonZeroU64::new(1).unwrap()),
+            },
+            carrick_sched_core::process::TerminationStatus::SUCCESS,
+        )
+        .unwrap();
+        let RetirementVerdict::CancelMembers { .. } = closing.cancel_members(vec![], vec![birth])
+        else {
+            panic!("exit_group owns member cancellation");
+        };
+        member.request_host_exit();
+        assert!(
+            !kernel.process_exiting(),
+            "native Closing precedes host process_exiting() publication"
+        );
+
+        let tid = sibling.thread().registry_id();
+        let registry = Arc::new(ThreadRegistry::new(root.thread().registry_id()));
+        registry.register_child_with_tid(tid, 0);
+        let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+            registry,
+            Arc::new(FutexTable::new()),
+            Arc::new(NoopPlatformFutex),
+            Arc::new(|_| Arc::new(NoopPlatformFutex)),
+            kernel.process_fork_barrier.clone(),
+            kernel.crash_capture.clone(),
+            Some(Arc::clone(sibling.thread())),
+            Some(process.pid()),
+            sibling.thread().key().tid,
+            kernel.fatal_signal.current_generation(),
+            tid,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(carrick_hal::GenericVcpuRegistry::new()),
+            carrick_hal::InGuestFlag::for_guest_thread(),
+            1_000,
+        );
+        state.service_kernel_context = Some(sibling.retain_exact());
+        let mut job =
+            suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, None);
+        let result = job.terminal_settlement.result.clone();
+        let binding = Arc::new(
+            continuation::HvpatchTaskBinding::new_with_stage1_mm(
+                executor::TaskLoadIdentity {
+                    abi: cpu.cpu.guest_abi(),
+                    version: cpu.cpu.version(),
+                    mm: cpu.mm,
+                    asid_generation: cpu.asid_generation,
+                },
+                Arc::new(continuation::HvpatchTaskQuantum::new(
+                    Box::new(NeverPolled),
+                    job.completion.clone(),
+                )),
+                Box::new(()),
+                process.stage1_mm_lease().unwrap(),
+            )
+            .unwrap(),
+        );
+        let expected = binding.stage1_ttbr0().unwrap();
+        let carrick_hal::threaded::GuestCpuState::Aarch64V1(registers) = &mut cpu.cpu else {
+            unreachable!()
+        };
+        let registers = Arc::make_mut(registers);
+        registers.ttbr0 = carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE;
+        registers.ttbr1 = registers.ttbr0;
+        let mut engine = CrashCaptureTestEngine {
+            exec_support: true,
+            snapshot_cpu: Some(cpu.cpu.clone()),
+            ..Default::default()
+        };
+        let reject_descendant = |_, _| unreachable!();
+        let mut submission = executor::ExecutorSubmissionContext {
+            registration: Some(&registration),
+            scheduler: &scheduler,
+            publish_test_descendant: &reject_descendant,
+            current: Some(&authority),
+            authority: executor::ExecutionLeaseAuthoritySlot::from(Some(running.take_lease())),
+            exec_replacement: None,
+        };
+        let need_resched = std::sync::atomic::AtomicBool::new(false);
+        let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+        control.binding = Some(&binding);
+
+        let exit = job.poll(&mut engine, &mut control);
+        assert!(
+            matches!(
+                exit,
+                executor::ExecutorExit::Blocked(
+                    carrick_kernel::kernel::objects::BlockedReason::ChildState
+                )
+            ),
+            "{exit:?}"
+        );
+        assert!(matches!(
+            job.phase,
+            HvpatchProductionPhase::RetryThreadExit { code: 0 }
+        ));
+        assert!(
+            !job.phase.is_terminal_transition(),
+            "RetryThreadExit is a member exit retry, not a drain owner"
+        );
+
+        let snapshots = std::cell::Cell::new(0);
+        let residency = binding.take_cpu_save().map(|save| {
+            save.into_residency(&binding, || {
+                snapshots.set(snapshots.get() + 1);
+                engine.snapshot_guest_state_for_publication()
+            })
+            .unwrap()
+        });
+        let saved = match residency {
+            Some(executor::residency::TaskCpuResidency::Materialized(saved)) => saved,
+            None => engine.snapshot_guest_state_for_publication().unwrap(),
+            _ => panic!("RetryThreadExit save must force materialization"),
+        };
+        let loaded = carrick_kernel::kernel::objects::MigratableTaskState { cpu: saved, ..cpu };
+        binding
+            .validate_state(&loaded)
+            .expect("RetryThreadExit load must retain its process TTBR pair");
+        let carrick_hal::threaded::GuestCpuState::Aarch64V1(registers) = &loaded.cpu else {
+            unreachable!()
+        };
+        assert_eq!((registers.ttbr0, registers.ttbr1), (expected, expected));
+        assert_eq!(
+            snapshots.get(),
+            1,
+            "one full snapshot per terminal suspension"
+        );
+
+        drop(reserved_fork);
+        let resumed = job.poll(&mut engine, &mut control);
+        assert!(
+            matches!(resumed, executor::ExecutorExit::Exited),
+            "{resumed:?}"
+        );
+        job.after_terminal_settlement();
+        assert!(matches!(
+            result.take_published(),
+            Some(Ok(VcpuLoopOutcome::ThreadDone))
+        ));
+        assert!(member.host_retirement().is_some());
+
+        let lease = control.submission.take_execution_lease().unwrap();
+        running.restore_lease(lease).unwrap();
+        scheduler.settle_exited(running).unwrap();
+        scheduler.unregister_executor(&registration).unwrap();
+        scheduler.close();
+    }
+
+    /// #1709: `RetryThreadExit` must NOT be classified as
+    /// `is_terminal_transition()`: a peer's `exit_group` or `execve` drain can
+    /// overtake the parked member, which must retire as `ThreadDone` at the
+    /// loop top (`binding.rs` `process_exiting()` gate) and through
+    /// `after_reaped_settlement` (`publish_lost_claim_terminal_result`) without
+    /// hitting the terminal-owner `carrick_fatal!`.
+    #[test]
+    fn retry_thread_exit_remains_non_terminal_transition_for_peer_drain() {
+        assert!(!HvpatchProductionPhase::RetryThreadExit { code: 0 }.is_terminal_transition());
+        assert!(HvpatchProductionPhase::RetryThreadExit { code: 0 }.needs_terminal_cpu_save());
+
+        for settle_via_reap in [false, true] {
+            let (_runtime, scheduler, kernel, root, process, _generation) =
+                test_carrier_graph_with_dispatcher!(72_470, SyscallDispatcher::new());
+            root.thread().set_affinity(carrick_hal::CpuAffinity::all(1));
+            let tid = ThreadId::synthetic_for_tests(72_471);
+            let sibling = root
+                .kernel()
+                .reserve_thread_clone(
+                    &root,
+                    carrick_kernel::kernel::ClonePlan::from_flags(
+                        carrick_abi::LinuxCloneFlags::THREAD
+                            | carrick_abi::LinuxCloneFlags::SIGHAND
+                            | carrick_abi::LinuxCloneFlags::VM,
+                    )
+                    .unwrap(),
+                    None,
+                )
+                .unwrap()
+                .prepare(tid)
+                .unwrap()
+                .commit()
+                .unwrap()
+                .into_context()
+                .unwrap();
+            let registry = Arc::new(ThreadRegistry::new(root.thread().registry_id()));
+            registry.register_child_with_tid(tid, 0);
+            let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+                registry,
+                Arc::new(FutexTable::new()),
+                Arc::new(NoopPlatformFutex),
+                Arc::new(|_| Arc::new(NoopPlatformFutex)),
+                kernel.process_fork_barrier.clone(),
+                kernel.crash_capture.clone(),
+                Some(Arc::clone(sibling.thread())),
+                Some(process.pid()),
+                sibling.thread().key().tid,
+                kernel.fatal_signal.current_generation(),
+                tid,
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(carrick_hal::GenericVcpuRegistry::new()),
+                carrick_hal::InGuestFlag::for_guest_thread(),
+                1_000,
+            );
+            state.service_kernel_context = Some(sibling.retain_exact());
+            let mut job = suffix_failure_test_job(
+                &kernel,
+                state,
+                HvpatchProductionPhase::RetryThreadExit { code: 7 },
+                None,
+            );
+            let result = job.terminal_settlement.result.clone();
+
+            assert_eq!(
+                kernel
+                    .try_claim_persistent_process_exit(root.thread().registry_id())
+                    .unwrap()
+                    .claim,
+                ProcessExitClaim::Owner
+            );
+            kernel.begin_process_exit();
+            assert!(kernel.process_exiting());
+
+            if settle_via_reap {
+                job.after_reaped_settlement();
+            } else {
+                let registration = scheduler
+                    .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
+                    .unwrap();
+                let mut running = scheduler.take(&registration).unwrap();
+                let reject_descendant = |_, _| unreachable!();
+                let mut submission = executor::ExecutorSubmissionContext {
+                    registration: Some(&registration),
+                    scheduler: &scheduler,
+                    publish_test_descendant: &reject_descendant,
+                    current: None,
+                    authority: executor::ExecutionLeaseAuthoritySlot::from(Some(
+                        running.take_lease(),
+                    )),
+                    exec_replacement: None,
+                };
+                let need_resched = std::sync::atomic::AtomicBool::new(false);
+                let mut control =
+                    executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+                let mut engine = CrashCaptureTestEngine::default();
+                let exit = job.poll(&mut engine, &mut control);
+                assert!(matches!(exit, executor::ExecutorExit::Exited), "{exit:?}");
+                assert!(
+                    job.state.guest_execution.is_none(),
+                    "losing RetryThreadExit member must finish before MM executor registration"
+                );
+                job.after_terminal_settlement();
+                let lease = control.submission.take_execution_lease().unwrap();
+                running.restore_lease(lease).unwrap();
+                scheduler.settle_exited(running).unwrap();
+                scheduler.unregister_executor(&registration).unwrap();
+            }
+
+            assert!(matches!(
+                result.take_published(),
+                Some(Ok(VcpuLoopOutcome::ThreadDone))
+            ));
+            scheduler.close();
+        }
+    }
+
     #[test]
     fn executor_failure_after_exit_group_keeps_thread_done_and_finishes_owner() {
         use carrick_core::terminal::{
@@ -11939,6 +12334,7 @@ mod tests {
             .is_terminal_transition()
         );
         assert!(!HvpatchProductionPhase::Resident.is_terminal_transition());
+        assert!(!HvpatchProductionPhase::RetryThreadExit { code: 0 }.is_terminal_transition());
         assert!(
             !HvpatchProductionPhase::ResumeBlocked {
                 frame: carrick_hal::RawSyscall {
