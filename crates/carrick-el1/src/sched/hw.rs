@@ -18,10 +18,13 @@ use carrick_el1_abi::CurrentTask;
 #[cfg(target_os = "none")]
 use carrick_el1_abi::{Aarch64ParkedContext, TrapFrame};
 
-// Keep the production invalidation sequence inspectable by host tests. These
-// are the AArch64 encodings of `dsb ishst` and `dsb ish`, respectively.
-const ASID_INVALIDATION_PRE_BARRIER: u32 = 0xd503_3a9f;
-const ASID_INVALIDATION_POST_BARRIER: u32 = 0xd503_3b9f;
+// Keep the production invalidation sequence inspectable by host tests. HVF
+// vCPUs do not provide Carrick an architectural inner-shareable topology to
+// which completion can safely be confined, so both barriers are `dsb sy`.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+const ASID_INVALIDATION_PRE_BARRIER: u32 = 0xd503_3f9f;
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+const ASID_INVALIDATION_POST_BARRIER: u32 = 0xd503_3f9f;
 
 /// EL1's user-word reader: stage-1 permission check, then one fixup-guarded
 /// unprivileged 32-bit load (single-copy atomic for an aligned word).
@@ -162,8 +165,9 @@ impl ThreadCpu for HardwareCpu {
     fn invalidate_asid(&mut self, ttbr0: u64) {
         // SAFETY: TLBI ASIDE1IS takes the ASID in bits 63:48, as TTBR0_EL1
         // holds it; the prior table stores are made visible first, and the
-        // invalidation completes on every PE of the Inner Shareable domain
-        // before the `isb`.
+        // full-system barriers match Carrick's host-driven ASID maintenance:
+        // the invalidation completes on every virtual PE before the `isb`,
+        // without assuming HVF vCPUs share an architectural IS domain.
         unsafe {
             core::arch::asm!(
                 ".inst {pre_barrier}",
