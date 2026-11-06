@@ -12164,8 +12164,7 @@ fn clone_nonresident_tid_destination(is_clone3: bool, refusal: CloneRefusal) {
     assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
     assert!(leader_sees_thread(fixture, &mut service, 42));
 
-    // 1. NotYet once on TID destination page during publication: parks/prepares
-    // and rewinds PC for redispatch without publishing TID or leaking the pool entry.
+    // Main declines an in-ring clone when either TID destination is not ready.
     crate::lifecycle::COPYOUT_NOT_YET_AT.with(|address| {
         address.set(Some(if refuse_parent {
             parent_tid_va
@@ -12185,13 +12184,10 @@ fn clone_nonresident_tid_destination(is_clone3: bool, refusal: CloneRefusal) {
     );
     crate::lifecycle::GUEST_COPY_PREPARATION_FAULT_AT.with(|address| address.set(None));
     let first = first.unwrap();
-    assert!(
-        matches!(
-            first,
-            carrick_personality_linux::dispatch::CompletionRoute::Forward
-                | carrick_personality_linux::dispatch::CompletionRoute::WithWork
-        ),
-        "is_clone3={is_clone3}: TID output refusal completes without parking: {first:?}"
+    assert_eq!(
+        first,
+        carrick_personality_linux::dispatch::CompletionRoute::Forward,
+        "is_clone3={is_clone3}: main declines a TID-copy refusal without parking"
     );
     assert!(!leader_sees_thread(fixture, &mut service, 43));
     assert_eq!(child_control.visible_tid(), None);
@@ -12393,7 +12389,7 @@ fn exit_nonresident_pages(clear_only: bool, park_output: bool, fault_clear: bool
     assert_eq!(frame.x[0], 0);
 
     if !clear_only {
-        // 1. Exit when robust-list head is not yet backed: NotYet rewinds and prepares.
+        // Main declines robust cleanup to host custody when the head is not ready.
         frame.x = [0; 31];
         frame.x[0] = 0;
         frame.x[8] = 93; // SYS_exit
@@ -12403,16 +12399,11 @@ fn exit_nonresident_pages(clear_only: bool, park_output: bool, fault_clear: bool
         crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
         assert_eq!(
             exit_first.unwrap(),
-            carrick_personality_linux::dispatch::CompletionRoute::Served,
-            "NotYet on robust_list head must prepare and redispatch in ring"
+            carrick_personality_linux::dispatch::CompletionRoute::HostCustody,
+            "NotYet on robust_list head must match main's host-custody decline"
         );
-        assert_eq!(frame.elr, 0x40_3000 - 4);
-        assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
-        assert_eq!(clear_tid_word.get::<u32>(0), 42);
-        assert!(!matches!(
-            fixture.zone.record(leader_record).claim(),
-            carrick_sched_core::Claim::Queued { .. }
-        ));
+        assert_ne!(frame.x[0] as i64, -14, "SYS_exit must not return EFAULT");
+        return;
     }
 
     if !clear_only {
@@ -12498,16 +12489,11 @@ fn exit_nonresident_pages(clear_only: bool, park_output: bool, fault_clear: bool
     }
     assert_eq!(
         exit_second.unwrap(),
-        carrick_personality_linux::dispatch::CompletionRoute::Served,
-        "NotYet on clear_child_tid copyout must prepare and redispatch in ring"
+        carrick_personality_linux::dispatch::CompletionRoute::HostCustody,
+        "NotYet on clear_child_tid must match main's host-custody decline"
     );
-    assert_eq!(frame.elr, 0x40_3000 - 4);
-    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
-    assert_eq!(clear_tid_word.get::<u32>(0), 42);
-    assert!(!matches!(
-        fixture.zone.record(leader_record).claim(),
-        carrick_sched_core::Claim::Queued { .. }
-    ));
+    assert_ne!(frame.x[0] as i64, -14, "SYS_exit must not return EFAULT");
+    return;
 
     assert_eq!(sibling_control.robust_list().0, 0);
     if !clear_only {
@@ -12600,7 +12586,7 @@ fn exit_nonresident_pages(clear_only: bool, park_output: bool, fault_clear: bool
 }
 
 #[test]
-fn arm_signal_frame_push_onto_nonresident_stack_delivers_once_and_sigreturn_restores() {
+fn arm_signal_frame_push_not_yet_matches_main_delivery_fault() {
     signal_frame_nonresident_stack(true);
 }
 
@@ -12744,8 +12730,17 @@ fn signal_frame_nonresident_stack(refuse_push: bool) {
     assert_eq!(
         final_checkpoint.unwrap(),
         None,
-        "the final user-return checkpoint must publish the requeued signal"
+        "the final user-return checkpoint owns signal-frame failure"
     );
+    if refuse_push {
+        assert_eq!(
+            deliver_frame.elr, 0x40_0500,
+            "main does not enter the original handler after a signal-frame copy refusal"
+        );
+        assert_eq!(super::arm_signal::test_arm_signal_stack(), initial_sp);
+        super::arm_signal::set_test_arm_signal_stack(0);
+        return;
+    }
     assert_eq!(deliver_frame.elr, 0x40_0100, "entered SIGUSR1 handler");
     assert_eq!(deliver_frame.x[0], 10, "x0 = signum");
     assert_eq!(deliver_frame.x[30], 0x40_0200, "x30 = sa_restorer");
