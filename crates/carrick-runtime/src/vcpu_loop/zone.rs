@@ -305,8 +305,8 @@ fn until_deadline(deadline: u64) -> std::time::Duration {
     std::time::Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX))
 }
 
-fn owns_installed_space(zone_mm: Option<u64>, installed: u64, _terminal: bool) -> bool {
-    zone_mm.is_none_or(|mm| mm == installed)
+fn owns_installed_space(zone_mm: Option<u64>, installed: u64, terminal: bool) -> bool {
+    zone_mm.is_none_or(|mm| mm == installed || (terminal && installed == 0))
 }
 
 #[cfg(test)]
@@ -532,7 +532,10 @@ where
     /// This job's own thread is on the vCPU again: EL1 installed its address
     /// space before it ran it (EL1 increment 2), so the exit is this
     /// thread's to handle. Anything else would let the host resolve a fault
-    /// or run a syscall against the wrong address space: fail loud.
+    /// or run a syscall against the wrong address space: fail loud. A terminal
+    /// continuation is host-only and its materialized save deliberately
+    /// vacates this same slot to maintenance space zero; that state still
+    /// belongs to the exiting group, but no foreign process space does.
     fn own_space_installed(
         &self,
         zone: &ZoneTables,
