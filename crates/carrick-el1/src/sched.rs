@@ -150,6 +150,14 @@ pub trait ThreadCpu {
     fn live_ttbr0(&self) -> Option<u64>;
     /// Invalidate, on every PE, the stage-1 translations of the ASID in
     /// `ttbr0` (`TLBI ASIDE1IS`), complete before the call returns.
+    ///
+    /// This is a completion requirement, not a receipt inferred from issuing
+    /// the instruction. A virtual CPU backend must establish that it covers
+    /// running siblings and concurrent guest entries. Per-slot generation
+    /// coverage only establishes the next-entry obligation; it cannot supply
+    /// that proof for a sibling which remains in user execution. The ARM/HVF
+    /// completion proof remains open in issue #1736; callers must not treat
+    /// the generation ledger as acknowledgment from those siblings.
     fn invalidate_asid(&mut self, ttbr0: u64);
     /// The virtual counter (`CNTVCT_EL0`).
     fn now(&self) -> u64;

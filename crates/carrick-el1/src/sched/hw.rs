@@ -256,9 +256,12 @@ impl ThreadCpu for HardwareCpu {
 
     fn invalidate_asid(&mut self, ttbr0: u64) {
         // SAFETY: TLBI ASIDE1IS takes the ASID in bits 63:48, as TTBR0_EL1
-        // holds it; the prior table stores are made visible first, and the
-        // invalidation completes on every PE of the Inner Shareable domain
-        // before the `isb`.
+        // holds it. This is the architectural Inner Shareable maintenance
+        // sequence: publish table stores, issue TLBI, complete it, then
+        // synchronize this PE's instruction stream. It does not itself supply
+        // a backend receipt for virtual CPUs outside this executing context;
+        // the running-sibling and concurrent-entry proof required by
+        // ThreadCpu::invalidate_asid remains open for HVF (#1736).
         unsafe {
             core::arch::asm!(
                 "dsb ishst",
