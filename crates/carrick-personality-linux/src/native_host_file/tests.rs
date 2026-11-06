@@ -939,3 +939,25 @@ fn ppoll_arrays_need_readable_input_and_writable_output_before_crossing() {
         })
     );
 }
+
+#[test]
+fn file_staging_true_input_fault_does_not_request_backing() {
+    let mut user = memory(b"resident");
+    for call in [
+        HostFileCall::Write {
+            fd: 1,
+            buf: 0,
+            count: 1,
+        },
+        HostFileCall::Writev {
+            fd: 1,
+            iov: 0,
+            iovcnt: 1,
+        },
+    ] {
+        assert_eq!(
+            run(call, &mut user),
+            returned(carrick_syscall_abi::LINUX_EFAULT)
+        );
+    }
+}
