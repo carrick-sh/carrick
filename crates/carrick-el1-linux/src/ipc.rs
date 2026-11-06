@@ -2809,6 +2809,30 @@ mod tests {
     }
 
     #[test]
+    fn el1_ipc_readv_scatters_and_consumes_each_byte_once() {
+        let mut w = world();
+        let t = w.table(w.a_tid);
+        let (reader, writer, _) = w.pipe(t, NONBLOCK);
+        w.mem.write(MM, 0x100000, b"abcdef");
+        let mut f = syscall(SYS_WRITE, writer, 0x100000, 6, A_SVC);
+        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 6));
+        let headers = [0x100100u64, 2, 0, 0, 0x100200, 4]
+            .into_iter()
+            .flat_map(u64::to_ne_bytes)
+            .collect::<Vec<_>>();
+        w.mem.write(MM, 0x100300, &headers);
+        let storage = w.region.descriptor_allocations();
+        let mut f = syscall(65, reader, 0x100300, 3, A_SVC);
+        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 6));
+        assert_eq!(w.mem.read(MM, 0x100100, 2), b"ab");
+        assert_eq!(w.mem.read(MM, 0x100200, 4), b"cdef");
+        assert_eq!(w.region.descriptor_allocations(), storage);
+        let mut f = syscall(SYS_READ, reader, 0x100100, 1, A_SVC);
+        assert_eq!((w.call(&mut f), f.x[0] as i64), (RETURNED, linux::EAGAIN));
+        assert_eq!(host_calls(&w), 0);
+    }
+
+    #[test]
     fn el1_ipc_writev_preserves_vector_order_on_a_pipe() {
         let mut w = world();
         let t = w.table(w.a_tid);
