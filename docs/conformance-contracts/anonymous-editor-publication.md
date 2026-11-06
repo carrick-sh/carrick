@@ -36,3 +36,34 @@ A successful `reset_slot` clears local coverage together with the timer
 cache because a new mailbox lease can name a different vCPU. The reset
 witness was red (`None` instead of `Some(1)` owed) before clearing these
 fields. A refused reset preserves the still-owned slot.
+
+## Remaining completion obligation
+
+The per-slot generation is an entry obligation, not a shootdown receipt.
+`SpaceEditor` excludes another editor and host root retirement; it does not
+exclude a sibling already executing user instructions. In particular, an
+installer can capture generation `g`, the editor can invalidate, and that
+installer can cross back into guest execution before the editor publishes
+`g + 1`. Its previously captured grant does not observe the new obligation.
+This is a protocol counterexample to a generation-only proof, not a newly
+observed hardware failure or a core diagnosis.
+
+Publishing before invalidation alone also leaves an installer that captured
+`g` before publication. Completing this contract requires admission and
+invalidation completion to cover both already-running siblings and siblings
+crossing the host/guest boundary. An architectural broadcast claim must
+establish that guarantee for the backend's virtual CPUs, including host
+entry and exit. The failed stronger-barrier experiment in the population
+report cannot supply that proof.
+
+An alternative is an owned continuation using the existing paused-MM
+descriptor transaction: retain the operation and its completion authority,
+close admission, obtain exact sibling acknowledgments, and complete only
+after invalidation. It must release execution capacity while awaiting those
+acknowledgments. Neither synchronously waiting on a pool worker nor forwarding
+after an untracked partial mutation is a valid implementation. Its witness
+must hold one sibling across entry and another in user execution, delay an
+acknowledgment, and prove that the edit cannot report completion early while
+other runnable tasks still make progress. The final signed population must
+then be collected on the resulting head; the historical population does not
+discharge this obligation.
