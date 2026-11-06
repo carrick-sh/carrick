@@ -666,6 +666,41 @@ impl NativeLane<'_> {
     }
 }
 impl UserCopy for NativeLane<'_> {
+    fn atomic_load_u32(
+        &mut self,
+        address: UserVa,
+        value: &mut u32,
+    ) -> carrick_core::personality::CopyOutcome {
+        use carrick_core::personality::CopyOutcome;
+        if address.raw() & 3 != 0 || !self.valid_user_range(address.raw(), 4) {
+            return CopyOutcome::Fault;
+        }
+        // SAFETY: the stopped host retains this aligned, eagerly backed
+        // aperture in the exact current MM throughout the native turn.
+        *value = unsafe { core::sync::atomic::AtomicU32::from_ptr(address.raw() as *mut u32) }
+            .load(Ordering::Acquire);
+        CopyOutcome::Done
+    }
+    fn atomic_compare_exchange_u32(
+        &mut self,
+        address: UserVa,
+        expected: u32,
+        desired: u32,
+        observed: &mut u32,
+    ) -> carrick_core::personality::CopyOutcome {
+        use carrick_core::personality::CopyOutcome;
+        if address.raw() & 3 != 0 || !self.valid_user_range(address.raw(), 4) {
+            return CopyOutcome::Fault;
+        }
+        // SAFETY: same exact-MM retained writable aperture as the load.
+        let word = unsafe { core::sync::atomic::AtomicU32::from_ptr(address.raw() as *mut u32) };
+        *observed =
+            match word.compare_exchange(expected, desired, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(word) | Err(word) => word,
+            };
+        CopyOutcome::Done
+    }
+
     fn copy_in(
         &mut self,
         dst: &mut [u8],
@@ -999,7 +1034,7 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
             return returned(0);
         }
         let Some(outputs) = crate::process::prepare_wait_outputs(self, status, rusage) else {
-            return returned(carrick_syscall_abi::LINUX_EFAULT.guest_retval());
+            return returned(carrick_abi::LINUX_EFAULT.guest_retval());
         };
         let wait_result = outputs.result(child_pid);
         if let Some(code) = code {
@@ -1168,15 +1203,23 @@ impl FutexVenue for NativeLane<'_> {
             .then_some(carrick_core::Served::Returned { switched: false })
     }
     fn wait(&mut self, wait: FutexWait) -> Option<Self::Served> {
-        if !self.valid_user_range(wait.address.raw(), 4) {
-            return None;
-        }
-        let guard = self.zone.lock(
+        let zone = self.zone;
+        let guard = zone.lock(
             ZoneTables::bucket_of(wait.mm.raw(), wait.address.raw()),
             &BoundedSpin(1024),
         )?;
-        // SAFETY: the exact installed MM's checked readable user aperture.
-        let word = unsafe { core::ptr::read_unaligned(wait.address.raw() as *const u32) };
+        let mut word = 0;
+        match UserCopy::atomic_load_u32(self, wait.address, &mut word) {
+            carrick_core::personality::CopyOutcome::Done => {}
+            carrick_core::personality::CopyOutcome::Fault => {
+                self.frame.rax = carrick_abi::LINUX_EFAULT.guest_retval() as u64;
+                return Some(carrick_core::Served::Returned { switched: false });
+            }
+            carrick_core::personality::CopyOutcome::NotYet(_) => {
+                // This adapter admits only its retained, eagerly backed aperture.
+                self.fail_lifecycle(carrick_core_abi::NativeRunFailureReason::NativeQuarantined);
+            }
+        }
         if word != wait.expected {
             self.frame.rax = wait.mismatch_result.raw() as u64;
             return Some(carrick_core::Served::Returned { switched: false });
