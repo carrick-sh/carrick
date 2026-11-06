@@ -11243,27 +11243,60 @@ exec /usr/bin/git "$@"
     }
     #[test]
     fn replay_1763_published_incomplete_rounds_continue() {
-        for issue in [1755, 1735, 1740] {
+        let records: Vec<Value> = serde_json::from_str(include_str!(
+            "../tests/fixtures/dispatch-1763-outcomes.json"
+        ))
+        .unwrap();
+        let mut replayed = 0;
+        for record in records
+            .iter()
+            .filter(|r| r["source"].as_str().unwrap().contains("/pull/"))
+        {
+            let body = record["body"].as_str().unwrap();
+            let raw = body
+                .split("Worker contract (claims for review):\n\n```text\n")
+                .nth(1)
+                .unwrap()
+                .split("\n```")
+                .next()
+                .unwrap();
+            let contract: Value = serde_json::from_str(raw).unwrap();
+            let summary = format!(
+                "{}\n{}",
+                contract["summary"].as_str().unwrap(),
+                contract["risks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| r.as_str().unwrap())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
             shared_fixture(|root| {
                 current_pr(root);
-                pushed_checkpoint(&"c".repeat(40));
-                server(root).round_outcome(
-                    FinishStatus::Blocked,
-                    &format!("#{issue}: implementation remains incomplete; next: finish the production witness"),
-                    None,
-                ).unwrap();
+                pushed_checkpoint(contract["review"]["head"].as_str().unwrap());
+                server(root)
+                    .round_outcome(FinishStatus::Blocked, &summary, None)
+                    .unwrap();
                 let posted = regular_text(&root.join("posted.md")).unwrap();
-                assert_eq!(outcome_status(&posted), Some("Continuing"), "{posted}");
-                assert!(
-                    posted.contains("chain=true")
-                        || regular_text(&root.join("outputs"))
-                            .unwrap()
-                            .contains("chain=true")
+                assert_eq!(
+                    outcome_status(&posted),
+                    Some("Continuing"),
+                    "{}: {posted}",
+                    record["source"]
                 );
-                assert!(posted.contains("finish the production witness"));
+                assert!(
+                    regular_text(&root.join("outputs"))
+                        .unwrap()
+                        .contains("chain=true")
+                );
+                assert!(posted.contains(contract["summary"].as_str().unwrap()));
             });
+            replayed += 1;
         }
+        assert_eq!(replayed, 4, "two #1755 rounds plus #1735 and #1740");
     }
+
     #[test]
     fn replay_1763_unnamed_blocker_is_contract_violation() {
         shared_fixture(|root| {
