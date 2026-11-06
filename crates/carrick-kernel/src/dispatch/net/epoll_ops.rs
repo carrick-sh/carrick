@@ -3665,6 +3665,57 @@ mod nested_epoll_readiness_tests {
     }
 
     #[test]
+    fn epoll_pwait2_timeout_read_refusal_redispatches_before_wait() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        for abi in [LinuxGuestAbi::Aarch64, LinuxGuestAbi::X86_64] {
+            let mut dispatcher = SyscallDispatcher::new();
+            let kernel = dispatcher.capture_one_task_context().unwrap();
+            let reporter = CompatReporter::default();
+            let mut setup = LinearMemory::new(0x1000, vec![0; 0x2000]);
+            let epfd = create_epoll(&mut dispatcher, &kernel, &mut setup, &reporter);
+            let mut memory = OwnerRefusingMemory::new(0x1000, 0x2000, 0xa5);
+            memory.seed(0x1200, &[0; 16]);
+            let request = SyscallRequest::new(
+                441,
+                SyscallArgs::from([epfd as u64, 0x1100, 1, 0x1200, 0, 0]),
+            )
+            .with_guest_abi(abi);
+            let wait = memory.refuse_next_read();
+            assert_eq!(
+                dispatcher
+                    .dispatch(&kernel, request, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+            );
+            assert_eq!(memory.inner.read_bytes(0x1100, 16).unwrap(), vec![0xa5; 16]);
+            assert_eq!(
+                dispatcher
+                    .dispatch(&kernel, request, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::Returned { value: 0 }
+            );
+            let bad = SyscallRequest::new(
+                441,
+                SyscallArgs::from([epfd as u64, 0x1100, 1, 0x9000, 0, 0]),
+            )
+            .with_guest_abi(abi);
+            assert_eq!(
+                dispatcher
+                    .dispatch(&kernel, bad, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::errno(LINUX_EFAULT)
+            );
+            memory.seed(0x1200, &(-1i64).to_le_bytes());
+            assert_eq!(
+                dispatcher
+                    .dispatch(&kernel, request, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::errno(LINUX_EINVAL)
+            );
+        }
+    }
+
+    #[test]
     fn s1_empty_epoll_skips_owner_preparation() {
         use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
         let mut dispatcher = SyscallDispatcher::new();
@@ -5014,9 +5065,10 @@ impl<'a> NetView<'a> {
             let timeout_ms = if timeout_addr == 0 {
                 -1
             } else {
-                let timespec = match read_kernel_struct::<LinuxTimespec>(memory, timeout_addr) {
+                let timespec = match memory.read_struct::<LinuxTimespec>(timeout_addr) {
                     Ok(timespec) => timespec,
-                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                    Err(error) => return Ok(DispatchOutcome::from_owner_memory_error(error)
+                        .unwrap_or_else(|| DispatchOutcome::errno(LINUX_EFAULT))),
                 };
                 let sec = timespec.tv_sec;
                 let nsec = timespec.tv_nsec;
