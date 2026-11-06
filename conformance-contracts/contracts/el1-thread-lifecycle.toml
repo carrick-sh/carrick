@@ -80,6 +80,7 @@ embed = [
 # applied per retained lifecycle page; this does not complete guest waits.
 vm_free = [
   "carrick-el1-linux::aarch64_process_tests::arm_closed_gate_service_entry_retires_the_sibling_instead_of_busy",
+  "carrick-el1-linux::lifecycle::tests::clone_tid_refusal_does_not_erase_a_live_siblings_store",
   "carrick-el1-linux::aarch64_process_tests::arm_closed_gate_service_entry_cancels_retained_ipc_before_retirement",
   "carrick-el1-linux::native_process_runtime::host_test_support::native_service_duplicate_custody_is_an_invariant_at_bridge_settlement",
   "carrick-el1-linux::native_process_runtime::host_test_support::native_service_suspended_member_cannot_admit_a_second_bridge",
