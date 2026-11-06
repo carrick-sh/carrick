@@ -1736,6 +1736,7 @@ unsafe impl<'a> carrick_mmu_core::aarch64::HostArenaResolver for HvfPageTableRes
             // thousands of mappings quadratic (pagetablegrow spent minutes
             // in `live_pt_debug_walk`); it stays only as the last resort.
             .or_else(|| self.task.mm_access.structural_owner_host_ptr(base, needed))
+            .or_else(|| self.task.mm_access.mm_root_stage2_host_ptr(base, needed))
             .or_else(|| self.task.host_ptr_for_ipa(base, needed))
     }
 
