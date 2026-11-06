@@ -9098,6 +9098,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
 #[cfg(test)]
 mod transfer_service_tests {
     use super::*;
+    use std::num::NonZeroU64;
     #[test]
     fn owner_service_completion_costs_no_tlb_maintenance() {
         // Decode the actual instruction selected as the host-driven call's
@@ -9123,8 +9124,12 @@ mod transfer_service_tests {
         runs: usize,
         ttbr0: u64,
         fail_restore: bool,
+        owner_wait: Option<(carrick_el1_abi::PortalWaitCause, u64)>,
     }
     impl Aarch64Vcpu for Cpu {
+        fn mailbox_slot(&self) -> Option<usize> {
+            Some(0)
+        }
         fn get_reg(&self, r: Reg) -> Result<u64, TrapError> {
             Ok(self
                 .regs
@@ -9186,6 +9191,24 @@ mod transfer_service_tests {
         fn run(&mut self) -> Result<Aarch64Exit, TrapError> {
             self.runs += 1;
             let pc = self.get_reg(Reg::Pc)?;
+            if let Some((cause, revision)) = self.owner_wait {
+                let frame_va = self.get_reg(Reg::X(0))?;
+                let offset = frame_va
+                    .checked_sub(carrick_el1_abi::EL1_REGION_BASE)
+                    .expect("service frame belongs to the installed EL1 region");
+                let frame_ptr = (carrick_el1_abi::get_el1_region_host_ptr() + offset as usize)
+                    as *mut carrick_el1_abi::TrapFrame;
+                // SAFETY: run_drain_call placed this frame in the installed
+                // test region and exclusively loans it to this service call.
+                let mut frame = unsafe { frame_ptr.read_volatile() };
+                frame.x[0] = 11;
+                frame.x[14] = 3;
+                frame.x[16] = cause.encode();
+                frame.x[17] = revision;
+                // SAFETY: the same exclusive service-frame loan remains live.
+                unsafe { frame_ptr.write_volatile(frame) };
+                return Ok(Aarch64Exit::MaintenanceDone);
+            }
             if pc == carrick_mem::memory::LINUX_EL1_MAINT_BASE
                 || pc == carrick_mem::memory::LINUX_EL1_ASID_MAINT_BASE
             {
@@ -9213,6 +9236,30 @@ mod transfer_service_tests {
     struct Vm {
         bound: Option<Stage1Authority>,
         bootstrap: Option<Vec<u8>>,
+        file_fault_grant: bool,
+        retained_file_fault_grant: Option<Arc<std::sync::atomic::AtomicBool>>,
+    }
+
+    struct FileFaultGrant {
+        txn: carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        retained: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Drop for FileFaultGrant {
+        fn drop(&mut self) {
+            self.retained
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+    impl crate::user_transfer::TransferGrant for FileFaultGrant {
+        fn transaction(&self) -> &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn {
+            &self.txn
+        }
+        fn settle(
+            &mut self,
+            _: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+        ) -> Result<bool, TrapError> {
+            panic!("the contended owner must withdraw before a receipt exists")
+        }
     }
     struct UnmappedResolver;
     unsafe impl carrick_mmu_core::aarch64::HostArenaResolver for UnmappedResolver {
@@ -9322,6 +9369,37 @@ mod transfer_service_tests {
         fn kick_handle(&self) -> Self::KickHandle {
             panic!("unused backend method")
         }
+        fn prepare_owner_frame_grant(
+            &self,
+            _: crate::user_transfer::TransferTarget,
+            window: carrick_el1_abi::PortalGrantWindow,
+        ) -> Result<crate::user_transfer::TransferPreparation, TrapError> {
+            if !self.file_fault_grant {
+                return Ok(crate::user_transfer::TransferPreparation::Declined);
+            }
+            use carrick_mmu_core::aarch64::descriptor_txn::{
+                DescriptorOp, DescriptorTxn, DescriptorTxnId, PageSpan, TableGrants,
+            };
+            let retained = self
+                .retained_file_fault_grant
+                .as_ref()
+                .expect("enabled file grant retains custody")
+                .clone();
+            Ok(crate::user_transfer::TransferPreparation::Grant(Box::new(
+                FileFaultGrant {
+                    txn: DescriptorTxn {
+                        id: DescriptorTxnId {
+                            mm_key: NonZeroU64::new(window.operation.mm.raw()).unwrap(),
+                            generation: NonZeroU64::new(1).unwrap(),
+                        },
+                        root: carrick_mmu_core::aarch64::SubstrateGpa(0x4000),
+                        op: DescriptorOp::Retire(PageSpan::new(window.fault_page, 4096)),
+                        tables: TableGrants::NONE,
+                    },
+                    retained,
+                },
+            )))
+        }
         fn build_sibling_builder(
             &self,
             vcpu: &Self::Vcpu,
@@ -9349,6 +9427,7 @@ mod transfer_service_tests {
                 runs: 0,
                 ttbr0: 0x7000_0080_0000_0000,
                 fail_restore: false,
+                owner_wait: None,
             },
             Stage1Authority::new(),
             UserMemoryAuthority::from_legacy(Arc::new(MemoryProtections::default())),
@@ -9356,6 +9435,68 @@ mod transfer_service_tests {
             0,
             0,
         )
+    }
+
+    // Installs the shared ABI region pointer; must run on the serial host lane.
+    #[test]
+    fn serial_host_withdrawn_file_fault_parks_authenticated_owner_wait() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut region = carrick_test_support::TestEl1Region::zeroed();
+        let region_ptr = region.as_mut_ptr() as usize;
+        // SAFETY: TestEl1Region owns aligned storage for the complete shared
+        // ABI region, including the MmPortalSlots at this fixed offset.
+        let slots = unsafe {
+            &*((region_ptr + carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize)
+                as *const carrick_el1_abi::MmPortalSlots)
+        };
+        let previous = carrick_el1_abi::get_el1_region_host_ptr();
+        struct Restore(usize);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                carrick_el1_abi::record_el1_region_host_ptr(self.0);
+            }
+        }
+        let _restore = Restore(previous);
+        carrick_el1_abi::record_el1_region_host_ptr(region_ptr);
+
+        let nz = |value| NonZeroU64::new(value).unwrap();
+        let mm = carrick_el1_abi::ReservationMm::new(2).unwrap();
+        let carrier = nz(17);
+        assert!(slots.bind_carrier(carrier));
+        let window = carrick_el1_abi::PortalGrantWindow {
+            operation: carrick_el1_abi::PortalOperation {
+                carrier,
+                mm,
+                incarnation: nz(3),
+                sequence: nz(4),
+            },
+            mapping_incarnation: carrick_el1_abi::ReservationIncarnation::new(5).unwrap(),
+            range: carrick_el1_abi::ReservationRange::new(0x6000, 0x7000).unwrap(),
+            protection: carrick_el1_abi::ReservationProtection::READ,
+            fault_page: 0x6000,
+            host_backing: Some(carrick_el1_abi::HostBackingIdentity::new(nz(6), nz(7), 0)),
+            fork_sequence: None,
+        };
+        assert!(slots.grant(0).unwrap().publish_fault_selection(9, window));
+
+        let retained = Arc::new(AtomicBool::new(true));
+        let mut engine = engine_fixture();
+        engine.mm_generation = mm.raw();
+        engine.vm.file_fault_grant = true;
+        engine.vm.retained_file_fault_grant = Some(retained.clone());
+        engine.vcpu.get_mut().owner_wait = Some((carrick_el1_abi::PortalWaitCause::Editor, 19));
+
+        let outcome = engine.service_owner_file_fault(mm.raw(), 9).unwrap();
+        let Some(carrick_hal::OwnerFileFaultOutcome::PendingOwner(wait)) = outcome else {
+            panic!("withdrawn owner contention must park, got {outcome:?}");
+        };
+        assert_eq!(wait.handle().carrier(), carrier);
+        assert_eq!(wait.handle().mm(), mm);
+        assert_eq!(wait.cause(), carrick_el1_abi::PortalWaitCause::Editor);
+        assert_eq!(wait.revision(), 19);
+        assert!(!retained.load(Ordering::Acquire));
+        assert!(!slots.grant(0).unwrap().has_outstanding_for(mm.raw()));
     }
     #[test]
     fn relocated_bootstrap_edits_use_retained_physical_table_custody() {
@@ -9613,6 +9754,7 @@ mod transfer_service_tests {
                 runs: 0,
                 ttbr0: 0x7000_0080_0000_0000,
                 fail_restore: true,
+                owner_wait: None,
             };
             let result = run_el1_service_effect_on(&mut cpu, 0x1000, 0x3000, true, &mut || false);
             assert!(result.is_err());
@@ -9642,6 +9784,7 @@ mod transfer_service_tests {
             runs: 0,
             ttbr0: original,
             fail_restore: false,
+            owner_wait: None,
         };
         let root = carrick_mem::memory::CarrierMaintenanceRoot::new(Gpa::new(
             carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE,
@@ -9669,6 +9812,7 @@ mod transfer_service_tests {
                 runs: 0,
                 ttbr0: 0x7000_0080_0000_0000,
                 fail_restore: false,
+                owner_wait: None,
             };
             let mut regs: Vec<_> = (0..31).map(Reg::X).collect();
             regs.extend([Reg::Pc, Reg::Pstate, Reg::ElrEl1, Reg::SpsrEl1, Reg::SpEl1]);
