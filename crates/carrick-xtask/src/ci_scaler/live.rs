@@ -4305,6 +4305,21 @@ printf '{"data":%s}\n200' "$body"
         assert_eq!(budgets_50, vec![Duration::from_millis(50)]);
         assert_eq!(elapsed_50, Duration::ZERO);
 
+        // Count time spent in the failed command as well as backoff. At the
+        // exact boundary there is no budget left for another attempt, so do
+        // not sleep even when the original limit could cover the delay.
+        let (spent, spent_budgets, spent_elapsed) = run_ssh_with_budget(
+            &failing_ssh,
+            Duration::from_millis(250),
+            Duration::from_millis(150),
+        );
+        assert!(matches!(
+            spent.unwrap_err(),
+            ScalerError::Transient(TransientFailure::SshConnect)
+        ));
+        assert_eq!(spent_budgets, vec![Duration::from_millis(250)]);
+        assert_eq!(spent_elapsed, Duration::from_millis(150));
+
         let (err_250, budgets_250, elapsed_250) =
             run_ssh_with_budget(&failing_ssh, Duration::from_millis(250), Duration::ZERO);
         assert!(
