@@ -10,6 +10,8 @@ pub use carrick_personality_linux::sched::{
 use carrick_personality_linux::sched::{FutexCall, FutexFrequency, FutexVenue, FutexWait};
 use core::sync::atomic::Ordering;
 
+pub(crate) const RETAINED_RELATIVE_DEADLINE: u64 = 1 << 63;
+
 /// ARM's Linux execution entry: the substrate moves registers, then this
 /// adapter re-enters the admitted native process owner before EL0 resumes.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -94,9 +96,11 @@ pub fn is_served_futex_op(frame: &TrapFrame) -> bool {
     ::carrick_personality_linux::sched::is_served_futex_op(frame.x[8], crate::sched::args(frame))
 }
 fn args(frame: &TrapFrame) -> [u64; 6] {
-    [
+    let mut args = [
         frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5],
-    ]
+    ];
+    args[1] &= !RETAINED_RELATIVE_DEADLINE;
+    args
 }
 struct Adapter<'a, 's, C: ThreadCpu, U: UserWord> {
     sched: &'a mut Sched<'s, C, U>,
@@ -120,6 +124,17 @@ impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, C, U> {
     }
     fn now(&self) -> CounterTick {
         CounterTick::new(self.sched.cpu.now())
+    }
+    fn relative_deadline(&mut self, _key: u64, proposed: CounterTick) -> CounterTick {
+        if self.frame.x[1] & RETAINED_RELATIVE_DEADLINE != 0 {
+            return CounterTick::new(self.frame.x[5]);
+        }
+        self.frame.x[1] |= RETAINED_RELATIVE_DEADLINE;
+        self.frame.x[5] = proposed.raw();
+        proposed
+    }
+    fn finish_relative_wait(&mut self) {
+        self.frame.x[1] &= !RETAINED_RELATIVE_DEADLINE;
     }
     fn wake(
         &mut self,

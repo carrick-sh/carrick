@@ -153,6 +153,10 @@ impl carrick_guest_arch::ProcessContext for Aarch64ParkedContext {
     fn restart_syscall(&mut self) {
         self.native.pc = self.native.pc.wrapping_sub(4);
     }
+    fn retain_relative_futex_deadline(&mut self, marker: u64, deadline: u64) {
+        self.native.x[1] |= marker;
+        self.native.x[5] = deadline;
+    }
 }
 
 impl carrick_guest_arch::ThreadContext for Aarch64ParkedContext {
