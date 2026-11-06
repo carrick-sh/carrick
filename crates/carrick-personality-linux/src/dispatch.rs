@@ -1611,17 +1611,8 @@ mod ring_first_tests {
             address: carrick_guest_arch::UserVa,
             bytes: alloc::vec::Vec<u8>,
         ) -> crate::signal::SignalOutcome {
-            let result = match crate::lifecycle::UserCopy::copy_out(self, address, &bytes) {
-                carrick_core::personality::CopyOutcome::Done => 0,
-                carrick_core::personality::CopyOutcome::Fault => -14,
-                carrick_core::personality::CopyOutcome::NotYet(_) => {
-                    panic!("eager test venue refused output")
-                }
-            };
-            crate::signal::SignalOutcome::Returned {
-                result: crate::abi::entry::SyscallResult::new(result),
-                work: false,
-            }
+            let _ = (address, bytes);
+            panic!("eager test venue cannot retain an unavailable output")
         }
 
         fn arguments(&self) -> [u64; 6] {
@@ -1669,17 +1660,8 @@ mod ring_first_tests {
             bytes: alloc::vec::Vec<u8>,
             work: bool,
         ) -> crate::lifecycle::LifecycleOutcome {
-            let result = match crate::lifecycle::UserCopy::copy_out(self, address, &bytes) {
-                carrick_core::personality::CopyOutcome::Done => 0,
-                carrick_core::personality::CopyOutcome::Fault => -14,
-                carrick_core::personality::CopyOutcome::NotYet(_) => {
-                    panic!("eager test venue refused output")
-                }
-            };
-            crate::lifecycle::LifecycleOutcome::Returned {
-                result: crate::abi::entry::SyscallResult::new(result),
-                work,
-            }
+            let _ = (address, bytes, work);
+            panic!("eager test venue cannot retain an unavailable output")
         }
 
         fn guest_isa(&self) -> carrick_guest_arch::GuestIsa {
