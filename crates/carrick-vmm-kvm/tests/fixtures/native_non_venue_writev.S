@@ -1,17 +1,17 @@
-/* #1756: a non-venue writev must be refused in ring, never host-replayed.
- * Native Linux oracle: build with -DNATIVE_ORACLE; EBADF (9), exit 0.
+/* #1756: host stdout is outside the pipe venue, never host-replayed.
+ * Native Linux oracle: build with -DNATIVE_ORACLE; write 1, stdout "!", exit 0.
  * Carrick's strict ring-first contract: counted ENOSYS (38), exit 0.
  */
 .global _start
 .text
 _start:
     mov $20, %eax
-    mov $-1, %rdi
+    mov $1, %edi
     lea vectors(%rip), %rsi
     mov $1, %edx
     syscall
 #ifdef NATIVE_ORACLE
-    cmp $-9, %rax
+    cmp $1, %rax
 #else
     cmp $-38, %rax
 #endif

@@ -1853,8 +1853,8 @@ fn in_zone_two_process_pipe_vectors_move_bytes_exactly_once() {
     assert_eq!(counters.refused[1].load(Acquire), 0);
 }
 
-/// Native Linux returns EBADF (9) for the same invalid descriptor. Under
-/// strict ring-first the absent venue instead returns counted ENOSYS (38),
+/// Native Linux writes one byte to the same host-backed stdout. Under
+/// strict ring-first the non-pipe venue instead returns counted ENOSYS (38),
 /// preserving the original x86 ordinal 20 and never crossing to the host.
 #[test]
 fn non_venue_writev_is_counted_without_host_crossing() {
