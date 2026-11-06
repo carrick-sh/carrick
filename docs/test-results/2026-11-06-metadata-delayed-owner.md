@@ -99,3 +99,23 @@ owner=false, parked=3. Run 7 completes the guest but reports one denied
 grant, with all 123 successful grants returned. No hangs or aborts occurred;
 all 20 binaries finished and all run-scoped cleanup checks passed. This is
 not closure; raw evidence is retained under `head2/`.
+
+The contender-before-owner monitor witness is red then green; the monitor
+now requires both observations with the original bound. Probe teardown also
+waits for publication of the delayed worker's handle before joining it.
+
+A bounded diagnostic captured the first actual uname refusal in a core
+(`core-72345`, run 10 in `refusal-core-100`). The lifecycle ring decodes
+with zero errors. Root task 1, execution 3, thread serial 2, MM 1 agrees
+with current record 1, incarnation 205, OnCpu on slot 2; installed MM is 1.
+The root CurrentTask and record both have lifecycle_page=control_slot=0.
+Other live records retain nonzero lifecycle references. This explains why
+the earlier native-admission and sysinfo-venue diagnostic branches did not
+capture these calls: the dispatcher falls back before acquiring that venue.
+
+`thread_lifecycle.rs::publish_resolved` clears both references and converts
+MetadataResolutionError::Busy into successful HostServed. The executor load
+ignores the returned publication outcome. Its existing unit test explicitly
+expects this fallback; under ring-first dispatch it causes refused uname
+calls. The exact mapping refusal still needs classification before choosing
+the owned deferral correction. No diagnostic population is acceptance.
