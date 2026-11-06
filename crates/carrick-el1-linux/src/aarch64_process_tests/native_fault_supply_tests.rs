@@ -292,6 +292,12 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
     if case != ChildStockCase::FirstBirth {
         let mut physical = super::native_retirement_tests::PhysicalStock::new(&fixture.tables);
         physical.metadata_in_el1_window = true;
+        physical.bind_lane(
+            &fixture.task,
+            fixture.zone,
+            carrick_guest_arch::CpuId::new(0),
+            fixture.address.root,
+        );
         crossing.physical = Some(std::sync::Mutex::new(physical));
     }
     let crossing = Box::leak(Box::new(crossing));
@@ -333,6 +339,16 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
     );
     let child = fixture.zone.slot(fixture.slot).current().unwrap();
     let identity = fixture.zone.record(child).identity();
+    if let Some(physical) = &crossing.physical {
+        // SAFETY: the synchronous fixture exclusively owns the selected record.
+        let context = unsafe { fixture.zone.record(child).ctx_mut() }
+            .address_context()
+            .unwrap();
+        physical
+            .lock()
+            .unwrap()
+            .observe_root(u64::from(fixture.slot.raw()), context.root);
+    }
     let owner = registry()
         .for_record(fixture.zone, fixture.zone.record_ref(child))
         .unwrap();
@@ -1425,6 +1441,12 @@ fn composed_native_supply_with_prepared(
         Box::leak(carrick_el1::cow::test_support::residency_table());
     let mut crossing = TestStockCrossing::new(&pages);
     let mut stock = super::native_retirement_tests::PhysicalStock::new(&fixture.tables);
+    stock.bind_lane(
+        &fixture.task,
+        fixture.zone,
+        carrick_guest_arch::CpuId::new(0),
+        fixture.address.root,
+    );
     stock.pool = Some(pool);
     stock.residency = Some(residency);
     crossing.physical = Some(std::sync::Mutex::new(stock));
@@ -1468,6 +1490,16 @@ fn composed_native_supply_with_prepared(
     );
     let child = fixture.zone.slot(fixture.slot).current().unwrap();
     let identity = fixture.zone.record(child).identity();
+    if let Some(physical) = &crossing.physical {
+        // SAFETY: the synchronous fixture exclusively owns the selected record.
+        let context = unsafe { fixture.zone.record(child).ctx_mut() }
+            .address_context()
+            .unwrap();
+        physical
+            .lock()
+            .unwrap()
+            .observe_root(u64::from(fixture.slot.raw()), context.root);
+    }
     let owner = registry()
         .for_record(fixture.zone, fixture.zone.record_ref(child))
         .unwrap();

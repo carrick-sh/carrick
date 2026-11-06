@@ -2667,18 +2667,15 @@ fn root_execution(
     zone: &carrick_el1_abi::ZoneTables,
     ttbr0: u64,
 ) -> Option<crate::fork_stock::GrantExecution> {
-    let (binding, root) = diagnostic_identity(cpu, task, zone, ttbr0)?;
-    Some(crate::fork_stock::GrantExecution::new(
+    crate::fork_stock::GrantExecution::from_stopped_lane(
         cpu,
-        binding,
-        carrick_guest_arch::AddressContext {
-            root,
-            mm: carrick_guest_arch::MmGeneration::new(core::num::NonZeroU64::new(
-                binding.mm.raw(),
-            )?),
-            generation: task.root_generation()?,
-        },
-    ))
+        carrick_core::entry::binding(&task.execution, &task.mm),
+        task.root_generation(),
+        zone,
+        carrick_guest_arch::RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(
+            ttbr0 & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK,
+        ))?,
+    )
 }
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]

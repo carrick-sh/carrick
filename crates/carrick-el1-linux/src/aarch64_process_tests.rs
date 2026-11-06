@@ -547,7 +547,9 @@ impl ForkStockCrossing for TestStockCrossing {
         &self.fd_map
     }
 
-    fn cross_fork_stock(&self, record_gpa: u64, _cpu: u64) -> Result<(), NativeProcessError> {
+    fn cross_fork_stock(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError> {
+        #[cfg(not(test))]
+        let _ = cpu;
         let tag = unsafe { *(record_gpa as *const u64) };
         match ForkStockKind::decode(tag) {
             Some(ForkStockKind::Loan) => {
@@ -570,7 +572,12 @@ impl ForkStockCrossing for TestStockCrossing {
                 #[cfg(test)]
                 if let Some(physical) = &self.physical {
                     let mut physical = physical.lock().unwrap();
-                    let loan = physical.loan(req, exchange, child_slice, parent_slice);
+                    let execution = physical.execution(cpu).inspect_err(|_| {
+                        exchange.refuse(ForkStockRefusal::Stale);
+                    })?;
+                    let loan = physical
+                        .loan(execution, exchange, child_slice, parent_slice)
+                        .map_err(|_| NativeProcessError::Stale)?;
                     *self.pending_loan.lock().unwrap() = Some(loan);
                     return Ok(());
                 }
@@ -658,7 +665,13 @@ impl ForkStockCrossing for TestStockCrossing {
                 };
                 #[cfg(test)]
                 if let Some(physical) = &self.physical {
-                    physical.lock().unwrap().reserve(loan, settlement);
+                    let mut physical = physical.lock().unwrap();
+                    let execution = physical.execution(cpu).inspect_err(|_| {
+                        settlement.refuse(ForkStockRefusal::Stale);
+                    })?;
+                    physical
+                        .reserve(execution, settlement)
+                        .map_err(|_| NativeProcessError::Stale)?;
                 }
                 if !self.has_physical() && !settlement.accept(loan) {
                     return Err(NativeProcessError::Invalid);
@@ -684,14 +697,22 @@ impl ForkStockCrossing for TestStockCrossing {
                     CommitFault::MissingReply => return Ok(()),
                     CommitFault::None => {}
                 }
-                if let Some(loan) = self.pending_loan.lock().unwrap().take() {
+                let pending = *self.pending_loan.lock().unwrap();
+                if let Some(loan) = pending {
                     #[cfg(test)]
                     if let Some(physical) = &self.physical {
-                        physical.lock().unwrap().commit(loan, settlement);
+                        let mut physical = physical.lock().unwrap();
+                        let execution = physical.execution(cpu).inspect_err(|_| {
+                            settlement.refuse(ForkStockRefusal::Stale);
+                        })?;
+                        physical
+                            .commit(execution, settlement)
+                            .map_err(|_| NativeProcessError::Stale)?;
                     }
                     if !self.has_physical() && !settlement.accept(loan) {
                         return Err(NativeProcessError::Invalid);
                     }
+                    self.pending_loan.lock().unwrap().take();
                 }
                 Ok(())
             }
@@ -699,6 +720,18 @@ impl ForkStockCrossing for TestStockCrossing {
                 self.settlements_aborted.fetch_add(1, Ordering::AcqRel);
                 self.reserved_custody_rows.store(0, Ordering::Release);
                 let settlement = unsafe { &mut *(record_gpa as *mut ForkStockSettlement) };
+                #[cfg(test)]
+                if let Some(physical) = &self.physical {
+                    let mut physical = physical.lock().unwrap();
+                    let execution = physical.execution(cpu).inspect_err(|_| {
+                        settlement.refuse(ForkStockRefusal::Stale);
+                    })?;
+                    physical
+                        .settle(execution, settlement)
+                        .map_err(|_| NativeProcessError::Stale)?;
+                    self.pending_loan.lock().unwrap().take();
+                    return Ok(());
+                }
                 if let Some(loan) = self.pending_loan.lock().unwrap().take() {
                     if !settlement.accept(loan) {
                         return Err(NativeProcessError::Invalid);
@@ -737,10 +770,15 @@ impl ForkStockCrossing for TestStockCrossing {
                     // SAFETY: the synchronous fixture retains the ring reply slot.
                     let reply =
                         unsafe { &*(address.raw() as *const carrick_el1_abi::PortalGrantSlot) };
+                    let mut physical = physical.lock().unwrap();
+                    let execution = physical.execution(cpu).inspect_err(|_| {
+                        settlement.refuse();
+                    })?;
                     physical
-                        .lock()
-                        .unwrap()
-                        .settle_backing_reply(owner, generation, reply);
+                        .settle_descriptor(execution, owner, generation, reply)
+                        .inspect_err(|_| {
+                            settlement.refuse();
+                        })?;
                 }
                 settlement
                     .accept()
@@ -2449,7 +2487,7 @@ fn arm_child_wait_wake(in_ring: bool, sibling: bool) {
 
 #[cfg(test)]
 fn arm_child_wait_wake_with_stock(in_ring: bool, sibling: bool, physical: bool) {
-    let fixture = Fixture::new(0x10000, asid(1));
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     fixture.zone.spaces.set_idle_ttbr(0x30000);
     let source = BornInZoneSource {
         zone: fixture.zone,
@@ -2481,9 +2519,14 @@ fn arm_child_wait_wake_with_stock(in_ring: bool, sibling: bool, physical: bool) 
         0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
     ]);
     if physical {
-        crossing.physical = Some(std::sync::Mutex::new(
-            native_retirement_tests::PhysicalStock::new(&fixture.tables),
-        ));
+        let mut stock = native_retirement_tests::PhysicalStock::new(&fixture.tables);
+        stock.bind_lane(
+            &fixture.task,
+            fixture.zone,
+            carrick_guest_arch::CpuId::new(0),
+            fixture.address.root,
+        );
+        crossing.physical = Some(std::sync::Mutex::new(stock));
     }
     let mut service = Aarch64NativeProcessService::with_crossing(
         &fixture.task,

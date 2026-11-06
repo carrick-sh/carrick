@@ -182,6 +182,36 @@ impl GrantExecution {
         }
     }
 
+    /// Authenticate a stopped lane against its live installed MM and root.
+    /// The caller reads the binding and root incarnation from the stopped
+    /// lane's current-task atomics, and supplies the observed hardware root.
+    pub fn from_stopped_lane<C: Copy + Send + Sync + zerocopy::FromZeros>(
+        cpu: CpuId,
+        binding: ExecutionBinding,
+        generation: Option<carrick_guest_arch::ContextGeneration>,
+        zone: &carrick_sched_core::ZoneTables<C>,
+        root: RootGpa,
+    ) -> Option<Self> {
+        let slot = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)?;
+        let index = zone.spaces.find(binding.mm.raw())?;
+        let grant = zone.spaces.grant(index, binding.mm.raw())?;
+        if !binding.issued()
+            || zone.installed_space(slot) != binding.mm.raw()
+            || root.address().raw() != grant.ttbr0 & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK
+        {
+            return None;
+        }
+        Some(Self::new(
+            cpu,
+            binding,
+            AddressContext {
+                root,
+                mm: carrick_guest_arch::MmGeneration::new(NonZeroU64::new(binding.mm.raw())?),
+                generation: generation?,
+            },
+        ))
+    }
+
     pub fn matches(self, current: Self) -> bool {
         self.cpu == current.cpu
             && self.binding == current.binding
@@ -2002,6 +2032,17 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         self.tags
             .release_unpublished(reserved.tag)
             .map_err(|_| ForkStockRefusal::Invalid)
+    }
+
+    /// Match a stopped lane to the exact live child custody it may settle.
+    pub fn child_execution_matches(
+        &self,
+        execution: GrantExecution,
+        owner: carrick_el1_abi::El1MmHandle,
+    ) -> bool {
+        execution.binding.mm.raw() == owner.mm().raw()
+            && self.child_owner(owner.mm()) == Some(owner)
+            && self.child_root(owner.mm()) == Some(execution.context.root)
     }
 
     /// The outstanding loan of an authenticated stopped CPU.
