@@ -447,3 +447,66 @@ fn cache_preparation_failure_is_infrastructure_and_offline_gate_never_fetches() 
     assert_eq!(calls.lines().count(), 1);
     assert!(calls.starts_with("metadata --locked --format-version"));
 }
+
+#[test]
+fn xtask_recipe_partitions_serial_host_under_single_thread() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let captured = carrick_xtask::test_shards::records(&root, "_test-xtask", &[]).unwrap();
+    assert_eq!(
+        captured.len(),
+        2,
+        "_test-xtask must partition parallel and serial_host passes: {captured:?}"
+    );
+    let (parallel, serial) = (&captured[0], &captured[1]);
+    assert_eq!(
+        parallel[0], "",
+        "parallel _test-xtask pass must not force single-threaded execution"
+    );
+    assert!(
+        parallel.ends_with(&[
+            "--".to_string(),
+            "--skip".to_string(),
+            "serial_host".to_string(),
+        ]),
+        "parallel _test-xtask pass must skip serial_host: {parallel:?}"
+    );
+    assert_eq!(
+        serial[0], "1",
+        "serial_host _test-xtask pass must set RUST_TEST_THREADS=1"
+    );
+    assert_eq!(
+        serial.last().map(String::as_str),
+        Some("serial_host"),
+        "serial_host _test-xtask pass must filter on serial_host: {serial:?}"
+    );
+    assert!(
+        !serial[3..].iter().any(|arg| arg == "--"),
+        "serial_host filter must be positional before harness separator: {serial:?}"
+    );
+    assert_eq!(
+        &parallel[3..parallel.len() - 3],
+        &serial[3..serial.len() - 1],
+        "parallel and serial_host passes must select identical Cargo targets and features"
+    );
+
+    let no_run =
+        carrick_xtask::test_shards::records(&root, "_test-xtask", &["--no-run".to_string()])
+            .unwrap();
+    assert_eq!(no_run.len(), 2);
+    assert_eq!(
+        no_run[0]
+            .last_chunk::<4>()
+            .map(|c| c.each_ref().map(String::as_str)),
+        Some(["--no-run", "--", "--skip", "serial_host"]),
+        "--no-run must precede harness args on parallel pass: {:?}",
+        no_run[0]
+    );
+    assert_eq!(
+        no_run[1]
+            .last_chunk::<2>()
+            .map(|c| c.each_ref().map(String::as_str)),
+        Some(["--no-run", "serial_host"]),
+        "--no-run must precede filter on serial_host pass: {:?}",
+        no_run[1]
+    );
+}
