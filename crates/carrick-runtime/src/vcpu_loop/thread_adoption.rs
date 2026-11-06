@@ -719,6 +719,12 @@ where
             .take_opened_start_gate(generation)
             .ok_or_else(|| TrapError::Hypervisor("born adoption lost start proof".into()))?;
         logical.install_start_gate(gate)?;
+        #[cfg(any(test, feature = "test-support"))]
+        carrick_kernel::el1_zone::first_entry_test_control::emit(
+            carrick_kernel::el1_zone::first_entry_test_control::Event::BeforePublish(
+                context.thread().key(),
+            ),
+        );
         let result = dormant.activate(
             &scheduler,
             context.thread().clone(),

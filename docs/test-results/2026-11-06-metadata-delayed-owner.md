@@ -76,3 +76,18 @@ Adapter operation tokens remain attached: the companion native witness
 record and incarnation to remain pinned. The metadata witness is green,
 and the scheduler regular library suite passes all 268 tests. Its
 `serial_host` partition has no tests. Signed proof remains pending.
+
+The first correction's recipe invocation still failed with `host_failures=64`,
+although its subsequent predetermined population passed 20/20. That failure
+is retained and prevents claiming closure. Review found a second ordering
+error: `activate_born_thread` makes the successor runnable before
+`adopt_born_record` retires its old activation. Registry rehome can therefore
+return Busy while the old record remains Activating, before metadata
+settlement even runs.
+
+The signed production witness
+`el1_first_entry_retires_before_host_publication` pairs ExecutorTaken with
+the exact thread's pre-publication event. It fails on three real records,
+each still Activating (`publication-red2.log`). The first draft inspected
+an absent control-slot reference; its failure is not counted as evidence.
+No sleep or scheduler barrier is used by this witness.
