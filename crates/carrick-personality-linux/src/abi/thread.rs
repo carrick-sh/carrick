@@ -579,12 +579,12 @@ pub struct ThreadControlSlot {
 pub struct AffinitySeedRefused;
 
 /// Undo for the two clone output words, retained until restoration finishes.
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 pub(crate) struct CloneTidRollback {
     pub outputs: [(carrick_guest_arch::UserVa, [u8; 4]); 2],
     pub completion: CloneRollbackCompletion,
 }
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 pub(crate) enum CloneRollbackCompletion {
     Retry,
     Returned(crate::abi::entry::SyscallResult),
@@ -592,7 +592,7 @@ pub(crate) enum CloneRollbackCompletion {
 }
 
 /// Exact exit-walk progress, owned by the stopped/running member, never by a CPU.
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 pub(crate) struct RobustExitCursor {
     pub entry: u64,
     pub next: u64,
@@ -602,7 +602,7 @@ pub(crate) struct RobustExitCursor {
     pub word: u32,
     pub phase: RobustExitPhase,
 }
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 pub(crate) enum RobustExitPhase {
     Next,
     Read,

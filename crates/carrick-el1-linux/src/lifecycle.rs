@@ -281,7 +281,7 @@ impl<
             if let Some(word) = unsafe {
                 carrick_el1::substrate::file::compare_exchange_user_u32_guarded(
                     task,
-                    address.raw(),
+                    address,
                     expected,
                     replacement,
                 )

@@ -171,10 +171,11 @@ pub unsafe fn copy_from_user_guarded(
 #[inline(never)]
 pub unsafe fn compare_exchange_user_u32_guarded(
     task: &CurrentTask,
-    address: u64,
+    address: carrick_guest_arch::UserVa,
     expected: u32,
     replacement: u32,
 ) -> Option<u32> {
+    let address = address.raw();
     #[cfg(not(target_os = "none"))]
     {
         let _ = task;
