@@ -309,31 +309,23 @@ impl Cpl0Carrier {
     ) -> Result<usize, TrapError> {
         const PAGE: usize = 4096;
         const MAX_BYTES: usize = X86_CPL0_INITIAL_EXTENT_MAX_SIZE as usize;
-        let mut image_pages = 0usize;
-        let mut initialized = 0usize;
-        for region in &image.regions {
-            let pages = usize::try_from((region.end - region.start) / PAGE as u64)
-                .map_err(|_| fail("initial image page count"))?;
-            image_pages = image_pages
-                .checked_add(pages)
-                .ok_or_else(|| fail("initial image pages"))?;
-            initialized = initialized
-                .checked_add(region.file_bytes.len())
-                .ok_or_else(|| fail("initial image bytes"))?;
-        }
+        let initialized = image
+            .regions
+            .iter()
+            .try_fold(0usize, |sum, region| {
+                sum.checked_add(region.file_bytes.len())
+            })
+            .ok_or_else(|| fail("initial image bytes"))?;
         let strings = argv
             .iter()
             .chain(env)
             .try_fold(0usize, |sum, value| sum.checked_add(value.len()))
             .ok_or_else(|| fail("initial argv/env bytes"))?;
-        let user_pages = image_pages
-            .checked_add(initial_stack_pages(image, argv, env)?)
+        // Entry is the only prepopulated ELF leaf. Untouched data is supplied
+        // on demand from its retained source, without a boot grant or receipt.
+        let user_pages = initial_stack_pages(image, argv, env)?
+            .checked_add(1)
             .ok_or_else(|| fail("initial user pages"))?;
-        // This loader still owns resident data grants for the entire image.
-        // Reject impossible populations before walking their table geometry.
-        if user_pages > MAX_BYTES / PAGE {
-            return Err(fail("initial image exceeds carrier memory budget"));
-        }
         let table_pages =
             initial_table_grant_count(image).ok_or_else(|| fail("initial table grant count"))?;
         let grants = table_pages
@@ -858,13 +850,8 @@ impl Cpl0Carrier {
             0,
         );
         let grants_offset = staged.len();
-        let image_pages: usize = image
-            .regions
-            .iter()
-            .map(|r| ((r.end - r.start) / 4096) as usize)
-            .sum();
-        let data_grants = image_pages
-            .checked_add(initial_stack_pages(image, argv, env)?)
+        let data_grants = initial_stack_pages(image, argv, env)?
+            .checked_add(1)
             .ok_or_else(|| fail("initial data grants"))?;
         let table_grants =
             initial_table_grant_count(image).ok_or_else(|| fail("initial table grants"))?;
@@ -1302,6 +1289,7 @@ impl Cpl0Carrier {
                 reply.result_initial_break,
                 reply.stack_top,
                 image,
+                &regions,
                 limits,
             )?;
             inventory.finish()?;
@@ -1364,8 +1352,13 @@ impl Cpl0Carrier {
         initial_break: u64,
         stack_top: u64,
         image: &carrick_mem::x86_initial_image::X86InitialImage<'_>,
+        sources: &[X86InitialBootRegion],
         limits: InitialReservationLimits,
     ) -> Result<(), TrapError> {
+        let mut identities = Vec::with_capacity(sources.len());
+        for source in sources {
+            identities.push(self.custody.retain_initial_source(source)?);
+        }
         let layout =
             initial_reservation_layout(UserVa::new(initial_break), UserVa::new(stack_top), limits)?;
         let table = self
@@ -1420,16 +1413,18 @@ impl Cpl0Carrier {
             .lock(index.index(), mm, &NoRootWait)
             .and_then(|mut model| {
                 model.finish_import()?;
-                for region in &image.regions {
+                for (region, source) in image.regions.iter().zip(&identities) {
                     let bits = u64::from(region.perms.read)
                         | (u64::from(region.perms.write) << 1)
                         | (u64::from(region.perms.execute) << 2);
-                    model.insert_opaque(
+                    model.insert_opaque_backed(
                         ReservationRange::new(region.start, region.end)
                             .ok_or(carrick_el1::memory::reservations::Refusal::Invalid)?,
                         carrick_el1_abi::ReservationProtection::from_bits(bits)
                             .ok_or(carrick_el1::memory::reservations::Refusal::Invalid)?,
-                        carrick_el1_abi::ReservationNodeFlags::PRIVATE,
+                        carrick_el1_abi::ReservationNodeFlags::PRIVATE
+                            .union(carrick_el1_abi::ReservationNodeFlags::FILE),
+                        Some(*source),
                     )?;
                 }
                 model.insert_opaque(

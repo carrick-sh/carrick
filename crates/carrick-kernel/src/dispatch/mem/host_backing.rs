@@ -5,12 +5,7 @@ use carrick_el1_abi::HostBackingIdentity;
 use core::num::NonZeroU64;
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-
-// Physical custody identity, not task/MM identity. Distinct custodians must
-// reject each other's tokens even when both have just retained their first file.
-static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum SourceKey {
@@ -70,13 +65,7 @@ impl HostBackingCustody {
         if let Some(record) = state.sources.get(&key).and_then(Weak::upgrade) {
             return Some(HostBackingLease(record));
         }
-        let handle = NonZeroU64::new(
-            NEXT_HANDLE
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                    value.checked_add(1)
-                })
-                .ok()?,
-        )?;
+        let handle = carrick_hal::fork_stock::allocate_host_backing_handle()?;
         let record = Arc::new(Record {
             key,
             label,
@@ -97,13 +86,7 @@ impl HostBackingCustody {
         source: PrivateFileBacking,
         label: String,
     ) -> Option<HostBackingLease> {
-        let handle = NonZeroU64::new(
-            NEXT_HANDLE
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                    value.checked_add(1)
-                })
-                .ok()?,
-        )?;
+        let handle = carrick_hal::fork_stock::allocate_host_backing_handle()?;
         let record = Arc::new(Record {
             key: SourceKey::of(&source),
             label,
@@ -196,6 +179,7 @@ impl Drop for Record {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
     #[test]
     fn fork_source_custody_bounds_identity_work_for_many_sources() {
         use carrick_hal::fork_stock::{ForkHostBackingCustody, HostBackingRetention};

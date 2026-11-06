@@ -11,28 +11,26 @@ fixture = "carrick-el1::isa::x86::initial_mm::tests; carrick-vmm-kvm::cpl0_initi
 scale_points = [1, 2, 3]
 structural_budgets = []
 rationale = """
-The shared ElfProgram resolves PT_INTERP once using the guest filesystem,
-plans its segments with the same ISA-neutral ELF parser, and supplies both
-images to the existing MM owner. Only executable regions determine brk.
-The dynamic fixture preserves one frame grant/publication per mapped user
-page and proves interpreter entry with executable auxiliary metadata. The
-configured bootstrap stack is privately zero-backed before entry, including
-its prefix: production retains its existing 64 KiB bound. Only the initialized
-tail is serialized. The lower-stack translation assertion was NotPresent
-before full configured backing; no demand-fault retry or stack-size increase
-is introduced.
-The host parses through the one ISA-neutral ELF planner and lends only file
-bytes and load metadata. The guest creates an unpublished root, copies the
-single supervisor half, builds its own stack, initializes private zeroed
-frames and maps each user page through an edit intent. One publication record
-is returned per mapped page. The VM-free fixture checks six user pages (two ELF and four stack),
-six data grants, one root plus exactly five unique page-table grants, and
-zero-filled BSS, and that every owned initial page (text, data and the
-anonymous stack) is published with owner-private (PRIVATE) custody, so a
-later copy-on-write of an ELF data page is admitted. The KVM fixture enters a real static ELF at its mapped RIP
-and observes exit_group(7), with no semantic host forward. This bounded
-carrier fixture does not prove production VM/vCPU lifetime or the CLI x86 run
-path; those belong to the x86-run milestone and director acceptance.
+The ISA-neutral ELF planner supplies the executable and PT_INTERP regions;
+only executable regions determine brk. The x86 guest initial owner backs the
+entry leaf and full configured bootstrap stack. Remaining ELF pages retain
+immutable initialized bytes and implicit zero padding through the reservation
+owner's HostBackingIdentity. Faults select those sources through the existing
+Prepare protocol. Source custody belongs to the carrier's retained initial
+aperture, so a parent's exit or exec cannot invalidate a child's byte source.
+The initial aperture remains capped at 512 MiB. At 4, 32 and 100 MiB, sizing
+permits one staged copy plus topology-sized table stock and bounded metadata;
+untouched pages owe neither private output frames nor publications. Fork
+inherits absent sources separately from the bounded resident frame population.
+The large-fork binding reads a nonzero initialized byte in a distant leaf that
+was absent at fork, in both child and parent.
+This is not yet a complete integration: forwarded host reads and writes still
+require resident stage-1 translations. Valid ELF-backed syscall buffers can
+therefore fail when untouched. The existing UserRead/UserWrite transfer owner
+must prepare these buffers and retain the syscall across Supply/Wait before
+forwarding. A direct source-read fallback or host descriptor edit would bypass
+that owner. The initial-MM suite remains red and this candidate must not land.
+Signed acceptance, native Docker differential and runtime ratios remain open.
 """
 
 [bindings]
@@ -42,6 +40,7 @@ vm_free = [
   "carrick-el1::isa::x86_initial_mm::tests::guest_stack_has_sysv_order_and_exact_auxv_addresses",
   "carrick-el1::isa::x86_initial_mm::tests::fresh_owner_enters_interpreter_but_break_and_auxv_belong_to_executable",
   "carrick-x86-cpl0-host::cpl0_boot::birth_source_tests::bootstrap_metadata_records_are_disjoint_before_root_binding",
+  "carrick-x86-cpl0-host::cpl0_boot::birth_source_tests::initial_source_retains_partial_bytes_zero_tail_and_exact_identity",
   "carrick-mem::x86_initial_image::static_x86_image_reuses_elf_plan_without_host_mm_edits",
   "carrick-mem::x86_initial_image::dynamic_x86_image_enters_interpreter_with_executable_auxv",
 ]

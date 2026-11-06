@@ -1519,6 +1519,20 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         self.free.insert(handle.slot);
         Ok(())
     }
+    /// Retain physical byte custody without granting mapping authority. The
+    /// caller must already own an immutable span inside this registration.
+    pub(crate) fn retain_source_extent(
+        &self,
+        pa: FrameGpa,
+        len: usize,
+    ) -> Result<Arc<BackingExtent>, MemoryError> {
+        self.admit()?;
+        let slot = self
+            .locate(pa, len)
+            .ok_or_else(|| error("byte source outside retained storage"))?;
+        Ok(Arc::clone(&slot.backing.extent))
+    }
+
     pub fn read(&self, pa: FrameGpa, len: usize) -> Result<Vec<u8>, MemoryError> {
         self.admit()?;
         let ptr = self

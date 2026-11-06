@@ -18,6 +18,10 @@ _start:
     cmpl $(7 << 8), -24(%rsp)
     jne failure
 child:
+    /* This leaf is absent at fork in both MMs. Each must fault the retained
+       initialized source, rather than silently obtaining anonymous zeros. */
+    cmpb $0x5a, payload_tail(%rip)
+    jne failure
     mov $7, %edi
     jmp exit
 failure:
@@ -27,3 +31,5 @@ exit:
     syscall
     ud2
     .skip 100 * 1024 * 1024, 0
+payload_tail:
+    .byte 0x5a

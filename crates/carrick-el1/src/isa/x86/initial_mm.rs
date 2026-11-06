@@ -481,12 +481,21 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
     // those tables at the page that first uses them, rather than lending the
     // entire image's stock to a single bounded descriptor transaction.
     let mut prefixes = [BTreeSet::new(), BTreeSet::new(), BTreeSet::new()];
+    // Only the entry page and bootstrap stack start resident.
+    let entry_page = image.entry.raw() & !(PAGE - 1);
     let mut publications = Vec::new();
     for region in spans {
         let end = region.start + region.len;
         let initialized_start = region.start + region.initialized_offset;
         let initialized_end = initialized_start + region.contents.len();
-        for va in (region.start..end).step_by(PAGE as usize) {
+        let (resident_start, resident_end) = match region.contents {
+            RegionContents::Guest(_) if entry_page >= region.start && entry_page < end => {
+                (entry_page, entry_page + PAGE)
+            }
+            RegionContents::Guest(_) => continue,
+            RegionContents::Stack(_) => (region.start, end),
+        };
+        for va in (resident_start..resident_end).step_by(PAGE as usize) {
             let grant = source
                 .take_zeroed_data()
                 .ok_or(InitialMmError::FrameUnavailable)?;
@@ -914,23 +923,18 @@ mod tests {
             0,
             "the initial anonymous stack needs owner-private COW custody"
         );
-        let data_leaf = translate_leaf(
-            &words,
-            loaded.address.root,
-            UserVa::new(0x402000),
-            Access::Write,
-            true,
-        )
-        .unwrap();
-        assert_ne!(
-            data_leaf.descriptor & carrick_mmu_core::x86::descriptor_txn::PRIVATE,
-            0,
-            "initial ELF data is private Linux mapping custody too"
+        assert!(
+            translate_leaf(
+                &words,
+                loaded.address.root,
+                UserVa::new(0x402000),
+                Access::Read,
+                true
+            )
+            .is_err(),
+            "untouched ELF data must retain its source without a private output frame"
         );
-        assert_eq!(
-            loaded.publications.len(),
-            6 + usize::from(interpreted) + extra as usize
-        );
+        assert_eq!(loaded.publications.len(), 5);
         assert_eq!(loaded.initial_break.raw(), expected_break);
         assert_eq!(loaded.context.frame[15], entry);
         assert_eq!(loaded.context.frame[16], 0x23);
@@ -941,7 +945,7 @@ mod tests {
         let leaf = translate_leaf(
             &words,
             loaded.address.root,
-            UserVa::new(0x400000),
+            UserVa::new(entry),
             Access::Execute,
             true,
         )
@@ -965,29 +969,14 @@ mod tests {
             )
             .is_err()
         );
-        let data = translate_leaf(
-            &words,
-            loaded.address.root,
-            UserVa::new(0x402000),
-            Access::Write,
-            true,
-        )
-        .unwrap();
-        assert_eq!(&frames.data_at(data.output.raw())[..3], b"hi\n");
-        assert!(
-            frames.data_at(data.output.raw())[3..]
-                .iter()
-                .all(|byte| *byte == 0)
-        );
         assert_eq!(
-            frames.next_data,
-            0x90_6000 + PAGE * (u64::from(interpreted) + extra),
-            "one data grant per user page"
+            frames.next_data, 0x90_5000,
+            "entry plus four bootstrap stack pages; untouched ELF data owes no grant"
         );
         assert_eq!(
             frames.next_table,
-            0x80_9000 + 3 * PAGE * u64::from(interpreted) + PAGE * extra,
-            "one root, five user tables and three private copy tables"
+            0x80_9000 + PAGE * u64::from(interpreted),
+            "root, resident user paths and the private copy branch"
         );
         assert_ne!(loaded.address.root.address().raw(), 0x60_0000);
     }

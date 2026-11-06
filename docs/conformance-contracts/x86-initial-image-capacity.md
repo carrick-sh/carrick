@@ -1,5 +1,8 @@
 # Large x86 initial images (#1715)
 
+The first two sections record earlier witnesses and the table-stock correction.
+The current candidate and its remaining blocker are recorded at the end.
+
 The `x86.mm.initial-image` contract now includes a 100 MiB initialized ELF
 through production carrier boot and a similarly sized fork/wait assertion.
 The boot assertion passes; the fork assertion currently fails at the separate
@@ -66,3 +69,35 @@ frames before entry. Source custody must survive fork, parent exit and exec;
 partial pages, BSS, protection changes and kernel user-copy materialization
 must use that same authority. No such implementation or acceptance is claimed
 by this witness commit.
+
+## Source-backed candidate and remaining blocker
+
+The candidate prepopulates only the entry leaf and configured bootstrap stack.
+The KVM aperture planner charges those grants and publications, one staged copy
+of initialized bytes, and topology-sized tables. It does not raise the 512 MiB
+aperture. Untouched ELF pages are imported with a retained source identity in
+the sole reservation graph. The shared physical service authenticates that
+identity and fills private grants only when selected by the existing fault
+owner. Partial initialized pages and BSS use zero padding. The immutable source
+retains the actual `BackingExtent`, rather than a bootstrap `GuestRam` window.
+Initial source handles and open-file handles share one neutral monotonic issuer.
+
+Fork authenticates byte-source custody separately from resident-frame custody.
+The extended 100 MiB witness requires child and parent to read a nonzero byte
+from a distant leaf absent at fork. Both this witness and the 4/32/100 MiB
+allocation witness pass on real KVM. Initial sources remain retained until the
+carrier is destroyed, bounded by its one initial image.
+
+The candidate is not ready to land. `ForwardVenue::read_bytes_raw` and
+`write_bytes_raw` require present, authenticated stage-1 leaves. An untouched
+ELF syscall buffer can therefore fail or change a valid guest result. The full
+initial-MM suite reports 22 passes, eight failures, one ignored. User instruction
+faults alone do not cover kernel user copies.
+
+The required integration is the shared `MmPortal::begin` / `select` /
+`revalidate` / `complete` protocol, with `UserRead` or `UserWrite` intent before
+forwarding. It must preserve the syscall and transfer continuation across
+`Supply`, `CowSupply` and owner waits. The current synchronous host `GuestMemory`
+API has no owned suspension venue. A direct retained-source fallback would make
+a second copy authority; lowering contention to EFAULT or spinning would be
+incorrect. Independent review requests changes for this P0 regression.

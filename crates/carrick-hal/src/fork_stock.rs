@@ -56,6 +56,20 @@ pub enum HostBackingReadError {
     Unavailable,
 }
 
+/// Allocate a process-unique byte-source handle shared by all custodians.
+/// Moving an image source between services must never alias an open-file source.
+pub fn allocate_host_backing_handle() -> Option<NonZeroU64> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
+    NonZeroU64::new(
+        NEXT_HANDLE
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .ok()?,
+    )
+}
+
 pub trait HostBackingRetention: Send + Sync {
     fn identity(&self) -> carrick_el1_abi::HostBackingIdentity;
     /// Returns a bounded readable prefix; no bytes beyond a backing fault are supplied.

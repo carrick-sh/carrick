@@ -2452,6 +2452,7 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
     pub(crate) ram: Arc<GuestRam>,
     birth_live: BirthSourceRevocation,
     initial_extent: Option<(BackingHandle, usize)>,
+    initial_sources: carrick_hal::fork_stock::ForkHostBackingCustody,
     _kernel_region: Option<BackingHandle>,
     files: RetainedFileRegion,
     frame_inventory: Arc<dyn PhysicalFrameInventory>,
@@ -3773,6 +3774,58 @@ impl carrick_hal::birth_serial::BirthSerialSource for PhysicalBirthSource {
     }
 }
 
+/// Immutable PT_LOAD bytes in the supervisor-only staging aperture. This
+/// source owns physical custody only; the reservation graph owns VA, offsets,
+/// permissions and inheritance. It stays alive across root exit and exec while
+/// any descendant can still select it.
+struct InitialImageSource {
+    extent: Arc<BackingExtent>,
+    identity: carrick_el1_abi::HostBackingIdentity,
+    start: FrameGpa,
+    initialized_offset: u64,
+    initialized_len: u64,
+    len: u64,
+}
+impl carrick_hal::fork_stock::HostBackingRetention for InitialImageSource {
+    fn identity(&self) -> carrick_el1_abi::HostBackingIdentity {
+        self.identity
+    }
+    fn read(
+        &self,
+        request: carrick_hal::fork_stock::HostBackingRead,
+    ) -> Result<Vec<u8>, carrick_hal::fork_stock::HostBackingReadError> {
+        use carrick_hal::fork_stock::HostBackingReadError as Error;
+        let identity = request.identity();
+        if identity.handle() != self.identity.handle()
+            || identity.generation() != self.identity.generation()
+        {
+            return Err(Error::Stale);
+        }
+        let offset = identity.offset();
+        let end = offset
+            .checked_add(request.length() as u64)
+            .ok_or(Error::Unavailable)?;
+        if end > self.len {
+            return Err(Error::Inaccessible);
+        }
+        let mut bytes = vec![0; request.length()];
+        let copy_start = offset.max(self.initialized_offset);
+        let copy_end = end.min(self.initialized_offset + self.initialized_len);
+        if copy_start < copy_end {
+            let data = self
+                .extent
+                .read_unpublished(
+                    self.start.raw() + copy_start - self.initialized_offset,
+                    (copy_end - copy_start) as usize,
+                )
+                .map_err(|_| Error::Unavailable)?;
+            let at = (copy_start - offset) as usize;
+            bytes[at..at + data.len()].copy_from_slice(&data);
+        }
+        Ok(bytes)
+    }
+}
+
 pub struct BootstrapCustody<M: CarrierMemoryIo>(Cpl0HostCustody<M>);
 
 impl<M: CarrierMemoryIo> BootstrapCustody<M> {
@@ -3802,6 +3855,7 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             ram,
             birth_live: BirthSourceRevocation::new(),
             initial_extent,
+            initial_sources: Default::default(),
             _kernel_region: kernel_region,
             files: files.0,
             frame_inventory,
@@ -3829,6 +3883,41 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             kicks: 0,
             work_exits: 0,
         }))
+    }
+    /// Admit an immutable source before opening the initial reservation root.
+    /// The boot ABI's disjoint-area check keeps these bytes outside all mutable
+    /// grants, stack, request and publication storage.
+    pub fn retain_initial_source(
+        &mut self,
+        region: &carrick_core_abi::X86InitialBootRegion,
+    ) -> Result<carrick_el1_abi::HostBackingIdentity, TrapError> {
+        if region
+            .initialized_offset
+            .checked_add(region.initialized_len)
+            .is_none_or(|end| end > region.len)
+        {
+            return Err(fail("initial retained source range"));
+        }
+        let extent = self
+            .0
+            ._vm
+            .retain_source_extent(
+                FrameGpa::new(region.source_gpa),
+                region.initialized_len as usize,
+            )
+            .map_err(|error| fail(error.to_string()))?;
+        let handle = carrick_hal::fork_stock::allocate_host_backing_handle()
+            .ok_or_else(|| fail("initial source identity exhausted"))?;
+        let identity = carrick_el1_abi::HostBackingIdentity::new(handle, NonZeroU64::MIN, 0);
+        self.0.initial_sources.inherit(Arc::new(InitialImageSource {
+            extent,
+            identity,
+            start: FrameGpa::new(region.source_gpa),
+            initialized_offset: region.initialized_offset,
+            initialized_len: region.initialized_len,
+            len: region.len,
+        }));
+        Ok(identity)
     }
     pub fn memory(&self) -> &CarrierMemory<M> {
         &self.0._vm
@@ -4024,6 +4113,43 @@ mod birth_source_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use carrick_hal::birth_serial::{BirthSerialSource, BirthSourceError, BirthSourceIdentity};
+
+    #[test]
+    fn initial_source_retains_partial_bytes_zero_tail_and_exact_identity() {
+        use carrick_hal::fork_stock::{
+            HostBackingRead, HostBackingReadError, HostBackingRetention,
+        };
+        let extent = Arc::new(BackingExtent::private(FrameGpa::new(0x1000), 4096).unwrap());
+        let pointer = extent.host_base().unwrap().raw() as *mut u8;
+        // SAFETY: this isolated private extent has no VM or other writer, and
+        // its initialized source occupies the first three allocated bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(b"abc".as_ptr(), pointer, 3);
+        }
+        let handle = carrick_hal::fork_stock::allocate_host_backing_handle().unwrap();
+        let identity = carrick_el1_abi::HostBackingIdentity::new(handle, NonZeroU64::MIN, 0);
+        let source = InitialImageSource {
+            extent,
+            identity,
+            start: FrameGpa::new(0x1000),
+            initialized_offset: 3,
+            initialized_len: 3,
+            len: 8192,
+        };
+        let read = |offset, len| {
+            source.read(HostBackingRead::new(identity.advance(offset).unwrap(), len).unwrap())
+        };
+        assert_eq!(read(0, 8).unwrap(), b"\0\0\0abc\0\0");
+        assert_eq!(read(4, 4).unwrap(), b"bc\0\0");
+        assert_eq!(read(4096, 4096).unwrap(), vec![0; 4096]);
+        assert_eq!(read(8192, 1), Err(HostBackingReadError::Inaccessible));
+        let stale =
+            carrick_el1_abi::HostBackingIdentity::new(handle, NonZeroU64::new(2).unwrap(), 0);
+        assert_eq!(
+            source.read(HostBackingRead::new(stale, 1).unwrap()),
+            Err(HostBackingReadError::Stale)
+        );
+    }
 
     #[test]
     fn bootstrap_metadata_records_are_disjoint_before_root_binding() {
