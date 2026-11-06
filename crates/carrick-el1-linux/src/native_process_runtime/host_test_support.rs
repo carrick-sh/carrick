@@ -5,6 +5,7 @@ use carrick_guest_arch::{ContextGeneration, FrameGpa};
 use carrick_sched_core::ParkedContextWords;
 
 std::thread_local! {
+    static SIGNAL_COPY_ATTEMPTS: std::cell::RefCell<Vec<(UserVa, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
     static SIGNAL_COPIES: std::cell::RefCell<Vec<(UserVa, Vec<u8>)>> = const {
         std::cell::RefCell::new(Vec::new())
     };
@@ -64,6 +65,10 @@ pub(crate) fn record_return_copyout(address: UserVa, len: usize) {
 #[cfg(test)]
 pub(crate) fn take_return_copyouts() -> Vec<(UserVa, usize)> {
     RETURN_COPYOUTS.with(|copies| copies.borrow_mut().take().unwrap())
+}
+
+pub fn take_signal_copy_attempts() -> Vec<(UserVa, usize)> {
+    SIGNAL_COPY_ATTEMPTS.with(|calls| core::mem::take(&mut *calls.borrow_mut()))
 }
 
 pub fn take_signal_copies() -> Vec<(UserVa, Vec<u8>)> {
@@ -354,6 +359,7 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         address: UserVa,
         bytes: &[u8],
     ) -> Result<(), NativeProcessError> {
+        SIGNAL_COPY_ATTEMPTS.with(|calls| calls.borrow_mut().push((address, bytes.len())));
         if address.raw() == 1 {
             return Err(NativeProcessError::Fault);
         }
@@ -807,8 +813,21 @@ impl NativeSignalFixture {
         usize,
         Option<carrick_personality_linux::dispatch::CompletionRoute>,
     ) {
+        self.drain_and_deliver_with_copy_error(queue, frame, None)
+    }
+
+    pub fn drain_and_deliver_with_copy_error(
+        &self,
+        queue: &carrick_el1_abi::SharedSignalIngressQueue,
+        frame: &mut carrick_el1_abi::TrapFrame,
+        error: Option<NativeProcessError>,
+    ) -> (
+        usize,
+        Option<carrick_personality_linux::dispatch::CompletionRoute>,
+    ) {
         use zerocopy::IntoBytes;
         let mut service = self.service();
+        service.child_copy_error = error;
         let drained = self
             .registry
             .drain_external_ingress(self.zone, queue, self.slot, &mut service)

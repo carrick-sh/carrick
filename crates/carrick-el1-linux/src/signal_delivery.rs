@@ -384,4 +384,69 @@ mod altstack_tests {
         assert_eq!(saved_sp, 0x40_0000);
         assert_eq!(saved_pstate, 0x6000_0000);
     }
+    #[test]
+    fn production_signal_frame_refusal_keeps_main_fault_branch() {
+        use crate::native_process_runtime::host_test_support::{
+            NativeSignalFixture, take_signal_copies, take_signal_copy_attempts,
+        };
+        use carrick_core_abi::{
+            EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
+        };
+
+        // Unsupported is the physical service's not-yet-backed refusal. Both
+        // refusals used to make copy_signal_frame(...).is_ok() false.
+        for error in [NativeProcessError::Unsupported, NativeProcessError::Fault] {
+            let binding = ExecutionBinding {
+                task: EntryTaskKey::from_raw(777),
+                generation: SnapshotGeneration::from_raw(1),
+                mm: EntryMmKey::from_raw(1),
+                thread_generation: EntryThreadGeneration::from_raw(1),
+            };
+            let fixture = NativeSignalFixture::new(
+                binding,
+                binding.task,
+                carrick_core_abi::BirthSerial::of_task(
+                    carrick_sched_core::process::TaskSerial::from_raw_u64(5).unwrap(),
+                ),
+            );
+            fixture.install_sigint_handler(false);
+            let queue = carrick_el1_abi::SharedSignalIngressQueue::new();
+            queue
+                .admit(carrick_el1_abi::ExternalSignalRecord::new(
+                    carrick_core_abi::EntryEventIdentity::from_binding(binding),
+                    binding,
+                    fixture.record(),
+                    carrick_el1_abi::SignalEventGeneration::new(core::num::NonZeroU64::MIN),
+                    Signal::from_number(2).unwrap(),
+                    carrick_el1_abi::ExternalSignalSource::Terminal,
+                ))
+                .unwrap();
+            let mut frame = carrick_el1_abi::TrapFrame {
+                elr: 0x40_0000,
+                spsr: 0x6000_03c0,
+                ..Default::default()
+            };
+            let before = frame;
+            let _ = take_signal_copy_attempts();
+            let _ = take_signal_copies();
+            let (drained, route) =
+                fixture.drain_and_deliver_with_copy_error(&queue, &mut frame, Some(error));
+            assert_eq!(drained, 1);
+            assert_eq!(route, Some(CompletionRoute::Suspended));
+            assert!(take_signal_copies().is_empty());
+            let attempts = take_signal_copy_attempts();
+            assert_eq!(attempts.len(), 1, "one copy attempt, no retry or replay");
+            assert_eq!(
+                attempts[0].1,
+                core::mem::size_of::<carrick_personality_linux::signal::arm::SignalFrame>()
+            );
+            assert_eq!(
+                attempts[0].0.raw(),
+                (0x40_0000 - attempts[0].1 as u64) & !15
+            );
+            assert_eq!(frame.elr, before.elr);
+            assert_eq!(frame.spsr, before.spsr);
+            assert_eq!(frame.x, before.x);
+        }
+    }
 }
