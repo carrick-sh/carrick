@@ -54,10 +54,13 @@ gh workflow run signed-gate.yml --ref main -f pr=main -f sha=<main-ancestor-sha>
 
 ## Rollout and director verification
 
-Keep this change draft until #1668, #847, #1572, #1736 and #1741 have their
-required proofs; do not mask flipping tests. #1732 tracks the existing main
-coalescing lane; this workflow retains a baseline for every push rather than
-coalescing away a base the queue needs. Land the Rust support on trusted main
+Keep this change draft until #1668, #1572, #1736 and #1741 have their
+required proofs; do not mask flipping tests. The host-read prerequisite #847
+is closed, with its fix and signed population evidence on admitted main.
+#1732 proposes a separate coalescing baseline dispatcher. This workflow
+supplies automatic baselines directly from push events and replaces that
+proposal's dispatch-token requirement. Do not enable both producers or
+coalesce away a base the queue needs. Land the Rust support on trusted main
 before activating the required queue check: authorization checks out main. The
 director announces the shared CI change on #231 and adds **Signed queue gate**
 to main's required checks (GitHub Actions source),
