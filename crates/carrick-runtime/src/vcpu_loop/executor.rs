@@ -1622,19 +1622,11 @@ fn adopt_born_record(
     };
     // SAFETY: the stopped executor owns this Host handback or claimed service head.
     let frame = unsafe { *live.ctx_mut() };
-    let adoption = scheduler
-        .kernel()
-        .adopt_born_thread_at_first_entry(key, &frame.native)
-        .map_err(NextError::Fatal)?;
-    // A host-owned birth with no host thread has no other owner unless its
-    // terminal retirement (which cancels the record) is taking it.
-    if adoption == carrick_kernel::kernel::FirstEntryAdoption::NoHostThread && !live.is_cancelled()
-    {
-        return Err(NextError::Fatal(format!(
-            "host-owned birth has no host thread: record={record:?} key={key:?}"
-        )));
-    }
-    if adoption == carrick_kernel::kernel::FirstEntryAdoption::Adopted {
+    let mut custody = Some(custody);
+    let mut retire = || {
+        let custody = custody
+            .take()
+            .ok_or("first-entry retirement invoked twice")?;
         #[cfg(any(test, feature = "test-support"))]
         {
             use carrick_kernel::el1_zone::first_entry_test_control::{Event, emit};
@@ -1642,16 +1634,35 @@ fn adopt_born_record(
             emit(Event::BeforeRetire(record));
         }
         if !zone.free_first_entry_activation(custody) {
-            return Err(NextError::Fatal(
-                "first-entry activation lost exclusive record custody".into(),
-            ));
+            return Err("first-entry activation lost exclusive record custody".into());
         }
         #[cfg(any(test, feature = "test-support"))]
         carrick_kernel::el1_zone::first_entry_test_control::emit(
             carrick_kernel::el1_zone::first_entry_test_control::Event::Retired(record),
         );
+        Ok(())
+    };
+    let adoption = scheduler
+        .kernel()
+        .adopt_born_thread_at_first_entry(key, &frame.native, &mut retire)
+        .map_err(NextError::Fatal)?;
+    if adoption == carrick_kernel::kernel::FirstEntryAdoption::Adopted {
+        if custody.is_some() {
+            return Err(NextError::Fatal(
+                "first-entry adoption omitted retirement".into(),
+            ));
+        }
         return Ok(true);
     }
+    // No adoption consumed the record; the terminal owner may have cancelled it.
+    if adoption == carrick_kernel::kernel::FirstEntryAdoption::NoHostThread && !live.is_cancelled()
+    {
+        return Err(NextError::Fatal(format!(
+            "host-owned birth has no host thread: record={record:?} key={key:?}"
+        )));
+    }
+    let custody =
+        custody.ok_or_else(|| NextError::Fatal("unadopted first entry lost custody".into()))?;
     if !zone.release_first_entry_activation(custody) {
         return Err(NextError::Fatal(
             "first-entry activation could not release custody".into(),
