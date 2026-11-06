@@ -2124,17 +2124,10 @@ impl<I: CarrierCpuIo, M: CarrierMemoryIo> super::ForwardVenue<'_, I, M> {
         if view.header().op != carrick_core_abi::host_file::HostFileOp::MapPrivate {
             return Err(fail("unsupported synchronous host file operation"));
         }
-        let releases = carrick_core_abi::host_file::MapSourceReply::decode_releases(view.input())
-            .ok_or_else(|| fail("host file releases"))?;
-        let sources = self.custody.sources_mut(self.execution.context)?;
-        for release in releases {
-            sources.release(release.handle, release.generation);
-        }
-        if sources.len() >= 1024 {
-            carrick_core_abi::host_file::HostFileRequestView::parse(&mut bytes)
-                .and_then(|view| view.reply(-12, &[]))
-                .map_err(|_| fail("host file limit reply"))?;
-        }
+        self.custody
+            .sources_mut(self.execution.context)?
+            .prepare_private_mapping(&mut bytes)
+            .map_err(|_| fail("host file source admission"))?;
         Ok(bytes)
     }
 

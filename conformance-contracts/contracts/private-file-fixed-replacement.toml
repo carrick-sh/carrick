@@ -9,6 +9,9 @@ rationale = "A file-backed PROT_NONE reservation of 0x65ee48 bytes, fixed RX tex
 
 [bindings]
 vm_free = [
+  "carrick-kernel::el1_delegation::tests::serial_host::published_private_source_fault_joins_late_delegation_recall (production late entry and retained source read, no stale bytes during recall)",
+  "carrick-hal::fork_stock::tests::private_map_releases_keep_native_source_custody_steady (shared admission, 1024 retained sources, errno 12 and release-before-readmission)",
+  "carrick-kernel::kernel::objects::tests::serial_host_ipc_mapping_projection_shares_live_delegation_identity (published projection observes later delegation entry and clearing)",
   "carrick-kernel::dispatch::mem::delegated_tests::admitted_private_host_file_populate_self_held_gate_is_not_fatal (POPULATE/LOCKED regression preservation only; success remains #1141)",
   "carrick-kernel::dispatch::mem::delegated_tests::admitted_proc_executable_private_mmap_avoids_its_own_gate",
   "carrick-kernel::dispatch::mem::delegated_tests::{libpython_fixed_file_segments_use_owner_source_without_eager_copy,libpython_old_deferred_recipe_and_owner_copy_refusals,remap_file_pages_on_shared_mapping_wait_for_owner_refused_copyout_leaving_private_file_mappings_intact}; real file, production AddressSpace, root, deferred registry and bounded PREPARE admission. RED: eager file copy and premature predecessor retirement. Component reproduction: overlapping deferred file recipe -> InvalidRange -> whole-map owner copy exceeds 4096 -> ENOMEM lowering. Retirement classification: carrick-aarch64::descriptor_drain::retirement_tests::retirement_refusals_are_clean_only_before_any_chunk_commits. Signed branch confirmation remains open.",

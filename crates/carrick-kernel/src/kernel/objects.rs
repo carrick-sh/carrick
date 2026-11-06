@@ -1171,6 +1171,9 @@ struct DescriptionPhysicalLifetime {
     /// Counts this description against its host inode's EL1 ownership record
     /// (host regular files only; set once at construction).
     el1_registration: std::sync::OnceLock<crate::el1_delegation::InodeOpenRegistration>,
+    /// Every view of this physical source must join the same delegation
+    /// recall before reading host bytes, including IPC mapping projections.
+    delegation_handle: std::sync::atomic::AtomicU32,
     fd_refs: AtomicUsize,
     transition: Mutex<DescriptionLifecycle>,
 }
@@ -1180,7 +1183,6 @@ pub(crate) struct IpcPhysicalHold {
     backing: Option<OpaqueFileDescriptionBacking>,
     admitted: Arc<AtomicBool>,
     mapping_description: Option<Arc<FileDescription>>,
-    original: Weak<FileDescription>,
 }
 
 pub(crate) enum MappingAdmission<'a> {
@@ -1276,7 +1278,6 @@ pub struct FileDescription {
     common: Arc<DescriptionCommon>,
     epoll_registrations: Mutex<BTreeMap<(FileDescriptionId, i32), Weak<FileDescription>>>,
     revision: ObjectRevision,
-    delegation_handle: std::sync::atomic::AtomicU32,
 }
 
 impl FileDescription {
@@ -1332,7 +1333,6 @@ impl FileDescription {
                 common: Arc::new(common),
                 epoll_registrations: Mutex::new(BTreeMap::new()),
                 revision: ObjectRevision::new(),
-                delegation_handle: std::sync::atomic::AtomicU32::new(0),
             })
         });
         let token = owner.retain_host_resource(Box::new(IpcPhysicalHold {
@@ -1340,7 +1340,6 @@ impl FileDescription {
             backing,
             admitted: Arc::clone(&admitted),
             mapping_description,
-            original: Arc::downgrade(self),
         }))?;
         let backing = IpcBacking::Host(token).encode();
         let description = match owner.admit_description(fd::Description::new(
@@ -1400,7 +1399,6 @@ impl FileDescription {
             common,
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
-            delegation_handle: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -1433,7 +1431,6 @@ impl FileDescription {
             common,
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
-            delegation_handle: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -1460,7 +1457,6 @@ impl FileDescription {
             common: Arc::new(DescriptionCommon::new(0)),
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
-            delegation_handle: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -1471,17 +1467,20 @@ impl FileDescription {
             common: Arc::new(DescriptionCommon::new(0)),
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
-            delegation_handle: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
     pub fn delegation_handle(&self) -> u32 {
-        self.delegation_handle
+        self.common
+            .physical
+            .delegation_handle
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn set_delegation_handle(&self, handle: u32) {
-        self.delegation_handle
+        self.common
+            .physical
+            .delegation_handle
             .store(handle, std::sync::atomic::Ordering::Release);
     }
 
@@ -1789,8 +1788,9 @@ impl FileDescription {
 
     /// Acquire from an owned descriptor or pinned IPC resource, serialized with
     /// final close and physical-resource release.
-    /// A mapping and an EL1 delegation never coexist: the delegation is
-    /// recalled first, and a mapped description is never delegated.
+    /// Recall a published delegation first. An initial entry already in flight
+    /// can still publish later; fault-time reads join that same shared identity.
+    /// A new delegation rejects an already mapped description.
     pub(crate) fn retain_mapping(
         self: &Arc<Self>,
         admission: MappingAdmission<'_>,
@@ -1804,9 +1804,7 @@ impl FileDescription {
                 {
                     return None;
                 }
-                if let Some(original) = hold.original.upgrade() {
-                    crate::el1_delegation::recall_if_delegated(&original);
-                }
+                crate::el1_delegation::recall_if_delegated(self);
             }
         }
         let mut lifecycle = self.common.physical.transition.lock();

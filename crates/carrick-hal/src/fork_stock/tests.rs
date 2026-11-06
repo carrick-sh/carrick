@@ -2623,3 +2623,82 @@ fn maintenance_reclaim_requires_the_exact_nonzero_hardware_root() {
     assert!(ReclaimExecution::maintenance_root(page(0), page(0)).is_none());
     assert!(ReclaimExecution::maintenance_root(page(0x2000), page(0x2000)).is_some());
 }
+
+#[test]
+fn private_map_releases_keep_native_source_custody_steady() {
+    use carrick_core_abi::host_file::{self, HostFileHeader, HostFileOp, MapSourceReply};
+    use core::num::NonZeroU64;
+    struct Source(carrick_el1_abi::HostBackingIdentity);
+    impl HostBackingRetention for Source {
+        fn identity(&self) -> carrick_el1_abi::HostBackingIdentity {
+            self.0
+        }
+        fn read(&self, _: HostBackingRead) -> Result<Vec<u8>, HostBackingReadError> {
+            Ok(Vec::new())
+        }
+    }
+    let identity = |token: u64| {
+        carrick_el1_abi::HostBackingIdentity::new(
+            NonZeroU64::new(token).unwrap(),
+            NonZeroU64::MIN,
+            0,
+        )
+    };
+    let request = |op, released: &[u64]| {
+        let input: Vec<u8> = released
+            .iter()
+            .flat_map(|token| {
+                MapSourceReply {
+                    handle: NonZeroU64::new(*token).unwrap(),
+                    generation: NonZeroU64::MIN,
+                }
+                .encode()
+            })
+            .collect();
+        let mut record =
+            vec![0u8; host_file::record_len(input.len(), MapSourceReply::BYTES).unwrap()];
+        host_file::encode(
+            &mut record,
+            HostFileHeader {
+                op,
+                table: [1, 1, 1],
+                fd: 3,
+                flags: 0,
+                args: [0; 4],
+            },
+            &input,
+            MapSourceReply::BYTES,
+        )
+        .unwrap();
+        record
+    };
+    let mut sources = ForkHostBackingCustody::default();
+    for cycle in 1..=1000u64 {
+        let mut record = request(HostFileOp::MapPrivate, &[cycle - 1].map(|t| t.max(1)));
+        assert!(sources.prepare_private_mapping(&mut record).unwrap());
+        sources.inherit(std::sync::Arc::new(Source(identity(cycle))));
+        assert_eq!(
+            sources.len(),
+            1,
+            "cycle {cycle}: only the live source is held"
+        );
+    }
+    let mut write = request(HostFileOp::Write, &[]);
+    assert!(sources.prepare_private_mapping(&mut write).unwrap());
+    let mut too_many = request(HostFileOp::MapPrivate, &[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert!(sources.prepare_private_mapping(&mut too_many).is_err());
+    // Fill the real source owner to its bound without requiring a guest
+    // reservation tree to have the same independent capacity.
+    for token in 1001..=2023 {
+        sources.inherit(std::sync::Arc::new(Source(identity(token))));
+    }
+    assert_eq!(sources.len(), 1024);
+    let mut denied = request(HostFileOp::MapPrivate, &[]);
+    assert!(!sources.prepare_private_mapping(&mut denied).unwrap());
+    assert_eq!(host_file::reply(&denied).unwrap().result, -12);
+    assert_eq!(sources.len(), 1024);
+    let mut recovered = request(HostFileOp::MapPrivate, &[1000]);
+    assert!(sources.prepare_private_mapping(&mut recovered).unwrap());
+    assert!(host_file::reply(&recovered).is_none());
+    assert_eq!(sources.len(), 1023);
+}
