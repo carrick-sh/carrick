@@ -29,6 +29,13 @@ use carrick_el1_abi::{
 use carrick_hal::threaded::GuestCpuState;
 use carrick_kernel::el1_zone::HostLockWait;
 
+fn load_zone_futex_word(
+    memory: &impl carrick_guest_mem::GuestMemory,
+    address: u64,
+) -> Result<u32, carrick_guest_mem::MemoryError> {
+    memory.atomic_load_user_u32(address)
+}
+
 pub(super) enum OwnerMemoryAction {
     Syscall {
         frame: carrick_hal::RawSyscall,
@@ -731,16 +738,19 @@ where
                 )
                 .into());
             };
-            let word = engine
-                .read_bytes(uaddr, 4)
-                .ok()
-                .and_then(|bytes| bytes.try_into().ok())
-                .map(u32::from_ne_bytes);
-            match word {
-                None => Err(crate::linux_abi::LINUX_EFAULT),
-                Some(word) if word != value => Err(crate::linux_abi::LINUX_EAGAIN),
-                Some(_) => match zone.alloc_record(identity) {
-                    Err(_) => Err(crate::linux_abi::LINUX_EAGAIN),
+            match load_zone_futex_word(engine, uaddr) {
+                Err(error) => Err(DispatchOutcome::from_owner_memory_error(error).unwrap_or(
+                    DispatchOutcome::Errno {
+                        errno: crate::linux_abi::LINUX_EFAULT,
+                    },
+                )),
+                Ok(word) if word != value => Err(DispatchOutcome::Errno {
+                    errno: crate::linux_abi::LINUX_EAGAIN,
+                }),
+                Ok(_) => match zone.alloc_record(identity) {
+                    Err(_) => Err(DispatchOutcome::Errno {
+                        errno: crate::linux_abi::LINUX_EAGAIN,
+                    }),
                     Ok(record) => {
                         // SAFETY: freshly allocated and not yet published.
                         unsafe {
@@ -752,7 +762,9 @@ where
                             .is_err()
                         {
                             zone.free_record(record);
-                            Err(crate::linux_abi::LINUX_EAGAIN)
+                            Err(DispatchOutcome::Errno {
+                                errno: crate::linux_abi::LINUX_EAGAIN,
+                            })
                         } else {
                             zone.publish_park(record, seq);
                             Ok((record, seq))
@@ -763,13 +775,8 @@ where
         };
         let (record, seq) = match parked {
             Ok(parked) => parked,
-            Err(errno) => {
-                return self.route_outcome(
-                    engine,
-                    control,
-                    frame,
-                    DispatchOutcome::Errno { errno },
-                );
+            Err(outcome) => {
+                return self.route_outcome(engine, control, frame, outcome);
             }
         };
         zone.counters
