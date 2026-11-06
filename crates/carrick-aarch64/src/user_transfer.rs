@@ -179,6 +179,14 @@ pub trait TransferPin {
     /// finish during retention, before EL1 takes the copy editor.
     fn copy(&mut self, request: carrick_el1_abi::PortalCopyRequest<'_>, bytes: &mut [u8]) -> bool;
     fn copy_out(&mut self, request: carrick_el1_abi::PortalCopyRequest<'_>, bytes: &[u8]) -> bool;
+    fn atomic_compare_exchange_u32(
+        &mut self,
+        _request: carrick_el1_abi::PortalCopyRequest<'_>,
+        _expected: u32,
+        _desired: u32,
+    ) -> Option<u32> {
+        None
+    }
 }
 impl TransferPin for Box<dyn TransferPin> {
     fn pending(&self) -> Option<carrick_guest_mem::OwnedMemoryWait> {
@@ -192,6 +200,14 @@ impl TransferPin for Box<dyn TransferPin> {
     }
     fn copy_out(&mut self, request: carrick_el1_abi::PortalCopyRequest<'_>, bytes: &[u8]) -> bool {
         (**self).copy_out(request, bytes)
+    }
+    fn atomic_compare_exchange_u32(
+        &mut self,
+        request: carrick_el1_abi::PortalCopyRequest<'_>,
+        expected: u32,
+        desired: u32,
+    ) -> Option<u32> {
+        (**self).atomic_compare_exchange_u32(request, expected, desired)
     }
 }
 /// Retained physical ownership may move from synchronous preparation into

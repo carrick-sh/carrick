@@ -3687,9 +3687,30 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         desired: u32,
     ) -> Result<u32, MemoryError> {
         if self.protections.owner().is_some() {
-            // Establish the owner-selected backing before the backend obtains
-            // its write admission and executes the compare-exchange.
-            let _ = self.read_owner_bytes(address, size_of::<u32>())?;
+            let range =
+                carrick_guest_mem::GuestWriteRange::new(GuestVa::new(address), size_of::<u32>())
+                    .ok_or(MemoryError::OutOfBounds {
+                        address,
+                        length: size_of::<u32>(),
+                    })?;
+            let prepared = self
+                .prepare_owner_write(&[range], carrick_el1_abi::PortalTransferIntent::UserWrite)
+                .map_err(|error| match error {
+                    carrick_guest_mem::MemoryPrepareError::Limit(limit) => MemoryError::HostMap(
+                        format!("atomic word requires bounded prepare: {limit:?}"),
+                    ),
+                    carrick_guest_mem::MemoryPrepareError::Fault(error) => error,
+                    carrick_guest_mem::MemoryPrepareError::Physical(wait) => {
+                        MemoryError::Physical(wait)
+                    }
+                    carrick_guest_mem::MemoryPrepareError::OwnerWait(wait) => {
+                        MemoryError::OwnerWait(wait)
+                    }
+                    carrick_guest_mem::MemoryPrepareError::Supply(supply) => {
+                        MemoryError::Supply(Box::new(supply))
+                    }
+                })?;
+            return prepared.atomic_compare_exchange_u32(expected, desired);
         }
         self.vm
             .atomic_compare_exchange_user_u32(address, expected, desired)
