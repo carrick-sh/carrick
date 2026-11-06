@@ -2,8 +2,8 @@
 //! lookups still see the prior description, fork does not inherit claims, and
 //! close cannot make a claimed number available to an unrelated opener.
 use super::{
-    Authority, DeferredRelease, Description, Entry, Error, Fd, LockWait, OfdPin, REF, SlotBacking,
-    TableId,
+    Authority, DeferredRelease, Description, Entry, Error, Fd, LockWait, OfdPin, PIN, REF,
+    SlotBacking, TableId,
 };
 
 /// One reservation in an exact table incarnation. Move into commit or cancel;
@@ -181,5 +181,114 @@ impl<B: SlotBacking, W: LockWait, const T: usize> Authority<'_, B, W, T> {
             }
         })();
         result.map_err(|error| ReservationRefusal { error, reservation })
+    }
+}
+
+/// Two empty numeric claims, retained together until pipe output completes.
+#[must_use]
+#[derive(Debug)]
+pub struct PairReservation {
+    claims: Option<[SlotReservation; 2]>,
+}
+impl PairReservation {
+    pub fn fds(&self) -> Option<[Fd; 2]> {
+        self.claims
+            .as_ref()
+            .map(|claims| [claims[0].fd, claims[1].fd])
+    }
+}
+
+impl<B: SlotBacking, W: LockWait, const T: usize> Authority<'_, B, W, T> {
+    /// Reserve both lowest free slots without publishing either description.
+    pub fn reserve_pair(&self, table: TableId) -> Result<PairReservation, Error> {
+        let (_guard, t) = self.lock(table)?;
+        let first = t.allocate(0)?;
+        let second = t.allocate(first + 1)?;
+        t.storage.reserve(first);
+        t.storage.reserve(second);
+        Ok(PairReservation {
+            claims: Some([
+                SlotReservation {
+                    table,
+                    fd: Fd(first as i32),
+                },
+                SlotReservation {
+                    table,
+                    fd: Fd(second as i32),
+                },
+            ]),
+        })
+    }
+
+    /// Settle both claims and transfer both preparation pins into table refs.
+    /// On refusal the caller retains claims and pins unchanged. Pin holds are
+    /// released under this same table lock, so concurrent close cannot make
+    /// their release final after publication. A lowered soft limit cannot
+    /// revoke admitted numeric claims.
+    pub fn publish_pair(
+        &self,
+        pair: &mut PairReservation,
+        pins: &mut [Option<OfdPin>; 2],
+        cloexec: bool,
+    ) -> Result<(), Error> {
+        let claims = pair.claims.as_ref().ok_or(Error::InvalidArgument)?;
+        let (guard, t) = self.lock(claims[0].table)?;
+        for (claim, pin) in claims.iter().zip(pins.iter()) {
+            self.check_pin(pin.as_ref().ok_or(Error::StalePin)?)?;
+            if !t.storage.reserved(claim.fd.0 as usize)
+                || t.storage.get(claim.fd.0 as usize).is_some()
+            {
+                return Err(Error::InvalidArgument);
+            }
+        }
+        let covered = [
+            self.cover(claims[0].fd.0 as usize)?,
+            self.cover(claims[1].fd.0 as usize)?,
+        ];
+        let [Some(reader), Some(writer)] = &*pins else {
+            return Err(Error::StalePin);
+        };
+        let indices = [reader.key.index, writer.key.index];
+        self.retain(indices[0], REF)?;
+        if let Err(error) = self.retain(indices[1], REF) {
+            self.drop_hold(indices[0], REF)?;
+            return Err(error);
+        }
+        guard.record.begin_write();
+        for ((claim, index), covered) in claims.iter().zip(indices).zip(covered) {
+            t.storage.install(
+                covered,
+                Entry {
+                    ofd: index,
+                    cloexec,
+                },
+            );
+            t.storage.unreserve(claim.fd.0 as usize);
+        }
+        for index in indices {
+            if self.drop_hold(index, PIN)?.is_some() {
+                return Err(Error::BadBacking);
+            }
+        }
+        *pins = [None, None];
+        pair.claims = None;
+        guard.record.end_write();
+        Ok(())
+    }
+
+    /// Cancel both unpublished claims atomically; retirement already removed them.
+    pub fn cancel_pair(&self, pair: &mut PairReservation) -> Result<(), Error> {
+        let claims = pair.claims.as_ref().ok_or(Error::InvalidArgument)?;
+        let (_guard, t) = self.lock(claims[0].table)?;
+        for claim in claims {
+            if !t.storage.reserved(claim.fd.0 as usize) {
+                return Err(Error::InvalidArgument);
+            }
+        }
+        for claim in claims {
+            t.storage.unreserve(claim.fd.0 as usize);
+        }
+        pair.claims = None;
+        Ok(())
     }
 }

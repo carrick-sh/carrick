@@ -1,7 +1,9 @@
 # Native child IPC constructors (#1506)
 
-This is a red-first checkpoint for `kernel.el1.ipc-fd-authority`, not a
-constructor implementation or an acceptance claim. The four
+`kernel.el1.ipc-fd-authority` covers the constructor ownership work below.
+The epoll and pipe constructors now serve the VM-free native witnesses;
+eventfd and timerfd remain unimplemented. No signed acceptance is claimed.
+The four
 `serial_host_native_fork_children_create_*_in_their_own_tables` bindings
 fork two children through `NativeProcessRuntime` and call the production
 `dispatch_syscall_with_native` entry with a real ARM trap frame. Both
@@ -9,17 +11,17 @@ children and their parent remain live. Each binding requires a ring answer,
 CLOEXEC on the allocated descriptors, no publication into the parent table,
 and distinct backing identities for the two children's newly created objects.
 The pipe result is copied from the user buffer separately after each call.
-These tests deliberately remain red until the corresponding ring service exists.
+The eventfd and timerfd bindings remain red until their ring services exist.
 
 The `serial_host_native_root_creates_*_with_live_children` bindings use the
 same real-fork fixture and production entry, switch back to the root while
 both children remain live, and authenticate its borrowed table identity.
 They require creation, FD_CLOEXEC lookup and close to complete in ring.
-They deliberately remain red too: root success through the host crossing
+They require the shared ring path: root success through the host crossing
 does not satisfy the one-path contract. These root bindings complement the
 child bindings; neither population substitutes for the other.
 
-## Root cause
+## Original root cause
 
 `serve_ipc_with_signals` admits read, write and epoll wait, not constructors.
 `service_owner` classifies the four constructors as `RingOwed`, through their
@@ -131,7 +133,7 @@ member operations to the epoll returned by the new constructor in both root
 and child. It also does not prove blocking wake delivery, MOD/DEL, or timer
 arming/expiry. No crossing policy or production service changes here.
 
-## Epoll implementation checkpoint
+## Earlier epoll implementation checkpoint
 
 The shared descriptor family now serves `epoll_create1`, and zone-member
 `epoll_ctl` uses the existing shared epoll core. Construction validates
@@ -148,18 +150,18 @@ particular, the newly constructed object has only the existing empty-wait
 witness; the independent pipe-readiness control uses a pre-admitted epoll.
 No additional witnesses were added in this continuation.
 
-Independent review requests changes: root epolls created by this path
+The checkpoint's independent review requested changes: root epolls created by this path
 lack the host description required by forwarded host-member operations;
-shared-core HostHalf refusals still forward; object/OFD growth contention
-can become EIO; and native wait fallback cases and x86 wait parity remain
-unresolved. These are blockers, not accepted semantics or follow-up-only
+shared-core HostHalf refusals still forward; and native wait fallback cases
+and x86 wait parity remain unresolved. The growth-contention finding from
+that review is corrected by the shared publication owner below. These are blockers, not accepted semantics or follow-up-only
 coverage. Removing the constructor crossing in this checkpoint does not
 establish that the root's full existing epoll surface is preserved. Do not
 land it without resolving those findings and obtaining confirming review
 and signed proof. No Go-build or guest-execution claim follows from the
 VM-free results.
 
-## Pipe storage prerequisite
+## Earlier pipe storage prerequisite
 
 The shared `IpcRegion::create_pipe` entry can now run in either venue without
 returning host allocator work. Reuse keeps a fitting ring. An undersized ring
@@ -183,7 +185,9 @@ A completed-answer copyout alone cannot own those constructor resources.
 
 Pipe output retains two fd-core numeric claims and two prepared descriptions
 until the exact-MM copyout completes. Its owned completion publishes the pair
-under one table sequence; cancellation drops both claims and endpoint pins.
+under one table sequence and transfers the preparation pins under that same
+lock, so concurrent close cannot leave an ignored final-release wake.
+Cancellation drops both unpublished claims and endpoint pins.
 The mapping lifetime is distinct from a single dispatch borrow so a service
 wait cannot outlive its IPC authority.
 
@@ -195,7 +199,9 @@ supplier. The correction uses the existing shared storage owner:
 - Each record store has one shared short publication lock. Growth takes the
   observed count, reprobes after another publisher advanced it, and checks the
   ceiling inside the lock. Count and the complete free-list segment publish
-  before unlock. No table/object lock, allocation, copy or callback is held.
+  before unlock. A distinct completed-publication count is the admission
+  observation; the earlier resolvable count only authenticates new indices.
+  No table/object lock, allocation, copy or callback is held.
 - Pipe extents use a second `carrick_fd_core::storage::Storage` over the ring
   half of the pool. Delete the host-private buddy allocator. Stock, live and
   retained rings share this authority. A first write takes stock or allocates
@@ -210,3 +216,23 @@ with the requirements to preserve observed-count admission at the final segment,
 initialize metadata before publication, and exercise two native children without
 assuming stock supply. Signed execution and the existing broader epoll review
 remain separate acceptance obligations.
+
+## Pipe implementation proof
+
+The existing root/two-child constructor entry witnesses now cover usable pipes,
+CLOEXEC and nonblocking flags. Root output fault followed by another creation
+requires the same lowest descriptors, proving no leaked numeric claim. The
+physical-service owner-wait variants drive that same production TrapFrame entry
+with the eight-byte result across a page boundary: only the first four bytes
+are delivered before the wait, neither fd is visible while parked, and resumption
+publishes both once. Fatal cancellation returns both numeric holes and endpoint
+references without delivering the suffix. These are controlled VM-free schedules,
+not guest instructions or signed acceptance.
+
+The fd-core publication transfers both preparation pins while its table lock
+still excludes close. The shared storage tests require disjoint no-stock rings,
+retained undersized replacement with no leaked allocation, and actual pool
+exhaustion reported as errno 12. Mid-publication probes require admission to
+observe the old completed inventory until the segment is fully linked. The
+new locks cover one fixed record segment or one logarithmic buddy operation;
+no syscall retries, timeouts or concurrency budgets are widened.

@@ -1,5 +1,5 @@
 //! Linux read(2)/write(2) on pipes and eventfds served in EL1, on the shared
-//! IPC objects (`carrick_el1_abi::ipc`) the host creates and manages.
+//! IPC objects (`carrick_el1_abi::ipc`) shared by ring and host venues.
 //!
 //! Decoding (descriptor access, O_NONBLOCK, buffer sizes) and Linux results
 //! (EOF, EAGAIN, EBADF, EINVAL, EPIPE + SIGPIPE) live here; the staged copy
@@ -45,9 +45,9 @@ pub use carrick_el1_abi::ipc::IPC_HANDBACK_NR;
 use carrick_el1_abi::ipc::fd::{AccessMode, Error as FdError, Fd, TableId};
 use carrick_el1_abi::ipc::pipe::{WaitFor, WakeSet};
 use carrick_el1_abi::ipc::{
-    IpcBacking, IpcEventValue, IpcHandback, IpcLockHolder, IpcMmKey, IpcObjectHandle, IpcOpKind,
-    IpcOpToken, IpcOperation, IpcRegion, IpcReleased, IpcTaskKey, IpcUserVa, OfdPin, RawOfdPin,
-    RawTableId, WriteProgress,
+    IpcBacking, IpcError, IpcEventValue, IpcHandback, IpcLockHolder, IpcMmKey, IpcObjectHandle,
+    IpcOpKind, IpcOpToken, IpcOperation, IpcRegion, IpcReleased, IpcTaskKey, IpcUserVa, OfdPin,
+    RawOfdPin, RawTableId, WriteProgress,
 };
 use carrick_el1_abi::ipc_tables::IpcTableMap;
 use carrick_el1_abi::{CurrentTask, EL1_GUEST_LOCK_SPINS, IpcLeave, TrapFrame};
@@ -942,6 +942,17 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
         );
         let (status, wake) = match transferred {
             Ok(step) => step,
+            Err(IpcError::Fd(FdError::NoMemory)) => {
+                drop(guard);
+                let written = op.progress.written;
+                finish_native(sched, token, region);
+                frame.x[0] = if written > 0 {
+                    written
+                } else {
+                    carrick_syscall_abi::LINUX_ENOMEM.guest_retval() as u64
+                };
+                return (IpcServed::Returned { switched: false }, false);
+            }
             Err(_) => {
                 drop(guard);
                 return (
@@ -1696,9 +1707,7 @@ mod tests {
     use super::*;
     use carrick_el1::substrate::sched::{FakeCpu, HardwareUserWord};
     use carrick_el1_abi::ipc::fd::{Description, StatusFlags};
-    use carrick_el1_abi::ipc::{
-        End, EventMode, Extent, IPC_POOL_ALIGN, IpcDirectory, IpcPipeStorage, LockWait,
-    };
+    use carrick_el1_abi::ipc::{End, EventMode, Extent, IpcDirectory, LockWait};
     use carrick_el1_abi::{Counters, El1TaskId, SlotId, ThreadCtx, ThreadIdentity, ZoneTables};
     use core::cell::{Cell, RefCell};
     use std::alloc::{GlobalAlloc, Layout, System};
@@ -1883,7 +1892,6 @@ mod tests {
     struct World {
         region: &'static IpcRegion<'static>,
         /// Next free byte of the pool's ring area and descriptor area.
-        next: Cell<u64>,
         zone: TestZone,
         task: CurrentTask,
         cpu: FakeCpu,
@@ -1972,7 +1980,6 @@ mod tests {
         cpu.asid_invalidations.reserve(4096);
         World {
             region: Box::leak(Box::new(region)),
-            next: Cell::new(0),
             zone,
             task,
             cpu,
@@ -1985,12 +1992,6 @@ mod tests {
     }
 
     impl World {
-        /// Ring-area bytes.
-        fn bump(&self, bytes: u64) -> u64 {
-            let at = self.next.get();
-            self.next.set((at + bytes).next_multiple_of(IPC_POOL_ALIGN));
-            at
-        }
         /// A descriptor extent of `capacity` slots, in the descriptor area.
         fn descriptor_extent(&self, capacity: usize) -> Extent {
             self.region
@@ -2026,11 +2027,10 @@ mod tests {
         fn pipe(&self, t: TableId, flags: StatusFlags) -> (i32, i32, IpcObjectHandle) {
             let object = self.unbacked_pipe_object();
             // The ring the host's first write would provide.
-            let mut storage = IpcPipeStorage {
-                offset: self.bump(65536 + 16 * 8),
-                ring_bytes: 65536,
-                pages: 16,
-            };
+            let mut storage = self
+                .region
+                .provision_pipe_storage(65536, 16, &HostWait)
+                .unwrap();
             let mut guard = self.region.lock(object, &HostWait).unwrap();
             assert_eq!(guard.provide_pipe_storage(&mut storage), Ok(true));
             drop(guard);
@@ -2993,7 +2993,7 @@ mod tests {
     /// forwards unchanged before any effect, so the host provides the ring
     /// and performs the write; reads and EOF need no ring.
     #[test]
-    fn el1_ipc_io_first_write_to_an_unbacked_pipe_forwards_before_effects() {
+    fn el1_ipc_io_first_write_supplies_shared_storage_or_returns_enomem() {
         let mut w = world();
         let t = w.table(w.a_tid);
         let object = w.unbacked_pipe_object();
@@ -3012,36 +3012,49 @@ mod tests {
         let wfd = open(&w, End::Writer, AccessMode::WriteOnly);
         w.mem.map(MM, 0x10000, PAGE);
         w.mem.write(MM, 0x10000, b"ping");
-        let seqs = w.region.observe(object).unwrap();
-        let mut f = syscall(SYS_WRITE, wfd, 0x10000, 4, A_SVC);
-        let before = f;
-        assert_eq!(w.call(&mut f), IpcServed::Forward);
-        assert_eq!((f.x, f.elr), (before.x, before.elr), "frame unchanged");
-        assert_eq!(
-            w.region.observe(object).unwrap(),
-            seqs,
-            "no effect, no wake"
-        );
-        let mut g = w.region.lock(object, &HostWait).unwrap();
-        assert!(!g.pipe().unwrap().is_backed());
-        assert_eq!(g.pipe().unwrap().unread_bytes(), 0);
-        drop(g);
-        // An empty unbacked pipe reads as EAGAIN in EL1, with no ring.
+        // Empty idle pipes need no backing. The first write supplies it in
+        // ring even with no stocked extent, through the shared allocator.
         let mut f = syscall(SYS_READ, r, 0x10000, 4, A_SVC);
         assert_eq!((w.call(&mut f), f.x[0] as i64), (RETURNED, linux::EAGAIN));
-        // Once the host provided the ring, EL1 serves the write itself.
-        let mut ring = IpcPipeStorage {
-            offset: w.bump(65536 + 16 * 8),
-            ring_bytes: 65536,
-            pages: 16,
-        };
-        let mut g = w.region.lock(object, &HostWait).unwrap();
-        assert_eq!(g.provide_pipe_storage(&mut ring), Ok(true));
-        drop(g);
+        assert_eq!(w.region.pipe_allocations(), 0);
         let mut f = syscall(SYS_WRITE, wfd, 0x10000, 4, A_SVC);
         assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 4));
         let mut f = syscall(SYS_READ, r, 0x10000, 4, A_SVC);
         assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 4));
+        let mut held = Vec::new();
+        loop {
+            match w.region.provision_pipe_storage(65536, 16, &HostWait) {
+                Ok(storage) => held.push(storage),
+                Err(IpcError::Fd(FdError::NoMemory)) => break,
+                error => panic!("unexpected allocation result: {error:?}"),
+            }
+        }
+        let empty = w.unbacked_pipe_object();
+        let write = w
+            .host()
+            .open(
+                t,
+                Fd(0),
+                Description::new(
+                    IpcBacking::Pipe {
+                        object: empty,
+                        end: End::Writer,
+                    }
+                    .encode(),
+                    AccessMode::WriteOnly,
+                    NONBLOCK,
+                ),
+                false,
+            )
+            .unwrap()
+            .0;
+        let mut f = syscall(SYS_WRITE, write, 0x10000, 4, A_SVC);
+        assert_eq!((w.call(&mut f), f.x[0] as i64), (RETURNED, -12));
+        for mut storage in held {
+            w.region
+                .reclaim_pipe_storage(&mut storage, &HostWait)
+                .unwrap();
+        }
     }
 
     /// With stocked rings (the host keeps them provisioned), the first write
@@ -3052,11 +3065,10 @@ mod tests {
         let mut w = world();
         let t = w.table(w.a_tid);
         for _ in 0..2 {
-            let ring = IpcPipeStorage {
-                offset: w.bump(65536 + 16 * 8),
-                ring_bytes: 65536,
-                pages: 16,
-            };
+            let ring = w
+                .region
+                .provision_pipe_storage(65536, 16, &HostWait)
+                .unwrap();
             assert_eq!(w.region.stock_ring(ring), Ok(()));
         }
         let object = w.unbacked_pipe_object();

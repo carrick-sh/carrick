@@ -176,12 +176,13 @@ pub(crate) fn el1_pwrite64<V: MemoryValidator>(
 
 /// Bind ring output to the existing exact-MM native write protocol. Input
 /// remains guarded copy; a refused output carries its producer observation.
-pub(crate) struct OwnerCopy<'a, 'p, U, C: carrick_core_abi::EntryContext> {
+pub(crate) struct OwnerCopy<'a, 'p, 'ipc, U, C: carrick_core_abi::EntryContext> {
     pub inner: U,
-    pub owner: Option<&'a mut (dyn carrick_personality_linux::lifecycle::ProcessNative<C> + 'p)>,
+    pub owner:
+        Option<&'a mut (dyn carrick_personality_linux::lifecycle::ProcessNative<'ipc, C> + 'p)>,
     pub wait: Option<carrick_core::mm::transaction::CopyoutRequest>,
 }
-impl<U: UserCopy, C: carrick_core_abi::EntryContext> UserCopy for OwnerCopy<'_, '_, U, C> {
+impl<U: UserCopy, C: carrick_core_abi::EntryContext> UserCopy for OwnerCopy<'_, '_, '_, U, C> {
     fn service_origin(&self) -> carrick_core_abi::service::ServiceOrigin {
         if self
             .owner

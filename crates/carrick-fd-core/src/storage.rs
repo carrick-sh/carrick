@@ -17,6 +17,45 @@ pub enum StorageError {
     Contended,
 }
 
+/// Short shared publication ownership; never held over allocation, I/O or callbacks.
+#[repr(C)]
+pub struct PublicationLock(AtomicU32);
+pub struct PublicationGuard<'a>(&'a AtomicU32);
+impl Drop for PublicationGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(0, Ordering::Release);
+    }
+}
+impl Default for PublicationLock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl PublicationLock {
+    #[cfg(not(all(test, feature = "loom")))]
+    pub const fn new() -> Self {
+        Self(AtomicU32::new(0))
+    }
+    #[cfg(all(test, feature = "loom"))]
+    pub fn new() -> Self {
+        Self(AtomicU32::new(0))
+    }
+    pub fn acquire(&self, wait: &impl LockWait) -> Result<PublicationGuard<'_>, StorageError> {
+        let mut attempt = 0u32;
+        while self
+            .0
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            attempt = attempt.saturating_add(1);
+            if !wait.wait(attempt) {
+                return Err(StorageError::Contended);
+            }
+        }
+        Ok(PublicationGuard(&self.0))
+    }
+}
+
 /// Owned allocation receipt. The venue transfers its ownership into the
 /// descriptor table's extent and reconstructs it only from a retired extent.
 #[must_use = "storage remains owned until released or transferred into a table extent"]

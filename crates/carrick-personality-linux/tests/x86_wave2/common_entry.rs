@@ -203,7 +203,9 @@ fn serve_full<'a, Context: dispatch::DispatchContext + 'a>(
     call: &CanonicalCall,
     world: &'a World,
     anonymous: &'a mut dyn PendingAnonymousVenue,
-    mut process: Option<&'a mut dyn carrick_personality_linux::lifecycle::ProcessNative<Context>>,
+    mut process: Option<
+        &'a mut dyn carrick_personality_linux::lifecycle::ProcessNative<'_, Context>,
+    >,
     source: Option<carrick_core_abi::BornInZoneSource<'a, Context>>,
 ) -> (carrick_personality_linux::dispatch::CompletionRoute, i64) {
     let mut frame = X86Frame {
@@ -230,7 +232,7 @@ fn serve_full<'a, Context: dispatch::DispatchContext + 'a>(
         Some(&*world.venue),
         process.as_mut().map(|process| {
             &mut **process
-                as &mut (dyn carrick_personality_linux::lifecycle::ProcessNative<Context> + '_)
+                as &mut (dyn carrick_personality_linux::lifecycle::ProcessNative<'_, Context> + '_)
         }),
         source,
         Some(anonymous),
@@ -658,7 +660,7 @@ fn common_linux_entry_calls_native_process_custody() {
         fork_tids: std::vec::Vec<ProcessForkChildTid>,
         idle: bool,
     }
-    impl ProcessNative for Process {
+    impl ProcessNative<'_> for Process {
         fn wait_guest_copy(
             &mut self,
             _: carrick_core::user_copy::GuestCopyRequest,
@@ -930,7 +932,7 @@ fn compact_common_entry_suspends_only_after_authenticated_park() {
         receipt: Option<EntryHandoffReceipt<ParkedContextWords>>,
         visits: usize,
     }
-    impl ProcessNative<ParkedContextWords> for Process<'_> {
+    impl ProcessNative<'_, ParkedContextWords> for Process<'_> {
         fn wait_guest_copy(
             &mut self,
             _: carrick_core::user_copy::GuestCopyRequest,

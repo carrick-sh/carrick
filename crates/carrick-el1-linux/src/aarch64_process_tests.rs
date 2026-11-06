@@ -1451,7 +1451,7 @@ impl Fixture {
         ttbr0: u64,
         service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
         dispatch: impl FnOnce(
-            &mut dyn carrick_personality_linux::lifecycle::ProcessNative<Aarch64ParkedContext>,
+            &mut dyn carrick_personality_linux::lifecycle::ProcessNative<'_, Aarch64ParkedContext>,
         ) -> R,
     ) -> Result<R, NativeProcessError> {
         with_process_entry(
@@ -7258,7 +7258,9 @@ fn arm_unadopted_exit_wakes_closing_owner_without_process_venue() {
         }),
         None,
         Some(fixture),
-        None::<&mut dyn carrick_personality_linux::lifecycle::ProcessNative<Aarch64ParkedContext>>,
+        None::<
+            &mut dyn carrick_personality_linux::lifecycle::ProcessNative<'_, Aarch64ParkedContext>,
+        >,
         None,
         None,
         |_| core::ptr::null_mut(),
@@ -8568,7 +8570,9 @@ fn arm_concurrent_exit_group_loser_retires_and_wakes_owner() {
         }),
         None,
         Some(fixture),
-        None::<&mut dyn carrick_personality_linux::lifecycle::ProcessNative<Aarch64ParkedContext>>,
+        None::<
+            &mut dyn carrick_personality_linux::lifecycle::ProcessNative<'_, Aarch64ParkedContext>,
+        >,
         None,
         None,
         |_| core::ptr::null_mut(),
@@ -8691,7 +8695,9 @@ fn arm_unadopted_exit_wakes_unplaceable_closing_owner_without_process_venue() {
         }),
         None,
         Some(fixture),
-        None::<&mut dyn carrick_personality_linux::lifecycle::ProcessNative<Aarch64ParkedContext>>,
+        None::<
+            &mut dyn carrick_personality_linux::lifecycle::ProcessNative<'_, Aarch64ParkedContext>,
+        >,
         None,
         None,
         |_| core::ptr::null_mut(),
@@ -9933,16 +9939,6 @@ fn serial_host_native_children_close_descriptors_above_inherited_capacity() {
     let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
     let words = fixture.tables.live(&fixture.maintenance);
     let task = CurrentTask::new();
-    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
-        source,
-        &fixture.task,
-        fixture.page,
-        fixture.control,
-        fixture.address,
-        fixture.address,
-        parked,
-    )
-    .unwrap();
     let owner = Arc::new(
         HostIpc::with_ceiling(
             1 << 20,
@@ -9995,6 +9991,17 @@ fn serial_host_native_children_close_descriptors_above_inherited_capacity() {
     let mut crossing = TestStockCrossing::new(&pages);
     crossing.metadata_in_el1_window = true;
     crossing.ipc = Some((Arc::clone(&owner), map));
+    let tables = crate::ipc::MapTables(map);
+    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+        source,
+        &fixture.task,
+        fixture.page,
+        fixture.control,
+        fixture.address,
+        fixture.address,
+        parked,
+    )
+    .unwrap();
     let mut service = Aarch64NativeProcessService::with_crossing(
         &fixture.task,
         fixture.slot,
@@ -10040,7 +10047,6 @@ fn serial_host_native_children_close_descriptors_above_inherited_capacity() {
             .is_queued()
     );
 
-    let tables = crate::ipc::MapTables(map);
     let venue = crate::ipc::IpcVenue {
         region: owner.region(),
         tables: &tables,
@@ -10258,16 +10264,6 @@ fn native_descriptor_witness(
     let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
     let words = fixture.tables.live(&fixture.maintenance);
     let task = CurrentTask::new();
-    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
-        source,
-        &fixture.task,
-        fixture.page,
-        fixture.control,
-        fixture.address,
-        fixture.address,
-        parked,
-    )
-    .unwrap();
     let owner = Arc::new(
         HostIpc::with_limits(
             1 << 20,
@@ -10351,6 +10347,17 @@ fn native_descriptor_witness(
     let mut crossing = TestStockCrossing::new(&pages);
     crossing.metadata_in_el1_window = true;
     crossing.ipc = Some((Arc::clone(&owner), map));
+    let tables = crate::ipc::MapTables(map);
+    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+        source,
+        &fixture.task,
+        fixture.page,
+        fixture.control,
+        fixture.address,
+        fixture.address,
+        parked,
+    )
+    .unwrap();
     let mut service = Aarch64NativeProcessService::with_crossing(
         &fixture.task,
         fixture.slot,
@@ -10405,7 +10412,6 @@ fn native_descriptor_witness(
         drop(epoll);
     }
 
-    let tables = crate::ipc::MapTables(map);
     let venue = crate::ipc::IpcVenue {
         region: owner.region(),
         tables: &tables,
@@ -10596,7 +10602,7 @@ fn native_descriptor_witness(
             } else {
                 vec![result as u64]
             };
-            for fd in created {
+            for fd in created.iter().copied() {
                 let (route, result) = run_in_child(0, sys::FCNTL.raw(), [fd, LINUX_F_GETFD, 0]);
                 assert!(matches!(
                     route,
@@ -10612,6 +10618,34 @@ fn native_descriptor_witness(
                     result, 0,
                     "root descriptor must close through its ring owner"
                 );
+            }
+            if nr == sys::PIPE2.raw() {
+                // A failed exact-MM output must cancel both numeric claims.
+                let (route, result) =
+                    run_in_child(0, nr, [carrick_guest_arch::USER_CEILING, flags, 0]);
+                assert!(matches!(
+                    route,
+                    CompletionRoute::Served | CompletionRoute::WithWork
+                ));
+                assert_eq!(result, -14);
+                let (route, result) = run_in_child(0, nr, args);
+                assert!(matches!(
+                    route,
+                    CompletionRoute::Served | CompletionRoute::WithWork
+                ));
+                assert_eq!(result, 0);
+                let retried: Vec<_> = output
+                    .as_bytes()
+                    .chunks_exact(4)
+                    .map(|bytes| u64::from(u32::from_ne_bytes(bytes.try_into().unwrap())))
+                    .collect();
+                assert_eq!(
+                    retried, created,
+                    "copy fault leaves no descriptors or reserved holes"
+                );
+                for fd in retried {
+                    assert_eq!(run_in_child(0, sys::CLOSE.raw(), [fd, 0, 0]).1, 0);
+                }
             }
             return;
         }
@@ -11029,16 +11063,6 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
     let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
     let words = fixture.tables.live(&fixture.maintenance);
     let task = CurrentTask::new();
-    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
-        source,
-        &fixture.task,
-        fixture.page,
-        fixture.control,
-        fixture.address,
-        fixture.address,
-        parked,
-    )
-    .unwrap();
     let owner = Arc::new(
         HostIpc::with_limits(
             1 << 20,
@@ -11092,6 +11116,17 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
     let mut crossing = TestStockCrossing::new(&pages);
     crossing.metadata_in_el1_window = true;
     crossing.ipc = Some((Arc::clone(&owner), map));
+    let tables = crate::ipc::MapTables(map);
+    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+        source,
+        &fixture.task,
+        fixture.page,
+        fixture.control,
+        fixture.address,
+        fixture.address,
+        parked,
+    )
+    .unwrap();
     let mut service = Aarch64NativeProcessService::with_crossing(
         &fixture.task,
         fixture.slot,
@@ -11137,7 +11172,6 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
             .is_queued()
     );
 
-    let tables = crate::ipc::MapTables(map);
     let venue = crate::ipc::IpcVenue {
         region: owner.region(),
         tables: &tables,

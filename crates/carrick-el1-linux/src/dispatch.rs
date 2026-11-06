@@ -413,7 +413,7 @@ pub(super) fn dispatch_arm_syscall_with_native_process<F, C, U, X>(
     inotify_table: &[DelegatedInotify],
     name_cache: &InotifyNameCache,
     zone: Option<Zone<'_, C, U>>,
-    ipc: Option<&ipc::IpcVenue<'_>>,
+    ipc: Option<&ipc::IpcVenue<'static>>,
     lifecycle: Option<&dyn lifecycle::LifecycleVenue>,
     page: &'static carrick_el1_abi::ThreadLifecyclePage,
     control: &'static carrick_el1_abi::ThreadControlSlot,
@@ -565,7 +565,7 @@ pub(super) fn fallback_or_refuse_arm_process_call<F, C, U>(
     inotify_table: &[DelegatedInotify],
     name_cache: &InotifyNameCache,
     zone: Option<Zone<'_, C, U>>,
-    ipc: Option<&ipc::IpcVenue<'_>>,
+    ipc: Option<&ipc::IpcVenue<'static>>,
     cache_lookup: F,
     refused: bool,
 ) -> Action
@@ -1963,7 +1963,7 @@ where
 /// published for this venue ([`lifecycle::LifecycleVenue`]): thread clone
 /// and exit and the per-thread setup calls are served in EL1.
 #[allow(clippy::too_many_arguments)]
-pub fn dispatch_syscall_with_lifecycle<'a, F, C, U, G>(
+pub fn dispatch_syscall_with_lifecycle<'a, 'ipc, F, C, U, G>(
     frame: &'a mut G,
     counters: &'a Counters,
     current_tasks: &'a [CurrentTask],
@@ -1973,9 +1973,9 @@ pub fn dispatch_syscall_with_lifecycle<'a, F, C, U, G>(
     inotify_table: &'a [DelegatedInotify],
     name_cache: &'a InotifyNameCache,
     zone: Option<Zone<'a, C, U>>,
-    ipc: Option<&'a ipc::IpcVenue<'a>>,
+    ipc: Option<&'a ipc::IpcVenue<'ipc>>,
     lifecycle: Option<&'a dyn lifecycle::LifecycleVenue>,
-    process: Option<&'a mut dyn lifecycle::ProcessNative<LegacyDispatchContext>>,
+    process: Option<&'a mut dyn lifecycle::ProcessNative<'ipc, LegacyDispatchContext>>,
     cache_lookup: F,
 ) -> Action
 where
@@ -2070,7 +2070,7 @@ impl DispatchContext for carrick_sched_core::Aarch64ParkedContext {
 /// Supply native process and anonymous custody to the same full Linux pipeline.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-pub fn dispatch_syscall_with_native<'a, F, C, U, G, Context>(
+pub fn dispatch_syscall_with_native<'a, 'ipc, F, C, U, G, Context>(
     frame: &'a mut G,
     counters: &'a Counters,
     current_tasks: &'a [CurrentTask],
@@ -2080,9 +2080,9 @@ pub fn dispatch_syscall_with_native<'a, F, C, U, G, Context>(
     inotify_table: &'a [DelegatedInotify],
     name_cache: &'a InotifyNameCache,
     zone: Option<Zone<'a, C, U>>,
-    ipc: Option<&'a ipc::IpcVenue<'a>>,
+    ipc: Option<&'a ipc::IpcVenue<'ipc>>,
     lifecycle: Option<&'a dyn lifecycle::LifecycleVenue>,
-    process: Option<&'a mut dyn lifecycle::ProcessNative<Context>>,
+    process: Option<&'a mut dyn lifecycle::ProcessNative<'ipc, Context>>,
     source: Option<carrick_el1_abi::BornInZoneSource<'a, Context>>,
     anonymous: Option<
         &'a mut dyn carrick_personality_linux::pending_anonymous::PendingAnonymousVenue,
@@ -2168,12 +2168,14 @@ pub enum NativeInvariant {
     RevisionCredit,
     SignalNumber,
     ProcessGraph(super::process_owner::GuestProcessInvariant),
+    PipeOutput,
 }
 
 impl core::fmt::Debug for NativeInvariant {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::EntryBinding => f.write_str("EntryBinding"),
+            Self::PipeOutput => f.write_str("PipeOutput"),
             Self::NativeService(error) => f.debug_tuple("NativeService").field(error).finish(),
             Self::PhysicalCustody(reason) => f
                 .debug_tuple("PhysicalCustody")
@@ -2196,6 +2198,7 @@ impl NativeInvariant {
         use carrick_el1_abi::EntryBindingFatalReason as Fatal;
         match self {
             NativeInvariant::EntryBinding => Fatal::EntryBinding,
+            NativeInvariant::PipeOutput => Fatal::NativeServiceQuarantined,
             NativeInvariant::NativeService(reason) => *reason,
             NativeInvariant::PhysicalCustody(reason) => match reason {
                 PhysicalCustodyInvariant::RootExitRefused => Fatal::RootExitRefused,
@@ -2315,7 +2318,7 @@ pub fn invalid_completion(reason: NativeInvariant) -> ! {
 }
 
 fn complete_poll_copyout<'p, C: carrick_core_abi::EntryContext>(
-    process: Option<&mut (dyn lifecycle::ProcessNative<C> + 'p)>,
+    process: Option<&mut (dyn lifecycle::ProcessNative<'_, C> + 'p)>,
     task: &CurrentTask,
     address: carrick_guest_arch::UserVa,
     bytes: &[u8],
@@ -2358,6 +2361,7 @@ fn host_owned_poll_copyout_refusal_keeps_the_host_fallback() {
 
 pub struct El1PendingFamilies<
     'a,
+    'ipc,
     F,
     C: sched::ThreadCpu,
     U: sched::UserWord,
@@ -2377,9 +2381,9 @@ pub struct El1PendingFamilies<
     pub(super) inotify_table: &'a [DelegatedInotify],
     pub(super) name_cache: &'a InotifyNameCache,
     pub(super) zone: Option<Zone<'a, C, U>>,
-    pub(super) ipc: Option<&'a ipc::IpcVenue<'a>>,
+    pub(super) ipc: Option<&'a ipc::IpcVenue<'ipc>>,
     pub(super) lifecycle: Option<&'a dyn lifecycle::LifecycleVenue>,
-    pub(super) process: Option<&'a mut dyn lifecycle::ProcessNative<Context>>,
+    pub(super) process: Option<&'a mut dyn lifecycle::ProcessNative<'ipc, Context>>,
     pub(super) source: Option<carrick_el1_abi::BornInZoneSource<'a, Context>>,
     pub(super) anonymous:
         Option<&'a mut dyn carrick_personality_linux::pending_anonymous::PendingAnonymousVenue>,
@@ -2387,12 +2391,13 @@ pub struct El1PendingFamilies<
 }
 impl<
     'a,
+    'ipc,
     F: Fn(u32) -> *mut u8,
     C: sched::ThreadCpu,
     U: sched::UserWord,
     G: GuestDispatchFrame,
     Context: DispatchContext,
-> PendingFamilies<'a, Context> for El1PendingFamilies<'a, F, C, U, G, Context>
+> PendingFamilies<'a, Context> for El1PendingFamilies<'a, 'ipc, F, C, U, G, Context>
 {
     fn resume_owned_continuation(&mut self) -> Option<lifecycle::LifecycleOutcome> {
         self.process.as_deref_mut()?.resume_owned_continuation()
@@ -2403,7 +2408,8 @@ impl<
     fn native_descriptor_owner(&self) -> bool {
         self.ipc.zip(self.task()).is_some_and(|(venue, task)| {
             let nr = self.frame.canonical_ordinal().raw();
-            if nr == carrick_personality_linux::crossing::nr::EPOLL_CREATE1.raw()
+            if nr == carrick_personality_linux::crossing::nr::PIPE2.raw()
+                || nr == carrick_personality_linux::crossing::nr::EPOLL_CREATE1.raw()
                 || nr == carrick_personality_linux::crossing::nr::EPOLL_CTL.raw()
                 || venue.tables.is_owned_table(task)
             {
@@ -2427,6 +2433,7 @@ impl<
         let ordinal = self.frame.canonical_ordinal().raw();
         if self.native_descriptor_owner() {
             if [
+                carrick_personality_linux::crossing::nr::PIPE2,
                 carrick_personality_linux::crossing::nr::EPOLL_CREATE1,
                 carrick_personality_linux::crossing::nr::EPOLL_CTL,
                 carrick_personality_linux::crossing::nr::DUP,
@@ -3122,7 +3129,7 @@ impl<
     G: GuestDispatchFrame,
     Context: DispatchContext,
 > carrick_personality_linux::pending_anonymous::PendingAnonymousVenue
-    for El1PendingFamilies<'_, F, C, U, G, Context>
+    for El1PendingFamilies<'_, '_, F, C, U, G, Context>
 {
     fn original_argument0(&self) -> u64 {
         self.frame.argument(0).unwrap_or(0)
@@ -3303,6 +3310,53 @@ impl carrick_el1_abi::ipc::LockWait for NativeFdWait {
     }
 }
 
+/// Constructor custody contains no published descriptor until copyout finishes.
+/// The exact region, pins and numeric claims survive an owner-memory park.
+struct PipeOutput<'a> {
+    region: carrick_el1_abi::ipc::IpcRegion<'a>,
+    claims: Option<carrick_fd_core::reservation::PairReservation>,
+    pins: [Option<carrick_el1_abi::ipc::OfdPin>; 2],
+    backings: [Option<carrick_el1_abi::ipc::BackingToken>; 2],
+    cloexec: bool,
+}
+impl lifecycle::CopyoutEffect for PipeOutput<'_> {
+    fn commit(&mut self) -> Result<(), carrick_syscall_abi::LinuxErrno> {
+        let authority = self.region.fd(NativeFdWait);
+        let claims = self.claims.as_mut().ok_or(carrick_syscall_abi::LINUX_EIO)?;
+        authority
+            .publish_pair(claims, &mut self.pins, self.cloexec)
+            .map_err(|_| carrick_syscall_abi::LINUX_EIO)?;
+        self.claims = None;
+        Ok(())
+    }
+}
+impl Drop for PipeOutput<'_> {
+    fn drop(&mut self) {
+        let authority = self.region.fd(NativeFdWait);
+        if let Some(mut claims) = self.claims.take() {
+            match authority.cancel_pair(&mut claims) {
+                Ok(()) | Err(carrick_fd_core::Error::StaleTable) => {}
+                Err(_) => invalid_completion(NativeInvariant::PipeOutput),
+            }
+        }
+        for (pin, backing) in self.pins.iter_mut().zip(self.backings.iter_mut()) {
+            let release = if let Some(pin) = pin.take() {
+                authority
+                    .unpin(pin)
+                    .unwrap_or_else(|_| invalid_completion(NativeInvariant::PipeOutput))
+                    .map(|description| description.backing)
+            } else {
+                backing.take()
+            };
+            if let Some(backing) = release {
+                self.region
+                    .release_backing(backing, &NativeFdWait)
+                    .unwrap_or_else(|_| invalid_completion(NativeInvariant::PipeOutput));
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum NativeDupTarget {
     Lowest(carrick_el1_abi::ipc::fd::Fd),
@@ -3319,7 +3373,7 @@ struct NativeDupRequest {
 
 #[inline(never)]
 fn raise_native_sigpipe<'p, Context: DispatchContext>(
-    process: Option<&mut (dyn lifecycle::ProcessNative<Context> + 'p)>,
+    process: Option<&mut (dyn lifecycle::ProcessNative<'_, Context> + 'p)>,
 ) {
     if let Some(signals) = process.and_then(|p| p.signal_venue()) {
         signals.raise_sigpipe();
@@ -3363,6 +3417,7 @@ fn run_with_table_growth<T>(
     ) -> Result<T, carrick_el1_abi::ipc::fd::Error>,
 ) -> Result<T, FamilyCompletion> {
     loop {
+        let seen = region.ofd_count();
         match op(region.fd(NativeFdWait)) {
             Ok(val) => return Ok(val),
             Err(carrick_el1_abi::ipc::fd::Error::NeedsBacking { descriptors }) => {
@@ -3371,7 +3426,9 @@ fn run_with_table_growth<T>(
                     .map_err(map_ipc_error)?;
             }
             Err(carrick_el1_abi::ipc::fd::Error::NeedsOfds) => {
-                region.grow_ofds().map_err(map_ipc_error)?;
+                region
+                    .grow_ofds(seen, carrick_el1_abi::ipc::IPC_MAX_OFDS)
+                    .map_err(map_ipc_error)?;
             }
             Err(err) => return Err(map_fd_error(err)),
         }
@@ -3379,7 +3436,7 @@ fn run_with_table_growth<T>(
 }
 
 impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context: DispatchContext>
-    El1PendingFamilies<'_, F, C, U, G, Context>
+    El1PendingFamilies<'_, '_, F, C, U, G, Context>
 {
     fn settle_delegated_release(
         frame: &mut G,
@@ -3508,6 +3565,108 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
             .map(|(z, slot)| (z.tables, slot));
 
         match ordinal {
+            nr if nr == carrick_personality_linux::crossing::nr::PIPE2.raw() => {
+                use carrick_el1_abi::ipc::{
+                    IpcBacking,
+                    fd::{Description, StatusFlags},
+                    pipe::End,
+                };
+                let flags = self.frame.argument(1).unwrap_or(0) as u32 as u64;
+                if flags & !(carrick_syscall_abi::LINUX_O_CLOEXEC | carrick_abi::LINUX_O_NONBLOCK)
+                    != 0
+                {
+                    return FamilyCompletion::Complete(
+                        carrick_syscall_abi::LINUX_EINVAL.guest_retval(),
+                    );
+                }
+                let Some(process) = self.process.as_deref_mut() else {
+                    return FamilyCompletion::Forward;
+                };
+                let mut claims = match run_with_table_growth(&venue.region, table, |auth| {
+                    auth.reserve_pair(table)
+                }) {
+                    Ok(claims) => claims,
+                    Err(error) => return error,
+                };
+                let object = loop {
+                    let seen = venue.region.object_count();
+                    match venue.region.create_pipe(65536, &NativeFdWait) {
+                        Ok(object) => break object,
+                        Err(carrick_el1_abi::ipc::IpcError::NoObjects) => {
+                            if let Err(error) = venue
+                                .region
+                                .grow_objects(seen, carrick_el1_abi::ipc::IPC_MAX_OBJECTS)
+                            {
+                                let _ = venue.region.fd(NativeFdWait).cancel_pair(&mut claims);
+                                return map_ipc_error(error);
+                            }
+                        }
+                        Err(error) => {
+                            let _ = venue.region.fd(NativeFdWait).cancel_pair(&mut claims);
+                            return map_ipc_error(error);
+                        }
+                    }
+                };
+                let Some(fds) = claims.fds() else {
+                    invalid_completion(NativeInvariant::PipeOutput)
+                };
+                let backings = [End::Reader, End::Writer]
+                    .map(|end| Some(IpcBacking::Pipe { object, end }.encode()));
+                let mut output = PipeOutput {
+                    region: venue.region,
+                    claims: Some(claims),
+                    pins: [None, None],
+                    backings,
+                    cloexec: flags & carrick_syscall_abi::LINUX_O_CLOEXEC != 0,
+                };
+                if let Some((zone, _)) = zone {
+                    for lane in [
+                        carrick_el1_abi::ipc::pipe::WaitFor::Readable,
+                        carrick_el1_abi::ipc::pipe::WaitFor::Writable,
+                    ] {
+                        if let Some(key) = carrick_el1_abi::ipc::object_wait_key(object, lane)
+                            && zone
+                                .bind_object_wait(key, &carrick_sched_core::ShortLockSpin)
+                                .is_err()
+                        {
+                            return FamilyCompletion::Complete(
+                                carrick_syscall_abi::LINUX_EIO.guest_retval(),
+                            );
+                        }
+                    }
+                }
+                for (index, access) in [AccessMode::ReadOnly, AccessMode::WriteOnly]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let Some(backing) = output.backings[index] else {
+                        invalid_completion(NativeInvariant::PipeOutput)
+                    };
+                    let description = Description::new(
+                        backing,
+                        access,
+                        StatusFlags {
+                            nonblock: flags & carrick_abi::LINUX_O_NONBLOCK != 0,
+                            ..StatusFlags::default()
+                        },
+                    );
+                    match run_with_table_growth(&venue.region, table, |auth| {
+                        auth.create_pinned(description)
+                    }) {
+                        Ok(pin) => {
+                            output.pins[index] = Some(pin);
+                            output.backings[index] = None;
+                        }
+                        Err(error) => return error,
+                    }
+                }
+                let bytes = fds.into_iter().flat_map(|fd| fd.0.to_ne_bytes()).collect();
+                lifecycle::lifecycle_effect(&process.complete_constructor_output(
+                    carrick_guest_arch::UserVa::new(self.frame.argument(0).unwrap_or(0)),
+                    bytes,
+                    alloc::boxed::Box::new(output),
+                ))
+            }
             nr if nr == carrick_personality_linux::crossing::nr::EPOLL_CREATE1.raw() => {
                 let flags = self.frame.argument(0).unwrap_or(0) as u32 as u64;
                 if flags & !carrick_syscall_abi::LINUX_O_CLOEXEC != 0 {
@@ -3516,10 +3675,14 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                     );
                 }
                 let object = loop {
+                    let seen = venue.region.object_count();
                     match venue.region.create_epoll(&NativeFdWait) {
                         Ok(object) => break object,
                         Err(carrick_el1_abi::ipc::IpcError::NoObjects) => {
-                            if let Err(error) = venue.region.grow_objects() {
+                            if let Err(error) = venue
+                                .region
+                                .grow_objects(seen, carrick_el1_abi::ipc::IPC_MAX_OBJECTS)
+                            {
                                 return map_ipc_error(error);
                             }
                         }
@@ -3980,7 +4143,7 @@ impl<
     U: sched::UserWord,
     G: GuestDispatchFrame,
     Context: DispatchContext,
-> carrick_personality_linux::sched::SchedVenue for El1PendingFamilies<'_, F, C, U, G, Context>
+> carrick_personality_linux::sched::SchedVenue for El1PendingFamilies<'_, '_, F, C, U, G, Context>
 {
     fn yield_current(&mut self) -> FamilyCompletion {
         let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
@@ -4120,7 +4283,7 @@ impl<
     U: sched::UserWord,
     G: GuestDispatchFrame,
     Context: DispatchContext,
-> PendingFileVenue for El1PendingFamilies<'_, F, C, U, G, Context>
+> PendingFileVenue for El1PendingFamilies<'_, '_, F, C, U, G, Context>
 {
     fn ordinal(&self) -> u64 {
         self.frame.canonical_ordinal().raw()
@@ -4206,7 +4369,7 @@ impl<
     }
 }
 impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context: DispatchContext>
-    El1PendingFamilies<'_, F, C, U, G, Context>
+    El1PendingFamilies<'_, '_, F, C, U, G, Context>
 {
     fn file_access(&self) -> carrick_el1::substrate::file_notification::FileAccess<'_> {
         match (self.zone.as_ref(), self.frame.slot()) {
@@ -5391,6 +5554,7 @@ mod tests {
                             lifecycle: None,
                             process: None::<
                                 &mut dyn carrick_personality_linux::lifecycle::ProcessNative<
+                                    '_,
                                     carrick_el1_abi::Aarch64ParkedContext,
                                 >,
                             >,
@@ -5625,7 +5789,7 @@ mod tests {
                 None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
                 None,
                 None,
-                None::<&mut dyn lifecycle::ProcessNative<carrick_sched_core::ThreadCtx>>,
+                None::<&mut dyn lifecycle::ProcessNative<'_, carrick_sched_core::ThreadCtx>>,
                 None,
                 None,
                 |_| core::ptr::null_mut(),
@@ -5689,6 +5853,7 @@ mod tests {
             lifecycle: None,
             process: None::<
                 &mut dyn carrick_personality_linux::lifecycle::ProcessNative<
+                    '_,
                     carrick_sched_core::ThreadCtx,
                 >,
             >,

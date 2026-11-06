@@ -301,7 +301,6 @@ host_crossings! {
     Fcntl = nr::FCNTL, false, Temporary;
     InotifyInit1 = nr::INOTIFY_INIT1, false, Temporary;
     Close = nr::CLOSE, false, Temporary;
-    Pipe2 = nr::PIPE2, false, Temporary;
     Signalfd4 = nr::SIGNALFD4, false, Temporary;
     TimerfdCreate = nr::TIMERFD_CREATE, false, Temporary;
     TimerfdSettime = nr::TIMERFD_SETTIME, false, Temporary;

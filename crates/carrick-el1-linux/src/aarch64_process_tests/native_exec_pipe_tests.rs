@@ -66,6 +66,7 @@ fn serial_host_native_fork_exec_pipe_writer_reaches_its_parent() {
     crossing.metadata_in_el1_window = true;
     crossing.ipc = Some((owner.clone(), map));
     let words = fixture.tables.live(&fixture.maintenance);
+    let tables = crate::ipc::MapTables(map);
     let runtime = Arc::new(
         NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
             source,
@@ -249,7 +250,6 @@ fn serial_host_native_fork_exec_pipe_writer_reaches_its_parent() {
         fixture.task.mm.key.load(Ordering::Acquire),
         child_binding.address.mm.raw().get()
     );
-    let tables = crate::ipc::MapTables(map);
     let venue = crate::ipc::IpcVenue {
         region: owner.region(),
         tables: &tables,

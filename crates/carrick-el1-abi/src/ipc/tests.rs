@@ -55,7 +55,6 @@ const EL1: BoundedSpin = BoundedSpin(1024);
 struct Fixture {
     region: &'static IpcRegion<'static>,
     /// Next free byte of the ring area, and of the descriptor area.
-    next: Cell<u64>,
     next_descriptor: Cell<u64>,
     pool_len: u64,
 }
@@ -88,23 +87,11 @@ fn fixture(pool_len: usize) -> Fixture {
             .with_ceiling(&TEST_CEILING);
     Fixture {
         region: Box::leak(Box::new(region)),
-        next: Cell::new(0),
         next_descriptor: Cell::new(ipc_descriptor_area(pool_len as u64).start),
         pool_len: pool_len as u64,
     }
 }
 impl Fixture {
-    /// Ring-area bytes.
-    fn bump(&self, bytes: u64) -> u64 {
-        let at = self.next.get();
-        let end = (at + bytes).next_multiple_of(IPC_POOL_ALIGN);
-        assert!(
-            end <= ipc_ring_area(self.pool_len).end,
-            "fixture ring area exhausted"
-        );
-        self.next.set(end);
-        at
-    }
     fn descriptors(&self, capacity: usize) -> Extent {
         let at = self.next_descriptor.get();
         let end = (at + descriptor_extent_bytes(capacity)).next_multiple_of(IPC_POOL_ALIGN);
@@ -116,16 +103,9 @@ impl Fixture {
         }
     }
     fn pipe_storage(&self) -> IpcPipeStorage {
-        let pages = 16;
-        let s = IpcPipeStorage {
-            offset: 0,
-            ring_bytes: (pages * IPC_PIPE_PAGE_SIZE) as u64,
-            pages: pages as u64,
-        };
-        IpcPipeStorage {
-            offset: self.bump(s.footprint()),
-            ..s
-        }
+        self.region
+            .provision_pipe_storage(65536, 16, &Spin)
+            .unwrap()
     }
     fn host(&self) -> IpcFdAuthority<'static, Spin> {
         self.region.fd(Spin)
@@ -921,7 +901,8 @@ fn el1_ipc_operation_release_only_follows_a_reusable_slot_push() {
 
 #[test]
 fn el1_ipc_live_pipe_storage_replacement_preserves_both_venues() {
-    let fx = fixture(512 * 1024);
+    // Buddy extents: 128 KiB old + 256 KiB replacement in the ring half.
+    let fx = fixture(1 << 20);
     let table = fx.table();
     let (_, _, object) = fx.pipe(table);
     let old = {
@@ -936,7 +917,10 @@ fn el1_ipc_live_pipe_storage_replacement_preserves_both_venues() {
         ring_bytes: 131072,
         pages: 32,
     };
-    next.offset = fx.bump(next.footprint());
+    next = fx
+        .region
+        .provision_pipe_storage(next.ring_bytes, next.pages, &Spin)
+        .unwrap();
     let supplied = next;
     {
         let mut host = fx.region.lock(object, &Spin).unwrap();
@@ -1143,7 +1127,11 @@ fn el1_ipc_object_and_description_stores_grow_by_segment() {
         fx.region.create_eventfd(0, EventMode::Counter, &Spin),
         Err(IpcError::NoObjects)
     );
-    assert_eq!(fx.region.grow_objects(), Ok(IPC_OBJECT_SEGMENT));
+    assert_eq!(
+        fx.region
+            .grow_objects(fx.region.object_count(), IPC_MAX_OBJECTS),
+        Ok(IPC_OBJECT_SEGMENT)
+    );
     let grown = fx
         .region
         .create_eventfd(9, EventMode::Counter, &Spin)
@@ -1188,18 +1176,35 @@ fn el1_ipc_object_and_description_stores_grow_by_segment() {
         fx.host().open(t, Fd(0), desc(grown), false),
         Err(fd::Error::NeedsOfds)
     );
-    assert_eq!(fx.region.grow_ofds(), Ok(IPC_OFD_SEGMENT));
+    assert_eq!(
+        fx.region.grow_ofds(fx.region.ofd_count(), IPC_MAX_OFDS),
+        Ok(IPC_OFD_SEGMENT)
+    );
     let fd = fx.host().open(t, Fd(0), desc(grown), false).unwrap();
     assert_eq!(el1.fd(EL1).get(t, fd).unwrap().backing, desc(grown).backing);
     // Only the zone-wide ceiling refuses.
     while fx.region.object_count() < IPC_MAX_OBJECTS {
-        assert_eq!(fx.region.grow_objects(), Ok(IPC_OBJECT_SEGMENT));
+        assert_eq!(
+            fx.region
+                .grow_objects(fx.region.object_count(), IPC_MAX_OBJECTS),
+            Ok(IPC_OBJECT_SEGMENT)
+        );
     }
-    assert_eq!(fx.region.grow_objects(), Err(IpcError::ZoneLimit));
+    assert_eq!(
+        fx.region
+            .grow_objects(fx.region.object_count(), IPC_MAX_OBJECTS),
+        Err(IpcError::ZoneLimit)
+    );
     while fx.region.ofd_count() < IPC_MAX_OFDS {
-        assert_eq!(fx.region.grow_ofds(), Ok(IPC_OFD_SEGMENT));
+        assert_eq!(
+            fx.region.grow_ofds(fx.region.ofd_count(), IPC_MAX_OFDS),
+            Ok(IPC_OFD_SEGMENT)
+        );
     }
-    assert_eq!(fx.region.grow_ofds(), Err(IpcError::ZoneLimit));
+    assert_eq!(
+        fx.region.grow_ofds(fx.region.ofd_count(), IPC_MAX_OFDS),
+        Err(IpcError::ZoneLimit)
+    );
     // The last record of the zone is an ordinary record.
     let objects: Vec<_> =
         core::iter::from_fn(|| fx.region.create_eventfd(0, EventMode::Counter, &Spin).ok())
@@ -1227,7 +1232,9 @@ fn el1_ipc_object_and_description_stores_grow_by_segment() {
 fn el1_ipc_host_wake_index_spans_every_segment_without_scanning() {
     let fx = fixture(1 << 20);
     while fx.region.object_count() < 5 * IPC_OBJECT_SEGMENT {
-        fx.region.grow_objects().unwrap();
+        fx.region
+            .grow_objects(fx.region.object_count(), IPC_MAX_OBJECTS)
+            .unwrap();
     }
     let objects: Vec<_> = (0..5 * IPC_OBJECT_SEGMENT)
         .map(|_| {
@@ -1329,7 +1336,8 @@ fn el1_ipc_too_small_retained_ring_stays_owned_until_replacement() {
 /// that has no ring yet; every other case keeps the stock intact.
 #[test]
 fn el1_ipc_ring_stock_is_bounded_and_spent_only_on_first_writes() {
-    let fx = fixture(1 << 20);
+    // Every stocked ring now owns a real rounded allocation.
+    let fx = fixture(((IPC_RING_STOCK + 8) * 2 * 131072).next_power_of_two());
     let mut odd = fx.pipe_storage();
     odd.ring_bytes = 8192;
     odd.pages = 2;
@@ -1364,14 +1372,13 @@ fn el1_ipc_ring_stock_is_bounded_and_spent_only_on_first_writes() {
         "EPIPE spends no ring"
     );
     drop(g);
-    // Fill the stock (one extent repeated: nothing takes these back).
-    let ring = fx.pipe_storage();
     let mut fill = 1;
     while fx.region.ring_stock_has_room() {
-        assert_eq!(fx.region.stock_ring(ring), Ok(()));
+        assert_eq!(fx.region.stock_ring(fx.pipe_storage()), Ok(()));
         fill += 1;
     }
     assert_eq!(fill, IPC_RING_STOCK);
+    let ring = fx.pipe_storage();
     assert_eq!(fx.region.stock_ring(ring), Err(ring), "bounded");
 }
 
@@ -1559,4 +1566,105 @@ fn vector_input_survives_concurrent_descriptor_growth_and_retired_lookup() {
         }
         region.finish_operation(token, || {}).unwrap();
     });
+}
+
+#[test]
+fn shared_pipe_supply_without_stock_reuses_and_replaces_owned_extents() {
+    let fx = fixture(2 << 20);
+    let first = fx.region.create_pipe(8192, &Spin).unwrap();
+    let second = fx.region.create_pipe(65536, &Spin).unwrap();
+    let old = {
+        let mut guard = fx.region.lock(first, &Spin).unwrap();
+        assert!(guard.ensure_pipe_storage().unwrap());
+        assert_eq!(guard.pipe().unwrap().try_write(b"first").result, Ok(5));
+        guard.storage()
+    };
+    let peer = {
+        let mut guard = fx.region.lock(second, &Spin).unwrap();
+        assert!(guard.ensure_pipe_storage().unwrap());
+        assert_eq!(guard.pipe().unwrap().try_write(b"second").result, Ok(6));
+        guard.storage()
+    };
+    assert_ne!(old.offset, peer.offset);
+    assert_eq!(fx.region.pipe_allocations(), 2);
+    for end in [End::Reader, End::Writer] {
+        fx.region
+            .release_backing(IpcBacking::Pipe { object: first, end }.encode(), &Spin)
+            .unwrap();
+    }
+    let reused = fx.region.create_pipe(65536, &Spin).unwrap();
+    assert_eq!(reused.to_raw().index, first.to_raw().index);
+    {
+        let mut guard = fx.region.lock(reused, &Spin).unwrap();
+        assert_eq!(guard.storage(), old);
+        assert!(!guard.pipe().unwrap().is_backed());
+        assert!(guard.ensure_pipe_storage().unwrap());
+        assert_ne!(guard.storage().offset, old.offset);
+        assert!(guard.ensure_pipe_storage().unwrap());
+    }
+    assert_eq!(
+        fx.region.pipe_allocations(),
+        2,
+        "one exact replacement, no leak"
+    );
+    let mut guard = fx.region.lock(second, &Spin).unwrap();
+    let mut bytes = [0; 6];
+    assert_eq!(guard.pipe().unwrap().try_read(&mut bytes).result, Ok(6));
+    assert_eq!(&bytes, b"second");
+}
+
+#[test]
+fn shared_growth_reprobes_a_peer_publication_even_at_the_ceiling() {
+    let fx = fixture(1 << 20);
+    let objects = fx.region.object_count();
+    let ofds = fx.region.ofd_count();
+    assert_eq!(
+        fx.region
+            .grow_objects(objects, objects + IPC_OBJECT_SEGMENT),
+        Ok(IPC_OBJECT_SEGMENT)
+    );
+    assert_eq!(
+        fx.region
+            .grow_objects(objects, objects + IPC_OBJECT_SEGMENT),
+        Ok(0)
+    );
+    assert_eq!(
+        fx.region
+            .grow_objects(fx.region.object_count(), objects + IPC_OBJECT_SEGMENT),
+        Err(IpcError::ZoneLimit)
+    );
+    assert_eq!(
+        fx.region.grow_ofds(ofds, ofds + IPC_OFD_SEGMENT),
+        Ok(IPC_OFD_SEGMENT)
+    );
+    assert_eq!(fx.region.grow_ofds(ofds, ofds + IPC_OFD_SEGMENT), Ok(0));
+    assert_eq!(
+        fx.region
+            .grow_ofds(fx.region.ofd_count(), ofds + IPC_OFD_SEGMENT),
+        Err(IpcError::ZoneLimit)
+    );
+}
+
+std::thread_local! {
+    static OBJECT_PUBLICATION_PROBE: Cell<bool> = const { Cell::new(false) };
+}
+pub(super) fn observe_object_publication(first: usize, completed: usize) {
+    if OBJECT_PUBLICATION_PROBE.get() {
+        assert_eq!(completed, first);
+    }
+}
+#[test]
+fn object_growth_observation_excludes_the_segment_still_being_linked() {
+    let fx = fixture(1 << 20);
+    let seen = fx.region.object_count();
+    OBJECT_PUBLICATION_PROBE.set(true);
+    assert_eq!(
+        fx.region.grow_objects(seen, seen + IPC_OBJECT_SEGMENT),
+        Ok(IPC_OBJECT_SEGMENT)
+    );
+    OBJECT_PUBLICATION_PROBE.set(false);
+    assert_eq!(
+        fx.region.grow_objects(seen, seen + IPC_OBJECT_SEGMENT),
+        Ok(0)
+    );
 }

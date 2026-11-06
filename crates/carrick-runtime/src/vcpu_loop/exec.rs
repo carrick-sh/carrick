@@ -7284,7 +7284,7 @@ pub(crate) mod tests {
             result: i64,
             calls: usize,
         }
-        impl ProcessNative<carrick_el1_abi::Aarch64ParkedContext> for Owner {
+        impl ProcessNative<'_, carrick_el1_abi::Aarch64ParkedContext> for Owner {
             fn wait_guest_copy(
                 &mut self,
                 _: carrick_core::user_copy::GuestCopyRequest,
@@ -7384,7 +7384,7 @@ pub(crate) mod tests {
                 None,
                 None,
                 Some(&Venue),
-                owned.then_some(&mut owner as &mut dyn ProcessNative<_>),
+                owned.then_some(&mut owner as &mut dyn ProcessNative<'_, _>),
                 None,
                 None,
                 |_| core::ptr::null_mut(),
