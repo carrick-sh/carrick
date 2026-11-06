@@ -515,7 +515,11 @@ fn reset_clears_inheritable_home_acl_without_replacing_inode() {
         .args(["+a", "everyone allow read,readattr,readextattr,readsecurity,file_inherit,directory_inherit"])
         .arg(&home).status().unwrap().success());
     let listing = |path: &std::path::Path| {
-        let out = Command::new("/bin/ls").args(["-lde"]).arg(path).output().unwrap();
+        let out = Command::new("/bin/ls")
+            .args(["-lde"])
+            .arg(path)
+            .output()
+            .unwrap();
         assert!(out.status.success());
         String::from_utf8(out.stdout).unwrap()
     };
@@ -527,7 +531,10 @@ fn reset_clears_inheritable_home_acl_without_replacing_inode() {
         let acl = listing(path);
         assert!(!acl.contains("everyone allow"), "{}: {acl}", path.display());
     }
-    assert_eq!(std::fs::read_to_string(home.join("config/clean")).unwrap(), "clean");
+    assert_eq!(
+        std::fs::read_to_string(home.join("config/clean")).unwrap(),
+        "clean"
+    );
 }
 
 #[test]

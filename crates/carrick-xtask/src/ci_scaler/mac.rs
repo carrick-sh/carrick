@@ -1088,6 +1088,9 @@ pub fn reset_job_area(
 }
 
 fn bounded_reset(command: &mut Command, limit: Duration, context: &str) -> Result<(), ScalerError> {
+    use std::os::unix::process::CommandExt;
+    // Include the system chmod utility in timeout custody.
+    command.process_group(0);
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1104,7 +1107,8 @@ fn bounded_reset(command: &mut Command, limit: Duration, context: &str) -> Resul
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
             result => {
                 // Never turn timeout cleanup into another unbounded wait.
-                // The helper does not fork; SIGKILL targets exactly its PID.
+                // The helper and any chmod child share this private group.
+                unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
                 let _ = child.kill();
                 let reap_deadline = Instant::now() + Duration::from_secs(1);
                 let mut reaped = false;
@@ -1181,6 +1185,14 @@ fn reset_job_area_in_place(
     }
     lock.lock()?;
     let _lock = crate::lock_file::OwnedFileLock::from_locked(lock);
+    #[cfg(target_os = "macos")]
+    let _lock = {
+        let mut lock = _lock;
+        // chmod inherits custody too: if either process is stuck during
+        // SIGKILL, a later reset must wait until both have released it.
+        lock.retain_until_last_close();
+        lock
+    };
     // Retire debris from the former rename-based reset without following links.
     wipe(&parent.join(format!(".{name}.new")))?;
     wipe(&parent.join(format!(".{name}.old")))?;
@@ -1197,6 +1209,24 @@ fn reset_job_area_in_place(
     }
     lchown(home, owner, unsafe { libc::getegid() })?;
     std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700))?;
+    // chmod's mode bits do not remove extended ACL entries. Clear the
+    // retained inode's job-controlled ACL before deleting or creating children,
+    // so inherited grants cannot contaminate the restored skeleton. This runs
+    // inside the bounded helper's private process group.
+    #[cfg(target_os = "macos")]
+    {
+        let status = Command::new("/bin/chmod")
+            .arg("-N")
+            .arg(home)
+            .stdin(Stdio::from(_lock.try_clone()?))
+            .status()?;
+        if !status.success() {
+            return Err(ScalerError::CommandFailed(format!(
+                "clear job-home ACL {}: {status}",
+                home.display()
+            )));
+        }
+    }
     for entry in std::fs::read_dir(home)? {
         wipe(&entry?.path())?;
     }
@@ -1567,6 +1597,48 @@ mod tests {
     use super::super::assignment::prioritize_demand;
     use super::super::github::QueuedJob;
     use super::*;
+
+    #[test]
+    fn serial_host_reset_timeout_closes_descendant_custody() {
+        use std::io::Read;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+
+        let (mut observer, custody) = UnixStream::pair().unwrap();
+        observer
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut command = Command::new("/bin/sh");
+        // The descendant inherits stderr. EOF therefore witnesses that it
+        // exited too, rather than merely reaping the reset helper.
+        command.args(["-c", r#"sleep 30 & printf 'ready %s' "$!" >&2; wait"#]);
+        use std::os::unix::process::CommandExt;
+        let custody_fd = OwnedFd::from(custody);
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(custody_fd.as_raw_fd(), 2) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let start = Instant::now();
+        let error = bounded_reset(&mut command, Duration::from_secs(1), "fixture home")
+            .unwrap_err()
+            .to_string();
+        assert!(start.elapsed() < Duration::from_secs(5), "{error}");
+        assert!(error.contains("fixture home"), "{error}");
+        drop(command);
+        let mut bytes = Vec::new();
+        let read = observer.read_to_end(&mut bytes);
+        let text = std::str::from_utf8(&bytes).unwrap();
+        let pid: i32 = text.strip_prefix("ready ").unwrap().parse().unwrap();
+        if read.is_err() {
+            // A red mutation must not leave its fixture descendant alive.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(read.is_ok(), "descendant retained custody: {read:?}");
+    }
 
     fn job(id: u64) -> JobKey {
         JobKey {
