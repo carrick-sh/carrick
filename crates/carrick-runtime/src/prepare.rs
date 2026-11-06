@@ -1508,7 +1508,13 @@ impl PreparedRun {
                             error => crate::memory::AddressSpaceError::Elf(error),
                         })?;
                     let image = carrick_mem::x86_initial_image::prepare_x86_elf(&program).map_err(
-                        |error| RuntimeError::Unsupported(format!("x86 ELF load: {error}")),
+                        |error| {
+                            crate::memory::AddressSpaceError::Elf(
+                                carrick_mem::elf::ElfInspectError::Parse(
+                                    goblin::error::Error::Malformed(error.to_string()),
+                                ),
+                            )
+                        },
                     )?;
                     let extent_bytes =
                         carrick_vmm_kvm::cpl0_boot::Cpl0Carrier::initial_extent_bytes_for(
