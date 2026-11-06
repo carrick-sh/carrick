@@ -1384,6 +1384,28 @@ fn el1_ipc_pool_areas_are_type_stable() {
 }
 
 #[test]
+fn ring_pipe_creation_is_backed_before_publication() {
+    let fx = fixture(1 << 20);
+    let mut storage = fx.pipe_storage();
+    let supplied = storage;
+    let object = fx
+        .region
+        .create_backed_pipe(65536, &mut storage, &EL1)
+        .unwrap();
+    assert_eq!(
+        storage,
+        IpcPipeStorage::default(),
+        "creation consumes its extent"
+    );
+    let mut guard = fx.region.lock(object, &EL1).unwrap();
+    assert_eq!(guard.storage(), supplied);
+    assert!(
+        guard.pipe().unwrap().is_backed(),
+        "no first-write host provisioning"
+    );
+}
+
+#[test]
 fn vector_input_copy_fault_is_a_prefix_not_an_invariant() {
     let fx = fixture(1 << 20);
     let token = fx.region.begin_operation(IpcOperation::EMPTY).unwrap();
