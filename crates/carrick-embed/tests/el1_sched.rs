@@ -3823,7 +3823,7 @@ impl MetadataDelayProgress {
                 self.boundaries += 1;
             }
         }
-        self.parked >= 3
+        self.owner && self.parked >= 3
     }
 }
 
