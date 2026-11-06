@@ -1,5 +1,24 @@
 # Native child descriptor family (#1678): incomplete implementation
 
+The shared fd-core now provides `close_range_retained`: callers supply empty
+receipt storage for the complete selected population. Under the existing table
+guard it pins every selected description before vacating any slot. Insufficient
+receipt storage or pin saturation preserves the entire range, returning any
+prefix pins. Each non-Copy receipt owns its original table/fd identity and an
+exact incarnation pin; `pinned_close_effects` reads sticky effects through that
+pin after removal. No numeric replay or backing callback is part of this API.
+Work is three linear passes over the allocated selected extent, independent
+of a UINT_MAX endpoint, with no allocation or additional lock ordering.
+
+The fd-core witnesses cover replacement-slot survival (including flags and
+offset), a second live table, late effect publication, and admission rollback.
+They do not exercise carrier cleanup. Crossing integration must still bind
+receipts to the caller and operation, retain the host OpenFile before reuse,
+and settle canonical cleanup by description identity. Single close has the
+same numeric-replay hazard and must use that integration too. Plain range
+close remains Forward; this foundation does not complete item 1 or authorize
+allowlist promotion.
+
 The existing `kernel.el1.ipc-fd-authority` contract covers this family.
 Linux authority is dup(2), fcntl(2), close(2), and close_range(2). Fork copies
 slots and descriptor flags while sharing open descriptions and pipe state.
