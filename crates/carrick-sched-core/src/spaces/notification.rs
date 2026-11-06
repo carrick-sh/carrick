@@ -2,7 +2,7 @@
 use super::SpaceIndex;
 use crate::object_wait::{
     BorrowedObjectNotificationSource, ObjectNotificationTicket, ObjectWaitError, ObjectWaitKey,
-    ObjectWaitSnapshot, OwnedObjectWakeEffects,
+    ObjectWaitSnapshot, OwnedObjectWakeEffects, release_notifications,
 };
 use crate::{LockWait, ThreadCtx, Waker, ZoneTables};
 use core::num::NonZeroU64;
@@ -342,9 +342,13 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceNotificationLease<'a,
         let complete = |effects: OwnedObjectWakeEffects<'_, C>| {
             venue.deliver.invoke(venue.zone, venue.waker, effects)
         };
-        let publications = SpaceWaitCause::ALL
-            .map(|cause| self.reserve(cause).advance_revision(venue.waker, &complete));
-        for publication in publications {
+        let publications = release_notifications(
+            SpaceWaitCause::ALL.map(|cause| Some(self.reserve(cause))),
+            || {}, // Source closure is already visible.
+            venue.waker,
+            &complete,
+        );
+        for publication in publications.into_iter().flatten() {
             publication.publish();
         }
     }
@@ -414,24 +418,10 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceNotificationLease<'a,
             unlocked,
             publications: [const { None }; 6],
         };
-        release.unlock();
-        macro_rules! retain {
-            ($index:literal, $cause:expr) => {
-                if causes.contains(&$cause) {
-                    release.publications[$index] = Some(
-                        self.reserve($cause)
-                            .advance_revision(venue.waker, &completion),
-                    );
-                }
-            };
-        }
-        let _: [(); 6] = [(); SpaceWaitCause::ALL.len()];
-        retain!(0, SpaceWaitCause::PreparedOverlap);
-        retain!(1, SpaceWaitCause::Editor);
-        retain!(2, SpaceWaitCause::Reservations);
-        retain!(3, SpaceWaitCause::PendingEdit);
-        retain!(4, SpaceWaitCause::Gate);
-        retain!(5, SpaceWaitCause::Metadata);
+        let tickets =
+            SpaceWaitCause::ALL.map(|cause| causes.contains(&cause).then(|| self.reserve(cause)));
+        release.publications =
+            release_notifications(tickets, || release.unlock(), venue.waker, &completion);
         drop(release);
     }
 
@@ -668,8 +658,7 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceAccess<'a, C> {
         }
         Ok(exclusion)
     }
-    /// Preserve the nested host pause count; the release revision precedes
-    /// the atomic decrement, and delivery follows it.
+    /// Preserve the nested host pause count and notify after decrementing it.
     pub fn lower(self, index: SpaceIndex) {
         self.release_gate(index, false);
     }
@@ -705,19 +694,25 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceAccess<'a, C> {
             let completion = |effects: OwnedObjectWakeEffects<'_, C>| {
                 venue.deliver.invoke(venue.zone, venue.waker, effects)
             };
-            let publication = lease
-                .reserve(SpaceWaitCause::Gate)
-                .advance_revision(venue.waker, &completion);
-            #[cfg(test)]
-            tests::before_resource_unlock();
-            if opening {
-                entry.gate.fetch_and(
-                    !(super::GATE_CLOSED | super::GATE_INITIAL_BIND),
-                    Ordering::SeqCst,
-                );
-            } else {
-                entry.gate.fetch_sub(1, Ordering::SeqCst);
-            }
+            let [Some(publication)] = release_notifications(
+                [Some(lease.reserve(SpaceWaitCause::Gate))],
+                || {
+                    #[cfg(test)]
+                    tests::before_resource_unlock();
+                    if opening {
+                        entry.gate.fetch_and(
+                            !(super::GATE_CLOSED | super::GATE_INITIAL_BIND),
+                            Ordering::SeqCst,
+                        );
+                    } else {
+                        entry.gate.fetch_sub(1, Ordering::SeqCst);
+                    }
+                },
+                venue.waker,
+                &completion,
+            ) else {
+                unreachable!("one gate release ticket");
+            };
             publication.publish();
         } else if opening {
             self.spaces.open(index);
@@ -1187,10 +1182,13 @@ mod tests {
                 unlocked: ResourceUnlocked::Plain,
                 publications: core::array::from_fn(|_| None),
             };
-            release.publications[0] = Some(
-                lease
-                    .reserve(SpaceWaitCause::Editor)
-                    .advance_revision(Waker::Host, &completion),
+            release.publications = release_notifications(
+                core::array::from_fn(|index| {
+                    (index == 0).then(|| lease.reserve(SpaceWaitCause::Editor))
+                }),
+                || release.unlock(),
+                Waker::Host,
+                &completion,
             );
             panic!("abandon release custody after advancing revision");
         }));
@@ -1349,6 +1347,7 @@ mod tests {
             assert_eq!(error, ObjectWaitError::Changed);
             assert_eq!(operation.index(), 77);
             assert!(!zone.record(record).has_object_operation());
+            access(&zone).close(entry.index());
             entry.retire_entry(access(&zone).venue().unwrap());
         }
     }
