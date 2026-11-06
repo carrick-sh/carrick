@@ -5,6 +5,19 @@
 
 use super::*;
 
+pub(crate) enum CoreCaptureAttempt {
+    Complete(Option<PreparedCorePublication>),
+    OwnerWait(carrick_el1_abi::PortalOwnerWait),
+}
+
+pub(crate) struct PendingCoreRead {
+    address: u64,
+    length: usize,
+    continuation: carrick_guest_mem::OwnedReadContinuation,
+    extents: Vec<carrick_kernel::core_dump::CoreExtent>,
+    remaining_budget: u64,
+}
+
 pub(crate) struct PreparedCorePublication {
     pub(crate) snapshot: carrick_kernel::dispatch::CoreProcessSnapshot,
     pub(crate) payload: carrick_kernel::core_dump::CorePayload,
@@ -213,15 +226,15 @@ where
     }
 
     pub(crate) fn capture_core_for_publication(
-        &self,
+        &mut self,
         kernel: &Kernel,
         engine: &mut E,
         fatal: FatalSignalRecord,
-    ) -> Result<Option<PreparedCorePublication>, RuntimeError> {
+    ) -> Result<CoreCaptureAttempt, RuntimeError> {
         // Linux default actions that carry a core. Other fatal signals still
         // publish a signal wait status, but never set WCOREDUMP.
         if !matches!(fatal.signo, 3 | 4 | 5 | 6 | 7 | 8 | 11 | 24 | 25 | 31) {
-            return Ok(None);
+            return Ok(CoreCaptureAttempt::Complete(None));
         }
         let context = kernel
             .dispatcher
@@ -369,7 +382,7 @@ where
                     ))
                 })?;
             if !process.dumpable || process.rlimit_core == 0 {
-                return Ok(None);
+                return Ok(CoreCaptureAttempt::Complete(None));
             }
 
             if ::std::env::var_os("CARRICK_CORE_FAILPOINT")
@@ -661,8 +674,15 @@ where
                     "core publication failpoint memory-read".to_owned(),
                 ));
             }
-            let mut extents = Vec::new();
-            let mut remaining_budget = process.rlimit_core;
+            let pending = self.pending_core_read.take();
+            let mut extents = pending
+                .as_ref()
+                .map(|pending| pending.extents.clone())
+                .unwrap_or_default();
+            let mut remaining_budget = pending
+                .as_ref()
+                .map_or(process.rlimit_core, |pending| pending.remaining_budget);
+            let mut pending = pending;
             for (idx, map) in process.maps.iter().enumerate() {
                 if !dumpable_maps[idx] || remaining_budget == 0 {
                     continue;
@@ -704,12 +724,57 @@ where
                         // continue scanning past them to later nonzero data.
                         let to_read = (sub_len - consumed).min(64 * 1024);
                         let address = sub_start + consumed as u64;
-                        let bytes = engine.read_core_bytes(address, to_read).map_err(|error| {
-                            RuntimeError::Trap(TrapError::Hypervisor(format!(
-                                "read core region {address:#x}..{:#x}: {error}",
-                                address.saturating_add(to_read as u64)
-                            )))
-                        })?;
+                        if pending
+                            .as_ref()
+                            .is_some_and(|pending| address < pending.address)
+                        {
+                            consumed += to_read;
+                            continue;
+                        }
+                        let read = if pending.as_ref().is_some_and(|pending| {
+                            pending.address == address && pending.length == to_read
+                        }) {
+                            let pending = pending.take().expect("matched pending core read");
+                            engine.resume_read(pending.continuation)
+                        } else if let Some(pending) = pending.as_ref() {
+                            return Err(RuntimeError::Configuration(format!(
+                                "core mapping layout changed before retained read {:#x}..{:#x}; next range is {address:#x}..{:#x}",
+                                pending.address,
+                                pending.address.saturating_add(pending.length as u64),
+                                address.saturating_add(to_read as u64),
+                            )));
+                        } else {
+                            engine.read_core_bytes(address, to_read)
+                        };
+                        let bytes = match read {
+                            Ok(bytes) => bytes,
+                            Err(carrick_guest_mem::MemoryError::ReadSuspended(suspension)) => {
+                                let carrick_guest_mem::MemoryReadSuspension { wait, continuation } =
+                                    *suspension;
+                                let carrick_guest_mem::MemoryReadWait::Owner(wait) = wait else {
+                                    return Err(RuntimeError::Trap(TrapError::Hypervisor(
+                                        format!(
+                                            "read core region {address:#x}..{:#x}: retained core read requires unsupported wait {wait:?}",
+                                            address.saturating_add(to_read as u64)
+                                        ),
+                                    )));
+                                };
+                                self.pending_core_read = Some(PendingCoreRead {
+                                    address,
+                                    length: to_read,
+                                    continuation,
+                                    extents,
+                                    remaining_budget,
+                                });
+                                return Ok(CoreCaptureAttempt::OwnerWait(wait));
+                            }
+                            Err(error) => {
+                                return Err(RuntimeError::Trap(TrapError::Hypervisor(format!(
+                                    "read core region {address:#x}..{:#x}: {error}",
+                                    address.saturating_add(to_read as u64)
+                                ))));
+                            }
+                        };
                         // Bulk preparation is not guest residency. Zero-filled
                         // pages can be holes without omitting host-written data.
                         for run in carrick_kernel::dispatch::mem::core_data_runs(&bytes) {
@@ -757,16 +822,32 @@ where
             );
             crate::probes::hvpatch_core_hash(generation.get(), hash_words);
             lifecycle(3, 0);
-            Ok(Some(PreparedCorePublication {
-                snapshot: process,
-                payload,
-                generation: generation.get(),
-                fatal_tid: fatal.tid.raw(),
-                publication: None,
-            }))
+            Ok(CoreCaptureAttempt::Complete(Some(
+                PreparedCorePublication {
+                    snapshot: process,
+                    payload,
+                    generation: generation.get(),
+                    fatal_tid: fatal.tid.raw(),
+                    publication: None,
+                },
+            )))
         })();
-        if result.is_err() || matches!(&result, Ok(None)) {
-            lifecycle(6, if result.is_err() { 1 } else { 2 });
+        if result.is_err()
+            || matches!(
+                &result,
+                Ok(CoreCaptureAttempt::Complete(None) | CoreCaptureAttempt::OwnerWait(_))
+            )
+        {
+            lifecycle(
+                6,
+                if result.is_err() {
+                    1
+                } else if matches!(&result, Ok(CoreCaptureAttempt::Complete(None))) {
+                    2
+                } else {
+                    3
+                },
+            );
         }
         finish_crash_collection(authority, barrier, quiesced, lease_drain_guard, result)
     }
@@ -1317,9 +1398,11 @@ mod tests {
             },
         );
 
-        let prepared = result
-            .expect("capture core must succeed")
-            .expect("fatal signal must yield prepared publication");
+        let CoreCaptureAttempt::Complete(Some(prepared)) =
+            result.expect("capture core must succeed")
+        else {
+            panic!("fatal signal must yield prepared publication");
+        };
 
         // 1. Verify read_core_bytes was called ONLY for the 3 touched pages (total 12 KiB)
         let reads = tracker.lock().clone();
@@ -1562,12 +1645,20 @@ mod tests {
         );
         state.service_kernel_context = Some(worker.retain_exact());
 
-        let target_addr = 0x0000_1000_0000_0000_u64;
+        let prefix_addr = 0x0000_1000_0000_0000_u64;
+        let target_addr = prefix_addr + 0x2000;
         let target_len = 4096_usize;
         let deferred = kernel
             .dispatcher
             .deferred_anonymous_state(root.task().shared().mm().id())
             .expect("deferred anonymous state");
+        deferred
+            .reserve_fresh(carrick_guest_mem::GuestVa::new(prefix_addr), target_len)
+            .expect("reserve prefix VMA");
+        deferred
+            .begin_materialization(carrick_guest_mem::GuestVa::new(prefix_addr), target_len)
+            .expect("materialize prefix")
+            .commit();
         deferred
             .reserve_fresh(carrick_guest_mem::GuestVa::new(target_addr), target_len)
             .expect("reserve VMA");
@@ -1575,13 +1666,15 @@ mod tests {
             .begin_materialization(carrick_guest_mem::GuestVa::new(target_addr), target_len)
             .expect("materialize")
             .commit();
-        kernel.dispatcher.record_dynamic_mapping(
-            target_addr,
-            target_len as u64,
-            carrick_abi::LinuxProtFlags::READ | carrick_abi::LinuxProtFlags::WRITE,
-            carrick_vfs::ProcMapSharing::Private,
-            String::new(),
-        );
+        for address in [prefix_addr, target_addr] {
+            kernel.dispatcher.record_dynamic_mapping(
+                address,
+                target_len as u64,
+                carrick_abi::LinuxProtFlags::READ | carrick_abi::LinuxProtFlags::WRITE,
+                carrick_vfs::ProcMapSharing::Private,
+                String::new(),
+            );
+        }
 
         let region = Region::new();
         let zone = region.zone();
@@ -1605,9 +1698,14 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::sync_channel(0);
         let tracker = Arc::new(Mutex::new(Vec::new()));
         let mut engine = CrashCaptureTestEngine {
-            guest_memory: [(target_addr, vec![0x5a; target_len])].into(),
+            guest_memory: [
+                (prefix_addr, vec![0xa5; target_len]),
+                (target_addr, vec![0x5a; target_len]),
+            ]
+            .into(),
             read_tracker: Some(Arc::clone(&tracker)),
             read_refusal_tx: Some(tx),
+            owner_read_refusal_at: Some(target_addr),
             copyout_owner_probe: Some(super::super::tests::CopyoutOwnerProbe {
                 wait,
                 zone: zone as *const _ as usize,
@@ -1616,7 +1714,7 @@ mod tests {
         };
 
         std::thread::scope(|scope| {
-            scope.spawn(move || {
+            let release = scope.spawn(move || {
                 rx.recv_timeout(Duration::from_secs(5))
                     .expect("core read must observe the closed owner gate");
                 carrick_el1_linux::sched::object_wait::space_access(
@@ -1625,6 +1723,21 @@ mod tests {
                 )
                 .lower(index);
             });
+            let first = state
+                .capture_core_for_publication(
+                    &kernel,
+                    &mut engine,
+                    FatalSignalRecord {
+                        image_generation: kernel.fatal_signal.current_generation(),
+                        tid: worker.thread().key().tid,
+                        signo: 11,
+                        code: 1,
+                        addr: target_addr,
+                    },
+                )
+                .expect("owner Gate is a retained core-capture wait");
+            assert!(matches!(first, CoreCaptureAttempt::OwnerWait(actual) if actual == wait));
+            release.join().expect("release owner gate");
             let prepared = state
                 .capture_core_for_publication(
                     &kernel,
@@ -1637,11 +1750,17 @@ mod tests {
                         addr: target_addr,
                     },
                 )
-                .expect("owner Gate is contention, not a failed core capture")
-                .expect("fatal signal must prepare a core publication");
-            assert_eq!(prepared.payload.extents.len(), 1);
+                .expect("released owner Gate must resume core capture");
+            let CoreCaptureAttempt::Complete(Some(prepared)) = prepared else {
+                panic!("fatal signal must prepare a core publication after release");
+            };
+            assert_eq!(prepared.payload.extents.len(), 2);
         });
-        assert_eq!(tracker.lock().as_slice(), &[(target_addr, target_len)]);
+        assert_eq!(
+            tracker.lock().as_slice(),
+            &[(prefix_addr, target_len), (target_addr, target_len)],
+            "the completed prefix must not be reread after the owner wake"
+        );
     }
 
     #[test]

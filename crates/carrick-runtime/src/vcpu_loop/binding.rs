@@ -352,6 +352,10 @@ pub(super) enum HvpatchProductionPhase {
     ResumeRetainedOwner {
         action: Box<RetainedMemoryAction>,
     },
+    EnrollRetainedOwner {
+        action: Box<RetainedMemoryAction>,
+        wait: carrick_el1_abi::PortalOwnerWait,
+    },
     RetainedMemoryRetry {
         action: Box<RetainedMemoryAction>,
     },
@@ -392,6 +396,10 @@ pub(super) enum HvpatchProductionPhase {
 }
 
 pub(super) enum RetainedMemoryAction {
+    CoreCapture {
+        context: carrick_kernel::kernel::KernelContext,
+        terminal: PersistentTerminal,
+    },
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     ChildTid {
         context: carrick_kernel::kernel::KernelContext,
@@ -413,7 +421,10 @@ pub(super) enum RetainedMemoryAction {
 
 impl RetainedMemoryAction {
     fn is_drain_owner(&self) -> bool {
-        matches!(self, Self::ExecDrain { .. } | Self::ProcessFinish { .. })
+        matches!(
+            self,
+            Self::ExecDrain { .. } | Self::ProcessFinish { .. } | Self::CoreCapture { .. }
+        )
     }
 }
 
@@ -496,6 +507,7 @@ impl HvpatchProductionPhase {
     /// losing members without triggering the terminal-owner `carrick_fatal!`.
     pub(super) fn is_terminal_transition(&self) -> bool {
         if let Self::ResumeRetainedOwner { action }
+        | Self::EnrollRetainedOwner { action, .. }
         | Self::ResumeRetainedPhysical { action, .. }
         | Self::RetainedMemoryRetry { action } = self
         {
@@ -522,10 +534,12 @@ impl HvpatchProductionPhase {
             | Self::TerminalRetireRetry { .. }
             | Self::RetryThreadExit { .. } => true,
             Self::ResumeRetainedOwner { action }
+            | Self::EnrollRetainedOwner { action, .. }
             | Self::ResumeRetainedPhysical { action, .. }
             | Self::RetainedMemoryRetry { action } => matches!(
                 action.as_ref(),
                 RetainedMemoryAction::ProcessFinish { .. }
+                    | RetainedMemoryAction::CoreCapture { .. }
                     | RetainedMemoryAction::ThreadExit { .. }
             ),
             _ => false,
@@ -561,6 +575,7 @@ impl HvpatchProductionPhase {
             Self::RetainedMemoryRetry { .. } => 21,
             Self::ResumeFaultPhysical { .. } => 22,
             Self::ResumeFaultOwner { .. } => 23,
+            Self::EnrollRetainedOwner { .. } => 24,
         }
     }
 }
@@ -1531,6 +1546,9 @@ where
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
         action: RetainedMemoryAction,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        if let RetainedMemoryAction::CoreCapture { context, terminal } = action {
+            return Ok(self.capture_terminal_core_or_continue(engine, terminal, context));
+        }
         if let RetainedMemoryAction::ThreadExit { code } = action {
             return self.drive_thread_exit(engine, control, code);
         }
@@ -1592,6 +1610,12 @@ where
         let saved = match action.as_ref() {
             RetainedMemoryAction::ExecDrain { context, .. }
             | RetainedMemoryAction::ProcessFinish { context, .. } => context,
+            RetainedMemoryAction::CoreCapture { .. } => {
+                return Err(RuntimeError::Configuration(
+                    "core capture reached child-TID drain".to_owned(),
+                )
+                .into());
+            }
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             RetainedMemoryAction::ChildTid { .. } => unreachable!("child TID handled before drain"),
             RetainedMemoryAction::ThreadExit { .. } => {
@@ -1659,6 +1683,7 @@ where
                     }
                     other => other,
                 }),
+            RetainedMemoryAction::CoreCapture { .. } => unreachable!("handled before drain"),
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             RetainedMemoryAction::ChildTid { .. } => unreachable!("child TID handled before drain"),
             RetainedMemoryAction::ThreadExit { .. } => Err(RuntimeError::Configuration(
@@ -2004,7 +2029,15 @@ where
                     });
             }
         }
-        let mut terminal = terminal;
+        self.capture_terminal_core_or_continue(engine, terminal, context)
+    }
+
+    fn capture_terminal_core_or_continue(
+        &mut self,
+        engine: &mut E,
+        mut terminal: PersistentTerminal,
+        context: carrick_kernel::kernel::KernelContext,
+    ) -> executor::ExecutorExit {
         if let PersistentTerminal::Outcome {
             ref outcome,
             ref mut prepared_core,
@@ -2024,19 +2057,41 @@ where
                 self.state.linux_tid,
                 terminating_signal,
             ) {
-                *prepared_core =
-                    match self
-                        .state
-                        .capture_core_for_publication(&self.kernel, engine, fatal)
-                    {
-                        Ok(p) => p.map(Box::new),
-                        Err(error) => {
-                            tracing::warn!(%error, "capture core for publication");
-                            None
-                        }
-                    };
+                match self
+                    .state
+                    .capture_core_for_publication(&self.kernel, engine, fatal)
+                {
+                    Ok(super::crash::CoreCaptureAttempt::Complete(publication)) => {
+                        *prepared_core = publication.map(Box::new);
+                    }
+                    Ok(super::crash::CoreCaptureAttempt::OwnerWait(wait)) => {
+                        self.phase = HvpatchProductionPhase::EnrollRetainedOwner {
+                            action: Box::new(RetainedMemoryAction::CoreCapture {
+                                context,
+                                terminal,
+                            }),
+                            wait,
+                        };
+                        return self.suspend(
+                            HvpatchLoopSuspension::BlockedContinuation,
+                            executor::ExecutorExit::Yielded,
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "capture core for publication");
+                        *prepared_core = None;
+                    }
+                }
             }
         }
+        self.continue_persistent_process_terminal(terminal, context)
+    }
+
+    fn continue_persistent_process_terminal(
+        &mut self,
+        terminal: PersistentTerminal,
+        context: carrick_kernel::kernel::KernelContext,
+    ) -> executor::ExecutorExit {
         if let Err(error) = self.state.capture_child_tid_clear() {
             return self.finish(Err(error));
         }
@@ -5060,6 +5115,10 @@ where
                 HvpatchProductionPhase::RetainedMemoryRetry { action } => {
                     self.state.thread_exit_retry_subscription = None;
                     return self.drive_retained_memory(engine, control, *action);
+                }
+                HvpatchProductionPhase::EnrollRetainedOwner { action, wait } => {
+                    self.phase = HvpatchProductionPhase::RetainedMemoryRetry { action };
+                    return self.park_retained_memory_owner(engine, control, wait);
                 }
                 HvpatchProductionPhase::ResumeRetainedOwner { action } => {
                     self.phase = HvpatchProductionPhase::RetainedMemoryRetry { action };
