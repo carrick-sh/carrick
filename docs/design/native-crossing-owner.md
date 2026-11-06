@@ -232,3 +232,46 @@ binaries or signed receipts blocks implementation acceptance. A docs review
 can approve an approach with those measurements pending; it cannot declare
 #1335 fixed or conformance restored. Keep the design PR draft until independent
 review and the director's implementation ordering are recorded.
+
+## Descriptor cleanup admission (#1678)
+
+The retained fd-core close transaction supplies the descriptor lifetime half
+of this slice: preparation reserves the exact slot and pins its description;
+commit removes that slot and returns cleanup custody; cancellation releases
+both without changing the descriptor. Cleanup settlement addresses the retained
+description, never the old descriptor number. Range cleanup needs one such
+receipt per removed description, including aliases of the same description.
+
+Production integration is blocked on the other half: the existing native
+host-file continuation has no typed close-cleanup operation that owns those
+receipts through publication, cancellation and completion. `CarrierWork` drains
+retired OFDs for final physical releases, but a close effect can apply while
+other aliases remain. It therefore cannot replace per-close cleanup custody.
+The current native descriptor close uses `CommitOwed(0)` when close effects
+are present. Replaying the original numeric close after the slot is reusable
+can act on a successor descriptor and is not a valid cleanup implementation.
+
+The carrier cleanup venue must retain the exact description and the closing
+caller's task and file-table identities, reserve service capacity before the
+slot is removed, and consume record-lock, epoll and inotify effects exactly
+once. It must use the existing crossing owner on both ISA adapters. Existing
+host close helpers that capture an ambient host `FileTable` cannot establish
+that authority for a native fork child. A final-release queue alone cannot
+carry the per-close effect, and a second native descriptor table is excluded.
+
+A check that effects are empty before closing is insufficient: registration
+uses `require_pinned_close_effects` on an existing pin and can race the check.
+An effect-free admission must either synchronize with registration or retain a
+cleanup receipt when an effect appears; it cannot discard the receipt or
+convert a committed close to an unrouted answer. `CLOSE_RANGE_UNSHARE` also
+needs native successor-table publication rather than mutation of a shared
+`CLONE_FILES` table. Keep `close` and `close_range` in the Forward allowlist
+until these ownership paths and their production witnesses are implemented.
+
+Required production witnesses close an old descriptor, reuse its number, then
+settle or replay the old cleanup and assert the successor survives. Cover
+single close and several range members, cancellation before publication,
+service-capacity refusal, Busy once then success, late effect registration,
+shared-table unshare and both ISA adapters. VM-free fd-core receipt tests prove
+lifetime and rollback only; they do not establish production cleanup acceptance
+or a signed census result.
