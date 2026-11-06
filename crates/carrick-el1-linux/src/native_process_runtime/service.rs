@@ -337,6 +337,35 @@ impl ServiceCompletion {
 }
 
 impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
+    #[cfg(test)]
+    pub(crate) fn cancel_futex_owner_wait_for_test(&self, record: RecordRef) {
+        let request = self.graph.lock().service_wait(&record).unwrap().request;
+        let _queue = self
+            .zone
+            .object_wait(
+                ObjectWaitKey::native_service(record).unwrap(),
+                &carrick_sched_core::ShortLockSpin,
+            )
+            .unwrap();
+        let control = self
+            .graph
+            .lock()
+            .service_wait(&record)
+            .unwrap()
+            .control
+            .clone();
+        assert!(control.service.cancel(request.identity).unwrap());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_relative_futex_wait_for_test(&self, record: RecordRef) -> bool {
+        self.graph
+            .lock()
+            .pending
+            .member(&record)
+            .is_some_and(|state| state.relative_futex_wait.is_some())
+    }
+
     pub(crate) fn cancel_service<S: NativeProcessService<'a, C>>(
         &self,
         record: RecordRef,
@@ -2667,6 +2696,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 };
             }
             if retry_syscall_after_supply {
+                if result != ServiceResult::Supplied {
+                    let _ = ProcessNative::take_relative_futex_wait(self);
+                }
                 return match result {
                     ServiceResult::Supplied => Ok(NativeResume::RetrySyscall),
                     ServiceResult::Refused

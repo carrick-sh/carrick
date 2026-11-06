@@ -4395,10 +4395,12 @@ mod overlay_dispatch_tests {
         use std::num::NonZeroU64;
         use std::time::{Duration, SystemTime};
 
+        for refused_load in [1, 2] {
         struct Word {
             wait: PortalOwnerWait,
             loads: std::cell::Cell<u32>,
             bytes: [u8; 16],
+            refused_load: u32,
         }
         impl GuestMemory for Word {
             fn read_bytes_raw(&self, _: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
@@ -4407,7 +4409,7 @@ mod overlay_dispatch_tests {
             fn atomic_load_user_u32(&self, _: u64) -> Result<u32, MemoryError> {
                 let load = self.loads.get() + 1;
                 self.loads.set(load);
-                if load == 2 {
+                if load == self.refused_load {
                     Err(MemoryError::OwnerWait(self.wait))
                 } else {
                     Ok(7)
@@ -4438,6 +4440,7 @@ mod overlay_dispatch_tests {
             wait,
             loads: std::cell::Cell::new(0),
             bytes,
+            refused_load,
         };
         let reporter = CompatReporter::default();
         let futex = crate::thread::FutexTable::new();
@@ -4457,6 +4460,10 @@ mod overlay_dispatch_tests {
             ]),
         );
         let clock = crate::kernel::container::ClockDomain::deterministic(SystemTime::UNIX_EPOCH);
+        let completion = SyscallCompletionToken::new(
+            PreparedSyscall { request, original_args: request.args }, context.retain_exact(), None,
+        );
+        let operation = completion.relative_futex_wait();
         let first = dispatch_threaded_futex(
             &context,
             &clock,
@@ -4470,9 +4477,11 @@ mod overlay_dispatch_tests {
             None,
             None,
             host_table_futex_queue(),
+        Some(operation),
         );
         assert_eq!(first, DispatchOutcome::OwnerMemoryWait { wait, committed: 0 });
         clock.advance(Duration::from_secs(1)).unwrap();
+        memory.bytes[..8].copy_from_slice(&9_i64.to_ne_bytes());
         let second = dispatch_threaded_futex(
             &context,
             &clock,
@@ -4486,12 +4495,19 @@ mod overlay_dispatch_tests {
             None,
             None,
             host_table_futex_queue(),
+        Some(operation),
         );
         match second {
             DispatchOutcome::FutexWait { timeout, .. } => {
                 assert_eq!(timeout, Some(Duration::from_secs(4)));
             }
             other => panic!("expected retained timed wait, got {other:?}"),
+        }
+        drop(completion);
+        let successor = SyscallCompletionToken::new(
+            PreparedSyscall { request, original_args: request.args }, context.retain_exact(), None,
+        );
+        assert_eq!(successor.relative_futex_wait().retained_remaining(&clock), None);
         }
     }
 
@@ -4672,6 +4688,7 @@ mod overlay_dispatch_tests {
             None,
             None,
             host_table_futex_queue(),
+        None,
         );
 
         assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
@@ -4711,6 +4728,7 @@ mod overlay_dispatch_tests {
             None,
             None,
             host_table_futex_queue(),
+        None,
         );
 
         assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
@@ -4781,6 +4799,7 @@ mod overlay_dispatch_tests {
             None,
             None,
             host_table_futex_queue(),
+        None,
         );
 
         assert_eq!(
@@ -4840,6 +4859,7 @@ mod overlay_dispatch_tests {
             None,
             None,
             host_table_futex_queue(),
+        None,
         );
 
         match outcome {

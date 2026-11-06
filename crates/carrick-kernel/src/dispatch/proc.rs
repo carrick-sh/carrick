@@ -2470,6 +2470,7 @@ impl<'a> ProcView<'a> {
                     futex_flags,
                     word,
                     queue,
+                    thread.as_ref().and_then(|thread| thread.relative_futex_wait),
                 ));
             }
 

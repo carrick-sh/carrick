@@ -543,6 +543,7 @@ impl SyscallDispatcher {
                     hvpatch_linux_tid,
                     thread.work_scope,
                     crate::el1_zone::FutexQueueAuthority::of_context(kernel),
+                    thread.relative_futex_wait,
                 )
             }
             99 => {

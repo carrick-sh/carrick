@@ -2395,7 +2395,15 @@ impl<
 > PendingFamilies<'a, Context> for El1PendingFamilies<'a, F, C, U, G, Context>
 {
     fn resume_owned_continuation(&mut self) -> Option<lifecycle::LifecycleOutcome> {
-        self.process.as_deref_mut()?.resume_owned_continuation()
+        let process = self.process.as_deref_mut()?;
+        let args = core::array::from_fn(|index| self.frame.argument(index).unwrap_or(0));
+        if !carrick_personality_linux::sched::is_served_futex_op(
+            self.frame.canonical_ordinal().raw(),
+            args,
+        ) {
+            let _ = process.take_relative_futex_wait();
+        }
+        process.resume_owned_continuation()
     }
     fn may_serve_poll(&self) -> bool {
         self.frame.may_serve_poll()
@@ -2931,6 +2939,10 @@ impl<
         Some(self)
     }
     fn futex(&mut self) -> FamilyCompletion {
+        let mut operation = self
+            .process
+            .as_deref_mut()
+            .and_then(|process| process.take_relative_futex_wait());
         let Some(frame) = self.frame.arm_frame() else {
             self.frame.record_isa_unsupported_forward();
             return FamilyCompletion::Forward;
@@ -2945,7 +2957,7 @@ impl<
         {
             let orig_x0 = frame.x[0];
             let mut sched = native_scheduler(zone, task, counters, zslot, &mut self.handoff);
-            let served = sched.serve_futex_typed(frame);
+            let served = sched.serve_futex_operation(frame, &mut operation);
             let disposition = match served {
                 Ok(served) => served.map_or(ipc::IpcServed::Forward, ipc::IpcServed::from),
                 Err(carrick_core::user_copy::CopyOutcome::Fault) => {
@@ -2957,7 +2969,24 @@ impl<
                     if self.process.is_none() {
                         return FamilyCompletion::Forward;
                     }
+                    if let Some(operation) = operation {
+                        self.process
+                            .as_deref_mut()
+                            .unwrap()
+                            .retain_relative_futex_wait(operation);
+                    }
                     let outcome = lifecycle::LifecycleNative::wait_guest_copy(self, request);
+                    if !matches!(
+                        outcome,
+                        lifecycle::LifecycleOutcome::Redispatch
+                            | lifecycle::LifecycleOutcome::Transferred { .. }
+                    ) {
+                        let _ = self
+                            .process
+                            .as_deref_mut()
+                            .unwrap()
+                            .take_relative_futex_wait();
+                    }
                     return carrick_personality_linux::lifecycle::lifecycle_effect(&outcome);
                 }
                 Err(carrick_core::user_copy::CopyOutcome::Done) => {

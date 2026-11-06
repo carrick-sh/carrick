@@ -151,6 +151,14 @@ impl RootProcessInitialization {
 pub(crate) fn process_context_for_tests(
     pid: i32,
 ) -> (ProcessContext, carrick_kernel::kernel::KernelContext) {
+    process_context_for_tests_with_clock(pid, None)
+}
+
+#[cfg(test)]
+pub(crate) fn process_context_for_tests_with_clock(
+    pid: i32,
+    clock: Option<std::sync::Arc<carrick_kernel::kernel::container::ClockDomain>>,
+) -> (ProcessContext, carrick_kernel::kernel::KernelContext) {
     let (resources, backend) =
         MmResources::new_root(0x4000, carrick_hal::asid::AsidAllocator::new())
             .expect("test HVPatch root resources");
@@ -162,6 +170,13 @@ pub(crate) fn process_context_for_tests(
         std::sync::Arc::new(carrick_hal::NullHostSignalBridge::default()),
     )
     .expect("test HVPatch bootstrap");
+    let bootstrap = if let Some(clock) = clock {
+        bootstrap.with_container(std::sync::Arc::new(
+            carrick_kernel::kernel::Container::for_reference_model().with_clock(clock),
+        ))
+    } else {
+        bootstrap
+    };
     let (kernel, root) =
         carrick_kernel::kernel::Kernel::bootstrap_root(bootstrap).expect("test HVPatch kernel");
     backend.bind_inventory(&kernel, root.shared().mm().id());

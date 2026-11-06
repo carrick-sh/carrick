@@ -784,6 +784,13 @@ where
         zone.counters
             .host_parks
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let timeout = self
+            .state
+            .syscall_completion
+            .guest("zone park lost relative futex owner")?
+            .relative_futex_wait()
+            .retained_remaining(context.task().container().clock())
+            .or(timeout);
         engine.discard_terminal_syscall_continuation()?;
         self.state.retire_syscall()?;
         let record = zone.record_ref(record);
