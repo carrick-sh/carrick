@@ -183,3 +183,35 @@ completion, which may also occur during the call.
 
 The production x86 adapter, shared IPC mapping, complete namespace admission,
 pipe creation and passing real-KVM served witness remain required for #1756.
+
+## Production admission and creation constraints
+
+The remaining work is more than selecting the shared transfer engine from an
+x86 trap. Production `LinuxPersonality` supplies no IPC venue, and the shared
+dispatcher still requires `arm_frame()` before constructing its execution
+capability. X86's descriptor lifecycle supplies no IPC binding either. All
+three boundaries must use the same mapped authority before the served witness
+can establish parity.
+
+Publish the IPC window before admitting its complete root namespace. That
+namespace must include existing host descriptions, including stdio, before it
+can allocate pipe descriptors: publishing an empty table would both collide
+with existing descriptors and turn valid host descriptors into EBADF. Fork
+and retirement then use `DescriptorNamespace` with that same region and map.
+An absent namespace is still a refusal, not permission to replay pipe I/O on
+the host.
+
+There is currently no production ring `pipe2` constructor in the shared Linux
+dispatcher. `IpcRegion::create_pipe` is documented as host-venue-only: it may
+return an unbacked object and detach a reused record's undersized storage for
+reclamation. The IPC test world's `pipe` helper explicitly supplies storage;
+its successful transfer tests do not prove production pipe creation. A new
+constructor must own storage provisioning and reclamation as well as the two
+descriptions. A fresh-region production-entry witness must create the pipe
+and transfer bytes without a host first write; a failed descriptor-pair
+copyout must roll back both descriptions and the object. Merely calling
+`create_pipe` and installing two descriptors does not meet that requirement.
+
+These are implementation constraints, not new acceptance evidence. Keep the
+served KVM witness and original-ordinal refusal census authoritative; neither
+a mapped window alone nor VM-free transfer tests close this contract.
