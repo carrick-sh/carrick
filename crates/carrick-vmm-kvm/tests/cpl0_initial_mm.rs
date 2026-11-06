@@ -948,6 +948,18 @@ fn image() -> PathBuf {
     PathBuf::from(env!("CARRICK_X86_CPL0_FIXTURE_IMAGE"))
 }
 
+#[test]
+fn production_initial_image_spans_more_than_one_edit_table_budget() {
+    // Sixteen MiB of zero BSS needs more than eight lower-level tables
+    // once the independently placed bootstrap stack is included.
+    let mut elf = tiny_elf();
+    elf[104..112].copy_from_slice(&(16_u64 * 1024 * 1024).to_le_bytes());
+    let outcome = run_pool_fixture(&elf, 32);
+    assert_eq!(outcome.run.exit_code, 7);
+    assert!(outcome.run.stdout.is_empty());
+    assert!(outcome.run.stderr.is_empty());
+}
+
 fn tiny_elf() -> Vec<u8> {
     let mut bytes = vec![0; 0xc0];
     bytes[..4].copy_from_slice(b"\x7fELF");
