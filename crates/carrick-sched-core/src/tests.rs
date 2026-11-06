@@ -3686,6 +3686,15 @@ fn cancelled_metadata_wait_releases_record_without_resume() {
 
 #[test]
 fn adopted_first_entry_settles_detached_metadata_receipt() {
+    first_entry_operation_retirement(true);
+}
+
+#[test]
+fn first_entry_retirement_preserves_detached_adapter_receipt() {
+    first_entry_operation_retirement(false);
+}
+
+fn first_entry_operation_retirement(metadata: bool) {
     use crate::object_wait::{ObjectWaitKey, OperationToken};
     let zone = zone();
     let key = ObjectWaitKey::metadata_request(17).unwrap();
@@ -3704,7 +3713,11 @@ fn adopted_first_entry_settles_detached_metadata_receipt() {
         .park_rechecked(
             queue.snapshot(),
             id,
-            OperationToken::metadata_request(17).unwrap(),
+            if metadata {
+                OperationToken::metadata_request(17).unwrap()
+            } else {
+                OperationToken::new(1572, 17).unwrap()
+            },
             || true,
         )
         .unwrap();
@@ -3719,6 +3732,12 @@ fn adopted_first_entry_settles_detached_metadata_receipt() {
     // The host adoption has retained the saved retry context. This receipt
     // has no endpoint pin and no adapter that could ever resume the old record.
     assert!(zone.free_first_entry_activation(activation));
+    if !metadata {
+        assert!(zone.live(record).is_some());
+        assert!(zone.record(id).has_adapter_operation());
+        assert_eq!(zone.record(id).incarnation(), record.incarnation);
+        return;
+    }
     assert!(
         zone.live(record).is_none(),
         "adopted metadata receipt stranded a retiring first entry"
