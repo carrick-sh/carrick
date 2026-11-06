@@ -110,3 +110,22 @@ design review before implementation. The existing host TimerFdState cannot
 be placed in shared ring memory: it contains host mutex/condition-variable,
 Arc clock-domain and wait-queue references, and change-listener callbacks.
 Moving only its counter arithmetic does not establish a ring-owned timer.
+
+## Independent epoll member control
+
+`serial_host_native_fork_epoll_ctl_observes_peer_pipe_write` separates the
+missing member service from the constructor refusal. It admits an epoll
+through the existing host IPC owner before two real native forks, then closes
+the parent descriptor. Child 0 calls production `epoll_ctl(ADD)` for its
+inherited pipe reader. A zero-timeout wait must leave the event buffer
+unchanged before child 1 writes. Child 0 must then receive EPOLLIN with the
+registered data cookie, read the peer's exact bytes, and observe no readiness
+after draining the pipe. Every wait has timeout zero; no host timing or
+sleep loop supplies the verdict.
+
+The test fails independently at the unserved `epoll_ctl` entry on the current
+implementation. Later readiness assertions remain prospective. This control
+cannot replace the constructor witnesses: acceptance still requires applying
+member operations to the epoll returned by the new constructor in both root
+and child. It also does not prove blocking wake delivery, MOD/DEL, or timer
+arming/expiry. No crossing policy or production service changes here.

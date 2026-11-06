@@ -10223,8 +10223,23 @@ fn serial_host_native_root_creates_timerfd_with_live_children() {
     );
 }
 
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_fork_epoll_ctl_observes_peer_pipe_write() {
+    native_descriptor_witness(None, false, true);
+}
+
 #[cfg(all(test, not(target_os = "macos")))]
 fn native_descriptor_calls(constructor: Option<u64>, root_constructor: bool) {
+    native_descriptor_witness(constructor, root_constructor, false);
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+fn native_descriptor_witness(
+    constructor: Option<u64>,
+    root_constructor: bool,
+    inherited_epoll: bool,
+) {
     use crate::ipc::IpcTables;
     use carrick_abi::{
         LINUX_F_DUPFD, LINUX_F_DUPFD_CLOEXEC, LINUX_F_GETFD, LINUX_F_GETFL, LINUX_F_SETFD,
@@ -10309,6 +10324,21 @@ fn native_descriptor_calls(constructor: Option<u64>, root_constructor: bool) {
         carrick_el1_abi::ipc::fd::CloseEffects::POSIX_RECORD_LOCKS,
     );
 
+    // Supply an inherited, fully admitted epoll only in the control witness.
+    // Constructor witnesses still have to create their object through dispatch.
+    let epoll = inherited_epoll.then(|| {
+        let object = owner.create_epoll().unwrap();
+        let description = owner
+            .admit_description(fd::Description::new(
+                IpcBacking::Epoll { object }.encode(),
+                fd::AccessMode::ReadWrite,
+                fd::StatusFlags::default(),
+            ))
+            .unwrap();
+        description.install(table.id(), fd::Fd(6), true).unwrap();
+        description
+    });
+
     let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
     let map = unsafe {
         &*region
@@ -10370,6 +10400,11 @@ fn native_descriptor_calls(constructor: Option<u64>, root_constructor: bool) {
             .is_queued()
     );
 
+    if let Some(epoll) = epoll {
+        table.close(fd::Fd(6)).unwrap();
+        drop(epoll);
+    }
+
     let tables = crate::ipc::MapTables(map);
     let venue = crate::ipc::IpcVenue {
         region: owner.region(),
@@ -10378,7 +10413,7 @@ fn native_descriptor_calls(constructor: Option<u64>, root_constructor: bool) {
     let counters = Box::new(carrick_el1_abi::Counters::new());
     let names = Box::new(carrick_el1_abi::InotifyNameCache::new());
 
-    let run_in_child = |idx: usize, nr: u64, args: [u64; 3]| -> (CompletionRoute, i64) {
+    let run_in_child_full = |idx: usize, nr: u64, args: [u64; 4]| -> (CompletionRoute, i64) {
         let mut cpu = crate::sched::FakeCpu::default();
         let mut svc = Aarch64NativeProcessService::with_crossing(
             &task,
@@ -10405,6 +10440,7 @@ fn native_descriptor_calls(constructor: Option<u64>, root_constructor: bool) {
         frame.x[0] = args[0];
         frame.x[1] = args[1];
         frame.x[2] = args[2];
+        frame.x[3] = args[3];
         carrick_test_support::assert_guest_args(&args);
         let route = super::dispatch::dispatch_syscall_with_native(
             &mut frame,
@@ -10430,6 +10466,10 @@ fn native_descriptor_calls(constructor: Option<u64>, root_constructor: bool) {
         (route, frame.x[0] as i64)
     };
 
+    let run_in_child = |idx: usize, nr: u64, args: [u64; 3]| {
+        run_in_child_full(idx, nr, [args[0], args[1], args[2], 0])
+    };
+
     let sys_dup = carrick_personality_linux::crossing::nr::DUP.raw();
     let sys_dup3 = carrick_personality_linux::crossing::nr::DUP3.raw();
     let sys_fcntl = carrick_personality_linux::crossing::nr::FCNTL.raw();
@@ -10447,6 +10487,74 @@ fn native_descriptor_calls(constructor: Option<u64>, root_constructor: bool) {
     );
     for binding in &child_bindings {
         assert!(runtime.task_binding(binding.key).is_some());
+    }
+
+    if inherited_epoll {
+        use carrick_personality_linux::crossing::nr as sys;
+        let cookie = 0x1506_1234_5678_9abcu64;
+        let mut interest = [0u8; 16];
+        interest[..4].copy_from_slice(&carrick_abi::LINUX_EPOLLIN.to_ne_bytes());
+        interest[8..].copy_from_slice(&cookie.to_ne_bytes());
+        let interest = carrick_test_support::GuestUserBuffer::from_bytes(&interest);
+        let events = carrick_test_support::GuestUserBuffer::from_bytes(&[0xa5; 16]);
+        let completed = |idx, ordinal, arguments| {
+            let (route, result) = run_in_child_full(idx, ordinal, arguments);
+            assert!(
+                matches!(route, CompletionRoute::Served | CompletionRoute::WithWork),
+                "child {idx} epoll member call {ordinal} must be served in ring, got {route:?} ({result})"
+            );
+            result
+        };
+        assert_eq!(
+            completed(
+                0,
+                sys::EPOLL_CTL.raw(),
+                [6, carrick_abi::LINUX_EPOLL_CTL_ADD, 3, interest.arg()]
+            ),
+            0
+        );
+        assert_eq!(
+            completed(0, sys::EPOLL_PWAIT.raw(), [6, events.arg(), 1, 0]),
+            0
+        );
+        assert_eq!(events.as_bytes(), &[0xa5; 16]);
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(fixture.slot, child_bindings[0].record.id)
+                .is_queued()
+        );
+        activate_target(source, &task, &child_bindings[1]);
+        let payload = carrick_test_support::GuestUserBuffer::from_bytes(b"peer");
+        assert_eq!(completed(1, sys::WRITE.raw(), [4, payload.arg(), 4, 0]), 4);
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(fixture.slot, child_bindings[1].record.id)
+                .is_queued()
+        );
+        activate_target(source, &task, &child_bindings[0]);
+        assert_eq!(
+            completed(0, sys::EPOLL_PWAIT.raw(), [6, events.arg(), 1, 0]),
+            1
+        );
+        assert_eq!(
+            u32::from_ne_bytes(events.as_bytes()[..4].try_into().unwrap())
+                & carrick_abi::LINUX_EPOLLIN,
+            carrick_abi::LINUX_EPOLLIN
+        );
+        assert_eq!(
+            u64::from_ne_bytes(events.as_bytes()[8..16].try_into().unwrap()),
+            cookie
+        );
+        let received = carrick_test_support::GuestUserBuffer::zeroed(4);
+        assert_eq!(completed(0, sys::READ.raw(), [3, received.arg(), 4, 0]), 4);
+        assert_eq!(received.as_bytes(), b"peer");
+        assert_eq!(
+            completed(0, sys::EPOLL_PWAIT.raw(), [6, events.arg(), 1, 0]),
+            0
+        );
+        return;
     }
 
     if let Some(nr) = constructor {
