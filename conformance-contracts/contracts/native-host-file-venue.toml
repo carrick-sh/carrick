@@ -7,6 +7,12 @@ fixture = "unit:native_reads_equal_the_dispatchers_own_syscalls"
 scale_points = [1]
 structural_budgets = []
 rationale = """
+Native pipe authority failures stay typed through runtime and carrier service
+adapters. The stale-backing venue witness requires Invariant, no guest reply,
+and exact pin settlement; the runtime preserves that category and the carrier
+returns its run-error Result, never Unsupported or counted ENOSYS. The VM-free
+venue test does not execute the macOS adapter; cross-build and signed evidence
+remain necessary for that boundary.
 A ring-owned (native) process has no host task. Its calls on in-zone objects
 (pipes, eventfds, epoll) retain shared ring state. Pipe capacity uses one typed
 allocation service through this existing owner; it pins that same shared pipe
