@@ -560,6 +560,20 @@ fn native_sibling_exit_group_reloads_process_roots() {
     );
 }
 
+/// Observe native cancellation of live file-operation siblings through HVF.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn native_exit_group_save_diagnostic() {
+    let _guard = common::guest_lock();
+    let probe = carrick_runtime::vcpu_loop::executor::native_terminal_test_control::arm();
+    let watchdog = common::Watchdog::start(std::time::Duration::from_secs(30));
+    let result = common::interceptor_probe_builder("exit-group-stress").run_blocking();
+    watchdog.disarm();
+    println!("native-save-diagnostic {:?}", probe.observation());
+    let result = common::run_or_fail(result);
+    assert!(result.success(), "exit_code={}", result.exit_code);
+}
+
 /// Exercise the hardware cleanup in HvpatchPersistentExecutor::save, rather
 /// than the save selector or a source-text ordering assertion.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
