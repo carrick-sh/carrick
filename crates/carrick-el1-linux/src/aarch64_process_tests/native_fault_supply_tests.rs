@@ -4331,7 +4331,7 @@ fn arm_host_born_fault_waiter_cancels_cleanly_on_exit_group_kill_and_sibling_exe
 }
 
 #[test]
-fn arm_clone_tid_output_waits_for_sibling_in_flight_grant_publication() {
+fn arm_clone_tid_output_refuses_before_sibling_in_flight_grant_publication() {
     use crate::mm_portal::{GuestVa, MmError, SelectionVenues, TransferIntent, TransferStep};
     use carrick_el1::fault::{NoopCowResolver, NoopPreparedResolver};
     use carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal;
@@ -4424,18 +4424,20 @@ fn arm_clone_tid_output_waits_for_sibling_in_flight_grant_publication() {
     clone_frame.x[8] = 220; // SYS_clone
 
     // 1. Before the 2 MiB stack block page `VA + 4096` is resident in Stage-1,
-    // EL1 `serve_clone` observes `NotYet` in `TidOutput::capture`, prepares
-    // the read through the owner-memory wait path, and rewinds PC to redispatch.
+    // EL1 `serve_clone` observes `NotYet` in `TidOutput::capture` and keeps
+    // main's non-parking contract: refuse before claiming or publishing a TID.
     crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
-    let redispatched = arm_call(fixture, fixture.control, &mut service, &mut clone_frame);
+    let refused = arm_call(fixture, fixture.control, &mut service, &mut clone_frame);
     crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
     assert_eq!(
-        redispatched.unwrap(),
-        carrick_personality_linux::dispatch::CompletionRoute::Served,
-        "non-resident clone TID output in a valid VMA must prepare and redispatch"
+        refused.unwrap(),
+        carrick_personality_linux::dispatch::CompletionRoute::WithWork,
+        "non-resident clone TID output must refuse without parking"
     );
-    assert_eq!(clone_frame.elr, 0x401ffc);
-    clone_frame.elr = 0x402000;
+    assert_eq!(clone_frame.elr, 0x402000);
+    assert_eq!(clone_frame.x[0] as i64, -14);
+    assert_eq!(tid_words.get::<[i32; 2]>(0), [11, 22]);
+    assert_eq!(child_control.visible_tid(), None);
 
     // 2. On the host, `CloneTidOutputTransaction::capture` reads the TID output
     // address through `MmPortal::select`. When sibling B acquires the
