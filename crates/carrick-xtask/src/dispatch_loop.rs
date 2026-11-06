@@ -2768,6 +2768,14 @@ impl Server<'_> {
             self.post(&format!("Dispatch refused: {error}"))?;
             return Err(error);
         }
+        if branch != self.dispatch.branch
+            && ((self.dispatch.resume && self.pr.is_some())
+                || !self.dispatch.superseded_prs.is_empty())
+        {
+            return Err(ScalerError::Guard(
+                "continue the admitted PR branch; request Fresh start: yes on the issue for a new lane",
+            ));
+        }
         let fresh = format!("work/dispatch-{}-{}", self.dispatch.issue, run_id()?);
         let target = if branch == fresh
             && branch_prs(self.root, branch, "all")?
@@ -5509,8 +5517,8 @@ fi
             owned.select_branch(branch).unwrap();
             assert_eq!(owned.dispatch.layer_history, Some(layer));
             std::fs::write(root.join("prs.json"), "[]").unwrap();
-            owned.select_branch("work/dispatch-799-999").unwrap();
-            assert!(owned.dispatch.layer_history.is_none());
+            assert!(owned.select_branch("work/dispatch-799-999").is_err());
+            assert!(owned.dispatch.layer_history.is_some());
             assert!(
                 lookup(
                     json!([comment.clone()]),

@@ -52,7 +52,21 @@ never parses issue structure. The
 loop reads the full issue, so #587's problem statement and acceptance need no
 special heading. Unclear work can finish blocked with a question for the requesting collaborator.
 
-For issue work, the server starts `work/dispatch-<issue>-<run>`. The loop can
+For issue work, admission first looks for an open owned dispatch PR for that
+issue and continues its branch and exact live tip. The existing checkout,
+rebase and expected-tip publication checks apply; publication updates the
+same PR. Multiple open owned PRs are refused rather than choosing one or
+creating another lane. With no open owned PR, the server starts
+`work/dispatch-<issue>-<run>`.
+
+A trusted, unedited `/agent` trigger can explicitly request a new lane with a
+standalone `Fresh start: yes` line. Admission records the owned open PRs it
+supersedes. Only after the replacement PR has been published does the server
+recheck those PRs' ownership and close them with a pointer to the replacement.
+A failed publication leaves the earlier PRs open; a failed close is reported
+as a publication failure and can be resumed. Issue prose does not select a branch or request a fresh start.
+
+The loop can
 select another linked `work/dispatch-*` branch before invoking workers. A
 candidate must have an open owned dispatch draft PR closing this issue, or an
 authenticated earlier run's handoff recording its publication. The server
