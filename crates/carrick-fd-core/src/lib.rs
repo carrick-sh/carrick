@@ -1168,7 +1168,22 @@ impl<B: SlotBacking, W: LockWait, const T: usize> SlotTableTransaction<'_, '_, B
         // No bitmap/slot change during preparation: the next lowest hole is
         // strictly above the first, so two searches suffice without a scan.
         let second = self.table.allocate(first + 1)?;
-        let covered = [c.cover(first)?, c.cover(second)?];
+        self.publish_pair([Fd(first as i32), Fd(second as i32)], pins, cloexec, false)
+    }
+
+    /// Common publication for immediate installs and owned empty-slot claims.
+    /// All fallible preparation precedes the table sequence write.
+    fn publish_pair(
+        &mut self,
+        fds: [Fd; 2],
+        pins: [&OfdPin; 2],
+        cloexec: bool,
+        reserved: bool,
+    ) -> Result<[Fd; 2], Error> {
+        let c = self.authority;
+        c.check_pin(pins[0])?;
+        c.check_pin(pins[1])?;
+        let covered = [c.cover(fds[0].0 as usize)?, c.cover(fds[1].0 as usize)?];
         c.retain(pins[0].key.index, REF)?;
         if let Err(error) = c.retain(pins[1].key.index, REF) {
             // The preparation pin prevents this rollback being a final hold.
@@ -1184,15 +1199,18 @@ impl<B: SlotBacking, W: LockWait, const T: usize> SlotTableTransaction<'_, '_, B
                     cloexec,
                 },
             );
+            if reserved {
+                self.table.storage.unreserve(fd.0);
+            }
             #[cfg(test)]
-            if fd.0 == first
+            if fd.0 == fds[0].0 as usize
                 && let Some(probe) = self.after_first_publication
             {
                 probe(self);
             }
         }
         self.guard.record.end_write();
-        Ok([Fd(first as i32), Fd(second as i32)])
+        Ok(fds)
     }
 }
 
