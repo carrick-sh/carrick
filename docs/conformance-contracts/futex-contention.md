@@ -1,5 +1,18 @@
 # Futex example
 
+The relative-timeout witnesses for #1745 are intentionally red until the
+operation continuation retains its deadline. The host binding
+`threaded_futex_relative_deadline_survives_owner_redispatch` admits two live
+threads, refuses the compare-under-lock atomic load once, and advances a
+deterministic clock by one second. A five-second relative wait must then
+have four seconds remaining. The EL1 production-entry binding
+`futex_unbacked_word_waits_for_owner_with_two_live_threads` similarly requires
+the original expiry tick after an owner-service park. These tests establish
+the deadline defect; they do not yet prove synchronous redispatch, signal
+cleanup, forwarding, cancellation, or the host zone's final atomic recheck.
+Those paths remain required before the issue can be accepted. No runtime
+ratio or signed execution claim follows from these VM-free witnesses.
+
 `kernel.futex.contention` is the first vertical contract. Its VM-free binding
 checks exact wake cardinality, no lost wake, one continuation enrollment and
 park per blocking episode, no redispatch while parked, and queue work
