@@ -555,63 +555,15 @@ where
     } = options;
     let argv: Vec<String> = argv.into_iter().collect();
     let env: Vec<String> = env.into_iter().collect();
-    // Docker accepts a bare entrypoint command (`carrick run alpine ls`); resolve
-    // it against $PATH like runc/execvp before loading. A name with '/' is left
-    // as-is. Guest execve(2) is unaffected (it keeps full-path semantics).
-    // PATH-resolve a bare command AND resolve `#!` shebang scripts to their
-    // interpreter (Docker / execve(2) semantics) before loading, so a script
-    // entrypoint runs instead of failing "not an ELF binary".
     let launch_context = dispatcher.capture_one_task_context().map_err(|error| {
         RuntimeError::Unsupported(format!("capture image launch Kernel context: {error}"))
     })?;
-    let argv_for_cmdline = argv.clone();
-    let argv_bytes: Vec<Vec<u8>> = argv.into_iter().map(String::into_bytes).collect();
-    let resolved_entry = dispatcher.with_kernel_credentials(&launch_context, || {
-        carrick_kernel::exec_helpers::resolve_entrypoint_program(
-            path,
-            &env,
-            argv_bytes,
-            &dispatcher,
-        )
-    });
-    let (resolved, argv) = resolved_entry.map_err(|_| {
-        RuntimeError::AddressSpace(AddressSpaceError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            path.to_owned(),
-        )))
-    })?;
-    // /proc/self/cmdline reflects the user's argv, but /proc/self/exe MUST be the
-    // RESOLVED absolute binary path — real Linux always stores the resolved path.
-    // A bare `uname` would otherwise absolutize to `/uname` (cwd-relative) and
-    // break anything that opens /proc/self/exe: Apple Rosetta opens it to find its
-    // x86 target ("rosetta error: Unable to open /proc/self/exe"), and uutils-
-    // coreutils (Ubuntu 26.04) derives its locale dir from it. Identity is set
-    // AFTER resolution so the recorded exe is the real binary, not the bare name.
-    let path: &str = &resolved;
-    let executable_source = dispatcher
-        .with_kernel_credentials(&launch_context, || {
-            dispatcher.acquire_exec_source(&launch_context, path)
-        })
-        .map_err(|error| {
-            let error = match error {
-                carrick_kernel::dispatch::executable_authority::ExecSourceError::Linux(errno) => {
-                    std::io::Error::from_raw_os_error(errno.get())
-                }
-                carrick_kernel::dispatch::executable_authority::ExecSourceError::Host(error) => {
-                    error
-                }
-            };
-            RuntimeError::AddressSpace(AddressSpaceError::Io(error))
-        })?;
-    let bytes = executable_source
-        .read_all()
-        .map_err(AddressSpaceError::Io)?;
-    dispatcher.set_executable_identity_with_source(
-        resolved.clone(),
-        argv_for_cmdline,
-        env.iter().map(|s| s.as_bytes().to_vec()).collect(),
-        executable_source,
-    );
+    let crate::execute::InitialEntrypoint {
+        path: resolved,
+        bytes,
+        argv,
+    } = crate::execute::prepare_initial_entrypoint(&dispatcher, &launch_context, path, argv, &env)?;
+    let path = resolved.as_str();
     // Redirect x86_64 binaries through Rosetta 2 (binfmt_misc-style). argv is
     // already opaque bytes (Linux ABI).
     let mut needs_at_base = false;

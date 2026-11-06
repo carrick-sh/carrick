@@ -34,7 +34,6 @@ use crate::execute::{
     HostRootLayout, cached_lower_enabled, detached_stable_scratch_path, effective_guest_hostname,
     install_rosetta_mounts, prepare_host_root, record_detached_scratch, seed_guest_baseline,
 };
-#[cfg(any(test, feature = "platform-macos"))]
 use crate::execute::{
     entrypoint_not_executable_result, entrypoint_not_found_result, is_entrypoint_not_executable,
     is_entrypoint_not_found,
@@ -1358,7 +1357,6 @@ fn prepare_with_lease(
 /// runc/shell exit conventions for a failed entrypoint load: 127 for "not
 /// found", 126 for "found but not executable"; a configuration-time refusal
 /// passes through unwrapped so it surfaces labeled as what it is.
-#[cfg(any(test, feature = "platform-macos"))]
 fn classify_run_outcome(
     run: Result<RunResult, RuntimeError>,
     label: &str,
@@ -1463,119 +1461,121 @@ impl PreparedRun {
             target_arch = "x86_64"
         ))]
         let run = if backend == ExecutionBackend::KvmX86Cpl0 {
-            let dispatcher = dispatcher;
-            let _ = (
-                &debug_state_path,
-                &root,
-                &carrier,
-                &carrier_lease,
-                &arm_ring_first,
-            );
-            let root_context = dispatcher.capture_one_task_context().map_err(|error| {
-                RuntimeError::Unsupported(format!("capture x86 root identity: {error}"))
-            })?;
-            // Initial image commands use the same PATH and shebang policy as
-            // ARM/HVF. Only the ELF machine and carrier construction below are
-            // ISA-specific; guest execve retains its full-path semantics.
-            let argv_for_cmdline = argv.clone();
-            let (executable, argv) = dispatcher
-                .with_kernel_credentials(&root_context, || {
-                    carrick_kernel::exec_helpers::resolve_entrypoint_program(
-                        &executable,
-                        &env,
-                        argv.into_iter().map(String::into_bytes).collect(),
+            classify_run_outcome(
+                (|| {
+                    let dispatcher = dispatcher;
+                    let _ = (
+                        &debug_state_path,
+                        &root,
+                        &carrier,
+                        &carrier_lease,
+                        &arm_ring_first,
+                    );
+                    let root_context = dispatcher.capture_one_task_context().map_err(|error| {
+                        RuntimeError::Unsupported(format!("capture x86 root identity: {error}"))
+                    })?;
+                    let crate::execute::InitialEntrypoint {
+                        path: _resolved_path,
+                        bytes,
+                        argv,
+                    } = crate::execute::prepare_initial_entrypoint(
                         &dispatcher,
+                        &root_context,
+                        &executable,
+                        argv,
+                        &env,
+                    )?;
+                    let argv: Vec<String> = argv
+                        .into_iter()
+                        .map(String::from_utf8)
+                        .collect::<Result<_, _>>()
+                        .map_err(|error| {
+                            crate::memory::AddressSpaceError::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                error,
+                            ))
+                        })?;
+                    let program = dispatcher
+                        .with_kernel_credentials(&root_context, || {
+                            carrick_mem::elf::ElfProgram::load(&bytes, 62, &|path| {
+                                dispatcher.read_exec_file(path)
+                            })
+                        })
+                        .map_err(|error| match error {
+                            carrick_mem::elf::ElfInspectError::Io(error) => {
+                                crate::memory::AddressSpaceError::Io(error)
+                            }
+                            error => crate::memory::AddressSpaceError::Elf(error),
+                        })?;
+                    let image = carrick_mem::x86_initial_image::prepare_x86_elf(&program).map_err(
+                        |error| RuntimeError::Unsupported(format!("x86 ELF load: {error}")),
+                    )?;
+                    let extent_bytes =
+                        carrick_vmm_kvm::cpl0_boot::Cpl0Carrier::initial_extent_bytes_for(
+                            &image, &argv, &env,
+                        )?;
+                    let mut machine = carrick_vmm_kvm::cpl0_boot::Cpl0Carrier::boot_production(
+                        // This per-VM facade owns only physical inventory/ID
+                        // custody. CPL0 retains Linux process and MM semantics.
+                        Arc::new(carrick_kernel::kernel::FrameInventoryAuthority::new())
+                            .physical_projection(Arc::new(
+                                carrick_kernel::kernel::ObjectIdRegistry::new(),
+                            )),
+                        extent_bytes,
+                    )?;
+                    root_context
+                        .kernel()
+                        .object_ids()
+                        .bind_initial_birth_source(machine.birth_serial_source()?)
+                        .map_err(|error| {
+                            RuntimeError::Unsupported(format!(
+                                "bind initial x86 carrier birth source: {error}"
+                            ))
+                        })?;
+                    machine.bind_initial_task_identity(
+                        carrick_vmm_kvm::cpl0_boot::InitialTaskBinding {
+                            task: root_context.task().key(),
+                            mm: carrick_hal::MmGeneration::new(
+                                root_context.shared().mm().id().nonzero(),
+                            ),
+                            thread: carrick_sched_core::ThreadIdentity {
+                                tid: carrick_el1_abi::El1TaskId::from_linux_tid(
+                                    root_context.thread().key().tid.raw(),
+                                )
+                                .raw(),
+                                serial: root_context.thread().key().serial.raw(),
+                                mm: 0,
+                                file_table: root_context.resources().files().id().raw(),
+                                generation:
+                                    carrick_kernel::kernel::objects::ExecutionGeneration::INITIAL
+                                        .raw(),
+                                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                                affinity: 3,
+                                lifecycle_page: 0,
+                                control_slot: 0,
+                            },
+                        },
+                    )?;
+                    let limits = carrick_vmm_kvm::cpl0_boot::InitialReservationLimits {
+                        address: dispatcher.launch_resource_limit(carrick_abi::LinuxResource::As),
+                        data: dispatcher.launch_resource_limit(carrick_abi::LinuxResource::Data),
+                    };
+                    machine.load_guest_mm(&image, &argv, &env, limits)?;
+                    run_prepared_kvm_pool_with_debug(
+                        machine,
+                        root_context,
+                        dispatcher,
+                        max_traps,
+                        kvm_debug,
+                        #[cfg(feature = "kvm-pool-test-control")]
+                        None,
+                        None,
                     )
-                })
-                .map_err(|errno| {
-                    RuntimeError::Unsupported(format!(
-                        "resolve guest executable {executable}: errno {}",
-                        errno.get()
-                    ))
-                })?;
-            // The initial-image API takes UTF-8 strings. Inputs and the shared
-            // shebang parser produce UTF-8; reject a broken boundary explicitly.
-            let argv: Vec<String> = argv
-                .into_iter()
-                .map(String::from_utf8)
-                .collect::<Result<_, _>>()
-                .map_err(|error| RuntimeError::Unsupported(format!("entrypoint argv: {error}")))?;
-            let executable_source = dispatcher
-                .with_kernel_credentials(&root_context, || {
-                    dispatcher.acquire_exec_source(&root_context, &executable)
-                })
-                .map_err(|error| {
-                    RuntimeError::Unsupported(format!("guest executable {executable}: {error:?}"))
-                })?;
-            let bytes = executable_source.read_all().map_err(|error| {
-                RuntimeError::Unsupported(format!("read guest executable {executable}: {error}"))
-            })?;
-            dispatcher.set_executable_identity_with_source(
-                executable,
-                argv_for_cmdline,
-                env.iter().map(|entry| entry.as_bytes().to_vec()).collect(),
-                executable_source,
-            );
-            let program = carrick_mem::elf::ElfProgram::load(&bytes, 62, &|path| {
-                dispatcher.read_exec_file(path)
-            })
-            .map_err(|error| RuntimeError::Unsupported(format!("ELF program load: {error}")))?;
-            let image = carrick_mem::x86_initial_image::prepare_x86_elf(&program)
-                .map_err(|error| RuntimeError::Unsupported(format!("x86 ELF load: {error}")))?;
-            let extent_bytes = carrick_vmm_kvm::cpl0_boot::Cpl0Carrier::initial_extent_bytes_for(
-                &image, &argv, &env,
-            )?;
-            let mut machine = carrick_vmm_kvm::cpl0_boot::Cpl0Carrier::boot_production(
-                // This per-VM facade owns only physical inventory/ID
-                // custody. CPL0 retains Linux process and MM semantics.
-                Arc::new(carrick_kernel::kernel::FrameInventoryAuthority::new())
-                    .physical_projection(Arc::new(carrick_kernel::kernel::ObjectIdRegistry::new())),
-                extent_bytes,
-            )?;
-            root_context
-                .kernel()
-                .object_ids()
-                .bind_initial_birth_source(machine.birth_serial_source()?)
-                .map_err(|error| {
-                    RuntimeError::Unsupported(format!(
-                        "bind initial x86 carrier birth source: {error}"
-                    ))
-                })?;
-            machine.bind_initial_task_identity(carrick_vmm_kvm::cpl0_boot::InitialTaskBinding {
-                task: root_context.task().key(),
-                mm: carrick_hal::MmGeneration::new(root_context.shared().mm().id().nonzero()),
-                thread: carrick_sched_core::ThreadIdentity {
-                    tid: carrick_el1_abi::El1TaskId::from_linux_tid(
-                        root_context.thread().key().tid.raw(),
-                    )
-                    .raw(),
-                    serial: root_context.thread().key().serial.raw(),
-                    mm: 0,
-                    file_table: root_context.resources().files().id().raw(),
-                    generation: carrick_kernel::kernel::objects::ExecutionGeneration::INITIAL.raw(),
-                    affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
-                    affinity: 3,
-                    lifecycle_page: 0,
-                    control_slot: 0,
-                },
-            })?;
-            let limits = carrick_vmm_kvm::cpl0_boot::InitialReservationLimits {
-                address: dispatcher.launch_resource_limit(carrick_abi::LinuxResource::As),
-                data: dispatcher.launch_resource_limit(carrick_abi::LinuxResource::Data),
-            };
-            machine.load_guest_mm(&image, &argv, &env, limits)?;
-            run_prepared_kvm_pool_with_debug(
-                machine,
-                root_context,
-                dispatcher,
-                max_traps,
-                kvm_debug,
-                #[cfg(feature = "kvm-pool-test-control")]
-                None,
-                None,
+                    .map_err(|failure| failure.error)
+                    .map(|outcome| outcome.run)
+                })(),
+                "failed to run x86 image",
             )
-            .map_err(|failure| failure.error)
-            .map(|outcome| outcome.run)
         } else {
             Err(RuntimeError::Unsupported(format!(
                 "Linux execution backend {backend:?} is not available"
