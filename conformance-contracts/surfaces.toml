@@ -1010,6 +1010,7 @@ surfaces = [
   { path = "crates/carrick-sched-core/src/tests.rs", contract = "kernel.el1.guest-run-queue" },
   { path = "crates/carrick-sched-core/src/tests.rs", contract = "kernel.el1.guest-scheduler" },
   { path = "crates/carrick-sched-core/src/tests.rs", contract = "kernel.el1.ipc-two-process" },
+  { path = "crates/carrick-sched-core/src/tests.rs", contract = "kernel.el1.metadata-allocation" },
   # Concurrent owned deadlines belong to the shared guest scheduler.
   { path = "crates/carrick-sched-core/src/tests.rs", contract = "kernel.el1.thread-lifecycle" },
   { path = "crates/carrick-sched-core/src/tests.rs", contract = "kernel.native.entropy" },
