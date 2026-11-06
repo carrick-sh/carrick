@@ -220,16 +220,6 @@ pub(crate) fn dispatch_threaded_futex(
             errno: LINUX_EINVAL,
         };
     }
-    if timeout_address != 0
-        && matches!(raw_command, LINUX_FUTEX_WAIT | LINUX_FUTEX_WAIT_BITSET)
-        && let Ok(timespec) = read_futex_timespec(memory, timeout_address)
-        && !linux_timeout_timespec_is_valid(timespec)
-    {
-        return DispatchOutcome::Errno {
-            errno: LINUX_EINVAL,
-        };
-    }
-
     // Only WAIT / CMP_REQUEUE / PI ops consult the futex VALUE; WAKE and plain
     // REQUEUE are keyed purely on the guest address (the parking-lot table keys
     // on the VA, which is identical across the shared guest address space). Real
@@ -918,6 +908,15 @@ fn read_futex_timespec(
         CopyOutcome::Done => Ok(LinuxTimespec {
             tv_sec: i64::from_ne_bytes(bytes[..8].try_into().unwrap()),
             tv_nsec: i64::from_ne_bytes(bytes[8..].try_into().unwrap()),
+        })
+        .and_then(|timespec| {
+            if linux_timeout_timespec_is_valid(timespec) {
+                Ok(timespec)
+            } else {
+                Err(DispatchOutcome::Errno {
+                    errno: LINUX_EINVAL,
+                })
+            }
         }),
         CopyOutcome::NotYet(_) => Err(copy
             .take_refusal()
