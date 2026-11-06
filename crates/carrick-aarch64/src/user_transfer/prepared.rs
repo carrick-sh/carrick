@@ -223,6 +223,73 @@ impl<'a, S: PreparedService, P: TransferPin> PreparedWrite<'a, S, P> {
         }
         page.permit = None;
     }
+
+    fn settle_atomic_u32(&mut self, expected: u32, desired: u32) -> u32 {
+        if self.pages.len() != 1 || self.ranges.len() != 1 || self.ranges[0].len() != 4 {
+            carrick_fatal::carrick_fatal!(
+                "aarch64::prepared_copy",
+                "atomic word settlement requires one exact four-byte range"
+            );
+        }
+        let page = &mut self.pages[0];
+        let permit = page.permit.unwrap_or_else(|| {
+            carrick_fatal::carrick_fatal!(
+                "aarch64::prepared_copy",
+                "atomic word settlement lost its prepared permit"
+            )
+        });
+        let request = page.retained.request;
+        let mut ticket = self
+            .slot
+            .submit_commit(request, permit, 4)
+            .unwrap_or_else(|| {
+                carrick_fatal::carrick_fatal!(
+                    "aarch64::prepared_copy",
+                    "prepared atomic settlement lost exclusive transport"
+                )
+            });
+        let mut observed = None;
+        self.service
+            .run(&mut || {
+                ticket.copy_requested(|authorization| {
+                    observed = page.retained.pin.atomic_compare_exchange_u32(
+                        authorization,
+                        expected,
+                        desired,
+                    );
+                    observed.is_some()
+                })
+            })
+            .unwrap_or_else(|error| {
+                carrick_fatal::carrick_fatal!(
+                    "aarch64::prepared_copy",
+                    "prepared atomic settlement failed: {error}"
+                )
+            });
+        let completion = ticket.take_completion().unwrap_or_else(|| {
+            carrick_fatal::carrick_fatal!(
+                "aarch64::prepared_copy",
+                "prepared atomic settlement attempted suspension"
+            )
+        });
+        if completion.operation != request.operation
+            || completion.retained != request.retained
+            || completion.errno != 0
+            || completion.completed != 4
+        {
+            carrick_fatal::carrick_fatal!(
+                "aarch64::prepared_copy",
+                "prepared atomic settlement identity or count changed"
+            );
+        }
+        page.permit = None;
+        observed.unwrap_or_else(|| {
+            carrick_fatal::carrick_fatal!(
+                "aarch64::prepared_copy",
+                "prepared atomic settlement omitted its observed word"
+            )
+        })
+    }
 }
 impl<S: PreparedService, P: TransferPin> PreparedGuestWrite for PreparedWrite<'_, S, P> {
     fn commit(mut self: Box<Self>, outputs: &[&[u8]]) {
@@ -247,6 +314,14 @@ impl<S: PreparedService, P: TransferPin> PreparedGuestWrite for PreparedWrite<'_
             let prefix = (len != 0).then(|| &bytes[page.offset..page.offset + len]);
             self.settle(index, prefix);
         }
+    }
+
+    fn atomic_compare_exchange_u32(
+        mut self: Box<Self>,
+        expected: u32,
+        desired: u32,
+    ) -> Result<u32, carrick_guest_mem::MemoryError> {
+        Ok(self.settle_atomic_u32(expected, desired))
     }
 }
 impl<S: PreparedService, P: TransferPin> Drop for PreparedWrite<'_, S, P> {
@@ -437,7 +512,12 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(Box::new(prepared).atomic_compare_exchange_u32(7, 11), 7);
+        assert_eq!(
+            Box::new(prepared)
+                .atomic_compare_exchange_u32(7, 11)
+                .unwrap(),
+            7
+        );
         assert_eq!(word.get(), 11);
         assert_eq!(
             *state.events.borrow(),
