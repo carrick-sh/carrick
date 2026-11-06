@@ -305,6 +305,22 @@ fn until_deadline(deadline: u64) -> std::time::Duration {
     std::time::Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX))
 }
 
+fn owns_installed_space(zone_mm: Option<u64>, installed: u64, _terminal: bool) -> bool {
+    zone_mm.is_none_or(|mm| mm == installed)
+}
+
+#[cfg(test)]
+mod terminal_space_tests {
+    use super::owns_installed_space;
+
+    #[test]
+    fn sibling_owned_terminal_accepts_its_vacated_zone_slot() {
+        assert!(owns_installed_space(Some(1), 0, true));
+        assert!(!owns_installed_space(Some(1), 2, true));
+        assert!(!owns_installed_space(Some(1), 0, false));
+    }
+}
+
 impl<E: ThreadedEngine + 'static> ProductionHvpatchLoopJob<E>
 where
     E::SiblingSpec: 'static,
@@ -524,11 +540,19 @@ where
     ) -> Result<(), ProductionHvpatchPollError> {
         let installed = zone.installed_space(slot);
         match self.state.zone_mm {
-            Some(mm) if mm != installed => Err(RuntimeError::Configuration(format!(
-                "EL1 zone slot {slot:?} returned the loaded thread of address space {mm} \
+            Some(mm)
+                if !owns_installed_space(
+                    self.state.zone_mm,
+                    installed,
+                    self.phase.is_terminal_transition(),
+                ) =>
+            {
+                Err(RuntimeError::Configuration(format!(
+                    "EL1 zone slot {slot:?} returned the loaded thread of address space {mm} \
                  with address space {installed} installed"
-            ))
-            .into()),
+                ))
+                .into())
+            }
             _ => Ok(()),
         }
     }
