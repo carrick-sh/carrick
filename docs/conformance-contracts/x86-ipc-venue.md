@@ -47,8 +47,7 @@ delivery or parking. No table/object lock or copy permit may span a park.
 A reviewer must check any new cross-crate lock order before implementation
 is accepted.
 
-Acceptance remains open: enable the real-KVM fixture, add served/refusal
-census assertions, test a non-venue descriptor's counted ENOSYS, update
+Acceptance remains open: enable and pass the real-KVM served fixture, update
 `x86_writev_remains_counted_enosys_under_strict_ring_first` with the oracle,
 and run the requested lower-layer and real-KVM gates. The oracle above
 proves bytes and EOF only; it does not prove a ring execution venue.
@@ -58,6 +57,23 @@ On the admitted base, real KVM runs the fixture and returns guest exit 90
 creation precondition, **not** a reached two-process vector transfer failure.
 The native oracle reaches and passes every stage. Do not claim vector parity
 from this red run; later witnesses must reach the transfer and count it.
+
+The vector witness now asserts the terminal census as well as guest bytes:
+three scalar reads and one call in each vector direction must be served,
+with zero forwards or refusals for those operations. At least the child's
+scalar pipe write must be served; the final stdout diagnostic may cross.
+Service arrays use canonical ordinals, while refusal arrays use native
+x86 ordinals. This assertion remains behind the same ignored red fixture
+until the production venue exists.
+
+`non_venue_writev_is_counted_without_host_crossing` independently calls
+native ordinal 20 on descriptor -1, without requiring pipe creation first.
+It requires one root ring refusal, no carrier refusal, no served vector
+write and no host forward. Its same-source native Linux oracle is compiled
+with `-DNATIVE_ORACLE` and requires EBADF (9); Carrick intentionally returns
+ENOSYS (38) for the absent venue under strict ring-first. Both variants
+exit 0 with empty output when their own contract holds. This independent
+refusal witness does not demonstrate pipe service.
 
 ## Shared scatter copyout prerequisite
 
