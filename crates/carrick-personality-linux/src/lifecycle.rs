@@ -1229,19 +1229,49 @@ fn resume_clone_tid_rollback<'a>(
         if address.raw() == 0 {
             continue;
         }
-        match native.copy_out(address, &bytes) {
-            CopyOutcome::Done => {}
-            CopyOutcome::Fault => {
-                let mut observed = [0; 4];
-                match native.copy_in(&mut observed, address) {
-                    CopyOutcome::Done if observed != bytes => {
+        let check_preimage = match native.copy_out(address, &bytes) {
+            CopyOutcome::Done => false,
+            CopyOutcome::Fault => true,
+            CopyOutcome::NotYet(request) => match native.wait_guest_copy(request) {
+                LifecycleOutcome::Returned { result, .. } if result.raw() < 0 => {
+                    // Preparation found a true fault. The syscall cannot
+                    // return while its undo still owns a user word.
+                    if matches!(undo.completion, CloneRollbackCompletion::Retry) {
+                        undo.completion = CloneRollbackCompletion::Returned(result);
+                        slot.retain_clone_tid_rollback(undo);
+                    }
+                    true
+                }
+                LifecycleOutcome::Returned { .. } => {
+                    native.fail_lifecycle(NativeRunFailureReason::ClaimRollback)
+                }
+                outcome => return Some(outcome),
+            },
+        };
+        if check_preimage {
+            let mut observed = [0; 4];
+            match native.copy_in(&mut observed, address) {
+                CopyOutcome::Done if observed != bytes => {
+                    native.fail_lifecycle(NativeRunFailureReason::ClaimRollback)
+                }
+                CopyOutcome::Done | CopyOutcome::Fault => {}
+                CopyOutcome::NotYet(request) => match native.wait_guest_copy(request) {
+                    LifecycleOutcome::Returned { result, .. }
+                        if result.raw() == carrick_syscall_abi::LINUX_EFAULT.guest_retval() =>
+                    {
+                        // This destination is no longer readable. Retire
+                        // its undo, rather than returning with stale custody.
+                        if matches!(undo.completion, CloneRollbackCompletion::Retry) {
+                            undo.completion = CloneRollbackCompletion::Returned(result);
+                            slot.retain_clone_tid_rollback(undo);
+                        }
+                    }
+                    LifecycleOutcome::Returned { .. } => {
                         native.fail_lifecycle(NativeRunFailureReason::ClaimRollback)
                     }
-                    CopyOutcome::Done | CopyOutcome::Fault => {}
-                    CopyOutcome::NotYet(request) => return Some(native.wait_guest_copy(request)),
-                }
+                    outcome => return Some(outcome),
+                },
             }
-            CopyOutcome::NotYet(request) => return Some(native.wait_guest_copy(request)),
         }
         undo.outputs[i].0 = UserVa::new(0);
         slot.retain_clone_tid_rollback(undo);

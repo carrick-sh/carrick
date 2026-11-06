@@ -20,6 +20,7 @@ std::thread_local! {
     pub(super) static COPYIN_NOT_YET_AT: core::cell::Cell<Option<u64>> = const { core::cell::Cell::new(None) };
     pub(super) static COPYIN_CALLS: core::cell::RefCell<std::vec::Vec<u64>> = const { core::cell::RefCell::new(std::vec::Vec::new()) };
     pub(super) static COPYOUT_PUBLISH_WAITERS_AT: core::cell::Cell<Option<u64>> = const { core::cell::Cell::new(None) };
+    pub(super) static GUEST_COPY_PREPARATION_FAULT_AT: core::cell::Cell<Option<u64>> = const { core::cell::Cell::new(None) };
     pub(super) static COPYOUT_REFUSE_PUBLISH_AT: core::cell::Cell<Option<u64>> = const { core::cell::Cell::new(None) };
     pub(super) static COPYOUT_REFUSE_RESTORE_AT: core::cell::Cell<Option<u64>> = const { core::cell::Cell::new(None) };
     pub(super) static COPYOUT_NOT_YET_AT: core::cell::Cell<Option<u64>> = const {
@@ -301,6 +302,15 @@ impl<
     }
 
     fn wait_guest_copy(&mut self, request: GuestCopyRequest) -> LifecycleOutcome {
+        #[cfg(test)]
+        if GUEST_COPY_PREPARATION_FAULT_AT
+            .with(|address| address.get() == Some(request.address.raw()))
+        {
+            return LifecycleOutcome::Returned {
+                result: SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
+                work: false,
+            };
+        }
         let venue = self.process_venue().unwrap_or_else(|| {
             super::dispatch::invalid_completion(super::dispatch::NativeInvariant::EntryBinding)
         });

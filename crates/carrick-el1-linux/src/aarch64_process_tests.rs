@@ -12018,22 +12018,37 @@ fn signal_setup_nonresident_input(nr: u64) {
 
 #[test]
 fn arm_clone_nonresident_tid_destination_publishes_once() {
-    clone_nonresident_tid_destination(false, false);
+    clone_nonresident_tid_destination(false, CloneRefusal::Child);
 }
 
 #[test]
 fn arm_clone3_nonresident_tid_destination_publishes_once() {
-    clone_nonresident_tid_destination(true, false);
+    clone_nonresident_tid_destination(true, CloneRefusal::Child);
 }
 
 #[test]
 fn arm_clone_refused_parent_preserves_unattempted_child_output() {
-    clone_nonresident_tid_destination(false, true);
-    clone_nonresident_tid_destination(true, true);
+    clone_nonresident_tid_destination(false, CloneRefusal::Parent);
+    clone_nonresident_tid_destination(true, CloneRefusal::Parent);
+}
+
+#[test]
+fn arm_clone_preparation_fault_retires_completed_undo() {
+    clone_nonresident_tid_destination(false, CloneRefusal::ParentPreparationFault);
+    clone_nonresident_tid_destination(true, CloneRefusal::ParentPreparationFault);
 }
 
 #[cfg(test)]
-fn clone_nonresident_tid_destination(is_clone3: bool, refuse_parent: bool) {
+enum CloneRefusal {
+    Child,
+    Parent,
+    ParentPreparationFault,
+}
+
+#[cfg(test)]
+fn clone_nonresident_tid_destination(is_clone3: bool, refusal: CloneRefusal) {
+    let refuse_parent = !matches!(refusal, CloneRefusal::Child);
+    let preparation_fault = matches!(refusal, CloneRefusal::ParentPreparationFault);
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let (_peer_control, _peer_record) = imported_thread(fixture);
     let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
@@ -12145,14 +12160,32 @@ fn clone_nonresident_tid_destination(is_clone3: bool, refuse_parent: bool) {
         }))
     });
     crate::lifecycle::COPYOUT_REFUSE_RESTORE_AT.with(|address| address.set(Some(parent_tid_va)));
+    if preparation_fault {
+        crate::lifecycle::GUEST_COPY_PREPARATION_FAULT_AT
+            .with(|address| address.set(Some(parent_tid_va)));
+    }
     let first = arm_call(fixture, fixture.control, &mut service, &mut frame);
     crate::lifecycle::COPYOUT_REFUSE_RESTORE_AT.with(|address| address.set(None));
+    crate::lifecycle::GUEST_COPY_PREPARATION_FAULT_AT.with(|address| address.set(None));
     assert_eq!(
         first.unwrap(),
-        carrick_personality_linux::dispatch::CompletionRoute::Served
+        if preparation_fault {
+            carrick_personality_linux::dispatch::CompletionRoute::WithWork
+        } else {
+            carrick_personality_linux::dispatch::CompletionRoute::Served
+        }
     );
     assert!(!leader_sees_thread(fixture, &mut service, 43));
     assert_eq!(child_control.visible_tid(), None);
+    let parent_preimage = if preparation_fault {
+        assert_eq!(frame.x[0] as i64, -14);
+        // The failed syscall has returned. A peer's subsequent write may
+        // never be consumed by undo retained from that completed call.
+        tid_words.set(0, 0x4444_4444_u32);
+        0x4444_4444
+    } else {
+        0x1111_1111
+    };
     let child_preimage = if refuse_parent {
         // Publication never reached this destination. A live peer's update
         // while parent undo waits must survive; it belongs to no clone undo.
@@ -12182,7 +12215,7 @@ fn clone_nonresident_tid_destination(is_clone3: bool, refuse_parent: bool) {
     );
     assert_eq!(
         tid_words.get::<[u32; 2]>(0),
-        [0x1111_1111, child_preimage],
+        [parent_preimage, child_preimage],
         "is_clone3={is_clone3}: rollback restores only attempted output preimages"
     );
     assert!(!leader_sees_thread(fixture, &mut service, 43));

@@ -219,3 +219,10 @@ never an unreached destination. The refused-parent clone/clone3 witness lets
 a live peer change the unreached child word while parent undo waits; a later
 child-output refusal must preserve the peer's new preimage, not restore the
 word captured before the parent attempt.
+
+A terminal preparation error does not itself complete clone undo. Before
+returning that error, verify every still-owned destination has its original
+word or is unreadable, then retire the undo. A readable changed word that
+cannot be restored fails the rollback invariant. The preparation-EFAULT
+production witness performs a peer write after the failed syscall returns;
+a later clone must not restore any preimage from that completed call.
