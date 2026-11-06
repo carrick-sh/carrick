@@ -7501,6 +7501,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     fn is_root_process(&self) -> bool {
         NativeProcessEntry::is_root_process(self)
     }
+    fn owns_descriptor_namespace(&self) -> bool {
+        self.source.zone.record(self.record.id).is_native_owned()
+    }
     fn interrupt_pending_wait(&mut self) -> bool {
         let pending = self.signal_interrupts_current();
         if pending
@@ -14153,6 +14156,10 @@ mod tests {
                 let mut entry = runtime
                     .enter(source, &task, words(address), &mut service)
                     .unwrap();
+                assert!(
+                    !entry.owns_descriptor_namespace(),
+                    "borrowed host record keeps host mutation custody"
+                );
                 let LifecycleOutcome::Returned { result, .. } =
                     entry.fork(ProcessForkChildTid::vfork(UserVa::new(CHILD_STACK)))
                 else {
@@ -14206,6 +14213,10 @@ mod tests {
             let mut entry = runtime
                 .enter(source, &task, words(parent_address), &mut service)
                 .unwrap();
+            assert!(
+                entry.owns_descriptor_namespace(),
+                "native child owns its descriptor namespace"
+            );
             // The parent parks instead of returning the child's pid.
             let outcome = entry.fork(ProcessForkChildTid::vfork(UserVa::new(CHILD_STACK)));
             assert!(

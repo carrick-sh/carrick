@@ -2843,51 +2843,23 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         parent_table: u64,
         child_table: u64,
     ) -> Result<(), NativeProcessError> {
-        if !super::file_table::fork_fd_map(
+        super::file_table::fork_native_namespace(
             self.crossing.fd_map(),
             self.crossing.open_table(),
+            self.crossing.ipc_binding(),
             parent_table,
             child_table,
-        ) {
-            return Err(NativeProcessError::Exhausted);
-        }
-        if let Some((region, map)) = self.crossing.ipc_binding()
-            && let Some(parent) = map.lookup_authoritative(parent_table)
-        {
-            let result = region
-                .fork_descriptors(
-                    carrick_el1_abi::ipc::fd::TableId::from_raw(parent),
-                    &carrick_sched_core::ShortLockSpin,
-                    |child| {
-                        map.publish_owned(child_table, child.to_raw())
-                            .map_err(|_| carrick_el1_abi::ipc::fd::Error::NoMemory)
-                    },
-                )
-                .map_err(|_| NativeProcessError::Exhausted);
-            if let Err(error) = result {
-                super::file_table::retire_fd_map(
-                    self.crossing.fd_map(),
-                    self.crossing.open_table(),
-                    child_table,
-                );
-                return Err(error);
-            }
-        }
-        Ok(())
+        )
     }
     fn retire_fd_table(&mut self, table: u64) {
-        if let Some((region, map)) = self.crossing.ipc_binding()
-            && let Some(raw) = map.take_owned(table)
-        {
-            super::ipc::retire_namespace(
-                &region,
-                carrick_el1_abi::ipc::fd::TableId::from_raw(raw),
-                self.task,
-            )
-            .unwrap_or_else(|_| fatal());
-        }
-        super::file_table::retire_fd_map(self.crossing.fd_map(), self.crossing.open_table(), table);
-        self.task.linux.mark_pending_host_work();
+        super::file_table::retire_native_namespace(
+            self.crossing.fd_map(),
+            self.crossing.open_table(),
+            self.crossing.ipc_binding(),
+            table,
+            self.task,
+        )
+        .unwrap_or_else(|_| fatal());
     }
 }
 
