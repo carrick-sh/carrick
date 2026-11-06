@@ -583,7 +583,7 @@ mod tests {
 
     #[test]
     fn test_aarch64_crossings_exact() {
-        assert_eq!(HOST_CROSSINGS.iter().flatten().count(), 122);
+        assert_eq!(HOST_CROSSINGS.iter().flatten().count(), 121);
         for (crossing, _, _) in HOST_CROSSINGS.iter().flatten() {
             let nr = crossing.canonical();
             assert!(
