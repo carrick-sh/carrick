@@ -3629,10 +3629,7 @@ impl HvfTaskState {
                     carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
                 )
             })
-            .flatten()
-            .ok_or_else(|| {
-                TrapError::Hypervisor("HVPatch COW page-table backing is absent".to_owned())
-            })?;
+            .flatten();
         // Reuse grants write to the span's leaves without repointing them, so
         // every 4 KiB page of the span must already name the old frame at its
         // offset (a valid or retained-output leaf). A page with no output at
@@ -3646,6 +3643,9 @@ impl HvfTaskState {
             CowWriteRoute::Copy
         };
         if route == CowWriteRoute::ReuseSoleOwner {
+            let page_table_host = page_table_host.ok_or_else(|| {
+                TrapError::Hypervisor("HVPatch COW page-table backing is absent".to_owned())
+            })?;
             // The writer is the frame's only owner: no copy, no new frame, no
             // inventory or alias change; its leaves become writable in place.
             drop(old_source.take());
@@ -4071,6 +4071,12 @@ impl HvfTaskState {
                 // same exact-leaf receipt consumed by the later protection
                 // publication, after authenticating EL1's completion.
                 if frame_cow_preserves_guest_protection(intent) {
+                    let page_table_host = page_table_host.unwrap_or_else(|| {
+                        carrick_fatal!(
+                            "hvpatch::cow",
+                            "completed internal guest COW has no page-table backing"
+                        )
+                    });
                     let live = tables
                         .with_manager(|manager| {
                             let resolver =
@@ -4106,6 +4112,9 @@ impl HvfTaskState {
                 Ok(())
             })()
         } else {
+            let page_table_host = page_table_host.ok_or_else(|| {
+                TrapError::Hypervisor("HVPatch COW page-table backing is absent".to_owned())
+            })?;
             const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000;
             const AP_MASK: u64 = 0b11 << 6;
             const AP_USER_RW: u64 = 0b01 << 6;
@@ -4275,6 +4284,9 @@ impl HvfTaskState {
         };
         if let Err(error) = page_table_result {
             if !guest_lane {
+                let page_table_host = page_table_host.unwrap_or_else(|| {
+                    carrick_fatal!("hvpatch::cow", "host COW rollback lost page-table backing")
+                });
                 let _ = self.page_tables_authority().edit(
                     || Err(()),
                     |manager| {
