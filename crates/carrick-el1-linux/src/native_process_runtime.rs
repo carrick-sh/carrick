@@ -3720,15 +3720,15 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         words: &C,
         service: &'r mut S,
     ) -> Result<Box<NativeProcessEntry<'r, 'a, M, C, S>>, NativeProcessError> {
-        let (
+        let AuthenticatedProcessEntry {
             binding,
             record,
-            member_control,
+            control: member_control,
             process,
             calling_tid,
             owner_continuation,
             relative_futex_pending,
-        ) = self.authenticate_registered(registry, source, current, address, words)?;
+        } = self.authenticate_registered(registry, source, current, address, words)?;
         Ok(Box::new(NativeProcessEntry {
             runtime: self,
             source,
@@ -3770,18 +3770,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         current: &'a CurrentTask,
         address: AddressContext<RootGpa>,
         words: &C,
-    ) -> Result<
-        (
-            ExecutionBinding,
-            RecordRef,
-            &'a ThreadControlSlot,
-            TaskKey,
-            u32,
-            bool,
-            bool,
-        ),
-        NativeProcessError,
-    > {
+    ) -> Result<AuthenticatedProcessEntry<'a>, NativeProcessError> {
         if !core::ptr::eq(source.zone, self.zone) {
             return Err(NativeProcessError::Stale);
         }
@@ -3857,15 +3846,15 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .member(&record_ref)
             .is_some_and(|state| state.futex.is_some());
         drop(graph);
-        Ok((
+        Ok(AuthenticatedProcessEntry {
             binding,
-            record_ref,
-            member_control,
-            member.process,
+            record: record_ref,
+            control: member_control,
+            process: member.process,
             calling_tid,
             owner_continuation,
             relative_futex_pending,
-        ))
+        })
     }
     /// The cwd and root of the root's child `visible`, or of the root.
     #[cfg(test)]
@@ -4035,6 +4024,18 @@ impl<'a> NativeServiceCall<'a> {
     ) -> Self {
         Self { ordinal, counters }
     }
+}
+
+/// The authenticated graph snapshot used to construct one process entry.
+/// Captured presence hints do not own or duplicate the member's operations.
+struct AuthenticatedProcessEntry<'a> {
+    binding: ExecutionBinding,
+    record: RecordRef,
+    control: &'a ThreadControlSlot,
+    process: TaskKey,
+    calling_tid: u32,
+    owner_continuation: bool,
+    relative_futex_pending: bool,
 }
 
 pub struct NativeProcessEntry<

@@ -12354,7 +12354,7 @@ fn futex_owner_wait(timed: bool, synchronous: bool, interrupted: bool) {
     crate::sched::ThreadCpu::load(&mut cpu, &mut frame, &retained);
     if timed {
         // The SVC entry overwrites FAR. A retry may only use operation custody.
-        frame.far = 0xfeed_bad;
+        frame.far = 0x0fee_dbad;
         cpu.now = 101;
         let mut entry = runtime
             .enter_registered(
@@ -12414,7 +12414,7 @@ fn futex_owner_wait(timed: bool, synchronous: bool, interrupted: bool) {
             );
             assert_eq!(frame.elr, 0x700000, "the real handler must be selected");
             crate::sched::ThreadCpu::load(&mut cpu, &mut frame, &parked);
-            frame.far = 0xfeed_bad;
+            frame.far = 0x0fee_dbad;
             let _route_after_signal = crate::dispatch::dispatch_syscall_with_native(
                 &mut frame,
                 &counters,
