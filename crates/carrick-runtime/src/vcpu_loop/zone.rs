@@ -30,7 +30,7 @@ use carrick_hal::threaded::GuestCpuState;
 use carrick_kernel::el1_zone::HostLockWait;
 
 fn load_zone_futex_word(
-    memory: &impl carrick_guest_mem::GuestMemory,
+    memory: &impl carrick_guest_mem::CurrentMmMemory,
     address: u64,
 ) -> Result<u32, carrick_guest_mem::MemoryError> {
     memory.atomic_load_user_u32(address)
@@ -81,6 +81,8 @@ mod futex_word_tests {
     use carrick_guest_mem::{GuestMemory, MemoryError};
 
     struct OwnerWord;
+
+    impl carrick_guest_mem::CurrentMmMemory for OwnerWord {}
 
     impl GuestMemory for OwnerWord {
         fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
