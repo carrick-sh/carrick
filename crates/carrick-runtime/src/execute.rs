@@ -1,9 +1,9 @@
 //! Runtime execution entry points that bridge shared run specs to
 //! dispatcher-backed guest execution.
 
+use crate::memory::AddressSpaceError;
 use carrick_kernel::dispatch::SyscallDispatcher;
 use carrick_kernel::network::NetworkHostsEntry;
-#[cfg(any(test, feature = "platform-macos"))]
 use carrick_kernel::run_result::{RunResult, RuntimeError};
 #[cfg(feature = "fs-memory")]
 use carrick_spec::FsBackendKind;
@@ -20,7 +20,6 @@ use std::path::PathBuf;
 /// could not be found/read. The runc/shell convention is to exit 127 for that —
 /// `docker run img /nope` and `sh -c nope` both yield 127 — not the generic 1 a
 /// propagated error would produce.
-#[cfg(any(test, feature = "platform-macos"))]
 pub(crate) fn is_entrypoint_not_found(e: &RuntimeError) -> bool {
     matches!(
         e,
@@ -30,7 +29,6 @@ pub(crate) fn is_entrypoint_not_found(e: &RuntimeError) -> bool {
 }
 
 /// A 127 ("command not found") result for a failed entrypoint load.
-#[cfg(any(test, feature = "platform-macos"))]
 pub(crate) fn entrypoint_not_found_result() -> RunResult {
     RunResult {
         exit_code: 127,
@@ -49,7 +47,6 @@ pub(crate) fn entrypoint_not_found_result() -> RunResult {
 /// permission denial (EACCES). The runc/shell convention is to exit 126 for
 /// that — `docker run img /etc/hostname` yields 126 — distinct from 127 (not
 /// found) and the generic 1 a propagated error would produce.
-#[cfg(any(test, feature = "platform-macos"))]
 pub(crate) fn is_entrypoint_not_executable(e: &RuntimeError) -> bool {
     match e {
         // A file that isn't a loadable AArch64 ELF (wrong magic, truncated,
@@ -68,7 +65,6 @@ pub(crate) fn is_entrypoint_not_executable(e: &RuntimeError) -> bool {
 
 /// A 126 ("command found but not executable") result for an entrypoint that
 /// exists but cannot be loaded/exec'd.
-#[cfg(any(test, feature = "platform-macos"))]
 pub(crate) fn entrypoint_not_executable_result() -> RunResult {
     RunResult {
         exit_code: 126,
@@ -683,4 +679,67 @@ mod exit_code_tests {
             backend.metadata("/bin")
         );
     }
+}
+
+pub(crate) struct InitialEntrypoint {
+    pub path: String,
+    pub bytes: Vec<u8>,
+    pub argv: Vec<Vec<u8>>,
+}
+
+/// Resolve and bind the initial image once, independent of the carrier ISA.
+/// Keep the original cmdline while executable identity follows the resolved ELF.
+pub(crate) fn prepare_initial_entrypoint(
+    dispatcher: &SyscallDispatcher,
+    context: &carrick_kernel::kernel::KernelContext,
+    path: &str,
+    argv: Vec<String>,
+    env: &[String],
+) -> Result<InitialEntrypoint, RuntimeError> {
+    let argv_for_cmdline = argv.clone();
+    let argv_bytes: Vec<Vec<u8>> = argv.into_iter().map(String::into_bytes).collect();
+    let resolved_entry = dispatcher.with_kernel_credentials(context, || {
+        carrick_kernel::exec_helpers::resolve_entrypoint_program(path, env, argv_bytes, dispatcher)
+    });
+    let (resolved, argv) = resolved_entry.map_err(|_| {
+        RuntimeError::AddressSpace(AddressSpaceError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            path.to_owned(),
+        )))
+    })?;
+    // /proc/self/cmdline reflects the user's argv, but /proc/self/exe MUST be the
+    // RESOLVED absolute binary path — real Linux always stores the resolved path.
+    // A bare `uname` would otherwise absolutize to `/uname` (cwd-relative) and
+    // break anything that opens /proc/self/exe: Apple Rosetta opens it to find its
+    // x86 target ("rosetta error: Unable to open /proc/self/exe"), and uutils-
+    // coreutils (Ubuntu 26.04) derives its locale dir from it. Identity is set
+    // AFTER resolution so the recorded exe is the real binary, not the bare name.
+    let path: &str = &resolved;
+    let executable_source = dispatcher
+        .with_kernel_credentials(context, || dispatcher.acquire_exec_source(context, path))
+        .map_err(|error| {
+            let error = match error {
+                carrick_kernel::dispatch::executable_authority::ExecSourceError::Linux(errno) => {
+                    std::io::Error::from_raw_os_error(errno.get())
+                }
+                carrick_kernel::dispatch::executable_authority::ExecSourceError::Host(error) => {
+                    error
+                }
+            };
+            RuntimeError::AddressSpace(AddressSpaceError::Io(error))
+        })?;
+    let bytes = executable_source
+        .read_all()
+        .map_err(AddressSpaceError::Io)?;
+    dispatcher.set_executable_identity_with_source(
+        resolved.clone(),
+        argv_for_cmdline,
+        env.iter().map(|s| s.as_bytes().to_vec()).collect(),
+        executable_source,
+    );
+    Ok(InitialEntrypoint {
+        path: resolved,
+        bytes,
+        argv,
+    })
 }
