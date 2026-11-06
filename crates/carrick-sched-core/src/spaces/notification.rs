@@ -307,6 +307,8 @@ struct ResourceRelease<'a, 'z, 'c, C: Copy + Send + Sync + zerocopy::FromZeros =
 }
 impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for ResourceRelease<'_, '_, '_, C> {
     fn drop(&mut self) {
+        #[cfg(test)]
+        tests::before_resource_unlock();
         self.word.store(self.unlocked.word(), Ordering::SeqCst);
         for publication in &mut self.publications {
             if let Some(publication) = publication.take() {
@@ -766,6 +768,15 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> core::ops::Deref for SpaceAcce
 mod tests {
     use super::*;
     use crate::BoundedSpin;
+    std::thread_local! {
+        static BEFORE_RESOURCE_UNLOCK: std::cell::RefCell<Option<std::boxed::Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+    pub(super) fn before_resource_unlock() {
+        let hook = BEFORE_RESOURCE_UNLOCK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
     fn zone() -> std::boxed::Box<ZoneTables> {
         let ptr = unsafe { std::alloc::alloc_zeroed(std::alloc::Layout::new::<ZoneTables>()) };
         assert!(!ptr.is_null());
@@ -1260,6 +1271,146 @@ mod tests {
             before,
             "closing source refuses before claiming editor"
         );
+    }
+    #[test]
+    fn actual_resource_refusal_during_final_release_cannot_park_after_it() {
+        use crate::object_wait::OperationToken;
+        use std::sync::{Arc, Mutex};
+        for cause in SpaceWaitCause::ALL {
+            let zone: Arc<ZoneTables> = Arc::from(zone());
+            let entry = admitted(&zone);
+            let lease = entry.notifications(NonZeroU64::new(1).unwrap()).unwrap();
+            let word = Arc::new(AtomicU64::new(1));
+            let observed = Arc::new(Mutex::new(None));
+            let observer_zone = zone.clone();
+            let observer_word = word.clone();
+            let observer_result = observed.clone();
+            BEFORE_RESOURCE_UNLOCK.with(|slot| {
+                *slot.borrow_mut() = Some(std::boxed::Box::new(move || {
+                    let entry = observer_zone
+                        .space_entry(NonZeroU64::new(77).unwrap())
+                        .unwrap();
+                    let lease = entry.notifications(NonZeroU64::new(1).unwrap()).unwrap();
+                    let snapshot = lease.observe(cause);
+                    assert_eq!(
+                        observer_word.compare_exchange(0, 2, Ordering::SeqCst, Ordering::SeqCst),
+                        Err(1)
+                    );
+                    *observer_result.lock().unwrap() = Some(snapshot);
+                }));
+            });
+            // The production release entry point owns the real notification
+            // stream and the exclusively held resource word.
+            unsafe {
+                lease.release_resource(
+                    access(&zone).venue().unwrap(),
+                    &word,
+                    ResourceUnlocked::Plain,
+                    &[cause],
+                );
+            }
+            assert_eq!(word.load(Ordering::SeqCst), 0);
+            let snapshot = observed.lock().unwrap().take().unwrap();
+            let record = zone
+                .alloc_record(crate::ThreadIdentity {
+                    tid: 77,
+                    serial: 1,
+                    mm: 77,
+                    file_table: 1,
+                    generation: 1,
+                    affinity_source: crate::AffinitySource::UNBOUND,
+                    affinity: 0,
+                    lifecycle_page: 0,
+                    control_slot: 0,
+                })
+                .unwrap();
+            let complete = |effects: OwnedObjectWakeEffects<'_>| {
+                let _ = effects.deliver_handbacks(&mut |_| {});
+            };
+            let result = lease.reserve(cause).park_host_rechecked(
+                snapshot,
+                record,
+                OperationToken::new(77, 1).unwrap(),
+                &complete,
+                || lease.is_live(),
+            );
+            let Err((error, operation)) = result else {
+                panic!("owner parked after the final {cause:?} release with no producer");
+            };
+            assert_eq!(error, ObjectWaitError::Changed);
+            assert_eq!(operation.index(), 77);
+            assert!(!zone.record(record).has_object_operation());
+            entry.retire_entry(access(&zone).venue().unwrap());
+        }
+    }
+    #[test]
+    fn actual_editor_refusal_during_final_release_cannot_park_after_it() {
+        use crate::object_wait::OperationToken;
+        use std::sync::{Arc, Mutex};
+        let zone: Arc<ZoneTables> = Arc::from(zone());
+        let entry = admitted(&zone);
+        let spaces = access(&zone);
+        spaces.open(entry.index());
+        let editor = spaces
+            .try_begin_edit(entry.index(), 77, NonZeroU64::new(1).unwrap())
+            .unwrap();
+        let observed = Arc::new(Mutex::new(None));
+        let observer_zone = zone.clone();
+        let observer_result = observed.clone();
+        super::super::editor_test_hook::install_before_release(move || {
+            let entry = observer_zone
+                .space_entry(NonZeroU64::new(77).unwrap())
+                .unwrap();
+            let lease = entry.notifications(NonZeroU64::new(1).unwrap()).unwrap();
+            let snapshot = lease.observe(SpaceWaitCause::Editor);
+            assert!(matches!(
+                observer_zone.spaces.try_begin_edit_cause(
+                    entry.index(),
+                    77,
+                    NonZeroU64::new(2).unwrap(),
+                    access(&observer_zone).venue()
+                ),
+                Err(super::super::EditAdmissionRefusal::Editor)
+            ));
+            *observer_result.lock().unwrap() = Some(snapshot);
+        });
+        // Drive the actual editor destructor. The hook schedules a second
+        // owner's observe/refuse between revision publication and unlock.
+        drop(editor);
+        let lease = entry.notifications(NonZeroU64::new(1).unwrap()).unwrap();
+        let snapshot = observed.lock().unwrap().take().unwrap();
+        let record = zone
+            .alloc_record(crate::ThreadIdentity {
+                tid: 77,
+                serial: 1,
+                mm: 77,
+                file_table: 1,
+                generation: 1,
+                affinity_source: crate::AffinitySource::UNBOUND,
+                affinity: 0,
+                lifecycle_page: 0,
+                control_slot: 0,
+            })
+            .unwrap();
+        let complete = |effects: OwnedObjectWakeEffects<'_>| {
+            let _ = effects.deliver_handbacks(&mut |_| {});
+        };
+        let operation = OperationToken::new(77, 1).unwrap();
+        let result = lease.reserve(SpaceWaitCause::Editor).park_host_rechecked(
+            snapshot,
+            record,
+            operation,
+            &complete,
+            || lease.is_live(),
+        );
+        let Err((error, operation)) = result else {
+            panic!("owner parked after the final editor release with no producer");
+        };
+        assert_eq!(error, ObjectWaitError::Changed);
+        assert_eq!(operation.index(), 77);
+        assert!(!zone.record(record).has_object_operation());
+        spaces.close(entry.index());
+        entry.retire_entry(access(&zone).venue().unwrap());
     }
     #[test]
     fn actual_editor_release_under_held_queue_delivers_only_after_unlock() {

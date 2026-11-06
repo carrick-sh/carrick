@@ -911,6 +911,8 @@ surfaces = [
   { path = "crates/carrick-sched-core/src/refusal.rs", contract = "kernel.memory.owner-wait" },
   { path = "crates/carrick-sched-core/src/spaces.rs", contract = "kernel.el1.address-space-switch" },
   { path = "crates/carrick-sched-core/src/spaces.rs", contract = "kernel.el1.stage1-publication" },
+  { path = "crates/carrick-sched-core/src/spaces.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-sched-core/src/spaces/notification.rs", contract = "kernel.memory.owner-wait" },
   { path = "crates/carrick-sched-core/src/tests.rs", contract = "kernel.el1.deferred-handback-identity" },
   { path = "crates/carrick-sched-core/src/tests.rs", contract = "kernel.el1.futex-handoff" },
   { path = "crates/carrick-sched-core/src/tests.rs", contract = "kernel.el1.guest-run-queue" },
