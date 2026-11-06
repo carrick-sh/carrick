@@ -10398,7 +10398,14 @@ fn native_fork_descriptor_calls(constructor: Option<u64>) {
     if let Some(nr) = constructor {
         use carrick_personality_linux::crossing::nr as sys;
         let output = carrick_test_support::GuestUserBuffer::zeroed(8);
-        let flags = carrick_syscall_abi::LINUX_O_CLOEXEC;
+        // Every follow-up read is nonblocking: an empty or miswired object
+        // must fail an assertion instead of parking this fixture indefinitely.
+        let flags = carrick_syscall_abi::LINUX_O_CLOEXEC
+            | if nr == sys::EPOLL_CREATE1.raw() {
+                0
+            } else {
+                LINUX_O_NONBLOCK
+            };
         let args = if nr == sys::PIPE2.raw() {
             [output.arg(), flags, 0]
         } else if nr == sys::EVENTFD2.raw() {
@@ -10423,7 +10430,91 @@ fn native_fork_descriptor_calls(constructor: Option<u64>) {
             // Test the production family entry. Forward here is the missing
             // ring implementation: native_unstaged_exit subsequently lowers
             // this exact child call to counted ENOSYS (-38).
-            results.push((route, result, output.as_bytes().to_vec()));
+            let pair = output.as_bytes().to_vec();
+            // Check completion before using the return as a descriptor. Each
+            // functional check runs while this child is still the active task.
+            assert!(
+                matches!(route, CompletionRoute::Served | CompletionRoute::WithWork),
+                "child {idx} constructor {nr} must be served in ring, got {route:?} ({result})"
+            );
+            assert!(
+                result >= 0,
+                "child {idx} constructor {nr} errno {}",
+                -result
+            );
+            let completed = |ordinal, arguments| {
+                let (route, result) = run_in_child(idx, ordinal, arguments);
+                assert!(
+                    matches!(route, CompletionRoute::Served | CompletionRoute::WithWork),
+                    "child {idx} follow-up {ordinal} must be served in ring, got {route:?} ({result})"
+                );
+                result
+            };
+            if nr == sys::PIPE2.raw() {
+                assert_eq!(result, 0);
+                let read = u64::from(u32::from_ne_bytes(pair[..4].try_into().unwrap()));
+                let write = u64::from(u32::from_ne_bytes(pair[4..].try_into().unwrap()));
+                let payload = carrick_test_support::GuestUserBuffer::from_bytes(b"new pipe");
+                let received = carrick_test_support::GuestUserBuffer::zeroed(8);
+                assert_eq!(completed(sys::READ.raw(), [read, received.arg(), 8]), -11);
+                assert_eq!(completed(sys::WRITE.raw(), [write, payload.arg(), 8]), 8);
+                assert_eq!(completed(sys::READ.raw(), [read, received.arg(), 8]), 8);
+                assert_eq!(received.as_bytes(), payload.as_bytes());
+                assert_eq!(completed(sys::READ.raw(), [read, received.arg(), 8]), -11);
+                assert_ne!(
+                    completed(sys::FCNTL.raw(), [read, LINUX_F_GETFL, 0]) & LINUX_O_NONBLOCK as i64,
+                    0
+                );
+                assert_ne!(
+                    completed(sys::FCNTL.raw(), [write, LINUX_F_GETFL, 0])
+                        & LINUX_O_NONBLOCK as i64,
+                    0
+                );
+            } else if nr == sys::EVENTFD2.raw() {
+                let fd = result as u64;
+                let received = carrick_test_support::GuestUserBuffer::zeroed(8);
+                assert_eq!(completed(sys::READ.raw(), [fd, received.arg(), 8]), 8);
+                assert_eq!(
+                    u64::from_ne_bytes(received.as_bytes().try_into().unwrap()),
+                    7
+                );
+                assert_eq!(completed(sys::READ.raw(), [fd, received.arg(), 8]), -11);
+                let value = carrick_test_support::GuestUserBuffer::from_value(23u64);
+                assert_eq!(completed(sys::WRITE.raw(), [fd, value.arg(), 8]), 8);
+                assert_eq!(completed(sys::READ.raw(), [fd, received.arg(), 8]), 8);
+                assert_eq!(
+                    u64::from_ne_bytes(received.as_bytes().try_into().unwrap()),
+                    23
+                );
+                assert_ne!(
+                    completed(sys::FCNTL.raw(), [fd, LINUX_F_GETFL, 0]) & LINUX_O_NONBLOCK as i64,
+                    0
+                );
+            } else if nr == sys::EPOLL_CREATE1.raw() {
+                // The unused argument registers are zero, including timeout
+                // and signal mask. An empty instance must return immediately.
+                let events = carrick_test_support::GuestUserBuffer::from_bytes(&[0xa5; 16]);
+                assert_eq!(
+                    completed(sys::EPOLL_PWAIT.raw(), [result as u64, events.arg(), 1]),
+                    0
+                );
+                assert_eq!(events.as_bytes(), &[0xa5; 16]);
+            } else {
+                // A timer constructor must publish a usable, disarmed timer,
+                // not just an fd. This does not prove arming or clock identity.
+                let spec = carrick_test_support::GuestUserBuffer::from_bytes(&[0xa5; 32]);
+                assert_eq!(
+                    completed(sys::TIMERFD_GETTIME.raw(), [result as u64, spec.arg(), 0]),
+                    0
+                );
+                assert_eq!(spec.as_bytes(), &[0; 32]);
+                let received = carrick_test_support::GuestUserBuffer::zeroed(8);
+                assert_eq!(
+                    completed(sys::READ.raw(), [result as u64, received.arg(), 8]),
+                    -11
+                );
+            }
+            results.push((route, result, pair));
         }
         let mut backings = Vec::new();
         for (idx, (route, result, pair)) in results.into_iter().enumerate() {

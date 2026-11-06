@@ -60,3 +60,30 @@ The VM-free witnesses do not prove guest instructions, backing supply,
 signed ARM execution, x86 execution or Go build. Those higher-layer bindings,
 constructor refusal/rollback schedules and deterministic work budgets remain
 required before acceptance.
+
+## Functional witness requirements
+
+The constructor bindings now require usable objects before switching away from
+one child to the other. Pipe creation must support an eight-byte round trip,
+then return EAGAIN (11) on an empty nonblocking read. Eventfd must return its
+initial value (7), become empty, then accept and return a new value (23).
+Both pipe ends and eventfd must expose O_NONBLOCK through production fcntl.
+An empty epoll must complete a zero-timeout wait without changing the event
+buffer. A new timerfd must report a zero itimerspec and return EAGAIN (11)
+for a nonblocking read while disarmed. All follow-up calls use the same
+production native-process dispatch entry as the constructors.
+
+These follow-up assertions are prospective: the current constructor refusal
+stops each test before they execute. They therefore add no green backing,
+readiness or clock-domain evidence. In particular, the disarmed timer check
+does not prove arming, expiry counts, time-namespace identity or wakeups;
+the empty epoll check does not prove member add/modify/delete or readiness.
+Those functional schedules, constructor rollback and Busy-once resumption
+remain necessary. No timeout, retry or wider route is introduced here.
+
+The timer migration changes the shared IPC record layout and clock authority
+interface. Under AGENTS.md, those ABI/interface choices require a separate
+design review before implementation. The existing host TimerFdState cannot
+be placed in shared ring memory: it contains host mutex/condition-variable,
+Arc clock-domain and wait-queue references, and change-listener callbacks.
+Moving only its counter arithmetic does not establish a ring-owned timer.
