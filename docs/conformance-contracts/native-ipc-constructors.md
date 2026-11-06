@@ -66,8 +66,9 @@ the authority's release notification.
 Pipe construction must prepare owner-aware user output before effects, use
 `SlotTableTransaction::install_pair` for atomic publication, and settle both
 endpoint descriptions on failed publication or genuine copyout fault.
-Allocation/cleanup must account for retained pipe storage; the current
-`create_pipe` API explicitly returns storage requiring host retirement.
+Allocation/cleanup must account for retained pipe storage. `create_pipe`
+now retains a too-small extent on its object; it no longer returns storage
+requiring host retirement at construction.
 No object/table lock may survive user copy, service, or suspension.
 
 Timerfd needs one shared, pointer-free timer authority, with host users moved
@@ -157,3 +158,23 @@ establish that the root's full existing epoll surface is preserved. Do not
 land it without resolving those findings and obtaining confirming review
 and signed proof. No Go-build or guest-execution claim follows from the
 VM-free results.
+
+## Pipe storage prerequisite
+
+The shared `IpcRegion::create_pipe` entry can now run in either venue without
+returning host allocator work. Reuse keeps a fitting ring. An undersized ring
+stays attached to its object while the pipe is unbacked, and the existing host
+replacement operation returns that extent exactly once for reclamation.
+Stock supply refuses before taking a ring if replacement would need to reclaim
+an old extent. The existing host first-write supply owns that replacement.
+No second allocator, shared-record layout or lock order is introduced.
+
+The existing storage lifecycle witness was red because creation detached the
+old extent. It now checks retained identity, an effect-free write refusal,
+replacement custody and an unspent stock ring. The bound remains one retained
+extent per object; creation allocates no backing and does no storage copy.
+This prerequisite does not serve the pipe2 syscall. Its root and child
+constructor witnesses remain red. Pair publication must still retain both
+endpoint descriptions across output preparation, owner waits, genuine copy
+fault rollback, table/OFD/object growth and scheduler wait-key admission.
+A completed-answer copyout alone cannot own those constructor resources.

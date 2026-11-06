@@ -141,9 +141,8 @@ impl Fixture {
     /// What the host venue does for pipe(2): one object, two descriptions,
     /// then (as the host's first write would) the pipe's ring.
     fn pipe(&self, table: TableId) -> (Fd, Fd, IpcObjectHandle) {
-        let mut retired = None;
-        let object = self.region.create_pipe(65536, &mut retired, &Spin).unwrap();
-        if retired.is_none() {
+        let object = self.region.create_pipe(65536, &Spin).unwrap();
+        {
             let mut storage = self.pipe_storage();
             let mut guard = self.region.lock(object, &Spin).unwrap();
             if !guard.provide_pipe_storage(&mut storage).unwrap() {
@@ -560,9 +559,7 @@ fn el1_ipc_storage_refusals_roll_back_and_free_records_keep_storage() {
     // A fresh record needs no storage: the pipe starts unbacked, and its
     // first write refuses before any effect (EL1 forwards; the host
     // provides the ring). Out-of-pool storage fails closed, nothing kept.
-    let mut none = None;
-    let unbacked = fx.region.create_pipe(65536, &mut none, &Spin).unwrap();
-    assert_eq!(none, None);
+    let unbacked = fx.region.create_pipe(65536, &Spin).unwrap();
     let mut g = fx.region.lock(unbacked, &Spin).unwrap();
     assert_eq!(g.pipe().unwrap().capacity(), 65536);
     assert!(!g.pipe().unwrap().is_backed());
@@ -618,10 +615,8 @@ fn el1_ipc_storage_refusals_roll_back_and_free_records_keep_storage() {
     fx.finish(fx.host().close(t, r).unwrap());
     fx.finish(fx.host().close(t, w).unwrap());
     // The freed record kept its storage: a new pipe reuses it.
-    let mut none = None;
-    let reused = fx.region.create_pipe(65536, &mut none, &Spin).unwrap();
+    let reused = fx.region.create_pipe(65536, &Spin).unwrap();
     assert_eq!(reused.index(), object.index());
-    assert_eq!(none, None);
     assert!(
         fx.region
             .lock(reused, &Spin)
@@ -1270,38 +1265,63 @@ fn el1_ipc_host_wake_index_spans_every_segment_without_scanning() {
 /// A too-small extent remains with the object until the host replaces it.
 #[test]
 fn el1_ipc_too_small_retained_ring_stays_owned_until_replacement() {
-    let fx = fixture(4 << 20);
-    let t = fx.table();
-    let (r, w, object) = fx.pipe(t);
-    let kept = fx.region.lock(object, &Spin).unwrap().storage();
-    fx.finish(fx.host().close(t, r).unwrap());
-    fx.finish(fx.host().close(t, w).unwrap());
-    let mut retired = None;
-    let big = fx.region.create_pipe(1 << 20, &mut retired, &Spin).unwrap();
-    assert_eq!(big.index(), object.index());
-    assert_eq!(
-        retired, None,
-        "construction cannot hand storage to a host allocator"
+    let fx = fixture(1 << 20);
+    let object = fx.region.create_pipe(8192, &Spin).unwrap();
+    let mut small = fx.pipe_storage();
+    small.ring_bytes = 8192;
+    small.pages = 2;
+    let kept = small;
+    assert!(
+        fx.region
+            .lock(object, &Spin)
+            .unwrap()
+            .provide_pipe_storage(&mut small)
+            .unwrap()
     );
-    let mut g = fx.region.lock(big, &Spin).unwrap();
+    for end in [End::Reader, End::Writer] {
+        fx.region
+            .release_backing(IpcBacking::Pipe { object, end }.encode(), &Spin)
+            .unwrap();
+    }
+    let pipe = fx.region.create_pipe(65536, &Spin).unwrap();
+    assert_eq!(pipe.index(), object.index());
+    let stocked = fx.pipe_storage();
+    fx.region.stock_ring(stocked).unwrap();
+    let mut g = fx.region.lock(pipe, &Spin).unwrap();
     assert_eq!(g.storage(), kept);
-    assert_eq!(g.pipe().unwrap().capacity(), 1 << 20);
+    assert_eq!(g.pipe().unwrap().capacity(), 65536);
     assert!(!g.pipe().unwrap().is_backed());
     assert_eq!(
         g.pipe().unwrap().try_write(b"x").result,
         Err(pipe::Error::Storage)
     );
-    let mut replacement = IpcPipeStorage {
-        offset: fx.next.get(),
-        ring_bytes: 1 << 20,
-        pages: (1 << 20) / IPC_PIPE_PAGE_SIZE as u64,
-    };
+    assert_eq!(
+        g.provide_ring_from_stock(),
+        Ok(false),
+        "old extent still needs its allocator"
+    );
+    assert_eq!(g.storage(), kept);
+    let mut replacement = fx.pipe_storage();
     assert_eq!(g.provide_pipe_storage(&mut replacement), Ok(true));
     assert_eq!(
         replacement, kept,
         "replacement transfers the old extent exactly once"
     );
     assert_eq!(g.pipe().unwrap().try_write(b"x").result, Ok(1));
+    assert_eq!(g.provide_pipe_storage(&mut replacement), Ok(false));
+    assert_eq!(
+        replacement, kept,
+        "an already-backed pipe does not consume or return another extent"
+    );
+    drop(g);
+    let other = fx.region.create_pipe(65536, &Spin).unwrap();
+    let mut g = fx.region.lock(other, &Spin).unwrap();
+    assert_eq!(g.provide_ring_from_stock(), Ok(true));
+    assert_eq!(
+        g.storage(),
+        stocked,
+        "refusal did not spend the stocked ring"
+    );
 }
 
 /// The ring stock holds only default-capacity rings inside the pool, is
@@ -1321,9 +1341,8 @@ fn el1_ipc_ring_stock_is_bounded_and_spent_only_on_first_writes() {
     assert_eq!(fx.region.stock_ring(outside), Err(outside));
     let stocked = fx.pipe_storage();
     assert_eq!(fx.region.stock_ring(stocked), Ok(()));
-    let mut none = None;
-    let pipe = fx.region.create_pipe(65536, &mut none, &Spin).unwrap();
-    let big = fx.region.create_pipe(1 << 20, &mut none, &Spin).unwrap();
+    let pipe = fx.region.create_pipe(65536, &Spin).unwrap();
+    let big = fx.region.create_pipe(1 << 20, &Spin).unwrap();
     let mut g = fx.region.lock(big, &Spin).unwrap();
     assert_eq!(g.provide_ring_from_stock(), Ok(false), "sized by the host");
     drop(g);
@@ -1332,7 +1351,7 @@ fn el1_ipc_ring_stock_is_bounded_and_spent_only_on_first_writes() {
     assert_eq!(g.storage(), stocked);
     assert_eq!(g.provide_ring_from_stock(), Ok(true), "already backed");
     drop(g);
-    let other = fx.region.create_pipe(65536, &mut none, &Spin).unwrap();
+    let other = fx.region.create_pipe(65536, &Spin).unwrap();
     let mut g = fx.region.lock(other, &Spin).unwrap();
     assert_eq!(g.provide_ring_from_stock(), Ok(false), "stock empty");
     assert!(g.pipe().unwrap().release(End::Reader).result.is_ok());
@@ -1386,8 +1405,7 @@ fn el1_ipc_pool_areas_are_type_stable() {
         pages: 16,
     };
     assert_eq!(fx.region.stock_ring(ring), Err(ring));
-    let mut retired = None;
-    let pipe = fx.region.create_pipe(65536, &mut retired, &Spin).unwrap();
+    let pipe = fx.region.create_pipe(65536, &Spin).unwrap();
     let mut g = fx.region.lock(pipe, &Spin).unwrap();
     let mut misplaced = ring;
     assert_eq!(

@@ -802,14 +802,7 @@ impl HostIpc {
     /// first write ([`HostIpc::ensure_pipe_storage`]), as Linux allocates
     /// pipe pages on demand.
     pub fn create_pipe(&self, capacity: usize) -> Result<IpcObjectHandle, AdmissionError> {
-        let mut retired = None;
-        let object =
-            self.with_object(|region| region.create_pipe(capacity, &mut retired, &HostLockWait));
-        // A reused record's too-small ring, detached after the object lock.
-        if let Some(retired) = retired {
-            self.rings.lock().release(retired.offset);
-        }
-        let object = object?;
+        let object = self.with_object(|region| region.create_pipe(capacity, &HostLockWait))?;
         self.bind_waits(object);
         self.top_up_ring_stock();
         Ok(object)

@@ -2020,13 +2020,7 @@ mod tests {
         }
         /// A new pipe object before any write: no ring yet.
         fn unbacked_pipe_object(&self) -> IpcObjectHandle {
-            let mut retired = None;
-            let object = self
-                .region
-                .create_pipe(65536, &mut retired, &HostWait)
-                .unwrap();
-            assert_eq!(retired, None);
-            object
+            self.region.create_pipe(65536, &HostWait).unwrap()
         }
         /// pipe(2) as the host venue performs it, after its first write.
         fn pipe(&self, t: TableId, flags: StatusFlags) -> (i32, i32, IpcObjectHandle) {

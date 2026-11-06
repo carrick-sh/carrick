@@ -25,6 +25,7 @@ structural_budgets = []
 
 [bindings]
 vm_free = [
+  "carrick-el1-abi::ipc::tests::el1_ipc_too_small_retained_ring_stays_owned_until_replacement (#1506: retained extent identity, no stock consumption on refusal, exactly one replacement transfer; constructor syscall remains unserved)",
   "carrick-el1-linux::aarch64_process_tests::serial_host_native_fork_epoll_ctl_observes_peer_pipe_write (#1506 red-first: pre-admitted inherited epoll, native child ADD, peer child pipe write, zero-timeout readiness/data and drain; no constructor or signed execution claim)",
   "carrick-el1-linux::aarch64_process_tests::{serial_host_native_fork_children_create_eventfd_in_their_own_tables,serial_host_native_fork_children_create_epoll_in_their_own_tables,serial_host_native_fork_children_create_pipe_in_their_own_tables,serial_host_native_fork_children_create_timerfd_in_their_own_tables} (#1506 red-first: real forks, two live children, production dispatch, independent backing and private descriptor publication; no signed instruction or complete constructor work-budget claim)",
   "carrick-el1-linux::aarch64_process_tests::{serial_host_native_root_creates_epoll_with_live_children,serial_host_native_root_creates_pipe_with_live_children,serial_host_native_root_creates_eventfd_with_live_children,serial_host_native_root_creates_timerfd_with_live_children} (#1506 red-first: borrowed root table, two live native children, production dispatch, in-ring creation/fcntl/close; no signed instruction or constructor implementation claim)",
