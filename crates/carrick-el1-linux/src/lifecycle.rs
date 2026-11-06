@@ -112,6 +112,11 @@ impl<
         }
     }
     fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> CopyOutcome {
+        // No owner can supply backing for a range outside the user domain.
+        // Preserve terminal Fault so exit can consume it without host custody.
+        if !carrick_guest_arch::lower_half_range(dst.raw(), src.len() as u64) {
+            return CopyOutcome::Fault;
+        }
         #[cfg(test)]
         if let Some(user) = &mut self.lifecycle_user {
             return CopyOutcome::from_completed(user.copy_out(dst.raw(), src));

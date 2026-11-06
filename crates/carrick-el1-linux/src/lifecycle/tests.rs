@@ -1577,6 +1577,7 @@ fn exit_clear_tid_fault_wakes_the_queued_joiner_once() {
         serve_directly(&mut w, &mut frame, &mut user),
         Some(Action::Served)
     );
+    assert_eq!(w.zone.counters.el1_wakes.load(Ordering::Relaxed) - wakes, 1);
     assert_eq!(
         word.get(),
         CHILD_VISIBLE,

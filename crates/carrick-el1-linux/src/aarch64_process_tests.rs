@@ -6156,12 +6156,27 @@ fn arm_raw_exit_faulting_clear_tid_still_retires_adopted_and_unadopted() {
             )
             .unwrap();
         if unadopted {
-            assert!(fixture.zone.mark_native_owned(record.id));
+            // A native-owned exit may immediately select another guest. Give
+            // it a real runnable sibling rather than an empty fake CPU's WFI.
+            let leader = fixture.control.zone_record().unwrap().id;
+            assert!(
+                fixture
+                    .zone
+                    .requeue_preempted(fixture.slot, leader)
+                    .is_queued()
+            );
         }
         run_as(fixture, 42, 12, 102, control);
         assert_eq!(
             fixture.zone.switch_in_full(fixture.slot).unwrap().record,
             record.id
+        );
+        if unadopted {
+            assert!(fixture.zone.mark_native_owned(record.id));
+        }
+        assert_eq!(
+            fixture.zone.record(record.id).has_native_execution_owner(),
+            unadopted
         );
         control.set_clear_child_tid(u64::MAX);
         let entry = control.entry().unwrap();
@@ -6169,10 +6184,14 @@ fn arm_raw_exit_faulting_clear_tid_still_retires_adopted_and_unadopted() {
         frame.x[8] = 93;
         // A noncanonical user range is permanently invalid, not demand backing.
         let route = arm_call(fixture, control, &mut service, &mut frame);
+        let route = route.unwrap();
+        // Terminal completion keeps the handoff at the native boundary,
+        // including when a runnable sibling needs its retained owner checkpoint.
         assert_eq!(
-            route.unwrap(),
+            route,
             carrick_personality_linux::dispatch::CompletionRoute::Suspended
         );
+        assert_ne!(fixture.zone.slot(fixture.slot).current(), Some(record.id));
         assert_eq!(fixture.page.live(), 1, "unadopted={unadopted}");
         assert_eq!(control.clear_child_tid(), 0);
         assert!(matches!(

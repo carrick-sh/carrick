@@ -1517,20 +1517,22 @@ fn serve_exit<'a>(
     let clear_child_tid = slot.clear_child_tid();
     if clear_child_tid != 0 {
         let status = native.result();
-        let copied = native
-            .copy_out(UserVa::new(clear_child_tid), &CHILD_TID_CLEAR)
-            .is_done();
-        let woken =
-            copied && native.wake_child_tid(EntryMmKey::from_raw(mm), UserVa::new(clear_child_tid));
-        if !woken {
-            // The host exits the thread instead: clearing the word again
-            // and waking are idempotent.
+        let copy = native.copy_out(UserVa::new(clear_child_tid), &CHILD_TID_CLEAR);
+        match copy {
+            CopyOutcome::Done | CopyOutcome::Fault => {}
+            CopyOutcome::NotYet(_) => {
+                // Parking needs retained terminal custody, rather than an ordinary
+                // syscall retry. Keep the existing handback until that owner exists.
+                native.set_result(status);
+                return decline!(LifecycleDecline::ExitClearTidCopyout);
+            }
+        }
+        // Linux ignores a terminal clear-store fault and still wakes one
+        // joiner. Fault is completion of this best-effort store, never a reason
+        // to abandon an unadopted record in host custody.
+        if !native.wake_child_tid(EntryMmKey::from_raw(mm), UserVa::new(clear_child_tid)) {
             native.set_result(status);
-            return decline!(if copied {
-                LifecycleDecline::ExitClearTidWake
-            } else {
-                LifecycleDecline::ExitClearTidCopyout
-            });
+            return decline!(LifecycleDecline::ExitClearTidWake);
         }
         // Copy and wake are already complete on either release outcome.
         // Publish that progress before a requeue can expose the record. The
