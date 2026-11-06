@@ -3386,7 +3386,10 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 .with_manager(|manager| manager.translate_retained_output(va))
                 .flatten()
                 .map(Gpa::new)
-            {
+                .or_else(|| {
+                    (!carrick_mem::memory::needs_stage1_translation(va, chunk_len as u64))
+                        .then_some(Gpa::new(va))
+                }) {
                 Some(ipa) => ipa,
                 None => {
                     let pristine = match self.vm.deferred_anonymous_state() {
@@ -3414,12 +3417,13 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     continue;
                 }
             };
-            // The excluded stage-1 snapshot above selected the exact retained
-            // output, including a prepared or permission-invalid leaf whose
-            // Linux VMA is dumpable. Read that authenticated output through
-            // the owner-selected backing seam: `translated_read` is the
-            // ordinary syscall-buffer path and deliberately refuses an
-            // admitted owner MM back to its portal.
+            // The excluded stage-1 snapshot above selected either the exact
+            // retained private output or the identity-backed high-VA window,
+            // including a prepared or permission-invalid leaf whose Linux VMA
+            // is dumpable. Read that authenticated output through the
+            // owner-selected backing seam: `translated_read` is the ordinary
+            // syscall-buffer path and deliberately refuses an admitted owner
+            // MM back to its portal.
             let bytes = match self.vm.translated_read_excluded(va, ipa.raw(), chunk_len) {
                 Ok(bytes) => bytes,
                 Err(error) => {
