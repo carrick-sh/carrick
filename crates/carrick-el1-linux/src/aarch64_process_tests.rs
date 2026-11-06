@@ -6202,6 +6202,7 @@ fn arm_raw_exit_faulting_clear_tid_still_retires_adopted_and_unadopted() {
     }
 }
 
+#[cfg(test)]
 fn raw_exit_faulting_robust_head(unadopted: bool) {
     use carrick_el1_abi::Lifecycle;
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
