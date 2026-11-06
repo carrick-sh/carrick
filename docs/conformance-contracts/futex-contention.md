@@ -6,7 +6,7 @@ operation continuation retains its deadline. The host binding
 threads, refuses the compare-under-lock atomic load once, and advances a
 deterministic clock by one second. A five-second relative wait must then
 have four seconds remaining. The EL1 production-entry binding
-`futex_unbacked_word_waits_for_owner_with_two_live_threads` similarly requires
+`futex_relative_deadline_survives_owner_wait_with_two_live_threads` similarly requires
 the original expiry tick after an owner-service park. These tests establish
 the deadline defect; they do not yet prove synchronous redispatch, signal
 cleanup, forwarding, cancellation, or the host zone's final atomic recheck.
