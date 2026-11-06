@@ -1133,6 +1133,7 @@ fn serve_sigaltstack(
 struct TidOutput {
     address: u64,
     preimage: [u8; 4],
+    attempted: bool,
 }
 
 impl TidOutput {
@@ -1146,7 +1147,11 @@ impl TidOutput {
         let mut preimage = [0u8; 4];
         let outcome = user.copy_in(&mut preimage, UserVa::new(address));
         match outcome {
-            CopyOutcome::Done => Ok(Some(Self { address, preimage })),
+            CopyOutcome::Done => Ok(Some(Self {
+                address,
+                preimage,
+                attempted: false,
+            })),
             CopyOutcome::Fault | CopyOutcome::NotYet(_) => Err(outcome),
         }
     }
@@ -1162,11 +1167,14 @@ struct TidOutputs {
 }
 
 impl TidOutputs {
-    fn publish(&self, visible_tid: u32, user: &mut (impl UserCopy + ?Sized)) -> CopyOutcome {
+    fn publish(&mut self, visible_tid: u32, user: &mut (impl UserCopy + ?Sized)) -> CopyOutcome {
         let bytes = visible_tid.to_le_bytes();
-        let Some(parent) = &self.parent else {
+        let Some(parent) = &mut self.parent else {
             return self.publish_child(&bytes, user);
         };
+        // A guarded copy can fault after a prefix, so retain undo before
+        // attempting it, but never claim an output that was not reached.
+        parent.attempted = true;
         let parent_outcome = user.copy_out(UserVa::new(parent.address), &bytes);
         if !parent_outcome.is_done() {
             return parent_outcome;
@@ -1174,10 +1182,15 @@ impl TidOutputs {
         self.publish_child(&bytes, user)
     }
 
-    fn publish_child(&self, bytes: &[u8; 4], user: &mut (impl UserCopy + ?Sized)) -> CopyOutcome {
-        let Some(child) = &self.child else {
+    fn publish_child(
+        &mut self,
+        bytes: &[u8; 4],
+        user: &mut (impl UserCopy + ?Sized),
+    ) -> CopyOutcome {
+        let Some(child) = &mut self.child else {
             return CopyOutcome::Done;
         };
+        child.attempted = true;
         user.copy_out(UserVa::new(child.address), bytes)
     }
 
@@ -1187,9 +1200,12 @@ impl TidOutputs {
         completion: crate::abi::thread::CloneRollbackCompletion,
     ) {
         let output = |value: &Option<TidOutput>| {
-            value.as_ref().map_or((UserVa::new(0), [0; 4]), |value| {
-                (UserVa::new(value.address), value.preimage)
-            })
+            value
+                .as_ref()
+                .filter(|value| value.attempted)
+                .map_or((UserVa::new(0), [0; 4]), |value| {
+                    (UserVa::new(value.address), value.preimage)
+                })
         };
         slot.retain_clone_tid_rollback(crate::abi::thread::CloneTidRollback {
             outputs: [output(&self.parent), output(&self.child)],
@@ -1505,7 +1521,7 @@ fn serve_thread_clone_common<'a>(
             });
         }
     };
-    let outputs = TidOutputs { parent, child };
+    let mut outputs = TidOutputs { parent, child };
 
     let state = native.task_state()?;
     let affinity = native.affinity()?;

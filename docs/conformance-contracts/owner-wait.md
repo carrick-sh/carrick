@@ -213,3 +213,9 @@ cannot overwrite a successor owner. The ISA adapters contain only guarded
 atomic mechanics; the ownership and wake decisions stay in the shared owner.
 BSD reference: FreeBSD's `handle_futex_death` uses `casueword32` before waking
 ([source](https://github.com/freebsd/freebsd-src/blob/main/sys/compat/linux/linux_futex.c)).
+
+Undo covers attempted outputs, including a potentially copied prefix, and
+never an unreached destination. The refused-parent clone/clone3 witness lets
+a live peer change the unreached child word while parent undo waits; a later
+child-output refusal must preserve the peer's new preimage, not restore the
+word captured before the parent attempt.

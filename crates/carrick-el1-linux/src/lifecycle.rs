@@ -20,6 +20,7 @@ std::thread_local! {
     pub(super) static COPYIN_NOT_YET_AT: core::cell::Cell<Option<u64>> = const { core::cell::Cell::new(None) };
     pub(super) static COPYIN_CALLS: core::cell::RefCell<std::vec::Vec<u64>> = const { core::cell::RefCell::new(std::vec::Vec::new()) };
     pub(super) static COPYOUT_PUBLISH_WAITERS_AT: core::cell::Cell<Option<u64>> = const { core::cell::Cell::new(None) };
+    pub(super) static COPYOUT_REFUSE_PUBLISH_AT: core::cell::Cell<Option<u64>> = const { core::cell::Cell::new(None) };
     pub(super) static COPYOUT_REFUSE_RESTORE_AT: core::cell::Cell<Option<u64>> = const { core::cell::Cell::new(None) };
     pub(super) static COPYOUT_NOT_YET_AT: core::cell::Cell<Option<u64>> = const {
         core::cell::Cell::new(None)
@@ -38,6 +39,8 @@ fn test_output_refused(dst: UserVa, src: &[u8]) -> bool {
             .fetch_or(0x8000_0000, core::sync::atomic::Ordering::AcqRel);
     }
     COPYOUT_NOT_YET_AT.with(|address| address.get() == Some(dst.raw()))
+        || (COPYOUT_REFUSE_PUBLISH_AT.with(|address| address.get() == Some(dst.raw()))
+            && src == 43_u32.to_le_bytes())
         || (COPYOUT_REFUSE_RESTORE_AT.with(|address| address.get() == Some(dst.raw()))
             && src != 43_u32.to_le_bytes())
 }

@@ -12018,16 +12018,22 @@ fn signal_setup_nonresident_input(nr: u64) {
 
 #[test]
 fn arm_clone_nonresident_tid_destination_publishes_once() {
-    clone_nonresident_tid_destination(false);
+    clone_nonresident_tid_destination(false, false);
 }
 
 #[test]
 fn arm_clone3_nonresident_tid_destination_publishes_once() {
-    clone_nonresident_tid_destination(true);
+    clone_nonresident_tid_destination(true, false);
+}
+
+#[test]
+fn arm_clone_refused_parent_preserves_unattempted_child_output() {
+    clone_nonresident_tid_destination(false, true);
+    clone_nonresident_tid_destination(true, true);
 }
 
 #[cfg(test)]
-fn clone_nonresident_tid_destination(is_clone3: bool) {
+fn clone_nonresident_tid_destination(is_clone3: bool, refuse_parent: bool) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let (_peer_control, _peer_record) = imported_thread(fixture);
     let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
@@ -12072,7 +12078,7 @@ fn clone_nonresident_tid_destination(is_clone3: bool) {
         .bind_control_address(entry, child_control as *const _ as u64)
         .unwrap();
 
-    let tid_words =
+    let mut tid_words =
         carrick_test_support::GuestUserBuffer::from_values(&[0x1111_1111_u32, 0x2222_2222_u32]);
     let parent_tid_va = tid_words.arg_at(0);
     let child_tid_va = tid_words.arg_at(4);
@@ -12131,7 +12137,13 @@ fn clone_nonresident_tid_destination(is_clone3: bool) {
 
     // 1. NotYet once on TID destination page during publication: parks/prepares
     // and rewinds PC for redispatch without publishing TID or leaking the pool entry.
-    crate::lifecycle::COPYOUT_NOT_YET_AT.with(|address| address.set(Some(child_tid_va)));
+    crate::lifecycle::COPYOUT_NOT_YET_AT.with(|address| {
+        address.set(Some(if refuse_parent {
+            parent_tid_va
+        } else {
+            child_tid_va
+        }))
+    });
     crate::lifecycle::COPYOUT_REFUSE_RESTORE_AT.with(|address| address.set(Some(parent_tid_va)));
     let first = arm_call(fixture, fixture.control, &mut service, &mut frame);
     crate::lifecycle::COPYOUT_REFUSE_RESTORE_AT.with(|address| address.set(None));
@@ -12141,11 +12153,22 @@ fn clone_nonresident_tid_destination(is_clone3: bool) {
     );
     assert!(!leader_sees_thread(fixture, &mut service, 43));
     assert_eq!(child_control.visible_tid(), None);
+    let child_preimage = if refuse_parent {
+        // Publication never reached this destination. A live peer's update
+        // while parent undo waits must survive; it belongs to no clone undo.
+        tid_words.set(1, 0x3333_3333_u32);
+        crate::lifecycle::COPYOUT_NOT_YET_AT.with(|address| address.set(None));
+        crate::lifecycle::COPYOUT_REFUSE_PUBLISH_AT.with(|address| address.set(Some(child_tid_va)));
+        0x3333_3333
+    } else {
+        0x2222_2222
+    };
     // The rollback destination is now available, while child output still
     // refuses. Restore the original preimage before any new birth attempt.
     set_args(&mut frame);
     let first = arm_call(fixture, fixture.control, &mut service, &mut frame);
     crate::lifecycle::COPYOUT_NOT_YET_AT.with(|address| address.set(None));
+    crate::lifecycle::COPYOUT_REFUSE_PUBLISH_AT.with(|address| address.set(None));
     assert_eq!(
         first.unwrap(),
         carrick_personality_linux::dispatch::CompletionRoute::Served,
@@ -12159,8 +12182,8 @@ fn clone_nonresident_tid_destination(is_clone3: bool) {
     );
     assert_eq!(
         tid_words.get::<[u32; 2]>(0),
-        [0x1111_1111, 0x2222_2222],
-        "is_clone3={is_clone3}: rolled-back NotYet must restore preimage"
+        [0x1111_1111, child_preimage],
+        "is_clone3={is_clone3}: rollback restores only attempted output preimages"
     );
     assert!(!leader_sees_thread(fixture, &mut service, 43));
 
