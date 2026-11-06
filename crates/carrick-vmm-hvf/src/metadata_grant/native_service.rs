@@ -1939,9 +1939,7 @@ pub(super) fn settle_native_descriptor_reply(
         }
         drop(ledger);
         let mut stock = custody.fork_stock.lock();
-        if stock.owner.child_owner(owner.mm()) != Some(owner)
-            || stock.owner.child_root(owner.mm()) != Some(execution.context.root)
-        {
+        if !stock.owner.child_execution_matches(execution, owner) {
             return Ok(false);
         }
         let Some(txn) = stock

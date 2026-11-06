@@ -87,6 +87,13 @@ impl Drop for SupplyBacking {
     }
 }
 
+struct PhysicalLane {
+    cpu: carrick_guest_arch::CpuId,
+    task: &'static CurrentTask,
+    zone: &'static ZoneTables<Aarch64ParkedContext>,
+    root: AtomicU64,
+}
+
 pub(super) struct PhysicalStock {
     pub owner: ForkStock<carrick_hal::asid::AsidAllocator, PhysicalChild>,
     record: Arc<Mutex<CarrierStage2Record>>,
@@ -99,7 +106,7 @@ pub(super) struct PhysicalStock {
     pub settled: usize,
     window: Option<LifecycleWindow>,
     pub metadata_in_el1_window: bool,
-    execution: Option<GrantExecution>,
+    lanes: Vec<PhysicalLane>,
     tables: (core::ptr::NonNull<AtomicU64>, u64, usize),
     releases: usize,
 }
@@ -154,7 +161,7 @@ impl PhysicalStock {
             settled: 0,
             window: None,
             metadata_in_el1_window: false,
-            execution: None,
+            lanes: Vec::new(),
             tables: (
                 core::ptr::NonNull::new(tables.words.as_ptr().cast_mut()).unwrap(),
                 tables.base,
@@ -164,13 +171,56 @@ impl PhysicalStock {
         }
     }
 
+    pub fn bind_lane(
+        &mut self,
+        task: &'static CurrentTask,
+        zone: &'static ZoneTables<Aarch64ParkedContext>,
+        cpu: carrick_guest_arch::CpuId,
+        root: RootGpa,
+    ) {
+        self.lanes.push(PhysicalLane {
+            cpu,
+            task,
+            zone,
+            root: AtomicU64::new(root.address().raw()),
+        });
+    }
+
+    /// The VM-free CPU's root register observation; scheduler fixtures update
+    /// it when they switch roots, independently of the current-task binding.
+    pub fn observe_root(&self, cpu: u64, root: RootGpa) {
+        self.lanes
+            .iter()
+            .find(|lane| u64::from(lane.cpu.raw()) == cpu)
+            .unwrap()
+            .root
+            .store(root.address().raw(), Ordering::Release);
+    }
+
+    pub fn execution(&self, cpu: u64) -> Result<GrantExecution, NativeProcessError> {
+        let lane = self
+            .lanes
+            .iter()
+            .find(|lane| u64::from(lane.cpu.raw()) == cpu)
+            .ok_or(NativeProcessError::Stale)?;
+        GrantExecution::from_stopped_lane(
+            lane.cpu,
+            carrick_core::entry::binding(&lane.task.execution, &lane.task.mm),
+            lane.task.root_generation(),
+            lane.zone,
+            RootGpa::page_aligned(FrameGpa::new(lane.root.load(Ordering::Acquire)))
+                .ok_or(NativeProcessError::Stale)?,
+        )
+        .ok_or(NativeProcessError::Stale)
+    }
+
     pub fn loan(
         &mut self,
-        req: carrick_el1_abi::ForkStockRequest,
+        execution: GrantExecution,
         exchange: &mut ForkStockExchange,
         child: Vec<RootGpa>,
         parent: Vec<RootGpa>,
-    ) -> ForkStockLoan {
+    ) -> Result<ForkStockLoan, ForkStockRefusal> {
         // One retained allocation permits the real lifecycle clear operation.
         let (base, controls_offset, len) = if self.metadata_in_el1_window {
             super::metadata_lifecycle_allocation()
@@ -211,26 +261,26 @@ impl PhysicalStock {
         }
         self.owner.install(table_stock, vec![lifecycle]).unwrap();
         let aliases = window.prepare_affinity_aliases(lifecycle).unwrap();
-        let execution =
-            GrantExecution::new(carrick_guest_arch::CpuId::new(0), req.binding, req.context);
-        self.execution = Some(execution);
         let loan = self
             .owner
             .loan(&mut NoTableLedger, execution, exchange, |life| {
                 window.is_zero(life)
-            })
-            .unwrap();
+            })?;
         aliases.publish();
         self.window = Some(window);
-        loan
+        Ok(loan)
     }
 
-    pub fn reserve(&mut self, _loan: ForkStockLoan, settlement: &mut ForkStockSettlement) {
+    pub fn reserve(
+        &mut self,
+        execution: GrantExecution,
+        settlement: &mut ForkStockSettlement,
+    ) -> Result<(), ForkStockRefusal> {
         let venue = PinVenue(self.record.clone());
         let identity = self.identity;
         self.owner
             .reserve_custody(
-                self.execution.unwrap(),
+                execution,
                 settlement,
                 |_| true,
                 |_| true,
@@ -258,12 +308,40 @@ impl PhysicalStock {
                     })
                 },
             )
-            .unwrap();
+            .map(|_| ())
     }
-    pub fn commit(&mut self, _loan: ForkStockLoan, settlement: &mut ForkStockSettlement) {
+    pub fn commit(
+        &mut self,
+        execution: GrantExecution,
+        settlement: &mut ForkStockSettlement,
+    ) -> Result<(), carrick_hal::fork_stock::ForkStockServiceError> {
+        self.settle(execution, settlement)
+    }
+
+    pub fn settle(
+        &mut self,
+        execution: GrantExecution,
+        settlement: &mut ForkStockSettlement,
+    ) -> Result<(), carrick_hal::fork_stock::ForkStockServiceError> {
+        let window = self.window.unwrap();
         self.owner
-            .commit_admitted(&mut NoTableLedger, self.execution.unwrap(), settlement)
-            .unwrap();
+            .settle(
+                &mut NoTableLedger,
+                execution,
+                settlement,
+                |_| true,
+                |_| true,
+                |life| window.clear(life),
+            )
+            .inspect_err(|error| {
+                settlement.refuse(
+                    if *error == carrick_hal::fork_stock::ForkStockServiceError::StaleExecution {
+                        ForkStockRefusal::Stale
+                    } else {
+                        ForkStockRefusal::Invalid
+                    },
+                );
+            })
     }
     pub fn reclaim(&mut self, zone: &ZoneTables<Aarch64ParkedContext>) {
         use carrick_hal::fork_stock::{ReclaimExecution, SlotAbsence};
@@ -374,6 +452,20 @@ impl PhysicalStock {
             .track_native_descriptor_tables(&mut NoTableLedger, reservation, *txn)
             .unwrap();
     }
+    pub fn settle_descriptor(
+        &mut self,
+        execution: GrantExecution,
+        owner: carrick_el1_abi::El1MmHandle,
+        generation: NonZeroU64,
+        slot: &carrick_el1_abi::PortalGrantSlot,
+    ) -> Result<(), NativeProcessError> {
+        if !self.owner.child_execution_matches(execution, owner) {
+            return Err(NativeProcessError::Stale);
+        }
+        self.settle_backing_reply(owner, generation, slot);
+        Ok(())
+    }
+
     pub fn settle_backing_reply(
         &mut self,
         owner: carrick_el1_abi::El1MmHandle,
@@ -517,12 +609,14 @@ fn native_backing_release_already_retired_owner_is_clean_absence_without_quarant
             parent_bytes: 4096,
         };
         let mut exchange = ForkStockExchange::new(request).unwrap();
-        let loan = stock.loan(
-            request,
-            &mut exchange,
-            vec![child_root],
-            vec![parent_table, spare_table],
-        );
+        let loan = stock
+            .loan(
+                parent_exec,
+                &mut exchange,
+                vec![child_root],
+                vec![parent_table, spare_table],
+            )
+            .unwrap();
         let handle = unsafe {
             carrick_el1_abi::El1MmHandle::from_admitted_owner(
                 NonZeroU64::MIN,
@@ -544,10 +638,10 @@ fn native_backing_release_already_retired_owner_is_clean_absence_without_quarant
             0,
         )
         .unwrap();
-        stock.reserve(loan, &mut reserve);
+        stock.reserve(parent_exec, &mut reserve).unwrap();
         let mut commit =
             carrick_el1_abi::ForkStockSettlement::commit_reserved(loan, completion).unwrap();
-        stock.commit(loan, &mut commit);
+        stock.commit(parent_exec, &mut commit).unwrap();
 
         let physical_owner = carrick_hal::GuestFrameOwner {
             native_mm: MmGeneration::new(NonZeroU64::new(child_mm.raw()).unwrap()),
@@ -1005,4 +1099,200 @@ fn region_teardown_drains_and_clears_shared_retired_spaces_before_address_reuse(
         });
     }));
     assert!(leaked_entry.is_err());
+}
+
+/// Two real native processes remain live while another child passes the
+/// production prepare/commit boundary. Settlement must use the parent's
+/// current root incarnation, rather than the snapshot at stock loan time.
+#[test]
+fn two_live_processes_reauthenticate_birth_settlement_after_parent_generation_moves() {
+    for move_generation in [false, true] {
+        let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+        let source = BornInZoneSource {
+            zone: fixture.zone,
+            slot: fixture.slot,
+        };
+        let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+        let words = fixture.tables.live(&fixture.maintenance);
+        let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+            source,
+            &fixture.task,
+            fixture.page,
+            fixture.control,
+            fixture.address,
+            fixture.address,
+            parked,
+        )
+        .unwrap();
+        let first_crossing =
+            TestStockCrossing::new(&[0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000]);
+        let mut first_service = Aarch64NativeProcessService::with_crossing(
+            &fixture.task,
+            fixture.slot,
+            fixture.zone,
+            fixture.region.table(),
+            NonZeroU64::MIN,
+            &first_crossing,
+        )
+        .with_words(&words);
+        let LifecycleOutcome::Returned { result, .. } = runtime
+            .enter(source, &fixture.task, parked, &mut first_service)
+            .unwrap()
+            .fork(ProcessForkChildTid::NONE)
+        else {
+            panic!("first child must be born");
+        };
+        let parent_key = TaskKey {
+            id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
+            serial: TaskSerial::from_raw_u64(11).unwrap(),
+        };
+        let child_key = runtime
+            .namespace_child_key(parent_key, result.raw() as u32)
+            .unwrap();
+        assert!(runtime.task_binding(parent_key).is_some());
+        assert!(runtime.task_binding(child_key).is_some());
+
+        let mut crossing =
+            TestStockCrossing::new(&[0x28000, 0x29000, 0x2a000, 0x2b000, 0x2c000, 0x2d000]);
+        let mut physical = PhysicalStock::new(&fixture.tables);
+        physical.bind_lane(
+            &fixture.task,
+            fixture.zone,
+            carrick_guest_arch::CpuId::new(0),
+            fixture.address.root,
+        );
+        crossing.physical = Some(Mutex::new(physical));
+        let mut service = Aarch64NativeProcessService::with_crossing(
+            &fixture.task,
+            fixture.slot,
+            fixture.zone,
+            fixture.region.table(),
+            NonZeroU64::MIN,
+            &crossing,
+        )
+        .with_words(&words);
+        // Use the production MM preparation and custody reservation, not a
+        // forged completion or a test-only inner settlement helper.
+        let prepared = service
+            .prepare_mm(
+                &fixture.address,
+                &parked,
+                MmGeneration::new(NonZeroU64::new(3).unwrap()),
+            )
+            .unwrap();
+        let born = service.commit_mm(prepared).unwrap();
+        assert_eq!(crossing.settlements_reserved.load(Ordering::Acquire), 1);
+        if move_generation {
+            fixture.task.publish_root_generation(ContextGeneration::new(
+                NonZeroU64::new(fixture.address.generation.raw().get() + 1).unwrap(),
+            ));
+        }
+        let settled = service.settle_mm(born);
+        if move_generation {
+            let (error, retained) = settled.expect_err("production refuses the stale loan");
+            assert_eq!(error, NativeProcessError::Quarantined);
+            let physical = crossing.physical.as_ref().unwrap().lock().unwrap();
+            let live = physical.execution(0).unwrap();
+            assert_eq!(
+                physical.owner.settlement_loan(live),
+                Err(carrick_hal::fork_stock::ForkStockServiceError::StaleExecution)
+            );
+            assert_eq!(physical.owner.live_children(), 0);
+            // Production retains uncertain published custody for quarantine.
+            core::mem::forget(retained);
+        } else {
+            settled.unwrap();
+            // A different live process cannot settle this child's descriptor
+            // receipt even though both owners and both roots remain live.
+            let owner = crossing
+                .physical
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .owner
+                .child_owner(ReservationMm::new(3).unwrap())
+                .unwrap();
+            let reply = Box::new(carrick_el1_abi::PortalGrantSlot::new());
+            let address = KernelVa::new(core::ptr::from_ref(&*reply) as u64);
+            let mut descriptor = carrick_el1_abi::NativeDescriptorSettlement::EMPTY;
+            descriptor
+                .initialize(owner, NonZeroU64::MIN, address)
+                .unwrap();
+            assert_eq!(
+                crossing.cross_fork_stock(&raw mut descriptor as *mut _ as u64, 0),
+                Err(NativeProcessError::Stale)
+            );
+            assert_eq!(
+                descriptor.take(owner, NonZeroU64::MIN, address),
+                Some(Err(()))
+            );
+            assert_eq!(
+                crossing
+                    .physical
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .owner
+                    .live_children(),
+                1
+            );
+        }
+        assert_eq!(crossing.settlements_committed.load(Ordering::Acquire), 1);
+        assert!(runtime.task_binding(parent_key).is_some());
+        assert!(runtime.task_binding(child_key).is_some());
+    }
+}
+
+#[test]
+fn physical_stock_live_lane_checks_execution_mm_root_and_generation() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut stock = PhysicalStock::new(&fixture.tables);
+    stock.bind_lane(
+        &fixture.task,
+        fixture.zone,
+        carrick_guest_arch::CpuId::new(0),
+        fixture.address.root,
+    );
+    let original = stock.execution(0).unwrap();
+    assert_eq!(
+        original.binding,
+        crate::common_entry::execution_binding(&fixture.task)
+    );
+    assert_eq!(original.context, fixture.address);
+    assert_eq!(stock.execution(1), Err(NativeProcessError::Stale));
+
+    fixture.task.execution.task.store(42, Ordering::Release);
+    assert_ne!(stock.execution(0).unwrap().binding, original.binding);
+    fixture
+        .task
+        .execution
+        .task
+        .store(original.binding.task.raw(), Ordering::Release);
+    fixture
+        .task
+        .mm
+        .thread_generation
+        .store(102, Ordering::Release);
+    assert_ne!(stock.execution(0).unwrap().binding, original.binding);
+    fixture
+        .task
+        .mm
+        .thread_generation
+        .store(original.binding.thread_generation.raw(), Ordering::Release);
+    fixture.task.mm.key.store(2, Ordering::Release);
+    assert_eq!(stock.execution(0), Err(NativeProcessError::Stale));
+    fixture
+        .task
+        .mm
+        .key
+        .store(original.binding.mm.raw(), Ordering::Release);
+    stock.observe_root(0, RootGpa::page_aligned(FrameGpa::new(0x20000)).unwrap());
+    assert_eq!(stock.execution(0), Err(NativeProcessError::Stale));
+    stock.observe_root(0, fixture.address.root);
+    fixture
+        .task
+        .publish_root_generation(ContextGeneration::new(NonZeroU64::new(102).unwrap()));
+    assert_ne!(stock.execution(0).unwrap().context, original.context);
 }
