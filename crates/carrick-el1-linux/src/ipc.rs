@@ -127,7 +127,7 @@ fn release_native_description<C: carrick_el1_abi::EntryContext>(
     zone: &carrick_sched_core::ZoneTables<C>,
     slot: carrick_el1_abi::SlotId,
     task: &CurrentTask,
-    wake: &dyn Fn(WakeEffects),
+    deliver_wake: &dyn Fn(WakeEffects),
 ) -> Result<(), carrick_el1_abi::ipc::IpcError> {
     use carrick_el1_abi::ipc::IpcError;
     match region.release_backing(description.backing, &Finish)? {
@@ -161,8 +161,7 @@ fn release_native_description<C: carrick_el1_abi::EntryContext>(
                 if report.deferred != 0 {
                     task.linux.mark_pending_host_work();
                 }
-                crate::sched::object_wait::deliver_wake_effects(zone, slot, effects);
-                let _ = wake;
+                deliver_wake(effects);
             }
         }
         IpcReleased::Epoll => {}
@@ -1475,8 +1474,7 @@ fn finish<E: IpcExecution>(sched: &mut E, token: IpcOpToken, region: &IpcRegion<
 /// scheduler record authenticates its token; the arena authenticates its MM.
 pub(crate) fn retire_native_operation<C: carrick_el1_abi::EntryContext>(
     region: &IpcRegion<'_>,
-    zone: &carrick_sched_core::ZoneTables<C>,
-    slot: carrick_el1_abi::SlotId,
+    source: carrick_el1_abi::BornInZoneSource<'_, C>,
     task: &CurrentTask,
     binding: carrick_el1_abi::ExecutionBinding,
     operation: carrick_sched_core::object_wait::OperationToken,
@@ -1484,6 +1482,8 @@ pub(crate) fn retire_native_operation<C: carrick_el1_abi::EntryContext>(
     wake: &dyn Fn(WakeEffects),
 ) -> Result<usize, crate::native_process_runtime::NativeProcessError> {
     use crate::native_process_runtime::NativeProcessError;
+    let zone = source.zone;
+    let slot = source.slot;
     let token = from_sched_token(operation).ok_or(NativeProcessError::Quarantined)?;
     let op = region
         .operation(&token)
@@ -2627,8 +2627,10 @@ mod tests {
                 };
                 retire_native_operation(
                     w.region,
-                    &w.zone,
-                    SLOT,
+                    carrick_el1_abi::BornInZoneSource {
+                        zone: &w.zone,
+                        slot: SLOT,
+                    },
                     &w.task,
                     binding,
                     to_sched_token(token).unwrap(),

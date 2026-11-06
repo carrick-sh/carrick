@@ -2790,8 +2790,10 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             .ok_or(NativeProcessError::Stale)?;
         crate::ipc::retire_native_operation(
             &region,
-            self.zone,
-            self.slot,
+            carrick_el1_abi::BornInZoneSource {
+                zone: self.zone,
+                slot: self.slot,
+            },
             self.task,
             binding,
             operation,
