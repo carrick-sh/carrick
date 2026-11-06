@@ -6202,6 +6202,76 @@ fn arm_raw_exit_faulting_clear_tid_still_retires_adopted_and_unadopted() {
     }
 }
 
+fn raw_exit_faulting_robust_head(unadopted: bool) {
+    use carrick_el1_abi::Lifecycle;
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let (control, record) = imported_thread_with_identity(fixture, |_| {});
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    if unadopted {
+        // A native-owned exit may immediately select another guest. Give
+        // it a real runnable sibling rather than an empty fake CPU's WFI.
+        let leader = fixture.control.zone_record().unwrap().id;
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(fixture.slot, leader)
+                .is_queued()
+        );
+    }
+    run_as(fixture, 42, 12, 102, control);
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        record.id
+    );
+    if unadopted {
+        assert!(fixture.zone.mark_native_owned(record.id));
+    }
+    assert_eq!(
+        fixture.zone.record(record.id).has_native_execution_owner(),
+        unadopted
+    );
+    control.set_robust_list(u64::MAX, 24);
+    let entry = control.entry().unwrap();
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[8] = 93;
+    // A noncanonical user range is permanently invalid, not demand backing.
+    let route = arm_call(fixture, control, &mut service, &mut frame);
+    let route = route.unwrap();
+    // Terminal completion keeps the handoff at the native boundary,
+    // including when a runnable sibling needs its retained owner checkpoint.
+    assert_eq!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended
+    );
+    let current = fixture.zone.slot(fixture.slot).current();
+    assert_ne!(current, Some(record.id));
+    assert_eq!(fixture.page.live(), 1, "unadopted={unadopted}");
+    assert_eq!(control.clear_child_tid(), 0);
+    assert!(matches!(
+        fixture.page.state(entry.index()),
+        Some((_, carrick_el1_abi::EntryState::ExitedInZone))
+    ));
+    assert!(!control.host_exit_requested());
+}
+
+#[test]
+fn arm_raw_exit_faulting_robust_head_retires_adopted_thread() {
+    raw_exit_faulting_robust_head(false);
+}
+
+#[test]
+fn arm_raw_exit_faulting_robust_head_retires_unadopted_thread() {
+    raw_exit_faulting_robust_head(true);
+}
+
 #[test]
 fn arm_two_live_threads_exit_group_ends_group_with_status() {
     use carrick_el1_abi::Lifecycle;
