@@ -17,6 +17,17 @@ use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 use std::boxed::Box;
 
+#[test]
+fn host_futex_fixture_accepts_aligned_pointers_outside_guest_va_range() {
+    use carrick_core::personality::CopyOutcome;
+
+    let host_pointer = UserVa::new(0xffff_0000_0000_0000);
+    assert!(matches!(
+        super::futex_word_refusal(host_pointer),
+        CopyOutcome::NotYet(_)
+    ));
+}
+
 const MM: u64 = 7;
 const SLOT: SlotId = SlotId::new(3);
 
