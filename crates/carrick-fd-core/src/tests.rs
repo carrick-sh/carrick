@@ -86,6 +86,62 @@ fn retained_range_admission_refusal_preserves_every_slot_and_releases_prefix_pin
     }
 }
 
+#[test]
+fn retained_single_close_cleanup_cannot_close_reused_number() {
+    let c = authority::<1, 4>();
+    let table = c.create_table(8, &mut storage(8)).unwrap();
+    let fd = c.open(table, Fd(3), description(91), false).unwrap();
+    let (observer, _) = c.pin(table, fd).unwrap();
+    let receipt = c.close_retained(table, fd).unwrap();
+    assert_eq!(c.close_retained(table, fd), Err(Error::BadFd));
+    let replacement = c.open(table, fd, description(92), true).unwrap();
+    assert_eq!(replacement, fd);
+    c.set_offset(table, replacement, Offset(37)).unwrap();
+    // Effects may be published after numeric removal by a pre-existing pin.
+    c.require_pinned_close_effects(&observer, CloseEffects::POSIX_RECORD_LOCKS)
+        .unwrap();
+    assert_eq!(receipt.table(), table);
+    assert_eq!(receipt.fd(), fd);
+    assert_eq!(c.pinned(receipt.pin()).unwrap().backing, BackingToken(91));
+    assert_eq!(
+        c.pinned_close_effects(receipt.pin()),
+        Ok(CloseEffects::POSIX_RECORD_LOCKS)
+    );
+    assert_eq!(c.unpin(observer), Ok(None));
+    // Consume the exact old description rather than replaying close(fd).
+    assert_eq!(
+        c.unpin(receipt.into_pin()).unwrap().unwrap().backing,
+        BackingToken(91)
+    );
+    assert_eq!(c.get(table, replacement).unwrap().backing, BackingToken(92));
+    assert_eq!(c.getfd(table, replacement), Ok(true));
+    assert_eq!(c.get(table, replacement).unwrap().offset, Offset(37));
+    assert_eq!(
+        c.close(table, replacement).unwrap().unwrap().backing,
+        BackingToken(92)
+    );
+}
+
+#[test]
+fn retained_single_close_pin_refusal_preserves_slot() {
+    let c = authority::<1, 4>();
+    let table = c.create_table(8, &mut storage(8)).unwrap();
+    let fd = c.open(table, Fd(3), description(93), true).unwrap();
+    let (observer, _) = c.pin(table, fd).unwrap();
+    let ofd = c.ofd(observer.key().index).unwrap();
+    ofd.holds.store(REF | FREE_INDEX, Ordering::Relaxed);
+    assert_eq!(c.close_retained(table, fd), Err(Error::NoMemory));
+    assert_eq!(c.get(table, fd).unwrap().backing, BackingToken(93));
+    assert_eq!(c.getfd(table, fd), Ok(true));
+    ofd.holds.store(REF | PIN, Ordering::Relaxed);
+    assert_eq!(c.unpin(observer), Ok(None));
+    let receipt = c.close_retained(table, fd).unwrap();
+    assert_eq!(
+        c.unpin(receipt.into_pin()).unwrap().unwrap().backing,
+        BackingToken(93)
+    );
+}
+
 // Reservation custody stays in one authority, including across backing growth.
 #[test]
 fn owned_reservations_two_live_tables_keep_targets_and_fork_private() {

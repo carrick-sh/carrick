@@ -143,3 +143,27 @@ The separate projection witness uses admitted stdio bindings at incarnation 1,
 checks authority refusal leaves flags unchanged, and checks only selected slots
 in the caller's table acquire CLOEXEC. This catches an incorrect `incarnation >
 1` live-slot predicate that would pass core-only F_GETFD assertions.
+
+## Single-close custody foundation (Linux continuation)
+
+`close_retained` now returns the same non-Copy `CloseReceipt` as retained
+range close. It authenticates the authority, takes the table lock, retains the
+selected description and removes the slot while that pin prevents finalization.
+Cleanup reads late sticky effects through the pin, then consumes it outside the
+table lock. Work is one direct slot lookup and one removal, independent of the
+numeric descriptor value. Pin saturation preserves the live descriptor.
+
+The fd-core single-close witnesses require the original backing to be released
+once after numeric reuse, preserving the replacement's flags and offset. They
+also require admission refusal to preserve the slot. These are substrate proofs,
+not a production-entry red/green: production dispatch still emits numeric replay
+for effect-bearing close. The P0 remains open. No Forward entry is removed.
+
+The next production change must reserve crossing-service custody before either
+single or range removal, retain the canonical host OpenFile and caller identity,
+and settle the receipt even through cancellation. The existing HostFile wire
+record has no close-cleanup operation. Its shared interface and publication/
+lock order need independent review under the repository rule before adding that
+operation. This foundation neither approves that interface nor completes item 1
+of the owner's ordered brief. Pipe sizing, the #1410/#1399 native witnesses and
+signed population comparison remain unfinished. Keep the PR draft.

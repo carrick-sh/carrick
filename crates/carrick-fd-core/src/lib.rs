@@ -1985,6 +1985,32 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         self.close_locked_filtered(&t, fd, release_here)
     }
 
+    /// Remove one descriptor while retaining its exact description for cleanup.
+    /// The caller reserves crossing custody before admission and settles effects
+    /// through the receipt's pin outside the table lock. Reusing the numeric fd
+    /// cannot redirect settlement. Pin exhaustion leaves the descriptor intact.
+    pub fn close_retained(&self, table: TableId, fd: Fd) -> Result<CloseReceipt, Error> {
+        let authority = self.identity()?;
+        let (_guard, t) = self.lock(table)?;
+        let entry = t.entry(fd)?;
+        let generation = self.ofd(entry.ofd)?.generation.load(Ordering::Acquire);
+        self.retain(entry.ofd, PIN)?;
+        let receipt = CloseReceipt {
+            table,
+            fd,
+            pin: OfdPin {
+                authority,
+                key: OfdKey {
+                    index: entry.ofd,
+                    generation,
+                },
+            },
+        };
+        // The cleanup pin prevents finalization during numeric removal.
+        self.close_locked(&t, fd)?;
+        Ok(receipt)
+    }
+
     /// Pop and free one finalized OFD whose physical backing release was
     /// deferred to the host (`close_filtered` / `dup2_filtered` / `dup3_filtered`).
     pub fn take_retired_ofd(&self) -> Result<Option<Description>, Error> {

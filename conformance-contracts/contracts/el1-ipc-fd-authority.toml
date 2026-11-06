@@ -26,6 +26,7 @@ structural_budgets = []
 [bindings]
 vm_free = [
   "carrick-kernel::kernel::objects::ipc::tests::{one_table_writer,no_host_slot_selection}",
+  "carrick-fd-core::tests::{retained_single_close_cleanup_cannot_close_reused_number,retained_single_close_pin_refusal_preserves_slot}",
   "carrick-fd-core::tests::{retained_range_cleanup_survives_reused_gap_and_late_effects,retained_range_admission_refusal_preserves_every_slot_and_releases_prefix_pins}",
   "carrick-el1-abi::ipc_tables::tests::directory_custody_cannot_replace_or_retire_a_borrowed_binding",
   "carrick-el1-linux::aarch64_process_tests::{serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof,serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe}",
