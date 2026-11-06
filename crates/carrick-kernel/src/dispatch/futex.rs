@@ -93,7 +93,7 @@ pub(crate) fn dispatch_futex_pi(
                     Ok(observed) => {
                         dispatch_futex_pi(memory, address, command, observed, tid, wake)
                     }
-                    Err(refusal) => *refusal,
+                    Err(refusal) => refusal,
                 };
             }
             if owner == tid {
@@ -115,7 +115,7 @@ pub(crate) fn dispatch_futex_pi(
                 Ok(observed) => {
                     return dispatch_futex_pi(memory, address, command, observed, tid, wake);
                 }
-                Err(refusal) => return *refusal,
+                Err(refusal) => return refusal,
             }
             if let Some(wake) = wake {
                 let woken = wake.table.wake(address, 1);
@@ -139,26 +139,29 @@ pub(crate) fn dispatch_futex_pi(
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "dispatcher refusals stay inline so futex admission does not allocate"
+)]
 fn compare_exchange_futex_word(
     memory: &mut impl CurrentMmMemory,
     address: u64,
     expected: u32,
     desired: u32,
-) -> Result<u32, Box<DispatchOutcome>> {
+) -> Result<u32, DispatchOutcome> {
     let mut copy = HostFutexCopy::new(memory);
     let mut observed = 0;
     match copy.atomic_compare_exchange_u32(UserVa::new(address), expected, desired, &mut observed) {
         CopyOutcome::Done => Ok(observed),
-        CopyOutcome::NotYet(_) => Err(Box::new(
-            copy.take_refusal()
-                .and_then(DispatchOutcome::from_owner_memory_error)
-                .unwrap_or(DispatchOutcome::Errno {
-                    errno: LINUX_EFAULT,
-                }),
-        )),
-        CopyOutcome::Fault => Err(Box::new(DispatchOutcome::Errno {
+        CopyOutcome::NotYet(_) => Err(copy
+            .take_refusal()
+            .and_then(DispatchOutcome::from_owner_memory_error)
+            .unwrap_or(DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            })),
+        CopyOutcome::Fault => Err(DispatchOutcome::Errno {
             errno: LINUX_EFAULT,
-        })),
+        }),
     }
 }
 
@@ -424,7 +427,7 @@ pub(crate) fn dispatch_threaded_futex(
             } else {
                 let timespec = match read_futex_timespec(memory, timeout_address) {
                     Ok(t) => t,
-                    Err(outcome) => return *outcome,
+                    Err(outcome) => return outcome,
                 };
                 // FUTEX_WAIT uses a RELATIVE timeout; FUTEX_WAIT_BITSET uses an
                 // ABSOLUTE deadline (CLOCK_MONOTONIC, or CLOCK_REALTIME if
@@ -606,7 +609,7 @@ pub(crate) fn dispatch_zone_futex(
             } else {
                 let timespec = match read_futex_timespec(memory, timeout_address) {
                     Ok(t) => t,
-                    Err(outcome) => return *outcome,
+                    Err(outcome) => return outcome,
                 };
                 if raw_command == LINUX_FUTEX_WAIT_BITSET {
                     Some(relative_from_absolute_timespec(
@@ -708,7 +711,7 @@ pub(crate) fn dispatch_futex_waitv_args(
     } else {
         let timespec = match read_futex_timespec(memory, timeout_address) {
             Ok(timespec) => timespec,
-            Err(outcome) => return *outcome,
+            Err(outcome) => return outcome,
         };
         Some(relative_from_absolute_timespec(
             clock,
@@ -895,10 +898,14 @@ pub(crate) fn read_futex_word(
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "dispatcher refusals stay inline so futex admission does not allocate"
+)]
 fn read_futex_timespec(
     memory: &mut impl CurrentMmMemory,
     address: u64,
-) -> Result<LinuxTimespec, Box<DispatchOutcome>> {
+) -> Result<LinuxTimespec, DispatchOutcome> {
     let mut copy = HostFutexCopy::new(memory);
     let mut bytes = [0u8; core::mem::size_of::<LinuxTimespec>()];
     match copy.copy_in(&mut bytes, UserVa::new(address)) {
@@ -916,21 +923,20 @@ fn read_futex_timespec(
             if linux_timeout_timespec_is_valid(timespec) {
                 Ok(timespec)
             } else {
-                Err(Box::new(DispatchOutcome::Errno {
+                Err(DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
-                }))
+                })
             }
         }),
-        CopyOutcome::NotYet(_) => Err(Box::new(
-            copy.take_refusal()
-                .and_then(DispatchOutcome::from_owner_memory_error)
-                .unwrap_or(DispatchOutcome::Errno {
-                    errno: LINUX_EFAULT,
-                }),
-        )),
-        CopyOutcome::Fault => Err(Box::new(DispatchOutcome::Errno {
+        CopyOutcome::NotYet(_) => Err(copy
+            .take_refusal()
+            .and_then(DispatchOutcome::from_owner_memory_error)
+            .unwrap_or(DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            })),
+        CopyOutcome::Fault => Err(DispatchOutcome::Errno {
             errno: LINUX_EFAULT,
-        })),
+        }),
     }
 }
 
