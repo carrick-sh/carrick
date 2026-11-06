@@ -251,16 +251,32 @@ fn split_at_last_paren(s: &str) -> (&str, &str) {
 /// list` — that enumerates every APFS container on the system and costs
 /// ~250 ms, which a profile showed dominated trivial-guest startup. A
 /// volume named `carrick` is mounted by `diskutil apfs addVolume` at the
-/// conventional `/Volumes/carrick`, so a single `stat` of that path is an
-/// equivalent (and instant) probe for the common case. The slow
+/// conventional `/Volumes/carrick`; a bounded case-sensitivity probe validates
+/// that candidate without enumerating disks. The slow
 /// `diskutil`-backed `find_carrick_volume` is reserved for the explicit
 /// `carrick volume` subcommands, not this per-run path.
-pub fn preferred_scratch_root() -> std::io::Result<PathBuf> {
-    // Cached once per process; the scratch root cannot change while we run.
-    static CACHE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    Ok(CACHE
-        .get_or_init(|| resolve_scratch_root(&Path::new("/Volumes").join(DEFAULT_VOLUME_NAME)))
-        .clone())
+pub fn preferred_scratch_root() -> &'static ScratchRoot {
+    // One process configuration authority owns both immutable decisions.
+    static CACHE: std::sync::OnceLock<ScratchRoot> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| ScratchRoot {
+        path: resolve_scratch_root(&Path::new("/Volumes").join(DEFAULT_VOLUME_NAME)),
+        #[cfg(feature = "fs-memory")]
+        backend_kind: std::sync::OnceLock::new(),
+    })
+}
+
+/// The selected scratch path and its lazily determined backend policy. Each
+/// decision runs once, admitting at most two probe workers in this process.
+pub struct ScratchRoot {
+    path: PathBuf,
+    #[cfg(feature = "fs-memory")]
+    backend_kind: std::sync::OnceLock<carrick_spec::FsBackendKind>,
+}
+
+impl ScratchRoot {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 fn resolve_scratch_root(conventional: &Path) -> PathBuf {
@@ -289,35 +305,33 @@ fn resolve_scratch_root(conventional: &Path) -> PathBuf {
 /// in-memory backend is not selectable and is silently incoherent across guest
 /// `fork` anyway (see the fs-memory design spec).
 pub fn default_writable_backend_kind() -> carrick_spec::FsBackendKind {
-    // Like the scratch-root decision, backend selection is immutable per process.
-    // Together these two caches admit at most two probe workers, even if both
-    // filesystems stall forever. No mutable process-wide admission is needed.
-    static CACHE: std::sync::OnceLock<carrick_spec::FsBackendKind> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(resolve_writable_backend_kind)
-}
-
-fn resolve_writable_backend_kind() -> carrick_spec::FsBackendKind {
     #[cfg(not(feature = "fs-memory"))]
     {
         carrick_spec::FsBackendKind::Host
     }
     #[cfg(feature = "fs-memory")]
     {
-        let probe = preferred_scratch_root()
-            .unwrap_or_else(|_| std::env::temp_dir().join("carrick-scratch"));
-        if std::fs::create_dir_all(&probe).is_err() {
-            return carrick_spec::FsBackendKind::Memory;
-        }
-        if probe_case_sensitive(&probe) {
-            carrick_spec::FsBackendKind::Host
-        } else {
-            tracing::warn!(
-                "carrick: {} is case-insensitive; defaulting --fs to memory. \
-                 Pass `--fs host` to force the cap-std backend (some Linux tools may misbehave).",
-                probe.display()
-            );
-            carrick_spec::FsBackendKind::Memory
-        }
+        let scratch = preferred_scratch_root();
+        *scratch
+            .backend_kind
+            .get_or_init(|| resolve_writable_backend_kind(scratch.path()))
+    }
+}
+
+#[cfg(feature = "fs-memory")]
+fn resolve_writable_backend_kind(probe: &Path) -> carrick_spec::FsBackendKind {
+    if std::fs::create_dir_all(probe).is_err() {
+        return carrick_spec::FsBackendKind::Memory;
+    }
+    if probe_case_sensitive(probe) {
+        carrick_spec::FsBackendKind::Host
+    } else {
+        tracing::warn!(
+            "carrick: {} is case-insensitive; defaulting --fs to memory. \
+             Pass `--fs host` to force the cap-std backend (some Linux tools may misbehave).",
+            probe.display()
+        );
+        carrick_spec::FsBackendKind::Memory
     }
 }
 
