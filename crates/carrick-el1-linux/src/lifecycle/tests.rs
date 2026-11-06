@@ -3469,3 +3469,39 @@ fn managed_clone_copyout_fault_unbinds_birth_before_retry() {
     assert_eq!(parent_word.get(), CHILD_VISIBLE);
     assert_eq!(w.page().live(), 2);
 }
+
+#[test]
+fn native_cross_page_copy_without_owner_returns_fault() {
+    let mut frame = Cpl0IdentityFrame(TrapFrame::default());
+    let counters = Counters::new();
+    let tasks = [CurrentTask::new()];
+    let cache = InotifyNameCache::new();
+    let mut pending = El1PendingFamilies {
+        handoff: None,
+        lifecycle_user: None,
+        frame: &mut frame,
+        counters: &counters,
+        current_tasks: &tasks,
+        fd_map: &[],
+        object_table: &[],
+        open_table: &[],
+        inotify_table: &[],
+        name_cache: &cache,
+        zone: None::<Zone<'_, FakeCpu, HardwareUserWord>>,
+        ipc: None,
+        lifecycle: None,
+        process: None::<&mut dyn carrick_personality_linux::lifecycle::ProcessNative>,
+        source: None,
+        anonymous: None,
+        cache_lookup: |_| core::ptr::null_mut(),
+    };
+    assert_eq!(
+        UserCopy::copy_out(
+            &mut pending,
+            UserVa::new(carrick_guest_arch::USER_CEILING - 3),
+            &[0; 8]
+        ),
+        CopyOutcome::Fault,
+        "a lane without an owner cannot retain a cross-page output"
+    );
+}

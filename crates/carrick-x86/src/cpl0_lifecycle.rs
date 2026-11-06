@@ -6,8 +6,6 @@ use crate::cpl0_entry::{CpuBinding, NativeFrame};
 use crate::cpl0_scheduler::XsaveArea;
 #[cfg(target_os = "none")]
 use crate::cpl0_scheduler::{NativeTlsRegister, read_tls, write_tls};
-#[cfg(not(target_os = "none"))]
-use carrick_abi::LINUX_EFAULT;
 use carrick_core_abi::EntryMmKey;
 use carrick_el1_abi::{Counters, CurrentTask, EntryRef, ThreadControlSlot, ThreadLifecyclePage};
 use carrick_guest_arch::{RootGpa, UserVa};
@@ -23,8 +21,6 @@ use carrick_personality_linux::{
 use carrick_sched_core::{
     BoundedSpin, Claim, RecordRef, SlotId, ThreadIdentity, WakeEffects, Waker, ZoneTables,
 };
-#[cfg(target_os = "none")]
-use carrick_syscall_abi::LINUX_EFAULT;
 use core::sync::atomic::{AtomicU16, Ordering};
 #[cfg(target_os = "none")]
 use rust_alloc::vec::Vec;
@@ -712,17 +708,10 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         bytes: Vec<u8>,
         work: bool,
     ) -> LifecycleOutcome {
-        let result = match self.copy_out(address, &bytes) {
-            carrick_core::personality::CopyOutcome::Done => 0,
-            carrick_core::personality::CopyOutcome::Fault => LINUX_EFAULT.guest_retval(),
-            carrick_core::personality::CopyOutcome::NotYet(request) => {
-                return self.wait_guest_copy(request);
-            }
-        };
-        LifecycleOutcome::Returned {
-            result: SyscallResult::new(result),
-            work,
-        }
+        let _ = (address, bytes, work);
+        // This eagerly provisioned aperture never returns NotYet. A deferred
+        // answer here would lose its setup effect if redispatched.
+        self.fail_lifecycle(carrick_core_abi::NativeRunFailureReason::NativeQuarantined)
     }
     fn guest_isa(&self) -> carrick_guest_arch::GuestIsa {
         carrick_guest_arch::GuestIsa::X86_64

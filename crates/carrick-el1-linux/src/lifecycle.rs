@@ -116,6 +116,19 @@ impl<
         if let Some(user) = &mut self.lifecycle_user {
             return CopyOutcome::from_completed(user.copy_out(dst.raw(), src));
         }
+        // The native physical adapter reports only whole-copy completion.
+        // A multi-page attempt can commit a prefix before an owner wait, so
+        // give its cursor to the retained output owner before writing a byte.
+        if !self.frame.arm_scheduler()
+            && src.len() > 4096 - (dst.raw() as usize & 4095)
+            && self.process_venue().is_some()
+        {
+            return CopyOutcome::NotYet(GuestCopyRequest {
+                address: dst,
+                len: carrick_guest_arch::GuestLen::new(src.len() as u64),
+                access: carrick_guest_arch::Access::Write,
+            });
+        }
         if !self.frame.arm_scheduler()
             && let Some(result) = self
                 .process_venue()
@@ -187,21 +200,6 @@ impl<
         bytes: alloc::vec::Vec<u8>,
         work: bool,
     ) -> LifecycleOutcome {
-        match UserCopy::copy_out(self, address, &bytes) {
-            CopyOutcome::Done => {
-                return LifecycleOutcome::Returned {
-                    result: SyscallResult::new(0),
-                    work,
-                };
-            }
-            CopyOutcome::Fault => {
-                return LifecycleOutcome::Returned {
-                    result: SyscallResult::new(-14),
-                    work,
-                };
-            }
-            CopyOutcome::NotYet(_) => {}
-        }
         let venue = self.process_venue().unwrap_or_else(|| {
             super::dispatch::invalid_completion(super::dispatch::NativeInvariant::EntryBinding)
         });
