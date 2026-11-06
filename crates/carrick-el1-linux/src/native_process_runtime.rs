@@ -4069,6 +4069,18 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         Ok(())
     }
 
+    /// A scheduler handoff can replace the task on this slot while an older
+    /// native entry is still unwinding. That entry cannot select signals or
+    /// publish a frame for its successor's registers and address space.
+    pub(crate) fn matches_signal_return(
+        &self,
+        task: &CurrentTask,
+        control: &ThreadControlSlot,
+    ) -> bool {
+        self.binding == crate::common_entry::execution_binding(task)
+            && core::ptr::eq(self.control, control)
+    }
+
     /// Test pending native work before the ISA saves FP/SIMD for delivery.
     /// A suspended mask needs its restoration even if no signal is pending.
     pub fn signal_checkpoint_needed(&self) -> bool {

@@ -9,6 +9,8 @@ mod native_fault_supply_tests;
 mod native_ipc_wake_tests;
 #[cfg(test)]
 mod native_retirement_tests;
+#[cfg(test)]
+mod native_signal_resume_tests;
 
 use super::aarch64_process::{Aarch64NativeProcessService, ForkStockCrossing};
 #[cfg(test)]
