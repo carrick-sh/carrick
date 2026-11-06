@@ -12283,6 +12283,11 @@ fn exit_nonresident_pages(clear_only: bool) {
         futex_offset: i64,
         list_op_pending: u64,
     }
+    let mut last_node = carrick_test_support::GuestUserBuffer::from_value(RobustNode {
+        next: 0,
+        futex: 42 | 0x8000_0000,
+        pad: 0,
+    });
     let mut robust_node = carrick_test_support::GuestUserBuffer::from_value(RobustNode {
         next: 0,
         futex: 42 | 0x8000_0000, // owned by TID 42 with FUTEX_WAITERS bit
@@ -12297,12 +12302,20 @@ fn exit_nonresident_pages(clear_only: bool) {
     robust_node.set(
         0,
         RobustNode {
-            next: robust_head.arg(),
+            next: last_node.arg(),
             futex: 42 | 0x8000_0000,
             pad: 0,
         },
     );
 
+    last_node.set(
+        0,
+        RobustNode {
+            next: robust_head.arg(),
+            futex: 42 | 0x8000_0000,
+            pad: 0,
+        },
+    );
     frame.x = [0; 31];
     frame.x[0] = if clear_only { 0 } else { robust_head.arg() };
     frame.x[1] = 24;
@@ -12336,6 +12349,39 @@ fn exit_nonresident_pages(clear_only: bool) {
         ));
     }
 
+    if !clear_only {
+        crate::lifecycle::COPYIN_CALLS.with(|calls| calls.borrow_mut().clear());
+        crate::lifecycle::COPYIN_NOT_YET_AT.with(|address| address.set(Some(last_node.arg())));
+        frame.x = [0; 31];
+        frame.x[8] = 93;
+        frame.elr = 0x40_3000;
+        let parked = arm_call(fixture, sibling_control, &mut service, &mut frame);
+        crate::lifecycle::COPYIN_NOT_YET_AT.with(|address| address.set(None));
+        assert_eq!(
+            parked.unwrap(),
+            carrick_personality_linux::dispatch::CompletionRoute::Served
+        );
+        assert_eq!(robust_node.get::<RobustNode>(0).futex, 0xc000_0000);
+        crate::lifecycle::CHILD_TID_WAKE_CALLS
+            .with(|calls| assert_eq!(&*calls.borrow(), &[robust_node.arg_at(8)]));
+    }
+
+    if !clear_only {
+        crate::lifecycle::COPYOUT_NOT_YET_AT.with(|address| address.set(Some(last_node.arg_at(8))));
+        frame.x = [0; 31];
+        frame.x[8] = 93;
+        frame.elr = 0x40_3000;
+        let parked = arm_call(fixture, sibling_control, &mut service, &mut frame);
+        crate::lifecycle::COPYOUT_NOT_YET_AT.with(|address| address.set(None));
+        assert_eq!(
+            parked.unwrap(),
+            carrick_personality_linux::dispatch::CompletionRoute::Served
+        );
+        assert_eq!(last_node.get::<RobustNode>(0).futex, 42 | 0x8000_0000);
+        crate::lifecycle::CHILD_TID_WAKE_CALLS
+            .with(|calls| assert_eq!(&*calls.borrow(), &[robust_node.arg_at(8)]));
+    }
+
     // 2. Exit when clear_child_tid page is not yet backed for copyout:
     // NotYet rewinds and prepares without losing membership or wake.
     frame.x = [0; 31];
@@ -12362,7 +12408,39 @@ fn exit_nonresident_pages(clear_only: bool) {
     if !clear_only {
         assert_eq!(robust_node.get::<RobustNode>(0).futex, 0xc000_0000);
         crate::lifecycle::CHILD_TID_WAKE_CALLS.with(|calls| {
-            assert_eq!(&*calls.borrow(), &[robust_node.arg_at(8)]);
+            assert_eq!(
+                &*calls.borrow(),
+                &[robust_node.arg_at(8), last_node.arg_at(8)]
+            );
+        });
+        crate::lifecycle::COPYIN_CALLS.with(|calls| {
+            assert_eq!(
+                calls
+                    .borrow()
+                    .iter()
+                    .filter(|address| **address == robust_head.arg())
+                    .count(),
+                1,
+                "retained cursor must not restart the head"
+            );
+            assert_eq!(
+                calls
+                    .borrow()
+                    .iter()
+                    .filter(|address| **address == robust_node.arg())
+                    .count(),
+                1,
+                "retained cursor must not repeat a completed entry"
+            );
+            assert_eq!(
+                calls
+                    .borrow()
+                    .iter()
+                    .filter(|address| **address == last_node.arg_at(8))
+                    .count(),
+                1,
+                "a refused write retains the original WAITERS word"
+            );
         });
     }
 
@@ -12399,7 +12477,11 @@ fn exit_nonresident_pages(clear_only: bool) {
             if clear_only {
                 vec![clear_tid_word.arg()]
             } else {
-                vec![robust_node.arg_at(8), clear_tid_word.arg()]
+                vec![
+                    robust_node.arg_at(8),
+                    last_node.arg_at(8),
+                    clear_tid_word.arg(),
+                ]
             }
             .as_slice(),
             "one robust wake and one clear-child-TID wake, without replay"

@@ -181,3 +181,11 @@ places an eight-byte old mask three bytes before a page boundary, writes those
 three bytes, waits on the second page's exact owner, and requires only the
 remaining five bytes on resume. No initial copy or completion hook may replay
 the committed first page or the already committed mask update.
+Thread exit retains its robust-list cursor in the exact member's control slot.
+A refusal at a later entry never rereads the head or a completed entry. The
+read, owner-died write, wake, and declined-wake restoration are distinct phases;
+a refused write retains the original futex word, including FUTEX_WAITERS.
+The production ARM non-last-thread exit witness parks on the second list entry
+and its output, then on clear-child-TID: each owned mutex becomes 0xc0000000,
+each gets one wake, and completed entries have one next-pointer read each.
+No cursor or write permit is held by an execution slot while parked.

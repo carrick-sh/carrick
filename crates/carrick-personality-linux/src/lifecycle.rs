@@ -1668,46 +1668,12 @@ const FUTEX_WAITERS: u32 = 0x8000_0000;
 const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
 const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
 
-fn handle_exit_robust_futex<'a>(
-    node_addr: u64,
-    futex_offset: i64,
-    current_tid: u32,
-    mm_key: EntryMmKey,
-    native: &mut dyn LifecycleNative<'a>,
-) -> Result<(), Option<LifecycleOutcome>> {
-    let futex_addr = (node_addr as i64).wrapping_add(futex_offset) as u64;
-    let mut futex_bytes = [0u8; 4];
-    let read_outcome = native.copy_in(&mut futex_bytes, UserVa::new(futex_addr));
-    match read_outcome {
-        CopyOutcome::Done => {}
-        CopyOutcome::NotYet(req) => return Err(Some(native.wait_guest_copy(req))),
-        CopyOutcome::Fault => return Ok(()),
-    }
-    let futex_word = u32::from_le_bytes(futex_bytes);
-    if (futex_word & FUTEX_TID_MASK) == current_tid {
-        let new_val = (futex_word & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
-        let write_outcome = native.copy_out(UserVa::new(futex_addr), &new_val.to_le_bytes());
-        match write_outcome {
-            CopyOutcome::Done => {}
-            CopyOutcome::NotYet(req) => return Err(Some(native.wait_guest_copy(req))),
-            CopyOutcome::Fault => return Ok(()),
-        }
-        if (futex_word & FUTEX_WAITERS) != 0
-            && !native.wake_child_tid(mm_key, UserVa::new(futex_addr))
-        {
-            let _ = native.copy_out(UserVa::new(futex_addr), &futex_word.to_le_bytes());
-            native.record_decline(LifecycleDecline::ExitRobust);
-            return Err(None);
-        }
-    }
-    Ok(())
-}
-
 fn walk_exit_robust_list<'a>(
     slot: &ThreadControlSlot,
     mm_key: EntryMmKey,
     native: &mut dyn LifecycleNative<'a>,
 ) -> Result<(), Option<LifecycleOutcome>> {
+    use crate::abi::thread::{RobustExitCursor, RobustExitPhase};
     let (head, _len) = slot.robust_list();
     if head == 0 {
         return Ok(());
@@ -1720,46 +1686,121 @@ fn walk_exit_robust_list<'a>(
         native.record_decline(LifecycleDecline::ExitRobust);
         return Err(None);
     };
-    let mut head_bytes = [0u8; 24];
-    let head_copy = native.copy_in(&mut head_bytes, UserVa::new(head));
-    match head_copy {
-        CopyOutcome::Done => {}
-        CopyOutcome::NotYet(req) => return Err(Some(native.wait_guest_copy(req))),
-        CopyOutcome::Fault => {
-            slot.set_robust_list(0, 0);
-            return Ok(());
-        }
-    }
-    let mut b0 = [0u8; 8];
-    b0.copy_from_slice(&head_bytes[0..8]);
-    let mut entry = u64::from_le_bytes(b0);
-    let mut b1 = [0u8; 8];
-    b1.copy_from_slice(&head_bytes[8..16]);
-    let futex_offset = i64::from_le_bytes(b1);
-    let mut b2 = [0u8; 8];
-    b2.copy_from_slice(&head_bytes[16..24]);
-    let pending = u64::from_le_bytes(b2);
-
-    let mut count = 0usize;
-    while entry != head && entry != 0 && count < ROBUST_LIST_LIMIT {
-        let mut next_bytes = [0u8; 8];
-        let next_copy = native.copy_in(&mut next_bytes, UserVa::new(entry));
-        let next_entry = match next_copy {
-            CopyOutcome::Done => u64::from_le_bytes(next_bytes),
+    let mut cursor = if let Some(cursor) = slot.robust_exit_cursor() {
+        cursor
+    } else {
+        let mut bytes = [0u8; 24];
+        match native.copy_in(&mut bytes, UserVa::new(head)) {
+            CopyOutcome::Done => {}
             CopyOutcome::NotYet(req) => return Err(Some(native.wait_guest_copy(req))),
-            CopyOutcome::Fault => break,
-        };
-        if entry != pending {
-            handle_exit_robust_futex(entry, futex_offset, current_tid, mm_key, native)?;
+            CopyOutcome::Fault => {
+                slot.set_robust_list(0, 0);
+                return Ok(());
+            }
         }
-        entry = next_entry;
-        count += 1;
+        let word = |offset: usize| {
+            let mut value = [0; 8];
+            value.copy_from_slice(&bytes[offset..offset + 8]);
+            u64::from_le_bytes(value)
+        };
+        RobustExitCursor {
+            entry: word(0),
+            next: 0,
+            offset: word(8) as i64,
+            pending: word(16),
+            count: 0,
+            word: 0,
+            phase: RobustExitPhase::Next,
+        }
+    };
+    loop {
+        slot.retain_robust_exit(cursor);
+        let address = UserVa::new(cursor.entry.wrapping_add_signed(cursor.offset));
+        match cursor.phase {
+            RobustExitPhase::Next => {
+                if cursor.entry == head
+                    || cursor.entry == 0
+                    || cursor.count >= ROBUST_LIST_LIMIT as u64
+                {
+                    if cursor.pending == 0 {
+                        slot.set_robust_list(0, 0);
+                        return Ok(());
+                    }
+                    cursor.entry = cursor.pending;
+                    cursor.pending = 0;
+                    cursor.next = 0;
+                    cursor.phase = RobustExitPhase::Read;
+                    continue;
+                }
+                let mut bytes = [0; 8];
+                match native.copy_in(&mut bytes, UserVa::new(cursor.entry)) {
+                    CopyOutcome::Done => cursor.next = u64::from_le_bytes(bytes),
+                    CopyOutcome::NotYet(req) => return Err(Some(native.wait_guest_copy(req))),
+                    CopyOutcome::Fault => {
+                        cursor.entry = 0;
+                        continue;
+                    }
+                }
+                if cursor.entry == cursor.pending {
+                    cursor.entry = cursor.next;
+                    cursor.count += 1;
+                } else {
+                    cursor.phase = RobustExitPhase::Read;
+                }
+            }
+            RobustExitPhase::Read => {
+                let mut bytes = [0; 4];
+                match native.copy_in(&mut bytes, address) {
+                    CopyOutcome::Done => cursor.word = u32::from_le_bytes(bytes),
+                    CopyOutcome::NotYet(req) => return Err(Some(native.wait_guest_copy(req))),
+                    CopyOutcome::Fault => {
+                        cursor.entry = cursor.next;
+                        cursor.count += 1;
+                        cursor.phase = RobustExitPhase::Next;
+                        continue;
+                    }
+                }
+                if cursor.word & FUTEX_TID_MASK == current_tid {
+                    cursor.phase = RobustExitPhase::Write;
+                } else {
+                    cursor.entry = cursor.next;
+                    cursor.count += 1;
+                    cursor.phase = RobustExitPhase::Next;
+                }
+            }
+            RobustExitPhase::Write => {
+                // Retain the original word across a partial/refused copy; never
+                // derive WAITERS or wake authority from our own modified output.
+                let value = (cursor.word & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
+                match native.copy_out(address, &value.to_le_bytes()) {
+                    CopyOutcome::Done => cursor.phase = RobustExitPhase::Wake,
+                    CopyOutcome::NotYet(req) => return Err(Some(native.wait_guest_copy(req))),
+                    CopyOutcome::Fault => {
+                        cursor.entry = cursor.next;
+                        cursor.count += 1;
+                        cursor.phase = RobustExitPhase::Next;
+                    }
+                }
+            }
+            RobustExitPhase::Wake => {
+                if cursor.word & FUTEX_WAITERS != 0 && !native.wake_child_tid(mm_key, address) {
+                    cursor.phase = RobustExitPhase::Restore;
+                    continue;
+                }
+                cursor.entry = cursor.next;
+                cursor.count += 1;
+                cursor.phase = RobustExitPhase::Next;
+            }
+            RobustExitPhase::Restore => {
+                match native.copy_out(address, &cursor.word.to_le_bytes()) {
+                    CopyOutcome::NotYet(req) => return Err(Some(native.wait_guest_copy(req))),
+                    CopyOutcome::Done | CopyOutcome::Fault => {}
+                }
+                native.record_decline(LifecycleDecline::ExitRobust);
+                return Err(None);
+            }
+        }
     }
-    if pending != 0 {
-        handle_exit_robust_futex(pending, futex_offset, current_tid, mm_key, native)?;
-    }
-    slot.set_robust_list(0, 0);
-    Ok(())
 }
 
 /// `exit(status)` of a non-leader thread that EL1 switched in, when it is

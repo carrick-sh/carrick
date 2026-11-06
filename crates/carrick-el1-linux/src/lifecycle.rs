@@ -17,6 +17,8 @@ pub use carrick_personality_linux::thread::{LifecycleThread, SYS_SET_ROBUST_LIST
 
 #[cfg(test)]
 std::thread_local! {
+    pub(super) static COPYIN_NOT_YET_AT: core::cell::Cell<Option<u64>> = const { core::cell::Cell::new(None) };
+    pub(super) static COPYIN_CALLS: core::cell::RefCell<std::vec::Vec<u64>> = const { core::cell::RefCell::new(std::vec::Vec::new()) };
     pub(super) static COPYOUT_NOT_YET_AT: core::cell::Cell<Option<u64>> = const {
         core::cell::Cell::new(None)
     };
@@ -94,6 +96,17 @@ impl<
 > UserCopy for El1PendingFamilies<'_, F, C, U, G, Context>
 {
     fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> CopyOutcome {
+        #[cfg(test)]
+        {
+            COPYIN_CALLS.with(|calls| calls.borrow_mut().push(src.raw()));
+            if COPYIN_NOT_YET_AT.with(|address| address.get() == Some(src.raw())) {
+                return CopyOutcome::NotYet(GuestCopyRequest {
+                    address: src,
+                    len: carrick_guest_arch::GuestLen::new(dst.len() as u64),
+                    access: carrick_guest_arch::Access::Read,
+                });
+            }
+        }
         #[cfg(test)]
         if let Some(user) = &mut self.lifecycle_user {
             return CopyOutcome::from_completed(user.copy_in(dst, src.raw()));

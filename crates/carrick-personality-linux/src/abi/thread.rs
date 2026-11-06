@@ -50,7 +50,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 /// Protocol revision, folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 21;
+pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 22;
 
 pub use carrick_core::lifecycle::{ClaimedEntry, ExitAdmission, Lifecycle, MemberControlCustody};
 pub use carrick_core_abi::lifecycle::*;
@@ -564,6 +564,7 @@ pub struct ThreadControlSlot {
     release_waiter: carrick_core::lifecycle::MemberReleaseWaiter,
     /// Exact native service custody survives execution-slot reuse.
     pub service: carrick_core_abi::service::ServiceCell,
+    robust_cursor: [AtomicU64; 7],
 }
 
 /// Quiescent initialization was attempted on a live execution authority.
@@ -575,6 +576,26 @@ pub struct ThreadControlSlot {
     ::core::cmp::PartialEq,
 )]
 pub struct AffinitySeedRefused;
+
+/// Exact exit-walk progress, owned by the stopped/running member, never by a CPU.
+#[derive(Clone, Copy)]
+pub(crate) struct RobustExitCursor {
+    pub entry: u64,
+    pub next: u64,
+    pub offset: i64,
+    pub pending: u64,
+    pub count: u64,
+    pub word: u32,
+    pub phase: RobustExitPhase,
+}
+#[derive(Clone, Copy)]
+pub(crate) enum RobustExitPhase {
+    Next,
+    Read,
+    Write,
+    Wake,
+    Restore,
+}
 
 impl ThreadControlSlot {
     /// The stopped execution owner publishes once; migration retains this exact
@@ -707,6 +728,7 @@ impl ThreadControlSlot {
             native_pending_writer: AtomicU32::new(0),
             in_zone_standard_pending: InZoneStandardPending::new(),
             service: carrick_core_abi::service::ServiceCell::new(),
+            robust_cursor: [const { AtomicU64::new(0) }; 7],
         }
     }
 
@@ -861,6 +883,7 @@ impl ThreadControlSlot {
         self.alt_sp.store(0, Ordering::Relaxed);
         self.alt_size.store(0, Ordering::Relaxed);
         self.alt_flags.store(0, Ordering::Relaxed);
+        self.robust_cursor[6].store(0, Ordering::Relaxed);
         self.robust_head.store(0, Ordering::Relaxed);
         self.robust_len.store(0, Ordering::Relaxed);
         self.clear_child_tid.store(
@@ -1050,8 +1073,52 @@ impl ThreadControlSlot {
 
     /// Owner-written robust list registration `(head, len)`.
     pub fn set_robust_list(&self, head: u64, len: u32) {
+        self.robust_cursor[6].store(0, Ordering::Relaxed);
         self.robust_head.store(head, Ordering::Relaxed);
         self.robust_len.store(len, Ordering::Release);
+    }
+    /// Only the exact member's execution owner reads or publishes this cursor.
+    pub(crate) fn robust_exit_cursor(&self) -> Option<RobustExitCursor> {
+        let phase = match self.robust_cursor[6].load(Ordering::Acquire) {
+            1 => RobustExitPhase::Next,
+            2 => RobustExitPhase::Read,
+            3 => RobustExitPhase::Write,
+            4 => RobustExitPhase::Wake,
+            5 => RobustExitPhase::Restore,
+            _ => return None,
+        };
+        let load = |i: usize| self.robust_cursor[i].load(Ordering::Relaxed);
+        Some(RobustExitCursor {
+            entry: load(0),
+            next: load(1),
+            offset: load(2) as i64,
+            pending: load(3),
+            count: load(4),
+            word: load(5) as u32,
+            phase,
+        })
+    }
+    pub(crate) fn retain_robust_exit(&self, cursor: RobustExitCursor) {
+        for (cell, value) in self.robust_cursor.iter().zip([
+            cursor.entry,
+            cursor.next,
+            cursor.offset as u64,
+            cursor.pending,
+            cursor.count,
+            u64::from(cursor.word),
+        ]) {
+            cell.store(value, Ordering::Relaxed);
+        }
+        self.robust_cursor[6].store(
+            match cursor.phase {
+                RobustExitPhase::Next => 1,
+                RobustExitPhase::Read => 2,
+                RobustExitPhase::Write => 3,
+                RobustExitPhase::Wake => 4,
+                RobustExitPhase::Restore => 5,
+            },
+            Ordering::Release,
+        );
     }
     /// `(head, len)`; read by the owner or by the exit walker after the
     /// owner has stopped.
@@ -1575,11 +1642,8 @@ impl LifecycleHatches {
             | (if self.sigmask { SERVING_SIGMASK } else { 0 })
     }
 }
-// 448, not 384: the synchronous-fault fields (`fault_address`, `fault_code`,
-// `fault_signal`) and the member `release_waiter` took the last padding before
-// the 64-aligned `ServiceCell`, which therefore moved from 256 to 320 (#1100).
-// Loan sizes and `EL1_ABI_LAYOUT_HASH` derive from this layout.
-const _: () = assert!(core::mem::size_of::<ThreadControlSlot>() == 448);
+// The member-owned robust cursor follows the aligned service cell.
+const _: () = assert!(core::mem::size_of::<ThreadControlSlot>() == 512);
 const _: () = assert!(core::mem::align_of::<carrick_core_abi::service::ServiceCell>() == 64);
 const _: () = assert!(core::mem::offset_of!(ThreadControlSlot, service) == 320);
 const _: () = assert!(core::mem::size_of::<PoolEntry>() == 80);
@@ -3225,7 +3289,7 @@ mod layout_manifest {
                 size_of::<ThreadControlSlot>(),
                 align_of::<ThreadControlSlot>()
             ),
-            (448, 64)
+            (512, 64)
         );
         // Exhaustive pattern makes newly added fields require a manifest entry.
         let _ = |ThreadControlSlot {
@@ -3264,6 +3328,7 @@ mod layout_manifest {
                      affinity_guest_alias: _,
                      release_waiter: _,
                      service: _,
+                     robust_cursor: _,
                  }: ThreadControlSlot| {};
         field!(ThreadControlSlot, visible_tid, AtomicU32, 0, 4, 4);
         field!(ThreadControlSlot, fault_address, AtomicU64, 8, 8, 8);
@@ -3363,6 +3428,7 @@ mod layout_manifest {
             128,
             64
         );
+        field!(ThreadControlSlot, robust_cursor, [AtomicU64; 7], 448, 56, 8);
     }
 
     #[test]
