@@ -965,6 +965,7 @@ impl Personality for LinuxPersonality {
         }
 
         let files = file_tables(binding);
+        let ipc = carrick_el1_linux::ipc::guest_venue(binding.cpu_slot);
         let cache_lookup = |handle: u32| {
             files
                 .cache(handle)
@@ -1021,7 +1022,7 @@ impl Personality for LinuxPersonality {
                         carrick_el1::substrate::sched::HardwareUserWord,
                     >,
                 >,
-                None,
+                ipc.as_ref(),
                 Some(&GuestLifecycleVenue),
                 Some(&mut *process),
                 Some(source),

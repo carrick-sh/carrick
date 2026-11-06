@@ -2401,9 +2401,10 @@ impl<
         self.frame.may_serve_poll()
     }
     fn native_descriptor_owner(&self) -> bool {
-        self.ipc
-            .zip(self.task())
-            .is_some_and(|(venue, task)| venue.tables.is_owned_table(task))
+        matches!(
+            self.native_descriptor_namespace(),
+            NativeDescriptorNamespace::Native(_)
+        )
     }
     fn may_serve_descriptor(&self) -> bool {
         let ordinal = self.frame.canonical_ordinal().raw();
@@ -3275,6 +3276,12 @@ pub(super) fn native_scheduler<'s, C: sched::ThreadCpu, U: sched::UserWord>(
     }
 }
 
+// An unavailable publication cannot select the legacy numeric namespace.
+enum NativeDescriptorNamespace {
+    Legacy,
+    Native(Option<carrick_el1_abi::ipc::RawTableId>),
+}
+
 struct NativeFdWait;
 impl carrick_el1_abi::ipc::LockWait for NativeFdWait {
     fn wait(&self, _attempt: u32) -> bool {
@@ -3355,6 +3362,27 @@ fn run_with_table_growth<T>(
 impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context: DispatchContext>
     El1PendingFamilies<'_, F, C, U, G, Context>
 {
+    fn native_descriptor_namespace(&self) -> NativeDescriptorNamespace {
+        let native = self
+            .process
+            .as_deref()
+            .is_some_and(|process| process.owns_descriptor_namespace());
+        let Some((venue, task)) = self.ipc.zip(self.task()) else {
+            return if native {
+                NativeDescriptorNamespace::Native(None)
+            } else {
+                NativeDescriptorNamespace::Legacy
+            };
+        };
+        if let Some(table) = venue.tables.owned_table_of(task) {
+            return NativeDescriptorNamespace::Native(Some(table));
+        }
+        if native {
+            return NativeDescriptorNamespace::Native(venue.tables.table_of(task));
+        }
+        NativeDescriptorNamespace::Legacy
+    }
+
     fn settle_delegated_release(
         frame: &mut G,
         open_table: &[DelegatedOpenFile],
@@ -3468,7 +3496,8 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
         let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return FamilyCompletion::Forward;
         };
-        let Some(raw) = venue.tables.owned_table_of(task) else {
+        let NativeDescriptorNamespace::Native(Some(raw)) = self.native_descriptor_namespace()
+        else {
             return FamilyCompletion::Forward;
         };
         let table = TableId::from_raw(raw);

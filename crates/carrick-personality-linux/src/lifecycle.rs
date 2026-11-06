@@ -255,6 +255,12 @@ pub enum ThreadBirthAdmission {
 pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::ThreadCtx> {
     /// The admitted process graph owns root identity; namespace PID 1 does not.
     fn is_root_process(&self) -> bool;
+    /// A native execution record owns its complete published descriptor
+    /// namespace even when the carrier supplied its initial table. Borrowed
+    /// host records retain their host mutation owner.
+    fn owns_descriptor_namespace(&self) -> bool {
+        false
+    }
     /// Resume this exact thread's retained operation before a new syscall is
     /// dispatched. Readiness alone cannot authorize a user return.
     fn resume_owned_continuation(&mut self) -> Option<LifecycleOutcome> {

@@ -3,7 +3,6 @@
 The production KVM read-only and private-write witnesses now pass. The same
 shared mapping handler and file-fault supply serve the x86 calls. Acceptance
 is still incomplete: prepared-edit contention has no owned suspension binding,
-the stronger fork-lifetime case stops at parent close errno 9,
 and a CLI `/bin/echo ok` attempt exits 127 without a host-file crossing.
 Neither libc loading nor Python startup is proven.
 
@@ -71,16 +70,22 @@ anonymous pages.
 
 `cpl0_initial_mm` exercises read-only first-touch, private writes with an
 unchanged source, write-only fd rejection (errno 13), beyond-EOF SIGBUS, and
-a red child first-touch case after the parent unmaps. The child case blocks SIGUSR1 before
+child first-touch after the parent unmaps. The child case blocks SIGUSR1 before
 fork; the parent unmaps and closes its fd before signalling. The child closes
 its inherited fd before its bounded five-second sigtimedwait, then faults and
 writes the mapping. The host compares the file bytes after both tasks finish.
 Every fixture also runs under a bounded native Linux control.
-The strengthened child case currently fails at the parent close with errno 9
-(exit 38), before the signal and child first-touch. The earlier case passed
-when close results were unchecked and the child kept its fd; that result is
-not evidence for mapping-only lifetime. Keep the red case as an acceptance
-blocker rather than weakening its fd-lifetime requirements.
+The strengthened case was red at parent close (errno 9, exit 38), then at
+child close (errno 9, child exit 37). The x86 dispatcher did not attach its
+mapped IPC venue and the fork service copied only the legacy descriptor
+projection. Native records now select their complete published namespace;
+borrowed host records retain their host mutation owner. ARM's existing
+shared-IPC fork and retirement operations moved into
+`file_table::{fork_native_namespace,retire_native_namespace}` and both ISAs
+call them. Delegated-child rollback and deferred physical release are
+preserved. The strengthened KVM case now passes with both close results
+checked. The existing VM-free vfork schedule also checks that a borrowed host
+record cannot claim this descriptor ownership while its native child can.
 
 The shared host-source witness samples a partial final page, truncates the
 already retained file, and requires inaccessible supply past its new EOF. This
@@ -102,7 +107,10 @@ retain the exact `NativeMapKey` and source in the existing per-member map-source
 custody across parking, consume the matching scheduler operation on resume,
 and release execution capacity through the existing native process owner.
 Restarting and staging a new source is not an equivalent fix: it changes
-custody and can leak sources. Root Busy needs the same owned release protocol.
+custody and can leak sources. Root Busy and an unavailable native descriptor publication need the same
+owned release protocol. The descriptor selector retains native ownership
+when its publication is unavailable; it still forwards rather than parking,
+which remains a P1 acceptance blocker.
 Add production Busy-once/then-success and prepared-conflict witnesses before
 claiming concurrency acceptance. Full signed ARM gates and loader acceptance
 remain outstanding.
