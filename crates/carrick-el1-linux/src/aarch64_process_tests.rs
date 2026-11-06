@@ -12505,7 +12505,7 @@ fn exit_nonresident_pages(clear_only: bool, park_output: bool, fault_clear: bool
             "a faulting clear_child_tid is ignored and SYS_exit retains terminal custody"
         );
         assert_ne!(frame.x[0] as i64, -14, "SYS_exit must never return EFAULT");
-        assert!(sibling_control.robust_exit_cursor().is_none());
+        assert_eq!(sibling_control.robust_list().0, 0);
         return;
     }
     assert_eq!(
