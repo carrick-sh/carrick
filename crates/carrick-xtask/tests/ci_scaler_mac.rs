@@ -208,31 +208,37 @@ fn run_once_state_is_one_use_and_bound_to_the_vetted_run() {
 /// the umask `sudo` happened to pass down (a developer's 0007 gave 0640).
 #[test]
 fn serial_host_run_once_state_modes_do_not_depend_on_the_callers_umask() {
-    for mask in [0o000, 0o007, 0o027, 0o077, 0o277] {
-        let _umask = UmaskGuard::new(mask);
-        let (root, exe, uid) = fixture();
-        let state_root = root.path().join("run");
-        let state = prepare_run_once(
-            "carrick-hvf-10-1-1-100",
-            &exe,
-            &state_root,
-            &binding(),
-            uid,
-            uid,
-        )
-        .unwrap();
-        let mode =
-            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&state), 0o755, "state dir under umask {mask:o}");
-        assert_eq!(mode(&state.join("policy")), 0o644, "umask {mask:o}");
-        assert_eq!(mode(&state.join("admit-job.sh")), 0o755, "umask {mask:o}");
-        assert_eq!(
-            mode(&state.join("assignment.json")),
-            0o600,
-            "umask {mask:o}"
-        );
-        assert_eq!(mode(&state.join("admission.lock")), 0o600, "umask {mask:o}");
-    }
+    run_with_isolated_umask(
+        "serial_host_run_once_state_modes_do_not_depend_on_the_callers_umask",
+        || {
+            for mask in [0o000, 0o007, 0o027, 0o077, 0o277] {
+                let _umask = UmaskGuard::new(mask);
+                let (root, exe, uid) = fixture();
+                let state_root = root.path().join("run");
+                let state = prepare_run_once(
+                    "carrick-hvf-10-1-1-100",
+                    &exe,
+                    &state_root,
+                    &binding(),
+                    uid,
+                    uid,
+                )
+                .unwrap();
+                let mode = |path: &std::path::Path| {
+                    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+                };
+                assert_eq!(mode(&state), 0o755, "state dir under umask {mask:o}");
+                assert_eq!(mode(&state.join("policy")), 0o644, "umask {mask:o}");
+                assert_eq!(mode(&state.join("admit-job.sh")), 0o755, "umask {mask:o}");
+                assert_eq!(
+                    mode(&state.join("assignment.json")),
+                    0o600,
+                    "umask {mask:o}"
+                );
+                assert_eq!(mode(&state.join("admission.lock")), 0o600, "umask {mask:o}");
+            }
+        },
+    );
 }
 
 #[test]
@@ -463,6 +469,33 @@ fn reset_never_writes_through_a_symlink_planted_in_the_job_home() {
     assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1);
 }
 
+/// `umask(2)` mutates the OS process's file-creation mask across every thread.
+/// Re-exec each `UmaskGuard` test in its own single-threaded child process so
+/// adversarial masks (`0o277` owner-readonly, `0o000` world-writable) can never
+/// race with sibling tests or corrupt saved masks even under unpartitioned
+/// `cargo test` runs.
+fn run_with_isolated_umask(test_name: &str, body: impl FnOnce()) {
+    const CHILD_ENV: &str = "CARRICK_XTASK_UMASK_ISOLATED_CHILD";
+    if std::env::var(CHILD_ENV).as_deref() == Ok(test_name) {
+        body();
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--nocapture"])
+        .env(CHILD_ENV, test_name)
+        .env("RUST_TEST_THREADS", "1")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("1 passed; 0 failed"),
+        "isolated umask child {test_name} failed ({}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+}
+
 struct UmaskGuard {
     prev: libc::mode_t,
 }
@@ -484,120 +517,154 @@ impl Drop for UmaskGuard {
 
 #[test]
 fn serial_host_runner_tree_and_skeleton_reset_succeed_under_group_writable_umask() {
-    for mask in [0o002, 0o022] {
-        let _umask = UmaskGuard::new(mask);
-        let root = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-        let uid = unsafe { libc::geteuid() };
-        let gid = unsafe { libc::getegid() };
+    run_with_isolated_umask(
+        "serial_host_runner_tree_and_skeleton_reset_succeed_under_group_writable_umask",
+        || {
+            for mask in [0o002, 0o022] {
+                let _umask = UmaskGuard::new(mask);
+                let root = tempfile::tempdir().unwrap();
+                std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+                let uid = unsafe { libc::geteuid() };
+                let gid = unsafe { libc::getegid() };
 
-        // 1. Verify runner tree under ambient umask:
-        let tree_dir = root.path().join("actions-runner");
-        mkdir_mode(tree_dir.join("bin"), 0o755);
-        mkdir_mode(tree_dir.join("_work/job"), 0o700);
-        mkdir_mode(tree_dir.join("_diag"), 0o700);
-        write_skeleton_entry(tree_dir.join("run.sh"), "#!/bin/sh\n", 0o755);
-        write_skeleton_entry(tree_dir.join("bin/Runner.Listener"), "listener", 0o755);
-        std::os::unix::fs::symlink("Runner.Listener", tree_dir.join("bin/listener")).unwrap();
-        mkdir_mode(&tree_dir, 0o755);
+                // 1. Verify runner tree under ambient umask:
+                let tree_dir = root.path().join("actions-runner");
+                mkdir_mode(tree_dir.join("bin"), 0o755);
+                mkdir_mode(tree_dir.join("_work/job"), 0o700);
+                mkdir_mode(tree_dir.join("_diag"), 0o700);
+                write_skeleton_entry(tree_dir.join("run.sh"), "#!/bin/sh\n", 0o755);
+                write_skeleton_entry(tree_dir.join("bin/Runner.Listener"), "listener", 0o755);
+                std::os::unix::fs::symlink("Runner.Listener", tree_dir.join("bin/listener"))
+                    .unwrap();
+                mkdir_mode(&tree_dir, 0o755);
 
-        let manifest_text = runner_manifest_for(&tree_dir, Some(uid)).unwrap();
-        let manifest = root.path().join("manifest.txt");
-        write_skeleton_entry(&manifest, &manifest_text, 0o644);
-        let pin = sha256_hex(manifest_text.as_bytes());
-        verify_runner_tree(&tree_dir, &manifest, &pin, Some(uid)).unwrap();
+                let manifest_text = runner_manifest_for(&tree_dir, Some(uid)).unwrap();
+                let manifest = root.path().join("manifest.txt");
+                write_skeleton_entry(&manifest, &manifest_text, 0o644);
+                let pin = sha256_hex(manifest_text.as_bytes());
+                verify_runner_tree(&tree_dir, &manifest, &pin, Some(uid)).unwrap();
 
-        // 2. Verify skeleton creation and reset_job_area under ambient umask:
-        let skel = root.path().join("skel");
-        mkdir_mode(&skel, 0o755);
-        mkdir_mode(skel.join(".config"), 0o755);
-        write_skeleton_entry(skel.join(".zshrc"), "export SKEL=1\n", 0o644);
-        write_skeleton_entry(skel.join(".config/git"), "[core]\n", 0o644);
+                // 2. Verify skeleton creation and reset_job_area under ambient umask:
+                let skel = root.path().join("skel");
+                mkdir_mode(&skel, 0o755);
+                mkdir_mode(skel.join(".config"), 0o755);
+                write_skeleton_entry(skel.join(".zshrc"), "export SKEL=1\n", 0o644);
+                write_skeleton_entry(skel.join(".config/git"), "[core]\n", 0o644);
 
-        // All skeleton entries must be owner-only regardless of umask
-        assert_eq!(
-            std::fs::metadata(&skel).unwrap().permissions().mode() & 0o022,
-            0,
-            "skel directory must be owner-only under umask {mask:o}"
-        );
-        assert_eq!(
-            std::fs::metadata(skel.join(".config"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o022,
-            0,
-            "skel/.config must be owner-only under umask {mask:o}"
-        );
-        assert_eq!(
-            std::fs::metadata(skel.join(".zshrc"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o022,
-            0,
-            "skel/.zshrc must be owner-only under umask {mask:o}"
-        );
-        assert_eq!(
-            std::fs::metadata(skel.join(".config/git"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o022,
-            0,
-            "skel/.config/git must be owner-only under umask {mask:o}"
-        );
+                // All skeleton entries must be owner-only regardless of umask
+                assert_eq!(
+                    std::fs::metadata(&skel).unwrap().permissions().mode() & 0o022,
+                    0,
+                    "skel directory must be owner-only under umask {mask:o}"
+                );
+                assert_eq!(
+                    std::fs::metadata(skel.join(".config"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o022,
+                    0,
+                    "skel/.config must be owner-only under umask {mask:o}"
+                );
+                assert_eq!(
+                    std::fs::metadata(skel.join(".zshrc"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o022,
+                    0,
+                    "skel/.zshrc must be owner-only under umask {mask:o}"
+                );
+                assert_eq!(
+                    std::fs::metadata(skel.join(".config/git"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o022,
+                    0,
+                    "skel/.config/git must be owner-only under umask {mask:o}"
+                );
 
-        let home = root.path().join(format!("home-{mask:o}"));
-        let work = root.path().join(format!("work-{mask:o}"));
-        let diag = root.path().join(format!("diag-{mask:o}"));
+                let home = root.path().join(format!("home-{mask:o}"));
+                let work = root.path().join(format!("work-{mask:o}"));
+                let diag = root.path().join(format!("diag-{mask:o}"));
 
-        reset_job_area(&skel, &home, &[work.clone(), diag.clone()], uid, uid, gid).unwrap();
+                reset_job_area(&skel, &home, &[work.clone(), diag.clone()], uid, uid, gid).unwrap();
 
-        // Verify that the recreated home and its contents are all owner-only
-        assert_eq!(
-            std::fs::metadata(&home).unwrap().permissions().mode() & 0o022,
-            0,
-            "recreated home must be owner-only under umask {mask:o}"
-        );
-        assert_eq!(
-            std::fs::metadata(home.join(".config"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o022,
-            0,
-            "recreated home/.config must be owner-only under umask {mask:o}"
-        );
-        assert_eq!(
-            std::fs::metadata(home.join(".zshrc"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o022,
-            0,
-            "recreated home/.zshrc must be owner-only under umask {mask:o}"
-        );
-        assert_eq!(
-            std::fs::metadata(home.join(".config/git"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o022,
-            0,
-            "recreated home/.config/git must be owner-only under umask {mask:o}"
-        );
-        assert_eq!(
-            std::fs::metadata(&work).unwrap().permissions().mode() & 0o022,
-            0,
-            "work directory must be owner-only under umask {mask:o}"
-        );
-        assert_eq!(
-            std::fs::metadata(&diag).unwrap().permissions().mode() & 0o022,
-            0,
-            "diag directory must be owner-only under umask {mask:o}"
-        );
-    }
+                // Verify that the recreated home and its contents are all owner-only
+                assert_eq!(
+                    std::fs::metadata(&home).unwrap().permissions().mode() & 0o022,
+                    0,
+                    "recreated home must be owner-only under umask {mask:o}"
+                );
+                assert_eq!(
+                    std::fs::metadata(home.join(".config"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o022,
+                    0,
+                    "recreated home/.config must be owner-only under umask {mask:o}"
+                );
+                assert_eq!(
+                    std::fs::metadata(home.join(".zshrc"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o022,
+                    0,
+                    "recreated home/.zshrc must be owner-only under umask {mask:o}"
+                );
+                assert_eq!(
+                    std::fs::metadata(home.join(".config/git"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o022,
+                    0,
+                    "recreated home/.config/git must be owner-only under umask {mask:o}"
+                );
+                assert_eq!(
+                    std::fs::metadata(&work).unwrap().permissions().mode() & 0o022,
+                    0,
+                    "work directory must be owner-only under umask {mask:o}"
+                );
+                assert_eq!(
+                    std::fs::metadata(&diag).unwrap().permissions().mode() & 0o022,
+                    0,
+                    "diag directory must be owner-only under umask {mask:o}"
+                );
+            }
+        },
+    );
+}
+
+#[test]
+fn serial_host_umask_fixtures_isolate_process_umask_from_concurrent_callers() {
+    let barrier = std::sync::Barrier::new(3);
+    std::thread::scope(|scope| {
+        let b = &barrier;
+        scope.spawn(move || {
+            b.wait();
+            for _ in 0..8 {
+                serial_host_run_once_state_modes_do_not_depend_on_the_callers_umask();
+            }
+        });
+        scope.spawn(move || {
+            b.wait();
+            for _ in 0..8 {
+                serial_host_runner_tree_and_skeleton_reset_succeed_under_group_writable_umask();
+            }
+        });
+        scope.spawn(move || {
+            b.wait();
+            for _ in 0..16 {
+                toolchain_must_be_owner_only();
+                job_home_and_work_are_recreated_from_the_skeleton_before_every_job();
+            }
+        });
+    });
 }
 
 #[test]

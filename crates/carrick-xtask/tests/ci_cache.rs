@@ -421,6 +421,33 @@ fn warm_tail_replays_consumer_xtask_builds_after_eviction_pressure() {
             "{recipe}: consumer feature set drift"
         );
     }
+    let xtask_lines: Vec<&str> = justfile
+        .split("_test-xtask *ARGS:")
+        .nth(1)
+        .unwrap()
+        .split("\n\n")
+        .next()
+        .unwrap()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    assert_eq!(
+        xtask_lines.len(),
+        2,
+        "_test-xtask must run parallel (--skip serial_host) then serial (RUST_TEST_THREADS=1)"
+    );
+    let parallel_sel = xtask_lines[0]
+        .strip_suffix(" -- --skip serial_host")
+        .expect("_test-xtask parallel pass must exclude serial_host");
+    let serial_sel = xtask_lines[1]
+        .strip_prefix("env RUST_TEST_THREADS=1 ")
+        .and_then(|l| l.strip_suffix(" serial_host"))
+        .expect("_test-xtask serial pass must set RUST_TEST_THREADS=1 and filter serial_host");
+    assert_eq!(
+        parallel_sel, serial_sel,
+        "_test-xtask parallel and serial passes must select the identical targets"
+    );
 }
 
 #[test]
