@@ -331,6 +331,56 @@ fn freeing_a_member_detaches_items_the_host_did_not() {
     );
 }
 
+/// Duplicate registration does not consume fan-out capacity. Linux requires
+/// EEXIST even when the member cannot admit another distinct registration.
+#[test]
+fn duplicate_add_at_member_capacity_preserves_registration_and_allows_mod() {
+    for kind in [EpollMember::EventFd, EpollMember::PipeReader] {
+        let r = region();
+        let member = match kind {
+            EpollMember::EventFd => r.create_eventfd(0, EventMode::Counter, &Spin).unwrap(),
+            EpollMember::PipeReader => pipe(r, 0),
+            _ => unreachable!(),
+        };
+        let epolls: Vec<_> = (0..MAX_MEMBER_ITEMS)
+            .map(|_| r.create_epoll(&Spin).unwrap())
+            .collect();
+        for &ep in &epolls {
+            r.epoll_add(ep, member, kind, 4, 99, IN, 1, &Spin).unwrap();
+        }
+        let free_items = || {
+            (0..IPC_EPOLL_ITEMS)
+                .filter(|&i| r.epoll_item_at(i).unwrap().live.load(Ordering::Relaxed) == 0)
+                .count()
+        };
+        let before = free_items();
+        assert_eq!(
+            r.epoll_add(epolls[0], member, kind, 4, 99, IN, 2, &Spin),
+            Err(EpollCtlError::Exists),
+            "duplicate {kind:?} ADD must remain EEXIST at the fan-out bound"
+        );
+        assert_eq!(free_items(), before, "duplicate ADD allocates no item");
+        r.epoll_modify(epolls[0], 4, 99, IN, 3, &Spin).unwrap();
+        match kind {
+            EpollMember::EventFd => {
+                eventfd_write(r, member, 1);
+            }
+            EpollMember::PipeReader => {
+                pipe_write(r, member, b"x");
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            harvest(r, epolls[0], 2),
+            std::vec![EpollReport {
+                events: IN,
+                data: 3
+            }]
+        );
+        assert_eq!(free_items(), before, "MOD retains the existing item");
+    }
+}
+
 #[test]
 fn a_member_carries_a_bounded_number_of_zone_items() {
     let r = region();
