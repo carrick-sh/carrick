@@ -309,9 +309,9 @@ fn owns_installed_space(
     zone_mm: Option<u64>,
     installed: u64,
     terminal: bool,
-    process_exiting: bool,
+    exit_requested: bool,
 ) -> bool {
-    zone_mm.is_none_or(|mm| mm == installed || ((terminal || process_exiting) && installed == 0))
+    zone_mm.is_none_or(|mm| mm == installed || ((terminal || exit_requested) && installed == 0))
 }
 
 #[cfg(test)]
@@ -540,22 +540,33 @@ where
     /// or run a syscall against the wrong address space: fail loud. A terminal
     /// continuation is host-only and its materialized save deliberately
     /// vacates this same slot to maintenance space zero. A resident sibling
-    /// can observe that vacated slot after the shared process enters exit.
-    /// Both states still belong to the exiting group, but no foreign process
-    /// space does.
+    /// can observe that vacated slot after the terminal owner requests this
+    /// exact thread's exit. Both states still belong to the exiting group,
+    /// but no foreign process space does.
     fn own_space_installed(
         &self,
         zone: &ZoneTables,
         slot: SlotId,
     ) -> Result<(), ProductionHvpatchPollError> {
         let installed = zone.installed_space(slot);
+        let exit_requested = self
+            .state
+            .kernel_thread
+            .as_ref()
+            .or_else(|| {
+                self.state
+                    .service_kernel_context
+                    .as_ref()
+                    .map(|context| context.thread())
+            })
+            .is_some_and(|thread| thread.control_slot().host_exit_requested());
         match self.state.zone_mm {
             Some(mm)
                 if !owns_installed_space(
                     self.state.zone_mm,
                     installed,
                     self.phase.is_terminal_transition(),
-                    self.kernel.process_exiting(),
+                    exit_requested,
                 ) =>
             {
                 Err(RuntimeError::Configuration(format!(
