@@ -337,6 +337,43 @@ pub fn read_u32(task: &CurrentTask, address: u64) -> Option<u32> {
     (ok != 0).then_some(value as u32)
 }
 
+/// Fixup-guarded aligned user-word compare-exchange, including SMAP cleanup.
+pub fn compare_exchange_u32(
+    task: &CurrentTask,
+    address: u64,
+    expected: u32,
+    desired: u32,
+) -> Option<u32> {
+    if super::interrupt::sync_user_memory_generation().is_err()
+        || !current_task(task)
+        || address & 3 != 0
+        || accessible_bytes(address, 4, false) != 4
+        || accessible_bytes(address, 4, true) != 4
+    {
+        return None;
+    }
+    let fixup = &task.linux.fixup_pc as *const _ as *const u64;
+    let mut observed = expected;
+    let mut ok = 1_u64;
+    // SAFETY: user permissions and the exact live task were checked above.
+    // LOCK CMPXCHG is one atomic RMW; #PF restores SMAP and clears the fixup.
+    unsafe {
+        core::arch::asm!(
+            "mov {tmp}, cr4", "bt {tmp}, 21", "jnc 9f", "stac", "9:",
+            "lea {tmp}, [rip + 2f]", "mov [{fixup}], {tmp}",
+            "lock cmpxchg dword ptr [{address}], {desired:e}",
+            "jmp 3f",
+            "2:", "mov {ok}, 0",
+            "3:", "mov qword ptr [{fixup}], 0",
+            "mov {tmp}, cr4", "bt {tmp}, 21", "jnc 8f", "clac", "8:",
+            tmp = out(reg) _, fixup = in(reg) fixup, address = in(reg) address,
+            desired = in(reg) desired, inout("eax") observed,
+            ok = inout(reg) ok, options(nostack)
+        );
+    }
+    (ok != 0).then_some(observed)
+}
+
 /// Copy with exactly one user operand; partial bytes on a fault are ignored by
 /// the caller's false result, as on ARM. `src` and `dst` must permit pointer
 /// arithmetic for `len` bytes; the user side may be unmapped.

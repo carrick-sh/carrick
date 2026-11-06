@@ -332,6 +332,33 @@ pub trait UserCopy {
     fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> CopyOutcome;
     fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> CopyOutcome;
 
+    /// Load one aligned 32-bit word atomically, with acquire ordering.
+    /// `value` changes only on `Done`. Byte copies cannot implement this
+    /// operation: concurrent users may otherwise observe a torn futex value.
+    /// A byte-only provider defers to its memory owner without touching memory.
+    fn atomic_load_u32(&mut self, address: UserVa, value: &mut u32) -> CopyOutcome {
+        let _ = value;
+        atomic_word_refusal(address, Access::Read)
+    }
+
+    /// Atomically compare one aligned word with `expected` and, if equal,
+    /// replace it with `desired`, with acquire/release ordering on success
+    /// and acquire ordering on mismatch. `observed` changes only on `Done`;
+    /// equality with `expected` then means the exchange succeeded. A mismatch
+    /// is `Done`, not a fault or an owner wait. `NotYet` performs no store.
+    /// Callers must release object/bucket locks before waiting on the owner,
+    /// then repeat the comparison under the lock after resumption.
+    fn atomic_compare_exchange_u32(
+        &mut self,
+        address: UserVa,
+        expected: u32,
+        desired: u32,
+        observed: &mut u32,
+    ) -> CopyOutcome {
+        let _ = (expected, desired, observed);
+        atomic_word_refusal(address, Access::Write)
+    }
+
     /// Read a padding-free typed ABI record from guest memory.
     ///
     /// Records with explicit padding compile cleanly:
@@ -472,7 +499,34 @@ pub trait UserCopy {
     }
 }
 
+/// An unavailable atomic operand must be prepared by its exact memory owner.
+/// Alignment and canonical-range failures are already authoritative faults.
+pub fn atomic_word_refusal(address: UserVa, access: Access) -> CopyOutcome {
+    if address.raw() & 3 != 0 || !carrick_guest_arch::lower_half_range(address.raw(), 4) {
+        return CopyOutcome::Fault;
+    }
+    CopyOutcome::NotYet(GuestCopyRequest {
+        address,
+        len: GuestLen::new(4),
+        access,
+    })
+}
+
 impl<U: UserCopy + ?Sized> UserCopy for &mut U {
+    fn atomic_load_u32(&mut self, address: UserVa, value: &mut u32) -> CopyOutcome {
+        (**self).atomic_load_u32(address, value)
+    }
+
+    fn atomic_compare_exchange_u32(
+        &mut self,
+        address: UserVa,
+        expected: u32,
+        desired: u32,
+        observed: &mut u32,
+    ) -> CopyOutcome {
+        (**self).atomic_compare_exchange_u32(address, expected, desired, observed)
+    }
+
     #[inline]
     fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> CopyOutcome {
         (**self).copy_in(dst, src)

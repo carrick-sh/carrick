@@ -66,7 +66,10 @@ impl UserWord for HardwareUserWord {
     fn read_u32(&self, _task: &CurrentTask, uaddr: u64) -> Option<u32> {
         // Host builds (unit tests): the "user" word is host memory.
         // SAFETY: tests pass the address of a live, aligned u32.
-        Some(unsafe { core::ptr::read_volatile(uaddr as *const u32) })
+        Some(
+            unsafe { core::sync::atomic::AtomicU32::from_ptr(uaddr as *mut u32) }
+                .load(core::sync::atomic::Ordering::Acquire),
+        )
     }
 
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -112,6 +115,102 @@ impl UserWord for HardwareUserWord {
     fn read_u64(&self, _task: &CurrentTask, uaddr: u64) -> Option<u64> {
         // SAFETY: tests pass the address of a live, aligned u64.
         Some(unsafe { core::ptr::read_volatile(uaddr as *const u64) })
+    }
+}
+
+/// One aligned, fixup-guarded acquire load for the typed user-copy adapter.
+pub(crate) fn atomic_load_u32(task: &CurrentTask, address: u64) -> Option<u32> {
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = task;
+        #[cfg(any(test, feature = "host-test"))]
+        if crate::substrate::file::SIMULATE_COPY_FAULT
+            .with(|f| f.load(core::sync::atomic::Ordering::Relaxed))
+        {
+            return None;
+        }
+        // SAFETY: the adapter checked alignment and retained readable storage.
+        return Some(
+            unsafe { core::sync::atomic::AtomicU32::from_ptr(address as *mut u32) }
+                .load(core::sync::atomic::Ordering::Acquire),
+        );
+    }
+    #[cfg(target_os = "none")]
+    {
+        let value = HardwareUserWord.read_u32(task, address)?;
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: order following accesses after the unprivileged word load.
+        unsafe {
+            core::arch::asm!("dmb ishld", options(nostack, preserves_flags));
+        }
+        Some(value)
+    }
+}
+
+/// One guarded compare-exchange. A mismatch returns the observed word;
+/// a failed user access returns None without publishing a successful store.
+pub(crate) fn atomic_compare_exchange_u32(
+    task: &CurrentTask,
+    address: u64,
+    expected: u32,
+    desired: u32,
+) -> Option<u32> {
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = task;
+        #[cfg(any(test, feature = "host-test"))]
+        if crate::substrate::file::SIMULATE_COPY_FAULT
+            .with(|f| f.load(core::sync::atomic::Ordering::Relaxed))
+        {
+            return None;
+        }
+        // SAFETY: the adapter checked alignment and retained writable storage.
+        let word = unsafe { core::sync::atomic::AtomicU32::from_ptr(address as *mut u32) };
+        let observed = word.compare_exchange(
+            expected,
+            desired,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        );
+        Some(match observed {
+            Ok(word) | Err(word) => word,
+        })
+    }
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    {
+        crate::isa::x86::user_access::compare_exchange_u32(task, address, expected, desired)
+    }
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    {
+        let fixup = &task.linux.fixup_pc as *const _ as *const u64;
+        let mut ok = 1_u64;
+        let observed: u32;
+        // SAFETY: the adapter checked user read/write permissions. Exclusive
+        // instructions have no unprivileged form, so PAN is lowered only for
+        // the guarded operand and restored on both completion and fixup.
+        // No call, scheduler handoff or owner wait occurs with PAN lowered.
+        unsafe {
+            core::arch::asm!(
+                "mrs {pan}, pan",
+                "adr {tmp}, 4f", "str {tmp}, [{fixup}]",
+                "msr pan, #0",
+                "2:",
+                "ldaxr {observed:w}, [{address}]",
+                "cmp {observed:w}, {expected:w}", "b.ne 3f",
+                "stlxr {status:w}, {desired:w}, [{address}]",
+                "cbnz {status:w}, 2b",
+                "b 5f",
+                "3:", "clrex", "b 5f",
+                "4:", "clrex", "mov {ok}, #0", "mov {observed:w}, #0",
+                "5:", "msr pan, {pan}", "str xzr, [{fixup}]",
+                pan = out(reg) _, tmp = out(reg) _, status = out(reg) _,
+                observed = out(reg) observed, address = in(reg) address,
+                fixup = in(reg) fixup, expected = in(reg) expected,
+                desired = in(reg) desired, ok = inout(reg) ok,
+                options(nostack)
+            );
+        }
+        (ok != 0).then_some(observed)
     }
 }
 
