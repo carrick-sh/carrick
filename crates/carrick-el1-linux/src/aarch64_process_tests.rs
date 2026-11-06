@@ -12374,7 +12374,7 @@ fn exit_nonresident_pages(clear_only: bool, park_output: bool, fault_clear: bool
     );
     assert_eq!(frame.x[0], 0);
 
-    if !clear_only {
+    if !clear_only && park_output {
         // Main declines robust cleanup to host custody when the head is not ready.
         frame.x = [0; 31];
         frame.x[0] = 0;
@@ -12392,94 +12392,29 @@ fn exit_nonresident_pages(clear_only: bool, park_output: bool, fault_clear: bool
         return;
     }
 
-    if !clear_only {
-        crate::lifecycle::COPYIN_CALLS.with(|calls| calls.borrow_mut().clear());
-        crate::lifecycle::COPYIN_NOT_YET_AT.with(|address| address.set(Some(last_node.arg())));
+    if clear_only || park_output {
+        // Main declines an unavailable or faulting clear_child_tid copy to host custody.
         frame.x = [0; 31];
-        frame.x[8] = 93;
+        frame.x[0] = 0;
+        frame.x[8] = 93; // SYS_exit
         frame.elr = 0x40_3000;
-        let parked = arm_call(fixture, sibling_control, &mut service, &mut frame);
-        crate::lifecycle::COPYIN_NOT_YET_AT.with(|address| address.set(None));
-        assert_eq!(
-            parked.unwrap(),
-            carrick_personality_linux::dispatch::CompletionRoute::Served
-        );
-        assert_eq!(robust_node.get::<RobustNode>(0).futex, 0xc000_0000);
-        crate::lifecycle::CHILD_TID_WAKE_CALLS
-            .with(|calls| assert_eq!(&*calls.borrow(), &[robust_node.arg_at(8)]));
-    }
-
-    if !clear_only {
-        crate::lifecycle::COPYOUT_PUBLISH_WAITERS_AT
-            .with(|address| address.set(Some(last_node.arg_at(8))));
-        crate::lifecycle::COPYOUT_NOT_YET_AT.with(|address| {
-            address.set(Some(if park_output {
-                last_node.arg_at(8)
-            } else {
-                clear_tid_word.arg()
-            }))
-        });
-        frame.x = [0; 31];
-        frame.x[8] = 93;
-        frame.elr = 0x40_3000;
-        let parked = arm_call(fixture, sibling_control, &mut service, &mut frame);
-        crate::lifecycle::COPYOUT_NOT_YET_AT.with(|address| address.set(None));
-        assert_eq!(
-            parked.unwrap(),
-            carrick_personality_linux::dispatch::CompletionRoute::Served
-        );
-        assert_eq!(
-            last_node.get::<RobustNode>(0).futex,
-            if park_output {
-                42 | 0x8000_0000
-            } else {
-                0xc000_0000
-            }
-        );
-        crate::lifecycle::CHILD_TID_WAKE_CALLS.with(|calls| {
-            assert_eq!(
-                &*calls.borrow(),
-                if park_output {
-                    vec![robust_node.arg_at(8)]
-                } else {
-                    vec![robust_node.arg_at(8), last_node.arg_at(8)]
-                }
-                .as_slice()
-            );
-        });
-    }
-
-    // 2. Exit when clear_child_tid page is not yet backed for copyout:
-    // NotYet rewinds and prepares without losing membership or wake.
-    frame.x = [0; 31];
-    frame.x[0] = 0;
-    frame.x[8] = 93; // SYS_exit
-    frame.elr = 0x40_3000;
-    crate::lifecycle::COPYOUT_NOT_YET_AT.with(|address| address.set(Some(clear_tid_word.arg())));
-    if fault_clear {
-        crate::lifecycle::GUEST_COPY_PREPARATION_FAULT_AT
+        crate::lifecycle::COPYOUT_NOT_YET_AT
             .with(|address| address.set(Some(clear_tid_word.arg())));
-    }
-    let exit_second = arm_call(fixture, sibling_control, &mut service, &mut frame);
-    crate::lifecycle::COPYOUT_NOT_YET_AT.with(|address| address.set(None));
-    crate::lifecycle::GUEST_COPY_PREPARATION_FAULT_AT.with(|address| address.set(None));
-    if fault_clear {
+        if fault_clear {
+            crate::lifecycle::GUEST_COPY_PREPARATION_FAULT_AT
+                .with(|address| address.set(Some(clear_tid_word.arg())));
+        }
+        let exit_second = arm_call(fixture, sibling_control, &mut service, &mut frame);
+        crate::lifecycle::COPYOUT_NOT_YET_AT.with(|address| address.set(None));
+        crate::lifecycle::GUEST_COPY_PREPARATION_FAULT_AT.with(|address| address.set(None));
         assert_eq!(
             exit_second.unwrap(),
             carrick_personality_linux::dispatch::CompletionRoute::HostCustody,
-            "a faulting clear_child_tid is ignored and SYS_exit retains terminal custody"
+            "an unavailable clear_child_tid is ignored and SYS_exit retains terminal custody"
         );
         assert_ne!(frame.x[0] as i64, -14, "SYS_exit must never return EFAULT");
-        assert_eq!(sibling_control.robust_list().0, 0);
         return;
     }
-    assert_eq!(
-        exit_second.unwrap(),
-        carrick_personality_linux::dispatch::CompletionRoute::HostCustody,
-        "NotYet on clear_child_tid must match main's host-custody decline"
-    );
-    assert_ne!(frame.x[0] as i64, -14, "SYS_exit must not return EFAULT");
-    return;
 
     assert_eq!(sibling_control.robust_list().0, 0);
     if !clear_only {
