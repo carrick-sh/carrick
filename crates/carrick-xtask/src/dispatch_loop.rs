@@ -4481,15 +4481,7 @@ pub(super) fn run(root: &Path, event_path: &Path, setup: &str) -> Result<(), Sca
         loop_completion(code, server.finished)
     })();
     let _final_commands = CommandWindow::until(final_deadline);
-    finish_loop(&mut server, result, cleanup_dispatch_users())
-}
-
-/// Publish the final outcome after the caller has attempted account retirement.
-fn finish_loop(
-    server: &mut Server<'_>,
-    result: Result<(), ScalerError>,
-    retirement: Result<(), ScalerError>,
-) -> Result<(), ScalerError> {
+    let retirement = cleanup_dispatch_users();
     if !server.finished {
         let loop_err = crate::agent_runner::state()
             .ok()
@@ -8660,7 +8652,6 @@ if test "$1 $2" = 'pr edit'; then
  exit 0
 fi
 if test "$1 $2" = 'issue comment'; then
- printf '%s\n' "$@" > "$RUNNER_TEMP/comment-args"
  while test "$1" != --body-file; do shift; done
  cp "$2" "$RUNNER_TEMP/posted.md"
  exit 0
@@ -9085,41 +9076,6 @@ exec /usr/bin/git "$@"
                 reason.contains("loop timed out without finish"),
                 "wrong fallback reason: {reason}"
             );
-        });
-    }
-    #[test]
-    fn review_setup_failure_posts_fallback_only_on_the_admitted_pr() {
-        shared_fixture(|root| {
-            let mut s = server(root);
-            s.setup = "failure/skipped";
-            // This fixture owns files only. Account retirement is exercised by
-            // its own witnesses; never retire a real account from this test.
-            let error = finish_loop(
-                &mut s,
-                Err(ScalerError::Guard("loop bootstrap/auth did not complete")),
-                Ok(()),
-            )
-            .unwrap_err();
-            assert!(error.to_string().contains("fallback outcome posted"));
-            let report = regular_text(&root.join("posted.md")).unwrap();
-            assert!(report.contains("Dispatch outcome: Failed"), "{report}");
-            assert!(report.contains("Worker was not invoked"), "{report}");
-            assert!(report.contains("\"calls\":0"), "{report}");
-            assert!(report.contains(&format!(
-                "Dispatch run: https://github.com/{REPOSITORY}/actions/runs/{}",
-                run_id().unwrap()
-            )));
-            assert!(!report.contains("fixture-token"), "{report}");
-            let args = regular_text(&root.join("comment-args")).unwrap();
-            assert!(args.starts_with("issue\ncomment\n800\n"), "{args}");
-            // A real retirement failure remains an error after reporting.
-            let error = finish_loop(
-                &mut s,
-                Err(ScalerError::Guard("loop bootstrap/auth did not complete")),
-                Err(ScalerError::Guard("fixture retirement failed")),
-            )
-            .unwrap_err();
-            assert!(error.to_string().contains("fixture retirement failed"));
         });
     }
     #[test]

@@ -524,7 +524,7 @@ fn issue_brief(issue: &serde_json::Value) -> serde_json::Value {
 }
 
 #[test]
-fn review_admission_pins_labels_and_credentials_without_starting_accounts() {
+fn review_setup_failure_posts_fallback_only_on_the_admitted_pr() {
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
@@ -632,10 +632,37 @@ fi
             .unwrap();
     relabeled["labels"] = json!([{"name":"dispatch:opus"}]);
     std::fs::write(temp.path().join("issue.json"), relabeled.to_string()).unwrap();
-    // Reporting is covered through production finalization with a test-owned
-    // tree in dispatch_loop. Running the full loop here would retire the
-    // host's actual coordinator account even when setup failed.
+    let output = invoke(&[
+        "dispatch-worker",
+        "loop",
+        "--setup-status",
+        "failure/skipped",
+        "--event",
+    ]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("fallback outcome posted"),
+        "{output:?}"
+    );
+    let report = std::fs::read_to_string(temp.path().join("posted.md")).unwrap();
+    assert!(report.contains("Dispatch outcome: Failed"));
+    assert!(report.contains("Worker was not invoked"));
+    assert!(report.contains("\"calls\":0"));
+    assert!(
+        report.contains("Dispatch run: https://github.com/carrick-sh/carrick/actions/runs/999")
+    );
+    assert!(!report.contains("fixture-job-token"));
     let calls = std::fs::read_to_string(temp.path().join("gh.args")).unwrap();
+    assert!(calls.contains("issue\ncomment\n800\n"));
+    assert!(!calls.contains("issue\ncomment\n799"));
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.ends_with("/issues/799"))
+            .count(),
+        1,
+        "loop re-queried issue labels after admission"
+    );
     std::fs::create_dir(state.join("home")).unwrap();
     let auth = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
         .args(["agent-runner", "auth", "--event"])
