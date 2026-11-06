@@ -262,11 +262,20 @@ impl carrick_vmm_hvf::metadata_grant::NativeExecHostService for NativeExecCapabi
             .run
             .get()
             .and_then(std::sync::Weak::upgrade)
-            .ok_or(carrick_vmm_hvf::metadata_grant::NativeHostFileRefused)?;
+            .ok_or(carrick_vmm_hvf::metadata_grant::NativeHostFileRefused::Unsupported)?;
         run.dispatcher
             .serve_native_host_file(record)
             .map(|served| served.retained_source)
-            .map_err(|_| carrick_vmm_hvf::metadata_grant::NativeHostFileRefused)
+            .map_err(|error| match error {
+                carrick_kernel::dispatch::native_files::NativeHostFileRefusal::Unsupported => {
+                    carrick_vmm_hvf::metadata_grant::NativeHostFileRefused::Unsupported
+                }
+                carrick_kernel::dispatch::native_files::NativeHostFileRefusal::Invariant(error) => {
+                    carrick_vmm_hvf::metadata_grant::NativeHostFileRefused::Invariant(format!(
+                        "native host-file authority failed: {error:?}"
+                    ))
+                }
+            })
     }
 
     /// The host-served root's live cwd and root, read once for a child the

@@ -31,6 +31,7 @@ vm_free = [
   "carrick-kernel::dispatch::native_files::tests::native_reads_equal_the_dispatchers_own_syscalls",
   "carrick-personality-linux::native_host_file::tests::native_pipe_capacity_fcntl_stages_one_shared_owner_operation",
   "carrick-kernel::dispatch::native_files::tests::native_pipe_capacity_uses_shared_owner_and_both_ends",
+  "carrick-kernel::dispatch::native_files::tests::native_pipe_capacity_authority_failure_is_not_a_guest_reply",
   "carrick-el1-linux::aarch64_process_tests::native_child_handoff_tests::arm_native_fork_child_pipe_capacity_stages_shared_owner_service",
   "carrick-kernel::el1_ipc::tests::native_pin_raced_once_releases_exact_description_then_admits_target",
   "carrick-kernel::el1_ipc::tests::native_resize_revalidates_prepared_backing_after_competing_growth",

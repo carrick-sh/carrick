@@ -28,8 +28,9 @@ pub trait NativeExecHostService: core::fmt::Debug + Send + Sync + 'static {
     /// Serve one ring-staged host-file record
     /// ([`carrick_core_abi::host_file`]) under the caller's own access
     /// context, which a path record carries by value, writing its reply in
-    /// place. `Err` refuses the exact request
-    /// (the ring answers counted ENOSYS); no reply may have been written. A
+    /// place. `Unsupported` refuses the exact request (counted ENOSYS);
+    /// `Invariant` fails the run without publishing a guest result or
+    /// replaying any committed effect. No error writes a reply. A
     /// private-mapping record returns the retained byte source, which the
     /// carrier registers for the caller's MM before acknowledging.
     fn serve_host_file(
@@ -44,15 +45,13 @@ pub trait NativeExecHostService: core::fmt::Debug + Send + Sync + 'static {
     fn root_fork_seed(&self, record: &mut carrick_core_abi::service::RootForkSeed) -> bool;
 }
 
-/// The retained service does not serve this exact host-file request.
-#[derive(
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::core::fmt::Debug,
-    ::core::cmp::Eq,
-    ::core::cmp::PartialEq,
-)]
-pub struct NativeHostFileRefused;
+/// Distinguish an unsupported request from broken retained authority. An
+/// invariant failure terminates the run, including after a committed effect.
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
+pub enum NativeHostFileRefused {
+    Unsupported,
+    Invariant(String),
+}
 
 /// Opaque fallibly prepared image. Exact carrier custody retains this result
 /// until the ring consumes successor adoption or terminal cleanup drops it.
@@ -193,7 +192,7 @@ mod native_exec_service_registration_tests {
             Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>,
             NativeHostFileRefused,
         > {
-            Err(NativeHostFileRefused)
+            Err(NativeHostFileRefused::Unsupported)
         }
 
         fn root_fork_seed(&self, _record: &mut carrick_core_abi::service::RootForkSeed) -> bool {
@@ -395,12 +394,14 @@ type MapReleases = [Option<(core::num::NonZeroU64, core::num::NonZeroU64)>;
 
 fn private_map_releases(record: &mut [u8]) -> Result<Option<MapReleases>, NativeHostFileRefused> {
     use carrick_core_abi::host_file::{HostFileOp, HostFileRequestView, MapSourceReply};
-    let view = HostFileRequestView::parse(record).map_err(|_| NativeHostFileRefused)?;
+    let view =
+        HostFileRequestView::parse(record).map_err(|_| NativeHostFileRefused::Unsupported)?;
     if view.header().op != HostFileOp::MapPrivate {
         return Ok(None);
     }
     let mut releases: MapReleases = [None; carrick_core_abi::host_file::MAX_MAP_RELEASES];
-    let decoded = MapSourceReply::decode_releases(view.input()).ok_or(NativeHostFileRefused)?;
+    let decoded =
+        MapSourceReply::decode_releases(view.input()).ok_or(NativeHostFileRefused::Unsupported)?;
     for (slot, release) in releases.iter_mut().zip(decoded) {
         *slot = Some((release.handle, release.generation));
     }
@@ -504,7 +505,10 @@ impl NativeService {
         };
         let map_releases = match private_map_releases(record.bytes_mut()) {
             Ok(releases) => releases,
-            Err(NativeHostFileRefused) => return self.refuse_host_file(),
+            Err(NativeHostFileRefused::Unsupported) => return self.refuse_host_file(),
+            Err(NativeHostFileRefused::Invariant(reason)) => {
+                return Err(TrapError::Hypervisor(reason));
+            }
         };
         if let Some(releases) = map_releases {
             // The owner's retirements first, then admission of one more
@@ -560,7 +564,8 @@ impl NativeService {
                 }
                 finished
             }
-            Err(NativeHostFileRefused) => self.refuse_host_file(),
+            Err(NativeHostFileRefused::Unsupported) => self.refuse_host_file(),
+            Err(NativeHostFileRefused::Invariant(reason)) => Err(TrapError::Hypervisor(reason)),
         }
     }
 

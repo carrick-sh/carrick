@@ -212,6 +212,15 @@ pub enum InstallHostDescriptionError {
     Unavailable,
 }
 
+/// Linux pipe results stay distinct from shared-authority failures. The
+/// service owner fails the run on an invariant error, including settlement
+/// after a committed resize; it must not publish an ordinary guest errno.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativePipeCapacityError {
+    Linux(carrick_abi::LinuxErrno),
+    Shared(IpcError),
+}
+
 /// Why a native host-file service could not reach a host resource.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PinnedHostResourceError {
@@ -1112,29 +1121,27 @@ impl HostIpc {
         &self,
         table: fd::TableId,
         number: fd::Fd,
-    ) -> Result<(fd::OfdPin, fd::Description), fd::Error> {
+    ) -> Result<(fd::OfdPin, fd::Description), IpcError> {
         self.pin_native_description_with(|| self.region().fd(HostLockWait).pin(table, number))
     }
 
     fn pin_native_description_with(
         &self,
         mut admit: impl FnMut() -> Result<(fd::OfdPin, fd::Description), fd::Error>,
-    ) -> Result<(fd::OfdPin, fd::Description), fd::Error> {
+    ) -> Result<(fd::OfdPin, fd::Description), IpcError> {
         let region = self.region();
         let authority = region.fd(HostLockWait);
         loop {
             match admit() {
                 Err(fd::Error::PinRaced(raw)) => {
-                    if let Some(last) = authority.unpin(fd::OfdPin::from_raw(raw))? {
-                        self.release(last.backing).unwrap_or_else(|error| {
-                            carrick_fatal::carrick_fatal!(
-                                "ipc::pin",
-                                "raced pin release failed: {error:?}"
-                            )
-                        });
+                    if let Some(last) = authority
+                        .unpin(fd::OfdPin::from_raw(raw))
+                        .map_err(IpcError::Fd)?
+                    {
+                        self.release(last.backing)?;
                     }
                 }
-                result => return result,
+                result => return result.map_err(IpcError::Fd),
             }
         }
     }
@@ -1147,28 +1154,28 @@ impl HostIpc {
         table: fd::TableId,
         number: fd::Fd,
         requested: Option<u64>,
-    ) -> Result<usize, carrick_abi::LinuxErrno> {
+    ) -> Result<usize, NativePipeCapacityError> {
+        use NativePipeCapacityError::{Linux, Shared};
         use carrick_abi::{LINUX_EBADF, LINUX_EBUSY, LINUX_EINVAL, LINUX_ENOMEM, LINUX_EPERM};
         let region = self.region();
         let authority = region.fd(HostLockWait);
         let (pin, description) = self
             .pin_native_description(table, number)
             .map_err(|error| match error {
-                fd::Error::BadFd | fd::Error::StaleTable => LINUX_EBADF,
-                _ => carrick_fatal::carrick_fatal!("ipc::pipe", "capacity pin failed: {error:?}"),
+                IpcError::Fd(fd::Error::BadFd | fd::Error::StaleTable) => Linux(LINUX_EBADF),
+                error => Shared(error),
             })?;
         let result = (|| {
-            let Some(carrick_el1_abi::ipc::IpcBacking::Pipe { object, .. }) =
-                carrick_el1_abi::ipc::IpcBacking::decode(description.backing)
-            else {
-                return Err(LINUX_EBADF);
+            let object = match carrick_el1_abi::ipc::IpcBacking::decode(description.backing) {
+                Some(carrick_el1_abi::ipc::IpcBacking::Pipe { object, .. }) => object,
+                Some(_) => return Err(Linux(LINUX_EBADF)),
+                None => return Err(Shared(IpcError::Corrupt)),
             };
             if let Some(requested) = requested {
-                // fcntl's argument is an int. Keep the same validation and
-                // growth ceiling as the host-dispatched shared pipe owner.
+                // fcntl's argument is an int, with the shared growth ceiling.
                 let requested = requested as u32 as i32;
                 if requested < 0 {
-                    return Err(LINUX_EINVAL);
+                    return Err(Linux(LINUX_EINVAL));
                 }
                 let result = self
                     .resize_pipe(
@@ -1177,49 +1184,32 @@ impl HostIpc {
                         crate::dispatch::fs::pipe::MAX_PIPE_CAPACITY,
                     )
                     .map_err(|error| match error {
-                        AdmissionError::NoMemory => LINUX_ENOMEM,
-                        AdmissionError::Shared(IpcError::Object(pipe::Error::Busy)) => LINUX_EBUSY,
+                        AdmissionError::NoMemory => Linux(LINUX_ENOMEM),
+                        AdmissionError::Shared(IpcError::Object(pipe::Error::Busy)) => {
+                            Linux(LINUX_EBUSY)
+                        }
                         AdmissionError::Shared(IpcError::Object(pipe::Error::Permission)) => {
-                            LINUX_EPERM
+                            Linux(LINUX_EPERM)
                         }
                         AdmissionError::Shared(IpcError::Object(pipe::Error::Invalid)) => {
-                            LINUX_EINVAL
+                            Linux(LINUX_EINVAL)
                         }
                         AdmissionError::Shared(IpcError::Object(pipe::Error::Storage)) => {
-                            LINUX_ENOMEM
+                            Linux(LINUX_ENOMEM)
                         }
-                        error => carrick_fatal::carrick_fatal!(
-                            "ipc::pipe",
-                            "capacity mutation failed: {error:?}"
-                        ),
+                        AdmissionError::Shared(error) => Shared(error),
                     });
                 self.service_host_wake(object);
                 result
             } else {
-                let mut guard = region.lock(object, &HostLockWait).unwrap_or_else(|error| {
-                    carrick_fatal::carrick_fatal!("ipc::pipe", "capacity object failed: {error:?}")
-                });
-                Ok(guard
-                    .pipe()
-                    .unwrap_or_else(|error| {
-                        carrick_fatal::carrick_fatal!(
-                            "ipc::pipe",
-                            "capacity kind failed: {error:?}"
-                        )
-                    })
-                    .capacity())
+                let mut guard = region.lock(object, &HostLockWait).map_err(Shared)?;
+                Ok(guard.pipe().map_err(Shared)?.capacity())
             }
         })();
-        match authority.unpin(pin) {
-            Ok(Some(last)) => {
-                self.release(last.backing).unwrap_or_else(|error| {
-                    carrick_fatal::carrick_fatal!("ipc::pipe", "capacity release failed: {error:?}")
-                });
-            }
-            Ok(None) => {}
-            Err(error) => {
-                carrick_fatal::carrick_fatal!("ipc::pipe", "capacity unpin failed: {error:?}")
-            }
+        // Settle the exact pin even if the operation failed. Settlement
+        // failure supersedes success/errno, so no committed result is replayed.
+        if let Some(last) = authority.unpin(pin).map_err(IpcError::Fd).map_err(Shared)? {
+            self.release(last.backing).map_err(Shared)?;
         }
         result
     }
@@ -1239,7 +1229,7 @@ impl HostIpc {
         let (pin, description) = self
             .pin_native_description(table, number)
             .map_err(|error| match error {
-                fd::Error::BadFd => PinnedHostResourceError::BadFd,
+                IpcError::Fd(fd::Error::BadFd) => PinnedHostResourceError::BadFd,
                 _ => PinnedHostResourceError::Unavailable,
             })?;
         let resource = match carrick_el1_abi::ipc::IpcBacking::decode(description.backing) {

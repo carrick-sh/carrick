@@ -299,3 +299,11 @@ The VM-free child witness proves retained request/acknowledgement custody;
 the shared production venue witness separately exercises backed growth and
 both endpoints. Those compositional tests do not prove signed execution or
 Linux oracle parity, which remain director acceptance requirements.
+
+Pipe-capacity service errors keep Linux results separate from authority
+failure. Ordinary unsupported requests retain counted ENOSYS. A stale object,
+invalid backing, or failed exact-pin settlement is an invariant result that
+passes through the runtime service boundary and becomes a carrier run error,
+without publishing a guest reply. Settlement failure after a committed resize
+overrides the provisional success; it cannot turn into ENOSYS or a replay.
+This uses the adapter's existing Result error path, without new fatal sites.
