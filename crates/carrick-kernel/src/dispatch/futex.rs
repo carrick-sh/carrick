@@ -178,6 +178,7 @@ pub(crate) fn dispatch_threaded_futex(
     hvpatch_linux_tid: Option<u32>,
     work_scope: Option<&carrick_observability::work_meter::WorkScope>,
     queue: crate::el1_zone::FutexQueueAuthority,
+    relative_wait: Option<&super::request::RelativeFutexWait>,
 ) -> DispatchOutcome {
     let address = request.arg(0);
     let operation = request.arg(1);
@@ -240,6 +241,21 @@ pub(crate) fn dispatch_threaded_futex(
             | LINUX_FUTEX_UNLOCK_PI
             | LINUX_FUTEX_CMP_REQUEUE
     );
+    if raw_command == LINUX_FUTEX_WAIT
+        && timeout_address != 0
+        && let Some(operation) = relative_wait
+        && operation.retained_remaining(clock).is_none()
+    {
+        let timespec = match read_futex_timespec(memory, timeout_address) {
+            Ok(timespec) => timespec,
+            Err(outcome) => return outcome,
+        };
+        let interval = match duration_from_linux_timespec(timespec) {
+            Ok(interval) => interval,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        operation.admit(clock, interval.unwrap_or(Duration::ZERO));
+    }
     let word = if needs_word {
         match read_futex_word(memory, address) {
             Ok(word) => word,
@@ -323,6 +339,7 @@ pub(crate) fn dispatch_threaded_futex(
             futex_flags,
             word,
             queue,
+            relative_wait,
         );
     }
 
@@ -423,6 +440,10 @@ pub(crate) fn dispatch_threaded_futex(
             }
             let timeout = if timeout_address == 0 {
                 None
+            } else if raw_command == LINUX_FUTEX_WAIT
+                && let Some(remaining) = relative_wait.and_then(|op| op.retained_remaining(clock))
+            {
+                Some(remaining)
             } else {
                 let timespec = match read_futex_timespec(memory, timeout_address) {
                     Ok(t) => t,
@@ -577,6 +598,7 @@ pub(crate) fn dispatch_zone_futex(
     futex_flags: LinuxFutexFlags,
     word: u32,
     queue: crate::el1_zone::ZoneFutexQueue,
+    relative_wait: Option<&super::request::RelativeFutexWait>,
 ) -> DispatchOutcome {
     let address = request.arg(0);
     let value = request.arg(2) as u32;
@@ -605,6 +627,10 @@ pub(crate) fn dispatch_zone_futex(
             }
             let timeout = if timeout_address == 0 {
                 None
+            } else if raw_command == LINUX_FUTEX_WAIT
+                && let Some(remaining) = relative_wait.and_then(|op| op.retained_remaining(clock))
+            {
+                Some(remaining)
             } else {
                 let timespec = match read_futex_timespec(memory, timeout_address) {
                     Ok(t) => t,

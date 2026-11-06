@@ -2192,6 +2192,13 @@ where
                     let work_scope = kernel.dispatcher.work_scope();
                     let make_thread_ctx = || {
                         let ctx = ThreadCtx::new(self.this_tid, &self.registry, &self.futex);
+                        let ctx = if let Ok(completion) =
+                            self.syscall_completion.guest("relative futex completion")
+                        {
+                            ctx.with_relative_futex_wait(completion.relative_futex_wait())
+                        } else {
+                            ctx
+                        };
                         if let Some(ref scope) = work_scope {
                             ctx.with_work_scope(scope)
                         } else {
@@ -3675,6 +3682,7 @@ pub(crate) mod tests {
         pub(crate) guest_memory: std::collections::BTreeMap<u64, Vec<u8>>,
         pub(crate) read_tracker: Option<CrashReadTracker>,
         pub(crate) fail_read_at: Option<u64>,
+        pub(crate) atomic_word: Option<Box<dyn Fn(u64) -> Result<u32, carrick_guest_mem::MemoryError> + Send>>,
         pub(crate) fail_execve_into: Option<String>,
         pub(crate) terminal_continuation_discards: usize,
         pub(crate) mailbox_slot: Option<usize>,
@@ -3749,6 +3757,17 @@ pub(crate) mod tests {
     }
 
     impl carrick_guest_mem::GuestMemory for CrashCaptureTestEngine {
+        fn atomic_load_user_u32(
+            &self,
+            address: u64,
+        ) -> Result<u32, carrick_guest_mem::MemoryError> {
+            if let Some(load) = &self.atomic_word {
+                return load(address);
+            }
+            let bytes = self.read_bytes_raw(address, 4)?;
+            Ok(u32::from_ne_bytes(bytes.try_into().unwrap()))
+        }
+
         fn user_memory_venue(&self) -> carrick_guest_mem::UserMemoryVenue {
             if self.prepare_dependency.is_some()
                 || self.copyout_owner_probe.is_some()
@@ -4224,8 +4243,12 @@ pub(crate) mod tests {
     }
 
     macro_rules! test_carrier_graph_with_dispatcher {
-        ($pid:expr, $dispatcher:expr) => {{
-            let (process, root) = crate::hvpatch::process_context_for_tests($pid);
+        ($pid:expr, $dispatcher:expr) => {
+            test_carrier_graph_with_dispatcher!($pid, $dispatcher, None)
+        };
+        ($pid:expr, $dispatcher:expr, $clock:expr) => {{
+            let (process, root) =
+                crate::hvpatch::process_context_for_tests_with_clock($pid, $clock);
             $dispatcher.bind_hvpatch_process(Arc::new(process.clone()));
             let kernel = Arc::new(KernelState::new(
                 $dispatcher,

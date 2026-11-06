@@ -182,8 +182,36 @@ pub(crate) fn merge_policy_terminal(
     }
 }
 
+/// Relative FUTEX_WAIT time belongs to one syscall completion owner. Dropping
+/// that owner also drops this state, including on signal or cancellation.
+#[derive(Default)]
+pub struct RelativeFutexWait {
+    deadline: parking_lot::Mutex<Option<std::time::Duration>>,
+}
+impl RelativeFutexWait {
+    pub fn admit(
+        &self,
+        clock: &crate::kernel::container::ClockDomain,
+        interval: std::time::Duration,
+    ) {
+        let now = clock.monotonic_now();
+        let mut deadline = self.deadline.lock();
+        deadline.get_or_insert_with(|| now.saturating_add(interval));
+    }
+
+    pub fn retained_remaining(
+        &self,
+        clock: &crate::kernel::container::ClockDomain,
+    ) -> Option<std::time::Duration> {
+        self.deadline
+            .lock()
+            .map(|deadline| clock.scale_timeout(deadline.saturating_sub(clock.monotonic_now())))
+    }
+}
+
 /// Single owner for terminal syscall publication across deferred run-loop work.
 pub struct SyscallCompletionToken {
+    relative_futex_wait: RelativeFutexWait,
     syscall: PreparedSyscall,
     context: crate::kernel::KernelContext,
     container_id: crate::kernel::container::ContainerId,
@@ -198,11 +226,16 @@ impl SyscallCompletionToken {
     ) -> Self {
         let container_id = context.task().container().id();
         Self {
+            relative_futex_wait: RelativeFutexWait::default(),
             syscall,
             context,
             container_id,
             observers,
         }
+    }
+
+    pub fn relative_futex_wait(&self) -> &RelativeFutexWait {
+        &self.relative_futex_wait
     }
 
     pub const fn syscall(&self) -> PreparedSyscall {
@@ -379,6 +412,7 @@ pub const fn syscall_requires_execution_lease(nr: u64, args: SyscallArgs) -> boo
 /// (`gettid`, `set_tid_address`, `futex`).
 #[derive(Clone, Copy)]
 pub struct ThreadCtx<'a> {
+    pub relative_futex_wait: Option<&'a RelativeFutexWait>,
     pub tid: crate::thread::ThreadId,
     pub registry: &'a crate::thread::ThreadRegistry,
     pub futex: &'a crate::thread::FutexTable,
@@ -397,7 +431,13 @@ impl<'a> ThreadCtx<'a> {
             registry,
             futex,
             work_scope: None,
+            relative_futex_wait: None,
         }
+    }
+
+    pub fn with_relative_futex_wait(mut self, operation: &'a RelativeFutexWait) -> Self {
+        self.relative_futex_wait = Some(operation);
+        self
     }
 
     #[inline]
@@ -407,5 +447,32 @@ impl<'a> ThreadCtx<'a> {
     ) -> Self {
         self.work_scope = Some(scope);
         self
+    }
+}
+
+#[cfg(test)]
+mod relative_futex_tests {
+    use super::RelativeFutexWait;
+    use crate::kernel::container::ClockDomain;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn relative_futex_deadline_uses_guest_clock_and_scales_only_remaining_wait() {
+        for (num, den) in [(2, 1), (1, 2)] {
+            let clock = ClockDomain::scaled(SystemTime::UNIX_EPOCH, num, den).unwrap();
+            let operation = RelativeFutexWait::default();
+            let before = clock.monotonic_now();
+            operation.admit(&clock, Duration::from_secs(5));
+            let remaining = operation.retained_remaining(&clock).unwrap();
+            let after = clock.monotonic_now();
+            let deadline = operation.deadline.lock().unwrap();
+            assert!(deadline >= before + Duration::from_secs(5));
+            assert!(deadline <= after + Duration::from_secs(5));
+            assert!(remaining <= clock.scale_timeout(Duration::from_secs(5)));
+            assert!(
+                remaining
+                    >= clock.scale_timeout(Duration::from_secs(5).saturating_sub(after - before))
+            );
+        }
     }
 }

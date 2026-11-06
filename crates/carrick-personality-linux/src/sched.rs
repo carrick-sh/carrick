@@ -47,6 +47,12 @@ impl FutexCall {
     }
 }
 
+/// Custody of the original expiry while the futex operand waits for its owner.
+/// This is moved with the operation; it is never stored in a register save area.
+pub struct RelativeFutexWait {
+    pub deadline: CounterTick,
+}
+
 /// Native context and clock hooks over the existing wait owner. No new wait
 /// ledger or runnable graph is created by this Linux client.
 pub trait FutexVenue {
@@ -56,6 +62,10 @@ pub trait FutexVenue {
     fn read_u64(&self, address: UserVa) -> Option<u64>;
     fn frequency(&self) -> FutexFrequency;
     fn now(&self) -> CounterTick;
+    fn retained_deadline(&self) -> Option<CounterTick> {
+        None
+    }
+
     fn wake(
         &mut self,
         mm: ReservationMm,
@@ -91,7 +101,9 @@ pub fn serve_futex<V: FutexVenue>(call: FutexCall, venue: &mut V) -> Option<V::S
     if matches!(op, FUTEX_WAKE_PRIVATE | FUTEX_WAKE_BITSET_PRIVATE) {
         return venue.wake(mm, address, bitset, expected as i32 as u32);
     }
-    let deadline = if timeout != 0 {
+    let deadline = if let Some(deadline) = venue.retained_deadline() {
+        Some(deadline)
+    } else if timeout != 0 {
         if !venue.timed_wait_allowed() {
             return None;
         }

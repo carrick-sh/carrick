@@ -1203,6 +1203,7 @@ enum MemberWait<'a> {
 
 #[derive(Default)]
 struct MemberWaitState<'a> {
+    relative_futex_wait: Option<carrick_personality_linux::sched::RelativeFutexWait>,
     wait: Option<MemberWait<'a>>,
     suspend_mask: Option<carrick_signal_core::policy::SigBlockMask>,
 }
@@ -1364,6 +1365,18 @@ struct Graph<'a, M: Clone, C: ProcessContext> {
     vfork_parents: BTreeMap<TaskKey, TaskKey>,
 }
 impl<'a, M: Clone, C: ProcessContext> Graph<'a, M, C> {
+    fn take_relative_futex_wait(
+        &mut self,
+        record: &RecordRef,
+    ) -> Option<carrick_personality_linux::sched::RelativeFutexWait> {
+        let state = self.pending.member_mut(record)?;
+        let operation = state.relative_futex_wait.take();
+        if state.wait.is_none() && state.suspend_mask.is_none() {
+            self.pending.remove_member(record);
+        }
+        operation
+    }
+
     fn has_member_wait(&self, record: &RecordRef) -> bool {
         self.pending
             .member(record)
@@ -1386,7 +1399,7 @@ impl<'a, M: Clone, C: ProcessContext> Graph<'a, M, C> {
     fn take_member_wait(&mut self, record: &RecordRef) -> Option<MemberWait<'a>> {
         let state = self.pending.member_mut(record)?;
         let wait = state.wait.take();
-        if state.suspend_mask.is_none() {
+        if state.suspend_mask.is_none() && state.relative_futex_wait.is_none() {
             self.pending.remove_member(record);
         }
         wait
@@ -1414,7 +1427,7 @@ impl<'a, M: Clone, C: ProcessContext> Graph<'a, M, C> {
     ) -> Option<carrick_signal_core::policy::SigBlockMask> {
         let state = self.pending.member_mut(record)?;
         let mask = state.suspend_mask.take();
-        if state.wait.is_none() {
+        if state.wait.is_none() && state.relative_futex_wait.is_none() {
             self.pending.remove_member(record);
         }
         mask
@@ -1669,6 +1682,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     member.record != *record && member.thread.id() != key.task.id()
                 });
             }
+        }
+        for (_, record, _) in &completed {
+            let _ = graph.take_relative_futex_wait(record);
         }
         drop(graph);
         for (key, record, _) in completed {
@@ -2704,6 +2720,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         record: RecordRef,
     ) {
         let mut state = self.state.lock();
+        let _ = runtime.graph.lock().take_relative_futex_wait(&record);
         let carrier = core::ptr::from_ref(runtime.zone).addr();
         let key = state.members.iter().find_map(|(key, member)| {
             (key.carrier == carrier && member.process == process && member.record == record)
@@ -2734,6 +2751,12 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         };
         for key in members {
             if let Some(member) = state.members.remove(&key) {
+                drop(
+                    runtime
+                        .graph
+                        .lock()
+                        .take_relative_futex_wait(&member.record),
+                );
                 state
                     .records
                     .remove(&Self::record_key(runtime.zone, member.record));
@@ -4180,6 +4203,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         self.run_failure.take()
     }
     fn run_failed(&mut self, reason: carrick_core_abi::NativeRunFailureReason) -> LifecycleOutcome {
+        let _ = ProcessNative::take_relative_futex_wait(self);
         self.run_failure = Some(reason);
         if let Some(record) = self
             .source
@@ -4758,6 +4782,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         address: UserVa,
         bytes: &[u8],
     ) -> Result<(), NativeProcessError> {
+        let _ = ProcessNative::take_relative_futex_wait(self);
         let mm = self
             .runtime
             .graph
@@ -7523,6 +7548,24 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     }
     fn take_run_failure(&mut self) -> Option<carrick_core_abi::NativeRunFailureReason> {
         self.run_failure.take()
+    }
+    fn take_relative_futex_wait(
+        &mut self,
+    ) -> Option<carrick_personality_linux::sched::RelativeFutexWait> {
+        self.runtime
+            .graph
+            .lock()
+            .take_relative_futex_wait(&self.record)
+    }
+    fn retain_relative_futex_wait(
+        &mut self,
+        operation: carrick_personality_linux::sched::RelativeFutexWait,
+    ) {
+        self.runtime
+            .graph
+            .lock()
+            .member_wait_state(self.record)
+            .relative_futex_wait = Some(operation);
     }
     fn wait_guest_copy(
         &mut self,

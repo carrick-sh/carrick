@@ -12060,16 +12060,41 @@ fn signal_setup_nonresident_input(nr: u64) {
 
 #[test]
 fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
-    futex_owner_wait_episode(false);
+    futex_owner_wait_episode(false, false, false, None);
 }
 
 #[test]
 fn futex_relative_deadline_survives_owner_wait_with_two_live_threads() {
-    futex_owner_wait_episode(true);
+    futex_owner_wait_episode(true, false, false, None);
+}
+
+#[test]
+fn futex_relative_deadline_survives_synchronous_owner_redispatch_with_two_live_threads() {
+    futex_owner_wait_episode(true, true, false, None);
+}
+
+#[test]
+fn futex_cancelled_owner_wait_releases_deadline_before_next_wait() {
+    futex_owner_wait_episode(true, false, true, None);
+}
+
+#[test]
+fn futex_owner_deadline_is_discarded_before_an_unrelated_syscall() {
+    futex_owner_wait_episode(true, false, false, Some(172));
+}
+
+#[test]
+fn futex_owner_deadline_is_discarded_before_an_unserved_futex() {
+    futex_owner_wait_episode(true, false, false, Some(98));
 }
 
 #[cfg(test)]
-fn futex_owner_wait_episode(timed: bool) {
+fn futex_owner_wait_episode(
+    timed: bool,
+    synchronous: bool,
+    cancelled: bool,
+    intervening: Option<u64>,
+) {
     use crate::native_process_runtime::host_test_support::Physical;
     use crate::sched::{LinuxSchedEntry, UserWord};
     use carrick_el1_abi::Lifecycle;
@@ -12172,7 +12197,7 @@ fn futex_owner_wait_episode(timed: bool) {
             observed.revision(),
         )
     };
-    service.prepare_copy_error = Some(NativeProcessError::OwnerWait(wait));
+    service.prepare_copy_error = (!synchronous).then_some(NativeProcessError::OwnerWait(wait));
     let word = Word {
         missing: core::cell::Cell::new(true),
         value: core::cell::Cell::new(0x12345678),
@@ -12232,44 +12257,121 @@ fn futex_owner_wait_episode(timed: bool) {
         );
         assert_eq!(
             route,
-            CompletionRoute::Suspended,
+            if synchronous {
+                CompletionRoute::Served
+            } else {
+                CompletionRoute::Suspended
+            },
             "missing backing must park on the owner, never forward an unexpected errno"
         );
-        assert!(fixture.zone.slot(fixture.slot).current().is_none());
-        assert_eq!(fixture.zone.counters.el1_parks.load(Ordering::Relaxed), 1);
+        if !synchronous {
+            assert!(fixture.zone.slot(fixture.slot).current().is_none());
+        }
+        assert_eq!(
+            fixture.zone.counters.el1_parks.load(Ordering::Relaxed),
+            u64::from(!synchronous)
+        );
     }
     assert!(
         word.missing.get(),
         "a refused load cannot supply its own backing"
     );
+    assert_eq!(
+        runtime.has_relative_futex_wait_for_test(fixture.control.zone_record().unwrap()),
+        timed
+    );
+    if cancelled {
+        runtime.cancel_futex_owner_wait_for_test(fixture.control.zone_record().unwrap());
+    }
     word.missing.set(false);
     service.prepare_copy_error = None;
     access.lower(space.index());
-    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
-    assert_eq!(selected.record, fixture.control.zone_record().unwrap().id);
-    let mut entry = runtime
-        .enter_registered(
-            registry(),
-            source,
-            &fixture.task,
-            fixture.address,
-            &parked,
-            &mut service,
-        )
-        .unwrap();
-    let resumed = entry.resume_checkpoint(|_| Ok(None)).unwrap();
-    assert!(matches!(
-        resumed,
-        crate::native_process_runtime::NativeResume::RetrySyscall
-    ));
-    drop(entry);
+    if !synchronous {
+        let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+        assert_eq!(selected.record, fixture.control.zone_record().unwrap().id);
+        let mut entry = runtime
+            .enter_registered(
+                registry(),
+                source,
+                &fixture.task,
+                fixture.address,
+                &parked,
+                &mut service,
+            )
+            .unwrap();
+        let resumed = entry.resume_checkpoint(|_| Ok(None)).unwrap();
+        if cancelled {
+            assert!(
+                matches!(resumed, crate::native_process_runtime::NativeResume::Returned(result) if result.raw() == -14)
+            );
+            assert!(
+                !runtime.has_relative_futex_wait_for_test(fixture.control.zone_record().unwrap())
+            );
+        } else {
+            assert!(matches!(
+                resumed,
+                crate::native_process_runtime::NativeResume::RetrySyscall
+            ));
+        }
+        drop(entry);
+    } else {
+        crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut parked);
+    }
     // A fresh comparison uses the original syscall arguments retained by
     // the owner continuation, even if a sibling changed the word meanwhile.
-    let retained = unsafe { *fixture.zone.record(record).ctx_mut() };
-    assert_eq!(retained.native.x[0], VA);
+    let retained = if synchronous {
+        parked
+    } else {
+        unsafe { *fixture.zone.record(record).ctx_mut() }
+    };
+    if !cancelled {
+        assert_eq!(retained.native.x[0], VA);
+    }
     assert_eq!(retained.native.x[2], 0x12345678);
     crate::sched::ThreadCpu::load(&mut cpu, &mut frame, &retained);
+    if let Some(ordinal) = intervening {
+        frame.x[8] = ordinal;
+        if ordinal == 98 {
+            frame.x[1] = 512;
+        }
+        let mut entry = runtime
+            .enter_registered(
+                registry(),
+                source,
+                &fixture.task,
+                fixture.address,
+                &retained,
+                &mut service,
+            )
+            .unwrap();
+        crate::dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &cache,
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &word,
+            }),
+            None,
+            Some(fixture),
+            Some(&mut *entry),
+            Some(source),
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        drop(entry);
+        assert!(!runtime.has_relative_futex_wait_for_test(fixture.control.zone_record().unwrap()));
+        crate::sched::ThreadCpu::load(&mut cpu, &mut frame, &retained);
+    }
     if timed {
+        frame.x[0] = VA;
+        frame.far = 0xdead_beef; // The next SVC may overwrite FAR freely.
         cpu.now = 101;
         let mut entry = runtime
             .enter_registered(
@@ -12304,10 +12406,16 @@ fn futex_owner_wait_episode(timed: bool) {
         );
         drop(entry);
         assert_eq!(
-            cpu.now, 105,
+            cpu.now,
+            if cancelled || intervening.is_some() {
+                106
+            } else {
+                105
+            },
             "owner redispatch must retain the original relative deadline"
         );
         assert_eq!(frame.x[0] as i64, -110);
+        assert!(!runtime.has_relative_futex_wait_for_test(fixture.control.zone_record().unwrap()));
         registry().unregister_root_for_test(&runtime);
         return;
     }
