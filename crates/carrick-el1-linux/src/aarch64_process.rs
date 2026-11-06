@@ -2796,6 +2796,9 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             binding,
             operation,
             &|owned| crate::sched::object_wait::deliver_completion(self.zone, self.slot, owned),
+            &|effects| {
+                crate::sched::object_wait::deliver_wake_effects(self.zone, self.slot, effects)
+            },
         )
     }
     fn copy_syscall_output(
