@@ -1,6 +1,6 @@
 /* #1756 native Linux oracle: exit 0, stdout "pipe-vectors=once\n".
  * Nonblocking pipe checks bound every I/O; wait4 reaps the finite child.
- * Both processes are alive when the child publishes the vector write.
+ * Both processes are alive when the child publishes scalar and vector writes.
  */
 .global _start
 .text
@@ -29,6 +29,17 @@ _start:
     cmp %r12d, %eax
     jne failure
     cmpl $0, status(%rip)
+    jne failure
+    mov $99, %r15d
+    /* Exercise scalar read independently of the readv below. */
+    xor %eax, %eax
+    mov pipe_fds(%rip), %edi
+    lea output(%rip), %rsi
+    mov $1, %edx
+    syscall
+    cmp $1, %rax
+    jne failure
+    cmpb $0x21, output(%rip)
     jne failure
     mov $94, %r15d
     mov $19, %eax
@@ -76,6 +87,15 @@ _start:
     xor %edi, %edi
     jmp exit
 child:
+    mov $97, %r15d
+    /* A scalar prefix makes all four transfer calls part of this witness. */
+    mov $1, %eax
+    mov pipe_fds+4(%rip), %edi
+    lea scalar(%rip), %rsi
+    mov $1, %edx
+    syscall
+    cmp $1, %rax
+    jne failure
     mov $92, %r15d
     mov $20, %eax
     mov pipe_fds+4(%rip), %edi
@@ -99,6 +119,7 @@ write_vectors:
 read_vectors:
     .quad output, 2, output+2, 4
 first: .ascii "a"
+scalar: .ascii "!"
 second: .ascii "bc"
 third: .ascii "def"
 success: .ascii "pipe-vectors=once\n"
