@@ -1,0 +1,96 @@
+name: Signed baseline
+
+on:
+  push:
+    branches:
+      - main
+
+permissions: {}
+
+# Serialize push-to-main dispatches so out-of-order runner scheduling cannot
+# dispatch an older main commit after a newer tip has already been dispatched,
+# which would cancel the newer baseline in signed-gate-main (#1729).
+concurrency:
+  group: signed-baseline-dispatch-main
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    if: >-
+      github.repository == 'carrick-sh/carrick' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      !github.event.deleted
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Check that pushed commit is still current main tip
+        id: tip
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAIN_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          case "$MAIN_SHA" in
+            *[!0-9a-f]* | 0000000000000000000000000000000000000000)
+              echo "::error::Refusing non-hex or zero push SHA: $MAIN_SHA" >&2
+              exit 1
+              ;;
+          esac
+          if [ "${#MAIN_SHA}" -ne 40 ]; then
+            echo "::error::Refusing non-40-char push SHA: $MAIN_SHA" >&2
+            exit 1
+          fi
+          live_tip="$(
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "repos/$REPO/git/ref/heads/main" \
+              --jq '.object.sha'
+          )"
+          case "$live_tip" in
+            *[!0-9a-f]* | 0000000000000000000000000000000000000000)
+              echo "::error::Invalid live refs/heads/main SHA: $live_tip" >&2
+              exit 1
+              ;;
+          esac
+          if [ "${#live_tip}" -ne 40 ]; then
+            echo "::error::Failed to resolve 40-char live refs/heads/main tip for $REPO" >&2
+            exit 1
+          fi
+          if [ "$live_tip" != "$MAIN_SHA" ]; then
+            echo "::notice::refs/heads/main already advanced to $live_tip; skipping superseded baseline dispatch for $MAIN_SHA"
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "current=true" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch signed baseline for current main SHA
+        if: steps.tip.outputs.current == 'true'
+        shell: bash
+        env:
+          # Signed gate authorization (#654) and baseline admission require
+          # workflow_dispatch on main by tjfontaine; GITHUB_TOKEN and the
+          # carrick-workers App are rejected. Provision a fine-grained owner
+          # PAT scoped to carrick-sh/carrick with Actions: Read and write only.
+          GH_TOKEN: ${{ secrets.SIGNED_GATE_DISPATCH_TOKEN }}
+          MAIN_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::SIGNED_GATE_DISPATCH_TOKEN secret is not configured; cannot dispatch signed-gate.yml as owner" >&2
+            exit 1
+          fi
+          jq -cn --arg sha "$MAIN_SHA" '{ref: "main", inputs: {pr: "main", sha: $sha}}' \
+            | gh api \
+                --method POST \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "repos/$REPO/actions/workflows/signed-gate.yml/dispatches" \
+                --input -
+          echo "Dispatched signed-gate.yml baseline for main SHA $MAIN_SHA"
