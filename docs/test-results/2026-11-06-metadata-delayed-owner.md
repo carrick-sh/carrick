@@ -36,3 +36,34 @@ Durable host evidence is in
 standard signed artifact receipt, build log, population runner, and `base/`
 with full per-run output, cleanup logs, artifact identities and population
 rows. This is baseline evidence, not a fix or signed acceptance claim.
+
+An uninstrumented diagnostic run (`fix1572-core-16`) reproduced the
+EntryBinding abort and produced `core-38763`. LLDB decoded both event rings
+with zero errors. Slot 1 had neither a current nor a home record. Records
+6 and 7 retained claim `Retiring { incarnation: 1 }` and a detached metadata
+operation (index `u64::MAX`, generation 3, queue zero). The old first-entry
+records could no longer execute the adapter that consumes that operation.
+
+The production host adoption in `vcpu_loop/executor.rs::adopt_born_record`
+retains the saved retry context in the host thread, then calls
+`ZoneTables::free_first_entry_activation`. That entry changes the old claim
+to Retiring, but `finish_retiring_record` refuses all operation tokens.
+Metadata receipts own no endpoint pin; their old-record lifetime must settle
+at this transfer. The current code only discards them under cancellation,
+so a successful adoption strands the old record and obstructs registry
+rehome. This is an execution-authority settlement defect, not a grant leak.
+
+The VM-free witness
+`tests::adopted_first_entry_settles_detached_metadata_receipt` drives actual
+record allocation, metadata queue enrollment, host notification, activation
+claim and first-entry retirement. On the unchanged implementation it fails
+at `adopted metadata receipt stranded a retiring first entry`. Its full red
+output is `witness-red-exact.log` in the durable evidence directory.
+The initial short filter selected zero tests and an initial draft fixture
+refused enrollment; neither is counted as red evidence.
+
+Ten LLDB-launched diagnostic runs passed, as did one syscall-flow trace.
+The latter fired service-entry probes but zero syscall-return probes and
+is not accepted as syscall-result evidence. The diagnosis uses the core;
+the core's counters show uname is served in ring on this main (64 served,
+zero forwarded), despite the historical fixture's `host_calls` label.
