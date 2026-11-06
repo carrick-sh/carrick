@@ -175,6 +175,17 @@ pub(super) struct PendingService<'a> {
     control: Arc<carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>>,
 }
 
+impl PendingService<'_> {
+    /// A caught signal interrupts a guest wait, not an internal obligation
+    /// that must finish before its committed context can return to user code.
+    fn signal_interruptible(&self) -> bool {
+        self.copyout.is_none()
+            && !self.copyin
+            && !self.adapter
+            && !matches!(self.request.operation, ServiceOperation::CarrierWork { .. })
+    }
+}
+
 /// Exact immutable proof for the graph/registry/scheduler cutover.  This is
 /// boxed by the caller so validation does not add another large EL1 frame.
 struct ValidatedExecSuccessor<'a> {
@@ -321,8 +332,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .lock()
             .service_wait(&record)
             .filter(|pending| {
-                (pending.copyout.is_none() && !pending.copyin && !pending.adapter)
-                    || pending.claim.cancellation().is_some()
+                pending.signal_interruptible() || pending.claim.cancellation().is_some()
             })
             .map(|pending| (pending.request, pending.control.clone(), pending.adapter));
         let Some((request, control, adapter)) = pending else {
@@ -1374,6 +1384,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 return Err(error);
             }
         }
+        #[cfg(test)]
+        super::host_test_support::run_service_published_hook(self.runtime as *const _ as usize);
         Ok(PreparedService::Request(request, adapter))
     }
 
@@ -1475,13 +1487,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ),
             &|_| {},
             || {
-                let internal_copy = self
+                let interruptible = self
                     .runtime
                     .graph
                     .lock()
                     .service_wait(&self.record)
-                    .is_some_and(|pending| pending.copyin || pending.copyout.is_some());
-                if ((!adapter && !internal_copy && self.signal_interrupts_current())
+                    .is_some_and(PendingService::signal_interruptible);
+                if ((interruptible && self.signal_interrupts_current())
                     || self.runtime.graph.lock().pending.has_exit(&self.key))
                     && let Err(error) = self.control.service.cancel(request.identity)
                 {
@@ -1730,7 +1742,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         (true, false),
                         |pending| {
                             (
-                                pending.copyout.is_none() && !pending.copyin && !pending.adapter,
+                                pending.signal_interruptible(),
                                 (pending.copyout.is_some() || pending.copyin)
                                     && pending.claim.cancellation().is_some(),
                             )
