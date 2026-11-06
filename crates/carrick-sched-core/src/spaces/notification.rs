@@ -708,6 +708,8 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceAccess<'a, C> {
             let publication = lease
                 .reserve(SpaceWaitCause::Gate)
                 .advance_revision(venue.waker, &completion);
+            #[cfg(test)]
+            tests::before_resource_unlock();
             if opening {
                 entry.gate.fetch_and(
                     !(super::GATE_CLOSED | super::GATE_INITIAL_BIND),
@@ -1282,6 +1284,73 @@ mod tests {
             before,
             "closing source refuses before claiming editor"
         );
+    }
+    #[test]
+    fn actual_gate_refusal_during_final_release_cannot_park_after_it() {
+        use crate::object_wait::OperationToken;
+        use std::sync::{Arc, Mutex};
+        for opening in [true, false] {
+            let cause = SpaceWaitCause::Gate;
+            let zone: Arc<ZoneTables> = Arc::from(zone());
+            let entry = admitted(&zone);
+            let lease = entry.notifications(NonZeroU64::new(1).unwrap()).unwrap();
+            if !opening {
+                access(&zone).open(entry.index());
+                access(&zone).raise(entry.index());
+            }
+            let observed = Arc::new(Mutex::new(None));
+            let observer_zone = zone.clone();
+
+            let observer_result = observed.clone();
+            BEFORE_RESOURCE_UNLOCK.with(|slot| {
+                *slot.borrow_mut() = Some(std::boxed::Box::new(move || {
+                    let entry = observer_zone
+                        .space_entry(NonZeroU64::new(77).unwrap())
+                        .unwrap();
+                    let lease = entry.notifications(NonZeroU64::new(1).unwrap()).unwrap();
+                    let snapshot = lease.observe(cause);
+                    assert_ne!(observer_zone.spaces.gate(entry.index()), 0);
+                    *observer_result.lock().unwrap() = Some(snapshot);
+                }));
+            });
+            if opening {
+                access(&zone).open(entry.index());
+            } else {
+                access(&zone).lower(entry.index());
+            }
+            assert_eq!(zone.spaces.gate(entry.index()), 0);
+            let snapshot = observed.lock().unwrap().take().unwrap();
+            let record = zone
+                .alloc_record(crate::ThreadIdentity {
+                    tid: 77,
+                    serial: 1,
+                    mm: 77,
+                    file_table: 1,
+                    generation: 1,
+                    affinity_source: crate::AffinitySource::UNBOUND,
+                    affinity: 0,
+                    lifecycle_page: 0,
+                    control_slot: 0,
+                })
+                .unwrap();
+            let complete = |effects: OwnedObjectWakeEffects<'_>| {
+                let _ = effects.deliver_handbacks(&mut |_| {});
+            };
+            let result = lease.reserve(cause).park_host_rechecked(
+                snapshot,
+                record,
+                OperationToken::new(77, 1).unwrap(),
+                &complete,
+                || lease.is_live(),
+            );
+            let Err((error, operation)) = result else {
+                panic!("owner parked after the final {cause:?} release with no producer");
+            };
+            assert_eq!(error, ObjectWaitError::Changed);
+            assert_eq!(operation.index(), 77);
+            assert!(!zone.record(record).has_object_operation());
+            entry.retire_entry(access(&zone).venue().unwrap());
+        }
     }
     #[test]
     fn actual_resource_refusal_during_final_release_cannot_park_after_it() {
