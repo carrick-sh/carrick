@@ -7528,6 +7528,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         self.prepare_guest_input(request)
             .unwrap_or_else(|error| self.run_failed(error.run_failure_reason()))
     }
+    fn retain_relative_futex_deadline(&mut self, deadline: u64) {
+        // `words` is the exact admitted syscall frame. Owner-copy parking
+        // publishes it into the record after preparation selects its wait.
+        self.words
+            .retain_relative_futex_deadline(crate::sched::RETAINED_RELATIVE_DEADLINE, deadline);
+    }
     fn copy_out_owned(
         &mut self,
         dst: UserVa,

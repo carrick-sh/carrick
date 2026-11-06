@@ -270,6 +270,9 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
     }
     /// Prepare an unavailable input and retain its exact syscall until ready.
     fn wait_guest_copy(&mut self, request: GuestCopyRequest) -> LifecycleOutcome;
+    /// Retain an absolute relative-futex deadline in the exact syscall frame
+    /// owned by this continuation before an owner-copy park.
+    fn retain_relative_futex_deadline(&mut self, _deadline: u64) {}
     /// An admitted process may retain an exact-MM write authority (including COW).
     /// None means this venue does not own user transfers.
     fn copy_out_owned(
