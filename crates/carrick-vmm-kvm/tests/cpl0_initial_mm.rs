@@ -1069,6 +1069,13 @@ fn production_large_initialized_elf_retains_first_fork_table_capacity() {
     );
 }
 
+#[test]
+fn production_wait_prepares_untouched_initial_elf_output() {
+    let elf = native_exit_fixture("lazy_wait_output.S");
+    let outcome = run_pool_fixture(&elf, 32);
+    assert_eq!(outcome.run.exit_code, 7);
+}
+
 fn write_then_exit_elf(pointer: u64, count: u32) -> Vec<u8> {
     let mut bytes = tiny_elf();
     let mut code = vec![0xb8, X86_SYS_WRITE, 0, 0, 0, 0xbf, 1, 0, 0, 0];
