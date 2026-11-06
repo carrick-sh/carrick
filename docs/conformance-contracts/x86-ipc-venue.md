@@ -17,17 +17,20 @@ in_zone_two_process_pipe_vectors_move_bytes_exactly_once -- --ignored --exact`.
 The guest-exit budget bounds exits, not a parked carrier's wall time; a
 bounded external test runner is still required.
 
-The existing adapter in `carrick-el1-linux/src/ipc.rs` uses the shared
-`carrick-pipe-core` and `carrick-fd-core` authority. Its production entry
-currently requires an ARM `TrapFrame` and `Sched` whose zone and handoff
-receipt carry `Aarch64ParkedContext`. `park_key` rewinds by ARM SVC length.
-The x86 production dispatcher supplies neither an IPC venue nor this ARM
-scheduler. Passing a venue alone cannot enable x86 transfer.
+The adapter in `carrick-el1-linux/src/ipc.rs` uses the shared
+`carrick-pipe-core` and `carrick-fd-core` authority. Its transfer and epoll
+engines now take `IpcExecution`, whose associated context and frame need not
+be ARM types. `IpcFrame` separates canonical family decoding from the native
+ordinal retained for refusal accounting. The existing ARM `Sched` implements
+this capability and owns its SVC rewind, register restart marker and handoff.
+The x86 production dispatcher still supplies neither an IPC venue nor an
+execution capability. Passing a venue alone cannot enable x86 transfer.
 
-The remaining implementation should extract a context-neutral IPC execution
-capability from that adapter, preserving one transfer state machine and its
-owned token, pin, imported vectors and byte cursor. ARM and x86 should supply
-only context capture, resumption PC and scheduler handoff mechanics. The
+The capability preserves one transfer state machine and its owned token,
+pin, imported vectors and byte cursor. Execution implementations supply
+context capture, resumption PC and scheduler handoff mechanics. Owner-wait
+enrollment remains held across park so its source cannot retire between the
+snapshot and queue enrollment. The extraction adds no lock order. The
 adapter now admits scalar read/write and both vector directions on pipes.
 Readv requires native ring custody (legacy handback has only contiguous
 output permits). Without that owner it declines before any pin or effect.
@@ -77,3 +80,15 @@ existing counted-refusal policy. No crossing allowlist or lock order changes
 are made by this prerequisite. X86 still supplies no IPC venue or matching
 execution capability, so its acceptance witness remains red at pipe2 and its
 writev counted-ENOSYS invariant remains unchanged.
+
+## Shared execution-capability prerequisite
+
+The production ARM entry now uses the generic transfer engine for scalar and
+vector I/O and epoll. `IpcExecution` exposes the exact context-typed zone,
+running slot/task and counters, the existing wait primitives, clock conversion,
+and the park/wake transport. Native ordinal retention is distinct from
+canonical family selection; neither ISA may substitute its canonical syscall
+number for the original refusal census index. No x86 transfer implementation,
+window mapping, descriptor namespace admission or creation path is claimed by
+this prerequisite. Existing shared IPC and two-live-process owner-wait tests
+remain the lower-layer witnesses; the real-KVM acceptance remains red.
