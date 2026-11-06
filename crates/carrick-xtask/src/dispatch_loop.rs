@@ -6451,7 +6451,7 @@ fi
                 "{posted}"
             );
             assert!(server.contains(MAILBOX_HEADER), "{posted}");
-            assert_eq!(outcome_status(&posted), Some("Blocked"));
+            assert_eq!(outcome_status(&posted), Some("Failed"));
         });
     }
     #[test]
