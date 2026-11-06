@@ -183,3 +183,108 @@ impl<B: SlotBacking, W: LockWait, const T: usize> Authority<'_, B, W, T> {
         result.map_err(|error| ReservationRefusal { error, reservation })
     }
 }
+
+/// Two empty numeric slots held by one pipe-creation operation. Copy their
+/// numbers to userspace before committing; a copy fault cancels the claims,
+/// so no published endpoint ever needs to be closed by numeric fd on rollback.
+#[must_use = "settle this pair or retain it in the operation continuation"]
+#[derive(Debug)]
+pub struct SlotPairReservation {
+    table: TableId,
+    fds: [Fd; 2],
+}
+
+impl SlotPairReservation {
+    pub const fn fds(&self) -> [Fd; 2] {
+        self.fds
+    }
+    pub const fn table(&self) -> TableId {
+        self.table
+    }
+}
+
+/// Both slot claims remain owned on contention or any other refusal.
+#[must_use]
+#[derive(Debug)]
+pub struct PairReservationRefusal {
+    error: Error,
+    reservation: SlotPairReservation,
+}
+
+impl PairReservationRefusal {
+    pub const fn error(&self) -> Error {
+        self.error
+    }
+    pub fn into_reservation(self) -> SlotPairReservation {
+        self.reservation
+    }
+}
+
+impl<B: SlotBacking, W: LockWait, const T: usize> Authority<'_, B, W, T> {
+    /// Claim two lowest free slots in one table-lock scope. Failure to find
+    /// the second slot leaves no first claim behind. Nothing is published;
+    /// fork and lock-free lookup see neither endpoint while copyout waits.
+    pub fn reserve_pair(&self, table: TableId, min: Fd) -> Result<SlotPairReservation, Error> {
+        if min.0 < 0 {
+            return Err(Error::InvalidArgument);
+        }
+        let (_guard, t) = self.lock(table)?;
+        let first = t.allocate(min.0 as usize)?;
+        let second = t.allocate(first + 1)?;
+        // Prepare ceiling coverage before claiming either slot, so a refusal
+        // cannot strand a reservation without an owned receipt.
+        self.cover(first)?;
+        self.cover(second)?;
+        t.storage.reserve(first);
+        t.storage.reserve(second);
+        Ok(SlotPairReservation {
+            table,
+            fds: [Fd(first as i32), Fd(second as i32)],
+        })
+    }
+
+    /// Cancel the pair before publication. No descriptor entry or physical
+    /// description is closed, including in a sibling table or reused number.
+    pub fn cancel_pair(
+        &self,
+        reservation: SlotPairReservation,
+    ) -> Result<(), PairReservationRefusal> {
+        let result = (|| {
+            let (_guard, t) = self.lock(reservation.table)?;
+            for fd in reservation.fds {
+                if !t.storage.reserved(fd.0 as usize) || t.storage.get(fd.0 as usize).is_some() {
+                    return Err(Error::InvalidArgument);
+                }
+            }
+            for fd in reservation.fds {
+                t.storage.unreserve(fd.0 as usize);
+            }
+            Ok(())
+        })();
+        result.map_err(|error| PairReservationRefusal { error, reservation })
+    }
+
+    /// Publish both prepared descriptions under the same sequence write as
+    /// immediate pair installation. Pins remain caller-owned; no user copy,
+    /// object release or allocation runs under the table lock. Admission
+    /// survives a later lowering of the descriptor limit, like a single claim.
+    pub fn commit_pair(
+        &self,
+        reservation: SlotPairReservation,
+        pins: [&OfdPin; 2],
+        cloexec: bool,
+    ) -> Result<[Fd; 2], PairReservationRefusal> {
+        let result = (|| {
+            let mut transaction = self.transaction(reservation.table)?;
+            for fd in reservation.fds {
+                if !transaction.table.storage.reserved(fd.0 as usize)
+                    || transaction.table.storage.get(fd.0 as usize).is_some()
+                {
+                    return Err(Error::InvalidArgument);
+                }
+            }
+            transaction.publish_pair(reservation.fds, pins, cloexec, true)
+        })();
+        result.map_err(|error| PairReservationRefusal { error, reservation })
+    }
+}
