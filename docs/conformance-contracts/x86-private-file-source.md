@@ -47,8 +47,8 @@ explicitly carrier-scoped instead of using ARM's process-global registration.
 opens use `NativeOpenFile`. Both now reach `native_map_reference`, which rejects O_PATH with errno 9, checks
 read access and registers the same retained private source. The projection
 shares the original physical lifetime, backing, identity and seals, but owns
-no fd reference, cursor authority or publication pin. Its original-description
-backlink is weak. Mapping admission recalls a live original delegation before
+no fd reference, cursor authority or publication pin. Its delegation handle and inode registration live in that same physical
+lifetime. Mapping admission recalls through this shared identity before
 incrementing the shared mapping count under the physical transition lock.
 The pinned IPC resource authorizes admission after the host numeric fd closes;
 final resource release still waits for both IPC holds and mappings to end.
@@ -147,3 +147,32 @@ original description has dirty delegated bytes. The writeback hook holds
 recall in flight; the source reply must wait for release. Reading the retained
 source then requires the new bytes and a zero-filled page tail. This witness
 passes on the rebased base layer without changing delegation policy.
+
+### Shared source identity and bounded admission review fixes
+
+The delegation handle belongs to the physical description lifetime, alongside
+its inode registration. IPC mapping projections and their original description
+therefore observe the same live handle even when delegation begins after IPC
+publication. Admission and fault-time `read_for_io` use that same identity;
+the weak original-description recall workaround is removed. This adds no
+publication backlink or lock order: recall still precedes the physical
+transition lock, and source reads still run outside physical carrier custody.
+
+`ForkHostBackingCustody::prepare_private_mapping` is now the common ARM/x86
+record-admission owner. It validates the complete release list, retires those
+sources, and writes errno 12 at 1,024 retained sources before host service.
+Its VM-free binding fills the actual custody to that bound, checks the error
+reply, and releases one source through the next request before readmission.
+The existing thousand-cycle release witness moves from HVF to this shared
+owner. This component witness does not resolve the real-KVM reservation
+population failure or the suspension consumer dependency described above.
+
+The fault-specific binding
+`published_private_source_fault_joins_late_delegation_recall` admits the pinned
+IPC mapping during a real delegation's fill-to-publication interval. The
+already eligible delegation then publishes and receives a dirty guest write.
+The production retained-source read must enter recall, publish no bytes while
+writeback is held, and return the updated bytes and zero tail after release.
+This is distinct from the older mapping-admission witness. The source-retention
+operation now has a narrow MM-authority method shared by production host-file
+admission and this test; it retains the original metadata-lock scope.

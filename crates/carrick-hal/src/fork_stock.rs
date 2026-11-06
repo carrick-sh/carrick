@@ -69,6 +69,32 @@ pub struct ForkHostBackingCustody {
     sources: BTreeMap<(NonZeroU64, NonZeroU64), std::sync::Arc<dyn HostBackingRetention>>,
 }
 impl ForkHostBackingCustody {
+    /// Retire the request's released sources before admitting one more private
+    /// mapping. Exhaustion is a completed Linux ENOMEM reply, never a carrier
+    /// invariant failure. Non-mapping records need no source admission.
+    pub fn prepare_private_mapping(
+        &mut self,
+        record: &mut [u8],
+    ) -> Result<bool, carrick_core_abi::host_file::HostFileRecordError> {
+        use carrick_core_abi::host_file::{
+            HostFileOp, HostFileRecordError, HostFileRequestView, MapSourceReply,
+        };
+        let view = HostFileRequestView::parse(record)?;
+        if view.header().op != HostFileOp::MapPrivate {
+            return Ok(true);
+        }
+        let releases =
+            MapSourceReply::decode_releases(view.input()).ok_or(HostFileRecordError::Invalid)?;
+        for release in releases {
+            self.release(release.handle, release.generation);
+        }
+        if self.len() >= 1024 {
+            view.reply(carrick_abi::LINUX_ENOMEM.guest_retval(), &[])?;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     pub fn inherit(&mut self, source: std::sync::Arc<dyn HostBackingRetention>) {
         let identity = source.identity();
         self.sources

@@ -374,39 +374,6 @@ impl core::fmt::Debug for NativeService {
             .finish_non_exhaustive()
     }
 }
-/// The byte sources one native MM may hold for private file mappings. Each
-/// pins a host file description, so the bound is a host-resource bound; past
-/// it a new mapping fails with ENOMEM, as Linux fails one past its per-MM
-/// mapping limit. Sources leave as the MM's reservation owner retires them.
-pub struct NativePrivateSourceBound;
-
-impl NativePrivateSourceBound {
-    pub const LIMIT: usize = 1024;
-
-    pub const fn admits(held: usize) -> bool {
-        held < Self::LIMIT
-    }
-}
-
-/// Released sources a private-mapping request carries, or `None` for any
-/// other host-file request. A malformed release list is refused.
-type MapReleases = [Option<(core::num::NonZeroU64, core::num::NonZeroU64)>;
-    carrick_core_abi::host_file::MAX_MAP_RELEASES];
-
-fn private_map_releases(record: &mut [u8]) -> Result<Option<MapReleases>, NativeHostFileRefused> {
-    use carrick_core_abi::host_file::{HostFileOp, HostFileRequestView, MapSourceReply};
-    let view = HostFileRequestView::parse(record).map_err(|_| NativeHostFileRefused)?;
-    if view.header().op != HostFileOp::MapPrivate {
-        return Ok(None);
-    }
-    let mut releases: MapReleases = [None; carrick_core_abi::host_file::MAX_MAP_RELEASES];
-    let decoded = MapSourceReply::decode_releases(view.input()).ok_or(NativeHostFileRefused)?;
-    for (slot, release) in releases.iter_mut().zip(decoded) {
-        *slot = Some((release.handle, release.generation));
-    }
-    Ok(Some(releases))
-}
-
 fn with_native_sources_of<R>(
     custody: &crate::trap::CarrierVmCustody,
     handle: carrick_core_abi::El1MmHandle,
@@ -502,31 +469,26 @@ impl NativeService {
         let Some(record) = self.exec_payload.as_mut() else {
             return Err(stale());
         };
-        let map_releases = match private_map_releases(record.bytes_mut()) {
-            Ok(releases) => releases,
-            Err(NativeHostFileRefused) => return self.refuse_host_file(),
-        };
-        if let Some(releases) = map_releases {
-            // The owner's retirements first, then admission of one more
-            // source within this MM's bound.
-            let Some(held) = self.with_native_sources(|sources| {
-                for (handle, generation) in releases.iter().flatten() {
-                    sources.release(*handle, *generation);
-                }
-                sources.len()
-            }) else {
-                return Err(stale());
+        let is_mapping =
+            match carrick_core_abi::host_file::HostFileRequestView::parse(record.bytes_mut()) {
+                Ok(view) => view.header().op == carrick_core_abi::host_file::HostFileOp::MapPrivate,
+                Err(_) => return self.refuse_host_file(),
             };
-            if !NativePrivateSourceBound::admits(held) {
-                let Some(record) = self.exec_payload.as_mut() else {
-                    return Err(stale());
-                };
-                // Linux reports a mapping past its per-MM limit as ENOMEM.
-                carrick_core_abi::host_file::HostFileRequestView::parse(record.bytes_mut())
-                    .and_then(|view| view.reply(-12, &[]))
-                    .map_err(|_| stale())?;
-                return self
-                    .finish_exec_ticket(|ticket| ticket.complete(true).map_err(|_| stale()));
+        if is_mapping {
+            // The shared source owner handles retirements and writes ENOMEM at
+            // the bound before either ISA invokes the host file service.
+            let mut record = self.exec_payload.take().ok_or_else(stale)?;
+            let admitted = self
+                .with_native_sources(|sources| sources.prepare_private_mapping(record.bytes_mut()))
+                .ok_or_else(stale)?;
+            self.exec_payload = Some(record);
+            match admitted {
+                Err(_) => return self.refuse_host_file(),
+                Ok(false) => {
+                    return self
+                        .finish_exec_ticket(|ticket| ticket.complete(true).map_err(|_| stale()));
+                }
+                Ok(true) => {}
             }
         }
         let Some(record) = self.exec_payload.as_mut() else {
@@ -2436,84 +2398,5 @@ mod intake_tests {
             cell.consume(request.identity),
             Ok(carrick_core_abi::service::ServiceResult::Cancelled)
         );
-    }
-
-    /// The carrier side of private-mapping custody: a request's release
-    /// list drops exactly the sources it names, the per-MM bound refuses
-    /// past its limit, and a thousand map/release cycles hold one source.
-    #[test]
-    fn private_map_releases_keep_native_source_custody_steady() {
-        use carrick_core_abi::host_file::{self, HostFileHeader, HostFileOp, MapSourceReply};
-        use core::num::NonZeroU64;
-        struct Source(carrick_el1_abi::HostBackingIdentity);
-        impl carrick_hal::fork_stock::HostBackingRetention for Source {
-            fn identity(&self) -> carrick_el1_abi::HostBackingIdentity {
-                self.0
-            }
-            fn read(
-                &self,
-                _: carrick_hal::fork_stock::HostBackingRead,
-            ) -> Result<Vec<u8>, carrick_hal::fork_stock::HostBackingReadError> {
-                Ok(Vec::new())
-            }
-        }
-        let identity = |token: u64| {
-            carrick_el1_abi::HostBackingIdentity::new(
-                NonZeroU64::new(token).unwrap(),
-                NonZeroU64::MIN,
-                0,
-            )
-        };
-        let request = |op, released: &[u64]| {
-            let input: Vec<u8> = released
-                .iter()
-                .flat_map(|token| {
-                    MapSourceReply {
-                        handle: NonZeroU64::new(*token).unwrap(),
-                        generation: NonZeroU64::MIN,
-                    }
-                    .encode()
-                })
-                .collect();
-            let mut record =
-                vec![0u8; host_file::record_len(input.len(), MapSourceReply::BYTES).unwrap()];
-            host_file::encode(
-                &mut record,
-                HostFileHeader {
-                    op,
-                    table: [1, 1, 1],
-                    fd: 3,
-                    flags: 0,
-                    args: [0; 4],
-                },
-                &input,
-                MapSourceReply::BYTES,
-            )
-            .unwrap();
-            record
-        };
-        let mut sources = carrick_hal::fork_stock::ForkHostBackingCustody::default();
-        for cycle in 1..=1000u64 {
-            let mut record = request(HostFileOp::MapPrivate, &[cycle - 1].map(|t| t.max(1)));
-            let releases = private_map_releases(&mut record).unwrap().unwrap();
-            for (handle, generation) in releases.iter().flatten() {
-                sources.release(*handle, *generation);
-            }
-            assert!(NativePrivateSourceBound::admits(sources.len()));
-            sources.inherit(Arc::new(Source(identity(cycle))));
-            assert_eq!(
-                sources.len(),
-                1,
-                "cycle {cycle}: only the live source is held"
-            );
-        }
-        // Other requests carry no release list; a malformed one is refused.
-        let mut write = request(HostFileOp::Write, &[]);
-        assert!(private_map_releases(&mut write).unwrap().is_none());
-        let mut too_many = request(HostFileOp::MapPrivate, &[1, 2, 3, 4, 5, 6, 7, 8, 9]);
-        assert!(private_map_releases(&mut too_many).is_err());
-        assert!(!NativePrivateSourceBound::admits(
-            NativePrivateSourceBound::LIMIT
-        ));
     }
 }
