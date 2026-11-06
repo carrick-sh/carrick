@@ -3389,6 +3389,23 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             {
                 Some(ipa) => ipa,
                 None => {
+                    let pristine = match self.vm.deferred_anonymous_state() {
+                        Some(state) => state
+                            .copy_pristine_file(
+                                GuestVa::new(va),
+                                &mut out[copied..copied + chunk_len],
+                            )
+                            .map_err(|error| {
+                                MemoryError::HostMap(format!(
+                                    "read deferred private file backing: {error}"
+                                ))
+                            })?,
+                        None => false,
+                    };
+                    if pristine {
+                        copied += chunk_len;
+                        continue;
+                    }
                     let Some(zero) = self.fresh_zero_chunk(address, copied, length) else {
                         self.trace_read_fault(address.wrapping_add(copied as u64), length, 1);
                         return Err(MemoryError::OutOfBounds { address, length });
