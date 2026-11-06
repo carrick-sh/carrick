@@ -355,6 +355,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn serial_host_scratch_root_override_wins() {
+        let root = tempfile::tempdir().unwrap();
+        let chosen = root.path().join("internal-scratch");
+        let previous = std::env::var_os("CARRICK_SCRATCH_ROOT");
+        // SAFETY: this test runs in the serial_host partition.
+        unsafe { std::env::set_var("CARRICK_SCRATCH_ROOT", &chosen) };
+        let actual = resolve_scratch_root();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("CARRICK_SCRATCH_ROOT", value),
+                None => std::env::remove_var("CARRICK_SCRATCH_ROOT"),
+            }
+        }
+        assert_eq!(actual, chosen);
+        assert!(
+            !chosen.exists(),
+            "override selection must not touch the disk"
+        );
+    }
+
+    #[test]
+    fn serial_host_case_probe_fifo_is_bounded() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let fifo = root.path().join(".carrick-case-probe");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: name is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let path = root.path().to_owned();
+        let (send, recv) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            send.send(probe_case_sensitive(&path)).unwrap();
+        });
+        let result = recv.recv_timeout(std::time::Duration::from_secs(1));
+        // Release the old blocking implementation even when the assertion fails.
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .unwrap();
+        thread.join().unwrap();
+        drop(reader);
+        assert_eq!(
+            result,
+            Ok(false),
+            "stalled probe must fail closed within one second"
+        );
+    }
+
+    #[test]
     fn parse_apfs_list_finds_named_case_sensitive_volume() {
         let sample = "\
 APFS Containers (1 found)
