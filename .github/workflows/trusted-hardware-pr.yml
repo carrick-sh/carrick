@@ -22,3 +22,10 @@ jobs:
     steps:
       - run: |
           echo "Trusted hardware lanes (HVF signed + KVM) run only in the merge queue: .github/workflows/kernel-runtime.yml. This placeholder lets a pull request satisfy the required check name; the merge group re-evaluates it on real hardware."
+
+  signed-queue-gate:
+    name: Signed queue gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: echo "Signed acceptance runs on the merge group; PR gates are available on request."
