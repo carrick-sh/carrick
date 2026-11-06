@@ -152,8 +152,65 @@ impl TransferPin for RetainedUserData {
         }
         self.copy_bytes(authorization, TransferBytes::Write(bytes))
     }
+    fn atomic_compare_exchange_u32(
+        &mut self,
+        authorization: carrick_el1_abi::PortalCopyRequest<'_>,
+        expected: u32,
+        desired: u32,
+    ) -> Option<u32> {
+        if self._write.as_ref().is_some_and(|write| !write.is_ready()) {
+            return None;
+        }
+        let request = authorization.request();
+        if request.operation.carrier != self.carrier
+            || request.retained != self.identity
+            || request.selected != self.selected
+            || request.intent != self.intent
+            || !self.intent.is_write()
+            || request.range.len() != 4
+            || self.len < 4
+            || !(self.pointer as usize).is_multiple_of(4)
+        {
+            return None;
+        }
+        // SAFETY: exact authorization, retained backing and write pin cover
+        // this aligned word for the whole compare-exchange.
+        let word = unsafe { std::sync::atomic::AtomicU32::from_ptr(self.pointer.cast::<u32>()) };
+        let observed = match word.compare_exchange(
+            expected,
+            desired,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(value) | Err(value) => value,
+        };
+        if observed == expected {
+            self.publish_completed_write(4);
+        }
+        Some(observed)
+    }
 }
 impl RetainedUserData {
+    fn publish_completed_write(&self, len: usize) {
+        let mapping = self._mapping.as_ref().unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::user_transfer",
+                "write lost retained content owner"
+            )
+        });
+        let offset = self.pointer as usize - mapping.host_base() as usize;
+        mapping.code_content.mark_icache_dirty(offset, len);
+        if self.selected.executable {
+            self.custody
+                .publish_user_executable(self.selected.ipa, len as u64, |_, _| None, |_, _| None)
+                .unwrap_or_else(|error| {
+                    carrick_fatal!(
+                        "hvpatch::user_transfer",
+                        "executable write publication failed: {error:?}"
+                    )
+                });
+        }
+    }
     fn copy_bytes(
         &mut self,
         authorization: carrick_el1_abi::PortalCopyRequest<'_>,
@@ -200,24 +257,7 @@ impl RetainedUserData {
         if self.intent.is_write() {
             // A peer MM may have consumed admission dirtiness before this
             // memcpy. Publish the completed write, then await I2 completion.
-            let mapping = self._mapping.as_ref().unwrap_or_else(|| {
-                carrick_fatal!(
-                    "hvpatch::user_transfer",
-                    "write lost retained content owner"
-                )
-            });
-            let offset = self.pointer as usize - mapping.host_base() as usize;
-            mapping.code_content.mark_icache_dirty(offset, len);
-        }
-        if self.intent.is_write() && self.selected.executable {
-            self.custody
-                .publish_user_executable(self.selected.ipa, len as u64, |_, _| None, |_, _| None)
-                .unwrap_or_else(|error| {
-                    carrick_fatal!(
-                        "hvpatch::user_transfer",
-                        "executable write publication failed: {error:?}"
-                    )
-                });
+            self.publish_completed_write(len);
         }
         true
     }
