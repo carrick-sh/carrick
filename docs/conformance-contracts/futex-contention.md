@@ -137,3 +137,24 @@ WAIT also needs separate treatment: Linux WAIT only reads its operand, so a
 mandatory writeback must not introduce a write-permission requirement. These
 constraints apply to the existing host paths; they do not justify a new
 fallback, owner polling loop, outcome type, or an early debt-ceiling decrease.
+
+### Fork/exec successor refusal witness (#1721)
+
+`serial_host_native_fork_exec_child_futex_retains_owner_refusal` extends the
+native fork/exec fixture with a second live process. The parent waits through
+production `wait4`; the child completes the exec service and uses the successor
+MM. Its first private WAIT has a valid aligned address with a simulated unavailable
+physical word. The dispatcher must retain the owner Gate wait, preserve the
+original comparison arguments, and return errno 11 after backing becomes
+available with a different value. It must never turn this refusal into errno 14
+or forward the child to an unavailable host dispatcher. A subsequent raw clone
+uses glibc's clone flags and native thread stock; a matching WAIT selects that
+birth, whose first dispatched gettid must return its issued TID. The original
+parent remains alive throughout.
+
+This is a controlled memory-supply witness for the `UserCopy` correction carried
+by prerequisite #1726. It does not execute glibc, identify the futex that caused
+the reported `forkexecpthread` abort, or establish signed GNU/musl parity. The
+exec reply, physical backing and owner refusal are controlled by the native
+harness; the process graph, dispatcher, clone, wait queue and continuation are
+production code. Actual child-futex capture and the signed census remain open.

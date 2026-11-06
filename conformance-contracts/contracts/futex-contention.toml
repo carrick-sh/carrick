@@ -26,6 +26,7 @@ rationale = "Blocking futex operations must park without redispatch and wake wit
 vm_free = [
   "carrick-kernel-example::futex_contention_contract",
   "carrick-el1-linux::aarch64_process_tests::futex_unbacked_word_waits_for_owner_with_two_live_threads",
+  "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_fork_exec_child_futex_retains_owner_refusal",
   "carrick-el1::substrate::file::atomic_copy_tests",
   "carrick-kernel::dispatch::overlay_dispatch_tests::futex_wait_preserves_owner_memory_refusal_before_comparison",
   "carrick-kernel::dispatch::proc::copyout_refusal_s3_tests::futex_pi_lock_and_unlock_wait_for_owner_refused_copyout_without_waking_waiters",
