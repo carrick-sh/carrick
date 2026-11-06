@@ -456,7 +456,17 @@ mod serial_host {
                 None => std::env::remove_var("CARRICK_HOME"),
             }
         }
+        // Check before releasing the worker: without the resolver deadline,
+        // its own safety timeout would finish the probe and mask the defect.
+        let still_stalled = matches!(
+            completion.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
         let _ = release.send(());
+        assert!(
+            still_stalled,
+            "resolver must return while the probe is stalled"
+        );
         completion
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
