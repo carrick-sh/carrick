@@ -3383,7 +3383,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             let chunk_len = (length - copied).min((0x1000 - (va & 0xfff)) as usize);
             let ipa = match self
                 .page_tables
-                .with_manager(|manager| manager.translate(va))
+                .with_manager(|manager| manager.translate_retained_output(va))
                 .flatten()
                 .map(Gpa::new)
             {
@@ -3414,10 +3414,12 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     continue;
                 }
             };
-            // The live stage-1 walk above selected the exact IPA while the
-            // matching MM exclusion is held. Read that authenticated output
-            // directly: `translated_read` is the ordinary syscall-buffer seam
-            // and deliberately refuses an admitted owner MM back to its portal.
+            // The excluded stage-1 snapshot above selected the exact retained
+            // output, including a prepared or permission-invalid leaf whose
+            // Linux VMA is dumpable. Read that authenticated output through
+            // the owner-selected backing seam: `translated_read` is the
+            // ordinary syscall-buffer path and deliberately refuses an
+            // admitted owner MM back to its portal.
             let bytes = match self.vm.translated_read_excluded(va, ipa.raw(), chunk_len) {
                 Ok(bytes) => bytes,
                 Err(error) => {
