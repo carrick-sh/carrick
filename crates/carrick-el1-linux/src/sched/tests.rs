@@ -26,6 +26,10 @@ fn host_futex_fixture_accepts_aligned_pointers_outside_guest_va_range() {
         super::futex_word_refusal(host_pointer),
         CopyOutcome::NotYet(_)
     ));
+    assert_eq!(
+        super::futex_word_refusal(UserVa::new(host_pointer.raw() + 1)),
+        CopyOutcome::Fault
+    );
 }
 
 const MM: u64 = 7;
