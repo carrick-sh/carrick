@@ -12686,9 +12686,7 @@ fn signal_frame_nonresident_stack(refuse_push: bool) {
     tkill_frame.x[8] = 130; // SYS_tkill
 
     let deliver_frame = if refuse_push {
-        crate::file::SIMULATE_COPYOUT_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
         let first_delivery = arm_call(fixture, fixture.control, &mut service, &mut tkill_frame);
-        crate::file::SIMULATE_COPYOUT_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
         assert_eq!(
             first_delivery.unwrap(),
             carrick_personality_linux::dispatch::CompletionRoute::WithWork,
@@ -12709,28 +12707,34 @@ fn signal_frame_nonresident_stack(refuse_push: bool) {
     };
     settle_boundary();
     let mut deliver_frame = deliver_frame;
+    if refuse_push {
+        crate::file::SIMULATE_COPYOUT_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
+    }
+    let final_checkpoint = super::aarch64_process::with_process_entry(
+        BornInZoneSource {
+            zone: fixture.zone,
+            slot: fixture.slot,
+        },
+        &fixture.task,
+        &ThreadCtx::ZERO,
+        fixture_ttbr0(fixture),
+        fixture.page,
+        fixture.control,
+        &mut service,
+        |process| {
+            super::arm_signal::test_final_user_return_checkpoint(
+                &fixture.task,
+                fixture.control,
+                process,
+                &mut deliver_frame,
+            )
+        },
+    );
+    if refuse_push {
+        crate::file::SIMULATE_COPYOUT_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
+    }
     assert_eq!(
-        super::aarch64_process::with_process_entry(
-            BornInZoneSource {
-                zone: fixture.zone,
-                slot: fixture.slot,
-            },
-            &fixture.task,
-            &ThreadCtx::ZERO,
-            fixture_ttbr0(fixture),
-            fixture.page,
-            fixture.control,
-            &mut service,
-            |process| {
-                super::arm_signal::test_final_user_return_checkpoint(
-                    &fixture.task,
-                    fixture.control,
-                    process,
-                    &mut deliver_frame,
-                )
-            },
-        )
-        .unwrap(),
+        final_checkpoint.unwrap(),
         None,
         "the final user-return checkpoint must publish the requeued signal"
     );
