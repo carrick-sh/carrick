@@ -506,6 +506,25 @@ pub trait GuestMemory {
         Err(MemoryPrepareError::Fault(MemoryError::Unsupported))
     }
 
+    /// Atomically load one aligned 32-bit user word with acquire ordering.
+    /// Backends must retain the exact physical owner through the instruction.
+    fn atomic_load_user_u32(&self, address: u64) -> Result<u32, MemoryError> {
+        let _ = address;
+        Err(MemoryError::Unsupported)
+    }
+
+    /// Compare-exchange one aligned 32-bit user word. Success is acquire/release;
+    /// mismatch is acquire and returns the observed word.
+    fn atomic_compare_exchange_user_u32(
+        &mut self,
+        address: u64,
+        expected: u32,
+        desired: u32,
+    ) -> Result<u32, MemoryError> {
+        let _ = (address, expected, desired);
+        Err(MemoryError::Unsupported)
+    }
+
     /// Supply an exact owner-issued physical dependency. A completed supply
     /// only makes a retry eligible; the owner revalidates its live root and
     /// permissions when the caller prepares again.

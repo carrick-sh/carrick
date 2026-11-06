@@ -4342,10 +4342,13 @@ mod overlay_dispatch_tests {
         }
         impl GuestMemory for Word {
             fn read_bytes_raw(&self, _: u64, _: usize) -> Result<Vec<u8>, MemoryError> {
+                panic!("futex words must use the atomic user-copy operation")
+            }
+            fn atomic_load_user_u32(&self, _: u64) -> Result<u32, MemoryError> {
                 if self.unavailable {
                     Err(MemoryError::OwnerWait(self.wait))
                 } else {
-                    Ok(7u32.to_ne_bytes().to_vec())
+                    Ok(7)
                 }
             }
             fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
@@ -4414,13 +4417,13 @@ mod overlay_dispatch_tests {
 
         impl CurrentMmMemory for SharedOnly {}
         // Software read fails, but the shared host pointer yields the word.
-        let mem = SharedOnly { word: 0x00C0_FFEE };
-        assert_eq!(read_futex_word(&mem, 0x0100_0160_0000), Ok(0x00C0_FFEE));
+        let mut mem = SharedOnly { word: 0x00C0_FFEE };
+        assert_eq!(read_futex_word(&mut mem, 0x0100_0160_0000), Ok(0x00C0_FFEE));
 
         // No shared mapping -> EFAULT propagates unchanged (no regression for
         // a genuinely bad private/anon address).
-        let lin = LinearMemory::new(0x1000, vec![0u8; 8]);
-        assert_eq!(read_futex_word(&lin, 0x9_9999_9999), Err(Box::new(DispatchOutcome::Errno { errno: LINUX_EFAULT })));
+        let mut lin = LinearMemory::new(0x1000, vec![0u8; 8]);
+        assert_eq!(read_futex_word(&mut lin, 0x9_9999_9999), Err(Box::new(DispatchOutcome::Errno { errno: LINUX_EFAULT })));
     }
 
     struct CountingMemory {
@@ -5542,7 +5545,7 @@ mod hvpatch_in_process_fork_tests {
 
         assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
         assert_eq!(
-            read_futex_word(&memory, address).unwrap(),
+            read_futex_word(&mut memory, address).unwrap(),
             u32::try_from(child_context.thread().key().tid.raw()).unwrap()
         );
     }

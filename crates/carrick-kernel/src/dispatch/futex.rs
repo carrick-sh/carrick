@@ -14,6 +14,9 @@ use carrick_abi::{
     LINUX_FUTEX_WAIT_BITSET, LINUX_FUTEX_WAITV_MAX, LINUX_FUTEX_WAKE, LINUX_FUTEX_WAKE_BITSET,
     LinuxFutexFlags,
 };
+use carrick_core::personality::{
+    Access, CopyOutcome, GuestCopyRequest, GuestLen, UserCopy, UserVa,
+};
 use carrick_guest_mem::CurrentMmMemory;
 
 use super::outcome::{DispatchOutcome, SharedFutexTarget};
@@ -85,17 +88,13 @@ pub(crate) fn dispatch_futex_pi(
     match command {
         LINUX_FUTEX_LOCK_PI | LINUX_FUTEX_TRYLOCK_PI => {
             if owner == 0 {
-                let out = match super::copyout::prepare(
-                    context,
-                    memory,
-                    [Some(super::copyout::UserSlot::new(address, 4))],
-                ) {
-                    Ok(out) => out,
-                    Err(refusal) => return refusal.into_outcome(),
-                };
-                return match out.commit([&tid.to_ne_bytes()]) {
-                    Ok(()) => DispatchOutcome::Returned { value: 0 },
-                    Err(fault) => fault.outcome(),
+                let desired = (word & !LINUX_FUTEX_TID_MASK) | tid;
+                return match compare_exchange_futex_word(memory, address, word, desired) {
+                    Ok(observed) if observed == word => DispatchOutcome::Returned { value: 0 },
+                    Ok(observed) => {
+                        dispatch_futex_pi(context, memory, address, command, observed, tid, wake)
+                    }
+                    Err(refusal) => refusal,
                 };
             }
             if owner == tid {
@@ -111,16 +110,15 @@ pub(crate) fn dispatch_futex_pi(
             if owner != tid {
                 return DispatchOutcome::Errno { errno: LINUX_EPERM };
             }
-            let out = match super::copyout::prepare(
-                context,
-                memory,
-                [Some(super::copyout::UserSlot::new(address, 4))],
-            ) {
-                Ok(out) => out,
-                Err(refusal) => return refusal.into_outcome(),
-            };
-            if let Err(fault) = out.commit([&0u32.to_ne_bytes()]) {
-                return fault.outcome();
+            let desired = word & !LINUX_FUTEX_TID_MASK;
+            match compare_exchange_futex_word(memory, address, word, desired) {
+                Ok(observed) if observed == word => {}
+                Ok(observed) => {
+                    return dispatch_futex_pi(
+                        context, memory, address, command, observed, tid, wake,
+                    );
+                }
+                Err(refusal) => return refusal,
             }
             if let Some(wake) = wake {
                 let woken = wake.table.wake(address, 1);
@@ -141,6 +139,28 @@ pub(crate) fn dispatch_futex_pi(
         _ => DispatchOutcome::Errno {
             errno: LINUX_ENOSYS,
         },
+    }
+}
+
+fn compare_exchange_futex_word(
+    memory: &mut impl CurrentMmMemory,
+    address: u64,
+    expected: u32,
+    desired: u32,
+) -> Result<u32, DispatchOutcome> {
+    let mut copy = HostFutexCopy::new(memory);
+    let mut observed = 0;
+    match copy.atomic_compare_exchange_u32(UserVa::new(address), expected, desired, &mut observed) {
+        CopyOutcome::Done => Ok(observed),
+        CopyOutcome::NotYet(_) => Err(copy
+            .take_refusal()
+            .and_then(DispatchOutcome::from_owner_memory_error)
+            .unwrap_or(DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            })),
+        CopyOutcome::Fault => Err(DispatchOutcome::Errno {
+            errno: LINUX_EFAULT,
+        }),
     }
 }
 
@@ -859,34 +879,123 @@ pub(crate) fn dispatch_futex_waitv_args(
 /// CPython multiprocessing SyncManager teardown, where a forked server child's
 /// `FUTEX_WAIT_BITSET|CLOCK_REALTIME` on a shared semaphore aborted the process.
 pub(crate) fn read_futex_word(
-    memory: &impl CurrentMmMemory,
+    memory: &mut impl CurrentMmMemory,
     address: u64,
 ) -> Result<u32, Box<DispatchOutcome>> {
-    let mut bytes = [0; 4];
-    match memory.read_into(address, &mut bytes) {
-        Ok(()) => Ok(u32::from_ne_bytes(bytes)),
-        Err(error) => {
-            // A pending exact-owner transfer is not evidence of a bad address.
-            // This read has no side effects: release its transfer and redispatch
-            // the original syscall after the existing owner dependency settles.
-            if let Some(refusal) = DispatchOutcome::from_owner_memory_error(error) {
-                return Err(Box::new(refusal));
-            }
-            match memory.shared_futex_location(address) {
-                Some(location) if location.wait_addr().raw().is_multiple_of(4) => {
-                    // SAFETY: the resolved location is a live aligned shared
-                    // word, as required by the existing shared wait/wake seam.
-                    // Atomic access avoids tearing against a guest update.
-                    let word = unsafe {
-                        std::sync::atomic::AtomicU32::from_ptr(
-                            location.wait_addr().raw() as *mut u32
-                        )
-                    };
-                    Ok(word.load(std::sync::atomic::Ordering::Acquire))
-                }
-                _ => Err(Box::new(DispatchOutcome::Errno {
+    let mut copy = HostFutexCopy::new(memory);
+    let mut value = 0;
+    match copy.atomic_load_u32(UserVa::new(address), &mut value) {
+        CopyOutcome::Done => Ok(value),
+        CopyOutcome::NotYet(_) => Err(Box::new(
+            copy.take_refusal()
+                .and_then(DispatchOutcome::from_owner_memory_error)
+                .unwrap_or(DispatchOutcome::Errno {
                     errno: LINUX_EFAULT,
-                })),
+                }),
+        )),
+        CopyOutcome::Fault => match copy.memory.shared_futex_location(address) {
+            Some(location) if location.wait_addr().raw().is_multiple_of(4) => {
+                // SAFETY: the resolved location is a live aligned shared word.
+                let word = unsafe {
+                    std::sync::atomic::AtomicU32::from_ptr(location.wait_addr().raw() as *mut u32)
+                };
+                Ok(word.load(std::sync::atomic::Ordering::Acquire))
+            }
+            _ => Err(Box::new(DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            })),
+        },
+    }
+}
+
+struct HostFutexCopy<'a, M: CurrentMmMemory> {
+    memory: &'a mut M,
+    refusal: Option<carrick_guest_mem::MemoryError>,
+}
+
+impl<'a, M: CurrentMmMemory> HostFutexCopy<'a, M> {
+    fn new(memory: &'a mut M) -> Self {
+        Self {
+            memory,
+            refusal: None,
+        }
+    }
+
+    fn take_refusal(&mut self) -> Option<carrick_guest_mem::MemoryError> {
+        self.refusal.take()
+    }
+}
+
+impl<M: CurrentMmMemory> UserCopy for HostFutexCopy<'_, M> {
+    fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> CopyOutcome {
+        CopyOutcome::from_completed(self.memory.read_into(src.raw(), dst).is_ok())
+    }
+
+    fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> CopyOutcome {
+        CopyOutcome::from_completed(self.memory.write_bytes(dst.raw(), src).is_ok())
+    }
+
+    fn atomic_load_u32(&mut self, address: UserVa, value: &mut u32) -> CopyOutcome {
+        match self.memory.atomic_load_user_u32(address.raw()) {
+            Ok(word) => {
+                *value = word;
+                CopyOutcome::Done
+            }
+            Err(error) => {
+                let retryable = matches!(
+                    &error,
+                    carrick_guest_mem::MemoryError::ReadSuspended(_)
+                        | carrick_guest_mem::MemoryError::OwnerWait(_)
+                        | carrick_guest_mem::MemoryError::Physical(_)
+                        | carrick_guest_mem::MemoryError::Supply(_)
+                );
+                self.refusal = Some(error);
+                if retryable {
+                    CopyOutcome::NotYet(GuestCopyRequest {
+                        address,
+                        len: GuestLen::new(4),
+                        access: Access::Read,
+                    })
+                } else {
+                    CopyOutcome::Fault
+                }
+            }
+        }
+    }
+
+    fn atomic_compare_exchange_u32(
+        &mut self,
+        address: UserVa,
+        expected: u32,
+        desired: u32,
+        observed: &mut u32,
+    ) -> CopyOutcome {
+        match self
+            .memory
+            .atomic_compare_exchange_user_u32(address.raw(), expected, desired)
+        {
+            Ok(word) => {
+                *observed = word;
+                CopyOutcome::Done
+            }
+            Err(error) => {
+                let retryable = matches!(
+                    &error,
+                    carrick_guest_mem::MemoryError::ReadSuspended(_)
+                        | carrick_guest_mem::MemoryError::OwnerWait(_)
+                        | carrick_guest_mem::MemoryError::Physical(_)
+                        | carrick_guest_mem::MemoryError::Supply(_)
+                );
+                self.refusal = Some(error);
+                if retryable {
+                    CopyOutcome::NotYet(GuestCopyRequest {
+                        address,
+                        len: GuestLen::new(4),
+                        access: Access::Write,
+                    })
+                } else {
+                    CopyOutcome::Fault
+                }
             }
         }
     }

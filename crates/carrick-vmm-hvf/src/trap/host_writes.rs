@@ -281,6 +281,45 @@ impl BackingOwner {
 }
 
 impl HvfTaskState {
+    pub(crate) fn atomic_load_user_u32(
+        &self,
+        custody: &CarrierVmCustody,
+        address: u64,
+    ) -> Result<u32, MemoryError> {
+        if !address.is_multiple_of(4) {
+            return Err(MemoryError::OutOfBounds { address, length: 4 });
+        }
+        let access = admit_contiguous(self, custody, HostAccess::Read, address, 4, None)?;
+        // SAFETY: admission retains one aligned live word through this load.
+        let word = unsafe { &*(access.pointer.cast::<std::sync::atomic::AtomicU32>()) };
+        Ok(word.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    pub(crate) fn atomic_compare_exchange_user_u32(
+        &self,
+        custody: &CarrierVmCustody,
+        address: u64,
+        expected: u32,
+        desired: u32,
+    ) -> Result<u32, MemoryError> {
+        if !address.is_multiple_of(4) {
+            return Err(MemoryError::OutOfBounds { address, length: 4 });
+        }
+        let access = admit_contiguous(self, custody, HostAccess::Write, address, 4, None)?;
+        // SAFETY: admission retains one aligned writable word through the exchange.
+        let word = unsafe { &*(access.pointer.cast::<std::sync::atomic::AtomicU32>()) };
+        Ok(
+            match word.compare_exchange(
+                expected,
+                desired,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(value) | Err(value) => value,
+            },
+        )
+    }
+
     /// Admit `len` bytes at guest `address` (one contiguous mapping) as a
     /// zero-copy host-call SOURCE, retaining the exact backing owner for the
     /// lifetime of the returned [`HostRead`].
