@@ -721,9 +721,9 @@ impl HostIpc {
     /// first write ([`HostIpc::ensure_pipe_storage`]), as Linux allocates
     /// pipe pages on demand.
     pub fn create_pipe(&self, capacity: usize) -> Result<IpcObjectHandle, AdmissionError> {
+        self.top_up_ring_stock()?;
         let object = self.with_object(|region| region.create_pipe(capacity, &HostLockWait))?;
         self.bind_waits(object);
-        self.top_up_ring_stock();
         Ok(object)
     }
 
@@ -732,25 +732,22 @@ impl HostIpc {
     /// exit) for up to [`carrick_el1_abi::ipc::IPC_RING_STOCK`] pipes created between writes. The
     /// stock bounds the pool address space idle pipes can claim, so a zone
     /// of many idle pipes still costs records only. A refused provision
-    /// only means later first writes take the host path.
-    fn top_up_ring_stock(&self) {
+    /// only means later first writes allocate through the shared ring allocator.
+    fn top_up_ring_stock(&self) -> Result<(), AdmissionError> {
         let region = self.region();
         if !region.ring_stock_has_room() {
-            return;
+            return Ok(());
         }
         let Ok(ring) = self.provision_pipe(
             IPC_STOCK_RING_BYTES,
             IPC_STOCK_RING_BYTES / IPC_PIPE_PAGE_SIZE as u64,
         ) else {
-            return;
+            return Ok(());
         };
         if let Err(mut ring) = region.stock_ring(ring) {
-            region
-                .reclaim_pipe_storage(&mut ring, &HostLockWait)
-                .unwrap_or_else(|error| {
-                    carrick_fatal::carrick_fatal!("ipc::stock", "unused stock extent: {error:?}")
-                });
+            region.reclaim_pipe_storage(&mut ring, &HostLockWait)?;
         }
+        Ok(())
     }
 
     /// Give `object`'s pipe its ring before a host write: provisioned from
@@ -762,7 +759,7 @@ impl HostIpc {
         &self,
         object: IpcObjectHandle,
     ) -> Result<(), AdmissionError> {
-        self.top_up_ring_stock();
+        self.top_up_ring_stock()?;
         let region = self.region();
         let mut guard = region.lock(object, &HostLockWait)?;
         guard
