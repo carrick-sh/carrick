@@ -7,9 +7,8 @@ on:
 
 permissions: {}
 
-# Serialize push-to-main dispatches so out-of-order runner scheduling cannot
-# dispatch an older main commit after a newer tip has already been dispatched,
-# which would cancel the newer baseline in signed-gate-main-tip (#1729).
+# Serialize dispatches and resolve live main inside the slot. Pending push
+# events may arrive out of order; dispatch the live tip, not the event SHA.
 concurrency:
   group: signed-baseline-dispatch-main
   cancel-in-progress: false
@@ -26,25 +25,14 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Check that pushed commit is still current main tip
+      - name: Resolve live main tip
         id: tip
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          MAIN_SHA: ${{ github.sha }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          case "$MAIN_SHA" in
-            *[!0-9a-f]* | 0000000000000000000000000000000000000000)
-              echo "::error::Refusing non-hex or zero push SHA: $MAIN_SHA" >&2
-              exit 1
-              ;;
-          esac
-          if [ "${#MAIN_SHA}" -ne 40 ]; then
-            echo "::error::Refusing non-40-char push SHA: $MAIN_SHA" >&2
-            exit 1
-          fi
           live_tip="$(
             gh api \
               -H "Accept: application/vnd.github+json" \
@@ -62,15 +50,9 @@ jobs:
             echo "::error::Failed to resolve 40-char live refs/heads/main tip for $REPO" >&2
             exit 1
           fi
-          if [ "$live_tip" != "$MAIN_SHA" ]; then
-            echo "::notice::refs/heads/main already advanced to $live_tip; skipping superseded baseline dispatch for $MAIN_SHA"
-            echo "current=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "current=true" >> "$GITHUB_OUTPUT"
+          echo "sha=$live_tip" >> "$GITHUB_OUTPUT"
 
       - name: Dispatch signed baseline for current main SHA
-        if: steps.tip.outputs.current == 'true'
         shell: bash
         env:
           # Signed gate authorization (#654) and baseline admission require
@@ -78,7 +60,7 @@ jobs:
           # carrick-workers App are rejected. Provision a fine-grained owner
           # PAT scoped to carrick-sh/carrick with Actions: Read and write only.
           GH_TOKEN: ${{ secrets.SIGNED_GATE_DISPATCH_TOKEN }}
-          MAIN_SHA: ${{ github.sha }}
+          MAIN_SHA: ${{ steps.tip.outputs.sha }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail

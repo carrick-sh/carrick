@@ -41,8 +41,8 @@ not add to those failure sets. Missing required suite populations cannot
 seed a baseline.
 
 Every push to `main` triggers `.github/workflows/signed-baseline.yml`, which
-serializes push events, checks via `GITHUB_TOKEN` (`contents: read`) that the
-pushed commit is still the live `refs/heads/main` tip, and dispatches
+serializes push events, resolves the live `refs/heads/main` tip via
+`GITHUB_TOKEN` (`contents: read`), and dispatches
 `signed-gate.yml` on `main` (`pr=main`, `sha=<main-sha>`) using the
 `SIGNED_GATE_DISPATCH_TOKEN` repository secret (#1729). Provision
 `SIGNED_GATE_DISPATCH_TOKEN` as an owner (`tjfontaine`) fine-grained personal
@@ -52,6 +52,10 @@ broadening `GITHUB_TOKEN` or `carrick-workers` App trust (#654). Automatic dispa
 automatic tip runs share the workflow-level `signed-gate-main-tip` concurrency group
 with `cancel-in-progress: true`, cancelling superseded in-flight baselines when
 `main` advances again.
+The dispatcher always sends the live tip it reads inside its serialized slot,
+even if its triggering push was older. Out-of-order pending-slot replacement
+therefore cannot skip the newest tip. A landing after that read queues another
+dispatch; multiple dispatches of the same tip are harmless.
 
 If no baseline exists yet (for example, while the automatic baseline is still
 running, after a failed run, or for an older `main` ancestor), authorization
