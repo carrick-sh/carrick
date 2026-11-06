@@ -241,8 +241,7 @@ fn split_at_last_paren(s: &str) -> (&str, &str) {
 
 /// Where should `HostFsBackend` place its per-run scratch dir? An explicit
 /// `CARRICK_HOME` places scratch at `$CARRICK_HOME/scratch`, checking it without touching
-/// the conventional mount. GitHub CI otherwise uses its admitted internal checkout
-/// at `$GITHUB_WORKSPACE/target/carrick-home/scratch`. Outside CI, prefer
+/// the conventional mount. Prefer
 /// the dedicated carrick APFS volume (always case-sensitive, isolated,
 /// throw-away-able). Fall back to `~/.carrick/scratch` for hosts where
 /// the volume hasn't been laid down yet.
@@ -316,19 +315,6 @@ fn resolve_scratch_root(
 ) -> ScratchRoot {
     if let Some(home) = std::env::var_os("CARRICK_HOME").filter(|s| !s.is_empty()) {
         return checked_scratch_root(PathBuf::from(home).join("scratch"), true, probe);
-    }
-    // CI checkouts are admitted on internal storage. Ordinary host tests must
-    // follow the same policy as acceptance and signed wrappers, without relying
-    // on each workflow step to export an override before opening the USB mount.
-    if std::env::var_os("GITHUB_ACTIONS").is_some_and(|value| value == "true")
-        && let Some(workspace) =
-            std::env::var_os("GITHUB_WORKSPACE").filter(|value| !value.is_empty())
-    {
-        return checked_scratch_root(
-            PathBuf::from(workspace).join("target/carrick-home/scratch"),
-            true,
-            probe,
-        );
     }
     let conventional = checked_scratch_root(conventional.to_owned(), false, probe.clone());
     if conventional.case_sensitive {
@@ -445,37 +431,6 @@ mod fs_default_tests {
 #[cfg(test)]
 mod serial_host {
     use super::*;
-
-    #[test]
-    fn ci_workspace_bypasses_conventional_mount() {
-        let root = tempfile::tempdir().unwrap();
-        let variables = ["CARRICK_HOME", "GITHUB_ACTIONS", "GITHUB_WORKSPACE"];
-        let previous = variables.map(std::env::var_os);
-        // SAFETY: this module runs in the serial_host partition.
-        unsafe {
-            std::env::remove_var("CARRICK_HOME");
-            std::env::set_var("GITHUB_ACTIONS", "true");
-            std::env::set_var("GITHUB_WORKSPACE", root.path());
-        }
-        let conventional = root.path().join("cold-storage");
-        let expected = root.path().join("target/carrick-home/scratch");
-        let selected = expected.clone();
-        let actual = resolve_scratch_root(&conventional, move |path, create| {
-            assert_eq!(path, selected, "CI must not touch the conventional mount");
-            assert!(create);
-            probe_scratch_root(path, create)
-        });
-        unsafe {
-            for (name, value) in variables.into_iter().zip(previous) {
-                match value {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
-                }
-            }
-        }
-        assert_eq!(actual.path(), expected);
-        assert!(actual.host_path().is_ok());
-    }
 
     #[test]
     fn stalled_probe_returns_failure_before_worker_finishes() {

@@ -10,6 +10,12 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Keep runtime scratch on the internal checkout
+      shell: bash
+      run: |
+        set -euo pipefail
+        # CI checkouts are internal; /Volumes/carrick is cold USB storage.
+        printf 'CARRICK_HOME=%s\n' "${CARRICK_HOME:-$GITHUB_WORKSPACE/target/carrick-home}" >> "$GITHUB_ENV"
     - name: Prepare locked Cargo cache (infrastructure)
       shell: bash
       working-directory: ${{ inputs.root }}
