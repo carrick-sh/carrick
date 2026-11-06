@@ -689,6 +689,9 @@ impl SyscallDispatcher {
         reference: Arc<crate::kernel::objects::MappedFileReference>,
     ) -> Served {
         let description = reference.description();
+        if description.common().status_flags() & carrick_abi::LINUX_O_PATH != 0 {
+            return Served::errno(carrick_abi::LINUX_EBADF);
+        }
         if description.common().status_flags() & carrick_abi::LINUX_O_ACCMODE
             == carrick_abi::LINUX_O_WRONLY
         {

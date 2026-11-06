@@ -44,7 +44,7 @@ explicitly carrier-scoped instead of using ARM's process-global registration.
 ## Shared physical source projection
 
 `FileTable::publish_ipc` exports host slots as `IpcPhysicalHold`, while native
-opens use `NativeOpenFile`. Both now reach `native_map_reference`, which checks
+opens use `NativeOpenFile`. Both now reach `native_map_reference`, which rejects O_PATH with errno 9, checks
 read access and registers the same retained private source. The projection
 shares the original physical lifetime, backing, identity and seals, but owns
 no fd reference, cursor authority or publication pin. Its original-description
@@ -59,7 +59,8 @@ Do not replace this with a numeric host-fd lookup, copied namespace, or a
 strong original-description backlink (which cycles through publication).
 The VM-free production-service witness closes the host fd, proves the original
 description is gone and then reads the retained bytes. Disabling the physical
-resource branch reproduces `NativeHostFileRefusal` in that witness.
+resource branch reproduces `NativeHostFileRefusal` in that witness. The
+O_PATH witness was separately red (exit 33) before the shared access check.
 
 File grants use the existing authenticated descriptor/inventory publisher.
 They are excluded from the anonymous-only evidence population; that recorder
@@ -69,7 +70,8 @@ anonymous pages.
 ## Witnesses and remaining acceptance
 
 `cpl0_initial_mm` exercises read-only first-touch, private writes with an
-unchanged source, write-only fd rejection (errno 13), beyond-EOF SIGBUS, and
+unchanged source, write-only fd rejection (errno 13), path-only fd rejection
+(errno 9), beyond-EOF SIGBUS, and
 child first-touch after the parent unmaps. The child case blocks SIGUSR1 before
 fork; the parent unmaps and closes its fd before signalling. The child closes
 its inherited fd before its bounded five-second sigtimedwait, then faults and
