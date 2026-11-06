@@ -513,6 +513,8 @@ impl HvpatchProductionPhase {
     /// These suspensions perform host termination work only. EL1 may have
     /// vacated the process translations already, so they cannot keep lazy
     /// hardware residency. Exec drains retain their separate successor path.
+    /// Unlike `is_terminal_transition`, this includes member exit retries:
+    /// their CPU image needs process roots even though a peer may own the drain.
     fn needs_terminal_cpu_save(&self) -> bool {
         match self {
             Self::TerminalProcessDrain { .. }
