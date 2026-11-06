@@ -239,7 +239,8 @@ fn split_at_last_paren(s: &str) -> (&str, &str) {
     }
 }
 
-/// Where should `HostFsBackend` place its per-run scratch dir? Prefer
+/// Where should `HostFsBackend` place its per-run scratch dir? An explicit
+/// `CARRICK_SCRATCH_ROOT` wins without touching the conventional mount. Prefer
 /// the dedicated carrick APFS volume (always case-sensitive, isolated,
 /// throw-away-able). Fall back to `~/.carrick/scratch` for hosts where
 /// the volume hasn't been laid down yet.
@@ -260,12 +261,15 @@ pub fn preferred_scratch_root() -> std::io::Result<PathBuf> {
 }
 
 fn resolve_scratch_root() -> PathBuf {
+    if let Some(root) = std::env::var_os("CARRICK_SCRATCH_ROOT").filter(|s| !s.is_empty()) {
+        return PathBuf::from(root);
+    }
     // Fast path: the conventional mount point of the carrick volume. Verify
     // it's actually case-sensitive (a Linux ABI requirement) so a coincidental
     // dir at that path on a case-insensitive boot volume can't be mistaken for
     // our volume.
     let conventional = Path::new("/Volumes").join(DEFAULT_VOLUME_NAME);
-    if conventional.is_dir() && probe_case_sensitive(&conventional) {
+    if probe_case_sensitive(&conventional) {
         return conventional;
     }
     // Fallback: honour the user's $CARRICK_HOME, else $HOME/.carrick. (No
@@ -319,8 +323,50 @@ pub fn default_writable_backend_kind() -> carrick_spec::FsBackendKind {
 /// Probe whether `path` resides on a case-sensitive filesystem.
 /// Tries to round-trip a sentinel file through opposite case spellings;
 /// on a case-insensitive volume the two open the same inode. Returns
-/// `false` on any error rather than misreporting `true`.
+/// `false` on any error rather than misreporting `true`. All filesystem work
+/// runs on one process-wide worker with a 250 ms caller deadline. A syscall
+/// stuck in the host kernel may outlive that deadline; further probes then
+/// fail closed instead of accumulating blocked threads.
 pub fn probe_case_sensitive(path: &Path) -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    // A stalled filesystem syscall cannot be cancelled safely in-process. Keep
+    // at most one outstanding worker, including after its caller times out.
+    // Further probes fail closed while that worker owns the slot. Do not join
+    // it on timeout: even stat, close and unlink may stall on a sick volume.
+    static ACTIVE: AtomicBool = AtomicBool::new(false);
+    struct Slot;
+    impl Drop for Slot {
+        fn drop(&mut self) {
+            ACTIVE.store(false, Ordering::Release);
+        }
+    }
+    if ACTIVE
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return false;
+    }
+    let slot = Slot;
+    let path = path.to_owned();
+    let (send, recv) = std::sync::mpsc::sync_channel(1);
+    if std::thread::Builder::new()
+        .name("carrick-case-probe".into())
+        .spawn(move || {
+            let _slot = slot;
+            let result = probe_case_sensitive_inner(&path);
+            let _ = send.send(result);
+        })
+        .is_err()
+    {
+        return false;
+    }
+    recv.recv_timeout(Duration::from_millis(250))
+        .unwrap_or(false)
+}
+
+fn probe_case_sensitive_inner(path: &Path) -> bool {
     let lower = path.join(".carrick-case-probe");
     let upper = path.join(".CARRICK-case-probe");
     if std::fs::File::create(&lower).is_err() {
@@ -330,7 +376,7 @@ pub fn probe_case_sensitive(path: &Path) -> bool {
     let _ = std::fs::remove_file(&lower);
     // On case-sensitive: upper doesn't exist → Err.
     // On case-insensitive: upper opens the same inode as lower → Ok.
-    metadata_upper.is_err()
+    matches!(metadata_upper, Err(error) if error.kind() == std::io::ErrorKind::NotFound)
 }
 
 #[cfg(test)]
