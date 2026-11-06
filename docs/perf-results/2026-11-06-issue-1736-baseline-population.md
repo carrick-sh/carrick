@@ -31,3 +31,49 @@ means that write used a stale writable translation and modified the frame that
 the child inherited, instead of faulting through the fork's COW-armed parent
 descriptor. The enclosing Rust test then panicked only because the fixture
 returned exit status 1.
+
+## Diagnosis and negative control
+
+The worker is pinned to guest CPU 1; the fork editor and invalidation run on
+guest CPU 0. Bounded `hvpatch-mm-reuse-isolation` traces identified the live
+parent as MM generation / architectural ASID 53. All 30 traced attempts
+passed, so the trace perturbed the race; the untraced failure above is the
+authoritative stale-translation witness.
+
+The first hypothesis strengthened the barriers around CPU 0's `TLBI
+ASIDE1IS` from `DSB ISHST` / `DSB ISH` to `DSB SY`. Its exact signed
+population was still 19/20 for fork/exec, with the same
+`child_failures=1` mode (run 10 under
+`target/issue1736/population-after/fork-exec/`). The stronger barriers were
+therefore removed rather than treated as closure.
+
+The deterministic red witness was
+`each_vcpu_covers_a_foreign_cow_publication_for_itself`. Slot 1 invalidated
+publication 1 and advanced the address-space-global coverage word; slot 2's
+production install then incorrectly returned `cow_owed=None`. The missed
+operation was slot 2's own local invalidation of publication 1. A guest
+broadcast invalidation was being recorded as coverage for virtual CPUs on
+which it had not completed.
+
+## Final signed population
+
+Fix revision: `e4b20d690ec64290157ab24c328b7ca719b5d437`.
+
+The exact signed executable was
+`target/release/deps/el1_sched-24da1b99c955c4f7`, SHA-256
+`3fe8c2891f4cc8f3cf4b8a28ac5cdbd0ba98eae743f6043ca03dfd9113e32f63`,
+CDHash `6e8975f3652c775eb8af460f1ce068ff5ed5169c`, LC_UUID
+`DC6B1133-22CC-3924-9B93-8EECC339112A`. It carried the hypervisor entitlement.
+Each run had a distinct `CARRICK_RUN_ID`; every post-run process census was
+zero. Raw logs are under `target/issue1736/population-final/`.
+
+| Signed test | Pass | Fail | Failure mode |
+|---|---:|---:|---|
+| `el1_tlb_cross_vcpu_mm_edits_leave_no_stale_translation` | 20 | 0 | none |
+| `el1_tlb_fork_and_exec_leave_no_stale_translation` | 20 | 0 | none |
+
+The fix retains a monotonic descriptor-publication generation per address
+space but moves completed coverage to each vCPU slot. Fork, `mprotect`, and
+`munmap` publish a generation. A slot that could retain that MM must perform
+its own local invalidation before it may keep or install the root, and only
+then records its own coverage.
