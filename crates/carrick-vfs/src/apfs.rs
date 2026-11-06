@@ -433,6 +433,37 @@ mod serial_host {
     use super::*;
 
     #[test]
+    fn ci_workspace_bypasses_conventional_mount() {
+        let root = tempfile::tempdir().unwrap();
+        let variables = ["CARRICK_HOME", "GITHUB_ACTIONS", "GITHUB_WORKSPACE"];
+        let previous = variables.map(std::env::var_os);
+        // SAFETY: this module runs in the serial_host partition.
+        unsafe {
+            std::env::remove_var("CARRICK_HOME");
+            std::env::set_var("GITHUB_ACTIONS", "true");
+            std::env::set_var("GITHUB_WORKSPACE", root.path());
+        }
+        let conventional = root.path().join("cold-storage");
+        let expected = root.path().join("target/carrick-home/scratch");
+        let selected = expected.clone();
+        let actual = resolve_scratch_root(&conventional, move |path, create| {
+            assert_eq!(path, selected, "CI must not touch the conventional mount");
+            assert!(create);
+            probe_scratch_root(path, create)
+        });
+        unsafe {
+            for (name, value) in variables.into_iter().zip(previous) {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+        assert_eq!(actual.path(), expected);
+        assert!(actual.host_path().is_ok());
+    }
+
+    #[test]
     fn stalled_probe_returns_failure_before_worker_finishes() {
         let root = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("CARRICK_HOME");
