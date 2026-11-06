@@ -58,10 +58,9 @@ Keep this change draft until #1668, #847, #1572, #1736 and #1741 have their
 required proofs; do not mask flipping tests. #1732 tracks the existing main
 coalescing lane; this workflow retains a baseline for every push rather than
 coalescing away a base the queue needs. Land the Rust support on trusted main
-before activating the workflow handoff: authorization checks out main. The
-director announces the shared CI change on #231, runs `git apply signed-queue.patch` (dispatch cannot publish
-workflow files), removes the handoff after the workflow tests exercise the
-live files, and adds **Signed queue gate** to main's required checks (GitHub Actions source),
+before activating the required queue check: authorization checks out main. The
+director announces the shared CI change on #231 and adds **Signed queue gate**
+to main's required checks (GitHub Actions source),
 removing any mandatory per-PR `signed-gate` status requirement. The queue
 check-response budget must cover waiting for the base plus the signed run.
 Repo settings are not changed by this patch.
