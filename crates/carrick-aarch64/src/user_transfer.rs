@@ -114,8 +114,7 @@ fn finish_supply(
         // Withdrawal proves no descriptor was claimed. Release the speculative
         // physical grant before handing a generation-exact wait to the caller.
         drop(grant);
-        if frame.x[0] == 11 && frame.x[14] == 3 {
-            let wait = authenticated_owner_wait(target, &frame)?;
+        if let Some(wait) = authenticated_owner_wait(target, &frame)? {
             Ok(SupplyProgress::OwnerWait(wait))
         } else {
             Ok(SupplyProgress::Declined)
@@ -131,12 +130,17 @@ fn finish_supply(
 pub(crate) fn authenticated_owner_wait(
     target: TransferTarget,
     frame: &TrapFrame,
-) -> Result<carrick_el1_abi::PortalOwnerWait, TrapError> {
+) -> Result<Option<carrick_el1_abi::PortalOwnerWait>, TrapError> {
+    if frame.x[0] != 11 || frame.x[14] != 3 {
+        return Ok(None);
+    }
     let cause = carrick_el1_abi::PortalWaitCause::decode(frame.x[16])
         .ok_or_else(|| TrapError::Hypervisor("grant returned invalid owner wait".into()))?;
     // SAFETY: the exact carrier service authenticated this target's
     // notification source before testing its admission condition.
-    Ok(unsafe { carrick_el1_abi::PortalOwnerWait::from_owner(target.handle, cause, frame.x[17]) })
+    Ok(Some(unsafe {
+        carrick_el1_abi::PortalOwnerWait::from_owner(target.handle, cause, frame.x[17])
+    }))
 }
 
 /// Capture only the refused immutable selection, never a host policy answer.
@@ -770,6 +774,34 @@ mod grant_wait_tests {
         fn settle(&mut self, _: &DescriptorReceipt) -> Result<bool, TrapError> {
             panic!("an admission wait must not invent a descriptor receipt");
         }
+    }
+
+    #[test]
+    fn authenticated_owner_wait_requires_exact_service_tags() {
+        let nz = |n| NonZeroU64::new(n).unwrap();
+        let handle = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                nz(1),
+                ReservationMm::new(2).unwrap(),
+                nz(3),
+            )
+        };
+        let target = TransferTarget::from_handle(handle, 0x4000);
+        let mut frame = TrapFrame::default();
+        frame.x[16] = PortalWaitCause::Editor.encode();
+        frame.x[17] = 19;
+        assert_eq!(authenticated_owner_wait(target, &frame).unwrap(), None);
+        frame.x[0] = 11;
+        assert_eq!(authenticated_owner_wait(target, &frame).unwrap(), None);
+        frame.x[14] = 3;
+        let wait = authenticated_owner_wait(target, &frame)
+            .unwrap()
+            .expect("exact wait tags authenticate the receipt");
+        assert_eq!(wait.handle(), handle);
+        assert_eq!(wait.cause(), PortalWaitCause::Editor);
+        assert_eq!(wait.revision(), 19);
+        frame.x[16] = u64::MAX;
+        assert!(authenticated_owner_wait(target, &frame).is_err());
     }
 
     #[test]

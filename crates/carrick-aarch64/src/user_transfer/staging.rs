@@ -144,14 +144,12 @@ fn stage_with_loan<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
             carrick_fatal::carrick_fatal!("aarch64::prepared_copy", "zero owner receipt identity")
         })
     };
-    if frame.x[0] == 11 && frame.x[14] == 3 {
-        let cause = carrick_el1_abi::PortalWaitCause::decode(frame.x[16]).unwrap_or_else(|| {
-            carrick_fatal::carrick_fatal!("aarch64::prepared_copy", "invalid owner wait cause")
-        });
-        // SAFETY: this exact target was served under exclusive carrier CPU custody.
-        let observed = unsafe {
-            carrick_el1_abi::PortalOwnerWait::from_owner(target.handle, cause, frame.x[17])
-        };
+    if let Some(observed) =
+        super::authenticated_owner_wait(target, &frame).unwrap_or_else(|error| {
+            carrick_fatal::carrick_fatal!("aarch64::prepared_copy", "invalid owner wait: {error}")
+        })
+    {
+        let cause = observed.cause();
         return Err(if cause == carrick_el1_abi::PortalWaitCause::Metadata {
             MemoryPrepareError::Supply(MemorySupplyRequest::Metadata {
                 operation: PortalOperation {
