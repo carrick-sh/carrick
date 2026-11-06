@@ -275,3 +275,27 @@ service-capacity refusal, Busy once then success, late effect registration,
 shared-table unshare and both ISA adapters. VM-free fd-core receipt tests prove
 lifetime and rollback only; they do not establish production cleanup acceptance
 or a signed census result.
+
+## Pipe capacity allocation service (#1678)
+
+`HostFileOp::PipeCapacity` extends the existing retained native service record.
+Its fixed header carries the caller's table, fd, fcntl command and integer
+argument; it carries no user pointer. The Linux decoder and carrier venue are
+shared; the current native staging caller is AArch64-only. x86 has no native
+host-file staging bridge on this main, so its pipe-capacity adapter remains
+unimplemented and requires a neutral staging entry before acceptance. This is
+an allocation crossing for an
+in-zone object, not delegation of Linux pipe semantics to a host pipe.
+
+The carrier pins the selected shared description through the fd authority,
+without retaining a descriptor-table lock across pipe access or provisioning.
+The exact pin spans allocation, capacity publication and wake delivery; a
+concurrent numeric close/reuse cannot redirect it to a successor description.
+The existing shared pipe core performs rounding, shrink/occupancy checks,
+growth limits and revision/wake publication. The existing IPC owner provisions
+backing and reclaims replaced extents. No new fd table or pipe path is added.
+
+The VM-free child witness proves retained request/acknowledgement custody;
+the shared production venue witness separately exercises backed growth and
+both endpoints. Those compositional tests do not prove signed execution or
+Linux oracle parity, which remain director acceptance requirements.

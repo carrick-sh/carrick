@@ -60,6 +60,11 @@ pub enum HostFileOp {
     /// The header `fd` is unused (`-1`); each entry is pinned in the
     /// caller's table.
     Poll = 12,
+    /// Capacity of an in-zone pipe. The carrier supplies allocation through
+    /// the shared pipe owner, never a host pipe or a second descriptor table.
+    /// `args[0]` is the Linux fcntl command and `args[1]` its integer argument.
+    /// The selected description is pinned for the complete operation.
+    PipeCapacity = 13,
 }
 
 /// Bytes of one Linux `struct pollfd` (`int fd; short events, revents`).
@@ -175,6 +180,7 @@ impl HostFileOp {
             10 => Self::Getdents64,
             11 => Self::MapPrivate,
             12 => Self::Poll,
+            13 => Self::PipeCapacity,
             _ => return None,
         })
     }

@@ -1,14 +1,17 @@
 schema_version = 1
 id = "kernel.native.host-file-venue"
-title = "Native processes cross to the host only for host files, through the dispatcher's own path"
-guest_surfaces = ["syscall:read", "syscall:pread64", "syscall:lseek", "syscall:getdents64", "syscall:fstat", "syscall:newfstatat", "syscall:statx", "syscall:openat", "syscall:faccessat", "syscall:write", "syscall:writev", "syscall:chdir", "syscall:getcwd", "syscall:execve"]
-semantic_authority = ["man 2 read", "man 2 pread", "man 2 lseek", "man 2 getdents64", "man 2 fstat", "man 2 statx", "man 2 openat", "man 2 pipe", "owner decision on #231, #894 and #937"]
+title = "Native processes retain operation ownership across typed carrier services"
+guest_surfaces = ["syscall:read", "syscall:pread64", "syscall:lseek", "syscall:getdents64", "syscall:fstat", "syscall:newfstatat", "syscall:statx", "syscall:openat", "syscall:faccessat", "syscall:write", "syscall:writev", "syscall:chdir", "syscall:getcwd", "syscall:execve", "syscall:fcntl"]
+semantic_authority = ["man 2 read", "man 2 pread", "man 2 lseek", "man 2 getdents64", "man 2 fstat", "man 2 statx", "man 2 openat", "man 2 pipe", "man 2 fcntl", "owner decision on #231, #894 and #937"]
 fixture = "unit:native_reads_equal_the_dispatchers_own_syscalls"
 scale_points = [1]
 structural_budgets = []
 rationale = """
 A ring-owned (native) process has no host task. Its calls on in-zone objects
-(pipes, eventfds, epoll) never build a host request: they stay with the ring,
+(pipes, eventfds, epoll) retain shared ring state. Pipe capacity uses one typed
+allocation service through this existing owner; it pins that same shared pipe
+and runs the shared allocator/core, never a host pipe or host fd namespace.
+Other in-zone operations never build a host request: they stay with the ring,
 which answers fstat/statx of those objects itself from the same shared stat
 record the dispatcher reports. Calls on host-backed descriptions cross once
 to the carrier, which runs the dispatcher's own description cores (read,
@@ -26,6 +29,11 @@ dispatcher's syscalls byte for byte and prove the in-zone routing.
 vm_free = [
   "carrick-el1-linux::aarch64_process_tests::native_child_handoff_tests::{arm_native_fork_child_stdout_retains_capability_after_root_exit_publication,arm_native_fork_tree_releases_capability_after_last_exit}",
   "carrick-kernel::dispatch::native_files::tests::native_reads_equal_the_dispatchers_own_syscalls",
+  "carrick-personality-linux::native_host_file::tests::native_pipe_capacity_fcntl_stages_one_shared_owner_operation",
+  "carrick-kernel::dispatch::native_files::tests::native_pipe_capacity_uses_shared_owner_and_both_ends",
+  "carrick-el1-linux::aarch64_process_tests::native_child_handoff_tests::arm_native_fork_child_pipe_capacity_stages_shared_owner_service",
+  "carrick-kernel::el1_ipc::tests::native_pin_raced_once_releases_exact_description_then_admits_target",
+  "carrick-kernel::el1_ipc::tests::native_resize_revalidates_prepared_backing_after_competing_growth",
   "carrick-el1-linux::dispatch::tests::native_host_file_stage_keeps_in_zone_writes_in_ring_and_stages_host_stdout",
   "carrick-kernel::dispatch::mem::native_successor::tests::successor_image_rows_cover_every_user_leaf_and_make_elf_pages_lazy",
   "carrick-kernel::dispatch::native_files::tests::in_zone_pipe_stat_matches_the_dispatchers_pipe_record",
@@ -46,7 +54,8 @@ vm_free = [
 ]
 
 [bindings.unresolved]
+x86_native = "The current x86 native adapter has no host-file staging bridge; pipe-capacity staging is AArch64-only until that neutral bridge is wired. No both-ISA acceptance is claimed."
 embed_structural = "The director owns the signed carrier binding and exact-artifact verification for this venue."
-observation = "No versioned WorkObservation counts venue crossings yet; the routing witnesses prove zero host requests for in-zone objects."
+observation = "No versioned WorkObservation counts venue crossings yet; the routing witnesses prove zero host requests for in-zone data/stat operations; pipe capacity has one bounded typed shared-owner service."
 embed = "The signed native pipeline witnesses (`sh -c 'ls / | head -2'`, `true | true`) bind the exec successor's image import and RELRO end to end (#894 ruling 1); acceptance waits on the director's recorded signed run. A static-pie successor witness is tracked as a follow-up."
 docker = "Semantics come from the syscall specifications; the dispatcher's own syscalls are the in-tree oracle for byte equality."

@@ -348,6 +348,23 @@ impl SyscallDispatcher {
                 })
                 .ok_or(NativeHostFileRefusal)?
             }
+        } else if header.op == HostFileOp::PipeCapacity {
+            if header.flags != 0
+                || !view.input().is_empty()
+                || view.output_capacity() != 0
+                || header.args[2..] != [0, 0]
+            {
+                return Err(NativeHostFileRefusal);
+            }
+            let requested = match header.args[0] {
+                carrick_abi::LINUX_F_GETPIPE_SZ => None,
+                carrick_abi::LINUX_F_SETPIPE_SZ => Some(header.args[1]),
+                _ => return Err(NativeHostFileRefusal),
+            };
+            match owner.native_pipe_capacity(table, fd::Fd(header.fd), requested) {
+                Ok(capacity) => Served::value(capacity as i64),
+                Err(errno) => Served::errno(errno),
+            }
         } else if header.op == HostFileOp::Poll {
             self.serve_native_poll(owner, table, header, view.input(), view.output_capacity())
         } else {
@@ -568,7 +585,8 @@ impl SyscallDispatcher {
             HostFileOp::Openat
             | HostFileOp::Faccessat
             | HostFileOp::Newfstatat
-            | HostFileOp::Poll => Served::Refused,
+            | HostFileOp::Poll
+            | HostFileOp::PipeCapacity => Served::Refused,
         }
     }
 
@@ -1013,6 +1031,84 @@ mod tests {
             let reply = host_file::reply(&bytes).unwrap();
             (reply.result, reply.output.to_vec())
         }
+    }
+
+    #[test]
+    fn native_pipe_capacity_uses_shared_owner_and_both_ends() {
+        use carrick_el1_abi::ipc::{
+            IpcBacking,
+            fd::{AccessMode, Description, Fd, RawTableId, StatusFlags, TableId},
+            pipe,
+        };
+        let fixture = fixture();
+        let table = TableId::from_raw(RawTableId {
+            authority: fixture.table[0],
+            index: fixture.table[1],
+            generation: fixture.table[2],
+        });
+        fixture.owner.ensure_capacity(table, 16).unwrap();
+        let object = fixture.owner.create_pipe(65536).unwrap();
+        // Provision backing first, so growth exercises the real allocator,
+        // rather than merely changing an unbacked record's capacity.
+        fixture.owner.ensure_pipe_storage(object).unwrap();
+        let region = fixture.owner.region();
+        let fd_owner = region.fd(crate::el1_zone::HostLockWait);
+        let open = |end, access| {
+            fd_owner
+                .open(
+                    table,
+                    Fd(4),
+                    Description::new(
+                        IpcBacking::Pipe { object, end }.encode(),
+                        access,
+                        StatusFlags::default(),
+                    ),
+                    false,
+                )
+                .unwrap()
+                .0
+        };
+        let read = open(pipe::End::Reader, AccessMode::ReadOnly);
+        let write = open(pipe::End::Writer, AccessMode::WriteOnly);
+        let capacity = |fd, command, arg| {
+            fixture
+                .result(
+                    None,
+                    record(
+                        fixture.table,
+                        HostFileOp::PipeCapacity,
+                        fd,
+                        [command, arg, 0, 0],
+                        &[],
+                        0,
+                    ),
+                )
+                .0
+        };
+        assert_eq!(capacity(read, carrick_abi::LINUX_F_GETPIPE_SZ, 0), 65536);
+        assert_eq!(
+            capacity(write, carrick_abi::LINUX_F_SETPIPE_SZ, 131072),
+            131072
+        );
+        assert_eq!(capacity(read, carrick_abi::LINUX_F_GETPIPE_SZ, 0), 131072);
+        assert_eq!(capacity(read, carrick_abi::LINUX_F_SETPIPE_SZ, 4096), 4096);
+        assert_eq!(capacity(write, carrick_abi::LINUX_F_GETPIPE_SZ, 0), 4096);
+        assert_eq!(
+            capacity(read, carrick_abi::LINUX_F_SETPIPE_SZ, u64::MAX),
+            carrick_abi::LINUX_EINVAL.guest_retval()
+        );
+        assert_eq!(
+            capacity(read, carrick_abi::LINUX_F_SETPIPE_SZ, 1048577),
+            carrick_abi::LINUX_EPERM.guest_retval()
+        );
+        assert_eq!(
+            capacity(3, carrick_abi::LINUX_F_SETPIPE_SZ, 4096),
+            carrick_abi::LINUX_EBADF.guest_retval()
+        );
+        assert_eq!(
+            capacity(99, carrick_abi::LINUX_F_GETPIPE_SZ, 0),
+            carrick_abi::LINUX_EBADF.guest_retval()
+        );
     }
 
     #[test]

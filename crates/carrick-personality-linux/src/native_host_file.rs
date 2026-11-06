@@ -144,6 +144,11 @@ pub enum HostFileCall {
         offset: u64,
         whence: u64,
     },
+    PipeCapacity {
+        fd: i32,
+        command: u64,
+        argument: u64,
+    },
     Getdents64 {
         fd: i32,
         dirp: u64,
@@ -274,6 +279,19 @@ impl HostFileCall {
                 offset: args[1],
                 whence: args[2],
             },
+            c if c == nr::FCNTL
+                && matches!(
+                    args[1],
+                    carrick_syscall_abi::LINUX_F_GETPIPE_SZ
+                        | carrick_syscall_abi::LINUX_F_SETPIPE_SZ
+                ) =>
+            {
+                Self::PipeCapacity {
+                    fd,
+                    command: args[1],
+                    argument: args[2],
+                }
+            }
             c if c == nr::GETDENTS64 => Self::Getdents64 {
                 fd,
                 dirp: args[1],
@@ -853,6 +871,22 @@ fn stage_call(
             NativeDescriptor::HostBacked { .. } => {
                 staging.request(HostFileOp::Lseek, fd, 0, [offset, whence, 0, 0], &[], None)
             }
+        },
+        HostFileCall::PipeCapacity {
+            fd,
+            command,
+            argument,
+        } => match staging.descriptor(fd)? {
+            NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
+            NativeDescriptor::InZone(InZoneKind::Pipe) => staging.request(
+                HostFileOp::PipeCapacity,
+                fd,
+                0,
+                [command, argument, 0, 0],
+                &[],
+                None,
+            ),
+            _ => errno(carrick_syscall_abi::LINUX_EBADF),
         },
         HostFileCall::Getdents64 { fd, dirp, count } => match staging.descriptor(fd)? {
             NativeDescriptor::InZone(_) => errno(carrick_syscall_abi::LINUX_ENOTDIR),

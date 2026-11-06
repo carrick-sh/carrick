@@ -3,25 +3,40 @@ use super::*;
 
 #[test]
 fn arm_native_fork_child_reinstalls_mm_after_service_ack() {
-    fork_child_service_ack(false, false, false);
+    fork_child_service_ack(false, false, false, None);
 }
 
 #[test]
 fn arm_native_fork_child_stdout_service_keeps_exact_entry() {
-    fork_child_service_ack(true, false, false);
+    fork_child_service_ack(true, false, false, None);
 }
 
 #[test]
 fn arm_native_fork_child_stdout_retains_capability_after_root_exit_publication() {
-    fork_child_service_ack(true, true, false);
+    fork_child_service_ack(true, true, false, None);
 }
 
 #[test]
 fn arm_native_fork_tree_releases_capability_after_last_exit() {
-    fork_child_service_ack(true, true, true);
+    fork_child_service_ack(true, true, true, None);
 }
 
-fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool) {
+#[test]
+fn arm_native_fork_child_pipe_capacity_stages_shared_owner_service() {
+    for command in [
+        carrick_syscall_abi::LINUX_F_GETPIPE_SZ,
+        carrick_syscall_abi::LINUX_F_SETPIPE_SZ,
+    ] {
+        fork_child_service_ack(false, false, false, Some(command));
+    }
+}
+
+fn fork_child_service_ack(
+    stdout: bool,
+    root_exit: bool,
+    child_exit: bool,
+    pipe_command: Option<u64>,
+) {
     use carrick_el1_abi::Lifecycle;
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     fixture.zone.spaces.set_idle_ttbr(0x30000);
@@ -173,6 +188,12 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool) {
         saved.native.x[8] = 64;
         saved.native.pc = 0x2a6f20;
     }
+    if let Some(command) = pipe_command {
+        saved.native.x[0] = 7;
+        saved.native.x[1] = command;
+        saved.native.x[2] = 8192;
+        saved.native.x[8] = 25;
+    }
     let child_ttbr = cpu.ttbr;
     assert_eq!(fixture.zone.installed_space(fixture.slot), identity.mm);
     let result = with_process_entry(
@@ -187,7 +208,7 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool) {
         child_control,
         &mut service,
         |entry| {
-            let result = if stdout {
+            let result = if stdout || pipe_command.is_some() {
                 use carrick_personality_linux::native_host_file::{
                     DescriptionAccess, HostFileStage, NativeDescriptor,
                 };
@@ -212,6 +233,12 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool) {
                     &crate::file::HardwareValidator,
                     [5, 1, 0],
                     |fd| {
+                        if pipe_command.is_some() {
+                            assert_eq!(fd, 7);
+                            return Some(NativeDescriptor::InZone(
+                                carrick_personality_linux::native_host_file::InZoneKind::Pipe,
+                            ));
+                        }
                         assert_eq!(fd, 1);
                         Some(NativeDescriptor::HostBacked {
                             access: DescriptionAccess::WriteOnly,
@@ -220,7 +247,7 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool) {
                     &mut |_| panic!("stdout releases no mapping sources"),
                 )
                 else {
-                    panic!("the fork child's stdout must stage a host request");
+                    panic!("the fork child must stage its typed owner request");
                 };
                 let result = entry.begin_host_file_service(
                     record,
@@ -229,7 +256,11 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool) {
                     map,
                     chdir,
                     crate::native_process_runtime::NativeServiceCall::new(
-                        carrick_guest_arch::NativeOrdinal::new(56),
+                        carrick_guest_arch::NativeOrdinal::new(if pipe_command.is_some() {
+                            25
+                        } else {
+                            56
+                        }),
                         Box::leak(Box::new(carrick_el1_abi::Counters::new())),
                     ),
                 );
@@ -280,7 +311,7 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool) {
         )
     }
     .unwrap();
-    if stdout {
+    if stdout || pipe_command.is_some() {
         let carrick_core_abi::service::ServiceOperation::HostFile {
             capability,
             payload,
@@ -297,8 +328,20 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool) {
             )
         };
         let view = carrick_core_abi::host_file::HostFileRequestView::parse(record).unwrap();
-        assert_eq!(view.input(), stdout_bytes);
-        view.reply(57, &[]).unwrap();
+        if let Some(command) = pipe_command {
+            assert_eq!(
+                view.header().op,
+                carrick_core_abi::host_file::HostFileOp::PipeCapacity
+            );
+            assert_eq!(view.header().fd, 7);
+            assert_eq!(view.header().args, [command, 8192, 0, 0]);
+            // Transport acknowledgement only; the shared production venue's
+            // allocator and capacity semantics are tested in native_files.
+            view.reply(8192, &[]).unwrap();
+        } else {
+            assert_eq!(view.input(), stdout_bytes);
+            view.reply(57, &[]).unwrap();
+        }
     }
     assert!(ticket.complete(true).is_ok());
     fixture
@@ -359,7 +402,7 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool) {
     assert!(matches!(
         resumed,
         super::super::native_process_runtime::NativeResume::Returned(result)
-            if result.raw() as u64 == if stdout { 57 } else { saved.native.x[0] }
+            if result.raw() as u64 == if pipe_command.is_some() { 8192 } else if stdout { 57 } else { saved.native.x[0] }
     ));
     drop(owner);
     assert_eq!(child_page.claimed_count(), 0);
