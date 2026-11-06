@@ -412,6 +412,8 @@ impl AnonymousEditGeneration {
 
 /// Exact-MM live-leaf operation behind the syscall policy.
 pub trait AnonymousPermissionEditor {
+    fn bind_admitted_space(&mut self, _grant: carrick_sched_core::spaces::SpaceGrant) {}
+
     fn bind_resident_edit(&mut self, _generation: AnonymousEditGeneration) {}
 
     fn protect_and_invalidate(
@@ -423,6 +425,8 @@ pub trait AnonymousPermissionEditor {
 
 /// Exact-MM live-terminal retirement behind the syscall policy.
 pub trait AnonymousRetirementEditor {
+    fn bind_admitted_space(&mut self, _grant: carrick_sched_core::spaces::SpaceGrant) {}
+
     fn bind_resident_edit(&mut self, _generation: AnonymousEditGeneration) {}
 
     fn retire_and_invalidate(
@@ -435,11 +439,26 @@ pub trait AnonymousRetirementEditor {
 }
 
 #[cfg(target_os = "none")]
-pub struct HardwareAnonymousPermissionEditor;
+#[derive(Default)]
+pub struct HardwareAnonymousPermissionEditor(Option<carrick_sched_core::spaces::SpaceGrant>);
 
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+/// Publish under the editor's retained admission, even when a host pause has
+/// closed the gate while waiting for that editor. No second grant is requested.
+#[cfg(any(test, target_os = "none"))]
+fn publish_admitted_mm_tlb_edit(
+    zone: &carrick_el1_abi::ZoneTables,
+    slot: carrick_guest_arch::SlotId,
+    admitted: carrick_sched_core::spaces::SpaceGrant,
+) -> Option<(u64, u64)> {
+    let mm = zone.installed_space(slot);
+    (zone.spaces.find(mm) == Some(admitted.index))
+        .then(|| (mm, zone.spaces.note_tlb_edit(admitted.index)))
+}
+
+#[cfg(target_os = "none")]
 fn publish_current_mm_tlb_edit(
     ttbr0: u64,
+    admitted: carrick_sched_core::spaces::SpaceGrant,
 ) -> (
     &'static carrick_el1_abi::ZoneTables,
     carrick_guest_arch::SlotId,
@@ -461,27 +480,38 @@ fn publish_current_mm_tlb_edit(
             carrick_el1_abi::EntryBindingFatalReason::EntryBinding,
         )
     };
-    let Some(grant) = zone.spaces.grant(index, mm) else {
-        crate::substrate::sched::hw::fatal_entry_binding(
-            carrick_el1_abi::EntryBindingFatalReason::EntryBinding,
-        )
-    };
-    if grant.ttbr0 != ttbr0 {
+    // The exact-MM editor admitted this grant before changing descriptors.
+    // A host pause may now be waiting for that editor; it cannot revoke it.
+    if admitted.index != index || admitted.ttbr0 != ttbr0 {
         crate::substrate::sched::hw::fatal_entry_binding(
             carrick_el1_abi::EntryBindingFatalReason::EntryBinding,
         )
     }
-    let publication = zone.spaces.note_tlb_edit(index);
+    let (mm, publication) =
+        publish_admitted_mm_tlb_edit(zone, slot, admitted).unwrap_or_else(|| {
+            crate::substrate::sched::hw::fatal_entry_binding(
+                carrick_el1_abi::EntryBindingFatalReason::EntryBinding,
+            )
+        });
     (zone, slot, mm, publication)
 }
 
 #[cfg(target_os = "none")]
 impl AnonymousPermissionEditor for HardwareAnonymousPermissionEditor {
+    fn bind_admitted_space(&mut self, grant: carrick_sched_core::spaces::SpaceGrant) {
+        self.0 = Some(grant);
+    }
+
     fn protect_and_invalidate(
         &mut self,
         ttbr0: carrick_guest_arch::AddressSpaceRegister,
         edit: GuestPermissionEdit,
     ) -> Result<(), GuestPermissionEditError> {
+        let admitted = self.0.take().unwrap_or_else(|| {
+            crate::substrate::sched::hw::fatal_entry_binding(
+                carrick_el1_abi::EntryBindingFatalReason::EntryBinding,
+            )
+        });
         let ttbr0 = ttbr0.raw();
         const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
         let physical_base = ttbr0 & TTBR_BADDR_MASK;
@@ -497,7 +527,7 @@ impl AnonymousPermissionEditor for HardwareAnonymousPermissionEditor {
                 edit,
             )?;
         }
-        let (zone, slot, mm, publication) = publish_current_mm_tlb_edit(ttbr0);
+        let (zone, slot, mm, publication) = publish_current_mm_tlb_edit(ttbr0, admitted);
         let mut cpu = crate::substrate::sched::HardwareCpu;
         crate::substrate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
         zone.cover_cow(slot, mm, publication);
@@ -506,10 +536,15 @@ impl AnonymousPermissionEditor for HardwareAnonymousPermissionEditor {
 }
 
 #[cfg(target_os = "none")]
-pub struct HardwareAnonymousRetirementEditor;
+#[derive(Default)]
+pub struct HardwareAnonymousRetirementEditor(Option<carrick_sched_core::spaces::SpaceGrant>);
 
 #[cfg(target_os = "none")]
 impl AnonymousRetirementEditor for HardwareAnonymousRetirementEditor {
+    fn bind_admitted_space(&mut self, grant: carrick_sched_core::spaces::SpaceGrant) {
+        self.0 = Some(grant);
+    }
+
     fn retire_and_invalidate(
         &mut self,
         mm: carrick_el1_abi::ReservationMm,
@@ -517,6 +552,11 @@ impl AnonymousRetirementEditor for HardwareAnonymousRetirementEditor {
         address: carrick_guest_arch::UserVa,
         len: carrick_guest_arch::GuestLen,
     ) -> Result<(), GuestRetirementError> {
+        let admitted = self.0.take().unwrap_or_else(|| {
+            crate::substrate::sched::hw::fatal_entry_binding(
+                carrick_el1_abi::EntryBindingFatalReason::EntryBinding,
+            )
+        });
         let ttbr0 = ttbr0.raw();
         let address = address.raw();
         let len = len.raw();
@@ -546,7 +586,7 @@ impl AnonymousRetirementEditor for HardwareAnonymousRetirementEditor {
         if !residency.commit() {
             return Err(GuestRetirementError::RollbackFailed);
         }
-        let (zone, slot, mm, publication) = publish_current_mm_tlb_edit(ttbr0);
+        let (zone, slot, mm, publication) = publish_current_mm_tlb_edit(ttbr0, admitted);
         let mut cpu = crate::substrate::sched::HardwareCpu;
         crate::substrate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
         zone.cover_cow(slot, mm, publication);
@@ -818,7 +858,8 @@ impl<T> AnonymousDescriptorEditor for T where
 
 /// Hardware descriptor steps for a delegated MM's root transaction.
 #[cfg(target_os = "none")]
-pub struct HardwareAnonymousEditor;
+#[derive(Default)]
+pub struct HardwareAnonymousEditor(Option<carrick_sched_core::spaces::SpaceGrant>);
 
 #[cfg(target_os = "none")]
 impl AnonymousBackingProbe for HardwareAnonymousEditor {
@@ -876,17 +917,25 @@ impl AnonymousBackingProbe for HardwareAnonymousEditor {
 
 #[cfg(target_os = "none")]
 impl AnonymousPermissionEditor for HardwareAnonymousEditor {
+    fn bind_admitted_space(&mut self, grant: carrick_sched_core::spaces::SpaceGrant) {
+        self.0 = Some(grant);
+    }
+
     fn protect_and_invalidate(
         &mut self,
         ttbr0: carrick_guest_arch::AddressSpaceRegister,
         edit: GuestPermissionEdit,
     ) -> Result<(), GuestPermissionEditError> {
-        HardwareAnonymousPermissionEditor.protect_and_invalidate(ttbr0, edit)
+        HardwareAnonymousPermissionEditor(self.0).protect_and_invalidate(ttbr0, edit)
     }
 }
 
 #[cfg(target_os = "none")]
 impl AnonymousRetirementEditor for HardwareAnonymousEditor {
+    fn bind_admitted_space(&mut self, grant: carrick_sched_core::spaces::SpaceGrant) {
+        self.0 = Some(grant);
+    }
+
     fn retire_and_invalidate(
         &mut self,
         mm: carrick_el1_abi::ReservationMm,
@@ -894,7 +943,7 @@ impl AnonymousRetirementEditor for HardwareAnonymousEditor {
         address: carrick_guest_arch::UserVa,
         len: carrick_guest_arch::GuestLen,
     ) -> Result<(), GuestRetirementError> {
-        HardwareAnonymousRetirementEditor.retire_and_invalidate(mm, ttbr0, address, len)
+        HardwareAnonymousRetirementEditor(self.0).retire_and_invalidate(mm, ttbr0, address, len)
     }
 }
 
@@ -1088,6 +1137,8 @@ pub fn serve_delegated_anonymous<
     let Some(_editor_guard) = spaces.try_begin_edit(index, mm_key, owner) else {
         return refuse(pending, &mut model, Leave::EditorBusy);
     };
+    AnonymousPermissionEditor::bind_admitted_space(editor, _editor_guard.grant());
+    AnonymousRetirementEditor::bind_admitted_space(editor, _editor_guard.grant());
     editor.bind_operation(request.sequence);
     let (va, len) = (request.range.start(), request.range.len());
     if request.operation == carrick_el1_abi::ReservationOperation::Move {
@@ -1320,6 +1371,7 @@ pub fn try_serve_munmap<E: AnonymousRetirementEditor>(
     let Some(generation) = AnonymousEditGeneration::resident() else {
         return MunmapDisposition::Forward;
     };
+    editor.bind_admitted_space(_guard.grant());
     editor.bind_resident_edit(generation);
     match editor.retire_and_invalidate(
         carrick_el1_abi::ReservationMm::new(mm_key).expect("admitted MM is nonzero"),
@@ -1403,6 +1455,7 @@ pub fn try_serve_mprotect<E: AnonymousPermissionEditor>(
     let Some(generation) = AnonymousEditGeneration::resident() else {
         return MprotectDisposition::Forward;
     };
+    editor.bind_admitted_space(guard.grant());
     editor.bind_resident_edit(generation);
     match editor.protect_and_invalidate(
         carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
@@ -1517,6 +1570,90 @@ mod tests {
         frame.x[1] = 0x2001;
         frame.x[2] = prot;
         (frame, [task], spaces, ttbr0)
+    }
+
+    #[test]
+    fn admitted_permission_editor_survives_pause_once_then_success() {
+        use carrick_sched_core::SlotId;
+        let layout = std::alloc::Layout::new::<carrick_el1_abi::ZoneTables>();
+        // SAFETY: ZoneTables documents all-zero as a valid empty zone; the
+        // typed layout also preserves its required alignment.
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<carrick_el1_abi::ZoneTables>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let (frame, tasks, _, root) = fixture(PROT_READ);
+        let index = zone.spaces.publish_closed(17, root, root).unwrap();
+        zone.spaces.open(index);
+        let slot = SlotId::new(0);
+        zone.install_space(slot, 17).unwrap();
+        struct PausingEditor<'a> {
+            zone: &'a carrick_el1_abi::ZoneTables,
+            slot: SlotId,
+            admitted: Option<carrick_sched_core::spaces::SpaceGrant>,
+            calls: usize,
+        }
+        impl AnonymousPermissionEditor for PausingEditor<'_> {
+            fn bind_admitted_space(&mut self, grant: carrick_sched_core::spaces::SpaceGrant) {
+                self.admitted = Some(grant);
+            }
+            fn protect_and_invalidate(
+                &mut self,
+                root: carrick_guest_arch::AddressSpaceRegister,
+                _: GuestPermissionEdit,
+            ) -> Result<(), GuestPermissionEditError> {
+                let admitted = self.admitted.take().expect("policy must carry admission");
+                assert_eq!(admitted.ttbr0, root.raw());
+                self.calls += 1;
+                self.zone.spaces.raise(admitted.index);
+                assert!(self.zone.spaces.grant(admitted.index, 17).is_none());
+                // The real publication entry point must accept an already
+                // admitted edit despite that pause, without a fatal refusal.
+                let (mm, published) =
+                    publish_admitted_mm_tlb_edit(self.zone, self.slot, admitted).unwrap();
+                self.zone.cover_cow(self.slot, mm, published);
+                Ok(())
+            }
+        }
+        let mut editor = PausingEditor {
+            zone: &zone,
+            slot,
+            admitted: None,
+            calls: 0,
+        };
+        assert_eq!(
+            try_serve_mprotect(
+                &frame,
+                &tasks,
+                SpaceAccess::source_free(&zone.spaces),
+                &mut editor
+            ),
+            MprotectDisposition::Return(0)
+        );
+        // A new operation refuses before touching tables while paused.
+        assert_eq!(
+            try_serve_mprotect(
+                &frame,
+                &tasks,
+                SpaceAccess::source_free(&zone.spaces),
+                &mut editor
+            ),
+            MprotectDisposition::Forward
+        );
+        assert_eq!(editor.calls, 1);
+        zone.spaces.lower(index);
+        assert_eq!(
+            try_serve_mprotect(
+                &frame,
+                &tasks,
+                SpaceAccess::source_free(&zone.spaces),
+                &mut editor
+            ),
+            MprotectDisposition::Return(0)
+        );
+        assert_eq!(editor.calls, 2);
+        zone.spaces.lower(index);
     }
 
     #[test]

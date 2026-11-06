@@ -3146,7 +3146,7 @@ impl<
             task,
             access,
             memory::reservations::shared_guest(),
-            &mut memory::HardwareAnonymousEditor,
+            &mut memory::HardwareAnonymousEditor::default(),
             file,
         ) {
             memory::DelegatedAnonymous::PreparedConflict => DelegatedStep::PreparedConflict,
@@ -3200,7 +3200,7 @@ impl<
             },
             self.current_tasks,
             access,
-            &mut memory::HardwareAnonymousPermissionEditor,
+            &mut memory::HardwareAnonymousPermissionEditor::default(),
         ) {
             memory::MprotectDisposition::Forward => PermissionStep::Forward,
             memory::MprotectDisposition::Return(result) => {
@@ -3224,7 +3224,7 @@ impl<
             },
             self.current_tasks,
             access,
-            &mut memory::HardwareAnonymousRetirementEditor,
+            &mut memory::HardwareAnonymousRetirementEditor::default(),
         ) {
             memory::MunmapDisposition::Forward => RetirementStep::Forward,
             memory::MunmapDisposition::Return(result) => {
