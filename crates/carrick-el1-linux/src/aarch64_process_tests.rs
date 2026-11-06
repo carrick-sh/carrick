@@ -12060,6 +12060,16 @@ fn signal_setup_nonresident_input(nr: u64) {
 
 #[test]
 fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
+    futex_owner_wait_episode(false);
+}
+
+#[test]
+fn futex_relative_deadline_survives_owner_wait_with_two_live_threads() {
+    futex_owner_wait_episode(true);
+}
+
+#[cfg(test)]
+fn futex_owner_wait_episode(timed: bool) {
     use crate::native_process_runtime::host_test_support::Physical;
     use crate::sched::{LinuxSchedEntry, UserWord};
     use carrick_el1_abi::Lifecycle;
@@ -12185,7 +12195,7 @@ fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
     frame.x[0] = VA;
     frame.x[1] = crate::sched::FUTEX_WAIT_PRIVATE;
     frame.x[2] = 0x12345678;
-    frame.x[3] = VA + 8;
+    frame.x[3] = if timed { VA + 8 } else { 0 };
     let mut parked = parked;
     crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut parked);
     {
@@ -12259,6 +12269,48 @@ fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
     assert_eq!(retained.native.x[0], VA);
     assert_eq!(retained.native.x[2], 0x12345678);
     crate::sched::ThreadCpu::load(&mut cpu, &mut frame, &retained);
+    if timed {
+        cpu.now = 101;
+        let mut entry = runtime
+            .enter_registered(
+                registry(),
+                source,
+                &fixture.task,
+                fixture.address,
+                &retained,
+                &mut service,
+            )
+            .unwrap();
+        crate::dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &cache,
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &word,
+            }),
+            None,
+            Some(fixture),
+            Some(&mut *entry),
+            Some(source),
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        drop(entry);
+        assert_eq!(
+            cpu.now, 105,
+            "owner redispatch must retain the original relative deadline"
+        );
+        assert_eq!(frame.x[0] as i64, -110);
+        registry().unregister_root_for_test(&runtime);
+        return;
+    }
     word.value.set(0);
     let served = crate::sched::Sched {
         handoff: None,
@@ -12277,7 +12329,8 @@ fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
     assert_eq!(frame.x[0] as i64, -11);
     crate::sched::ThreadCpu::load(&mut cpu, &mut frame, &retained);
     word.value.set(0x12345678);
-    cpu.now = 101;
+    // Bound the matching untimed park at the existing host-kick boundary.
+    cpu.pending.push_back(carrick_el1_abi::GIC_KICK_INTID);
     assert_eq!(
         crate::sched::Sched {
             handoff: None,
@@ -12289,11 +12342,7 @@ fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
             counters: &counters,
         }
         .serve_futex(&mut frame),
-        Some(crate::sched::Served::Returned { switched: true })
-    );
-    assert_eq!(
-        cpu.now, 105,
-        "owner redispatch must retain the original relative deadline"
+        Some(crate::sched::Served::Idle)
     );
     if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
         work.settled();
