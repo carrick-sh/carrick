@@ -22,13 +22,13 @@ pub(crate) fn test_arm_signal_stack() -> u64 {
     TEST_ARM_SIGNAL_STACK.with(core::cell::Cell::get)
 }
 
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 struct ArmSignalMachine {
     backend: LinuxAarch64Backend,
     user_sp: carrick_guest_arch::UserVa,
 }
 
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedContext>
     for ArmSignalMachine
 {
@@ -236,6 +236,31 @@ where
     super::signal_delivery::deliver_signal_on_syscall_return(
         task, control, process, frame, fpstate, machine,
     )
+}
+
+#[cfg(test)]
+pub(crate) fn test_final_user_return_checkpoint<'a, X>(
+    task: &carrick_el1_abi::CurrentTask,
+    control: &carrick_el1_abi::ThreadControlSlot,
+    process: &mut super::native_process_runtime::NativeProcessEntry<
+        '_,
+        'a,
+        super::aarch64_process::Mm,
+        carrick_sched_core::Aarch64ParkedContext,
+        super::aarch64_process::Aarch64NativeProcessService<'a, X>,
+    >,
+    frame: &mut TrapFrame,
+) -> Option<carrick_personality_linux::dispatch::CompletionRoute>
+where
+    X: super::aarch64_process::ForkStockCrossing,
+{
+    use zerocopy::IntoBytes;
+    let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+    let mut machine = ArmSignalMachine {
+        backend: LinuxAarch64Backend,
+        user_sp: carrick_guest_arch::UserVa::new(test_arm_signal_stack()),
+    };
+    deliver_on_user_return_with(task, control, process, frame, fp.as_bytes(), &mut machine)
 }
 
 /// Internal EL0t DAIF mask stored in `TrapFrame.spsr` and `ThreadCtx.pstate` across the EL1

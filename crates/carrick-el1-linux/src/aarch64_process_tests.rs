@@ -12655,6 +12655,19 @@ fn signal_frame_nonresident_stack(refuse_push: bool) {
         carrick_personality_linux::dispatch::CompletionRoute::WithWork
     );
     assert_eq!(frame.x[0], 0);
+    let _ = fixture.task.linux.take_served_boundary();
+    if let Some(doorbell) = fixture.task.linux.take_host_work_doorbell() {
+        doorbell.settled();
+    }
+    let settle_boundary = || {
+        assert!(
+            fixture.task.linux.take_served_boundary().is_some(),
+            "WithWork must retain the completed syscall result"
+        );
+        if let Some(doorbell) = fixture.task.linux.take_host_work_doorbell() {
+            doorbell.settled();
+        }
+    };
 
     // 2. Prepare user stack in GuestUserBuffer and queue SIGUSR1 via production SYS_tkill (130)
     // while the stack page is not yet backed (`SIMULATE_COPYOUT_FAULT = true`).
@@ -12678,34 +12691,49 @@ fn signal_frame_nonresident_stack(refuse_push: bool) {
         crate::file::SIMULATE_COPYOUT_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
         assert_eq!(
             first_delivery.unwrap(),
-            carrick_personality_linux::dispatch::CompletionRoute::Served,
-            "NotYet on signal stack frame push must prepare stack without forcing SIGSEGV"
+            carrick_personality_linux::dispatch::CompletionRoute::WithWork,
+            "NotYet on signal stack frame push must preserve the completed tkill result without forcing SIGSEGV"
         );
         assert_eq!(
             tkill_frame.elr, 0x40_0500,
             "handler must not be entered before signal frame is written"
         );
         assert_eq!(super::arm_signal::test_arm_signal_stack(), initial_sp);
-
-        // 3. Next syscall boundary (e.g. getpid = 172, or return checkpoint) with stack page backed
-        // delivers the requeued SIGUSR1 exactly once.
-        let mut deliver_frame = tkill_frame;
-        deliver_frame.x[0] = 41;
-        deliver_frame.x[8] = 172; // SYS_getpid
-        let second_delivery =
-            arm_call(fixture, fixture.control, &mut service, &mut deliver_frame).unwrap();
-        assert_eq!(
-            second_delivery,
-            carrick_personality_linux::dispatch::CompletionRoute::Served
-        );
-        deliver_frame
+        tkill_frame
     } else {
         assert_eq!(
             arm_call(fixture, fixture.control, &mut service, &mut tkill_frame).unwrap(),
-            carrick_personality_linux::dispatch::CompletionRoute::Served
+            carrick_personality_linux::dispatch::CompletionRoute::WithWork
         );
         tkill_frame
     };
+    settle_boundary();
+    let mut deliver_frame = deliver_frame;
+    assert_eq!(
+        super::aarch64_process::with_process_entry(
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            &fixture.task,
+            &ThreadCtx::ZERO,
+            fixture_ttbr0(fixture),
+            fixture.page,
+            fixture.control,
+            &mut service,
+            |process| {
+                super::arm_signal::test_final_user_return_checkpoint(
+                    &fixture.task,
+                    fixture.control,
+                    process,
+                    &mut deliver_frame,
+                )
+            },
+        )
+        .unwrap(),
+        None,
+        "the final user-return checkpoint must publish the requeued signal"
+    );
     assert_eq!(deliver_frame.elr, 0x40_0100, "entered SIGUSR1 handler");
     assert_eq!(deliver_frame.x[0], 10, "x0 = signum");
     assert_eq!(deliver_frame.x[30], 0x40_0200, "x30 = sa_restorer");
