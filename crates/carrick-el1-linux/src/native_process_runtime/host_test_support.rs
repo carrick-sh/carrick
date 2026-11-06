@@ -317,6 +317,22 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         }
         Ok(())
     }
+    fn copy_owned_bytes(
+        &mut self,
+        mm: &Self::Mm,
+        address: UserVa,
+        bytes: &[u8],
+    ) -> Result<(), NativeProcessError> {
+        // Match the physical CPL0 service: one owner admission per page.
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let address = address.raw() + offset as u64;
+            let count = (4096 - (address as usize & 4095)).min(bytes.len() - offset);
+            self.copy_signal_bytes(mm, UserVa::new(address), &bytes[offset..offset + count])?;
+            offset += count;
+        }
+        Ok(())
+    }
     fn prepare_owned_read(
         &mut self,
         _: &Self::Mm,
@@ -5728,6 +5744,70 @@ fn host_request_during_owner_wait_park_yields_then_reparks() {
 #[cfg(test)]
 #[test]
 fn sigprocmask_oldset_owner_wait_commits_mask_and_output_once() {
+    signal_setup_output_owner_wait(false);
+}
+
+#[cfg(test)]
+#[test]
+fn native_signal_setup_cross_page_owner_wait_writes_each_byte_once() {
+    signal_setup_output_owner_wait(true);
+}
+
+#[cfg(test)]
+fn signal_setup_output_owner_wait(cross_page: bool) {
+    use carrick_personality_linux::dispatch::SyscallFrame;
+    struct Frame {
+        inner: carrick_el1_abi::TrapFrame,
+        native: bool,
+    }
+    impl SyscallFrame for Frame {
+        fn canonical_ordinal(&self) -> carrick_syscall_abi::CanonicalNr {
+            self.inner.canonical_ordinal()
+        }
+        fn argument(&self, index: usize) -> Option<u64> {
+            self.inner.argument(index)
+        }
+        fn result(&self) -> carrick_guest_arch::NativeReturnWord {
+            self.inner.result()
+        }
+        fn set_result(&mut self, result: carrick_guest_arch::NativeReturnWord) {
+            self.inner.set_result(result);
+        }
+        fn slot(&self) -> Option<carrick_guest_arch::SlotId> {
+            self.inner.slot()
+        }
+        fn user_sp(&self) -> Option<UserVa> {
+            self.inner.user_sp()
+        }
+    }
+    impl crate::dispatch::GuestDispatchFrame for Frame {
+        fn native_number(&self) -> carrick_guest_arch::NativeOrdinal {
+            carrick_guest_arch::NativeOrdinal::new(if self.native { 14 } else { 135 })
+        }
+        fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
+            if self.native {
+                carrick_personality_linux::crossing::HostCrossingSet::X86
+            } else {
+                carrick_personality_linux::crossing::HostCrossingSet::Aarch64
+            }
+        }
+        fn arm_frame(&mut self) -> Option<&mut carrick_el1_abi::TrapFrame> {
+            if self.native {
+                None
+            } else {
+                Some(&mut self.inner)
+            }
+        }
+        fn arm_frame_ref(&self) -> Option<&carrick_el1_abi::TrapFrame> {
+            if self.native { None } else { Some(&self.inner) }
+        }
+        fn arm_scheduler(&self) -> bool {
+            !self.native
+        }
+        fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64> {
+            None
+        }
+    }
     use crate::thread_setup::{LifecycleThread, LifecycleVenue};
     struct Venue {
         page: &'static ThreadLifecyclePage,
@@ -5772,7 +5852,9 @@ fn sigprocmask_oldset_owner_wait_commits_mask_and_output_once() {
     let observed =
         notifications.observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Gate);
     let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
-    access.raise(space.index());
+    if !cross_page {
+        access.raise(space.index());
+    }
     // SAFETY: the fixture retains this exact owner's live Gate observation.
     let wait = unsafe {
         carrick_core_abi::PortalOwnerWait::from_owner(
@@ -5783,7 +5865,16 @@ fn sigprocmask_oldset_owner_wait_commits_mask_and_output_once() {
     };
     service.child_copy_error = Some(NativeProcessError::OwnerWait(wait));
     let set = carrick_test_support::GuestUserBuffer::from_value(u64::MAX);
-    let old = carrick_test_support::GuestUserBuffer::from_value(0xdead_beef_u64);
+    let old = carrick_test_support::GuestUserBuffer::zeroed(8192);
+    let old_address = old.arg() + if cross_page { 4093 } else { 0 };
+    if cross_page {
+        service.child_copy_error_at = Some(old_address + 3);
+        service.on_copy_complete = Some(Box::new(move |address| {
+            if address.raw() == old_address {
+                access.raise(space.index());
+            }
+        }));
+    }
     take_signal_copies();
     {
         let mut entry = fixture
@@ -5797,9 +5888,12 @@ fn sigprocmask_oldset_owner_wait_commits_mask_and_output_once() {
                 &mut service,
             )
             .unwrap();
-        let mut frame = carrick_el1_abi::TrapFrame::default();
-        frame.x[8] = 135;
-        frame.x[..4].copy_from_slice(&[0, set.arg(), old.arg(), 8]);
+        let mut frame = Frame {
+            inner: carrick_el1_abi::TrapFrame::default(),
+            native: cross_page,
+        };
+        frame.inner.x[8] = 135;
+        frame.inner.x[..4].copy_from_slice(&[0, set.arg(), old_address, 8]);
         crate::file::SIMULATE_COPYOUT_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
         let route = crate::dispatch::dispatch_syscall_with_native(
             &mut frame,
@@ -5825,7 +5919,14 @@ fn sigprocmask_oldset_owner_wait_commits_mask_and_output_once() {
         );
     }
     assert_eq!(fixture.control.blocked().0, !0x0004_0100_u64);
-    assert!(take_signal_copies().is_empty());
+    assert_eq!(
+        take_signal_copies(),
+        if cross_page {
+            vec![(UserVa::new(old_address), vec![0; 3])]
+        } else {
+            vec![]
+        }
+    );
     // Detect any replay of the already committed mask operation on resume.
     let _ = fixture.control.store_blocked_then_read_pending(
         carrick_el1_abi::BlockedMask(0x80),
@@ -5857,7 +5958,11 @@ fn sigprocmask_oldset_owner_wait_commits_mask_and_output_once() {
     assert_eq!(fixture.control.blocked().0, 0x80);
     assert_eq!(
         take_signal_copies(),
-        [(UserVa::new(old.arg()), 0_u64.to_le_bytes().to_vec())]
+        if cross_page {
+            vec![(UserVa::new(old_address + 3), vec![0; 5])]
+        } else {
+            vec![(UserVa::new(old_address), 0_u64.to_le_bytes().to_vec())]
+        }
     );
     assert!(matches!(
         entry.resume_checkpoint().unwrap(),

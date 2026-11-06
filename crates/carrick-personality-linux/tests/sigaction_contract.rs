@@ -40,17 +40,8 @@ impl<'a> SignalNative<'a> for Native {
         address: carrick_guest_arch::UserVa,
         bytes: Vec<u8>,
     ) -> carrick_personality_linux::signal::SignalOutcome {
-        let result = match self.copy_out(address, &bytes) {
-            carrick_core::personality::CopyOutcome::Done => 0,
-            carrick_core::personality::CopyOutcome::Fault => -14,
-            carrick_core::personality::CopyOutcome::NotYet(_) => {
-                panic!("eager test venue refused output")
-            }
-        };
-        carrick_personality_linux::signal::SignalOutcome::Returned {
-            result: carrick_personality_linux::abi::entry::SyscallResult::new(result),
-            work: false,
-        }
+        let _ = (address, bytes);
+        panic!("resident sigaction must complete in shared policy")
     }
 
     fn arguments(&self) -> [u64; 6] {
