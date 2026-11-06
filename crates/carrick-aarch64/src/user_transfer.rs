@@ -115,13 +115,7 @@ fn finish_supply(
         // physical grant before handing a generation-exact wait to the caller.
         drop(grant);
         if frame.x[0] == 11 && frame.x[14] == 3 {
-            let cause = carrick_el1_abi::PortalWaitCause::decode(frame.x[16])
-                .ok_or_else(|| TrapError::Hypervisor("grant returned invalid owner wait".into()))?;
-            // SAFETY: the exact carrier service authenticated this target's
-            // notification source before testing its admission condition.
-            let wait = unsafe {
-                carrick_el1_abi::PortalOwnerWait::from_owner(target.handle, cause, frame.x[17])
-            };
+            let wait = authenticated_owner_wait(target, &frame)?;
             Ok(SupplyProgress::OwnerWait(wait))
         } else {
             Ok(SupplyProgress::Declined)
@@ -132,6 +126,17 @@ fn finish_supply(
             "unsettled owner grant retains physical custody"
         );
     }
+}
+
+pub(crate) fn authenticated_owner_wait(
+    target: TransferTarget,
+    frame: &TrapFrame,
+) -> Result<carrick_el1_abi::PortalOwnerWait, TrapError> {
+    let cause = carrick_el1_abi::PortalWaitCause::decode(frame.x[16])
+        .ok_or_else(|| TrapError::Hypervisor("grant returned invalid owner wait".into()))?;
+    // SAFETY: the exact carrier service authenticated this target's
+    // notification source before testing its admission condition.
+    Ok(unsafe { carrick_el1_abi::PortalOwnerWait::from_owner(target.handle, cause, frame.x[17]) })
 }
 
 /// Capture only the refused immutable selection, never a host policy answer.

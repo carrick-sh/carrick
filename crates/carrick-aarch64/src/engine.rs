@@ -5617,19 +5617,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             let frame = outcome?;
             drop(grant);
             if frame.x[0] == 11 && frame.x[14] == 3 {
-                let cause =
-                    carrick_el1_abi::PortalWaitCause::decode(frame.x[16]).ok_or_else(|| {
-                        TrapError::Hypervisor("file grant returned invalid owner wait".into())
-                    })?;
-                // SAFETY: the exact carrier service authenticated this target's
-                // notification source before testing its admission condition.
-                let wait = unsafe {
-                    carrick_el1_abi::PortalOwnerWait::from_owner(
-                        target.handle(),
-                        cause,
-                        frame.x[17],
-                    )
-                };
+                let wait = crate::user_transfer::authenticated_owner_wait(target, &frame)?;
                 Ok(Some(carrick_hal::OwnerFileFaultOutcome::PendingOwner(wait)))
             } else {
                 Ok(Some(carrick_hal::OwnerFileFaultOutcome::Refused))
