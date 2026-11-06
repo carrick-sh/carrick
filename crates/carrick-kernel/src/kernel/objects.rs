@@ -4757,6 +4757,42 @@ mod tests {
     }
 
     #[test]
+    fn serial_host_ipc_mapping_projection_shares_live_delegation_identity() {
+        use carrick_el1_abi::ipc::fd;
+        let owner = Arc::new(crate::el1_ipc::HostIpc::new(1 << 20).unwrap());
+        let backing = Arc::new(parking_lot::RwLock::new(
+            crate::dispatch::fd_table::OpenDescription::SyntheticFile {
+                base: crate::dispatch::fd_table::OpenDescriptionBase::new(0),
+                path: "/projection".into(),
+                contents: b"source".to_vec(),
+                offset: 0,
+            },
+        ));
+        let description =
+            Arc::new(FileDescription::concrete_with_status_flags(backing, 0).unwrap());
+        description.retain_fd_ref();
+        let slot = FileSlot::new(Arc::clone(&description), 0);
+        let table = crate::el1_ipc::HostTable::create(Arc::clone(&owner), 64, 4).unwrap();
+        table.replace_slot(fd::Fd(3), &slot).unwrap();
+        owner
+            .with_pinned_host_resource(table.id(), fd::Fd(3), |resource| {
+                let hold = resource.downcast_ref::<IpcPhysicalHold>().unwrap();
+                let projected = hold.mapping_description.as_ref().unwrap();
+                // Publication may precede delegation. A copied initial handle is
+                // insufficient: both views must observe later entry and recall.
+                description.set_delegation_handle(17);
+                let entered = projected.delegation_handle();
+                description.set_delegation_handle(0);
+                assert_eq!(entered, 17);
+                projected.set_delegation_handle(23);
+                let recalled = description.delegation_handle();
+                projected.set_delegation_handle(0);
+                assert_eq!(recalled, 23);
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn serial_host_el1_ipc_host_description_alias_and_functional_retirement() {
         use carrick_el1_abi::ipc::{IpcBacking, fd};
         let ids = ObjectIdRegistry::new();
