@@ -1,5 +1,12 @@
 # Issue #1736 baseline signed population
 
+**Historical evidence; issue acceptance remains open.** The populations below
+belong to the two artifacts identified here. They are not populations for the
+current PR head. The failure mode was inferred from fixture output, not named
+from a captured core or event ring. The outstanding synchronous sibling
+completion obligation is described in
+[anonymous editor publication](../conformance-contracts/anonymous-editor-publication.md).
+
 Source revision: `0d5dfaa508e5b92edbe2b18404cd2c7d4230f719`
 
 Fixture bundle:
@@ -55,7 +62,7 @@ operation was slot 2's own local invalidation of publication 1. A guest
 broadcast invalidation was being recorded as coverage for virtual CPUs on
 which it had not completed.
 
-## Final signed population
+## Earlier candidate signed population
 
 Fix revision: `e4b20d690ec64290157ab24c328b7ca719b5d437`.
 
@@ -74,6 +81,12 @@ zero. Raw logs are under `target/issue1736/population-final/`.
 
 The fix retains a monotonic descriptor-publication generation per address
 space but moves completed coverage to each vCPU slot. Fork, `mprotect`, and
-`munmap` publish a generation. A slot that could retain that MM must perform
+`munmap` publish a generation. A slot entering that MM must perform
 its own local invalidation before it may keep or install the root, and only
 then records its own coverage.
+
+This entry check cannot acknowledge an already-running sibling or an installer
+holding an older grant. Consequently, the observed 20/20 candidate population
+does not prove that synchronous permission changes or frame retirement wait
+for those siblings. No fresh signed population was run on the Linux dispatch
+runner, which cannot execute HVF guests.

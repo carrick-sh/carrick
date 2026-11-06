@@ -67,3 +67,46 @@ acknowledgment, and prove that the edit cannot report completion early while
 other runnable tasks still make progress. The final signed population must
 then be collected on the resulting head; the historical population does not
 discharge this obligation.
+
+## Existing venues and the missing integration
+
+`carrick-personality-linux::pending_anonymous::serve` currently has no owned
+invalidation-wait result. `PermissionStep::Return` completes the syscall;
+`CommitOwed` also installs success before handing metadata work to the carrier.
+Neither can represent an edit awaiting sibling acknowledgments. Likewise,
+`RetirementStep::Retired` describes an already applied edit. Reusing these
+variants for a delayed shootdown would expose completion before its authority
+exists.
+
+The delegated path already captures the originating task generation, exact MM,
+arguments and return address in `PendingReservationSyscall`, but
+`serve_delegated_anonymous` consumes that custody within the synchronous call.
+Its `PreparedConflict` park waits for a reservation producer, not for vCPU
+invalidation. That notification cannot be substituted for an exact sibling
+acknowledgment.
+
+The HVF `ForeignEl1Publisher` is an existing example of authenticated descriptor
+submission under a paused target. Its contract requires the caller to supply
+the pause and lend a vCPU; `authenticate` does not obtain the pause itself.
+Calling that publisher from a synchronous anonymous hook therefore does not
+solve admission or release the waiting executor. It is also an HVF adapter,
+not an appropriate home for neutral continuation ownership.
+
+A correction needs a retained operation outcome through the native anonymous
+entry owner, plus exact-MM pause custody established before descriptor mutation.
+The owner must enroll on acknowledged release, surrender execution capacity,
+and resume that same operation after siblings have left the old translation
+state. Only after descriptor execution, invalidation and receipt settlement may
+it install the Linux result or release retired backing. Cancellation must
+distinguish an unmutated proposal from an applied transaction whose settlement
+is still owed. These are changes to continuation custody and cross-crate lock
+ordering, not another generation increment or a stronger DSB instruction.
+
+The required deterministic schedule has three independently controlled actors:
+the editor, a sibling holding a pre-edit install grant, and a sibling already
+executing user code. It delays each sibling acknowledgment separately, requires
+the edit to remain incomplete, and runs an unrelated runnable task with the
+normal executor capacity. Releasing both acknowledgments must complete the
+original edit once, without replaying it. This schedule and its production
+continuation integration remain unimplemented; the existing tests do not
+establish this property.
