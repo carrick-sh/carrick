@@ -101,6 +101,7 @@ fn args(frame: &TrapFrame) -> [u64; 6] {
 struct Adapter<'a, 's, C: ThreadCpu, U: UserWord> {
     sched: &'a mut Sched<'s, C, U>,
     frame: &'a mut TrapFrame,
+    refusal: Option<carrick_core::personality::CopyOutcome>,
 }
 impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, C, U> {
     type Served = Served;
@@ -132,7 +133,7 @@ impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, C, U> {
     }
     fn wait(&mut self, wait: FutexWait) -> Option<Served> {
         let zone = self.sched.zone;
-        self.sched.wait_word(
+        let result = self.sched.wait_word_with(
             self.frame,
             wait.mm.raw(),
             wait.address.raw(),
@@ -148,25 +149,112 @@ impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, C, U> {
                         carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64,
                     ))
             },
+            |user, task, address| {
+                use carrick_core::personality::{CopyOutcome, UserCopy};
+                let mut copy = FutexCopy { task, user };
+                let mut word = 0;
+                match copy.atomic_load_u32(UserVa::new(address), &mut word) {
+                    CopyOutcome::Done => Ok(word),
+                    refusal => Err(refusal),
+                }
+            },
+        );
+        match result {
+            Ok(served) => served,
+            Err(refusal) => {
+                self.refusal = Some(refusal);
+                None
+            }
+        }
+    }
+}
+
+/// Adapt the scheduler's ISA word reader to the one typed copy interface.
+/// Test venues can withhold backing without dereferencing an absent host page.
+struct FutexCopy<'a, U> {
+    task: &'a carrick_el1_abi::CurrentTask,
+    user: &'a U,
+}
+impl<U: UserWord> carrick_core::personality::UserCopy for FutexCopy<'_, U> {
+    fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> carrick_core::personality::CopyOutcome {
+        carrick_core::personality::UserCopy::copy_in(
+            &mut crate::file::ValidatedCopy {
+                task: self.task,
+                validator: &crate::file::HardwareValidator,
+            },
+            dst,
+            src,
         )
+    }
+    fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> carrick_core::personality::CopyOutcome {
+        carrick_core::personality::UserCopy::copy_out(
+            &mut crate::file::ValidatedCopy {
+                task: self.task,
+                validator: &crate::file::HardwareValidator,
+            },
+            dst,
+            src,
+        )
+    }
+    fn atomic_load_u32(
+        &mut self,
+        address: UserVa,
+        value: &mut u32,
+    ) -> carrick_core::personality::CopyOutcome {
+        use carrick_core::personality::{CopyOutcome, atomic_word_refusal};
+        let refusal = atomic_word_refusal(address, carrick_guest_arch::Access::Read);
+        if refusal == CopyOutcome::Fault {
+            return refusal;
+        }
+        match self.user.read_u32(self.task, address.raw()) {
+            Some(word) => {
+                #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+                // SAFETY: acquire ordering after the guarded unprivileged load.
+                unsafe {
+                    core::arch::asm!("dmb ishld", options(nostack, preserves_flags));
+                }
+                *value = word;
+                CopyOutcome::Done
+            }
+            None => refusal,
+        }
     }
 }
 /// Linux entry points over the neutral scheduler: futex service and the
 /// timer-expiry result its interrupt and idle paths report.
 pub trait LinuxSchedEntry {
     fn serve_futex(&mut self, frame: &mut TrapFrame) -> Option<Served>;
+    fn serve_futex_typed(
+        &mut self,
+        frame: &mut TrapFrame,
+    ) -> Result<Option<Served>, carrick_core::personality::CopyOutcome>;
     fn serve_irq(&mut self, frame: &mut TrapFrame) -> carrick_el1_abi::Action;
     fn serve_idle_entry(&mut self, frame: &mut TrapFrame) -> carrick_el1_abi::Action;
 }
 impl<C: ThreadCpu, U: UserWord> LinuxSchedEntry for Sched<'_, C, U> {
     fn serve_futex(&mut self, frame: &mut TrapFrame) -> Option<Served> {
+        self.serve_futex_typed(frame).ok().flatten()
+    }
+    fn serve_futex_typed(
+        &mut self,
+        frame: &mut TrapFrame,
+    ) -> Result<Option<Served>, carrick_core::personality::CopyOutcome> {
         if !is_served_futex_op(frame) {
-            return None;
+            return Ok(None);
         }
         let call = FutexCall {
             args: crate::sched::args(frame),
         };
-        ::carrick_personality_linux::sched::serve_futex(call, &mut Adapter { sched: self, frame })
+        let mut adapter = Adapter {
+            sched: self,
+            frame,
+            refusal: None,
+        };
+        let served = ::carrick_personality_linux::sched::serve_futex(call, &mut adapter);
+        match adapter.refusal {
+            Some(refusal) => Err(refusal),
+            None => Ok(served),
+        }
     }
     fn serve_irq(&mut self, frame: &mut TrapFrame) -> carrick_el1_abi::Action {
         self.interrupt(frame, ETIMEDOUT_RESULT)
