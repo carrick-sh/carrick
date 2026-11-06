@@ -1,6 +1,6 @@
 schema = "carrick.conformance-exemption.v1"
-base = "f9c55762a180feb26d319737ada24f8c2b14f80e"
-head = "1ce7a4ffd4ac4184ccc706abf1c17c0b601f1543"
+base = "8b1bdb785be5e7ccc050c77833203720f269e405"
+head = "217a7e8d55c934aac6b07c192045d4a4586ef4e7"
 contracts = [
   "diagnostics.syscall-refusal",
   "kernel.copyout.owner-refusal",
