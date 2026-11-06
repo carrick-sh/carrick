@@ -140,6 +140,8 @@ fn image_path_and_shebang_entrypoints_use_the_shared_resolver() {
     );
     assert_eq!(native.status.code(), Some(7));
     let bytes = std::fs::read(&elf).unwrap();
+    let mut invalid_entry_bytes = bytes.clone();
+    invalid_entry_bytes[24..32].copy_from_slice(&0u64.to_le_bytes());
     let ld_test_bytes = std::fs::read(&ld_test).unwrap();
     let interp_ok_bytes = std::fs::read(&interp_ok).unwrap();
     let missing_interp_bytes = std::fs::read(&missing_interp).unwrap();
@@ -150,6 +152,10 @@ fn image_path_and_shebang_entrypoints_use_the_shared_resolver() {
         for (name, contents) in [
             ("opt/image/bin/python3", bytes.as_slice()),
             ("opt/image/bin/go", bytes.as_slice()),
+            (
+                "opt/image/bin/invalid-entry",
+                invalid_entry_bytes.as_slice(),
+            ),
             (
                 "opt/image/bin/docker-entrypoint.sh",
                 b"#!/opt/image/bin/python3 script-option\n".as_slice(),
@@ -241,6 +247,7 @@ fn image_path_and_shebang_entrypoints_use_the_shared_resolver() {
         ("/opt/image/bin", 126),
         ("not-elf", 126),
         ("bad-interp", 126),
+        ("invalid-entry", 126),
     ] {
         let output = Command::new(&cli)
             .timeout(Duration::from_secs(10))
