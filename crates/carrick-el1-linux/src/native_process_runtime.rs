@@ -2751,12 +2751,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         };
         for key in members {
             if let Some(member) = state.members.remove(&key) {
-                drop(
-                    runtime
-                        .graph
-                        .lock()
-                        .take_relative_futex_wait(&member.record),
-                );
+                let _ = runtime
+                    .graph
+                    .lock()
+                    .take_relative_futex_wait(&member.record);
                 state
                     .records
                     .remove(&Self::record_key(runtime.zone, member.record));

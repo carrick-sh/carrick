@@ -136,7 +136,9 @@ impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, C, U> {
             .wake_word(self.frame, mm.raw(), address.raw(), bitset, limit)
     }
     fn wait(&mut self, wait: FutexWait) -> Option<Served> {
-        if let Some(deadline) = wait.deadline {
+        if self.operation.is_none()
+            && let Some(deadline) = wait.deadline
+        {
             *self.operation =
                 Some(carrick_personality_linux::sched::RelativeFutexWait { deadline });
         }

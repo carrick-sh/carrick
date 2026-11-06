@@ -9699,11 +9699,9 @@ mod tests {
             let clock = Arc::new(ClockDomain::deterministic(
                 std::time::SystemTime::UNIX_EPOCH,
             ));
-            let (runtime, scheduler, kernel, root, process, generation) = test_carrier_graph_with_dispatcher!(
-                72_845,
-                SyscallDispatcher::new(),
-                Some(clock.clone())
-            );
+            let dispatcher = SyscallDispatcher::new();
+            let (runtime, scheduler, kernel, root, process, generation) =
+                test_carrier_graph_with_dispatcher!(72_845, dispatcher, Some(clock.clone()));
             root.thread().set_affinity(carrick_hal::CpuAffinity::all(1));
             let sibling = root
                 .kernel()
@@ -9739,6 +9737,7 @@ mod tests {
             let physical = OwnedMemoryWait(Arc::new(
                 PendingContentWrite::new(content.clone(), 0, 4096).unwrap(),
             ));
+            let physical = Mutex::new(Some(physical));
             let loads = Arc::new(AtomicUsize::new(0));
             let observed_loads = loads.clone();
             let mut engine = CrashCaptureTestEngine {
@@ -9746,7 +9745,7 @@ mod tests {
                     assert_eq!(address, 0x410000);
                     let load = observed_loads.fetch_add(1, Ordering::SeqCst) + 1;
                     if load == 2 {
-                        Err(MemoryError::Physical(physical.clone()))
+                        Err(MemoryError::Physical(physical.lock().take().unwrap()))
                     } else {
                         Ok(7)
                     }
