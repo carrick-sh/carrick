@@ -38,7 +38,6 @@ structural_budgets = []
 
 [bindings]
 vm_free = [
-  "carrick-sched-core::tests::slot_cow_coverage_survives_rebinding_and_rejects_retired_asid_identity",
   "carrick-runtime::vcpu_loop::executor::tests::{serial_host_process_exit_retires_abi_born_sibling_before_direct_load,serial_host_group_close_retires_abi_born_sibling_during_direct_load,serial_host_missing_abi_born_sibling_without_terminal_intent_fails_closed} (actual ABI birth and retained control, queued process-exit cancellation and native terminal release during a held load; zero retired-member guest entries, one terminal settlement, all workers joined; absence without terminal intent remains fatal)",
   "carrick-el1-linux::aarch64_process_tests::arm_unregistered_host_cancel_commits_terminal_intent_before_record_release (Busy once then successful native release)",
   "carrick-el1-linux::aarch64_process_tests::exit_group_hang_tests::serial_host_arm_exit_group_unregistered_sibling_wakes_parked_host (production exit_group, enrolled exact record retirement, nonperiodic waits, real host receipts and one Closing wake)",
@@ -58,6 +57,7 @@ vm_free = [
   "carrick-sched-core::tests::{host_claim_is_not_published_before_queue_cleanup,host_claim_cleanup_does_not_unlink_a_replacement_waiter,host_wake_transfer_owns_waitv_cleanup_until_completion,a_host_request_during_transfer_prevents_guest_relocation} (owned transfer, cancellation, waitv cleanup and deferred host requests)",
   "carrick-sched-core::tests::{host_request_wins_against_enrolled_guest_park,host_request_after_guest_park_claims_the_published_wait,requested_running_records_survive_preemption_and_unswitch} (atomic running request versus park admission; zero leftover wait entries and timer on refusal; VM-free only)",
   "carrick-el1-abi::refusal_census_tests::refusal_snapshot_preserves_caller_populations_without_changing_service_counts",
+  "carrick-sched-core::tests::slot_cow_coverage_survives_rebinding_and_rejects_retired_asid_identity",
 ]
 embed = [
   "carrick-embed::el1_sched (signed; el1_sched_futex_handoff_after_self_affinity_change: inherited CPU-1 residency migrates to CPU 0 before same-CPU handoffs, zero cross-vCPU wakes and at least 5000 in-guest switches; el1_sched_cross_vcpu_handoff_has_no_host_exits: affine exits per round trip < 0.01 at 5 us and 200 us of work per turn, cross-vCPU wakes and WFI SGIs per round trip; el1_sched_timed_wait_times_out_in_guest: exits per wait < 0.01, every result ETIMEDOUT, none early; el1_sched_preemption_reaches_compute_loops: both CPU-0 syscall-free loops complete 16 counted turns with at least two in-guest preemptions, without a wall-clock sample window; el1_sched_idle_carrier_costs_no_host_cpu: < 1% of a core idle, vCPUs in WFI; el1_sched_signal_reaches_a_wfi_parked_vcpu; el1_sched_exit_group_with_parked_threads and el1_sched_exec_from_a_sibling_with_parked_threads with WFI-parked siblings; el1_sched_pstate_seen_by_the_guest_is_unchanged)",

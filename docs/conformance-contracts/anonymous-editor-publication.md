@@ -25,8 +25,14 @@ changed head. The earlier signed population evidence belongs to its original
 artifact and does not establish a result for this change.
 
 `slot_cow_coverage_survives_rebinding_and_rejects_retired_asid_identity`
-drives `ZoneTables::cover_cow` on two slots, rebinding one slot through a
+drives `ZoneTables::cover_cow` on two slots, resetting and rebinding a slot
+to a replacement vCPU, switching that slot through a
 second live MM, then retiring the first MM and publishing a new MM with the
 same numeric root/ASID and publication generation. Coverage must remain
 local to both the slot and MM identity. This is a scheduler lifecycle witness,
 not proof of hardware ASID-retirement completion.
+
+A successful `reset_slot` clears local coverage together with the timer
+cache because a new mailbox lease can name a different vCPU. The reset
+witness was red (`None` instead of `Some(1)` owed) before clearing these
+fields. A refused reset preserves the still-owned slot.

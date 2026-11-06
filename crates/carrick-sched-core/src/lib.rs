@@ -4568,6 +4568,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         // The slot may name another vCPU now (a new mailbox lease): what EL1
         // armed on the old one says nothing about this one's timer.
         s.timer_cval.store(0, Ordering::Relaxed);
+        // Local TLB completion belongs to that vCPU incarnation too. The
+        // replacement must consume the MM publication before retaining it.
+        s.cow_covered.store(0, Ordering::Release);
+        s.cow_mm.store(0, Ordering::Release);
+
         // The loaded thread starts a fresh slice (EL1 restarts it at its next
         // look): a slice left over from what the slot ran before would
         // preempt it at the first tick, and a slot whose threads all need
