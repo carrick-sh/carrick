@@ -102,3 +102,38 @@ skip the unused read, while a separate shared mirror wake obtains a fresh word
 before publication. The shared-pointer fallback uses an acquire atomic load.
 This supplemental test proves refusal propagation, not atomicity of the direct
 host read or scheduler enrollment; those remain incomplete in this slice.
+
+### Host atomic admission boundary
+
+The remaining host migration must retain both semantic and physical authority
+through the atomic instruction. `GuestMemory::host_read` returns an optional
+retained pointer, but absence does not distinguish an invalid address from an
+owner that has not made backing available. `host_ptr_for_write` is only a
+request: its pointer cannot be dereferenced without exact backing admission.
+Neither optional pointer is sufficient to translate refusal into `CopyOutcome`.
+Reading bytes first to diagnose pointer admission is also not an atomic load.
+
+The owner-backed ARM transfer already has an authenticated effect callback.
+`PreparedWrite::settle` runs `ticket.copy_requested` while the exact prepared
+permit, current service loan and `TransferPin` remain live. An atomic operand
+must execute inside that authorization interval, on the retained selected
+backing. Extending only `PreparedGuestWrite::commit` with a byte buffer cannot
+implement compare-exchange: a sibling may change the word between a prior load
+and that commit. The read operand similarly needs read authority, without
+requiring write permission or breaking COW merely to compare a WAIT value.
+
+A host `UserCopy` adapter must return the existing `CopyOutcome` while retaining
+any host owner receipt until the dispatch outcome takes it. `GuestCopyRequest`
+identifies the requested user access; it does not replace the exact owner
+incarnation, physical dependency or supply request needed by host redispatch.
+The adapter must release permits and bucket locks before returning that wait.
+A `NotYet` result must publish neither a loaded value nor a guest store.
+
+PI ownership updates must compare-exchange the full observed word, including
+its flag bits. Checking the masked TID and later committing bytes can overwrite
+a concurrent owner or flag update. A failed exchange must re-evaluate the
+observed ownership before returning success or waking a waiter. Mirror-backed
+WAIT also needs separate treatment: Linux WAIT only reads its operand, so a
+mandatory writeback must not introduce a write-permission requirement. These
+constraints apply to the existing host paths; they do not justify a new
+fallback, owner polling loop, outcome type, or an early debt-ceiling decrease.
