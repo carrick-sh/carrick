@@ -64,11 +64,6 @@ pub trait FutexVenue {
         limit: u32,
     ) -> Option<Self::Served>;
     fn wait(&mut self, wait: FutexWait) -> Option<Self::Served>;
-    fn relative_deadline(&mut self, key: u64, proposed: CounterTick) -> CounterTick {
-        let _ = key;
-        proposed
-    }
-    fn finish_relative_wait(&mut self) {}
 }
 
 pub struct FutexWait {
@@ -110,14 +105,13 @@ pub fn serve_futex<V: FutexVenue>(call: FutexCall, venue: &mut V) -> Option<V::S
         let ticks = (secs as u64)
             .saturating_mul(venue.frequency().hz())
             .saturating_add(nanos_ticks);
-        let proposed = CounterTick::new(venue.now().raw().saturating_add(ticks).max(1));
-        let key =
-            address.raw() ^ timeout.rotate_left(17) ^ expected.rotate_left(33) ^ op.rotate_left(49);
-        Some(venue.relative_deadline(key, proposed))
+        Some(CounterTick::new(
+            venue.now().raw().saturating_add(ticks).max(1),
+        ))
     } else {
         None
     };
-    let served = venue.wait(FutexWait {
+    venue.wait(FutexWait {
         mm,
         address,
         bitset,
@@ -125,11 +119,7 @@ pub fn serve_futex<V: FutexVenue>(call: FutexCall, venue: &mut V) -> Option<V::S
         deadline,
         mismatch_result: SyscallResult::new(EAGAIN),
         timeout_result: SyscallResult::new(ETIMEDOUT_RESULT as i64),
-    });
-    if served.is_some() {
-        venue.finish_relative_wait();
-    }
-    served
+    })
 }
 
 pub fn is_served_futex_op(ordinal: u64, args: [u64; 6]) -> bool {
