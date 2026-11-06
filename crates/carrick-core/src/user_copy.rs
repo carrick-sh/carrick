@@ -135,6 +135,7 @@ pub trait UserCopy {
     }
 
     /// Write a padding-free typed ABI record to guest memory.
+    /// Preserve owner refusal so the caller can retain its operation and wait.
     ///
     /// Records with explicit padding compile cleanly:
     ///
@@ -151,7 +152,7 @@ pub trait UserCopy {
     ///     b: u32,
     /// }
     ///
-    /// fn publish<C: UserCopy>(copy: &mut C, dst: UserVa, val: &ExplicitPad) -> bool {
+    /// fn publish<C: UserCopy>(copy: &mut C, dst: UserVa, val: &ExplicitPad) -> carrick_core::user_copy::CopyOutcome {
     ///     copy.write_val(dst, val)
     /// }
     /// ```
@@ -170,7 +171,7 @@ pub trait UserCopy {
     ///     b: u32,
     /// }
     ///
-    /// fn publish<C: UserCopy>(copy: &mut C, dst: UserVa, val: &ImplicitPad) -> bool {
+    /// fn publish<C: UserCopy>(copy: &mut C, dst: UserVa, val: &ImplicitPad) -> carrick_core::user_copy::CopyOutcome {
     ///     copy.write_val(dst, val)
     /// }
     /// ```
@@ -188,7 +189,7 @@ pub trait UserCopy {
     ///     b: u32,
     /// }
     ///
-    /// fn publish<C: UserCopy>(copy: &mut C, dst: UserVa, val: &UncheckedCopy) -> bool {
+    /// fn publish<C: UserCopy>(copy: &mut C, dst: UserVa, val: &UncheckedCopy) -> carrick_core::user_copy::CopyOutcome {
     ///     copy.write_val(dst, val)
     /// }
     /// ```
@@ -197,11 +198,11 @@ pub trait UserCopy {
         &mut self,
         dst: UserVa,
         val: &T,
-    ) -> bool
+    ) -> CopyOutcome
     where
         Self: Sized,
     {
-        self.copy_out(dst, val.as_bytes()).is_done()
+        self.copy_out(dst, val.as_bytes())
     }
 }
 
@@ -241,5 +242,43 @@ impl<U: UserCopy + ?Sized> UserCopy for &mut U {
     #[inline]
     fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> CopyOutcome {
         (**self).copy_out(dst, src)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct RefusingCopy(CopyOutcome);
+
+    impl UserCopy for RefusingCopy {
+        fn copy_in(&mut self, _: &mut [u8], _: UserVa) -> CopyOutcome {
+            unreachable!("write_val must only copy out")
+        }
+
+        fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> CopyOutcome {
+            assert_eq!(dst, UserVa::new(0x4000));
+            assert_eq!(src, 42_u32.to_ne_bytes());
+            self.0
+        }
+    }
+
+    #[test]
+    fn typed_record_write_preserves_every_copy_outcome() {
+        let request = GuestCopyRequest {
+            address: UserVa::new(0x4000),
+            len: GuestLen::new(4),
+            access: Access::Write,
+        };
+        for outcome in [
+            CopyOutcome::Done,
+            CopyOutcome::Fault,
+            CopyOutcome::NotYet(request),
+        ] {
+            assert_eq!(
+                RefusingCopy(outcome).write_val(request.address, &42_u32),
+                outcome
+            );
+        }
     }
 }

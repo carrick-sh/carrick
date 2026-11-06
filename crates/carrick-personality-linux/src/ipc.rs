@@ -160,7 +160,7 @@ fn invoke_msg<'a>(
                     };
                     match res {
                         Ok(val) => {
-                            if !(&mut native).write_val(buf_ptr, &info) {
+                            if !(&mut native).write_val(buf_ptr, &info).is_done() {
                                 return ret_errno(LINUX_EFAULT);
                             }
                             ret(val)
@@ -181,7 +181,7 @@ fn invoke_msg<'a>(
                     };
                     match res {
                         Ok(val) => {
-                            if !(&mut native).write_val(buf_ptr, &ds) {
+                            if !(&mut native).write_val(buf_ptr, &ds).is_done() {
                                 return ret_errno(LINUX_EFAULT);
                             }
                             ret(val)
@@ -269,7 +269,7 @@ fn invoke_msg<'a>(
             match res {
                 Ok((outcome, Some((original_idx, mtype, data)))) => {
                     let text_va = UserVa::new(msgp.raw().wrapping_add(8));
-                    let copy_ok = (&mut native).write_val(msgp, &mtype)
+                    let copy_ok = (&mut native).write_val(msgp, &mtype).is_done()
                         && (data.is_empty() || native.copy_out(text_va, &data).is_done());
                     if !copy_ok {
                         // Restore message to original position in queue so it is not lost!
@@ -323,7 +323,7 @@ fn invoke_sem<'a>(
                     };
                     match res {
                         Ok(val) => {
-                            if !(&mut native).write_val(arg_ptr, &info) {
+                            if !(&mut native).write_val(arg_ptr, &info).is_done() {
                                 return ret_errno(LINUX_EFAULT);
                             }
                             ret(val)
@@ -347,10 +347,10 @@ fn invoke_sem<'a>(
                         Ok(val) => {
                             let ok = match native.guest_isa() {
                                 carrick_guest_arch::GuestIsa::X86_64 => {
-                                    (&mut native).write_val(arg_ptr, &ds)
+                                    (&mut native).write_val(arg_ptr, &ds).is_done()
                                 }
                                 carrick_guest_arch::GuestIsa::Aarch64 => {
-                                    (&mut native).write_val(arg_ptr, &ds.to_aarch64())
+                                    (&mut native).write_val(arg_ptr, &ds.to_aarch64()).is_done()
                                 }
                             };
                             if !ok {
