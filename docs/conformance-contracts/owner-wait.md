@@ -210,3 +210,16 @@ Signed integration is
 remain unchanged. The Linux authority is that a blocked read resumes when
 its byte arrives; internal memory contention cannot strand the completion.
 
+
+# Gate and delegated release ordering (#1773)
+
+All scheduler notification revisions now pass through `release_notifications`,
+which executes the resource release before advancing the retained tickets.
+The revision increment is private to the notification implementation. Gate
+open/lower and delegated inode unlock use this same ordering as MM resources;
+terminal-source producers have already published closure before calling it.
+The Gate witness schedules a contender's observation and real gate refusal
+immediately before both open and final lower, then enrolls after delivery.
+It must recover `Changed` and its operation without parking. This was red
+on admitted main: the contender parked after the final Gate release.
+No retry, polling, extra queue or work-budget change is introduced.

@@ -1,7 +1,7 @@
 //! Notification custody licensed by an authenticated delegated-inode guard.
 use super::{
     BorrowedObjectNotificationSource, ObjectNotificationTicket, ObjectWaitError, ObjectWaitKey,
-    OwnedObjectWakeEffects,
+    OwnedObjectWakeEffects, release_notifications,
 };
 use crate::{Waker, ZoneTables};
 use core::num::NonZeroU64;
@@ -118,8 +118,14 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> DelegatedLockRelease<'_, '_, C
         let completion = |effects: OwnedObjectWakeEffects<'_, C>| {
             (self.venue.deliver)(self.venue.zone, self.venue.waker, effects)
         };
-        let publication = ticket.advance_revision(self.venue.waker, &completion);
-        drop(unlock);
+        let [Some(publication)] = release_notifications(
+            [Some(ticket)],
+            || drop(unlock),
+            self.venue.waker,
+            &completion,
+        ) else {
+            unreachable!("one delegated release ticket");
+        };
         after_unlock();
         publication.publish();
     }

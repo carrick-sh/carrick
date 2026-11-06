@@ -825,32 +825,44 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectNotificationTicket<'
     }
     /// Never waits or retries. A current holder or this publisher owns delivery.
     pub fn publish(self, waker: Waker, completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>)) {
-        let revision = self.advance_revision(waker, completion);
+        let [Some(revision)] = release_notifications([Some(self)], || {}, waker, completion) else {
+            unreachable!("one notification ticket");
+        };
         revision.publish();
     }
-    /// Advance the producer revision while its resource is still excluded.
-    /// The returned receipt must publish after that resource is unlocked.
-    pub(crate) fn advance_revision<'c>(
-        self,
-        waker: Waker,
-        completion: &'c dyn Fn(OwnedObjectWakeEffects<'_, C>),
-    ) -> ObjectNotificationPublication<'a, 'c, C> {
-        let queue = self.zone.object_queue(self.key.index as usize);
-        assert_eq!(
-            queue.generation.load(Ordering::Acquire),
-            self.key.generation,
-            "admitted notification incarnation"
-        );
-        let previous = queue.epoch.fetch_add(1, Ordering::SeqCst);
-        assert!(previous != u64::MAX, "notification epoch exhaustion");
-        ObjectNotificationPublication {
-            ticket: self,
-            waker,
-            completion,
-        }
-    }
 }
-#[must_use = "publish the advanced producer revision after resource unlock"]
+
+/// Release the resource before advancing any producer revision. Retain every
+/// receipt before delivery so callbacks cannot invalidate sibling producers.
+pub(crate) fn release_notifications<'a, 'c, C, const N: usize>(
+    tickets: [Option<ObjectNotificationTicket<'a, C>>; N],
+    release: impl FnOnce(),
+    waker: Waker,
+    completion: &'c dyn Fn(OwnedObjectWakeEffects<'_, C>),
+) -> [Option<ObjectNotificationPublication<'a, 'c, C>>; N]
+where
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+{
+    release();
+    tickets.map(|ticket| {
+        ticket.map(|ticket| {
+            let queue = ticket.zone.object_queue(ticket.key.index as usize);
+            assert_eq!(
+                queue.generation.load(Ordering::Acquire),
+                ticket.key.generation,
+                "admitted notification incarnation"
+            );
+            let previous = queue.epoch.fetch_add(1, Ordering::SeqCst);
+            assert!(previous != u64::MAX, "notification epoch exhaustion");
+            ObjectNotificationPublication {
+                ticket,
+                waker,
+                completion,
+            }
+        })
+    })
+}
+#[must_use = "publish the producer revision after resource release"]
 pub(crate) struct ObjectNotificationPublication<
     'a,
     'c,
