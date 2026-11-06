@@ -1125,36 +1125,32 @@ mod tests {
     }
 
     impl UserCopy for MockNative {
-        fn copy_in(
-            &mut self,
-            dst: &mut [u8],
-            src: UserVa,
-        ) -> carrick_core::personality::CopyOutcome {
+        fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> carrick_core::user_copy::CopyOutcome {
             let addr = src.raw();
             for (i, byte) in dst.iter_mut().enumerate() {
                 let target = addr + i as u64;
                 if self.write_only.contains(&target) || self.unmapped.contains(&target) {
-                    return carrick_core::personality::CopyOutcome::Fault;
+                    return carrick_core::user_copy::CopyOutcome::Fault;
                 }
                 if let Some(&b) = self.memory.get(&target) {
                     *byte = b;
                 } else {
-                    return carrick_core::personality::CopyOutcome::Fault;
+                    return carrick_core::user_copy::CopyOutcome::Fault;
                 }
             }
-            carrick_core::personality::CopyOutcome::Done
+            carrick_core::user_copy::CopyOutcome::Done
         }
 
-        fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> carrick_core::personality::CopyOutcome {
+        fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> carrick_core::user_copy::CopyOutcome {
             let addr = dst.raw();
             for (i, &byte) in src.iter().enumerate() {
                 let target = addr + i as u64;
                 if self.unmapped.contains(&target) {
-                    return carrick_core::personality::CopyOutcome::Fault;
+                    return carrick_core::user_copy::CopyOutcome::Fault;
                 }
                 self.memory.insert(target, byte);
             }
-            carrick_core::personality::CopyOutcome::Done
+            carrick_core::user_copy::CopyOutcome::Done
         }
     }
 

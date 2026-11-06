@@ -1,6 +1,6 @@
 //! OS personality trait and execution flow primitives.
 
-pub use carrick_core::personality::UserCopy;
+pub use carrick_core::user_copy::UserCopy;
 use carrick_el1::isa::x86::Kernel;
 use carrick_el1::isa::x86::context::{
     native::{CpuBinding, NativeFrame},

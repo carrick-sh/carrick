@@ -101,7 +101,7 @@ fn args(frame: &TrapFrame) -> [u64; 6] {
 struct Adapter<'a, 's, C: ThreadCpu, U: UserWord> {
     sched: &'a mut Sched<'s, C, U>,
     frame: &'a mut TrapFrame,
-    refusal: Option<carrick_core::personality::CopyOutcome>,
+    refusal: Option<carrick_core::user_copy::CopyOutcome>,
 }
 impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, C, U> {
     type Served = Served;
@@ -150,7 +150,7 @@ impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, C, U> {
                     ))
             },
             |user, task, address| {
-                use carrick_core::personality::{CopyOutcome, UserCopy};
+                use carrick_core::user_copy::{CopyOutcome, UserCopy};
                 let mut copy = FutexCopy { task, user };
                 let mut word = 0;
                 match copy.atomic_load_u32(UserVa::new(address), &mut word) {
@@ -176,14 +176,14 @@ struct FutexCopy<'a, U> {
     user: &'a U,
 }
 
-fn futex_word_refusal(address: UserVa) -> carrick_core::personality::CopyOutcome {
+fn futex_word_refusal(address: UserVa) -> carrick_core::user_copy::CopyOutcome {
     #[cfg(target_os = "none")]
     {
-        carrick_core::personality::atomic_word_refusal(address, carrick_guest_arch::Access::Read)
+        carrick_core::user_copy::atomic_word_refusal(address, carrick_guest_arch::Access::Read)
     }
     #[cfg(not(target_os = "none"))]
     {
-        use carrick_core::personality::{CopyOutcome, GuestCopyRequest};
+        use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest};
         if address.raw() & 3 != 0 {
             CopyOutcome::Fault
         } else {
@@ -196,9 +196,9 @@ fn futex_word_refusal(address: UserVa) -> carrick_core::personality::CopyOutcome
     }
 }
 
-impl<U: UserWord> carrick_core::personality::UserCopy for FutexCopy<'_, U> {
-    fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> carrick_core::personality::CopyOutcome {
-        carrick_core::personality::UserCopy::copy_in(
+impl<U: UserWord> carrick_core::user_copy::UserCopy for FutexCopy<'_, U> {
+    fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> carrick_core::user_copy::CopyOutcome {
+        carrick_core::user_copy::UserCopy::copy_in(
             &mut crate::file::ValidatedCopy {
                 task: self.task,
                 validator: &crate::file::HardwareValidator,
@@ -207,8 +207,8 @@ impl<U: UserWord> carrick_core::personality::UserCopy for FutexCopy<'_, U> {
             src,
         )
     }
-    fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> carrick_core::personality::CopyOutcome {
-        carrick_core::personality::UserCopy::copy_out(
+    fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> carrick_core::user_copy::CopyOutcome {
+        carrick_core::user_copy::UserCopy::copy_out(
             &mut crate::file::ValidatedCopy {
                 task: self.task,
                 validator: &crate::file::HardwareValidator,
@@ -221,8 +221,8 @@ impl<U: UserWord> carrick_core::personality::UserCopy for FutexCopy<'_, U> {
         &mut self,
         address: UserVa,
         value: &mut u32,
-    ) -> carrick_core::personality::CopyOutcome {
-        use carrick_core::personality::CopyOutcome;
+    ) -> carrick_core::user_copy::CopyOutcome {
+        use carrick_core::user_copy::CopyOutcome;
         let refusal = futex_word_refusal(address);
         if refusal == CopyOutcome::Fault {
             return refusal;
@@ -246,7 +246,7 @@ pub trait LinuxSchedEntry {
     fn serve_futex_typed(
         &mut self,
         frame: &mut TrapFrame,
-    ) -> Result<Option<Served>, carrick_core::personality::CopyOutcome>;
+    ) -> Result<Option<Served>, carrick_core::user_copy::CopyOutcome>;
     fn serve_irq(&mut self, frame: &mut TrapFrame) -> carrick_el1_abi::Action;
     fn serve_idle_entry(&mut self, frame: &mut TrapFrame) -> carrick_el1_abi::Action;
 }
@@ -257,7 +257,7 @@ impl<C: ThreadCpu, U: UserWord> LinuxSchedEntry for Sched<'_, C, U> {
     fn serve_futex_typed(
         &mut self,
         frame: &mut TrapFrame,
-    ) -> Result<Option<Served>, carrick_core::personality::CopyOutcome> {
+    ) -> Result<Option<Served>, carrick_core::user_copy::CopyOutcome> {
         if !is_served_futex_op(frame) {
             return Ok(None);
         }

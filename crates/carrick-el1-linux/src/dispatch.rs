@@ -2948,19 +2948,19 @@ impl<
             let served = sched.serve_futex_typed(frame);
             let disposition = match served {
                 Ok(served) => served.map_or(ipc::IpcServed::Forward, ipc::IpcServed::from),
-                Err(carrick_core::personality::CopyOutcome::Fault) => {
+                Err(carrick_core::user_copy::CopyOutcome::Fault) => {
                     return FamilyCompletion::Complete(
                         carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
                     );
                 }
-                Err(carrick_core::personality::CopyOutcome::NotYet(request)) => {
+                Err(carrick_core::user_copy::CopyOutcome::NotYet(request)) => {
                     if self.process.is_none() {
                         return FamilyCompletion::Forward;
                     }
                     let outcome = lifecycle::LifecycleNative::wait_guest_copy(self, request);
                     return carrick_personality_linux::lifecycle::lifecycle_effect(&outcome);
                 }
-                Err(carrick_core::personality::CopyOutcome::Done) => {
+                Err(carrick_core::user_copy::CopyOutcome::Done) => {
                     invalid_completion(NativeInvariant::EntryBinding)
                 }
             };

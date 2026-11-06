@@ -377,7 +377,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             interrupt,
             |user, task, address| {
                 user.read_u32(task, address)
-                    .ok_or(carrick_core::personality::atomic_word_refusal(
+                    .ok_or(carrick_core::user_copy::atomic_word_refusal(
                         carrick_guest_arch::UserVa::new(address),
                         carrick_guest_arch::Access::Read,
                     ))
@@ -405,8 +405,8 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             &U,
             &CurrentTask,
             u64,
-        ) -> Result<u32, carrick_core::personality::CopyOutcome>,
-    ) -> Result<Option<Served>, carrick_core::personality::CopyOutcome> {
+        ) -> Result<u32, carrick_core::user_copy::CopyOutcome>,
+    ) -> Result<Option<Served>, carrick_core::user_copy::CopyOutcome> {
         let (zone, slot) = (self.zone, self.slot);
         let guard = zone.short_lock(
             ZoneTables::bucket_of_with_context(mm, uaddr),

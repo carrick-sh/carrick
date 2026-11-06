@@ -13,6 +13,7 @@ pub mod lifecycle;
 pub mod mm;
 pub mod personality;
 pub mod terminal;
+pub mod user_copy;
 pub mod wait;
 /// Shared typed refusal vocabulary owned by the scheduler wait substrate.
 pub mod refusal {
@@ -20,7 +21,7 @@ pub mod refusal {
 }
 pub use personality::{
     CallContext, CallOrdinal, EntryDecodeError, Personality, PersonalityAbi, ServiceError, TaskId,
-    TaskKey, TaskSerial, ThreadKey, UserCopy, UserMemory, UserStackOffset,
+    TaskKey, TaskSerial, ThreadKey, UserMemory, UserStackOffset,
 };
 
 #[cfg(test)]
