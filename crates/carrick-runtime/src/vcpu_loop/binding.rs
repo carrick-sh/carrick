@@ -8145,6 +8145,34 @@ mod tests {
     /// reservation drops.
     #[test]
     fn retry_thread_exit_terminal_save_keeps_process_translation() {
+        retry_thread_exit_terminal_save(None);
+    }
+
+    #[test]
+    fn serial_host_unkeyed_thread_exit_retry_parks_on_exact_memory_owner() {
+        use carrick_el1_linux::mm_portal::test_support::Region;
+        struct Restore(usize);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                carrick_el1_abi::record_el1_region_host_ptr(self.0);
+            }
+        }
+        let region = Region::new();
+        assert!(
+            region
+                .portal_slots()
+                .bind_carrier(NonZeroU64::new(1709).unwrap())
+        );
+        let _restore = Restore(carrick_el1_abi::get_el1_region_host_ptr());
+        carrick_el1_abi::record_el1_region_host_ptr(region.ptr.as_ptr() as usize);
+        carrick_kernel::el1_zone::with_test_zone(carrick_el1_abi::zone_tables().unwrap(), || {
+            retry_thread_exit_terminal_save(Some(&region));
+        });
+    }
+
+    fn retry_thread_exit_terminal_save(
+        owner_region: Option<&carrick_el1_linux::mm_portal::test_support::Region>,
+    ) {
         use carrick_core::terminal::{Live, Process, RetirementVerdict, TerminalCustody};
         use carrick_guest_arch::{
             AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa,
@@ -8280,7 +8308,7 @@ mod tests {
         let registry = Arc::new(ThreadRegistry::new(root.thread().registry_id()));
         registry.register_child_with_tid(tid, 0);
         let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
-            registry,
+            registry.clone(),
             Arc::new(FutexTable::new()),
             Arc::new(NoopPlatformFutex),
             Arc::new(|_| Arc::new(NoopPlatformFutex)),
@@ -8388,6 +8416,87 @@ mod tests {
             "one full snapshot per terminal suspension"
         );
 
+        if let Some(region) = owner_region {
+            use carrick_el1_linux::mm_portal::{
+                MmPortal,
+                test_support::{ROOT, VA, admit_notified, nodes},
+            };
+            let zone = region.zone();
+            let mm = admit_notified(region, sibling.shared().mm().id().raw(), ROOT, 1, 0);
+            let view = nodes(region);
+            let portal = MmPortal::new(
+                NonZeroU64::new(1709).unwrap(),
+                region.table(),
+                &zone.spaces,
+                &view,
+            )
+            .with_zone(zone)
+            .unwrap();
+            let handle = portal.admitted_handle(mm, 0).unwrap();
+            let index = zone.spaces.find(mm.raw()).unwrap();
+            zone.spaces.raise(index);
+            let wait = portal
+                .observe_wait(handle, carrick_el1_abi::PortalWaitCause::Gate)
+                .unwrap()
+                .unwrap();
+            registry.set_clear_child_tid(tid, VA);
+            engine.guest_memory.insert(VA, vec![1; 4]);
+            engine.copyout_owner_probe = Some(CopyoutOwnerProbe::new(wait, zone));
+            assert_eq!(
+                job.state.zone_mm, None,
+                "cancellation precedes first zone refresh"
+            );
+            let parked = job
+                .poll_with_engine_typed(&mut engine, &mut control)
+                .expect("terminal member wait must use its retained MM before first zone entry");
+            let executor::ExecutorExit::BlockedContinuation {
+                continuation,
+                vfork_activation: None,
+            } = parked
+            else {
+                panic!("terminal memory owner did not park: {parked:?}")
+            };
+            let record = continuation.zone_wait().unwrap().record;
+            assert_eq!(zone.live(record).unwrap().identity().mm, mm.raw());
+            assert!(sibling.exact_thread_is_live());
+            assert!(root.exact_thread_is_live());
+            assert_eq!(engine.guest_memory[&VA], [1; 4]);
+            assert_eq!(engine.prepared_commits, 0);
+            let service = carrick_kernel::kernel::continuation::CarrierWaitService::new(
+                Arc::clone(&scheduler),
+            );
+            let mut wait_registration = service.prepare_registration(&continuation);
+            service.enroll(&mut wait_registration).unwrap();
+            let lease = control.submission.take_execution_lease().unwrap();
+            running.restore_lease(lease).unwrap();
+            scheduler
+                .settle_blocked_continuation(running, *continuation, wait_registration)
+                .unwrap();
+            assert_eq!(scheduler.queued_len(), 0, "the gate still owns the wait");
+            let publisher = Arc::clone(&scheduler);
+            carrick_kernel::el1_zone::with_test_handback_publisher(
+                Arc::new(move |event| {
+                    if let carrick_kernel::el1_zone::HandbackEvent::Ready(record) = event {
+                        publisher.publish_zone_handback(record);
+                    }
+                }),
+                || {
+                    carrick_el1_linux::sched::object_wait::space_access(
+                        zone,
+                        carrick_sched_core::SlotId::new(1),
+                    )
+                    .lower(index);
+                    carrick_kernel::el1_zone::hand_back_completions();
+                },
+            );
+            running = scheduler
+                .try_take(&registration)
+                .unwrap()
+                .expect("owner release wakes the retained member");
+            assert_eq!(running.thread_key(), sibling.thread().key());
+            control.submission.authority =
+                executor::ExecutionLeaseAuthoritySlot::from(Some(running.take_lease()));
+        }
         drop(reserved_fork);
         let resumed = job.poll(&mut engine, &mut control);
         assert!(
@@ -8400,6 +8509,20 @@ mod tests {
             Some(Ok(VcpuLoopOutcome::ThreadDone))
         ));
         assert!(member.host_retirement().is_some());
+        if owner_region.is_some() {
+            assert_eq!(
+                engine.prepared_attempts, 2,
+                "one refusal, one successful preparation"
+            );
+            assert_eq!(
+                engine.prepared_commits, 1,
+                "commit the retained clear exactly once"
+            );
+            assert_eq!(
+                engine.guest_memory[&carrick_el1_linux::mm_portal::test_support::VA],
+                [0; 4]
+            );
+        }
 
         let lease = control.submission.take_execution_lease().unwrap();
         running.restore_lease(lease).unwrap();

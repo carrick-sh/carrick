@@ -3616,6 +3616,15 @@ pub(crate) mod tests {
     }
 
     impl CopyoutOwnerProbe {
+        pub(crate) fn new(
+            wait: carrick_el1_abi::PortalOwnerWait,
+            zone: &carrick_el1_abi::ZoneTables,
+        ) -> Self {
+            Self {
+                wait,
+                zone: zone as *const _ as usize,
+            }
+        }
         fn wait_if_busy(self) -> Option<carrick_el1_abi::PortalOwnerWait> {
             // SAFETY: the VM-free fixture retains the exact carrier region
             // until the test has completed every prepare and resume.
