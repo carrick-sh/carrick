@@ -53,9 +53,16 @@ impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedCont
     fn save_return(
         &self,
         frame: &carrick_el1_abi::TrapFrame,
-        _fpstate: &[u8],
+        fpstate: &[u8],
         context: &mut carrick_sched_core::Aarch64ParkedContext,
     ) -> bool {
+        use zerocopy::FromBytes;
+        let Ok(fp) = carrick_syscall_abi::LinuxFpsimdContext::ref_from_bytes(fpstate) else {
+            return false;
+        };
+        context.native.v = fp.vregs;
+        context.native.fpsr = u64::from(fp.fpsr);
+        context.native.fpcr = u64::from(fp.fpcr);
         context.native.x = frame.x;
         context.native.pc = frame.elr;
         context.native.pstate = frame.spsr;

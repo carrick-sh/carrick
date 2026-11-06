@@ -1224,6 +1224,21 @@ fn production_initial_mm_admits_one_shared_reservation_root() {
 }
 
 #[test]
+fn signal_frame_on_unbacked_altstack_runs_once_and_sigreturn_restores() {
+    let elf = native_exit_fixture("native_signal_stack.S");
+    let outcome = run_pool_fixture(&elf, 64);
+    assert!(
+        outcome.fault_record.is_none(),
+        "signal stack supply stays in ring"
+    );
+    assert_eq!(outcome.run.terminating_signal, None);
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "handler count and restored tkill result"
+    );
+}
+
+#[test]
 fn production_user_page_fault_terminates_with_sigsegv_in_ring() {
     let elf = production_fault_elf();
     let outcome = run_pool_fixture(&elf, 32);

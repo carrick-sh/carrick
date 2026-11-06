@@ -5,7 +5,6 @@ use carrick_guest_arch::{ContextGeneration, FrameGpa};
 use carrick_sched_core::ParkedContextWords;
 
 std::thread_local! {
-    pub(crate) static SIGNAL_PUSH_FAULT: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
     static SIGNAL_COPY_ATTEMPTS: std::cell::RefCell<Vec<(UserVa, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
     static SIGNAL_COPIES: std::cell::RefCell<Vec<(UserVa, Vec<u8>)>> = const {
         std::cell::RefCell::new(Vec::new())
@@ -444,19 +443,6 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
             hook(request.address);
         }
         Ok(())
-    }
-    fn copyout_fault(
-        &self,
-        address: UserVa,
-    ) -> Option<(carrick_guest_arch::FaultInfo, NonZeroU64)> {
-        SIGNAL_PUSH_FAULT.with(|flag| flag.get()).then_some((
-            carrick_guest_arch::FaultInfo {
-                address,
-                access: carrick_guest_arch::Access::Write,
-                present: false,
-            },
-            NonZeroU64::MIN,
-        ))
     }
     fn retire_adapter_operation(
         &mut self,

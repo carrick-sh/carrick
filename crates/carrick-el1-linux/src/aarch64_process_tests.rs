@@ -8756,9 +8756,16 @@ impl crate::signal_delivery::SignalMachine<Aarch64ParkedContext> for ArmWaitSign
     fn save_return(
         &self,
         frame: &carrick_el1_abi::TrapFrame,
-        _fpstate: &[u8],
+        fpstate: &[u8],
         context: &mut Aarch64ParkedContext,
     ) -> bool {
+        use zerocopy::FromBytes;
+        let Ok(fp) = carrick_syscall_abi::LinuxFpsimdContext::ref_from_bytes(fpstate) else {
+            return false;
+        };
+        context.native.v = fp.vregs;
+        context.native.fpsr = u64::from(fp.fpsr);
+        context.native.fpcr = u64::from(fp.fpcr);
         context.native.x = frame.x;
         context.native.pc = frame.elr;
         context.native.pstate = frame.spsr;
@@ -8843,6 +8850,8 @@ fn arm_parked_wait4_signal_wake_replaced_record_discards_restart_context() {
 }
 
 std::thread_local! {
+    pub(super) static SIGNAL_FRAME_WAIT: core::cell::Cell<Option<NativeProcessError>> = const { core::cell::Cell::new(None) };
+    pub(super) static SIGNAL_FRAME_SUPPLY_FAULT: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
     pub(super) static SIGNAL_FRAME_NOT_YET: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 

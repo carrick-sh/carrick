@@ -465,9 +465,9 @@ mod altstack_tests {
             EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
         };
 
-        // Unsupported is the physical service's not-yet-backed refusal. Both
-        // refusals used to make copy_signal_frame(...).is_ok() false.
-        for error in [NativeProcessError::Fault] {
+        // An invalid user address remains the existing terminal delivery fault.
+        {
+            let error = NativeProcessError::Fault;
             let binding = ExecutionBinding {
                 task: EntryTaskKey::from_raw(777),
                 generation: SnapshotGeneration::from_raw(1),

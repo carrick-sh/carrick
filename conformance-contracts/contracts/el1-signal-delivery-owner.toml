@@ -63,6 +63,7 @@ vm_free = [
 ]
 
 embed = [
+  "carrick-vmm-kvm::cpl0_initial_mm::signal_frame_on_unbacked_altstack_runs_once_and_sigreturn_restores",
   "carrick-conformance-next::probes_shard_0::m5_el0_nested_altstack_and_fault_frame_bindings",
   "carrick-embed::el1_sched::el1_sched_pstate_seen_by_the_guest_is_unchanged",
 ]
