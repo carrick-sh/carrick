@@ -2387,10 +2387,13 @@ impl<'a> ProcView<'a> {
                     | LINUX_FUTEX_UNLOCK_PI
                     | LINUX_FUTEX_CMP_REQUEUE
             );
-            let word = match read_futex_word(memory, address.0) {
-                Ok(word) => word,
-                Err(errno) if needs_word => return Ok(DispatchOutcome::Errno { errno }),
-                Err(_) => 0,
+            let word = if needs_word {
+                match read_futex_word(memory, address.0) {
+                    Ok(word) => word,
+                    Err(refusal) => return Ok(*refusal),
+                }
+            } else {
+                0
             };
 
             if matches!(
@@ -2500,7 +2503,11 @@ impl<'a> ProcView<'a> {
                         // is not shared across the fork — the umtx waits/wakes on this
                         // mirror, not on the divergent per-process copies.
                         if location.is_mirror() {
-                            shared_futex_store(location, word);
+                            let fresh = match read_futex_word(memory, address.0) {
+                                Ok(fresh) => fresh,
+                                Err(refusal) => return Ok(*refusal),
+                            };
+                            shared_futex_store(location, fresh);
                         }
                         // Cross-process (MAP_SHARED) wake: route through the
                         // `PlatformFutex::shared_wake` seam (the wake counterpart
