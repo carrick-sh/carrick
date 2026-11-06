@@ -175,6 +175,27 @@ struct FutexCopy<'a, U> {
     task: &'a carrick_el1_abi::CurrentTask,
     user: &'a U,
 }
+
+fn futex_word_refusal(address: UserVa) -> carrick_core::personality::CopyOutcome {
+    #[cfg(target_os = "none")]
+    {
+        carrick_core::personality::atomic_word_refusal(address, carrick_guest_arch::Access::Read)
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        use carrick_core::personality::{CopyOutcome, GuestCopyRequest};
+        if address.raw() & 3 != 0 {
+            CopyOutcome::Fault
+        } else {
+            CopyOutcome::NotYet(GuestCopyRequest {
+                address,
+                len: carrick_guest_arch::GuestLen::new(4),
+                access: carrick_guest_arch::Access::Read,
+            })
+        }
+    }
+}
+
 impl<U: UserWord> carrick_core::personality::UserCopy for FutexCopy<'_, U> {
     fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> carrick_core::personality::CopyOutcome {
         carrick_core::personality::UserCopy::copy_in(
@@ -201,8 +222,8 @@ impl<U: UserWord> carrick_core::personality::UserCopy for FutexCopy<'_, U> {
         address: UserVa,
         value: &mut u32,
     ) -> carrick_core::personality::CopyOutcome {
-        use carrick_core::personality::{CopyOutcome, atomic_word_refusal};
-        let refusal = atomic_word_refusal(address, carrick_guest_arch::Access::Read);
+        use carrick_core::personality::CopyOutcome;
+        let refusal = futex_word_refusal(address);
         if refusal == CopyOutcome::Fault {
             return refusal;
         }
