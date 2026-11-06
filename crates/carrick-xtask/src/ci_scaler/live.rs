@@ -4229,16 +4229,112 @@ printf '{"data":%s}\n200' "$body"
     }
     #[test]
     fn serial_host_ssh_connect_timeout_retries_within_command_budget() {
+        // Non-verdict hang guard for waiting on child exit and pipe EOF
+        // (matching `security_tests` and `lease_supervisor`); command-budget
+        // accounting is driven by a deterministic clock rather than racing
+        // host `execve`/AMFI/scheduler latency against a wall-clock deadline.
+        const SUBPROCESS_HANG_GUARD: Duration = Duration::from_secs(60);
+
+        let run_ssh_with_budget = |ssh: &Path, budget: Duration, per_attempt_cost: Duration| {
+            let simulated_elapsed = std::cell::Cell::new(Duration::ZERO);
+            let mut attempt_budgets = Vec::new();
+            let result = execute_with_clock(
+                &mut Command::new(ssh),
+                &[],
+                budget,
+                || simulated_elapsed.get(),
+                |delay| simulated_elapsed.set(simulated_elapsed.get() + delay),
+                |cmd, inp, attempt_limit| {
+                    attempt_budgets.push(attempt_limit);
+                    let out = execute_with_failure(cmd, inp, SUBPROCESS_HANG_GUARD, |_| None);
+                    simulated_elapsed.set(simulated_elapsed.get() + per_attempt_cost);
+                    out
+                },
+            );
+            (result, attempt_budgets, simulated_elapsed.get())
+        };
+
         let dir = tempfile::tempdir().unwrap();
         let ssh = dir.path().join("ssh");
         let marker =
             crate::remote_accept::shell_quote(&dir.path().join("connected").display().to_string());
-        std::fs::write(&ssh, format!("#!/bin/sh\nif [ ! -e {marker} ]; then touch {marker}; printf 'ssh: connect to host fixture port 22: Connection timed out' >&2; exit 255; fi\nprintf connected\n")).unwrap();
-        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(
-            execute(&mut Command::new(ssh), &[], Duration::from_secs(2)).unwrap(),
-            b"connected"
+        let script = format!(
+            "#!/bin/sh\nif [ ! -e {marker} ]; then : > {marker}; printf 'ssh: connect to host fixture port 22: Connection timed out' >&2; exit 255; fi\nprintf connected\n"
         );
+        // Write the fixture in an unshared descriptor table and run while a
+        // sibling pre-exec fork is live so `ETXTBSY` (os error 26) cannot recur.
+        let (result, attempt_budgets, elapsed) = crate::lock_file::tests::with_unrelated_fork_exec(
+            || {
+                crate::lock_file::tests::write_test_executable(
+                    &ssh,
+                    &script,
+                    std::fs::Permissions::from_mode(0o755),
+                );
+                run_ssh_with_budget(&ssh, Duration::from_secs(2), Duration::from_millis(300))
+            },
+            || {},
+        );
+        assert_eq!(result.unwrap(), b"connected");
+        assert_eq!(
+            attempt_budgets,
+            vec![Duration::from_secs(2), Duration::from_millis(1600)],
+            "second attempt must share the original 2s command budget minus attempt 1 and 100ms backoff"
+        );
+        assert_eq!(elapsed, Duration::from_millis(700));
+
+        // Retries must also stop once the remaining command budget cannot cover
+        // the next backoff delay, rather than sleeping past the budget or
+        // spawning a zero-budget attempt that misclassifies `SshConnect` as `Timeout`.
+        let budget_dir = tempfile::tempdir().unwrap();
+        let failing_ssh = budget_dir.path().join("ssh");
+        crate::lock_file::tests::write_test_executable(
+            &failing_ssh,
+            "#!/bin/sh\nprintf 'ssh: connect to host fixture port 22: Connection timed out' >&2\nexit 255\n",
+            std::fs::Permissions::from_mode(0o755),
+        );
+
+        let (err_50, budgets_50, elapsed_50) =
+            run_ssh_with_budget(&failing_ssh, Duration::from_millis(50), Duration::ZERO);
+        assert!(
+            matches!(
+                err_50.unwrap_err(),
+                ScalerError::Transient(TransientFailure::SshConnect)
+            ),
+            "50ms budget cannot afford 100ms first backoff"
+        );
+        assert_eq!(budgets_50, vec![Duration::from_millis(50)]);
+        assert_eq!(elapsed_50, Duration::ZERO);
+
+        let (err_250, budgets_250, elapsed_250) =
+            run_ssh_with_budget(&failing_ssh, Duration::from_millis(250), Duration::ZERO);
+        assert!(
+            matches!(
+                err_250.unwrap_err(),
+                ScalerError::Transient(TransientFailure::SshConnect)
+            ),
+            "250ms budget affords 100ms first backoff but not 400ms second backoff"
+        );
+        assert_eq!(
+            budgets_250,
+            vec![Duration::from_millis(250), Duration::from_millis(150)]
+        );
+        assert_eq!(elapsed_250, Duration::from_millis(100));
+
+        let (err_600, budgets_600, elapsed_600) =
+            run_ssh_with_budget(&failing_ssh, Duration::from_millis(600), Duration::ZERO);
+        assert!(matches!(
+            err_600.unwrap_err(),
+            ScalerError::Transient(TransientFailure::SshConnect)
+        ));
+        assert_eq!(
+            budgets_600,
+            vec![
+                Duration::from_millis(600),
+                Duration::from_millis(500),
+                Duration::from_millis(100),
+            ]
+        );
+        assert_eq!(elapsed_600, Duration::from_millis(500));
     }
     #[test]
     fn pve_server_errors_are_transient_even_without_json() {

@@ -1614,33 +1614,56 @@ fn transport_failure(
     None
 }
 
-pub(crate) fn execute(
+const SSH_CONNECT_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_millis(100), Duration::from_millis(400)];
+
+fn execute_with_clock(
     command: &mut Command,
     input: &[u8],
     limit: Duration,
+    mut elapsed: impl FnMut() -> Duration,
+    mut sleep: impl FnMut(Duration),
+    mut run_attempt: impl FnMut(&mut Command, &[u8], Duration) -> Result<Vec<u8>, ScalerError>,
 ) -> Result<Vec<u8>, ScalerError> {
     if Path::new(command.get_program())
         .file_name()
         .is_some_and(|name| name == "ssh")
     {
-        let deadline = Instant::now() + limit;
-        for delay in [100, 400] {
-            let attempt_limit = deadline.saturating_duration_since(Instant::now());
-            match execute_with_failure(command, input, attempt_limit, |_| None) {
+        for delay in SSH_CONNECT_RETRY_DELAYS {
+            let attempt_limit = limit.saturating_sub(elapsed());
+            match run_attempt(command, input, attempt_limit) {
                 Err(ScalerError::Transient(TransientFailure::SshConnect)) => {
-                    std::thread::sleep(Duration::from_millis(delay))
+                    if limit.saturating_sub(elapsed()) <= delay {
+                        return Err(ScalerError::Transient(TransientFailure::SshConnect));
+                    }
+                    sleep(delay);
                 }
                 result => return result,
             }
         }
-        return execute_with_failure(
-            command,
-            input,
-            deadline.saturating_duration_since(Instant::now()),
-            |_| None,
-        );
+        let attempt_limit = limit.saturating_sub(elapsed());
+        if attempt_limit.is_zero() {
+            return Err(ScalerError::Transient(TransientFailure::SshConnect));
+        }
+        return run_attempt(command, input, attempt_limit);
     }
-    execute_with_failure(command, input, limit, |_| None)
+    run_attempt(command, input, limit)
+}
+
+pub(crate) fn execute(
+    command: &mut Command,
+    input: &[u8],
+    limit: Duration,
+) -> Result<Vec<u8>, ScalerError> {
+    let start = Instant::now();
+    execute_with_clock(
+        command,
+        input,
+        limit,
+        || start.elapsed(),
+        std::thread::sleep,
+        |cmd, inp, attempt_limit| execute_with_failure(cmd, inp, attempt_limit, |_| None),
+    )
 }
 
 #[cfg(test)]
