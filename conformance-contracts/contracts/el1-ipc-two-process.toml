@@ -6,6 +6,7 @@ id = "kernel.el1.ipc-two-process"
 title = "Two-process blocking pipe and eventfd IPC is served and parked in the guest"
 guest_surfaces = [
   "syscall:read",
+  "syscall:readv",
   "syscall:write",
   "syscall:writev",
   "syscall:eventfd2",
@@ -17,6 +18,7 @@ guest_surfaces = [
   "vmm:hvf",
 ]
 semantic_authority = [
+  "man 2 readv and native Linux oracle: buffers are filled in array order; a scatter fault leaves the incomplete pipe buffer unread while earlier complete buffers remain consumed; imported headers and the committed byte cursor belong to the retained operation",
   "man 2 writev: vectors are consumed in order as one write; pipe atomicity applies to their aggregate length, and imported vector headers survive suspension",
   "man 2 pipe / man 7 pipe: a read on an empty pipe with a live writer blocks until data is written, and returns EOF after every writer closes; writes of at most PIPE_BUF bytes are atomic",
   "man 2 eventfd: a read blocks while the counter is zero and returns the counter value once it is nonzero",
@@ -30,6 +32,7 @@ rationale = "Request/response IPC between forked processes (`pairs` concurrent p
 
 [bindings]
 vm_free = [
+  "carrick-el1-linux::ipc::tests::{el1_ipc_readv_without_native_custody_declines_before_effects,el1_ipc_readv_scatters_and_consumes_each_byte_once,el1_ipc_readv_payload_fault_preserves_the_incomplete_pipe_buffer,two_live_process_pipe_readv_owner_wait_retains_headers_and_cursor,two_live_process_pipe_readv_owner_wait_returns_prefix_if_peer_drains} (shared scatter transfer: ordered output, exact-once consumption, retained headers and cursor through owner wait, disjoint live MMs)",
   "carrick-el1-linux::native_process_runtime::host_test_support::portal_wait_terminal_cancellation_resumes_exact_native_service_waiter (portal service cancellation component: caught-signal interruption retains committed CarrierWork; typed terminal cancellation detaches its exact enrolled portal queue, resumes the waiter and preserves completed result 65; outside the scalar IPC fence)",
   "carrick-el1-linux::ipc::tests::{ipc_operation_slot_native_finish_and_retire_publish,ipc_operation_slot_epoll_retry_publishes} (independent production native completion, exec/exit retirement and epoll Retry release publications)",
   "carrick-kernel::kernel::continuation::ipc::tests::serial_host_zone_operation_slot_release_reaches_bound_source (carrier source binding followed by production host finish and ZoneHostServices release; exact epoch and stale retry)",

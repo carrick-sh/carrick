@@ -1,7 +1,8 @@
 # x86 IPC venue (#1756): red witness and remaining implementation
 
-This slice adds a red-first real-KVM fixture for
-`kernel.el1.ipc-two-process`. It does **not** implement the x86 venue.
+This work adds a red-first real-KVM fixture and shared retained scatter
+copyout for `kernel.el1.ipc-two-process`. It does **not** implement the
+x86 execution venue.
 The native x86_64 Linux oracle runs the same `native_pipe_vectors.S`:
 exit 0, stdout `pipe-vectors=once\n`, no stderr. Child `writev` publishes
 three vectors; parent `readv` scatters them into two vectors. A subsequent
@@ -25,8 +26,13 @@ The remaining implementation should extract a context-neutral IPC execution
 capability from that adapter, preserving one transfer state machine and its
 owned token, pin, imported vectors and byte cursor. ARM and x86 should supply
 only context capture, resumption PC and scheduler handoff mechanics. The
-current adapter admits scalar read/write and writev but excludes readv;
-readv must be added to the shared operation and retained copyout path.
+adapter now admits scalar read/write and both vector directions on pipes.
+Readv requires native ring custody (legacy handback has only contiguous
+output permits). Without that owner it declines before any pin or effect.
+Readv uses the same imported headers and logical byte cursor as writev,
+and the same staged pipe transaction as scalar read. A failed scatter output leaves its incomplete pipe buffer unread; earlier
+complete buffers keep their committed cursor. The vector range walker remains one binary
+search followed by the touched vectors, without rescanning earlier headers.
 The x86 carrier also needs the shared IPC authority mapped and published,
 with complete descriptor namespace admission and fork/exit custody.
 
@@ -47,3 +53,25 @@ On the admitted base, real KVM runs the fixture and returns guest exit 90
 creation precondition, **not** a reached two-process vector transfer failure.
 The native oracle reaches and passes every stage. Do not claim vector parity
 from this red run; later witnesses must reach the transfer and count it.
+
+## Shared scatter copyout prerequisite
+
+`el1_ipc_readv_scatters_and_consumes_each_byte_once` fails before the change
+with `Forward` instead of a returned six-byte result. It passes after shared
+scatter copyout is enabled. The production adapter tests also cover a payload
+fault after two delivered bytes and an owner wait after one delivered page.
+A fresh native Linux oracle requires errno 14 with all six bytes unread for
+a fault inside the first buffer, or a 4096-byte result with the failing
+six-byte buffer unread after one complete buffer. The fault witness was red
+at result 2 rather than errno 14 before committing scatter per pipe buffer.
+The latter keeps two live MMs, changes the original guest vector headers
+while parked, and checks exact cursor resumption or a short prefix if the peer
+drains the source. Normal operation retirement reclaims the vector allocation.
+These are VM-free adapter proofs, not x86 execution or signed HVF evidence.
+
+Readv's shared family route cannot enter the scalar-file fallback: an iovec
+array is not a byte buffer. A declined non-venue descriptor stays under the
+existing counted-refusal policy. No crossing allowlist or lock order changes
+are made by this prerequisite. X86 still supplies no IPC venue or matching
+execution capability, so its acceptance witness remains red at pipe2 and its
+writev counted-ENOSYS invariant remains unchanged.
