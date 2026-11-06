@@ -437,44 +437,6 @@ pub trait AnonymousRetirementEditor {
 #[cfg(target_os = "none")]
 pub struct HardwareAnonymousPermissionEditor;
 
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
-fn publish_current_mm_tlb_edit(
-    ttbr0: u64,
-) -> (
-    &'static carrick_el1_abi::ZoneTables,
-    carrick_guest_arch::SlotId,
-    u64,
-    u64,
-) {
-    let Some(raw_slot) =
-        carrick_el1_abi::el1_stack_slot(crate::substrate::sched::hw::read_current_sp())
-    else {
-        crate::substrate::sched::hw::fatal_entry_binding(
-            carrick_el1_abi::EntryBindingFatalReason::CpuStackSlot,
-        )
-    };
-    let slot = carrick_guest_arch::SlotId::new(raw_slot as u8);
-    let zone = unsafe { &*(carrick_el1_abi::EL1_ZONE_BASE as *const carrick_el1_abi::ZoneTables) };
-    let mm = zone.installed_space(slot);
-    let Some(index) = zone.spaces.find(mm) else {
-        crate::substrate::sched::hw::fatal_entry_binding(
-            carrick_el1_abi::EntryBindingFatalReason::EntryBinding,
-        )
-    };
-    let Some(grant) = zone.spaces.grant(index, mm) else {
-        crate::substrate::sched::hw::fatal_entry_binding(
-            carrick_el1_abi::EntryBindingFatalReason::EntryBinding,
-        )
-    };
-    if grant.ttbr0 != ttbr0 {
-        crate::substrate::sched::hw::fatal_entry_binding(
-            carrick_el1_abi::EntryBindingFatalReason::EntryBinding,
-        )
-    }
-    let publication = zone.spaces.note_tlb_edit(index);
-    (zone, slot, mm, publication)
-}
-
 #[cfg(target_os = "none")]
 impl AnonymousPermissionEditor for HardwareAnonymousPermissionEditor {
     fn protect_and_invalidate(
@@ -497,10 +459,8 @@ impl AnonymousPermissionEditor for HardwareAnonymousPermissionEditor {
                 edit,
             )?;
         }
-        let (zone, slot, mm, publication) = publish_current_mm_tlb_edit(ttbr0);
         let mut cpu = crate::substrate::sched::HardwareCpu;
         crate::substrate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
-        zone.cover_cow(slot, mm, publication);
         Ok(())
     }
 }
@@ -546,10 +506,8 @@ impl AnonymousRetirementEditor for HardwareAnonymousRetirementEditor {
         if !residency.commit() {
             return Err(GuestRetirementError::RollbackFailed);
         }
-        let (zone, slot, mm, publication) = publish_current_mm_tlb_edit(ttbr0);
         let mut cpu = crate::substrate::sched::HardwareCpu;
         crate::substrate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
-        zone.cover_cow(slot, mm, publication);
         Ok(())
     }
 }
@@ -1085,7 +1043,7 @@ pub fn serve_delegated_anonymous<
     ) else {
         return refuse(pending, &mut model, Leave::NoGrant);
     };
-    let Some(_editor_guard) = spaces.try_begin_edit(index, mm_key, owner) else {
+    let Some(editor_guard) = spaces.try_begin_edit(index, mm_key, owner) else {
         return refuse(pending, &mut model, Leave::EditorBusy);
     };
     editor.bind_operation(request.sequence);
@@ -1172,7 +1130,10 @@ pub fn serve_delegated_anonymous<
                 carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
                 edit,
             ) {
-                Ok(()) => None,
+                Ok(()) => {
+                    editor_guard.note_tlb_edit();
+                    None
+                }
                 Err(GuestPermissionEditError::RollbackFailed) => {
                     panic!("EL1 anonymous permission rollback failed")
                 }
@@ -1196,7 +1157,10 @@ pub fn serve_delegated_anonymous<
                 carrick_guest_arch::UserVa::new(start),
                 carrick_guest_arch::GuestLen::new(run_len),
             ) {
-                Ok(()) => Some(slot),
+                Ok(()) => {
+                    editor_guard.note_tlb_edit();
+                    Some(slot)
+                }
                 Err(GuestRetirementError::RollbackFailed) => {
                     panic!("EL1 anonymous retirement rollback failed")
                 }
@@ -1314,7 +1278,7 @@ pub fn try_serve_munmap<E: AnonymousRetirementEditor>(
     else {
         return MunmapDisposition::Forward;
     };
-    let Some(_guard) = spaces.try_begin_edit(index, mm_key, owner) else {
+    let Some(guard) = spaces.try_begin_edit(index, mm_key, owner) else {
         return MunmapDisposition::Forward;
     };
     let Some(generation) = AnonymousEditGeneration::resident() else {
@@ -1327,7 +1291,10 @@ pub fn try_serve_munmap<E: AnonymousRetirementEditor>(
         carrick_guest_arch::UserVa::new(address),
         carrick_guest_arch::GuestLen::new(len),
     ) {
-        Ok(()) => MunmapDisposition::Retired,
+        Ok(()) => {
+            guard.note_tlb_edit();
+            MunmapDisposition::Retired
+        }
         Err(GuestRetirementError::BadRange) => MunmapDisposition::Return(-EINVAL),
         Err(
             GuestRetirementError::TableOutsidePrimary
@@ -1409,13 +1376,17 @@ pub fn try_serve_mprotect<E: AnonymousPermissionEditor>(
         edit,
     ) {
         Ok(()) if journal_room => {
+            guard.note_tlb_edit();
             // The host applies this, in order, before it next reads the
             // MM's VMA rows; no exit now.
             let recorded = guard.journal_protect(address, address + len, (prot & 7) as u8);
             debug_assert!(recorded.is_ok());
             MprotectDisposition::Return(0)
         }
-        Ok(()) => MprotectDisposition::ReturnWithWork,
+        Ok(()) => {
+            guard.note_tlb_edit();
+            MprotectDisposition::ReturnWithWork
+        }
         Err(GuestPermissionEditError::BadRange) => MprotectDisposition::Return(-EINVAL),
         Err(GuestPermissionEditError::PermissionWidening) => MprotectDisposition::Forward,
         Err(

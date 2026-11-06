@@ -38,6 +38,7 @@ structural_budgets = []
 
 [bindings]
 vm_free = [
+  "carrick-sched-core::tests::slot_cow_coverage_survives_rebinding_and_rejects_retired_asid_identity",
   "carrick-runtime::vcpu_loop::executor::tests::{serial_host_process_exit_retires_abi_born_sibling_before_direct_load,serial_host_group_close_retires_abi_born_sibling_during_direct_load,serial_host_missing_abi_born_sibling_without_terminal_intent_fails_closed} (actual ABI birth and retained control, queued process-exit cancellation and native terminal release during a held load; zero retired-member guest entries, one terminal settlement, all workers joined; absence without terminal intent remains fatal)",
   "carrick-el1-linux::aarch64_process_tests::arm_unregistered_host_cancel_commits_terminal_intent_before_record_release (Busy once then successful native release)",
   "carrick-el1-linux::aarch64_process_tests::exit_group_hang_tests::serial_host_arm_exit_group_unregistered_sibling_wakes_parked_host (production exit_group, enrolled exact record retirement, nonperiodic waits, real host receipts and one Closing wake)",

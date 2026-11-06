@@ -259,6 +259,13 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceEditor<'a, C> {
         }
     }
 
+    /// Publish a completed descriptor edit while retaining the admission that
+    /// excludes host root retirement. A pause may have raised the gate while
+    /// waiting for this editor; publication must not request a fresh grant.
+    pub fn note_tlb_edit(&self) -> u64 {
+        self.entry.cow_published.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
     pub fn mmap_next(&self) -> u64 {
         self.entry.mmap_next.load(Ordering::Acquire)
     }
