@@ -738,6 +738,7 @@ surfaces = [
   { path = "crates/carrick-personality-linux/src/identity/credential_tests.rs", contract = "kernel.el1.thread-lifecycle" },
   { path = "crates/carrick-personality-linux/src/ipc.rs", contract = "core.entry.completion" },
   { path = "crates/carrick-personality-linux/src/ipc.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-personality-linux/src/ipc.rs", contract = "kernel.memory.owner-wait" },
   { path = "crates/carrick-personality-linux/src/ipc/namespace.rs", contract = "kernel.ipc.permission-classes" },
   { path = "crates/carrick-personality-linux/src/lifecycle.rs", contract = "core.entry.completion" },
   { path = "crates/carrick-personality-linux/src/lifecycle.rs", contract = "kernel.el1.ipc-two-process" },

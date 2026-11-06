@@ -162,6 +162,13 @@ fn x86_sysv_ipc_routes_to_ring_and_zeroes_abi_padding_bytes() {
         }
     }
     impl ProcessIpcVenue for RouteVenue {
+        fn complete_output(
+            &mut self,
+            _: carrick_personality_linux::ipc::IpcOutput,
+        ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
+            unreachable!("route fixture never refuses output")
+        }
+
         fn msgget(&mut self, key: i32, msgflg: i32) -> Result<i32, i64> {
             self.ns
                 .msgget(&self.creds, key, msgflg)
@@ -275,6 +282,14 @@ fn x86_sysv_ipc_routes_to_ring_and_zeroes_abi_padding_bytes() {
         }
     }
     impl<'a> IpcNative<'a> for X86IpcEnv<'_> {
+        fn retain_output(
+            &mut self,
+            _: carrick_core::user_copy::GuestCopyRequest,
+            _: carrick_personality_linux::ipc::IpcOutput,
+        ) -> carrick_personality_linux::ipc::IpcOutcome {
+            unreachable!("route fixture never refuses output")
+        }
+
         fn arguments(&self) -> [u64; 6] {
             self.args
         }

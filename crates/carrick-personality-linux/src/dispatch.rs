@@ -497,6 +497,15 @@ fn serve_family<'a, C: EntryContext + 'a>(
                 Some((result, original)),
             ),
             crate::ipc::IpcOutcome::Suspended => (FamilyCompletion::Suspended, None),
+            crate::ipc::IpcOutcome::HostCustody => (FamilyCompletion::HostCustody, None),
+            crate::ipc::IpcOutcome::ReturnedWithWork(result) => (
+                FamilyCompletion::CompleteWithWork(result.raw()),
+                Some((result, original)),
+            ),
+            crate::ipc::IpcOutcome::Redispatch => (FamilyCompletion::FrameRestored, None),
+            crate::ipc::IpcOutcome::Transferred { result, .. } => {
+                (FamilyCompletion::Switched(result.raw()), None)
+            }
         };
         return FamilyRun {
             completion,
