@@ -6,8 +6,6 @@ use crate::cpl0_entry::{CpuBinding, NativeFrame};
 use crate::cpl0_scheduler::XsaveArea;
 #[cfg(target_os = "none")]
 use crate::cpl0_scheduler::{NativeTlsRegister, read_tls, write_tls};
-#[cfg(target_os = "none")]
-use alloc::vec::Vec;
 #[cfg(not(target_os = "none"))]
 use carrick_abi::LINUX_EFAULT;
 use carrick_core_abi::EntryMmKey;
@@ -28,6 +26,8 @@ use carrick_sched_core::{
 #[cfg(target_os = "none")]
 use carrick_syscall_abi::LINUX_EFAULT;
 use core::sync::atomic::{AtomicU16, Ordering};
+#[cfg(target_os = "none")]
+use rust_alloc::vec::Vec;
 
 /// Terminal native-custody failures after guest mutation. These are kernel
 /// invariant errors, never a request to replay the syscall on the host.
