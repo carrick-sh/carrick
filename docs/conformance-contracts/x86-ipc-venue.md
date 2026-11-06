@@ -152,7 +152,34 @@ unmapped simulated output failed with errno 14; that fixture error was
 corrected before recording the transport red result.
 
 This step does not supply the x86 execution adapter, IPC mapping or descriptor
-admission. Native final-description release still uses the existing shared
-scheduler wake helper, whose task publication must be bound to x86's layout
-when the x86 venue is integrated. Pipe creation and the real-KVM served
+admission. Final-description release transport is now explicit as described below;
+the x86 venue must still supply its task publication and wake mechanics. Pipe creation and the real-KVM served
 fixture remain unresolved; no x86 pipe-service claim is made.
+
+
+## Execution-owned final endpoint release
+
+Native refusal cleanup and native service cancellation now receive an explicit
+wake-effects callback alongside detached queue completion. Dropping the final
+operation pin releases the backing through the shared fd/pipe owner and sends
+its readiness wakes through that callback. `IpcExecution::deliver_release_wake`
+is required for an execution adapter. ARM supplies its existing scheduler
+transport, including native descriptor close/dup and cancellation callers.
+The shared release owner retains its lane notification and deferred-work policy;
+no object/table lock survives into transport delivery. The bounded lane and
+epoll traversal is unchanged.
+
+`native_final_pipe_pin_release_uses_execution_transport` enters the public
+transfer adapter on an empty pipe. Its execution venue closes the numeric read
+descriptor after the operation has pinned it, then refuses park. Production
+native refusal cleanup returns counted ENOSYS (38), retires the final reader
+reference and must invoke the execution's release-wake callback. Before the
+callback is wired, it reaches the same result and endpoint retirement but fails
+`final endpoint release bypassed execution transport`. The test binds the
+writer notification lane without inventing a blocked writer. It proves native
+cleanup transport, not two-process guest scheduling or an x86 execution venue.
+An independent callback counter separates final release from ordinary queue
+completion, which may also occur during the call.
+
+The production x86 adapter, shared IPC mapping, complete namespace admission,
+pipe creation and passing real-KVM served witness remain required for #1756.
