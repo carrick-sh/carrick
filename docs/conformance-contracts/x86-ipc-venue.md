@@ -1,5 +1,23 @@
 # x86 IPC venue (#1756): red witness and remaining implementation
 
+## Continuation status
+
+The earlier prerequisite commits have been preserved and rebased onto the
+admitted main. This continuation has not implemented the missing production
+venue, and no external issue or PR blocks that implementation. Acceptance
+remains unmet; the branch must not be treated as ready to land.
+
+The native assembly oracle still exits 0 with `pipe-vectors=once` and empty
+stderr. The freestanding CPL0 build, KVM compile check, Linux and macOS cross
+checks, contract-change check and authority-debt source check pass. The regular
+host-library test run is incomplete: `carrick-el1-linux` terminated with
+SIGKILL before reporting a result. Its serial partition passes all 30 tests,
+and the x86 descriptor-region suite passes all six tests. These checks do not
+prove x86 pipe service, replace the required real-KVM positive witness, or
+confer signed HVF or Docker acceptance.
+
+## Preserved prerequisites
+
 This work adds a red-first real-KVM fixture and shared retained scatter
 copyout for `kernel.el1.ipc-two-process`. It does **not** implement the
 x86 execution venue.
