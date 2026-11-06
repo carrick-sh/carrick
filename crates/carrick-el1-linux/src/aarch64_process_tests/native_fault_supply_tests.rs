@@ -4660,6 +4660,13 @@ fn arm_clone_tid_output_refuses_before_sibling_in_flight_grant_publication() {
         ),
         Ok(TransferStep::Selected(_))
     ));
+    clone_frame.elr = 0x402000;
+    clone_frame.x[0] = clone_flags;
+    clone_frame.x[1] = child_stack;
+    clone_frame.x[2] = parent_tid_va;
+    clone_frame.x[3] = 0;
+    clone_frame.x[4] = child_tid_va;
+    clone_frame.x[8] = 220;
     assert_eq!(
         arm_call(fixture, fixture.control, &mut service, &mut clone_frame).unwrap(),
         carrick_personality_linux::dispatch::CompletionRoute::WithWork,
