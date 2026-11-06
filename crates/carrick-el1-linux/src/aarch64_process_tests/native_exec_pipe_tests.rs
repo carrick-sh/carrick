@@ -111,6 +111,12 @@ fn serial_host_native_fork_exec_pipe_writer_reaches_its_parent() {
     };
     let child_binding = runtime.task_binding(child).unwrap();
     let parent_binding = runtime.task_binding(parent).unwrap();
+    // SAFETY: the stopped fixture exclusively owns the parent's current
+    // record. Supply the context save normally performed before preemption;
+    // the root fixture's default words do not authenticate its address space.
+    unsafe {
+        *fixture.zone.record(parent_binding.record.id).ctx_mut() = parent_binding.words;
+    }
     assert!(
         fixture
             .zone
@@ -286,7 +292,7 @@ fn serial_host_native_fork_exec_pipe_writer_reaches_its_parent() {
                 &binding.words,
                 &mut service,
             )
-            .unwrap();
+            .unwrap_or_else(|error| panic!("native entry nr={nr}, fd={fd}: {error:?}"));
         let route = crate::dispatch::dispatch_syscall_with_native(
             &mut frame,
             &counters,
@@ -308,10 +314,16 @@ fn serial_host_native_fork_exec_pipe_writer_reaches_its_parent() {
             None,
             |_| core::ptr::null_mut(),
         );
-        assert_eq!(
-            route,
-            carrick_personality_linux::dispatch::CompletionRoute::Served,
-            "production native IPC dispatch"
+        // Completed in-ring I/O can still owe native return-event work.
+        // This fixture checks committed results and pipe bytes below, without
+        // modelling the carrier's return transport. Neither route replays I/O.
+        assert!(
+            matches!(
+                route,
+                carrick_personality_linux::dispatch::CompletionRoute::Served
+                    | carrick_personality_linux::dispatch::CompletionRoute::WithWork
+            ),
+            "production native IPC dispatch: {route:?}, nr={nr}"
         );
         frame.x[0]
     };
