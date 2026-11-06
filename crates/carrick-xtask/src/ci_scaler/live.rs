@@ -4335,6 +4335,51 @@ printf '{"data":%s}\n200' "$body"
             ]
         );
         assert_eq!(elapsed_600, Duration::from_millis(500));
+
+        // If scheduler contention causes the first backoff sleep itself to wake
+        // at or past the command budget, `execute_with_clock` must still return
+        // `SshConnect` rather than spawning a zero-budget second attempt.
+        let overslept = std::cell::Cell::new(Duration::ZERO);
+        let mut overslept_budgets = Vec::new();
+        let err_overslept = execute_with_clock(
+            &mut Command::new(&failing_ssh),
+            &[],
+            Duration::from_millis(150),
+            || overslept.get(),
+            |_delay| overslept.set(Duration::from_millis(160)),
+            |cmd, inp, attempt_limit| {
+                overslept_budgets.push(attempt_limit);
+                execute_with_failure(cmd, inp, SUBPROCESS_HANG_GUARD, |_| None)
+            },
+        );
+        assert!(matches!(
+            err_overslept.unwrap_err(),
+            ScalerError::Transient(TransientFailure::SshConnect)
+        ));
+        assert_eq!(overslept_budgets, vec![Duration::from_millis(150)]);
+
+        // Non-`ssh` commands must never enter the `SshConnect` retry loop.
+        let failing_curl = budget_dir.path().join("curl");
+        crate::lock_file::tests::write_test_executable(
+            &failing_curl,
+            "#!/bin/sh\nprintf 'ssh: connect to host fixture port 22: Connection timed out' >&2\nexit 255\n",
+            std::fs::Permissions::from_mode(0o755),
+        );
+        let (err_non_ssh, budgets_non_ssh, elapsed_non_ssh) =
+            run_ssh_with_budget(&failing_curl, Duration::from_secs(2), Duration::ZERO);
+        assert!(matches!(
+            err_non_ssh.unwrap_err(),
+            ScalerError::CommandFailed(_)
+        ));
+        assert_eq!(budgets_non_ssh, vec![Duration::from_secs(2)]);
+        assert_eq!(elapsed_non_ssh, Duration::ZERO);
+
+        // Also exercise the public `execute` entry point on the connected
+        // fixture (marker already present, so zero backoff sleep occurs).
+        assert_eq!(
+            execute(&mut Command::new(&ssh), &[], SUBPROCESS_HANG_GUARD).unwrap(),
+            b"connected"
+        );
     }
     #[test]
     fn pve_server_errors_are_transient_even_without_json() {

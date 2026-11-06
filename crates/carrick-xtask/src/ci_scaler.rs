@@ -1629,23 +1629,26 @@ fn execute_with_clock(
         .file_name()
         .is_some_and(|name| name == "ssh")
     {
-        for delay in SSH_CONNECT_RETRY_DELAYS {
-            let attempt_limit = limit.saturating_sub(elapsed());
+        let mut delays = SSH_CONNECT_RETRY_DELAYS.into_iter();
+        let mut attempt_limit = limit.saturating_sub(elapsed());
+        loop {
             match run_attempt(command, input, attempt_limit) {
                 Err(ScalerError::Transient(TransientFailure::SshConnect)) => {
+                    let Some(delay) = delays.next() else {
+                        return Err(ScalerError::Transient(TransientFailure::SshConnect));
+                    };
                     if limit.saturating_sub(elapsed()) <= delay {
                         return Err(ScalerError::Transient(TransientFailure::SshConnect));
                     }
                     sleep(delay);
+                    attempt_limit = limit.saturating_sub(elapsed());
+                    if attempt_limit.is_zero() {
+                        return Err(ScalerError::Transient(TransientFailure::SshConnect));
+                    }
                 }
                 result => return result,
             }
         }
-        let attempt_limit = limit.saturating_sub(elapsed());
-        if attempt_limit.is_zero() {
-            return Err(ScalerError::Transient(TransientFailure::SshConnect));
-        }
-        return run_attempt(command, input, attempt_limit);
     }
     run_attempt(command, input, limit)
 }
