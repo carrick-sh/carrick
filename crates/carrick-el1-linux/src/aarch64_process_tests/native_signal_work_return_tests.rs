@@ -9,47 +9,55 @@ use zerocopy::{FromBytes, IntoBytes};
 
 #[test]
 fn arm_unblock_resident_null_oldset_delivers_before_work_return() {
-    resident_signal_work_return(1, false, None, false, None);
+    resident_signal_work_return(1, false, None, false, None, true);
 }
 #[test]
 fn arm_unblock_resident_oldset_delivers_before_work_return() {
-    resident_signal_work_return(1, true, None, false, None);
+    resident_signal_work_return(1, true, None, false, None, true);
+}
+#[test]
+fn arm_host_owned_unblock_null_oldset_delivers_before_work_return() {
+    resident_signal_work_return(1, false, None, false, None, false);
+}
+#[test]
+fn arm_host_owned_unblock_resident_oldset_delivers_before_work_return() {
+    resident_signal_work_return(1, true, None, false, None, false);
 }
 #[test]
 fn arm_setmask_resident_null_oldset_delivers_before_work_return() {
-    resident_signal_work_return(2, false, None, false, None);
+    resident_signal_work_return(2, false, None, false, None, true);
 }
 #[test]
 fn arm_setmask_resident_oldset_delivers_before_work_return() {
-    resident_signal_work_return(2, true, None, false, None);
+    resident_signal_work_return(2, true, None, false, None, true);
 }
 
 #[test]
 fn arm_completed_carrier_work_delivers_before_user_return() {
-    resident_signal_work_return(1, false, Some(false), false, None);
+    resident_signal_work_return(1, false, Some(false), false, None, true);
 }
 #[test]
 fn arm_interrupted_crossing_delivers_before_user_return() {
-    resident_signal_work_return(1, false, Some(true), false, None);
+    resident_signal_work_return(1, false, Some(true), false, None, true);
 }
 
 #[test]
 fn arm_interrupted_crossing_sa_restart_restores_original_svc() {
-    resident_signal_work_return(1, false, Some(true), true, None);
+    resident_signal_work_return(1, false, Some(true), true, None, true);
 }
 #[test]
 fn arm_completed_carrier_work_sa_restart_preserves_committed_result() {
-    resident_signal_work_return(1, false, Some(false), true, None);
+    resident_signal_work_return(1, false, Some(false), true, None, true);
 }
 
 #[test]
 fn arm_carrier_work_does_not_manufacture_pending_host_work() {
-    resident_signal_work_return(1, false, Some(false), false, Some(false));
+    resident_signal_work_return(1, false, Some(false), false, Some(false), true);
 }
 
 #[test]
 fn arm_carrier_work_preserves_real_pending_host_work_and_parks() {
-    resident_signal_work_return(1, false, Some(false), false, Some(true));
+    resident_signal_work_return(1, false, Some(false), false, Some(true), true);
 }
 
 fn resident_signal_work_return(
@@ -58,6 +66,7 @@ fn resident_signal_work_return(
     service: Option<bool>,
     restart: bool,
     pending_only: Option<bool>,
+    native_owned: bool,
 ) {
     let fixture: &'static Fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let source = BornInZoneSource {
@@ -102,10 +111,12 @@ fn resident_signal_work_return(
         peer.id
     );
     run_as(fixture, 42, 12, 102, peer_control);
-    // Adopt the selected record into native execution, as the running owner
-    // does before an in-ring service can return directly to user space.
-    assert!(fixture.zone.mark_native_owned(peer.id));
-    assert!(fixture.zone.record(peer.id).is_native_owned());
+    if native_owned {
+        // Adopt the selected record into native execution, as the running owner
+        // does before an in-ring service can return directly to user space.
+        assert!(fixture.zone.mark_native_owned(peer.id));
+    }
+    assert_eq!(fixture.zone.record(peer.id).is_native_owned(), native_owned);
     // SAFETY: switch_in_full gave this lane exclusive sibling custody.
     unsafe {
         let context = fixture.zone.record(peer.id).ctx_mut();
