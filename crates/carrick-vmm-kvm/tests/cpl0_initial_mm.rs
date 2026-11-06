@@ -1657,6 +1657,10 @@ fn in_zone_child_pipe2_and_unfaulted_cow_read_matches_native_oracle() {
 }
 
 fn private_file_fixture(cow: bool) {
+    private_file_fixture_with(cow, &[], 0);
+}
+
+fn private_file_fixture_with(cow: bool, scenario: &[&str], open_flags: u64) {
     let dir = tempfile::tempdir().expect("private source directory");
     let path = dir.path().join("source");
     let mut bytes = vec![0x37; 4096];
@@ -1665,6 +1669,7 @@ fn private_file_fixture(cow: bool) {
     std::fs::write(&path, &bytes).expect("private source file");
     let define = format!("-DFILE_PATH=\"{}\"", path.display());
     let mut flags = vec![define.as_str()];
+    flags.extend_from_slice(scenario);
     if cow {
         flags.push("-DCOW_WRITE");
     }
@@ -1679,11 +1684,17 @@ fn private_file_fixture(cow: bool) {
         .arg(&oracle)
         .output()
         .expect("bounded native oracle");
-    assert!(
-        native.status.success(),
-        "native oracle: {:?}",
-        native.status
-    );
+    let expects_bus = scenario.contains(&"-DEXPECT_BUS");
+    if expects_bus {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(native.status.signal(), Some(7), "native SIGBUS control");
+    } else {
+        assert!(
+            native.status.success(),
+            "native oracle: {:?}",
+            native.status
+        );
+    }
     let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
     dispatcher.set_fs_backend(Box::new(
         carrick_vfs::fs_backend::HostFsBackend::from_path(std::path::Path::new("/"))
@@ -1701,7 +1712,14 @@ fn private_file_fixture(cow: bool) {
             &root,
             carrick_kernel::dispatch::SyscallRequest::new(
                 56,
-                carrick_kernel::compat::SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+                carrick_kernel::compat::SyscallArgs::from([
+                    (-100_i64) as u64,
+                    0x4000,
+                    open_flags,
+                    0,
+                    0,
+                    0,
+                ]),
             ),
             &mut setup_memory,
             &carrick_kernel::compat::CompatReporter::default(),
@@ -1724,7 +1742,8 @@ fn private_file_fixture(cow: bool) {
     )
     .expect("private mapping production runtime");
     assert_eq!(
-        outcome.run.exit_code, 0,
+        outcome.run.exit_code,
+        if expects_bus { 135 } else { 0 },
         "31=open, 32=mmap, 33=bytes; run={:?}",
         outcome.run
     );
@@ -1739,4 +1758,23 @@ fn private_file_read_only_faults_in_source_bytes() {
 #[test]
 fn private_file_write_preserves_source_bytes() {
     private_file_fixture(true);
+}
+
+#[test]
+fn private_file_write_only_mapping_returns_eacces() {
+    private_file_fixture_with(
+        false,
+        &["-DEXPECT_ACCESS_FAILURE"],
+        carrick_abi::LINUX_O_WRONLY,
+    );
+}
+
+#[test]
+fn private_file_child_first_touch_after_parent_unmap() {
+    private_file_fixture_with(true, &["-DCHILD_FIRST_TOUCH"], 0);
+}
+
+#[test]
+fn private_file_page_beyond_eof_delivers_sigbus() {
+    private_file_fixture_with(false, &["-DEXPECT_BUS"], 0);
 }

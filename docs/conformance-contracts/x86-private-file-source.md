@@ -1,8 +1,11 @@
 # x86 private file source binding (#1722)
 
-The two production KVM witnesses in `cpl0_initial_mm` remain red: their native
-controls exit 0, but Carrick returns mmap errno 38 and exits 32. This work is
-not ready to land. Neither libc loading nor echo nor Python startup is proven.
+The production KVM read-only and private-write witnesses now pass. The same
+shared mapping handler and file-fault supply serve the x86 calls. Acceptance
+is still incomplete: prepared-edit contention has no owned suspension binding,
+the stronger fork-lifetime case stops at parent close errno 9,
+and a CLI `/bin/echo ok` attempt exits 127 without a host-file crossing.
+Neither libc loading nor Python startup is proven.
 
 ## Shared mapping and source transport
 
@@ -39,35 +42,67 @@ original authority's bytes. Copying its directory or pool would create a
 second allocator/descriptor authority and is incorrect. X86 publication is
 explicitly carrier-scoped instead of using ARM's process-global registration.
 
-## Remaining resource prerequisite
+## Shared physical source projection
 
-Each real KVM witness now counts one `host-file` crossing, proving staging
-and synchronous transport are reached. Neither reaches a physical file-page
-grant. The remaining refusal is in shared host-file resource service:
-`FileTable::publish_ipc` exports preopened host slots as `IpcPhysicalHold`,
-whereas `serve_native_resource` accepts `NativeOpenFile` (and implicit stdio).
-The x86 forwarded open path also installs host slots; ARM native opens install
-`NativeOpenFile` through `NativeOpenSink`.
+`FileTable::publish_ipc` exports host slots as `IpcPhysicalHold`, while native
+opens use `NativeOpenFile`. Both now reach `native_map_reference`, which checks
+read access and registers the same retained private source. The projection
+shares the original physical lifetime, backing, identity and seals, but owns
+no fd reference, cursor authority or publication pin. Its original-description
+backlink is weak. Mapping admission recalls a live original delegation before
+incrementing the shared mapping count under the physical transition lock.
+The pinned IPC resource authorizes admission after the host numeric fd closes;
+final resource release still waits for both IPC holds and mappings to end.
+Only MapPrivate is projected: unrelated host operations retain their existing
+service admission.
 
-Do not fix this with a numeric host-fd lookup, a copied namespace, a strong
-FileDescription backlink in IpcPhysicalHold (which cycles through publication),
-or by changing the witnesses to bypass x86 open authority. Integration needs
-a shared physical resource/source projection or shared native-open service
-admission, with the same functional lifetime and delegation recall rules.
+Do not replace this with a numeric host-fd lookup, copied namespace, or a
+strong original-description backlink (which cycles through publication).
+The VM-free production-service witness closes the host fd, proves the original
+description is gone and then reads the retained bytes. Disabling the physical
+resource branch reproduces `NativeHostFileRefusal` in that witness.
 
-## Review and evidence still owed
+File grants use the existing authenticated descriptor/inventory publisher.
+They are excluded from the anonymous-only evidence population; that recorder
+continues to reject a file-backed input rather than miscounting file pages as
+anonymous pages.
 
-The cross-crate lock order is capture under physical custody, release custody
-for host service/file I/O, then reacquire and revalidate exact execution/MM/root
-before publishing. Independent source review covered the installation and
-retained storage, confirmed the IPC/dynamic-grant aperture overlap fix, and
-requests changes for the unresolved resource refusal and these missing proofs.
+## Witnesses and remaining acceptance
 
-The no-backing completion leaves an authenticated file selection pending;
-the fault entry cancels it and delivers SIGBUS. EOF/truncation and inaccessible
-source behavior need production witnesses after source staging is accepted.
-Prepared-edit contention still needs an owned suspension binding: the existing
-x86 adapter forwards `PreparedConflict` and has no `park_prepared`
-implementation. A real child must also fault an untouched file page after its
-parent unmaps/exits, then write privately without changing the source. The
-single-MM read-only and private-write cases cannot prove that fork lifetime.
+`cpl0_initial_mm` exercises read-only first-touch, private writes with an
+unchanged source, write-only fd rejection (errno 13), beyond-EOF SIGBUS, and
+a red child first-touch case after the parent unmaps. The child case blocks SIGUSR1 before
+fork; the parent unmaps and closes its fd before signalling. The child closes
+its inherited fd before its bounded five-second sigtimedwait, then faults and
+writes the mapping. The host compares the file bytes after both tasks finish.
+Every fixture also runs under a bounded native Linux control.
+The strengthened child case currently fails at the parent close with errno 9
+(exit 38), before the signal and child first-touch. The earlier case passed
+when close results were unchecked and the child kept its fd; that result is
+not evidence for mapping-only lifetime. Keep the red case as an acceptance
+blocker rather than weakening its fd-lifetime requirements.
+
+The shared host-source witness samples a partial final page, truncates the
+already retained file, and requires inaccessible supply past its new EOF. This
+proves source revalidation, not a real-KVM truncation verdict. A guest
+ftruncate-based KVM attempt stopped at ENOSYS before touching the mapping.
+The real-KVM EOF witness separately proves SIGBUS when a file page has no accessible
+supply. A plain CLI echo attempt against a locally imported image containing
+the host echo, interpreter and libc exited 127, with no host-file crossing;
+it does not prove the loader mapped libc. Later loader services remain #1714.
+
+The cross-crate lock order remains capture under physical custody, release
+custody for host service/file I/O, then reacquire and revalidate exact
+execution/MM/root before publishing. Independent review must cover it.
+
+Prepared-edit contention remains a P1 acceptance blocker: x86 currently
+forwards `PreparedConflict` and implements no `park_prepared`. A sound follow-up
+must share `coordinate_prepared_edit_wait` and ARM's semantic overlap predicate,
+retain the exact `NativeMapKey` and source in the existing per-member map-source
+custody across parking, consume the matching scheduler operation on resume,
+and release execution capacity through the existing native process owner.
+Restarting and staging a new source is not an equivalent fix: it changes
+custody and can leak sources. Root Busy needs the same owned release protocol.
+Add production Busy-once/then-success and prepared-conflict witnesses before
+claiming concurrency acceptance. Full signed ARM gates and loader acceptance
+remain outstanding.
