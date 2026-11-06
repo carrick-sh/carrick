@@ -102,6 +102,7 @@ struct Adapter<'a, 's, C: ThreadCpu, U: UserWord> {
     sched: &'a mut Sched<'s, C, U>,
     frame: &'a mut TrapFrame,
     refusal: Option<carrick_core::personality::CopyOutcome>,
+    operation: &'a mut Option<carrick_personality_linux::sched::RelativeFutexWait>,
 }
 impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, C, U> {
     type Served = Served;
@@ -121,6 +122,9 @@ impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, C, U> {
     fn now(&self) -> CounterTick {
         CounterTick::new(self.sched.cpu.now())
     }
+    fn retained_deadline(&self) -> Option<CounterTick> {
+        self.operation.as_ref().map(|op| op.deadline)
+    }
     fn wake(
         &mut self,
         mm: ReservationMm,
@@ -132,6 +136,11 @@ impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, C, U> {
             .wake_word(self.frame, mm.raw(), address.raw(), bitset, limit)
     }
     fn wait(&mut self, wait: FutexWait) -> Option<Served> {
+        if let Some(deadline) = wait.deadline {
+            *self.operation =
+                Some(carrick_personality_linux::sched::RelativeFutexWait { deadline });
+        }
+
         let zone = self.sched.zone;
         let result = self.sched.wait_word_with(
             self.frame,
@@ -249,6 +258,11 @@ pub trait LinuxSchedEntry {
         &mut self,
         frame: &mut TrapFrame,
     ) -> Result<Option<Served>, carrick_core::personality::CopyOutcome>;
+    fn serve_futex_operation(
+        &mut self,
+        frame: &mut TrapFrame,
+        operation: &mut Option<carrick_personality_linux::sched::RelativeFutexWait>,
+    ) -> Result<Option<Served>, carrick_core::personality::CopyOutcome>;
     fn serve_irq(&mut self, frame: &mut TrapFrame) -> carrick_el1_abi::Action;
     fn serve_idle_entry(&mut self, frame: &mut TrapFrame) -> carrick_el1_abi::Action;
 }
@@ -260,6 +274,13 @@ impl<C: ThreadCpu, U: UserWord> LinuxSchedEntry for Sched<'_, C, U> {
         &mut self,
         frame: &mut TrapFrame,
     ) -> Result<Option<Served>, carrick_core::personality::CopyOutcome> {
+        self.serve_futex_operation(frame, &mut None)
+    }
+    fn serve_futex_operation(
+        &mut self,
+        frame: &mut TrapFrame,
+        operation: &mut Option<carrick_personality_linux::sched::RelativeFutexWait>,
+    ) -> Result<Option<Served>, carrick_core::personality::CopyOutcome> {
         if !is_served_futex_op(frame) {
             return Ok(None);
         }
@@ -270,6 +291,7 @@ impl<C: ThreadCpu, U: UserWord> LinuxSchedEntry for Sched<'_, C, U> {
             sched: self,
             frame,
             refusal: None,
+            operation,
         };
         let served = ::carrick_personality_linux::sched::serve_futex(call, &mut adapter);
         match adapter.refusal {

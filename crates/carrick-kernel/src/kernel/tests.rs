@@ -1750,6 +1750,7 @@ mod futex_queue_authority {
                 None,
                 None,
                 FutexQueueAuthority::of_context(thread),
+                None,
             )
         }
 
