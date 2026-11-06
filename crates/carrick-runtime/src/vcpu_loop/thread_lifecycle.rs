@@ -33,6 +33,7 @@ fn publish_resolved(
     let (page, control) = match resolve() {
         Ok(binding) => binding,
         Err(carrick_el1_abi::MetadataResolutionError::Busy) => {
+            carrick_fatal::carrick_fatal!("fix1572", "lifecycle mapping returned Busy");
             return Ok(LifecyclePublication::HostServed);
         }
         Err(error) => return Err(error),

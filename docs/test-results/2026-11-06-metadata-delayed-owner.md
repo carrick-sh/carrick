@@ -113,9 +113,20 @@ Other live records retain nonzero lifecycle references. This explains why
 the earlier native-admission and sysinfo-venue diagnostic branches did not
 capture these calls: the dispatcher falls back before acquiring that venue.
 
-`thread_lifecycle.rs::publish_resolved` clears both references and converts
-MetadataResolutionError::Busy into successful HostServed. The executor load
-ignores the returned publication outcome. Its existing unit test explicitly
-expects this fallback; under ring-first dispatch it causes refused uname
-calls. The exact mapping refusal still needs classification before choosing
-the owned deferral correction. No diagnostic population is acceptance.
+The record has a `Woken` handback. That alone does not distinguish a host
+futex park from an in-guest wake. All three host
+park constructors in `vcpu_loop/zone.rs` explicitly set lifecycle_page and
+control_slot to zero; the guest scheduler copies those fields into CurrentTask
+when resuming the record. This is a candidate source, not yet an attributed cause. The earlier
+mapping-Busy fallback hypothesis was not established by this core and is not
+being treated as this defect's cause.
+
+A hardware watchpoint on GRANTS_DENIED was qualified against the deliberate
+allocation-denial fixture, then used for 100 bounded diagnostic delayed-owner
+runs. None hit the watchpoint. These instrumented runs are not acceptance
+and do not explain the one denial in the intermediate population.
+
+Two host-park provenance witness attempts reached no host-park constructor
+(timed-wait and concurrent allocator respectively). Their absent-coverage
+assertions are not red witnesses of the lifecycle loss. The temporary hooks
+were removed. The load-time mapping fallback remains to be classified.
