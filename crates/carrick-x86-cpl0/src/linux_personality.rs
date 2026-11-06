@@ -272,7 +272,7 @@ impl GuestDispatchFrame for NativeDispatch<'_> {
             &mut backend,
             self.frame,
             &mut self.fpstate.0,
-            &mut |dst, va| copy_in.copy_in(dst, va),
+            &mut |dst, va| copy_in.copy_in(dst, va).is_done(),
         )
         .map_err(|_| carrick_personality_linux::abi::signal::LINUX_EFAULT)
     }
@@ -290,7 +290,7 @@ impl GuestDispatchFrame for NativeDispatch<'_> {
             params,
             siginfo,
             &self.fpstate.0,
-            &mut |va, src| copy_out.copy_out(va, src),
+            &mut |va, src| copy_out.copy_out(va, src).is_done(),
         )
         .map_err(|_| carrick_personality_linux::abi::signal::LINUX_EFAULT)
     }
