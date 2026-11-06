@@ -10229,9 +10229,9 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
         )
         .unwrap(),
     );
-    // Initial extent capacity 8 with soft limit 64 forces in-ring table growth
+    // Initial extent capacity 8 with soft limit 8192 forces in-ring table growth
     // when native children dup3/F_DUPFD above descriptor 7.
-    let table = HostTable::create(Arc::clone(&owner), 64, 8).unwrap();
+    let table = HostTable::create(Arc::clone(&owner), 8192, 8).unwrap();
     let object = owner.create_pipe(65536).unwrap();
     let reader = owner
         .admit_description(fd::Description::new(
@@ -10401,6 +10401,53 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
     activate_target(source, &task, &child_bindings[0]);
     for binding in &child_bindings {
         assert!(runtime.task_binding(binding.key).is_some());
+    }
+
+    // #1752: a real fork child must use the shared selector beyond the
+    // legacy host projection's 1024-descriptor readiness window.
+    assert_eq!(
+        run_in_child(0, sys_fcntl, [4, LINUX_F_DUPFD_CLOEXEC, 4096]).1,
+        4096,
+        "fork child high-minimum duplication must not return EIO (-5)"
+    );
+    assert_eq!(run_in_child(0, sys_fcntl, [4096, LINUX_F_GETFD, 0]).1, 1);
+    assert_eq!(
+        run_in_child(0, sys_fcntl, [4096, LINUX_F_SETFL, LINUX_O_NONBLOCK]).1,
+        0
+    );
+    assert_eq!(
+        run_in_child(1, sys_fcntl, [4, LINUX_F_GETFL, 0]).1,
+        (LINUX_O_WRONLY | LINUX_O_NONBLOCK) as i64,
+        "high duplicate retains the inherited shared open description"
+    );
+    assert_eq!(run_in_child(0, sys_fcntl, [4096, LINUX_F_SETFL, 0]).1, 0);
+    assert_eq!(run_in_child(0, sys_close, [4096, 0, 0]).1, 0);
+    assert_eq!(
+        run_in_child(0, sys_fcntl, [5, LINUX_F_DUPFD_CLOEXEC, 4096]).1,
+        4096,
+        "host-backed descriptions use the same high descriptor reservation"
+    );
+    assert_eq!(run_in_child(0, sys_fcntl, [4096, LINUX_F_GETFD, 0]).1, 1);
+    assert_eq!(run_in_child(0, sys_close, [4096, 0, 0]).1, 0);
+    assert_eq!(
+        run_in_child(0, sys_fcntl, [4, LINUX_F_DUPFD_CLOEXEC, 8192]).1,
+        -22
+    );
+    assert_eq!(
+        run_in_child(0, sys_fcntl, [4, LINUX_F_DUPFD_CLOEXEC, 8191]).1,
+        8191
+    );
+    assert_eq!(
+        run_in_child(0, sys_fcntl, [4, LINUX_F_DUPFD_CLOEXEC, 8191]).1,
+        -24
+    );
+    assert_eq!(run_in_child(0, sys_close, [8191, 0, 0]).1, 0);
+    for child in children {
+        owner
+            .region()
+            .fd(carrick_kernel::el1_zone::HostLockWait)
+            .set_limit(fd::TableId::from_raw(map.lookup_owned(child).unwrap()), 64)
+            .unwrap();
     }
 
     // 1. dup(4) allocates lowest free slot 0 and clears FD_CLOEXEC.

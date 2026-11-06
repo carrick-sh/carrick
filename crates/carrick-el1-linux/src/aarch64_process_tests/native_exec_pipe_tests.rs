@@ -36,7 +36,7 @@ fn serial_host_native_fork_exec_pipe_writer_reaches_its_parent() {
         )
         .unwrap(),
     );
-    let table = Arc::new(HostTable::create(owner.clone(), 64, 64).unwrap());
+    let table = Arc::new(HostTable::create(owner.clone(), 8192, 64).unwrap());
     let object = owner.create_pipe(65536).unwrap();
     for (number, end, access) in [
         (3, End::Reader, fd::AccessMode::ReadOnly),
@@ -297,9 +297,9 @@ fn serial_host_native_fork_exec_pipe_writer_reaches_its_parent() {
             &mut frame,
             &counters,
             core::slice::from_ref(&fixture.task),
+            crossing.fd_map(),
             &[],
-            &[],
-            &[],
+            crossing.open_table(),
             &[],
             names,
             Some(crate::dispatch::Zone {
@@ -327,8 +327,29 @@ fn serial_host_native_fork_exec_pipe_writer_reaches_its_parent() {
         );
         frame.x[0]
     };
+    // #1752: repeat the high-minimum operation after the production exec
+    // checkpoint has adopted the fork child's successor image.
+    let fcntl = carrick_personality_linux::crossing::nr::FCNTL.raw();
     assert_eq!(
-        call(64, 4, memory.arg() + 128, 2),
+        call(fcntl, 4, carrick_abi::LINUX_F_DUPFD_CLOEXEC, 4096),
+        4096
+    );
+    assert_eq!(call(fcntl, 4096, carrick_abi::LINUX_F_GETFD, 0), 1);
+    assert_eq!(
+        call(fcntl, 4, carrick_abi::LINUX_F_DUPFD_CLOEXEC, 8192) as i64,
+        -22
+    );
+    assert_eq!(
+        call(fcntl, 4, carrick_abi::LINUX_F_DUPFD_CLOEXEC, 8191),
+        8191
+    );
+    assert_eq!(
+        call(fcntl, 4, carrick_abi::LINUX_F_DUPFD_CLOEXEC, 8191) as i64,
+        -24
+    );
+    assert_eq!(call(57, 8191, 0, 0), 0);
+    assert_eq!(
+        call(64, 4096, memory.arg() + 128, 2),
         2,
         "exec successor's scalar write"
     );
