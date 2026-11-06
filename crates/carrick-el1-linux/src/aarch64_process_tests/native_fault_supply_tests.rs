@@ -5343,9 +5343,9 @@ fn arm_sibling_refusal_on_vcpu_mailbox_never_erases_child_file_first_fetch() {
         &mut NoopCowResolver,
     );
     assert_eq!(action, carrick_el1_abi::Action::Forward);
-    if let OwnerFaultSupplyOutcome::Wait(_) = supply.outcome() {
-        return;
-    }
+    // A stale refusal is not contention: waiting on it could never be woken
+    // by the root, so the child must hand off now.
+    assert_eq!(supply.outcome(), OwnerFaultSupplyOutcome::Unavailable);
     // The host serves an owner file fault only from this exact pair; any
     // other forward of a file translation fault becomes SIGSEGV.
     let selection = portal
@@ -5362,4 +5362,70 @@ fn arm_sibling_refusal_on_vcpu_mailbox_never_erases_child_file_first_fetch() {
     assert_eq!(request.request_generation, generation);
     assert_eq!(window.fault_page, far & !4095);
     assert!(window.host_backing.is_some());
+    assert!(
+        mailbox
+            .claim_response(mm.raw(), sibling_generation)
+            .is_none(),
+        "the displaced sibling refusal answers nothing; the sibling re-requests"
+    );
+
+    // Busy once, then success: this worker's selection lane still holds the
+    // previous handoff (the host has not consumed it). That is contention:
+    // the child waits on the owner, publishes nothing and is not forwarded
+    // as a handed-off fault.
+    assert!(mailbox.abandon_unstarted_request(request));
+    let mut frame = carrick_el1_abi::TrapFrame {
+        esr: 0x8200_0007,
+        far,
+        elr: far,
+        slot: u64::from(fixture.slot.raw()),
+        ..Default::default()
+    };
+    let busy_supply = OwnerFaultSupply::new(portal).with_handle(handle);
+    let dispatch = |frame: &mut carrick_el1_abi::TrapFrame, supply: &OwnerFaultSupply<'_>| {
+        carrick_el1::fault::dispatch_fault_with_prepared(
+            frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            access,
+            crate::cow_resolver::native_fault_supply(false, GrantMailboxes::own(&mailbox), supply),
+            Some(PreparedFaultPath {
+                residency: &residency,
+                resolver: &mut SelectionWords(&words),
+                roots: Some(fixture.region.table()),
+                file_slots: Some(portal),
+            }),
+            &mut NoopCowResolver,
+        )
+    };
+    assert_eq!(
+        dispatch(&mut frame, &busy_supply),
+        carrick_el1_abi::Action::Forward
+    );
+    let OwnerFaultSupplyOutcome::Wait(wait) = busy_supply.outcome() else {
+        panic!(
+            "occupied selection lane must wait, not report a handoff: {:?}",
+            busy_supply.outcome()
+        );
+    };
+    assert_eq!(wait.handle(), handle);
+    assert!(
+        mailbox.claim_request().is_none(),
+        "busy lane publishes no request"
+    );
+    let lane = portal.grant(usize::from(fixture.slot.raw())).unwrap();
+    assert!(lane.cancel_fault_selection(window, generation));
+    let retry_supply = OwnerFaultSupply::new(portal).with_handle(handle);
+    assert_eq!(
+        dispatch(&mut frame, &retry_supply),
+        carrick_el1_abi::Action::Forward
+    );
+    assert_eq!(retry_supply.outcome(), OwnerFaultSupplyOutcome::Unavailable);
+    let (retry_generation, _) = lane
+        .pending_fault_selection(mm.raw(), far)
+        .expect("released lane hands the file first fetch off");
+    let retried = mailbox
+        .claim_request_for_fault(mm.raw(), far, 4)
+        .expect("released lane publishes the exact request");
+    assert_eq!(retried.request_generation, retry_generation);
 }

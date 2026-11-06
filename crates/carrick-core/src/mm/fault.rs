@@ -278,6 +278,11 @@ impl<
         va: u64,
         access: u64,
     ) -> Result<bool, crate::mm::reservation::Refusal> {
+        // `busy` is contention: the root, a pending root operation, or this
+        // worker's own selection or mailbox lane. It is never reported as a
+        // handoff. The host serves a file first touch only from the exact
+        // selection and request pair published here; a forward without it
+        // answers a valid mapping with SIGSEGV (#1692).
         let mut busy = false;
         let owner_source = core::cell::Cell::new(false);
         let mut run = || -> Option<bool> {
@@ -300,29 +305,41 @@ impl<
             let (mapping, reservation_incarnation) = root.node(va)?;
             mapping.host_backing?;
             owner_source.set(true);
-            let window = select_fault_window(
+            let window = match select_fault_window(
                 &mut root,
                 self.slots.carrier()?,
                 carrick_guest_arch::UserVa::new(va),
                 carrick_guest_arch::GuestLen::new(4096),
                 carrick_core_abi::ReservationProtection::from_bits(access)?,
-            )
-            .ok()?;
+            ) {
+                Ok(window) => window,
+                Err(crate::mm::reservation::Refusal::Busy) => {
+                    busy = true;
+                    return None;
+                }
+                Err(_) => return None,
+            };
             drop(root);
             let slot = self.slots.grant(self.worker as usize)?;
             let generation = next_frame_grant_generation();
             if !slot.publish_fault_selection(generation, window) {
-                return Some(true);
+                busy = true;
+                return None;
             }
-            if !self.mailbox.try_publish_request(FrameGrantRequest {
-                mm_key,
-                reservation_incarnation,
-                request_generation: generation,
-                fault_va: va,
-                requested_len: window.range.len(),
-                access,
-            }) {
-                slot.cancel_fault_selection(window, generation);
+            if !self
+                .mailbox
+                .try_publish_request_displacing_refusal(FrameGrantRequest {
+                    mm_key,
+                    reservation_incarnation,
+                    request_generation: generation,
+                    fault_va: va,
+                    requested_len: window.range.len(),
+                    access,
+                })
+            {
+                assert!(slot.cancel_fault_selection(window, generation));
+                busy = true;
+                return None;
             }
             Some(true)
         };

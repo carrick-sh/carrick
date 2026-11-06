@@ -213,6 +213,44 @@ impl FrameGrantMailbox {
         {
             return false;
         }
+        self.write_claimed_request(request);
+        true
+    }
+
+    /// Guest, on the faulting vCPU's own mailbox: publish `request`, first
+    /// retiring an unconsumed refusal another thread left here. A refusal
+    /// carries no frame authority; it only stops its owner from asking twice.
+    /// The EL1 scheduler can switch threads between a refusal and its owner's
+    /// re-fault, so that owner consumes it later from a peer slot. A request
+    /// that needs this exact mailbox (a file first touch has no page-granular
+    /// host fallback) must not be refused by that stale answer. The owner's
+    /// later consume finds nothing and issues a fresh request. In-flight
+    /// requests and a peer's in-progress consume are left untouched.
+    pub fn try_publish_request_displacing_refusal(&self, request: FrameGrantRequest) -> bool {
+        if !Self::request_is_valid(request) {
+            return false;
+        }
+        let claimed = [FRAME_GRANT_MAILBOX_IDLE, FRAME_GRANT_MAILBOX_RESPONSE]
+            .into_iter()
+            .any(|from| {
+                self.state
+                    .compare_exchange(
+                        from,
+                        FRAME_GRANT_MAILBOX_GUEST_WRITING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+            });
+        if !claimed {
+            return false;
+        }
+        self.write_claimed_request(request);
+        true
+    }
+
+    /// Fill a mailbox this guest moved to GUEST_WRITING, then publish it.
+    fn write_claimed_request(&self, request: FrameGrantRequest) {
         self.status
             .store(FRAME_GRANT_ERR_INVALID, Ordering::Relaxed);
         self.mm_key.store(request.mm_key, Ordering::Relaxed);
@@ -234,7 +272,6 @@ impl FrameGrantMailbox {
         self.inventory_revision.store(0, Ordering::Relaxed);
         self.state
             .store(FRAME_GRANT_MAILBOX_REQUESTED, Ordering::Release);
-        true
     }
 
     pub fn claim_request(&self) -> Option<FrameGrantRequest> {
@@ -732,5 +769,47 @@ mod layout_manifest {
             32768,
             64
         );
+    }
+}
+
+#[cfg(test)]
+mod displacing_refusal {
+    use super::*;
+
+    fn request(generation: u64, fault_va: u64, access: u64) -> FrameGrantRequest {
+        FrameGrantRequest {
+            mm_key: 7,
+            reservation_incarnation: ReservationIncarnation::new(3).unwrap(),
+            request_generation: generation,
+            fault_va,
+            requested_len: 4096,
+            access,
+        }
+    }
+
+    #[test]
+    fn file_request_displaces_only_a_stale_refusal() {
+        let mailbox = FrameGrantMailbox::new();
+        // Idle publishes like the ordinary request.
+        assert!(mailbox.try_publish_request_displacing_refusal(request(1, 0x4000_0000, 4)));
+        // An in-flight request is never displaced.
+        assert!(!mailbox.try_publish_request_displacing_refusal(request(2, 0x5000_0000, 4)));
+        assert!(mailbox.claim_request().is_some());
+        assert!(!mailbox.try_publish_request_displacing_refusal(request(2, 0x5000_0000, 4)));
+        // A refusal left for another thread is retired by the new request.
+        assert!(mailbox.publish_refusal(FRAME_GRANT_ERR_DENIED));
+        assert!(!mailbox.try_publish_request(request(2, 0x5000_0000, 4)));
+        assert!(mailbox.try_publish_request_displacing_refusal(request(2, 0x5000_0000, 4)));
+        assert!(
+            mailbox.claim_response(7, 1).is_none(),
+            "displaced refusal answers nothing"
+        );
+        assert_eq!(mailbox.claim_request().unwrap().request_generation, 2);
+        // A peer mid-consume keeps its claim.
+        assert!(mailbox.publish_refusal(FRAME_GRANT_ERR_DENIED));
+        assert!(mailbox.claim_response(7, 2).is_some());
+        assert!(!mailbox.try_publish_request_displacing_refusal(request(3, 0x6000_0000, 4)));
+        assert!(mailbox.finish_response(7, 2));
+        assert!(mailbox.try_publish_request_displacing_refusal(request(3, 0x6000_0000, 4)));
     }
 }

@@ -1188,10 +1188,14 @@ pub fn dispatch_fault_with_regions<C: CowResolver>(
 
 /// Release one observed refusal. A racing consumer may have released it
 /// first; either way it no longer occupies the mailbox for this fault.
-fn release_refusal(source: &FrameGrantMailbox, mm_key: u64, request_generation: u64) {
+/// Whether this caller claimed and released the exact refusal. A refusal a
+/// concurrent consumer or a displacing request took first answers nothing.
+fn release_refusal(source: &FrameGrantMailbox, mm_key: u64, request_generation: u64) -> bool {
     if source.claim_response(mm_key, request_generation).is_some() {
         assert!(source.finish_response(mm_key, request_generation));
+        return true;
     }
+    false
 }
 
 /// Consume the refusal answering this fault, left on the faulting vCPU's
@@ -1219,8 +1223,9 @@ fn consume_refusal(
         return false;
     };
     let current = current_incarnation() == Some(response.request.reservation_incarnation);
-    release_refusal(source, mm_key, response.request.request_generation);
-    current
+    // Only a refusal this fault actually consumed forwards it once. A preview
+    // displaced before the claim answered nothing: issue a fresh request.
+    release_refusal(source, mm_key, response.request.request_generation) && current
 }
 
 /// A fault the residency table served may still have a refusal outstanding
