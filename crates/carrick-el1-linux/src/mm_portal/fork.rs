@@ -679,6 +679,7 @@ pub fn serve_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         }
         frame.x[1] = 7; // Parent and closed child publication.
         let child = portal.publish_fork(plan, &words, frame.slot as u32)?;
+        let cow_publication = zone.spaces.note_tlb_edit(index);
         #[cfg(target_arch = "aarch64")]
         crate::sched::ThreadCpu::invalidate_asid(&mut crate::sched::HardwareCpu, grant.ttbr0);
         #[cfg(target_arch = "x86_64")]
@@ -687,6 +688,11 @@ pub fn serve_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         {
             carrick_el1::isa::x86::fatal_entry_binding();
         }
+        zone.cover_cow(
+            carrick_guest_arch::SlotId::new(frame.slot as u8),
+            request.operation.mm.raw(),
+            cow_publication,
+        );
         let completion = child.completion();
         *pending.lock() = Some(child);
         frame.x[1] = 8; // Detached receipt publication.

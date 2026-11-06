@@ -96,9 +96,10 @@ pub struct SpaceEntry {
     ttbr1: AtomicU64,
     /// [`GATE_CLOSED`] | raised pauses.
     gate: AtomicU64,
-    /// Foreign-COW publications for the space (host, under a pause).
+    /// TLB-sensitive descriptor publications for the space.
     cow_published: AtomicU64,
-    /// Publications an EL1 broadcast invalidation covered.
+    /// Publications covered by the legacy space-global invalidation ledger.
+    /// Runnable vCPUs use the per-slot coverage in [`crate::ZoneSlot`].
     cow_covered: AtomicU64,
     /// The exact guest EL1 page-table editor, or zero. A host pause raises
     /// `gate` and waits for this word to clear before mutating the same tables.
@@ -157,6 +158,9 @@ pub struct SpaceGrant {
     pub index: SpaceIndex,
     pub ttbr0: u64,
     pub ttbr1: u64,
+    /// Latest TLB-sensitive publication. Each vCPU compares this with its own
+    /// coverage before it may keep or install the address space.
+    pub cow_published: u64,
     /// Foreign-COW publications not yet covered by an EL1 invalidation: the
     /// installer runs `TLBI ASIDE1IS` for the space's ASID and then
     /// [`AddressSpaces::cover_cow`] with this value.
@@ -250,6 +254,7 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceEditor<'a, C> {
             index: self.index,
             ttbr0: self.entry.ttbr0.load(Ordering::Acquire),
             ttbr1: self.entry.ttbr1.load(Ordering::Acquire),
+            cow_published: published,
             cow_owed: (published != covered).then_some(published),
         }
     }
@@ -488,6 +493,7 @@ impl AddressSpaces {
             index,
             ttbr0,
             ttbr1,
+            cow_published: 0,
             cow_owed: None,
         })
     }
@@ -631,12 +637,18 @@ impl AddressSpaces {
         self.entry(index).brk_current.store(val, Ordering::Release);
     }
 
-    /// Host, under a pause of the space: its translations changed under a
-    /// foreign COW; the next EL1 install invalidates its ASID first.
-    pub fn note_cow(&self, index: SpaceIndex) {
+    /// A descriptor edit requires every vCPU that may retain this ASID to
+    /// invalidate locally before it next runs the space.
+    pub fn note_tlb_edit(&self, index: SpaceIndex) -> u64 {
         self.entry(index)
             .cow_published
-            .fetch_add(1, Ordering::SeqCst);
+            .fetch_add(1, Ordering::SeqCst)
+            + 1
+    }
+
+    /// Host foreign-COW spelling of [`Self::note_tlb_edit`].
+    pub fn note_cow(&self, index: SpaceIndex) -> u64 {
+        self.note_tlb_edit(index)
     }
 
     /// EL1, after publishing its slot's occupancy word for `key`: the roots
@@ -660,6 +672,7 @@ impl AddressSpaces {
             index,
             ttbr0,
             ttbr1,
+            cow_published: published,
             cow_owed: (published != covered).then_some(published),
         })
     }
@@ -911,6 +924,7 @@ impl AddressSpaces {
                 index,
                 ttbr0,
                 ttbr1,
+                cow_published: 0,
                 cow_owed: None,
             },
         })

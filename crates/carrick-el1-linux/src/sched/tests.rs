@@ -1936,7 +1936,18 @@ fn an_owed_cow_invalidation_runs_before_the_install() {
     let (mut frame, mut cpu) = live(0xA, a_addr, FUTEX_WAIT_PRIVATE, 0);
     assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), SWITCHED);
     assert_eq!(cpu.asid_invalidations, [TTBR_OTHER]);
-    assert_eq!(zone.spaces.grant(other, OTHER_MM).unwrap().cow_owed, None);
+    assert_eq!(
+        zone.kept_space_authority(SLOT, OTHER_MM),
+        carrick_sched_core::KeptAuthority::Open(carrick_sched_core::KeptGrant {
+            root: TTBR_OTHER,
+            invalidation_owed: false,
+        })
+    );
+    assert_eq!(
+        zone.spaces.grant(other, OTHER_MM).unwrap().cow_owed,
+        Some(1),
+        "another vCPU still owes its own local invalidation"
+    );
     assert_eq!(
         zone.counters.el1_cow_invalidations.load(Ordering::Relaxed),
         1

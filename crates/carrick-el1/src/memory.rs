@@ -437,6 +437,44 @@ pub trait AnonymousRetirementEditor {
 #[cfg(target_os = "none")]
 pub struct HardwareAnonymousPermissionEditor;
 
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+fn publish_current_mm_tlb_edit(
+    ttbr0: u64,
+) -> (
+    &'static carrick_el1_abi::ZoneTables,
+    carrick_guest_arch::SlotId,
+    u64,
+    u64,
+) {
+    let Some(raw_slot) =
+        carrick_el1_abi::el1_stack_slot(crate::substrate::sched::hw::read_current_sp())
+    else {
+        crate::substrate::sched::hw::fatal_entry_binding(
+            carrick_el1_abi::EntryBindingFatalReason::CpuStackSlot,
+        )
+    };
+    let slot = carrick_guest_arch::SlotId::new(raw_slot as u8);
+    let zone = unsafe { &*(carrick_el1_abi::EL1_ZONE_BASE as *const carrick_el1_abi::ZoneTables) };
+    let mm = zone.installed_space(slot);
+    let Some(index) = zone.spaces.find(mm) else {
+        crate::substrate::sched::hw::fatal_entry_binding(
+            carrick_el1_abi::EntryBindingFatalReason::EntryBinding,
+        )
+    };
+    let Some(grant) = zone.spaces.grant(index, mm) else {
+        crate::substrate::sched::hw::fatal_entry_binding(
+            carrick_el1_abi::EntryBindingFatalReason::EntryBinding,
+        )
+    };
+    if grant.ttbr0 != ttbr0 {
+        crate::substrate::sched::hw::fatal_entry_binding(
+            carrick_el1_abi::EntryBindingFatalReason::EntryBinding,
+        )
+    }
+    let publication = zone.spaces.note_tlb_edit(index);
+    (zone, slot, mm, publication)
+}
+
 #[cfg(target_os = "none")]
 impl AnonymousPermissionEditor for HardwareAnonymousPermissionEditor {
     fn protect_and_invalidate(
@@ -459,8 +497,10 @@ impl AnonymousPermissionEditor for HardwareAnonymousPermissionEditor {
                 edit,
             )?;
         }
+        let (zone, slot, mm, publication) = publish_current_mm_tlb_edit(ttbr0);
         let mut cpu = crate::substrate::sched::HardwareCpu;
         crate::substrate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
+        zone.cover_cow(slot, mm, publication);
         Ok(())
     }
 }
@@ -506,8 +546,10 @@ impl AnonymousRetirementEditor for HardwareAnonymousRetirementEditor {
         if !residency.commit() {
             return Err(GuestRetirementError::RollbackFailed);
         }
+        let (zone, slot, mm, publication) = publish_current_mm_tlb_edit(ttbr0);
         let mut cpu = crate::substrate::sched::HardwareCpu;
         crate::substrate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
+        zone.cover_cow(slot, mm, publication);
         Ok(())
     }
 }
