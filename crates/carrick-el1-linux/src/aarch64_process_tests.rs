@@ -10149,6 +10149,41 @@ fn serial_host_native_children_close_descriptors_above_inherited_capacity() {
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof() {
+    native_fork_descriptor_calls(None);
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_fork_children_create_eventfd_in_their_own_tables() {
+    native_fork_descriptor_calls(Some(
+        carrick_personality_linux::crossing::nr::EVENTFD2.raw(),
+    ));
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_fork_children_create_epoll_in_their_own_tables() {
+    native_fork_descriptor_calls(Some(
+        carrick_personality_linux::crossing::nr::EPOLL_CREATE1.raw(),
+    ));
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_fork_children_create_pipe_in_their_own_tables() {
+    native_fork_descriptor_calls(Some(carrick_personality_linux::crossing::nr::PIPE2.raw()));
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_fork_children_create_timerfd_in_their_own_tables() {
+    native_fork_descriptor_calls(Some(
+        carrick_personality_linux::crossing::nr::TIMERFD_CREATE.raw(),
+    ));
+}
+
+#[cfg(not(target_os = "macos"))]
+fn native_fork_descriptor_calls(constructor: Option<u64>) {
     use carrick_abi::{
         LINUX_F_DUPFD, LINUX_F_DUPFD_CLOEXEC, LINUX_F_GETFD, LINUX_F_GETFL, LINUX_F_SETFD,
         LINUX_F_SETFL, LINUX_O_NONBLOCK, LINUX_O_WRONLY,
@@ -10358,6 +10393,93 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
     activate_target(source, &task, &child_bindings[0]);
     for binding in &child_bindings {
         assert!(runtime.task_binding(binding.key).is_some());
+    }
+
+    if let Some(nr) = constructor {
+        use carrick_personality_linux::crossing::nr as sys;
+        let output = carrick_test_support::GuestUserBuffer::zeroed(8);
+        let flags = carrick_syscall_abi::LINUX_O_CLOEXEC;
+        let args = if nr == sys::PIPE2.raw() {
+            [output.arg(), flags, 0]
+        } else if nr == sys::EVENTFD2.raw() {
+            [7, flags, 0]
+        } else if nr == sys::TIMERFD_CREATE.raw() {
+            [1, flags, 0] // CLOCK_MONOTONIC
+        } else {
+            [flags, 0, 0]
+        };
+        let mut results = Vec::new();
+        for idx in 0..2 {
+            if idx != 0 {
+                assert!(
+                    fixture
+                        .zone
+                        .requeue_preempted(fixture.slot, child_bindings[idx - 1].record.id)
+                        .is_queued()
+                );
+                activate_target(source, &task, &child_bindings[idx]);
+            }
+            let (route, result) = run_in_child(idx, nr, args);
+            // Test the production family entry. Forward here is the missing
+            // ring implementation: native_unstaged_exit subsequently lowers
+            // this exact child call to counted ENOSYS (-38).
+            results.push((route, result, output.as_bytes().to_vec()));
+        }
+        let mut backings = Vec::new();
+        for (idx, (route, result, pair)) in results.into_iter().enumerate() {
+            assert!(
+                matches!(route, CompletionRoute::Served | CompletionRoute::WithWork),
+                "child {idx} constructor {nr} must be served in ring, got {route:?} ({result})"
+            );
+            assert!(
+                result >= 0,
+                "child {idx} constructor {nr} errno {}",
+                -result
+            );
+            let child_table = fd::TableId::from_raw(map.lookup_owned(children[idx]).unwrap());
+            let fds = if nr == sys::PIPE2.raw() {
+                assert_eq!(result, 0);
+                pair.chunks_exact(4)
+                    .map(|bytes| i32::from_ne_bytes(bytes.try_into().unwrap()))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![i32::try_from(result).unwrap()]
+            };
+            for created in fds {
+                assert!(
+                    owner
+                        .region()
+                        .fd(carrick_kernel::el1_zone::HostLockWait)
+                        .getfd(child_table, fd::Fd(created))
+                        .unwrap()
+                );
+                backings.push(
+                    owner
+                        .region()
+                        .fd(carrick_kernel::el1_zone::HostLockWait)
+                        .get(child_table, fd::Fd(created))
+                        .unwrap()
+                        .backing,
+                );
+                assert!(
+                    owner
+                        .region()
+                        .fd(carrick_kernel::el1_zone::HostLockWait)
+                        .get(table.id(), fd::Fd(created))
+                        .is_err(),
+                    "child creation must not publish in the parent table"
+                );
+            }
+        }
+        let per_child = if nr == sys::PIPE2.raw() { 2 } else { 1 };
+        for endpoint in 0..per_child {
+            assert_ne!(
+                backings[endpoint],
+                backings[per_child + endpoint],
+                "new constructors must allocate independent objects in the two live children"
+            );
+        }
+        return;
     }
 
     // 1. dup(4) allocates lowest free slot 0 and clears FD_CLOEXEC.
