@@ -1841,6 +1841,11 @@ pub(crate) fn service_native_fork_stock(
                 ) {
                     Ok(()) => true,
                     Err(error) => {
+                        report_stock_refusal(
+                            None,
+                            Some(execution),
+                            &format!("{kind:?}: {error:?}"),
+                        );
                         settlement.refuse(
                             if error
                                 == carrick_hal::fork_stock::ForkStockServiceError::StaleExecution
