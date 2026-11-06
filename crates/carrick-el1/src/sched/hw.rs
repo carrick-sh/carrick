@@ -18,6 +18,11 @@ use carrick_el1_abi::CurrentTask;
 #[cfg(target_os = "none")]
 use carrick_el1_abi::{Aarch64ParkedContext, TrapFrame};
 
+// Keep the production invalidation sequence inspectable by host tests. These
+// are the AArch64 encodings of `dsb ishst` and `dsb ish`, respectively.
+const ASID_INVALIDATION_PRE_BARRIER: u32 = 0xd503_3a9f;
+const ASID_INVALIDATION_POST_BARRIER: u32 = 0xd503_3b9f;
+
 /// EL1's user-word reader: stage-1 permission check, then one fixup-guarded
 /// unprivileged 32-bit load (single-copy atomic for an aligned word).
 pub struct HardwareUserWord;
@@ -261,10 +266,12 @@ impl ThreadCpu for HardwareCpu {
         // before the `isb`.
         unsafe {
             core::arch::asm!(
-                "dsb ishst",
+                ".inst {pre_barrier}",
                 "tlbi aside1is, {asid}",
-                "dsb ish",
+                ".inst {post_barrier}",
                 "isb",
+                pre_barrier = const ASID_INVALIDATION_PRE_BARRIER,
+                post_barrier = const ASID_INVALIDATION_POST_BARRIER,
                 asid = in(reg) ttbr0 & (0xffff << 48),
                 options(nostack)
             );
@@ -354,6 +361,19 @@ impl ThreadCpu for HardwareCpu {
         // SAFETY: reading this vCPU's affinity.
         unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nostack, nomem)) };
         super::sgi_target_of(mpidr)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ASID_INVALIDATION_POST_BARRIER, ASID_INVALIDATION_PRE_BARRIER};
+
+    const AARCH64_DSB_SY_OPCODE: u32 = 0xd503_3f9f;
+
+    #[test]
+    fn cross_vcpu_asid_invalidation_uses_full_system_barriers() {
+        assert_eq!(ASID_INVALIDATION_PRE_BARRIER, AARCH64_DSB_SY_OPCODE);
+        assert_eq!(ASID_INVALIDATION_POST_BARRIER, AARCH64_DSB_SY_OPCODE);
     }
 }
 
