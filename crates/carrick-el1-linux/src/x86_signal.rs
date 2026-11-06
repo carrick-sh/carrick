@@ -37,7 +37,7 @@ impl LinuxX86Backend {
         resume: UserReturn,
         siginfo: Option<&'a [u8]>,
         fpstate: &[u8],
-        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
+        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> carrick_core::personality::CopyOutcome,
     ) -> Result<UserVa, ArchError> {
         // 1. Determine stack location
         // On x86_64, user stack has a 128-byte red zone:
@@ -135,11 +135,15 @@ impl LinuxX86Backend {
         }
 
         // 3. Write frame to user stack
+        use carrick_core::personality::CopyOutcome;
         let frame_bytes = rtsigframe.as_bytes();
-        if !copy_out(UserVa::new(fp_address), &fp_image)
-            || !copy_out(UserVa::new(new_sp), frame_bytes)
-        {
-            return Err(ArchError::InvalidFrame);
+        match copy_out(UserVa::new(fp_address), &fp_image) {
+            CopyOutcome::Done => {}
+            CopyOutcome::Fault | CopyOutcome::NotYet(_) => return Err(ArchError::InvalidFrame),
+        }
+        match copy_out(UserVa::new(new_sp), frame_bytes) {
+            CopyOutcome::Done => {}
+            CopyOutcome::Fault | CopyOutcome::NotYet(_) => return Err(ArchError::InvalidFrame),
         }
 
         // 4. Set up registers for handler invocation
@@ -165,7 +169,7 @@ impl SignalBackend for LinuxX86Backend {
         params: SignalFrameParams,
         siginfo: Option<&[u8]>,
         fpstate: &[u8],
-        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
+        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> carrick_core::personality::CopyOutcome,
     ) -> Result<UserVa, Self::Error> {
         self.setup_signal_frame_with_resume(
             frame,

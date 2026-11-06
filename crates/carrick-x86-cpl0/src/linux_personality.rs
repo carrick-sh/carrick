@@ -2,6 +2,8 @@
 
 #![cfg(all(target_os = "none", target_arch = "x86_64"))]
 
+extern crate alloc;
+
 use carrick_abi::{LINUX_SEGV_ACCERR, LINUX_SEGV_MAPERR, LINUX_SIGSEGV, LinuxErrno, LinuxSiginfo};
 use carrick_el1::isa::x86::context::native::{CpuBinding, NativeFrame, checked_scheduler_slot};
 use carrick_el1::isa::x86::context::scheduler::XsaveArea;
@@ -290,7 +292,7 @@ impl GuestDispatchFrame for NativeDispatch<'_> {
             params,
             siginfo,
             &self.fpstate.0,
-            &mut |va, src| copy_out.copy_out(va, src).is_done(),
+            &mut |va, src| copy_out.copy_out(va, src),
         )
         .map_err(|_| carrick_personality_linux::abi::signal::LINUX_EFAULT)
     }
@@ -335,6 +337,21 @@ impl carrick_el1_linux::signal_delivery::SignalMachine<carrick_sched_core::Parke
 
     fn backend(&mut self) -> &mut Self::Backend {
         &mut self.backend
+    }
+
+    fn save_return(
+        &self,
+        frame: &NativeFrame,
+        fpstate: &[u8],
+        context: &mut carrick_sched_core::ParkedContextWords,
+    ) -> bool {
+        let mut xstate = alloc::boxed::Box::new(XsaveArea::ZERO);
+        if fpstate.len() != xstate.0.len() {
+            return false;
+        }
+        xstate.0.copy_from_slice(fpstate);
+        *context = capture(frame, &xstate);
+        true
     }
 
     fn user_sp(&self, frame: &NativeFrame) -> UserVa {

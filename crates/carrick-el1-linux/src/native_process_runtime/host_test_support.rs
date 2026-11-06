@@ -5,6 +5,7 @@ use carrick_guest_arch::{ContextGeneration, FrameGpa};
 use carrick_sched_core::ParkedContextWords;
 
 std::thread_local! {
+    static SIGNAL_COPY_ATTEMPTS: std::cell::RefCell<Vec<(UserVa, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
     static SIGNAL_COPIES: std::cell::RefCell<Vec<(UserVa, Vec<u8>)>> = const {
         std::cell::RefCell::new(Vec::new())
     };
@@ -66,8 +67,29 @@ pub(crate) fn take_return_copyouts() -> Vec<(UserVa, usize)> {
     RETURN_COPYOUTS.with(|copies| copies.borrow_mut().take().unwrap())
 }
 
+pub fn take_signal_copy_attempts() -> Vec<(UserVa, usize)> {
+    SIGNAL_COPY_ATTEMPTS.with(|calls| core::mem::take(&mut *calls.borrow_mut()))
+}
+
 pub fn take_signal_copies() -> Vec<(UserVa, Vec<u8>)> {
     SIGNAL_COPIES.with(|copies| core::mem::take(&mut *copies.borrow_mut()))
+}
+
+/// Reassemble adjacent page pieces for signal codec assertions. Raw attempt
+/// and copy observations remain separate for structural/cursor assertions.
+pub fn take_signal_frames() -> Vec<(UserVa, Vec<u8>)> {
+    let pieces = SIGNAL_COPIES.with(|copies| core::mem::take(&mut *copies.borrow_mut()));
+    let mut frames: Vec<(UserVa, Vec<u8>)> = Vec::new();
+    for (address, bytes) in pieces {
+        if let Some((base, previous)) = frames.last_mut()
+            && base.raw().checked_add(previous.len() as u64) == Some(address.raw())
+        {
+            previous.extend_from_slice(&bytes);
+        } else {
+            frames.push((address, bytes));
+        }
+    }
+    frames
 }
 
 #[cfg(test)]
@@ -354,6 +376,7 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         address: UserVa,
         bytes: &[u8],
     ) -> Result<(), NativeProcessError> {
+        SIGNAL_COPY_ATTEMPTS.with(|calls| calls.borrow_mut().push((address, bytes.len())));
         if address.raw() == 1 {
             return Err(NativeProcessError::Fault);
         }
@@ -807,8 +830,21 @@ impl NativeSignalFixture {
         usize,
         Option<carrick_personality_linux::dispatch::CompletionRoute>,
     ) {
+        self.drain_and_deliver_with_copy_error(queue, frame, None)
+    }
+
+    pub fn drain_and_deliver_with_copy_error(
+        &self,
+        queue: &carrick_el1_abi::SharedSignalIngressQueue,
+        frame: &mut carrick_el1_abi::TrapFrame,
+        error: Option<NativeProcessError>,
+    ) -> (
+        usize,
+        Option<carrick_personality_linux::dispatch::CompletionRoute>,
+    ) {
         use zerocopy::IntoBytes;
         let mut service = self.service();
+        service.child_copy_error = error;
         let drained = self
             .registry
             .drain_external_ingress(self.zone, queue, self.slot, &mut service)
@@ -888,6 +924,29 @@ impl crate::signal_delivery::SignalMachine<ParkedContextWords> for HostArmSignal
     fn restart(&self, _: &mut carrick_el1_abi::TrapFrame, _: &ParkedContextWords) -> bool {
         false
     }
+    fn restart_from_argument(&self, frame: &mut carrick_el1_abi::TrapFrame, argument: u64) -> bool {
+        let Some(pc) = frame.elr.checked_sub(4) else {
+            return false;
+        };
+        frame.elr = pc;
+        frame.x[0] = argument;
+        true
+    }
+
+    fn save_return(
+        &self,
+        _frame: &carrick_el1_abi::TrapFrame,
+        _fpstate: &[u8],
+        _context: &mut ParkedContextWords,
+    ) -> bool {
+        // This codec-only fixture cannot encode an ARM context into x86 words.
+        false
+    }
+
+    fn forwarded_restart_argument(&self, frame: &carrick_el1_abi::TrapFrame) -> Option<u64> {
+        Some(frame.far)
+    }
+
     fn restart_forwarded(&self, frame: &mut carrick_el1_abi::TrapFrame) -> Option<bool> {
         crate::arm_signal::restart_forwarded_frame(frame)
     }
@@ -920,7 +979,7 @@ impl carrick_personality_linux::signal::SignalBackend for HostArmBackend {
         params: carrick_personality_linux::signal::SignalFrameParams,
         siginfo: Option<&[u8]>,
         fpstate: &[u8],
-        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
+        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> carrick_core::personality::CopyOutcome,
     ) -> Result<UserVa, Self::Error> {
         crate::arm_signal::setup_arm_signal_frame(frame, params, siginfo, fpstate, copy_out)
     }

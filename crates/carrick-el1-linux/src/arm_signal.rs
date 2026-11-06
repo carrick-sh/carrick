@@ -41,6 +41,39 @@ impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedCont
         }
     }
 
+    fn restart_from_argument(&self, frame: &mut carrick_el1_abi::TrapFrame, argument: u64) -> bool {
+        let Some(pc) = frame.elr.checked_sub(4) else {
+            return false;
+        };
+        frame.elr = pc;
+        frame.x[0] = argument;
+        true
+    }
+
+    fn save_return(
+        &self,
+        frame: &carrick_el1_abi::TrapFrame,
+        fpstate: &[u8],
+        context: &mut carrick_sched_core::Aarch64ParkedContext,
+    ) -> bool {
+        use zerocopy::FromBytes;
+        let Ok(fp) = carrick_syscall_abi::LinuxFpsimdContext::ref_from_bytes(fpstate) else {
+            return false;
+        };
+        context.native.v = fp.vregs;
+        context.native.fpsr = u64::from(fp.fpsr);
+        context.native.fpcr = u64::from(fp.fpcr);
+        context.native.x = frame.x;
+        context.native.pc = frame.elr;
+        context.native.pstate = frame.spsr;
+        context.native.sp_el0 = self.user_sp.raw();
+        true
+    }
+
+    fn forwarded_restart_argument(&self, frame: &carrick_el1_abi::TrapFrame) -> Option<u64> {
+        Some(frame.far)
+    }
+
     fn restart_forwarded(&self, frame: &mut TrapFrame) -> Option<bool> {
         restart_forwarded_frame(frame)
     }
@@ -439,7 +472,7 @@ impl carrick_personality_linux::signal::SignalBackend for LinuxAarch64Backend {
         params: carrick_personality_linux::signal::SignalFrameParams,
         siginfo: Option<&[u8]>,
         _fpstate: &[u8],
-        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
+        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> carrick_core::personality::CopyOutcome,
     ) -> Result<UserVa, Self::Error> {
         setup_arm_signal_frame(frame, params, siginfo, _fpstate, copy_out)
     }
@@ -498,13 +531,16 @@ pub(crate) fn setup_arm_signal_frame(
     params: carrick_personality_linux::signal::SignalFrameParams,
     siginfo: Option<&[u8]>,
     fpstate: &[u8],
-    copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
+    copy_out: &mut dyn FnMut(UserVa, &[u8]) -> carrick_core::personality::CopyOutcome,
 ) -> Result<UserVa, ArchError> {
+    use carrick_core::personality::CopyOutcome;
+
     let (sp, sigframe) = build(frame, params, siginfo, fpstate)?;
     let new_sp = sp.raw();
 
-    if !copy_out(UserVa::new(new_sp), &sigframe) {
-        return Err(ArchError::InvalidFrame);
+    match copy_out(UserVa::new(new_sp), &sigframe) {
+        CopyOutcome::Done => {}
+        CopyOutcome::Fault | CopyOutcome::NotYet(_) => return Err(ArchError::InvalidFrame),
     }
 
     let info_addr = new_sp;
@@ -1033,7 +1069,7 @@ mod tests {
                 fp.as_bytes(),
                 &mut |va, bytes| {
                     written = Some((va, bytes.to_vec()));
-                    true
+                    carrick_core::personality::CopyOutcome::Done
                 },
             )
             .expect("setup_arm_signal_frame must succeed");

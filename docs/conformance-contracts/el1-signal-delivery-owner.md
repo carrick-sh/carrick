@@ -74,3 +74,31 @@ scheduler load and resume_production path for a rehomed host-owned root, with
 no work, a parked carrier reply and an inline carrier acknowledgment. A
 shared-policy refusal observed before a concurrent work drain remains owned
 until its exact checkpoint; clearing the doorbell cannot erase that obligation.
+
+## Retained signal-frame push (#1723)
+
+An unbacked handler stack retains one selected action and payload under the
+exact member record. It is no longer returned to the pending queue. A private
+register frame and a page-copy journal separate preparation from publication:
+completed pieces are validated and skipped on resume, and register, mask,
+interrupted-child-wait and alternate-stack changes commit after the last byte.
+The original suspend mask and interrupted wait remain in their existing owners
+until that commit. The copied journal is bounded by the architecture's signal
+frame sizes; each completed page piece is written once.
+
+The physical service carries a signal-push payload distinct from syscall
+retry. Before a park the ISA adapter saves the live completed return, including
+its actual return value. Owner contention subscribes to the original owner's
+release notification. Backing completion re-enters signal publication without
+rewinding the completed syscall. Refusal marks the selected push failed and
+settles through the existing delivery-fault policy once. Synchronous fault
+payloads remain published until handler commit or the terminal default verdict;
+they are never enqueued a second time. Member and process retirement discard
+the retained push together with its continuation count.
+
+VM-free witnesses cover an interrupted child wait with two live threads,
+owner-wait parking with a retained mask and completed result, a synchronous
+fault's handler push, and a refused physical Fault service. These are production
+return-owner and service-boundary reductions. They do not execute guest handler
+instructions, prove hardware signal return, or close the signed and Docker
+bindings above.

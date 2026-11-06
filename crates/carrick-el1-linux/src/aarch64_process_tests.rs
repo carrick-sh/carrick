@@ -14,6 +14,8 @@ mod native_ipc_wake_tests;
 #[cfg(test)]
 mod native_retirement_tests;
 #[cfg(test)]
+mod native_signal_push_tests;
+#[cfg(test)]
 mod native_signal_resume_tests;
 #[cfg(test)]
 mod native_signal_work_return_tests;
@@ -8742,6 +8744,39 @@ impl crate::signal_delivery::SignalMachine<Aarch64ParkedContext> for ArmWaitSign
         }
     }
 
+    fn restart_from_argument(&self, frame: &mut carrick_el1_abi::TrapFrame, argument: u64) -> bool {
+        let Some(pc) = frame.elr.checked_sub(4) else {
+            return false;
+        };
+        frame.elr = pc;
+        frame.x[0] = argument;
+        true
+    }
+
+    fn save_return(
+        &self,
+        frame: &carrick_el1_abi::TrapFrame,
+        fpstate: &[u8],
+        context: &mut Aarch64ParkedContext,
+    ) -> bool {
+        use zerocopy::FromBytes;
+        let Ok(fp) = carrick_syscall_abi::LinuxFpsimdContext::ref_from_bytes(fpstate) else {
+            return false;
+        };
+        context.native.v = fp.vregs;
+        context.native.fpsr = u64::from(fp.fpsr);
+        context.native.fpcr = u64::from(fp.fpcr);
+        context.native.x = frame.x;
+        context.native.pc = frame.elr;
+        context.native.pstate = frame.spsr;
+        context.native.sp_el0 = self.user_sp.raw();
+        true
+    }
+
+    fn forwarded_restart_argument(&self, frame: &carrick_el1_abi::TrapFrame) -> Option<u64> {
+        Some(frame.far)
+    }
+
     fn restart_forwarded(&self, frame: &mut carrick_el1_abi::TrapFrame) -> Option<bool> {
         crate::arm_signal::restart_forwarded_frame(frame)
     }
@@ -8780,7 +8815,7 @@ impl carrick_personality_linux::signal::SignalBackend for ArmWaitSignalBackend {
         params: carrick_personality_linux::signal::SignalFrameParams,
         siginfo: Option<&[u8]>,
         fpstate: &[u8],
-        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
+        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> carrick_core::personality::CopyOutcome,
     ) -> Result<UserVa, Self::Error> {
         crate::arm_signal::setup_arm_signal_frame(frame, params, siginfo, fpstate, copy_out)
     }
@@ -8801,21 +8836,37 @@ impl carrick_personality_linux::signal::SignalBackend for ArmWaitSignalBackend {
 // the signal frame lands on a guest user stack.
 #[test]
 fn arm_parked_wait4_signal_wake_sa_restart_saves_original_context_across_fresh_checkpoint() {
-    arm_parked_wait4_signal_wake_case(true, false, true);
+    arm_parked_wait4_signal_wake_case(true, false, true, false);
 }
 
 #[test]
 fn arm_parked_wait4_signal_wake_without_sa_restart_retains_eintr() {
-    arm_parked_wait4_signal_wake_case(false, false, false);
+    arm_parked_wait4_signal_wake_case(false, false, false, false);
 }
 
 #[test]
 fn arm_parked_wait4_signal_wake_replaced_record_discards_restart_context() {
-    arm_parked_wait4_signal_wake_case(true, true, false);
+    arm_parked_wait4_signal_wake_case(true, true, false, false);
+}
+
+std::thread_local! {
+    pub(super) static SIGNAL_FRAME_WAIT: core::cell::Cell<Option<NativeProcessError>> = const { core::cell::Cell::new(None) };
+    pub(super) static SIGNAL_FRAME_SUPPLY_FAULT: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    pub(super) static SIGNAL_FRAME_NOT_YET: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+#[test]
+fn arm_signal_frame_not_yet_in_ring_keeps_two_thread_wait_restart() {
+    arm_parked_wait4_signal_wake_case(true, false, true, true);
 }
 
 #[cfg(test)]
-fn arm_parked_wait4_signal_wake_case(restart: bool, replace: bool, check_member: bool) {
+fn arm_parked_wait4_signal_wake_case(
+    restart: bool,
+    replace: bool,
+    check_member: bool,
+    refuse_frame: bool,
+) {
     use carrick_personality_linux::signal::{
         ProcessSignals, SignalInfo, SignalProcessSelector, SignalRequest,
     };
@@ -9149,6 +9200,7 @@ fn arm_parked_wait4_signal_wake_case(restart: bool, replace: bool, check_member:
             "a replacement record cannot inherit the retired record's restart"
         );
     }
+    SIGNAL_FRAME_NOT_YET.with(|flag| flag.set(refuse_frame));
     let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
     let delivered = {
         let mut process = runtime
@@ -9185,6 +9237,10 @@ fn arm_parked_wait4_signal_wake_case(restart: bool, replace: bool, check_member:
             },
         )
     };
+    assert!(
+        !SIGNAL_FRAME_NOT_YET.with(|flag| flag.get()),
+        "frame copy refusal must execute at the production return checkpoint"
+    );
     assert_eq!(delivered, None);
     assert_eq!(
         frame.elr, 0x700000,

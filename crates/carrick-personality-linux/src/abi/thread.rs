@@ -1007,6 +1007,12 @@ impl ThreadControlSlot {
         self.forwarded_mask_armed.load(Ordering::Acquire) != 0
     }
 
+    /// Inspect the saved mask without consuming its return obligation.
+    pub fn forwarded_wait_mask(&self) -> Option<BlockedMask> {
+        self.forwarded_wait_mask_armed()
+            .then(|| BlockedMask(self.forwarded_saved_mask.load(Ordering::Acquire)))
+    }
+
     /// The native signal owner consumes the saved mask once, in the same
     /// selection path as an in-ring sigsuspend mask.
     pub fn take_forwarded_wait_mask(&self) -> Option<BlockedMask> {

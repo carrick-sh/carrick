@@ -150,6 +150,7 @@ pub(super) struct AdapterPreparation {
 enum ServicePayload<'a> {
     None,
     Copyin,
+    SignalPush,
     Copyout(OwnedCopyout),
     Adapter,
     Exec(Box<[u8]>),
@@ -165,6 +166,7 @@ pub(super) struct PendingService<'a> {
     host_file: Option<PendingHostFile<'a>>,
     copyout: Option<Box<OwnedCopyout>>,
     copyin: bool,
+    signal_push: bool,
     adapter: bool,
     exec_successor: Option<Box<dyn ExecSuccessorSlot + 'a>>,
     retry_syscall_after_supply: bool,
@@ -181,6 +183,7 @@ impl PendingService<'_> {
     fn signal_interruptible(&self) -> bool {
         self.copyout.is_none()
             && !self.copyin
+            && !self.signal_push
             && !self.adapter
             && !matches!(self.request.operation, ServiceOperation::CarrierWork { .. })
     }
@@ -786,6 +789,94 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ServiceCompletion::RetrySyscall,
         )
     }
+    /// Prepare a selected handler's stack without replaying its completed
+    /// syscall or fault. The retained signal owner consumes the reply.
+    #[inline(never)]
+    pub(crate) fn prepare_signal_push(
+        &mut self,
+        request: carrick_core::personality::GuestCopyRequest,
+    ) -> Result<NativeResume, NativeProcessError> {
+        match self.signal_copy_refusal.take() {
+            Some(NativeProcessError::OwnerWait(wait)) => {
+                return self.begin_service_inner(
+                    ServiceOperation::CarrierWork {
+                        entry: OwnerEntry::Syscall,
+                    },
+                    None,
+                    Some(wait),
+                    ServicePayload::SignalPush,
+                    ServiceCompletion::OwnerCheckpoint,
+                );
+            }
+            Some(NativeProcessError::Busy) => {
+                return self.begin_service_inner(
+                    ServiceOperation::CarrierWork {
+                        entry: OwnerEntry::Syscall,
+                    },
+                    None,
+                    None,
+                    ServicePayload::SignalPush,
+                    ServiceCompletion::OwnerCheckpoint,
+                );
+            }
+            _ => {}
+        }
+        let mm = self
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .task(self.key)
+            .map_err(|_| NativeProcessError::Stale)?
+            .native()
+            .resources()
+            .mm
+            .clone();
+        let (operation, sequence, wait) = match self.service.prepare_owned_write(
+            &mm,
+            carrick_core::mm::transaction::CopyoutRequest {
+                address: request.address,
+                len: request.len,
+            },
+        ) {
+            Ok(()) => return Ok(NativeResume::NoPending),
+            Err(NativeProcessError::Fault) => {
+                self.fail_signal_push()?;
+                return Ok(NativeResume::NoPending);
+            }
+            Err(NativeProcessError::OwnerWait(wait)) => (
+                ServiceOperation::CarrierWork {
+                    entry: OwnerEntry::Syscall,
+                },
+                None,
+                Some(wait),
+            ),
+            Err(NativeProcessError::Busy) => (
+                ServiceOperation::CarrierWork {
+                    entry: OwnerEntry::Syscall,
+                },
+                None,
+                None,
+            ),
+            Err(NativeProcessError::Unsupported) => {
+                let (mut fault, sequence) = self
+                    .service
+                    .copyout_fault(request.address)
+                    .ok_or(NativeProcessError::Unsupported)?;
+                fault.access = carrick_guest_arch::Access::Write;
+                (ServiceOperation::Fault(fault), Some(sequence), None)
+            }
+            Err(error) => return Err(error),
+        };
+        self.begin_service_inner(
+            operation,
+            sequence,
+            wait,
+            ServicePayload::SignalPush,
+            ServiceCompletion::OwnerCheckpoint,
+        )
+    }
+
     /// Supply readable memory for a guest-copy input, then
     /// retry the exact SVC before any setup effect. A refused supply becomes
     /// `EFAULT` from the copy rather than a user data-abort signal.
@@ -1145,8 +1236,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     ) -> Result<PreparedService, NativeProcessError> {
         self.service_phase = NativeServicePhase::Payload;
         let copyin = matches!(&payload, ServicePayload::Copyin);
+        let signal_push = matches!(&payload, ServicePayload::SignalPush);
         let (payload, copyout, adapter) = match payload {
-            ServicePayload::Copyin => (ServicePayload::None, None, false),
+            ServicePayload::Copyin | ServicePayload::SignalPush => {
+                (ServicePayload::None, None, false)
+            }
             ServicePayload::Copyout(output) => {
                 (ServicePayload::None, Some(Box::new(output)), false)
             }
@@ -1163,7 +1257,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 return Err(NativeProcessError::Stale);
             }
             (_, ServicePayload::None) => (None, None),
-            (_, ServicePayload::Copyout(_) | ServicePayload::Copyin | ServicePayload::Adapter) => {
+            (
+                _,
+                ServicePayload::Copyout(_)
+                | ServicePayload::Copyin
+                | ServicePayload::SignalPush
+                | ServicePayload::Adapter,
+            ) => {
                 return Err(NativeProcessError::Stale);
             }
         };
@@ -1372,6 +1472,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 host_file,
                 copyout,
                 copyin,
+                signal_push,
                 adapter,
                 exec_successor,
                 retry_syscall_after_supply,
@@ -1441,6 +1542,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 self.release_service_claim(pending.claim)?;
                 return Err(error);
             }
+        }
+        if signal_push {
+            // Return-time signal preparation has no enclosing syscall work
+            // publication. This real notice must ring before the lane parks.
+            self.current.linux.mark_pending_host_work();
         }
         #[cfg(test)]
         super::host_test_support::run_service_published_hook(self.runtime as *const _ as usize);
@@ -1795,17 +1901,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 let key =
                     ObjectWaitKey::native_service(self.record).ok_or(ObjectWaitError::Stale)?;
                 let _queue = zone.object_wait(key, &carrick_sched_core::ShortLockSpin)?;
-                let (interruptible, output_cancelled) =
-                    self.runtime.graph.lock().service_wait(&self.record).map_or(
-                        (true, false),
-                        |pending| {
-                            (
-                                pending.signal_interruptible(),
-                                (pending.copyout.is_some() || pending.copyin)
-                                    && pending.claim.cancellation().is_some(),
-                            )
-                        },
-                    );
+                let (interruptible, output_cancelled) = self
+                    .runtime
+                    .graph
+                    .lock()
+                    .service_wait(&self.record)
+                    .map_or((true, false), |pending| {
+                        (
+                            pending.signal_interruptible(),
+                            (pending.copyout.is_some() || pending.copyin || pending.signal_push)
+                                && pending.claim.cancellation().is_some(),
+                        )
+                    });
                 if output_cancelled
                     || (interruptible && self.signal_interrupts_current())
                     || self.runtime.graph.lock().pending.has_exit(&self.key)
@@ -2504,7 +2611,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
         let retry_syscall_after_supply = pending.retry_syscall_after_supply;
         let exiting = self.runtime.graph.lock().pending.has_exit(&self.key)
-            || ((pending.copyout.is_some() || pending.copyin)
+            || ((pending.copyout.is_some() || pending.copyin || pending.signal_push)
                 && pending.claim.cancellation().is_some());
         if (exiting || result == ServiceResult::Cancelled)
             && let Some(PendingServiceReply::Fault(reply)) = &pending.reply
@@ -2655,6 +2762,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             return self.finish_adapter_service(result, pending.claim);
         }
         let completed = (|| {
+            if pending.signal_push {
+                match result {
+                    ServiceResult::Supplied => {}
+                    ServiceResult::Refused
+                    | ServiceResult::BackingFault
+                    | ServiceResult::Cancelled
+                    | ServiceResult::Failed(_) => self.fail_signal_push()?,
+                    ServiceResult::Wait(_) | ServiceResult::ExecPrepared(_) => {
+                        return Err(NativeProcessError::Quarantined);
+                    }
+                }
+                return Ok(NativeResume::NoPending);
+            }
             if output.is_some() {
                 return if matches!(request.operation, ServiceOperation::Fault(_))
                     && result != ServiceResult::Supplied

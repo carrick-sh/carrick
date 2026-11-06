@@ -2718,6 +2718,16 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         address: UserVa,
         bytes: &[u8],
     ) -> Result<(), NativeProcessError> {
+        #[cfg(test)]
+        if let Some(error) =
+            super::aarch64_process_tests::SIGNAL_FRAME_WAIT.with(|flag| flag.take())
+        {
+            return Err(error);
+        }
+        #[cfg(test)]
+        if super::aarch64_process_tests::SIGNAL_FRAME_NOT_YET.with(|flag| flag.replace(false)) {
+            return Err(NativeProcessError::Unsupported);
+        }
         self.access_user_target(
             mm,
             address,
@@ -2731,6 +2741,10 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         mm: &Self::Mm,
         request: carrick_core::mm::transaction::CopyoutRequest,
     ) -> Result<(), NativeProcessError> {
+        #[cfg(test)]
+        if super::aarch64_process_tests::SIGNAL_FRAME_SUPPLY_FAULT.with(|flag| flag.get()) {
+            return Err(NativeProcessError::Unsupported);
+        }
         self.access_user_target(
             mm,
             request.address,
@@ -2756,6 +2770,17 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         &self,
         address: UserVa,
     ) -> Option<(carrick_guest_arch::FaultInfo, NonZeroU64)> {
+        #[cfg(test)]
+        if super::aarch64_process_tests::SIGNAL_FRAME_SUPPLY_FAULT.with(|flag| flag.get()) {
+            return Some((
+                carrick_guest_arch::FaultInfo {
+                    address,
+                    access: carrick_guest_arch::Access::Write,
+                    present: false,
+                },
+                NonZeroU64::MIN,
+            ));
+        }
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
             let slots = unsafe {
