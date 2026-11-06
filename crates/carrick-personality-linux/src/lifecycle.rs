@@ -483,7 +483,8 @@ impl From<carrick_sched_core::Requeue> for BornEnqueue {
 pub trait LifecycleNative<'a>: UserCopy {
     /// Resume an input before any syscall effect has been committed.
     fn wait_guest_copy(&mut self, request: GuestCopyRequest) -> LifecycleOutcome;
-    /// Retain a completed setup operation's original output across memory waits.
+    /// Retain a completed setup operation's original output after `NotYet`.
+    /// The shared policy already attempted the copy; do not restart it here.
     fn finish_signal_output(
         &mut self,
         address: UserVa,
@@ -922,6 +923,29 @@ fn settle_setup_error<'a>(
     }
 }
 
+/// Copy a completed setup answer before allocating continuation storage.
+/// The memory adapter must refuse before writing when it cannot retain its
+/// own partial progress; the output hook takes over without retrying here.
+pub(crate) fn copy_setup_output(
+    user: &mut (impl UserCopy + ?Sized),
+    address: UserVa,
+    bytes: &[u8],
+    work: bool,
+) -> Result<(), SignalSetupError> {
+    match user.copy_out(address, bytes) {
+        CopyOutcome::Done => Ok(()),
+        CopyOutcome::Fault => Err(SignalSetupError::Errno(
+            carrick_syscall_abi::LINUX_EFAULT,
+            work,
+        )),
+        CopyOutcome::NotYet(_) => Err(SignalSetupError::Output {
+            address,
+            bytes: bytes.to_vec(),
+            work,
+        }),
+    }
+}
+
 /// `rt_sigprocmask(how, set, oldset, sigsetsize)`. `Some(work)`: served
 /// (result 0); `work` when a pending signal may now be deliverable to this
 /// thread, or must move to a sibling because this thread just blocked it.
@@ -982,11 +1006,9 @@ pub fn serve_sigprocmask(
         false
     };
     if oldset != 0 {
-        return Some(Err(SignalSetupError::Output {
-            address: UserVa::new(oldset),
-            bytes: old.0.to_le_bytes().to_vec(),
-            work,
-        }));
+        return Some(
+            copy_setup_output(user, UserVa::new(oldset), &old.0.to_le_bytes(), work).map(|()| work),
+        );
     }
     Some(Ok(work))
 }
@@ -1076,11 +1098,12 @@ fn serve_sigaltstack(
                 current.size,
             )
         };
-        return Some(Err(SignalSetupError::Output {
-            address: UserVa::new(old_ss),
-            bytes: stack_t_bytes([sp, u64::from(flags), size]).to_vec(),
-            work: false,
-        }));
+        return Some(copy_setup_output(
+            user,
+            UserVa::new(old_ss),
+            &stack_t_bytes([sp, u64::from(flags), size]),
+            false,
+        ));
     }
     Some(Ok(()))
 }
@@ -1534,4 +1557,74 @@ fn serve_exit<'a>(
     }
     Some(native.run_next(SyscallResult::new(crate::sched::ETIMEDOUT_RESULT as i64)))
         .map(|(served, result)| (served, result.raw()))
+}
+
+#[cfg(test)]
+mod signal_setup_copy_contract {
+    use super::*;
+
+    struct Copy {
+        writes: usize,
+        fault: bool,
+    }
+    impl UserCopy for Copy {
+        fn copy_in(&mut self, _: &mut [u8], _: UserVa) -> CopyOutcome {
+            CopyOutcome::Fault
+        }
+        fn copy_out(&mut self, _: UserVa, _: &[u8]) -> CopyOutcome {
+            self.writes += 1;
+            CopyOutcome::from_completed(!self.fault)
+        }
+    }
+
+    #[test]
+    fn resident_setup_outputs_complete_in_shared_policy() {
+        let page = ThreadLifecyclePage::new();
+        let slot = ThreadControlSlot::new();
+        let thread = LifecycleThread {
+            page: &page,
+            slot: &slot,
+        };
+        let mut copy = Copy {
+            writes: 0,
+            fault: false,
+        };
+        assert!(matches!(
+            serve_sigprocmask([0, 0, 1, 8, 0, 0], thread, &mut copy),
+            Some(Ok(false))
+        ));
+        assert_eq!(copy.writes, 1);
+        assert!(matches!(
+            serve_sigaltstack(
+                [0, 1, 0, 0, 0, 0],
+                thread,
+                &mut copy,
+                None,
+                carrick_guest_arch::GuestIsa::Aarch64
+            ),
+            Some(Ok(()))
+        ));
+        assert_eq!(copy.writes, 2);
+    }
+
+    #[test]
+    fn resident_setup_output_fault_is_typed_without_continuation() {
+        let page = ThreadLifecyclePage::new();
+        let slot = ThreadControlSlot::new();
+        let thread = LifecycleThread {
+            page: &page,
+            slot: &slot,
+        };
+        let mut copy = Copy {
+            writes: 0,
+            fault: true,
+        };
+        assert!(
+            matches!(serve_sigprocmask([0, 0, 1, 8, 0, 0], thread, &mut copy), Some(Err(SignalSetupError::Errno(errno, false))) if errno == carrick_syscall_abi::LINUX_EFAULT)
+        );
+        assert!(
+            matches!(serve_sigaltstack([0, 1, 0, 0, 0, 0], thread, &mut copy, None, carrick_guest_arch::GuestIsa::Aarch64), Some(Err(SignalSetupError::Errno(errno, false))) if errno == carrick_syscall_abi::LINUX_EFAULT)
+        );
+        assert_eq!(copy.writes, 2);
+    }
 }

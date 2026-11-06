@@ -221,17 +221,8 @@ impl<'a> LifecycleNative<'a> for Turn<'a> {
         bytes: Vec<u8>,
         work: bool,
     ) -> carrick_personality_linux::lifecycle::LifecycleOutcome {
-        let result = match self.copy_out(address, &bytes) {
-            carrick_core::personality::CopyOutcome::Done => 0,
-            carrick_core::personality::CopyOutcome::Fault => -14,
-            carrick_core::personality::CopyOutcome::NotYet(_) => {
-                panic!("eager test venue refused output")
-            }
-        };
-        carrick_personality_linux::lifecycle::LifecycleOutcome::Returned {
-            result: carrick_personality_linux::abi::entry::SyscallResult::new(result),
-            work,
-        }
+        let _ = (address, bytes, work);
+        panic!("eager test venue cannot retain an unavailable output")
     }
 
     fn guest_isa(&self) -> carrick_guest_arch::GuestIsa {

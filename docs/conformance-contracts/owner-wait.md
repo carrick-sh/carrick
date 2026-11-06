@@ -167,3 +167,17 @@ These bindings exercise the production dispatcher and completion fold. They
 do not establish signed scheduler/VMM or Docker differential acceptance.
 Those gates remain director-owned. Immediate ppoll publication and the other
 operation families still listed on #986 remain outside this slice.
+
+Signal setup copies a resident old mask, alternate stack or action directly
+through the typed user-copy interface. Only `NotYet` retains an owned output;
+`Fault` returns errno 14 with any already committed setup effect preserved.
+The resident shared-policy witnesses require completion without invoking a
+native continuation hook. The native physical adapter cannot report a partial
+multi-page copy through `CopyOutcome`, so it transfers such outputs to the
+retained page cursor before writing any bytes. This conservative native path
+also retains a payload when both pages are resident. The production dispatch
+witness `native_signal_setup_cross_page_owner_wait_writes_each_byte_once`
+places an eight-byte old mask three bytes before a page boundary, writes those
+three bytes, waits on the second page's exact owner, and requires only the
+remaining five bytes on resume. No initial copy or completion hook may replay
+the committed first page or the already committed mask update.

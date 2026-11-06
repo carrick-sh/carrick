@@ -462,6 +462,8 @@ pub trait SignalNative<'a>: crate::lifecycle::UserCopy {
         &mut self,
         request: carrick_core::personality::GuestCopyRequest,
     ) -> SignalOutcome;
+    /// Retain an already attempted output after `NotYet`, without retrying
+    /// the user copy before transferring it to the continuation owner.
     fn finish_signal_output(
         &mut self,
         address: carrick_guest_arch::UserVa,
@@ -617,10 +619,21 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
                 oldact.sa_flags = flags;
                 oldact.sa_mask = [current.mask.bits()];
                 let bytes = IntoBytes::as_bytes(&oldact);
-                return Some(native.finish_signal_output(
-                    carrick_guest_arch::UserVa::new(oldact_ptr),
-                    bytes.to_vec(),
-                ));
+                let address = carrick_guest_arch::UserVa::new(oldact_ptr);
+                return match crate::lifecycle::copy_setup_output(native, address, bytes, false) {
+                    Ok(()) => returned(0, false),
+                    Err(crate::lifecycle::SignalSetupError::Errno(errno, work)) => {
+                        returned(errno.guest_retval(), work)
+                    }
+                    Err(crate::lifecycle::SignalSetupError::Input(request)) => {
+                        Some(native.wait_guest_copy(request))
+                    }
+                    Err(crate::lifecycle::SignalSetupError::Output {
+                        address,
+                        bytes,
+                        work: _,
+                    }) => Some(native.finish_signal_output(address, bytes)),
+                };
             }
             returned(0, false)
         }
