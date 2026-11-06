@@ -19,6 +19,8 @@ permissions:
   contents: read
 
 env:
+  # CI checkouts live on internal storage; /Volumes/carrick is cold cache.
+  CARRICK_HOME: ${{ github.workspace }}/target/carrick-home
   CARGO_TERM_COLOR: always
   # Swatinem/rust-cache exports CARGO_INCREMENTAL=0 in the jobs that use it, and
   # sccache hashes every CARGO_* variable into its key. Pin it workflow-wide so

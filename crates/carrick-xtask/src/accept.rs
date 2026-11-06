@@ -1423,6 +1423,9 @@ fn run_command_redirect(
     for (k, v) in env {
         cmd.env(k, v);
     }
+    // Gate checkouts are admitted on the host's internal volume. Keep runtime
+    // scratch there rather than probing the conventional cold-storage mount.
+    cmd.env("CARRICK_HOME", cwd.join("target/carrick-home"));
     // A focused local build override must never narrow an acceptance gate.
     cmd.env_remove("CARRICK_TEST_TARGET");
 
@@ -2441,6 +2444,26 @@ mod tests {
             AcceptPhase::Host
         );
         assert!(profile_phase(profile, AcceptPhase::Signed).is_err());
+    }
+
+    #[test]
+    fn acceptance_child_uses_checkout_scratch_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease =
+            HostLease::acquire_path(&dir.path().join("host.lock"), HostLeaseMode::Gate).unwrap();
+        let (status, _) = run_command_redirect(
+            &lease,
+            "sh",
+            &[
+                "-c",
+                "test \"$CARRICK_HOME\" = \"$PWD/target/carrick-home\"",
+            ],
+            &[("CARRICK_HOME", "/Volumes/carrick")],
+            dir.path(),
+            &dir.path().join("log"),
+        )
+        .unwrap();
+        assert_eq!(status, Some(0));
     }
 
     #[test]

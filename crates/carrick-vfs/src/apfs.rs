@@ -240,7 +240,7 @@ fn split_at_last_paren(s: &str) -> (&str, &str) {
 }
 
 /// Where should `HostFsBackend` place its per-run scratch dir? An explicit
-/// `CARRICK_HOME` places scratch at `$CARRICK_HOME/scratch` without touching
+/// `CARRICK_HOME` places scratch at `$CARRICK_HOME/scratch`, checking it without touching
 /// the conventional mount. Prefer
 /// the dedicated carrick APFS volume (always case-sensitive, isolated,
 /// throw-away-able). Fall back to `~/.carrick/scratch` for hosts where
@@ -251,50 +251,67 @@ fn split_at_last_paren(s: &str) -> (&str, &str) {
 /// list` — that enumerates every APFS container on the system and costs
 /// ~250 ms, which a profile showed dominated trivial-guest startup. A
 /// volume named `carrick` is mounted by `diskutil apfs addVolume` at the
-/// conventional `/Volumes/carrick`; a bounded case-sensitivity probe validates
+/// conventional `/Volumes/carrick`; a nonblocking case-sensitivity probe validates
 /// that candidate without enumerating disks. The slow
 /// `diskutil`-backed `find_carrick_volume` is reserved for the explicit
 /// `carrick volume` subcommands, not this per-run path.
 pub fn preferred_scratch_root() -> &'static ScratchRoot {
     // One process configuration authority owns both immutable decisions.
     static CACHE: std::sync::OnceLock<ScratchRoot> = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| ScratchRoot {
-        path: resolve_scratch_root(&Path::new("/Volumes").join(DEFAULT_VOLUME_NAME)),
-        #[cfg(feature = "fs-memory")]
-        backend_kind: std::sync::OnceLock::new(),
-    })
+    CACHE.get_or_init(|| resolve_scratch_root(&Path::new("/Volumes").join(DEFAULT_VOLUME_NAME)))
 }
 
-/// The selected scratch path and its lazily determined backend policy. Each
-/// decision runs once, admitting at most two probe workers in this process.
+/// The selected scratch path and its case-sensitivity decision, checked once.
 pub struct ScratchRoot {
     path: PathBuf,
-    #[cfg(feature = "fs-memory")]
-    backend_kind: std::sync::OnceLock<carrick_spec::FsBackendKind>,
+    case_sensitive: bool,
 }
 
 impl ScratchRoot {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Refuse host-backed Linux paths unless the selected root passed the probe.
+    pub fn host_path(&self) -> std::io::Result<&Path> {
+        if self.case_sensitive {
+            Ok(&self.path)
+        } else {
+            Err(std::io::Error::other(format!(
+                "scratch root {} is not usable as a case-sensitive filesystem",
+                self.path.display()
+            )))
+        }
+    }
 }
 
-fn resolve_scratch_root(conventional: &Path) -> PathBuf {
+fn checked_scratch_root(path: PathBuf) -> ScratchRoot {
+    let case_sensitive = std::fs::create_dir_all(&path).is_ok() && probe_case_sensitive(&path);
+    ScratchRoot {
+        path,
+        case_sensitive,
+    }
+}
+
+fn resolve_scratch_root(conventional: &Path) -> ScratchRoot {
     if let Some(home) = std::env::var_os("CARRICK_HOME").filter(|s| !s.is_empty()) {
-        return PathBuf::from(home).join("scratch");
+        return checked_scratch_root(PathBuf::from(home).join("scratch"));
     }
     // Fast path: the conventional mount point of the carrick volume. Verify
     // it's actually case-sensitive (a Linux ABI requirement) so a coincidental
     // dir at that path on a case-insensitive boot volume can't be mistaken for
     // our volume.
     if probe_case_sensitive(conventional) {
-        return conventional.to_owned();
+        return ScratchRoot {
+            path: conventional.to_owned(),
+            case_sensitive: true,
+        };
     }
     // No explicit home and no usable conventional mount: use the user's home.
     let home = std::env::var_os("HOME")
         .map(|h| PathBuf::from(h).join(".carrick"))
         .unwrap_or_else(|| PathBuf::from("/tmp/carrick"));
-    home.join("scratch")
+    checked_scratch_root(home.join("scratch"))
 }
 
 /// The default writable-layer backend when the user passes no `--fs`.
@@ -311,81 +328,48 @@ pub fn default_writable_backend_kind() -> carrick_spec::FsBackendKind {
     }
     #[cfg(feature = "fs-memory")]
     {
-        let scratch = preferred_scratch_root();
-        *scratch
-            .backend_kind
-            .get_or_init(|| resolve_writable_backend_kind(scratch.path()))
+        if preferred_scratch_root().case_sensitive {
+            carrick_spec::FsBackendKind::Host
+        } else {
+            carrick_spec::FsBackendKind::Memory
+        }
     }
 }
 
-#[cfg(feature = "fs-memory")]
-fn resolve_writable_backend_kind(probe: &Path) -> carrick_spec::FsBackendKind {
-    if std::fs::create_dir_all(probe).is_err() {
-        return carrick_spec::FsBackendKind::Memory;
-    }
-    if probe_case_sensitive(probe) {
-        carrick_spec::FsBackendKind::Host
-    } else {
-        tracing::warn!(
-            "carrick: {} is case-insensitive; defaulting --fs to memory. \
-             Pass `--fs host` to force the cap-std backend (some Linux tools may misbehave).",
-            probe.display()
-        );
-        carrick_spec::FsBackendKind::Memory
-    }
-}
-
-/// An owned probe attempt. Dropping it detaches rather than joining a worker
-/// that may be stuck inside a host filesystem syscall.
-struct CaseSensitivityProbe {
-    result: std::sync::mpsc::Receiver<bool>,
-    _worker: std::thread::JoinHandle<()>,
-}
-
-impl CaseSensitivityProbe {
-    fn start(path: &Path) -> std::io::Result<Self> {
-        let path = path.to_owned();
-        let (send, result) = std::sync::mpsc::sync_channel(1);
-        let worker = std::thread::Builder::new()
-            .name("carrick-case-probe".into())
-            .spawn(move || {
-                let result = probe_case_sensitive_inner(&path);
-                let _ = send.send(result);
-            })?;
-        Ok(Self {
-            result,
-            _worker: worker,
-        })
-    }
-
-    fn wait(&self) -> bool {
-        self.result
-            .recv_timeout(std::time::Duration::from_millis(250))
-            .unwrap_or(false)
-    }
-}
-
-/// Probe whether `path` resides on a case-sensitive filesystem. All filesystem
-/// work (including close and unlink) runs behind a 250 ms caller deadline.
-/// Only the two cached production decisions above may launch a probe; keeping
-/// this private bounds outstanding workers to two per process on a sick disk.
+/// Probe with exclusive nonblocking creation. Existing files (including FIFOs,
+/// devices and symlinks) are unusable and must never be opened or removed.
+/// O_NONBLOCK prevents FIFO rendezvous; it does not bound filesystem device I/O.
+/// Gate hosts must select an internal root with CARRICK_HOME to avoid USB stalls.
 fn probe_case_sensitive(path: &Path) -> bool {
-    CaseSensitivityProbe::start(path)
-        .map(|probe| probe.wait())
-        .unwrap_or(false)
+    // A private namespace prevents simultaneous startups from treating each
+    // other's live sentinel as an unusable filesystem.
+    let Ok(directory) = tempfile::Builder::new()
+        .prefix(".carrick-case-")
+        .tempdir_in(path)
+    else {
+        return false;
+    };
+    probe_case_sensitive_in(directory.path())
 }
 
-fn probe_case_sensitive_inner(path: &Path) -> bool {
+fn probe_case_sensitive_in(path: &Path) -> bool {
+    use std::os::unix::fs::OpenOptionsExt;
     let lower = path.join(".carrick-case-probe");
     let upper = path.join(".CARRICK-case-probe");
-    if std::fs::File::create(&lower).is_err() {
+    let Ok(file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_EXCL)
+        .open(&lower)
+    else {
         return false;
-    }
+    };
+    let regular = file.metadata().is_ok_and(|metadata| metadata.is_file());
     let metadata_upper = std::fs::metadata(&upper);
     let _ = std::fs::remove_file(&lower);
     // On case-sensitive: upper doesn't exist → Err.
     // On case-insensitive: upper opens the same inode as lower → Ok.
-    matches!(metadata_upper, Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    regular && matches!(metadata_upper, Err(error) if error.kind() == std::io::ErrorKind::NotFound)
 }
 
 #[cfg(test)]
@@ -425,7 +409,7 @@ mod serial_host {
                 None => std::env::remove_var("CARRICK_HOME"),
             }
         }
-        assert_eq!(actual, chosen.join("scratch"));
+        assert_eq!(actual.path(), chosen.join("scratch"));
         assert!(
             chosen.join("scratch").is_dir(),
             "override must be created and checked for case sensitivity"
@@ -434,34 +418,69 @@ mod serial_host {
 
     #[test]
     fn serial_host_case_probe_fifo_is_bounded() {
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::FileTypeExt;
         let root = tempfile::tempdir().unwrap();
         let fifo = root.path().join(".carrick-case-probe");
         let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
         // SAFETY: name is a valid NUL-terminated path.
         assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
-        let probe = CaseSensitivityProbe::start(root.path()).unwrap();
-        let result = probe.wait();
-        // Release the FIFO, then require actual worker completion before joining
-        // and removing the directory. Every receive has a deadline.
-        let reader = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&fifo)
-            .unwrap();
-        probe
-            .result
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap();
-        probe._worker.join().unwrap();
-        drop(reader);
-        assert!(fifo.exists(), "probe must not remove an existing special file");
-        assert!(!result, "stalled probe must fail closed within 250 ms");
-        #[cfg(target_os = "linux")]
+        assert!(!probe_case_sensitive_in(root.path()));
         assert!(
-            probe_case_sensitive(root.path()),
-            "probe must recover after FIFO release"
+            std::fs::symlink_metadata(&fifo)
+                .unwrap()
+                .file_type()
+                .is_fifo()
         );
+    }
+
+    #[test]
+    fn unusable_override_refuses_host_backend() {
+        let root = tempfile::tempdir().unwrap();
+        let chosen = root.path().join("scratch");
+        std::fs::write(&chosen, b"not a directory").unwrap();
+        let previous = std::env::var_os("CARRICK_HOME");
+        // SAFETY: environment changes run only in the serial_host partition.
+        unsafe { std::env::set_var("CARRICK_HOME", root.path()) };
+        let actual = resolve_scratch_root(root.path());
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("CARRICK_HOME", value),
+                None => std::env::remove_var("CARRICK_HOME"),
+            }
+        }
+        assert_eq!(actual.path(), chosen);
+        assert!(actual.host_path().is_err());
+        assert_eq!(std::fs::read(chosen).unwrap(), b"not a directory");
+    }
+
+    #[test]
+    fn simultaneous_probes_have_private_namespaces() {
+        let root = tempfile::tempdir().unwrap();
+        // A sentinel from another run must not make this root unusable.
+        std::fs::write(root.path().join(".carrick-case-probe"), b"owned by peer").unwrap();
+        let expected = probe_case_sensitive(root.path());
+        std::thread::scope(|scope| {
+            let tasks: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| probe_case_sensitive(root.path())))
+                .collect();
+            for task in tasks {
+                assert_eq!(task.join().unwrap(), expected);
+            }
+        });
+        assert_eq!(
+            std::fs::read(root.path().join(".carrick-case-probe")).unwrap(),
+            b"owned by peer"
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn probe_preserves_existing_regular_file() {
+        let root = tempfile::tempdir().unwrap();
+        let collision = root.path().join(".carrick-case-probe");
+        std::fs::write(&collision, b"keep me").unwrap();
+        assert!(!probe_case_sensitive_in(root.path()));
+        assert_eq!(std::fs::read(collision).unwrap(), b"keep me");
     }
 
     #[test]
