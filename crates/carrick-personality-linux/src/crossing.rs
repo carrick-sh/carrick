@@ -294,7 +294,6 @@ host_crossings! {
     Gettimeofday = nr::GETTIMEOFDAY, false, Permanent;
     Getrandom = nr::GETRANDOM, false, Permanent;
     Eventfd2 = nr::EVENTFD2, false, Temporary;
-    EpollCreate1 = nr::EPOLL_CREATE1, false, Temporary;
     EpollCtl = nr::EPOLL_CTL, false, Temporary;
     EpollPwait = nr::EPOLL_PWAIT, true, Temporary;
     Dup = nr::DUP, false, Temporary;

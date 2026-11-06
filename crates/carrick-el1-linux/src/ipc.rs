@@ -170,6 +170,35 @@ fn release_native_description<C: carrick_el1_abi::EntryContext>(
     Ok(())
 }
 
+/// Deliver the shared epoll core's publication after dropping object locks.
+pub(crate) fn notify_native_wake<C: carrick_el1_abi::EntryContext>(
+    wake: carrick_el1_abi::ipc::IpcWake,
+    zone: Option<(&carrick_sched_core::ZoneTables<C>, carrick_el1_abi::SlotId)>,
+    task: &CurrentTask,
+) {
+    if wake.host_owed {
+        task.linux.mark_pending_host_work();
+    }
+    let Some((zone, slot)) = zone else {
+        return;
+    };
+    let Some(key) = wait_key(wake.object, WaitFor::Readable) else {
+        return;
+    };
+    let result = loop {
+        match carrick_core::wait::notify_object(zone, slot, key) {
+            Err(ObjectWaitError::Busy) => core::hint::spin_loop(),
+            result => break result,
+        }
+    };
+    if let Ok((report, effects)) = result {
+        if report.deferred != 0 {
+            task.linux.mark_pending_host_work();
+        }
+        crate::sched::object_wait::deliver_wake_effects(zone, slot, effects);
+    }
+}
+
 pub(crate) fn is_zone_releasable_backing(
     description: carrick_el1_abi::ipc::fd::Description,
 ) -> bool {

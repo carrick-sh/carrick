@@ -129,3 +129,31 @@ cannot replace the constructor witnesses: acceptance still requires applying
 member operations to the epoll returned by the new constructor in both root
 and child. It also does not prove blocking wake delivery, MOD/DEL, or timer
 arming/expiry. No crossing policy or production service changes here.
+
+## Epoll implementation checkpoint
+
+The shared descriptor family now serves `epoll_create1`, and zone-member
+`epoll_ctl` uses the existing shared epoll core. Construction validates
+CLOEXEC, binds scheduler readiness keys and rolls the object back if
+numeric publication fails. Root descriptors backed by zone objects select
+that same ring descriptor owner for fcntl, close and duplication. The
+control input uses the guest ISA's event layout (16 bytes on ARM, packed
+12 bytes on x86).
+
+The three existing epoll witnesses pass in the VM-free native suite; the
+six pipe, eventfd and timer constructor witnesses still fail. This is an
+implementation checkpoint, not completed constructor acceptance. In
+particular, the newly constructed object has only the existing empty-wait
+witness; the independent pipe-readiness control uses a pre-admitted epoll.
+No additional witnesses were added in this continuation.
+
+Independent review requests changes: root epolls created by this path
+lack the host description required by forwarded host-member operations;
+shared-core HostHalf refusals still forward; object/OFD growth contention
+can become EIO; and native wait fallback cases and x86 wait parity remain
+unresolved. These are blockers, not accepted semantics or follow-up-only
+coverage. Removing the constructor crossing in this checkpoint does not
+establish that the root's full existing epoll surface is preserved. Do not
+land it without resolving those findings and obtaining confirming review
+and signed proof. No Go-build or guest-execution claim follows from the
+VM-free results.

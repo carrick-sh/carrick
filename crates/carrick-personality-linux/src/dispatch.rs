@@ -656,6 +656,7 @@ const fn route_shared(ordinal: u64, allocator_control: u64) -> Family {
         226 => Family::Anonymous(AnonymousCall::Mprotect),
         63 => Family::Read,
         64 | 66 => Family::Write,
+        20 | 21 => Family::Descriptor,
         22 => Family::EpollWait,
         62 => Family::FileSeek,
         67 | 68 => Family::FilePositioned,

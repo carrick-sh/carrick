@@ -2401,14 +2401,34 @@ impl<
         self.frame.may_serve_poll()
     }
     fn native_descriptor_owner(&self) -> bool {
-        self.ipc
-            .zip(self.task())
-            .is_some_and(|(venue, task)| venue.tables.is_owned_table(task))
+        self.ipc.zip(self.task()).is_some_and(|(venue, task)| {
+            let nr = self.frame.canonical_ordinal().raw();
+            if nr == carrick_personality_linux::crossing::nr::EPOLL_CREATE1.raw()
+                || nr == carrick_personality_linux::crossing::nr::EPOLL_CTL.raw()
+                || venue.tables.is_owned_table(task)
+            {
+                return true;
+            }
+            // Root-created zone objects share the same descriptor owner
+            // as children; host-backed root descriptions keep their venue.
+            venue.tables.table_of(task).is_some_and(|raw| {
+                venue
+                    .region
+                    .fd(NativeFdWait)
+                    .get(
+                        carrick_el1_abi::ipc::fd::TableId::from_raw(raw),
+                        carrick_el1_abi::ipc::fd::Fd(self.frame.argument(0).unwrap_or(0) as i32),
+                    )
+                    .is_ok_and(ipc::is_zone_releasable_backing)
+            })
+        })
     }
     fn may_serve_descriptor(&self) -> bool {
         let ordinal = self.frame.canonical_ordinal().raw();
         if self.native_descriptor_owner() {
             if [
+                carrick_personality_linux::crossing::nr::EPOLL_CREATE1,
+                carrick_personality_linux::crossing::nr::EPOLL_CTL,
                 carrick_personality_linux::crossing::nr::DUP,
                 carrick_personality_linux::crossing::nr::DUP3,
                 carrick_personality_linux::crossing::nr::CLOSE,
@@ -3327,6 +3347,9 @@ fn map_fd_error(error: carrick_el1_abi::ipc::fd::Error) -> FamilyCompletion {
 
 fn map_ipc_error(error: carrick_el1_abi::ipc::IpcError) -> FamilyCompletion {
     match error {
+        carrick_el1_abi::ipc::IpcError::ZoneLimit => {
+            FamilyCompletion::Complete(carrick_abi::LINUX_ENFILE.guest_retval())
+        }
         carrick_el1_abi::ipc::IpcError::Fd(fd_err) => map_fd_error(fd_err),
         _ => FamilyCompletion::Complete(carrick_syscall_abi::LINUX_EIO.guest_retval()),
     }
@@ -3346,6 +3369,9 @@ fn run_with_table_growth<T>(
                 region
                     .ensure_table_capacity(table, descriptors, &NativeFdWait)
                     .map_err(map_ipc_error)?;
+            }
+            Err(carrick_el1_abi::ipc::fd::Error::NeedsOfds) => {
+                region.grow_ofds().map_err(map_ipc_error)?;
             }
             Err(err) => return Err(map_fd_error(err)),
         }
@@ -3468,7 +3494,7 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
         let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return FamilyCompletion::Forward;
         };
-        let Some(raw) = venue.tables.owned_table_of(task) else {
+        let Some(raw) = venue.tables.table_of(task) else {
             return FamilyCompletion::Forward;
         };
         let table = TableId::from_raw(raw);
@@ -3482,6 +3508,193 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
             .map(|(z, slot)| (z.tables, slot));
 
         match ordinal {
+            nr if nr == carrick_personality_linux::crossing::nr::EPOLL_CREATE1.raw() => {
+                let flags = self.frame.argument(0).unwrap_or(0) as u32 as u64;
+                if flags & !carrick_syscall_abi::LINUX_O_CLOEXEC != 0 {
+                    return FamilyCompletion::Complete(
+                        carrick_syscall_abi::LINUX_EINVAL.guest_retval(),
+                    );
+                }
+                let object = loop {
+                    match venue.region.create_epoll(&NativeFdWait) {
+                        Ok(object) => break object,
+                        Err(carrick_el1_abi::ipc::IpcError::NoObjects) => {
+                            if let Err(error) = venue.region.grow_objects() {
+                                return map_ipc_error(error);
+                            }
+                        }
+                        Err(error) => return map_ipc_error(error),
+                    }
+                };
+                if let Some((zone, _)) = zone {
+                    for lane in [
+                        carrick_el1_abi::ipc::pipe::WaitFor::Readable,
+                        carrick_el1_abi::ipc::pipe::WaitFor::Writable,
+                    ] {
+                        if let Some(key) = carrick_el1_abi::ipc::object_wait_key(object, lane)
+                            && zone
+                                .bind_object_wait(key, &carrick_sched_core::ShortLockSpin)
+                                .is_err()
+                        {
+                            let _ = venue.region.epoll_destroy(object, &NativeFdWait);
+                            return FamilyCompletion::Complete(
+                                carrick_syscall_abi::LINUX_EIO.guest_retval(),
+                            );
+                        }
+                    }
+                }
+                let description = carrick_el1_abi::ipc::fd::Description::new(
+                    carrick_el1_abi::ipc::IpcBacking::Epoll { object }.encode(),
+                    AccessMode::ReadWrite,
+                    carrick_el1_abi::ipc::fd::StatusFlags::default(),
+                );
+                let result = run_with_table_growth(&venue.region, table, |auth| {
+                    auth.open(table, Fd(0), description, flags != 0)
+                });
+                match result {
+                    Ok(fd) => FamilyCompletion::Complete(i64::from(fd.0)),
+                    Err(error) => {
+                        if let Err(release) = venue.region.epoll_destroy(object, &NativeFdWait) {
+                            return map_ipc_error(release);
+                        }
+                        error
+                    }
+                }
+            }
+            nr if nr == carrick_personality_linux::crossing::nr::EPOLL_CTL.raw() => {
+                use carrick_el1_abi::ipc::{
+                    IpcBacking,
+                    epoll::{EpollCtlError, EpollMember},
+                };
+                let authority = venue.region.fd(NativeFdWait);
+                let (epin, edesc) = match authority.pin(table, old) {
+                    Ok(pair) => pair,
+                    Err(error) => return map_fd_error(error),
+                };
+                let result = (|| {
+                    let Some(IpcBacking::Epoll { object: epoll }) =
+                        IpcBacking::decode(edesc.backing)
+                    else {
+                        // Host epolls retain their existing service; this
+                        // adapter owns only the shared zone representation.
+                        return FamilyCompletion::Forward;
+                    };
+                    let member_fd = Fd(self.frame.argument(2).unwrap_or(0) as i32);
+                    if member_fd == old {
+                        return FamilyCompletion::Complete(
+                            carrick_syscall_abi::LINUX_EINVAL.guest_retval(),
+                        );
+                    }
+                    let (pin, description) = match authority.pin(table, member_fd) {
+                        Ok(pair) => pair,
+                        Err(error) => return map_fd_error(error),
+                    };
+                    let result = (|| {
+                        let Some((member, kind)) = IpcBacking::decode(description.backing)
+                            .and_then(EpollMember::of_backing)
+                        else {
+                            return FamilyCompletion::Forward;
+                        };
+                        let op = self.frame.argument(1).unwrap_or(0) as u32 as u64;
+                        let mut bytes = [0u8; 16];
+                        let data_offset = if self.frame.arm_scheduler() { 8 } else { 4 };
+                        let event_bytes = data_offset + 8;
+                        if op != carrick_abi::LINUX_EPOLL_CTL_DEL {
+                            let mut user = file::ValidatedCopy {
+                                task,
+                                validator: &file::HardwareValidator,
+                            };
+                            if !user.copy_in(
+                                &mut bytes[..event_bytes],
+                                self.frame.argument(3).unwrap_or(0),
+                            ) {
+                                return FamilyCompletion::Complete(
+                                    carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
+                                );
+                            }
+                        }
+                        let events = u32::from_ne_bytes(bytes[..4].try_into().unwrap_or_default());
+                        let data = u64::from_ne_bytes(
+                            bytes[data_offset..event_bytes]
+                                .try_into()
+                                .unwrap_or_default(),
+                        );
+                        let key = pin.key();
+                        let key =
+                            (u64::from(key.index) << 32) | (key.generation & u64::from(u32::MAX));
+                        let result = match op {
+                            carrick_abi::LINUX_EPOLL_CTL_ADD => venue.region.epoll_add(
+                                epoll,
+                                member,
+                                kind,
+                                member_fd.0,
+                                key,
+                                events,
+                                data,
+                                &NativeFdWait,
+                            ),
+                            carrick_abi::LINUX_EPOLL_CTL_MOD => venue.region.epoll_modify(
+                                epoll,
+                                member_fd.0,
+                                key,
+                                events,
+                                data,
+                                &NativeFdWait,
+                            ),
+                            carrick_abi::LINUX_EPOLL_CTL_DEL => venue
+                                .region
+                                .epoll_delete(epoll, member_fd.0, key, &NativeFdWait)
+                                .map(|()| None),
+                            _ => {
+                                return FamilyCompletion::Complete(
+                                    carrick_syscall_abi::LINUX_EINVAL.guest_retval(),
+                                );
+                            }
+                        };
+                        match result {
+                            Ok(wake) => {
+                                if let Some(wake) = wake {
+                                    ipc::notify_native_wake(wake, zone, task);
+                                }
+                                FamilyCompletion::Complete(0)
+                            }
+                            Err(EpollCtlError::Exists) => {
+                                FamilyCompletion::Complete(carrick_abi::LINUX_EEXIST.guest_retval())
+                            }
+                            Err(EpollCtlError::NotFound) => {
+                                FamilyCompletion::Complete(carrick_abi::LINUX_ENOENT.guest_retval())
+                            }
+                            Err(EpollCtlError::Invalid) => FamilyCompletion::Complete(
+                                carrick_syscall_abi::LINUX_EINVAL.guest_retval(),
+                            ),
+                            Err(EpollCtlError::HostHalf(_)) => FamilyCompletion::Forward,
+                            Err(EpollCtlError::Ipc(error)) => map_ipc_error(error),
+                        }
+                    })();
+                    match authority.unpin_filtered(pin, ipc::is_zone_releasable_backing) {
+                        Ok(release) => {
+                            if let Err(error) =
+                                ipc::settle_native_release(&venue.region, release, zone, task)
+                            {
+                                return map_ipc_error(error);
+                            }
+                        }
+                        Err(error) => return map_fd_error(error),
+                    }
+                    result
+                })();
+                match authority.unpin_filtered(epin, ipc::is_zone_releasable_backing) {
+                    Ok(release) => {
+                        if let Err(error) =
+                            ipc::settle_native_release(&venue.region, release, zone, task)
+                        {
+                            return map_ipc_error(error);
+                        }
+                    }
+                    Err(error) => return map_fd_error(error),
+                }
+                result
+            }
             nr if nr == carrick_personality_linux::crossing::nr::DUP.raw() => {
                 let new_fd = match self.duplicate_owned_ipc(
                     venue,
