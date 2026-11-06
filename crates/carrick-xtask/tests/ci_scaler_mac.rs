@@ -507,7 +507,7 @@ fn reset_clears_inheritable_home_acl_without_replacing_inode() {
     let home = root.path().join("home");
     mkdir_mode(&skel, 0o700);
     mkdir_mode(&home, 0o700);
-    mkdir_mode(&skel.join("config"), 0o700);
+    mkdir_mode(skel.join("config"), 0o700);
     write_skeleton_entry(skel.join("config/clean"), "clean", 0o600);
     // An allow entry remains visible despite chmod 0700, and is inherited by
     // new children. This uses only a caller-owned temporary tree, without sudo.
