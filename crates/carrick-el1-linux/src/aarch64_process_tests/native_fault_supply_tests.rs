@@ -5233,3 +5233,133 @@ fn unmanaged_thread_birth_reusing_freed_record_does_not_observe_stale_mm() {
         "reused record must carry caller MM, never a freed predecessor's MM"
     );
 }
+
+/// #1692: a glibc `pthread_create` child faulted on its first fetch of a
+/// libc text page (ESR 0x82000007) and the host delivered SIGSEGV. Each
+/// vCPU has one single-flight frame-grant mailbox. A sibling thread's
+/// anonymous grant refusal is left in RESPONSE on that vCPU when the EL1
+/// scheduler switches threads between the refusal and the sibling's
+/// re-fault (the sibling later consumes it from a peer slot). The child
+/// then runs on that vCPU and takes a file-backed instruction fault. The
+/// file first-touch handoff could not publish its request, cancelled its
+/// selection and still reported the fault as handed off, so the host found
+/// neither selection nor request and answered a valid exec mapping with
+/// SIGSEGV. This drives the production EL1 fault entry with two live threads
+/// and the sibling refusal ordered before the child's first fetch.
+#[test]
+fn arm_sibling_refusal_on_vcpu_mailbox_never_erases_child_file_first_fetch() {
+    use carrick_el1::fault::{GrantMailboxes, NoopCowResolver, PreparedFaultPath};
+    const CODE: u64 = VA + 0x20_0000;
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    fixture.zone.spaces.set_idle_ttbr(0x30000);
+    // The parent (sibling) is a second live thread of the same MM on slot 1.
+    let sibling_slot = SlotId::new(1);
+    fixture.zone.drive(sibling_slot, 1);
+    fixture.zone.publish_slot(sibling_slot, 1, Some(1), 2);
+    fixture.zone.enter_guest(sibling_slot);
+    fixture.zone.install_space(sibling_slot, 1).unwrap();
+    let (_, sibling) =
+        imported_thread_on_slot(fixture, sibling_slot, |identity| identity.affinity = 2);
+    assert!(fixture.zone.live(sibling).is_some());
+    assert_eq!(fixture.page.live(), 2);
+    let portal = fixture.region.portal_slots();
+    assert!(portal.bind_carrier(NonZeroU64::MIN));
+    let handle = crate::cow_resolver::admitted_fault_mm_handle(
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        fixture.slot,
+        &fixture.task,
+    )
+    .expect("admitted root supplies the exact MM handle");
+    let mm = handle.mm();
+
+    // libc text: a private file-backed, read+execute mapping.
+    let source = carrick_el1_abi::HostBackingIdentity::new(
+        NonZeroU64::new(71).unwrap(),
+        NonZeroU64::new(4).unwrap(),
+        0,
+    );
+    let owner_portal = crate::aarch64_process::Portal::for_zone(
+        NonZeroU64::MIN,
+        fixture.region.table(),
+        fixture.zone,
+    );
+    let incarnation = {
+        let mut root = owner_portal.root_any(mm, 0).unwrap();
+        root.insert_opaque_backed(
+            carrick_el1_abi::ReservationRange::new(CODE, CODE + 0x4000).unwrap(),
+            carrick_el1_abi::ReservationProtection::from_bits(5).unwrap(),
+            carrick_el1_abi::ReservationNodeFlags::PRIVATE,
+            Some(source),
+        )
+        .unwrap();
+        root.node(VA).unwrap().1
+    };
+
+    // The sibling's anonymous first touch on this vCPU was refused, and the
+    // sibling was switched away before re-faulting: RESPONSE stays here.
+    let mailbox = carrick_el1_abi::FrameGrantMailbox::new();
+    let sibling_generation = carrick_core::mm::fault::next_frame_grant_generation();
+    assert!(
+        mailbox.try_publish_request(carrick_el1_abi::FrameGrantRequest {
+            mm_key: mm.raw(),
+            reservation_incarnation: incarnation,
+            request_generation: sibling_generation,
+            fault_va: VA + 8,
+            requested_len: carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE,
+            access: 2,
+        })
+    );
+    assert!(mailbox.claim_request().is_some());
+    assert!(mailbox.publish_refusal(carrick_el1_abi::FRAME_GRANT_ERR_DENIED));
+
+    // The child's first instruction fetch of the libc page on that vCPU.
+    let far = CODE + 0x660;
+    let mut frame = carrick_el1_abi::TrapFrame {
+        esr: 0x8200_0007,
+        far,
+        elr: far,
+        slot: u64::from(fixture.slot.raw()),
+        ..Default::default()
+    };
+    let residency = carrick_el1::cow::test_support::residency_table();
+    let words = fixture.tables.live(&fixture.maintenance);
+    let counters = carrick_el1_abi::Counters::new();
+    let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
+    let supply = OwnerFaultSupply::new(portal).with_handle(handle);
+    let action = carrick_el1::fault::dispatch_fault_with_prepared(
+        &mut frame,
+        &counters,
+        core::slice::from_ref(&fixture.task),
+        access,
+        crate::cow_resolver::native_fault_supply(false, GrantMailboxes::own(&mailbox), &supply),
+        Some(PreparedFaultPath {
+            residency: &residency,
+            resolver: &mut SelectionWords(&words),
+            roots: Some(fixture.region.table()),
+            file_slots: Some(portal),
+        }),
+        &mut NoopCowResolver,
+    );
+    assert_eq!(action, carrick_el1_abi::Action::Forward);
+    if let OwnerFaultSupplyOutcome::Wait(_) = supply.outcome() {
+        return;
+    }
+    // The host serves an owner file fault only from this exact pair; any
+    // other forward of a file translation fault becomes SIGSEGV.
+    let selection = portal
+        .grant(usize::from(fixture.slot.raw()))
+        .unwrap()
+        .pending_fault_selection(mm.raw(), far);
+    let request = mailbox.claim_request_for_fault(mm.raw(), far, 4);
+    let (Some((generation, window)), Some(request)) = (selection, request) else {
+        panic!(
+            "child file first fetch forwarded with no owner handoff (selection={selection:?}, \
+             request={request:?}); the host answers it with SIGSEGV"
+        );
+    };
+    assert_eq!(request.request_generation, generation);
+    assert_eq!(window.fault_page, far & !4095);
+    assert!(window.host_backing.is_some());
+}

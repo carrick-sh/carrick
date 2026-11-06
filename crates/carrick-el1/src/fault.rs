@@ -1657,7 +1657,9 @@ fn dispatch_classified_fault<
         return Action::Forward;
     }
 
-    #[cfg(target_os = "none")]
+    // The VM-free EL1 harness (`host-test`) drives this exact production
+    // file first-touch handoff; only the hardware entry differs.
+    #[cfg(any(target_os = "none", feature = "host-test"))]
     if let Some(roots) = prepared.as_ref().and_then(|path| path.roots)
         && let Some(slots) = prepared.as_ref().and_then(|path| path.file_slots)
     {
