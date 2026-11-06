@@ -146,6 +146,8 @@ fn production_x86_family_absences_obey_crossings_without_user_memory() {
         ("loader openat", 257),
         ("loader legacy access", 21),
         ("loader writev", 20),
+        ("loader fstat", 5),
+        ("loader newfstatat", 262),
         ("file seek", 8),
         ("file pread", 17),
         ("file pwrite", 18),
@@ -195,7 +197,7 @@ fn production_x86_family_absences_obey_crossings_without_user_memory() {
                 None,
                 |_| core::ptr::null_mut(),
             );
-            let allowed = matches!(native, 0 | 1 | 8 | 17 | 18 | 20 | 21 | 257 | 281);
+            let allowed = matches!(native, 0 | 1 | 5 | 8 | 17 | 18 | 20 | 21 | 257 | 262 | 281);
             assert_eq!(
                 action,
                 if allowed {
@@ -225,7 +227,10 @@ fn production_x86_family_absences_obey_crossings_without_user_memory() {
                 "{family} must distinguish ISA refusal from semantic forwarding"
             );
             assert_eq!(
-                counters.served[call.canonical.raw() as usize].load(Ordering::Relaxed),
+                counters
+                    .served
+                    .get(call.canonical.raw() as usize)
+                    .map_or(0, |count| count.load(Ordering::Relaxed)),
                 0,
                 "{family} must not record a guest service"
             );
