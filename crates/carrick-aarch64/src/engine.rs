@@ -3666,10 +3666,16 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
 impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     fn atomic_load_user_u32(&self, address: u64) -> Result<u32, MemoryError> {
         if self.protections.owner().is_some() {
-            // The owner transfer supplies or waits for an absent private page.
-            // The backend atomic then revalidates and pins that exact live
-            // backing through the instruction; the copied bytes are not used.
-            let _ = self.read_owner_bytes(address, size_of::<u32>())?;
+            // The selected transfer retains the exact owner through its one
+            // aligned word copy. This is the only venue for an owner-private
+            // page that deliberately has no host task mapping.
+            let bytes = self.read_owner_bytes(address, size_of::<u32>())?;
+            return Ok(u32::from_ne_bytes(bytes.try_into().map_err(|_| {
+                MemoryError::OutOfBounds {
+                    address,
+                    length: size_of::<u32>(),
+                }
+            })?));
         }
         self.vm.atomic_load_user_u32(address)
     }
