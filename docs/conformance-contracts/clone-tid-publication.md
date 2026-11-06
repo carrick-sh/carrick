@@ -224,6 +224,28 @@ sibling stores. No new test is claimed here: constructing this witness is
 still a prerequisite before implementation, along with independent review of
 this cross-crate lock order.
 
+## Additional production-entry reduction
+
+`clone_tid_not_yet_retains_birth_with_a_registered_mapping_editor` adds a
+VM-free first-boundary witness in `aarch64_process_tests/native_fault_supply_tests.rs`.
+Both actors have retained native scheduler records and enter the production
+registry/process venue with distinct bindings in the same MM. Both destination
+leaves are absent; the production selector must request supply for each.
+The existing host hardware-fault switch makes the normal `UserCopy` path return
+`CopyOutcome::NotYet`. Clone is dispatched with the real process venue, then the
+sibling enters that same owner and changes the second page's protection through
+`serve_delegated_anonymous`, including descriptor and reservation settlement.
+The expected red result is clone forwarding while retaining execution capacity,
+instead of suspending with an owned copy request. No runtime code changes.
+
+This is still a partial witness. The hardware fault is injected, and the
+independent `copy_in` observation is not evidence of a retained clone request.
+The sibling performs real protection work, but does not contend against an
+aggregate transaction. There are no admitted sibling byte reads, unmap,
+owner-wait enrollment, backing supply/resume, successful birth or post-admission
+birth-refusal schedule in this reduction. Those parts of the replacement
+witness above remain required before implementation or acceptance.
+
 ## Current red reduction and remaining acceptance
 
 `clone_tid_refusal_does_not_erase_a_live_siblings_store` creates a real sibling
