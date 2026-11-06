@@ -67,6 +67,24 @@ artifacts move to the external USB volume (`/Volumes/carrick`, 233 GB total):
      directories `0700` so `carrick-hvf` has zero read or write access to director volumes
      or `ci`'s volume (matching #650 / #1169).
 
+### Runtime scratch stays internal
+
+The conventional `/Volumes/carrick` mount is cold USB storage on cloudmac.
+Runtime scratch must instead use the admitted internal checkout. The shared
+`prepare-cargo` action exports `CARRICK_HOME=$GITHUB_WORKSPACE/target/carrick-home`
+when no override is set; signed test scripts use `$PWD/target/carrick-home`
+under the same condition. Acceptance commands always set their child processes'
+`CARRICK_HOME` to `<checkout>/target/carrick-home`. Any explicit CI override must
+also point to internal storage.
+
+The shared VFS resolver checks `$CARRICK_HOME/scratch` before touching the
+conventional mount. An unusable explicit root fails closed for the host
+backend rather than falling back to USB. Each candidate's directory creation,
+case-sensitivity probe and cleanup share a two-second caller deadline. The
+result is cached for the process lifetime. A timed-out filesystem worker is
+detached, so the deadline bounds the caller's wait; it cannot cancel kernel
+I/O. Selecting internal storage remains necessary even with that deadline.
+
 ## Host setup and #1232 binding security requirements
 
 Performed by the owner on `cloudmac` before enabling `sh.carrick.hvf-runner`:
