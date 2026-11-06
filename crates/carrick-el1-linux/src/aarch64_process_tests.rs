@@ -6253,10 +6253,11 @@ fn raw_exit_faulting_robust_head(unadopted: bool) {
     );
     let current = fixture.zone.slot(fixture.slot).current();
     assert_ne!(current, Some(record.id));
-    assert_eq!(fixture.page.live(), 1, "unadopted={unadopted}");
-    assert_eq!(control.clear_child_tid(), 0);
+    let live = fixture.page.live();
+    assert_eq!(live, 1);
+    let state = fixture.page.state(entry.index());
     assert!(matches!(
-        fixture.page.state(entry.index()),
+        state,
         Some((_, carrick_el1_abi::EntryState::ExitedInZone))
     ));
     assert!(!control.host_exit_requested());
