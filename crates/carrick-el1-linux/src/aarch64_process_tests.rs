@@ -10182,7 +10182,7 @@ fn serial_host_native_fork_children_create_timerfd_in_their_own_tables() {
     ));
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(test, not(target_os = "macos")))]
 fn native_fork_descriptor_calls(constructor: Option<u64>) {
     use carrick_abi::{
         LINUX_F_DUPFD, LINUX_F_DUPFD_CLOEXEC, LINUX_F_GETFD, LINUX_F_GETFL, LINUX_F_SETFD,
