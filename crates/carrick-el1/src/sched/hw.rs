@@ -130,10 +130,10 @@ pub(crate) fn atomic_load_u32(task: &CurrentTask, address: u64) -> Option<u32> {
             return None;
         }
         // SAFETY: the adapter checked alignment and retained readable storage.
-        return Some(
+        Some(
             unsafe { core::sync::atomic::AtomicU32::from_ptr(address as *mut u32) }
                 .load(core::sync::atomic::Ordering::Acquire),
-        );
+        )
     }
     #[cfg(target_os = "none")]
     {
@@ -191,6 +191,7 @@ pub(crate) fn atomic_compare_exchange_u32(
         // No call, scheduler handoff or owner wait occurs with PAN lowered.
         unsafe {
             core::arch::asm!(
+                ".arch_extension pan",
                 "mrs {pan}, pan",
                 "adr {tmp}, 4f", "str {tmp}, [{fixup}]",
                 "msr pan, #0",
