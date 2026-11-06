@@ -12179,6 +12179,11 @@ fn clone_nonresident_tid_destination(is_clone3: bool, refusal: CloneRefusal) {
             .with(|address| address.set(Some(parent_tid_va)));
     }
     let first = arm_call(fixture, fixture.control, &mut service, &mut frame);
+    assert_eq!(
+        tid_words.get::<[u32; 2]>(0),
+        [0x1111_1111, 0x2222_2222],
+        "is_clone3={is_clone3}: a refused child TID copy must not expose an unborn TID to the live peer"
+    );
     crate::lifecycle::COPYOUT_REFUSE_RESTORE_AT.with(|address| address.set(None));
     crate::lifecycle::GUEST_COPY_PREPARATION_FAULT_AT.with(|address| address.set(None));
     assert_eq!(
