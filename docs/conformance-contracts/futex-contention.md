@@ -1,17 +1,37 @@
 # Futex example
 
-The relative-timeout witnesses for #1745 are intentionally red until the
-operation continuation retains its deadline. The host binding
-`threaded_futex_relative_deadline_survives_owner_redispatch` admits two live
-threads, refuses the compare-under-lock atomic load once, and advances a
-deterministic clock by one second. A five-second relative wait must then
-have four seconds remaining. The EL1 production-entry binding
-`futex_relative_deadline_survives_owner_wait_with_two_live_threads` similarly requires
-the original expiry tick after an owner-service park. These tests establish
-the deadline defect; they do not yet prove synchronous redispatch, signal
-cleanup, forwarding, cancellation, or the host zone's final atomic recheck.
-Those paths remain required before the issue can be accepted. No runtime
-ratio or signed execution claim follows from these VM-free witnesses.
+Relative `FUTEX_WAIT` time belongs to the admitted operation, including time
+spent obtaining the futex word's backing. The host syscall completion token
+owns its guest-monotonic deadline through owner service and the zone's final
+atomic recheck. Only the remaining duration is converted into host wait time;
+scaled container clocks do not mix guest and host units. After the final successful comparison and enrollment, the host transfers the
+remaining expiry to the zone wait and retires the syscall token. Completion and cancellation consume that token.
+
+The EL1 adapter moves a typed relative-wait operation into the exact native
+member's continuation state on a copy refusal. Service ACK leaves that custody
+available for the original syscall's retry; synchronous `Redispatch` uses the
+same owner without allocating a parked register save area. An admitted futex
+wait transfers the expiry into its scheduler record. Terminal service failure,
+a new unrelated or unserved syscall, signal-frame construction, and member or
+process retirement discard the retained operation. Neither trap-frame scratch
+nor user registers carry a deadline.
+
+The two-live-thread binding
+`threaded_futex_relative_deadline_survives_owner_redispatch` refuses either the
+first or second atomic comparison, advances a deterministic clock one second,
+and changes the original timespec. A five-second wait still has four seconds
+remaining. A new completion token starts with no inherited deadline. The EL1
+bindings require expiry tick 105 after admission at tick 100, whether owner
+preparation parks or returns synchronous `Redispatch`. Separate episodes prove
+that cancellation, unrelated syscalls and unserved futex operations release
+custody before the next wait. The host runtime binding
+`serial_host_futex_deadline_survives_zone_word_recheck_owner_park` drives the
+production dispatcher, refuses the final `zone_park` load, releases its owner
+at virtual second one, and resumes the production job. Its resulting zone
+continuation must expire four seconds later, rather than five.
+
+These VM-free witnesses establish continuation semantics and bounded work.
+They do not supply signed execution or an end-to-end Docker timing ratio.
 
 `kernel.futex.contention` is the first vertical contract. Its VM-free binding
 checks exact wake cardinality, no lost wake, one continuation enrollment and
