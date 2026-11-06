@@ -234,7 +234,7 @@ host_crossings! {
     Read = nr::READ, true, Permanent;
     Write = nr::WRITE, true, Permanent;
     Readv = nr::READV, false, Permanent;
-    Writev = nr::WRITEV, true, Permanent;
+    Writev = nr::WRITEV, false, Permanent;
     Pread64 = nr::PREAD64, true, Permanent;
     Pwrite64 = nr::PWRITE64, true, Permanent;
     Preadv = nr::PREADV, false, Permanent;
@@ -518,10 +518,7 @@ mod tests {
             );
             assert_eq!(
                 HostCrossingSet::X86.is_allowed(canonical),
-                matches!(
-                    ordinal,
-                    22 | 48 | 56 | 62 | 63 | 64 | 66 | 67 | 68 | 93 | 94
-                ),
+                matches!(ordinal, 22 | 48 | 56 | 62 | 63 | 64 | 67 | 68 | 93 | 94),
                 "x86 canonical={ordinal}"
             );
         }
@@ -557,7 +554,7 @@ mod tests {
                 .flatten()
                 .filter(|(_, x86, _)| *x86)
                 .count(),
-            11
+            10
         );
         for (crossing, _, _) in HOST_CROSSINGS.iter().flatten().filter(|(_, x86, _)| *x86) {
             let nr = crossing.canonical();

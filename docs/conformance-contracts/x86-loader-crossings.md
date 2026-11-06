@@ -2,9 +2,16 @@
 
 Contract: `kernel.el1.arm-ring-first-crossing`.
 
-The x86 crossing subset refused canonical `openat`, `faccessat` and `writev`
-before they could reach the shared host-file dispatcher. ARM admitted those
-same host-file operations. The shared x86 personality decoder also left native
+The x86 crossing subset refused canonical `openat` and `faccessat` before they
+could reach the shared host-file dispatcher. ARM admitted those same host-file
+operations.
+
+`writev` stays out of the x86 crossing set. The ring's IPC family claims it for
+in-zone objects (pipes), and x86 has no ring IPC venue yet, so admitting it to
+the host crossing would replay writes to in-zone fds on the host. That is the
+compat-zone leak `x86_writev_remains_counted_enosys_under_strict_ring_first`
+guards against. x86 `writev` is served when x86 gets the same ring IPC venue as
+ARM (one lane), not through the crossing. The shared x86 personality decoder also left native
 `access` (21) undecoded: the HAL's existing legacy lowering happened only after
 a crossing that ring entry refused.
 

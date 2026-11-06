@@ -145,7 +145,6 @@ fn production_x86_family_absences_obey_crossings_without_user_memory() {
         ("futex", 202),
         ("loader openat", 257),
         ("loader legacy access", 21),
-        ("loader writev", 20),
         ("loader fstat", 5),
         ("loader newfstatat", 262),
         ("file seek", 8),
