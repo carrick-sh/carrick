@@ -51,6 +51,7 @@ pub mod native_terminal_test_control {
         pub hardware_roots: Option<[u64; 2]>,
         pub process_root: Option<u64>,
         pub reloaded_roots: Option<[u64; 2]>,
+        pub samples: Vec<(ThreadKey, u64, [u64; 2])>,
     }
 
     pub struct Guard(Arc<Mutex<Observation>>);
@@ -87,9 +88,6 @@ pub mod native_terminal_test_control {
         let Some(probe) = ARMED.lock().clone() else {
             return Ok(());
         };
-        if probe.lock().thread != Some(thread) {
-            return Ok(());
-        }
         use carrick_aarch64::Aarch64Vcpu;
         let vcpu = engine.vcpu();
         let roots = [
@@ -97,7 +95,10 @@ pub mod native_terminal_test_control {
             vcpu.get_sys_reg(carrick_hal::SysReg::Ttbr1)?,
         ];
         let mut observation = probe.lock();
-        if observation.hardware_roots.is_none() {
+        observation
+            .samples
+            .push((thread, binding.stage1_ttbr0().unwrap_or(0), roots));
+        if observation.thread == Some(thread) && observation.hardware_roots.is_none() {
             observation.hardware_roots = Some(roots);
             observation.process_root = binding.stage1_ttbr0();
         }
