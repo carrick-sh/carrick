@@ -405,6 +405,8 @@ impl Frames {
                     "::ipc_transfer::", "::ipc::serve_ipc_with_signals::",
                     "::ipc::admit::", "::ipc::run::",
                     "::substrate::ipc::transfer_with_input::",
+                    "::substrate::ipc::transfer_with_io::",
+                    "::copy_vector_range::",
                     "::copy_vector_input::", "::import_vectors::",
                 ]) + self.qualified("PrefixCopy", "::copy_in::") + fd_storage,
             ),
@@ -584,9 +586,12 @@ impl Frames {
                 native
                     + self.sum(&[
                         "::ipc_transfer::",
-                        "::ipc::serve_ipc_with_sigpipe::",
+                        "::ipc::serve_ipc_with_signals::",
                         "::ipc::run::",
                         "::substrate::ipc::transfer::",
+                        "::substrate::ipc::transfer_with_io::",
+                        "::copy_vector_output::",
+                        "::copy_vector_range::",
                         "::prepare_copyout::",
                         "::prepare_owned_copyout::",
                         "::prepare_owned_write::",
@@ -918,6 +923,20 @@ mod tests {
             .insert("x::settle_native_descriptor_reply::h0".to_owned(), 11000);
         let error = frames.check(16384, 288).unwrap_err();
         assert!(error.contains("native backing reply"));
+    }
+
+    #[test]
+    fn vector_scatter_and_shared_transfer_frames_remain_charged() {
+        for symbol in [
+            "x::substrate::ipc::transfer_with_io::h0",
+            "x::copy_vector_output::h0",
+            "x::copy_vector_range::h0",
+        ] {
+            let mut frames = small_frames();
+            frames.0.insert(symbol.to_owned(), 12000);
+            let error = frames.check(16384, 288).unwrap_err();
+            assert!(error.contains("ring pipe copyout"), "{symbol}: {error}");
+        }
     }
 
     #[test]
