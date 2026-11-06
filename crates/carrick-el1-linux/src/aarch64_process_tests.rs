@@ -12024,7 +12024,7 @@ fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
         fn read_u32(&self, _: &CurrentTask, address: u64) -> Option<u32> {
             assert_eq!(address, VA);
             self.reads.set(self.reads.get() + 1);
-            (!self.missing.replace(false)).then_some(self.value.get())
+            (!self.missing.get()).then_some(self.value.get())
         }
         fn read_u64(&self, _: &CurrentTask, _: u64) -> Option<u64> {
             panic!("untimed wait")
@@ -12172,6 +12172,11 @@ fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
         assert!(fixture.zone.slot(fixture.slot).current().is_none());
         assert_eq!(fixture.zone.counters.el1_parks.load(Ordering::Relaxed), 1);
     }
+    assert!(
+        word.missing.get(),
+        "a refused load cannot supply its own backing"
+    );
+    word.missing.set(false);
     service.prepare_copy_error = None;
     access.lower(space.index());
     let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
@@ -12248,6 +12253,8 @@ fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
     fixture.zone.enter_guest(waker_slot);
     fixture.zone.install_space(waker_slot, 1).unwrap();
     let mut wake_cpu = crate::sched::FakeCpu::default();
+    word.missing.set(true);
+    let reads_before_wake = word.reads.get();
     for expected in [1, 0] {
         wake.x[0] = VA;
         assert_eq!(
@@ -12265,6 +12272,8 @@ fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
         );
         assert_eq!(wake.x[0], expected);
     }
+    assert!(word.missing.get(), "WAKE must not prepare or read the word");
+    assert_eq!(word.reads.get(), reads_before_wake);
     run_as_leader(fixture);
     assert_eq!(
         wake.x[0], 0,
