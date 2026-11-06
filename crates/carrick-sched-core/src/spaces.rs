@@ -331,11 +331,12 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for SpaceEditor<'_, C> {
             let completion = |effects: crate::object_wait::OwnedObjectWakeEffects<'_, C>| {
                 venue.deliver.invoke(venue.zone, venue.waker, effects)
             };
-            let receipt = lease
-                .reserve(SpaceWaitCause::Editor)
-                .advance_revision(venue.waker, &completion);
+            let ticket = lease.reserve(SpaceWaitCause::Editor);
             self.release_editor();
-            receipt.publish();
+            // A contender may observe and refuse right up to the unlock.
+            // Advance afterward so that observation cannot outlive the
+            // last release and become a park with no producer.
+            ticket.publish(venue.waker, &completion);
         } else {
             self.release_editor();
         }

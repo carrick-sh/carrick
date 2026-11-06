@@ -298,18 +298,27 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceEntryHandle<'a, C> {
             .close_space_notifications(self.index, self.identity(incarnation), venue)
     }
 }
-/// Private release custody: even unwinding while constructing several
-/// publications unlocks the protected resource before any receipt is dropped.
+/// Private release custody: unlock exactly once before revision advancement
+/// and retain every advanced publication through callback unwinding.
 struct ResourceRelease<'a, 'z, 'c, C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
-    word: &'a AtomicU64,
+    word: Option<&'a AtomicU64>,
     unlocked: ResourceUnlocked,
     publications: [Option<crate::object_wait::ObjectNotificationPublication<'z, 'c, C>>; 6],
 }
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> ResourceRelease<'_, '_, '_, C> {
+    fn unlock(&mut self) {
+        #[cfg(test)]
+        if self.word.is_some() {
+            tests::before_resource_unlock();
+        }
+        if let Some(word) = self.word.take() {
+            word.store(self.unlocked.word(), Ordering::SeqCst);
+        }
+    }
+}
 impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for ResourceRelease<'_, '_, '_, C> {
     fn drop(&mut self) {
-        #[cfg(test)]
-        tests::before_resource_unlock();
-        self.word.store(self.unlocked.word(), Ordering::SeqCst);
+        self.unlock();
         for publication in &mut self.publications {
             if let Some(publication) = publication.take() {
                 publication.publish();
@@ -378,8 +387,9 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceNotificationLease<'a,
         // SAFETY: the caller supplies the same exact exclusive resource custody.
         unsafe { self.release_resource(venue, word, unlocked, &SpaceWaitCause::ALL) };
     }
-    /// Unlock and publish as one release authority. No advanced receipt can
-    /// escape to a caller or be destroyed before its resource unlock.
+    /// Unlock before advancing revisions, then publish with retained source
+    /// custody. A contender that refused the held resource cannot sample a
+    /// revision newer than that resource's final unlock.
     ///
     /// # Safety
     /// The caller owns the exact MM resource represented by `word`, exclusively
@@ -400,10 +410,11 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceNotificationLease<'a,
             venue.deliver.invoke(venue.zone, venue.waker, effects)
         };
         let mut release = ResourceRelease {
-            word,
+            word: Some(word),
             unlocked,
             publications: [const { None }; 6],
         };
+        release.unlock();
         macro_rules! retain {
             ($index:literal, $cause:expr) => {
                 if causes.contains(&$cause) {
@@ -1170,7 +1181,7 @@ mod tests {
         };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut release = ResourceRelease {
-                word: &word,
+                word: Some(&word),
                 unlocked: ResourceUnlocked::Plain,
                 publications: core::array::from_fn(|_| None),
             };
