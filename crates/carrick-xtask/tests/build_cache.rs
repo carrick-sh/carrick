@@ -694,3 +694,30 @@ fn recipes_inherit_offline_only_after_cache_preparation() {
         assert!(!args.contains(&"--offline"), "{stdout}");
     }
 }
+
+#[test]
+fn build_environment_never_looks_up_conventional_volumes() {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/lib/build-env.sh");
+    for enabled in ["0", "1"] {
+        let output = Command::new(find("sh"))
+            .args(["-xc", ". \"$1\"", "witness"])
+            .arg(&script)
+            .env("CARRICK_SCCACHE", enabled)
+            .env("CARRICK_HOME", "/internal/operator-home")
+            .env_remove("SCCACHE_DIR")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let trace = String::from_utf8(output.stderr).unwrap();
+        assert!(!trace.contains("/Volumes/"), "{trace}");
+    }
+}
+
+#[test]
+fn cli_resource_tests_do_not_probe_shared_storage() {
+    let source = include_str!("../../carrick-cli/tests/cli.rs");
+    assert!(
+        !source.contains("/Volumes/carrick"),
+        "isolated CLI children must not inspect shared storage"
+    );
+}

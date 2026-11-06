@@ -2447,18 +2447,61 @@ mod tests {
     }
 
     #[test]
-    fn acceptance_child_uses_checkout_scratch_home() {
+    fn acceptance_child_preserves_supplied_scratch_home() {
         let dir = tempfile::tempdir().unwrap();
         let lease =
             HostLease::acquire_path(&dir.path().join("host.lock"), HostLeaseMode::Gate).unwrap();
         let (status, _) = run_command_redirect(
             &lease,
             "sh",
-            &[
-                "-c",
-                "test \"$CARRICK_HOME\" = \"$PWD/target/carrick-home\"",
-            ],
-            &[("CARRICK_HOME", "/Volumes/carrick")],
+            &["-c", "test \"$CARRICK_HOME\" = \"/internal/operator-home\""],
+            &[("CARRICK_HOME", "/internal/operator-home")],
+            dir.path(),
+            &dir.path().join("log"),
+        )
+        .unwrap();
+        assert_eq!(status, Some(0));
+    }
+
+    #[test]
+    fn acceptance_child_defaults_home_and_preserves_inherited_home() {
+        const WITNESS: &str = "CARRICK_ACCEPT_HOME_WITNESS";
+        let Ok(expected) = std::env::var(WITNESS) else {
+            for inherited in [false, true] {
+                let mut child = Command::new(std::env::current_exe().unwrap());
+                child.args([
+                    "--exact",
+                    "accept::tests::acceptance_child_defaults_home_and_preserves_inherited_home",
+                ]);
+                child.env(
+                    WITNESS,
+                    if inherited {
+                        "/internal/inherited-home"
+                    } else {
+                        "default"
+                    },
+                );
+                child.env_remove("CARRICK_HOME");
+                if inherited {
+                    child.env("CARRICK_HOME", "/internal/inherited-home");
+                }
+                assert!(child.status().unwrap().success());
+            }
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let lease =
+            HostLease::acquire_path(&dir.path().join("host.lock"), HostLeaseMode::Gate).unwrap();
+        let expected = if expected == "default" {
+            dir.path().join("target/carrick-home")
+        } else {
+            PathBuf::from(expected)
+        };
+        let (status, _) = run_command_redirect(
+            &lease,
+            "sh",
+            &["-c", "test \"$CARRICK_HOME\" = \"$EXPECTED_HOME\""],
+            &[("EXPECTED_HOME", expected.to_str().unwrap())],
             dir.path(),
             &dir.path().join("log"),
         )
