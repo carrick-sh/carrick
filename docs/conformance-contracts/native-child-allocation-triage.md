@@ -50,6 +50,16 @@ No counter observations from the nineteen failing probes were available in
 this checkout; the list above is a classification guide, not their measured
 failure population.
 
+The public #1501 report names `accessx`, `acceptsock` and `fdceiling` as
+examples, but does not enumerate all nineteen or include their anonymous-leave
+counts. `accessx` and `acceptsock` allocate C strings without forking in their
+own `main`. Their native identity can therefore come from the harness's
+fork/exec, and a reduction must cover an exec successor as well as a fork-only
+child. The passing first-allocation witness above does not exercise exec.
+The shared successor planner already marks hidden heap backing lazy and leaves
+it without reservation nodes until `brk` grows; its existence alone does not
+prove the observed successor's actual descriptor graph.
+
 The root and child differ at the final unclaimed-syscall boundary:
 `carrick-el1-linux/src/dispatch.rs::unclaimed_native_syscall` retains the host
 route for a root, but returns counted ENOSYS for a fork child, which has no
