@@ -305,8 +305,13 @@ fn until_deadline(deadline: u64) -> std::time::Duration {
     std::time::Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX))
 }
 
-fn owns_installed_space(zone_mm: Option<u64>, installed: u64, terminal: bool) -> bool {
-    zone_mm.is_none_or(|mm| mm == installed || (terminal && installed == 0))
+fn owns_installed_space(
+    zone_mm: Option<u64>,
+    installed: u64,
+    terminal: bool,
+    process_exiting: bool,
+) -> bool {
+    zone_mm.is_none_or(|mm| mm == installed || ((terminal || process_exiting) && installed == 0))
 }
 
 #[cfg(test)]
@@ -315,9 +320,9 @@ mod terminal_space_tests {
 
     #[test]
     fn sibling_owned_terminal_accepts_its_vacated_zone_slot() {
-        assert!(owns_installed_space(Some(1), 0, true));
-        assert!(!owns_installed_space(Some(1), 2, true));
-        assert!(!owns_installed_space(Some(1), 0, false));
+        assert!(owns_installed_space(Some(1), 0, false, true));
+        assert!(!owns_installed_space(Some(1), 2, false, true));
+        assert!(!owns_installed_space(Some(1), 0, false, false));
     }
 }
 
@@ -534,8 +539,10 @@ where
     /// thread's to handle. Anything else would let the host resolve a fault
     /// or run a syscall against the wrong address space: fail loud. A terminal
     /// continuation is host-only and its materialized save deliberately
-    /// vacates this same slot to maintenance space zero; that state still
-    /// belongs to the exiting group, but no foreign process space does.
+    /// vacates this same slot to maintenance space zero. A resident sibling
+    /// can observe that vacated slot after the shared process enters exit.
+    /// Both states still belong to the exiting group, but no foreign process
+    /// space does.
     fn own_space_installed(
         &self,
         zone: &ZoneTables,
@@ -548,6 +555,7 @@ where
                     self.state.zone_mm,
                     installed,
                     self.phase.is_terminal_transition(),
+                    self.kernel.process_exiting(),
                 ) =>
             {
                 Err(RuntimeError::Configuration(format!(
