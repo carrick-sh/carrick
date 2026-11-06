@@ -857,6 +857,11 @@ pub fn invoke<'a>(
         }
         None
     })?;
+    if matches!(call, LifecycleCall::Clone | LifecycleCall::Clone3)
+        && let Some(outcome) = resume_clone_tid_rollback(thread.slot, native)
+    {
+        return Some(outcome);
+    }
     match call {
         LifecycleCall::GetTid => {
             if !thread.page.serves_threads() {
@@ -1167,6 +1172,20 @@ struct TidOutputs {
 }
 
 impl TidOutputs {
+    /// Establish write access for every destination before publishing either
+    /// TID. Writing each captured preimage is idempotent and prevents a later
+    /// destination's preparation park from exposing a partially published
+    /// unborn identity in the shared address space.
+    fn prepare(&self, user: &mut (impl UserCopy + ?Sized)) -> CopyOutcome {
+        for output in [&self.parent, &self.child].into_iter().flatten() {
+            let outcome = user.copy_out(UserVa::new(output.address), &output.preimage);
+            if !outcome.is_done() {
+                return outcome;
+            }
+        }
+        CopyOutcome::Done
+    }
+
     fn publish(&mut self, visible_tid: u32, user: &mut (impl UserCopy + ?Sized)) -> CopyOutcome {
         let bytes = visible_tid.to_le_bytes();
         let Some(parent) = &mut self.parent else {
@@ -1552,6 +1571,18 @@ fn serve_thread_clone_common<'a>(
         }
     };
     let mut outputs = TidOutputs { parent, child };
+    match outputs.prepare(native) {
+        CopyOutcome::Done => {}
+        CopyOutcome::NotYet(request) => return Some(native.wait_guest_copy(request)),
+        CopyOutcome::Fault => {
+            return has_venue.then(|| {
+                returned(
+                    SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
+                    false,
+                )
+            });
+        }
+    }
 
     let state = native.task_state()?;
     let affinity = native.affinity()?;
