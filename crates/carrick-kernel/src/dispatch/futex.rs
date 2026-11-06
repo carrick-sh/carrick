@@ -956,8 +956,10 @@ impl<M: CurrentMmMemory> UserCopy for HostFutexCopy<'_, M> {
         }
     }
 
-    fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> CopyOutcome {
-        CopyOutcome::from_completed(self.memory.write_bytes(dst.raw(), src).is_ok())
+    fn copy_out(&mut self, _dst: UserVa, _src: &[u8]) -> CopyOutcome {
+        // Futex operands are loaded or compare-exchanged; this adapter has no
+        // byte-copy output operation.
+        CopyOutcome::Fault
     }
 
     fn atomic_load_u32(&mut self, address: UserVa, value: &mut u32) -> CopyOutcome {
