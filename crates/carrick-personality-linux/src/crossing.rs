@@ -582,7 +582,7 @@ mod tests {
 
     #[test]
     fn test_aarch64_crossings_exact() {
-        assert_eq!(HOST_CROSSINGS.iter().flatten().count(), 121);
+        assert_eq!(HOST_CROSSINGS.iter().flatten().count(), 120);
         for (crossing, _, _) in HOST_CROSSINGS.iter().flatten() {
             let nr = crossing.canonical();
             assert!(
@@ -594,6 +594,7 @@ mod tests {
         // Implemented families are not unported crossings. Their explicit declines
         // use typed family fallback and bypass this unported-call table.
         for wire_in_ring in [
+            nr::PIPE2,
             CanonicalNr(27), // inotify_add_watch
             CanonicalNr(28), // inotify_rm_watch
             nr::PPOLL,
