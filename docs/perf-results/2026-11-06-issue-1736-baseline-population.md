@@ -55,7 +55,7 @@ operation was slot 2's own local invalidation of publication 1. A guest
 broadcast invalidation was being recorded as coverage for virtual CPUs on
 which it had not completed.
 
-## Final signed population
+## Earlier candidate signed population (not landing acceptance)
 
 Fix revision: `e4b20d690ec64290157ab24c328b7ca719b5d437`.
 
@@ -77,3 +77,12 @@ space but moves completed coverage to each vCPU slot. Fork, `mprotect`, and
 `munmap` publish a generation. A slot that could retain that MM must perform
 its own local invalidation before it may keep or install the root, and only
 then records its own coverage.
+
+This population predates the retained-editor admission fix and is not
+acceptance evidence for the current branch. In particular, a vCPU already
+executing EL0 does not pass through the scheduler's installation check when
+another vCPU publishes an edit. Per-slot coverage prevents a future
+installation from inheriting another slot's acknowledgement; it does not
+establish completion on that already-running sibling. The remaining P1 and
+required completion witness are described in
+[`tlb-editor-admission.md`](../conformance-contracts/tlb-editor-admission.md).
