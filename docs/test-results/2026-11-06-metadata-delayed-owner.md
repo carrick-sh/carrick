@@ -130,3 +130,46 @@ Two host-park provenance witness attempts reached no host-park constructor
 (timed-wait and concurrent allocator respectively). Their absent-coverage
 assertions are not red witnesses of the lifecycle loss. The temporary hooks
 were removed. The load-time mapping fallback remains to be classified.
+
+
+## Linux continuation: checkpoint review and publication classification
+
+The continuation preserves the ten earlier commits and rebases them onto the
+admitted main `d14143ee8cf40ec4ee34b60959685ca0ee2fa139`. The checkpoint's
+unconditional fatal on lifecycle mapping `Busy` is rejected and removed:
+contention cannot be turned into a carrier abort. This removes a diagnostic,
+not the lifecycle-authority-loss defect.
+
+There are two code paths that permit the observed zero pair:
+
+- `CarrierLifecycleMappings::publish` calls `publish_resolved`, which clears
+  the current pair before resolution. A `Busy` result returns successful
+  `HostServed`; both backend publication callers discard that outcome and
+  continue loading the task. No suspension preserves publication authority.
+- The production `zone_park`, `park_owner_memory_action`, and
+  `ipc_park_attempt` constructors in `vcpu_loop/zone.rs` explicitly initialize
+  both lifecycle references to zero. Allocation and queue publication retain
+  that identity in the record. A normal futex `Woken` handback without an
+  object operation is allowed by `ZoneRecord::needs_host` to run in ring.
+  `carrick_el1::sched::publish_identity` copies the record's zero references
+  into `CurrentTask`. An otherwise matching OnCpu execution therefore does
+  not prove lifecycle authority survived the host park.
+
+The signed core's `Woken` handback does not prove which path produced it.
+Neither source is attributed as the captured failure's cause in this round.
+The native-process harness allocates scheduler records directly and bypasses
+these production host-park entry points; a helper-only identity test would not
+close the missing witness tracked by #1758. No new reproduction or signed
+population is claimed.
+
+The structural repair remains open: authenticate the exact task ID, serial,
+MM and execution generation before preserving its already published guest
+alias pair through a host park, retaining its carrier mapping owners. Host
+control addresses are not guest aliases. Mapping refusal also needs an owned
+publication continuation enrolled on the existing release notification;
+returning `HostServed` does not provide one. No timeout, polling, retry budget
+or reduced concurrency is an acceptable substitute.
+
+This Linux clone cannot run signed HVF. Original historical attribution,
+paired signed population evidence and two consecutive main signed passes
+remain outstanding. The diagnostic removal alone does not satisfy #1572.
