@@ -331,11 +331,24 @@ fn exit_decline_census_names_the_authority_without_changing_it() {
 struct FaultingUser {
     deny_in: Vec<u64>,
     deny_out: Vec<u64>,
+    deny_out_after_first: Vec<u64>,
+    observed_out: Vec<u64>,
 }
 
 impl crate::file::UserCopy for FaultingUser {
     fn copy_out(&mut self, dst_va: u64, src: &[u8]) -> bool {
-        if self.deny_out.contains(&dst_va) {
+        let seen = self.observed_out.contains(&dst_va);
+        self.observed_out.push(dst_va);
+        let deny_after_prepare = seen
+            && self
+                .deny_out_after_first
+                .iter()
+                .position(|address| *address == dst_va)
+                .is_some_and(|position| {
+                    self.deny_out_after_first.remove(position);
+                    true
+                });
+        if self.deny_out.contains(&dst_va) || deny_after_prepare {
             return false;
         }
         // SAFETY: tests pass live guest user buffers, mapped in this process.
@@ -1240,6 +1253,7 @@ fn sigaltstack_serves_off_the_alternate_stack() {
             } else {
                 Vec::new()
             },
+            ..Default::default()
         };
         assert_eq!(
             serve_directly(&mut w, &mut frame, &mut user),
@@ -3427,7 +3441,7 @@ fn managed_clone_copyout_fault_unbinds_birth_before_retry() {
     };
     let parent_word = GuestUserValue::new(0xaaaa_u32);
     let mut user = FaultingUser {
-        deny_out: std::vec![parent_word.arg()],
+        deny_out_after_first: std::vec![parent_word.arg()],
         ..Default::default()
     };
     let args = clone_args(GLIBC_FLAGS, parent_word.arg(), 0);
