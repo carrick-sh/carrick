@@ -1435,3 +1435,67 @@ fn imported_vectors_scale_and_reclaim_with_the_operation_slot() {
         fx.region.finish_operation(reused, || {}).unwrap();
     }
 }
+
+#[test]
+fn vector_input_survives_concurrent_descriptor_growth_and_retired_lookup() {
+    let fx = fixture(1 << 20);
+    let region = fx.region;
+    let mut extent = region.provision_descriptors(64, &Spin).unwrap();
+    let retired_words = region.resolve(extent).unwrap().1;
+    let table = region.fd(Spin).create_table(1024, &mut extent).unwrap();
+    let (start, ready) = std::sync::mpsc::sync_channel(0);
+    let (done, finished) = std::sync::mpsc::sync_channel(0);
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            ready
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let mut larger = region.provision_descriptors(128, &Spin).unwrap();
+            region.fd(Spin).grow_table(table, &mut larger).unwrap();
+            region.reclaim_descriptors(&mut larger, &Spin).unwrap();
+            // Model the delayed lock-free reader's atomic loads before seq
+            // rejects its retired extent, while that memory is reused.
+            for word in retired_words {
+                let _ = word.load(Ordering::Relaxed);
+            }
+            done.send(()).unwrap();
+        });
+        let token = region.begin_operation(IpcOperation::EMPTY).unwrap();
+        region
+            .import_vectors(&token, 1, |_, header| {
+                header[..8].copy_from_slice(&4096u64.to_ne_bytes());
+                header[8..].copy_from_slice(&4u64.to_ne_bytes());
+                true
+            })
+            .unwrap();
+        let mut bytes = [0; 4];
+        assert_eq!(
+            region
+                .copy_vector_input(&token, 0, &mut bytes, |dst, _| {
+                    start.send(()).unwrap();
+                    finished
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    dst.copy_from_slice(b"pipe");
+                    dst.len()
+                })
+                .unwrap(),
+            4
+        );
+        assert_eq!(&bytes, b"pipe");
+        region.finish_operation(token, || {}).unwrap();
+        // Reuse the retired extent as headers while its atomic view remains
+        // valid. No allocator zero-fill or plain Vector writes are permitted.
+        let token = region.begin_operation(IpcOperation::EMPTY).unwrap();
+        region
+            .import_vectors(&token, 1, |_, header| {
+                header.fill(0);
+                true
+            })
+            .unwrap();
+        for word in retired_words {
+            let _ = word.load(Ordering::Relaxed);
+        }
+        region.finish_operation(token, || {}).unwrap();
+    });
+}
