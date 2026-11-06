@@ -164,7 +164,7 @@ pub enum HostCrossingKind {
 // One declaration generates the identity enum and constant-time dense lookup.
 // No separately maintained match or ordinal array can drift from this table.
 macro_rules! host_crossings {
-    ($( $variant:ident = $canonical:path, $x86:literal, $kind:ident; )+) => {
+    ($( $variant:ident = $canonical:path, $x86:literal, $kind:ident $(, [$($alias:path),+])?; )+) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
         #[repr(u64)]
         pub enum AllowedHostCrossing { $( $variant = $canonical.raw(), )+ }
@@ -175,6 +175,14 @@ macro_rules! host_crossings {
                 match self {
                     $( Self::$variant => crate::dispatch::OperandSpec { crossing: Self::$variant }, )+
                 }
+            }
+        }
+        // Private x86 output layouts retain their ABI identity while sharing
+        // the canonical operation's crossing kind and service owner.
+        const fn private_x86_crossing(canonical: CanonicalNr) -> Option<AllowedHostCrossing> {
+            match canonical.raw() {
+                $( $( $($alias)|+ => Some(AllowedHostCrossing::$variant), )? )+
+                _ => None,
             }
         }
         const HOST_CROSSINGS: [Option<(AllowedHostCrossing, bool, HostCrossingKind)>; 513] = {
@@ -237,8 +245,8 @@ host_crossings! {
     Splice = nr::SPLICE, false, Temporary;
     Tee = nr::TEE, false, Temporary;
     Readlinkat = nr::READLINKAT, false, Permanent;
-    Newfstatat = nr::NEWFSTATAT, false, Permanent;
-    Fstat = nr::FSTAT, false, Permanent;
+    Newfstatat = nr::NEWFSTATAT, false, Permanent, [carrick_syscall_abi::CARRICK_PRIVATE_X86_NEWFSTATAT];
+    Fstat = nr::FSTAT, false, Permanent, [carrick_syscall_abi::CARRICK_PRIVATE_X86_FSTAT];
     Sync = nr::SYNC, false, Permanent;
     Fsync = nr::FSYNC, false, Permanent;
     Fdatasync = nr::FDATASYNC, false, Permanent;
@@ -322,7 +330,11 @@ impl AllowedHostCrossing {
     }
     const fn from_canonical(canonical: CanonicalNr, x86: bool) -> Option<Self> {
         if canonical.raw() > 512 {
-            return None;
+            return if x86 {
+                private_x86_crossing(canonical)
+            } else {
+                None
+            };
         }
         match HOST_CROSSINGS[canonical.raw() as usize] {
             Some((crossing, allowed_x86, _)) if !x86 || allowed_x86 => Some(crossing),
@@ -512,6 +524,28 @@ mod tests {
                 ),
                 "x86 canonical={ordinal}"
             );
+        }
+    }
+
+    #[test]
+    fn x86_stat_layout_aliases_cross_without_admitting_arm_layouts() {
+        for (private, crossing) in [
+            (
+                carrick_syscall_abi::CARRICK_PRIVATE_X86_FSTAT,
+                AllowedHostCrossing::Fstat,
+            ),
+            (
+                carrick_syscall_abi::CARRICK_PRIVATE_X86_NEWFSTATAT,
+                AllowedHostCrossing::Newfstatat,
+            ),
+        ] {
+            assert_eq!(
+                AllowedHostCrossing::from_canonical_x86(CanonicalNr(private)),
+                Some(crossing)
+            );
+            assert_eq!(crossing.kind(), Some(HostCrossingKind::Permanent));
+            assert!(!HostCrossingSet::Aarch64.is_allowed(CanonicalNr(private)));
+            assert!(!HostCrossingSet::X86.is_allowed(crossing.canonical()));
         }
     }
 
