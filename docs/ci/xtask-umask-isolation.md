@@ -54,3 +54,26 @@ Before counting, one exact run confirmed the harness selected and completed
 one target test. Both binaries were built from this checkout, temporarily
 restoring the baseline test source for the baseline build, then restoring the
 committed isolation fix. No production source changed.
+
+## Final continuation population
+
+The continuation worker preserved the harvested commits and confirmed that the
+branch was already based on admitted main. Its fresh population measured:
+
+| Selection | Baseline target passes | Isolated target passes |
+| --- | ---: | ---: |
+| Exact target, 50 invocations | 50/50 | 50/50 |
+| Entire integration binary, 16 threads, 50 invocations | 45/50 | 50/50 |
+
+Eight baseline full-binary invocations failed: five failed the target and
+three failed other filesystem cases. All failures reported permission denied.
+This also demonstrates why locking only the two umask mutators would be
+insufficient: unrelated fixture creation consumes the same process umask.
+All 50 fixed full-binary invocations passed every case.
+
+The baseline test source was extracted from admitted main and compiled as a
+Rust test binary against the same unchanged production libraries used by the
+fixed test. The checkout's source stayed fixed throughout. The exact compiler
+arguments are saved in `agent/evidence/baseline-command.json`; raw logs,
+known-answer selections, and per-invocation target verdicts are beside it.
+These are Linux measurements; no macOS or signed guest result is implied.
