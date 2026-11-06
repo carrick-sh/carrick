@@ -320,11 +320,20 @@ mod exec_comm_tests {
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
 enum ServiceCompletion {
     Inline,
     RetrySyscall,
     OwnerCheckpoint,
+}
+
+impl ServiceCompletion {
+    fn retries_syscall(&self) -> bool {
+        matches!(self, Self::RetrySyscall)
+    }
+
+    fn checkpoints_owner(&self) -> bool {
+        matches!(self, Self::OwnerCheckpoint)
+    }
 }
 
 impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
@@ -1112,7 +1121,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             fault_sequence,
             owner_wait,
             payload,
-            completion == ServiceCompletion::RetrySyscall,
+            completion.retries_syscall(),
         )?;
         let (request, adapter) = match prepared {
             PreparedService::Request(request, adapter) => (request, adapter),
@@ -1121,10 +1130,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if let Some(wait) = owner_wait {
             self.park_owner_wait(&request, wait)
         } else {
-            self.park_service(
-                &request,
-                adapter || completion == ServiceCompletion::OwnerCheckpoint,
-            )
+            self.park_service(&request, adapter || completion.checkpoints_owner())
         }
     }
 
