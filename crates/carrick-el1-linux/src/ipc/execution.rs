@@ -80,6 +80,9 @@ pub trait IpcExecution {
         operation: OperationToken,
     ) -> Result<IpcServed, (ObjectWaitError, OperationToken)>;
 
+    /// Publish readiness wakes caused by dropping the final endpoint pin.
+    fn deliver_release_wake(&self, effects: WakeEffects);
+
     /// Deliver a detached queue completion through this execution venue.
     /// Task lookup and boundary-work publication belong to the transport:
     /// a context-generic engine cannot use ARM's fixed current-task aperture.
@@ -133,6 +136,9 @@ impl<C: ThreadCpu, U: UserWord> IpcExecution for Sched<'_, C, U> {
     }
     fn finish_object_wake(&mut self, effects: WakeEffects) {
         self.finish_object_wake(effects);
+    }
+    fn deliver_release_wake(&self, effects: WakeEffects) {
+        crate::sched::object_wait::deliver_wake_effects(self.zone, self.slot, effects);
     }
     fn deliver_completion(
         &self,
