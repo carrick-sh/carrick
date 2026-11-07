@@ -7,6 +7,7 @@ pub mod authority_debt;
 mod authority_dialect;
 mod authority_macro;
 pub mod authority_source;
+pub mod board;
 pub mod ci_changes;
 pub mod ci_receipt;
 pub mod ci_scaler;
