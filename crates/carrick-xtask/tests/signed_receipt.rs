@@ -1448,7 +1448,7 @@ else:
             .to_string(),
         )
         .unwrap();
-        Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
             .env(
                 "PATH",
                 format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
