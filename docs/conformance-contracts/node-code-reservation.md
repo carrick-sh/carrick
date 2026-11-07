@@ -93,3 +93,23 @@ It checks one RWX reservation row before any first touch, then the existing
 resident descriptor and generated host-code checks. This distinguishes the
 native entry venue from production host dispatch without merging their
 ownership or address domains.
+
+## Continuation boundary
+
+The Linux continuation reconfirmed that both whole-range host-dispatch
+bindings above pass with the saved implementation. The native-pages venue
+now returns `MemoryError::HostMap` with the reported sparse-publication
+refusal if a nonzero protection edit enters its legacy callback. This lets
+production `mprotect` handle the refusal instead of panicking inside the
+fixture. Successful generated-code execution still requires the owner
+callback to publish the actual native permissions.
+
+This is not a red reproduction or evidence that Node starts. The host
+dispatcher selects owner publication only while an authenticated reservation
+proposal is held; an admitted MM alone does not establish that the edited
+range belongs to that owner. The sparse refusal must remain intact for
+unauthenticated publication. A further production correction needs the
+failing signed run's mapping/forwarding history (including whether the
+protection request holds such a proposal), or a red lower-layer witness
+that captures that history. The director's exact-head signed Node check is
+still required.
