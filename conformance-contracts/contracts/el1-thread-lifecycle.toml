@@ -80,6 +80,7 @@ embed = [
 # applied per retained lifecycle page; this does not complete guest waits.
 vm_free = [
   "carrick-el1-linux::native_process_runtime::host_test_support::thread_cleanup_tests::raw_exit_keeps_admission_when_fork_closes_gate_during_cleanup (production exit, adopted and native-owned member, lifecycle fork gate closes during exact-MM wait)",
+  "carrick-el1-linux::native_process_runtime::host_test_support::thread_cleanup_tests::{raw_exit_faulting_robust_word_keeps_successor,exit_group_worker_terminal_copy_wait_finishes_after_fault_or_supply,raw_exit_initial_fork_gate_retains_adopted_custody,raw_exit_initial_fork_gate_retains_unadopted_custody} (production terminal entry, two live members, exact robust successor, group worker MM wait/fault/supply; initial-gate binding remains red)",
   "carrick-el1-linux::native_process_runtime::host_test_support::thread_cleanup_tests::two_raw_exits_finish_when_parked_cleanup_becomes_last (two pooled members after coherent leader retirement; real Gate wait; original final status preserved)",
   "carrick-el1-linux::aarch64_process_tests::arm_raw_exit_robust_pending_entry_is_processed_once (production raw exit; resident list and pending operation, adopted and native owned)",
   "carrick-el1-linux::native_process_runtime::host_test_support::thread_cleanup_tests::{raw_exit_terminal_copies_park_and_finish_once,raw_exit_terminal_supply_refusal_advances_instead_of_retrying} (production native terminal entry, real TID waiter, exact-MM Gate producer, supply and refusal; one wake)",

@@ -69,3 +69,32 @@ The two-raw-exit final-member witness is now green. Its initial leader
 retirement uses neutral terminal custody, then removes the actual graph and
 registry member; its two worker exits use production native entry and a real
 MM producer queue. Initial lifecycle-gate contention above remains open.
+
+## Additional production witnesses and admission constraint
+
+`raw_exit_faulting_robust_word_keeps_successor` faults the first futex after
+reading its next link and requires the second owned word to receive OWNER_DIED.
+It covers adopted and native-owned members through production raw exit.
+`exit_group_worker_terminal_copy_wait_finishes_after_fault_or_supply` starts
+process close while another member is live, then parks that worker's robust
+head or clear-TID copy on the real MM Gate producer. It requires worker
+retirement, the original process status, and no repeated successful clear-TID
+store after either access fault or supply. Service-cell refusal is covered
+separately by the existing raw-exit binding.
+
+The `raw_exit_initial_fork_gate_retains_{adopted,unadopted}_custody` tests
+remain red production bindings: an already active fork gate causes NativeQuarantined before the
+cleanup owner is retained. They deliberately observe custody while the holder
+is still active. Actual holder-release/resume needs another production binding
+with the eventual notification protocol.
+
+The existing process-close `exit_wait` field cannot simply double as a gate
+notification source: runtime terminal-wake dispatch treats its presence as a
+process-close indicator and latches its one-shot sibling wake population.
+Also, some host admission guards release while the kernel registry write lock
+is held; synchronous scheduler wake callbacks there can reacquire that lock.
+The admission fix must keep a distinct authenticated release identity, defer
+callbacks past registry unlock, retain it across memory waits, and retire its
+MM identity at exec. HostOnly must coordinate host conflicting operations
+with any newly admitted pooled exit, rather than wait for a permanent policy
+to reopen. No change to that protocol is implemented by these witnesses.
