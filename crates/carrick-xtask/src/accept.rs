@@ -1481,7 +1481,74 @@ pub fn verify_signed_fixtures(
     })
 }
 
-pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptError> {
+pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError> {
+    run_on_host(root_arg, args, std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn run_on_host(
+    root_arg: Option<&Path>,
+    args: AcceptArgs,
+    os: &str,
+    arch: &str,
+) -> Result<(), AcceptError> {
+    let requested_receipt = args.receipt.clone();
+    let profile = args.profile;
+    let phase = args.phase;
+    let mut published = false;
+    let result = profile_phase(profile, phase).and_then(|_| {
+        if profile == AcceptProfile::Kvm && (os != "linux" || arch != "x86_64") {
+            Err(AcceptError::Failed(format!(
+                "KVM requires Linux x86_64; host is {os}-{arch}"
+            )))
+        } else {
+            run_inner(root_arg, args, &mut published)
+        }
+    });
+    if let (Err(error), Some(path)) = (&result, requested_receipt)
+        && !published
+    {
+        // Refusals must remain visible even before repository or lease admission.
+        // Never reuse a receipt left by an earlier invocation.
+        let info = crate::cli::resolve_repo_info(root_arg).ok();
+        let receipt = AcceptReceipt {
+            schema_version: 1,
+            timestamp: generate_timestamp(),
+            head: info
+                .as_ref()
+                .map(|info| info.head.clone())
+                .unwrap_or_default(),
+            clean_tree: false,
+            phase: phase.to_string(),
+            profile: profile.to_string(),
+            overall: "FAIL".into(),
+            steps: Vec::new(),
+            skipped_steps: Vec::new(),
+            artifact: None,
+            fixture_validation: None,
+            el1: None,
+            probe_diffs: Vec::new(),
+            cleanup_counts: Vec::new(),
+            fixture_bundle: None,
+            host_load: Default::default(),
+            failures: vec![format!("accept refusal: {error}")],
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|source| AcceptError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        crate::atomic_file::write(&path, &serde_json::to_vec_pretty(&receipt)?)
+            .map_err(|source| AcceptError::Io { path, source })?;
+    }
+    result
+}
+
+fn run_inner(
+    root_arg: Option<&Path>,
+    mut args: AcceptArgs,
+    published: &mut bool,
+) -> Result<(), AcceptError> {
     args.phase = profile_phase(args.profile, args.phase)?;
     // remote-accept holds its checkout lock first. Hold the host lease across
     // host compilation/tests, signing, cleanup, and receipt publication.
@@ -2380,6 +2447,8 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
         source: e,
     })?;
 
+    *published = true;
+
     // Print summary
     println!("\n==================== ACCEPT GATE SUMMARY ====================");
     println!("Phase:        {}", args.phase);
@@ -2949,5 +3018,31 @@ thread 'test_probe_futex' panicked at 'explicit panic', tests/foo.rs:12:5
         let json = serde_json::to_string_pretty(&receipt).expect("serialize receipt");
         let deserialized: AcceptReceipt = serde_json::from_str(&json).expect("deserialize receipt");
         assert_eq!(receipt, deserialized);
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+
+    #[test]
+    fn macos_kvm_refusal_publishes_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipt.json");
+        let result = run_on_host(
+            None,
+            AcceptArgs {
+                phase: AcceptPhase::All,
+                profile: AcceptProfile::Kvm,
+                receipt: Some(path.clone()),
+            },
+            "macos",
+            "aarch64",
+        );
+        assert!(result.is_err());
+        let receipt: AcceptReceipt = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(receipt.overall, "FAIL");
+        assert!(receipt.steps.is_empty());
+        assert!(receipt.failures[0].contains("KVM requires Linux x86_64; host is macos-aarch64"));
     }
 }
