@@ -232,10 +232,13 @@ pub use carrick_vmm_hvf::{
     read_el1_region_host_ptr, reset_el1_counters, reset_metadata_grant_state,
 };
 
-/// Inspect the IPC region retained by the active carrier installation.
+/// Inspect IPC storage and descriptor-map custody retained by the active carrier.
 /// An execution backend without an installed ring IPC venue returns `None`.
 pub fn with_carrier_ipc_region<T>(
-    op: impl FnOnce(&carrick_el1_abi::ipc::IpcRegion<'_>) -> T,
+    op: impl FnOnce(
+        &carrick_el1_abi::ipc::IpcRegion<'_>,
+        &std::sync::Arc<dyn carrick_el1_abi::IpcTableMapBacking>,
+    ) -> T,
 ) -> Option<T> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {

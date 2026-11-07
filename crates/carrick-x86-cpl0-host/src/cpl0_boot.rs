@@ -2519,9 +2519,7 @@ pub struct ForwardVenue<'a, M: CarrierCpuIo, Mem: CarrierMemoryIo = M> {
 }
 
 impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
-    pub fn ipc_table_map(
-        &self,
-    ) -> Result<Arc<dyn carrick_el1_abi::ipc_tables::IpcTableMapBacking>, TrapError> {
+    pub fn ipc_table_map(&self) -> Result<Arc<dyn carrick_el1_abi::IpcTableMapBacking>, TrapError> {
         let base = self
             .files
             ._backing
@@ -3640,14 +3638,19 @@ struct RetainedIpcTableMap {
     _backing: Arc<BackingExtent>,
     base: carrick_guest_mem::HostVa,
 }
-impl carrick_el1_abi::ipc_tables::IpcTableMapBacking for RetainedIpcTableMap {
-    fn table_map(&self) -> &carrick_el1_abi::ipc_tables::IpcTableMap {
+impl carrick_el1_abi::IpcTableMapBacking for RetainedIpcTableMap {
+    fn with_table_map(
+        &self,
+        visitor: &mut dyn FnMut(&carrick_el1_abi::ipc_tables::IpcTableMap),
+    ) -> Result<(), carrick_el1_abi::FileRegionError> {
         // SAFETY: constructed only from the complete authenticated file extent;
         // the Arc owns its storage independently of carrier registration.
-        unsafe {
+        let map = unsafe {
             &*((self.base.raw() + carrick_el1_abi::EL1_IPC_TABLE_MAP_OFFSET as usize)
                 as *const carrick_el1_abi::ipc_tables::IpcTableMap)
-        }
+        };
+        visitor(map);
+        Ok(())
     }
 }
 
@@ -3965,9 +3968,7 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
     pub fn file_region_binding(&self) -> carrick_el1_abi::FileRegionBinding {
         self.0.files.registration.binding()
     }
-    pub fn ipc_table_map(
-        &self,
-    ) -> Result<Arc<dyn carrick_el1_abi::ipc_tables::IpcTableMapBacking>, TrapError> {
+    pub fn ipc_table_map(&self) -> Result<Arc<dyn carrick_el1_abi::IpcTableMapBacking>, TrapError> {
         self.0.ipc_table_map()
     }
 

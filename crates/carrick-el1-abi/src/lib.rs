@@ -3396,17 +3396,6 @@ pub trait IpcWindowBacking: Send + Sync {
     fn pool_len(&self) -> usize;
 }
 
-/// The IPC table map in the EL1 region, as the host maps it.
-pub fn ipc_table_map_host() -> Option<&'static ipc_tables::IpcTableMap> {
-    let ptr = get_el1_region_host_ptr();
-    if ptr == 0 {
-        return None;
-    }
-    // SAFETY: the EL1 region mapping outlives the carrier; the map is at an
-    // aligned offset inside it and all-zero is an empty map.
-    Some(unsafe { &*((ptr + EL1_IPC_TABLE_MAP_OFFSET as usize) as *const ipc_tables::IpcTableMap) })
-}
-
 /// Host view of the shared metadata mailbox, if an EL1 region is installed.
 pub fn metadata_mailbox_host() -> Option<&'static MetadataGrantMailbox> {
     let ptr = get_el1_region_host_ptr();

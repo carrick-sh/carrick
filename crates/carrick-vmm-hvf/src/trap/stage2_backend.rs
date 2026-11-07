@@ -1020,7 +1020,7 @@ pub fn reset_el1_counters() {
     EL1_REGION_HOST_PTR.store(0, std::sync::atomic::Ordering::Release);
     carrick_el1_abi::record_el1_region_host_ptr(0);
     if let Some(installed) = INSTALLED_IPC_WINDOW.lock().as_mut() {
-        installed.published = false;
+        installed.window.published = false;
     }
 }
 
@@ -1297,6 +1297,14 @@ mod tests {
             })
             .expect("ARM boot must retain the shared file registration");
         assert!(retained.file_region_is_live());
+        let mut visited = false;
+        carrick_el1_abi::IpcTableMapBacking::with_table_map(retained.as_ref(), &mut |map| {
+            visited = true;
+            assert!(!map.window_published());
+            map.publish_window();
+        })
+        .expect("live retained registration grants map access");
+        assert!(visited);
         let stale = region.host_addr as usize;
         assert_eq!(carrick_el1_abi::get_el1_region_host_ptr(), stale);
         drop(region);
@@ -1304,6 +1312,14 @@ mod tests {
             !retained.file_region_is_live(),
             "retirement withdraws registration even while an issuance handle retains backing"
         );
+        let mut visited = false;
+        assert_eq!(
+            carrick_el1_abi::IpcTableMapBacking::with_table_map(retained.as_ref(), &mut |_| {
+                visited = true
+            }),
+            Err(carrick_el1_abi::FileRegionError::Retired),
+        );
+        assert!(!visited, "retired registration never exposes the map");
         let actual = carrick_el1_abi::get_el1_region_host_ptr();
         reset_el1_counters();
         assert_eq!(
@@ -1585,32 +1601,46 @@ pub(crate) fn install_ipc_window_using(
 /// The window mapped into the live carrier VM (one carrier per process);
 /// holding it retains the memory's owner. Replaced when a new carrier VM
 /// maps the window; the previous VM's records were terminalized with it.
-static INSTALLED_IPC_WINDOW: parking_lot::Mutex<Option<IpcWindowInstallation>> =
+struct InstalledIpcVenue {
+    window: IpcWindowInstallation,
+    region: std::sync::Arc<dyn carrick_el1_abi::IpcTableMapBacking>,
+}
+
+static INSTALLED_IPC_WINDOW: parking_lot::Mutex<Option<InstalledIpcVenue>> =
     parking_lot::Mutex::new(None);
 
 /// Borrow the installed carrier's IPC storage while retaining its backing.
 /// The callback cannot return references into storage that a successor may retire.
 pub fn with_installed_ipc_region<T>(
-    op: impl FnOnce(&carrick_el1_abi::ipc::IpcRegion<'_>) -> T,
+    op: impl FnOnce(
+        &carrick_el1_abi::ipc::IpcRegion<'_>,
+        &std::sync::Arc<dyn carrick_el1_abi::IpcTableMapBacking>,
+    ) -> T,
 ) -> Option<T> {
-    let backing = {
+    let (backing, retained_region) = {
         let installed = INSTALLED_IPC_WINDOW.lock();
         let installed = installed.as_ref()?;
-        if !installed.published {
+        if !installed.window.published {
             return None;
         }
-        std::sync::Arc::clone(&installed.backing)
+        (
+            std::sync::Arc::clone(&installed.window.backing),
+            std::sync::Arc::clone(&installed.region),
+        )
     };
     // SAFETY: the installation retains both initialized mappings throughout
     // this callback, including while a different kernel offers its next window.
     let window = unsafe { carrick_el1_abi::HostIpcWindow::new(backing.as_ref()) }?;
     let region = window.attach().ok()?;
-    Some(op(&region))
+    Some(op(&region, &retained_region))
 }
 
 /// Map the registered IPC window into the carrier VM, if the host authority
 /// registered one (otherwise EL1 never attaches and IPC calls forward).
-pub(crate) fn install_registered_ipc_window(custody: &CarrierVmCustody) -> Result<(), TrapError> {
+pub(crate) fn install_registered_ipc_window(
+    custody: &CarrierVmCustody,
+    retained_region: std::sync::Arc<dyn carrick_el1_abi::IpcTableMapBacking>,
+) -> Result<(), TrapError> {
     let Some(backing) = registered_ipc_window_backing() else {
         return Ok(());
     };
@@ -1652,11 +1682,15 @@ pub(crate) fn install_registered_ipc_window(custody: &CarrierVmCustody) -> Resul
             }
         },
     )?;
-    *INSTALLED_IPC_WINDOW.lock() = Some(installed);
-    // Only now may EL1 touch the window (its header decides the rest).
-    if let Some(map) = carrick_el1_abi::ipc_table_map_host() {
-        map.publish_window();
-    }
+    // Publish through the exact registration retained by this installation.
+    // A retired registration must never make a successor's window visible.
+    retained_region
+        .with_table_map(&mut |map| map.publish_window())
+        .map_err(|error| TrapError::Hypervisor(format!("IPC region registration: {error:?}")))?;
+    *INSTALLED_IPC_WINDOW.lock() = Some(InstalledIpcVenue {
+        window: installed,
+        region: retained_region,
+    });
     Ok(())
 }
 

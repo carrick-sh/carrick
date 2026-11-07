@@ -1537,12 +1537,7 @@ impl PreparedRun {
                         root_context
                             .resources()
                             .files()
-                            .publish_ipc(
-                                owner,
-                                carrick_kernel::kernel::objects::IpcTableMapBinding::Retained(
-                                    machine.ipc_table_map()?,
-                                ),
-                            )
+                            .publish_ipc(owner, machine.ipc_table_map()?)
                             .map_err(|e| {
                                 RuntimeError::Unsupported(format!("x86 IPC publication: {e:?}"))
                             })?;

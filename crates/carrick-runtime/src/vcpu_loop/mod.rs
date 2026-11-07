@@ -1752,10 +1752,11 @@ where
                 ))
             })?;
         if let Some(slot) = engine.mailbox_slot() {
-            let _ = crate::with_carrier_ipc_region(|region| {
+            let _ = crate::with_carrier_ipc_region(|region, map_backing| {
                 carrick_kernel::kernel::continuation::ipc::publish_file_table(
                     &kernel_context,
                     region,
+                    map_backing,
                 );
             });
             carrick_kernel::el1_delegation::revalidate_current_task(

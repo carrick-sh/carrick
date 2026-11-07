@@ -63,6 +63,7 @@ vm_free = [
   "carrick-kernel::kernel::continuation::ipc::tests::el1_ipc_vector_handback_prefetch_preserves_imported_order_and_reclaims_storage",
   "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_fork_exec_pipe_writer_reaches_its_parent",
   "carrick-personality-linux::dispatch::ring_first_tests::writev_dispatches_through_the_ipc_writer_without_scalar_file_fallback",
+  "carrick-kernel::kernel::objects::ipc::tests::publication_retains_map_until_namespace_withdrawal (production publication retains map custody and withdraws before releasing its owner)",
 ]
 # #1507: imported pipe writev uses the existing owned pipe operation.
 # The VM-free bounds are zero host calls and reclamation to the exact

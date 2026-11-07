@@ -6986,8 +6986,12 @@ where
             &context,
             authority.fd_ceiling_publisher(),
         );
-        let _ = crate::with_carrier_ipc_region(|region| {
-            carrick_kernel::kernel::continuation::ipc::publish_file_table(&context, region);
+        let _ = crate::with_carrier_ipc_region(|region, map_backing| {
+            carrick_kernel::kernel::continuation::ipc::publish_file_table(
+                &context,
+                region,
+                map_backing,
+            );
         });
 
         let boxed: Box<dyn std::any::Any> = Box::new(engine);

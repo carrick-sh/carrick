@@ -3739,6 +3739,18 @@ impl BirthZoneBacking {
         registration.tables(registration.binding()).is_ok()
     }
 }
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl carrick_el1_abi::IpcTableMapBacking for BirthZoneBacking {
+    fn with_table_map(
+        &self,
+        visitor: &mut dyn FnMut(&carrick_el1_abi::ipc_tables::IpcTableMap),
+    ) -> Result<(), carrick_el1_abi::FileRegionError> {
+        let registration = self.registration.lock();
+        let tables = registration.tables(registration.binding())?;
+        visitor(tables.ipc_table_map());
+        Ok(())
+    }
+}
 // SAFETY: this is the fixed initialized EL1 MAP_SHARED region, which cannot
 // become exclusive exec backing after promotion. Cross-thread byte access uses
 // the existing zone ABI's atomics/claim protocol; the final Arc owns munmap.

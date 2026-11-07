@@ -1573,9 +1573,7 @@ impl Cpl0Carrier {
     }
 
     /// Acquire stopped-carrier proof and authenticate the retained registration.
-    pub fn ipc_table_map(
-        &self,
-    ) -> Result<Arc<dyn carrick_el1_abi::ipc_tables::IpcTableMapBacking>, TrapError> {
+    pub fn ipc_table_map(&self) -> Result<Arc<dyn carrick_el1_abi::IpcTableMapBacking>, TrapError> {
         self.custody.ipc_table_map()
     }
 
@@ -1836,15 +1834,8 @@ impl Cpl0Carrier {
         let mut ipc_generation = None;
         if let Some(owner) = ipc {
             use carrick_x86_cpl0_host::carrier_memory::IpcWindowPart;
-            let window = unsafe {
-                carrick_el1_abi::HostIpcWindow::new(
-                    carrick_guest_arch::HostVa::new(owner.directory_ptr() as usize),
-                    carrick_guest_arch::GuestLen::new(owner.directory_len() as u64),
-                    carrick_guest_arch::HostVa::new(owner.pool_ptr() as usize),
-                    carrick_guest_arch::GuestLen::new(owner.pool_len() as u64),
-                )
-            }
-            .ok_or_else(|| fail("invalid IPC window geometry"))?;
+            let window = unsafe { carrick_el1_abi::HostIpcWindow::new(owner.as_ref()) }
+                .ok_or_else(|| fail("invalid IPC window geometry"))?;
             ipc_generation = Some(
                 window
                     .attach()

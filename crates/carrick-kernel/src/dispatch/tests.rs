@@ -149,14 +149,13 @@ mod overlay_dispatch_tests {
     #[test]
     fn serial_host_el1_ipc_production_eventfd_table_shares_data_with_guest_view() {
         use carrick_el1_abi::ipc::{fd, IpcBacking};
-        use carrick_el1_abi::ipc_tables::IpcTableMap;
         let mut dispatcher = SyscallDispatcher::new();
         let context = dispatcher.capture_one_task_context().unwrap();
         let owner = context.kernel().ipc().unwrap();
         // SAFETY: zero is the empty atomic map; retained for this test process.
-        let map = unsafe { &*std::alloc::alloc_zeroed(std::alloc::Layout::new::<IpcTableMap>()).cast::<IpcTableMap>() };
+        let map = Arc::new(carrick_test_support::TestIpcTableMap::new());
         let files = context.resources().files();
-        files.publish_ipc(Arc::clone(&owner), map).unwrap();
+        files.publish_ipc(Arc::clone(&owner), map.clone()).unwrap();
         let mut memory = LinearMemory::new(0x4000, vec![0; 4096]);
         let reporter = CompatReporter::default();
         let create = dispatcher.dispatch(&context, SyscallRequest::new(19, SyscallArgs([7, 0, 0, 0, 0, 0])), &mut memory, &reporter).unwrap();

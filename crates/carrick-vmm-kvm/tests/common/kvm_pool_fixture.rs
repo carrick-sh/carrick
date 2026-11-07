@@ -103,9 +103,7 @@ pub fn try_run_program_with_dispatcher(
             .files()
             .publish_ipc(
                 owner,
-                carrick_kernel::kernel::objects::IpcTableMapBinding::Retained(
-                    carrier.ipc_table_map().expect("retained descriptor map"),
-                ),
+                carrier.ipc_table_map().expect("retained descriptor map"),
             )
             .expect("publish exact table");
     }
