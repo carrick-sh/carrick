@@ -1549,7 +1549,6 @@ impl PreparedRun {
                     }
                     root_context
                         .kernel()
-                        .object_ids()
                         .bind_initial_birth_source(machine.birth_serial_source()?)
                         .map_err(|error| {
                             RuntimeError::Unsupported(format!(

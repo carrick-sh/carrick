@@ -110,7 +110,6 @@ pub fn try_run_program_with_dispatcher(
             .expect("publish exact table");
     }
     root.kernel()
-        .object_ids()
         .bind_initial_birth_source(
             carrier
                 .birth_serial_source()

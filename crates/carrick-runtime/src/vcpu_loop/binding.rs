@@ -2524,6 +2524,14 @@ where
                             threads::CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EAGAIN),
                         ));
                     }
+                    Err(carrick_kernel::kernel::KernelOperationError::Id(
+                        carrick_kernel::kernel::IdError::StorageRequired
+                        | carrick_kernel::kernel::IdError::Exhausted,
+                    )) => {
+                        return Ok(PersistentHvpatchCloneAttempt::Complete(
+                            threads::CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EAGAIN),
+                        ));
+                    }
                     Err(error) => {
                         return Err(RuntimeError::Configuration(format!(
                             "reserve persistent HVPatch thread clone: {error}"

@@ -1434,6 +1434,15 @@ impl Kernel {
     pub fn shared_futex(&self) -> &carrick_thread::platform_futex::SharedFutexTable {
         &self.shared_futex
     }
+    /// Bind the retained carrier authorities before native admission.
+    pub fn bind_initial_birth_source(
+        &self,
+        source: Arc<dyn carrick_hal::birth_serial::BirthSerialSource>,
+    ) -> Result<(), KernelError> {
+        self.ids.bind_namespace_source(source.clone())?;
+        self.object_ids.bind_initial_birth_source(source)?;
+        Ok(())
+    }
     pub fn bootstrap_root(
         bootstrap: RootBootstrap,
     ) -> Result<(Arc<Self>, KernelContext), KernelError> {
@@ -1444,7 +1453,10 @@ impl Kernel {
         let process_group_claim = ids.claim_process_group(process_group_id)?;
         let session_claim = ids.claim_session(session_id)?;
         let object_ids = match bootstrap.birth_source {
-            Some(source) => ObjectIdRegistry::with_birth_source(source),
+            Some(source) => {
+                ids.bind_namespace_source(source.clone())?;
+                ObjectIdRegistry::with_birth_source(source)
+            }
             None => ObjectIdRegistry::new(),
         };
         let fd_ceiling = Arc::new(super::FdCeilingAuthority::new());
@@ -1502,6 +1514,13 @@ impl Kernel {
         )?);
         let session = Arc::new(Session::new(session_id, &ids, session_claim)?);
         let pid_identity = container.prepare_pid_root(task_key)?;
+        if let Some(domain) = container
+            .pid_region()
+            .and_then(|region| region.visible_domain())
+        {
+            ids.bind_visible_domain(task_key.id, domain)?;
+        }
+
         let namespace_id = pid_identity.as_ref().map_or_else(
             || {
                 u32::try_from(task_key.id.raw()).unwrap_or_else(|_| {
@@ -2050,6 +2069,13 @@ impl Kernel {
         };
         let leader = task.attach_thread(leader_key, registry_id, Arc::clone(&resources))?;
         let pid_identity = container.prepare_pid_root(task_key)?;
+        if let Some(domain) = container
+            .pid_region()
+            .and_then(|region| region.visible_domain())
+        {
+            self.ids.bind_visible_domain(task_key.id, domain)?;
+        }
+
         container_reservation.record_prepared_task(task_key);
         let process_group = Arc::new(ProcessGroup::new(
             process_group_id,

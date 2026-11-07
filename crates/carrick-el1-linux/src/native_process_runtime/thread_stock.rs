@@ -6,9 +6,10 @@ use carrick_core::lifecycle::stock::{
 
 pub(super) struct NativeThreadStock<'a, C: ProcessContext> {
     controls: &'a [ThreadControlSlot],
-    identities: StockEntries<NativeClaim>,
+    identities: StockEntries<NativeClaim<'a>>,
     waiters: Vec<carrick_el1_abi::RecordRef>,
     release: Arc<ControlRelease<'a, C>>,
+    namespace_exhausted: bool,
 }
 struct ControlRelease<'a, C: ProcessContext> {
     zone: &'a ZoneTables<C>,
@@ -58,6 +59,7 @@ impl<'a, C: ProcessContext> NativeThreadStock<'a, C> {
                     return Ok(Self {
                         controls,
                         identities: StockEntries::default(),
+                        namespace_exhausted: false,
                         waiters: Vec::with_capacity(carrick_el1_abi::THREAD_POOL_ENTRIES + 1),
                         release: Arc::new(ControlRelease {
                             zone,
@@ -129,7 +131,7 @@ pub(super) fn replenish<'a, M: Clone, C: ProcessContext>(
     caller: u32,
 ) -> Result<(), NativeProcessError> {
     let limit = at_limit(graph, key, caller)?;
-    let namespace = graph.namespace.clone();
+    let namespace = graph.namespace;
     let visible_namespace = graph.visible_namespace;
     let task = graph
         .owner
@@ -144,11 +146,12 @@ pub(super) fn replenish<'a, M: Clone, C: ProcessContext>(
         return Ok(());
     };
     stock.settle(resources.page)?;
+    stock.namespace_exhausted = false;
     struct Stock<'s, 'a, C: ProcessContext> {
         stock: &'s mut NativeThreadStock<'a, C>,
         page: &'a ThreadLifecyclePage,
         zone: &'a ZoneTables<C>,
-        namespace: Arc<SpinLock<NamespaceState>>,
+        namespace: &'a NamespaceTable,
         visible_namespace: VisibleNamespace,
         key: TaskKey,
         uid: carrick_personality_linux::identity::TaskUid,
@@ -184,19 +187,22 @@ pub(super) fn replenish<'a, M: Clone, C: ProcessContext>(
             let Some(serial) = self.zone.serial_issuer().allocate() else {
                 return false;
             };
-            let (number, visible) = {
-                let mut namespace = self.namespace.lock();
-                let Ok(number) = namespace.reserve_next(ClaimKind::Thread) else {
-                    return false;
-                };
-                let Some(visible) = namespace.reserve_visible(self.visible_namespace) else {
-                    namespace.release(number, ClaimKind::Thread);
-                    return false;
-                };
-                (number, visible)
+            let Some((number, visible)) =
+                self.namespace
+                    .with_view(&carrick_sched_core::ShortLockSpin, |namespace| {
+                        let number = namespace.reserve_next(ClaimKind::Thread).ok()?;
+                        let Ok(visible) = namespace.reserve_visible(self.visible_namespace) else {
+                            namespace.release(number, ClaimKind::Thread);
+                            return None;
+                        };
+                        Some((number, visible))
+                    })
+            else {
+                self.stock.namespace_exhausted = true;
+                return false;
             };
             let claim = NativeClaim {
-                namespace: self.namespace.clone(),
+                namespace: self.namespace,
                 claims: vec![(number, ClaimKind::Thread)],
             };
             let Ok(entry) = self.page.stock_with_control(
@@ -319,6 +325,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         .thread_stock
                         .as_ref()
                         .ok_or(ObjectWaitError::Stale)?;
+                    if stock.namespace_exhausted && stock.identities.standing(resources.page) == 0 {
+                        limit = true;
+                        return Err(ObjectWaitError::Changed);
+                    }
                     // SAFETY: stock retains the source and control extent in
                     // the shared mapping until final-pin settlement. The queue
                     // is enrolled before this neutral admission decision.
@@ -461,7 +471,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
 pub(crate) fn claim_counts<M: Clone, C: ProcessContext>(
     runtime: &NativeProcessRuntime<'_, M, C>,
 ) -> carrick_sched_core::process::identity_allocator::IdRegistryCounts {
-    runtime.graph.lock().namespace.lock().counts()
+    runtime
+        .graph
+        .lock()
+        .namespace
+        .with_view(&carrick_sched_core::ShortLockSpin, |ns| ns.counts())
 }
 #[cfg(all(test, not(target_os = "macos")))]
 pub(crate) fn retain_signal_snapshot<'a, M: Clone, C: ProcessContext>(
