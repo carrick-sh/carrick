@@ -1613,10 +1613,23 @@ fn fork_child_pipe_copyout_selects_owner_preparation_with_two_live_mms() {
         words: &'a W,
         root: RootGpa,
     }
-    impl<W: LiveDescriptorWords> HostFileUser for ChildCopy<'_, W> {
-        fn copy_in(&mut self, _: &mut [u8], _: u64) -> bool {
+    impl<W: LiveDescriptorWords> carrick_personality_linux::lifecycle::UserCopy for ChildCopy<'_, W> {
+        fn copy_in(
+            &mut self,
+            _: &mut [u8],
+            _: carrick_guest_arch::UserVa,
+        ) -> carrick_personality_linux::lifecycle::CopyOutcome {
             panic!("a pipe read has no user input");
         }
+        fn copy_out(
+            &mut self,
+            _: carrick_guest_arch::UserVa,
+            _: &[u8],
+        ) -> carrick_personality_linux::lifecycle::CopyOutcome {
+            panic!("staging does not copy output bytes")
+        }
+    }
+    impl<W: LiveDescriptorWords> HostFileUser for ChildCopy<'_, W> {
         fn writable(&mut self, address: u64, len: usize) -> usize {
             if Aarch64Mmu::translate(
                 self.words,

@@ -7,20 +7,30 @@ struct Memory {
     bytes: Vec<u8>,
     writable: bool,
 }
-impl HostFileUser for Memory {
-    fn copy_in(&mut self, dst: &mut [u8], src: u64) -> bool {
+impl carrick_core::user_copy::UserCopy for Memory {
+    fn copy_in(&mut self, dst: &mut [u8], src: carrick_guest_arch::UserVa) -> CopyOutcome {
+        let src = src.raw();
         let Some(start) = src.checked_sub(self.base) else {
-            return false;
+            return CopyOutcome::Fault;
         };
         let start = start as usize;
         match self.bytes.get(start..start + dst.len()) {
             Some(bytes) => {
                 dst.copy_from_slice(bytes);
-                true
+                CopyOutcome::Done
             }
-            None => false,
+            None => CopyOutcome::Fault,
         }
     }
+    fn copy_out(
+        &mut self,
+        _: carrick_guest_arch::UserVa,
+        _: &[u8],
+    ) -> carrick_core::user_copy::CopyOutcome {
+        panic!("staging does not copy output bytes")
+    }
+}
+impl HostFileUser for Memory {
     fn writable(&mut self, dst: u64, len: usize) -> usize {
         if !self.writable {
             return 0;
@@ -420,7 +430,7 @@ fn empty_path_stat_names_the_descriptor() {
 }
 
 #[test]
-fn unreadable_input_requests_fault_supply_first_and_long_paths_fail() {
+fn invalid_input_faults_and_long_paths_fail() {
     let mut user = memory(b"");
     assert_eq!(
         run(
@@ -431,10 +441,7 @@ fn unreadable_input_requests_fault_supply_first_and_long_paths_fail() {
             },
             &mut user
         ),
-        Some(HostFileStage::Fault {
-            address: 0x9000,
-            access: Access::Read
-        })
+        returned(carrick_syscall_abi::LINUX_EFAULT)
     );
     let mut long = memory(&vec![b'a'; LINUX_PATH_MAX + 8]);
     assert_eq!(
@@ -466,13 +473,9 @@ fn completion_copies_output_only_on_success() {
         .unwrap()
         .reply(3, b"abc")
         .unwrap();
-    let mut copied = Vec::new();
-    let result = complete(&record, output, &mut |address, bytes| {
-        copied.push((address, bytes.to_vec()));
-        true
-    });
+    let (result, bytes) = complete(&record, output);
     assert_eq!(result, SyscallResult::new(3));
-    assert_eq!(copied, vec![(BASE, b"abc".to_vec())]);
+    assert_eq!(bytes, b"abc");
     // No reply (refused or cancelled service) never copies anything.
     let (record, output, _) = request(run(
         HostFileCall::Read {
@@ -483,8 +486,11 @@ fn completion_copies_output_only_on_success() {
         &mut user,
     ));
     assert_eq!(
-        complete(&record, output, &mut |_, _| panic!("no output")),
-        SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO)
+        complete(&record, output),
+        (
+            SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO),
+            &[][..]
+        )
     );
 }
 
@@ -924,10 +930,7 @@ fn ppoll_arrays_need_readable_input_and_writable_output_before_crossing() {
     };
     assert_eq!(
         run(unreadable, &mut user),
-        Some(HostFileStage::Fault {
-            address: BASE - 4096,
-            access: Access::Read,
-        })
+        returned(carrick_syscall_abi::LINUX_EFAULT)
     );
     let (call, mut user) = ppoll(&[(1, 0x4)], None);
     user.writable = false;
@@ -938,4 +941,195 @@ fn ppoll_arrays_need_readable_input_and_writable_output_before_crossing() {
             access: Access::Write,
         })
     );
+}
+
+#[test]
+fn file_staging_true_input_fault_does_not_request_backing() {
+    let mut user = memory(b"resident");
+    for call in [
+        HostFileCall::Write {
+            fd: 1,
+            buf: 0,
+            count: 1,
+        },
+        HostFileCall::Writev {
+            fd: 1,
+            iov: 0,
+            iovcnt: 1,
+        },
+    ] {
+        assert_eq!(
+            run(call, &mut user),
+            returned(carrick_syscall_abi::LINUX_EFAULT)
+        );
+    }
+}
+
+#[test]
+fn file_staging_not_yet_input_builds_no_request_before_supply() {
+    use carrick_core::user_copy::GuestCopyRequest;
+    use carrick_guest_arch::{GuestLen, UserVa};
+
+    struct LazyInput {
+        memory: Memory,
+        pending: Option<u64>,
+        refused: usize,
+    }
+    impl carrick_core::user_copy::UserCopy for LazyInput {
+        fn copy_in(&mut self, dst: &mut [u8], src: carrick_guest_arch::UserVa) -> CopyOutcome {
+            let src = src.raw();
+            if self.pending == Some(src) {
+                self.pending = None;
+                self.refused += 1;
+                return CopyOutcome::NotYet(GuestCopyRequest {
+                    address: UserVa::new(src),
+                    len: GuestLen::new(dst.len() as u64),
+                    access: Access::Read,
+                });
+            }
+            self.memory
+                .copy_in(dst, carrick_guest_arch::UserVa::new(src))
+        }
+        fn copy_out(
+            &mut self,
+            _: carrick_guest_arch::UserVa,
+            _: &[u8],
+        ) -> carrick_core::user_copy::CopyOutcome {
+            panic!("staging does not copy output bytes")
+        }
+    }
+    impl HostFileUser for LazyInput {
+        fn writable(&mut self, _: u64, _: usize) -> usize {
+            panic!("write input may be read-only");
+        }
+    }
+
+    for vector in [false, true] {
+        let mut bytes = vec![0; 64];
+        bytes[32..38].copy_from_slice(b"abcdef");
+        bytes[..8].copy_from_slice(&(BASE + 32).to_le_bytes());
+        bytes[8..16].copy_from_slice(&3u64.to_le_bytes());
+        bytes[16..24].copy_from_slice(&(BASE + 35).to_le_bytes());
+        bytes[24..32].copy_from_slice(&3u64.to_le_bytes());
+        let refused_address = BASE + if vector { 35 } else { 32 };
+        let mut user = LazyInput {
+            memory: memory(&bytes),
+            pending: Some(refused_address),
+            refused: 0,
+        };
+        let call = if vector {
+            HostFileCall::Writev {
+                fd: 1,
+                iov: BASE,
+                iovcnt: 2,
+            }
+        } else {
+            HostFileCall::Write {
+                fd: 1,
+                buf: BASE + 32,
+                count: 6,
+            }
+        };
+        let mut resolve = caller;
+        let mut releases = |_: &mut [host_file::MapSourceReply]| 0;
+        let mut namespace = NativeNamespace {
+            table: TABLE,
+            resolve: &mut resolve,
+            releases: &mut releases,
+        };
+        assert_eq!(
+            stage(call, &mut namespace, &mut user),
+            Some(HostFileStage::Fault {
+                address: refused_address,
+                access: Access::Read,
+            })
+        );
+        let (mut record, output, _) = request(stage(call, &mut namespace, &mut user));
+        assert!(output.is_none());
+        assert_eq!(
+            HostFileRequestView::parse(&mut record).unwrap().input(),
+            b"abcdef"
+        );
+        assert_eq!(user.refused, 1);
+    }
+}
+
+/// Outcome classification at the production staging entry. This does not
+/// establish descriptor retention through native-process/carrier service.
+#[test]
+fn ppoll_input_preserves_fault_and_exact_owner_request() {
+    use carrick_core::user_copy::GuestCopyRequest;
+    use carrick_guest_arch::{GuestLen, UserVa};
+
+    struct RefusedInput {
+        memory: Memory,
+        address: u64,
+        outcome: Option<CopyOutcome>,
+    }
+    impl carrick_core::user_copy::UserCopy for RefusedInput {
+        fn copy_in(&mut self, dst: &mut [u8], src: carrick_guest_arch::UserVa) -> CopyOutcome {
+            let src = src.raw();
+            if src == self.address
+                && let Some(outcome) = self.outcome.take()
+            {
+                return outcome;
+            }
+            self.memory
+                .copy_in(dst, carrick_guest_arch::UserVa::new(src))
+        }
+        fn copy_out(
+            &mut self,
+            _: carrick_guest_arch::UserVa,
+            _: &[u8],
+        ) -> carrick_core::user_copy::CopyOutcome {
+            panic!("staging does not copy output bytes")
+        }
+    }
+    impl HostFileUser for RefusedInput {
+        fn writable(&mut self, dst: u64, len: usize) -> usize {
+            self.memory.writable(dst, len)
+        }
+    }
+
+    for timeout_input in [false, true] {
+        let address = BASE
+            + if timeout_input {
+                host_file::POLLFD_BYTES as u64
+            } else {
+                0
+            };
+        let request = GuestCopyRequest {
+            address: UserVa::new(address + 4),
+            len: GuestLen::new(4),
+            access: Access::Read,
+        };
+        for outcome in [CopyOutcome::NotYet(request), CopyOutcome::Fault] {
+            let (call, memory) = ppoll(&[(1, 0x4)], Some((0, 0)));
+            let mut user = RefusedInput {
+                memory,
+                address,
+                outcome: Some(outcome),
+            };
+            let mut resolve = caller;
+            let mut releases = |_: &mut [host_file::MapSourceReply]| 0;
+            let mut namespace = NativeNamespace {
+                table: TABLE,
+                resolve: &mut resolve,
+                releases: &mut releases,
+            };
+            let expected = match outcome {
+                CopyOutcome::Fault => returned(carrick_syscall_abi::LINUX_EFAULT),
+                CopyOutcome::NotYet(request) => Some(HostFileStage::Fault {
+                    address: request.address.raw(),
+                    access: request.access,
+                }),
+                CopyOutcome::Done => unreachable!(),
+            };
+            assert_eq!(stage(call, &mut namespace, &mut user), expected);
+            assert!(matches!(
+                stage(call, &mut namespace, &mut user),
+                Some(HostFileStage::Request { .. })
+            ));
+        }
+    }
 }

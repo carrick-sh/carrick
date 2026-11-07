@@ -3,7 +3,6 @@
   "bool-trait:crates/carrick-el1/src/file.rs:UserCopy::copy_in": 1,
   "bool-trait:crates/carrick-el1/src/file.rs:UserCopy::copy_out": 1,
   "bool-trait:crates/carrick-el1/src/isa/x86/initial_mm.rs:InitialFrameSource::copy_guest_data": 1,
-  "bool-trait:crates/carrick-personality-linux/src/native_host_file.rs:HostFileUser::copy_in": 1,
   "bool-trait:crates/carrick-personality-linux/src/sched.rs:SchedVenue::copy_in": 1,
   "bool-trait:crates/carrick-personality-linux/src/sched.rs:SchedVenue::copy_out": 1,
   "error-collapse:crates/carrick-core/src/file.rs": 2,

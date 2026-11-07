@@ -14,10 +14,12 @@ use crate::abi::entry::SyscallResult;
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
+use carrick_core::user_copy::{CopyOutcome, UserCopy};
 use carrick_core_abi::host_file::{
     self, HOST_FILE_CHUNK_BYTES, HostFileHeader, HostFileOp, record_len,
 };
 use carrick_guest_arch::Access;
+use carrick_guest_arch::UserVa;
 use carrick_syscall_abi::{CanonicalNr, LinuxErrno};
 
 /// Size of the aarch64 Linux `struct stat` (`asm-generic/stat.h`).
@@ -301,13 +303,11 @@ impl HostFileCall {
     }
 }
 
-/// User memory as the staging step needs it. Before a request with output
-/// crosses, its whole output range must already be writable, so the reply's
-/// copy-out cannot need a page the ring would have to supply mid-completion:
-/// staging asks for fault supply first and retries the exact call, and a
-/// refused supply is EFAULT, as Linux reports a bad buffer.
-pub trait HostFileUser {
-    fn copy_in(&mut self, dst: &mut [u8], src: u64) -> bool;
+/// Native staging uses the neutral `UserCopy` interface for transfers; this
+/// extension describes output preparation. Staging requests owner backing
+/// before crossing when the destination is not currently writable. Completion
+/// retains the carrier's reply if output needs another owner-memory wait.
+pub trait HostFileUser: UserCopy {
     /// Contiguous bytes from `dst` that user mode can write now.
     fn writable(&mut self, dst: u64, len: usize) -> usize;
 }
@@ -398,12 +398,15 @@ fn copy_path(user: &mut dyn HostFileUser, address: u64) -> Path {
         let room = (PAGE_BYTES - cursor % PAGE_BYTES) as usize;
         let take = room.min(LINUX_PATH_MAX - bytes.len());
         let mut chunk = vec![0u8; take];
-        if !user.copy_in(&mut chunk, cursor) {
-            // Retry the exact call after supply; a refused supply is EFAULT.
-            return Path::Stage(HostFileStage::Fault {
-                address: cursor,
-                access: Access::Read,
-            });
+        match user.copy_in(&mut chunk, UserVa::new(cursor)) {
+            CopyOutcome::Done => {}
+            CopyOutcome::Fault => return Path::Stage(errno(carrick_syscall_abi::LINUX_EFAULT)),
+            CopyOutcome::NotYet(request) => {
+                return Path::Stage(HostFileStage::Fault {
+                    address: request.address.raw(),
+                    access: request.access,
+                });
+            }
         }
         if let Some(end) = chunk.iter().position(|byte| *byte == 0) {
             bytes.extend_from_slice(&chunk[..end]);
@@ -559,11 +562,17 @@ fn gather_vectors(
         return Err(errno(carrick_syscall_abi::LINUX_EINVAL));
     }
     let mut vectors = vec![0u8; iovcnt as usize * IOVEC_BYTES];
-    if !vectors.is_empty() && !user.copy_in(&mut vectors, iov) {
-        return Err(HostFileStage::Fault {
-            address: iov,
-            access: Access::Read,
-        });
+    if !vectors.is_empty() {
+        match user.copy_in(&mut vectors, UserVa::new(iov)) {
+            CopyOutcome::Done => {}
+            CopyOutcome::Fault => return Err(errno(carrick_syscall_abi::LINUX_EFAULT)),
+            CopyOutcome::NotYet(request) => {
+                return Err(HostFileStage::Fault {
+                    address: request.address.raw(),
+                    access: request.access,
+                });
+            }
+        }
     }
     // Linux rejects a negative total before any transfer.
     let mut total: u64 = 0;
@@ -586,13 +595,15 @@ fn gather_vectors(
         let take = (len as usize).min(room);
         let start = input.len();
         input.resize(start + take, 0);
-        if !user.copy_in(&mut input[start..], base) {
-            // Supply first and retry the exact call; a refused supply
-            // completes as EFAULT.
-            return Err(HostFileStage::Fault {
-                address: base,
-                access: Access::Read,
-            });
+        match user.copy_in(&mut input[start..], UserVa::new(base)) {
+            CopyOutcome::Done => {}
+            CopyOutcome::Fault => return Err(errno(carrick_syscall_abi::LINUX_EFAULT)),
+            CopyOutcome::NotYet(request) => {
+                return Err(HostFileStage::Fault {
+                    address: request.address.raw(),
+                    access: request.access,
+                });
+            }
         }
     }
     Ok(input)
@@ -634,11 +645,17 @@ fn stage_call(
         HostFileCall::Write { fd, buf, count } => {
             return staging.write(fd, user, |user| {
                 let mut input = vec![0u8; chunk(count)];
-                if !input.is_empty() && !user.copy_in(&mut input, buf) {
-                    return Err(HostFileStage::Fault {
-                        address: buf,
-                        access: Access::Read,
-                    });
+                if !input.is_empty() {
+                    match user.copy_in(&mut input, UserVa::new(buf)) {
+                        CopyOutcome::Done => {}
+                        CopyOutcome::Fault => return Err(errno(carrick_syscall_abi::LINUX_EFAULT)),
+                        CopyOutcome::NotYet(request) => {
+                            return Err(HostFileStage::Fault {
+                                address: request.address.raw(),
+                                access: request.access,
+                            });
+                        }
+                    }
                 }
                 Ok(input)
             });
@@ -1005,11 +1022,15 @@ fn stage_ppoll(
         PollWait::MayWait
     } else {
         let mut spec = [0u8; 16];
-        if !user.copy_in(&mut spec, timeout) {
-            return Some(HostFileStage::Fault {
-                address: timeout,
-                access: Access::Read,
-            });
+        match user.copy_in(&mut spec, UserVa::new(timeout)) {
+            CopyOutcome::Done => {}
+            CopyOutcome::Fault => return Some(errno(carrick_syscall_abi::LINUX_EFAULT)),
+            CopyOutcome::NotYet(request) => {
+                return Some(HostFileStage::Fault {
+                    address: request.address.raw(),
+                    access: request.access,
+                });
+            }
         }
         let seconds = i64::from_le_bytes(spec[..8].try_into().unwrap_or([0; 8]));
         let nanoseconds = i64::from_le_bytes(spec[8..].try_into().unwrap_or([0; 8]));
@@ -1021,11 +1042,15 @@ fn stage_ppoll(
     };
     let len = nfds as usize * POLLFD_BYTES;
     let mut entries = vec![0u8; len];
-    if !user.copy_in(&mut entries, fds) {
-        return Some(HostFileStage::Fault {
-            address: fds,
-            access: Access::Read,
-        });
+    match user.copy_in(&mut entries, UserVa::new(fds)) {
+        CopyOutcome::Done => {}
+        CopyOutcome::Fault => return Some(errno(carrick_syscall_abi::LINUX_EFAULT)),
+        CopyOutcome::NotYet(request) => {
+            return Some(HostFileStage::Fault {
+                address: request.address.raw(),
+                access: request.access,
+            });
+        }
     }
     let mut host_backed = false;
     for entry in entries.chunks_exact(POLLFD_BYTES) {
@@ -1109,27 +1134,29 @@ pub fn map_source(record: &[u8]) -> Result<host_file::MapSourceReply, SyscallRes
 }
 
 /// Map the carrier's reply to the syscall result, copying any output back
-/// through the ring's own user copy.
-pub fn complete(
-    record: &[u8],
-    output: Option<HostFileOutput>,
-    copy_out: &mut dyn FnMut(u64, &[u8]) -> bool,
-) -> SyscallResult {
+/// through the ring's existing owned-output continuation. Validation does
+/// not access user memory: the service owner retains these bytes before
+/// retiring the request, then copies them with its exact-MM owner protocol.
+pub fn complete(record: &[u8], output: Option<HostFileOutput>) -> (SyscallResult, &[u8]) {
     let Some(reply) = host_file::reply(record) else {
-        return SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO);
+        return (
+            SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO),
+            &[],
+        );
     };
     if reply.result < 0 {
-        return SyscallResult::new(reply.result);
+        return (SyscallResult::new(reply.result), &[]);
     }
     if let Some(output) = output {
         if reply.output.len() > output.len {
-            return SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO);
+            return (
+                SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO),
+                &[],
+            );
         }
-        if !reply.output.is_empty() && !copy_out(output.address, reply.output) {
-            return SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT);
-        }
+        return (SyscallResult::new(reply.result), reply.output);
     }
-    SyscallResult::new(reply.result)
+    (SyscallResult::new(reply.result), &[])
 }
 
 /// Stamp a staged `Write` record with its writer's own `RLIMIT_FSIZE` soft

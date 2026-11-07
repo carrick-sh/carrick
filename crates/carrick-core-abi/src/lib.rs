@@ -39,6 +39,23 @@ pub use open_lifetime::*;
 mod seqlock;
 pub use seqlock::*;
 
+/// Borrowed identity of an operation's retained description. This key grants
+/// lookup only: it cannot be installed, cloned into a hold, or unpinned.
+/// The operation must retain its owning `carrick_fd_core::OfdPin` until every
+/// borrower has finished (including carrier cancellation acknowledgement).
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub struct OfdPinIdentity {
+    pub authority: u64,
+    pub index: u64,
+    pub generation: u64,
+}
+
 pub mod host_file;
 pub mod service;
 

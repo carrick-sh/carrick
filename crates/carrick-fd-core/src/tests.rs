@@ -4,6 +4,40 @@ use super::*;
 use std::sync::{Mutex, OnceLock};
 use std::{boxed::Box, vec, vec::Vec};
 
+#[test]
+fn borrowed_pin_identity_retains_original_after_numeric_reuse() {
+    let c = authority::<1, 2>();
+    let foreign = authority::<1, 2>();
+    let table = c.create_table(2, &mut storage(2)).unwrap();
+    let number = c.open(table, Fd(0), description(41), false).unwrap();
+    let (pin, original) = c.pin(table, number).unwrap();
+    let identity = pin.identity();
+    assert_eq!(c.close(table, number), Ok(None));
+    assert_eq!(c.open(table, Fd(0), description(42), false), Ok(number));
+    assert_eq!(c.pinned_identity(identity), Ok(original));
+    assert_eq!(c.holds(&pin), Ok((0, 1)), "borrowing adds no hold");
+    assert_eq!(foreign.pinned_identity(identity), Err(Error::StalePin));
+    let mut invalid = identity;
+    invalid.index = u64::MAX;
+    assert_eq!(c.pinned_identity(invalid), Err(Error::StalePin));
+    assert_eq!(c.unpin(pin), Ok(Some(original)));
+    assert_eq!(c.pinned_identity(identity), Err(Error::StalePin));
+    let replacement = c.create_pinned(description(43)).unwrap();
+    assert_eq!(replacement.key().index as u64, identity.index);
+    assert_eq!(c.pinned_identity(identity), Err(Error::StalePin));
+    assert_eq!(c.get(table, number).unwrap().backing, BackingToken(42));
+    let (second_pin, _) = c.pin(table, number).unwrap();
+    let no_longer_pinned = second_pin.identity();
+    assert_eq!(c.unpin(second_pin), Ok(None));
+    assert_eq!(
+        c.pinned_identity(no_longer_pinned),
+        Err(Error::StalePin),
+        "a descriptor hold alone cannot authenticate an operation pin"
+    );
+    c.unpin(replacement).unwrap();
+    c.destroy_table(table, |_| {}).unwrap();
+}
+
 // Reservation custody stays in one authority, including across backing growth.
 #[test]
 fn owned_reservations_two_live_tables_keep_targets_and_fork_private() {
