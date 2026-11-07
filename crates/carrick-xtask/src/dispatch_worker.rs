@@ -1293,6 +1293,9 @@ fn worker_prompt(dispatch: &Dispatch) -> String {
         KVM/HAL code. Leave whole-workspace just lint-domains and just test-kernel to CI.\n\
         To propose a PR body, write ../pr-body.md beside result.json (relative to the checkout root).\n\
         Keep it at most 8 KiB, write for people, and omit closing references and dispatch footers; the server adds them. Put worker review text in ../review.md; the publisher posts it as a PR review explicitly marked as the worker’s own review and links it in the outcome. Typed review metadata (reviewer_model, session_id, author_session_id, verdict, head) may bind the exact head but never proves independence.\n\
+        Before publication the server audits earlier issue run commits against HEAD and main.\n\
+        For each intentionally dropped commit, add a risks entry exactly `Dropped <full SHA>: <reason>`; unexplained drops refuse publication.\n\
+        Workflow edits cannot be published by dispatch; omissions end automatic continuation and require the director to apply harvest.patch.\n\
         Return the requested JSON contract, stating unrun gates and blockers honestly.\n\n{}{}",
         dispatch.issue,
         dispatch.branch,
@@ -5178,6 +5181,8 @@ struct Applied {
     /// publish `.github/workflows/*` (#1241); the owner publishes them.
     #[serde(default)]
     workflow_left_out: Vec<String>,
+    #[serde(default)]
+    earlier_commits: Vec<String>,
     /// How the last worker's launcher ended (#1473).
     #[serde(default)]
     pub(crate) last_worker_exit: Option<LauncherExit>,
@@ -5221,8 +5226,14 @@ impl Applied {
         } else {
             "no review published"
         };
+        let history = self.earlier_commits.join("\n");
+        let handoff = if self.workflow_left_out.is_empty() {
+            String::new()
+        } else {
+            "- workflow changes were left out; the director must apply `harvest.patch`. Automatic continuation stopped.\n".to_owned()
+        };
         format!(
-            "{}{}{}- PR commits: {}.{}\n- PR body: {}.\n- Board status: {}.{}\n- Worker review: {review}{review_link}.\n",
+            "{history}\n{handoff}{}{}{}- PR commits: {}.{}\n- PR body: {}.\n- Board status: {}.{}\n- Worker review: {review}{review_link}.\n",
             self.provider_events.iter().map(|event| format!("- Provider filter: {event}.\n")).collect::<String>(),
             self.adoption_blocked
                 .as_ref()
@@ -6649,12 +6660,132 @@ fn preserve_harvest(work: &Path, base: &str, token: &str) -> Result<Option<Strin
     )))
 }
 
+/// Audit every earlier issue lane, including closed PRs. Git cherry compares
+/// stable patch identities; subjects cover conflict-resolved ports and empty
+/// evidence commits. Missing history is a publication failure, never a pass.
+fn audit_earlier_commits(
+    root: &Path,
+    work: &Path,
+    dispatch: &Dispatch,
+    receipt: &Receipt,
+    contract: &Contract,
+    main: &str,
+    token: &str,
+) -> Result<(), ScalerError> {
+    let mut tips = std::collections::BTreeSet::new();
+    if !receipt.expected_tip.is_empty() {
+        tips.insert(receipt.expected_tip.clone());
+    }
+    for pr in linked_prs(root, dispatch.issue, "all")? {
+        if pr["head"]["repo"]["full_name"] != REPOSITORY
+            || !(publish_app_author(&pr["user"]) || dispatch_comment_author(&pr["user"]))
+        {
+            continue;
+        }
+        let tip = pr["head"]["sha"]
+            .as_str()
+            .filter(|tip| sha(tip))
+            .ok_or(ScalerError::Guard("earlier run PR lacks a valid head"))?;
+        tips.insert(tip.to_owned());
+    }
+    if tips.is_empty() {
+        return Ok(());
+    }
+    let subjects = git(work, &["log", "--format=%s%x00", main, "HEAD"])?;
+    let subjects: std::collections::BTreeSet<_> = subjects.split('\0').map(str::trim).collect();
+    let mut report = Vec::new();
+    let mut unexplained = false;
+    let mut seen = std::collections::BTreeSet::new();
+    for tip in tips {
+        if git(work, &["cat-file", "-e", &format!("{tip}^{{commit}}")]).is_err() {
+            let mut fetch = git_invocation(
+                work,
+                &[
+                    "-c",
+                    "credential.helper=!gh auth git-credential",
+                    "fetch",
+                    "--no-tags",
+                    "https://github.com/carrick-sh/carrick",
+                    &tip,
+                ],
+            );
+            fetch.env("GH_TOKEN", token);
+            output(&mut fetch)?;
+        }
+        let fork = git(work, &["merge-base", main, &tip])?;
+        let fork = fork.trim();
+        let matching = |target: &str| -> Result<std::collections::BTreeSet<String>, ScalerError> {
+            Ok(git(work, &["cherry", target, &tip, fork])?
+                .lines()
+                .filter_map(|line| line.strip_prefix("- ").map(str::to_owned))
+                .collect())
+        };
+        let kept_head = matching("HEAD")?;
+        let kept_main = matching(main)?;
+        for commit in git(work, &["rev-list", "--reverse", &format!("{fork}..{tip}")])?.lines() {
+            if !seen.insert(commit.to_owned()) {
+                continue;
+            }
+            let subject = git(work, &["show", "-s", "--format=%s", commit])?;
+            let ancestor = [main, "HEAD"]
+                .iter()
+                .any(|target| git(work, &["merge-base", "--is-ancestor", commit, target]).is_ok());
+            let empty = git(
+                work,
+                &[
+                    "diff-tree",
+                    "--root",
+                    "--no-commit-id",
+                    "--name-only",
+                    "-r",
+                    commit,
+                ],
+            )?
+            .trim()
+            .is_empty();
+            let kept =
+                ancestor || (!empty && (kept_head.contains(commit) || kept_main.contains(commit)));
+            let disposition = if kept {
+                "kept (head or main patch)".to_owned()
+            } else if subjects.contains(subject.trim()) {
+                "ported (matching subject in head or main)".to_owned()
+            } else {
+                let prefix = format!("Dropped {commit}:");
+                let reason = contract.risks.iter().find_map(|line| {
+                    line.strip_prefix(&prefix)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                });
+                match reason {
+                    Some(reason) => format!("dropped: {reason}"),
+                    None => {
+                        unexplained = true;
+                        "dropped WITHOUT REASON; publication refused (contract violation)"
+                            .to_owned()
+                    }
+                }
+            };
+            report.push(format!(
+                "- Earlier commit `{commit}` ({:?}): {disposition}.",
+                subject.trim()
+            ));
+        }
+    }
+    Applied::record(|a| a.earlier_commits = report)?;
+    if unexplained {
+        return Err(ScalerError::Guard(
+            "contract violation: earlier run commits dropped without reasons; supply risk lines `Dropped <full SHA>: <reason>`",
+        ));
+    }
+    Ok(())
+}
+
 #[expect(clippy::too_many_arguments, reason = "one publication request")]
 fn publish_commits(
     root: &Path,
     dispatch: &Dispatch,
     receipt: &Receipt,
-    _contract: &Contract,
+    contract: &Contract,
     report_path: &Path,
     token: &str,
     runs: &mut agent_loop::RunCache,
@@ -6858,6 +6989,7 @@ fn publish_commits(
             },
         };
         *preserve = Some(base.clone());
+        audit_earlier_commits(root, &work, dispatch, receipt, contract, &live_main, token)?;
         // Main and the branch tip admitted before this run are trusted history.
         // A worker may rebase across either without owning their messages.
         check_commit_closures(
@@ -10658,6 +10790,47 @@ fi
             )
             .unwrap();
             git(&work, &["reset", "--hard", &candidate]).unwrap();
+            if witness.ends_with("main") {
+                git(
+                    &work,
+                    &[
+                        "--git-dir",
+                        outer.join("live-main.git").to_str().unwrap(),
+                        "fetch",
+                        work.to_str().unwrap(),
+                        &format!("{}:refs/heads/main", commits.last().unwrap()),
+                    ],
+                )
+                .unwrap();
+            }
+            if witness.ends_with("subject") || witness.ends_with("patch") {
+                for (i, commit) in commits.iter().enumerate() {
+                    if witness.ends_with("patch") {
+                        git(&work, &["cherry-pick", commit]).unwrap();
+                        git(
+                            &work,
+                            &[
+                                "commit",
+                                "--amend",
+                                "-m",
+                                &format!("fix(core): renamed port {i}"),
+                            ],
+                        )
+                        .unwrap();
+                    } else {
+                        let path = format!("earlier-{i}");
+                        std::fs::write(work.join(&path), "conflict resolved differently\n")
+                            .unwrap();
+                        git(&work, &["add", &path]).unwrap();
+                        git(
+                            &work,
+                            &["commit", "-m", &format!("fix(core): earlier fix {i}")],
+                        )
+                        .unwrap();
+                    }
+                }
+                receipt.head = git(&work, &["rev-parse", "HEAD"]).unwrap().trim().into();
+            }
             if witness.ends_with("reason") {
                 for commit in &commits {
                     contract.risks.push(format!(
@@ -10674,7 +10847,14 @@ fi
                 "fixture-token",
                 &mut agent_loop::RunCache::default(),
             );
-            if witness.ends_with("reason") {
+            if witness.ends_with("main")
+                || witness.ends_with("subject")
+                || witness.ends_with("patch")
+            {
+                assert_eq!(result.unwrap(), Some(800));
+                let report = Applied::load().unwrap().report();
+                assert!(!report.contains("dropped"), "{report}");
+            } else if witness.ends_with("reason") {
                 assert_eq!(result.unwrap(), Some(800));
                 let report = Applied::load().unwrap().report();
                 for commit in &commits {
@@ -12904,6 +13084,21 @@ fi
     #[test]
     fn replay_1749_to_1796_refuses_four_unexplained_drops() {
         publication_fixture("earlier-drop");
+    }
+
+    #[test]
+    fn earlier_commits_kept_by_main_are_admitted() {
+        publication_fixture("earlier-drop-main");
+    }
+
+    #[test]
+    fn earlier_commits_kept_by_patch_are_admitted() {
+        publication_fixture("earlier-drop-patch");
+    }
+
+    #[test]
+    fn earlier_commits_ported_by_subject_are_admitted() {
+        publication_fixture("earlier-drop-subject");
     }
 
     #[test]
