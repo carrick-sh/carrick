@@ -49,6 +49,14 @@ pub enum BirthSourceError {
 /// escapes this boundary. Guest issuance accesses that same word directly.
 pub trait BirthSerialSource: Send + Sync + core::fmt::Debug {
     fn identity(&self) -> &BirthSourceIdentity;
+    /// Lend the retained zone's namespace under its non-refusing leaf lock.
+    /// The callback must not allocate, cross venues, wake, or acquire locks.
+    fn with_namespace(
+        &self,
+        expected: &BirthSourceIdentity,
+        op: &mut dyn FnMut(&mut carrick_sched_core::process::identity_allocator::NamespaceView<'_>),
+    ) -> Result<(), BirthSourceError>;
+
     /// MM identities use a distinct zone word under the same retained custody.
     fn allocate_mm(
         &self,
@@ -122,6 +130,19 @@ pub mod test_support {
     {
         fn identity(&self) -> &BirthSourceIdentity {
             &self.identity
+        }
+        fn with_namespace(
+            &self,
+            expected: &BirthSourceIdentity,
+            op: &mut dyn FnMut(
+                &mut carrick_sched_core::process::identity_allocator::NamespaceView<'_>,
+            ),
+        ) -> Result<(), BirthSourceError> {
+            self.check(expected)?;
+            self.zone
+                .namespace()
+                .with_view(&carrick_sched_core::ShortLockSpin, op);
+            Ok(())
         }
         fn allocate_mm(
             &self,
