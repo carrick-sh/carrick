@@ -4331,6 +4331,117 @@ esac
         );
     }
 
+    #[test]
+    fn serial_host_storage_submission_errors_do_not_wedge_storage_admission() {
+        const CHILD: &str = "CARRICK_STORAGE_SUBMIT_1821";
+        if std::env::var_os(CHILD).is_none() {
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ci_scaler::live::tests::serial_host_storage_submission_errors_do_not_wedge_storage_admission",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let curl = dir.path().join("curl");
+        std::fs::write(
+            &curl,
+            r#"#!/bin/sh
+cat >/dev/null
+for arg do url=$arg; done
+mode=$(cat "$CARRICK_STORAGE_DIR/mode")
+case "$url" in
+ */clone)
+   case "$mode" in
+     reject_400) printf '{"errors":{"newid":"already exists"}}\n400' ;;
+     server_500) printf 'internal server error\n500' ;;
+     ok) printf '{"data":"UPID:willow:ok"}\n200' ;;
+     *) exit 93 ;;
+   esac ;;
+ *'/tasks?source=active'*)
+   if [ -f "$CARRICK_STORAGE_DIR/active_clone" ]; then
+     printf '{"data":[{"type":"qmclone","id":"300","starttime":1}]}\n200'
+   else
+     printf '{"data":[]}\n200'
+   fi ;;
+ */tasks/*/status)
+   printf '{"data":{"status":"stopped","exitstatus":"OK"}}\n200' ;;
+ *) exit 92 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pvesh = dir.path().join("pvesh");
+        std::fs::write(&pvesh, "#!/bin/sh\nprintf '[]\\n'\n").unwrap();
+        std::fs::set_permissions(&pvesh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    dir.path().display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            );
+            std::env::set_var("CARRICK_STORAGE_DIR", dir.path());
+        }
+        let pve = Pve {
+            site: site::WILLOW,
+            token: Token {
+                id: "fixture".into(),
+                secret: "synthetic".into(),
+            },
+            deadline: std::cell::Cell::new(None),
+        };
+        let mut ledger = Ledger::default();
+        let mut row = row();
+        ledger.rows.push(row.clone());
+        let path = dir.path().join("ledger.json");
+        ledger.save(&path).unwrap();
+
+        // 1. An unambiguous HTTP 4xx rejection starts no PVE task and must not
+        // wedge subsequent cleanup or storage admission on the node/storage.
+        std::fs::write(dir.path().join("mode"), "reject_400").unwrap();
+        let token = pve.storage_admission().unwrap();
+        let rejected = submit_clone(&pve, &mut ledger, &mut row, &path, &token);
+        drop(token);
+        assert!(matches!(rejected, Err(ScalerError::PveRejected(_))));
+        pve.clear_volumes(CloneId::try_from(309).unwrap()).unwrap();
+
+        // 2. An ambiguous HTTP 5xx submission defers with StorageBusy while an
+        // active storage task runs, then clears once active tasks finish.
+        std::fs::write(dir.path().join("mode"), "server_500").unwrap();
+        std::fs::write(dir.path().join("active_clone"), "").unwrap();
+        let token = pve.storage_admission().unwrap();
+        let transient = submit_clone(&pve, &mut ledger, &mut row, &path, &token);
+        drop(token);
+        assert!(matches!(
+            transient,
+            Err(ScalerError::Transient(TransientFailure::PveServer))
+        ));
+        assert!(matches!(
+            pve.clear_volumes(CloneId::try_from(309).unwrap()),
+            Err(ScalerError::StorageBusy)
+        ));
+
+        std::fs::remove_file(dir.path().join("active_clone")).unwrap();
+        pve.clear_volumes(CloneId::try_from(309).unwrap()).unwrap();
+
+        std::fs::write(dir.path().join("mode"), "ok").unwrap();
+        let token = pve.storage_admission().unwrap();
+        submit_clone(&pve, &mut ledger, &mut row, &path, &token).unwrap();
+    }
+
     fn row() -> Record {
         Ledger::default()
             .reserve(
