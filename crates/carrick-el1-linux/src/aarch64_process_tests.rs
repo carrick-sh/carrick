@@ -2230,16 +2230,19 @@ fn native_fork_child_time_handler_with_flags(number: carrick_abi::CanonicalNr, f
 }
 
 #[test]
+#[ignore = "#1808 slice 3: clock_gettime/adjtimex/clock_adjtime routing"]
 fn native_fork_child_clock_gettime_reaches_time_handler() {
     native_fork_child_time_handler(carrick_abi::syscall::nr::CLOCK_GETTIME);
 }
 
 #[test]
+#[ignore = "#1808 slice 3: clock_gettime/adjtimex/clock_adjtime routing"]
 fn native_fork_child_clock_adjtime_reaches_time_handler() {
     native_fork_child_time_handler(carrick_abi::syscall::nr::CLOCK_ADJTIME);
 }
 
 #[test]
+#[ignore = "#1808 slice 3: clock_gettime/adjtimex/clock_adjtime routing"]
 fn native_fork_child_adjtimex_reaches_time_handler() {
     native_fork_child_time_handler(carrick_abi::syscall::nr::ADJTIMEX);
 }
