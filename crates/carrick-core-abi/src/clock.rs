@@ -12,6 +12,8 @@
 //! remain in the ring; the host adapter serves bounded `ClockDomain` queries,
 //! atomic `timex` updates, and non-blocking sleep deadline subscriptions.
 
+use crate::EntryMmKey;
+use carrick_syscall_abi::LinuxErrno;
 use core::num::NonZeroU64;
 
 /// Run-scoped capability naming the container's shared `ClockDomain` resource.
@@ -124,7 +126,7 @@ impl ClockSleepFlags {
 pub struct ClockSleepChannel {
     pub record_id: u32,
     pub record_generation: u64,
-    pub mm: u64,
+    pub mm: EntryMmKey,
     pub address: NonZeroU64,
 }
 
@@ -162,10 +164,10 @@ pub enum ClockRequest<'a> {
 /// Decoded reply from a completed clock-resource record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClockReply<'a> {
-    Sample(Result<(u64, u32), i32>),
-    TimexPreflight(Result<(), i32>),
-    TimexApply(Result<(i64, &'a [u8; CLOCK_TIMEX_BYTES]), i32>),
-    SleepArm(Result<ClockSleepArmOutcome, i32>),
+    Sample(Result<(u64, u32), LinuxErrno>),
+    TimexPreflight(Result<(), LinuxErrno>),
+    TimexApply(Result<(i64, &'a [u8; CLOCK_TIMEX_BYTES]), LinuxErrno>),
+    SleepArm(Result<ClockSleepArmOutcome, LinuxErrno>),
     SleepCancel {
         remaining_secs: u64,
         remaining_nanos: u32,
@@ -274,7 +276,7 @@ pub fn encode_sleep_arm_request(
     write_u64(buf, 40, secs);
     write_u32(buf, CLOCK_HEADER_BYTES, channel.record_id);
     write_u64(buf, CLOCK_HEADER_BYTES + 8, channel.record_generation);
-    write_u64(buf, CLOCK_HEADER_BYTES + 16, channel.mm);
+    write_u64(buf, CLOCK_HEADER_BYTES + 16, channel.mm.raw());
     write_u64(buf, CLOCK_HEADER_BYTES + 24, channel.address.get());
 }
 
@@ -375,7 +377,7 @@ pub fn parse_request(bytes: &[u8]) -> Result<ClockRequest<'_>, ClockRecordError>
                 channel: ClockSleepChannel {
                     record_id,
                     record_generation,
-                    mm,
+                    mm: EntryMmKey::from_raw(mm),
                     address,
                 },
             })
@@ -397,13 +399,10 @@ pub fn parse_request(bytes: &[u8]) -> Result<ClockRequest<'_>, ClockRecordError>
 }
 
 /// Write an errno failure reply in place.
-pub fn write_errno_reply(bytes: &mut [u8], errno: i32) -> Result<(), ClockRecordError> {
+pub fn write_errno_reply(bytes: &mut [u8], errno: LinuxErrno) -> Result<(), ClockRecordError> {
     let _ = validate_envelope(bytes)?;
-    if errno <= 0 {
-        return Err(ClockRecordError::Invalid);
-    }
     write_u32(bytes, 8, REPLY_ERRNO);
-    write_u32(bytes, 12, errno as u32);
+    write_u32(bytes, 12, errno.get() as u32);
     Ok(())
 }
 
@@ -508,9 +507,10 @@ pub fn parse_reply(bytes: &[u8]) -> Result<ClockReply<'_>, ClockRecordError> {
     }
     if tag == REPLY_ERRNO {
         let errno = i32::try_from(aux).map_err(|_| ClockRecordError::Invalid)?;
-        if errno <= 0 {
+        if !(1..=4095).contains(&errno) {
             return Err(ClockRecordError::Invalid);
         }
+        let errno = LinuxErrno::new(errno);
         return match op {
             ClockResourceOp::Sample => Ok(ClockReply::Sample(Err(errno))),
             ClockResourceOp::TimexPreflight => Ok(ClockReply::TimexPreflight(Err(errno))),
@@ -603,8 +603,24 @@ mod tests {
         assert_eq!(parse_reply(&buf), Ok(ClockReply::TimexApply(Ok((5, &out)))));
 
         encode_timex_request(&mut buf, true, false, &input);
-        write_errno_reply(&mut buf, 22).unwrap();
-        assert_eq!(parse_reply(&buf), Ok(ClockReply::TimexPreflight(Err(22))));
+        write_errno_reply(&mut buf, carrick_syscall_abi::LINUX_EINVAL).unwrap();
+        assert_eq!(
+            parse_reply(&buf),
+            Ok(ClockReply::TimexPreflight(Err(
+                carrick_syscall_abi::LINUX_EINVAL
+            )))
+        );
+    }
+
+    #[test]
+    fn reply_rejects_errno_outside_linux_domain() {
+        let mut buf = [0; CLOCK_RECORD_BYTES];
+        encode_sample_request(&mut buf, 0);
+        write_errno_reply(&mut buf, carrick_syscall_abi::LINUX_EINVAL).unwrap();
+        for invalid in [0_u32, 4096, i32::MAX as u32, u32::MAX] {
+            write_u32(&mut buf, 12, invalid);
+            assert_eq!(parse_reply(&buf), Err(ClockRecordError::Invalid));
+        }
     }
 
     #[test]
@@ -613,7 +629,7 @@ mod tests {
         let channel = ClockSleepChannel {
             record_id: 3,
             record_generation: 9,
-            mm: 11,
+            mm: EntryMmKey::from_raw(11),
             address: NonZeroU64::new(0x1000).unwrap(),
         };
         let flags = ClockSleepFlags::new(true, false);

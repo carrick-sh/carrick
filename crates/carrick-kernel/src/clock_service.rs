@@ -76,12 +76,12 @@ pub fn wake_sleep_channel_in_zone<C>(
     }
     let mut transfers = Vec::new();
     if let Some(guard) = zone.lock(
-        ZoneTables::<C>::bucket_of_with_context(channel.mm, channel.address.get()),
+        ZoneTables::<C>::bucket_of_with_context(channel.mm.raw(), channel.address.get()),
         wait,
     ) {
         zone.wake_host(
             &guard,
-            channel.mm,
+            channel.mm.raw(),
             channel.address.get(),
             u32::MAX,
             u32::MAX,
@@ -221,20 +221,20 @@ impl ClockResourceService {
         let request = match TimexRequest::validate(&parsed, access) {
             Ok(req) => req,
             Err(TimexValidationError::Errno(errno)) => {
-                return write_errno_reply(bytes, errno.get());
+                return write_errno_reply(bytes, errno);
             }
             Err(TimexValidationError::InvalidModeOutput) => {
-                return write_errno_reply(bytes, LINUX_EINVAL.get());
+                return write_errno_reply(bytes, LINUX_EINVAL);
             }
         };
         let step = match request.realtime_step(|| {
             carrick_abi::LinuxTimexStatus::from_bits_retain(self.clock.adjtimex_state().status)
         }) {
             Ok(step) => step,
-            Err(errno) => return write_errno_reply(bytes, errno.get()),
+            Err(errno) => return write_errno_reply(bytes, errno),
         };
         if step.is_some() && self.clock.is_controlled() {
-            return write_errno_reply(bytes, LINUX_EPERM.get());
+            return write_errno_reply(bytes, LINUX_EPERM);
         }
         write_timex_preflight_ok(bytes)
     }
@@ -256,10 +256,10 @@ impl ClockResourceService {
         let request = match TimexRequest::validate(&parsed, access) {
             Ok(req) => req,
             Err(TimexValidationError::Errno(errno)) => {
-                return write_errno_reply(bytes, errno.get());
+                return write_errno_reply(bytes, errno);
             }
             Err(TimexValidationError::InvalidModeOutput) => {
-                return write_errno_reply(bytes, LINUX_EINVAL.get());
+                return write_errno_reply(bytes, LINUX_EINVAL);
             }
         };
         let mut output = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
@@ -271,7 +271,7 @@ impl ClockResourceService {
                     .map_err(|_| ClockRecordError::Invalid)?;
                 write_timex_apply_reply(bytes, value, out_bytes)
             }
-            Err(errno) => write_errno_reply(bytes, errno.get()),
+            Err(errno) => write_errno_reply(bytes, errno),
         }
     }
 
@@ -539,7 +539,10 @@ fn is_realtime_sleep_clock(clock_id: u64) -> bool {
     )
 }
 
-fn sample_container_clock(clock: &ClockDomain, clock_id: u64) -> Result<Duration, i32> {
+fn sample_container_clock(
+    clock: &ClockDomain,
+    clock_id: u64,
+) -> Result<Duration, carrick_abi::LinuxErrno> {
     match clock_id {
         LINUX_CLOCK_REALTIME | LINUX_CLOCK_REALTIME_ALARM | LINUX_CLOCK_TAI => {
             Ok(clock.realtime_now())
@@ -548,17 +551,20 @@ fn sample_container_clock(clock: &ClockDomain, clock_id: u64) -> Result<Duration
         LINUX_CLOCK_MONOTONIC | LINUX_CLOCK_MONOTONIC_RAW => Ok(clock.monotonic_now()),
         LINUX_CLOCK_MONOTONIC_COARSE => Ok(linux_coarse_duration(clock.monotonic_now())),
         LINUX_CLOCK_BOOTTIME | LINUX_CLOCK_BOOTTIME_ALARM => Ok(clock.boottime_now()),
-        _ => Err(LINUX_EINVAL.get()),
+        _ => Err(LINUX_EINVAL),
     }
 }
 
-fn sample_sleep_clock(clock: &ClockDomain, clock_id: u64) -> Result<Duration, i32> {
+fn sample_sleep_clock(
+    clock: &ClockDomain,
+    clock_id: u64,
+) -> Result<Duration, carrick_abi::LinuxErrno> {
     if matches!(
         clock_id,
         LINUX_CLOCK_PROCESS_CPUTIME_ID | LINUX_CLOCK_THREAD_CPUTIME_ID
     ) || dynamic_cpu_clock(clock_id).is_some()
     {
-        return Err(LINUX_EOPNOTSUPP.get());
+        return Err(LINUX_EOPNOTSUPP);
     }
     sample_container_clock(clock, clock_id)
 }
@@ -603,7 +609,7 @@ mod tests {
         let channel = ClockSleepChannel {
             record_id: 1,
             record_generation: 1,
-            mm: 1,
+            mm: carrick_core_abi::EntryMmKey::from_raw(1),
             address: NonZeroU64::new(0x1000).unwrap(),
         };
         encode_sleep_arm_request(
@@ -683,7 +689,7 @@ mod tests {
         let channel = ClockSleepChannel {
             record_id: 2,
             record_generation: 1,
-            mm: 1,
+            mm: carrick_core_abi::EntryMmKey::from_raw(1),
             address: NonZeroU64::new(0x2000).unwrap(),
         };
         let mut buf = [0u8; CLOCK_RECORD_BYTES];
