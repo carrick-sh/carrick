@@ -127,6 +127,124 @@ mod terminal_memory_wait_tests {
     }
 }
 
+/// Memory mechanics for an exact thread's terminal cleanup. The lane performs
+/// these operations only while the MM transfer fence is held.
+pub enum TerminalAccess<'a> {
+    Read {
+        address: carrick_guest_arch::UserVa,
+        bytes: &'a mut [u8],
+    },
+    Load {
+        address: carrick_guest_arch::UserVa,
+        value: &'a mut u32,
+    },
+    CompareExchange {
+        address: carrick_guest_arch::UserVa,
+        expected: u32,
+        desired: u32,
+        observed: &'a mut u32,
+    },
+}
+impl TerminalAccess<'_> {
+    pub fn address(&self) -> carrick_guest_arch::UserVa {
+        match self {
+            Self::Read { address, .. }
+            | Self::Load { address, .. }
+            | Self::CompareExchange { address, .. } => *address,
+        }
+    }
+    pub fn len(&self) -> carrick_guest_arch::GuestLen {
+        carrick_guest_arch::GuestLen::new(match self {
+            Self::Read { bytes, .. } => bytes.len() as u64,
+            _ => 4,
+        })
+    }
+    pub fn access(&self) -> carrick_guest_arch::Access {
+        match self {
+            Self::CompareExchange { .. } => carrick_guest_arch::Access::Write,
+            _ => carrick_guest_arch::Access::Read,
+        }
+    }
+    pub fn perform(
+        &mut self,
+        copy: &mut impl crate::user_copy::UserCopy,
+        address: carrick_guest_arch::UserVa,
+        len: u64,
+    ) -> bool {
+        use crate::user_copy::CopyOutcome;
+        match self {
+            Self::Read {
+                address: base,
+                bytes,
+            } => {
+                let Some(offset) = address
+                    .raw()
+                    .checked_sub(base.raw())
+                    .and_then(|n| usize::try_from(n).ok())
+                else {
+                    return false;
+                };
+                let Some(end) = usize::try_from(len)
+                    .ok()
+                    .and_then(|n| offset.checked_add(n))
+                else {
+                    return false;
+                };
+                let Some(piece) = bytes.get_mut(offset..end) else {
+                    return false;
+                };
+                copy.copy_in(piece, address) == CopyOutcome::Done
+            }
+            Self::Load {
+                address: base,
+                value,
+            } if *base == address && len == 4 => {
+                copy.atomic_load_u32(address, value) == CopyOutcome::Done
+            }
+            Self::CompareExchange {
+                address: base,
+                expected,
+                desired,
+                observed,
+            } if *base == address && len == 4 => {
+                copy.atomic_compare_exchange_u32(address, *expected, *desired, observed)
+                    == CopyOutcome::Done
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The exact thread identity and personality cursor survive every memory park.
+/// No lane may resume this payload using another thread's execution binding.
+pub struct ThreadCleanup<'a, P> {
+    identity: ThreadTerminalIdentity,
+    payload: P,
+    admission: Option<crate::lifecycle::ExitAdmission<'a>>,
+}
+impl<'a, P> ThreadCleanup<'a, P> {
+    pub fn new(identity: ThreadTerminalIdentity, payload: P) -> Self {
+        Self {
+            identity,
+            payload,
+            admission: None,
+        }
+    }
+    /// Keep the admitted ABI window alive while the personality cursor parks.
+    pub fn retain_admission(&mut self, admission: crate::lifecycle::ExitAdmission<'a>) {
+        self.admission = Some(admission);
+    }
+    pub fn take_admission(&mut self) -> Option<crate::lifecycle::ExitAdmission<'a>> {
+        self.admission.take()
+    }
+    pub fn identity(&self) -> ThreadTerminalIdentity {
+        self.identity
+    }
+    pub fn resume(&mut self, binding: ExecutionBinding) -> Option<&mut P> {
+        (self.identity.binding() == binding).then_some(&mut self.payload)
+    }
+}
+
 pub struct PoolMemberObservation<'a> {
     pub entry: EntryRef,
     /// The control slot retained by this member, even if its shared pool

@@ -737,7 +737,9 @@ pub fn retire_cancelled_pool_member(
 
 /// The exact page owns the storage and retains its ledger notification authority.
 /// Linux payload initialization happens between reserve and release publication.
-pub trait Lifecycle {
+// Lifecycle admissions may be retained by an exact-thread continuation and
+// resumed on another executor. The shared atomic page must outlive that move.
+pub trait Lifecycle: Sync {
     fn terminal_notification(&self) -> Option<crate::terminal::TerminalNotification> {
         None
     }

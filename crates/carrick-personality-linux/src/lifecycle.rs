@@ -254,6 +254,10 @@ pub enum ThreadBirthAdmission {
 
 pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::ThreadCtx> {
     /// The admitted process graph owns root identity; namespace PID 1 does not.
+    /// Exact native owner for nonfinal exit cleanup, including memory parks.
+    fn exit_thread(&mut self, _status: TerminationStatus) -> Option<LifecycleOutcome> {
+        None
+    }
     fn is_root_process(&self) -> bool;
     /// A native execution record owns its complete published descriptor
     /// namespace even when the carrier supplied its initial table. Borrowed
@@ -591,6 +595,9 @@ pub trait LifecycleNative<'a>: UserCopy {
         None
     }
     /// Exact retained process owner for an adopted thread's terminal handoff.
+    fn process_exit_thread(&mut self, _status: TerminationStatus) -> Option<LifecycleOutcome> {
+        None
+    }
     fn process_exit_binding(&self) -> Option<ExecutionBinding> {
         None
     }
@@ -873,6 +880,11 @@ pub fn invoke<'a>(
             if !native.has_scheduler() {
                 native.record_decline(LifecycleDecline::ExitScheduler);
                 return None;
+            }
+            if let Some(outcome) =
+                native.process_exit_thread(TerminationStatus::exited(args[0] as u32))
+            {
+                return Some(outcome);
             }
             if let Some((progress, result)) = serve_exit(thread, native) {
                 Some(LifecycleOutcome::Transferred {
@@ -1454,10 +1466,17 @@ fn serve_exit<'a>(
     ) {
         return decline!(LifecycleDecline::ExitEntryState);
     }
-    // No robust-list walker exists yet (it will live in sched-core, shared
-    // with the host lane): a registered list is walked by nobody here.
     if slot.robust_list().0 != 0 {
-        return decline!(LifecycleDecline::ExitRobust);
+        // Linux abandons a list whose head cannot be read, but still exits.
+        // Keep readable and unavailable lists on the existing owner path
+        // until their walk and memory wait have retained terminal custody.
+        let mut head = [0; crate::thread::ROBUST_LIST_HEAD_SIZE as usize];
+        if !matches!(
+            native.copy_in(&mut head, UserVa::new(slot.robust_list().0)),
+            CopyOutcome::Fault
+        ) {
+            return decline!(LifecycleDecline::ExitRobust);
+        }
     }
     // A pending signal is delivered (or re-targeted) by the host.
     if page.pending().load().0 != 0 || slot.pending().load().0 != 0 {
@@ -1523,20 +1542,22 @@ fn serve_exit<'a>(
     let clear_child_tid = slot.clear_child_tid();
     if clear_child_tid != 0 {
         let status = native.result();
-        let copied = native
-            .copy_out(UserVa::new(clear_child_tid), &CHILD_TID_CLEAR)
-            .is_done();
-        let woken =
-            copied && native.wake_child_tid(EntryMmKey::from_raw(mm), UserVa::new(clear_child_tid));
-        if !woken {
-            // The host exits the thread instead: clearing the word again
-            // and waking are idempotent.
+        let copy = native.copy_out(UserVa::new(clear_child_tid), &CHILD_TID_CLEAR);
+        match copy {
+            CopyOutcome::Done | CopyOutcome::Fault => {}
+            CopyOutcome::NotYet(_) => {
+                // Parking needs retained terminal custody, rather than an ordinary
+                // syscall retry. Keep the existing handback until that owner exists.
+                native.set_result(status);
+                return decline!(LifecycleDecline::ExitClearTidCopyout);
+            }
+        }
+        // Linux ignores a terminal clear-store fault and still wakes one
+        // joiner. Fault is completion of this best-effort store, never a reason
+        // to abandon an unadopted record in host custody.
+        if !native.wake_child_tid(EntryMmKey::from_raw(mm), UserVa::new(clear_child_tid)) {
             native.set_result(status);
-            return decline!(if copied {
-                LifecycleDecline::ExitClearTidWake
-            } else {
-                LifecycleDecline::ExitClearTidCopyout
-            });
+            return decline!(LifecycleDecline::ExitClearTidWake);
         }
         // Copy and wake are already complete on either release outcome.
         // Publish that progress before a requeue can expose the record. The

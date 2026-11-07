@@ -32,6 +32,21 @@ pub(super) fn install_raw_exit_before_commit_hook(
     hooks.push((page_address, hook));
 }
 
+#[cfg(test)]
+pub(super) fn run_raw_exit_before_commit_hook(page: &ThreadLifecyclePage) {
+    let page_address = page as *const _ as usize;
+    let hook = {
+        let mut hooks = RAW_EXIT_BEFORE_COMMIT_HOOK.lock();
+        hooks
+            .iter()
+            .position(|(page, _)| *page == page_address)
+            .map(|index| hooks.swap_remove(index).1)
+    };
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 impl<
     'a,
     F: Fn(u32) -> *mut u8,
@@ -84,6 +99,11 @@ impl<
 > UserCopy for El1PendingFamilies<'_, F, C, U, G, Context>
 {
     fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> CopyOutcome {
+        // A non-user range cannot become readable after backing supply.
+        // Terminal cleanup must consume this fault rather than redispatch it.
+        if !carrick_guest_arch::lower_half_range(src.raw(), dst.len() as u64) {
+            return CopyOutcome::Fault;
+        }
         #[cfg(test)]
         if let Some(user) = &mut self.lifecycle_user {
             return CopyOutcome::from_completed(user.copy_in(dst, src.raw()));
@@ -112,6 +132,11 @@ impl<
         }
     }
     fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> CopyOutcome {
+        // No owner can supply backing for a range outside the user domain.
+        // Preserve terminal Fault so exit can consume it without host custody.
+        if !carrick_guest_arch::lower_half_range(dst.raw(), src.len() as u64) {
+            return CopyOutcome::Fault;
+        }
         #[cfg(test)]
         if let Some(user) = &mut self.lifecycle_user {
             return CopyOutcome::from_completed(user.copy_out(dst.raw(), src));
@@ -309,6 +334,17 @@ impl<
     }
     fn process_exit_group(&mut self, status: u8) -> Option<LifecycleOutcome> {
         Some(self.process_venue()?.exit_group(status))
+    }
+    fn process_exit_thread(
+        &mut self,
+        status: carrick_sched_core::process::TerminationStatus,
+    ) -> Option<LifecycleOutcome> {
+        let unadopted = self.exit_record().is_some_and(|record| record.unadopted);
+        let mut outcome = self.process_venue()?.exit_thread(status)?;
+        if unadopted {
+            self.run_ready_after_native_transfer(&mut outcome);
+        }
+        Some(outcome)
     }
     fn process_exit_binding(&self) -> Option<carrick_core_abi::ExecutionBinding> {
         let binding = LifecycleNative::binding(self)?;
@@ -671,20 +707,14 @@ impl<
             .ok();
         #[cfg(test)]
         if self.handoff.is_some() {
-            let page_address =
-                task.metadata
+            let page = unsafe {
+                &*(task
+                    .metadata
                     .lifecycle_page
-                    .load(core::sync::atomic::Ordering::Acquire) as usize;
-            let hook = {
-                let mut hooks = RAW_EXIT_BEFORE_COMMIT_HOOK.lock();
-                hooks
-                    .iter()
-                    .position(|(page, _)| *page == page_address)
-                    .map(|index| hooks.swap_remove(index).1)
+                    .load(core::sync::atomic::Ordering::Acquire)
+                    as *const ThreadLifecyclePage)
             };
-            if let Some(hook) = hook {
-                hook();
-            }
+            run_raw_exit_before_commit_hook(page);
         }
         self.handoff.is_some()
     }

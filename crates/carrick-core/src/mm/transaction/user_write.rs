@@ -108,6 +108,11 @@ pub trait UserWriteVenue<Context: Copy + Send + Sync + zerocopy::FromZeros> {
     /// Copy only while the exact owner fence is live; the bytes are the
     /// selected slice of the original kernel source, never a replayed prefix.
     fn copy(&mut self, fence: &ValidatedChunk<'_, Context>, bytes: &[u8]) -> bool;
+
+    /// Perform an owned read or atomic operation before releasing this exact-MM fence.
+    fn access_selected(&mut self, _fence: &ValidatedChunk<'_, Context>) -> bool {
+        false
+    }
 }
 
 impl<
@@ -138,6 +143,7 @@ impl<
             target,
             Some(request),
             PortalTransferIntent::UserWrite,
+            false,
             words,
             venue,
         )
@@ -149,7 +155,14 @@ impl<
         words: &W,
         venue: &mut V,
     ) -> Result<(), UserWriteError<V::Error>> {
-        self.write_user_target(target, None, PortalTransferIntent::UserWrite, words, venue)
+        self.write_user_target(
+            target,
+            None,
+            PortalTransferIntent::UserWrite,
+            false,
+            words,
+            venue,
+        )
     }
 
     /// Materialize readable memory using the same exact-owner transfer and
@@ -161,7 +174,30 @@ impl<
         words: &W,
         venue: &mut V,
     ) -> Result<(), UserWriteError<V::Error>> {
-        self.write_user_target(target, None, PortalTransferIntent::UserRead, words, venue)
+        self.write_user_target(
+            target,
+            None,
+            PortalTransferIntent::UserRead,
+            false,
+            words,
+            venue,
+        )
+    }
+
+    /// Execute venue-owned memory work under the same fence as byte writes.
+    pub fn access_user_target<W: LiveDescriptorWords + ?Sized, V: UserWriteVenue<Context>>(
+        &self,
+        target: UserWriteTarget,
+        access: carrick_guest_arch::Access,
+        words: &W,
+        venue: &mut V,
+    ) -> Result<(), UserWriteError<V::Error>> {
+        let intent = match access {
+            carrick_guest_arch::Access::Read => PortalTransferIntent::UserRead,
+            carrick_guest_arch::Access::Write => PortalTransferIntent::UserWrite,
+            _ => return Err(UserWriteError::InvalidSource),
+        };
+        self.write_user_target(target, None, intent, true, words, venue)
     }
 
     fn write_user_target<W: LiveDescriptorWords + ?Sized, V: UserWriteVenue<Context>>(
@@ -169,6 +205,7 @@ impl<
         target: UserWriteTarget,
         request: Option<UserWriteRequest<'_>>,
         intent: PortalTransferIntent,
+        access: bool,
         words: &W,
         venue: &mut V,
     ) -> Result<(), UserWriteError<V::Error>> {
@@ -228,6 +265,8 @@ impl<
                         if !venue.copy(&fence, bytes) {
                             return Err(UserWriteError::Fault);
                         }
+                    } else if access && !venue.access_selected(&fence) {
+                        return Err(UserWriteError::Fault);
                     }
                     fence.complete(&mut continuation)?;
                     awaiting_supply_progress = false;

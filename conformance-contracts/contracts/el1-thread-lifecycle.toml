@@ -79,6 +79,17 @@ embed = [
 # zone admission record has already been released. One control-wake batch is
 # applied per retained lifecycle page; this does not complete guest waits.
 vm_free = [
+  "carrick-el1-linux::native_process_runtime::host_test_support::thread_cleanup_tests::raw_exit_keeps_admission_when_fork_closes_gate_during_cleanup (production exit, adopted and native-owned member, lifecycle fork gate closes during exact-MM wait)",
+  "carrick-el1-linux::native_process_runtime::host_test_support::thread_cleanup_tests::{raw_exit_faulting_robust_word_keeps_successor,exit_group_worker_terminal_copy_wait_finishes_after_fault_or_supply,raw_exit_initial_fork_gate_retains_adopted_custody,raw_exit_initial_fork_gate_retains_unadopted_custody} (production terminal entry, two live members, exact robust successor, group worker MM wait/fault/supply; initial-gate binding remains red)",
+  "carrick-el1-linux::native_process_runtime::host_test_support::thread_cleanup_tests::two_raw_exits_finish_when_parked_cleanup_becomes_last (two pooled members after coherent leader retirement; real Gate wait; original final status preserved)",
+  "carrick-el1-linux::aarch64_process_tests::arm_raw_exit_robust_pending_entry_is_processed_once (production raw exit; resident list and pending operation, adopted and native owned)",
+  "carrick-el1-linux::native_process_runtime::host_test_support::thread_cleanup_tests::{raw_exit_terminal_copies_park_and_finish_once,raw_exit_terminal_supply_refusal_advances_instead_of_retrying} (production native terminal entry, real TID waiter, exact-MM Gate producer, supply and refusal; one wake)",
+  "carrick-el1-linux::aarch64_process_tests::{arm_raw_exit_faulting_robust_head_retires_adopted_thread,arm_raw_exit_faulting_robust_head_retires_unadopted_thread} (terminal invalid robust-list head does not hand a nonfinal pooled exit to host custody; no parked-walker claim)",
+  "carrick-el1-linux::aarch64_process_tests::{arm_raw_exit_unavailable_robust_head_keeps_adopted_custody,arm_raw_exit_unavailable_robust_head_keeps_unadopted_custody,arm_raw_exit_empty_robust_head_retires_adopted_thread,arm_raw_exit_empty_robust_head_retires_unadopted_thread,arm_raw_exit_unavailable_clear_tid_keeps_adopted_custody,arm_raw_exit_unavailable_clear_tid_keeps_unadopted_custody} (red-first terminal-owner acceptance; production dispatch with two live threads, no ignored tests; retained cleanup implementation outstanding)",
+  "carrick-el1-linux::aarch64_process_tests::arm_exit_group_worker_resident_clear_tid_writes_zero (red-first production exit_group with a live worker; terminal member cleanup must finish before record retirement)",
+  "carrick-personality-linux::x86_wave2::x5_exit_faulting_robust_head_requeued_wakes_once (terminal robust-head fault followed by release refusal preserves one clear-TID store and wake in shared ARM/x86 policy)",
+  "carrick-el1-linux::aarch64_process_tests::arm_raw_exit_faulting_clear_tid_still_retires_adopted_and_unadopted",
+  "carrick-el1-linux::lifecycle::tests::exit_clear_tid_fault_wakes_the_queued_joiner_once",
   "carrick-el1-linux::aarch64_process_tests::arm_closed_gate_service_entry_retires_the_sibling_instead_of_busy",
   "carrick-el1-linux::aarch64_process_tests::arm_closed_gate_service_entry_cancels_retained_ipc_before_retirement",
   "carrick-el1-linux::native_process_runtime::host_test_support::native_service_duplicate_custody_is_an_invariant_at_bridge_settlement",

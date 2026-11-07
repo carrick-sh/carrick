@@ -380,6 +380,30 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         }
         Ok(())
     }
+    fn terminal_access(
+        &mut self,
+        _mm: &Self::Mm,
+        mut access: carrick_core::terminal::TerminalAccess<'_>,
+    ) -> Result<(), NativeProcessError> {
+        let address = access.address();
+        if let Some(error) = self.child_copy_error
+            && self
+                .child_copy_error_at
+                .is_none_or(|at| at == address.raw())
+        {
+            return Err(error);
+        }
+        let task = CurrentTask::new();
+        let mut copy = crate::file::ValidatedCopy {
+            task: &task,
+            validator: &crate::file::HardwareValidator,
+        };
+        if access.perform(&mut copy, address, access.len().raw()) {
+            Ok(())
+        } else {
+            Err(NativeProcessError::Fault)
+        }
+    }
     fn copy_owned_bytes(
         &mut self,
         mm: &Self::Mm,
@@ -2061,22 +2085,34 @@ fn add_signal_sibling(
     operation: Option<carrick_core_abi::service::ServiceOperation>,
     host_issued: bool,
 ) -> ExecSibling {
+    add_signal_sibling_at(fixture, operation, host_issued, 42, 0, SlotId::new(1))
+}
+fn add_signal_sibling_at(
+    fixture: &NativeSignalFixture,
+    operation: Option<carrick_core_abi::service::ServiceOperation>,
+    host_issued: bool,
+    tid: u32,
+    index: usize,
+    slot: SlotId,
+) -> ExecSibling {
+    let serial = u64::from(tid + 60);
+    let birth = u64::from(tid - 30);
     let binding = ExecutionBinding {
-        task: carrick_core_abi::EntryTaskKey::from_raw(42),
-        generation: carrick_core_abi::SnapshotGeneration::from_raw(12),
+        task: carrick_core_abi::EntryTaskKey::from_raw(u64::from(tid)),
+        generation: carrick_core_abi::SnapshotGeneration::from_raw(birth),
         mm: carrick_core_abi::EntryMmKey::from_raw(1),
-        thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(102),
+        thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(serial),
     };
     let control = Box::leak(Box::new(ThreadControlSlot::new()));
     if host_issued {
         control
             .reset_for_host_birth(carrick_el1_abi::BlockedMask(0))
             .unwrap();
-        assert!(control.publish_visible_tid(42));
+        assert!(control.publish_visible_tid(tid));
         control.publish_host_birth_identity(
             carrick_core::terminal::ThreadBirthIdentity::from_parts(
                 binding.task,
-                carrick_core_abi::BirthSerial::of_task(TaskSerial::from_raw_u64(12).unwrap()),
+                carrick_core_abi::BirthSerial::of_task(TaskSerial::from_raw_u64(birth).unwrap()),
                 binding.thread_generation,
             )
             .unwrap(),
@@ -2092,13 +2128,13 @@ fn add_signal_sibling(
         let entry = fixture
             .page
             .stock(
-                0,
+                index,
                 carrick_el1_abi::EntryIdentity {
-                    tid: 42,
-                    visible_tid: 42,
-                    thread_serial: 102,
+                    tid,
+                    visible_tid: tid,
+                    thread_serial: serial,
                     birth: carrick_core_abi::entry::BirthSerial::of_task(
-                        TaskSerial::from_raw_u64(12).unwrap(),
+                        TaskSerial::from_raw_u64(birth).unwrap(),
                     ),
                     uid_credit: 0,
                 },
@@ -2111,11 +2147,11 @@ fn add_signal_sibling(
         control
             .reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, entry)
             .unwrap();
-        assert!(control.publish_visible_tid(42));
+        assert!(control.publish_visible_tid(tid));
         control.publish_host_birth_identity(
             carrick_core::terminal::ThreadBirthIdentity::from_parts(
                 binding.task,
-                carrick_core_abi::BirthSerial::of_task(TaskSerial::from_raw_u64(12).unwrap()),
+                carrick_core_abi::BirthSerial::of_task(TaskSerial::from_raw_u64(birth).unwrap()),
                 binding.thread_generation,
             )
             .unwrap(),
@@ -2140,16 +2176,15 @@ fn add_signal_sibling(
 
     let task = Box::leak(Box::new(CurrentTask::new()));
     task.set(
-        carrick_el1_abi::El1TaskId::from_linux_tid(42),
+        carrick_el1_abi::El1TaskId::from_linux_tid(i32::try_from(tid).unwrap()),
         binding.generation,
         5,
     );
     task.mm.key.store(1, Ordering::Release);
-    task.mm.thread_generation.store(102, Ordering::Release);
+    task.mm.thread_generation.store(serial, Ordering::Release);
     task.publish_visible_pid(41);
     task.publish_root_generation(fixture.address.generation);
     task.publish_lifecycle(fixture.page as *const _ as u64, control as *const _ as u64);
-    let slot = SlotId::new(1);
     fixture.zone.drive(slot, 2);
     fixture.zone.publish_slot(slot, 1, Some(1), 1);
     fixture.zone.enter_guest(slot);
@@ -2159,11 +2194,11 @@ fn add_signal_sibling(
         .current_or_new(
             slot,
             ThreadIdentity {
-                tid: 42,
-                serial: 102,
+                tid: u64::from(tid),
+                serial,
                 mm: 1,
                 file_table: 5,
-                generation: 12,
+                generation: birth,
                 affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 1,
                 lifecycle_page: fixture.page as *const _ as u64,
@@ -6427,3 +6462,7 @@ fn sigprocmask_set_owner_wait_redispatches_before_effects() {
     ));
     assert!(take_signal_copies().is_empty());
 }
+
+#[cfg(test)]
+#[path = "tests/thread_cleanup.rs"]
+mod thread_cleanup_tests;

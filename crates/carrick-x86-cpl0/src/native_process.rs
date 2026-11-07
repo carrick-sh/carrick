@@ -618,6 +618,32 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
                 other => other,
             })
     }
+    fn copyout_fault(
+        &self,
+        address: UserVa,
+    ) -> Option<(carrick_guest_arch::FaultInfo, NonZeroU64)> {
+        let slots = unsafe {
+            &*(carrick_el1::isa::x86_kernel_layout().portal.raw() as *const MmPortalSlots)
+        };
+        let slot = slots.grant(usize::from(self.slot.raw()))?;
+        let mm = self.task.mm.key.load(Ordering::Acquire);
+        let (sequence, _) = slot.pending_fault_selection(mm, address.raw())?;
+        Some((
+            carrick_guest_arch::FaultInfo {
+                address,
+                access: carrick_guest_arch::Access::Write,
+                present: false,
+            },
+            NonZeroU64::new(sequence)?,
+        ))
+    }
+    fn terminal_access(
+        &mut self,
+        mm: &Self::Mm,
+        access: carrick_core::terminal::TerminalAccess<'_>,
+    ) -> Result<(), NativeProcessError> {
+        self.access_terminal(mm, access)
+    }
     fn copy_owned_bytes(
         &mut self,
         mm: &Self::Mm,

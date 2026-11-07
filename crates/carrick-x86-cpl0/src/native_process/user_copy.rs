@@ -8,6 +8,7 @@ use carrick_el1_abi::KernelFaultVenues;
 /// Physical crossings and ISA byte access for the shared native-write protocol.
 struct NativeWriteVenue<'a> {
     task: &'a CurrentTask,
+    terminal: Option<carrick_core::terminal::TerminalAccess<'a>>,
     address: UserVa,
     slot: SlotId,
     pool: &'a carrick_el1_abi::CowGrantPool,
@@ -56,6 +57,35 @@ impl<'a> UserWriteVenue<ParkedContextWords> for NativeWriteVenue<'a> {
         );
         Ok(())
     }
+    fn supply_backing(
+        &mut self,
+        window: carrick_el1_abi::PortalGrantWindow,
+    ) -> Option<Result<(), Self::Error>> {
+        Some(match self.slots.grant(usize::from(self.slot.raw())) {
+            Some(slot) if slot.publish_fault_selection(window.operation.sequence.get(), window) => {
+                Err(NativeProcessError::Unsupported)
+            }
+            Some(_) => Err(NativeProcessError::Busy),
+            None => Err(NativeProcessError::Stale),
+        })
+    }
+    fn access_selected(
+        &mut self,
+        fence: &carrick_core::mm::transfer::ValidatedChunk<'_, ParkedContextWords>,
+    ) -> bool {
+        let Some(access) = self.terminal.as_mut() else {
+            return true;
+        };
+        let mut copy = carrick_el1::substrate::file::ValidatedCopy {
+            task: self.task,
+            validator: &carrick_el1::substrate::file::HardwareValidator,
+        };
+        access.perform(
+            &mut copy,
+            UserVa::new(fence.selected().va.raw()),
+            fence.selected().len,
+        )
+    }
     fn copy(
         &mut self,
         fence: &carrick_core::mm::transfer::ValidatedChunk<'_, ParkedContextWords>,
@@ -84,6 +114,24 @@ impl Service {
         address: UserVa,
         bytes: &[u8],
     ) -> Result<(), NativeProcessError> {
+        self.access_user_bytes(mm, address, Some(bytes), None)
+    }
+    pub(super) fn access_terminal(
+        &mut self,
+        mm: &Mm,
+        access: carrick_core::terminal::TerminalAccess<'_>,
+    ) -> Result<(), NativeProcessError> {
+        self.access_user_bytes(mm, access.address(), None, Some(access))
+    }
+    fn access_user_bytes(
+        &mut self,
+        mm: &Mm,
+        address: UserVa,
+        bytes: Option<&[u8]>,
+        terminal: Option<carrick_core::terminal::TerminalAccess<'_>>,
+    ) -> Result<(), NativeProcessError> {
+        let len = terminal.as_ref().map(|access| access.len());
+        let kind = terminal.as_ref().map(|access| access.access());
         if carrick_el1::isa::x86::hardware_live_root().map_err(error)? != mm.root {
             return Err(NativeProcessError::Stale);
         }
@@ -111,6 +159,7 @@ impl Service {
             unsafe { carrick_el1::fault::X86PreparedResolver::under_editor(mm.mm.raw(), &words) };
         let mut venue = NativeWriteVenue {
             task: self.task,
+            terminal,
             address,
             slot: self.slot,
             pool,
@@ -123,8 +172,8 @@ impl Service {
                 completion: None,
             },
         };
-        owner
-            .write_user_bytes(
+        let result = if let Some(bytes) = bytes {
+            owner.write_user_bytes(
                 UserWriteRequest {
                     handle,
                     address,
@@ -134,16 +183,29 @@ impl Service {
                 &words,
                 &mut venue,
             )
-            .map_err(|failure| match failure {
-                UserWriteError::Owner(carrick_core::mm::transaction::MmError::Wait(wait)) => {
-                    NativeProcessError::OwnerWait(wait)
-                }
-                UserWriteError::Owner(owner) => error(owner),
-                UserWriteError::Mechanics(error) => error,
-                UserWriteError::Busy => NativeProcessError::Busy,
-                UserWriteError::InvalidSource => NativeProcessError::Invalid,
-                UserWriteError::Fault => NativeProcessError::Fault,
-                UserWriteError::UnsupportedSupply => NativeProcessError::Unsupported,
-            })
+        } else {
+            owner.access_user_target(
+                carrick_core::mm::transaction::UserWriteTarget {
+                    handle,
+                    address,
+                    len: len.ok_or(NativeProcessError::Invalid)?,
+                    slot: self.slot,
+                },
+                kind.ok_or(NativeProcessError::Invalid)?,
+                &words,
+                &mut venue,
+            )
+        };
+        result.map_err(|failure| match failure {
+            UserWriteError::Owner(carrick_core::mm::transaction::MmError::Wait(wait)) => {
+                NativeProcessError::OwnerWait(wait)
+            }
+            UserWriteError::Owner(owner) => error(owner),
+            UserWriteError::Mechanics(error) => error,
+            UserWriteError::Busy => NativeProcessError::Busy,
+            UserWriteError::InvalidSource => NativeProcessError::Invalid,
+            UserWriteError::Fault => NativeProcessError::Fault,
+            UserWriteError::UnsupportedSupply => NativeProcessError::Unsupported,
+        })
     }
 }

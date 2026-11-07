@@ -20,6 +20,7 @@ pub mod pending_anonymous;
 
 pub mod lifecycle;
 pub mod thread;
+pub mod thread_cleanup;
 
 pub mod identity;
 pub mod ipc;

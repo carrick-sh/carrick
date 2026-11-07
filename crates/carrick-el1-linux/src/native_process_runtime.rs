@@ -3,6 +3,7 @@
 //! incarnation; it does not import a host TaskSerial or launcher credentials.
 extern crate alloc;
 mod service;
+mod thread_cleanup;
 pub(crate) mod thread_stock;
 use super::{
     native_fork_refusal::{NativeForkStage, at_busy_site, busy},
@@ -597,6 +598,13 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
         bytes: &[u8],
     ) -> Result<(), NativeProcessError> {
         self.copy_signal_bytes(mm, address, bytes)
+    }
+    fn terminal_access(
+        &mut self,
+        _mm: &Self::Mm,
+        _access: carrick_core::terminal::TerminalAccess<'_>,
+    ) -> Result<(), NativeProcessError> {
+        Err(NativeProcessError::Unsupported)
     }
     fn prepare_owned_write(
         &mut self,
@@ -1214,11 +1222,17 @@ enum PendingKey {
     Operation(TaskKey),
     Exit(TaskKey),
     Member(RecordRef),
+    Cleanup(RecordRef),
 }
+type ThreadCleanup<'a> = carrick_core::terminal::ThreadCleanup<
+    'a,
+    carrick_personality_linux::thread_cleanup::ThreadCleanup,
+>;
 enum PendingState<'a> {
     Operation(PendingContinuation),
     Exit(Box<PendingExit<'a>>),
     Member(MemberWaitState<'a>),
+    Cleanup(Box<ThreadCleanup<'a>>),
 }
 #[derive(Default)]
 struct PendingTable<'a> {
@@ -1232,6 +1246,18 @@ impl<'a> PendingTable<'a> {
     #[inline(never)]
     fn take_row(&mut self, key: &PendingKey) -> Option<PendingState<'a>> {
         self.rows.remove(key).map(|row| *row)
+    }
+    fn take_cleanup(&mut self, record: RecordRef) -> Option<Box<ThreadCleanup<'a>>> {
+        match self.take_row(&PendingKey::Cleanup(record))? {
+            PendingState::Cleanup(owner) => Some(owner),
+            _ => unreachable!(),
+        }
+    }
+    fn put_cleanup(&mut self, record: RecordRef, owner: Box<ThreadCleanup<'a>>) {
+        self.insert_row(PendingKey::Cleanup(record), PendingState::Cleanup(owner));
+    }
+    fn has_cleanup(&self, record: RecordRef) -> bool {
+        self.rows.contains_key(&PendingKey::Cleanup(record))
     }
     fn get(&self, key: &TaskKey) -> Option<&PendingContinuation> {
         match self.rows.get(&PendingKey::Operation(*key))?.as_ref() {
@@ -3647,9 +3673,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .ok_or(NativeProcessError::Stale)?;
         row.credentials_for(calling_tid)
             .map_err(|_| NativeProcessError::Stale)?;
-        let owner_continuation = graph
-            .pending
-            .parked_by(&key, ContinuationOwner::of(control, calling_tid))
+        let owner_continuation = graph.pending.has_cleanup(source.zone.record_ref(record))
+            || graph
+                .pending
+                .parked_by(&key, ContinuationOwner::of(control, calling_tid))
             || graph
                 .pending
                 .exit(&key)
@@ -3815,13 +3842,15 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .ok_or(NativeProcessError::Stale)?;
         row.credentials_for(calling_tid)
             .map_err(|_| NativeProcessError::Stale)?;
-        let owner_continuation = graph.pending.parked_by(
-            &member.process,
-            ContinuationOwner::of(member_control, calling_tid),
-        ) || graph
-            .pending
-            .exit(&member.process)
-            .is_some_and(|pending| core::ptr::eq(pending.caller.control(), member_control));
+        let owner_continuation = graph.pending.has_cleanup(record_ref)
+            || graph.pending.parked_by(
+                &member.process,
+                ContinuationOwner::of(member_control, calling_tid),
+            )
+            || graph
+                .pending
+                .exit(&member.process)
+                .is_some_and(|pending| core::ptr::eq(pending.caller.control(), member_control));
         drop(graph);
         Ok((
             binding,
@@ -5521,6 +5550,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 Err(error) => self.run_failed(error.run_failure_reason()),
             });
         }
+        let terminal_status = {
+            let mut graph = self.runtime.graph.lock();
+            graph.pending.take_cleanup(self.record).map(|owner| {
+                let status = owner.identity().status();
+                graph.pending.put_cleanup(self.record, owner);
+                status
+            })
+        };
+        if let Some(status) = terminal_status {
+            return Some(match self.retire_closing_member(status) {
+                Ok(outcome) => outcome,
+                Err(error) => self.run_failed(error.run_failure_reason()),
+            });
+        }
         let record = self.source.zone.record(self.record.id);
         let continuation = matches!(
             record.resume_disposition(),
@@ -5608,6 +5651,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         status: carrick_sched_core::process::TerminationStatus,
     ) -> Result<LifecycleOutcome, NativeProcessError> {
+        if let Some(parked) = self.finish_thread_cleanup(status)? {
+            return Ok(parked);
+        }
         let page = self
             .runtime
             .graph
@@ -5645,28 +5691,65 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }
                 return Ok(LifecycleOutcome::HostCustody);
             }
+            Err((_, carrick_core::lifecycle::MemberMembershipError::Floor)) => {
+                let status = LinuxWaitStatus::from_termination_status(status)
+                    .map_err(|_| NativeProcessError::Invalid)?;
+                return self.exit_with_status(status, OwnerEntry::Syscall);
+            }
             Err(_) => return Err(NativeProcessError::Quarantined),
         };
-        let receipt = custody
-            .retire_zone_current(
+        let retained_admission = self
+            .runtime
+            .graph
+            .lock()
+            .pending
+            .take_cleanup(self.record)
+            .and_then(|mut cleanup| cleanup.take_admission());
+        let mut admission = match retained_admission
+            .map(Ok)
+            .unwrap_or_else(|| page.begin_exit(entry))
+        {
+            Ok(admission) => Some(admission),
+            Err(carrick_core::lifecycle::TransitionError::GateClosed(gate))
+                if gate.is_terminal() =>
+            {
+                None
+            }
+            Err(_) => return Err(NativeProcessError::Quarantined),
+        };
+        let retirement = custody
+            .zone_retirement(self.control, &mut membership, admission.as_mut())
+            .ok_or(NativeProcessError::Quarantined)?;
+        let receipt = retirement
+            .retire_current(self.binding, self.source, self.record.id)
+            .map_err(|_| NativeProcessError::Quarantined)?;
+        #[cfg(test)]
+        crate::lifecycle::run_raw_exit_before_commit_hook(page);
+        if let Some(admission) = admission {
+            admission
+                .commit_with_member(self.control)
+                .map_err(|_| NativeProcessError::Quarantined)?;
+            membership.publish();
+        } else {
+            carrick_core::lifecycle::retire_cancelled_pool_member(
+                page,
+                entry,
                 self.control,
-                &mut membership,
-                self.binding,
-                self.source,
-                self.record.id,
+                membership,
             )
             .map_err(|_| NativeProcessError::Quarantined)?;
-        carrick_core::lifecycle::retire_cancelled_pool_member(
-            page,
-            entry,
-            self.control,
-            membership,
-        )
-        .map_err(|_| NativeProcessError::Quarantined)?;
+        }
+        self.runtime.graph.lock().pending.take_cleanup(self.record);
         self.retire_thread_verdict(custody.into_verdict(page));
-        self.current
-            .linux
-            .mark_native_terminal_work(self.source.slot);
+        // Group cancellation owes the carrier its terminal CPU boundary.
+        // A raw in-zone exit uses its existing retirement receipt; carrying
+        // a new host-work doorbell into the next native task would consume
+        // that task's next syscall as the previous exit's boundary.
+        if self.runtime.graph.lock().pending.has_exit(&self.key) {
+            self.current
+                .linux
+                .mark_native_terminal_work(self.source.slot);
+        }
         self.lifecycle_admission_settled()
             .map_err(|_| NativeProcessError::Quarantined)?;
         self.handoff = Some(receipt);
@@ -6489,6 +6572,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             status: wait_status,
             entry,
         })?;
+        if let Some(parked) = self.finish_thread_cleanup(wait_status.to_termination_status())? {
+            return Ok(parked);
+        }
+        self.runtime.graph.lock().pending.take_cleanup(self.record);
         let settled = loop {
             if let Some(outcome) = self.park_pending_exit(page, &channel, entry)? {
                 return Ok(outcome);
@@ -6529,60 +6616,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             // A host retirement can claim its birth slot after the ready
             // check. Re-enrol on the channel and recheck under its lock.
         };
-        let clear_child_tid = self.control.clear_child_tid();
-        if clear_child_tid != 0 {
-            let mm = self
-                .runtime
-                .graph
-                .lock()
-                .owner
-                .task(self.key)
-                .map_err(|_| NativeProcessError::Stale)?
-                .native()
-                .resources()
-                .mm
-                .clone();
-            if self
-                .service
-                .copy_signal_bytes(&mm, UserVa::new(clear_child_tid), &0_u32.to_ne_bytes())
-                .is_ok()
-            {
-                let zone = self.source.zone;
-                let guard = zone.short_lock(
-                    ZoneTables::<C>::bucket_of_with_context(self.binding.mm.raw(), clear_child_tid),
-                    &NativeBucketWait {
-                        lifetime: core::marker::PhantomData,
-                        #[cfg(test)]
-                        probe: self.publication_wait_probe,
-                    },
-                );
-                let mut effects = WakeEffects::default();
-                let wake = zone.wake_placed(
-                    &guard,
-                    self.binding.mm.raw(),
-                    clear_child_tid,
-                    carrick_personality_linux::thread::CHILD_TID_WAKE_MASK,
-                    carrick_personality_linux::thread::CHILD_TID_WAKE_COUNT,
-                    carrick_sched_core::Waker::El1 {
-                        slot: self.source.slot,
-                    },
-                    &mut [],
-                    &mut effects,
-                );
-                drop(guard);
-                if matches!(wake, Err(carrick_sched_core::WakeRefusal::Unplaceable)) {
-                    self.service.wake_unplaceable_wait(ProcessWaitChannel {
-                        mm: self.binding.mm,
-                        address: core::num::NonZeroU64::new(clear_child_tid)
-                            .ok_or(NativeProcessError::Quarantined)?,
-                    })?;
-                } else {
-                    wake.map_err(|_| NativeProcessError::Quarantined)?;
-                    self.service.wake_effects(effects);
-                }
-                self.control.set_clear_child_tid(0);
-            }
-        }
         let transaction = self
             .runtime
             .graph
@@ -7498,6 +7531,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
 impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> ProcessNative<C>
     for NativeProcessEntry<'_, 'a, M, C, S>
 {
+    fn exit_thread(
+        &mut self,
+        status: carrick_sched_core::process::TerminationStatus,
+    ) -> Option<LifecycleOutcome> {
+        Some(
+            self.retire_closing_member(status)
+                .unwrap_or_else(|error| self.run_failed(error.run_failure_reason())),
+        )
+    }
     fn is_root_process(&self) -> bool {
         NativeProcessEntry::is_root_process(self)
     }

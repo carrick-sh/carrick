@@ -589,6 +589,14 @@ pub fn x5_linux_clone_exit() {
 /// re-run exit (in the zone or on the host lane) must not clear and wake a
 /// second time: the control slot records the clear.
 pub fn x5_exit_requeued_after_wake_wakes_once() {
+    exit_requeued_after_wake_wakes_once(false);
+}
+
+pub fn x5_exit_faulting_robust_head_requeued_wakes_once() {
+    exit_requeued_after_wake_wakes_once(true);
+}
+
+fn exit_requeued_after_wake_wakes_once(faulting_robust_head: bool) {
     for (x86, replace_clear) in [(false, false), (true, false), (false, true), (true, true)] {
         let a = Process::new(7);
         let mut turn = Turn::new(&a, x86);
@@ -612,6 +620,9 @@ pub fn x5_exit_requeued_after_wake_wakes_once() {
         assert_eq!(turn.syscall(220, args), dispatch::CompletionRoute::Served);
         assert_eq!(turn.words, [7, 7]);
         turn.enter_child();
+        if faulting_robust_head {
+            a.slots[1].set_robust_list(u64::MAX, 24);
+        }
         assert_eq!(a.slots[1].clear_child_tid(), 0x1004);
         let parent = a
             .zone

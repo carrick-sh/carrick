@@ -1487,6 +1487,7 @@ impl Drop for Aarch64ExecSuccessorSlot<'_> {
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 struct NativeWriteVenue<'a, X> {
     allow_backing: bool,
+    terminal: Option<carrick_core::terminal::TerminalAccess<'a>>,
     task: &'a CurrentTask,
     slot: SlotId,
     crossing: &'a X,
@@ -1552,6 +1553,24 @@ impl<X: ForkStockCrossing> UserWriteVenue<Aarch64ParkedContext> for NativeWriteV
         )
     }
 
+    fn access_selected(
+        &mut self,
+        fence: &carrick_core::mm::transfer::ValidatedChunk<'_, Aarch64ParkedContext>,
+    ) -> bool {
+        let Some(access) = self.terminal.as_mut() else {
+            return true;
+        };
+        let mut copy = crate::file::ValidatedCopy {
+            task: self.task,
+            validator: &crate::file::HardwareValidator,
+        };
+        access.perform(
+            &mut copy,
+            UserVa::new(fence.selected().va.raw()),
+            fence.selected().len,
+        )
+    }
+
     fn copy(
         &mut self,
         fence: &carrick_core::mm::transfer::ValidatedChunk<'_, Aarch64ParkedContext>,
@@ -1604,6 +1623,7 @@ impl<'a, X: ForkStockCrossing> Aarch64NativeProcessService<'a, X> {
         len: carrick_guest_arch::GuestLen,
         bytes: Option<&[u8]>,
         access: carrick_guest_arch::Access,
+        mut terminal: Option<carrick_core::terminal::TerminalAccess<'_>>,
     ) -> Result<(), NativeProcessError> {
         if self.task.mm.key.load(Ordering::Acquire) != mm.mm.raw().get() {
             return Err(NativeProcessError::Stale);
@@ -1642,6 +1662,7 @@ impl<'a, X: ForkStockCrossing> Aarch64NativeProcessService<'a, X> {
             };
             let mut venue = NativeWriteVenue {
                 allow_backing: bytes.is_none(),
+                terminal: terminal.take(),
                 task: self.task,
                 slot: self.slot,
                 crossing: &self.crossing,
@@ -1661,6 +1682,18 @@ impl<'a, X: ForkStockCrossing> Aarch64NativeProcessService<'a, X> {
                         bytes,
                         slot: self.slot,
                     },
+                    &*live,
+                    &mut venue,
+                )
+            } else if venue.terminal.is_some() {
+                owner.access_user_target(
+                    carrick_core::mm::transaction::UserWriteTarget {
+                        handle,
+                        address,
+                        len,
+                        slot: self.slot,
+                    },
+                    access,
                     &*live,
                     &mut venue,
                 )
@@ -1695,7 +1728,15 @@ impl<'a, X: ForkStockCrossing> Aarch64NativeProcessService<'a, X> {
                 task: self.task,
                 validator: &crate::file::HardwareValidator,
             });
-            if let Some(bytes) = bytes {
+            if let Some(terminal) = terminal.as_mut() {
+                let mut typed = crate::file::ValidatedCopy {
+                    task: self.task,
+                    validator: &crate::file::HardwareValidator,
+                };
+                if !terminal.perform(&mut typed, address, len.raw()) {
+                    return Err(NativeProcessError::Fault);
+                }
+            } else if let Some(bytes) = bytes {
                 if !carrick_personality_linux::lifecycle::UserCopy::copy_out(
                     &mut copy, address, bytes,
                 )
@@ -2724,7 +2765,18 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             carrick_guest_arch::GuestLen::new(bytes.len() as u64),
             Some(bytes),
             carrick_guest_arch::Access::Write,
+            None,
         )
+    }
+    fn terminal_access(
+        &mut self,
+        mm: &Self::Mm,
+        access: carrick_core::terminal::TerminalAccess<'_>,
+    ) -> Result<(), NativeProcessError> {
+        let address = access.address();
+        let len = access.len();
+        let kind = access.access();
+        self.access_user_target(mm, address, len, None, kind, Some(access))
     }
     fn prepare_owned_write(
         &mut self,
@@ -2737,6 +2789,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             request.len,
             None,
             carrick_guest_arch::Access::Write,
+            None,
         )
     }
     fn prepare_owned_read(
@@ -2750,6 +2803,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             request.len,
             None,
             carrick_guest_arch::Access::Read,
+            None,
         )
     }
     fn copyout_fault(
