@@ -7681,6 +7681,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             address,
             bytes,
             offset: 0,
+            prefix_on_fault: false,
             result,
         });
         match self.drain_copyout(result) {

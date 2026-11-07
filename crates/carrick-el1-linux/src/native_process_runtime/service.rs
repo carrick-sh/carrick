@@ -138,6 +138,7 @@ pub(super) struct OwnedCopyout {
     pub bytes: Vec<u8>,
     pub offset: usize,
     pub result: SyscallResult,
+    pub prefix_on_fault: bool,
 }
 
 /// Physical preparation is enrolled only after the IPC dispatch stack unwinds.
@@ -154,6 +155,11 @@ enum ServicePayload<'a> {
     Adapter,
     Exec(Box<[u8]>),
     HostFile(PendingHostFile<'a>),
+    Entropy {
+        record: Box<[u8]>,
+        address: UserVa,
+        empty_fault: bool,
+    },
 }
 
 pub(super) struct PendingService<'a> {
@@ -163,6 +169,7 @@ pub(super) struct PendingService<'a> {
     _exec_payload: Option<Box<[u8]>>,
     /// The same custody for a host-file record, which the carrier also writes.
     host_file: Option<PendingHostFile<'a>>,
+    entropy: Option<(Box<[u8]>, UserVa, bool)>,
     copyout: Option<Box<OwnedCopyout>>,
     copyin: bool,
     adapter: bool,
@@ -657,8 +664,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                                 ServiceCompletion::RetrySyscall,
                             );
                         }
+                        Err(NativeProcessError::Fault) if output.prefix_on_fault => {
+                            return Ok(entropy_copy_fault(output.offset));
+                        }
                         Err(error) => return Err(error),
                     }
+                }
+                Err(NativeProcessError::Fault) if output.prefix_on_fault => {
+                    return Ok(entropy_copy_fault(output.offset));
                 }
                 Err(error) => return Err(error),
             }
@@ -1041,6 +1054,91 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ServiceCompletion::Inline,
         )
     }
+    /// Retain bounded entropy staging until this exact ticket settles. The
+    /// exact MM prepares the accessible output prefix before publication.
+    pub fn begin_entropy_service(
+        &mut self,
+        address: UserVa,
+        mut capacity: usize,
+        flags: u32,
+        requested: carrick_guest_arch::GuestLen,
+    ) -> Result<NativeResume, NativeProcessError> {
+        use carrick_core_abi::service::entropy;
+        if capacity > entropy::MAX_ENTROPY_BYTES {
+            return Err(NativeProcessError::Invalid);
+        }
+        capacity = capacity.min(usize::try_from(requested.raw()).unwrap_or(usize::MAX));
+        // Invalid flags must reach the shared handler before any user-memory
+        // decision. A zero-capacity request asks it only for that validation.
+        if !carrick_abi::getrandom_flags_valid(flags) {
+            capacity = 0;
+        }
+        while capacity != 0 {
+            match self.prepare_owner_output(carrick_core::mm::transaction::CopyoutRequest {
+                address,
+                len: carrick_guest_arch::GuestLen::new(capacity as u64),
+            }) {
+                Ok(()) => break,
+                Err(NativeProcessError::Fault) => capacity /= 2,
+                Err(NativeProcessError::Busy) => {
+                    return self.begin_service_inner(
+                        ServiceOperation::CarrierWork {
+                            entry: OwnerEntry::Syscall,
+                        },
+                        None,
+                        None,
+                        ServicePayload::None,
+                        ServiceCompletion::RetrySyscall,
+                    );
+                }
+                Err(NativeProcessError::OwnerWait(wait)) => {
+                    return self.begin_service_inner(
+                        ServiceOperation::CarrierWork {
+                            entry: OwnerEntry::Syscall,
+                        },
+                        None,
+                        Some(wait),
+                        ServicePayload::None,
+                        ServiceCompletion::RetrySyscall,
+                    );
+                }
+                Err(NativeProcessError::Unsupported) => {
+                    let (fault, sequence) = self
+                        .service
+                        .copyout_fault(address)
+                        .ok_or(NativeProcessError::Unsupported)?;
+                    return self.begin_service_inner(
+                        ServiceOperation::Fault(fault),
+                        Some(sequence),
+                        None,
+                        ServicePayload::None,
+                        ServiceCompletion::RetrySyscall,
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let mut record =
+            alloc::vec![0; entropy::ENTROPY_HEADER_BYTES + capacity].into_boxed_slice();
+        entropy::encode_request(&mut record, flags).map_err(|_| NativeProcessError::Invalid)?;
+        let payload = entropy::EntropyPayloadDescriptor::checked(
+            carrick_guest_arch::GuestVa::new(record.as_ptr().addr() as u64),
+            carrick_guest_arch::GuestLen::new(record.len() as u64),
+        )
+        .ok_or(NativeProcessError::Invalid)?;
+        self.begin_service_inner(
+            ServiceOperation::Entropy { payload },
+            None,
+            None,
+            ServicePayload::Entropy {
+                record,
+                address,
+                empty_fault: requested.raw() != 0 && capacity == 0,
+            },
+            ServiceCompletion::Inline,
+        )
+    }
+
     /// The caller's own `RLIMIT_FSIZE` soft limit, which the ring owns.
     pub(super) fn caller_file_size_soft_limit(&self) -> Result<u64, NativeProcessError> {
         let graph = self.runtime.graph.lock();
@@ -1182,10 +1280,24 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ServicePayload::Adapter => (ServicePayload::None, None, true),
             payload => (payload, None, false),
         };
-        let (exec_payload, host_file) = match (operation, payload) {
-            (ServiceOperation::Exec { .. }, ServicePayload::Exec(payload)) => (Some(payload), None),
+        let (exec_payload, host_file, entropy) = match (operation, payload) {
+            (ServiceOperation::Exec { .. }, ServicePayload::Exec(payload)) => {
+                (Some(payload), None, None)
+            }
             (ServiceOperation::HostFile { .. }, ServicePayload::HostFile(pending)) => {
-                (None, Some(pending))
+                (None, Some(pending), None)
+            }
+            (
+                ServiceOperation::Entropy { payload },
+                ServicePayload::Entropy {
+                    record,
+                    address,
+                    empty_fault,
+                },
+            ) if payload.address().raw() == record.as_ptr().addr() as u64
+                && payload.length().raw() == record.len() as u64 =>
+            {
+                (None, None, Some((record, address, empty_fault)))
             }
             (
                 ServiceOperation::Exec { .. }
@@ -1193,10 +1305,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 | ServiceOperation::Entropy { .. },
                 _,
             )
-            | (_, ServicePayload::Exec(_) | ServicePayload::HostFile(_)) => {
+            | (
+                _,
+                ServicePayload::Exec(_)
+                | ServicePayload::HostFile(_)
+                | ServicePayload::Entropy { .. },
+            ) => {
                 return Err(NativeProcessError::Stale);
             }
-            (_, ServicePayload::None) => (None, None),
+            (_, ServicePayload::None) => (None, None, None),
             (_, ServicePayload::Copyout(_) | ServicePayload::Copyin | ServicePayload::Adapter) => {
                 return Err(NativeProcessError::Stale);
             }
@@ -1404,6 +1521,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 reply,
                 _exec_payload: exec_payload,
                 host_file,
+                entropy,
                 copyout,
                 copyin,
                 adapter,
@@ -2687,7 +2805,24 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .record(self.record.id)
                 .consume_owner_continuation();
         }
-        let output = pending.copyout.take();
+        let mut output = pending.copyout.take();
+        if matches!(request.operation, ServiceOperation::Entropy { .. })
+            && matches!(result, ServiceResult::Supplied | ServiceResult::Cancelled)
+            && let Some((record, address, empty_fault)) = pending.entropy.as_ref()
+            && let Ok((value, bytes)) = carrick_core_abi::service::entropy::reply(record)
+        {
+            output = Some(Box::new(OwnedCopyout {
+                address: *address,
+                bytes: bytes.to_vec(),
+                offset: 0,
+                result: SyscallResult::new(if value == 0 && *empty_fault {
+                    carrick_syscall_abi::LINUX_EFAULT.guest_retval()
+                } else {
+                    value
+                }),
+                prefix_on_fault: true,
+            }));
+        }
         if pending.adapter {
             return self.finish_adapter_service(result, pending.claim);
         }
@@ -2967,6 +3102,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         completed
     }
 }
+fn entropy_copy_fault(committed: usize) -> NativeResume {
+    NativeResume::Returned(if committed == 0 {
+        SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT)
+    } else {
+        SyscallResult::new(committed as i64)
+    })
+}
+
 pub(super) fn service_protocol_error(error: ServiceError) -> NativeProcessError {
     match error {
         // All callers either own the exact executing member before transport

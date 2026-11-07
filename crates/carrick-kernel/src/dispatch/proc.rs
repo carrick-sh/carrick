@@ -3818,81 +3818,7 @@ impl<'a> ProcView<'a> {
         }
 
         fn getrandom(this, cx, address: GuestPtr, length: u64, flags: u64) {
-            // Linux's flags argument is unsigned int: upper register bits
-            // are outside the argument, not unsupported flag bits.
-            let flags = flags as u32;
-            // Only GRND_NONBLOCK(1) | GRND_RANDOM(2) | GRND_INSECURE(4) are
-            // valid; any other bit → EINVAL (LTP getrandom05). carrick draws
-            // from the host CSPRNG regardless of the source/blocking flags.
-            const GRND_SUPPORTED: u32 = 0x0001 | 0x0002 | 0x0004;
-            if flags & !GRND_SUPPORTED != 0 || flags & (0x0002 | 0x0004) == (0x0002 | 0x0004) {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            }
-            let length = usize::try_from(length).map_err(|_| DispatchError::LengthTooLarge(length))?;
-            // Linux caps getrandom at 2^31-1 and returns a short count; clamp so a
-            // huge length can't OOM-abort the runtime. Probe: bigread (read class).
-            let length = length.min(crate::dispatch::MAX_RW_COUNT);
-            if length == 0 {
-                return Ok(DispatchOutcome::Returned { value: 0 });
-            }
-            let mut offset = 0usize;
-            while offset < length {
-                let chunk_len = (length - offset).min(super::copyout::COPYOUT_MAX_BYTES);
-                let Some(chunk_addr) = address.0.checked_add(offset as u64) else {
-                    return Ok(if offset == 0 {
-                        DispatchOutcome::errno(LINUX_EFAULT)
-                    } else {
-                        DispatchOutcome::returned_len(offset)?
-                    });
-                };
-                let out = match super::copyout::prepare_array(
-                    cx.kernel,
-                    cx.memory,
-                    carrick_guest_mem::GuestVa::new(chunk_addr),
-                    chunk_len,
-                    1,
-                ) {
-                    Ok(out) => out,
-                    Err(refusal) => return Ok(if offset == 0 {
-                        refusal.into_outcome()
-                    } else {
-                        DispatchOutcome::returned_len(offset)?
-                    }),
-                };
-                let admitted = out.records();
-                if admitted == 0 {
-                    return Ok(if offset == 0 {
-                        DispatchOutcome::errno(LINUX_EFAULT)
-                    } else {
-                        DispatchOutcome::returned_len(offset)?
-                    });
-                }
-                // Generate only the secured byte prefix. A later refusal or
-                // address fault returns the bytes already delivered, so retry
-                // never replaces an earlier random prefix with new data.
-                let mut bytes = vec![0; admitted];
-                if fill_host_random(&mut bytes).is_err() {
-                    // Host entropy failure cannot authorize predictable bytes.
-                    // Preserve only a prefix already committed to the caller.
-                    return Ok(if offset == 0 {
-                        DispatchOutcome::errno(carrick_abi::LINUX_EIO)
-                    } else {
-                        DispatchOutcome::returned_len(offset)?
-                    });
-                }
-                if let Err(fault) = out.commit(&bytes) {
-                    return Ok(if offset == 0 {
-                        fault.outcome()
-                    } else {
-                        DispatchOutcome::returned_len(offset)?
-                    });
-                }
-                offset += admitted;
-                if admitted < chunk_len {
-                    return Ok(DispatchOutcome::returned_len(offset)?);
-                }
-            }
-            Ok(DispatchOutcome::returned_len(length)?)
+            getrandom(&mut HandlerEntropyMemory { context: cx.kernel, memory: cx.memory }, address, length, flags)
         }
 
         fn sys_exit(this, cx, code: u64) {
@@ -4673,6 +4599,185 @@ fn ptrace_poke_failure_errno(error: &PtracePokeFailure) -> LinuxErrno {
         }
         PtracePokeFailure::Witness(errno) => *errno,
     }
+}
+
+/// One entropy algorithm for dispatcher user memory and authenticated ring
+/// staging. Preparation is a memory authority decision, never a task lookup.
+trait EntropyMemory {
+    type Prepared<'m>: EntropyPrepared
+    where
+        Self: 'm;
+    fn prepare(
+        &mut self,
+        address: u64,
+        length: usize,
+    ) -> Result<Self::Prepared<'_>, DispatchOutcome>;
+}
+trait EntropyPrepared {
+    fn capacity(&self) -> usize;
+    fn commit(self, bytes: &[u8]) -> Result<(), DispatchOutcome>;
+}
+struct HandlerEntropyMemory<'a, M> {
+    context: &'a crate::kernel::KernelContext,
+    memory: &'a mut M,
+}
+impl<M: CurrentMmMemory> EntropyMemory for HandlerEntropyMemory<'_, M> {
+    type Prepared<'m>
+        = super::copyout::PreparedArrayOut<'m, M>
+    where
+        Self: 'm;
+    fn prepare(
+        &mut self,
+        address: u64,
+        length: usize,
+    ) -> Result<Self::Prepared<'_>, DispatchOutcome> {
+        super::copyout::prepare_array(
+            self.context,
+            self.memory,
+            carrick_guest_mem::GuestVa::new(address),
+            length,
+            1,
+        )
+        .map_err(|refusal| refusal.into_outcome())
+    }
+}
+impl<M: CurrentMmMemory> EntropyPrepared for super::copyout::PreparedArrayOut<'_, M> {
+    fn capacity(&self) -> usize {
+        self.records()
+    }
+    fn commit(self, bytes: &[u8]) -> Result<(), DispatchOutcome> {
+        self.commit(bytes).map_err(|fault| fault.outcome())
+    }
+}
+struct StagingEntropyMemory<'a>(&'a mut [u8]);
+struct StagingEntropyPrepared<'a>(&'a mut [u8]);
+impl EntropyMemory for StagingEntropyMemory<'_> {
+    type Prepared<'m>
+        = StagingEntropyPrepared<'m>
+    where
+        Self: 'm;
+    fn prepare(
+        &mut self,
+        address: u64,
+        length: usize,
+    ) -> Result<Self::Prepared<'_>, DispatchOutcome> {
+        let offset = usize::try_from(address).map_err(|_| DispatchOutcome::errno(LINUX_EFAULT))?;
+        let end = offset
+            .checked_add(length)
+            .ok_or(DispatchOutcome::errno(LINUX_EFAULT))?;
+        self.0
+            .get_mut(offset..end)
+            .map(StagingEntropyPrepared)
+            .ok_or(DispatchOutcome::errno(LINUX_EFAULT))
+    }
+}
+impl EntropyPrepared for StagingEntropyPrepared<'_> {
+    fn capacity(&self) -> usize {
+        self.0.len()
+    }
+    fn commit(self, bytes: &[u8]) -> Result<(), DispatchOutcome> {
+        self.0.copy_from_slice(bytes);
+        Ok(())
+    }
+}
+fn getrandom(
+    memory: &mut impl EntropyMemory,
+    address: GuestPtr,
+    length: u64,
+    flags: u64,
+) -> Result<DispatchOutcome, DispatchError> {
+    // Linux's flags argument is unsigned int: upper register bits
+    // are outside the argument, not unsupported flag bits.
+    let flags = flags as u32;
+    // Only GRND_NONBLOCK(1) | GRND_RANDOM(2) | GRND_INSECURE(4) are
+    // valid; any other bit → EINVAL (LTP getrandom05). carrick draws
+    // from the host CSPRNG regardless of the source/blocking flags.
+    if !carrick_abi::getrandom_flags_valid(flags) {
+        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+    }
+    let length = usize::try_from(length).map_err(|_| DispatchError::LengthTooLarge(length))?;
+    // Linux caps getrandom at 2^31-1 and returns a short count; clamp so a
+    // huge length can't OOM-abort the runtime. Probe: bigread (read class).
+    let length = length.min(crate::dispatch::MAX_RW_COUNT);
+    if length == 0 {
+        return Ok(DispatchOutcome::Returned { value: 0 });
+    }
+    let mut offset = 0usize;
+    while offset < length {
+        let chunk_len = (length - offset).min(super::copyout::COPYOUT_MAX_BYTES);
+        let Some(chunk_addr) = address.0.checked_add(offset as u64) else {
+            return Ok(if offset == 0 {
+                DispatchOutcome::errno(LINUX_EFAULT)
+            } else {
+                DispatchOutcome::returned_len(offset)?
+            });
+        };
+        let out = match memory.prepare(chunk_addr, chunk_len) {
+            Ok(out) => out,
+            Err(refusal) => {
+                return Ok(if offset == 0 {
+                    refusal
+                } else {
+                    DispatchOutcome::returned_len(offset)?
+                });
+            }
+        };
+        let admitted = out.capacity();
+        if admitted == 0 {
+            return Ok(if offset == 0 {
+                DispatchOutcome::errno(LINUX_EFAULT)
+            } else {
+                DispatchOutcome::returned_len(offset)?
+            });
+        }
+        // Generate only the secured byte prefix. A later refusal or
+        // address fault returns the bytes already delivered, so retry
+        // never replaces an earlier random prefix with new data.
+        let mut bytes = vec![0; admitted];
+        if fill_host_random(&mut bytes).is_err() {
+            // Host entropy failure cannot authorize predictable bytes.
+            // Preserve only a prefix already committed to the caller.
+            return Ok(if offset == 0 {
+                DispatchOutcome::errno(carrick_abi::LINUX_EIO)
+            } else {
+                DispatchOutcome::returned_len(offset)?
+            });
+        }
+        if let Err(fault) = out.commit(&bytes) {
+            return Ok(if offset == 0 {
+                fault
+            } else {
+                DispatchOutcome::returned_len(offset)?
+            });
+        }
+        offset += admitted;
+        if admitted < chunk_len {
+            return Ok(DispatchOutcome::returned_len(offset)?);
+        }
+    }
+    Ok(DispatchOutcome::returned_len(length)?)
+}
+
+/// Serve only bounded, already authenticated ring staging. This does not
+/// access the carrier root's guest memory, credentials or lifecycle authority.
+pub(super) fn serve_native_entropy(
+    record: &mut [u8],
+) -> Result<(), carrick_core_abi::service::entropy::InvalidEntropyRecord> {
+    use carrick_core_abi::service::entropy;
+    let request = entropy::request(record)?;
+    let outcome = getrandom(
+        &mut StagingEntropyMemory(&mut record[entropy::ENTROPY_HEADER_BYTES..]),
+        GuestPtr(0),
+        request.capacity as u64,
+        u64::from(request.flags),
+    )
+    .map_err(|_| entropy::InvalidEntropyRecord)?;
+    let result = match outcome {
+        DispatchOutcome::Returned { value } => value as i64,
+        DispatchOutcome::Errno { errno } => errno.guest_retval(),
+        _ => return Err(entropy::InvalidEntropyRecord),
+    };
+    entropy::publish_reply(record, result)
 }
 
 // Fault injection is thread-local: unrelated dispatch tests keep the real source.

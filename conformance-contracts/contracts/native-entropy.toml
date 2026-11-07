@@ -6,7 +6,7 @@ semantic_authority = ["man 2 getrandom", "docs/host-facility-boundary.md"]
 fixture = "unit:arm_native_fork_child_getrandom_default_returns_eight_bytes"
 scale_points = [1]
 structural_budgets = []
-rationale = "A fork child and its parent remain live while the child asks for eight random bytes with flags zero or GRND_NONBLOCK. The production Linux dispatcher and final native entry refusal boundary must not answer ENOSYS. These are explicit ignored red witnesses run with --ignored, not passing acceptance bindings. The service implementation must retain exact member/MM custody, bound staging storage, and never replay a committed prefix."
+rationale = "A fork child and parent remain live through bounded entropy staging, the existing host getrandom handler, exact ticket acknowledgment, copyout and native resume. Staging is bounded to 4096 bytes. Busy and OwnerWait retain bytes and the committed cursor rather than regenerating or replaying output. Physical signed ARM and x86 transport require their own evidence."
 
 [bindings]
 vm_free = [
@@ -22,11 +22,18 @@ vm_free = [
   "carrick-core-abi::service::tests::entropy_service_roundtrips_exact_ticket_and_settles_cancellation",
   "carrick-core-abi::service::tests::entropy_notice_checks_bounded_descriptor_and_reserved_service_words",
   "carrick-el1-linux::native_process_runtime::host_test_support::entropy_service_requires_retained_ring_payload_before_notice",
+  "carrick-el1-linux::native_process_runtime::host_test_support::entropy_service_first_byte_fault_returns_efault",
+  "carrick-el1-linux::native_process_runtime::host_test_support::entropy_service_accessible_prefix_is_a_short_read",
+  "carrick-el1-linux::native_process_runtime::host_test_support::entropy_service_flags_precede_output_fault",
+  "carrick-el1-linux::native_process_runtime::host_test_support::entropy_service_retains_reply_through_busy_and_resume",
+  "carrick-el1-linux::native_process_runtime::host_test_support::entropy_service_retains_reply_through_owner_wait_and_resume",
+  "carrick-el1-linux::native_process_runtime::host_test_support::entropy_service_cancellation_before_reply_releases_payload",
+  "carrick-el1-linux::native_process_runtime::host_test_support::entropy_service_cancellation_after_reply_keeps_generated_bytes",
 ]
 
 [bindings.unresolved]
-semantics = "The two VM-free witnesses are red and ignored pending implementation; errno 38 is a defect, not an accepted result. The checked entropy protocol exists, but native payload admission and child completion remain unimplemented."
-structural = "The codec bounds each record to the existing copyout chunk limit, but retained staging and exact crossing counts still require the service owner and measured completion witnesses; the refusal tests do not prove them."
+semantics = "ARM VM-free witnesses drive asynchronous completion and native resume. Signed native-child execution remains UNRUN (director)."
+structural = "Bounded staging and retained page cursor have VM-free witnesses, including stale-MM claim refusal. Signed work counts and runtime ratios remain UNRUN (director)."
 x86 = "The ignored KVM cpl0_initial_mm tests serial_host_native_child_getrandom_default_returns_eight_bytes and serial_host_native_child_getrandom_nonblock_returns_eight_bytes exercise fork, child getrandom and parent wait through the production pool. Native Linux exits 8 for both flags, KVM exits 218 (-38 modulo 256). The x86 carrier still needs typed entropy transport; these are defect witnesses, not acceptance."
 embed_structural = "UNRUN (director): signed fork-child getrandom, node -e and openssl rand on the implementation head."
 docker = "UNRUN: native Linux differential for flags, EFAULT and accessible-prefix short reads."

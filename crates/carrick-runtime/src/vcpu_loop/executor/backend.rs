@@ -1077,6 +1077,13 @@ pub(super) fn finish_native_service(
         carrick_core_abi::service::ServiceOperation::HostFile { .. }
     ) {
         service.serve_host_file()?
+    } else if matches!(
+        service.request().operation,
+        carrick_core_abi::service::ServiceOperation::Entropy { .. }
+    ) {
+        service.serve_entropy(|record| {
+            carrick_kernel::dispatch::serve_native_entropy(record).is_ok()
+        })?
     } else {
         service.supply(|zone, _waker, effects| {
             carrick_sched_core::LockWait::complete_object_wake(

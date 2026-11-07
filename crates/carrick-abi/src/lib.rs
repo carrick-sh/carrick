@@ -129,6 +129,12 @@ pub mod syscall;
 /// which lives here (the leaf crate) so it can be shared by both `carrick-abi`
 /// and `carrick-hal` without a cycle. `carrick-hal::guest_arch` re-exports
 /// `SyscallRemap` from here.
+/// Linux getrandom takes an unsigned int and rejects unknown or conflicting
+/// source flags before accessing output memory.
+pub const fn getrandom_flags_valid(flags: u32) -> bool {
+    flags & !7 == 0 && flags & 6 != 6
+}
+
 #[cfg(test)]
 mod x86_syscall_crosscheck;
 

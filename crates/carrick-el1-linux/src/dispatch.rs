@@ -984,10 +984,41 @@ struct StagedHostFile {
 }
 
 /// One staged native service request, before its owner publishes it.
+/// Stage only a bounded accessible prefix; the exact-MM owner prepares COW
+/// and authenticates it before entropy is requested from the carrier.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub(super) fn native_entropy_stage(
+    frame: &TrapFrame,
+    validator: &impl file::MemoryValidator,
+) -> (
+    carrick_guest_arch::UserVa,
+    usize,
+    u32,
+    carrick_guest_arch::GuestLen,
+) {
+    let capacity =
+        frame.x[1].min(carrick_core_abi::service::entropy::MAX_ENTROPY_BYTES as u64) as usize;
+    let capacity = validator
+        .writable_bytes(frame.x[0], capacity)
+        .max(validator.readable_bytes(frame.x[0], capacity));
+    (
+        carrick_guest_arch::UserVa::new(frame.x[0]),
+        capacity,
+        frame.x[2] as u32,
+        carrick_guest_arch::GuestLen::new(frame.x[1]),
+    )
+}
+
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 enum NativeServiceStage {
     Exec(alloc::boxed::Box<[u8]>),
     HostFile(alloc::boxed::Box<StagedHostFile>),
+    Entropy {
+        address: carrick_guest_arch::UserVa,
+        capacity: usize,
+        flags: u32,
+        requested: carrick_guest_arch::GuestLen,
+    },
     Fault(carrick_guest_arch::FaultInfo),
     Return(i64),
     Operation,
@@ -1219,7 +1250,7 @@ fn arm_native_service_exit(
         return Some(arm_signal_user_return(frame));
     }
     let mut service_wait = wait;
-    let (operation, exec_payload, host_file, retry_exec_stage) = {
+    let (operation, exec_payload, host_file, entropy, retry_exec_stage) = {
         let staged = match native_exec_stage(frame, task) {
             Some(NativeExecStage::Payload(payload)) => NativeServiceStage::Exec(payload),
             Some(NativeExecStage::Failed(errno)) => {
@@ -1230,6 +1261,16 @@ fn arm_native_service_exit(
             // work first settles that work (CarrierWork) and is replayed;
             // staging it here would pre-empt the settlement forever.
             None if action != Action::Forward => NativeServiceStage::Operation,
+            None if frame.x[8] == 278 => {
+                let (address, capacity, flags, requested) =
+                    native_entropy_stage(frame, &file::HardwareValidator);
+                NativeServiceStage::Entropy {
+                    address,
+                    capacity,
+                    flags,
+                    requested,
+                }
+            }
             None => match ipc::guest_venue(frame.slot as u32).and_then(|venue| {
                 let table = ipc::native_table(&venue, task)?;
                 let access = carrick_el1::substrate::sched::object_wait::space_access(zone, slot);
@@ -1310,8 +1351,20 @@ fn arm_native_service_exit(
             },
         };
         match staged {
-            NativeServiceStage::Exec(payload) => (None, Some(payload), None, false),
-            NativeServiceStage::HostFile(staged) => (None, None, Some(staged), false),
+            NativeServiceStage::Exec(payload) => (None, Some(payload), None, None, false),
+            NativeServiceStage::HostFile(staged) => (None, None, Some(staged), None, false),
+            NativeServiceStage::Entropy {
+                address,
+                capacity,
+                flags,
+                requested,
+            } => (
+                None,
+                None,
+                None,
+                Some((address, capacity, flags, requested)),
+                false,
+            ),
             NativeServiceStage::Return(result) => {
                 frame.x[0] = result as u64;
                 return Some(arm_signal_user_return(frame));
@@ -1339,6 +1392,7 @@ fn arm_native_service_exit(
                             Some(carrick_core_abi::service::ServiceOperation::Fault(fault)),
                             None,
                             None,
+                            None,
                             true,
                         )
                     }
@@ -1355,7 +1409,9 @@ fn arm_native_service_exit(
                 counters,
             ) {
                 NativeUnstagedExit::Refused(refused) => return Some(refused),
-                NativeUnstagedExit::Operation(operation) => (Some(operation), None, None, false),
+                NativeUnstagedExit::Operation(operation) => {
+                    (Some(operation), None, None, None, false)
+                }
                 NativeUnstagedExit::Declined => return None,
             },
         }
@@ -1419,6 +1475,8 @@ fn arm_native_service_exit(
                         ),
                     )
                 }
+            } else if let Some((address, capacity, flags, requested)) = entropy {
+                process.begin_entropy_service(address, capacity, flags, requested)
             } else if let Some(staged) = host_file {
                 if service_wait.is_some() {
                     Err(super::native_process_runtime::NativeProcessError::Quarantined)
