@@ -729,6 +729,7 @@ mod tests {
             assigned_key: Some(key),
             approved: true,
             mints: vec![],
+            busy_retries: 0,
         }
     }
     fn request(scope: &str, run: u64) -> Vec<u8> {

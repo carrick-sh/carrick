@@ -350,16 +350,14 @@ impl TeardownApi for MockTeardown {
     fn wait_task(&mut self, task: &str) -> Result<(), ScalerError> {
         if task == "destroy-task" && self.interruption == Some(Interruption::DestroyLock) {
             self.interruption = None;
-            return Err(ScalerError::External("destroy storage lock timeout"));
+            return Err(ScalerError::StorageBusy);
         }
         Ok(())
     }
     fn clear_volumes(&mut self, _: &Record) -> Result<(), ScalerError> {
         if self.interruption == Some(Interruption::StorageLock) {
             self.interruption = None;
-            return Err(ScalerError::External(
-                "storage lock timeout; volume remains",
-            ));
+            return Err(ScalerError::StorageBusy);
         }
         self.volume = false;
         Ok(())
@@ -1425,15 +1423,16 @@ fn vmid_lock_timeout_fails_closed_and_frees_nothing() {
     let mut busy = true;
     let mut lock = |_: CloneId| {
         if std::mem::take(&mut busy) {
-            Err(ScalerError::External(
-                "PVE VMID lock busy; retry cleanup next reconcile",
-            ))
+            Err(ScalerError::StorageBusy)
         } else {
             Ok(())
         }
     };
     let mut run = |args: &[&str]| pve.run(args);
-    assert!(clear_clone_volumes("carrick-ctb", "local", id, &mut run, &mut lock).is_err());
+    assert!(matches!(
+        clear_clone_volumes("carrick-ctb", "local", id, &mut run, &mut lock),
+        Err(ScalerError::StorageBusy)
+    ));
     clear_clone_volumes("carrick-ctb", "local", id, &mut run, &mut lock).unwrap();
     assert_eq!(pve.frees, 1);
     assert!(!pve.orphan);
@@ -1451,7 +1450,7 @@ fn pve_vmid_lock_files_exclude_a_holder_and_time_out() {
     // flock binds open file descriptions, so a second open contends like qm.
     assert!(matches!(
         lock_files_within(&paths[1..], Duration::from_millis(100)),
-        Err(ScalerError::External(_))
+        Err(ScalerError::StorageBusy)
     ));
     drop(held);
     lock_files_within(&paths, Duration::ZERO).unwrap();
@@ -1480,4 +1479,22 @@ fn owner_parsers_accept_string_and_number_vmids() {
     )
     .unwrap();
     assert_eq!(volumes, ["local:309/d"]);
+}
+
+#[test]
+fn storage_busy_removal_retains_durable_cleanup_until_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ledger, mut row, mut api, path) = teardown_fixture(dir.path());
+    api.interruption = Some(Interruption::StorageLock);
+    assert!(matches!(
+        continue_teardown(&mut api, &mut ledger, &mut row, dir.path(), &path),
+        Err(ScalerError::StorageBusy)
+    ));
+    assert!(api.volume && api.registered);
+    let mut ledger = Ledger::load(&path).unwrap();
+    let mut row = ledger.rows[0].clone();
+    assert_eq!(row.state, State::Reaping);
+    assert!(continue_teardown(&mut api, &mut ledger, &mut row, dir.path(), &path).unwrap());
+    assert!(!api.volume && !api.registered);
+    assert_eq!(Ledger::load(&path).unwrap().rows[0].state, State::Destroyed);
 }
