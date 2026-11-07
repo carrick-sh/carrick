@@ -2081,6 +2081,111 @@ mod tests {
             }
             (route, frame.x[0] as i64)
         }
+        /// V8 reserves its code range with MAP_NORESERVE before granting RWX.
+        /// No untouched page needs backing or a host publication for this edit.
+        #[test]
+        fn two_isa_noreserve_code_range_stays_owner_admitted() {
+            use carrick_guest_arch::{GuestIsa, UserVa};
+            use carrick_sched_core::SlotId;
+            const LENGTH: u64 = 256 * 1024 * 1024;
+            for isa in [GuestIsa::Aarch64, GuestIsa::X86_64] {
+                let spaces = AddressSpaces::new();
+                let table = table();
+                let key = 17;
+                let index = spaces.publish_closed(key, LIVE_ROOT, LIVE_ROOT).unwrap();
+                spaces.open(index);
+                let mm = ReservationMm::new(key).unwrap();
+                let mut geometry = layout();
+                geometry.arena = ReservationRange::new(ARENA, ARENA + LENGTH).unwrap();
+                table.publish(index.index(), mm, geometry).unwrap();
+                table
+                    .lock(index.index(), mm)
+                    .unwrap()
+                    .finish_import()
+                    .unwrap();
+                let task = CurrentTask::new();
+                task.execution.task.store(117, Ordering::Relaxed);
+                task.mm.thread_generation.store(11, Ordering::Relaxed);
+                task.mm.key.store(key, Ordering::Relaxed);
+                let counters = Counters::new();
+                let mut editor = Editor::over(RangeBacking::Empty);
+                let mut invoke = |nr, args| {
+                    let mut native = AnonymousCall::new(
+                        carrick_core::CallOrdinal::from_raw(nr),
+                        args,
+                        0,
+                        SlotId::from_index(7).unwrap(),
+                        UserVa::new(0x40004),
+                    );
+                    let mut arm = TrapFrame::default();
+                    arm.x[8] = nr;
+                    arm.x[..6].copy_from_slice(&args);
+                    let call: &mut dyn AnonymousCallView = match isa {
+                        GuestIsa::Aarch64 => &mut arm,
+                        GuestIsa::X86_64 => &mut native,
+                    };
+                    assert_eq!(
+                        serve_delegated_anonymous(
+                            call,
+                            &counters,
+                            &task,
+                            carrick_sched_core::spaces::notification::SpaceAccess::source_free(
+                                &spaces
+                            ),
+                            &*table,
+                            &mut editor,
+                            None,
+                        ),
+                        DelegatedAnonymous::Served,
+                        "{isa:?} nr={nr}"
+                    );
+                    call.result().0 as i64
+                };
+                assert_eq!(
+                    invoke(
+                        SYS_MMAP,
+                        [
+                            ARENA,
+                            LENGTH,
+                            0,
+                            MAP_PRIVATE | MAP_ANONYMOUS | 0x4000,
+                            u64::MAX,
+                            0
+                        ]
+                    ),
+                    ARENA as i64
+                );
+                assert_eq!(
+                    invoke(SYS_MPROTECT, [ARENA + 4096, LENGTH - 8192, 7, 0, 0, 0]),
+                    0
+                );
+                assert_eq!(editor.calls.len(), 2, "one backing probe per operation");
+                assert!(
+                    editor
+                        .calls
+                        .iter()
+                        .all(|call| matches!(call, Call::Probe(..))),
+                    "hidden reservations allocate no backing and edit no descriptors"
+                );
+                let mut model = table.lock(index.index(), mm).unwrap();
+                assert!(model.is_admitted());
+                let mut rows = Vec::new();
+                model
+                    .observe_range(
+                        ReservationRange::new(ARENA, ARENA + LENGTH).unwrap(),
+                        &mut |row| rows.push(row),
+                    )
+                    .unwrap();
+                assert_eq!(rows.len(), 3);
+                assert_eq!(rows[0].protection, ReservationProtection::NONE);
+                assert_eq!(
+                    rows[1].protection,
+                    ReservationProtection::READ_WRITE_EXECUTE
+                );
+                assert_eq!(rows[2].protection, ReservationProtection::NONE);
+            }
+        }
+
         /// Both native call views enter the same reservation transaction. The
         /// peer observes committed permissions/ranges, not a copied VMA model.
         #[test]
