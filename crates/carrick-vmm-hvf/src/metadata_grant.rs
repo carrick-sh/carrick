@@ -1461,7 +1461,15 @@ pub(crate) fn service_pending_metadata_request(
     custody: &crate::trap::CarrierVmCustody,
     generation: Option<crate::trap::CarrierVmGeneration>,
 ) -> Result<bool, TrapError> {
-    let Some(mailbox) = carrick_el1_abi::metadata_mailbox_host() else {
+    if !request_has_live_vm(custody, generation) {
+        return Ok(false);
+    }
+    // Clone the exact carrier's mapping owner before borrowing its registered
+    // mailbox. No publication or registration lock crosses metadata service.
+    let Some(backing) = custody.file_region_backing.lock().upgrade() else {
+        return Ok(false);
+    };
+    let Some(mailbox) = backing.metadata_mailbox() else {
         return Ok(false);
     };
     let Some(request) = mailbox.claim_request() else {
@@ -3731,6 +3739,15 @@ impl BirthZoneBacking {
     pub(crate) fn retire(&self) {
         self.live.store(false, Ordering::Release);
         self.registration.lock().retire();
+    }
+
+    fn metadata_mailbox(&self) -> Option<&carrick_el1_abi::MetadataGrantMailbox> {
+        let registration = self.registration.lock();
+        let mailbox = registration.metadata_mailbox().ok()? as *const _;
+        // SAFETY: registration authenticates this initialized record. The
+        // caller's backing borrow retains its mapping after this lock is
+        // released, including if the mapping row retires during service.
+        Some(unsafe { &*mailbox })
     }
 
     #[cfg(test)]

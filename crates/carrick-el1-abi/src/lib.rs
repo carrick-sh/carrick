@@ -3380,17 +3380,6 @@ pub trait IpcWindowBacking: Send + Sync {
     fn pool_len(&self) -> usize;
 }
 
-/// Host view of the shared metadata mailbox, if an EL1 region is installed.
-pub fn metadata_mailbox_host() -> Option<&'static MetadataGrantMailbox> {
-    let ptr = get_el1_region_host_ptr();
-    if ptr == 0 {
-        return None;
-    }
-    // SAFETY: the EL1 region owner keeps this shared mapping alive until it
-    // first clears EL1_REGION_HOST_PTR; the mailbox contains only atomics.
-    Some(unsafe { &*((ptr + EL1_METADATA_MAILBOX_OFFSET as usize) as *const MetadataGrantMailbox) })
-}
-
 /// Host view of one slot's anonymous-frame mailbox, if an EL1 region is
 /// installed and `slot` names a persistent vCPU slot.
 pub fn frame_grant_mailbox_host_for_slot(slot: usize) -> Option<&'static FrameGrantMailbox> {
