@@ -70,19 +70,29 @@ remain unwired; no real-KVM pipe-service acceptance is claimed.
 
 ## Continuation status
 
-The earlier prerequisite commits have been preserved and rebased onto the
-admitted main. This continuation has not implemented the missing production
-venue, and no external issue or PR blocks that implementation. Acceptance
-remains unmet; the branch must not be treated as ready to land.
+A fresh checkout audit and explicitly enabled real-KVM run still find the
+production venue absent. The served fixture executes and fails with guest
+exit 90 instead of 0 at `pipe2`, before fork or vector transfer. The native
+Linux execution of the same assembly exits 0 with exactly
+`pipe-vectors=once\n` and empty stderr. These are different outcomes, not a
+passing pipe-service comparison.
 
-The native assembly oracle still exits 0 with `pipe-vectors=once` and empty
-stderr. The freestanding CPL0 build, KVM compile check, Linux and macOS cross
-checks, contract-change check and authority-debt source check pass. The regular
-host-library test run is incomplete: `carrick-el1-linux` terminated with
-SIGKILL before reporting a result. Its serial partition passes all 30 tests,
-and the x86 descriptor-region suite passes all six tests. These checks do not
-prove x86 pipe service, replace the required real-KVM positive witness, or
-confer signed HVF or Docker acceptance.
+The remaining work crosses four production boundaries:
+
+1. Install and publish the IPC authority, then admit the complete descriptor
+   namespace, including existing host descriptions.
+2. Supply the x86 execution capability to the shared IPC engine. The shared
+   dispatcher currently requires `arm_frame()` before entering that engine.
+3. Bind fork, close and retirement to the same authority. X86's native
+   process service currently passes `ipc: None` to `DescriptorNamespace`.
+4. Wire retained pipe creation and transfer dispatch, then enable the KVM
+   served witness and update the strict-writev invariant with the oracle.
+
+The latest continuation adds no runtime implementation. All earlier commits
+remain preserved on the admitted main. There is no external issue or PR
+blocking the remaining implementation; acceptance remains unmet and the
+branch is not ready to land. Compiler checks and prerequisite tests do not
+close either production integration or the real-KVM acceptance finding.
 
 ## Preserved prerequisites
 
