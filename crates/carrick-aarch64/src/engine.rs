@@ -6729,7 +6729,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                     })?;
             } else {
                 page_tables
-                    .set_fork_readonly(range.va, range.len, child_source.as_deref_mut())
+                    .set_fork_readonly_adopting(range.va, range.len, child_source.as_deref_mut())
                     .map_err(|error| {
                         TrapError::Hypervisor(format!(
                             "prepare hvpatch child private fork leaves read-only: {error:?}"
@@ -6837,7 +6837,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                                     range.executable,
                                 )?
                             } else {
-                                manager.set_fork_readonly(range.va, range.len)?
+                                manager.set_fork_readonly_adopting(range.va, range.len)?
                             };
                         }
                         Ok(outcome)

@@ -13681,6 +13681,92 @@ mod guest_cow {
     }
 }
 
+/// A host image row remains historically writable after owner mprotect.
+/// Neither an empty nor a retained fork range can turn that into write intent.
+#[test]
+fn owner_fault_rejects_untagged_readonly_image_with_stale_mapping_permission() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let transport = CarrierForeignMmTransport::new();
+    let mut fixture = retained_reuse_fixture(
+        &transport,
+        791,
+        0x9a01_7a00_0000,
+        0x9b01_7a00_0000,
+        carrick_mmu_core::aarch64::LiveDescriptorOwner::Host,
+    );
+    let (_authority, _lease, _invalidator) = prepare_foreign_cow(&fixture.installed);
+    let tables = fixture.installed.state.page_tables_authority();
+    tables
+        .edit(
+            || panic!("fixture manager"),
+            |editor| {
+                editor.manager.set_rw(TEST_VA, OWNER_LEN, false, None)?;
+                editor.manager.set_readonly(TEST_VA, 4096, false, None)?;
+                let resolver = fixture
+                    .task
+                    .page_table_resolver(editor.base(), Some(fixture.root_host as *mut u8));
+                unsafe { editor.sync_to_host(resolver) }
+            },
+        )
+        .unwrap();
+    tables.select_live_descriptor_owner(carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest);
+    struct DeniedPublication;
+    impl carrick_aarch64::vmm::Stage1Services for DeniedPublication {
+        fn flush(&mut self) -> Result<(), TrapError> {
+            panic!("denied store must not flush")
+        }
+        fn guest_publication_available(&self) -> bool {
+            true
+        }
+        fn publish(
+            &mut self,
+            _: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        ) -> Result<
+            carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+            carrick_aarch64::vmm::GuestPublishError,
+        > {
+            panic!("denied store must not publish")
+        }
+    }
+    for retained_arm in [true, false] {
+        if !retained_arm {
+            fixture.task.cow_armed.lock().ranges.clear();
+        }
+        let before = live_table_words(&fixture);
+        let owners = owner_keys();
+        assert!(
+            fixture
+                .task
+                .mapping_for_range_in(&transport.custody, TEST_VA, 1)
+                .unwrap()
+                .guest_writable
+        );
+        let result = fixture.task.perform_frame_cow(
+            &transport.custody,
+            TEST_VA,
+            carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible,
+            super::super::cow_engine::tests::permission_fault_trigger(TEST_VA, fixture.root_key.0),
+            &mut DeniedPublication,
+        );
+        assert!(
+            matches!(result, Ok(false)),
+            "protected fault must stay NotCow: {result:?}"
+        );
+        assert_eq!(
+            live_table_words(&fixture),
+            before,
+            "including writable neighbor"
+        );
+        assert_eq!(
+            owner_keys(),
+            owners,
+            "no backing allocated for denied store"
+        );
+    }
+}
+
 fn exercise_sole_owner_cow_reuse(guest_writable: bool) {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let _external = ExternalAliasStateRestore::capture();

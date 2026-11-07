@@ -1788,6 +1788,17 @@ impl<'a> Stage1Editor<'a> {
             .set_fork_readonly(base, size, self.arena_source.as_deref_mut())
     }
 
+    /// Record current write intent while arming host-published user leaves.
+    /// Later guest-owner faults must not infer this from mapping metadata.
+    pub fn set_fork_readonly_adopting(
+        &mut self,
+        base: u64,
+        size: usize,
+    ) -> Result<PageTableApplyOutcome, PageTableError> {
+        self.manager
+            .set_fork_readonly_adopting(base, size, self.arena_source.as_deref_mut())
+    }
+
     pub fn set_kernel_readonly(
         &mut self,
         base: u64,
