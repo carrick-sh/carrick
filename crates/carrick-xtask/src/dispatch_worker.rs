@@ -148,9 +148,41 @@ pub(crate) fn owner_collaborator() -> impl FnMut(&str) -> bool {
     fake_collaborators(&[("tjfontaine", "admin")])
 }
 
+/// The owner's requested unit of work, resolved once at admission.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoundKind {
+    #[default]
+    Code,
+    Review {
+        pr: u64,
+    },
+}
+impl RoundKind {
+    pub(crate) fn from_trigger(text: &str) -> Self {
+        let text = text.to_ascii_lowercase();
+        let Some((_, tail)) = text.split_once("review pr #") else {
+            return Self::Code;
+        };
+        let digits = tail.chars().take_while(char::is_ascii_digit).count();
+        if tail[digits..].starts_with(" only")
+            && text.contains("change no code")
+            && text.contains("push nothing")
+            && let Ok(pr) = tail[..digits].parse::<u64>()
+            && pr > 0
+        {
+            Self::Review { pr }
+        } else {
+            Self::Code
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Dispatch {
+    #[serde(default)]
+    pub round_kind: RoundKind,
     pub issue: u64,
     pub title: String,
     pub body: String,
@@ -720,6 +752,12 @@ fn validate_event_with_publication(
         )
     };
     Ok(Dispatch {
+        round_kind: RoundKind::from_trigger(
+            event["comment"]["body"]
+                .as_str()
+                .or_else(|| event["review"]["body"].as_str())
+                .unwrap_or_default(),
+        ),
         issue,
         title: event["issue"]["title"]
             .as_str()
@@ -1211,30 +1249,36 @@ fn agent_lease() -> Result<
 }
 
 fn worker_prompt(dispatch: &Dispatch) -> String {
-    let history = match &dispatch.continuation {
-        Continuation::Owned => format!(
-            "Rebase onto admitted main {} (refs/carrick/dispatch-main) before working.\n\
+    let history = if let RoundKind::Review { pr } = dispatch.round_kind {
+        format!(
+            "Review PR #{pr} at its admitted head only. Change no code, do not rebase, and push nothing. Write a Verdict: APPROVE or Verdict: CHANGES REQUESTED line in ../review.md.\n"
+        )
+    } else {
+        match &dispatch.continuation {
+            Continuation::Owned => format!(
+                "Rebase onto admitted main {} (refs/carrick/dispatch-main) before working.\n\
             Resolve any conflicts in this isolated checkout; preserve earlier workers' commits.\n",
-            dispatch.base
-        ),
-        Continuation::Adopted {
-            pr,
-            tip,
-            rebase: true,
-            ..
-        } => format!(
-            "This continues PR #{pr}, which the director owns. The director consented to a rebase:\n\
+                dispatch.base
+            ),
+            Continuation::Adopted {
+                pr,
+                tip,
+                rebase: true,
+                ..
+            } => format!(
+                "This continues PR #{pr}, which the director owns. The director consented to a rebase:\n\
             rebase the admitted PR head {tip} onto admitted main {} (refs/carrick/dispatch-main),\n\
             resolve conflicts in this isolated checkout, and keep every commit and its author.\n\
             Publication refuses a HEAD that descends from neither {tip} nor admitted main.\n\
             The PR body is not yours to change.\n",
-            dispatch.base
-        ),
-        Continuation::Adopted { pr, tip, .. } => format!(
-            "This continues PR #{pr}, which the director owns. Add commits on top of the admitted PR head {tip};\n\
+                dispatch.base
+            ),
+            Continuation::Adopted { pr, tip, .. } => format!(
+                "This continues PR #{pr}, which the director owns. Add commits on top of the admitted PR head {tip};\n\
             do not rebase or rewrite existing commits; the director owns keeping the branch current with main.\n\
             Publication refuses any HEAD that does not descend from {tip}. The PR body is not yours to change.\n"
-        ),
+            ),
+        }
     };
     let history = if let Some(parent) = &dispatch.parent_branch {
         history
@@ -6513,6 +6557,30 @@ fn publish_with(
     runs: &mut agent_loop::RunCache,
     mode: PublishMode,
 ) -> Result<Option<u64>, ScalerError> {
+    if let RoundKind::Review { pr } = dispatch.round_kind {
+        let target = require_target_pr(root, dispatch)?;
+        if target["number"].as_u64() != Some(pr) {
+            return Err(ScalerError::Guard(
+                "review round target differs from admitted PR",
+            ));
+        }
+        let admitted = admitted_tip(dispatch, receipt);
+        if admitted.is_empty() || receipt.head != admitted {
+            return Err(ScalerError::Guard(
+                "review round may not push commits or change code",
+            ));
+        }
+        let head = target["head"]["sha"].as_str().unwrap_or_default();
+        if head != admitted {
+            return Err(ScalerError::Guard("review round PR head changed"));
+        }
+        if !Applied::load()?.review
+            && let Some(text) = receipt.review_text.as_deref()
+        {
+            publish_review(root, pr, text, &receipt.contract.review, head, token)?;
+        }
+        return Ok(Some(pr));
+    }
     let mut preserve = None;
     let mut result = publish_commits(
         root,
@@ -12813,6 +12881,33 @@ fi
                 validate_event(&value, "tjfontaine", &mut owner_collaborator()).is_ok(),
                 "label {label} refused"
             );
+        }
+    }
+    #[test]
+    fn review_round_kind_is_admitted_and_keeps_the_reviewed_head() {
+        let mut value = event();
+        value.as_object_mut().unwrap().remove("label");
+        value["action"] = "created".into();
+        value["issue"]["state"] = "open".into();
+        value["comment"] = json!({"user":{"login":"tjfontaine","type":"User"},
+            "body":"/agent Review PR #1776 only; change no code and push nothing.",
+            "created_at":"2026-11-07T00:00:00Z","updated_at":"2026-11-07T00:00:00Z"});
+        let admitted = validate_event(&value, "tjfontaine", &mut owner_collaborator()).unwrap();
+        assert_eq!(admitted.round_kind, RoundKind::Review { pr: 1776 });
+        assert!(worker_prompt(&admitted).contains("do not rebase"));
+        let encoded = serde_json::to_string(&admitted).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Dispatch>(&encoded)
+                .unwrap()
+                .round_kind,
+            admitted.round_kind
+        );
+        for text in [
+            "Implement the review publication fix",
+            "review PR #1776 only",
+            "review PR #bad only; change no code and push nothing",
+        ] {
+            assert_eq!(RoundKind::from_trigger(text), RoundKind::Code);
         }
     }
     #[test]

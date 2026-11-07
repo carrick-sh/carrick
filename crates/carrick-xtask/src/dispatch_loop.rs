@@ -2122,7 +2122,10 @@ impl Server<'_> {
             finish
         };
         let brief = brief.or(inferred_brief);
-        if finish == FinishStatus::Blocked && blocker.is_none() {
+        if self.dispatch.round_kind == RoundKind::Code
+            && finish == FinishStatus::Blocked
+            && blocker.is_none()
+        {
             return Err(ScalerError::Guard(
                 "contract violation: Blocked requires a named external blocker (Blocker: #issue, PR URL, or owner decision URL)",
             ));
@@ -2147,9 +2150,14 @@ impl Server<'_> {
         } else {
             "Worker was not invoked.".into()
         };
+        let review_result = if let RoundKind::Review { pr } = self.dispatch.round_kind {
+            Some(self.finish_review(pr))
+        } else {
+            None
+        };
         let mut applied = Applied::load()?;
         applied.review_claimed |= self.history.iter().any(Contract::review_claimed);
-        if applied.review {
+        if applied.review && review_result.is_none() {
             let work = crate::agent_runner::state()?.join("work");
             let live = super::live_branch_tip(&work, &self.dispatch.branch).ok();
             applied.review = applied.review_head.as_deref().is_some_and(|reviewed| {
@@ -2240,11 +2248,14 @@ impl Server<'_> {
         if matches!(applied.body, AppliedBody::Failed(_)) {
             observations.push("PR body publication failed".to_owned());
         }
-        let unpushed = (observations.is_empty() && claimed_done)
+        let unpushed = (review_result.is_none() && observations.is_empty() && claimed_done)
             .then(|| self.unpushed_head())
             .flatten();
         let facts = self.pr.map(|pr| self.round_facts(pr, claimed_done));
-        let stalled = (observations.is_empty() && unpushed.is_none() && claimed_done)
+        let stalled = (review_result.is_none()
+            && observations.is_empty()
+            && unpushed.is_none()
+            && claimed_done)
             .then(|| facts.as_ref().and_then(RoundFacts::stalled))
             .flatten();
         let round = self.chain.as_ref().map_or(1, |c| c.round);
@@ -2281,6 +2292,14 @@ impl Server<'_> {
         let status = if workflow_handoff {
             observations.push("workflow changes were left out; the director must apply `harvest.patch`; automatic continuation stopped".into());
             RoundStatus::Failed
+        } else if let Some(result) = &review_result {
+            match result {
+                Ok(_) => RoundStatus::Done,
+                Err(reason) => {
+                    observations.push(reason.clone());
+                    RoundStatus::Failed
+                }
+            }
         } else if (applied.review_claimed && !applied.review) || applied.last_provider_filter {
             RoundStatus::Blocked
         } else if !observations.is_empty() {
@@ -2321,6 +2340,9 @@ impl Server<'_> {
             .map(|p| format!("{p}\n\n"))
             .chain(facts.as_ref().map(|f| format!("{}\n\n", f.report())))
             .collect();
+        if let Some(Ok(verdict)) = &review_result {
+            checked.push_str(&format!("Published review verdict: {verdict}\n\n"));
+        }
         if unnamed_blocked {
             checked.insert_str(
                 0,
@@ -2523,6 +2545,106 @@ impl Server<'_> {
         }
         Ok(())
     }
+    /// Complete review-only work through the existing publisher, even when
+    /// the coordinator never called publish (#1731). Only GitHub's current
+    /// head and published review bodies decide the outcome.
+    fn finish_review(&mut self, pr: u64) -> Result<String, String> {
+        let check = || -> Result<String, ScalerError> {
+            if self.pr != Some(pr) {
+                return Err(ScalerError::Guard(
+                    "review round target differs from admitted PR",
+                ));
+            }
+            let state = crate::agent_runner::state()?;
+            if let Some(receipt) = worker_checkpoint(&state, &self.dispatch)? {
+                publish_with(
+                    self.root,
+                    &self.dispatch,
+                    &receipt,
+                    &receipt.contract,
+                    &state.join("publication.md"),
+                    &self.token,
+                    &mut self.runs,
+                    PublishMode::Full,
+                )?;
+            }
+            let target = api(self.root, &format!("repos/{REPOSITORY}/pulls/{pr}"))?;
+            let head =
+                target["head"]["sha"]
+                    .as_str()
+                    .filter(|h| sha(h))
+                    .ok_or(ScalerError::Guard(
+                        "no verdict published: current head unreadable",
+                    ))?;
+            let mut reviews = list(self.root, &format!("repos/{REPOSITORY}/pulls/{pr}/reviews"))?;
+            for comment in list(
+                self.root,
+                &format!("repos/{REPOSITORY}/issues/{pr}/comments"),
+            )? {
+                let body = comment["body"].as_str().unwrap_or_default();
+                // A coordinator's progress summary is not a review. The
+                // historical #1776 review starts with its verdict and names
+                // the exact head after `at`, as its retained fixture shows.
+                if !body.trim_start().starts_with("Verdict: ")
+                    || !dispatch_comment_author(&comment["user"])
+                        && !super::reactor::trusted_owner(&comment["user"])
+                {
+                    continue;
+                }
+                let reviewed = review_head_pattern
+                    .captures(body)
+                    .and_then(|c| c.get(1))
+                    .map(|m| m.as_str());
+                if reviewed == Some(head) {
+                    reviews.push(json!({"commit_id":head, "state":"COMMENTED", "body":body,
+                        "html_url":comment["html_url"]}));
+                }
+            }
+            let (review, verdict) = reviews
+                .iter()
+                .rev()
+                .find_map(|review| {
+                    if review["commit_id"].as_str() != Some(head)
+                        || matches!(
+                            review["state"].as_str(),
+                            None | Some("PENDING" | "DISMISSED")
+                        )
+                    {
+                        return None;
+                    }
+                    let verdict = review["body"].as_str()?.lines().find_map(|line| {
+                        match line.trim().strip_prefix("Verdict: ")? {
+                            "APPROVE" => Some("APPROVE"),
+                            "CHANGES REQUESTED" => Some("CHANGES REQUESTED"),
+                            _ => None,
+                        }
+                    })?;
+                    Some((review, verdict))
+                })
+                .ok_or(ScalerError::Guard("no verdict published"))?;
+            let current = api(self.root, &format!("repos/{REPOSITORY}/pulls/{pr}"))?;
+            if current["head"]["sha"].as_str() != Some(head) {
+                return Err(ScalerError::Guard(
+                    "no verdict published: PR head changed during review verification",
+                ));
+            }
+            Applied::record(|a| {
+                a.review = true;
+                a.review_head = Some(head.to_owned());
+                a.review_url = review["html_url"].as_str().map(str::to_owned);
+            })?;
+            Ok(verdict.to_owned())
+        };
+        let mut check = check;
+        check().map_err(|error| {
+            let reason = error.to_string();
+            if reason.contains("may not push") || reason.contains("no verdict published") {
+                reason
+            } else {
+                format!("no verdict published: {reason}")
+            }
+        })
+    }
     /// Done means pushed (#1168): after every worker, whatever its status,
     /// and before any fallback outcome, push the harvested commits as a WIP
     /// checkpoint under the run's advancing lease. Commits only: the loop's
@@ -2538,6 +2660,19 @@ impl Server<'_> {
             let Some(receipt) = worker_checkpoint(&state, &self.dispatch)? else {
                 return Ok(None);
             };
+            if matches!(self.dispatch.round_kind, RoundKind::Review { .. }) {
+                publish_with(
+                    self.root,
+                    &self.dispatch,
+                    &receipt,
+                    &receipt.contract,
+                    &state.join("checkpoint.md"),
+                    &self.token,
+                    &mut self.runs,
+                    PublishMode::CommitsOnly,
+                )?;
+                return Ok(None);
+            }
             let lease = RunLease::load(&state, admitted_tip(&self.dispatch, &receipt))?;
             if receipt.head == lease.current() || produced_nothing(&self.dispatch, &receipt) {
                 return Ok(None);
@@ -4518,6 +4653,7 @@ mod tests {
         Server {
             root,
             dispatch: Dispatch {
+                round_kind: RoundKind::Code,
                 issue: 799,
                 title: "fixture".into(),
                 body: "fixture".into(),
@@ -4687,6 +4823,7 @@ mod tests {
         // Recorded in #1813: #1776/#1709 and #1800/#1794 approved;
         // #1731/#1727 requested changes but left its review in review.md.
         shared_fixture(|root| {
+            std::fs::create_dir_all(crate::agent_runner::state().unwrap()).unwrap();
             for (round, pr, verdict) in [
                 (1776, 1709, "APPROVE"),
                 (1731, 1727, "CHANGES REQUESTED"),
@@ -4694,6 +4831,8 @@ mod tests {
             ] {
                 let mut s = server(root);
                 s.trigger = json!({"body": format!("review PR #{pr} only; change no code and push nothing")});
+                s.dispatch.round_kind =
+                    RoundKind::from_trigger("review PR #800 only; change no code and push nothing");
                 let mut live: Value =
                     serde_json::from_str(&regular_text(&root.join("pr.json")).unwrap()).unwrap();
                 live["head"]["sha"] = json!("a".repeat(40));
@@ -4712,6 +4851,220 @@ mod tests {
                     "round #{round}: {posted}"
                 );
                 assert!(posted.contains(verdict), "round #{round}: {posted}");
+            }
+        });
+    }
+    #[test]
+    fn replay_1813_recorded_outcomes() {
+        let records: Vec<Value> = serde_json::from_str(include_str!(
+            "../tests/fixtures/dispatch-1813-outcomes.json"
+        ))
+        .unwrap();
+        assert_eq!(records.len(), 3);
+        shared_fixture(|root| {
+            for record in &records {
+                let state = crate::agent_runner::state().unwrap();
+                if state.exists() {
+                    std::fs::remove_dir_all(&state).unwrap();
+                }
+                std::fs::create_dir_all(&state).unwrap();
+                let head = record["head"].as_str().unwrap();
+                current_pr(root);
+                let mut pr: Value =
+                    serde_json::from_str(&regular_text(&root.join("pr.json")).unwrap()).unwrap();
+                pr["head"]["sha"] = json!(head);
+                std::fs::write(root.join("pr.json"), pr.to_string()).unwrap();
+                std::fs::write(root.join("prs.json"), json!([pr]).to_string()).unwrap();
+                std::fs::write(root.join("behind"), "2").unwrap();
+                std::fs::write(root.join("remote-tip"), head).unwrap();
+                std::fs::write(root.join("stop-reviews.json"), "[[]]").unwrap();
+                std::fs::write(root.join("layer-comments.json"), "[[]]").unwrap();
+                let mut s = server(root);
+                let trigger = record["trigger"].as_str().unwrap();
+                let actual_kind = RoundKind::from_trigger(trigger);
+                assert_eq!(
+                    actual_kind,
+                    RoundKind::Review {
+                        pr: record["pr"].as_u64().unwrap()
+                    }
+                );
+                // All transport fixture endpoints use #800; classify the
+                // original trigger first, then map only its target number.
+                s.dispatch.round_kind = RoundKind::Review { pr: 800 };
+                s.dispatch.selected_tip = Some(head.into());
+                let old = record["body"].as_str().unwrap();
+                assert_eq!(outcome_status(old), Some("Failed"));
+                assert!(old.contains("commits pushed this round: 0"));
+                assert!(old.contains("commits behind main: 2"));
+                if let Some(body) = record["published_comment"]["body"].as_str() {
+                    std::fs::write(
+                        root.join("layer-comments.json"),
+                        json!([[{
+                            "body":body,"user":{"login":"github-actions[bot]","type":"Bot"},
+                            "html_url":record["published_comment"]["source"]
+                        }]])
+                        .to_string(),
+                    )
+                    .unwrap();
+                } else {
+                    std::fs::create_dir_all(state.join("work")).unwrap();
+                    std::fs::write(root.join("replay-head"), head).unwrap();
+                    let contract = Contract {
+                        status: ContractStatus::Done,
+                        summary: "Read-only review".into(),
+                        tests: vec![],
+                        risks: vec![],
+                        loop_summary: None,
+                        review: Review::Published(true),
+                    };
+                    s.used.workers = 1;
+                    s.history.push(contract.clone());
+                    let receipt = super::super::Receipt {
+                        head: head.into(),
+                        checkpointed: false,
+                        base: s.dispatch.base.clone(),
+                        branch: s.dispatch.branch.clone(),
+                        exit_code: 0,
+                        expected_tip: head.into(),
+                        pr_body: None,
+                        review_text: Some(record["review_text"].as_str().unwrap().into()),
+                        worker: s.dispatch.worker.clone(),
+                        contract,
+                    };
+                    std::fs::write(
+                        state.join("receipt.json"),
+                        serde_json::to_vec(&receipt).unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        publish(
+                            root,
+                            &s.dispatch,
+                            &receipt,
+                            &receipt.contract,
+                            &state.join("publication.md"),
+                            &s.token,
+                            &mut s.runs
+                        )
+                        .unwrap(),
+                        Some(800)
+                    );
+                }
+                // Replay the coordinator's failure classification too: the
+                // published verdict owns a review round's outcome.
+                s.outcome(ContractStatus::Failed, "Review finished without pushing")
+                    .unwrap();
+                let posted = regular_text(&root.join("posted.md")).unwrap();
+                assert_eq!(
+                    outcome_status(&posted),
+                    Some("Done"),
+                    "{}: {posted}",
+                    record["source"]
+                );
+                assert!(
+                    posted.contains(record["verdict"].as_str().unwrap()),
+                    "{posted}"
+                );
+                if record["published_comment"].is_null() {
+                    let request = regular_text(&root.join("published-review.json")).unwrap();
+                    assert!(request.contains("worker's own review"));
+                    assert!(request.contains(head));
+                }
+                assert!(!root.join("push.args").exists());
+            }
+        });
+    }
+    fn review_checkpoint<'a>(root: &'a Path, head: &str, verdict: &str) -> Server<'a> {
+        current_pr(root);
+        let live: Value =
+            serde_json::from_str(&regular_text(&root.join("pr.json")).unwrap()).unwrap();
+        std::fs::write(root.join("prs.json"), json!([live]).to_string()).unwrap();
+        let mut s = server(root);
+        s.dispatch.round_kind = RoundKind::Review { pr: 800 };
+        s.dispatch.selected_tip = Some("a".repeat(40));
+        s.used.workers = 1;
+        let contract = Contract {
+            status: ContractStatus::Done,
+            summary: "Review complete".into(),
+            tests: vec![],
+            risks: vec![],
+            loop_summary: None,
+            review: Review::Published(true),
+        };
+        s.history.push(contract.clone());
+        let state = crate::agent_runner::state().unwrap();
+        std::fs::create_dir_all(state.join("work")).unwrap();
+        std::fs::write(root.join("replay-head"), head).unwrap();
+        std::fs::write(root.join("replay-commits"), "1").unwrap();
+        let receipt = super::super::Receipt {
+            head: head.into(),
+            checkpointed: false,
+            base: s.dispatch.base.clone(),
+            branch: s.dispatch.branch.clone(),
+            exit_code: 0,
+            expected_tip: "a".repeat(40),
+            pr_body: None,
+            review_text: Some(format!("Verdict: {verdict}\n\nThree P1 findings.")),
+            worker: s.dispatch.worker.clone(),
+            contract,
+        };
+        std::fs::write(
+            state.join("receipt.json"),
+            serde_json::to_vec(&receipt).unwrap(),
+        )
+        .unwrap();
+        s
+    }
+    #[test]
+    fn replay_1813_publishes_without_coordinator_publish() {
+        shared_fixture(|root| {
+            let mut s = review_checkpoint(root, &"a".repeat(40), "CHANGES REQUESTED");
+            // Even without a coordinator publish request, outcome must
+            // finish the existing worker-review publication without a push.
+            s.outcome(ContractStatus::Done, "Review only; push nothing")
+                .unwrap();
+            let posted = regular_text(&root.join("posted.md")).unwrap();
+            assert!(posted.contains("Dispatch outcome: Done"), "{posted}");
+            assert!(posted.contains("CHANGES REQUESTED"), "{posted}");
+            let request = regular_text(&root.join("published-review.json")).unwrap();
+            assert!(request.contains("worker's own review"), "{request}");
+            assert!(request.contains("Three P1 findings"), "{request}");
+            assert!(!root.join("push.args").exists());
+        });
+    }
+    #[test]
+    fn replay_1813_review_round_refuses_commits_at_checkpoint_and_outcome() {
+        shared_fixture(|root| {
+            let mut s = review_checkpoint(root, &"b".repeat(40), "APPROVE");
+            assert!(s.checkpoint_publish().unwrap().contains("may not push"));
+            s.outcome(ContractStatus::Done, "Review finished").unwrap();
+            let posted = regular_text(&root.join("posted.md")).unwrap();
+            assert!(posted.contains("Dispatch outcome: Failed"), "{posted}");
+            assert!(posted.contains("may not push"), "{posted}");
+            assert!(!root.join("published-review.json").exists());
+            assert!(!root.join("push.args").exists());
+        });
+    }
+    #[test]
+    fn replay_1813_review_round_requires_current_published_verdict() {
+        shared_fixture(|root| {
+            current_pr(root);
+            let mut s = server(root);
+            s.dispatch.round_kind = RoundKind::Review { pr: 800 };
+            for reviews in [
+                json!([[]]),
+                json!([[{
+                    "commit_id": "b".repeat(40), "state": "COMMENTED", "body": "Verdict: APPROVE"
+                }]]),
+                json!([[{
+                    "commit_id": "a".repeat(40), "state": "PENDING", "body": "Verdict: APPROVE"
+                }]]),
+            ] {
+                std::fs::write(root.join("stop-reviews.json"), reviews.to_string()).unwrap();
+                s.outcome(ContractStatus::Done, "Review claimed").unwrap();
+                let posted = regular_text(&root.join("posted.md")).unwrap();
+                assert!(posted.contains("Dispatch outcome: Failed"), "{posted}");
+                assert!(posted.contains("no verdict published"), "{posted}");
             }
         });
     }
@@ -8644,6 +8997,17 @@ fi
                 (
                     "gh",
                     r#"#!/bin/sh
+if test "$1 $2 $3" = 'api -X POST' && test "$4" = repos/carrick-sh/carrick/pulls/800/reviews; then
+ /usr/bin/python3 - "$6" "$RUNNER_TEMP" <<'REVIEW'
+import json,pathlib,sys
+r=pathlib.Path(sys.argv[2]);v=json.loads(pathlib.Path(sys.argv[1]).read_text())
+(r/"published-review.json").write_text(json.dumps(v))
+v.update(state="COMMENTED",html_url="https://github.com/carrick-sh/carrick/pull/800#pullrequestreview-123")
+(r/"stop-reviews.json").write_text(json.dumps([[v]]))
+print(json.dumps({"html_url":v["html_url"]}))
+REVIEW
+ exit 0
+fi
 if test "$1 $2 $3" = 'api -X PATCH'; then
  cp "${6#body=@}" "$RUNNER_TEMP/applied-body.md"
  exit 0
