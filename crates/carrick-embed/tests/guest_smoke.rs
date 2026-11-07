@@ -781,6 +781,16 @@ printf '{"exit_code":0}\n'
     )
     .expect("write CLI witness");
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("executable");
+    // Known-answer negative control: reproduce the previous command's exact
+    // override and prove the fake CLI rejects it before checking production.
+    let previous = cli_json_process(&store, &bin, "scratch-witness-red")
+        .env("CARRICK_HOME", store.root())
+        .output()
+        .expect("run previous CLI environment");
+    assert!(
+        !previous.status.success(),
+        "old scratch override must be rejected"
+    );
     let output = cli_json_process(&store, &bin, "scratch-witness")
         .output()
         .expect("run CLI command builder");
