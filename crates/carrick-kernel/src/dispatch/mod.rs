@@ -690,6 +690,15 @@ mod perf;
 pub mod exec_files;
 pub mod executable_authority;
 pub(crate) mod proc;
+
+/// Execute the existing getrandom handler on bounded native-service staging.
+/// Ticket and exact-MM authentication belong to the carrier transport.
+pub fn serve_native_entropy(
+    record: &mut [u8],
+) -> Result<(), carrick_core_abi::service::entropy::InvalidEntropyRecord> {
+    proc::serve_native_entropy(record)
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub use proc::build_hvpatch_waitid_siginfo;
 mod proctitle;

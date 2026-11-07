@@ -453,6 +453,25 @@ impl NativeService {
         self.exec_payload.as_ref().map(RetainedExecPayload::bytes)
     }
 
+    /// Serve authenticated, retained entropy staging and publish its reply
+    /// before acknowledging the same ticket. The adapter owns RNG semantics.
+    pub fn serve_entropy(
+        mut self,
+        serve: impl FnOnce(&mut [u8]) -> bool,
+    ) -> Result<carrick_sched_core::WakeEffects, TrapError> {
+        if !matches!(
+            self.request().operation,
+            carrick_core_abi::service::ServiceOperation::Entropy { .. }
+        ) {
+            return Err(stale());
+        }
+        let record = self.exec_payload.as_mut().ok_or_else(stale)?;
+        if !serve(record.bytes_mut()) {
+            return Err(stale());
+        }
+        self.finish_exec_ticket(|ticket| ticket.complete(true).map_err(|_| stale()))
+    }
+
     /// Serve the ring-staged host-file record through the retained file
     /// capability the request names. The reply is written before the ticket
     /// completes; a refusal leaves no reply and answers counted ENOSYS.
@@ -1657,6 +1676,15 @@ pub(super) fn take(
                         )?)
                     }
                     carrick_core_abi::service::ServiceOperation::HostFile { payload, .. } => {
+                        Some(retain_exec_payload(
+                            custody,
+                            region,
+                            ticket.request().identity.birth.mm,
+                            payload.address().raw(),
+                            payload.length().raw(),
+                        )?)
+                    }
+                    carrick_core_abi::service::ServiceOperation::Entropy { payload } => {
                         Some(retain_exec_payload(
                             custody,
                             region,

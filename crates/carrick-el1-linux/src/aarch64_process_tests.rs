@@ -3818,16 +3818,14 @@ fn arm_root_setup_enters_production_process_venue() {
     physical.shutdown_without_child();
 }
 
-// These are deliberately runnable red witnesses, not acceptance results.
-// Entropy needs a reviewed carrier service protocol before these can be enabled.
+// These witnesses retain two live processes through staging, host service,
+// ticket acknowledgment and native resume.
 #[test]
-#[ignore = "#1338: native-child entropy service is not implemented"]
 fn arm_native_fork_child_getrandom_default_returns_eight_bytes() {
     native_fork_child_getrandom(0);
 }
 
 #[test]
-#[ignore = "#1338: native-child entropy service is not implemented"]
 fn arm_native_fork_child_getrandom_nonblock_returns_eight_bytes() {
     native_fork_child_getrandom(1);
 }
@@ -3958,19 +3956,94 @@ fn native_fork_child_getrandom(flags: u64) {
         None,
         |_| core::ptr::null_mut(),
     );
-    if route == CompletionRoute::Forward {
-        // The same final entry boundary used after no ring stage serves a call.
-        let _ = crate::dispatch::native_unstaged_exit(
-            &mut frame,
-            &child_task.linux,
-            carrick_el1_abi::Action::Forward,
-            || registry.thread_group_owner(fixture.zone, page, child_task.visible_pid().unwrap()),
-            &counters,
+    assert_eq!(route, CompletionRoute::Forward);
+    let (address, capacity, flags, requested) =
+        crate::dispatch::native_entropy_stage(&frame, &crate::file::HardwareValidator);
+    assert!(matches!(
+        entry
+            .begin_entropy_service(address, capacity, flags, requested)
+            .unwrap(),
+        crate::native_process_runtime::NativeResume::Left(None)
+    ));
+    assert!(entry.take_handoff_receipt().is_some());
+    drop(entry);
+    let notice = child_task.service_notice.take().unwrap().unwrap();
+    // SAFETY: the live child retains this control slot in fixture-owned stock.
+    let child_control = unsafe {
+        &*(child_task.metadata.control_slot.load(Ordering::Acquire) as *const ThreadControlSlot)
+    };
+    let queue = fixture
+        .zone
+        .object_wait(
+            carrick_sched_core::object_wait::ObjectWaitKey::native_service(child.record).unwrap(),
+            &carrick_sched_core::ShortLockSpin,
+        )
+        .unwrap();
+    // SAFETY: this fixture owns the parked member and its service queue.
+    let ticket = unsafe {
+        carrick_core_abi::service::ServiceCell::claim_notice(
+            &child_control.service,
+            notice,
+            NonZeroU64::MIN,
+            fixture.zone.record(child.record.id).identity(),
+        )
+    }
+    .unwrap();
+    let carrick_core_abi::service::ServiceOperation::Entropy { payload } =
+        ticket.request().operation
+    else {
+        panic!("ARM child must stage entropy, not an ordinal crossing");
+    };
+    // SAFETY: the pending ring service retains this exact staging allocation
+    // through the ticket's acknowledgment; the member remains parked.
+    let record = unsafe {
+        core::slice::from_raw_parts_mut(
+            payload.address().raw() as *mut u8,
+            payload.length().raw() as usize,
+        )
+    };
+    carrick_kernel::dispatch::serve_native_entropy(record).unwrap();
+    assert!(ticket.complete(true).is_ok());
+    queue
+        .notify_object(
+            fixture.slot,
+            &mut carrick_sched_core::WakeEffects::default(),
+        )
+        .unwrap();
+    drop(queue);
+    // The still-live parent is also runnable; keep its queue custody while
+    // selecting the completed child's service continuation.
+    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    if selected.record != child.record.id {
+        assert_eq!(selected.record, parent_binding.record.id);
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(fixture.slot, selected.record)
+                .is_queued()
+        );
+        assert_eq!(
+            fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+            child.record.id
         );
     }
-    assert_eq!(
-        frame.x[0] as i64, 8,
-        "native child getrandom(flags={flags})"
+    let saved = unsafe { runtime.record_binding(child.record) }
+        .unwrap()
+        .words;
+    let mut entry = runtime
+        .enter_registered(
+            registry,
+            source,
+            child_task,
+            child.address,
+            &saved,
+            &mut child_service,
+        )
+        .unwrap();
+    let resumed = entry.resume_checkpoint(|_| Ok(None)).unwrap();
+    assert!(
+        matches!(resumed, crate::native_process_runtime::NativeResume::Returned(result) if result.raw() == 8),
+        "native child getrandom(flags={flags}) must return eight only after completion and resume"
     );
     assert_eq!(counters.refused_child[278].load(Ordering::Acquire), 0);
 }
