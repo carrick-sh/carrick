@@ -1,18 +1,11 @@
 //! Credential masking for bounded scaler command diagnostics. No publication gate.
 use crate::ci_scaler::ScalerError;
-use std::os::unix::fs::OpenOptionsExt;
 
-const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const REFUSAL: &str = "diagnostic redaction refused unsafe credential state";
 pub(crate) struct DiagnosticSecrets {
     secrets: Vec<String>,
 }
 impl DiagnosticSecrets {
-    /// Every secret value captured, for consumers that register them
-    /// elsewhere (the live log's `::add-mask::`).
-    pub(crate) fn values(&self) -> &[String] {
-        &self.secrets
-    }
     fn add(&mut self, value: &str) {
         if !value.is_empty() && !self.secrets.iter().any(|s| s == value) {
             self.secrets.push(value.to_owned());
@@ -53,54 +46,13 @@ impl DiagnosticSecrets {
             _ => {}
         }
     }
-    /// Every credential file under the runner's agent `state`, by exact value.
-    fn state_files(&mut self, state: &std::path::Path) -> Result<(), ScalerError> {
-        for path in [
-            "redaction-secrets.json",
-            "home/.codex/auth.json",
-            "home/.gemini/antigravity-cli/antigravity-oauth-token",
-            "loop-home/.gemini/antigravity-cli/antigravity-oauth-token",
-            // The owner's Copilot PAT (#1474).
-            "home/.copilot-dispatch/token",
-        ] {
-            let path = state.join(path);
-            match std::fs::symlink_metadata(&path) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e.into()),
-                Ok(meta) if meta.is_file() && meta.len() <= MAX_FILE_BYTES => {}
-                _ => return Err(ScalerError::Guard(REFUSAL)),
-            }
-            let value = std::fs::read_to_string(&path)?;
-            if path.ends_with("redaction-secrets.json") {
-                self.json_values(
-                    &serde_json::from_str(&value).map_err(|_| ScalerError::Guard(REFUSAL))?,
-                );
-            } else {
-                self.add(&value);
-            }
-        }
-        Ok(())
-    }
-    /// Capture once before agent execution, never from agent-modified state.
+    /// Capture the process's GitHub credentials by exact value.
     pub(crate) fn capture() -> Result<Self, ScalerError> {
         let mut gate = Self { secrets: vec![] };
-        for key in [
-            "GH_TOKEN",
-            "GITHUB_TOKEN",
-            "AGENT_DIRECTOR_TOKEN",
-            "DISPATCH_BOARD_TOKEN",
-            "DISPATCH_PUBLISH_TOKEN",
-        ] {
+        for key in ["GH_TOKEN", "GITHUB_TOKEN"] {
             if let Ok(value) = std::env::var(key) {
                 gate.add(&value);
             }
-        }
-        // On-demand App tokens (#1012) this process minted.
-        for value in crate::dispatch_mint::minted_secrets() {
-            gate.add(&value);
-        }
-        if let Ok(state) = crate::agent_runner::state() {
-            gate.state_files(&state)?;
         }
         Ok(gate)
     }
@@ -158,34 +110,10 @@ fn token_shape(bytes: &[u8], prefix: &[u8], jwt: bool) -> bool {
             length >= 8 && (!jwt || suffix.get(length) == Some(&b'.'))
         })
 }
-/// Persist earlier-step secrets outside artifacts; the run captures them once.
-pub(crate) fn remember() -> Result<(), ScalerError> {
-    let gate = DiagnosticSecrets::capture()?;
-    let path = crate::agent_runner::state()?.join("redaction-secrets.json");
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)?;
-    use std::io::Write;
-    file.write_all(&serde_json::to_vec(&gate.secrets)?)?;
-    Ok(())
-}
 pub(crate) fn redact(bytes: &[u8]) -> String {
     DiagnosticSecrets::capture()
         .map(|gate| gate.diagnostic(bytes))
         .unwrap_or_else(|_| "[REDACTED: credential state unavailable]".into())
-}
-/// Redact the whole stream before cutting to `limit` tail bytes: a credential
-/// split by the cut would lose the prefix the redactor recognises it by (#1458).
-pub(crate) fn redact_tail(bytes: &[u8], limit: usize) -> String {
-    let redacted = redact(bytes);
-    let mut start = redacted.len().saturating_sub(limit);
-    while !redacted.is_char_boundary(start) {
-        start += 1;
-    }
-    redacted[start..].to_owned()
 }
 #[cfg(test)]
 mod tests {
@@ -198,30 +126,6 @@ mod tests {
                 .is_ok()
         );
         Ok(())
-    }
-    /// #1474: the Copilot PAT is redacted by its exact value, not only by
-    /// its `github_pat_` shape.
-    #[test]
-    fn the_copilot_token_file_is_redacted_by_value() {
-        let state = tempfile::tempdir().unwrap();
-        let token = state.path().join("home/.copilot-dispatch/token");
-        std::fs::create_dir_all(token.parent().unwrap()).unwrap();
-        let secret = "github_pat_11FIXTURE_copilotOnlyValue0123";
-        std::fs::write(&token, secret).unwrap();
-        let mut gate = super::DiagnosticSecrets { secrets: vec![] };
-        gate.state_files(state.path()).unwrap();
-        assert!(
-            gate.secrets.iter().any(|s| s == secret),
-            "not captured by value"
-        );
-        let text = format!("worker said {secret} once");
-        assert!(gate.check(text.as_bytes()).is_err());
-        assert!(!gate.diagnostic(text.as_bytes()).contains(secret));
-        // Without the file, nothing is captured by value.
-        let empty = tempfile::tempdir().unwrap();
-        let mut none = super::DiagnosticSecrets { secrets: vec![] };
-        none.state_files(empty.path()).unwrap();
-        assert!(none.secrets.is_empty());
     }
     #[test]
     fn credential_shapes_are_removed_from_diagnostics() {
@@ -245,14 +149,5 @@ mod tests {
             super::redact(b"curl: connection refused"),
             "curl: connection refused"
         );
-    }
-    #[test]
-    fn redact_tail_redacts_before_cutting_on_char_boundary() {
-        let secret = "Q7".repeat(30);
-        let text = format!("auth ghp_{secret}\n{}é\n", "y".repeat(60));
-        let tail = super::redact_tail(text.as_bytes(), 80);
-        assert!(tail.len() <= 80, "{}", tail.len());
-        assert!(!tail.contains(&secret[secret.len() - 16..]), "{tail}");
-        assert!(tail.contains("[REDACTED]"), "{tail}");
     }
 }

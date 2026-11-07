@@ -49,9 +49,7 @@ const GUEST_SCRIPTS: [GuestScript; 2] = [
 /// hook admits only its approved SHA.
 fn guest_script_source(script: &GuestScript, admission: &Admission) -> Result<String, ScalerError> {
     match admission {
-        Admission::Standing | Admission::Agent if script.path == HOOK_PATH => {
-            standing_hook_script()
-        }
+        Admission::Standing if script.path == HOOK_PATH => standing_hook_script(),
         _ => Ok(script.source.to_owned()),
     }
 }
@@ -68,28 +66,6 @@ const GUEST_ASSIGNMENT_APPROVE: &str = r#"cd /run/carrick-ci || exit 1
 if [ -e approved-policy ]; then [ "$(cat approved-policy)" = "$1" ] && exit 0; exit 4; fi
 umask 022
 printf '%s\n' "$1" > approved-policy.tmp && chmod 644 approved-policy.tmp && mv approved-policy.tmp approved-policy"#;
-/// Root: print the tool server's pending token request (#1012) under the
-/// request file's own lock. Exit 5 = this clone has no mint channel. The
-/// runner owns the file and could hold its lock forever, so every guest mint
-/// script waits at most three seconds for it (exit 6) and is killed after ten.
-const GUEST_MINT_READ: &str = r#"cd /run/carrick-ci || exit 1
-[ -f token-request ] && [ ! -L token-request ] || exit 5
-exec 9<token-request && timeout 10 /usr/bin/flock -w 3 9 || exit 6
-head -c 4097 <&9"#;
-/// Root: write stdin (the answer) into the runner-owned 0600 response file
-/// under its lock. The file and the root-owned directory are never replaced,
-/// so the write cannot follow a planted link; the token never enters argv.
-const GUEST_MINT_RESPOND: &str = r#"cd /run/carrick-ci || exit 1
-[ -f token-response ] && [ ! -L token-response ] || exit 5
-exec 9<token-response && timeout 10 /usr/bin/flock -w 3 9 || exit 6
-timeout 10 head -c 8192 > token-response"#;
-/// Root: empty the request under its lock, only while it still holds the
-/// nonce `$1` (any request when `$1` is empty): a request written after the
-/// controller's read is never wiped.
-const GUEST_MINT_CLEAR: &str = r#"cd /run/carrick-ci || exit 1
-[ -f token-request ] && [ ! -L token-request ] || exit 5
-exec 9<token-request && timeout 10 /usr/bin/flock -w 3 9 || exit 6
-if [ -z "$1" ] || grep -qF -- "\"$1\"" token-request; then : > token-request; fi"#;
 fn script_install_command(path: &str, source: &str) -> String {
     format!(
         "umask 077; printf '%s' {} > {} && chmod 755 {}",
@@ -1369,7 +1345,7 @@ fn boot_and_register(
         row,
         &["/bin/sh", "-c", "rm -f /usr/local/bin/carrick-ci-admit-job"],
     )?;
-    let standing = matches!(admission, Admission::Standing | Admission::Agent);
+    let standing = matches!(admission, Admission::Standing);
     if standing {
         // The re-vet half of the hook runs the template's own xtask; refuse a
         // template whose xtask predates it rather than fail a job at set-up.
@@ -1388,34 +1364,17 @@ fn boot_and_register(
             ));
         }
     }
-    if matches!(admission, Admission::Agent) {
-        // Agent policy parsing and assignment authorization shipped with this
-        // command. Old template binaries must fail before minting a runner.
-        pve.agent(
-            row,
-            &["/usr/local/bin/carrick-xtask", "agent-runner", "--help"],
-        )?;
-    }
     // Re-vet the reserved run now and bind the runner to it: the hook admits
     // this run, attempt, SHA and owner-only dispatch actors. A standing clone that
     // GitHub assigns another job asks the controller to re-vet that one.
     let policy = gh.vet(admission, row.key)?;
     // The job-start hook reads this root-owned policy; jobs cannot write it.
     // Only the runner-owned rendezvous request is writable by the hook.
-    let mut rendezvous = if standing {
+    let rendezvous = if standing {
         format!(" && install -m 600 -o runner -g runner /dev/null {GUEST_STATE}/assignment.json")
     } else {
         String::new()
     };
-    if matches!(admission, Admission::Agent) {
-        // On-demand dispatch tokens (#1012): runner-owned request and
-        // response files in the root-owned state directory.
-        for file in [mint::REQUEST_FILE, mint::RESPONSE_FILE] {
-            rendezvous.push_str(&format!(
-                " && install -m 600 -o runner -g runner /dev/null {GUEST_STATE}/{file}"
-            ));
-        }
-    }
     pve.agent(
         row,
         &[
@@ -1705,12 +1664,9 @@ fn reconcile_one(
     }
     let lane_pve = pve.for_lane(row.lane)?;
     let pve = &lane_pve;
-    let lane_admission = row.lane.admission();
-    let approval = if row.lane == CloneLane::Agent {
-        (approval.0, &lane_admission)
-    } else {
-        approval
-    };
+    // Agent-lane rows predate the Actions dispatch retirement: they are
+    // reconciled and reaped, never resumed, since no agent run is admitted.
+    let resumable = (row.lane == CloneLane::Kvm).then_some(approval);
     let present = pve.inventory()?.iter().any(|v| v.id == row.vm.get());
     let task = match &row.task {
         Some(task) => pve.task_state(task)?,
@@ -1796,7 +1752,9 @@ fn reconcile_one(
                 None,
                 false,
             )?;
-            if pending_owned_job(&row, &job, &run, approval.1) {
+            if let Some(approval) = resumable
+                && pending_owned_job(&row, &job, &run, approval.1)
+            {
                 println!(
                     "vm={} resuming completed clone in place; error history retained",
                     row.vm.get()
@@ -2134,106 +2092,6 @@ impl assignment::AssignmentExchange for GuestExchange<'_> {
         }
     }
 }
-/// The standing transport of on-demand dispatch tokens (#1012).
-struct GuestMint<'a> {
-    pve: &'a Pve,
-    row: Record,
-}
-impl GuestMint<'_> {
-    fn run(
-        &self,
-        script: &str,
-        arg: &str,
-        input: Option<&str>,
-    ) -> Result<GuestOutput, ScalerError> {
-        let output =
-            self.pve
-                .agent_output_input(&self.row, &["/bin/sh", "-c", script, "sh", arg], input)?;
-        match output.exit {
-            GuestExit(0) => Ok(output),
-            GuestExit(5) => Err(ScalerError::Guard("clone has no mint channel")),
-            GuestExit(6) => Err(ScalerError::External("guest mint file lock held")),
-            _ => Err(ScalerError::External("guest mint exchange")),
-        }
-    }
-}
-impl mint::MintExchange for GuestMint<'_> {
-    fn read(&mut self) -> Result<Option<Vec<u8>>, ScalerError> {
-        let output = self.run(GUEST_MINT_READ, "", None)?;
-        Ok((!output.stdout.is_empty()).then(|| output.stdout.into_bytes()))
-    }
-    fn respond(&mut self, response: &mint::MintResponse) -> Result<(), ScalerError> {
-        self.run(
-            GUEST_MINT_RESPOND,
-            "",
-            Some(&serde_json::to_string(response)?),
-        )
-        .map(drop)
-    }
-    fn clear(&mut self, nonce: Option<&mint::MintNonce>) -> Result<(), ScalerError> {
-        // The nonce is 32 hex digits; it is safe as an argument.
-        self.run(
-            GUEST_MINT_CLEAR,
-            nonce.map_or("", mint::MintNonce::as_str),
-            None,
-        )
-        .map(drop)
-    }
-}
-/// How often one agent clone's request file is polled.
-const MINT_POLL: Duration = Duration::from_secs(3);
-/// Serve token requests from running, approved agent clones. Failures are
-/// logged; the request stays pending and the tool server's bounded wait
-/// falls back to the job token.
-fn serve_mints(
-    pve: &Pve,
-    minter: &impl mint::MintApi,
-    ledger: &mut Ledger,
-    path: &Path,
-    polled: &mut std::collections::BTreeMap<String, Instant>,
-    held: &mut mint::HeldTokens,
-) {
-    let revoked = held.revoke_finished(minter, ledger);
-    if revoked > 0 {
-        println!("revoked {revoked} dispatch token(s) of finished clones");
-    }
-    polled.retain(|name, _| {
-        ledger
-            .rows
-            .iter()
-            .any(|r| r.name == *name && r.state == State::Running)
-    });
-    let open: Vec<Record> = ledger
-        .rows
-        .iter()
-        .filter(|r| r.lane == CloneLane::Agent && r.state == State::Running && r.approved)
-        .filter(|r| {
-            polled
-                .get(&r.name)
-                .is_none_or(|at| at.elapsed() >= MINT_POLL)
-        })
-        .cloned()
-        .collect();
-    for row in open {
-        polled.insert(row.name.clone(), Instant::now());
-        let vm = row.vm.get();
-        let name = row.name.clone();
-        let mut exchange = GuestMint { pve, row };
-        match mint::serve_mint(minter, &mut exchange, &name, ledger, path, held) {
-            Ok(mint::MintServed::Idle) => {}
-            Ok(mint::MintServed::Ignored) => {
-                println!("vm={vm} token request ignored (malformed or already answered)");
-            }
-            Ok(mint::MintServed::Minted(scope)) => {
-                println!("vm={vm} minted a {} token", scope.label());
-            }
-            Ok(mint::MintServed::Refused(reason)) => {
-                println!("vm={vm} token request refused: {}", reason.describe());
-            }
-            Err(error) => eprintln!("vm={vm} token request failed: {error}; retried next poll"),
-        }
-    }
-}
 /// Serve every standing clone's assignment rendezvous (#333): GitHub may
 /// assign a clone any queued job with its labels, not the one it was minted
 /// for. Runs on a dedicated worker, independent of reconciliation, provisioning
@@ -2425,7 +2283,6 @@ pub(super) fn controller(
         matches!(admission, Admission::Standing),
         |name| std::env::var(name).ok(),
     )?;
-    let agents = enabled.agents;
     // Cross-host claims (#1597) are on for every standing controller, with
     // an exact `CARRICK_JOB_CLAIMS=0` opt-out; a follower needs them.
     let mut claims = (matches!(admission, Admission::Standing)
@@ -2463,33 +2320,11 @@ pub(super) fn controller(
         let path = path.clone();
         let assignment_pve = Pve::local()?;
         let mut settled = Vec::new();
-        let minter = mint::AppMinter {
-            gh: &Github,
-            key: mint::AppKey::load()?,
-        };
-        if agents && !mint::MintApi::configured(&minter) {
-            eprintln!(
-                "no {} credential: dispatch token requests are refused",
-                mint::KEY_CREDENTIAL
-            );
-        }
-        let mut polled = std::collections::BTreeMap::new();
-        let mut held = mint::HeldTokens::default();
         Some(assignment::AssignmentService::start(move || {
             let pass = (|| -> Result<(), ScalerError> {
                 let mut ledger = publication.snapshot()?;
                 ledger.publication = Some(publication.clone());
                 revet_assignments(&assignment_pve, &Github, &mut ledger, &path, &mut settled);
-                if agents {
-                    serve_mints(
-                        &assignment_pve,
-                        &minter,
-                        &mut ledger,
-                        &path,
-                        &mut polled,
-                        &mut held,
-                    );
-                }
                 Ok(())
             })();
             if let Err(error) = pass {
@@ -2684,53 +2519,41 @@ fn admit_one(
         {
             continue;
         }
-        let policy = if lane == CloneLane::Agent {
-            Admission::Agent
-        } else {
-            original_admission.clone()
-        };
-        if let Some(job) = select_demand(
-            ledger,
-            path,
-            if lane == CloneLane::Kvm {
-                kvm_demand.clone()
-            } else {
-                gh.demand(&policy, lane.labels())?
-            },
-            |job| {
-                // A follower leaves fresh demand to the leader (#1597).
-                if let Some(claims) = claims.as_deref_mut()
-                    && !claims.ready(job, Instant::now())
+        // Only the KVM lane has demand: the agent lane admits no run since
+        // Actions dispatch was retired.
+        if lane != CloneLane::Kvm {
+            continue;
+        }
+        let policy = original_admission.clone();
+        if let Some(job) = select_demand(ledger, path, kvm_demand.clone(), |job| {
+            // A follower leaves fresh demand to the leader (#1597).
+            if let Some(claims) = claims.as_deref_mut()
+                && !claims.ready(job, Instant::now())
+            {
+                return Err(ScalerError::Deferred("follower grace period"));
+            }
+            gh.vet(&policy, job)?;
+            // Claim only a vetted job, before any reservation, so two
+            // hosts never both boot a clone for it. A claim error (GitHub
+            // degraded) defers this job only, so it never freezes the pass.
+            if let Some(claims) = claims.as_deref_mut() {
+                match super::claim::claim(&mut super::claim::github_api(), job, claims.host, now()?)
                 {
-                    return Err(ScalerError::Deferred("follower grace period"));
-                }
-                gh.vet(&policy, job)?;
-                // Claim only a vetted job, before any reservation, so two
-                // hosts never both boot a clone for it. A claim error (GitHub
-                // degraded) defers this job only, so it never freezes the pass.
-                if let Some(claims) = claims.as_deref_mut() {
-                    match super::claim::claim(
-                        &mut super::claim::github_api(),
-                        job,
-                        claims.host,
-                        now()?,
-                    ) {
-                        Ok(super::claim::Outcome::Won) => {}
-                        Ok(super::claim::Outcome::HeldElsewhere) => {
-                            return Err(ScalerError::Deferred("claimed by another host"));
-                        }
-                        Err(error) => {
-                            eprintln!(
-                                "run={} attempt={} job={} claim failed: {error}; deferred",
-                                job.run.0, job.attempt, job.job.0
-                            );
-                            return Err(ScalerError::Deferred("claim failed"));
-                        }
+                    Ok(super::claim::Outcome::Won) => {}
+                    Ok(super::claim::Outcome::HeldElsewhere) => {
+                        return Err(ScalerError::Deferred("claimed by another host"));
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "run={} attempt={} job={} claim failed: {error}; deferred",
+                            job.run.0, job.attempt, job.job.0
+                        );
+                        return Err(ScalerError::Deferred("claim failed"));
                     }
                 }
-                Ok(job)
-            },
-        )? {
+            }
+            Ok(job)
+        })? {
             selected = Some((lane, policy, job));
             break;
         }
@@ -2750,10 +2573,7 @@ fn admit_one(
         (budget, lane),
         || {
             gh.vet(admission, job)?;
-            match resource_admission(pve, pending) {
-                Err(ScalerError::CpuCeiling { .. }) if lane == CloneLane::Agent => Ok(false),
-                result => result,
-            }
+            resource_admission(pve, pending)
         },
         || pve.reservation_inventory(),
     );
@@ -3253,7 +3073,7 @@ mod tests {
     fn serial_host_guest_payload_installs_exact_bytes_without_expansion() {
         let dir = tempfile::tempdir().unwrap();
         let pilot = Admission::pilot(&"a".repeat(40)).unwrap();
-        for admission in [pilot, Admission::Standing, Admission::Agent] {
+        for admission in [pilot, Admission::Standing] {
             for (i, script) in GUEST_SCRIPTS.iter().enumerate() {
                 let source = guest_script_source(script, &admission).unwrap();
                 let path = dir.path().join(format!("payload-{i}"));
@@ -3271,8 +3091,7 @@ mod tests {
                     0o755
                 );
                 // Only a standing clone's hook may fall back to a re-vet.
-                let revet = script.path == HOOK_PATH
-                    && matches!(admission, Admission::Standing | Admission::Agent);
+                let revet = script.path == HOOK_PATH && matches!(admission, Admission::Standing);
                 assert_eq!(source.contains("admit-job --controller"), revet);
             }
         }
@@ -3285,160 +3104,6 @@ mod tests {
             .args(["-c", &script, "sh", arg])
             .output()
             .unwrap()
-    }
-    /// A guest mint script in `state`, with `input` on stdin as `input-data`.
-    /// Hosts without util-linux `flock` (macOS) run it unlocked.
-    fn guest_mint(state: &Path, script: &str, input: &str) -> std::process::Output {
-        guest_mint_arg(state, script, "", input)
-    }
-    fn guest_mint_arg(state: &Path, script: &str, arg: &str, input: &str) -> std::process::Output {
-        let mut script = script.replace("/run/carrick-ci", state.to_str().unwrap());
-        if !Path::new("/usr/bin/flock").exists() {
-            script = script
-                .replace("timeout 10 /usr/bin/flock -w 3 9", "true")
-                .replace("timeout 10 head", "head");
-        }
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", &script, "sh", arg])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        // A refusing script exits before reading stdin, so the write may race
-        // its exit and see EPIPE; the caller's status and file checks decide.
-        match child.stdin.take().unwrap().write_all(input.as_bytes()) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
-            Err(error) => panic!("write guest mint input: {error}"),
-        }
-        child.wait_with_output().unwrap()
-    }
-    #[test]
-    fn serial_host_guest_mint_scripts_round_trip_with_the_tool_server() {
-        let state = tempfile::tempdir().unwrap();
-        let state = state.path().to_owned();
-        std::fs::write(
-            state.join("approved-policy"),
-            format!("agent run=41 attempt=2 sha={}\n", "a".repeat(40)),
-        )
-        .unwrap();
-        // `read_policy` refuses a group-writable policy; don't inherit umask.
-        std::fs::set_permissions(
-            state.join("approved-policy"),
-            std::fs::Permissions::from_mode(0o644),
-        )
-        .unwrap();
-        for file in [mint::REQUEST_FILE, mint::RESPONSE_FILE] {
-            std::fs::write(state.join(file), "").unwrap();
-        }
-        // No channel files: the controller sees exit 5, never a created file.
-        let empty = tempfile::tempdir().unwrap();
-        assert_eq!(
-            guest_mint(empty.path(), GUEST_MINT_READ, "").status.code(),
-            Some(5)
-        );
-        assert!(!empty.path().join(mint::REQUEST_FILE).exists());
-        let client_state = state.clone();
-        let client = std::thread::spawn(move || {
-            crate::dispatch_mint::request(
-                &client_state,
-                mint::MintScope::Board,
-                Duration::from_secs(10),
-                None,
-            )
-            .ok()
-            .map(|token| token.secret().to_owned())
-        });
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let request: Value = loop {
-            let output = guest_mint(&state, GUEST_MINT_READ, "");
-            assert!(output.status.success());
-            if let Ok(request) = serde_json::from_slice(&output.stdout) {
-                break request;
-            }
-            assert!(Instant::now() < deadline, "no token request");
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        assert_eq!(request["scope"], "board");
-        let response = json!({"status":"minted","nonce":request["nonce"],
-            "token":"ghs_guestScriptFixture0123456789"});
-        assert!(
-            guest_mint(&state, GUEST_MINT_RESPOND, &response.to_string())
-                .status
-                .success()
-        );
-        // A clear for another nonce leaves the request in place.
-        assert!(
-            guest_mint_arg(&state, GUEST_MINT_CLEAR, &"0".repeat(32), "")
-                .status
-                .success()
-        );
-        assert!(
-            !std::fs::read(state.join(mint::REQUEST_FILE))
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            guest_mint_arg(
-                &state,
-                GUEST_MINT_CLEAR,
-                request["nonce"].as_str().unwrap(),
-                ""
-            )
-            .status
-            .success()
-        );
-        assert_eq!(
-            client.join().unwrap().as_deref(),
-            Some("ghs_guestScriptFixture0123456789")
-        );
-        for file in [mint::REQUEST_FILE, mint::RESPONSE_FILE] {
-            assert!(
-                std::fs::read(state.join(file)).unwrap().is_empty(),
-                "{file}"
-            );
-        }
-        // A planted link is refused, not written through.
-        std::fs::remove_file(state.join(mint::RESPONSE_FILE)).unwrap();
-        std::os::unix::fs::symlink(
-            state.join("approved-policy"),
-            state.join(mint::RESPONSE_FILE),
-        )
-        .unwrap();
-        assert_eq!(
-            guest_mint(&state, GUEST_MINT_RESPOND, &"overwrite".repeat(16 * 1024))
-                .status
-                .code(),
-            Some(5)
-        );
-        assert!(
-            std::fs::read_to_string(state.join("approved-policy"))
-                .unwrap()
-                .starts_with("agent ")
-        );
-    }
-    /// A runner holding the request lock cannot stall the controller.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn serial_host_guest_mint_scripts_fail_fast_on_a_held_lock() {
-        use std::os::unix::io::AsRawFd;
-        let state = tempfile::tempdir().unwrap();
-        for file in [mint::REQUEST_FILE, mint::RESPONSE_FILE] {
-            std::fs::write(state.path().join(file), "{}").unwrap();
-        }
-        let held = File::open(state.path().join(mint::REQUEST_FILE)).unwrap();
-        // SAFETY: flock on a descriptor this test owns.
-        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
-        for script in [GUEST_MINT_READ, GUEST_MINT_CLEAR] {
-            let start = Instant::now();
-            let output = guest_mint(state.path(), script, "");
-            assert_eq!(output.status.code(), Some(6));
-            assert!(start.elapsed() < Duration::from_secs(8));
-        }
-        assert_eq!(
-            std::fs::read_to_string(state.path().join(mint::REQUEST_FILE)).unwrap(),
-            "{}"
-        );
     }
     #[test]
     fn serial_host_guest_rendezvous_does_not_follow_assignment_symlinks() {

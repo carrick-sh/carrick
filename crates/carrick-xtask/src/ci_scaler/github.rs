@@ -10,80 +10,6 @@ pub(super) struct QueuedJob {
     pub sha: String,
 }
 
-#[derive(Default)]
-struct AdmissionNotices(std::collections::BTreeSet<(RunId, u32)>);
-impl AdmissionNotices {
-    fn key(run: &Value) -> (RunId, u32) {
-        (
-            RunId(run["id"].as_u64().unwrap_or_default()),
-            run["run_attempt"]
-                .as_u64()
-                .and_then(|n| u32::try_from(n).ok())
-                .unwrap_or_default(),
-        )
-    }
-    fn record(&mut self, run: &Value, reason: &str) -> Option<String> {
-        self.0.insert(Self::key(run)).then(|| {
-            format!(
-                "dispatch run={} attempt={} refused: {reason}",
-                run["id"], run["run_attempt"]
-            )
-        })
-    }
-}
-fn admission_notices() -> &'static std::sync::Mutex<AdmissionNotices> {
-    static NOTICES: std::sync::OnceLock<std::sync::Mutex<AdmissionNotices>> =
-        std::sync::OnceLock::new();
-    NOTICES.get_or_init(Default::default)
-}
-fn admission_refused(run: &Value, reason: &str) {
-    if let Some(message) = admission_notices()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .record(run, reason)
-    {
-        eprintln!("{message}");
-    }
-}
-
-/// Check the PR's own workflow changes against its merge base with main.
-/// Today's main can have advanced since an earlier review ran.
-pub(crate) fn dispatch_workflow_unchanged(
-    head: &str,
-    mut lookup: impl FnMut(&str) -> Result<Value, ScalerError>,
-) -> Result<bool, ScalerError> {
-    if !full_sha(head) {
-        return Ok(false);
-    }
-    let comparison = lookup(&format!("repos/{REPOSITORY}/compare/main...{head}"))?;
-    let files = comparison["files"]
-        .as_array()
-        .ok_or(ScalerError::External("comparison files"))?;
-    if files
-        .iter()
-        .any(|f| f["filename"] == DISPATCH_WORKFLOW || f["previous_filename"] == DISPATCH_WORKFLOW)
-    {
-        return Ok(false);
-    }
-    // GitHub caps comparison files at 300. Blob equality with the merge base
-    // proves the head kept main's workflow even when the file list is capped.
-    let base = comparison["merge_base_commit"]["sha"]
-        .as_str()
-        .filter(|s| full_sha(s))
-        .ok_or(ScalerError::External("comparison merge base"))?;
-    let mut blobs = Vec::new();
-    for reference in [head, base] {
-        let blob = lookup(&format!(
-            "repos/{REPOSITORY}/contents/{DISPATCH_WORKFLOW}?ref={reference}"
-        ))?;
-        if blob["type"] != "file" || !blob["sha"].as_str().is_some_and(full_sha) {
-            return Ok(false);
-        }
-        blobs.push(blob["sha"].clone());
-    }
-    Ok(blobs[0] == blobs[1])
-}
-
 pub(crate) struct Github;
 impl Github {
     pub(crate) fn request(
@@ -206,38 +132,13 @@ impl Github {
         for status in ["queued", "in_progress"] {
             runs.extend(self.workflow_runs(admission, status)?);
         }
-        if matches!(admission, Admission::Agent) {
-            let active: std::collections::BTreeSet<_> =
-                runs.iter().map(AdmissionNotices::key).collect();
-            admission_notices()
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .0
-                .retain(|key| active.contains(key));
-        }
-        Self::queued_jobs(
-            admission,
-            labels,
-            &runs,
-            |run| self.jobs(run),
-            |run| {
-                Self::admits_run(
-                    admission,
-                    run,
-                    &mut |method, endpoint, body, paginate| {
-                        self.request(method, endpoint, body, paginate)
-                    },
-                    &mut crate::dispatch_worker::recorded_publication,
-                )
-            },
-        )
+        Self::queued_jobs(admission, labels, &runs, |run| self.jobs(run))
     }
     fn queued_jobs(
         admission: &Admission,
         labels: &[&str],
         runs: &[Value],
         mut jobs: impl FnMut(&Value) -> Result<Vec<Value>, ScalerError>,
-        mut admitted: impl FnMut(&Value) -> Result<bool, ScalerError>,
     ) -> Result<Vec<QueuedJob>, ScalerError> {
         let mut demand = Vec::new();
         for run in runs {
@@ -246,9 +147,6 @@ impl Github {
             }
             let pending = (|| -> Result<Vec<QueuedJob>, ScalerError> {
                 let run_jobs = jobs(run)?;
-                if !guard_ready(admission, &run_jobs) {
-                    return Ok(Vec::new());
-                }
                 let mut candidates = Vec::new();
                 for job in run_jobs {
                     let job_labels: Vec<&str> = job["labels"]
@@ -282,18 +180,9 @@ impl Github {
                             .into(),
                     });
                 }
-                if candidates.is_empty() || !admitted(run)? {
-                    return Ok(Vec::new());
-                }
                 Ok(candidates)
             })();
-            match pending {
-                Ok(pending) => demand.extend(pending),
-                Err(error) if matches!(admission, Admission::Agent) => {
-                    admission_refused(run, &error.to_string())
-                }
-                Err(error) => return Err(error),
-            }
+            demand.extend(pending?);
         }
         demand.sort_by_key(|job| job.key.job.0);
         demand.dedup_by_key(|job| job.key.job.0);
@@ -415,353 +304,21 @@ impl Github {
     /// Re-read admission and attempt immediately before minting a runner.
     /// The hook's policy is bound to this exact run and SHA.
     pub(super) fn vet(&self, admission: &Admission, key: JobKey) -> Result<JobPolicy, ScalerError> {
-        Self::vet_inner(
-            admission,
-            key,
-            |method, endpoint, body, paginate| self.request(method, endpoint, body, paginate),
-            &mut crate::dispatch_worker::recorded_publication,
-        )
+        Self::vet_inner(admission, key, |method, endpoint, body, paginate| {
+            self.request(method, endpoint, body, paginate)
+        })
     }
 
+    /// An actual assignment is re-vetted as standing KVM work; no other run
+    /// is admitted on a clone.
     pub(super) fn vet_assignment(&self, key: JobKey) -> Result<JobPolicy, ScalerError> {
-        let run = self.request(
-            "GET",
-            &format!("repos/{REPOSITORY}/actions/runs/{}", key.run.0),
-            None,
-            false,
-        )?;
-        self.vet(
-            &if run["path"] == DISPATCH_WORKFLOW {
-                Admission::Agent
-            } else {
-                Admission::Standing
-            },
-            key,
-        )
-    }
-
-    /// issue_comment runs use main, so their REST run has no issue/PR mapping.
-    /// Successful trusted-main guard steps expose only the webhook IDs and
-    /// observed head. Fetch the authoritative objects before admitting demand.
-    fn admits_comment(
-        run: &Value,
-        request: &mut impl FnMut(&str, &str, Option<Value>, bool) -> Result<Value, ScalerError>,
-        publication: &mut crate::dispatch_worker::PublicationLookup<'_>,
-    ) -> Result<bool, ScalerError> {
-        let id = run["id"]
-            .as_u64()
-            .ok_or(ScalerError::Guard("missing run id"))?;
-        let attempt = run["run_attempt"]
-            .as_u64()
-            .ok_or(ScalerError::Guard("missing run attempt"))?;
-        let data = request(
-            "GET",
-            &format!("repos/{REPOSITORY}/actions/runs/{id}/attempts/{attempt}/jobs?per_page=100"),
-            None,
-            true,
-        )?;
-        let jobs = pages(&data, "jobs")?;
-        if !guard_ready(&Admission::Agent, &jobs) {
-            return Ok(false);
-        }
-        let guard = jobs
-            .iter()
-            .find(|j| j["name"] == "guard")
-            .ok_or(ScalerError::Guard("missing guard"))?;
-        let steps: Vec<_> = guard["steps"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|s| s["conclusion"] == "success")
-            .collect();
-        let markers: Vec<_> = steps
-            .iter()
-            .filter_map(|s| s["name"].as_str()?.strip_prefix("Dispatch comment "))
-            .collect();
-        if markers.len() != 1 {
-            return Ok(false);
-        }
-        let parts: Vec<_> = markers[0].split_whitespace().collect();
-        let [number, comment_id, digest] = parts.as_slice() else {
-            return Ok(false);
-        };
-        let (number, comment_id) = (
-            number
-                .parse::<u64>()
-                .map_err(|_| ScalerError::Guard("invalid issue marker"))?,
-            comment_id
-                .parse::<u64>()
-                .map_err(|_| ScalerError::Guard("invalid comment marker"))?,
-        );
-        let comment = request(
-            "GET",
-            &format!("repos/{REPOSITORY}/issues/comments/{comment_id}"),
-            None,
-            false,
-        )?;
-        if comment["id"].as_u64() != Some(comment_id)
-            || comment["issue_url"]
-                != format!("https://api.github.com/repos/{REPOSITORY}/issues/{number}")
-            || !crate::dispatch_worker::agent_comment(&comment, &mut |login: &str| {
-                crate::dispatch_worker::write_collaborator(login, |endpoint| {
-                    request("GET", endpoint, None, false)
-                })
-            })
-            || crate::dispatch_worker::comment_digest(&comment) != *digest
-        {
-            return Ok(false);
-        }
-        let mut issue = request(
-            "GET",
-            &format!("repos/{REPOSITORY}/issues/{number}"),
-            None,
-            false,
-        )?;
-        if issue.get("pull_request").is_some() {
-            let pr = request(
-                "GET",
-                &format!("repos/{REPOSITORY}/pulls/{number}"),
-                None,
-                false,
-            )?;
-            let branch = pr["head"]["ref"].as_str().unwrap_or_default();
-            let heads: Vec<_> = steps
-                .iter()
-                .filter_map(|s| s["name"].as_str()?.strip_prefix("Dispatch head "))
-                .collect();
-            if heads.len() != 1
-                || !full_sha(heads[0])
-                || pr["head"]["sha"] != heads[0]
-                || pr["state"] != "open"
-            {
-                return Ok(false);
-            }
-            let Some(issue_number) = crate::dispatch_worker::dispatch_branch(branch) else {
-                // The same adoption predicate the guard and clone admission use.
-                use crate::dispatch_worker::AdoptionRead;
-                let adoption = crate::dispatch_worker::adopted_pr(&pr, |read| match read {
-                    AdoptionRead::ClosingReferences(number) => request(
-                        "POST",
-                        "graphql",
-                        Some(crate::dispatch_worker::closing_references_request(number)),
-                        false,
-                    ),
-                    AdoptionRead::Parent(endpoint) => request("GET", &endpoint, None, false),
-                    AdoptionRead::Issue(number) => request(
-                        "GET",
-                        &format!("repos/{REPOSITORY}/issues/{number}"),
-                        None,
-                        false,
-                    ),
-                })?;
-                // The guard names the issue it resolved; both must agree.
-                let guard_issue: Vec<_> = steps
-                    .iter()
-                    .filter_map(|s| s["name"].as_str()?.strip_prefix("Dispatch issue "))
-                    .collect();
-                return Ok(adoption.is_some_and(|adoption| {
-                    guard_issue.len() == 1
-                        && adoption
-                            .issue_number()
-                            .is_some_and(|issue| guard_issue[0] == issue.to_string())
-                }));
-            };
-            let original_id = crate::dispatch_worker::branch_run(issue_number, branch)?;
-            let original = request(
-                "GET",
-                &format!("repos/{REPOSITORY}/actions/runs/{original_id}"),
-                None,
-                false,
-            )?;
-            let valid_base = crate::dispatch_worker::stack_parent(&pr, |endpoint| {
-                request("GET", &endpoint, None, false)
-            })
-            .ok();
-            if !crate::dispatch_worker::owned_pr_on_base(
-                &pr,
-                &original,
-                issue_number,
-                branch,
-                (if pr["user"]["login"] == "carrick-workers[bot]" {
-                    publication(&pr, &original, issue_number, branch)
-                } else {
-                    None
-                })
-                .as_ref(),
-                valid_base.as_ref(),
-                &mut |login: &str| {
-                    crate::dispatch_worker::write_collaborator(login, |endpoint| {
-                        request("GET", endpoint, None, false)
-                    })
-                },
-            ) {
-                return Ok(false);
-            }
-            issue = request(
-                "GET",
-                &format!("repos/{REPOSITORY}/issues/{issue_number}"),
-                None,
-                false,
-            )?;
-        }
-        // Any issue author (#1214); the trusted comment is the approval.
-        Ok(issue["state"] == "open")
-    }
-
-    /// A chained round (#1241 part 3): REST runs carry no inputs, so the
-    /// trusted-main guard names the outcome it admitted in a step; the
-    /// controller re-verifies that outcome with the same chain rule.
-    fn admits_chain(
-        run: &Value,
-        request: &mut impl FnMut(&str, &str, Option<Value>, bool) -> Result<Value, ScalerError>,
-    ) -> Result<bool, ScalerError> {
-        if !crate::dispatch_worker::chain_run(run) {
-            return Ok(false);
-        }
-        let id = run["id"]
-            .as_u64()
-            .ok_or(ScalerError::Guard("missing run id"))?;
-        let attempt = run["run_attempt"]
-            .as_u64()
-            .ok_or(ScalerError::Guard("missing run attempt"))?;
-        let data = request(
-            "GET",
-            &format!("repos/{REPOSITORY}/actions/runs/{id}/attempts/{attempt}/jobs?per_page=100"),
-            None,
-            true,
-        )?;
-        let jobs = pages(&data, "jobs")?;
-        if !guard_ready(&Admission::Agent, &jobs) {
-            return Ok(false);
-        }
-        let markers: Vec<_> = jobs
-            .iter()
-            .filter(|j| j["name"] == "guard")
-            .flat_map(|j| j["steps"].as_array().into_iter().flatten())
-            .filter(|s| s["conclusion"] == "success")
-            .filter_map(|s| s["name"].as_str()?.strip_prefix("Chain outcome "))
-            .collect();
-        let [marker] = markers.as_slice() else {
-            return Ok(false);
-        };
-        let parts: Vec<_> = marker.split_whitespace().collect();
-        let [issue, outcome] = parts.as_slice() else {
-            return Ok(false);
-        };
-        let (Ok(issue), Ok(outcome)) = (issue.parse::<u64>(), outcome.parse::<u64>()) else {
-            return Ok(false);
-        };
-        let link = crate::dispatch_worker::verify_chain(outcome, &mut |endpoint| {
-            request("GET", endpoint, None, false)
-        })?;
-        Ok(link.issue == issue)
-    }
-
-    /// Both queued demand and the final pre-clone/reassignment vet use this
-    /// API-backed admission. A successful PR-supplied guard is insufficient.
-    fn admits_run(
-        admission: &Admission,
-        run: &Value,
-        request: &mut impl FnMut(&str, &str, Option<Value>, bool) -> Result<Value, ScalerError>,
-        publication: &mut crate::dispatch_worker::PublicationLookup<'_>,
-    ) -> Result<bool, ScalerError> {
-        let checked = (|| -> Result<bool, ScalerError> {
-            if !admission.identifies_run(run) {
-                return Ok(false);
-            }
-            // Run shape is structural; the run's actors must be live
-            // write collaborators (#1214) before any demand or vet.
-            if matches!(admission, Admission::Agent)
-                && !crate::dispatch_worker::dispatch_run_admitted(run, None, &mut |login: &str| {
-                    crate::dispatch_worker::write_collaborator(login, |endpoint| {
-                        request("GET", endpoint, None, false)
-                    })
-                })
-            {
-                return Ok(false);
-            }
-            if matches!(admission, Admission::Agent) && run["event"] == "issue_comment" {
-                return Self::admits_comment(run, request, publication);
-            }
-            if matches!(admission, Admission::Agent) && run["event"] == "workflow_dispatch" {
-                return Self::admits_chain(run, request);
-            }
-            if !matches!(admission, Admission::Agent) || run["event"] != "pull_request_review" {
-                return Ok(true);
-            }
-            // REST runs carry no review payload. Main's guard condition and
-            // driver admission enforce changes_requested; PR workflow changes
-            // are refused below so the merge uses main's policy.
-            let branch = run["head_branch"]
-                .as_str()
-                .ok_or(ScalerError::Guard("review branch missing"))?;
-            let Some(issue) = crate::dispatch_worker::dispatch_branch(branch) else {
-                return Ok(false);
-            };
-            let id = crate::dispatch_worker::branch_run(issue, branch)?;
-            let original = request(
-                "GET",
-                &format!("repos/{REPOSITORY}/actions/runs/{id}"),
-                None,
-                false,
-            )?;
-            let prs = request(
-                "GET",
-                &format!("repos/{REPOSITORY}/pulls?state=open&head=carrick-sh:{branch}"),
-                None,
-                false,
-            )?;
-            if !prs.as_array().into_iter().flatten().any(|pr| {
-                let valid_base = crate::dispatch_worker::stack_parent(pr, |endpoint| {
-                    request("GET", &endpoint, None, false)
-                })
-                .ok();
-                pr["head"]["sha"] == run["head_sha"]
-                    && crate::dispatch_worker::owned_pr_on_base(
-                        pr,
-                        &original,
-                        issue,
-                        branch,
-                        (if pr["user"]["login"] == "carrick-workers[bot]" {
-                            publication(pr, &original, issue, branch)
-                        } else {
-                            None
-                        })
-                        .as_ref(),
-                        valid_base.as_ref(),
-                        &mut |login: &str| {
-                            crate::dispatch_worker::write_collaborator(login, |endpoint| {
-                                request("GET", endpoint, None, false)
-                            })
-                        },
-                    )
-            }) {
-                return Ok(false);
-            }
-            let head = run["head_sha"]
-                .as_str()
-                .ok_or(ScalerError::Guard("review SHA missing"))?;
-            dispatch_workflow_unchanged(head, |endpoint| request("GET", endpoint, None, false))
-        })();
-        match checked {
-            Ok(true) => Ok(true),
-            result if matches!(admission, Admission::Agent) => {
-                let reason = result
-                    .err()
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| "PR head/ownership or workflow check refused".into());
-                admission_refused(run, &reason);
-                Ok(false)
-            }
-            result => result,
-        }
+        self.vet(&Admission::Standing, key)
     }
 
     fn vet_inner(
         admission: &Admission,
         key: JobKey,
         mut request: impl FnMut(&str, &str, Option<Value>, bool) -> Result<Value, ScalerError>,
-        publication: &mut crate::dispatch_worker::PublicationLookup<'_>,
     ) -> Result<JobPolicy, ScalerError> {
         let run = request(
             "GET",
@@ -769,25 +326,13 @@ impl Github {
             None,
             false,
         )?;
-        if !Self::admits_run(admission, &run, &mut request, publication)?
+        // Both queued demand and the final pre-clone/reassignment vet re-read
+        // the run from the API; a successful PR-supplied step is insufficient.
+        if !admission.identifies_run(&run)
             || run["id"].as_u64() != Some(key.run.0)
             || run["run_attempt"].as_u64() != Some(u64::from(key.attempt))
         {
             return Err(ScalerError::Guard("reserved run is no longer admitted"));
-        }
-        if matches!(admission, Admission::Agent) {
-            let data = request(
-                "GET",
-                &format!(
-                    "repos/{REPOSITORY}/actions/runs/{}/attempts/{}/jobs?per_page=100",
-                    key.run.0, key.attempt
-                ),
-                None,
-                true,
-            )?;
-            if !guard_ready(admission, &pages(&data, "jobs")?) {
-                return Err(ScalerError::Guard("dispatch guard has not succeeded"));
-            }
         }
         let sha = run["head_sha"]
             .as_str()
@@ -795,11 +340,6 @@ impl Github {
             .to_ascii_lowercase();
         Ok(match admission {
             Admission::Pilot { sha } => JobPolicy::Pilot { sha: sha.clone() },
-            Admission::Agent => JobPolicy::Agent(RunBinding {
-                run: key.run,
-                attempt: key.attempt,
-                sha,
-            }),
             Admission::Standing => JobPolicy::Bound(RunBinding {
                 run: key.run,
                 attempt: key.attempt,
@@ -950,596 +490,11 @@ fn pages(data: &Value, field: &str) -> Result<Vec<Value>, ScalerError> {
     Ok(result)
 }
 
-/// A blocked `needs: guard` job must never consume a credentialed clone.
-/// Demand and the final pre-JIT/reassignment vet both check this attempt.
-fn guard_ready(admission: &Admission, jobs: &[Value]) -> bool {
-    !matches!(admission, Admission::Agent)
-        || jobs.iter().any(|job| {
-            job["name"] == "guard" && job["status"] == "completed" && job["conclusion"] == "success"
-        })
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
-    /// Live permission answers (#1214): `tjfontaine` admin, `collaborator`
-    /// write, `reader` read; `api-down` fails; anyone else is a 404.
-    fn permission(endpoint: &str) -> Result<Value, ScalerError> {
-        let login = endpoint
-            .strip_prefix(&format!("repos/{REPOSITORY}/collaborators/"))
-            .and_then(|rest| rest.strip_suffix("/permission"))
-            .unwrap();
-        match login {
-            "tjfontaine" => Ok(json!({"permission":"admin"})),
-            "collaborator" => Ok(json!({"permission":"write"})),
-            "reader" => Ok(json!({"permission":"read"})),
-            "api-down" => Err(ScalerError::GithubGone),
-            _ => Err(ScalerError::Guard("gh: Not Found (HTTP 404)")),
-        }
-    }
-
-    #[test]
-    fn agent_comment_controller_rechecks_collaborator_unedited_comment_and_owned_pr() {
-        let mut run = review_run(99);
-        run["event"] = "issue_comment".into();
-        run["head_branch"] = "main".into();
-        let mut original = review_run(42);
-        original["event"] = "issues".into();
-        original["head_branch"] = "main".into();
-        let mut unsafe_cases = Vec::new();
-        for (case, allowed) in [
-            ("issue", true),
-            ("pr", true),
-            ("outsider", false),
-            ("edited", false),
-            ("same_timestamp_edit", false),
-            ("wrong_command", false),
-            ("unowned", false),
-            ("stale", false),
-            // #1214: the issue author no longer matters; the commenter's live
-            // write permission does.
-            ("other_issue_author", true),
-            ("collaborator", true),
-            ("reader", false),
-            ("api-down", false),
-            ("no_guard", false),
-            ("wrong_issue", false),
-        ] {
-            let mut comment = json!({"id":123,"issue_url":format!("https://api.github.com/repos/{REPOSITORY}/issues/800"),"user":{"login":"tjfontaine","type":"User"},"created_at":"2026-10-24T00:00:00Z","updated_at":"2026-10-24T00:00:00Z","body":"/agent resolve the conflict"});
-            let digest = crate::dispatch_worker::comment_digest(&comment);
-            if case == "same_timestamp_edit" {
-                comment["body"] = "/agent changed".into();
-            }
-            if ["outsider", "collaborator", "reader", "api-down"].contains(&case) {
-                comment["user"]["login"] = case.into();
-            }
-            if case == "edited" {
-                comment["updated_at"] = "2026-10-24T00:01:00Z".into();
-            }
-            if case == "wrong_command" {
-                comment["body"] = "/agentish".into();
-            }
-            if case == "wrong_issue" {
-                comment["issue_url"] =
-                    "https://api.github.com/repos/outsider/repo/issues/800".into();
-            }
-            let pr_case = ["pr", "unowned", "stale"].contains(&case);
-            let issue = json!({"state":"open","number":799,"user":{"login":if case == "other_issue_author" { "outsider" } else { "tjfontaine" },"type":"User"}});
-            let mut pr = json!({"state":"open","number":800,"user":{"login":"github-actions[bot]","type":"Bot"},"head":{"ref":"work/dispatch-799-42","sha":"a".repeat(40),"repo":{"full_name":REPOSITORY}},"base":{"ref":"main"},"draft":true,"body":format!("Closes #799\nDispatch run: https://github.com/{REPOSITORY}/actions/runs/42")});
-            if case == "unowned" {
-                pr["user"]["login"] = "outsider".into();
-            }
-            if case == "stale" {
-                pr["head"]["sha"] = "b".repeat(40).into();
-            }
-            let mut calls = Vec::new();
-            let admitted = Github::admits_run(&Admission::Agent, &run, &mut |_, endpoint, _, _| {
-                calls.push(endpoint.to_owned());
-                Ok(if endpoint.contains("/jobs?") {
-                    json!([{"jobs":[{"name":"guard","status":"completed","conclusion":if case=="no_guard" {"failure"} else {"success"},"steps":[{"name":format!("Dispatch comment 800 123 {digest}"),"conclusion":"success"},{"name":format!("Dispatch head {}","a".repeat(40)),"conclusion":"success"}]}]}])
-                } else if endpoint.ends_with("/issues/comments/123") { comment.clone() }
-                else if endpoint.ends_with("/issues/800") { if pr_case { json!({"pull_request":{}}) } else { issue.clone() } }
-                else if endpoint.ends_with("/pulls/800") { pr.clone() }
-                else if endpoint.ends_with("/actions/runs/42") { original.clone() }
-                else if endpoint.ends_with("/issues/799") { issue.clone() }
-                else if endpoint.contains("/collaborators/") { permission(endpoint)? }
-                else { panic!("unexpected endpoint {endpoint}") })
-            }, &mut |_, _, _, _| None).unwrap();
-            if admitted != allowed {
-                unsafe_cases.push(case);
-            }
-        }
-        assert!(
-            unsafe_cases.is_empty(),
-            "controller unsafe cases: {unsafe_cases:?}"
-        );
-    }
-    fn chained_run() -> Value {
-        json!({"id":99,"run_attempt":1,"event":"workflow_dispatch","head_branch":"main",
-            "head_sha":"a".repeat(40),"path":DISPATCH_WORKFLOW,
-            "repository":{"full_name":REPOSITORY},"head_repository":{"full_name":REPOSITORY},
-            "actor":{"login":"github-actions[bot]","type":"Bot"},
-            "triggering_actor":{"login":"github-actions[bot]","type":"Bot"}})
-    }
-    /// #1241 part 3: the controller admits a chained run only through the
-    /// same chain rule as the guard (`verify_chain`), reading the outcome the
-    /// trusted guard step names, and job start admits only the chain shape.
-    #[test]
-    fn chained_runs_are_admitted_only_by_the_chain_rule() {
-        use crate::dispatch_worker::chain_fixture;
-        let mut cases: Vec<(String, bool, Value, String)> = chain_fixture::CASES
-            .iter()
-            .map(|(case, refused)| {
-                (
-                    case.to_string(),
-                    refused.is_none(),
-                    chained_run(),
-                    "Chain outcome 799 30".to_owned(),
-                )
-            })
-            .collect();
-        for (case, pointer, value) in [
-            (
-                "wrong actor",
-                "/actor",
-                json!({"login":"tjfontaine","type":"User"}),
-            ),
-            (
-                "bot of another app",
-                "/actor",
-                json!({"login":"carrick-workers[bot]","type":"Bot"}),
-            ),
-            (
-                "wrong triggering actor",
-                "/triggering_actor",
-                json!({"login":"tjfontaine","type":"User"}),
-            ),
-            ("wrong ref", "/head_branch", json!("work/dispatch-799-42")),
-            ("wrong workflow", "/path", json!(".github/workflows/ci.yml")),
-            ("wrong event", "/event", json!("repository_dispatch")),
-        ] {
-            let mut run = chained_run();
-            *run.pointer_mut(pointer).unwrap() = value;
-            cases.push((case.into(), false, run, "Chain outcome 799 30".into()));
-        }
-        cases.push((
-            "no marker".into(),
-            false,
-            chained_run(),
-            "Dispatch issue 799".into(),
-        ));
-        cases.push((
-            "marker for another issue".into(),
-            false,
-            chained_run(),
-            "Chain outcome 798 30".into(),
-        ));
-        let mut wrong = Vec::new();
-        for (case, allowed, run, marker) in cases {
-            let fixture_case = if chain_fixture::CASES.iter().any(|(c, _)| *c == case) {
-                case.as_str()
-            } else {
-                "authentic"
-            };
-            let map = chain_fixture::chain_case(fixture_case);
-            let mut serve = chain_fixture::serve(&map);
-            let jobs = json!([{"jobs":[{"name":"guard","status":"completed","conclusion":"success",
-                "steps":[{"name":marker,"conclusion":"success"}]}]}]);
-            let admitted = Github::admits_run(
-                &Admission::Agent,
-                &run,
-                &mut |method, endpoint, _, _| {
-                    assert_eq!(method, "GET");
-                    if endpoint.contains("/actions/runs/99/attempts/1/jobs") {
-                        return Ok(jobs.clone());
-                    }
-                    if endpoint.contains("/collaborators/") {
-                        return permission(endpoint);
-                    }
-                    serve(endpoint)
-                },
-                &mut |_, _, _, _| None,
-            )
-            .unwrap();
-            if admitted != allowed {
-                wrong.push(case);
-            }
-        }
-        assert!(
-            wrong.is_empty(),
-            "controller chain verdicts wrong: {wrong:?}"
-        );
-        // Job start: only the chain shape, bound to the vetted run.
-        let context = |actor: &str, git_ref: &str, workflow: &str| JobContext {
-            repository: REPOSITORY.into(),
-            actor: actor.into(),
-            triggering_actor: "github-actions[bot]".into(),
-            event: "workflow_dispatch".into(),
-            workflow_ref: format!("{REPOSITORY}/{workflow}@{git_ref}"),
-            git_ref: git_ref.into(),
-            sha: "a".repeat(40),
-            run_id: 99,
-            run_attempt: 1,
-        };
-        let agent = Admission::Agent;
-        assert!(
-            agent
-                .authorize(&context(
-                    "github-actions[bot]",
-                    "refs/heads/main",
-                    DISPATCH_WORKFLOW
-                ))
-                .is_ok()
-        );
-        for refused in [
-            context("tjfontaine", "refs/heads/main", DISPATCH_WORKFLOW),
-            context(
-                "github-actions[bot]",
-                "refs/heads/work/x",
-                DISPATCH_WORKFLOW,
-            ),
-            context(
-                "github-actions[bot]",
-                "refs/heads/main",
-                ".github/workflows/ci.yml",
-            ),
-        ] {
-            assert!(agent.authorize(&refused).is_err(), "{refused:?}");
-        }
-    }
-    #[test]
-    fn agent_comment_controller_admits_only_an_adoptable_director_pr() {
-        let mut run = review_run(99);
-        run["event"] = "issue_comment".into();
-        run["head_branch"] = "main".into();
-        let tip = "a".repeat(40);
-        let mut unsafe_cases = Vec::new();
-        for (case, allowed) in [
-            ("adopted", true),
-            ("owner_authored", true),
-            ("fork", false),
-            ("head_main", false),
-            ("non_work_ref", false),
-            ("dispatch_ref", false),
-            // #1214: neither the PR nor the issue author is checked.
-            ("third_party_author", true),
-            ("app_issue", true),
-            ("collaborator", true),
-            ("reader", false),
-            ("no_reference", false),
-            ("two_references", false),
-            ("closed_issue", false),
-            ("other_issue_author", true),
-            ("stale", false),
-            ("edited", false),
-            ("outsider", false),
-            ("closed_pr", false),
-            ("guard_issue_mismatch", false),
-            ("no_guard_issue", false),
-        ] {
-            let mut comment = json!({"id":123,"issue_url":format!("https://api.github.com/repos/{REPOSITORY}/issues/1150"),"user":{"login":"tjfontaine","type":"User"},"created_at":"2026-10-30T00:00:00Z","updated_at":"2026-10-30T00:00:00Z","body":"/agent continue"});
-            let digest = crate::dispatch_worker::comment_digest(&comment);
-            if case == "edited" {
-                comment["updated_at"] = "2026-10-30T00:01:00Z".into();
-            }
-            if ["outsider", "collaborator", "reader"].contains(&case) {
-                comment["user"]["login"] = case.into();
-            }
-            let mut pr = json!({"number":1150,"state":"open","draft":false,"user":{"login":"carrick-workers[bot]","type":"Bot"},
-                "head":{"ref":"work/986-slice4","sha":tip,"repo":{"full_name":REPOSITORY}},
-                "base":{"ref":"main","repo":{"full_name":REPOSITORY}},"body":"Closes #986"});
-            let mut issue =
-                json!({"number":986,"state":"open","user":{"login":"tjfontaine","type":"User"}});
-            let mut references = vec![986];
-            match case {
-                "owner_authored" => pr["user"] = json!({"login":"tjfontaine","type":"User"}),
-                "fork" => pr["head"]["repo"]["full_name"] = "outsider/carrick".into(),
-                "head_main" => pr["head"]["ref"] = "main".into(),
-                "non_work_ref" => pr["head"]["ref"] = "feature/slice4".into(),
-                "dispatch_ref" => pr["head"]["ref"] = "work/dispatch-986-42".into(),
-                "third_party_author" => pr["user"] = json!({"login":"outsider","type":"User"}),
-                "no_reference" => references.clear(),
-                "two_references" => references.push(987),
-                "closed_issue" => issue["state"] = "closed".into(),
-                "other_issue_author" => issue["user"]["login"] = "outsider".into(),
-                "app_issue" => issue["user"] = json!({"login":"carrick-workers[bot]","type":"Bot"}),
-                "stale" => pr["head"]["sha"] = "b".repeat(40).into(),
-                "closed_pr" => pr["state"] = "closed".into(),
-                _ => {}
-            }
-            let nodes: Vec<_> = references
-                .iter()
-                .map(|n| json!({"number":n,"repository":{"nameWithOwner":REPOSITORY}}))
-                .collect();
-            let connection = json!({"nodes":nodes,"pageInfo":{"hasNextPage":false}});
-            let mut steps = vec![
-                json!({"name":format!("Dispatch comment 1150 123 {digest}"),"conclusion":"success"}),
-                json!({"name":format!("Dispatch head {tip}"),"conclusion":"success"}),
-            ];
-            match case {
-                "guard_issue_mismatch" => {
-                    steps.push(json!({"name":"Dispatch issue 987","conclusion":"success"}))
-                }
-                "no_guard_issue" => {}
-                _ => steps.push(json!({"name":"Dispatch issue 986","conclusion":"success"})),
-            }
-            // A dispatch-named ref takes the owned path: a real original run
-            // whose App PR has no publication binding, never the predicate.
-            let mut original = review_run(42);
-            original["event"] = "issues".into();
-            original["head_branch"] = "main".into();
-            let mut graphql = 0;
-            let admitted = Github::admits_run(&Admission::Agent, &run, &mut |method, endpoint, body, _| {
-                Ok(if endpoint.contains("/jobs?") {
-                    json!([{"jobs":[{"name":"guard","status":"completed","conclusion":"success","steps":steps}]}])
-                } else if endpoint == "graphql" {
-                    graphql += 1;
-                    assert_eq!(method, "POST");
-                    assert_eq!(body.unwrap()["variables"]["number"], 1150);
-                    json!({"data":{"repository":{"pullRequest":{"closingIssuesReferences":connection,"bodyReferences":connection}}}})
-                } else if endpoint.ends_with("/issues/comments/123") { comment.clone() }
-                else if endpoint.ends_with("/issues/1150") { json!({"pull_request":{}}) }
-                else if endpoint.ends_with("/pulls/1150") { pr.clone() }
-                else if endpoint.ends_with("/issues/986") { issue.clone() }
-                else if endpoint.ends_with("/actions/runs/42") { original.clone() }
-                else if endpoint.contains("/collaborators/") { permission(endpoint)? }
-                else { panic!("unexpected endpoint {endpoint}") })
-            }, &mut |_, _, _, _| None).unwrap();
-            if case == "dispatch_ref" {
-                assert_eq!(
-                    graphql, 0,
-                    "a dispatch-named ref reached the adoption predicate"
-                );
-            }
-            if admitted != allowed {
-                unsafe_cases.push(case);
-            }
-        }
-        assert!(
-            unsafe_cases.is_empty(),
-            "controller adoption cases decided wrongly: {unsafe_cases:?}"
-        );
-    }
-    #[test]
-    fn dispatch_review_refusals_log_once_per_active_attempt() {
-        let mut notices = AdmissionNotices::default();
-        let mut run = review_run(99);
-        assert!(
-            notices
-                .record(&run, "API unavailable")
-                .unwrap()
-                .contains("run=99")
-        );
-        assert!(
-            notices.record(&run, "still unavailable").is_none(),
-            "duplicate refusal log"
-        );
-        run["run_attempt"] = 2.into();
-        assert!(notices.record(&run, "new attempt").is_some());
-    }
-    fn review_run(id: u64) -> Value {
-        json!({"id":id,"run_attempt":1,"head_sha":"a".repeat(40),"head_branch":"work/dispatch-799-42","event":"pull_request_review",
-            "path":DISPATCH_WORKFLOW,"repository":{"full_name":REPOSITORY},"head_repository":{"full_name":REPOSITORY},
-            "actor":{"login":"tjfontaine","type":"User"},"triggering_actor":{"login":"tjfontaine","type":"User"}})
-    }
-    fn review_jobs(id: u64) -> Vec<Value> {
-        vec![
-            json!({"name":"guard","status":"completed","conclusion":"success","labels":[]}),
-            json!({"id":id,"name":"worker","status":"queued","runner_id":0,"labels":["carrick-agent"]}),
-        ]
-    }
-    #[test]
-    fn dispatch_review_vet_checks_pr_changes_instead_of_main_workflow_changes() {
-        let mut original = review_run(42);
-        original["event"] = "issues".into();
-        original["head_branch"] = "main".into();
-        let mut failures = Vec::new();
-        for (bot, changed, head_blob, allowed) in [
-            ("github-actions[bot]", false, "b", true), // main advanced; PR kept its original workflow
-            ("github-actions[bot]", true, "c", false), // PR changed workflow to match today's main
-            ("outsider", false, "c", false),
-            ("github-actions[bot]", false, "c", true),
-        ] {
-            let run = review_run(99);
-            let pr = json!({"number":800,"user":{"login":bot,"type":"Bot"},"draft":true,
-                "head":{"ref":"work/dispatch-799-42","sha":"a".repeat(40),"repo":{"full_name":REPOSITORY}},
-                "base":{"ref":"main"},"body":"Closes #799\nDispatch run: https://github.com/carrick-sh/carrick/actions/runs/42"});
-            let key = JobKey {
-                run: RunId(99),
-                attempt: 1,
-                job: JobId(9),
-            };
-            let result = Github::vet_inner(
-                &Admission::Agent,
-                key,
-                |method, endpoint, _, _| {
-                    assert_eq!(method, "GET");
-                    if endpoint.ends_with("/99") {
-                        Ok(run.clone())
-                    } else if endpoint.ends_with("/42") {
-                        Ok(original.clone())
-                    } else if endpoint.contains("/pulls?") {
-                        Ok(json!([pr.clone()]))
-                    } else if endpoint.contains("/compare/main...") {
-                        assert!(endpoint.ends_with(&"a".repeat(40)));
-                        Ok(
-                            json!({"merge_base_commit":{"sha":"b".repeat(40)},"files":[{"filename":if changed { DISPATCH_WORKFLOW } else { "source.rs" }}]}),
-                        )
-                    } else if endpoint.contains("/contents/") {
-                        Ok(
-                            json!({"type":"file","sha":if endpoint.ends_with("ref=main") { "c".repeat(40) } else { head_blob.repeat(40) }}),
-                        )
-                    } else if endpoint.ends_with("/jobs?per_page=100") {
-                        Ok(json!([{"jobs":review_jobs(9)}]))
-                    } else if endpoint.contains("/collaborators/") {
-                        permission(endpoint)
-                    } else {
-                        panic!("unexpected API endpoint: {endpoint}")
-                    }
-                },
-                &mut |_, _, _, _| None,
-            );
-            if result.is_ok() != allowed {
-                failures.push(format!(
-                    "bot={bot}, PR changed={changed}, head blob={head_blob}: admitted={}",
-                    result.is_ok()
-                ));
-            }
-        }
-        assert!(
-            failures.is_empty(),
-            "workflow admission errors: {failures:?}"
-        );
-    }
-    #[test]
-    fn dispatch_review_capped_comparison_requires_merge_base_blob_equality() {
-        for (head_blob, allowed) in [("b", true), ("c", false)] {
-            let run = review_run(99);
-            let mut original = review_run(42);
-            original["event"] = "issues".into();
-            original["head_branch"] = "main".into();
-            let pr = json!({"number":800,"user":{"login":"github-actions[bot]","type":"Bot"},"draft":true,
-                "head":{"ref":"work/dispatch-799-42","sha":"a".repeat(40),"repo":{"full_name":REPOSITORY}},"base":{"ref":"main"},
-                "body":"Closes #799\nDispatch run: https://github.com/carrick-sh/carrick/actions/runs/42"});
-            let mut blobs = Vec::new();
-            let admitted = Github::admits_run(&Admission::Agent, &run, &mut |_, endpoint, _, _| {
-                if endpoint.ends_with("/42") { Ok(original.clone()) }
-                else if endpoint.contains("/pulls?") { Ok(json!([pr.clone()])) }
-                else if endpoint.contains("/compare/") { Ok(json!({"files":vec![json!({"filename":"source.rs"});300],"merge_base_commit":{"sha":"b".repeat(40)}})) }
-                else if endpoint.contains("/contents/") {
-                    blobs.push(endpoint.to_owned());
-                    Ok(json!({"type":"file","sha":if endpoint.ends_with(&"a".repeat(40)) {head_blob.repeat(40)} else {"b".repeat(40)}}))
-                } else if endpoint.contains("/collaborators/") { permission(endpoint) }
-                else { panic!("unexpected endpoint {endpoint}") }
-            }, &mut |_, _, _, _| None).unwrap();
-            assert_eq!(admitted, allowed);
-            assert_eq!(blobs.len(), 2);
-            assert!(blobs[1].ends_with(&format!("ref={}", "b".repeat(40))));
-        }
-    }
-    #[test]
-    fn dispatch_review_expensive_checks_wait_for_unassigned_eligible_jobs() {
-        let runs: Vec<_> = (99..104).map(review_run).collect();
-        let mut checks = Vec::new();
-        let demand = Github::queued_jobs(
-            &Admission::Agent,
-            &["carrick-agent"],
-            &runs,
-            |run| {
-                let id = run["id"].as_u64().unwrap();
-                let mut jobs = review_jobs(id);
-                match id {
-                    99 => jobs[0]["status"] = "queued".into(),
-                    100 => {
-                        jobs[1]["status"] = "in_progress".into();
-                        jobs[1]["runner_id"] = 55.into();
-                    }
-                    101 => jobs[1]["labels"] = json!(["other-lane"]),
-                    103 => jobs[1]["runner_id"] = 55.into(),
-                    _ => {}
-                }
-                Ok(jobs)
-            },
-            |run| {
-                checks.push(run["id"].as_u64().unwrap());
-                Ok(true)
-            },
-        )
-        .unwrap();
-        assert_eq!(checks, vec![102], "API checks ran before cheap job filters");
-        assert_eq!(demand.len(), 1);
-        assert_eq!(demand[0].key.run, RunId(102));
-    }
-    #[test]
-    fn dispatch_review_api_failure_does_not_hide_other_demand() {
-        let runs = vec![review_run(99), review_run(100)];
-        let demand = Github::queued_jobs(
-            &Admission::Agent,
-            &["carrick-agent"],
-            &runs,
-            |run| Ok(review_jobs(run["id"].as_u64().unwrap())),
-            |run| {
-                if run["id"] == 99 {
-                    Github::admits_run(
-                        &Admission::Agent,
-                        run,
-                        &mut |_, _, _, _| Err(ScalerError::GithubGone),
-                        &mut |_, _, _, _| None,
-                    )
-                } else {
-                    Ok(true)
-                }
-            },
-        );
-        assert!(demand.is_ok(), "one missing review run blocked all demand");
-        let demand = demand.unwrap();
-        assert_eq!(demand.len(), 1);
-        assert_eq!(demand[0].key.run, RunId(100));
-        let key = JobKey {
-            run: RunId(99),
-            attempt: 1,
-            job: JobId(9),
-        };
-        assert!(
-            Github::vet_inner(
-                &Admission::Agent,
-                key,
-                |_, endpoint, _, _| {
-                    if endpoint.ends_with("/99") {
-                        Ok(review_run(99))
-                    } else {
-                        Err(ScalerError::GithubGone)
-                    }
-                },
-                &mut |_, _, _, _| None
-            )
-            .is_err()
-        );
-    }
-    #[test]
-    fn dispatch_vet_requires_this_attempts_successful_hosted_guard() {
-        let run = json!({"id":42,"run_attempt":2,"head_sha":"a".repeat(40), "head_branch":"main", "event":"issues",
-            "path":DISPATCH_WORKFLOW,"repository":{"full_name":REPOSITORY}, "head_repository":{"full_name":REPOSITORY},
-            "actor":{"login":"tjfontaine","type":"User"},"triggering_actor":{"login":"tjfontaine","type":"User"}});
-        let key = JobKey {
-            run: RunId(42),
-            attempt: 2,
-            job: JobId(9),
-        };
-        for (status, conclusion, permitted) in [
-            ("queued", "success", false),
-            ("completed", "failure", false),
-            ("completed", "success", true),
-        ] {
-            let policy = Github::vet_inner(
-                &Admission::Agent,
-                key,
-                |_, endpoint, _, paginated| {
-                    if endpoint.ends_with("/42") {
-                        return Ok(run.clone());
-                    }
-                    if endpoint.contains("/collaborators/") {
-                        return permission(endpoint);
-                    }
-                    assert_eq!(
-                        endpoint,
-                        "repos/carrick-sh/carrick/actions/runs/42/attempts/2/jobs?per_page=100"
-                    );
-                    assert!(paginated);
-                    Ok(
-                        json!([{"jobs":[{"name":"guard", "status":status,"conclusion":conclusion}]}]),
-                    )
-                },
-                &mut |_, _, _, _| None,
-            );
-            assert_eq!(policy.is_ok(), permitted);
-            if permitted {
-                assert!(matches!(policy.unwrap(), JobPolicy::Agent(_)));
-            }
-        }
-    }
     #[test]
     fn reservations_and_assignments_accept_main_push_and_dispatch_only() {
         let key = JobKey {
@@ -1561,16 +516,11 @@ mod tests {
                 "head_repository":{"full_name":REPOSITORY},
                 "actor":{"login":"tjfontaine"},
                 "triggering_actor":{"login":"tjfontaine"}});
-            let result = Github::vet_inner(
-                &Admission::Standing,
-                key,
-                |method, endpoint, _, _| {
-                    assert_eq!(method, "GET");
-                    assert!(endpoint.ends_with("/runs/1"), "{endpoint}");
-                    Ok(run.clone())
-                },
-                &mut |_, _, _, _| None,
-            );
+            let result = Github::vet_inner(&Admission::Standing, key, |method, endpoint, _, _| {
+                assert_eq!(method, "GET");
+                assert!(endpoint.ends_with("/runs/1"), "{endpoint}");
+                Ok(run.clone())
+            });
             assert_eq!(result.is_ok(), admitted, "{event} {branch}");
             if let Ok(policy) = result {
                 assert!(
@@ -1611,20 +561,14 @@ mod tests {
             let path = dir.path().join("ledger.json");
             let mut ledger = Ledger::default();
             let runs: Vec<_> = (1..=4).map(push_run).collect();
-            let demand = Github::queued_jobs(
-                &Admission::Standing,
-                labels,
-                &runs,
-                |run| {
-                    let n = run["id"].as_u64().unwrap();
-                    Ok(vec![hardware_job(
-                        n,
-                        labels,
-                        if n == 4 { "in_progress" } else { "queued" },
-                    )])
-                },
-                |_| Ok(true),
-            )
+            let demand = Github::queued_jobs(&Admission::Standing, labels, &runs, |run| {
+                let n = run["id"].as_u64().unwrap();
+                Ok(vec![hardware_job(
+                    n,
+                    labels,
+                    if n == 4 { "in_progress" } else { "queued" },
+                )])
+            })
             .unwrap();
             let mut cancelled = Vec::new();
             let ordered = coalesce_demand(&mut ledger, demand.clone(), &path, |entry| {
