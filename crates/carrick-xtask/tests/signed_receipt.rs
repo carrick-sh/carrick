@@ -523,7 +523,12 @@ else:
             .env("GITHUB_EVENT_NAME", "merge_group")
             .env("GITHUB_ACTOR", "github-merge-queue[bot]")
             .env("GITHUB_TRIGGERING_ACTOR", "github-merge-queue[bot]")
-            .env("GITHUB_REF", queue_ref)
+            .env(
+                "GITHUB_REF",
+                payload["merge_group"]["head_ref"]
+                    .as_str()
+                    .unwrap_or(queue_ref),
+            )
             .env("GITHUB_SHA", b.clone())
             .env("TEST_PENDING_BASE", "1")
             .env("TEST_QUEUE_ENTRIES", entries)
@@ -535,13 +540,15 @@ else:
             .unwrap()
     };
     let live_predecessor = serde_json::json!([{
+        "baseCommit": {"oid": d},
         "headCommit": {"oid": d},
         "pullRequest": {
             "number": 123,
             "baseRefName": "main",
             "baseRepository": {"nameWithOwner": "carrick-sh/carrick"}
         }
-    }]).to_string();
+    }])
+    .to_string();
     let queue = |payload: &serde_json::Value| queue_with_entries(payload, &live_predecessor);
     let queued = queue(&queue_payload);
     assert!(
@@ -573,7 +580,28 @@ else:
     // A first-parent ancestor is not enough: second-in-line authorization
     // requires the predecessor to still be a live entry in main's queue.
     let stale_base = queue_with_entries(&second, "[]");
-    assert!(!stale_base.status.success(), "accepted a non-live queue base");
+    let stale_was_refused = !stale_base.status.success();
+    let dequeued_entry = serde_json::json!([{
+        "baseCommit": {"oid": a},
+        "headCommit": {"oid": d},
+        "pullRequest": {
+            "number": 123,
+            "baseRefName": "main",
+            "baseRepository": {"nameWithOwner": "carrick-sh/carrick"}
+        }
+    }])
+    .to_string();
+    let dequeued_base = queue_with_entries(&second, &dequeued_entry);
+    let dequeued_was_refused = !dequeued_base.status.success();
+    let mut forged_ref = second.clone();
+    forged_ref["merge_group"]["head_ref"] =
+        json!("refs/heads/gh-readonly-queue/main/pr-999-forged");
+    let forged = queue(&forged_ref);
+    let forged_was_refused = !forged.status.success();
+    assert!(
+        stale_was_refused && dequeued_was_refused && forged_was_refused,
+        "refusal witnesses: stale={stale_was_refused}, dequeued={dequeued_was_refused}, forged={forged_was_refused}"
+    );
     for (field, bad) in [
         ("base_ref", "refs/heads/other"),
         ("head_ref", "refs/heads/feature"),
@@ -588,7 +616,7 @@ else:
     unrelated_base["merge_group"]["base_sha"] = json!(unrelated);
     let refused = queue(&unrelated_base);
     assert!(!refused.status.success());
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("not a first-parent ancestor"));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("not a live entry"));
     let mut wrong = queue_payload.clone();
     wrong["action"] = json!("destroyed");
     assert!(!queue(&wrong).status.success());
@@ -811,6 +839,19 @@ else:
         .env("GITHUB_EVENT_NAME", "merge_group")
         .env("GITHUB_REF", queue_ref)
         .env("GITHUB_SHA", c.clone())
+        .env(
+            "TEST_QUEUE_ENTRIES",
+            serde_json::json!([{
+                "baseCommit": {"oid": b},
+                "headCommit": {"oid": c},
+                "pullRequest": {
+                    "number": 123,
+                    "baseRefName": "main",
+                    "baseRepository": {"nameWithOwner": "carrick-sh/carrick"}
+                }
+            }])
+            .to_string(),
+        )
         .env("GITHUB_ACTOR", "merge-bot")
         .env("GITHUB_TRIGGERING_ACTOR", "merge-bot")
         .args(["signed-gate", "prepare", "--event"])
