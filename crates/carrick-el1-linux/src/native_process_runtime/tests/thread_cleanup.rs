@@ -399,3 +399,86 @@ fn two_raw_exits_finish_when_parked_cleanup_becomes_last() {
     assert!(entry.take_run_failure().is_none());
     assert_eq!(fixture.page.live(), 0);
 }
+
+#[test]
+fn raw_exit_waits_for_initial_fork_gate_then_finishes() {
+    for unadopted in [false, true] {
+        let fixture = native_exec_fixture();
+        let sibling = add_signal_sibling(&fixture, None, false);
+        if unadopted {
+            assert!(fixture.zone.mark_native_owned(sibling.record.id));
+        }
+        let word = carrick_test_support::GuestUserBuffer::from_value(42_u32);
+        sibling.control.set_clear_child_tid(word.arg());
+        let mut service = fixture.service();
+        service.tid_words.insert((1, word.arg()), 42);
+        fixture.page.close_for_fork().unwrap();
+        let source = BornInZoneSource {
+            zone: fixture.zone,
+            slot: sibling.slot,
+        };
+        {
+            let mut entry = fixture
+                .runtime
+                .enter_registered(
+                    fixture.registry,
+                    source,
+                    sibling.task,
+                    fixture.address,
+                    &words(fixture.address),
+                    &mut service,
+                )
+                .unwrap();
+            assert!(matches!(
+                entry
+                    .exit_thread(carrick_sched_core::process::TerminationStatus::exited(7))
+                    .unwrap(),
+                LifecycleOutcome::Transferred { .. }
+            ));
+            assert!(
+                entry.take_run_failure().is_none(),
+                "gate contention retains terminal custody"
+            );
+            assert!(entry.take_handoff_receipt().is_some());
+        }
+        assert_eq!(fixture.page.live(), 2);
+        assert_eq!(service.tid_words[&(1, word.arg())], 42);
+        assert!(!sibling.control.host_exit_requested());
+        fixture.page.reopen_after_fork().unwrap();
+        let notification = fixture.page.terminal_notification().unwrap();
+        publish_terminal_notification(
+            &notification,
+            fixture.zone,
+            fixture.slot,
+            &carrick_sched_core::ShortLockSpin,
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            fixture.zone.switch_in_full(sibling.slot).unwrap().record,
+            sibling.record.id
+        );
+        let saved = unsafe { fixture.runtime.record_binding(sibling.record) }
+            .unwrap()
+            .words;
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                sibling.task,
+                fixture.address,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.resume_checkpoint(|_| Ok(None)).unwrap(),
+            NativeResume::Left(None)
+        ));
+        assert!(entry.take_run_failure().is_none());
+        assert!(fixture.zone.live(sibling.record).is_none());
+        assert_eq!(fixture.page.live(), 1);
+        assert_eq!(sibling.control.clear_child_tid(), 0);
+    }
+}
