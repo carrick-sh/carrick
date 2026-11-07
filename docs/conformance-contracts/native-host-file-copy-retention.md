@@ -92,3 +92,27 @@ carrier-resource witnesses only. No crossing wire change, exact-task staging
 retention or production lazy-memory syscall witness is claimed by this
 checkpoint. The production staging path still has the two admission
 boundaries described above.
+
+## Completed host-file output checkpoint
+
+Host-file completion now validates the reply without touching user memory.
+The native service owner moves the validated output into its existing
+`OwnedCopyout` before retiring the request record and releases the previous
+service claim before attempting output. An owner refusal retains the bytes,
+original result and next page cursor; it does not issue another host read.
+The obsolete plain syscall-output copy hook and boolean completion callback
+are removed. A genuine copy or preparation fault remains errno 14.
+
+The VM-free native-process bindings
+`native_read_reply_retains_bytes_and_cursor_across_owner_wait` and
+`native_read_reply_fatal_cancellation_commits_no_more_bytes` run production
+read staging and HostFile service completion with a supplied carrier reply.
+They require one first-page delivery, an owner gate park on the second page,
+and either the remaining page alone on resume or no more bytes after fatal
+cancellation. The first binding fails on the preceding completion code
+because it returns EFAULT instead of parking. These bindings do not serve
+an actual host resource and do not establish descriptor retention.
+
+Descriptor admission before staging, retained vector input, carrier pin
+integration and production write/writev retention witnesses remain open.
+The completion checkpoint alone does not satisfy issue #1694.

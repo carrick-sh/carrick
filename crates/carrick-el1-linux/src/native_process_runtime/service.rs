@@ -628,8 +628,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                                 ServiceCompletion::RetrySyscall,
                             );
                         }
+                        Err(NativeProcessError::Fault) => {
+                            return Ok(NativeResume::Returned(SyscallResult::from_errno(
+                                carrick_syscall_abi::LINUX_EFAULT,
+                            )));
+                        }
                         Err(error) => return Err(error),
                     }
+                }
+                Err(NativeProcessError::Fault) => {
+                    return Ok(NativeResume::Returned(SyscallResult::from_errno(
+                        carrick_syscall_abi::LINUX_EFAULT,
+                    )));
                 }
                 Err(error) => return Err(error),
             }
@@ -2829,17 +2839,24 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             .complete_chdir(&pending_file.record, pending_file.call)
                             .map(NativeResume::Returned);
                     }
-                    let mut copy_out = |address: u64, bytes: &[u8]| {
-                        self.copy_syscall_output(carrick_guest_arch::UserVa::new(address), bytes)
-                            .is_ok()
-                    };
-                    Ok(NativeResume::Returned(
-                        carrick_personality_linux::native_host_file::complete(
-                            &pending_file.record,
-                            pending_file.output,
-                            &mut copy_out,
-                        ),
-                    ))
+                    let (result, bytes) = carrick_personality_linux::native_host_file::complete(
+                        &pending_file.record,
+                        pending_file.output,
+                    );
+                    if bytes.is_empty() {
+                        return Ok(NativeResume::Returned(result));
+                    }
+                    let output = pending_file.output.ok_or(NativeProcessError::Quarantined)?;
+                    // The host effect is already complete. Retain its answer
+                    // before dropping the record, and unwind the service claim
+                    // before enrolling on an output-owner refusal.
+                    self.copyout_ready = Some(Box::new(OwnedCopyout {
+                        address: UserVa::new(output.address),
+                        bytes: bytes.to_vec(),
+                        offset: 0,
+                        result,
+                    }));
+                    Ok(NativeResume::NoPending)
                 }
                 (ServiceOperation::HostFile { .. }, ServiceResult::Supplied) => {
                     // Supplied without a reply is a transport violation.
