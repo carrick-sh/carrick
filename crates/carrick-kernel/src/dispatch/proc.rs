@@ -4646,7 +4646,8 @@ impl<M: CurrentMmMemory> EntropyPrepared for super::copyout::PreparedArrayOut<'_
         self.records()
     }
     fn commit(self, bytes: &[u8]) -> Result<(), Box<DispatchOutcome>> {
-        self.commit(bytes).map_err(|fault| Box::new(fault.outcome()))
+        self.commit(bytes)
+            .map_err(|fault| Box::new(fault.outcome()))
     }
 }
 struct StagingEntropyMemory<'a>(&'a mut [u8]);
@@ -4661,7 +4662,8 @@ impl EntropyMemory for StagingEntropyMemory<'_> {
         address: u64,
         length: usize,
     ) -> Result<Self::Prepared<'_>, Box<DispatchOutcome>> {
-        let offset = usize::try_from(address).map_err(|_| Box::new(DispatchOutcome::errno(LINUX_EFAULT)))?;
+        let offset =
+            usize::try_from(address).map_err(|_| Box::new(DispatchOutcome::errno(LINUX_EFAULT)))?;
         let end = offset
             .checked_add(length)
             .ok_or_else(|| Box::new(DispatchOutcome::errno(LINUX_EFAULT)))?;
