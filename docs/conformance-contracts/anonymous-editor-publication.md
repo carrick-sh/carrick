@@ -78,6 +78,53 @@ other runnable tasks still make progress. The final signed population must
 then be collected on the resulting head; the historical population does not
 discharge this obligation.
 
+## Reviewed integration boundary for a retained pause
+
+The host's existing pause is not an asynchronous acquisition interface.
+`carrick-kernel::dispatch::mm_quiesce::pause_exact_mm` calls
+`drain_exact_mm`, which waits for resident departures. Its test-only
+`try_drain_exact_mm` does not provide production continuation custody.
+Calling the synchronous pause from an anonymous service would occupy an
+executor while waiting for guest tasks.
+
+`carrick-runtime::vcpu_loop::binding::RetainedMemoryAction` is the existing
+capacity-releasing owner to extend if acquisition is carried by the host.
+It currently has no anonymous reservation operation or originating syscall
+frame. The process-quiesce suspension beside it waits for a fork barrier's
+release, not for the page-table coordinator's exact resident population to
+drain. Neither API can be substituted without changing its ownership contract.
+
+The proposed acquisition order, requiring a separate interface review before
+implementation, is:
+
+1. Capture the anonymous proposal and originating task generation before any
+   descriptor effect. Release the reservation model borrow and guest editor
+   before submitting pause acquisition. Keep the pending reservation owned;
+   do not cancel it merely to recreate the syscall later.
+2. Elect one exact-MM pause owner and close entry admission before observing
+   residents. Retain that owner and an authenticated drain subscription in
+   the capacity-releasing action. Enrollment must precede the final resident
+   probe, covering a departure between observation and park publication.
+3. Prompt both resident execution and concurrent installers through their
+   existing host/guest admission handshake. A wake is a prompt to recheck
+   the owned drain, not an acknowledgment inferred from elapsed time or a
+   generation counter.
+4. Once drained, lend the paused target's exact descriptor authority to the
+   original operation. Reacquire its reservation model and maintenance editor
+   only for the descriptor transaction; neither borrow crosses a park.
+5. Settle descriptor invalidation, root metadata and backing receipts before
+   releasing the pause and completing the original syscall. Cancellation
+   before mutation refuses the proposal; cancellation after mutation retains
+   settlement custody and suppresses only delivery to the departed origin.
+
+The forbidden lock edge is guest editor → host pause acquisition: the host
+raises the gate and waits for the same guest editor, producing a cycle. The
+reverse transfer must therefore cross an owned, unmutated proposal, not a
+borrowed editor or an applied but untracked edit. New request/receipt layouts
+and the cross-crate lock order need the separate design review required by
+AGENTS.md. This describes an integration boundary, not an implemented pause
+protocol, and supplies no new runtime or signed acceptance evidence.
+
 ## Existing venues and the missing integration
 
 `carrick-personality-linux::pending_anonymous::serve` currently has no owned
