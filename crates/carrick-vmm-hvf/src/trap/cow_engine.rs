@@ -7452,15 +7452,13 @@ impl HvfTaskState {
                 self.page_tables_authority().with_manager(|manager| {
                     let leaf =
                         carrick_mmu_core::aarch64::terminal_descriptor(manager.debug_walk(va));
-                    if carrick_mmu_core::aarch64::terminal_descriptor_has_el1_private_authority(
-                        leaf,
-                    ) {
+                    if carrick_mmu_core::aarch64::terminal_descriptor_is_fork_cow(leaf) {
                         carrick_mmu_core::aarch64::terminal_descriptor_may_write(leaf)
                     } else {
-                        // Untagged leaves carry no fork write intent. Their
-                        // live AP permission is authoritative, including a
-                        // later owner mprotect. Fork adopts writable host
-                        // leaves explicitly before lowering AP.
+                        // Without a fork marker, bit 57 is only a ceiling
+                        // on tagged leaves, and absent on host leaves. Live
+                        // AP permission supplies current write authority in
+                        // both cases, including after owner mprotect.
                         carrick_mmu_core::aarch64::terminal_descriptor_permits_el0(
                             leaf,
                             carrick_mmu_core::aarch64::LeafAccess::Write,
