@@ -1393,7 +1393,7 @@ if args[:2] == ['run', 'download']:
     shutil.copyfile(baselines / (sha + '.json'), pathlib.Path(args[args.index('--dir') + 1]) / 'candidate.json')
 elif args[:2] == ['api', 'graphql']:
     nodes = json.loads(os.environ['TEST_QUEUE_ENTRIES'])
-    print(json.dumps({{'data': {{'repository': {{'mergeQueue': {{'entries': {{'nodes': nodes}}}}}}}}}}))
+    print(json.dumps({{'data': {{'repository': {{'mergeQueue': {{'entries': {{'nodes': nodes, 'pageInfo': {{'hasNextPage': False}}}}}}}}}}}}))
 elif args[0] == 'api':
     endpoint = args[-1]
     if '/compare/' in endpoint and '?per_page=' not in endpoint:
@@ -1412,7 +1412,7 @@ elif args[0] == 'api':
         commits = [{{'sha': line}} for line in proc.stdout.splitlines() if line]
         print(json.dumps([{{'commits': commits}}]))
     elif '/commits/' in endpoint and '/pulls?' in endpoint:
-        print(json.dumps([[{{'number': 901, 'base': {{'ref': 'main', 'repo': {{'full_name': 'carrick-sh/carrick'}}}}}}]]))
+        print(json.dumps([[{{'number': 901, 'merged_at': '2026-01-01T00:00:00Z', 'base': {{'ref': 'main', 'repo': {{'full_name': 'carrick-sh/carrick'}}}}}}]]))
     elif '/workflows/signed-gate.yml/runs' in endpoint:
         run = {{'id': 100, 'path': '.github/workflows/signed-gate.yml', 'head_branch': 'main', 'event': 'workflow_dispatch', 'status': 'completed', 'repository': {{'full_name': 'carrick-sh/carrick'}}, 'head_repository': {{'full_name': 'carrick-sh/carrick'}}, 'actor': {{'login': 'tjfontaine'}}, 'triggering_actor': {{'login': 'tjfontaine'}}}}
         print(json.dumps([{{'workflow_runs': [run]}}]))
@@ -1581,11 +1581,13 @@ fn queued_merge_group_resolves_rebased_prs_and_names_them_in_published_receipt()
     let ref_1799 = format!("refs/heads/gh-readonly-queue/main/pr-1799-{b}");
     let ref_1700 = format!("refs/heads/gh-readonly-queue/main/pr-1700-{a}");
     let ref_1801 = format!("refs/heads/gh-readonly-queue/main/pr-1801-{a}");
+    let ref_1802 = format!("refs/heads/gh-readonly-queue/main/pr-1802-{a}");
     git(&["update-ref", &ref_1762, &d]);
     git(&["update-ref", &ref_1788, &b]);
     git(&["update-ref", &ref_1799, &c]);
     git(&["update-ref", &ref_1700, &stale]);
     git(&["update-ref", &ref_1801, &batched]);
+    git(&["update-ref", &ref_1802, &batched]);
 
     let real_git = String::from_utf8(Command::new("which").arg("git").output().unwrap().stdout)
         .unwrap()
@@ -1639,7 +1641,7 @@ fn queued_merge_group_resolves_rebased_prs_and_names_them_in_published_receipt()
                 }
             },
             {
-                "baseCommit": { "oid": c },
+                "baseCommit": { "oid": a },
                 "headCommit": { "oid": batched_mid },
                 "pullRequest": {
                     "number": 1801,
@@ -1684,14 +1686,14 @@ elif '--method' in args and args[args.index('--method') + 1] == 'POST':
         out.write(json.dumps({'endpoint': endpoint, 'body': json.load(sys.stdin)}) + '\n')
 elif args[:2] == ['api', 'graphql']:
     nodes = json.loads(pathlib.Path(os.environ['TEST_ENTRIES']).read_text())
-    print(json.dumps({'data': {'repository': {'mergeQueue': {'entries': {'nodes': nodes}}}}}))
+    print(json.dumps({'data': {'repository': {'mergeQueue': {'entries': {'nodes': nodes, 'pageInfo': {'hasNextPage': False}}}}}}))
 elif args[0] == 'api':
     endpoint = args[-1]
     if '/commits/' in endpoint and '/pulls?' in endpoint:
         sha = endpoint.split('/commits/')[1].split('/pulls', 1)[0]
         merged = json.loads(pathlib.Path(os.environ['TEST_MERGED_PULLS']).read_text())
         rows = [
-            {'number': n, 'base': {'ref': 'main', 'repo': {'full_name': 'carrick-sh/carrick'}}}
+            {'number': n, 'merged_at': '2026-01-01T00:00:00Z', 'base': {'ref': 'main', 'repo': {'full_name': 'carrick-sh/carrick'}}}
             for n in merged.get(sha, [])
         ]
         print(json.dumps([rows]))
@@ -1773,7 +1775,7 @@ else:
     assert_eq!(second_req["prs"], json!([1762, 1788]));
 
     // (3) Batched multi-PR group resolves every queued entry in the range.
-    let (batched_req, _) = run_prepare("batched", &ref_1801, &a, &batched);
+    let (batched_req, _) = run_prepare("batched", &ref_1802, &a, &batched);
     assert_eq!(batched_req["base"], a);
     assert_eq!(batched_req["prs"], json!([1801, 1802]));
 

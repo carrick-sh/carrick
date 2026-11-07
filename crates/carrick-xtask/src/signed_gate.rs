@@ -271,6 +271,21 @@ fn parse_queue_ref_pr(git_ref: &str) -> Option<u64> {
     digits.parse::<u64>().ok().filter(|&n| n > 0)
 }
 
+fn is_ancestor(graph: &Path, ancestor: &str, descendant: &str) -> Result<bool, ReceiptError> {
+    let status = Command::new("git")
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .current_dir(graph)
+        .status()
+        .map_err(|error| fail(error.to_string()))?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(fail(format!(
+            "git merge-base --is-ancestor failed with {status}"
+        ))),
+    }
+}
+
 fn resolve_merge_group_prs(
     graph: &Path,
     base: &str,
@@ -291,7 +306,7 @@ fn resolve_merge_group_prs(
     let queued_ordered: Vec<&str> = rev_list.lines().filter(|s| !s.is_empty()).collect();
     let group_commits: std::collections::BTreeSet<&str> = queued_ordered.iter().copied().collect();
     let mut prs = std::collections::BTreeSet::new();
-    let mut matched_commits = std::collections::BTreeSet::new();
+    let mut covered_commits = std::collections::BTreeSet::new();
     let queue_pr = parse_queue_ref_pr(git_ref)
         .ok_or_else(|| fail("merge-group ref does not contain a valid queue PR number"))?;
     let remote_refs = checked(
@@ -314,13 +329,35 @@ fn resolve_merge_group_prs(
     }
     for node in queue_entries {
         if let Some(oid) = node["headCommit"]["oid"].as_str()
+            && let Some(base_oid) = node["baseCommit"]["oid"].as_str()
             && group_commits.contains(oid)
             && node["pullRequest"]["baseRefName"] == "main"
             && node["pullRequest"]["baseRepository"]["nameWithOwner"] == REPOSITORY
             && let Some(number) = node["pullRequest"]["number"].as_u64()
         {
             prs.insert(number);
-            matched_commits.insert(oid.to_owned());
+            if let Some(head_index) = queued_ordered.iter().position(|commit| *commit == oid) {
+                let first_index = if base_oid == base {
+                    Some(0)
+                } else {
+                    let base_position = queued_ordered
+                        .iter()
+                        .position(|commit| *commit == base_oid)
+                        .map(|index| index + 1);
+                    match base_position {
+                        Some(index) => Some(index),
+                        None if is_ancestor(graph, base_oid, base)? => Some(0),
+                        None => None,
+                    }
+                };
+                if let Some(first_index) = first_index.filter(|index| *index <= head_index) {
+                    covered_commits.extend(
+                        queued_ordered[first_index..=head_index]
+                            .iter()
+                            .map(|commit| (*commit).to_owned()),
+                    );
+                }
+            }
         }
     }
     if !queue_entries.iter().any(|node| {
@@ -337,16 +374,16 @@ fn resolve_merge_group_prs(
     // queried, its queue entry disappeared and /commits/{sha}/pulls now links it.
     // Queue entries merge strictly FIFO from main, so any already-merged entries
     // form a prefix before the earliest commit still present in mergeQueue.
-    let fallback_end = if matched_commits.contains(requested_sha) {
+    let fallback_end = if covered_commits.contains(requested_sha) {
         queued_ordered
             .iter()
-            .position(|c| matched_commits.contains(*c))
+            .position(|commit| covered_commits.contains(*commit))
             .unwrap_or(queued_ordered.len())
     } else {
         queued_ordered.len()
     };
     for &commit_sha in &queued_ordered[..fallback_end] {
-        if matched_commits.contains(commit_sha) {
+        if covered_commits.contains(commit_sha) {
             continue;
         }
         let mut attributed = false;
