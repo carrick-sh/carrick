@@ -4611,11 +4611,11 @@ trait EntropyMemory {
         &mut self,
         address: u64,
         length: usize,
-    ) -> Result<Self::Prepared<'_>, DispatchOutcome>;
+    ) -> Result<Self::Prepared<'_>, Box<DispatchOutcome>>;
 }
 trait EntropyPrepared {
     fn capacity(&self) -> usize;
-    fn commit(self, bytes: &[u8]) -> Result<(), DispatchOutcome>;
+    fn commit(self, bytes: &[u8]) -> Result<(), Box<DispatchOutcome>>;
 }
 struct HandlerEntropyMemory<'a, M> {
     context: &'a crate::kernel::KernelContext,
@@ -4630,7 +4630,7 @@ impl<M: CurrentMmMemory> EntropyMemory for HandlerEntropyMemory<'_, M> {
         &mut self,
         address: u64,
         length: usize,
-    ) -> Result<Self::Prepared<'_>, DispatchOutcome> {
+    ) -> Result<Self::Prepared<'_>, Box<DispatchOutcome>> {
         super::copyout::prepare_array(
             self.context,
             self.memory,
@@ -4638,15 +4638,15 @@ impl<M: CurrentMmMemory> EntropyMemory for HandlerEntropyMemory<'_, M> {
             length,
             1,
         )
-        .map_err(|refusal| refusal.into_outcome())
+        .map_err(|refusal| Box::new(refusal.into_outcome()))
     }
 }
 impl<M: CurrentMmMemory> EntropyPrepared for super::copyout::PreparedArrayOut<'_, M> {
     fn capacity(&self) -> usize {
         self.records()
     }
-    fn commit(self, bytes: &[u8]) -> Result<(), DispatchOutcome> {
-        self.commit(bytes).map_err(|fault| fault.outcome())
+    fn commit(self, bytes: &[u8]) -> Result<(), Box<DispatchOutcome>> {
+        self.commit(bytes).map_err(|fault| Box::new(fault.outcome()))
     }
 }
 struct StagingEntropyMemory<'a>(&'a mut [u8]);
@@ -4660,22 +4660,22 @@ impl EntropyMemory for StagingEntropyMemory<'_> {
         &mut self,
         address: u64,
         length: usize,
-    ) -> Result<Self::Prepared<'_>, DispatchOutcome> {
-        let offset = usize::try_from(address).map_err(|_| DispatchOutcome::errno(LINUX_EFAULT))?;
+    ) -> Result<Self::Prepared<'_>, Box<DispatchOutcome>> {
+        let offset = usize::try_from(address).map_err(|_| Box::new(DispatchOutcome::errno(LINUX_EFAULT)))?;
         let end = offset
             .checked_add(length)
-            .ok_or(DispatchOutcome::errno(LINUX_EFAULT))?;
+            .ok_or_else(|| Box::new(DispatchOutcome::errno(LINUX_EFAULT)))?;
         self.0
             .get_mut(offset..end)
             .map(StagingEntropyPrepared)
-            .ok_or(DispatchOutcome::errno(LINUX_EFAULT))
+            .ok_or_else(|| Box::new(DispatchOutcome::errno(LINUX_EFAULT)))
     }
 }
 impl EntropyPrepared for StagingEntropyPrepared<'_> {
     fn capacity(&self) -> usize {
         self.0.len()
     }
-    fn commit(self, bytes: &[u8]) -> Result<(), DispatchOutcome> {
+    fn commit(self, bytes: &[u8]) -> Result<(), Box<DispatchOutcome>> {
         self.0.copy_from_slice(bytes);
         Ok(())
     }
@@ -4716,7 +4716,7 @@ fn getrandom(
             Ok(out) => out,
             Err(refusal) => {
                 return Ok(if offset == 0 {
-                    refusal
+                    *refusal
                 } else {
                     DispatchOutcome::returned_len(offset)?
                 });
@@ -4745,7 +4745,7 @@ fn getrandom(
         }
         if let Err(fault) = out.commit(&bytes) {
             return Ok(if offset == 0 {
-                fault
+                *fault
             } else {
                 DispatchOutcome::returned_len(offset)?
             });
