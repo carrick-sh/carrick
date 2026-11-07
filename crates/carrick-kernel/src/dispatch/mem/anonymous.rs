@@ -1935,7 +1935,16 @@ impl MemView<'_> {
             && let Some(reservation_prot) = reservation_prot
         {
             match self.propose(mem, &root, |model| {
-                model.mmap(placement, length, reservation_prot)
+                match model.mmap(placement, length, reservation_prot) {
+                    // A rejected advisory hint does not change the mapping's
+                    // owner. In particular a hint into PIE text must relocate
+                    // through this same anonymous owner, rather than acquire
+                    // the opaque placeholder of a host-served mapping.
+                    Err(Refusal::ForeignMapping) if matches!(placement, Placement::Hint(_)) => {
+                        model.mmap(Placement::Anywhere, length, reservation_prot)
+                    }
+                    result => result,
+                }
             })? {
                 Ok(request) => {
                     // What the root held no node for is fresh memory, however

@@ -27,6 +27,7 @@ structural_budgets = []
 # witnesses; core.entry.completion owns result/work publication and counting.
 # The dispatch-only mmap/brk fallback test is not a permission-editor witness.
 vm_free = [
+  "carrick-kernel::dispatch::mem::delegated_tests::{delegated_occupied_pie_hint_relocates_to_owner_code_range,serial_host_delegated_occupied_pie_hint_code_range_writes_and_executes} (occupied PIE hint after a 512 MiB cage; relocated whole 256 MiB RWX commit remains owner-admitted, zero legacy publication; native stores and generated x86 code; red at ENOMEM before owner relocation fix)",
   "carrick-kernel::dispatch::mem::delegated_tests::{delegated_whole_code_range_keeps_owner_protection,serial_host_delegated_whole_code_range_writes_and_executes} (whole 256 MiB arena PROT_NONE MAP_NORESERVE to RWX at 0x6020000000; passing control before continuation fix, not reproduction of signed Node failure)",
   "carrick-kernel::dispatch::mem::delegated_tests::serial_host_delegated_outside_hint_native_store_survives_protection (Linux host: production admitted-owner mmap/mprotect, real native PROT_NONE 256 MiB outside-arena hint and unhinted control, volatile stores after owner-published RW/RWX; no VMM execution claim)",
   "carrick-el1-linux::aarch64_process_tests::native_fault_supply_tests::native_owner_whole_code_range_writes_and_executes (native process admission and Linux entry with whole 256 MiB RWX commit, zero pre-commit touches, then resident owner protection and generated host-code execution; no signed/VMM acceptance)",
