@@ -2432,8 +2432,19 @@ impl<
             }
             return false;
         }
+        if ordinal == carrick_personality_linux::crossing::nr::FCNTL.raw() {
+            return self.frame.argument(1) == Some(carrick_abi::LINUX_F_GETFD)
+                && self.task().is_some_and(|task| {
+                    super::file_table::host_binding_descriptor_flags(
+                        self.fd_map,
+                        task.linux.file_table.load(Ordering::Acquire),
+                        self.frame.argument(0).unwrap_or(0) as i32,
+                    )
+                    .is_some()
+                });
+        }
         if self.frame.may_serve_descriptor() {
-            return ordinal != carrick_personality_linux::crossing::nr::FCNTL.raw();
+            return true;
         }
         if ![
             carrick_personality_linux::crossing::nr::DUP,
@@ -2750,6 +2761,15 @@ impl<
         let file_table = task.linux.file_table.load(Ordering::Acquire).max(1);
         let ordinal = self.frame.canonical_ordinal().raw();
         let old = self.frame.argument(0).unwrap_or(0) as i32;
+        if ordinal == carrick_personality_linux::crossing::nr::FCNTL.raw() {
+            if self.frame.argument(1) != Some(carrick_abi::LINUX_F_GETFD) {
+                return FamilyCompletion::Forward;
+            }
+            return super::file_table::host_binding_descriptor_flags(self.fd_map, file_table, old)
+                .map_or(FamilyCompletion::Forward, |flags| {
+                    FamilyCompletion::Complete(i64::from(flags))
+                });
+        }
         let result = match ordinal {
             nr if nr == carrick_personality_linux::crossing::nr::DUP.raw() => {
                 super::file_table::dup_host_binding(
