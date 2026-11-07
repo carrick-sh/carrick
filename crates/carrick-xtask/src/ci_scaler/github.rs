@@ -84,9 +84,9 @@ pub(crate) fn dispatch_workflow_unchanged(
     Ok(blobs[0] == blobs[1])
 }
 
-pub(super) struct Github;
+pub(crate) struct Github;
 impl Github {
-    pub(super) fn request(
+    pub(crate) fn request(
         &self,
         method: &str,
         endpoint: &str,

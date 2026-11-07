@@ -1,0 +1,410 @@
+[
+  {
+    "method": "POST",
+    "endpoint": "graphql",
+    "contains": "projectV2(number:1)",
+    "response": {
+      "data": {
+        "organization": {
+          "projectV2": {
+            "id": "project",
+            "fields": {
+              "nodes": [
+                {
+                  "id": "field",
+                  "name": "Status",
+                  "options": [
+                    {
+                      "name": "Todo",
+                      "id": "option-Todo"
+                    },
+                    {
+                      "name": "In progress",
+                      "id": "option-In progress"
+                    },
+                    {
+                      "name": "In review",
+                      "id": "option-In review"
+                    },
+                    {
+                      "name": "Blocked",
+                      "id": "option-Blocked"
+                    },
+                    {
+                      "name": "Done",
+                      "id": "option-Done"
+                    }
+                  ]
+                }
+              ],
+              "pageInfo": {
+                "hasNextPage": false,
+                "endCursor": null
+              }
+            },
+            "items": {
+              "nodes": [
+                {
+                  "id": "item-887",
+                  "content": {
+                    "id": "I_887",
+                    "number": 887,
+                    "repository": {
+                      "nameWithOwner": "carrick-sh/carrick"
+                    }
+                  },
+                  "fieldValueByName": {
+                    "name": "Blocked"
+                  }
+                },
+                {
+                  "id": "item-777",
+                  "content": {
+                    "id": "I_done",
+                    "number": 777,
+                    "repository": {
+                      "nameWithOwner": "carrick-sh/carrick"
+                    }
+                  },
+                  "fieldValueByName": {
+                    "name": "Done"
+                  }
+                }
+              ],
+              "pageInfo": {
+                "hasNextPage": true,
+                "endCursor": "project-1"
+              }
+            }
+          }
+        }
+      }
+    },
+    "variables": {
+      "cursor": null
+    }
+  },
+  {
+    "method": "POST",
+    "endpoint": "graphql",
+    "contains": "projectV2(number:1)",
+    "response": {
+      "data": {
+        "organization": {
+          "projectV2": {
+            "id": "project",
+            "fields": {
+              "nodes": [
+                {
+                  "id": "field",
+                  "name": "Status",
+                  "options": [
+                    {
+                      "name": "Todo",
+                      "id": "option-Todo"
+                    },
+                    {
+                      "name": "In progress",
+                      "id": "option-In progress"
+                    },
+                    {
+                      "name": "In review",
+                      "id": "option-In review"
+                    },
+                    {
+                      "name": "Blocked",
+                      "id": "option-Blocked"
+                    },
+                    {
+                      "name": "Done",
+                      "id": "option-Done"
+                    }
+                  ]
+                }
+              ],
+              "pageInfo": {
+                "hasNextPage": false,
+                "endCursor": null
+              }
+            },
+            "items": {
+              "nodes": [
+                {
+                  "id": "item-999",
+                  "content": {
+                    "id": "I_closed",
+                    "number": 999,
+                    "repository": {
+                      "nameWithOwner": "carrick-sh/carrick"
+                    }
+                  },
+                  "fieldValueByName": {
+                    "name": "Todo"
+                  }
+                }
+              ],
+              "pageInfo": {
+                "hasNextPage": false,
+                "endCursor": null
+              }
+            }
+          }
+        }
+      }
+    },
+    "variables": {
+      "cursor": "project-1"
+    }
+  },
+  {
+    "method": "POST",
+    "endpoint": "graphql",
+    "contains": "issues(first:100",
+    "response": {
+      "data": {
+        "repository": {
+          "issues": {
+            "nodes": [
+              {
+                "id": "I_887"
+              },
+              {
+                "id": "I_done"
+              }
+            ],
+            "pageInfo": {
+              "hasNextPage": true,
+              "endCursor": "issues-1"
+            }
+          }
+        }
+      }
+    },
+    "variables": {
+      "cursor": null
+    }
+  },
+  {
+    "method": "POST",
+    "endpoint": "graphql",
+    "contains": "issues(first:100",
+    "response": {
+      "data": {
+        "repository": {
+          "issues": {
+            "nodes": [],
+            "pageInfo": {
+              "hasNextPage": false,
+              "endCursor": null
+            }
+          }
+        }
+      }
+    },
+    "variables": {
+      "cursor": "issues-1"
+    }
+  },
+  {
+    "method": "POST",
+    "endpoint": "graphql",
+    "contains": "pullRequests(first:100",
+    "response": {
+      "data": {
+        "repository": {
+          "pullRequests": {
+            "nodes": [
+              {
+                "id": "PR_test"
+              }
+            ],
+            "pageInfo": {
+              "hasNextPage": false,
+              "endCursor": null
+            }
+          }
+        }
+      }
+    },
+    "variables": {
+      "cursor": null
+    }
+  },
+  {
+    "method": "POST",
+    "endpoint": "graphql",
+    "contains": "nodes(ids:$ids)",
+    "response": {
+      "data": {
+        "nodes": [
+          {
+            "__typename": "Issue",
+            "id": "I_887",
+            "number": 887,
+            "state": "OPEN",
+            "comments": {
+              "nodes": [
+                {
+                  "author": {
+                    "login": "github-actions[bot]"
+                  },
+                  "body": "Dispatch outcome: Blocked\n",
+                  "createdAt": "2026-11-06T00:00:00Z"
+                }
+              ],
+              "pageInfo": {
+                "hasNextPage": true,
+                "endCursor": "comments-1"
+              }
+            },
+            "updatedAt": "2026-11-07T00:00:00Z"
+          },
+          {
+            "__typename": "Issue",
+            "id": "I_closed",
+            "number": 999,
+            "state": "CLOSED",
+            "updatedAt": "2026-11-07T00:00:00Z",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "hasNextPage": false,
+                "endCursor": null
+              }
+            }
+          },
+          {
+            "__typename": "PullRequest",
+            "id": "PR_test",
+            "number": 100,
+            "state": "OPEN",
+            "updatedAt": "2026-11-05T00:00:00Z",
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "hasNextPage": false,
+                "endCursor": null
+              }
+            },
+            "isDraft": true,
+            "headRefOid": "abc",
+            "reviews": {
+              "nodes": [],
+              "pageInfo": {
+                "hasNextPage": true,
+                "endCursor": "reviews-1"
+              }
+            },
+            "closingIssuesReferences": {
+              "nodes": [
+                {
+                  "id": "I_887",
+                  "number": 887,
+                  "repository": {
+                    "nameWithOwner": "carrick-sh/carrick"
+                  }
+                }
+              ],
+              "pageInfo": {
+                "hasNextPage": false,
+                "endCursor": null
+              }
+            }
+          }
+        ]
+      }
+    },
+    "variables": {
+      "ids": [
+        "I_887",
+        "I_closed",
+        "PR_test"
+      ]
+    }
+  },
+  {
+    "method": "POST",
+    "endpoint": "graphql",
+    "contains": "n0:node(id:$id0)",
+    "response": {
+      "data": {
+        "n0": {
+          "reviews": {
+            "nodes": [
+              {
+                "state": "COMMENTED",
+                "body": "Verdict: APPROVE",
+                "submittedAt": "2026-11-07T00:00:00Z",
+                "commit": {
+                  "oid": "abc"
+                }
+              }
+            ],
+            "pageInfo": {
+              "hasNextPage": false,
+              "endCursor": null
+            }
+          }
+        },
+        "n1": {
+          "comments": {
+            "nodes": [
+              {
+                "author": {
+                  "login": "tjfontaine"
+                },
+                "body": "Resume work",
+                "createdAt": "2026-11-07T00:00:00Z"
+              }
+            ],
+            "pageInfo": {
+              "hasNextPage": false,
+              "endCursor": null
+            }
+          }
+        }
+      }
+    },
+    "variables": {
+      "id0": "PR_test",
+      "cursor0": "reviews-1",
+      "id1": "I_887",
+      "cursor1": "comments-1"
+    }
+  },
+  {
+    "method": "GET",
+    "endpoint": "repos/carrick-sh/carrick/actions/workflows/dispatch-worker.yml/runs?status=in_progress&per_page=100",
+    "response": [
+      {
+        "workflow_runs": [
+          {
+            "id": 42
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "method": "GET",
+    "endpoint": "repos/carrick-sh/carrick/actions/runs/42/jobs?per_page=100",
+    "response": [
+      {
+        "jobs": [
+          {
+            "steps": [
+              {
+                "name": "Dispatch issue 887",
+                "conclusion": "success"
+              },
+              {
+                "name": "Dispatch issue 123",
+                "conclusion": "failure"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+]

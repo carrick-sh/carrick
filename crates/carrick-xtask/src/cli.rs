@@ -20,6 +20,8 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Reconcile organization project 1 from GitHub facts (dry-run by default).
+    Board(crate::board::Args),
     /// Start or attach to the job-local compiler cache under its socket lock.
     CompilerCacheStart,
     #[command(about = "Acquire and renew CAS leases over refs/claims/*")]
@@ -478,6 +480,10 @@ where
         Commands::Workorder(args) => {
             let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
             crate::workorder::run(&root, args, writer)?;
+            Ok(())
+        }
+        Commands::Board(args) => {
+            crate::board::run(args, writer)?;
             Ok(())
         }
         Commands::Claims(args) => {
