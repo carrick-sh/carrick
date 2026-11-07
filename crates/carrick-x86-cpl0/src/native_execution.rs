@@ -137,6 +137,7 @@ pub fn schedule(slot: SlotId) -> ! {
                     // RetrySyscall re-enters an ARM exec-staging SVC; x86 has
                     // no native exec service, so it is as invalid here.
                     carrick_el1_linux::native_process_runtime::NativeResume::Invalid
+                    | carrick_el1_linux::native_process_runtime::NativeResume::RetrySavedSyscall
                     | carrick_el1_linux::native_process_runtime::NativeResume::RetrySyscall => {
                         fatal_boot()
                     }
