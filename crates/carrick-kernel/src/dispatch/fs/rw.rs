@@ -736,15 +736,26 @@ fn deliver_read<M: CurrentMmMemory>(
 }
 
 fn synthetic_device_read(kind: &carrick_vfs::SyntheticDeviceKind, length: usize) -> Vec<u8> {
+    if *kind == carrick_vfs::SyntheticDeviceKind::Null {
+        return Vec::new();
+    }
+    let mut bytes = vec![0; length];
+    let len = synthetic_device_read_into(*kind, &mut bytes);
+    bytes.truncate(len);
+    bytes
+}
+
+fn synthetic_device_read_into(kind: carrick_vfs::SyntheticDeviceKind, bytes: &mut [u8]) -> usize {
     match kind {
-        carrick_vfs::SyntheticDeviceKind::Null => Vec::new(),
+        carrick_vfs::SyntheticDeviceKind::Null => return 0,
         carrick_vfs::SyntheticDeviceKind::Zero | carrick_vfs::SyntheticDeviceKind::Full => {
-            vec![0u8; length]
+            bytes.fill(0)
         }
         carrick_vfs::SyntheticDeviceKind::Random | carrick_vfs::SyntheticDeviceKind::Urandom => {
-            random_device_bytes(length)
+            random_device_bytes(&mut *bytes);
         }
     }
+    bytes.len()
 }
 
 /// `write(2)` on a synthetic device: `/dev/full` is full, the rest swallow.
@@ -1341,15 +1352,17 @@ impl<'a> FsView<'a> {
         contents: &[u8],
         at: usize,
         dst: &mut [u8],
-    ) -> Result<usize, DispatchOutcome> {
+    ) -> Result<usize, Box<DispatchOutcome>> {
         let self_pid = crate::vfs::proc::self_linux_pid(self.synthetic_proc_identity(kernel));
         if crate::vfs::proc::is_proc_self_mem_path(path, self_pid) {
             if self.range_touches_secretmem(at as u64, dst.len() as u64) {
-                return Err(DispatchOutcome::errno(carrick_abi::LINUX_EIO));
+                return Err(Box::new(DispatchOutcome::errno(carrick_abi::LINUX_EIO)));
             }
             let bytes = memory.read_bytes(at as u64, dst.len()).map_err(|error| {
-                DispatchOutcome::from_owner_memory_error(error)
-                    .unwrap_or_else(|| DispatchOutcome::errno(carrick_abi::LINUX_EIO))
+                Box::new(
+                    DispatchOutcome::from_owner_memory_error(error)
+                        .unwrap_or_else(|| DispatchOutcome::errno(carrick_abi::LINUX_EIO)),
+                )
             })?;
             let len = bytes.len().min(dst.len());
             dst[..len].copy_from_slice(&bytes[..len]);
@@ -1423,7 +1436,7 @@ impl<'a> FsView<'a> {
                     |_, at, bytes| {
                         contents
                             .read_at(at as u64, bytes)
-                            .map_err(DispatchOutcome::errno)
+                            .map_err(|errno| Box::new(DispatchOutcome::errno(errno)))
                     },
                 )?;
                 return Ok(match refusal {
@@ -1518,11 +1531,21 @@ impl<'a> FsView<'a> {
                     offset,
                     |_, at, bytes| {
                         let source = retained_executable_bytes(executable, at, bytes.len())
-                            .map_err(DispatchOutcome::errno)?;
+                            .map_err(|errno| Box::new(DispatchOutcome::errno(errno)))?;
                         bytes[..source.len()].copy_from_slice(&source);
                         Ok(source.len())
                     },
                 )?),
+                OpenDescription::SyntheticDevice { kind, .. } => {
+                    Some(read_from_repeatable_owner_at(
+                        task.kernel,
+                        memory,
+                        address,
+                        length,
+                        &mut 0,
+                        |_, _, bytes| Ok(synthetic_device_read_into(*kind, bytes)),
+                    )?)
+                }
                 _ => None,
             };
             if let Some((copied, refusal)) = result {
@@ -1574,7 +1597,7 @@ impl<'a> FsView<'a> {
                     &mut bytes,
                 ) {
                     Ok(read_len) => read_len,
-                    Err(outcome) => return Ok(outcome),
+                    Err(outcome) => return Ok(*outcome),
                 };
                 bytes.truncate(read_len);
                 *offset += read_len;
@@ -1957,7 +1980,7 @@ impl<'a> FsView<'a> {
                     |_, at, bytes| {
                         contents
                             .read_at(at as u64, bytes)
-                            .map_err(DispatchOutcome::errno)
+                            .map_err(|errno| Box::new(DispatchOutcome::errno(errno)))
                     },
                 )?),
                 OpenDescription::InMemoryFile { contents, .. } => {
@@ -1996,10 +2019,20 @@ impl<'a> FsView<'a> {
                         &mut { offset },
                         |_, at, bytes| {
                             let source = retained_executable_bytes(executable, at, bytes.len())
-                                .map_err(DispatchOutcome::errno)?;
+                                .map_err(|errno| Box::new(DispatchOutcome::errno(errno)))?;
                             bytes[..source.len()].copy_from_slice(&source);
                             Ok(source.len())
                         },
+                    )?)
+                }
+                OpenDescription::SyntheticDevice { kind, .. } => {
+                    Some(read_from_repeatable_owner_at(
+                        kernel,
+                        memory,
+                        buffer,
+                        length,
+                        &mut { offset },
+                        |_, _, bytes| Ok(synthetic_device_read_into(*kind, bytes)),
                     )?)
                 }
                 _ => None,
@@ -3440,7 +3473,7 @@ impl<'a> FsView<'a> {
                 let result = match &mut *open {
                     OpenDescription::File { contents, offset, .. } => Some(read_from_repeatable_owner_iovecs(
                         cx.kernel, memory, &iovecs, offset,
-                        |_, at, bytes| contents.read_at(at as u64, bytes).map_err(DispatchOutcome::errno))?),
+                        |_, at, bytes| contents.read_at(at as u64, bytes).map_err(|errno| Box::new(DispatchOutcome::errno(errno))))?),
                     OpenDescription::InMemoryFile { contents, offset, .. } => {
                         let data = contents.read();
                         Some(read_from_repeatable_owner_iovecs(cx.kernel, memory, &iovecs, offset, |_, at, bytes| {
@@ -3454,10 +3487,13 @@ impl<'a> FsView<'a> {
                         |memory, at, bytes| this.read_synthetic_at(cx.kernel, memory, path, contents, at, bytes))?),
                     OpenDescription::ProcExecutable { executable, offset, .. } => Some(read_from_repeatable_owner_iovecs(
                         cx.kernel, memory, &iovecs, offset, |_, at, bytes| {
-                            let source = retained_executable_bytes(executable, at, bytes.len()).map_err(DispatchOutcome::errno)?;
+                            let source = retained_executable_bytes(executable, at, bytes.len()).map_err(|errno| Box::new(DispatchOutcome::errno(errno)))?;
                             bytes[..source.len()].copy_from_slice(&source);
                             Ok(source.len())
                         })?),
+                    OpenDescription::SyntheticDevice { kind, .. } => Some(read_from_repeatable_owner_iovecs(
+                        cx.kernel, memory, &iovecs, &mut 0,
+                        |_, _, bytes| Ok(synthetic_device_read_into(*kind, bytes)))?),
                     _ => None,
                 };
                 if let Some(outcome) = result { return Ok(outcome); }
@@ -3746,7 +3782,7 @@ impl<'a> FsView<'a> {
                 let result = match &*open {
                     OpenDescription::File { contents, .. } => Some(read_from_repeatable_owner_iovecs(
                         cx.kernel, memory, &iovecs, &mut { offset },
-                        |_, at, bytes| contents.read_at(at as u64, bytes).map_err(DispatchOutcome::errno))?),
+                        |_, at, bytes| contents.read_at(at as u64, bytes).map_err(|errno| Box::new(DispatchOutcome::errno(errno))))?),
                     OpenDescription::InMemoryFile { contents, .. } => {
                         let data = contents.read();
                         Some(read_from_repeatable_owner_iovecs(cx.kernel, memory, &iovecs, &mut { offset }, |_, at, bytes| {
@@ -3760,10 +3796,13 @@ impl<'a> FsView<'a> {
                         |memory, at, bytes| this.read_synthetic_at(cx.kernel, memory, path, contents, at, bytes))?),
                     OpenDescription::ProcExecutable { executable, .. } => Some(read_from_repeatable_owner_iovecs(
                         cx.kernel, memory, &iovecs, &mut { offset }, |_, at, bytes| {
-                            let source = retained_executable_bytes(executable, at, bytes.len()).map_err(DispatchOutcome::errno)?;
+                            let source = retained_executable_bytes(executable, at, bytes.len()).map_err(|errno| Box::new(DispatchOutcome::errno(errno)))?;
                             bytes[..source.len()].copy_from_slice(&source);
                             Ok(source.len())
                         })?),
+                    OpenDescription::SyntheticDevice { kind, .. } => Some(read_from_repeatable_owner_iovecs(
+                        cx.kernel, memory, &iovecs, &mut 0,
+                        |_, _, bytes| Ok(synthetic_device_read_into(*kind, bytes)))?),
                     _ => None,
                 };
                 if let Some(outcome) = result { return Ok(outcome); }

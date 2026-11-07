@@ -32,3 +32,10 @@ for genuinely inaccessible source memory rather than classifying contention
 as that error. Native directory controls additionally require errno 14 for a
 true output fault and a true preparation fault; internal refusal never earns
 that verdict.
+
+Synthetic-device output uses that same admission loop with a temporary
+cursor rather than a description offset. Zero/full and random devices fill
+the admitted page-sized scratch; the CSPRNG accepts the existing borrowed
+buffer without allocating a new source Vec per piece. The same CSPRNG
+function retains its existing fatal authority. Null-device EOF performs no
+output preparation, even when the fixture has a pending owner refusal.

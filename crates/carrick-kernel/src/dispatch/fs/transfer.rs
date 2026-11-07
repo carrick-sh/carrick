@@ -1545,7 +1545,7 @@ impl<'a> FsView<'a> {
                         | carrick_vfs::SyntheticDeviceKind::Full => vec![0u8; count],
                         carrick_vfs::SyntheticDeviceKind::Random
                         | carrick_vfs::SyntheticDeviceKind::Urandom => {
-                            random_device_bytes(count)
+                            random_device_bytes(vec![0; count])
                         }
                     };
 

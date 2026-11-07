@@ -13,12 +13,12 @@ use crate::dispatch::read_kernel_struct;
 use crate::linux_abi::LinuxErrno;
 use carrick_vfs::{SparseBuffer, SyntheticDeviceKind};
 
-/// `len` fresh bytes from the host CSPRNG, for a guest read of `/dev/random` or
+/// Fill an owned or borrowed buffer from the host CSPRNG, for a guest read of `/dev/random` or
 /// `/dev/urandom`.
 ///
 /// Linux's `/dev/urandom` never short-reads and never fails once the pool is
 /// seeded, and `/dev/random` on a running kernel behaves the same, so the
-/// guest-visible contract is "always exactly `len` bytes". `getrandom` is the
+/// guest-visible contract is "always fill the supplied buffer". `getrandom` is the
 /// portable spelling of "ask the host's own CSPRNG" — `getentropy(2)` on Darwin
 /// and the BSDs, `getrandom(2)` on Linux — which keeps this crate free of the
 /// Darwin-only `arc4random_buf` it used to name and so able to compile for a
@@ -27,16 +27,16 @@ use carrick_vfs::{SparseBuffer, SyntheticDeviceKind};
 /// A host CSPRNG that refuses to produce bytes is not a condition a guest read
 /// can be told about honestly (there is no Linux errno for it, and returning
 /// zeroes would hand the guest predictable "randomness"), so it is fatal.
-pub(crate) fn random_device_bytes(len: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; len];
-    if let Err(error) = getrandom::fill(&mut buf) {
-        tracing::error!(%error, len, "host CSPRNG refused to fill a random-device read");
+pub(crate) fn random_device_bytes<B: AsMut<[u8]>>(mut buffer: B) -> B {
+    let buf = buffer.as_mut();
+    if let Err(error) = getrandom::fill(buf) {
+        tracing::error!(%error, len = buf.len(), "host CSPRNG refused to fill a random-device read");
         carrick_fatal!(
             "dispatch::random_device",
             "host CSPRNG refused to fill a random-device read"
         );
     }
-    buf
+    buffer
 }
 
 pub(crate) fn read_u64(memory: &impl CurrentMmMemory, address: u64) -> Result<u64, LinuxErrno> {
@@ -203,7 +203,7 @@ pub(in crate::dispatch) fn read_from_repeatable_owner_at<M: CurrentMmMemory>(
     address: u64,
     length: usize,
     offset: &mut usize,
-    mut read_at: impl FnMut(&mut M, usize, &mut [u8]) -> Result<usize, super::DispatchOutcome>,
+    mut read_at: impl FnMut(&mut M, usize, &mut [u8]) -> Result<usize, Box<super::DispatchOutcome>>,
 ) -> Result<(usize, Option<super::DispatchOutcome>), DispatchError> {
     let mut scratch = [0u8; 4096];
     let mut copied = 0usize;
@@ -217,7 +217,7 @@ pub(in crate::dispatch) fn read_from_repeatable_owner_at<M: CurrentMmMemory>(
             Ok(0) => break,
             Ok(read_len) => read_len,
             Err(_errno) if copied > 0 => break,
-            Err(outcome) => return Ok((copied, Some(outcome))),
+            Err(outcome) => return Ok((copied, Some(*outcome))),
         };
         let range = GuestWriteRange::new(GuestVa::new(at), read_len)
             .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
@@ -252,7 +252,7 @@ pub(in crate::dispatch) fn read_from_repeatable_owner_iovecs<M: CurrentMmMemory>
     memory: &mut M,
     iovecs: &[LinuxIovec],
     offset: &mut usize,
-    mut read_at: impl FnMut(&mut M, usize, &mut [u8]) -> Result<usize, super::DispatchOutcome>,
+    mut read_at: impl FnMut(&mut M, usize, &mut [u8]) -> Result<usize, Box<super::DispatchOutcome>>,
 ) -> Result<super::DispatchOutcome, DispatchError> {
     let mut total = 0usize;
     for iovec in iovecs {
@@ -312,7 +312,7 @@ pub(crate) fn read_from_synthetic_device_iovecs(
                 if iov_len == 0 {
                     continue;
                 }
-                let buf = random_device_bytes(iov_len);
+                let buf = random_device_bytes(vec![0; iov_len]);
                 if memory.write_bytes(iovec.iov_base, &buf).is_err() {
                     return Ok(total);
                 }

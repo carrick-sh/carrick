@@ -672,11 +672,10 @@ impl<'a> FsView<'a> {
                         out_off as libc::off_t,
                     )
                 };
-                let n = match n.host_syscall_errno() {
+                match n.host_syscall_errno() {
                     Ok(value) => value as usize,
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                };
-                n
+                }
             };
 
             // Advance the input offset (pointer or the fd's own position).
