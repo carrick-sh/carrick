@@ -27,3 +27,12 @@ and both process-global publications are still present. Retained
 the live x86-layout venue witness and ARM migration remain unimplemented.
 The typed guest view witness proves address preservation, not a live venue.
 No slice-1 completion or x86 runtime acceptance is claimed.
+
+The typed-view continuation passed the ABI suite (191 tests; serial filter
+matched zero), EL1-native (742 tests, one ignored), freestanding CPL0 build,
+Linux and macOS cross-checks, native KVM crate check, clippy, formatting,
+contract-change validation and source-only authority validation including the
+admitted-main delta ratchet. The initial ARM image compile refusal and derive
+audit refusal were corrected before these final passes. These checks do not
+supply the missing live venue or real-KVM pipe-service acceptance. Docker and
+HVF execution are unavailable on this Linux runner; runtime KVM was not run.
