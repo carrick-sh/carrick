@@ -7119,6 +7119,46 @@ fn delegated_frame_grant_stock_probe_retains_busy_instead_of_losing_stock() {
     );
 }
 
+/// V8 commits its complete arena CodeRange, without a preceding page fault.
+#[test]
+fn delegated_whole_code_range_keeps_owner_protection() {
+    const START: u64 = 0x6020000000;
+    const LENGTH: u64 = 256 * 1024 * 1024;
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let mut memory = CountingMmapMemory::new(START, PAGE as usize);
+    memory.defer_anon = true;
+    let mapped = returned(host_mmap(
+        &mut dispatcher,
+        &mut memory,
+        START,
+        LENGTH,
+        0,
+        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | carrick_abi::LINUX_MAP_NORESERVE,
+        -1,
+    )) as u64;
+    assert_eq!(mapped, START);
+    assert!(root.lock().is_admitted());
+    memory.owner_protect_log.borrow_mut().clear();
+    memory.protect_log.borrow_mut().clear();
+    memory.fail_protect_non_zero.set(true);
+    assert_eq!(
+        returned(call(
+            &mut dispatcher,
+            &mut memory,
+            SYS_MPROTECT,
+            [mapped, LENGTH, 7, 0, 0, 0]
+        )),
+        0
+    );
+    assert_eq!(
+        *memory.owner_protect_log.borrow(),
+        vec![(START, LENGTH as usize, 7)]
+    );
+    assert!(memory.protect_log.borrow().is_empty());
+    assert_eq!(memory.zero_backing_calls.get(), 0);
+}
+
 /// A free Linux hint outside the arena must remain an owner reservation,
 /// rather than becoming an opaque host alias or moving into the arena.
 #[test]
@@ -7256,6 +7296,17 @@ fn delegated_outside_hint_avoids_rosetta_window() {
 #[cfg(target_os = "linux")]
 #[test]
 fn serial_host_delegated_outside_hint_native_store_survives_protection() {
+    native_code_reservation(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn serial_host_delegated_whole_code_range_writes_and_executes() {
+    native_code_reservation(true);
+}
+
+#[cfg(target_os = "linux")]
+fn native_code_reservation(whole: bool) {
     struct NativePages {
         start: u64,
         len: usize,
@@ -7269,7 +7320,10 @@ fn serial_host_delegated_outside_hint_native_store_survives_protection() {
                     start as *mut libc::c_void,
                     len,
                     libc::PROT_NONE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE,
+                    libc::MAP_PRIVATE
+                        | libc::MAP_ANONYMOUS
+                        | libc::MAP_NORESERVE
+                        | libc::MAP_FIXED_NOREPLACE,
                     -1,
                     0,
                 )
@@ -7364,7 +7418,8 @@ fn serial_host_delegated_outside_hint_native_store_survives_protection() {
 
     const HINT: u64 = 0x7000000000;
     const LENGTH: u64 = 256 * 1024 * 1024;
-    for hint in [0, HINT] {
+    let hints: &[u64] = if whole { &[0x6020000000] } else { &[0, HINT] };
+    for &hint in hints {
         let mut dispatcher = SyscallDispatcher::new();
         let root = Root::admit(&dispatcher);
         let expected = if hint == 0 { LINUX_MMAP_BASE } else { hint };
@@ -7375,7 +7430,7 @@ fn serial_host_delegated_outside_hint_native_store_survives_protection() {
             hint,
             LENGTH,
             0,
-            LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+            LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | carrick_abi::LINUX_MAP_NORESERVE,
             -1,
         )) as u64;
         assert_eq!(
@@ -7384,10 +7439,11 @@ fn serial_host_delegated_outside_hint_native_store_survives_protection() {
         );
         assert!(root.lock().is_admitted());
         memory.publications.clear();
-        // Touch both ends of an interior RW range, leaving untouched guards.
-        let writable = mapped + PAGE;
-        let writable_len = LENGTH - 2 * PAGE;
-        for prot in [1, 3, 7, 3] {
+        // Preserve the interior-range control; the V8 case commits every page.
+        let writable = if whole { mapped } else { mapped + PAGE };
+        let writable_len = if whole { LENGTH } else { LENGTH - 2 * PAGE };
+        let protections: &[u64] = if whole { &[7] } else { &[1, 3, 7, 3] };
+        for &prot in protections {
             assert_eq!(
                 returned(call(
                     &mut dispatcher,
@@ -7415,9 +7471,24 @@ fn serial_host_delegated_outside_hint_native_store_survives_protection() {
                 }
             }
         }
+        #[cfg(target_arch = "x86_64")]
+        if whole {
+            // SAFETY: the complete range has just been made RWX by production
+            // dispatch. Write `mov eax, 42; ret` and execute in this allocation.
+            unsafe {
+                let code = [0xb8u8, 42, 0, 0, 0, 0xc3];
+                std::ptr::copy_nonoverlapping(code.as_ptr(), writable as *mut u8, code.len());
+                let function: unsafe extern "C" fn() -> u32 =
+                    std::mem::transmute(writable as usize);
+                assert_eq!(function(), 42);
+            }
+        }
         assert_eq!(
             memory.publications,
-            [1, 3, 7, 3].map(|prot| (writable, writable_len as usize, prot))
+            protections
+                .iter()
+                .map(|&prot| (writable, writable_len as usize, prot))
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             returned(call(
