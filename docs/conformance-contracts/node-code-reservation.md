@@ -41,3 +41,15 @@ proposals cannot mint it. Subsequent protection, decommit and retirement
 require complete coverage by owner-authorized nodes. Relocation into the
 allocation arena drops the external placement bit. The node record layout
 and the existing descriptor/backing completion transaction are unchanged.
+
+`serial_host_delegated_outside_hint_native_store_survives_protection` adds a
+Linux native physical venue to production host mmap/mprotect dispatch. It
+reserves actual host pages with MAP_FIXED_NOREPLACE at the free outside-arena
+hint, with an unhinted arena control. Under the admitted MM root, it changes
+an interior range to R, RW, RWX and back to RW. The owner publication callback
+applies libc mprotect to those pages; legacy nonzero protection publication
+fails the test.
+Volatile stores and reads at both ends of each writable range then exercise
+the actual returned address, rather than a byte-copy backend or a separately
+allocated frame. Host VA equals guest VA only by explicit fixture placement;
+this does not change production VA/IPA lookup or establish VMM supply.
