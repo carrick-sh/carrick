@@ -397,18 +397,16 @@ elif '--method' in args and args[args.index('--method')+1] == 'POST':
     endpoint = args[args.index('POST')+1]
     with open(os.environ['TEST_POSTS'], 'a') as out:
         out.write(json.dumps({'endpoint':endpoint,'body':json.load(sys.stdin)})+'\n')
+elif args[:2] == ['api', 'graphql']:
+    print(json.dumps({'data':{'repository':{'mergeQueue':{'entries':{'nodes':[]}}}}}))
 elif args[0] == 'api':
     endpoint = args[-1]
     if '/pulls/' in endpoint:
         print(json.dumps({'state':'open','head':{'sha':head},'base':{'ref':'main'}}))
     elif '/compare/' in endpoint:
-        if '?per_page=' in endpoint:
-            assert endpoint.split('/compare/')[1].startswith(base+'...'+head)
-            print(json.dumps([{'commits':[{'sha':os.environ['TEST_PREVIOUS_SHA']},{'sha':head}]}]))
-        else:
-            print(json.dumps({'merge_base_commit':{'sha':base}}))
+        print(json.dumps({'merge_base_commit':{'sha':base}}))
     elif '/commits/' in endpoint and '/pulls?' in endpoint:
-        print(json.dumps([[{'number':n,'base':{'ref':'main','repo':{'full_name':'carrick-sh/carrick'}}} for n in ([123] if os.environ['TEST_PREVIOUS_SHA'] in endpoint else [124])]]))
+        print(json.dumps([[]]))
     elif '/actions/runs/100' == endpoint[-17:]:
         print(json.dumps({'id':100,'path':'.github/workflows/signed-gate.yml','head_branch':'main','event':'push','head_sha':base,'status':'completed','repository':{'full_name':'carrick-sh/carrick'},'head_repository':{'full_name':'carrick-sh/carrick'}}))
     elif '/workflows/signed-gate.yml/runs' in endpoint:
@@ -655,6 +653,11 @@ else:
             .unwrap()
     };
     assert!(publish_queue().status.success());
+    assert!(
+        std::fs::read_to_string(results.join("comment.md"))
+            .unwrap()
+            .contains("Pull requests: #123, #124")
+    );
     let mut regression = candidate.clone();
     regression.steps[2]
         .failed_tests
@@ -680,12 +683,11 @@ else:
             .unwrap()
             .ends_with("/124/comments")
     );
-    assert!(
-        last[2]["body"]["body"]
-            .as_str()
-            .unwrap()
-            .contains("new_queue_failure")
-    );
+    for item in &last[1..] {
+        let body = item["body"]["body"].as_str().unwrap();
+        assert!(body.contains("Pull requests: #123, #124"), "{body}");
+        assert!(body.contains("new_queue_failure"), "{body}");
+    }
     std::fs::write(&candidate_path, serde_json::to_vec(&candidate).unwrap()).unwrap();
 
     // A valid receipt cannot hide a failed execution job, nor can an unrelated
@@ -1484,49 +1486,39 @@ fn queued_merge_group_resolves_rebased_prs_and_names_them_in_published_receipt()
     let gh = bin.join("gh");
     std::fs::write(
         &gh,
-        format!(
-            r#"#!/usr/bin/env python3
-import json, os, pathlib, shutil, subprocess, sys
+        r#"#!/usr/bin/env python3
+import json, os, pathlib, shutil, sys
 args = sys.argv[1:]
-graph = os.environ['TEST_GRAPH']
-git_bin = {real_git:?}
 if args[:2] == ['run', 'download']:
     shutil.copyfile(os.environ['TEST_BASE'], pathlib.Path(args[args.index('--dir') + 1]) / 'candidate.json')
 elif '--method' in args and args[args.index('--method') + 1] == 'POST':
     endpoint = args[args.index('POST') + 1]
     with open(os.environ['TEST_POSTS'], 'a') as out:
-        out.write(json.dumps({{'endpoint': endpoint, 'body': json.load(sys.stdin)}}) + '\n')
+        out.write(json.dumps({'endpoint': endpoint, 'body': json.load(sys.stdin)}) + '\n')
 elif args[:2] == ['api', 'graphql']:
     nodes = json.loads(pathlib.Path(os.environ['TEST_ENTRIES']).read_text())
-    print(json.dumps({{'data': {{'repository': {{'mergeQueue': {{'entries': {{'nodes': nodes}}}}}}}}}}))
+    print(json.dumps({'data': {'repository': {'mergeQueue': {'entries': {'nodes': nodes}}}}}))
 elif args[0] == 'api':
     endpoint = args[-1]
-    if '/compare/' in endpoint and '?per_page=' in endpoint:
-        spec = endpoint.split('/compare/')[1].split('?', 1)[0]
-        left, right = spec.split('...', 1)
-        proc = subprocess.run([git_bin, '-C', graph, 'rev-list', '--reverse', f'{{left}}..{{right}}'], text=True, capture_output=True, check=True)
-        commits = [{{'sha': line}} for line in proc.stdout.splitlines() if line]
-        print(json.dumps([{{'commits': commits}}]))
-    elif '/commits/' in endpoint and '/pulls?' in endpoint:
+    if '/commits/' in endpoint and '/pulls?' in endpoint:
         sha = endpoint.split('/commits/')[1].split('/pulls', 1)[0]
         merged = json.loads(pathlib.Path(os.environ['TEST_MERGED_PULLS']).read_text())
         rows = [
-            {{'number': n, 'base': {{'ref': 'main', 'repo': {{'full_name': 'carrick-sh/carrick'}}}}}}
+            {'number': n, 'base': {'ref': 'main', 'repo': {'full_name': 'carrick-sh/carrick'}}}
             for n in merged.get(sha, [])
         ]
         print(json.dumps([rows]))
     elif '/workflows/signed-gate.yml/runs' in endpoint:
-        run = {{'id': 100, 'path': '.github/workflows/signed-gate.yml', 'head_branch': 'main', 'event': 'workflow_dispatch', 'status': 'completed', 'repository': {{'full_name': 'carrick-sh/carrick'}}, 'head_repository': {{'full_name': 'carrick-sh/carrick'}}, 'actor': {{'login': 'tjfontaine'}}, 'triggering_actor': {{'login': 'tjfontaine'}}}}
-        print(json.dumps([{{'workflow_runs': [run]}}]))
+        run = {'id': 100, 'path': '.github/workflows/signed-gate.yml', 'head_branch': 'main', 'event': 'workflow_dispatch', 'status': 'completed', 'repository': {'full_name': 'carrick-sh/carrick'}, 'head_repository': {'full_name': 'carrick-sh/carrick'}, 'actor': {'login': 'tjfontaine'}, 'triggering_actor': {'login': 'tjfontaine'}}
+        print(json.dumps([{'workflow_runs': [run]}]))
     elif '/artifacts?' in endpoint:
         base_sha = os.environ['TEST_BASE_SHA']
-        print(json.dumps([{{'artifacts': [{{'name': f'signed-baseline-{{base_sha}}-1', 'expired': False}}]}}]))
+        print(json.dumps([{'artifacts': [{'name': f'signed-baseline-{base_sha}-1', 'expired': False}]}]))
     else:
         raise SystemExit('unexpected API endpoint: ' + endpoint)
 else:
     raise SystemExit('unexpected gh invocation: ' + repr(args))
-"#
-        ),
+"#,
     )
     .unwrap();
     std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1701,4 +1693,16 @@ else:
     let (raced_req, _) = run_prepare("raced", &ref_1788, &d, &b);
     assert_eq!(raced_req["base"], a);
     assert_eq!(raced_req["prs"], json!([1762, 1788]));
+
+    // (6) Race on a multi-PR batch: if #1801+#1802 merged before mergeQueue was
+    // queried (even if ls-remote still saw ref_1801), fallback recovers #1802 too.
+    std::fs::write(&entries_path, "[]").unwrap();
+    std::fs::write(
+        &merged_pulls_path,
+        json!({ batched_mid.clone(): [1801], batched.clone(): [1802] }).to_string(),
+    )
+    .unwrap();
+    let (batched_raced_req, _) = run_prepare("batched-raced", &ref_1801, &a, &batched);
+    assert_eq!(batched_raced_req["base"], a);
+    assert_eq!(batched_raced_req["prs"], json!([1801, 1802]));
 }
