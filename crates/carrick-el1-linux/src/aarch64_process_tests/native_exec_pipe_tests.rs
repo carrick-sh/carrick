@@ -628,6 +628,84 @@ fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
         resumed_frame.elr, 0x400000,
         "resume exactly at the parked SVC"
     );
+    // A timer IRQ preempts the resumed reader before its SVC executes. This
+    // goes through the production IRQ path (`serve_irq` -> `interrupt` ->
+    // `preempt` -> `ThreadCpu::save(.., CpuExitCause::Interrupted)`), not the
+    // `requeue_preempted` shortcut below, which never saves the context. On
+    // the pre-fix `save`, which always wrote `AfterSyscall`, this save
+    // replaced the reader's `AtSyscall` position and the next selection
+    // rewound it to SVC-4 (#887's double rewind, review P1 on #1799).
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, parent_binding.record.id)
+            .is_queued(),
+        "another runnable thread must be queued for the slice to preempt"
+    );
+    resume_cpu.inner.freq = 1_000_000_000;
+    fixture.zone.slot(fixture.slot).restart_slice(1);
+    resume_cpu.inner.now = 1 + resume_cpu.inner.freq;
+    let irq = (crate::sched::Sched {
+        handoff: None,
+        zone: fixture.zone,
+        slot: fixture.slot,
+        task: &fixture.task,
+        cpu: &mut resume_cpu,
+        user: &crate::sched::HardwareUserWord,
+        counters: &counters,
+    })
+    .serve_irq(&mut resumed_frame);
+    assert_ne!(
+        fixture.zone.slot(fixture.slot).current(),
+        Some(child_binding.record.id),
+        "the expired slice must preempt the reader through the IRQ save ({irq:?})"
+    );
+    // SAFETY: the IRQ save queued the reader; this stopped fixture owns its
+    // record until the scheduler selects it again below.
+    let saved = unsafe { fixture.zone.record(child_binding.record.id).ctx_mut() };
+    assert_eq!(
+        (saved.native.pc, saved.saved_syscall_pc()),
+        (
+            0x400000,
+            Some(carrick_sched_core::SavedSyscallPc::AtSyscall)
+        ),
+        "an IRQ save before the SVC executes must keep the SVC position"
+    );
+    let mut after_irq = carrick_el1_abi::TrapFrame::default();
+    for _ in 0..2 {
+        assert_eq!(
+            (crate::sched::Sched {
+                handoff: None,
+                zone: fixture.zone,
+                slot: fixture.slot,
+                task: &fixture.task,
+                cpu: &mut resume_cpu,
+                user: &crate::sched::HardwareUserWord,
+                counters: &counters,
+            })
+            .yield_queued(&mut after_irq),
+            Some(crate::sched::Served::Returned { switched: true })
+        );
+        if fixture.zone.slot(fixture.slot).current() == Some(child_binding.record.id) {
+            break;
+        }
+        let other = fixture.zone.slot(fixture.slot).current().unwrap();
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(fixture.slot, other)
+                .is_queued()
+        );
+    }
+    assert_eq!(
+        fixture.zone.slot(fixture.slot).current(),
+        Some(child_binding.record.id),
+        "the scheduler must reselect the preempted reader"
+    );
+    assert_eq!(
+        after_irq.elr, 0x400000,
+        "a reader preempted by an IRQ before its SVC resumes at the SVC, not SVC-4"
+    );
     drop(resume_cpu);
 
     // Preempt before the SVC executes and select the same reader again. The
