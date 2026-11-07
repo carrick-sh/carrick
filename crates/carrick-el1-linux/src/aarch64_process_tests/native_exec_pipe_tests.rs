@@ -859,7 +859,7 @@ fn child_futex<'a>(
     child: TaskKey,
     counters: &carrick_el1_abi::Counters,
 ) {
-    use carrick_core::personality::{CopyOutcome, GuestCopyRequest};
+    use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest};
     use carrick_guest_arch::{Access, GuestLen};
     use carrick_personality_linux::dispatch::CompletionRoute;
     struct Word(core::cell::Cell<bool>);
