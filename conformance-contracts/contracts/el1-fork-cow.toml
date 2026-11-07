@@ -35,6 +35,7 @@ rationale = "EL1 increment 2 fork copy-on-write checkpoint (TASK 2 and TASK 3). 
 
 [bindings]
 vm_free = [
+  "carrick-kernel::kernel::mm_occupancy::tests::cow_refill_excludes_sibling_through_publication (scoped fault operation, full 64-record USED chain, settlement, sibling exclusion through refill publication, retry; component proof only, no physical copy or signed acceptance)",
   "carrick-mmu-core::aarch64::tests::adopting_fork_arm_splits_full_host_block_and_keeps_private_pages (full aligned host block through production adopting fork arm, live parent and offline child keep 512 authenticated COW leaves with exactly one L3 table; nested fork preserves protected neighbor; red first without splitting and again with split-only offline coalescing)",
   "carrick-vmm-hvf::trap::foreign_mm::tests::owner_fault_rejects_untagged_readonly_image_with_stale_mapping_permission (production host fault resolver returns NotCow with and without retained fork ranges; no table edits, neighboring permission changes, or backing allocation; macOS VM-free run pending)",
   "carrick-hal::fork_stock::tests::empty_native_descriptor_demand_does_not_touch_unrelated_stock (zero-table inherited publications leave unrelated spare populations at 16, 256 and 4096 untouched; red on the first fault-side implementation because empty admission sorted the spare pool)",
