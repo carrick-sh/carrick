@@ -567,6 +567,51 @@ pub fn wake_exit_wait_channel(
     Some(woken.count)
 }
 
+/// Wake a ring-owned process member parked in a native clock sleep.
+///
+/// Updates the member's `native_service` queue epoch first (closing the
+/// arm-to-park window without nested locks) and then wakes its wait channel
+/// in the active zone.
+pub fn wake_native_sleep_channel(channel: carrick_core_abi::clock::ClockSleepChannel) {
+    let Some(zone) = zone().or_else(zone_tables) else {
+        return;
+    };
+    if let Some(id) = carrick_el1_abi::RecordId::from_raw(channel.record_id) {
+        let record = carrick_sched_core::RecordRef {
+            id,
+            incarnation: channel.record_generation,
+        };
+        if let Some(key) = carrick_sched_core::object_wait::ObjectWaitKey::native_service(record)
+            && let Ok(queue) = zone.object_wait(key, &HostLockWait)
+        {
+            let mut delivery = ObjectWakeDelivery::new();
+            let ObjectWakeDelivery { handed, len, slots } = &mut delivery;
+            if queue
+                .notify_object_host(
+                    &mut |handed_rec| {
+                        if let Some(slot) = handed.get_mut(*len) {
+                            slot.write(handed_rec);
+                            *len += 1;
+                        }
+                    },
+                    &mut |placed| {
+                        if placed.resched {
+                            let index = usize::from(placed.slot.raw());
+                            slots[index / 64] |= 1 << (index % 64);
+                        }
+                    },
+                )
+                .is_ok()
+            {
+                drop(queue);
+                delivery.deliver();
+            }
+        }
+    }
+    let woken = wake(zone, channel.mm, channel.address.get(), u32::MAX, u32::MAX);
+    hand_back(&woken.handed);
+}
+
 /// Publish one actual physical producer's release through the exact carrier
 /// owner's notification source. This uses the existing static zone mapping
 /// contract; it does not extend that mapping's lifetime.
