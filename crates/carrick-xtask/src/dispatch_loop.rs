@@ -2054,6 +2054,50 @@ impl RoundFacts {
         }
     }
 }
+fn director_owned_unrun_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let unrun = lower.contains("unrun")
+        || lower.contains("unsupported host")
+        || lower.contains("unavailable on this linux");
+    let director_gate = [
+        "signed",
+        "hvf",
+        "macos",
+        "smoke-signed",
+        "test-embed",
+        "cloudmac",
+    ]
+    .iter()
+    .any(|gate| lower.contains(gate));
+    unrun && director_gate
+}
+
+fn director_owned_unrun_only(worker: &Contract) -> bool {
+    if worker.status != ContractStatus::Done
+        || worker
+            .risks
+            .iter()
+            .any(|r| r.to_ascii_lowercase().contains("incomplete"))
+    {
+        return false;
+    }
+    let mut saw_director_unrun = false;
+    for test in &worker.tests {
+        let lower = test.trim_start().to_ascii_lowercase();
+        if lower.starts_with("fail") || lower.starts_with("error") {
+            return false;
+        }
+        if lower.contains("unrun") {
+            if director_owned_unrun_text(test) {
+                saw_director_unrun = true;
+            } else {
+                return false;
+            }
+        }
+    }
+    saw_director_unrun || worker.risks.iter().any(|r| director_owned_unrun_text(r))
+}
+
 impl Server<'_> {
     fn post(&self, body: &str) -> Result<(), ScalerError> {
         let state = crate::agent_runner::state()?;
@@ -2105,7 +2149,9 @@ impl Server<'_> {
     ) -> Result<(), ScalerError> {
         // Remaining work on a published checkpoint uses the existing chain,
         // even when the coordinator called that progress "blocked" (#1763).
-        let blocker = external_blocker(summary);
+        let stop_url = super::round_inbox::stop_requested();
+        let stopped = stop_url.is_some();
+        let blocker = external_blocker(summary).or(stop_url.as_deref());
         let inferred_brief = (finish == FinishStatus::Blocked
             && blocker.is_none()
             && self.pushed_head().is_some()
@@ -2114,10 +2160,30 @@ impl Server<'_> {
                 .any(|word| summary.to_ascii_lowercase().contains(word)))
         .then_some(summary);
         let workflow_handoff = !Applied::load()?.workflow_left_out.is_empty();
+        // A director-owned UNRUN check (signed HVF/macOS on a Linux worker) is
+        // neither a pass nor a failure (#1813): when a code worker succeeded
+        // and pushed its commits with no failing host checks, neither a
+        // coordinator Blocked/Failed over that UNRUN check nor a loop timeout
+        // before finish may fail the round.
+        let director_unrun_done = self.dispatch.round_kind == RoundKind::Code
+            && !workflow_handoff
+            && inferred_brief.is_none()
+            && blocker.is_none()
+            && !stopped
+            && self.pushed_head().is_some()
+            && self.used.workers > 0
+            && self.history.last().is_some_and(director_owned_unrun_only)
+            && matches!(finish, FinishStatus::Blocked | FinishStatus::Failed)
+            && (director_owned_unrun_text(summary)
+                || (self.used.finishes == 0 && summary.contains("without finish")));
         let finish = if workflow_handoff {
             FinishStatus::Failed
+        } else if stopped {
+            FinishStatus::Blocked
         } else if inferred_brief.is_some() {
             FinishStatus::Continue
+        } else if director_unrun_done {
+            FinishStatus::Done
         } else {
             finish
         };
@@ -2130,6 +2196,7 @@ impl Server<'_> {
                 "contract violation: Blocked requires a named external blocker (Blocker: #issue, PR URL, or owner decision URL)",
             ));
         }
+        let is_review_round = matches!(self.dispatch.round_kind, RoundKind::Review { .. });
         let requested_status = RoundStatus::requested(finish);
         let loop_claimed = match finish {
             FinishStatus::Done => "done",
@@ -2150,28 +2217,7 @@ impl Server<'_> {
         } else {
             "Worker was not invoked.".into()
         };
-        let review_result = if let RoundKind::Review { pr } = self.dispatch.round_kind {
-            Some(self.finish_review(pr))
-        } else {
-            None
-        };
         let mut applied = Applied::load()?;
-        applied.review_claimed |= self.history.iter().any(Contract::review_claimed);
-        if review_result.as_ref().is_some_and(Result::is_err) {
-            applied.review = false;
-        }
-        if applied.review && review_result.is_none() {
-            let work = crate::agent_runner::state()?.join("work");
-            let live = super::live_branch_tip(&work, &self.dispatch.branch).ok();
-            applied.review = applied.review_head.as_deref().is_some_and(|reviewed| {
-                live.as_deref()
-                    .and_then(|tip| tip.split_whitespace().next())
-                    == Some(reviewed)
-            });
-        }
-        let review_published = applied.review;
-        self.pr = applied.publication_pr.or(self.pr);
-        let manual_repair = applied.manual_repair.clone();
         let mut observations = Vec::new();
         let last_failed = self.used.workers > 0
             && self
@@ -2182,7 +2228,8 @@ impl Server<'_> {
         // the server, and still the live tip), and only then did its
         // launcher exit badly. That is published work with a failed
         // launcher, not a round that produced nothing.
-        let published_exit = (last_failed
+        let published_exit = (!is_review_round
+            && last_failed
             && !applied.published_checkpoint
             && applied.wip_pushed.is_some()
             && self.unpushed_head().is_none())
@@ -2251,11 +2298,65 @@ impl Server<'_> {
         if matches!(applied.body, AppliedBody::Failed(_)) {
             observations.push("PR body publication failed".to_owned());
         }
-        let unpushed = (review_result.is_none() && observations.is_empty() && claimed_done)
+        // A strong round that ran no worker because none it admits had
+        // capacity is blocked on capacity, not done (#1275).
+        let tier_blocked = (self.tier.tier == super::worker_tier::WorkerTier::Strong
+            && self.used.workers == 0
+            && self.tier_unavailable)
+            .then(|| {
+                format!(
+                    "Server observed: no strong-tier worker had capacity ({}), so the round did not run on a weaker one.",
+                    self.tier.reason
+                )
+            });
+        let review_floor_blocked = workflow_handoff
+            || stopped
+            || (finish == FinishStatus::Blocked && blocker.is_some())
+            || last_failed
+            || !observations.is_empty()
+            || applied.last_provider_filter
+            || applied.adoption_blocked.is_some()
+            || tier_blocked.is_some();
+        if is_review_round
+            && review_floor_blocked
+            && let Ok(state) = crate::agent_runner::state()
+            && let Ok(Some(receipt)) = worker_checkpoint(&state, &self.dispatch)
+        {
+            let admitted = super::admitted_tip(&self.dispatch, &receipt);
+            if admitted.is_empty() || receipt.head != admitted {
+                observations.push("review round may not push commits or change code".into());
+            }
+        }
+        let review_result = match self.dispatch.round_kind {
+            RoundKind::Review { pr } if !review_floor_blocked => Some(self.finish_review(pr)),
+            _ => None,
+        };
+        if review_result.is_some() {
+            applied = Applied::load()?;
+        }
+        applied.review_claimed |= self.history.iter().any(Contract::review_claimed);
+        if is_review_round && !matches!(review_result, Some(Ok(_))) {
+            applied.review = false;
+        }
+        if applied.review && !is_review_round {
+            let work = crate::agent_runner::state()?.join("work");
+            let live = super::live_branch_tip(&work, &self.dispatch.branch).ok();
+            applied.review = applied.review_head.as_deref().is_some_and(|reviewed| {
+                live.as_deref()
+                    .and_then(|tip| tip.split_whitespace().next())
+                    == Some(reviewed)
+            });
+        }
+        let review_published = applied.review;
+        self.pr = applied.publication_pr.or(self.pr);
+        let manual_repair = applied.manual_repair.clone();
+        let unpushed = (!is_review_round && observations.is_empty() && claimed_done)
             .then(|| self.unpushed_head())
             .flatten();
-        let facts = self.pr.map(|pr| self.round_facts(pr, claimed_done));
-        let stalled = (review_result.is_none()
+        let facts = self
+            .pr
+            .map(|pr| self.round_facts(pr, !is_review_round && claimed_done));
+        let stalled = (!is_review_round
             && observations.is_empty()
             && unpushed.is_none()
             && claimed_done)
@@ -2281,17 +2382,6 @@ impl Server<'_> {
             }
         })
         .flatten();
-        // A strong round that ran no worker because none it admits had
-        // capacity is blocked on capacity, not done (#1275).
-        let tier_blocked = (self.tier.tier == super::worker_tier::WorkerTier::Strong
-            && self.used.workers == 0
-            && self.tier_unavailable)
-            .then(|| {
-                format!(
-                    "Server observed: no strong-tier worker had capacity ({}), so the round did not run on a weaker one.",
-                    self.tier.reason
-                )
-            });
         let status = if workflow_handoff {
             observations.push("workflow changes were left out; the director must apply `harvest.patch`; automatic continuation stopped".into());
             RoundStatus::Failed
@@ -2303,7 +2393,9 @@ impl Server<'_> {
                     RoundStatus::Failed
                 }
             }
-        } else if (applied.review_claimed && !applied.review) || applied.last_provider_filter {
+        } else if (!is_review_round && applied.review_claimed && !applied.review)
+            || applied.last_provider_filter
+        {
             RoundStatus::Blocked
         } else if !observations.is_empty() {
             RoundStatus::Failed
@@ -2571,6 +2663,12 @@ impl Server<'_> {
                     PublishMode::Full,
                 )?;
             }
+            let applied = Applied::load()?;
+            let current_run = run_id()?;
+            let trigger_at = ["created_at", "submitted_at"]
+                .iter()
+                .find_map(|key| self.trigger[key].as_str())
+                .and_then(super::reactor::parse_iso);
             let target = api(self.root, &format!("repos/{REPOSITORY}/pulls/{pr}"))?;
             let head =
                 target["head"]["sha"]
@@ -2579,7 +2677,31 @@ impl Server<'_> {
                     .ok_or(ScalerError::Guard(
                         "no verdict published: current head unreadable",
                     ))?;
-            let mut reviews = list(self.root, &format!("repos/{REPOSITORY}/pulls/{pr}/reviews"))?;
+            let mut reviews: Vec<Value> = list(
+                self.root,
+                &format!("repos/{REPOSITORY}/pulls/{pr}/reviews"),
+            )?
+            .into_iter()
+            .filter(|review| {
+                if dispatch_comment_author(&review["user"]) {
+                    applied.review
+                        && applied.review_head.as_deref() == Some(head)
+                        && review["html_url"]
+                            .as_str()
+                            .is_some_and(|url| applied.review_url.as_deref() == Some(url))
+                } else if super::reactor::trusted_owner(&review["user"]) {
+                    trigger_at
+                        .zip(
+                            review["submitted_at"]
+                                .as_str()
+                                .and_then(super::reactor::parse_iso),
+                        )
+                        .is_some_and(|(since, at)| at >= since)
+                } else {
+                    false
+                }
+            })
+            .collect();
             let review_head_pattern = regex::Regex::new(r"(?:Reviewed head: |at `?)([a-f0-9]{40})")
                 .map_err(|_| ScalerError::Guard("review head pattern"))?;
             for comment in list(
@@ -2588,12 +2710,27 @@ impl Server<'_> {
             )? {
                 let body = comment["body"].as_str().unwrap_or_default();
                 // A coordinator's progress summary is not a review. The
-                // historical #1776 review starts with its verdict and names
-                // the exact head after `at`, as its retained fixture shows.
-                if !body.trim_start().starts_with("Verdict: ")
-                    || !dispatch_comment_author(&comment["user"])
-                        && !super::reactor::trusted_owner(&comment["user"])
-                {
+                // historical #1776 review starts with its verdict, names the
+                // exact head after `at`, and carries this run's server footer.
+                if !body.trim_start().starts_with("Verdict: ") {
+                    continue;
+                }
+                let comment_at = comment["created_at"]
+                    .as_str()
+                    .and_then(super::reactor::parse_iso);
+                let this_round_comment = if dispatch_comment_author(&comment["user"]) {
+                    run_from_body(body) == Some(current_run.as_str())
+                        && trigger_at
+                            .zip(comment_at)
+                            .is_none_or(|(since, at)| at >= since)
+                } else if super::reactor::trusted_owner(&comment["user"]) {
+                    trigger_at
+                        .zip(comment_at)
+                        .is_some_and(|(since, at)| at >= since)
+                } else {
+                    false
+                };
+                if !this_round_comment {
                     continue;
                 }
                 let reviewed = review_head_pattern
@@ -2899,6 +3036,11 @@ impl Server<'_> {
     }
     fn select_branch(&mut self, branch: &str) -> Result<Value, ScalerError> {
         if self.dispatch.review {
+            return Err(ScalerError::Guard("review must continue the reviewed PR"));
+        }
+        if let RoundKind::Review { pr } = self.dispatch.round_kind
+            && (branch != self.dispatch.branch || self.pr != Some(pr))
+        {
             return Err(ScalerError::Guard("review must continue the reviewed PR"));
         }
         if self.dispatch.continuation != Continuation::Owned {
@@ -4907,6 +5049,12 @@ mod tests {
                 assert!(old.contains("commits pushed this round: 0"));
                 assert!(old.contains("commits behind main: 2"));
                 if let Some(body) = record["published_comment"]["body"].as_str() {
+                    let recorded_run = run_from_body(old).unwrap();
+                    assert_eq!(run_from_body(body), Some(recorded_run));
+                    let body = body.replace(
+                        &format!("actions/runs/{recorded_run}"),
+                        &format!("actions/runs/{}", run_id().unwrap()),
+                    );
                     std::fs::write(
                         root.join("layer-comments.json"),
                         json!([[{
@@ -5334,6 +5482,89 @@ mod tests {
             assert!(!posted.contains("Published review verdict:"), "{posted}");
             assert!(!posted.contains("Contract violation:"), "{posted}");
             assert!(!root.join("published-review.json").exists());
+
+            // Stop and strong-tier capacity floors also precede review_result,
+            // even when an authenticated post-trigger review exists on HEAD.
+            std::fs::write(
+                root.join("stop-reviews.json"),
+                json!([[{
+                    "commit_id": head,
+                    "state": "COMMENTED",
+                    "user": {"login": "tjfontaine", "type": "User"},
+                    "submitted_at": "2026-11-07T09:00:00Z",
+                    "body": "Verdict: APPROVE",
+                    "html_url": "https://github.com/carrick-sh/carrick/pull/800#pullrequestreview-5811999999"
+                }]])
+                .to_string(),
+            )
+            .unwrap();
+            std::fs::remove_dir_all(&state).unwrap();
+            std::fs::create_dir_all(&state).unwrap();
+            super::super::round_inbox::start(
+                root,
+                vec![799, 800],
+                None,
+                "2026-11-07T08:23:09Z",
+                Vec::new(),
+                Vec::new(),
+                "2026-11-07T08:23:09Z",
+            );
+            super::super::round_inbox::receive(vec![json!({
+                "id": 777,
+                "user": {"login": "tjfontaine", "type": "User"},
+                "created_at": "2026-11-07T08:30:00Z",
+                "updated_at": "2026-11-07T08:30:00Z",
+                "html_url": "https://github.com/carrick-sh/carrick/issues/799#issuecomment-777",
+                "body": "/agent stop"
+            })]);
+            let mut stopped = server(root);
+            stopped.trigger = json!({
+                "body": "review PR #800 only; change no code and push nothing",
+                "created_at": "2026-11-07T08:23:09Z"
+            });
+            stopped.dispatch.round_kind = RoundKind::Review { pr: 800 };
+            stopped
+                .outcome(
+                    ContractStatus::Blocked,
+                    "Stopped by the owner's `/agent stop` (https://github.com/carrick-sh/carrick/issues/799#issuecomment-777); the work so far is checkpointed.",
+                )
+                .unwrap();
+            let posted = regular_text(&root.join("posted.md")).unwrap();
+            assert_eq!(outcome_status(&posted), Some("Blocked"), "{posted}");
+            assert!(!posted.contains("Published review verdict:"), "{posted}");
+            super::super::round_inbox::start(
+                root,
+                Vec::new(),
+                None,
+                "2026-11-07T08:23:09Z",
+                Vec::new(),
+                Vec::new(),
+                "2026-11-07T08:23:09Z",
+            );
+
+            let mut no_capacity = server(root);
+            no_capacity.trigger = json!({
+                "body": "Worker tier: strong\nreview PR #800 only; change no code and push nothing",
+                "created_at": "2026-11-07T08:23:09Z"
+            });
+            no_capacity.tier = super::super::worker_tier::decide(
+                "",
+                "",
+                "Worker tier: strong\nreview PR #800 only; change no code and push nothing",
+                &[],
+            );
+            no_capacity.tier_unavailable = true;
+            no_capacity.dispatch.round_kind = RoundKind::Review { pr: 800 };
+            no_capacity
+                .outcome(ContractStatus::Done, "Review finished without capacity")
+                .unwrap();
+            let posted = regular_text(&root.join("posted.md")).unwrap();
+            assert_eq!(outcome_status(&posted), Some("Failed"), "{posted}");
+            assert!(
+                posted.contains("no strong-tier worker had capacity"),
+                "{posted}"
+            );
+            assert!(!posted.contains("Published review verdict:"), "{posted}");
         });
     }
     #[test]

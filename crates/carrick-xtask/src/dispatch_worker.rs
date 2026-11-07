@@ -3876,6 +3876,17 @@ fn resolve_event(
         let number = event["pull_request"]["number"]
             .as_u64()
             .ok_or(ScalerError::Guard("missing PR number"))?;
+        if let RoundKind::Review { pr: target_pr } = RoundKind::from_trigger(
+            event["comment"]["body"]
+                .as_str()
+                .or_else(|| event["review"]["body"].as_str())
+                .unwrap_or_default(),
+        ) && number != target_pr
+        {
+            return Err(ScalerError::Guard(
+                "review round target differs from triggering PR",
+            ));
+        }
         let Some(issue) = dispatch_branch(&branch) else {
             // Only a collaborator /agent comment adopts; reviews need a dispatch ref.
             if event.get("comment").is_none() {
@@ -3917,9 +3928,32 @@ fn select_issue_branch(
     let issue = event["issue"]["number"]
         .as_u64()
         .ok_or(ScalerError::Guard("missing issue number"))?;
+    let round_kind = RoundKind::from_trigger(
+        event["comment"]["body"]
+            .as_str()
+            .or_else(|| event["review"]["body"].as_str())
+            .unwrap_or_default(),
+    );
     let fresh = event["comment"]["body"]
         .as_str()
         .is_some_and(|body| body.lines().any(|line| line.trim() == "Fresh start: yes"));
+    if let RoundKind::Review { pr: target_pr } = round_kind {
+        if fresh {
+            return Err(ScalerError::Guard(
+                "review round may not request Fresh start: yes",
+            ));
+        }
+        let matching: Vec<Value> = prs
+            .iter()
+            .filter(|pr| pr["number"].as_u64() == Some(target_pr))
+            .cloned()
+            .collect();
+        let selected = select_owned_pr(issue, &matching, run, trusted)?.ok_or(
+            ScalerError::Guard("review round requires an open owned dispatch PR matching its target"),
+        )?;
+        event["pull_request"] = selected;
+        return Ok(());
+    }
     if fresh {
         let mut superseded = Vec::new();
         for pr in prs {
@@ -6579,6 +6613,19 @@ fn publish_with(
         let head = target["head"]["sha"].as_str().unwrap_or_default();
         if head != admitted {
             return Err(ScalerError::Guard("review round PR head changed"));
+        }
+        if mode == PublishMode::CommitsOnly {
+            return Ok(None);
+        }
+        if receipt.exit_code != 0
+            || contract.status == ContractStatus::Failed
+            || Applied::load()?
+                .last_worker_exit
+                .is_some_and(|exit| exit != LauncherExit::Clean)
+        {
+            return Err(ScalerError::Guard(
+                "review round worker failed or timed out before completing a review",
+            ));
         }
         if !Applied::load()?.review
             && let Some(text) = receipt.review_text.as_deref()
