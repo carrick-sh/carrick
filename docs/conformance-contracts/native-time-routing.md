@@ -136,3 +136,34 @@ The independent source review confirmed these prerequisites and found no
 semantic change in the validation extraction. It did not approve a working
 time route, transport or sleep implementation. These remain unimplemented;
 the four native-child witnesses must stay red until those owners exist.
+
+## Clock transaction witnesses
+
+The resource transport must not compose independent state reads and writes.
+Two production-dispatch schedules expose why:
+
+- `clock_adjtime_notifies_after_discipline_publication` subscribes to a
+  realtime change, then submits SETOFFSET, NANO and TICK together. The listener
+  must observe the new offset and discipline together, and may reenter the
+  clock snapshot API. Before the transaction fix it observes tick 10000
+  instead of 10500, alongside the new offset.
+- `clock_adjtime_reinterprets_units_after_output_preparation` admits a second
+  clock_adjtime on the same domain during the first call's output preparation.
+  That call changes the units to nanoseconds. The first call must derive its
+  implicit SETOFFSET units under the mutation authority, not reuse a step
+  computed before preparation. Both operations enter the production dispatcher;
+  the memory fixture supplies only the deterministic interleaving.
+
+The reviewed transaction order is clock-change lock, then discipline lock.
+Guest output preparation takes neither. Preflight rejects invalid requests
+before preparation, but its derived step is discarded. Execution recomputes
+the step against the locked discipline, checks controlled-clock refusal before
+effects, and publishes offset, discipline and reply before unlocking and
+notifying listeners. A preflight error linearizes at its snapshot; execution
+or revalidation error linearizes under the transaction locks. Memory preparation
+refusals have no clock effects, and genuine output faults remain deferred to
+copyout commit. This needs no syscall retry or extra clock sample.
+
+These witnesses cover the clock authority prerequisite only. They do not
+establish a working native clock transport or satisfy the child-read acceptance
+criterion.
