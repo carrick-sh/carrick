@@ -130,6 +130,7 @@ struct FakeBinding {
     audit_fails: AtomicBool,
     entered: parking_lot::Mutex<Option<Arc<Barrier>>>,
     run_notification: parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    run_release: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     shutdown_kick_armed: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     resume: parking_lot::Mutex<Option<Arc<Barrier>>>,
     progress: AtomicUsize,
@@ -206,6 +207,7 @@ impl FakeBinding {
             audit_fails: AtomicBool::new(false),
             entered: parking_lot::Mutex::new(None),
             run_notification: parking_lot::Mutex::new(None),
+            run_release: parking_lot::Mutex::new(None),
             shutdown_kick_armed: parking_lot::Mutex::new(None),
             resume: parking_lot::Mutex::new(None),
             progress: AtomicUsize::new(0),
@@ -1221,6 +1223,11 @@ impl PersistentExecutor for FakeExecutor {
         binding.progress.fetch_add(1, Ordering::SeqCst);
         if let Some(notification) = binding.run_notification.lock().take() {
             let _ = notification.send(());
+        }
+        if let Some(release) = binding.run_release.lock().take() {
+            release
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|error| TrapError::Hypervisor(format!("fake run release: {error}")))?;
         }
         if let Some(gate) = binding.entered.lock().take() {
             gate.wait();
@@ -5133,15 +5140,17 @@ fn queued_task_preempts_resident_syscall_loop_at_boundary() {
     let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let factory = Arc::new(FakeFactory::default());
 
-    let first_entered = Arc::new(Barrier::new(2));
-    let first_resume = Arc::new(Barrier::new(2));
+    let (first_entered_tx, first_entered) = std::sync::mpsc::channel();
+    let (first_resume, first_resume_rx) = std::sync::mpsc::channel();
     let first_binding = FakeBinding::new(31, [Step::Syscalls(10_000), Step::Exit]);
-    *first_binding.entered.lock() = Some(Arc::clone(&first_entered));
-    *first_binding.resume.lock() = Some(Arc::clone(&first_resume));
+    *first_binding.run_notification.lock() = Some(first_entered_tx);
+    *first_binding.run_release.lock() = Some(first_resume_rx);
 
-    let second_entered = Arc::new(Barrier::new(2));
+    let (second_entered_tx, second_entered) = std::sync::mpsc::channel();
+    let (second_resume, second_resume_rx) = std::sync::mpsc::channel();
     let second_binding = FakeBinding::new(32, [Step::Exit]);
-    *second_binding.entered.lock() = Some(Arc::clone(&second_entered));
+    *second_binding.run_notification.lock() = Some(second_entered_tx);
+    *second_binding.run_release.lock() = Some(second_resume_rx);
 
     factory.install(&first, Arc::clone(&first_binding));
     factory.install(&second, Arc::clone(&second_binding));
@@ -5149,17 +5158,24 @@ fn queued_task_preempts_resident_syscall_loop_at_boundary() {
     let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
     let first_authority = enqueue_root(&scheduler, &first, publish(&first, 31));
 
-    first_entered.wait();
+    first_entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("task A enters");
     let second_authority = enqueue_root(&scheduler, &second, publish(&second, 32));
-    first_resume.wait();
+    first_resume.send(()).unwrap();
 
-    second_entered.wait();
+    second_entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("task B preempts A");
+    // Keep B at its observed entry until the assertion is sampled. Otherwise
+    // B can exit and A can finish before this test thread is scheduled again.
     let progress_when_b_entered = first_binding.progress.load(Ordering::SeqCst);
     assert!(
         progress_when_b_entered < 10_000,
         "task B must enter before task A exhausts its syscalls (progress: {progress_when_b_entered})"
     );
 
+    second_resume.send(()).unwrap();
     drop((first_authority, second_authority));
     let report = pool.shutdown().expect("clean shutdown");
     assert_eq!(first_binding.progress.load(Ordering::SeqCst), 10_001);
