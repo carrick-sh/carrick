@@ -212,7 +212,39 @@ pub fn label_authorized(events: &[Value], sender: &str) -> bool {
             e["event"] == "labeled" && e["actor"]["login"] == sender && allowed(sender)
         })
 }
-const MERGE_QUEUE_QUERY: &str = "query { repository(owner: \"carrick-sh\", name: \"carrick\") { mergeQueue(branch: \"main\") { entries(first: 100) { nodes { headCommit { oid } pullRequest { number baseRefName baseRepository { nameWithOwner } } } } } } }";
+const MERGE_QUEUE_QUERY: &str = "query { repository(owner: \"carrick-sh\", name: \"carrick\") { mergeQueue(branch: \"main\") { entries(first: 100) { nodes { baseCommit { oid } headCommit { oid } pullRequest { number baseRefName baseRepository { nameWithOwner } } } } } } }";
+
+fn merge_queue_entries() -> Result<Vec<Value>, ReceiptError> {
+    let graphql_text = checked(
+        "gh",
+        &[
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={MERGE_QUEUE_QUERY}"),
+        ],
+        None,
+    )?;
+    let graphql: Value = serde_json::from_str(&graphql_text).map_err(|e| fail(e.to_string()))?;
+    if !graphql["errors"].is_null() {
+        return Err(fail("mergeQueue GraphQL query returned errors"));
+    }
+    Ok(
+        graphql["data"]["repository"]["mergeQueue"]["entries"]["nodes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default(),
+    )
+}
+
+fn live_main_queue_entry(entries: &[Value], sha: &str) -> bool {
+    entries.iter().any(|node| {
+        node["baseCommit"]["oid"] == sha
+            && node["pullRequest"]["baseRefName"] == "main"
+            && node["pullRequest"]["baseRepository"]["nameWithOwner"] == REPOSITORY
+            && node["pullRequest"]["number"].as_u64().is_some()
+    })
+}
 
 fn parse_queue_ref_pr(git_ref: &str) -> Option<u64> {
     let rest = git_ref
@@ -230,6 +262,7 @@ fn resolve_merge_group_prs(
     base: &str,
     requested_sha: &str,
     git_ref: &str,
+    queue_entries: &[Value],
 ) -> Result<Vec<u64>, ReceiptError> {
     let rev_list = checked(
         "git",
@@ -244,6 +277,7 @@ fn resolve_merge_group_prs(
     let queued_ordered: Vec<&str> = rev_list.lines().filter(|s| !s.is_empty()).collect();
     let group_commits: std::collections::BTreeSet<&str> = queued_ordered.iter().copied().collect();
     let mut prs = std::collections::BTreeSet::new();
+    let mut api_prs = std::collections::BTreeSet::new();
     let mut matched_commits = std::collections::BTreeSet::new();
     if let Some(number) = parse_queue_ref_pr(git_ref) {
         prs.insert(number);
@@ -266,33 +300,22 @@ fn resolve_merge_group_prs(
             prs.insert(number);
         }
     }
-    let graphql_text = checked(
-        "gh",
-        &[
-            "api",
-            "graphql",
-            "-f",
-            &format!("query={MERGE_QUEUE_QUERY}"),
-        ],
-        None,
-    )?;
-    let graphql: Value = serde_json::from_str(&graphql_text).map_err(|e| fail(e.to_string()))?;
-    if !graphql["errors"].is_null() {
-        return Err(fail("mergeQueue GraphQL query returned errors"));
-    }
-    if let Some(nodes) = graphql["data"]["repository"]["mergeQueue"]["entries"]["nodes"].as_array()
-    {
-        for node in nodes {
-            if let Some(oid) = node["headCommit"]["oid"].as_str()
-                && group_commits.contains(oid)
-                && node["pullRequest"]["baseRefName"] == "main"
-                && node["pullRequest"]["baseRepository"]["nameWithOwner"] == REPOSITORY
-                && let Some(number) = node["pullRequest"]["number"].as_u64()
-            {
-                prs.insert(number);
-                matched_commits.insert(oid.to_owned());
-            }
+    for node in queue_entries {
+        if let Some(oid) = node["headCommit"]["oid"].as_str()
+            && group_commits.contains(oid)
+            && node["pullRequest"]["baseRefName"] == "main"
+            && node["pullRequest"]["baseRepository"]["nameWithOwner"] == REPOSITORY
+            && let Some(number) = node["pullRequest"]["number"].as_u64()
+        {
+            prs.insert(number);
+            api_prs.insert(number);
+            matched_commits.insert(oid.to_owned());
         }
+    }
+    if parse_queue_ref_pr(git_ref).is_some_and(|number| !api_prs.contains(&number)) {
+        return Err(fail(
+            "merge-group ref does not identify a live entry in the main merge queue",
+        ));
     }
     // If an earlier group (or this group) merged onto main before mergeQueue was
     // queried, its queue entry disappeared and /commits/{sha}/pulls now links it.
@@ -442,6 +465,34 @@ fn prepare(event_path: &Path, output: &Path) -> Result<(), ReceiptError> {
             "refs/heads/main",
             &requested_sha,
         )?;
+        let main_tip = checked(
+            "git",
+            &["rev-parse", "--verify", "refs/heads/main^{commit}"],
+            Some(graph.path()),
+        )?;
+        let queue_entries = merge_queue_entries()?;
+        // A current main tip is the ordinary first-in-line base. Every other
+        // base must be witnessed as a live entry in this repository's main
+        // merge queue; ancestry and queue-ref spelling are not authorization.
+        if comparison_sha != main_tip.trim()
+            && !live_main_queue_entry(&queue_entries, comparison_sha)
+        {
+            return Err(fail(
+                "merge-group base is not a live entry in the main merge queue",
+            ));
+        }
+        if comparison_sha != main_tip.trim() {
+            let base_ancestor = crate::ci_receipt::resolve_main_ancestor(
+                graph.path(),
+                "refs/heads/main",
+                comparison_sha,
+            )?;
+            if base_ancestor.before_sha != ancestor.before_sha {
+                return Err(fail(
+                    "live merge-group base does not share the candidate's main chain",
+                ));
+            }
+        }
         let base = if comparison_sha == ancestor.before_sha {
             ancestor.before_sha
         } else {
@@ -467,7 +518,13 @@ fn prepare(event_path: &Path, output: &Path) -> Result<(), ReceiptError> {
             .as_str()
             .filter(|r| parse_queue_ref_pr(r).is_some())
             .unwrap_or(&git_ref);
-        let prs = resolve_merge_group_prs(graph.path(), &base, &requested_sha, queue_ref)?;
+        let prs = resolve_merge_group_prs(
+            graph.path(),
+            &base,
+            &requested_sha,
+            queue_ref,
+            &queue_entries,
+        )?;
         (RequestKind::MergeGroup, base, prs)
     } else {
         let comparison = api(&format!(
