@@ -8536,6 +8536,115 @@ mod container_clock_tests {
     }
 
     #[test]
+    fn clock_adjtime_reinterprets_units_after_output_preparation() {
+        use super::copyout::owner_fixture::OwnerRefusingMemory;
+        use carrick_guest_mem::{GuestWriteRange, MemoryPrepareError, PreparedGuestWrite, UserMemoryVenue};
+
+        struct InterleavedMemory<'a> {
+            inner: OwnerRefusingMemory,
+            on_prepare: Option<Box<dyn FnOnce() + 'a>>,
+        }
+        impl GuestMemory for InterleavedMemory<'_> {
+            fn user_memory_venue(&self) -> UserMemoryVenue {
+                UserMemoryVenue::Owner
+            }
+            fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+                self.inner.read_bytes_raw(address, length)
+            }
+            fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+                self.inner.write_bytes_raw(address, bytes)
+            }
+            fn prepare_write(&mut self, ranges: &[GuestWriteRange]) -> Result<Box<dyn PreparedGuestWrite + '_>, MemoryPrepareError> {
+                if let Some(change) = self.on_prepare.take() {
+                    change();
+                }
+                self.inner.prepare_write(ranges)
+            }
+        }
+        impl CurrentMmMemory for InterleavedMemory<'_> {}
+
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        context.task().with_caps(|caps| *caps = crate::namespace::process::CapabilitySet::full());
+        let mut sibling = SyscallDispatcher::new();
+        let mut memory = InterleavedMemory {
+            inner: OwnerRefusingMemory::new(MEM_BASE, MEM_LEN, 0),
+            on_prepare: Some(Box::new(|| {
+                // A second admitted syscall changes the shared domain after
+                // preflight and before the first call's mutation. No threads
+                // or timing assumptions are needed to force this schedule.
+                let mut memory = LinearMemory::new(MEM_BASE, vec![0; MEM_LEN]);
+                let mut nano = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
+                nano.modes = LINUX_ADJ_NANO;
+                memory.write_bytes(TIMEX_ADDR, nano.abi_bytes()).unwrap();
+                assert_eq!(sibling.dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &CompatReporter::default()).unwrap(), DispatchOutcome::Returned { value: LINUX_TIME_OK });
+            })),
+        };
+        let mut request = LinuxTimex::new_read_state(LinuxTimeval::new(0, 123));
+        request.modes = LINUX_ADJ_SETOFFSET;
+        memory.inner.seed(TIMEX_ADDR, request.abi_bytes());
+        assert_eq!(dispatcher.dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &CompatReporter::default()).unwrap(), DispatchOutcome::Returned { value: LINUX_TIME_OK });
+        assert!(memory.on_prepare.is_none());
+        assert_eq!(memory.inner.prepares, 1);
+        assert_eq!(memory.inner.commits.len(), 1);
+        assert_eq!(context.task().container().clock().realtime_offset_ns(), 123);
+    }
+
+    #[test]
+    fn clock_adjtime_notifies_after_discipline_publication() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
+        let context = dispatcher.capture_one_task_context().unwrap();
+        context
+            .task()
+            .with_caps(|caps| *caps = crate::namespace::process::CapabilitySet::full());
+        let clock = Arc::clone(context.task().container().clock());
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (generation, ()) = clock.with_clock_change_snapshot(|| ());
+        let callback_clock = Arc::downgrade(&clock);
+        let callback_observed = Arc::clone(&observed);
+        let enrollment = clock.subscribe_clock_change(
+            generation,
+            Arc::new(move || {
+                let clock = callback_clock.upgrade().unwrap();
+                // Both locks must be released before notification: real timer
+                // listeners take another snapshot and may inspect discipline.
+                let (_, state) = clock.with_clock_change_snapshot(|| {
+                    (clock.realtime_offset_ns(), clock.adjtimex_state())
+                });
+                callback_observed.lock().unwrap().push(state);
+            }),
+        );
+        assert!(matches!(
+            enrollment,
+            crate::kernel::container::ClockChangeEnrollment::Subscribed(_)
+        ));
+        let mut timex = LinuxTimex::new_read_state(LinuxTimeval::new(0, 123));
+        timex.modes = LINUX_ADJ_SETOFFSET | LINUX_ADJ_NANO | LINUX_ADJ_TICK;
+        timex.tick = 10_500;
+        memory.write_bytes(TIMEX_ADDR, timex.abi_bytes()).unwrap();
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        SYS_CLOCK_ADJTIME,
+                        SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0]),
+                    ),
+                    &mut memory,
+                    &CompatReporter::default(),
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: LINUX_TIME_OK },
+        );
+        let observations = observed.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].0, 123);
+        assert_eq!(observations[0].1.tick, 10_500);
+        assert_ne!(observations[0].1.status & LINUX_STA_NANO, 0);
+    }
+
+    #[test]
     fn clock_adjtime_setoffset_moves_realtime() {
         let mut dispatcher = SyscallDispatcher::new();
         let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
