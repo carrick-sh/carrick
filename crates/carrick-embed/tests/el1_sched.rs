@@ -3891,6 +3891,32 @@ fn el1_metadata_allocator_host_wait_requires_unmasked_irq() {
     );
 }
 
+/// An image mapping's historical writable flag cannot authorize a store after
+/// mprotect. Exercise the actual EL0 fault both before fork and after a writable
+/// neighbor in the same compound has taken COW while the child remains alive.
+#[test]
+fn el1_owner_cow_preserves_host_image_readonly_protection() {
+    let _guard = common::guest_lock();
+    let carrier = carrier_or_fail();
+    for mode in ["cow-protected-image", "cow-protected-image-fork"] {
+        let measured = run_fixture(&carrier, &[mode], Duration::from_secs(40));
+        assert!(
+            measured
+                .result
+                .stdout_utf8()
+                .contains("cow-protected-image attempting denied store"),
+            "must reach the protected store: {}",
+            describe(&measured)
+        );
+        assert_eq!(
+            measured.result.signal,
+            Some(carrick_embed::Signal(libc::SIGSEGV)),
+            "mprotect must survive COW selection: {}",
+            describe(&measured)
+        );
+    }
+}
+
 /// Exercise the initial owner MM through the production permission-fault
 /// entry beyond two full 64-slot COW grant chains without intervening syscalls.
 #[test]
