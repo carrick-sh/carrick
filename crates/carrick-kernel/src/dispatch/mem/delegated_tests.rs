@@ -7168,5 +7168,84 @@ fn delegated_outside_hint_keeps_owner_protection() {
             "owner mapping entered legacy protection"
         );
         assert_eq!(memory.zero_backing_calls.get(), 0, "reservation stays lazy");
+        assert!(dispatcher.fault_requires_mm_mutation(mapped));
+        // A protection split retains external placement authority until retirement.
+        assert_eq!(
+            returned(call(
+                &mut dispatcher,
+                &mut memory,
+                SYS_MUNMAP,
+                [mapped, LENGTH, 0, 0, 0, 0]
+            )),
+            0
+        );
+        assert!(!dispatcher.fault_requires_mm_mutation(mapped));
     }
+}
+
+#[test]
+fn delegated_outside_hint_collision_keeps_existing_owner() {
+    const HINT: u64 = 0x7000000000;
+    let mut dispatcher = SyscallDispatcher::new();
+    let _root = Root::admit(&dispatcher);
+    let mut memory = CountingMmapMemory::new(HINT, PAGE as usize);
+    memory.defer_anon = true;
+    let flags = LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS;
+    assert_eq!(
+        returned(host_mmap(
+            &mut dispatcher,
+            &mut memory,
+            HINT,
+            PAGE,
+            0,
+            flags,
+            -1
+        )),
+        HINT as i64
+    );
+    let second = returned(host_mmap(
+        &mut dispatcher,
+        &mut memory,
+        HINT,
+        PAGE,
+        0,
+        flags,
+        -1,
+    ));
+    assert_ne!(second, HINT as i64, "an occupied advisory hint relocates");
+    assert_eq!(
+        returned(call(
+            &mut dispatcher,
+            &mut memory,
+            SYS_MPROTECT,
+            [HINT, PAGE, 3, 0, 0, 0]
+        )),
+        0
+    );
+    assert_eq!(
+        memory.owner_protect_log.borrow().last(),
+        Some(&(HINT, PAGE as usize, 3))
+    );
+}
+
+#[test]
+fn delegated_outside_hint_avoids_rosetta_window() {
+    let mut dispatcher = SyscallDispatcher::new();
+    let _root = Root::admit(&dispatcher);
+    let hint = crate::memory::LINUX_ROSETTA_VA_BASE;
+    let mut memory = arena_memory();
+    memory.defer_anon = true;
+    let mapped = returned(host_mmap(
+        &mut dispatcher,
+        &mut memory,
+        hint,
+        PAGE,
+        0,
+        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+        -1,
+    ));
+    assert_ne!(
+        mapped, hint as i64,
+        "runtime aperture cannot become anonymous owner memory"
+    );
 }
