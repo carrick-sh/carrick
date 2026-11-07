@@ -33,6 +33,8 @@ rationale = "Request/response IPC between forked processes (`pairs` concurrent p
 [bindings]
 vm_free = [
   "carrick-kernel::kernel::continuation::ipc::tests::host_ipc_completion_regions_retain_their_exact_kernel_owner (production completion services retain two distinct kernel mappings after dispatcher teardown and reject the peer operation storage)",
+  "carrick-el1-abi::file_region::registration_mailbox_tests::registered_metadata_mailbox_is_carrier_local_and_refuses_retirement (retained metadata-service storage prerequisite: two live registrations and retirement refusal; no runtime IPC acceptance claim)",
+  "carrick-vmm-hvf::trap::stage2_backend::tests::metadata_service_selects_its_carrier_with_two_live_regions (macOS VM-free production metadata service selects its retained carrier after an unpublished replacement is dropped; requires macOS execution)",
   "carrick-kernel::kernel::continuation::ipc::tests::serial_host_ipc_admission_borrows_the_installed_window_and_rejects_a_peer (production descriptor publication accepts only the supplied installed owner after window publication)",
   "carrick-el1-abi::HostIpcWindow::attach (compile-fail lifetime witness rejects escape from the retained window borrow)",
   "carrick-el1-linux::ipc::bound_venue_tests::{relocated_x86_layout_attaches_registered_ipc_venue,arm_layout_attaches_the_same_registered_ipc_venue,guest_venue_refuses_foreign_layout_before_memory_access} (registered venue attachment only; no runtime pipe-service claim)",
