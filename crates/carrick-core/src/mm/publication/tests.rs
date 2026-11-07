@@ -1613,7 +1613,7 @@ fn fork_child_pipe_copyout_selects_owner_preparation_with_two_live_mms() {
         words: &'a W,
         root: RootGpa,
     }
-    impl<W: LiveDescriptorWords> crate::user_copy::UserCopy for ChildCopy<'_, W> {
+    impl<W: LiveDescriptorWords> carrick_personality_linux::lifecycle::UserCopy for ChildCopy<'_, W> {
         fn copy_in(
             &mut self,
             _: &mut [u8],
@@ -1625,7 +1625,7 @@ fn fork_child_pipe_copyout_selects_owner_preparation_with_two_live_mms() {
             &mut self,
             _: carrick_guest_arch::UserVa,
             _: &[u8],
-        ) -> crate::user_copy::CopyOutcome {
+        ) -> carrick_personality_linux::lifecycle::CopyOutcome {
             panic!("staging does not copy output bytes")
         }
     }
