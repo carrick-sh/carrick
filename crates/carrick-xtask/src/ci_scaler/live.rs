@@ -4261,16 +4261,38 @@ printf '{"data":%s}\n200' "$body"
         let script = format!(
             "#!/bin/sh\nif [ ! -e {marker} ]; then : > {marker}; printf 'ssh: connect to host fixture port 22: Connection timed out' >&2; exit 255; fi\nprintf connected\n"
         );
-        // Write the fixture in an unshared descriptor table and run while a
-        // sibling pre-exec fork is live so `ETXTBSY` (os error 26) cannot recur.
+        // The failed CI invocation reported ETXTBSY, not Timeout: a sibling
+        // fork inherited the fixture's writable descriptor before exec. Hold
+        // the writer open until that fork exists, then close it before running
+        // ssh. Only the writer's unshared descriptor table prevents inheritance.
+        let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+        let (close_tx, close_rx) = std::sync::mpsc::channel();
+        let ssh_for_writer = ssh.clone();
+        let writer = std::thread::spawn(move || {
+            crate::lock_file::tests::write_test_executable_with_hook(
+                &ssh_for_writer,
+                script.as_bytes(),
+                std::fs::Permissions::from_mode(0o755),
+                || {
+                    opened_tx.send(()).unwrap();
+                    close_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                },
+            );
+        });
+        opened_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let (result, attempt_budgets, elapsed) = crate::lock_file::tests::with_unrelated_fork_exec(
             || {
-                crate::lock_file::tests::write_test_executable(
-                    &ssh,
-                    &script,
-                    std::fs::Permissions::from_mode(0o755),
+                close_tx.send(()).unwrap();
+                writer.join().unwrap();
+                let result =
+                    run_ssh_with_budget(&ssh, Duration::from_secs(2), Duration::from_millis(300));
+                // Drive the production entry point before the unrelated fork
+                // crosses exec and releases any inherited writable descriptor.
+                assert_eq!(
+                    execute(&mut Command::new(&ssh), &[], SUBPROCESS_HANG_GUARD).unwrap(),
+                    b"connected"
                 );
-                run_ssh_with_budget(&ssh, Duration::from_secs(2), Duration::from_millis(300))
+                result
             },
             || {},
         );
