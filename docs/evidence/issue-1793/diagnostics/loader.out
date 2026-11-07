@@ -1,0 +1,65 @@
+{
+  "command": [
+    "/usr/bin/dash",
+    "-c",
+    "printf \"loader-shell-ok\\n\""
+  ],
+  "exit_code": 127,
+  "image": "golang:1.24",
+  "report": {
+    "deferred_syscalls": [],
+    "execution_witness": {
+      "anonymous_private_mms": [],
+      "anonymous_private_pages": 0,
+      "backend": "kvm-x86-cpl0",
+      "cross_mm_private_aliases": 0,
+      "guest_entries": 9,
+      "host_forward_families": [
+        {
+          "count": 4,
+          "family": "host_crossing"
+        }
+      ],
+      "host_forwards": 4,
+      "peer_active_private_grants": 0,
+      "physical_crossing_families": [
+        {
+          "count": 1,
+          "family": "root_exit"
+        }
+      ],
+      "portal_exits": 5
+    },
+    "partial_syscalls": [],
+    "proc_read_unimplemented": [],
+    "summary": {
+      "deferred_syscall_invocations": 0,
+      "distinct_deferred_syscalls": 0,
+      "distinct_partial_syscalls": 0,
+      "distinct_proc_read_unimplemented": 0,
+      "distinct_sys_read_unimplemented": 0,
+      "distinct_unhandled_ioctls": 0,
+      "distinct_unhandled_syscalls": 0,
+      "distinct_unknown_syscall_flags": 0,
+      "distinct_unsupported_signals": 0,
+      "fast_path_blind_spots": 0,
+      "partial_syscall_invocations": 0,
+      "syscall_invocations": 4,
+      "syscall_returns_errno": 0,
+      "syscall_returns_ok": 0,
+      "unhandled_ioctl_invocations": 0,
+      "unhandled_syscall_invocations": 0,
+      "unknown_syscall_flag_invocations": 0
+    },
+    "sys_read_unimplemented": [],
+    "unhandled_ioctls": [],
+    "unhandled_syscalls": [],
+    "unknown_syscall_flags": [],
+    "unsupported_signals": []
+  },
+  "stderr": "",
+  "stdout": "",
+  "store": "/var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick",
+  "trap_limit_hit": false,
+  "traps": 6
+}

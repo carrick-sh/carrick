@@ -1,0 +1,20 @@
+2026-11-07T00:58:30Z
+    PID    PPID STAT WCHAN                     COMMAND
+  22868   22867 Dl   balance_dirty_pages       carrick:i1793-20261107T005759-node-child: 0 containers
+total 0
+lr-x------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:58 0 -> /dev/null
+l-wx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:58 1 -> /var/tmp/carrick-dispatch-mbVrAA/agent/work/docs/evidence/issue-1793/run-2/node-child.out
+lr-x------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:58 10 -> /var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/scratch/.tmpupmqXd
+lr-x------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:58 11 -> /var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/scratch/.carrick-layer-cache/5b047af557637fe62936bbd7ab4733b873465512069d054cd4af47eb31ba3965/usr/lib/x86_64-linux-gnu
+lr-x------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:58 12 -> /var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/scratch/.carrick-layer-cache/5b047af557637fe62936bbd7ab4733b873465512069d054cd4af47eb31ba3965
+lr-x------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:58 13 -> /var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/scratch/.carrick-layer-cache/5b047af557637fe62936bbd7ab4733b873465512069d054cd4af47eb31ba3965/usr/lib/x86_64-linux-gnu/libicudata.a
+lr-x------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:58 14 -> /var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/scratch/.carrick-layer-cache/5b047af557637fe62936bbd7ab4733b873465512069d054cd4af47eb31ba3965/usr
+l-wx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:58 15 -> /var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/scratch/.tmpupmqXd/usr/lib/x86_64-linux-gnu/libicudata.a
+l-wx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:58 2 -> /var/tmp/carrick-dispatch-mbVrAA/agent/work/docs/evidence/issue-1793/run-2/node-child.err
+lrwx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:58 3 -> /var/tmp/carrick-dispatch-mbVrAA/agent/work/.git/carrick-worktree-admission/generation-6nz7ACGWLlZj3XfvCEr9KMuHeJaCkB3a
+l-wx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:58 4 -> pipe:[16444]
+lrwx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:58 5 -> /tmp/carrick-kernel-arena-22868-0 (deleted)
+lr-x------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:58 6 -> /var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/scratch/.carrick-layer-cache/5b047af557637fe62936bbd7ab4733b873465512069d054cd4af47eb31ba3965/usr/lib
+lrwx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:58 7 -> /var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/scratch/.tmpupmqXd/.carrick.lock
+lrwx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:58 8 -> socket:[33570]
+lrwx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:58 9 -> socket:[33571]

@@ -1,0 +1,4 @@
+REPOSITORY                  TAG           IMAGE ID        CREATED                 SIZE
+node                        24            6b9d4ea31e61    Less than a minute ago  410.0MB
+python                      3.12          97dc788c1887    Less than a minute ago  411.9MB
+golang                      1.24          46fdd02b6cbc    Less than a minute ago  324.0MB

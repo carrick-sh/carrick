@@ -1,0 +1,9 @@
+2026-11-07T00:55:50Z
+40f16257cd5286b3a37fd5b9503154774294088f
+50184689cf7f3cae5da2ee6120e38ec12f539ed07cb881cf79ae8e0dfb33589d  /var/tmp/carrick-dispatch-mbVrAA/agent/work/target/release/carrick
+Linux carrick-ci-42317799660-1-128235836627-1794011553 6.12.111+deb13-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.12.111-1 (2026-09-28) x86_64 GNU/Linux
+uid=999(carrick-dispatch-agent) gid=989(carrick-dispatch-agent) groups=989(carrick-dispatch-agent),992(kvm)
+crw-rw---- 1 root kvm 10, 232 Nov  7 00:53 /dev/kvm
+CARRICK_REQUIRE_KVM=1
+lease_socket=/tmp/carrick-lease-zoAWXj/lease.sock
+carrick-cli 0.1.0

@@ -1,0 +1,6 @@
+docs/evidence/issue-1793/run.sh: line 23: 15759 Killed                  timeout --signal=KILL 1s sleep 5 > "$out/deadline.out" 2> "$out/deadline.err"
+docs/evidence/issue-1793/run.sh: line 49: 16181 Killed                  CARRICK_RUN_ID="$active_id" timeout --signal=KILL 120s "$bin" run --platform linux/amd64 --pull never --entrypoint /bin/sh "$image" -c "$cmd" < /dev/null > "$out/$name.out" 2> "$out/$name.err"
+docs/evidence/issue-1793/run.sh: line 49: 16688 Killed                  CARRICK_RUN_ID="$active_id" timeout --signal=KILL 120s "$bin" run --platform linux/amd64 --pull never --entrypoint /bin/sh "$image" -c "$cmd" < /dev/null > "$out/$name.out" 2> "$out/$name.err"
+docs/evidence/issue-1793/run.sh: line 49: 17257 Killed                  CARRICK_RUN_ID="$active_id" timeout --signal=KILL 120s "$bin" run --platform linux/amd64 --pull never --entrypoint /bin/sh "$image" -c "$cmd" < /dev/null > "$out/$name.out" 2> "$out/$name.err"
+docs/evidence/issue-1793/run.sh: line 73: ode:24: command not found
+error: Recipe `lease` failed with exit code 127

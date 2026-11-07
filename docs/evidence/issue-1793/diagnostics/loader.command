@@ -1,0 +1,1 @@
+/var/tmp/carrick-dispatch-mbVrAA/agent/work/target/release/carrick run --json --platform linux/amd64 --pull never --entrypoint /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 golang:1.24 /usr/bin/dash -c printf\ \"loader-shell-ok\\n\" 

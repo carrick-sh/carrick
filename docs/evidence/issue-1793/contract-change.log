@@ -1,0 +1,2 @@
+python3 scripts/conformance/check-contract-change.py --root . --base 71c57e106688ba954a5a9947c9868f8a92160660 --head HEAD
+conformance contract check passed: all changed surfaces covered or exempted

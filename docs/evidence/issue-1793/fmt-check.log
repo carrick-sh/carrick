@@ -1,0 +1,1 @@
+'/var/tmp/carrick-dispatch-mbVrAA/agent/work/target/debug/carrick-xtask' worktree-run -- cargo --locked --config 'build.rustc-wrapper=""' fmt --all -- --check

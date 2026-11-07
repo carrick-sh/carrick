@@ -18,9 +18,9 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 # Known answers: preserve nonzero status, capture both streams, enforce deadline.
 set +e
-timeout --signal=KILL 1s bash -c 'echo known-out; echo known-err >&2; exit 7' > "$out/known.out" 2> "$out/known.err"
+timeout --foreground --signal=KILL 1s bash -c 'echo known-out; echo known-err >&2; exit 7' > "$out/known.out" 2> "$out/known.err"
 known=$?
-timeout --signal=KILL 1s sleep 5 > "$out/deadline.out" 2> "$out/deadline.err"
+timeout --foreground --signal=KILL 1s sleep 5 > "$out/deadline.out" 2> "$out/deadline.err"
 deadline=$?
 set -e
 [[ $known == 7 && $deadline == 137 ]]
@@ -40,7 +40,7 @@ printf 'row\timage\trun_id\tstatus\texit\n' > "$out/rows.tsv"
 for image in golang:1.24 python:3.12 node:24; do
     key=${image/:/-}
     set +e
-    timeout --signal=KILL 120s "$bin" pull --platform linux/amd64 "$image" > "$out/pull-$key.out" 2> "$out/pull-$key.err"
+    timeout --foreground --signal=KILL 120s "$bin" pull --platform linux/amd64 "$image" > "$out/pull-$key.out" 2> "$out/pull-$key.err"
     rc=$?
     set -e
     printf '%s\n' "$rc" > "$out/pull-$key.status"
@@ -48,6 +48,7 @@ done
 "$bin" images > "$out/images.txt" 2>&1
 row() {
     local name=$1 image=$2 cmd=$3 key=${2/:/-} rc
+    if [[ -n ${ONLY_ROW:-} && $name != "$ONLY_ROW" ]]; then return; fi
     active_id="i1793-$(date -u +%Y%m%dT%H%M%S)-$name"
     printf '%s\n' "$cmd" > "$out/$name.command"
     if [[ $(cat "$out/pull-$key.status") != 0 ]]; then
@@ -56,7 +57,7 @@ row() {
         return
     fi
     set +e
-    CARRICK_RUN_ID="$active_id" timeout --signal=KILL 120s "$bin" run --platform linux/amd64 --pull never --entrypoint /bin/sh "$image" -c "$cmd" < /dev/null > "$out/$name.out" 2> "$out/$name.err"
+    CARRICK_RUN_ID="$active_id" timeout --foreground --signal=KILL 120s "$bin" run --platform linux/amd64 --pull never --entrypoint /bin/sh "$image" -c "$cmd" < /dev/null > "$out/$name.out" 2> "$out/$name.err"
     rc=$?
     set -e
     cleanup

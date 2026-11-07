@@ -1,0 +1,18 @@
+2026-11-07T00:54:21Z
+    PID    PPID STAT WCHAN                     COMMAND
+  17258   17257 Dl   balance_dirty_pages       carrick:i1793-20261107T005325-node-version: 0 containers
+total 0
+lr-x------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:54 0 -> /dev/null
+l-wx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:54 1 -> /var/tmp/carrick-dispatch-mbVrAA/agent/work/docs/evidence/issue-1793/run-1/node-version.out
+lrwx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:54 10 -> /var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/scratch/.tmpqFUiOQ/.carrick.lock
+lr-x------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:54 11 -> /var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/scratch/.tmpqFUiOQ
+lr-x------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:54 12 -> /var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/scratch/.carrick-layer-cache/.building-17258-1794012805505147545/usr/lib/gcc/x86_64-linux-gnu/12
+l-wx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:54 13 -> /var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/scratch/.carrick-layer-cache/.building-17258-1794012805505147545/usr/lib/gcc/x86_64-linux-gnu/12/cc1
+l-wx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:54 2 -> /var/tmp/carrick-dispatch-mbVrAA/agent/work/docs/evidence/issue-1793/run-1/node-version.err
+lrwx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:54 3 -> /var/tmp/carrick-dispatch-mbVrAA/agent/work/.git/carrick-worktree-admission/generation-6nz7ACGWLlZj3XfvCEr9KMuHeJaCkB3a
+l-wx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:54 4 -> pipe:[16444]
+lrwx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:54 5 -> /tmp/carrick-kernel-arena-17258-0 (deleted)
+lr-x------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:54 6 -> /var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/blobs/sha256/9bab93d346cda15207e5a5000093cee7256ec1092fb689ec3d2997faf31b9a16
+lr-x------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:54 7 -> /var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/scratch/.carrick-layer-cache/.building-17258-1794012805505147545
+lrwx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:54 8 -> socket:[25338]
+lrwx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:54 9 -> socket:[25339]

@@ -1,0 +1,19 @@
+2026-11-07T00:50:13Z
+    PID    PPID STAT WCHAN                     COMMAND
+  16689   16688 Dl   do_get_write_access       carrick:i1793-20261107T004943-py-thread: 0 containers
+total 0
+lr-x------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:50 0 -> /dev/null
+l-wx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:50 1 -> /var/tmp/carrick-dispatch-mbVrAA/agent/work/docs/evidence/issue-1793/run-1/py-thread.out
+lrwx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:50 10 -> /var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/scratch/.tmppTXY8H/.carrick.lock
+lr-x------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:50 11 -> /var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/scratch/.tmppTXY8H
+lr-x------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:50 12 -> /var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/scratch/.carrick-layer-cache/e57871c7786ff8855e4e0b51152cd0e88a68a9de729de9eb33166db066daf0da/usr/bin/x86_64-linux-gnu-lto-dump-14
+l-wx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:50 13 -> /var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/scratch/.tmppTXY8H/usr/bin/x86_64-linux-gnu-lto-dump-14
+lr-x------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:50 15 -> /var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/scratch/.carrick-layer-cache/e57871c7786ff8855e4e0b51152cd0e88a68a9de729de9eb33166db066daf0da/usr
+l-wx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:50 2 -> /var/tmp/carrick-dispatch-mbVrAA/agent/work/docs/evidence/issue-1793/run-1/py-thread.err
+lrwx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:50 3 -> /var/tmp/carrick-dispatch-mbVrAA/agent/work/.git/carrick-worktree-admission/generation-6nz7ACGWLlZj3XfvCEr9KMuHeJaCkB3a
+l-wx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:50 4 -> pipe:[16444]
+lrwx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:50 5 -> /tmp/carrick-kernel-arena-16689-0 (deleted)
+lr-x------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:50 6 -> /var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/scratch/.carrick-layer-cache/e57871c7786ff8855e4e0b51152cd0e88a68a9de729de9eb33166db066daf0da
+lr-x------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:50 7 -> /var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/scratch/.carrick-layer-cache/e57871c7786ff8855e4e0b51152cd0e88a68a9de729de9eb33166db066daf0da/usr/bin
+lrwx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:50 8 -> socket:[28890]
+lrwx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 00:50 9 -> socket:[28891]

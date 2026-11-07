@@ -1,0 +1,21 @@
+2026-11-07T01:01:28Z
+    PID    PPID STAT WCHAN                     COMMAND
+  25661   25660 Dl   balance_dirty_pages       carrick:i1793-diag-20261107T005937-shell: 0 containers
+total 0
+lr-x------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 01:01 0 -> /dev/null
+l-wx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 01:01 1 -> /var/tmp/carrick-dispatch-mbVrAA/agent/work/docs/evidence/issue-1793/diagnostics/shell.out
+lrwx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 01:01 10 -> /var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/scratch/.tmpIx0EEg/.carrick.lock
+lr-x------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 01:01 11 -> /var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/scratch/.tmpIx0EEg
+lr-x------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 01:01 12 -> /var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/scratch/.carrick-layer-cache/bcd982c8f24a79ab40e5d8acf66e7a92e00dbe40383d34cd00fc6829afe6cff6/usr/lib/python3.13
+lr-x------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 01:01 13 -> /var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/scratch/.carrick-layer-cache/bcd982c8f24a79ab40e5d8acf66e7a92e00dbe40383d34cd00fc6829afe6cff6
+lr-x------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 01:01 14 -> /var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/scratch/.carrick-layer-cache/bcd982c8f24a79ab40e5d8acf66e7a92e00dbe40383d34cd00fc6829afe6cff6/usr/lib/python3.13/__pycache__
+lr-x------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 01:01 15 -> /var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/scratch/.carrick-layer-cache/bcd982c8f24a79ab40e5d8acf66e7a92e00dbe40383d34cd00fc6829afe6cff6/usr/lib/python3.13/__pycache__/csv.cpython-313.pyc
+l-wx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 01:01 16 -> /var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/scratch/.tmpIx0EEg/usr/lib/python3.13/__pycache__/csv.cpython-313.pyc
+l-wx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 01:01 2 -> /var/tmp/carrick-dispatch-mbVrAA/agent/work/docs/evidence/issue-1793/diagnostics/shell.err
+lrwx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 01:01 3 -> /var/tmp/carrick-dispatch-mbVrAA/agent/work/.git/carrick-worktree-admission/generation-6nz7ACGWLlZj3XfvCEr9KMuHeJaCkB3a
+l-wx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 01:01 4 -> pipe:[16444]
+lrwx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 01:01 5 -> /tmp/carrick-kernel-arena-25661-0 (deleted)
+lr-x------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 01:01 6 -> /var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/scratch/.carrick-layer-cache/bcd982c8f24a79ab40e5d8acf66e7a92e00dbe40383d34cd00fc6829afe6cff6/usr
+lr-x------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 01:01 7 -> /var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/scratch/.carrick-layer-cache/bcd982c8f24a79ab40e5d8acf66e7a92e00dbe40383d34cd00fc6829afe6cff6/usr/lib
+lrwx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 01:01 8 -> socket:[41251]
+lrwx------ 1 carrick-dispatch-agent carrick-dispatch-agent 64 Nov  7 01:01 9 -> socket:[41252]
