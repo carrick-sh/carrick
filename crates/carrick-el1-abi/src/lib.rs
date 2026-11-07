@@ -3308,7 +3308,13 @@ pub unsafe fn host_aperture_control() -> Option<&'static ApertureControl> {
 }
 
 /// Host-only addresses of the shared IPC directory and pool.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HostIpcWindow {
     directory: carrick_guest_arch::HostVa,
     directory_bytes: carrick_guest_arch::GuestLen,
