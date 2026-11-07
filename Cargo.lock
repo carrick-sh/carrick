@@ -797,6 +797,7 @@ dependencies = [
  "carrick-spec",
  "carrick-test-support",
  "carrick-thread",
+ "carrick-time-core",
  "carrick-timer-core",
  "carrick-vfs",
  "flate2",
@@ -1116,6 +1117,13 @@ dependencies = [
  "parking_lot",
  "parking_lot_core",
  "serde",
+]
+
+[[package]]
+name = "carrick-time-core"
+version = "0.1.0"
+dependencies = [
+ "carrick-abi",
 ]
 
 [[package]]
