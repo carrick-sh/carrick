@@ -1478,8 +1478,11 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
     let root = repo_info.repository_root;
     let head = repo_info.head;
     verify_clean_checkout(&root)?;
-    // Resolve and admit scratch once before any host or signed tests.
-    carrick_vfs::scratch::preflight_default().map_err(|e| AcceptError::Failed(e.to_string()))?;
+    // Host compilation and VM-free tests do not require Linux scratch semantics.
+    if matches!(args.phase, AcceptPhase::Signed | AcceptPhase::All) {
+        carrick_vfs::scratch::preflight_default()
+            .map_err(|e| AcceptError::Failed(e.to_string()))?;
+    }
 
     let short_head_out = command::run_checked("git", ["rev-parse", "--short", "HEAD"], Some(&root))
         .map_err(|e| AcceptError::Git(e.to_string()))?;

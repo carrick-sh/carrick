@@ -275,10 +275,17 @@ fn resolve_scratch_root(
     resolve_default_scratch_root(
         conventional,
         std::env::var_os("HOME").map(PathBuf::from).as_deref(),
-        Path::new("/tmp/carrick/scratch"),
+        &temporary_scratch_root(),
         crate::scratch::internal_volume,
         probe,
     )
+}
+
+fn temporary_scratch_root() -> PathBuf {
+    // SAFETY: geteuid has no preconditions and identifies the filesystem user.
+    PathBuf::from(format!("/tmp/carrick-{}/scratch", unsafe {
+        libc::geteuid()
+    }))
 }
 
 fn resolve_default_scratch_root(
@@ -350,6 +357,45 @@ mod serial_host {
     use super::*;
 
     #[test]
+    fn backend_default_honours_override_without_requiring_case_sensitivity() {
+        const CHILD: &str = "CARRICK_SCRATCH_BACKEND_WITNESS";
+        if std::env::var_os(CHILD).is_some() {
+            let home = PathBuf::from(std::env::var_os("CARRICK_HOME").unwrap());
+            assert_eq!(
+                crate::fs_backend::default_scratch_root().unwrap(),
+                home.join("scratch")
+            );
+            let backend = crate::fs_backend::HostFsBackend::new().unwrap();
+            drop(backend);
+            // On insensitive hosts construction must work while guest admission
+            // still refuses the same root. Linux exercises the override branch.
+            assert_eq!(
+                crate::scratch::preflight_default().is_ok(),
+                probe_case_sensitive(&home)
+            );
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "apfs::serial_host::backend_default_honours_override_without_requiring_case_sensitivity"])
+            .env(CHILD, "1")
+            .env("CARRICK_HOME", home.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    #[test]
+    fn temporary_scratch_is_scoped_to_effective_user() {
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        assert_eq!(
+            temporary_scratch_root(),
+            PathBuf::from(format!("/tmp/carrick-{uid}/scratch"))
+        );
+    }
+
+    #[test]
     fn conventional_volume_requires_internal_storage() {
         for internal in [false, true] {
             let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -398,15 +444,12 @@ mod serial_host {
         let previous = std::env::var_os("CARRICK_HOME");
         unsafe { std::env::remove_var("CARRICK_HOME") };
         let actual = resolve_scratch_root(Path::new("/unusable-conventional"), |path, _| {
-            path == Path::new("/tmp/carrick/scratch")
+            path == temporary_scratch_root()
         });
         if let Some(previous) = previous {
             unsafe { std::env::set_var("CARRICK_HOME", previous) };
         }
-        assert_eq!(
-            actual.host_path().unwrap(),
-            Path::new("/tmp/carrick/scratch")
-        );
+        assert_eq!(actual.host_path().unwrap(), temporary_scratch_root());
     }
 
     #[test]
@@ -449,6 +492,10 @@ mod serial_host {
             .unwrap();
         assert_eq!(actual.path(), root.path().join("scratch"));
         assert!(actual.host_path().is_err(), "stalled root must fail closed");
+        assert!(
+            actual.construction_path().is_err(),
+            "construction must not retry stalled I/O"
+        );
     }
 
     #[test]

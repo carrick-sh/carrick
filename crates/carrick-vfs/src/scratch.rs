@@ -89,11 +89,25 @@ pub(crate) fn internal_volume(path: &Path) -> bool {
 pub struct ScratchRoot {
     path: PathBuf,
     pub(crate) case_sensitive: bool,
+    probe_completed: bool,
 }
 
 impl ScratchRoot {
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// VM-free construction may use insensitive storage, but must never retry
+    /// filesystem I/O after a probe worker failed to return.
+    pub(crate) fn construction_path(&self) -> std::io::Result<&Path> {
+        if self.probe_completed {
+            Ok(&self.path)
+        } else {
+            Err(std::io::Error::other(format!(
+                "scratch probe for {} did not complete within its deadline",
+                self.path.display()
+            )))
+        }
     }
 
     /// Refuse host-backed Linux paths unless the selected root passed the probe.
@@ -115,12 +129,13 @@ pub(crate) fn checked_scratch_root(
     probe: impl FnOnce(&Path, bool) -> bool + Send + 'static,
 ) -> ScratchRoot {
     let candidate = path.clone();
-    let case_sensitive = bounded_probe(std::time::Duration::from_secs(2), move || {
+    let result = bounded_probe(std::time::Duration::from_secs(2), move || {
         probe(&candidate, create)
     });
     ScratchRoot {
         path,
-        case_sensitive,
+        case_sensitive: result.unwrap_or(false),
+        probe_completed: result.is_some(),
     }
 }
 
@@ -138,7 +153,7 @@ pub(crate) fn probe_scratch_root(path: &Path, create: bool) -> bool {
 fn bounded_probe(
     timeout: std::time::Duration,
     probe: impl FnOnce() -> bool + Send + 'static,
-) -> bool {
+) -> Option<bool> {
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     let Ok(_worker) = std::thread::Builder::new()
         .name("scratch-case-probe".into())
@@ -146,9 +161,9 @@ fn bounded_probe(
             let _ = sender.send(probe());
         })
     else {
-        return false;
+        return None;
     };
-    receiver.recv_timeout(timeout).unwrap_or(false)
+    receiver.recv_timeout(timeout).ok()
 }
 
 #[cfg(test)]
@@ -157,6 +172,7 @@ pub(crate) fn probe_case_sensitive(path: &Path) -> bool {
     bounded_probe(std::time::Duration::from_secs(2), move || {
         probe_case_sensitive_unbounded(&path)
     })
+    .unwrap_or(false)
 }
 
 pub(crate) fn probe_case_sensitive_unbounded(path: &Path) -> bool {
