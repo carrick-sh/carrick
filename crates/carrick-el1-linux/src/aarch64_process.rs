@@ -996,8 +996,9 @@ pub trait ForkStockCrossing {
             if !map.window_published() {
                 return None;
             }
-            let region = carrick_el1_abi::ipc_window_guest()?
-                .attach()
+            // SAFETY: window publication follows installation of both retained
+            // supervisor mappings, which outlive every guest consumer.
+            let region = unsafe { carrick_el1_abi::ipc_window_guest()?.attach() }
                 .ok()?
                 .with_ceiling(&carrick_el1_abi::GUEST_DESCRIPTOR_CEILING);
             Some((region, map))
