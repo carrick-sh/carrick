@@ -9,9 +9,10 @@
 use super::{
     Act, AdoptionRead, CommentView, Decision, Effect, Gate, Github, Live, MARKER, QUIET_SECS,
     REPOSITORY, ReviewVerdict, RoundKind, ScalerError, UNATTENDED_ROUNDS, adopted_pr,
-    adoption_facts, classify, clip, director_pr, ecosystem_wait_reason, enforce, gather,
-    is_review_brief, is_signed_scoreboard_text, iso, limit_warnings, lookback, outcome_bot,
-    owned_pr, parse_iso, parse_outcomes, select_reviewer_tier, trusted_owner, trusted_pr,
+    adoption_facts, canonicalize_review_brief, classify, clip, director_pr, ecosystem_wait_reason,
+    enforce, gather, is_review_brief, is_signed_scoreboard_text, iso, last_independent_review_oid,
+    limit_warnings, lookback, outcome_bot, owned_pr, parse_iso, parse_outcomes,
+    select_reviewer_tier, trusted_owner, trusted_pr,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -832,7 +833,7 @@ impl Server<'_> {
                 },
             )
         } else {
-            let decision = Decision {
+            let mut decision = Decision {
                 action: Act::Round,
                 text: arg_str(args, "brief")?.into(),
                 reason: String::new(),
@@ -887,15 +888,6 @@ impl Server<'_> {
                     o.kind == RoundKind::Implementation && o.status.eq_ignore_ascii_case("done")
                 })
             {
-                if let Some(last) = outcomes.last() {
-                    let cap = self.remote.capacity();
-                    let _ = select_reviewer_tier(
-                        last.author_tier
-                            .unwrap_or(super::super::worker_tier::WorkerTier::Strong),
-                        &last.author_backends,
-                        cap.as_ref(),
-                    );
-                }
                 if let Some(wait) = ecosystem_wait_reason(
                     &pr,
                     n,
@@ -919,7 +911,7 @@ impl Server<'_> {
             if had_wait && !self.dry_run {
                 save(&self.state, &state).map_err(fail)?;
             }
-            let mut post_review_fix = false;
+            let mut outcome_continuation = false;
             if let Some(last) = outcomes.last() {
                 continued_outcome = Some(last.key.clone());
                 let after = &comment_views[last.index + 1..];
@@ -932,6 +924,11 @@ impl Server<'_> {
                         && !c.body.trim_start().starts_with("/agent")
                         && !is_signed_scoreboard_text(c.body)
                 });
+                let uncontinued = state
+                    .prs
+                    .get(&n)
+                    .and_then(|m| m.last_continued_outcome.as_deref())
+                    != Some(last.key.as_str());
                 if last.status.eq_ignore_ascii_case("done") && !owner_chat_after {
                     if last.kind == RoundKind::Review
                         && last.verdict == Some(ReviewVerdict::Approved)
@@ -941,17 +938,35 @@ impl Server<'_> {
                                 .into(),
                         );
                     }
-                    if last.kind == RoundKind::Review
+                    if last.kind == RoundKind::Implementation
+                        && !round_triggered_after
+                        && review_requested
+                    {
+                        let cap = self.remote.capacity();
+                        let (rev_tier, fallback) = select_reviewer_tier(
+                            last.author_tier
+                                .unwrap_or(super::super::worker_tier::WorkerTier::Strong),
+                            &last.author_backends,
+                            cap.as_ref(),
+                        );
+                        let prev_oid = last_independent_review_oid(&reviews, &outcomes);
+                        decision.text = canonicalize_review_brief(
+                            &decision.text,
+                            &head,
+                            prev_oid.as_deref(),
+                            rev_tier,
+                            fallback.as_deref(),
+                        );
+                        if uncontinued {
+                            outcome_continuation = true;
+                        }
+                    } else if last.kind == RoundKind::Review
                         && last.verdict == Some(ReviewVerdict::ChangesRequested)
                         && !round_triggered_after
                         && !review_requested
-                        && state
-                            .prs
-                            .get(&n)
-                            .and_then(|m| m.last_continued_outcome.as_deref())
-                            != Some(last.key.as_str())
+                        && uncontinued
                     {
-                        post_review_fix = true;
+                        outcome_continuation = true;
                     }
                 }
             }
@@ -973,7 +988,7 @@ impl Server<'_> {
                 None => true,
             };
             let repeat_round = !owner_spoke
-                && !post_review_fix
+                && !outcome_continuation
                 && memory.and_then(|m| m.last_round_head.as_deref()) == Some(head.as_str());
             let unattended =
                 !owner_spoke && memory.is_some_and(|m| m.unattended >= UNATTENDED_ROUNDS);
@@ -1074,7 +1089,7 @@ impl Server<'_> {
     }
 }
 
-const INSTRUCTIONS: &str = "Events from carrick-sh/carrick pull requests come from wait_events (or, when the session loads this server as a channel, as <channel source=\"carrick-reactor\" pr=... kind=... event_id=... author=... head=...> tags), one per event. A long wait_events call runs in the background: end your turn and act on its task notification. kind is comment, review, review_comment (owner text), outcome (a dispatch outcome comment), ci_run (a completed GitHub Actions run on the PR's head, any conclusion), ci_job (a job that failed, was cancelled or timed out while its run is still in progress), new_pr, quiet_pr or needs_closes. Route each event to the PR's own subagent pr-<N>: start it on the PR's first event and resume it with SendMessage after that. Subagents investigate with read_pr, read_thread, read_diff, read_ci, read_outcomes and read_issue, and act only through reply or request_round. When unsure, do nothing.";
+const INSTRUCTIONS: &str = "Events from carrick-sh/carrick pull requests come from wait_events (or, when the session loads this server as a channel, as <channel source=\"carrick-reactor\" pr=... kind=... event_id=... author=... head=...> tags), one per event. A long wait_events call runs in the background: end your turn and act on its task notification. kind is comment, review, review_comment (owner text), outcome (a dispatch outcome comment), ci_run (a completed GitHub Actions run on the PR's head, any conclusion), ci_job (a job that failed, was cancelled or timed out while its run is still in progress), new_pr, quiet_pr or needs_closes. Route each event to the PR's own subagent pr-<N>: start it on the PR's first event and resume it with SendMessage after that. Subagents investigate with read_pr, read_thread, read_diff, read_ci, read_outcomes and read_issue, and act only through reply or request_round. When an implementation round ends Done, immediately start one independent review round via request_round (review only, push nothing, focused on the issue's acceptance criteria and the diff since the last published independent review; request_round sets the opposite reviewer tier and enforces the signed-scoreboard wait on ecosystem-blocker PRs); when a review round ends Done with APPROVED, start no further round; when a review requests changes (CHANGES REQUESTED), start a fix round via request_round. When unsure, do nothing.";
 
 /// Serialized stdout: one lock, one line per JSON-RPC message.
 pub(super) type Out = std::sync::Arc<std::sync::Mutex<Box<dyn Write + Send>>>;

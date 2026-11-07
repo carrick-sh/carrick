@@ -605,15 +605,99 @@ fn parse_loop_claims(body: &str) -> String {
         .join("\n")
 }
 
+fn starts_with_verdict_keyword(upper: &str, keyword: &str) -> bool {
+    upper
+        .strip_prefix(keyword)
+        .is_some_and(|rest| rest.chars().next().is_none_or(|c| !c.is_ascii_alphabetic()))
+}
+
+fn clean_verdict_line(line: &str) -> &str {
+    line.trim()
+        .trim_start_matches(['#', '*', '_', '`', '>', '-', ' '])
+        .trim()
+}
+
+fn classify_verdict_text(text: &str) -> Option<ReviewVerdict> {
+    let mut first_content: Option<&str> = None;
+    for raw in text.lines() {
+        let cleaned = clean_verdict_line(raw);
+        if cleaned.is_empty()
+            || cleaned.eq_ignore_ascii_case("worker review")
+            || cleaned.starts_with("Reviewed head:")
+            || cleaned.starts_with(SELF_REVIEW_DISCLAIMER)
+            || cleaned
+                .get(..13)
+                .is_some_and(|p| p.eq_ignore_ascii_case("loop claimed:"))
+        {
+            continue;
+        }
+        if first_content.is_none() {
+            first_content = Some(cleaned);
+        }
+        if let Some(rest) = cleaned
+            .get(..8)
+            .filter(|p| p.eq_ignore_ascii_case("verdict:"))
+            .and_then(|_| cleaned.get(8..))
+        {
+            let upper = rest
+                .trim()
+                .trim_start_matches(['*', '_', '`'])
+                .trim()
+                .to_ascii_uppercase();
+            if [
+                "CHANGES REQUESTED",
+                "CHANGES_REQUESTED",
+                "REQUEST CHANGES",
+                "REQUEST_CHANGES",
+            ]
+            .iter()
+            .any(|kw| starts_with_verdict_keyword(&upper, kw))
+            {
+                return Some(ReviewVerdict::ChangesRequested);
+            }
+            if starts_with_verdict_keyword(&upper, "APPROVED")
+                || starts_with_verdict_keyword(&upper, "APPROVE")
+            {
+                return Some(ReviewVerdict::Approved);
+            }
+        }
+        let upper = cleaned.to_ascii_uppercase();
+        if ["CHANGES REQUESTED", "CHANGES_REQUESTED", "REQUEST_CHANGES"]
+            .iter()
+            .any(|kw| starts_with_verdict_keyword(&upper, kw))
+        {
+            return Some(ReviewVerdict::ChangesRequested);
+        }
+    }
+    if let Some(first) = first_content {
+        let upper = first.to_ascii_uppercase();
+        if starts_with_verdict_keyword(&upper, "APPROVED")
+            || starts_with_verdict_keyword(&upper, "APPROVE")
+        {
+            return Some(ReviewVerdict::Approved);
+        }
+    }
+    None
+}
+
 fn text_has_review_verdict_marker(text: &str) -> bool {
-    let trimmed = text.trim_start();
-    trimmed.starts_with("APPROVED")
-        || trimmed.starts_with("CHANGES REQUESTED")
+    classify_verdict_text(text).is_some()
         || text.to_ascii_lowercase().contains("independent review")
 }
 
 fn text_requests_changes(text: &str) -> bool {
-    text.to_ascii_uppercase().contains("CHANGES REQUESTED")
+    classify_verdict_text(text) == Some(ReviewVerdict::ChangesRequested)
+}
+
+fn is_verdict_header_line(line: &str) -> bool {
+    let cleaned = clean_verdict_line(line);
+    let upper = cleaned.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "CHANGES REQUESTED" | "CHANGES_REQUESTED" | "REQUEST_CHANGES" | "APPROVED" | "APPROVE"
+    ) || cleaned
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case("verdict:"))
 }
 
 pub(super) fn parse_outcomes(
@@ -661,6 +745,15 @@ pub(super) fn parse_outcomes(
             .and_then(|v| v["review"]["verdict"].as_str())
             .unwrap_or_default();
         let review_url = parse_worker_review_url(server);
+        let linked_review = review_url.as_deref().and_then(|u| {
+            reviews.iter().find(|r| {
+                r["url"]
+                    .as_str()
+                    .or_else(|| r["html_url"].as_str())
+                    .unwrap_or_default()
+                    == u
+            })
+        });
 
         let kind = if let Some(rk) = round_kind_line {
             if rk.eq_ignore_ascii_case("review") {
@@ -684,7 +777,11 @@ pub(super) fn parse_outcomes(
                 || matches!(
                     wc_verdict.to_ascii_lowercase().as_str(),
                     "changes_requested" | "request_changes"
-                ))
+                )
+                || linked_review.is_some_and(|r| {
+                    matches!(r["state"].as_str(), Some("APPROVED" | "CHANGES_REQUESTED"))
+                        || classify_verdict_text(r["body"].as_str().unwrap_or_default()).is_some()
+                }))
         {
             RoundKind::Review
         } else {
@@ -693,16 +790,9 @@ pub(super) fn parse_outcomes(
 
         let verdict =
             (kind == RoundKind::Review && status.eq_ignore_ascii_case("done")).then(|| {
-                let review_says_cr = review_url.as_deref().is_some_and(|u| {
-                    reviews.iter().any(|r| {
-                        let ru = r["url"]
-                            .as_str()
-                            .or_else(|| r["html_url"].as_str())
-                            .unwrap_or_default();
-                        ru == u
-                            && (r["state"] == "CHANGES_REQUESTED"
-                                || text_requests_changes(r["body"].as_str().unwrap_or_default()))
-                    })
+                let review_says_cr = linked_review.is_some_and(|r| {
+                    r["state"] == "CHANGES_REQUESTED"
+                        || text_requests_changes(r["body"].as_str().unwrap_or_default())
                 });
                 if text_requests_changes(oc_summary)
                     || text_requests_changes(oc_loop_summary)
@@ -731,7 +821,7 @@ pub(super) fn parse_outcomes(
         .unwrap_or_default();
         let findings = raw_findings
             .lines()
-            .filter(|l| !l.trim().eq_ignore_ascii_case("CHANGES REQUESTED"))
+            .filter(|l| !is_verdict_header_line(l))
             .collect::<Vec<_>>()
             .join(" ")
             .split_whitespace()
@@ -813,36 +903,62 @@ fn backend_usable_for_review(
     if entry["installed"] != true
         || !positive(&entry["free_slots"])
         || !positive(&entry["quota_free"])
+        || (entry["score"].is_number() && !positive(&entry["score"]))
         || (tier == WorkerTier::Standard && backend == "copilot")
         || (require_different_backend && author_backends.iter().any(|b| b == backend))
     {
         return false;
     }
-    let Some(models) = entry["models"].as_array() else {
-        return false;
+    let agy_group_usable = |group: &str| {
+        let quota_ok = if entry["quota"]["groups"].is_object() {
+            positive(&entry["quota"]["groups"][group]["quota_free"])
+        } else {
+            true
+        };
+        let score_ok = if entry["group_scores"].is_object() {
+            positive(&entry["group_scores"][group])
+        } else {
+            true
+        };
+        quota_ok && score_ok
     };
-    models.iter().filter_map(Value::as_str).any(|model| {
-        if backend == "agy" {
-            let group = if model.starts_with("gemini-") {
-                Some("gemini")
-            } else if model.starts_with("claude-") || model.starts_with("gpt-oss") {
-                Some("claude")
-            } else {
-                None
-            };
-            if let Some(g) = group {
-                let gq = &entry["quota"]["groups"][g]["quota_free"];
-                if gq.is_number() && !positive(gq) {
+    if let Some(models) = entry["models"].as_array() {
+        return models.iter().filter_map(Value::as_str).any(|model| {
+            if backend == "agy" {
+                let group = if model.starts_with("gemini-") {
+                    Some("gemini")
+                } else if model.starts_with("claude-") || model.starts_with("gpt-oss") {
+                    Some("claude")
+                } else {
+                    None
+                };
+                if group.is_some_and(|g| !agy_group_usable(g)) {
                     return false;
                 }
             }
-        }
-        match tier {
-            WorkerTier::Strong => strong_model(backend, model),
-            WorkerTier::Standard if distinct_tier_models => !strong_model(backend, model),
-            WorkerTier::Standard => true,
-        }
-    })
+            match tier {
+                WorkerTier::Strong => strong_model(backend, model),
+                WorkerTier::Standard if distinct_tier_models => !strong_model(backend, model),
+                WorkerTier::Standard => true,
+            }
+        });
+    }
+    if !entry["models"].is_null() {
+        return false;
+    }
+    // Raw `agy_worker.py capacity --json` reports omit `models` (populated by
+    // separate `models --backend` probes in `dispatch_loop`). Infer tier
+    // eligibility from the backend and its group quotas.
+    match backend {
+        "codex" => tier == WorkerTier::Strong || !distinct_tier_models,
+        "copilot" => tier == WorkerTier::Strong,
+        "agy" => match tier {
+            WorkerTier::Strong => agy_group_usable("claude"),
+            WorkerTier::Standard if distinct_tier_models => agy_group_usable("gemini"),
+            WorkerTier::Standard => agy_group_usable("gemini") || agy_group_usable("claude"),
+        },
+        _ => false,
+    }
 }
 
 pub(super) fn select_reviewer_tier(
@@ -916,7 +1032,7 @@ fn build_review_brief(
         "Independent review of PR #{pr_number}{issue_clause}: review only, push nothing.\n\
          Worker tier: {}\n\
          Focus on {acceptance_target} {diff_scope}\n\
-         Publish a review verdict, or make the verdict (`APPROVED` or `CHANGES REQUESTED`) the first line of the summary. Rate any findings P0/P1/P2.",
+         Publish a review verdict (`Verdict: APPROVE` or `Verdict: CHANGES REQUESTED`), or make the verdict (`APPROVED` or `CHANGES REQUESTED`) the first line of the summary. Rate any findings P0/P1/P2.",
         tier_name(tier),
     );
     if let Some(backend) = fallback_backend {
@@ -925,6 +1041,49 @@ fn build_review_brief(
         ));
     }
     brief
+}
+
+pub(super) fn canonicalize_review_brief(
+    brief: &str,
+    head: &str,
+    prev_review_oid: Option<&str>,
+    tier: super::worker_tier::WorkerTier,
+    fallback_backend: Option<&str>,
+) -> String {
+    let tier_line = format!("Worker tier: {}", tier_name(tier));
+    let mut lines: Vec<String> = brief
+        .lines()
+        .filter(|l| {
+            let t = l.trim();
+            !t.starts_with("Worker tier:") && !t.starts_with("Preferred reviewer backend:")
+        })
+        .map(str::to_owned)
+        .collect();
+    let insert_at = usize::from(!lines.is_empty());
+    lines.insert(insert_at, tier_line);
+    let mut out = lines.join("\n");
+    if let Some(prev) = prev_review_oid.filter(|oid| !oid.is_empty() && *oid != head) {
+        let prev_short = prev.get(..12).unwrap_or(prev);
+        let head_short = head.get(..12).unwrap_or(head);
+        if !out.contains(prev_short) {
+            out.push_str(&format!(
+                "\nScope the review to the diff since the last published review (`{prev_short}..{head_short}`)."
+            ));
+        }
+    }
+    let lower = out.to_ascii_lowercase();
+    if !lower.contains("verdict") && !out.contains("APPROVED") && !out.contains("CHANGES REQUESTED")
+    {
+        out.push_str(
+            "\nPublish a review verdict (`Verdict: APPROVE` or `Verdict: CHANGES REQUESTED`), or make the verdict (`APPROVED` or `CHANGES REQUESTED`) the first line of the summary.",
+        );
+    }
+    if let Some(backend) = fallback_backend {
+        out.push_str(&format!(
+            "\nPreferred reviewer backend: `{backend}` (opposite tier has no quota; use a different backend from the author round)."
+        ));
+    }
+    out
 }
 
 fn build_fix_brief(
@@ -1293,7 +1452,7 @@ pub(crate) fn cycle(
             .as_array()
             .map_or(&[][..], Vec::as_slice);
         let outcomes = parse_outcomes(&all_comments, reviews);
-        let mut post_review_fix = false;
+        let mut outcome_continuation = false;
         let mut continued_key = None;
         let mut auto_decision = None;
         if let Some(last) = outcomes.last() {
@@ -1345,6 +1504,7 @@ pub(crate) fn cycle(
                     let (rev_tier, fallback) =
                         select_reviewer_tier(author_tier, &last.author_backends, cap.as_ref());
                     let prev_oid = last_independent_review_oid(reviews, &outcomes);
+                    outcome_continuation = true;
                     continued_key = Some(last.key.clone());
                     auto_decision = Some(Decision {
                         action: Act::Round,
@@ -1371,7 +1531,7 @@ pub(crate) fn cycle(
                         .rev()
                         .find(|o| o.kind == RoundKind::Implementation)
                         .and_then(|o| o.author_tier);
-                    post_review_fix = true;
+                    outcome_continuation = true;
                     continued_key = Some(last.key.clone());
                     auto_decision = Some(Decision {
                         action: Act::Round,
@@ -1404,7 +1564,7 @@ pub(crate) fn cycle(
             eligible: adoptable || owned,
             pr_run_active,
             active_total,
-            repeat_round: !post_review_fix
+            repeat_round: !outcome_continuation
                 && memory.last_round_head.as_deref() == Some(head.as_str())
                 && !memory.human_since_round,
             unattended: memory.unattended_rounds >= UNATTENDED_ROUNDS,
@@ -1541,7 +1701,7 @@ pub(crate) fn iso(secs: u64) -> String {
 struct Live<'a> {
     root: &'a Path,
 }
-const FACTS_QUERY: &str = r#"query{repository(owner:"carrick-sh",name:"carrick"){pullRequests(states:OPEN,first:100){nodes{number commits(last:1){nodes{commit{committedDate statusCheckRollup{state}}}} reviews(last:20){nodes{databaseId url state body submittedAt commit{oid} author{login __typename}}} comments(last:30){nodes{databaseId url body author{login __typename}}}}}}}"#;
+const FACTS_QUERY: &str = r#"query{repository(owner:"carrick-sh",name:"carrick"){pullRequests(states:OPEN,first:100){nodes{number commits(last:1){nodes{commit{committedDate statusCheckRollup{state}}}} reviews(last:50){nodes{databaseId url state body submittedAt commit{oid} author{login __typename}}} comments(last:50){nodes{databaseId url body author{login __typename}}}}}}}"#;
 impl Github for Live<'_> {
     fn open_prs(&mut self) -> Result<Vec<Value>, ScalerError> {
         Ok(serde_json::from_str(&super::gh(
@@ -1663,6 +1823,44 @@ impl Github for Live<'_> {
                 "databaseId,status,headBranch,displayTitle",
             ],
         )?)?)
+    }
+    fn capacity(&mut self) -> Option<Value> {
+        let dir = tempfile::tempdir().ok()?;
+        let out = dir.path().join("capacity.json");
+        let mut child = Command::new("agy_worker.py")
+            .args(["capacity", "--json"])
+            .current_dir(self.root)
+            .stdin(Stdio::null())
+            .stdout(std::fs::File::create(&out).ok()?)
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        return None;
+                    }
+                    break;
+                }
+                Ok(None) => {
+                    if Instant::now() > deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+            }
+        }
+        let parsed: Value = serde_json::from_slice(&std::fs::read(&out).ok()?).ok()?;
+        parsed["backends"].is_object().then_some(parsed)
     }
     fn post(&mut self, pr: u64, body: &str) -> Result<(), ScalerError> {
         super::gh(
