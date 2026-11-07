@@ -500,52 +500,55 @@ fn serial_host_pipe_adapter_return_allows_unrelated_native_service() {
     let memory = carrick_test_support::GuestUserBuffer::from_value(*b"q");
     let names = Box::leak(Box::new(carrick_el1_abi::InotifyNameCache::new()));
     let mut cpu = crate::sched::FakeCpu::default();
-    let dispatch = |service: &mut Physical<'_, Aarch64ParkedContext>, cpu: &mut crate::sched::FakeCpu, nr, fd| {
-        let selected = fixture.zone.slot(fixture.slot).current().unwrap();
-        // SAFETY: this stopped fixture exclusively owns the selected live record.
-        let binding = unsafe { runtime.record_binding(fixture.zone.record_ref(selected)) }.unwrap();
-        let mut entry = runtime
-            .enter_registered(
-                registry,
-                source,
-                &fixture.task,
-                binding.address,
-                &binding.words,
-                service,
-            )
-            .unwrap();
-        let mut frame = carrick_el1_abi::TrapFrame {
-            elr: 0x400004,
-            slot: u64::from(fixture.slot.raw()),
-            ..Default::default()
-        };
-        frame.x[8] = nr;
-        frame.x[0] = fd;
-        frame.x[1] = memory.arg();
-        frame.x[2] = 1;
-        let route = crate::dispatch::dispatch_syscall_with_native(
-            &mut frame,
-            &counters,
-            core::slice::from_ref(&fixture.task),
-            &[],
-            &[],
-            &[],
-            &[],
-            names,
-            Some(crate::dispatch::Zone {
-                tables: fixture.zone,
-                cpu,
-                user: &crate::sched::HardwareUserWord,
-            }),
-            Some(&venue),
-            None,
-            Some(&mut *entry),
-            Some(source),
-            None,
-            |_| core::ptr::null_mut(),
-        );
-        (route, frame.x[0])
-    };
+    macro_rules! dispatch {
+        ($service:expr, $cpu:expr, $nr:expr, $fd:expr) => {{
+            let selected = fixture.zone.slot(fixture.slot).current().unwrap();
+            // SAFETY: this stopped fixture exclusively owns the selected live record.
+            let binding =
+                unsafe { runtime.record_binding(fixture.zone.record_ref(selected)) }.unwrap();
+            let mut entry = runtime
+                .enter_registered(
+                    registry,
+                    source,
+                    &fixture.task,
+                    binding.address,
+                    &binding.words,
+                    $service,
+                )
+                .unwrap();
+            let mut frame = carrick_el1_abi::TrapFrame {
+                elr: 0x400004,
+                slot: u64::from(fixture.slot.raw()),
+                ..Default::default()
+            };
+            frame.x[8] = $nr;
+            frame.x[0] = $fd;
+            frame.x[1] = memory.arg();
+            frame.x[2] = 1;
+            let route = crate::dispatch::dispatch_syscall_with_native(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                &[],
+                &[],
+                &[],
+                &[],
+                names,
+                Some(crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: $cpu,
+                    user: &crate::sched::HardwareUserWord,
+                }),
+                Some(&venue),
+                None,
+                Some(&mut *entry),
+                Some(source),
+                None,
+                |_| core::ptr::null_mut(),
+            );
+            (route, frame.x[0])
+        }};
+    }
     // Both real fork participants stay alive throughout the reader's park.
     assert!(
         fixture
@@ -554,7 +557,7 @@ fn serial_host_pipe_adapter_return_allows_unrelated_native_service() {
             .is_queued()
     );
     activate_target(source, &fixture.task, &parent_binding);
-    assert_eq!(dispatch(&mut service, &mut cpu, 64, 4).1, 1);
+    assert_eq!(dispatch!(&mut service, &mut cpu, 64, 4).1, 1);
     assert!(
         fixture
             .zone
@@ -564,7 +567,7 @@ fn serial_host_pipe_adapter_return_allows_unrelated_native_service() {
     activate_target(source, &fixture.task, &child_binding);
     service.prepare_copy_error = Some(NativeProcessError::Busy);
     crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
-    let parked = dispatch(&mut service, &mut cpu, 63, 3);
+    let parked = dispatch!(&mut service, &mut cpu, 63, 3);
     crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
     assert_eq!(
         parked.0,
@@ -617,7 +620,22 @@ fn serial_host_pipe_adapter_return_allows_unrelated_native_service() {
             NativeResume::RetrySyscall
         ));
     }
-    assert_eq!(dispatch(&mut service, &mut cpu, 63, 3).1, 1);
+    assert_eq!(dispatch!(&mut service, &mut cpu, 63, 3).1, 1);
+    assert!(
+        !fixture
+            .zone
+            .record(child_binding.record.id)
+            .has_object_operation(),
+        "the completed adapter must consume its record token"
+    );
+    assert_eq!(
+        fixture
+            .zone
+            .record(child_binding.record.id)
+            .resume_disposition(),
+        carrick_sched_core::object_wait::ResumeDisposition::UserReturn,
+        "the completed adapter must consume its owner continuation"
+    );
     let binding = unsafe { runtime.record_binding(child_binding.record) }.unwrap();
     let mut entry = runtime
         .enter_registered(
