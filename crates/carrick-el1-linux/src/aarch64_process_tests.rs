@@ -1310,6 +1310,16 @@ impl Fixture {
         control: &'static ThreadControlSlot,
         leader: ThreadIdentity,
     ) -> Self {
+        Self::with_identity_and_arena(root_gpa, asid, page, control, leader, 0x1000_0000)
+    }
+    fn with_identity_and_arena(
+        root_gpa: u64,
+        asid: carrick_guest_arch::Asid,
+        page: &'static ThreadLifecyclePage,
+        control: &'static ThreadControlSlot,
+        leader: ThreadIdentity,
+        arena_len: u64,
+    ) -> Self {
         let file_table = leader.file_table;
         // The host records the leader's birth identity when it allocates the
         // control slot. Its process serial is independent of the snapshot.
@@ -1398,7 +1408,7 @@ impl Fixture {
                 mm,
                 carrick_el1_abi::Layout {
                     heap: carrick_el1_abi::ReservationRange::new(4096, VA).unwrap(),
-                    arena: carrick_el1_abi::ReservationRange::new(VA, VA + 0x1000_0000).unwrap(),
+                    arena: carrick_el1_abi::ReservationRange::new(VA, VA + arena_len).unwrap(),
                     policy: carrick_el1_abi::ReservationPolicyPayload::new([
                         4096,
                         u64::MAX,

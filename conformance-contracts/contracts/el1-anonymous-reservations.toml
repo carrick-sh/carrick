@@ -23,6 +23,7 @@ rationale = "EL1 increment 2 anonymous reservation checkpoint (TASK 1). Under th
 
 [bindings]
 vm_free = [
+  "carrick-el1-linux::aarch64_process_tests::native_fault_supply_tests::native_owner_noreserve_code_range_writes_and_executes (Linux x86_64 host: native process admission, full Linux dispatch, lazy 256 MiB reservation, resident RWX editor, validated physical backing and host-native generated-code execution; guest instruction execution remains signed-lane evidence)",
   "carrick-el1::memory::tests::delegated::two_isa_noreserve_code_range_stays_owner_admitted (256 MiB lazy PROT_NONE to RWX subrange; no backing allocation or descriptor edit for untouched pages; instruction execution remains signed-lane evidence)",
   "carrick-core::mm::retirement::nonce_tests::release_record_pin_outcome_classifies_held_premapped_and_predecessor (last requested mapped pin yields neutral ReadyToRetry; premapped safe-point retirement and superseded predecessors retain their existing verdicts)",
   "carrick-thread::physical_retirement::tests (S2b exact-record completion enrollment, release-before-enrollment, identity/reuse control, cancellation, deferred callback publication, typed producer abandonment and revocation of captured callbacks; no native Pending ACK or service-budget claim)",
