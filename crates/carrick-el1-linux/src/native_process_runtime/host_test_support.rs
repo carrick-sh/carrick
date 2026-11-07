@@ -6452,5 +6452,6 @@ fn sigprocmask_set_owner_wait_redispatches_before_effects() {
     assert!(take_signal_copies().is_empty());
 }
 
+#[cfg(test)]
 #[path = "tests/thread_cleanup.rs"]
 mod thread_cleanup_tests;

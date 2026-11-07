@@ -52,7 +52,24 @@ impl<'a, C: ProcessContext, S: NativeProcessService<'a, C>> UserCopy for Cleanup
         if !carrick_guest_arch::lower_half_range(address.raw(), request.len.raw()) {
             return CopyOutcome::Fault;
         }
-        let result = self.service.copy_owned_bytes(self.mm, address, bytes);
+        let result = match self.service.copy_owned_bytes(self.mm, address, bytes) {
+            Err(NativeProcessError::Unsupported) => {
+                // Byte-write selection may identify missing backing before
+                // publishing a supply window. Preparation owns that window;
+                // the terminal cursor still owns the store and its wake.
+                match self.service.prepare_owned_write(
+                    self.mm,
+                    carrick_core::mm::transaction::CopyoutRequest {
+                        address,
+                        len: request.len,
+                    },
+                ) {
+                    Ok(()) => self.service.copy_owned_bytes(self.mm, address, bytes),
+                    Err(error) => Err(error),
+                }
+            }
+            result => result,
+        };
         self.result(result, request)
     }
     fn atomic_load_u32(&mut self, address: UserVa, value: &mut u32) -> CopyOutcome {

@@ -5729,9 +5729,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
         self.runtime.graph.lock().pending.take_cleanup(self.record);
         self.retire_thread_verdict(custody.into_verdict(page));
-        self.current
-            .linux
-            .mark_native_terminal_work(self.source.slot);
+        // Group cancellation owes the carrier its terminal CPU boundary.
+        // A raw in-zone exit uses its existing retirement receipt; carrying
+        // a new host-work doorbell into the next native task would consume
+        // that task's next syscall as the previous exit's boundary.
+        if self.runtime.graph.lock().pending.has_exit(&self.key) {
+            self.current
+                .linux
+                .mark_native_terminal_work(self.source.slot);
+        }
         self.lifecycle_admission_settled()
             .map_err(|_| NativeProcessError::Quarantined)?;
         self.handoff = Some(receipt);
