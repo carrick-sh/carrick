@@ -2083,6 +2083,56 @@ fn fork_cow_process(
     Some(verified_pages)
 }
 
+// Keep these host-published image pages separate from unrelated fixture state.
+// A guest mmap would instead test tagged EL1-private leaves.
+#[repr(align(16384))]
+struct CowProtectedImage([u8; 32768]);
+static mut COW_PROTECTED_IMAGE: CowProtectedImage = CowProtectedImage([0xa5; 32768]);
+
+fn cow_protected_image(fork: bool) -> i32 {
+    unsafe { libc::alarm(30) };
+    let base = std::ptr::addr_of_mut!(COW_PROTECTED_IMAGE).cast::<u8>();
+    let protected = unsafe { base.add(4096) };
+    if unsafe { libc::mprotect(protected.cast(), 4096, libc::PROT_READ) } != 0 {
+        return 1;
+    }
+    let mut pipe = [0; 2];
+    let child = if fork {
+        if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
+            return 2;
+        }
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            unsafe { libc::close(pipe[1]) };
+            // EOF also releases the child when the parent takes SIGSEGV.
+            let _ = poll_read_byte(pipe[0], 10_000);
+            let isolated = unsafe { base.read_volatile() == 0xa5 };
+            unsafe { libc::_exit(i32::from(!isolated)) };
+        }
+        if child < 0 {
+            return 3;
+        }
+        unsafe { libc::close(pipe[0]) };
+        child
+    } else {
+        -1
+    };
+    // Resolving the writable neighbor must preserve this page's protection,
+    // even when both pages occupy the same physical COW compound.
+    unsafe { base.write_volatile(0x3c) };
+    let marker = b"cow-protected-image attempting denied store\n";
+    unsafe { libc::write(1, marker.as_ptr().cast(), marker.len()) };
+    unsafe { protected.write_volatile(0x77) };
+    // Reaching here is the bug: clean up the child and return success so the
+    // host assertion must distinguish a real SIGSEGV from ordinary completion.
+    if child > 0 {
+        unsafe { libc::close(pipe[1]) };
+        let mut status = 0;
+        unsafe { libc::waitpid(child, &mut status, 0) };
+    }
+    0
+}
+
 /// The initial, host-served MM must replenish its COW chain after fork.
 /// Use distinct 16 KiB compounds (not adjacent Linux 4 KiB pages) and no
 /// syscalls between writes: syscall entry can otherwise settle USED records
@@ -3837,6 +3887,8 @@ fn main() {
             },
         },
         "fork-cow-parent" => fork_cow_parent(),
+        "cow-protected-image" => cow_protected_image(false),
+        "cow-protected-image-fork" => cow_protected_image(true),
         "fork-cow" => fork_cow(
             args.get(2).and_then(|n| n.parse().ok()).unwrap_or(100),
             args.get(3).and_then(|n| n.parse().ok()).unwrap_or(16),
