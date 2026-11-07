@@ -2831,9 +2831,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 return if matches!(request.operation, ServiceOperation::Fault(_))
                     && result != ServiceResult::Supplied
                 {
-                    Ok(NativeResume::Returned(SyscallResult::new(
-                        carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
-                    )))
+                    if let Some(output) = output.as_ref().filter(|output| output.prefix_on_fault) {
+                        Ok(entropy_copy_fault(output.offset))
+                    } else {
+                        Ok(NativeResume::Returned(SyscallResult::new(
+                            carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
+                        )))
+                    }
                 } else {
                     Ok(NativeResume::NoPending)
                 };
