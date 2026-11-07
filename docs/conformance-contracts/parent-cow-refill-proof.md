@@ -84,3 +84,15 @@ cow_refill_excludes_sibling_through_publication -- --nocapture`:
 These are observed component results, not a claim that the unmodified merge
 base or the strengthened signed fixture was executed. The old early-drop
 ordering was read from both fault entries before the existing refill-scope fix.
+
+The continuation also completed the focused kernel regular partition (2818
+passed, one existing ignored), kernel serial partition (195 passed), and Linux
+runtime library suite run serially (739 passed, six existing ignored). The
+runtime population includes
+`capture_core_gate_busy_once_then_reads_after_owner_release`. macOS cross-check
+including Clippy, the freestanding x86 CPL0 release build, host `just clippy`,
+contract-change coverage against admitted main, formatting and diff checks all
+passed. Source authority debt passed both ceilings and the admitted-base range
+ratchet (1266 source counters). These are host/component and compile results;
+no signed artifact, native Docker comparison or KVM runtime result is claimed.
+Whole-workspace lint-domains and test-kernel were left to CI as instructed.
