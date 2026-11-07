@@ -301,6 +301,10 @@ impl ReservationNodeFlags {
     /// unadmitted root's import sets it; no admitted edit, host attribute or
     /// guest decision can, so it is the root's typed ownership of that span.
     pub const IMAGE: Self = Self(1 << 9);
+    /// An anonymous range placed outside the allocation layout by the host's
+    /// validated placement venue. Carried by splits and fork; never mintable
+    /// by guest proposals or admitted host inserts. A fork import retains it.
+    pub const PLACED_OUTSIDE_LAYOUT: Self = Self(1 << 10);
     pub const ANONYMOUS_PRIVATE: Self = Self(Self::ANONYMOUS.0 | Self::PRIVATE.0);
     /// Attributes the host sets with `set_flags` (`mlock`, `madvise`).
     pub const ATTRIBUTES: Self = Self(
@@ -315,13 +319,19 @@ impl ReservationNodeFlags {
     /// host-owned. `GROWSDOWN` is not one of them (a stack is host-owned).
     /// `IMAGE` rides them too: a split of an image node stays the root's.
     pub const CARRIED: Self = Self(
-        Self::LOCKED.0 | Self::DONTFORK.0 | Self::WIPEONFORK.0 | Self::DONTDUMP.0 | Self::IMAGE.0,
+        Self::LOCKED.0
+            | Self::DONTFORK.0
+            | Self::WIPEONFORK.0
+            | Self::DONTDUMP.0
+            | Self::IMAGE.0
+            | Self::PLACED_OUTSIDE_LAYOUT.0,
     );
     const ALL: u32 = Self::ANONYMOUS_PRIVATE.0
         | Self::ATTRIBUTES.0
         | Self::FILE.0
         | Self::SHARED_ANONYMOUS.0
-        | Self::IMAGE.0;
+        | Self::IMAGE.0
+        | Self::PLACED_OUTSIDE_LAYOUT.0;
 
     pub const fn from_bits(bits: u32) -> Option<Self> {
         if bits & !Self::ALL == 0 {
