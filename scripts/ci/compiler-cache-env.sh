@@ -64,7 +64,14 @@ if [[ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]]; then
         echo "SCCACHE_DIR=$dir"
         # Per-host cap (2026-11-07: cloudmac's 60 GB CI volume filled mid-job with two runners' 15 GB
         # caches plus two concurrent builds). A self-hosted runner may set CARRICK_SCCACHE_CACHE_SIZE.
-        echo "SCCACHE_CACHE_SIZE=${CARRICK_SCCACHE_CACHE_SIZE:-15G}"
+        # Only a sane size is accepted: 1-9999 with an M or G suffix, no other characters. Anything else
+        # (zero, overflow, a newline that would inject a second $GITHUB_ENV line) is ignored, keeping 15G.
+        cache_size=${CARRICK_SCCACHE_CACHE_SIZE:-15G}
+        if [[ ! $cache_size =~ ^[1-9][0-9]{0,3}[MG]$ ]]; then
+            echo "compiler-cache-env: ignoring invalid CARRICK_SCCACHE_CACHE_SIZE; using 15G" >&2
+            cache_size=15G
+        fi
+        echo "SCCACHE_CACHE_SIZE=$cache_size"
         echo "SCCACHE_SERVER_UDS=$socket"
     } >> "$GITHUB_ENV"
     echo "backend=local" >> "$GITHUB_OUTPUT"
