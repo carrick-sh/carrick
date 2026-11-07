@@ -13643,6 +13643,58 @@ mod tests {
         let _ = (GuestCowClass::AlreadyWritable, GuestCowNotArmed::Unmapped);
     }
 
+    /// Full host blocks occur in image/stack ranges. Both the live parent
+    /// and offline child must retain per-page fork authority after arming.
+    #[test]
+    fn adopting_fork_arm_splits_full_host_block_and_keeps_private_pages() {
+        const TWO_MIB: u64 = 1 << 21;
+        let va = LINUX_MMAP_BASE + 32 * TWO_MIB;
+        for offline_child in [false, true] {
+            let mut image = hvpatch_manager();
+            image.set_rw(va, TWO_MIB as usize, false, None).unwrap();
+            assert_eq!(image.debug_walk(va)[2] & TYPE_BITS, TYPE_BLOCK);
+            if offline_child {
+                image.declare_offline_private_image();
+            }
+            let tables_before = image.pool_stats().0;
+            image
+                .set_fork_readonly_adopting(va, TWO_MIB as usize, None)
+                .unwrap();
+            for page in 0..512 {
+                let leaf = terminal_descriptor(image.debug_walk(va + page * PT_PAGE));
+                assert!(
+                    descriptor_txn::guest_cow::is_guest_cow_write_leaf(3, leaf),
+                    "page {page}, offline={offline_child}: {leaf:#x}"
+                );
+                assert_eq!(
+                    image.debug_walk(va + page * PT_PAGE)[2] & TYPE_BITS,
+                    TYPE_TABLE_OR_PAGE,
+                    "COW must keep per-page authority"
+                );
+            }
+            assert_eq!(
+                image.pool_stats().0 - tables_before,
+                1,
+                "one L3 table for one fully covered host block"
+            );
+            image
+                .set_readonly(va + PT_PAGE, PT_PAGE as usize, false, None)
+                .unwrap();
+            image
+                .set_fork_readonly_adopting(va, TWO_MIB as usize, None)
+                .unwrap();
+            let protected = terminal_descriptor(image.debug_walk(va + PT_PAGE));
+            assert!(
+                !terminal_descriptor_may_write(protected),
+                "nested fork preserves denial"
+            );
+            let neighbor = terminal_descriptor(image.debug_walk(va));
+            assert!(descriptor_txn::guest_cow::is_guest_cow_write_leaf(
+                3, neighbor
+            ));
+        }
+    }
+
     #[test]
     fn imported_private_block_admission_uses_one_table_and_preserves_neighbor() {
         let mut image = hvpatch_manager();
