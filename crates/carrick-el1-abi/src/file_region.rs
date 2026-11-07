@@ -241,6 +241,14 @@ impl FileRegionRegistration {
                 .add(crate::EL1_METADATA_MAILBOX_OFFSET as usize)
                 .cast::<crate::MetadataGrantMailbox>()
                 .write(crate::MetadataGrantMailbox::new());
+            for slot in 0..(crate::EL1_STACK_SLOTS as usize) {
+                mapped
+                    .as_ptr()
+                    .add(crate::EL1_CURRENT_TASKS_OFFSET as usize)
+                    .cast::<crate::CurrentTask>()
+                    .add(slot)
+                    .write(crate::CurrentTask::new());
+            }
             for index in 0..MAX_DELEGATED_FILES {
                 mapped
                     .as_ptr()
@@ -270,13 +278,18 @@ impl FileRegionRegistration {
                 .add(EL1_NAME_CACHE_OFFSET as usize)
                 .cast::<InotifyNameCache>()
                 .write(InotifyNameCache::new());
-            // The map contains only integer atomics and reserved integers;
-            // all-zero is its empty, unpublished state. Initialize in place
-            // without a large by-value temporary on a supervisor stack.
+            // The map and zone tables contain only atomics and claim-protected
+            // context; all-zero is their empty, unpublished state. Initialize
+            // in place without a large by-value temporary on a supervisor stack.
             mapped
                 .as_ptr()
                 .add(crate::EL1_IPC_TABLE_MAP_OFFSET as usize)
                 .cast::<crate::ipc_tables::IpcTableMap>()
+                .write_bytes(0, 1);
+            mapped
+                .as_ptr()
+                .add(crate::EL1_ZONE_OFFSET as usize)
+                .cast::<crate::ZoneTables>()
                 .write_bytes(0, 1);
             mapped
                 .as_ptr()
@@ -304,6 +317,13 @@ impl FileRegionRegistration {
         self.binding
     }
 
+    /// Authenticate that this registration remains live and return the base of
+    /// its retained `EL1_REGION_SIZE` mapping.
+    pub fn retained_base(&self) -> Result<NonNull<u8>, FileRegionError> {
+        self.tables(self.binding)?;
+        Ok(self.mapped)
+    }
+
     /// Borrow the initialized mailbox from this exact carrier registration.
     /// Retirement refuses new borrows; no process-global aperture is read.
     pub fn metadata_mailbox(&self) -> Result<&crate::MetadataGrantMailbox, FileRegionError> {
@@ -317,6 +337,61 @@ impl FileRegionRegistration {
                 .add(crate::EL1_METADATA_MAILBOX_OFFSET as usize)
                 .cast::<crate::MetadataGrantMailbox>()
         })
+    }
+
+    /// Borrow the initialized zone tables from this exact carrier registration.
+    /// Retirement refuses new borrows; no process-global aperture is read.
+    pub fn zone_tables(&self) -> Result<&crate::ZoneTables, FileRegionError> {
+        const {
+            assert!(core::mem::align_of::<crate::ZoneTables>() <= 4096);
+        }
+        self.tables(self.binding)?;
+        // SAFETY: initialization zeroes this atomic/claim-protected table
+        // before publication; 4 KiB mapping alignment plus checked offset
+        // guarantee alignment, and the borrow retains the mapping.
+        Ok(unsafe {
+            &*self
+                .mapped
+                .as_ptr()
+                .add(crate::EL1_ZONE_OFFSET as usize)
+                .cast::<crate::ZoneTables>()
+        })
+    }
+
+    /// Borrow a slot's `CurrentTask` record from this exact carrier registration.
+    pub fn current_task(
+        &self,
+        slot: carrick_guest_arch::SlotId,
+    ) -> Result<&crate::CurrentTask, FileRegionError> {
+        const {
+            assert!(core::mem::align_of::<crate::CurrentTask>() <= 4096);
+        }
+        let index = usize::from(slot.raw());
+        if index >= crate::EL1_STACK_SLOTS as usize {
+            return Err(FileRegionError::Layout);
+        }
+        self.tables(self.binding)?;
+        // SAFETY: initialization writes all `EL1_STACK_SLOTS` task records
+        // before publication; `index` is in bounds and aligned.
+        Ok(unsafe {
+            &*self
+                .mapped
+                .as_ptr()
+                .add(crate::EL1_CURRENT_TASKS_OFFSET as usize)
+                .cast::<crate::CurrentTask>()
+                .add(index)
+        })
+    }
+
+    /// Publish pending host work on `slot` in this exact carrier registration.
+    pub fn mark_pending_host_work(
+        &self,
+        slot: carrick_guest_arch::SlotId,
+    ) -> Result<(), FileRegionError> {
+        let current_task = self.current_task(slot)?;
+        current_task.linux.mark_pending_host_work();
+        crate::record_direct_slot_host_work_publication();
+        Ok(())
     }
 
     pub fn tables(&self, expected: FileRegionBinding) -> Result<FileTables<'_>, FileRegionError> {
@@ -551,6 +626,81 @@ mod registration_mailbox_tests {
                 Err(FileRegionError::Retired)
             ));
             assert!(b.metadata_mailbox().is_ok());
+        }
+        // SAFETY: registrations and every borrowed view are now gone.
+        unsafe {
+            std::alloc::dealloc(first.as_ptr(), layout);
+            std::alloc::dealloc(second.as_ptr(), layout);
+        }
+    }
+
+    #[test]
+    fn registered_zone_and_slot_doorbell_are_carrier_local_and_refuse_retirement() {
+        let layout =
+            std::alloc::Layout::from_size_align(EL1_REGION_SIZE as usize, 4096).expect("layout");
+        let allocate =
+            || NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) }).expect("allocated region");
+        let first = allocate();
+        let second = allocate();
+        let binding = |identity| {
+            FileRegionBinding::new(
+                FileRegionId::from_carrier(NonZeroU64::new(identity).expect("identity")),
+                KernelVa::new(crate::EL1_REGION_BASE),
+                FrameGpa::new(crate::EL1_REGION_BASE),
+                GuestLen::new(EL1_REGION_SIZE),
+            )
+            .expect("binding")
+        };
+        let slot = carrick_guest_arch::SlotId::from_index(3).expect("valid slot");
+        {
+            // SAFETY: exclusive extents outlive both registrations and have no guest CPUs.
+            let mut a = unsafe { FileRegionRegistration::initialize(first, binding(11)) }
+                .expect("first registration");
+            // SAFETY: disjoint exclusive extent retained until registration drop.
+            let b = unsafe { FileRegionRegistration::initialize(second, binding(22)) }
+                .expect("second registration");
+
+            assert_eq!(a.retained_base().expect("live first base"), first);
+            assert_eq!(b.retained_base().expect("live second base"), second);
+
+            let first_zone = a.zone_tables().expect("live first zone");
+            let second_zone = b.zone_tables().expect("live second zone");
+            first_zone.spaces.set_idle_ttbr(0x1111_0000);
+            assert_eq!(second_zone.spaces.idle_ttbr(), 0);
+
+            a.mark_pending_host_work(slot)
+                .expect("first slot doorbell publication");
+            assert!(
+                a.current_task(slot)
+                    .expect("first slot task")
+                    .linux
+                    .has_pending_host_work()
+            );
+            assert!(
+                !b.current_task(slot)
+                    .expect("second slot task")
+                    .linux
+                    .has_pending_host_work()
+            );
+
+            a.retire();
+            assert!(matches!(a.retained_base(), Err(FileRegionError::Retired)));
+            assert!(matches!(a.zone_tables(), Err(FileRegionError::Retired)));
+            assert!(matches!(
+                a.current_task(slot),
+                Err(FileRegionError::Retired)
+            ));
+            assert!(matches!(
+                a.mark_pending_host_work(slot),
+                Err(FileRegionError::Retired)
+            ));
+            assert_eq!(
+                b.zone_tables()
+                    .expect("second remains live")
+                    .spaces
+                    .idle_ttbr(),
+                0
+            );
         }
         // SAFETY: registrations and every borrowed view are now gone.
         unsafe {

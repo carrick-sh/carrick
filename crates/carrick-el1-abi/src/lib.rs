@@ -3621,6 +3621,11 @@ impl Drop for SlotRun {
     }
 }
 
+pub(crate) fn record_direct_slot_host_work_publication() {
+    HOST_WORK_PUBLICATIONS[HostWorkPublishReason::DirectSlot as usize]
+        .fetch_add(1, Ordering::Relaxed);
+}
+
 /// Mark return-to-user work pending for the vCPU at `slot`.
 pub fn mark_pending_host_work(slot: usize) {
     let ptr = get_el1_region_host_ptr();
@@ -3630,8 +3635,7 @@ pub fn mark_pending_host_work(slot: usize) {
     let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
     let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
     current_task.linux.mark_pending_host_work();
-    HOST_WORK_PUBLICATIONS[HostWorkPublishReason::DirectSlot as usize]
-        .fetch_add(1, Ordering::Relaxed);
+    record_direct_slot_host_work_publication();
 }
 
 /// Whether host work is published to the vCPU at `slot`, without consuming
