@@ -1187,7 +1187,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             (ServiceOperation::HostFile { .. }, ServicePayload::HostFile(pending)) => {
                 (None, Some(pending))
             }
-            (ServiceOperation::Exec { .. } | ServiceOperation::HostFile { .. }, _)
+            // Clock requests require a retained ring operation and reply owner.
+            // The generic payload-free entry cannot grant that custody.
+            (ServiceOperation::Clock { .. }, _)
+            | (ServiceOperation::Exec { .. } | ServiceOperation::HostFile { .. }, _)
             | (_, ServicePayload::Exec(_) | ServicePayload::HostFile(_)) => {
                 return Err(NativeProcessError::Stale);
             }
@@ -1554,7 +1557,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ServiceOperation::Fault(_) | ServiceOperation::Exception(_) => OwnerEntry::Exception,
             ServiceOperation::Crossing { .. }
             | ServiceOperation::Exec { .. }
-            | ServiceOperation::HostFile { .. } => OwnerEntry::Syscall,
+            | ServiceOperation::HostFile { .. }
+            | ServiceOperation::Clock { .. } => OwnerEntry::Syscall,
             ServiceOperation::CarrierWork { entry } => entry,
         };
         let mut completion = None;
@@ -2564,7 +2568,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             }
                             ServiceOperation::Crossing { .. }
                             | ServiceOperation::Exec { .. }
-                            | ServiceOperation::HostFile { .. } => OwnerEntry::Syscall,
+                            | ServiceOperation::HostFile { .. }
+                            | ServiceOperation::Clock { .. } => OwnerEntry::Syscall,
                             ServiceOperation::CarrierWork { entry } => entry,
                         }
                     });
@@ -2714,6 +2719,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 };
             }
             match (request.operation, result) {
+                // No payload-free completion may manufacture a clock answer.
+                // Clock admission above refuses before publishing a request.
+                (ServiceOperation::Clock { .. }, _) => Err(NativeProcessError::Quarantined),
                 (_, ServiceResult::Wait(_)) => Err(NativeProcessError::Quarantined),
                 (
                     ServiceOperation::CarrierWork { .. },

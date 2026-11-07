@@ -1630,6 +1630,53 @@ fn native_exec_fixture() -> NativeSignalFixture {
     )
 }
 
+#[test]
+#[cfg(test)]
+fn native_clock_requires_retained_payload_before_service_publication() {
+    use carrick_core_abi::clock::{CLOCK_RECORD_BYTES, ClockCapabilityId};
+    use carrick_core_abi::service::{ClockPayloadDescriptor, ServiceOperation};
+
+    let fixture = native_exec_fixture();
+    let mut service = fixture.service();
+    let context = words(fixture.address);
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            fixture.task,
+            fixture.address,
+            &context,
+            &mut service,
+        )
+        .unwrap();
+    let operation = ServiceOperation::Clock {
+        capability: ClockCapabilityId::new(NonZeroU64::MIN),
+        payload: ClockPayloadDescriptor::checked(
+            carrick_guest_arch::GuestVa::new(0x1000),
+            carrick_guest_arch::GuestLen::new(CLOCK_RECORD_BYTES as u64),
+            carrick_guest_arch::NativeOrdinal::new(113),
+        )
+        .unwrap(),
+    };
+    assert!(matches!(
+        entry.begin_service(operation, None),
+        Err(NativeProcessError::Stale)
+    ));
+    assert_eq!(fixture.task.service_notice.take().unwrap(), None);
+    assert_eq!(carrick_el1_abi::Lifecycle::claimed_count(fixture.page), 0);
+    assert!(
+        !fixture
+            .runtime
+            .graph
+            .lock()
+            .has_member_wait(&fixture.record)
+    );
+}
+
 /// These are corrupt custody, not a sibling holding a releasable resource.
 /// Drive the same begin/settle pair as arm_native_service_exit: an exact
 /// member may have only one cell, pending row and execution-lane notice.
