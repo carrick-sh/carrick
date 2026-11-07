@@ -8864,6 +8864,34 @@ mod copyout_refusal_s3_tests {
     }
 
     #[test]
+    fn getrandom_rejects_conflicting_sources_before_output_preparation() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = OwnerRefusingMemory::new(BASE, 16, FILL);
+        for flags in [6, 7] {
+            for length in [0, 8] {
+                assert_eq!(
+                    dispatcher
+                        .dispatch(
+                            &context,
+                            SyscallRequest::new(
+                                nr::GETRANDOM.raw(),
+                                SyscallArgs::from([BASE, length, flags, 0, 0, 0]),
+                            ),
+                            &mut memory,
+                            &CompatReporter::default(),
+                        )
+                        .unwrap(),
+                    DispatchOutcome::errno(LINUX_EINVAL),
+                    "flags={flags} length={length}",
+                );
+            }
+        }
+        assert_eq!(memory.prepares, 0);
+        assert_eq!(memory.read_bytes(BASE, 16).unwrap(), [FILL; 16]);
+    }
+
+    #[test]
     fn getrandom_returns_accessible_prefix_within_first_chunk() {
         let mut dispatcher = SyscallDispatcher::new();
         let context = dispatcher.capture_one_task_context().unwrap();

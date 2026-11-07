@@ -585,6 +585,7 @@ surfaces = [
   { path = "crates/carrick-kernel/src/dispatch/outcome.rs", contract = "kernel.futex.contention" },
   { path = "crates/carrick-kernel/src/dispatch/outcome.rs", contract = "kernel.memory.owner-wait" },
   { path = "crates/carrick-kernel/src/dispatch/proc.rs", contract = "kernel.futex.contention" },
+  { path = "crates/carrick-kernel/src/dispatch/proc.rs", contract = "kernel.native.entropy" },
   { path = "crates/carrick-kernel/src/dispatch/request.rs", contract = "kernel.fs.directory-copyout" },
   { path = "crates/carrick-kernel/src/dispatch/request.rs", contract = "kernel.memory.owner-wait" },
   { path = "crates/carrick-kernel/src/dispatch/resources.rs", contract = "kernel.dispatch.resource-scope" },
