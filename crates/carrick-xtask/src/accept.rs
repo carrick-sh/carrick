@@ -900,6 +900,9 @@ pub fn parse_unitemized_failures(log: &str) -> Vec<String> {
 /// The failure text `cleanup_remaining` records for an unproven reap.
 pub const CLEANUP_UNKNOWN: &str = "scoped cleanup failed or reported no remaining count";
 
+/// Prefix recorded in `AcceptReceipt::failures` when `accept` refuses before step publication.
+pub const ACCEPT_REFUSAL_PREFIX: &str = "accept refusal: ";
+
 pub fn generate_timestamp() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1485,61 +1488,84 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
     run_on_host(root_arg, args, std::env::consts::OS, std::env::consts::ARCH)
 }
 
+pub fn validate_request_for_host(
+    args: &AcceptArgs,
+    os: &str,
+    arch: &str,
+) -> Result<AcceptPhase, AcceptError> {
+    let phase = profile_phase(args.profile, args.phase)?;
+    if args.profile == AcceptProfile::Kvm && (os != "linux" || arch != "x86_64") {
+        return Err(AcceptError::Failed(format!(
+            "KVM requires Linux x86_64; host is {os}-{arch}"
+        )));
+    }
+    Ok(phase)
+}
+
+pub fn publish_refusal(
+    root_arg: Option<&Path>,
+    args: &AcceptArgs,
+    error: &dyn fmt::Display,
+) -> Result<(), AcceptError> {
+    let Some(path) = args.receipt.as_deref() else {
+        return Ok(());
+    };
+    // Refusals must remain visible even before repository or lease admission.
+    // Never reuse a receipt left by an earlier invocation.
+    let phase = profile_phase(args.profile, args.phase).unwrap_or(args.phase);
+    let info = crate::cli::resolve_repo_info(root_arg).ok();
+    let receipt = AcceptReceipt {
+        schema_version: 1,
+        timestamp: generate_timestamp(),
+        head: info
+            .as_ref()
+            .map(|info| info.head.clone())
+            .unwrap_or_default(),
+        clean_tree: false,
+        phase: phase.to_string(),
+        profile: args.profile.to_string(),
+        overall: "FAIL".into(),
+        steps: Vec::new(),
+        skipped_steps: Vec::new(),
+        artifact: None,
+        fixture_validation: None,
+        el1: None,
+        probe_diffs: Vec::new(),
+        cleanup_counts: Vec::new(),
+        fixture_bundle: None,
+        host_load: Default::default(),
+        failures: vec![format!("{ACCEPT_REFUSAL_PREFIX}{error}")],
+    };
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).map_err(|source| AcceptError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    crate::atomic_file::write(path, &serde_json::to_vec_pretty(&receipt)?).map_err(|source| {
+        AcceptError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    })
+}
+
 fn run_on_host(
     root_arg: Option<&Path>,
-    args: AcceptArgs,
+    mut args: AcceptArgs,
     os: &str,
     arch: &str,
 ) -> Result<(), AcceptError> {
-    let requested_receipt = args.receipt.clone();
-    let profile = args.profile;
-    let phase = args.phase;
+    let refusal_args = args.clone();
     let mut published = false;
-    let result = profile_phase(profile, phase).and_then(|_| {
-        if profile == AcceptProfile::Kvm && (os != "linux" || arch != "x86_64") {
-            Err(AcceptError::Failed(format!(
-                "KVM requires Linux x86_64; host is {os}-{arch}"
-            )))
-        } else {
-            run_inner(root_arg, args, &mut published)
-        }
+    let result = validate_request_for_host(&args, os, arch).and_then(|phase| {
+        args.phase = phase;
+        run_inner(root_arg, args, &mut published)
     });
-    if let (Err(error), Some(path)) = (&result, requested_receipt)
+    if let Err(error) = &result
         && !published
     {
-        // Refusals must remain visible even before repository or lease admission.
-        // Never reuse a receipt left by an earlier invocation.
-        let info = crate::cli::resolve_repo_info(root_arg).ok();
-        let receipt = AcceptReceipt {
-            schema_version: 1,
-            timestamp: generate_timestamp(),
-            head: info
-                .as_ref()
-                .map(|info| info.head.clone())
-                .unwrap_or_default(),
-            clean_tree: false,
-            phase: phase.to_string(),
-            profile: profile.to_string(),
-            overall: "FAIL".into(),
-            steps: Vec::new(),
-            skipped_steps: Vec::new(),
-            artifact: None,
-            fixture_validation: None,
-            el1: None,
-            probe_diffs: Vec::new(),
-            cleanup_counts: Vec::new(),
-            fixture_bundle: None,
-            host_load: Default::default(),
-            failures: vec![format!("accept refusal: {error}")],
-        };
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|source| AcceptError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
-        crate::atomic_file::write(&path, &serde_json::to_vec_pretty(&receipt)?)
-            .map_err(|source| AcceptError::Io { path, source })?;
+        publish_refusal(root_arg, &refusal_args, error)?;
     }
     result
 }
@@ -2434,7 +2460,10 @@ fn run_inner(
     let overall = if failures.is_empty() { "PASS" } else { "FAIL" };
     receipt.overall = overall.into();
 
-    if let Some(parent) = receipt_path.parent() {
+    if let Some(parent) = receipt_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         fs::create_dir_all(parent).map_err(|e| AcceptError::Io {
             path: parent.to_path_buf(),
             source: e,
