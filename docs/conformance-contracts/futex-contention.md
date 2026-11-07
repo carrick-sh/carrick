@@ -4,8 +4,10 @@ Relative `FUTEX_WAIT` time belongs to the admitted operation, including time
 spent obtaining the futex word's backing. The host syscall completion token
 owns its guest-monotonic deadline through owner service and the zone's final
 atomic recheck. Only the remaining duration is converted into host wait time;
-scaled container clocks do not mix guest and host units. After the final successful comparison and enrollment, the host transfers the
-remaining expiry to the zone wait and retires the syscall token. Completion and cancellation consume that token.
+scaled container clocks do not mix guest and host units. After the final
+successful comparison and enrollment, the host transfers the remaining expiry
+to the zone wait and retires the syscall token. Completion and cancellation
+consume that token.
 
 The EL1 adapter moves a typed relative-wait operation into the exact native
 member's continuation state on a copy refusal. Service ACK leaves that custody
@@ -24,7 +26,11 @@ remaining. A new completion token starts with no inherited deadline. The EL1
 bindings require expiry tick 105 after admission at tick 100, whether owner
 preparation parks or returns synchronous `Redispatch`. Separate episodes prove
 that cancellation, unrelated syscalls and unserved futex operations release
-custody before the next wait. The host runtime binding
+custody before the next wait.
+`futex_caught_signal_releases_owner_deadline_before_handler_wait` delivers a
+caught SIGUSR1 through the production return checkpoint while the original
+deadline is retained, then requires a fresh five-second wait in the handler
+without an intervening unrelated syscall. The host runtime binding
 `serial_host_futex_deadline_survives_zone_word_recheck_owner_park` drives the
 production dispatcher, refuses the final `zone_park` load, releases its owner
 at virtual second one, and resumes the production job. Its resulting zone

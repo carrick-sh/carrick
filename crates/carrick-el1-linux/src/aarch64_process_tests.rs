@@ -12060,32 +12060,37 @@ fn signal_setup_nonresident_input(nr: u64) {
 
 #[test]
 fn futex_unbacked_word_waits_for_owner_with_two_live_threads() {
-    futex_owner_wait_episode(false, false, false, None);
+    futex_owner_wait_episode(false, false, false, None, false);
 }
 
 #[test]
 fn futex_relative_deadline_survives_owner_wait_with_two_live_threads() {
-    futex_owner_wait_episode(true, false, false, None);
+    futex_owner_wait_episode(true, false, false, None, false);
 }
 
 #[test]
 fn futex_relative_deadline_survives_synchronous_owner_redispatch_with_two_live_threads() {
-    futex_owner_wait_episode(true, true, false, None);
+    futex_owner_wait_episode(true, true, false, None, false);
 }
 
 #[test]
 fn futex_cancelled_owner_wait_releases_deadline_before_next_wait() {
-    futex_owner_wait_episode(true, false, true, None);
+    futex_owner_wait_episode(true, false, true, None, false);
 }
 
 #[test]
 fn futex_owner_deadline_is_discarded_before_an_unrelated_syscall() {
-    futex_owner_wait_episode(true, false, false, Some(172));
+    futex_owner_wait_episode(true, false, false, Some(172), false);
 }
 
 #[test]
 fn futex_owner_deadline_is_discarded_before_an_unserved_futex() {
-    futex_owner_wait_episode(true, false, false, Some(98));
+    futex_owner_wait_episode(true, false, false, Some(98), false);
+}
+
+#[test]
+fn futex_caught_signal_releases_owner_deadline_before_handler_wait() {
+    futex_owner_wait_episode(true, false, false, None, true);
 }
 
 #[cfg(test)]
@@ -12094,6 +12099,7 @@ fn futex_owner_wait_episode(
     synchronous: bool,
     cancelled: bool,
     intervening: Option<u64>,
+    caught_signal: bool,
 ) {
     use crate::native_process_runtime::host_test_support::Physical;
     use crate::sched::{LinuxSchedEntry, UserWord};
@@ -12329,6 +12335,66 @@ fn futex_owner_wait_episode(
     }
     assert_eq!(retained.native.x[2], 0x12345678);
     crate::sched::ThreadCpu::load(&mut cpu, &mut frame, &retained);
+    if caught_signal {
+        use carrick_personality_linux::signal::ProcessSignals;
+        use carrick_signal_core::policy::{Action, Disposition, HandlerAddress, Signal};
+        use zerocopy::IntoBytes;
+
+        let signal = Signal::from_number(10).unwrap();
+        let mut entry = runtime
+            .enter_registered(
+                registry(),
+                source,
+                &fixture.task,
+                fixture.address,
+                &retained,
+                &mut service,
+            )
+            .unwrap();
+        entry
+            .rt_sigaction(
+                signal,
+                Some(Action {
+                    disposition: Disposition::Handler(HandlerAddress(0x700000)),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        fixture
+            .control
+            .post_in_zone_standard_signal(signal)
+            .unwrap();
+        entry.import_in_zone_standard_signals().unwrap();
+        assert!(entry.signal_checkpoint_needed());
+        let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+        assert_eq!(
+            super::signal_delivery::deliver_signal_on_syscall_return(
+                &fixture.task,
+                fixture.control,
+                &mut entry,
+                &mut frame,
+                fp.as_bytes(),
+                &mut ArmWaitSignalMachine {
+                    user_sp: UserVa::new(0x900000),
+                    backend: ArmWaitSignalBackend,
+                },
+            ),
+            None
+        );
+        assert_eq!(
+            frame.elr, 0x700000,
+            "caught signal must actually reach its handler"
+        );
+        drop(entry);
+        assert!(!runtime.has_relative_futex_wait_for_test(fixture.control.zone_record().unwrap()));
+        // The handler makes the same timed WAIT immediately: no intervening
+        // unrelated syscall can incidentally clear the previous operation.
+        frame.x[8] = crate::sched::SYS_FUTEX as u64;
+        frame.x[0] = VA;
+        frame.x[1] = crate::sched::FUTEX_WAIT_PRIVATE;
+        frame.x[2] = 0x12345678;
+        frame.x[3] = VA + 8;
+    }
     if let Some(ordinal) = intervening {
         frame.x[8] = ordinal;
         if ordinal == 98 {
@@ -12407,7 +12473,7 @@ fn futex_owner_wait_episode(
         drop(entry);
         assert_eq!(
             cpu.now,
-            if cancelled || intervening.is_some() {
+            if cancelled || intervening.is_some() || caught_signal {
                 106
             } else {
                 105
