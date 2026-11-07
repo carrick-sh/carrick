@@ -1,0 +1,18 @@
+schema = "carrick.conformance-exemption.v1"
+base = "94d569b5993306e32eb30f1a0fb132c6fa3181ba"
+head = "f02f57a0c87922a1863ab62e345c708753ac9dcc"
+contracts = [
+  "kernel.scheduler.runnable-progress",
+  "process.native.terminal-child",
+  "kernel.el1.futex-handoff",
+  "kernel.el1.guest-scheduler",
+  "kernel.futex.contention",
+  "kernel.el1.metadata-allocation",
+  "process.native.short-lock",
+]
+paths = [
+  "crates/carrick-el1/src/alloc.rs",
+  "crates/carrick-el1/src/isa/aarch64.rs",
+  "crates/carrick-el1/src/sched/hw.rs",
+]
+rationale = "This change makes the existing interrupt-mask save and restore lifetime-safe and combines the existing mask-then-lock order into one guard. All currently reachable sections retain the same saved mask and release the same lock before restoring it; only an early exit that previously leaked the mask gains safe restoration. The existing semantic and work contracts remain unchanged, and a host test covers the corrected early-return path."
