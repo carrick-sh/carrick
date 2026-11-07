@@ -9006,9 +9006,7 @@ mod copyout_refusal_s3_tests {
                     let expected = if low >= 6 {
                         DispatchOutcome::errno(LINUX_EINVAL)
                     } else {
-                        DispatchOutcome::Returned {
-                            value: length as i64,
-                        }
+                        DispatchOutcome::returned_u64_or_errno(length)
                     };
                     assert_eq!(
                         dispatcher
