@@ -68,6 +68,7 @@ lists it). Do not read the crate map as a completed neutral/Linux layering.
 | `carrick-softmmu` | `no_std` + `alloc` linear guest-physical placement (`LinearPlacement`, the sole `AuthenticatedGpa -> HostVa` conversion), direct-mapped 1024-entry `read`/`write`/`exec` software TLB (`SoftTlb` with large-page `invlpg` span eviction), MMIO holes, extent authentication (`ExtentTable`), single-walk stage-1 walker (`SoftWalker` over `translate_leaf_hardware`) with hardware x86-64 permission, CR-gating (`WP`, `SMEP`, `SMAP`, `NXE`), and atomic `A`/`D` semantics, and the physical-retirement venue (`retirement`: each soft vCPU seated in the inventory's neutral `carrick-core` invalidation domain, served at block entry) for the software vCPU. |
 | `carrick-syscall-abi` | Guest-safe Linux syscall numbering, canonical tables, and wait-option domains. |
 | `carrick-thread` | Thread registry, private-futex park table, and fork/page-table quiesce barriers. |
+| `carrick-time-core` | Shared no_std Linux clock-discipline state, transitions and timex serialization. |
 | `carrick-timer-core` | Platform-neutral interval/POSIX timer slot bookkeeping and timer due-time decisions. |
 
 ## Host Primitive Layers
