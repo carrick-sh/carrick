@@ -66,6 +66,18 @@ recheck those PRs' ownership and close them with a pointer to the replacement.
 A failed publication leaves the earlier PRs open; a failed close is reported
 as a publication failure and can be resumed. Issue prose does not select a branch or request a fresh start.
 
+Before any checkpoint or final publication, the server audits commits from
+all earlier issue run PRs (open or closed) and the admitted branch tip against
+both the candidate head and live main. Patch-equivalent commits are kept;
+matching subjects identify ports after conflict resolution. The outcome lists
+the findings. A missing commit requires a worker contract `risks` entry of
+`Dropped <full SHA>: <reason>`. Without a nonempty reason, publication is
+refused as a contract violation. Unreadable earlier history fails closed.
+
+When dispatch leaves workflow changes out of a checkpoint, the outcome says
+that the director must apply `harvest.patch`. That round ends Failed and does
+not automatically continue; another dispatch turn cannot publish those files.
+
 The loop can
 select another linked `work/dispatch-*` branch before invoking workers. A
 candidate must have an open owned dispatch draft PR closing this issue, or an

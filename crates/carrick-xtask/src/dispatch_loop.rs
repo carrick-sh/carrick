@@ -2113,7 +2113,10 @@ impl Server<'_> {
                 .iter()
                 .any(|word| summary.to_ascii_lowercase().contains(word)))
         .then_some(summary);
-        let finish = if inferred_brief.is_some() {
+        let workflow_handoff = !Applied::load()?.workflow_left_out.is_empty();
+        let finish = if workflow_handoff {
+            FinishStatus::Failed
+        } else if inferred_brief.is_some() {
             FinishStatus::Continue
         } else {
             finish
@@ -2275,8 +2278,10 @@ impl Server<'_> {
                     self.tier.reason
                 )
             });
-        let status = if (applied.review_claimed && !applied.review) || applied.last_provider_filter
-        {
+        let status = if workflow_handoff {
+            observations.push("workflow changes were left out; the director must apply `harvest.patch`; automatic continuation stopped".into());
+            RoundStatus::Failed
+        } else if (applied.review_claimed && !applied.review) || applied.last_provider_filter {
             RoundStatus::Blocked
         } else if !observations.is_empty() {
             RoundStatus::Failed
@@ -2563,6 +2568,7 @@ impl Server<'_> {
                     refresh_checkpoint_head(&state, &work)?;
                     receipt = worker_checkpoint(&state, &self.dispatch)?
                         .ok_or(ScalerError::Guard("checkpoint receipt lost"))?;
+                    Applied::record(|a| a.workflow_left_out = left)?;
                     publish_with(
                         self.root,
                         &self.dispatch,
@@ -2573,7 +2579,6 @@ impl Server<'_> {
                         &mut self.runs,
                         PublishMode::CommitsOnly,
                     )?;
-                    Applied::record(|a| a.workflow_left_out = left)?;
                 }
                 other => {
                     other?;
@@ -6121,6 +6126,14 @@ fi
         dispatch.resume = false;
         dispatch.review = false;
         dispatch.base = git(root, &["rev-parse", "HEAD"]).unwrap().trim().into();
+        // Publication reads earlier PR heads from the API, so pair this
+        // native fixture's PR metadata with its real initial Git history.
+        let fixture = PathBuf::from(std::env::var_os("RUNNER_TEMP").unwrap());
+        let mut pr: Value =
+            serde_json::from_str(&regular_text(&fixture.join("pr.json")).unwrap()).unwrap();
+        pr["head"]["sha"] = json!(dispatch.base);
+        std::fs::write(fixture.join("pr.json"), pr.to_string()).unwrap();
+        std::fs::write(fixture.join("prs.json"), json!([pr]).to_string()).unwrap();
         dispatch.loop_deadline = Some(Instant::now() + Duration::from_secs(60));
         dispatch.harvest_deadline = Some(Instant::now() + Duration::from_secs(60));
         dispatch
