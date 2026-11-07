@@ -10537,11 +10537,13 @@ fn serial_host_native_fork_netpoll_eventfd_wait() {
     native_descriptor_witness(None, false, false, true, false);
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_root_pipe_zone_ceiling() {
     native_descriptor_witness(None, true, false, false, true);
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_fork_pipe_zone_ceiling() {
     native_descriptor_witness(None, false, false, false, true);
