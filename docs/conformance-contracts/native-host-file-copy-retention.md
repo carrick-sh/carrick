@@ -147,3 +147,27 @@ break existing calls. This checkpoint therefore leaves the header untouched.
 The required production write/writev and read/readv retention witnesses,
 retained vector input, carrier integration and delegation conversions are
 still open; the type move supplies no red/green behavioral evidence.
+
+## Remaining native input classification checkpoint
+
+The two native ppoll input copies now preserve the same typed outcome as
+path and write staging. A true fault returns errno 14 without requesting
+backing; an owner refusal forwards its exact address and access rather than
+substituting the start of the timespec or pollfd array. The staging binding
+`ppoll_input_preserves_fault_and_exact_owner_request` covers both inputs and
+successful staging after a one-shot refusal. It was red for both the fault
+classification and the requested-address assertion. It proves neither an
+owner park nor descriptor retention. Existing poll admission and readiness
+policy are unchanged.
+
+The CPL0 `MappingUser` adapter now returns the typed fault for its unsupported
+input direction. `MapPrivate` stages no user input; the old boolean signature
+failed the actual freestanding image build with E0053. A successful host KVM
+compile check alone did not expose that stale signature on earlier workers'
+hosts. The full `just build-cpl0` red/green check qualifies this adapter port.
+
+The guest-copy syntax debt remains 243: neither the missed `.is_done()`
+classification nor the stale implementation signature was a counted trait
+obligation. No ceiling is lowered for this checkpoint. Descriptor retention,
+gathered-input retention, delegation conversions and production retention
+witnesses remain required before issue acceptance.
