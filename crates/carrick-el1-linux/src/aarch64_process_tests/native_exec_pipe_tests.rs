@@ -629,6 +629,59 @@ fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
         "resume exactly at the parked SVC"
     );
     drop(resume_cpu);
+
+    // Preempt before the SVC executes and select the same reader again. The
+    // retry position belongs to the saved context, so selection is idempotent
+    // until a later architectural save replaces that context.
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, child_binding.record.id)
+            .is_queued()
+    );
+    let mut resume_cpu = ResumeCpu {
+        inner: crate::sched::FakeCpu::default(),
+        runtime: &runtime,
+        registry,
+        source,
+        task: &fixture.task,
+        service: &mut fork_service,
+    };
+    let mut selected_again = carrick_el1_abi::TrapFrame::default();
+    for _ in 0..2 {
+        assert_eq!(
+            (crate::sched::Sched {
+                handoff: None,
+                zone: fixture.zone,
+                slot: fixture.slot,
+                task: &fixture.task,
+                cpu: &mut resume_cpu,
+                user: &crate::sched::HardwareUserWord,
+                counters: &counters,
+            })
+            .yield_queued(&mut selected_again),
+            Some(crate::sched::Served::Returned { switched: true })
+        );
+        if fixture.zone.slot(fixture.slot).current() == Some(child_binding.record.id) {
+            break;
+        }
+        let other = fixture.zone.slot(fixture.slot).current().unwrap();
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(fixture.slot, other)
+                .is_queued()
+        );
+    }
+    assert_eq!(
+        fixture.zone.slot(fixture.slot).current(),
+        Some(child_binding.record.id)
+    );
+    assert_eq!(
+        selected_again.elr, 0x400000,
+        "a second selection before execution must not rewind twice"
+    );
+    drop(resume_cpu);
     assert_eq!(dispatch!(&mut service, &mut cpu, 63, 3).1, 1);
     assert!(
         !fixture

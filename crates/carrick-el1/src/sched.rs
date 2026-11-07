@@ -1399,17 +1399,20 @@ impl ThreadCpu for FakeCpu {
             .unwrap_or(carrick_el1_abi::Action::Forward)
     }
     fn save(&mut self, frame: &TrapFrame, ctx: &mut Aarch64ParkedContext) {
-        let ctx = &mut ctx.native;
-        hw::save_frame(frame, ctx);
-        ctx.sp_el0 = self.regs.sp_el0;
-        ctx.tpidr_el0 = self.regs.tpidr_el0;
-        ctx.tpidrro_el0 = self.regs.tpidrro_el0;
-        ctx.contextidr_el1 = self.regs.contextidr_el1;
+        hw::save_frame(frame, &mut ctx.native);
+        ctx.native.sp_el0 = self.regs.sp_el0;
+        ctx.native.tpidr_el0 = self.regs.tpidr_el0;
+        ctx.native.tpidrro_el0 = self.regs.tpidrro_el0;
+        ctx.native.contextidr_el1 = self.regs.contextidr_el1;
         if !self.skip_fpsimd {
-            ctx.v = self.regs.v;
-            ctx.fpsr = self.regs.fpsr;
-            ctx.fpcr = self.regs.fpcr;
+            ctx.native.v = self.regs.v;
+            ctx.native.fpsr = self.regs.fpsr;
+            ctx.native.fpcr = self.regs.fpcr;
         }
+        ctx.replace_saved_pc(
+            ctx.native.pc,
+            carrick_sched_core::SavedSyscallPc::AfterSyscall,
+        );
     }
 
     fn load(&mut self, frame: &mut TrapFrame, ctx: &Aarch64ParkedContext) {

@@ -1,7 +1,9 @@
 //! Shared AArch64 parked-context ABI. Machine conversion belongs to the ISA leaf.
 
 use crate::ThreadCtx;
-use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
+use carrick_guest_arch::{
+    AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa, SavedSyscallPc,
+};
 use core::num::NonZeroU64;
 
 /// Mask extracting the physical base address from an ARM TTBR0_EL1 register value
@@ -24,7 +26,7 @@ pub struct Aarch64ParkedContext {
     root: u64,
     mm: u64,
     generation: u64,
-    _pad: u64,
+    saved_syscall_pc: u64,
 }
 
 const _: () = {
@@ -32,7 +34,7 @@ const _: () = {
     assert!(core::mem::offset_of!(Aarch64ParkedContext, root) == 832);
     assert!(core::mem::offset_of!(Aarch64ParkedContext, mm) == 840);
     assert!(core::mem::offset_of!(Aarch64ParkedContext, generation) == 848);
-    assert!(core::mem::offset_of!(Aarch64ParkedContext, _pad) == 856);
+    assert!(core::mem::offset_of!(Aarch64ParkedContext, saved_syscall_pc) == 856);
     assert!(core::mem::size_of::<Aarch64ParkedContext>() == 864);
     assert!(core::mem::align_of::<Aarch64ParkedContext>() == 16);
 };
@@ -52,7 +54,7 @@ impl Aarch64ParkedContext {
         root: 0,
         mm: 0,
         generation: 0,
-        _pad: 0,
+        saved_syscall_pc: 0,
     };
 
     pub fn from_parts(native: ThreadCtx, address: AddressContext<RootGpa>) -> Self {
@@ -61,7 +63,7 @@ impl Aarch64ParkedContext {
             root: address.root.address().raw(),
             mm: address.mm.raw().get(),
             generation: address.generation.raw().get(),
-            _pad: 0,
+            saved_syscall_pc: 0,
         }
     }
 
@@ -71,7 +73,7 @@ impl Aarch64ParkedContext {
             root: register,
             mm,
             generation,
-            _pad: 0,
+            saved_syscall_pc: 0,
         }
     }
 
@@ -109,6 +111,24 @@ impl Aarch64ParkedContext {
 
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Replace the architectural PC and its syscall-relative meaning together.
+    pub fn replace_saved_pc(&mut self, pc: u64, position: SavedSyscallPc) {
+        self.native.pc = pc;
+        self.saved_syscall_pc = match position {
+            SavedSyscallPc::AfterSyscall => 0,
+            SavedSyscallPc::AtSyscall => 1,
+        };
+    }
+
+    /// Interpret the position stored with this exact saved context.
+    pub fn saved_syscall_pc(&self) -> Option<SavedSyscallPc> {
+        match self.saved_syscall_pc {
+            0 => Some(SavedSyscallPc::AfterSyscall),
+            1 => Some(SavedSyscallPc::AtSyscall),
+            _ => None,
+        }
     }
 
     /// Lower retained owner custody to the same native entry instruction.
@@ -152,6 +172,9 @@ impl carrick_guest_arch::ProcessContext for Aarch64ParkedContext {
     }
     fn restart_syscall(&mut self) {
         self.native.pc = self.native.pc.wrapping_sub(4);
+    }
+    fn saved_syscall_pc(&self) -> Option<SavedSyscallPc> {
+        Aarch64ParkedContext::saved_syscall_pc(self)
     }
 }
 

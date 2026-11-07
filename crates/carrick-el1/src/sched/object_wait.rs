@@ -255,22 +255,31 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
         let request = carrick_core::wait::ObjectParkRequest::from_locked_snapshot(
             key, snapshot, operation, deadline,
         );
-        carrick_core::wait::park_object_record(zone, slot, request, &completion, || {
-            let fresh = zone.slot(slot).current().is_none();
-            let record = match self.current_record() {
-                Ok(record) => record,
-                Err(_) => return Err(ObjectWaitError::Exhausted),
-            };
-            // SAFETY: this is the slot's current record or its newly allocated
-            // home record. Only this CPU owns its context until publish below.
-            let ctx = unsafe { zone.record(record).ctx_mut() };
-            self.cpu.save(frame, ctx);
-            ctx.native.pc = resume.raw();
-            // SAFETY: this slot exclusively owns the record until the park
-            // publication below transfers it.
-            unsafe { zone.record(record).publish_saved_syscall_resume_pc() };
-            Ok((record, fresh))
-        })
+        let mut replaced = None;
+        let result =
+            carrick_core::wait::park_object_record(zone, slot, request, &completion, || {
+                let fresh = zone.slot(slot).current().is_none();
+                let record = match self.current_record() {
+                    Ok(record) => record,
+                    Err(_) => return Err(ObjectWaitError::Exhausted),
+                };
+                // SAFETY: this is the slot's current record or its newly allocated
+                // home record. Only this CPU owns its context until publish below.
+                let ctx = unsafe { zone.record(record).ctx_mut() };
+                replaced = Some((record, fresh, *ctx));
+                self.cpu.save(frame, ctx);
+                ctx.replace_saved_pc(resume.raw(), carrick_sched_core::SavedSyscallPc::AtSyscall);
+                Ok((record, fresh))
+            });
+        if result.is_err()
+            && let Some((record, fresh, previous)) = replaced
+            && !fresh
+        {
+            // SAFETY: failed publication leaves this slot owning its current
+            // record, so the complete replaced context is still ours.
+            unsafe { *zone.record(record).ctx_mut() = previous };
+        }
+        result
     }
 
     /// Consume the park ticket by leaving for the host at once, running
