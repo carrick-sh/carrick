@@ -1742,7 +1742,8 @@ fn pending_pipe_pair_copy_fault_cancels_claims_without_closing_reused_numbers() 
         StatusFlags::default(),
     );
     assert_eq!(f.host().open(child, Fd(0), unrelated, false), Ok(fds[0]));
-    let lock = f.host().transaction(table).unwrap();
+    let authority = f.host();
+    let lock = authority.transaction(table).unwrap();
     assert!(pair.cancel(&BoundedSpin(0), |_| {}).is_err());
     drop(lock);
     let mut freed = 0;
@@ -1765,7 +1766,8 @@ fn pending_pipe_pair_publication_busy_once_retains_both_endpoints() {
     let mut pair = PendingPipePair::new(*f.region, table, 65536, StatusFlags::default(), false);
     pair.prepare(&mut f.pipe_storage(), &EL1).unwrap();
     let fds = pair.fds().unwrap();
-    let lock = f.host().transaction(table).unwrap();
+    let authority = f.host();
+    let lock = authority.transaction(table).unwrap();
     assert!(pair.publish(&BoundedSpin(0)).is_err());
     drop(lock);
     assert_eq!(pair.fds(), Some(fds));
@@ -1804,4 +1806,60 @@ fn pending_pipe_pair_finish_object_busy_keeps_release_custody() {
     assert_eq!(releases, 2);
     assert!(pair.is_settled());
     assert_eq!(f.host().get(table, fds[0]), Ok(unrelated));
+}
+
+#[test]
+fn pending_pipe_pair_partial_ofd_preparation_cancels_both_object_references() {
+    let f = fixture(4 * 1024 * 1024);
+    let table = f.table();
+    let authority = f.host();
+    let unrelated = Description::new(
+        IpcBacking::Host(HostResourceToken::new(9).unwrap()).encode(),
+        AccessMode::ReadOnly,
+        StatusFlags::default(),
+    );
+    let mut occupied = Vec::new();
+    for _ in 0..f.region.ofd_count() - 1 {
+        occupied.push(authority.create_pinned(unrelated).unwrap());
+    }
+    let mut pair = PendingPipePair::new(*f.region, table, 65536, StatusFlags::default(), false);
+    assert_eq!(
+        pair.prepare(&mut f.pipe_storage(), &EL1),
+        Err(IpcError::Fd(fd::Error::NeedsOfds))
+    );
+    assert_eq!(pair.fds(), None);
+    let mut releases = 0;
+    pair.cancel(&EL1, |_| releases += 1).unwrap();
+    assert_eq!(releases, 2);
+    assert!(pair.is_settled());
+    let reclaimed = authority.create_pinned(unrelated).unwrap();
+    assert_eq!(authority.unpin(reclaimed), Ok(Some(unrelated)));
+    for pin in occupied {
+        assert_eq!(authority.unpin(pin), Ok(Some(unrelated)));
+    }
+}
+
+#[test]
+fn pending_pipe_pair_retired_namespace_cannot_redirect_cancel_to_reused_table() {
+    let f = fixture(4 * 1024 * 1024);
+    let table = f.table();
+    let mut pair = PendingPipePair::new(*f.region, table, 65536, StatusFlags::default(), false);
+    pair.prepare(&mut f.pipe_storage(), &EL1).unwrap();
+    let fds = pair.fds().unwrap();
+    f.host()
+        .destroy_table(table, |_| panic!("unpublished endpoints"))
+        .unwrap();
+    let replacement = f.table();
+    let unrelated = Description::new(
+        IpcBacking::Host(HostResourceToken::new(10).unwrap()).encode(),
+        AccessMode::ReadOnly,
+        StatusFlags::default(),
+    );
+    assert_eq!(
+        f.host().open(replacement, Fd(0), unrelated, false),
+        Ok(fds[0])
+    );
+    pair.cancel(&EL1, |_| {}).unwrap();
+    assert!(pair.is_settled());
+    assert_eq!(f.host().get(replacement, fds[0]), Ok(unrelated));
 }
