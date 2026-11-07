@@ -2083,6 +2083,149 @@ fn fork_cow_process(
     Some(verified_pages)
 }
 
+// Keep these host-published image pages separate from unrelated fixture state.
+// A guest mmap would instead test tagged EL1-private leaves.
+#[repr(align(16384))]
+struct CowProtectedImage([u8; 32768]);
+static mut COW_PROTECTED_IMAGE: CowProtectedImage = CowProtectedImage([0xa5; 32768]);
+
+fn cow_protected_image(fork: bool) -> i32 {
+    unsafe { libc::alarm(30) };
+    let base = unsafe { std::ptr::addr_of_mut!(COW_PROTECTED_IMAGE.0).cast::<u8>() };
+    let protected = unsafe { base.add(4096) };
+    if unsafe { libc::mprotect(protected.cast(), 4096, libc::PROT_READ) } != 0 {
+        return 1;
+    }
+    let mut pipe = [0; 2];
+    let child = if fork {
+        if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
+            return 2;
+        }
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            unsafe { libc::close(pipe[1]) };
+            // EOF also releases the child when the parent takes SIGSEGV.
+            let _ = poll_read_byte(pipe[0], 10_000);
+            let isolated = unsafe { base.read_volatile() == 0xa5 };
+            unsafe { libc::_exit(i32::from(!isolated)) };
+        }
+        if child < 0 {
+            return 3;
+        }
+        unsafe { libc::close(pipe[0]) };
+        child
+    } else {
+        -1
+    };
+    // Resolving the writable neighbor must preserve this page's protection,
+    // even when both pages occupy the same physical COW compound.
+    unsafe { base.write_volatile(0x3c) };
+    let marker = b"cow-protected-image attempting denied store\n";
+    unsafe { libc::write(1, marker.as_ptr().cast(), marker.len()) };
+    unsafe { protected.write_volatile(0x77) };
+    // Reaching here is the bug: clean up the child and return success so the
+    // host assertion must distinguish a real SIGSEGV from ordinary completion.
+    if child > 0 {
+        unsafe { libc::close(pipe[1]) };
+        let mut status = 0;
+        unsafe { libc::waitpid(child, &mut status, 0) };
+    }
+    0
+}
+
+/// The initial, host-served MM must replenish its COW chain after fork.
+/// Use distinct 16 KiB compounds (not adjacent Linux 4 KiB pages) and no
+/// syscalls between writes: syscall entry can otherwise settle USED records
+/// and hide the refill defect.
+fn fork_cow_parent() -> i32 {
+    const COMPOUNDS: usize = 192;
+    const STRIDE: usize = 16 * 1024;
+    const LEN: usize = COMPOUNDS * STRIDE;
+    unsafe { libc::alarm(30) };
+    let region = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            LEN,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if region == libc::MAP_FAILED {
+        return 1;
+    }
+    let bytes = region.cast::<u8>();
+    for i in 0..COMPOUNDS {
+        unsafe { bytes.add(i * STRIDE).write_volatile(0xa5) };
+    }
+    let mut p2c = [0; 2];
+    let mut c2p = [0; 2];
+    if unsafe { libc::pipe(p2c.as_mut_ptr()) } != 0 || unsafe { libc::pipe(c2p.as_mut_ptr()) } != 0
+    {
+        return 2;
+    }
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        unsafe {
+            libc::close(p2c[1]);
+            libc::close(c2p[0]);
+        }
+        // Stay alive on the shared source until BOTH parent writers finish.
+        let ready = write_signal_byte(c2p[1], b'R');
+        let done = poll_read_byte(p2c[0], 10_000);
+        let isolated =
+            (0..COMPOUNDS).all(|i| unsafe { bytes.add(i * STRIDE).read_volatile() } == 0xa5);
+        unsafe { libc::_exit(i32::from(!(ready && done && isolated))) };
+    }
+    if child < 0 {
+        return 3;
+    }
+    unsafe {
+        libc::close(p2c[0]);
+        libc::close(c2p[1]);
+    }
+    let ready = poll_read_byte(c2p[0], 10_000);
+    let base = bytes as usize;
+    let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let mut writers = Vec::new();
+    for worker in 0..2 {
+        let start = start.clone();
+        writers.push(std::thread::spawn(move || {
+            start.wait();
+            // Each live sibling writes 96 distinct compounds, with no syscall
+            // in the loop. Their shared MM must recycle the 64-slot chain.
+            let mut ok = true;
+            for i in (worker..COMPOUNDS).step_by(2) {
+                let byte = (base + i * STRIDE) as *mut u8;
+                unsafe {
+                    ok &= byte.read_volatile() == 0xa5;
+                    byte.write_volatile(i as u8);
+                }
+            }
+            ok
+        }));
+    }
+    start.wait();
+    let mut ok = ready;
+    for writer in writers {
+        ok &= writer.join().unwrap_or(false);
+    }
+    for i in 0..COMPOUNDS {
+        ok &= unsafe { bytes.add(i * STRIDE).read_volatile() } == i as u8;
+    }
+    ok &= write_signal_byte(p2c[1], b'D');
+    let mut status = 0;
+    let waited = unsafe { libc::waitpid(child, &mut status, 0) };
+    ok &= waited == child && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+    for fd in [p2c[1], c2p[0]] {
+        unsafe { libc::close(fd) };
+    }
+    unsafe { libc::munmap(region, LEN) };
+    println!("fork-cow-parent compounds={COMPOUNDS} writers=2 child-isolated={ok} ok={ok}");
+    i32::from(!ok)
+}
+
 fn fork_cow(forks: usize, pages: usize) -> i32 {
     let page_size_raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if page_size_raw <= 0 {
@@ -3784,6 +3927,9 @@ fn main() {
                 }
             },
         },
+        "fork-cow-parent" => fork_cow_parent(),
+        "cow-protected-image" => cow_protected_image(false),
+        "cow-protected-image-fork" => cow_protected_image(true),
         "fork-cow" => fork_cow(
             args.get(2).and_then(|n| n.parse().ok()).unwrap_or(100),
             args.get(3).and_then(|n| n.parse().ok()).unwrap_or(16),

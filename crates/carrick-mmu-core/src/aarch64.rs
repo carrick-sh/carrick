@@ -1530,6 +1530,10 @@ impl TerminalRule {
                 fork_arm: true,
                 adopt_private: true,
                 ..
+            } | Self::Pt {
+                op: Some(PtOp::ForkReadOnly),
+                adopt_private: true,
+                ..
             }
         )
     }
@@ -5501,6 +5505,12 @@ impl PageTableManager {
         if e0 & VALID == 0 || e0 & TYPE_BITS != child_type {
             return None;
         }
+        // EL1-private authority is defined per 4 KiB leaf. Even an offline
+        // graph must retain that shape: a uniform fork-COW table is not a
+        // coarse block that the guest COW resolver can authenticate.
+        if e0 & SW_EL1_PRIVATE != 0 {
+            return None;
+        }
         let base_pa = e0 & child_pa_mask;
         let parent_span = child_stride.checked_mul(512)?;
         if !base_pa.is_multiple_of(parent_span) {
@@ -6229,8 +6239,9 @@ impl PageTableManager {
     }
 
     /// [`Self::set_fork_readonly`], first adopting host-published writable
-    /// 4 KiB leaves as EL1-private so EL1 can resolve their COW itself (a
-    /// guest-lane MM's compound-granule, non-kernel ranges only).
+    /// leaves as EL1-private so EL1 can resolve their COW itself. Fully
+    /// covered host blocks are split to 4 KiB leaves, retaining that authority
+    /// in both the live parent and an offline child image.
     pub fn set_fork_readonly_adopting(
         &mut self,
         va: u64,
@@ -13641,6 +13652,58 @@ mod tests {
         let leaf = terminal_descriptor(ro.debug_walk(ro_va + PT_PAGE));
         assert_eq!(leaf & SW_EL1_PRIVATE, 0);
         let _ = (GuestCowClass::AlreadyWritable, GuestCowNotArmed::Unmapped);
+    }
+
+    /// Full host blocks occur in image/stack ranges. Both the live parent
+    /// and offline child must retain per-page fork authority after arming.
+    #[test]
+    fn adopting_fork_arm_splits_full_host_block_and_keeps_private_pages() {
+        const TWO_MIB: u64 = 1 << 21;
+        let va = LINUX_MMAP_BASE + 32 * TWO_MIB;
+        for offline_child in [false, true] {
+            let mut image = hvpatch_manager();
+            image.set_rw(va, TWO_MIB as usize, false, None).unwrap();
+            assert_eq!(image.debug_walk(va)[2] & TYPE_BITS, TYPE_BLOCK);
+            if offline_child {
+                image.declare_offline_private_image();
+            }
+            let tables_before = image.pool_stats().0;
+            image
+                .set_fork_readonly_adopting(va, TWO_MIB as usize, None)
+                .unwrap();
+            for page in 0..512 {
+                let leaf = terminal_descriptor(image.debug_walk(va + page * PT_PAGE));
+                assert!(
+                    descriptor_txn::guest_cow::is_guest_cow_write_leaf(3, leaf),
+                    "page {page}, offline={offline_child}: {leaf:#x}"
+                );
+                assert_eq!(
+                    image.debug_walk(va + page * PT_PAGE)[2] & TYPE_BITS,
+                    TYPE_TABLE_OR_PAGE,
+                    "COW must keep per-page authority"
+                );
+            }
+            assert_eq!(
+                image.pool_stats().0 - tables_before,
+                1,
+                "one L3 table for one fully covered host block"
+            );
+            image
+                .set_readonly(va + PT_PAGE, PT_PAGE as usize, false, None)
+                .unwrap();
+            image
+                .set_fork_readonly_adopting(va, TWO_MIB as usize, None)
+                .unwrap();
+            let protected = terminal_descriptor(image.debug_walk(va + PT_PAGE));
+            assert!(
+                !terminal_descriptor_may_write(protected),
+                "nested fork preserves denial"
+            );
+            let neighbor = terminal_descriptor(image.debug_walk(va));
+            assert!(descriptor_txn::guest_cow::is_guest_cow_write_leaf(
+                3, neighbor
+            ));
+        }
     }
 
     #[test]

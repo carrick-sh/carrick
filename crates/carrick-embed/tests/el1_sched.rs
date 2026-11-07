@@ -3891,6 +3891,80 @@ fn el1_metadata_allocator_host_wait_requires_unmasked_irq() {
     );
 }
 
+/// An image mapping's historical writable flag cannot authorize a store after
+/// mprotect. Exercise the actual EL0 fault both before fork and after a writable
+/// neighbor in the same compound has taken COW while the child remains alive.
+#[test]
+fn el1_owner_cow_preserves_host_image_readonly_protection() {
+    let _guard = common::guest_lock();
+    let carrier = carrier_or_fail();
+    for mode in ["cow-protected-image", "cow-protected-image-fork"] {
+        let measured = run_fixture(&carrier, &[mode], Duration::from_secs(40));
+        assert!(
+            measured
+                .result
+                .stdout_utf8()
+                .contains("cow-protected-image attempting denied store"),
+            "must reach the protected store: {}",
+            describe(&measured)
+        );
+        assert_eq!(
+            measured.result.signal,
+            Some(carrick_embed::Signal(libc::SIGSEGV)),
+            "mprotect must survive COW selection: {}",
+            describe(&measured)
+        );
+    }
+}
+
+/// Exercise the initial owner MM through the production permission-fault
+/// entry beyond two full 64-slot COW grant chains without intervening syscalls.
+#[test]
+fn el1_fork_cow_parent_replenishes_used_grants() {
+    let _guard = common::guest_lock();
+    let carrier = carrier_or_fail();
+    // Publish the carrier ledger before differencing this run.
+    run_fixture(&carrier, &["fork-cow", "1", "1"], Duration::from_secs(40));
+    let before = carrick_embed::host_cow_snapshot();
+    assert!(before.complete, "warm-up must publish the carrier ledger");
+    let pool_before = el1_cow_pool_counters();
+    let measured = run_fixture(&carrier, &["fork-cow-parent"], Duration::from_secs(40));
+    let cow = carrick_embed::host_cow_snapshot()
+        .checked_delta(&before)
+        .expect("same live carrier with complete COW observations");
+    let pool_after = el1_cow_pool_counters();
+    println!(
+        "fork-cow-parent grants={cow:?} pool_before={pool_before:?} pool_after={pool_after:?}"
+    );
+    assert!(measured.result.success(), "{}", describe(&measured));
+    assert!(
+        measured
+            .result
+            .stdout_utf8()
+            .contains("fork-cow-parent compounds=192 writers=2 child-isolated=true ok=true")
+    );
+    assert!(
+        cow.guest_lane_selected >= 2,
+        "parent and child use the owner lane: {cow:?}"
+    );
+    assert!(
+        cow.guest_cow_provisioned > 64,
+        "must refill beyond the full chain: {cow:?}"
+    );
+    assert!(
+        cow.guest_cow_settled >= 192,
+        "must settle consumed compounds: {cow:?}"
+    );
+    assert!(
+        pool_after.0 - pool_before.0 >= 192,
+        "EL1 must copy the compounds"
+    );
+    assert_eq!(
+        cow.host_cow_by_path[0], 0,
+        "carrier stage-fault COW must not mask failed grant recycling: {cow:?}"
+    );
+}
+
 /// Contract `kernel.el1.fork-cow`: fork COW resolution verification.
 /// Forks across three scales with private anonymous pages armed read-only for
 /// COW; four guest threads per process concurrently write them, taking write

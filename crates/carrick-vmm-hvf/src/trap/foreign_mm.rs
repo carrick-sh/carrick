@@ -1250,6 +1250,23 @@ impl MmAccessState {
             .map(|owner| owner.ptr())
     }
 
+    pub(crate) fn mm_root_stage2_host_ptr(
+        &self,
+        physical_ipa: u64,
+        physical_size: usize,
+    ) -> Option<*mut u8> {
+        let authority = self.mm_root_stage2.lock();
+        let authority = authority.as_ref()?;
+        let offset = physical_ipa.checked_sub(authority.physical_extent.0)?;
+        let end = offset.checked_add(physical_size as u64)?;
+        (end <= authority.physical_extent.1 as u64).then(|| {
+            // SAFETY: `offset..end` was checked against the exact retained
+            // structural owner extent above. The returned pointer remains
+            // covered by the authority guard held by this MM.
+            unsafe { authority.owner.ptr().add(offset as usize) }
+        })
+    }
+
     pub(crate) fn install_mm_root_stage2_authority(
         &self,
         root_slot: (u64, u64),

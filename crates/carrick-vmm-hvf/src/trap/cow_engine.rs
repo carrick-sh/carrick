@@ -3154,6 +3154,14 @@ impl HvfTaskState {
         const NON_GLOBAL: u64 = 1 << 11;
         let span_start = span.va & !(PAGE_SIZE - 1);
         let span_end = span.va.saturating_add(span.len as u64);
+        // Compute before taking the manager's edit lock: this authority
+        // distinguishes tagged owner leaves from ordinary host image leaves.
+        let guest_lane = self.page_tables_authority().live_descriptor_owner()
+            == carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest;
+        let writable_pages: std::collections::BTreeSet<_> = (span_start..span_end)
+            .step_by(PAGE_SIZE as usize)
+            .filter(|va| self.frame_cow_page_writable(*va, source_guest_writable, guest_lane))
+            .collect();
         let page_table_result = {
             let page_tables_authority = self.page_tables_authority();
             page_tables_authority.edit(
@@ -3191,7 +3199,7 @@ impl HvfTaskState {
                     HvfVmState::refresh_stage1_exclusivity(manager.manager);
                     let mut page_va = span_start;
                     while page_va < span_end {
-                        if source_guest_writable && !self.protections.legacy().is_none_or(|protections| protections.range_write_denied(page_va, 1))
+                        if writable_pages.contains(&page_va)
                         {
                             manager
                                 .set_writable_preserving_attributes(page_va, PAGE_SIZE as usize)
@@ -3236,8 +3244,7 @@ impl HvfTaskState {
                             )));
                         }
                         let leaf = live[3];
-                        let expected_ap = if source_guest_writable
-                            && !self.protections.legacy().is_none_or(|protections| protections.range_write_denied(page_va, 1))
+                        let expected_ap = if writable_pages.contains(&page_va)
                         {
                             AP_USER_RW
                         } else {
@@ -3343,26 +3350,30 @@ impl HvfTaskState {
         // Another vCPU of this MM may have won while we waited for topology.
         // Owner MMs authenticate the arm from their live descriptors. Host
         // MMs select one candidate without cloning the whole arm population.
-        let (span, armed_is_empty, armed_len) = if guest_lane {
-            (self.guest_private_cow_span(fault_va), true, 0)
-        } else {
+        let (host_candidate, armed_is_empty, armed_len) = {
             let cow_armed = self.cow_armed.lock();
-            let candidate = cow_armed.span_for(fault_va);
-            let empty = cow_armed.ranges.is_empty();
-            let len = cow_armed.ranges.len();
-            drop(cow_armed);
             (
-                candidate.map(|candidate| self.live_cow_span(candidate, fault_va)),
-                empty,
-                len,
+                cow_armed.span_for(fault_va),
+                cow_armed.ranges.is_empty(),
+                cow_armed.ranges.len(),
             )
+        };
+        // Owner COW requires the live fork marker and recorded current
+        // write intent. Retained host candidates still bound backing work,
+        // but never substitute for a later per-page permission restriction.
+        let span = if guest_lane {
+            self.guest_private_cow_span(fault_va)
+                .or_else(|| host_candidate.map(|candidate| self.live_cow_span(candidate, fault_va)))
+        } else {
+            host_candidate.map(|candidate| self.live_cow_span(candidate, fault_va))
         };
         let Some(span) = span else {
             let mapping = self.mapping_for_range_in(custody, fault_va, 1);
-            let write_denied = self
-                .protections
-                .legacy()
-                .is_none_or(|protections| protections.range_write_denied(fault_va, 1));
+            let write_denied = !self.frame_cow_page_writable(
+                fault_va,
+                mapping.is_some_and(|mapping| mapping.guest_writable),
+                guest_lane,
+            );
             let private_writable_mapping = mapping.is_some_and(|mapping| {
                 mapping.guest_writable && mapping.sharing == GuestMappingSharing::Private
             });
@@ -3438,9 +3449,7 @@ impl HvfTaskState {
             })?
             .guest_writable;
         if frame_cow_write_is_denied(
-            self.protections
-                .legacy()
-                .is_none_or(|protections| protections.range_write_denied(fault_va, 1)),
+            !self.frame_cow_page_writable(fault_va, source_guest_writable, guest_lane),
             source_guest_writable,
             intent,
         ) {
@@ -3621,10 +3630,7 @@ impl HvfTaskState {
                     carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
                 )
             })
-            .flatten()
-            .ok_or_else(|| {
-                TrapError::Hypervisor("HVPatch COW page-table backing is absent".to_owned())
-            })?;
+            .flatten();
         // Reuse grants write to the span's leaves without repointing them, so
         // every 4 KiB page of the span must already name the old frame at its
         // offset (a valid or retained-output leaf). A page with no output at
@@ -3638,6 +3644,9 @@ impl HvfTaskState {
             CowWriteRoute::Copy
         };
         if route == CowWriteRoute::ReuseSoleOwner {
+            let page_table_host = page_table_host.ok_or_else(|| {
+                TrapError::Hypervisor("HVPatch COW page-table backing is absent".to_owned())
+            })?;
             // The writer is the frame's only owner: no copy, no new frame, no
             // inventory or alias change; its leaves become writable in place.
             drop(old_source.take());
@@ -4007,6 +4016,18 @@ impl HvfTaskState {
         // cloning the whole 1.75 MiB table region (see `begin_undo`).
         let mut preserved_protection_receipt = None;
         let page_table_result = if let Some(backing) = guest_identity {
+            // Internal maintenance needs a host walk after publication. Admit
+            // its backing before publishing, while clean refusal can still
+            // roll back the prepared grant.
+            let protection_host = if frame_cow_preserves_guest_protection(intent) {
+                Some(page_table_host.ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "internal guest COW page-table backing is absent".to_owned(),
+                    )
+                })?)
+            } else {
+                None
+            };
             (|| -> Result<(), TrapError> {
                 use carrick_mmu_core::aarch64::descriptor_txn::CowRepointAccess;
                 let access = if span.kernel_only {
@@ -4014,11 +4035,11 @@ impl HvfTaskState {
                 } else {
                     let mut writable_pages = 0_u8;
                     for index in 0..(span.len as u64 / PAGE_SIZE) {
-                        if source_guest_writable
-                            && !self.protections.legacy().is_none_or(|protections| {
-                                protections.range_write_denied(span.va + index * PAGE_SIZE, 1)
-                            })
-                        {
+                        if self.frame_cow_page_writable(
+                            span.va + index * PAGE_SIZE,
+                            source_guest_writable,
+                            guest_lane,
+                        ) {
                             writable_pages |= 1 << index;
                         }
                     }
@@ -4062,7 +4083,7 @@ impl HvfTaskState {
                 // Maintenance can repoint a still-invalid page. Retain the
                 // same exact-leaf receipt consumed by the later protection
                 // publication, after authenticating EL1's completion.
-                if frame_cow_preserves_guest_protection(intent) {
+                if let Some(page_table_host) = protection_host {
                     let live = tables
                         .with_manager(|manager| {
                             let resolver =
@@ -4098,12 +4119,20 @@ impl HvfTaskState {
                 Ok(())
             })()
         } else {
+            let page_table_host = page_table_host.ok_or_else(|| {
+                TrapError::Hypervisor("HVPatch COW page-table backing is absent".to_owned())
+            })?;
             const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000;
             const AP_MASK: u64 = 0b11 << 6;
             const AP_USER_RW: u64 = 0b01 << 6;
             const VALID: u64 = 1;
             const TYPE_TABLE_OR_PAGE: u64 = 0b11;
             const NON_GLOBAL: u64 = 1 << 11;
+            let writable_pages: std::collections::BTreeSet<_> = ((span.va & !(PAGE_SIZE - 1))
+                ..span.va.saturating_add(span.len as u64))
+                .step_by(PAGE_SIZE as usize)
+                .filter(|va| self.frame_cow_page_writable(*va, source_guest_writable, guest_lane))
+                .collect();
             let page_tables_authority = self.page_tables_authority();
             page_tables_authority
                 .edit(
@@ -4169,7 +4198,8 @@ impl HvfTaskState {
                             let span_end = span.va.saturating_add(span.len as u64);
                             let mut page_va = span.va & !(PAGE_SIZE - 1);
                             while page_va < span_end {
-                                if source_guest_writable && !self.protections.legacy().is_none_or(|protections| protections.range_write_denied(page_va, 1)) {
+                                if writable_pages.contains(&page_va)
+                                {
                                     manager
                                         .set_writable_preserving_attributes(page_va, PAGE_SIZE as usize)
                                         .map_err(|error| {
@@ -4219,8 +4249,7 @@ impl HvfTaskState {
                             let page_is_valid = leaf & VALID != 0;
                             let expected_ap = if span.kernel_only {
                                 0
-                            } else if source_guest_writable
-                                && !self.protections.legacy().is_none_or(|protections| protections.range_write_denied(page_va, 1))
+                            } else if writable_pages.contains(&page_va)
                             {
                                 AP_USER_RW
                             } else {
@@ -4256,7 +4285,9 @@ impl HvfTaskState {
                 )
         };
         if let Err(error) = page_table_result {
-            if !guest_lane {
+            // The host edit arm admitted this backing before any edits.
+            // Guest-owned tables use their verified publication rollback.
+            if let Some(page_table_host) = page_table_host.filter(|_| !guest_lane) {
                 let _ = self.page_tables_authority().edit(
                     || Err(()),
                     |manager| {
@@ -7410,6 +7441,43 @@ impl HvfTaskState {
             .flatten()
     }
 
+    fn frame_cow_page_writable(
+        &self,
+        va: u64,
+        source_guest_writable: bool,
+        guest_lane: bool,
+    ) -> bool {
+        let owner_write_intent = guest_lane
+            .then(|| {
+                self.page_tables_authority().with_manager(|manager| {
+                    let leaf =
+                        carrick_mmu_core::aarch64::terminal_descriptor(manager.debug_walk(va));
+                    if carrick_mmu_core::aarch64::terminal_descriptor_is_fork_cow(leaf) {
+                        carrick_mmu_core::aarch64::terminal_descriptor_may_write(leaf)
+                    } else {
+                        // Without a fork marker, bit 57 is only a ceiling
+                        // on tagged leaves, and absent on host leaves. Live
+                        // AP permission supplies current write authority in
+                        // both cases, including after owner mprotect.
+                        carrick_mmu_core::aarch64::terminal_descriptor_permits_el0(
+                            leaf,
+                            carrick_mmu_core::aarch64::LeafAccess::Write,
+                        )
+                    }
+                })
+            })
+            .flatten();
+        let legacy_write_denied = self
+            .protections
+            .legacy()
+            .map(|protections| protections.range_write_denied(va, 1));
+        frame_cow_page_write_authority(
+            source_guest_writable,
+            owner_write_intent,
+            legacy_write_denied,
+        )
+    }
+
     pub(crate) fn translate_va_for_cow(&self, va: u64) -> Option<u64> {
         self.page_tables_authority()
             .with_manager(|m| m.translate(va))
@@ -8021,6 +8089,18 @@ pub(crate) fn frame_cow_write_is_denied(
 ) -> bool {
     intent == carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible
         && (protection_denied || !guest_writable)
+}
+
+pub(crate) fn frame_cow_page_write_authority(
+    source_guest_writable: bool,
+    owner_write_intent: Option<bool>,
+    legacy_write_denied: Option<bool>,
+) -> bool {
+    source_guest_writable
+        && match owner_write_intent {
+            Some(may_write) => may_write,
+            None => matches!(legacy_write_denied, Some(false)),
+        }
 }
 
 pub(crate) fn frame_cow_preserves_guest_protection(

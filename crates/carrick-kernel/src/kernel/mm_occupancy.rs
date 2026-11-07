@@ -887,6 +887,7 @@ impl carrick_thread::fork_quiesce::FenceMirror for SpaceGate {
 /// its retired shape). Raising the gate refuses new EL1 editors and waits for
 /// an admitted one; EL1 then forwards the fault or syscall to the host.
 pub struct El1EditorExclusion {
+    excluded: carrick_sched_core::ExcludedEditor<'static>,
     tables: SpaceTables,
     index: SpaceIndex,
     key: u64,
@@ -894,6 +895,13 @@ pub struct El1EditorExclusion {
     /// while it is held, engine code on this thread may store to the MM's
     /// live descriptors itself. Released before the gate is lowered.
     held: Option<carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion>,
+}
+
+impl El1EditorExclusion {
+    /// Borrow the exact proof for the lifetime of this gate guard.
+    pub fn excluded(&self) -> &carrick_sched_core::ExcludedEditor<'_> {
+        &self.excluded
+    }
 }
 
 impl std::fmt::Debug for El1EditorExclusion {
@@ -922,6 +930,15 @@ pub fn exclude_el1_editor(mm: MmId) -> Option<El1EditorExclusion> {
     )
 }
 
+/// Retain a settled exact-MM exclusion through the fault resolver's refill
+/// publication. Only then may guest EL1 retry. An unpublished MM has no guard.
+pub fn with_el1_editor_excluded<R>(
+    _exclusion: Option<El1EditorExclusion>,
+    resolve: impl FnOnce() -> R,
+) -> R {
+    resolve()
+}
+
 fn exclude_el1_editor_in(tables: SpaceTables, mm: MmId) -> Option<El1EditorExclusion> {
     let key = mm.raw();
     let index = tables.spaces.find(key)?;
@@ -931,6 +948,7 @@ fn exclude_el1_editor_in(tables: SpaceTables, mm: MmId) -> Option<El1EditorExclu
     settle_excluded(&tables, &excluded);
     let held = Some(carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion::register(&excluded));
     Some(El1EditorExclusion {
+        excluded,
         tables,
         index,
         key,

@@ -11787,6 +11787,20 @@ fn live_resolver_cached_retirement_and_extension_removal_fail_closed() {
         .state
         .install_structural_mapping_authority(Some(root_slot), Arc::clone(&root_owner))
         .expect("install root structural authority");
+    assert_eq!(
+        installed
+            .state
+            .mm_root_stage2_host_ptr(root, carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,),
+        Some(original_host),
+        "the MM-root authority must resolve its live table backing without a mapping row",
+    );
+    assert!(
+        installed
+            .state
+            .mm_root_stage2_host_ptr(root + root_slot.1, 1)
+            .is_none(),
+        "the MM-root authority must reject bytes beyond its exact extent",
+    );
     installed
         .state
         .frame_inventory
@@ -13667,8 +13681,116 @@ mod guest_cow {
     }
 }
 
+/// A host image row remains historically writable after owner mprotect.
+/// Neither an empty nor a retained fork range can turn that into write intent.
 #[test]
-fn sole_owner_cow_reuse_adopts_guest_published_live_leaves() {
+fn owner_fault_rejects_untagged_readonly_image_with_stale_mapping_permission() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let transport = CarrierForeignMmTransport::new();
+    let mut fixture = retained_reuse_fixture(
+        &transport,
+        791,
+        0x9a01_7a00_0000,
+        0x9b01_7a00_0000,
+        carrick_mmu_core::aarch64::LiveDescriptorOwner::Host,
+    );
+    let (_authority, _lease, _invalidator) = prepare_foreign_cow(&fixture.installed);
+    let tables = fixture.installed.state.page_tables_authority();
+    tables
+        .edit(
+            || panic!("fixture manager"),
+            |editor| {
+                editor.manager.set_rw(TEST_VA, OWNER_LEN, false, None)?;
+                editor.manager.set_readonly(TEST_VA, 4096, false, None)?;
+                let resolver = fixture
+                    .task
+                    .page_table_resolver(editor.base(), Some(fixture.root_host as *mut u8));
+                unsafe { editor.sync_to_host(resolver) }
+            },
+        )
+        .unwrap();
+    tables.select_live_descriptor_owner(carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest);
+    struct DeniedPublication;
+    impl carrick_aarch64::vmm::Stage1Services for DeniedPublication {
+        fn flush(&mut self) -> Result<(), TrapError> {
+            panic!("denied store must not flush")
+        }
+        fn guest_publication_available(&self) -> bool {
+            true
+        }
+        fn publish(
+            &mut self,
+            _: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        ) -> Result<
+            carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+            carrick_aarch64::vmm::GuestPublishError,
+        > {
+            panic!("denied store must not publish")
+        }
+    }
+    let arm_snapshot = fixture.task.cow_armed.lock().snapshot();
+    let walk = tables.with_manager(|m| m.debug_walk(TEST_VA)).unwrap();
+    let leaf_offset =
+        (walk[2] & 0x0000_ffff_ffff_f000) - fixture.root_key.0 + ((TEST_VA >> 12) & 511) * 8;
+    assert!(leaf_offset + 8 <= fixture.root_key.1);
+    for tagged_ceiling in [false, true] {
+        fixture.task.cow_armed.lock().restore(arm_snapshot.clone());
+        if tagged_ceiling {
+            // Model an owner-protected private resident after its COW arm was
+            // consumed: bit 57 is an allocation ceiling, not current intent.
+            // SAFETY: the fixture retains the live primary table owner.
+            unsafe {
+                let word = (fixture.root_host as *mut u8)
+                    .add(leaf_offset as usize)
+                    .cast::<u64>();
+                let leaf = word.read_volatile();
+                word.write_volatile((leaf | (1 << 56) | (1 << 57)) & !(1 << 55));
+            }
+        }
+        for retained_arm in [true, false] {
+            if !retained_arm {
+                fixture.task.cow_armed.lock().ranges.clear();
+            }
+            let before = live_table_words(&fixture);
+            let owners = owner_keys();
+            assert!(
+                fixture
+                    .task
+                    .mapping_for_range_in(&transport.custody, TEST_VA, 1)
+                    .unwrap()
+                    .guest_writable
+            );
+            let result = fixture.task.perform_frame_cow(
+                &transport.custody,
+                TEST_VA,
+                carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible,
+                super::super::cow_engine::tests::permission_fault_trigger(
+                    TEST_VA,
+                    fixture.root_key.0,
+                ),
+                &mut DeniedPublication,
+            );
+            assert!(
+                matches!(result, Ok(false)),
+                "protected fault must stay NotCow: {result:?}"
+            );
+            assert_eq!(
+                live_table_words(&fixture),
+                before,
+                "including writable neighbor"
+            );
+            assert_eq!(
+                owner_keys(),
+                owners,
+                "no backing allocated for denied store"
+            );
+        }
+    }
+}
+
+fn exercise_sole_owner_cow_reuse(guest_writable: bool) {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let _external = ExternalAliasStateRestore::capture();
     let _stub = ScopedStage2MapTestStub::enable();
@@ -13680,6 +13802,15 @@ fn sole_owner_cow_reuse_adopts_guest_published_live_leaves() {
         0x9b01_7900_0000,
         carrick_mmu_core::aarch64::LiveDescriptorOwner::Host,
     );
+    if guest_writable {
+        fixture
+            .installed
+            .state
+            .protections
+            .legacy()
+            .unwrap()
+            .set_unmapped(TEST_VA, OWNER_LEN, false);
+    }
     let tables = fixture.installed.state.page_tables_authority();
     tables.replace_manager(tables.snapshot_image());
     let walk = tables.with_manager(|m| m.debug_walk(TEST_VA)).unwrap();
@@ -13718,7 +13849,7 @@ fn sole_owner_cow_reuse_adopts_guest_published_live_leaves() {
             },
             0x9b01_7900_0000,
             fixture.root_host as *mut u8,
-            false,
+            guest_writable,
             &mut Flush,
         )
         .expect("reuse must adopt live leaves before authenticating its edit");
@@ -13729,8 +13860,18 @@ fn sole_owner_cow_reuse_adopts_guest_published_live_leaves() {
     );
     assert_eq!(
         tables.with_manager(|m| m.debug_walk(TEST_VA)[3] & (3 << 6)),
-        Some(3 << 6)
+        Some(if guest_writable { 1 << 6 } else { 3 << 6 })
     );
+}
+
+#[test]
+fn sole_owner_cow_reuse_adopts_guest_published_live_leaves() {
+    exercise_sole_owner_cow_reuse(false);
+}
+
+#[test]
+fn sole_owner_cow_reuse_restores_write_for_untagged_host_leaves() {
+    exercise_sole_owner_cow_reuse(true);
 }
 
 #[test]

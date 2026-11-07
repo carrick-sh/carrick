@@ -352,6 +352,10 @@ pub(super) enum HvpatchProductionPhase {
     ResumeRetainedOwner {
         action: Box<RetainedMemoryAction>,
     },
+    EnrollRetainedOwner {
+        action: Box<RetainedMemoryAction>,
+        wait: carrick_el1_abi::PortalOwnerWait,
+    },
     RetainedMemoryRetry {
         action: Box<RetainedMemoryAction>,
     },
@@ -392,6 +396,10 @@ pub(super) enum HvpatchProductionPhase {
 }
 
 pub(super) enum RetainedMemoryAction {
+    CoreCapture {
+        context: carrick_kernel::kernel::KernelContext,
+        terminal: PersistentTerminal,
+    },
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     ChildTid {
         context: carrick_kernel::kernel::KernelContext,
@@ -413,7 +421,10 @@ pub(super) enum RetainedMemoryAction {
 
 impl RetainedMemoryAction {
     fn is_drain_owner(&self) -> bool {
-        matches!(self, Self::ExecDrain { .. } | Self::ProcessFinish { .. })
+        matches!(
+            self,
+            Self::ExecDrain { .. } | Self::ProcessFinish { .. } | Self::CoreCapture { .. }
+        )
     }
 }
 
@@ -496,6 +507,7 @@ impl HvpatchProductionPhase {
     /// losing members without triggering the terminal-owner `carrick_fatal!`.
     pub(super) fn is_terminal_transition(&self) -> bool {
         if let Self::ResumeRetainedOwner { action }
+        | Self::EnrollRetainedOwner { action, .. }
         | Self::ResumeRetainedPhysical { action, .. }
         | Self::RetainedMemoryRetry { action } = self
         {
@@ -522,10 +534,12 @@ impl HvpatchProductionPhase {
             | Self::TerminalRetireRetry { .. }
             | Self::RetryThreadExit { .. } => true,
             Self::ResumeRetainedOwner { action }
+            | Self::EnrollRetainedOwner { action, .. }
             | Self::ResumeRetainedPhysical { action, .. }
             | Self::RetainedMemoryRetry { action } => matches!(
                 action.as_ref(),
                 RetainedMemoryAction::ProcessFinish { .. }
+                    | RetainedMemoryAction::CoreCapture { .. }
                     | RetainedMemoryAction::ThreadExit { .. }
             ),
             _ => false,
@@ -561,6 +575,7 @@ impl HvpatchProductionPhase {
             Self::RetainedMemoryRetry { .. } => 21,
             Self::ResumeFaultPhysical { .. } => 22,
             Self::ResumeFaultOwner { .. } => 23,
+            Self::EnrollRetainedOwner { .. } => 24,
         }
     }
 }
@@ -1531,6 +1546,11 @@ where
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
         action: RetainedMemoryAction,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        if let RetainedMemoryAction::CoreCapture { context, terminal } = action {
+            return Ok(
+                self.begin_persistent_process_terminal_with_claim(engine, terminal, context, None)
+            );
+        }
         if let RetainedMemoryAction::ThreadExit { code } = action {
             return self.drive_thread_exit(engine, control, code);
         }
@@ -1592,6 +1612,12 @@ where
         let saved = match action.as_ref() {
             RetainedMemoryAction::ExecDrain { context, .. }
             | RetainedMemoryAction::ProcessFinish { context, .. } => context,
+            RetainedMemoryAction::CoreCapture { .. } => {
+                return Err(RuntimeError::Configuration(
+                    "core capture reached child-TID drain".to_owned(),
+                )
+                .into());
+            }
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             RetainedMemoryAction::ChildTid { .. } => unreachable!("child TID handled before drain"),
             RetainedMemoryAction::ThreadExit { .. } => {
@@ -1659,6 +1685,7 @@ where
                     }
                     other => other,
                 }),
+            RetainedMemoryAction::CoreCapture { .. } => unreachable!("handled before drain"),
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             RetainedMemoryAction::ChildTid { .. } => unreachable!("child TID handled before drain"),
             RetainedMemoryAction::ThreadExit { .. } => Err(RuntimeError::Configuration(
@@ -1903,7 +1930,7 @@ where
                     "claim persistent process terminal owner failed: {failure}"
                 );
             });
-        self.begin_persistent_process_terminal_with_claim(engine, terminal, context, receipt)
+        self.begin_persistent_process_terminal_with_claim(engine, terminal, context, Some(receipt))
     }
 
     fn begin_persistent_process_terminal_from_exec(
@@ -1933,7 +1960,7 @@ where
         if receipt.claim == ProcessExitClaim::Owner {
             self.kernel.begin_process_exit();
         }
-        self.begin_persistent_process_terminal_with_claim(engine, terminal, context, receipt)
+        self.begin_persistent_process_terminal_with_claim(engine, terminal, context, Some(receipt))
     }
 
     fn begin_persistent_process_terminal_with_claim(
@@ -1941,67 +1968,71 @@ where
         engine: &mut E,
         terminal: PersistentTerminal,
         context: carrick_kernel::kernel::KernelContext,
-        receipt: ProcessExitClaimReceipt,
+        new_claim: Option<ProcessExitClaimReceipt>,
     ) -> executor::ExecutorExit {
-        match receipt.claim {
-            ProcessExitClaim::LostToExec | ProcessExitClaim::AlreadyOwned => {
-                self.state.trace_hvpatch_thread_terminal(
+        // A retained CoreCapture action already owns the terminal claim. It
+        // resumes here without claiming or arming terminal settlement again.
+        if let Some(receipt) = new_claim {
+            match receipt.claim {
+                ProcessExitClaim::LostToExec | ProcessExitClaim::AlreadyOwned => {
+                    self.state.trace_hvpatch_thread_terminal(
                     carrick_observability::probes::HvpatchThreadTerminalReason::ProcessTerminalLoser,
                     2,
                 );
-                if self.terminal_runtime == PersistentTerminalRuntimeState::Resident {
-                    if let Err(error) = self.state.capture_child_tid_clear() {
-                        return self.finish(Err(error));
+                    if self.terminal_runtime == PersistentTerminalRuntimeState::Resident {
+                        if let Err(error) = self.state.capture_child_tid_clear() {
+                            return self.finish(Err(error));
+                        }
+                        if !self.state.thread_exit_withdrawn {
+                            let _ = self
+                                .state
+                                .withdraw_persistent_terminal_owner_runtime(&self.kernel);
+                            self.state.thread_exit_withdrawn = true;
+                        }
+                        self.terminal_runtime = PersistentTerminalRuntimeState::Withdrawn;
                     }
-                    if !self.state.thread_exit_withdrawn {
-                        let _ = self
-                            .state
-                            .withdraw_persistent_terminal_owner_runtime(&self.kernel);
-                        self.state.thread_exit_withdrawn = true;
-                    }
-                    self.terminal_runtime = PersistentTerminalRuntimeState::Withdrawn;
+                    self.state.handoff_child_tid_clear();
+                    return self.finish(Ok(VcpuLoopOutcome::ThreadDone));
                 }
-                self.state.handoff_child_tid_clear();
-                return self.finish(Ok(VcpuLoopOutcome::ThreadDone));
-            }
-            ProcessExitClaim::Pending => {
-                tracing::info!(tid = ?self.state.this_tid, "process-terminal claim PENDING parks");
-                let scheduler = self
+                ProcessExitClaim::Pending => {
+                    tracing::info!(tid = ?self.state.this_tid, "process-terminal claim PENDING parks");
+                    let scheduler = self
                     .kernel
                     .hvpatch_runtime
                     .as_ref()
                     .unwrap_or_else(|| carrick_fatal!("kernel::runtime_binding", "A pending terminal claim cannot subscribe its exact thread without the Kernel HVPatch runtime"))
                     .continuation_services(context.kernel())
                     .0;
-                let thread = context.thread().key();
-                let subscription = self.kernel.clone_admission.subscribe_change(
-                    receipt.change_epoch,
-                    Arc::new(move || {
-                        let _ = scheduler.wake(thread);
-                    }),
-                );
-                self.phase = HvpatchProductionPhase::TerminalClaimRetry {
-                    terminal,
-                    context,
-                    _subscription: subscription,
-                };
-                return self.suspend(
-                    HvpatchLoopSuspension::TerminalSiblingDrain,
-                    executor::ExecutorExit::Blocked(
-                        carrick_kernel::kernel::objects::BlockedReason::ChildState,
-                    ),
-                );
-            }
-            ProcessExitClaim::Owner => {
-                self.terminal_settlement
-                    .arm_process_owner()
-                    .unwrap_or_else(|failure| {
-                        tracing::error!(%failure, "arm persistent terminal result owner");
-                        carrick_fatal!(
-                            "kernel::terminal_settlement",
-                            "arm persistent terminal result owner failed: {failure}"
-                        );
-                    });
+                    let thread = context.thread().key();
+                    let subscription = self.kernel.clone_admission.subscribe_change(
+                        receipt.change_epoch,
+                        Arc::new(move || {
+                            let _ = scheduler.wake(thread);
+                        }),
+                    );
+                    self.phase = HvpatchProductionPhase::TerminalClaimRetry {
+                        terminal,
+                        context,
+                        _subscription: subscription,
+                    };
+                    return self.suspend(
+                        HvpatchLoopSuspension::TerminalSiblingDrain,
+                        executor::ExecutorExit::Blocked(
+                            carrick_kernel::kernel::objects::BlockedReason::ChildState,
+                        ),
+                    );
+                }
+                ProcessExitClaim::Owner => {
+                    self.terminal_settlement
+                        .arm_process_owner()
+                        .unwrap_or_else(|failure| {
+                            tracing::error!(%failure, "arm persistent terminal result owner");
+                            carrick_fatal!(
+                                "kernel::terminal_settlement",
+                                "arm persistent terminal result owner failed: {failure}"
+                            );
+                        });
+                }
             }
         }
         let mut terminal = terminal;
@@ -2024,17 +2055,31 @@ where
                 self.state.linux_tid,
                 terminating_signal,
             ) {
-                *prepared_core =
-                    match self
-                        .state
-                        .capture_core_for_publication(&self.kernel, engine, fatal)
-                    {
-                        Ok(p) => p.map(Box::new),
-                        Err(error) => {
-                            tracing::warn!(%error, "capture core for publication");
-                            None
-                        }
-                    };
+                match self
+                    .state
+                    .capture_core_for_publication(&self.kernel, engine, fatal)
+                {
+                    Ok(Ok(publication)) => {
+                        *prepared_core = publication;
+                    }
+                    Ok(Err(wait)) => {
+                        self.phase = HvpatchProductionPhase::EnrollRetainedOwner {
+                            action: Box::new(RetainedMemoryAction::CoreCapture {
+                                context,
+                                terminal,
+                            }),
+                            wait,
+                        };
+                        return self.suspend(
+                            HvpatchLoopSuspension::BlockedContinuation,
+                            executor::ExecutorExit::Yielded,
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "capture core for publication");
+                        *prepared_core = None;
+                    }
+                }
             }
         }
         if let Err(error) = self.state.capture_child_tid_clear() {
@@ -5061,6 +5106,10 @@ where
                     self.state.thread_exit_retry_subscription = None;
                     return self.drive_retained_memory(engine, control, *action);
                 }
+                HvpatchProductionPhase::EnrollRetainedOwner { action, wait } => {
+                    self.phase = HvpatchProductionPhase::RetainedMemoryRetry { action };
+                    return self.park_retained_memory_owner(engine, control, wait);
+                }
                 HvpatchProductionPhase::ResumeRetainedOwner { action } => {
                     self.phase = HvpatchProductionPhase::RetainedMemoryRetry { action };
                     let result = self.consume_owner_zone(control)?;
@@ -5502,10 +5551,29 @@ where
                 // descriptor pair immediately before its typed trigger. Do not
                 // duplicate that pair here: the structural consumer joins and
                 // consumes one sequence per attempted fault.
+                // EL1 forwards an armed write when its grant chain is full
+                // of USED completions. Reclaim those records through the
+                // neutral MM owner before asking the engine to refill; a
+                // full chain must not become a write denial in host COW.
+                let context = self
+                    .kernel
+                    .dispatcher
+                    .capture_kernel_context(self.state.linux_tid)
+                    .map_err(|error| {
+                        RuntimeError::Configuration(format!(
+                            "COW fault lost exact task context: {error}"
+                        ))
+                    })?;
+                let resolution = carrick_kernel::kernel::mm_occupancy::with_el1_editor_excluded(
+                    carrick_kernel::kernel::mm_occupancy::exclude_el1_editor(
+                        context.shared().mm().id(),
+                    ),
+                    || engine.resolve_frame_cow_fault(syndrome, far),
+                )?;
                 if let carrick_hal::CowFaultResolution::Resolved {
                     translation,
                     arm_generation,
-                } = engine.resolve_frame_cow_fault(syndrome, far)?
+                } = resolution
                 {
                     self.state
                         .note_cow_resolution(far, syndrome, translation, arm_generation)?;
@@ -5530,10 +5598,29 @@ where
                 ..
             }) => {
                 let fault_access = signal::el0_fault_access(syndrome);
+                // EL1 forwards an armed write when its grant chain is full
+                // of USED completions. Reclaim those records through the
+                // neutral MM owner before asking the engine to refill; a
+                // full chain must not become a write denial in host COW.
+                let context = self
+                    .kernel
+                    .dispatcher
+                    .capture_kernel_context(self.state.linux_tid)
+                    .map_err(|error| {
+                        RuntimeError::Configuration(format!(
+                            "COW fault lost exact task context: {error}"
+                        ))
+                    })?;
+                let resolution = carrick_kernel::kernel::mm_occupancy::with_el1_editor_excluded(
+                    carrick_kernel::kernel::mm_occupancy::exclude_el1_editor(
+                        context.shared().mm().id(),
+                    ),
+                    || engine.resolve_frame_cow_fault(syndrome, far),
+                )?;
                 if let carrick_hal::CowFaultResolution::Resolved {
                     translation,
                     arm_generation,
-                } = engine.resolve_frame_cow_fault(syndrome, far)?
+                } = resolution
                 {
                     if let Some(mm_key) = self.state.zone_mm {
                         signal::cancel_frame_grant_request(

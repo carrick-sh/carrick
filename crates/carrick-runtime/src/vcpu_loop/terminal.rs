@@ -599,11 +599,12 @@ pub(crate) fn core_note_resume_pair(
 /// genuine guest `svc`+4 address is the patched branch, so the shape check fails.
 pub(crate) fn guest_visible_resume_pc<E: carrick_hal::ThreadedEngine>(
     engine: &E,
+    excluded: Option<&carrick_sched_core::ExcludedEditor<'_>>,
     resume_pc: u64,
 ) -> u64 {
     (|| {
         let start = resume_pc.checked_sub(4)?;
-        let bytes = engine.read_core_bytes(start, 8).ok()?;
+        let bytes = engine.read_core_bytes(excluded, start, 8).ok()?;
         let svc = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?);
         let return_branch = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?);
         carrick_hal::aarch64::decode_hvpatch_island_origin(resume_pc, svc, return_branch)?
@@ -838,7 +839,7 @@ mod tests {
             .insert(ISLAND_RETURN_BRANCH - 4, island_bytes);
 
         assert_eq!(
-            guest_visible_resume_pc(&engine, ISLAND_RETURN_BRANCH),
+            guest_visible_resume_pc(&engine, None, ISLAND_RETURN_BRANCH),
             EXPECTED_RESUME_PC,
             "an island's return-branch address must translate back to svc+4"
         );
@@ -856,7 +857,7 @@ mod tests {
         // `read_bytes_raw` answers zero-filled bytes, which is not the
         // `svc #0`/`B` shape.
         let live_pc = 0x210300_u64;
-        assert_eq!(guest_visible_resume_pc(&engine, live_pc), live_pc);
+        assert_eq!(guest_visible_resume_pc(&engine, None, live_pc), live_pc);
     }
 
     #[test]

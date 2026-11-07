@@ -4,6 +4,16 @@
 
 use std::path::Path;
 
+/// Only construct fault metadata; witnesses below drive the product resolver.
+pub(crate) fn permission_fault_trigger(va: u64, root: u64) -> super::FrameCowTrigger {
+    super::FrameCowTrigger {
+        class: carrick_observability::probes::HvpatchFrameCowTriggerClass::Stage1PermissionFault,
+        syndrome: (0x24 << 26) | (1 << 6) | 0xf,
+        far: va,
+        ttbr0: root,
+    }
+}
+
 #[test]
 fn host_cow_accounting_is_mm_scoped_and_survives_retirement() {
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();

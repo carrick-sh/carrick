@@ -5,6 +5,12 @@
 
 use super::*;
 
+// Reuse the owner protocol's authenticated dependency. The outer Result
+// reports capture failures; this result either completes an unpublished
+// snapshot or transfers its exact release observation to the scheduler.
+pub(crate) type CoreCaptureAttempt =
+    Result<Option<Box<PreparedCorePublication>>, carrick_el1_abi::PortalOwnerWait>;
+
 pub(crate) struct PreparedCorePublication {
     pub(crate) snapshot: carrick_kernel::dispatch::CoreProcessSnapshot,
     pub(crate) payload: carrick_kernel::core_dump::CorePayload,
@@ -213,15 +219,15 @@ where
     }
 
     pub(crate) fn capture_core_for_publication(
-        &self,
+        &mut self,
         kernel: &Kernel,
         engine: &mut E,
         fatal: FatalSignalRecord,
-    ) -> Result<Option<PreparedCorePublication>, RuntimeError> {
+    ) -> Result<CoreCaptureAttempt, RuntimeError> {
         // Linux default actions that carry a core. Other fatal signals still
         // publish a signal wait status, but never set WCOREDUMP.
         if !matches!(fatal.signo, 3 | 4 | 5 | 6 | 7 | 8 | 11 | 24 | 25 | 31) {
-            return Ok(None);
+            return Ok(Ok(None));
         }
         let context = kernel
             .dispatcher
@@ -348,6 +354,24 @@ where
                         "core capture could not pause its address space: {error:?}"
                     ))
                 })?;
+            // `pause_current_mm_for_capture` freezes every executor of this MM
+            // and raises its published EL1 gate. Register the matching editor
+            // exclusion on this thread as well: core reads are host-owned
+            // snapshot work, so routing them back through the owner portal
+            // would try to reacquire our own Gate. AddressSpaces gates are
+            // counted; this nested guard lowers before `_snapshot_pause` and
+            // therefore cannot reopen the MM early.
+            // No published address-space entry means guest EL1 cannot edit
+            // this MM, so there is no editor to exclude. The exact-MM pause
+            // above still freezes host executors, and an owner read may retain
+            // its continuation on an independent Gate until that owner
+            // releases. When the MM is published, retaining this optional
+            // guard registers the typed exclusion witness the HVPatch backing
+            // reader requires.
+            let snapshot_exclusion = carrick_kernel::kernel::mm_occupancy::exclude_el1_editor(
+                context.shared().mm().id(),
+            );
+            let excluded = snapshot_exclusion.as_ref().map(|guard| guard.excluded());
             lifecycle(1, 0);
 
             engine.prepare_core_snapshot().map_err(|error| {
@@ -369,7 +393,7 @@ where
                     ))
                 })?;
             if !process.dumpable || process.rlimit_core == 0 {
-                return Ok(None);
+                return Ok(Ok(None));
             }
 
             if ::std::env::var_os("CARRICK_CORE_FAILPOINT")
@@ -448,7 +472,8 @@ where
                                 // CopyIn on every blocking park, and for a
                                 // thread EL1 itself parked mid-syscall; see
                                 // `guest_visible_resume_pc`'s doc comment).
-                                let resume_pc = guest_visible_resume_pc(engine, resume_pc);
+                                let resume_pc =
+                                    guest_visible_resume_pc(engine, excluded, resume_pc);
                                 gregs[32] = resume_pc;
                                 gregs[33] = carrick_hal::el0_visible_pstate(resume_pstate);
                                 Ok(carrick_kernel::core_dump::ThreadState {
@@ -704,12 +729,45 @@ where
                         // continue scanning past them to later nonzero data.
                         let to_read = (sub_len - consumed).min(64 * 1024);
                         let address = sub_start + consumed as u64;
-                        let bytes = engine.read_core_bytes(address, to_read).map_err(|error| {
-                            RuntimeError::Trap(TrapError::Hypervisor(format!(
-                                "read core region {address:#x}..{:#x}: {error}",
-                                address.saturating_add(to_read as u64)
-                            )))
-                        })?;
+                        let read = engine.read_core_bytes(excluded, address, to_read);
+                        let bytes = match read {
+                            Ok(bytes) => bytes,
+                            Err(carrick_guest_mem::MemoryError::ReadSuspended(suspension)) => {
+                                let carrick_guest_mem::MemoryReadSuspension {
+                                    wait,
+                                    continuation: _,
+                                } = *suspension;
+                                let carrick_guest_mem::MemoryReadWait::Owner(wait) = wait else {
+                                    return Err(RuntimeError::Trap(TrapError::Hypervisor(
+                                        format!(
+                                            "read core region {address:#x}..{:#x}: retained core read requires unsupported wait {wait:?}",
+                                            address.saturating_add(to_read as u64)
+                                        ),
+                                    )));
+                                };
+                                if excluded
+                                    .is_some_and(|proof| proof.key() == wait.handle().mm().raw())
+                                    && wait.cause() == carrick_el1_abi::PortalWaitCause::Gate
+                                {
+                                    return Err(RuntimeError::Configuration(
+                                        "core owner read waited on capture's own excluded gate"
+                                            .into(),
+                                    ));
+                                }
+                                // The pause and exclusion end before waiting. Discard
+                                // this unpublished snapshot, including partial bytes:
+                                // a sibling may change memory while the owner wakes.
+                                // The next attempt captures registers, maps and every
+                                // extent together under a fresh exclusion.
+                                return Ok(Err(wait));
+                            }
+                            Err(error) => {
+                                return Err(RuntimeError::Trap(TrapError::Hypervisor(format!(
+                                    "read core region {address:#x}..{:#x}: {error}",
+                                    address.saturating_add(to_read as u64)
+                                ))));
+                            }
+                        };
                         // Bulk preparation is not guest residency. Zero-filled
                         // pages can be holes without omitting host-written data.
                         for run in carrick_kernel::dispatch::mem::core_data_runs(&bytes) {
@@ -757,16 +815,25 @@ where
             );
             crate::probes::hvpatch_core_hash(generation.get(), hash_words);
             lifecycle(3, 0);
-            Ok(Some(PreparedCorePublication {
+            Ok(Ok(Some(Box::new(PreparedCorePublication {
                 snapshot: process,
                 payload,
                 generation: generation.get(),
                 fatal_tid: fatal.tid.raw(),
                 publication: None,
-            }))
+            }))))
         })();
-        if result.is_err() || matches!(&result, Ok(None)) {
-            lifecycle(6, if result.is_err() { 1 } else { 2 });
+        if result.is_err() || matches!(&result, Ok(Ok(None) | Err(_))) {
+            lifecycle(
+                6,
+                if result.is_err() {
+                    1
+                } else if matches!(&result, Ok(Ok(None))) {
+                    2
+                } else {
+                    3
+                },
+            );
         }
         finish_crash_collection(authority, barrier, quiesced, lease_drain_guard, result)
     }
@@ -1317,9 +1384,9 @@ mod tests {
             },
         );
 
-        let prepared = result
-            .expect("capture core must succeed")
-            .expect("fatal signal must yield prepared publication");
+        let Ok(Some(prepared)) = result.expect("capture core must succeed") else {
+            panic!("fatal signal must yield prepared publication");
+        };
 
         // 1. Verify read_core_bytes was called ONLY for the 3 touched pages (total 12 KiB)
         let reads = tracker.lock().clone();
@@ -1489,6 +1556,313 @@ mod tests {
         assert!(
             result.is_err(),
             "engine read error during core capture must fail closed"
+        );
+    }
+
+    #[test]
+    fn core_read_uses_capture_exclusion_without_reentering_its_gate() {
+        use carrick_el1_abi::PortalWaitCause;
+        use carrick_el1_linux::mm_portal::{
+            MmPortal,
+            test_support::{ROOT, Region, admit_notified, nodes},
+        };
+        let region = Region::new();
+        let zone = region.zone();
+        let mm = admit_notified(&region, 1733, ROOT, 1, 0);
+        let view = nodes(&region);
+        let portal = MmPortal::new(
+            std::num::NonZeroU64::new(1733).unwrap(),
+            region.table(),
+            &zone.spaces,
+            &view,
+        )
+        .with_zone(zone)
+        .unwrap();
+        let handle = portal.admitted_handle(mm, 0).unwrap();
+        let index = zone.spaces.find(mm.raw()).unwrap();
+        {
+            let excluded = zone.spaces.raise_and_wait_for_editor(index, || {});
+            let wait = portal
+                .observe_wait(handle, PortalWaitCause::Gate)
+                .unwrap()
+                .unwrap();
+            let address = 0x2000;
+            let engine = CrashCaptureTestEngine {
+                guest_memory: [(address, vec![0x5a; 4096])].into(),
+                capture_owns_gate: true,
+                copyout_owner_probe: Some(super::super::tests::CopyoutOwnerProbe {
+                    wait,
+                    zone: zone as *const _ as usize,
+                }),
+                ..CrashCaptureTestEngine::default()
+            };
+            assert!(matches!(
+                carrick_guest_mem::GuestMemory::read_bytes_raw(&engine, address, 4096),
+                Err(carrick_guest_mem::MemoryError::ReadSuspended(_))
+            ));
+            // The core read must complete without lowering the very gate that
+            // authenticates its stable memory snapshot.
+            assert_eq!(
+                engine
+                    .read_core_bytes(Some(&excluded), address, 4096)
+                    .unwrap(),
+                vec![0x5a; 4096]
+            );
+            assert!(
+                portal
+                    .observe_wait(handle, PortalWaitCause::Gate)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        carrick_el1_linux::sched::object_wait::space_access(
+            zone,
+            carrick_sched_core::SlotId::new(1),
+        )
+        .lower(index);
+    }
+
+    #[test]
+    fn capture_core_gate_busy_once_then_reads_after_owner_release() {
+        capture_core_owner_gate(false);
+    }
+
+    #[test]
+    fn capture_core_reads_through_its_own_pause_gate() {
+        capture_core_owner_gate(true);
+    }
+
+    fn capture_core_owner_gate(own_gate: bool) {
+        use carrick_el1_abi::PortalWaitCause;
+        use carrick_el1_linux::mm_portal::{
+            MmPortal,
+            test_support::{ROOT, Region, admit_notified, nodes},
+        };
+        use std::num::NonZeroU64;
+
+        let (process, root) = crate::hvpatch::process_context_for_tests(70_272);
+        let plan = carrick_kernel::kernel::ClonePlan::from_flags(
+            carrick_abi::LinuxCloneFlags::THREAD
+                | carrick_abi::LinuxCloneFlags::SIGHAND
+                | carrick_abi::LinuxCloneFlags::VM,
+        )
+        .expect("thread clone plan");
+        let worker = process
+            .kernel_graph()
+            .reserve_thread_clone(&root, plan, None)
+            .expect("reserve crash worker")
+            .prepare(ThreadId::synthetic_for_tests(70_273))
+            .expect("prepare crash worker")
+            .commit()
+            .expect("publish crash worker")
+            .start_thread()
+            .expect("start crash worker")
+            .into_context();
+        let dispatcher = SyscallDispatcher::new();
+        let mut auxv_bytes = Vec::new();
+        auxv_bytes.extend_from_slice(&6_u64.to_le_bytes());
+        auxv_bytes.extend_from_slice(&4096_u64.to_le_bytes());
+        auxv_bytes.extend_from_slice(&0_u64.to_le_bytes());
+        auxv_bytes.extend_from_slice(&0_u64.to_le_bytes());
+        dispatcher.set_auxv_image(auxv_bytes);
+        dispatcher.bind_hvpatch_process(Arc::new(process.clone()));
+        let kernel = Arc::new(KernelState::new(
+            dispatcher,
+            Arc::new(EndpointTestSignalPump),
+            Arc::new(EndpointTestSignalArrival),
+            Some(process.clone()),
+            None,
+        ));
+        let barrier = kernel.process_fork_barrier.clone().expect("crash barrier");
+        let authority = kernel.crash_capture.clone().expect("crash authority");
+        let owner = ThreadId::synthetic_for_tests(70_273);
+        let owner_in_guest = carrick_hal::InGuestFlag::for_guest_thread();
+        let kicker = Arc::new(carrick_hal::GenericVcpuRegistry::new());
+        register_crash_test_vcpu(kicker.as_ref(), owner, &owner_in_guest);
+        let kicker: Arc<dyn VcpuRegistry> = kicker;
+        let platform: Arc<dyn PlatformFutex> = Arc::new(NoopPlatformFutex);
+        let platform_factory: PlatformFutexFactory = Arc::new(|_| Arc::new(NoopPlatformFutex));
+        let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+            Arc::new(ThreadRegistry::new(owner)),
+            Arc::new(FutexTable::new()),
+            platform,
+            platform_factory,
+            Some(Arc::clone(&barrier)),
+            Some(Arc::clone(&authority)),
+            Some(Arc::clone(worker.thread())),
+            Some(process.pid()),
+            worker.thread().key().tid,
+            kernel.fatal_signal.current_generation(),
+            owner,
+            Arc::new(Mutex::new(Vec::new())),
+            kicker,
+            owner_in_guest,
+            1_000,
+        );
+        state.service_kernel_context = Some(worker.retain_exact());
+
+        let prefix_addr = 0x0000_1000_0000_0000_u64;
+        let target_addr = prefix_addr + 0x2000;
+        let target_len = 4096_usize;
+        let deferred = kernel
+            .dispatcher
+            .deferred_anonymous_state(root.task().shared().mm().id())
+            .expect("deferred anonymous state");
+        deferred
+            .reserve_fresh(carrick_guest_mem::GuestVa::new(prefix_addr), target_len)
+            .expect("reserve prefix VMA");
+        deferred
+            .begin_materialization(carrick_guest_mem::GuestVa::new(prefix_addr), target_len)
+            .expect("materialize prefix")
+            .commit();
+        deferred
+            .reserve_fresh(carrick_guest_mem::GuestVa::new(target_addr), target_len)
+            .expect("reserve VMA");
+        deferred
+            .begin_materialization(carrick_guest_mem::GuestVa::new(target_addr), target_len)
+            .expect("materialize")
+            .commit();
+        for address in [prefix_addr, target_addr] {
+            kernel.dispatcher.record_dynamic_mapping(
+                address,
+                target_len as u64,
+                carrick_abi::LinuxProtFlags::READ | carrick_abi::LinuxProtFlags::WRITE,
+                carrick_vfs::ProcMapSharing::Private,
+                String::new(),
+            );
+        }
+
+        let region = Box::leak(Box::new(Region::new()));
+        let zone = region.zone();
+        let mm = admit_notified(region, root.shared().mm().id().raw(), ROOT, 1, 0);
+        let view = nodes(region);
+        let portal = MmPortal::new(
+            NonZeroU64::new(1_733).unwrap(),
+            region.table(),
+            &zone.spaces,
+            &view,
+        )
+        .with_zone(zone)
+        .unwrap();
+        let handle = portal.admitted_handle(mm, 0).unwrap();
+        let index = zone.spaces.find(mm.raw()).unwrap();
+        zone.spaces.raise(index);
+        let wait = portal
+            .observe_wait(handle, PortalWaitCause::Gate)
+            .unwrap()
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(0);
+        let tracker = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = CrashCaptureTestEngine {
+            guest_memory: [
+                (prefix_addr, vec![0xa5; target_len]),
+                (target_addr, vec![0x5a; target_len]),
+            ]
+            .into(),
+            read_tracker: Some(Arc::clone(&tracker)),
+            read_refusal_tx: (!own_gate).then_some(tx),
+            capture_owns_gate: own_gate,
+            owner_read_refusal_at: (!own_gate).then_some(target_addr),
+            copyout_owner_probe: Some(super::super::tests::CopyoutOwnerProbe {
+                wait,
+                zone: zone as *const _ as usize,
+            }),
+            ..CrashCaptureTestEngine::default()
+        };
+
+        if own_gate {
+            // Release this setup gate. Only capture itself raises the gate
+            // seen by its raw owner read; no independent producer can wake it.
+            carrick_el1_linux::sched::object_wait::space_access(
+                zone,
+                carrick_sched_core::SlotId::new(1),
+            )
+            .lower(index);
+            let prepared = carrick_kernel::el1_zone::with_test_zone(zone, || {
+                state.capture_core_for_publication(
+                    &kernel,
+                    &mut engine,
+                    FatalSignalRecord {
+                        image_generation: kernel.fatal_signal.current_generation(),
+                        tid: worker.thread().key().tid,
+                        signo: 11,
+                        code: 1,
+                        addr: target_addr,
+                    },
+                )
+            })
+            .expect("capture must read through its own exclusion");
+            let Ok(Some(prepared)) = prepared else {
+                panic!("capture's own gate cannot become a retained wait");
+            };
+            assert_eq!(prepared.payload.extents.len(), 2);
+            assert_eq!(prepared.payload.extents[0].bytes, vec![0xa5; target_len]);
+            assert_eq!(prepared.payload.extents[1].bytes, vec![0x5a; target_len]);
+            assert_eq!(zone.spaces.gate(index), 0, "capture releases its gate");
+            assert_eq!(
+                tracker.lock().as_slice(),
+                &[(prefix_addr, target_len), (target_addr, target_len)]
+            );
+            return;
+        }
+
+        std::thread::scope(|scope| {
+            let release = scope.spawn(move || {
+                rx.recv_timeout(Duration::from_secs(5))
+                    .expect("core read must observe the closed owner gate");
+                carrick_el1_linux::sched::object_wait::space_access(
+                    zone,
+                    carrick_sched_core::SlotId::new(1),
+                )
+                .lower(index);
+            });
+            let first = state
+                .capture_core_for_publication(
+                    &kernel,
+                    &mut engine,
+                    FatalSignalRecord {
+                        image_generation: kernel.fatal_signal.current_generation(),
+                        tid: worker.thread().key().tid,
+                        signo: 11,
+                        code: 1,
+                        addr: target_addr,
+                    },
+                )
+                .expect("owner Gate is a retained core-capture wait");
+            assert!(matches!(first, Err(actual) if actual == wait));
+            release.join().expect("release owner gate");
+            // Another participant may change the prefix after the first
+            // attempt released its snapshot exclusion to wait.
+            engine
+                .guest_memory
+                .insert(prefix_addr, vec![0xc3; target_len]);
+            let prepared = state
+                .capture_core_for_publication(
+                    &kernel,
+                    &mut engine,
+                    FatalSignalRecord {
+                        image_generation: kernel.fatal_signal.current_generation(),
+                        tid: worker.thread().key().tid,
+                        signo: 11,
+                        code: 1,
+                        addr: target_addr,
+                    },
+                )
+                .expect("released owner Gate must resume core capture");
+            let Ok(Some(prepared)) = prepared else {
+                panic!("fatal signal must prepare a core publication after release");
+            };
+            assert_eq!(prepared.payload.extents.len(), 2);
+            assert_eq!(prepared.payload.extents[0].bytes, vec![0xc3; target_len]);
+        });
+        assert_eq!(
+            tracker.lock().as_slice(),
+            &[
+                (prefix_addr, target_len),
+                (prefix_addr, target_len),
+                (target_addr, target_len)
+            ],
+            "the prefix must be recaptured after releasing snapshot exclusion"
         );
     }
 

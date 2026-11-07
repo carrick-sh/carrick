@@ -3347,6 +3347,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             carrick_el1_abi::PortalTransferIntent::UserRead,
         )
     }
+
     fn read_owner_bytes_with_intent(
         &self,
         address: u64,
@@ -6259,16 +6260,61 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         Ok(())
     }
 
-    fn read_core_bytes(
-        &self,
-        address: u64,
-        length: usize,
-    ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
-        // `capture_and_publish_core` has already joined this range to a
-        // quiesced, readable Linux VMA. Use the backing-only path so the
-        // syscall EFAULT metadata for the larger hidden heap reservation does
-        // not reject its live `[heap_base, brk)` prefix.
+    fn read_legacy_core_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
         <Self as GuestMemory>::read_bytes_raw(self, address, length)
+    }
+
+    fn core_memory_mm(&self) -> Option<carrick_hal::guest_arch_binding::core_arch::MmGeneration> {
+        self.protections
+            .owner()
+            .and_then(|handle| std::num::NonZeroU64::new(handle.mm().raw()))
+            .map(carrick_hal::guest_arch_binding::core_arch::MmGeneration::new)
+    }
+
+    fn core_stage1_output(
+        &self,
+        address: GuestVa,
+        length: usize,
+    ) -> Result<Option<Gpa>, MemoryError> {
+        if self.core_memory_mm().map(|mm| mm.raw().get()) != Some(self.mm_generation) {
+            return Err(MemoryError::HostMap(
+                "owner memory incarnation mismatch".into(),
+            ));
+        }
+        let va = address.raw();
+        Ok(self
+            .page_tables
+            .with_manager(|manager| manager.translate_retained_output(va))
+            .flatten()
+            .map(Gpa::new)
+            .or_else(|| {
+                (!carrick_mem::memory::needs_stage1_translation(va, length as u64))
+                    .then_some(Gpa::new(va))
+            }))
+    }
+
+    fn read_core_backing(
+        &self,
+        excluded: &carrick_sched_core::ExcludedEditor<'_>,
+        address: GuestVa,
+        output: Gpa,
+        length: usize,
+    ) -> Result<Vec<u8>, MemoryError> {
+        self.vm
+            .translated_read_excluded(excluded, address.raw(), output.raw(), length)
+    }
+
+    fn copy_core_pristine(&self, address: GuestVa, dst: &mut [u8]) -> Result<bool, MemoryError> {
+        match self.vm.deferred_anonymous_state() {
+            Some(state) => state.copy_pristine_file(address, dst).map_err(|error| {
+                MemoryError::HostMap(format!("read deferred private file backing: {error}"))
+            }),
+            None => Ok(false),
+        }
+    }
+
+    fn core_untouched_zero(&self, address: GuestVa, length: usize) -> bool {
+        self.fresh_zero_chunk(address.raw(), 0, length) == Some(length)
     }
 
     fn diagnostic_fault_page_tables(&self, far: u64) -> Option<(u64, [u64; 4])> {
@@ -6616,7 +6662,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                     })?;
             } else {
                 page_tables
-                    .set_fork_readonly(range.va, range.len, child_source.as_deref_mut())
+                    .set_fork_readonly_adopting(range.va, range.len, child_source.as_deref_mut())
                     .map_err(|error| {
                         TrapError::Hypervisor(format!(
                             "prepare hvpatch child private fork leaves read-only: {error:?}"
@@ -6724,7 +6770,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                                     range.executable,
                                 )?
                             } else {
-                                manager.set_fork_readonly(range.va, range.len)?
+                                manager.set_fork_readonly_adopting(range.va, range.len)?
                             };
                         }
                         Ok(outcome)
