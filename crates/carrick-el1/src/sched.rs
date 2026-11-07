@@ -202,6 +202,8 @@ pub trait ThreadCpu {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResumeAction {
     NoPending,
+    /// Retry from a checkpoint whose saved PC already names the syscall.
+    RetrySavedSyscall,
     RetrySyscall,
     Returned(carrick_guest_arch::NativeReturnWord),
     Left,
@@ -655,7 +657,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             // The wake only says that physical supply completed. Replaying
             // the SVC must preserve all original syscall arguments, including
             // x0, rather than installing the scheduler's wake result.
-            ResumeAction::RetrySyscall => None,
+            ResumeAction::RetrySavedSyscall | ResumeAction::RetrySyscall => None,
             ResumeAction::Left => {
                 self.leave_space();
                 return LoadResult::Left;

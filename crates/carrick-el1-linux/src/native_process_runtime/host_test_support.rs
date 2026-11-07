@@ -2909,6 +2909,7 @@ fn exec_after_sibling_drain(parked_read: bool) {
     let resumed = entry.resume_checkpoint(|_| Ok(None));
     let resumed_kind = match &resumed {
         Ok(NativeResume::NoPending) => "no-pending",
+        Ok(NativeResume::RetrySavedSyscall) => "retry-saved-syscall",
         Ok(NativeResume::RetrySyscall) => "retry-syscall",
         Ok(NativeResume::Left(_)) => "left",
         Ok(NativeResume::Returned(_)) => "returned",
@@ -5610,6 +5611,7 @@ fn host_contended_service_park(
         } else {
             let observed = match &resumed {
                 Ok(NativeResume::NoPending) => "NoPending",
+                Ok(NativeResume::RetrySavedSyscall) => "RetrySavedSyscall",
                 Ok(NativeResume::RetrySyscall) => "RetrySyscall",
                 Ok(NativeResume::Returned(_)) => "Returned",
                 Ok(NativeResume::Left(_)) => "Left",

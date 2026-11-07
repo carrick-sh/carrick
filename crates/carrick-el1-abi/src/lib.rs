@@ -4563,7 +4563,7 @@ impl Default for InotifyNameCache {
 
 const _: () = {
     assert!(MAX_NAME_CACHE_PATH_LEN == NAME_CACHE_PATH_WORDS * core::mem::size_of::<u64>());
-    assert!(EL1_ABI_LAYOUT_HASH == 0x9c691dc0c7441d89);
+    assert!(EL1_ABI_LAYOUT_HASH == 0xafc0cb84282b2275);
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
     assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);
