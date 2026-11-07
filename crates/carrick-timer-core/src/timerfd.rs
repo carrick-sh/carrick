@@ -129,6 +129,17 @@ mod tests {
     const DEADLINE: Duration = Duration::from_nanos(100);
 
     #[test]
+    fn shared_timer_state_has_explicit_record_layout() {
+        // Timer IPC storage needs an explicit layout, rather than the
+        // compiler-selected representation of Option<Duration>.
+        assert_eq!(core::mem::size_of::<State>(), 48);
+        assert_eq!(core::mem::align_of::<State>(), 8);
+        assert_eq!(core::mem::offset_of!(State, interval), 0);
+        assert_eq!(core::mem::offset_of!(State, deadline), 16);
+        assert_eq!(core::mem::offset_of!(State, expirations), 32);
+    }
+
+    #[test]
     fn rearm_and_disarm_discard_unread_expirations() {
         let mut timer = State::default();
         timer.arm(
