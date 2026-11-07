@@ -5038,6 +5038,22 @@ mod tests {
         });
     }
     #[test]
+    fn review_push_transport_witness_records_real_attempts() {
+        shared_fixture(|root| {
+            git(root, &["init", "-b", "main"]).unwrap();
+            git(
+                root,
+                &["commit", "--allow-empty", "-m", "transport control"],
+            )
+            .unwrap();
+            // Positive control for the no-push assertions: the same Git
+            // transport must record an attempted push when one is made.
+            git(root, &["push", "fixture"]).unwrap();
+            let attempts = regular_text(&root.join("push.args")).unwrap();
+            assert!(attempts.contains("push\nfixture"), "{attempts}");
+        });
+    }
+    #[test]
     fn replay_1813_review_round_refuses_commits_at_checkpoint_and_outcome() {
         shared_fixture(|root| {
             let mut s = review_checkpoint(root, &"b".repeat(40), "APPROVE");
@@ -9153,6 +9169,7 @@ for arg do
    exec /usr/bin/git fetch --no-tags "$RUNNER_TEMP/base" "$ref"
   fi ;;
  push)
+  printf '%s\n' "$@" >> "$RUNNER_TEMP/push.args"
   /usr/bin/git rev-parse HEAD > "$RUNNER_TEMP/remote-tip"; exit 0 ;;
  ls-remote)
   for ref do :; done
