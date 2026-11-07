@@ -403,7 +403,10 @@ elif '--method' in args and args[args.index('--method')+1] == 'POST':
         out.write(json.dumps({'endpoint':endpoint,'body':json.load(sys.stdin)})+'\n')
 elif args[:2] == ['api', 'graphql']:
     nodes = json.loads(os.environ.get('TEST_QUEUE_ENTRIES', '[]'))
-    print(json.dumps({'data':{'repository':{'mergeQueue':{'entries':{'nodes':nodes}}}}}))
+    entries = {'pageInfo': {'hasNextPage': os.environ.get('TEST_QUEUE_HAS_NEXT') == '1'}}
+    if os.environ.get('TEST_QUEUE_OMIT_NODES') != '1':
+        entries['nodes'] = nodes
+    print(json.dumps({'data':{'repository':{'mergeQueue':{'entries':entries}}}}))
 elif args[0] == 'api':
     endpoint = args[-1]
     if '/pulls/' in endpoint:
@@ -521,7 +524,11 @@ else:
     let queue_payload = json!({"repository":{"full_name":"carrick-sh/carrick"},"action":"checks_requested","merge_group":{"base_ref":"refs/heads/main","head_ref":queue_ref,"head_sha":b.clone(),"base_sha":a.clone()}});
     std::fs::write(&queue_event, queue_payload.to_string()).unwrap();
     let queue_dir = dir.path().join("queue-request");
-    let queue_with_entries = |payload: &serde_json::Value, entries: &str| {
+    let queue_with_config = |payload: &serde_json::Value,
+                             entries: &str,
+                             has_next: &str,
+                             omit_nodes: &str,
+                             rest_pulls: &str| {
         std::fs::write(&queue_event, payload.to_string()).unwrap();
         child()
             .env("GITHUB_EVENT_NAME", "merge_group")
@@ -539,21 +546,26 @@ else:
             )
             .env("TEST_PENDING_BASE", "1")
             .env("TEST_QUEUE_ENTRIES", entries)
+            .env("TEST_QUEUE_HAS_NEXT", has_next)
+            .env("TEST_QUEUE_OMIT_NODES", omit_nodes)
             .env("TEST_HIDE_QUEUE_REFS", "1")
-            .env(
-                "TEST_REST_PULLS",
-                if payload["merge_group"]["head_ref"] == "refs/heads/gh-readonly-queue/main/forged" {
-                    r#"[{"number":777,"base":{"ref":"main","repo":{"full_name":"carrick-sh/carrick"}}}]"#
-                } else {
-                    "[]"
-                },
-            )
+            .env("TEST_REST_PULLS", rest_pulls)
             .args(["signed-gate", "prepare", "--event"])
             .arg(&queue_event)
             .arg("--output")
             .arg(&queue_dir)
             .output()
             .unwrap()
+    };
+    let queue_with_entries = |payload: &serde_json::Value, entries: &str| {
+        let rest_pulls = if payload["merge_group"]["head_ref"]
+            == "refs/heads/gh-readonly-queue/main/forged"
+        {
+            r#"[{"number":777,"merged_at":"2026-01-01T00:00:00Z","base":{"ref":"main","repo":{"full_name":"carrick-sh/carrick"}}}]"#
+        } else {
+            "[]"
+        };
+        queue_with_config(payload, entries, "0", "0", rest_pulls)
     };
     let live_predecessor = serde_json::json!([
         {"baseCommit":{"oid":a},"headCommit":{"oid":d},"pullRequest":{"number":123,"baseRefName":"main","baseRepository":{"nameWithOwner":"carrick-sh/carrick"}}},
@@ -589,6 +601,56 @@ else:
         serde_json::from_slice(&std::fs::read(queue_dir.join("request.json")).unwrap()).unwrap();
     assert_eq!(second_request["base"], a.clone());
     assert_eq!(second_request["prs"], json!([123, 124]));
+    let mut third = queue_payload.clone();
+    third["merge_group"]["head_ref"] = json!("refs/heads/gh-readonly-queue/main/pr-125-test");
+    third["merge_group"]["head_sha"] = json!(c.clone());
+    third["merge_group"]["base_sha"] = json!(b.clone());
+    let third = queue(&third);
+    assert!(
+        third.status.success(),
+        "{}",
+        String::from_utf8_lossy(&third.stderr)
+    );
+    let third_request: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(queue_dir.join("request.json")).unwrap()).unwrap();
+    assert_eq!(third_request["prs"], json!([123, 124, 125]));
+
+    let truncated_queue = queue_with_config(&queue_payload, &live_predecessor, "1", "0", "[]");
+    let missing_queue_nodes = queue_with_config(&queue_payload, "[]", "0", "1", "[]");
+    assert!(
+        !truncated_queue.status.success() && !missing_queue_nodes.status.success(),
+        "partial or structurally incomplete queue data was accepted"
+    );
+
+    // If a predecessor leaves the queue between event creation and lookup,
+    // its merged PR association must survive into the receipt. An empty or
+    // unmerged REST association cannot silently drop it.
+    let current_only = serde_json::json!([{
+        "baseCommit":{"oid":d},"headCommit":{"oid":b},
+        "pullRequest":{"number":124,"baseRefName":"main","baseRepository":{"nameWithOwner":"carrick-sh/carrick"}}
+    }]).to_string();
+    let merged_predecessor = r#"[{"number":123,"merged_at":"2026-01-01T00:00:00Z","base":{"ref":"main","repo":{"full_name":"carrick-sh/carrick"}}}]"#;
+    let race_resolved = queue_with_config(&second, &current_only, "0", "0", merged_predecessor);
+    assert!(
+        race_resolved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&race_resolved.stderr)
+    );
+    let race_request: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(queue_dir.join("request.json")).unwrap()).unwrap();
+    assert_eq!(race_request["prs"], json!([123, 124]));
+    let race_unresolved = queue_with_config(&second, &current_only, "0", "0", "[]");
+    let race_unmerged = queue_with_config(
+        &second,
+        &current_only,
+        "0",
+        "0",
+        r#"[{"number":123,"merged_at":null,"base":{"ref":"main","repo":{"full_name":"carrick-sh/carrick"}}}]"#,
+    );
+    assert!(
+        !race_unresolved.status.success() && !race_unmerged.status.success(),
+        "unresolved or unmerged predecessor association was accepted"
+    );
     // An unqueued descendant cannot borrow the current live PR's number.
     let mut forged_descendant = second.clone();
     forged_descendant["merge_group"]["head_sha"] = json!(x.clone());
@@ -874,12 +936,16 @@ else:
     );
     std::fs::write(&baseline_path, serde_json::to_vec(&admitted(&b)).unwrap()).unwrap();
     let mut next_queue = queue_payload;
+    next_queue["merge_group"]["head_ref"] = json!("refs/heads/gh-readonly-queue/main/pr-123-next");
     next_queue["merge_group"]["head_sha"] = json!(c.clone());
     next_queue["merge_group"]["base_sha"] = json!(b.clone());
     std::fs::write(&queue_event, next_queue.to_string()).unwrap();
     let queued = next_child()
         .env("GITHUB_EVENT_NAME", "merge_group")
-        .env("GITHUB_REF", queue_ref)
+        .env(
+            "GITHUB_REF",
+            "refs/heads/gh-readonly-queue/main/pr-123-next",
+        )
         .env("GITHUB_SHA", c.clone())
         .env(
             "TEST_QUEUE_ENTRIES",
