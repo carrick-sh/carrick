@@ -1,5 +1,8 @@
 # KVM ecosystem attempts at the admitted main
 
+This is the original attempt report. See the [followup diagnosis and direct
+eight-row table](followup.md) for the subsequent investigation.
+
 The eight requested commands were attempted, but **the ecosystem scoreboard is
 not measured**. No command produced its expected output. Five launches exited
 127 without a diagnostic; three reached the 120-second SIGKILL deadline. These

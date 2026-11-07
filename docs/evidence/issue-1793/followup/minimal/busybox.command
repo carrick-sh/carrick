@@ -1,1 +1,0 @@
-RUST_LOG=carrick=debug CARRICK_REQUIRE_KVM=1 CARRICK_RUN_ID=i1793-launch-20261107T014823-busybox timeout --foreground --signal=KILL 120s /var/tmp/carrick-dispatch-zbe4Cx/agent/work/target/release/carrick run --rm --json --platform linux/amd64 busybox /bin/echo hi 

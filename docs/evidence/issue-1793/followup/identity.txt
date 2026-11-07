@@ -1,5 +1,0 @@
-c3ade819fe69e95330ffa9bf7e32eeb047d4eb93
-4fb38788da79ed8aefcea942cc45fc2ad4287d4a83dfe19a7e7cbdf3dbd76365  target/release/carrick
-Linux carrick-ci-42324352122-1-128257061387-1794015363 6.12.111+deb13-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.12.111-1 (2026-09-28) x86_64 GNU/Linux
-uid=999(carrick-dispatch-agent) gid=989(carrick-dispatch-agent) groups=989(carrick-dispatch-agent),992(kvm)
-KVM_GET_API_VERSION=12 KVM_CREATE_VM=success
