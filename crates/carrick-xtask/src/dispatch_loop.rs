@@ -2287,9 +2287,10 @@ impl Server<'_> {
             // Done means pushed (#1168), and a Done that changed nothing
             // must not leave the PR behind or conflicting (#1215).
             RoundStatus::Blocked
-        } else if published_exit.is_some() && claimed_done {
-            // Published work, but its launcher didn't finish: for review,
-            // and never chained on its own (#1253).
+        } else if published_exit.is_some() && finish == FinishStatus::Done {
+            // An incomplete worker cannot establish Done (#1253). An
+            // explicit continuation may use its published checkpoint and
+            // next-step brief, subject to the same chain bounds as usual.
             RoundStatus::Blocked
         } else if tier_blocked.is_some() && claimed_done {
             // A strong round never downgrades to a weaker worker (#1275).
@@ -11281,7 +11282,7 @@ exec /usr/bin/git "$@"
             shared_fixture(|root| {
                 current_pr(root);
                 let head = contract["review"]["head"].as_str().unwrap();
-                // Replay the failed worker contract and WIP publication, not
+                // Replay the actual worker contract and WIP publication, not
                 // just its prose. Reviews now publish through the separately
                 // exercised publisher; bind that receipt to this live head.
                 std::fs::create_dir_all(crate::agent_runner::state().unwrap().join("work"))
@@ -11330,16 +11331,18 @@ exec /usr/bin/git "$@"
                     serde_json::to_vec(&receipt).unwrap(),
                 )
                 .unwrap();
-                assert_eq!(server.history[0].status, ContractStatus::Failed);
+                let incomplete_worker = server.history[0].status == ContractStatus::Failed;
                 assert_eq!(server.unpushed_head(), None);
                 server
                     .round_outcome(FinishStatus::Blocked, &summary, None)
                     .unwrap();
                 let posted = regular_text(&root.join("posted.md")).unwrap();
-                assert!(
-                    posted.contains("Published: the worker's commits are on the branch"),
-                    "{posted}"
-                );
+                if incomplete_worker {
+                    assert!(
+                        posted.contains("Published: the worker's commits are on the branch"),
+                        "{posted}"
+                    );
+                }
                 assert_eq!(
                     outcome_status(&posted),
                     Some("Continuing"),

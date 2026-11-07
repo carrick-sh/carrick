@@ -764,8 +764,10 @@ on every worker, keeping new, unedited items (`round_inbox`):
 When the last worker's launcher exits badly after its own commits were
 pushed (the server's WIP push, still the live branch tip, not a
 server-created checkpoint), the outcome leads with "Published: the worker's
-commits are on the branch at `<head>`; then: <the exit>" and reports Failed while preserving the published progress, rather than
-claiming completion (#1253, #1763).
+commits are on the branch at `<head>`; then: <the exit>". A request for Done
+reports Failed while preserving that progress (#1253). A continuation with
+stated remaining work can use the published checkpoint under the usual
+publication checks and chain bounds (#1763).
 
 ### Rounds chain (#1241 part 3)
 
@@ -775,8 +777,8 @@ round runs short with work left, the coordinator finishes with `continue`
 and a brief: the next step and how to prove it. The server reports
 `Dispatch outcome: Continuing` only when the round pushed a checkpoint (a
 worker's WIP push or a publish, read from the run's server-owned
-`published-tip`), the usual floors would not have turned a `done` into
-a failure, and the round is below the chain limit; otherwise the outcome is
+`published-tip`), the publication and checkpoint checks pass, and the round
+is below the chain limit; otherwise the outcome is
 Failed with the server's reason (#1763). A chain has at most four rounds: the
 owner-triggered one and three chained ones. The worker contract keeps its
 own `done|blocked|failed` schema; a Continuing outcome records `blocked` in
