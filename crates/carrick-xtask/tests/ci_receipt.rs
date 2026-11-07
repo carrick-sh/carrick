@@ -2884,7 +2884,10 @@ fn required_manifest_lane_must_execute_a_test() {
 
 #[test]
 fn skipped_required_steps_fail_but_profile_exclusions_do_not() {
-    let mut r = receipt(vec![]);
+    let mut executed = step("el1-embed", true, &[]);
+    executed.started_tests = vec!["el1_suite::completed_test".into()];
+    executed.finished_binaries = vec!["el1_suite".into()];
+    let mut r = receipt(vec![executed]);
     r.skipped_steps = vec!["generic-probe-shards".into()];
     assert!(
         diff(&r, &r)
