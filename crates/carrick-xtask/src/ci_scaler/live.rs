@@ -922,6 +922,9 @@ fn warnings_are_storage_lock_timeouts(expected: usize, log: &Value) -> bool {
         let Some(line) = entry["t"].as_str() else {
             return false;
         };
+        if line.starts_with("ERROR:") || line.starts_with("TASK ERROR:") {
+            return false;
+        }
         if let Some(warning) = line.strip_prefix("WARN: ") {
             if !storage_lock_timeout(warning) {
                 return false;
@@ -4597,6 +4600,10 @@ case "$method:$url" in
    body='{{"status":"stopped","exitstatus":"WARNINGS: 2"}}' ;;
  GET:*/tasks/UPID:willow:mismatchwarn/log?limit=500)
    body='[{{"n":1,"t":"WARN: Could not remove disk '\''local:308/vm-308-disk-0.qcow2'\'', check manually: can'\''t lock file '\''/var/lock/pve-manager/pve-storage-local'\'' - got timeout"}},{{"n":2,"t":"TASK WARNINGS: 2"}}]' ;;
+ GET:*/tasks/UPID:willow:errwarn/status)
+   body='{{"status":"stopped","exitstatus":"WARNINGS: 1"}}' ;;
+ GET:*/tasks/UPID:willow:errwarn/log?limit=500)
+   body='[{{"n":1,"t":"WARN: Could not remove disk '\''local:308/vm-308-disk-0.qcow2'\'', check manually: can'\''t lock file '\''/var/lock/pve-manager/pve-storage-local'\'' - got timeout"}},{{"n":2,"t":"ERROR: volume index corrupt"}},{{"n":3,"t":"TASK WARNINGS: 1"}}]' ;;
  GET:*/tasks/UPID:willow:zero/status)
    body='{{"status":"stopped","exitstatus":"WARNINGS: 0"}}' ;;
  *) exit 92 ;;
@@ -4686,16 +4693,20 @@ printf '{{"data":%s}}\n200' "$body"
         assert_eq!(pass.finished, 1);
         assert_eq!(Ledger::load(&path).unwrap().rows[0].state, State::Destroyed);
         let pvesh_calls = std::fs::read_to_string(dir.path().join("pvesh_calls")).unwrap();
-        assert!(pvesh_calls.contains("/nodes/willow/storage/local/content"));
+        assert!(pvesh_calls.contains("/nodes/willow/storage/local-lvm/content"));
 
-        // Negative controls: non-storage warnings, mismatched counts, zero warnings,
-        // and query characters in task IDs fail closed.
+        // Negative controls: non-storage warnings, mismatched counts, error lines,
+        // zero warnings, and query characters in task IDs fail closed.
         assert_eq!(
             pve.task_state("UPID:willow:mixedwarn").unwrap(),
             TaskState::Failed
         );
         assert_eq!(
             pve.task_state("UPID:willow:mismatchwarn").unwrap(),
+            TaskState::Failed
+        );
+        assert_eq!(
+            pve.task_state("UPID:willow:errwarn").unwrap(),
             TaskState::Failed
         );
         assert_eq!(
