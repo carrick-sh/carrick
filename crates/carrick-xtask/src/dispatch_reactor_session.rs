@@ -822,6 +822,12 @@ impl Server<'_> {
                 text: arg_str(args, "brief")?.into(),
                 reason: String::new(),
             };
+            if let crate::dispatch_worker::RoundKind::Review { pr } =
+                crate::dispatch_worker::RoundKind::from_trigger(&decision.text)
+                && pr != n
+            {
+                return Err("review round names another PR".into());
+            }
             let comments = self
                 .remote
                 .list(&format!(
@@ -1808,6 +1814,29 @@ mod tests {
             )
             .0
         );
+    }
+
+    #[test]
+    fn review_round_target_is_checked_before_requesting_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("s.json");
+        let mut fake = remote();
+        let (err, text) = call(
+            &mut fake,
+            &state,
+            "request_round",
+            json!({"pr":30,"brief":"review PR #31 only; change no code and push nothing"}),
+        );
+        assert!(err && text.contains("another PR"), "{text}");
+        assert!(fake.posted.is_empty());
+        let (err, text) = call(
+            &mut fake,
+            &state,
+            "request_round",
+            json!({"pr":30,"brief":"review PR #30 only; change no code and push nothing"}),
+        );
+        assert!(!err, "{text}");
+        assert_eq!(fake.posted.len(), 1);
     }
 
     #[test]
