@@ -542,7 +542,7 @@ fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
             &[],
             &[],
             &[],
-            &mut *names,
+            &*names,
             Some(crate::dispatch::Zone {
                 tables: fixture.zone,
                 cpu: &mut cpu,
