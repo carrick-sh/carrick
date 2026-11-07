@@ -786,13 +786,48 @@ fn acceptance_unusable_override_is_checked_before_tests() {
     // target is deliberately untracked; acceptance rejects dirty input before
     // starting. Ignore it just as an admitted checkout does.
     fs::write(repo.path().join(".git/info/exclude"), b"/target/\n").unwrap();
+    // Stop the host phase at its first real step; scratch must not prevent
+    // reaching that step, even on a case-insensitive home.
+    let bin = repo.path().join("target/bin");
+    fs::create_dir_all(&bin).unwrap();
+    let just = bin.join("just");
+    fs::write(&just, "#!/bin/sh\necho host-step-witness >&2\nexit 1\n").unwrap();
+    fs::set_permissions(&just, fs::Permissions::from_mode(0o755)).unwrap();
+    let host = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .args([
+            "--root",
+            repo.path().to_str().unwrap(),
+            "accept",
+            "--profile",
+            "no-docker",
+            "--phase",
+            "host",
+        ])
+        .env("CARRICK_HOME", &home)
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&host.stdout).contains("Host phase starting"),
+        "{host:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&host.stderr).contains("scratch preflight"),
+        "{host:?}"
+    );
+    fs::remove_dir_all(repo.path().join("target/el1-gate")).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
         .args([
             "--root",
             repo.path().to_str().unwrap(),
             "accept",
             "--profile",
-            "linux-portable",
+            "no-docker",
+            "--phase",
+            "signed",
         ])
         .env("CARRICK_HOME", &home)
         .output()

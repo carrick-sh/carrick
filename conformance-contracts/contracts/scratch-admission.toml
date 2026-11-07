@@ -10,9 +10,12 @@ rationale = "An explicit home is authoritative; defaults admit only internal con
 
 [bindings]
 vm_free = [
+  "carrick-runtime::prepare::tests::serial_host_prepare_defers_case_sensitive_admission_until_execute",
   "carrick-xtask::tests::build_cache::acceptance_unusable_override_is_checked_before_tests",
   "carrick-xtask::tests::build_cache::scratch_preflight_uses_explicit_case_sensitive_home",
   "carrick-vfs::apfs::serial_host::conventional_volume_requires_internal_storage",
+  "carrick-vfs::apfs::serial_host::backend_default_honours_override_without_requiring_case_sensitivity",
+  "carrick-vfs::apfs::serial_host::temporary_scratch_is_scoped_to_effective_user",
   "carrick-vfs::apfs::serial_host::case_insensitive_home_falls_through_to_tmp",
   "carrick-vfs::apfs::serial_host::no_usable_default_reports_configuration_error",
   "carrick-vfs::apfs::serial_host::stalled_probe_returns_failure_before_worker_finishes",

@@ -771,6 +771,7 @@ pub struct PreparedRun {
     max_traps: usize,
     debug_state_path: Option<PathBuf>,
     root: RootBacking,
+    admit_default_scratch: bool,
     dispatcher: SyscallDispatcher,
     #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
     kvm_debug: Option<PreparedKvmDebugServer>,
@@ -1344,6 +1345,9 @@ fn prepare_with_lease(
             .debug_state_path
             .as_ref()
             .map(|p| PathBuf::from(p.as_std_path())),
+        admit_default_scratch: matches!(root, RootBacking::Host)
+            && container.launch().exec_overlay.is_none()
+            && container.launch().registry_id().is_none(),
         root,
         dispatcher,
         interactive_session,
@@ -1396,6 +1400,10 @@ impl PreparedRun {
     /// }
     /// ```
     pub fn execute(self) -> Result<RunResult, RuntimeError> {
+        if self.admit_default_scratch {
+            carrick_vfs::scratch::preflight_default()
+                .map_err(|error| RuntimeError::FsBackend(anyhow::anyhow!(error)))?;
+        }
         let PreparedRun {
             arm_ring_first,
             backend,
@@ -1405,6 +1413,7 @@ impl PreparedRun {
             max_traps,
             debug_state_path,
             root,
+            admit_default_scratch: _,
             dispatcher,
             interactive_session,
             carrier,
@@ -2014,6 +2023,35 @@ mod tests {
             resolve_stdio(&spec, None),
             Err(RuntimeError::Configuration(_))
         ));
+    }
+
+    #[test]
+    fn serial_host_prepare_defers_case_sensitive_admission_until_execute() {
+        let home = tempfile::tempdir().expect("home");
+        let home = home.path().to_str().expect("UTF-8 fixture path");
+        if crate::carrier::tests::isolated_fixture_process(&[
+            ("CARRICK_HOME", home),
+            ("HOME", home),
+        ]) {
+            return;
+        }
+        let _guard = ProcessCarrierTestGuard::acquire("scratch preparation witness");
+        let prepared = Runtime::prepare(
+            &hvpatch_run_spec(),
+            test_launch(),
+            RuntimeExtensions::default(),
+        )
+        .expect("VM-free preparation must accept a writable insensitive home");
+        assert!(prepared.admit_default_scratch);
+        if carrick_vfs::apfs::preferred_scratch_root()
+            .host_path()
+            .is_err()
+        {
+            let error = prepared
+                .execute()
+                .expect_err("guest execution must refuse insensitive scratch");
+            assert!(matches!(error, RuntimeError::FsBackend(_)), "{error}");
+        }
     }
 
     #[test]
