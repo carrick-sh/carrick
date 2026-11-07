@@ -509,55 +509,54 @@ fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
     let memory = carrick_test_support::GuestUserBuffer::from_value(*b"q");
     let names = Box::leak(Box::new(carrick_el1_abi::InotifyNameCache::new()));
     let mut cpu = crate::sched::FakeCpu::default();
-    macro_rules! dispatch {
-        ($service:expr, $cpu:expr, $nr:expr, $fd:expr) => {{
-            let selected = fixture.zone.slot(fixture.slot).current().unwrap();
-            // SAFETY: this stopped fixture exclusively owns the selected live record.
-            let binding =
-                unsafe { runtime.record_binding(fixture.zone.record_ref(selected)) }.unwrap();
-            let mut entry = runtime
-                .enter_registered(
-                    registry,
-                    source,
-                    &fixture.task,
-                    binding.address,
-                    &binding.words,
-                    $service,
-                )
-                .unwrap();
-            let mut frame = carrick_el1_abi::TrapFrame {
-                elr: 0x400004,
-                slot: u64::from(fixture.slot.raw()),
-                ..Default::default()
-            };
-            frame.x[8] = $nr;
-            frame.x[0] = $fd;
-            frame.x[1] = memory.arg();
-            frame.x[2] = 1;
-            let route = crate::dispatch::dispatch_syscall_with_native(
-                &mut frame,
-                &counters,
-                core::slice::from_ref(&fixture.task),
-                &[],
-                &[],
-                &[],
-                &[],
-                names,
-                Some(crate::dispatch::Zone {
-                    tables: fixture.zone,
-                    cpu: $cpu,
-                    user: &crate::sched::HardwareUserWord,
-                }),
-                Some(&venue),
-                None,
-                Some(&mut *entry),
-                Some(source),
-                None,
-                |_| core::ptr::null_mut(),
-            );
-            (route, frame.x[0])
-        }};
-    }
+    // A closure rather than a declarative macro: the CI receipt's test-retirement scan refuses
+    // any macro definition in a crate's sources, since one could generate tests it can't see.
+    let mut dispatch = |nr: u64, fd: u64| {
+        let selected = fixture.zone.slot(fixture.slot).current().unwrap();
+        // SAFETY: this stopped fixture exclusively owns the selected live record.
+        let binding = unsafe { runtime.record_binding(fixture.zone.record_ref(selected)) }.unwrap();
+        let mut entry = runtime
+            .enter_registered(
+                registry,
+                source,
+                &fixture.task,
+                binding.address,
+                &binding.words,
+                &mut service,
+            )
+            .unwrap();
+        let mut frame = carrick_el1_abi::TrapFrame {
+            elr: 0x400004,
+            slot: u64::from(fixture.slot.raw()),
+            ..Default::default()
+        };
+        frame.x[8] = nr;
+        frame.x[0] = fd;
+        frame.x[1] = memory.arg();
+        frame.x[2] = 1;
+        let route = crate::dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &mut *names,
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            }),
+            Some(&venue),
+            None,
+            Some(&mut *entry),
+            Some(source),
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        (route, frame.x[0])
+    };
     // Both real fork participants stay alive throughout the reader's park.
     assert!(
         fixture
@@ -573,7 +572,7 @@ fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
             .is_queued()
     );
     activate_target(source, &fixture.task, &child_binding);
-    let parked = dispatch!(&mut service, &mut cpu, 63, 3);
+    let parked = dispatch(63, 3);
     assert_eq!(
         parked.0,
         carrick_personality_linux::dispatch::CompletionRoute::Suspended
@@ -593,7 +592,7 @@ fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
     );
     let _ = fixture.task.linux.take_host_work_doorbell();
     activate_target(source, &fixture.task, &parent_binding);
-    assert_eq!(dispatch!(&mut service, &mut cpu, 64, 4).1, 1);
+    assert_eq!(dispatch(64, 4).1, 1);
     fixture.zone.spaces.set_idle_ttbr(0x30000);
     // Reload through the production scheduler checkpoint. The object park
     // recorded the SVC itself (0x400000), so adapter completion must not apply
@@ -761,7 +760,7 @@ fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
         "a second selection before execution must not rewind twice"
     );
     drop(resume_cpu);
-    assert_eq!(dispatch!(&mut service, &mut cpu, 63, 3).1, 1);
+    assert_eq!(dispatch(63, 3).1, 1);
     assert!(
         !fixture
             .zone
