@@ -60,6 +60,7 @@ const MAP_PRIVATE: u64 = 0x02;
 const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
 const MAP_GROWSDOWN: u64 = 0x0100;
+const MAP_NORESERVE: u64 = 0x4000;
 const MAP_STACK: u64 = 0x20000;
 const MAP_HUGETLB: u64 = 0x40000;
 const MAP_FIXED_NOREPLACE: u64 = 0x100000;
@@ -261,6 +262,9 @@ pub fn decide_reservation_syscall<
             // MAP_DENYWRITE and MAP_EXECUTABLE are ignored by Linux (man 2
             // mmap); the dynamic loader passes MAP_DENYWRITE on its anonymous
             // image reservation as well as its file segments.
+            // MAP_NORESERVE changes swap reservation, not mapping ownership.
+            // Like the host mmap decoder, keep backing lazy; V8 uses this
+            // hint for its PROT_NONE JIT reservation before mprotect(RWX).
             const MAP_DENYWRITE: u64 = 0x0800;
             const MAP_EXECUTABLE: u64 = 0x1000;
             let supported = MAP_PRIVATE
@@ -268,6 +272,7 @@ pub fn decide_reservation_syscall<
                 | MAP_FIXED
                 | MAP_FIXED_NOREPLACE
                 | MAP_STACK
+                | MAP_NORESERVE
                 | MAP_DENYWRITE
                 | MAP_EXECUTABLE;
             let file = match file {
@@ -2148,7 +2153,7 @@ mod tests {
                             ARENA,
                             LENGTH,
                             0,
-                            MAP_PRIVATE | MAP_ANONYMOUS | 0x4000,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
                             u64::MAX,
                             0
                         ]
