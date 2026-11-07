@@ -34,3 +34,33 @@ impl TestEl1Region {
         self.0.as_mut_ptr()
     }
 }
+
+/// Owned atomic table-map storage for VM-free publication witnesses.
+pub struct TestIpcTableMap(Box<carrick_el1_abi::ipc_tables::IpcTableMap>);
+
+impl TestIpcTableMap {
+    pub fn new() -> Self {
+        // SAFETY: the table map consists of zero-valid integer atomics.
+        Self(unsafe { Box::new_zeroed().assume_init() })
+    }
+}
+impl Default for TestIpcTableMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl core::ops::Deref for TestIpcTableMap {
+    type Target = carrick_el1_abi::ipc_tables::IpcTableMap;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl carrick_el1_abi::IpcTableMapBacking for TestIpcTableMap {
+    fn with_table_map(
+        &self,
+        visitor: &mut dyn FnMut(&carrick_el1_abi::ipc_tables::IpcTableMap),
+    ) -> Result<(), carrick_el1_abi::FileRegionError> {
+        visitor(self);
+        Ok(())
+    }
+}

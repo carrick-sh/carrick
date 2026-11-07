@@ -192,6 +192,27 @@ impl FileRegionBinding {
     }
 }
 
+/// Retained carrier ownership for descriptor publications that outlive a
+/// host boundary. Implementations authenticate their registration and retain
+/// its mapping while invoking the visitor. No borrowed map may escape.
+pub trait IpcTableMapBacking: Send + Sync {
+    /// Visit exactly once while the registration is live; refuse without a
+    /// visit after retirement. The map borrow cannot escape its custody.
+    ///
+    /// ```compile_fail
+    /// use carrick_el1_abi::{IpcTableMapBacking, ipc_tables::IpcTableMap};
+    /// fn escape(backing: &dyn IpcTableMapBacking) -> &'static IpcTableMap {
+    ///     let mut escaped = None;
+    ///     backing.with_table_map(&mut |map| escaped = Some(map)).unwrap();
+    ///     escaped.unwrap()
+    /// }
+    /// ```
+    fn with_table_map(
+        &self,
+        visitor: &mut dyn FnMut(&crate::ipc_tables::IpcTableMap),
+    ) -> Result<(), FileRegionError>;
+}
+
 /// Non-cloning host registration. Its constructor requires retained mapping
 /// custody; a bare process-global region pointer cannot create this authority.
 #[derive(Debug)]

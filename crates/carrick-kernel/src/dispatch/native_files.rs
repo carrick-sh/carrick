@@ -797,17 +797,11 @@ mod tests {
     use crate::kernel::ids::ObjectIdRegistry;
     use crate::kernel::{FileDescription, FileSlotNumber};
     use carrick_core_abi::host_file::{self, HostFileHeader};
-    use carrick_el1_abi::ipc_tables::IpcTableMap;
 
     const FDCWD: i32 = LINUX_AT_FDCWD as i32;
 
-    fn map() -> &'static IpcTableMap {
-        // SAFETY: zero-initialized atomics, alive for the test process, used
-        // only through their synchronized API.
-        unsafe {
-            &*std::alloc::alloc_zeroed(std::alloc::Layout::new::<IpcTableMap>())
-                .cast::<IpcTableMap>()
-        }
+    fn map() -> Arc<carrick_test_support::TestIpcTableMap> {
+        Arc::new(carrick_test_support::TestIpcTableMap::new())
     }
 
     struct Fixture {
@@ -853,7 +847,7 @@ mod tests {
         regular.retain_fd_ref();
         files.install(FileSlotNumber::for_open_fd(3).unwrap(), regular, false);
         let map = map();
-        files.publish_ipc(Arc::clone(&owner), map).unwrap();
+        files.publish_ipc(Arc::clone(&owner), map.clone()).unwrap();
         let raw = map.lookup(files.id().raw()).unwrap();
         Fixture {
             dispatcher,
@@ -2250,7 +2244,9 @@ mod tests {
             .resources()
             .files();
         let map = map();
-        child_files.publish_ipc(Arc::clone(&owner), map).unwrap();
+        child_files
+            .publish_ipc(Arc::clone(&owner), map.clone())
+            .unwrap();
         let raw = map.lookup(child_files.id().raw()).unwrap();
         let table = fd::TableId::from_raw(fd::RawTableId {
             authority: raw.authority,

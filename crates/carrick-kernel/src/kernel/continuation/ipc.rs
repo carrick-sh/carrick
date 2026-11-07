@@ -199,11 +199,17 @@ pub fn host_window_backing(
 /// Missing windows and bounded admission refusals retain host service. Never
 /// publish a different kernel's descriptor IDs into the carrier's mapping.
 /// `region` must be borrowed from the retained installed carrier window.
-pub fn publish_file_table(context: &crate::kernel::KernelContext, region: &IpcRegion<'_>) {
-    let Some(map) = carrick_el1_abi::ipc_table_map_host() else {
-        return;
-    };
-    if !map.window_published() {
+pub fn publish_file_table(
+    context: &crate::kernel::KernelContext,
+    region: &IpcRegion<'_>,
+    map: &std::sync::Arc<dyn carrick_el1_abi::IpcTableMapBacking>,
+) {
+    let mut published = false;
+    if map
+        .with_table_map(&mut |map| published = map.window_published())
+        .is_err()
+        || !published
+    {
         return;
     }
     let Some(owner) = context.kernel().existing_ipc() else {
@@ -212,7 +218,10 @@ pub fn publish_file_table(context: &crate::kernel::KernelContext, region: &IpcRe
     if !region.same_mapping(&owner.region()) {
         return;
     }
-    let _ = context.resources().files().publish_ipc(owner, map);
+    let _ = context
+        .resources()
+        .files()
+        .publish_ipc(owner, std::sync::Arc::clone(map));
 }
 
 /// Deliver guest-produced IPC readiness at this kernel's host boundary.

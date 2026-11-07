@@ -90,7 +90,27 @@ and an unpublished map, and publishes the installed owner's table. A peer
 cannot replace that published entry. Admission performs the same constant-work mapping
 comparison before the existing bounded descriptor publication.
 
-The table map still comes from the global EL1 region; migrating that and the
-remaining region consumers onto retained carrier registration is unfinished.
-Neither this scoped IPC access nor the earlier ARM migration proves real KVM
-pipe service or completes Slice 1.
+Descriptor publication now retains its table map through `IpcTableMapBacking`.
+The ARM implementation visits the map through its existing
+`FileRegionRegistration`, holding registration custody for the visit and
+refusing a retired registration. The installed venue retains this same owner
+alongside the IPC storage. Runtime admission receives both owners from that
+installation; `ipc_table_map_host` is removed. File-table bindings retain the
+map owner until withdrawal, rather than storing a static reference into a
+mapping that teardown can release. Publication and withdrawal use the same
+owner and neither reconstructs a region pointer.
+
+`publication_retains_map_until_namespace_withdrawal` drives production
+`FileTable::publish_ipc`: after the caller drops its handle, the namespace
+keeps the map alive; namespace drop withdraws its entry before releasing its
+last owner. The two-kernel admission witness no longer installs a global
+aperture. The macOS mapping-owner witness checks that the retained registration
+visits its map while live and refuses to invoke the visitor after retirement.
+The latter witness requires HVF and is only cross-compiled on Linux.
+The first attempt to pass a borrowed registered map to publication failed with
+E0521: `FileTable::Binding` still required a static map. The retained owner
+removes that requirement without extending the reference lifetime.
+
+Other region consumers still use `EL1_REGION_HOST_PTR`; migrating those onto
+retained registration remains unfinished. Neither these scoped IPC accesses
+nor the earlier ARM migration proves real KVM pipe service or completes Slice 1.
