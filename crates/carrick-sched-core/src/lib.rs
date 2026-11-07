@@ -103,6 +103,7 @@ pub mod refusal;
 pub mod spaces;
 mod x86_context;
 pub use aarch64_context::{AARCH64_ROOT_ADDRESS_MASK, Aarch64ParkedContext};
+pub use carrick_guest_arch::SavedSyscallPc;
 pub use process::{
     Aarch64ThreadPointerRegister, ProcessContext, ThreadContext, ThreadPointerRegister,
     X86ThreadPointerRegister,

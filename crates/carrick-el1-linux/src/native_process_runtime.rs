@@ -5825,15 +5825,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     fn resume_owned_checkpoint(
         &mut self,
     ) -> Result<NativeResume, carrick_core_abi::NativeRunFailureReason> {
-        let syscall_retry = if self
-            .source
-            .zone
-            .record(self.record.id)
-            .take_saved_syscall_resume_pc()
-        {
-            NativeResume::RetrySavedSyscall
-        } else {
-            NativeResume::RetrySyscall
+        let syscall_retry = match self.words.saved_syscall_pc() {
+            Some(carrick_sched_core::SavedSyscallPc::AtSyscall) => NativeResume::RetrySavedSyscall,
+            Some(carrick_sched_core::SavedSyscallPc::AfterSyscall) => NativeResume::RetrySyscall,
+            None => return Err(NativeProcessError::Quarantined.run_failure_reason()),
         };
         if let Some(result) = self.resume_exec_closing() {
             return result.map_err(NativeProcessError::run_failure_reason);
