@@ -2,7 +2,8 @@
 
 The corrected signed classification is an outside-arena mmap hint, rather
 than RWX or MAP_NORESERVE by itself. Unhinted reservations already work.
-Linux mmap(2) requires a free usable hint to be honoured. A hinted reservation
+Linux mmap(2) treats the requested address as an advisory placement hint;
+Carrick honours free usable hints outside its allocation arena. A hinted reservation
 must retain its MM owner through later R, RW and RWX protection changes,
 without entering legacy host sparse publication. Untouched pages remain lazy.
 
