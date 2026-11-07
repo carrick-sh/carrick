@@ -1,0 +1,669 @@
+[
+  {
+    "name": "closed issue",
+    "node": {
+      "__typename": "Issue",
+      "id": "I_test",
+      "number": 100,
+      "state": "CLOSED",
+      "updatedAt": "2026-11-05T00:00:00Z",
+      "comments": {
+        "nodes": []
+      }
+    },
+    "expected": "Done",
+    "current": null,
+    "running": [],
+    "open": [
+      100,
+      200
+    ]
+  },
+  {
+    "name": "merged PR",
+    "node": {
+      "__typename": "PullRequest",
+      "id": "PR_test",
+      "number": 100,
+      "state": "MERGED",
+      "updatedAt": "2026-11-05T00:00:00Z",
+      "comments": {
+        "nodes": []
+      },
+      "isDraft": true,
+      "headRefOid": "abc",
+      "reviews": {
+        "nodes": []
+      },
+      "closingIssuesReferences": {
+        "nodes": [
+          {
+            "id": "I_887",
+            "number": 887,
+            "repository": {
+              "nameWithOwner": "carrick-sh/carrick"
+            }
+          }
+        ]
+      }
+    },
+    "expected": "Done",
+    "current": null,
+    "running": [],
+    "open": [
+      100,
+      200
+    ]
+  },
+  {
+    "name": "ready PR",
+    "node": {
+      "__typename": "PullRequest",
+      "id": "PR_test",
+      "number": 100,
+      "state": "OPEN",
+      "updatedAt": "2026-11-05T00:00:00Z",
+      "comments": {
+        "nodes": []
+      },
+      "isDraft": false,
+      "headRefOid": "abc",
+      "reviews": {
+        "nodes": []
+      },
+      "closingIssuesReferences": {
+        "nodes": [
+          {
+            "id": "I_887",
+            "number": 887,
+            "repository": {
+              "nameWithOwner": "carrick-sh/carrick"
+            }
+          }
+        ]
+      }
+    },
+    "expected": "In review",
+    "current": null,
+    "running": [],
+    "open": [
+      100,
+      200
+    ]
+  },
+  {
+    "name": "current head published verdict",
+    "node": {
+      "__typename": "PullRequest",
+      "id": "PR_test",
+      "number": 100,
+      "state": "OPEN",
+      "updatedAt": "2026-11-05T00:00:00Z",
+      "comments": {
+        "nodes": []
+      },
+      "isDraft": true,
+      "headRefOid": "abc",
+      "reviews": {
+        "nodes": [
+          {
+            "state": "COMMENTED",
+            "body": "Verdict: APPROVE",
+            "submittedAt": "2026-11-07T00:00:00Z",
+            "commit": {
+              "oid": "abc"
+            }
+          }
+        ]
+      },
+      "closingIssuesReferences": {
+        "nodes": [
+          {
+            "id": "I_887",
+            "number": 887,
+            "repository": {
+              "nameWithOwner": "carrick-sh/carrick"
+            }
+          }
+        ]
+      }
+    },
+    "expected": "In review",
+    "current": null,
+    "running": [],
+    "open": [
+      100,
+      200
+    ]
+  },
+  {
+    "name": "old head verdict ignored",
+    "node": {
+      "__typename": "PullRequest",
+      "id": "PR_test",
+      "number": 100,
+      "state": "OPEN",
+      "updatedAt": "2026-11-05T00:00:00Z",
+      "comments": {
+        "nodes": []
+      },
+      "isDraft": true,
+      "headRefOid": "abc",
+      "reviews": {
+        "nodes": [
+          {
+            "state": "COMMENTED",
+            "body": "Verdict: APPROVE",
+            "submittedAt": "2026-11-07T00:00:00Z",
+            "commit": {
+              "oid": "old"
+            }
+          }
+        ]
+      },
+      "closingIssuesReferences": {
+        "nodes": [
+          {
+            "id": "I_887",
+            "number": 887,
+            "repository": {
+              "nameWithOwner": "carrick-sh/carrick"
+            }
+          }
+        ]
+      }
+    },
+    "expected": null,
+    "current": null,
+    "running": [],
+    "open": [
+      100,
+      200
+    ]
+  },
+  {
+    "name": "pending verdict ignored",
+    "node": {
+      "__typename": "PullRequest",
+      "id": "PR_test",
+      "number": 100,
+      "state": "OPEN",
+      "updatedAt": "2026-11-05T00:00:00Z",
+      "comments": {
+        "nodes": []
+      },
+      "isDraft": true,
+      "headRefOid": "abc",
+      "reviews": {
+        "nodes": [
+          {
+            "state": "PENDING",
+            "body": "Verdict: APPROVE",
+            "submittedAt": null,
+            "commit": {
+              "oid": "abc"
+            }
+          }
+        ]
+      },
+      "closingIssuesReferences": {
+        "nodes": [
+          {
+            "id": "I_887",
+            "number": 887,
+            "repository": {
+              "nameWithOwner": "carrick-sh/carrick"
+            }
+          }
+        ]
+      }
+    },
+    "expected": null,
+    "current": null,
+    "running": [],
+    "open": [
+      100,
+      200
+    ]
+  },
+  {
+    "name": "recent draft",
+    "node": {
+      "__typename": "PullRequest",
+      "id": "PR_test",
+      "number": 100,
+      "state": "OPEN",
+      "updatedAt": "2026-11-06T12:00:00Z",
+      "comments": {
+        "nodes": []
+      },
+      "isDraft": true,
+      "headRefOid": "abc",
+      "reviews": {
+        "nodes": []
+      },
+      "closingIssuesReferences": {
+        "nodes": [
+          {
+            "id": "I_887",
+            "number": 887,
+            "repository": {
+              "nameWithOwner": "carrick-sh/carrick"
+            }
+          }
+        ]
+      }
+    },
+    "expected": "In progress",
+    "current": null,
+    "running": [],
+    "open": [
+      100,
+      200
+    ]
+  },
+  {
+    "name": "stale draft",
+    "node": {
+      "__typename": "PullRequest",
+      "id": "PR_test",
+      "number": 100,
+      "state": "OPEN",
+      "updatedAt": "2026-11-05T00:00:00Z",
+      "comments": {
+        "nodes": []
+      },
+      "isDraft": true,
+      "headRefOid": "abc",
+      "reviews": {
+        "nodes": []
+      },
+      "closingIssuesReferences": {
+        "nodes": [
+          {
+            "id": "I_887",
+            "number": 887,
+            "repository": {
+              "nameWithOwner": "carrick-sh/carrick"
+            }
+          }
+        ]
+      }
+    },
+    "expected": null,
+    "current": null,
+    "running": [],
+    "open": [
+      100,
+      200
+    ]
+  },
+  {
+    "name": "latest dispatch blocked",
+    "node": {
+      "__typename": "Issue",
+      "id": "I_test",
+      "number": 100,
+      "state": "OPEN",
+      "updatedAt": "2026-11-05T00:00:00Z",
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "login": "github-actions[bot]"
+            },
+            "body": "Dispatch outcome: Done",
+            "createdAt": "2026-11-05T00:00:00Z"
+          },
+          {
+            "author": {
+              "login": "github-actions[bot]"
+            },
+            "body": "Dispatch outcome: Blocked",
+            "createdAt": "2026-11-06T00:00:00Z"
+          }
+        ]
+      }
+    },
+    "expected": "Blocked",
+    "current": null,
+    "running": [],
+    "open": [
+      100,
+      200
+    ]
+  },
+  {
+    "name": "later dispatch clears old outcome",
+    "node": {
+      "__typename": "Issue",
+      "id": "I_test",
+      "number": 100,
+      "state": "OPEN",
+      "updatedAt": "2026-11-05T00:00:00Z",
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "login": "github-actions[bot]"
+            },
+            "body": "Dispatch outcome: Blocked",
+            "createdAt": "2026-11-05T00:00:00Z"
+          },
+          {
+            "author": {
+              "login": "github-actions[bot]"
+            },
+            "body": "Dispatch outcome: Continuing",
+            "createdAt": "2026-11-06T00:00:00Z"
+          }
+        ]
+      }
+    },
+    "expected": null,
+    "current": null,
+    "running": [],
+    "open": [
+      100,
+      200
+    ]
+  },
+  {
+    "name": "director names open blocker",
+    "node": {
+      "__typename": "Issue",
+      "id": "I_test",
+      "number": 100,
+      "state": "OPEN",
+      "updatedAt": "2026-11-05T00:00:00Z",
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "login": "tjfontaine"
+            },
+            "body": "This waits on #200 before resuming.",
+            "createdAt": "2026-11-06T00:00:00Z"
+          }
+        ]
+      }
+    },
+    "expected": "Blocked",
+    "current": null,
+    "running": [],
+    "open": [
+      100,
+      200
+    ]
+  },
+  {
+    "name": "closed blocker clears blocked",
+    "node": {
+      "__typename": "Issue",
+      "id": "I_test",
+      "number": 100,
+      "state": "OPEN",
+      "updatedAt": "2026-11-05T00:00:00Z",
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "login": "tjfontaine"
+            },
+            "body": "This waits on #200 before resuming.",
+            "createdAt": "2026-11-06T00:00:00Z"
+          },
+          {
+            "author": {
+              "login": "github-actions[bot]"
+            },
+            "body": "Dispatch outcome: Blocked",
+            "createdAt": "2026-11-06T00:00:00Z"
+          }
+        ]
+      }
+    },
+    "expected": "Todo",
+    "current": "Blocked",
+    "running": [],
+    "open": [
+      100
+    ]
+  },
+  {
+    "name": "newest director comment supersedes wait",
+    "node": {
+      "__typename": "Issue",
+      "id": "I_test",
+      "number": 100,
+      "state": "OPEN",
+      "updatedAt": "2026-11-05T00:00:00Z",
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "login": "tjfontaine"
+            },
+            "body": "waits on #200",
+            "createdAt": "2026-11-05T00:00:00Z"
+          },
+          {
+            "author": {
+              "login": "tjfontaine"
+            },
+            "body": "Proceed now",
+            "createdAt": "2026-11-06T00:00:00Z"
+          }
+        ]
+      }
+    },
+    "expected": null,
+    "current": null,
+    "running": [],
+    "open": [
+      100,
+      200
+    ]
+  },
+  {
+    "name": "other author cannot block",
+    "node": {
+      "__typename": "Issue",
+      "id": "I_test",
+      "number": 100,
+      "state": "OPEN",
+      "updatedAt": "2026-11-05T00:00:00Z",
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "login": "outsider"
+            },
+            "body": "waits on #200",
+            "createdAt": "2026-11-06T00:00:00Z"
+          },
+          {
+            "author": {
+              "login": "outsider"
+            },
+            "body": "Dispatch outcome: Blocked",
+            "createdAt": "2026-11-06T00:00:00Z"
+          }
+        ]
+      }
+    },
+    "expected": null,
+    "current": null,
+    "running": [],
+    "open": [
+      100,
+      200
+    ]
+  },
+  {
+    "name": "done never reopened",
+    "node": {
+      "__typename": "PullRequest",
+      "id": "PR_test",
+      "number": 100,
+      "state": "OPEN",
+      "updatedAt": "2026-11-05T00:00:00Z",
+      "comments": {
+        "nodes": []
+      },
+      "isDraft": false,
+      "headRefOid": "abc",
+      "reviews": {
+        "nodes": []
+      },
+      "closingIssuesReferences": {
+        "nodes": [
+          {
+            "id": "I_887",
+            "number": 887,
+            "repository": {
+              "nameWithOwner": "carrick-sh/carrick"
+            }
+          }
+        ]
+      }
+    },
+    "expected": "Done",
+    "current": "Done",
+    "running": [
+      100
+    ],
+    "open": [
+      100,
+      200
+    ]
+  },
+  {
+    "name": "unclassified preserves status",
+    "node": {
+      "__typename": "Issue",
+      "id": "I_test",
+      "number": 100,
+      "state": "OPEN",
+      "updatedAt": "2026-11-05T00:00:00Z",
+      "comments": {
+        "nodes": []
+      }
+    },
+    "expected": null,
+    "current": "In progress",
+    "running": [],
+    "open": [
+      100,
+      200
+    ]
+  },
+  {
+    "name": "review beats running",
+    "node": {
+      "__typename": "PullRequest",
+      "id": "PR_test",
+      "number": 100,
+      "state": "OPEN",
+      "updatedAt": "2026-11-05T00:00:00Z",
+      "comments": {
+        "nodes": []
+      },
+      "isDraft": false,
+      "headRefOid": "abc",
+      "reviews": {
+        "nodes": []
+      },
+      "closingIssuesReferences": {
+        "nodes": [
+          {
+            "id": "I_887",
+            "number": 887,
+            "repository": {
+              "nameWithOwner": "carrick-sh/carrick"
+            }
+          }
+        ]
+      }
+    },
+    "expected": "In review",
+    "current": null,
+    "running": [
+      100
+    ],
+    "open": [
+      100,
+      200
+    ]
+  },
+  {
+    "name": "App-published dispatch outcome",
+    "node": {
+      "__typename": "Issue",
+      "id": "I_test",
+      "number": 100,
+      "state": "OPEN",
+      "updatedAt": "2026-11-05T00:00:00Z",
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "login": "github-actions[bot]"
+            },
+            "body": "Dispatch outcome: Done",
+            "createdAt": "2026-11-05T00:00:00Z"
+          },
+          {
+            "author": {
+              "login": "carrick-workers[bot]"
+            },
+            "body": "Dispatch outcome: Blocked",
+            "createdAt": "2026-11-06T00:00:00Z"
+          }
+        ]
+      }
+    },
+    "expected": "Blocked",
+    "current": null,
+    "running": [],
+    "open": [
+      100,
+      200
+    ]
+  },
+  {
+    "name": "App outcome supersedes old Actions outcome",
+    "node": {
+      "__typename": "Issue",
+      "id": "I_test",
+      "number": 100,
+      "state": "OPEN",
+      "updatedAt": "2026-11-05T00:00:00Z",
+      "comments": {
+        "nodes": [
+          {
+            "author": {
+              "login": "github-actions[bot]"
+            },
+            "body": "Dispatch outcome: Blocked",
+            "createdAt": "2026-11-05T00:00:00Z"
+          },
+          {
+            "author": {
+              "login": "carrick-workers[bot]"
+            },
+            "body": "Dispatch outcome: Continuing",
+            "createdAt": "2026-11-06T00:00:00Z"
+          }
+        ]
+      }
+    },
+    "expected": null,
+    "current": null,
+    "running": [],
+    "open": [
+      100,
+      200
+    ]
+  }
+]

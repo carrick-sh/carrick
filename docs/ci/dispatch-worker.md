@@ -1385,3 +1385,28 @@ To qualify the disk saving, repeat the per-round disk-write measurement from
 is approximately 1.9 GB per worker; metadata validation still reads the shared
 tree. A source change or a fixture pass alone does not establish that measured
 round-level saving.
+
+### Reconcile the operations board
+
+Run `just xtask board reconcile` during each operations sweep. It reads org
+project 1 and the open issues and PRs in `carrick-sh/carrick`, then prints one
+JSON line per proposed change, including the old and new status and a reason.
+Missing items are listed even when there is no status to infer. The default
+mode performs no mutations. `just xtask board reconcile --apply` prints its
+complete plan first and executes only that plan. Both commands need `gh`
+authentication; applying also needs organization project write permission.
+
+Closed or merged items become Done; existing Done items stay Done. A ready PR
+or a published current-head review with an exact `Verdict: APPROVE` line means
+In review. A running dispatch round or a draft updated in the preceding 24
+hours means In progress. PR review/progress also advances its closing issues,
+using GitHub's closing relationships. Review takes precedence over progress,
+and both take precedence over Blocked.
+
+The latest workflow-bot `Dispatch outcome:` record can establish Blocked. The
+newest comment by the director (`tjfontaine`) can also name a blocker with
+`waits on #N`; the plan includes that number. If that blocker has closed, an
+otherwise Blocked item moves to Todo. Without one of these facts, existing
+status is left alone. Closed items outside the board are not added by this
+open-item census. A failure while reading prevents all writes; a failure
+while applying stops the run and may leave an already-applied prefix.

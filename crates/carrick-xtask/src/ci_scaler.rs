@@ -15,6 +15,7 @@ mod assignment;
 mod capture;
 mod claim;
 mod github;
+pub(crate) use github::Github;
 pub(crate) use github::dispatch_workflow_unchanged;
 mod live;
 mod mac;

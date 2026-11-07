@@ -8,6 +8,12 @@ use std::process::{Command, Stdio};
 
 #[path = "dispatch_loop.rs"]
 mod agent_loop;
+
+/// Read the server-authored outcome line, excluding embedded worker claims.
+pub(crate) fn published_outcome_status(body: &str) -> Option<&str> {
+    agent_loop::outcome_status(body)
+}
+
 #[path = "dispatch_live_log.rs"]
 mod live_log;
 #[path = "dispatch_reactor.rs"]
