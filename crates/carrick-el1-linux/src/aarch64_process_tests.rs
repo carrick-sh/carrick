@@ -2091,6 +2091,7 @@ fn test_fork_child_gets_distinct_root_and_x0_zero() {
 /// Null user pointers deliberately remove clock calibration and MM supply from
 /// this first routing witness. This is not yet the successful-read acceptance
 /// witness: it isolates ENOSYS before any time handler or copy can run.
+#[cfg(test)]
 fn native_fork_child_time_handler(number: carrick_abi::CanonicalNr) {
     use super::native_process_runtime::NativeThreadGroupOwner;
     use carrick_personality_linux::dispatch::CompletionRoute;
