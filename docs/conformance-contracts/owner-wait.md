@@ -223,3 +223,16 @@ immediately before both open and final lower, then enrolls after delivery.
 It must recover `Changed` and its operation without parking. This was red
 on admitted main: the contender parked after the final Gate release.
 No retry, polling, extra queue or work-budget change is introduced.
+
+The finishing round repeated the production Gate witness against the preserved
+pre-fix implementation: it failed with “owner parked after the final Gate
+release with no producer”. Restoring the fix passed both open and final lower.
+After rebasing, the scheduler suite passed 269 unit tests, two integration tests
+and twelve doctests; its `serial_host` partition contains no tests. Native EL1
+passed 734 tests with one ignored. CPL0, contract coverage, source-only and
+PR-base authority-debt checks, formatting and host-supported clippy passed.
+The first native EL1 attempt stopped before executing tests because the offline
+cache lacked a dependency; fetching dependencies allowed the real suite to run.
+Independent source re-review found no findings. This Linux evidence does not
+supply signed HVF, Docker, runtime ratios or the merge-queue KVM gate; those
+acceptance layers remain outstanding.
