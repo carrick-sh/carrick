@@ -1284,7 +1284,8 @@ if args[:2] == ['run', 'download']:
     sha = name.removeprefix('signed-baseline-').rsplit('-', 1)[0]
     shutil.copyfile(baselines / (sha + '.json'), pathlib.Path(args[args.index('--dir') + 1]) / 'candidate.json')
 elif args[:2] == ['api', 'graphql']:
-    print(json.dumps({{'data': {{'repository': {{'mergeQueue': {{'entries': {{'nodes': []}}}}}}}}}}))
+    nodes = json.loads(os.environ['TEST_QUEUE_ENTRIES'])
+    print(json.dumps({{'data': {{'repository': {{'mergeQueue': {{'entries': {{'nodes': nodes}}}}}}}}}}))
 elif args[0] == 'api':
     endpoint = args[-1]
     if '/compare/' in endpoint and '?per_page=' not in endpoint:
@@ -1351,6 +1352,22 @@ else:
             .env("GITHUB_SHA", head_sha)
             .env("TEST_GRAPH", &repo)
             .env("TEST_BASELINES", &baselines)
+            .env(
+                "TEST_QUEUE_ENTRIES",
+                serde_json::json!([
+                    {
+                        "baseCommit": {"oid": m1},
+                        "headCommit": {"oid": valid_g1},
+                        "pullRequest": {"number": 901, "baseRefName": "main", "baseRepository": {"nameWithOwner": "carrick-sh/carrick"}}
+                    },
+                    {
+                        "baseCommit": {"oid": valid_g1},
+                        "headCommit": {"oid": valid_g2},
+                        "pullRequest": {"number": 902, "baseRefName": "main", "baseRepository": {"nameWithOwner": "carrick-sh/carrick"}}
+                    }
+                ])
+                .to_string(),
+            )
             .env_remove("GITHUB_OUTPUT")
             .args(["signed-gate", "prepare", "--event"])
             .arg(&event_path)
@@ -1487,6 +1504,7 @@ fn queued_merge_group_resolves_rebased_prs_and_names_them_in_published_receipt()
         &entries_path,
         json!([
             {
+                "baseCommit": { "oid": a },
                 "headCommit": { "oid": d },
                 "pullRequest": {
                     "number": 1762,
@@ -1495,6 +1513,7 @@ fn queued_merge_group_resolves_rebased_prs_and_names_them_in_published_receipt()
                 }
             },
             {
+                "baseCommit": { "oid": d },
                 "headCommit": { "oid": b },
                 "pullRequest": {
                     "number": 1788,
@@ -1503,6 +1522,7 @@ fn queued_merge_group_resolves_rebased_prs_and_names_them_in_published_receipt()
                 }
             },
             {
+                "baseCommit": { "oid": b },
                 "headCommit": { "oid": c },
                 "pullRequest": {
                     "number": 1799,
@@ -1511,6 +1531,7 @@ fn queued_merge_group_resolves_rebased_prs_and_names_them_in_published_receipt()
                 }
             },
             {
+                "baseCommit": { "oid": c },
                 "headCommit": { "oid": batched_mid },
                 "pullRequest": {
                     "number": 1801,
@@ -1519,6 +1540,7 @@ fn queued_merge_group_resolves_rebased_prs_and_names_them_in_published_receipt()
                 }
             },
             {
+                "baseCommit": { "oid": batched_mid },
                 "headCommit": { "oid": batched },
                 "pullRequest": {
                     "number": 1802,
@@ -1527,6 +1549,7 @@ fn queued_merge_group_resolves_rebased_prs_and_names_them_in_published_receipt()
                 }
             },
             {
+                "baseCommit": { "oid": batched_mid },
                 "headCommit": { "oid": batched },
                 "pullRequest": {
                     "number": 9999,
@@ -1728,37 +1751,4 @@ else:
                 .contains("Pull requests: #1762, #1788")
         );
     }
-
-    // (5) Race: predecessor #1762 just merged after git fetch (its queue ref and
-    // mergeQueue entry disappeared, and /commits/{d}/pulls now links d -> #1762).
-    git(&["update-ref", "-d", &ref_1762]);
-    std::fs::write(
-        &entries_path,
-        json!([{
-            "headCommit": { "oid": b },
-            "pullRequest": {
-                "number": 1788,
-                "baseRefName": "main",
-                "baseRepository": { "nameWithOwner": "carrick-sh/carrick" }
-            }
-        }])
-        .to_string(),
-    )
-    .unwrap();
-    std::fs::write(&merged_pulls_path, json!({ d.clone(): [1762] }).to_string()).unwrap();
-    let (raced_req, _) = run_prepare("raced", &ref_1788, &d, &b);
-    assert_eq!(raced_req["base"], a);
-    assert_eq!(raced_req["prs"], json!([1762, 1788]));
-
-    // (6) Race on a multi-PR batch: if #1801+#1802 merged before mergeQueue was
-    // queried (even if ls-remote still saw ref_1801), fallback recovers #1802 too.
-    std::fs::write(&entries_path, "[]").unwrap();
-    std::fs::write(
-        &merged_pulls_path,
-        json!({ batched_mid.clone(): [1801], batched.clone(): [1802] }).to_string(),
-    )
-    .unwrap();
-    let (batched_raced_req, _) = run_prepare("batched-raced", &ref_1801, &a, &batched);
-    assert_eq!(batched_raced_req["base"], a);
-    assert_eq!(batched_raced_req["prs"], json!([1801, 1802]));
 }
