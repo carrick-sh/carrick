@@ -8,11 +8,6 @@ use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-fn publish(path: &std::path::Path) {
-    fs::write(path, b"#!/bin/sh\nexit 0\n").unwrap();
-    carrick_test_support::publish_executable(path, 0o700).unwrap();
-}
-
 #[test]
 fn executable_fixture_survives_parallel_fork_inheriting_writer() {
     let root = tempfile::tempdir().unwrap();
@@ -62,7 +57,8 @@ fn executable_fixture_survives_parallel_fork_inheriting_writer() {
                     let spawning = scope.spawn(move || command.status().unwrap());
                     parent.read_exact(&mut [0u8]).unwrap();
                     drop(writer);
-                    publish(&path);
+                    fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
+                    carrick_test_support::publish_executable(&path, 0o700).unwrap();
                     let executed = Command::new(&path).status();
                     parent.write_all(&[1u8]).unwrap();
                     assert!(spawning.join().unwrap().success());

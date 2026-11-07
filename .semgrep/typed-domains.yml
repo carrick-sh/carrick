@@ -411,9 +411,23 @@ rules:
                 fs::write($P, ...).unwrap();
                 ...
               }
+          - pattern-inside: |
+              {
+                ...
+                std::fs::write(&$P, ...).unwrap();
+                ...
+              }
+          - pattern-inside: |
+              {
+                ...
+                fs::write(&$P, ...).unwrap();
+                ...
+              }
       - pattern-either:
           - pattern: std::fs::set_permissions($P, std::fs::Permissions::from_mode($MODE))
           - pattern: fs::set_permissions($P, fs::Permissions::from_mode($MODE))
+          - pattern: std::fs::set_permissions(&$P, std::fs::Permissions::from_mode($MODE))
+          - pattern: fs::set_permissions(&$P, fs::Permissions::from_mode($MODE))
       - metavariable-regex:
           metavariable: $MODE
           regex: '^0o7[0-7]+$'

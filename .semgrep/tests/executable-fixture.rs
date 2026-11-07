@@ -22,3 +22,14 @@ fn data(path: &std::path::Path) {
     // ok: carrick-no-raw-executable-fixture
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
 }
+
+fn borrowed_write(path: std::path::PathBuf) {
+    std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+    // ruleid: carrick-no-raw-executable-fixture
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+fn borrowed_chmod(path: &std::path::Path) {
+    std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+    // ruleid: carrick-no-raw-executable-fixture
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
