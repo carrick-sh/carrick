@@ -495,7 +495,7 @@ fn job_home_and_work_are_recreated_from_the_skeleton_before_every_job() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn reset_clears_inheritable_home_acl_without_replacing_inode() {
+fn reset_clears_home_acl_and_xattrs_without_replacing_inode() {
     use std::os::unix::fs::MetadataExt;
     use std::process::Command;
 
@@ -524,8 +524,27 @@ fn reset_clears_inheritable_home_acl_without_replacing_inode() {
         String::from_utf8(out.stdout).unwrap()
     };
     assert!(listing(&home).contains("everyone allow"));
+    let outside = root.path().join("outside");
+    write_skeleton_entry(&outside, "untouched", 0o600);
+    write_skeleton_entry(home.join("stale"), "old job", 0o600);
+    std::os::unix::fs::symlink(&outside, home.join("outside-link")).unwrap();
+    std::os::unix::fs::symlink(&outside, skel.join("outside-link")).unwrap();
+    let xattr = |args: &[&str], path: &std::path::Path| {
+        let out = Command::new("/usr/bin/xattr").args(args).arg(path).output().unwrap();
+        assert!(out.status.success(), "{}: {:?}", path.display(), out);
+        out.stdout
+    };
+    for path in [&home, &home.join("stale"), &outside] {
+        xattr(&["-w", "com.carrick.reset-test", "old job"], path);
+        assert!(!xattr(&[], path).is_empty());
+    }
     let inode = std::fs::metadata(&home).unwrap().ino();
     reset_job_area(&skel, &home, &[], uid, uid, gid).unwrap();
+    for path in [&home, &home.join("config"), &home.join("config/clean"), &home.join("outside-link")] {
+        assert!(xattr(&["-s"], path).is_empty(), "{} retains xattrs", path.display());
+    }
+    assert!(!home.join("stale").exists());
+    assert_eq!(xattr(&["-p", "com.carrick.reset-test"], &outside), b"old job");
     assert_eq!(std::fs::metadata(&home).unwrap().ino(), inode);
     for path in [&home, &home.join("config"), &home.join("config/clean")] {
         let acl = listing(path);
