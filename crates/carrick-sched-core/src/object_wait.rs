@@ -2520,6 +2520,25 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         })
     }
 
+    /// Lock-free observation of a bound object wait queue's epoch.
+    ///
+    /// Returns `None` if `key` is out of bounds, unbound (`epoch == 0`), or
+    /// bound to a different generation.
+    pub fn object_wait_epoch(&self, key: ObjectWaitKey) -> Option<u64> {
+        if key.index as usize >= OBJECT_WAIT_QUEUES || key.generation == 0 {
+            return None;
+        }
+        let queue = self.object_queue(key.index as usize);
+        if queue.generation.load(Ordering::Acquire) != key.generation {
+            return None;
+        }
+        let epoch = queue.epoch.load(Ordering::SeqCst);
+        if epoch == 0 || queue.generation.load(Ordering::Acquire) != key.generation {
+            return None;
+        }
+        Some(epoch)
+    }
+
     /// Acquisition must name a delivery venue even on a legacy readiness
     /// queue: a concurrent lock admission may transfer completion custody.
     ///
