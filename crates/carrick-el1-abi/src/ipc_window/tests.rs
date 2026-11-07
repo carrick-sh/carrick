@@ -133,7 +133,7 @@ fn ipc_binding_refuses_overflow_zero_va_and_overlapping_domains() {
     let mut cases = std::vec::Vec::new();
     for lane in [0, 1, 3, 4] {
         let mut geometry = valid;
-        geometry[lane] = u64::MAX & !0x1f_ffff;
+        geometry[lane] = !0x1f_ffff_u64;
         cases.push(geometry);
     }
     for lane in [0, 3] {
