@@ -199,42 +199,25 @@ pub(crate) fn timerfd_poll_source_from_lease(
 fn timerfd_plan(state: &TimerFdState) -> TimerFdReadPlan {
     let (clock_generation, plan) = state.clock.with_clock_change_snapshot(|| {
         let mut timer = state.inner.lock();
-        let ready = refresh_timerfd_locked(&state.clock, &mut timer) > 0;
-        let deadline = timer.state.deadline();
-        let host_timeout = if ready {
-            Some(Duration::ZERO)
-        } else if state.clock.is_deterministic()
-            || (state.clock.is_frozen()
-                && matches!(
-                    timer.clock_id,
-                    LINUX_CLOCK_REALTIME
-                        | LINUX_CLOCK_REALTIME_COARSE
-                        | LINUX_CLOCK_REALTIME_ALARM
-                        | LINUX_CLOCK_TAI
-                ))
-        {
-            None
-        } else {
-            deadline.and_then(|deadline| {
-                linux_clock_duration(&state.clock, timer.clock_id)
-                    .map(|now| state.clock.scale_timeout(deadline.saturating_sub(now)))
-            })
+        use carrick_timer_core::timerfd::clock::Clock;
+        let clock = match timer.clock_id {
+            LINUX_CLOCK_REALTIME | LINUX_CLOCK_REALTIME_ALARM => Clock::Realtime,
+            LINUX_CLOCK_BOOTTIME | LINUX_CLOCK_BOOTTIME_ALARM => Clock::Boottime,
+            _ => Clock::Monotonic,
         };
-        let virtual_due = state
-            .clock
-            .is_deterministic()
-            .then(|| {
-                deadline.map(|deadline| match timer.clock_id {
-                    LINUX_CLOCK_REALTIME | LINUX_CLOCK_REALTIME_ALARM | LINUX_CLOCK_TAI => {
-                        deadline.saturating_sub(state.clock.realtime_epoch_duration())
-                    }
-                    _ => deadline,
-                })
-            })
-            .flatten();
+        let view = state.clock.timer_clock_view();
+        // Refresh and enrollment use one sample under the clock-change
+        // snapshot. The creator domain, never the reader, chooses its source.
+        let now = timer
+            .state
+            .deadline()
+            .map(|_| view.now(clock, |host| state.clock.sample_timer_host_clock(host)));
+        let ready = timer.state.refresh(now) > 0;
+        let deadline = timer.state.deadline();
+        let plan = view.deadline_at(clock, deadline, ready, now);
         TimerFdReadPlan {
-            host_timeout,
-            virtual_due,
+            host_timeout: plan.host_timeout,
+            virtual_due: plan.virtual_due,
             ready,
             deadline,
             expirations: timer.state.pending(),

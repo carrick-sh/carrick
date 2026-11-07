@@ -3,6 +3,8 @@
 //! The caller samples the timer creator’s clock domain and serializes state
 //! updates. This module neither selects a clock nor owns readiness delivery.
 
+pub mod clock;
+
 use core::time::Duration;
 
 /// Timerfd state independent of its storage and clock authority.
@@ -411,6 +413,68 @@ mod clock_projection_tests {
         assert_eq!(
             scaled.scale_timeout(Duration::MAX),
             Duration::from_nanos(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn scaled_zero_speed_and_boundaries_keep_existing_conversion_policy() {
+        let stopped = ClockView::Scaled {
+            realtime: Duration::from_secs(500),
+            numerator: 0,
+            denominator: 2,
+        };
+        assert_eq!(stopped.now(Clock::Realtime, host), Duration::from_secs(500));
+        assert_eq!(stopped.now(Clock::Monotonic, host), Duration::ZERO);
+        // Preserve the current host inverse conversion for zero speed; a
+        // different zero-speed wake policy needs its own semantic change.
+        assert_eq!(
+            stopped.scale_timeout(Duration::from_secs(3)),
+            Duration::from_secs(6)
+        );
+        let saturated = ClockView::Scaled {
+            realtime: Duration::MAX,
+            numerator: u32::MAX,
+            denominator: 1,
+        };
+        assert_eq!(
+            saturated.now(Clock::Realtime, |_| Duration::MAX),
+            Duration::MAX
+        );
+        assert_eq!(
+            saturated.now(Clock::Boottime, |_| Duration::MAX),
+            Duration::from_nanos(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn a_deadline_samples_its_source_once_and_never_samples_when_disarmed() {
+        let view = ClockView::Live {
+            realtime_offset_ns: 1_000_000_000,
+        };
+        let mut calls = 0;
+        let plan = view.deadline(
+            Clock::Realtime,
+            Some(Duration::from_secs(1005)),
+            false,
+            |source| {
+                calls += 1;
+                assert_eq!(source, HostClock::Realtime);
+                Duration::from_secs(1000)
+            },
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(plan.host_timeout, Some(Duration::from_secs(4)));
+        assert_eq!(
+            view.deadline(Clock::Realtime, None, false, |_| panic!(
+                "disarmed timer sampled host"
+            ))
+            .host_timeout,
+            None
+        );
+        assert_eq!(
+            view.deadline_at(Clock::Realtime, Some(Duration::MAX), false, None)
+                .host_timeout,
+            None
         );
     }
 

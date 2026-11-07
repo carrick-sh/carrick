@@ -377,3 +377,29 @@ deterministic clocks use explicit virtual progress. A raw architecture
 counter cannot substitute for these modes. The Temporary crossings must
 remain until the complete service exists; this prerequisite does not justify
 retiring them or claiming signed acceptance.
+
+## Shared creator-clock projection prerequisite
+
+`carrick_timer_core::timerfd::clock` now owns clock transformation and timer
+wake-deadline selection. Production `ClockDomain` supplies the selected native
+source lazily: calibrated realtime, monotonic, boottime, or elapsed time since
+that domain's origin. Its existing mode, offset and virtual-progress owners
+remain authoritative. Frozen mode fixes realtime only; deterministic mode does
+not sample the host; scaled samples and inverse timeouts preserve the existing
+u64-nanosecond saturation and zero-numerator policy.
+
+The host timerfd planner builds the view under its existing clock-change
+snapshot lock, then uses one sample for both refresh and deadline derivation.
+Clock callbacks, deterministic waiter participation and timer-change publication
+remain with their existing owners. The core view is ordinary Rust policy, not a
+wire record, authenticated domain handle or shared clock publication protocol.
+No IPC ABI or crossing policy changes in this step.
+
+The red core binding required the missing projection API; its green scenarios
+cover independent live clock sources, signed-offset saturation, frozen realtime
+with live monotonic/boottime deadlines, rational scaling, deterministic epoch
+conversion, one native sample, and no sample for disarmed or virtual deadlines.
+Existing host clock and timerfd tests remain the production integration proof.
+This extraction does not serve native timerfd calls. Shared IPC timer storage,
+creator-domain publication and generation-authenticated deadline enrollment
+remain required before retiring the Temporary crossings or claiming acceptance.

@@ -778,86 +778,72 @@ impl ClockDomain {
             .unwrap_or(Duration::ZERO)
     }
 
+    /// Snapshot the creator-domain transformation. This is ordinary Rust
+    /// policy, not a published ring clock record. Timer owners capture it
+    /// under `with_clock_change_snapshot` before deriving a wait plan.
+    pub(crate) fn timer_clock_view(&self) -> carrick_timer_core::timerfd::clock::ClockView {
+        use carrick_timer_core::timerfd::clock::ClockView;
+        let since_epoch =
+            |base: &SystemTime| base.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
+        match &self.control {
+            TimeControl::System | TimeControl::Offset(_) => ClockView::Live {
+                realtime_offset_ns: self.realtime_offset_ns(),
+            },
+            TimeControl::Frozen(base) => ClockView::Frozen {
+                realtime: since_epoch(base),
+            },
+            TimeControl::Scaled { base, num, den } => ClockView::Scaled {
+                realtime: since_epoch(base),
+                numerator: *num,
+                denominator: *den,
+            },
+            TimeControl::Deterministic { epoch } => ClockView::Deterministic {
+                realtime_epoch: since_epoch(epoch),
+                monotonic: Duration::from_nanos(self.virtual_monotonic_ns.load(Ordering::SeqCst)),
+            },
+        }
+    }
+
+    pub(crate) fn sample_timer_host_clock(
+        &self,
+        clock: carrick_timer_core::timerfd::clock::HostClock,
+    ) -> Duration {
+        use carrick_timer_core::timerfd::clock::HostClock;
+        match clock {
+            HostClock::Realtime => self.realtime_base_now(),
+            HostClock::Monotonic => crate::dispatch::monotonic_duration(),
+            HostClock::Boottime => crate::dispatch::boottime_duration(),
+            HostClock::Elapsed => self.start_host_instant.elapsed(),
+        }
+    }
+
     /// CLOCK_REALTIME as this container sees it.
     pub fn realtime_now(&self) -> Duration {
-        match &self.control {
-            TimeControl::System => {
-                let offset_ns = self.realtime_offset_ns();
-                let base = self.realtime_base_now();
-                if offset_ns >= 0 {
-                    base.saturating_add(Duration::from_nanos(offset_ns as u64))
-                } else {
-                    base.saturating_sub(Duration::from_nanos(offset_ns.unsigned_abs()))
-                }
-            }
-            TimeControl::Offset(delta) => {
-                let offset_ns = delta.as_nanos_i64().unwrap_or(0);
-                let base = self.realtime_base_now();
-                if offset_ns >= 0 {
-                    base.saturating_add(Duration::from_nanos(offset_ns as u64))
-                } else {
-                    base.saturating_sub(Duration::from_nanos(offset_ns.unsigned_abs()))
-                }
-            }
-            TimeControl::Frozen(base) => base.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO),
-            TimeControl::Scaled { base, num, den } => {
-                let base_dur = base.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
-                let elapsed_scaled = self.scaled_elapsed(*num, *den);
-                base_dur.saturating_add(elapsed_scaled)
-            }
-            TimeControl::Deterministic { epoch } => {
-                let epoch_dur = epoch.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
-                let virt_ns = self.virtual_monotonic_ns.load(Ordering::SeqCst);
-                epoch_dur.saturating_add(Duration::from_nanos(virt_ns))
-            }
-        }
+        self.timer_clock_view().now(
+            carrick_timer_core::timerfd::clock::Clock::Realtime,
+            |clock| self.sample_timer_host_clock(clock),
+        )
     }
 
     /// CLOCK_MONOTONIC as this container sees it.
     pub fn monotonic_now(&self) -> Duration {
-        match &self.control {
-            TimeControl::System | TimeControl::Offset(_) | TimeControl::Frozen(_) => {
-                crate::dispatch::monotonic_duration()
-            }
-            TimeControl::Scaled { num, den, .. } => self.scaled_elapsed(*num, *den),
-            TimeControl::Deterministic { .. } => {
-                let virt_ns = self.virtual_monotonic_ns.load(Ordering::SeqCst);
-                Duration::from_nanos(virt_ns)
-            }
-        }
+        self.timer_clock_view().now(
+            carrick_timer_core::timerfd::clock::Clock::Monotonic,
+            |clock| self.sample_timer_host_clock(clock),
+        )
     }
 
     /// CLOCK_BOOTTIME as this container sees it.
     pub fn boottime_now(&self) -> Duration {
-        match &self.control {
-            TimeControl::System | TimeControl::Offset(_) | TimeControl::Frozen(_) => {
-                crate::dispatch::boottime_duration()
-            }
-            TimeControl::Scaled { num, den, .. } => self.scaled_elapsed(*num, *den),
-            TimeControl::Deterministic { .. } => {
-                let virt_ns = self.virtual_monotonic_ns.load(Ordering::SeqCst);
-                Duration::from_nanos(virt_ns)
-            }
-        }
-    }
-
-    fn scaled_elapsed(&self, num: u32, den: u32) -> Duration {
-        let den = if den == 0 { 1 } else { den };
-        let elapsed_host = self.start_host_instant.elapsed();
-        let scaled_nanos = (elapsed_host.as_nanos() * (num as u128)) / (den as u128);
-        Duration::from_nanos(u64::try_from(scaled_nanos).unwrap_or(u64::MAX))
+        self.timer_clock_view().now(
+            carrick_timer_core::timerfd::clock::Clock::Boottime,
+            |clock| self.sample_timer_host_clock(clock),
+        )
     }
 
     /// Scale a guest timeout into the duration to wait on the host.
     pub fn scale_timeout(&self, timeout: Duration) -> Duration {
-        match &self.control {
-            TimeControl::Scaled { num, den, .. } => {
-                let num = if *num == 0 { 1 } else { *num };
-                let host_nanos = (timeout.as_nanos() * (*den as u128)) / (num as u128);
-                Duration::from_nanos(u64::try_from(host_nanos).unwrap_or(u64::MAX))
-            }
-            _ => timeout,
-        }
+        self.timer_clock_view().scale_timeout(timeout)
     }
 
     /// Advance virtual time in Deterministic mode by `delta`.
