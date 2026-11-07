@@ -13283,6 +13283,60 @@ fi
     }
 
     #[test]
+    fn replay_1813_issue_review_trigger_refuses_fresh_start_and_binds_target_pr() {
+        let mut original = review_event();
+        original["issue"]["number"] = json!(1813);
+        original["pull_request"]["number"] = json!(1816);
+        original["pull_request"]["state"] = json!("open");
+        original["pull_request"]["head"]["ref"] = json!("work/dispatch-1813-42");
+        original["pull_request"]["head"]["sha"] = json!("b".repeat(40));
+        let pr = original["pull_request"].clone();
+        let run = original["dispatch_run"].clone();
+        let mut trigger = event();
+        trigger["issue"]["number"] = json!(1813);
+        trigger["issue"]["state"] = json!("open");
+        trigger["action"] = json!("created");
+        trigger["comment"] = json!({
+            "body": "/agent\nFresh start: yes\nreview PR #1816 only; change no code and push nothing",
+            "user": {"login": "tjfontaine", "type": "User"},
+            "created_at": "now",
+            "updated_at": "now"
+        });
+        assert!(
+            select_issue_branch(
+                &mut trigger,
+                std::slice::from_ref(&pr),
+                |_, _| Ok((run.clone(), None)),
+                &mut owner_collaborator(),
+            )
+            .is_err(),
+            "review round accepted Fresh start: yes"
+        );
+        trigger["comment"]["body"] =
+            json!("/agent\nreview PR #9999 only; change no code and push nothing");
+        assert!(
+            select_issue_branch(
+                &mut trigger,
+                std::slice::from_ref(&pr),
+                |_, _| Ok((run.clone(), None)),
+                &mut owner_collaborator(),
+            )
+            .is_err(),
+            "review round selected a PR different from its target"
+        );
+        trigger["comment"]["body"] =
+            json!("/agent\nreview PR #1816 only; change no code and push nothing");
+        select_issue_branch(
+            &mut trigger,
+            std::slice::from_ref(&pr),
+            |_, _| Ok((run.clone(), None)),
+            &mut owner_collaborator(),
+        )
+        .unwrap();
+        assert_eq!(trigger["pull_request"]["number"], 1816);
+    }
+
+    #[test]
     fn review_admission_requires_trusted_reviewer_and_owned_pr() {
         let event = review_event();
         let dispatch = validate_event(&event, "tjfontaine", &mut owner_collaborator())
