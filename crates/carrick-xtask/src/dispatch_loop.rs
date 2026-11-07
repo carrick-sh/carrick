@@ -4683,6 +4683,39 @@ mod tests {
         });
     }
     #[test]
+    fn replay_1813_review_rounds_finish_from_published_verdict() {
+        // Recorded in #1813: #1776/#1709 and #1800/#1794 approved;
+        // #1731/#1727 requested changes but left its review in review.md.
+        shared_fixture(|root| {
+            for (round, pr, verdict) in [
+                (1776, 1709, "APPROVE"),
+                (1731, 1727, "CHANGES REQUESTED"),
+                (1800, 1794, "APPROVE"),
+            ] {
+                let mut s = server(root);
+                s.trigger = json!({"body": format!("review PR #{pr} only; change no code and push nothing")});
+                let mut live: Value =
+                    serde_json::from_str(&regular_text(&root.join("pr.json")).unwrap()).unwrap();
+                live["head"]["sha"] = json!("a".repeat(40));
+                std::fs::write(root.join("pr.json"), live.to_string()).unwrap();
+                std::fs::write(root.join("behind"), "2").unwrap();
+                std::fs::write(root.join("stop-reviews.json"), json!([[{
+                    "commit_id": "a".repeat(40), "state": "COMMENTED",
+                    "body": format!("Verdict: {verdict}"),
+                    "html_url": "https://github.com/carrick-sh/carrick/pull/800#pullrequestreview-123"
+                }]]).to_string()).unwrap();
+                s.outcome(ContractStatus::Done, "Review finished; pushed nothing")
+                    .unwrap();
+                let posted = regular_text(&root.join("posted.md")).unwrap();
+                assert!(
+                    posted.contains("Dispatch outcome: Done"),
+                    "round #{round}: {posted}"
+                );
+                assert!(posted.contains(verdict), "round #{round}: {posted}");
+            }
+        });
+    }
+    #[test]
     fn unpublished_review_claim_fails_round() {
         super::super::tests::publication_fixture_outcome("review-claimed", |root, dispatch| {
             let mut s = server(root);
