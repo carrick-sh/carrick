@@ -419,7 +419,7 @@ pub unsafe fn execute_native_descriptor_txn(
     let words = NativeDescriptorWords::checked(txn.root, txn.id, tables)?;
     let guard = crate::substrate::sched::hw::disable_irq_save();
     let receipt = execute_descriptor_txn(&words, txn, txn.root, &mut InlineJournal::new());
-    crate::substrate::sched::hw::restore_irq(guard);
+    drop(guard);
     if words.failed_drain.get() || matches!(receipt.outcome, DescriptorOutcome::Indeterminate(_)) {
         return Err(ArchError::Busy);
     }

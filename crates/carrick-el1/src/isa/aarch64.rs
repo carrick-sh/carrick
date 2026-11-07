@@ -624,7 +624,7 @@ impl InterruptBackend for Aarch64Backend {
         hw::disable_irq_save()
     }
     fn restore_interrupts(&mut self, mask: hw::IrqGuard) -> Result<(), Self::Error> {
-        hw::restore_irq(mask);
+        drop(mask);
         Ok(())
     }
     fn park_until_interrupt(&mut self) -> Result<(), Self::Error> {
