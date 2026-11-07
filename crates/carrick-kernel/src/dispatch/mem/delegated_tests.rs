@@ -7624,10 +7624,11 @@ fn native_code_reservation(case: NativeCodeReservationCase) {
         ) -> Result<(), MemoryError> {
             // Permit only the initial inaccessible reservation, so the red
             // witness reaches hint placement rather than failing on setup.
-            assert_eq!(
-                prot, 0,
-                "owner mapping entered legacy protection publication"
-            );
+            if prot != 0 {
+                return Err(MemoryError::HostMap(
+                    "admitted owner MM cannot enter host sparse publication".to_owned(),
+                ));
+            }
             self.protect_owner_reserved_range(address, len, prot)
         }
         fn protect_owner_reserved_range(
