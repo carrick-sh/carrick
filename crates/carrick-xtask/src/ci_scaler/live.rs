@@ -29,6 +29,8 @@ static STORAGE: (
 
 struct StorageAdmission {
     key: StorageKey,
+    // Only an explicitly ambiguous request may outlive this admission guard.
+    retain_uncertain: std::cell::Cell<bool>,
 }
 impl StorageAdmission {
     fn acquire(node: &str, storage: &str) -> Result<Self, ScalerError> {
@@ -48,7 +50,10 @@ impl StorageAdmission {
             let slot = slots.entry(key.clone()).or_default();
             if !slot.owned {
                 slot.owned = true;
-                return Ok(Self { key });
+                return Ok(Self {
+                    key,
+                    retain_uncertain: std::cell::Cell::new(slot.uncertain),
+                });
             }
             let Some(deadline) = deadline else {
                 return Err(ScalerError::StorageBusy);
@@ -121,15 +126,19 @@ impl StorageAdmission {
     fn submit_task(&self, pve: &Pve, call: PveCall, path: &str) -> Result<String, ScalerError> {
         remaining(pve.deadline.get(), Duration::from_secs(45))?;
         self.set_uncertain(true)?;
+        // From this point even unwinding could lose an accepted task's reply.
+        self.retain_uncertain.set(true);
         match pve.request(call, path) {
             Ok(response) => {
                 let task = task_id(response)?;
                 self.record_task(task.clone())?;
+                self.retain_uncertain.set(false);
                 Ok(task)
             }
             Err(error) => {
                 if matches!(&error, ScalerError::PveRejected(msg) if msg.starts_with("HTTP 4")) {
-                    self.set_uncertain(false)?;
+                    // No task was accepted; Drop settles the slot on every exit.
+                    self.retain_uncertain.set(false);
                 }
                 Err(error)
             }
@@ -162,6 +171,9 @@ impl Drop for StorageAdmission {
         if let Ok(mut slots) = STORAGE.0.lock()
             && let Some(slot) = slots.get_mut(&self.key)
         {
+            if !self.retain_uncertain.get() {
+                slot.uncertain = false;
+            }
             slot.owned = false;
             STORAGE.1.notify_all();
         }
