@@ -360,3 +360,48 @@ unresolved. The Linux worker cannot run signed HVF; the director's paired
 population and two consecutive main signed runs remain acceptance work. The
 shared binding introduces no per-ISA policy; CPL0's separate existing host-wait
 path is not exercised by this owner-wait fixture.
+
+## Linux verification continuation, 2026-11-07
+
+Rebased onto admitted main without conflicts. `git range-diff` matched all
+18 preceding commits with `=`; no implementation, witness or earlier commit
+was intentionally dropped. This continuation adds verification evidence only.
+
+The production owner-wait witness was re-proven red then green on this Linux
+x86_64 runner. Removing only the three `bind_parked_lifecycle` calls from the
+host-park producers made exactly one test fail at `host park lost its retained
+lifecycle aliases before owner release`, with actual aliases `(0, 0)`.
+Restoring the calls made that same test pass. Temporary source edits were
+restored and the working tree checked before this record was committed.
+This is a deterministic producer witness, not a signed population result.
+
+Completed checks:
+
+- Runtime regular partition: 647 passed, five ignored; serial partition:
+  94 passed, one ignored, both with one test thread.
+- Standard `just _test-unit-runtime` recipe with `syscall-shim,platform-linux`:
+  741 passed, six ignored.
+- Scheduler-core: 270 passed; its serial partition selected zero tests.
+- Focused kernel `lifecycle_` tests: 40 passed; kernel-example
+  `admission_interleavings`: nine passed.
+- `just fmt-check`, `just cross-check-macos` (compile and clippy),
+  `just build-cpl0`, `just check-linux`, native `cargo check -p carrick-vmm-kvm`,
+  and `just clippy` passed.
+- Contract-change against admitted main, source-only authority debt, and the
+  authority-debt PR-base ratchet passed. Live host discovery executed the
+  Linux CLI/runtime lanes; its non-Linux live lanes remain pending.
+
+Gate outputs and exit statuses were captured in
+`/var/tmp/carrick-1572-validation/` on this ephemeral worker. Initial command
+attempts could not locate Cargo on PATH; after adding the job's installed
+Cargo bin directory, every check above was executed successfully. The job's
+VM-local lease environment was retained throughout; no hypervisor lease was
+acquired. No push, PR publication or comment was performed by the worker.
+
+HVF and Docker are unavailable here. `/dev/kvm` exists, but no KVM runtime
+verdict is claimed: full KVM acceptance belongs to the queue. Whole-workspace
+`lint-domains`, `test-kernel` and `ci` were not run in this worker slice.
+The director-owned 20-run signed HVF population, paired signed proof and two
+consecutive main signed passes remain outstanding. The previously documented
+first-publication refusal defect also remains unresolved; passing host-park
+checks cannot discharge it. This continuation does not close #1572.
