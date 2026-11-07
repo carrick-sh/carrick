@@ -5564,11 +5564,19 @@ where
                             "COW fault lost exact task context: {error}"
                         ))
                     })?;
-                signal::settle_guest_cow_of(context.shared().mm().id());
+                let resolution = {
+                    // Keep EL1 excluded through refill publication. Releasing
+                    // after settlement alone lets a sibling fill the chain
+                    // with USED records again before the engine provisions.
+                    let _cow_exclusion = carrick_kernel::kernel::mm_occupancy::exclude_el1_editor(
+                        context.shared().mm().id(),
+                    );
+                    engine.resolve_frame_cow_fault(syndrome, far)?
+                };
                 if let carrick_hal::CowFaultResolution::Resolved {
                     translation,
                     arm_generation,
-                } = engine.resolve_frame_cow_fault(syndrome, far)?
+                } = resolution
                 {
                     self.state
                         .note_cow_resolution(far, syndrome, translation, arm_generation)?;
@@ -5606,11 +5614,19 @@ where
                             "COW fault lost exact task context: {error}"
                         ))
                     })?;
-                signal::settle_guest_cow_of(context.shared().mm().id());
+                let resolution = {
+                    // Keep EL1 excluded through refill publication. Releasing
+                    // after settlement alone lets a sibling fill the chain
+                    // with USED records again before the engine provisions.
+                    let _cow_exclusion = carrick_kernel::kernel::mm_occupancy::exclude_el1_editor(
+                        context.shared().mm().id(),
+                    );
+                    engine.resolve_frame_cow_fault(syndrome, far)?
+                };
                 if let carrick_hal::CowFaultResolution::Resolved {
                     translation,
                     arm_generation,
-                } = engine.resolve_frame_cow_fault(syndrome, far)?
+                } = resolution
                 {
                     if let Some(mm_key) = self.state.zone_mm {
                         signal::cancel_frame_grant_request(
