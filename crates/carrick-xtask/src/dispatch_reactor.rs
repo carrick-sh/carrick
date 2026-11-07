@@ -78,6 +78,9 @@ pub(crate) trait Github {
     /// REST jobs of one run's latest attempt.
     fn run_jobs(&mut self, run: u64) -> Result<Vec<Value>, ScalerError>;
     fn post(&mut self, pr: u64, body: &str) -> Result<(), ScalerError>;
+    fn capacity(&mut self) -> Option<Value> {
+        None
+    }
 }
 /// The deciding agent; tests substitute a fake.
 pub(crate) trait Agent {
@@ -1057,6 +1060,8 @@ mod tests {
         pub active_runs: Vec<Value>,
         pub jobs: std::collections::BTreeMap<u64, Vec<Value>>,
         pub closing: Vec<u64>,
+        pub issues: std::collections::BTreeMap<u64, Value>,
+        pub capacity: Option<Value>,
         pub posted: Vec<(u64, String)>,
     }
     impl Github for FakeGh {
@@ -1081,9 +1086,9 @@ mod tests {
                     json!({"data":{"repository":{"pullRequest":{"closingIssuesReferences":c,"bodyReferences":c}}}})
                 }
                 AdoptionRead::Parent(_) => panic!("unexpected stack read"),
-                AdoptionRead::Issue(n) => {
+                AdoptionRead::Issue(n) => self.issues.get(&n).cloned().unwrap_or_else(|| {
                     json!({"number":n,"state":"open","user":{"login":"tjfontaine","type":"User"}})
-                }
+                }),
             })
         }
         fn workflow_runs(&mut self, _: &str) -> Result<Vec<Value>, ScalerError> {
@@ -1106,6 +1111,9 @@ mod tests {
         fn post(&mut self, pr: u64, body: &str) -> Result<(), ScalerError> {
             self.posted.push((pr, body.to_owned()));
             Ok(())
+        }
+        fn capacity(&mut self) -> Option<Value> {
+            self.capacity.clone()
         }
     }
     struct FakeAgent {
@@ -1538,5 +1546,627 @@ mod tests {
         assert_eq!(iso(0), "1970-01-01T00:00:00Z");
         assert_eq!(iso(NOW), "2026-10-31T00:00:00Z");
         assert_eq!(iso(951_782_400), "2000-02-29T00:00:00Z");
+    }
+
+    fn fixture_1825() -> Value {
+        serde_json::from_str(include_str!("../tests/fixtures/dispatch-1825-outcomes.json")).unwrap()
+    }
+
+    fn dispatch_pr(number: u64, issue: u64, run: u64, sha: &str) -> Value {
+        let mut p = pr(number, &format!("work/dispatch-{issue}-{run}"));
+        p["user"] = json!({"login":"carrick-workers[bot]","type":"Bot"});
+        p["head"]["sha"] = json!(sha);
+        p["body"] = json!(format!("Closes #{issue}"));
+        p
+    }
+
+    fn outcome_event(
+        pr_num: u64,
+        record: &Value,
+        at: &str,
+    ) -> Value {
+        json!({
+            "id": record["id"],
+            "issue_url": format!("https://api.github.com/repos/{REPOSITORY}/issues/{pr_num}"),
+            "html_url": record["url"],
+            "user": {"login": "carrick-workers[bot]", "type": "Bot"},
+            "body": record["body"],
+            "created_at": at,
+            "updated_at": at,
+        })
+    }
+
+    #[test]
+    fn replay_1825_done_implementation_starts_one_review_round_on_opposite_tier() {
+        let fx = fixture_1825();
+        let impl_done = &fx["pr_1781_impl_done"];
+        let head = impl_done["head"].as_str().unwrap();
+
+        // Strong-tier implementation Done -> starts one standard-tier review round.
+        // Author worker self-reviews (even on an earlier Continuing commit) must not
+        // masquerade as an independent review or shrink the first review's diff.
+        let mut fake = FakeGh {
+            prs: vec![dispatch_pr(1781, 1780, 42300000001, head)],
+            facts: vec![json!({
+                "number": 1781,
+                "commits": {"nodes": [{"commit": {"committedDate": "2026-10-30T23:50:00Z", "statusCheckRollup": {"state": "SUCCESS"}}}]},
+                "reviews": {"nodes": [
+                    {
+                        "databaseId": 9000,
+                        "url": "https://github.com/carrick-sh/carrick/pull/1781#pullrequestreview-9000",
+                        "state": "COMMENTED",
+                        "commit": {"oid": "a000000000000000000000000000000000000000"},
+                        "body": "## Worker review\n\nReviewed head: a000000000000000000000000000000000000000\n\nThis is the worker's own review; it is not an independent review.\n\nEarlier checkpoint self-review.",
+                        "submittedAt": "2026-10-30T23:40:00Z",
+                        "author": {"login": "carrick-workers[bot]", "__typename": "Bot"}
+                    },
+                    {
+                        "databaseId": 9001,
+                        "url": "https://github.com/carrick-sh/carrick/pull/1781#pullrequestreview-9001",
+                        "state": "COMMENTED",
+                        "commit": {"oid": head},
+                        "body": format!("## Worker review\n\nReviewed head: {head}\n\nThis is the worker's own review; it is not an independent review.\n\nAuthor self-review."),
+                        "submittedAt": "2026-10-30T23:58:00Z",
+                        "author": {"login": "carrick-workers[bot]", "__typename": "Bot"}
+                    }
+                ]},
+                "comments": {"nodes": [{
+                    "databaseId": 7001,
+                    "url": impl_done["url"],
+                    "body": impl_done["body"],
+                    "author": {"login": "carrick-workers[bot]", "__typename": "Bot"}
+                }]}
+            })],
+            comments: vec![outcome_event(1781, impl_done, "2026-10-30T23:59:00Z")],
+            closing: vec![1780],
+            ..FakeGh::default()
+        };
+        let mut inert = agent(Act::Ignore, "");
+        let mut state = State::default();
+        let log = cycle(&mut fake, &mut inert, &mut state, NOW, EPOCH, false).unwrap();
+        assert_eq!(fake.posted.len(), 1, "{log:?}");
+        let posted = &fake.posted[0].1;
+        assert_eq!(
+            crate::dispatch_worker::worker_tier::decide("", "", posted, &[]).tier,
+            crate::dispatch_worker::worker_tier::WorkerTier::Standard,
+            "author strong must select standard reviewer tier:\n{posted}"
+        );
+        let lower = posted.to_ascii_lowercase();
+        assert!(lower.contains("review only"), "{posted}");
+        assert!(lower.contains("push nothing"), "{posted}");
+        assert!(lower.contains("verdict"), "{posted}");
+        assert!(lower.contains("first line of the summary"), "{posted}");
+        assert!(posted.contains("#1780"), "{posted}");
+        assert!(
+            !posted.contains("a00000000000.."),
+            "author self-review must not narrow first independent review:\n{posted}"
+        );
+        // Subsequent poll starts no second review round.
+        cycle(&mut fake, &mut inert, &mut state, NOW + 60, EPOCH, false).unwrap();
+        assert_eq!(fake.posted.len(), 1);
+
+        // Reverse direction: standard-tier author Done -> strong-tier review round.
+        let std_done = &fx["pr_1815_standard_impl_done"];
+        let std_head = std_done["head"].as_str().unwrap();
+        let mut std_gh = FakeGh {
+            prs: vec![dispatch_pr(1815, 1814, 42300000010, std_head)],
+            facts: vec![json!({
+                "number": 1815,
+                "comments": {"nodes": [{
+                    "databaseId": 7101,
+                    "url": std_done["url"],
+                    "body": std_done["body"],
+                    "author": {"login": "carrick-workers[bot]", "__typename": "Bot"}
+                }]}
+            })],
+            comments: vec![outcome_event(1815, std_done, "2026-10-30T23:59:00Z")],
+            closing: vec![1814],
+            ..FakeGh::default()
+        };
+        cycle(
+            &mut std_gh,
+            &mut inert,
+            &mut State::default(),
+            NOW,
+            EPOCH,
+            false,
+        )
+        .unwrap();
+        assert_eq!(std_gh.posted.len(), 1);
+        assert_eq!(
+            crate::dispatch_worker::worker_tier::decide("", "", &std_gh.posted[0].1, &[]).tier,
+            crate::dispatch_worker::worker_tier::WorkerTier::Strong,
+            "author standard must select strong reviewer tier:\n{}",
+            std_gh.posted[0].1
+        );
+
+        // Fallback when opposite tier has no quota: same tier with a different backend.
+        let mut no_std_quota = FakeGh {
+            prs: vec![dispatch_pr(1781, 1780, 42300000001, head)],
+            facts: vec![json!({
+                "number": 1781,
+                "comments": {"nodes": [{
+                    "databaseId": 7001,
+                    "url": impl_done["url"],
+                    "body": impl_done["body"],
+                    "author": {"login": "carrick-workers[bot]", "__typename": "Bot"}
+                }]}
+            })],
+            comments: vec![outcome_event(1781, impl_done, "2026-10-30T23:59:00Z")],
+            closing: vec![1780],
+            capacity: Some(json!({
+                "backends": {
+                    "agy": {
+                        "installed": true,
+                        "free_slots": 2,
+                        "quota_free": 0.0,
+                        "score": 0.0,
+                        "quota": {"groups": {"gemini": {"quota_free": 0.0}, "claude": {"quota_free": 0.0}}},
+                        "models": ["gemini-4-argon-high", "claude-opus-4-6-thinking"]
+                    },
+                    "codex": {
+                        "installed": true,
+                        "free_slots": 2,
+                        "quota_free": 0.7,
+                        "score": 0.7,
+                        "models": ["gpt-6.1-sol"]
+                    },
+                    "copilot": {
+                        "installed": true,
+                        "free_slots": 2,
+                        "quota_free": 1.0,
+                        "score": 1.0,
+                        "models": ["claude-opus-4-6"]
+                    }
+                }
+            })),
+            ..FakeGh::default()
+        };
+        cycle(
+            &mut no_std_quota,
+            &mut inert,
+            &mut State::default(),
+            NOW,
+            EPOCH,
+            false,
+        )
+        .unwrap();
+        assert_eq!(no_std_quota.posted.len(), 1);
+        let fallback_brief = &no_std_quota.posted[0].1;
+        assert_eq!(
+            crate::dispatch_worker::worker_tier::decide("", "", fallback_brief, &[]).tier,
+            crate::dispatch_worker::worker_tier::WorkerTier::Strong,
+            "exhausted opposite tier must stay on author tier:\n{fallback_brief}"
+        );
+        assert!(
+            fallback_brief.contains("copilot"),
+            "fallback brief must select a non-author backend:\n{fallback_brief}"
+        );
+    }
+
+    #[test]
+    fn replay_1825_review_round_ending_done_does_not_start_another() {
+        let fx = fixture_1825();
+        let impl_done = &fx["pr_1781_impl_done"];
+        let rev_done = &fx["pr_1781_review_approved"];
+        let head = rev_done["head"].as_str().unwrap();
+
+        // Even on a fresh State (e.g. director-started review round or restarted reactor)
+        // and even if the agent would return Round, a review round ending Done starts none.
+        let mut fake = FakeGh {
+            prs: vec![dispatch_pr(1781, 1780, 42300000001, head)],
+            facts: vec![json!({
+                "number": 1781,
+                "comments": {"nodes": [
+                    {"databaseId": 7001, "url": impl_done["url"], "body": impl_done["body"], "author": {"login": "carrick-workers[bot]", "__typename": "Bot"}},
+                    {"databaseId": 7002, "url": "https://github.com/carrick-sh/carrick/pull/1781#issuecomment-7002", "body": "/agent\nWorker tier: standard\nIndependent review (review only, push nothing).", "author": {"login": "tjfontaine", "__typename": "User"}},
+                    {"databaseId": 7003, "url": rev_done["url"], "body": rev_done["body"], "author": {"login": "carrick-workers[bot]", "__typename": "Bot"}}
+                ]}
+            })],
+            comments: vec![outcome_event(1781, rev_done, "2026-10-30T23:59:00Z")],
+            closing: vec![1780],
+            ..FakeGh::default()
+        };
+        let mut eager = agent(Act::Round, "spurious second review");
+        let mut state = State::default();
+        let log = cycle(&mut fake, &mut eager, &mut state, NOW, EPOCH, false).unwrap();
+        assert!(fake.posted.is_empty(), "{log:?}");
+        assert_eq!(eager.calls, 0, "review Done must not consult LLM to start another round");
+
+        // Also coordinates with #1813 / PR #1816 typed `Round kind: review` server line.
+        let mut typed_body = rev_done["body"].as_str().unwrap().replacen(
+            "Worker tier: standard",
+            "Round kind: review\nWorker tier: standard",
+            1,
+        );
+        // Even if someone contrived a non-zero commit count, explicit `Round kind: review` wins.
+        typed_body = typed_body.replacen("commits pushed this round: 0;", "commits pushed this round: 1;", 1);
+        let typed_record = json!({
+            "id": 7099,
+            "url": "https://github.com/carrick-sh/carrick/pull/1781#issuecomment-7099",
+            "body": typed_body,
+        });
+        let mut typed_gh = FakeGh {
+            prs: vec![dispatch_pr(1781, 1780, 42300000001, head)],
+            facts: vec![json!({
+                "number": 1781,
+                "comments": {"nodes": [
+                    {"databaseId": 7099, "url": typed_record["url"], "body": typed_record["body"], "author": {"login": "carrick-workers[bot]", "__typename": "Bot"}}
+                ]}
+            })],
+            comments: vec![outcome_event(1781, &typed_record, "2026-10-30T23:59:00Z")],
+            closing: vec![1780],
+            ..FakeGh::default()
+        };
+        cycle(
+            &mut typed_gh,
+            &mut eager,
+            &mut State::default(),
+            NOW,
+            EPOCH,
+            false,
+        )
+        .unwrap();
+        assert!(typed_gh.posted.is_empty());
+    }
+
+    #[test]
+    fn replay_1825_ecosystem_pr_without_signed_scoreboard_records_named_wait() {
+        let fx = fixture_1825();
+        let eco_done = &fx["pr_1740_ecosystem_impl_done"];
+        let eco_head = eco_done["head"].as_str().unwrap();
+
+        // Direct ecosystem blocker (#1506, plus sweep guard 19's full root set).
+        for blocker in [887_u64, 1733, 1791, 1506, 1671, 1756] {
+            let mut fake = FakeGh {
+                prs: vec![dispatch_pr(1740, blocker, 42205586763, eco_head)],
+                facts: vec![json!({
+                    "number": 1740,
+                    "comments": {"nodes": [{
+                        "databaseId": 7201,
+                        "url": eco_done["url"],
+                        "body": eco_done["body"].as_str().unwrap().replace("1506", &blocker.to_string()),
+                        "author": {"login": "carrick-workers[bot]", "__typename": "Bot"}
+                    }]}
+                })],
+                comments: vec![outcome_event(1740, eco_done, "2026-10-30T23:59:00Z")],
+                closing: vec![blocker],
+                ..FakeGh::default()
+            };
+            let mut state = State::default();
+            let log = cycle(
+                &mut fake,
+                &mut agent(Act::Round, "must not fire"),
+                &mut state,
+                NOW,
+                EPOCH,
+                false,
+            )
+            .unwrap();
+            assert!(fake.posted.is_empty(), "blocker #{blocker}: {log:?}");
+            let wait = state.prs[&1740].waiting_on.as_deref().unwrap_or_default();
+            assert!(
+                wait.contains("signed scoreboard") && wait.contains(&format!("#{blocker}")),
+                "blocker #{blocker} missing named wait: {wait:?}"
+            );
+        }
+
+        // Stale scoreboard on an older commit does not unlock the current head;
+        // a signed scoreboard on the current head clears the wait and starts review.
+        let mut fake = FakeGh {
+            prs: vec![dispatch_pr(1740, 1506, 42205586763, eco_head)],
+            facts: vec![json!({
+                "number": 1740,
+                "comments": {"nodes": [
+                    {
+                        "databaseId": 7199,
+                        "url": "https://github.com/carrick-sh/carrick/pull/1740#issuecomment-7199",
+                        "body": "Signed scoreboard on `5e9780c5c634`: cpython/go smoke PASS.",
+                        "author": {"login": "tjfontaine", "__typename": "User"}
+                    },
+                    {
+                        "databaseId": 7201,
+                        "url": eco_done["url"],
+                        "body": eco_done["body"],
+                        "author": {"login": "carrick-workers[bot]", "__typename": "Bot"}
+                    }
+                ]}
+            })],
+            comments: vec![outcome_event(1740, eco_done, "2026-10-30T23:59:00Z")],
+            closing: vec![1506],
+            ..FakeGh::default()
+        };
+        let mut state = State::default();
+        let mut inert = agent(Act::Ignore, "");
+        cycle(&mut fake, &mut inert, &mut state, NOW, EPOCH, false).unwrap();
+        assert!(fake.posted.is_empty());
+        assert!(state.prs[&1740].waiting_on.is_some());
+
+        // Director records signed scoreboard on current head -> review round starts.
+        let board = json!({
+            "id": 7202,
+            "issue_url": format!("https://api.github.com/repos/{REPOSITORY}/issues/1740"),
+            "html_url": "https://github.com/carrick-sh/carrick/pull/1740#issuecomment-7202",
+            "user": {"login": "tjfontaine", "type": "User"},
+            "body": format!("Signed scoreboard on `{}`: smoke-signed PASS, Go child ENOSYS=0.", &eco_head[..12]),
+            "created_at": "2026-10-31T00:02:00Z",
+            "updated_at": "2026-10-31T00:02:00Z",
+        });
+        fake.comments = vec![board];
+        fake.facts[0]["comments"]["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "databaseId": 7202,
+                "url": "https://github.com/carrick-sh/carrick/pull/1740#issuecomment-7202",
+                "body": format!("Signed scoreboard on `{}`: smoke-signed PASS, Go child ENOSYS=0.", &eco_head[..12]),
+                "author": {"login": "tjfontaine", "__typename": "User"}
+            }));
+        cycle(&mut fake, &mut inert, &mut state, NOW + 120, EPOCH, false).unwrap();
+        assert_eq!(state.prs[&1740].waiting_on, None);
+        assert_eq!(fake.posted.len(), 1);
+        assert_eq!(
+            crate::dispatch_worker::worker_tier::decide("", "", &fake.posted[0].1, &[]).tier,
+            crate::dispatch_worker::worker_tier::WorkerTier::Standard
+        );
+
+        // Successor issue/PR (#1829 split from #1733) is also gated until signed scoreboard,
+        // and unblocks when `Signed gate: **PASS**` lands on its head.
+        let succ_done = &fx["pr_1830_ecosystem_successor_done"];
+        let succ_head = succ_done["head"].as_str().unwrap();
+        let mut issues = std::collections::BTreeMap::new();
+        issues.insert(
+            1829,
+            json!({
+                "number": 1829,
+                "state": "open",
+                "title": "Split constructor slice",
+                "body": "Split from #1733 so the base PR stays small.",
+                "user": {"login": "tjfontaine", "type": "User"}
+            }),
+        );
+        let mut succ_gh = FakeGh {
+            prs: vec![dispatch_pr(1830, 1829, 42300000030, succ_head)],
+            facts: vec![json!({
+                "number": 1830,
+                "comments": {"nodes": [{
+                    "databaseId": 7301,
+                    "url": succ_done["url"],
+                    "body": succ_done["body"],
+                    "author": {"login": "carrick-workers[bot]", "__typename": "Bot"}
+                }]}
+            })],
+            comments: vec![outcome_event(1830, succ_done, "2026-10-30T23:59:00Z")],
+            closing: vec![1829],
+            issues,
+            ..FakeGh::default()
+        };
+        let mut succ_state = State::default();
+        cycle(&mut succ_gh, &mut inert, &mut succ_state, NOW, EPOCH, false).unwrap();
+        assert!(succ_gh.posted.is_empty());
+        assert!(
+            succ_state.prs[&1830]
+                .waiting_on
+                .as_deref()
+                .is_some_and(|w| w.contains("signed scoreboard") && w.contains("#1733")),
+            "{:?}",
+            succ_state.prs[&1830].waiting_on
+        );
+        let gate_pass = format!("Signed gate: **PASS**\n\n- Candidate: `{succ_head}`\n");
+        succ_gh.comments = vec![json!({
+            "id": 7302,
+            "issue_url": format!("https://api.github.com/repos/{REPOSITORY}/issues/1830"),
+            "html_url": "https://github.com/carrick-sh/carrick/pull/1830#issuecomment-7302",
+            "user": {"login": "github-actions[bot]", "type": "Bot"},
+            "body": gate_pass,
+            "created_at": "2026-10-31T00:05:00Z",
+            "updated_at": "2026-10-31T00:05:00Z",
+        })];
+        succ_gh.facts[0]["comments"]["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "databaseId": 7302,
+                "url": "https://github.com/carrick-sh/carrick/pull/1830#issuecomment-7302",
+                "body": gate_pass,
+                "author": {"login": "github-actions[bot]", "__typename": "Bot"}
+            }));
+        cycle(
+            &mut succ_gh,
+            &mut inert,
+            &mut succ_state,
+            NOW + 300,
+            EPOCH,
+            false,
+        )
+        .unwrap();
+        assert_eq!(succ_state.prs[&1830].waiting_on, None);
+        assert_eq!(succ_gh.posted.len(), 1);
+    }
+
+    #[test]
+    fn replay_1825_changes_requested_starts_fix_round_and_scopes_next_review_diff() {
+        let fx = fixture_1825();
+        let impl_done = &fx["pr_1781_impl_done"];
+        let rev_cr = &fx["pr_1781_review_changes_requested"];
+        let fix_done = &fx["pr_1781_fix_done"];
+        let h1 = impl_done["head"].as_str().unwrap();
+        let h2 = fix_done["head"].as_str().unwrap();
+
+        let mut fake = FakeGh {
+            prs: vec![dispatch_pr(1781, 1780, 42300000001, h1)],
+            facts: vec![json!({
+                "number": 1781,
+                "reviews": {"nodes": []},
+                "comments": {"nodes": [{
+                    "databaseId": 7001,
+                    "url": impl_done["url"],
+                    "body": impl_done["body"],
+                    "author": {"login": "carrick-workers[bot]", "__typename": "Bot"}
+                }]}
+            })],
+            comments: vec![outcome_event(1781, impl_done, "2026-10-30T23:59:00Z")],
+            closing: vec![1780],
+            ..FakeGh::default()
+        };
+        let mut state = State::default();
+        let mut inert = agent(Act::Ignore, "");
+
+        // Step 1: Done implementation round on H1 -> Review Round 1 on H1.
+        cycle(&mut fake, &mut inert, &mut state, NOW, EPOCH, false).unwrap();
+        assert_eq!(fake.posted.len(), 1);
+
+        // Step 2: Review Round 1 finishes on H1 with CHANGES REQUESTED -> Fix Round 2 on H1.
+        let review_trigger_body = fake.posted[0].1.clone();
+        fake.facts[0]["reviews"]["nodes"] = json!([{
+            "databaseId": 9002,
+            "url": "https://github.com/carrick-sh/carrick/pull/1781#pullrequestreview-9002",
+            "state": "COMMENTED",
+            "commit": {"oid": h1},
+            "body": format!("## Worker review\n\nReviewed head: {h1}\n\nThis is the worker's own review; it is not an independent review.\n\nCHANGES REQUESTED\nP1: off-by-one in boundary validation."),
+            "submittedAt": "2026-10-31T00:05:00Z",
+            "author": {"login": "carrick-workers[bot]", "__typename": "Bot"}
+        }]);
+        fake.facts[0]["comments"]["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .extend([
+                json!({
+                    "databaseId": 7002,
+                    "url": "https://github.com/carrick-sh/carrick/pull/1781#issuecomment-7002",
+                    "body": review_trigger_body,
+                    "author": {"login": "tjfontaine", "__typename": "User"}
+                }),
+                json!({
+                    "databaseId": 7004,
+                    "url": rev_cr["url"],
+                    "body": rev_cr["body"],
+                    "author": {"login": "carrick-workers[bot]", "__typename": "Bot"}
+                }),
+            ]);
+        fake.comments = vec![outcome_event(1781, rev_cr, "2026-10-31T00:06:00Z")];
+        let log = cycle(&mut fake, &mut inert, &mut state, NOW + 360, EPOCH, false).unwrap();
+        assert_eq!(
+            fake.posted.len(),
+            2,
+            "CHANGES REQUESTED must start a fix round on H1: {log:?}"
+        );
+        let fix_brief = &fake.posted[1].1;
+        assert!(
+            !fix_brief.to_ascii_lowercase().contains("review only"),
+            "fix round must not be a review-only brief:\n{fix_brief}"
+        );
+
+        // Step 3: Fix Round 2 pushes H2 and ends Done (with its own worker self-review #9003 on H2)
+        // -> Review Round 3 starts on H2 scoped to H1..H2 (since #pullrequestreview-9002).
+        fake.prs[0]["head"]["sha"] = json!(h2);
+        fake.facts[0]["reviews"]["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "databaseId": 9003,
+                "url": "https://github.com/carrick-sh/carrick/pull/1781#pullrequestreview-9003",
+                "state": "COMMENTED",
+                "commit": {"oid": h2},
+                "body": format!("## Worker review\n\nReviewed head: {h2}\n\nThis is the worker's own review; it is not an independent review.\n\nAuthor self-review of fix."),
+                "submittedAt": "2026-10-31T00:15:00Z",
+                "author": {"login": "carrick-workers[bot]", "__typename": "Bot"}
+            }));
+        fake.facts[0]["comments"]["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "databaseId": 7006,
+                "url": fix_done["url"],
+                "body": fix_done["body"],
+                "author": {"login": "carrick-workers[bot]", "__typename": "Bot"}
+            }));
+        fake.comments = vec![outcome_event(1781, fix_done, "2026-10-31T00:16:00Z")];
+        let log = cycle(&mut fake, &mut inert, &mut state, NOW + 960, EPOCH, false).unwrap();
+        assert_eq!(fake.posted.len(), 3, "{log:?}");
+        let second_review = &fake.posted[2].1;
+        assert!(
+            second_review.contains(&format!("{}..{}", &h1[..12], &h2[..12])),
+            "second review round must scope diff since last published review ({h1}..{h2}):\n{second_review}"
+        );
+    }
+
+    #[test]
+    fn replay_1825_round_loop_guard_caps_chains() {
+        let fx = fixture_1825();
+        let impl_done = &fx["pr_1781_impl_done"];
+        let rev1_cr = &fx["pr_1781_review_changes_requested"];
+        let fix_done = &fx["pr_1781_fix_done"];
+        let rev2_cr = &fx["pr_1781_review2_changes_requested"];
+        let h1 = impl_done["head"].as_str().unwrap();
+        let h2 = fix_done["head"].as_str().unwrap();
+
+        let mut fake = FakeGh {
+            prs: vec![dispatch_pr(1781, 1780, 42300000001, h1)],
+            facts: vec![json!({
+                "number": 1781,
+                "reviews": {"nodes": []},
+                "comments": {"nodes": [{
+                    "databaseId": 7001,
+                    "url": impl_done["url"],
+                    "body": impl_done["body"],
+                    "author": {"login": "carrick-workers[bot]", "__typename": "Bot"}
+                }]}
+            })],
+            comments: vec![outcome_event(1781, impl_done, "2026-10-30T23:59:00Z")],
+            closing: vec![1780],
+            ..FakeGh::default()
+        };
+        let mut state = State::default();
+        let mut inert = agent(Act::Ignore, "");
+
+        // Round 1 (unattended = 1): review on H1.
+        cycle(&mut fake, &mut inert, &mut state, NOW, EPOCH, false).unwrap();
+        assert_eq!(state.prs[&1781].unattended_rounds, 1);
+
+        // Round 2 (unattended = 2): fix on H1 after CHANGES REQUESTED.
+        let r1_brief = fake.posted[0].1.clone();
+        fake.facts[0]["comments"]["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .extend([
+                json!({"databaseId": 7002, "url": "https://github.com/carrick-sh/carrick/pull/1781#issuecomment-7002", "body": r1_brief, "author": {"login": "tjfontaine", "__typename": "User"}}),
+                json!({"databaseId": 7004, "url": rev1_cr["url"], "body": rev1_cr["body"], "author": {"login": "carrick-workers[bot]", "__typename": "Bot"}}),
+            ]);
+        fake.comments = vec![outcome_event(1781, rev1_cr, "2026-10-31T00:06:00Z")];
+        cycle(&mut fake, &mut inert, &mut state, NOW + 360, EPOCH, false).unwrap();
+        assert_eq!(state.prs[&1781].unattended_rounds, 2);
+
+        // Round 3 (unattended = 3 == UNATTENDED_ROUNDS): review on H2 after fix Done.
+        fake.prs[0]["head"]["sha"] = json!(h2);
+        fake.facts[0]["comments"]["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"databaseId": 7006, "url": fix_done["url"], "body": fix_done["body"], "author": {"login": "carrick-workers[bot]", "__typename": "Bot"}}));
+        fake.comments = vec![outcome_event(1781, fix_done, "2026-10-31T00:16:00Z")];
+        cycle(&mut fake, &mut inert, &mut state, NOW + 960, EPOCH, false).unwrap();
+        assert_eq!(state.prs[&1781].unattended_rounds, UNATTENDED_ROUNDS);
+        assert_eq!(fake.posted.len(), 3);
+
+        // Round 4 attempt: Review 2 requests changes again -> capped by UNATTENDED_ROUNDS!
+        let r2_brief = fake.posted[2].1.clone();
+        fake.facts[0]["comments"]["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .extend([
+                json!({"databaseId": 7007, "url": "https://github.com/carrick-sh/carrick/pull/1781#issuecomment-7007", "body": r2_brief, "author": {"login": "tjfontaine", "__typename": "User"}}),
+                json!({"databaseId": 7008, "url": rev2_cr["url"], "body": rev2_cr["body"], "author": {"login": "carrick-workers[bot]", "__typename": "Bot"}}),
+            ]);
+        fake.comments = vec![outcome_event(1781, rev2_cr, "2026-10-31T00:26:00Z")];
+        let log = cycle(&mut fake, &mut inert, &mut state, NOW + 1560, EPOCH, false).unwrap();
+        assert_eq!(
+            fake.posted.len(),
+            3,
+            "round-loop guard must cap unattended review/fix chain at {UNATTENDED_ROUNDS}: {log:?}"
+        );
+        assert!(
+            log.iter().any(|l| l.contains("unattended round limit")),
+            "{log:?}"
+        );
     }
 }
