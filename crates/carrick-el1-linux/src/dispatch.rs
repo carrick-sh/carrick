@@ -1754,7 +1754,7 @@ pub(crate) fn arm_deliver_declined_fault_signal_current(
         owner_wait,
         |process, frame| super::arm_signal::deliver_on_user_return(task, process, frame),
     )
-    .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding))
+    .unwrap_or_else(|error| invalid_completion(native_service_invariant(error)))
 }
 
 /// Lower-EL data abort, translation fault at level 0, used only to carry the
@@ -1856,7 +1856,7 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
         &mut service,
         |process| super::arm_signal::deliver_on_user_return(task, process, frame),
     )
-    .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
+    .unwrap_or_else(|error| invalid_completion(native_service_invariant(error)));
     match delivered {
         None | Some(carrick_personality_linux::dispatch::CompletionRoute::Served) => Action::Served,
         Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended) => Action::Idle,

@@ -592,17 +592,17 @@ fn admit_entry_runtime(
 ) -> Result<(Arc<Runtime>, Mm), NativeProcessError> {
     // SAFETY: the EL1 caller owns the running slot and its record until the
     // process route returns to the vector.
-    let observed = unsafe { observed_entry_address(source, task, ttbr0, record)? };
+    let observed = unsafe { observed_entry_address(source, task, ttbr0, record).map_err(|e| if matches!(e, NativeProcessError::Stale) { NativeProcessError::Invalid } else { e })? };
     let address = if control.entry().is_some() {
         REGISTRY
             .group_address(
                 source.zone,
                 observed,
                 page,
-                task.visible_pid().ok_or(NativeProcessError::Stale)?,
+                task.visible_pid().ok_or(NativeProcessError::Fault)?,
             )
             .filter(|address| *address == observed)
-            .ok_or(NativeProcessError::Stale)?
+            .ok_or(NativeProcessError::Exhausted)?
     } else {
         observed
     };
@@ -619,7 +619,7 @@ fn admit_entry_runtime(
                 source.zone,
                 address,
                 page,
-                task.visible_pid().ok_or(NativeProcessError::Stale)?,
+                task.visible_pid().ok_or(NativeProcessError::Fault)?,
             )
             .is_some()
     {
