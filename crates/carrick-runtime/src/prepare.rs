@@ -2018,6 +2018,9 @@ mod tests {
 
     #[test]
     fn prepare_failure_releases_pid_placement() {
+        if crate::carrier::tests::isolated_fixture_process(&[]) {
+            return;
+        }
         let _carrier_guard =
             ProcessCarrierTestGuard::acquire("prepare_failure_releases_pid_placement");
         let mut spec = hvpatch_run_spec();
@@ -2033,6 +2036,9 @@ mod tests {
 
     #[test]
     fn prepare_on_holds_and_rolls_back_the_exact_carrier_lease() {
+        if crate::carrier::tests::isolated_fixture_process(&[]) {
+            return;
+        }
         let _carrier_guard = ProcessCarrierTestGuard::acquire(
             "prepare_on_holds_and_rolls_back_the_exact_carrier_lease",
         );
@@ -2079,6 +2085,9 @@ mod tests {
 
     #[test]
     fn process_carrier_test_guard_isolates_leaked_and_concurrent_prepare_leases() {
+        if crate::carrier::tests::isolated_fixture_process(&[]) {
+            return;
+        }
         prepare_failure_releases_pid_placement();
         prepare_on_holds_and_rolls_back_the_exact_carrier_lease();
 
@@ -2106,6 +2115,9 @@ mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn execute_releases_pid_placement_after_the_run() {
+        if crate::carrier::tests::isolated_fixture_process(&[]) {
+            return;
+        }
         let _carrier_guard =
             ProcessCarrierTestGuard::acquire("execute_releases_pid_placement_after_the_run");
         let mut spec = hvpatch_run_spec();
@@ -2121,6 +2133,9 @@ mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn hvpatch_uses_container_entrypoint_resolution() {
+        if crate::carrier::tests::isolated_fixture_process(&[]) {
+            return;
+        }
         let _carrier_guard =
             ProcessCarrierTestGuard::acquire("hvpatch_uses_container_entrypoint_resolution");
         let result = Runtime::execute(&hvpatch_run_spec())
@@ -2133,6 +2148,9 @@ mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn hvpatch_uses_container_entrypoint_resolution_for_every_container_in_one_carrier() {
+        if crate::carrier::tests::isolated_fixture_process(&[]) {
+            return;
+        }
         let _carrier_guard = ProcessCarrierTestGuard::acquire(
             "hvpatch_uses_container_entrypoint_resolution_for_every_container_in_one_carrier",
         );
