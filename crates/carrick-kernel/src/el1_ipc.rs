@@ -58,6 +58,8 @@ pub enum AdmissionError {
     NoMemory,
     ObjectWaitBusy,
     ObjectWaitKeyOutOfRange,
+    ObjectWaitInvariant(carrick_sched_core::object_wait::ObjectWaitError),
+    ObjectRollbackInvariant(IpcError),
     Shared(IpcError),
 }
 impl From<IpcError> for AdmissionError {
@@ -93,10 +95,13 @@ impl CreateError {
             AdmissionError::Shared(IpcError::ZoneLimit) => Self::FileTableFull,
             AdmissionError::ObjectWaitBusy => Self::ObjectWaitBusy,
             AdmissionError::ObjectWaitKeyOutOfRange => Self::ObjectWaitKeyOutOfRange,
-            error @ (AdmissionError::NoMemory | AdmissionError::Shared(_)) => {
+            error @ (AdmissionError::NoMemory
+            | AdmissionError::ObjectWaitInvariant(_)
+            | AdmissionError::ObjectRollbackInvariant(_)
+            | AdmissionError::Shared(_)) => {
                 carrick_fatal::carrick_fatal!(
                     "ipc::admission",
-                    "object creation refused outside the zone limit: {error:?}"
+                    "object creation or wait-binding invariant failed: {error:?}"
                 )
             }
         }
@@ -840,13 +845,9 @@ impl HostIpc {
                         let Some(key) = bound[bound_count] else {
                             continue;
                         };
-                        zone.unbind_object_wait(key, &HostLockWait)
-                            .unwrap_or_else(|error| {
-                                carrick_fatal::carrick_fatal!(
-                                    "ipc::admission",
-                                    "object wait rollback invariant failed: {error:?}"
-                                )
-                            });
+                        if let Err(error) = zone.unbind_object_wait(key, &HostLockWait) {
+                            return Err(error);
+                        }
                     }
                     return Err(carrick_sched_core::object_wait::ObjectWaitError::Exhausted);
                 };
@@ -864,13 +865,9 @@ impl HostIpc {
                         let Some(key) = bound[bound_count] else {
                             continue;
                         };
-                        zone.unbind_object_wait(key, &HostLockWait)
-                            .unwrap_or_else(|rollback| {
-                                carrick_fatal::carrick_fatal!(
-                                    "ipc::admission",
-                                    "object wait rollback invariant failed: {rollback:?}"
-                                )
-                            });
+                        if let Err(rollback) = zone.unbind_object_wait(key, &HostLockWait) {
+                            return Err(rollback);
+                        }
                     }
                     return Err(error);
                 }
@@ -880,19 +877,20 @@ impl HostIpc {
         }
         Ok(())
     }
-    fn discard_unpublished_pipe(&self, object: IpcObjectHandle) {
+    fn discard_unpublished_pipe(&self, object: IpcObjectHandle) -> Result<(), IpcError> {
         let region = self.region();
-        for end in [pipe::End::Reader, pipe::End::Writer] {
+        for (index, end) in [pipe::End::Reader, pipe::End::Writer]
+            .into_iter()
+            .enumerate()
+        {
             let backing = carrick_el1_abi::ipc::IpcBacking::Pipe { object, end }.encode();
-            region
-                .release_backing(backing, &HostLockWait)
-                .unwrap_or_else(|error| {
-                    carrick_fatal::carrick_fatal!(
-                        "ipc::admission",
-                        "unpublished pipe rollback invariant failed ({error:?})"
-                    )
-                });
+            let released = region.release_backing(backing, &HostLockWait)?;
+            if !matches!(released, carrick_el1_abi::ipc::IpcReleased::Object { freed, .. } if freed == (index == 1))
+            {
+                return Err(IpcError::Corrupt);
+            }
         }
+        Ok(())
     }
     fn wait_bind_error(error: carrick_sched_core::object_wait::ObjectWaitError) -> AdmissionError {
         match error {
@@ -902,22 +900,15 @@ impl HostIpc {
             carrick_sched_core::object_wait::ObjectWaitError::Exhausted => {
                 AdmissionError::ObjectWaitKeyOutOfRange
             }
-            error => carrick_fatal::carrick_fatal!(
-                "ipc::admission",
-                "object wait binding invariant failed ({error:?})"
-            ),
+            error => AdmissionError::ObjectWaitInvariant(error),
         }
     }
-    fn discard_unpublished_eventfd(&self, object: IpcObjectHandle) {
+    fn discard_unpublished_eventfd(&self, object: IpcObjectHandle) -> Result<(), IpcError> {
         let backing = carrick_el1_abi::ipc::IpcBacking::EventFd { object }.encode();
-        self.region()
-            .release_backing(backing, &HostLockWait)
-            .unwrap_or_else(|error| {
-                carrick_fatal::carrick_fatal!(
-                    "ipc::admission",
-                    "unpublished eventfd rollback invariant failed ({error:?})"
-                )
-            });
+        match self.region().release_backing(backing, &HostLockWait)? {
+            carrick_el1_abi::ipc::IpcReleased::Object { freed: true, .. } => Ok(()),
+            _ => Err(IpcError::Corrupt),
+        }
     }
     fn provision_pipe(
         &self,
@@ -945,7 +936,9 @@ impl HostIpc {
         }
         let object = object?;
         if let Err(error) = self.bind_waits(object) {
-            self.discard_unpublished_pipe(object);
+            if let Err(rollback) = self.discard_unpublished_pipe(object) {
+                return Err(AdmissionError::ObjectRollbackInvariant(rollback));
+            }
             return Err(Self::wait_bind_error(error));
         }
         self.top_up_ring_stock();
@@ -1024,7 +1017,9 @@ impl HostIpc {
         let object =
             self.with_object(|region| region.create_eventfd(initial, mode, &HostLockWait))?;
         if let Err(error) = self.bind_waits(object) {
-            self.discard_unpublished_eventfd(object);
+            if let Err(rollback) = self.discard_unpublished_eventfd(object) {
+                return Err(AdmissionError::ObjectRollbackInvariant(rollback));
+            }
             return Err(Self::wait_bind_error(error));
         }
         Ok(object)
@@ -1035,15 +1030,19 @@ impl HostIpc {
     pub fn create_epoll(&self) -> Result<IpcObjectHandle, AdmissionError> {
         let object = self.with_object(|region| region.create_epoll(&HostLockWait))?;
         if let Err(error) = self.bind_waits(object) {
-            self.region()
-                .epoll_destroy(object, &HostLockWait)
-                .unwrap_or_else(|rollback| {
-                    carrick_fatal::carrick_fatal!(
-                        "ipc::admission",
-                        "unpublished epoll rollback invariant failed ({rollback:?})"
-                    )
-                });
-            return Err(Self::wait_bind_error(error));
+            if let Err(rollback) = self.region().epoll_destroy(object, &HostLockWait) {
+                let error = AdmissionError::ObjectRollbackInvariant(rollback);
+                let _ = CreateError::from_admission(error);
+                return Err(error);
+            }
+            let error = Self::wait_bind_error(error);
+            if matches!(
+                error,
+                AdmissionError::ObjectWaitInvariant(_) | AdmissionError::ObjectRollbackInvariant(_)
+            ) {
+                let _ = CreateError::from_admission(error);
+            }
+            return Err(error);
         }
         Ok(object)
     }
