@@ -681,7 +681,7 @@ fn group_worker_cleanup(unadopted: bool, head_wait: bool, refused: bool) {
             .iter()
             .filter(|(_, address, _)| *address == word.arg())
             .count(),
-        usize::from(!(refused && !head_wait)),
+        usize::from(!refused || head_wait),
         "a completed clear-TID store is never replayed",
     );
 }
