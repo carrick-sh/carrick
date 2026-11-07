@@ -1,13 +1,10 @@
 Create a container without starting it (like `docker create`). Pulls the image and persists the config; launch it later with `carrick start`
 
-Usage: carrick create [OPTIONS] <IMAGE> [COMMAND]...
+Usage: carrick create [OPTIONS] <IMAGE> <COMMAND>...
 
 Arguments:
-  <IMAGE>
-          
-
-  [COMMAND]...
-          
+  <IMAGE> <COMMAND>...
+          The image, then an optional guest command and its arguments. Every token after the image belongs to the guest, as with `docker run`
 
 Options:
       --platform <OS/ARCH>

@@ -598,9 +598,10 @@ pub(crate) enum Commands {
         run_args: RunArgs,
         #[clap(flatten)]
         exec_args: ExecutionArgs,
-        /// The image, then the guest command and its arguments.
+        /// The image, then an optional guest command and its arguments. Every
+        /// token after the image belongs to the guest, as with `docker run`.
         #[arg(
-            value_name = "IMAGE [COMMAND [ARG...]]",
+            value_names = ["IMAGE", "COMMAND"],
             required = true,
             num_args = 1..,
             trailing_var_arg = true
@@ -627,9 +628,10 @@ pub(crate) enum Commands {
     Create {
         #[clap(flatten)]
         run_args: RunArgs,
-        /// The image, then the guest command and its arguments.
+        /// The image, then an optional guest command and its arguments. Every
+        /// token after the image belongs to the guest, as with `docker run`.
         #[arg(
-            value_name = "IMAGE [COMMAND [ARG...]]",
+            value_names = ["IMAGE", "COMMAND"],
             required = true,
             num_args = 1..,
             trailing_var_arg = true
@@ -764,9 +766,10 @@ pub(crate) enum Commands {
         /// Set environment variables for the command (`KEY=VALUE`).
         #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
-        /// The container id or name, then the command and its arguments.
+        /// The container id or name, then the command and its arguments. Every
+        /// token after the container belongs to the command, as with `docker exec`.
         #[arg(
-            value_name = "CONTAINER COMMAND [ARG...]",
+            value_names = ["CONTAINER", "COMMAND"],
             required = true,
             num_args = 2..,
             trailing_var_arg = true
