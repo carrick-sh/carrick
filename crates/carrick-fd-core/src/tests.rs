@@ -26,6 +26,14 @@ fn borrowed_pin_identity_retains_original_after_numeric_reuse() {
     assert_eq!(replacement.key().index as u64, identity.index);
     assert_eq!(c.pinned_identity(identity), Err(Error::StalePin));
     assert_eq!(c.get(table, number).unwrap().backing, BackingToken(42));
+    let (second_pin, _) = c.pin(table, number).unwrap();
+    let no_longer_pinned = second_pin.identity();
+    assert_eq!(c.unpin(second_pin), Ok(None));
+    assert_eq!(
+        c.pinned_identity(no_longer_pinned),
+        Err(Error::StalePin),
+        "a descriptor hold alone cannot authenticate an operation pin"
+    );
     c.unpin(replacement).unwrap();
     c.destroy_table(table, |_| {}).unwrap();
 }

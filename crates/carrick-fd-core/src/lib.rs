@@ -217,7 +217,25 @@ pub struct RawOfdPin {
     pub index: u64,
     pub generation: u64,
 }
+
+/// Borrowed identity of an operation's retained description. This key grants
+/// lookup only: it cannot be installed, cloned into a hold, or unpinned.
+/// The operation must retain its owning [`OfdPin`] until every borrower has
+/// finished (including carrier cancellation acknowledgement).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OfdPinIdentity {
+    pub authority: u64,
+    pub index: u64,
+    pub generation: u64,
+}
 impl OfdPin {
+    pub fn identity(&self) -> OfdPinIdentity {
+        OfdPinIdentity {
+            authority: self.authority,
+            index: u64::from(self.key.index),
+            generation: self.key.generation,
+        }
+    }
     pub fn key(&self) -> OfdKey {
         self.key
     }
@@ -2312,21 +2330,33 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
     }
 
     fn check_pin(&self, pin: &OfdPin) -> Result<(), Error> {
-        let ofd = self.ofd(pin.key.index).map_err(|_| Error::StalePin)?;
+        self.check_pin_identity(pin.identity()).map(|_| ())
+    }
+
+    fn check_pin_identity(&self, pin: OfdPinIdentity) -> Result<u32, Error> {
+        let index = u32::try_from(pin.index).map_err(|_| Error::StalePin)?;
+        let ofd = self.ofd(index).map_err(|_| Error::StalePin)?;
         if pin.authority != self.identity()?
-            || ofd.generation.load(Ordering::Acquire) != pin.key.generation
+            || ofd.generation.load(Ordering::Acquire) != pin.generation
             || ofd.holds.load(Ordering::Acquire) & FREE_INDEX == 0
         {
             return Err(Error::StalePin);
         }
-        Ok(())
+        Ok(index)
     }
 
     /// Current state of a pinned description (status flags may change while
     /// an operation is suspended, e.g. F_SETFL O_NONBLOCK from a sibling).
     pub fn pinned(&self, pin: &OfdPin) -> Result<Description, Error> {
-        self.check_pin(pin)?;
-        self.snapshot(pin.key.index)
+        self.pinned_identity(pin.identity())
+    }
+
+    /// Authenticate a borrowed operation pin without another descriptor-table
+    /// lookup or a second owning `OfdPin`. The owner must remain retained for
+    /// the entire lookup and use of its result. Authentication rejects foreign,
+    /// retired and recycled descriptions; it does not acquire a new hold.
+    pub fn pinned_identity(&self, pin: OfdPinIdentity) -> Result<Description, Error> {
+        self.snapshot(self.check_pin_identity(pin)?)
     }
 
     /// Admit a description before installing a numeric descriptor. The pin
