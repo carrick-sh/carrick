@@ -14,7 +14,7 @@ use crate::abi::entry::SyscallResult;
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
-use carrick_core::personality::CopyOutcome;
+use carrick_core::user_copy::CopyOutcome;
 use carrick_core_abi::host_file::{
     self, HOST_FILE_CHUNK_BYTES, HostFileHeader, HostFileOp, record_len,
 };

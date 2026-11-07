@@ -1000,18 +1000,14 @@ struct HostFileCopy<'a, V: file::MemoryValidator>(file::ValidatedCopy<'a, V>);
 impl<V: file::MemoryValidator> carrick_personality_linux::native_host_file::HostFileUser
     for HostFileCopy<'_, V>
 {
-    fn copy_in(&mut self, dst: &mut [u8], src: u64) -> carrick_core::personality::CopyOutcome {
-        use carrick_core::personality::{CopyOutcome, GuestCopyRequest};
-        if file::UserCopy::copy_in(&mut self.0, dst, src) {
-            CopyOutcome::Done
-        } else {
-            CopyOutcome::NotYet(GuestCopyRequest {
-                address: carrick_guest_arch::UserVa::new(src),
-                len: carrick_guest_arch::GuestLen::new(dst.len() as u64),
-                access: carrick_guest_arch::Access::Read,
-            })
-        }
+    fn copy_in(&mut self, dst: &mut [u8], src: u64) -> carrick_core::user_copy::CopyOutcome {
+        carrick_core::user_copy::UserCopy::copy_in(
+            &mut self.0,
+            dst,
+            carrick_guest_arch::UserVa::new(src),
+        )
     }
+
     fn writable(&mut self, dst: u64, len: usize) -> usize {
         self.0.validator.writable_bytes(dst, len)
     }
@@ -4473,6 +4469,58 @@ mod tests {
         assert_eq!(view.path(), b"/bin/static");
         assert_eq!(view.argv().collect::<alloc::vec::Vec<_>>(), [b"static"]);
         assert_eq!(view.envp().collect::<alloc::vec::Vec<_>>(), [b"A=B"]);
+    }
+
+    #[test]
+    fn native_host_file_input_adapter_distinguishes_fault_from_lazy_source() {
+        use carrick_personality_linux::native_host_file::{DescriptionAccess, HostFileStage};
+        struct Lazy(core::cell::Cell<bool>);
+        impl file::MemoryValidator for Lazy {
+            fn writable_bytes(&self, _: u64, _: usize) -> usize {
+                0
+            }
+            fn readable_bytes(&self, _: u64, len: usize) -> usize {
+                if self.0.replace(false) { 0 } else { len }
+            }
+        }
+        let task = CurrentTask::new();
+        let bytes = b"abcdef";
+        let mut frame = TrapFrame {
+            esr: 0x15 << 26,
+            ..TrapFrame::default()
+        };
+        frame.x[8] = 64;
+        frame.x[0] = 1;
+        frame.x[1] = carrick_guest_arch::USER_CEILING;
+        frame.x[2] = bytes.len() as u64;
+        let stage = |frame: &TrapFrame, validator: &Lazy| {
+            native_host_file_stage(
+                frame,
+                &task,
+                validator,
+                [3, 4, 5],
+                |_| {
+                    Some(NativeDescriptor::HostBacked {
+                        access: DescriptionAccess::WriteOnly,
+                    })
+                },
+                &mut |_| 0,
+            )
+        };
+        assert!(matches!(stage(&frame, &Lazy(core::cell::Cell::new(true))),
+            Some(HostFileStage::Returned(result))
+                if result.raw() == carrick_syscall_abi::LINUX_EFAULT.guest_retval()));
+        frame.x[1] = bytes.as_ptr().addr() as u64;
+        let lazy = Lazy(core::cell::Cell::new(true));
+        assert!(
+            matches!(stage(&frame, &lazy), Some(HostFileStage::Fault { address, access })
+            if address == frame.x[1] && access == carrick_guest_arch::Access::Read)
+        );
+        let Some(HostFileStage::Request { mut record, .. }) = stage(&frame, &lazy) else {
+            panic!("resident read-only source must stage once");
+        };
+        let view = carrick_core_abi::host_file::HostFileRequestView::parse(&mut record).unwrap();
+        assert_eq!(view.input(), bytes);
     }
 
     #[test]

@@ -961,7 +961,7 @@ fn file_staging_true_input_fault_does_not_request_backing() {
 
 #[test]
 fn file_staging_not_yet_input_builds_no_request_before_supply() {
-    use carrick_core::personality::GuestCopyRequest;
+    use carrick_core::user_copy::GuestCopyRequest;
     use carrick_guest_arch::{GuestLen, UserVa};
 
     struct LazyInput {
