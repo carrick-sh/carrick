@@ -31,6 +31,14 @@ struct FileRegionHeader {
 
 const _: () = {
     assert!(size_of::<FileRegionHeader>() == 64);
+    assert!(
+        crate::EL1_IPC_TABLE_MAP_OFFSET + size_of::<crate::ipc_tables::IpcTableMap>() as u64
+            <= EL1_REGION_SIZE
+    );
+    assert!(
+        crate::EL1_IPC_TABLE_MAP_OFFSET
+            .is_multiple_of(align_of::<crate::ipc_tables::IpcTableMap>() as u64)
+    );
     assert!(size_of::<[DelegatedFile; MAX_DELEGATED_FILES]>() as u64 <= EL1_OBJECT_TABLE_SIZE);
     assert!(size_of::<[FdMapSlot; FD_MAP_CAPACITY]>() as u64 <= EL1_FD_MAP_SIZE);
     assert!(
@@ -204,6 +212,14 @@ impl FileRegionRegistration {
                 .add(EL1_NAME_CACHE_OFFSET as usize)
                 .cast::<InotifyNameCache>()
                 .write(InotifyNameCache::new());
+            // The map contains only integer atomics and reserved integers;
+            // all-zero is its empty, unpublished state. Initialize in place
+            // without a large by-value temporary on a supervisor stack.
+            mapped
+                .as_ptr()
+                .add(crate::EL1_IPC_TABLE_MAP_OFFSET as usize)
+                .cast::<crate::ipc_tables::IpcTableMap>()
+                .write_bytes(0, 1);
             mapped
                 .as_ptr()
                 .add(EL1_FILE_REGION_HEADER_OFFSET as usize)
@@ -337,15 +353,19 @@ impl<'a> FileTables<'a> {
         unsafe { Self::attach(mapped, expected) }
     }
 
-    /// Descriptor namespace belonging to this exact retained carrier.
-    pub fn ipc_table_map(&self) -> &'a crate::ipc_tables::IpcTableMap {
-        // SAFETY: the map is aligned and contained in the authenticated region.
+    /// Descriptor namespace map in this authenticated carrier's region.
+    /// The borrow retains registration custody; no process-global aperture
+    /// or ISA-specific virtual address participates in host resolution.
+    pub fn ipc_table_map(&self) -> &crate::ipc_tables::IpcTableMap {
+        // SAFETY: registration initializes this reservation before publishing
+        // its identity. Attachment authenticates that identity and retains
+        // mapping custody; the ABI assertions check extent and alignment.
         unsafe {
             &*self
                 .mapped
                 .as_ptr()
                 .add(crate::EL1_IPC_TABLE_MAP_OFFSET as usize)
-                .cast()
+                .cast::<crate::ipc_tables::IpcTableMap>()
         }
     }
 
