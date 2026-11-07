@@ -497,8 +497,7 @@ pub struct IrqGuard {
 }
 
 #[cfg(all(not(test), not(target_os = "none")))]
-static HOST_IRQ_MASKED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static HOST_IRQ_MASKED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
 std::thread_local! {
