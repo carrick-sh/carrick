@@ -19,6 +19,15 @@ use crate::el1_zone::HostLockWait;
 
 static NEXT_REGION: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(test)]
+static INJECT_OBJECT_WAIT_BIND_BUSY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn inject_object_wait_bind_busy_once() {
+    INJECT_OBJECT_WAIT_BIND_BUSY.store(true, Ordering::Release);
+}
+
 /// Admission failure, before any descriptor or host reservation is published.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionError {
@@ -774,7 +783,17 @@ impl HostIpc {
         if let Some(zone) = crate::el1_zone::zone() {
             for direction in [pipe::WaitFor::Readable, pipe::WaitFor::Writable] {
                 if let Some(key) = carrick_el1_abi::ipc::object_wait_key(object, direction) {
-                    zone.bind_object_wait(key, &HostLockWait)
+                    #[cfg(test)]
+                    let result = if INJECT_OBJECT_WAIT_BIND_BUSY
+                        .swap(false, Ordering::AcqRel)
+                    {
+                        Err(carrick_sched_core::object_wait::ObjectWaitError::Busy)
+                    } else {
+                        zone.bind_object_wait(key, &HostLockWait)
+                    };
+                    #[cfg(not(test))]
+                    let result = zone.bind_object_wait(key, &HostLockWait);
+                    result
                         .unwrap_or_else(|_| {
                             carrick_fatal::carrick_fatal!(
                                 "ipc::admission",

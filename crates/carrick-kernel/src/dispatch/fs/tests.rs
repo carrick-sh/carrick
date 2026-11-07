@@ -5276,6 +5276,36 @@ fn serial_host_pipemass_fd_limit_preserves_wait_domains_and_incarnations() {
 }
 
 #[test]
+fn serial_host_pipe_create_busy_wait_binding_is_not_fatal() {
+    use crate::el1_zone::HostLockWait;
+    // SAFETY: zero is the valid empty scheduler state; use aligned heap
+    // storage because the complete zone is too large for a test stack.
+    let zone = unsafe {
+        let ptr =
+            std::alloc::alloc_zeroed(std::alloc::Layout::new::<carrick_el1_abi::ZoneTables>());
+        assert!(!ptr.is_null());
+        Box::leak(Box::from_raw(ptr.cast::<carrick_el1_abi::ZoneTables>()))
+    };
+    crate::el1_zone::with_test_zone(zone, || {
+        let metadata = carrick_sched_core::object_wait::ObjectWaitKey::metadata_request(1).unwrap();
+        zone.bind_object_wait(metadata, &HostLockWait).unwrap();
+        let mut h = SpliceTestRig::new(4096);
+        let before = h.dispatcher.captured_file_table().slot_count();
+
+        crate::el1_ipc::inject_object_wait_bind_busy_once();
+        let outcome = h.run(SpliceTestRig::SYS_PIPE2, [0x4000, 0, 0, 0, 0, 0]);
+
+        assert_eq!(outcome, DispatchOutcome::errno(carrick_abi::LINUX_EAGAIN));
+        assert_eq!(h.dispatcher.captured_file_table().slot_count(), before);
+        assert_eq!(
+            h.run(SpliceTestRig::SYS_PIPE2, [0x4000, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 },
+            "the next production pipe2 succeeds after the one-shot Busy refusal",
+        );
+    });
+}
+
+#[test]
 fn m1_failed_pair_copyout_leaves_no_descriptors_or_reserved_holes() {
     let mut h = SpliceTestRig::new(4096);
     let before = h.dispatcher.captured_file_table().slot_count();
