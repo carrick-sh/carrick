@@ -1,0 +1,13 @@
+--- a/.github/workflows/kernel-runtime.yml
++++ b/.github/workflows/kernel-runtime.yml
+@@ -514,6 +514,10 @@
+           just accept --profile kvm --receipt target/ci-receipts/receipt.json || status=$?
+           echo "xtask accept exited $status"
+           test -s target/ci-receipts/receipt.json
++          # Reject missing execution even against an equally broken baseline.
++          # Named test failures still belong to the hosted differential gate.
++          just xtask ci-receipt diff --baseline target/ci-receipts/receipt.json \
++            --candidate target/ci-receipts/receipt.json --fail-on-new
+ 
+       # Lane jobs only produce and upload receipts; they never wait for a
+       # base receipt, so a queued entry can never hold the runner its base
