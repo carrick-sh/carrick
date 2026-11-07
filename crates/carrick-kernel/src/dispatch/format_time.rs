@@ -7,10 +7,10 @@ pub(crate) use carrick_abi::{
     LINUX_CLOCK_MONOTONIC_COARSE, LINUX_CLOCK_MONOTONIC_RAW, LINUX_CLOCK_PROCESS_CPUTIME_ID,
     LINUX_CLOCK_REALTIME, LINUX_CLOCK_REALTIME_ALARM, LINUX_CLOCK_REALTIME_COARSE,
     LINUX_CLOCK_RESOLUTION_NSEC, LINUX_CLOCK_TAI, LINUX_CLOCK_THREAD_CPUTIME_ID, LINUX_EAGAIN,
-    LINUX_EFAULT, LINUX_EINTR, LINUX_EINVAL, LINUX_EOPNOTSUPP, LINUX_EPERM, LINUX_ITIMER_PROF,
+    LINUX_EFAULT, LINUX_EINTR, LINUX_EINVAL, LINUX_EOPNOTSUPP, LINUX_ITIMER_PROF,
     LINUX_ITIMER_REAL, LINUX_ITIMER_VIRTUAL, LINUX_UTIME_NOW, LINUX_UTIME_OMIT, LinuxItimerspec,
     LinuxItimerval, LinuxTimerfdExpirations, LinuxTimespec, LinuxTimeval, LinuxTimex,
-    LinuxTimexModes, LinuxTimexStatus, LinuxTimezone, LinuxTms,
+    LinuxTimezone, LinuxTms,
 };
 use carrick_guest_mem::CurrentMmMemory;
 
@@ -483,7 +483,7 @@ pub(super) fn linux_timeval_usec_is_valid(tv: LinuxTimeval) -> bool {
     (0..1_000_000).contains(&usec)
 }
 
-use carrick_time_core::{linux_time_state_from_status, linux_timex_from_state, linux_timex_time};
+use carrick_time_core::{TimexAccess, TimexRequest, TimexValidationError};
 
 pub(super) fn adjtimex_bootstrap(
     context: &crate::kernel::KernelContext,
@@ -496,28 +496,28 @@ pub(super) fn adjtimex_bootstrap(
         Ok(timex) => timex,
         Err(errno) => return DispatchOutcome::Errno { errno },
     };
-    let modes = LinuxTimexModes::from_bits_retain(timex.modes);
-    if modes.contains(LinuxTimexModes::OFFSET_SINGLESHOT_FLAG)
-        && !modes.contains(LinuxTimexModes::OFFSET)
-    {
-        let invalid = LinuxTimex::invalid_mode_error_state();
-        return copyout_format_time_record(
-            context,
-            memory,
-            address,
-            &invalid,
-            DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            },
-        );
-    }
-    if timex.modes == 0 {
+    let access = if can_adjust {
+        TimexAccess::Adjust
+    } else {
+        TimexAccess::ReadOnly
+    };
+    let request = match TimexRequest::validate(&timex, access) {
+        Ok(request) => request,
+        Err(TimexValidationError::InvalidModeOutput) => {
+            return copyout_format_time_record(
+                context,
+                memory,
+                address,
+                &LinuxTimex::invalid_mode_error_state(),
+                DispatchOutcome::errno(LINUX_EINVAL),
+            );
+        }
+        Err(TimexValidationError::Errno(errno)) => return DispatchOutcome::errno(errno),
+    };
+    if !request.modifies() {
         let state = clock.adjtimex_state();
-        let status = LinuxTimexStatus::from_bits_retain(state.status);
-        let now = clock.realtime_now();
-        let time = linux_timex_time(now, status);
-        let current = linux_timex_from_state(time, &state);
-        let value = linux_time_state_from_status(status);
+        let mut current = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
+        let value = request.write_reply(&state, clock.realtime_now(), &mut current);
         return copyout_format_time_record(
             context,
             memory,
@@ -526,121 +526,12 @@ pub(super) fn adjtimex_bootstrap(
             DispatchOutcome::Returned { value },
         );
     }
-    if modes == LinuxTimexModes::OFFSET_SS_READ {
-        let state = clock.adjtimex_state();
-        let status = LinuxTimexStatus::from_bits_retain(state.status);
-        let now = clock.realtime_now();
-        let time = linux_timex_time(now, status);
-        let mut current = linux_timex_from_state(time, &state);
-        current.modes = timex.modes;
-        current.offset = 0;
-        let value = linux_time_state_from_status(status);
-        return copyout_format_time_record(
-            context,
-            memory,
-            address,
-            &current,
-            DispatchOutcome::Returned { value },
-        );
-    }
-    if !can_adjust {
-        return DispatchOutcome::Errno { errno: LINUX_EPERM };
-    }
-
-    const KNOWN_MODES: u32 = LinuxTimexModes::IDEMPOTENT_SUPPORTED.bits()
-        | LinuxTimexModes::OFFSET_SINGLESHOT_FLAG.bits();
-    if (timex.modes & !KNOWN_MODES) != 0 {
-        return DispatchOutcome::Errno {
-            errno: LINUX_EINVAL,
-        };
-    }
-    // ADJ_MICRO|ADJ_NANO together and ADJ_TAI|ADJ_TIMECONST together are
-    // ACCEPTED by Linux (native arm64 oracle, probe `adjtimexmodel`
-    // `micro_nano_together_accepted` / `tai_timeconst_together_accepted`);
-    // the later of the two stores simply wins.
-    if modes.contains(LinuxTimexModes::OFFSET_SINGLESHOT_FLAG)
-        && modes != LinuxTimexModes::OFFSET_SINGLESHOT
-    {
-        return DispatchOutcome::Errno {
-            errno: LINUX_EINVAL,
-        };
-    }
-
-    if modes.contains(LinuxTimexModes::TICK) {
-        let minimum = 900_000 / LINUX_CLK_TCK;
-        let maximum = 1_100_000 / LINUX_CLK_TCK;
-        let requested_tick = timex.tick;
-        if !(minimum..=maximum).contains(&requested_tick) {
-            return DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            };
-        }
-    }
-    // An out-of-range `freq` is CLAMPED to +/-MAXFREQ, not refused: the
-    // native arm64 oracle accepts 35_000_000 (probe `adjtimexmodel`,
-    // `oversized_freq_accepted`). The clamp happens where the value is stored.
-    if modes.contains(LinuxTimexModes::OFFSET_SINGLESHOT_FLAG) {
-        let requested_offset = timex.offset;
-        if !(-131_071..=131_071).contains(&requested_offset) {
-            return DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            };
-        }
-    }
-    // Unknown `status` bits are ignored, not refused: the oracle accepts
-    // `1 << 20` (`unknown_status_bits_accepted`). Only the defined, writable
-    // bits are stored where the value lands.
-
-    let mut step_realtime_ns: Option<i64> = None;
-    if modes.contains(LinuxTimexModes::SETOFFSET) {
-        let is_nano = if modes.contains(LinuxTimexModes::NANO) {
-            true
-        } else if modes.contains(LinuxTimexModes::MICRO) {
-            false
-        } else {
-            LinuxTimexStatus::from_bits_retain(clock.adjtimex_state().status)
-                .contains(LinuxTimexStatus::NANO)
-        };
-        let max_sub = if is_nano { 1_000_000_000 } else { 1_000_000 };
-        if timex.time.tv_usec < 0 || timex.time.tv_usec >= max_sub {
-            return DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            };
-        }
-        let sec_ns = match timex.time.tv_sec.checked_mul(1_000_000_000) {
-            Some(s) => s,
-            None => {
-                return DispatchOutcome::Errno {
-                    errno: LINUX_EINVAL,
-                };
-            }
-        };
-        let sub_ns = if is_nano {
-            timex.time.tv_usec
-        } else {
-            timex.time.tv_usec.saturating_mul(1_000)
-        };
-        let delta_ns = match sec_ns.checked_add(sub_ns) {
-            Some(d) => d,
-            None => {
-                return DispatchOutcome::Errno {
-                    errno: LINUX_EINVAL,
-                };
-            }
-        };
-        step_realtime_ns = Some(delta_ns);
-    } else if modes == LinuxTimexModes::OFFSET_SINGLESHOT {
-        let delta_ns = match timex.offset.checked_mul(1_000) {
-            Some(ns) => ns,
-            None => {
-                return DispatchOutcome::Errno {
-                    errno: LINUX_EINVAL,
-                };
-            }
-        };
-        step_realtime_ns = Some(delta_ns);
-    }
-
+    let step_realtime_ns = match request.realtime_step(|| {
+        carrick_abi::LinuxTimexStatus::from_bits_retain(clock.adjtimex_state().status)
+    }) {
+        Ok(step) => step,
+        Err(errno) => return DispatchOutcome::errno(errno),
+    };
     let out = match super::copyout::prepare(
         context,
         memory,
@@ -649,24 +540,17 @@ pub(super) fn adjtimex_bootstrap(
         Ok(out) => out,
         Err(refusal) => return refusal.into_outcome(),
     };
-
     if let Some(delta_ns) = step_realtime_ns {
         if let Err(errno) = clock.try_step_realtime_offset_ns(delta_ns) {
             return DispatchOutcome::Errno { errno };
         }
     }
-
     let updated_state = clock.with_adjtimex_mut(|state| {
-        carrick_time_core::apply_timex_fields(state, &timex);
+        request.apply_fields(state);
         state.clone()
     });
-
-    let status = LinuxTimexStatus::from_bits_retain(updated_state.status);
-    let now = clock.realtime_now();
-    let time = linux_timex_time(now, status);
-    let mut current = linux_timex_from_state(time, &updated_state);
-    current.modes = timex.modes;
-    let value = linux_time_state_from_status(status);
+    let mut current = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
+    let value = request.write_reply(&updated_state, clock.realtime_now(), &mut current);
     match out.commit([carrick_abi::KernelAbi::abi_bytes(&current)]) {
         Ok(()) => DispatchOutcome::Returned { value },
         Err(fault) => fault.outcome(),
