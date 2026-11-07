@@ -719,10 +719,48 @@ impl ClockDomain {
             .clone()
     }
 
-    /// Mutate the `adjtimex(2)` discipline state under the domain's lock.
-    pub fn with_adjtimex_mut<R>(&self, f: impl FnOnce(&mut AdjtimexState) -> R) -> R {
-        let mut guard = self.adjtimex.lock().unwrap_or_else(|p| p.into_inner());
-        f(&mut guard)
+    /// Execute one validated discipline request against this clock authority.
+    ///
+    /// The caller prepares guest output before a modifying request. A preflight
+    /// validation may reject before preparation, but its derived step must not
+    /// be reused: concurrent requests can change the implicit SETOFFSET units.
+    /// Lock order is clock changes, then discipline. No user-memory operation
+    /// runs under either lock, and notifications run after both are released.
+    pub fn apply_timex(
+        &self,
+        request: &carrick_time_core::TimexRequest<'_>,
+        output: &mut carrick_abi::LinuxTimex,
+    ) -> Result<i64, carrick_abi::LinuxErrno> {
+        let mut changes = self
+            .clock_changes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut discipline = self.adjtimex.lock().unwrap_or_else(|p| p.into_inner());
+        let step = request
+            .realtime_step(|| carrick_abi::LinuxTimexStatus::from_bits_retain(discipline.status))?;
+        if step.is_some() && self.is_controlled() {
+            return Err(carrick_abi::LINUX_EPERM);
+        }
+        if let Some(delta) = step {
+            // All offset writers hold clock_changes, so this is one bounded
+            // update rather than a compare/exchange retry loop.
+            let current = self.realtime_offset_ns.load(Ordering::SeqCst);
+            self.realtime_offset_ns
+                .store(current.saturating_add(delta), Ordering::SeqCst);
+            self.epoch.fetch_add(1, Ordering::Release);
+        }
+        request.apply_fields(&mut discipline);
+        let value = request.write_reply(&discipline, self.realtime_now(), output);
+        let callbacks = step.map(|_| {
+            changes.generation = changes.generation.wrapping_add(1);
+            changes.listeners.values().cloned().collect()
+        });
+        drop(discipline);
+        drop(changes);
+        if let Some(callbacks) = callbacks {
+            self.finish_clock_change(callbacks);
+        }
+        Ok(value)
     }
 
     /// CLOCK_REALTIME before this domain's offset: `uptime + vvar base` when
@@ -2086,17 +2124,60 @@ mod clock_domain_tests {
         assert_eq!(state.tai, 0);
         assert_eq!(state.singleshot_offset, 0);
 
-        clock.with_adjtimex_mut(|s| {
-            s.freq = 12345;
-            s.status = carrick_abi::LINUX_STA_PLL;
-            s.constant = 5;
-            s.tai = 37;
-        });
+        let mut input =
+            carrick_abi::LinuxTimex::new_read_state(carrick_abi::LinuxTimeval::new(0, 0));
+        input.modes = carrick_abi::LINUX_ADJ_FREQUENCY
+            | carrick_abi::LINUX_ADJ_STATUS
+            | carrick_abi::LINUX_ADJ_TIMECONST;
+        input.freq = 12345;
+        input.status = carrick_abi::LINUX_STA_PLL;
+        input.constant = 5;
+        let request = carrick_time_core::TimexRequest::validate(
+            &input,
+            carrick_time_core::TimexAccess::Adjust,
+        )
+        .unwrap();
+        let mut output =
+            carrick_abi::LinuxTimex::new_read_state(carrick_abi::LinuxTimeval::new(0, 0));
+        clock.apply_timex(&request, &mut output).unwrap();
         let modified = clock.adjtimex_state();
         assert_eq!(modified.freq, 12345);
         assert_eq!(modified.status, carrick_abi::LINUX_STA_PLL);
         assert_eq!(modified.constant, 5);
-        assert_eq!(modified.tai, 37);
+        assert_eq!(modified.tai, 0);
+    }
+
+    #[test]
+    fn timex_controlled_step_leaves_discipline_and_reply_untouched() {
+        use carrick_abi::{KernelAbi, LinuxTimeval, LinuxTimex};
+        use carrick_time_core::{TimexAccess, TimexRequest};
+        for clock in [
+            ClockDomain::offset(SignedDuration::from_secs(10)),
+            ClockDomain::frozen(UNIX_EPOCH),
+            ClockDomain::scaled(UNIX_EPOCH, 2, 1).unwrap(),
+            ClockDomain::deterministic(UNIX_EPOCH),
+        ] {
+            let before = clock.adjtimex_state();
+            let offset = clock.realtime_offset_ns();
+            let (generation, ()) = clock.with_clock_change_snapshot(|| ());
+            let mut input = LinuxTimex::new_read_state(LinuxTimeval::new(0, 123));
+            input.modes = carrick_abi::LINUX_ADJ_SETOFFSET
+                | carrick_abi::LINUX_ADJ_NANO
+                | carrick_abi::LINUX_ADJ_TICK;
+            input.tick = 10_500;
+            let request = TimexRequest::validate(&input, TimexAccess::Adjust).unwrap();
+            let mut output = LinuxTimex::invalid_mode_error_state();
+            let output_before = output.abi_bytes().to_vec();
+            assert_eq!(
+                clock.apply_timex(&request, &mut output),
+                Err(carrick_abi::LINUX_EPERM)
+            );
+            assert_eq!(clock.adjtimex_state(), before);
+            assert_eq!(clock.realtime_offset_ns(), offset);
+            assert_eq!(clock.epoch(), 0);
+            assert_eq!(clock.with_clock_change_snapshot(|| ()).0, generation);
+            assert_eq!(output.abi_bytes(), output_before);
+        }
     }
 
     #[test]

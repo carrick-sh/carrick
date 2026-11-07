@@ -515,9 +515,11 @@ pub(super) fn adjtimex_bootstrap(
         Err(TimexValidationError::Errno(errno)) => return DispatchOutcome::errno(errno),
     };
     if !request.modifies() {
-        let state = clock.adjtimex_state();
         let mut current = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
-        let value = request.write_reply(&state, clock.realtime_now(), &mut current);
+        let value = match clock.apply_timex(&request, &mut current) {
+            Ok(value) => value,
+            Err(errno) => return DispatchOutcome::errno(errno),
+        };
         return copyout_format_time_record(
             context,
             memory,
@@ -526,12 +528,13 @@ pub(super) fn adjtimex_bootstrap(
             DispatchOutcome::Returned { value },
         );
     }
-    let step_realtime_ns = match request.realtime_step(|| {
+    // Preserve validation before a memory-owner refusal. The step is only a
+    // preflight: apply_timex derives it again under the mutation authority.
+    if let Err(errno) = request.realtime_step(|| {
         carrick_abi::LinuxTimexStatus::from_bits_retain(clock.adjtimex_state().status)
     }) {
-        Ok(step) => step,
-        Err(errno) => return DispatchOutcome::errno(errno),
-    };
+        return DispatchOutcome::errno(errno);
+    }
     let out = match super::copyout::prepare(
         context,
         memory,
@@ -540,17 +543,11 @@ pub(super) fn adjtimex_bootstrap(
         Ok(out) => out,
         Err(refusal) => return refusal.into_outcome(),
     };
-    if let Some(delta_ns) = step_realtime_ns {
-        if let Err(errno) = clock.try_step_realtime_offset_ns(delta_ns) {
-            return DispatchOutcome::Errno { errno };
-        }
-    }
-    let updated_state = clock.with_adjtimex_mut(|state| {
-        request.apply_fields(state);
-        state.clone()
-    });
     let mut current = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
-    let value = request.write_reply(&updated_state, clock.realtime_now(), &mut current);
+    let value = match clock.apply_timex(&request, &mut current) {
+        Ok(value) => value,
+        Err(errno) => return DispatchOutcome::errno(errno),
+    };
     match out.commit([carrick_abi::KernelAbi::abi_bytes(&current)]) {
         Ok(()) => DispatchOutcome::Returned { value },
         Err(fault) => fault.outcome(),
