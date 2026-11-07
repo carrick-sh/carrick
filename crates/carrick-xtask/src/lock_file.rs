@@ -161,7 +161,7 @@ pub(crate) mod tests {
         write_test_executable_with_hook(path.as_ref(), contents.as_ref(), permissions, || {});
     }
 
-    fn write_test_executable_with_hook(
+    pub(crate) fn write_test_executable_with_hook(
         path: &std::path::Path,
         contents: &[u8],
         permissions: std::fs::Permissions,
