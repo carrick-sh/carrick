@@ -19,6 +19,72 @@ pub fn preflight_home(home: &Path) -> std::io::Result<()> {
         )))
 }
 
+/// Admit the shared resolver's choice once before starting a gate's tests.
+pub fn preflight_default() -> std::io::Result<()> {
+    preflight_selected(crate::apfs::preferred_scratch_root())
+}
+
+pub(crate) fn preflight_selected(root: &ScratchRoot) -> std::io::Result<()> {
+    root.host_path().map(|_| ()).map_err(|error| {
+        std::io::Error::other(format!(
+            "failed scratch preflight: {error}; set CARRICK_HOME to an internal case-sensitive directory"
+        ))
+    })
+}
+
+// The conventional APFS mount is a macOS-only default. On other hosts it is
+// never automatically admitted; explicit configuration remains authoritative.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn internal_volume(_: &Path) -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn internal_volume(path: &Path) -> bool {
+    use core_foundation_sys::{array::*, base::*, dictionary::*, number::*, url::*};
+    let bytes = path.as_os_str().as_encoded_bytes();
+    // SAFETY: all CF objects are checked for NULL, borrowed only while their
+    // owner lives, and released according to the Create/Copy ownership rule.
+    // These public keys describe the device bus and removable media, without
+    // launching diskutil or enumerating APFS containers. See Apple's CFURL
+    // Volume Property Keys documentation. This runs inside the probe deadline.
+    unsafe {
+        let url = CFURLCreateFromFileSystemRepresentation(
+            std::ptr::null(),
+            bytes.as_ptr(),
+            bytes.len() as CFIndex,
+            1,
+        );
+        if url.is_null() {
+            return false;
+        }
+        let keys = [
+            kCFURLVolumeIsInternalKey.cast(),
+            kCFURLVolumeIsRemovableKey.cast(),
+        ];
+        let array = CFArrayCreate(std::ptr::null(), keys.as_ptr(), 2, &kCFTypeArrayCallBacks);
+        if array.is_null() {
+            CFRelease(url.cast());
+            return false;
+        }
+        let properties = CFURLCopyResourcePropertiesForKeys(url, array, std::ptr::null_mut());
+        let accepted = if properties.is_null() {
+            false
+        } else {
+            let internal = CFDictionaryGetValue(properties, kCFURLVolumeIsInternalKey.cast());
+            let removable = CFDictionaryGetValue(properties, kCFURLVolumeIsRemovableKey.cast());
+            // CFBoolean values are singletons. Missing/unknown values reject
+            // the candidate as well as an external bus (including USB).
+            let result = internal == kCFBooleanTrue.cast() && removable == kCFBooleanFalse.cast();
+            CFRelease(properties.cast());
+            result
+        };
+        CFRelease(array.cast());
+        CFRelease(url.cast());
+        accepted
+    }
+}
+
 /// The selected scratch path and its case-sensitivity decision, checked once.
 pub struct ScratchRoot {
     path: PathBuf,
@@ -67,8 +133,8 @@ pub(crate) fn probe_scratch_root(path: &Path, create: bool) -> bool {
 /// O_NONBLOCK prevents FIFO rendezvous; it does not bound filesystem device I/O.
 /// The caller waits at most two seconds, including directory creation and cleanup.
 /// A stalled filesystem worker is detached; the process-wide ScratchRoot cache
-/// prevents repeated workers on subsequent backend construction. Gate hosts still
-/// select an internal root with CARRICK_HOME to avoid touching cold storage.
+/// prevents repeated workers on subsequent backend construction. Automatic conventional-volume admission requires internal storage; an explicit
+/// CARRICK_HOME must also avoid cold storage.
 fn bounded_probe(
     timeout: std::time::Duration,
     probe: impl FnOnce() -> bool + Send + 'static,

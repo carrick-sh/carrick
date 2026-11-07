@@ -734,7 +734,7 @@ fn scratch_preflight_uses_explicit_case_sensitive_home() {
         .output()
         .unwrap();
     // macOS temporary storage may be case-insensitive; that is the failure
-    // exercised by acceptance_default_home_is_checked_before_tests below.
+    // exercised by acceptance_unusable_override_is_checked_before_tests below.
     let lower = home.path().join("lower");
     fs::write(&lower, b"").unwrap();
     if !home.path().join("LOWER").exists() {
@@ -746,7 +746,7 @@ fn scratch_preflight_uses_explicit_case_sensitive_home() {
 }
 
 #[test]
-fn acceptance_default_home_is_checked_before_tests() {
+fn acceptance_unusable_override_is_checked_before_tests() {
     let repo = tempfile::tempdir().unwrap();
     for args in [
         vec!["init", "--quiet"],
@@ -772,7 +772,7 @@ fn acceptance_default_home_is_checked_before_tests() {
         );
     }
     let home = repo.path().join("target/carrick-home");
-    // On case-sensitive test hosts, use an unusable default to exercise the
+    // On case-sensitive test hosts, use an unusable override to exercise the
     // same production refusal. On macOS's usual insensitive temp volume,
     // leave the directory writable and let the real case probe reject it.
     let lower = repo.path().join("lower");
@@ -794,12 +794,12 @@ fn acceptance_default_home_is_checked_before_tests() {
             "--profile",
             "linux-portable",
         ])
-        .env_remove("CARRICK_HOME")
+        .env("CARRICK_HOME", &home)
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "{output:?}");
-    assert!(stderr.contains("CARRICK_HOME="), "{stderr}");
+    assert!(stderr.contains("CARRICK_HOME"), "{stderr}");
     assert_eq!(
         stderr.matches("failed scratch preflight").count(),
         1,
@@ -810,7 +810,7 @@ fn acceptance_default_home_is_checked_before_tests() {
 }
 
 #[test]
-fn standalone_signed_runner_rejects_default_before_building_tests() {
+fn standalone_signed_runner_rejects_override_before_building_tests() {
     let dir = tempfile::tempdir().unwrap();
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts");
     symlink(&source, dir.path().join("scripts")).unwrap();
@@ -831,7 +831,7 @@ for arg do
         scratch-preflight)
             shift
             printf '%s\n' "$CARRICK_HOME" > "$WITNESS_PROBE"
-            exec "$WITNESS_XTASK" scratch-preflight "$CARRICK_HOME" ;;
+            exec "$WITNESS_XTASK" scratch-preflight ;;
     esac
     shift
 done
@@ -854,7 +854,7 @@ exit 90
         .env("CARRICK_HOST_LEASE_SOCKET", "validated-by-fixture")
         .env("WITNESS_XTASK", env!("CARGO_BIN_EXE_carrick-xtask"))
         .env("WITNESS_PROBE", dir.path().join("probe"))
-        .env_remove("CARRICK_HOME")
+        .env("CARRICK_HOME", &home)
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);

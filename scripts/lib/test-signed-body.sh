@@ -43,8 +43,7 @@
 # on a gate destroys evidence): every executable's full output goes to the
 # terminal.
 set -euo pipefail
-# The admitted checkout lives on internal storage; USB is cache-only.
-export CARRICK_HOME="${CARRICK_HOME:-$PWD/target/carrick-home}"
+# Scratch admission below uses the shared resolver and preserves CARRICK_HOME.
 # Signed probes must retain refusal evidence even outside CI. Gates choose
 # their own private destination when checking a particular workload.
 export CARRICK_EL1_CENSUS="${CARRICK_EL1_CENSUS:-$PWD/target/carrick-census}"
@@ -74,7 +73,7 @@ fi
 # logs detected PIDs and parent commands even with CARRICK_ALLOW_LOAD=1.
 cargo run --locked -p carrick-xtask -- host-lease --mode carrick --check-load -- true
 
-cargo run --locked -p carrick-xtask -- scratch-preflight "$CARRICK_HOME"
+cargo run --locked -p carrick-xtask -- scratch-preflight
 
 pkg="${1:?usage: scripts/test-signed.sh <package> [libtest args...]}"
 shift

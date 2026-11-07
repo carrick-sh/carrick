@@ -72,25 +72,23 @@ artifacts move to the external USB volume (`/Volumes/carrick`, 233 GB total):
 The conventional `/Volumes/carrick` mount is cold USB storage on cloudmac.
 Runtime scratch must instead use an internal case-sensitive volume. Set
 `CARRICK_HOME` in the runner environment to a directory on that volume; an
-internal checkout alone is insufficient when its volume is case-insensitive. The shared
-`prepare-cargo` action exports `CARRICK_HOME=$GITHUB_WORKSPACE/target/carrick-home`
-when no override is set; signed test scripts use `$PWD/target/carrick-home`
-under the same condition. Acceptance commands default their child processes'
-`CARRICK_HOME` to `<checkout>/target/carrick-home`, preserving inherited and
-per-command operator overrides. Any explicit CI override must
-also point to internal case-sensitive storage. Acceptance and standalone signed
-tests validate the selected home once before starting tests, using the shared
-VFS probe. An unusable or case-insensitive default fails the gate immediately
-with a message naming `CARRICK_HOME`, rather than failing every guest test.
-This preflight never falls back to the conventional USB mount.
+internal checkout alone is insufficient when its volume is case-insensitive.
+CI, acceptance and signed test scripts preserve an explicit `CARRICK_HOME`
+and otherwise use the shared VFS resolver. It prefers `/Volumes/carrick` only
+when Apple's volume properties identify internal, non-removable storage and
+the bounded case probe succeeds. External USB storage is skipped. It then
+tries `$HOME/.carrick/scratch` and `/tmp/carrick/scratch`, accepting only a
+case-sensitive candidate. Unknown volume properties reject the conventional
+mount. No default is derived from the checkout.
 
-The shared VFS resolver checks `$CARRICK_HOME/scratch` before touching the
-conventional mount. An unusable explicit root fails closed for the host
-backend rather than falling back to USB. Each candidate's directory creation,
-case-sensitivity probe and cleanup share a two-second caller deadline. The
-result is cached for the process lifetime. A timed-out filesystem worker is
-detached, so the deadline bounds the caller's wait; it cannot cancel kernel
-I/O. Selecting internal storage remains necessary even with that deadline.
+Acceptance and standalone signed tests validate scratch once before starting
+tests. If no candidate works they fail early with a message naming
+`CARRICK_HOME`. An unusable explicit override fails without falling back.
+Each candidate's volume discovery, directory creation, case-sensitivity probe
+and cleanup share a two-second caller deadline. The result is cached for the
+process lifetime. A timed-out filesystem worker is detached: the deadline
+bounds the caller's wait but cannot cancel kernel I/O. Explicit overrides
+must therefore still point to internal case-sensitive storage.
 
 ## Host setup and #1232 binding security requirements
 

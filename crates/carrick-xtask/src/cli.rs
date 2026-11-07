@@ -23,7 +23,7 @@ pub enum Commands {
     /// Start or attach to the job-local compiler cache under its socket lock.
     CompilerCacheStart,
     /// Check configured runtime scratch before signed tests start.
-    ScratchPreflight { home: PathBuf },
+    ScratchPreflight { home: Option<PathBuf> },
     #[command(about = "Acquire and renew CAS leases over refs/claims/*")]
     Claims(crate::claims::ClaimsArgs),
     /// Repeat a signed test and capture the first selected failure (macOS).
@@ -666,8 +666,14 @@ where
             Ok(())
         }
         Commands::ScratchPreflight { home } => {
-            carrick_vfs::scratch::preflight_home(&home)
-                .map_err(|source| CliError::Io { path: home, source })?;
+            let result = match &home {
+                Some(home) => carrick_vfs::scratch::preflight_home(home),
+                None => carrick_vfs::scratch::preflight_default(),
+            };
+            result.map_err(|source| CliError::Io {
+                path: home.unwrap_or_default(),
+                source,
+            })?;
             Ok(())
         }
         Commands::HostLease(args) => {
