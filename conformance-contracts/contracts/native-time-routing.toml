@@ -1,0 +1,22 @@
+schema_version = 1
+id = "kernel.time.native-routing"
+title = "Native fork children reach the shared time service"
+guest_surfaces = ["syscall:clock_gettime", "syscall:clock_adjtime", "syscall:adjtimex", "syscall:nanosleep"]
+semantic_authority = ["man 2 clock_gettime", "man 2 clock_adjtime", "man 2 adjtimex", "man 2 nanosleep", "native Linux x86_64 null-pointer syscall oracle"]
+fixture = "native-fork-child-time-handler"
+scale_points = [2]
+structural_budgets = []
+rationale = "One production native fork leaves the parent and child alive with distinct MMs. Each child call must reach time argument validation, returning EFAULT for null pointers and counting zero ENOSYS refusals. The initial binding is deliberately red and does not prove successful reads, sleep semantics, work scaling or runtime ratios. See docs/conformance-contracts/native-time-routing.md."
+
+[bindings]
+vm_free = [
+  "carrick-el1-linux::aarch64_process_tests::native_fork_child_clock_gettime_reaches_time_handler",
+  "carrick-el1-linux::aarch64_process_tests::native_fork_child_clock_adjtime_reaches_time_handler",
+  "carrick-el1-linux::aarch64_process_tests::native_fork_child_adjtimex_reaches_time_handler",
+  "carrick-el1-linux::aarch64_process_tests::native_fork_child_nanosleep_reaches_time_handler",
+]
+
+[bindings.unresolved]
+vm_free = "Successful realtime read, x86 entry binding, retained copy, sleep continuation and timex state remain unimplemented. Null-pointer routing evidence alone does not satisfy #1808."
+embed = "UNRUN (director): original pipeline syscall census, signed pipeline reproduction and paired signed populations."
+docker = "UNRUN: native Linux x86_64 null-pointer checks are supplementary evidence, not the declared ARM64 Docker oracle."

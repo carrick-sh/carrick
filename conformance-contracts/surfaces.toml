@@ -199,6 +199,7 @@ surfaces = [
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs", contract = "kernel.futex.contention" },
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs", contract = "kernel.native.entropy" },
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs", contract = "kernel.native.namespace-mutation" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs", contract = "kernel.time.native-routing" },
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs", contract = "kernel.wait.child-rusage" },
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs", contract = "kernel.wait.process-group" },
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs", contract = "process.native.arm-admission" },
