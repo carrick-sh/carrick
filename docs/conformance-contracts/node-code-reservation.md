@@ -118,6 +118,10 @@ same owner. Free validated external hints keep their earlier path; fixed
 placements and genuinely host-served mappings retain theirs. Protection
 publication still requires an authenticated reservation proposal, and the
 sparse refusal remains intact.
+If the optional owner relocation cannot fit the allocation layout, its
+original foreign-mapping result retains the existing high-alias gap search.
+`x86_mmap_last_lower_half_gap_and_invalid_hint` guards that fallback; the
+initial continuation fix returned errno 12 there before this correction.
 
 `delegated_occupied_pie_hint_relocates_to_owner_code_range` checks both ISA
 call views, zero backing allocation, exact owner publication, and the
