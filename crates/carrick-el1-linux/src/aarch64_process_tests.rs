@@ -10528,30 +10528,42 @@ fn serial_host_native_root_creates_timerfd_with_live_children() {
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_fork_epoll_ctl_observes_peer_pipe_write() {
-    native_descriptor_witness(None, false, true, false, false);
+    native_descriptor_witness(None, false, true, false, false, false);
 }
 
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_fork_netpoll_eventfd_wait() {
-    native_descriptor_witness(None, false, false, true, false);
+    native_descriptor_witness(None, false, false, true, false, false);
 }
 
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_root_pipe_zone_ceiling() {
-    native_descriptor_witness(None, true, false, false, true);
+    native_descriptor_witness(None, true, false, false, true, false);
 }
 
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_fork_pipe_zone_ceiling() {
-    native_descriptor_witness(None, false, false, false, true);
+    native_descriptor_witness(None, false, false, false, true, false);
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_root_pipe_zone_ofd_ceiling() {
+    native_descriptor_witness(None, true, false, false, false, true);
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_fork_pipe_zone_ofd_ceiling() {
+    native_descriptor_witness(None, false, false, false, false, true);
 }
 
 #[cfg(all(test, not(target_os = "macos")))]
 fn native_descriptor_calls(constructor: Option<u64>, root_constructor: bool) {
-    native_descriptor_witness(constructor, root_constructor, false, false, false);
+    native_descriptor_witness(constructor, root_constructor, false, false, false, false);
 }
 
 #[cfg(all(test, not(target_os = "macos")))]
@@ -10561,6 +10573,7 @@ fn native_descriptor_witness(
     inherited_epoll: bool,
     netpoll: bool,
     zone_ceiling: bool,
+    ofd_ceiling: bool,
 ) {
     use crate::ipc::IpcTables;
     use carrick_abi::{
@@ -10856,6 +10869,90 @@ fn native_descriptor_witness(
             CompletionRoute::Served | CompletionRoute::WithWork
         ));
         assert_eq!(result, -23, "constructor must observe zone ENFILE (23)");
+        return;
+    }
+
+    if ofd_ceiling {
+        // Keep objects plentiful and fill the description segment with real
+        // reader/writer pairs, each backed by its own pipe object.
+        let mut retained = Vec::new();
+        loop {
+            let object = owner
+                .create_pipe(65536)
+                .expect("object ceiling is not full");
+            let reader = owner.admit_description(fd::Description::new(
+                IpcBacking::Pipe {
+                    object,
+                    end: End::Reader,
+                }
+                .encode(),
+                fd::AccessMode::ReadOnly,
+                fd::StatusFlags::default(),
+            ));
+            let Ok(reader) = reader else {
+                break;
+            };
+            let writer = owner.admit_description(fd::Description::new(
+                IpcBacking::Pipe {
+                    object,
+                    end: End::Writer,
+                }
+                .encode(),
+                fd::AccessMode::WriteOnly,
+                fd::StatusFlags::default(),
+            ));
+            let Ok(writer) = writer else {
+                drop(reader);
+                break;
+            };
+            retained.push((object, reader, writer));
+        }
+        assert_eq!(
+            owner.region().ofd_count(),
+            carrick_el1_abi::ipc::IPC_OFD_SEGMENT
+        );
+        let extra_object = owner.create_pipe(65536).expect("objects remain available");
+        let _ = extra_object;
+
+        let before_objects = owner.region().object_count();
+        let before_ofds = owner.region().ofd_count();
+        let output = carrick_test_support::GuestUserBuffer::from_bytes(&[0; 8]);
+        let (route, result) = run_in_child_full(
+            0,
+            carrick_personality_linux::crossing::nr::PIPE2.raw(),
+            [output.arg(), 0, 0, 0],
+        );
+        assert!(matches!(
+            route,
+            CompletionRoute::Served | CompletionRoute::WithWork
+        ));
+        assert_eq!(result, -23, "pipe2 must observe OFD ceiling ENFILE (23)");
+        assert_eq!(
+            owner.region().object_count(),
+            before_objects,
+            "failed pipe2 leaked an object"
+        );
+        assert_eq!(
+            owner.region().ofd_count(),
+            before_ofds,
+            "failed pipe2 leaked a description"
+        );
+
+        let (object, reader, writer) = retained.pop().expect("at least one pipe pair");
+        drop(reader);
+        drop(writer);
+        let _ = object;
+        let (route, result) = run_in_child_full(
+            0,
+            carrick_personality_linux::crossing::nr::PIPE2.raw(),
+            [output.arg(), 0, 0, 0],
+        );
+        assert!(matches!(
+            route,
+            CompletionRoute::Served | CompletionRoute::WithWork
+        ));
+        assert!(result >= 0, "pipe2 after freeing an OFD pair: {result}");
+        drop(retained);
         return;
     }
 
