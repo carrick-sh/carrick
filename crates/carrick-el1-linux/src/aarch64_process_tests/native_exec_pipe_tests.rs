@@ -1,6 +1,7 @@
 //! A production native fork and exec retain the same in-zone pipe endpoint.
 use super::*;
 use crate::native_process_runtime::{NativeResume, NativeServiceCall, host_test_support::Physical};
+use crate::sched::LinuxSchedEntry;
 use carrick_core_abi::service::{
     ExecAdoptionReceipt, ExecSuccessorBacking, ExecSuccessorEntry, ExecSuccessorManifest,
     ServiceCell,
@@ -635,11 +636,11 @@ fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
     // the pre-fix `save`, which always wrote `AfterSyscall`, this save
     // replaced the reader's `AtSyscall` position and the next selection
     // rewound it to SVC-4 (#887's double rewind, review P1 on #1799).
-    assert!(
-        fixture
-            .zone
-            .requeue_preempted(fixture.slot, parent_binding.record.id)
-            .is_queued(),
+    // `yield_queued` requeued the parent when it switched to the reader, so the
+    // slot already has another runnable thread for the slice to hand over to.
+    assert_ne!(
+        fixture.zone.slot(fixture.slot).queued(),
+        0,
         "another runnable thread must be queued for the slice to preempt"
     );
     resume_cpu.inner.freq = 1_000_000_000;
