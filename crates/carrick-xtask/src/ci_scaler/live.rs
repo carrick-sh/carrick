@@ -758,9 +758,7 @@ pub(super) fn lock_files_within(
                 return Err(error.into());
             }
             if Instant::now() >= deadline {
-                return Err(ScalerError::External(
-                    "PVE VMID lock busy; retry cleanup next reconcile",
-                ));
+                return Err(ScalerError::StorageBusy);
             }
             // PVE's holder is another process and flock has no release
             // notification, so poll the external lock until the deadline.
@@ -2068,6 +2066,7 @@ fn reconcile_one(
         None => TaskState::Absent,
     };
     if !present
+        && row.busy_retries < MAX_BUSY_RETRIES
         && ((row.state == State::Cloning && task == TaskState::Busy)
             || (row.state == State::WaitingStorage && task == TaskState::Absent))
     {
@@ -2079,6 +2078,8 @@ fn reconcile_one(
             false,
         )?;
         if pending_owned_job(&row, &job, &run, approval.1) {
+            row.busy_retries += 1;
+            update(ledger, &row, path)?;
             if let Some(provisioners) = provisioners {
                 provisioners.resume_clone(
                     ledger,
@@ -2155,6 +2156,11 @@ fn reconcile_one(
         Recovery::FinishAbsent => {
             if task == TaskState::Failed {
                 row.failure = Some("recorded PVE task failed; VM absent".into());
+            } else if row.busy_retries >= MAX_BUSY_RETRIES {
+                recovery_note(
+                    &mut row,
+                    "storage contention retry limit reached; closing absent reservation",
+                );
             }
             if row.state == State::Reaping {
                 return continue_teardown(
@@ -2229,10 +2235,10 @@ fn reconcile_one(
                     approval,
                     PreBoot::FailFast,
                 ) {
-                    row.failure = Some(match &row.failure {
-                        Some(previous) => format!("{previous}; resume: {error}"),
-                        None => error.to_string(),
-                    });
+                    if matches!(error, ScalerError::StorageBusy | ScalerError::Deferred(_)) {
+                        row.busy_retries += 1;
+                    }
+                    recovery_note(&mut row, &format!("resume: {error}"));
                     // A failed/ambiguous JIT delivery is not a licensed reap.
                     // Preserve its actual preparation state for assignment and
                     // drain checks, which may discover a job already running.
@@ -3149,6 +3155,10 @@ impl Provisioners {
                         work(&pve, &mut owned, &mut row, &dir, &path, (group, &admission));
                     if let Err(error) = &provisioned {
                         if resume {
+                            if matches!(error, ScalerError::StorageBusy | ScalerError::Deferred(_))
+                            {
+                                row.busy_retries += 1;
+                            }
                             recovery_note(&mut row, &format!("resume: {error}"));
                         } else {
                             row.failure = Some(error.to_string());
