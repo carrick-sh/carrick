@@ -3213,7 +3213,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             Ok(NativeResume::NoPending)
                         }
                         carrick_core_abi::clock::ClockReply::Sample(Err(errno)) => Ok(
-                            NativeResume::Returned(SyscallResult::new(-i64::from(errno))),
+                            NativeResume::Returned(SyscallResult::new(errno.guest_retval())),
                         ),
                         _ => Err(NativeProcessError::Quarantined),
                     }
