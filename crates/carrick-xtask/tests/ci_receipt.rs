@@ -3227,6 +3227,14 @@ fn kvm_recipe_without_tests_fails_receipt_and_comparison() {
         let step = &receipt.steps[0];
         assert_eq!(step.exit_code, Some(code));
         assert!(step.started_tests.is_empty());
+        assert!(!step.passed);
+        assert!(matches!(
+            step.outcome,
+            Some(carrick_xtask::accept::StepOutcome::Failed { .. })
+        ));
+        let error = step.error.as_deref().unwrap();
+        assert!(error.contains("no tests executed"), "{error}");
+        assert!(error.contains(&format!("Some({code})")), "{error}");
         assert!(
             matches!(
                 step.execution_outcome(),
