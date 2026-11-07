@@ -4696,6 +4696,17 @@ esac
     }
 
     #[test]
+    fn storage_submission_drop_releases_unsubmitted_operation() {
+        let admission = StorageAdmission::acquire("submission-drop-1821", "local").unwrap();
+        // Dropping before a request is issued must settle the submission, even
+        // when the owner exits through an early return or unwinding.
+        admission.set_uncertain(true).unwrap();
+        drop(admission);
+        let next = StorageAdmission::acquire("submission-drop-1821", "local").unwrap();
+        assert!(!next.is_uncertain().unwrap());
+    }
+
+    #[test]
     fn serial_host_storage_submission_errors_do_not_wedge_storage_admission() {
         const CHILD: &str = "CARRICK_STORAGE_SUBMIT_1821";
         if std::env::var_os(CHILD).is_none() {
