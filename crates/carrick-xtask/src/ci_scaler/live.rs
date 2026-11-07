@@ -729,6 +729,18 @@ fn pool_inventory(pool: &Value, node: &str) -> Result<Vec<PoolMember>, ScalerErr
     }
     Ok(result)
 }
+fn classify_task(result: &Value) -> TaskState {
+    if result["status"] == "stopped" {
+        if result["exitstatus"] == "OK" {
+            TaskState::Succeeded
+        } else {
+            TaskState::Failed
+        }
+    } else {
+        TaskState::Running
+    }
+}
+
 impl Pve {
     fn task_done(&self, task: &str) -> Result<bool, ScalerError> {
         match self.task_state(task)? {
@@ -745,15 +757,9 @@ impl Pve {
             PveCall::Get,
             &format!("/nodes/{}/tasks/{task}/status", self.site.node),
         )?;
-        if result["status"] == "stopped" {
-            if result["exitstatus"] != "OK" {
-                return Ok(TaskState::Failed);
-            }
-            Ok(TaskState::Succeeded)
-        } else {
-            Ok(TaskState::Running)
-        }
+        Ok(classify_task(&result))
     }
+
     fn wait_task(&self, task: &str) -> Result<(), ScalerError> {
         let deadline = self
             .deadline
@@ -3941,6 +3947,36 @@ printf '{"data":%s}\n200' "$body"
         assert_eq!(
             recover_registration(&row, &[json!({"id":99,"name":"someone-else"})]).unwrap(),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod storage_contention_tests {
+    use super::*;
+
+    #[test]
+    fn recorded_storage_timeout_defers_task_without_freezing() {
+        let result = json!({"status":"stopped", "exitstatus":
+            "can't lock file '/var/lock/pve-manager/pve-storage-local' - got timeout"});
+        let state = classify_task(&result);
+        assert_ne!(
+            state,
+            TaskState::Failed,
+            "storage contention must be retryable"
+        );
+    }
+
+    #[test]
+    fn recorded_unknown_failure_remains_failed() {
+        assert_eq!(
+            classify_task(&json!({"status":"stopped",
+            "exitstatus":"clone failed: unable to read image"})),
+            TaskState::Failed
+        );
+        assert_eq!(
+            classify_task(&json!({"status":"stopped","exitstatus":"OK"})),
+            TaskState::Succeeded
         );
     }
 }
