@@ -133,12 +133,13 @@ struct PendingHostFile<'a> {
 }
 
 /// Ring-owned input of a typed service, retained until completion ACK.
-pub(super) struct OwnedCopyout {
+pub(super) struct OwnedCopyout<'a> {
     pub address: UserVa,
     pub bytes: Vec<u8>,
     pub offset: usize,
     pub result: SyscallResult,
     pub prefix_on_fault: bool,
+    pub effect: Option<Box<dyn carrick_personality_linux::lifecycle::CopyoutEffect + 'a>>,
 }
 
 /// Physical preparation is enrolled only after the IPC dispatch stack unwinds.
@@ -151,7 +152,7 @@ pub(super) struct AdapterPreparation {
 enum ServicePayload<'a> {
     None,
     Copyin,
-    Copyout(OwnedCopyout),
+    Copyout(OwnedCopyout<'a>),
     Adapter,
     Exec(Box<[u8]>),
     HostFile(PendingHostFile<'a>),
@@ -170,7 +171,7 @@ pub(super) struct PendingService<'a> {
     /// The same custody for a host-file record, which the carrier also writes.
     host_file: Option<PendingHostFile<'a>>,
     entropy: Option<(Box<[u8]>, UserVa, bool)>,
-    copyout: Option<Box<OwnedCopyout>>,
+    copyout: Option<Box<OwnedCopyout<'a>>>,
     copyin: bool,
     adapter: bool,
     exec_successor: Option<Box<dyn ExecSuccessorSlot + 'a>>,
@@ -577,7 +578,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     #[inline(never)]
     pub(super) fn finish_copyout(
         &mut self,
-        mut output: OwnedCopyout,
+        mut output: OwnedCopyout<'a>,
     ) -> Result<NativeResume, NativeProcessError> {
         let mut prepared_offset = None;
         while output.offset < output.bytes.len() {
@@ -675,6 +676,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }
                 Err(error) => return Err(error),
             }
+        }
+        if let Some(effect) = output.effect.as_mut() {
+            effect.commit().unwrap_or_else(|_| {
+                crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::PipeOutput)
+            });
         }
         Ok(NativeResume::Returned(output.result))
     }

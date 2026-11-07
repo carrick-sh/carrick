@@ -4,6 +4,96 @@ use super::*;
 use std::sync::{Mutex, OnceLock};
 use std::{boxed::Box, vec, vec::Vec};
 
+#[test]
+fn pipe_pair_claims_keep_two_tables_private_and_settle_once() {
+    let c = authority::<3, 8>();
+    let parent = c.create_table(8, &mut storage(4)).unwrap();
+    let mut pair = c.reserve_pair(parent).unwrap();
+    assert_eq!(pair.fds(), Some([Fd(0), Fd(1)]));
+    let peer = c.fork(parent, &mut storage(4)).unwrap();
+    assert_eq!(c.get(parent, Fd(0)), Err(Error::BadFd));
+    assert_eq!(c.get(parent, Fd(1)), Err(Error::BadFd));
+    assert_eq!(c.open(parent, Fd(0), description(9), false), Ok(Fd(2)));
+    assert_eq!(c.open(peer, Fd(0), description(8), false), Ok(Fd(0)));
+    let reader = c.create_pinned(description(10)).unwrap();
+    let writer = c.create_pinned(description(11)).unwrap();
+    let mut pins = [Some(reader), Some(writer)];
+    // A concurrent lowered soft limit does not revoke already admitted slots.
+    c.set_limit(parent, 1).unwrap();
+    c.publish_pair(&mut pair, &mut pins, true).unwrap();
+    assert_eq!(pair.fds(), None);
+    assert_eq!(c.cancel_pair(&mut pair), Err(Error::InvalidArgument));
+    assert_eq!(
+        c.publish_pair(&mut pair, &mut pins, true),
+        Err(Error::InvalidArgument)
+    );
+    for (fd, token) in [(Fd(0), 10), (Fd(1), 11)] {
+        assert_eq!(c.get(parent, fd).unwrap().backing, BackingToken(token));
+        assert_eq!(c.getfd(parent, fd), Ok(true));
+    }
+    assert!(pins.iter().all(Option::is_none));
+    let mut count = 0;
+    c.destroy_table(parent, |_| count += 1).unwrap();
+    c.destroy_table(peer, |_| count += 1).unwrap();
+    assert_eq!(count, 4);
+}
+
+#[test]
+fn pipe_pair_refusal_preserves_claims_and_cancel_restores_lowest_holes() {
+    let (core, arena) = core_with::<1>(4);
+    let c = core.bind(arena, BoundedSpin(0));
+    let table = c.create_table(4, &mut storage(4)).unwrap();
+    let mut pair = c.reserve_pair(table).unwrap();
+    let reader = c.create_pinned(description(10)).unwrap();
+    let writer = c.create_pinned(description(11)).unwrap();
+    let mut pins = [Some(reader), Some(writer)];
+    let transaction = c.transaction(table).unwrap();
+    assert_eq!(
+        c.publish_pair(&mut pair, &mut pins, false),
+        Err(Error::Contended)
+    );
+    assert_eq!(c.cancel_pair(&mut pair), Err(Error::Contended));
+    assert_eq!(pair.fds(), Some([Fd(0), Fd(1)]));
+    drop(transaction);
+    c.cancel_pair(&mut pair).unwrap();
+    assert_eq!(pair.fds(), None);
+    assert_eq!(
+        c.unpin(pins[0].take().unwrap()).unwrap().unwrap().backing,
+        BackingToken(10)
+    );
+    assert_eq!(
+        c.unpin(pins[1].take().unwrap()).unwrap().unwrap().backing,
+        BackingToken(11)
+    );
+    assert_eq!(c.open(table, Fd(0), description(12), false), Ok(Fd(0)));
+    c.set_limit(table, 2).unwrap();
+    assert!(matches!(c.reserve_pair(table), Err(Error::TooManyFiles)));
+    // Finding only one hole must not reserve that hole on refusal.
+    assert_eq!(c.open(table, Fd(0), description(13), false), Ok(Fd(1)));
+}
+
+std::thread_local! {
+    static OFD_PUBLICATION_PROBE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+pub(super) fn observe_ofd_publication(first: usize, completed: usize) {
+    if OFD_PUBLICATION_PROBE.get() {
+        assert_eq!(completed, first);
+    }
+}
+#[test]
+fn growth_observation_excludes_the_segment_still_being_linked() {
+    let core = Core::<1>::new().unwrap();
+    let arena = TestArena::with_ofds(8);
+    let c = core.bind(arena, BoundedSpin(0));
+    c.publish_ofds(2).unwrap();
+    let seen = core.ofd_count();
+    OFD_PUBLICATION_PROBE.set(true);
+    assert_eq!(c.grow_ofds(seen, 2, seen + 2), Ok(2));
+    OFD_PUBLICATION_PROBE.set(false);
+    assert_eq!(c.grow_ofds(seen, 2, seen + 2), Ok(0));
+    assert_eq!(core.ofd_count(), seen + 2);
+}
+
 // Reservation custody stays in one authority, including across backing growth.
 #[test]
 fn owned_reservations_two_live_tables_keep_targets_and_fork_private() {

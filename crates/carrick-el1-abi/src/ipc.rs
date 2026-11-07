@@ -11,8 +11,8 @@
 //! object records ([`IPC_MAX_OBJECTS`]), the open-file-description records
 //! ([`IPC_MAX_OFDS`]) and the leaf words of the owed-host-wake index. The
 //! reservation is address space only: a store grows by *publishing* one
-//! segment at a time (the growth venue, the host, links the new zeroed
-//! records into the free list after publishing the count with Release), so
+//! segment at a time (either venue links zeroed records under the shared
+//! publication owner, then publishes its completed count with Release), so
 //! memory is committed in proportion to the records ever used, and both
 //! venues resolve an index only below the published count. The ceilings are
 //! the zone-wide file table's limit (ENFILE), not an allocation policy.
@@ -72,10 +72,11 @@
 //! into a host round trip. A host holder may itself wait for this vCPU to
 //! stop, so EL1 waits for it only a bounded while and then refuses with
 //! `Contended` before effects; the host waits for any holder. No lock is held across I/O, a WFI, a context switch or a host wait,
-//! and nothing allocates under a lock: pool storage is provisioned by the
-//! host before it takes any lock. A write to an unbacked pipe refuses with
-//! `pipe::Error::Storage` before any effect; EL1 then forwards the call and
-//! the host provides the ring ([`IpcObjectGuard::provide_pipe_storage`]).
+//! and no host allocation occurs under an object lock. Lazy pipe backing
+//! uses the shared buddy metadata: one bounded allocation/reclamation may
+//! nest under the object lock, and releases its allocator lock before return.
+//! No allocator holder acquires an object lock. Stock is only a cache;
+//! [`IpcObjectGuard::ensure_pipe_storage`] supplies a ring in either venue.
 //!
 //! Zone epoll objects ([`epoll`]) add one rule: a member (pipe or eventfd)
 //! lock is taken before an epoll lock (`EPOLL_CTL_ADD`/`MOD`/`DEL`, a final
@@ -93,7 +94,6 @@ use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use carrick_fd_core::BoundedSpin;
 use carrick_fd_core::free_list::{pop, push};
 pub use carrick_fd_core::{
     self as fd, BackingToken, DescriptorSlot, Extent, LockWait, OfdPin, OfdRecord, RawOfdPin,
@@ -457,7 +457,9 @@ pub struct IpcDirectory {
     /// Object records published ([`IpcRegion::grow_objects`]); only grows,
     /// always a multiple of [`IPC_OBJECT_SEGMENT`].
     object_count: AtomicU64,
-    _reserved: [u64; 5],
+    object_publication: fd::storage::PublicationLock,
+    object_published: AtomicU64,
+    _reserved: [u64; 3],
     fd: IpcFdCore,
     free_operations: AtomicU64,
     /// Ring stock: two tagged lock-free stacks over `ring_stock` slots, the
@@ -498,11 +500,12 @@ pub const IPC_DESCRIPTOR_STORAGE_OFFSET: usize = page_round(
     IPC_EPOLL_ITEMS_OFFSET + epoll::IPC_EPOLL_ITEMS * core::mem::size_of::<epoll::IpcEpollItem>(),
 );
 type DescriptorStorage = fd::storage::Storage<IPC_DESCRIPTOR_STORAGE_NODES>;
-/// Length of the directory mapping: fixed head plus every store's
-/// reservation, a multiple of 16 KiB (the host's stage-2 granule).
-pub const IPC_DIRECTORY_BYTES: usize = (IPC_DESCRIPTOR_STORAGE_OFFSET
-    + core::mem::size_of::<DescriptorStorage>())
-.next_multiple_of(0x4000);
+/// Offset of pointer-free pipe allocation metadata, after descriptor metadata.
+pub const IPC_PIPE_STORAGE_OFFSET: usize =
+    page_round(IPC_DESCRIPTOR_STORAGE_OFFSET + core::mem::size_of::<DescriptorStorage>());
+/// Length of the directory mapping, including both allocator stores.
+pub const IPC_DIRECTORY_BYTES: usize =
+    (IPC_PIPE_STORAGE_OFFSET + core::mem::size_of::<DescriptorStorage>()).next_multiple_of(0x4000);
 const _: () =
     assert!(IPC_EPOLL_ITEMS_OFFSET.is_multiple_of(core::mem::align_of::<epoll::IpcEpollItem>()));
 const _: () = assert!(IPC_OBJECTS_OFFSET.is_multiple_of(core::mem::align_of::<IpcObjectRecord>()));
@@ -523,6 +526,8 @@ const _: () = assert!(IPC_OFDS_OFFSET.is_multiple_of(core::mem::align_of::<OfdRe
 /// Layout facts of this ABI; see [`IPC_LAYOUT_HASH`].
 const LAYOUT_FACTS: &[u64] = &[
     IPC_MAGIC,
+    core::mem::offset_of!(IpcDirectory, object_published) as u64,
+    core::mem::offset_of!(IpcDirectory, object_publication) as u64,
     IPC_FD_TABLES as u64,
     IPC_MAX_OFDS as u64,
     IPC_OFD_SEGMENT as u64,
@@ -541,6 +546,7 @@ const LAYOUT_FACTS: &[u64] = &[
     core::mem::offset_of!(IpcDirectory, owed_host_wakes_without_target) as u64,
     core::mem::offset_of!(IpcDirectory, fd) as u64,
     IPC_DESCRIPTOR_STORAGE_OFFSET as u64,
+    IPC_PIPE_STORAGE_OFFSET as u64,
     core::mem::size_of::<DescriptorStorage>() as u64,
     core::mem::size_of::<IpcFdCore>() as u64,
     core::mem::size_of::<IpcObjectRecord>() as u64,
@@ -871,6 +877,14 @@ pub enum IpcError {
     Fd(fd::Error),
 }
 
+fn pipe_storage_error(error: fd::storage::StorageError) -> IpcError {
+    match error {
+        fd::storage::StorageError::Exhausted => IpcError::Fd(fd::Error::NoMemory),
+        fd::storage::StorageError::Contended => IpcError::Contended,
+        fd::storage::StorageError::Invalid => IpcError::BadStorage,
+    }
+}
+
 // ---------------------------------------------------------------- region
 
 /// A venue's view of the shared IPC memory: the directory mapping plus the
@@ -980,8 +994,12 @@ impl<'a> IpcRegion<'a> {
             .descriptor_storage()
             .initialize(pool_len as u64 / IPC_POOL_AREAS)
             .map_err(|_| IpcError::BadRegion)?;
-        region.grow_ofds()?;
-        region.grow_objects()?;
+        region
+            .pipe_storage()
+            .initialize(pool_len as u64 / IPC_POOL_AREAS)
+            .map_err(|_| IpcError::BadRegion)?;
+        region.grow_ofds(0, IPC_MAX_OFDS)?;
+        region.grow_objects(0, IPC_MAX_OBJECTS)?;
         for i in (0..IPC_RING_STOCK).rev() {
             push(&d.ring_stock_empty, i, &d.ring_stock[i].next_free);
         }
@@ -1077,6 +1095,81 @@ impl<'a> IpcRegion<'a> {
                 .add(IPC_DESCRIPTOR_STORAGE_OFFSET)
                 .cast::<DescriptorStorage>()
         }
+    }
+
+    fn pipe_storage(&self) -> &'a DescriptorStorage {
+        // SAFETY: same checked directory reservation as descriptor metadata;
+        // the two stores occupy distinct aligned ranges initialized before READY.
+        unsafe {
+            &*self
+                .base
+                .add(IPC_PIPE_STORAGE_OFFSET)
+                .cast::<DescriptorStorage>()
+        }
+    }
+
+    /// Allocate one pipe extent through the shared buddy owner in either venue.
+    pub fn provision_pipe_storage(
+        &self,
+        ring_bytes: u64,
+        pages: u64,
+        wait: &impl LockWait,
+    ) -> Result<IpcPipeStorage, IpcError> {
+        if ring_bytes == 0 || !ring_bytes.is_multiple_of(IPC_PIPE_PAGE_SIZE as u64) || pages == 0 {
+            return Err(IpcError::BadStorage);
+        }
+        let footprint = pages
+            .checked_mul(core::mem::size_of::<Page>() as u64)
+            .and_then(|bytes| ring_bytes.checked_add(bytes))
+            .ok_or(IpcError::BadStorage)?;
+        let storage = IpcPipeStorage {
+            offset: 0,
+            ring_bytes,
+            pages,
+        };
+        let allocation = self
+            .pipe_storage()
+            .allocate(footprint, wait)
+            .map_err(pipe_storage_error)?;
+        Ok(IpcPipeStorage {
+            offset: ipc_ring_area(self.pool_len).start + allocation.offset,
+            ..storage
+        })
+    }
+
+    /// Consume exactly one extent returned by replacement or unused supply.
+    pub fn reclaim_pipe_storage(
+        &self,
+        storage: &mut IpcPipeStorage,
+        wait: &impl LockWait,
+    ) -> Result<(), IpcError> {
+        if storage.ring_bytes == 0 && storage.pages == 0 {
+            return Ok(());
+        }
+        let offset = storage
+            .offset
+            .checked_sub(ipc_ring_area(self.pool_len).start)
+            .ok_or(IpcError::BadStorage)?;
+        let footprint = storage
+            .pages
+            .checked_mul(core::mem::size_of::<Page>() as u64)
+            .and_then(|bytes| storage.ring_bytes.checked_add(bytes))
+            .ok_or(IpcError::BadStorage)?;
+        let bytes = footprint
+            .max(1)
+            .div_ceil(4096)
+            .checked_next_power_of_two()
+            .and_then(|pages| pages.checked_mul(4096))
+            .ok_or(IpcError::BadStorage)?;
+        self.pipe_storage()
+            .release(&mut fd::storage::Allocation { offset, bytes }, wait)
+            .map_err(pipe_storage_error)?;
+        *storage = IpcPipeStorage::default();
+        Ok(())
+    }
+
+    pub fn pipe_allocations(&self) -> usize {
+        self.pipe_storage().live_allocations() as usize
     }
 
     /// Allocate table backing from the same pointer-free pool in either venue.
@@ -1313,7 +1406,7 @@ impl<'a> IpcRegion<'a> {
 
     /// Published object records ([`IpcRegion::grow_objects`]).
     pub fn object_count(&self) -> usize {
-        self.dir.object_count.load(Ordering::Acquire) as usize
+        self.dir.object_published.load(Ordering::Acquire) as usize
     }
 
     /// Published open-file-description records ([`IpcRegion::grow_ofds`]).
@@ -1323,41 +1416,45 @@ impl<'a> IpcRegion<'a> {
 
     /// Publish the next [`IPC_OBJECT_SEGMENT`] object records: the count is
     /// published (Release) before the zeroed records join the free list, so
-    /// every popped index resolves in both venues. Growth venue (the host)
-    /// only, outside any lock; a concurrent growth refuses (`Contended`).
+    /// every popped index resolves in both venues. The growing venue takes
+    /// a shared short publication lock, outside table/object locks.
+    /// Observers read the completed count only after every free-list push.
     /// Returns the records added: O(segment) work, once per segment.
-    pub fn grow_objects(&self) -> Result<usize, IpcError> {
+    pub fn grow_objects(&self, seen: usize, limit: usize) -> Result<usize, IpcError> {
+        let _guard = self
+            .dir
+            .object_publication
+            .acquire(&carrick_sched_core::ShortLockSpin)
+            .map_err(|_| IpcError::Contended)?;
         let first = self.dir.object_count.load(Ordering::Acquire);
-        if first >= IPC_MAX_OBJECTS as u64 {
-            return Err(IpcError::ZoneLimit);
+        if first as usize != seen {
+            return Ok(0);
         }
         let end = first + IPC_OBJECT_SEGMENT as u64;
-        self.dir
-            .object_count
-            .compare_exchange(first, end, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| IpcError::Contended)?;
+        if end > limit.min(IPC_MAX_OBJECTS) as u64 {
+            return Err(IpcError::ZoneLimit);
+        }
+        self.dir.object_count.store(end, Ordering::Release);
+        #[cfg(test)]
+        tests::observe_object_publication(first as usize, self.object_count());
         for index in (first..end).rev() {
             let record = self.record(index as u32).ok_or(IpcError::Corrupt)?;
             push(&self.dir.free_objects, index as usize, &record.next_free);
         }
+        self.dir.object_published.store(end, Ordering::Release);
         Ok(IPC_OBJECT_SEGMENT)
     }
 
-    /// Publish the next [`IPC_OFD_SEGMENT`] open-file-description records
-    /// (see [`fd::Authority::publish_ofds`]). Growth venue only. Returns the
-    /// records added.
-    pub fn grow_ofds(&self) -> Result<usize, IpcError> {
-        let first = self.ofd_count();
-        if first >= IPC_MAX_OFDS {
-            return Err(IpcError::ZoneLimit);
-        }
-        let count = IPC_OFD_SEGMENT.min(IPC_MAX_OFDS - first);
+    /// Shared OFD growth, bounded by this venue's configured ceiling.
+    pub fn grow_ofds(&self, seen: usize, limit: usize) -> Result<usize, IpcError> {
         self.dir
             .fd
-            .bind(self, BoundedSpin(0))
-            .publish_ofds(count)
-            .map_err(IpcError::Fd)?;
-        Ok(count)
+            .bind(self, carrick_sched_core::ShortLockSpin)
+            .grow_ofds(seen, IPC_OFD_SEGMENT, limit.min(IPC_MAX_OFDS))
+            .map_err(|error| match error {
+                fd::Error::TooManyFiles => IpcError::ZoneLimit,
+                error => IpcError::Fd(error),
+            })
     }
 
     /// For a wedge post-mortem: the owed-host-wake index as a host boundary
@@ -1587,50 +1684,33 @@ impl<'a> IpcRegion<'a> {
     }
 
     /// Create a pipe of `capacity` bytes (rounded like F_SETPIPE_SZ) with one
-    /// reader and one writer reference. No pool storage is needed: a free
-    /// record's retained storage is reused when it fits, otherwise the pipe
-    /// starts *unbacked* (its ring is provided at the first write) and the
-    /// record's too-small storage is detached into `retired` for the host to
-    /// reclaim. `retired` must be `None` on entry. Host venue only.
+    /// reader and one writer reference. Either venue may create it without
+    /// allocating or detaching host-owned storage. A free record's retained
+    /// storage is reused when it fits; otherwise the pipe starts unbacked.
+    /// A too-small extent stays owned by the record until the host replaces
+    /// it through `provide_pipe_storage`, which returns it for reclamation.
     pub fn create_pipe<W: LockWait>(
         &self,
         capacity: usize,
-        retired: &mut Option<IpcPipeStorage>,
         wait: &W,
     ) -> Result<IpcObjectHandle, IpcError> {
-        if retired.is_some() {
-            return Err(IpcError::BadStorage);
-        }
-        let capacity =
-            Pipe::rounded_capacity(IPC_PIPE_PAGE_SIZE, capacity).map_err(IpcError::Object)?;
+        let fresh = PipeRecord::unbacked(IPC_PIPE_PAGE_SIZE, capacity).map_err(IpcError::Object)?;
+        let capacity = fresh.capacity();
         let (index, record) = self.pop_object()?;
         let mut guard = self.lock_fresh(index, record, wait)?;
-        let existing = guard.storage();
-        let initialized = if existing.fits(capacity) {
-            guard.pipe_parts().and_then(|(state, bytes, slots)| {
+        // SAFETY: the object lock is held and the record is unpublished.
+        unsafe { (*record.state.get()).pipe = fresh };
+        if guard.storage().fits(capacity) {
+            let initialized = guard.pipe_parts().and_then(|(state, bytes, slots)| {
                 Pipe::init(&mut state.pipe, bytes, slots, IPC_PIPE_PAGE_SIZE, capacity)
                     .map(|_| ())
                     .map_err(IpcError::Object)
-            })
-        } else {
-            PipeRecord::unbacked(IPC_PIPE_PAGE_SIZE, capacity)
-                .map_err(IpcError::Object)
-                .and_then(|fresh| {
-                    guard.set_storage(IpcPipeStorage::default())?;
-                    // SAFETY: the object lock is held and the record is
-                    // unpublished.
-                    unsafe { (*record.state.get()).pipe = fresh };
-                    Ok(())
-                })
-        };
-        if let Err(e) = initialized {
-            let _ = guard.set_storage(existing);
-            drop(guard);
-            push(&self.dir.free_objects, index as usize, &record.next_free);
-            return Err(e);
-        }
-        if guard.storage() != existing {
-            *retired = Some(existing);
+            });
+            if let Err(error) = initialized {
+                drop(guard);
+                push(&self.dir.free_objects, index as usize, &record.next_free);
+                return Err(error);
+            }
         }
         Ok(guard.publish_kind(KIND_PIPE))
     }
@@ -2054,8 +2134,17 @@ impl<'a> IpcObjectGuard<'a> {
     #[allow(clippy::type_complexity)]
     fn pipe_parts(&mut self) -> Result<(&mut IpcObjectState, &mut [u8], &mut [Page]), IpcError> {
         let s = self.storage();
-        if s == IpcPipeStorage::default() {
-            // Unbacked: the record alone (its ring comes at the first write).
+        // SAFETY: callers hold the object lock and have initialized the pipe
+        // variant, including the unpublished create_pipe initialization.
+        let pipe = unsafe { &(*self.record.state.get()).pipe };
+        let capacity = pipe
+            .capacity_pages
+            .checked_mul(pipe.page_size)
+            .and_then(|capacity| usize::try_from(capacity).ok())
+            .ok_or(IpcError::Corrupt)?;
+        if !s.fits(capacity) {
+            // Unbacked: retain an undersized extent for the host's later
+            // replacement, but do not expose it as this pipe's live ring.
             // SAFETY: the object lock is held (exclusive state access).
             return Ok((unsafe { &mut *self.record.state.get() }, &mut [], &mut []));
         }
@@ -2086,11 +2175,35 @@ impl<'a> IpcObjectGuard<'a> {
         Pipe::attach(&mut state.pipe, bytes, slots).map_err(|_| IpcError::Corrupt)
     }
 
+    /// One lazy backing supplier for both venues. Stock is a cache of the
+    /// same allocator's extents; an empty cache cannot change Linux semantics.
+    pub fn ensure_pipe_storage(&mut self) -> Result<bool, IpcError> {
+        if self.provide_ring_from_stock()? {
+            return Ok(true);
+        }
+        let pipe = self.pipe()?;
+        if pipe.references(End::Reader) == 0 {
+            return Ok(false);
+        }
+        let capacity = pipe.capacity() as u64;
+        let mut storage = self.region.provision_pipe_storage(
+            capacity,
+            capacity / IPC_PIPE_PAGE_SIZE as u64,
+            &carrick_sched_core::ShortLockSpin,
+        )?;
+        let result = self.provide_pipe_storage(&mut storage);
+        // Supply returns either the replaced extent or the unused allocation.
+        self.region
+            .reclaim_pipe_storage(&mut storage, &carrick_sched_core::ShortLockSpin)?;
+        result
+    }
+
     /// Either venue, under this lock: give an unbacked pipe a ring from the
     /// host-provisioned stock, so its first write needs no host exit.
     /// `true` when the pipe has its ring (already, or now); `false` when the
-    /// stock is empty, the pipe has no reader (the write is EPIPE) or its
-    /// capacity exceeds a stock ring (the host sizes it). No allocation.
+    /// stock is empty, the pipe has no reader (the write is EPIPE), its
+    /// capacity exceeds a stock ring, or a retained extent needs host
+    /// reclamation when replaced (the host sizes it). No allocation.
     pub fn provide_ring_from_stock(&mut self) -> Result<bool, IpcError> {
         let pipe = self.pipe()?;
         if pipe.is_backed() {
@@ -2099,6 +2212,11 @@ impl<'a> IpcObjectGuard<'a> {
         // EPIPE is decided before any ring is spent; a pipe resized past the
         // default capacity is sized by the host.
         if pipe.references(End::Reader) == 0 || pipe.capacity() as u64 > IPC_STOCK_RING_BYTES {
+            return Ok(false);
+        }
+        // Stock rings have no host allocator to reclaim an old extent. Keep
+        // that extent attached until the host supplies replacement storage.
+        if self.storage() != IpcPipeStorage::default() {
             return Ok(false);
         }
         let Some(mut ring) = self.region.take_stock_ring() else {

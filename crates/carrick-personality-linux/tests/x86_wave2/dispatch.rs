@@ -64,7 +64,7 @@ fn anonymous_reservation_routing_counts_two_mm_fallback_without_effects() {
 fn unmigrated_family_completes_once_through_linux_owner() {
     fn requires_real_family<'a, T: carrick_personality_linux::dispatch::PendingFamilies<'a>>() {}
     requires_real_family::<
-        El1PendingFamilies<'_, fn(u32) -> *mut u8, NoCpu, sched::HardwareUserWord>,
+        El1PendingFamilies<'_, '_, fn(u32) -> *mut u8, NoCpu, sched::HardwareUserWord>,
     >();
     test_thread_sleep_survives_task_generation_bump();
 }

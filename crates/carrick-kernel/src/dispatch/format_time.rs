@@ -127,7 +127,7 @@ impl BlockingTimerFdRead {
             return TimerFdReadStep::Wait(self);
         }
         let value = LinuxTimerfdExpirations {
-            expirations: timer.expirations,
+            expirations: timer.state.pending(),
         };
         let out = match super::copyout::prepare(
             context,
@@ -142,7 +142,7 @@ impl BlockingTimerFdRead {
         // Linux consumes the ready expiration before attempting the guest
         // copyout: a bad destination returns EFAULT, and a later nonblocking
         // read observes EAGAIN rather than the old count.
-        timer.expirations = 0;
+        timer.state.consume();
         if out
             .commit([carrick_abi::KernelAbi::abi_bytes(&value)])
             .is_err()
@@ -199,45 +199,28 @@ pub(crate) fn timerfd_poll_source_from_lease(
 fn timerfd_plan(state: &TimerFdState) -> TimerFdReadPlan {
     let (clock_generation, plan) = state.clock.with_clock_change_snapshot(|| {
         let mut timer = state.inner.lock();
-        let ready = refresh_timerfd_locked(&state.clock, &mut timer) > 0;
-        let deadline = timer.deadline;
-        let host_timeout = if ready {
-            Some(Duration::ZERO)
-        } else if state.clock.is_deterministic()
-            || (state.clock.is_frozen()
-                && matches!(
-                    timer.clock_id,
-                    LINUX_CLOCK_REALTIME
-                        | LINUX_CLOCK_REALTIME_COARSE
-                        | LINUX_CLOCK_REALTIME_ALARM
-                        | LINUX_CLOCK_TAI
-                ))
-        {
-            None
-        } else {
-            deadline.and_then(|deadline| {
-                linux_clock_duration(&state.clock, timer.clock_id)
-                    .map(|now| state.clock.scale_timeout(deadline.saturating_sub(now)))
-            })
+        use carrick_timer_core::timerfd::clock::Clock;
+        let clock = match timer.clock_id {
+            LINUX_CLOCK_REALTIME | LINUX_CLOCK_REALTIME_ALARM => Clock::Realtime,
+            LINUX_CLOCK_BOOTTIME | LINUX_CLOCK_BOOTTIME_ALARM => Clock::Boottime,
+            _ => Clock::Monotonic,
         };
-        let virtual_due = state
-            .clock
-            .is_deterministic()
-            .then(|| {
-                deadline.map(|deadline| match timer.clock_id {
-                    LINUX_CLOCK_REALTIME | LINUX_CLOCK_REALTIME_ALARM | LINUX_CLOCK_TAI => {
-                        deadline.saturating_sub(state.clock.realtime_epoch_duration())
-                    }
-                    _ => deadline,
-                })
-            })
-            .flatten();
+        let view = state.clock.timer_clock_view();
+        // Refresh and enrollment use one sample under the clock-change
+        // snapshot. The creator domain, never the reader, chooses its source.
+        let now = timer
+            .state
+            .deadline()
+            .map(|_| view.now(clock, |host| state.clock.sample_timer_host_clock(host)));
+        let ready = timer.state.refresh(now) > 0;
+        let deadline = timer.state.deadline();
+        let plan = view.deadline_at(clock, deadline, ready, now);
         TimerFdReadPlan {
-            host_timeout,
-            virtual_due,
+            host_timeout: plan.host_timeout,
+            virtual_due: plan.virtual_due,
             ready,
             deadline,
-            expirations: timer.expirations,
+            expirations: timer.state.pending(),
             timer_generation: state.change_generation(),
             clock_generation: 0,
         }
@@ -875,16 +858,11 @@ pub(super) fn refresh_timerfd_locked(
     clock: &crate::kernel::container::ClockDomain,
     timer: &mut TimerFdInner,
 ) -> u64 {
-    let (ready, next_deadline) = timerfd_expirations(
-        clock,
-        timer.clock_id,
-        timer.interval,
-        timer.deadline,
-        timer.expirations,
-    );
-    timer.expirations = ready;
-    timer.deadline = next_deadline;
-    ready
+    let now = timer
+        .state
+        .deadline()
+        .and_then(|_| linux_clock_duration(clock, timer.clock_id));
+    timer.state.refresh(now)
 }
 
 pub(super) fn timerfd_ready_count(state: &TimerFdState) -> u64 {
@@ -903,42 +881,6 @@ pub(super) fn timerfd_itimerspec(
     LinuxItimerspec::new(
         linux_timespec_from_optional_duration(interval),
         linux_timespec_from_optional_duration(remaining),
-    )
-}
-
-pub(super) fn timerfd_expirations(
-    clock: &crate::kernel::container::ClockDomain,
-    clock_id: u64,
-    interval: Option<Duration>,
-    deadline: Option<Duration>,
-    expirations: u64,
-) -> (u64, Option<Duration>) {
-    let Some(deadline) = deadline else {
-        return (expirations, None);
-    };
-    let Some(now) = linux_clock_duration(clock, clock_id) else {
-        return (expirations, Some(deadline));
-    };
-    if now < deadline {
-        return (expirations, Some(deadline));
-    }
-    let Some(interval) = interval else {
-        return (expirations.saturating_add(1), None);
-    };
-    if interval.is_zero() {
-        return (expirations.saturating_add(1), None);
-    }
-
-    let now_nanos = duration_to_nanos(now);
-    let deadline_nanos = duration_to_nanos(deadline);
-    let interval_nanos = duration_to_nanos(interval);
-    let elapsed_periods = ((now_nanos - deadline_nanos) / interval_nanos).saturating_add(1);
-    let count = u64::try_from(elapsed_periods).unwrap_or(u64::MAX);
-    let next_deadline_nanos =
-        deadline_nanos.saturating_add(interval_nanos.saturating_mul(elapsed_periods));
-    (
-        expirations.saturating_add(count),
-        Some(duration_from_nanos_saturating(next_deadline_nanos)),
     )
 }
 
@@ -974,15 +916,6 @@ pub(super) fn linux_timespec_from_optional_duration(duration: Option<Duration>) 
 pub(super) fn duration_to_nanos(duration: Duration) -> u128 {
     const NANOS_PER_SEC: u128 = 1_000_000_000;
     u128::from(duration.as_secs()) * NANOS_PER_SEC + u128::from(duration.subsec_nanos())
-}
-
-pub(super) fn duration_from_nanos_saturating(nanos: u128) -> Duration {
-    const NANOS_PER_SEC: u128 = 1_000_000_000;
-    let seconds = nanos / NANOS_PER_SEC;
-    if seconds > u128::from(u64::MAX) {
-        return Duration::new(u64::MAX, 999_999_999);
-    }
-    Duration::new(seconds as u64, (nanos % NANOS_PER_SEC) as u32)
 }
 
 pub(super) fn read_itimerspec(

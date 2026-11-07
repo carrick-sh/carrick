@@ -281,7 +281,7 @@ impl SyscallDispatcher {
 
             if old_value != 0 {
                 let previous =
-                    timerfd_itimerspec(&state.clock, timer.clock_id, timer.interval, timer.deadline);
+                    timerfd_itimerspec(&state.clock, timer.clock_id, timer.state.interval(), timer.state.deadline());
                 let out = match super::copyout::UserOut::<LinuxItimerspec>::new(old_value)
                     .prepare(cx.kernel, memory)
                 {
@@ -294,15 +294,16 @@ impl SyscallDispatcher {
             }
 
             let now = linux_clock_duration(&state.clock, timer.clock_id).unwrap_or(Duration::ZERO);
-            timer.interval = next_interval;
-            timer.deadline = next_value.map(|value| {
+            timer.state.arm(
+                now,
+                next_interval,
+                next_value,
                 if flags & LINUX_TIMER_ABSTIME != 0 {
-                    value
+                    carrick_timer_core::timerfd::DeadlineMode::Absolute
                 } else {
-                    now.saturating_add(value)
-                }
-            });
-            timer.expirations = 0;
+                    carrick_timer_core::timerfd::DeadlineMode::Relative
+                },
+            );
             drop(timer);
             state.publish_change();
             state.changed.notify_all();
@@ -324,7 +325,7 @@ impl SyscallDispatcher {
             let mut timer = state.inner.lock();
             refresh_timerfd_locked(&state.clock, &mut timer);
             let current =
-                timerfd_itimerspec(&state.clock, timer.clock_id, timer.interval, timer.deadline);
+                timerfd_itimerspec(&state.clock, timer.clock_id, timer.state.interval(), timer.state.deadline());
             Ok(super::copyout::copyout_record(cx.kernel, memory, current_value, &current, DispatchOutcome::Returned { value: 0 }))
         }
 

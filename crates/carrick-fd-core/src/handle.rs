@@ -2585,7 +2585,7 @@ const _: () = {
     ));
     assert!(matches!(
         crate::layout_fact("TaskHandleCore.size"),
-        Some(320)
+        Some(384)
     ));
     assert!(matches!(
         crate::layout_fact("TaskHandleCore.align"),
@@ -2593,14 +2593,14 @@ const _: () = {
     ));
     assert!(matches!(
         crate::layout_fact("TaskHandleCore.free_bindings"),
-        Some(128)
-    ));
-    assert!(matches!(
-        crate::layout_fact("TaskHandleCore.buckets"),
         Some(192)
     ));
     assert!(matches!(
-        crate::layout_fact("TaskHandleCore.bindings"),
+        crate::layout_fact("TaskHandleCore.buckets"),
         Some(256)
+    ));
+    assert!(matches!(
+        crate::layout_fact("TaskHandleCore.bindings"),
+        Some(320)
     ));
 };

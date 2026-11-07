@@ -19,6 +19,7 @@ extern crate std;
 pub mod gate;
 pub mod itimer;
 pub mod posix;
+pub mod timerfd;
 
 pub use gate::{FireOutcome, GateHold, TransitionGate};
 

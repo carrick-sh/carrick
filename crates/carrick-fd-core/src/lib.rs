@@ -738,6 +738,8 @@ pub struct Core<const T: usize> {
     retired_tables: AtomicU64,
     retired_ofds: AtomicU64,
     pub(crate) tables: [TableRecord; T],
+    ofd_publication: storage::PublicationLock,
+    ofd_published: AtomicU64,
 }
 
 const fn str_eq(a: &str, b: &str) -> bool {
@@ -757,7 +759,15 @@ const fn str_eq(a: &str, b: &str) -> bool {
 }
 
 /// Named layout facts a shared-memory venue folds into its ABI layout hash.
-pub const NAMED_LAYOUT_FACTS: [(&str, u64); 60] = [
+pub const NAMED_LAYOUT_FACTS: [(&str, u64); 62] = [
+    (
+        "Core.ofd_publication",
+        core::mem::offset_of!(Core<1>, ofd_publication) as u64,
+    ),
+    (
+        "Core.ofd_published",
+        core::mem::offset_of!(Core<1>, ofd_published) as u64,
+    ),
     ("TABLE_RETIRED", TABLE_RETIRED as u64),
     (
         "Core.retired_tables",
@@ -1060,6 +1070,8 @@ impl<const T: usize> Core<T> {
             free_tables: AtomicU64::new(0),
             free_ofds: AtomicU64::new(0),
             ofd_count: AtomicU64::new(0),
+            ofd_publication: storage::PublicationLock::new(),
+            ofd_published: AtomicU64::new(0),
             free_objects: AtomicU64::new(0),
             object_count: AtomicU64::new(0),
             retired_tables: AtomicU64::new(0),
@@ -1099,9 +1111,10 @@ impl<const T: usize> Core<T> {
         self.identity.load(Ordering::Acquire)
     }
 
-    /// OFD records the venue has published (indices `0..ofd_count`).
+    /// Fully linked OFD inventory, observed before a potentially failing allocation.
+    /// Authentication uses the separate resolvable count during publication.
     pub fn ofd_count(&self) -> usize {
-        self.ofd_count.load(Ordering::Acquire) as usize
+        self.ofd_published.load(Ordering::Acquire) as usize
     }
 
     /// Personality object records the venue has published (indices `0..object_count`).
@@ -1330,10 +1343,39 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
     /// `ofd_count()..ofd_count() + count` resolvable, zero-filled and used by
     /// nothing else. The count is published (Release) before the records
     /// join the free list, so every index the list hands out resolves. The
-    /// one growth venue serializes its calls; a concurrent publication
-    /// refuses with `Contended` and changes nothing. O(count), outside any
-    /// table lock.
+    /// shared publication lock serializes venues through the last free-list
+    /// push. Admission observes a separate completed count, never a segment
+    /// still being linked. O(count), outside every table lock.
     pub fn publish_ofds(&self, count: usize) -> Result<(), Error> {
+        let _guard = self
+            .core
+            .ofd_publication
+            .acquire(&self.wait)
+            .map_err(|_| Error::Contended)?;
+        self.publish_ofds_locked(count)
+    }
+
+    /// Grow once from the failed allocation's observation. A completed peer
+    /// publication is success even at the ceiling: its free list is now ready.
+    pub fn grow_ofds(&self, seen: usize, segment: usize, limit: usize) -> Result<usize, Error> {
+        let _guard = self
+            .core
+            .ofd_publication
+            .acquire(&self.wait)
+            .map_err(|_| Error::Contended)?;
+        let first = self.core.ofd_count.load(Ordering::Acquire) as usize;
+        if first != seen {
+            return Ok(0);
+        }
+        let count = segment.min(limit.saturating_sub(first));
+        if count == 0 {
+            return Err(Error::TooManyFiles);
+        }
+        self.publish_ofds_locked(count)?;
+        Ok(count)
+    }
+
+    fn publish_ofds_locked(&self, count: usize) -> Result<(), Error> {
         self.identity()?;
         let first = self.core.ofd_count.load(Ordering::Acquire);
         let end = first
@@ -1349,14 +1391,14 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
                 return Err(Error::BadBacking);
             }
         }
-        self.core
-            .ofd_count
-            .compare_exchange(first, end, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| Error::Contended)?;
+        self.core.ofd_count.store(end, Ordering::Release);
+        #[cfg(all(test, not(feature = "loom")))]
+        tests::observe_ofd_publication(first as usize, self.core.ofd_count());
         for index in (first..end).rev() {
             let record = self.ofd(index as u32)?;
             push(&self.core.free_ofds, index as usize, &record.next_free);
         }
+        self.core.ofd_published.store(end, Ordering::Release);
         Ok(())
     }
 
