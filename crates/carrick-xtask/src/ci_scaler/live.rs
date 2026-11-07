@@ -35,35 +35,70 @@ impl StorageAdmission {
         if slot.owned {
             return Err(ScalerError::StorageBusy);
         }
-        if slot.uncertain {
-            return Err(ScalerError::Guard(
-                "ambiguous storage submission; owner inspection required",
-            ));
-        }
         slot.owned = true;
         Ok(Self { key })
     }
-    fn task(&self, task: Option<String>) -> Result<(), ScalerError> {
+    fn restore_task(node: &str, storage: &str, task: String) -> Result<(), ScalerError> {
+        STORAGE
+            .lock()
+            .map_err(|_| ScalerError::Guard("storage admission poisoned"))?
+            .entry((node.to_owned(), storage.to_owned()))
+            .or_default()
+            .tasks
+            .insert(task);
+        Ok(())
+    }
+    fn record_task(&self, task: String) -> Result<(), ScalerError> {
         let mut slots = STORAGE
             .lock()
             .map_err(|_| ScalerError::Guard("storage admission poisoned"))?;
         let slot = slots.entry(self.key.clone()).or_default();
         slot.uncertain = false;
-        if let Some(task) = task {
-            slot.tasks.insert(task);
-        } else {
-            slot.tasks.clear();
+        slot.tasks.insert(task);
+        Ok(())
+    }
+    fn complete_task(&self, task: &str) -> Result<(), ScalerError> {
+        if let Some(slot) = STORAGE
+            .lock()
+            .map_err(|_| ScalerError::Guard("storage admission poisoned"))?
+            .get_mut(&self.key)
+        {
+            slot.tasks.remove(task);
         }
         Ok(())
     }
-    fn submitting(&self) -> Result<(), ScalerError> {
+    fn is_uncertain(&self) -> Result<bool, ScalerError> {
+        Ok(STORAGE
+            .lock()
+            .map_err(|_| ScalerError::Guard("storage admission poisoned"))?
+            .get(&self.key)
+            .is_some_and(|slot| slot.uncertain))
+    }
+    fn set_uncertain(&self, uncertain: bool) -> Result<(), ScalerError> {
         STORAGE
             .lock()
             .map_err(|_| ScalerError::Guard("storage admission poisoned"))?
             .entry(self.key.clone())
             .or_default()
-            .uncertain = true;
+            .uncertain = uncertain;
         Ok(())
+    }
+    fn submit_task(&self, pve: &Pve, call: PveCall, path: &str) -> Result<String, ScalerError> {
+        remaining(pve.deadline.get(), Duration::from_secs(45))?;
+        self.set_uncertain(true)?;
+        match pve.request(call, path) {
+            Ok(response) => {
+                let task = task_id(response)?;
+                self.record_task(task.clone())?;
+                Ok(task)
+            }
+            Err(error) => {
+                if matches!(&error, ScalerError::PveRejected(msg) if msg.starts_with("HTTP 4")) {
+                    self.set_uncertain(false)?;
+                }
+                Err(error)
+            }
+        }
     }
     fn pending(&self) -> Result<Vec<String>, ScalerError> {
         Ok(STORAGE
@@ -74,14 +109,14 @@ impl StorageAdmission {
             .unwrap_or_default())
     }
     fn wait(&self, pve: &Pve, task: &str) -> Result<(), ScalerError> {
-        self.task(Some(task.to_owned()))?;
+        self.record_task(task.to_owned())?;
         let result = pve.wait_task(task);
         // Unknown outcomes retain custody, including observer deadlines.
         if matches!(
             &result,
             Ok(()) | Err(ScalerError::StorageBusy) | Err(ScalerError::External("PVE task failed"))
         ) {
-            self.task(None)?;
+            self.complete_task(task)?;
         }
         result
     }
@@ -771,8 +806,24 @@ impl Pve {
             ) {
                 return Err(ScalerError::StorageBusy);
             }
+            token.complete_task(&task)?;
         }
-        token.task(None)?;
+        if token.is_uncertain()? {
+            let active = self.request(
+                PveCall::Get,
+                &format!("/nodes/{}/tasks?source=active", self.site.node),
+            )?;
+            let entries = active
+                .as_array()
+                .ok_or(ScalerError::External("PVE active tasks"))?;
+            if entries.iter().any(|entry| match entry["type"].as_str() {
+                Some(kind) => matches!(kind, "qmclone" | "qmstart" | "qmdestroy" | "imgdel"),
+                None => true,
+            }) {
+                return Err(ScalerError::StorageBusy);
+            }
+            token.set_uncertain(false)?;
+        }
         Ok(token)
     }
     fn clear_volumes(&self, id: CloneId) -> Result<(), ScalerError> {
@@ -1359,9 +1410,7 @@ fn submit_clone(
     row.task = None; // A previous Busy task cannot authenticate a new POST.
     update(ledger, row, path)?; // Write-ahead, even if POST's outcome is ambiguous.
     let (call, source) = clone_call(pve.site, row)?;
-    admission.submitting()?;
-    let task = task_id(pve.request(call, &source)?)?;
-    admission.task(Some(task.clone()))?;
+    let task = admission.submit_task(pve, call, &source)?;
     row.task = Some(task.clone());
     update(ledger, row, path)?;
     admission.wait(pve, &task)
@@ -1471,19 +1520,14 @@ fn boot_and_register(
     row.state = State::Booting;
     row.task = None;
     update(ledger, row, path)?;
-    storage.submitting()?;
-    row.task = Some(task_id(pve.request(
+    let task = storage.submit_task(
+        pve,
         PveCall::Post(json!({})),
         &format!("{}/status/start", pve.base(row.vm)),
-    )?)?);
-    storage.task(row.task.clone())?;
-    update(ledger, row, path)?;
-    storage.wait(
-        pve,
-        row.task
-            .as_deref()
-            .ok_or(ScalerError::Guard("start task missing"))?,
     )?;
+    row.task = Some(task.clone());
+    update(ledger, row, path)?;
+    storage.wait(pve, &task)?;
     drop(storage);
     wait_for_readiness(deadline, || {
         qualify_guest(|command| pve.agent_output(row, command))?;
@@ -1642,15 +1686,10 @@ impl TeardownApi for LiveTeardown<'_> {
         )?)?))
     }
     fn destroy(&mut self, row: &Record) -> Result<String, ScalerError> {
-        self.storage = Some(self.pve.storage_admission()?);
+        let storage = self.pve.storage_admission()?;
         self.pve.guard(row)?;
-        if let Some(storage) = &self.storage {
-            storage.submitting()?;
-        }
-        let task = task_id(self.pve.request(PveCall::Delete, &self.pve.base(row.vm))?)?;
-        if let Some(storage) = &self.storage {
-            storage.task(Some(task.clone()))?;
-        }
+        let task = storage.submit_task(self.pve, PveCall::Delete, &self.pve.base(row.vm))?;
+        self.storage = Some(storage);
         Ok(task)
     }
     fn wait_task(&mut self, task: &str) -> Result<(), ScalerError> {
@@ -2678,8 +2717,7 @@ pub(super) fn controller(
             && let Some(task) = &row.task
         {
             let site = pve.site.for_lane(row.lane)?;
-            let token = StorageAdmission::acquire(site.node, site.storage)?;
-            token.task(Some(task.clone()))?;
+            StorageAdmission::restore_task(site.node, site.storage, task.clone())?;
         }
     }
 
@@ -4833,12 +4871,13 @@ mod storage_contention_tests {
         ));
         let other = StorageAdmission::acquire("fixture-1821", "other").unwrap();
         first
-            .task(Some("UPID:fixture-1821:pending".into()))
+            .record_task("UPID:fixture-1821:pending".into())
             .unwrap();
         drop(first);
         let next = StorageAdmission::acquire("fixture-1821", "local").unwrap();
         assert_eq!(next.pending().unwrap(), ["UPID:fixture-1821:pending"]);
-        next.task(None).unwrap();
+        next.complete_task("UPID:fixture-1821:pending").unwrap();
+        assert!(next.pending().unwrap().is_empty());
         drop(other);
     }
 
