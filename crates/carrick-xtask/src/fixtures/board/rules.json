@@ -5,11 +5,11 @@
       "__typename": "Issue",
       "id": "I_test",
       "number": 100,
-      "state": "CLOSED",
       "updatedAt": "2026-11-05T00:00:00Z",
       "comments": {
         "nodes": []
-      }
+      },
+      "closed": true
     },
     "expected": "Done",
     "current": null,
@@ -25,7 +25,6 @@
       "__typename": "PullRequest",
       "id": "PR_test",
       "number": 100,
-      "state": "MERGED",
       "updatedAt": "2026-11-05T00:00:00Z",
       "comments": {
         "nodes": []
@@ -45,7 +44,8 @@
             }
           }
         ]
-      }
+      },
+      "closed": true
     },
     "expected": "Done",
     "current": null,
@@ -61,7 +61,6 @@
       "__typename": "PullRequest",
       "id": "PR_test",
       "number": 100,
-      "state": "OPEN",
       "updatedAt": "2026-11-05T00:00:00Z",
       "comments": {
         "nodes": []
@@ -81,7 +80,8 @@
             }
           }
         ]
-      }
+      },
+      "closed": false
     },
     "expected": "In review",
     "current": null,
@@ -97,7 +97,6 @@
       "__typename": "PullRequest",
       "id": "PR_test",
       "number": 100,
-      "state": "OPEN",
       "updatedAt": "2026-11-05T00:00:00Z",
       "comments": {
         "nodes": []
@@ -126,7 +125,8 @@
             }
           }
         ]
-      }
+      },
+      "closed": false
     },
     "expected": "In review",
     "current": null,
@@ -142,7 +142,6 @@
       "__typename": "PullRequest",
       "id": "PR_test",
       "number": 100,
-      "state": "OPEN",
       "updatedAt": "2026-11-05T00:00:00Z",
       "comments": {
         "nodes": []
@@ -171,7 +170,8 @@
             }
           }
         ]
-      }
+      },
+      "closed": false
     },
     "expected": null,
     "current": null,
@@ -187,7 +187,6 @@
       "__typename": "PullRequest",
       "id": "PR_test",
       "number": 100,
-      "state": "OPEN",
       "updatedAt": "2026-11-05T00:00:00Z",
       "comments": {
         "nodes": []
@@ -216,7 +215,8 @@
             }
           }
         ]
-      }
+      },
+      "closed": false
     },
     "expected": null,
     "current": null,
@@ -232,7 +232,6 @@
       "__typename": "PullRequest",
       "id": "PR_test",
       "number": 100,
-      "state": "OPEN",
       "updatedAt": "2026-11-06T12:00:00Z",
       "comments": {
         "nodes": []
@@ -252,7 +251,8 @@
             }
           }
         ]
-      }
+      },
+      "closed": false
     },
     "expected": "In progress",
     "current": null,
@@ -268,7 +268,6 @@
       "__typename": "PullRequest",
       "id": "PR_test",
       "number": 100,
-      "state": "OPEN",
       "updatedAt": "2026-11-05T00:00:00Z",
       "comments": {
         "nodes": []
@@ -288,7 +287,8 @@
             }
           }
         ]
-      }
+      },
+      "closed": false
     },
     "expected": null,
     "current": null,
@@ -304,7 +304,6 @@
       "__typename": "Issue",
       "id": "I_test",
       "number": 100,
-      "state": "OPEN",
       "updatedAt": "2026-11-05T00:00:00Z",
       "comments": {
         "nodes": [
@@ -323,7 +322,8 @@
             "createdAt": "2026-11-06T00:00:00Z"
           }
         ]
-      }
+      },
+      "closed": false
     },
     "expected": "Blocked",
     "current": null,
@@ -339,7 +339,6 @@
       "__typename": "Issue",
       "id": "I_test",
       "number": 100,
-      "state": "OPEN",
       "updatedAt": "2026-11-05T00:00:00Z",
       "comments": {
         "nodes": [
@@ -358,7 +357,8 @@
             "createdAt": "2026-11-06T00:00:00Z"
           }
         ]
-      }
+      },
+      "closed": false
     },
     "expected": null,
     "current": null,
@@ -374,7 +374,6 @@
       "__typename": "Issue",
       "id": "I_test",
       "number": 100,
-      "state": "OPEN",
       "updatedAt": "2026-11-05T00:00:00Z",
       "comments": {
         "nodes": [
@@ -386,7 +385,8 @@
             "createdAt": "2026-11-06T00:00:00Z"
           }
         ]
-      }
+      },
+      "closed": false
     },
     "expected": "Blocked",
     "current": null,
@@ -402,7 +402,6 @@
       "__typename": "Issue",
       "id": "I_test",
       "number": 100,
-      "state": "OPEN",
       "updatedAt": "2026-11-05T00:00:00Z",
       "comments": {
         "nodes": [
@@ -421,7 +420,8 @@
             "createdAt": "2026-11-06T00:00:00Z"
           }
         ]
-      }
+      },
+      "closed": false
     },
     "expected": "Todo",
     "current": "Blocked",
@@ -436,7 +436,6 @@
       "__typename": "Issue",
       "id": "I_test",
       "number": 100,
-      "state": "OPEN",
       "updatedAt": "2026-11-05T00:00:00Z",
       "comments": {
         "nodes": [
@@ -455,7 +454,8 @@
             "createdAt": "2026-11-06T00:00:00Z"
           }
         ]
-      }
+      },
+      "closed": false
     },
     "expected": null,
     "current": null,
@@ -471,7 +471,6 @@
       "__typename": "Issue",
       "id": "I_test",
       "number": 100,
-      "state": "OPEN",
       "updatedAt": "2026-11-05T00:00:00Z",
       "comments": {
         "nodes": [
@@ -490,7 +489,8 @@
             "createdAt": "2026-11-06T00:00:00Z"
           }
         ]
-      }
+      },
+      "closed": false
     },
     "expected": null,
     "current": null,
@@ -506,7 +506,6 @@
       "__typename": "PullRequest",
       "id": "PR_test",
       "number": 100,
-      "state": "OPEN",
       "updatedAt": "2026-11-05T00:00:00Z",
       "comments": {
         "nodes": []
@@ -526,7 +525,8 @@
             }
           }
         ]
-      }
+      },
+      "closed": false
     },
     "expected": "Done",
     "current": "Done",
@@ -544,11 +544,11 @@
       "__typename": "Issue",
       "id": "I_test",
       "number": 100,
-      "state": "OPEN",
       "updatedAt": "2026-11-05T00:00:00Z",
       "comments": {
         "nodes": []
-      }
+      },
+      "closed": false
     },
     "expected": null,
     "current": "In progress",
@@ -564,7 +564,6 @@
       "__typename": "PullRequest",
       "id": "PR_test",
       "number": 100,
-      "state": "OPEN",
       "updatedAt": "2026-11-05T00:00:00Z",
       "comments": {
         "nodes": []
@@ -584,7 +583,8 @@
             }
           }
         ]
-      }
+      },
+      "closed": false
     },
     "expected": "In review",
     "current": null,
@@ -602,7 +602,6 @@
       "__typename": "Issue",
       "id": "I_test",
       "number": 100,
-      "state": "OPEN",
       "updatedAt": "2026-11-05T00:00:00Z",
       "comments": {
         "nodes": [
@@ -621,7 +620,8 @@
             "createdAt": "2026-11-06T00:00:00Z"
           }
         ]
-      }
+      },
+      "closed": false
     },
     "expected": "Blocked",
     "current": null,
@@ -637,7 +637,6 @@
       "__typename": "Issue",
       "id": "I_test",
       "number": 100,
-      "state": "OPEN",
       "updatedAt": "2026-11-05T00:00:00Z",
       "comments": {
         "nodes": [
@@ -656,7 +655,8 @@
             "createdAt": "2026-11-06T00:00:00Z"
           }
         ]
-      }
+      },
+      "closed": false
     },
     "expected": null,
     "current": null,
