@@ -306,7 +306,12 @@ fn resident_signal_work_return(
             );
         }
         let mut service_context = words;
-        crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut service_context);
+        crate::sched::ThreadCpu::save(
+            &mut cpu,
+            &frame,
+            &mut service_context,
+            crate::sched::CpuExitCause::Svc,
+        );
         let mut entry = runtime
             .enter_registered(
                 registry(),
@@ -406,7 +411,12 @@ fn resident_signal_work_return(
     for _ in 0..2 {
         let checkpoint = |frame: &mut carrick_el1_abi::TrapFrame| {
             let mut checkpoint_context = words;
-            crate::sched::ThreadCpu::save(&mut cpu, frame, &mut checkpoint_context);
+            crate::sched::ThreadCpu::save(
+                &mut cpu,
+                frame,
+                &mut checkpoint_context,
+                crate::sched::CpuExitCause::Svc,
+            );
             let mut entry = runtime
                 .enter_registered(
                     registry(),

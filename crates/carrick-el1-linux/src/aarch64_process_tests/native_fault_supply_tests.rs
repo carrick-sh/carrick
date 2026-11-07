@@ -536,7 +536,12 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
             frame.x[..6].copy_from_slice(&[0x50f00, VA + 0x12000, 0, 0, 0, 0]);
             // SAFETY: this fixture owns the current execution record.
             let mut saved = unsafe { *fixture.zone.record(caller.id).ctx_mut() };
-            crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut saved);
+            crate::sched::ThreadCpu::save(
+                &mut cpu,
+                &frame,
+                &mut saved,
+                crate::sched::CpuExitCause::Svc,
+            );
             {
                 let mut entry = owner
                     .enter(
@@ -1101,7 +1106,7 @@ fn loan_call_for_task(
             .is_ok()
     );
     let mut saved = Box::new(Aarch64ParkedContext::ZERO);
-    crate::sched::ThreadCpu::save(cpu, frame, &mut saved);
+    crate::sched::ThreadCpu::save(cpu, frame, &mut saved, crate::sched::CpuExitCause::Svc);
     let cache = carrick_el1_abi::InotifyNameCache::new();
     with_process_entry(
         BornInZoneSource {
@@ -2246,7 +2251,12 @@ fn composed_native_supply_with_prepared(
             }
             let page = unsafe { &*(identity.lifecycle_page as *const ThreadLifecyclePage) };
             let mut saved = Aarch64ParkedContext::ZERO;
-            crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut saved);
+            crate::sched::ThreadCpu::save(
+                &mut cpu,
+                &frame,
+                &mut saved,
+                crate::sched::CpuExitCause::Svc,
+            );
             let result = with_process_entry(
                 BornInZoneSource {
                     zone: fixture.zone,
@@ -2378,7 +2388,12 @@ fn composed_native_supply_with_prepared(
     let page = unsafe { &*(identity.lifecycle_page as *const ThreadLifecyclePage) };
     let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
     let mut saved = Aarch64ParkedContext::ZERO;
-    crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut saved);
+    crate::sched::ThreadCpu::save(
+        &mut cpu,
+        &frame,
+        &mut saved,
+        crate::sched::CpuExitCause::Svc,
+    );
     let child_root = fixture
         .zone
         .spaces
@@ -2723,7 +2738,12 @@ fn composed_native_supply_with_prepared(
         .pending_fault_selection(identity.mm, frame.far)
         .unwrap();
     let mut saved = Aarch64ParkedContext::ZERO;
-    crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut saved);
+    crate::sched::ThreadCpu::save(
+        &mut cpu,
+        &frame,
+        &mut saved,
+        crate::sched::CpuExitCause::Svc,
+    );
     assert!(matches!(
         with_process_entry(
             source,
@@ -3231,7 +3251,12 @@ fn composed_native_supply_with_prepared(
         context,
     ));
     let mut saved = Aarch64ParkedContext::ZERO;
-    crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut saved);
+    crate::sched::ThreadCpu::save(
+        &mut cpu,
+        &frame,
+        &mut saved,
+        crate::sched::CpuExitCause::Svc,
+    );
     with_process_entry(
         source,
         &fixture.task,
@@ -3626,7 +3651,12 @@ fn arm_two_live_threads_wait_for_sibling_first_touch_publication() {
     assert_eq!(wait.cause(), carrick_el1_abi::PortalWaitCause::Editor);
     assert_eq!(wait.handle(), handle);
     let mut saved = Aarch64ParkedContext::ZERO;
-    crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut saved);
+    crate::sched::ThreadCpu::save(
+        &mut cpu,
+        &frame,
+        &mut saved,
+        crate::sched::CpuExitCause::Svc,
+    );
     let result = with_process_entry(
         BornInZoneSource {
             zone: fixture.zone,
@@ -3704,8 +3734,13 @@ struct ProductionResumeCpu<'a, X: ForkStockCrossing> {
 }
 
 impl<X: ForkStockCrossing> crate::sched::ThreadCpu for ProductionResumeCpu<'_, X> {
-    fn save(&mut self, frame: &carrick_el1_abi::TrapFrame, ctx: &mut Aarch64ParkedContext) {
-        self.inner.save(frame, ctx);
+    fn save(
+        &mut self,
+        frame: &carrick_el1_abi::TrapFrame,
+        ctx: &mut Aarch64ParkedContext,
+        exit: crate::sched::CpuExitCause,
+    ) {
+        self.inner.save(frame, ctx, exit);
     }
 
     fn load(&mut self, frame: &mut carrick_el1_abi::TrapFrame, ctx: &Aarch64ParkedContext) {

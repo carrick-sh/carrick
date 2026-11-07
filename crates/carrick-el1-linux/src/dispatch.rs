@@ -278,7 +278,12 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                 )
             };
             let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
-            sched::ThreadCpu::save(&mut sched::HardwareCpu, frame, &mut saved);
+            sched::ThreadCpu::save(
+                &mut sched::HardwareCpu,
+                frame,
+                &mut saved,
+                sched::CpuExitCause::Svc,
+            );
             let ttbr0 = carrick_el1::isa::aarch64::hardware_live_ttbr();
             let mut service =
                 match super::aarch64_process::Aarch64NativeProcessService::new(task, slot) {
@@ -1370,7 +1375,12 @@ fn arm_native_service_exit(
             None
         };
     let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
-    sched::ThreadCpu::save(&mut sched::HardwareCpu, frame, &mut saved);
+    sched::ThreadCpu::save(
+        &mut sched::HardwareCpu,
+        frame,
+        &mut saved,
+        sched::CpuExitCause::Svc,
+    );
     let mut service = super::aarch64_process::Aarch64NativeProcessService::new(task, slot)
         .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
     let (result, phase) = super::aarch64_process::with_process_entry(
@@ -1723,7 +1733,12 @@ pub(crate) fn arm_deliver_declined_fault_signal_current(
     };
     let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
     let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
-    sched::ThreadCpu::save(&mut sched::HardwareCpu, frame, &mut saved);
+    sched::ThreadCpu::save(
+        &mut sched::HardwareCpu,
+        frame,
+        &mut saved,
+        sched::CpuExitCause::Svc,
+    );
     let ttbr0 = carrick_el1::isa::aarch64::hardware_live_ttbr();
     let mut service = super::aarch64_process::Aarch64NativeProcessService::new(task, slot)
         .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
@@ -1822,7 +1837,12 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
         return Action::Served;
     }
     let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
-    sched::ThreadCpu::save(&mut sched::HardwareCpu, frame, &mut saved);
+    sched::ThreadCpu::save(
+        &mut sched::HardwareCpu,
+        frame,
+        &mut saved,
+        sched::CpuExitCause::Svc,
+    );
     let ttbr0 = carrick_el1::isa::aarch64::hardware_live_ttbr();
     let mut service = super::aarch64_process::Aarch64NativeProcessService::new(task, slot)
         .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
