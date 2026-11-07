@@ -3,6 +3,7 @@
 //! incarnation; it does not import a host TaskSerial or launcher credentials.
 extern crate alloc;
 mod service;
+pub use service::sleep::{NativeSleep, SleepCompletion, SleepProgress, SleepRequest};
 pub(crate) mod thread_stock;
 use super::{
     native_fork_refusal::{NativeForkStage, at_busy_site, busy},
