@@ -628,6 +628,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                                 ServiceCompletion::RetrySyscall,
                             );
                         }
+                        Err(NativeProcessError::Fault) => {
+                            return Ok(NativeResume::Returned(SyscallResult::from_errno(
+                                carrick_syscall_abi::LINUX_EFAULT,
+                            )));
+                        }
                         Err(error) => return Err(error),
                     }
                 }

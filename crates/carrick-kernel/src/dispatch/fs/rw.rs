@@ -1333,6 +1333,41 @@ impl<'a> FsView<'a> {
         Ok(out)
     }
 
+    fn read_synthetic_at(
+        &self,
+        kernel: &crate::kernel::KernelContext,
+        memory: &impl CurrentMmMemory,
+        path: &str,
+        contents: &[u8],
+        at: usize,
+        dst: &mut [u8],
+    ) -> Result<usize, DispatchOutcome> {
+        let self_pid = crate::vfs::proc::self_linux_pid(self.synthetic_proc_identity(kernel));
+        if crate::vfs::proc::is_proc_self_mem_path(path, self_pid) {
+            if self.range_touches_secretmem(at as u64, dst.len() as u64) {
+                return Err(DispatchOutcome::errno(carrick_abi::LINUX_EIO));
+            }
+            let bytes = memory.read_bytes(at as u64, dst.len()).map_err(|error| {
+                DispatchOutcome::from_owner_memory_error(error)
+                    .unwrap_or_else(|| DispatchOutcome::errno(carrick_abi::LINUX_EIO))
+            })?;
+            let len = bytes.len().min(dst.len());
+            dst[..len].copy_from_slice(&bytes[..len]);
+            return Ok(len);
+        }
+        if crate::vfs::proc::is_proc_self_pagemap_path(path, self_pid) {
+            let present = (1u64 << 63).to_le_bytes();
+            for (index, byte) in dst.iter_mut().enumerate() {
+                *byte = present[at.wrapping_add(index) % present.len()];
+            }
+            return Ok(dst.len());
+        }
+        let source = contents.get(at..).unwrap_or_default();
+        let len = source.len().min(dst.len());
+        dst[..len].copy_from_slice(&source[..len]);
+        Ok(len)
+    }
+
     /// `read(2)` on one open description, shared by the syscall handler and
     /// the native host-file venue. `task` carries a guest task's syscall
     /// state; `None` is the venue's carrier record buffer, which reads only
@@ -1385,7 +1420,11 @@ impl<'a> FsView<'a> {
                     address,
                     length,
                     offset,
-                    |at, bytes| contents.read_at(at as u64, bytes),
+                    |_, at, bytes| {
+                        contents
+                            .read_at(at as u64, bytes)
+                            .map_err(DispatchOutcome::errno)
+                    },
                 )?;
                 return Ok(match refusal {
                     Some(outcome) => outcome,
@@ -1411,7 +1450,7 @@ impl<'a> FsView<'a> {
                     address,
                     length,
                     offset,
-                    |at, bytes| {
+                    |_, at, bytes| {
                         let source = data.read_range(at, bytes.len());
                         bytes[..source.len()].copy_from_slice(&source);
                         Ok(source.len())
@@ -1452,6 +1491,46 @@ impl<'a> FsView<'a> {
                 )),
             };
         };
+        if memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner {
+            let result = match &mut *open {
+                OpenDescription::SyntheticFile {
+                    path,
+                    contents,
+                    offset,
+                    ..
+                } => Some(read_from_repeatable_owner_at(
+                    task.kernel,
+                    memory,
+                    address,
+                    length,
+                    offset,
+                    |memory, at, bytes| {
+                        self.read_synthetic_at(task.kernel, memory, path, contents, at, bytes)
+                    },
+                )?),
+                OpenDescription::ProcExecutable {
+                    executable, offset, ..
+                } => Some(read_from_repeatable_owner_at(
+                    task.kernel,
+                    memory,
+                    address,
+                    length,
+                    offset,
+                    |_, at, bytes| {
+                        let source = retained_executable_bytes(executable, at, bytes.len())
+                            .map_err(DispatchOutcome::errno)?;
+                        bytes[..source.len()].copy_from_slice(&source);
+                        Ok(source.len())
+                    },
+                )?),
+                _ => None,
+            };
+            if let Some((copied, refusal)) = result {
+                return Ok(
+                    refusal.unwrap_or_else(|| DispatchOutcome::returned_len_or_errno(copied))
+                );
+            }
+        }
         let (read_len, bytes) = match &mut *open {
             OpenDescription::Closed { .. } => {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
@@ -1478,42 +1557,28 @@ impl<'a> FsView<'a> {
                 // independently (an fd can outlive the check that made it).
                 let self_pid =
                     crate::vfs::proc::self_linux_pid(self.synthetic_proc_identity(task.kernel));
-                if crate::vfs::proc::is_proc_self_mem_path(path, self_pid) {
-                    let va = *offset as u64;
-                    // Secret memory (memfd_secret mappings) is invisible
-                    // to the kernel's view of the process: a read that
-                    // touches a live secretmem mapping fails EIO
-                    // (memfdsecret probe `procmem_hidden`).
-                    if length > 0 && self.range_touches_secretmem(va, length as u64) {
-                        drop(open);
-                        return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EIO));
-                    }
-                    match memory.read_bytes(va, length) {
-                        Ok(bytes) => {
-                            let read_len = bytes.len();
-                            *offset += read_len;
-                            (read_len, bytes)
-                        }
-                        Err(_) => {
-                            drop(open);
-                            return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EIO));
-                        }
-                    }
-                } else if crate::vfs::proc::is_proc_self_pagemap_path(path, self_pid) {
-                    let present = (1u64 << 63).to_le_bytes();
-                    let mut bytes = vec![0u8; length];
-                    for (i, byte) in bytes.iter_mut().enumerate() {
-                        *byte = present[(*offset + i) % present.len()];
-                    }
-                    *offset += bytes.len();
-                    (bytes.len(), bytes)
+                let special = crate::vfs::proc::is_proc_self_mem_path(path, self_pid)
+                    || crate::vfs::proc::is_proc_self_pagemap_path(path, self_pid);
+                let take = if special {
+                    length
                 } else {
-                    let remaining: &[u8] = contents.get(*offset..).unwrap_or(&[]);
-                    let read_len = remaining.len().min(length);
-                    let bytes = remaining[..read_len].to_vec();
-                    *offset += read_len;
-                    (read_len, bytes)
-                }
+                    contents.len().saturating_sub(*offset).min(length)
+                };
+                let mut bytes = vec![0; take];
+                let read_len = match self.read_synthetic_at(
+                    task.kernel,
+                    memory,
+                    path,
+                    contents,
+                    *offset,
+                    &mut bytes,
+                ) {
+                    Ok(read_len) => read_len,
+                    Err(outcome) => return Ok(outcome),
+                };
+                bytes.truncate(read_len);
+                *offset += read_len;
+                (read_len, bytes)
             }
             OpenDescription::SyntheticDevice { kind, .. } => {
                 let bytes = synthetic_device_read(kind, length);
@@ -1889,7 +1954,11 @@ impl<'a> FsView<'a> {
                     buffer,
                     length,
                     &mut { offset },
-                    |at, bytes| contents.read_at(at as u64, bytes),
+                    |_, at, bytes| {
+                        contents
+                            .read_at(at as u64, bytes)
+                            .map_err(DispatchOutcome::errno)
+                    },
                 )?),
                 OpenDescription::InMemoryFile { contents, .. } => {
                     let data = contents.read();
@@ -1899,8 +1968,35 @@ impl<'a> FsView<'a> {
                         buffer,
                         length,
                         &mut { offset },
-                        |at, bytes| {
+                        |_, at, bytes| {
                             let source = data.read_range(at, bytes.len());
+                            bytes[..source.len()].copy_from_slice(&source);
+                            Ok(source.len())
+                        },
+                    )?)
+                }
+                OpenDescription::SyntheticFile { path, contents, .. } => {
+                    Some(read_from_repeatable_owner_at(
+                        kernel,
+                        memory,
+                        buffer,
+                        length,
+                        &mut { offset },
+                        |memory, at, bytes| {
+                            self.read_synthetic_at(kernel, memory, path, contents, at, bytes)
+                        },
+                    )?)
+                }
+                OpenDescription::ProcExecutable { executable, .. } => {
+                    Some(read_from_repeatable_owner_at(
+                        kernel,
+                        memory,
+                        buffer,
+                        length,
+                        &mut { offset },
+                        |_, at, bytes| {
+                            let source = retained_executable_bytes(executable, at, bytes.len())
+                                .map_err(DispatchOutcome::errno)?;
                             bytes[..source.len()].copy_from_slice(&source);
                             Ok(source.len())
                         },
@@ -3340,6 +3436,32 @@ impl<'a> FsView<'a> {
                 }
                 _ => {}
             }
+            if memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner {
+                let result = match &mut *open {
+                    OpenDescription::File { contents, offset, .. } => Some(read_from_repeatable_owner_iovecs(
+                        cx.kernel, memory, &iovecs, offset,
+                        |_, at, bytes| contents.read_at(at as u64, bytes).map_err(DispatchOutcome::errno))?),
+                    OpenDescription::InMemoryFile { contents, offset, .. } => {
+                        let data = contents.read();
+                        Some(read_from_repeatable_owner_iovecs(cx.kernel, memory, &iovecs, offset, |_, at, bytes| {
+                            let source = data.read_range(at, bytes.len());
+                            bytes[..source.len()].copy_from_slice(&source);
+                            Ok(source.len())
+                        })?)
+                    }
+                    OpenDescription::SyntheticFile { path, contents, offset, .. } => Some(read_from_repeatable_owner_iovecs(
+                        cx.kernel, memory, &iovecs, offset,
+                        |memory, at, bytes| this.read_synthetic_at(cx.kernel, memory, path, contents, at, bytes))?),
+                    OpenDescription::ProcExecutable { executable, offset, .. } => Some(read_from_repeatable_owner_iovecs(
+                        cx.kernel, memory, &iovecs, offset, |_, at, bytes| {
+                            let source = retained_executable_bytes(executable, at, bytes.len()).map_err(DispatchOutcome::errno)?;
+                            bytes[..source.len()].copy_from_slice(&source);
+                            Ok(source.len())
+                        })?),
+                    _ => None,
+                };
+                if let Some(outcome) = result { return Ok(outcome); }
+            }
             let read_len = match &mut *open {
                 OpenDescription::Closed { .. } => {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
@@ -3619,6 +3741,32 @@ impl<'a> FsView<'a> {
                 }
                 drop(open);
                 return Ok(DispatchOutcome::Returned { value: total });
+            }
+            if memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner {
+                let result = match &*open {
+                    OpenDescription::File { contents, .. } => Some(read_from_repeatable_owner_iovecs(
+                        cx.kernel, memory, &iovecs, &mut { offset },
+                        |_, at, bytes| contents.read_at(at as u64, bytes).map_err(DispatchOutcome::errno))?),
+                    OpenDescription::InMemoryFile { contents, .. } => {
+                        let data = contents.read();
+                        Some(read_from_repeatable_owner_iovecs(cx.kernel, memory, &iovecs, &mut { offset }, |_, at, bytes| {
+                            let source = data.read_range(at, bytes.len());
+                            bytes[..source.len()].copy_from_slice(&source);
+                            Ok(source.len())
+                        })?)
+                    }
+                    OpenDescription::SyntheticFile { path, contents, .. } => Some(read_from_repeatable_owner_iovecs(
+                        cx.kernel, memory, &iovecs, &mut { offset },
+                        |memory, at, bytes| this.read_synthetic_at(cx.kernel, memory, path, contents, at, bytes))?),
+                    OpenDescription::ProcExecutable { executable, .. } => Some(read_from_repeatable_owner_iovecs(
+                        cx.kernel, memory, &iovecs, &mut { offset }, |_, at, bytes| {
+                            let source = retained_executable_bytes(executable, at, bytes.len()).map_err(DispatchOutcome::errno)?;
+                            bytes[..source.len()].copy_from_slice(&source);
+                            Ok(source.len())
+                        })?),
+                    _ => None,
+                };
+                if let Some(outcome) = result { return Ok(outcome); }
             }
             let read_len = match &*open {
                 OpenDescription::Closed { .. } => {

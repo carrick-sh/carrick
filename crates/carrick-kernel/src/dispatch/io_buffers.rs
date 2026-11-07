@@ -197,13 +197,13 @@ fn copy_read_bytes(memory: &mut impl CurrentMmMemory, address: u64, bytes: &[u8]
 /// each bounded chunk before preparing its destination, then commit only the
 /// bytes actually read. The caller owns the file offset and advances it by
 /// `copied` even when the next chunk needs an owner supply or wait.
-pub(in crate::dispatch) fn read_from_repeatable_owner_at(
+pub(in crate::dispatch) fn read_from_repeatable_owner_at<M: CurrentMmMemory>(
     context: &crate::kernel::KernelContext,
-    memory: &mut impl CurrentMmMemory,
+    memory: &mut M,
     address: u64,
     length: usize,
     offset: &mut usize,
-    mut read_at: impl FnMut(usize, &mut [u8]) -> Result<usize, LinuxErrno>,
+    mut read_at: impl FnMut(&mut M, usize, &mut [u8]) -> Result<usize, super::DispatchOutcome>,
 ) -> Result<(usize, Option<super::DispatchOutcome>), DispatchError> {
     let mut scratch = [0u8; 4096];
     let mut copied = 0usize;
@@ -213,11 +213,11 @@ pub(in crate::dispatch) fn read_from_repeatable_owner_at(
             .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
         let source_offset = *offset;
         let step = (4096 - (at as usize & 4095)).min(length - copied);
-        let read_len = match read_at(source_offset, &mut scratch[..step]) {
+        let read_len = match read_at(memory, source_offset, &mut scratch[..step]) {
             Ok(0) => break,
             Ok(read_len) => read_len,
             Err(_errno) if copied > 0 => break,
-            Err(errno) => return Err(DispatchError::Errno(errno)),
+            Err(outcome) => return Ok((copied, Some(outcome))),
         };
         let range = GuestWriteRange::new(GuestVa::new(at), read_len)
             .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
@@ -243,6 +243,44 @@ pub(in crate::dispatch) fn read_from_repeatable_owner_at(
         drop(effect);
     }
     Ok((copied, None))
+}
+
+/// Use the same bounded owner admission across a vector while retaining
+/// the description's cursor. A later refusal reports only delivered bytes.
+pub(in crate::dispatch) fn read_from_repeatable_owner_iovecs<M: CurrentMmMemory>(
+    context: &crate::kernel::KernelContext,
+    memory: &mut M,
+    iovecs: &[LinuxIovec],
+    offset: &mut usize,
+    mut read_at: impl FnMut(&mut M, usize, &mut [u8]) -> Result<usize, super::DispatchOutcome>,
+) -> Result<super::DispatchOutcome, DispatchError> {
+    let mut total = 0usize;
+    for iovec in iovecs {
+        let len = usize::try_from(iovec.iov_len)
+            .map_err(|_| DispatchError::LengthTooLarge(iovec.iov_len))?;
+        let (copied, refusal) = read_from_repeatable_owner_at(
+            context,
+            memory,
+            iovec.iov_base,
+            len,
+            offset,
+            &mut read_at,
+        )?;
+        total = total
+            .checked_add(copied)
+            .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
+        if let Some(outcome) = refusal {
+            return Ok(if total == 0 {
+                outcome
+            } else {
+                super::DispatchOutcome::returned_len_or_errno(total)
+            });
+        }
+        if copied < len {
+            break;
+        }
+    }
+    Ok(super::DispatchOutcome::returned_len_or_errno(total))
 }
 
 pub(crate) fn read_from_synthetic_device_iovecs(
@@ -444,7 +482,7 @@ mod owner_repeatable_read_tests {
         let address = BASE + 100;
         let source_offset = 50;
         let observed_offsets = RefCell::new(Vec::new());
-        let mut read_at = |at: usize, bytes: &mut [u8]| {
+        let mut read_at = |_: &mut OwnerMemory, at: usize, bytes: &mut [u8]| {
             observed_offsets.borrow_mut().push(at);
             let source = payload.get(at - source_offset..).unwrap_or_default();
             let count =

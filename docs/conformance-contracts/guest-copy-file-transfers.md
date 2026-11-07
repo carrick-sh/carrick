@@ -18,3 +18,17 @@ a host directory backend or prove physical backing supply.
 
 Signed HVF, native ARM64 Docker, x86 guest execution, runtime ratios and
 exact-artifact promotion remain higher-layer gates.
+
+Independent review also identified repeatable synthetic and retained-executable
+fd reads whose cursor moved before output admission. The production read,
+pread, readv and preadv witness covers those descriptions and proc-self memory.
+Source callbacks now preserve a typed owner refusal, and the existing bounded
+copy helper advances the cursor only after committing its prepared output.
+Vectors keep the same description guard and return only the delivered prefix
+if a later piece refuses. The source is never consumed on a zero-byte refusal.
+The scalar witness was red at EFAULT (14); after that repair the vector witness
+was red at a false zero-byte read. Proc-self memory retains Linux's EIO (5)
+for genuinely inaccessible source memory rather than classifying contention
+as that error. Native directory controls additionally require errno 14 for a
+true output fault and a true preparation fault; internal refusal never earns
+that verdict.

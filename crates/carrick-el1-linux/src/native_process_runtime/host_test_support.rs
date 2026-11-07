@@ -6428,8 +6428,32 @@ fn sigprocmask_set_owner_wait_redispatches_before_effects() {
     assert!(take_signal_copies().is_empty());
 }
 
+#[cfg(test)]
 #[test]
 fn production_getdents_reply_owner_refusal_retains_entries() {
+    getdents_reply_copy_outcome(NativeProcessError::Busy, None);
+}
+
+#[cfg(test)]
+#[test]
+fn production_getdents_reply_true_output_fault_returns_efault() {
+    getdents_reply_copy_outcome(NativeProcessError::Fault, None);
+}
+
+#[cfg(test)]
+#[test]
+fn production_getdents_reply_true_preparation_fault_returns_efault() {
+    getdents_reply_copy_outcome(
+        NativeProcessError::Unsupported,
+        Some(NativeProcessError::Fault),
+    );
+}
+
+#[cfg(test)]
+fn getdents_reply_copy_outcome(
+    copy_error: NativeProcessError,
+    prepare_error: Option<NativeProcessError>,
+) {
     use carrick_core_abi::{
         host_file::HostFileRequestView,
         service::{ServiceCell, ServiceOperation},
@@ -6523,10 +6547,12 @@ fn production_getdents_reply_owner_refusal_retains_entries() {
             payload.length().raw() as usize,
         )
     };
-    HostFileRequestView::parse(record)
-        .unwrap()
-        .reply(24, &bytes)
-        .unwrap();
+    let mut view = HostFileRequestView::parse(record).unwrap();
+    assert_eq!(
+        view.header().op,
+        carrick_core_abi::host_file::HostFileOp::Getdents64
+    );
+    view.reply(24, &bytes).unwrap();
     assert!(ticket.complete(true).is_ok());
     fixture
         .zone
@@ -6538,7 +6564,8 @@ fn production_getdents_reply_owner_refusal_retains_entries() {
         .notify_object(fixture.slot, &mut WakeEffects::default())
         .unwrap();
     fixture.zone.switch_in_full(fixture.slot).unwrap();
-    service.child_copy_error = Some(NativeProcessError::Busy);
+    service.child_copy_error = Some(copy_error);
+    service.prepare_copy_error = prepare_error;
     take_signal_copies();
     {
         let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
@@ -6555,11 +6582,17 @@ fn production_getdents_reply_owner_refusal_retains_entries() {
                 &mut service,
             )
             .unwrap();
+        let resumed = entry.resume_checkpoint(|_| Ok(None)).unwrap();
+        if copy_error == NativeProcessError::Fault
+            || prepare_error == Some(NativeProcessError::Fault)
+        {
+            assert!(matches!(resumed, NativeResume::Returned(result) if result.raw() == -14));
+            assert!(take_signal_copies().is_empty());
+            assert!(fixture.task.service_notice.take().unwrap().is_none());
+            return;
+        }
         assert!(
-            matches!(
-                entry.resume_checkpoint(|_| Ok(None)).unwrap(),
-                NativeResume::Left(None)
-            ),
+            matches!(resumed, NativeResume::Left(None)),
             "completed directory reply must park, never EFAULT or reissue getdents64"
         );
     }
