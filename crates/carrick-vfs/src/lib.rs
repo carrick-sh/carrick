@@ -15,22 +15,7 @@
 //! kernel-view filesystems (procfs, sysfs, devpts, /dev) live in
 //! carrick-kernel (`carrick_kernel::vfs`) because they render kernel state.
 
-#[cfg(target_os = "macos")]
 pub mod apfs;
-/// Linux/non-macOS `apfs` shim. The real `apfs` module (macOS-only, above)
-/// drives APFS volume management via `diskutil`; that does not apply on Linux.
-/// But the CLI + engine consult `default_writable_backend_kind` to pick the
-/// default fs backend, and on Linux the host filesystem (cap-std passthrough)
-/// is always the fork-coherent writable source of truth. The `*_carrick_volume`
-/// functions are genuinely macOS-only — the `carrick volume` subcommand is
-/// gated off on Linux. Gated as the exact complement of the real module's
-/// `target_os = "macos"` so the two can never both exist.
-#[cfg(not(target_os = "macos"))]
-pub mod apfs {
-    pub fn default_writable_backend_kind() -> carrick_spec::FsBackendKind {
-        carrick_spec::FsBackendKind::Host
-    }
-}
 #[cfg(target_os = "macos")]
 pub mod darwin_fs;
 pub mod fs_backend;
@@ -64,9 +49,3 @@ pub use carrick_observability::probes;
 pub use carrick_host_bsd::bsd_to_linux_errno as host_to_linux_errno;
 #[cfg(target_os = "linux")]
 pub use carrick_host_linux::host_to_linux_errno;
-
-// Exercise portable scratch policy on hosts without APFS.
-#[cfg(all(test, not(target_os = "macos")))]
-#[path = "apfs.rs"]
-#[allow(dead_code)] // Operator-only APFS APIs are not used on this test host.
-mod apfs_host_tests;

@@ -1420,11 +1420,6 @@ fn run_command_redirect(
     cmd.stdout(log_file);
     cmd.stderr(err_file);
 
-    // Gate checkouts are internal. Supply a default without replacing an
-    // operator's inherited home; explicit per-command configuration wins.
-    if std::env::var_os("CARRICK_HOME").is_none() {
-        cmd.env("CARRICK_HOME", cwd.join("target/carrick-home"));
-    }
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -1483,13 +1478,8 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
     let root = repo_info.repository_root;
     let head = repo_info.head;
     verify_clean_checkout(&root)?;
-    // Fail once before any host or signed test rather than emitting one
-    // container-preparation failure per guest. Never consult the USB mount.
-    let scratch_home = std::env::var_os("CARRICK_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| root.join("target/carrick-home"));
-    carrick_vfs::scratch::preflight_home(&root.join(&scratch_home))
-        .map_err(|e| AcceptError::Failed(e.to_string()))?;
+    // Resolve and admit scratch once before any host or signed tests.
+    carrick_vfs::scratch::preflight_default().map_err(|e| AcceptError::Failed(e.to_string()))?;
 
     let short_head_out = command::run_checked("git", ["rev-parse", "--short", "HEAD"], Some(&root))
         .map_err(|e| AcceptError::Git(e.to_string()))?;
@@ -2463,7 +2453,10 @@ mod tests {
         let (status, _) = run_command_redirect(
             &lease,
             "sh",
-            &["-c", "test \"$CARRICK_HOME\" = \"/internal/operator-home\""],
+            &[
+                "-c",
+                "test \"${CARRICK_HOME:-}\" = \"/internal/operator-home\"",
+            ],
             &[("CARRICK_HOME", "/internal/operator-home")],
             dir.path(),
             &dir.path().join("log"),
@@ -2473,14 +2466,14 @@ mod tests {
     }
 
     #[test]
-    fn acceptance_child_defaults_home_and_preserves_inherited_home() {
+    fn acceptance_child_leaves_home_unset_and_preserves_inherited_home() {
         const WITNESS: &str = "CARRICK_ACCEPT_HOME_WITNESS";
         let Ok(expected) = std::env::var(WITNESS) else {
             for inherited in [false, true] {
                 let mut child = Command::new(std::env::current_exe().unwrap());
                 child.args([
                     "--exact",
-                    "accept::tests::acceptance_child_defaults_home_and_preserves_inherited_home",
+                    "accept::tests::acceptance_child_leaves_home_unset_and_preserves_inherited_home",
                 ]);
                 child.env(
                     WITNESS,
@@ -2502,14 +2495,14 @@ mod tests {
         let lease =
             HostLease::acquire_path(&dir.path().join("host.lock"), HostLeaseMode::Gate).unwrap();
         let expected = if expected == "default" {
-            dir.path().join("target/carrick-home")
+            PathBuf::new()
         } else {
             PathBuf::from(expected)
         };
         let (status, _) = run_command_redirect(
             &lease,
             "sh",
-            &["-c", "test \"$CARRICK_HOME\" = \"$EXPECTED_HOME\""],
+            &["-c", "test \"${CARRICK_HOME:-}\" = \"$EXPECTED_HOME\""],
             &[("EXPECTED_HOME", expected.to_str().unwrap())],
             dir.path(),
             &dir.path().join("log"),

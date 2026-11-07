@@ -6,15 +6,18 @@ semantic_authority = ["Linux pathname case sensitivity; man 7 path_resolution"]
 fixture = "An explicit internal home, an unusable default home, and a stalled filesystem probe"
 scale_points = [1]
 structural_budgets = []
-rationale = "The configured home is the sole candidate during gate admission. Case-insensitive storage cannot preserve Linux pathname identity. Directory creation, case probing and cleanup share a two-second caller deadline; blocked kernel I/O may outlive the detached worker. The override witness counts zero conventional candidate accesses. These host-native assertions precede guest dispatch and do not export guest work-meter observations."
+rationale = "An explicit home is authoritative; defaults admit only internal conventional storage, then case-sensitive home and temporary candidates. Case-insensitive storage cannot preserve Linux pathname identity. Directory creation, case probing and cleanup share a two-second caller deadline; blocked kernel I/O may outlive the detached worker. The override witness counts zero conventional candidate accesses. These host-native assertions precede guest dispatch and do not export guest work-meter observations."
 
 [bindings]
 vm_free = [
-  "carrick-xtask::tests::build_cache::acceptance_default_home_is_checked_before_tests",
+  "carrick-xtask::tests::build_cache::acceptance_unusable_override_is_checked_before_tests",
   "carrick-xtask::tests::build_cache::scratch_preflight_uses_explicit_case_sensitive_home",
+  "carrick-vfs::apfs::serial_host::conventional_volume_requires_internal_storage",
+  "carrick-vfs::apfs::serial_host::case_insensitive_home_falls_through_to_tmp",
+  "carrick-vfs::apfs::serial_host::no_usable_default_reports_configuration_error",
   "carrick-vfs::apfs::serial_host::stalled_probe_returns_failure_before_worker_finishes",
   "carrick-vfs::apfs::serial_host::serial_host_scratch_root_override_wins",
-  "carrick-xtask::tests::build_cache::standalone_signed_runner_rejects_default_before_building_tests",
+  "carrick-xtask::tests::build_cache::standalone_signed_runner_rejects_override_before_building_tests",
 ]
 
 [bindings.unresolved]

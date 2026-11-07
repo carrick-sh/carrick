@@ -1045,6 +1045,8 @@ surfaces = [
   { path = "crates/carrick-timer-core/src/gate.rs", contract = "kernel.timer.delivery-gate" },
   { path = "crates/carrick-timer-core/src/itimer.rs", contract = "kernel.timer.delivery-gate" },
   { path = "crates/carrick-timer-core/src/lib.rs", contract = "kernel.timer.delivery-gate" },
+  { path = "crates/carrick-vfs/src/apfs.rs", contract = "host.vfs.scratch-admission" },
+  { path = "crates/carrick-vfs/src/lib.rs", contract = "host.vfs.scratch-admission" },
   { path = "crates/carrick-vfs/src/scratch.rs", contract = "host.vfs.scratch-admission" },
   { path = "crates/carrick-vfs/src/vfs/rootfs.rs", contract = "kernel.inotify.mark-race-hotpath" },
   { path = "crates/carrick-vfs/src/vfs/rootfs.rs", contract = "kernel.inotify.watch" },

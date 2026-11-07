@@ -246,22 +246,14 @@ fn split_at_last_paren(s: &str) -> (&str, &str) {
     }
 }
 
-/// Where should `HostFsBackend` place its per-run scratch dir? An explicit
-/// `CARRICK_HOME` places scratch at `$CARRICK_HOME/scratch`, checking it without touching
-/// the conventional mount. Prefer
-/// the dedicated carrick APFS volume (always case-sensitive, isolated,
-/// throw-away-able). Fall back to `~/.carrick/scratch` for hosts where
-/// the volume hasn't been laid down yet.
+/// Select case-sensitive per-run scratch independently of the checkout volume.
+/// An explicit `CARRICK_HOME` is authoritative. Otherwise try the conventional
+/// `/Volumes/carrick` only on internal, non-removable storage, then the home
+/// and temporary candidates. Unusable explicit configuration fails closed.
 ///
-/// HOT PATH: this runs at the start of every `carrick` invocation that
-/// uses the host FS backend. It must NOT shell out to `diskutil apfs
-/// list` — that enumerates every APFS container on the system and costs
-/// ~250 ms, which a profile showed dominated trivial-guest startup. A
-/// volume named `carrick` is mounted by `diskutil apfs addVolume` at the
-/// conventional `/Volumes/carrick`; a nonblocking case-sensitivity probe validates
-/// that candidate without enumerating disks. The slow
-/// `diskutil`-backed `find_carrick_volume` is reserved for the explicit
-/// `carrick volume` subcommands, not this per-run path.
+/// Device metadata and case probing share a bounded worker deadline. The hot
+/// path uses public volume properties, never diskutil or APFS enumeration.
+/// A process-wide cache prevents repeated probes (including stalled workers).
 pub fn preferred_scratch_root() -> &'static ScratchRoot {
     // One process configuration authority owns both immutable decisions.
     static CACHE: std::sync::OnceLock<ScratchRoot> = std::sync::OnceLock::new();
@@ -280,14 +272,38 @@ fn resolve_scratch_root(
     if let Some(home) = std::env::var_os("CARRICK_HOME").filter(|s| !s.is_empty()) {
         return checked_scratch_root(PathBuf::from(home).join("scratch"), true, probe);
     }
-    let conventional = checked_scratch_root(conventional.to_owned(), false, probe.clone());
+    resolve_default_scratch_root(
+        conventional,
+        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+        Path::new("/tmp/carrick/scratch"),
+        crate::scratch::internal_volume,
+        probe,
+    )
+}
+
+fn resolve_default_scratch_root(
+    conventional: &Path,
+    home: Option<&Path>,
+    temporary: &Path,
+    internal: impl Fn(&Path) -> bool + Send + 'static,
+    probe: impl Fn(&Path, bool) -> bool + Clone + Send + 'static,
+) -> ScratchRoot {
+    // Device discovery shares the same deadline as the case probe. Unknown
+    // device properties fail closed, before creating anything on that volume.
+    let conventional_probe = probe.clone();
+    let conventional = checked_scratch_root(conventional.to_owned(), false, move |path, create| {
+        internal(path) && conventional_probe(path, create)
+    });
     if conventional.case_sensitive {
         return conventional;
     }
-    let home = std::env::var_os("HOME")
-        .map(|h| PathBuf::from(h).join(".carrick"))
-        .unwrap_or_else(|| PathBuf::from("/tmp/carrick"));
-    checked_scratch_root(home.join("scratch"), true, probe)
+    if let Some(home) = home {
+        let candidate = checked_scratch_root(home.join(".carrick/scratch"), true, probe.clone());
+        if candidate.case_sensitive {
+            return candidate;
+        }
+    }
+    checked_scratch_root(temporary.to_owned(), true, probe)
 }
 
 /// The default writable-layer backend when the user passes no `--fs`.
@@ -298,11 +314,11 @@ fn resolve_scratch_root(
 /// in-memory backend is not selectable and is silently incoherent across guest
 /// `fork` anyway (see the fs-memory design spec).
 pub fn default_writable_backend_kind() -> carrick_spec::FsBackendKind {
-    #[cfg(not(feature = "fs-memory"))]
+    #[cfg(any(not(feature = "fs-memory"), not(target_os = "macos")))]
     {
         carrick_spec::FsBackendKind::Host
     }
-    #[cfg(feature = "fs-memory")]
+    #[cfg(all(feature = "fs-memory", target_os = "macos"))]
     {
         if preferred_scratch_root().case_sensitive {
             carrick_spec::FsBackendKind::Host
@@ -332,6 +348,66 @@ mod fs_default_tests {
 #[cfg(test)]
 mod serial_host {
     use super::*;
+
+    #[test]
+    fn conventional_volume_requires_internal_storage() {
+        for internal in [false, true] {
+            let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let observed = calls.clone();
+            let actual = resolve_default_scratch_root(
+                Path::new("/conventional"),
+                Some(Path::new("/home")),
+                Path::new("/temporary"),
+                move |_| internal,
+                move |path, _| {
+                    observed.lock().unwrap().push(path.to_owned());
+                    true
+                },
+            );
+            assert_eq!(
+                actual.host_path().unwrap(),
+                if internal {
+                    Path::new("/conventional")
+                } else {
+                    Path::new("/home/.carrick/scratch")
+                }
+            );
+            assert_eq!(calls.lock().unwrap().as_slice(), &[actual.path()]);
+        }
+    }
+
+    #[test]
+    fn no_usable_default_reports_configuration_error() {
+        let actual = resolve_default_scratch_root(
+            Path::new("/conventional"),
+            Some(Path::new("/home")),
+            Path::new("/temporary"),
+            |_| false,
+            |_, _| false,
+        );
+        assert!(actual.host_path().is_err());
+        let error = crate::scratch::preflight_selected(&actual)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error.matches("failed scratch preflight").count(), 1);
+        assert!(error.contains("CARRICK_HOME"));
+    }
+
+    #[test]
+    fn case_insensitive_home_falls_through_to_tmp() {
+        let previous = std::env::var_os("CARRICK_HOME");
+        unsafe { std::env::remove_var("CARRICK_HOME") };
+        let actual = resolve_scratch_root(Path::new("/unusable-conventional"), |path, _| {
+            path == Path::new("/tmp/carrick/scratch")
+        });
+        if let Some(previous) = previous {
+            unsafe { std::env::set_var("CARRICK_HOME", previous) };
+        }
+        assert_eq!(
+            actual.host_path().unwrap(),
+            Path::new("/tmp/carrick/scratch")
+        );
+    }
 
     #[test]
     fn stalled_probe_returns_failure_before_worker_finishes() {
