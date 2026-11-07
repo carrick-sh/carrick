@@ -2083,6 +2083,58 @@ fn fork_cow_process(
     Some(verified_pages)
 }
 
+/// The initial, host-served MM must replenish its COW chain after fork.
+/// Use distinct 16 KiB compounds (not adjacent Linux 4 KiB pages) and no
+/// syscalls between writes: syscall entry can otherwise settle USED records
+/// and hide the refill defect.
+fn fork_cow_parent() -> i32 {
+    const COMPOUNDS: usize = 192;
+    const STRIDE: usize = 16 * 1024;
+    const LEN: usize = COMPOUNDS * STRIDE;
+    unsafe { libc::alarm(30) };
+    let region = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            LEN,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if region == libc::MAP_FAILED {
+        return 1;
+    }
+    let bytes = region.cast::<u8>();
+    for i in 0..COMPOUNDS {
+        unsafe { bytes.add(i * STRIDE).write_volatile(0xa5) };
+    }
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        unsafe { libc::_exit(0) };
+    }
+    let mut status = 0;
+    let waited = if child > 0 {
+        unsafe { libc::waitpid(child, &mut status, 0) }
+    } else {
+        -1
+    };
+    let mut ok =
+        waited == child && child > 0 && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+    for i in 0..COMPOUNDS {
+        unsafe {
+            ok &= bytes.add(i * STRIDE).read_volatile() == 0xa5;
+            bytes.add(i * STRIDE).write_volatile(i as u8);
+        }
+    }
+    for i in 0..COMPOUNDS {
+        ok &= unsafe { bytes.add(i * STRIDE).read_volatile() } == i as u8;
+    }
+    unsafe { libc::munmap(region, LEN) };
+    println!("fork-cow-parent compounds={COMPOUNDS} ok={ok}");
+    i32::from(!ok)
+}
+
 fn fork_cow(forks: usize, pages: usize) -> i32 {
     let page_size_raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if page_size_raw <= 0 {
@@ -3784,6 +3836,7 @@ fn main() {
                 }
             },
         },
+        "fork-cow-parent" => fork_cow_parent(),
         "fork-cow" => fork_cow(
             args.get(2).and_then(|n| n.parse().ok()).unwrap_or(100),
             args.get(3).and_then(|n| n.parse().ok()).unwrap_or(16),

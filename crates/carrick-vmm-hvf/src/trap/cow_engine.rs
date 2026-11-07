@@ -3154,6 +3154,14 @@ impl HvfTaskState {
         const NON_GLOBAL: u64 = 1 << 11;
         let span_start = span.va & !(PAGE_SIZE - 1);
         let span_end = span.va.saturating_add(span.len as u64);
+        // Compute before taking the manager's edit lock: this authority
+        // distinguishes tagged owner leaves from ordinary host image leaves.
+        let guest_lane = self.page_tables_authority().live_descriptor_owner()
+            == carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest;
+        let writable_pages: std::collections::BTreeSet<_> = (span_start..span_end)
+            .step_by(PAGE_SIZE as usize)
+            .filter(|va| self.frame_cow_page_writable(*va, source_guest_writable, guest_lane))
+            .collect();
         let page_table_result = {
             let page_tables_authority = self.page_tables_authority();
             page_tables_authority.edit(
@@ -3191,12 +3199,7 @@ impl HvfTaskState {
                     HvfVmState::refresh_stage1_exclusivity(manager.manager);
                     let mut page_va = span_start;
                     while page_va < span_end {
-                        if source_guest_writable
-                            && carrick_mmu_core::aarch64::terminal_descriptor_may_write(
-                                carrick_mmu_core::aarch64::terminal_descriptor(
-                                    manager.debug_walk(page_va),
-                                ),
-                            )
+                        if writable_pages.contains(&page_va)
                         {
                             manager
                                 .set_writable_preserving_attributes(page_va, PAGE_SIZE as usize)
@@ -3241,12 +3244,7 @@ impl HvfTaskState {
                             )));
                         }
                         let leaf = live[3];
-                        let expected_ap = if source_guest_writable
-                            && carrick_mmu_core::aarch64::terminal_descriptor_may_write(
-                                carrick_mmu_core::aarch64::terminal_descriptor(
-                                    manager.debug_walk(page_va),
-                                ),
-                            )
+                        let expected_ap = if writable_pages.contains(&page_va)
                         {
                             AP_USER_RW
                         } else {
@@ -4131,6 +4129,11 @@ impl HvfTaskState {
             const VALID: u64 = 1;
             const TYPE_TABLE_OR_PAGE: u64 = 0b11;
             const NON_GLOBAL: u64 = 1 << 11;
+            let writable_pages: std::collections::BTreeSet<_> = ((span.va & !(PAGE_SIZE - 1))
+                ..span.va.saturating_add(span.len as u64))
+                .step_by(PAGE_SIZE as usize)
+                .filter(|va| self.frame_cow_page_writable(*va, source_guest_writable, guest_lane))
+                .collect();
             let page_tables_authority = self.page_tables_authority();
             page_tables_authority
                 .edit(
@@ -4196,12 +4199,7 @@ impl HvfTaskState {
                             let span_end = span.va.saturating_add(span.len as u64);
                             let mut page_va = span.va & !(PAGE_SIZE - 1);
                             while page_va < span_end {
-                                if source_guest_writable
-                                    && carrick_mmu_core::aarch64::terminal_descriptor_may_write(
-                                        carrick_mmu_core::aarch64::terminal_descriptor(
-                                            manager.debug_walk(page_va),
-                                        ),
-                                    )
+                                if writable_pages.contains(&page_va)
                                 {
                                     manager
                                         .set_writable_preserving_attributes(page_va, PAGE_SIZE as usize)
@@ -4252,12 +4250,7 @@ impl HvfTaskState {
                             let page_is_valid = leaf & VALID != 0;
                             let expected_ap = if span.kernel_only {
                                 0
-                            } else if source_guest_writable
-                                && carrick_mmu_core::aarch64::terminal_descriptor_may_write(
-                                    carrick_mmu_core::aarch64::terminal_descriptor(
-                                        manager.debug_walk(page_va),
-                                    ),
-                                )
+                            } else if writable_pages.contains(&page_va)
                             {
                                 AP_USER_RW
                             } else {

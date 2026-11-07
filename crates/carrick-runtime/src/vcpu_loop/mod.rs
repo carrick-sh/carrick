@@ -1070,7 +1070,6 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// `Some` only for a process multiplexed in the shared HvPatch VM.
     pub(super) process_fork_barrier: Option<Arc<crate::fork_quiesce::QuiesceBarrier>>,
     pub(super) crash_capture: Option<Arc<carrick_kernel::kernel::CrashCaptureAuthority>>,
-    pub(super) pending_core_read: Option<crash::PendingCoreRead>,
     #[cfg(test)]
     pub(super) crash_lease_drain_budget: CrashLeaseDrainBudget,
     pub(super) kernel_thread: Option<carrick_kernel::kernel::ThreadRef>,
@@ -1212,7 +1211,6 @@ where
             platform_futex_factory,
             process_fork_barrier,
             crash_capture,
-            pending_core_read: None,
             kernel_thread,
             guest_execution: None,
             execution_lease: ExecutionLeaseCell::owned(),
