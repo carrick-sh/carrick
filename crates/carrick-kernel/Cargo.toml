@@ -80,6 +80,7 @@ carrick-observability = { path = "../carrick-observability" }
 carrick-signal-core = { path = "../carrick-signal-core" }
 carrick-pipe-core = { path = "../carrick-pipe-core" }
 carrick-signal-linux = { path = "../carrick-signal-linux" }
+carrick-time-core = { path = "../carrick-time-core" }
 carrick-timer-core = { path = "../carrick-timer-core" }
 carrick-spec = { path = "../carrick-spec" }
 carrick-vfs = { path = "../carrick-vfs" }

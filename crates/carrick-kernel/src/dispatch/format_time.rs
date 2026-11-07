@@ -8,10 +8,9 @@ pub(crate) use carrick_abi::{
     LINUX_CLOCK_REALTIME, LINUX_CLOCK_REALTIME_ALARM, LINUX_CLOCK_REALTIME_COARSE,
     LINUX_CLOCK_RESOLUTION_NSEC, LINUX_CLOCK_TAI, LINUX_CLOCK_THREAD_CPUTIME_ID, LINUX_EAGAIN,
     LINUX_EFAULT, LINUX_EINTR, LINUX_EINVAL, LINUX_EOPNOTSUPP, LINUX_EPERM, LINUX_ITIMER_PROF,
-    LINUX_ITIMER_REAL, LINUX_ITIMER_VIRTUAL, LINUX_TIME_DEL, LINUX_TIME_ERROR, LINUX_TIME_INS,
-    LINUX_TIME_OK, LINUX_UTIME_NOW, LINUX_UTIME_OMIT, LinuxItimerspec, LinuxItimerval,
-    LinuxTimerfdExpirations, LinuxTimespec, LinuxTimeval, LinuxTimex, LinuxTimexModes,
-    LinuxTimexStatus, LinuxTimezone, LinuxTms,
+    LINUX_ITIMER_REAL, LINUX_ITIMER_VIRTUAL, LINUX_UTIME_NOW, LINUX_UTIME_OMIT, LinuxItimerspec,
+    LinuxItimerval, LinuxTimerfdExpirations, LinuxTimespec, LinuxTimeval, LinuxTimex,
+    LinuxTimexModes, LinuxTimexStatus, LinuxTimezone, LinuxTms,
 };
 use carrick_guest_mem::CurrentMmMemory;
 
@@ -467,58 +466,7 @@ pub(super) fn linux_timeval_usec_is_valid(tv: LinuxTimeval) -> bool {
     (0..1_000_000).contains(&usec)
 }
 
-pub(super) fn linux_time_state_from_status(status: LinuxTimexStatus) -> i64 {
-    if status.contains(LinuxTimexStatus::UNSYNC) {
-        LINUX_TIME_ERROR
-    } else if status.contains(LinuxTimexStatus::INS) {
-        LINUX_TIME_INS
-    } else if status.contains(LinuxTimexStatus::DEL) {
-        LINUX_TIME_DEL
-    } else {
-        LINUX_TIME_OK
-    }
-}
-
-pub(super) fn linux_timex_from_state(
-    time: LinuxTimeval,
-    state: &crate::kernel::container::AdjtimexState,
-) -> LinuxTimex {
-    LinuxTimex {
-        modes: 0,
-        _pad0: 0,
-        offset: state.offset,
-        freq: state.freq,
-        maxerror: state.maxerror,
-        esterror: state.esterror,
-        status: state.status,
-        _pad1: 0,
-        constant: state.constant,
-        precision: 1,
-        tolerance: 32_768_000,
-        time,
-        tick: state.tick,
-        ppsfreq: 0,
-        jitter: 0,
-        shift: 0,
-        _pad2: 0,
-        stabil: 0,
-        jitcnt: 0,
-        calcnt: 0,
-        errcnt: 0,
-        stbcnt: 0,
-        tai: state.tai,
-        _pad3: [0; 11],
-    }
-}
-
-pub(super) fn linux_timex_time(duration: Duration, status: LinuxTimexStatus) -> LinuxTimeval {
-    let sub = if status.contains(LinuxTimexStatus::NANO) {
-        i64::from(duration.subsec_nanos())
-    } else {
-        i64::from(duration.subsec_micros())
-    };
-    LinuxTimeval::new(duration.as_secs() as i64, sub)
-}
+use carrick_time_core::{linux_time_state_from_status, linux_timex_from_state, linux_timex_time};
 
 pub(super) fn adjtimex_bootstrap(
     context: &crate::kernel::KernelContext,
@@ -692,51 +640,7 @@ pub(super) fn adjtimex_bootstrap(
     }
 
     let updated_state = clock.with_adjtimex_mut(|state| {
-        if modes.contains(LinuxTimexModes::OFFSET) {
-            if modes.contains(LinuxTimexModes::OFFSET_SINGLESHOT_FLAG) {
-                state.offset = 0;
-            } else {
-                state.offset = timex.offset;
-            }
-        }
-        if modes.contains(LinuxTimexModes::FREQUENCY) {
-            // Linux clamps to +/-MAXFREQ (scaled ppm) instead of refusing.
-            state.freq = timex.freq.clamp(-32_768_000, 32_768_000);
-        }
-        if modes.contains(LinuxTimexModes::MAXERROR) {
-            state.maxerror = timex.maxerror;
-        }
-        if modes.contains(LinuxTimexModes::ESTERROR) {
-            state.esterror = timex.esterror;
-        }
-        if modes.contains(LinuxTimexModes::STATUS) {
-            let current_status = LinuxTimexStatus::from_bits_retain(state.status);
-            // `from_bits_truncate`: bits Linux does not define are dropped,
-            // not refused (the oracle accepts `1 << 20`).
-            let requested_status = LinuxTimexStatus::from_bits_truncate(timex.status);
-            let merged = (current_status & LinuxTimexStatus::RONLY)
-                | (requested_status & !LinuxTimexStatus::RONLY);
-            state.status = merged.bits();
-        }
-        if modes.contains(LinuxTimexModes::NANO) {
-            let mut s = LinuxTimexStatus::from_bits_retain(state.status);
-            s.insert(LinuxTimexStatus::NANO);
-            state.status = s.bits();
-        }
-        if modes.contains(LinuxTimexModes::MICRO) {
-            let mut s = LinuxTimexStatus::from_bits_retain(state.status);
-            s.remove(LinuxTimexStatus::NANO);
-            state.status = s.bits();
-        }
-        if modes.contains(LinuxTimexModes::TIMECONST) {
-            state.constant = timex.constant;
-        }
-        if modes.contains(LinuxTimexModes::TAI) {
-            state.tai = timex.constant as i32;
-        }
-        if modes.contains(LinuxTimexModes::TICK) {
-            state.tick = timex.tick;
-        }
+        carrick_time_core::apply_timex_fields(state, &timex);
         state.clone()
     });
 

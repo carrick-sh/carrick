@@ -14,9 +14,13 @@ vm_free = [
   "carrick-el1-linux::aarch64_process_tests::native_fork_child_clock_adjtime_reaches_time_handler",
   "carrick-el1-linux::aarch64_process_tests::native_fork_child_adjtimex_reaches_time_handler",
   "carrick-el1-linux::aarch64_process_tests::native_fork_child_nanosleep_reaches_time_handler",
+  "carrick-kernel::dispatch::container_clock_tests::clock_adjtime_privileged_roundtrips_all_adj_modes",
+  "carrick-kernel::dispatch::container_clock_tests::clock_adjtime_setoffset_moves_realtime",
+  "carrick-kernel::dispatch::container_clock_tests::clock_adjtime_unprivileged_modifying_modes_fail_with_eperm",
 ]
 
 [bindings.unresolved]
 vm_free = "Successful realtime read, x86 entry binding, retained copy, sleep continuation and timex state remain unimplemented. Null-pointer routing evidence alone does not satisfy #1808."
+embed_structural = "UNRUN: retained clock-output and sleep work meters have no signed binding yet."
 embed = "UNRUN (director): original pipeline syscall census, signed pipeline reproduction and paired signed populations."
 docker = "UNRUN: native Linux x86_64 null-pointer checks are supplementary evidence, not the declared ARM64 Docker oracle."

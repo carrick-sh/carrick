@@ -71,3 +71,44 @@ sleep completion/interruption, timex state sharing, both ISA entry bindings,
 and a live syscall census of the original pipeline. Signed A/B populations
 and the pipeline demo remain director work; this host-only reduction does
 not prove them. No complexity or runtime-ratio acceptance is claimed.
+
+## Shared transition prerequisite
+
+`carrick-time-core` now owns the existing `AdjtimexState`, timex output
+serialization and bounded field-update transition. The host `ClockDomain`
+and dispatcher consume that implementation. This is a move of existing
+behavior, including its documented frequency/slew approximations; it does
+not register an in-ring time route. Validation, exact-MM output preparation,
+offset changes, locking and notification retain their existing order in the
+host dispatcher. The container-clock production-entry tests exercise the
+moved implementation. The four native-child witnesses remain red.
+
+An independent design review supports a typed clock-resource operation,
+without using the raw host syscall crossing or the host-file protocol.
+`ServiceOperation` currently has no clock operation; adding a discriminator
+requires publish/decode/completion validation even if the service-cell size
+stays unchanged. The request must retain the exact native member/MM and a
+run clock capability. The ring owns Linux validation, credentials and user
+memory. The existing `ClockDomain` can remain the single clock-resource
+authority, preserving calibrated realtime/vDSO agreement, virtual-clock
+policies and clock-change notification.
+
+For the remaining implementation:
+
+- Supply physical/model clock samples through both ISA service adapters.
+  CPU clocks must select guest task accounting, never carrier CPU time.
+- Retain completed samples through exact-MM copyout. A memory-owner wait
+  must not resample or restart the syscall.
+- Move timex validation into the shared core before introducing a ring
+  consumer. Preserve output preparation before mutation. State-dependent
+  SETOFFSET interpretation and updates need one atomic authority operation;
+  snapshot-and-replace would lose concurrent updates. The extracted field
+  helper alone does not provide that transaction.
+- Give sleeps an owned deadline, remaining-time output and signal policy,
+  integrated with clock changes and deterministic advancement. The waiter
+  must release execution capacity.
+- Bind the routes only with working resource venues on both ISAs, and prove
+  successful realtime reads, timex sharing, sleep completion/interruption
+  and retained copyout before claiming the four null-pointer tests green.
+
+This prerequisite must not be published as the completed #1808 fix.
