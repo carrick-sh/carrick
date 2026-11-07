@@ -1837,11 +1837,11 @@ impl Cpl0Carrier {
         if let Some(owner) = ipc {
             use carrick_x86_cpl0_host::carrier_memory::IpcWindowPart;
             let window = unsafe {
-                carrick_el1_abi::IpcWindow::new(
-                    owner.directory_ptr() as usize,
-                    owner.directory_len(),
-                    owner.pool_ptr() as usize,
-                    owner.pool_len(),
+                carrick_el1_abi::HostIpcWindow::new(
+                    carrick_guest_arch::HostVa::new(owner.directory_ptr() as usize),
+                    carrick_guest_arch::GuestLen::new(owner.directory_len() as u64),
+                    carrick_guest_arch::HostVa::new(owner.pool_ptr() as usize),
+                    carrick_guest_arch::GuestLen::new(owner.pool_len() as u64),
                 )
             }
             .ok_or_else(|| fail("invalid IPC window geometry"))?;

@@ -13,11 +13,17 @@ exist. They are now unit tests in the existing ABI lib target so the normal
 ABI test gate executes them. Additional edge cases cover overflow, zero
 VAs, overlap with the carrier region and nonidentity VA/GPA mappings.
 
-This is geometry admission only. It does not authenticate a live mapping,
-construct an IPC venue, or serve a syscall. The existing `IpcWindow`,
-`IPC_WINDOW_HOST`, `EL1_REGION_HOST_PTR` and ARM guest publication remain
-unchanged. The approved slice still requires the typed host/guest view
-split, shared `guest_venue(layout, binding)`, reuse of retained
-`FileRegionRegistration` and `IpcRegion::attach`, and migration of ARM to
-that publication path. No slice-1 completion or x86 runtime acceptance is
-claimed by these witnesses.
+The host view is now `HostIpcWindow`, with `HostVa` addresses and
+`GuestLen` sizes. The guest view is `GuestIpcWindow`, with distinct
+`KernelVa` and `FrameGpa` addresses and ABI lengths returned as `GuestLen`.
+Both attach through the existing `IpcRegion::attach`. The host view refuses
+pointer overflow before attachment; its typed-address witness was compile-red
+with E0433 before the split. The guest view can be derived from the admitted
+binding without converting frame GPAs into supervisor pointers.
+
+This remains partial slice-1 work. The ARM fixed-address guest constructor
+and both process-global publications are still present. Retained
+`FileRegionRegistration` integration, a shared `guest_venue(layout, binding)`,
+the live x86-layout venue witness and ARM migration remain unimplemented.
+The typed guest view witness proves address preservation, not a live venue.
+No slice-1 completion or x86 runtime acceptance is claimed.
