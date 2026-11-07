@@ -22,6 +22,7 @@ impact = ["dep:carrick-conformance"]
 smoke-signed = ["dep:carrick-conformance"]
 
 [dependencies]
+carrick-vfs = { path = "../carrick-vfs" }
 carrick-fatal = { path = "../carrick-fatal" }
 clap.workspace = true
 regex.workspace = true

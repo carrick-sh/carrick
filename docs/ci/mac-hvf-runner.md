@@ -67,6 +67,29 @@ artifacts move to the external USB volume (`/Volumes/carrick`, 233 GB total):
      directories `0700` so `carrick-hvf` has zero read or write access to director volumes
      or `ci`'s volume (matching #650 / #1169).
 
+### Runtime scratch stays internal
+
+The conventional `/Volumes/carrick` mount is cold USB storage on cloudmac.
+Runtime scratch must instead use an internal case-sensitive volume. Set
+`CARRICK_HOME` in the runner environment to a directory on that volume; an
+internal checkout alone is insufficient when its volume is case-insensitive.
+CI, acceptance and signed test scripts preserve an explicit `CARRICK_HOME`
+and otherwise use the shared VFS resolver. It prefers `/Volumes/carrick` only
+when Apple's volume properties identify internal, non-removable storage and
+the bounded case probe succeeds. External USB storage is skipped. It then
+tries `$HOME/.carrick/scratch` and `/tmp/carrick/scratch`, accepting only a
+case-sensitive candidate. Unknown volume properties reject the conventional
+mount. No default is derived from the checkout.
+
+Acceptance and standalone signed tests validate scratch once before starting
+tests. If no candidate works they fail early with a message naming
+`CARRICK_HOME`. An unusable explicit override fails without falling back.
+Each candidate's volume discovery, directory creation, case-sensitivity probe
+and cleanup share a two-second caller deadline. The result is cached for the
+process lifetime. A timed-out filesystem worker is detached: the deadline
+bounds the caller's wait but cannot cancel kernel I/O. Explicit overrides
+must therefore still point to internal case-sensitive storage.
+
 ## Host setup and #1232 binding security requirements
 
 Performed by the owner on `cloudmac` before enabling `sh.carrick.hvf-runner`:

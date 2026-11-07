@@ -676,15 +676,12 @@ fn split_json_envelope(stdout: &[u8]) -> (Vec<u8>, serde_json::Value) {
     (stdout[..start].to_vec(), envelope)
 }
 
-fn run_cli_json(store: &ImageStore) -> CliRun {
-    let bin = common::repo_root().join("target/release/carrick");
-    assert!(
-        bin.exists(),
-        "{} missing: `just test-embed` depends on `build`",
-        bin.display()
-    );
-    let run_id = format!("{}-cli", common::run_id());
-    let child = Command::new(&bin)
+fn cli_json_process(store: &ImageStore, bin: &std::path::Path, run_id: &str) -> Command {
+    let mut command = Command::new(bin);
+    command
+        // Select the image cache without changing production scratch resolution.
+        .arg("--store")
+        .arg(store.root())
         .args([
             "run",
             "--json",
@@ -694,12 +691,23 @@ fn run_cli_json(store: &ImageStore) -> CliRun {
             "echo",
             "hello world",
         ])
-        .env("CARRICK_RUN_ID", &run_id)
-        .env("CARRICK_HOME", store.root())
+        .env("CARRICK_RUN_ID", run_id)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .process_group(0)
+        .process_group(0);
+    command
+}
+
+fn run_cli_json(store: &ImageStore) -> CliRun {
+    let bin = common::repo_root().join("target/release/carrick");
+    assert!(
+        bin.exists(),
+        "{} missing: `just test-embed` depends on `build`",
+        bin.display()
+    );
+    let run_id = format!("{}-cli", common::run_id());
+    let child = cli_json_process(store, &bin, &run_id)
         .spawn()
         .expect("spawn target/release/carrick");
     let pgid: libc::pid_t = libc::pid_t::try_from(child.id()).expect("child pid fits pid_t");
@@ -735,6 +743,62 @@ fn run_cli_json(store: &ImageStore) -> CliRun {
         envelope,
         status,
     }
+}
+
+#[test]
+fn serial_host_cli_image_store_preserves_scratch_configuration() {
+    use std::os::unix::fs::PermissionsExt;
+    const CHILD: &str = "CARRICK_CLI_SCRATCH_WITNESS";
+    if std::env::var_os(CHILD).is_none() {
+        // Native macOS uses its usual insensitive temporary volume here.
+        // Linux still witnesses the unset override and independent cache path.
+        let home = tempfile::tempdir().expect("home");
+        let output = Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "serial_host_cli_image_store_preserves_scratch_configuration",
+            ])
+            .env(CHILD, "1")
+            .env_remove("CARRICK_HOME")
+            .env("HOME", home.path())
+            .output()
+            .expect("scratch witness child");
+        assert!(output.status.success(), "{output:?}");
+        return;
+    }
+    let store = ImageStore::default_for_user();
+    let fixture = tempfile::tempdir().expect("fake CLI");
+    let bin = fixture.path().join("carrick");
+    std::fs::write(
+        &bin,
+        r#"#!/bin/sh
+set -eu
+test "${CARRICK_HOME+x}" != x
+test "$1" = --store
+test "$2" = "$HOME/.carrick"
+printf '{"exit_code":0}\n'
+"#,
+    )
+    .expect("write CLI witness");
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("executable");
+    // Known-answer negative control: reproduce the previous command's exact
+    // override and prove the fake CLI rejects it before checking production.
+    let previous = cli_json_process(&store, &bin, "scratch-witness-red")
+        .env("CARRICK_HOME", store.root())
+        .output()
+        .expect("run previous CLI environment");
+    assert!(
+        !previous.status.success(),
+        "old scratch override must be rejected"
+    );
+    let output = cli_json_process(&store, &bin, "scratch-witness")
+        .output()
+        .expect("run CLI command builder");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["exit_code"],
+        0
+    );
 }
 
 #[test]

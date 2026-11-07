@@ -196,13 +196,7 @@ fn load_elf_command_prints_address_space_summary() {
 
 #[test]
 fn network_cli_manages_docker_style_resources() {
-    // The Docker API resource store is rooted next to the container registry,
-    // which prefers the shared /Volumes/carrick scratch volume on macOS. Skip
-    // there so this CLI test never mutates the operator's real network store.
-    if std::path::Path::new("/Volumes/carrick").is_dir() {
-        eprintln!("SKIP network_cli: shared /Volumes/carrick volume present");
-        return;
-    }
+    // Each child uses an isolated home; no shared-volume lookup is needed.
     let home = tempfile::tempdir().unwrap();
     let network_name = "carrick_cli_network";
     let other_network_name = "carrick_cli_network_other";
@@ -329,14 +323,7 @@ fn network_cli_manages_docker_style_resources() {
 
 #[test]
 fn network_cli_connects_and_disconnects_container_resources() {
-    // The Docker API resource store is rooted next to the container registry,
-    // which prefers the shared /Volumes/carrick scratch volume on macOS. Skip
-    // there so this CLI test never mutates the operator's real container or
-    // network store.
-    if std::path::Path::new("/Volumes/carrick").is_dir() {
-        eprintln!("SKIP network_connect_cli: shared /Volumes/carrick volume present");
-        return;
-    }
+    // Each child uses an isolated home; no shared-volume lookup is needed.
     let home = tempfile::tempdir().unwrap();
     let id = "b".repeat(64);
     let cdir = scratch_root(home.path()).join("containers").join(&id);
@@ -496,13 +483,7 @@ fn network_cli_accepts_docker_resource_commands() {
 
 #[test]
 fn volume_cli_manages_docker_style_resources() {
-    // The Docker API resource store is rooted next to the container registry,
-    // which prefers the shared /Volumes/carrick scratch volume on macOS. Skip
-    // there so this CLI test never mutates the operator's real volume store.
-    if std::path::Path::new("/Volumes/carrick").is_dir() {
-        eprintln!("SKIP volume_cli: shared /Volumes/carrick volume present");
-        return;
-    }
+    // Each child uses an isolated home; no shared-volume lookup is needed.
     let home = tempfile::tempdir().unwrap();
     let volume_name = "carrick_cli_volume";
     let other_volume_name = "carrick_cli_volume_other";
@@ -700,13 +681,7 @@ fn volume_cli_accepts_docker_resource_commands() {
 
 #[test]
 fn resource_cli_prune_honors_filters() {
-    // The Docker API resource store is rooted next to the container registry,
-    // which prefers the shared /Volumes/carrick scratch volume on macOS. Skip
-    // there so this CLI test never mutates the operator's real resource store.
-    if std::path::Path::new("/Volumes/carrick").is_dir() {
-        eprintln!("SKIP resource_prune_cli: shared /Volumes/carrick volume present");
-        return;
-    }
+    // Each child uses an isolated home; no shared-volume lookup is needed.
     let home = tempfile::tempdir().unwrap();
 
     Command::cargo_bin("carrick")
@@ -807,13 +782,7 @@ fn resource_cli_prune_honors_filters() {
 
 #[test]
 fn logs_replays_captured_output_for_a_container() {
-    // The registry root prefers the shared /Volumes/carrick volume when it
-    // exists; only when it's absent does CARRICK_HOME redirect it. Self-skip on
-    // a host with the shared volume so we never pollute (or depend on) it.
-    if std::path::Path::new("/Volumes/carrick").is_dir() {
-        eprintln!("SKIP logs_replays: shared /Volumes/carrick volume present");
-        return;
-    }
+    // Each child uses an isolated home; no shared-volume lookup is needed.
     let home = tempfile::tempdir().unwrap();
     // Match the registry selected by the isolated child on this host.
     let id = "a".repeat(64);

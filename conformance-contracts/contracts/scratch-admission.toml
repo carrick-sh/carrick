@@ -1,0 +1,29 @@
+schema_version = 1
+id = "host.vfs.scratch-admission"
+title = "Case-sensitive scratch admission has a bounded caller wait"
+guest_surfaces = ["filesystem:host-scratch"]
+semantic_authority = ["Linux pathname case sensitivity; man 7 path_resolution"]
+fixture = "An explicit internal home, an unusable default home, and a stalled filesystem probe"
+scale_points = [1]
+structural_budgets = []
+rationale = "An explicit home is authoritative; defaults admit only internal conventional storage, then case-sensitive home and temporary candidates. Case-insensitive storage cannot preserve Linux pathname identity. Directory creation, case probing and cleanup share a two-second caller deadline; blocked kernel I/O may outlive the detached worker. The override witness counts zero conventional candidate accesses. These host-native assertions precede guest dispatch and do not export guest work-meter observations."
+
+[bindings]
+vm_free = [
+  "carrick-xtask::tests::build_cache::acceptance_unusable_override_is_checked_before_tests",
+  "carrick-embed::tests::guest_smoke::serial_host_cli_image_store_preserves_scratch_configuration",
+  "carrick-runtime::prepare::tests::serial_host_prepare_defers_case_sensitive_admission_until_execute",
+  "carrick-xtask::tests::build_cache::scratch_preflight_uses_explicit_case_sensitive_home",
+  "carrick-vfs::apfs::serial_host::conventional_volume_requires_internal_storage",
+  "carrick-vfs::apfs::serial_host::backend_default_honours_override_without_requiring_case_sensitivity",
+  "carrick-vfs::apfs::serial_host::temporary_scratch_is_scoped_to_effective_user",
+  "carrick-vfs::apfs::serial_host::case_insensitive_home_falls_through_to_tmp",
+  "carrick-vfs::apfs::serial_host::no_usable_default_reports_configuration_error",
+  "carrick-vfs::apfs::serial_host::stalled_probe_returns_failure_before_worker_finishes",
+  "carrick-vfs::apfs::serial_host::serial_host_scratch_root_override_wins",
+  "carrick-xtask::tests::build_cache::standalone_signed_runner_rejects_override_before_building_tests",
+]
+
+[bindings.unresolved]
+embed_structural = "Director must re-run signed acceptance on macOS with an internal case-sensitive CARRICK_HOME; Linux worker cannot validate HVF."
+docker = "Host storage admission precedes guest execution and has no Docker syscall differential."

@@ -7146,27 +7146,11 @@ impl FsBackend for HostFsBackend {
 }
 
 pub fn default_scratch_root() -> std::io::Result<PathBuf> {
-    // Prefer the dedicated carrick APFS volume (case-sensitive, isolated,
-    // throw-away-able via `carrick volume delete`) when it exists. The
-    // user lays it down once via `carrick volume create`; without it we
-    // fall back to `~/.carrick/scratch`, which on a standard macOS
-    // install is on the case-INSENSITIVE boot volume and will cause the
-    // dispatcher's case-sensitivity probe to demote us to MemoryBackend.
-    #[cfg(target_os = "macos")]
-    {
-        return crate::apfs::preferred_scratch_root();
-    }
-    #[allow(unreachable_code)]
-    {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("TMPDIR").map(PathBuf::from))
-            .unwrap_or_else(|| PathBuf::from("/tmp"));
-        let mut path = home;
-        path.push(".carrick");
-        path.push("scratch");
-        Ok(path)
-    }
+    // Construction is also used by VM-free preparation and filesystem tests.
+    // Case-sensitive admission belongs to guest execution and signed gates.
+    Ok(crate::apfs::preferred_scratch_root()
+        .construction_path()?
+        .to_owned())
 }
 
 pub(crate) fn acquire_lockfile(

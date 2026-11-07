@@ -104,27 +104,29 @@ pub(crate) fn install_fs_backend(
     let mut backend: Box<dyn FsBackend> = match kind {
         #[cfg(feature = "fs-memory")]
         FsBackendKind::Memory => Box::new(MemoryBackend::new()),
-        FsBackendKind::Host => match HostFsBackend::new() {
-            Ok(mut host) => {
-                // SEED THE BACKEND WITH THE FULL ROOTFS. ("rootfs as APFS, throw
-                // away when done": materialise every rootfs file/dir/symlink onto
-                // the cap-std scratch dir so all fs syscalls flow through real
-                // host syscalls against a real filesystem.)
-                if let Some(rootfs) = dispatcher.rootfs() {
-                    if let Err(err) = host.seed_from_rootfs(rootfs) {
-                        let (mut mem, kind) = host_failure_fallback(&format!(
-                            "--fs host seed-from-rootfs failed ({err})"
-                        ))?;
-                        seed_guest_baseline(&mut *mem);
-                        let _ = dispatcher.set_fs_backend(mem);
-                        return Ok(kind);
+        FsBackendKind::Host => {
+            match carrick_vfs::scratch::preflight_default().and_then(|()| HostFsBackend::new()) {
+                Ok(mut host) => {
+                    // SEED THE BACKEND WITH THE FULL ROOTFS. ("rootfs as APFS, throw
+                    // away when done": materialise every rootfs file/dir/symlink onto
+                    // the cap-std scratch dir so all fs syscalls flow through real
+                    // host syscalls against a real filesystem.)
+                    if let Some(rootfs) = dispatcher.rootfs() {
+                        if let Err(err) = host.seed_from_rootfs(rootfs) {
+                            let (mut mem, kind) = host_failure_fallback(&format!(
+                                "--fs host seed-from-rootfs failed ({err})"
+                            ))?;
+                            seed_guest_baseline(&mut *mem);
+                            let _ = dispatcher.set_fs_backend(mem);
+                            return Ok(kind);
+                        }
+                        host_seeded = true;
                     }
-                    host_seeded = true;
+                    Box::new(host)
                 }
-                Box::new(host)
+                Err(err) => host_failure_fallback(&format!("--fs host failed ({err})"))?.0,
             }
-            Err(err) => host_failure_fallback(&format!("--fs host failed ({err})"))?.0,
-        },
+        }
     };
     seed_guest_baseline(&mut *backend);
     let _ = dispatcher.set_fs_backend(backend);
