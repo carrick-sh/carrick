@@ -54,6 +54,9 @@ pub const HVF_CLOSURE_LABELS: [&str; 4] = ["self-hosted", "macOS", "ARM64", "car
 /// A job key whose runners repeatedly closed without running it is not
 /// re-served beyond this many reservations; a re-run is a new attempt.
 pub const MAX_SERVES_PER_JOB: usize = 3;
+/// Maximum consecutive storage-contention (`Busy`) retries before a reservation
+/// stops retrying and closes or reaps cleanly.
+pub const MAX_BUSY_RETRIES: u32 = 5;
 pub const KERNEL_RUNTIME_WORKFLOW: &str = ".github/workflows/kernel-runtime.yml";
 pub const PILOT_WORKFLOW: &str = ".github/workflows/willow-pilot.yml";
 const PILOT_BRANCH: &str = "work/willow-pilot";
@@ -219,6 +222,9 @@ pub struct Record {
     /// Answered on-demand dispatch token requests (#1012); never token bytes.
     #[serde(default)]
     pub mints: Vec<mint::MintEntry>,
+    /// Consecutive storage-contention (`Busy`) retries attempted for this row.
+    #[serde(default)]
+    pub busy_retries: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -329,6 +335,7 @@ impl Ledger {
             assigned_key: None,
             approved: false,
             mints: Vec::new(),
+            busy_retries: 0,
         };
         self.rows.push(row.clone());
         Ok(row)
@@ -939,7 +946,10 @@ pub fn recovery_decision(row: &Record, present: bool, task: TaskState, now: u64)
             return Recovery::ResumeReaping;
         }
         if (row.state == State::Cloning && task == TaskState::Succeeded)
-            || (row.state == State::Booting && task == TaskState::Busy)
+            || (row.state == State::Booting
+                && task == TaskState::Busy
+                && row.busy_retries < MAX_BUSY_RETRIES
+                && now.saturating_sub(row.created) < 900)
         {
             return Recovery::ResumeClone;
         }
@@ -1150,7 +1160,13 @@ pub fn reap_decision(row: &Record, now: u64, assignment: Assignment) -> Reap {
     }
     match assignment {
         Assignment::Completed => Reap::Destroy,
-        Assignment::Unassigned if now.saturating_sub(row.created) >= 900 => Reap::Destroy,
+        Assignment::Unassigned
+            if now.saturating_sub(row.created) >= 900
+                || (matches!(row.state, State::Cloning | State::Booting)
+                    && row.busy_retries >= MAX_BUSY_RETRIES) =>
+        {
+            Reap::Destroy
+        }
         _ => Reap::Keep,
     }
 }
