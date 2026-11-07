@@ -85,7 +85,7 @@ impl<'a> NativeProcessService<'a, Words> for NoPhysicalCrossings {
 
 // Exercise the production El1PendingFamilies venue, including checked copy.
 fn ring_call(
-    process: &mut dyn ProcessNative<Words>,
+    process: &mut dyn ProcessNative<'_, Words>,
     current: &[CurrentTask],
     zone: &ZoneTables,
     index: u8,
@@ -97,7 +97,7 @@ fn ring_call(
 }
 
 fn ring_call_route(
-    process: &mut dyn ProcessNative<Words>,
+    process: &mut dyn ProcessNative<'_, Words>,
     current: &[CurrentTask],
     zone: &ZoneTables,
     index: u8,

@@ -169,10 +169,9 @@ pub fn transfer_with_input<U: UserCopy>(
             }
         }
         IpcOpKind::PipeWrite => {
-            // A fresh pipe's first write takes a stocked ring here, under
-            // the object lock; with none in stock the write reports
-            // `Storage` before any effect and the call leaves for the host.
-            guard.provide_ring_from_stock()?;
+            // Lazy supply uses stock or the same shared extent allocator.
+            // An empty cache cannot change the write into a host crossing.
+            guard.ensure_pipe_storage()?;
             let mut p = guard.pipe()?;
             loop {
                 let step =

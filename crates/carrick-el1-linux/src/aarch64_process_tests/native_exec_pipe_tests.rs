@@ -92,6 +92,7 @@ fn fork_exec_successor_with_futex(futex: Option<u64>, bitset: u64) {
     crossing.metadata_in_el1_window = true;
     crossing.ipc = Some((owner.clone(), map));
     let words = fixture.tables.live(&fixture.maintenance);
+    let tables = crate::ipc::MapTables(map);
     let runtime = Arc::new(
         NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
             source,
@@ -332,7 +333,7 @@ fn fork_exec_successor_with_futex(futex: Option<u64>, bitset: u64) {
         &*std::alloc::alloc_zeroed(std::alloc::Layout::new::<carrick_el1_abi::InotifyNameCache>())
             .cast::<carrick_el1_abi::InotifyNameCache>()
     };
-    let mut call = |nr, fd, address, count| {
+    let mut call_full = |nr, fd, address, count, extra| {
         let mut frame = carrick_el1_abi::TrapFrame {
             elr: 0x400004,
             slot: u64::from(fixture.slot.raw()),
@@ -342,6 +343,7 @@ fn fork_exec_successor_with_futex(futex: Option<u64>, bitset: u64) {
         frame.x[0] = fd;
         frame.x[1] = address;
         frame.x[2] = count;
+        frame.x[3] = extra;
         let selected = fixture.zone.slot(fixture.slot).current().unwrap();
         // SAFETY: fixture retains this selected live record.
         let binding = unsafe { runtime.record_binding(fixture.zone.record_ref(selected)) }.unwrap();
@@ -389,20 +391,97 @@ fn fork_exec_successor_with_futex(futex: Option<u64>, bitset: u64) {
         );
         frame.x[0]
     };
+    // Constructors must use the successor's native table after exec, just
+    // as they do before exec. Check a usable counter and empty epoll wait.
+    use carrick_personality_linux::crossing::nr as sys;
+    let event = call_full(
+        sys::EVENTFD2.raw(),
+        7,
+        carrick_syscall_abi::LINUX_O_CLOEXEC | carrick_abi::LINUX_O_NONBLOCK,
+        0,
+        0,
+    );
+    assert!(
+        (event as i64) >= 0,
+        "post-exec eventfd errno {}",
+        -(event as i64)
+    );
+    let epoll = call_full(
+        sys::EPOLL_CREATE1.raw(),
+        carrick_syscall_abi::LINUX_O_CLOEXEC,
+        0,
+        0,
+        0,
+    );
+    assert!(
+        (epoll as i64) >= 0,
+        "post-exec epoll errno {}",
+        -(epoll as i64)
+    );
     assert_eq!(
-        call(64, 4, memory.arg() + 128, 2),
+        call_full(sys::READ.raw(), event, memory.arg() + 768, 8, 0),
+        8
+    );
+    assert_eq!(
+        u64::from_ne_bytes(memory.as_mut_bytes()[768..776].try_into().unwrap()),
+        7
+    );
+    assert_eq!(
+        call_full(sys::EPOLL_PWAIT.raw(), epoll, memory.arg() + 800, 1, 0),
+        0
+    );
+    // Go's netpollinit registers its wake eventfd after fork+exec. Exercise
+    // that composition on the successor's table, including the ARM event
+    // layout and the EPOLLET high bit, rather than only two constructors.
+    let cookie = 0x1506_1740_8870_0001u64;
+    let interest = memory.arg() + 832;
+    memory.as_mut_bytes()[832..836].copy_from_slice(
+        &(carrick_el1_abi::ipc::epoll::events::IN | carrick_el1_abi::ipc::epoll::events::ET)
+            .to_ne_bytes(),
+    );
+    memory.as_mut_bytes()[840..848].copy_from_slice(&cookie.to_ne_bytes());
+    assert_eq!(
+        call_full(sys::EPOLL_CTL.raw(), epoll, 1, event, interest),
+        0
+    );
+    let wake = memory.arg() + 864;
+    memory.as_mut_bytes()[864..872].copy_from_slice(&1u64.to_ne_bytes());
+    assert_eq!(call_full(sys::WRITE.raw(), event, wake, 8, 0), 8);
+    assert_eq!(
+        call_full(sys::EPOLL_PWAIT.raw(), epoll, memory.arg() + 800, 1, 0),
+        1
+    );
+    assert_eq!(
+        u64::from_ne_bytes(memory.as_mut_bytes()[808..816].try_into().unwrap()),
+        cookie
+    );
+    assert_eq!(
+        call_full(sys::READ.raw(), event, memory.arg() + 768, 8, 0),
+        8
+    );
+    assert_eq!(
+        call_full(sys::EPOLL_PWAIT.raw(), epoll, memory.arg() + 800, 1, 0),
+        0
+    );
+    assert_eq!(call_full(sys::EPOLL_CTL.raw(), epoll, 2, event, 0), 0);
+    assert_eq!(call_full(sys::FCNTL.raw(), event, 1, 0, 0), 1);
+    assert_eq!(call_full(sys::FCNTL.raw(), epoll, 1, 0, 0), 1);
+    assert_eq!(call_full(sys::CLOSE.raw(), event, 0, 0, 0), 0);
+    assert_eq!(call_full(sys::CLOSE.raw(), epoll, 0, 0, 0), 0);
+    assert_eq!(
+        call_full(64, 4, memory.arg() + 128, 2, 0),
         2,
         "exec successor's scalar write"
     );
     assert_eq!(
-        call(66, 4, memory.arg(), 2),
+        call_full(66, 4, memory.arg(), 2, 0),
         6,
         "exec successor's vector write"
     );
     crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
     for bad in [0, 1u64 << 48, 0x6000_0000] {
         assert_eq!(
-            call(66, 4, bad, 1) as i64,
+            call_full(66, 4, bad, 1, 0) as i64,
             -14,
             "native child bad iovec {bad:#x} must settle EFAULT in ring"
         );
@@ -415,7 +494,7 @@ fn fork_exec_successor_with_futex(futex: Option<u64>, bitset: u64) {
             .is_queued()
     );
     activate_target(source, &fixture.task, &parent_binding);
-    assert_eq!(call(63, 3, memory.arg() + 512, 8), 8);
+    assert_eq!(call_full(63, 3, memory.arg() + 512, 8, 0), 8);
     assert_eq!(&memory.as_mut_bytes()[512..520], b"1\n1\n2\n3\n");
     registry.unregister_root_for_test(&runtime);
 }
@@ -479,6 +558,9 @@ fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
             .cast::<carrick_el1_abi::ipc_tables::IpcTableMap>()
     };
     map.publish(5, table.id().to_raw()).unwrap();
+    // Declared before `runtime`: the dispatch closure's IPC venue borrows it, and the
+    // runtime (dropped after it otherwise) holds work that names that venue.
+    let tables = crate::ipc::MapTables(map);
     let pages: Vec<_> = (0..32).map(|n| 0x20000 + n * 0x1000).collect();
     let mut crossing = TestStockCrossing::new(&pages);
     crossing.metadata_in_el1_window = true;
@@ -562,7 +644,6 @@ fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
     };
     let counters = carrick_el1_abi::Counters::new();
 
-    let tables = crate::ipc::MapTables(map);
     let venue = crate::ipc::IpcVenue {
         region: owner.region(),
         tables: &tables,

@@ -46,6 +46,7 @@ an epoll costs no host exit in steady state.
 vm_free = [
   "carrick-el1-abi::ipc::epoll::tests::{bounded_ready_count_preserves_edges_and_oneshots,ready_count_survives_cursor_replacement_between_batches,ready_count_requires_shared_zone_only_proof}",
   "carrick-kernel::dispatch::net::epoll_ops::nested_epoll_readiness_tests::{s1_empty_epoll_skips_owner_preparation,s1_host_epoll_refusals_preserve_edge_and_empty_host_policy}",
+  "carrick-el1-linux::aarch64_process_tests::serial_host_native_fork_netpoll_eventfd_wait (production native-child entry, child-created eventfd and epoll, EPOLLIN|EPOLLET ADD/MOD/DEL, timeout-zero readiness, finite park and inherited eventfd writer wake; zero forwarded calls and released execution capacity, no signed or x86 execution claim)",
 ]
 embed = [
   "carrick-embed::el1_sched::el1_epoll_eventfd_pingpong_stays_in_guest",

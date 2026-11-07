@@ -4440,6 +4440,7 @@ fn completed_output_busy_yields(in_preparation: bool) {
             )
             .unwrap();
         let result = entry.finish_copyout(service::OwnedCopyout {
+            effect: None,
             address: UserVa::new(0x10000),
             bytes: bytes.clone(),
             offset: 0,
@@ -4526,7 +4527,12 @@ fn completed_poll_output_preparation_busy_yields_then_delivers_the_answer() {
 }
 
 #[cfg(test)]
-fn retained_poll_output_owner_wait(cancel: bool, during_enrollment: bool, production_frame: bool) {
+fn retained_poll_output_owner_wait(
+    cancel: bool,
+    during_enrollment: bool,
+    production_frame: bool,
+    constructor: bool,
+) {
     // Page-aligned guest user input lets the real TrapFrame path read its
     // pollfd array; physical output still goes through this fixture's native
     // service.
@@ -4535,14 +4541,74 @@ fn retained_poll_output_owner_wait(cancel: bool, during_enrollment: bool, produc
             1024 * core::mem::size_of::<crate::file_table::PollFd>(),
         )
     });
-    let address = pages.as_ref().map_or(0x10000, |pages| pages.arg());
-    let expected_result = if production_frame { 1024 } else { 37 };
+    let address =
+        pages.as_ref().map_or(0x10000, |pages| pages.arg()) + if constructor { 4092 } else { 0 };
+    let piece = if constructor { 4 } else { 4096 };
+    let expected_result = if constructor {
+        0
+    } else if production_frame {
+        1024
+    } else {
+        37
+    };
     let fixture = native_exec_fixture();
     let source = BornInZoneSource {
         zone: fixture.zone,
         slot: fixture.slot,
     };
+    // The native fixture already owns process-lifetime leaked mappings.
+    // This mapping must outlive its retained service rows too.
+    let constructor_owner: Option<&'static std::sync::Arc<carrick_kernel::el1_ipc::HostIpc>> =
+        constructor.then(|| {
+            &*Box::leak(Box::new(std::sync::Arc::new(
+                carrick_kernel::el1_ipc::HostIpc::new(1 << 20).unwrap(),
+            )))
+        });
+    let constructor_table = constructor_owner.as_ref().map(|owner| {
+        carrick_kernel::el1_ipc::HostTable::create(std::sync::Arc::clone(owner), 64, 8).unwrap()
+    });
+    let constructor_venue = constructor_owner
+        .as_ref()
+        .zip(constructor_table.as_ref())
+        .map(|(owner, table)| {
+            let map: &'static carrick_el1_abi::ipc_tables::IpcTableMap = unsafe {
+                &*std::alloc::alloc_zeroed(std::alloc::Layout::new::<
+                    carrick_el1_abi::ipc_tables::IpcTableMap,
+                >())
+                .cast()
+            };
+            map.publish(
+                fixture.task.linux.file_table.load(Ordering::Acquire),
+                table.id().to_raw(),
+            )
+            .unwrap();
+            let tables = Box::leak(Box::new(crate::ipc::MapTables(map)));
+            crate::ipc::IpcVenue {
+                region: owner.region(),
+                tables,
+            }
+        });
     let mut service = fixture.service();
+    if constructor {
+        // This physical fixture models four-byte stores as registered words.
+        // The eight-byte pipe output deliberately straddles two pages.
+        for at in [address, address + piece] {
+            service
+                .tid_words
+                .insert((fixture.address.mm.raw().get(), at), 0);
+        }
+    }
+    let take_output = |service: &mut Physical<'_>| {
+        if constructor {
+            assert!(take_signal_copies().is_empty());
+            core::mem::take(&mut service.tid_writes)
+                .into_iter()
+                .map(|(_, at, value)| (UserVa::new(at), value.to_ne_bytes().to_vec()))
+                .collect::<Vec<_>>()
+        } else {
+            take_signal_copies()
+        }
+    };
     let handle = service.service_mm_handle(&fixture.address).unwrap();
     let space = fixture
         .zone
@@ -4583,8 +4649,13 @@ fn retained_poll_output_owner_wait(cancel: bool, during_enrollment: bool, produc
         )
     };
     service.child_copy_error = Some(NativeProcessError::OwnerWait(wait));
-    service.child_copy_error_at = Some(address + 4096);
-    let bytes: Vec<u8> = if production_frame {
+    service.child_copy_error_at = Some(address + piece);
+    let bytes: Vec<u8> = if constructor {
+        [0i32, 1i32]
+            .into_iter()
+            .flat_map(i32::to_ne_bytes)
+            .collect()
+    } else if production_frame {
         (0..1024)
             .flat_map(|_| {
                 [
@@ -4602,7 +4673,7 @@ fn retained_poll_output_owner_wait(cancel: bool, during_enrollment: bool, produc
     } else {
         (0..8192).map(|n| (n % 251) as u8).collect()
     };
-    take_signal_copies();
+    take_output(&mut service);
     {
         let mut entry = fixture
             .runtime
@@ -4617,9 +4688,17 @@ fn retained_poll_output_owner_wait(cancel: bool, during_enrollment: bool, produc
             .unwrap();
         if production_frame {
             let mut frame = carrick_el1_abi::TrapFrame::default();
-            frame.x[8] = carrick_syscall_abi::nr::PPOLL.raw();
+            frame.x[8] = if constructor {
+                carrick_personality_linux::crossing::nr::PIPE2.raw()
+            } else {
+                carrick_syscall_abi::nr::PPOLL.raw()
+            };
             frame.x[0] = address;
-            frame.x[1] = 1024;
+            frame.x[1] = if constructor {
+                carrick_abi::LINUX_O_NONBLOCK | carrick_syscall_abi::LINUX_O_CLOEXEC
+            } else {
+                1024
+            };
             carrick_test_support::assert_guest_args(&frame.x[..6]);
             let counters = carrick_el1_abi::Counters::default();
             let route = crate::dispatch::dispatch_syscall_with_native(
@@ -4638,7 +4717,7 @@ fn retained_poll_output_owner_wait(cancel: bool, during_enrollment: bool, produc
                         crate::sched::HardwareUserWord,
                     >,
                 >,
-                None,
+                constructor_venue.as_ref(),
                 None,
                 Some(&mut *entry),
                 Some(source),
@@ -4647,7 +4726,9 @@ fn retained_poll_output_owner_wait(cancel: bool, during_enrollment: bool, produc
             );
             assert_eq!(
                 route,
-                carrick_personality_linux::dispatch::CompletionRoute::Suspended
+                carrick_personality_linux::dispatch::CompletionRoute::Suspended,
+                "result={}, address={address:#x}",
+                frame.x[0] as i64
             );
             assert_eq!(counters.refused[73].load(Ordering::Relaxed), 0);
         } else {
@@ -4669,11 +4750,24 @@ fn retained_poll_output_owner_wait(cancel: bool, during_enrollment: bool, produc
         }
     }
     assert_eq!(
-        take_signal_copies(),
-        [(UserVa::new(address), bytes[..4096].to_vec())]
+        take_output(&mut service),
+        [(UserVa::new(address), bytes[..piece as usize].to_vec())]
     );
+    if let Some(table) = constructor_table.as_ref() {
+        for fd in [0, 1] {
+            assert_eq!(
+                constructor_owner
+                    .as_ref()
+                    .unwrap()
+                    .region()
+                    .fd(carrick_kernel::el1_zone::HostLockWait)
+                    .get(table.id(), carrick_el1_abi::ipc::fd::Fd(fd)),
+                Err(carrick_el1_abi::ipc::fd::Error::BadFd)
+            );
+        }
+    }
     if during_enrollment {
-        assert!(take_signal_copies().is_empty());
+        assert!(take_output(&mut service).is_empty());
         assert!(
             fixture
                 .runtime
@@ -4730,10 +4824,11 @@ fn retained_poll_output_owner_wait(cancel: bool, during_enrollment: bool, produc
         )
         .unwrap();
     let resumed = entry.resume_checkpoint(|_| Ok(None)).unwrap();
+    drop(entry);
     if cancel {
         assert!(!matches!(resumed, NativeResume::Returned(_)));
         assert!(
-            take_signal_copies().is_empty(),
+            take_output(&mut service).is_empty(),
             "fatal cancellation cannot publish another output chunk"
         );
     } else {
@@ -4741,34 +4836,78 @@ fn retained_poll_output_owner_wait(cancel: bool, during_enrollment: bool, produc
             matches!(resumed, NativeResume::Returned(result) if result.raw() == expected_result)
         );
         assert_eq!(
-            take_signal_copies(),
-            [(UserVa::new(address + 4096), bytes[4096..].to_vec())]
+            take_output(&mut service),
+            [(
+                UserVa::new(address + piece),
+                bytes[piece as usize..].to_vec()
+            )]
         );
+    }
+    if let Some(table) = constructor_table.as_ref() {
+        let region = constructor_owner.as_ref().unwrap().region();
+        let authority = region.fd(carrick_kernel::el1_zone::HostLockWait);
+        if cancel {
+            let mut claims = authority.reserve_pair(table.id()).unwrap();
+            assert_eq!(
+                claims.fds(),
+                Some([
+                    carrick_el1_abi::ipc::fd::Fd(0),
+                    carrick_el1_abi::ipc::fd::Fd(1)
+                ])
+            );
+            authority.cancel_pair(&mut claims).unwrap();
+            let object = region
+                .create_pipe(65536, &carrick_kernel::el1_zone::HostLockWait)
+                .unwrap();
+            assert_eq!(
+                object.to_raw().index,
+                0,
+                "cancel returns both endpoint references and the object"
+            );
+        } else {
+            for fd in [0, 1] {
+                assert_eq!(
+                    authority.getfd(table.id(), carrick_el1_abi::ipc::fd::Fd(fd)),
+                    Ok(true)
+                );
+            }
+        }
     }
 }
 
 #[cfg(test)]
 #[test]
 fn completed_ppoll_output_retains_result_and_next_byte_across_owner_wait() {
-    retained_poll_output_owner_wait(false, false, false);
+    retained_poll_output_owner_wait(false, false, false, false);
 }
 
 #[cfg(test)]
 #[test]
 fn completed_ppoll_output_cancellation_commits_no_more_bytes() {
-    retained_poll_output_owner_wait(true, false, false);
+    retained_poll_output_owner_wait(true, false, false, false);
 }
 
 #[cfg(test)]
 #[test]
 fn completed_ppoll_output_cancellation_during_enrollment_never_returns_an_errno() {
-    retained_poll_output_owner_wait(true, true, false);
+    retained_poll_output_owner_wait(true, true, false, false);
 }
 
 #[cfg(test)]
 #[test]
 fn production_trap_frame_ppoll_retains_completed_output_across_owner_wait() {
-    retained_poll_output_owner_wait(false, false, true);
+    retained_poll_output_owner_wait(false, false, true, false);
+}
+
+#[cfg(test)]
+#[test]
+fn pipe_constructor_output_retains_both_claims_across_owner_wait() {
+    retained_poll_output_owner_wait(false, false, true, true);
+}
+#[cfg(test)]
+#[test]
+fn pipe_constructor_output_cancellation_reclaims_both_claims_and_endpoints() {
+    retained_poll_output_owner_wait(true, false, true, true);
 }
 
 #[cfg(test)]

@@ -252,7 +252,12 @@ pub enum ThreadBirthAdmission {
     Owned(LifecycleOutcome),
 }
 
-pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::ThreadCtx> {
+pub trait CopyoutEffect: Send {
+    /// Commit only after all output bytes were delivered. Drop cancels otherwise.
+    fn commit(&mut self) -> Result<(), carrick_syscall_abi::LinuxErrno>;
+}
+
+pub trait ProcessNative<'ipc, C: carrick_core_abi::EntryContext = carrick_sched_core::ThreadCtx> {
     /// The admitted process graph owns root identity; namespace PID 1 does not.
     fn is_root_process(&self) -> bool;
     /// A native execution record owns its complete published descriptor
@@ -301,6 +306,18 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
         operation: carrick_sched_core::object_wait::OperationToken,
     ) -> carrick_core::mm::transaction::CopyoutPreparation {
         carrick_core::mm::transaction::CopyoutPreparation::Unrouted(operation)
+    }
+    /// Retain constructor custody with output; drop rolls it back on cancellation.
+    fn complete_constructor_output(
+        &mut self,
+        _address: UserVa,
+        _bytes: alloc::vec::Vec<u8>,
+        _effect: alloc::boxed::Box<dyn CopyoutEffect + 'ipc>,
+    ) -> LifecycleOutcome {
+        LifecycleOutcome::Returned {
+            result: SyscallResult::new(carrick_syscall_abi::LINUX_EFAULT.guest_retval()),
+            work: false,
+        }
     }
     /// Retain a completed answer while its destination waits for its owner.
     fn complete_copyout(

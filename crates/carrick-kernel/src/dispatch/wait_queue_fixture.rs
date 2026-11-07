@@ -216,7 +216,12 @@ fn timerfd() -> WaitQueueFixture {
         producer: Box::new(move || {
             // An already-elapsed deadline is what an armed timer looks like
             // once it fires; `timerfd_ready_count` then reports the expiration.
-            producer_state.inner.lock().deadline = Some(std::time::Duration::ZERO);
+            producer_state.inner.lock().state.arm(
+                std::time::Duration::ZERO,
+                None,
+                Some(std::time::Duration::ZERO),
+                carrick_timer_core::timerfd::DeadlineMode::Absolute,
+            );
             producer_state.wait_queue.wake_all();
         }),
         _guards: Vec::new(),

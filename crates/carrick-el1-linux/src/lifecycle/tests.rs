@@ -407,7 +407,7 @@ fn serve_directly(w: &mut World, frame: &mut TrapFrame, user: &mut FaultingUser)
     })
 }
 
-fn serve_directly_with_process<P: ProcessNative>(
+fn serve_directly_with_process<P: for<'ipc> ProcessNative<'ipc>>(
     w: &mut World,
     frame: &mut TrapFrame,
     user: &mut FaultingUser,
@@ -1724,7 +1724,7 @@ fn process_native_hooks_require_every_execution_identity_component() {
         binding: carrick_el1_abi::ExecutionBinding,
         calls: usize,
     }
-    impl ProcessNative for Probe {
+    impl ProcessNative<'_> for Probe {
         fn wait_guest_copy(
             &mut self,
             _: carrick_core::user_copy::GuestCopyRequest,
@@ -1959,7 +1959,7 @@ fn clone_uses_the_exact_stamped_dispatch_identity() {
     struct BirthProbe {
         binding: carrick_el1_abi::ExecutionBinding,
     }
-    impl ProcessNative for BirthProbe {
+    impl ProcessNative<'_> for BirthProbe {
         fn wait_guest_copy(
             &mut self,
             _: carrick_core::user_copy::GuestCopyRequest,
@@ -2049,7 +2049,7 @@ fn clone_refuses_missing_dispatch_identity_without_registering() {
     struct BirthProbe {
         binding: carrick_el1_abi::ExecutionBinding,
     }
-    impl ProcessNative for BirthProbe {
+    impl ProcessNative<'_> for BirthProbe {
         fn wait_guest_copy(
             &mut self,
             _: carrick_core::user_copy::GuestCopyRequest,
@@ -2136,7 +2136,7 @@ fn clone_missing_nonleader_identity_cannot_inherit_leader() {
     struct BirthProbe {
         binding: carrick_el1_abi::ExecutionBinding,
     }
-    impl ProcessNative for BirthProbe {
+    impl ProcessNative<'_> for BirthProbe {
         fn wait_guest_copy(
             &mut self,
             _: carrick_core::user_copy::GuestCopyRequest,
@@ -2237,7 +2237,7 @@ fn clone_stamped_nonleader_inherits_the_calling_thread() {
     struct BirthProbe {
         binding: carrick_el1_abi::ExecutionBinding,
     }
-    impl ProcessNative for BirthProbe {
+    impl ProcessNative<'_> for BirthProbe {
         fn wait_guest_copy(
             &mut self,
             _: carrick_core::user_copy::GuestCopyRequest,
@@ -2338,7 +2338,7 @@ fn clone_stamped_nonleader_inherits_the_calling_thread() {
     assert_eq!(w.zone.slot(SLOT).queued(), 1);
 }
 struct IdentityOwner(carrick_el1_abi::ExecutionBinding);
-impl<C: carrick_el1_abi::EntryContext> ProcessNative<C> for IdentityOwner {
+impl<C: carrick_el1_abi::EntryContext> ProcessNative<'_, C> for IdentityOwner {
     fn wait_guest_copy(
         &mut self,
         _: carrick_core::user_copy::GuestCopyRequest,
@@ -2604,7 +2604,7 @@ fn clone_terminal_close_rolls_back_before_owned_exit_settlement() {
         settlements: &'a core::cell::Cell<u32>,
         refuse_birth: bool,
     }
-    impl ProcessNative for GraphOwner<'_> {
+    impl ProcessNative<'_> for GraphOwner<'_> {
         fn wait_guest_copy(
             &mut self,
             _: carrick_core::user_copy::GuestCopyRequest,
@@ -2749,7 +2749,7 @@ fn clone_queue_publication_can_reenter_the_process_graph_after_unlock() {
         settlements: &'a core::cell::Cell<u32>,
         refuse_birth: bool,
     }
-    impl ProcessNative for GraphOwner<'_> {
+    impl ProcessNative<'_> for GraphOwner<'_> {
         fn wait_guest_copy(
             &mut self,
             _: carrick_core::user_copy::GuestCopyRequest,
@@ -2894,7 +2894,7 @@ fn birth_record_refusal_retains_the_claim_for_rollback() {
         ..Default::default()
     };
     let names = InotifyNameCache::new();
-    let mut native: super::El1PendingFamilies<'_, _, FakeCpu, HardwareUserWord> =
+    let mut native: super::El1PendingFamilies<'_, '_, _, FakeCpu, HardwareUserWord> =
         super::El1PendingFamilies {
             handoff: None,
             lifecycle_user: None,
@@ -2957,7 +2957,7 @@ fn clone_terminal_failure_witness(mode: u8) {
         refuse_birth: bool,
         mode: u8,
     }
-    impl ProcessNative for GraphOwner<'_> {
+    impl ProcessNative<'_> for GraphOwner<'_> {
         fn wait_guest_copy(
             &mut self,
             _: carrick_core::user_copy::GuestCopyRequest,
@@ -3166,7 +3166,7 @@ fn native_exit_group_leaves_the_woken_successor_to_the_scheduler() {
     struct Exiting {
         binding: carrick_el1_abi::ExecutionBinding,
     }
-    impl ProcessNative for Exiting {
+    impl ProcessNative<'_> for Exiting {
         fn wait_guest_copy(
             &mut self,
             _: carrick_core::user_copy::GuestCopyRequest,
@@ -3266,7 +3266,7 @@ fn arm_dispatch_consumes_native_run_failure_before_return() {
     struct Failed {
         binding: carrick_el1_abi::ExecutionBinding,
     }
-    impl ProcessNative for Failed {
+    impl ProcessNative<'_> for Failed {
         fn wait_guest_copy(
             &mut self,
             _: carrick_core::user_copy::GuestCopyRequest,
@@ -3351,7 +3351,7 @@ fn managed_clone_copyout_fault_unbinds_birth_before_retry() {
         record: Option<carrick_el1_abi::RecordRef>,
         zone: *const ZoneTables,
     }
-    impl ProcessNative for Owner {
+    impl ProcessNative<'_> for Owner {
         fn wait_guest_copy(
             &mut self,
             _: carrick_core::user_copy::GuestCopyRequest,
