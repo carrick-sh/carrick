@@ -297,7 +297,6 @@ fn fork_exec_successor(futex: Option<u64>) {
             &mut service,
             parent,
             child,
-            &counters,
             operation,
         );
         registry.unregister_root_for_test(&runtime);
@@ -864,9 +863,9 @@ fn child_futex<'a>(
     service: &mut Physical<'a, Aarch64ParkedContext>,
     parent: TaskKey,
     child: TaskKey,
-    counters: &carrick_el1_abi::Counters,
     operation: u64,
 ) {
+    let counters = &carrick_el1_abi::Counters::new();
     use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest};
     use carrick_guest_arch::{Access, GuestLen};
     use carrick_personality_linux::dispatch::CompletionRoute;
@@ -944,6 +943,7 @@ fn child_futex<'a>(
     };
     let mut frame = carrick_el1_abi::TrapFrame {
         elr: 0x400004,
+        esr: 0x15 << 26,
         ..Default::default()
     };
     frame.x[8] = crate::sched::SYS_FUTEX as u64;
@@ -990,6 +990,38 @@ fn child_futex<'a>(
             None,
             |_| core::ptr::null_mut(),
         );
+        if route == CompletionRoute::Forward {
+            // Complete the same unclaimed-syscall capture as the ARM vector.
+            // Derive lineage from this real exec successor, not a fabricated
+            // ForkChild classification, so the red diagnostic shows the errno
+            // libc would receive after opcode refusal.
+            let (page, _) = fixture.task.lifecycle_refs().unwrap();
+            let owner = registry.thread_group_owner(
+                fixture.zone,
+                page,
+                fixture.task.visible_pid().unwrap(),
+            );
+            assert_eq!(
+                owner,
+                crate::native_process_runtime::NativeThreadGroupOwner::ForkChild
+            );
+            assert_eq!(
+                crate::dispatch::native_unstaged_exit(
+                    &mut frame,
+                    &fixture.task.linux,
+                    carrick_el1_abi::Action::Forward,
+                    || owner,
+                    counters,
+                ),
+                crate::dispatch::NativeUnstagedExit::Refused(carrick_el1_abi::Action::Served),
+            );
+            assert_eq!(frame.x[0] as i64, -38, "native child receives ENOSYS");
+            assert_eq!(
+                word.reads.get(),
+                0,
+                "opcode refusal happens before UserCopy"
+            );
+        }
         assert_eq!(
             route,
             CompletionRoute::Suspended,

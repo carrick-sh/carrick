@@ -288,7 +288,11 @@ keys, or interpret an absolute timestamp as a relative duration.
 extends the existing production native fork/exec witness at child-private VA
 `0x40000000` in the exec successor's MM, while its parent remains alive.
 The pre-fix dispatcher returned `Forward` before any `CopyOutcome` or
-`MemoryError`: opcode admission rejected 393. After admission, unavailable
+`MemoryError`: opcode admission rejected 393. The witness then runs production
+`native_unstaged_exit`, deriving ForkChild lineage from the registered exec
+successor. That final capture installs errno 38 (`ENOSYS`) with zero operand
+reads. Restoring the corrected admission must eliminate that refusal.
+After admission, unavailable
 backing yields `CopyOutcome::NotYet` for a four-byte read and the exact owner's
 Gate wait. Supply resumes the original comparison with errno 11, never errno
 14. A matching wait subsequently enrolls and selects the successor's real
