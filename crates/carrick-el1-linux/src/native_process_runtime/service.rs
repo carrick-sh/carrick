@@ -1087,7 +1087,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         },
                         None,
                         None,
-                        ServicePayload::None,
+                        ServicePayload::Copyin,
                         ServiceCompletion::RetrySyscall,
                     );
                 }
@@ -1098,7 +1098,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         },
                         None,
                         Some(wait),
-                        ServicePayload::None,
+                        ServicePayload::Copyin,
                         ServiceCompletion::RetrySyscall,
                     );
                 }
@@ -1111,7 +1111,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         ServiceOperation::Fault(fault),
                         Some(sequence),
                         None,
-                        ServicePayload::None,
+                        ServicePayload::Copyin,
                         ServiceCompletion::RetrySyscall,
                     );
                 }

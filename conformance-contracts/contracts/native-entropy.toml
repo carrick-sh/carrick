@@ -25,6 +25,7 @@ vm_free = [
   "carrick-el1-linux::native_process_runtime::host_test_support::entropy_service_first_byte_fault_returns_efault",
   "carrick-el1-linux::native_process_runtime::host_test_support::entropy_service_accessible_prefix_is_a_short_read",
   "carrick-el1-linux::native_process_runtime::host_test_support::entropy_service_flags_precede_output_fault",
+  "carrick-el1-linux::native_process_runtime::host_test_support::entropy_service_preparation_busy_retries_before_generation",
   "carrick-el1-linux::native_process_runtime::host_test_support::entropy_service_retains_reply_through_busy_and_resume",
   "carrick-el1-linux::native_process_runtime::host_test_support::entropy_service_retains_reply_through_owner_wait_and_resume",
   "carrick-el1-linux::native_process_runtime::host_test_support::entropy_service_cancellation_before_reply_releases_payload",
