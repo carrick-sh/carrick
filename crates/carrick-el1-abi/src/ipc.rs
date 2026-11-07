@@ -86,7 +86,9 @@
 //! Guest page size for pipe accounting is [`IPC_PIPE_PAGE_SIZE`] (Linux
 //! aarch64 4 KiB pages, `carrick_abi::LINUX_PAGE_SIZE`).
 
+mod pipe_creation;
 mod vectors;
+pub use pipe_creation::PendingPipePair;
 pub use vectors::{IPC_MAX_IOVECS, VectorImportError, VectorInputInvariant};
 
 use core::cell::UnsafeCell;
