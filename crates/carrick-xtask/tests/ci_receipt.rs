@@ -3443,7 +3443,7 @@ fn refused_profile_writes_failure_receipt() {
 }
 
 #[test]
-fn refused_host_only_profile_normalizes_phase_for_baseline_diff() {
+fn refused_profiles_normalize_phase_and_fail_baseline_diff() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
     let out_dir = dir.path().join("out");
@@ -3476,7 +3476,13 @@ fn refused_host_only_profile_normalizes_phase_for_baseline_diff() {
     // normalizes the default `all` phase (or macOS refuses KVM directly).
     std::fs::write(repo.join("untracked.txt"), "dirty\n").unwrap();
 
-    for profile in ["kvm", "linux-portable", "el1-native"] {
+    for (profile, phase) in [
+        ("kvm", "host"),
+        ("linux-portable", "host"),
+        ("el1-native", "host"),
+        ("no-docker", "all"),
+        ("full", "all"),
+    ] {
         for pre_supervisor_lease_refusal in [false, true] {
             let receipt_path = out_dir.join("receipt.json");
             let _ = std::fs::remove_file(&receipt_path);
@@ -3506,7 +3512,7 @@ fn refused_host_only_profile_normalizes_phase_for_baseline_diff() {
             .unwrap();
             assert_eq!(candidate.overall, "FAIL");
             assert_eq!(
-                candidate.phase, "host",
+                candidate.phase, phase,
                 "{profile} refusal wrote unnormalized phase"
             );
             assert_eq!(candidate.profile, profile);
@@ -3518,35 +3524,41 @@ fn refused_host_only_profile_normalizes_phase_for_baseline_diff() {
                 failure_keys(&candidate)
             );
 
-            let mut baseline = receipt(vec![]);
-            baseline.phase = "host".into();
+            let mut completed = step("completed", true, &[]);
+            completed.started_tests = vec!["witness".into()];
+            completed.finished_binaries = vec!["fixture".into()];
+            let mut baseline = receipt(vec![completed]);
+            baseline.phase = phase.into();
             baseline.profile = profile.into();
             baseline.overall = "PASS".into();
             let baseline_path = out_dir.join("baseline.json");
             std::fs::write(&baseline_path, serde_json::to_vec(&baseline).unwrap()).unwrap();
 
-            let vs_base = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
-                .args(["ci-receipt", "diff", "--baseline"])
-                .arg(&baseline_path)
-                .arg("--candidate")
-                .arg(&receipt_path)
-                .arg("--fail-on-new")
-                .output()
-                .unwrap();
-            assert!(
-                !vs_base.status.success(),
-                "{profile} refusal passed against host baseline"
-            );
-            let stderr = String::from_utf8_lossy(&vs_base.stderr);
-            assert!(
-                !stderr.contains("not comparable"),
-                "{profile} phase mismatch against host baseline: {stderr}"
-            );
-            let stdout = String::from_utf8_lossy(&vs_base.stdout);
-            assert!(
-                stdout.contains("not-run:accept-refusal:"),
-                "{profile}: {stdout}\n{stderr}"
-            );
+            for comparison_base in [&baseline_path, &receipt_path] {
+                let vs_base = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+                    .args(["ci-receipt", "diff", "--baseline"])
+                    .arg(comparison_base)
+                    .arg("--candidate")
+                    .arg(&receipt_path)
+                    .arg("--fail-on-new")
+                    .output()
+                    .unwrap();
+                assert!(
+                    !vs_base.status.success(),
+                    "{profile} refusal passed against host baseline"
+                );
+                let stderr = String::from_utf8_lossy(&vs_base.stderr);
+                assert!(
+                    !stderr.contains("not comparable"),
+                    "{profile} phase mismatch against host baseline: {stderr}"
+                );
+                let stdout = String::from_utf8_lossy(&vs_base.stdout);
+                assert!(
+                    stdout.contains("not-run:accept-refusal:"),
+                    "{profile}: {stdout}\n{stderr}"
+                );
+                assert!(stdout.contains("NEW"), "{profile}: {stdout}");
+            }
         }
     }
 }
