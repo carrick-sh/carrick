@@ -10528,18 +10528,23 @@ fn serial_host_native_root_creates_timerfd_with_live_children() {
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_fork_epoll_ctl_observes_peer_pipe_write() {
-    native_descriptor_witness(None, false, true, false);
+    native_descriptor_witness(None, false, true, false, false);
 }
 
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_fork_netpoll_eventfd_wait() {
-    native_descriptor_witness(None, false, false, true);
+    native_descriptor_witness(None, false, false, true, false);
+}
+
+#[test]
+fn serial_host_native_fork_pipe_zone_ceiling() {
+    native_descriptor_witness(None, false, false, false, true);
 }
 
 #[cfg(all(test, not(target_os = "macos")))]
 fn native_descriptor_calls(constructor: Option<u64>, root_constructor: bool) {
-    native_descriptor_witness(constructor, root_constructor, false, false);
+    native_descriptor_witness(constructor, root_constructor, false, false, false);
 }
 
 #[cfg(all(test, not(target_os = "macos")))]
@@ -10548,6 +10553,7 @@ fn native_descriptor_witness(
     root_constructor: bool,
     inherited_epoll: bool,
     netpoll: bool,
+    zone_ceiling: bool,
 ) {
     use crate::ipc::IpcTables;
     use carrick_abi::{
@@ -10571,6 +10577,11 @@ fn native_descriptor_witness(
         HostIpc::with_limits(
             1 << 20,
             IpcLimits {
+                objects: if zone_ceiling {
+                    carrick_el1_abi::ipc::IPC_OBJECT_SEGMENT
+                } else {
+                    IpcLimits::ZONE.objects
+                },
                 descriptions: carrick_el1_abi::ipc::IPC_OFD_SEGMENT,
                 ..IpcLimits::ZONE
             },
@@ -10814,6 +10825,32 @@ fn native_descriptor_witness(
     );
     for binding in &child_bindings {
         assert!(runtime.task_binding(binding.key).is_some());
+    }
+
+    if zone_ceiling {
+        // Fill the configured object population through the host authority.
+        // Retain every token so the production child's pipe must grow stock.
+        let mut retained = Vec::new();
+        while let Ok(object) = owner.create_pipe(65536) {
+            retained.push(object);
+        }
+        assert_eq!(retained.len() + 1, carrick_el1_abi::ipc::IPC_OBJECT_SEGMENT);
+        assert!(
+            owner.create_pipe(65536).is_err(),
+            "root observes zone ceiling"
+        );
+        let output = carrick_test_support::GuestUserBuffer::from_bytes(&[0; 8]);
+        let (route, result) = run_in_child_full(
+            0,
+            carrick_personality_linux::crossing::nr::PIPE2.raw(),
+            [output.arg(), 0, 0, 0],
+        );
+        assert!(matches!(
+            route,
+            CompletionRoute::Served | CompletionRoute::WithWork
+        ));
+        assert_eq!(result, -23, "native child must observe zone ENFILE (23)");
+        return;
     }
 
     if netpoll {
