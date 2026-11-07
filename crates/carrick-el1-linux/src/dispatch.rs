@@ -264,7 +264,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                         cpu: &mut sched::HardwareCpu,
                         user: &sched::HardwareUserWord,
                     }),
-                    ipc::guest_venue(frame.slot as u32).as_ref(),
+                    ipc::current_guest_venue(frame.slot as u32).as_ref(),
                     |handle| carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8,
                     unowned,
                 );
@@ -298,7 +298,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                                 cpu: &mut sched::HardwareCpu,
                                 user: &sched::HardwareUserWord,
                             }),
-                            ipc::guest_venue(frame.slot as u32).as_ref(),
+                            ipc::current_guest_venue(frame.slot as u32).as_ref(),
                             |handle| carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8,
                             refused(),
                         );
@@ -318,7 +318,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                     cpu: &mut sched::HardwareCpu,
                     user: &sched::HardwareUserWord,
                 }),
-                ipc::guest_venue(frame.slot as u32).as_ref(),
+                ipc::current_guest_venue(frame.slot as u32).as_ref(),
                 lifecycle::guest_venue(),
                 page,
                 control,
@@ -345,7 +345,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                         cpu: &mut sched::HardwareCpu,
                         user: &sched::HardwareUserWord,
                     }),
-                    ipc::guest_venue(frame.slot as u32).as_ref(),
+                    ipc::current_guest_venue(frame.slot as u32).as_ref(),
                     |handle| carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8,
                     refused(),
                 ),
@@ -367,7 +367,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                     cpu: &mut sched::HardwareCpu,
                     user: &sched::HardwareUserWord,
                 }),
-                ipc::guest_venue(frame.slot as u32).as_ref(),
+                ipc::current_guest_venue(frame.slot as u32).as_ref(),
                 |handle| carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8,
             )
         }
@@ -1225,7 +1225,7 @@ fn arm_native_service_exit(
             // work first settles that work (CarrierWork) and is replayed;
             // staging it here would pre-empt the settlement forever.
             None if action != Action::Forward => NativeServiceStage::Operation,
-            None => match ipc::guest_venue(frame.slot as u32).and_then(|venue| {
+            None => match ipc::current_guest_venue(frame.slot as u32).and_then(|venue| {
                 let table = ipc::native_table(&venue, task)?;
                 let access = carrick_el1::substrate::sched::object_wait::space_access(zone, slot);
                 let lock_slot = frame.slot as u32;
@@ -1398,7 +1398,7 @@ fn arm_native_service_exit(
                     // names in the caller's own ring table (#1530), read
                     // through the stable owned-table authority: an unrelated
                     // table-map update must not read as "no table" (ENOSYS).
-                    let table = ipc::guest_venue(frame.slot as u32)
+                    let table = ipc::current_guest_venue(frame.slot as u32)
                         .and_then(|venue| ipc::native_exec_table(venue.tables, task));
                     process.begin_exec_service(
                         payload,
