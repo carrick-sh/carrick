@@ -22,6 +22,7 @@ structural_budgets = []
 # witnesses; core.entry.completion owns result/work publication and counting.
 # The dispatch-only mmap/brk fallback test is not a retirement-editor witness.
 vm_free = [
+  "carrick-el1::memory::tests::delegated::two_isa_noreserve_code_range_stays_owner_admitted (retire the complete lazy noreserve range after its RWX subrange edit; no backing or descriptor edits)",
   "carrick-mmu-core::aarch64::tests::{allocation_free_guest_retirement_retires_complete_l2_and_l3_terminals,allocation_free_guest_retirement_refuses_partial_or_untagged_ranges}",
   "carrick-el1::memory::tests::{resident_anonymous_munmap_retires_under_exact_mm_guard,malformed_or_ineligible_munmap_preserves_linux_fallback}",
   "carrick-el1::memory::tests::delegated::two_isa_anonymous_edits_publish_to_a_live_peer",

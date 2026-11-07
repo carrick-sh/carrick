@@ -268,7 +268,7 @@ unsafe impl Sync for Root {}
 const fn pack_prot(prot: ReservationProtection) -> u16 {
     prot.bits() as u16
 }
-/// Lossless: validated node flags use ten bits.
+/// Lossless: validated node flags use eleven bits.
 const fn pack_flags(flags: ReservationNodeFlags) -> u16 {
     flags.bits() as u16
 }
@@ -1946,13 +1946,16 @@ impl<
             .iter()
             .any(|r| r.start() <= range.start() && range.end() <= r.end())
     }
-    /// Whether nodes the root's import marked [`ReservationNodeFlags::IMAGE`]
-    /// cover every byte of `range`: the root's own image outside its layout.
+    /// Whether every byte belongs to an imported image or a host-validated
+    /// external placement. Ordinary editable imported rows do not confer
+    /// authority outside the allocation layout.
     fn image_cover(&mut self, range: ReservationRange) -> bool {
         let mut cursor = range.start();
         while let Some(n) = self.next(cursor) {
             if n.start > cursor
-                || !Policy::flags(&n).contains(ReservationNodeFlags::IMAGE)
+                || !Policy::flags(&n).intersects(
+                    ReservationNodeFlags::IMAGE.union(ReservationNodeFlags::PLACED_OUTSIDE_LAYOUT),
+                )
                 || !Policy::root_editable(&n)
             {
                 return false;
@@ -1972,6 +1975,13 @@ impl<
         usize::from(self.straddles(range.start())) + usize::from(self.straddles(range.end()))
     }
     fn proposal(&mut self, proposal: ReservationProposal) -> Result<Decision, Refusal> {
+        self.proposal_with_external_placement(proposal, false)
+    }
+    fn proposal_with_external_placement(
+        &mut self,
+        proposal: ReservationProposal,
+        external_placement: bool,
+    ) -> Result<Decision, Refusal> {
         let ReservationProposal {
             range,
             protection: prot,
@@ -1994,19 +2004,21 @@ impl<
         {
             return Err(Refusal::PreparedConflict);
         }
-        if flags.contains(ReservationNodeFlags::IMAGE) {
+        if flags.contains(ReservationNodeFlags::IMAGE)
+            || (flags.contains(ReservationNodeFlags::PLACED_OUTSIDE_LAYOUT) && !external_placement)
+        {
             return Err(Refusal::Invalid);
         }
         // The layout bounds placement. Outside it the root edits only the
-        // image its own import adopted (typed by `IMAGE`); any other range
-        // there, however editable its nodes look, belongs to the host.
+        // image its import adopted or a host-validated external placement.
+        // Ordinary editable imported nodes confer no outside-layout authority.
         let image_edit = matches!(
             operation,
             ReservationOperation::Protect
                 | ReservationOperation::Retire
                 | ReservationOperation::Decommit
         ) && self.image_cover(range);
-        if !image_edit && !self.in_layout(range) {
+        if !external_placement && !image_edit && !self.in_layout(range) {
             return Err(Refusal::ForeignMapping);
         }
         // A retired resident extent's frames are unreusable until the
@@ -2371,6 +2383,43 @@ impl<
         backing: HostBackingIdentity,
     ) -> Result<Decision, Refusal> {
         Policy::mmap_private_file(self, placement, GuestLen::new(len), prot, backing)
+    }
+    /// Prepare an anonymous range outside the allocation layout. The host
+    /// placement authority validates user VA bounds, reserved apertures and
+    /// boot VMAs first. This exact root still checks collisions, owed returns,
+    /// limits and metadata before retaining the ordinary rollbackable proposal.
+    pub fn prepare_external_anonymous(
+        &mut self,
+        range: ReservationRange,
+        prot: ReservationProtection,
+    ) -> Result<Decision, Refusal> {
+        if !self.host_holder
+            || !self.host_proposal
+            || !range.start().is_multiple_of(4096)
+            || !range.end().is_multiple_of(4096)
+        {
+            return Err(Refusal::Invalid);
+        }
+        if self
+            .next(range.start())
+            .is_some_and(|node| node.start < range.end())
+        {
+            return Err(Refusal::Collision);
+        }
+        self.proposal_with_external_placement(
+            ReservationProposal {
+                range,
+                protection: prot,
+                operation: ReservationOperation::Prepare,
+                result: UserVa::new(range.start()),
+                policy_value: UserVa::new(self.brk_current()),
+                require_coverage: false,
+                source: None,
+                flags: ReservationNodeFlags::ANONYMOUS_PRIVATE
+                    .union(ReservationNodeFlags::PLACED_OUTSIDE_LAYOUT),
+            },
+            true,
+        )
     }
     pub fn munmap(&mut self, range: ReservationRange) -> Result<Decision, Refusal> {
         self.proposal(ReservationProposal {
@@ -2952,7 +3001,10 @@ impl<
             return Err(Refusal::Invalid);
         }
         // Image ownership is the import's alone.
-        if flags.contains(ReservationNodeFlags::IMAGE) && self.state().admitted {
+        if flags.intersects(
+            ReservationNodeFlags::PLACED_OUTSIDE_LAYOUT.union(ReservationNodeFlags::IMAGE),
+        ) && self.state().admitted
+        {
             return Err(Refusal::Invalid);
         }
         if self.pending().is_some() || self.state().fork_pending {

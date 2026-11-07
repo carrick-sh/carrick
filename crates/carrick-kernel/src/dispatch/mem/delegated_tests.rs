@@ -445,7 +445,7 @@ impl Root {
 
 fn call(
     dispatcher: &mut SyscallDispatcher,
-    memory: &mut CountingMmapMemory,
+    memory: &mut impl carrick_guest_mem::CurrentMmMemory,
     number: u64,
     args: [u64; 6],
 ) -> DispatchOutcome {
@@ -461,7 +461,7 @@ fn call(
 
 fn host_mmap(
     dispatcher: &mut SyscallDispatcher,
-    memory: &mut CountingMmapMemory,
+    memory: &mut impl carrick_guest_mem::CurrentMmMemory,
     address: u64,
     len: u64,
     prot: u64,
@@ -7117,4 +7117,688 @@ fn delegated_frame_grant_stock_probe_retains_busy_instead_of_losing_stock() {
             .with_resident_frame_grant_plan_for_test(base, STOCK_WINDOW, |plan| plan.stock)
             .unwrap()
     );
+}
+
+/// V8 commits its complete arena CodeRange, without a preceding page fault.
+#[test]
+fn delegated_whole_code_range_keeps_owner_protection() {
+    const START: u64 = 0x6020000000;
+    const LENGTH: u64 = 256 * 1024 * 1024;
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let mut memory = CountingMmapMemory::new(START, PAGE as usize);
+    memory.defer_anon = true;
+    let mapped = returned(host_mmap(
+        &mut dispatcher,
+        &mut memory,
+        START,
+        LENGTH,
+        0,
+        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | carrick_abi::LINUX_MAP_NORESERVE,
+        -1,
+    )) as u64;
+    assert_eq!(mapped, START);
+    assert!(root.lock().is_admitted());
+    memory.owner_protect_log.borrow_mut().clear();
+    memory.protect_log.borrow_mut().clear();
+    memory.fail_protect_non_zero.set(true);
+    assert_eq!(
+        returned(call(
+            &mut dispatcher,
+            &mut memory,
+            SYS_MPROTECT,
+            [mapped, LENGTH, 7, 0, 0, 0]
+        )),
+        0
+    );
+    assert_eq!(
+        *memory.owner_protect_log.borrow(),
+        vec![(START, LENGTH as usize, 7)]
+    );
+    assert!(memory.protect_log.borrow().is_empty());
+    assert_eq!(memory.zero_backing_calls.get(), 0);
+}
+
+/// A free Linux hint outside the arena must remain an owner reservation,
+/// rather than becoming an opaque host alias or moving into the arena.
+#[test]
+fn delegated_outside_hint_keeps_owner_protection() {
+    const HINT: u64 = 0x7000000000;
+    const LENGTH: u64 = 256 * 1024 * 1024;
+    for hint in [0, HINT] {
+        let mut dispatcher = SyscallDispatcher::new();
+        let _root = Root::admit(&dispatcher);
+        let mut memory = CountingMmapMemory::new(HINT, PAGE as usize);
+        memory.defer_anon = true;
+        let mapped = returned(host_mmap(
+            &mut dispatcher,
+            &mut memory,
+            hint,
+            LENGTH,
+            0,
+            LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+            -1,
+        )) as u64;
+        if hint != 0 {
+            assert_eq!(mapped, hint, "free hint must be honoured");
+        }
+        memory.owner_protect_log.borrow_mut().clear();
+        memory.protect_log.borrow_mut().clear();
+        for prot in [1, 3, 7] {
+            assert_eq!(
+                returned(call(
+                    &mut dispatcher,
+                    &mut memory,
+                    SYS_MPROTECT,
+                    [mapped, PAGE, prot, 0, 0, 0]
+                )),
+                0
+            );
+        }
+        assert_eq!(
+            *memory.owner_protect_log.borrow(),
+            vec![
+                (mapped, PAGE as usize, 1),
+                (mapped, PAGE as usize, 3),
+                (mapped, PAGE as usize, 7)
+            ]
+        );
+        assert!(
+            memory.protect_log.borrow().is_empty(),
+            "owner mapping entered legacy protection"
+        );
+        assert_eq!(memory.zero_backing_calls.get(), 0, "reservation stays lazy");
+        assert!(dispatcher.fault_requires_mm_mutation(mapped));
+        // A protection split retains external placement authority until retirement.
+        assert_eq!(
+            returned(call(
+                &mut dispatcher,
+                &mut memory,
+                SYS_MUNMAP,
+                [mapped, LENGTH, 0, 0, 0, 0]
+            )),
+            0
+        );
+        assert!(!dispatcher.fault_requires_mm_mutation(mapped));
+    }
+}
+
+#[test]
+fn delegated_outside_hint_collision_keeps_existing_owner() {
+    const HINT: u64 = 0x7000000000;
+    let mut dispatcher = SyscallDispatcher::new();
+    let _root = Root::admit(&dispatcher);
+    let mut memory = CountingMmapMemory::new(HINT, PAGE as usize);
+    memory.defer_anon = true;
+    let flags = LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS;
+    assert_eq!(
+        returned(host_mmap(
+            &mut dispatcher,
+            &mut memory,
+            HINT,
+            PAGE,
+            0,
+            flags,
+            -1
+        )),
+        HINT as i64
+    );
+    let second = returned(host_mmap(
+        &mut dispatcher,
+        &mut memory,
+        HINT,
+        PAGE,
+        0,
+        flags,
+        -1,
+    ));
+    assert_ne!(second, HINT as i64, "an occupied advisory hint relocates");
+    memory.owner_protect_log.borrow_mut().clear();
+    memory.protect_log.borrow_mut().clear();
+    memory.fail_protect_non_zero.set(true);
+    assert_eq!(
+        returned(call(
+            &mut dispatcher,
+            &mut memory,
+            SYS_MPROTECT,
+            [HINT, PAGE, 3, 0, 0, 0]
+        )),
+        0
+    );
+    assert_eq!(
+        returned(call(
+            &mut dispatcher,
+            &mut memory,
+            SYS_MPROTECT,
+            [second as u64, PAGE, 7, 0, 0, 0]
+        )),
+        0,
+        "relocated mapping from an occupied outside hint must stay owner-admitted"
+    );
+    assert_eq!(
+        *memory.owner_protect_log.borrow(),
+        vec![(HINT, PAGE as usize, 3), (second as u64, PAGE as usize, 7)]
+    );
+    assert!(memory.protect_log.borrow().is_empty());
+}
+
+#[test]
+fn delegated_outside_hint_avoids_rosetta_window() {
+    let mut dispatcher = SyscallDispatcher::new();
+    let _root = Root::admit(&dispatcher);
+    let hint = crate::memory::LINUX_ROSETTA_VA_BASE;
+    let mut memory = arena_memory();
+    memory.defer_anon = true;
+    let mapped = returned(host_mmap(
+        &mut dispatcher,
+        &mut memory,
+        hint,
+        PAGE,
+        0,
+        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+        -1,
+    ));
+    assert_ne!(
+        mapped, hint as i64,
+        "runtime aperture cannot become anonymous owner memory"
+    );
+    memory.owner_protect_log.borrow_mut().clear();
+    memory.protect_log.borrow_mut().clear();
+    memory.fail_protect_non_zero.set(true);
+    assert_eq!(
+        returned(call(
+            &mut dispatcher,
+            &mut memory,
+            SYS_MPROTECT,
+            [mapped as u64, PAGE, 7, 0, 0, 0]
+        )),
+        0,
+        "relocated mapping from a reserved runtime aperture must stay owner-admitted"
+    );
+    assert_eq!(
+        *memory.owner_protect_log.borrow(),
+        vec![(mapped as u64, PAGE as usize, 7)]
+    );
+    assert!(memory.protect_log.borrow().is_empty());
+}
+
+/// V8 `CodeRange::InitReservation` passes `&FunctionInStaticBinaryForAddressHint`
+/// rounded up to the page size — an address inside the PIE `.text` VMA at
+/// `LINUX_PIE_DEFAULT_BASE` (`0x88_0000_0000`), after an earlier 512 MiB cage
+/// reservation already occupies `0x60_0000_0000..0x60_2000_0000`. Guest in-ring
+/// decode forwards the outside-layout hint to the host, which sees the occupied
+/// PIE VMA and relocates into the arena at `0x60_2000_0000` (`412853731328`).
+/// That relocated 256 MiB reservation must remain owned by the MM root so both
+/// in-ring (AArch64 EL1 and x86_64 CPL0) and host-forwarded RWX `mprotect`
+/// publish through the owner rather than entering legacy sparse publication.
+#[test]
+fn delegated_occupied_pie_hint_relocates_to_owner_code_range() {
+    use carrick_el1::memory::{
+        AnonymousCall, AnonymousCallView, ReservationDisposition, decide_reservation_syscall,
+    };
+    use carrick_el1_abi::{CurrentTask, TrapFrame};
+    use carrick_guest_arch::{GuestIsa, UserVa};
+    use carrick_sched_core::SlotId;
+    use std::sync::atomic::Ordering;
+
+    const PRIOR_CAGE: u64 = 512 * 1024 * 1024;
+    const EXPECTED_CODE_RANGE: u64 = LINUX_MMAP_BASE + PRIOR_CAGE; // 0x60_2000_0000 (412853731328)
+    const LENGTH: u64 = 256 * 1024 * 1024;
+    let pie_base = crate::elf::LINUX_PIE_DEFAULT_BASE;
+    let pie_hint = pie_base + PAGE;
+
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_address_space_regions(vec![ProcMapsEntry {
+        start: pie_base,
+        end: pie_base + 4 * 1024 * 1024,
+        read: true,
+        write: false,
+        execute: true,
+        sharing: carrick_vfs::ProcMapSharing::Private,
+        path: "/usr/local/bin/node".to_owned(),
+    }]);
+    let root = Root::admit(&dispatcher);
+    assert_eq!(
+        root.guest_mmap(Placement::Anywhere, PRIOR_CAGE, ReservationProtection::NONE),
+        Ok(LINUX_MMAP_BASE)
+    );
+
+    let task = CurrentTask::new();
+    task.execution.task.store(117, Ordering::Relaxed);
+    task.mm.thread_generation.store(11, Ordering::Relaxed);
+    task.mm.key.store(root.mm.raw(), Ordering::Relaxed);
+
+    let flags = LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | carrick_abi::LINUX_MAP_NORESERVE;
+    for isa in [GuestIsa::Aarch64, GuestIsa::X86_64] {
+        let native = AnonymousCall::new(
+            carrick_core::CallOrdinal::from_raw(SYS_MMAP),
+            [pie_hint, LENGTH, 0, flags, u64::MAX, 0],
+            0,
+            SlotId::from_index(0).unwrap(),
+            UserVa::new(pie_hint),
+        );
+        let mut arm = TrapFrame::default();
+        arm.x[8] = SYS_MMAP;
+        arm.x[..6].copy_from_slice(&[pie_hint, LENGTH, 0, flags, u64::MAX, 0]);
+        let call_view: &dyn AnonymousCallView = match isa {
+            GuestIsa::Aarch64 => &arm,
+            GuestIsa::X86_64 => &native,
+        };
+        let mut model = root.lock();
+        assert!(
+            matches!(
+                decide_reservation_syscall(call_view, &task, &mut model, None),
+                ReservationDisposition::Forward
+            ),
+            "{isa:?} outside-layout PIE hint must forward to the host VMA check"
+        );
+    }
+
+    let mut memory = CountingMmapMemory::new(EXPECTED_CODE_RANGE, PAGE as usize);
+    memory.defer_anon = true;
+    memory.fail_protect_non_zero.set(true);
+    let mapped = returned(host_mmap(
+        &mut dispatcher,
+        &mut memory,
+        pie_hint,
+        LENGTH,
+        0,
+        flags,
+        -1,
+    )) as u64;
+    assert_eq!(mapped, EXPECTED_CODE_RANGE);
+    assert!(root.lock().is_admitted());
+
+    for advice in [
+        carrick_abi::LINUX_MADV_DONTFORK,
+        carrick_abi::LINUX_MADV_HUGEPAGE,
+    ] {
+        assert_eq!(
+            returned(call(
+                &mut dispatcher,
+                &mut memory,
+                SYS_MADVISE,
+                [mapped, LENGTH, advice, 0, 0, 0]
+            )),
+            0
+        );
+    }
+
+    memory.owner_protect_log.borrow_mut().clear();
+    memory.protect_log.borrow_mut().clear();
+    assert_eq!(
+        returned(call(
+            &mut dispatcher,
+            &mut memory,
+            SYS_MPROTECT,
+            [mapped, LENGTH, 7, 0, 0, 0]
+        )),
+        0,
+        "relocated 256 MiB code range at {mapped:#x} must publish RWX through the MM owner"
+    );
+    assert_eq!(
+        *memory.owner_protect_log.borrow(),
+        vec![(EXPECTED_CODE_RANGE, LENGTH as usize, 7)]
+    );
+    assert!(
+        memory.protect_log.borrow().is_empty(),
+        "relocated code range entered legacy sparse protection publication"
+    );
+    assert_eq!(memory.zero_backing_calls.get(), 0);
+
+    // Both guest ISAs must also recognize the relocated reservation in-ring.
+    for isa in [GuestIsa::Aarch64, GuestIsa::X86_64] {
+        let native = AnonymousCall::new(
+            carrick_core::CallOrdinal::from_raw(SYS_MPROTECT),
+            [mapped, LENGTH, 3, 0, 0, 0],
+            0,
+            SlotId::from_index(0).unwrap(),
+            UserVa::new(pie_hint),
+        );
+        let mut arm = TrapFrame::default();
+        arm.x[8] = SYS_MPROTECT;
+        arm.x[..6].copy_from_slice(&[mapped, LENGTH, 3, 0, 0, 0]);
+        let call_view: &dyn AnonymousCallView = match isa {
+            GuestIsa::Aarch64 => &arm,
+            GuestIsa::X86_64 => &native,
+        };
+        let mut model = root.lock();
+        match decide_reservation_syscall(call_view, &task, &mut model, None) {
+            ReservationDisposition::Work(pending) => {
+                pending.cancel(&mut model).unwrap();
+            }
+            other => panic!(
+                "{isa:?} relocated code range lost in-ring owner authority: {:?}",
+                matches!(other, ReservationDisposition::Forward)
+            ),
+        }
+    }
+
+    assert_eq!(
+        returned(call(
+            &mut dispatcher,
+            &mut memory,
+            SYS_MUNMAP,
+            [mapped, LENGTH, 0, 0, 0, 0]
+        )),
+        0
+    );
+
+    // Also cover V8 `AllocateAlignedMemory`'s over-allocated reservation + trim
+    // shape when the aligned PIE hint (`0x88_0000_0000`) collides with `.text`.
+    let padded = 2 * LENGTH;
+    let over_mapped = returned(host_mmap(
+        &mut dispatcher,
+        &mut memory,
+        pie_base,
+        padded,
+        0,
+        flags,
+        -1,
+    )) as u64;
+    assert_eq!(over_mapped, EXPECTED_CODE_RANGE);
+    assert_eq!(
+        returned(call(
+            &mut dispatcher,
+            &mut memory,
+            SYS_MUNMAP,
+            [over_mapped + LENGTH, LENGTH, 0, 0, 0, 0]
+        )),
+        0
+    );
+    memory.owner_protect_log.borrow_mut().clear();
+    memory.protect_log.borrow_mut().clear();
+    assert_eq!(
+        returned(call(
+            &mut dispatcher,
+            &mut memory,
+            SYS_MPROTECT,
+            [over_mapped, LENGTH, 7, 0, 0, 0]
+        )),
+        0
+    );
+    assert_eq!(
+        *memory.owner_protect_log.borrow(),
+        vec![(EXPECTED_CODE_RANGE, LENGTH as usize, 7)]
+    );
+    assert!(memory.protect_log.borrow().is_empty());
+    assert_eq!(
+        returned(call(
+            &mut dispatcher,
+            &mut memory,
+            SYS_MUNMAP,
+            [over_mapped, LENGTH, 0, 0, 0, 0]
+        )),
+        0
+    );
+}
+
+/// Real native host pages make a missing publication observable as a fault,
+/// rather than a recording-backend mismatch. This is a physical test venue,
+/// not evidence of VMM translation or signed guest execution.
+#[cfg(target_os = "linux")]
+#[test]
+fn serial_host_delegated_outside_hint_native_store_survives_protection() {
+    native_code_reservation(NativeCodeReservationCase::OutsideHintInterior);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn serial_host_delegated_whole_code_range_writes_and_executes() {
+    native_code_reservation(NativeCodeReservationCase::ArenaHintWhole);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn serial_host_delegated_occupied_pie_hint_code_range_writes_and_executes() {
+    native_code_reservation(NativeCodeReservationCase::OccupiedPieHintRelocatedWhole);
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeCodeReservationCase {
+    OutsideHintInterior,
+    ArenaHintWhole,
+    OccupiedPieHintRelocatedWhole,
+}
+
+#[cfg(target_os = "linux")]
+fn native_code_reservation(case: NativeCodeReservationCase) {
+    struct NativePages {
+        start: u64,
+        len: usize,
+        publications: Vec<(u64, usize, u64)>,
+    }
+    impl NativePages {
+        fn reserve(start: u64, len: usize) -> Self {
+            // SAFETY: NOREPLACE never overwrites existing process storage.
+            let ptr = unsafe {
+                libc::mmap(
+                    start as *mut libc::c_void,
+                    len,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE
+                        | libc::MAP_ANONYMOUS
+                        | libc::MAP_NORESERVE
+                        | libc::MAP_FIXED_NOREPLACE,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(ptr, libc::MAP_FAILED, "{}", std::io::Error::last_os_error());
+            assert_eq!(ptr as u64, start);
+            Self {
+                start,
+                len,
+                publications: Vec::new(),
+            }
+        }
+        fn contains(&self, address: u64, len: usize) -> bool {
+            address >= self.start
+                && address
+                    .checked_add(len as u64)
+                    .is_some_and(|end| end <= self.start + self.len as u64)
+        }
+    }
+    impl Drop for NativePages {
+        fn drop(&mut self) {
+            // SAFETY: this fixture exclusively owns the retained host mapping.
+            assert_eq!(unsafe { libc::munmap(self.start as *mut _, self.len) }, 0);
+        }
+    }
+    impl GuestMemory for NativePages {
+        fn supports_lazy_anonymous_mmap(&self) -> bool {
+            true
+        }
+        fn read_bytes_raw(&self, _: u64, _: usize) -> Result<Vec<u8>, MemoryError> {
+            Err(MemoryError::Unsupported)
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            Err(MemoryError::Unsupported)
+        }
+        fn protect_range(
+            &mut self,
+            address: u64,
+            len: usize,
+            prot: u64,
+        ) -> Result<(), MemoryError> {
+            // Permit only the initial inaccessible reservation, so the red
+            // witness reaches hint placement rather than failing on setup.
+            assert_eq!(
+                prot, 0,
+                "owner mapping entered legacy protection publication"
+            );
+            self.protect_owner_reserved_range(address, len, prot)
+        }
+        fn protect_owner_reserved_range(
+            &mut self,
+            address: u64,
+            len: usize,
+            prot: u64,
+        ) -> Result<(), MemoryError> {
+            assert!(self.contains(address, len));
+            // SAFETY: checked subrange of our live allocation. Linux protection
+            // bits R/W/X match this native physical test venue's libc bits.
+            assert_eq!(
+                unsafe { libc::mprotect(address as *mut _, len, prot as i32) },
+                0
+            );
+            self.publications.push((address, len, prot));
+            Ok(())
+        }
+        fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+            self.protect_owner_reserved_range(address, len, 0)
+        }
+        fn zero_pending_backing(
+            &mut self,
+            request: carrick_el1_abi::ReservationRequest,
+        ) -> Result<(), MemoryError> {
+            let range = request.range;
+            assert!(self.contains(range.start(), range.len() as usize));
+            // SAFETY: discard only our private anonymous physical venue. This
+            // restores zero-on-next-touch even after the test's native stores.
+            assert_eq!(
+                unsafe {
+                    libc::madvise(
+                        range.start() as *mut _,
+                        range.len() as usize,
+                        libc::MADV_DONTNEED,
+                    )
+                },
+                0
+            );
+            Ok(())
+        }
+    }
+
+    impl carrick_guest_mem::CurrentMmMemory for NativePages {}
+
+    const HINT: u64 = 0x7000000000;
+    const PRIOR_CAGE: u64 = 512 * 1024 * 1024;
+    const LENGTH: u64 = 256 * 1024 * 1024;
+    let whole = case != NativeCodeReservationCase::OutsideHintInterior;
+    let pie_base = crate::elf::LINUX_PIE_DEFAULT_BASE;
+    let specs: Vec<(u64, u64)> = match case {
+        NativeCodeReservationCase::OutsideHintInterior => {
+            vec![(0, LINUX_MMAP_BASE), (HINT, HINT)]
+        }
+        NativeCodeReservationCase::ArenaHintWhole => vec![(0x6020000000, 0x6020000000)],
+        NativeCodeReservationCase::OccupiedPieHintRelocatedWhole => {
+            vec![(pie_base + PAGE, LINUX_MMAP_BASE + PRIOR_CAGE)]
+        }
+    };
+    for (hint, expected) in specs {
+        let mut dispatcher = SyscallDispatcher::new();
+        if case == NativeCodeReservationCase::OccupiedPieHintRelocatedWhole {
+            dispatcher.set_address_space_regions(vec![ProcMapsEntry {
+                start: pie_base,
+                end: pie_base + 4 * 1024 * 1024,
+                read: true,
+                write: false,
+                execute: true,
+                sharing: carrick_vfs::ProcMapSharing::Private,
+                path: "/usr/local/bin/node".to_owned(),
+            }]);
+        }
+        let root = Root::admit(&dispatcher);
+        if case == NativeCodeReservationCase::OccupiedPieHintRelocatedWhole {
+            assert_eq!(
+                root.guest_mmap(Placement::Anywhere, PRIOR_CAGE, ReservationProtection::NONE),
+                Ok(LINUX_MMAP_BASE)
+            );
+        }
+        let mut memory = NativePages::reserve(expected, LENGTH as usize);
+        let mapped = returned(host_mmap(
+            &mut dispatcher,
+            &mut memory,
+            hint,
+            LENGTH,
+            0,
+            LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | carrick_abi::LINUX_MAP_NORESERVE,
+            -1,
+        )) as u64;
+        assert_eq!(
+            mapped, expected,
+            "free hint must be honoured; occupied PIE hint relocates to next arena gap"
+        );
+        assert!(root.lock().is_admitted());
+        if case == NativeCodeReservationCase::OccupiedPieHintRelocatedWhole {
+            for advice in [
+                carrick_abi::LINUX_MADV_DONTFORK,
+                carrick_abi::LINUX_MADV_HUGEPAGE,
+            ] {
+                assert_eq!(
+                    returned(call(
+                        &mut dispatcher,
+                        &mut memory,
+                        SYS_MADVISE,
+                        [mapped, LENGTH, advice, 0, 0, 0]
+                    )),
+                    0
+                );
+            }
+        }
+        memory.publications.clear();
+        // Preserve the interior-range control; the V8 cases commit every page.
+        let writable = if whole { mapped } else { mapped + PAGE };
+        let writable_len = if whole { LENGTH } else { LENGTH - 2 * PAGE };
+        let protections: &[u64] = if whole { &[7] } else { &[1, 3, 7, 3] };
+        for &prot in protections {
+            assert_eq!(
+                returned(call(
+                    &mut dispatcher,
+                    &mut memory,
+                    SYS_MPROTECT,
+                    [writable, writable_len, prot, 0, 0, 0]
+                )),
+                0
+            );
+            assert_eq!(
+                memory.publications.last(),
+                Some(&(writable, writable_len as usize, prot)),
+                "mprotect succeeded without publishing the owner protection"
+            );
+            if prot & 2 != 0 {
+                // SAFETY: dispatch must have published RW on this actual native
+                // allocation. No byte-copy mock can make these stores succeed.
+                unsafe {
+                    let first = writable as *mut u8;
+                    let last = (writable + writable_len - 1) as *mut u8;
+                    first.write_volatile(prot as u8);
+                    last.write_volatile(0xa5);
+                    assert_eq!(first.read_volatile(), prot as u8);
+                    assert_eq!(last.read_volatile(), 0xa5);
+                }
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        if whole {
+            // SAFETY: the complete range has just been made RWX by production
+            // dispatch. Write `mov eax, 42; ret` and execute in this allocation.
+            unsafe {
+                let code = [0xb8u8, 42, 0, 0, 0, 0xc3];
+                std::ptr::copy_nonoverlapping(code.as_ptr(), writable as *mut u8, code.len());
+                let function: unsafe extern "C" fn() -> u32 =
+                    std::mem::transmute(writable as usize);
+                assert_eq!(function(), 42);
+            }
+        }
+        assert_eq!(
+            memory.publications,
+            protections
+                .iter()
+                .map(|&prot| (writable, writable_len as usize, prot))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            returned(call(
+                &mut dispatcher,
+                &mut memory,
+                SYS_MUNMAP,
+                [mapped, LENGTH, 0, 0, 0, 0]
+            )),
+            0
+        );
+        assert!(!dispatcher.fault_requires_mm_mutation(mapped));
+    }
 }

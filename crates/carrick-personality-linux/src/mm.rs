@@ -372,6 +372,6 @@ mod flag_tests {
             ReservationNodeFlags::ANONYMOUS.protection_ceiling(ReservationProtection::READ),
             ReservationProtection::READ
         );
-        assert_eq!(ReservationNodeFlags::from_bits(1 << 10), None);
+        assert_eq!(ReservationNodeFlags::from_bits(1 << 11), None);
     }
 }
