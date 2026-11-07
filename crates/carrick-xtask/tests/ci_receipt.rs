@@ -3224,6 +3224,16 @@ fn kvm_recipe_without_tests_fails_receipt_and_comparison() {
         let receipt: AcceptReceipt =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(receipt.overall, "FAIL");
+        if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            assert!(receipt.steps.is_empty());
+            assert!(
+                receipt
+                    .failures
+                    .iter()
+                    .any(|reason| reason.contains("KVM requires Linux x86_64"))
+            );
+            continue;
+        }
         let step = &receipt.steps[0];
         assert_eq!(step.exit_code, Some(code));
         assert!(step.started_tests.is_empty());
@@ -3334,5 +3344,36 @@ fn kvm_workflow_rejects_zero_execution_but_preserves_named_failures() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(root.join("target/ci-receipts/receipt.json").is_file());
+    }
+}
+
+#[test]
+fn refused_profile_writes_failure_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nested/receipt.json");
+    for profile in ["kvm", "linux-portable", "el1-native"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .args([
+                "accept",
+                "--profile",
+                profile,
+                "--phase",
+                "signed",
+                "--receipt",
+            ])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let receipt: AcceptReceipt =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(receipt.overall, "FAIL");
+        assert_eq!(receipt.profile, profile);
+        assert!(
+            receipt
+                .failures
+                .iter()
+                .any(|reason| reason.contains("supports the host phase only"))
+        );
     }
 }
