@@ -96,6 +96,7 @@ fn automatic_request(
             if event["action"] == "checks_requested"
                 && event["merge_group"]["base_ref"] == "refs/heads/main"
                 && git_ref.starts_with("refs/heads/gh-readonly-queue/main/")
+                && parse_queue_ref_pr(git_ref).is_some()
                 && event["merge_group"]["head_ref"] == git_ref =>
         {
             (
@@ -212,7 +213,7 @@ pub fn label_authorized(events: &[Value], sender: &str) -> bool {
             e["event"] == "labeled" && e["actor"]["login"] == sender && allowed(sender)
         })
 }
-const MERGE_QUEUE_QUERY: &str = "query { repository(owner: \"carrick-sh\", name: \"carrick\") { mergeQueue(branch: \"main\") { entries(first: 100) { nodes { baseCommit { oid } headCommit { oid } pullRequest { number baseRefName baseRepository { nameWithOwner } } } } } } }";
+const MERGE_QUEUE_QUERY: &str = "query { repository(owner: \"carrick-sh\", name: \"carrick\") { mergeQueue(branch: \"main\") { entries(first: 100) { nodes { baseCommit { oid } headCommit { oid } pullRequest { number baseRefName baseRepository { nameWithOwner } } } pageInfo { hasNextPage } } } } }";
 
 fn merge_queue_entries() -> Result<Vec<Value>, ReceiptError> {
     let graphql_text = checked(
@@ -229,12 +230,19 @@ fn merge_queue_entries() -> Result<Vec<Value>, ReceiptError> {
     if !graphql["errors"].is_null() {
         return Err(fail("mergeQueue GraphQL query returned errors"));
     }
-    Ok(
-        graphql["data"]["repository"]["mergeQueue"]["entries"]["nodes"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default(),
-    )
+    let entries = &graphql["data"]["repository"]["mergeQueue"]["entries"];
+    let nodes = entries["nodes"]
+        .as_array()
+        .ok_or_else(|| fail("mergeQueue response is missing entry nodes"))?;
+    if entries["pageInfo"]["hasNextPage"]
+        .as_bool()
+        .ok_or_else(|| fail("mergeQueue response is missing pagination data"))?
+    {
+        return Err(fail(
+            "mergeQueue has more than 100 entries; refusing partial authorization",
+        ));
+    }
+    Ok(nodes.clone())
 }
 
 fn live_main_queue_entry(entries: &[Value], sha: &str) -> bool {
@@ -250,8 +258,14 @@ fn parse_queue_ref_pr(git_ref: &str) -> Option<u64> {
     let rest = git_ref
         .strip_prefix("refs/heads/gh-readonly-queue/main/pr-")
         .or_else(|| git_ref.strip_prefix("gh-readonly-queue/main/pr-"))?;
-    let digits = rest.split('-').next()?;
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    let (digits, suffix) = rest.split_once('-')?;
+    if digits.is_empty()
+        || !digits.bytes().all(|b| b.is_ascii_digit())
+        || suffix.is_empty()
+        || !suffix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
         return None;
     }
     digits.parse::<u64>().ok().filter(|&n| n > 0)
@@ -277,11 +291,9 @@ fn resolve_merge_group_prs(
     let queued_ordered: Vec<&str> = rev_list.lines().filter(|s| !s.is_empty()).collect();
     let group_commits: std::collections::BTreeSet<&str> = queued_ordered.iter().copied().collect();
     let mut prs = std::collections::BTreeSet::new();
-    let mut api_prs = std::collections::BTreeSet::new();
     let mut matched_commits = std::collections::BTreeSet::new();
-    if let Some(number) = parse_queue_ref_pr(git_ref) {
-        prs.insert(number);
-    }
+    let queue_pr = parse_queue_ref_pr(git_ref)
+        .ok_or_else(|| fail("merge-group ref does not contain a valid queue PR number"))?;
     let remote_refs = checked(
         "git",
         &[
@@ -308,13 +320,17 @@ fn resolve_merge_group_prs(
             && let Some(number) = node["pullRequest"]["number"].as_u64()
         {
             prs.insert(number);
-            api_prs.insert(number);
             matched_commits.insert(oid.to_owned());
         }
     }
-    if parse_queue_ref_pr(git_ref).is_some_and(|number| !api_prs.contains(&number)) {
+    if !queue_entries.iter().any(|node| {
+        node["headCommit"]["oid"] == requested_sha
+            && node["pullRequest"]["number"].as_u64() == Some(queue_pr)
+            && node["pullRequest"]["baseRefName"] == "main"
+            && node["pullRequest"]["baseRepository"]["nameWithOwner"] == REPOSITORY
+    }) {
         return Err(fail(
-            "merge-group ref does not identify a live entry in the main merge queue",
+            "merge-group head is not the live entry named by its main queue ref",
         ));
     }
     // If an earlier group (or this group) merged onto main before mergeQueue was
@@ -330,16 +346,27 @@ fn resolve_merge_group_prs(
         queued_ordered.len()
     };
     for &commit_sha in &queued_ordered[..fallback_end] {
+        if matched_commits.contains(commit_sha) {
+            continue;
+        }
+        let mut attributed = false;
         for pull in pages(
             &format!("repos/{REPOSITORY}/commits/{commit_sha}/pulls?per_page=100"),
             None,
         )? {
             if pull["base"]["ref"] == "main"
                 && pull["base"]["repo"]["full_name"] == REPOSITORY
+                && pull["merged_at"].as_str().is_some()
                 && let Some(number) = pull["number"].as_u64()
             {
                 prs.insert(number);
+                attributed = true;
             }
+        }
+        if !attributed {
+            return Err(fail(format!(
+                "predecessor commit {commit_sha} is not attributed to a merged main PR"
+            )));
         }
     }
     if prs.is_empty() {
