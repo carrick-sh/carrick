@@ -1073,13 +1073,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if !carrick_abi::getrandom_flags_valid(flags) {
             capacity = 0;
         }
-        while capacity != 0 {
+        // Permissions and COW are page-granular. Prepare each bounded piece
+        // once: halving a failed whole range loses valid bytes before a fault.
+        let mut prepared = 0;
+        while prepared < capacity {
+            let Some(next) = address.raw().checked_add(prepared as u64) else {
+                break;
+            };
+            let count = (4096 - (next as usize & 4095)).min(capacity - prepared);
+            let target = UserVa::new(next);
             match self.prepare_owner_output(carrick_core::mm::transaction::CopyoutRequest {
-                address,
-                len: carrick_guest_arch::GuestLen::new(capacity as u64),
+                address: target,
+                len: carrick_guest_arch::GuestLen::new(count as u64),
             }) {
-                Ok(()) => break,
-                Err(NativeProcessError::Fault) => capacity /= 2,
+                Ok(()) => prepared += count,
+                Err(NativeProcessError::Fault) => break,
                 Err(NativeProcessError::Busy) => {
                     return self.begin_service_inner(
                         ServiceOperation::CarrierWork {
@@ -1105,7 +1113,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 Err(NativeProcessError::Unsupported) => {
                     let (fault, sequence) = self
                         .service
-                        .copyout_fault(address)
+                        .copyout_fault(target)
                         .ok_or(NativeProcessError::Unsupported)?;
                     return self.begin_service_inner(
                         ServiceOperation::Fault(fault),
@@ -1118,6 +1126,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 Err(error) => return Err(error),
             }
         }
+        capacity = prepared;
         let mut record =
             alloc::vec![0; entropy::ENTROPY_HEADER_BYTES + capacity].into_boxed_slice();
         entropy::encode_request(&mut record, flags).map_err(|_| NativeProcessError::Invalid)?;
@@ -2884,7 +2893,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     Err(NativeProcessError::Quarantined)
                 }
                 (ServiceOperation::Entropy { .. }, ServiceResult::Supplied) => {
-                    // No retained entropy payload has been admitted here yet.
+                    // Supplied requires a valid reply in the retained entropy record.
                     Err(NativeProcessError::Quarantined)
                 }
                 (ServiceOperation::Entropy { .. }, ServiceResult::Cancelled) => {

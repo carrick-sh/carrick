@@ -6482,11 +6482,13 @@ fn sigprocmask_set_owner_wait_redispatches_before_effects() {
 /// Production service admission owns the allocation until the exact ACK;
 /// deterministic bytes isolate transport custody from the carrier RNG.
 #[test]
+#[cfg(test)]
 fn entropy_service_retains_reply_through_busy_and_resume() {
     entropy_service_retained_cursor(false);
 }
 
 #[test]
+#[cfg(test)]
 fn entropy_service_retains_reply_through_owner_wait_and_resume() {
     entropy_service_retained_cursor(true);
 }
@@ -6701,22 +6703,27 @@ enum EntropyReplyCase {
 }
 
 #[test]
+#[cfg(test)]
 fn entropy_service_first_byte_fault_returns_efault() {
     entropy_service_result(EntropyReplyCase::FirstFault);
 }
 #[test]
+#[cfg(test)]
 fn entropy_service_accessible_prefix_is_a_short_read() {
     entropy_service_result(EntropyReplyCase::Prefix);
 }
 #[test]
+#[cfg(test)]
 fn entropy_service_flags_precede_output_fault() {
     entropy_service_result(EntropyReplyCase::InvalidFlags);
 }
 #[test]
+#[cfg(test)]
 fn entropy_service_cancellation_before_reply_releases_payload() {
     entropy_service_result(EntropyReplyCase::CancelBeforeReply);
 }
 #[test]
+#[cfg(test)]
 fn entropy_service_cancellation_after_reply_keeps_generated_bytes() {
     entropy_service_result(EntropyReplyCase::CancelAfterReply);
 }
@@ -6895,6 +6902,7 @@ fn entropy_service_result(case: EntropyReplyCase) {
 }
 
 #[test]
+#[cfg(test)]
 fn entropy_service_preparation_busy_retries_before_generation() {
     use carrick_core_abi::service::{ServiceCell, ServiceOperation};
     let fixture = native_exec_fixture();

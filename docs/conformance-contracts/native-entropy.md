@@ -11,7 +11,11 @@ coverage or a hardened trust boundary.
 The native ARM exit stages ordinal 278 as a typed entropy request instead of
 an ordinal-only Crossing. The ring owns a record bounded to 4096 output bytes.
 The child's exact MM prepares the accessible output prefix before publication,
-including COW preparation. A preparation refusal yields through the existing
+including COW preparation, in at most two page-sized pieces. A 13-byte
+request with eight writable bytes was red at six staged bytes; the page-wise
+preparation now retains all eight. First-byte faults require one preparation
+and invalid flags zero; the service witnesses count these operations.
+A preparation refusal yields through the existing
 service owner and retries before generating bytes. Invalid flags reach the
 shared handler before any output-memory error.
 
