@@ -99,14 +99,12 @@ impl NativeShapeTarget {
         let parsed =
             Cli::from_arg_matches(&matches).with_context(|| format!("decode {label} target"))?;
         let Commands::Run {
-            image,
-            run_args,
-            command: target_command,
-            ..
+            run_args, target, ..
         } = parsed.command
         else {
             bail!("{label} target must be a run subcommand");
         };
+        let (image, target_command) = crate::args::split_target(target)?;
         let exec_backend = run_args.exec_backend;
         if !allowed.contains(&exec_backend) {
             bail!(

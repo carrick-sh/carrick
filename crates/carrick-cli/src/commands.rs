@@ -133,10 +133,9 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     ..RunArgs::default()
                 },
                 exec_args: ExecutionArgs::default(),
-                image,
+                target: vec![image, "/bin/sh".to_owned()],
                 json: false,
                 detach: false,
-                command: vec!["/bin/sh".to_owned()],
             }
         }
         other => other,
@@ -534,11 +533,11 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::Run {
             run_args,
             exec_args,
-            image,
+            target,
             json,
             detach,
-            command,
         } => {
+            let (image, command) = crate::args::split_target(target)?;
             // Apply forwarded env BEFORE anything reads it (e.g. host_facts'
             // CPU-count cache). CLI args survive sudo's env_reset where a bare
             // `sudo VAR=val` is rejected without SETENV in sudoers.
@@ -721,11 +720,8 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::Stop { time, containers } => crate::lifecycle::stop(time, &containers)?,
         Commands::Kill { signal, containers } => crate::lifecycle::kill(&signal, &containers)?,
         Commands::Rm { force, containers } => crate::lifecycle::rm(force, &containers)?,
-        Commands::Create {
-            run_args,
-            image,
-            command,
-        } => {
+        Commands::Create { run_args, target } => {
+            let (image, command) = crate::args::split_target(target)?;
             let req = build_launch_request(
                 carrick_spec::ImageSource::Oci(image),
                 &run_args,
@@ -748,18 +744,20 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             user,
             workdir,
             env,
-            container,
-            command,
-        } => crate::lifecycle::exec(crate::lifecycle::ExecArgs {
-            store: store.clone(),
-            spec: &container,
-            command,
-            interactive,
-            tty,
-            user,
-            workdir,
-            env,
-        })?,
+            target,
+        } => {
+            let (container, command) = crate::args::split_target(target)?;
+            crate::lifecycle::exec(crate::lifecycle::ExecArgs {
+                store: store.clone(),
+                spec: &container,
+                command,
+                interactive,
+                tty,
+                user,
+                workdir,
+                env,
+            })?
+        }
         Commands::DispatchSyscall {
             number,
             args,
