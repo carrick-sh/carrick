@@ -11,10 +11,14 @@ for admits it only after the controller re-vets that run
 the controller binary in `/root/carrick-ci/bin` carries this, so deploying it
 needs a controller restart, not a template rebuild.
 
-The same standing service also serves issue-label agent clones from the
-active agent template (9000/9001); see [dispatch-worker.md](dispatch-worker.md) for the four-clone budget,
-runner-independent credentials and VM-local leases. The KVM placement
-and its two-clone budget below are separate from the agent budget.
+The same standing service used to serve GitHub Actions dispatch clones from
+the agent template (9000/9001). Actions dispatch was retired on 2026-11-07:
+the director now starts worker VMs from template 9001 on carrick-hz itself,
+with `conductor worker start` from carrick-sh/agy-director. The controller's
+agent lane admits no job any more; it only reconciles and reaps rows left
+from before the retirement. The agent template build, qualification and
+retirement checks below still apply to 9000/9001. The KVM placement and its
+two-clone budget below are unchanged.
 
 This is trusted-ref CI infrastructure for an experimental project, not an
 adversarial isolation boundary.
@@ -116,11 +120,6 @@ workflow (dispatch requires both `actor` and `triggering_actor` to be
 `tjfontaine`); merge groups, pull requests and schedules are refused. The HVF
 lane runs on the same events on cloudmac. The optional HVF full-conformance
 closure runs only on owner dispatch when enabled, on a separate runner.
-For `dispatch-worker.yml` the hook also admits a chained round (#1241
-part 3): `workflow_dispatch` on `main` started and triggered by
-`github-actions[bot]`. The controller has already re-verified the chain
-outcome its guard named before minting that clone
-([dispatch docs](dispatch-worker.md#rounds-chain-1241-part-3)).
 `ci.yml` continues running its own PR, merge-group, push, schedule and
 dispatch lanes; only `ci-ok` is required for merging. Pre-merge hardware
 evidence belongs to the director; these post-landing runs are the backstop.
@@ -215,7 +214,6 @@ Wants=network-online.target
 
 [Service]
 LoadCredentialEncrypted=gh-token:/etc/credstore.encrypted/carrick-ci-gh-token
-LoadCredentialEncrypted=dispatch-app-key:/etc/credstore.encrypted/carrick-dispatch-app-key
 Environment=PATH=/root/carrick-ci/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # `$$` passes `$` to the shell; systemd would otherwise substitute it.
 ExecStart=/bin/sh -c 'GH_TOKEN=$$(cat "$${CREDENTIALS_DIRECTORY}/gh-token"); export GH_TOKEN; exec /root/carrick-ci/bin/carrick-xtask ci-scaler standing --runner-group-id 1 --max-concurrency 2 --max-agent-clones 6'
@@ -240,47 +238,15 @@ Willow's "forward over SSH stdin, never write it on the host", because a
 standing service must survive reboots. See
 [the security review](willow-pilot-security-review.md#contabo-standing-credential).
 
-## Dispatch App key
+## Retired dispatch App key
 
-The controller mints the dispatch tool server's publish and board tokens on
-demand (#1012; flow in [dispatch-worker.md](dispatch-worker.md#accounts-and-credentials)).
-It reads the `carrick-workers` App private key (PEM) from
-`$CREDENTIALS_DIRECTORY/dispatch-app-key`, loaded by the unit's second
-`LoadCredentialEncrypted=` line from
-`/etc/credstore.encrypted/carrick-dispatch-app-key` (root 0600). The owner
-pipes the key in on stdin
-(`systemd-creds encrypt --name=dispatch-app-key - /etc/credstore.encrypted/carrick-dispatch-app-key`)
-and never prints it. The key never enters a clone or GitHub Actions. The owner
-token stored beside it is already more powerful than the App key, so a host
-compromise already exposes more than this adds. The Mac minter keeps its own
-copy for the secrets other jobs still read.
-
-Without the credential the controller logs `no dispatch-app-key credential`
-at start and refuses every request as `unconfigured`; dispatch then publishes
-with the job token and records that reason.
-
-The exchange uses only the scoped PVE token's existing guest-agent exec
-right. At provisioning, an agent clone gets two more runner-owned 0600 files
-in `/run/carrick-ci`: `token-request` and `token-response`. The assignment
-worker polls each running, approved agent clone's request every three seconds.
-It writes the answer through the exec call's stdin (`input-data`), so a token
-never appears in a guest command line. It empties the request (only while it
-still holds the answered nonce) before writing the answer, so a back-to-back
-request is never lost. The runner owns both files and could hold their locks,
-so each guest script waits at most three seconds for a lock and is killed
-after ten. The controller's admission lock covers only ledger reads and saves,
-never guest calls, GitHub reads or the mint; the budget entry is still saved
-before the mint.
-
-The controller keeps each token it minted in memory beside the clone's row,
-never in the ledger. Once that row is no longer running (its job finished and
-it is reaping or gone), it revokes the tokens with
-`DELETE /installation/token`, best effort, ten-second bound, token in curl's
-stdin config. Tokens forgotten by a controller restart expire within the
-hour. The ledger row's `mints` field records
-each answered nonce, scope, job and refusal reason (never a token), before any
-mint is attempted. The journal logs `vm=<id> minted a publish token` or
-`token request refused: <reason>`, never token bytes.
+The controller no longer mints App tokens: that served the retired Actions
+dispatch tool server (#1012). It reads no `dispatch-app-key` credential. A
+host unit that still has a `LoadCredentialEncrypted=dispatch-app-key` line
+keeps starting; remove that line and
+`/etc/credstore.encrypted/carrick-dispatch-app-key` at the next controller
+deploy. Ledger rows written before the retirement may carry a `mints` field;
+the controller ignores it.
 
 ## VM-local leases (owner decision #639)
 
@@ -300,13 +266,13 @@ owner disabled that file on ctb-w1..w4 on 2026-10-18 and retires it from VM
 authorized keys and sshd drop-in. Workers must not perform those
 administrative changes.
 
-The [agent dispatch provider](dispatch-worker.md) shares the existing ledger,
-VMID pool, admission checks, assignment re-vetting, deadlines and destruction
-path with `willow-kvm`. Its active template is VM 9001 (9000 retained until unreferenced), with 8 vCPU and 20 GiB per
-clone and at most four live agent clones. KVM capacity is counted separately.
-Clones are destroyed after one job, including failed or timed-out jobs. The
-owner deploys the controller and verifies the live trial; portable tests alone
-do not establish deployed acceptance.
+The agent lane shares the existing ledger, VMID pool, reconciliation and
+destruction path with `willow-kvm`. Since the Actions dispatch retirement it
+admits no job: `--max-agent-clones` and `CARRICK_AGENT_CLONES` are still
+accepted so deployed units keep starting, and the lane only reconciles and
+reaps rows left from before. Removing the lane, its flag and its ledger rows needs a coordinated
+unit change on each host and is a follow-up. KVM capacity is counted
+separately.
 
 ## Debugging
 
@@ -374,8 +340,8 @@ Agent template slots are the typed set **9000 and 9001**, outside
 shared Rust toolchain, #1521) for new clones; 9001 remains a protected base
 until its last linked clone is destroyed.
 Their provisioning addresses are `10.77.0.150` and `10.77.0.151`, respectively.
-KVM source 300 and clone VMIDs 308–349 are unchanged. No clone drain or pause
-in dispatch is required while the new template builds.
+KVM source 300 and clone VMIDs 308–349 are unchanged. No clone drain is
+required while the new template builds.
 
 The director announces the rollout before and after on #231. Build one
 slot at a time. Keep the existing controller serving 9000 while staging
@@ -412,11 +378,12 @@ reads the clone's `qualification.json`, and destroys the clone on success
 or failure. Failure diagnostics go to stderr; keep that log together with
 `clone-qualification.json`. Cleanup failure is itself a failed qualification.
 The base template remains available for diagnosis. The qualification command
-does not register a GitHub runner or exercise a dispatch job.
+does not register a GitHub runner or start a worker.
 
 Do not infer readiness from the base manifest alone. Before redeploying the
 controller, record the qualification result and before/after cutover notes
-on #231, then verify a real fresh dispatch job including runner registration.
+on #231, then verify a fresh worker VM from the new template
+(`conductor worker start`).
 The 9001 readiness incident has not been diagnosed merely by adding this gate;
 collect clone cloud-init, network and service diagnostics on the PVE host.
 
@@ -429,11 +396,11 @@ pveum acl modify /vms/9001 --roles PVETemplateUser --tokens 'ci-scaler@pve!elast
 
 Install the new controller binary and restart its service with the existing
 ledger. Startup checks the new source's template flag, resource shape,
-firewall and exact `VM.Audit`/`VM.Clone` rights before dispatching. Newly
+firewall and exact `VM.Audit`/`VM.Clone` rights before admitting work. Newly
 admitted clones use the active site row. Existing clones resume their own
 VMs, retaining the old linked base; neither their disks nor their ledger
-identities are rewritten. Validate a fresh dispatch round's worker KVM
-access and lease handoff; record the actual KVM test, template manifest and
+identities are rewritten. Validate a fresh worker VM's KVM access and
+VM-local lease; record the actual KVM test, template manifest and
 controller SHA in the rollout evidence. For the next rotation, change the
 site row back to the other qualified slot before deploying the controller.
 
@@ -479,7 +446,7 @@ the new source keep their own linked base and resume as before. This
 rollback is valid **only while the old template still exists with its
 `PVETemplateUser` ACL grants and its `/etc/pve/firewall/<old VMID>.fw`**;
 the restored controller depends on all of them. Do not retire the old slot
-until the new controller has passed a live dispatch round.
+until a fresh worker VM from the new template has passed a live round.
 
 After retirement there is no binary rollback. Rolling back then means
 rebuilding a template in the freed slot with this procedure, and because
@@ -525,7 +492,8 @@ scoped privileged path for capture rounds, and no general root. The
 carrick-87 review narrowed it further: root bpftrace with a free-form
 program (`-e PROG`) can read any process's memory and any file, including
 the loop and runner tokens and `redaction-secrets.json`, which would erase
-the loop/worker uid separation in [dispatch-worker.md](dispatch-worker.md).
+the separation between the worker account and the accounts that hold
+credentials.
 Agent templates built from this script therefore:
 
 - install Debian's `bpftrace`;
@@ -649,11 +617,11 @@ document it:
    controller, and flip the Contabo site row (`agent_template` in
    `crates/carrick-xtask/src/ci_scaler/site.rs`, Blue → Green) in its own
    PR. Deploy that controller and restart it on the existing ledger.
-5. Verify a fresh dispatch round, rerun #1600's capture round with
+5. Verify a fresh worker VM, rerun #1600's capture round with
    `sudo carrick-capture signal-kill-sender --seconds N`, then announce on
    #231 how the other session would notice a broken template:
-   `qualify-clone` or `verify-capture` failures, or dispatch clones that
-   never become ready.
+   `qualify-clone` or `verify-capture` failures, or worker VMs that never
+   become ready.
 6. Keep 9000, its ACL grants and `/etc/pve/firewall/9000.fw` until that
    live round passes. Rollback is the controller copy above, which selects
    9000 again.
