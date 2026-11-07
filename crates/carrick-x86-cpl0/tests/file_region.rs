@@ -301,3 +301,22 @@ fn file_region_unpublished_is_distinct_from_retired() {
         FileRegionError::Retired.fatal_payload()
     );
 }
+
+#[test]
+fn x86_ipc_table_map_uses_retained_file_registration() {
+    let fixture = Fixture::new(1756);
+    let tables = fixture.tables();
+    let map = tables.ipc_table_map();
+    let base = fixture._storage.as_ptr() as usize;
+    assert_eq!(
+        core::ptr::from_ref(map) as usize - base,
+        EL1_IPC_TABLE_MAP_OFFSET as usize
+    );
+    assert!(!map.window_published());
+    map.publish_window();
+    assert!(fixture.tables().ipc_table_map().window_published());
+    assert_eq!(
+        fixture.registration.binding().guest().raw(),
+        X86_CPL0_REGION_BASE
+    );
+}
