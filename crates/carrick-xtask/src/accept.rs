@@ -903,6 +903,19 @@ pub const CLEANUP_UNKNOWN: &str = "scoped cleanup failed or reported no remainin
 /// Prefix recorded in `AcceptReceipt::failures` when `accept` refuses before step publication.
 pub const ACCEPT_REFUSAL_PREFIX: &str = "accept refusal: ";
 
+/// Format the `AcceptReceipt::failures` entry recorded when a required lane executes 0 tests.
+pub fn format_zero_executed_lane_failure(lane: &str) -> String {
+    format!("not-run: lane '{lane}': zero executed tests")
+}
+
+/// Extract the lane name from a `format_zero_executed_lane_failure` entry.
+pub fn parse_zero_executed_lane_failure(failure: &str) -> Option<&str> {
+    failure
+        .strip_prefix("not-run: lane '")
+        .and_then(|rest| rest.strip_suffix("': zero executed tests"))
+        .filter(|lane| !lane.is_empty())
+}
+
 pub fn generate_timestamp() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1536,7 +1549,10 @@ pub fn publish_refusal(
         host_load: Default::default(),
         failures: vec![format!("{ACCEPT_REFUSAL_PREFIX}{error}")],
     };
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         fs::create_dir_all(parent).map_err(|source| AcceptError::Io {
             path: parent.to_path_buf(),
             source,
@@ -2453,7 +2469,7 @@ fn run_inner(
         .map_err(|error| AcceptError::Failed(error.to_string()))?;
     for (lane, executed) in census {
         if executed == 0 {
-            failures.push(format!("not-run: lane '{lane}': zero executed tests"));
+            failures.push(format_zero_executed_lane_failure(&lane));
         }
     }
     receipt.failures = failures.clone();
