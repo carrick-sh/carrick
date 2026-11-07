@@ -4023,6 +4023,18 @@ impl HvfTaskState {
         // cloning the whole 1.75 MiB table region (see `begin_undo`).
         let mut preserved_protection_receipt = None;
         let page_table_result = if let Some(backing) = guest_identity {
+            // Internal maintenance needs a host walk after publication. Admit
+            // its backing before publishing, while clean refusal can still
+            // roll back the prepared grant.
+            let protection_host = if frame_cow_preserves_guest_protection(intent) {
+                Some(page_table_host.ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "internal guest COW page-table backing is absent".to_owned(),
+                    )
+                })?)
+            } else {
+                None
+            };
             (|| -> Result<(), TrapError> {
                 use carrick_mmu_core::aarch64::descriptor_txn::CowRepointAccess;
                 let access = if span.kernel_only {
@@ -4078,13 +4090,7 @@ impl HvfTaskState {
                 // Maintenance can repoint a still-invalid page. Retain the
                 // same exact-leaf receipt consumed by the later protection
                 // publication, after authenticating EL1's completion.
-                if frame_cow_preserves_guest_protection(intent) {
-                    let page_table_host = page_table_host.unwrap_or_else(|| {
-                        carrick_fatal!(
-                            "hvpatch::cow",
-                            "completed internal guest COW has no page-table backing"
-                        )
-                    });
+                if let Some(page_table_host) = protection_host {
                     let live = tables
                         .with_manager(|manager| {
                             let resolver =
@@ -4286,10 +4292,9 @@ impl HvfTaskState {
                 )
         };
         if let Err(error) = page_table_result {
-            if !guest_lane {
-                let page_table_host = page_table_host.unwrap_or_else(|| {
-                    carrick_fatal!("hvpatch::cow", "host COW rollback lost page-table backing")
-                });
+            // The host edit arm admitted this backing before any edits.
+            // Guest-owned tables use their verified publication rollback.
+            if let Some(page_table_host) = page_table_host.filter(|_| !guest_lane) {
                 let _ = self.page_tables_authority().edit(
                     || Err(()),
                     |manager| {
