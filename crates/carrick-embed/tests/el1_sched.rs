@@ -3960,8 +3960,8 @@ fn el1_fork_cow_parent_replenishes_used_grants() {
         "EL1 must copy the compounds"
     );
     assert_eq!(
-        cow.guest_lane_host_cow_by_path[0], 0,
-        "host stage-fault COW must not mask failed grant recycling: {cow:?}"
+        cow.host_cow_by_path[0], 0,
+        "carrier stage-fault COW must not mask failed grant recycling: {cow:?}"
     );
 }
 
