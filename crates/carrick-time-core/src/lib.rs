@@ -106,7 +106,7 @@ pub fn linux_timex_time(duration: Duration, status: LinuxTimexStatus) -> LinuxTi
 /// validate credentials, prepare guest output or apply the realtime offset:
 /// those obligations must precede this transition, as in the host dispatcher.
 /// It performs bounded work with no allocation or physical clock reads.
-pub fn apply_timex_fields(state: &mut AdjtimexState, timex: &LinuxTimex) {
+fn apply_timex_fields(state: &mut AdjtimexState, timex: &LinuxTimex) {
     let modes = LinuxTimexModes::from_bits_retain(timex.modes);
     if modes.contains(LinuxTimexModes::OFFSET) {
         if modes.contains(LinuxTimexModes::OFFSET_SINGLESHOT_FLAG) {
@@ -152,5 +152,155 @@ pub fn apply_timex_fields(state: &mut AdjtimexState, timex: &LinuxTimex) {
     }
     if modes.contains(LinuxTimexModes::TICK) {
         state.tick = timex.tick;
+    }
+}
+
+/// The caller's already authenticated Linux clock-adjustment authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TimexAccess {
+    ReadOnly,
+    Adjust,
+}
+
+/// Validation has one unusual Linux result: a malformed singleshot mode
+/// writes a defined error record before returning EINVAL. Keep that effect
+/// distinct from a refusal that must leave user memory untouched.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TimexValidationError {
+    InvalidModeOutput,
+    Errno(carrick_abi::LinuxErrno),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TimexKind {
+    Read,
+    ReadSingleshot,
+    Adjust,
+}
+
+/// A borrowed, validated Linux request. No ABI-sized value is copied onto
+/// the kernel stack. State-dependent offset interpretation still belongs
+/// inside the clock authority's transaction, via `realtime_step`.
+pub struct TimexRequest<'a> {
+    input: &'a LinuxTimex,
+    kind: TimexKind,
+}
+
+impl<'a> TimexRequest<'a> {
+    pub fn validate(
+        input: &'a LinuxTimex,
+        access: TimexAccess,
+    ) -> Result<Self, TimexValidationError> {
+        use carrick_abi::{LINUX_CLK_TCK, LINUX_EINVAL, LINUX_EPERM};
+        let modes = LinuxTimexModes::from_bits_retain(input.modes);
+        if modes.contains(LinuxTimexModes::OFFSET_SINGLESHOT_FLAG)
+            && !modes.contains(LinuxTimexModes::OFFSET)
+        {
+            return Err(TimexValidationError::InvalidModeOutput);
+        }
+        let kind = if input.modes == 0 {
+            TimexKind::Read
+        } else if modes == LinuxTimexModes::OFFSET_SS_READ {
+            TimexKind::ReadSingleshot
+        } else {
+            // Preserve Linux's permission-before-adjustment-validation order.
+            if access != TimexAccess::Adjust {
+                return Err(TimexValidationError::Errno(LINUX_EPERM));
+            }
+            // The native ARM64 adjtimexmodel oracle accepts MICRO|NANO
+            // and TAI|TIMECONST together. The later field update wins.
+            // Frequency is clamped and unknown status bits are dropped by
+            // the transition, rather than rejected here.
+            const KNOWN_MODES: u32 = LinuxTimexModes::IDEMPOTENT_SUPPORTED.bits()
+                | LinuxTimexModes::OFFSET_SINGLESHOT_FLAG.bits();
+            let tick = input.tick;
+            let offset = input.offset;
+            if (input.modes & !KNOWN_MODES) != 0
+                || (modes.contains(LinuxTimexModes::OFFSET_SINGLESHOT_FLAG)
+                    && modes != LinuxTimexModes::OFFSET_SINGLESHOT)
+                || (modes.contains(LinuxTimexModes::TICK)
+                    && !(900_000 / LINUX_CLK_TCK..=1_100_000 / LINUX_CLK_TCK).contains(&tick))
+                || (modes.contains(LinuxTimexModes::OFFSET_SINGLESHOT_FLAG)
+                    && !(-131_071..=131_071).contains(&offset))
+            {
+                return Err(TimexValidationError::Errno(LINUX_EINVAL));
+            }
+            TimexKind::Adjust
+        };
+        Ok(Self { input, kind })
+    }
+
+    pub fn modifies(&self) -> bool {
+        self.kind == TimexKind::Adjust
+    }
+
+    /// Compute a step against the state held by the clock's mutation owner.
+    /// This never changes state, including on overflow or an invalid subsecond.
+    pub fn realtime_step(
+        &self,
+        status: impl FnOnce() -> LinuxTimexStatus,
+    ) -> Result<Option<i64>, carrick_abi::LinuxErrno> {
+        use carrick_abi::LINUX_EINVAL;
+        if !self.modifies() {
+            return Ok(None);
+        }
+        let modes = LinuxTimexModes::from_bits_retain(self.input.modes);
+        if modes.contains(LinuxTimexModes::SETOFFSET) {
+            let is_nano = if modes.contains(LinuxTimexModes::NANO) {
+                true
+            } else if modes.contains(LinuxTimexModes::MICRO) {
+                false
+            } else {
+                status().contains(LinuxTimexStatus::NANO)
+            };
+            let max_sub = if is_nano { 1_000_000_000 } else { 1_000_000 };
+            if self.input.time.tv_usec < 0 || self.input.time.tv_usec >= max_sub {
+                return Err(LINUX_EINVAL);
+            }
+            let sec_ns = self
+                .input
+                .time
+                .tv_sec
+                .checked_mul(1_000_000_000)
+                .ok_or(LINUX_EINVAL)?;
+            let sub_ns = if is_nano {
+                self.input.time.tv_usec
+            } else {
+                self.input.time.tv_usec.saturating_mul(1_000)
+            };
+            Ok(Some(sec_ns.checked_add(sub_ns).ok_or(LINUX_EINVAL)?))
+        } else if modes == LinuxTimexModes::OFFSET_SINGLESHOT {
+            Ok(Some(
+                self.input.offset.checked_mul(1_000).ok_or(LINUX_EINVAL)?,
+            ))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Apply only the discipline fields, after output preparation and a
+    /// successful step, under the same authority as `realtime_step`.
+    pub fn apply_fields(&self, state: &mut AdjtimexState) {
+        if self.modifies() {
+            apply_timex_fields(state, self.input);
+        }
+    }
+
+    /// Fill caller-owned storage so ring callers need no large return value.
+    pub fn write_reply(
+        &self,
+        state: &AdjtimexState,
+        now: Duration,
+        output: &mut LinuxTimex,
+    ) -> i64 {
+        let status = LinuxTimexStatus::from_bits_retain(state.status);
+        *output = linux_timex_from_state(linux_timex_time(now, status), state);
+        if self.kind != TimexKind::Read {
+            output.modes = self.input.modes;
+        }
+        if self.kind == TimexKind::ReadSingleshot {
+            output.offset = 0;
+        }
+        linux_time_state_from_status(status)
     }
 }
