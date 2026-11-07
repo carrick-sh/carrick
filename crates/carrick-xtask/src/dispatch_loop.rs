@@ -7001,6 +7001,25 @@ fi
                 "{}",
                 applied.report()
             );
+            // Isolate the workflow handoff from the fixture's unfinished-work floor.
+            server.history.last_mut().unwrap().status = ContractStatus::Done;
+            Applied::record(|a| a.published_checkpoint = false).unwrap();
+            server
+                .round_outcome(
+                    FinishStatus::Continue,
+                    "next: finish workflow wiring",
+                    Some("finish workflow wiring"),
+                )
+                .unwrap();
+            let posted = regular_text(&root.join("posted.md")).unwrap();
+            assert!(posted.contains("Dispatch outcome: Failed"), "{posted}");
+            assert!(
+                posted.contains(
+                    "workflow changes were left out; the director must apply `harvest.patch`"
+                ),
+                "{posted}"
+            );
+            assert!(!posted.contains("Dispatch outcome: Continuing"), "{posted}");
         });
     }
     /// #1241: an owner comment that arrives mid-round reaches the
