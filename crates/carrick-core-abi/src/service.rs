@@ -155,6 +155,52 @@ pub enum ServiceOperation {
         capability: ExecCapabilityId,
         payload: HostFilePayloadDescriptor,
     },
+    /// Serve one bounded clock-resource record staged by the ring
+    /// ([`crate::clock`]). The capability selects the run's shared
+    /// `ClockDomain` authority; user pointers and credentials stay in the ring.
+    Clock {
+        capability: crate::clock::ClockCapabilityId,
+        payload: ClockPayloadDescriptor,
+    },
+}
+
+/// One bounded ring-owned clock-resource record ([`crate::clock`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClockPayloadDescriptor {
+    address: GuestVa,
+    length: GuestLen,
+    ordinal: NativeOrdinal,
+}
+impl ClockPayloadDescriptor {
+    pub const fn checked(
+        address: GuestVa,
+        length: GuestLen,
+        ordinal: NativeOrdinal,
+    ) -> Option<Self> {
+        if length.raw() != crate::clock::CLOCK_RECORD_BYTES as u64
+            || address.raw().checked_add(length.raw()).is_none()
+        {
+            return None;
+        }
+        Some(Self {
+            address,
+            length,
+            ordinal: NativeOrdinal::new(if ordinal.raw() < 512 {
+                ordinal.raw()
+            } else {
+                512
+            }),
+        })
+    }
+    pub const fn ordinal(self) -> NativeOrdinal {
+        self.ordinal
+    }
+    pub const fn address(self) -> GuestVa {
+        self.address
+    }
+    pub const fn length(self) -> GuestLen {
+        self.length
+    }
 }
 
 /// One bounded ring-owned host-file record ([`crate::host_file`]).
@@ -1276,6 +1322,14 @@ impl ServiceCell {
                 payload.address().raw(),
                 payload.length().raw() | (payload.ordinal().raw() << 32),
             ),
+            ServiceOperation::Clock {
+                capability: _,
+                payload,
+            } => (
+                8,
+                payload.address().raw(),
+                payload.length().raw() | (payload.ordinal().raw() << 32),
+            ),
         };
         for (index, value) in [(8, execution.raw()), (9, kind), (10, first), (11, second)] {
             self.words[index].store(value, Ordering::Relaxed);
@@ -1286,6 +1340,7 @@ impl ServiceCell {
             match operation {
                 ServiceOperation::Exec { capability, .. }
                 | ServiceOperation::HostFile { capability, .. } => capability.raw().get(),
+                ServiceOperation::Clock { capability, .. } => capability.raw().get(),
                 _ => fault_sequence.map_or(0, NonZeroU64::get),
             },
             Ordering::Relaxed,
@@ -1447,6 +1502,18 @@ impl ServiceCell {
                         .ok_or(ServiceError::Stale)?,
                     }
                 }
+                8 => ServiceOperation::Clock {
+                    capability: crate::clock::ClockCapabilityId::new(
+                        NonZeroU64::new(cell.result.load(Ordering::Relaxed))
+                            .ok_or(ServiceError::Stale)?,
+                    ),
+                    payload: ClockPayloadDescriptor::checked(
+                        GuestVa::new(first),
+                        GuestLen::new(cell.words[11].load(Ordering::Relaxed) & u64::from(u32::MAX)),
+                        NativeOrdinal::new(cell.words[11].load(Ordering::Relaxed) >> 32),
+                    )
+                    .ok_or(ServiceError::Stale)?,
+                },
                 _ => return Err(ServiceError::Stale),
             };
             let fault_sequence = if matches!(operation, ServiceOperation::Fault(_)) {
@@ -1552,11 +1619,23 @@ impl ServiceCell {
                         == (payload.length().raw() | (payload.ordinal().raw() << 32))
                     && cell.result.load(Ordering::Relaxed) == capability.raw().get()
             }
+            ServiceOperation::Clock {
+                capability,
+                payload,
+            } => {
+                cell.words[9].load(Ordering::Relaxed) == 8
+                    && cell.words[10].load(Ordering::Relaxed) == payload.address().raw()
+                    && cell.words[11].load(Ordering::Relaxed)
+                        == (payload.length().raw() | (payload.ordinal().raw() << 32))
+                    && cell.result.load(Ordering::Relaxed) == capability.raw().get()
+            }
         };
         if !operation_matches
             || (!matches!(
                 request.operation,
-                ServiceOperation::Exec { .. } | ServiceOperation::HostFile { .. }
+                ServiceOperation::Exec { .. }
+                    | ServiceOperation::HostFile { .. }
+                    | ServiceOperation::Clock { .. }
             ) && cell.result.load(Ordering::Relaxed)
                 != request.fault_sequence.map_or(0, NonZeroU64::get))
         {
@@ -3046,5 +3125,60 @@ mod tests {
             Ok(ServiceResult::Wait(wait))
         );
         assert_eq!(cell.reset_unpublished(), Err(ServiceError::Busy));
+    }
+
+    #[test]
+    fn clock_payload_roundtrips_and_rejects_wrong_length_or_capability() {
+        let len = GuestLen::new(crate::clock::CLOCK_RECORD_BYTES as u64);
+        assert!(
+            ClockPayloadDescriptor::checked(
+                GuestVa::new(0x1000),
+                GuestLen::new(len.raw() - 1),
+                NativeOrdinal::new(113),
+            )
+            .is_none()
+        );
+        assert!(
+            ClockPayloadDescriptor::checked(GuestVa::new(u64::MAX), len, NativeOrdinal::new(113),)
+                .is_none()
+        );
+        let payload = ClockPayloadDescriptor::checked(
+            GuestVa::new(0x8000_0000),
+            len,
+            NativeOrdinal::new(113),
+        )
+        .unwrap();
+        let capability = crate::clock::ClockCapabilityId::new(NonZeroU64::new(42).unwrap());
+        let operation = ServiceOperation::Clock {
+            capability,
+            payload,
+        };
+        let cell = ServiceCell::new();
+        let owner = birth(1, 5);
+        cell.bind(owner).unwrap();
+        let request = cell
+            .publish(owner, SnapshotGeneration::INITIAL, operation, None)
+            .unwrap();
+        let mut wrong_cap = request;
+        wrong_cap.operation = ServiceOperation::Clock {
+            capability: crate::clock::ClockCapabilityId::new(NonZeroU64::new(99).unwrap()),
+            payload,
+        };
+        assert!(matches!(cell.claim(wrong_cap), Err(ServiceError::Stale)));
+        let member = carrick_sched_core::ThreadIdentity {
+            tid: 1,
+            serial: owner.thread.raw(),
+            mm: owner.mm.mm().raw(),
+            generation: SnapshotGeneration::INITIAL.raw(),
+            ..Default::default()
+        };
+        // SAFETY: local cell and synthetic exact member remain alive for the claim.
+        let ticket = unsafe {
+            ServiceCell::claim_notice(&cell, request.identity.into(), owner.mm.carrier(), member)
+        }
+        .unwrap();
+        assert_eq!(ticket.request().operation, operation);
+        assert!(ticket.complete(true).is_ok());
+        assert_eq!(cell.consume(request.identity), Ok(ServiceResult::Supplied));
     }
 }
