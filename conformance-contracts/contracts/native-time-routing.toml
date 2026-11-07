@@ -1,8 +1,8 @@
 schema_version = 1
 id = "kernel.time.native-routing"
 title = "Native fork children reach the shared time service"
-guest_surfaces = ["syscall:clock_gettime", "syscall:clock_adjtime", "syscall:adjtimex", "syscall:nanosleep"]
-semantic_authority = ["man 2 clock_gettime", "man 2 clock_adjtime", "man 2 adjtimex", "man 2 nanosleep", "native Linux x86_64 null-pointer syscall oracle"]
+guest_surfaces = ["syscall:clock_gettime", "syscall:clock_adjtime", "syscall:adjtimex", "syscall:nanosleep", "syscall:clock_nanosleep"]
+semantic_authority = ["man 2 clock_gettime", "man 2 clock_adjtime", "man 2 adjtimex", "man 2 nanosleep", "man 2 clock_nanosleep", "native Linux x86_64 null-pointer syscall oracle"]
 fixture = "native-fork-child-time-handler"
 scale_points = [2]
 structural_budgets = []
@@ -14,6 +14,8 @@ vm_free = [
   "carrick-el1-linux::aarch64_process_tests::native_fork_child_clock_adjtime_reaches_time_handler",
   "carrick-el1-linux::aarch64_process_tests::native_fork_child_adjtimex_reaches_time_handler",
   "carrick-el1-linux::aarch64_process_tests::native_fork_child_nanosleep_reaches_time_handler",
+  "carrick-el1-linux::aarch64_process_tests::native_fork_child_clock_nanosleep_reaches_time_handler",
+  "carrick-el1-linux::aarch64_process_tests::native_fork_child_absolute_clock_nanosleep_reaches_time_handler",
   "carrick-el1-linux::native_process_runtime::host_test_support::native_clock_requires_retained_payload_before_service_publication",
   "carrick-kernel::clock_service::tests::sample_and_deterministic_sleep_wake_through_service",
   "carrick-kernel::clock_service::tests::absolute_realtime_sleep_wakes_on_timex_step",

@@ -291,3 +291,17 @@ Clock; and x86 `linux_personality.rs` still refuses NativeService. No time
 family is enabled by this checkpoint. Timex ring input/output preparation,
 sleep continuations and both production resource bindings remain required.
 This is not completion of #1808. Signed/HVF verification remains director work.
+
+## ARM sleep slice: additional red routing witnesses
+
+The production native-fork fixture now also enters `clock_nanosleep` with
+relative flags and with `TIMER_ABSTIME`. Both calls use `CLOCK_REALTIME` and
+a null request. Like the existing `nanosleep` witness, they require EFAULT
+(14) and zero counted refusals. Native Linux x86_64 returns 14 in both
+cases; this supplements, and does not replace, the ARM64 Docker oracle.
+
+The initial isolated run reports 747 passed, six failed and one ignored.
+Both new cases return ENOSYS (-38), expected EFAULT (-14); the original
+four time-routing witnesses remain red. These tests cover argument routing
+only. A working sleep continuation, deadline completion, EINTR remaining
+time, pool exhaustion and signed execution are still unproved.
