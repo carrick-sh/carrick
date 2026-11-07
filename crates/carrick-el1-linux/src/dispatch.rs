@@ -5403,6 +5403,65 @@ mod tests {
     }
 
     #[test]
+    fn admitted_descriptor_getfd_is_served_without_a_host_crossing() {
+        use carrick_personality_linux::dispatch::CompletionRoute;
+        // Linux fcntl(2): F_GETFD returns the descriptor flag, independently
+        // of the open description. Unknown commands remain unrouted.
+        let tasks = [CurrentTask::new()];
+        tasks[0].set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            5,
+        );
+        let slots = [FdMapSlot::new(), FdMapSlot::new()];
+        assert!(slots[0].try_claim());
+        slots[0].set(5, 1, 1, 9);
+        assert!(slots[1].try_claim());
+        slots[1].set(6, 1, 1, 9);
+        slots[1].fd_flags.store(1, Ordering::Release);
+        for (table, command, expected, refused) in [
+            (5, carrick_abi::LINUX_F_GETFD, 0, 0),
+            (6, carrick_abi::LINUX_F_GETFD, 1, 0),
+            (7, carrick_abi::LINUX_F_GETFD, -38, 1),
+            (5, carrick_abi::LINUX_F_GETFL, -38, 1),
+        ] {
+            tasks[0].linux.file_table.store(table, Ordering::Release);
+            let counters = Counters::default();
+            let mut frame = TrapFrame::default();
+            frame.x[8] = carrick_personality_linux::crossing::nr::FCNTL.raw();
+            frame.x[0] = 1;
+            frame.x[1] = command;
+            let route = dispatch_syscall_with_native(
+                &mut frame,
+                &counters,
+                &tasks,
+                &slots,
+                &[],
+                &[],
+                &[],
+                &InotifyNameCache::new(),
+                None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
+                None,
+                None,
+                None::<&mut dyn lifecycle::ProcessNative<carrick_sched_core::ThreadCtx>>,
+                None,
+                None,
+                |_| core::ptr::null_mut(),
+            );
+            if refused == 0 {
+                assert_eq!(route, CompletionRoute::Served);
+                assert_eq!(frame.x[0] as i64, expected);
+                assert_eq!(counters.forwarded[25].load(Ordering::Relaxed), 0);
+            } else {
+                // ARM's compatibility policy forwards unavailable venues;
+                // the production CPL0 binding below proves counted refusal.
+                assert_eq!(route, CompletionRoute::Forward);
+                assert_eq!(frame.x[0], 1);
+            }
+        }
+    }
+
+    #[test]
     fn affinity_without_process_authority_uses_counted_refusal() {
         use carrick_personality_linux::dispatch::CompletionRoute;
         let tasks = [CurrentTask::new()];
