@@ -70,6 +70,15 @@ const _: () = {
         lanes_gpa + LIFECYCLE_STRIDE + size_of::<LifecycleLane>() as u64
             <= PROGRESS_ZONE_GPA + SUPERVISOR_BYTES
     );
+    let direct = carrick_el1_abi::X86_CPL0_DIRECT_VA + PROGRESS_ZONE_GPA;
+    assert!(
+        direct + SUPERVISOR_BYTES <= PROGRESS_ZONE || PROGRESS_ZONE + SUPERVISOR_BYTES <= direct
+    );
+    assert!(direct + SUPERVISOR_BYTES <= carrick_el1_abi::X86_CPL0_REGION_BASE);
+    assert!(PROGRESS_ZONE + SUPERVISOR_BYTES <= carrick_el1_abi::X86_CPL0_REGION_BASE);
+    assert!(
+        PROGRESS_ZONE_GPA + SUPERVISOR_BYTES <= carrick_x86_cpl0_host::cpl0_boot::KERNEL_REGION_GPA
+    );
     // The interrupt witness has a separate window above allocator backing.
     assert!(
         PROGRESS_ZONE_GPA

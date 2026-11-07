@@ -34,7 +34,10 @@ this larger artifact remains required.
 
 The CPL0 interrupt/lifecycle fixture derives its sidecars from the complete
 scheduler size and places that backing above the bootstrap allocator in a
-separate physical window. Its second page-table root retains a disjoint low
+separate physical window. Bootstrap allocator backing follows the reserved
+maximum initial-image extent, keeping it disjoint from the larger production
+metadata. Those address-space gaps allocate no host RAM. Its second page-table
+root retains a disjoint low
 RAM reservation accepted by the shared table-alias authority. The fixture's
 supervisor and direct aliases both name the new scheduler backing; production
 initial-extent boot keeps its separate allocation path.

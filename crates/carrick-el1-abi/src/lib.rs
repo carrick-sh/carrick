@@ -4718,7 +4718,9 @@ mod tests {
         assert_eq!(EL1_REGION_BASE, 0x2D_0400_0000);
         assert_eq!(EL1_REGION_SIZE, 0x0800_0000);
         assert_eq!(EL1_IPC_BASE, 0x2D_1000_0000);
-        assert!(EL1_NAME_CACHE_OFFSET + EL1_NAME_CACHE_SIZE <= EL1_ZONE_OFFSET);
+        const {
+            assert!(EL1_NAME_CACHE_OFFSET + EL1_NAME_CACHE_SIZE <= EL1_ZONE_OFFSET);
+        }
         assert_eq!(EL1_ZONE_OFFSET + EL1_ZONE_SIZE, EL1_REGION_SIZE);
     }
 

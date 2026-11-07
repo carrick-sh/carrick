@@ -44,8 +44,30 @@ pub const RAM_SIZE: usize = 16 * 1024 * 1024;
 pub const META_GPA: u64 = 0xc0_0000;
 pub const META_LEN: u64 = 0x10_0000;
 pub const PRODUCTION_METADATA_GPA: u64 = META_GPA;
-pub const ALLOCATOR_GPA: u64 = 0x20_00000;
+/// Bootstrap metadata has separate backing beyond the reserved initial image.
+/// No address-space gap is allocated as host RAM.
+pub const ALLOCATOR_GPA: u64 = {
+    let metadata_end =
+        META_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET + size_of::<X86Cpl0Zone>() as u64;
+    let image_end =
+        X86_CPL0_INITIAL_EXTENT_GPA + carrick_core_abi::X86_CPL0_INITIAL_EXTENT_MAX_SIZE;
+    let end = if metadata_end > image_end {
+        metadata_end
+    } else {
+        image_end
+    };
+    end.next_multiple_of(0x20_0000)
+};
 pub const INITIAL_EXTENT_GPA: u64 = X86_CPL0_INITIAL_EXTENT_GPA;
+const _: () = {
+    assert!(
+        META_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET + size_of::<X86Cpl0Zone>() as u64
+            <= INITIAL_EXTENT_GPA
+    );
+    assert!(
+        INITIAL_EXTENT_GPA + carrick_core_abi::X86_CPL0_INITIAL_EXTENT_MAX_SIZE <= ALLOCATOR_GPA
+    );
+};
 pub const KERNEL_REGION_GPA: u64 = 0x1_0000_0000;
 /// Reserved before dynamic grants, including carriers with no IPC authority.
 pub const IPC_WINDOW_GPA: u64 = 0x2_0000_0000;
