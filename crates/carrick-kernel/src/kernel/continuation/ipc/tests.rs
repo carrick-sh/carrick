@@ -17,6 +17,32 @@ const MM: IpcMmKey = IpcMmKey(7);
 const BUF: u64 = 0x10_0000;
 
 #[test]
+fn host_ipc_completion_regions_retain_their_exact_kernel_owner() {
+    let first = crate::dispatch::SyscallDispatcher::new();
+    let second = crate::dispatch::SyscallDispatcher::new();
+    let first_context = first.capture_one_task_context().unwrap();
+    let second_context = second.capture_one_task_context().unwrap();
+    let first_owner = first_context.kernel().ipc().unwrap();
+    let second_owner = second_context.kernel().ipc().unwrap();
+    let first_service = ZoneHostServices::for_dispatcher(&first).unwrap();
+    let second_service = ZoneHostServices::for_dispatcher(&second).unwrap();
+    let first_region = first_service.region();
+    let second_region = second_service.region();
+    assert!(first_region.same_mapping(&first_owner.region()));
+    assert!(second_region.same_mapping(&second_owner.region()));
+    assert!(!first_region.same_mapping(&second_region));
+    let token = first_region.begin_operation(IpcOperation::EMPTY).unwrap();
+    let raw = token.into_raw();
+    assert_eq!(first_service.validate_region(&first_region), Ok(()));
+    assert_eq!(
+        second_service.validate_region(&first_region),
+        Err(IpcError::BadRegion)
+    );
+    assert!(second_region.operation(&IpcOpToken::from_raw(raw)).is_err());
+    finish(&first_region, IpcOpToken::from_raw(raw), &first_service).unwrap();
+}
+
+#[test]
 fn serial_host_zone_operation_slot_release_reaches_bound_source() {
     // SAFETY: all-zero is the valid empty ABI state; aligned storage lives
     // through the scoped host binding.
