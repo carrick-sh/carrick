@@ -1106,7 +1106,36 @@ impl HostIpc {
             fd::Error::BadFd => PinnedHostResourceError::BadFd,
             _ => PinnedHostResourceError::Unavailable,
         })?;
-        let resource = match carrick_el1_abi::ipc::IpcBacking::decode(description.backing) {
+        let result = self
+            .host_resource(description)
+            .map(|resource| serve(&resource));
+        self.release_host_pin(pin)?;
+        result
+    }
+
+    /// Serve the exact description already retained by an operation. This
+    /// borrows its authenticated identity and never resolves a numeric fd or
+    /// constructs a second pin owner. The operation must keep its pin until
+    /// service completion/cancellation acknowledgement.
+    pub fn with_retained_host_resource<R>(
+        &self,
+        identity: fd::OfdPinIdentity,
+        serve: impl FnOnce(&HostResource) -> R,
+    ) -> Result<R, PinnedHostResourceError> {
+        let description = self
+            .region()
+            .fd(HostLockWait)
+            .pinned_identity(identity)
+            .map_err(|_| PinnedHostResourceError::Unavailable)?;
+        self.host_resource(description)
+            .map(|resource| serve(&resource))
+    }
+
+    fn host_resource(
+        &self,
+        description: fd::Description,
+    ) -> Result<HostResource, PinnedHostResourceError> {
+        match carrick_el1_abi::ipc::IpcBacking::decode(description.backing) {
             Some(carrick_el1_abi::ipc::IpcBacking::Host(token)) => self
                 .resources
                 .lock()
@@ -1116,9 +1145,13 @@ impl HostIpc {
                 .ok_or(PinnedHostResourceError::Unavailable),
             Some(_) => Err(PinnedHostResourceError::InZone),
             None => Err(PinnedHostResourceError::Unavailable),
-        };
-        let result = resource.map(|resource| serve(&resource));
-        match authority.unpin(pin) {
+        }
+    }
+
+    /// Retire an owned host-service pin through the existing final-backing
+    /// release authority. A borrowed service identity cannot call this API.
+    pub fn release_host_pin(&self, pin: fd::OfdPin) -> Result<(), PinnedHostResourceError> {
+        match self.region().fd(HostLockWait).unpin(pin) {
             Ok(Some(last)) => {
                 self.release(last.backing)
                     .map_err(|_| PinnedHostResourceError::Unavailable)?;
@@ -1126,7 +1159,7 @@ impl HostIpc {
             Ok(None) => {}
             Err(_) => return Err(PinnedHostResourceError::Unavailable),
         }
-        result
+        Ok(())
     }
     #[cfg(feature = "test-support")]
     pub fn retained_host_resources(&self) -> usize {
@@ -1199,8 +1232,90 @@ impl HostIpc {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use carrick_el1_abi::ipc::{IpcBacking, fd, pipe};
+
+    #[test]
+    fn serial_host_retained_file_pin_serves_original_and_finalizes_once() {
+        struct Bytes {
+            bytes: parking_lot::Mutex<Vec<u8>>,
+            drops: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Drop for Bytes {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let owner = HostIpc::new(1 << 20).unwrap();
+        let table = owner.create_table(4, 4).unwrap();
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let install = || {
+            owner
+                .install_host_description(
+                    table,
+                    Box::new(Bytes {
+                        bytes: parking_lot::Mutex::new(Vec::new()),
+                        drops: Arc::clone(&drops),
+                    }),
+                    fd::AccessMode::ReadWrite,
+                    fd::StatusFlags::default(),
+                    false,
+                )
+                .unwrap()
+        };
+        let number = install();
+        let region = owner.region();
+        let authority = region.fd(HostLockWait);
+        let (pin, _) = authority.pin(table, number).unwrap();
+        let identity = pin.identity();
+        assert_eq!(authority.close(table, number), Ok(None));
+        assert_eq!(install(), number);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        owner
+            .with_retained_host_resource(identity, |resource| {
+                resource
+                    .downcast_ref::<Bytes>()
+                    .unwrap()
+                    .bytes
+                    .lock()
+                    .extend_from_slice(b"once");
+            })
+            .unwrap();
+        owner
+            .with_retained_host_resource(identity, |resource| {
+                assert_eq!(
+                    &*resource.downcast_ref::<Bytes>().unwrap().bytes.lock(),
+                    b"once"
+                );
+            })
+            .unwrap();
+        assert_eq!(authority.holds(&pin), Ok((0, 1)));
+        owner
+            .with_pinned_host_resource(table, number, |resource| {
+                assert!(
+                    resource
+                        .downcast_ref::<Bytes>()
+                        .unwrap()
+                        .bytes
+                        .lock()
+                        .is_empty()
+                );
+            })
+            .unwrap();
+        owner.release_host_pin(pin).unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let mut called = false;
+        assert_eq!(
+            owner.with_retained_host_resource(identity, |_| called = true),
+            Err(PinnedHostResourceError::Unavailable)
+        );
+        assert!(!called, "a stale pin must not reach a resource");
+        let last = authority.close(table, number).unwrap().unwrap();
+        owner.release(last.backing).unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn serial_host_el1_ipc_host_subscription_lifetime_is_exact() {

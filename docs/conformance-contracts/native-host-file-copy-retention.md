@@ -73,3 +73,22 @@ each witness red on the pre-fix production implementation, then green; a
 direct call to the staging helper cannot prove these ownership transitions.
 The existing adapter classification tests remain useful but are not these
 witnesses. Signed and Docker evidence remain separate higher-layer gates.
+
+## Borrowed-pin API checkpoint
+
+`OfdPin::identity` now lends an `OfdPinIdentity`, which can authenticate a
+lookup through `Authority::pinned_identity` without manufacturing ownership.
+`HostIpc::with_retained_host_resource` uses that lookup and the existing host
+resource table. `release_host_pin` shares the existing final backing release
+authority with numeric admission. The borrowed key cannot be passed to
+`unpin`; the owned pin must remain live through every borrower.
+
+The fd-core binding closes/reuses the numeric descriptor and checks the
+original description, unchanged hold count, foreign authority, oversized
+index, retirement and generation reuse. The carrier binding writes the
+original host resource after numeric reuse, checks the replacement remains
+empty, and counts exactly one final release per resource. These are API and
+carrier-resource witnesses only. No crossing wire change, exact-task staging
+retention or production lazy-memory syscall witness is claimed by this
+checkpoint. The production staging path still has the two admission
+boundaries described above.
