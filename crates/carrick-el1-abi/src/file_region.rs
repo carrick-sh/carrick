@@ -342,7 +342,6 @@ impl<'a> FileTables<'a> {
     /// initialized physical extent for `'a`. Guest consumers must stop before
     /// the host retires the registration. This converts a guest VA only in the
     /// guest; host code must use `FileRegionRegistration::tables`.
-    #[cfg(target_os = "none")]
     pub unsafe fn in_guest(expected: FileRegionBinding) -> Result<Self, FileRegionError> {
         if expected.identity.raw() == 0 {
             return Err(FileRegionError::Unpublished);
@@ -357,9 +356,21 @@ impl<'a> FileTables<'a> {
     /// The borrow retains registration custody; no process-global aperture
     /// or ISA-specific virtual address participates in host resolution.
     pub fn ipc_table_map(&self) -> &crate::ipc_tables::IpcTableMap {
+        self.retained_ipc_table_map()
+    }
+
+    /// Consume the view while retaining the original registration lifetime.
+    /// A guest venue can keep this map after the temporary file view is gone;
+    /// its mapping custody is still bounded by the registration borrow (or
+    /// the explicit unsafe guest-attachment contract).
+    pub fn into_ipc_table_map(self) -> &'a crate::ipc_tables::IpcTableMap {
+        self.retained_ipc_table_map()
+    }
+
+    fn retained_ipc_table_map(&self) -> &'a crate::ipc_tables::IpcTableMap {
         // SAFETY: registration initializes this reservation before publishing
         // its identity. Attachment authenticates that identity and retains
-        // mapping custody; the ABI assertions check extent and alignment.
+        // mapping custody for 'a; the ABI checks extent and alignment.
         unsafe {
             &*self
                 .mapped
