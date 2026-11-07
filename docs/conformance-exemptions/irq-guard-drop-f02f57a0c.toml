@@ -1,6 +1,6 @@
 schema = "carrick.conformance-exemption.v1"
 base = "94d569b5993306e32eb30f1a0fb132c6fa3181ba"
-head = "f02f57a0c87922a1863ab62e345c708753ac9dcc"
+head = "b2b3d5096872b2c2a9c74f779647fee39f3d6618"
 contracts = [
   "kernel.scheduler.runnable-progress",
   "process.native.terminal-child",
