@@ -121,6 +121,19 @@ fn signed_queue_workflow_requires_published_group_pass_and_seeds_main() {
         assert!(required.iter().any(|j| j.as_str() == Some(job)));
     }
     let command = check["steps"][0]["run"].as_str().unwrap();
+    // Execute the committed command only after checking that Actions supplies
+    // each dependency's actual result (a constant success would fail open).
+    for (variable, job) in [
+        ("AUTHORIZE", "authorize"),
+        ("FIXTURES", "signed-fixtures"),
+        ("GATE", "gate"),
+        ("PUBLISH", "publish"),
+    ] {
+        assert_eq!(
+            check["steps"][0]["env"][variable].as_str().unwrap(),
+            format!("${{{{ needs.{job}.result }}}}")
+        );
+    }
     for dependency in ["AUTHORIZE", "FIXTURES", "GATE", "PUBLISH"] {
         assert!(command.contains(&format!("test \"${dependency}\" = success")));
     }
