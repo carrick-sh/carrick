@@ -3923,13 +3923,45 @@ fn el1_owner_cow_preserves_host_image_readonly_protection() {
 fn el1_fork_cow_parent_replenishes_used_grants() {
     let _guard = common::guest_lock();
     let carrier = carrier_or_fail();
+    // Publish the carrier ledger before differencing this run.
+    run_fixture(&carrier, &["fork-cow", "1", "1"], Duration::from_secs(40));
+    let before = carrick_embed::host_cow_snapshot();
+    assert!(before.complete, "warm-up must publish the carrier ledger");
+    let pool_before = el1_cow_pool_counters();
     let measured = run_fixture(&carrier, &["fork-cow-parent"], Duration::from_secs(40));
+    let cow = carrick_embed::host_cow_snapshot()
+        .checked_delta(&before)
+        .expect("same live carrier with complete COW observations");
+    let pool_after = el1_cow_pool_counters();
+    println!(
+        "fork-cow-parent grants={cow:?} pool_before={pool_before:?} pool_after={pool_after:?}"
+    );
     assert!(measured.result.success(), "{}", describe(&measured));
     assert!(
         measured
             .result
             .stdout_utf8()
-            .contains("fork-cow-parent compounds=192 ok=true")
+            .contains("fork-cow-parent compounds=192 writers=2 child-isolated=true ok=true")
+    );
+    assert!(
+        cow.guest_lane_selected >= 2,
+        "parent and child use the owner lane: {cow:?}"
+    );
+    assert!(
+        cow.guest_cow_provisioned > 64,
+        "must refill beyond the full chain: {cow:?}"
+    );
+    assert!(
+        cow.guest_cow_settled >= 192,
+        "must settle consumed compounds: {cow:?}"
+    );
+    assert!(
+        pool_after.0 - pool_before.0 >= 192,
+        "EL1 must copy the compounds"
+    );
+    assert_eq!(
+        cow.guest_lane_host_cow_by_path[0], 0,
+        "host stage-fault COW must not mask failed grant recycling: {cow:?}"
     );
 }
 
