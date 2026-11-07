@@ -8197,6 +8197,60 @@ mod container_clock_tests {
     }
 
     #[test]
+    fn root_timex_aliases_preserve_discipline_and_output_ordering() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
+        let reporter = CompatReporter::default();
+        let context = dispatcher.capture_one_task_context().expect("root context");
+        context
+            .task()
+            .with_caps(|caps| *caps = crate::namespace::process::CapabilitySet::full());
+        // Both root entry points must mutate and read the same discipline.
+        // Alternate the writer so neither alias is merely a read-only witness.
+        for (writer, reader, tick, status, state) in [
+            (carrick_abi::syscall::nr::ADJTIMEX.raw(), SYS_CLOCK_ADJTIME, 10_500, LINUX_STA_UNSYNC, LINUX_TIME_ERROR),
+            (SYS_CLOCK_ADJTIME, carrick_abi::syscall::nr::ADJTIMEX.raw(), 9_500, 0, LINUX_TIME_OK),
+        ] {
+            let mut request = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
+            request.modes = LINUX_ADJ_TICK | LINUX_ADJ_STATUS;
+            request.tick = tick;
+            request.status = status;
+            memory.write_bytes(TIMEX_ADDR, request.abi_bytes()).unwrap();
+            let args = |ordinal| {
+                if ordinal == SYS_CLOCK_ADJTIME {
+                    SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])
+                } else {
+                    SyscallArgs([TIMEX_ADDR, 0, 0, 0, 0, 0])
+                }
+            };
+            assert_eq!(
+                dispatcher.dispatch(&context, SyscallRequest::new(writer, args(writer)), &mut memory, &reporter).unwrap(),
+                DispatchOutcome::Returned { value: state }
+            );
+            let read_request = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
+            memory.write_bytes(TIMEX_ADDR, read_request.abi_bytes()).unwrap();
+            assert_eq!(
+                dispatcher.dispatch(&context, SyscallRequest::new(reader, args(reader)), &mut memory, &reporter).unwrap(),
+                DispatchOutcome::Returned { value: state }
+            );
+            let reply = read_kernel_struct::<LinuxTimex>(&memory, TIMEX_ADDR).unwrap();
+            assert_eq!({ reply.tick }, tick);
+            assert_eq!({ reply.status }, status);
+            // A faulting modifying request cannot publish a discipline change.
+            let bad_args = if writer == SYS_CLOCK_ADJTIME {
+                SyscallArgs([LINUX_CLOCK_REALTIME, 0, 0, 0, 0, 0])
+            } else {
+                SyscallArgs([0; 6])
+            };
+            assert_eq!(
+                dispatcher.dispatch(&context, SyscallRequest::new(writer, bad_args), &mut memory, &reporter).unwrap(),
+                DispatchOutcome::errno(LINUX_EFAULT)
+            );
+            assert_eq!(context.task().container().clock().adjtimex_state().tick, tick);
+        }
+    }
+
+    #[test]
     fn clock_adjtime_read_reports_time_ok_by_default() {
         let mut dispatcher = SyscallDispatcher::new();
         let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);

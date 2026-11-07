@@ -305,3 +305,22 @@ Both new cases return ENOSYS (-38), expected EFAULT (-14); the original
 four time-routing witnesses remain red. These tests cover argument routing
 only. A working sleep continuation, deadline completion, EINTR remaining
 time, pool exhaustion and signed execution are still unproved.
+
+## Round 2 review corrections (incomplete slice 2)
+
+The three clock_gettime/adjtimex/clock_adjtime native-child witnesses are
+explicitly ignored for #1808 slice 3 and removed from the active contract
+bindings. The three sleep-routing witnesses remain active and red until the
+owned sleep service is implemented. No green native-suite claim follows from
+this scoping change.
+
+Decoded clock replies now use the existing `LinuxErrno`; wake channels carry
+`EntryMmKey` through decoding and encoding. Wire bytes remain unchanged.
+The decoder rejects errno words outside 1..=4095 before constructing the
+typed value. Clock-id typing remains unresolved: no existing `ClockId` was
+found in this branch, and this continuation does not invent a new type.
+
+`root_timex_aliases_preserve_discipline_and_output_ordering` exercises both
+root production dispatch entry points as alternating discipline writers and
+readers, checking tick/status and TIME_ERROR plus EFAULT without mutation for
+an unreadable input. It covers host behavior, not native-child routing.
