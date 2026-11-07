@@ -10588,7 +10588,6 @@ fn native_descriptor_witness(
                     IpcLimits::ZONE.objects
                 },
                 descriptions: carrick_el1_abi::ipc::IPC_OFD_SEGMENT,
-                ..IpcLimits::ZONE
             },
         )
         .unwrap(),
