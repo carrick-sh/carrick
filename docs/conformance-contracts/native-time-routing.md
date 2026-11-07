@@ -119,10 +119,10 @@ This prerequisite must not be published as the completed #1808 fix.
 The x86 native entry has no generic native-service consumer. In
 `carrick-x86-cpl0/src/linux_personality.rs`, the `NativeService` completion
 route explicitly counts a refusal and returns ENOSYS. The production host
-adapter is `carrick-x86-cpl0-host/src/cpl0_boot.rs`; its ordinary and idle-peer
-port handling both need service admission and completion. The fixture's
-forward-port support is not that transport. A shared time family returning
-`NativeService` would therefore remain broken on x86.
+adapter is `carrick-x86-cpl0-host/src/cpl0_boot.rs`. A shared time family
+returning `NativeService` would therefore remain broken on x86. This does not
+mean bounded clock operations require a new generic consumer: the production
+synchronous resource port described below is another existing transport.
 
 The existing x86 `native_execution` timer expiry and shared
 `NativeProcessService` signal-clock methods can park and wake a task against
@@ -177,3 +177,59 @@ reply bytes or notification generation.
 These witnesses cover the clock authority prerequisite only. They do not
 establish a working native clock transport or satisfy the child-read acceptance
 criterion.
+
+## Continuation design review: bounded clock resource transport
+
+Rebasing onto the next admitted main preserved all six prerequisite commits.
+The four child-routing witnesses still return ENOSYS (38), rather than EFAULT
+(14). Static family selection remains `Unported`; none of those witnesses
+observes an in-progress publication. A Busy wait at that selector cannot fix
+the missing service.
+
+An independent source review identified a smaller transport for clock reads
+than adding a generic x86 native-service consumer:
+
+- `carrick-x86-cpl0/src/anonymous.rs` already sends a bounded host-resource
+  request over the synchronous physical port. A clock request needs its own
+  record and crossing number/tag, not a host-file opcode or Linux syscall
+  forwarding.
+- `carrick-runtime/src/vcpu_loop/executor/cpl0.rs::service_syscall_trap`
+  recognizes resource crossings before the root-only syscall forwarding
+  policy. Its `HostFile` decision captures input, releases physical custody
+  during host work, and retains the exact forwarding token for completion.
+  A distinct clock decision can use that transport sequence.
+- `carrick-x86-cpl0-host/src/cpl0_anonymous.rs::ForwardVenue` authenticates
+  supervisor storage with `execution.context` in `capture_host_file` and
+  reauthenticates it in `complete_host_file`. Extract only that transport
+  machinery; file mapping admission and source inheritance remain file
+  operations. Clock payloads need their own fixed bound and validation.
+- ARM can retain the same clock record through a distinct
+  `ServiceOperation::Clock`, with publish, decode, claim and completion
+  validation. Its carrier intake belongs beside the existing native service
+  intake; runtime completion selects the shared clock resource handler.
+- Both adapters use the run's existing `ClockDomain`. The clock resource must
+  be initialized before native root admission, inherited through fork, and
+  preserved across exec. An admitted route cannot represent a missing or
+  partially installed resource as ENOSYS.
+- The shared ring continuation owns Linux validation and exact-member/MM
+  output. Once sampled, it retains the returned bytes through copyout waits.
+  Resuming output must not read the clock again or restart the syscall.
+
+This review approves the transport direction, not an implementation. There
+is no new clock ABI or routed time family in this checkpoint. The synchronous
+transport is appropriate only for bounded resource work. It must not wait for
+a sleep deadline or run a Linux syscall through the root dispatcher.
+
+Sleep still requires a shared owner retaining its copied input, deadline,
+remaining-time destination, signal policy and exact member. Clock-domain
+generation snapshots and subscriptions must close the change/enrollment
+race, and deterministic waits must retain their advancement enrollment.
+Completion and cancellation acknowledge those resources before releasing
+custody. A physical timer alone cannot implement frozen/scaled/deterministic
+time or realtime steps. Timex must use the existing atomic `apply_timex`
+operation after output preparation with the caller's own credentials.
+
+Required code and proof remain open: both clock adapters, publication before
+execution, successful child realtime read, retained-copyout refusal, sleep
+completion/interruption, shared timex state, and the original pipeline's live
+syscall census. The four red routing witnesses are not acceptance evidence.
