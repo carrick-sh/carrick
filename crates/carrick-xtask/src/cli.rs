@@ -426,7 +426,13 @@ where
             Commands::StressCapture(_) if cfg!(target_os = "macos") => {
                 Some((crate::host_lease::HostLeaseMode::Carrick, true))
             }
-            Commands::Accept(_) => Some((crate::host_lease::HostLeaseMode::Gate, true)),
+            Commands::Accept(args) => crate::accept::validate_request_for_host(
+                args,
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+            )
+            .ok()
+            .map(|_| (crate::host_lease::HostLeaseMode::Gate, true)),
             Commands::Fixtures(args) => match &args.action {
                 crate::fixtures::FixturesAction::Restore { .. }
                 | crate::fixtures::FixturesAction::Prepare { .. } => {
@@ -456,7 +462,15 @@ where
                     .into_os_string(),
             ];
             command.extend(argv.into_iter().skip(1));
-            let code = crate::host_lease::run_command(mode, check_load, &command)?;
+            let code = match crate::host_lease::run_command(mode, check_load, &command) {
+                Ok(code) => code,
+                Err(error) => {
+                    if let Commands::Accept(args) = &cli.command {
+                        crate::accept::publish_refusal(cli.root.as_deref(), args, &error)?;
+                    }
+                    return Err(error.into());
+                }
+            };
             std::process::exit(code);
         }
     }

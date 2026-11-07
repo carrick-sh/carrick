@@ -8,9 +8,9 @@ prepare=0
 if [ "${1:-}" = --prepare ]; then prepare=1; shift; fi
 root="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
 shopt -s nullglob
-manifests=("$root"/fixtures/*/Cargo.toml)
+manifests=("$root"/fixtures/*/Cargo.toml "$root"/crates/*/fixtures/*/Cargo.toml)
 if [ "${#manifests[@]}" -eq 0 ]; then
-    echo 'fixture lockfile gate: no fixtures/*/Cargo.toml' >&2
+    echo 'fixture lockfile gate: no fixture Cargo.toml files' >&2
     exit 1
 fi
 if [ "$prepare" = 1 ]; then
@@ -26,6 +26,10 @@ for manifest in "${manifests[@]}"; do
         echo "missing lockfile: $manifest" >&2
         exit 1
     fi
+done
+for manifest in "${manifests[@]}"; do
+    # Resolve fixture aliases before Cargo resolves relative path dependencies.
+    manifest="$(cd -P "$(dirname "$manifest")" && pwd)/Cargo.toml"
     if [ "$prepare" = 1 ]; then
         # Check the restored cache first. No retry loop or hidden online fallback
         # is permitted after this explicit preparation step.

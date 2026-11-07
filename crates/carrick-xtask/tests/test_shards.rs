@@ -447,3 +447,25 @@ fn cache_preparation_failure_is_infrastructure_and_offline_gate_never_fetches() 
     assert_eq!(calls.lines().count(), 1);
     assert!(calls.starts_with("metadata --locked --format-version"));
 }
+
+#[test]
+fn fixture_lockfile_gate_rejects_missing_nested_lock_before_cargo() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = dir.path().join("crates/backend/fixtures/probe");
+    std::fs::create_dir_all(&fixture).unwrap();
+    std::fs::write(fixture.join("Cargo.toml"), "[workspace]\n").unwrap();
+    let output = Command::new("bash")
+        .arg(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../scripts/check-fixture-lockfiles.sh"),
+        )
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("missing lockfile:"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("crates/backend/fixtures/probe/Cargo.toml")
+    );
+}
