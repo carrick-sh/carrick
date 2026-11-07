@@ -24,6 +24,8 @@ dispatcher's syscalls byte for byte and prove the in-zone routing.
 
 [bindings]
 vm_free = [
+  "carrick-el1-linux::native_process_runtime::host_test_support::native_read_reply_retains_bytes_and_cursor_across_owner_wait",
+  "carrick-el1-linux::native_process_runtime::host_test_support::native_read_reply_fatal_cancellation_commits_no_more_bytes",
   "carrick-el1-linux::dispatch::tests::native_host_file_input_adapter_distinguishes_fault_from_lazy_source",
   "carrick-personality-linux::native_host_file::tests::file_staging_not_yet_input_builds_no_request_before_supply",
   "carrick-personality-linux::native_host_file::tests::file_staging_true_input_fault_does_not_request_backing",

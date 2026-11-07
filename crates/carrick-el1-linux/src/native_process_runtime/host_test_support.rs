@@ -4362,6 +4362,252 @@ fn tgkill_reaches_a_futex_parked_host_issued_sibling() {
     );
 }
 
+/// Exercise the production host-file service and completion entries. The
+/// carrier reply is supplied here; this is not a descriptor-retention witness.
+#[cfg(test)]
+fn native_read_reply_owner_wait(cancel: bool) {
+    use carrick_core_abi::service::{ServiceCell, ServiceOperation};
+    use carrick_personality_linux::native_host_file::{
+        DescriptionAccess, HostFileStage, NativeDescriptor,
+    };
+    struct Resident;
+    impl crate::file::MemoryValidator for Resident {
+        fn writable_bytes(&self, _: u64, len: usize) -> usize {
+            len
+        }
+        fn readable_bytes(&self, _: u64, len: usize) -> usize {
+            len
+        }
+    }
+    let fixture = native_exec_fixture();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let counters = Box::leak(Box::new(carrick_el1_abi::Counters::new()));
+    let mut service = fixture.service();
+    let handle = service.service_mm_handle(&fixture.address).unwrap();
+    let space = fixture
+        .zone
+        .space_entry(NonZeroU64::new(handle.mm().raw()).unwrap())
+        .unwrap();
+    space
+        .admit_notifications(
+            handle.incarnation(),
+            &carrick_sched_core::BoundedSpin(0),
+            &|effects| {
+                let _ = effects.defer_handbacks();
+            },
+        )
+        .unwrap();
+    let observed = space
+        .notifications(handle.incarnation())
+        .unwrap()
+        .observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Gate);
+    let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
+    service.on_copy_complete = Some(Box::new(move |address| {
+        if address.raw() == 0x10000 {
+            access.raise(space.index());
+        }
+    }));
+    // SAFETY: this fixture retains the exact live owner across the gate wait.
+    let wait = unsafe {
+        carrick_core_abi::PortalOwnerWait::from_owner(
+            handle,
+            carrick_core_abi::PortalWaitCause::Gate,
+            observed.revision(),
+        )
+    };
+    service.child_copy_error = Some(NativeProcessError::OwnerWait(wait));
+    service.child_copy_error_at = Some(0x11000);
+    let bytes: Vec<u8> = (0..8192).map(|n| (n % 251) as u8).collect();
+    let mut frame = carrick_el1_abi::TrapFrame {
+        esr: 0x15 << 26,
+        ..Default::default()
+    };
+    frame.x[8] = 63; // AArch64 read, the canonical ordinal.
+    frame.x[0] = 3;
+    frame.x[1] = 0x10000;
+    frame.x[2] = bytes.len() as u64;
+    let Some(HostFileStage::Request {
+        record,
+        output,
+        resolves_path,
+        map,
+        chdir,
+    }) = crate::dispatch::native_host_file_stage(
+        &frame,
+        fixture.task,
+        &Resident,
+        [1, 1, 1],
+        |_| {
+            Some(NativeDescriptor::HostBacked {
+                access: DescriptionAccess::ReadOnly,
+            })
+        },
+        &mut |_| 0,
+    )
+    else {
+        panic!("production read must stage a host-file request")
+    };
+    take_signal_copies();
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.begin_host_file_service(
+                record,
+                output,
+                resolves_path,
+                map,
+                chdir,
+                NativeServiceCall::new(
+                    carrick_guest_arch::NativeOrdinal::new(frame.x[8]),
+                    counters
+                )
+            ),
+            Ok(NativeResume::Left(None))
+        ));
+        assert!(entry.take_handoff_receipt().is_some());
+    }
+    let notice = fixture.task.service_notice.take().unwrap().unwrap();
+    let queue = fixture
+        .zone
+        .object_wait(
+            carrick_sched_core::object_wait::ObjectWaitKey::native_service(fixture.record).unwrap(),
+            &carrick_sched_core::ShortLockSpin,
+        )
+        .unwrap();
+    // SAFETY: this fixture owns the exact service queue and selected member.
+    let ticket = unsafe {
+        ServiceCell::claim_notice(
+            &fixture.control.service,
+            notice,
+            NonZeroU64::MIN,
+            fixture.zone.record(fixture.record.id).identity(),
+        )
+    }
+    .unwrap();
+    let ServiceOperation::HostFile { payload, .. } = ticket.request().operation else {
+        panic!("read must cross exactly once through HostFile")
+    };
+    // SAFETY: the claimed service owns mutable access until its completion ACK.
+    let record = unsafe {
+        core::slice::from_raw_parts_mut(
+            payload.address().raw() as *mut u8,
+            payload.length().raw() as usize,
+        )
+    };
+    carrick_core_abi::host_file::HostFileRequestView::parse(record)
+        .unwrap()
+        .reply(bytes.len() as i64, &bytes)
+        .unwrap();
+    assert!(ticket.complete(true).is_ok());
+    queue
+        .notify_object(fixture.slot, &mut WakeEffects::default())
+        .unwrap();
+    drop(queue);
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture.record.id
+    );
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                entry.resume_checkpoint(|_| Ok(None)),
+                Ok(NativeResume::Left(None))
+            ),
+            "completed read must park on its output owner, never return EFAULT"
+        );
+        assert!(entry.take_handoff_receipt().is_some());
+    }
+    assert_eq!(
+        take_signal_copies(),
+        [(UserVa::new(0x10000), bytes[..4096].to_vec())]
+    );
+    assert!(
+        fixture.task.service_notice.take().unwrap().is_none(),
+        "an owner gate wait must not issue another host read"
+    );
+    if cancel {
+        fixture
+            .page
+            .process_exit_custody()
+            .publish_cancellation(carrick_core::terminal::ProcessCancellation::FatalSignal);
+        fixture
+            .runtime
+            .cancel_service(fixture.record, fixture.slot, &mut service)
+            .unwrap();
+    }
+    service.child_copy_error = None;
+    access.lower(space.index());
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture.record.id
+    );
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    let resumed = entry.resume_checkpoint(|_| Ok(None)).unwrap();
+    if cancel {
+        assert!(!matches!(resumed, NativeResume::Returned(_)));
+        assert!(take_signal_copies().is_empty());
+    } else {
+        assert!(matches!(resumed, NativeResume::Returned(result) if result.raw() == 8192));
+        assert_eq!(
+            take_signal_copies(),
+            [(UserVa::new(0x11000), bytes[4096..].to_vec())]
+        );
+    }
+    assert!(fixture.task.service_notice.take().unwrap().is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn native_read_reply_retains_bytes_and_cursor_across_owner_wait() {
+    native_read_reply_owner_wait(false);
+}
+
+#[cfg(test)]
+#[test]
+fn native_read_reply_fatal_cancellation_commits_no_more_bytes() {
+    native_read_reply_owner_wait(true);
+}
+
 #[cfg(test)]
 fn completed_output_busy_yields(in_preparation: bool) {
     use carrick_core_abi::service::{ServiceCell, ServiceOperation};
