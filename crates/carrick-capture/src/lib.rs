@@ -1,14 +1,14 @@
-//! The one root-run capture command on dispatch agent clones (#1621; owner
+//! The one root-run capture command on agent-template clones (#1621; owner
 //! decision on #231, 2026-11-04, scoped by the carrick-87 review).
 //!
-//! The dispatch worker may run `sudo carrick-capture <name> [--seconds N]`
+//! The worker account may run `sudo carrick-capture <name> [--seconds N]`
 //! and nothing else that reaches bpftrace. `<name>` must be one of
 //! [`SCRIPTS`], reviewed `.bt` files compiled into this binary and installed
 //! root-owned under [`SCRIPT_DIR`]. There is no way to pass a program (`-e`),
 //! a program file, an include path, an output file or any other bpftrace
 //! option: root bpftrace with a free-form program can read any process's
-//! memory and any file, which would erase the loop/worker uid separation in
-//! `docs/ci/dispatch-worker.md`.
+//! memory and any file, which would erase the separation between the worker
+//! account and the accounts that hold credentials.
 //!
 //! Before it runs anything, the front checks that the installed script is
 //! byte-identical to the compiled-in copy and that it and every directory
