@@ -1,6 +1,6 @@
 //! Pure identity allocation shared by host and native process consumers.
 //! Consumers provide exclusion and own role-preserving claim lifetimes.
-use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 use core::num::{NonZeroI32, NonZeroU32, NonZeroU64};
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -48,13 +48,524 @@ pub struct NamespaceState {
     owner: Option<NamespaceAllocation>,
     refused: u64,
 }
+/// Venue-local owner of relocatable storage. Only the node array and header
+/// are mapped; this Vec is never interpreted through a foreign address alias.
 #[derive(Debug)]
 struct NamespaceAllocation {
+    header: NamespaceHeader,
+    nodes: Vec<NamespaceNode>,
+}
+
+/// Pointer-free allocator control, protected by the consumer's authority lock.
+/// All links index the separately retained node array; zero is the null link.
+#[derive(Debug)]
+#[repr(C)]
+pub struct NamespaceHeader {
     first: i32,
     last: i32,
     next: i32,
-    claims: BTreeMap<i32, ClaimCounts>,
-    visible_next: BTreeMap<VisibleNamespace, u32>,
+    root: u32,
+    free: u32,
+    used: u32,
+    visible_count: u32,
+    counts: [u64; 5],
+}
+
+/// One relocatable AVL node. A node is either an internal-number claim or an
+/// exact visible-namespace cursor; unused nodes belong to the header's free list.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+pub struct NamespaceNode {
+    key: u64,
+    claims: ClaimCounts,
+    visible_next: u32,
+    left: u32,
+    right: u32,
+    height: u32,
+}
+
+/// One allocator implementation over either local or mapped storage. The
+/// caller retains both allocations and exclusive authority for this borrow.
+/// Neither header nor nodes contain an address into the allocating venue.
+pub struct NamespaceView<'a> {
+    header: &'a mut NamespaceHeader,
+    nodes: &'a mut [NamespaceNode],
+}
+
+impl NamespaceHeader {
+    pub fn new(first: i32, last: i32, next: i32) -> Self {
+        assert!(first > 0);
+        assert!(last >= first);
+        assert!((first..=last).contains(&next));
+        Self {
+            first,
+            last,
+            next,
+            root: 0,
+            free: 0,
+            used: 0,
+            visible_count: 0,
+            counts: [0; 5],
+        }
+    }
+
+    /// Borrow an authenticated storage allocation. The consumer must map the
+    /// complete same node array, with initialized spare nodes, at either alias.
+    pub fn view<'a>(&'a mut self, nodes: &'a mut [NamespaceNode]) -> NamespaceView<'a> {
+        NamespaceView {
+            header: self,
+            nodes,
+        }
+    }
+}
+
+impl NamespaceHeader {
+    fn counts(&self) -> IdRegistryCounts {
+        IdRegistryCounts {
+            reserved_numbers: self.counts[0] as usize,
+            task_claims: self.counts[1] as usize,
+            thread_claims: self.counts[2] as usize,
+            process_group_claims: self.counts[3] as usize,
+            session_claims: self.counts[4] as usize,
+        }
+    }
+    fn find(&self, nodes: &[NamespaceNode], key: u64) -> Option<usize> {
+        let mut index = self.root;
+        while index != 0 {
+            let node = nodes[index as usize];
+            match key.cmp(&node.key) {
+                core::cmp::Ordering::Less => index = node.left,
+                core::cmp::Ordering::Greater => index = node.right,
+                core::cmp::Ordering::Equal => return Some(index as usize),
+            }
+        }
+        None
+    }
+}
+
+impl NamespaceView<'_> {
+    fn height(&self, index: u32) -> u32 {
+        if index == 0 {
+            0
+        } else {
+            self.nodes[index as usize].height
+        }
+    }
+    fn update(&mut self, index: u32) {
+        let node = self.nodes[index as usize];
+        self.nodes[index as usize].height = 1 + self.height(node.left).max(self.height(node.right));
+    }
+    fn rotate_left(&mut self, index: u32) -> u32 {
+        let right = self.nodes[index as usize].right;
+        self.nodes[index as usize].right = self.nodes[right as usize].left;
+        self.nodes[right as usize].left = index;
+        self.update(index);
+        self.update(right);
+        right
+    }
+    fn rotate_right(&mut self, index: u32) -> u32 {
+        let left = self.nodes[index as usize].left;
+        self.nodes[index as usize].left = self.nodes[left as usize].right;
+        self.nodes[left as usize].right = index;
+        self.update(index);
+        self.update(left);
+        left
+    }
+    fn balance(&mut self, index: u32) -> u32 {
+        self.update(index);
+        let node = self.nodes[index as usize];
+        if self.height(node.left) > self.height(node.right) + 1 {
+            let left = self.nodes[node.left as usize];
+            if self.height(left.right) > self.height(left.left) {
+                self.nodes[index as usize].left = self.rotate_left(node.left);
+            }
+            return self.rotate_right(index);
+        }
+        if self.height(node.right) > self.height(node.left) + 1 {
+            let right = self.nodes[node.right as usize];
+            if self.height(right.left) > self.height(right.right) {
+                self.nodes[index as usize].right = self.rotate_right(node.right);
+            }
+            return self.rotate_left(index);
+        }
+        index
+    }
+    fn find(&self, key: u64) -> Option<usize> {
+        self.header.find(self.nodes, key)
+    }
+    // An AVL tree with u32 node indices has height below 48. The fixed path
+    // keeps insert/remove off the recursive EL1/CPL0 stack budget entirely.
+    fn rebalance_path(&mut self, path: &[u32]) {
+        for depth in (0..path.len()).rev() {
+            let old = path[depth];
+            let new = self.balance(old);
+            if depth == 0 {
+                self.header.root = new;
+            } else {
+                let parent = path[depth - 1] as usize;
+                if self.nodes[parent].left == old {
+                    self.nodes[parent].left = new;
+                } else {
+                    self.nodes[parent].right = new;
+                }
+            }
+        }
+    }
+    fn insert(&mut self, index: u32) {
+        let mut path = [0_u32; 48];
+        let mut depth = 0;
+        let key = self.nodes[index as usize].key;
+        let mut root = self.header.root;
+        while root != 0 {
+            path[depth] = root;
+            depth += 1;
+            root = if key < self.nodes[root as usize].key {
+                self.nodes[root as usize].left
+            } else {
+                self.nodes[root as usize].right
+            };
+        }
+        if depth == 0 {
+            self.header.root = index;
+        } else {
+            let parent = path[depth - 1] as usize;
+            if key < self.nodes[parent].key {
+                self.nodes[parent].left = index;
+            } else {
+                self.nodes[parent].right = index;
+            }
+            self.rebalance_path(&path[..depth]);
+        }
+    }
+    fn entry(&mut self, key: u64) -> Result<usize, IdError> {
+        if let Some(index) = self.find(key) {
+            return Ok(index);
+        }
+        let index = if self.header.free != 0 {
+            let index = self.header.free;
+            self.header.free = self.nodes[index as usize].left;
+            index
+        } else {
+            let index = self
+                .header
+                .used
+                .checked_add(1)
+                .ok_or(IdError::StorageRequired)?;
+            if index as usize >= self.nodes.len() {
+                return Err(IdError::StorageRequired);
+            }
+            self.header.used = index;
+            index
+        };
+        self.nodes[index as usize] = NamespaceNode {
+            key,
+            height: 1,
+            ..NamespaceNode::default()
+        };
+        self.insert(index);
+        Ok(index as usize)
+    }
+    fn free(&mut self, index: u32) {
+        self.nodes[index as usize] = NamespaceNode {
+            left: self.header.free,
+            ..NamespaceNode::default()
+        };
+        self.header.free = index;
+    }
+    fn remove(&mut self, key: u64) {
+        let mut path = [0_u32; 48];
+        let mut depth = 0;
+        let mut index = self.header.root;
+        while index != 0 && self.nodes[index as usize].key != key {
+            path[depth] = index;
+            depth += 1;
+            index = if key < self.nodes[index as usize].key {
+                self.nodes[index as usize].left
+            } else {
+                self.nodes[index as usize].right
+            };
+        }
+        if index == 0 {
+            return;
+        }
+        let node = self.nodes[index as usize];
+        if node.left != 0 && node.right != 0 {
+            // Remove the successor, retaining the original index and links.
+            let target = index as usize;
+            path[depth] = index;
+            depth += 1;
+            index = node.right;
+            while self.nodes[index as usize].left != 0 {
+                path[depth] = index;
+                depth += 1;
+                index = self.nodes[index as usize].left;
+            }
+            let successor = self.nodes[index as usize];
+            self.nodes[target].key = successor.key;
+            self.nodes[target].claims = successor.claims;
+            self.nodes[target].visible_next = successor.visible_next;
+        }
+        let node = self.nodes[index as usize];
+        let replacement = if node.left == 0 {
+            node.right
+        } else {
+            node.left
+        };
+        if depth == 0 {
+            self.header.root = replacement;
+        } else {
+            let parent = path[depth - 1] as usize;
+            if self.nodes[parent].left == index {
+                self.nodes[parent].left = replacement;
+            } else {
+                self.nodes[parent].right = replacement;
+            }
+        }
+        self.free(index);
+        self.rebalance_path(&path[..depth]);
+    }
+    fn internal_key(raw: i32) -> u64 {
+        raw as u32 as u64
+    }
+    // Namespace incarnations occupy all 64 bits, so keep their original key
+    // by storing internal numbers in the otherwise impossible id=0 domain.
+    fn namespace_key(namespace: VisibleNamespace) -> u64 {
+        namespace.0.get()
+    }
+    fn visible_entry(&mut self, namespace: VisibleNamespace) -> Result<usize, IdError> {
+        let key = Self::namespace_key(namespace);
+        if let Some(index) = self.find(key) {
+            return Ok(index);
+        }
+        let index = self.entry(key)?;
+        self.nodes[index].visible_next = 2;
+        self.header.visible_count += 1;
+        Ok(index)
+    }
+    fn advance(&mut self) {
+        self.header.next = if self.header.next == self.header.last {
+            self.header.first
+        } else {
+            self.header.next + 1
+        };
+    }
+    pub fn release(&mut self, raw: InternalIdentity, kind: ClaimKind) {
+        let key = Self::internal_key(raw.get());
+        let Some(index) = self.find(key) else {
+            debug_assert!(false, "live identity token lost its registry claim");
+            return;
+        };
+        if !self.nodes[index].claims.decrement(kind) {
+            debug_assert!(false, "identity claim reference count underflow");
+            return;
+        }
+        self.header.counts[1 + kind.index()] -= 1;
+        if self.nodes[index].claims.is_empty() {
+            self.remove(key);
+            self.header.counts[0] -= 1;
+        }
+    }
+    pub fn reserve_next(&mut self, kind: ClaimKind) -> Result<InternalIdentity, IdError> {
+        let start = self.header.next;
+        loop {
+            let candidate = self.header.next;
+            // A storage refusal keeps the cursor and every claim unchanged.
+            if !self.is_reserved_number(candidate) {
+                let index = match self.entry(Self::internal_key(candidate)) {
+                    Ok(index) => index,
+                    Err(error) => {
+                        self.header.next = start;
+                        return Err(error);
+                    }
+                };
+                let incremented = self.nodes[index].claims.increment(kind);
+                debug_assert!(incremented);
+                self.header.counts[0] += 1;
+                self.header.counts[1 + kind.index()] += 1;
+                self.advance();
+                return Ok(InternalIdentity(
+                    NonZeroI32::new(candidate).ok_or(IdError::OutOfRange(candidate))?,
+                ));
+            }
+            self.advance();
+            if self.header.next == start {
+                return Err(IdError::Exhausted);
+            }
+        }
+    }
+    pub fn reserve_exact(
+        &mut self,
+        raw: i32,
+        kind: ClaimKind,
+    ) -> Result<InternalIdentity, IdError> {
+        if raw < self.header.first || raw > self.header.last {
+            return Err(IdError::OutOfRange(raw));
+        }
+        if self.is_reserved_number(raw) {
+            return Err(IdError::AlreadyReserved(raw));
+        }
+        let index = self.entry(Self::internal_key(raw))?;
+        let incremented = self.nodes[index].claims.increment(kind);
+        debug_assert!(incremented);
+        self.header.counts[0] += 1;
+        self.header.counts[1 + kind.index()] += 1;
+        Ok(InternalIdentity(
+            NonZeroI32::new(raw).ok_or(IdError::OutOfRange(raw))?,
+        ))
+    }
+    pub fn claim_related(
+        &mut self,
+        raw: i32,
+        kind: ClaimKind,
+    ) -> Result<InternalIdentity, IdError> {
+        let nonzero = NonZeroI32::new(raw).ok_or(IdError::OutOfRange(raw))?;
+        let index = self
+            .find(Self::internal_key(raw))
+            .ok_or(IdError::UnknownNamespaceId(raw))?;
+        if !self.nodes[index].claims.increment(kind) {
+            return Err(IdError::ClaimCountExhausted(raw));
+        }
+        self.header.counts[1 + kind.index()] += 1;
+        Ok(InternalIdentity(nonzero))
+    }
+    /// Preparation burns the visible number even when birth rolls back.
+    /// PID1 belongs to the root seed. StorageRequired is a provision request,
+    /// distinct from exhaustion, with no partially issued visible identity.
+    pub fn reserve_visible(
+        &mut self,
+        namespace: VisibleNamespace,
+    ) -> Result<VisibleIdentity, IdError> {
+        let index = self.visible_entry(namespace)?;
+        let next = &mut self.nodes[index].visible_next;
+        if *next >= i32::MAX as u32 {
+            return Err(IdError::Exhausted);
+        }
+        let value = NonZeroU32::new(*next).ok_or(IdError::Exhausted)?;
+        *next += 1;
+        Ok(VisibleIdentity(value))
+    }
+    pub fn advance_visible_past(
+        &mut self,
+        namespace: VisibleNamespace,
+        member: VisibleIdentity,
+    ) -> Result<(), IdError> {
+        if member.get() > i32::MAX as u32 {
+            return Err(IdError::Exhausted);
+        }
+        let next = member.get().checked_add(1).ok_or(IdError::Exhausted)?;
+        let index = self.visible_entry(namespace)?;
+        self.nodes[index].visible_next = self.nodes[index].visible_next.max(next);
+        Ok(())
+    }
+    pub fn set_next(&mut self, raw: i32) {
+        assert!((self.header.first..=self.header.last).contains(&raw));
+        self.header.next = raw;
+    }
+    pub fn retire_visible_namespace(&mut self, namespace: VisibleNamespace) {
+        let key = Self::namespace_key(namespace);
+        if self.find(key).is_some() {
+            self.remove(key);
+            self.header.visible_count -= 1;
+        }
+    }
+    pub fn is_reserved_number(&self, raw: i32) -> bool {
+        self.find(Self::internal_key(raw)).is_some()
+    }
+    pub fn visible_namespace_count(&self) -> usize {
+        self.header.visible_count as usize
+    }
+    pub fn counts(&self) -> IdRegistryCounts {
+        self.header.counts()
+    }
+}
+
+impl NamespaceAllocation {
+    fn new(first: i32, last: i32, next: i32) -> Self {
+        Self {
+            header: NamespaceHeader::new(first, last, next),
+            nodes: alloc::vec![NamespaceNode::default(); 16],
+        }
+    }
+    fn provision(&mut self) -> Result<(), IdError> {
+        if self.header.free == 0 && self.header.used as usize + 1 == self.nodes.len() {
+            let next = self
+                .nodes
+                .len()
+                .checked_mul(2)
+                .filter(|next| *next <= u32::MAX as usize)
+                .ok_or(IdError::StorageRequired)?;
+            self.nodes
+                .try_reserve_exact(next - self.nodes.len())
+                .map_err(|_| IdError::StorageRequired)?;
+            self.nodes.resize(next, NamespaceNode::default());
+        }
+        Ok(())
+    }
+    fn view(&mut self) -> NamespaceView<'_> {
+        self.header.view(&mut self.nodes)
+    }
+    fn reserve_next(&mut self, kind: ClaimKind) -> Result<InternalIdentity, IdError> {
+        if self.header.counts[0] < (self.header.last - self.header.first + 1) as u64 {
+            self.provision()?;
+        }
+        self.view().reserve_next(kind)
+    }
+    fn reserve_exact(&mut self, raw: i32, kind: ClaimKind) -> Result<InternalIdentity, IdError> {
+        if (self.header.first..=self.header.last).contains(&raw) && !self.is_reserved_number(raw) {
+            self.provision()?;
+        }
+        self.view().reserve_exact(raw, kind)
+    }
+    fn claim_related(&mut self, raw: i32, kind: ClaimKind) -> Result<InternalIdentity, IdError> {
+        self.view().claim_related(raw, kind)
+    }
+    fn release(&mut self, raw: InternalIdentity, kind: ClaimKind) {
+        self.view().release(raw, kind);
+    }
+    fn reserve_visible(&mut self, namespace: VisibleNamespace) -> Option<VisibleIdentity> {
+        if self
+            .header
+            .find(&self.nodes, NamespaceView::namespace_key(namespace))
+            .is_none()
+        {
+            self.provision().ok()?;
+        }
+        self.view().reserve_visible(namespace).ok()
+    }
+    fn advance_visible_past(
+        &mut self,
+        namespace: VisibleNamespace,
+        member: VisibleIdentity,
+    ) -> Option<()> {
+        if member.get() > i32::MAX as u32 {
+            return None;
+        }
+        if self
+            .header
+            .find(&self.nodes, NamespaceView::namespace_key(namespace))
+            .is_none()
+        {
+            self.provision().ok()?;
+        }
+        self.view().advance_visible_past(namespace, member).ok()
+    }
+    fn set_next(&mut self, raw: i32) {
+        self.view().set_next(raw);
+    }
+    fn retire_visible_namespace(&mut self, namespace: VisibleNamespace) {
+        self.view().retire_visible_namespace(namespace);
+    }
+    fn is_reserved_number(&self, raw: i32) -> bool {
+        self.header
+            .find(&self.nodes, NamespaceView::internal_key(raw))
+            .is_some()
+    }
+    fn counts(&self) -> IdRegistryCounts {
+        self.header.counts()
+    }
+    fn visible_namespace_count(&self) -> usize {
+        self.header.visible_count as usize
+    }
 }
 /// Owned claims and cursors, moved once rather than mirrored at the source.
 #[derive(Debug)]
@@ -62,6 +573,13 @@ pub struct TransferredNamespaceState {
     owner: NamespaceAllocation,
 }
 impl TransferredNamespaceState {
+    /// Consume local allocation custody into separately mappable, pointer-free
+    /// storage. The caller owns synchronization, mapping and node-array growth;
+    /// the allocator algorithm remains NamespaceView at both aliases.
+    pub fn into_storage(self) -> (NamespaceHeader, Vec<NamespaceNode>) {
+        (self.owner.header, self.owner.nodes)
+    }
+
     pub fn into_owner(self) -> NamespaceState {
         NamespaceState {
             owner: Some(self.owner),
@@ -125,14 +643,9 @@ impl NamespaceState {
         namespace: VisibleNamespace,
         member: VisibleIdentity,
     ) -> Option<()> {
-        let owner = self.allocation().ok()?;
-        let next = member.get().checked_add(1)?;
-        if member.get() > i32::MAX as u32 {
-            return None;
-        }
-        let cursor = owner.visible_next.entry(namespace).or_insert(2);
-        *cursor = (*cursor).max(next);
-        Some(())
+        self.allocation()
+            .ok()?
+            .advance_visible_past(namespace, member)
     }
     pub fn set_next(&mut self, raw: i32) {
         if let Ok(owner) = self.allocation() {
@@ -166,34 +679,6 @@ impl NamespaceState {
     }
 }
 
-impl NamespaceAllocation {
-    fn advance(&mut self) {
-        self.next = if self.next == self.last {
-            self.first
-        } else {
-            self.next + 1
-        };
-    }
-
-    pub fn release(&mut self, raw: InternalIdentity, kind: ClaimKind) {
-        let key = raw.get();
-        let remove = {
-            let Some(claims) = self.claims.get_mut(&key) else {
-                debug_assert!(false, "live identity token lost its registry claim");
-                return;
-            };
-            if !claims.decrement(kind) {
-                debug_assert!(false, "identity claim reference count underflow");
-                return;
-            }
-            claims.is_empty()
-        };
-        if remove {
-            self.claims.remove(&key);
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub enum ClaimKind {
     Task,
@@ -202,7 +687,8 @@ pub enum ClaimKind {
     Session,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
 struct ClaimCounts {
     tasks: u32,
     threads: u32,
@@ -244,6 +730,7 @@ impl ClaimCounts {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
 pub struct IdRegistryCounts {
     pub reserved_numbers: usize,
     pub task_claims: usize,
@@ -252,8 +739,21 @@ pub struct IdRegistryCounts {
     pub session_claims: usize,
 }
 
+impl ClaimKind {
+    fn index(self) -> usize {
+        match self {
+            Self::Task => 0,
+            Self::Thread => 1,
+            Self::ProcessGroup => 2,
+            Self::Session => 3,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IdError {
+    /// The mapped consumer must provision storage outside its authority lock.
+    StorageRequired,
     AuthorityTransferred,
     Exhausted,
     OutOfRange(i32),
@@ -262,120 +762,10 @@ pub enum IdError {
     ClaimCountExhausted(i32),
 }
 
-impl NamespaceAllocation {
-    pub fn new(first: i32, last: i32, next: i32) -> Self {
-        assert!(first > 0);
-        assert!(last >= first);
-        assert!((first..=last).contains(&next));
-        Self {
-            first,
-            last,
-            next,
-            claims: BTreeMap::new(),
-            visible_next: BTreeMap::new(),
-        }
-    }
-    /// Preparation burns its visible number even when birth rolls back.
-    /// PID1 is reserved for the root seed, not allocated here.
-    pub fn reserve_visible(&mut self, namespace: VisibleNamespace) -> Option<VisibleIdentity> {
-        let next = self.visible_next.entry(namespace).or_insert(2);
-        if *next >= i32::MAX as u32 {
-            return None;
-        }
-        let value = NonZeroU32::new(*next)?;
-        *next += 1;
-        Some(VisibleIdentity(value))
-    }
-    pub fn visible_namespace_count(&self) -> usize {
-        self.visible_next.len()
-    }
-    /// Exact namespace retirement discards only its visible-number cursor.
-    pub fn retire_visible_namespace(&mut self, namespace: VisibleNamespace) {
-        self.visible_next.remove(&namespace);
-    }
-    pub fn set_next(&mut self, raw: i32) {
-        assert!((self.first..=self.last).contains(&raw));
-        self.next = raw;
-    }
-    pub fn is_reserved_number(&self, raw: i32) -> bool {
-        self.claims.contains_key(&raw)
-    }
-    pub fn counts(&self) -> IdRegistryCounts {
-        self.claims
-            .values()
-            .fold(IdRegistryCounts::default(), |mut counts, claim| {
-                counts.reserved_numbers += 1;
-                counts.task_claims += claim.tasks as usize;
-                counts.thread_claims += claim.threads as usize;
-                counts.process_group_claims += claim.process_groups as usize;
-                counts.session_claims += claim.sessions as usize;
-                counts
-            })
-    }
-    pub fn reserve_next(&mut self, kind: ClaimKind) -> Result<InternalIdentity, IdError> {
-        let start = self.next;
-        loop {
-            let candidate = self.next;
-            self.advance();
-            if !self.claims.contains_key(&candidate) {
-                let Some(candidate) = NonZeroI32::new(candidate) else {
-                    return Err(IdError::OutOfRange(candidate));
-                };
-                let incremented = self
-                    .claims
-                    .entry(candidate.get())
-                    .or_default()
-                    .increment(kind);
-                if !incremented {
-                    return Err(IdError::ClaimCountExhausted(candidate.get()));
-                }
-                return Ok(InternalIdentity(candidate));
-            }
-            if self.next == start {
-                return Err(IdError::Exhausted);
-            }
-        }
-    }
-    pub fn reserve_exact(
-        &mut self,
-        raw: i32,
-        kind: ClaimKind,
-    ) -> Result<InternalIdentity, IdError> {
-        if raw < self.first || raw > self.last {
-            return Err(IdError::OutOfRange(raw));
-        }
-        if self.claims.contains_key(&raw) {
-            return Err(IdError::AlreadyReserved(raw));
-        }
-        let Some(raw) = NonZeroI32::new(raw) else {
-            return Err(IdError::OutOfRange(raw));
-        };
-        if !self.claims.entry(raw.get()).or_default().increment(kind) {
-            return Err(IdError::ClaimCountExhausted(raw.get()));
-        }
-        Ok(InternalIdentity(raw))
-    }
-    pub fn claim_related(
-        &mut self,
-        raw: i32,
-        kind: ClaimKind,
-    ) -> Result<InternalIdentity, IdError> {
-        let Some(nonzero) = NonZeroI32::new(raw) else {
-            return Err(IdError::OutOfRange(raw));
-        };
-        let Some(claims) = self.claims.get_mut(&raw) else {
-            return Err(IdError::UnknownNamespaceId(raw));
-        };
-        if !claims.increment(kind) {
-            return Err(IdError::ClaimCountExhausted(raw));
-        }
-        Ok(InternalIdentity(nonzero))
-    }
-}
-
 impl core::fmt::Display for IdError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::StorageRequired => f.write_str("namespace metadata storage requires growth"),
             Self::AuthorityTransferred => {
                 f.write_str("Linux namespace authority has been transferred")
             }
@@ -876,7 +1266,7 @@ mod tests {
         assert_eq!(owner.reserve_visible(new).unwrap().get(), 2);
         owner.retire_visible_namespace(old);
         assert_eq!(owner.reserve_visible(new).unwrap().get(), 3);
-        assert_eq!(owner.owner.as_mut().unwrap().visible_next.len(), 1);
+        assert_eq!(owner.visible_namespace_count(), 1);
     }
 
     #[test]
@@ -892,18 +1282,20 @@ mod tests {
         let other = VisibleNamespace::new(NonZeroU32::new(2).unwrap(), NonZeroU32::MIN);
         assert_eq!(owner.reserve_visible(other).unwrap().get(), 2);
         owner
-            .owner
-            .as_mut()
-            .unwrap()
-            .visible_next
-            .insert(namespace, i32::MAX as u32 - 1);
+            .advance_visible_past(
+                namespace,
+                VisibleIdentity::from_existing_member(
+                    NonZeroU32::new(i32::MAX as u32 - 2).unwrap(),
+                ),
+            )
+            .unwrap();
         assert_eq!(
             owner.reserve_visible(namespace).unwrap().get(),
             i32::MAX as u32 - 1
         );
         assert_eq!(owner.reserve_visible(namespace), None);
         owner.retire_visible_namespace(namespace);
-        assert_eq!(owner.owner.as_mut().unwrap().visible_next.len(), 1);
+        assert_eq!(owner.visible_namespace_count(), 1);
         assert_eq!(owner.reserve_visible(other).unwrap().get(), 3);
     }
 
