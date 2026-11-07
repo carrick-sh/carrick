@@ -56,3 +56,17 @@ host delegation and memory-mailbox consumers still use the global region;
 replacing only the IPC accessor does not migrate their lifetimes. No
 Slice 1 completion or x86 runtime pipe-service acceptance is claimed.
 Slices 2–6 remain outside this continuation's scope.
+
+Host handback, continuation and resume now borrow their operation storage
+from `ZoneHostServices`, whose existing `Arc<HostIpc>` retains the exact
+kernel's authority. The borrowed `IpcRegion` cannot outlive that service.
+The two-kernel production-service witness drops both dispatchers, contexts
+and external storage owners before looking up and completing an operation;
+the peer service rejects that region and cannot find its operation. The
+witness was compile-red with E0599 before the borrowed region accessor.
+This removes the global window from completion selection, but does not
+remove its publication. Descriptor admission must still compare its kernel
+owner with the carrier's mapped window: a reused carrier can retain the
+first kernel's window while a later kernel presents a different authority.
+Removing that guard before a retained carrier binding replaces it would
+publish foreign descriptor identities into the live map.
