@@ -36,14 +36,11 @@ fn region() -> &'static IpcRegion<'static> {
 }
 
 /// A backed pipe (ring from a fresh ring-area extent).
-fn pipe(r: &IpcRegion<'_>, offset: u64) -> IpcObjectHandle {
-    let mut retired = None;
-    let object = r.create_pipe(65536, &mut retired, &Spin).unwrap();
-    let mut storage = IpcPipeStorage {
-        offset,
-        ring_bytes: 16 * IPC_PIPE_PAGE_SIZE as u64,
-        pages: 16,
-    };
+fn pipe(r: &IpcRegion<'_>, _offset: u64) -> IpcObjectHandle {
+    let object = r.create_pipe(65536, &Spin).unwrap();
+    let mut storage = r
+        .provision_pipe_storage(16 * IPC_PIPE_PAGE_SIZE as u64, 16, &Spin)
+        .unwrap();
     let mut guard = r.lock(object, &Spin).unwrap();
     assert!(guard.provide_pipe_storage(&mut storage).unwrap());
     object

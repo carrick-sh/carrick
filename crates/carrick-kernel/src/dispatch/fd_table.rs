@@ -384,9 +384,7 @@ impl TimerFdState {
         Self {
             inner: Mutex::new(TimerFdInner {
                 clock_id,
-                interval: None,
-                deadline: None,
-                expirations: 0,
+                state: carrick_timer_core::timerfd::State::default(),
             }),
             changed: Condvar::new(),
             clock,
@@ -457,9 +455,7 @@ impl TimerFdState {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct TimerFdInner {
     pub(super) clock_id: u64,
-    pub(super) interval: Option<Duration>,
-    pub(super) deadline: Option<Duration>,
-    pub(super) expirations: u64,
+    pub(super) state: carrick_timer_core::timerfd::State,
 }
 
 #[derive(Debug, Clone)]

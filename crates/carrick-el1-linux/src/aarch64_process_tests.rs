@@ -1489,7 +1489,7 @@ impl Fixture {
         ttbr0: u64,
         service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
         dispatch: impl FnOnce(
-            &mut dyn carrick_personality_linux::lifecycle::ProcessNative<Aarch64ParkedContext>,
+            &mut dyn carrick_personality_linux::lifecycle::ProcessNative<'_, Aarch64ParkedContext>,
         ) -> R,
     ) -> Result<R, NativeProcessError> {
         with_process_entry(
@@ -7301,7 +7301,9 @@ fn arm_unadopted_exit_wakes_closing_owner_without_process_venue() {
         }),
         None,
         Some(fixture),
-        None::<&mut dyn carrick_personality_linux::lifecycle::ProcessNative<Aarch64ParkedContext>>,
+        None::<
+            &mut dyn carrick_personality_linux::lifecycle::ProcessNative<'_, Aarch64ParkedContext>,
+        >,
         None,
         None,
         |_| core::ptr::null_mut(),
@@ -8611,7 +8613,9 @@ fn arm_concurrent_exit_group_loser_retires_and_wakes_owner() {
         }),
         None,
         Some(fixture),
-        None::<&mut dyn carrick_personality_linux::lifecycle::ProcessNative<Aarch64ParkedContext>>,
+        None::<
+            &mut dyn carrick_personality_linux::lifecycle::ProcessNative<'_, Aarch64ParkedContext>,
+        >,
         None,
         None,
         |_| core::ptr::null_mut(),
@@ -8734,7 +8738,9 @@ fn arm_unadopted_exit_wakes_unplaceable_closing_owner_without_process_venue() {
         }),
         None,
         Some(fixture),
-        None::<&mut dyn carrick_personality_linux::lifecycle::ProcessNative<Aarch64ParkedContext>>,
+        None::<
+            &mut dyn carrick_personality_linux::lifecycle::ProcessNative<'_, Aarch64ParkedContext>,
+        >,
         None,
         None,
         |_| core::ptr::null_mut(),
@@ -9976,16 +9982,6 @@ fn serial_host_native_children_close_descriptors_above_inherited_capacity() {
     let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
     let words = fixture.tables.live(&fixture.maintenance);
     let task = CurrentTask::new();
-    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
-        source,
-        &fixture.task,
-        fixture.page,
-        fixture.control,
-        fixture.address,
-        fixture.address,
-        parked,
-    )
-    .unwrap();
     let owner = Arc::new(
         HostIpc::with_ceiling(
             1 << 20,
@@ -10038,6 +10034,17 @@ fn serial_host_native_children_close_descriptors_above_inherited_capacity() {
     let mut crossing = TestStockCrossing::new(&pages);
     crossing.metadata_in_el1_window = true;
     crossing.ipc = Some((Arc::clone(&owner), map));
+    let tables = crate::ipc::MapTables(map);
+    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+        source,
+        &fixture.task,
+        fixture.page,
+        fixture.control,
+        fixture.address,
+        fixture.address,
+        parked,
+    )
+    .unwrap();
     let mut service = Aarch64NativeProcessService::with_crossing(
         &fixture.task,
         fixture.slot,
@@ -10083,7 +10090,6 @@ fn serial_host_native_children_close_descriptors_above_inherited_capacity() {
             .is_queued()
     );
 
-    let tables = crate::ipc::MapTables(map);
     let venue = crate::ipc::IpcVenue {
         region: owner.region(),
         tables: &tables,
@@ -10192,6 +10198,98 @@ fn serial_host_native_children_close_descriptors_above_inherited_capacity() {
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof() {
+    native_fork_descriptor_calls(None);
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_fork_children_create_eventfd_in_their_own_tables() {
+    native_fork_descriptor_calls(Some(
+        carrick_personality_linux::crossing::nr::EVENTFD2.raw(),
+    ));
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_fork_children_create_epoll_in_their_own_tables() {
+    native_fork_descriptor_calls(Some(
+        carrick_personality_linux::crossing::nr::EPOLL_CREATE1.raw(),
+    ));
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_fork_children_create_pipe_in_their_own_tables() {
+    native_fork_descriptor_calls(Some(carrick_personality_linux::crossing::nr::PIPE2.raw()));
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_fork_children_create_timerfd_in_their_own_tables() {
+    native_fork_descriptor_calls(Some(
+        carrick_personality_linux::crossing::nr::TIMERFD_CREATE.raw(),
+    ));
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+fn native_fork_descriptor_calls(constructor: Option<u64>) {
+    native_descriptor_calls(constructor, false);
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_root_creates_epoll_with_live_children() {
+    native_descriptor_calls(
+        Some(carrick_personality_linux::crossing::nr::EPOLL_CREATE1.raw()),
+        true,
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_root_creates_pipe_with_live_children() {
+    native_descriptor_calls(
+        Some(carrick_personality_linux::crossing::nr::PIPE2.raw()),
+        true,
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_root_creates_eventfd_with_live_children() {
+    native_descriptor_calls(
+        Some(carrick_personality_linux::crossing::nr::EVENTFD2.raw()),
+        true,
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_root_creates_timerfd_with_live_children() {
+    native_descriptor_calls(
+        Some(carrick_personality_linux::crossing::nr::TIMERFD_CREATE.raw()),
+        true,
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn serial_host_native_fork_epoll_ctl_observes_peer_pipe_write() {
+    native_descriptor_witness(None, false, true);
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+fn native_descriptor_calls(constructor: Option<u64>, root_constructor: bool) {
+    native_descriptor_witness(constructor, root_constructor, false);
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+fn native_descriptor_witness(
+    constructor: Option<u64>,
+    root_constructor: bool,
+    inherited_epoll: bool,
+) {
+    use crate::ipc::IpcTables;
     use carrick_abi::{
         LINUX_F_DUPFD, LINUX_F_DUPFD_CLOEXEC, LINUX_F_GETFD, LINUX_F_GETFL, LINUX_F_SETFD,
         LINUX_F_SETFL, LINUX_O_NONBLOCK, LINUX_O_WRONLY,
@@ -10209,16 +10307,6 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
     let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
     let words = fixture.tables.live(&fixture.maintenance);
     let task = CurrentTask::new();
-    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
-        source,
-        &fixture.task,
-        fixture.page,
-        fixture.control,
-        fixture.address,
-        fixture.address,
-        parked,
-    )
-    .unwrap();
     let owner = Arc::new(
         HostIpc::with_limits(
             1 << 20,
@@ -10275,6 +10363,21 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
         carrick_el1_abi::ipc::fd::CloseEffects::POSIX_RECORD_LOCKS,
     );
 
+    // Supply an inherited, fully admitted epoll only in the control witness.
+    // Constructor witnesses still have to create their object through dispatch.
+    let epoll = inherited_epoll.then(|| {
+        let object = owner.create_epoll().unwrap();
+        let description = owner
+            .admit_description(fd::Description::new(
+                IpcBacking::Epoll { object }.encode(),
+                fd::AccessMode::ReadWrite,
+                fd::StatusFlags::default(),
+            ))
+            .unwrap();
+        description.install(table.id(), fd::Fd(6), true).unwrap();
+        description
+    });
+
     let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
     let map = unsafe {
         &*region
@@ -10287,6 +10390,17 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
     let mut crossing = TestStockCrossing::new(&pages);
     crossing.metadata_in_el1_window = true;
     crossing.ipc = Some((Arc::clone(&owner), map));
+    let tables = crate::ipc::MapTables(map);
+    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+        source,
+        &fixture.task,
+        fixture.page,
+        fixture.control,
+        fixture.address,
+        fixture.address,
+        parked,
+    )
+    .unwrap();
     let mut service = Aarch64NativeProcessService::with_crossing(
         &fixture.task,
         fixture.slot,
@@ -10336,7 +10450,11 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
             .is_queued()
     );
 
-    let tables = crate::ipc::MapTables(map);
+    if let Some(epoll) = epoll {
+        table.close(fd::Fd(6)).unwrap();
+        drop(epoll);
+    }
+
     let venue = crate::ipc::IpcVenue {
         region: owner.region(),
         tables: &tables,
@@ -10344,8 +10462,13 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
     let counters = Box::new(carrick_el1_abi::Counters::new());
     let names = Box::new(carrick_el1_abi::InotifyNameCache::new());
 
-    let run_in_child = |idx: usize, nr: u64, args: [u64; 3]| -> (CompletionRoute, i64) {
-        let mut cpu = crate::sched::FakeCpu::default();
+    let run_in_child_full = |idx: usize, nr: u64, args: [u64; 4]| -> (CompletionRoute, i64) {
+        let mut cpu = crate::sched::FakeCpu {
+            // Keep the timerfd past-deadline witness independent of defaults.
+            now: 1_000_000,
+            freq: 24_000_000,
+            ..Default::default()
+        };
         let mut svc = Aarch64NativeProcessService::with_crossing(
             &task,
             fixture.slot,
@@ -10355,8 +10478,12 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
             &crossing,
         )
         .with_words(&words);
-        let child_ctx =
-            Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, child_bindings[idx].address);
+        let binding = if root_constructor {
+            &parent_binding
+        } else {
+            &child_bindings[idx]
+        };
+        let child_ctx = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, binding.address);
         let mut entry = runtime.enter(source, &task, child_ctx, &mut svc).unwrap();
         let mut frame = carrick_el1_abi::TrapFrame {
             slot: fixture.slot.index() as u64,
@@ -10367,6 +10494,7 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
         frame.x[0] = args[0];
         frame.x[1] = args[1];
         frame.x[2] = args[2];
+        frame.x[3] = args[3];
         carrick_test_support::assert_guest_args(&args);
         let route = super::dispatch::dispatch_syscall_with_native(
             &mut frame,
@@ -10392,15 +10520,445 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
         (route, frame.x[0] as i64)
     };
 
+    let run_in_child = |idx: usize, nr: u64, args: [u64; 3]| {
+        run_in_child_full(idx, nr, [args[0], args[1], args[2], 0])
+    };
+
     let sys_dup = carrick_personality_linux::crossing::nr::DUP.raw();
     let sys_dup3 = carrick_personality_linux::crossing::nr::DUP3.raw();
     let sys_fcntl = carrick_personality_linux::crossing::nr::FCNTL.raw();
     let sys_close = carrick_personality_linux::crossing::nr::CLOSE.raw();
     let sys_read = carrick_personality_linux::crossing::nr::READ.raw();
     let sys_write = carrick_personality_linux::crossing::nr::WRITE.raw();
-    activate_target(source, &task, &child_bindings[0]);
+    activate_target(
+        source,
+        &task,
+        if root_constructor {
+            &parent_binding
+        } else {
+            &child_bindings[0]
+        },
+    );
     for binding in &child_bindings {
         assert!(runtime.task_binding(binding.key).is_some());
+    }
+
+    if inherited_epoll {
+        use carrick_personality_linux::crossing::nr as sys;
+        let cookie = 0x1506_1234_5678_9abcu64;
+        let mut interest = [0u8; 16];
+        interest[..4].copy_from_slice(&carrick_abi::LINUX_EPOLLIN.to_ne_bytes());
+        interest[8..].copy_from_slice(&cookie.to_ne_bytes());
+        let interest = carrick_test_support::GuestUserBuffer::from_bytes(&interest);
+        let events = carrick_test_support::GuestUserBuffer::from_bytes(&[0xa5; 16]);
+        let completed = |idx, ordinal, arguments| {
+            let (route, result) = run_in_child_full(idx, ordinal, arguments);
+            assert!(
+                matches!(route, CompletionRoute::Served | CompletionRoute::WithWork),
+                "child {idx} epoll member call {ordinal} must be served in ring, got {route:?} ({result})"
+            );
+            result
+        };
+        assert_eq!(
+            completed(
+                0,
+                sys::EPOLL_CTL.raw(),
+                [6, carrick_abi::LINUX_EPOLL_CTL_ADD, 3, interest.arg()]
+            ),
+            0
+        );
+        assert_eq!(
+            completed(0, sys::EPOLL_PWAIT.raw(), [6, events.arg(), 1, 0]),
+            0
+        );
+        assert_eq!(events.as_bytes(), &[0xa5; 16]);
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(fixture.slot, child_bindings[0].record.id)
+                .is_queued()
+        );
+        activate_target(source, &task, &child_bindings[1]);
+        let payload = carrick_test_support::GuestUserBuffer::from_bytes(b"peer");
+        assert_eq!(completed(1, sys::WRITE.raw(), [4, payload.arg(), 4, 0]), 4);
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(fixture.slot, child_bindings[1].record.id)
+                .is_queued()
+        );
+        activate_target(source, &task, &child_bindings[0]);
+        assert_eq!(
+            completed(0, sys::EPOLL_PWAIT.raw(), [6, events.arg(), 1, 0]),
+            1
+        );
+        assert_eq!(
+            u32::from_ne_bytes(events.as_bytes()[..4].try_into().unwrap())
+                & carrick_abi::LINUX_EPOLLIN,
+            carrick_abi::LINUX_EPOLLIN
+        );
+        assert_eq!(
+            u64::from_ne_bytes(events.as_bytes()[8..16].try_into().unwrap()),
+            cookie
+        );
+        let received = carrick_test_support::GuestUserBuffer::zeroed(4);
+        assert_eq!(completed(0, sys::READ.raw(), [3, received.arg(), 4, 0]), 4);
+        assert_eq!(received.as_bytes(), b"peer");
+        assert_eq!(
+            completed(0, sys::EPOLL_PWAIT.raw(), [6, events.arg(), 1, 0]),
+            0
+        );
+        return;
+    }
+
+    if let Some(nr) = constructor {
+        use carrick_personality_linux::crossing::nr as sys;
+        let output = carrick_test_support::GuestUserBuffer::zeroed(8);
+        // Every follow-up read is nonblocking: an empty or miswired object
+        // must fail an assertion instead of parking this fixture indefinitely.
+        let flags = carrick_syscall_abi::LINUX_O_CLOEXEC
+            | if nr == sys::EPOLL_CREATE1.raw() {
+                0
+            } else {
+                LINUX_O_NONBLOCK
+            };
+        let args = if nr == sys::PIPE2.raw() {
+            [output.arg(), flags, 0]
+        } else if nr == sys::EVENTFD2.raw() {
+            [7, flags, 0]
+        } else if nr == sys::TIMERFD_CREATE.raw() {
+            [1, flags, 0] // CLOCK_MONOTONIC
+        } else {
+            [flags, 0, 0]
+        };
+        if root_constructor {
+            assert_eq!(tables.table_of(&task), Some(table.id().to_raw()));
+            assert!(tables.owned_table_of(&task).is_none());
+            let (route, result) = run_in_child(0, nr, args);
+            assert!(
+                matches!(route, CompletionRoute::Served | CompletionRoute::WithWork),
+                "root constructor {nr} must share the children's ring path, got {route:?} ({result})"
+            );
+            assert!(result >= 0, "root constructor {nr} errno {}", -result);
+            let created = if nr == sys::PIPE2.raw() {
+                assert_eq!(result, 0);
+                output
+                    .as_bytes()
+                    .chunks_exact(4)
+                    .map(|bytes| u64::from(u32::from_ne_bytes(bytes.try_into().unwrap())))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![result as u64]
+            };
+            for fd in created.iter().copied() {
+                let (route, result) = run_in_child(0, sys::FCNTL.raw(), [fd, LINUX_F_GETFD, 0]);
+                assert!(matches!(
+                    route,
+                    CompletionRoute::Served | CompletionRoute::WithWork
+                ));
+                assert_eq!(result, 1, "root descriptor must expose FD_CLOEXEC in ring");
+                let (route, result) = run_in_child(0, sys::CLOSE.raw(), [fd, 0, 0]);
+                assert!(matches!(
+                    route,
+                    CompletionRoute::Served | CompletionRoute::WithWork
+                ));
+                assert_eq!(
+                    result, 0,
+                    "root descriptor must close through its ring owner"
+                );
+            }
+            if nr == sys::EVENTFD2.raw() {
+                let invalid = run_in_child(0, nr, [7, 2, 0]);
+                assert!(matches!(
+                    invalid.0,
+                    CompletionRoute::Served | CompletionRoute::WithWork
+                ));
+                assert_eq!(invalid.1, -22, "unknown eventfd flag");
+                let (_, semaphore) = run_in_child(0, nr, [2, flags | 1, 0]);
+                assert_eq!(
+                    semaphore, created[0] as i64,
+                    "invalid flags cannot consume an fd"
+                );
+                let value = carrick_test_support::GuestUserBuffer::zeroed(8);
+                for _ in 0..2 {
+                    assert_eq!(
+                        run_in_child(0, sys::READ.raw(), [semaphore as u64, value.arg(), 8]).1,
+                        8
+                    );
+                    assert_eq!(u64::from_ne_bytes(value.as_bytes().try_into().unwrap()), 1);
+                }
+                assert_eq!(
+                    run_in_child(0, sys::READ.raw(), [semaphore as u64, value.arg(), 8]).1,
+                    -11
+                );
+                assert_eq!(
+                    run_in_child(0, sys::CLOSE.raw(), [semaphore as u64, 0, 0]).1,
+                    0
+                );
+            }
+            if nr == sys::PIPE2.raw() {
+                // A failed exact-MM output must cancel both numeric claims.
+                let (route, result) =
+                    run_in_child(0, nr, [carrick_guest_arch::USER_CEILING, flags, 0]);
+                assert!(matches!(
+                    route,
+                    CompletionRoute::Served | CompletionRoute::WithWork
+                ));
+                assert_eq!(result, -14);
+                let (route, result) = run_in_child(0, nr, args);
+                assert!(matches!(
+                    route,
+                    CompletionRoute::Served | CompletionRoute::WithWork
+                ));
+                assert_eq!(result, 0);
+                let retried: Vec<_> = output
+                    .as_bytes()
+                    .chunks_exact(4)
+                    .map(|bytes| u64::from(u32::from_ne_bytes(bytes.try_into().unwrap())))
+                    .collect();
+                assert_eq!(
+                    retried, created,
+                    "copy fault leaves no descriptors or reserved holes"
+                );
+                for fd in retried {
+                    assert_eq!(run_in_child(0, sys::CLOSE.raw(), [fd, 0, 0]).1, 0);
+                }
+            }
+            return;
+        }
+        let mut results = Vec::new();
+        for idx in 0..2 {
+            if idx != 0 {
+                assert!(
+                    fixture
+                        .zone
+                        .requeue_preempted(fixture.slot, child_bindings[idx - 1].record.id)
+                        .is_queued()
+                );
+                activate_target(source, &task, &child_bindings[idx]);
+            }
+            let (route, result) = run_in_child(idx, nr, args);
+            // Test the production family entry. Forward here is the missing
+            // ring implementation: native_unstaged_exit subsequently lowers
+            // this exact child call to counted ENOSYS (-38).
+            let pair = output.as_bytes().to_vec();
+            // Check completion before using the return as a descriptor. Each
+            // functional check runs while this child is still the active task.
+            assert!(
+                matches!(route, CompletionRoute::Served | CompletionRoute::WithWork),
+                "child {idx} constructor {nr} must be served in ring, got {route:?} ({result})"
+            );
+            assert!(
+                result >= 0,
+                "child {idx} constructor {nr} errno {}",
+                -result
+            );
+            let completed = |ordinal, arguments| {
+                let (route, result) = run_in_child(idx, ordinal, arguments);
+                assert!(
+                    matches!(route, CompletionRoute::Served | CompletionRoute::WithWork),
+                    "child {idx} follow-up {ordinal} must be served in ring, got {route:?} ({result})"
+                );
+                result
+            };
+            if nr == sys::PIPE2.raw() {
+                assert_eq!(result, 0);
+                let read = u64::from(u32::from_ne_bytes(pair[..4].try_into().unwrap()));
+                let write = u64::from(u32::from_ne_bytes(pair[4..].try_into().unwrap()));
+                let payload = carrick_test_support::GuestUserBuffer::from_bytes(b"new pipe");
+                let received = carrick_test_support::GuestUserBuffer::zeroed(8);
+                assert_eq!(completed(sys::READ.raw(), [read, received.arg(), 8]), -11);
+                assert_eq!(completed(sys::WRITE.raw(), [write, payload.arg(), 8]), 8);
+                assert_eq!(completed(sys::READ.raw(), [read, received.arg(), 8]), 8);
+                assert_eq!(received.as_bytes(), payload.as_bytes());
+                assert_eq!(completed(sys::READ.raw(), [read, received.arg(), 8]), -11);
+                assert_ne!(
+                    completed(sys::FCNTL.raw(), [read, LINUX_F_GETFL, 0]) & LINUX_O_NONBLOCK as i64,
+                    0
+                );
+                assert_ne!(
+                    completed(sys::FCNTL.raw(), [write, LINUX_F_GETFL, 0])
+                        & LINUX_O_NONBLOCK as i64,
+                    0
+                );
+            } else if nr == sys::EVENTFD2.raw() {
+                let fd = result as u64;
+                let received = carrick_test_support::GuestUserBuffer::zeroed(8);
+                assert_eq!(completed(sys::READ.raw(), [fd, received.arg(), 8]), 8);
+                assert_eq!(
+                    u64::from_ne_bytes(received.as_bytes().try_into().unwrap()),
+                    7
+                );
+                assert_eq!(completed(sys::READ.raw(), [fd, received.arg(), 8]), -11);
+                let value = carrick_test_support::GuestUserBuffer::from_value(23u64);
+                assert_eq!(completed(sys::WRITE.raw(), [fd, value.arg(), 8]), 8);
+                assert_eq!(completed(sys::READ.raw(), [fd, received.arg(), 8]), 8);
+                assert_eq!(
+                    u64::from_ne_bytes(received.as_bytes().try_into().unwrap()),
+                    23
+                );
+                assert_ne!(
+                    completed(sys::FCNTL.raw(), [fd, LINUX_F_GETFL, 0]) & LINUX_O_NONBLOCK as i64,
+                    0
+                );
+            } else if nr == sys::EPOLL_CREATE1.raw() {
+                // The unused argument registers are zero, including timeout
+                // and signal mask. An empty instance must return immediately.
+                let events = carrick_test_support::GuestUserBuffer::from_bytes(&[0xa5; 16]);
+                assert_eq!(
+                    completed(sys::EPOLL_PWAIT.raw(), [result as u64, events.arg(), 1]),
+                    0
+                );
+                assert_eq!(events.as_bytes(), &[0xa5; 16]);
+                // A newly constructed epoll uses the same member owner as
+                // an inherited one; register a newly constructed eventfd.
+                let eventfd = completed(sys::EVENTFD2.raw(), [1, LINUX_O_NONBLOCK, 0]);
+                assert!(eventfd >= 0);
+                let mut member_bytes = [0; 16];
+                member_bytes[..4].copy_from_slice(&1u32.to_ne_bytes());
+                member_bytes[8..].copy_from_slice(&0x1506u64.to_ne_bytes());
+                let member = carrick_test_support::GuestUserBuffer::from_bytes(&member_bytes);
+                let (route, added) = run_in_child_full(
+                    idx,
+                    sys::EPOLL_CTL.raw(),
+                    [result as u64, 1, eventfd as u64, member.arg()],
+                );
+                assert!(matches!(
+                    route,
+                    CompletionRoute::Served | CompletionRoute::WithWork
+                ));
+                assert_eq!(added, 0);
+                assert_eq!(
+                    completed(sys::EPOLL_PWAIT.raw(), [result as u64, events.arg(), 1]),
+                    1
+                );
+                assert_eq!(
+                    u64::from_ne_bytes(events.as_bytes()[8..16].try_into().unwrap()),
+                    0x1506
+                );
+                let counter = carrick_test_support::GuestUserBuffer::zeroed(8);
+                assert_eq!(
+                    completed(sys::READ.raw(), [eventfd as u64, counter.arg(), 8]),
+                    8
+                );
+                assert_eq!(
+                    completed(sys::EPOLL_PWAIT.raw(), [result as u64, events.arg(), 1]),
+                    0
+                );
+                assert_eq!(completed(sys::CLOSE.raw(), [eventfd as u64, 0, 0]), 0);
+            } else {
+                // A timer constructor must publish a usable timer, not just
+                // an fd. All calls go through this child's production entry.
+                let spec = carrick_test_support::GuestUserBuffer::from_bytes(&[0xa5; 32]);
+                assert_eq!(
+                    completed(sys::TIMERFD_GETTIME.raw(), [result as u64, spec.arg(), 0]),
+                    0
+                );
+                assert_eq!(spec.as_bytes(), &[0; 32]);
+                let received = carrick_test_support::GuestUserBuffer::zeroed(8);
+                assert_eq!(
+                    completed(sys::READ.raw(), [result as u64, received.arg(), 8]),
+                    -11
+                );
+                // Absolute monotonic 1ns is already in the past in this
+                // default-clock fixture. A one-shot must fire exactly once;
+                // no sleep, polling loop or host timer supplies the answer.
+                let mut armed = [0u8; 32];
+                armed[24..32].copy_from_slice(&1i64.to_ne_bytes());
+                let armed = carrick_test_support::GuestUserBuffer::from_bytes(&armed);
+                let previous = carrick_test_support::GuestUserBuffer::from_bytes(&[0xa5; 32]);
+                let (route, set) = run_in_child_full(
+                    idx,
+                    sys::TIMERFD_SETTIME.raw(),
+                    [
+                        result as u64,
+                        carrick_abi::LINUX_TIMER_ABSTIME,
+                        armed.arg(),
+                        previous.arg(),
+                    ],
+                );
+                assert!(matches!(
+                    route,
+                    CompletionRoute::Served | CompletionRoute::WithWork
+                ));
+                assert_eq!(set, 0, "child {idx} arms its own timerfd");
+                assert_eq!(previous.as_bytes(), &[0; 32]);
+                assert_eq!(
+                    completed(sys::READ.raw(), [result as u64, received.arg(), 8]),
+                    8
+                );
+                assert_eq!(
+                    u64::from_ne_bytes(received.as_bytes().try_into().unwrap()),
+                    1
+                );
+                assert_eq!(
+                    completed(sys::READ.raw(), [result as u64, received.arg(), 8]),
+                    -11,
+                    "a consumed one-shot cannot fire twice"
+                );
+                assert_eq!(
+                    completed(sys::TIMERFD_GETTIME.raw(), [result as u64, spec.arg(), 0]),
+                    0
+                );
+                assert_eq!(spec.as_bytes(), &[0; 32], "expired one-shot is disarmed");
+            }
+            results.push((route, result, pair));
+        }
+        let mut backings = Vec::new();
+        for (idx, (route, result, pair)) in results.into_iter().enumerate() {
+            assert!(
+                matches!(route, CompletionRoute::Served | CompletionRoute::WithWork),
+                "child {idx} constructor {nr} must be served in ring, got {route:?} ({result})"
+            );
+            assert!(
+                result >= 0,
+                "child {idx} constructor {nr} errno {}",
+                -result
+            );
+            let child_table = fd::TableId::from_raw(map.lookup_owned(children[idx]).unwrap());
+            let fds = if nr == sys::PIPE2.raw() {
+                assert_eq!(result, 0);
+                pair.chunks_exact(4)
+                    .map(|bytes| i32::from_ne_bytes(bytes.try_into().unwrap()))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![i32::try_from(result).unwrap()]
+            };
+            for created in fds {
+                assert!(
+                    owner
+                        .region()
+                        .fd(carrick_kernel::el1_zone::HostLockWait)
+                        .getfd(child_table, fd::Fd(created))
+                        .unwrap()
+                );
+                backings.push(
+                    owner
+                        .region()
+                        .fd(carrick_kernel::el1_zone::HostLockWait)
+                        .get(child_table, fd::Fd(created))
+                        .unwrap()
+                        .backing,
+                );
+                assert!(
+                    owner
+                        .region()
+                        .fd(carrick_kernel::el1_zone::HostLockWait)
+                        .get(table.id(), fd::Fd(created))
+                        .is_err(),
+                    "child creation must not publish in the parent table"
+                );
+            }
+        }
+        let per_child = if nr == sys::PIPE2.raw() { 2 } else { 1 };
+        for endpoint in 0..per_child {
+            assert_ne!(
+                backings[endpoint],
+                backings[per_child + endpoint],
+                "new constructors must allocate independent objects in the two live children"
+            );
+        }
+        return;
     }
 
     // 1. dup(4) allocates lowest free slot 0 and clears FD_CLOEXEC.
@@ -10659,16 +11217,6 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
     let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
     let words = fixture.tables.live(&fixture.maintenance);
     let task = CurrentTask::new();
-    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
-        source,
-        &fixture.task,
-        fixture.page,
-        fixture.control,
-        fixture.address,
-        fixture.address,
-        parked,
-    )
-    .unwrap();
     let owner = Arc::new(
         HostIpc::with_limits(
             1 << 20,
@@ -10722,6 +11270,17 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
     let mut crossing = TestStockCrossing::new(&pages);
     crossing.metadata_in_el1_window = true;
     crossing.ipc = Some((Arc::clone(&owner), map));
+    let tables = crate::ipc::MapTables(map);
+    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+        source,
+        &fixture.task,
+        fixture.page,
+        fixture.control,
+        fixture.address,
+        fixture.address,
+        parked,
+    )
+    .unwrap();
     let mut service = Aarch64NativeProcessService::with_crossing(
         &fixture.task,
         fixture.slot,
@@ -10767,7 +11326,6 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
             .is_queued()
     );
 
-    let tables = crate::ipc::MapTables(map);
     let venue = crate::ipc::IpcVenue {
         region: owner.region(),
         tables: &tables,

@@ -656,6 +656,7 @@ const fn route_shared(ordinal: u64, allocator_control: u64) -> Family {
         226 => Family::Anonymous(AnonymousCall::Mprotect),
         63 => Family::Read,
         64 | 66 => Family::Write,
+        20 | 21 => Family::Descriptor,
         22 => Family::EpollWait,
         62 => Family::FileSeek,
         67 | 68 => Family::FilePositioned,
@@ -880,7 +881,14 @@ pub const fn descriptor_ordinal(ordinal: CanonicalNr) -> bool {
     use crate::crossing::nr;
     matches!(
         owner_ordinal(ordinal),
-        nr::DUP | nr::DUP3 | nr::FCNTL | nr::CLOSE
+        nr::DUP
+            | nr::DUP3
+            | nr::FCNTL
+            | nr::CLOSE
+            | nr::EPOLL_CREATE1
+            | nr::EPOLL_CTL
+            | nr::PIPE2
+            | nr::EVENTFD2
     )
 }
 

@@ -12,8 +12,8 @@
 schema_version = 1
 id = "kernel.el1.ipc-fd-authority"
 title = "One shared descriptor incarnation retains exact OFD pins"
-guest_surfaces = ["kernel:filetable", "syscall:execve", "syscall:dup2", "syscall:fcntl", "syscall:close", "syscall:sendmsg", "syscall:mmap"]
-semantic_authority = ["man 2 execve", "man 2 fork", "man 2 clone", "man 2 dup", "man 2 fcntl", "man 2 close", "man 2 close_range", "man 7 inotify", "man 7 epoll", "man 7 unix", "man 2 mmap"]
+guest_surfaces = ["kernel:filetable", "syscall:execve", "syscall:dup2", "syscall:fcntl", "syscall:close", "syscall:sendmsg", "syscall:mmap", "syscall:pipe2", "syscall:eventfd2", "syscall:epoll_create1", "syscall:timerfd_create", "syscall:timerfd_settime", "syscall:timerfd_gettime"]
+semantic_authority = ["man 2 execve", "man 2 fork", "man 2 clone", "man 2 dup", "man 2 fcntl", "man 2 close", "man 2 close_range", "man 7 inotify", "man 7 epoll", "man 7 unix", "man 2 mmap", "man 2 pipe2", "man 2 eventfd", "man 2 epoll_create1", "man 2 timerfd_create"]
 fixture = "fd-core:two-live-table owners and incarnation pins"
 scale_points = [65, 4096, 65536]
 rationale = "Fork shares OFD offsets/status, not descriptor flags. CLONE_FILES shares table identity; exec unshares first. Pins retain the original incarnation through close/dup2/reuse and final release occurs once. A native in-ring close remains local when it has no host-owned effects; descriptions carrying process record locks, host-owned epoll interest, or inotify close observation replay through the one canonical host close authority. Allocation searches at most 2*bitmap_levels-1 words and backed steady-state operations allocate zero objects. Descriptor backing allocation uses a shared pointer-free buddy tree with logarithmic tree depth; live extents remain disjoint and retirement returns storage to the same pool. See the M1 witness ledger for exact test bindings and evidence limits."
@@ -25,6 +25,16 @@ structural_budgets = []
 
 [bindings]
 vm_free = [
+  "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_fork_exec_pipe_writer_reaches_its_parent (#1506: production fork/exec successor constructs eventfd and epoll, counter read, empty wait, flags and close)",
+  "carrick-el1-linux::aarch64_process_tests::serial_host_native_fork_children_create_timerfd_in_their_own_tables (#1506 red-first: production child settime with old-value output, immediate absolute one-shot expiration, exact count, drained EAGAIN and disarmed gettime; constructor still unserved, no scheduler-wakeup or creator-domain proof)",
+  "carrick-timer-core::timerfd::tests (shared state/arm/consume and expiry arithmetic prerequisite only; no ring clock, scheduler or constructor acceptance)",
+  "carrick-timer-core::timerfd::clock_projection_tests (shared creator-clock source and deadline policy consumed by host ClockDomain/timerfd planner; no published ring clock or native constructor acceptance)",
+  "carrick-kernel::kernel::container::clock_domain_tests (production ClockDomain clock modes, offsets, virtual progress and clock-change enrollment)",
+  "carrick-kernel::dispatch::container_clock_tests::timerfd_deadline_is_bound_to_the_creating_containers_clock (production host timers isolate their creator domains)",
+  "carrick-el1-abi::ipc::tests::el1_ipc_too_small_retained_ring_stays_owned_until_replacement (#1506: retained extent identity, no stock consumption on refusal, exactly one replacement transfer; constructor syscall remains unserved)",
+  "carrick-el1-linux::aarch64_process_tests::serial_host_native_fork_epoll_ctl_observes_peer_pipe_write (#1506 red-first: pre-admitted inherited epoll, native child ADD, peer child pipe write, zero-timeout readiness/data and drain; no constructor or signed execution claim)",
+  "carrick-el1-linux::aarch64_process_tests::{serial_host_native_fork_children_create_eventfd_in_their_own_tables,serial_host_native_fork_children_create_epoll_in_their_own_tables,serial_host_native_fork_children_create_pipe_in_their_own_tables,serial_host_native_fork_children_create_timerfd_in_their_own_tables} (#1506 red-first: real forks, two live children, production dispatch, independent backing and private descriptor publication; no signed instruction or complete constructor work-budget claim)",
+  "carrick-el1-linux::aarch64_process_tests::{serial_host_native_root_creates_epoll_with_live_children,serial_host_native_root_creates_pipe_with_live_children,serial_host_native_root_creates_eventfd_with_live_children,serial_host_native_root_creates_timerfd_with_live_children} (#1506 red-first: borrowed root table, two live native children, production dispatch, in-ring creation/fcntl/close; no signed instruction or constructor implementation claim)",
   "carrick-kernel::kernel::objects::ipc::tests::{one_table_writer,no_host_slot_selection}",
   "carrick-el1-abi::ipc_tables::tests::directory_custody_cannot_replace_or_retire_a_borrowed_binding",
   "carrick-el1-linux::aarch64_process_tests::{serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof,serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe}",
@@ -46,6 +56,10 @@ vm_free = [
   "carrick-kernel::kernel::objects::tests::reserved_pair_refusal_publishes_neither_slot_or_functional_reference",
   "carrick-xtask::el1_image_sysroot::image_build::frame_budget::tests::{fd_inheritance_charges_retained_core_and_storage_frames,fd_retirement_charges_release_callbacks_after_revocation}",
   "carrick-el1-abi::refusal_census_tests::refusal_snapshot_preserves_caller_populations_without_changing_service_counts",
+  "carrick-el1-abi::ipc::tests::{shared_pipe_supply_without_stock_reuses_and_replaces_owned_extents,shared_growth_reprobes_a_peer_publication_even_at_the_ceiling,object_growth_observation_excludes_the_segment_still_being_linked}",
+  "carrick-fd-core::tests::{pipe_pair_claims_keep_two_tables_private_and_settle_once,pipe_pair_refusal_preserves_claims_and_cancel_restores_lowest_holes,growth_observation_excludes_the_segment_still_being_linked}",
+  "carrick-el1-linux::native_process_runtime::host_test_support::{pipe_constructor_output_retains_both_claims_across_owner_wait,pipe_constructor_output_cancellation_reclaims_both_claims_and_endpoints}",
+  "carrick-el1-linux::ipc::tests::el1_ipc_io_first_write_supplies_shared_storage_or_returns_enomem",
 ]
 
 [bindings.unresolved]

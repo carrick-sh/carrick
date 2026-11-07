@@ -293,8 +293,6 @@ host_crossings! {
     Times = nr::TIMES, false, Permanent;
     Gettimeofday = nr::GETTIMEOFDAY, false, Permanent;
     Getrandom = nr::GETRANDOM, false, Permanent;
-    Eventfd2 = nr::EVENTFD2, false, Temporary;
-    EpollCreate1 = nr::EPOLL_CREATE1, false, Temporary;
     EpollCtl = nr::EPOLL_CTL, false, Temporary;
     EpollPwait = nr::EPOLL_PWAIT, true, Temporary;
     Dup = nr::DUP, false, Temporary;
@@ -302,7 +300,6 @@ host_crossings! {
     Fcntl = nr::FCNTL, false, Temporary;
     InotifyInit1 = nr::INOTIFY_INIT1, false, Temporary;
     Close = nr::CLOSE, false, Temporary;
-    Pipe2 = nr::PIPE2, false, Temporary;
     Signalfd4 = nr::SIGNALFD4, false, Temporary;
     TimerfdCreate = nr::TIMERFD_CREATE, false, Temporary;
     TimerfdSettime = nr::TIMERFD_SETTIME, false, Temporary;
@@ -584,7 +581,7 @@ mod tests {
 
     #[test]
     fn test_aarch64_crossings_exact() {
-        assert_eq!(HOST_CROSSINGS.iter().flatten().count(), 122);
+        assert_eq!(HOST_CROSSINGS.iter().flatten().count(), 119);
         for (crossing, _, _) in HOST_CROSSINGS.iter().flatten() {
             let nr = crossing.canonical();
             assert!(
@@ -596,6 +593,9 @@ mod tests {
         // Implemented families are not unported crossings. Their explicit declines
         // use typed family fallback and bypass this unported-call table.
         for wire_in_ring in [
+            nr::PIPE2,
+            nr::EVENTFD2,
+            nr::EPOLL_CREATE1,
             CanonicalNr(27), // inotify_add_watch
             CanonicalNr(28), // inotify_rm_watch
             nr::PPOLL,

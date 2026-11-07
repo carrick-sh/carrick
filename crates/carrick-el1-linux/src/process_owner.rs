@@ -1134,7 +1134,9 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
     /// Return heap custody directly instead of an aggregate return buffer.
     // Unboxing at the call retains the topology/effects on the EL1 stack;
     // boxed custody reduces publish_exit + finish_exit by 384 compiled bytes.
+    // Keep the boxed publication frame separate from finish_exit on EL1.
     #[allow(clippy::boxed_local)]
+    #[inline(never)]
     pub fn publish(
         mut self: Box<Self>,
     ) -> Result<Box<GuestPublishedExit<N>>, GuestProcessError<N::Error>> {

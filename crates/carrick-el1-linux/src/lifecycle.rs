@@ -34,14 +34,15 @@ pub(super) fn install_raw_exit_before_commit_hook(
 
 impl<
     'a,
+    'ipc,
     F: Fn(u32) -> *mut u8,
     C: ThreadCpu,
     U: UserWord,
     G: GuestDispatchFrame,
     Context: super::dispatch::DispatchContext,
-> El1PendingFamilies<'a, F, C, U, G, Context>
+> El1PendingFamilies<'a, 'ipc, F, C, U, G, Context>
 {
-    fn process_venue(&mut self) -> Option<&mut (dyn ProcessNative<Context> + 'a)> {
+    fn process_venue(&mut self) -> Option<&mut (dyn ProcessNative<'ipc, Context> + 'a)> {
         let binding = LifecycleNative::binding(self)?;
         let venue = self.process.as_deref_mut()?;
         (venue.binding() == binding).then_some(venue)
@@ -81,7 +82,7 @@ impl<
     U: UserWord,
     G: GuestDispatchFrame,
     Context: super::dispatch::DispatchContext,
-> UserCopy for El1PendingFamilies<'_, F, C, U, G, Context>
+> UserCopy for El1PendingFamilies<'_, '_, F, C, U, G, Context>
 {
     fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> CopyOutcome {
         #[cfg(test)]
@@ -173,12 +174,13 @@ impl<
 
 impl<
     'a,
+    'ipc,
     F: Fn(u32) -> *mut u8,
     C: ThreadCpu,
     U: UserWord,
     G: GuestDispatchFrame,
     Context: super::dispatch::DispatchContext,
-> LifecycleNative<'a> for El1PendingFamilies<'a, F, C, U, G, Context>
+> LifecycleNative<'a> for El1PendingFamilies<'a, 'ipc, F, C, U, G, Context>
 {
     fn wait_guest_copy(&mut self, request: GuestCopyRequest) -> LifecycleOutcome {
         let venue = self.process_venue().unwrap_or_else(|| {
@@ -729,13 +731,14 @@ impl<
 
 impl<
     'a,
+    'ipc,
     F: Fn(u32) -> *mut u8,
     C: ThreadCpu,
     U: UserWord,
     G: GuestDispatchFrame,
     Context: super::dispatch::DispatchContext,
 > carrick_personality_linux::identity::IdentityNative<'a>
-    for El1PendingFamilies<'a, F, C, U, G, Context>
+    for El1PendingFamilies<'a, 'ipc, F, C, U, G, Context>
 {
     fn arguments(&self) -> [u64; 6] {
         [
@@ -807,13 +810,14 @@ impl<
 
 impl<
     'a,
+    'ipc,
     F: Fn(u32) -> *mut u8,
     C: ThreadCpu,
     U: UserWord,
     G: GuestDispatchFrame,
     Context: super::dispatch::DispatchContext,
 > carrick_personality_linux::sysinfo::SysinfoNative<'a>
-    for El1PendingFamilies<'a, F, C, U, G, Context>
+    for El1PendingFamilies<'a, 'ipc, F, C, U, G, Context>
 {
     fn arguments(&self) -> [u64; 6] {
         [
@@ -841,12 +845,14 @@ impl<
 
 impl<
     'a,
+    'ipc,
     F: Fn(u32) -> *mut u8,
     C: ThreadCpu,
     U: UserWord,
     G: GuestDispatchFrame,
     Context: super::dispatch::DispatchContext,
-> carrick_personality_linux::ipc::IpcNative<'a> for El1PendingFamilies<'a, F, C, U, G, Context>
+> carrick_personality_linux::ipc::IpcNative<'a>
+    for El1PendingFamilies<'a, 'ipc, F, C, U, G, Context>
 {
     fn arguments(&self) -> [u64; 6] {
         [
@@ -877,13 +883,14 @@ impl<
 
 impl<
     'a,
+    'ipc,
     F: Fn(u32) -> *mut u8,
     C: ThreadCpu,
     U: UserWord,
     G: GuestDispatchFrame,
     Context: super::dispatch::DispatchContext,
 > carrick_personality_linux::signal::SignalNative<'a>
-    for El1PendingFamilies<'a, F, C, U, G, Context>
+    for El1PendingFamilies<'a, 'ipc, F, C, U, G, Context>
 {
     fn wait_guest_copy(
         &mut self,

@@ -4035,7 +4035,7 @@ pub struct NativeProcessEntry<
     // A shared return checkpoint observed real work before a concurrent host
     // could drain its doorbell. Keep that refusal with this admitted owner.
     signal_work_deferred: bool,
-    copyout_ready: Option<Box<service::OwnedCopyout>>,
+    copyout_ready: Option<Box<service::OwnedCopyout<'a>>>,
     adapter_ready: Option<Box<service::AdapterPreparation>>,
     service_phase: NativeServicePhase,
 }
@@ -4043,6 +4043,32 @@ pub struct NativeProcessEntry<
 impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     NativeProcessEntry<'r, 'a, M, C, S>
 {
+    fn finish_output_outcome(
+        &mut self,
+        result: Result<NativeResume, NativeProcessError>,
+    ) -> LifecycleOutcome {
+        match self.drain_copyout(result) {
+            Ok(NativeResume::Returned(result)) => returned(result.raw()),
+            Ok(NativeResume::Left(None)) => LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                result: SyscallResult::new(0),
+            },
+            Ok(NativeResume::NoPending) => {
+                // A cancellation can win before park publishes. The service
+                // has dropped output and returned terminal custody; it has
+                // not completed this syscall with an errno.
+                if let Some(outcome) = self.resume_pending_lifecycle() {
+                    return outcome;
+                }
+                match self.cancel_owner_wait() {
+                    Ok(outcome) => outcome,
+                    Err(error) => self.run_failed(error.run_failure_reason()),
+                }
+            }
+            Ok(_) => self.run_failed(NativeProcessError::Quarantined.run_failure_reason()),
+            Err(error) => self.fail(error),
+        }
+    }
     /// Saved words owned by this admitted member, before executor handback.
     pub fn resume_context(&self) -> &C {
         &self.words
@@ -7495,7 +7521,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         Ok(visible.get())
     }
 }
-impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> ProcessNative<C>
+impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> ProcessNative<'a, C>
     for NativeProcessEntry<'_, 'a, M, C, S>
 {
     fn is_root_process(&self) -> bool {
@@ -7587,6 +7613,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         );
         carrick_core::mm::transaction::OwnedOperationYield::Suspended
     }
+    fn complete_constructor_output(
+        &mut self,
+        address: UserVa,
+        bytes: Vec<u8>,
+        effect: Box<dyn carrick_personality_linux::lifecycle::CopyoutEffect + 'a>,
+    ) -> LifecycleOutcome {
+        let result = self.finish_copyout(service::OwnedCopyout {
+            address,
+            bytes,
+            offset: 0,
+            result: SyscallResult::new(0),
+            effect: Some(effect),
+        });
+        self.finish_output_outcome(result)
+    }
     fn complete_copyout(
         &mut self,
         address: UserVa,
@@ -7598,28 +7639,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             bytes,
             offset: 0,
             result,
+            effect: None,
         });
-        match self.drain_copyout(result) {
-            Ok(NativeResume::Returned(result)) => returned(result.raw()),
-            Ok(NativeResume::Left(None)) => LifecycleOutcome::Transferred {
-                progress: carrick_core::Served::Idle,
-                result: SyscallResult::new(0),
-            },
-            Ok(NativeResume::NoPending) => {
-                // A cancellation can win before park publishes. The service
-                // has dropped output and returned terminal custody; it has
-                // not completed this syscall with an errno.
-                if let Some(outcome) = self.resume_pending_lifecycle() {
-                    return outcome;
-                }
-                match self.cancel_owner_wait() {
-                    Ok(outcome) => outcome,
-                    Err(error) => self.run_failed(error.run_failure_reason()),
-                }
-            }
-            Ok(_) => self.run_failed(NativeProcessError::Quarantined.run_failure_reason()),
-            Err(error) => self.fail(error),
-        }
+        self.finish_output_outcome(result)
     }
     fn take_map_source(
         &mut self,
@@ -15632,6 +15654,7 @@ mod tests {
         let names = carrick_el1_abi::InotifyNameCache::new();
         let mut copy = HostCopy;
         let mut pending: super::super::dispatch::El1PendingFamilies<
+            '_,
             '_,
             _,
             super::super::sched::FakeCpu,

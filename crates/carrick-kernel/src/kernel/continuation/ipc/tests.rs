@@ -269,11 +269,7 @@ impl World {
         at
     }
     fn pipe(&self) -> (Fd, Fd, IpcObjectHandle) {
-        let mut retired = None;
-        let object = self
-            .region
-            .create_pipe(65536, &mut retired, &HostIpcWait)
-            .unwrap();
+        let object = self.region.create_pipe(65536, &HostIpcWait).unwrap();
         // The ring the host's first write provides.
         let mut storage = IpcPipeStorage {
             offset: self.bump(65536 + 16 * 8),
