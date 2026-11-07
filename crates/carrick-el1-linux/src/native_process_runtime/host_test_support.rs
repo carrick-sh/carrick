@@ -6547,7 +6547,7 @@ fn getdents_reply_copy_outcome(
             payload.length().raw() as usize,
         )
     };
-    let mut view = HostFileRequestView::parse(record).unwrap();
+    let view = HostFileRequestView::parse(record).unwrap();
     assert_eq!(
         view.header().op,
         carrick_core_abi::host_file::HostFileOp::Getdents64

@@ -445,7 +445,7 @@ impl<'a> FsView<'a> {
         }
         let out_off = match self.sendfile_offset(out_fd, off_out_addr, memory) {
             Ok(offset) => offset as u64,
-            Err(outcome) => return outcome,
+            Err(outcome) => return *outcome,
         };
         let offset_out = match super::super::copyout::prepare(
             kernel,
@@ -1530,7 +1530,7 @@ impl<'a> FsView<'a> {
                         // Character devices have no seek position, so off_in is not
                         // used or updated, but guest pointer validity is checked.
                         if let Err(outcome) = this.sendfile_offset(in_fd.0, off_in_address, memory) {
-                            return Ok(outcome);
+                            return Ok(*outcome);
                         }
                     }
 
@@ -1581,7 +1581,7 @@ impl<'a> FsView<'a> {
             };
             let mut offset = match this.sendfile_offset(in_fd.0, off_in_address, memory) {
                 Ok(offset) => offset,
-                Err(outcome) => return Ok(outcome),
+                Err(outcome) => return Ok(*outcome),
             };
             let offset_out = match super::super::copyout::prepare(cx.kernel, memory, [
                 super::super::copyout::UserSlot::optional(off_in_address, 8),

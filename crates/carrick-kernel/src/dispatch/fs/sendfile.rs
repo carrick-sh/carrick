@@ -189,30 +189,33 @@ impl<'a> FsView<'a> {
         in_fd: i32,
         offset_address: u64,
         memory: &impl CurrentMmMemory,
-    ) -> Result<usize, DispatchOutcome> {
+    ) -> Result<usize, Box<DispatchOutcome>> {
         if offset_address != 0 {
             return match memory.read_bytes(offset_address, 8) {
                 Ok(bytes) => {
                     let offset = u64::from_ne_bytes(
                         bytes
                             .try_into()
-                            .map_err(|_| DispatchOutcome::errno(LINUX_EFAULT))?,
+                            .map_err(|_| Box::new(DispatchOutcome::errno(LINUX_EFAULT)))?,
                     );
-                    usize::try_from(offset)
-                        .map_err(|_| DispatchOutcome::errno(crate::linux_abi::LINUX_EOVERFLOW))
+                    usize::try_from(offset).map_err(|_| {
+                        Box::new(DispatchOutcome::errno(crate::linux_abi::LINUX_EOVERFLOW))
+                    })
                 }
-                Err(error) => Err(DispatchOutcome::from_owner_memory_error(error)
-                    .unwrap_or_else(|| DispatchOutcome::errno(LINUX_EFAULT))),
+                Err(error) => Err(Box::new(
+                    DispatchOutcome::from_owner_memory_error(error)
+                        .unwrap_or_else(|| DispatchOutcome::errno(LINUX_EFAULT)),
+                )),
             };
         }
         let Some(in_file) = self.open_file(in_fd) else {
-            return Err(DispatchOutcome::errno(LINUX_EBADF));
+            return Err(Box::new(DispatchOutcome::errno(LINUX_EBADF)));
         };
         let Some(open) = crate::kernel::FileDescription::read_for_io(&in_file.description) else {
-            return Err(DispatchOutcome::errno(LINUX_EINVAL));
+            return Err(Box::new(DispatchOutcome::errno(LINUX_EINVAL)));
         };
         match &*open {
-            OpenDescription::Closed { .. } => Err(DispatchOutcome::errno(LINUX_EBADF)),
+            OpenDescription::Closed { .. } => Err(Box::new(DispatchOutcome::errno(LINUX_EBADF))),
             OpenDescription::File { offset, .. }
             | OpenDescription::InMemoryFile { offset, .. }
             | OpenDescription::SyntheticFile { offset, .. } => Ok(*offset),
@@ -223,7 +226,7 @@ impl<'a> FsView<'a> {
                     .host_syscall_errno()
                 {
                     Ok(cur) => Ok(cur as usize),
-                    Err(errno) => Err(DispatchOutcome::errno(errno)),
+                    Err(errno) => Err(Box::new(DispatchOutcome::errno(errno))),
                 }
             }
             OpenDescription::Directory { .. }
@@ -247,7 +250,7 @@ impl<'a> FsView<'a> {
             | OpenDescription::VirtualConsole { .. }
             | OpenDescription::Netlink { .. }
             | OpenDescription::InMemorySocket { .. }
-            | OpenDescription::Packet { .. } => Err(DispatchOutcome::errno(LINUX_EINVAL)),
+            | OpenDescription::Packet { .. } => Err(Box::new(DispatchOutcome::errno(LINUX_EINVAL))),
         }
     }
 
@@ -384,7 +387,7 @@ impl<'a> FsView<'a> {
 
             let mut offset = match this.sendfile_offset(in_fd.0, offset_address, memory) {
                 Ok(offset) => offset,
-                Err(outcome) => return Ok(outcome),
+                Err(outcome) => return Ok(*outcome),
             };
             let offset_out = match copyout::prepare(cx.kernel, memory, [UserSlot::optional(offset_address, 8)]) {
                 Ok(out) => out,
@@ -585,12 +588,12 @@ impl<'a> FsView<'a> {
 
             let in_offset = match this.sendfile_offset(in_fd.0, off_in_addr, memory) {
                 Ok(offset) => offset,
-                Err(outcome) => return Ok(outcome),
+                Err(outcome) => return Ok(*outcome),
             };
             let out_offset = if off_out_addr != 0 || this.copy_same_file(in_fd.0, out_fd.0) {
                 match this.sendfile_offset(out_fd.0, off_out_addr, memory) {
                     Ok(offset) => offset,
-                    Err(outcome) => return Ok(outcome),
+                    Err(outcome) => return Ok(*outcome),
                 }
             } else { 0 };
             // copy_file_range onto the SAME file with OVERLAPPING ranges must fail
