@@ -36,3 +36,19 @@ admitted-main delta ratchet. The initial ARM image compile refusal and derive
 audit refusal were corrected before these final passes. These checks do not
 supply the missing live venue or real-KVM pipe-service acceptance. Docker and
 HVF execution are unavailable on this Linux runner; runtime KVM was not run.
+
+The retained file registration now initializes the existing IPC table-map
+reservation in place before publishing its identity. `FileTables::ipc_table_map`
+borrows that map through the same authenticated registration as the file
+records. The x86-layout witness was compile-red with E0599 before this
+accessor existed. It checks the actual mapped reservation and publication
+isolation between two live carrier registrations; a second witness poisons
+the reservation before registration and requires an empty unpublished map.
+These checks prove a live registered table-map view, not a complete IPC venue:
+no IPC directory/pool is attached and no pipe bytes are transferred by them.
+
+The shared guest constructor, ARM registration ownership migration and removal
+of both global publications remain outstanding. Existing ARM consumers also
+use the global region for delegation and memory mailboxes; replacing the IPC
+map accessor alone does not migrate those lifetimes. The work still does not
+meet Slice 1 acceptance. Slices 2–6 remain out of this continuation's scope.
