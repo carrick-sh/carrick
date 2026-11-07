@@ -19,27 +19,54 @@ struct StorageSlot {
     tasks: std::collections::BTreeSet<String>,
 }
 type StorageKey = (String, String);
-static STORAGE: std::sync::Mutex<std::collections::BTreeMap<StorageKey, StorageSlot>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static STORAGE: (
+    std::sync::Mutex<std::collections::BTreeMap<StorageKey, StorageSlot>>,
+    std::sync::Condvar,
+) = (
+    std::sync::Mutex::new(std::collections::BTreeMap::new()),
+    std::sync::Condvar::new(),
+);
 
 struct StorageAdmission {
     key: StorageKey,
 }
 impl StorageAdmission {
     fn acquire(node: &str, storage: &str) -> Result<Self, ScalerError> {
+        Self::acquire_until(node, storage, None)
+    }
+    fn acquire_until(
+        node: &str,
+        storage: &str,
+        deadline: Option<Instant>,
+    ) -> Result<Self, ScalerError> {
         let key = (node.to_owned(), storage.to_owned());
         let mut slots = STORAGE
+            .0
             .lock()
             .map_err(|_| ScalerError::Guard("storage admission poisoned"))?;
-        let slot = slots.entry(key.clone()).or_default();
-        if slot.owned {
-            return Err(ScalerError::StorageBusy);
+        loop {
+            let slot = slots.entry(key.clone()).or_default();
+            if !slot.owned {
+                slot.owned = true;
+                return Ok(Self { key });
+            }
+            let Some(deadline) = deadline else {
+                return Err(ScalerError::StorageBusy);
+            };
+            let wait = deadline.saturating_duration_since(Instant::now());
+            if wait.is_zero() {
+                return Err(ScalerError::StorageBusy);
+            }
+            let (next, _) = STORAGE
+                .1
+                .wait_timeout(slots, wait)
+                .map_err(|_| ScalerError::Guard("storage admission poisoned"))?;
+            slots = next;
         }
-        slot.owned = true;
-        Ok(Self { key })
     }
     fn restore_task(node: &str, storage: &str, task: String) -> Result<(), ScalerError> {
         STORAGE
+            .0
             .lock()
             .map_err(|_| ScalerError::Guard("storage admission poisoned"))?
             .entry((node.to_owned(), storage.to_owned()))
@@ -50,6 +77,7 @@ impl StorageAdmission {
     }
     fn record_task(&self, task: String) -> Result<(), ScalerError> {
         let mut slots = STORAGE
+            .0
             .lock()
             .map_err(|_| ScalerError::Guard("storage admission poisoned"))?;
         let slot = slots.entry(self.key.clone()).or_default();
@@ -59,16 +87,19 @@ impl StorageAdmission {
     }
     fn complete_task(&self, task: &str) -> Result<(), ScalerError> {
         if let Some(slot) = STORAGE
+            .0
             .lock()
             .map_err(|_| ScalerError::Guard("storage admission poisoned"))?
             .get_mut(&self.key)
         {
             slot.tasks.remove(task);
+            STORAGE.1.notify_all();
         }
         Ok(())
     }
     fn is_uncertain(&self) -> Result<bool, ScalerError> {
         Ok(STORAGE
+            .0
             .lock()
             .map_err(|_| ScalerError::Guard("storage admission poisoned"))?
             .get(&self.key)
@@ -76,11 +107,15 @@ impl StorageAdmission {
     }
     fn set_uncertain(&self, uncertain: bool) -> Result<(), ScalerError> {
         STORAGE
+            .0
             .lock()
             .map_err(|_| ScalerError::Guard("storage admission poisoned"))?
             .entry(self.key.clone())
             .or_default()
             .uncertain = uncertain;
+        if !uncertain {
+            STORAGE.1.notify_all();
+        }
         Ok(())
     }
     fn submit_task(&self, pve: &Pve, call: PveCall, path: &str) -> Result<String, ScalerError> {
@@ -102,6 +137,7 @@ impl StorageAdmission {
     }
     fn pending(&self) -> Result<Vec<String>, ScalerError> {
         Ok(STORAGE
+            .0
             .lock()
             .map_err(|_| ScalerError::Guard("storage admission poisoned"))?
             .get(&self.key)
@@ -123,10 +159,11 @@ impl StorageAdmission {
 }
 impl Drop for StorageAdmission {
     fn drop(&mut self) {
-        if let Ok(mut slots) = STORAGE.lock()
+        if let Ok(mut slots) = STORAGE.0.lock()
             && let Some(slot) = slots.get_mut(&self.key)
         {
             slot.owned = false;
+            STORAGE.1.notify_all();
         }
     }
 }
@@ -797,33 +834,56 @@ fn local_storage_command(args: &[&str]) -> Result<Value, ScalerError> {
 }
 impl Pve {
     fn storage_admission(&self) -> Result<StorageAdmission, ScalerError> {
-        let token = StorageAdmission::acquire(self.site.node, self.site.storage)?;
-        for task in token.pending()? {
-            if matches!(
-                self.task_state(&task)?,
-                TaskState::Running | TaskState::Absent
-            ) {
+        self.storage_admission_until(None)
+    }
+    fn storage_admission_until(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Result<StorageAdmission, ScalerError> {
+        loop {
+            let token =
+                StorageAdmission::acquire_until(self.site.node, self.site.storage, deadline)?;
+            let mut busy = false;
+            for task in token.pending()? {
+                if matches!(
+                    self.task_state(&task)?,
+                    TaskState::Running | TaskState::Absent
+                ) {
+                    busy = true;
+                    break;
+                }
+                token.complete_task(&task)?;
+            }
+            if !busy && token.is_uncertain()? {
+                let active = self.request(
+                    PveCall::Get,
+                    &format!("/nodes/{}/tasks?source=active", self.site.node),
+                )?;
+                let entries = active
+                    .as_array()
+                    .ok_or(ScalerError::External("PVE active tasks"))?;
+                if entries.iter().any(|entry| match entry["type"].as_str() {
+                    Some(kind) => matches!(kind, "qmclone" | "qmstart" | "qmdestroy" | "imgdel"),
+                    None => true,
+                }) {
+                    busy = true;
+                } else {
+                    token.set_uncertain(false)?;
+                }
+            }
+            if !busy {
+                return Ok(token);
+            }
+            let Some(deadline) = deadline else {
+                return Err(ScalerError::StorageBusy);
+            };
+            let wait = deadline.saturating_duration_since(Instant::now());
+            if wait.is_zero() {
                 return Err(ScalerError::StorageBusy);
             }
-            token.complete_task(&task)?;
+            drop(token);
+            std::thread::sleep(wait.min(Duration::from_secs(2)));
         }
-        if token.is_uncertain()? {
-            let active = self.request(
-                PveCall::Get,
-                &format!("/nodes/{}/tasks?source=active", self.site.node),
-            )?;
-            let entries = active
-                .as_array()
-                .ok_or(ScalerError::External("PVE active tasks"))?;
-            if entries.iter().any(|entry| match entry["type"].as_str() {
-                Some(kind) => matches!(kind, "qmclone" | "qmstart" | "qmdestroy" | "imgdel"),
-                None => true,
-            }) {
-                return Err(ScalerError::StorageBusy);
-            }
-            token.set_uncertain(false)?;
-        }
-        Ok(token)
     }
     fn clear_volumes(&self, id: CloneId) -> Result<(), ScalerError> {
         let _admission = self.storage_admission()?;
@@ -1457,7 +1517,7 @@ fn provision(
     )?;
     row.state = State::WaitingStorage;
     update(ledger, row, path)?;
-    let admission = pve.storage_admission()?;
+    let admission = pve.storage_admission_until(Some(PreBoot::Defer.deadline()))?;
     submit_clone(pve, ledger, row, path, &admission)?;
     drop(admission);
     boot_and_register(pve, gh, ledger, row, dir, path, approval, PreBoot::Defer)
@@ -1552,15 +1612,22 @@ fn boot_and_register(
     )?;
     // Other clones still booting are charged at nominal size although they
     // may already use part of it, so a refusal here means "not now". A
-    // worker waits for them to run (or retire); the loop fails fast.
+    // worker waits for them to run (or retire); the loop defers to the next pass.
     let admit_by = pre_boot.deadline();
     loop {
         ledger.refresh()?;
-        if resource_admission(pve, ledger.pending(&row.name, nominal(pve)))? {
+        let admitted = match resource_admission(pve, ledger.pending(&row.name, nominal(pve))) {
+            Err(ScalerError::CpuCeiling { .. }) if row.lane == CloneLane::Agent => Ok(false),
+            result => result,
+        }?;
+        if admitted {
             break;
         }
         if Instant::now() >= admit_by {
-            return Err(ScalerError::Guard("host admission denied before boot"));
+            return Err(match pre_boot {
+                PreBoot::FailFast => ScalerError::Deferred("host admission busy before boot"),
+                PreBoot::Defer => ScalerError::Guard("host admission denied before boot"),
+            });
         }
         std::thread::sleep(Duration::from_secs(15));
     }
@@ -1580,7 +1647,7 @@ fn boot_and_register(
     let shared_deadline = ApiDeadline(&pve.deadline);
     // Starting regenerates cloud-init disks too, so it shares storage admission.
     // Retain Cloning on local contention; reconcile can resume the completed clone.
-    let storage = pve.storage_admission()?;
+    let storage = pve.storage_admission_until((pre_boot == PreBoot::Defer).then_some(deadline))?;
     row.state = State::Booting;
     row.task = None;
     update(ledger, row, path)?;
@@ -1860,6 +1927,18 @@ fn reconcile_all(
     path: &Path,
     approval: (u64, &Admission),
 ) -> Result<Pass, ScalerError> {
+    reconcile_all_with(pve, gh, ledger, dir, path, approval, None)
+}
+
+fn reconcile_all_with(
+    pve: &Pve,
+    gh: &Github,
+    ledger: &mut Ledger,
+    dir: &Path,
+    path: &Path,
+    approval: (u64, &Admission),
+    provisioners: Option<&Provisioners>,
+) -> Result<Pass, ScalerError> {
     let active: Vec<Record> = ledger
         .rows
         .iter()
@@ -1870,14 +1949,25 @@ fn reconcile_all(
     let mut first_error = None;
     for row in active {
         let lane = row.lane;
-        match reconcile_one(pve, gh, ledger, dir, path, approval, row) {
+        let snapshot = row.clone();
+        match reconcile_one(pve, gh, ledger, dir, path, approval, row, provisioners) {
             Ok(true) => finished += 1,
             Ok(false) => {}
             Err(error @ ScalerError::CpuCeiling { .. }) if lane == CloneLane::Kvm => {
                 return Err(error);
             }
-            Err(ScalerError::StorageBusy) => {
-                eprintln!("storage busy; owned operation deferred to next reconcile");
+            Err(error @ (ScalerError::StorageBusy | ScalerError::Deferred(_))) => {
+                let current = ledger
+                    .rows
+                    .iter()
+                    .find(|r| r.name == snapshot.name)
+                    .unwrap_or(&snapshot);
+                eprintln!(
+                    "vm={} state={:?} task={} deferred ({error}); retained for next reconcile",
+                    current.vm.get(),
+                    current.state,
+                    current.task.as_deref().unwrap_or("none")
+                );
             }
             Err(error) => {
                 first_error.get_or_insert(error);
@@ -1955,6 +2045,7 @@ fn reconcile_one(
     path: &Path,
     approval: (u64, &Admission),
     row: Record,
+    provisioners: Option<&Provisioners>,
 ) -> Result<bool, ScalerError> {
     let Some(mut row) = reconcile_target(ledger, &row.name)? else {
         return Ok(false);
@@ -1988,6 +2079,16 @@ fn reconcile_one(
             false,
         )?;
         if pending_owned_job(&row, &job, &run, approval.1) {
+            if let Some(provisioners) = provisioners {
+                provisioners.resume_clone(
+                    ledger,
+                    row,
+                    pve.for_lane(lane_pve.site.lane)?,
+                    (dir, path),
+                    (approval.0, approval.1.clone()),
+                )?;
+                return Ok(false);
+            }
             pve.clear_volumes(row.vm)?;
             let admission = pve.storage_admission()?;
             submit_clone(pve, ledger, &mut row, path, &admission)?;
@@ -2108,6 +2209,16 @@ fn reconcile_one(
                     "vm={} resuming completed clone in place; error history retained",
                     row.vm.get()
                 );
+                if let Some(provisioners) = provisioners {
+                    provisioners.resume_boot(
+                        ledger,
+                        row,
+                        pve.for_lane(lane_pve.site.lane)?,
+                        (dir, path),
+                        (approval.0, approval.1.clone()),
+                    )?;
+                    return Ok(false);
+                }
                 if let Err(error) = boot_and_register(
                     pve,
                     gh,
@@ -2697,7 +2808,15 @@ pub(super) fn controller(
     loop {
         ledger.refresh()?;
         if reconcile.elapsed() >= RECONCILE_INTERVAL {
-            let pass = reconcile_all(&pve, &gh, &mut ledger, dir, &path, (group, admission))?;
+            let pass = reconcile_all_with(
+                &pve,
+                &gh,
+                &mut ledger,
+                dir,
+                &path,
+                (group, admission),
+                Some(&provisioners),
+            )?;
             if pass.finished > 0 && one_job {
                 ledger.refresh()?;
                 return one_job_result(ledger.rows.last());
@@ -2749,11 +2868,16 @@ pub(super) fn controller(
         // A failed provisioning worker freezes admission exactly as a failed
         // in-line provision did.
         let mut provision_failed = None;
-        for result in provisioners.finished() {
-            match result {
+        for outcome in provisioners.finished_outcomes() {
+            match outcome.result {
                 Ok(()) => {}
-                Err(ScalerError::StorageBusy) => {
-                    eprintln!("storage busy; provisioning retained for reconciliation");
+                Err(error @ (ScalerError::StorageBusy | ScalerError::Deferred(_))) => {
+                    eprintln!(
+                        "vm={} state={:?} task={} deferred ({error}); provisioning retained for reconciliation",
+                        outcome.vm.get(),
+                        outcome.state,
+                        outcome.task.as_deref().unwrap_or("none")
+                    );
                 }
                 Err(error @ ScalerError::CpuCeiling { .. }) => return Err(error),
                 Err(error) => {
@@ -2966,28 +3090,44 @@ fn admit_one(
     Ok(true)
 }
 
+pub(super) struct ProvisionOutcome {
+    vm: CloneId,
+    state: State,
+    task: Option<String>,
+    result: Result<(), ScalerError>,
+}
+
 /// Provisioning workers (#1251): each owns one reserved row's lifecycle
 /// through its own ledger publication until the clone runs or fails, so a
 /// burst of jobs boots clones side by side instead of one per pass.
 pub(super) struct Provisioners {
-    results: std::sync::mpsc::Sender<Result<(), ScalerError>>,
-    finished: std::sync::mpsc::Receiver<Result<(), ScalerError>>,
+    results: std::sync::mpsc::Sender<ProvisionOutcome>,
+    finished: std::sync::mpsc::Receiver<ProvisionOutcome>,
 }
 impl Provisioners {
     pub(super) fn new() -> Self {
         let (results, finished) = std::sync::mpsc::channel();
         Self { results, finished }
     }
-    /// Hand `row` to a new worker. The claim is taken here, before the
-    /// lifecycle loop's next save, and released when the worker ends,
-    /// including by panic.
-    fn start(
+    #[allow(clippy::too_many_arguments)]
+    fn spawn(
         &self,
         ledger: &Ledger,
         mut row: Record,
         pve: Pve,
         paths: (&Path, &Path),
         approval: (u64, Admission),
+        resume: bool,
+        work: impl FnOnce(
+            &Pve,
+            &mut Ledger,
+            &mut Record,
+            &Path,
+            &Path,
+            (u64, &Admission),
+        ) -> Result<(), ScalerError>
+        + Send
+        + 'static,
     ) -> Result<(), ScalerError> {
         let (publication, claim) = ledger
             .publication
@@ -3003,36 +3143,138 @@ impl Provisioners {
         std::thread::spawn(move || {
             let _claim = claim;
             let (group, admission) = approval;
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let provisioned = provision(
-                    &pve,
-                    &Github,
-                    &mut owned,
-                    &mut row,
-                    &dir,
-                    &path,
-                    (group, &admission),
-                );
-                if let Err(error) = &provisioned {
-                    row.failure = Some(error.to_string());
-                    // Keep the provisioning error; reconcile recovers the row
-                    // even if this record is lost.
-                    if let Err(record) = update(&mut owned, &row, &path) {
-                        eprintln!("vm={} failure not recorded: {record}", row.vm.get());
+            let (vm, state, task, result) =
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let provisioned =
+                        work(&pve, &mut owned, &mut row, &dir, &path, (group, &admission));
+                    if let Err(error) = &provisioned {
+                        if resume {
+                            recovery_note(&mut row, &format!("resume: {error}"));
+                        } else {
+                            row.failure = Some(error.to_string());
+                        }
+                        // Keep the provisioning error; reconcile recovers the row
+                        // even if this record is lost.
+                        if let Err(record) = update(&mut owned, &row, &path) {
+                            eprintln!("vm={} failure not recorded: {record}", row.vm.get());
+                        }
                     }
-                }
-                provisioned
-            }))
-            .unwrap_or(Err(ScalerError::Guard("provisioning worker panicked")));
+                    (row.vm, row.state, row.task.clone(), provisioned)
+                })) {
+                    Ok(outcome) => outcome,
+                    Err(_) => (
+                        row.vm,
+                        State::Reserved,
+                        None,
+                        Err(ScalerError::Guard("provisioning worker panicked")),
+                    ),
+                };
             // The receiver outlives every worker unless the controller is
             // already exiting; then reconciliation recovers the row.
-            let _ = results.send(result);
+            let _ = results.send(ProvisionOutcome {
+                vm,
+                state,
+                task,
+                result,
+            });
         });
         Ok(())
     }
-    /// Results of workers that finished since the last call.
-    fn finished(&self) -> Vec<Result<(), ScalerError>> {
+    /// Hand `row` to a new worker. The claim is taken here, before the
+    /// lifecycle loop's next save, and released when the worker ends,
+    /// including by panic.
+    fn start(
+        &self,
+        ledger: &Ledger,
+        row: Record,
+        pve: Pve,
+        paths: (&Path, &Path),
+        approval: (u64, Admission),
+    ) -> Result<(), ScalerError> {
+        self.spawn(
+            ledger,
+            row,
+            pve,
+            paths,
+            approval,
+            false,
+            |pve, owned, row, dir, path, approval| {
+                provision(pve, &Github, owned, row, dir, path, approval)
+            },
+        )
+    }
+    fn resume_clone(
+        &self,
+        ledger: &Ledger,
+        row: Record,
+        pve: Pve,
+        paths: (&Path, &Path),
+        approval: (u64, Admission),
+    ) -> Result<(), ScalerError> {
+        self.spawn(
+            ledger,
+            row,
+            pve,
+            paths,
+            approval,
+            true,
+            |pve, owned, row, dir, path, approval| {
+                pve.clear_volumes(row.vm)?;
+                let admission = pve.storage_admission_until(Some(PreBoot::Defer.deadline()))?;
+                submit_clone(pve, owned, row, path, &admission)?;
+                drop(admission);
+                boot_and_register(
+                    pve,
+                    &Github,
+                    owned,
+                    row,
+                    dir,
+                    path,
+                    approval,
+                    PreBoot::Defer,
+                )
+            },
+        )
+    }
+    fn resume_boot(
+        &self,
+        ledger: &Ledger,
+        row: Record,
+        pve: Pve,
+        paths: (&Path, &Path),
+        approval: (u64, Admission),
+    ) -> Result<(), ScalerError> {
+        self.spawn(
+            ledger,
+            row,
+            pve,
+            paths,
+            approval,
+            true,
+            |pve, owned, row, dir, path, approval| {
+                boot_and_register(
+                    pve,
+                    &Github,
+                    owned,
+                    row,
+                    dir,
+                    path,
+                    approval,
+                    PreBoot::Defer,
+                )
+            },
+        )
+    }
+    /// Structured results of workers that finished since the last call.
+    fn finished_outcomes(&self) -> Vec<ProvisionOutcome> {
         self.finished.try_iter().collect()
+    }
+    #[cfg(test)]
+    fn finished(&self) -> Vec<Result<(), ScalerError>> {
+        self.finished_outcomes()
+            .into_iter()
+            .map(|outcome| outcome.result)
+            .collect()
     }
 }
 
