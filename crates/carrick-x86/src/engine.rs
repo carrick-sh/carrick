@@ -1578,6 +1578,44 @@ impl<V: X86Vmm> ThreadedEngine for X86EngineCore<V> {
     type SiblingSpec = X86SiblingSpec<V>;
     type ProcessSpec = ();
 
+    fn core_memory_mm(&self) -> Option<carrick_hal::guest_arch_binding::core_arch::MmGeneration> {
+        std::num::NonZeroU64::new(self.mm_generation)
+            .map(carrick_hal::guest_arch_binding::core_arch::MmGeneration::new)
+    }
+
+    fn core_stage1_output(
+        &self,
+        address: GuestVa,
+        _length: usize,
+    ) -> Result<Option<Gpa>, MemoryError> {
+        Ok(self.vm.translate_va(address.raw()).map(Gpa::new))
+    }
+
+    fn read_core_backing(
+        &self,
+        _excluded: &carrick_sched_core::ExcludedEditor<'_>,
+        address: GuestVa,
+        output: Gpa,
+        length: usize,
+    ) -> Result<Vec<u8>, MemoryError> {
+        let host = self
+            .vm
+            .syscall_buffer_host_ptr(address, output, length)
+            .ok_or(MemoryError::OutOfBounds {
+                address: address.raw(),
+                length,
+            })?;
+        let mut bytes = vec![0; length];
+        // SAFETY: the VMM resolved the complete translated range; the caller
+        // retains exact-MM exclusion and the destination is disjoint storage.
+        unsafe { std::ptr::copy_nonoverlapping(host, bytes.as_mut_ptr(), length) };
+        Ok(bytes)
+    }
+
+    fn core_untouched_zero(&self, address: GuestVa, _length: usize) -> bool {
+        self.vm.is_guest_reserved(address.raw())
+    }
+
     fn audit_executor_boundary(&mut self) -> Result<(), TrapError> {
         Err(TrapError::Hypervisor(
             "x86 threaded backend does not expose executor boundary audit authority".to_owned(),
@@ -2433,6 +2471,35 @@ mod tests {
                 .expect_err("high user alias must be rejected before VMM install");
             assert!(format!("{error:?}").contains("outside lower-half user range"));
         }
+    }
+
+    #[test]
+    fn core_snapshot_uses_shared_policy_and_translates_every_page() {
+        let shared = carrick_mem::memory::LINUX_SHARED_FILE_BASE;
+        let overlay = carrick_mem::memory::LINUX_PRIVATE_OVERLAY_BASE;
+        let vm = FragmentVmm::new(shared, overlay);
+        let engine = X86EngineCore::from_parts(vm, TestVcpu::default(), test_layout());
+        let spaces = Box::new(carrick_sched_core::AddressSpaces::new());
+        let index = spaces.publish_closed(1, 0x1000, 0).unwrap();
+        let excluded = spaces.raise_and_wait_for_editor(index, || {});
+        let bytes = engine
+            .read_core_bytes(Some(&excluded), shared + 0xff0, 0x1020)
+            .unwrap();
+        assert_eq!(bytes.len(), 0x1020);
+        assert!(bytes[..0x10].iter().all(|byte| *byte == 0x11));
+        assert!(bytes[0x10..0x1010].iter().all(|byte| *byte == 0x22));
+        assert!(bytes[0x1010..].iter().all(|byte| *byte == 0x33));
+        // A proof for a different incarnation cannot authorize a backing read.
+        let other = spaces.publish_closed(2, 0x2000, 0).unwrap();
+        let wrong = spaces.raise_and_wait_for_editor(other, || {});
+        assert!(matches!(
+            engine.read_core_bytes(Some(&wrong), shared, 1),
+            Err(MemoryError::HostMap(_))
+        ));
+        drop(wrong);
+        spaces.lower(other);
+        drop(excluded);
+        spaces.lower(index);
     }
 
     #[test]

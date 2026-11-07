@@ -3348,114 +3348,6 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         )
     }
 
-    /// Read through the exact live stage-1 translation while this host thread
-    /// holds the MM's EL1-editor exclusion. Crash capture raises that
-    /// exclusion to freeze the address space, so re-entering the owner portal
-    /// would refuse on our own Gate forever: dropping the exclusion to make
-    /// the portal read would also destroy the coherent snapshot. The admitted
-    /// owner handle and held exclusion authenticate the same MM incarnation;
-    /// the live stage-1 walk then authenticates each VA-to-IPA translation.
-    fn read_excluded_owner_bytes(
-        &self,
-        address: u64,
-        length: usize,
-    ) -> Option<Result<Vec<u8>, MemoryError>> {
-        let handle = self.protections.owner()?;
-        if handle.mm().raw() != self.mm_generation {
-            return Some(Err(MemoryError::HostMap(
-                "owner memory incarnation mismatch".into(),
-            )));
-        }
-        carrick_hal::el1_editor_exclusion::with_held_exclusion(handle.mm().raw(), |excluded| {
-            excluded.map(|_| self.read_live_backing_bytes(address, length))
-        })
-    }
-
-    fn read_live_backing_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
-        let mut out = vec![0u8; length];
-        let mut copied = 0usize;
-        while copied < length {
-            let offset =
-                u64::try_from(copied).map_err(|_| MemoryError::OutOfBounds { address, length })?;
-            let va = address
-                .checked_add(offset)
-                .ok_or(MemoryError::OutOfBounds { address, length })?;
-            let chunk_len = (length - copied).min((0x1000 - (va & 0xfff)) as usize);
-            let ipa = match self
-                .page_tables
-                .with_manager(|manager| manager.translate_retained_output(va))
-                .flatten()
-                .map(Gpa::new)
-                .or_else(|| {
-                    (!carrick_mem::memory::needs_stage1_translation(va, chunk_len as u64))
-                        .then_some(Gpa::new(va))
-                }) {
-                Some(ipa) => ipa,
-                None => {
-                    let pristine = match self.vm.deferred_anonymous_state() {
-                        Some(state) => state
-                            .copy_pristine_file(
-                                GuestVa::new(va),
-                                &mut out[copied..copied + chunk_len],
-                            )
-                            .map_err(|error| {
-                                MemoryError::HostMap(format!(
-                                    "read deferred private file backing: {error}"
-                                ))
-                            })?,
-                        None => false,
-                    };
-                    if pristine {
-                        copied += chunk_len;
-                        continue;
-                    }
-                    let Some(zero) = self.fresh_zero_chunk(address, copied, length) else {
-                        self.trace_read_fault(address.wrapping_add(copied as u64), length, 1);
-                        return Err(MemoryError::OutOfBounds { address, length });
-                    };
-                    copied += zero;
-                    continue;
-                }
-            };
-            // The excluded stage-1 snapshot above selected either the exact
-            // retained private output or the identity-backed high-VA window,
-            // including a prepared or permission-invalid leaf whose Linux VMA
-            // is dumpable. Read that authenticated output through the
-            // owner-selected backing seam: `translated_read` is the ordinary
-            // syscall-buffer path and deliberately refuses an admitted owner
-            // MM back to its portal.
-            let bytes = match self.vm.translated_read_excluded(va, ipa.raw(), chunk_len) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    let deferred = match self.vm.deferred_anonymous_state() {
-                        Some(state) => state
-                            .copy_pristine_file(
-                                GuestVa::new(va),
-                                &mut out[copied..copied + chunk_len],
-                            )
-                            .map_err(|error| {
-                                MemoryError::HostMap(format!(
-                                    "read deferred private file backing: {error}"
-                                ))
-                            })?,
-                        None => false,
-                    };
-                    if deferred {
-                        copied += chunk_len;
-                        continue;
-                    }
-                    self.trace_read_fault(va, length, 2);
-                    return Err(error);
-                }
-            };
-            if bytes.len() != chunk_len {
-                return Err(MemoryError::OutOfBounds { address, length });
-            }
-            out[copied..copied + chunk_len].copy_from_slice(&bytes);
-            copied += chunk_len;
-        }
-        Ok(out)
-    }
     fn read_owner_bytes_with_intent(
         &self,
         address: u64,
@@ -6368,20 +6260,61 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         Ok(())
     }
 
-    fn read_core_bytes(
+    fn read_legacy_core_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        <Self as GuestMemory>::read_bytes_raw(self, address, length)
+    }
+
+    fn core_memory_mm(&self) -> Option<carrick_hal::guest_arch_binding::core_arch::MmGeneration> {
+        self.protections
+            .owner()
+            .and_then(|handle| std::num::NonZeroU64::new(handle.mm().raw()))
+            .map(carrick_hal::guest_arch_binding::core_arch::MmGeneration::new)
+    }
+
+    fn core_stage1_output(
         &self,
-        address: u64,
+        address: GuestVa,
         length: usize,
-    ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
-        // `capture_and_publish_core` has already joined this range to a
-        // quiesced, readable Linux VMA. Use the backing-only path so the
-        // syscall EFAULT metadata for the larger hidden heap reservation does
-        // not reject its live `[heap_base, brk)` prefix.
-        if let Some(read) = self.read_excluded_owner_bytes(address, length) {
-            read
-        } else {
-            <Self as GuestMemory>::read_bytes_raw(self, address, length)
+    ) -> Result<Option<Gpa>, MemoryError> {
+        if self.core_memory_mm().map(|mm| mm.raw().get()) != Some(self.mm_generation) {
+            return Err(MemoryError::HostMap(
+                "owner memory incarnation mismatch".into(),
+            ));
         }
+        let va = address.raw();
+        Ok(self
+            .page_tables
+            .with_manager(|manager| manager.translate_retained_output(va))
+            .flatten()
+            .map(Gpa::new)
+            .or_else(|| {
+                (!carrick_mem::memory::needs_stage1_translation(va, length as u64))
+                    .then_some(Gpa::new(va))
+            }))
+    }
+
+    fn read_core_backing(
+        &self,
+        excluded: &carrick_sched_core::ExcludedEditor<'_>,
+        address: GuestVa,
+        output: Gpa,
+        length: usize,
+    ) -> Result<Vec<u8>, MemoryError> {
+        self.vm
+            .translated_read_excluded(excluded, address.raw(), output.raw(), length)
+    }
+
+    fn copy_core_pristine(&self, address: GuestVa, dst: &mut [u8]) -> Result<bool, MemoryError> {
+        match self.vm.deferred_anonymous_state() {
+            Some(state) => state.copy_pristine_file(address, dst).map_err(|error| {
+                MemoryError::HostMap(format!("read deferred private file backing: {error}"))
+            }),
+            None => Ok(false),
+        }
+    }
+
+    fn core_untouched_zero(&self, address: GuestVa, length: usize) -> bool {
+        self.fresh_zero_chunk(address.raw(), 0, length) == Some(length)
     }
 
     fn diagnostic_fault_page_tables(&self, far: u64) -> Option<(u64, [u64; 4])> {

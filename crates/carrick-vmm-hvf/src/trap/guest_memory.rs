@@ -282,22 +282,21 @@ impl HvfVmState {
 
     pub(crate) fn read_guest_bytes_excluded(
         &self,
+        excluded: &carrick_sched_core::ExcludedEditor<'_>,
         address: u64,
         length: usize,
     ) -> Result<Vec<u8>, MemoryError> {
         let handle = self.protections.owner().ok_or_else(|| {
             MemoryError::HostMap("excluded owner read has no admitted owner".into())
         })?;
-        carrick_hal::el1_editor_exclusion::with_held_exclusion(handle.mm().raw(), |excluded| {
-            if excluded.is_none() {
-                return Err(MemoryError::HostMap(
-                    "excluded owner read has no matching EL1-editor exclusion".into(),
-                ));
-            }
-            let mut bytes = vec![0_u8; length];
-            self.read_guest_bytes_into_selected(address, &mut bytes, true)?;
-            Ok(bytes)
-        })
+        if excluded.key() != handle.mm().raw() {
+            return Err(MemoryError::HostMap(
+                "excluded owner read has no matching EL1-editor exclusion".into(),
+            ));
+        }
+        let mut bytes = vec![0_u8; length];
+        self.read_guest_bytes_into_selected(address, &mut bytes, true)?;
+        Ok(bytes)
     }
 
     fn read_guest_bytes_into_selected(

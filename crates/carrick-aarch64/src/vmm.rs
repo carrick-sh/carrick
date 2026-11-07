@@ -1197,6 +1197,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// their transfer portal.
     fn translated_read_excluded(
         &self,
+        _excluded: &carrick_sched_core::ExcludedEditor<'_>,
         va: u64,
         ipa: u64,
         len: usize,

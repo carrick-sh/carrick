@@ -3685,6 +3685,7 @@ pub(crate) mod tests {
         pub(crate) read_tracker: Option<CrashReadTracker>,
         pub(crate) read_refusal_tx: Option<std::sync::mpsc::SyncSender<()>>,
         pub(crate) owner_read_refusal_at: Option<u64>,
+        pub(crate) capture_owns_gate: bool,
         pub(crate) fail_read_at: Option<u64>,
         pub(crate) atomic_word: Option<AtomicWordLoad>,
         pub(crate) fail_execve_into: Option<String>,
@@ -3849,7 +3850,33 @@ pub(crate) mod tests {
                 && self
                     .owner_read_refusal_at
                     .is_none_or(|target| target == address)
-                && let Some(wait) = probe.wait_if_busy()
+                && let Some(wait) = if self.capture_owns_gate {
+                    // The gate was raised after the fixture's initial sample.
+                    // Observe its current producer revision, as an owner does.
+                    let zone = unsafe { &*(probe.zone as *const carrick_el1_abi::ZoneTables) };
+                    let mm = std::num::NonZeroU64::new(probe.wait.handle().mm().raw()).unwrap();
+                    let index = zone.spaces.find(mm.get()).unwrap();
+                    (zone.spaces.gate(index) != 0).then(|| {
+                        let revision = zone
+                            .space_entry(mm)
+                            .unwrap()
+                            .notifications(probe.wait.handle().incarnation())
+                            .unwrap()
+                            .observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Gate)
+                            .revision();
+                        // SAFETY: revision was sampled from this exact admitted
+                        // owner's Gate producer while its gate is raised.
+                        unsafe {
+                            carrick_el1_abi::PortalOwnerWait::from_owner(
+                                probe.wait.handle(),
+                                carrick_el1_abi::PortalWaitCause::Gate,
+                                revision,
+                            )
+                        }
+                    })
+                } else {
+                    probe.wait_if_busy()
+                }
             {
                 if let Some(tx) = &self.read_refusal_tx {
                     let _ = tx.send(());
@@ -4091,6 +4118,53 @@ pub(crate) mod tests {
             self.native_owner_cancellations += 1;
             Ok(())
         }
+        fn core_memory_mm(
+            &self,
+        ) -> Option<carrick_hal::guest_arch_binding::core_arch::MmGeneration> {
+            self.capture_owns_gate.then(|| {
+                carrick_hal::guest_arch_binding::core_arch::MmGeneration::new(
+                    std::num::NonZeroU64::new(
+                        self.copyout_owner_probe.unwrap().wait.handle().mm().raw(),
+                    )
+                    .unwrap(),
+                )
+            })
+        }
+
+        fn core_stage1_output(
+            &self,
+            address: carrick_guest_mem::GuestVa,
+            _length: usize,
+        ) -> Result<Option<carrick_guest_mem::Gpa>, carrick_guest_mem::MemoryError> {
+            Ok(Some(carrick_guest_mem::Gpa::new(address.raw())))
+        }
+
+        fn read_core_backing(
+            &self,
+            _excluded: &carrick_sched_core::ExcludedEditor<'_>,
+            address: carrick_guest_mem::GuestVa,
+            _output: carrick_guest_mem::Gpa,
+            length: usize,
+        ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
+            let probe = self.copyout_owner_probe.expect("capture owner");
+            // SAFETY: the fixture retains its real region throughout capture.
+            let zone = unsafe { &*(probe.zone as *const carrick_el1_abi::ZoneTables) };
+            let index = zone.spaces.find(probe.wait.handle().mm().raw()).unwrap();
+            assert_ne!(zone.spaces.gate(index), 0, "read retains capture's pause");
+            assert!(matches!(
+                carrick_guest_mem::GuestMemory::read_bytes_raw(self, address.raw(), length),
+                Err(carrick_guest_mem::MemoryError::ReadSuspended(_))
+            ));
+            if let Some(tracker) = &self.read_tracker {
+                tracker.lock().push((address.raw(), length));
+            }
+            Ok(self
+                .guest_memory
+                .get(&address.raw())
+                .cloned()
+                .unwrap_or_else(|| vec![0; length]))
+        }
+
         type Arch = carrick_hal::Aarch64GuestArch;
         type KickHandle = CrashCaptureTestKick;
         type SiblingSpec = ();
