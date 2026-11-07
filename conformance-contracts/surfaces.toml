@@ -197,6 +197,7 @@ surfaces = [
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_child_handoff_tests.rs", contract = "kernel.native.namespace-mutation" },
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_child_handoff_tests.rs", contract = "process.native.arm-admission" },
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_exec_pipe_tests.rs", contract = "kernel.el1.ipc-two-process" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_exec_pipe_tests.rs", contract = "kernel.futex.contention" },
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_fault_supply_tests.rs", contract = "kernel.el1.fork-cow" },
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_fault_supply_tests.rs", contract = "kernel.el1.mm-exclusive-owner" },
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_fault_supply_tests.rs", contract = "process.native.terminal-child" },

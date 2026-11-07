@@ -1,10 +1,11 @@
-//! A production native fork and exec retain the same in-zone pipe endpoint.
+//! Production native fork/exec successors retain IPC and memory-wait custody.
 use super::*;
 use crate::native_process_runtime::{NativeResume, NativeServiceCall, host_test_support::Physical};
 use carrick_core_abi::service::{
     ExecAdoptionReceipt, ExecSuccessorBacking, ExecSuccessorEntry, ExecSuccessorManifest,
     ServiceCell,
 };
+use carrick_el1_abi::Lifecycle;
 use carrick_el1_abi::ipc::{IpcBacking, fd, pipe::End};
 use carrick_kernel::el1_ipc::{HostIpc, HostTable, IpcLimits};
 use carrick_sched_core::{ShortLockSpin, WakeEffects};
@@ -12,6 +13,15 @@ use std::{collections::BTreeMap, sync::Arc};
 
 #[test]
 fn serial_host_native_fork_exec_pipe_writer_reaches_its_parent() {
+    fork_exec_successor(false);
+}
+
+#[test]
+fn serial_host_native_fork_exec_child_futex_retains_owner_refusal() {
+    fork_exec_successor(true);
+}
+
+fn fork_exec_successor(futex: bool) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     struct RestoreRegion(usize);
     impl Drop for RestoreRegion {
@@ -117,12 +127,35 @@ fn serial_host_native_fork_exec_pipe_writer_reaches_its_parent() {
     unsafe {
         *fixture.zone.record(parent_binding.record.id).ctx_mut() = parent_binding.words;
     }
-    assert!(
-        fixture
-            .zone
-            .requeue_preempted(fixture.slot, parent_binding.record.id)
-            .is_queued()
-    );
+    if futex {
+        let mut entry = runtime
+            .enter_registered(
+                registry,
+                source,
+                &fixture.task,
+                parent_binding.address,
+                &parent_binding.words,
+                &mut fork_service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.wait4(
+                ProcessWaitPid::from_syscall_argument(u64::MAX),
+                UserVa::new(0),
+                LinuxWaitOptions::empty(),
+                UserVa::new(0)
+            ),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert!(entry.take_handoff_receipt().is_some());
+    } else {
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(fixture.slot, parent_binding.record.id)
+                .is_queued()
+        );
+    }
     activate_target(source, &fixture.task, &child_binding);
     let child_table = fixture.task.linux.file_table.load(Ordering::Acquire);
     assert_ne!(child_table, 5, "production fork owns an inherited table");
@@ -249,6 +282,19 @@ fn serial_host_native_fork_exec_pipe_writer_reaches_its_parent() {
         fixture.task.mm.key.load(Ordering::Acquire),
         child_binding.address.mm.raw().get()
     );
+    if futex {
+        child_futex(
+            fixture,
+            registry,
+            &runtime,
+            &mut service,
+            parent,
+            child,
+            &counters,
+        );
+        registry.unregister_root_for_test(&runtime);
+        return;
+    }
     let tables = crate::ipc::MapTables(map);
     let venue = crate::ipc::IpcVenue {
         region: owner.region(),
@@ -356,4 +402,353 @@ fn serial_host_native_fork_exec_pipe_writer_reaches_its_parent() {
     assert_eq!(call(63, 3, memory.arg() + 512, 8), 8);
     assert_eq!(&memory.as_mut_bytes()[512..520], b"1\n1\n2\n3\n");
     registry.unregister_root_for_test(&runtime);
+}
+
+// Control only physical word supply. Fork, exec, copy preparation, scheduler
+// custody and resumption all use the production native owner.
+fn child_futex<'a>(
+    fixture: &'a Fixture,
+    registry: &NativeProcessRegistry<'a, AddressContext<RootGpa>, Aarch64ParkedContext>,
+    runtime: &NativeProcessRuntime<'a, AddressContext<RootGpa>, Aarch64ParkedContext>,
+    service: &mut Physical<'a, Aarch64ParkedContext>,
+    parent: TaskKey,
+    child: TaskKey,
+    counters: &carrick_el1_abi::Counters,
+) {
+    use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest};
+    use carrick_guest_arch::{Access, GuestLen};
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    struct Word(core::cell::Cell<bool>);
+    impl crate::sched::UserWord for Word {
+        fn read_u32(&self, _: &CurrentTask, address: u64) -> Option<u32> {
+            assert_eq!(address, VA);
+            self.0.get().then_some(0)
+        }
+        fn read_u64(&self, _: &CurrentTask, _: u64) -> Option<u64> {
+            panic!("untimed wait")
+        }
+    }
+    assert!(
+        runtime.task_binding(parent).is_some(),
+        "parent remains live"
+    );
+    // Physical acknowledges exec retirement synchronously; settle its return
+    // doorbell before issuing the successor's first new syscall.
+    if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
+        work.settled();
+    }
+    let binding = runtime.task_binding(child).unwrap();
+    assert_ne!(binding.address.mm, fixture.address.mm);
+    let word = Word(core::cell::Cell::new(false));
+    let request = GuestCopyRequest {
+        address: UserVa::new(VA),
+        len: GuestLen::new(4),
+        access: Access::Read,
+    };
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let handle = service.service_mm_handle(&binding.address).unwrap();
+    let space = fixture
+        .zone
+        .space_entry(NonZeroU64::new(handle.mm().raw()).unwrap())
+        .unwrap();
+    space
+        .admit_notifications(handle.incarnation(), &ShortLockSpin, &|effects| {
+            crate::sched::object_wait::deliver_host_completion(fixture.zone, effects);
+        })
+        .unwrap();
+    let observed = space
+        .notifications(handle.incarnation())
+        .unwrap()
+        .observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Gate);
+    fixture.zone.spaces.set_idle_ttbr(0x30000);
+    let installed = fixture
+        .zone
+        .install_space(fixture.slot, handle.mm().raw())
+        .unwrap();
+    let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
+    access.raise(space.index());
+    // SAFETY: this exact live successor owner retains its raised gate.
+    service.prepare_copy_error = Some(NativeProcessError::OwnerWait(unsafe {
+        carrick_core_abi::PortalOwnerWait::from_owner(
+            handle,
+            carrick_core_abi::PortalWaitCause::Gate,
+            observed.revision(),
+        )
+    }));
+    let names = carrick_el1_abi::InotifyNameCache::new();
+    let mut cpu = crate::sched::FakeCpu {
+        ttbr: (installed.ttbr0, installed.ttbr1),
+        ..Default::default()
+    };
+    let mut frame = carrick_el1_abi::TrapFrame {
+        elr: 0x400004,
+        ..Default::default()
+    };
+    frame.x[8] = crate::sched::SYS_FUTEX as u64;
+    frame.x[0] = VA;
+    frame.x[1] = crate::sched::FUTEX_WAIT_PRIVATE;
+    frame.x[2] = 1;
+    let mut parked = binding.words;
+    crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut parked);
+    {
+        let mut entry = runtime
+            .enter_registered(
+                registry,
+                source,
+                &fixture.task,
+                binding.address,
+                &parked,
+                service,
+            )
+            .unwrap();
+        let route = crate::dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            counters,
+            core::slice::from_ref(&fixture.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &names,
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &word,
+            }),
+            None,
+            None,
+            Some(&mut *entry),
+            Some(source),
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        assert_eq!(
+            route,
+            CompletionRoute::Suspended,
+            "fork child WAIT_PRIVATE address={VA:#x}, expected {:?}; result={}",
+            CopyOutcome::NotYet(request),
+            frame.x[0] as i64
+        );
+        assert!(entry.take_run_failure().is_none());
+    }
+    service.prepare_copy_error = None;
+    word.0.set(true);
+    access.lower(space.index());
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        binding.record.id
+    );
+    let mut entry = runtime
+        .enter_registered(
+            registry,
+            source,
+            &fixture.task,
+            binding.address,
+            &parked,
+            service,
+        )
+        .unwrap();
+    assert!(matches!(
+        entry.resume_checkpoint(|_| Ok(None)),
+        Ok(NativeResume::RetrySyscall)
+    ));
+    drop(entry);
+    // SAFETY: this fixture exclusively owns the selected child record.
+    let retained = unsafe { *fixture.zone.record(binding.record.id).ctx_mut() };
+    crate::sched::ThreadCpu::load(&mut cpu, &mut frame, &retained);
+    let mut entry = runtime
+        .enter_registered(
+            registry,
+            source,
+            &fixture.task,
+            binding.address,
+            &retained,
+            service,
+        )
+        .unwrap();
+    let route = crate::dispatch::dispatch_syscall_with_native(
+        &mut frame,
+        counters,
+        core::slice::from_ref(&fixture.task),
+        &[],
+        &[],
+        &[],
+        &[],
+        &names,
+        Some(crate::dispatch::Zone {
+            tables: fixture.zone,
+            cpu: &mut cpu,
+            user: &word,
+        }),
+        None,
+        None,
+        Some(&mut *entry),
+        Some(source),
+        None,
+        |_| core::ptr::null_mut(),
+    );
+    assert!(matches!(
+        route,
+        CompletionRoute::Served | CompletionRoute::WithWork
+    ));
+    assert_eq!(
+        frame.x[0] as i64, -11,
+        "retry compares the original expected value, never EFAULT"
+    );
+    assert!(entry.take_run_failure().is_none());
+    assert!(runtime.task_binding(parent).is_some());
+    assert!(runtime.task_binding(child).is_some());
+    drop(entry);
+
+    struct Venue;
+    impl crate::thread_setup::LifecycleVenue for Venue {
+        fn thread<'b>(
+            &'b self,
+            task: &'b CurrentTask,
+        ) -> Option<crate::thread_setup::LifecycleThread<'b>> {
+            let (page, slot) = task.lifecycle_refs()?;
+            Some(crate::thread_setup::LifecycleThread { page, slot })
+        }
+        fn born_slot(
+            &self,
+            page: &ThreadLifecyclePage,
+            entry: carrick_el1_abi::EntryRef,
+        ) -> Option<&ThreadControlSlot> {
+            let address = page.control_address(entry)?;
+            // SAFETY: the production native stock retains the control allocation.
+            Some(unsafe { &*(address as *const ThreadControlSlot) })
+        }
+    }
+    let venue = Venue;
+    let memory = carrick_test_support::GuestUserBuffer::zeroed(8192);
+    frame.x[8] = 220;
+    frame.x[..5].copy_from_slice(&[
+        0x003d_0f00,
+        memory.arg() + 8192,
+        memory.arg(),
+        memory.arg() + 128,
+        memory.arg() + 4,
+    ]);
+    let mut entry = runtime
+        .enter_registered(
+            registry,
+            source,
+            &fixture.task,
+            binding.address,
+            &retained,
+            service,
+        )
+        .unwrap();
+    let route = crate::dispatch::dispatch_syscall_with_native(
+        &mut frame,
+        counters,
+        core::slice::from_ref(&fixture.task),
+        &[],
+        &[],
+        &[],
+        &[],
+        &names,
+        Some(crate::dispatch::Zone {
+            tables: fixture.zone,
+            cpu: &mut cpu,
+            user: &word,
+        }),
+        None,
+        Some(&venue),
+        Some(&mut *entry),
+        Some(source),
+        None,
+        |_| core::ptr::null_mut(),
+    );
+    assert!(
+        matches!(route, CompletionRoute::Served | CompletionRoute::WithWork),
+        "clone route {route:?}, result {}",
+        frame.x[0] as i64
+    );
+    let tid = frame.x[0] as u32;
+    assert!(
+        tid > 0 && (frame.x[0] as i64) > 0,
+        "thread clone result {}",
+        frame.x[0] as i64
+    );
+    drop(entry);
+    // Acknowledge the clone's completed Born publication before running again.
+    if let Some(work) = fixture.task.linux.take_host_work_doorbell() {
+        work.settled();
+    }
+    // A matching WAIT switches from the exec leader to its real clone birth.
+    frame.x[8] = crate::sched::SYS_FUTEX as u64;
+    frame.x[..6].copy_from_slice(&[VA, crate::sched::FUTEX_WAIT_PRIVATE, 0, 0, 0, 0]);
+    use crate::sched::LinuxSchedEntry;
+    assert_eq!(
+        crate::sched::Sched {
+            handoff: None,
+            zone: fixture.zone,
+            slot: fixture.slot,
+            task: &fixture.task,
+            cpu: &mut cpu,
+            user: &word,
+            counters,
+        }
+        .serve_futex(&mut frame),
+        Some(crate::sched::Served::Returned { switched: true })
+    );
+    let (page, control) = fixture.task.lifecycle_refs().unwrap();
+    assert_eq!(control.visible_tid(), Some(tid));
+    assert_eq!(
+        page.live(),
+        2,
+        "exec child's leader and cloned thread remain live"
+    );
+    registry
+        .register_thread(source, &fixture.task, binding.address, page, control)
+        .unwrap();
+    let selected = fixture.zone.slot(fixture.slot).current().unwrap();
+    // SAFETY: the scheduler selected this exact clone birth for execution.
+    let worker = unsafe { runtime.record_binding(fixture.zone.record_ref(selected)) }.unwrap();
+    let mut entry = runtime
+        .enter_registered(
+            registry,
+            source,
+            &fixture.task,
+            worker.address,
+            &worker.words,
+            service,
+        )
+        .unwrap();
+    frame.x[8] = 178;
+    let route = crate::dispatch::dispatch_syscall_with_native(
+        &mut frame,
+        counters,
+        core::slice::from_ref(&fixture.task),
+        &[],
+        &[],
+        &[],
+        &[],
+        &names,
+        Some(crate::dispatch::Zone {
+            tables: fixture.zone,
+            cpu: &mut cpu,
+            user: &word,
+        }),
+        None,
+        Some(&venue),
+        Some(&mut *entry),
+        Some(source),
+        None,
+        |_| core::ptr::null_mut(),
+    );
+    assert!(matches!(
+        route,
+        CompletionRoute::Served | CompletionRoute::WithWork
+    ));
+    assert_eq!(
+        frame.x[0],
+        u64::from(tid),
+        "post-exec cloned thread reached its first syscall"
+    );
+    assert!(runtime.task_binding(parent).is_some());
 }
