@@ -1360,6 +1360,71 @@ mod tests {
     }
 
     #[test]
+    fn retained_abi_region_selects_its_carrier_and_refuses_retirement() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let mapping = GuestMapping {
+            guest_start: carrick_mem::memory::LINUX_EL1_KERNEL_BASE,
+            ipa_start: carrick_mem::memory::LINUX_EL1_KERNEL_BASE,
+            mapped_size: carrick_mem::memory::LINUX_EL1_KERNEL_SIZE,
+            offset_in_mapping: 0,
+            payload_size: 0,
+            perms: SegmentPerms {
+                read: true,
+                write: true,
+                execute: false,
+            },
+            shared: false,
+            image: std::sync::Arc::new(Vec::new()),
+            private_file_backing: None,
+        };
+        let a = CarrierVmCustody::new_live_fixture();
+        let b = CarrierVmCustody::new_live_fixture();
+        let first = prepare_exec_region_raw_in(&a, &mapping).expect("first carrier region");
+        let second = prepare_exec_region_raw_in(&b, &mapping).expect("second carrier region");
+        assert_eq!(
+            carrick_el1_abi::get_el1_region_host_ptr(),
+            second.host_addr as usize,
+            "second carrier owns the legacy global aperture"
+        );
+
+        let slot = carrick_guest_arch::SlotId::from_index(0).expect("slot 0");
+        let cpu = carrick_guest_arch::CpuId::new(0);
+        let guard_a = crate::metadata_grant::retained_abi_region(&a).expect("first carrier region");
+        let guard_b =
+            crate::metadata_grant::retained_abi_region(&b).expect("second carrier region");
+        let (task_a, zone_a) =
+            crate::metadata_grant::stopped_records(guard_a.as_region(), cpu).expect("records a");
+        let (task_b, zone_b) =
+            crate::metadata_grant::stopped_records(guard_b.as_region(), cpu).expect("records b");
+        assert!(
+            !core::ptr::eq(zone_a, zone_b) && !core::ptr::eq(task_a, task_b),
+            "carrier-retained ABI regions must resolve disjoint carrier mappings"
+        );
+        guard_a
+            .mark_pending_host_work(slot)
+            .expect("live carrier slot doorbell");
+        assert!(task_a.linux.has_pending_host_work());
+        assert!(
+            !task_b.linux.has_pending_host_work(),
+            "marking slot doorbell on carrier A must not touch carrier B"
+        );
+
+        drop(guard_a);
+        drop(first);
+        assert!(
+            crate::metadata_grant::retained_abi_region(&a).is_none(),
+            "retired carrier region must refuse new host borrows"
+        );
+        assert!(
+            crate::metadata_grant::retained_abi_region(&b).is_some(),
+            "peer carrier region remains live"
+        );
+        drop(guard_b);
+        drop(second);
+        reset_el1_counters();
+    }
+
+    #[test]
     fn el1_aperture_pointer_retires_with_its_host_mapping() {
         let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let mapping = GuestMapping {
@@ -1729,7 +1794,7 @@ pub fn with_installed_ipc_region<T>(
 /// registered one (otherwise EL1 never attaches and IPC calls forward).
 pub(crate) fn install_registered_ipc_window(
     custody: &CarrierVmCustody,
-    retained_region: std::sync::Arc<dyn carrick_el1_abi::IpcTableMapBacking>,
+    retained_region: std::sync::Arc<crate::metadata_grant::BirthZoneBacking>,
 ) -> Result<(), TrapError> {
     let Some(backing) = registered_ipc_window_backing() else {
         return Ok(());
@@ -1737,24 +1802,28 @@ pub(crate) fn install_registered_ipc_window(
     // SAFETY: registered backing has validated geometry and retains the memory.
     let window = unsafe { carrick_el1_abi::HostIpcWindow::new(backing.as_ref()) };
     // The zone may have been installed after host backing registration.
-    // Bind before either publication store lets a guest probe or retire.
+    // Bind through the exact retained carrier registration before either
+    // publication store lets a guest probe or retire.
     if let Some(window) = window {
         let region = window.attach().map_err(|error| {
             TrapError::Hypervisor(format!("IPC window attachment failed: {error:?}"))
         })?;
-        let zone = carrick_el1_abi::zone_tables().ok_or_else(|| {
-            TrapError::Hypervisor("IPC window publication requires its carrier zone".to_owned())
-        })?;
-        zone.bind_ipc_operation_slots(
-            region.operation_slot_generation(),
-            &carrick_sched_core::BoundedSpin(0),
-            &|owned| {
-                let _ = owned.into_parts();
-            },
-        )
-        .map_err(|error| {
-            TrapError::Hypervisor(format!("IPC slot source publication failed: {error:?}"))
-        })?;
+        retained_region
+            .with_zone_tables(|zone| {
+                zone.bind_ipc_operation_slots(
+                    region.operation_slot_generation(),
+                    &carrick_sched_core::BoundedSpin(0),
+                    &|owned| {
+                        let _ = owned.into_parts();
+                    },
+                )
+            })
+            .map_err(|error| {
+                TrapError::Hypervisor(format!("IPC carrier zone registration: {error:?}"))
+            })?
+            .map_err(|error| {
+                TrapError::Hypervisor(format!("IPC slot source publication failed: {error:?}"))
+            })?;
     }
     let installed = install_ipc_window_using(
         custody,
@@ -1774,6 +1843,7 @@ pub(crate) fn install_registered_ipc_window(
     )?;
     // Publish through the exact registration retained by this installation.
     // A retired registration must never make a successor's window visible.
+    let retained_region: std::sync::Arc<dyn carrick_el1_abi::IpcTableMapBacking> = retained_region;
     retained_region
         .with_table_map(&mut |map| map.publish_window())
         .map_err(|error| TrapError::Hypervisor(format!("IPC region registration: {error:?}")))?;

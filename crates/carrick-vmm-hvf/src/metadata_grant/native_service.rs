@@ -692,9 +692,9 @@ impl NativeService {
         self,
         complete: impl FnOnce(ServiceTicket<ServicePin>) -> Result<(), TrapError>,
     ) -> Result<carrick_sched_core::WakeEffects, TrapError> {
-        let region = retained_abi_region(&self.custody).ok_or_else(|| stale())?;
+        let guard = retained_abi_region(&self.custody).ok_or_else(|| stale())?;
         let (_, zone) = stopped_records(
-            region,
+            guard.as_region(),
             carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
         )
         .ok_or_else(|| stale())?;
@@ -763,9 +763,9 @@ impl NativeService {
             None => return self.refuse(),
         };
         let custody = Arc::clone(&self.custody);
-        let region = retained_abi_region(&custody).ok_or_else(|| stale())?;
+        let guard = retained_abi_region(&custody).ok_or_else(|| stale())?;
         let (_, zone) = stopped_records(
-            region,
+            guard.as_region(),
             carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
         )
         .ok_or_else(|| stale())?;
@@ -957,9 +957,9 @@ impl NativeService {
             target,
             window,
         )?;
-        let region = retained_abi_region(&custody).ok_or_else(stale)?;
+        let guard = retained_abi_region(&custody).ok_or_else(stale)?;
         let (_, zone) = stopped_records(
-            region,
+            guard.as_region(),
             carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
         )
         .ok_or_else(stale)?;
@@ -1001,9 +1001,9 @@ impl NativeService {
             grant,
             _pin: self._reply_pin.take().map(|pin| pin._backing),
         });
-        let region = retained_abi_region(&custody).ok_or_else(stale)?;
+        let guard = retained_abi_region(&custody).ok_or_else(stale)?;
         let (_, zone) = stopped_records(
-            region,
+            guard.as_region(),
             carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
         )
         .ok_or_else(stale)?;
@@ -1341,9 +1341,9 @@ impl NativeService {
     ) -> Result<carrick_sched_core::WakeEffects, TrapError> {
         let custody = Arc::clone(&self.custody);
         let request = self.request();
-        let region = retained_abi_region(&custody).ok_or_else(stale)?;
+        let guard = retained_abi_region(&custody).ok_or_else(stale)?;
         let (_, zone) = stopped_records(
-            region,
+            guard.as_region(),
             carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
         )
         .ok_or_else(stale)?;
@@ -1433,9 +1433,9 @@ impl NativeService {
         backing_fault: bool,
     ) -> Result<carrick_sched_core::WakeEffects, TrapError> {
         let request = self.request();
-        let region = retained_abi_region(&self.custody).ok_or_else(|| stale())?;
+        let guard = retained_abi_region(&self.custody).ok_or_else(|| stale())?;
         let (_, zone) = stopped_records(
-            region,
+            guard.as_region(),
             carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
         )
         .ok_or_else(|| stale())?;
@@ -1512,8 +1512,8 @@ pub(super) fn take(
     custody: &Arc<crate::trap::CarrierVmCustody>,
     cpu: carrick_guest_arch::CpuId,
 ) -> Result<Option<NativeService>, TrapError> {
-    let region = retained_abi_region(custody).ok_or_else(|| stale())?;
-    let (task, zone) = stopped_records(region, cpu).ok_or_else(|| stale())?;
+    let guard = retained_abi_region(custody).ok_or_else(|| stale())?;
+    let (task, zone) = stopped_records(guard.as_region(), cpu).ok_or_else(|| stale())?;
     let Some(selector) = task.service_notice.take().map_err(|_| stale())? else {
         return Ok(None);
     };

@@ -8510,12 +8510,13 @@ impl HvfInner {
                     let address = carrick_guest_arch::KernelVa::new(
                         vcpu.get_reg(Reg::X1).map_err(hvf_error)?,
                     );
-                    let region =
+                    let guard =
                         crate::metadata_grant::retained_abi_region(custody).ok_or_else(|| {
                             TrapError::Hypervisor(
                                 "native run failure has no retained ABI region".into(),
                             )
                         })?;
+                    let region = guard.as_region();
                     let pointer = crate::metadata_grant::abi_stack_ptr::<
                         carrick_core_abi::NativeRunFailure,
                     >(region, cpu, address)

@@ -78,6 +78,30 @@ impl<'a> RetainedAbiRegion<'a> {
     }
 }
 
+/// Carrier-retained guard keeping the `BirthZoneBacking` mapping alive for the
+/// duration of a `RetainedAbiRegion` borrow.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct RetainedCarrierAbiRegion {
+    backing: Arc<BirthZoneBacking>,
+    base: core::ptr::NonNull<u8>,
+}
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl RetainedCarrierAbiRegion {
+    pub(crate) fn as_region(&self) -> RetainedAbiRegion<'_> {
+        RetainedAbiRegion {
+            base: self.base,
+            _retained: core::marker::PhantomData,
+        }
+    }
+
+    pub(crate) fn mark_pending_host_work(
+        &self,
+        slot: carrick_guest_arch::SlotId,
+    ) -> Result<(), carrick_el1_abi::FileRegionError> {
+        self.backing.mark_pending_host_work(slot)
+    }
+}
+
 /// Runtime-owned handback venue for an already enrolled parent wait.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub trait NativeWaitChannelWake: std::fmt::Debug + Send + Sync {
@@ -104,8 +128,8 @@ fn terminal_child_binding(
     phase: carrick_sched_core::TerminalPhase,
 ) -> Option<carrick_el1_abi::ExecutionBinding> {
     let slot = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)?;
-    let region = retained_abi_region(custody)?;
-    let (task, zone) = stopped_records(region, cpu)?;
+    let guard = retained_abi_region(custody)?;
+    let (task, zone) = stopped_records(guard.as_region(), cpu)?;
     let binding = carrick_core::entry::binding(&task.execution, &task.mm);
     let source = carrick_el1_abi::BornInZoneSource { zone, slot };
     if !carrick_core::entry::terminal_matches(binding, source, phase) {
@@ -140,10 +164,14 @@ fn service_terminal_operation(
     ) else {
         return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
     };
+    let Some(guard) = retained_abi_region(custody) else {
+        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    };
+    let region = guard.as_region();
+    let Some((task, zone)) = stopped_records(region, cpu) else {
+        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    };
     if retired {
-        let Some(zone) = carrick_el1_abi::zone_tables() else {
-            return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
-        };
         let idle = zone.spaces.idle_ttbr();
         if idle == 0
             || (ttbr0 & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK)
@@ -164,9 +192,6 @@ fn service_terminal_operation(
                 carrick_hal::fork_stock::ReclaimExecution::maintenance_root(live, idle)
             });
             let Some(execution) = execution else {
-                return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
-            };
-            let Some(region) = retained_abi_region(custody) else {
                 return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
             };
             let mut stock = custody.fork_stock.lock();
@@ -196,12 +221,6 @@ fn service_terminal_operation(
     }
     // Pending retirement still needs the live child-root capability. Terminal
     // wakes use only the slot's exact execution receipt, which survives reclaim.
-    let Some(region) = retained_abi_region(custody) else {
-        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
-    };
-    let Some((task, _)) = stopped_records(region, cpu) else {
-        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
-    };
     let Some(execution) = (|| {
         let mm = carrick_el1_abi::ReservationMm::new(binding.mm.raw())?;
         let stock = custody.fork_stock.lock();
@@ -224,16 +243,13 @@ fn service_terminal_operation(
     {
         return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
     }
-    let Some(pointer) = retained_abi_region(custody).and_then(|region| {
+    let Some(pointer) =
         abi_stack_ptr::<NativeChildRetire>(region, cpu, carrick_guest_arch::KernelVa::new(args[0]))
-    }) else {
+    else {
         return [METADATA_GRANT_ERR_INVALID, 0, 0, 0];
     };
     // Settle USED while the exact root still exists, then release unused pool
     // records. Physical bytes remain with ForkStock until neutral reclamation.
-    let Some((_, zone)) = stopped_records(region, cpu) else {
-        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
-    };
     let Some(wake) = custody.native_wait_channel_wake.lock().clone() else {
         return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
     };
@@ -290,9 +306,6 @@ fn service_terminal_operation(
     {
         return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
     }
-    let Some(zone) = carrick_el1_abi::zone_tables() else {
-        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
-    };
     let Some(slot) = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize) else {
         return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
     };
@@ -1371,6 +1384,7 @@ mod delayed_owner {
     }
     pub(super) fn defer(
         request: carrick_el1_abi::MetadataGrantRequest,
+        backing: &super::BirthZoneBacking,
         mailbox: &carrick_el1_abi::MetadataGrantMailbox,
         custody: &crate::trap::CarrierVmCustody,
         generation: Option<crate::trap::CarrierVmGeneration>,
@@ -1398,7 +1412,7 @@ mod delayed_owner {
         };
         let request_generation = mailbox.request_generation();
         let _ = gate.events.send(Observation::OwnerClaimed);
-        loser(mailbox);
+        loser(backing, mailbox);
         // Test-only custody: defer completion without holding an executor or
         // trap/engine ownership while the remaining records enroll.
         let owner_gate = Arc::clone(&gate);
@@ -1428,17 +1442,22 @@ mod delayed_owner {
         *gate.owner.lock() = Some(owner);
         true
     }
-    pub(super) fn loser(mailbox: &carrick_el1_abi::MetadataGrantMailbox) {
+    pub(super) fn loser(
+        backing: &super::BirthZoneBacking,
+        mailbox: &carrick_el1_abi::MetadataGrantMailbox,
+    ) {
         let gate = GATE.lock().clone();
         if let Some(gate) = gate
             && gate.active.load(Ordering::Acquire)
             && mailbox.state.load(Ordering::Acquire)
                 == carrick_el1_abi::METADATA_MAILBOX_HOST_WORKING
         {
-            let parked = carrick_el1_abi::zone_tables()
-                .and_then(|zone| {
+            let parked = backing
+                .with_zone_tables(|zone| {
                     zone.object_queue_census(carrick_el1_abi::METADATA_WAIT_QUEUE_INDEX)
                 })
+                .ok()
+                .flatten()
                 .map_or(0, |census| census.waiters);
             let _ = gate.events.send(Observation::Contended { parked });
         }
@@ -1474,11 +1493,11 @@ pub(crate) fn service_pending_metadata_request(
     };
     let Some(request) = mailbox.claim_request() else {
         #[cfg(feature = "metadata-grant-test-support")]
-        delayed_owner::loser(mailbox);
+        delayed_owner::loser(&backing, mailbox);
         return Ok(false);
     };
     #[cfg(feature = "metadata-grant-test-support")]
-    if delayed_owner::defer(request, mailbox, custody, generation) {
+    if delayed_owner::defer(request, &backing, mailbox, custody, generation) {
         return Ok(false);
     }
     complete_metadata_request(
@@ -2261,7 +2280,8 @@ pub(crate) fn handle_metadata_grant_trap(
     let arg3 = vcpu
         .get_reg(Reg::X3)
         .map_err(|e| TrapError::Hypervisor(format!("failed to read X3 for metadata grant: {e}")))?;
-    let region = retained_abi_region(custody);
+    let guard = retained_abi_region(custody);
+    let region = guard.as_ref().map(RetainedCarrierAbiRegion::as_region);
     let execution = if op == GRANT_OP_ROOT_EXIT {
         let ttbr0 = vcpu
             .get_sys_reg(applevisor::vcpu::SysReg::TTBR0_EL1)
@@ -2283,19 +2303,20 @@ pub(crate) fn handle_metadata_grant_trap(
         let slot = usize::try_from(arg1)
             .ok()
             .and_then(carrick_sched_core::SlotId::from_index);
-        if let Some((zone, slot)) = carrick_el1_abi::zone_tables().zip(slot) {
-            let lane = zone.slot(slot);
-            // A delayed receipt cannot kick an allowed successor. The host
-            // reads its retained alias, including host-only control bindings.
-            let excluded = lane
-                .affinity_source()
-                .load()
-                .zip(lane.bound_cpu())
-                .is_some_and(|(mask, cpu)| {
-                    !carrick_core::affinity::CpuAffinity::from_words(&[mask]).is_allowed(cpu)
-                });
-            if excluded {
-                carrick_el1_abi::mark_pending_host_work(usize::from(slot.raw()));
+        if let Some((guard, slot)) = guard.as_ref().zip(slot)
+            && let Ok(excluded) = guard.backing.with_zone_tables(|zone| {
+                let lane = zone.slot(slot);
+                // A delayed receipt cannot kick an allowed successor. The host
+                // reads its retained alias, including host-only control bindings.
+                lane.affinity_source()
+                    .load()
+                    .zip(lane.bound_cpu())
+                    .is_some_and(|(mask, cpu)| {
+                        !carrick_core::affinity::CpuAffinity::from_words(&[mask]).is_allowed(cpu)
+                    })
+            })
+        {
+            if excluded && guard.mark_pending_host_work(slot).is_ok() {
                 crate::vcpu_kick::kick_zone_slot(usize::from(slot.raw()));
             }
             [METADATA_GRANT_SUCCESS, 0, 0, 0]
@@ -2426,10 +2447,10 @@ fn service_fork_refusal(
     address: carrick_guest_arch::KernelVa,
     ttbr0: u64,
 ) -> [u64; 4] {
-    let Some(region) = retained_abi_region(custody) else {
+    let Some(guard) = retained_abi_region(custody) else {
         return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
     };
-    service_fork_refusal_using_region(custody, generation, cpu, address, ttbr0, region)
+    service_fork_refusal_using_region(custody, generation, cpu, address, ttbr0, guard.as_region())
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2569,15 +2590,11 @@ pub(crate) fn abi_stack_ptr<T>(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn retained_abi_region(
-    _custody: &crate::trap::CarrierVmCustody,
-) -> Option<RetainedAbiRegion<'_>> {
-    // SAFETY: the synchronous stopped lane retains this carrier's ABI mapping.
-    unsafe {
-        RetainedAbiRegion::new(
-            carrick_el1_abi::get_el1_region_host_ptr() as *mut u8,
-            carrick_el1_abi::EL1_REGION_SIZE as usize,
-        )
-    }
+    custody: &crate::trap::CarrierVmCustody,
+) -> Option<RetainedCarrierAbiRegion> {
+    let backing = custody.file_region_backing.lock().upgrade()?;
+    let base = backing.retained_base()?;
+    Some(RetainedCarrierAbiRegion { backing, base })
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2591,7 +2608,7 @@ pub(crate) fn stopped_execution(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn stopped_records<'a>(
+pub(crate) fn stopped_records<'a>(
     region: RetainedAbiRegion<'a>,
     cpu: carrick_guest_arch::CpuId,
 ) -> Option<(
@@ -2617,7 +2634,8 @@ pub(crate) fn entry_binding_fatal_diagnostic(
     registers: carrick_el1_abi::ArmEntryFatalRegisters,
 ) -> Option<carrick_el1_abi::ArmEntryBindingFatal> {
     let slot = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)?;
-    let region = retained_abi_region(custody)?;
+    let guard = retained_abi_region(custody)?;
+    let region = guard.as_region();
     let pointer = abi_stack_ptr::<carrick_el1_abi::TrapFrame>(
         region,
         cpu,
@@ -3741,6 +3759,34 @@ impl BirthZoneBacking {
         self.registration.lock().retire();
     }
 
+    pub(crate) fn retained_base(&self) -> Option<core::ptr::NonNull<u8>> {
+        if !self.live.load(Ordering::Acquire) {
+            return None;
+        }
+        self.registration.lock().retained_base().ok()
+    }
+
+    pub(crate) fn with_zone_tables<T>(
+        &self,
+        visitor: impl FnOnce(&carrick_el1_abi::ZoneTables) -> T,
+    ) -> Result<T, carrick_el1_abi::FileRegionError> {
+        if !self.live.load(Ordering::Acquire) {
+            return Err(carrick_el1_abi::FileRegionError::Retired);
+        }
+        let registration = self.registration.lock();
+        Ok(visitor(registration.zone_tables()?))
+    }
+
+    pub(crate) fn mark_pending_host_work(
+        &self,
+        slot: carrick_guest_arch::SlotId,
+    ) -> Result<(), carrick_el1_abi::FileRegionError> {
+        if !self.live.load(Ordering::Acquire) {
+            return Err(carrick_el1_abi::FileRegionError::Retired);
+        }
+        self.registration.lock().mark_pending_host_work(slot)
+    }
+
     fn metadata_mailbox(&self) -> Option<&carrick_el1_abi::MetadataGrantMailbox> {
         let registration = self.registration.lock();
         let mailbox = registration.metadata_mailbox().ok()? as *const _;
@@ -3806,21 +3852,12 @@ impl CarrierBirthSource {
         let state = self.custody.state.lock();
         if expected != &self.identity
             || !matches!(state.lifecycle, crate::trap::CarrierVmLifecycle::Live(g) if g == self.generation)
-            || !self.backing.live.load(Ordering::Acquire)
         {
             return Err(carrick_hal::birth_serial::BirthSourceError::StaleOwner);
         }
-        // SAFETY: this exact carrier's initialized EL1 mapping is retained by
-        // backing; its size/alignment were checked before source publication.
-        let zone = unsafe {
-            &*self
-                .backing
-                .mapping
-                .as_ptr()
-                .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
-                .cast::<carrick_el1_abi::ZoneTables>()
-        };
-        Ok(op(zone))
+        self.backing
+            .with_zone_tables(op)
+            .map_err(|_| carrick_hal::birth_serial::BirthSourceError::StaleOwner)
     }
 }
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

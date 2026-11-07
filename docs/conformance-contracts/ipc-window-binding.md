@@ -111,6 +111,15 @@ The first attempt to pass a borrowed registered map to publication failed with
 E0521: `FileTable::Binding` still required a static map. The retained owner
 removes that requirement without extending the reference lifetime.
 
-Other region consumers still use `EL1_REGION_HOST_PTR`; migrating those onto
-retained registration remains unfinished. Neither these scoped IPC accesses
-nor the earlier ARM migration proves real KVM pipe service or completes Slice 1.
+`FileRegionRegistration` also initializes the region's `ZoneTables` and
+`CurrentTask` records in place before publishing its live identity, exposing
+carrier-local `retained_base`, `zone_tables`, `current_task` and
+`mark_pending_host_work` accessors that refuse retired registrations. HVF
+`retained_abi_region`, `service_terminal_operation`, `GRANT_OP_RESIDENCY_KICK`
+and `install_registered_ipc_window` now borrow the exact carrier's retained
+`BirthZoneBacking` rather than reading `get_el1_region_host_ptr` or the global
+`zone_tables` / `mark_pending_host_work` helpers. Other host delegation and
+executor consumers in `carrick-el1-abi`, `carrick-kernel`, `carrick-runtime`
+and `carrick-vmm-hvf` still use `EL1_REGION_HOST_PTR`; migrating those onto
+retained registration remains unfinished. Neither these scoped accesses nor the
+earlier ARM migration proves real KVM pipe service or completes Slice 1.
