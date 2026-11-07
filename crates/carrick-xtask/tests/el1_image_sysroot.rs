@@ -24,8 +24,7 @@ fn loaded_image_budget_includes_trailing_bss_and_alignment() {
 }
 
 fn executable(path: &Path, script: &str) {
-    std::fs::write(path, script).unwrap();
-    carrick_test_support::publish_executable(path, 0o755).unwrap();
+    carrick_test_support::write_executable(path, script, 0o755).unwrap();
 }
 
 fn fixture() -> (tempfile::TempDir, Command) {
