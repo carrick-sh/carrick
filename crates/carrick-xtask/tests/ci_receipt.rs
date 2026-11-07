@@ -3566,6 +3566,13 @@ fn empty_step_and_zero_executed_lane_receipts_fail_without_candidate_tree() {
         empty.phase = phase.into();
         empty.profile = profile.into();
         empty.overall = "FAIL".into();
+        // Scope exclusions are not evidence that any required lane ran.
+        if profile == "no-docker" {
+            empty.skipped_steps = carrick_xtask::accept::NO_DOCKER_EXCLUSIONS
+                .iter()
+                .map(|step| (*step).to_owned())
+                .collect();
+        }
         let empty_path = dir.path().join(format!("empty-{phase}-{profile}.json"));
         let summary_path = dir.path().join(format!("summary-{phase}-{profile}.md"));
         std::fs::write(&empty_path, serde_json::to_vec(&empty).unwrap()).unwrap();
