@@ -276,6 +276,15 @@ shared-table unshare and both ISA adapters. VM-free fd-core receipt tests prove
 lifetime and rollback only; they do not establish production cleanup acceptance
 or a signed census result.
 
+`CLOSE_RANGE_CLOEXEC` uses the existing ring descriptor owner without removing
+slots or creating cleanup receipts. Its fd-core mutation and host-binding
+projection share the fd-map mutation guard with `F_SETFD` and descriptor
+replacement, in fd-map to fd-core order. Forked tables retain independent
+flags; a sparse range is bounded by allocated descriptor storage and the fixed
+projection capacity. Plain range close, retained close-effect delivery and
+successor-table publication for `UNSHARE` remain unfinished. This flag-only
+operation does not authorize removing `close_range` from the Forward allowlist.
+
 ## Pipe capacity allocation service (#1678)
 
 `HostFileOp::PipeCapacity` extends the existing retained native service record.
