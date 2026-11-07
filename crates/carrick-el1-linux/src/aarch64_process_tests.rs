@@ -2093,6 +2093,11 @@ fn test_fork_child_gets_distinct_root_and_x0_zero() {
 /// witness: it isolates ENOSYS before any time handler or copy can run.
 #[cfg(test)]
 fn native_fork_child_time_handler(number: carrick_abi::CanonicalNr) {
+    native_fork_child_time_handler_with_flags(number, 0);
+}
+
+#[cfg(test)]
+fn native_fork_child_time_handler_with_flags(number: carrick_abi::CanonicalNr, flags: u64) {
     use super::native_process_runtime::NativeThreadGroupOwner;
     use carrick_personality_linux::dispatch::CompletionRoute;
 
@@ -2180,6 +2185,7 @@ fn native_fork_child_time_handler(number: carrick_abi::CanonicalNr) {
     // CLOCK_REALTIME = 0; all user pointers are null. The expected Linux
     // result for each of these calls is EFAULT (14), never ENOSYS (38).
     frame.x[8] = number.raw();
+    frame.x[1] = flags;
     let route = super::dispatch::dispatch_syscall_with_native(
         &mut frame,
         &counters,
@@ -2241,6 +2247,18 @@ fn native_fork_child_adjtimex_reaches_time_handler() {
 #[test]
 fn native_fork_child_nanosleep_reaches_time_handler() {
     native_fork_child_time_handler(carrick_abi::syscall::nr::NANOSLEEP);
+}
+
+#[test]
+fn native_fork_child_clock_nanosleep_reaches_time_handler() {
+    native_fork_child_time_handler(carrick_abi::syscall::nr::CLOCK_NANOSLEEP);
+}
+
+#[test]
+fn native_fork_child_absolute_clock_nanosleep_reaches_time_handler() {
+    // TIMER_ABSTIME still requires a readable request timespec. A null
+    // request must reach Linux validation rather than child-route refusal.
+    native_fork_child_time_handler_with_flags(carrick_abi::syscall::nr::CLOCK_NANOSLEEP, 1);
 }
 
 #[test]
