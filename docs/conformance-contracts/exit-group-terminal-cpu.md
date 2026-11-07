@@ -102,7 +102,8 @@ same-executor resident reaffirmation does not restore process translation.
     publication and that a second-root write failure retains detached backend
     and worker vCPU ownership.
 
-The missing-cache schedule is proven VM-free. The reported signed population
-(10/10 base, 9/10 candidate on PR #1739) still requires a fresh paired signed
-run on this fix; this Linux worker does not establish a signed pass rate or
-attribute every preceding `ProcessExit` diagnostic to the missing-cache defect.
+The VM-free witnesses prove the missing-cache ordering and terminal CPU-save
+selection. Landing this timing-dependent fix also requires paired ten-run
+signed populations, using one exact artifact per side and counting the test's
+own verdict line. The VM-free reduction does not establish a signed pass rate
+or attribute every `ProcessExit` diagnostic to the missing-cache defect.
