@@ -448,6 +448,12 @@ impl<'a> IpcRegion<'a> {
         }
         let mut member_guard = self.lock(member, wait)?;
         let level = member_guard.member_level(kind)?;
+        let mut epoll_guard = self.lock_epoll(epoll, wait)?;
+        // An existing (file, fd) needs no new fan-out slot. Preserve EEXIST
+        // before considering placement of a distinct registration.
+        if epoll_guard.find_item(fd, file_key).is_some() {
+            return Err(EpollCtlError::Exists);
+        }
         let mut count = 0;
         let mut cursor = member_guard.record.epoll_link.load(Ordering::Relaxed) as u32;
         while let Some(item) = self.item(cursor) {
@@ -456,10 +462,6 @@ impl<'a> IpcRegion<'a> {
         }
         if count >= MAX_MEMBER_ITEMS {
             return Err(EpollCtlError::HostHalf(HostHalfReason::MemberFanOut));
-        }
-        let mut epoll_guard = self.lock_epoll(epoll, wait)?;
-        if epoll_guard.find_item(fd, file_key).is_some() {
-            return Err(EpollCtlError::Exists);
         }
         let Some((number, item)) = self.alloc_item() else {
             return Err(EpollCtlError::HostHalf(HostHalfReason::ItemsExhausted));

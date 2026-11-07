@@ -1436,6 +1436,46 @@ mod overlay_dispatch_tests {
         );
     }
 
+    /// Drive the public syscall entry and real forked file table, rather
+    /// than translating the IPC owner's Exists result in the fixture.
+    #[test]
+    fn zone_epoll_duplicate_add_at_capacity_is_eexist_then_mod_after_fork() {
+        for pipe in [false, true] {
+            let mut h = Harness::new();
+            let member = if pipe {
+                let pair = h.reserve(8);
+                assert_eq!(returned(h.call(59, [pair, 0, 0, 0, 0, 0])), 0);
+                let bytes = h.memory.read_bytes(pair, 4).unwrap();
+                i32::from_le_bytes(bytes.try_into().unwrap()) as u64
+            } else {
+                returned(h.call(19, [0, 0, 0, 0, 0, 0])) as u64
+            };
+            let event = h.reserve(16);
+            let mut bytes = [0; 16];
+            bytes[..4].copy_from_slice(&LINUX_EPOLLIN.to_le_bytes());
+            bytes[8..].copy_from_slice(&1u64.to_le_bytes());
+            h.memory.write_bytes(event, &bytes).unwrap();
+            let mut epolls = Vec::new();
+            for _ in 0..carrick_el1_abi::ipc::epoll::MAX_MEMBER_ITEMS {
+                let ep = returned(h.call(20, [0; 6])) as u64;
+                assert_eq!(returned(h.call(21, [ep, 1, member, event, 0, 0])), 0);
+                epolls.push(ep);
+            }
+            assert_eq!(errno(h.call(21, [epolls[0], 1, member, event, 0, 0])), 17);
+            assert_eq!(returned(h.call(21, [epolls[0], 3, member, event, 0, 0])), 0);
+            let parent = h.dispatcher.capture_one_task_context().unwrap();
+            let (mut child, child_context) = super::hvpatch_in_process_fork_tests::fork_dispatcher(
+                &h.dispatcher, parent.thread().registry_id(),
+                crate::thread::ThreadId::synthetic_for_tests(1671), 41, 42);
+            for (op, expected) in [(1, DispatchOutcome::errno(LINUX_EEXIST)),
+                                   (3, DispatchOutcome::Returned { value: 0 })] {
+                assert_eq!(child.dispatch(&child_context,
+                    SyscallRequest::new(21, SyscallArgs([epolls[0], op, member, event, 0, 0])),
+                    &mut h.memory, &h.reporter).unwrap(), expected);
+            }
+        }
+    }
+
     #[test]
     fn empty_epoll_interest_add_publishes_the_shared_mutation_source() {
         let mut h = Harness::new();
