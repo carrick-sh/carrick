@@ -848,6 +848,24 @@ impl<
     Context: super::dispatch::DispatchContext,
 > carrick_personality_linux::ipc::IpcNative<'a> for El1PendingFamilies<'a, F, C, U, G, Context>
 {
+    fn retain_output(
+        &mut self,
+        _request: GuestCopyRequest,
+        output: carrick_personality_linux::ipc::IpcOutput,
+    ) -> carrick_personality_linux::ipc::IpcOutcome {
+        let venue = self.process_venue().unwrap_or_else(|| {
+            super::dispatch::invalid_completion(super::dispatch::NativeInvariant::EntryBinding)
+        });
+        let mut outcome = venue
+            .as_ipc_venue()
+            .unwrap_or_else(|| {
+                super::dispatch::invalid_completion(super::dispatch::NativeInvariant::EntryBinding)
+            })
+            .complete_output(output);
+        self.run_ready_after_native_transfer(&mut outcome);
+        carrick_personality_linux::ipc::IpcOutcome::from_lifecycle(outcome)
+    }
+
     fn arguments(&self) -> [u64; 6] {
         [
             self.frame.argument(0).unwrap_or(0),

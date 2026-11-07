@@ -138,6 +138,12 @@ pub(super) struct OwnedCopyout {
     pub bytes: Vec<u8>,
     pub offset: usize,
     pub result: SyscallResult,
+    pub custody: CopyoutCustody,
+}
+
+pub(super) enum CopyoutCustody {
+    Completed,
+    Ipc { message: Option<(i32, usize, i64)> },
 }
 
 /// Physical preparation is enrolled only after the IPC dispatch stack unwinds.
@@ -522,6 +528,50 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         })
     }
 
+    pub(super) fn complete_owned_copyout(&mut self, output: OwnedCopyout) -> LifecycleOutcome {
+        let result = self.finish_copyout(output);
+        match self.drain_copyout(result) {
+            Ok(NativeResume::Returned(result)) => returned(result.raw()),
+            Ok(NativeResume::Left(None)) => LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                result: SyscallResult::new(0),
+            },
+            Ok(NativeResume::NoPending) => {
+                // A cancellation can win before park publishes. The service
+                // has dropped output and returned terminal custody; it has
+                // not completed this syscall with an errno.
+                if let Some(outcome) = self.resume_pending_lifecycle() {
+                    return outcome;
+                }
+                match self.cancel_owner_wait() {
+                    Ok(outcome) => outcome,
+                    Err(error) => self.run_failed(error.run_failure_reason()),
+                }
+            }
+            Ok(_) => self.run_failed(NativeProcessError::Quarantined.run_failure_reason()),
+            Err(error) => self.fail(error),
+        }
+    }
+
+    fn restore_copyout_message(&mut self, output: &OwnedCopyout) {
+        if let CopyoutCustody::Ipc {
+            message: Some((id, index, kind)),
+        } = output.custody
+        {
+            let _ = self.msgrcv_restore(id, index, kind, output.bytes[8..].to_vec());
+        }
+    }
+
+    fn fault_copyout(&mut self, output: &OwnedCopyout) -> Result<NativeResume, NativeProcessError> {
+        if matches!(output.custody, CopyoutCustody::Completed) {
+            return Err(NativeProcessError::Fault);
+        }
+        self.restore_copyout_message(output);
+        Ok(NativeResume::Returned(SyscallResult::new(
+            carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
+        )))
+    }
+
     #[inline(never)]
     pub(super) fn drain_copyout(
         &mut self,
@@ -546,11 +596,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let mut prepared_offset = None;
         while output.offset < output.bytes.len() {
             let previous_prepared_offset = prepared_offset.take();
-            let address = output
-                .address
-                .raw()
-                .checked_add(output.offset as u64)
-                .ok_or(NativeProcessError::Fault)?;
+            let Some(address) = output.address.raw().checked_add(output.offset as u64) else {
+                return self.fault_copyout(&output);
+            };
             let count = (4096 - (address as usize & 4095)).min(output.bytes.len() - output.offset);
             match self.copy_owner_frame(
                 UserVa::new(address),
@@ -628,9 +676,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                                 ServiceCompletion::RetrySyscall,
                             );
                         }
+                        Err(NativeProcessError::Fault) => return self.fault_copyout(&output),
                         Err(error) => return Err(error),
                     }
                 }
+                Err(NativeProcessError::Fault) => return self.fault_copyout(&output),
                 Err(error) => return Err(error),
             }
         }
@@ -2651,6 +2701,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .consume_owner_continuation();
         }
         let output = pending.copyout.take();
+        if matches!(request.operation, ServiceOperation::Fault(_))
+            && result != ServiceResult::Supplied
+            && let Some(output) = &output
+        {
+            self.restore_copyout_message(output);
+        }
+
         if pending.adapter {
             return self.finish_adapter_service(result, pending.claim);
         }

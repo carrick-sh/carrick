@@ -230,6 +230,9 @@ impl<'ast> Visit<'ast> for Census {
     }
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
         let name = node.method.to_string();
+        if name == "is_done" && contains_copy(&node.receiver) {
+            self.record(node.span(), "typed-collapse", name.clone());
+        }
         if matches!(
             name.as_str(),
             "map_err"
@@ -329,7 +332,11 @@ fn counts(sites: &[Site]) -> Counts {
     let mut counts = Counts::new();
     for site in sites.iter().filter(|site| site.kind != "legacy-call") {
         *counts
-            .entry(if site.kind == "bool-trait" {
+            .entry(if site.kind == "typed-collapse" {
+                // A source-derived monotone total survives neutral code moves
+                // while the older per-file categories keep their exact limits.
+                "typed-collapse".into()
+            } else if site.kind == "bool-trait" {
                 format!("{}:{}:{}", site.kind, site.path, site.operation)
             } else {
                 format!("{}:{}", site.kind, site.path)
@@ -357,6 +364,22 @@ fn validate(found: &Counts, allowed: &Counts, previous: &Counts) -> Result<(), S
     Ok(())
 }
 
+fn source_counts_at(root: &Path, base: &str) -> Result<Counts, String> {
+    let output = std::process::Command::new("git")
+        .args(["archive", base, "--", "crates"])
+        .current_dir(root)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err("cannot archive guest-copy base".into());
+    }
+    let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
+    tar::Archive::new(output.stdout.as_slice())
+        .unpack(temp.path())
+        .map_err(|e| e.to_string())?;
+    Ok(counts(&discover(temp.path())?))
+}
+
 pub fn check(root: &Path, base: Option<&str>) -> Result<(), String> {
     let found = counts(&discover(root)?);
     let allowed = read_policy(&fs::read_to_string(root.join(POLICY)).map_err(|e| e.to_string())?)?;
@@ -368,19 +391,7 @@ pub fn check(root: &Path, base: Option<&str>) -> Result<(), String> {
         if exists.stdout.trim().is_empty() {
             // First introduction must compare against base source, not HEAD's
             // newly written ceilings. Never permit bootstrap headroom.
-            let output = std::process::Command::new("git")
-                .args(["archive", &base, "--", "crates"])
-                .current_dir(root)
-                .output()
-                .map_err(|e| e.to_string())?;
-            if !output.status.success() {
-                return Err("cannot archive guest-copy base".into());
-            }
-            let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
-            tar::Archive::new(output.stdout.as_slice())
-                .unpack(temp.path())
-                .map_err(|e| e.to_string())?;
-            counts(&discover(temp.path())?)
+            source_counts_at(root, &base)?
         } else {
             let output = crate::command::run_checked(
                 "git",
@@ -388,14 +399,30 @@ pub fn check(root: &Path, base: Option<&str>) -> Result<(), String> {
                 Some(root),
             )
             .map_err(|e| e.to_string())?;
-            read_policy(&output.stdout)?
+            let mut previous = read_policy(&output.stdout)?;
+            if !previous.keys().any(|key| key.as_str() == "typed-collapse") {
+                // First census of typed-outcome collapse compares with source,
+                // never the newly introduced HEAD ceilings. Once present, the
+                // committed category ratchets like every older kind.
+                previous.extend(
+                    source_counts_at(root, &base)?
+                        .into_iter()
+                        .filter(|(key, _)| key.as_str() == "typed-collapse"),
+                );
+            }
+            previous
         }
     } else {
         allowed.clone()
     };
     validate(&found, &allowed, &previous)?;
     println!(
-        "guest-copy debt: {} error collapses/bool trait methods across {} counters",
+        "typed guest-copy collapses: {} -> {}",
+        previous.get("typed-collapse").copied().unwrap_or(0),
+        found.get("typed-collapse").copied().unwrap_or(0)
+    );
+    println!(
+        "guest-copy debt: {} error collapses/typed collapses/bool trait methods across {} counters",
         found.values().sum::<usize>(),
         found.len()
     );
@@ -421,6 +448,22 @@ pub fn list(root: &Path, writer: &mut impl std::io::Write) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn typed_done_test_counts_owner_refusal_collapse() {
+        let sites = source_sites("f.rs", "fn f() { if !u.write_val(a, &b).is_done() { fault(); } if !u.copy_out(a, b).is_done() { fault(); } } ").unwrap();
+        assert_eq!(
+            sites.iter().filter(|s| s.kind == "typed-collapse").count(),
+            2
+        );
+        let handled = source_sites("f.rs", "fn f() { match u.copy_out(a, b) { CopyOutcome::Done => done(), CopyOutcome::Fault => fault(), CopyOutcome::NotYet(request) => park(request) } }").unwrap();
+        assert!(counts(&handled).is_empty());
+        let baseline = counts(&sites);
+        let mut added = baseline.clone();
+        *added.get_mut("typed-collapse").unwrap() += 1;
+        assert!(validate(&added, &added, &baseline).is_err());
+        validate(&counts(&handled), &counts(&handled), &baseline).unwrap();
+    }
+
     #[test]
     fn production_errno_collapse_and_macro_body_are_counted() {
         let source = r#"trait UserCopy { fn copy_in(&mut self, a: &mut [u8], b: u64) -> bool; }

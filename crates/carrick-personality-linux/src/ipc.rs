@@ -7,7 +7,8 @@ use core::time::Duration;
 pub mod namespace;
 
 use crate::abi::entry::SyscallResult;
-use crate::lifecycle::UserCopy;
+use crate::lifecycle::{LifecycleOutcome, UserCopy};
+use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest};
 use carrick_guest_arch::UserVa;
 pub use carrick_syscall_abi::ipc::{
     GETALL, GETNCNT, GETPID, GETVAL, GETZCNT, IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_NOWAIT,
@@ -50,12 +51,131 @@ pub enum IpcCall {
 pub enum IpcOutcome {
     Returned(SyscallResult),
     Suspended,
+    Redispatch,
+    HostCustody,
+    ReturnedWithWork(SyscallResult),
+    Transferred {
+        progress: carrick_core_abi::Served,
+        result: SyscallResult,
+    },
+}
+
+impl IpcOutcome {
+    pub fn from_lifecycle(outcome: LifecycleOutcome) -> Self {
+        match outcome {
+            LifecycleOutcome::Returned {
+                result,
+                work: false,
+            } => Self::Returned(result),
+            LifecycleOutcome::Returned { result, work: true } => Self::ReturnedWithWork(result),
+            LifecycleOutcome::Redispatch => Self::Redispatch,
+            LifecycleOutcome::Transferred {
+                progress: carrick_core_abi::Served::Idle,
+                ..
+            } => Self::Suspended,
+            LifecycleOutcome::Transferred { progress, result } => {
+                Self::Transferred { progress, result }
+            }
+            LifecycleOutcome::HostCustody => Self::HostCustody,
+        }
+    }
+
+    pub fn into_lifecycle(self) -> LifecycleOutcome {
+        match self {
+            Self::Returned(result) => LifecycleOutcome::Returned {
+                result,
+                work: false,
+            },
+            Self::Suspended => LifecycleOutcome::Transferred {
+                progress: carrick_core_abi::Served::Idle,
+                result: SyscallResult::new(0),
+            },
+            Self::Redispatch => LifecycleOutcome::Redispatch,
+            Self::HostCustody => LifecycleOutcome::HostCustody,
+            Self::ReturnedWithWork(result) => LifecycleOutcome::Returned { result, work: true },
+            Self::Transferred { progress, result } => {
+                LifecycleOutcome::Transferred { progress, result }
+            }
+        }
+    }
+}
+
+/// A completed IPC answer, including the next unwritten byte and any message
+/// removed from its queue. Memory contention must retain this exact answer.
+pub struct IpcOutput {
+    pub address: UserVa,
+    pub bytes: Vec<u8>,
+    pub offset: usize,
+    pub result: SyscallResult,
+    pub message: Option<(i32, usize, i64)>,
+}
+
+impl IpcOutput {
+    fn new(address: UserVa, bytes: Vec<u8>, result: i64) -> Self {
+        Self {
+            address,
+            bytes,
+            offset: 0,
+            result: SyscallResult::new(result),
+            message: None,
+        }
+    }
+
+    pub fn range(&self) -> Option<carrick_guest_arch::UserRange> {
+        carrick_guest_arch::UserRange::checked(
+            self.address,
+            carrick_guest_arch::GuestLen::new(self.bytes.len() as u64),
+        )
+        .filter(|range| range.in_lower_half())
+    }
+
+    pub fn restore(&self, venue: &mut dyn ProcessIpcVenue) {
+        if let Some((id, index, kind)) = self.message {
+            let _ = venue.msgrcv_restore(id, index, kind, self.bytes[8..].to_vec());
+        }
+    }
+}
+
+/// Copy only page-bounded pieces: a successful prefix belongs to this answer,
+/// and a refusal transfers its cursor to the memory owner's continuation.
+pub fn finish_output<'a>(native: &mut dyn IpcNative<'a>, mut output: IpcOutput) -> IpcOutcome {
+    if output.range().is_none() {
+        if let Some(venue) = native.process_ipc() {
+            output.restore(venue);
+        }
+        return ret_errno(LINUX_EFAULT);
+    }
+
+    while output.offset < output.bytes.len() {
+        let Some(address) = output.address.raw().checked_add(output.offset as u64) else {
+            if let Some(venue) = native.process_ipc() {
+                output.restore(venue);
+            }
+            return ret_errno(LINUX_EFAULT);
+        };
+        let count = (4096 - (address as usize & 4095)).min(output.bytes.len() - output.offset);
+        match native.copy_out(
+            UserVa::new(address),
+            &output.bytes[output.offset..output.offset + count],
+        ) {
+            CopyOutcome::Done => output.offset += count,
+            CopyOutcome::Fault => {
+                if let Some(venue) = native.process_ipc() {
+                    output.restore(venue);
+                }
+                return ret_errno(LINUX_EFAULT);
+            }
+            CopyOutcome::NotYet(request) => return native.retain_output(request, output),
+        }
+    }
+    IpcOutcome::Returned(output.result)
 }
 
 pub type MsgrcvMessage = (usize, i64, Vec<u8>);
 pub type MsgrcvResult = Result<(IpcOutcome, Option<MsgrcvMessage>), i64>;
 
 pub trait ProcessIpcVenue {
+    fn complete_output(&mut self, output: IpcOutput) -> LifecycleOutcome;
     fn msgget(&mut self, key: i32, msgflg: i32) -> Result<i32, i64>;
     fn msgctl(&mut self, msqid: i32, cmd: i32, buf: Option<&mut LinuxMsqidDs>) -> Result<i64, i64>;
     fn msgctl_info(&mut self, cmd: i32, buf: &mut LinuxMsginfo) -> Result<i64, i64>;
@@ -110,6 +230,7 @@ pub trait ProcessIpcVenue {
 }
 
 pub trait IpcNative<'a>: UserCopy {
+    fn retain_output(&mut self, request: GuestCopyRequest, output: IpcOutput) -> IpcOutcome;
     fn arguments(&self) -> [u64; 6];
     fn process_ipc(&mut self) -> Option<&mut dyn ProcessIpcVenue>;
     fn guest_isa(&self) -> carrick_guest_arch::GuestIsa {
@@ -159,12 +280,14 @@ fn invoke_msg<'a>(
                         venue.msgctl_info(cmd, &mut info)
                     };
                     match res {
-                        Ok(val) => {
-                            if !(&mut native).write_val(buf_ptr, &info).is_done() {
-                                return ret_errno(LINUX_EFAULT);
-                            }
-                            ret(val)
-                        }
+                        Ok(val) => finish_output(
+                            native,
+                            IpcOutput::new(
+                                buf_ptr,
+                                zerocopy::IntoBytes::as_bytes(&info).to_vec(),
+                                val,
+                            ),
+                        ),
                         Err(e) => ret(e),
                     }
                 }
@@ -180,12 +303,14 @@ fn invoke_msg<'a>(
                         venue.msgctl(msqid, cmd, Some(&mut ds))
                     };
                     match res {
-                        Ok(val) => {
-                            if !(&mut native).write_val(buf_ptr, &ds).is_done() {
-                                return ret_errno(LINUX_EFAULT);
-                            }
-                            ret(val)
-                        }
+                        Ok(val) => finish_output(
+                            native,
+                            IpcOutput::new(
+                                buf_ptr,
+                                zerocopy::IntoBytes::as_bytes(&ds).to_vec(),
+                                val,
+                            ),
+                        ),
                         Err(e) => ret(e),
                     }
                 }
@@ -267,20 +392,14 @@ fn invoke_msg<'a>(
                 venue.msgrcv(msqid, msgp, msgtyp, msgflg, msgsz)
             };
             match res {
-                Ok((outcome, Some((original_idx, mtype, data)))) => {
-                    let text_va = UserVa::new(msgp.raw().wrapping_add(8));
-                    let copy_ok = (&mut native).write_val(msgp, &mtype).is_done()
-                        && (data.is_empty() || native.copy_out(text_va, &data).is_done());
-                    if !copy_ok {
-                        // Restore message to original position in queue so it is not lost!
-                        if let Some(venue) = native.process_ipc() {
-                            let _ = venue.msgrcv_restore(msqid, original_idx, mtype, data);
-                        }
-                        return ret_errno(LINUX_EFAULT);
-                    }
-                    outcome
+                Ok((IpcOutcome::Returned(result), Some((original_idx, mtype, data)))) => {
+                    let mut bytes = mtype.to_ne_bytes().to_vec();
+                    bytes.extend_from_slice(&data);
+                    let mut output = IpcOutput::new(msgp, bytes, result.raw());
+                    output.message = Some((msqid, original_idx, mtype));
+                    finish_output(native, output)
                 }
-                Ok((outcome, None)) => outcome,
+                Ok((outcome, _)) => outcome,
                 Err(e) => ret(e),
             }
         }
@@ -322,12 +441,14 @@ fn invoke_sem<'a>(
                         venue.semctl_info(cmd, &mut info)
                     };
                     match res {
-                        Ok(val) => {
-                            if !(&mut native).write_val(arg_ptr, &info).is_done() {
-                                return ret_errno(LINUX_EFAULT);
-                            }
-                            ret(val)
-                        }
+                        Ok(val) => finish_output(
+                            native,
+                            IpcOutput::new(
+                                arg_ptr,
+                                zerocopy::IntoBytes::as_bytes(&info).to_vec(),
+                                val,
+                            ),
+                        ),
                         Err(e) => ret(e),
                     }
                 }
@@ -345,18 +466,15 @@ fn invoke_sem<'a>(
                     };
                     match res {
                         Ok(val) => {
-                            let ok = match native.guest_isa() {
+                            let bytes = match native.guest_isa() {
                                 carrick_guest_arch::GuestIsa::X86_64 => {
-                                    (&mut native).write_val(arg_ptr, &ds).is_done()
+                                    zerocopy::IntoBytes::as_bytes(&ds).to_vec()
                                 }
                                 carrick_guest_arch::GuestIsa::Aarch64 => {
-                                    (&mut native).write_val(arg_ptr, &ds.to_aarch64()).is_done()
+                                    zerocopy::IntoBytes::as_bytes(&ds.to_aarch64()).to_vec()
                                 }
                             };
-                            if !ok {
-                                return ret_errno(LINUX_EFAULT);
-                            }
-                            ret(val)
+                            finish_output(native, IpcOutput::new(arg_ptr, bytes, val))
                         }
                         Err(e) => ret(e),
                     }
@@ -466,15 +584,14 @@ fn invoke_sem<'a>(
                         venue.semctl_getall(semid, &mut vals)
                     };
                     match res {
-                        Ok(val) => {
-                            if !native
-                                .copy_out(arg_ptr, zerocopy::IntoBytes::as_bytes(vals.as_slice()))
-                                .is_done()
-                            {
-                                return ret_errno(LINUX_EFAULT);
-                            }
-                            ret(val)
-                        }
+                        Ok(val) => finish_output(
+                            native,
+                            IpcOutput::new(
+                                arg_ptr,
+                                zerocopy::IntoBytes::as_bytes(vals.as_slice()).to_vec(),
+                                val,
+                            ),
+                        ),
                         Err(e) => ret(e),
                     }
                 }
@@ -618,6 +735,9 @@ mod tests {
     }
 
     impl ProcessIpcVenue for TestVenue {
+        fn complete_output(&mut self, _: IpcOutput) -> LifecycleOutcome {
+            unreachable!("test copy owner is TestNative")
+        }
         fn msgget(&mut self, key: i32, msgflg: i32) -> Result<i32, i64> {
             self.ns
                 .msgget(&self.creds, key, msgflg)
@@ -787,6 +907,10 @@ mod tests {
         guest_mem: Vec<u8>,
         base_va: u64,
         venue: &'v mut TestVenue,
+        refuse_output: bool,
+        refuse_output_at: Option<u64>,
+        pending_output: Option<IpcOutput>,
+        fault_output: bool,
     }
 
     impl<'v> TestNative<'v> {
@@ -797,6 +921,10 @@ mod tests {
                 guest_mem: alloc::vec![0xff_u8; mem_len],
                 base_va: GUEST_BUF_VA,
                 venue,
+                refuse_output: false,
+                refuse_output_at: None,
+                pending_output: None,
+                fault_output: false,
             }
         }
     }
@@ -818,6 +946,22 @@ mod tests {
         }
 
         fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> carrick_core::user_copy::CopyOutcome {
+            if self.fault_output {
+                return CopyOutcome::Fault;
+            }
+            let refuse_at = self.refuse_output_at == Some(dst.raw());
+            if refuse_at {
+                self.refuse_output_at = None;
+            }
+            if core::mem::take(&mut self.refuse_output) || refuse_at {
+                return carrick_core::user_copy::CopyOutcome::NotYet(
+                    carrick_core::user_copy::GuestCopyRequest {
+                        address: dst,
+                        len: carrick_guest_arch::GuestLen::new(src.len() as u64),
+                        access: carrick_guest_arch::Access::Write,
+                    },
+                );
+            }
             let Some(off) = dst.raw().checked_sub(self.base_va) else {
                 return carrick_core::user_copy::CopyOutcome::Fault;
             };
@@ -834,6 +978,14 @@ mod tests {
     }
 
     impl<'a> IpcNative<'a> for TestNative<'_> {
+        fn retain_output(&mut self, request: GuestCopyRequest, output: IpcOutput) -> IpcOutcome {
+            assert_eq!(
+                request.address.raw(),
+                output.address.raw() + output.offset as u64
+            );
+            self.pending_output = Some(output);
+            IpcOutcome::Suspended
+        }
         fn arguments(&self) -> [u64; 6] {
             self.args
         }
@@ -844,6 +996,97 @@ mod tests {
 
         fn guest_isa(&self) -> GuestIsa {
             self.isa
+        }
+    }
+
+    #[test]
+    fn ipc_output_owner_refusal_is_not_efault() {
+        let mut venue = TestVenue::new();
+        let id = venue.msgget(0x1234, IPC_CREAT | 0o644).unwrap();
+        let mut native = TestNative::new(
+            &mut venue,
+            GuestIsa::X86_64,
+            [id as u64, IPC_STAT as u64, GUEST_BUF_VA, 0, 0, 0],
+            120,
+        );
+        native.refuse_output = true;
+        assert_eq!(invoke(IpcCall::MsgCtl, &mut native), IpcOutcome::Suspended);
+        let output = native.pending_output.take().expect("retained answer");
+        assert_eq!(
+            finish_output(&mut native, output),
+            IpcOutcome::Returned(SyscallResult::new(0))
+        );
+        assert!(native.pending_output.is_none());
+    }
+
+    #[test]
+    fn ipc_record_outputs_keep_frozen_answers_on_owner_wait_for_both_isas() {
+        for isa in [GuestIsa::X86_64, GuestIsa::Aarch64] {
+            let mut venue = TestVenue::new();
+            let msg = venue.msgget(0x1234, IPC_CREAT | 0o644).unwrap();
+            let sem = venue.semget(0x3456, 2, IPC_CREAT | 0o640).unwrap();
+            let cases = [
+                (
+                    IpcCall::MsgCtl,
+                    [msg as u64, IPC_STAT as u64, GUEST_BUF_VA, 0, 0, 0],
+                ),
+                (IpcCall::MsgCtl, [0, IPC_INFO as u64, GUEST_BUF_VA, 0, 0, 0]),
+                (
+                    IpcCall::SemCtl,
+                    [sem as u64, 0, IPC_STAT as u64, GUEST_BUF_VA, 0, 0],
+                ),
+                (IpcCall::SemCtl, [0, 0, IPC_INFO as u64, GUEST_BUF_VA, 0, 0]),
+                (
+                    IpcCall::SemCtl,
+                    [sem as u64, 0, GETALL as u64, GUEST_BUF_VA, 0, 0],
+                ),
+            ];
+            for (call, args) in cases {
+                let mut native = TestNative::new(&mut venue, isa, args, 128);
+                let expected = invoke(call, &mut native);
+                let expected_bytes = native.guest_mem.clone();
+                native.guest_mem.fill(0xff);
+                native.refuse_output = true;
+                assert_eq!(invoke(call, &mut native), IpcOutcome::Suspended);
+                let output = native.pending_output.take().expect("answer retained");
+                assert_eq!(output.offset, 0);
+                // The frozen bytes complete without repeating the namespace query.
+                assert_eq!(finish_output(&mut native, output), expected);
+                assert_eq!(native.guest_mem, expected_bytes);
+                native.fault_output = true;
+                assert_eq!(invoke(call, &mut native), ret_errno(LINUX_EFAULT));
+            }
+        }
+    }
+
+    #[test]
+    fn ipc_unaligned_record_owner_wait_does_not_replay_committed_prefix() {
+        for isa in [GuestIsa::X86_64, GuestIsa::Aarch64] {
+            let mut venue = TestVenue::new();
+            let id = venue.msgget(0x1234, IPC_CREAT | 0o644).unwrap();
+            let address = GUEST_BUF_VA + 4090;
+            let mut native = TestNative::new(
+                &mut venue,
+                isa,
+                [id as u64, IPC_STAT as u64, address, 0, 0, 0],
+                4090 + 120,
+            );
+            let expected = invoke(IpcCall::MsgCtl, &mut native);
+            let bytes = native.guest_mem.clone();
+            native.guest_mem.fill(0xff);
+            native.refuse_output_at = Some(GUEST_BUF_VA + 4096);
+            assert_eq!(invoke(IpcCall::MsgCtl, &mut native), IpcOutcome::Suspended);
+            let output = native.pending_output.take().expect("retained suffix");
+            assert_eq!(output.offset, 6);
+            assert_eq!(&native.guest_mem[4090..4096], &bytes[4090..4096]);
+            assert!(native.guest_mem[4096..].iter().all(|byte| *byte == 0xff));
+            // User changes to the committed prefix must survive resumption.
+            // Replaying from zero would silently overwrite them.
+            native.guest_mem[4090..4096].fill(0x5a);
+            assert_eq!(finish_output(&mut native, output), expected);
+            assert_eq!(&native.guest_mem[4090..4096], &[0x5a; 6]);
+            assert_eq!(&native.guest_mem[4096..], &bytes[4096..]);
+            assert!(native.pending_output.is_none());
         }
     }
 

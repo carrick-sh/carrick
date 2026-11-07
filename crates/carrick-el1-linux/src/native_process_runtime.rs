@@ -5367,6 +5367,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     progress: carrick_core::Served::Idle,
                     result: SyscallResult::new(0),
                 },
+                Ok(outcome) => outcome.into_lifecycle(),
                 Err(e) => returned(e),
             },
             PendingIpcPayload::Msgrcv {
@@ -5377,54 +5378,22 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 msgflg,
             } => match self.msgrcv(msqid, msgp, msgtyp, msgflg, msgsz) {
                 Ok((IpcOutcome::Returned(r), Some((original_idx, mtype, data)))) => {
-                    let text_va = u64::try_from(data.len())
-                        .ok()
-                        .and_then(|len| len.checked_add(8))
-                        .and_then(|len| {
-                            carrick_guest_arch::UserRange::checked(
-                                msgp,
-                                carrick_guest_arch::GuestLen::new(len),
-                            )
-                        })
-                        .filter(|range| range.in_lower_half())
-                        .and_then(|_| msgp.raw().checked_add(8))
-                        .map(UserVa::new);
-                    let (ok1, ok2) = if let Some(text_va) = text_va {
-                        let mtype_bytes = mtype.to_ne_bytes();
-                        let mtype_ok = unsafe {
-                            crate::file::copy_to_user_guarded(
-                                self.current,
-                                msgp.raw() as *mut u8,
-                                mtype_bytes.as_ptr(),
-                                8,
-                            )
-                        };
-                        let text_ok = mtype_ok
-                            && (data.is_empty()
-                                || unsafe {
-                                    crate::file::copy_to_user_guarded(
-                                        self.current,
-                                        text_va.raw() as *mut u8,
-                                        data.as_ptr(),
-                                        data.len(),
-                                    )
-                                });
-                        (mtype_ok, text_ok)
-                    } else {
-                        (false, false)
-                    };
-                    if !ok1 || !ok2 {
-                        let _ = self.msgrcv_restore(msqid, original_idx, mtype, data);
-                        returned(carrick_syscall_abi::LINUX_EFAULT.guest_retval())
-                    } else {
-                        returned(r.raw())
-                    }
+                    let mut bytes = mtype.to_ne_bytes().to_vec();
+                    bytes.extend_from_slice(&data);
+                    self.complete_output(carrick_personality_linux::ipc::IpcOutput {
+                        address: msgp,
+                        bytes,
+                        offset: 0,
+                        result: r,
+                        message: Some((msqid, original_idx, mtype)),
+                    })
                 }
                 Ok((IpcOutcome::Returned(r), None)) => returned(r.raw()),
                 Ok((IpcOutcome::Suspended, _)) => LifecycleOutcome::Transferred {
                     progress: carrick_core::Served::Idle,
                     result: SyscallResult::new(0),
                 },
+                Ok((outcome, _)) => outcome.into_lifecycle(),
                 Err(e) => returned(e),
             },
             PendingIpcPayload::Semop {
@@ -5452,6 +5421,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         progress: carrick_core::Served::Idle,
                         result: SyscallResult::new(0),
                     },
+                    Ok(outcome) => outcome.into_lifecycle(),
                     Err(e) => returned(e),
                 }
             }
@@ -7593,34 +7563,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         bytes: Vec<u8>,
         result: SyscallResult,
     ) -> LifecycleOutcome {
-        let result = self.finish_copyout(service::OwnedCopyout {
+        self.complete_owned_copyout(service::OwnedCopyout {
             address,
             bytes,
             offset: 0,
             result,
-        });
-        match self.drain_copyout(result) {
-            Ok(NativeResume::Returned(result)) => returned(result.raw()),
-            Ok(NativeResume::Left(None)) => LifecycleOutcome::Transferred {
-                progress: carrick_core::Served::Idle,
-                result: SyscallResult::new(0),
-            },
-            Ok(NativeResume::NoPending) => {
-                // A cancellation can win before park publishes. The service
-                // has dropped output and returned terminal custody; it has
-                // not completed this syscall with an errno.
-                if let Some(outcome) = self.resume_pending_lifecycle() {
-                    return outcome;
-                }
-                match self.cancel_owner_wait() {
-                    Ok(outcome) => outcome,
-                    Err(error) => self.run_failed(error.run_failure_reason()),
-                }
-            }
-            Ok(_) => self.run_failed(NativeProcessError::Quarantined.run_failure_reason()),
-            Err(error) => self.fail(error),
-        }
+            custody: service::CopyoutCustody::Completed,
+        })
     }
+
     fn take_map_source(
         &mut self,
         key: carrick_personality_linux::native_host_file::NativeMapKey,
@@ -8990,6 +8941,25 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
 impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     carrick_personality_linux::ipc::ProcessIpcVenue for NativeProcessEntry<'r, 'a, M, C, S>
 {
+    fn complete_output(
+        &mut self,
+        output: carrick_personality_linux::ipc::IpcOutput,
+    ) -> LifecycleOutcome {
+        if output.range().is_none() {
+            output.restore(self);
+            return returned(carrick_syscall_abi::LINUX_EFAULT.guest_retval());
+        }
+        self.complete_owned_copyout(service::OwnedCopyout {
+            address: output.address,
+            bytes: output.bytes,
+            offset: output.offset,
+            result: output.result,
+            custody: service::CopyoutCustody::Ipc {
+                message: output.message,
+            },
+        })
+    }
+
     fn msgget(&mut self, key: i32, msgflg: i32) -> Result<i32, i64> {
         let (creds, _, ipc) = self.ipc_env()?;
         ipc.lock()

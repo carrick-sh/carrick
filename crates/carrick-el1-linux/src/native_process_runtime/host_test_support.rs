@@ -4391,6 +4391,7 @@ fn completed_output_busy_yields(in_preparation: bool) {
             )
             .unwrap();
         let result = entry.finish_copyout(service::OwnedCopyout {
+            custody: service::CopyoutCustody::Completed,
             address: UserVa::new(0x10000),
             bytes: bytes.clone(),
             offset: 0,
@@ -4476,7 +4477,12 @@ fn completed_poll_output_preparation_busy_yields_then_delivers_the_answer() {
 }
 
 #[cfg(test)]
-fn retained_poll_output_owner_wait(cancel: bool, during_enrollment: bool, production_frame: bool) {
+fn retained_poll_output_owner_wait(
+    cancel: bool,
+    during_enrollment: bool,
+    production_frame: bool,
+    ipc_output: bool,
+) {
     // Page-aligned guest user input lets the real TrapFrame path read its
     // pollfd array; physical output still goes through this fixture's native
     // service.
@@ -4486,7 +4492,13 @@ fn retained_poll_output_owner_wait(cancel: bool, during_enrollment: bool, produc
         )
     });
     let address = pages.as_ref().map_or(0x10000, |pages| pages.arg());
-    let expected_result = if production_frame { 1024 } else { 37 };
+    let expected_result = if production_frame {
+        1024
+    } else if ipc_output {
+        8184
+    } else {
+        37
+    };
     let fixture = native_exec_fixture();
     let source = BornInZoneSource {
         zone: fixture.zone,
@@ -4550,7 +4562,13 @@ fn retained_poll_output_owner_wait(cancel: bool, during_enrollment: bool, produc
             })
             .collect()
     } else {
-        (0..8192).map(|n| (n % 251) as u8).collect()
+        if ipc_output {
+            let mut bytes = 7_i64.to_ne_bytes().to_vec();
+            bytes.extend((0..8184).map(|n| (n % 251) as u8));
+            bytes
+        } else {
+            (0..8192).map(|n| (n % 251) as u8).collect()
+        }
     };
     take_signal_copies();
     {
@@ -4600,6 +4618,59 @@ fn retained_poll_output_owner_wait(cancel: bool, during_enrollment: bool, produc
                 carrick_personality_linux::dispatch::CompletionRoute::Suspended
             );
             assert_eq!(counters.refused[73].load(Ordering::Relaxed), 0);
+        } else if ipc_output {
+            use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest, UserCopy};
+            use carrick_personality_linux::ipc::{self, IpcNative, ProcessIpcVenue};
+            struct CopyOwner<'v> {
+                venue: &'v mut dyn ProcessIpcVenue,
+                args: [u64; 6],
+            }
+            impl UserCopy for CopyOwner<'_> {
+                fn copy_in(&mut self, _: &mut [u8], _: UserVa) -> CopyOutcome {
+                    unreachable!("receive has no copy input")
+                }
+                fn copy_out(&mut self, address: UserVa, bytes: &[u8]) -> CopyOutcome {
+                    CopyOutcome::NotYet(GuestCopyRequest {
+                        address,
+                        len: carrick_guest_arch::GuestLen::new(bytes.len() as u64),
+                        access: carrick_guest_arch::Access::Write,
+                    })
+                }
+            }
+            impl<'a> IpcNative<'a> for CopyOwner<'_> {
+                fn arguments(&self) -> [u64; 6] {
+                    self.args
+                }
+                fn process_ipc(&mut self) -> Option<&mut dyn ProcessIpcVenue> {
+                    Some(self.venue)
+                }
+                fn retain_output(
+                    &mut self,
+                    _: GuestCopyRequest,
+                    output: ipc::IpcOutput,
+                ) -> IpcOutcome {
+                    IpcOutcome::from_lifecycle(self.venue.complete_output(output))
+                }
+            }
+            let queue = entry.msgget(0, 0o600).unwrap();
+            assert!(matches!(
+                entry.msgsnd(queue, 7, &bytes[8..], 0),
+                Ok(IpcOutcome::Returned(_))
+            ));
+            let mut native = CopyOwner {
+                venue: &mut *entry,
+                args: [queue as u64, address, 8184, 0, 0, 0],
+            };
+            assert_eq!(
+                ipc::invoke(ipc::IpcCall::MsgRcv, &mut native),
+                IpcOutcome::Suspended
+            );
+            // The queue no longer owns the message: only the retained output
+            // can complete it, without another dequeue or prefix replay.
+            let mut stat = ipc::LinuxMsqidDs::default();
+            entry.msgctl(queue, ipc::IPC_STAT, Some(&mut stat)).unwrap();
+            assert_eq!(stat.msg_qnum, 0);
+            assert!(entry.take_handoff_receipt().is_some());
         } else {
             assert!(
                 matches!(
@@ -4700,25 +4771,25 @@ fn retained_poll_output_owner_wait(cancel: bool, during_enrollment: bool, produc
 #[cfg(test)]
 #[test]
 fn completed_ppoll_output_retains_result_and_next_byte_across_owner_wait() {
-    retained_poll_output_owner_wait(false, false, false);
+    retained_poll_output_owner_wait(false, false, false, false);
 }
 
 #[cfg(test)]
 #[test]
 fn completed_ppoll_output_cancellation_commits_no_more_bytes() {
-    retained_poll_output_owner_wait(true, false, false);
+    retained_poll_output_owner_wait(true, false, false, false);
 }
 
 #[cfg(test)]
 #[test]
 fn completed_ppoll_output_cancellation_during_enrollment_never_returns_an_errno() {
-    retained_poll_output_owner_wait(true, true, false);
+    retained_poll_output_owner_wait(true, true, false, false);
 }
 
 #[cfg(test)]
 #[test]
 fn production_trap_frame_ppoll_retains_completed_output_across_owner_wait() {
-    retained_poll_output_owner_wait(false, false, true);
+    retained_poll_output_owner_wait(false, false, true, false);
 }
 
 #[cfg(test)]
@@ -6426,4 +6497,60 @@ fn sigprocmask_set_owner_wait_redispatches_before_effects() {
         NativeResume::NoPending
     ));
     assert!(take_signal_copies().is_empty());
+}
+
+#[cfg(test)]
+#[test]
+fn ipc_receive_retains_dequeued_message_and_cursor_across_owner_wait() {
+    retained_poll_output_owner_wait(false, false, false, true);
+}
+
+#[cfg(test)]
+#[test]
+fn ipc_receive_fault_restores_dequeued_message() {
+    use carrick_personality_linux::ipc::{self, ProcessIpcVenue};
+    let fixture = native_exec_fixture();
+    let mut service = fixture.service();
+    service.child_copy_error = Some(NativeProcessError::Fault);
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            fixture.task,
+            fixture.address,
+            &words(fixture.address),
+            &mut service,
+        )
+        .unwrap();
+    let queue = entry.msgget(0, 0o600).unwrap();
+    for address in [0x10000, u64::MAX - 3, carrick_guest_arch::USER_CEILING - 4] {
+        entry.msgsnd(queue, 7, &[1, 2, 3], 0).unwrap();
+        let (_, Some((index, kind, data))) =
+            entry.msgrcv(queue, UserVa::new(0x10000), 0, 0, 3).unwrap()
+        else {
+            panic!("message must be dequeued")
+        };
+        let mut bytes = kind.to_ne_bytes().to_vec();
+        bytes.extend_from_slice(&data);
+        let result = entry.complete_output(ipc::IpcOutput {
+            address: UserVa::new(address),
+            bytes,
+            offset: 0,
+            result: SyscallResult::new(3),
+            message: Some((queue, index, kind)),
+        });
+        assert!(matches!(result, LifecycleOutcome::Returned { result, .. } if result.raw() == -14));
+        let (_, Some((_, restored_kind, restored_data))) = entry
+            .msgrcv(queue, UserVa::new(0x10000), 0, ipc::IPC_NOWAIT, 3)
+            .unwrap()
+        else {
+            panic!("fault must restore message")
+        };
+        assert_eq!(restored_kind, 7);
+        assert_eq!(restored_data, [1, 2, 3]);
+    }
 }
