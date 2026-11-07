@@ -84,3 +84,12 @@ The signed failure still needs its preceding syscall sequence and exact
 artifact provenance to distinguish owner admission, opaque mapping history,
 and the forwarding venue from this passing control. Do not remove the sparse
 publication refusal or select owner publication without authenticated ownership.
+
+`native_owner_whole_code_range_writes_and_executes` additionally repeats the
+full native-process admission and Linux entry fixture with a whole-range
+RWX commit, retaining the prior interior-range case. The native fixture uses
+its own arena address; the host-dispatch controls above use the reported VA.
+It checks one RWX reservation row before any first touch, then the existing
+resident descriptor and generated host-code checks. This distinguishes the
+native entry venue from production host dispatch without merging their
+ownership or address domains.
