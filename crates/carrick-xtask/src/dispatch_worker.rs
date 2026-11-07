@@ -9580,6 +9580,19 @@ fi
                 let anchor = Applied::load().unwrap().layer.unwrap();
                 receipt.expected_tip = anchor.head.clone();
                 dispatch.layer_history = Some(anchor);
+                // This intentionally replaces this lane's two earlier commits
+                // with a differently named correction; publication must explain both.
+                for commit in git(
+                    &work,
+                    &["rev-list", &format!("{parent}..{}", receipt.expected_tip)],
+                )
+                .unwrap()
+                .lines()
+                {
+                    contract.risks.push(format!(
+                        "Dropped {commit}: replaced by the corrected child patch"
+                    ));
+                }
                 std::fs::remove_file(state.join("published-tip")).unwrap();
                 git(&work, &["reset", "--hard", &parent]).unwrap();
                 std::fs::write(work.join("child.txt"), "fixed child bytes\n").unwrap();
@@ -11698,7 +11711,7 @@ fi
             let old = &receipt.expected_tip[..12];
             let head = git(&work, &["rev-parse", "HEAD"]).unwrap();
             assert!(
-                report.starts_with("- PR commits: "),
+                report.contains("- PR commits: "),
                 "outcome still labels the list as pushed commits"
             );
             assert!(
