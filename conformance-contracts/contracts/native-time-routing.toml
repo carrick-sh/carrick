@@ -18,6 +18,8 @@ vm_free = [
   "carrick-kernel::dispatch::container_clock_tests::clock_adjtime_setoffset_moves_realtime",
   "carrick-kernel::dispatch::container_clock_tests::clock_adjtime_notifies_after_discipline_publication",
   "carrick-kernel::dispatch::container_clock_tests::clock_adjtime_reinterprets_units_after_output_preparation",
+  "carrick-kernel::dispatch::container_clock_tests::clock_adjtime_preflight_and_owner_refusal_have_no_effects",
+  "carrick-kernel::kernel::container::clock_domain_tests::timex_controlled_step_leaves_discipline_and_reply_untouched",
   "carrick-kernel::dispatch::container_clock_tests::clock_adjtime_unprivileged_modifying_modes_fail_with_eperm",
 ]
 

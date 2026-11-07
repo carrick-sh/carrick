@@ -8536,9 +8536,55 @@ mod container_clock_tests {
     }
 
     #[test]
+    fn clock_adjtime_preflight_and_owner_refusal_have_no_effects() {
+        use super::copyout::owner_fixture::OwnerRefusingMemory;
+        for (subsecond, expected_prepares) in [(123, 1), (1_000_000_000, 0)] {
+            let mut dispatcher = SyscallDispatcher::new();
+            let context = dispatcher.capture_one_task_context().unwrap();
+            context
+                .task()
+                .with_caps(|caps| *caps = crate::namespace::process::CapabilitySet::full());
+            let clock = Arc::clone(context.task().container().clock());
+            let before = clock.adjtimex_state();
+            let mut memory = OwnerRefusingMemory::new(MEM_BASE, MEM_LEN, 0);
+            let wait = memory.refuse_next();
+            let mut input = LinuxTimex::new_read_state(LinuxTimeval::new(0, subsecond));
+            input.modes = LINUX_ADJ_SETOFFSET | LINUX_ADJ_NANO | LINUX_ADJ_TICK;
+            input.tick = 10_500;
+            memory.seed(TIMEX_ADDR, input.abi_bytes());
+            let result = dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        SYS_CLOCK_ADJTIME,
+                        SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0]),
+                    ),
+                    &mut memory,
+                    &CompatReporter::default(),
+                )
+                .unwrap();
+            assert_eq!(
+                result,
+                if expected_prepares == 0 {
+                    DispatchOutcome::errno(LINUX_EINVAL)
+                } else {
+                    DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+                }
+            );
+            assert_eq!(memory.prepares, expected_prepares);
+            assert!(memory.commits.is_empty());
+            assert_eq!(clock.adjtimex_state(), before);
+            assert_eq!(clock.realtime_offset_ns(), 0);
+            assert_eq!(clock.epoch(), 0);
+        }
+    }
+
+    #[test]
     fn clock_adjtime_reinterprets_units_after_output_preparation() {
         use super::copyout::owner_fixture::OwnerRefusingMemory;
-        use carrick_guest_mem::{GuestWriteRange, MemoryPrepareError, PreparedGuestWrite, UserMemoryVenue};
+        use carrick_guest_mem::{
+            GuestWriteRange, MemoryPrepareError, PreparedGuestWrite, UserMemoryVenue,
+        };
 
         struct InterleavedMemory<'a> {
             inner: OwnerRefusingMemory,
@@ -8554,7 +8600,10 @@ mod container_clock_tests {
             fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
                 self.inner.write_bytes_raw(address, bytes)
             }
-            fn prepare_write(&mut self, ranges: &[GuestWriteRange]) -> Result<Box<dyn PreparedGuestWrite + '_>, MemoryPrepareError> {
+            fn prepare_write(
+                &mut self,
+                ranges: &[GuestWriteRange],
+            ) -> Result<Box<dyn PreparedGuestWrite + '_>, MemoryPrepareError> {
                 if let Some(change) = self.on_prepare.take() {
                     change();
                 }
@@ -8565,7 +8614,9 @@ mod container_clock_tests {
 
         let mut dispatcher = SyscallDispatcher::new();
         let context = dispatcher.capture_one_task_context().unwrap();
-        context.task().with_caps(|caps| *caps = crate::namespace::process::CapabilitySet::full());
+        context
+            .task()
+            .with_caps(|caps| *caps = crate::namespace::process::CapabilitySet::full());
         let mut sibling = SyscallDispatcher::new();
         let mut memory = InterleavedMemory {
             inner: OwnerRefusingMemory::new(MEM_BASE, MEM_LEN, 0),
@@ -8577,13 +8628,43 @@ mod container_clock_tests {
                 let mut nano = LinuxTimex::new_read_state(LinuxTimeval::new(0, 0));
                 nano.modes = LINUX_ADJ_NANO;
                 memory.write_bytes(TIMEX_ADDR, nano.abi_bytes()).unwrap();
-                assert_eq!(sibling.dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &CompatReporter::default()).unwrap(), DispatchOutcome::Returned { value: LINUX_TIME_OK });
+                assert_eq!(
+                    sibling
+                        .dispatch(
+                            &context,
+                            SyscallRequest::new(
+                                SYS_CLOCK_ADJTIME,
+                                SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])
+                            ),
+                            &mut memory,
+                            &CompatReporter::default()
+                        )
+                        .unwrap(),
+                    DispatchOutcome::Returned {
+                        value: LINUX_TIME_OK
+                    }
+                );
             })),
         };
         let mut request = LinuxTimex::new_read_state(LinuxTimeval::new(0, 123));
         request.modes = LINUX_ADJ_SETOFFSET;
         memory.inner.seed(TIMEX_ADDR, request.abi_bytes());
-        assert_eq!(dispatcher.dispatch(&context, SyscallRequest::new(SYS_CLOCK_ADJTIME, SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])), &mut memory, &CompatReporter::default()).unwrap(), DispatchOutcome::Returned { value: LINUX_TIME_OK });
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        SYS_CLOCK_ADJTIME,
+                        SyscallArgs([LINUX_CLOCK_REALTIME, TIMEX_ADDR, 0, 0, 0, 0])
+                    ),
+                    &mut memory,
+                    &CompatReporter::default()
+                )
+                .unwrap(),
+            DispatchOutcome::Returned {
+                value: LINUX_TIME_OK
+            }
+        );
         assert!(memory.on_prepare.is_none());
         assert_eq!(memory.inner.prepares, 1);
         assert_eq!(memory.inner.commits.len(), 1);
@@ -8635,7 +8716,9 @@ mod container_clock_tests {
                     &CompatReporter::default(),
                 )
                 .unwrap(),
-            DispatchOutcome::Returned { value: LINUX_TIME_OK },
+            DispatchOutcome::Returned {
+                value: LINUX_TIME_OK
+            },
         );
         let observations = observed.lock().unwrap();
         assert_eq!(observations.len(), 1);
