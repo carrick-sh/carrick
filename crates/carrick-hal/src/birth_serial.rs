@@ -92,8 +92,21 @@ pub mod test_support {
         Arc,
         atomic::{AtomicBool, Ordering},
     };
+    pub enum OwnedZone<C: Copy + Send + Sync + zerocopy::FromZeros + 'static> {
+        Shared(Arc<ZoneTables<C>>),
+        Static(&'static ZoneTables<C>),
+    }
+    impl<C: Copy + Send + Sync + zerocopy::FromZeros + 'static> core::ops::Deref for OwnedZone<C> {
+        type Target = ZoneTables<C>;
+        fn deref(&self) -> &Self::Target {
+            match self {
+                Self::Shared(zone) => zone,
+                Self::Static(zone) => zone,
+            }
+        }
+    }
     pub struct OwnedBirthZone<C: Copy + Send + Sync + zerocopy::FromZeros + 'static> {
-        pub zone: Arc<ZoneTables<C>>,
+        pub zone: OwnedZone<C>,
         identity: BirthSourceIdentity,
         live: AtomicBool,
     }
@@ -110,7 +123,19 @@ pub mod test_support {
                     NonZeroU64::MIN,
                     NonZeroU64::MIN,
                 ),
-                zone,
+                zone: OwnedZone::Shared(zone),
+                live: AtomicBool::new(true),
+            }
+        }
+        /// The fixture retains this complete initialized mapping forever.
+        pub fn from_static(zone: &'static ZoneTables<C>) -> Self {
+            Self {
+                zone: OwnedZone::Static(zone),
+                identity: BirthSourceIdentity::from_backend_identity(
+                    Arc::new(()),
+                    NonZeroU64::MIN,
+                    NonZeroU64::MIN,
+                ),
                 live: AtomicBool::new(true),
             }
         }

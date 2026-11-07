@@ -86,6 +86,11 @@ embed = [
 vm_free = [
   "carrick-el1-linux::aarch64_process_tests::arm_closed_gate_service_entry_retires_the_sibling_instead_of_busy",
   "carrick-el1-linux::aarch64_process_tests::serial_host_native_fork_pid_excludes_live_host_thread_tids",
+  "carrick-kernel::kernel::ids::tests::carrier_births_cover_reserved_unpublished_replenished_and_two_roots",
+  "carrick-el1-linux::aarch64_process_tests::serial_host_namespace_ring_pid_excludes_host_reservation",
+  "carrick-el1-linux::aarch64_process_tests::serial_host_namespace_reap_releases_number_to_host",
+  "carrick-el1-linux::aarch64_process_tests::serial_host_namespace_fork_waits_for_host_leaf_lock",
+  "carrick-el1-linux::aarch64_process_tests::serial_host_namespace_exhaustion_is_eagain_and_recovers_after_reap",
   "carrick-el1-linux::aarch64_process_tests::serial_host_native_fork_live_threads_identity_and_wait_control",
   "carrick-el1-linux::aarch64_process_tests::arm_closed_gate_service_entry_cancels_retained_ipc_before_retirement",
   "carrick-el1-linux::native_process_runtime::host_test_support::native_service_duplicate_custody_is_an_invariant_at_bridge_settlement",

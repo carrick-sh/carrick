@@ -717,6 +717,66 @@ pub struct NativeExecSuccessor<M, C: ProcessContext> {
     pub address: AddressContext<RootGpa>,
     pub words: Box<C>,
 }
+/// Existing low-level fixtures publish identities directly. Supply their
+/// claims explicitly in fixture setup, never during production admission.
+#[cfg(any(test, feature = "host-test"))]
+#[allow(clippy::unwrap_used)]
+pub(crate) fn seed_fixture_namespace<C: ProcessContext>(
+    zone: &ZoneTables<C>,
+    current: &CurrentTask,
+    page: &ThreadLifecyclePage,
+) {
+    let binding = super::common_entry::execution_binding(current);
+    zone.namespace()
+        .with_view(&carrick_sched_core::ShortLockSpin, |ns| {
+            let root = binding.task.raw() as i32;
+            let domain = ns.visible_domain(root).unwrap_or_else(|| {
+                VisibleNamespace::new(NonZeroU32::new(root as u32).unwrap(), NonZeroU32::MIN)
+            });
+            let first = ns.counts().reserved_numbers == 0;
+            if !ns.is_reserved_number(root) {
+                ns.reserve_exact(root, ClaimKind::Task).unwrap();
+                if first {
+                    ns.set_next(root.checked_add(1).unwrap());
+                }
+            }
+            ns.bind_visible_domain(root, domain).unwrap();
+            ns.advance_visible_past(
+                domain,
+                VisibleIdentity::from_existing_member(
+                    NonZeroU32::new(current.visible_pid().unwrap()).unwrap(),
+                ),
+            )
+            .unwrap();
+            for index in 0..page.entry_count() {
+                let Some((generation, state)) = page.state(index) else {
+                    continue;
+                };
+                if !matches!(
+                    state,
+                    carrick_el1_abi::EntryState::Born | carrick_el1_abi::EntryState::Published
+                ) {
+                    continue;
+                }
+                let entry = EntryRef::new(index as u32, generation);
+                let Some(identity) = page.identity(entry) else {
+                    continue;
+                };
+                if identity.tid == 0 {
+                    continue;
+                }
+                if !ns.is_reserved_number(identity.tid as i32) {
+                    ns.reserve_exact(identity.tid as i32, ClaimKind::Thread)
+                        .unwrap();
+                }
+                ns.bind_visible_domain(identity.tid as i32, domain).unwrap();
+                if let Some(visible) = NonZeroU32::new(identity.visible_tid) {
+                    ns.advance_visible_past(domain, VisibleIdentity::from_existing_member(visible))
+                        .unwrap();
+                }
+            }
+        });
+}
 fn namespace_error(
     error: carrick_sched_core::process::identity_allocator::IdError,
 ) -> NativeProcessError {
@@ -3468,6 +3528,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         words: C,
     ) -> Result<Self, NativeProcessError> {
         source.zone.mm_issuer().observe_existing(address.mm);
+        seed_fixture_namespace(source.zone, current, page);
         // These fixtures hand-publish root identities without host issuance.
         // Account for those exact values in setup, never in production admission.
         source.zone.serial_issuer().advance_past(
@@ -10973,6 +11034,7 @@ mod tests {
             )
             .unwrap();
             let source = BornInZoneSource { zone: &zone, slot };
+            seed_fixture_namespace(source.zone, task, &pages[index]);
             runtimes.push(
                 NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                     source,
@@ -11196,6 +11258,7 @@ mod tests {
             )
             .unwrap();
             let source = BornInZoneSource { zone: &zone, slot };
+            seed_fixture_namespace(source.zone, task, &pages[index]);
             runtimes.push(
                 NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                     source,
@@ -11396,13 +11459,25 @@ mod tests {
         let namespace = runtime.graph.lock().namespace;
         let number = namespace
             .with_view(&carrick_sched_core::ShortLockSpin, |ns| {
-                ns.reserve_exact(42, ClaimKind::Thread)
+                if ns.is_reserved_number(42) {
+                    ns.claim_related(42, ClaimKind::Thread)
+                } else {
+                    ns.reserve_exact(42, ClaimKind::Thread)
+                }
             })
             .unwrap();
         let observer_claim = NativeClaim {
             namespace,
             claims: vec![(number, ClaimKind::Thread)],
         };
+        let domain = runtime.graph.lock().visible_namespace;
+        namespace.with_view(&carrick_sched_core::ShortLockSpin, |ns| {
+            ns.advance_visible_past(
+                domain,
+                VisibleIdentity::from_existing_member(NonZeroU32::new(42).unwrap()),
+            )
+            .unwrap();
+        });
         let (observer_serial, entry) = reserved.unwrap_or_else(reserve_observer);
         let claim = page.claim(entry).unwrap();
         page.record_born(
@@ -11541,7 +11616,7 @@ mod tests {
                 leader_entry
                     .fork_publish(ProcessForkChildTid::NONE, reservation, prepared)
                     .unwrap(),
-                42
+                43
             );
         } else {
             let LifecycleOutcome::Returned { result, .. } =
@@ -11549,9 +11624,9 @@ mod tests {
             else {
                 panic!("surviving leader fork refused");
             };
-            assert_eq!(result.raw(), 42);
+            assert_eq!(result.raw(), 43);
         }
-        let child = runtime.namespace_child_key(process_key, 42).unwrap();
+        let child = runtime.namespace_child_key(process_key, 43).unwrap();
         let state = registry.state.lock();
         let reused_key = state
             .by_process
@@ -11775,6 +11850,10 @@ mod tests {
             registry.register_thread(source, &thread, address, &page, &leader_control),
             Err(NativeProcessError::Stale)
         ));
+        zone.namespace()
+            .with_view(&carrick_sched_core::ShortLockSpin, |ns| {
+                ns.reserve_exact(43, ClaimKind::Thread).unwrap();
+            });
         registry
             .register_thread(source, &thread, address, &page, &thread_control)
             .unwrap();

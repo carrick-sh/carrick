@@ -3720,7 +3720,7 @@ impl core::fmt::Debug for CarrierBirthSource {
     }
 }
 // SAFETY: retained MAP_SHARED backing is immutable except for the zone ABI's
-// atomics/claim-protected records. This source accesses only its atomic word.
+// atomics/claim-protected records. Namespace access holds its leaf lock.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe impl Send for CarrierBirthSource {}
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

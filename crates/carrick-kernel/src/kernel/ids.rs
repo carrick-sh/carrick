@@ -382,30 +382,39 @@ mod tests {
     fn carrier_births_cover_reserved_unpublished_replenished_and_two_roots() {
         use carrick_hal::birth_serial::BirthSerialSource;
         let source = birth_zone();
-        let make_root = || {
+        let make_root = |tid| {
             let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
-                41,
-                carrick_hal::ThreadId::from_guest_supplied_tid(41),
+                tid,
+                carrick_hal::ThreadId::from_guest_supplied_tid(tid),
                 "shared-birth-root".into(),
             )
             .unwrap()
             .with_birth_source(source.clone());
-            crate::kernel::Kernel::bootstrap_root(bootstrap).unwrap()
+            crate::kernel::Kernel::bootstrap_root(bootstrap)
         };
-        let (kernel, first) = make_root();
+        let (kernel, first) = make_root(41).unwrap();
+        assert!(
+            matches!(
+                make_root(41),
+                Err(crate::kernel::KernelError::Id(
+                    crate::kernel::IdError::AlreadyReserved(41)
+                ))
+            ),
+            "a second root cannot adopt an already live carrier number"
+        );
         let reserved = kernel.object_ids().thread_serial().unwrap();
         let unpublished_native = source.zone.serial_issuer().allocate().unwrap();
         let after_native = kernel.object_ids().thread_serial().unwrap();
         assert!(reserved.raw() < unpublished_native.get());
         assert!(after_native.raw() > unpublished_native.get());
         // Later host/pool supply and another root both use the same word.
-        let (other_kernel, other) = make_root();
+        let (other_kernel, other) = make_root(42).unwrap();
         assert_ne!(first.shared().mm().id(), other.shared().mm().id());
         let host_reserved_mm = kernel.object_ids().mm_id().unwrap();
         let native_reserved_mm = source.zone.mm_issuer().allocate().unwrap();
         assert!(native_reserved_mm.raw() > host_reserved_mm.nonzero());
         assert!(other_kernel.object_ids().mm_id().unwrap().nonzero() > native_reserved_mm.raw());
-        let (later_kernel, later) = make_root();
+        let (later_kernel, later) = make_root(43).unwrap();
         assert!(later.shared().mm().id().nonzero() > native_reserved_mm.raw());
         assert!(
             later_kernel.object_ids().mm_id().unwrap().nonzero()

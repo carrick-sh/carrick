@@ -3904,7 +3904,8 @@ impl PhysicalBirthSource {
     }
 }
 // SAFETY: zone is derived once from the retained initialized GuestRam. Only
-// its atomic issuer is accessed, under the physical-custody revocation guard.
+// atomic issuers and leaf-locked namespace are accessed under the
+// physical-custody revocation guard.
 unsafe impl Send for PhysicalBirthSource {}
 unsafe impl Sync for PhysicalBirthSource {}
 impl carrick_hal::birth_serial::BirthSerialSource for PhysicalBirthSource {

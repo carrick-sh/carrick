@@ -50,8 +50,10 @@ use carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK;
 use carrick_sched_core::RecordId;
 use carrick_sched_core::process::{TaskKey, TaskSerial};
 use carrick_sched_core::{Aarch64ParkedContext, ThreadCtx, ZoneTables};
-use core::num::NonZeroU64;
+use core::num::{NonZeroU32, NonZeroU64};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::Arc;
 
 #[cfg(test)]
 mod exit_group_hang_tests;
@@ -807,6 +809,12 @@ impl ForkStockCrossing for TestStockCrossing {
 }
 
 struct Fixture {
+    #[cfg(test)]
+    host_ids: carrick_kernel::kernel::IdRegistry,
+    #[cfg(test)]
+    _host_root: carrick_kernel::kernel::TaskClaim,
+    #[cfg(test)]
+    host_threads: std::sync::Mutex<Vec<carrick_kernel::kernel::ThreadClaim>>,
     zone: &'static ZoneTables<Aarch64ParkedContext>,
     task: CurrentTask,
     slot: SlotId,
@@ -1417,6 +1425,41 @@ impl Fixture {
                 .cast()
         };
 
+        let domain = carrick_sched_core::process::identity_allocator::VisibleNamespace::new(
+            NonZeroU32::MIN,
+            NonZeroU32::MIN,
+        );
+        #[cfg(test)]
+        let (host_ids, host_root, host_leader) = {
+            let root_id =
+                carrick_personality_linux::identity::task_id_from_linux_pid(leader.tid as i32)
+                    .unwrap();
+            let (ids, root) = carrick_kernel::kernel::IdRegistry::with_root(root_id).unwrap();
+            let thread = ids.claim_task_leader_thread(root_id).unwrap();
+            ids.bind_visible_domain(root_id, domain).unwrap();
+            ids.bind_namespace_source(Arc::new(
+                carrick_hal::birth_serial::test_support::OwnedBirthZone::from_static(zone),
+            ))
+            .unwrap();
+            (ids, root, thread)
+        };
+        // Downstream host-test users cannot depend on this crate's dev-only
+        // host kernel. Their synthetic root still owns explicit fixture claims.
+        #[cfg(not(test))]
+        zone.namespace()
+            .with_view(&carrick_sched_core::ShortLockSpin, |ns| {
+                use carrick_sched_core::process::identity_allocator::ClaimKind;
+                ns.reserve_exact(leader.tid as i32, ClaimKind::Task)
+                    .unwrap();
+                ns.claim_related(leader.tid as i32, ClaimKind::Thread)
+                    .unwrap();
+                ns.bind_visible_domain(leader.tid as i32, domain).unwrap();
+                ns.set_next(leader.tid as i32 + 1);
+            });
+        zone.namespace().with_view(&carrick_sched_core::ShortLockSpin, |ns| {
+            ns.advance_visible_past(domain, carrick_sched_core::process::identity_allocator::VisibleIdentity::from_existing_member(NonZeroU32::new(leader.tid as u32).unwrap())).unwrap();
+        });
+
         // This fixture supplies root births without the host issuer. Account
         // for both identities before native fork allocates from this source.
         zone.serial_issuer()
@@ -1497,6 +1540,12 @@ impl Fixture {
         let maintenance = CallerInvalidatesAsid;
 
         Self {
+            #[cfg(test)]
+            host_ids,
+            #[cfg(test)]
+            _host_root: host_root,
+            #[cfg(test)]
+            host_threads: std::sync::Mutex::new(vec![host_leader]),
             zone,
             task,
             slot,
@@ -4315,6 +4364,22 @@ fn imported_thread_on_control_and_slot(
     edit: impl FnOnce(&mut carrick_sched_core::ThreadIdentity),
 ) -> (&'static ThreadControlSlot, carrick_sched_core::RecordRef) {
     use carrick_el1_abi::Lifecycle;
+    fixture
+        .zone
+        .namespace()
+        .with_view(&carrick_sched_core::ShortLockSpin, |ns| {
+            use carrick_sched_core::process::identity_allocator::*;
+            if !ns.is_reserved_number(42) {
+                ns.reserve_exact(42, ClaimKind::Thread).unwrap();
+            }
+            let domain = VisibleNamespace::new(NonZeroU32::MIN, NonZeroU32::MIN);
+            ns.bind_visible_domain(42, domain).unwrap();
+            ns.advance_visible_past(
+                domain,
+                VisibleIdentity::from_existing_member(NonZeroU32::new(42).unwrap()),
+            )
+            .unwrap();
+        });
     let entry = fixture
         .page
         .stock(
@@ -5876,6 +5941,24 @@ fn arm_route_action(
 
 #[cfg(test)]
 fn run_as(fixture: &Fixture, tid: i32, generation: u64, serial: u64, control: &ThreadControlSlot) {
+    // This low-level fixture publishes an already-issued member directly.
+    fixture
+        .zone
+        .namespace()
+        .with_view(&carrick_sched_core::ShortLockSpin, |ns| {
+            use carrick_sched_core::process::identity_allocator::{
+                ClaimKind, VisibleIdentity, VisibleNamespace,
+            };
+            if !ns.is_reserved_number(tid) {
+                ns.reserve_exact(tid, ClaimKind::Thread).unwrap();
+            }
+            let domain = VisibleNamespace::new(NonZeroU32::MIN, NonZeroU32::MIN);
+            ns.bind_visible_domain(tid, domain).unwrap();
+            if let Some(visible) = control.visible_tid().and_then(NonZeroU32::new) {
+                ns.advance_visible_past(domain, VisibleIdentity::from_existing_member(visible))
+                    .unwrap();
+            }
+        });
     // Between two threads' calls the host boundary consumes both owed-work
     // flags (`settle_el1_boundary`) before it binds the next thread.
     let _ = fixture.task.linux.take_served_boundary();
@@ -5912,11 +5995,25 @@ fn run_as_leader(fixture: &Fixture) {
 /// execution binding and a retained control slot, but no pool entry.
 #[cfg(test)]
 fn host_born_sibling(fixture: &Fixture, visible_tid: u32) -> &'static ThreadControlSlot {
-    // The leader-TID rejection case keeps a sibling binding while claiming
-    // the leader's visible TID; other callers need distinct exact identities.
-    let binding_tid = if visible_tid == 41 { 42 } else { visible_tid };
+    let mut binding_tid = 0;
+    for _ in 0..64 {
+        let (issued_tid, reservation) = fixture.host_ids.reserve_thread().unwrap();
+        fixture
+            .host_threads
+            .lock()
+            .unwrap()
+            .push(reservation.commit());
+        binding_tid = issued_tid.raw() as u32;
+        if binding_tid >= visible_tid {
+            break;
+        }
+    }
+    assert!(binding_tid >= visible_tid);
     let generation = u64::from(binding_tid - 30);
     let thread_generation = u64::from(binding_tid + 60);
+    fixture.zone.namespace().with_view(&carrick_sched_core::ShortLockSpin, |ns| {
+        ns.advance_visible_past(carrick_sched_core::process::identity_allocator::VisibleNamespace::new(NonZeroU32::MIN, NonZeroU32::MIN), carrick_sched_core::process::identity_allocator::VisibleIdentity::from_existing_member(NonZeroU32::new(visible_tid).unwrap())).unwrap();
+    });
     let control = Box::leak(Box::new(ThreadControlSlot::new()));
     control
         .reset_for_host_birth(carrick_el1_abi::BlockedMask(0))
@@ -8741,6 +8838,11 @@ fn arm_concurrent_exit_group_loser_retires_and_wakes_owner() {
             NonZeroU64::MIN,
             TestStockCrossing::new(&[]),
         )));
+    crate::native_process_runtime::seed_fixture_namespace(
+        fixture.zone,
+        &fixture.task,
+        fixture.page,
+    );
     run_as_leader(fixture);
     fixture
         .enter(fixture.control, fixture_ttbr0(fixture), service, |_| ())
@@ -13932,18 +14034,46 @@ fn futex_owner_wait_episode(
 
 #[test]
 fn serial_host_native_fork_pid_excludes_live_host_thread_tids() {
-    native_fork_with_live_host_threads([42, 43]);
+    native_fork_with_live_host_threads([42, 43], NamespaceScenario::Collision);
 }
 
 #[test]
 fn serial_host_native_fork_live_threads_identity_and_wait_control() {
     // Qualify the child identity and reap assertions independently of the
     // known allocator collision, without changing production allocation.
-    native_fork_with_live_host_threads([52, 53]);
+    native_fork_with_live_host_threads([52, 53], NamespaceScenario::Control);
 }
 
 #[cfg(test)]
-fn native_fork_with_live_host_threads(sibling_tids: [u32; 2]) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NamespaceScenario {
+    Collision,
+    Control,
+    Reverse,
+    Reap,
+    Contention,
+    Exhaustion,
+}
+
+#[test]
+fn serial_host_namespace_ring_pid_excludes_host_reservation() {
+    native_fork_with_live_host_threads([42, 43], NamespaceScenario::Reverse);
+}
+#[test]
+fn serial_host_namespace_reap_releases_number_to_host() {
+    native_fork_with_live_host_threads([42, 43], NamespaceScenario::Reap);
+}
+#[test]
+fn serial_host_namespace_fork_waits_for_host_leaf_lock() {
+    native_fork_with_live_host_threads([42, 43], NamespaceScenario::Contention);
+}
+#[test]
+fn serial_host_namespace_exhaustion_is_eagain_and_recovers_after_reap() {
+    native_fork_with_live_host_threads([42, 43], NamespaceScenario::Exhaustion);
+}
+
+#[cfg(test)]
+fn native_fork_with_live_host_threads(sibling_tids: [u32; 2], scenario: NamespaceScenario) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let source = BornInZoneSource {
         zone: fixture.zone,
@@ -13999,7 +14129,34 @@ fn native_fork_with_live_host_threads(sibling_tids: [u32; 2]) {
             let runtime = registry()
                 .for_entry(source, &fixture.task, fixture.address)
                 .unwrap();
-            let outcome = process.fork(ProcessForkChildTid::NONE);
+            let outcome = if scenario == NamespaceScenario::Contention {
+                let table = fixture.zone.namespace();
+                let probe = table.contention_probe().unwrap();
+                std::thread::scope(|scope| {
+                    let (held, acquired) = std::sync::mpsc::sync_channel(1);
+                    let probe = &probe;
+                    scope.spawn(move || {
+                        table.with_view(&carrick_sched_core::ShortLockSpin, |_| {
+                            held.send(()).unwrap();
+                            let deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(5);
+                            while !probe.observed() {
+                                assert!(
+                                    std::time::Instant::now() < deadline,
+                                    "ring fork never contended on the host-held table"
+                                );
+                                core::hint::spin_loop();
+                            }
+                        })
+                    });
+                    acquired
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    process.fork(ProcessForkChildTid::NONE)
+                })
+            } else {
+                process.fork(ProcessForkChildTid::NONE)
+            };
             let parent_record = fixture
                 .zone
                 .slot(fixture.slot)
@@ -14032,6 +14189,17 @@ fn native_fork_with_live_host_threads(sibling_tids: [u32; 2]) {
     };
     let child = runtime.namespace_child_key(parent, child_pid).unwrap();
     assert!(runtime.identity_number_reserved(child.id));
+    if scenario == NamespaceScenario::Reverse {
+        runtime.set_next_identity_for_test(child.id);
+        let (host_tid, reservation) = fixture.host_ids.reserve_thread().unwrap();
+        assert_ne!(
+            host_tid.raw(),
+            child.id.raw(),
+            "host reused a live ring pid"
+        );
+        drop(reservation);
+    }
+    let mut capacity_claims = Vec::new();
     let child_binding = runtime.task_binding(child).unwrap();
     let child_task = &*Box::leak(Box::new(CurrentTask::new()));
     activate(source, child_task, &child_binding);
@@ -14099,6 +14267,28 @@ fn native_fork_with_live_host_threads(sibling_tids: [u32; 2]) {
     let mut entry = runtime
         .enter(source, &fixture.task, parent_binding.words, &mut service)
         .unwrap();
+    if scenario == NamespaceScenario::Exhaustion {
+        let mut exhausted = false;
+        for _ in 0..carrick_sched_core::process::identity_allocator::NAMESPACE_TABLE_NODES {
+            match fixture.host_ids.reserve_thread() {
+                Ok((_, reservation)) => capacity_claims.push(reservation.commit()),
+                Err(
+                    carrick_kernel::kernel::IdError::StorageRequired
+                    | carrick_kernel::kernel::IdError::Exhausted,
+                ) => {
+                    exhausted = true;
+                    break;
+                }
+                Err(error) => panic!("unexpected reservation failure: {error}"),
+            }
+        }
+        assert!(exhausted, "bounded table did not exhaust");
+        let refused = entry.fork(ProcessForkChildTid::NONE);
+        assert!(
+            matches!(refused, LifecycleOutcome::Returned { result, .. } if result.raw() == -11),
+            "capacity must return errno 11"
+        );
+    }
     let waited = entry.wait4(
         ProcessWaitPid::from_syscall_argument(u64::from(child_pid)),
         status.va(),
@@ -14116,6 +14306,16 @@ fn native_fork_with_live_host_threads(sibling_tids: [u32; 2]) {
         "wait4 must release the reaped child's internal number"
     );
     runtime.set_next_identity_for_test(child.id);
+    if scenario == NamespaceScenario::Reap {
+        let (host_tid, reservation) = fixture.host_ids.reserve_thread().unwrap();
+        assert_eq!(
+            host_tid.raw(),
+            child.id.raw(),
+            "ring reap did not free the shared number for host reservation"
+        );
+        drop(reservation);
+        runtime.set_next_identity_for_test(child.id);
+    }
     let mut entry = runtime
         .enter(source, &fixture.task, parent_binding.words, &mut service)
         .unwrap();

@@ -678,6 +678,7 @@ impl NativeSignalFixture {
         )
         .unwrap();
         let source = BornInZoneSource { zone, slot };
+        seed_fixture_namespace(zone, task, page);
         let runtime = Arc::new(
             NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
@@ -1204,6 +1205,7 @@ impl NativeOwnerSignalFixture {
         zone.serial_issuer().advance_past(
             NonZeroU64::new(control.host_birth_identity().unwrap().birth().raw()).unwrap(),
         );
+        seed_fixture_namespace(zone, root, page);
         let runtime = Arc::new(
             NativeProcessRuntime::admit_fresh_root::<B>(
                 BornInZoneSource { zone, slot },
@@ -2468,6 +2470,12 @@ fn add_signal_sibling(
         record,
         ..
     } = prepare_signal_sibling(fixture, host_issued);
+    fixture
+        .zone
+        .namespace()
+        .with_view(&carrick_sched_core::ShortLockSpin, |ns| {
+            ns.reserve_exact(42, ClaimKind::Thread).unwrap();
+        });
     fixture
         .registry
         .register_thread(
