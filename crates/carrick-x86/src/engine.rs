@@ -2481,24 +2481,26 @@ mod tests {
         let engine = X86EngineCore::from_parts(vm, TestVcpu::default(), test_layout());
         let spaces = Box::new(carrick_sched_core::AddressSpaces::new());
         let index = spaces.publish_closed(1, 0x1000, 0).unwrap();
-        let excluded = spaces.raise_and_wait_for_editor(index, || {});
-        let bytes = engine
-            .read_core_bytes(Some(&excluded), shared + 0xff0, 0x1020)
-            .unwrap();
-        assert_eq!(bytes.len(), 0x1020);
-        assert!(bytes[..0x10].iter().all(|byte| *byte == 0x11));
-        assert!(bytes[0x10..0x1010].iter().all(|byte| *byte == 0x22));
-        assert!(bytes[0x1010..].iter().all(|byte| *byte == 0x33));
-        // A proof for a different incarnation cannot authorize a backing read.
-        let other = spaces.publish_closed(2, 0x2000, 0).unwrap();
-        let wrong = spaces.raise_and_wait_for_editor(other, || {});
-        assert!(matches!(
-            engine.read_core_bytes(Some(&wrong), shared, 1),
-            Err(MemoryError::HostMap(_))
-        ));
-        drop(wrong);
-        spaces.lower(other);
-        drop(excluded);
+        {
+            let excluded = spaces.raise_and_wait_for_editor(index, || {});
+            let bytes = engine
+                .read_core_bytes(Some(&excluded), shared + 0xff0, 0x1020)
+                .unwrap();
+            assert_eq!(bytes.len(), 0x1020);
+            assert!(bytes[..0x10].iter().all(|byte| *byte == 0x11));
+            assert!(bytes[0x10..0x1010].iter().all(|byte| *byte == 0x22));
+            assert!(bytes[0x1010..].iter().all(|byte| *byte == 0x33));
+            // A proof for a different incarnation cannot authorize a backing read.
+            let other = spaces.publish_closed(2, 0x2000, 0).unwrap();
+            {
+                let wrong = spaces.raise_and_wait_for_editor(other, || {});
+                assert!(matches!(
+                    engine.read_core_bytes(Some(&wrong), shared, 1),
+                    Err(MemoryError::HostMap(_))
+                ));
+            }
+            spaces.lower(other);
+        }
         spaces.lower(index);
     }
 
