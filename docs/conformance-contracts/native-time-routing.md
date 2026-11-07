@@ -262,3 +262,32 @@ subscriptions, cancellation and remaining output across scheduler suspension.
 Success-path child clock reads, completed sleeps and timex reads must exercise
 those owners before any time family can be advertised as served. Signed/HVF
 pipeline census, runtime demo and paired populations remain UNRUN (director).
+
+## Retained sample owner checkpoint
+
+`NativeProcessEntry::begin_clock_sample` now retains the fixed clock record
+and its user destination under the exact native service claim. A successful
+ACK moves the decoded timespec into the existing owned-copyout continuation;
+a memory-owner wait cannot discard it or submit another sample. Transport
+completion is noninterruptible, like the subsequent committed copyout, while
+terminal cancellation still settles the exact service claim. Payload-free
+Clock admission remains rejected before publication.
+
+The VM-free `native_clock_sample_retains_reply_across_copyout_busy` witness
+uses the real ClockDomain resource adapter with deterministic time. It admits
+one sample, refuses output once as Busy, advances the domain, and requires the
+original sample after resumption. The second service request is CarrierWork,
+not another clock request, and the execution slot is vacant at both waits.
+This checks the native service entry and retained output, not syscall routing
+or a fork-child realtime read. Its initial fixture incorrectly attempted to
+consume the handoff receipt after resume_checkpoint had already consumed it;
+that fixture assertion was corrected.
+
+The four original syscall witnesses remain unresolved. In particular,
+`dispatch::route_aarch64` still selects Unported for time calls;
+`metadata_grant/native_service.rs` still lacks Clock payload intake and an
+admitted run clock resource; runtime `finish_native_service` does not dispatch
+Clock; and x86 `linux_personality.rs` still refuses NativeService. No time
+family is enabled by this checkpoint. Timex ring input/output preparation,
+sleep continuations and both production resource bindings remain required.
+This is not completion of #1808. Signed/HVF verification remains director work.
