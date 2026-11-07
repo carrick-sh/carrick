@@ -2165,6 +2165,7 @@ mod ipc_tests {
                     pool,
                     pool_len,
                     3,
+                    carrick_el1_abi::ipc::IpcLimits::ZONE,
                 )
             }
             .unwrap()

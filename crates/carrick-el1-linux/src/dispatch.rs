@@ -3516,9 +3516,7 @@ fn run_with_table_growth<T>(
                     .map_err(map_ipc_error)?;
             }
             Err(carrick_el1_abi::ipc::fd::Error::NeedsOfds) => {
-                region
-                    .grow_ofds(seen, carrick_el1_abi::ipc::IPC_MAX_OFDS)
-                    .map_err(map_ipc_error)?;
+                region.grow_ofds(seen).map_err(map_ipc_error)?;
             }
             Err(err) => return Err(map_fd_error(err)),
         }
@@ -3730,10 +3728,7 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                     match venue.region.create_pipe(65536, &NativeFdWait) {
                         Ok(object) => break object,
                         Err(carrick_el1_abi::ipc::IpcError::NoObjects) => {
-                            if let Err(error) = venue
-                                .region
-                                .grow_objects(seen, carrick_el1_abi::ipc::IPC_MAX_OBJECTS)
-                            {
+                            if let Err(error) = venue.region.grow_objects(seen) {
                                 let _ = venue.region.fd(NativeFdWait).cancel_pair(&mut claims);
                                 return map_ipc_error(error);
                             }
@@ -3840,10 +3835,7 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                     match created {
                         Ok(object) => break object,
                         Err(carrick_el1_abi::ipc::IpcError::NoObjects) => {
-                            if let Err(error) = venue
-                                .region
-                                .grow_objects(seen, carrick_el1_abi::ipc::IPC_MAX_OBJECTS)
-                            {
+                            if let Err(error) = venue.region.grow_objects(seen) {
                                 return map_ipc_error(error);
                             }
                         }

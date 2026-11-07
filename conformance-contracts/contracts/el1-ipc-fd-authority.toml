@@ -25,6 +25,7 @@ structural_budgets = []
 
 [bindings]
 vm_free = [
+  "carrick-el1-linux::aarch64_process_tests::{serial_host_native_fork_pipe_zone_ceiling,serial_host_native_root_pipe_zone_ceiling} (#1506: production fork and pipe2 reject configured zone object exhaustion with ENFILE in root and child)",
   "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_fork_exec_pipe_writer_reaches_its_parent (#1506: production fork/exec successor constructs eventfd and epoll, EPOLLIN|EPOLLET ADD, write/wait cookie, drain, DEL, flags and close)",
   "carrick-el1-linux::aarch64_process_tests::serial_host_native_fork_netpoll_eventfd_wait (#1506: child-owned CLOEXEC epoll/eventfd, EPOLLIN|EPOLLET ADD/MOD/DEL, timeout-zero harvest, real finite park releasing execution, inherited eventfd write by a native grandchild, exact readiness cookie and counter, retired operation/deadline, zero forwarded calls; no x86 or signed execution claim)",
   "carrick-el1-linux::aarch64_process_tests::serial_host_native_fork_children_create_timerfd_in_their_own_tables (#1506 red-first: production child settime with old-value output, immediate absolute one-shot expiration, exact count, drained EAGAIN and disarmed gettime; constructor still unserved, no scheduler-wakeup or creator-domain proof)",

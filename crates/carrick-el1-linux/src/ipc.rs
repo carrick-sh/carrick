@@ -1939,6 +1939,7 @@ mod tests {
                 pool,
                 pool_len,
                 42,
+                carrick_el1_abi::ipc::IpcLimits::ZONE,
             )
         }
         .unwrap()

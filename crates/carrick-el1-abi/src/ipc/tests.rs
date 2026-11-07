@@ -77,14 +77,19 @@ pub(super) fn zeroed_directory() -> *mut IpcDirectory {
 }
 
 fn fixture(pool_len: usize) -> Fixture {
+    fixture_with_limits(pool_len, IpcLimits::ZONE)
+}
+
+fn fixture_with_limits(pool_len: usize, limits: IpcLimits) -> Fixture {
     let dir = zeroed_directory();
     let pool =
         unsafe { std::alloc::alloc_zeroed(Layout::from_size_align(pool_len, 4096).unwrap()) };
     let identity = IDENTITY.fetch_add(1, Ordering::Relaxed);
-    let region =
-        unsafe { IpcRegion::initialize(dir, IPC_DIRECTORY_BYTES, pool, pool_len, identity) }
-            .unwrap()
-            .with_ceiling(&TEST_CEILING);
+    let region = unsafe {
+        IpcRegion::initialize(dir, IPC_DIRECTORY_BYTES, pool, pool_len, identity, limits)
+    }
+    .unwrap()
+    .with_ceiling(&TEST_CEILING);
     Fixture {
         region: Box::leak(Box::new(region)),
         next_descriptor: Cell::new(ipc_descriptor_area(pool_len as u64).start),
@@ -271,15 +276,15 @@ fn el1_ipc_region_attach_authenticates_the_header() {
         Some(IpcError::BadRegion)
     );
     assert_eq!(
-        unsafe { IpcRegion::initialize(dir, dl - 1, pool, len, 77) }.err(),
+        unsafe { IpcRegion::initialize(dir, dl - 1, pool, len, 77, IpcLimits::ZONE) }.err(),
         Some(IpcError::BadRegion),
         "a directory mapping shorter than the stores' reservation"
     );
-    let host = unsafe { IpcRegion::initialize(dir, dl, pool, len, 77) }
+    let host = unsafe { IpcRegion::initialize(dir, dl, pool, len, 77, IpcLimits::ZONE) }
         .unwrap()
         .with_ceiling(&TEST_CEILING);
     assert_eq!(
-        unsafe { IpcRegion::initialize(dir, dl, pool, len, 78) }.err(),
+        unsafe { IpcRegion::initialize(dir, dl, pool, len, 78, IpcLimits::ZONE) }.err(),
         Some(IpcError::BadRegion)
     );
     assert_eq!(
@@ -1128,8 +1133,7 @@ fn el1_ipc_object_and_description_stores_grow_by_segment() {
         Err(IpcError::NoObjects)
     );
     assert_eq!(
-        fx.region
-            .grow_objects(fx.region.object_count(), IPC_MAX_OBJECTS),
+        fx.region.grow_objects(fx.region.object_count()),
         Ok(IPC_OBJECT_SEGMENT)
     );
     let grown = fx
@@ -1177,7 +1181,7 @@ fn el1_ipc_object_and_description_stores_grow_by_segment() {
         Err(fd::Error::NeedsOfds)
     );
     assert_eq!(
-        fx.region.grow_ofds(fx.region.ofd_count(), IPC_MAX_OFDS),
+        fx.region.grow_ofds(fx.region.ofd_count()),
         Ok(IPC_OFD_SEGMENT)
     );
     let fd = fx.host().open(t, Fd(0), desc(grown), false).unwrap();
@@ -1185,24 +1189,22 @@ fn el1_ipc_object_and_description_stores_grow_by_segment() {
     // Only the zone-wide ceiling refuses.
     while fx.region.object_count() < IPC_MAX_OBJECTS {
         assert_eq!(
-            fx.region
-                .grow_objects(fx.region.object_count(), IPC_MAX_OBJECTS),
+            fx.region.grow_objects(fx.region.object_count()),
             Ok(IPC_OBJECT_SEGMENT)
         );
     }
     assert_eq!(
-        fx.region
-            .grow_objects(fx.region.object_count(), IPC_MAX_OBJECTS),
+        fx.region.grow_objects(fx.region.object_count()),
         Err(IpcError::ZoneLimit)
     );
     while fx.region.ofd_count() < IPC_MAX_OFDS {
         assert_eq!(
-            fx.region.grow_ofds(fx.region.ofd_count(), IPC_MAX_OFDS),
+            fx.region.grow_ofds(fx.region.ofd_count()),
             Ok(IPC_OFD_SEGMENT)
         );
     }
     assert_eq!(
-        fx.region.grow_ofds(fx.region.ofd_count(), IPC_MAX_OFDS),
+        fx.region.grow_ofds(fx.region.ofd_count()),
         Err(IpcError::ZoneLimit)
     );
     // The last record of the zone is an ordinary record.
@@ -1232,9 +1234,7 @@ fn el1_ipc_object_and_description_stores_grow_by_segment() {
 fn el1_ipc_host_wake_index_spans_every_segment_without_scanning() {
     let fx = fixture(1 << 20);
     while fx.region.object_count() < 5 * IPC_OBJECT_SEGMENT {
-        fx.region
-            .grow_objects(fx.region.object_count(), IPC_MAX_OBJECTS)
-            .unwrap();
+        fx.region.grow_objects(fx.region.object_count()).unwrap();
     }
     let objects: Vec<_> = (0..5 * IPC_OBJECT_SEGMENT)
         .map(|_| {
@@ -1615,32 +1615,25 @@ fn shared_pipe_supply_without_stock_reuses_and_replaces_owned_extents() {
 
 #[test]
 fn shared_growth_reprobes_a_peer_publication_even_at_the_ceiling() {
-    let fx = fixture(1 << 20);
+    let fx = fixture_with_limits(
+        1 << 20,
+        IpcLimits {
+            objects: 2 * IPC_OBJECT_SEGMENT,
+            descriptions: 2 * IPC_OFD_SEGMENT,
+        },
+    );
     let objects = fx.region.object_count();
     let ofds = fx.region.ofd_count();
+    assert_eq!(fx.region.grow_objects(objects), Ok(IPC_OBJECT_SEGMENT));
+    assert_eq!(fx.region.grow_objects(objects), Ok(0));
     assert_eq!(
-        fx.region
-            .grow_objects(objects, objects + IPC_OBJECT_SEGMENT),
-        Ok(IPC_OBJECT_SEGMENT)
-    );
-    assert_eq!(
-        fx.region
-            .grow_objects(objects, objects + IPC_OBJECT_SEGMENT),
-        Ok(0)
-    );
-    assert_eq!(
-        fx.region
-            .grow_objects(fx.region.object_count(), objects + IPC_OBJECT_SEGMENT),
+        fx.region.grow_objects(fx.region.object_count()),
         Err(IpcError::ZoneLimit)
     );
+    assert_eq!(fx.region.grow_ofds(ofds), Ok(IPC_OFD_SEGMENT));
+    assert_eq!(fx.region.grow_ofds(ofds), Ok(0));
     assert_eq!(
-        fx.region.grow_ofds(ofds, ofds + IPC_OFD_SEGMENT),
-        Ok(IPC_OFD_SEGMENT)
-    );
-    assert_eq!(fx.region.grow_ofds(ofds, ofds + IPC_OFD_SEGMENT), Ok(0));
-    assert_eq!(
-        fx.region
-            .grow_ofds(fx.region.ofd_count(), ofds + IPC_OFD_SEGMENT),
+        fx.region.grow_ofds(fx.region.ofd_count()),
         Err(IpcError::ZoneLimit)
     );
 }
@@ -1658,13 +1651,7 @@ fn object_growth_observation_excludes_the_segment_still_being_linked() {
     let fx = fixture(1 << 20);
     let seen = fx.region.object_count();
     OBJECT_PUBLICATION_PROBE.set(true);
-    assert_eq!(
-        fx.region.grow_objects(seen, seen + IPC_OBJECT_SEGMENT),
-        Ok(IPC_OBJECT_SEGMENT)
-    );
+    assert_eq!(fx.region.grow_objects(seen), Ok(IPC_OBJECT_SEGMENT));
     OBJECT_PUBLICATION_PROBE.set(false);
-    assert_eq!(
-        fx.region.grow_objects(seen, seen + IPC_OBJECT_SEGMENT),
-        Ok(0)
-    );
+    assert_eq!(fx.region.grow_objects(seen), Ok(0));
 }
