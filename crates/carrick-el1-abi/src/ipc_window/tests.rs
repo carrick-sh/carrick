@@ -197,3 +197,27 @@ fn ipc_binding_keeps_guest_virtual_and_physical_ranges_distinct() {
     assert_eq!(binding.pool_physical(), FrameGpa::new(POOL + 0x1_0000_0000));
     assert_eq!(binding.pool_bytes(), GuestLen::new(EL1_IPC_POOL_SPAN));
 }
+
+#[test]
+fn ipc_host_window_keeps_host_addresses_typed() {
+    use carrick_guest_arch::HostVa;
+    let directory = HostVa::new(0x200_0000);
+    let pool = HostVa::new(0x400_0000);
+    // SAFETY: validation only; no attachment or memory access in this witness.
+    let window = unsafe {
+        crate::HostIpcWindow::new(
+            directory,
+            GuestLen::new(EL1_IPC_DIRECTORY_SPAN),
+            pool,
+            GuestLen::new(EL1_IPC_POOL_SPAN),
+        )
+    }
+    .unwrap();
+    assert_eq!(window.directory(), directory);
+    assert_eq!(window.pool(), pool);
+    assert_eq!(
+        window.directory_bytes(),
+        GuestLen::new(EL1_IPC_DIRECTORY_SPAN)
+    );
+    assert_eq!(window.pool_bytes(), GuestLen::new(EL1_IPC_POOL_SPAN));
+}
