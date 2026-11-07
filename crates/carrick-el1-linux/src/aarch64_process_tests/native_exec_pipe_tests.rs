@@ -14,15 +14,21 @@ use std::{collections::BTreeMap, sync::Arc};
 
 #[test]
 fn serial_host_native_fork_exec_pipe_writer_reaches_its_parent() {
-    fork_exec_successor(false);
+    fork_exec_successor(None);
 }
 
 #[test]
 fn serial_host_native_fork_exec_child_futex_retains_owner_refusal() {
-    fork_exec_successor(true);
+    fork_exec_successor(Some(crate::sched::FUTEX_WAIT_PRIVATE));
 }
 
-fn fork_exec_successor(futex: bool) {
+#[test]
+fn serial_host_native_fork_exec_child_realtime_bitset_futex_retains_owner_refusal() {
+    // glibc sem_wait: CLOCK_REALTIME is valid even with no timeout.
+    fork_exec_successor(Some(128 | 256 | 9));
+}
+
+fn fork_exec_successor(futex: Option<u64>) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     struct RestoreRegion(usize);
     impl Drop for RestoreRegion {
@@ -128,7 +134,7 @@ fn fork_exec_successor(futex: bool) {
     unsafe {
         *fixture.zone.record(parent_binding.record.id).ctx_mut() = parent_binding.words;
     }
-    if futex {
+    if futex.is_some() {
         let mut entry = runtime
             .enter_registered(
                 registry,
@@ -283,7 +289,7 @@ fn fork_exec_successor(futex: bool) {
         fixture.task.mm.key.load(Ordering::Acquire),
         child_binding.address.mm.raw().get()
     );
-    if futex {
+    if let Some(operation) = futex {
         child_futex(
             fixture,
             registry,
@@ -292,6 +298,7 @@ fn fork_exec_successor(futex: bool) {
             parent,
             child,
             &counters,
+            operation,
         );
         registry.unregister_root_for_test(&runtime);
         return;
@@ -858,6 +865,7 @@ fn child_futex<'a>(
     parent: TaskKey,
     child: TaskKey,
     counters: &carrick_el1_abi::Counters,
+    operation: u64,
 ) {
     use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest};
     use carrick_guest_arch::{Access, GuestLen};
@@ -933,10 +941,16 @@ fn child_futex<'a>(
     };
     frame.x[8] = crate::sched::SYS_FUTEX as u64;
     frame.x[0] = VA;
-    frame.x[1] = crate::sched::FUTEX_WAIT_PRIVATE;
+    frame.x[1] = operation;
+    frame.x[5] = u64::from(u32::MAX);
     frame.x[2] = 1;
     let mut parked = binding.words;
-    crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut parked);
+    crate::sched::ThreadCpu::save(
+        &mut cpu,
+        &frame,
+        &mut parked,
+        crate::sched::CpuExitCause::Svc,
+    );
     {
         let mut entry = runtime
             .enter_registered(
@@ -972,7 +986,7 @@ fn child_futex<'a>(
         assert_eq!(
             route,
             CompletionRoute::Suspended,
-            "fork child WAIT_PRIVATE address={VA:#x}, expected {:?}; result={}",
+            "fork child futex op={operation} address={VA:#x}, expected {:?}; result={}",
             CopyOutcome::NotYet(request),
             frame.x[0] as i64
         );
@@ -1125,7 +1139,7 @@ fn child_futex<'a>(
     }
     // A matching WAIT switches from the exec leader to its real clone birth.
     frame.x[8] = crate::sched::SYS_FUTEX as u64;
-    frame.x[..6].copy_from_slice(&[VA, crate::sched::FUTEX_WAIT_PRIVATE, 0, 0, 0, 0]);
+    frame.x[..6].copy_from_slice(&[VA, operation, 0, 0, 0, u64::from(u32::MAX)]);
     use crate::sched::LinuxSchedEntry;
     assert_eq!(
         crate::sched::Sched {
