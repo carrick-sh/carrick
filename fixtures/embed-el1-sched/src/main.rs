@@ -2091,7 +2091,7 @@ static mut COW_PROTECTED_IMAGE: CowProtectedImage = CowProtectedImage([0xa5; 327
 
 fn cow_protected_image(fork: bool) -> i32 {
     unsafe { libc::alarm(30) };
-    let base = std::ptr::addr_of_mut!(COW_PROTECTED_IMAGE).cast::<u8>();
+    let base = unsafe { std::ptr::addr_of_mut!(COW_PROTECTED_IMAGE.0).cast::<u8>() };
     let protected = unsafe { base.add(4096) };
     if unsafe { libc::mprotect(protected.cast(), 4096, libc::PROT_READ) } != 0 {
         return 1;
