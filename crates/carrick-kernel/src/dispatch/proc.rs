@@ -3818,10 +3818,13 @@ impl<'a> ProcView<'a> {
         }
 
         fn getrandom(this, cx, address: GuestPtr, length: u64, flags: u64) {
+            // Linux's flags argument is unsigned int: upper register bits
+            // are outside the argument, not unsupported flag bits.
+            let flags = flags as u32;
             // Only GRND_NONBLOCK(1) | GRND_RANDOM(2) | GRND_INSECURE(4) are
             // valid; any other bit → EINVAL (LTP getrandom05). carrick draws
             // from the host CSPRNG regardless of the source/blocking flags.
-            const GRND_SUPPORTED: u64 = 0x0001 | 0x0002 | 0x0004;
+            const GRND_SUPPORTED: u32 = 0x0001 | 0x0002 | 0x0004;
             if flags & !GRND_SUPPORTED != 0 || flags & (0x0002 | 0x0004) == (0x0002 | 0x0004) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
