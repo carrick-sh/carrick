@@ -7,6 +7,8 @@ use carrick_core_abi::service::{
 };
 use carrick_sched_core::object_wait::{ObjectWaitKey, OperationToken};
 
+pub mod sleep;
+
 /// Publish one exact member's retained service capability before execution,
 /// or at the first service entry of an already authenticated host member.
 pub(super) fn bind_member_service<C: ProcessContext>(
