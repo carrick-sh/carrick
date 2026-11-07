@@ -285,6 +285,77 @@ projection capacity. Plain range close, retained close-effect delivery and
 successor-table publication for `UNSHARE` remain unfinished. This flag-only
 operation does not authorize removing `close_range` from the Forward allowlist.
 
+### Production cleanup cutover required before routing retirement
+
+The continuation audit on admitted main plus the retained-close commits found
+that the service cannot yet consume a close receipt. This is a production
+ownership gap, not a missing call to `settle_close_filtered`. In particular:
+
+- `serve_owned_ipc_descriptor` removes the slot and selects
+  `ServedBoundary::ReplayOriginal`. The native two-child descriptor fixture
+  explicitly expects that boundary. It therefore witnesses the unsafe replay,
+  not successful retained cleanup. Its green result cannot authorize routing
+  retirement.
+- `PendingHostFile` owns the staged bytes through service acknowledgement but
+  owns no `PreparedClose` or `CloseReceipt`. Its cancellation without a reply
+  returns `RetrySyscall`, which is valid only before a close commits.
+- The carrier's `serve_native_host_file` takes a record without an exact
+  closing `TaskKey`. POSIX lock release needs that task generation. Inotify's
+  existing close helper first consults a numeric path in the captured host
+  file table. Calling either helper with ambient carrier state would recreate
+  the second descriptor path excluded by this design.
+- The host-file decoder and venue are shared, but native staging still takes
+  the AArch64 `TrapFrame`. The x86 guest adapter needs the same retained
+  operation entry; a shared decoder alone does not establish that binding.
+
+The next implementation must extend the existing operation owner, with these
+states made explicit in its owned payload:
+
+1. **Admitted:** reserve service storage and retain exact caller, thread,
+   table and execution identities before preparing any slot. Refusal at this
+   point changes no descriptor. A range reserves capacity for every selected
+   close receipt before its first committed removal.
+2. **Prepared:** retain `PreparedClose` custody. Cancellation releases each
+   claim without closing a slot. Busy retains custody and enrolls on the
+   existing release notification; it cannot become an ordinary errno.
+3. **Committed:** move each resulting `CloseReceipt` into that same pending
+   operation. Publish a typed cleanup request naming the retained OFD and
+   closing task, rather than a syscall ordinal and reusable fd. The carrier
+   borrows the exact description through that retained authority. It must not
+   resolve the old fd in any table.
+4. **Cleanup acknowledged:** consume record-lock, epoll and inotify effects
+   exactly once, then settle the ring-owned receipts. A cancellation after
+   commitment joins cleanup and cannot return `RetrySyscall`. Lost reply or
+   refused transport retains the obligation instead of discarding its pin.
+
+The fixed host-file header has room for operation-specific words, so this
+does not require another descriptor namespace or necessarily a larger wire
+layout. A new operation tag and identity encoding still change protocol
+semantics and require the cross-crate interface review before implementation.
+Keep the actual receipt owned in ring memory; encoded identity words are a
+borrow authenticated by the existing service ticket, never another receipt.
+Refactor cleanup helpers around an exact retained description and caller
+identity before adding the carrier arm. Do not call the numeric host `close`
+handler from that arm.
+
+`UNSHARE` is a separate publication within the same operation: prepare a
+private successor using the existing fd authority, then publish its resource
+custody, IPC table binding, delegated projection and calling task's file-table
+identity together. A peer sharing the old table must retain every old entry,
+including a peer in the same thread group. Failure
+before publication leaves the source unchanged; after publication, cleanup
+belongs to the successor operation. A copied table ID alone is insufficient.
+
+The decisive production schedule has two live native threads admitted with
+`CLONE_FILES`: pause cleanup after committed removal, replace that number
+through production `dup3`, acknowledge old cleanup, and prove the replacement
+and peer's unrelated entries survive. Repeat for multiple range members,
+late effect registration and cancellation on either side of commitment.
+Neither direct fd-core receipt tests nor a synthetic carrier reply establish
+this claim. The current code has not passed this schedule; the five Forward
+entries remain pending that implementation, independent review and the signed
+population gate. No signed or oracle acceptance is claimed by this audit.
+
 ## Pipe capacity allocation service (#1678)
 
 `HostFileOp::PipeCapacity` extends the existing retained native service record.
