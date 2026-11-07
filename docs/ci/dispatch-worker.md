@@ -277,11 +277,25 @@ login, with the hidden marker `<!-- carrick-reactor -->`:
   CI loop. State records the round's head, time and count.
 - A `reply` posts plain text; text starting with `/agent` is refused.
 - Dispatch outcome comments (from `github-actions[bot]` or
-  `carrick-workers[bot]`, containing "Dispatch outcome") are events, so a
-  finished, blocked or failed round gets a decision. Other bot comments and
-  comments carrying the marker are not. Owner `/agent` commands do not ask
-  for a decision but count as a human comment. PRs labelled `agent:hold` are
-  skipped.
+  `carrick-workers[bot]`, containing "Dispatch outcome") and signed-gate
+  results (`Signed gate:`) are events, so a finished, blocked or failed round
+  gets a decision. Other bot comments and comments carrying the marker are not.
+  Owner `/agent` commands do not ask for a decision but count as a human
+  comment. PRs labelled `agent:hold` are skipped.
+- When an implementation round ends `Done` on a PR, the reactor deterministically
+  starts one independent review round (#1825) through the same `enforce` and
+  `UNATTENDED_ROUNDS` continuation path: on the opposite worker tier from the
+  author round (`strong` → `standard`, `standard` → `strong`, falling back to
+  the same tier on a different backend when live capacity shows the opposite
+  tier has no quota), with the standard review-only brief focused on the linked
+  issue's acceptance criteria and scoped to the diff since the last published
+  independent review on the PR (author worker self-reviews do not narrow the
+  diff). A review round ending `Done` without `CHANGES REQUESTED` starts no
+  further round; a `CHANGES REQUESTED` verdict starts one fix round on that
+  head within the unattended-round cap. Ecosystem-blocker PRs (#887, #1733,
+  #1791, #1506, #1671, #1756 and their split/successor issues) wait for a
+  signed scoreboard or `Signed gate: **PASS**` naming the current PR head
+  before starting review, recording a named wait in `waiting_on`.
 - Every open PR is in scope, however old: the reactor exists to finish PRs.
   Label a PR `agent:hold` to keep the reactor off it. In `run` mode a
   director PR without exactly one closing reference gets one reply asking

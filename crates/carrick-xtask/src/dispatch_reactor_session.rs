@@ -7,10 +7,11 @@
 //! `reply` and `request_round`, are the only effects, each checked by
 //! [`super::enforce`] under the same gates as the poll loop.
 use super::{
-    Act, AdoptionRead, Class, Decision, Effect, Gate, Github, Live, MARKER, QUIET_SECS, REPOSITORY,
-    ScalerError, UNATTENDED_ROUNDS, adopted_pr, adoption_facts, classify, clip, director_pr,
-    enforce, gather, iso, limit_warnings, lookback, outcome_bot, owned_pr, parse_iso,
-    trusted_owner, trusted_pr,
+    Act, AdoptionRead, CommentView, Decision, Effect, Gate, Github, Live, MARKER, QUIET_SECS,
+    REPOSITORY, ReviewVerdict, RoundKind, ScalerError, UNATTENDED_ROUNDS, adopted_pr,
+    adoption_facts, classify, clip, director_pr, ecosystem_wait_reason, enforce, gather,
+    is_review_brief, is_signed_scoreboard_text, iso, limit_warnings, lookback, outcome_bot,
+    owned_pr, parse_iso, parse_outcomes, select_reviewer_tier, trusted_owner, trusted_pr,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -287,7 +288,7 @@ pub(super) fn feed_cycle(
             }
         }
         if director {
-            let (_, count) = adoption_facts(gh, pr)?;
+            let (_, count, _) = adoption_facts(gh, pr)?;
             if count != Some(1) && !memory.closes_flagged {
                 memory.closes_flagged = true;
                 out.push(line(
@@ -379,6 +380,9 @@ pub(super) trait Remote {
     fn adoption(&mut self, read: AdoptionRead) -> Result<Value, ScalerError>;
     fn runs(&mut self) -> Result<Vec<Value>, ScalerError>;
     fn post(&mut self, pr: u64, body: &str) -> Result<(), ScalerError>;
+    fn capacity(&mut self) -> Option<Value> {
+        None
+    }
 }
 impl Remote for Live<'_> {
     fn get(&mut self, endpoint: &str) -> Result<Value, ScalerError> {
@@ -406,6 +410,9 @@ impl Remote for Live<'_> {
     fn post(&mut self, pr: u64, body: &str) -> Result<(), ScalerError> {
         Github::post(self, pr, body)
     }
+    fn capacity(&mut self) -> Option<Value> {
+        Github::capacity(self)
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -425,6 +432,8 @@ struct RoundMemory {
     last_reply_at: Option<String>,
     #[serde(default)]
     waiting_on: Option<String>,
+    #[serde(default)]
+    last_continued_outcome: Option<String>,
 }
 
 pub(super) struct Server<'a> {
@@ -718,7 +727,12 @@ impl Server<'_> {
                     .list(&format!("repos/{REPOSITORY}/issues/{n}/comments?per_page=100"))
                     .map_err(fail)?
                     .into_iter()
-                    .filter(|c| classify(&c["user"], c["body"].as_str().unwrap_or_default()) == Some(Class { trigger: true, human: false }))
+                    .filter(|c| {
+                        let body = c["body"].as_str().unwrap_or_default();
+                        outcome_bot(&c["user"])
+                            && body.contains("Dispatch outcome")
+                            && !body.contains(MARKER)
+                    })
                     .map(|c| json!({"at":c["created_at"],"url":c["html_url"],"body":c["body"].as_str().unwrap_or_default().chars().take(4000).collect::<String>()}))
                     .collect();
                 let skip = outcomes.len().saturating_sub(10);
@@ -792,6 +806,7 @@ impl Server<'_> {
         let head = pr["head"]["sha"].as_str().unwrap_or_default().to_owned();
         let mut state: ToolState = load(&self.state).map_err(fail)?;
         let mut human_reset = false;
+        let mut continued_outcome: Option<String> = None;
         let (decision, gate) = if name == "reply" {
             let decision = Decision {
                 action: Act::Reply,
@@ -828,6 +843,12 @@ impl Server<'_> {
                     "repos/{REPOSITORY}/issues/{n}/comments?per_page=100"
                 ))
                 .map_err(fail)?;
+            let reviews = self
+                .remote
+                .list(&format!(
+                    "repos/{REPOSITORY}/pulls/{n}/reviews?per_page=100"
+                ))
+                .map_err(fail)?;
             if let Some(blocker) = super::repeated_blocker(
                 comments
                     .iter()
@@ -848,7 +869,92 @@ impl Server<'_> {
                 }
                 return Err(format!("waiting on {blocker}; repeated external blocker"));
             }
+            let comment_views: Vec<CommentView<'_>> = comments
+                .iter()
+                .map(|c| CommentView {
+                    url: c["html_url"]
+                        .as_str()
+                        .or_else(|| c["url"].as_str())
+                        .unwrap_or_default(),
+                    user: &c["user"],
+                    body: c["body"].as_str().unwrap_or_default(),
+                })
+                .collect();
+            let outcomes = parse_outcomes(&comment_views, &reviews);
+            let review_requested = is_review_brief(&decision.text);
+            if review_requested
+                || outcomes.last().is_some_and(|o| {
+                    o.kind == RoundKind::Implementation && o.status.eq_ignore_ascii_case("done")
+                })
+            {
+                if let Some(last) = outcomes.last() {
+                    let cap = self.remote.capacity();
+                    let _ = select_reviewer_tier(
+                        last.author_tier
+                            .unwrap_or(super::super::worker_tier::WorkerTier::Strong),
+                        &last.author_backends,
+                        cap.as_ref(),
+                    );
+                }
+                if let Some(wait) = ecosystem_wait_reason(
+                    &pr,
+                    n,
+                    &head,
+                    &[],
+                    outcomes.last().and_then(|o| o.issue),
+                    &comment_views,
+                    &mut |r| self.remote.adoption(r),
+                )
+                .map_err(fail)?
+                {
+                    state.prs.entry(n).or_default().waiting_on = Some(wait.clone());
+                    if !self.dry_run {
+                        save(&self.state, &state).map_err(fail)?;
+                    }
+                    return Err(format!("waiting on {wait}"));
+                }
+            }
+            let had_wait = state.prs.get(&n).is_some_and(|m| m.waiting_on.is_some());
             state.prs.entry(n).or_default().waiting_on = None;
+            if had_wait && !self.dry_run {
+                save(&self.state, &state).map_err(fail)?;
+            }
+            let mut post_review_fix = false;
+            if let Some(last) = outcomes.last() {
+                continued_outcome = Some(last.key.clone());
+                let after = &comment_views[last.index + 1..];
+                let round_triggered_after = after
+                    .iter()
+                    .any(|c| trusted_owner(c.user) && c.body.trim_start().starts_with("/agent"));
+                let owner_chat_after = after.iter().any(|c| {
+                    trusted_owner(c.user)
+                        && !c.body.contains(MARKER)
+                        && !c.body.trim_start().starts_with("/agent")
+                        && !is_signed_scoreboard_text(c.body)
+                });
+                if last.status.eq_ignore_ascii_case("done") && !owner_chat_after {
+                    if last.kind == RoundKind::Review
+                        && last.verdict == Some(ReviewVerdict::Approved)
+                    {
+                        return Err(
+                            "refused: independent review round already ended Done on this head"
+                                .into(),
+                        );
+                    }
+                    if last.kind == RoundKind::Review
+                        && last.verdict == Some(ReviewVerdict::ChangesRequested)
+                        && !round_triggered_after
+                        && !review_requested
+                        && state
+                            .prs
+                            .get(&n)
+                            .and_then(|m| m.last_continued_outcome.as_deref())
+                            != Some(last.key.as_str())
+                    {
+                        post_review_fix = true;
+                    }
+                }
+            }
             let (owned, adoptable) = eligible(self.remote, &pr).map_err(fail)?;
             let active: Vec<Value> = self
                 .remote
@@ -867,6 +973,7 @@ impl Server<'_> {
                 None => true,
             };
             let repeat_round = !owner_spoke
+                && !post_review_fix
                 && memory.and_then(|m| m.last_round_head.as_deref()) == Some(head.as_str());
             let unattended =
                 !owner_spoke && memory.is_some_and(|m| m.unattended >= UNATTENDED_ROUNDS);
@@ -914,6 +1021,9 @@ impl Server<'_> {
                     };
                     memory.last_round_head = Some(head);
                     memory.last_round_at = Some(iso(self.now));
+                    if let Some(key) = continued_outcome {
+                        memory.last_continued_outcome = Some(key);
+                    }
                     save(&self.state, &state).map_err(fail)?;
                 }
                 Ok(format!("posted on #{n}"))
@@ -1498,7 +1608,10 @@ mod tests {
     struct FakeRemote {
         prs: BTreeMap<u64, Value>,
         comments: Vec<Value>,
+        reviews: Vec<Value>,
         closing: Vec<u64>,
+        issues: BTreeMap<u64, Value>,
+        capacity: Option<Value>,
         runs: Vec<Value>,
         posted: Vec<(u64, String)>,
         diff: String,
@@ -1523,6 +1636,8 @@ mod tests {
         fn list(&mut self, endpoint: &str) -> Result<Vec<Value>, ScalerError> {
             Ok(if endpoint.contains("/issues/") {
                 self.comments.clone()
+            } else if endpoint.contains("/reviews") {
+                self.reviews.clone()
             } else {
                 Vec::new()
             })
@@ -1541,6 +1656,7 @@ mod tests {
         fn adoption(&mut self, read: AdoptionRead) -> Result<Value, ScalerError> {
             let mut fake = FakeGh {
                 closing: self.closing.clone(),
+                issues: self.issues.clone(),
                 ..FakeGh::default()
             };
             Github::adoption(&mut fake, read)
@@ -1551,6 +1667,9 @@ mod tests {
         fn post(&mut self, pr: u64, body: &str) -> Result<(), ScalerError> {
             self.posted.push((pr, body.into()));
             Ok(())
+        }
+        fn capacity(&mut self) -> Option<Value> {
+            self.capacity.clone()
         }
     }
     fn remote() -> FakeRemote {
@@ -2336,4 +2455,178 @@ mod tests {
         assert_eq!(events_in(&replies(&buffer, 1)[0]), ["comment:3"]);
     }
     const SHA_HEAD: &str = "1fcdaac3c5322b601f362a5aa5f915781456c7c7";
+
+    #[test]
+    fn replay_1825_mcp_request_round_enforces_ecosystem_wait_single_review_and_fix_chain() {
+        let fx: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/dispatch-1825-outcomes.json"
+        ))
+        .unwrap();
+
+        // 1. Ecosystem PR (#1506) without signed scoreboard records a named wait and refuses review.
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("eco.json");
+        let eco_done = &fx["pr_1740_ecosystem_impl_done"];
+        let eco_head = eco_done["head"].as_str().unwrap();
+        let mut fake = remote();
+        let mut eco_pr = pr(1740, "work/dispatch-1506-42205586763");
+        eco_pr["user"] = json!({"login":"carrick-workers[bot]","type":"Bot"});
+        eco_pr["head"]["sha"] = json!(eco_head);
+        eco_pr["body"] = json!("Closes #1506");
+        fake.prs.insert(1740, eco_pr);
+        fake.closing = vec![1506];
+        fake.comments = vec![json!({
+            "id": 7201,
+            "html_url": eco_done["url"],
+            "user": {"login": "carrick-workers[bot]", "type": "Bot"},
+            "created_at": "2026-10-30T23:59:00Z",
+            "body": eco_done["body"],
+        })];
+        let (err, text) = call(
+            &mut fake,
+            &state,
+            "request_round",
+            json!({
+                "pr": 1740,
+                "brief": "Independent review of PR #1740 (review only; push nothing).\nWorker tier: standard\nPublish a verdict or make it the first line of the summary."
+            }),
+        );
+        assert!(
+            err && text.contains("waiting on signed scoreboard"),
+            "{text}"
+        );
+        assert!(fake.posted.is_empty());
+        let saved: ToolState = load(&state).unwrap();
+        assert!(
+            saved.prs[&1740]
+                .waiting_on
+                .as_deref()
+                .is_some_and(|w| w.contains("signed scoreboard") && w.contains("#1506")),
+            "{:?}",
+            saved.prs[&1740].waiting_on
+        );
+
+        // Once director records a signed scoreboard on eco_head, review round is admitted.
+        fake.comments.push(json!({
+            "id": 7202,
+            "html_url": "https://github.com/carrick-sh/carrick/pull/1740#issuecomment-7202",
+            "user": {"login": "tjfontaine", "type": "User"},
+            "created_at": "2026-10-31T00:02:00Z",
+            "body": format!("Signed scoreboard on `{}`: smoke-signed PASS.", &eco_head[..12]),
+        }));
+        let (err, text) = call(
+            &mut fake,
+            &state,
+            "request_round",
+            json!({
+                "pr": 1740,
+                "brief": "Independent review of PR #1740 (review only; push nothing).\nWorker tier: standard\nPublish a verdict or make it the first line of the summary."
+            }),
+        );
+        assert!(!err, "{text}");
+        assert_eq!(fake.posted.len(), 1);
+        let saved: ToolState = load(&state).unwrap();
+        assert_eq!(saved.prs[&1740].waiting_on, None);
+
+        // 2. Review round ending Done (APPROVED) refuses another review round;
+        //    CHANGES REQUESTED permits one fix round on the same head, capped by UNATTENDED_ROUNDS.
+        let chain_state = dir.path().join("chain.json");
+        let impl_done = &fx["pr_1781_impl_done"];
+        let rev_ok = &fx["pr_1781_review_approved"];
+        let rev_cr = &fx["pr_1781_review_changes_requested"];
+        let fix_done = &fx["pr_1781_fix_done"];
+        let rev2_cr = &fx["pr_1781_review2_changes_requested"];
+        let h1 = impl_done["head"].as_str().unwrap();
+        let h2 = fix_done["head"].as_str().unwrap();
+
+        let mut rev_ok_remote = remote();
+        let mut p1781 = pr(1781, "work/dispatch-1780-42300000001");
+        p1781["user"] = json!({"login":"carrick-workers[bot]","type":"Bot"});
+        p1781["head"]["sha"] = json!(h1);
+        rev_ok_remote.prs.insert(1781, p1781.clone());
+        rev_ok_remote.closing = vec![1780];
+        rev_ok_remote.comments = vec![
+            json!({"id": 7001, "html_url": impl_done["url"], "user": {"login": "carrick-workers[bot]", "type": "Bot"}, "created_at": "2026-10-30T23:50:00Z", "body": impl_done["body"]}),
+            json!({"id": 7003, "html_url": rev_ok["url"], "user": {"login": "carrick-workers[bot]", "type": "Bot"}, "created_at": "2026-10-30T23:59:00Z", "body": rev_ok["body"]}),
+        ];
+        let (err, text) = call(
+            &mut rev_ok_remote,
+            &dir.path().join("approved.json"),
+            "request_round",
+            json!({"pr": 1781, "brief": "Independent review again (review only; push nothing)."}),
+        );
+        assert!(
+            err,
+            "approved review Done must refuse another review: {text}"
+        );
+
+        // Chain: Review 1 (H1) -> Fix 2 (H1) -> Review 3 (H2) -> Fix 4 refused by UNATTENDED_ROUNDS.
+        let mut chain_remote = remote();
+        chain_remote.prs.insert(1781, p1781);
+        chain_remote.closing = vec![1780];
+        chain_remote.comments = vec![json!({
+            "id": 7001,
+            "html_url": impl_done["url"],
+            "user": {"login": "carrick-workers[bot]", "type": "Bot"},
+            "created_at": "2026-10-30T23:50:00Z",
+            "body": impl_done["body"],
+        })];
+        // Round 1: review on H1.
+        let (err, text) = call(
+            &mut chain_remote,
+            &chain_state,
+            "request_round",
+            json!({"pr": 1781, "brief": "Independent review of PR #1781 (review only; push nothing).\nWorker tier: standard"}),
+        );
+        assert!(!err, "{text}");
+
+        // Round 2: review requested changes on H1 -> fix round on H1 is allowed!
+        chain_remote.comments.push(json!({
+            "id": 7004,
+            "html_url": rev_cr["url"],
+            "user": {"login": "carrick-workers[bot]", "type": "Bot"},
+            "created_at": "2026-10-31T00:06:00Z",
+            "body": rev_cr["body"],
+        }));
+        let (err, text) = call(
+            &mut chain_remote,
+            &chain_state,
+            "request_round",
+            json!({"pr": 1781, "brief": "Fix off-by-one boundary validation from review and add regression test."}),
+        );
+        assert!(!err, "CHANGES REQUESTED must allow fix round on H1: {text}");
+
+        // Round 3: fix round pushes H2 -> review round on H2.
+        chain_remote.prs.get_mut(&1781).unwrap()["head"]["sha"] = json!(h2);
+        chain_remote.comments.push(json!({
+            "id": 7006,
+            "html_url": fix_done["url"],
+            "user": {"login": "carrick-workers[bot]", "type": "Bot"},
+            "created_at": "2026-10-31T00:16:00Z",
+            "body": fix_done["body"],
+        }));
+        let (err, text) = call(
+            &mut chain_remote,
+            &chain_state,
+            "request_round",
+            json!({"pr": 1781, "brief": "Independent review of H1..H2 (review only; push nothing).\nWorker tier: standard"}),
+        );
+        assert!(!err, "{text}");
+
+        // Round 4: second CHANGES REQUESTED hits UNATTENDED_ROUNDS = 3 cap.
+        chain_remote.comments.push(json!({
+            "id": 7008,
+            "html_url": rev2_cr["url"],
+            "user": {"login": "carrick-workers[bot]", "type": "Bot"},
+            "created_at": "2026-10-31T00:26:00Z",
+            "body": rev2_cr["body"],
+        }));
+        let (err, text) = call(
+            &mut chain_remote,
+            &chain_state,
+            "request_round",
+            json!({"pr": 1781, "brief": "Fix empty-slice edge case."}),
+        );
+        assert!(err && text.contains("unattended round limit"), "{text}");
+    }
 }
