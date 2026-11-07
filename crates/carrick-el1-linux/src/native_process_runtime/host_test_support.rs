@@ -380,6 +380,14 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         }
         Ok(())
     }
+    fn copy_syscall_output(
+        &mut self,
+        mm: &Self::Mm,
+        address: UserVa,
+        bytes: &[u8],
+    ) -> Result<(), NativeProcessError> {
+        self.copy_owned_bytes(mm, address, bytes)
+    }
     fn copy_owned_bytes(
         &mut self,
         mm: &Self::Mm,
@@ -6426,4 +6434,190 @@ fn sigprocmask_set_owner_wait_redispatches_before_effects() {
         NativeResume::NoPending
     ));
     assert!(take_signal_copies().is_empty());
+}
+
+#[test]
+fn production_getdents_reply_owner_refusal_retains_entries() {
+    use carrick_core_abi::{
+        host_file::HostFileRequestView,
+        service::{ServiceCell, ServiceOperation},
+    };
+    use carrick_personality_linux::native_host_file::{
+        DescriptionAccess, HostFileStage, NativeDescriptor,
+    };
+    let fixture = native_exec_fixture();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    let output_user = carrick_test_support::GuestUserBuffer::zeroed(4096);
+    let address = output_user.arg();
+    let mut frame = carrick_el1_abi::TrapFrame {
+        esr: 0x15 << 26,
+        ..Default::default()
+    };
+    frame.x[8] = 61;
+    frame.x[..3].copy_from_slice(&[3, address, 4096]);
+    let Some(HostFileStage::Request {
+        record,
+        output,
+        resolves_path,
+        map,
+        chdir,
+    }) = crate::dispatch::native_host_file_stage(
+        &frame,
+        fixture.task,
+        &crate::file::HardwareValidator,
+        [1, 1, 0],
+        |_| {
+            Some(NativeDescriptor::HostBacked {
+                access: DescriptionAccess::ReadOnly,
+            })
+        },
+        &mut |_| 0,
+    )
+    else {
+        panic!("production getdents64 must stage a directory request");
+    };
+    let counters = Box::leak(Box::new(carrick_el1_abi::Counters::new()));
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry
+                .begin_host_file_service(
+                    record,
+                    output,
+                    resolves_path,
+                    map,
+                    chdir,
+                    NativeServiceCall::new(carrick_guest_arch::NativeOrdinal::new(61), counters)
+                )
+                .unwrap(),
+            NativeResume::Left(None)
+        ));
+    }
+    let notice = fixture.task.service_notice.take().unwrap().unwrap();
+    let ticket = unsafe {
+        ServiceCell::claim_notice(
+            &fixture.control.service,
+            notice,
+            NonZeroU64::MIN,
+            fixture.zone.record(fixture.record.id).identity(),
+        )
+    }
+    .unwrap();
+    let ServiceOperation::HostFile { payload, .. } = ticket.request().operation else {
+        panic!("directory service");
+    };
+    let bytes = [
+        7, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 24, 0, 8, b'x', 0, 0, 0, 0,
+    ];
+    // The claimed carrier owns this reply until its ACK. A second request
+    // would consume the next directory batch instead of these entries.
+    let record = unsafe {
+        core::slice::from_raw_parts_mut(
+            payload.address().raw() as *mut u8,
+            payload.length().raw() as usize,
+        )
+    };
+    HostFileRequestView::parse(record)
+        .unwrap()
+        .reply(24, &bytes)
+        .unwrap();
+    assert!(ticket.complete(true).is_ok());
+    fixture
+        .zone
+        .object_wait(
+            carrick_sched_core::object_wait::ObjectWaitKey::native_service(fixture.record).unwrap(),
+            &carrick_sched_core::ShortLockSpin,
+        )
+        .unwrap()
+        .notify_object(fixture.slot, &mut WakeEffects::default())
+        .unwrap();
+    fixture.zone.switch_in_full(fixture.slot).unwrap();
+    service.child_copy_error = Some(NativeProcessError::Busy);
+    take_signal_copies();
+    {
+        let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+            .unwrap()
+            .words;
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                entry.resume_checkpoint(|_| Ok(None)).unwrap(),
+                NativeResume::Left(None)
+            ),
+            "completed directory reply must park, never EFAULT or reissue getdents64"
+        );
+    }
+    assert!(take_signal_copies().is_empty());
+    let notice = fixture.task.service_notice.take().unwrap().unwrap();
+    let ticket = unsafe {
+        ServiceCell::claim_notice(
+            &fixture.control.service,
+            notice,
+            NonZeroU64::MIN,
+            fixture.zone.record(fixture.record.id).identity(),
+        )
+    }
+    .unwrap();
+    assert!(matches!(
+        ticket.request().operation,
+        ServiceOperation::CarrierWork { .. }
+    ));
+    assert!(ticket.complete(true).is_ok());
+    fixture
+        .zone
+        .object_wait(
+            carrick_sched_core::object_wait::ObjectWaitKey::native_service(fixture.record).unwrap(),
+            &carrick_sched_core::ShortLockSpin,
+        )
+        .unwrap()
+        .notify_object(fixture.slot, &mut WakeEffects::default())
+        .unwrap();
+    service.child_copy_error = None;
+    fixture.zone.switch_in_full(fixture.slot).unwrap();
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    assert!(
+        matches!(entry.resume_checkpoint(|_| Ok(None)).unwrap(), NativeResume::Returned(result) if result.raw() == 24)
+    );
+    assert_eq!(
+        take_signal_copies(),
+        [(UserVa::new(address), bytes.to_vec())]
+    );
+    assert!(fixture.task.service_notice.take().unwrap().is_none());
 }
