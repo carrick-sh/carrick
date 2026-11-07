@@ -3358,19 +3358,12 @@ impl HvfTaskState {
                 cow_armed.ranges.len(),
             )
         };
-        // Guest-owned MMs normally carry their fork arm in the EL1-private
-        // descriptor itself.  Carrick's image and initial stack are older
-        // host-published mappings, though: they deliberately have no EL1
-        // private tags, and their fork arm remains in the backend range set.
-        // A vfork return can be the first write to one of those leaves after a
-        // copied child has armed it.  Keep the live descriptor as the first
-        // authority, then fall back to the retained host arm for exactly that
-        // untagged mapping instead of misclassifying the permission fault as a
-        // guest SIGSEGV.
+        // Owner COW requires the live fork marker and recorded current
+        // write intent. Retained host candidates still bound backing work,
+        // but never substitute for a later per-page permission restriction.
         let span = if guest_lane {
             self.guest_private_cow_span(fault_va)
                 .or_else(|| host_candidate.map(|candidate| self.live_cow_span(candidate, fault_va)))
-                .or_else(|| self.guest_host_published_cow_span(custody, fault_va))
         } else {
             host_candidate.map(|candidate| self.live_cow_span(candidate, fault_va))
         };
@@ -7448,54 +7441,6 @@ impl HvfTaskState {
             .flatten()
     }
 
-    /// Recover the page-sized fork arm of an older host-published user leaf.
-    ///
-    /// Image and initial-stack leaves predate EL1-private descriptor tags. In
-    /// a guest-owned MM their Linux permission still comes from the semantic
-    /// mapping. A valid plain AP_RO leaf over a writable private mapping is
-    /// therefore a fork arm, while an actually read-only VMA is excluded by
-    /// `guest_writable == false`.
-    fn guest_host_published_cow_span(
-        &self,
-        custody: &CarrierVmCustody,
-        va: u64,
-    ) -> Option<CowArmedSpan> {
-        use carrick_mmu_core::aarch64::{
-            terminal_descriptor, terminal_descriptor_has_el1_private_authority,
-        };
-        const PAGE: u64 = CowArmedRanges::PAGE_SIZE;
-        const VALID_PAGE: u64 = 0b11;
-        const AP_MASK: u64 = 0b11 << 6;
-        const AP_USER_RO: u64 = 0b11 << 6;
-        const NON_GLOBAL: u64 = 1 << 11;
-        const UXN: u64 = 1 << 54;
-
-        let page = align_down(va, PAGE);
-        // Mapping rows may be semantic fragments inside this physical page;
-        // the faulting byte is the authority we need, not coverage of all
-        // neighboring bytes in the 4 KiB COW allocation unit.
-        let mapping = self.mapping_for_range_in(custody, va, 1)?;
-        if !mapping.guest_writable || mapping.sharing != GuestMappingSharing::Private {
-            return None;
-        }
-        self.page_tables_authority()
-            .with_manager(|manager| {
-                let leaf = terminal_descriptor(manager.debug_walk(page));
-                (leaf & VALID_PAGE == VALID_PAGE
-                    && leaf & AP_MASK == AP_USER_RO
-                    && leaf & NON_GLOBAL != 0
-                    && !terminal_descriptor_has_el1_private_authority(leaf)
-                    && manager.translate(page).is_some())
-                .then_some(CowArmedSpan {
-                    va: page,
-                    len: PAGE as usize,
-                    executable: leaf & UXN == 0,
-                    kernel_only: false,
-                })
-            })
-            .flatten()
-    }
-
     fn frame_cow_page_writable(
         &self,
         va: u64,
@@ -7512,10 +7457,14 @@ impl HvfTaskState {
                     ) {
                         carrick_mmu_core::aarch64::terminal_descriptor_may_write(leaf)
                     } else {
-                        // Host-published image/stack leaves have no EL1
-                        // permission tags.  Their semantic mapping is the
-                        // write authority; AP_RO is the fork arm itself.
-                        source_guest_writable
+                        // Untagged leaves carry no fork write intent. Their
+                        // live AP permission is authoritative, including a
+                        // later owner mprotect. Fork adopts writable host
+                        // leaves explicitly before lowering AP.
+                        carrick_mmu_core::aarch64::terminal_descriptor_permits_el0(
+                            leaf,
+                            carrick_mmu_core::aarch64::LeafAccess::Write,
+                        )
                     }
                 })
             })
