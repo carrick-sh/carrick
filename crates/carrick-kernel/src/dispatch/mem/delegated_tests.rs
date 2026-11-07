@@ -7118,3 +7118,55 @@ fn delegated_frame_grant_stock_probe_retains_busy_instead_of_losing_stock() {
             .unwrap()
     );
 }
+
+/// A free Linux hint outside the arena must remain an owner reservation,
+/// rather than becoming an opaque host alias or moving into the arena.
+#[test]
+fn delegated_outside_hint_keeps_owner_protection() {
+    const HINT: u64 = 0x7000000000;
+    const LENGTH: u64 = 256 * 1024 * 1024;
+    for hint in [0, HINT] {
+        let mut dispatcher = SyscallDispatcher::new();
+        let _root = Root::admit(&dispatcher);
+        let mut memory = CountingMmapMemory::new(HINT, PAGE as usize);
+        memory.defer_anon = true;
+        let mapped = returned(host_mmap(
+            &mut dispatcher,
+            &mut memory,
+            hint,
+            LENGTH,
+            0,
+            LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+            -1,
+        )) as u64;
+        if hint != 0 {
+            assert_eq!(mapped, hint, "free hint must be honoured");
+        }
+        memory.owner_protect_log.borrow_mut().clear();
+        memory.protect_log.borrow_mut().clear();
+        for prot in [1, 3, 7] {
+            assert_eq!(
+                returned(call(
+                    &mut dispatcher,
+                    &mut memory,
+                    SYS_MPROTECT,
+                    [mapped, PAGE, prot, 0, 0, 0]
+                )),
+                0
+            );
+        }
+        assert_eq!(
+            *memory.owner_protect_log.borrow(),
+            vec![
+                (mapped, PAGE as usize, 1),
+                (mapped, PAGE as usize, 3),
+                (mapped, PAGE as usize, 7)
+            ]
+        );
+        assert!(
+            memory.protect_log.borrow().is_empty(),
+            "owner mapping entered legacy protection"
+        );
+        assert_eq!(memory.zero_backing_calls.get(), 0, "reservation stays lazy");
+    }
+}
