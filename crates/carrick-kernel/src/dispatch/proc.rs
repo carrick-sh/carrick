@@ -8886,6 +8886,49 @@ mod copyout_refusal_s3_tests {
     }
 
     #[test]
+    fn getrandom_flags_use_linux_unsigned_int_width() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        for high in [1u64 << 32, 1u64 << 63, u64::from(u32::MAX) << 32] {
+            for low in [0, 1, 2, 3, 4, 5, 6, 7, 8] {
+                for length in [0, 8] {
+                    let mut memory = OwnerRefusingMemory::new(BASE, 16, FILL);
+                    let expected = if low >= 6 {
+                        DispatchOutcome::errno(LINUX_EINVAL)
+                    } else {
+                        DispatchOutcome::Returned {
+                            value: length as i64,
+                        }
+                    };
+                    assert_eq!(
+                        dispatcher
+                            .dispatch(
+                                &context,
+                                SyscallRequest::new(
+                                    nr::GETRANDOM.raw(),
+                                    SyscallArgs::from([BASE, length, high | low, 0, 0, 0]),
+                                ),
+                                &mut memory,
+                                &CompatReporter::default(),
+                            )
+                            .unwrap(),
+                        expected,
+                        "flags={:#x} length={length}",
+                        high | low,
+                    );
+                    assert_eq!(
+                        memory.prepares,
+                        usize::from(low < 6 && length != 0),
+                        "flags={:#x} length={length}",
+                        high | low,
+                    );
+                    assert_eq!(memory.read_bytes(BASE + 8, 8).unwrap(), [FILL; 8]);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn getrandom_rejects_conflicting_sources_before_output_preparation() {
         let mut dispatcher = SyscallDispatcher::new();
         let context = dispatcher.capture_one_task_context().unwrap();

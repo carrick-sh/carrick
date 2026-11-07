@@ -13,6 +13,7 @@ vm_free = [
   "carrick-el1-linux::aarch64_process_tests::arm_native_fork_child_getrandom_default_returns_eight_bytes",
   "carrick-el1-linux::aarch64_process_tests::arm_native_fork_child_getrandom_nonblock_returns_eight_bytes",
   "carrick-kernel::dispatch::proc::copyout_refusal_s3_tests::getrandom_rejects_conflicting_sources_before_output_preparation",
+  "carrick-kernel::dispatch::proc::copyout_refusal_s3_tests::getrandom_flags_use_linux_unsigned_int_width",
   "carrick-kernel::dispatch::proc::copyout_refusal_s3_tests::getrandom_source_failure_preserves_uncommitted_destination",
   "carrick-kernel::dispatch::proc::copyout_refusal_s3_tests::getrandom_later_source_failure_returns_only_committed_prefix",
 ]
