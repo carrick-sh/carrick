@@ -717,20 +717,18 @@ where
         let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
             RuntimeError::Configuration("zone park lost its Kernel context".to_owned())
         })?;
-        let identity = ThreadIdentity {
+        let mut identity = ThreadIdentity {
             tid: carrick_el1_abi::El1TaskId::from_linux_tid(self.state.linux_tid.raw()).raw(),
             serial: context.thread().key().serial.raw(),
             mm,
             file_table: context.resources().files().id().raw(),
-            generation: control
-                .current_submission_key()
-                .map(|(_, generation)| generation.raw())
-                .unwrap_or(0),
+            generation: control.execution_lease_mut()?.generation().raw(),
             affinity_source: context.thread().control_slot().affinity_source(),
             affinity: context.thread().affinity().words()[0],
             lifecycle_page: 0,
             control_slot: 0,
         };
+        control.bind_parked_lifecycle(&mut identity)?;
         let parked = {
             let Some(guard) =
                 zone.lock(ZoneTables::bucket_of_with_context(mm, uaddr), &HostLockWait)
@@ -920,20 +918,18 @@ where
         let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
             RuntimeError::Configuration("owner wait lost its Kernel context".to_owned())
         })?;
-        let identity = ThreadIdentity {
+        let mut identity = ThreadIdentity {
             tid: carrick_el1_abi::El1TaskId::from_linux_tid(self.state.linux_tid.raw()).raw(),
             serial: context.thread().key().serial.raw(),
             mm,
             file_table: context.resources().files().id().raw(),
-            generation: control
-                .current_submission_key()
-                .map(|(_, generation)| generation.raw())
-                .unwrap_or(0),
+            generation: control.execution_lease_mut()?.generation().raw(),
             affinity_source: context.thread().control_slot().affinity_source(),
             affinity: context.thread().affinity().words()[0],
             lifecycle_page: 0,
             control_slot: 0,
         };
+        control.bind_parked_lifecycle(&mut identity)?;
         let enrollment = match slots.authenticate_wait(zone, wait) {
             Ok(enrollment) => enrollment,
             Err(ObjectWaitError::Stale) if matches!(action, OwnerMemoryAction::Fault) => {
@@ -1715,20 +1711,18 @@ where
             .dispatcher
             .capture_kernel_context(self.state.linux_tid)
             .map_err(|error| ipc_error("park context", error))?;
-        let identity = ThreadIdentity {
+        let mut identity = ThreadIdentity {
             tid: carrick_el1_abi::El1TaskId::from_linux_tid(self.state.linux_tid.raw()).raw(),
             serial: context.thread().key().serial.raw(),
             mm,
             file_table: context.resources().files().id().raw(),
-            generation: control
-                .current_submission_key()
-                .map(|(_, generation)| generation.raw())
-                .unwrap_or(0),
+            generation: control.execution_lease_mut()?.generation().raw(),
             affinity_source: context.thread().control_slot().affinity_source(),
             affinity: context.thread().affinity().words()[0],
             lifecycle_page: 0,
             control_slot: 0,
         };
+        control.bind_parked_lifecycle(&mut identity)?;
         let state = engine.snapshot_guest_state_for_publication()?;
         // Resume at the SVC with the original call's registers.
         let mut ctx = zone_ctx_from_state(&state, exit)?;

@@ -3749,6 +3749,95 @@ fn el1_metadata_allocator_grows_and_returns_extents() {
     );
 }
 
+/// Observe the real host publication while all allocator participants live.
+/// A successor must be able to rehome without the old activation blocking it.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn el1_first_entry_retires_before_host_publication() {
+    use carrick_kernel::el1_zone::first_entry_test_control::{self, Event};
+    let _guard = common::guest_lock();
+    let observed = std::sync::Arc::new(std::sync::Mutex::new((0, Vec::new(), Vec::new())));
+    let observations = observed.clone();
+    let _subscription = first_entry_test_control::subscribe(std::sync::Arc::new(move |event| {
+        let mut observed = observations.lock().unwrap();
+        if let Event::ExecutorTaken(record) = event {
+            let key = carrick_kernel::el1_zone::thread_key_of(record).unwrap();
+            observed.2.push((key, record));
+        }
+        if let Event::BeforePublish(key) = event {
+            let record = observed
+                .2
+                .iter()
+                .rev()
+                .find_map(|(candidate, record)| (*candidate == key).then_some(*record));
+            observed.0 += 1;
+            let claim = record.and_then(|record| {
+                carrick_el1_abi::zone_tables()
+                    .unwrap()
+                    .live(record)
+                    .map(|rec| rec.claim())
+            });
+            if claim.is_some() || record.is_none() {
+                observed.1.push((record, claim));
+            }
+        }
+    }));
+    let carrier = carrier_or_fail();
+    let measured = run_fixture(
+        &carrier,
+        &["metadata-allocator", "concurrent"],
+        Duration::from_secs(30),
+    );
+    let observed = observed.lock().unwrap();
+    assert!(
+        observed.0 > 0,
+        "must reach real host first-entry publication"
+    );
+    assert!(
+        observed.1.is_empty(),
+        "runnable publication preceded old first-entry retirement: {:?}",
+        observed.1
+    );
+    assert!(measured.result.success(), "{}", describe(&measured));
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Default)]
+struct MetadataDelayProgress {
+    owner: bool,
+    parked: u32,
+    boundaries: u32,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MetadataDelayProgress {
+    fn observe(
+        &mut self,
+        event: carrick_vmm_hvf::metadata_grant::MetadataDelayObservation,
+    ) -> bool {
+        use carrick_vmm_hvf::metadata_grant::MetadataDelayObservation;
+        match event {
+            MetadataDelayObservation::OwnerClaimed => self.owner = true,
+            MetadataDelayObservation::Contended { parked } => {
+                self.parked = self.parked.max(parked);
+                self.boundaries += 1;
+            }
+        }
+        self.owner && self.parked >= 3
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn metadata_delay_observer_waits_for_owner_after_contenders() {
+    use carrick_vmm_hvf::metadata_grant::MetadataDelayObservation;
+    let mut progress = MetadataDelayProgress::default();
+    assert!(!progress.observe(MetadataDelayObservation::Contended { parked: 3 }));
+    assert!(progress.observe(MetadataDelayObservation::OwnerClaimed));
+    assert!(progress.owner);
+    assert_eq!(progress.parked, 3);
+}
+
 /// Hold the actual host owner before mapping backing. Other allocator users
 /// must park exact records, rather than spending their 258-attempt budget.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3762,29 +3851,22 @@ fn el1_metadata_allocator_delayed_owner_parks_participants() {
     // metadata requests that can occur before the four workers exist.
     let probe = carrick_vmm_hvf::metadata_grant::arm_delayed_metadata_request(10 * 1024 * 1024);
     let monitor = std::thread::spawn(move || {
-        use carrick_vmm_hvf::metadata_grant::MetadataDelayObservation;
-        let mut owner = false;
-        let mut parked = 0;
-        let mut boundaries = 0;
+        let mut progress = MetadataDelayProgress::default();
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         loop {
             let observation = probe
                 .events
-                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
-            match observation.unwrap_or_else(|error| panic!("delayed metadata owner observation: {error}; owner={owner} parked={parked} boundaries={boundaries}")) {
-                MetadataDelayObservation::OwnerClaimed => owner = true,
-                MetadataDelayObservation::Contended { parked: count } => {
-                    parked = parked.max(count);
-                    boundaries += 1;
-                    if parked >= 3 {
-                        break;
-                    }
-                }
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .unwrap_or_else(|error| {
+                    panic!("delayed metadata owner observation: {error}; {progress:?}")
+                });
+            if progress.observe(observation) {
+                break;
             }
         }
         // Drop releases the owner before the test evaluates either verdict.
         drop(probe);
-        (owner, parked, boundaries)
+        (progress.owner, progress.parked, progress.boundaries)
     });
     let measured = run_fixture(
         &carrier,

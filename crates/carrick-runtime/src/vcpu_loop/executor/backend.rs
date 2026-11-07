@@ -1423,6 +1423,10 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 .quantum(),
         );
         let mut control = HvpatchQuantumControl {
+            lifecycle_aliases: self
+                .lifecycle_mappings
+                .as_deref()
+                .map(|m| m as &dyn super::binding::RetainedLifecycleAliases),
             need_resched,
             submission,
             binding: Some(

@@ -371,8 +371,10 @@ where
         context: &KernelContext,
         reservation: ThreadBirthAdoptionReservation,
         frame: &carrick_el1_abi::ThreadCtx,
+        before_publish: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<(), String> {
-        activate_born_thread::<E>(context, reservation, frame).map_err(|error| error.to_string())
+        activate_born_thread::<E>(context, reservation, frame, before_publish)
+            .map_err(|error| error.to_string())
     }
 
     fn owner(&self) -> TaskKey {
@@ -634,13 +636,14 @@ fn activate_born_thread<E: ThreadedEngine + 'static>(
     context: &KernelContext,
     reservation: ThreadBirthAdoptionReservation,
     frame: &carrick_el1_abi::ThreadCtx,
+    before_publish: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<(), TrapError>
 where
     E::SiblingSpec: 'static,
 {
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     {
-        let _ = (context, reservation, frame);
+        let _ = (context, reservation, frame, before_publish);
         Err(TrapError::Hypervisor(
             "born adoption requires HVPatch hardware backend".into(),
         ))
@@ -652,7 +655,9 @@ where
             // The caller frees this exact stopped zone record. The kernel's
             // terminal owner retires its row; no runtime registry/job may appear
             // after that owner's member census has closed.
-            Err(ThreadRuntimeAdoptionError::TerminalOwner) => return Ok(()),
+            Err(ThreadRuntimeAdoptionError::TerminalOwner) => {
+                return before_publish().map_err(TrapError::Hypervisor);
+            }
             Err(ThreadRuntimeAdoptionError::Trap(error)) => return Err(error),
         };
         let birth_admission = adopted.birth_admission.take();
@@ -719,11 +724,16 @@ where
             .take_opened_start_gate(generation)
             .ok_or_else(|| TrapError::Hypervisor("born adoption lost start proof".into()))?;
         logical.install_start_gate(gate)?;
-        let result = dormant.activate(
-            &scheduler,
-            context.thread().clone(),
-            logical.activation_proof()?,
+        let proof = logical.activation_proof()?;
+        // Retire the stopped birth before runnable publication permits rehome.
+        before_publish().map_err(TrapError::Hypervisor)?;
+        #[cfg(any(test, feature = "test-support"))]
+        carrick_kernel::el1_zone::first_entry_test_control::emit(
+            carrick_kernel::el1_zone::first_entry_test_control::Event::BeforePublish(
+                context.thread().key(),
+            ),
         );
+        let result = dormant.activate(&scheduler, context.thread().clone(), proof);
         // Registration, member enrollment and submission are all inside admission.
         drop(birth_admission);
         result

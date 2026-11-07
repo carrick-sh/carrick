@@ -210,6 +210,32 @@ impl CarrierLifecycleMappings {
     }
 }
 
+impl super::executor::RetainedLifecycleAliases for CarrierLifecycleMappings {
+    fn aliases(&self, control: &ThreadControlLease) -> Option<(GuestVa, GuestVa)> {
+        let state = self.state.lock();
+        let lifecycle = control.lifecycle();
+        let retained = state
+            .threads
+            .get(&(lifecycle.page_address().raw(), control.identity().1))?;
+        if retained.slot_address() != control.slot_address() || retained.graph_unregister_receipt()
+        {
+            return None;
+        }
+        let page = state.pages.get(&lifecycle.backing_base().raw())?;
+        let slot = state.pages.get(&control.backing_base().raw())?;
+        Some((
+            GuestVa::new(
+                page.guest_base.raw()
+                    + (lifecycle.page_address().raw() - lifecycle.backing_base().raw()) as u64,
+            ),
+            GuestVa::new(
+                slot.guest_base.raw()
+                    + (control.slot_address().raw() - control.backing_base().raw()) as u64,
+            ),
+        ))
+    }
+}
+
 impl Drop for CarrierLifecycleMappings {
     fn drop(&mut self) {
         // The final owner is the factory/last executor: all executor vCPUs

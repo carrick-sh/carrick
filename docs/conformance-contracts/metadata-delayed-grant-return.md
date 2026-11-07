@@ -66,3 +66,19 @@ attributes a real capacity-reclamation regression to the eager-return
 correction; it does not establish that every NEW signed failure shares it.
 The original historical attribution and two consecutive main signed passes
 remain director-owned acceptance work.
+
+The runtime host-park correction preserves the published lifecycle authority
+when constructing futex, owner-memory and IPC records. The quantum borrows
+its carrier's retained mapping owner and authenticates the complete parked
+execution against its execution lease before resolving the exact control's
+aliases. It never copies another slot's CurrentTask. The carrier keeps the
+backing mappings through the lifetime of all its records. Lookup performs no
+allocation, mapping, polling or wait and leaves allocator budgets unchanged.
+
+The VM-free production owner-wait fixture checks the aliases before releasing
+the editor that prevented completion. Its test-only provider retains the
+real control backing at direct aliases; the host park, record allocation,
+queue admission, continuation, release and reload are production operations.
+This isolates alias loss at the host-park producer. It does not prove HVF
+stage-2 publication, first-publication refusal handling, or the signed test's
+pass population. Those remain separate from this deterministic reduction.
