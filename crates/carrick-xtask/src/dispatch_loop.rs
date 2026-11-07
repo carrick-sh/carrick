@@ -2157,6 +2157,9 @@ impl Server<'_> {
         };
         let mut applied = Applied::load()?;
         applied.review_claimed |= self.history.iter().any(Contract::review_claimed);
+        if review_result.as_ref().is_some_and(Result::is_err) {
+            applied.review = false;
+        }
         if applied.review && review_result.is_none() {
             let work = crate::agent_runner::state()?.join("work");
             let live = super::live_branch_tip(&work, &self.dispatch.branch).ok();
@@ -5053,6 +5056,12 @@ mod tests {
             current_pr(root);
             let mut s = server(root);
             s.dispatch.round_kind = RoundKind::Review { pr: 800 };
+            std::fs::create_dir_all(crate::agent_runner::state().unwrap()).unwrap();
+            Applied::record(|a| {
+                a.review = true;
+                a.review_head = Some("b".repeat(40));
+            })
+            .unwrap();
             for reviews in [
                 json!([[]]),
                 json!([[{
@@ -5067,6 +5076,11 @@ mod tests {
                 let posted = regular_text(&root.join("posted.md")).unwrap();
                 assert!(posted.contains("Dispatch outcome: Failed"), "{posted}");
                 assert!(posted.contains("no verdict published"), "{posted}");
+                let contract: Value = serde_json::from_str(
+                    &regular_text(&root.join("dispatch-output/contract.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(contract["review"], false, "stale review evidence survived");
             }
         });
     }
