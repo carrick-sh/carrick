@@ -7,10 +7,11 @@
 //! `reply` and `request_round`, are the only effects, each checked by
 //! [`super::enforce`] under the same gates as the poll loop.
 use super::{
-    Act, AdoptionRead, Class, Decision, Effect, Gate, Github, Live, MARKER, QUIET_SECS, REPOSITORY,
-    ScalerError, UNATTENDED_ROUNDS, adopted_pr, adoption_facts, classify, clip, director_pr,
-    enforce, gather, iso, limit_warnings, lookback, outcome_bot, owned_pr, parse_iso,
-    trusted_owner, trusted_pr,
+    Act, AdoptionRead, CommentView, Decision, Effect, Gate, Github, Live, MARKER, QUIET_SECS,
+    REPOSITORY, ReviewVerdict, RoundKind, ScalerError, UNATTENDED_ROUNDS, adopted_pr,
+    adoption_facts, classify, clip, director_pr, ecosystem_wait_reason, enforce, gather,
+    is_review_brief, is_signed_scoreboard_text, iso, limit_warnings, lookback, outcome_bot,
+    owned_pr, parse_iso, parse_outcomes, select_reviewer_tier, trusted_owner, trusted_pr,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -287,7 +288,7 @@ pub(super) fn feed_cycle(
             }
         }
         if director {
-            let (_, count) = adoption_facts(gh, pr)?;
+            let (_, count, _) = adoption_facts(gh, pr)?;
             if count != Some(1) && !memory.closes_flagged {
                 memory.closes_flagged = true;
                 out.push(line(
@@ -431,6 +432,8 @@ struct RoundMemory {
     last_reply_at: Option<String>,
     #[serde(default)]
     waiting_on: Option<String>,
+    #[serde(default)]
+    last_continued_outcome: Option<String>,
 }
 
 pub(super) struct Server<'a> {
@@ -724,7 +727,12 @@ impl Server<'_> {
                     .list(&format!("repos/{REPOSITORY}/issues/{n}/comments?per_page=100"))
                     .map_err(fail)?
                     .into_iter()
-                    .filter(|c| classify(&c["user"], c["body"].as_str().unwrap_or_default()) == Some(Class { trigger: true, human: false }))
+                    .filter(|c| {
+                        let body = c["body"].as_str().unwrap_or_default();
+                        outcome_bot(&c["user"])
+                            && body.contains("Dispatch outcome")
+                            && !body.contains(MARKER)
+                    })
                     .map(|c| json!({"at":c["created_at"],"url":c["html_url"],"body":c["body"].as_str().unwrap_or_default().chars().take(4000).collect::<String>()}))
                     .collect();
                 let skip = outcomes.len().saturating_sub(10);
@@ -798,6 +806,7 @@ impl Server<'_> {
         let head = pr["head"]["sha"].as_str().unwrap_or_default().to_owned();
         let mut state: ToolState = load(&self.state).map_err(fail)?;
         let mut human_reset = false;
+        let mut continued_outcome: Option<String> = None;
         let (decision, gate) = if name == "reply" {
             let decision = Decision {
                 action: Act::Reply,
@@ -834,6 +843,12 @@ impl Server<'_> {
                     "repos/{REPOSITORY}/issues/{n}/comments?per_page=100"
                 ))
                 .map_err(fail)?;
+            let reviews = self
+                .remote
+                .list(&format!(
+                    "repos/{REPOSITORY}/pulls/{n}/reviews?per_page=100"
+                ))
+                .map_err(fail)?;
             if let Some(blocker) = super::repeated_blocker(
                 comments
                     .iter()
@@ -854,7 +869,92 @@ impl Server<'_> {
                 }
                 return Err(format!("waiting on {blocker}; repeated external blocker"));
             }
+            let comment_views: Vec<CommentView<'_>> = comments
+                .iter()
+                .map(|c| CommentView {
+                    url: c["html_url"]
+                        .as_str()
+                        .or_else(|| c["url"].as_str())
+                        .unwrap_or_default(),
+                    user: &c["user"],
+                    body: c["body"].as_str().unwrap_or_default(),
+                })
+                .collect();
+            let outcomes = parse_outcomes(&comment_views, &reviews);
+            let review_requested = is_review_brief(&decision.text);
+            if review_requested
+                || outcomes.last().is_some_and(|o| {
+                    o.kind == RoundKind::Implementation && o.status.eq_ignore_ascii_case("done")
+                })
+            {
+                if let Some(last) = outcomes.last() {
+                    let cap = self.remote.capacity();
+                    let _ = select_reviewer_tier(
+                        last.author_tier
+                            .unwrap_or(super::super::worker_tier::WorkerTier::Strong),
+                        &last.author_backends,
+                        cap.as_ref(),
+                    );
+                }
+                if let Some(wait) = ecosystem_wait_reason(
+                    &pr,
+                    n,
+                    &head,
+                    &[],
+                    outcomes.last().and_then(|o| o.issue),
+                    &comment_views,
+                    &mut |r| self.remote.adoption(r),
+                )
+                .map_err(fail)?
+                {
+                    state.prs.entry(n).or_default().waiting_on = Some(wait.clone());
+                    if !self.dry_run {
+                        save(&self.state, &state).map_err(fail)?;
+                    }
+                    return Err(format!("waiting on {wait}"));
+                }
+            }
+            let had_wait = state.prs.get(&n).is_some_and(|m| m.waiting_on.is_some());
             state.prs.entry(n).or_default().waiting_on = None;
+            if had_wait && !self.dry_run {
+                save(&self.state, &state).map_err(fail)?;
+            }
+            let mut post_review_fix = false;
+            if let Some(last) = outcomes.last() {
+                continued_outcome = Some(last.key.clone());
+                let after = &comment_views[last.index + 1..];
+                let round_triggered_after = after
+                    .iter()
+                    .any(|c| trusted_owner(c.user) && c.body.trim_start().starts_with("/agent"));
+                let owner_chat_after = after.iter().any(|c| {
+                    trusted_owner(c.user)
+                        && !c.body.contains(MARKER)
+                        && !c.body.trim_start().starts_with("/agent")
+                        && !is_signed_scoreboard_text(c.body)
+                });
+                if last.status.eq_ignore_ascii_case("done") && !owner_chat_after {
+                    if last.kind == RoundKind::Review
+                        && last.verdict == Some(ReviewVerdict::Approved)
+                    {
+                        return Err(
+                            "refused: independent review round already ended Done on this head"
+                                .into(),
+                        );
+                    }
+                    if last.kind == RoundKind::Review
+                        && last.verdict == Some(ReviewVerdict::ChangesRequested)
+                        && !round_triggered_after
+                        && !review_requested
+                        && state
+                            .prs
+                            .get(&n)
+                            .and_then(|m| m.last_continued_outcome.as_deref())
+                            != Some(last.key.as_str())
+                    {
+                        post_review_fix = true;
+                    }
+                }
+            }
             let (owned, adoptable) = eligible(self.remote, &pr).map_err(fail)?;
             let active: Vec<Value> = self
                 .remote
@@ -873,6 +973,7 @@ impl Server<'_> {
                 None => true,
             };
             let repeat_round = !owner_spoke
+                && !post_review_fix
                 && memory.and_then(|m| m.last_round_head.as_deref()) == Some(head.as_str());
             let unattended =
                 !owner_spoke && memory.is_some_and(|m| m.unattended >= UNATTENDED_ROUNDS);
@@ -920,6 +1021,9 @@ impl Server<'_> {
                     };
                     memory.last_round_head = Some(head);
                     memory.last_round_at = Some(iso(self.now));
+                    if let Some(key) = continued_outcome {
+                        memory.last_continued_outcome = Some(key);
+                    }
                     save(&self.state, &state).map_err(fail)?;
                 }
                 Ok(format!("posted on #{n}"))
@@ -2451,7 +2555,10 @@ mod tests {
             "request_round",
             json!({"pr": 1781, "brief": "Independent review again (review only; push nothing)."}),
         );
-        assert!(err, "approved review Done must refuse another review: {text}");
+        assert!(
+            err,
+            "approved review Done must refuse another review: {text}"
+        );
 
         // Chain: Review 1 (H1) -> Fix 2 (H1) -> Review 3 (H2) -> Fix 4 refused by UNATTENDED_ROUNDS.
         let mut chain_remote = remote();
