@@ -35,3 +35,5 @@ perform zero case probes there, an internal case-sensitive one to win, and
 a case-insensitive home to fall through to temporary storage. Volume metadata
 and the case probe share the same deadline. Native macOS volume-property
 classification still requires a live check on the signed host.
+Rebase onto admitted main 94d569b59 preserves the full commit history and
+re-proves all contract surfaces, cross-platform checks, and crate test suites.
