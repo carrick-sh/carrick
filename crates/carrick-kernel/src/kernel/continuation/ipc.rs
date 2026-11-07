@@ -198,16 +198,14 @@ pub fn host_window_backing(
 /// Bind the current production file table before returning to the guest.
 /// Missing windows and bounded admission refusals retain host service. Never
 /// publish a different kernel's descriptor IDs into the carrier's mapping.
-pub fn publish_file_table(context: &crate::kernel::KernelContext) {
+/// `region` must be borrowed from the retained installed carrier window.
+pub fn publish_file_table(context: &crate::kernel::KernelContext, region: &IpcRegion<'_>) {
     let Some(map) = carrick_el1_abi::ipc_table_map_host() else {
         return;
     };
     if !map.window_published() {
         return;
     }
-    let Some(region) = published_window_region() else {
-        return;
-    };
     let Some(owner) = context.kernel().existing_ipc() else {
         return;
     };
@@ -222,13 +220,6 @@ pub fn publish_file_table(context: &crate::kernel::KernelContext) {
 /// container's authority or silently leave this kernel's subscribers asleep.
 pub fn deliver_owed_host_wakes(kernel: &crate::kernel::Kernel) {
     kernel.deliver_ipc_host_wakes();
-}
-
-// Admission still authenticates the carrier's mapped window against the
-// candidate kernel. Completion instead borrows ZoneHostServices::region;
-// it must not select operation storage through this publication.
-fn published_window_region() -> Option<IpcRegion<'static>> {
-    carrick_el1_abi::ipc_window_host()?.attach().ok()
 }
 
 /// The wait-queue snapshots of both lanes of `object`, taken BEFORE its
