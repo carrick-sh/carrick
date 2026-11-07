@@ -476,42 +476,7 @@ pub fn vvar_realtime_word(base_realtime_ns: u64, offset_ns: i64) -> u64 {
     base_realtime_ns.wrapping_add(offset_ns as u64)
 }
 
-/// Time discipline state modeled for this clock domain per `struct timex`.
-///
-/// Deliberate approximations:
-/// - Frequency adjustments (`freq`, `tick`) are recorded and reported faithfully
-///   through `adjtimex` and `clock_adjtime`, but do not alter the virtual clock rate.
-/// - `maxerror` remains static between calls unless explicitly updated via `ADJ_MAXERROR`.
-/// - `ADJ_OFFSET_SINGLESHOT` is modeled as an immediate step applied to the domain's
-///   virtual realtime offset rather than an ongoing linear slew or PLL.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdjtimexState {
-    pub offset: i64,
-    pub freq: i64,
-    pub maxerror: i64,
-    pub esterror: i64,
-    pub status: i32,
-    pub constant: i64,
-    pub tick: i64,
-    pub tai: i32,
-    pub singleshot_offset: i64,
-}
-
-impl Default for AdjtimexState {
-    fn default() -> Self {
-        Self {
-            offset: 0,
-            freq: 0,
-            maxerror: 16_000_000,
-            esterror: 16_000_000,
-            status: 0,
-            constant: 2,
-            tick: 10_000,
-            tai: 0,
-            singleshot_offset: 0,
-        }
-    }
-}
+pub use carrick_time_core::AdjtimexState;
 
 /// The container's time authority. Supports standard system time tracking
 /// plus embedder-controlled modes (`Offset`, `Frozen`, `Scaled`, and
