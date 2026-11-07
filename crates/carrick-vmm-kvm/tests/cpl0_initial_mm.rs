@@ -129,6 +129,64 @@ const ELF_LOAD_VA: u64 = 0x400000;
 const X86_SYS_WRITE: u8 = 1;
 const X86_SYS_EXIT_GROUP: u8 = 231;
 
+// Runnable red witnesses: enabling these requires real child entropy service
+// transport, including completion through the CPL0 entry and host adapter.
+#[test]
+#[ignore = "#1338: native-child entropy transport is not implemented"]
+fn serial_host_native_child_getrandom_default_returns_eight_bytes() {
+    native_child_entropy_witness(
+        "serial_host_native_child_getrandom_default_returns_eight_bytes",
+        &[],
+    );
+}
+
+#[test]
+#[ignore = "#1338: native-child entropy transport is not implemented"]
+fn serial_host_native_child_getrandom_nonblock_returns_eight_bytes() {
+    native_child_entropy_witness(
+        "serial_host_native_child_getrandom_nonblock_returns_eight_bytes",
+        &["-DENTROPY_FLAGS=1"],
+    );
+}
+
+fn native_child_entropy_witness(test: &str, flags: &[&str]) {
+    // A parked guest need not consume the pool's exit budget. Bound the whole
+    // fixture in a separate test process so a lost child wake cannot hang CI.
+    // timeout owns that process group; KVM workers are threads in that process.
+    const CHILD: &str = "CARRICK_ENTROPY_WITNESS_CHILD";
+    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(test)) {
+        let output = std::process::Command::new("timeout")
+            .args(["--kill-after=1", "10"])
+            .arg(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                test,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, test)
+            .output()
+            .expect("bounded native entropy witness");
+        assert!(
+            output.status.success(),
+            "bounded child witness: {:?}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    let elf = native_exit_fixture_with_flags("native_child_entropy.S", flags);
+    let outcome = run_pool_fixture(&elf, 128);
+    assert_eq!(
+        outcome.run.exit_code, 8,
+        "child getrandom result (218 means ENOSYS)"
+    );
+    assert!(outcome.run.stdout.is_empty());
+    assert!(outcome.run.stderr.is_empty());
+}
+
 fn native_exit_fixture(name: &str) -> Vec<u8> {
     native_exit_fixture_with_flags(name, &[])
 }
