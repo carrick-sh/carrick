@@ -29,9 +29,17 @@ fn region() -> &'static IpcRegion<'static> {
     let pool =
         unsafe { std::alloc::alloc_zeroed(Layout::from_size_align(pool_len, 4096).unwrap()) };
     let identity = IDENTITY.fetch_add(1, Ordering::Relaxed);
-    let region =
-        unsafe { IpcRegion::initialize(dir, IPC_DIRECTORY_BYTES, pool, pool_len, identity) }
-            .unwrap();
+    let region = unsafe {
+        IpcRegion::initialize(
+            dir,
+            IPC_DIRECTORY_BYTES,
+            pool,
+            pool_len,
+            identity,
+            IpcLimits::ZONE,
+        )
+    }
+    .unwrap();
     Box::leak(Box::new(region))
 }
 

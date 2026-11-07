@@ -243,6 +243,7 @@ fn world() -> World {
             pool,
             pool_len,
             9,
+            carrick_el1_abi::ipc::IpcLimits::ZONE,
         )
     }
     .unwrap()

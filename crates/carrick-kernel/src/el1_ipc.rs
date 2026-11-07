@@ -110,24 +110,7 @@ impl Drop for Mapping {
     }
 }
 
-/// Zone-wide ceilings of the authority's elastic stores: the zone's file
-/// table limit (`fs.file-max`). Past them creation is ENFILE. Each store
-/// grows a whole segment at a time, so a ceiling is effective rounded down
-/// to its segment (never below the first segment, published at creation).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct IpcLimits {
-    /// Pipe and eventfd objects.
-    pub objects: usize,
-    /// Open file descriptions (pipe/eventfd ends and published host fds).
-    pub descriptions: usize,
-}
-impl IpcLimits {
-    /// The ABI's reservation: the largest zone the window can hold.
-    pub const ZONE: Self = Self {
-        objects: IPC_MAX_OBJECTS,
-        descriptions: IPC_MAX_OFDS,
-    };
-}
+pub use carrick_el1_abi::ipc::IpcLimits;
 
 /// Records the authority has published by growing its stores (never
 /// shrinks): the elastic-store work receipt.
@@ -474,6 +457,7 @@ impl HostIpc {
                 owner.pool_ptr(),
                 pool_bytes,
                 identity,
+                limits,
             )?;
         }
         Ok(owner)
@@ -494,14 +478,14 @@ impl HostIpc {
     /// configured ceiling. O(segment), under the growth lock only.
     fn grow_objects(&self, seen: usize) -> Result<(), AdmissionError> {
         let mut growth = self.growth.lock();
-        growth.object_records += self.region().grow_objects(seen, self.limits.objects)?;
+        growth.object_records += self.region().grow_objects(seen)?;
         Ok(())
     }
 
     /// As `grow_objects`, for the one shared OFD publication owner.
     fn grow_descriptions(&self, seen: usize) -> Result<(), AdmissionError> {
         let mut growth = self.growth.lock();
-        growth.description_records += self.region().grow_ofds(seen, self.limits.descriptions)?;
+        growth.description_records += self.region().grow_ofds(seen)?;
         Ok(())
     }
 

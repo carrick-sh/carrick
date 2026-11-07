@@ -584,3 +584,21 @@ not prove future expiry or blocking-reader/epoll wakeup correctness.
 This review adds no timer service, ABI record or crossing-policy change. The
 two native constructor failures remain acceptance blockers; this branch is
 not ready to land as a completed timerfd migration.
+
+## Configured zone ceilings
+
+The root and forked native child use the same immutable region ceilings.
+`IpcRegion::initialize` publishes object and description ceilings before the
+initialized header; growth callers supply only their observed population.
+As before, stores grow in whole segments and always publish the first
+segment. The directory clamps configuration to that first segment and the
+absolute maximum. Its layout facts include both configuration words, feeding
+`IPC_LAYOUT_HASH` and the computed `EL1_ABI_LAYOUT_HASH`.
+
+The production native-child `pipe2` witness exhausts a one-segment object
+ceiling through host admission while retaining its objects, then requires
+errno 23 (ENFILE), without allowing region growth. Before the fix, the child
+returned 0 instead of -23. The corresponding root constructor witness uses
+the same configured population and requires the same errno. Shared ABI tests
+exercise both object and description growth and a stale observation at the
+configured ceiling. These prove bounded admission, not signed execution.

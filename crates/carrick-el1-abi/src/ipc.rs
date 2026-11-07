@@ -459,7 +459,9 @@ pub struct IpcDirectory {
     object_count: AtomicU64,
     object_publication: fd::storage::PublicationLock,
     object_published: AtomicU64,
-    _reserved: [u64; 3],
+    object_ceiling: AtomicU64,
+    ofd_ceiling: AtomicU64,
+    _reserved: [u64; 1],
     fd: IpcFdCore,
     free_operations: AtomicU64,
     /// Ring stock: two tagged lock-free stacks over `ring_stock` slots, the
@@ -523,9 +525,30 @@ const _: () = assert!(
 );
 const _: () = assert!(IPC_OFDS_OFFSET.is_multiple_of(core::mem::align_of::<OfdRecord>()));
 
+/// Zone-wide ceilings of the authority's elastic stores: the zone's file
+/// table limit (`fs.file-max`). Past them creation is ENFILE. Each store
+/// grows a whole segment at a time, so a ceiling is effective rounded down
+/// to its segment (never below the first segment, published at creation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IpcLimits {
+    /// Pipe and eventfd objects.
+    pub objects: usize,
+    /// Open file descriptions (pipe/eventfd ends and published host fds).
+    pub descriptions: usize,
+}
+impl IpcLimits {
+    /// The ABI's reservation: the largest zone the window can hold.
+    pub const ZONE: Self = Self {
+        objects: IPC_MAX_OBJECTS,
+        descriptions: IPC_MAX_OFDS,
+    };
+}
+
 /// Layout facts of this ABI; see [`IPC_LAYOUT_HASH`].
 const LAYOUT_FACTS: &[u64] = &[
     IPC_MAGIC,
+    core::mem::offset_of!(IpcDirectory, object_ceiling) as u64,
+    core::mem::offset_of!(IpcDirectory, ofd_ceiling) as u64,
     core::mem::offset_of!(IpcDirectory, object_published) as u64,
     core::mem::offset_of!(IpcDirectory, object_publication) as u64,
     IPC_FD_TABLES as u64,
@@ -973,6 +996,7 @@ impl<'a> IpcRegion<'a> {
         pool: *mut u8,
         pool_len: usize,
         identity: u64,
+        limits: IpcLimits,
     ) -> Result<Self, IpcError> {
         Self::checked(dir, dir_len, pool)?;
         // SAFETY: caller contract; all-zero is a valid IpcDirectory.
@@ -980,6 +1004,16 @@ impl<'a> IpcRegion<'a> {
         if d.header.state.load(Ordering::Acquire) != 0 {
             return Err(IpcError::BadRegion);
         }
+        // Written once before publishing the initialized header. Growth in
+        // every execution venue reads these same immutable configuration words.
+        d.object_ceiling.store(
+            limits.objects.clamp(IPC_OBJECT_SEGMENT, IPC_MAX_OBJECTS) as u64,
+            Ordering::Relaxed,
+        );
+        d.ofd_ceiling.store(
+            limits.descriptions.clamp(IPC_OFD_SEGMENT, IPC_MAX_OFDS) as u64,
+            Ordering::Relaxed,
+        );
         d.fd.initialize(identity).map_err(IpcError::Fd)?;
         let region = Self {
             dir: d,
@@ -998,8 +1032,8 @@ impl<'a> IpcRegion<'a> {
             .pipe_storage()
             .initialize(pool_len as u64 / IPC_POOL_AREAS)
             .map_err(|_| IpcError::BadRegion)?;
-        region.grow_ofds(0, IPC_MAX_OFDS)?;
-        region.grow_objects(0, IPC_MAX_OBJECTS)?;
+        region.grow_ofds(0)?;
+        region.grow_objects(0)?;
         for i in (0..IPC_RING_STOCK).rev() {
             push(&d.ring_stock_empty, i, &d.ring_stock[i].next_free);
         }
@@ -1420,7 +1454,7 @@ impl<'a> IpcRegion<'a> {
     /// a shared short publication lock, outside table/object locks.
     /// Observers read the completed count only after every free-list push.
     /// Returns the records added: O(segment) work, once per segment.
-    pub fn grow_objects(&self, seen: usize, limit: usize) -> Result<usize, IpcError> {
+    pub fn grow_objects(&self, seen: usize) -> Result<usize, IpcError> {
         let _guard = self
             .dir
             .object_publication
@@ -1431,7 +1465,7 @@ impl<'a> IpcRegion<'a> {
             return Ok(0);
         }
         let end = first + IPC_OBJECT_SEGMENT as u64;
-        if end > limit.min(IPC_MAX_OBJECTS) as u64 {
+        if end > self.dir.object_ceiling.load(Ordering::Relaxed) {
             return Err(IpcError::ZoneLimit);
         }
         self.dir.object_count.store(end, Ordering::Release);
@@ -1445,12 +1479,16 @@ impl<'a> IpcRegion<'a> {
         Ok(IPC_OBJECT_SEGMENT)
     }
 
-    /// Shared OFD growth, bounded by this venue's configured ceiling.
-    pub fn grow_ofds(&self, seen: usize, limit: usize) -> Result<usize, IpcError> {
+    /// Shared OFD growth, bounded by the region's immutable zone ceiling.
+    pub fn grow_ofds(&self, seen: usize) -> Result<usize, IpcError> {
         self.dir
             .fd
             .bind(self, carrick_sched_core::ShortLockSpin)
-            .grow_ofds(seen, IPC_OFD_SEGMENT, limit.min(IPC_MAX_OFDS))
+            .grow_ofds(
+                seen,
+                IPC_OFD_SEGMENT,
+                self.dir.ofd_ceiling.load(Ordering::Relaxed) as usize,
+            )
             .map_err(|error| match error {
                 fd::Error::TooManyFiles => IpcError::ZoneLimit,
                 error => IpcError::Fd(error),
