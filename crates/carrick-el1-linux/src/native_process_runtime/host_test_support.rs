@@ -6993,4 +6993,5 @@ fn entropy_service_preparation_busy_retries_before_generation() {
         ServiceOperation::Entropy { .. }
     ));
     assert!(ticket.complete(false).is_ok());
+    drop(queue);
 }
