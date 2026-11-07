@@ -974,7 +974,18 @@ impl HvfVmState {
         let custody = std::sync::Arc::clone(&self.carrier_foreign_mm_transport.custody);
         // The first root of this carrier maps the host IPC authority's
         // memory once, for every process the carrier runs.
-        super::stage2_backend::install_registered_ipc_window(&custody)?;
+        let retained_region = self
+            .mappings
+            .iter()
+            .find(|row| row.start == carrick_el1_abi::EL1_REGION_BASE)
+            .and_then(|row| match row.host_mapping.as_ref() {
+                Some(RegionHostOwner::BirthZone(backing)) => Some(backing.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                TrapError::Hypervisor("IPC venue has no retained carrier region".into())
+            })?;
+        super::stage2_backend::install_registered_ipc_window(&custody, retained_region)?;
         let carrier_mappings = std::sync::Arc::new(PersistentCarrierMappings::extract(
             &mut self.mappings,
             custody,

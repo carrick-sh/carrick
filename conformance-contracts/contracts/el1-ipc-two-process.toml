@@ -6,6 +6,7 @@ id = "kernel.el1.ipc-two-process"
 title = "Two-process blocking pipe and eventfd IPC is served and parked in the guest"
 guest_surfaces = [
   "syscall:read",
+  "syscall:readv",
   "syscall:write",
   "syscall:writev",
   "syscall:eventfd2",
@@ -17,6 +18,7 @@ guest_surfaces = [
   "vmm:hvf",
 ]
 semantic_authority = [
+  "man 2 readv and native Linux oracle: buffers are filled in array order; a scatter fault leaves the incomplete pipe buffer unread while earlier complete buffers remain consumed; imported headers and the committed byte cursor belong to the retained operation",
   "man 2 writev: vectors are consumed in order as one write; pipe atomicity applies to their aggregate length, and imported vector headers survive suspension",
   "man 2 pipe / man 7 pipe: a read on an empty pipe with a live writer blocks until data is written, and returns EOF after every writer closes; writes of at most PIPE_BUF bytes are atomic",
   "man 2 eventfd: a read blocks while the counter is zero and returns the counter value once it is nonzero",
@@ -30,7 +32,18 @@ rationale = "Request/response IPC between forked processes (`pairs` concurrent p
 
 [bindings]
 vm_free = [
+  "carrick-kernel::kernel::continuation::ipc::tests::host_ipc_completion_regions_retain_their_exact_kernel_owner (production completion services retain two distinct kernel mappings after dispatcher teardown and reject the peer operation storage)",
+  "carrick-kernel::kernel::continuation::ipc::tests::serial_host_ipc_admission_borrows_the_installed_window_and_rejects_a_peer (production descriptor publication accepts only the supplied installed owner after window publication)",
+  "carrick-el1-abi::HostIpcWindow::attach (compile-fail lifetime witness rejects escape from the retained window borrow)",
+  "carrick-el1-linux::ipc::bound_venue_tests::{relocated_x86_layout_attaches_registered_ipc_venue,arm_layout_attaches_the_same_registered_ipc_venue,guest_venue_refuses_foreign_layout_before_memory_access} (registered venue attachment only; no runtime pipe-service claim)",
+  "carrick-el1-abi::ipc::tests::{pending_pipe_pair_publishes_after_copyout_and_forks_exact_endpoints,pending_pipe_pair_copy_fault_cancels_claims_without_closing_reused_numbers,pending_pipe_pair_publication_busy_once_retains_both_endpoints,pending_pipe_pair_finish_object_busy_keeps_release_custody,pending_pipe_pair_partial_ofd_preparation_cancels_both_object_references,pending_pipe_pair_retired_namespace_cannot_redirect_cancel_to_reused_table,pending_pipe_pair_resume_uses_current_execution_holder,pending_pipe_pair_foreign_view_refuses_before_custody_changes,pending_pipe_pair_publication_uses_current_descriptor_ceiling}",
+  "carrick-el1-abi::ipc_window::tests::{ipc_binding_refuses_zero_carrier_identity,ipc_binding_refuses_each_unaligned_address_and_wrong_length,ipc_binding_derives_x86_table_map_from_its_region} (typed geometry admission only; does not prove guest venue construction or publication)",
+  "carrick-el1-abi::ipc_window::tests::{ipc_host_window_keeps_host_addresses_typed,ipc_host_window_refuses_pointer_overflow,ipc_guest_window_keeps_x86_virtual_and_frame_addresses_distinct} (typed host/guest views only; does not prove live venue construction)",
+  "carrick-el1-linux::ipc::tests::native_final_pipe_pin_release_uses_execution_transport (public transfer entry retains a reader pin across descriptor close and park refusal; native retirement drops the final endpoint and delivers its wake through the execution transport)",
+  "carrick-el1-abi::ipc::tests::{ring_pipe_creation_is_backed_before_publication,ring_pipe_creation_reuses_or_returns_retained_storage,ring_pipe_creation_rejects_bad_storage_without_spending_the_record,ring_pipe_creation_refuses_overlap_and_preserves_retained_storage} (shared backed object construction: immediate exact-once transfer, retained extent reuse, displaced extent ownership and failure rollback; not descriptor publication or x86 execution)",
+  "carrick-el1-linux::ipc::tests::{el1_ipc_readv_without_native_custody_declines_before_effects,el1_ipc_readv_scatters_and_consumes_each_byte_once,el1_ipc_readv_payload_fault_preserves_the_incomplete_pipe_buffer,two_live_process_pipe_readv_owner_wait_retains_headers_and_cursor,two_live_process_pipe_readv_owner_wait_returns_prefix_if_peer_drains} (shared scatter transfer: ordered output, exact-once consumption, retained headers and cursor through owner wait, disjoint live MMs)",
   "carrick-el1-linux::native_process_runtime::host_test_support::portal_wait_terminal_cancellation_resumes_exact_native_service_waiter (portal service cancellation component: caught-signal interruption retains committed CarrierWork; typed terminal cancellation detaches its exact enrolled portal queue, resumes the waiter and preserves completed result 65; outside the scalar IPC fence)",
+  "carrick-el1-linux::ipc::tests::ipc_operation_completion_uses_execution_transport (production transfer completion delivers the operation-slot release through its exact execution transport)",
   "carrick-el1-linux::ipc::tests::{ipc_operation_slot_native_finish_and_retire_publish,ipc_operation_slot_epoll_retry_publishes} (independent production native completion, exec/exit retirement and epoll Retry release publications)",
   "carrick-kernel::kernel::continuation::ipc::tests::serial_host_zone_operation_slot_release_reaches_bound_source (carrier source binding followed by production host finish and ZoneHostServices release; exact epoch and stale retry)",
   "carrick-el1-linux::ipc::tests::ipc_operation_slot_busy_once_then_success (full shared operation arena; real retirement wakes an enrolled scheduler record and admits the unchanged operation)",
@@ -49,6 +62,7 @@ vm_free = [
   "carrick-kernel::kernel::continuation::ipc::tests::el1_ipc_vector_handback_prefetch_preserves_imported_order_and_reclaims_storage",
   "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_fork_exec_pipe_writer_reaches_its_parent",
   "carrick-personality-linux::dispatch::ring_first_tests::writev_dispatches_through_the_ipc_writer_without_scalar_file_fallback",
+  "carrick-kernel::kernel::objects::ipc::tests::publication_retains_map_until_namespace_withdrawal (production publication retains map custody and withdraws before releasing its owner)",
 ]
 # #1507: imported pipe writev uses the existing owned pipe operation.
 # The VM-free bounds are zero host calls and reclamation to the exact
@@ -59,6 +73,7 @@ embed = [
 
 [bindings.unresolved]
 docker = "Linux semantics of pipe and eventfd blocking are fixed by man pages; the fixture checks the completed round count itself. Same-source Docker differential binding remains open."
+x86_kvm = "#1756 red-first fixture: carrick-vmm-kvm::cpl0_initial_mm::in_zone_two_process_pipe_vectors_move_bytes_exactly_once is ignored until the shared venue is wired. Native Linux runs the same native_pipe_vectors.S and returns exit 0 with pipe-vectors=once. The fixture now asserts served/refusal census and has an independent non-venue writev refusal witness; the production venue and a passing served witness are still absent. Native assembly tests aggregate vector order, EAGAIN (11) after exactly one transfer and EOF after last writer close."
 embed_structural = "Not yet a registered WorkObservation binding: the signed test asserts served[63]/[64] >= 2*pairs*rounds, zero-fallback parks >= pairs*rounds, and forwarded read[63] < pairs*rounds outside the contract evaluator. Native scalar pipe signal/SA_RESTART execution and timed-epoll signal integration remain director-owned signed acceptance; the VM-free signal-frame witness does not execute guest handler instructions."
 
 # Integer-expressible form of "forwarded reads < rounds per pair": every scale

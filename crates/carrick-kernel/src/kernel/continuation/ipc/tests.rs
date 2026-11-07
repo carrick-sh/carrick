@@ -17,6 +17,76 @@ const MM: IpcMmKey = IpcMmKey(7);
 const BUF: u64 = 0x10_0000;
 
 #[test]
+fn serial_host_ipc_admission_borrows_the_installed_window_and_rejects_a_peer() {
+    let map = std::sync::Arc::new(carrick_test_support::TestIpcTableMap::new());
+    let retained: std::sync::Arc<dyn carrick_el1_abi::IpcTableMapBacking> = map.clone();
+    let first = crate::dispatch::SyscallDispatcher::new();
+    let second = crate::dispatch::SyscallDispatcher::new();
+    let first_context = first.capture_one_task_context().unwrap();
+    let second_context = second.capture_one_task_context().unwrap();
+    let backing = host_window_backing(&first).unwrap();
+    let _second_owner = second_context.kernel().ipc().unwrap();
+    // SAFETY: this retained kernel backing owns stable initialized mappings.
+    let window = unsafe { carrick_el1_abi::HostIpcWindow::new(backing.as_ref()) }.unwrap();
+    let installed = window.attach().unwrap();
+    let first_id = first_context.resources().files().id().raw();
+    let second_id = second_context.resources().files().id().raw();
+    assert_eq!(first_id, second_id, "kernel-local IDs deliberately collide");
+    publish_file_table(&first_context, &installed, &retained);
+    assert!(
+        map.lookup(first_id).is_none(),
+        "unmapped window must refuse"
+    );
+    map.publish_window();
+    publish_file_table(&second_context, &installed, &retained);
+    assert!(map.lookup(second_id).is_none(), "peer kernel must refuse");
+    publish_file_table(&first_context, &installed, &retained);
+    assert!(
+        map.lookup(first_id).is_some(),
+        "installed owner must publish"
+    );
+    let admitted = map.lookup(first_id).unwrap();
+    publish_file_table(&second_context, &installed, &retained);
+    assert_eq!(
+        map.lookup(first_id),
+        Some(admitted),
+        "peer cannot replace owner"
+    );
+}
+
+#[test]
+fn host_ipc_completion_regions_retain_their_exact_kernel_owner() {
+    let first = crate::dispatch::SyscallDispatcher::new();
+    let second = crate::dispatch::SyscallDispatcher::new();
+    let first_context = first.capture_one_task_context().unwrap();
+    let second_context = second.capture_one_task_context().unwrap();
+    let first_owner = first_context.kernel().ipc().unwrap();
+    let second_owner = second_context.kernel().ipc().unwrap();
+    let first_service = ZoneHostServices::for_dispatcher(&first).unwrap();
+    let second_service = ZoneHostServices::for_dispatcher(&second).unwrap();
+    let first_region = first_service.region();
+    let second_region = second_service.region();
+    assert!(first_region.same_mapping(&first_owner.region()));
+    assert!(second_region.same_mapping(&second_owner.region()));
+    assert!(!first_region.same_mapping(&second_region));
+    drop(first_owner);
+    drop(second_owner);
+    drop(first_context);
+    drop(second_context);
+    drop(first);
+    drop(second);
+    let token = first_region.begin_operation(IpcOperation::EMPTY).unwrap();
+    let raw = token.into_raw();
+    assert_eq!(first_service.validate_region(&first_region), Ok(()));
+    assert_eq!(
+        second_service.validate_region(&first_region),
+        Err(IpcError::BadRegion)
+    );
+    assert!(second_region.operation(&IpcOpToken::from_raw(raw)).is_err());
+    finish(&first_region, IpcOpToken::from_raw(raw), &first_service).unwrap();
+}
+
+#[test]
 fn serial_host_zone_operation_slot_release_reaches_bound_source() {
     // SAFETY: all-zero is the valid empty ABI state; aligned storage lives
     // through the scoped host binding.

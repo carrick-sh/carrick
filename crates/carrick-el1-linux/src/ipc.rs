@@ -35,12 +35,12 @@
 //!   other argument register is untouched, and the record says what to do
 //!   ([`IpcHandback`]) and carries the original `x0` and syscall number.
 
-use super::sched::{Sched, Served, ThreadCpu, UserWord};
+use super::sched::{Sched, ThreadCpu, UserWord};
+mod execution;
 use carrick_el1::substrate::file::UserCopy;
 use carrick_el1::substrate::ipc::{
     PrefixCopy, StepStatus, from_sched_token, to_sched_token, wait_key,
 };
-use carrick_el1::substrate::sched::object_wait::OperationResumePc;
 pub use carrick_el1_abi::ipc::IPC_HANDBACK_NR;
 use carrick_el1_abi::ipc::fd::{AccessMode, Error as FdError, Fd, TableId};
 use carrick_el1_abi::ipc::pipe::{WaitFor, WakeSet};
@@ -54,6 +54,7 @@ use carrick_el1_abi::{CurrentTask, EL1_GUEST_LOCK_SPINS, IpcLeave, TrapFrame};
 use carrick_sched_core::object_wait::{ObjectStateSnapshot, ObjectWaitError};
 use carrick_sched_core::{LockWait, ShortLockSpin, WakeEffects};
 use core::sync::atomic::Ordering;
+pub use execution::{IpcExecution, IpcFrame};
 
 /// Linux AArch64 values this adapter decodes and returns.
 mod linux {
@@ -67,8 +68,6 @@ mod linux {
     pub const MAX_RW_COUNT: u64 = 0x7fff_f000;
     /// eventfd reads and writes move one native-endian u64.
     pub const EVENTFD_WORD: u64 = 8;
-    /// Length of the AArch64 SVC instruction ELR points past.
-    pub const SVC_LEN: u64 = 4;
 }
 pub use linux::{SYS_READ, SYS_WRITE};
 
@@ -128,6 +127,7 @@ fn release_native_description<C: carrick_el1_abi::EntryContext>(
     zone: &carrick_sched_core::ZoneTables<C>,
     slot: carrick_el1_abi::SlotId,
     task: &CurrentTask,
+    deliver_wake: &dyn Fn(WakeEffects),
 ) -> Result<(), carrick_el1_abi::ipc::IpcError> {
     use carrick_el1_abi::ipc::IpcError;
     match region.release_backing(description.backing, &Finish)? {
@@ -161,7 +161,7 @@ fn release_native_description<C: carrick_el1_abi::EntryContext>(
                 if report.deferred != 0 {
                     task.linux.mark_pending_host_work();
                 }
-                crate::sched::object_wait::deliver_wake_effects(zone, slot, effects);
+                deliver_wake(effects);
             }
         }
         IpcReleased::Epoll => {}
@@ -184,6 +184,7 @@ pub(crate) fn settle_native_release<C: carrick_el1_abi::EntryContext>(
     release: carrick_el1_abi::ipc::fd::DeferredRelease,
     zone: Option<(&carrick_sched_core::ZoneTables<C>, carrick_el1_abi::SlotId)>,
     task: &CurrentTask,
+    wake: &dyn Fn(WakeEffects),
 ) -> Result<(), carrick_el1_abi::ipc::IpcError> {
     use carrick_el1_abi::ipc::fd::DeferredRelease;
     match release {
@@ -194,7 +195,7 @@ pub(crate) fn settle_native_release<C: carrick_el1_abi::EntryContext>(
         }
         DeferredRelease::Now(description) => {
             if let Some((zone, slot)) = zone {
-                release_native_description(region, description, zone, slot, task)
+                release_native_description(region, description, zone, slot, task, wake)
             } else {
                 match region.release_backing(description.backing, &Finish)? {
                     IpcReleased::Object { wake, .. } => {
@@ -226,45 +227,95 @@ impl IpcTables for MapTables<'_> {
     }
 }
 
-/// The shared IPC authority EL1 serves from: the window the runtime maps at
-/// `EL1_IPC_BASE`, once the host authority has published its directory.
-/// Unmapped or unpublished, the attach fails and every call forwards.
-#[cfg(target_os = "none")]
-pub fn guest_venue(slot: u32) -> Option<IpcVenue<'static>> {
-    static TABLES: GuestTables = GuestTables;
-    // Unmapped at stage-2 until the carrier installs it: never touch the
-    // window before the host says so.
-    if !carrick_el1_abi::ipc_table_map_guest().window_published() {
+impl IpcTables for IpcTableMap {
+    fn table_for_file_table(&self, file_table: u64) -> Option<RawTableId> {
+        self.lookup(file_table)
+    }
+    fn owned_table_of(&self, task: &CurrentTask) -> Option<RawTableId> {
+        self.lookup_owned(task.linux.file_table.load(Ordering::Acquire))
+    }
+}
+
+/// Attach a carrier's IPC venue independently of the image ISA.
+/// The table map comes from the authenticated file region named by `layout`,
+/// never from the ARM fixed aperture. An unpublished or retired region and
+/// an unpublished window have no venue and cannot claim descriptor service.
+///
+/// # Safety
+/// The caller retains this carrier's initialized file-region mapping and both
+/// IPC mappings for `'a`, with the virtual-to-physical bindings described by
+/// `binding`. Guest consumers must stop before registration retirement or
+/// mapping removal. Host code may use this only in VM-free fixtures that own
+/// mappings at the supplied supervisor virtual addresses.
+pub unsafe fn guest_venue<'a>(
+    layout: carrick_guest_arch::KernelLayout,
+    binding: carrick_el1_abi::IpcWindowBinding,
+) -> Option<IpcVenue<'a>> {
+    // SAFETY: the caller retains the exact supervisor mappings for 'a.
+    let (region, tables) = unsafe { guest_namespace(layout, binding) }?;
+    Some(IpcVenue { region, tables })
+}
+
+unsafe fn guest_namespace<'a>(
+    layout: carrick_guest_arch::KernelLayout,
+    binding: carrick_el1_abi::IpcWindowBinding,
+) -> Option<(IpcRegion<'a>, &'a IpcTableMap)> {
+    binding.table_map_address(layout).ok()?;
+    // SAFETY: the caller retains the exact guest mapping. Attachment checks
+    // the registration's complete identity and address domains.
+    let tables = unsafe { carrick_el1_abi::FileTables::in_guest(binding.region()) }.ok()?;
+    let map = tables.into_ipc_table_map();
+    // This acquire precedes the first directory/pool access. The carrier
+    // publishes only after both mappings and the operation slots are ready.
+    if !map.window_published() {
         return None;
     }
-    let region = carrick_el1_abi::ipc_window_guest()?
-        .attach()
+    // SAFETY: authenticated map and both admitted IPC ranges are retained for 'a.
+    let region = unsafe { carrick_el1_abi::GuestIpcWindow::from_binding(binding).attach() }
         .ok()?
-        .for_el1_slot(slot)
         .with_ceiling(&carrick_el1_abi::GUEST_DESCRIPTOR_CEILING);
-    Some(IpcVenue {
+    Some((region, map))
+}
+
+/// ARM's mapping adapter. Registration and attachment use the same shared
+/// constructor as the other ISA; only the image's fixed address geometry is
+/// selected here. An absent or retired registration cannot claim service.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+pub fn current_guest_namespace() -> Option<(IpcRegion<'static>, &'static IpcTableMap)> {
+    use carrick_el1_abi::{FileRegionBinding, IpcWindowBinding};
+    use carrick_guest_arch::{FrameGpa, GuestLen, KernelVa, LayoutBackend};
+    let layout = <carrick_el1::isa::aarch64::Aarch64Backend as LayoutBackend>::KERNEL_LAYOUT;
+    // SAFETY: boot retains and initializes this image's supervisor region
+    // before admitting a CPU, and stops every consumer before retiring it.
+    let region = unsafe { FileRegionBinding::in_guest_layout(layout) }.ok()?;
+    let binding = IpcWindowBinding::new(
         region,
-        tables: &TABLES,
+        KernelVa::new(carrick_el1_abi::EL1_IPC_BASE),
+        FrameGpa::new(carrick_el1_abi::EL1_IPC_BASE),
+        GuestLen::new(carrick_el1_abi::EL1_IPC_DIRECTORY_SPAN),
+        KernelVa::new(carrick_el1_abi::EL1_IPC_POOL_BASE),
+        FrameGpa::new(carrick_el1_abi::EL1_IPC_POOL_BASE),
+        GuestLen::new(carrick_el1_abi::EL1_IPC_POOL_SPAN),
+    )
+    .ok()?;
+    // SAFETY: boot maps these fixed ARM supervisor ranges and retains them
+    // until all guest consumers stop. Publication is checked before IPC access.
+    unsafe { guest_namespace(layout, binding) }
+}
+
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+pub fn current_guest_venue(slot: u32) -> Option<IpcVenue<'static>> {
+    let (region, tables) = current_guest_namespace()?;
+    Some(IpcVenue {
+        region: region.for_el1_slot(slot),
+        tables,
     })
 }
 
-/// Host builds serve no guest: there is no EL1 window to attach.
-#[cfg(not(target_os = "none"))]
-pub fn guest_venue(_slot: u32) -> Option<IpcVenue<'static>> {
+/// Other execution lanes require their own retained binding at admission.
+#[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+pub fn current_guest_venue(_slot: u32) -> Option<IpcVenue<'static>> {
     None
-}
-
-#[cfg(target_os = "none")]
-struct GuestTables;
-
-#[cfg(target_os = "none")]
-impl IpcTables for GuestTables {
-    fn table_for_file_table(&self, file_table: u64) -> Option<RawTableId> {
-        MapTables(carrick_el1_abi::ipc_table_map_guest()).table_for_file_table(file_table)
-    }
-    fn owned_table_of(&self, task: &CurrentTask) -> Option<RawTableId> {
-        MapTables(carrick_el1_abi::ipc_table_map_guest()).owned_table_of(task)
-    }
 }
 
 const EL1_WAIT: ShortLockSpin = ShortLockSpin;
@@ -355,9 +406,9 @@ impl LockWait for Finish {
 
 /// Serve read(2)/write(2) on a pipe or eventfd, and epoll_pwait(2) on a
 /// zone epoll, in EL1.
-pub fn serve_ipc<C: ThreadCpu, U: UserWord, M: UserCopy>(
-    sched: &mut Sched<'_, C, U>,
-    frame: &mut TrapFrame,
+pub fn serve_ipc<E: IpcExecution, M: UserCopy>(
+    sched: &mut E,
+    frame: &mut E::Frame,
     venue: &IpcVenue<'_>,
     user: &mut M,
 ) -> IpcServed {
@@ -367,16 +418,22 @@ pub fn serve_ipc<C: ThreadCpu, U: UserWord, M: UserCopy>(
 /// Serve IPC with the native signal owner. The pending-interruption probe
 /// runs after enrollment and before settling an interrupted retained operation.
 /// `sigpipe_owed` lets that same owner raise SIGPIPE without a host task.
-pub fn serve_ipc_with_signals<C: ThreadCpu, U: UserWord, M: UserCopy>(
-    sched: &mut Sched<'_, C, U>,
-    frame: &mut TrapFrame,
+pub fn serve_ipc_with_signals<E: IpcExecution, M: UserCopy>(
+    sched: &mut E,
+    frame: &mut E::Frame,
     venue: &IpcVenue<'_>,
     user: &mut M,
     native_signals: bool,
     interrupt: &mut dyn FnMut() -> bool,
 ) -> (IpcServed, bool) {
-    let nr = frame.x[8] as usize;
-    if nr != SYS_READ && nr != SYS_WRITE && nr != 66 && nr != SYS_EPOLL_PWAIT {
+    let nr = frame.ordinal().raw() as usize;
+    if nr != SYS_READ && nr != SYS_WRITE && nr != 65 && nr != 66 && nr != SYS_EPOLL_PWAIT {
+        return (IpcServed::Forward, false);
+    }
+    // Legacy handback prepares a contiguous output at op.buf, which for
+    // readv names the header array. Scatter output needs the native owner's
+    // retained in-ring continuation; decline before lookup, pins or effects.
+    if nr == 65 && !native_signals {
         return (IpcServed::Forward, false);
     }
     let (token, op, resumed) = match sched.take_object_operation() {
@@ -400,7 +457,7 @@ pub fn serve_ipc_with_signals<C: ThreadCpu, U: UserWord, M: UserCopy>(
                     false,
                 );
             };
-            if op.task != task_key(sched.task) || op.mm != mm_key(sched.task) {
+            if op.task != task_key(sched.task()) || op.mm != mm_key(sched.task()) {
                 if native_signals {
                     retain_native_operation(sched, token);
                     crate::dispatch::invalid_completion(
@@ -411,10 +468,10 @@ pub fn serve_ipc_with_signals<C: ThreadCpu, U: UserWord, M: UserCopy>(
                 return (leave(sched, IpcLeave::ForeignOperation, served), false);
             }
             let reason = sched
-                .zone
-                .slot(sched.slot)
+                .zone()
+                .slot(sched.slot())
                 .current()
-                .and_then(|id| sched.zone.record(id).handback());
+                .and_then(|id| sched.zone().record(id).handback());
             if native_signals {
                 let interrupted = reason == Some(carrick_sched_core::Handback::Signal)
                     && (user.interrupt_pending_wait() || interrupt());
@@ -423,7 +480,7 @@ pub fn serve_ipc_with_signals<C: ThreadCpu, U: UserWord, M: UserCopy>(
                 if interrupted || timed_out {
                     finish(sched, token, &venue.region);
                     if timed_out {
-                        frame.x[0] = 0;
+                        frame.set_result(0);
                     } else {
                         use carrick_signal_core::wait::{
                             RestartClass, TransferredBytes, WaitDecision, WaitProgress,
@@ -437,17 +494,17 @@ pub fn serve_ipc_with_signals<C: ThreadCpu, U: UserWord, M: UserCopy>(
                         // defers SA_RESTART to arm_signal::restart_forwarded_frame
                         // and its shared is_native_restartable_syscall predicate,
                         // through the zero-progress marker below.
-                        frame.x[0] =
+                        frame.set_result(
                             match interrupted_wait(RestartClass::Never, progress, Some(false)) {
                                 WaitDecision::CompletePartial(bytes) => bytes.get() as u64,
                                 _ => carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64,
-                            };
+                            },
+                        );
                         // The shared native signal checkpoint already owns
                         // SA_RESTART frame publication. Preserve arg0 in its
                         // existing mailbox marker, only before any progress.
                         if op.progress.written == 0 && op.kind != IpcOpKind::EpollWait {
-                            frame.esr = 0xfffe;
-                            frame.far = op.orig_x0;
+                            frame.mark_restart(op.orig_x0);
                         }
                     }
                     return (IpcServed::Returned { switched: false }, false);
@@ -467,13 +524,13 @@ pub fn serve_ipc_with_signals<C: ThreadCpu, U: UserWord, M: UserCopy>(
         Ok(None) => match admit(sched, frame, venue, user) {
             Admission::Admitted(token, op) => (token, op, false),
             Admission::Immediate(result) => {
-                frame.x[0] = result as u64;
+                frame.set_result(result as u64);
                 return (IpcServed::Returned { switched: false }, false);
             }
             Admission::Forward => return (IpcServed::Forward, false),
             Admission::CopyInFault => {
                 if native_signals {
-                    frame.x[0] = carrick_syscall_abi::LINUX_EFAULT.guest_retval() as u64;
+                    frame.set_result(carrick_syscall_abi::LINUX_EFAULT.guest_retval() as u64);
                     return (IpcServed::Returned { switched: false }, false);
                 }
                 return (IpcServed::Forward, false);
@@ -588,20 +645,20 @@ pub fn admit_operation_wait<'a, C: carrick_el1_abi::EntryContext>(
 }
 
 /// Decode a fresh call and take ownership of it, before any effect.
-fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
-    sched: &mut Sched<'_, C, U>,
-    frame: &TrapFrame,
+fn admit<E: IpcExecution, M: UserCopy>(
+    sched: &mut E,
+    frame: &E::Frame,
     venue: &IpcVenue<'_>,
     user: &mut M,
 ) -> Admission {
-    let task = sched.task;
+    let task = sched.task();
     let region = &venue.region;
     let Some(table) = venue.tables.table_of(task) else {
         return refuse(sched, IpcLeave::NoTable);
     };
     let table = TableId::from_raw(table);
-    let fd = Fd(frame.x[0] as i32);
-    let reading = frame.x[8] as usize == SYS_READ;
+    let fd = Fd(frame.argument(0) as i32);
+    let reading = frame.ordinal().raw() as usize == SYS_READ || frame.ordinal().raw() == 65;
     let fda = region.fd(EL1_WAIT);
     // A snapshot first (no retention): host-backed descriptions are never
     // pinned in EL1, so EL1 never holds a hold it could not release.
@@ -616,9 +673,9 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
         pin,
         task: task_key(task),
         mm: mm_key(task),
-        buf: IpcUserVa(frame.x[1]),
-        orig_x0: frame.x[0],
-        nr: frame.x[8] as u32,
+        buf: IpcUserVa(frame.argument(1)),
+        orig_x0: frame.argument(0),
+        nr: frame.native_number().raw() as u32,
         ..IpcOperation::EMPTY
     };
     let (pin, desc) = match fda.pin(table, fd) {
@@ -659,19 +716,19 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
         AccessMode::WriteOnly => !reading,
         AccessMode::Path => false,
     };
-    let vectored = frame.x[8] == 66;
-    if vectored && kind != IpcOpKind::PipeWrite {
+    let vectored = frame.ordinal().raw() == 65 || frame.ordinal().raw() == 66;
+    if vectored && !matches!(kind, IpcOpKind::PipeRead | IpcOpKind::PipeWrite) {
         release_pin(sched, OfdPin::from_raw(op.pin), region);
         return Admission::Forward;
     }
-    if vectored && permitted && frame.x[2] > carrick_el1_abi::ipc::IPC_MAX_IOVECS as u64 {
+    if vectored && permitted && frame.argument(2) > carrick_el1_abi::ipc::IPC_MAX_IOVECS as u64 {
         release_pin(sched, OfdPin::from_raw(op.pin), region);
         return Admission::Immediate(linux::EINVAL);
     }
     let count = if vectored {
         1
     } else {
-        frame.x[2].min(linux::MAX_RW_COUNT)
+        frame.argument(2).min(linux::MAX_RW_COUNT)
     };
     let eventfd = matches!(kind, IpcOpKind::EventFdRead | IpcOpKind::EventFdWrite);
     let immediate = if !permitted {
@@ -690,7 +747,7 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
     // eventfd(2): a write copies its value once, before it can block.
     let mut value = [0u8; linux::EVENTFD_WORD as usize];
     if kind == IpcOpKind::EventFdWrite
-        && PrefixCopy::new(user).copy_in(&mut value, frame.x[1]) != value.len()
+        && PrefixCopy::new(user).copy_in(&mut value, frame.argument(1)) != value.len()
     {
         // No effect yet: the host resolves the fault (first touch or EFAULT).
         release_pin(sched, OfdPin::from_raw(op.pin), region);
@@ -705,13 +762,13 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
             if vectored {
                 let mut header_copy_refused = false;
                 let imported =
-                    region.import_vectors(&token, frame.x[2] as usize, |index, header| {
-                        let copied =
-                            frame.x[1]
-                                .checked_add(index as u64 * 16)
-                                .is_some_and(|address| {
-                                    PrefixCopy::new(user).copy_in(header, address) == header.len()
-                                });
+                    region.import_vectors(&token, frame.argument(2) as usize, |index, header| {
+                        let copied = frame
+                            .argument(1)
+                            .checked_add(index as u64 * 16)
+                            .is_some_and(|address| {
+                                PrefixCopy::new(user).copy_in(header, address) == header.len()
+                            });
                         header_copy_refused |= !copied;
                         copied
                     });
@@ -765,11 +822,7 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
 /// another party's short object-lock section, and wakes the peer lane (EOF
 /// for readers, EPIPE for writers). Only IPC-backed descriptions are ever
 /// pinned in EL1.
-fn release_pin<C: ThreadCpu, U: UserWord>(
-    sched: &mut Sched<'_, C, U>,
-    pin: OfdPin,
-    region: &IpcRegion<'_>,
-) {
+fn release_pin<E: IpcExecution>(sched: &mut E, pin: OfdPin, region: &IpcRegion<'_>) {
     let Ok(Some(description)) = region.fd(EL1_WAIT).unpin(pin) else {
         return;
     };
@@ -779,7 +832,7 @@ fn release_pin<C: ThreadCpu, U: UserWord>(
         return;
     };
     if wake.host_owed {
-        sched.task.linux.mark_pending_host_work();
+        sched.task().linux.mark_pending_host_work();
     }
     // A freed object has no waiters: each holds a pin on it.
     if !freed {
@@ -797,9 +850,9 @@ fn release_pin<C: ThreadCpu, U: UserWord>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
-    sched: &mut Sched<'_, C, U>,
-    frame: &mut TrapFrame,
+fn run<E: IpcExecution, M: UserCopy>(
+    sched: &mut E,
+    frame: &mut E::Frame,
     venue: &IpcVenue<'_>,
     user: &mut M,
     mut token: IpcOpToken,
@@ -882,16 +935,16 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                 );
             }
         };
-        let vector_input = venue.region.has_vectors(&token).unwrap_or_else(|_| {
+        let vectored = venue.region.has_vectors(&token).unwrap_or_else(|_| {
             crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
         });
         let buf = op.buf.0;
-        let transferred = carrick_el1::substrate::ipc::transfer_with_input(
+        let transferred = carrick_el1::substrate::ipc::transfer_with_io(
             &mut guard,
             &mut op,
             &mut copy,
             |copy, at, dst| {
-                if vector_input {
+                if vectored {
                     match venue
                         .region
                         .copy_vector_input(&token, at, dst, |bytes, address| {
@@ -908,6 +961,27 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                     }
                 } else {
                     copy.copy_in(dst, buf.wrapping_add(at))
+                }
+            },
+            |copy, at, src| {
+                if vectored {
+                    let copied = venue
+                        .region
+                        .copy_vector_output(&token, at, src, |address, bytes| {
+                            copy.copy_out(address.0, bytes)
+                        })
+                        .unwrap_or_else(|_| {
+                            crate::dispatch::invalid_completion(
+                                crate::dispatch::NativeInvariant::EntryBinding,
+                            )
+                        });
+                    // Linux commits a pipe buffer only after its scatter
+                    // copy completes. A fault may have modified a preceding
+                    // vector, but that incomplete source buffer stays unread.
+                    // Earlier complete buffers retain their committed cursor.
+                    if copied == src.len() { copied } else { 0 }
+                } else {
+                    copy.copy_out(buf.wrapping_add(at), src)
                 }
             },
         );
@@ -939,7 +1013,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
         };
         let published = guard.publish(wake);
         if published.host_owed {
-            sched.task.linux.mark_pending_host_work();
+            sched.task().linux.mark_pending_host_work();
         }
         let effects = notify(sched, object, wake);
         let epoll_effects = notify_epolls(sched, &published);
@@ -1042,7 +1116,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                         // Only copied bytes were consumed. Report that exact
                         // prefix and leave the refused suffix at its source.
                         finish_native(sched, restored, region);
-                        frame.x[0] = op.progress.written;
+                        frame.set_result(op.progress.written);
                         return (IpcServed::Returned { switched: false }, false);
                     }
                     return (
@@ -1067,7 +1141,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                     );
                 }
                 CopyoutPreparation::Complete(result) => {
-                    frame.x[0] = result as u64;
+                    frame.set_result(result as u64);
                     return (IpcServed::Returned { switched: false }, false);
                 }
                 CopyoutPreparation::Suspended => return (IpcServed::Idle, false),
@@ -1077,28 +1151,17 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
             });
         }
         if let Some(wait) = owner_wait {
-            if wait.handle().mm().raw() != mm_key(sched.task).0 {
+            if wait.handle().mm().raw() != mm_key(sched.task()).0 {
                 crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding);
             }
-            let enrollment = carrick_core_abi::wait::PortalWaitEnrollment::for_owner(
-                sched.zone,
-                wait.handle(),
-                wait,
-            )
-            .unwrap_or_else(|_| {
+            if region.update_operation(&token, op).is_err() {
+                crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding);
+            }
+            let operation = to_sched_token(token).unwrap_or_else(|_| {
                 crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
             });
-            match park_key(
-                sched,
-                frame,
-                region,
-                token,
-                op,
-                enrollment.key(),
-                enrollment.observed_snapshot(),
-                None,
-                None,
-            ) {
+            let parked = park_result(sched.park_owner(frame, wait, operation));
+            match parked {
                 Parked::Done(served) => return (served, false),
                 Parked::Retry(t) => {
                     token = t;
@@ -1198,7 +1261,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                     linux::EPIPE
                 };
                 finish(sched, token, region);
-                frame.x[0] = result as u64;
+                frame.set_result(result as u64);
                 return (IpcServed::Returned { switched: false }, true);
             }
             StepStatus::Broken if written == 0 && !resumed => {
@@ -1264,7 +1327,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
             }
         };
         finish(sched, token, region);
-        frame.x[0] = result as u64;
+        frame.set_result(result as u64);
         return (IpcServed::Returned { switched: false }, false);
     }
 }
@@ -1272,8 +1335,8 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
 /// Notify the waiters of every zone epoll a member's change queued items
 /// on (their `Readable` lane), under the member's lock like the member's
 /// own lanes (lock order: object state, then a queue).
-fn notify_epolls<C: ThreadCpu, U: UserWord>(
-    sched: &Sched<'_, C, U>,
+fn notify_epolls<E: IpcExecution>(
+    sched: &E,
     wake: &carrick_el1_abi::ipc::IpcWake,
 ) -> [Option<WakeEffects>; carrick_el1_abi::ipc::epoll::MAX_MEMBER_ITEMS] {
     let mut out = [None; carrick_el1_abi::ipc::epoll::MAX_MEMBER_ITEMS];
@@ -1288,8 +1351,8 @@ fn notify_epolls<C: ThreadCpu, U: UserWord>(
 }
 
 /// Notify both lanes' waiters the step owes, under the object lock.
-fn notify<C: ThreadCpu, U: UserWord>(
-    sched: &Sched<'_, C, U>,
+fn notify<E: IpcExecution>(
+    sched: &E,
     object: IpcObjectHandle,
     wake: WakeSet,
 ) -> [Option<WakeEffects>; 2] {
@@ -1310,7 +1373,7 @@ fn notify<C: ThreadCpu, U: UserWord>(
             match sched.notify_object(key) {
                 Ok((report, effects)) => {
                     if report.deferred != 0 {
-                        sched.task.linux.mark_pending_host_work();
+                        sched.task().linux.mark_pending_host_work();
                     }
                     out[i] = Some(effects);
                     break;
@@ -1319,7 +1382,7 @@ fn notify<C: ThreadCpu, U: UserWord>(
                 // Never bound: nobody ever waited on this incarnation.
                 Err(ObjectWaitError::Stale) => break,
                 Err(_) => {
-                    sched.task.linux.mark_pending_host_work();
+                    sched.task().linux.mark_pending_host_work();
                     break;
                 }
             }
@@ -1330,8 +1393,8 @@ fn notify<C: ThreadCpu, U: UserWord>(
 
 /// Sample the lane's wait epoch under the object lock (binding the queue to
 /// this incarnation on first use).
-fn snapshot<C: ThreadCpu, U: UserWord>(
-    sched: &Sched<'_, C, U>,
+fn snapshot<E: IpcExecution>(
+    sched: &E,
     object: IpcObjectHandle,
     lane: WaitFor,
 ) -> Option<ObjectStateSnapshot> {
@@ -1341,7 +1404,7 @@ fn snapshot<C: ThreadCpu, U: UserWord>(
         // predicate and this observation, so no release can pass the probe.
         Ok(snap) => Some(unsafe { ObjectStateSnapshot::taken_under_object_lock(snap) }),
         Err(ObjectWaitError::Stale) => {
-            let _ = sched.zone.bind_object_wait(key, &EL1_WAIT);
+            let _ = sched.zone().bind_object_wait(key, &EL1_WAIT);
             // SAFETY: same retained IPC object guard as the first attempt.
             sched
                 .observe_object(key)
@@ -1359,9 +1422,9 @@ enum Parked {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn park<C: ThreadCpu, U: UserWord>(
-    sched: &mut Sched<'_, C, U>,
-    frame: &mut TrapFrame,
+fn park<E: IpcExecution>(
+    sched: &mut E,
+    frame: &mut E::Frame,
     region: &IpcRegion<'_>,
     token: IpcOpToken,
     op: IpcOperation,
@@ -1388,9 +1451,9 @@ fn park<C: ThreadCpu, U: UserWord>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn park_key<C: ThreadCpu, U: UserWord>(
-    sched: &mut Sched<'_, C, U>,
-    frame: &mut TrapFrame,
+fn park_key<E: IpcExecution>(
+    sched: &mut E,
+    frame: &mut E::Frame,
     region: &IpcRegion<'_>,
     token: IpcOpToken,
     op: IpcOperation,
@@ -1399,9 +1462,6 @@ fn park_key<C: ThreadCpu, U: UserWord>(
     deadline: Option<u64>,
     interrupt: Option<&mut dyn FnMut() -> bool>,
 ) -> Parked {
-    let Some(resume) = OperationResumePc::new(frame.elr.wrapping_sub(linux::SVC_LEN)) else {
-        return Parked::Refused(token);
-    };
     if region.update_operation(&token, op).is_err() {
         return Parked::Refused(token);
     }
@@ -1409,26 +1469,22 @@ fn park_key<C: ThreadCpu, U: UserWord>(
         Ok(t) => t,
         Err(token) => return Parked::Refused(token),
     };
-    match sched.park_object(frame, key, snap, resume, sched_token, deadline) {
-        Ok(parked) => {
-            // Enrollment precedes the single pending-signal probe. A signal
-            // before enrollment is seen here; a later one owns queue intake.
-            if interrupt.is_some_and(|interrupt| interrupt()) {
-                sched.task.linux.mark_pending_host_work();
-            }
-            let served = if sched.task.linux.has_pending_host_work() {
-                sched.leave_after_object_park(parked)
-            } else {
-                sched.resume_after_object_park(frame, parked, 0)
-            };
-            Parked::Done(match served {
-                Some(Served::Returned { switched }) => IpcServed::Returned { switched },
-                Some(Served::Idle) | None => IpcServed::Idle,
-            })
-        }
+    park_result(sched.park(frame, key, snap, sched_token, deadline, interrupt))
+}
+
+fn park_result(
+    result: Result<
+        IpcServed,
+        (
+            ObjectWaitError,
+            carrick_sched_core::object_wait::OperationToken,
+        ),
+    >,
+) -> Parked {
+    match result {
+        Ok(served) => Parked::Done(served),
         Err((error, t)) => {
             let Some(token) = from_sched_token(t) else {
-                // Unreachable for a token this adapter converted.
                 return Parked::Done(IpcServed::Idle);
             };
             if error == ObjectWaitError::Changed {
@@ -1444,22 +1500,21 @@ fn notify_operation_release<C: carrick_el1_abi::EntryContext>(
     region: &IpcRegion<'_>,
     zone: &carrick_sched_core::ZoneTables<C>,
     slot: carrick_el1_abi::SlotId,
+    completion: &dyn Fn(carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>),
 ) {
     zone.notify_ipc_operation_slot_release(
         region.operation_slot_generation(),
         carrick_sched_core::Waker::El1 { slot },
-        &|owned| crate::sched::object_wait::deliver_completion(zone, slot, owned),
+        completion,
     );
 }
 
 /// Retire the operation record and drop its pin.
-fn finish<C: ThreadCpu, U: UserWord>(
-    sched: &mut Sched<'_, C, U>,
-    token: IpcOpToken,
-    region: &IpcRegion<'_>,
-) {
+fn finish<E: IpcExecution>(sched: &mut E, token: IpcOpToken, region: &IpcRegion<'_>) {
     if let Ok(op) = region.finish_operation(token, || {
-        notify_operation_release(region, sched.zone, sched.slot)
+        notify_operation_release(region, sched.zone(), sched.slot(), &|owned| {
+            sched.deliver_completion(owned)
+        })
     }) {
         release_pin(sched, OfdPin::from_raw(op.pin), region);
     }
@@ -1469,13 +1524,16 @@ fn finish<C: ThreadCpu, U: UserWord>(
 /// scheduler record authenticates its token; the arena authenticates its MM.
 pub(crate) fn retire_native_operation<C: carrick_el1_abi::EntryContext>(
     region: &IpcRegion<'_>,
-    zone: &carrick_sched_core::ZoneTables<C>,
-    slot: carrick_el1_abi::SlotId,
+    source: carrick_el1_abi::BornInZoneSource<'_, C>,
     task: &CurrentTask,
     binding: carrick_el1_abi::ExecutionBinding,
     operation: carrick_sched_core::object_wait::OperationToken,
+    completion: &dyn Fn(carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>),
+    wake: &dyn Fn(WakeEffects),
 ) -> Result<usize, crate::native_process_runtime::NativeProcessError> {
     use crate::native_process_runtime::NativeProcessError;
+    let zone = source.zone;
+    let slot = source.slot;
     let token = from_sched_token(operation).ok_or(NativeProcessError::Quarantined)?;
     let op = region
         .operation(&token)
@@ -1484,32 +1542,30 @@ pub(crate) fn retire_native_operation<C: carrick_el1_abi::EntryContext>(
         return Err(NativeProcessError::Quarantined);
     }
     let op = region
-        .finish_operation(token, || notify_operation_release(region, zone, slot))
+        .finish_operation(token, || {
+            notify_operation_release(region, zone, slot, completion)
+        })
         .map_err(|_| NativeProcessError::Stale)?;
     let release = region
         .fd(EL1_WAIT)
         .unpin_filtered(OfdPin::from_raw(op.pin), is_zone_releasable_backing)
         .map_err(|_| NativeProcessError::Quarantined)?;
-    settle_native_release(region, release, Some((zone, slot)), task)
+    settle_native_release(region, release, Some((zone, slot)), task, wake)
         .map_err(|_| NativeProcessError::Quarantined)?;
     usize::try_from(op.progress.written).map_err(|_| NativeProcessError::Quarantined)
 }
 
 /// Count why a call leaves for the host (`Counters::ipc_leaves`).
-fn note<C: ThreadCpu, U: UserWord>(sched: &Sched<'_, C, U>, why: IpcLeave) {
-    sched.counters.ipc_leaves[why as usize].fetch_add(1, Ordering::Relaxed);
+fn note<E: IpcExecution>(sched: &E, why: IpcLeave) {
+    sched.counters().ipc_leaves[why as usize].fetch_add(1, Ordering::Relaxed);
 }
 
-fn leave<C: ThreadCpu, U: UserWord>(
-    sched: &Sched<'_, C, U>,
-    why: IpcLeave,
-    served: IpcServed,
-) -> IpcServed {
+fn leave<E: IpcExecution>(sched: &E, why: IpcLeave, served: IpcServed) -> IpcServed {
     note(sched, why);
     served
 }
 
-fn refuse<C: ThreadCpu, U: UserWord>(sched: &Sched<'_, C, U>, why: IpcLeave) -> Admission {
+fn refuse<E: IpcExecution>(sched: &E, why: IpcLeave) -> Admission {
     note(sched, why);
     Admission::Forward
 }
@@ -1517,9 +1573,9 @@ fn refuse<C: ThreadCpu, U: UserWord>(sched: &Sched<'_, C, U>, why: IpcLeave) -> 
 /// The call cannot continue in EL1: before any effect of a never-parked
 /// call, forward it unchanged; otherwise hand the owned operation back.
 #[allow(clippy::too_many_arguments)]
-fn bail<C: ThreadCpu, U: UserWord, M: UserCopy>(
-    sched: &mut Sched<'_, C, U>,
-    frame: &mut TrapFrame,
+fn bail<E: IpcExecution, M: UserCopy>(
+    sched: &mut E,
+    frame: &mut E::Frame,
     token: IpcOpToken,
     op: IpcOperation,
     resumed: bool,
@@ -1554,7 +1610,7 @@ fn bail<C: ThreadCpu, U: UserWord, M: UserCopy>(
                     })),
                 OwnedOperationYield::Suspended => Ok(IpcServed::Idle),
                 OwnedOperationYield::Complete(result) => {
-                    frame.x[0] = result as u64;
+                    frame.set_result(result as u64);
                     Ok(IpcServed::Returned { switched: false })
                 }
                 OwnedOperationYield::Unrouted(_) => crate::dispatch::invalid_completion(
@@ -1569,20 +1625,20 @@ fn bail<C: ThreadCpu, U: UserWord, M: UserCopy>(
             crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding);
         }
         finish_native(sched, token, &venue.region);
-        frame.x[0] = if matches!(why, IpcLeave::FaultFirst) {
+        frame.set_result(if matches!(why, IpcLeave::FaultFirst) {
             if op.progress.written == 0 {
                 carrick_syscall_abi::LINUX_EFAULT.guest_retval() as u64
             } else {
                 op.progress.written
             }
         } else {
-            sched.counters.record_refusal(
+            sched.counters().record_refusal(
                 carrick_guest_arch::NativeOrdinal::new(u64::from(op.nr)),
                 user.service_origin(),
                 carrick_el1_abi::RefusalVenue::Ring,
             );
             carrick_syscall_abi::LINUX_ENOSYS.guest_retval() as u64
-        };
+        });
         return Ok(IpcServed::Returned { switched: false });
     }
     if op.progress.written == 0 && !resumed {
@@ -1592,17 +1648,21 @@ fn bail<C: ThreadCpu, U: UserWord, M: UserCopy>(
     Ok(handback(frame, token, op, IpcHandback::Continue, 0, venue))
 }
 
-fn retain_native_operation<C: ThreadCpu, U: UserWord>(sched: &Sched<'_, C, U>, token: IpcOpToken) {
+fn retain_native_operation<E: IpcExecution>(sched: &E, token: IpcOpToken) {
     let operation = to_sched_token(token).unwrap_or_else(|_| {
         crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
     });
-    let record = sched.zone.slot(sched.slot).current().unwrap_or_else(|| {
-        crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
-    });
+    let record = sched
+        .zone()
+        .slot(sched.slot())
+        .current()
+        .unwrap_or_else(|| {
+            crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+        });
     carrick_core::wait::restore_object_operation(
-        sched.zone,
-        sched.slot,
-        sched.zone.record(record).identity(),
+        sched.zone(),
+        sched.slot(),
+        sched.zone().record(record).identity(),
         operation,
     )
     .unwrap_or_else(|_| {
@@ -1610,14 +1670,12 @@ fn retain_native_operation<C: ThreadCpu, U: UserWord>(sched: &Sched<'_, C, U>, t
     });
 }
 
-fn finish_native<C: ThreadCpu, U: UserWord>(
-    sched: &mut Sched<'_, C, U>,
-    token: IpcOpToken,
-    region: &IpcRegion<'_>,
-) {
+fn finish_native<E: IpcExecution>(sched: &mut E, token: IpcOpToken, region: &IpcRegion<'_>) {
     let op = region
         .finish_operation(token, || {
-            notify_operation_release(region, sched.zone, sched.slot)
+            notify_operation_release(region, sched.zone(), sched.slot(), &|owned| {
+                sched.deliver_completion(owned)
+            })
         })
         .unwrap_or_else(|_| {
             crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
@@ -1628,16 +1686,22 @@ fn finish_native<C: ThreadCpu, U: UserWord>(
         .unwrap_or_else(|_| {
             crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
         });
-    settle_native_release(region, release, Some((sched.zone, sched.slot)), sched.task)
-        .unwrap_or_else(|_| {
-            crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
-        });
+    settle_native_release(
+        region,
+        release,
+        Some((sched.zone(), sched.slot())),
+        sched.task(),
+        &|effects| sched.deliver_release_wake(effects),
+    )
+    .unwrap_or_else(|_| {
+        crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+    });
 }
 
 /// Hand the owned operation to the host: the record says what to do; the
 /// frame carries only the token (`x0`) and [`IPC_HANDBACK_NR`] (`x8`).
-fn handback(
-    frame: &mut TrapFrame,
+fn handback<F: IpcFrame>(
+    frame: &mut F,
     token: IpcOpToken,
     mut op: IpcOperation,
     what: IpcHandback,
@@ -1648,12 +1712,12 @@ fn handback(
     op.result = result;
     if op.nr == 0 {
         // A resumed operation: the re-executed SVC carries its registers.
-        op.orig_x0 = frame.x[0];
-        op.nr = frame.x[8] as u32;
+        op.orig_x0 = frame.argument(0);
+        op.nr = frame.native_number().raw() as u32;
     }
     let _ = venue.region.update_operation(&token, op);
-    frame.x[8] = IPC_HANDBACK_NR;
-    frame.x[0] = token.into_raw().pack();
+    frame.set_handback_number();
+    frame.set_result(token.into_raw().pack());
     IpcServed::Handback
 }
 
@@ -2363,6 +2427,221 @@ mod tests {
         (held, record)
     }
 
+    struct CompletionTransport<'a, C: ThreadCpu, U: UserWord> {
+        inner: Sched<'a, C, U>,
+        delivered: &'a core::cell::Cell<usize>,
+        refuse_park: Option<&'a dyn Fn()>,
+        release_delivered: core::cell::Cell<usize>,
+    }
+
+    impl<C: ThreadCpu, U: UserWord> IpcExecution for CompletionTransport<'_, C, U> {
+        type Context = carrick_el1_abi::Aarch64ParkedContext;
+        type Frame = TrapFrame;
+        fn zone(&self) -> &ZoneTables {
+            self.inner.zone
+        }
+        fn slot(&self) -> carrick_el1_abi::SlotId {
+            self.inner.slot
+        }
+        fn task(&self) -> &CurrentTask {
+            self.inner.task
+        }
+        fn counters(&self) -> &carrick_el1_abi::Counters {
+            self.inner.counters
+        }
+        fn now(&self) -> u64 {
+            self.inner.cpu.now()
+        }
+        fn ticks(&self, ns: u64) -> u64 {
+            self.inner.ticks(ns)
+        }
+        fn take_object_operation(
+            &self,
+        ) -> Result<Option<carrick_sched_core::object_wait::OperationToken>, ObjectWaitError>
+        {
+            self.inner.take_object_operation()
+        }
+        fn finish_object_wake(&mut self, effects: WakeEffects) {
+            self.inner.finish_object_wake(effects);
+        }
+        fn deliver_release_wake(&self, effects: WakeEffects) {
+            self.release_delivered.set(self.release_delivered.get() + 1);
+            self.inner.deliver_release_wake(effects);
+        }
+        fn deliver_completion(
+            &self,
+            owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, Self::Context>,
+        ) {
+            self.delivered.set(self.delivered.get() + 1);
+            self.inner.deliver_completion(owned);
+        }
+        fn park(
+            &mut self,
+            frame: &mut TrapFrame,
+            key: carrick_sched_core::object_wait::ObjectWaitKey,
+            snapshot: ObjectStateSnapshot,
+            operation: carrick_sched_core::object_wait::OperationToken,
+            deadline: Option<u64>,
+            interrupt: Option<&mut dyn FnMut() -> bool>,
+        ) -> Result<
+            IpcServed,
+            (
+                ObjectWaitError,
+                carrick_sched_core::object_wait::OperationToken,
+            ),
+        > {
+            if let Some(refuse) = self.refuse_park {
+                refuse();
+                return Err((ObjectWaitError::Stale, operation));
+            }
+            IpcExecution::park(
+                &mut self.inner,
+                frame,
+                key,
+                snapshot,
+                operation,
+                deadline,
+                interrupt,
+            )
+        }
+        fn park_owner(
+            &mut self,
+            frame: &mut TrapFrame,
+            wait: carrick_core_abi::PortalOwnerWait,
+            operation: carrick_sched_core::object_wait::OperationToken,
+        ) -> Result<
+            IpcServed,
+            (
+                ObjectWaitError,
+                carrick_sched_core::object_wait::OperationToken,
+            ),
+        > {
+            IpcExecution::park_owner(&mut self.inner, frame, wait, operation)
+        }
+    }
+
+    #[test]
+    fn native_final_pipe_pin_release_uses_execution_transport() {
+        let w = world();
+        let table = w.table(w.a_tid);
+        let (read, _write, object) = w.pipe(table, BLOCK);
+        w.mem.map(MM, 0x10000, PAGE);
+        let mut frame = syscall(SYS_READ, read, 0x10000, 1, A_SVC);
+        // Native notification authenticates the selected record, as the
+        // production executor does before dispatching a blocked operation.
+        w.queue(w.a_tid, MM, &frame, A_SVC);
+        assert!(w.zone.switch_in_full(SLOT).is_some());
+        w.task.linux.file_table.store(w.a_tid, Ordering::Relaxed);
+        w.map.publish(w.a_tid, table.to_raw()).unwrap();
+        let venue = w.venue();
+        // Bind the writer notification lane without inventing a blocked
+        // writer: this test observes transport, not peer scheduling.
+        w.zone
+            .bind_object_wait(wait_key(object, WaitFor::Writable).unwrap(), &HostWait)
+            .unwrap();
+        let mut cpu = FakeCpu::default();
+        let delivered = core::cell::Cell::new(0);
+        let close_before_refusal = || {
+            // The public transfer entry has pinned the endpoint and released
+            // the object lock before asking its execution venue to park.
+            assert_eq!(w.host().close(table, Fd(read)), Ok(None));
+        };
+        let mut sched = CompletionTransport {
+            inner: Sched {
+                handoff: None,
+                zone: &w.zone,
+                slot: SLOT,
+                task: &w.task,
+                cpu: &mut cpu,
+                user: &HardwareUserWord,
+                counters: w.counters,
+            },
+            delivered: &delivered,
+            refuse_park: Some(&close_before_refusal),
+            release_delivered: core::cell::Cell::new(0),
+        };
+        let mut user = User {
+            task: &w.task,
+            mem: &w.mem,
+        };
+        assert_eq!(
+            serve_ipc_with_signals(&mut sched, &mut frame, &venue, &mut user, true, &mut || {
+                false
+            })
+            .0,
+            IpcServed::Returned { switched: false }
+        );
+        assert_eq!(frame.x[0] as i64, -38);
+        assert_eq!(
+            w.region
+                .lock(object, &HostWait)
+                .unwrap()
+                .pipe()
+                .unwrap()
+                .references(End::Reader),
+            0
+        );
+        assert!(
+            sched.release_delivered.get() > 0,
+            "final endpoint release bypassed execution transport"
+        );
+    }
+
+    #[test]
+    fn ipc_operation_completion_uses_execution_transport() {
+        let w = world();
+        w.mem.map(MM, 0x10000, PAGE);
+        let table = w.table(w.a_tid);
+        let fd = w.eventfd(table, 1, EventMode::Counter, BLOCK);
+        let mut frame = syscall(SYS_READ, fd, 0x10000, 8, A_SVC);
+        let venue = w.venue();
+        let mut cpu = FakeCpu::default();
+        let delivered = core::cell::Cell::new(0);
+        let mut sched = CompletionTransport {
+            inner: Sched {
+                handoff: None,
+                zone: &w.zone,
+                slot: SLOT,
+                task: &w.task,
+                cpu: &mut cpu,
+                user: &HardwareUserWord,
+                counters: w.counters,
+            },
+            delivered: &delivered,
+            refuse_park: None,
+            release_delivered: core::cell::Cell::new(0),
+        };
+        // Bind the real release source before completion. Keep one arena
+        // slot free for the call's production admission and retain a waiter
+        // on the existing release queue.
+        let (mut held, waiter) = slot_release_waiter(&w);
+        let free = held.pop().unwrap();
+        w.region.finish_operation(free, || {}).unwrap();
+        let mut user = User {
+            task: &w.task,
+            mem: &w.mem,
+        };
+        assert_eq!(
+            serve_ipc_with_signals(&mut sched, &mut frame, &venue, &mut user, true, &mut || {
+                false
+            })
+            .0,
+            IpcServed::Returned { switched: false },
+        );
+        assert_eq!(frame.x[0], 8);
+        assert!(matches!(
+            w.zone.record(waiter).claim(),
+            carrick_sched_core::Claim::Queued { .. }
+        ));
+        assert!(
+            delivered.get() > 0,
+            "retirement bypassed the execution transport"
+        );
+        for token in held {
+            finish(&mut sched, token, w.region);
+        }
+    }
+
     #[test]
     fn ipc_operation_slot_native_finish_and_retire_publish() {
         for retiring in [false, true] {
@@ -2398,11 +2677,15 @@ mod tests {
                 };
                 retire_native_operation(
                     w.region,
-                    &w.zone,
-                    SLOT,
+                    carrick_el1_abi::BornInZoneSource {
+                        zone: &w.zone,
+                        slot: SLOT,
+                    },
                     &w.task,
                     binding,
                     to_sched_token(token).unwrap(),
+                    &|owned| sched.deliver_completion(owned),
+                    &|effects| sched.deliver_release_wake(effects),
                 )
                 .unwrap();
             } else {
@@ -2809,6 +3092,93 @@ mod tests {
     }
 
     #[test]
+    fn el1_ipc_readv_without_native_custody_declines_before_effects() {
+        let mut w = world();
+        let t = w.table(w.a_tid);
+        let (reader, writer, object) = w.pipe(t, NONBLOCK);
+        w.mem.write(MM, 0x100000, b"abcdef");
+        let mut f = syscall(SYS_WRITE, writer, 0x100000, 6, A_SVC);
+        assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 6));
+        let headers = [0x100100u64, 2, 0x100200, 4]
+            .into_iter()
+            .flat_map(u64::to_ne_bytes)
+            .collect::<Vec<_>>();
+        w.mem.write(MM, 0x100300, &headers);
+        let storage = w.region.descriptor_allocations();
+        let mut f = syscall(65, reader, 0x100300, 2, A_SVC);
+        let before = f;
+        assert_eq!(w.call(&mut f), IpcServed::Forward);
+        assert_eq!((f.x, f.elr), (before.x, before.elr));
+        assert_eq!(w.mem.read(MM, 0x100300, headers.len()), headers);
+        assert_eq!(w.region.descriptor_allocations(), storage);
+        assert_eq!(
+            w.region
+                .lock(object, &HostWait)
+                .unwrap()
+                .pipe()
+                .unwrap()
+                .unread_bytes(),
+            6
+        );
+    }
+
+    #[test]
+    fn el1_ipc_readv_scatters_and_consumes_each_byte_once() {
+        let mut w = world();
+        let t = w.table(w.a_tid);
+        let (reader, writer, _) = w.pipe(t, NONBLOCK);
+        w.mem.write(MM, 0x100000, b"abcdef");
+        let mut f = syscall(SYS_WRITE, writer, 0x100000, 6, A_SVC);
+        assert_eq!((w.call_with_owner(&mut f, true), f.x[0]), (RETURNED, 6));
+        let headers = [0x100100u64, 2, 0, 0, 0x100200, 4]
+            .into_iter()
+            .flat_map(u64::to_ne_bytes)
+            .collect::<Vec<_>>();
+        w.mem.write(MM, 0x100300, &headers);
+        let storage = w.region.descriptor_allocations();
+        let mut f = syscall(65, reader, 0x100300, 3, A_SVC);
+        assert_eq!((w.call_with_owner(&mut f, true), f.x[0]), (RETURNED, 6));
+        assert_eq!(w.mem.read(MM, 0x100100, 2), b"ab");
+        assert_eq!(w.mem.read(MM, 0x100200, 4), b"cdef");
+        assert_eq!(w.region.descriptor_allocations(), storage);
+        let mut f = syscall(SYS_READ, reader, 0x100100, 1, A_SVC);
+        assert_eq!((w.call(&mut f), f.x[0] as i64), (RETURNED, linux::EAGAIN));
+        assert_eq!(host_calls(&w), 0);
+    }
+
+    #[test]
+    fn el1_ipc_readv_payload_fault_preserves_the_incomplete_pipe_buffer() {
+        // Native x86 Linux oracle: a fault in the second vector may modify
+        // the first destination, but consumes only complete pipe buffers.
+        for prefix in [0usize, 4096] {
+            let mut w = world();
+            let t = w.table(w.a_tid);
+            let (reader, writer, _) = w.pipe(t, NONBLOCK);
+            let mut payload = std::vec![b'x'; prefix];
+            payload.extend_from_slice(b"abcdef");
+            w.mem.write(MM, 0x100000, &payload);
+            let mut f = syscall(SYS_WRITE, writer, 0x100000, payload.len() as u64, A_SVC);
+            assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, payload.len() as u64));
+            w.mem.map(MM, 0x200000, 8192);
+            let headers = [0x200000u64, prefix as u64 + 2, 0x400000, 4]
+                .into_iter()
+                .flat_map(u64::to_ne_bytes)
+                .collect::<Vec<_>>();
+            w.mem.write(MM, 0x100000, &headers);
+            let storage = w.region.descriptor_allocations();
+            let mut f = syscall(65, reader, 0x100000, 2, A_SVC);
+            assert_eq!(w.call_with_owner(&mut f, true), RETURNED);
+            assert_eq!(f.x[0] as i64, if prefix == 0 { -14 } else { prefix as i64 });
+            assert_eq!(w.mem.read(MM, 0x200000, prefix + 2), payload[..prefix + 2]);
+            let mut f = syscall(SYS_READ, reader, 0x100200, 6, A_SVC);
+            assert_eq!((w.call(&mut f), f.x[0]), (RETURNED, 6));
+            assert_eq!(w.mem.read(MM, 0x100200, 6), b"abcdef");
+            assert_eq!(w.region.descriptor_allocations(), storage);
+            assert_eq!(host_calls(&w), 0);
+        }
+    }
+
+    #[test]
     fn el1_ipc_writev_preserves_vector_order_on_a_pipe() {
         let mut w = world();
         let t = w.table(w.a_tid);
@@ -3179,15 +3549,25 @@ mod tests {
 
     #[test]
     fn two_live_process_pipe_owner_wait_retains_exact_bytes_and_cursor() {
-        pipe_owner_wait_with_peer(false);
+        pipe_owner_wait_with_peer(false, false);
     }
 
     #[test]
     fn two_live_process_pipe_owner_wait_returns_delivered_prefix_if_peer_drains() {
-        pipe_owner_wait_with_peer(true);
+        pipe_owner_wait_with_peer(true, false);
     }
 
-    fn pipe_owner_wait_with_peer(peer_drains: bool) {
+    #[test]
+    fn two_live_process_pipe_readv_owner_wait_retains_headers_and_cursor() {
+        pipe_owner_wait_with_peer(false, true);
+    }
+
+    #[test]
+    fn two_live_process_pipe_readv_owner_wait_returns_prefix_if_peer_drains() {
+        pipe_owner_wait_with_peer(true, true);
+    }
+
+    fn pipe_owner_wait_with_peer(peer_drains: bool, vectored: bool) {
         use crate::mm_portal::test_support::{IPA, Region, Tables, VA, nodes, residency};
         use crate::mm_portal::{GuestVa, MmError, MmPortal, TransferIntent};
         use carrick_core_abi::{
@@ -3284,7 +3664,16 @@ mod tests {
                 self.wait.take()
             }
         }
-        let mut frame = syscall(SYS_READ, read, VA, 8192, A_SVC);
+        let mut frame = if vectored {
+            let headers = [VA, 4096, 0, 0, VA + 4096, 4096]
+                .into_iter()
+                .flat_map(u64::to_ne_bytes)
+                .collect::<Vec<_>>();
+            w.mem.write(MM, 0x90000, &headers);
+            syscall(65, read, 0x90000, 3, A_SVC)
+        } else {
+            syscall(SYS_READ, read, VA, 8192, A_SVC)
+        };
         {
             let mut check = |at, len| {
                 if at == VA + 4096 && !raised {
@@ -3346,12 +3735,25 @@ mod tests {
                 tables: &w.tables,
             };
             assert_eq!(
-                serve_ipc(&mut sched, &mut frame, &venue, &mut user),
+                serve_ipc_with_signals(
+                    &mut sched,
+                    &mut frame,
+                    &venue,
+                    &mut user,
+                    vectored,
+                    &mut || false
+                )
+                .0,
                 SWITCHED,
                 "an owner refusal after a delivered page must park with its cursor"
             );
         }
         drop(view);
+        if vectored {
+            // The sibling changes the guest array while output waits. Resume
+            // must keep the imported headers and the delivered-byte cursor.
+            w.mem.write(MM, 0x90000, &[0; 48]);
+        }
         assert_eq!(w.mem.read(MM, VA, 4096), pattern[..4096]);
         assert_eq!(
             w.region
@@ -3375,7 +3777,10 @@ mod tests {
         assert_eq!(w.call(&mut frame), SWITCHED);
         reenter(&mut frame, A_SVC);
         let delivered = if peer_drains { 4096 } else { 8192 };
-        assert_eq!((w.call(&mut frame), frame.x[0]), (RETURNED, delivered));
+        assert_eq!(
+            (w.call_with_owner(&mut frame, vectored), frame.x[0]),
+            (RETURNED, delivered)
+        );
         assert_eq!(
             w.mem.read(MM, VA, delivered as usize),
             pattern[..delivered as usize]
@@ -5452,5 +5857,175 @@ mod tests {
         seq.fetch_add(1, Ordering::Release);
         assert_eq!(tables.table_of(&task), Some(raw(2)));
         assert_eq!(native_exec_table(&tables, &task), expected);
+    }
+}
+
+#[cfg(test)]
+mod bound_venue_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    fn attach_registered_layout(
+        layout: carrick_guest_arch::KernelLayout,
+        directory_va: u64,
+        pool_va: u64,
+    ) {
+        use carrick_el1_abi::*;
+        use carrick_guest_arch::{FrameGpa, GuestLen, KernelVa};
+        struct Mapping(*mut u8, usize);
+        impl Mapping {
+            fn new(address: u64, bytes: u64) -> Self {
+                // SAFETY: a hint only, never replaces an existing mapping.
+                let pointer = unsafe {
+                    libc::mmap(
+                        address as *mut _,
+                        bytes as usize,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+                assert_ne!(pointer, libc::MAP_FAILED);
+                let mapping = Self(pointer.cast(), bytes as usize);
+                assert_eq!(pointer as u64, address, "fixture VA must be available");
+                mapping
+            }
+        }
+        impl Drop for Mapping {
+            fn drop(&mut self) {
+                // SAFETY: owned mapping, all views have gone out of scope.
+                assert_eq!(unsafe { libc::munmap(self.0.cast(), self.1) }, 0);
+            }
+        }
+        let storage = Mapping::new(layout.region.raw(), EL1_REGION_SIZE);
+        let directory = Mapping::new(directory_va, EL1_IPC_DIRECTORY_SPAN);
+        let pool = Mapping::new(pool_va, EL1_IPC_POOL_SPAN);
+        let region = FileRegionBinding::new(
+            FileRegionId::from_carrier(core::num::NonZeroU64::MIN),
+            layout.region,
+            FrameGpa::new(0x1_0000_0000),
+            GuestLen::new(EL1_REGION_SIZE),
+        )
+        .unwrap();
+        // SAFETY: exclusive initialized mapping retained through registration drop.
+        let mut registration = unsafe {
+            FileRegionRegistration::initialize(core::ptr::NonNull::new(storage.0).unwrap(), region)
+        }
+        .unwrap();
+        // SAFETY: the fixture retains its registered supervisor mapping.
+        assert_eq!(
+            unsafe { FileRegionBinding::in_guest_layout(layout) },
+            Ok(region)
+        );
+        let binding = IpcWindowBinding::new(
+            region,
+            KernelVa::new(directory.0 as u64),
+            FrameGpa::new(0x6_0000_0000),
+            GuestLen::new(EL1_IPC_DIRECTORY_SPAN),
+            KernelVa::new(pool.0 as u64),
+            FrameGpa::new(0x7_0000_0000),
+            GuestLen::new(EL1_IPC_POOL_SPAN),
+        )
+        .unwrap();
+        // SAFETY: all three mappings are retained by this fixture.
+        assert!(
+            unsafe { guest_venue(layout, binding) }.is_none(),
+            "unpublished window"
+        );
+        // SAFETY: exclusive owned storage, exact admitted extents.
+        unsafe { IpcRegion::initialize(directory.0.cast(), directory.1, pool.0, pool.1, 42) }
+            .unwrap();
+        {
+            let tables = registration.tables(region).unwrap();
+            let map = tables.ipc_table_map();
+            let table = RawTableId {
+                authority: 42,
+                index: 3,
+                generation: 7,
+            };
+            map.publish_owned(19, table).unwrap();
+            map.publish_window();
+            // SAFETY: registration and storage outlive the attached venue.
+            let venue = unsafe { guest_venue(layout, binding) }.unwrap();
+            assert_eq!(venue.tables.table_for_file_table(19), Some(table));
+            assert_eq!(venue.tables.table_for_file_table(20), None);
+        }
+        registration.retire();
+        // SAFETY: storage remains mapped after withdrawing the registration.
+        assert_eq!(
+            unsafe { FileRegionBinding::in_guest_layout(layout) },
+            Err(FileRegionError::Retired),
+        );
+        // SAFETY: storage is retained, but the registration is now retired.
+        assert!(
+            unsafe { guest_venue(layout, binding) }.is_none(),
+            "retired identity"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relocated_x86_layout_attaches_registered_ipc_venue() {
+        // The upper-canonical x86 VA requires KVM; relocate its region only.
+        attach_registered_layout(
+            carrick_guest_arch::KernelLayout {
+                region: carrick_guest_arch::KernelVa::new(0x3_0000_0000),
+                ..carrick_el1::isa::x86_kernel_layout()
+            },
+            0x4_0000_0000,
+            0x5_0000_0000,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn arm_layout_attaches_the_same_registered_ipc_venue() {
+        use carrick_el1_abi::*;
+        use carrick_guest_arch::{KernelLayout, KernelVa};
+        // ARM's lower-canonical supervisor geometry is host-mappable. This
+        // authenticates registration and attachment, not guest execution.
+        attach_registered_layout(
+            KernelLayout {
+                region: KernelVa::new(EL1_REGION_BASE),
+                zone: KernelVa::new(EL1_ZONE_BASE),
+                portal: KernelVa::new(EL1_MM_PORTAL_BASE),
+                dynamic_metadata: KernelVa::new(EL1_DYNAMIC_METADATA_BASE),
+            },
+            EL1_IPC_BASE,
+            EL1_IPC_POOL_BASE,
+        );
+    }
+
+    #[test]
+    fn guest_venue_refuses_foreign_layout_before_memory_access() {
+        use carrick_el1_abi::*;
+        use carrick_guest_arch::{FrameGpa, GuestLen, KernelVa};
+        let layout = carrick_el1::isa::x86_kernel_layout();
+        let region = FileRegionBinding::new(
+            FileRegionId::from_carrier(core::num::NonZeroU64::MIN),
+            layout.region,
+            FrameGpa::new(0x1_0000_0000),
+            GuestLen::new(EL1_REGION_SIZE),
+        )
+        .unwrap();
+        let binding = IpcWindowBinding::new(
+            region,
+            KernelVa::new(0x4_0000_0000),
+            FrameGpa::new(0x6_0000_0000),
+            GuestLen::new(EL1_IPC_DIRECTORY_SPAN),
+            KernelVa::new(0x5_0000_0000),
+            FrameGpa::new(0x7_0000_0000),
+            GuestLen::new(EL1_IPC_POOL_SPAN),
+        )
+        .unwrap();
+        let foreign = carrick_guest_arch::KernelLayout {
+            region: KernelVa::new(0),
+            ..layout
+        };
+        // SAFETY: a foreign layout must be rejected before accessing memory.
+        assert!(unsafe { guest_venue(foreign, binding) }.is_none());
     }
 }

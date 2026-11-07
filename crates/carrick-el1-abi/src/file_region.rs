@@ -31,6 +31,14 @@ struct FileRegionHeader {
 
 const _: () = {
     assert!(size_of::<FileRegionHeader>() == 64);
+    assert!(
+        crate::EL1_IPC_TABLE_MAP_OFFSET + size_of::<crate::ipc_tables::IpcTableMap>() as u64
+            <= EL1_REGION_SIZE
+    );
+    assert!(
+        crate::EL1_IPC_TABLE_MAP_OFFSET
+            .is_multiple_of(align_of::<crate::ipc_tables::IpcTableMap>() as u64)
+    );
     assert!(size_of::<[DelegatedFile; MAX_DELEGATED_FILES]>() as u64 <= EL1_OBJECT_TABLE_SIZE);
     assert!(size_of::<[FdMapSlot; FD_MAP_CAPACITY]>() as u64 <= EL1_FD_MAP_SIZE);
     assert!(
@@ -106,6 +114,37 @@ pub struct FileRegionBinding {
 }
 
 impl FileRegionBinding {
+    /// Recover the mapping owner's publication at this image's supervisor layout.
+    /// This supplies geometry, not host mapping custody.
+    ///
+    /// # Safety
+    /// The current carrier retains an initialized, supervisor-only region at
+    /// `layout.region` for the call. Its header is immutable after publication;
+    /// retirement may only clear the atomic identity. Host callers may use this
+    /// only in fixtures that retain storage at the supplied supervisor VA.
+    pub unsafe fn in_guest_layout(
+        layout: carrick_guest_arch::KernelLayout,
+    ) -> Result<Self, FileRegionError> {
+        let base = layout.region.raw();
+        if base == 0 || !base.is_multiple_of(4096) || base.checked_add(EL1_REGION_SIZE).is_none() {
+            return Err(FileRegionError::Layout);
+        }
+        // SAFETY: the caller retains the initialized header in this extent.
+        let header =
+            unsafe { &*((base + EL1_FILE_REGION_HEADER_OFFSET) as *const FileRegionHeader) };
+        let identity = NonZeroU64::new(header.live_identity.load(Ordering::Acquire))
+            .ok_or(FileRegionError::Retired)?;
+        if header.guest != layout.region {
+            return Err(FileRegionError::Foreign);
+        }
+        Self::new(
+            FileRegionId::from_carrier(identity),
+            header.guest,
+            header.physical,
+            header.bytes,
+        )
+    }
+
     pub const UNPUBLISHED: Self = Self {
         identity: FileRegionId(0),
         guest: KernelVa::new(0),
@@ -153,8 +192,30 @@ impl FileRegionBinding {
     }
 }
 
+/// Retained carrier ownership for descriptor publications that outlive a
+/// host boundary. Implementations authenticate their registration and retain
+/// its mapping while invoking the visitor. No borrowed map may escape.
+pub trait IpcTableMapBacking: Send + Sync {
+    /// Visit exactly once while the registration is live; refuse without a
+    /// visit after retirement. The map borrow cannot escape its custody.
+    ///
+    /// ```compile_fail
+    /// use carrick_el1_abi::{IpcTableMapBacking, ipc_tables::IpcTableMap};
+    /// fn escape(backing: &dyn IpcTableMapBacking) -> &'static IpcTableMap {
+    ///     let mut escaped = None;
+    ///     backing.with_table_map(&mut |map| escaped = Some(map)).unwrap();
+    ///     escaped.unwrap()
+    /// }
+    /// ```
+    fn with_table_map(
+        &self,
+        visitor: &mut dyn FnMut(&crate::ipc_tables::IpcTableMap),
+    ) -> Result<(), FileRegionError>;
+}
+
 /// Non-cloning host registration. Its constructor requires retained mapping
 /// custody; a bare process-global region pointer cannot create this authority.
+#[derive(Debug)]
 pub struct FileRegionRegistration {
     mapped: NonNull<u8>,
     binding: FileRegionBinding,
@@ -204,6 +265,14 @@ impl FileRegionRegistration {
                 .add(EL1_NAME_CACHE_OFFSET as usize)
                 .cast::<InotifyNameCache>()
                 .write(InotifyNameCache::new());
+            // The map contains only integer atomics and reserved integers;
+            // all-zero is its empty, unpublished state. Initialize in place
+            // without a large by-value temporary on a supervisor stack.
+            mapped
+                .as_ptr()
+                .add(crate::EL1_IPC_TABLE_MAP_OFFSET as usize)
+                .cast::<crate::ipc_tables::IpcTableMap>()
+                .write_bytes(0, 1);
             mapped
                 .as_ptr()
                 .add(EL1_FILE_REGION_HEADER_OFFSET as usize)
@@ -326,7 +395,6 @@ impl<'a> FileTables<'a> {
     /// initialized physical extent for `'a`. Guest consumers must stop before
     /// the host retires the registration. This converts a guest VA only in the
     /// guest; host code must use `FileRegionRegistration::tables`.
-    #[cfg(target_os = "none")]
     pub unsafe fn in_guest(expected: FileRegionBinding) -> Result<Self, FileRegionError> {
         if expected.identity.raw() == 0 {
             return Err(FileRegionError::Unpublished);
@@ -335,6 +403,34 @@ impl<'a> FileTables<'a> {
             NonNull::new(expected.guest.raw() as *mut u8).ok_or(FileRegionError::Layout)?;
         // SAFETY: guest mapping custody is the caller's explicit obligation.
         unsafe { Self::attach(mapped, expected) }
+    }
+
+    /// Descriptor namespace map in this authenticated carrier's region.
+    /// The borrow retains registration custody; no process-global aperture
+    /// or ISA-specific virtual address participates in host resolution.
+    pub fn ipc_table_map(&self) -> &crate::ipc_tables::IpcTableMap {
+        self.retained_ipc_table_map()
+    }
+
+    /// Consume the view while retaining the original registration lifetime.
+    /// A guest venue can keep this map after the temporary file view is gone;
+    /// its mapping custody is still bounded by the registration borrow (or
+    /// the explicit unsafe guest-attachment contract).
+    pub fn into_ipc_table_map(self) -> &'a crate::ipc_tables::IpcTableMap {
+        self.retained_ipc_table_map()
+    }
+
+    fn retained_ipc_table_map(&self) -> &'a crate::ipc_tables::IpcTableMap {
+        // SAFETY: registration initializes this reservation before publishing
+        // its identity. Attachment authenticates that identity and retains
+        // mapping custody for 'a; the ABI checks extent and alignment.
+        unsafe {
+            &*self
+                .mapped
+                .as_ptr()
+                .add(crate::EL1_IPC_TABLE_MAP_OFFSET as usize)
+                .cast::<crate::ipc_tables::IpcTableMap>()
+        }
     }
 
     pub fn objects(&self) -> &[DelegatedFile; MAX_DELEGATED_FILES] {

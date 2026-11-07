@@ -4,7 +4,7 @@
 
 use carrick_el1_abi::*;
 use carrick_el1_linux::file_table::{
-    admit_host_fd, admit_stdio, close_host_binding, dup_host_binding, fork_fd_map, retire_fd_map,
+    DescriptorNamespace, admit_host_fd, admit_stdio, close_host_binding, dup_host_binding,
 };
 use carrick_guest_arch::{FrameGpa, GuestLen, KernelVa};
 use carrick_test_support::TestEl1Region;
@@ -232,7 +232,12 @@ fn file_region_fork_dup_lookup_and_retire_preserve_live_parent() {
     let shared_open = &tables.opens()[stdout as usize - 1];
     let incarnation = shared_open.generation.load(Ordering::Acquire);
     assert_eq!(shared_open.lifetime.ring_references(incarnation), Some(1));
-    assert!(fork_fd_map(tables.fd_map(), tables.opens(), 51, 52));
+    let namespace = DescriptorNamespace {
+        fd_map: tables.fd_map(),
+        open_table: tables.opens(),
+        ipc: None,
+    };
+    namespace.fork(51, 52).expect("child namespace");
     assert_eq!(shared_open.lifetime.ring_references(incarnation), Some(2));
     for table in [51, 52] {
         assert_eq!(
@@ -251,7 +256,9 @@ fn file_region_fork_dup_lookup_and_retire_preserve_live_parent() {
     assert!(
         open.is_bound_to(&tables.objects()[open.inode_handle.load(Ordering::Acquire) as usize - 1])
     );
-    retire_fd_map(tables.fd_map(), tables.opens(), 52);
+    let task = CurrentTask::new();
+    namespace.retire(52, &task).expect("retire child namespace");
+    assert!(task.linux.has_pending_host_work());
     assert_eq!(shared_open.lifetime.ring_references(incarnation), Some(2));
     assert_eq!(
         tables.fd_map()[child.1].incarnation.load(Ordering::Acquire),
@@ -293,4 +300,48 @@ fn file_region_unpublished_is_distinct_from_retired() {
         FileRegionError::Unpublished.fatal_payload(),
         FileRegionError::Retired.fatal_payload()
     );
+}
+
+#[test]
+fn x86_ipc_table_map_uses_retained_file_registration() {
+    let fixture = Fixture::new(1756);
+    let peer = Fixture::new(1757);
+    let tables = fixture.tables();
+    let map = tables.ipc_table_map();
+    let base = fixture._storage.as_ptr() as usize;
+    assert_eq!(
+        core::ptr::from_ref(map) as usize - base,
+        EL1_IPC_TABLE_MAP_OFFSET as usize
+    );
+    assert!(!map.window_published());
+    map.publish_window();
+    assert!(fixture.tables().ipc_table_map().window_published());
+    assert!(!peer.tables().ipc_table_map().window_published());
+    assert_eq!(
+        fixture.registration.binding().guest().raw(),
+        X86_CPL0_REGION_BASE
+    );
+}
+
+#[test]
+fn file_registration_initializes_ipc_map_before_publication() {
+    let mut storage = TestEl1Region::zeroed();
+    let mapped = NonNull::new(storage.as_mut_ptr()).expect("aligned storage");
+    // SAFETY: exclusive writable test storage; no references or consumers.
+    // Poison only the IPC reservation to prove registration initializes it.
+    unsafe {
+        mapped
+            .as_ptr()
+            .add(EL1_IPC_TABLE_MAP_OFFSET as usize)
+            .write_bytes(0xff, core::mem::size_of::<ipc_tables::IpcTableMap>());
+    }
+    // SAFETY: exclusive aligned full extent retained until registration drop.
+    let registration =
+        unsafe { FileRegionRegistration::initialize(mapped, binding(1758)) }.expect("publication");
+    let tables = registration
+        .tables(registration.binding())
+        .expect("own live region");
+    let map = tables.ipc_table_map();
+    assert!(!map.window_published());
+    assert!(map.lookup(1).is_none());
 }

@@ -1384,6 +1384,150 @@ fn el1_ipc_pool_areas_are_type_stable() {
 }
 
 #[test]
+fn ring_pipe_creation_is_backed_before_publication() {
+    let fx = fixture(1 << 20);
+    let mut storage = fx.pipe_storage();
+    let supplied = storage;
+    let object = fx
+        .region
+        .create_backed_pipe(65536, &mut storage, &EL1)
+        .unwrap();
+    assert_eq!(
+        storage,
+        IpcPipeStorage::default(),
+        "creation consumes its extent"
+    );
+    let mut guard = fx.region.lock(object, &EL1).unwrap();
+    assert_eq!(guard.storage(), supplied);
+    assert!(
+        guard.pipe().unwrap().is_backed(),
+        "no first-write host provisioning"
+    );
+    assert_eq!(guard.pipe().unwrap().try_write(b"once").result, Ok(4));
+    let mut output = [0; 4];
+    assert_eq!(guard.pipe().unwrap().try_read(&mut output).result, Ok(4));
+    assert_eq!(&output, b"once");
+    assert_eq!(
+        guard.pipe().unwrap().try_read(&mut output).result,
+        Err(pipe::Error::WouldBlock(pipe::WaitFor::Readable))
+    );
+}
+
+#[test]
+fn ring_pipe_creation_reuses_or_returns_retained_storage() {
+    let fx = fixture(1 << 20);
+    let mut storage = fx.pipe_storage();
+    let original = storage;
+    let object = fx
+        .region
+        .create_backed_pipe(4096, &mut storage, &EL1)
+        .unwrap();
+    fx.region.lock(object, &EL1).unwrap().free();
+
+    let mut spare = fx.pipe_storage();
+    let unused = spare;
+    let reused = fx
+        .region
+        .create_backed_pipe(65536, &mut spare, &EL1)
+        .unwrap();
+    assert_eq!(reused.index(), object.index());
+    assert_ne!(reused.generation(), object.generation());
+    assert_eq!(
+        spare, unused,
+        "fitting retained storage needs no new extent"
+    );
+    assert_eq!(fx.region.lock(reused, &EL1).unwrap().storage(), original);
+    fx.region.lock(reused, &EL1).unwrap().free();
+
+    // Grow beyond the retained extent: displaced storage returns to the owner.
+    let mut larger = IpcPipeStorage {
+        ring_bytes: 131072,
+        pages: 32,
+        offset: 0,
+    };
+    larger.offset = fx.bump(larger.footprint());
+    let installed = larger;
+    let grown = fx
+        .region
+        .create_backed_pipe(131072, &mut larger, &EL1)
+        .unwrap();
+    assert_eq!(grown.index(), object.index());
+    assert_eq!(larger, original);
+    assert_eq!(fx.region.lock(grown, &EL1).unwrap().storage(), installed);
+}
+
+#[test]
+fn ring_pipe_creation_rejects_bad_storage_without_spending_the_record() {
+    let fx = fixture(1 << 20);
+    let valid = fx.pipe_storage();
+    for invalid in [
+        IpcPipeStorage::default(),
+        IpcPipeStorage {
+            offset: fx.pool_len,
+            ..valid
+        },
+        IpcPipeStorage {
+            pages: u64::MAX,
+            ..valid
+        },
+        IpcPipeStorage {
+            ring_bytes: 4096,
+            pages: 1,
+            ..valid
+        },
+    ] {
+        let mut storage = invalid;
+        assert_eq!(
+            fx.region.create_backed_pipe(65536, &mut storage, &EL1),
+            Err(IpcError::BadStorage)
+        );
+        assert_eq!(storage, invalid);
+    }
+    let mut storage = valid;
+    let object = fx
+        .region
+        .create_backed_pipe(65536, &mut storage, &EL1)
+        .unwrap();
+    assert_eq!(
+        object.generation(),
+        0,
+        "failed creation never publishes a generation"
+    );
+    assert_eq!(fx.region.lock(object, &EL1).unwrap().storage(), valid);
+}
+
+#[test]
+fn ring_pipe_creation_refuses_overlap_and_preserves_retained_storage() {
+    let fx = fixture(1 << 20);
+    let mut storage = fx.pipe_storage();
+    let retained = storage;
+    let object = fx
+        .region
+        .create_backed_pipe(65536, &mut storage, &EL1)
+        .unwrap();
+    fx.region.lock(object, &EL1).unwrap().free();
+    let mut overlap = IpcPipeStorage {
+        ring_bytes: 131072,
+        pages: 32,
+        ..retained
+    };
+    let unchanged = overlap;
+    assert_eq!(
+        fx.region.create_backed_pipe(131072, &mut overlap, &EL1),
+        Err(IpcError::BadStorage)
+    );
+    assert_eq!(overlap, unchanged);
+    let mut none = IpcPipeStorage::default();
+    let reused = fx
+        .region
+        .create_backed_pipe(65536, &mut none, &EL1)
+        .unwrap();
+    assert_eq!(reused.index(), object.index());
+    assert_eq!(reused.generation(), object.generation() + 1);
+    assert_eq!(fx.region.lock(reused, &EL1).unwrap().storage(), retained);
+}
+
+#[test]
 fn vector_input_copy_fault_is_a_prefix_not_an_invariant() {
     let fx = fixture(1 << 20);
     let token = fx.region.begin_operation(IpcOperation::EMPTY).unwrap();
@@ -1528,4 +1672,307 @@ fn vector_input_survives_concurrent_descriptor_growth_and_retired_lookup() {
         }
         region.finish_operation(token, || {}).unwrap();
     });
+}
+
+#[test]
+fn pending_pipe_pair_publishes_after_copyout_and_forks_exact_endpoints() {
+    let f = fixture(4 * 1024 * 1024);
+    let table = f.table();
+    let mut pair = PendingPipePair::new(
+        *f.region,
+        table,
+        65536,
+        StatusFlags {
+            nonblock: true,
+            ..StatusFlags::default()
+        },
+        true,
+    );
+    pair.prepare(f.region, &mut f.pipe_storage(), &EL1).unwrap();
+    let fds = pair.fds().unwrap();
+    for fd in fds {
+        assert_eq!(f.host().get(table, fd), Err(fd::Error::BadFd));
+    }
+    pair.publish(f.region, &EL1).unwrap();
+    pair.finish(f.region, &EL1, |_| {}).unwrap();
+    assert!(pair.is_settled());
+    let child = f.host().fork(table, &mut f.descriptors(64)).unwrap();
+    for fd in fds {
+        assert_eq!(f.host().get(table, fd), f.host().get(child, fd));
+        assert_eq!(f.host().getfd(table, fd), Ok(true));
+    }
+    let reader = f.host().get(table, fds[0]).unwrap();
+    let writer = f.host().get(child, fds[1]).unwrap();
+    let Some(IpcBacking::Pipe {
+        object,
+        end: End::Reader,
+    }) = IpcBacking::decode(reader.backing)
+    else {
+        panic!("reader")
+    };
+    assert_eq!(
+        IpcBacking::decode(writer.backing),
+        Some(IpcBacking::Pipe {
+            object,
+            end: End::Writer
+        })
+    );
+    assert_eq!(
+        reader.flags,
+        StatusFlags {
+            nonblock: true,
+            ..StatusFlags::default()
+        }
+    );
+    let mut guard = f.region.lock(object, &EL1).unwrap();
+    assert!(guard.pipe().unwrap().is_backed());
+}
+
+#[test]
+fn pending_pipe_pair_copy_fault_cancels_claims_without_closing_reused_numbers() {
+    let f = fixture(4 * 1024 * 1024);
+    let table = f.table();
+    let mut pair = PendingPipePair::new(*f.region, table, 65536, StatusFlags::default(), false);
+    pair.prepare(f.region, &mut f.pipe_storage(), &EL1).unwrap();
+    let fds = pair.fds().unwrap();
+    let child = f.host().fork(table, &mut f.descriptors(64)).unwrap();
+    let unrelated = Description::new(
+        IpcBacking::Host(HostResourceToken::new(7).unwrap()).encode(),
+        AccessMode::ReadOnly,
+        StatusFlags::default(),
+    );
+    assert_eq!(f.host().open(child, Fd(0), unrelated, false), Ok(fds[0]));
+    let authority = f.host();
+    let lock = authority.transaction(table).unwrap();
+    assert!(pair.cancel(f.region, &BoundedSpin(0), |_| {}).is_err());
+    drop(lock);
+    let mut freed = 0;
+    pair.cancel(f.region, &EL1, |release| {
+        if matches!(release, IpcReleased::Object { freed: true, .. }) {
+            freed += 1;
+        }
+    })
+    .unwrap();
+    assert_eq!(freed, 1);
+    assert!(pair.is_settled());
+    assert_eq!(f.host().get(child, fds[0]), Ok(unrelated));
+    assert_eq!(f.host().open(table, Fd(0), unrelated, false), Ok(fds[0]));
+}
+
+#[test]
+fn pending_pipe_pair_publication_busy_once_retains_both_endpoints() {
+    let f = fixture(4 * 1024 * 1024);
+    let table = f.table();
+    let mut pair = PendingPipePair::new(*f.region, table, 65536, StatusFlags::default(), false);
+    pair.prepare(f.region, &mut f.pipe_storage(), &EL1).unwrap();
+    let fds = pair.fds().unwrap();
+    let authority = f.host();
+    let lock = authority.transaction(table).unwrap();
+    assert!(pair.publish(f.region, &BoundedSpin(0)).is_err());
+    drop(lock);
+    assert_eq!(pair.fds(), Some(fds));
+    pair.publish(f.region, &EL1).unwrap();
+    pair.finish(f.region, &EL1, |_| {}).unwrap();
+    assert!(pair.is_settled());
+    assert!(pair.cancel(f.region, &EL1, |_| {}).is_err());
+}
+
+#[test]
+fn pending_pipe_pair_finish_object_busy_keeps_release_custody() {
+    let f = fixture(4 * 1024 * 1024);
+    let table = f.table();
+    let mut pair = PendingPipePair::new(*f.region, table, 65536, StatusFlags::default(), false);
+    pair.prepare(f.region, &mut f.pipe_storage(), &EL1).unwrap();
+    let fds = pair.fds().unwrap();
+    pair.publish(f.region, &EL1).unwrap();
+    let backing = f.host().get(table, fds[0]).unwrap().backing;
+    let Some(IpcBacking::Pipe { object, .. }) = IpcBacking::decode(backing) else {
+        panic!("pipe")
+    };
+    for fd in fds {
+        assert_eq!(f.host().close(table, fd), Ok(None));
+    }
+    let guard = f.region.lock(object, &EL1).unwrap();
+    assert!(pair.finish(f.region, &BoundedSpin(0), |_| {}).is_err());
+    let unrelated = Description::new(
+        IpcBacking::Host(HostResourceToken::new(8).unwrap()).encode(),
+        AccessMode::ReadOnly,
+        StatusFlags::default(),
+    );
+    assert_eq!(f.host().open(table, Fd(0), unrelated, false), Ok(fds[0]));
+    drop(guard);
+    let mut releases = 0;
+    pair.finish(f.region, &EL1, |_| releases += 1).unwrap();
+    assert_eq!(releases, 2);
+    assert!(pair.is_settled());
+    assert_eq!(f.host().get(table, fds[0]), Ok(unrelated));
+}
+
+#[test]
+fn pending_pipe_pair_partial_ofd_preparation_cancels_both_object_references() {
+    let f = fixture(4 * 1024 * 1024);
+    let table = f.table();
+    let authority = f.host();
+    let unrelated = Description::new(
+        IpcBacking::Host(HostResourceToken::new(9).unwrap()).encode(),
+        AccessMode::ReadOnly,
+        StatusFlags::default(),
+    );
+    let mut occupied = Vec::new();
+    for _ in 0..f.region.ofd_count() - 1 {
+        occupied.push(authority.create_pinned(unrelated).unwrap());
+    }
+    let mut pair = PendingPipePair::new(*f.region, table, 65536, StatusFlags::default(), false);
+    assert_eq!(
+        pair.prepare(f.region, &mut f.pipe_storage(), &EL1),
+        Err(IpcError::Fd(fd::Error::NeedsOfds))
+    );
+    assert_eq!(pair.fds(), None);
+    let mut releases = 0;
+    pair.cancel(f.region, &EL1, |_| releases += 1).unwrap();
+    assert_eq!(releases, 2);
+    assert!(pair.is_settled());
+    let reclaimed = authority.create_pinned(unrelated).unwrap();
+    assert_eq!(authority.unpin(reclaimed), Ok(Some(unrelated)));
+    for pin in occupied {
+        assert_eq!(authority.unpin(pin), Ok(Some(unrelated)));
+    }
+}
+
+#[test]
+fn pending_pipe_pair_retired_namespace_cannot_redirect_cancel_to_reused_table() {
+    let f = fixture(4 * 1024 * 1024);
+    let table = f.table();
+    let mut pair = PendingPipePair::new(*f.region, table, 65536, StatusFlags::default(), false);
+    pair.prepare(f.region, &mut f.pipe_storage(), &EL1).unwrap();
+    let fds = pair.fds().unwrap();
+    f.host()
+        .destroy_table(table, |_| panic!("unpublished endpoints"))
+        .unwrap();
+    let replacement = f.table();
+    let unrelated = Description::new(
+        IpcBacking::Host(HostResourceToken::new(10).unwrap()).encode(),
+        AccessMode::ReadOnly,
+        StatusFlags::default(),
+    );
+    assert_eq!(
+        f.host().open(replacement, Fd(0), unrelated, false),
+        Ok(fds[0])
+    );
+    pair.cancel(f.region, &EL1, |_| {}).unwrap();
+    assert!(pair.is_settled());
+    assert_eq!(f.host().get(replacement, fds[0]), Ok(unrelated));
+}
+
+#[test]
+fn pending_pipe_pair_resume_uses_current_execution_holder() {
+    struct Observe<'a> {
+        region: &'a IpcRegion<'a>,
+        object: IpcObjectHandle,
+        holder: Cell<Option<IpcLockHolder>>,
+    }
+    impl LockWait for Observe<'_> {
+        fn wait(&self, _: u32) -> bool {
+            self.holder.set(self.region.lock_holder(self.object));
+            false
+        }
+    }
+    let f = fixture(4 * 1024 * 1024);
+    let table = f.table();
+    let first = f.region.for_el1_slot(1);
+    let resumed = f.region.for_el1_slot(2);
+    let mut pair = PendingPipePair::new(first, table, 65536, StatusFlags::default(), false);
+    pair.prepare(&first, &mut f.pipe_storage(), &EL1).unwrap();
+    let fds = pair.fds().unwrap();
+    pair.publish(&resumed, &EL1).unwrap();
+    let backing = f.host().get(table, fds[0]).unwrap().backing;
+    let Some(IpcBacking::Pipe { object, .. }) = IpcBacking::decode(backing) else {
+        panic!("pipe")
+    };
+    let epoll = f.region.create_epoll(&EL1).unwrap();
+    f.region
+        .epoll_add(
+            epoll,
+            object,
+            epoll::EpollMember::PipeReader,
+            fds[0].0,
+            1,
+            epoll::events::IN,
+            0,
+            &EL1,
+        )
+        .unwrap();
+    for fd in fds {
+        assert_eq!(f.host().close(table, fd), Ok(None));
+    }
+    let epoll_guard = f.region.lock(epoll, &EL1).unwrap();
+    let observe = Observe {
+        region: f.region,
+        object,
+        holder: Cell::new(None),
+    };
+    assert_eq!(
+        pair.finish(&resumed, &observe, |_| {}),
+        Err(IpcError::Contended)
+    );
+    assert_eq!(observe.holder.get(), Some(IpcLockHolder::El1 { slot: 2 }));
+    drop(epoll_guard);
+    pair.finish(&first, &EL1, |_| {}).unwrap();
+    assert!(pair.is_settled());
+}
+
+#[test]
+fn pending_pipe_pair_foreign_view_refuses_before_custody_changes() {
+    let f = fixture(4 * 1024 * 1024);
+    let foreign = fixture(4 * 1024 * 1024);
+    let table = f.table();
+    let mut pair = PendingPipePair::new(*f.region, table, 65536, StatusFlags::default(), false);
+    let mut storage = f.pipe_storage();
+    assert_eq!(
+        pair.prepare(foreign.region, &mut storage, &EL1),
+        Err(IpcError::BadRegion)
+    );
+    pair.prepare(f.region, &mut storage, &EL1).unwrap();
+    let fds = pair.fds().unwrap();
+    assert_eq!(
+        pair.cancel(foreign.region, &EL1, |_| {}),
+        Err(IpcError::BadRegion)
+    );
+    assert_eq!(pair.fds(), Some(fds));
+    assert_eq!(pair.publish(foreign.region, &EL1), Err(IpcError::BadRegion));
+    assert_eq!(pair.fds(), Some(fds));
+    pair.publish(f.region, &EL1).unwrap();
+    assert_eq!(
+        pair.finish(foreign.region, &EL1, |_| {}),
+        Err(IpcError::BadRegion)
+    );
+    pair.finish(f.region, &EL1, |_| {}).unwrap();
+    assert!(pair.is_settled());
+    for fd in fds {
+        assert!(f.host().get(table, fd).is_ok());
+    }
+}
+
+#[test]
+fn pending_pipe_pair_publication_uses_current_descriptor_ceiling() {
+    struct Deny;
+    impl crate::DescriptorCeiling for Deny {
+        fn cover(&self, _: u32) -> bool {
+            false
+        }
+    }
+    let f = fixture(4 * 1024 * 1024);
+    let table = f.table();
+    let mut pair = PendingPipePair::new(*f.region, table, 65536, StatusFlags::default(), false);
+    pair.prepare(f.region, &mut f.pipe_storage(), &EL1).unwrap();
+    let fds = pair.fds().unwrap();
+    let denied = f.region.with_ceiling(&Deny);
+    assert_eq!(
+        pair.publish(&denied, &EL1),
+        Err(IpcError::Fd(fd::Error::BadBacking))
+    );
+    assert_eq!(pair.fds(), Some(fds));
+    pair.publish(f.region, &EL1).unwrap();
+    pair.finish(f.region, &EL1, |_| {}).unwrap();
+    assert!(pair.is_settled());
 }

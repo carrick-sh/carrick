@@ -264,7 +264,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                         cpu: &mut sched::HardwareCpu,
                         user: &sched::HardwareUserWord,
                     }),
-                    ipc::guest_venue(frame.slot as u32).as_ref(),
+                    ipc::current_guest_venue(frame.slot as u32).as_ref(),
                     |handle| carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8,
                     unowned,
                 );
@@ -298,7 +298,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                                 cpu: &mut sched::HardwareCpu,
                                 user: &sched::HardwareUserWord,
                             }),
-                            ipc::guest_venue(frame.slot as u32).as_ref(),
+                            ipc::current_guest_venue(frame.slot as u32).as_ref(),
                             |handle| carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8,
                             refused(),
                         );
@@ -318,7 +318,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                     cpu: &mut sched::HardwareCpu,
                     user: &sched::HardwareUserWord,
                 }),
-                ipc::guest_venue(frame.slot as u32).as_ref(),
+                ipc::current_guest_venue(frame.slot as u32).as_ref(),
                 lifecycle::guest_venue(),
                 page,
                 control,
@@ -345,7 +345,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                         cpu: &mut sched::HardwareCpu,
                         user: &sched::HardwareUserWord,
                     }),
-                    ipc::guest_venue(frame.slot as u32).as_ref(),
+                    ipc::current_guest_venue(frame.slot as u32).as_ref(),
                     |handle| carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8,
                     refused(),
                 ),
@@ -367,7 +367,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                     cpu: &mut sched::HardwareCpu,
                     user: &sched::HardwareUserWord,
                 }),
-                ipc::guest_venue(frame.slot as u32).as_ref(),
+                ipc::current_guest_venue(frame.slot as u32).as_ref(),
                 |handle| carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8,
             )
         }
@@ -1225,7 +1225,7 @@ fn arm_native_service_exit(
             // work first settles that work (CarrierWork) and is replayed;
             // staging it here would pre-empt the settlement forever.
             None if action != Action::Forward => NativeServiceStage::Operation,
-            None => match ipc::guest_venue(frame.slot as u32).and_then(|venue| {
+            None => match ipc::current_guest_venue(frame.slot as u32).and_then(|venue| {
                 let table = ipc::native_table(&venue, task)?;
                 let access = carrick_el1::substrate::sched::object_wait::space_access(zone, slot);
                 let lock_slot = frame.slot as u32;
@@ -1398,7 +1398,7 @@ fn arm_native_service_exit(
                     // names in the caller's own ring table (#1530), read
                     // through the stable owned-table authority: an unrelated
                     // table-map update must not read as "no table" (ENOSYS).
-                    let table = ipc::guest_venue(frame.slot as u32)
+                    let table = ipc::current_guest_venue(frame.slot as u32)
                         .and_then(|venue| ipc::native_exec_table(venue.tables, task));
                     process.begin_exec_service(
                         payload,
@@ -2432,8 +2432,19 @@ impl<
             }
             return false;
         }
+        if ordinal == carrick_personality_linux::crossing::nr::FCNTL.raw() {
+            return self.frame.argument(1) == Some(carrick_abi::LINUX_F_GETFD)
+                && self.task().is_some_and(|task| {
+                    super::file_table::host_binding_descriptor_flags(
+                        self.fd_map,
+                        task.linux.file_table.load(Ordering::Acquire),
+                        self.frame.argument(0).unwrap_or(0) as i32,
+                    )
+                    .is_some()
+                });
+        }
         if self.frame.may_serve_descriptor() {
-            return ordinal != carrick_personality_linux::crossing::nr::FCNTL.raw();
+            return true;
         }
         if ![
             carrick_personality_linux::crossing::nr::DUP,
@@ -2750,6 +2761,15 @@ impl<
         let file_table = task.linux.file_table.load(Ordering::Acquire).max(1);
         let ordinal = self.frame.canonical_ordinal().raw();
         let old = self.frame.argument(0).unwrap_or(0) as i32;
+        if ordinal == carrick_personality_linux::crossing::nr::FCNTL.raw() {
+            if self.frame.argument(1) != Some(carrick_abi::LINUX_F_GETFD) {
+                return FamilyCompletion::Forward;
+            }
+            return super::file_table::host_binding_descriptor_flags(self.fd_map, file_table, old)
+                .map_or(FamilyCompletion::Forward, |flags| {
+                    FamilyCompletion::Complete(i64::from(flags))
+                });
+        }
         let result = match ordinal {
             nr if nr == carrick_personality_linux::crossing::nr::DUP.raw() => {
                 super::file_table::dup_host_binding(
@@ -3404,8 +3424,12 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                     let release = authority
                         .unpin_filtered(pin, ipc::is_zone_releasable_backing)
                         .map_err(map_fd_error)?;
-                    ipc::settle_native_release(&venue.region, release, zone, task)
-                        .map_err(map_ipc_error)?;
+                    ipc::settle_native_release(&venue.region, release, zone, task, &|effects| {
+                        if let Some((zone, slot)) = zone {
+                            crate::sched::object_wait::deliver_wake_effects(zone, slot, effects);
+                        }
+                    })
+                    .map_err(map_ipc_error)?;
                     return Err(error);
                 }
             };
@@ -3450,11 +3474,20 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
         let pin_release = authority
             .unpin_filtered(pin, ipc::is_zone_releasable_backing)
             .map_err(map_fd_error)?;
-        ipc::settle_native_release(&venue.region, pin_release, zone, task)
-            .map_err(map_ipc_error)?;
+        ipc::settle_native_release(&venue.region, pin_release, zone, task, &|effects| {
+            if let Some((zone, slot)) = zone {
+                crate::sched::object_wait::deliver_wake_effects(zone, slot, effects);
+            }
+        })
+        .map_err(map_ipc_error)?;
 
         let (release, delegated_release) = projected?;
-        ipc::settle_native_release(&venue.region, release, zone, task).map_err(map_ipc_error)?;
+        ipc::settle_native_release(&venue.region, release, zone, task, &|effects| {
+            if let Some((zone, slot)) = zone {
+                crate::sched::object_wait::deliver_wake_effects(zone, slot, effects);
+            }
+        })
+        .map_err(map_ipc_error)?;
         Self::settle_delegated_release(self.frame, self.open_table, task, delegated_release)?;
         Ok(new_fd)
     }
@@ -3563,7 +3596,13 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                     Ok(rel) => rel,
                     Err(err) => return map_fd_error(err),
                 };
-                if let Err(err) = ipc::settle_native_release(&venue.region, released, zone, task) {
+                if let Err(err) =
+                    ipc::settle_native_release(&venue.region, released, zone, task, &|effects| {
+                        if let Some((zone, slot)) = zone {
+                            crate::sched::object_wait::deliver_wake_effects(zone, slot, effects);
+                        }
+                    })
+                {
                     return map_ipc_error(err);
                 }
                 let change = super::file_table::close_host_binding(
@@ -5381,6 +5420,65 @@ mod tests {
         assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 0);
         assert_eq!(counters.forwarded[172].load(Ordering::Relaxed), 0);
         assert_eq!(counters.served[172].load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn admitted_descriptor_getfd_is_served_without_a_host_crossing() {
+        use carrick_personality_linux::dispatch::CompletionRoute;
+        // Linux fcntl(2): F_GETFD returns the descriptor flag, independently
+        // of the open description. Unknown commands remain unrouted.
+        let tasks = [CurrentTask::new()];
+        tasks[0].set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            5,
+        );
+        let slots = [FdMapSlot::new(), FdMapSlot::new()];
+        assert!(slots[0].try_claim());
+        slots[0].set(5, 1, 1, 9);
+        assert!(slots[1].try_claim());
+        slots[1].set(6, 1, 1, 9);
+        slots[1].fd_flags.store(1, Ordering::Release);
+        for (table, command, expected, refused) in [
+            (5, carrick_abi::LINUX_F_GETFD, 0, 0),
+            (6, carrick_abi::LINUX_F_GETFD, 1, 0),
+            (7, carrick_abi::LINUX_F_GETFD, -38, 1),
+            (5, carrick_abi::LINUX_F_GETFL, -38, 1),
+        ] {
+            tasks[0].linux.file_table.store(table, Ordering::Release);
+            let counters = Counters::default();
+            let mut frame = TrapFrame::default();
+            frame.x[8] = carrick_personality_linux::crossing::nr::FCNTL.raw();
+            frame.x[0] = 1;
+            frame.x[1] = command;
+            let route = dispatch_syscall_with_native(
+                &mut frame,
+                &counters,
+                &tasks,
+                &slots,
+                &[],
+                &[],
+                &[],
+                &InotifyNameCache::new(),
+                None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
+                None,
+                None,
+                None::<&mut dyn lifecycle::ProcessNative<carrick_sched_core::ThreadCtx>>,
+                None,
+                None,
+                |_| core::ptr::null_mut(),
+            );
+            if refused == 0 {
+                assert_eq!(route, CompletionRoute::Served);
+                assert_eq!(frame.x[0] as i64, expected);
+                assert_eq!(counters.forwarded[25].load(Ordering::Relaxed), 0);
+            } else {
+                // ARM's compatibility policy forwards unavailable venues;
+                // the production CPL0 binding below proves counted refusal.
+                assert_eq!(route, CompletionRoute::Forward);
+                assert_eq!(frame.x[0], 1);
+            }
+        }
     }
 
     #[test]

@@ -992,15 +992,7 @@ pub trait ForkStockCrossing {
     )> {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
-            let map = carrick_el1_abi::ipc_table_map_guest();
-            if !map.window_published() {
-                return None;
-            }
-            let region = carrick_el1_abi::ipc_window_guest()?
-                .attach()
-                .ok()?
-                .with_ceiling(&carrick_el1_abi::GUEST_DESCRIPTOR_CEILING);
-            Some((region, map))
+            crate::ipc::current_guest_namespace()
         }
         #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         {
@@ -2789,7 +2781,18 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             .ipc_binding()
             .ok_or(NativeProcessError::Stale)?;
         crate::ipc::retire_native_operation(
-            &region, self.zone, self.slot, self.task, binding, operation,
+            &region,
+            carrick_el1_abi::BornInZoneSource {
+                zone: self.zone,
+                slot: self.slot,
+            },
+            self.task,
+            binding,
+            operation,
+            &|owned| crate::sched::object_wait::deliver_completion(self.zone, self.slot, owned),
+            &|effects| {
+                crate::sched::object_wait::deliver_wake_effects(self.zone, self.slot, effects)
+            },
         )
     }
     fn copy_syscall_output(
@@ -2843,51 +2846,21 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         parent_table: u64,
         child_table: u64,
     ) -> Result<(), NativeProcessError> {
-        if !super::file_table::fork_fd_map(
-            self.crossing.fd_map(),
-            self.crossing.open_table(),
-            parent_table,
-            child_table,
-        ) {
-            return Err(NativeProcessError::Exhausted);
+        super::file_table::DescriptorNamespace {
+            fd_map: self.crossing.fd_map(),
+            open_table: self.crossing.open_table(),
+            ipc: self.crossing.ipc_binding(),
         }
-        if let Some((region, map)) = self.crossing.ipc_binding()
-            && let Some(parent) = map.lookup_authoritative(parent_table)
-        {
-            let result = region
-                .fork_descriptors(
-                    carrick_el1_abi::ipc::fd::TableId::from_raw(parent),
-                    &carrick_sched_core::ShortLockSpin,
-                    |child| {
-                        map.publish_owned(child_table, child.to_raw())
-                            .map_err(|_| carrick_el1_abi::ipc::fd::Error::NoMemory)
-                    },
-                )
-                .map_err(|_| NativeProcessError::Exhausted);
-            if let Err(error) = result {
-                super::file_table::retire_fd_map(
-                    self.crossing.fd_map(),
-                    self.crossing.open_table(),
-                    child_table,
-                );
-                return Err(error);
-            }
-        }
-        Ok(())
+        .fork(parent_table, child_table)
     }
     fn retire_fd_table(&mut self, table: u64) {
-        if let Some((region, map)) = self.crossing.ipc_binding()
-            && let Some(raw) = map.take_owned(table)
-        {
-            super::ipc::retire_namespace(
-                &region,
-                carrick_el1_abi::ipc::fd::TableId::from_raw(raw),
-                self.task,
-            )
-            .unwrap_or_else(|_| fatal());
+        super::file_table::DescriptorNamespace {
+            fd_map: self.crossing.fd_map(),
+            open_table: self.crossing.open_table(),
+            ipc: self.crossing.ipc_binding(),
         }
-        super::file_table::retire_fd_map(self.crossing.fd_map(), self.crossing.open_table(), table);
-        self.task.linux.mark_pending_host_work();
+        .retire(table, self.task)
+        .unwrap_or_else(|_| fatal());
     }
 }
 

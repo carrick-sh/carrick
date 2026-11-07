@@ -1654,3 +1654,58 @@ fn in_zone_child_pipe2_and_unfaulted_cow_read_matches_native_oracle() {
     assert_eq!(outcome.run.stdout, b"P");
     assert!(outcome.run.stderr.is_empty());
 }
+
+/// Native x86_64 Linux oracle (same assembly, `timeout 10`): exit 0 and
+/// `pipe-vectors=once\n`. Scalar write/read verifies a one-byte prefix before
+/// vector I/O; the next read requires EAGAIN (11), detecting
+/// duplicate publication; after closing the last writer the next read is EOF.
+#[test]
+#[ignore = "#1756: x86 shared ring IPC venue is not wired yet"]
+fn in_zone_two_process_pipe_vectors_move_bytes_exactly_once() {
+    let elf = native_exit_fixture("native_pipe_vectors.S");
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 128, ROOT_AFFINITY_IDLE_PEER)
+        .expect("two-process pipe vector run");
+    assert_eq!(outcome.run.exit_code, 0);
+    assert_eq!(outcome.run.stdout, b"pipe-vectors=once\n");
+    assert!(outcome.run.stderr.is_empty());
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("terminal census");
+    // Service arrays use canonical ordinals; refusal arrays preserve the
+    // original ISA ordinal. Bytes alone cannot prove ring service.
+    use std::sync::atomic::Ordering::Acquire;
+    for (canonical, native, count) in [(63, 0, 3), (65, 19, 1), (66, 20, 1)] {
+        assert_eq!(counters.served[canonical].load(Acquire), count);
+        assert_eq!(counters.forwarded[canonical].load(Acquire), 0);
+        assert_eq!(counters.refused[native].load(Acquire), 0);
+        assert_eq!(counters.venue_refused[native].load(Acquire), 0);
+    }
+    // The final diagnostic writes to host stdout; only the child's scalar
+    // pipe write is required to be served in ring.
+    assert!(counters.served[64].load(Acquire) >= 1);
+    assert_eq!(counters.refused[1].load(Acquire), 0);
+}
+
+/// Native Linux writes one byte to the same host-backed stdout. Under
+/// strict ring-first the non-pipe venue instead returns counted ENOSYS (38),
+/// preserving the original x86 ordinal 20 and never crossing to the host.
+#[test]
+fn non_venue_writev_is_counted_without_host_crossing() {
+    let elf = native_exit_fixture("native_non_venue_writev.S");
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 32, ROOT_AFFINITY_LOADED)
+        .expect("non-venue writev run");
+    assert_eq!(outcome.run.exit_code, 0);
+    assert!(outcome.run.stdout.is_empty());
+    assert!(outcome.run.stderr.is_empty());
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("terminal census");
+    use std::sync::atomic::Ordering::Acquire;
+    assert_eq!(counters.refused[20].load(Acquire), 1);
+    assert_eq!(counters.refused_child[20].load(Acquire), 0);
+    assert_eq!(counters.venue_refused[20].load(Acquire), 0);
+    assert_eq!(counters.forwarded[66].load(Acquire), 0);
+    assert_eq!(counters.served[66].load(Acquire), 0);
+}

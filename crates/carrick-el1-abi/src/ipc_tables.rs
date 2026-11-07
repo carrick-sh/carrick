@@ -428,12 +428,51 @@ mod tests {
             std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align(dir_len, 4096).unwrap())
         } as usize;
         let pool = 0x1000_0000_usize; // never dereferenced by these checks
+        #[derive(Clone, Copy)]
+        struct Backing {
+            dir: usize,
+            dir_len: usize,
+            pool: usize,
+            pool_len: usize,
+        }
+        impl crate::IpcWindowBacking for Backing {
+            fn directory_ptr(&self) -> *mut u8 {
+                self.dir as *mut u8
+            }
+            fn directory_len(&self) -> usize {
+                self.dir_len
+            }
+            fn pool_ptr(&self) -> *mut u8 {
+                self.pool as *mut u8
+            }
+            fn pool_len(&self) -> usize {
+                self.pool_len
+            }
+        }
+        let backing = Backing {
+            dir,
+            dir_len,
+            pool,
+            pool_len,
+        };
         // SAFETY: only validation and a header read of zeroed memory.
         unsafe {
-            assert!(crate::IpcWindow::new(dir, dir_len, pool, pool_len - 1).is_none());
-            assert!(crate::IpcWindow::new(dir, dir_len - 1, pool, pool_len).is_none());
-            assert!(crate::IpcWindow::new(0, dir_len, pool, pool_len).is_none());
-            let window = crate::IpcWindow::new(dir, dir_len, pool, pool_len).unwrap();
+            assert!(
+                crate::HostIpcWindow::new(&Backing {
+                    pool_len: pool_len - 1,
+                    ..backing
+                })
+                .is_none()
+            );
+            assert!(
+                crate::HostIpcWindow::new(&Backing {
+                    dir_len: dir_len - 1,
+                    ..backing
+                })
+                .is_none()
+            );
+            assert!(crate::HostIpcWindow::new(&Backing { dir: 0, ..backing }).is_none());
+            let window = crate::HostIpcWindow::new(&backing).unwrap();
             assert_eq!(
                 window.attach().err(),
                 Some(crate::ipc::IpcError::BadRegion),

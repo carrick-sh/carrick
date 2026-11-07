@@ -104,6 +104,13 @@ impl ZoneHostServices {
     ) -> Result<Self, IpcError> {
         Self::new(dispatcher.kernel_binding.read().kernel())
     }
+
+    /// Borrow the operation storage retained by this completion owner.
+    /// A different carrier's latest window publication cannot redirect it,
+    /// and the view cannot outlive the owner which keeps its mappings alive.
+    pub fn region(&self) -> IpcRegion<'_> {
+        self.owner.region()
+    }
 }
 
 impl IpcHostServices for ZoneHostServices {
@@ -191,23 +198,30 @@ pub fn host_window_backing(
 /// Bind the current production file table before returning to the guest.
 /// Missing windows and bounded admission refusals retain host service. Never
 /// publish a different kernel's descriptor IDs into the carrier's mapping.
-pub fn publish_file_table(context: &crate::kernel::KernelContext) {
-    let Some(map) = carrick_el1_abi::ipc_table_map_host() else {
-        return;
-    };
-    if !map.window_published() {
+/// `region` must be borrowed from the retained installed carrier window.
+pub fn publish_file_table(
+    context: &crate::kernel::KernelContext,
+    region: &IpcRegion<'_>,
+    map: &std::sync::Arc<dyn carrick_el1_abi::IpcTableMapBacking>,
+) {
+    let mut published = false;
+    if map
+        .with_table_map(&mut |map| published = map.window_published())
+        .is_err()
+        || !published
+    {
         return;
     }
-    let Some(region) = host_region() else {
-        return;
-    };
     let Some(owner) = context.kernel().existing_ipc() else {
         return;
     };
     if !region.same_mapping(&owner.region()) {
         return;
     }
-    let _ = context.resources().files().publish_ipc(owner, map);
+    let _ = context
+        .resources()
+        .files()
+        .publish_ipc(owner, std::sync::Arc::clone(map));
 }
 
 /// Deliver guest-produced IPC readiness at this kernel's host boundary.
@@ -215,13 +229,6 @@ pub fn publish_file_table(context: &crate::kernel::KernelContext) {
 /// container's authority or silently leave this kernel's subscribers asleep.
 pub fn deliver_owed_host_wakes(kernel: &crate::kernel::Kernel) {
     kernel.deliver_ipc_host_wakes();
-}
-
-/// The host's view of the shared IPC authority, once the carrier mapped
-/// its window and the authority published its directory; `None` otherwise
-/// (every IPC path then stays closed).
-pub fn host_region() -> Option<IpcRegion<'static>> {
-    carrick_el1_abi::ipc_window_host()?.attach().ok()
 }
 
 /// The wait-queue snapshots of both lanes of `object`, taken BEFORE its

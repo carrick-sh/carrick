@@ -1533,9 +1533,9 @@ pub(super) fn ipc_handback_route<E: ThreadedEngine>(
     request: &mut SyscallRequest,
     producer: &mut super::signal_ingress_producer::HostSignalIngressProducer,
 ) -> Result<IpcHandbackRoute, RuntimeError> {
-    let region = host_ipc::host_region().ok_or_else(|| {
-        RuntimeError::Configuration("IPC handback without a published IPC window".to_owned())
-    })?;
+    let service = host_ipc::ZoneHostServices::new(context.kernel())
+        .map_err(|error| ipc_error("IPC handback owner", error))?;
+    let region = service.region();
     let (token, op) = host_ipc::take_handback(&region, request.arg(0))
         .map_err(|error| ipc_error("handback names no live operation", error))?;
     request.number = carrick_abi::CanonicalNr(u64::from(op.nr));
@@ -1557,8 +1557,7 @@ pub(super) fn ipc_handback_route<E: ThreadedEngine>(
         IpcMmKey(zone_mm.unwrap_or(0)),
         engine,
         None,
-        &host_ipc::ZoneHostServices::new(context.kernel())
-            .map_err(|error| ipc_error("IPC owner", error))?,
+        &service,
     )
     .map_err(|error| ipc_error("handback completion", error))?;
     restart_with_remaining(engine, Some(request), &outcome)?;
@@ -1797,9 +1796,9 @@ where
         engine: &mut E,
         token: IpcOpToken,
     ) -> Result<IpcHandbackRoute, ProductionHvpatchPollError> {
-        let region = host_ipc::host_region().ok_or_else(|| {
-            RuntimeError::Configuration("IPC continuation without a published window".to_owned())
-        })?;
+        let service = host_ipc::ZoneHostServices::for_dispatcher(&self.kernel.dispatcher)
+            .map_err(|error| ipc_error("IPC continuation owner", error))?;
+        let region = service.region();
         let op = region
             .operation(&token)
             .map_err(|error| ipc_error("continuation", error))?;
@@ -1818,8 +1817,7 @@ where
             IpcMmKey(self.state.zone_mm.unwrap_or(0)),
             engine,
             None,
-            &host_ipc::ZoneHostServices::for_dispatcher(&self.kernel.dispatcher)
-                .map_err(|error| ipc_error("IPC owner", error))?,
+            &service,
         )
         .map_err(|error| ipc_error("continuation", error))?;
         // Re-entered at the SVC, the re-run reads its timeout from x3.
@@ -1907,9 +1905,9 @@ where
         token: IpcOpToken,
         reserved: Option<&carrick_kernel::kernel::continuation::ReservedSignal>,
     ) -> Result<Option<executor::ExecutorExit>, ProductionHvpatchPollError> {
-        let region = host_ipc::host_region().ok_or_else(|| {
-            RuntimeError::Configuration("IPC resume without a published window".to_owned())
-        })?;
+        let service = host_ipc::ZoneHostServices::for_dispatcher(&self.kernel.dispatcher)
+            .map_err(|error| ipc_error("IPC resume owner", error))?;
+        let region = service.region();
         // The resumed operation copies into the guest buffer without
         // passing syscall entry again; EL1 work this MM published while it
         // was parked is settled first, as at syscall entry.
@@ -1967,14 +1965,8 @@ where
         };
         let mut route = match cause {
             Some(cause) => {
-                let outcome = host_ipc::interrupt(
-                    &region,
-                    token,
-                    cause,
-                    &host_ipc::ZoneHostServices::for_dispatcher(&self.kernel.dispatcher)
-                        .map_err(|error| ipc_error("IPC owner", error))?,
-                )
-                .map_err(|error| ipc_error("interrupt", error))?;
+                let outcome = host_ipc::interrupt(&region, token, cause, &service)
+                    .map_err(|error| ipc_error("interrupt", error))?;
                 restart_with_remaining(engine, None, &outcome)?;
                 let context = self
                     .kernel

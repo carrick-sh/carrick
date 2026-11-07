@@ -6986,7 +6986,13 @@ where
             &context,
             authority.fd_ceiling_publisher(),
         );
-        carrick_kernel::kernel::continuation::ipc::publish_file_table(&context);
+        let _ = crate::with_carrier_ipc_region(|region, map_backing| {
+            carrick_kernel::kernel::continuation::ipc::publish_file_table(
+                &context,
+                region,
+                map_backing,
+            );
+        });
 
         let boxed: Box<dyn std::any::Any> = Box::new(engine);
         let hvf_engine = match boxed.downcast::<HvfEngine>() {

@@ -2649,9 +2649,7 @@ impl HvfMappedRegion {
 impl Drop for HvfMappedRegion {
     fn drop(&mut self) {
         if let Some(RegionHostOwner::BirthZone(backing)) = &self.host_mapping {
-            backing
-                .live
-                .store(false, std::sync::atomic::Ordering::Release);
+            backing.retire();
         }
         if self.start == carrick_mem::memory::LINUX_EL1_KERNEL_BASE && self.host_mapping.is_some() {
             stage2_backend::clear_el1_region_host_ptr_if(self.host_addr as usize);
@@ -8978,7 +8976,7 @@ pub(crate) use stage2_backend::*;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use stage2_backend::{
     IpcWindowBacking, read_el1_counters, read_el1_region_host_ptr, register_ipc_window_backing,
-    reset_el1_counters,
+    reset_el1_counters, with_installed_ipc_region,
 };
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

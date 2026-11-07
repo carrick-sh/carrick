@@ -434,11 +434,27 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         let task = CurrentTask::new();
         crate::ipc::retire_native_operation(
             region,
-            self.zone,
-            SlotId::from_index(0).unwrap(),
+            carrick_el1_abi::BornInZoneSource {
+                zone: self.zone,
+                slot: SlotId::from_index(0).unwrap(),
+            },
             &task,
             binding,
             operation,
+            &|owned| {
+                crate::sched::object_wait::deliver_completion(
+                    self.zone,
+                    SlotId::from_index(0).unwrap(),
+                    owned,
+                )
+            },
+            &|effects| {
+                crate::sched::object_wait::deliver_wake_effects(
+                    self.zone,
+                    SlotId::from_index(0).unwrap(),
+                    effects,
+                )
+            },
         )
     }
     fn signal_deadline(
@@ -5239,6 +5255,9 @@ fn retained_ipc_supply(
             release,
             Some((fixture.zone, fixture.slot)),
             fixture.task,
+            &|effects| {
+                crate::sched::object_wait::deliver_wake_effects(fixture.zone, fixture.slot, effects)
+            },
         )
         .unwrap();
     } else {
