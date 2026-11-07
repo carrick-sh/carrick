@@ -212,6 +212,131 @@ pub fn label_authorized(events: &[Value], sender: &str) -> bool {
             e["event"] == "labeled" && e["actor"]["login"] == sender && allowed(sender)
         })
 }
+const MERGE_QUEUE_QUERY: &str = "query { repository(owner: \"carrick-sh\", name: \"carrick\") { mergeQueue(branch: \"main\") { entries(first: 100) { nodes { headCommit { oid } pullRequest { number baseRefName baseRepository { nameWithOwner } } } } } } }";
+
+fn parse_queue_ref_pr(git_ref: &str) -> Option<u64> {
+    let rest = git_ref.strip_prefix("refs/heads/gh-readonly-queue/main/pr-")?;
+    let digits = rest.split('-').next()?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u64>().ok().filter(|&n| n > 0)
+}
+
+fn resolve_merge_group_prs(
+    graph: &Path,
+    base: &str,
+    comparison_sha: &str,
+    requested_sha: &str,
+    git_ref: &str,
+) -> Result<Vec<u64>, ReceiptError> {
+    let rev_list = checked(
+        "git",
+        &[
+            "rev-list",
+            "--first-parent",
+            "--reverse",
+            &format!("{base}..{requested_sha}"),
+        ],
+        Some(graph),
+    )?;
+    let queued_ordered: Vec<&str> = rev_list.lines().filter(|s| !s.is_empty()).collect();
+    let group_commits: std::collections::BTreeSet<&str> = queued_ordered.iter().copied().collect();
+    let mut prs = std::collections::BTreeSet::new();
+    let mut matched_commits = std::collections::BTreeSet::new();
+    if let Some(number) = parse_queue_ref_pr(git_ref) {
+        prs.insert(number);
+        matched_commits.insert(requested_sha.to_owned());
+    }
+    let remote_refs = checked(
+        "git",
+        &[
+            "ls-remote",
+            "--refs",
+            "https://github.com/carrick-sh/carrick.git",
+            "refs/heads/main",
+            "refs/heads/gh-readonly-queue/main/*",
+        ],
+        None,
+    )?;
+    let mut live_main = None;
+    for line in remote_refs.lines() {
+        if let Some((oid, refname)) = line.split_once('\t') {
+            if refname == "refs/heads/main" {
+                live_main = Some(oid);
+            } else if group_commits.contains(oid)
+                && let Some(number) = parse_queue_ref_pr(refname)
+            {
+                prs.insert(number);
+                matched_commits.insert(oid.to_owned());
+            }
+        }
+    }
+    let graphql_text = checked(
+        "gh",
+        &["api", "graphql", "-f", &format!("query={MERGE_QUEUE_QUERY}")],
+        None,
+    )?;
+    let graphql: Value = serde_json::from_str(&graphql_text).map_err(|e| fail(e.to_string()))?;
+    if !graphql["errors"].is_null() {
+        return Err(fail("mergeQueue GraphQL query returned errors"));
+    }
+    if let Some(nodes) = graphql["data"]["repository"]["mergeQueue"]["entries"]["nodes"].as_array()
+    {
+        for node in nodes {
+            if let Some(oid) = node["headCommit"]["oid"].as_str()
+                && group_commits.contains(oid)
+                && node["pullRequest"]["baseRefName"] == "main"
+                && node["pullRequest"]["baseRepository"]["nameWithOwner"] == REPOSITORY
+                && let Some(number) = node["pullRequest"]["number"].as_u64()
+            {
+                prs.insert(number);
+                matched_commits.insert(oid.to_owned());
+            }
+        }
+    }
+    // If an earlier group merged onto main right after git fetch, its queue ref
+    // and mergeQueue entry disappeared and /commits/{sha}/pulls now links it.
+    let mut fallback_end = 0;
+    if let Some(main_oid) = live_main
+        && let Some(idx) = queued_ordered.iter().position(|&c| c == main_oid)
+    {
+        fallback_end = fallback_end.max(idx + 1);
+    }
+    let split_pos = if comparison_sha == base {
+        0
+    } else {
+        queued_ordered
+            .iter()
+            .position(|&c| c == comparison_sha)
+            .map_or(0, |idx| idx + 1)
+    };
+    if comparison_sha != base && !matched_commits.contains(comparison_sha) {
+        fallback_end = fallback_end.max(split_pos);
+    }
+    let mut fallback_commits: Vec<&str> = queued_ordered[..fallback_end].to_vec();
+    if !matched_commits.contains(requested_sha) {
+        fallback_commits.extend_from_slice(&queued_ordered[fallback_end.max(split_pos)..]);
+    }
+    for commit_sha in fallback_commits {
+        for pull in pages(
+            &format!("repos/{REPOSITORY}/commits/{commit_sha}/pulls?per_page=100"),
+            None,
+        )? {
+            if pull["base"]["ref"] == "main"
+                && pull["base"]["repo"]["full_name"] == REPOSITORY
+                && let Some(number) = pull["number"].as_u64()
+            {
+                prs.insert(number);
+            }
+        }
+    }
+    if prs.is_empty() {
+        return Err(fail("merge_group resolved no pull requests"));
+    }
+    Ok(prs.into_iter().collect())
+}
+
 fn prepare(event_path: &Path, output: &Path) -> Result<(), ReceiptError> {
     let event = read_json(event_path)?;
     let actor = std::env::var("GITHUB_ACTOR").map_err(|e| fail(e.to_string()))?;
@@ -225,11 +350,12 @@ fn prepare(event_path: &Path, output: &Path) -> Result<(), ReceiptError> {
             "only the owner (tjfontaine) may start or rerun signed gates",
         ));
     }
+    let git_ref = std::env::var("GITHUB_REF").unwrap_or_default();
     let automatic_pair = if automatic {
         Some(automatic_request(
             &event,
             &event_name,
-            &std::env::var("GITHUB_REF").unwrap_or_default(),
+            &git_ref,
             &std::env::var("GITHUB_SHA").unwrap_or_default(),
         )?)
     } else {
@@ -245,7 +371,7 @@ fn prepare(event_path: &Path, output: &Path) -> Result<(), ReceiptError> {
                 .clone(),
         ),
         "workflow_dispatch" => {
-            if std::env::var("GITHUB_REF").unwrap_or_default() != "refs/heads/main" {
+            if git_ref != "refs/heads/main" {
                 return Err(fail("dispatch the trusted workflow from main"));
             }
             let input = event["inputs"]["pr"].as_str().unwrap_or_default();
@@ -306,7 +432,7 @@ fn prepare(event_path: &Path, output: &Path) -> Result<(), ReceiptError> {
         .as_ref()
         .map_or(requested_sha.as_str(), |pair| pair.1.as_str());
     let mut baseline_run = None;
-    let base = if event_name == "merge_group" {
+    let (kind, base, prs) = if event_name == "merge_group" {
         // Authorization checks out trusted main with shallow history. Fetch
         // real refs/heads/main and candidate graph objects into an isolated
         // bare repo; never check out queue code or trust all-parents compare.
@@ -329,7 +455,7 @@ fn prepare(event_path: &Path, output: &Path) -> Result<(), ReceiptError> {
             "refs/heads/main",
             &requested_sha,
         )?;
-        if comparison_sha == ancestor.before_sha {
+        let base = if comparison_sha == ancestor.before_sha {
             ancestor.before_sha
         } else {
             // Reuse select-baseline's first-parent validation of the event base.
@@ -342,17 +468,17 @@ fn prepare(event_path: &Path, output: &Path) -> Result<(), ReceiptError> {
                 &requested_sha,
                 |_, candidate| {
                     if candidate == ancestor.before_sha {
-                        fs::create_dir_all(output).map_err(|e| fail(e.to_string()))?;
-                        let id = download_baseline(candidate, output, true)?;
-                        baseline_run = Some(id);
-                        Ok(crate::ci_receipt::Baseline::Found(id, "base.json".into()))
+                        Ok(crate::ci_receipt::Baseline::Found(0, String::new()))
                     } else {
                         Ok(crate::ci_receipt::Baseline::Missing)
                     }
                 },
             )?;
             selected.baseline_sha
-        }
+        };
+        let prs =
+            resolve_merge_group_prs(graph.path(), &base, comparison_sha, &requested_sha, &git_ref)?;
+        (RequestKind::MergeGroup, base, prs)
     } else {
         let comparison = api(&format!(
             "repos/{REPOSITORY}/compare/main...{comparison_sha}"
@@ -363,40 +489,12 @@ fn prepare(event_path: &Path, output: &Path) -> Result<(), ReceiptError> {
         if pr.is_none() && base != comparison_sha {
             return Err(fail("main baseline SHA must be on main"));
         }
-        base
-    };
-    let kind = if event_name == "merge_group" {
-        RequestKind::MergeGroup
-    } else if pr.is_some() {
-        RequestKind::PullRequest
-    } else {
-        RequestKind::Main
-    };
-    let prs = if kind == RequestKind::MergeGroup {
-        // GitHub associates each original commit with its PR. Enumerate all
-        // commits so batched groups notify every participating author.
-        let commits = pages(
-            &format!("repos/{REPOSITORY}/compare/{base}...{requested_sha}?per_page=100"),
-            Some("commits"),
-        )?;
-        let mut prs = std::collections::BTreeSet::new();
-        for commit in commits {
-            let commit_sha = sha(commit["sha"].as_str().unwrap_or_default())?;
-            for pull in pages(
-                &format!("repos/{REPOSITORY}/commits/{commit_sha}/pulls?per_page=100"),
-                None,
-            )? {
-                if pull["base"]["ref"] == "main"
-                    && pull["base"]["repo"]["full_name"] == REPOSITORY
-                    && let Some(number) = pull["number"].as_u64()
-                {
-                    prs.insert(number);
-                }
-            }
-        }
-        prs.into_iter().collect()
-    } else {
-        pr.into_iter().collect()
+        let kind = if pr.is_some() {
+            RequestKind::PullRequest
+        } else {
+            RequestKind::Main
+        };
+        (kind, base, pr.into_iter().collect())
     };
     let mut request = Request {
         kind,
@@ -912,6 +1010,15 @@ fn publish(
             0,
             "Signed gate: **FAIL** (receipt or execution admission)\n\n",
         );
+    }
+    if !request.prs.is_empty() {
+        let prs = request
+            .prs
+            .iter()
+            .map(|pr| format!("#{pr}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        body.push_str(&format!("\nPull requests: {prs}\n"));
     }
     if let Ok(error) = fs::read_to_string(results.join("execution-error.txt")) {
         body.push_str(&format!("\nExecution diagnostic: {error}\n"));

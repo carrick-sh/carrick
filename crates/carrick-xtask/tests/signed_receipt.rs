@@ -397,6 +397,8 @@ elif '--method' in args and args[args.index('--method')+1] == 'POST':
     endpoint = args[args.index('POST')+1]
     with open(os.environ['TEST_POSTS'], 'a') as out:
         out.write(json.dumps({'endpoint':endpoint,'body':json.load(sys.stdin)})+'\n')
+elif args[:2] == ['api', 'graphql']:
+    print(json.dumps({'data':{'repository':{'mergeQueue':{'entries':{'nodes':[]}}}}}))
 elif args[0] == 'api':
     endpoint = args[-1]
     if '/pulls/' in endpoint:
