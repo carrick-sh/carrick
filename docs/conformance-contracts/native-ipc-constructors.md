@@ -290,3 +290,32 @@ those consumers exist would create unusable descriptors.
 The Temporary timerfd crossings remain, and the native constructor target is
 still open. No ARM, x86, signed execution or full #1506 acceptance is claimed
 by the arithmetic prerequisite. Earlier epoll review blockers remain open.
+
+## Timerfd finishing-round witness and clock seam
+
+The native two-child timerfd binding now requires `timerfd_settime` to arm
+an absolute monotonic one-shot at 1 ns, return its previous disarmed value,
+and let the same child read exactly one expiration. A second nonblocking
+read must return errno 11, and `timerfd_gettime` must report disarmed state.
+The fake counter is fixed at 1,000,000 ticks at 24 MHz; the deadline is
+already past. This is immediate-expiry coverage, not clock advancement or
+scheduler wakeup coverage. The constructor still refuses before these new
+assertions execute; they remain prospective until the implementation exists.
+
+Independent inspection confirmed that there is no existing ring clock-domain
+interface to plug into. `ClockDomain` in `kernel/container.rs` owns host
+`Instant`, callback subscriptions and deterministic waiter participation.
+IPC epoll deadlines use counter ticks, and the dormant transport in
+`memory/el1_clock.rs` explicitly excludes frozen/scaled clocks. Reusing
+those counters as the timer creator's clock would change observable behavior.
+
+The necessary migration must retain a generation-authenticated clock-domain
+handle on the timer object, publish pointer-free clock samples and changes,
+and enroll deadlines atomically with both timer and domain generations.
+Frozen, scaled and deterministic clocks need the same transformations and
+waiter participation as the host authority. Host and ring must consume one
+shared timer record, replacing `TimerFdInner`, with an IPC ABI identity
+update. Rearm and final release cancel deadlines by exact object generation;
+member updates precede epoll updates, and notification follows unlocking.
+These are implementation requirements, not a missing owner semantic decision.
+No production timerfd service was added in this finishing-round witness.

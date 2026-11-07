@@ -10420,7 +10420,12 @@ fn native_descriptor_witness(
     let names = Box::new(carrick_el1_abi::InotifyNameCache::new());
 
     let run_in_child_full = |idx: usize, nr: u64, args: [u64; 4]| -> (CompletionRoute, i64) {
-        let mut cpu = crate::sched::FakeCpu::default();
+        let mut cpu = crate::sched::FakeCpu {
+            // Keep the timerfd past-deadline witness independent of defaults.
+            now: 1_000_000,
+            freq: 24_000_000,
+            ..Default::default()
+        };
         let mut svc = Aarch64NativeProcessService::with_crossing(
             &task,
             fixture.slot,
@@ -10799,8 +10804,8 @@ fn native_descriptor_witness(
                 );
                 assert_eq!(completed(sys::CLOSE.raw(), [eventfd as u64, 0, 0]), 0);
             } else {
-                // A timer constructor must publish a usable, disarmed timer,
-                // not just an fd. This does not prove arming or clock identity.
+                // A timer constructor must publish a usable timer, not just
+                // an fd. All calls go through this child's production entry.
                 let spec = carrick_test_support::GuestUserBuffer::from_bytes(&[0xa5; 32]);
                 assert_eq!(
                     completed(sys::TIMERFD_GETTIME.raw(), [result as u64, spec.arg(), 0]),
@@ -10812,6 +10817,47 @@ fn native_descriptor_witness(
                     completed(sys::READ.raw(), [result as u64, received.arg(), 8]),
                     -11
                 );
+                // Absolute monotonic 1ns is already in the past in this
+                // default-clock fixture. A one-shot must fire exactly once;
+                // no sleep, polling loop or host timer supplies the answer.
+                let mut armed = [0u8; 32];
+                armed[24..32].copy_from_slice(&1i64.to_ne_bytes());
+                let armed = carrick_test_support::GuestUserBuffer::from_bytes(&armed);
+                let previous = carrick_test_support::GuestUserBuffer::from_bytes(&[0xa5; 32]);
+                let (route, set) = run_in_child_full(
+                    idx,
+                    sys::TIMERFD_SETTIME.raw(),
+                    [
+                        result as u64,
+                        carrick_abi::LINUX_TIMER_ABSTIME,
+                        armed.arg(),
+                        previous.arg(),
+                    ],
+                );
+                assert!(matches!(
+                    route,
+                    CompletionRoute::Served | CompletionRoute::WithWork
+                ));
+                assert_eq!(set, 0, "child {idx} arms its own timerfd");
+                assert_eq!(previous.as_bytes(), &[0; 32]);
+                assert_eq!(
+                    completed(sys::READ.raw(), [result as u64, received.arg(), 8]),
+                    8
+                );
+                assert_eq!(
+                    u64::from_ne_bytes(received.as_bytes().try_into().unwrap()),
+                    1
+                );
+                assert_eq!(
+                    completed(sys::READ.raw(), [result as u64, received.arg(), 8]),
+                    -11,
+                    "a consumed one-shot cannot fire twice"
+                );
+                assert_eq!(
+                    completed(sys::TIMERFD_GETTIME.raw(), [result as u64, spec.arg(), 0]),
+                    0
+                );
+                assert_eq!(spec.as_bytes(), &[0; 32], "expired one-shot is disarmed");
             }
             results.push((route, result, pair));
         }

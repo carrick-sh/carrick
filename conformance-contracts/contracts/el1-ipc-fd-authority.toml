@@ -12,7 +12,7 @@
 schema_version = 1
 id = "kernel.el1.ipc-fd-authority"
 title = "One shared descriptor incarnation retains exact OFD pins"
-guest_surfaces = ["kernel:filetable", "syscall:execve", "syscall:dup2", "syscall:fcntl", "syscall:close", "syscall:sendmsg", "syscall:mmap", "syscall:pipe2", "syscall:eventfd2", "syscall:epoll_create1", "syscall:timerfd_create"]
+guest_surfaces = ["kernel:filetable", "syscall:execve", "syscall:dup2", "syscall:fcntl", "syscall:close", "syscall:sendmsg", "syscall:mmap", "syscall:pipe2", "syscall:eventfd2", "syscall:epoll_create1", "syscall:timerfd_create", "syscall:timerfd_settime", "syscall:timerfd_gettime"]
 semantic_authority = ["man 2 execve", "man 2 fork", "man 2 clone", "man 2 dup", "man 2 fcntl", "man 2 close", "man 2 close_range", "man 7 inotify", "man 7 epoll", "man 7 unix", "man 2 mmap", "man 2 pipe2", "man 2 eventfd", "man 2 epoll_create1", "man 2 timerfd_create"]
 fixture = "fd-core:two-live-table owners and incarnation pins"
 scale_points = [65, 4096, 65536]
@@ -26,6 +26,7 @@ structural_budgets = []
 [bindings]
 vm_free = [
   "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_fork_exec_pipe_writer_reaches_its_parent (#1506: production fork/exec successor constructs eventfd and epoll, counter read, empty wait, flags and close)",
+  "carrick-el1-linux::aarch64_process_tests::serial_host_native_fork_children_create_timerfd_in_their_own_tables (#1506 red-first: production child settime with old-value output, immediate absolute one-shot expiration, exact count, drained EAGAIN and disarmed gettime; constructor still unserved, no scheduler-wakeup or creator-domain proof)",
   "carrick-timer-core::timerfd::tests (expiry arithmetic prerequisite only; no ring clock, scheduler or constructor acceptance)",
   "carrick-el1-abi::ipc::tests::el1_ipc_too_small_retained_ring_stays_owned_until_replacement (#1506: retained extent identity, no stock consumption on refusal, exactly one replacement transfer; constructor syscall remains unserved)",
   "carrick-el1-linux::aarch64_process_tests::serial_host_native_fork_epoll_ctl_observes_peer_pipe_write (#1506 red-first: pre-admitted inherited epoll, native child ADD, peer child pipe write, zero-timeout readiness/data and drain; no constructor or signed execution claim)",
