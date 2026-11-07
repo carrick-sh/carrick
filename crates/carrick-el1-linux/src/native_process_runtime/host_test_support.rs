@@ -2007,6 +2007,7 @@ fn native_clock_requires_retained_payload_before_service_publication() {
     );
 }
 
+#[cfg(test)]
 #[test]
 fn native_clock_sample_retains_reply_across_copyout_busy() {
     use carrick_core_abi::clock::{CLOCK_RECORD_BYTES, ClockCapabilityId};
