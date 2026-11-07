@@ -1598,7 +1598,7 @@ fn queued_merge_group_resolves_rebased_prs_and_names_them_in_published_receipt()
     std::fs::write(
         &git_shim,
         format!(
-            "#!/usr/bin/env python3\nimport os, sys\nargs = [os.environ['TEST_GRAPH'] if a == 'https://github.com/carrick-sh/carrick.git' else a for a in sys.argv[1:]]\nos.execv({real_git:?}, ['git'] + args)\n"
+            "#!/usr/bin/env python3\nimport os, sys\nargs = [os.environ['TEST_GRAPH'] if a == 'https://github.com/carrick-sh/carrick.git' else a for a in sys.argv[1:]]\nif args[:2] == ['ls-remote', '--refs'] and os.environ.get('TEST_HIDE_QUEUE_REFS') == '1': raise SystemExit(0)\nos.execv({real_git:?}, ['git'] + args)\n"
         ),
     )
     .unwrap();
@@ -1747,6 +1747,14 @@ else:
             .env("TEST_ENTRIES", &entries_path)
             .env("TEST_MERGED_PULLS", &merged_pulls_path)
             .env("TEST_POSTS", &posts_path)
+            .env(
+                "TEST_HIDE_QUEUE_REFS",
+                if label.starts_with("gap-") || label == "null-node" {
+                    "1"
+                } else {
+                    "0"
+                },
+            )
             .env_remove("GITHUB_OUTPUT")
             .args(["signed-gate", "prepare", "--event"])
             .arg(&event_path)
@@ -1793,18 +1801,15 @@ else:
     ]);
     std::fs::write(&entries_path, gap_entries.to_string()).unwrap();
     let gap_unresolved = run_prepare_output("gap-unresolved", &ref_gap_head, &a, &c);
-    assert!(
-        !gap_unresolved.status.success(),
-        "interior unattributed commit was accepted"
-    );
-    assert!(
-        String::from_utf8_lossy(&gap_unresolved.stderr).contains(&b),
-        "{}",
-        String::from_utf8_lossy(&gap_unresolved.stderr)
-    );
+    let gap_refused_with_commit = !gap_unresolved.status.success()
+        && String::from_utf8_lossy(&gap_unresolved.stderr).contains(&b);
     std::fs::write(&merged_pulls_path, json!({b.clone():[124]}).to_string()).unwrap();
-    let (gap_resolved, _) = run_prepare("gap-resolved", &ref_gap_head, &a, &c);
-    assert_eq!(gap_resolved["prs"], json!([123, 124, 125]));
+    let gap_resolved = run_prepare_output("gap-resolved", &ref_gap_head, &a, &c);
+    let gap_receipt_names_all_prs = gap_resolved.status.success()
+        && serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(dir.path().join("out-gap-resolved/request.json")).unwrap(),
+        )
+        .is_ok_and(|request| request["prs"] == json!([123, 124, 125]));
     std::fs::write(&merged_pulls_path, "{}").unwrap();
     std::fs::write(&entries_path, json!([
         {"baseCommit":{"oid":a},"headCommit":{"oid":d},"pullRequest":{"number":123,"baseRefName":"main","baseRepository":{"nameWithOwner":"carrick-sh/carrick"}}},
@@ -1812,7 +1817,14 @@ else:
         {"baseCommit":{"oid":b},"headCommit":{"oid":c},"pullRequest":{"number":125,"baseRefName":"main","baseRepository":{"nameWithOwner":"carrick-sh/carrick"}}}
     ]).to_string()).unwrap();
     let null_node = run_prepare_output("null-node", &ref_gap_head, &a, &c);
-    assert!(!null_node.status.success(), "null queue node was accepted");
+    let null_node_refused = !null_node.status.success();
+    assert!(
+        gap_refused_with_commit && gap_receipt_names_all_prs && null_node_refused,
+        "unattributed_gap_refused_with_commit={gap_refused_with_commit}; resolved_gap_names_all_prs={gap_receipt_names_all_prs}; null_node_refused={null_node_refused}; unresolved stderr={}; resolved stderr={}; null stderr={}",
+        String::from_utf8_lossy(&gap_unresolved.stderr),
+        String::from_utf8_lossy(&gap_resolved.stderr),
+        String::from_utf8_lossy(&null_node.stderr),
+    );
 
     // (4) Publish names both PRs in comment.md, GITHUB_STEP_SUMMARY, and PR comments
     // on both PASS and FAIL paths.
