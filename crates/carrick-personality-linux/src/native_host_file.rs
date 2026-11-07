@@ -1127,27 +1127,29 @@ pub fn map_source(record: &[u8]) -> Result<host_file::MapSourceReply, SyscallRes
 }
 
 /// Map the carrier's reply to the syscall result, copying any output back
-/// through the ring's own user copy.
-pub fn complete(
-    record: &[u8],
-    output: Option<HostFileOutput>,
-    copy_out: &mut dyn FnMut(u64, &[u8]) -> bool,
-) -> SyscallResult {
+/// through the ring's existing owned-output continuation. Validation does
+/// not access user memory: the service owner retains these bytes before
+/// retiring the request, then copies them with its exact-MM owner protocol.
+pub fn complete(record: &[u8], output: Option<HostFileOutput>) -> (SyscallResult, &[u8]) {
     let Some(reply) = host_file::reply(record) else {
-        return SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO);
+        return (
+            SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO),
+            &[],
+        );
     };
     if reply.result < 0 {
-        return SyscallResult::new(reply.result);
+        return (SyscallResult::new(reply.result), &[]);
     }
     if let Some(output) = output {
         if reply.output.len() > output.len {
-            return SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO);
+            return (
+                SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO),
+                &[],
+            );
         }
-        if !reply.output.is_empty() && !copy_out(output.address, reply.output) {
-            return SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT);
-        }
+        return (SyscallResult::new(reply.result), reply.output);
     }
-    SyscallResult::new(reply.result)
+    (SyscallResult::new(reply.result), &[])
 }
 
 /// Stamp a staged `Write` record with its writer's own `RLIMIT_FSIZE` soft

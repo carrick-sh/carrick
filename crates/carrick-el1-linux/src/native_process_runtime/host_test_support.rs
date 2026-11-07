@@ -4365,7 +4365,7 @@ fn tgkill_reaches_a_futex_parked_host_issued_sibling() {
 /// Exercise the production host-file service and completion entries. The
 /// carrier reply is supplied here; this is not a descriptor-retention witness.
 #[cfg(test)]
-fn native_read_reply_owner_wait(cancel: bool) {
+fn native_read_reply_owner_wait(cancel: bool, fault: bool) {
     use carrick_core_abi::service::{ServiceCell, ServiceOperation};
     use carrick_personality_linux::native_host_file::{
         DescriptionAccess, HostFileStage, NativeDescriptor,
@@ -4418,8 +4418,12 @@ fn native_read_reply_owner_wait(cancel: bool) {
             observed.revision(),
         )
     };
-    service.child_copy_error = Some(NativeProcessError::OwnerWait(wait));
-    service.child_copy_error_at = Some(0x11000);
+    service.child_copy_error = Some(if fault {
+        NativeProcessError::Fault
+    } else {
+        NativeProcessError::OwnerWait(wait)
+    });
+    service.child_copy_error_at = Some(if fault { 0x10000 } else { 0x11000 });
     let bytes: Vec<u8> = (0..8192).map(|n| (n % 251) as u8).collect();
     let mut frame = carrick_el1_abi::TrapFrame {
         esr: 0x15 << 26,
@@ -4535,14 +4539,32 @@ fn native_read_reply_owner_wait(cancel: bool) {
                 &mut service,
             )
             .unwrap();
-        assert!(
-            matches!(
-                entry.resume_checkpoint(|_| Ok(None)),
-                Ok(NativeResume::Left(None))
-            ),
-            "completed read must park on its output owner, never return EFAULT"
-        );
-        assert!(entry.take_handoff_receipt().is_some());
+        let result = entry.resume_checkpoint(|_| Ok(None));
+        if fault {
+            assert!(matches!(result, Ok(NativeResume::Returned(result))
+                if result.raw() == carrick_syscall_abi::LINUX_EFAULT.guest_retval()));
+            assert!(entry.take_handoff_receipt().is_none());
+        } else {
+            assert!(
+                matches!(result, Ok(NativeResume::Left(None))),
+                "completed read must park on its output owner, never return EFAULT"
+            );
+            // resume_checkpoint consumes the handoff receipt itself.
+            assert!(fixture.zone.slot(fixture.slot).current().is_none());
+            assert!(
+                fixture
+                    .runtime
+                    .graph
+                    .lock()
+                    .service_wait(&fixture.record)
+                    .is_some()
+            );
+        }
+    }
+    if fault {
+        assert!(take_signal_copies().is_empty());
+        assert!(fixture.task.service_notice.take().unwrap().is_none());
+        return;
     }
     assert_eq!(
         take_signal_copies(),
@@ -4599,13 +4621,19 @@ fn native_read_reply_owner_wait(cancel: bool) {
 #[cfg(test)]
 #[test]
 fn native_read_reply_retains_bytes_and_cursor_across_owner_wait() {
-    native_read_reply_owner_wait(false);
+    native_read_reply_owner_wait(false, false);
 }
 
 #[cfg(test)]
 #[test]
 fn native_read_reply_fatal_cancellation_commits_no_more_bytes() {
-    native_read_reply_owner_wait(true);
+    native_read_reply_owner_wait(true, false);
+}
+
+#[cfg(test)]
+#[test]
+fn native_read_reply_true_copy_fault_returns_efault() {
+    native_read_reply_owner_wait(false, true);
 }
 
 #[cfg(test)]

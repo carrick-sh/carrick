@@ -463,13 +463,9 @@ fn completion_copies_output_only_on_success() {
         .unwrap()
         .reply(3, b"abc")
         .unwrap();
-    let mut copied = Vec::new();
-    let result = complete(&record, output, &mut |address, bytes| {
-        copied.push((address, bytes.to_vec()));
-        true
-    });
+    let (result, bytes) = complete(&record, output);
     assert_eq!(result, SyscallResult::new(3));
-    assert_eq!(copied, vec![(BASE, b"abc".to_vec())]);
+    assert_eq!(bytes, b"abc");
     // No reply (refused or cancelled service) never copies anything.
     let (record, output, _) = request(run(
         HostFileCall::Read {
@@ -480,8 +476,11 @@ fn completion_copies_output_only_on_success() {
         &mut user,
     ));
     assert_eq!(
-        complete(&record, output, &mut |_, _| panic!("no output")),
-        SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO)
+        complete(&record, output),
+        (
+            SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO),
+            &[][..]
+        )
     );
 }
 
