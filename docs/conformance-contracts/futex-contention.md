@@ -27,14 +27,25 @@ bindings require expiry tick 105 after admission at tick 100, whether owner
 preparation parks or returns synchronous `Redispatch`. Separate episodes prove
 that cancellation, unrelated syscalls and unserved futex operations release
 custody before the next wait.
-`futex_caught_signal_releases_owner_deadline_before_handler_wait` delivers a
-caught SIGUSR1 through the production return checkpoint while the original
-deadline is retained, then requires a fresh five-second wait in the handler
-without an intervening unrelated syscall. The host runtime binding
+`futex_caught_signal_releases_owner_deadline_before_handler_wait` sends
+SIGUSR1 from the live sibling while the original waiter is still parked on
+owner service. After service ACK, the retained syscall must return errno 4
+without spending its deadline. The production return checkpoint delivers the
+handler, which receives a fresh five-second wait without an intervening
+unrelated syscall. The host runtime binding
 `serial_host_futex_deadline_survives_zone_word_recheck_owner_park` drives the
 production dispatcher, refuses the final `zone_park` load, releases its owner
 at virtual second one, and resumes the production job. Its resulting zone
 continuation must expire four seconds later, rather than five.
+Its cancellation companion sends SIGKILL while backing remains unavailable;
+the production job must retire its completion token without another operand
+load or guest return, and late owner release cannot requeue it.
+
+Native admission captures a presence hint under its existing graph lock.
+Ordinary syscalls with no retained futex do not acquire a second graph lock
+just to discover absence; the operation itself remains solely in the member
+row. Terminal service and lifecycle admission discard that owned state before
+closing or retiring the member.
 
 These VM-free witnesses establish continuation semantics and bounded work.
 They do not supply signed execution or an end-to-end Docker timing ratio.

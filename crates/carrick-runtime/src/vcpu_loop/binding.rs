@@ -10201,6 +10201,15 @@ mod tests {
 
     #[test]
     fn serial_host_futex_deadline_survives_zone_word_recheck_owner_park() {
+        futex_zone_owner_wait(false);
+    }
+
+    #[test]
+    fn serial_host_futex_owner_cancellation_releases_deadline_before_owner_readiness() {
+        futex_zone_owner_wait(true);
+    }
+
+    fn futex_zone_owner_wait(cancelled: bool) {
         use super::super::code_content_test::{CodeContent, PendingContentWrite};
         use carrick_guest_mem::{MemoryError, OwnedMemoryWait};
         use carrick_kernel::kernel::container::ClockDomain;
@@ -10400,6 +10409,60 @@ mod tests {
                 )
                 .unwrap();
             clock.advance(Duration::from_secs(1)).unwrap();
+            if cancelled {
+                sibling.signal_authority().enqueue_task_standard(
+                    carrick_kernel::kernel::LinuxSignal::for_signal_number(
+                        carrick_abi::LINUX_SIGKILL,
+                    )
+                    .unwrap(),
+                    None,
+                );
+                root.task().wake();
+                let mut resumed = scheduler
+                    .try_take(&registration)
+                    .unwrap()
+                    .expect("fatal signal wakes the owner-blocked futex");
+                control.submission.authority =
+                    executor::ExecutionLeaseAuthoritySlot::from(Some(resumed.take_lease()));
+                let exit = job.poll_with_engine(&mut engine, &mut control).unwrap();
+                assert!(
+                    matches!(exit, executor::ExecutorExit::Yielded),
+                    "terminal handoff: {exit:?}"
+                );
+                assert!(job.phase.is_terminal_transition());
+                assert!(
+                    job.state.syscall_completion.is_idle(),
+                    "cancellation consumes the futex deadline"
+                );
+                let exit = job.poll_with_engine(&mut engine, &mut control).unwrap();
+                assert!(
+                    matches!(exit, executor::ExecutorExit::Exited),
+                    "terminal completion: {exit:?}"
+                );
+                assert_eq!(
+                    loads.load(Ordering::SeqCst),
+                    2,
+                    "cancellation must precede any operand retry"
+                );
+                assert!(
+                    engine.completed_syscalls.is_empty(),
+                    "a cancelled wait must never return to the guest"
+                );
+                resumed
+                    .restore_lease(control.submission.take_execution_lease().unwrap())
+                    .unwrap();
+                scheduler.settle_exited(resumed).unwrap();
+                drop(reader);
+                assert_eq!(content.writer_count(), 0);
+                assert_eq!(
+                    scheduler.queued_len(),
+                    0,
+                    "late owner release cannot revive the cancelled wait"
+                );
+                scheduler.unregister_executor(&registration).unwrap();
+                scheduler.close();
+                return;
+            }
             drop(reader);
             let mut resumed = scheduler
                 .try_take(&registration)
