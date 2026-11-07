@@ -73,3 +73,41 @@ fn relative_timeout_preserves_home_record_admission_and_numeric_results() {
         assert_eq!(venue.waits, scale);
     }
 }
+
+#[test]
+fn untimed_realtime_bitset_wait_uses_the_same_private_wait_owner() {
+    use carrick_personality_linux::sched::FUTEX_WAIT_BITSET_PRIVATE_REALTIME;
+    let mut venue = ClockVenue {
+        home_record: false,
+        nanos: 0,
+        waits: 0,
+    };
+    let mut call = FutexCall {
+        args: [
+            0x1000,
+            FUTEX_WAIT_BITSET_PRIVATE_REALTIME,
+            7,
+            0,
+            0,
+            0x8000_0000,
+        ],
+    };
+    let wait = serve_futex(call, &mut venue).unwrap();
+    assert_eq!(wait.mm.raw(), 17);
+    assert_eq!(wait.bitset, 0x8000_0000);
+    assert_eq!(wait.expected, 7);
+    assert!(wait.deadline.is_none(), "the clock flag creates no timeout");
+    assert_eq!(venue.waits, 1);
+    for (op, timeout, mask) in [
+        (FUTEX_WAIT_BITSET_PRIVATE_REALTIME, 0x2000, 1),
+        (FUTEX_WAIT_BITSET_PRIVATE_REALTIME, 0, 0),
+        (FUTEX_WAIT_PRIVATE | 256, 0, 1),
+        (FUTEX_WAIT_BITSET_PRIVATE_REALTIME | 512, 0, 1),
+    ] {
+        call.args[1] = op;
+        call.args[3] = timeout;
+        call.args[5] = mask;
+        assert!(serve_futex(call, &mut venue).is_none());
+        assert_eq!(venue.waits, 1, "an unserved variant must not enroll");
+    }
+}

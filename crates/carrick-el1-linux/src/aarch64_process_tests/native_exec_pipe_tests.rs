@@ -870,11 +870,15 @@ fn child_futex<'a>(
     use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest};
     use carrick_guest_arch::{Access, GuestLen};
     use carrick_personality_linux::dispatch::CompletionRoute;
-    struct Word(core::cell::Cell<bool>);
+    struct Word {
+        available: core::cell::Cell<bool>,
+        reads: core::cell::Cell<u32>,
+    }
     impl crate::sched::UserWord for Word {
         fn read_u32(&self, _: &CurrentTask, address: u64) -> Option<u32> {
             assert_eq!(address, VA);
-            self.0.get().then_some(0)
+            self.reads.set(self.reads.get() + 1);
+            self.available.get().then_some(0)
         }
         fn read_u64(&self, _: &CurrentTask, _: u64) -> Option<u64> {
             panic!("untimed wait")
@@ -891,7 +895,10 @@ fn child_futex<'a>(
     }
     let binding = runtime.task_binding(child).unwrap();
     assert_ne!(binding.address.mm, fixture.address.mm);
-    let word = Word(core::cell::Cell::new(false));
+    let word = Word {
+        available: core::cell::Cell::new(false),
+        reads: core::cell::Cell::new(0),
+    };
     let request = GuestCopyRequest {
         address: UserVa::new(VA),
         len: GuestLen::new(4),
@@ -992,8 +999,9 @@ fn child_futex<'a>(
         );
         assert!(entry.take_run_failure().is_none());
     }
+    assert_eq!(word.reads.get(), 1, "one refusal transfers to the owner");
     service.prepare_copy_error = None;
-    word.0.set(true);
+    word.available.set(true);
     access.lower(space.index());
     assert_eq!(
         fixture.zone.switch_in_full(fixture.slot).unwrap().record,
@@ -1055,6 +1063,11 @@ fn child_futex<'a>(
     assert_eq!(
         frame.x[0] as i64, -11,
         "retry compares the original expected value, never EFAULT"
+    );
+    assert_eq!(
+        word.reads.get(),
+        2,
+        "mismatch consumes one atomic comparison"
     );
     assert!(entry.take_run_failure().is_none());
     assert!(runtime.task_binding(parent).is_some());
@@ -1153,6 +1166,11 @@ fn child_futex<'a>(
         }
         .serve_futex(&mut frame),
         Some(crate::sched::Served::Returned { switched: true })
+    );
+    assert_eq!(
+        word.reads.get(),
+        3,
+        "matching wait compares under the bucket lock and enrolls once"
     );
     let (page, control) = fixture.task.lifecycle_refs().unwrap();
     assert_eq!(control.visible_tid(), Some(tid));
