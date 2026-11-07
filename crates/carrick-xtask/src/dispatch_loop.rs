@@ -2546,7 +2546,7 @@ impl Server<'_> {
         Ok(())
     }
     /// Complete review-only work through the existing publisher, even when
-    /// the coordinator never called publish (#1731). Only GitHub's current
+    /// the coordinator never called publish (#1813). Only GitHub's current
     /// head and published review bodies decide the outcome.
     fn finish_review(&mut self, pr: u64) -> Result<String, String> {
         let check = || -> Result<String, ScalerError> {
@@ -2577,6 +2577,8 @@ impl Server<'_> {
                         "no verdict published: current head unreadable",
                     ))?;
             let mut reviews = list(self.root, &format!("repos/{REPOSITORY}/pulls/{pr}/reviews"))?;
+            let review_head_pattern = regex::Regex::new(r"(?:Reviewed head: |at `?)([a-f0-9]{40})")
+                .map_err(|_| ScalerError::Guard("review head pattern"))?;
             for comment in list(
                 self.root,
                 &format!("repos/{REPOSITORY}/issues/{pr}/comments"),
