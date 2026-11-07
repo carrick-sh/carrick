@@ -496,7 +496,7 @@ pub struct IrqGuard {
     pub saved_daif: u64,
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), not(target_os = "none")))]
 static HOST_IRQ_MASKED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -510,7 +510,7 @@ fn host_irq_swap(masked: bool) -> bool {
     HOST_IRQ_MASKED.with(|state| state.replace(masked))
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), not(target_os = "none")))]
 fn host_irq_swap(masked: bool) -> bool {
     HOST_IRQ_MASKED.swap(masked, core::sync::atomic::Ordering::SeqCst)
 }
@@ -520,7 +520,7 @@ fn host_irq_store(masked: bool) {
     HOST_IRQ_MASKED.with(|state| state.set(masked));
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), not(target_os = "none")))]
 fn host_irq_store(masked: bool) {
     HOST_IRQ_MASKED.store(masked, core::sync::atomic::Ordering::SeqCst);
 }
