@@ -111,7 +111,49 @@ pub struct NamespaceTable {
 // SAFETY: the leaf lock exclusively protects both UnsafeCells across aliases.
 unsafe impl Sync for NamespaceTable {}
 
+#[cfg(any(test, feature = "host-test"))]
+static OBSERVED_NAMESPACE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+#[cfg(any(test, feature = "host-test"))]
+static NAMESPACE_CONTENDED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Fixture observation of an actual failed acquisition, without changing the
+/// table layout or the production wait policy. Only one observer may be armed.
+#[cfg(any(test, feature = "host-test"))]
+pub struct NamespaceContentionProbe<'a>(&'a NamespaceTable);
+#[cfg(any(test, feature = "host-test"))]
+impl NamespaceContentionProbe<'_> {
+    pub fn observed(&self) -> bool {
+        NAMESPACE_CONTENDED.load(Ordering::Acquire)
+    }
+}
+#[cfg(any(test, feature = "host-test"))]
+impl Drop for NamespaceContentionProbe<'_> {
+    fn drop(&mut self) {
+        let _ = OBSERVED_NAMESPACE.compare_exchange(
+            core::ptr::from_ref(self.0).addr(),
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
 impl NamespaceTable {
+    #[cfg(any(test, feature = "host-test"))]
+    pub fn contention_probe(&self) -> Option<NamespaceContentionProbe<'_>> {
+        OBSERVED_NAMESPACE
+            .compare_exchange(
+                0,
+                core::ptr::from_ref(self).addr(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()?;
+        NAMESPACE_CONTENDED.store(false, Ordering::Release);
+        Some(NamespaceContentionProbe(self))
+    }
     /// The view cannot escape the closure. Callers perform only bounded
     /// allocator operations here and retain all outer custody until return.
     pub fn with_view<R>(
@@ -125,6 +167,10 @@ impl NamespaceTable {
             .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
+            #[cfg(any(test, feature = "host-test"))]
+            if OBSERVED_NAMESPACE.load(Ordering::Acquire) == core::ptr::from_ref(self).addr() {
+                NAMESPACE_CONTENDED.store(true, Ordering::Release);
+            }
             wait.wait_short(attempt);
             attempt = attempt.saturating_add(1);
         }
@@ -883,7 +929,8 @@ impl ClaimKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IdError {
-    /// The mapped consumer must provision storage outside its authority lock.
+    /// The view has no spare node. Fixed zone tables treat this as exhaustion;
+    /// local owners may provision storage before lending a new view.
     StorageRequired,
     AuthorityTransferred,
     Exhausted,

@@ -583,15 +583,20 @@ mod tests {
 
     #[test]
     fn prepared_cpl0_dispatcher_boots_in_exact_launch_container() {
-        prepared_cpl0_export_case(false);
+        prepared_cpl0_export_case(false, false);
     }
 
     #[test]
     fn prepared_cpl0_shared_birth_export_revokes_only_old_kernel() {
-        prepared_cpl0_export_case(true);
+        prepared_cpl0_export_case(true, false);
     }
 
-    fn prepared_cpl0_export_case(shared_births: bool) {
+    #[test]
+    fn zone_namespace_refuses_boot_export_without_revoking_host_claims() {
+        prepared_cpl0_export_case(true, true);
+    }
+
+    fn prepared_cpl0_export_case(shared_births: bool, zone_namespace: bool) {
         let network = Arc::new(crate::network::RuntimeNetwork::host_default());
         let container = Arc::new(crate::kernel::Container::new_with_namespaces(
             crate::kernel::LaunchContext::unmanaged(crate::kernel::RunId::new("cpl0-launch-test")),
@@ -686,6 +691,21 @@ mod tests {
                 .object_ids()
                 .bind_initial_birth_source(birth_source.clone())
                 .unwrap();
+        }
+        if zone_namespace {
+            context
+                .kernel()
+                .ids()
+                .bind_namespace_source(birth_source.clone())
+                .unwrap();
+            assert!(matches!(
+                context.kernel().export_boot_launch(&binding, vm),
+                Err(crate::kernel::boot_launch::BootExportError::RootScope)
+            ));
+            assert_eq!(context.kernel().boot_export_receipt().exports, 0);
+            assert!(context.exact_thread_is_live());
+            assert!(context.kernel().ids().reserve_thread().is_ok());
+            return;
         }
         let surviving_graph = crate::kernel::ObjectIdRegistry::with_birth_source(birth_source);
         let peer_before = surviving_graph.thread_serial().unwrap();

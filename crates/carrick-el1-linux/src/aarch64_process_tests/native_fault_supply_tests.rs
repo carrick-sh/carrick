@@ -844,8 +844,8 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
             assert_eq!(page.live(), 1);
             let claims_pinned = crate::native_process_runtime::thread_stock::claim_counts(&owner);
             assert_eq!(
-                claims_pinned.thread_claims, 9,
-                "retain all seven retired namespace claims until pins return"
+                claims_pinned.thread_claims, 10,
+                "retain seven retired claims, the child leader, and both host/ring parent claims until pins return"
             );
             drop(transient_pins.pop());
             let mut handoff = None;
@@ -1015,8 +1015,8 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
     }
     assert_eq!(
         crate::native_process_runtime::thread_stock::claim_counts(&owner).thread_claims,
-        1,
-        "only the live parent's thread claim remains"
+        2,
+        "only the live parent's host and ring thread claims remain"
     );
     let physical = crossing.physical.as_ref().unwrap().lock().unwrap();
     assert_eq!(

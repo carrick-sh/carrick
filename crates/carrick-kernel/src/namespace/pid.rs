@@ -1719,7 +1719,10 @@ mod tests {
     #[test]
     fn stale_namespace_claim_does_not_retain_a_dead_visible_cursor() {
         let region = test_region();
-        let ids = crate::kernel::IdRegistry::new();
+        let root = carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap();
+        let (ids, _root) = crate::kernel::IdRegistry::with_root(root).unwrap();
+        let (_first_id, _first_claim) = ids.reserve_thread().unwrap();
+        let (_second_id, _second_claim) = ids.reserve_thread().unwrap();
         drop(region.reserve_identity(&ids, 42, 41).unwrap());
         assert_eq!(ids.visible_namespace_count(), 1);
         assert!(region.arena.layout().pid_namespaces.release(region.claim));
@@ -1731,7 +1734,10 @@ mod tests {
     #[test]
     fn visible_preparation_burns_numbers_and_refuses_foreign_allocator() {
         let region = test_region();
-        let ids = crate::kernel::IdRegistry::new();
+        let root = carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap();
+        let (ids, _root) = crate::kernel::IdRegistry::with_root(root).unwrap();
+        let (_first_id, _first_claim) = ids.reserve_thread().unwrap();
+        let (_second_id, _second_claim) = ids.reserve_thread().unwrap();
         let first = region.reserve_identity(&ids, 42, 41).unwrap();
         assert_eq!(first.visible_id(), 2);
         drop(first);
