@@ -7216,6 +7216,7 @@ pub(crate) mod tests {
                 &mut self,
                 _: &carrick_el1_abi::TrapFrame,
                 _: &mut carrick_el1_abi::Aarch64ParkedContext,
+                _: carrick_el1::substrate::sched::CpuExitCause,
             ) {
                 panic!("no scheduler venue")
             }
