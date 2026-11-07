@@ -352,6 +352,8 @@ fn actions_prepare_download_and_publish_use_exact_baseline_and_fail_closed() {
     let d = commit("first queued PR");
     let b = commit("second queued PR");
     let c = commit("next group");
+    let tree = git(&["rev-parse", "HEAD^{tree}"]);
+    let x = git(&["commit-tree", &tree, "-p", &c, "-m", "unqueued descendant"]);
     git(&[
         "update-ref",
         "refs/heads/gh-readonly-queue/main/pr-123-a",
@@ -379,6 +381,8 @@ fn actions_prepare_download_and_publish_use_exact_baseline_and_fail_closed() {
     std::fs::write(&git_shim, format!(r#"#!/usr/bin/env python3
 import os, sys
 args = [os.environ['TEST_GRAPH'] if a == 'https://github.com/carrick-sh/carrick.git' else a for a in sys.argv[1:]]
+if args[:2] == ['ls-remote', '--refs'] and os.environ.get('TEST_HIDE_QUEUE_REFS'):
+    raise SystemExit(0)
 os.execv({real_git:?}, ['git'] + args)
 "#)).unwrap();
     std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -407,7 +411,7 @@ elif args[0] == 'api':
     elif '/compare/' in endpoint:
         print(json.dumps({'merge_base_commit':{'sha':base}}))
     elif '/commits/' in endpoint and '/pulls?' in endpoint:
-        print(json.dumps([[]]))
+        print(json.dumps([json.loads(os.environ.get('TEST_REST_PULLS', '[]'))]))
     elif '/actions/runs/100' == endpoint[-17:]:
         print(json.dumps({'id':100,'path':'.github/workflows/signed-gate.yml','head_branch':'main','event':'push','head_sha':base,'status':'completed','repository':{'full_name':'carrick-sh/carrick'},'head_repository':{'full_name':'carrick-sh/carrick'}}))
     elif '/workflows/signed-gate.yml/runs' in endpoint:
@@ -512,7 +516,7 @@ else:
     assert!(label("tjfontaine").status.success());
     assert!(!label("someone-else").status.success());
 
-    let queue_ref = "refs/heads/gh-readonly-queue/main/pr-123-test";
+    let queue_ref = "refs/heads/gh-readonly-queue/main/pr-124-test";
     let queue_event = dir.path().join("queue.json");
     let queue_payload = json!({"repository":{"full_name":"carrick-sh/carrick"},"action":"checks_requested","merge_group":{"base_ref":"refs/heads/main","head_ref":queue_ref,"head_sha":b.clone(),"base_sha":a.clone()}});
     std::fs::write(&queue_event, queue_payload.to_string()).unwrap();
@@ -529,9 +533,21 @@ else:
                     .as_str()
                     .unwrap_or(queue_ref),
             )
-            .env("GITHUB_SHA", b.clone())
+            .env(
+                "GITHUB_SHA",
+                payload["merge_group"]["head_sha"].as_str().unwrap_or(&b),
+            )
             .env("TEST_PENDING_BASE", "1")
             .env("TEST_QUEUE_ENTRIES", entries)
+            .env("TEST_HIDE_QUEUE_REFS", "1")
+            .env(
+                "TEST_REST_PULLS",
+                if payload["merge_group"]["head_ref"] == "refs/heads/gh-readonly-queue/main/forged" {
+                    r#"[{"number":777,"base":{"ref":"main","repo":{"full_name":"carrick-sh/carrick"}}}]"#
+                } else {
+                    "[]"
+                },
+            )
             .args(["signed-gate", "prepare", "--event"])
             .arg(&queue_event)
             .arg("--output")
@@ -539,15 +555,11 @@ else:
             .output()
             .unwrap()
     };
-    let live_predecessor = serde_json::json!([{
-        "baseCommit": {"oid": d},
-        "headCommit": {"oid": d},
-        "pullRequest": {
-            "number": 123,
-            "baseRefName": "main",
-            "baseRepository": {"nameWithOwner": "carrick-sh/carrick"}
-        }
-    }])
+    let live_predecessor = serde_json::json!([
+        {"baseCommit":{"oid":a},"headCommit":{"oid":d},"pullRequest":{"number":123,"baseRefName":"main","baseRepository":{"nameWithOwner":"carrick-sh/carrick"}}},
+        {"baseCommit":{"oid":d},"headCommit":{"oid":b},"pullRequest":{"number":124,"baseRefName":"main","baseRepository":{"nameWithOwner":"carrick-sh/carrick"}}},
+        {"baseCommit":{"oid":b},"headCommit":{"oid":c},"pullRequest":{"number":125,"baseRefName":"main","baseRepository":{"nameWithOwner":"carrick-sh/carrick"}}}
+    ])
     .to_string();
     let queue = |payload: &serde_json::Value| queue_with_entries(payload, &live_predecessor);
     let queued = queue(&queue_payload);
@@ -577,6 +589,21 @@ else:
         serde_json::from_slice(&std::fs::read(queue_dir.join("request.json")).unwrap()).unwrap();
     assert_eq!(second_request["base"], a.clone());
     assert_eq!(second_request["prs"], json!([123, 124]));
+    // An unqueued descendant cannot borrow the current live PR's number.
+    let mut forged_descendant = second.clone();
+    forged_descendant["merge_group"]["head_sha"] = json!(x.clone());
+    let forged_descendant = queue_with_entries(&forged_descendant, &live_predecessor);
+    let unqueued_descendant_refused = !forged_descendant.status.success();
+    // A malformed queue ref cannot fall back to REST commit associations.
+    let mut malformed_queue_ref = queue_payload.clone();
+    malformed_queue_ref["merge_group"]["head_ref"] =
+        json!("refs/heads/gh-readonly-queue/main/forged");
+    let malformed_ref = queue_with_entries(&malformed_queue_ref, "[]");
+    assert!(
+        unqueued_descendant_refused && !malformed_ref.status.success(),
+        "unqueued descendant refused={unqueued_descendant_refused}; malformed ref refused={}",
+        !malformed_ref.status.success()
+    );
     // A first-parent ancestor is not enough: second-in-line authorization
     // requires the predecessor to still be a live entry in main's queue.
     let stale_base = queue_with_entries(&second, "[]");
