@@ -23,8 +23,6 @@ unsafe fn metadata_zone_at<'a>(base: *const u8) -> &'a carrick_sched_core::ZoneT
 
 pub use carrick_core::mm::capacity::*;
 
-pub use crate::substrate::sched::hw::{IrqGuard, disable_irq_save, restore_irq};
-
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[inline(always)]
 fn current_el1_slot() -> Option<usize> {
@@ -87,8 +85,7 @@ impl MetadataStorage {
     }
 
     pub fn ensure_bootstrap_admitted(&self) {
-        let guard = disable_irq_save();
-        let mut core = self.lock.lock();
+        let mut core = self.lock.lock_irqsave();
         if core.diagnostics().active_extents == 0 {
             let _ = core.admit_extent(
                 bootstrap_metadata_base(),
@@ -97,7 +94,6 @@ impl MetadataStorage {
             );
         }
         core::mem::drop(core);
-        restore_irq(guard);
     }
 
     pub fn admit_bootstrap_region(
@@ -105,13 +101,11 @@ impl MetadataStorage {
         base_va: u64,
         size: usize,
     ) -> Result<(), ExtentAdmissionError> {
-        let guard = disable_irq_save();
-        let mut core = self.lock.lock();
+        let mut core = self.lock.lock_irqsave();
         let res = core
             .admit_extent(base_va, size, ExtentKind::Bootstrap)
             .map(|_| ());
         core::mem::drop(core);
-        restore_irq(guard);
         res
     }
 
@@ -324,8 +318,7 @@ impl MetadataStorage {
         let size = layout.size();
 
         // 1. Try allocating from existing extents under lock
-        let guard = disable_irq_save();
-        let mut core = self.lock.lock();
+        let mut core = self.lock.lock_irqsave();
         #[cfg(target_os = "none")]
         if core.diagnostics().active_extents == 0 {
             let _ = core.admit_extent(
@@ -348,7 +341,6 @@ impl MetadataStorage {
         }
         if p.is_some() {
             core::mem::drop(core);
-            restore_irq(guard);
             return p;
         }
 
@@ -359,7 +351,6 @@ impl MetadataStorage {
             // the shared response while bootstrap capacity remained.
             if core.take_grant_denied() {
                 core::mem::drop(core);
-                restore_irq(guard);
                 return None;
             }
             let needed_size = core.needed_grant_size(size, align);
@@ -380,7 +371,6 @@ impl MetadataStorage {
             }
         }
         core::mem::drop(core);
-        restore_irq(guard);
         None
     }
 
@@ -391,21 +381,18 @@ impl MetadataStorage {
     /// enclosing extent directly. Call outside reservation and descriptor locks.
     pub fn allocate_with_extent(&self, layout: Layout) -> Option<(*mut u8, ExtentGrantReceipt)> {
         let ptr = self.allocate(layout)?;
-        let irq = disable_irq_save();
-        let core = self.lock.lock();
+        let core = self.lock.lock_irqsave();
         // SAFETY: allocate just returned this live payload to this caller; it
         // has not escaped and cannot have been deallocated. Header lookup is
         // constant work regardless of the number of extents or allocations.
         let receipt = unsafe { core.allocation_extent(ptr) };
         core::mem::drop(core);
-        restore_irq(irq);
         receipt.map(|receipt| (ptr, receipt))
     }
 
     pub fn deallocate(&self, ptr: *mut u8, layout: Layout) {
         let align = layout.align().max(16);
-        let guard = disable_irq_save();
-        let mut core = self.lock.lock();
+        let mut core = self.lock.lock_irqsave();
         #[cfg(any(target_os = "none", test))]
         if let Some((mailbox, slot)) = self.mailbox_context() {
             Self::service_mailbox(mailbox, &mut core, slot);
@@ -416,7 +403,6 @@ impl MetadataStorage {
             Self::publish_pending_return(mailbox, &mut core, slot);
         }
         core::mem::drop(core);
-        restore_irq(guard);
     }
 
     #[cfg(any(all(feature = "allocator-test-control", target_os = "none"), test))]
@@ -424,12 +410,10 @@ impl MetadataStorage {
         let Some((mailbox, slot)) = self.mailbox_context() else {
             return false;
         };
-        let guard = disable_irq_save();
-        let mut core = self.lock.lock();
+        let mut core = self.lock.lock_irqsave();
         Self::service_mailbox(mailbox, &mut core, slot);
         let pending = Self::host_work_pending(mailbox, &core);
         core::mem::drop(core);
-        restore_irq(guard);
         pending
     }
 
@@ -443,12 +427,10 @@ impl MetadataStorage {
         let Some((mailbox, slot)) = self.mailbox_context() else {
             return false;
         };
-        let guard = disable_irq_save();
-        let mut core = self.lock.lock();
+        let mut core = self.lock.lock_irqsave();
         Self::drain_mailbox(mailbox, &mut core, slot);
         let pending = Self::host_work_pending(mailbox, &core);
         core::mem::drop(core);
-        restore_irq(guard);
         pending
     }
 
@@ -458,11 +440,9 @@ impl MetadataStorage {
     }
 
     pub fn diagnostics(&self) -> AllocatorDiagnostics {
-        let guard = disable_irq_save();
-        let core = self.lock.lock();
+        let core = self.lock.lock_irqsave();
         let diag = core.diagnostics();
         core::mem::drop(core);
-        restore_irq(guard);
         diag
     }
 }

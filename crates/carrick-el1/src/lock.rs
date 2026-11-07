@@ -19,6 +19,13 @@ pub struct SpinLockGuard<'a, T> {
     lock: &'a SpinLock<T>,
 }
 
+/// A spinlock held with local interrupts masked until the lock is released.
+/// Field order is intentional: Rust drops `lock` before `irq`.
+pub struct IrqSpinGuard<'a, T> {
+    lock: SpinLockGuard<'a, T>,
+    _irq: crate::substrate::sched::hw::IrqGuard,
+}
+
 impl<T> SpinLock<T> {
     pub const fn new(data: T) -> Self {
         Self {
@@ -42,6 +49,25 @@ impl<T> SpinLock<T> {
             }
         }
         SpinLockGuard { lock: self }
+    }
+
+    pub fn lock_irqsave(&self) -> IrqSpinGuard<'_, T> {
+        let irq = crate::substrate::sched::hw::disable_irq_save();
+        let lock = self.lock();
+        IrqSpinGuard { lock, _irq: irq }
+    }
+}
+
+impl<T> Deref for IrqSpinGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        &self.lock
+    }
+}
+
+impl<T> DerefMut for IrqSpinGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.lock
     }
 }
 

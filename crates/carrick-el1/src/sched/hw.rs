@@ -496,6 +496,35 @@ pub struct IrqGuard {
     pub saved_daif: u64,
 }
 
+#[cfg(not(test))]
+static HOST_IRQ_MASKED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+std::thread_local! {
+    static HOST_IRQ_MASKED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn host_irq_swap(masked: bool) -> bool {
+    HOST_IRQ_MASKED.with(|state| state.replace(masked))
+}
+
+#[cfg(not(test))]
+fn host_irq_swap(masked: bool) -> bool {
+    HOST_IRQ_MASKED.swap(masked, core::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(test)]
+fn host_irq_store(masked: bool) {
+    HOST_IRQ_MASKED.with(|state| state.set(masked));
+}
+
+#[cfg(not(test))]
+fn host_irq_store(masked: bool) {
+    HOST_IRQ_MASKED.store(masked, core::sync::atomic::Ordering::SeqCst);
+}
+
 #[inline(always)]
 #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
 pub fn disable_irq_save() -> IrqGuard {
@@ -511,25 +540,48 @@ pub fn disable_irq_save() -> IrqGuard {
     }
     #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
     {
-        daif = 0;
+        daif = u64::from(host_irq_swap(true));
     }
     IrqGuard { saved_daif: daif }
 }
 
-#[inline(always)]
 #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
-pub fn restore_irq(guard: IrqGuard) {
-    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-    unsafe {
-        core::arch::asm!(
-            "msr daif, {0}",
-            in(reg) guard.saved_daif,
-            options(nomem, nostack)
-        );
+impl Drop for IrqGuard {
+    fn drop(&mut self) {
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        unsafe {
+            core::arch::asm!(
+                "msr daif, {0}",
+                in(reg) self.saved_daif,
+                options(nomem, nostack)
+            );
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+        host_irq_store(self.saved_daif != 0);
     }
-    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
-    {
-        let _ = guard;
+}
+
+#[cfg(test)]
+mod irq_guard_tests {
+    use super::*;
+    #[test]
+    fn early_return_releases_lock_then_restores_interrupt_mask() {
+        host_irq_store(false);
+        let lock = crate::lock::SpinLock::new(0_u32);
+
+        fn return_early(lock: &crate::lock::SpinLock<u32>) -> Option<u32> {
+            let mut guard = lock.lock_irqsave();
+            *guard = 7;
+            assert!(HOST_IRQ_MASKED.with(core::cell::Cell::get));
+            if *guard == 7 {
+                return None;
+            }
+            Some(*guard)
+        }
+
+        assert_eq!(return_early(&lock), None);
+        assert!(!HOST_IRQ_MASKED.with(core::cell::Cell::get));
+        assert_eq!(*lock.lock(), 7);
     }
 }
 
@@ -550,12 +602,13 @@ pub fn disable_irq_save() -> IrqGuard {
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-#[inline(always)]
-pub fn restore_irq(guard: IrqGuard) {
-    if guard.flags & (1 << 9) != 0 {
-        // SAFETY: this guard captured enabled interrupts before the lock;
-        // callers invoke restore only after dropping the metadata lock.
-        unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+impl Drop for IrqGuard {
+    fn drop(&mut self) {
+        if self.flags & (1 << 9) != 0 {
+            // SAFETY: this guard captured enabled interrupts before the lock;
+            // the guard's containing lock guard is dropped before this guard.
+            unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+        }
     }
 }
 

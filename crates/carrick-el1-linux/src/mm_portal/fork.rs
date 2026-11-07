@@ -451,8 +451,7 @@ mod runtime_storage {
         #[inline(never)]
         fn initialize(&'static self) -> *mut PendingForkTable {
             // A same-CPU interrupt must not wait on its own initializer.
-            let irq = carrick_el1::alloc::disable_irq_save();
-            let guard = self.init_lock.lock();
+            let _guard = self.init_lock.lock_irqsave();
             let mut table = self.table.load(Ordering::Acquire);
             if table.is_null() {
                 let mut storage = Box::<PendingForkTable>::new_uninit();
@@ -467,8 +466,6 @@ mod runtime_storage {
                 table = Box::into_raw(unsafe { storage.assume_init() });
                 self.table.store(table, Ordering::Release);
             }
-            drop(guard);
-            carrick_el1::alloc::restore_irq(irq);
             table
         }
     }
