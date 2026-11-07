@@ -78,10 +78,11 @@ not prove them. No complexity or runtime-ratio acceptance is claimed.
 serialization and bounded field-update transition. The host `ClockDomain`
 and dispatcher consume that implementation. This is a move of existing
 behavior, including its documented frequency/slew approximations; it does
-not register an in-ring time route. Validation, exact-MM output preparation,
-offset changes, locking and notification retain their existing order in the
-host dispatcher. The container-clock production-entry tests exercise the
-moved implementation. The four native-child witnesses remain red.
+not register an in-ring time route. Exact-MM output preparation, offset changes, locking and notification
+retain their existing order in the host dispatcher. Validation and reply
+formatting now use the shared borrowed `TimexRequest`; malformed singleshot
+copyout remains distinct from an errno-only refusal. The container-clock
+production-entry tests exercise the moved implementation. The four native-child witnesses remain red.
 
 An independent design review supports a typed clock-resource operation,
 without using the raw host syscall crossing or the host-file protocol.
@@ -99,8 +100,8 @@ For the remaining implementation:
   CPU clocks must select guest task accounting, never carrier CPU time.
 - Retain completed samples through exact-MM copyout. A memory-owner wait
   must not resample or restart the syscall.
-- Move timex validation into the shared core before introducing a ring
-  consumer. Preserve output preparation before mutation. State-dependent
+- Timex validation now lives in the shared core. Preserve output preparation
+  before mutation when introducing a ring consumer. State-dependent
   SETOFFSET interpretation and updates need one atomic authority operation;
   snapshot-and-replace would lose concurrent updates. The extracted field
   helper alone does not provide that transaction.
@@ -112,3 +113,26 @@ For the remaining implementation:
   and retained copyout before claiming the four null-pointer tests green.
 
 This prerequisite must not be published as the completed #1808 fix.
+
+## Transport prerequisite found in the continuation
+
+The x86 native entry has no generic native-service consumer. In
+`carrick-x86-cpl0/src/linux_personality.rs`, the `NativeService` completion
+route explicitly counts a refusal and returns ENOSYS. The production host
+adapter is `carrick-x86-cpl0-host/src/cpl0_boot.rs`; its ordinary and idle-peer
+port handling both need service admission and completion. The fixture's
+forward-port support is not that transport. A shared time family returning
+`NativeService` would therefore remain broken on x86.
+
+The existing x86 `native_execution` timer expiry and shared
+`NativeProcessService` signal-clock methods can park and wake a task against
+a physical counter. They do not provide the container's frozen, scaled or
+deterministic policies, or notifications when guest realtime changes.
+A sleep resource needs retained deadline/subscription custody, cancellation
+acknowledgment and exact-member resumption. Blocking a host executor or
+resampling on an output-memory wait is not an implementation of that owner.
+
+The independent source review confirmed these prerequisites and found no
+semantic change in the validation extraction. It did not approve a working
+time route, transport or sleep implementation. These remain unimplemented;
+the four native-child witnesses must stay red until those owners exist.
