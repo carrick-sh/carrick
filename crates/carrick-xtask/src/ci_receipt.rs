@@ -155,6 +155,22 @@ fn candidate_receipt(
     Ok(dir.join(name).join("receipt.json"))
 }
 
+fn refusal_failure_key(failure: &str) -> Option<String> {
+    let reason = failure.strip_prefix(crate::accept::ACCEPT_REFUSAL_PREFIX)?;
+    let single_line = reason
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let normalized = if single_line.is_empty() {
+        "unspecified"
+    } else {
+        single_line.as_str()
+    };
+    Some(format!("not-run:accept-refusal:{normalized}"))
+}
+
 fn receipt_failure_keys(receipt: &AcceptReceipt) -> BTreeSet<String> {
     let mut keys = BTreeSet::new();
     for step in &receipt.steps {
@@ -194,8 +210,11 @@ fn receipt_failure_keys(receipt: &AcceptReceipt) -> BTreeSet<String> {
         }
     }
     for failure in &receipt.failures {
-        if let Some(reason) = failure.strip_prefix(crate::accept::ACCEPT_REFUSAL_PREFIX) {
-            keys.insert(format!("not-run:accept-refusal:{reason}"));
+        if let Some(key) = refusal_failure_key(failure) {
+            keys.insert(key);
+        }
+        if let Some(lane) = crate::accept::parse_zero_executed_lane_failure(failure) {
+            keys.insert(format!("not-run:lane:{lane}:zero executed tests"));
         }
         if let Some(step) = failure
             .strip_suffix(&format!("' {}", crate::accept::CLEANUP_UNKNOWN))
@@ -744,17 +763,11 @@ fn binary_runs_in_receipt_lane(
     Ok(!found)
 }
 
-/// Count executed tests by manifest lane. Excluded profiles (for example
-/// signed-cli's Docker suites in no-docker) are not required by this gate.
-/// Source manifests are read as data; no candidate build script is executed.
-pub fn lane_census(
-    receipt: &AcceptReceipt,
-    root: &Path,
-) -> Result<BTreeMap<String, usize>, ReceiptError> {
+fn required_lanes(receipt: &AcceptReceipt) -> BTreeSet<&'static str> {
     let mut required = BTreeSet::new();
     if receipt.profile == "kvm" {
         required.insert("kvm");
-    } else if receipt.profile == "el1-native" {
+    } else if matches!(receipt.profile.as_str(), "el1-native" | "linux-portable") {
         required.insert("host");
     } else {
         if receipt.phase != "signed" {
@@ -767,6 +780,17 @@ pub fn lane_census(
             }
         }
     }
+    required
+}
+
+/// Count executed tests by manifest lane. Excluded profiles (for example
+/// signed-cli's Docker suites in no-docker) are not required by this gate.
+/// Source manifests are read as data; no candidate build script is executed.
+pub fn lane_census(
+    receipt: &AcceptReceipt,
+    root: &Path,
+) -> Result<BTreeMap<String, usize>, ReceiptError> {
+    let required = required_lanes(receipt);
     // Supply source-only target metadata to the canonical lane resolver. Never
     // run candidate Cargo/build scripts in the trusted receipt grader.
     let mut packages = Vec::new();
@@ -1040,9 +1064,20 @@ pub fn diff_with_retired(
     {
         new.insert("not-run:lane:kvm:zero executed tests".into());
     }
+    if candidate_tree.as_os_str().is_empty()
+        && candidate.steps.is_empty()
+        && candidate.skipped_steps.is_empty()
+    {
+        for lane in required_lanes(candidate) {
+            new.insert(format!("not-run:lane:{lane}:zero executed tests"));
+        }
+    }
     for failure in &candidate.failures {
-        if let Some(reason) = failure.strip_prefix(crate::accept::ACCEPT_REFUSAL_PREFIX) {
-            new.insert(format!("not-run:accept-refusal:{reason}"));
+        if let Some(key) = refusal_failure_key(failure) {
+            new.insert(key);
+        }
+        if let Some(lane) = crate::accept::parse_zero_executed_lane_failure(failure) {
+            new.insert(format!("not-run:lane:{lane}:zero executed tests"));
         }
     }
     for step in &candidate.steps {
