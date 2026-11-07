@@ -9,6 +9,93 @@ use serde_json::{Value, json};
 use std::net::Ipv4Addr;
 use std::os::unix::fs::MetadataExt;
 
+/// Process-local admission is shared by both provisioning lanes and reaping.
+/// A timed-out observer retains the PVE task until a later admission observes
+/// it stopped; dropping a Rust worker does not mean its PVE task stopped.
+#[derive(Default)]
+struct StorageSlot {
+    owned: bool,
+    uncertain: bool,
+    tasks: std::collections::BTreeSet<String>,
+}
+type StorageKey = (String, String);
+static STORAGE: std::sync::Mutex<std::collections::BTreeMap<StorageKey, StorageSlot>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+struct StorageAdmission {
+    key: StorageKey,
+}
+impl StorageAdmission {
+    fn acquire(node: &str, storage: &str) -> Result<Self, ScalerError> {
+        let key = (node.to_owned(), storage.to_owned());
+        let mut slots = STORAGE
+            .lock()
+            .map_err(|_| ScalerError::Guard("storage admission poisoned"))?;
+        let slot = slots.entry(key.clone()).or_default();
+        if slot.owned {
+            return Err(ScalerError::StorageBusy);
+        }
+        if slot.uncertain {
+            return Err(ScalerError::Guard(
+                "ambiguous storage submission; owner inspection required",
+            ));
+        }
+        slot.owned = true;
+        Ok(Self { key })
+    }
+    fn task(&self, task: Option<String>) -> Result<(), ScalerError> {
+        let mut slots = STORAGE
+            .lock()
+            .map_err(|_| ScalerError::Guard("storage admission poisoned"))?;
+        let slot = slots.entry(self.key.clone()).or_default();
+        slot.uncertain = false;
+        if let Some(task) = task {
+            slot.tasks.insert(task);
+        } else {
+            slot.tasks.clear();
+        }
+        Ok(())
+    }
+    fn submitting(&self) -> Result<(), ScalerError> {
+        STORAGE
+            .lock()
+            .map_err(|_| ScalerError::Guard("storage admission poisoned"))?
+            .entry(self.key.clone())
+            .or_default()
+            .uncertain = true;
+        Ok(())
+    }
+    fn pending(&self) -> Result<Vec<String>, ScalerError> {
+        Ok(STORAGE
+            .lock()
+            .map_err(|_| ScalerError::Guard("storage admission poisoned"))?
+            .get(&self.key)
+            .map(|slot| slot.tasks.iter().cloned().collect())
+            .unwrap_or_default())
+    }
+    fn wait(&self, pve: &Pve, task: &str) -> Result<(), ScalerError> {
+        self.task(Some(task.to_owned()))?;
+        let result = pve.wait_task(task);
+        // Unknown outcomes retain custody, including observer deadlines.
+        if matches!(
+            &result,
+            Ok(()) | Err(ScalerError::StorageBusy) | Err(ScalerError::External("PVE task failed"))
+        ) {
+            self.task(None)?;
+        }
+        result
+    }
+}
+impl Drop for StorageAdmission {
+    fn drop(&mut self) {
+        if let Ok(mut slots) = STORAGE.lock()
+            && let Some(slot) = slots.get_mut(&self.key)
+        {
+            slot.owned = false;
+        }
+    }
+}
+
 #[derive(Clone, Deserialize)]
 struct Token {
     #[serde(rename = "full-tokenid")]
@@ -636,10 +723,14 @@ fn clear_clone_volumes<G>(
 }
 fn local_storage_command(args: &[&str]) -> Result<Value, ScalerError> {
     if args.first() == Some(&"pvesm") {
-        execute(
+        execute_with_stderr_failure(
             Command::new(args[0]).args(&args[1..]),
             &[],
             Duration::from_secs(90),
+            |stderr| {
+                storage_lock_timeout(&String::from_utf8_lossy(stderr))
+                    .then_some(ScalerError::StorageBusy)
+            },
         )?;
         Ok(Value::Null)
     } else {
@@ -647,7 +738,21 @@ fn local_storage_command(args: &[&str]) -> Result<Value, ScalerError> {
     }
 }
 impl Pve {
+    fn storage_admission(&self) -> Result<StorageAdmission, ScalerError> {
+        let token = StorageAdmission::acquire(self.site.node, self.site.storage)?;
+        for task in token.pending()? {
+            if matches!(
+                self.task_state(&task)?,
+                TaskState::Running | TaskState::Absent
+            ) {
+                return Err(ScalerError::StorageBusy);
+            }
+        }
+        token.task(None)?;
+        Ok(token)
+    }
     fn clear_volumes(&self, id: CloneId) -> Result<(), ScalerError> {
+        let _admission = self.storage_admission()?;
         clear_clone_volumes(
             self.site.node,
             self.site.storage,
@@ -729,10 +834,28 @@ fn pool_inventory(pool: &Value, node: &str) -> Result<Vec<PoolMember>, ScalerErr
     }
     Ok(result)
 }
+/// Match the recorded PVE storage-lock diagnostic, never a generic timeout
+/// (which could have left a clone running with an unknown outcome).
+fn storage_lock_timeout(message: &str) -> bool {
+    message
+        .split_once("can't lock file '/var/lock/pve-manager/pve-storage-")
+        .is_some_and(|(_, rest)| {
+            rest.split_once("' - got timeout")
+                .is_some_and(|(storage, _)| {
+                    !storage.is_empty()
+                        && storage
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+                })
+        })
+}
+
 fn classify_task(result: &Value) -> TaskState {
     if result["status"] == "stopped" {
         if result["exitstatus"] == "OK" {
             TaskState::Succeeded
+        } else if storage_lock_timeout(result["exitstatus"].as_str().unwrap_or("")) {
+            TaskState::Busy
         } else {
             TaskState::Failed
         }
@@ -746,6 +869,7 @@ impl Pve {
         match self.task_state(task)? {
             TaskState::Succeeded => Ok(true),
             TaskState::Failed => Err(ScalerError::External("PVE task failed")),
+            TaskState::Busy => Err(ScalerError::StorageBusy),
             _ => Ok(false),
         }
     }
@@ -1192,17 +1316,31 @@ fn provision(
         &[],
         Duration::from_secs(10),
     )?;
+    row.state = State::WaitingStorage;
+    update(ledger, row, path)?;
+    let admission = pve.storage_admission()?;
+    submit_clone(pve, ledger, row, path, &admission)?;
+    drop(admission);
+    boot_and_register(pve, gh, ledger, row, dir, path, approval, PreBoot::Defer)
+}
+
+fn submit_clone(
+    pve: &Pve,
+    ledger: &mut Ledger,
+    row: &mut Record,
+    path: &Path,
+    admission: &StorageAdmission,
+) -> Result<(), ScalerError> {
     row.state = State::Cloning;
+    row.task = None; // A previous Busy task cannot authenticate a new POST.
     update(ledger, row, path)?; // Write-ahead, even if POST's outcome is ambiguous.
     let (call, source) = clone_call(pve.site, row)?;
-    row.task = Some(task_id(pve.request(call, &source)?)?);
+    admission.submitting()?;
+    let task = task_id(pve.request(call, &source)?)?;
+    admission.task(Some(task.clone()))?;
+    row.task = Some(task.clone());
     update(ledger, row, path)?;
-    pve.wait_task(
-        row.task
-            .as_deref()
-            .ok_or(ScalerError::Guard("clone task missing"))?,
-    )?;
-    boot_and_register(pve, gh, ledger, row, dir, path, approval, PreBoot::Defer)
+    admission.wait(pve, &task)
 }
 
 /// One source-selection path for every newly admitted clone. Existing rows
@@ -1303,19 +1441,26 @@ fn boot_and_register(
     let deadline = Instant::now() + Duration::from_secs(300);
     pve.deadline.set(Some(deadline));
     let shared_deadline = ApiDeadline(&pve.deadline);
+    // Starting regenerates cloud-init disks too, so it shares storage admission.
+    // Retain Cloning on local contention; reconcile can resume the completed clone.
+    let storage = pve.storage_admission()?;
     row.state = State::Booting;
     row.task = None;
     update(ledger, row, path)?;
+    storage.submitting()?;
     row.task = Some(task_id(pve.request(
         PveCall::Post(json!({})),
         &format!("{}/status/start", pve.base(row.vm)),
     )?)?);
+    storage.task(row.task.clone())?;
     update(ledger, row, path)?;
-    pve.wait_task(
+    storage.wait(
+        pve,
         row.task
             .as_deref()
             .ok_or(ScalerError::Guard("start task missing"))?,
     )?;
+    drop(storage);
     wait_for_readiness(deadline, || {
         qualify_guest(|command| pve.agent_output(row, command))?;
         let ip = pve.guest_ip(row)?;
@@ -1426,6 +1571,7 @@ trait TeardownApi {
 struct LiveTeardown<'a> {
     pve: &'a Pve,
     gh: &'a Github,
+    storage: Option<StorageAdmission>,
 }
 impl TeardownApi for LiveTeardown<'_> {
     fn present(&mut self, row: &Record) -> Result<bool, ScalerError> {
@@ -1455,11 +1601,23 @@ impl TeardownApi for LiveTeardown<'_> {
         )?)?))
     }
     fn destroy(&mut self, row: &Record) -> Result<String, ScalerError> {
+        self.storage = Some(self.pve.storage_admission()?);
         self.pve.guard(row)?;
-        task_id(self.pve.request(PveCall::Delete, &self.pve.base(row.vm))?)
+        if let Some(storage) = &self.storage {
+            storage.submitting()?;
+        }
+        let task = task_id(self.pve.request(PveCall::Delete, &self.pve.base(row.vm))?)?;
+        if let Some(storage) = &self.storage {
+            storage.task(Some(task.clone()))?;
+        }
+        Ok(task)
     }
     fn wait_task(&mut self, task: &str) -> Result<(), ScalerError> {
-        self.pve.wait_task(task)
+        if let Some(storage) = self.storage.take() {
+            storage.wait(self.pve, task)
+        } else {
+            self.pve.wait_task(task)
+        }
     }
     fn clear_volumes(&mut self, row: &Record) -> Result<(), ScalerError> {
         self.pve.clear_volumes(row.vm)
@@ -1545,13 +1703,23 @@ fn cleanup(
     row.state = State::Reaping;
     row.task = None;
     update(ledger, row, path)?;
-    continue_teardown(&mut LiveTeardown { pve, gh }, ledger, row, dir, path)
+    continue_teardown(
+        &mut LiveTeardown {
+            pve,
+            gh,
+            storage: None,
+        },
+        ledger,
+        row,
+        dir,
+        path,
+    )
 }
 
 /// One reconciliation pass over every active clone.
 struct Pass {
     finished: usize,
-    /// Reconciliation failures freeze admission; quarantined rows retain only their own reservation.
+    /// Unknown outcomes freeze admission; storage contention retains only its operation.
     frozen: Option<ScalerError>,
 }
 /// Reconcile every active clone. One row's error does not starve the others.
@@ -1580,6 +1748,9 @@ fn reconcile_all(
             Ok(false) => {}
             Err(error @ ScalerError::CpuCeiling { .. }) if lane == CloneLane::Kvm => {
                 return Err(error);
+            }
+            Err(ScalerError::StorageBusy) => {
+                eprintln!("storage busy; owned operation deferred to next reconcile");
             }
             Err(error) => {
                 first_error.get_or_insert(error);
@@ -1678,6 +1849,35 @@ fn reconcile_one(
         Some(task) => pve.task_state(task)?,
         None => TaskState::Absent,
     };
+    if !present
+        && ((row.state == State::Cloning && task == TaskState::Busy)
+            || (row.state == State::WaitingStorage && task == TaskState::Absent))
+    {
+        let job = gh.job(row.key.job)?;
+        let run = gh.request(
+            "GET",
+            &format!("repos/{REPOSITORY}/actions/runs/{}", row.key.run.0),
+            None,
+            false,
+        )?;
+        if pending_owned_job(&row, &job, &run, approval.1) {
+            pve.clear_volumes(row.vm)?;
+            let admission = pve.storage_admission()?;
+            submit_clone(pve, ledger, &mut row, path, &admission)?;
+            drop(admission);
+            boot_and_register(
+                pve,
+                gh,
+                ledger,
+                &mut row,
+                dir,
+                path,
+                approval,
+                PreBoot::FailFast,
+            )?;
+            return Ok(false);
+        }
+    }
     let recovery = recovery_decision(&row, present, task, now()?);
     if recovery != Recovery::Quarantine && row.quarantined {
         row.quarantined = false;
@@ -1720,7 +1920,9 @@ fn reconcile_one(
             );
             update(ledger, &row, path)?;
             eprintln!("vm={} quarantined; owner inspection required", row.vm.get());
-            return Ok(false);
+            return Err(ScalerError::Guard(
+                "ambiguous clone state; owner inspection required",
+            ));
         }
         Recovery::FinishAbsent => {
             if task == TaskState::Failed {
@@ -1728,7 +1930,11 @@ fn reconcile_one(
             }
             if row.state == State::Reaping {
                 return continue_teardown(
-                    &mut LiveTeardown { pve, gh },
+                    &mut LiveTeardown {
+                        pve,
+                        gh,
+                        storage: None,
+                    },
                     ledger,
                     &mut row,
                     dir,
@@ -1747,7 +1953,17 @@ fn reconcile_one(
                 row.failure
                     .get_or_insert_with(|| "recorded PVE task failed during licensed reap".into());
             }
-            return continue_teardown(&mut LiveTeardown { pve, gh }, ledger, &mut row, dir, path);
+            return continue_teardown(
+                &mut LiveTeardown {
+                    pve,
+                    gh,
+                    storage: None,
+                },
+                ledger,
+                &mut row,
+                dir,
+                path,
+            );
         }
         Recovery::ResumeClone => {
             pve.guard(&row)?;
@@ -2312,6 +2528,18 @@ pub(super) fn controller(
     let gh = Github;
     let path = dir.join("ledger.json");
     let mut ledger = Ledger::load(&path)?;
+    // Recover storage custody before spawning workers. A previous controller's
+    // observer may have died while its asynchronous PVE tasks were still live.
+    for row in &ledger.rows {
+        if matches!(row.state, State::Cloning | State::Booting | State::Reaping)
+            && let Some(task) = &row.task
+        {
+            let site = pve.site.for_lane(row.lane)?;
+            let token = StorageAdmission::acquire(site.node, site.storage)?;
+            token.task(Some(task.clone()))?;
+        }
+    }
+
     let mut reconcile = Instant::now() - RECONCILE_INTERVAL;
     let mut frozen = true;
     let mut backoff = Backoff::default();
@@ -2398,6 +2626,9 @@ pub(super) fn controller(
         for result in provisioners.finished() {
             match result {
                 Ok(()) => {}
+                Err(ScalerError::StorageBusy) => {
+                    eprintln!("storage busy; provisioning retained for reconciliation");
+                }
                 Err(error @ ScalerError::CpuCeiling { .. }) => return Err(error),
                 Err(error) => {
                     provision_failed.get_or_insert(error);
@@ -3686,7 +3917,13 @@ case "$url" in
      task) body='[{"type":"qmclone","id":"300","starttime":1}]' ;;
      *) body='[]' ;;
    esac ;;
- */tasks/*/status) body='{"status":"running"}' ;;
+ */qemu/300/clone)
+   echo retry >> "$CARRICK_FIXTURE_DIR/clones"
+   body='"UPID:willow:retry"' ;;
+ */tasks/*/status)
+   if [ "$CARRICK_RECONCILE_1577" = clone_busy ]; then
+     body="{\"status\":\"stopped\",\"exitstatus\":\"can't lock file '/var/lock/pve-manager/pve-storage-local' - got timeout\"}"
+   else body='{"status":"running"}'; fi ;;
  */qemu) body='[]' ;;
  */storage)
    case "$CARRICK_RECONCILE_1577" in
@@ -3708,6 +3945,23 @@ printf '{"data":%s}\n200' "$body"
         let gh = dir.join("gh");
         std::fs::write(&gh, "#!/bin/sh\nprintf '[{\"runners\":[]}]'\n").unwrap();
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let approval = if case == "clone_busy" {
+            let sha = "a".repeat(40);
+            let job = json!({"id":2,"status":"queued","labels":LABELS});
+            let run = json!({"id":1,"run_attempt":1,"event":"workflow_dispatch",
+                "head_branch":PILOT_BRANCH,"head_sha":sha,"path":PILOT_WORKFLOW,
+                "repository":{"full_name":REPOSITORY}});
+            let quote = crate::remote_accept::shell_quote;
+            std::fs::write(&gh, format!(
+                "#!/bin/sh\ncase \"$*\" in *actions/jobs/2*) printf '%s' {} ;; *) printf '%s' {} ;; esac\n",
+                quote(&job.to_string()), quote(&run.to_string()))).unwrap();
+            Admission::pilot(&sha).unwrap()
+        } else {
+            Admission::Standing
+        };
+        let pvesh = dir.join("pvesh");
+        std::fs::write(&pvesh, "#!/bin/sh\nprintf '[]\\n'\n").unwrap();
+        std::fs::set_permissions(&pvesh, std::fs::Permissions::from_mode(0o755)).unwrap();
         // Subprocess isolation: no sibling test can observe these fixture tools.
         unsafe {
             std::env::set_var(
@@ -3730,21 +3984,47 @@ printf '{"data":%s}\n200' "$body"
         if case == "absent" {
             row.failure = Some("lost clone response".into());
         }
-        if case == "transient" {
+        if matches!(case, "transient" | "clone_busy") {
             row.task = Some(format!("{}fixture", site::WILLOW.task_prefix()));
+        }
+        if case == "storage_busy" {
+            row.state = State::Reaping;
         }
         ledger.rows.push(row.clone());
         let path = dir.join("ledger.json");
         ledger.save(&path).unwrap();
-        let pass = reconcile_all(
-            &pve,
-            &Github,
-            &mut ledger,
-            dir,
-            &path,
-            (1, &Admission::Standing),
-        )
-        .unwrap();
+        let storage = (case == "storage_busy").then(|| pve.storage_admission().unwrap());
+        let pass = reconcile_all(&pve, &Github, &mut ledger, dir, &path, (1, &approval)).unwrap();
+        if case == "storage_busy" {
+            assert!(pass.frozen.is_none(), "Busy must leave admission open");
+            assert_eq!(pass.finished, 0);
+            assert_eq!(Ledger::load(&path).unwrap().rows[0].state, State::Reaping);
+            let status: Value =
+                serde_json::from_slice(&std::fs::read(dir.join("reconcile-status.json")).unwrap())
+                    .unwrap();
+            assert_eq!(status["admission_frozen"], false);
+            drop(storage);
+            let pass =
+                reconcile_all(&pve, &Github, &mut ledger, dir, &path, (1, &approval)).unwrap();
+            assert!(pass.frozen.is_none());
+            assert_eq!(pass.finished, 1);
+            assert_eq!(Ledger::load(&path).unwrap().rows[0].state, State::Destroyed);
+            return;
+        }
+        if case == "clone_busy" {
+            assert!(pass.frozen.is_none());
+            assert_eq!(Ledger::load(&path).unwrap().rows[0].state, State::Cloning);
+            let pass =
+                reconcile_all(&pve, &Github, &mut ledger, dir, &path, (1, &approval)).unwrap();
+            assert!(pass.frozen.is_none());
+            assert_eq!(pass.finished, 0);
+            assert_eq!(
+                std::fs::read_to_string(dir.join("clones")).unwrap(),
+                "retry\nretry\n"
+            );
+            assert_eq!(ledger.rows[0].name, row.name);
+            return;
+        }
         let pass = if matches!(case, "absent" | "appears") {
             assert_eq!(pass.finished, 0, "one absence must retain the reservation");
             assert_eq!(ledger.rows[0].state, State::Cloning);
@@ -3786,9 +4066,10 @@ printf '{"data":%s}\n200' "$body"
             assert_eq!(calls.lines().count(), 3);
             return;
         }
-        assert!(
-            pass.frozen.is_none(),
-            "transport recovery/quarantine must not freeze other rows"
+        assert_eq!(
+            pass.frozen.is_some(),
+            matches!(case, "task" | "volume" | "incomplete" | "appears"),
+            "only unresolved ambiguous clone state freezes admission"
         );
         if case == "transient" {
             assert_eq!(pass.finished, 0);
@@ -3838,8 +4119,8 @@ printf '{"data":%s}\n200' "$body"
                     .contains("lost clone response")
             );
         }
-        // The production admission entry point reserves a different row while
-        // the quarantined reservation continues to consume its own slot.
+        // The reservation still consumes its own slot; the foreground loop
+        // additionally honors Pass::frozen before admitting another row.
         let admitted = reserve_admitted_clone(
             &mut ledger,
             &path,
@@ -3864,11 +4145,22 @@ printf '{"data":%s}\n200' "$body"
         let status: Value =
             serde_json::from_slice(&std::fs::read(dir.join("reconcile-status.json")).unwrap())
                 .unwrap();
-        assert_eq!(status["admission_frozen"], false);
+        assert_eq!(
+            status["admission_frozen"],
+            matches!(case, "task" | "volume" | "incomplete" | "appears")
+        );
         assert_eq!(
             status["quarantined"].as_array().unwrap().len(),
             usize::from(matches!(case, "task" | "volume" | "incomplete" | "appears"))
         );
+    }
+    #[test]
+    fn serial_host_reconcile_clone_busy() {
+        reconcile_fixture("clone_busy");
+    }
+    #[test]
+    fn serial_host_reconcile_storage_busy() {
+        reconcile_fixture("storage_busy");
     }
     #[test]
     fn serial_host_reconcile_absent() {
@@ -3921,6 +4213,124 @@ printf '{"data":%s}\n200' "$body"
         }
     }
 
+    /// Real transport and submission path with recorded task replies. The child
+    /// isolates PATH and the process-local storage authority from other tests.
+    #[test]
+    fn serial_host_storage_tasks_are_serial_and_busy_is_retried() {
+        const CHILD: &str = "CARRICK_STORAGE_1821";
+        if std::env::var_os(CHILD).is_none() {
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact",
+                    "ci_scaler::live::tests::serial_host_storage_tasks_are_serial_and_busy_is_retried",
+                    "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let curl = dir.path().join("curl");
+        std::fs::write(&curl, r#"#!/bin/sh
+cat >/dev/null
+for arg do url=$arg; done
+case "$url" in
+ */clone)
+   echo clone >> "$CARRICK_STORAGE_DIR/calls"
+   printf '{"data":"UPID:willow:fixture"}\n200' ;;
+ */tasks/*/status)
+   if [ "$(wc -l < "$CARRICK_STORAGE_DIR/calls")" -eq 1 ]; then
+     touch "$CARRICK_STORAGE_DIR/waiting"
+     n=0
+     while [ ! -f "$CARRICK_STORAGE_DIR/release" ]; do
+       n=$((n+1)); [ "$n" -lt 200 ] || exit 91
+       sleep 0.05
+     done
+     printf '%s\n200' "{\"data\":{\"status\":\"stopped\",\"exitstatus\":\"can't lock file '/var/lock/pve-manager/pve-storage-local' - got timeout\"}}"
+   else
+     printf '{"data":{"status":"stopped","exitstatus":"OK"}}\n200'
+   fi ;;
+ *) exit 92 ;;
+esac
+"#).unwrap();
+        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    dir.path().display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            );
+            std::env::set_var("CARRICK_STORAGE_DIR", dir.path());
+        }
+        let make_pve = || Pve {
+            site: site::WILLOW,
+            token: Token {
+                id: "fixture".into(),
+                secret: "synthetic".into(),
+            },
+            deadline: std::cell::Cell::new(None),
+        };
+        let mut ledger = Ledger::default();
+        let mut row = row();
+        ledger.rows.push(row.clone());
+        let path = dir.path().join("ledger.json");
+        ledger.save(&path).unwrap();
+        let worker_path = path.clone();
+        let first = std::thread::spawn(move || {
+            let pve = make_pve();
+            let token = pve.storage_admission().unwrap();
+            let result = submit_clone(&pve, &mut ledger, &mut row, &worker_path, &token);
+            (ledger, row, result)
+        });
+        let bound = Instant::now() + Duration::from_secs(10);
+        while !dir.path().join("waiting").exists() {
+            assert!(
+                Instant::now() < bound,
+                "first clone did not reach task wait"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let pve = make_pve();
+        let mut second = Ledger::default();
+        let mut second_row = self::row();
+        second_row.vm = CloneId::try_from(309).unwrap();
+        second_row.name.push_str("-second");
+        second_row.state = State::WaitingStorage;
+        second.rows.push(second_row.clone());
+        let second_path = dir.path().join("second.json");
+        second.save(&second_path).unwrap();
+        let second_attempt = pve.storage_admission().and_then(|token| {
+            submit_clone(&pve, &mut second, &mut second_row, &second_path, &token)
+        });
+        assert!(matches!(second_attempt, Err(ScalerError::StorageBusy)));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("calls")).unwrap(),
+            "clone\n"
+        );
+        std::fs::write(dir.path().join("release"), "").unwrap();
+        let (mut ledger, mut row, result) = first.join().unwrap();
+        assert!(matches!(result, Err(ScalerError::StorageBusy)));
+        assert_eq!(Ledger::load(&path).unwrap().rows[0].state, State::Cloning);
+        let token = pve.storage_admission().unwrap();
+        submit_clone(&pve, &mut second, &mut second_row, &second_path, &token).unwrap();
+        drop(token);
+        let token = pve.storage_admission().unwrap();
+        submit_clone(&pve, &mut ledger, &mut row, &path, &token).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("calls")).unwrap(),
+            "clone\nclone\nclone\n"
+        );
+        assert_eq!(
+            pve.task_state(row.task.as_deref().unwrap()).unwrap(),
+            TaskState::Succeeded
+        );
+    }
+
     fn row() -> Record {
         Ledger::default()
             .reserve(
@@ -3953,6 +4363,7 @@ printf '{"data":%s}\n200' "$body"
 
 #[cfg(test)]
 mod storage_contention_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
     #[test]
@@ -3960,10 +4371,70 @@ mod storage_contention_tests {
         let result = json!({"status":"stopped", "exitstatus":
             "can't lock file '/var/lock/pve-manager/pve-storage-local' - got timeout"});
         let state = classify_task(&result);
-        assert_ne!(
+        assert_eq!(
             state,
-            TaskState::Failed,
+            TaskState::Busy,
             "storage contention must be retryable"
+        );
+    }
+
+    #[test]
+    fn storage_token_retains_pending_tasks_and_scopes_admission() {
+        let first = StorageAdmission::acquire("fixture-1821", "local").unwrap();
+        assert!(matches!(
+            StorageAdmission::acquire("fixture-1821", "local"),
+            Err(ScalerError::StorageBusy)
+        ));
+        let other = StorageAdmission::acquire("fixture-1821", "other").unwrap();
+        first
+            .task(Some("UPID:fixture-1821:pending".into()))
+            .unwrap();
+        drop(first);
+        let next = StorageAdmission::acquire("fixture-1821", "local").unwrap();
+        assert_eq!(next.pending().unwrap(), ["UPID:fixture-1821:pending"]);
+        next.task(None).unwrap();
+        drop(other);
+    }
+
+    #[test]
+    fn serial_host_recorded_disk_free_failure_is_busy_without_retaining_external_text() {
+        let result = execute_with_stderr_failure(
+            Command::new("sh").args(["-c", "echo \"can't lock file '/var/lock/pve-manager/pve-storage-local' - got timeout\" >&2; exit 1"]),
+            &[], Duration::from_secs(5),
+            |stderr| storage_lock_timeout(&String::from_utf8_lossy(stderr))
+                .then_some(ScalerError::StorageBusy));
+        assert!(matches!(result, Err(ScalerError::StorageBusy)));
+        for unknown in [
+            "got timeout",
+            "can't lock file '/tmp/local' - got timeout",
+            "can't lock file '/var/lock/pve-manager/pve-storage-' - got timeout",
+        ] {
+            assert!(!storage_lock_timeout(unknown));
+        }
+    }
+    #[test]
+    fn busy_start_resumes_the_owned_clone() {
+        let mut row = Ledger::default()
+            .reserve(
+                JobKey {
+                    run: RunId(1),
+                    attempt: 1,
+                    job: JobId(2),
+                },
+                &[],
+                0,
+                Concurrency::ONE,
+            )
+            .unwrap();
+        row.state = State::Booting;
+        assert_eq!(
+            recovery_decision(&row, true, TaskState::Busy, 1),
+            Recovery::ResumeClone
+        );
+        row.state = State::Cloning;
+        assert_eq!(
+            recovery_decision(&row, false, TaskState::Absent, 1),
+            Recovery::Quarantine
         );
     }
 
