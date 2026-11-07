@@ -51,8 +51,8 @@ impl<'a> X86AnonymousVenue<'a> {
 // the shared host-file staging owner, rather than a second mmap decoder.
 struct MappingUser;
 impl carrick_personality_linux::native_host_file::HostFileUser for MappingUser {
-    fn copy_in(&mut self, _: &mut [u8], _: u64) -> bool {
-        false
+    fn copy_in(&mut self, _: &mut [u8], _: u64) -> carrick_core::user_copy::CopyOutcome {
+        carrick_core::user_copy::CopyOutcome::Fault
     }
     fn writable(&mut self, _: u64, _: usize) -> usize {
         0
