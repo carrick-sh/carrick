@@ -822,6 +822,14 @@ pub struct FatalReport {
     pub detail: FatalCode,
 }
 
+/// Where a saved PC sits relative to its owning syscall instruction.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SavedSyscallPc {
+    #[default]
+    AfterSyscall,
+    AtSyscall,
+}
+
 /// ISA-selected scheduler context operations needed by process birth.
 /// Implementations preserve native register/TLS/vector state and replace only
 /// the child's return value and exact address-space binding. The owner never
@@ -835,6 +843,9 @@ pub trait ProcessContext: Copy + Send + Sync + zerocopy::FromZeros {
     fn set_syscall_return(&mut self, value: u64);
     /// Restore the syscall instruction PC while preserving all arguments.
     fn restart_syscall(&mut self);
+    fn saved_syscall_pc(&self) -> Option<SavedSyscallPc> {
+        Some(SavedSyscallPc::AfterSyscall)
+    }
     fn with_syscall_return(mut self, value: u64) -> Self {
         self.set_syscall_return(value);
         self

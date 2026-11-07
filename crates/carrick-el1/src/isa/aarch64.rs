@@ -463,7 +463,11 @@ impl EntryBackend for Aarch64Backend {
     }
     fn save_context(&mut self, frame: &TrapFrame) -> Result<ThreadCtx, Self::Error> {
         let mut context = Aarch64ParkedContext::ZERO;
-        hw::HardwareCpu.save(frame, &mut context);
+        hw::HardwareCpu.save(
+            frame,
+            &mut context,
+            crate::substrate::sched::CpuExitCause::Interrupted,
+        );
         Ok(context.native)
     }
     fn load_context(

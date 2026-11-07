@@ -74,7 +74,7 @@ const fn cause_queue_index(index: usize, cause: spaces::notification::SpaceWaitC
         ORIGINAL_OBJECT_WAIT_QUEUES + (cause as usize - 1) * spaces::ADDRESS_SPACES + index
     }
 }
-pub const OBJECT_WAIT_PROTOCOL: u64 = 13;
+pub const OBJECT_WAIT_PROTOCOL: u64 = 15;
 pub const OBJECT_WAIT_LAYOUT_HASH: u64 = {
     let words = [
         OBJECT_WAIT_PROTOCOL,

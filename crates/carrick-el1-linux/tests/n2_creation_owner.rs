@@ -101,7 +101,12 @@ struct SaveCpu {
 }
 
 impl sched::ThreadCpu for SaveCpu {
-    fn save(&mut self, frame: &TrapFrame, ctx: &mut carrick_el1_abi::Aarch64ParkedContext) {
+    fn save(
+        &mut self,
+        frame: &TrapFrame,
+        ctx: &mut carrick_el1_abi::Aarch64ParkedContext,
+        _: sched::CpuExitCause,
+    ) {
         self.saves += 1;
         ctx.native.x = frame.x;
         ctx.native.pc = frame.elr;

@@ -695,6 +695,14 @@ fn the_virtual_timer_preempts_a_compute_loop() {
     assert_eq!(frame.x[0], 0, "B's wait returns 0");
     assert_eq!(zone.slot(SLOT).current(), Some(b));
     assert_eq!(task.execution.task.load(Ordering::Relaxed), 202);
+    let a = zone.slot(SLOT).host_record().unwrap();
+    assert_eq!(
+        // SAFETY: timer preemption queued A, so its record owns the saved
+        // context until the production scheduler selects it again below.
+        unsafe { zone.record(a).ctx_mut() }.saved_syscall_pc(),
+        Some(carrick_sched_core::SavedSyscallPc::AtSyscall),
+        "preemption before a resumed SVC executes must preserve its PC"
+    );
     // B computes; the next slice end brings A back, untouched.
     cpu.regs.v[3] ^= 7;
     cpu.now += slice;
@@ -704,6 +712,10 @@ fn the_virtual_timer_preempts_a_compute_loop() {
         "A resumes exactly where it was preempted"
     );
     assert_eq!(cpu.regs, a_running.1);
+    assert_eq!(
+        frame.elr, a_running.0.elr,
+        "Sched::load must not rewind the preempted instruction"
+    );
     assert_eq!(task.execution.task.load(Ordering::Relaxed), 101);
     assert_eq!(zone.slot(SLOT).current(), zone.slot(SLOT).host_record());
     assert_eq!(zone.counters.el1_preemptions.load(Ordering::Relaxed), 2);
@@ -2268,7 +2280,7 @@ fn arm_fake_backend_context_trace_is_unchanged() {
     let (mut frame, mut cpu) = live(0xa, 0x1000, FUTEX_WAIT_PRIVATE, 0);
     frame.x = a.x;
     let mut saved = Aarch64ParkedContext::ZERO;
-    cpu.save(&frame, &mut saved);
+    cpu.save(&frame, &mut saved, CpuExitCause::Svc);
     assert_eq!(saved.native.x, a.x);
     assert_eq!(saved.native.pc, a.pc);
     assert_eq!(saved.native.pstate, a.pstate);
@@ -2283,7 +2295,7 @@ fn arm_fake_backend_context_trace_is_unchanged() {
         &mut frame,
         &Aarch64ParkedContext::from_register(b, TTBR_MM, MM, 1),
     );
-    cpu.save(&frame, &mut saved);
+    cpu.save(&frame, &mut saved, CpuExitCause::Interrupted);
     assert_eq!(saved.native.x, b.x);
     assert_eq!(saved.native.pc, b.pc);
     assert_eq!(saved.native.pstate, b.pstate);
@@ -2353,6 +2365,32 @@ fn concurrent_timer_park_and_guard_refusal_preserve_record_ownership() {
     let resume = OperationResumePc::new(0x8000).unwrap();
     let op = OperationToken::new(101, 1).unwrap();
 
+    // A host-loaded lane already has a saved context. Force the observed
+    // generation stale after the park has replaced that context, then prove
+    // failed publication restores the whole prior value, including its PC
+    // position. A later adapter refusal must therefore still rewind once.
+    let record = zone.current_or_new(SLOT, identity(101)).unwrap();
+    let mut prior = Aarch64ParkedContext::from_register(thread_ctx(0xa, 0x4000), TTBR_MM, MM, 1);
+    prior.replace_saved_pc(0x7004, carrick_sched_core::SavedSyscallPc::AfterSyscall);
+    // SAFETY: this unpublished host-home record belongs to the fixture lane.
+    unsafe { *zone.record(record).ctx_mut() = prior };
+    let (report, effects) = sched.notify_object(key).unwrap();
+    assert_eq!(report.queued, 0);
+    sched.finish_object_wake(effects);
+    let changed = sched.park_object(
+        &frame,
+        key,
+        snapshot,
+        resume,
+        OperationToken::new(101, 3).unwrap(),
+        None,
+    );
+    assert!(matches!(
+        changed,
+        Err((carrick_sched_core::object_wait::ObjectWaitError::Changed, _))
+    ));
+    assert_eq!(unsafe { *zone.record(record).ctx_mut() }, prior);
+
     // 2. Guard acquisition error (stale/unbound key)
     let stale_key = ObjectWaitKey::new(2, 99).unwrap();
     let op2 = OperationToken::new(101, 2).unwrap();
@@ -2363,6 +2401,11 @@ fn concurrent_timer_park_and_guard_refusal_preserve_record_ownership() {
         None,
         "guard error must not leak fresh record"
     );
+    let snapshot = unsafe {
+        carrick_sched_core::object_wait::ObjectStateSnapshot::taken_under_object_lock(
+            sched.observe_object(key).unwrap(),
+        )
+    };
     let parked = sched
         .park_object(&frame, key, snapshot, resume, op, Some(5000))
         .unwrap();

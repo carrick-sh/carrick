@@ -739,7 +739,7 @@ fn switched_self_affinity(exclude: bool) {
         // SAFETY: the fixture owns this stopped, unpublished home record.
         let saved = unsafe { p.zone.record(sibling.id).ctx_mut() };
         *saved = p.words;
-        cpu.save(&frame, saved);
+        cpu.save(&frame, saved, carrick_el1_linux::sched::CpuExitCause::Svc);
         assert!(
             p.zone
                 .requeue_preempted(previous_slot, sibling.id)

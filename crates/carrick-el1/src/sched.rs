@@ -112,7 +112,7 @@ impl NativeEntryVenue {
 /// The CPU state and the per-vCPU hardware the in-guest scheduler uses.
 pub trait ThreadCpu {
     /// Save the running thread's `frame` and live state into `ctx`.
-    fn save(&mut self, frame: &TrapFrame, ctx: &mut Aarch64ParkedContext);
+    fn save(&mut self, frame: &TrapFrame, ctx: &mut Aarch64ParkedContext, exit: CpuExitCause);
     /// Make `ctx` the running thread: fill `frame` and load live state.
     fn load(&mut self, frame: &mut TrapFrame, ctx: &Aarch64ParkedContext);
     /// ISA entry after a selected record is installed, before ERET.
@@ -198,10 +198,32 @@ pub trait ThreadCpu {
     fn own_sgi_target(&self) -> u64;
 }
 
+/// Why EL0 stopped before its architectural context was saved.
+///
+/// An SVC frame names the instruction after the syscall. An interrupt or
+/// fault frame names the interrupted instruction and must never be rewound.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CpuExitCause {
+    Svc,
+    Interrupted,
+}
+
+impl CpuExitCause {
+    /// Position recorded with a context saved for this exit cause.
+    pub const fn saved_syscall_pc(self) -> carrick_sched_core::SavedSyscallPc {
+        match self {
+            Self::Svc => carrick_sched_core::SavedSyscallPc::AfterSyscall,
+            Self::Interrupted => carrick_sched_core::SavedSyscallPc::AtSyscall,
+        }
+    }
+}
+
 /// Scheduler effect of the native owner resume checkpoint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResumeAction {
     NoPending,
+    /// Retry from a checkpoint whose saved PC already names the syscall.
+    RetrySavedSyscall,
     RetrySyscall,
     Returned(carrick_guest_arch::NativeReturnWord),
     Left,
@@ -442,8 +464,11 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         // SAFETY: this vCPU runs the thread `record` holds (a fresh home
         // record, or the switched-in `OnCpu` one); nobody else may touch it
         // until the park below is published.
-        self.cpu
-            .save(frame, unsafe { zone.record(record).ctx_mut() });
+        self.cpu.save(
+            frame,
+            unsafe { zone.record(record).ctx_mut() },
+            CpuExitCause::Svc,
+        );
         let seq = zone.next_seq(record);
         // Reserve one exact record lease before publishing its timed park.
         if deadline.is_some() && zone.arm_timer(slot, record, seq).is_err() {
@@ -508,7 +533,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// leaves the caller's host handoff intact, so its execution capacity can
     /// be released without sending a native child to a host-task adopter.
     pub fn run_ready(&mut self, frame: &mut TrapFrame) -> Option<Served> {
-        if let Some(served) = self.enforce_affinity(frame) {
+        if let Some(served) = self.enforce_affinity(frame, CpuExitCause::Svc) {
             return Some(served);
         }
         loop {
@@ -530,8 +555,13 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// Enforce the current record's placement at an IRQ or completed-entry
     /// boundary. Syscall callers consume completion authority first, so the
     /// saved frame contains the completed result before publication.
-    pub fn enforce_affinity(&mut self, frame: &mut TrapFrame) -> Option<Served> {
-        if !self.zone.current_affinity_excludes_cpu(self.slot) || !self.park_preempted(frame) {
+    pub fn enforce_affinity(
+        &mut self,
+        frame: &mut TrapFrame,
+        exit: CpuExitCause,
+    ) -> Option<Served> {
+        if !self.zone.current_affinity_excludes_cpu(self.slot) || !self.park_preempted(frame, exit)
+        {
             return None;
         }
         let mut effects = WakeEffects::default();
@@ -593,7 +623,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             record,
         )?;
         frame.x[0] = 0;
-        let (loaded, requeue) = self.preempt_record(frame, record);
+        let (loaded, requeue) = self.preempt_record(frame, record, CpuExitCause::Svc);
         if self.zone.slot(self.slot).current() == Some(record) {
             return Some(Served::Returned { switched: false });
         }
@@ -655,7 +685,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             // The wake only says that physical supply completed. Replaying
             // the SVC must preserve all original syscall arguments, including
             // x0, rather than installing the scheduler's wake result.
-            ResumeAction::RetrySyscall => None,
+            ResumeAction::RetrySavedSyscall | ResumeAction::RetrySyscall => None,
             ResumeAction::Left => {
                 self.leave_space();
                 return LoadResult::Left;
@@ -909,7 +939,10 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         if self.zone.slot(self.slot).affinity_excludes_cpu() {
             return carrick_el1_abi::Action::Forward;
         }
-        if self.enforce_affinity(frame).is_some() {
+        if self
+            .enforce_affinity(frame, CpuExitCause::Interrupted)
+            .is_some()
+        {
             return carrick_el1_abi::Action::Idle;
         }
         if self.task.linux.has_pending_host_work() {
@@ -936,7 +969,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
                     // The next thread needs its executor: the running one
                     // goes to the tail of the run queue with its registers,
                     // and the vCPU leaves for the host with no thread on it.
-                    if self.park_preempted(frame) {
+                    if self.park_preempted(frame, CpuExitCause::Interrupted) {
                         self.service_exit();
                         return carrick_el1_abi::Action::Idle;
                     }
@@ -1001,14 +1034,15 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// Preempt the running thread into its record at the tail of this
     /// vCPU's run queue, with nothing switched in (the next thread needs its
     /// executor). False if it could not be parked; it keeps running.
-    fn park_preempted(&mut self, frame: &TrapFrame) -> bool {
+    fn park_preempted(&mut self, frame: &TrapFrame, exit: CpuExitCause) -> bool {
         let (zone, slot) = (self.zone, self.slot);
         let Ok(prev) = self.current_record() else {
             return false;
         };
         // SAFETY: `prev` holds the running thread (a fresh home record, or
         // the switched-in OnCpu one): this vCPU is its only owner.
-        self.cpu.save(frame, unsafe { zone.record(prev).ctx_mut() });
+        self.cpu
+            .save(frame, unsafe { zone.record(prev).ctx_mut() }, exit);
         requeue_owned(zone, slot, prev)
     }
 
@@ -1023,7 +1057,8 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         let Ok(prev) = self.current_record() else {
             return true;
         };
-        self.preempt_record(frame, prev).0
+        self.preempt_record(frame, prev, CpuExitCause::Interrupted)
+            .0
     }
 
     /// Switch `prev` out for the run queue's head. Returns whether a thread
@@ -1032,12 +1067,14 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         &mut self,
         frame: &mut TrapFrame,
         prev: carrick_el1_abi::RecordId,
+        exit: CpuExitCause,
     ) -> (bool, carrick_sched_core::Requeue) {
         let (zone, slot) = (self.zone, self.slot);
         let fresh = zone.slot(slot).current().is_none();
         // SAFETY: `prev` holds the running thread (a fresh home record, or
         // the switched-in OnCpu one): this vCPU is its only owner.
-        self.cpu.save(frame, unsafe { zone.record(prev).ctx_mut() });
+        self.cpu
+            .save(frame, unsafe { zone.record(prev).ctx_mut() }, exit);
         match zone.switch_in_full(slot) {
             Some(switched) => {
                 if !requeue_owned(zone, slot, prev) {
@@ -1396,18 +1433,18 @@ impl ThreadCpu for FakeCpu {
             .take()
             .unwrap_or(carrick_el1_abi::Action::Forward)
     }
-    fn save(&mut self, frame: &TrapFrame, ctx: &mut Aarch64ParkedContext) {
-        let ctx = &mut ctx.native;
-        hw::save_frame(frame, ctx);
-        ctx.sp_el0 = self.regs.sp_el0;
-        ctx.tpidr_el0 = self.regs.tpidr_el0;
-        ctx.tpidrro_el0 = self.regs.tpidrro_el0;
-        ctx.contextidr_el1 = self.regs.contextidr_el1;
+    fn save(&mut self, frame: &TrapFrame, ctx: &mut Aarch64ParkedContext, exit: CpuExitCause) {
+        hw::save_frame(frame, &mut ctx.native);
+        ctx.native.sp_el0 = self.regs.sp_el0;
+        ctx.native.tpidr_el0 = self.regs.tpidr_el0;
+        ctx.native.tpidrro_el0 = self.regs.tpidrro_el0;
+        ctx.native.contextidr_el1 = self.regs.contextidr_el1;
         if !self.skip_fpsimd {
-            ctx.v = self.regs.v;
-            ctx.fpsr = self.regs.fpsr;
-            ctx.fpcr = self.regs.fpcr;
+            ctx.native.v = self.regs.v;
+            ctx.native.fpsr = self.regs.fpsr;
+            ctx.native.fpcr = self.regs.fpcr;
         }
+        ctx.replace_saved_pc(ctx.native.pc, exit.saved_syscall_pc());
     }
 
     fn load(&mut self, frame: &mut TrapFrame, ctx: &Aarch64ParkedContext) {
