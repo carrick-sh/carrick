@@ -47,3 +47,30 @@ The strengthened signed refill witness, signed Python fork/subprocess and Go
 workloads, paired crash-population evidence, and attribution of the original
 crash from a published signed core remain UNRUN (director). On this Linux
 runner the signed entry point reports `macOS/HVF only` before running tests.
+
+## Portable verification in this continuation
+
+The regular/`serial_host` library partitions passed: AArch64 131/3, HAL
+227/0, kernel 2818/195 (one existing ignored regular test), MMU core 269/0,
+and x86 79/0. Zero serial cases means that crate defines no tests matching
+that partition; it does not stand in for a runtime gate.
+
+The justfile's prescribed full serial runtime recipe passed 744 tests with
+six existing ignored tests. An earlier parallel invocation was invalid for
+this crate: its process-wide lifecycle guard rejected an overlapping prepare
+test (649 passed, one failed, five ignored). This rejected invocation is
+retained in the evidence; serial execution is the existing required recipe,
+not a production workaround introduced by this change.
+
+`just build-cpl0`, `just check-linux`, `cargo check -p carrick-vmm-kvm`,
+formatting, diff whitespace and the contract-change check against admitted
+main passed. The built `carrick-xtask authority-debt --source-only` checker
+and its admitted-base comparison passed with 1266 source counters.
+
+The macOS all-target compile phase passed. At this record's writing its
+Clippy phase, host Clippy, embed unit suites and final test-scope reruns are
+still pending behind runner filesystem-journal I/O stalls; no completed
+result is claimed for them here. Signed and Docker execution are unavailable
+on this Linux runner (Docker executable absent). KVM is accessible, but its
+runtime merge-queue gate was not run. Whole-workspace lint-domains and
+test-kernel were deliberately left to CI.
