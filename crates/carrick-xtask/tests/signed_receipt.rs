@@ -398,7 +398,8 @@ elif '--method' in args and args[args.index('--method')+1] == 'POST':
     with open(os.environ['TEST_POSTS'], 'a') as out:
         out.write(json.dumps({'endpoint':endpoint,'body':json.load(sys.stdin)})+'\n')
 elif args[:2] == ['api', 'graphql']:
-    print(json.dumps({'data':{'repository':{'mergeQueue':{'entries':{'nodes':[]}}}}}))
+    nodes = json.loads(os.environ.get('TEST_QUEUE_ENTRIES', '[]'))
+    print(json.dumps({'data':{'repository':{'mergeQueue':{'entries':{'nodes':nodes}}}}}))
 elif args[0] == 'api':
     endpoint = args[-1]
     if '/pulls/' in endpoint:
@@ -516,7 +517,7 @@ else:
     let queue_payload = json!({"repository":{"full_name":"carrick-sh/carrick"},"action":"checks_requested","merge_group":{"base_ref":"refs/heads/main","head_ref":queue_ref,"head_sha":b.clone(),"base_sha":a.clone()}});
     std::fs::write(&queue_event, queue_payload.to_string()).unwrap();
     let queue_dir = dir.path().join("queue-request");
-    let queue = |payload: &serde_json::Value| {
+    let queue_with_entries = |payload: &serde_json::Value, entries: &str| {
         std::fs::write(&queue_event, payload.to_string()).unwrap();
         child()
             .env("GITHUB_EVENT_NAME", "merge_group")
@@ -525,6 +526,7 @@ else:
             .env("GITHUB_REF", queue_ref)
             .env("GITHUB_SHA", b.clone())
             .env("TEST_PENDING_BASE", "1")
+            .env("TEST_QUEUE_ENTRIES", entries)
             .args(["signed-gate", "prepare", "--event"])
             .arg(&queue_event)
             .arg("--output")
@@ -532,6 +534,15 @@ else:
             .output()
             .unwrap()
     };
+    let live_predecessor = serde_json::json!([{
+        "headCommit": {"oid": d},
+        "pullRequest": {
+            "number": 123,
+            "baseRefName": "main",
+            "baseRepository": {"nameWithOwner": "carrick-sh/carrick"}
+        }
+    }]).to_string();
+    let queue = |payload: &serde_json::Value| queue_with_entries(payload, &live_predecessor);
     let queued = queue(&queue_payload);
     assert!(
         queued.status.success(),
@@ -559,6 +570,10 @@ else:
         serde_json::from_slice(&std::fs::read(queue_dir.join("request.json")).unwrap()).unwrap();
     assert_eq!(second_request["base"], a.clone());
     assert_eq!(second_request["prs"], json!([123, 124]));
+    // A first-parent ancestor is not enough: second-in-line authorization
+    // requires the predecessor to still be a live entry in main's queue.
+    let stale_base = queue_with_entries(&second, "[]");
+    assert!(!stale_base.status.success(), "accepted a non-live queue base");
     for (field, bad) in [
         ("base_ref", "refs/heads/other"),
         ("head_ref", "refs/heads/feature"),
