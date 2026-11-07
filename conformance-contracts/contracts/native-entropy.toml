@@ -13,11 +13,13 @@ vm_free = [
   "carrick-el1-linux::aarch64_process_tests::arm_native_fork_child_getrandom_default_returns_eight_bytes",
   "carrick-el1-linux::aarch64_process_tests::arm_native_fork_child_getrandom_nonblock_returns_eight_bytes",
   "carrick-kernel::dispatch::proc::copyout_refusal_s3_tests::getrandom_rejects_conflicting_sources_before_output_preparation",
+  "carrick-kernel::dispatch::proc::copyout_refusal_s3_tests::getrandom_source_failure_preserves_uncommitted_destination",
+  "carrick-kernel::dispatch::proc::copyout_refusal_s3_tests::getrandom_later_source_failure_returns_only_committed_prefix",
 ]
 
 [bindings.unresolved]
 semantics = "The two VM-free witnesses are red and ignored pending implementation; errno 38 is a defect, not an accepted result. No native entropy service is implemented by this slice."
 structural = "Bounded staging and exact crossing counts require a typed entropy service and measured witnesses; the refusal tests do not prove them."
 x86 = "The x86 CPL0 carrier needs the same entropy venue; no x86 acceptance binding is registered yet."
-embed = "UNRUN (director): signed fork-child getrandom, node -e and openssl rand on the implementation head."
+embed_structural = "UNRUN (director): signed fork-child getrandom, node -e and openssl rand on the implementation head."
 docker = "UNRUN: native Linux differential for flags, EFAULT and accessible-prefix short reads."
