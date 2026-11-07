@@ -2159,29 +2159,70 @@ fn fork_cow_parent() -> i32 {
     for i in 0..COMPOUNDS {
         unsafe { bytes.add(i * STRIDE).write_volatile(0xa5) };
     }
+    let mut p2c = [0; 2];
+    let mut c2p = [0; 2];
+    if unsafe { libc::pipe(p2c.as_mut_ptr()) } != 0 || unsafe { libc::pipe(c2p.as_mut_ptr()) } != 0
+    {
+        return 2;
+    }
     let child = unsafe { libc::fork() };
     if child == 0 {
-        unsafe { libc::_exit(0) };
-    }
-    let mut status = 0;
-    let waited = if child > 0 {
-        unsafe { libc::waitpid(child, &mut status, 0) }
-    } else {
-        -1
-    };
-    let mut ok =
-        waited == child && child > 0 && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
-    for i in 0..COMPOUNDS {
         unsafe {
-            ok &= bytes.add(i * STRIDE).read_volatile() == 0xa5;
-            bytes.add(i * STRIDE).write_volatile(i as u8);
+            libc::close(p2c[1]);
+            libc::close(c2p[0]);
         }
+        // Stay alive on the shared source until BOTH parent writers finish.
+        let ready = write_signal_byte(c2p[1], b'R');
+        let done = poll_read_byte(p2c[0], 10_000);
+        let isolated =
+            (0..COMPOUNDS).all(|i| unsafe { bytes.add(i * STRIDE).read_volatile() } == 0xa5);
+        unsafe { libc::_exit(i32::from(!(ready && done && isolated))) };
+    }
+    if child < 0 {
+        return 3;
+    }
+    unsafe {
+        libc::close(p2c[0]);
+        libc::close(c2p[1]);
+    }
+    let ready = poll_read_byte(c2p[0], 10_000);
+    let base = bytes as usize;
+    let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let mut writers = Vec::new();
+    for worker in 0..2 {
+        let start = start.clone();
+        writers.push(std::thread::spawn(move || {
+            start.wait();
+            // Each live sibling writes 96 distinct compounds, with no syscall
+            // in the loop. Their shared MM must recycle the 64-slot chain.
+            let mut ok = true;
+            for i in (worker..COMPOUNDS).step_by(2) {
+                let byte = (base + i * STRIDE) as *mut u8;
+                unsafe {
+                    ok &= byte.read_volatile() == 0xa5;
+                    byte.write_volatile(i as u8);
+                }
+            }
+            ok
+        }));
+    }
+    start.wait();
+    let mut ok = ready;
+    for writer in writers {
+        ok &= writer.join().unwrap_or(false);
     }
     for i in 0..COMPOUNDS {
         ok &= unsafe { bytes.add(i * STRIDE).read_volatile() } == i as u8;
     }
+    ok &= write_signal_byte(p2c[1], b'D');
+    let mut status = 0;
+    let waited = unsafe { libc::waitpid(child, &mut status, 0) };
+    ok &= waited == child && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+    for fd in [p2c[1], c2p[0]] {
+        unsafe { libc::close(fd) };
+    }
     unsafe { libc::munmap(region, LEN) };
-    println!("fork-cow-parent compounds={COMPOUNDS} ok={ok}");
+    println!("fork-cow-parent compounds={COMPOUNDS} writers=2 child-isolated={ok} ok={ok}");
     i32::from(!ok)
 }
 
