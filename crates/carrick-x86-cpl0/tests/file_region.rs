@@ -305,6 +305,7 @@ fn file_region_unpublished_is_distinct_from_retired() {
 #[test]
 fn x86_ipc_table_map_uses_retained_file_registration() {
     let fixture = Fixture::new(1756);
+    let peer = Fixture::new(1757);
     let tables = fixture.tables();
     let map = tables.ipc_table_map();
     let base = fixture._storage.as_ptr() as usize;
@@ -315,8 +316,32 @@ fn x86_ipc_table_map_uses_retained_file_registration() {
     assert!(!map.window_published());
     map.publish_window();
     assert!(fixture.tables().ipc_table_map().window_published());
+    assert!(!peer.tables().ipc_table_map().window_published());
     assert_eq!(
         fixture.registration.binding().guest().raw(),
         X86_CPL0_REGION_BASE
     );
+}
+
+#[test]
+fn file_registration_initializes_ipc_map_before_publication() {
+    let mut storage = TestEl1Region::zeroed();
+    let mapped = NonNull::new(storage.as_mut_ptr()).expect("aligned storage");
+    // SAFETY: exclusive writable test storage; no references or consumers.
+    // Poison only the IPC reservation to prove registration initializes it.
+    unsafe {
+        mapped
+            .as_ptr()
+            .add(EL1_IPC_TABLE_MAP_OFFSET as usize)
+            .write_bytes(0xff, core::mem::size_of::<ipc_tables::IpcTableMap>());
+    }
+    // SAFETY: exclusive aligned full extent retained until registration drop.
+    let registration =
+        unsafe { FileRegionRegistration::initialize(mapped, binding(1758)) }.expect("publication");
+    let tables = registration
+        .tables(registration.binding())
+        .expect("own live region");
+    let map = tables.ipc_table_map();
+    assert!(!map.window_published());
+    assert!(map.lookup(1).is_none());
 }
