@@ -1250,3 +1250,122 @@ fn successor_image_import_failure_keeps_old_root_and_success_stays_closed() {
     assert!(region.zone.spaces.find(43_002).is_some());
     drop(old);
 }
+
+struct RefillBacking {
+    region: RetainedPublicationFixture,
+    pool: Arc<carrick_core_abi::mm::cow_pool::CowGrantPool>,
+    settled: Arc<AtomicUsize>,
+}
+// SAFETY: the fixture retains the aligned ABI allocation for every table borrow.
+unsafe impl AddressSpaceBacking for RefillBacking {
+    fn region(&self) -> Option<AddressSpaceRegion<'_>> {
+        self.region.region()
+    }
+    fn settlement(&self) -> Option<Arc<dyn carrick_el1_abi::CowGrantSettlement>> {
+        Some(Arc::new(RefillSettlement(
+            self.pool.clone(),
+            self.settled.clone(),
+        )))
+    }
+}
+struct RefillSettlement(
+    Arc<carrick_core_abi::mm::cow_pool::CowGrantPool>,
+    Arc<AtomicUsize>,
+);
+impl carrick_el1_abi::CowGrantSettlement for RefillSettlement {
+    fn settle(&self, excluded: &carrick_sched_core::ExcludedEditor<'_>) {
+        let completed: Vec<_> = self.0.completions(excluded).collect();
+        for completion in completed {
+            assert!(self.0.finish(excluded, &completion.grant));
+            self.1.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    fn release(&self, excluded: &carrick_sched_core::ExcludedEditor<'_>) {
+        self.0.release_mm(excluded);
+    }
+}
+/// Contract kernel.el1.fork-cow: a full USED chain is settled before refill,
+/// and a sibling cannot re-enter between settlement and publication. Uses the
+/// same scoped operation as both runtime fault entries, real editor admission
+/// and real grant transitions; no VM or simulated guest byte copy is claimed.
+#[test]
+fn cow_refill_excludes_sibling_through_publication() {
+    use carrick_core_abi::mm::cow_pool::{
+        COW_GRANT_PROBES, CowGrantCompletion, CowGrantPool, CowGrantPurpose,
+    };
+    use carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity;
+    use std::num::NonZeroU64;
+    let nz = |value| NonZeroU64::new(value).unwrap();
+    let backing = BackingIdentity {
+        frame_id: nz(1),
+        mapping_id: nz(2),
+        owner_generation: nz(3),
+        inventory_revision: nz(4),
+    };
+    let pool = Arc::new(CowGrantPool::new());
+    let settled = Arc::new(AtomicUsize::new(0));
+    let backing_owner = Arc::new(RefillBacking {
+        region: RetainedPublicationFixture {
+            bytes: carrick_test_support::TestEl1Region::zeroed(),
+            carrier: nz(1733),
+            released: Arc::default(),
+        },
+        pool: pool.clone(),
+        settled: settled.clone(),
+    });
+    let region = backing_owner.region().unwrap();
+    let spaces = &region.zone.spaces;
+    let key = mm(43_733);
+    let index = spaces.publish_closed(key.raw(), 0x4000, 0x4000).unwrap();
+    spaces.open(index);
+    let complete = |grant| CowGrantCompletion {
+        purpose: CowGrantPurpose::UserWrite,
+        grant,
+        span_va: 0x4000,
+        span_len: 0x4000,
+        old_ipa: 0x8000,
+        new_ipa: 0xc000,
+    };
+    {
+        let _editor = spaces.try_begin_edit(index, key.raw(), nz(9)).unwrap();
+        for _ in 0..COW_GRANT_PROBES {
+            pool.publish(key.raw(), 0xc000, backing).unwrap();
+            assert!(pool.complete(&complete(pool.claim(key.raw()).unwrap())));
+        }
+    }
+    assert!(
+        pool.publish(key.raw(), 0xc000, backing).is_none(),
+        "Busy: USED chain is full"
+    );
+    let exclusion =
+        exclude_el1_editor_in(SpaceTables::retained(backing_owner.clone()).unwrap(), key).unwrap();
+    with_el1_editor_excluded(Some(exclusion), || {
+        assert_eq!(settled.load(Ordering::Relaxed), COW_GRANT_PROBES);
+        assert!(
+            !pool.has_completions_for(key.raw()),
+            "settled before refill"
+        );
+        // Deterministic competing-writer schedule: if settlement released
+        // the gate early, the sibling fills the freshly emptied chain before
+        // the resolver can publish its refill. No timing or retry is needed.
+        if let Some(_sibling) = spaces.try_begin_edit(index, key.raw(), nz(10)) {
+            for _ in 0..COW_GRANT_PROBES {
+                pool.publish(key.raw(), 0xc000, backing).unwrap();
+                assert!(pool.complete(&complete(pool.claim(key.raw()).unwrap())));
+            }
+        }
+        pool.publish(key.raw(), 0xc000, backing)
+            .expect("refill after Busy must publish");
+        assert!(
+            spaces.try_begin_edit(index, key.raw(), nz(10)).is_none(),
+            "publication retains exclusion"
+        );
+    });
+    let _retry = spaces
+        .try_begin_edit(index, key.raw(), nz(10))
+        .expect("retry after publication");
+    assert!(pool.complete(&complete(
+        pool.claim(key.raw()).expect("retry consumes refill")
+    )));
+    drop(_retry);
+}

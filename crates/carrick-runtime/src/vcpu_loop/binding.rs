@@ -5564,15 +5564,12 @@ where
                             "COW fault lost exact task context: {error}"
                         ))
                     })?;
-                let resolution = {
-                    // Keep EL1 excluded through refill publication. Releasing
-                    // after settlement alone lets a sibling fill the chain
-                    // with USED records again before the engine provisions.
-                    let _cow_exclusion = carrick_kernel::kernel::mm_occupancy::exclude_el1_editor(
+                let resolution = carrick_kernel::kernel::mm_occupancy::with_el1_editor_excluded(
+                    carrick_kernel::kernel::mm_occupancy::exclude_el1_editor(
                         context.shared().mm().id(),
-                    );
-                    engine.resolve_frame_cow_fault(syndrome, far)?
-                };
+                    ),
+                    || engine.resolve_frame_cow_fault(syndrome, far),
+                )?;
                 if let carrick_hal::CowFaultResolution::Resolved {
                     translation,
                     arm_generation,
@@ -5614,15 +5611,12 @@ where
                             "COW fault lost exact task context: {error}"
                         ))
                     })?;
-                let resolution = {
-                    // Keep EL1 excluded through refill publication. Releasing
-                    // after settlement alone lets a sibling fill the chain
-                    // with USED records again before the engine provisions.
-                    let _cow_exclusion = carrick_kernel::kernel::mm_occupancy::exclude_el1_editor(
+                let resolution = carrick_kernel::kernel::mm_occupancy::with_el1_editor_excluded(
+                    carrick_kernel::kernel::mm_occupancy::exclude_el1_editor(
                         context.shared().mm().id(),
-                    );
-                    engine.resolve_frame_cow_fault(syndrome, far)?
-                };
+                    ),
+                    || engine.resolve_frame_cow_fault(syndrome, far),
+                )?;
                 if let carrick_hal::CowFaultResolution::Resolved {
                     translation,
                     arm_generation,
