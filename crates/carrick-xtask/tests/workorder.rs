@@ -263,7 +263,6 @@ fn provenance_requires_current_authorized_labels_and_unedited_order() {
 #[cfg(unix)]
 mod serial_host {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::process::Command;
 
@@ -352,7 +351,7 @@ else:
 "#,
         )
         .unwrap();
-        std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        carrick_test_support::publish_executable(&fake_gh, 0o755).unwrap();
 
         let path_env = std::env::join_paths(
             std::iter::once(bin_dir)

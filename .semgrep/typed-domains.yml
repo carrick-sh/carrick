@@ -385,3 +385,49 @@ rules:
     severity: ERROR
     message: Carry the release ticket, park_and_rerun it, or cancel it with a reason; do not discard contention custody.
     pattern-regex: '\bContended\s*\(\s*_\s*\)'
+
+  # A sibling fork can inherit a fixture writer until exec and make another
+  # thread's execution fail with ETXTBSY. Publish a fresh inode from the
+  # single-threaded test-support writer instead of making raw writes executable.
+  - id: carrick-no-raw-executable-fixture
+    languages: [rust]
+    severity: ERROR
+    message: Use carrick_test_support::write_executable or publish_executable; raw write/chmod fixtures race with sibling forks (ETXTBSY).
+    paths:
+      include:
+        - "crates/carrick-xtask/tests/**"
+        - ".semgrep/tests/executable-fixture.rs"
+    patterns:
+      - pattern-either:
+          - pattern-inside: |
+              {
+                ...
+                std::fs::write($P, ...).unwrap();
+                ...
+              }
+          - pattern-inside: |
+              {
+                ...
+                fs::write($P, ...).unwrap();
+                ...
+              }
+          - pattern-inside: |
+              {
+                ...
+                std::fs::write(&$P, ...).unwrap();
+                ...
+              }
+          - pattern-inside: |
+              {
+                ...
+                fs::write(&$P, ...).unwrap();
+                ...
+              }
+      - pattern-either:
+          - pattern: std::fs::set_permissions($P, std::fs::Permissions::from_mode($MODE))
+          - pattern: fs::set_permissions($P, fs::Permissions::from_mode($MODE))
+          - pattern: std::fs::set_permissions(&$P, std::fs::Permissions::from_mode($MODE))
+          - pattern: fs::set_permissions(&$P, fs::Permissions::from_mode($MODE))
+      - metavariable-regex:
+          metavariable: $MODE
+          regex: '^0o7[0-7]+$'

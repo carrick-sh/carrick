@@ -738,11 +738,10 @@ fn cli_load_check_runs_portable_ps_before_command() {
 
 #[test]
 fn fake_ps_refuses_load_and_override_records_parent_command() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let ps = dir.path().join("ps");
     std::fs::write(&ps, "#!/bin/sh\ncase \"$*\" in\n*comm=*) printf '10 1 bash\\n21 10 /usr/bin/yes\\n' ;;\n*) printf '10 bash -c deliberate load\\n21 yes\\n' ;;\nesac\n").unwrap();
-    std::fs::set_permissions(&ps, std::fs::Permissions::from_mode(0o755)).unwrap();
+    carrick_test_support::publish_executable(&ps, 0o755).unwrap();
     let lock = dir.path().join("lock");
     let command = |allow_load: &str| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"));

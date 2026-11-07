@@ -47,6 +47,7 @@ for checked_config in "${checked_configs[@]}"; do
 done
 
 "$semgrep_bin" --test --config .semgrep/typed-domains.yml .semgrep/tests/contention.rs
+"$semgrep_bin" --test --config .semgrep/typed-domains.yml .semgrep/tests/executable-fixture.rs
 "$semgrep_bin" --config .semgrep/ crates/ --severity ERROR --error --quiet
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"

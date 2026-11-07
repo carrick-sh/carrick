@@ -1,5 +1,5 @@
 use std::fs;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, SystemTime};
@@ -7,8 +7,7 @@ use std::time::{Duration, SystemTime};
 #[test]
 fn native_remote_protocol_needs_no_git_and_preserves_host_and_checkout_guards() {
     let write_executable = |path: &Path, script: &str| {
-        fs::write(path, script).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        carrick_test_support::write_executable(path, script, 0o755).unwrap();
     };
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();

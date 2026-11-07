@@ -3,6 +3,7 @@ use carrick_xtask::agent_runner::{
     DISPATCH_FINAL_RESERVE_MINUTES, DISPATCH_JOB_MINUTES, DISPATCH_LOOP_JOB_MINUTES,
     DISPATCH_LOOP_STEP_MINUTES,
 };
+use std::os::unix::fs::PermissionsExt;
 use yaml_rust2::YamlLoader;
 
 /// The workflow's job and loop-step `timeout-minutes` are the Rust
@@ -335,7 +336,6 @@ fn review_workflow_pins_main_and_orders_the_loop() {
 
 #[test]
 fn review_base_scripts_resolve_main_and_refuse_bad_checkouts_before_build() {
-    use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
     let docs = YamlLoader::load_from_str(include_str!(
         "../../../.github/workflows/dispatch-worker.yml"
@@ -386,7 +386,7 @@ merge-base) test "$2 $3 $4" = "--is-ancestor $FIXTURE_MAIN FETCH_HEAD"; exit "$F
 *) exit 91 ;;
 esac
 "#).unwrap();
-    std::fs::set_permissions(git, std::fs::Permissions::from_mode(0o700)).unwrap();
+    carrick_test_support::publish_executable(git, 0o700).unwrap();
     let main = "a".repeat(40);
     let merge = "b".repeat(40);
     let output = temp.path().join("output");
@@ -526,7 +526,6 @@ fn issue_brief(issue: &serde_json::Value) -> serde_json::Value {
 #[test]
 fn review_setup_failure_posts_fallback_only_on_the_admitted_pr() {
     use serde_json::json;
-    use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let base = Command::new("git")
@@ -584,7 +583,7 @@ fi
 "#,
     )
     .unwrap();
-    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+    carrick_test_support::publish_executable(&gh, 0o700).unwrap();
     for (name, script) in [
         (
             "git",
@@ -597,7 +596,7 @@ fi
     ] {
         let path = bin.join(name);
         std::fs::write(&path, script).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        carrick_test_support::publish_executable(path, 0o700).unwrap();
     }
     let invoke = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
@@ -738,7 +737,6 @@ fn guard_skips_reviews_outside_dispatch_changes_requests() {
 
 #[test]
 fn dispatch_review_stale_head_fails_before_checkout_or_build() {
-    use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
     let docs = YamlLoader::load_from_str(include_str!(
         "../../../.github/workflows/dispatch-worker.yml"
@@ -766,7 +764,7 @@ fn dispatch_review_stale_head_fails_before_checkout_or_build() {
     let temp = tempfile::tempdir().unwrap();
     let curl = temp.path().join("curl");
     std::fs::write(&curl, "#!/bin/sh\nfor arg do url=$arg; done\ntest \"$url\" = https://api.github.com/repos/carrick-sh/carrick/pulls/800 || exit 91\nprintf '{\"head\":{\"sha\":\"%s\"}}' \"$LIVE_HEAD\"\n").unwrap();
-    std::fs::set_permissions(curl, std::fs::Permissions::from_mode(0o700)).unwrap();
+    carrick_test_support::publish_executable(curl, 0o700).unwrap();
     for (live, allowed) in [("a", true), ("b", false)] {
         let output = Command::new("/bin/bash")
             .args(["-c", step["run"].as_str().unwrap()])
@@ -809,7 +807,6 @@ fn all_dispatch_triggers_use_one_loop() {
 #[test]
 fn issue_triggers_default_to_run_branch_without_parsing_body_directives() {
     use serde_json::json;
-    use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
     for trigger in ["label", "comment"] {
         for owned in [false, true] {
@@ -851,7 +848,7 @@ esac
 "#,
             )
             .unwrap();
-            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+            carrick_test_support::publish_executable(&gh, 0o700).unwrap();
             let result = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
                 .args(["dispatch-worker", "guard", "--admit", "--event"])
                 .arg(&event_path)
@@ -1062,3 +1059,7 @@ fn scope_refusal_guard_token_can_comment_on_issues_and_prs() {
             .contains("dispatch-worker guard")
     );
 }
+
+#[cfg(target_os = "linux")]
+#[path = "support/executable_fixture.rs"]
+mod executable_fixture;
