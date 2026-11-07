@@ -102,6 +102,7 @@ pub use trap::{
     host_cow_observe_current, host_cow_snapshot, read_el1_counters, read_el1_region_host_ptr,
     register_ipc_window_backing, reset_el1_counters, vcpu_hvc_not_svc_reasons,
     vcpu_hvc_not_svc_total, vcpu_lifecycle_totals, vcpu_run_exit_classes, vcpu_run_exits_total,
+    with_installed_ipc_region,
 };
 /// Serializes tests that fork REAL child processes. The test binary is one
 /// process, so any-child wait paths under test (`wait4(-1)`,

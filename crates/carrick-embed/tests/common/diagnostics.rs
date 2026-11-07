@@ -84,12 +84,10 @@ pub fn persist_watchdog(run_id: &str, dir: &Path) -> std::io::Result<PathBuf> {
     if let Some(zone) = carrick_el1_abi::zone_tables() {
         let mut census = String::new();
         let _ = zone.write_census(&mut census);
-        if let Some(region) =
-            carrick_el1_abi::ipc_window_host().and_then(|window| window.attach().ok())
-        {
-            let _ = carrick_el1_abi::ipc::write_ipc_wait_census(zone, &region, &mut census);
+        let _ = carrick_runtime::with_carrier_ipc_region(|region| {
+            let _ = carrick_el1_abi::ipc::write_ipc_wait_census(zone, region, &mut census);
             let _ = region.write_host_wake_census(&mut census);
-        }
+        });
         let _ = carrick_el1_abi::write_current_task_census(&mut census);
         capture.zone_census = Some(census);
     } else if capture.zone_census.is_none() && capture.physical.is_none() {

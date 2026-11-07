@@ -1019,7 +1019,9 @@ pub fn reset_el1_counters() {
     *LAST_EL1_COUNTERS.lock() = None;
     EL1_REGION_HOST_PTR.store(0, std::sync::atomic::Ordering::Release);
     carrick_el1_abi::record_el1_region_host_ptr(0);
-    carrick_el1_abi::record_ipc_window_host(None);
+    if let Some(installed) = INSTALLED_IPC_WINDOW.lock().as_mut() {
+        installed.published = false;
+    }
 }
 
 /// GIC interrupts with `intid` EL1 has taken in the live carrier so far.
@@ -1504,7 +1506,8 @@ pub(crate) fn registered_ipc_window_backing() -> Option<std::sync::Arc<dyn IpcWi
 /// owner of the memory, retained until the VM that maps it is destroyed.
 pub(crate) struct IpcWindowInstallation {
     /// The memory's owner, retained while the VM maps it.
-    _backing: std::sync::Arc<dyn IpcWindowBacking>,
+    backing: std::sync::Arc<dyn IpcWindowBacking>,
+    published: bool,
     pub(crate) records: [CarrierStage2RecordIdentity; 2],
 }
 
@@ -1573,7 +1576,8 @@ pub(crate) fn install_ipc_window_using(
         .try_into()
         .map_err(|_| TrapError::Hypervisor("IPC window installation lost a record".to_owned()))?;
     Ok(IpcWindowInstallation {
-        _backing: backing,
+        backing,
+        published: true,
         records,
     })
 }
@@ -1584,6 +1588,26 @@ pub(crate) fn install_ipc_window_using(
 static INSTALLED_IPC_WINDOW: parking_lot::Mutex<Option<IpcWindowInstallation>> =
     parking_lot::Mutex::new(None);
 
+/// Borrow the installed carrier's IPC storage while retaining its backing.
+/// The callback cannot return references into storage that a successor may retire.
+pub fn with_installed_ipc_region<T>(
+    op: impl FnOnce(&carrick_el1_abi::ipc::IpcRegion<'_>) -> T,
+) -> Option<T> {
+    let backing = {
+        let installed = INSTALLED_IPC_WINDOW.lock();
+        let installed = installed.as_ref()?;
+        if !installed.published {
+            return None;
+        }
+        std::sync::Arc::clone(&installed.backing)
+    };
+    // SAFETY: the installation retains both initialized mappings throughout
+    // this callback, including while a different kernel offers its next window.
+    let window = unsafe { carrick_el1_abi::HostIpcWindow::new(backing.as_ref()) }?;
+    let region = window.attach().ok()?;
+    Some(op(&region))
+}
+
 /// Map the registered IPC window into the carrier VM, if the host authority
 /// registered one (otherwise EL1 never attaches and IPC calls forward).
 pub(crate) fn install_registered_ipc_window(custody: &CarrierVmCustody) -> Result<(), TrapError> {
@@ -1591,14 +1615,7 @@ pub(crate) fn install_registered_ipc_window(custody: &CarrierVmCustody) -> Resul
         return Ok(());
     };
     // SAFETY: registered backing has validated geometry and retains the memory.
-    let window = unsafe {
-        carrick_el1_abi::HostIpcWindow::new(
-            carrick_guest_arch::HostVa::from_ptr(backing.directory_ptr()),
-            carrick_guest_arch::GuestLen::new(backing.directory_len() as u64),
-            carrick_guest_arch::HostVa::from_ptr(backing.pool_ptr()),
-            carrick_guest_arch::GuestLen::new(backing.pool_len() as u64),
-        )
-    };
+    let window = unsafe { carrick_el1_abi::HostIpcWindow::new(backing.as_ref()) };
     // The zone may have been installed after host backing registration.
     // Bind before either publication store lets a guest probe or retire.
     if let Some(window) = window {
@@ -1636,7 +1653,6 @@ pub(crate) fn install_registered_ipc_window(custody: &CarrierVmCustody) -> Resul
         },
     )?;
     *INSTALLED_IPC_WINDOW.lock() = Some(installed);
-    carrick_el1_abi::record_ipc_window_host(window);
     // Only now may EL1 touch the window (its header decides the rest).
     if let Some(map) = carrick_el1_abi::ipc_table_map_host() {
         map.publish_window();

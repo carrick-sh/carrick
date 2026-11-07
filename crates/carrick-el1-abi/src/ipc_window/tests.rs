@@ -198,21 +198,36 @@ fn ipc_binding_keeps_guest_virtual_and_physical_ranges_distinct() {
     assert_eq!(binding.pool_bytes(), GuestLen::new(EL1_IPC_POOL_SPAN));
 }
 
+struct HostBacking {
+    directory: usize,
+    pool: usize,
+}
+impl crate::IpcWindowBacking for HostBacking {
+    fn directory_ptr(&self) -> *mut u8 {
+        self.directory as *mut u8
+    }
+    fn directory_len(&self) -> usize {
+        EL1_IPC_DIRECTORY_SPAN as usize
+    }
+    fn pool_ptr(&self) -> *mut u8 {
+        self.pool as *mut u8
+    }
+    fn pool_len(&self) -> usize {
+        EL1_IPC_POOL_SPAN as usize
+    }
+}
+
 #[test]
 fn ipc_host_window_keeps_host_addresses_typed() {
     use carrick_guest_arch::HostVa;
     let directory = HostVa::new(0x200_0000);
     let pool = HostVa::new(0x400_0000);
+    let backing = HostBacking {
+        directory: directory.raw(),
+        pool: pool.raw(),
+    };
     // SAFETY: validation only; no attachment or memory access in this witness.
-    let window = unsafe {
-        crate::HostIpcWindow::new(
-            directory,
-            GuestLen::new(EL1_IPC_DIRECTORY_SPAN),
-            pool,
-            GuestLen::new(EL1_IPC_POOL_SPAN),
-        )
-    }
-    .unwrap();
+    let window = unsafe { crate::HostIpcWindow::new(&backing) }.unwrap();
     assert_eq!(window.directory(), directory);
     assert_eq!(window.pool(), pool);
     assert_eq!(
@@ -245,19 +260,9 @@ fn ipc_guest_window_keeps_x86_virtual_and_frame_addresses_distinct() {
 
 #[test]
 fn ipc_host_window_refuses_pointer_overflow() {
-    use carrick_guest_arch::HostVa;
     for (directory, pool) in [(usize::MAX, 0x400_0000), (0x200_0000, usize::MAX)] {
+        let backing = HostBacking { directory, pool };
         // SAFETY: validation only; no attachment or memory access.
-        assert!(
-            unsafe {
-                crate::HostIpcWindow::new(
-                    HostVa::new(directory),
-                    GuestLen::new(EL1_IPC_DIRECTORY_SPAN),
-                    HostVa::new(pool),
-                    GuestLen::new(EL1_IPC_POOL_SPAN),
-                )
-            }
-            .is_none()
-        );
+        assert!(unsafe { crate::HostIpcWindow::new(&backing) }.is_none());
     }
 }
