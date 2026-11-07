@@ -126,6 +126,20 @@ fn cover_in_ring(fd: i32) -> bool {
     })
 }
 
+/// Read Linux descriptor flags from the caller's ring-owned host binding.
+/// The namespace lock covers lookup and flag observation, just as it covers
+/// close and dup publication. A host view is not this venue's authority.
+pub fn host_binding_descriptor_flags(
+    fd_map: &[FdMapSlot],
+    file_table: u64,
+    fd: i32,
+) -> Option<u32> {
+    let _guard = lock_fd_map(fd_map)?;
+    let (_, index) = fd_map_lookup(fd_map, file_table, fd)?;
+    let flags = fd_map[index].fd_flags.load(Ordering::Acquire);
+    (flags & FdMapSlot::HOST_VIEW == 0).then_some(flags & GUEST_FD_CLOEXEC)
+}
+
 /// Remove one guest descriptor; only the last reference yields a host-object
 /// release obligation. The host never owns the guest descriptor number.
 pub fn close_host_binding(

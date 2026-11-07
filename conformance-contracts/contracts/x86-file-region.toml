@@ -13,7 +13,7 @@ schema_version = 1
 id = "kernel.x86.file-region"
 title = "CPL0 file records belong to one retained carrier region"
 guest_surfaces = ["personality:files", "syscall:dup", "syscall:close", "kernel:current-mm"]
-semantic_authority = ["open(2): distinct open descriptions share an inode", "dup(2), close(2): description references and descriptor lifetime", "Issue #330 and approved F2 design: exact carrier region custody"]
+semantic_authority = ["open(2): distinct open descriptions share an inode", "dup(2), close(2): description references and descriptor lifetime", "fcntl(2): F_GETFD reads per-descriptor FD_CLOEXEC, independently of the open description", "Issue #330 and approved F2 design: exact carrier region custody"]
 fixture = "carrick-x86-cpl0:file_region; carrick-vmm-kvm:cpl0_entry"
 scale_points = [1, 16, 20, 128, 512]
 rationale = "One checked venue names the shared ABI object/open/fd/name/cache allocations. KVM retains the exact host mapping with its separately typed supervisor VA and GPA. Guest venue authentication checks same-VM header/binding self-consistency plus a per-carrier identity; foreign, unpublished and retired bindings have distinct refusals. Guest-observed retirement is fixture-only. Descriptor mutation uses one region-resident lock word; host mutations own stopped-carrier execution exclusion and refuse paused CPL0 descriptor transactions. Guest admission never waits on host custody, and poisoning is a typed fatal. This is not inode-lock quiescence: a kicked CPU can hold an inode lock (F3/F4 constraint). Single-step fixtures use exclusive mutable carrier custody; M1 create_stopped has no F2 registration. Two carriers remain independent; real guest fork/dup/child-exit preserves distinct parent/child descriptor references to the inherited inode. Exact shared-open ring-reference counts are 1 before fork, 4 after both dup calls, and 3 after child retirement with the independently admitted idle-peer stdout included; the VM-free twin checks 1, 2, 4, 2 without that peer. Table witnesses do not claim FileService Open or regular-file I/O acceptance."
@@ -27,8 +27,8 @@ structural_budgets = []
 # custody or descriptor operation. The file_region suite remains the positive
 # venue/descriptor witness; x86 machine-frame conversion stays in this adapter.
 vm_free = [
-  "carrick-el1-linux::dispatch::tests::admitted_descriptor_getfd_is_served_without_a_host_crossing (fcntl F_GETFD reads caller-scoped flags; unknown namespaces and commands remain counted refusals)",
   "carrick-x86-cpl0-host::cpl0_boot::initial_reply_tests::{shared_physical_staging_rolls_back_before_exposure,inventory_retains_two_live_owner_selected_mms,initial_inventory_refuses_a_receipt_from_another_mm} (shared initial physical grant staging: exact-MM custody and rollback before exposure; existing file-region semantics unchanged)",
+  "carrick-el1-linux::dispatch::tests::admitted_descriptor_getfd_is_served_without_a_host_crossing (fcntl F_GETFD reads caller-scoped flags; unowned namespaces and commands retain their ISA crossing policy)",
   "carrick-x86-cpl0::file_region:: layout_alignment_capacity_and_extent, stdio_parity_and_closed_descriptor_stays_closed, record_beyond_fifteen_uses_shared_capacity, foreign_retired_and_two_carriers, fork_dup_lookup_and_retire_preserve_live_parent, unpublished_is_distinct_from_retired (all prefixed file_region_)",
   "carrick-el1-abi::tests::fd_map_waiter_does_no_rmw_while_lock_is_observed_held",
   "carrick-el1-abi::tests::an_image_built_against_another_layout_is_refused (shared ABI identity and EL1_NAME_CACHE_SIZE/alignment asserts include seqlock-backed InotifyNameCache; carrick-x86-cpl0::file_region::file_region_layout_alignment_capacity_and_extent re-verified; no new file-region custody or KVM claim)",
