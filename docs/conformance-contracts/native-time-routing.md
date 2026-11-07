@@ -154,7 +154,10 @@ Two production-dispatch schedules expose why:
   computed before preparation. Both operations enter the production dispatcher;
   the memory fixture supplies only the deterministic interleaving.
 
-The reviewed transaction order is clock-change lock, then discipline lock.
+`ClockDomain::apply_timex`, now used by the host dispatcher, owns the
+transaction. The arbitrary `with_adjtimex_mut` closure API is removed so
+callers cannot introduce the opposite lock order. The reviewed transaction
+order is clock-change lock, then discipline lock.
 Guest output preparation takes neither. Preflight rejects invalid requests
 before preparation, but its derived step is discarded. Execution recomputes
 the step against the locked discipline, checks controlled-clock refusal before
@@ -163,6 +166,13 @@ notifying listeners. A preflight error linearizes at its snapshot; execution
 or revalidation error linearizes under the transaction locks. Memory preparation
 refusals have no clock effects, and genuine output faults remain deferred to
 copyout commit. This needs no syscall retry or extra clock sample.
+
+Both schedules failed before this implementation: the second applied
+123000 ns instead of 123 ns. They pass with the transaction. Additional
+witnesses require no discipline, offset or epoch change on output-owner
+refusal; invalid subsecond validation precedes that refusal. Offset, frozen,
+scaled and deterministic domains reject a step without changing discipline,
+reply bytes or notification generation.
 
 These witnesses cover the clock authority prerequisite only. They do not
 establish a working native clock transport or satisfy the child-read acceptance
