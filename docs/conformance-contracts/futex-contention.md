@@ -253,7 +253,7 @@ the replacement image calls pthread_create and pthread_join. The native
 witness follows that order but does not execute pthread startup's libc futex
 operations. A pass must not be reported as a `forkexecpthread` pass or as
 red-first evidence for that abort. The typed-copy prerequisites are already
-on the admitted main; this branch adds no further production correction.
+on the admitted main; that original witness alone adds no production correction.
 
 To finish #1721, first run the original GNU and musl workload on current main.
 If GNU still aborts, capture the child's actual in-ring futex variant, user
@@ -262,3 +262,46 @@ fix. Keep that capture distinct from the controlled `NotYet` above. Then run
 the original probe through real guest execution and compare the signed census
 on one identified artifact. A Linux x86_64 native fixture can
 check the shared dispatcher protocol, but cannot establish that ARM/HVF result.
+
+### Untimed realtime bitset admission in native exec children (#1721)
+
+Node's [delayed task scheduler startup](https://github.com/nodejs/node/blob/v24.0.0/src/node_platform.cc)
+waits on `uv_sem_wait`; modern glibc uses `sem_wait` through
+[libuv's Unix semaphore implementation](https://github.com/libuv/libuv/blob/v1.x/src/unix/thread.c).
+A bounded native Linux experiment with a live parent, exec successor and
+semaphore-posting pthread observes operation 393:
+`FUTEX_WAIT_BITSET_PRIVATE | FUTEX_CLOCK_REALTIME`, timeout NULL and
+`FUTEX_BITSET_MATCH_ANY`. A separate direct syscall in an exec successor
+with word zero and expected value one returns errno 11. These experiments
+use Linux libc as an oracle, without inspecting GPL implementation sources;
+they are not a capture of the signed Node guest.
+
+The [Linux futex contract](https://man7.org/linux/man-pages/man2/futex.2.html)
+allows the realtime selector for WAIT_BITSET. With timeout NULL,
+[WAIT_BITSET](https://man7.org/linux/man-pages/man2/FUTEX_WAIT_BITSET.2const.html)
+waits indefinitely: there is no clock value to translate. The Linux policy
+therefore admits this exact private variant to its existing wait owner.
+It does not clear arbitrary operation flags, admit shared words under private
+keys, or interpret an absolute timestamp as a relative duration.
+
+`serial_host_native_fork_exec_child_realtime_bitset_futex_retains_owner_refusal`
+extends the existing production native fork/exec witness at child-private VA
+`0x40000000` in the exec successor's MM, while its parent remains alive.
+The pre-fix dispatcher returned `Forward` before any `CopyOutcome` or
+`MemoryError`: opcode admission rejected 393. After admission, unavailable
+backing yields `CopyOutcome::NotYet` for a four-byte read and the exact owner's
+Gate wait. Supply resumes the original comparison with errno 11, never errno
+14. A matching wait subsequently enrolls and selects the successor's real
+clone thread through its first gettid. The budget is one operand read before
+owner transfer, one mismatching read on resume, and one read under the bucket lock for the
+matching compare/enroll episode, with no polling or new wait ledger.
+
+The opcode-128 witness is retained. Its context save was ported to the
+scheduler's explicit `CpuExitCause::Svc` interface during rebase; its lifecycle
+and copy-refusal assertions are unchanged. The earlier neutral-copy import
+port is retained and the lane's evidence-only documentation remains applicable.
+
+Shared operation 265 observed at native pthread_join, non-NULL absolute
+WAIT_BITSET timeouts and PI variants remain outside this correction. Signed
+Node startup and GNU/musl forkexecpthread must still run on the director's Mac;
+passing this VM-free binding alone does not close the reported abort.

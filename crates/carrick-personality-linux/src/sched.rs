@@ -24,6 +24,7 @@ pub const FUTEX_WAIT_PRIVATE: u64 = 128;
 pub const FUTEX_WAKE_PRIVATE: u64 = 129;
 pub const FUTEX_WAIT_BITSET_PRIVATE: u64 = 128 | 9;
 pub const FUTEX_WAKE_BITSET_PRIVATE: u64 = 128 | 10;
+pub const FUTEX_WAIT_BITSET_PRIVATE_REALTIME: u64 = 128 | 256 | 9;
 pub const EAGAIN: i64 = -11;
 pub const ETIMEDOUT_RESULT: u64 = (-110_i64) as u64;
 
@@ -39,7 +40,13 @@ impl FutexCall {
         }
         match self.args[1] {
             FUTEX_WAIT_PRIVATE => true,
-            FUTEX_WAIT_BITSET_PRIVATE => self.args[3] == 0 && self.args[5] as u32 != 0,
+            // With no timeout the clock selector has no effect. In particular,
+            // glibc sem_wait supplies CLOCK_REALTIME even for an indefinite wait.
+            // Keep absolute timeouts outside admission until their clock domain
+            // and owner-copy protocol are implemented.
+            FUTEX_WAIT_BITSET_PRIVATE | FUTEX_WAIT_BITSET_PRIVATE_REALTIME => {
+                self.args[3] == 0 && self.args[5] as u32 != 0
+            }
             FUTEX_WAKE_PRIVATE => self.args[2] as i32 > 0,
             FUTEX_WAKE_BITSET_PRIVATE => self.args[2] as i32 > 0 && self.args[5] as u32 != 0,
             _ => false,
