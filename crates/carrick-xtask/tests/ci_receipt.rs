@@ -3212,13 +3212,14 @@ fn kvm_recipe_without_tests_fails_receipt_and_comparison() {
                     .success()
             );
         }
+        let lease_dir = tempfile::tempdir().unwrap();
         let path = root.join("target/receipt.json");
         let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
             .arg("--root")
             .arg(root)
             .args(["accept", "--profile", "kvm", "--receipt"])
             .arg(&path)
-            .env("CARRICK_HOST_LEASE_PATH", root.join("host.lock"))
+            .env("CARRICK_HOST_LEASE_PATH", lease_dir.path().join("host.lock"))
             .env_remove("CARRICK_HOST_LEASE_FD")
             .env_remove("CARRICK_HOST_LEASE_MODE")
             .env_remove("CARRICK_HOST_LEASE_SOCKET")

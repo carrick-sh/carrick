@@ -194,6 +194,9 @@ fn receipt_failure_keys(receipt: &AcceptReceipt) -> BTreeSet<String> {
         }
     }
     for failure in &receipt.failures {
+        if let Some(reason) = failure.strip_prefix(crate::accept::ACCEPT_REFUSAL_PREFIX) {
+            keys.insert(format!("not-run:accept-refusal:{reason}"));
+        }
         if let Some(step) = failure
             .strip_suffix(&format!("' {}", crate::accept::CLEANUP_UNKNOWN))
             .and_then(|head| head.strip_prefix("step '"))
@@ -1036,6 +1039,11 @@ pub fn diff_with_retired(
             .any(|step| step.name == "kvm-tests" && !step.started_tests.is_empty())
     {
         new.insert("not-run:lane:kvm:zero executed tests".into());
+    }
+    for failure in &candidate.failures {
+        if let Some(reason) = failure.strip_prefix(crate::accept::ACCEPT_REFUSAL_PREFIX) {
+            new.insert(format!("not-run:accept-refusal:{reason}"));
+        }
     }
     for step in &candidate.steps {
         if let crate::accept::StepOutcome::NotRun { reason } = step.execution_outcome() {
