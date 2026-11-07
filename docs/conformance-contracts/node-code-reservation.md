@@ -25,3 +25,18 @@ bytes. It does not execute an AArch64 guest on an x86 host, emulate hardware
 permission enforcement, or prove the VMM supply transaction. The signed Mac
 must still run `node24 -e 'console.log(process.version)'` and print `v24…` on
 the exact head. The VM-free witnesses cannot close that ecosystem acceptance.
+
+## Corrected trigger: outside-arena hint
+
+The signed classification on #1791 supersedes the initial RWX/NORESERVE
+premise: unhinted reservations already work. A free outside-arena hint must
+be honoured, and its later R, RW or RWX protection must use the same owner
+proposal as an arena reservation. Linux mmap(2) supplies the semantic
+rule; the structural rule is zero backing allocation for untouched pages
+and no entry into legacy sparse publication while the MM is admitted.
+
+`delegated_outside_hint_keeps_owner_protection` drives production host
+mmap/mprotect dispatch with a 256 MiB reservation at `0x7000000000` and an
+unhinted control. It checks exact hint placement and owner publication for
+protections 1, 3 and 7. Its backing is a test venue; it does not prove actual
+guest stores, hardware permission enforcement or signed Node startup.
