@@ -27,7 +27,9 @@ bindings require expiry tick 105 after admission at tick 100, whether owner
 preparation parks or returns synchronous `Redispatch`. Separate episodes prove
 that cancellation, unrelated syscalls and unserved futex operations release
 custody before the next wait.
-`futex_caught_signal_releases_owner_deadline_before_handler_wait` sends
+`futex_caught_signal_releases_owner_deadline_before_handler_wait` retains the
+original post-ACK signal-frame cleanup witness without redispatching the futex
+first. `futex_signal_during_owner_park_interrupts_then_starts_fresh_handler_wait` sends
 SIGUSR1 from the live sibling while the original waiter is still parked on
 owner service. After service ACK, the retained syscall must return errno 4
 without spending its deadline. The production return checkpoint delivers the

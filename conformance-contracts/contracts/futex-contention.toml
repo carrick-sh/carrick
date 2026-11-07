@@ -30,6 +30,7 @@ vm_free = [
   "carrick-el1-linux::aarch64_process_tests::futex_relative_deadline_survives_synchronous_owner_redispatch_with_two_live_threads",
   "carrick-el1-linux::aarch64_process_tests::futex_cancelled_owner_wait_releases_deadline_before_next_wait",
   "carrick-el1-linux::aarch64_process_tests::futex_caught_signal_releases_owner_deadline_before_handler_wait",
+  "carrick-el1-linux::aarch64_process_tests::futex_signal_during_owner_park_interrupts_then_starts_fresh_handler_wait",
   "carrick-el1-linux::aarch64_process_tests::futex_owner_deadline_is_discarded_before_an_unrelated_syscall",
   "carrick-el1-linux::aarch64_process_tests::futex_owner_deadline_is_discarded_before_an_unserved_futex",
   "carrick-runtime::vcpu_loop::binding::tests::serial_host_futex_deadline_survives_zone_word_recheck_owner_park",
