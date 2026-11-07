@@ -584,6 +584,10 @@ mod tests {
     fn sample_and_deterministic_sleep_wake_through_service() {
         let base = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let clock = Arc::new(ClockDomain::deterministic(base));
+        // This scenario advances time explicitly while another participant
+        // remains untimed. Without it, enrollment correctly auto-advances
+        // straight to the sleep deadline before serve_record returns.
+        let participant = clock.enroll_deterministic_waiter(None, || {}).unwrap();
         let wakes = Arc::new(CountWaker(AtomicUsize::new(0)));
         let waker: Arc<dyn ClockSleepWaker> = Arc::clone(&wakes) as _;
         let service = ClockResourceService::new(Arc::clone(&clock), waker);
@@ -640,6 +644,31 @@ mod tests {
                 remaining_nanos: 30_000_000,
             })
         );
+        drop(participant);
+        assert_eq!(clock.monotonic_now(), Duration::from_millis(20));
+
+        // A new lone timed participant auto-advances and wakes immediately.
+        // The cancelled 50 ms deadline must not influence that advancement.
+        encode_sleep_arm_request(
+            &mut buf,
+            LINUX_CLOCK_MONOTONIC,
+            ClockSleepFlags::new(false, false),
+            None,
+            0,
+            80_000_000,
+            channel,
+        );
+        service.serve_record(&mut buf).unwrap();
+        assert!(matches!(
+            parse_reply(&buf),
+            Ok(ClockReply::SleepArm(Ok(ClockSleepArmOutcome::Armed {
+                deadline_secs: 0,
+                deadline_nanos: 100_000_000,
+                ..
+            })))
+        ));
+        assert_eq!(clock.monotonic_now(), Duration::from_millis(100));
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
     }
 
     #[test]

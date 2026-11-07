@@ -43,6 +43,7 @@ surfaces = [
   { path = "crates/carrick-conformance-next/tests/fixtures/directory-copyout/src/main.rs", contract = "kernel.fs.directory-copyout" },
   { path = "crates/carrick-conformance-next/tests/fixtures/syscall_write_destinations.py", contract = "kernel.mm.syscall-code-write" },
   { path = "crates/carrick-conformance-next/tests/syscall_write_destinations.rs", contract = "kernel.mm.syscall-code-write" },
+  { path = "crates/carrick-core-abi/src/clock.rs", contract = "kernel.time.native-routing" },
   { path = "crates/carrick-core-abi/src/entry.rs", contract = "core.entry.completion" },
   { path = "crates/carrick-core-abi/src/executable_publication.rs", contract = "kernel.el1.fork-cow" },
   { path = "crates/carrick-core-abi/src/executable_publication.rs", contract = "kernel.el1.mm-exclusive-owner" },
