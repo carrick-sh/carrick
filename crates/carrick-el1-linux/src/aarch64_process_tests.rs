@@ -13908,3 +13908,179 @@ fn futex_owner_wait_episode(
     );
     registry().unregister_root_for_test(&runtime);
 }
+
+#[test]
+fn serial_host_native_fork_pid_excludes_live_host_thread_tids() {
+    native_fork_with_live_host_threads([42, 43]);
+}
+
+#[test]
+fn serial_host_native_fork_live_threads_identity_and_wait_control() {
+    // Qualify the child identity and reap assertions independently of the
+    // known allocator collision, without changing production allocation.
+    native_fork_with_live_host_threads([52, 53]);
+}
+
+#[cfg(test)]
+fn native_fork_with_live_host_threads(sibling_tids: [u32; 2]) {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    let mut live_tids = vec![41];
+    for tid in sibling_tids {
+        let control = host_born_sibling(fixture, tid);
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        frame.x[8] = 178;
+        arm_call(fixture, control, &mut service, &mut frame).unwrap();
+        assert_eq!(frame.x[0], u64::from(tid));
+        live_tids.push(tid);
+    }
+    run_as_leader(fixture);
+    let live_threads = carrick_el1_abi::Lifecycle::live(fixture.page);
+    assert_eq!(live_threads, 3);
+    let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
+    let pages: Vec<_> = (0..32).map(|n| 0x20000 + n * 0x1000).collect();
+    let mut crossing = TestStockCrossing::new(&pages);
+    crossing.metadata_in_el1_window = true;
+    let crossing = &*Box::leak(Box::new(crossing));
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        crossing,
+    )
+    .with_words(words);
+    let (outcome, runtime) = with_process_entry(
+        source,
+        &fixture.task,
+        &ThreadCtx::ZERO,
+        fixture_ttbr0(fixture),
+        fixture.page,
+        fixture.control,
+        &mut service,
+        |process| {
+            for &tid in &live_tids {
+                assert!(process.has_thread(tid));
+            }
+            let runtime = registry()
+                .for_entry(source, &fixture.task, fixture.address)
+                .unwrap();
+            let outcome = process.fork(ProcessForkChildTid::NONE);
+            let parent_record = fixture
+                .zone
+                .slot(fixture.slot)
+                .current()
+                .or_else(|| fixture.zone.slot(fixture.slot).host_record())
+                .unwrap();
+            assert!(
+                fixture
+                    .zone
+                    .requeue_preempted(fixture.slot, parent_record)
+                    .is_queued()
+            );
+            (outcome, runtime)
+        },
+    )
+    .unwrap();
+    let LifecycleOutcome::Returned { result, .. } = outcome else {
+        panic!("fork must return");
+    };
+    assert!(result.raw() > 0, "fork failed: {}", result.raw());
+    let child_pid = u32::try_from(result.raw()).unwrap();
+    assert!(
+        !live_tids.contains(&child_pid),
+        "child pid {child_pid} collides with live parent tid"
+    );
+
+    let parent = TaskKey {
+        id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
+        serial: TaskSerial::from_raw_u64(11).unwrap(),
+    };
+    let child = runtime.namespace_child_key(parent, child_pid).unwrap();
+    let child_binding = runtime.task_binding(child).unwrap();
+    let child_task = &*Box::leak(Box::new(CurrentTask::new()));
+    activate(source, child_task, &child_binding);
+    *crossing.zone.lock().unwrap() = Some(fixture.zone);
+    *crossing.child.lock().unwrap() = Some((
+        super::common_entry::execution_binding(child_task),
+        child_binding.address,
+    ));
+    let mut child_service = Aarch64NativeProcessService::with_crossing(
+        child_task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        crossing,
+    )
+    .with_words(words);
+    struct ChildLifecycle;
+    impl super::thread_setup::LifecycleVenue for ChildLifecycle {
+        fn thread<'a>(
+            &'a self,
+            task: &'a CurrentTask,
+        ) -> Option<carrick_personality_linux::thread::LifecycleThread<'a>> {
+            let (page, slot) = task.lifecycle_refs()?;
+            Some(carrick_personality_linux::thread::LifecycleThread { page, slot })
+        }
+        fn born_slot(
+            &self,
+            _: &ThreadLifecyclePage,
+            _: carrick_el1_abi::EntryRef,
+        ) -> Option<&ThreadControlSlot> {
+            None
+        }
+    }
+    let (_, child_control) = child_task.lifecycle_refs().unwrap();
+    let counters = carrick_el1_abi::Counters::new();
+    let cache = carrick_el1_abi::InotifyNameCache::new();
+    for nr in [172, 178] {
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        frame.x[8] = nr;
+        super::dispatch::dispatch_arm_syscall_with_native_process(
+            &mut frame, &counters, core::slice::from_ref(child_task), &[], &[], &[], &[],
+            &cache, None::<crate::dispatch::Zone<'_, crate::sched::FakeCpu, crate::sched::HardwareUserWord>>,
+            None, Some(&ChildLifecycle), child_task.lifecycle_refs().unwrap().0, child_control,
+            &ThreadCtx::ZERO, fixture.zone.spaces.grant(fixture.zone.spaces.find(child_binding.address.mm.raw().get()).unwrap(), child_binding.address.mm.raw().get()).unwrap().ttbr0,
+            &mut child_service, |_| core::ptr::null_mut(),
+        ).unwrap();
+        assert_eq!(frame.x[0], u64::from(child_pid), "child syscall {nr}");
+    }
+    let mut entry = runtime
+        .enter(source, child_task, child_binding.words, &mut child_service)
+        .unwrap();
+    assert!(matches!(
+        entry.exit_group(23),
+        LifecycleOutcome::Transferred { .. }
+    ));
+    drop(entry);
+    let parent_binding = runtime.task_binding(parent).unwrap();
+    activate(source, &fixture.task, &parent_binding);
+    let status = carrick_test_support::GuestUserBuffer::from_value(0i32);
+    let mut entry = runtime
+        .enter(source, &fixture.task, parent_binding.words, &mut service)
+        .unwrap();
+    let waited = entry.wait4(
+        ProcessWaitPid::from_syscall_argument(u64::from(child_pid)),
+        status.va(),
+        LinuxWaitOptions::WNOHANG,
+        UserVa::new(0),
+    );
+    assert!(
+        matches!(waited, LifecycleOutcome::Returned { result, .. } if result.raw() == i64::from(child_pid))
+    );
+    assert_eq!(status.get::<i32>(0), 23 << 8, "real child exit status");
+}
