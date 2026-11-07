@@ -1688,13 +1688,13 @@ fn pending_pipe_pair_publishes_after_copyout_and_forks_exact_endpoints() {
         },
         true,
     );
-    pair.prepare(&mut f.pipe_storage(), &EL1).unwrap();
+    pair.prepare(f.region, &mut f.pipe_storage(), &EL1).unwrap();
     let fds = pair.fds().unwrap();
     for fd in fds {
         assert_eq!(f.host().get(table, fd), Err(fd::Error::BadFd));
     }
-    pair.publish(&EL1).unwrap();
-    pair.finish(&EL1, |_| {}).unwrap();
+    pair.publish(f.region, &EL1).unwrap();
+    pair.finish(f.region, &EL1, |_| {}).unwrap();
     assert!(pair.is_settled());
     let child = f.host().fork(table, &mut f.descriptors(64)).unwrap();
     for fd in fds {
@@ -1733,7 +1733,7 @@ fn pending_pipe_pair_copy_fault_cancels_claims_without_closing_reused_numbers() 
     let f = fixture(4 * 1024 * 1024);
     let table = f.table();
     let mut pair = PendingPipePair::new(*f.region, table, 65536, StatusFlags::default(), false);
-    pair.prepare(&mut f.pipe_storage(), &EL1).unwrap();
+    pair.prepare(f.region, &mut f.pipe_storage(), &EL1).unwrap();
     let fds = pair.fds().unwrap();
     let child = f.host().fork(table, &mut f.descriptors(64)).unwrap();
     let unrelated = Description::new(
@@ -1744,10 +1744,10 @@ fn pending_pipe_pair_copy_fault_cancels_claims_without_closing_reused_numbers() 
     assert_eq!(f.host().open(child, Fd(0), unrelated, false), Ok(fds[0]));
     let authority = f.host();
     let lock = authority.transaction(table).unwrap();
-    assert!(pair.cancel(&BoundedSpin(0), |_| {}).is_err());
+    assert!(pair.cancel(f.region, &BoundedSpin(0), |_| {}).is_err());
     drop(lock);
     let mut freed = 0;
-    pair.cancel(&EL1, |release| {
+    pair.cancel(f.region, &EL1, |release| {
         if matches!(release, IpcReleased::Object { freed: true, .. }) {
             freed += 1;
         }
@@ -1764,17 +1764,17 @@ fn pending_pipe_pair_publication_busy_once_retains_both_endpoints() {
     let f = fixture(4 * 1024 * 1024);
     let table = f.table();
     let mut pair = PendingPipePair::new(*f.region, table, 65536, StatusFlags::default(), false);
-    pair.prepare(&mut f.pipe_storage(), &EL1).unwrap();
+    pair.prepare(f.region, &mut f.pipe_storage(), &EL1).unwrap();
     let fds = pair.fds().unwrap();
     let authority = f.host();
     let lock = authority.transaction(table).unwrap();
-    assert!(pair.publish(&BoundedSpin(0)).is_err());
+    assert!(pair.publish(f.region, &BoundedSpin(0)).is_err());
     drop(lock);
     assert_eq!(pair.fds(), Some(fds));
-    pair.publish(&EL1).unwrap();
-    pair.finish(&EL1, |_| {}).unwrap();
+    pair.publish(f.region, &EL1).unwrap();
+    pair.finish(f.region, &EL1, |_| {}).unwrap();
     assert!(pair.is_settled());
-    assert!(pair.cancel(&EL1, |_| {}).is_err());
+    assert!(pair.cancel(f.region, &EL1, |_| {}).is_err());
 }
 
 #[test]
@@ -1782,9 +1782,9 @@ fn pending_pipe_pair_finish_object_busy_keeps_release_custody() {
     let f = fixture(4 * 1024 * 1024);
     let table = f.table();
     let mut pair = PendingPipePair::new(*f.region, table, 65536, StatusFlags::default(), false);
-    pair.prepare(&mut f.pipe_storage(), &EL1).unwrap();
+    pair.prepare(f.region, &mut f.pipe_storage(), &EL1).unwrap();
     let fds = pair.fds().unwrap();
-    pair.publish(&EL1).unwrap();
+    pair.publish(f.region, &EL1).unwrap();
     let backing = f.host().get(table, fds[0]).unwrap().backing;
     let Some(IpcBacking::Pipe { object, .. }) = IpcBacking::decode(backing) else {
         panic!("pipe")
@@ -1793,7 +1793,7 @@ fn pending_pipe_pair_finish_object_busy_keeps_release_custody() {
         assert_eq!(f.host().close(table, fd), Ok(None));
     }
     let guard = f.region.lock(object, &EL1).unwrap();
-    assert!(pair.finish(&BoundedSpin(0), |_| {}).is_err());
+    assert!(pair.finish(f.region, &BoundedSpin(0), |_| {}).is_err());
     let unrelated = Description::new(
         IpcBacking::Host(HostResourceToken::new(8).unwrap()).encode(),
         AccessMode::ReadOnly,
@@ -1802,7 +1802,7 @@ fn pending_pipe_pair_finish_object_busy_keeps_release_custody() {
     assert_eq!(f.host().open(table, Fd(0), unrelated, false), Ok(fds[0]));
     drop(guard);
     let mut releases = 0;
-    pair.finish(&EL1, |_| releases += 1).unwrap();
+    pair.finish(f.region, &EL1, |_| releases += 1).unwrap();
     assert_eq!(releases, 2);
     assert!(pair.is_settled());
     assert_eq!(f.host().get(table, fds[0]), Ok(unrelated));
@@ -1824,12 +1824,12 @@ fn pending_pipe_pair_partial_ofd_preparation_cancels_both_object_references() {
     }
     let mut pair = PendingPipePair::new(*f.region, table, 65536, StatusFlags::default(), false);
     assert_eq!(
-        pair.prepare(&mut f.pipe_storage(), &EL1),
+        pair.prepare(f.region, &mut f.pipe_storage(), &EL1),
         Err(IpcError::Fd(fd::Error::NeedsOfds))
     );
     assert_eq!(pair.fds(), None);
     let mut releases = 0;
-    pair.cancel(&EL1, |_| releases += 1).unwrap();
+    pair.cancel(f.region, &EL1, |_| releases += 1).unwrap();
     assert_eq!(releases, 2);
     assert!(pair.is_settled());
     let reclaimed = authority.create_pinned(unrelated).unwrap();
@@ -1844,7 +1844,7 @@ fn pending_pipe_pair_retired_namespace_cannot_redirect_cancel_to_reused_table() 
     let f = fixture(4 * 1024 * 1024);
     let table = f.table();
     let mut pair = PendingPipePair::new(*f.region, table, 65536, StatusFlags::default(), false);
-    pair.prepare(&mut f.pipe_storage(), &EL1).unwrap();
+    pair.prepare(f.region, &mut f.pipe_storage(), &EL1).unwrap();
     let fds = pair.fds().unwrap();
     f.host()
         .destroy_table(table, |_| panic!("unpublished endpoints"))
@@ -1859,7 +1859,96 @@ fn pending_pipe_pair_retired_namespace_cannot_redirect_cancel_to_reused_table() 
         f.host().open(replacement, Fd(0), unrelated, false),
         Ok(fds[0])
     );
-    pair.cancel(&EL1, |_| {}).unwrap();
+    pair.cancel(f.region, &EL1, |_| {}).unwrap();
     assert!(pair.is_settled());
     assert_eq!(f.host().get(replacement, fds[0]), Ok(unrelated));
+}
+
+#[test]
+fn pending_pipe_pair_resume_uses_current_execution_holder() {
+    struct Observe<'a> {
+        region: &'a IpcRegion<'a>,
+        object: IpcObjectHandle,
+        holder: Cell<Option<IpcLockHolder>>,
+    }
+    impl LockWait for Observe<'_> {
+        fn wait(&self, _: u32) -> bool {
+            self.holder.set(self.region.lock_holder(self.object));
+            false
+        }
+    }
+    let f = fixture(4 * 1024 * 1024);
+    let table = f.table();
+    let first = f.region.for_el1_slot(1);
+    let resumed = f.region.for_el1_slot(2);
+    let mut pair = PendingPipePair::new(first, table, 65536, StatusFlags::default(), false);
+    pair.prepare(&first, &mut f.pipe_storage(), &EL1).unwrap();
+    let fds = pair.fds().unwrap();
+    pair.publish(&resumed, &EL1).unwrap();
+    let backing = f.host().get(table, fds[0]).unwrap().backing;
+    let Some(IpcBacking::Pipe { object, .. }) = IpcBacking::decode(backing) else {
+        panic!("pipe")
+    };
+    let epoll = f.region.create_epoll(&EL1).unwrap();
+    f.region
+        .epoll_add(
+            epoll,
+            object,
+            epoll::EpollMember::PipeReader,
+            fds[0].0,
+            1,
+            epoll::events::IN,
+            0,
+            &EL1,
+        )
+        .unwrap();
+    for fd in fds {
+        assert_eq!(f.host().close(table, fd), Ok(None));
+    }
+    let epoll_guard = f.region.lock(epoll, &EL1).unwrap();
+    let observe = Observe {
+        region: f.region,
+        object,
+        holder: Cell::new(None),
+    };
+    assert_eq!(
+        pair.finish(&resumed, &observe, |_| {}),
+        Err(IpcError::Contended)
+    );
+    assert_eq!(observe.holder.get(), Some(IpcLockHolder::El1 { slot: 2 }));
+    drop(epoll_guard);
+    pair.finish(&first, &EL1, |_| {}).unwrap();
+    assert!(pair.is_settled());
+}
+
+#[test]
+fn pending_pipe_pair_foreign_view_refuses_before_custody_changes() {
+    let f = fixture(4 * 1024 * 1024);
+    let foreign = fixture(4 * 1024 * 1024);
+    let table = f.table();
+    let mut pair = PendingPipePair::new(*f.region, table, 65536, StatusFlags::default(), false);
+    let mut storage = f.pipe_storage();
+    assert_eq!(
+        pair.prepare(foreign.region, &mut storage, &EL1),
+        Err(IpcError::BadRegion)
+    );
+    pair.prepare(f.region, &mut storage, &EL1).unwrap();
+    let fds = pair.fds().unwrap();
+    assert_eq!(
+        pair.cancel(foreign.region, &EL1, |_| {}),
+        Err(IpcError::BadRegion)
+    );
+    assert_eq!(pair.fds(), Some(fds));
+    assert_eq!(pair.publish(foreign.region, &EL1), Err(IpcError::BadRegion));
+    assert_eq!(pair.fds(), Some(fds));
+    pair.publish(f.region, &EL1).unwrap();
+    assert_eq!(
+        pair.finish(foreign.region, &EL1, |_| {}),
+        Err(IpcError::BadRegion)
+    );
+    pair.finish(f.region, &EL1, |_| {}).unwrap();
+    assert!(pair.is_settled());
+    for fd in fds {
+        assert!(f.host().get(table, fd).is_ok());
+    }
 }
