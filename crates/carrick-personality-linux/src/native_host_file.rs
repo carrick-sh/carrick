@@ -1023,11 +1023,15 @@ fn stage_ppoll(
         PollWait::MayWait
     } else {
         let mut spec = [0u8; 16];
-        if !user.copy_in(&mut spec, timeout).is_done() {
-            return Some(HostFileStage::Fault {
-                address: timeout,
-                access: Access::Read,
-            });
+        match user.copy_in(&mut spec, timeout) {
+            CopyOutcome::Done => {}
+            CopyOutcome::Fault => return Some(errno(carrick_syscall_abi::LINUX_EFAULT)),
+            CopyOutcome::NotYet(request) => {
+                return Some(HostFileStage::Fault {
+                    address: request.address.raw(),
+                    access: request.access,
+                });
+            }
         }
         let seconds = i64::from_le_bytes(spec[..8].try_into().unwrap_or([0; 8]));
         let nanoseconds = i64::from_le_bytes(spec[8..].try_into().unwrap_or([0; 8]));
@@ -1039,11 +1043,15 @@ fn stage_ppoll(
     };
     let len = nfds as usize * POLLFD_BYTES;
     let mut entries = vec![0u8; len];
-    if !user.copy_in(&mut entries, fds).is_done() {
-        return Some(HostFileStage::Fault {
-            address: fds,
-            access: Access::Read,
-        });
+    match user.copy_in(&mut entries, fds) {
+        CopyOutcome::Done => {}
+        CopyOutcome::Fault => return Some(errno(carrick_syscall_abi::LINUX_EFAULT)),
+        CopyOutcome::NotYet(request) => {
+            return Some(HostFileStage::Fault {
+                address: request.address.raw(),
+                access: request.access,
+            });
+        }
     }
     let mut host_backed = false;
     for entry in entries.chunks_exact(POLLFD_BYTES) {

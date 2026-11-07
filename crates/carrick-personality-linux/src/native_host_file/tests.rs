@@ -1047,10 +1047,10 @@ fn ppoll_input_preserves_fault_and_exact_owner_request() {
     }
     impl HostFileUser for RefusedInput {
         fn copy_in(&mut self, dst: &mut [u8], src: u64) -> CopyOutcome {
-            if src == self.address {
-                if let Some(outcome) = self.outcome.take() {
-                    return outcome;
-                }
+            if src == self.address
+                && let Some(outcome) = self.outcome.take()
+            {
+                return outcome;
             }
             self.memory.copy_in(dst, src)
         }
