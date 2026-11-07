@@ -3746,19 +3746,6 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
         self.read_bytes(address, length)
     }
 
-    /// Resume a retained core read after its exact owner released contention.
-    /// Most backends resume the owner continuation unchanged. A backend whose
-    /// coherent snapshot itself holds the owner's exclusion may consume that
-    /// now-stale refusal and read under the held snapshot authority instead.
-    fn resume_core_read(
-        &self,
-        continuation: carrick_guest_mem::OwnedReadContinuation,
-        _address: u64,
-        _length: usize,
-    ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
-        self.resume_read(continuation)
-    }
-
     /// Best-effort fault-time walk of the live stage-1 backing. The returned
     /// scalar is the exact TTBR root+ASID observed at the fault; descriptors are
     /// L0..L3 for `far`. Backends without host-editable guest page tables keep
