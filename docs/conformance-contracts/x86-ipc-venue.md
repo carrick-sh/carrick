@@ -1,5 +1,24 @@
 # x86 IPC venue (#1756): red witness and remaining implementation
 
+## Retained pipe creation
+
+`IpcRegion` now exposes `PendingPipePair`, which composes backed object
+creation with owned descriptor-pair admission. Preparation retains claims,
+unpublished endpoint references and any successfully prepared OFDs when a
+later stage refuses. Publication consumes both claims together, after the
+execution owner copies the numbers to userspace. Cancellation releases only
+claims and owned references; it never closes numeric descriptors. Final
+physical release remains owned across object-lock contention, including when
+another thread closes and reuses a published number before creation pins are
+released. Every call returns without holding a table or object lock.
+
+Six VM-free witnesses exercise this production API, including two live
+tables, partial OFD exhaustion, Busy once then success, and table retirement.
+The first four are compile-red before the API exists. This is shared
+creation custody, not x86 syscall wiring: the production x86 mapping, root
+namespace, execution adapter and pipe2 entry still need implementation.
+There is no external blocker and the real-KVM acceptance remains unmet.
+
 ## Owned descriptor-pair admission
 
 The shared fd core can now reserve both empty pipe descriptors in one table
