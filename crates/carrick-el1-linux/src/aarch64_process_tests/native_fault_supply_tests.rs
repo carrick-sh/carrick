@@ -5272,6 +5272,17 @@ fn unmanaged_thread_birth_reusing_freed_record_does_not_observe_stale_mm() {
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 fn native_owner_noreserve_code_range_writes_and_executes() {
+    native_owner_code_range(false);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn native_owner_whole_code_range_writes_and_executes() {
+    native_owner_code_range(true);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn native_owner_code_range(whole: bool) {
     use carrick_el1::memory::{AnonymousCall, AnonymousCallView, DelegatedAnonymous};
     use carrick_el1_abi::{Counters, InotifyNameCache, ReservationRange, TrapFrame};
     use carrick_mmu_core::aarch64::descriptor_txn::{
@@ -5423,7 +5434,12 @@ fn native_owner_noreserve_code_range_writes_and_executes() {
         frame.x[0]
     };
     assert_eq!(invoke(222, [START, LENGTH, 0, 0x4022, u64::MAX, 0]), START);
-    assert_eq!(invoke(226, [CODE, LENGTH - 8192, 7, 0, 0, 0]), 0);
+    let (protect_start, protect_len) = if whole {
+        (START, LENGTH)
+    } else {
+        (CODE, LENGTH - 8192)
+    };
+    assert_eq!(invoke(226, [protect_start, protect_len, 7, 0, 0, 0]), 0);
     let mm = ReservationMm::new(1).unwrap();
     let portal = super::super::aarch64_process::Portal::for_zone(
         NonZeroU64::MIN,
@@ -5443,7 +5459,7 @@ fn native_owner_noreserve_code_range_writes_and_executes() {
         rows.iter()
             .map(|row| row.protection.bits())
             .collect::<Vec<_>>(),
-        [0, 7, 0]
+        if whole { vec![7] } else { vec![0, 7, 0] }
     );
     assert_eq!(
         leaf(&words, fixture_ttbr0(fixture), CODE),
