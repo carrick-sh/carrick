@@ -1884,6 +1884,52 @@ impl MemView<'_> {
             Some((address, stale))
         };
         let reservation_prot = ReservationProtection::from_bits(prot & 7);
+        // A free hint beyond the arena still belongs to this MM's owner.
+        // Validate host-known apertures/VMAs before granting the explicit
+        // external placement authority; the root repeats its collision check.
+        if root_eligible
+            && !fixed
+            && congruence == MmapGrantCongruence::Any
+            && let Placement::Hint(hint) = placement
+            && let Some(range) = hint
+                .checked_add(length)
+                .and_then(|end| ReservationRange::new(hint, end))
+            && range.end() <= user_ceiling.exclusive_end()
+            && (mmap_address_uses_alias(hint, length, layout, user_ceiling)
+                || (hint >= layout.mmap_base.saturating_add(layout.mmap_size)
+                    && range.end() <= crate::elf::LINUX_PIE_DEFAULT_BASE))
+            && !guest_vma_overlaps_locked(mem, hint, length)
+            && mem
+                .semantic_vmas
+                .overlapping(hint, range.end())
+                .next()
+                .is_none()
+            && !super::overlaps_el0_clock_stub(hint, length)
+            && !ranges_overlap(
+                hint,
+                length,
+                crate::memory::LINUX_ROSETTA_VA_BASE,
+                crate::memory::LINUX_ROSETTA_VA_BASE
+                    .saturating_add(crate::memory::LINUX_ROSETTA_WINDOW_SIZE),
+            )
+            && let Some(protection) = reservation_prot
+        {
+            match self.propose(mem, &root, |model| {
+                model.prepare_external_anonymous(range, protection)
+            })? {
+                Ok(request) => {
+                    let holes = root
+                        .with_root(|model| super::fault::root_holes(model, request.range))
+                        .unwrap_or_else(|refusal| {
+                            broken_root("an external placement observation", refusal)
+                        });
+                    mem.retire_stale_first_touch(&holes);
+                    return Ok(grant(mem, request.range.start()));
+                }
+                Err(Refusal::Limit | Refusal::MetadataRequired) => return Ok(None),
+                Err(_) => {}
+            }
+        }
         if root_eligible
             && congruence == MmapGrantCongruence::Any
             && let Some(reservation_prot) = reservation_prot

@@ -1,12 +1,13 @@
 # Owner-admitted code reservations (#1791)
 
-The anonymous reservation and permission contracts require MAP_NORESERVE to
-preserve the admitted MM's ownership. Linux mmap(2) defines it as a swap
-reservation hint; it does not change anonymous mapping or mprotect semantics.
-The shared decoder previously forwarded that hint. V8 uses it for its
-PROT_NONE code range, whose later protection change must stay with the owner
-rather than entering legacy host sparse publication. The ownership guard and
-stage-1/stage-2/frame-inventory transaction are unchanged.
+The corrected signed classification is an outside-arena mmap hint, rather
+than RWX or MAP_NORESERVE by itself. Unhinted reservations already work.
+Linux mmap(2) requires a free usable hint to be honoured. A hinted reservation
+must retain its MM owner through later R, RW and RWX protection changes,
+without entering legacy host sparse publication. Untouched pages remain lazy.
+
+The earlier MAP_NORESERVE decoder coverage remains a useful control: Linux
+defines the flag as a swap reservation hint, without changing mapping ownership.
 
 `two_isa_noreserve_code_range_stays_owner_admitted` proves the shared decoder
 and owner transaction through both call views, with one backing probe per
@@ -26,17 +27,17 @@ permission enforcement, or prove the VMM supply transaction. The signed Mac
 must still run `node24 -e 'console.log(process.version)'` and print `v24…` on
 the exact head. The VM-free witnesses cannot close that ecosystem acceptance.
 
-## Corrected trigger: outside-arena hint
-
-The signed classification on #1791 supersedes the initial RWX/NORESERVE
-premise: unhinted reservations already work. A free outside-arena hint must
-be honoured, and its later R, RW or RWX protection must use the same owner
-proposal as an arena reservation. Linux mmap(2) supplies the semantic
-rule; the structural rule is zero backing allocation for untouched pages
-and no entry into legacy sparse publication while the MM is admitted.
-
 `delegated_outside_hint_keeps_owner_protection` drives production host
 mmap/mprotect dispatch with a 256 MiB reservation at `0x7000000000` and an
 unhinted control. It checks exact hint placement and owner publication for
 protections 1, 3 and 7. Its backing is a test venue; it does not prove actual
 guest stores, hardware permission enforcement or signed Node startup.
+
+The host validates a free hint against user bounds, semantic and boot VMAs,
+reserved apertures, the clock and Rosetta windows. Only then may it request
+an external anonymous proposal from the exact MM owner. A carried provenance
+bit distinguishes this placement from ordinary editable imports; generic
+proposals cannot mint it. Subsequent protection, decommit and retirement
+require complete coverage by owner-authorized nodes. Relocation into the
+allocation arena drops the external placement bit. The node record layout
+and the existing descriptor/backing completion transaction are unchanged.

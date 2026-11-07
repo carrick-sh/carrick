@@ -197,7 +197,10 @@ fn mremap_inner<M: ReservationPolicyAccess>(
         return Err(Refusal::ForeignMapping);
     }
     let prot = LinuxReservationPolicy::protection(&node);
-    let flags = LinuxReservationPolicy::flags(&node);
+    // A relocation into the allocation layout needs no external placement
+    // capability. It must not mint that provenance through a generic proposal.
+    let flags = LinuxReservationPolicy::flags(&node)
+        .difference(ReservationNodeFlags::PLACED_OUTSIDE_LAYOUT);
     let brk = LinuxReservationLayout::from(root.layout()).brk;
     let (operation, moved) = if keep_source {
         (ReservationOperation::Prepare, None)
