@@ -171,3 +171,19 @@ classification nor the stale implementation signature was a counted trait
 obligation. No ceiling is lowered for this checkpoint. Descriptor retention,
 gathered-input retention, delegation conversions and production retention
 witnesses remain required before issue acceptance.
+
+## Neutral staging input interface checkpoint
+
+`HostFileUser` now extends the neutral `UserCopy` interface instead of
+declaring its own `copy_in` method. All native staging inputs use `UserVa`
+at the transfer boundary. ARM forwards the shared interface directly to
+`ValidatedCopy`; the CPL0 mapping-only adapter refuses unsupported transfers
+with the same `CopyOutcome::Fault`. Test adapters also implement that interface.
+This is an interface consolidation with unchanged staging decisions and work;
+it adds no allocation, transfer, wait or host operation. The existing staging
+classification and real-fork output-admission bindings remain applicable.
+
+This checkpoint does not retain descriptor admission or gathered vectors,
+convert the separate delegation file interface, or supply the required
+production write/writev/read/readv retention witnesses. Guest-copy debt
+reduction and full issue acceptance remain open.

@@ -14,11 +14,12 @@ use crate::abi::entry::SyscallResult;
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
-use carrick_core::user_copy::CopyOutcome;
+use carrick_core::user_copy::{CopyOutcome, UserCopy};
 use carrick_core_abi::host_file::{
     self, HOST_FILE_CHUNK_BYTES, HostFileHeader, HostFileOp, record_len,
 };
 use carrick_guest_arch::Access;
+use carrick_guest_arch::UserVa;
 use carrick_syscall_abi::{CanonicalNr, LinuxErrno};
 
 /// Size of the aarch64 Linux `struct stat` (`asm-generic/stat.h`).
@@ -302,13 +303,11 @@ impl HostFileCall {
     }
 }
 
-/// User memory as the staging step needs it. Before a request with output
-/// crosses, its whole output range must already be writable, so the reply's
-/// copy-out cannot need a page the ring would have to supply mid-completion:
-/// staging asks for fault supply first and retries the exact call, and a
-/// refused supply is EFAULT, as Linux reports a bad buffer.
-pub trait HostFileUser {
-    fn copy_in(&mut self, dst: &mut [u8], src: u64) -> CopyOutcome;
+/// Native staging uses the neutral `UserCopy` interface for transfers; this
+/// extension describes output preparation. Staging requests owner backing
+/// before crossing when the destination is not currently writable. Completion
+/// retains the carrier's reply if output needs another owner-memory wait.
+pub trait HostFileUser: UserCopy {
     /// Contiguous bytes from `dst` that user mode can write now.
     fn writable(&mut self, dst: u64, len: usize) -> usize;
 }
@@ -399,7 +398,7 @@ fn copy_path(user: &mut dyn HostFileUser, address: u64) -> Path {
         let room = (PAGE_BYTES - cursor % PAGE_BYTES) as usize;
         let take = room.min(LINUX_PATH_MAX - bytes.len());
         let mut chunk = vec![0u8; take];
-        match user.copy_in(&mut chunk, cursor) {
+        match user.copy_in(&mut chunk, UserVa::new(cursor)) {
             CopyOutcome::Done => {}
             CopyOutcome::Fault => return Path::Stage(errno(carrick_syscall_abi::LINUX_EFAULT)),
             CopyOutcome::NotYet(request) => {
@@ -564,7 +563,7 @@ fn gather_vectors(
     }
     let mut vectors = vec![0u8; iovcnt as usize * IOVEC_BYTES];
     if !vectors.is_empty() {
-        match user.copy_in(&mut vectors, iov) {
+        match user.copy_in(&mut vectors, UserVa::new(iov)) {
             CopyOutcome::Done => {}
             CopyOutcome::Fault => return Err(errno(carrick_syscall_abi::LINUX_EFAULT)),
             CopyOutcome::NotYet(request) => {
@@ -596,7 +595,7 @@ fn gather_vectors(
         let take = (len as usize).min(room);
         let start = input.len();
         input.resize(start + take, 0);
-        match user.copy_in(&mut input[start..], base) {
+        match user.copy_in(&mut input[start..], UserVa::new(base)) {
             CopyOutcome::Done => {}
             CopyOutcome::Fault => return Err(errno(carrick_syscall_abi::LINUX_EFAULT)),
             CopyOutcome::NotYet(request) => {
@@ -647,7 +646,7 @@ fn stage_call(
             return staging.write(fd, user, |user| {
                 let mut input = vec![0u8; chunk(count)];
                 if !input.is_empty() {
-                    match user.copy_in(&mut input, buf) {
+                    match user.copy_in(&mut input, UserVa::new(buf)) {
                         CopyOutcome::Done => {}
                         CopyOutcome::Fault => return Err(errno(carrick_syscall_abi::LINUX_EFAULT)),
                         CopyOutcome::NotYet(request) => {
@@ -1023,7 +1022,7 @@ fn stage_ppoll(
         PollWait::MayWait
     } else {
         let mut spec = [0u8; 16];
-        match user.copy_in(&mut spec, timeout) {
+        match user.copy_in(&mut spec, UserVa::new(timeout)) {
             CopyOutcome::Done => {}
             CopyOutcome::Fault => return Some(errno(carrick_syscall_abi::LINUX_EFAULT)),
             CopyOutcome::NotYet(request) => {
@@ -1043,7 +1042,7 @@ fn stage_ppoll(
     };
     let len = nfds as usize * POLLFD_BYTES;
     let mut entries = vec![0u8; len];
-    match user.copy_in(&mut entries, fds) {
+    match user.copy_in(&mut entries, UserVa::new(fds)) {
         CopyOutcome::Done => {}
         CopyOutcome::Fault => return Some(errno(carrick_syscall_abi::LINUX_EFAULT)),
         CopyOutcome::NotYet(request) => {

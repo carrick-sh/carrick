@@ -50,10 +50,23 @@ impl<'a> X86AnonymousVenue<'a> {
 // MapPrivate stages no user bytes. Keep all validation and descriptor policy in
 // the shared host-file staging owner, rather than a second mmap decoder.
 struct MappingUser;
-impl carrick_personality_linux::native_host_file::HostFileUser for MappingUser {
-    fn copy_in(&mut self, _: &mut [u8], _: u64) -> carrick_core::user_copy::CopyOutcome {
+impl carrick_core::user_copy::UserCopy for MappingUser {
+    fn copy_in(
+        &mut self,
+        _: &mut [u8],
+        _: carrick_guest_arch::UserVa,
+    ) -> carrick_core::user_copy::CopyOutcome {
         carrick_core::user_copy::CopyOutcome::Fault
     }
+    fn copy_out(
+        &mut self,
+        _: carrick_guest_arch::UserVa,
+        _: &[u8],
+    ) -> carrick_core::user_copy::CopyOutcome {
+        carrick_core::user_copy::CopyOutcome::Fault
+    }
+}
+impl carrick_personality_linux::native_host_file::HostFileUser for MappingUser {
     fn writable(&mut self, _: u64, _: usize) -> usize {
         0
     }
