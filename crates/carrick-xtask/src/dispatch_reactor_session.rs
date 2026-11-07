@@ -2644,4 +2644,121 @@ mod tests {
         );
         assert!(err && text.contains("unattended round limit"), "{text}");
     }
+
+    #[test]
+    fn replay_1825_mcp_request_round_canonicalizes_reviewer_tier_and_diff_scope() {
+        use crate::dispatch_worker::worker_tier::{WorkerTier, decide};
+        let fx: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/dispatch-1825-outcomes.json"
+        ))
+        .unwrap();
+        let impl_done = &fx["pr_1781_impl_done"];
+        let fix_done = &fx["pr_1781_fix_done"];
+        let h1 = impl_done["head"].as_str().unwrap();
+        let h2 = fix_done["head"].as_str().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        // 1. Subagent passes wrong `Worker tier: strong` after a strong-tier author Done ->
+        //    MCP request_round rewrites to `Worker tier: standard`.
+        let mut fake = remote();
+        let mut p1781 = pr(1781, "work/dispatch-1780-42300000001");
+        p1781["user"] = json!({"login":"carrick-workers[bot]","type":"Bot"});
+        p1781["head"]["sha"] = json!(h1);
+        fake.prs.insert(1781, p1781.clone());
+        fake.closing = vec![1780];
+        fake.comments = vec![json!({
+            "id": 7001,
+            "html_url": impl_done["url"],
+            "user": {"login": "carrick-workers[bot]", "type": "Bot"},
+            "created_at": "2026-10-30T23:50:00Z",
+            "body": impl_done["body"],
+        })];
+        let (err, text) = call(
+            &mut fake,
+            &dir.path().join("canon1.json"),
+            "request_round",
+            json!({
+                "pr": 1781,
+                "brief": "Independent review of PR #1781 (review only, push nothing).\nWorker tier: strong\nFocus on #1780 acceptance."
+            }),
+        );
+        assert!(!err, "{text}");
+        let posted1 = &fake.posted[0].1;
+        assert_eq!(
+            decide("", "", posted1, &[]).tier,
+            WorkerTier::Standard,
+            "MCP request_round must canonicalize opposite reviewer tier:\n{posted1}"
+        );
+
+        // 2. When raw capacity shows opposite tier exhausted, MCP request_round falls back to
+        //    author tier with a non-author backend (`copilot`), and scopes diff to h1..h2
+        //    since the last independent review while ignoring author self-reviews.
+        let mut fallback_remote = remote();
+        let mut p1781_h2 = p1781;
+        p1781_h2["head"]["sha"] = json!(h2);
+        fallback_remote.prs.insert(1781, p1781_h2);
+        fallback_remote.closing = vec![1780];
+        fallback_remote.capacity = Some(json!({
+            "backends": {
+                "agy": {
+                    "installed": true,
+                    "free_slots": 2,
+                    "quota_free": 0.0,
+                    "score": 0.0,
+                    "quota": {"groups": {"gemini": {"quota_free": 0.0}, "claude": {"quota_free": 0.0}}}
+                },
+                "codex": {"installed": true, "free_slots": 2, "quota_free": 0.7, "score": 0.7},
+                "copilot": {"installed": true, "free_slots": 2, "quota_free": 0.9, "score": 0.9}
+            }
+        }));
+        fallback_remote.reviews = vec![
+            json!({
+                "id": 9002,
+                "html_url": "https://github.com/carrick-sh/carrick/pull/1781#pullrequestreview-9002",
+                "state": "CHANGES_REQUESTED",
+                "commit_id": h1,
+                "body": "Verdict: CHANGES REQUESTED\nP1: fix boundary.",
+                "user": {"login": "tjfontaine", "type": "User"}
+            }),
+            json!({
+                "id": 9003,
+                "html_url": "https://github.com/carrick-sh/carrick/pull/1781#pullrequestreview-9003",
+                "state": "COMMENTED",
+                "commit_id": h2,
+                "body": "## Worker review\n\nThis is the worker's own review; it is not an independent review.",
+                "user": {"login": "carrick-workers[bot]", "type": "Bot"}
+            }),
+        ];
+        fallback_remote.comments = vec![json!({
+            "id": 7006,
+            "html_url": fix_done["url"],
+            "user": {"login": "carrick-workers[bot]", "type": "Bot"},
+            "created_at": "2026-10-31T00:16:00Z",
+            "body": fix_done["body"],
+        })];
+        let (err, text) = call(
+            &mut fallback_remote,
+            &dir.path().join("canon2.json"),
+            "request_round",
+            json!({
+                "pr": 1781,
+                "brief": "Independent review of PR #1781 (review only, push nothing)."
+            }),
+        );
+        assert!(!err, "{text}");
+        let posted2 = &fallback_remote.posted[0].1;
+        assert_eq!(
+            decide("", "", posted2, &[]).tier,
+            WorkerTier::Strong,
+            "exhausted opposite tier must fall back to author tier:\n{posted2}"
+        );
+        assert!(
+            posted2.contains("copilot"),
+            "fallback must prefer non-author backend:\n{posted2}"
+        );
+        assert!(
+            posted2.contains(&format!("{}..{}", &h1[..12], &h2[..12])),
+            "MCP request_round must inject incremental review range {h1}..{h2}:\n{posted2}"
+        );
+    }
 }

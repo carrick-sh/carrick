@@ -360,6 +360,12 @@ Claude Code session that keeps one subagent per PR. It has two parts:
   Its read tools are `read_pr`, `read_thread`, `read_diff`, `read_ci`,
   `read_outcomes` and `read_issue`. Its only act tools are `reply` and
   `request_round`, and both go through the same `enforce` gates as `run`.
+  When continuing a `Done` implementation outcome with a review brief,
+  `request_round` enforces the ecosystem signed-scoreboard wait, canonicalizes
+  `Worker tier:` to the opposite tier (or a non-author fallback backend when
+  live capacity shows the opposite tier exhausted), scopes the diff since the
+  last published independent review, and refuses a second review after an
+  approved `Done` review round.
   The server records round heads and times in its own state file and
   re-checks for a later owner comment live before allowing another round on
   the same head. `reply` needs a trusted PR (the owner's or the publish

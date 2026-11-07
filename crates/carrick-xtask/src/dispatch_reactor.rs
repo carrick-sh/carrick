@@ -3208,4 +3208,237 @@ mod tests {
         cycle(&mut fake, &mut inert, &mut state, NOW + 120, EPOCH, false).unwrap();
         assert_eq!(fake.posted.len(), 1);
     }
+
+    #[test]
+    fn replay_1825_verdict_parsing_raw_capacity_and_recorded_1740_outcome() {
+        use crate::dispatch_worker::worker_tier::WorkerTier;
+        let fx = fixture_1825();
+        let impl_done = &fx["pr_1781_impl_done"];
+        let rev_done = &fx["pr_1781_review_approved"];
+        let head = rev_done["head"].as_str().unwrap();
+
+        // 1. "Verdict: APPROVE ... no changes requested." must NOT trigger a false-positive fix round.
+        let approve_no_cr = rev_done["body"].as_str().unwrap().replace(
+            "APPROVED\\n\\nVerified #1780 acceptance criteria",
+            "Verdict: APPROVE\\n\\nAll checks pass; no changes requested.",
+        );
+        let rec_ok = json!({
+            "id": 7401,
+            "url": "https://github.com/carrick-sh/carrick/pull/1781#issuecomment-7401",
+            "body": approve_no_cr,
+        });
+        let mut ok_gh = FakeGh {
+            prs: vec![dispatch_pr(1781, 1780, 42300000001, head)],
+            facts: vec![json!({
+                "number": 1781,
+                "comments": {"nodes": [
+                    {"databaseId": 7001, "url": impl_done["url"], "body": impl_done["body"], "author": {"login": "carrick-workers[bot]", "__typename": "Bot"}},
+                    {"databaseId": 7401, "url": rec_ok["url"], "body": rec_ok["body"], "author": {"login": "carrick-workers[bot]", "__typename": "Bot"}}
+                ]}
+            })],
+            comments: vec![outcome_event(1781, &rec_ok, "2026-10-30T23:59:00Z")],
+            closing: vec![1780],
+            ..FakeGh::default()
+        };
+        let mut state = State::default();
+        cycle(
+            &mut ok_gh,
+            &mut agent(Act::Ignore, ""),
+            &mut state,
+            NOW,
+            EPOCH,
+            false,
+        )
+        .unwrap();
+        assert!(
+            ok_gh.posted.is_empty(),
+            "Verdict: APPROVE with 'no changes requested.' must not start a fix round: {:?}",
+            ok_gh.posted
+        );
+
+        // Linked PR review with Verdict: CHANGES_REQUESTED starts a fix round.
+        let neutral_summary = rev_done["body"].as_str().unwrap().replace(
+            "APPROVED\\n\\nVerified #1780 acceptance criteria",
+            "Completed review; see linked PR review.",
+        );
+        let rec_cr = json!({
+            "id": 7402,
+            "url": "https://github.com/carrick-sh/carrick/pull/1781#issuecomment-7402",
+            "body": neutral_summary,
+        });
+        let mut cr_gh = FakeGh {
+            prs: vec![dispatch_pr(1781, 1780, 42300000001, head)],
+            facts: vec![json!({
+                "number": 1781,
+                "reviews": {"nodes": [{
+                    "databaseId": 9001,
+                    "url": "https://github.com/carrick-sh/carrick/pull/1781#pullrequestreview-9001",
+                    "state": "COMMENTED",
+                    "commit": {"oid": head},
+                    "body": "## Worker review\n\nVerdict: CHANGES_REQUESTED\n\nP1: missing boundary validation.",
+                    "author": {"login": "carrick-workers[bot]", "__typename": "Bot"}
+                }]},
+                "comments": {"nodes": [
+                    {"databaseId": 7402, "url": rec_cr["url"], "body": rec_cr["body"], "author": {"login": "carrick-workers[bot]", "__typename": "Bot"}}
+                ]}
+            })],
+            comments: vec![outcome_event(1781, &rec_cr, "2026-10-30T23:59:00Z")],
+            closing: vec![1780],
+            ..FakeGh::default()
+        };
+        cycle(
+            &mut cr_gh,
+            &mut agent(Act::Ignore, ""),
+            &mut State::default(),
+            NOW,
+            EPOCH,
+            false,
+        )
+        .unwrap();
+        assert_eq!(cr_gh.posted.len(), 1);
+
+        // 2. Raw `agy_worker.py capacity --json` (no `models` array) selects opposite tier or
+        //    falls back to a non-author backend on the same tier when opposite-tier group quota is 0.
+        let raw_cap_ok = json!({
+            "backends": {
+                "codex": {"installed": true, "free_slots": 4, "quota_free": 0.7, "score": 0.7},
+                "agy": {
+                    "installed": true,
+                    "free_slots": 4,
+                    "quota_free": 0.85,
+                    "score": 0.85,
+                    "quota": {"groups": {"gemini": {"quota_free": 0.85}, "claude": {"quota_free": 0.1}}},
+                    "group_scores": {"gemini": 0.85, "claude": 0.1}
+                },
+                "copilot": {"installed": true, "free_slots": 2, "quota_free": 0.5, "score": 0.5}
+            }
+        });
+        assert_eq!(
+            select_reviewer_tier(WorkerTier::Strong, &["codex".into()], Some(&raw_cap_ok)),
+            (WorkerTier::Standard, None)
+        );
+        let raw_cap_gemini_exhausted = json!({
+            "backends": {
+                "codex": {"installed": true, "free_slots": 4, "quota_free": 0.7, "score": 0.7},
+                "agy": {
+                    "installed": true,
+                    "free_slots": 4,
+                    "quota_free": 0.8,
+                    "score": 0.8,
+                    "quota": {"groups": {"gemini": {"quota_free": 0.0}, "claude": {"quota_free": 0.8}}},
+                    "group_scores": {"gemini": 0.0, "claude": 0.8}
+                },
+                "copilot": {"installed": true, "free_slots": 2, "quota_free": 0.4, "score": 0.4}
+            }
+        });
+        assert_eq!(
+            select_reviewer_tier(
+                WorkerTier::Strong,
+                &["codex".into()],
+                Some(&raw_cap_gemini_exhausted)
+            ),
+            (WorkerTier::Strong, Some("agy".into()))
+        );
+        assert_eq!(
+            select_reviewer_tier(
+                WorkerTier::Standard,
+                &["agy".into()],
+                Some(&raw_cap_gemini_exhausted)
+            ),
+            (WorkerTier::Strong, None)
+        );
+
+        // 3. 0-commit Done implementation round after an earlier reactor round on the same head
+        //    still starts its one independent review round.
+        let mut same_head_state = State::default();
+        same_head_state.prs.insert(
+            1781,
+            Memory {
+                rounds: 1,
+                unattended_rounds: 1,
+                last_round_head: Some(head.to_owned()),
+                last_round_at: Some("2026-10-30T23:40:00Z".into()),
+                last_continued_outcome: Some(
+                    "https://github.com/carrick-sh/carrick/pull/1781#issuecomment-6999".into(),
+                ),
+                ..Memory::default()
+            },
+        );
+        let mut same_head_gh = FakeGh {
+            prs: vec![dispatch_pr(1781, 1780, 42300000001, head)],
+            facts: vec![json!({
+                "number": 1781,
+                "comments": {"nodes": [
+                    {"databaseId": 7001, "url": impl_done["url"], "body": impl_done["body"], "author": {"login": "carrick-workers[bot]", "__typename": "Bot"}}
+                ]}
+            })],
+            comments: vec![outcome_event(1781, impl_done, "2026-10-30T23:59:00Z")],
+            closing: vec![1780],
+            ..FakeGh::default()
+        };
+        cycle(
+            &mut same_head_gh,
+            &mut agent(Act::Ignore, ""),
+            &mut same_head_state,
+            NOW,
+            EPOCH,
+            false,
+        )
+        .unwrap();
+        assert_eq!(same_head_gh.posted.len(), 1);
+        assert_eq!(same_head_state.prs[&1781].unattended_rounds, 2);
+
+        // 4. Recorded multi-worker PR #1740 (#1506) outcome from dispatch-1763-outcomes.json
+        //    adapted to Done waits on signed scoreboard, then starts a standard-tier review.
+        let recorded_1763: Vec<Value> = serde_json::from_str(include_str!(
+            "../tests/fixtures/dispatch-1763-outcomes.json"
+        ))
+        .unwrap();
+        let rec_1740 = recorded_1763
+            .iter()
+            .find(|e| e["source"].as_str().unwrap().contains("/pull/1740#"))
+            .unwrap();
+        let rec_1740_done = json!({
+            "id": 6688992437_u64,
+            "url": rec_1740["source"],
+            "body": rec_1740["body"]
+                .as_str()
+                .unwrap()
+                .replacen("Dispatch outcome: Blocked", "Dispatch outcome: Done", 1)
+                .replacen("\"status\": \"blocked\"", "\"status\": \"done\"", 1),
+        });
+        let head_1740 = "537d60de93ec5bdc39bb0f168ab784111be6af8e";
+        let mut gh_1740 = FakeGh {
+            prs: vec![dispatch_pr(1740, 1506, 42205586763, head_1740)],
+            facts: vec![json!({
+                "number": 1740,
+                "comments": {"nodes": [{
+                    "databaseId": 6688992437_u64,
+                    "url": rec_1740_done["url"],
+                    "body": rec_1740_done["body"],
+                    "author": {"login": "carrick-workers[bot]", "__typename": "Bot"}
+                }]}
+            })],
+            comments: vec![outcome_event(1740, &rec_1740_done, "2026-10-30T23:59:00Z")],
+            closing: vec![1506],
+            ..FakeGh::default()
+        };
+        let mut st_1740 = State::default();
+        cycle(
+            &mut gh_1740,
+            &mut agent(Act::Ignore, ""),
+            &mut st_1740,
+            NOW,
+            EPOCH,
+            false,
+        )
+        .unwrap();
+        assert!(gh_1740.posted.is_empty());
+        assert!(
+            st_1740.prs[&1740]
+                .waiting_on
+                .as_deref()
+                .is_some_and(|w| w.contains("signed scoreboard") && w.contains("#1506"))
+        );
+    }
 }
