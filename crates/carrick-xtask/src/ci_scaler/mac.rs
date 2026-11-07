@@ -1220,15 +1220,15 @@ fn wait_child_deadline(
     use std::os::fd::AsRawFd;
     let pid = libc::pid_t::try_from(child.id())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let pidfd = match carrick_portable::process_exit_fd(
-        carrick_portable::HostProcessId::from_native(pid)?,
-    ) {
-        Ok(fd) => fd,
-        Err(err) if err.raw_os_error() == Some(libc::ESRCH) => {
-            return child.try_wait();
-        }
-        Err(err) => return Err(err),
-    };
+    let pidfd =
+        match carrick_portable::process_exit_fd(carrick_portable::HostProcessId::from_native(pid)?)
+        {
+            Ok(fd) => fd,
+            Err(err) if err.raw_os_error() == Some(libc::ESRCH) => {
+                return child.try_wait();
+            }
+            Err(err) => return Err(err),
+        };
 
     let mut pfd = libc::pollfd {
         fd: pidfd.as_raw_fd(),
@@ -1246,7 +1246,9 @@ fn wait_child_deadline(
         // SAFETY: pfd points to a valid pollfd with the open pidfd.
         let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
         if ret > 0 {
-            return child.try_wait();
+            if let Some(status) = child.try_wait()? {
+                return Ok(Some(status));
+            }
         } else if ret == 0 {
             return Ok(None);
         } else {
