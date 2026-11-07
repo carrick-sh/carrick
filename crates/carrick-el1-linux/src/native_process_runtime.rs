@@ -3239,6 +3239,22 @@ impl<'a, M, C: ProcessContext> NativeResources<'a, M, C> {
 }
 impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
     #[cfg(test)]
+    pub(super) fn identity_number_reserved(&self, id: TaskId) -> bool {
+        self.graph
+            .lock()
+            .namespace
+            .lock()
+            .is_reserved_number(id.raw())
+    }
+
+    /// Force cursor wrap without creating or releasing any identity. Tests
+    /// still allocate through the production fork entry point.
+    #[cfg(test)]
+    pub(super) fn set_next_identity_for_test(&self, id: TaskId) {
+        self.graph.lock().namespace.lock().set_next(id.raw());
+    }
+
+    #[cfg(test)]
     pub(super) fn install_closing_race_hook(&self, hook: Box<dyn FnOnce() + Send>) {
         *self.closing_race_hook.lock() = Some(hook);
     }
