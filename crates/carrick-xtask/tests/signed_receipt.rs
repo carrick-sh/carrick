@@ -593,14 +593,29 @@ else:
     .to_string();
     let dequeued_base = queue_with_entries(&second, &dequeued_entry);
     let dequeued_was_refused = !dequeued_base.status.success();
+    let foreign_branch_entry = serde_json::json!([{
+        "baseCommit": {"oid": d},
+        "headCommit": {"oid": d},
+        "pullRequest": {
+            "number": 123,
+            "baseRefName": "release",
+            "baseRepository": {"nameWithOwner": "carrick-sh/carrick"}
+        }
+    }])
+    .to_string();
+    let foreign_branch = queue_with_entries(&second, &foreign_branch_entry);
+    let foreign_branch_was_refused = !foreign_branch.status.success();
     let mut forged_ref = second.clone();
     forged_ref["merge_group"]["head_ref"] =
         json!("refs/heads/gh-readonly-queue/main/pr-999-forged");
     let forged = queue(&forged_ref);
     let forged_was_refused = !forged.status.success();
     assert!(
-        stale_was_refused && dequeued_was_refused && forged_was_refused,
-        "refusal witnesses: stale={stale_was_refused}, dequeued={dequeued_was_refused}, forged={forged_was_refused}"
+        stale_was_refused
+            && dequeued_was_refused
+            && foreign_branch_was_refused
+            && forged_was_refused,
+        "refusal witnesses: stale={stale_was_refused}, dequeued={dequeued_was_refused}, foreign_branch={foreign_branch_was_refused}, forged={forged_was_refused}"
     );
     for (field, bad) in [
         ("base_ref", "refs/heads/other"),
