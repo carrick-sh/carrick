@@ -10163,7 +10163,7 @@ fn serial_host_native_child_committed_close_never_replays_reused_fd() {
     native_fork_descriptor_mutations(true);
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(test, not(target_os = "macos")))]
 fn native_fork_descriptor_mutations(check_cleanup_reuse: bool) {
     use carrick_abi::{
         LINUX_F_DUPFD, LINUX_F_DUPFD_CLOEXEC, LINUX_F_GETFD, LINUX_F_GETFL, LINUX_F_SETFD,
