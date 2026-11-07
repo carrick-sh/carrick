@@ -32,6 +32,16 @@ same numeric root/ASID and publication generation. Coverage must remain
 local to both the slot and MM identity. This is a scheduler lifecycle witness,
 not proof of hardware ASID-retirement completion.
 
+`scheduler_invalidates_cow_after_vcpu_slot_rebinding` and
+`scheduler_invalidates_reused_asid_with_matching_publication_number` extend
+that ledger witness through `Sched::run_ready`. The production installer
+must call the CPU invalidator, install the target root and acknowledge only
+the entering slot's exact MM. The CPU is modeled: these tests do not establish
+hardware ASID retirement or synchronous sibling completion.
+Restoring the pre-reset behavior (omitting the two coverage-clearing stores)
+makes the rebinding test fail at the CPU call assertion: no invalidation is
+issued, instead of the required single invalidation of the reused ASID.
+
 A successful `reset_slot` clears local coverage together with the timer
 cache because a new mailbox lease can name a different vCPU. The reset
 witness was red (`None` instead of `Some(1)` owed) before clearing these

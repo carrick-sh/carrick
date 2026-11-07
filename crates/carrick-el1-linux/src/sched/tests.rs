@@ -1954,6 +1954,80 @@ fn an_owed_cow_invalidation_runs_before_the_install() {
     );
 }
 
+// Exercise the scheduler installer, rather than acknowledging its ledger from
+// the test. FakeCpu records architectural calls; this does not model HVF TLBs
+// or establish synchronous completion on a sibling still executing EL0.
+fn scheduler_cow_entry_after_reuse(retire_mm: bool) {
+    let zone = zone();
+    publish_space(&zone, MM, TTBR_MM);
+    let old = publish_space(&zone, OTHER_MM, TTBR_OTHER);
+    let publication = zone.spaces.note_cow(old);
+    let sibling = SlotId::new(SLOT.raw() + 1);
+    for slot in [SLOT, sibling] {
+        zone.cover_cow(slot, OTHER_MM, publication);
+    }
+    let target = if retire_mm {
+        zone.spaces.close(old);
+        zone.spaces.free(old);
+        let replacement = publish_space(&zone, OTHER_MM + 1, TTBR_OTHER);
+        assert_eq!(zone.spaces.note_cow(replacement), publication);
+        OTHER_MM + 1
+    } else {
+        assert!(zone.reset_slot(SLOT));
+        OTHER_MM
+    };
+    host_publish(&zone, SLOT, MM, None, 0);
+    zone.enter_guest(SLOT);
+    let word = AtomicU32::new(0);
+    let addr = word.as_ptr() as u64;
+    let next = queue_foreign(&zone, 202, target, addr, thread_ctx(0xB, addr));
+    let task = task_for(101);
+    let (mut frame, mut cpu) = live(0xA, addr, FUTEX_WAIT_PRIVATE, 0);
+    cpu.ttbr = (TTBR_MM, TTBR_MM);
+    assert_eq!(
+        (Sched {
+            handoff: None,
+            zone: &zone,
+            slot: SLOT,
+            task: &task,
+            cpu: &mut cpu,
+            user: &HardwareUserWord,
+            counters: counters(),
+        })
+        .run_ready(&mut frame),
+        SWITCHED
+    );
+    assert_eq!(zone.slot(SLOT).current(), Some(next));
+    assert_eq!(cpu.asid_invalidations, [TTBR_OTHER]);
+    assert_eq!(cpu.translations.last(), Some(&(TTBR_OTHER, TTBR_OTHER)));
+    assert_eq!(zone.installed_space(SLOT), target);
+    assert_eq!(
+        zone.kept_space_authority(SLOT, target),
+        carrick_sched_core::KeptAuthority::Open(carrick_sched_core::KeptGrant {
+            root: TTBR_OTHER,
+            invalidation_owed: false,
+        })
+    );
+    assert_eq!(
+        zone.kept_space_authority(sibling, target),
+        carrick_sched_core::KeptAuthority::Open(carrick_sched_core::KeptGrant {
+            root: TTBR_OTHER,
+            invalidation_owed: retire_mm,
+        }),
+        "the scheduler acknowledges only the entering slot and exact MM"
+    );
+}
+
+#[test]
+fn scheduler_invalidates_cow_after_vcpu_slot_rebinding() {
+    scheduler_cow_entry_after_reuse(false);
+}
+
+#[test]
+fn scheduler_invalidates_reused_asid_with_matching_publication_number() {
+    scheduler_cow_entry_after_reuse(true);
+}
+
 /// A vCPU that parks in WFI holds no address space: it switches to the
 /// maintenance root and empties its occupancy slot, so no pause of the
 /// process it ran kicks it; the wake reinstalls the space.
