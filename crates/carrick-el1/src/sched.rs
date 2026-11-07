@@ -209,7 +209,8 @@ pub enum CpuExitCause {
 }
 
 impl CpuExitCause {
-    const fn saved_syscall_pc(self) -> carrick_sched_core::SavedSyscallPc {
+    /// Position recorded with a context saved for this exit cause.
+    pub const fn saved_syscall_pc(self) -> carrick_sched_core::SavedSyscallPc {
         match self {
             Self::Svc => carrick_sched_core::SavedSyscallPc::AfterSyscall,
             Self::Interrupted => carrick_sched_core::SavedSyscallPc::AtSyscall,
