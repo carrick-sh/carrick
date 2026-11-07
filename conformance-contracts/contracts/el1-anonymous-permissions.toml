@@ -36,6 +36,7 @@ vm_free = [
   "carrick-el1::memory::tests::native_memory_call_uses_projected_task_and_actual_editor_slot",
   "carrick-x86-cpl0::anonymous_refusal_tests::both_linux_decoders_project_the_same_anonymous_call",
   "carrick-el1::memory::tests::invalid_arm_slot_refuses_mprotect_before_editing",
+  "carrick-el1::memory::tests::admitted_mprotect_publishes_through_pause_then_next_edit_succeeds",
 ]
 embed = [
   "carrick-embed::el1_sched::el1_anonymous_permission_transitions_stay_in_guest",

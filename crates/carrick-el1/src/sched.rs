@@ -150,6 +150,14 @@ pub trait ThreadCpu {
     fn live_ttbr0(&self) -> Option<u64>;
     /// Invalidate, on every PE, the stage-1 translations of the ASID in
     /// `ttbr0` (`TLBI ASIDE1IS`), complete before the call returns.
+    ///
+    /// This is a completion requirement, not a receipt inferred from issuing
+    /// the instruction. A virtual CPU backend must establish that it covers
+    /// running siblings and concurrent guest entries. Per-slot generation
+    /// coverage only establishes the next-entry obligation; it cannot supply
+    /// that proof for a sibling which remains in user execution. The ARM/HVF
+    /// completion proof remains open in issue #1736; callers must not treat
+    /// the generation ledger as acknowledgment from those siblings.
     fn invalidate_asid(&mut self, ttbr0: u64);
     /// The virtual counter (`CNTVCT_EL0`).
     fn now(&self) -> u64;
@@ -724,7 +732,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         };
         if let Some(published) = grant.cow_owed {
             self.cpu.invalidate_asid(grant.ttbr0);
-            zone.spaces.cover_cow(grant.index, published);
+            zone.cover_cow(slot, mm, published);
             zone.counters
                 .el1_cow_invalidations
                 .fetch_add(1, Ordering::Relaxed);
@@ -1250,7 +1258,7 @@ fn idle_exit_without_slot() -> ! {
 #[inline(never)]
 fn keeps_installed_root(zone: &ZoneTables, slot: SlotId, mm: u64, live: Option<u64>) -> bool {
     const TTBR_BADDR: u64 = 0x0000_ffff_ffff_fffe;
-    let published = zone.spaces.kept_authority(mm);
+    let published = zone.kept_space_authority(slot, mm);
     let authority = match published {
         carrick_sched_core::KeptAuthority::Open(grant) => {
             carrick_sched_core::KeptAuthority::Open(carrick_sched_core::KeptGrant {

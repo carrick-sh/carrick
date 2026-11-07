@@ -2254,6 +2254,122 @@ fn a_closed_space_is_never_installed_again() {
     assert_eq!(zone.installed_space(SLOT), 0);
 }
 
+#[test]
+fn each_vcpu_covers_a_foreign_cow_publication_for_itself() {
+    let zone = zone();
+    zone.spaces.set_idle_ttbr(0x4000_0000);
+    let index = zone.spaces.publish_closed(MM, 0x7000, 0x7000).unwrap();
+    zone.spaces.open(index);
+    zone.spaces.note_cow(index);
+
+    let first = zone.install_space(SLOT, MM).unwrap();
+    let published = first.cow_owed.expect("first vCPU owes the publication");
+    zone.cover_cow(SLOT, MM, published);
+    assert_eq!(zone.install_space(SLOT, MM).unwrap().cow_owed, None);
+
+    let other = SlotId::new(SLOT.raw() + 1);
+    let second = zone.install_space(other, MM).unwrap();
+    assert_eq!(
+        second.cow_owed,
+        Some(published),
+        "one vCPU's local invalidation cannot cover another vCPU"
+    );
+
+    zone.cover_cow(other, MM, published);
+    let next = zone.spaces.note_cow(index);
+    assert_eq!(zone.install_space(SLOT, MM).unwrap().cow_owed, Some(next));
+    assert_eq!(zone.install_space(other, MM).unwrap().cow_owed, Some(next));
+    zone.cover_cow(SLOT, MM, next);
+    assert_eq!(zone.install_space(SLOT, MM).unwrap().cow_owed, None);
+    assert_eq!(
+        zone.install_space(other, MM).unwrap().cow_owed,
+        Some(next),
+        "coverage of the previous publication cannot acknowledge a new edit",
+    );
+}
+
+#[test]
+fn slot_cow_coverage_survives_rebinding_and_rejects_retired_asid_identity() {
+    let zone = zone();
+    let root = (9_u64 << 48) | 0x7000;
+    let first = zone.spaces.publish_closed(MM, root, root).unwrap();
+    zone.spaces.open(first);
+    let publication = zone.spaces.note_cow(first);
+    assert_eq!(
+        zone.install_space(SLOT, MM).unwrap().cow_owed,
+        Some(publication)
+    );
+    zone.cover_cow(SLOT, MM, publication);
+    assert_eq!(zone.install_space(SLOT, MM).unwrap().cow_owed, None);
+    zone.release_space(SLOT);
+    assert!(zone.reset_slot(SLOT));
+    zone.publish_slot(SLOT, MM, Some(1), u64::MAX);
+    assert_eq!(
+        zone.install_space(SLOT, MM).unwrap().cow_owed,
+        Some(publication),
+        "a replacement vCPU must not inherit the old vCPU's completion",
+    );
+    zone.cover_cow(SLOT, MM, publication);
+
+    let sibling = SlotId::new(SLOT.raw() + 1);
+    assert_eq!(
+        zone.install_space(sibling, MM).unwrap().cow_owed,
+        Some(publication)
+    );
+    zone.cover_cow(sibling, MM, publication);
+    zone.release_space(sibling);
+
+    let peer_mm = MM + 1;
+    let peer = zone
+        .spaces
+        .publish_closed(peer_mm, root + 0x1000, root + 0x1000)
+        .unwrap();
+    zone.spaces.open(peer);
+    let peer_publication = zone.spaces.note_cow(peer);
+    zone.release_space(SLOT);
+    assert_eq!(
+        zone.install_space(SLOT, peer_mm).unwrap().cow_owed,
+        Some(peer_publication)
+    );
+    zone.cover_cow(SLOT, peer_mm, peer_publication);
+    zone.release_space(SLOT);
+    assert_eq!(
+        zone.install_space(SLOT, MM).unwrap().cow_owed,
+        Some(publication)
+    );
+    zone.cover_cow(SLOT, MM, publication);
+    zone.release_space(SLOT);
+
+    zone.spaces.close(first);
+    zone.spaces.free(first);
+    let replacement_mm = MM + 2;
+    let replacement = zone
+        .spaces
+        .publish_closed(replacement_mm, root, root)
+        .unwrap();
+    zone.spaces.open(replacement);
+    let replacement_publication = zone.spaces.note_cow(replacement);
+    assert_eq!(
+        replacement_publication, publication,
+        "generation numbers may repeat across MMs"
+    );
+    assert_eq!(
+        zone.install_space(SLOT, replacement_mm).unwrap().cow_owed,
+        Some(replacement_publication)
+    );
+    zone.cover_cow(SLOT, replacement_mm, replacement_publication);
+    assert_eq!(
+        zone.install_space(SLOT, replacement_mm).unwrap().cow_owed,
+        None
+    );
+    assert_eq!(
+        zone.install_space(sibling, replacement_mm)
+            .unwrap()
+            .cow_owed,
+        Some(replacement_publication)
+    );
+}
+
 /// A synthetic EL1 save area for a thread EL1 parked (a private futex wait,
 /// exactly as `park` above does it), with a distinctive, fully populated
 /// [`ThreadCtx`] so a reader must round-trip every field, not just prove

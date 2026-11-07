@@ -1287,6 +1287,12 @@ pub struct ZoneSlot {
     /// Exact released execution, independent of reusable records. The slot's
     /// execution owner publishes it; the host authenticates at a CPU stop.
     terminal: [AtomicU64; 4],
+    /// Address space whose TLB-publication generation this vCPU covered.
+    cow_mm: AtomicU64,
+    /// Latest descriptor publication covered by this vCPU's local TLB
+    /// invalidation. Coverage is per vCPU: HVF need not broadcast a guest
+    /// `TLBI ASIDE1IS` to another virtual PE.
+    cow_covered: AtomicU64,
 }
 
 /// The bit of [`ZoneSlot`]'s drive word set while its driver waits on the
@@ -3659,17 +3665,49 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         if !self.occupancy.replace(here, from, to) {
             return None;
         }
-        let Some(grant) = self.spaces.grant(index, to) else {
+        let Some(mut grant) = self.spaces.grant(index, to) else {
             self.occupancy.replace(here, to, 0);
             self.counters
                 .el1_space_refusals
                 .fetch_add(1, Ordering::Relaxed);
             return None;
         };
+        grant.cow_owed = self.slot_cow_owed(slot, to, grant.cow_published);
         self.counters
             .el1_space_switches
             .fetch_add(1, Ordering::Relaxed);
         Some(grant)
+    }
+
+    fn slot_cow_owed(&self, slot: SlotId, mm: u64, published: u64) -> Option<u64> {
+        let state = self.slot(slot);
+        let covered_mm = state.cow_mm.load(Ordering::Acquire);
+        let covered = state.cow_covered.load(Ordering::Acquire);
+        (published != 0 && (covered_mm != mm || covered != published)).then_some(published)
+    }
+
+    /// Authority for this vCPU to retain its installed root. A descriptor
+    /// publication is covered only by this slot's completed invalidation.
+    pub fn kept_space_authority(&self, slot: SlotId, key: u64) -> KeptAuthority {
+        let Some(index) = self.spaces.find(key) else {
+            return KeptAuthority::Unpublished;
+        };
+        match self.spaces.grant(index, key) {
+            Some(grant) => KeptAuthority::Open(KeptGrant {
+                root: grant.ttbr0,
+                invalidation_owed: self.slot_cow_owed(slot, key, grant.cow_published).is_some(),
+            }),
+            None => KeptAuthority::Refused,
+        }
+    }
+
+    /// Record that `slot` completed a local invalidation covering the named
+    /// descriptor publication. This never confers coverage on another vCPU.
+    pub fn cover_cow(&self, slot: SlotId, mm: u64, published: u64) {
+        let state = self.slot(slot);
+        state.cow_covered.store(0, Ordering::Release);
+        state.cow_mm.store(mm, Ordering::Release);
+        state.cow_covered.store(published, Ordering::Release);
     }
 
     /// The host, with `slot`'s vCPU out of the guest after the in-ring owner
@@ -4530,6 +4568,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         // The slot may name another vCPU now (a new mailbox lease): what EL1
         // armed on the old one says nothing about this one's timer.
         s.timer_cval.store(0, Ordering::Relaxed);
+        // Local TLB completion belongs to that vCPU incarnation too. The
+        // replacement must consume the MM publication before retaining it.
+        s.cow_covered.store(0, Ordering::Release);
+        s.cow_mm.store(0, Ordering::Release);
+
         // The loaded thread starts a fresh slice (EL1 restarts it at its next
         // look): a slice left over from what the slot ran before would
         // preempt it at the first tick, and a slot whose threads all need
@@ -5674,9 +5717,11 @@ mod layout_manifest {
 
     #[test]
     fn affinity_alias_preserves_slot_layout() {
-        assert_eq!((size_of::<ZoneSlot>(), align_of::<ZoneSlot>()), (128, 64));
+        assert_eq!((size_of::<ZoneSlot>(), align_of::<ZoneSlot>()), (192, 64));
         field!(ZoneSlot, affinity_source, AtomicU64, 40, 8, 8);
         field!(ZoneSlot, affinity, AtomicU64, 64, 8, 8);
+        field!(ZoneSlot, cow_mm, AtomicU64, 128, 8, 8);
+        field!(ZoneSlot, cow_covered, AtomicU64, 136, 8, 8);
     }
 
     #[test]

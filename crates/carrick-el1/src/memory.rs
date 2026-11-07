@@ -1043,7 +1043,7 @@ pub fn serve_delegated_anonymous<
     ) else {
         return refuse(pending, &mut model, Leave::NoGrant);
     };
-    let Some(_editor_guard) = spaces.try_begin_edit(index, mm_key, owner) else {
+    let Some(editor_guard) = spaces.try_begin_edit(index, mm_key, owner) else {
         return refuse(pending, &mut model, Leave::EditorBusy);
     };
     editor.bind_operation(request.sequence);
@@ -1130,7 +1130,10 @@ pub fn serve_delegated_anonymous<
                 carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
                 edit,
             ) {
-                Ok(()) => None,
+                Ok(()) => {
+                    editor_guard.note_tlb_edit();
+                    None
+                }
                 Err(GuestPermissionEditError::RollbackFailed) => {
                     panic!("EL1 anonymous permission rollback failed")
                 }
@@ -1154,7 +1157,10 @@ pub fn serve_delegated_anonymous<
                 carrick_guest_arch::UserVa::new(start),
                 carrick_guest_arch::GuestLen::new(run_len),
             ) {
-                Ok(()) => Some(slot),
+                Ok(()) => {
+                    editor_guard.note_tlb_edit();
+                    Some(slot)
+                }
                 Err(GuestRetirementError::RollbackFailed) => {
                     panic!("EL1 anonymous retirement rollback failed")
                 }
@@ -1272,7 +1278,7 @@ pub fn try_serve_munmap<E: AnonymousRetirementEditor>(
     else {
         return MunmapDisposition::Forward;
     };
-    let Some(_guard) = spaces.try_begin_edit(index, mm_key, owner) else {
+    let Some(guard) = spaces.try_begin_edit(index, mm_key, owner) else {
         return MunmapDisposition::Forward;
     };
     let Some(generation) = AnonymousEditGeneration::resident() else {
@@ -1285,7 +1291,10 @@ pub fn try_serve_munmap<E: AnonymousRetirementEditor>(
         carrick_guest_arch::UserVa::new(address),
         carrick_guest_arch::GuestLen::new(len),
     ) {
-        Ok(()) => MunmapDisposition::Retired,
+        Ok(()) => {
+            guard.note_tlb_edit();
+            MunmapDisposition::Retired
+        }
         Err(GuestRetirementError::BadRange) => MunmapDisposition::Return(-EINVAL),
         Err(
             GuestRetirementError::TableOutsidePrimary
@@ -1367,13 +1376,17 @@ pub fn try_serve_mprotect<E: AnonymousPermissionEditor>(
         edit,
     ) {
         Ok(()) if journal_room => {
+            guard.note_tlb_edit();
             // The host applies this, in order, before it next reads the
             // MM's VMA rows; no exit now.
             let recorded = guard.journal_protect(address, address + len, (prot & 7) as u8);
             debug_assert!(recorded.is_ok());
             MprotectDisposition::Return(0)
         }
-        Ok(()) => MprotectDisposition::ReturnWithWork,
+        Ok(()) => {
+            guard.note_tlb_edit();
+            MprotectDisposition::ReturnWithWork
+        }
         Err(GuestPermissionEditError::BadRange) => MprotectDisposition::Return(-EINVAL),
         Err(GuestPermissionEditError::PermissionWidening) => MprotectDisposition::Forward,
         Err(
@@ -1459,6 +1472,49 @@ mod tests {
             self.calls.push((ttbr0, edit));
             self.result.map_or(Ok(()), Err)
         }
+    }
+
+    #[test]
+    fn admitted_mprotect_publishes_through_pause_then_next_edit_succeeds() {
+        struct PausingEditor<'a>(&'a AddressSpaces);
+        impl AnonymousPermissionEditor for PausingEditor<'_> {
+            fn protect_and_invalidate(
+                &mut self,
+                _: carrick_guest_arch::AddressSpaceRegister,
+                _: GuestPermissionEdit,
+            ) -> Result<(), GuestPermissionEditError> {
+                let index = self.0.find(17).unwrap();
+                assert!(self.0.active_editor(index).is_some());
+                self.0.raise(index);
+                assert!(self.0.grant(index, 17).is_none());
+                Ok(())
+            }
+        }
+        let (frame, tasks, spaces, _) = fixture(PROT_READ);
+        let index = spaces.find(17).unwrap();
+        let before = spaces.grant(index, 17).unwrap().cow_published;
+        assert_eq!(
+            try_serve_mprotect(
+                &frame,
+                &tasks,
+                SpaceAccess::source_free(&spaces),
+                &mut PausingEditor(&spaces)
+            ),
+            MprotectDisposition::Return(0),
+        );
+        assert!(spaces.active_editor(index).is_none());
+        spaces.lower(index);
+        assert_eq!(spaces.grant(index, 17).unwrap().cow_published, before + 1);
+        assert_eq!(
+            try_serve_mprotect(
+                &frame,
+                &tasks,
+                SpaceAccess::source_free(&spaces),
+                &mut RecordingEditor::default()
+            ),
+            MprotectDisposition::Return(0),
+        );
+        assert_eq!(spaces.grant(index, 17).unwrap().cow_published, before + 2);
     }
 
     fn fixture(prot: u64) -> (TrapFrame, [CurrentTask; 1], AddressSpaces, u64) {
