@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+  "config": {
+    "mediaType": "application/vnd.oci.image.config.v1+json",
+    "digest": "sha256:37662cc6e5410e27e5e3b3c92b7fd7c3afd7f69faa430623a1f822f3f59c6ccd",
+    "size": 6525
+  },
+  "layers": [
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:a6dd1c05fbba4f9028078a11f143cbb625d2408921eb8207bfa1dd1ad301276f",
+      "size": 49412508
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:e8a88afca2bd37d4058d4b33d9d4d29b0557f8b811bb8c106942b5b51e1e4aad",
+      "size": 25634385
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:411d2dc8717dbb4bb0d3cfa27e6e0275fca455c5220029d7a14dc7a75fbe8665",
+      "size": 67818699
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:696c1fe91c64662be9b13aa92628d62d6685ab94c0b55d185258a8f762133deb",
+      "size": 237233076
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:5ac0faf5954b65dead8505b22e45fab58d546b801db37d7b94fc6eeb4f453a87",
+      "size": 6085541
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:4ed680595f4b68f3c08c2ca8a5bc07d4df1b9034aca038855dfa730147309c80",
+      "size": 25747000
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:685e2037ccfc56ac319cf8aa33027e54511544cd48a588992514e9a76e2d38ae",
+      "size": 249
+    }
+  ],
+  "annotations": {
+    "com.docker.official-images.bashbrew.arch": "amd64",
+    "org.opencontainers.image.base.digest": "sha256:0bcdd861dae13860b1e82e6d5357521e2e618fbd589590d8b2ce316dbacc6712",
+    "org.opencontainers.image.base.name": "buildpack-deps:trixie",
+    "org.opencontainers.image.created": "2026-11-05T09:32:59Z",
+    "org.opencontainers.image.revision": "3d7e95597e56a415d9e4abc0f15877e005d2cb2e",
+    "org.opencontainers.image.source": "https://github.com/docker-library/python.git#3d7e95597e56a415d9e4abc0f15877e005d2cb2e:3.12/trixie",
+    "org.opencontainers.image.url": "https://hub.docker.com/_/python",
+    "org.opencontainers.image.version": "3.12.16-trixie"
+  }
+}

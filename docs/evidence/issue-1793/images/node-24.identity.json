@@ -1,0 +1,56 @@
+{
+  "image": "docker.io/library/node:24",
+  "digest": "sha256:6b9d4ea31e614e29f364bf75758458731eb1e105b80c99667438dd6b3fe262e0",
+  "image_dir": "/var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/images/docker.io/library/node/24",
+  "config_size": 6672,
+  "layers": [
+    {
+      "digest": "sha256:69245854ad5855991d16224f6abf55855d2d73922785206adea9c5c5988434a0",
+      "media_type": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "size": 48526483,
+      "path": "/var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/blobs/sha256/69245854ad5855991d16224f6abf55855d2d73922785206adea9c5c5988434a0"
+    },
+    {
+      "digest": "sha256:338554e9113fa6731ba588cb8f45e85b3e3fe7ada531ee7d7b0bc9291d616727",
+      "media_type": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "size": 23873217,
+      "path": "/var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/blobs/sha256/338554e9113fa6731ba588cb8f45e85b3e3fe7ada531ee7d7b0bc9291d616727"
+    },
+    {
+      "digest": "sha256:d6c30932f8d3f5798b438cce12cdf6cebb1717b52f51e22ff010b4d86667031d",
+      "media_type": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "size": 64432621,
+      "path": "/var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/blobs/sha256/d6c30932f8d3f5798b438cce12cdf6cebb1717b52f51e22ff010b4d86667031d"
+    },
+    {
+      "digest": "sha256:9bab93d346cda15207e5a5000093cee7256ec1092fb689ec3d2997faf31b9a16",
+      "media_type": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "size": 211826577,
+      "path": "/var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/blobs/sha256/9bab93d346cda15207e5a5000093cee7256ec1092fb689ec3d2997faf31b9a16"
+    },
+    {
+      "digest": "sha256:66af1f3ea224b644c1e64447cac7c86834633b8be6ac96959f89b69952db439d",
+      "media_type": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "size": 3321,
+      "path": "/var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/blobs/sha256/66af1f3ea224b644c1e64447cac7c86834633b8be6ac96959f89b69952db439d"
+    },
+    {
+      "digest": "sha256:bfd79c304261634f93e0a8df64bcbe6d67d42cc6432e5a10257b030b0511e29b",
+      "media_type": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "size": 60045881,
+      "path": "/var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/blobs/sha256/bfd79c304261634f93e0a8df64bcbe6d67d42cc6432e5a10257b030b0511e29b"
+    },
+    {
+      "digest": "sha256:4e104358ef94579f79c13b3bea5fe5df586b87dda8bb2b3b536b61f779bdfc8e",
+      "media_type": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "size": 1250672,
+      "path": "/var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/blobs/sha256/4e104358ef94579f79c13b3bea5fe5df586b87dda8bb2b3b536b61f779bdfc8e"
+    },
+    {
+      "digest": "sha256:e6beba97d8df7c36608a93960892c003cf726d475dfb97ae89ab5bd4453993f6",
+      "media_type": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "size": 451,
+      "path": "/var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/blobs/sha256/e6beba97d8df7c36608a93960892c003cf726d475dfb97ae89ab5bd4453993f6"
+    }
+  ]
+}

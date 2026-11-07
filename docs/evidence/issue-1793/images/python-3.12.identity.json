@@ -1,0 +1,50 @@
+{
+  "image": "docker.io/library/python:3.12",
+  "digest": "sha256:97dc788c1887c44354e700c624e7d0a7b61c6f5baf6e2ae4d767abfedc442435",
+  "image_dir": "/var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/images/docker.io/library/python/3.12",
+  "config_size": 6525,
+  "layers": [
+    {
+      "digest": "sha256:a6dd1c05fbba4f9028078a11f143cbb625d2408921eb8207bfa1dd1ad301276f",
+      "media_type": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "size": 49412508,
+      "path": "/var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/blobs/sha256/a6dd1c05fbba4f9028078a11f143cbb625d2408921eb8207bfa1dd1ad301276f"
+    },
+    {
+      "digest": "sha256:e8a88afca2bd37d4058d4b33d9d4d29b0557f8b811bb8c106942b5b51e1e4aad",
+      "media_type": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "size": 25634385,
+      "path": "/var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/blobs/sha256/e8a88afca2bd37d4058d4b33d9d4d29b0557f8b811bb8c106942b5b51e1e4aad"
+    },
+    {
+      "digest": "sha256:411d2dc8717dbb4bb0d3cfa27e6e0275fca455c5220029d7a14dc7a75fbe8665",
+      "media_type": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "size": 67818699,
+      "path": "/var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/blobs/sha256/411d2dc8717dbb4bb0d3cfa27e6e0275fca455c5220029d7a14dc7a75fbe8665"
+    },
+    {
+      "digest": "sha256:696c1fe91c64662be9b13aa92628d62d6685ab94c0b55d185258a8f762133deb",
+      "media_type": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "size": 237233076,
+      "path": "/var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/blobs/sha256/696c1fe91c64662be9b13aa92628d62d6685ab94c0b55d185258a8f762133deb"
+    },
+    {
+      "digest": "sha256:5ac0faf5954b65dead8505b22e45fab58d546b801db37d7b94fc6eeb4f453a87",
+      "media_type": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "size": 6085541,
+      "path": "/var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/blobs/sha256/5ac0faf5954b65dead8505b22e45fab58d546b801db37d7b94fc6eeb4f453a87"
+    },
+    {
+      "digest": "sha256:4ed680595f4b68f3c08c2ca8a5bc07d4df1b9034aca038855dfa730147309c80",
+      "media_type": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "size": 25747000,
+      "path": "/var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/blobs/sha256/4ed680595f4b68f3c08c2ca8a5bc07d4df1b9034aca038855dfa730147309c80"
+    },
+    {
+      "digest": "sha256:685e2037ccfc56ac319cf8aa33027e54511544cd48a588992514e9a76e2d38ae",
+      "media_type": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "size": 249,
+      "path": "/var/tmp/carrick-dispatch-mbVrAA/agent/home/.carrick/blobs/sha256/685e2037ccfc56ac319cf8aa33027e54511544cd48a588992514e9a76e2d38ae"
+    }
+  ]
+}
