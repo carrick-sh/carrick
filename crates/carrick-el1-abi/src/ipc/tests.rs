@@ -1952,3 +1952,27 @@ fn pending_pipe_pair_foreign_view_refuses_before_custody_changes() {
         assert!(f.host().get(table, fd).is_ok());
     }
 }
+
+#[test]
+fn pending_pipe_pair_publication_uses_current_descriptor_ceiling() {
+    struct Deny;
+    impl crate::DescriptorCeiling for Deny {
+        fn cover(&self, _: u32) -> bool {
+            false
+        }
+    }
+    let f = fixture(4 * 1024 * 1024);
+    let table = f.table();
+    let mut pair = PendingPipePair::new(*f.region, table, 65536, StatusFlags::default(), false);
+    pair.prepare(f.region, &mut f.pipe_storage(), &EL1).unwrap();
+    let fds = pair.fds().unwrap();
+    let denied = f.region.with_ceiling(&Deny);
+    assert_eq!(
+        pair.publish(&denied, &EL1),
+        Err(IpcError::Fd(fd::Error::BadBacking))
+    );
+    assert_eq!(pair.fds(), Some(fds));
+    pair.publish(f.region, &EL1).unwrap();
+    pair.finish(f.region, &EL1, |_| {}).unwrap();
+    assert!(pair.is_settled());
+}
