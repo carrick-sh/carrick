@@ -36,6 +36,7 @@ vm_free = [
   "carrick-runtime::vcpu_loop::binding::tests::serial_host_futex_deadline_survives_zone_word_recheck_owner_park",
   "carrick-runtime::vcpu_loop::binding::tests::serial_host_futex_owner_cancellation_releases_deadline_before_owner_readiness",
   "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_fork_exec_child_futex_retains_owner_refusal",
+  "carrick-el1-linux::aarch64_process_tests::native_exec_pipe_tests::serial_host_native_fork_exec_child_realtime_bitset_futex_retains_owner_refusal",
   "carrick-el1::substrate::file::atomic_copy_tests",
   "carrick-kernel::dispatch::overlay_dispatch_tests::futex_wait_preserves_owner_memory_refusal_before_comparison",
   "carrick-kernel::dispatch::overlay_dispatch_tests::threaded_futex_relative_deadline_survives_owner_redispatch",
