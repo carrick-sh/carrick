@@ -1549,6 +1549,61 @@ mod tests {
     }
 
     #[test]
+    fn core_read_uses_capture_exclusion_without_reentering_its_gate() {
+        use carrick_el1_abi::PortalWaitCause;
+        use carrick_el1_linux::mm_portal::{
+            MmPortal,
+            test_support::{ROOT, Region, admit_notified, nodes},
+        };
+        let region = Region::new();
+        let zone = region.zone();
+        let mm = admit_notified(&region, 1733, ROOT, 1, 0);
+        let view = nodes(&region);
+        let portal = MmPortal::new(
+            std::num::NonZeroU64::new(1733).unwrap(),
+            region.table(),
+            &zone.spaces,
+            &view,
+        )
+        .with_zone(zone)
+        .unwrap();
+        let handle = portal.admitted_handle(mm, 0).unwrap();
+        let index = zone.spaces.find(mm.raw()).unwrap();
+        let excluded = zone.spaces.raise_and_wait_for_editor(index, || {});
+        let wait = portal
+            .observe_wait(handle, PortalWaitCause::Gate)
+            .unwrap()
+            .unwrap();
+        let address = 0x2000;
+        let engine = CrashCaptureTestEngine {
+            guest_memory: [(address, vec![0x5a; 4096])].into(),
+            copyout_owner_probe: Some(super::super::tests::CopyoutOwnerProbe {
+                wait,
+                zone: zone as *const _ as usize,
+            }),
+            ..CrashCaptureTestEngine::default()
+        };
+        assert!(matches!(
+            carrick_guest_mem::GuestMemory::read_bytes_raw(&engine, address, 4096),
+            Err(carrick_guest_mem::MemoryError::ReadSuspended(_))
+        ));
+        // The core read must complete without lowering the very gate that
+        // authenticates its stable memory snapshot.
+        assert_eq!(
+            engine.read_core_bytes(address, 4096).unwrap(),
+            vec![0x5a; 4096]
+        );
+        assert!(
+            portal
+                .observe_wait(handle, PortalWaitCause::Gate)
+                .unwrap()
+                .is_some()
+        );
+        drop(excluded);
+        zone.spaces.lower(index);
+    }
+
+    #[test]
     fn capture_core_gate_busy_once_then_reads_after_owner_release() {
         use carrick_el1_abi::PortalWaitCause;
         use carrick_el1_linux::mm_portal::{
