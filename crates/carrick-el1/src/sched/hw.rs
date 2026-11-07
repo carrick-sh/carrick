@@ -224,6 +224,10 @@ pub struct HardwareCpu;
 impl ThreadCpu for HardwareCpu {
     fn save(&mut self, frame: &TrapFrame, ctx: &mut Aarch64ParkedContext) {
         aarch64_context::save(frame, &mut ctx.native);
+        ctx.replace_saved_pc(
+            ctx.native.pc,
+            carrick_sched_core::SavedSyscallPc::AfterSyscall,
+        );
     }
     fn load(&mut self, frame: &mut TrapFrame, ctx: &Aarch64ParkedContext) {
         aarch64_context::load(frame, &ctx.native);

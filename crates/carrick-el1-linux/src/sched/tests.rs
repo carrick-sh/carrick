@@ -2353,6 +2353,32 @@ fn concurrent_timer_park_and_guard_refusal_preserve_record_ownership() {
     let resume = OperationResumePc::new(0x8000).unwrap();
     let op = OperationToken::new(101, 1).unwrap();
 
+    // A host-loaded lane already has a saved context. Force the observed
+    // generation stale after the park has replaced that context, then prove
+    // failed publication restores the whole prior value, including its PC
+    // position. A later adapter refusal must therefore still rewind once.
+    let record = zone.current_or_new(SLOT, identity(101)).unwrap();
+    let mut prior = Aarch64ParkedContext::from_register(thread_ctx(0xa, 0x4000), TTBR_MM, MM, 1);
+    prior.replace_saved_pc(0x7004, carrick_sched_core::SavedSyscallPc::AfterSyscall);
+    // SAFETY: this unpublished host-home record belongs to the fixture lane.
+    unsafe { *zone.record(record).ctx_mut() = prior };
+    let (report, effects) = sched.notify_object(key).unwrap();
+    assert_eq!(report.queued, 0);
+    sched.finish_object_wake(effects);
+    let changed = sched.park_object(
+        &frame,
+        key,
+        snapshot,
+        resume,
+        OperationToken::new(101, 3).unwrap(),
+        None,
+    );
+    assert!(matches!(
+        changed,
+        Err((carrick_sched_core::object_wait::ObjectWaitError::Changed, _))
+    ));
+    assert_eq!(unsafe { *zone.record(record).ctx_mut() }, prior);
+
     // 2. Guard acquisition error (stale/unbound key)
     let stale_key = ObjectWaitKey::new(2, 99).unwrap();
     let op2 = OperationToken::new(101, 2).unwrap();
@@ -2363,6 +2389,11 @@ fn concurrent_timer_park_and_guard_refusal_preserve_record_ownership() {
         None,
         "guard error must not leak fresh record"
     );
+    let snapshot = unsafe {
+        carrick_sched_core::object_wait::ObjectStateSnapshot::taken_under_object_lock(
+            sched.observe_object(key).unwrap(),
+        )
+    };
     let parked = sched
         .park_object(&frame, key, snapshot, resume, op, Some(5000))
         .unwrap();

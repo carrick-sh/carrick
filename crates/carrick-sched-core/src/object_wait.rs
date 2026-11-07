@@ -74,7 +74,7 @@ const fn cause_queue_index(index: usize, cause: spaces::notification::SpaceWaitC
         ORIGINAL_OBJECT_WAIT_QUEUES + (cause as usize - 1) * spaces::ADDRESS_SPACES + index
     }
 }
-pub const OBJECT_WAIT_PROTOCOL: u64 = 14;
+pub const OBJECT_WAIT_PROTOCOL: u64 = 15;
 pub const OBJECT_WAIT_LAYOUT_HASH: u64 = {
     let words = [
         OBJECT_WAIT_PROTOCOL,
@@ -82,7 +82,6 @@ pub const OBJECT_WAIT_LAYOUT_HASH: u64 = {
         OBJECT_HOST_CONTINUATION as u64,
         OWNER_CONTINUATION as u64,
         OWNER_EXCEPTION_ENTRY as u64,
-        OWNER_SAVED_SYSCALL_PC as u64,
         ADMISSION_PENDING as u64,
         ADMISSION_CUSTODY as u64,
         ADMISSION_POSTED as u64,
@@ -939,7 +938,6 @@ const OBJECT_EXPIRED: u32 = 1;
 const OBJECT_HOST_CONTINUATION: u32 = 2;
 const OWNER_CONTINUATION: u32 = 4;
 const OWNER_EXCEPTION_ENTRY: u32 = 8;
-const OWNER_SAVED_SYSCALL_PC: u32 = 16;
 
 /// The entry whose native context the retained owner parked.
 #[derive(
@@ -1448,14 +1446,14 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'a, C> {
         let previous_expired = rec.object.expired.load(Ordering::Relaxed);
         let previous_deadline = rec.deadline.load(Ordering::Relaxed);
         rec.object.expired.store(
-            (match destination {
+            match destination {
                 OperationDestination::Guest => 0,
                 OperationDestination::Host => OBJECT_HOST_CONTINUATION,
                 OperationDestination::Owner(OwnerEntry::Syscall) => OWNER_CONTINUATION,
                 OperationDestination::Owner(OwnerEntry::Exception) => {
                     OWNER_CONTINUATION | OWNER_EXCEPTION_ENTRY
                 }
-            }) | (previous_expired & OWNER_SAVED_SYSCALL_PC),
+            },
             Ordering::Relaxed,
         );
         self.zone.set_deadline(record, deadline);
@@ -1639,16 +1637,6 @@ pub struct ObjectQueueCensus {
 }
 
 impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
-    /// Record that the saved context already names the retry instruction.
-    ///
-    /// # Safety
-    /// The caller exclusively owns this record while publishing its park.
-    pub unsafe fn publish_saved_syscall_resume_pc(&self) {
-        self.object
-            .expired
-            .fetch_or(OWNER_SAVED_SYSCALL_PC, Ordering::Release);
-    }
-
     /// Readiness resumes retained owner custody, not a completed user call.
     ///
     /// # Safety
@@ -1689,15 +1677,6 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
             !(OWNER_CONTINUATION | OWNER_EXCEPTION_ENTRY),
             Ordering::AcqRel,
         );
-    }
-
-    /// Consume the retry-PC position recorded by the object checkpoint.
-    pub fn take_saved_syscall_resume_pc(&self) -> bool {
-        self.object
-            .expired
-            .fetch_and(!OWNER_SAVED_SYSCALL_PC, Ordering::AcqRel)
-            & OWNER_SAVED_SYSCALL_PC
-            != 0
     }
 
     /// This record's object-wait registration, if it has one or owns a
