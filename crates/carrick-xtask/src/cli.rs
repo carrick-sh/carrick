@@ -24,6 +24,8 @@ pub enum Commands {
     Board(crate::board::Args),
     /// Start or attach to the job-local compiler cache under its socket lock.
     CompilerCacheStart,
+    /// Check configured runtime scratch before signed tests start.
+    ScratchPreflight { home: PathBuf },
     #[command(about = "Acquire and renew CAS leases over refs/claims/*")]
     Claims(crate::claims::ClaimsArgs),
     /// Repeat a signed test and capture the first selected failure (macOS).
@@ -667,6 +669,11 @@ where
         Commands::ProbeEmitters(args) => {
             let info = resolve_repo_info(cli.root.as_deref())?;
             crate::probe_emitters::run(&info.repository_root, args, writer)?;
+            Ok(())
+        }
+        Commands::ScratchPreflight { home } => {
+            carrick_vfs::scratch::preflight_home(&home)
+                .map_err(|source| CliError::Io { path: home, source })?;
             Ok(())
         }
         Commands::HostLease(args) => {

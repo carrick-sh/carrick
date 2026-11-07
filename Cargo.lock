@@ -1355,6 +1355,7 @@ dependencies = [
  "carrick-fatal",
  "carrick-guest-arch",
  "carrick-portable",
+ "carrick-vfs",
  "clap",
  "flate2",
  "libc",

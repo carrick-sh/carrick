@@ -74,6 +74,8 @@ fi
 # logs detected PIDs and parent commands even with CARRICK_ALLOW_LOAD=1.
 cargo run --locked -p carrick-xtask -- host-lease --mode carrick --check-load -- true
 
+cargo run --locked -p carrick-xtask -- scratch-preflight "$CARRICK_HOME"
+
 pkg="${1:?usage: scripts/test-signed.sh <package> [libtest args...]}"
 shift
 

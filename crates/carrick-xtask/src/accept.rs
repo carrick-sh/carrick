@@ -1483,6 +1483,13 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
     let root = repo_info.repository_root;
     let head = repo_info.head;
     verify_clean_checkout(&root)?;
+    // Fail once before any host or signed test rather than emitting one
+    // container-preparation failure per guest. Never consult the USB mount.
+    let scratch_home = std::env::var_os("CARRICK_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("target/carrick-home"));
+    carrick_vfs::scratch::preflight_home(&root.join(&scratch_home))
+        .map_err(|e| AcceptError::Failed(e.to_string()))?;
 
     let short_head_out = command::run_checked("git", ["rev-parse", "--short", "HEAD"], Some(&root))
         .map_err(|e| AcceptError::Git(e.to_string()))?;
