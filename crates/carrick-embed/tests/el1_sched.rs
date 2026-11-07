@@ -3891,6 +3891,22 @@ fn el1_metadata_allocator_host_wait_requires_unmasked_irq() {
     );
 }
 
+/// Exercise the initial owner MM through the production permission-fault
+/// entry beyond two full 64-slot COW grant chains without intervening syscalls.
+#[test]
+fn el1_fork_cow_parent_replenishes_used_grants() {
+    let _guard = common::guest_lock();
+    let carrier = carrier_or_fail();
+    let measured = run_fixture(&carrier, &["fork-cow-parent"], Duration::from_secs(40));
+    assert!(measured.result.success(), "{}", describe(&measured));
+    assert!(
+        measured
+            .result
+            .stdout_utf8()
+            .contains("fork-cow-parent compounds=192 ok=true")
+    );
+}
+
 /// Contract `kernel.el1.fork-cow`: fork COW resolution verification.
 /// Forks across three scales with private anonymous pages armed read-only for
 /// COW; four guest threads per process concurrently write them, taking write

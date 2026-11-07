@@ -13681,8 +13681,7 @@ mod guest_cow {
     }
 }
 
-#[test]
-fn sole_owner_cow_reuse_adopts_guest_published_live_leaves() {
+fn exercise_sole_owner_cow_reuse(guest_writable: bool) {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let _external = ExternalAliasStateRestore::capture();
     let _stub = ScopedStage2MapTestStub::enable();
@@ -13694,6 +13693,15 @@ fn sole_owner_cow_reuse_adopts_guest_published_live_leaves() {
         0x9b01_7900_0000,
         carrick_mmu_core::aarch64::LiveDescriptorOwner::Host,
     );
+    if guest_writable {
+        fixture
+            .installed
+            .state
+            .protections
+            .legacy()
+            .unwrap()
+            .set_unmapped(TEST_VA, OWNER_LEN, false);
+    }
     let tables = fixture.installed.state.page_tables_authority();
     tables.replace_manager(tables.snapshot_image());
     let walk = tables.with_manager(|m| m.debug_walk(TEST_VA)).unwrap();
@@ -13732,7 +13740,7 @@ fn sole_owner_cow_reuse_adopts_guest_published_live_leaves() {
             },
             0x9b01_7900_0000,
             fixture.root_host as *mut u8,
-            false,
+            guest_writable,
             &mut Flush,
         )
         .expect("reuse must adopt live leaves before authenticating its edit");
@@ -13743,8 +13751,18 @@ fn sole_owner_cow_reuse_adopts_guest_published_live_leaves() {
     );
     assert_eq!(
         tables.with_manager(|m| m.debug_walk(TEST_VA)[3] & (3 << 6)),
-        Some(3 << 6)
+        Some(if guest_writable { 1 << 6 } else { 3 << 6 })
     );
+}
+
+#[test]
+fn sole_owner_cow_reuse_adopts_guest_published_live_leaves() {
+    exercise_sole_owner_cow_reuse(false);
+}
+
+#[test]
+fn sole_owner_cow_reuse_restores_write_for_untagged_host_leaves() {
+    exercise_sole_owner_cow_reuse(true);
 }
 
 #[test]

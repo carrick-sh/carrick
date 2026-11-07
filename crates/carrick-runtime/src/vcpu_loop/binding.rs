@@ -2061,10 +2061,10 @@ where
                     .state
                     .capture_core_for_publication(&self.kernel, engine, fatal)
                 {
-                    Ok(super::crash::CoreCaptureAttempt::Complete(publication)) => {
+                    Ok(Ok(publication)) => {
                         *prepared_core = publication;
                     }
-                    Ok(super::crash::CoreCaptureAttempt::OwnerWait(wait)) => {
+                    Ok(Err(wait)) => {
                         self.phase = HvpatchProductionPhase::EnrollRetainedOwner {
                             action: Box::new(RetainedMemoryAction::CoreCapture {
                                 context,
@@ -5561,6 +5561,20 @@ where
                 // descriptor pair immediately before its typed trigger. Do not
                 // duplicate that pair here: the structural consumer joins and
                 // consumes one sequence per attempted fault.
+                // EL1 forwards an armed write when its grant chain is full
+                // of USED completions. Reclaim those records through the
+                // neutral MM owner before asking the engine to refill; a
+                // full chain must not become a write denial in host COW.
+                let context = self
+                    .kernel
+                    .dispatcher
+                    .capture_kernel_context(self.state.linux_tid)
+                    .map_err(|error| {
+                        RuntimeError::Configuration(format!(
+                            "COW fault lost exact task context: {error}"
+                        ))
+                    })?;
+                signal::settle_guest_cow_of(context.shared().mm().id());
                 if let carrick_hal::CowFaultResolution::Resolved {
                     translation,
                     arm_generation,
@@ -5589,6 +5603,20 @@ where
                 ..
             }) => {
                 let fault_access = signal::el0_fault_access(syndrome);
+                // EL1 forwards an armed write when its grant chain is full
+                // of USED completions. Reclaim those records through the
+                // neutral MM owner before asking the engine to refill; a
+                // full chain must not become a write denial in host COW.
+                let context = self
+                    .kernel
+                    .dispatcher
+                    .capture_kernel_context(self.state.linux_tid)
+                    .map_err(|error| {
+                        RuntimeError::Configuration(format!(
+                            "COW fault lost exact task context: {error}"
+                        ))
+                    })?;
+                signal::settle_guest_cow_of(context.shared().mm().id());
                 if let carrick_hal::CowFaultResolution::Resolved {
                     translation,
                     arm_generation,
