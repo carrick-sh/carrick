@@ -327,6 +327,20 @@ fn resolve_merge_group_prs(
             prs.insert(number);
         }
     }
+    for (index, node) in queue_entries.iter().enumerate() {
+        if node["baseCommit"]["oid"].as_str().is_none()
+            || node["headCommit"]["oid"].as_str().is_none()
+            || node["pullRequest"]["number"].as_u64().is_none()
+            || node["pullRequest"]["baseRefName"].as_str().is_none()
+            || node["pullRequest"]["baseRepository"]["nameWithOwner"]
+                .as_str()
+                .is_none()
+        {
+            return Err(fail(format!(
+                "mergeQueue entry {index} is null or incomplete"
+            )));
+        }
+    }
     for node in queue_entries {
         if let Some(oid) = node["headCommit"]["oid"].as_str()
             && let Some(base_oid) = node["baseCommit"]["oid"].as_str()
@@ -370,19 +384,10 @@ fn resolve_merge_group_prs(
             "merge-group head is not the live entry named by its main queue ref",
         ));
     }
-    // If an earlier group (or this group) merged onto main before mergeQueue was
-    // queried, its queue entry disappeared and /commits/{sha}/pulls now links it.
-    // Queue entries merge strictly FIFO from main, so any already-merged entries
-    // form a prefix before the earliest commit still present in mergeQueue.
-    let fallback_end = if covered_commits.contains(requested_sha) {
-        queued_ordered
-            .iter()
-            .position(|commit| covered_commits.contains(*commit))
-            .unwrap_or(queued_ordered.len())
-    } else {
-        queued_ordered.len()
-    };
-    for &commit_sha in &queued_ordered[..fallback_end] {
+    // Any commit not covered by a live queue entry may have merged onto main
+    // between event creation and this query. Resolve every such commit through
+    // REST, regardless of where it appears in the candidate range.
+    for &commit_sha in &queued_ordered {
         if covered_commits.contains(commit_sha) {
             continue;
         }
