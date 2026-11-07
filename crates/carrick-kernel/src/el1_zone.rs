@@ -608,7 +608,13 @@ pub fn wake_native_sleep_channel(channel: carrick_core_abi::clock::ClockSleepCha
             }
         }
     }
-    let woken = wake(zone, channel.mm, channel.address.get(), u32::MAX, u32::MAX);
+    let woken = wake(
+        zone,
+        channel.mm.raw(),
+        channel.address.get(),
+        u32::MAX,
+        u32::MAX,
+    );
     hand_back(&woken.handed);
 }
 
