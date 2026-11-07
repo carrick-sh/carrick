@@ -922,6 +922,15 @@ pub fn exclude_el1_editor(mm: MmId) -> Option<El1EditorExclusion> {
     )
 }
 
+/// Retain a settled exact-MM exclusion through the fault resolver's refill
+/// publication. Only then may guest EL1 retry. An unpublished MM has no guard.
+pub fn with_el1_editor_excluded<R>(
+    _exclusion: Option<El1EditorExclusion>,
+    resolve: impl FnOnce() -> R,
+) -> R {
+    resolve()
+}
+
 fn exclude_el1_editor_in(tables: SpaceTables, mm: MmId) -> Option<El1EditorExclusion> {
     let key = mm.raw();
     let index = tables.spaces.find(key)?;
