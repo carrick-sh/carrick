@@ -218,16 +218,7 @@ pub struct RawOfdPin {
     pub generation: u64,
 }
 
-/// Borrowed identity of an operation's retained description. This key grants
-/// lookup only: it cannot be installed, cloned into a hold, or unpinned.
-/// The operation must retain its owning [`OfdPin`] until every borrower has
-/// finished (including carrier cancellation acknowledgement).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct OfdPinIdentity {
-    pub authority: u64,
-    pub index: u64,
-    pub generation: u64,
-}
+pub use carrick_core_abi::OfdPinIdentity;
 impl OfdPin {
     pub fn identity(&self) -> OfdPinIdentity {
         OfdPinIdentity {
