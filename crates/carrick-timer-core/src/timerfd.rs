@@ -10,12 +10,60 @@ use core::time::Duration;
 /// The owner serializes access and supplies samples from the clock captured
 /// at creation. Neither an fd lookup nor the reading task selects the clock.
 /// Readiness delivery and deadline enrollment belong to that owner.
+///
+/// This pointer-free record has an explicit layout for embedding in the
+/// shared timer IPC authority. All fields are private: only these transitions
+/// may construct a record, so nanoseconds stay normalized and reserved words
+/// stay zero. A containing IPC record must still authenticate its own ABI,
+/// creator-clock identity, object generation and lock ownership.
+#[repr(C, align(8))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct State {
-    interval: Option<Duration>,
-    deadline: Option<Duration>,
+    interval: DurationRecord,
+    deadline: DurationRecord,
     expirations: u64,
+    present: u32,
+    reserved: u32,
 }
+
+const INTERVAL_PRESENT: u32 = 1;
+const DEADLINE_PRESENT: u32 = 2;
+
+/// Explicit seconds/nanoseconds storage; never an `Option` or Rust enum in
+/// shared memory. Presence belongs to State and absent values are zeroed.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DurationRecord {
+    seconds: u64,
+    nanos: u32,
+    reserved: u32,
+}
+
+impl DurationRecord {
+    fn encode(value: Option<Duration>) -> Self {
+        let value = value.unwrap_or(Duration::ZERO);
+        Self {
+            seconds: value.as_secs(),
+            nanos: value.subsec_nanos(),
+            reserved: 0,
+        }
+    }
+
+    const fn decode(self) -> Duration {
+        Duration::new(self.seconds, self.nanos)
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<DurationRecord>() == 16);
+    assert!(core::mem::size_of::<State>() == 48);
+    assert!(core::mem::align_of::<State>() == 8);
+    assert!(core::mem::offset_of!(State, interval) == 0);
+    assert!(core::mem::offset_of!(State, deadline) == 16);
+    assert!(core::mem::offset_of!(State, expirations) == 32);
+    assert!(core::mem::offset_of!(State, present) == 40);
+    assert!(core::mem::offset_of!(State, reserved) == 44);
+};
 
 /// Interpretation of a nonzero initial expiration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,12 +75,20 @@ pub enum DeadlineMode {
 impl State {
     /// Configured repeat interval, retained even when the timer is disarmed.
     pub const fn interval(&self) -> Option<Duration> {
-        self.interval
+        if self.present & INTERVAL_PRESENT != 0 {
+            Some(self.interval.decode())
+        } else {
+            None
+        }
     }
 
     /// Next expiration in the creator's clock domain, or a disarmed timer.
     pub const fn deadline(&self) -> Option<Duration> {
-        self.deadline
+        if self.present & DEADLINE_PRESENT != 0 {
+            Some(self.deadline.decode())
+        } else {
+            None
+        }
     }
 
     /// Already accounted expirations; sampling time is an explicit refresh.
@@ -42,8 +98,10 @@ impl State {
 
     /// Account for all due periods using a single creator-clock sample.
     pub fn refresh(&mut self, now: Option<Duration>) -> u64 {
-        (self.expirations, self.deadline) =
-            expirations(now, self.interval, self.deadline, self.expirations);
+        let (count, deadline) =
+            expirations(now, self.interval(), self.deadline(), self.expirations);
+        self.expirations = count;
+        self.set_deadline(deadline);
         self.expirations
     }
 
@@ -56,12 +114,27 @@ impl State {
         value: Option<Duration>,
         mode: DeadlineMode,
     ) {
-        self.interval = interval;
-        self.deadline = value.map(|value| match mode {
+        self.interval = DurationRecord::encode(interval);
+        self.present = if interval.is_some() {
+            INTERVAL_PRESENT
+        } else {
+            0
+        };
+        self.set_deadline(value.map(|value| match mode {
             DeadlineMode::Absolute => value,
             DeadlineMode::Relative => now.saturating_add(value),
-        });
+        }));
         self.expirations = 0;
+    }
+
+    fn set_deadline(&mut self, deadline: Option<Duration>) {
+        self.deadline = DurationRecord::encode(deadline);
+        self.present = (self.present & !DEADLINE_PRESENT)
+            | if deadline.is_some() {
+                DEADLINE_PRESENT
+            } else {
+                0
+            };
     }
 
     /// Consume the accumulated count once the output operation owns delivery.
@@ -140,6 +213,33 @@ mod tests {
     }
 
     #[test]
+    fn record_preserves_full_duration_range_and_zero_interval_presence() {
+        let mut timer = State::default();
+        assert_eq!(timer.interval(), None);
+        assert_eq!(timer.deadline(), None);
+        for interval in [None, Some(Duration::ZERO), Some(Duration::MAX)] {
+            timer.arm(
+                Duration::ZERO,
+                interval,
+                Some(Duration::MAX),
+                DeadlineMode::Absolute,
+            );
+            assert_eq!(timer.interval(), interval);
+            assert_eq!(timer.deadline(), Some(Duration::MAX));
+            assert_eq!(timer.refresh(None), 0);
+            assert_eq!(timer.refresh(Some(Duration::ZERO)), 0);
+            assert_eq!(timer.reserved, 0);
+            assert_eq!(timer.interval.reserved, 0);
+            assert_eq!(timer.deadline.reserved, 0);
+            timer.arm(Duration::ZERO, interval, None, DeadlineMode::Relative);
+            assert_eq!(timer.interval(), interval);
+            assert_eq!(timer.deadline(), None);
+            assert_eq!(timer.deadline, DurationRecord::default());
+            assert_eq!(timer.present & !(INTERVAL_PRESENT | DEADLINE_PRESENT), 0);
+        }
+    }
+
+    #[test]
     fn rearm_and_disarm_discard_unread_expirations() {
         let mut timer = State::default();
         timer.arm(
@@ -165,7 +265,7 @@ mod tests {
             DeadlineMode::Absolute,
         );
         assert_eq!(timer.refresh(Some(Duration::MAX)), 0);
-        assert_eq!(timer.deadline, None);
+        assert_eq!(timer.deadline(), None);
     }
 
     #[test]

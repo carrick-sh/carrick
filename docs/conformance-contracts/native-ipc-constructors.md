@@ -339,3 +339,41 @@ creator-clock isolation, EFAULT consumption and fd reuse; these remain the
 host authority witnesses. The native constructor witness remains red until
 shared clock-domain publication, the timer IPC object and scheduler expiry
 and rearm enrollment exist. No signed or constructor acceptance is claimed.
+
+## Explicit timer-state storage prerequisite
+
+The shared production `carrick_timer_core::timerfd::State` now has a reviewed
+48-byte C record layout with eight-byte alignment. Interval and deadline
+each use explicit seconds, nanoseconds and a zero reserved word; a presence
+bitmap distinguishes absent values from zero durations. The expiration
+count, bitmap and final reserved word have asserted offsets. Only the core
+transitions construct values. There is no byte-import API, and the full
+`Duration` range remains representable without truncation to u64 nanoseconds.
+
+The layout witness was red on the preceding state representation (40 bytes,
+containing Rust-native `Option<Duration>` values). Existing arm, refresh,
+consume and rearm tests exercise the same state now used by the host. This
+does not change the IPC ABI: no IPC object embeds the record yet. The native
+timerfd constructor remains unimplemented and its production witness is
+still required to turn green.
+
+Independent design review confirmed that completing the migration requires
+all of the following as one coherent authority:
+
+- a retained, generation-authenticated creator-clock handle and pointer-free
+  clock-mode projection shared by host and ring;
+- the timer record in the IPC object store, with a new authenticated IPC ABI
+  identity and an arm revision for cancellation;
+- migration of host `TimerFdInner` custody to that record;
+- deadline enrollment validating clock generation, object generation and arm
+  revision, including deterministic waiter participation;
+- read, set/get, readiness, rearm and final-release paths using that authority.
+
+The current host lock order is clock-change snapshot before timer state.
+Notifications follow unlocking, and member mutation precedes epoll mutation.
+Frozen mode freezes realtime only: its monotonic and boottime clocks remain
+live. Scaled clocks use elapsed time from their host Instant origin, while
+deterministic clocks use explicit virtual progress. A raw architecture
+counter cannot substitute for these modes. The Temporary crossings must
+remain until the complete service exists; this prerequisite does not justify
+retiring them or claiming signed acceptance.
