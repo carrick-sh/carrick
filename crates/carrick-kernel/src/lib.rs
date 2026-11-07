@@ -77,6 +77,7 @@
 // doc links rather than widen the public surface just to satisfy rustdoc.
 #![allow(rustdoc::private_intra_doc_links)]
 
+pub mod clock_service;
 pub mod container;
 pub(crate) mod container_policy;
 pub mod core_dump;
