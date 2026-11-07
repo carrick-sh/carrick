@@ -77,3 +77,27 @@ fixed test. The checkout's source stayed fixed throughout. The exact compiler
 arguments are saved in `agent/evidence/baseline-command.json`; raw logs,
 known-answer selections, and per-invocation target verdicts are beside it.
 These are Linux measurements; no macOS or signed guest result is implied.
+
+## Admitted-main finishing round
+
+After rebasing the four existing commits onto admitted main, a fresh Linux
+population passed 50/50 exact baseline selections and 42/50 complete baseline
+runs with 16 threads. The fixed binary passed 50/50 exact selections and all
+50/50 complete parallel runs. Every invocation was counted on the target's
+own verdict line, and both exact selections first passed a one-test
+known-answer check. Baseline failures again reported errno 13 during recursive
+directory creation or job-area reset; sibling filesystem cases were affected
+as well.
+
+The concrete race is creation of an intermediate directory under the other
+test's temporary 0277 mask: recursive creation precedes `mkdir_mode`'s chmod
+of its leaf, leaving the intermediate directory at 0500 and preventing creation
+below it. Overlapping guards can also restore a stale saved mask. The inherited
+child-process fix was kept unchanged: each mutator has its own process umask,
+while sibling tests retain parallel execution. No new production fix was needed.
+
+Fresh binaries, baseline source and compiler arguments, one-test checks,
+per-run logs and machine-counted verdicts are saved beside the checkout in
+`agent/evidence/`. Both binaries use the same production libraries; only the
+baseline test source comes from admitted main. This is local Linux host-test
+evidence, not macOS or signed guest evidence.
