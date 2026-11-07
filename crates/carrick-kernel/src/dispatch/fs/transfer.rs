@@ -394,7 +394,7 @@ impl<'a> FsView<'a> {
     /// count loses nothing.
     fn splice_write_out<M: CurrentMmMemory>(
         &self,
-        registry: &crate::kernel::tty::TtyRegistry,
+        kernel: &crate::kernel::KernelContext,
         target: SpliceOutputTarget,
         bytes: &[u8],
         memory: &mut M,
@@ -427,7 +427,12 @@ impl<'a> FsView<'a> {
                     };
                 }
             }
-            return match self.write_output_fd_partial(registry, out_fd, bytes, tid) {
+            return match self.write_output_fd_partial(
+                kernel.container().tty_registry(),
+                out_fd,
+                bytes,
+                tid,
+            ) {
                 // The destination could not take a single byte. A blocking
                 // `splice(2)` waits for room; the partial write path reports
                 // that as `EAGAIN` because it asked non-blocking, so restore
@@ -438,9 +443,17 @@ impl<'a> FsView<'a> {
                 other => other,
             };
         }
-        let out_off = match read_u64(memory, off_out_addr) {
-            Ok(v) => v,
-            Err(errno) => return DispatchOutcome::errno(errno),
+        let out_off = match self.sendfile_offset(out_fd, off_out_addr, memory) {
+            Ok(offset) => offset as u64,
+            Err(outcome) => return outcome,
+        };
+        let offset_out = match super::super::copyout::prepare(
+            kernel,
+            memory,
+            [Some(super::super::copyout::UserSlot::new(off_out_addr, 8))],
+        ) {
+            Ok(out) => out,
+            Err(refusal) => return refusal.into_outcome(),
         };
         let host_fd = match self.open_file(out_fd).as_ref() {
             Some(of) => {
@@ -470,11 +483,8 @@ impl<'a> FsView<'a> {
             Ok(value) => value as usize,
             Err(errno) => return DispatchOutcome::errno(errno),
         };
-        if memory
-            .write_bytes(off_out_addr, &(out_off + n as u64).to_ne_bytes())
-            .is_err()
-        {
-            return DispatchOutcome::errno(LINUX_EFAULT);
+        if let Err(fault) = offset_out.commit([&(out_off + n as u64).to_ne_bytes()]) {
+            return fault.outcome();
         }
         DispatchOutcome::returned_len_or_errno(n)
     }
@@ -1164,7 +1174,7 @@ impl<'a> FsView<'a> {
                         )));
                     }
                 };
-                let outcome = this.splice_write_out(cx.kernel.container().tty_registry(), SpliceOutputTarget { fd: out_fd.0, offset_address: off_out_address, nonblocking: out_nonblocking }, &bytes, cx.memory, tid);
+                let outcome = this.splice_write_out(cx.kernel, SpliceOutputTarget { fd: out_fd.0, offset_address: off_out_address, nonblocking: out_nonblocking }, &bytes, cx.memory, tid);
                 let DispatchOutcome::Returned { value } = outcome else {
                     drop(bytes);
                     return Ok(complete_wait(outcome));
@@ -1212,7 +1222,7 @@ impl<'a> FsView<'a> {
                 if buf.is_empty() {
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
-                let outcome = this.splice_write_out(cx.kernel.container().tty_registry(), SpliceOutputTarget { fd: out_fd.0, offset_address: off_out_address, nonblocking: out_nonblocking }, &buf, cx.memory, tid);
+                let outcome = this.splice_write_out(cx.kernel, SpliceOutputTarget { fd: out_fd.0, offset_address: off_out_address, nonblocking: out_nonblocking }, &buf, cx.memory, tid);
                 let DispatchOutcome::Returned { value } = outcome else {
                     this.restore_splice_pipe_bytes(in_fd.0, &buf);
                     return Ok(complete_wait(outcome));
@@ -1352,7 +1362,7 @@ impl<'a> FsView<'a> {
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
                 buf.truncate(n as usize);
-                let outcome = this.splice_write_out(cx.kernel.container().tty_registry(), SpliceOutputTarget { fd: out_fd.0, offset_address: off_out_address, nonblocking: out_nonblocking }, &buf, cx.memory, tid);
+                let outcome = this.splice_write_out(cx.kernel, SpliceOutputTarget { fd: out_fd.0, offset_address: off_out_address, nonblocking: out_nonblocking }, &buf, cx.memory, tid);
                 let DispatchOutcome::Returned { value } = outcome else {
                     // EAGAIN / WaitOnFds / Errno on the destination — propagate
                     // WITHOUT consuming any socket bytes (the peek left them).
@@ -1471,7 +1481,7 @@ impl<'a> FsView<'a> {
                         Ok((0, _)) => return Ok(DispatchOutcome::Returned { value: 0 }),
                         Ok((n, _)) => {
                             buf.truncate(n);
-                            let outcome = this.splice_write_out(cx.kernel.container().tty_registry(), SpliceOutputTarget { fd: out_fd.0, offset_address: off_out_address, nonblocking: out_nonblocking }, &buf, cx.memory, tid);
+                            let outcome = this.splice_write_out(cx.kernel, SpliceOutputTarget { fd: out_fd.0, offset_address: off_out_address, nonblocking: out_nonblocking }, &buf, cx.memory, tid);
                             let DispatchOutcome::Returned { value } = outcome else {
                                 return Ok(complete_wait(outcome));
                             };
@@ -1519,8 +1529,8 @@ impl<'a> FsView<'a> {
                     if off_in_address != 0 {
                         // Character devices have no seek position, so off_in is not
                         // used or updated, but guest pointer validity is checked.
-                        if read_u64(memory, off_in_address).is_err() {
-                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                        if let Err(outcome) = this.sendfile_offset(in_fd.0, off_in_address, memory) {
+                            return Ok(outcome);
                         }
                     }
 
@@ -1569,7 +1579,16 @@ impl<'a> FsView<'a> {
                 // staging handles it.
                 _ => count,
             };
-            let mut offset = this.sendfile_offset(in_fd.0, off_in_address, memory)??;
+            let mut offset = match this.sendfile_offset(in_fd.0, off_in_address, memory) {
+                Ok(offset) => offset,
+                Err(outcome) => return Ok(outcome),
+            };
+            let offset_out = match super::super::copyout::prepare(cx.kernel, memory, [
+                super::super::copyout::UserSlot::optional(off_in_address, 8),
+            ]) {
+                Ok(out) => out,
+                Err(refusal) => return Ok(refusal.into_outcome()),
+            };
             let bytes = this.sendfile_bytes(in_fd.0, offset, count)?;
             let outcome = match this.write_output_fd_partial(cx.kernel.container().tty_registry(), out_fd.0, &bytes, tid) {
                 // Nothing moved: the destination pipe is full. SPLICE_F_NONBLOCK
@@ -1625,11 +1644,9 @@ impl<'a> FsView<'a> {
                         _ => {}
                     }
                 }
-            } else if memory
-                .write_bytes(off_in_address, &(offset as u64).to_ne_bytes())
-                .is_err()
-            {
-                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            }
+            if let Err(fault) = offset_out.commit([&(offset as u64).to_ne_bytes()]) {
+                return Ok(fault.outcome());
             }
 
             Ok(DispatchOutcome::Returned { value })
@@ -1722,7 +1739,7 @@ impl<'a> FsView<'a> {
                         };
                     }
                     let bytes = &bytes[..room.map_or(bytes.len(), |room| bytes.len().min(room))];
-                    Ok(this.splice_write_out(cx.kernel.container().tty_registry(), SpliceOutputTarget { fd: fd.0, offset_address: 0, nonblocking }, bytes, memory, tid))
+                    Ok(this.splice_write_out(cx.kernel, SpliceOutputTarget { fd: fd.0, offset_address: 0, nonblocking }, bytes, memory, tid))
                 }
                 VmDir::ReadHost(hfd, owner) => Ok(Self::read_host_pipe_iovecs(
                     cx.kernel,
@@ -1773,23 +1790,35 @@ impl<'a> FsView<'a> {
                     };
                     let mut off = 0usize;
                     for v in &iovecs {
-                        if off >= bytes.len() {
-                            break;
+                        let iov_len = usize::try_from(v.iov_len).unwrap_or(0);
+                        let mut in_iov = 0usize;
+                        while in_iov < iov_len && off < bytes.len() {
+                            let len = (iov_len - in_iov).min(bytes.len() - off)
+                                .min(super::super::copyout::COPYOUT_MAX_BYTES);
+                            let Some(address) = v.iov_base.checked_add(in_iov as u64) else {
+                                bytes.commit(off);
+                                return Ok(if off == 0 { DispatchOutcome::errno(LINUX_EFAULT) }
+                                    else { DispatchOutcome::returned_len_or_errno(off) });
+                            };
+                            let out = match super::super::copyout::prepare(cx.kernel, memory, [
+                                Some(super::super::copyout::UserSlot::new(address, len)),
+                            ]) {
+                                Ok(out) => out,
+                                Err(refusal) => {
+                                    bytes.commit(off);
+                                    return Ok(if off == 0 { refusal.into_outcome() }
+                                        else { DispatchOutcome::returned_len_or_errno(off) });
+                                }
+                            };
+                            if let Err(fault) = out.commit([&bytes[off..off + len]]) {
+                                bytes.commit(off);
+                                return Ok(if off == 0 { fault.outcome() }
+                                    else { DispatchOutcome::returned_len_or_errno(off) });
+                            }
+                            off += len;
+                            in_iov += len;
                         }
-                        let len =
-                            usize::try_from(v.iov_len).unwrap_or(0).min(bytes.len() - off);
-                        if len == 0 {
-                            continue;
-                        }
-                        if memory
-                            .write_bytes(v.iov_base, &bytes[off..off + len])
-                            .is_err()
-                        {
-                            bytes.commit(off);
-                            return Ok(if off == 0 { DispatchOutcome::errno(LINUX_EFAULT) }
-                                else { DispatchOutcome::returned_len_or_errno(off) });
-                        }
-                        off += len;
+                        if off == bytes.len() { break; }
                     }
                     bytes.commit(off);
                     Ok(DispatchOutcome::returned_len_or_errno(off))

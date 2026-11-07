@@ -3,6 +3,7 @@
 //! fast path. Split out of `dispatch/fs.rs` (WS-F3) as `impl SyscallDispatcher`
 //! methods; the move is type-transparent to `self.…` callers.
 use super::*;
+use crate::dispatch::copyout::{self, UserSlot};
 use crate::linux_abi::LinuxErrno;
 
 /// `CARRICK_DARWIN_COPYFILE_FAST_PATH=0` disables the whole-file
@@ -188,35 +189,41 @@ impl<'a> FsView<'a> {
         in_fd: i32,
         offset_address: u64,
         memory: &impl CurrentMmMemory,
-    ) -> Result<Result<usize, LinuxErrno>, DispatchError> {
+    ) -> Result<usize, DispatchOutcome> {
         if offset_address != 0 {
-            return match read_u64(memory, offset_address) {
-                Ok(offset) => {
-                    Ok(Ok(usize::try_from(offset)
-                        .map_err(|_| DispatchError::LengthTooLarge(offset))?))
+            return match memory.read_bytes(offset_address, 8) {
+                Ok(bytes) => {
+                    let offset = u64::from_ne_bytes(
+                        bytes
+                            .try_into()
+                            .map_err(|_| DispatchOutcome::errno(LINUX_EFAULT))?,
+                    );
+                    usize::try_from(offset)
+                        .map_err(|_| DispatchOutcome::errno(crate::linux_abi::LINUX_EOVERFLOW))
                 }
-                Err(errno) => Ok(Err(errno)),
+                Err(error) => Err(DispatchOutcome::from_owner_memory_error(error)
+                    .unwrap_or_else(|| DispatchOutcome::errno(LINUX_EFAULT))),
             };
         }
         let Some(in_file) = self.open_file(in_fd) else {
-            return Ok(Err(LINUX_EBADF));
+            return Err(DispatchOutcome::errno(LINUX_EBADF));
         };
         let Some(open) = crate::kernel::FileDescription::read_for_io(&in_file.description) else {
-            return Ok(Err(LINUX_EINVAL));
+            return Err(DispatchOutcome::errno(LINUX_EINVAL));
         };
         match &*open {
-            OpenDescription::Closed { .. } => Ok(Err(LINUX_EBADF)),
+            OpenDescription::Closed { .. } => Err(DispatchOutcome::errno(LINUX_EBADF)),
             OpenDescription::File { offset, .. }
             | OpenDescription::InMemoryFile { offset, .. }
-            | OpenDescription::SyntheticFile { offset, .. } => Ok(Ok(*offset)),
-            OpenDescription::ProcExecutable { offset, .. } => Ok(Ok(*offset)),
+            | OpenDescription::SyntheticFile { offset, .. } => Ok(*offset),
+            OpenDescription::ProcExecutable { offset, .. } => Ok(*offset),
             // HostFile: current offset is the kernel's; query via lseek.
             OpenDescription::HostFile { host_fd, .. } => {
                 match (unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_CUR) })
                     .host_syscall_errno()
                 {
-                    Ok(cur) => Ok(Ok(cur as usize)),
-                    Err(errno) => Ok(Err(errno)),
+                    Ok(cur) => Ok(cur as usize),
+                    Err(errno) => Err(DispatchOutcome::errno(errno)),
                 }
             }
             OpenDescription::Directory { .. }
@@ -240,7 +247,7 @@ impl<'a> FsView<'a> {
             | OpenDescription::VirtualConsole { .. }
             | OpenDescription::Netlink { .. }
             | OpenDescription::InMemorySocket { .. }
-            | OpenDescription::Packet { .. } => Ok(Err(LINUX_EINVAL)),
+            | OpenDescription::Packet { .. } => Err(DispatchOutcome::errno(LINUX_EINVAL)),
         }
     }
 
@@ -375,7 +382,14 @@ impl<'a> FsView<'a> {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
 
-            let mut offset = this.sendfile_offset(in_fd.0, offset_address, memory)??;
+            let mut offset = match this.sendfile_offset(in_fd.0, offset_address, memory) {
+                Ok(offset) => offset,
+                Err(outcome) => return Ok(outcome),
+            };
+            let offset_out = match copyout::prepare(cx.kernel, memory, [UserSlot::optional(offset_address, 8)]) {
+                Ok(out) => out,
+                Err(refusal) => return Ok(refusal.into_outcome()),
+            };
 
             // Darwin-native fast path: a regular file -> socket uses macOS
             // sendfile(2) (BSD-style, in-kernel, zero-copy). It honors socket
@@ -402,7 +416,7 @@ impl<'a> FsView<'a> {
                 let sent = rc.max(0) as usize;
                 let advance_and_return = |offset: usize,
                                           sent: usize,
-                                          memory: &mut dyn CurrentMmMemory|
+                                          offset_out: copyout::PreparedCopyout<'_, _, 1>|
                  -> Result<DispatchOutcome, DispatchError> {
                     let new_off = offset.saturating_add(sent);
                     if offset_address == 0 {
@@ -415,21 +429,19 @@ impl<'a> FsView<'a> {
                         if positioned >= 0 {
                             this.record_host_file_absolute_offset(in_fd.0, positioned);
                         }
-                    } else if memory
-                        .write_bytes(offset_address, &(new_off as u64).to_ne_bytes())
-                        .is_err()
-                    {
-                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                    }
+                    if let Err(fault) = offset_out.commit([&(new_off as u64).to_ne_bytes()]) {
+                        return Ok(fault.outcome());
                     }
                     Ok(DispatchOutcome::returned_len_or_errno(sent))
                 };
                 match (rc as i64).host_syscall_errno() {
-                    Ok(_) => return advance_and_return(offset, sent, memory),
+                    Ok(_) => return advance_and_return(offset, sent, offset_out),
                     Err(e) if e == LINUX_EAGAIN => {
                         if sent > 0 {
                             // Partial transfer before the socket filled: report it
                             // (Go advances and loops).
-                            return advance_and_return(offset, sent, memory);
+                            return advance_and_return(offset, sent, offset_out);
                         }
                         return Ok(if this.io_is_nonblocking(out_fd.0, 0) {
                             DispatchOutcome::errno(LINUX_EAGAIN)
@@ -534,11 +546,9 @@ impl<'a> FsView<'a> {
                         _ => {}
                     }
                 }
-            } else if memory
-                .write_bytes(offset_address, &(offset as u64).to_ne_bytes())
-                .is_err()
-            {
-                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            }
+            if let Err(fault) = offset_out.commit([&(offset as u64).to_ne_bytes()]) {
+                return Ok(fault.outcome());
             }
 
             Ok(DispatchOutcome::returned_len_or_errno(written_total))
@@ -573,7 +583,16 @@ impl<'a> FsView<'a> {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
 
-            let in_offset = this.sendfile_offset(in_fd.0, off_in_addr, memory)??;
+            let in_offset = match this.sendfile_offset(in_fd.0, off_in_addr, memory) {
+                Ok(offset) => offset,
+                Err(outcome) => return Ok(outcome),
+            };
+            let out_offset = if off_out_addr != 0 || this.copy_same_file(in_fd.0, out_fd.0) {
+                match this.sendfile_offset(out_fd.0, off_out_addr, memory) {
+                    Ok(offset) => offset,
+                    Err(outcome) => return Ok(outcome),
+                }
+            } else { 0 };
             // copy_file_range onto the SAME file with OVERLAPPING ranges must fail
             // EINVAL (Linux). Go's io.Copy(f, f) self-copy hits exactly this: fd_in
             // == fd_out, NULL/NULL offsets → identical (thus overlapping) ranges.
@@ -586,7 +605,6 @@ impl<'a> FsView<'a> {
             // cross-file path. Sits above the Darwin clone fast path so it can't
             // mis-handle an overlapping self-copy either.
             if this.copy_same_file(in_fd.0, out_fd.0) {
-                let out_offset = this.sendfile_offset(out_fd.0, off_out_addr, memory)??;
                 let in_end = in_offset.saturating_add(count);
                 let out_end = out_offset.saturating_add(count);
                 if in_offset < out_end && out_offset < in_end {
@@ -604,6 +622,12 @@ impl<'a> FsView<'a> {
             )? {
                 return Ok(outcome);
             }
+            let offsets_out = match copyout::prepare(cx.kernel, memory, [
+                UserSlot::optional(off_in_addr, 8), UserSlot::optional(off_out_addr, 8),
+            ]) {
+                Ok(out) => out,
+                Err(refusal) => return Ok(refusal.into_outcome()),
+            };
             let bytes = this.sendfile_bytes(in_fd.0, in_offset, count)?;
             if bytes.is_empty() {
                 return Ok(DispatchOutcome::Returned { value: 0 });
@@ -623,7 +647,7 @@ impl<'a> FsView<'a> {
                 };
                 usize::try_from(value).unwrap_or(0)
             } else {
-                let out_off = read_u64(memory, off_out_addr)?;
+                let out_off = out_offset as u64;
                 let host_fd = match this.open_file(out_fd.0).as_ref() {
                     Some(of) => match crate::kernel::FileDescription::read_for_io(&of.description).as_deref() {
                         Some(OpenDescription::HostFile {
@@ -652,12 +676,6 @@ impl<'a> FsView<'a> {
                     Ok(value) => value as usize,
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 };
-                if memory
-                    .write_bytes(off_out_addr, &(out_off + n as u64).to_ne_bytes())
-                    .is_err()
-                {
-                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                }
                 n
             };
 
@@ -682,11 +700,12 @@ impl<'a> FsView<'a> {
                         _ => {}
                     }
                 }
-            } else if memory
-                .write_bytes(off_in_addr, &(new_in as u64).to_ne_bytes())
-                .is_err()
-            {
-                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            }
+            if let Err(fault) = offsets_out.commit([
+                &(new_in as u64).to_ne_bytes(),
+                &(out_offset.saturating_add(written) as u64).to_ne_bytes(),
+            ]) {
+                return Ok(fault.outcome());
             }
 
             Ok(DispatchOutcome::returned_len_or_errno(written))

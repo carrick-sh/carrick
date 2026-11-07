@@ -1739,6 +1739,62 @@ mod overlay_dispatch_tests {
     }
 
     #[test]
+    fn transfer_output_offsets_and_vmsplice_preserve_refused_bytes() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        use std::os::fd::IntoRawFd;
+        let mut h = Harness::new();
+        let path = h.put_str("/range-input");
+        let input = returned(h.call(56, [(-100i64) as u64, path, O_CREAT | 2, 0o600, 0, 0]));
+        let data = h.put_bytes(b"abcdef");
+        assert_eq!(returned(h.call(64, [input as u64, data, 6, 0, 0, 0])), 6);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let output = h.dispatcher.install_fd_at_or_above(3, OpenFile::from_open_description_with_status_flags(
+            Arc::new(RwLock::new(OpenDescription::HostFile {
+                base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
+                host_fd: HostFdRef::new(file.reopen().unwrap().into_raw_fd()),
+                metadata: RootFsMetadata { path: file.path().to_owned(), kind: RootFsEntryKind::File, mode: 0o600, size: 0 },
+                writable: true,
+            })), crate::linux_abi::LINUX_O_RDWR, 0)).unwrap();
+        let kernel = h.dispatcher.capture_one_task_context().unwrap();
+        let mut memory = OwnerRefusingMemory::new(0x1000, 0x2000, 0);
+        memory.seed(0x1000, &1u64.to_ne_bytes());
+        memory.seed(0x1008, &2u64.to_ne_bytes());
+        let wait = memory.refuse_next();
+        let request = SyscallRequest::new(285, SyscallArgs([input as u64, 0x1000, output as u64, 0x1008, 3, 0]));
+        assert_eq!(h.dispatcher.dispatch(&kernel, request, &mut memory, &h.reporter).unwrap(),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 });
+        assert_eq!(file.as_file().metadata().unwrap().len(), 0);
+        assert_eq!(memory.read_bytes(0x1000, 8).unwrap(), 1u64.to_ne_bytes());
+        assert_eq!(memory.read_bytes(0x1008, 8).unwrap(), 2u64.to_ne_bytes());
+        assert_eq!(h.dispatcher.dispatch(&kernel, request, &mut memory, &h.reporter).unwrap(),
+            DispatchOutcome::Returned { value: 3 });
+        assert_eq!(memory.read_bytes(0x1000, 8).unwrap(), 4u64.to_ne_bytes());
+        assert_eq!(memory.read_bytes(0x1008, 8).unwrap(), 5u64.to_ne_bytes());
+        assert_eq!(std::fs::read(file.path()).unwrap(), b"\0\0bcd");
+        assert_eq!(returned(h.call(62, [input as u64, 0, 1, 0, 0, 0])), 6);
+        assert_eq!(returned(h.call(62, [output as u64, 0, 1, 0, 0, 0])), 0);
+
+        let pair = h.reserve(8);
+        assert_eq!(returned(h.call(59, [pair, crate::linux_abi::LINUX_O_NONBLOCK as u64, 0, 0, 0, 0])), 0);
+        let pair = h.memory.read_bytes(pair, 8).unwrap();
+        let reader = i32::from_ne_bytes(pair[..4].try_into().unwrap()) as u64;
+        let writer = i32::from_ne_bytes(pair[4..].try_into().unwrap()) as u64;
+        assert_eq!(returned(h.call(64, [writer, data, 6, 0, 0, 0])), 6);
+        memory.seed(0x1000, &0x1100u64.to_ne_bytes());
+        memory.seed(0x1008, &6u64.to_ne_bytes());
+        let request = SyscallRequest::new(75, SyscallArgs([reader, 0x1000, 1, 0, 0, 0]));
+        let wait = memory.refuse_next();
+        assert_eq!(h.dispatcher.dispatch(&kernel, request, &mut memory, &h.reporter).unwrap(),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 });
+        assert_eq!(memory.read_bytes(0x1100, 6).unwrap(), [0; 6]);
+        assert_eq!(h.dispatcher.dispatch(&kernel, request, &mut memory, &h.reporter).unwrap(),
+            DispatchOutcome::Returned { value: 6 });
+        assert_eq!(memory.read_bytes(0x1100, 6).unwrap(), b"abcdef");
+        let drain = h.reserve(8);
+        assert_eq!(h.call(63, [reader, drain, 8, 0, 0, 0]), DispatchOutcome::errno(LINUX_EAGAIN));
+    }
+
+    #[test]
     fn blocked_sendfile_captures_input_and_output_before_input_reuse() {
         let mut h = Harness::new();
         let path = h.put_str("/sendfile-authority");

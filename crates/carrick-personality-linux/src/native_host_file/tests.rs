@@ -469,9 +469,9 @@ fn completion_copies_output_only_on_success() {
     let mut copied = Vec::new();
     let result = complete(&record, output, &mut |address, bytes| {
         copied.push((address, bytes.to_vec()));
-        true
+        carrick_core::user_copy::CopyOutcome::Done
     });
-    assert_eq!(result, SyscallResult::new(3));
+    assert_eq!(result, Ok(SyscallResult::new(3)));
     assert_eq!(copied, vec![(BASE, b"abc".to_vec())]);
     // No reply (refused or cancelled service) never copies anything.
     let (record, output, _) = request(run(
@@ -484,7 +484,7 @@ fn completion_copies_output_only_on_success() {
     ));
     assert_eq!(
         complete(&record, output, &mut |_, _| panic!("no output")),
-        SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO)
+        Ok(SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO))
     );
 }
 
@@ -938,4 +938,42 @@ fn ppoll_arrays_need_readable_input_and_writable_output_before_crossing() {
             access: Access::Write,
         })
     );
+}
+
+#[test]
+fn completion_preserves_typed_copy_refusals() {
+    use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest};
+    use carrick_guest_arch::{GuestLen, UserVa};
+    let mut user = memory(&[0; 32]);
+    let (mut record, output, _) = request(run(
+        HostFileCall::Read {
+            fd: 3,
+            buf: BASE,
+            count: 32,
+        },
+        &mut user,
+    ));
+    HostFileRequestView::parse(&mut record)
+        .unwrap()
+        .reply(3, b"abc")
+        .unwrap();
+    let not_yet = CopyOutcome::NotYet(GuestCopyRequest {
+        address: UserVa::new(BASE),
+        len: GuestLen::new(3),
+        access: Access::Write,
+    });
+    for refusal in [not_yet, CopyOutcome::Fault] {
+        assert_eq!(complete(&record, output, &mut |_, _| refusal), Err(refusal));
+        assert_eq!(host_file::reply(&record).unwrap().output, b"abc");
+    }
+    let mut copies = 0;
+    assert_eq!(
+        complete(&record, output, &mut |_, bytes| {
+            assert_eq!(bytes, b"abc");
+            copies += 1;
+            CopyOutcome::Done
+        }),
+        Ok(SyscallResult::new(3))
+    );
+    assert_eq!(copies, 1);
 }

@@ -4565,10 +4565,10 @@ mod tests {
             &mut |address, bytes| {
                 assert_eq!(address, pollfds.as_ptr().addr() as u64);
                 pollfds.copy_from_slice(bytes);
-                true
+                carrick_core::user_copy::CopyOutcome::Done
             },
         );
-        assert_eq!(result.raw(), 1, "readiness, not ENOSYS");
+        assert_eq!(result.unwrap().raw(), 1, "readiness, not ENOSYS");
         assert_eq!(pollfds, reply);
 
         // A mixed set keeps its route: the carrier cannot observe the pipe.

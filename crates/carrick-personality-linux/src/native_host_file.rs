@@ -1113,23 +1113,28 @@ pub fn map_source(record: &[u8]) -> Result<host_file::MapSourceReply, SyscallRes
 pub fn complete(
     record: &[u8],
     output: Option<HostFileOutput>,
-    copy_out: &mut dyn FnMut(u64, &[u8]) -> bool,
-) -> SyscallResult {
+    copy_out: &mut dyn FnMut(u64, &[u8]) -> carrick_core::user_copy::CopyOutcome,
+) -> Result<SyscallResult, carrick_core::user_copy::CopyOutcome> {
+    use carrick_core::user_copy::CopyOutcome;
     let Some(reply) = host_file::reply(record) else {
-        return SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO);
+        return Ok(SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO));
     };
     if reply.result < 0 {
-        return SyscallResult::new(reply.result);
+        return Ok(SyscallResult::new(reply.result));
     }
     if let Some(output) = output {
         if reply.output.len() > output.len {
-            return SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO);
+            return Ok(SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO));
         }
-        if !reply.output.is_empty() && !copy_out(output.address, reply.output) {
-            return SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT);
+        if !reply.output.is_empty() {
+            match copy_out(output.address, reply.output) {
+                CopyOutcome::Done => {}
+                CopyOutcome::Fault => return Err(CopyOutcome::Fault),
+                CopyOutcome::NotYet(request) => return Err(CopyOutcome::NotYet(request)),
+            }
         }
     }
-    SyscallResult::new(reply.result)
+    Ok(SyscallResult::new(reply.result))
 }
 
 /// Stamp a staged `Write` record with its writer's own `RLIMIT_FSIZE` soft
