@@ -3911,6 +3911,16 @@ impl carrick_hal::birth_serial::BirthSerialSource for PhysicalBirthSource {
     fn identity(&self) -> &carrick_hal::birth_serial::BirthSourceIdentity {
         &self.identity
     }
+    fn with_namespace(
+        &self,
+        expected: &carrick_hal::birth_serial::BirthSourceIdentity,
+        op: &mut dyn FnMut(&mut carrick_sched_core::process::identity_allocator::NamespaceView<'_>),
+    ) -> Result<(), carrick_hal::birth_serial::BirthSourceError> {
+        self.with_zone(expected, |zone| {
+            zone.namespace()
+                .with_view(&carrick_sched_core::ShortLockSpin, op);
+        })
+    }
     fn allocate_mm(
         &self,
         expected: &carrick_hal::birth_serial::BirthSourceIdentity,
