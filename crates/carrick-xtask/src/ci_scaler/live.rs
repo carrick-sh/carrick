@@ -33,6 +33,7 @@ struct StorageAdmission {
     retain_uncertain: std::cell::Cell<bool>,
 }
 impl StorageAdmission {
+    #[cfg(test)]
     fn acquire(node: &str, storage: &str) -> Result<Self, ScalerError> {
         Self::acquire_until(node, storage, None)
     }
@@ -1929,6 +1930,7 @@ struct Pass {
 /// Reconcile every active clone. One row's error does not starve the others.
 /// KVM CPU-ceiling stops retain their existing policy. Agent admission
 /// pressure freezes new work while reconciliation continues for live agents.
+#[cfg(test)]
 fn reconcile_all(
     pve: &Pve,
     gh: &Github,
@@ -4750,6 +4752,8 @@ case "$url" in
  */clone)
    case "$mode" in
      reject_400) printf '{"errors":{"newid":"already exists"}}\n400' ;;
+     transport) exit 7 ;;
+     missing_id) printf '{"data":null}\n200' ;;
      server_500) printf 'internal server error\n500' ;;
      ok) printf '{"data":"UPID:willow:ok"}\n200' ;;
      *) exit 93 ;;
@@ -4817,9 +4821,27 @@ esac
         std::fs::remove_file(dir.path().join("active_clone")).unwrap();
         pve.clear_volumes(CloneId::try_from(309).unwrap()).unwrap();
 
-        std::fs::write(dir.path().join("mode"), "ok").unwrap();
-        let token = pve.storage_admission().unwrap();
-        submit_clone(&pve, &mut ledger, &mut row, &path, &token).unwrap();
+        // Lost transport replies and missing task IDs retain uncertainty, but
+        // an empty active-task census permits the next production submission.
+        // Unwinding with the admission still owned exercises its real Drop path.
+        for mode in ["transport", "missing_id", "unwind"] {
+            std::fs::write(
+                dir.path().join("mode"),
+                if mode == "unwind" { "missing_id" } else { mode },
+            )
+            .unwrap();
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let token = pve.storage_admission().unwrap();
+                assert!(submit_clone(&pve, &mut ledger, &mut row, &path, &token).is_err());
+                if mode == "unwind" {
+                    panic!("recorded submission owner unwinds after losing task ID");
+                }
+            }));
+            assert_eq!(outcome.is_err(), mode == "unwind");
+            std::fs::write(dir.path().join("mode"), "ok").unwrap();
+            let token = pve.storage_admission().unwrap();
+            submit_clone(&pve, &mut ledger, &mut row, &path, &token).unwrap();
+        }
     }
 
     #[test]
