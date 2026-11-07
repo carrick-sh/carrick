@@ -3822,7 +3822,7 @@ impl<'a> ProcView<'a> {
             // valid; any other bit → EINVAL (LTP getrandom05). carrick draws
             // from the host CSPRNG regardless of the source/blocking flags.
             const GRND_SUPPORTED: u64 = 0x0001 | 0x0002 | 0x0004;
-            if flags & !GRND_SUPPORTED != 0 {
+            if flags & !GRND_SUPPORTED != 0 || flags & (0x0002 | 0x0004) == (0x0002 | 0x0004) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let length = usize::try_from(length).map_err(|_| DispatchError::LengthTooLarge(length))?;
@@ -3868,8 +3868,14 @@ impl<'a> ProcView<'a> {
                 // address fault returns the bytes already delivered, so retry
                 // never replaces an earlier random prefix with new data.
                 let mut bytes = vec![0; admitted];
-                if getrandom::fill(&mut bytes).is_err() {
-                    fill_deterministic_bootstrap_random(&mut bytes);
+                if fill_host_random(&mut bytes).is_err() {
+                    // Host entropy failure cannot authorize predictable bytes.
+                    // Preserve only a prefix already committed to the caller.
+                    return Ok(if offset == 0 {
+                        DispatchOutcome::errno(carrick_abi::LINUX_EIO)
+                    } else {
+                        DispatchOutcome::returned_len(offset)?
+                    });
                 }
                 if let Err(fault) = out.commit(&bytes) {
                     return Ok(if offset == 0 {
@@ -4666,14 +4672,30 @@ fn ptrace_poke_failure_errno(error: &PtracePokeFailure) -> LinuxErrno {
     }
 }
 
-fn fill_deterministic_bootstrap_random(bytes: &mut [u8]) {
-    let mut state = 0x00ca_221c_u64;
-    for byte in bytes {
-        state ^= state << 7;
-        state ^= state >> 9;
-        state ^= state << 8;
-        *byte = state as u8;
+// Fault injection is thread-local: unrelated dispatch tests keep the real source.
+#[cfg(test)]
+std::thread_local! {
+    static RANDOM_FAILURE_AFTER: core::cell::Cell<Option<usize>> = const {
+        core::cell::Cell::new(None)
+    };
+}
+
+fn fill_host_random(bytes: &mut [u8]) -> Result<(), getrandom::Error> {
+    #[cfg(test)]
+    if RANDOM_FAILURE_AFTER.with(|remaining| match remaining.get() {
+        Some(0) => {
+            remaining.set(None);
+            true
+        }
+        Some(count) => {
+            remaining.set(Some(count - 1));
+            false
+        }
+        None => false,
+    }) {
+        return Err(getrandom::Error::UNSUPPORTED);
     }
+    getrandom::fill(bytes)
 }
 
 /// Atomically load a cross-process futex word from its fork-coherent host address
@@ -8889,6 +8911,59 @@ mod copyout_refusal_s3_tests {
         }
         assert_eq!(memory.prepares, 0);
         assert_eq!(memory.read_bytes(BASE, 16).unwrap(), [FILL; 16]);
+    }
+
+    #[test]
+    fn getrandom_source_failure_preserves_uncommitted_destination() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = OwnerRefusingMemory::new(BASE, 16, FILL);
+        RANDOM_FAILURE_AFTER.with(|remaining| remaining.set(Some(0)));
+        let outcome = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::GETRANDOM.raw(),
+                    SyscallArgs::from([BASE, 8, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &CompatReporter::default(),
+            )
+            .unwrap();
+        assert_eq!(outcome, DispatchOutcome::errno(carrick_abi::LINUX_EIO));
+        assert_eq!(memory.read_bytes(BASE, 16).unwrap(), [FILL; 16]);
+        assert_eq!(memory.prepares, 1);
+    }
+
+    #[test]
+    fn getrandom_later_source_failure_returns_only_committed_prefix() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let chunk = super::super::copyout::COPYOUT_MAX_BYTES;
+        let mut memory = OwnerRefusingMemory::new(BASE, chunk * 2, FILL);
+        RANDOM_FAILURE_AFTER.with(|remaining| remaining.set(Some(1)));
+        let outcome = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::GETRANDOM.raw(),
+                    SyscallArgs::from([BASE, (chunk * 2) as u64, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &CompatReporter::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Returned {
+                value: chunk as i64
+            }
+        );
+        assert_eq!(
+            memory.read_bytes(BASE + chunk as u64, chunk).unwrap(),
+            vec![FILL; chunk]
+        );
+        assert_eq!(memory.prepares, 2);
     }
 
     #[test]

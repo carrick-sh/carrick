@@ -39,10 +39,24 @@ copyout witnesses; and x86 carrier transport coverage. Shared Rust logic alone
 does not prove the x86 physical transport. Signed Node/OpenSSL checks belong to
 the director and do not replace these VM-free witnesses.
 
-The existing root implementation also merits explicit Linux flag and failure
-controls: it accepts `GRND_RANDOM | GRND_INSECURE` and falls back to deterministic
-bootstrap bytes when its host RNG fails. Reusing that code is not evidence that
-those behaviors satisfy Linux or cryptographic failure semantics.
+The root handler now rejects `GRND_RANDOM | GRND_INSECURE` (flags 6 or 7)
+before the zero-length fast path or output preparation. The production-dispatch
+witness was red at flags 6, length 0: it returned 0 instead of errno 22. A native
+Linux diagnostic returned errno 22 at lengths 0 and 8 for both combinations.
+The witness also requires zero output preparations and unchanged user bytes.
+Linux authority: [getrandom(2)](https://man7.org/linux/man-pages/man2/getrandom.2.html)
+and that native diagnostic; Docker differential remains unrun.
+
+Host RNG failure now returns errno 5 before the first commit, or the count
+already committed if a later chunk fails. The deterministic bootstrap fallback
+is removed: a host facility failure must never silently deliver predictable
+entropy. Thread-local fault injection drives the production dispatcher on both the
+first and second fill. The witnesses require unchanged uncommitted bytes, one
+preparation per attempted chunk and only the committed prefix in the result.
+Restoring the old fallback under the same injected failures made both witnesses
+red: first-fill failure returned 8 instead of errno 5, and second-fill failure
+returned 8192 instead of the committed 4096. These handler corrections do not implement the native-child
+service, and neither child witness is enabled as passing acceptance.
 
 Socket and MAP_SHARED file mappings remain separate unimplemented siblings of
 this entropy slice. AF_UNIX remains in-zone. Private-file mapping support does
