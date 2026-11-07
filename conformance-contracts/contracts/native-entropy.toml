@@ -20,6 +20,6 @@ vm_free = [
 [bindings.unresolved]
 semantics = "The two VM-free witnesses are red and ignored pending implementation; errno 38 is a defect, not an accepted result. No native entropy service is implemented by this slice."
 structural = "Bounded staging and exact crossing counts require a typed entropy service and measured witnesses; the refusal tests do not prove them."
-x86 = "The x86 CPL0 carrier needs the same entropy venue; no x86 acceptance binding is registered yet."
+x86 = "The ignored KVM cpl0_initial_mm tests serial_host_native_child_getrandom_default_returns_eight_bytes and serial_host_native_child_getrandom_nonblock_returns_eight_bytes exercise fork, child getrandom and parent wait through the production pool. Native Linux exits 8 for both flags, KVM exits 218 (-38 modulo 256). The x86 carrier still needs typed entropy transport; these are defect witnesses, not acceptance."
 embed_structural = "UNRUN (director): signed fork-child getrandom, node -e and openssl rand on the implementation head."
 docker = "UNRUN: native Linux differential for flags, EFAULT and accessible-prefix short reads."

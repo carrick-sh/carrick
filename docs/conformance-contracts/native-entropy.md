@@ -61,3 +61,55 @@ service, and neither child witness is enabled as passing acceptance.
 Socket and MAP_SHARED file mappings remain separate unimplemented siblings of
 this entropy slice. AF_UNIX remains in-zone. Private-file mapping support does
 not prove MAP_SHARED support.
+
+## Physical x86 refusal witness
+
+The ignored `cpl0_initial_mm` tests
+`serial_host_native_child_getrandom_default_returns_eight_bytes` and
+`serial_host_native_child_getrandom_nonblock_returns_eight_bytes` now exercise
+the real KVM production pool. Their static assembly fixture forks, calls x86
+getrandom (318) in the child with an eight-byte stack buffer, and waits in the
+still-live parent. It exits 8 only for an exact eight-byte result, 218 for
+ENOSYS (-38), and 91 for other results or lifecycle failures. Native Linux
+returns 8 for both flag values; KVM returns 218 for both. These remain explicit
+red witnesses, outside the VM-free binding population.
+
+Each test runs its KVM work in a subprocess under `timeout --kill-after=1 10`.
+The guest's blocking parent wait cannot outlive that process deadline, even
+when no further VM exits occur. The wrapper was checked with a temporary
+expected result of 218: both tests completed successfully through the real
+KVM fixture. Restoring the expected result to 8 makes them fail again. That
+control proves execution and result propagation, not entropy support.
+
+## Implementation entry points still open
+
+The routing request spans a new ABI and retained completion, rather than a
+new ordinal match. The existing production paths make the missing work concrete:
+
+- `carrick-core-abi::service::ServiceOperation` needs a typed entropy payload
+  and checked encoding/decoding. Its `Crossing` variant carries no arguments
+  or output, and `Supplied` is explicitly quarantined by native completion.
+- `NativeProcess::begin_service_inner` in
+  `carrick-el1-linux/src/native_process_runtime/service.rs` already owns
+  service birth, exact member/MM authentication, terminal claims, cancellation
+  acknowledgment and retained payload lifetime. Entropy must extend that
+  owner, retaining bytes and cursor across copyout waits. `PendingHostFile`
+  illustrates the lifetime but is not the entropy venue.
+- ARM `NativeServiceStage` and `arm_native_service_exit` in
+  `carrick-el1-linux/src/dispatch.rs` stage requests after dispatch. The two
+  existing ARM witnesses must be extended through asynchronous completion and
+  resume before their return registers can prove success.
+- HVF `NativeService` in `metadata_grant/native_service.rs` retains and
+  authenticates staged guest payloads for carrier service. The entropy adapter
+  must invoke `proc::getrandom` against bounded staging memory, then write its
+  reply before acknowledging the same ticket.
+- x86 `linux_personality.rs` in `carrick-x86-cpl0` explicitly refuses
+  `CompletionRoute::NativeService`. Selecting that route alone still produces
+  ENOSYS. Its `anonymous.rs` physical crossing and
+  `carrick-x86-cpl0-host/src/cpl0_anonymous.rs` capture/completion are transport
+  examples, currently file-specific and restricted to private file mappings.
+  Both the CPL0 entry and carrier adapter need entropy transport.
+
+No entropy protocol, staging owner or carrier adapter is implemented here.
+The earlier root-handler fixes and these additional witnesses do not satisfy
+the issue's child-service acceptance criterion.
