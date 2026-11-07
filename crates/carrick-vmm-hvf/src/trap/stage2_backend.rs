@@ -1270,6 +1270,77 @@ mod tests {
     use super::*;
 
     #[test]
+    fn metadata_service_selects_its_carrier_with_two_live_regions() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let mapping = GuestMapping {
+            guest_start: carrick_el1_abi::EL1_REGION_BASE,
+            ipa_start: carrick_el1_abi::EL1_REGION_BASE,
+            mapped_size: carrick_el1_abi::EL1_REGION_SIZE,
+            offset_in_mapping: 0,
+            payload_size: 0,
+            perms: SegmentPerms {
+                read: true,
+                write: true,
+                execute: false,
+            },
+            shared: false,
+            image: std::sync::Arc::new(Vec::new()),
+            private_file_backing: None,
+        };
+        let a = CarrierVmCustody::new_live_fixture();
+        let b = CarrierVmCustody::new_live_fixture();
+        let first = prepare_exec_region_raw_in(&a, &mapping).expect("first carrier region");
+        let second = prepare_exec_region_raw_in(&b, &mapping).expect("second carrier region");
+        let mailbox = |region: &HvfMappedRegion| {
+            // SAFETY: both owned mappings stay live through the complete test;
+            // this fixed ABI record uses atomics for shared access.
+            unsafe {
+                &*region
+                    .host_addr
+                    .add(carrick_el1_abi::EL1_METADATA_MAILBOX_OFFSET as usize)
+                    .cast::<carrick_el1_abi::MetadataGrantMailbox>()
+            }
+        };
+        let first_mailbox = mailbox(&first);
+        let second_mailbox = mailbox(&second);
+        for (mailbox, cookie) in [(first_mailbox, 11), (second_mailbox, 22)] {
+            assert!(
+                mailbox.try_publish_request(carrick_el1_abi::MetadataGrantRequest {
+                    // Invalid operation completes without issuing any VMM work.
+                    op: u64::from(u32::MAX),
+                    arg1: 0,
+                    arg2: 0,
+                    arg3: 0,
+                    cookie,
+                })
+            );
+        }
+        let _ = crate::metadata_grant::service_pending_metadata_request(&a, a.live_generation());
+        assert_eq!(
+            first_mailbox
+                .claim_response()
+                .expect("first carrier completed")
+                .cookie,
+            11
+        );
+        assert_eq!(
+            second_mailbox
+                .state
+                .load(std::sync::atomic::Ordering::Acquire),
+            carrick_el1_abi::METADATA_MAILBOX_REQUESTED,
+            "peer request must remain untouched"
+        );
+        let _ = crate::metadata_grant::service_pending_metadata_request(&b, b.live_generation());
+        assert_eq!(
+            second_mailbox
+                .claim_response()
+                .expect("second carrier completed")
+                .cookie,
+            22
+        );
+    }
+
+    #[test]
     fn el1_aperture_pointer_retires_with_its_host_mapping() {
         let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let mapping = GuestMapping {

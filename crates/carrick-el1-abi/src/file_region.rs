@@ -333,6 +333,67 @@ impl Drop for FileRegionRegistration {
     }
 }
 
+#[cfg(test)]
+mod registration_mailbox_tests {
+    extern crate std;
+    use super::*;
+
+    #[test]
+    fn registered_metadata_mailbox_is_carrier_local_and_refuses_retirement() {
+        let layout = std::alloc::Layout::from_size_align(EL1_REGION_SIZE as usize, 4096)
+            .expect("region layout");
+        let allocate = || {
+            // SAFETY: exact page-aligned region allocation, retained below.
+            NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) }).expect("region allocation")
+        };
+        let first = allocate();
+        let second = allocate();
+        let binding = |identity| {
+            FileRegionBinding::new(
+                FileRegionId::from_carrier(NonZeroU64::new(identity).expect("identity")),
+                KernelVa::new(crate::EL1_REGION_BASE),
+                FrameGpa::new(crate::EL1_REGION_BASE),
+                GuestLen::new(EL1_REGION_SIZE),
+            )
+            .expect("binding")
+        };
+        {
+            // SAFETY: exclusive initialized extents outlive both registrations.
+            let mut a = unsafe { FileRegionRegistration::initialize(first, binding(1)) }
+                .expect("first registration");
+            // SAFETY: disjoint exclusive extent, retained until registration drop.
+            let b = unsafe { FileRegionRegistration::initialize(second, binding(2)) }
+                .expect("second registration");
+            let mailbox = a.metadata_mailbox().expect("live first carrier");
+            assert!(mailbox.try_publish_request(crate::MetadataGrantRequest {
+                op: crate::METADATA_GRANT_OP_ALLOC,
+                arg1: 4096,
+                arg2: 0,
+                arg3: 0,
+                cookie: 7,
+            }));
+            assert!(
+                b.metadata_mailbox()
+                    .expect("live second carrier")
+                    .claim_request()
+                    .is_none()
+            );
+            assert_eq!(mailbox.claim_request().expect("first request").cookie, 7);
+            a.retire();
+            assert!(matches!(
+                a.metadata_mailbox(),
+                Err(FileRegionError::Retired)
+            ));
+            assert!(b.metadata_mailbox().is_ok());
+        }
+        // SAFETY: registrations and every borrowed view are now gone.
+        unsafe {
+            std::alloc::dealloc(first.as_ptr(), layout);
+            std::alloc::dealloc(second.as_ptr(), layout);
+        }
+    }
+}
+
 fn check_mapping(mapped: NonNull<u8>, binding: FileRegionBinding) -> Result<(), FileRegionError> {
     FileRegionBinding::new(
         binding.identity,
