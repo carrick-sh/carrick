@@ -1677,6 +1677,138 @@ fn native_clock_requires_retained_payload_before_service_publication() {
     );
 }
 
+#[test]
+fn native_clock_sample_retains_reply_across_copyout_busy() {
+    use carrick_core_abi::clock::{CLOCK_RECORD_BYTES, ClockCapabilityId};
+    use carrick_core_abi::service::{ServiceCell, ServiceOperation};
+    use carrick_kernel::clock_service::{ClockResourceService, El1ZoneClockSleepWaker};
+    use carrick_kernel::kernel::container::ClockDomain;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let fixture = native_exec_fixture();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    service.child_copy_error = Some(NativeProcessError::Busy);
+    let clock = Arc::new(ClockDomain::deterministic(
+        UNIX_EPOCH + Duration::from_secs(1234),
+    ));
+    let resource = ClockResourceService::new(clock.clone(), Arc::new(El1ZoneClockSleepWaker));
+    take_signal_copies();
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry
+                .begin_clock_sample(
+                    ClockCapabilityId::new(NonZeroU64::MIN),
+                    carrick_abi::LINUX_CLOCK_REALTIME,
+                    UserVa::new(0x10000),
+                    carrick_guest_arch::NativeOrdinal::new(113),
+                )
+                .unwrap(),
+            NativeResume::Left(None)
+        ));
+        assert!(entry.take_handoff_receipt().is_some());
+    }
+    // Complete the resource request, then the copyout's physical-owner work.
+    // The second request must never sample the clock again.
+    for round in 0..2 {
+        assert!(fixture.zone.slot(fixture.slot).current().is_none());
+        let notice = fixture.task.service_notice.take().unwrap().unwrap();
+        let queue = fixture
+            .zone
+            .object_wait(
+                carrick_sched_core::object_wait::ObjectWaitKey::native_service(fixture.record)
+                    .unwrap(),
+                &carrick_sched_core::ShortLockSpin,
+            )
+            .unwrap();
+        // SAFETY: the fixture retains the exact member under its service queue.
+        let ticket = unsafe {
+            ServiceCell::claim_notice(
+                &fixture.control.service,
+                notice,
+                NonZeroU64::MIN,
+                fixture.zone.record(fixture.record.id).identity(),
+            )
+        }
+        .unwrap();
+        if round == 0 {
+            let ServiceOperation::Clock { payload, .. } = ticket.request().operation else {
+                panic!("sample must use a typed clock request");
+            };
+            assert_eq!(payload.length().raw(), CLOCK_RECORD_BYTES as u64);
+            // SAFETY: this ticket owns the ring's retained request allocation
+            // through ACK; the fixture models the carrier's mapped supervisor storage.
+            let record =
+                unsafe { &mut *(payload.address().raw() as *mut [u8; CLOCK_RECORD_BYTES]) };
+            resource.serve_record(record).unwrap();
+        } else {
+            assert!(matches!(
+                ticket.request().operation,
+                ServiceOperation::CarrierWork { .. }
+            ));
+            service.child_copy_error = None;
+        }
+        assert!(ticket.complete(true).is_ok());
+        queue
+            .notify_object(fixture.slot, &mut WakeEffects::default())
+            .unwrap();
+        drop(queue);
+        assert_eq!(
+            fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+            fixture.record.id
+        );
+        let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+            .unwrap()
+            .words;
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        let result = entry.resume_checkpoint(|_| Ok(None)).unwrap();
+        if round == 0 {
+            assert!(matches!(result, NativeResume::Left(None)));
+            // resume_checkpoint consumes the exact handoff receipt itself.
+            assert!(entry.take_handoff_receipt().is_none());
+            assert!(take_signal_copies().is_empty());
+            clock.advance(Duration::from_secs(10)).unwrap();
+        } else {
+            assert!(matches!(result, NativeResume::Returned(result) if result.raw() == 0));
+        }
+    }
+    let mut expected = 1234u64.to_le_bytes().to_vec();
+    expected.extend_from_slice(&0u64.to_le_bytes());
+    assert_eq!(take_signal_copies(), [(UserVa::new(0x10000), expected)]);
+    assert!(
+        !fixture
+            .runtime
+            .graph
+            .lock()
+            .has_member_wait(&fixture.record)
+    );
+    assert_eq!(carrick_el1_abi::Lifecycle::claimed_count(fixture.page), 0);
+}
+
 /// These are corrupt custody, not a sibling holding a releasable resource.
 /// Drive the same begin/settle pair as arm_native_service_exit: an exact
 /// member may have only one cell, pending row and execution-lane notice.
