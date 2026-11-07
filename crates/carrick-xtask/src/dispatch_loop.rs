@@ -4835,7 +4835,10 @@ mod tests {
                 (1800, 1794, "APPROVE"),
             ] {
                 let mut s = server(root);
-                s.trigger = json!({"body": format!("review PR #{pr} only; change no code and push nothing")});
+                s.trigger = json!({
+                    "body": format!("review PR #{pr} only; change no code and push nothing"),
+                    "created_at": "2026-11-07T06:00:00Z"
+                });
                 s.dispatch.round_kind =
                     RoundKind::from_trigger("review PR #800 only; change no code and push nothing");
                 let mut live: Value =
@@ -4845,6 +4848,8 @@ mod tests {
                 std::fs::write(root.join("behind"), "2").unwrap();
                 std::fs::write(root.join("stop-reviews.json"), json!([[{
                     "commit_id": "a".repeat(40), "state": "COMMENTED",
+                    "user": {"login": "tjfontaine", "type": "User"},
+                    "submitted_at": "2026-11-07T06:05:00Z",
                     "body": format!("Verdict: {verdict}"),
                     "html_url": "https://github.com/carrick-sh/carrick/pull/800#pullrequestreview-123"
                 }]]).to_string()).unwrap();
@@ -5098,6 +5103,392 @@ mod tests {
                 .unwrap();
                 assert_eq!(contract["review"], false, "stale review evidence survived");
             }
+        });
+    }
+    #[test]
+    fn replay_1813_rejects_untrusted_pull_review_authors() {
+        // Independent review P1 #1 on #1816: in a public repository, neither an
+        // unprivileged GitHub user nor the shared carrick-workers[bot] App may
+        // supply a review-round verdict via pulls/{pr}/reviews.
+        shared_fixture(|root| {
+            current_pr(root);
+            std::fs::create_dir_all(crate::agent_runner::state().unwrap()).unwrap();
+            std::fs::write(root.join("behind"), "2").unwrap();
+            for user in [
+                json!({"login": "mallory", "type": "User"}),
+                json!({"login": "carrick-workers[bot]", "type": "Bot"}),
+            ] {
+                let mut s = server(root);
+                s.trigger = json!({
+                    "body": "review PR #800 only; change no code and push nothing",
+                    "created_at": "2026-11-07T10:55:11Z"
+                });
+                s.dispatch.round_kind = RoundKind::Review { pr: 800 };
+                std::fs::write(
+                    root.join("stop-reviews.json"),
+                    json!([[{
+                        "commit_id": "a".repeat(40),
+                        "state": "COMMENTED",
+                        "user": user,
+                        "submitted_at": "2026-11-07T11:00:00Z",
+                        "body": "Verdict: APPROVE",
+                        "html_url": "https://github.com/carrick-sh/carrick/pull/800#pullrequestreview-999"
+                    }]])
+                    .to_string(),
+                )
+                .unwrap();
+                s.outcome(ContractStatus::Done, "Review finished; pushed nothing")
+                    .unwrap();
+                let posted = regular_text(&root.join("posted.md")).unwrap();
+                assert_eq!(outcome_status(&posted), Some("Failed"), "{user}: {posted}");
+                assert!(
+                    posted.contains("no verdict published"),
+                    "untrusted review accepted for {user}: {posted}"
+                );
+                assert!(!posted.contains("Published review verdict:"));
+                let contract: Value = serde_json::from_str(
+                    &regular_text(&root.join("dispatch-output/contract.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(contract["review"], false, "{user}: {contract}");
+            }
+        });
+    }
+    #[test]
+    fn replay_1813_rejects_pre_existing_and_author_self_reviews() {
+        // Independent review P1 #2 on #1816: a review round must not adopt a
+        // #1783 code-worker self-review from the authoring run, an owner review
+        // submitted before the round's trigger, or an earlier run's bot comment.
+        shared_fixture(|root| {
+            let head = "f0597f6702f1d5cf6e3cba351e0ba340f1173a96";
+            current_pr(root);
+            let mut pr: Value =
+                serde_json::from_str(&regular_text(&root.join("pr.json")).unwrap()).unwrap();
+            pr["head"]["sha"] = json!(head);
+            std::fs::write(root.join("pr.json"), pr.to_string()).unwrap();
+            std::fs::write(root.join("prs.json"), json!([pr]).to_string()).unwrap();
+            std::fs::write(root.join("remote-tip"), head).unwrap();
+            std::fs::write(root.join("behind"), "38").unwrap();
+            for (label, reviews, comments) in [
+                (
+                    "code-round #1783 worker self-review (#pullrequestreview-5811046884)",
+                    json!([[{
+                        "commit_id": head,
+                        "state": "COMMENTED",
+                        "user": {"login": "github-actions[bot]", "type": "Bot"},
+                        "submitted_at": "2026-11-07T08:24:34Z",
+                        "body": format!("## Worker review\n\nReviewed head: {head}\n\nThis is the worker's own review; it is not an independent review.\n\nVerdict: APPROVE\n\nWorker self-review."),
+                        "html_url": "https://github.com/carrick-sh/carrick/pull/800#pullrequestreview-5811046884"
+                    }]]),
+                    json!([[]]),
+                ),
+                (
+                    "owner review submitted before review-round trigger",
+                    json!([[{
+                        "commit_id": head,
+                        "state": "COMMENTED",
+                        "user": {"login": "tjfontaine", "type": "User"},
+                        "submitted_at": "2026-11-07T09:00:00Z",
+                        "body": "Verdict: APPROVE",
+                        "html_url": "https://github.com/carrick-sh/carrick/pull/800#pullrequestreview-5811500000"
+                    }]]),
+                    json!([[]]),
+                ),
+                (
+                    "earlier dispatch run bot verdict comment",
+                    json!([[]]),
+                    json!([[{
+                        "user": {"login": "github-actions[bot]", "type": "Bot"},
+                        "created_at": "2026-11-07T05:58:00Z",
+                        "body": format!("Verdict: APPROVE\n\nIndependent review at `{head}`.\n\nDispatch run: https://github.com/carrick-sh/carrick/actions/runs/42340834840\n"),
+                        "html_url": "https://github.com/carrick-sh/carrick/pull/800#issuecomment-6703084419"
+                    }]]),
+                ),
+            ] {
+                let state = crate::agent_runner::state().unwrap();
+                if state.exists() {
+                    std::fs::remove_dir_all(&state).unwrap();
+                }
+                std::fs::create_dir_all(&state).unwrap();
+                std::fs::write(root.join("stop-reviews.json"), reviews.to_string()).unwrap();
+                std::fs::write(root.join("layer-comments.json"), comments.to_string()).unwrap();
+                let mut s = server(root);
+                s.trigger = json!({
+                    "body": "review PR #800 only; change no code and push nothing",
+                    "created_at": "2026-11-07T10:55:11Z"
+                });
+                s.dispatch.round_kind = RoundKind::Review { pr: 800 };
+                s.dispatch.selected_tip = Some(head.into());
+                s.outcome(ContractStatus::Done, "Review finished without publishing")
+                    .unwrap();
+                let posted = regular_text(&root.join("posted.md")).unwrap();
+                assert_eq!(outcome_status(&posted), Some("Failed"), "{label}: {posted}");
+                assert!(posted.contains("no verdict published"), "{label}: {posted}");
+                assert!(
+                    !posted.contains("Published review verdict:"),
+                    "{label}: {posted}"
+                );
+            }
+        });
+    }
+    #[test]
+    fn replay_1813_timed_out_review_round_stays_failed() {
+        // Replay PR #1799#issuecomment-6705111601 (timed-out review round on #887)
+        // when the head already carries a #1783 code-worker self-review and the
+        // timed-out worker left an incomplete review draft.
+        shared_fixture(|root| {
+            let head = "f4b65976d06a31b7156ef5f47f3400bbf08fb0f4";
+            let state = crate::agent_runner::state().unwrap();
+            std::fs::create_dir_all(state.join("work")).unwrap();
+            current_pr(root);
+            let mut pr: Value =
+                serde_json::from_str(&regular_text(&root.join("pr.json")).unwrap()).unwrap();
+            pr["head"]["sha"] = json!(head);
+            std::fs::write(root.join("pr.json"), pr.to_string()).unwrap();
+            std::fs::write(root.join("prs.json"), json!([pr]).to_string()).unwrap();
+            std::fs::write(root.join("remote-tip"), head).unwrap();
+            std::fs::write(root.join("replay-head"), head).unwrap();
+            std::fs::write(root.join("replay-commits"), "0").unwrap();
+            std::fs::write(root.join("behind"), "18").unwrap();
+            std::fs::write(
+                root.join("stop-reviews.json"),
+                json!([[{
+                    "commit_id": head,
+                    "state": "COMMENTED",
+                    "user": {"login": "github-actions[bot]", "type": "Bot"},
+                    "submitted_at": "2026-11-07T07:57:50Z",
+                    "body": format!("## Worker review\n\nReviewed head: {head}\n\nThis is the worker's own review; it is not an independent review.\n\nVerdict: APPROVE\n\nAuthor self-review."),
+                    "html_url": "https://github.com/carrick-sh/carrick/pull/800#pullrequestreview-5810308741"
+                }]])
+                .to_string(),
+            )
+            .unwrap();
+            let contract = Contract {
+                status: ContractStatus::Failed,
+                summary: "No valid worker contract\nWorker timed out; partial work harvested for continuation".into(),
+                tests: vec![],
+                risks: vec!["Worker output is incomplete".into()],
+                loop_summary: None,
+                review: Review::Published(false),
+            };
+            let mut s = server(root);
+            s.trigger = json!({
+                "body": "review PR #800 only; change no code and push nothing",
+                "created_at": "2026-11-07T08:23:09Z"
+            });
+            s.dispatch.round_kind = RoundKind::Review { pr: 800 };
+            s.dispatch.selected_tip = Some(head.into());
+            s.used.workers = 1;
+            s.history.push(contract.clone());
+            let package = root.join("dispatch-output");
+            std::fs::create_dir_all(&package).unwrap();
+            std::fs::write(
+                package.join("contract.json"),
+                serde_json::to_vec(&contract).unwrap(),
+            )
+            .unwrap();
+            Applied::record(|a| {
+                a.last_worker_exit = Some(LauncherExit::TimedOut);
+            })
+            .unwrap();
+            let receipt = super::super::Receipt {
+                head: head.into(),
+                checkpointed: false,
+                base: s.dispatch.base.clone(),
+                branch: s.dispatch.branch.clone(),
+                exit_code: 124,
+                expected_tip: head.into(),
+                pr_body: None,
+                review_text: Some("Verdict: APPROVE\n\nIncomplete draft before timeout.".into()),
+                worker: s.dispatch.worker.clone(),
+                contract,
+            };
+            std::fs::write(
+                state.join("receipt.json"),
+                serde_json::to_vec(&receipt).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(s.checkpoint_publish(), None);
+            assert!(!root.join("published-review.json").exists());
+            let refusal = s
+                .execute(Request::Publish(Empty {}))
+                .expect_err("timed-out review worker published")
+                .to_string();
+            assert!(
+                !refusal.contains("rebase onto admitted main"),
+                "timed-out review round demanded code rebase: {refusal}"
+            );
+            s.outcome(
+                ContractStatus::Failed,
+                "The worker timed out after 2219s without completing the review contract.",
+            )
+            .unwrap();
+            let posted = regular_text(&root.join("posted.md")).unwrap();
+            assert_eq!(outcome_status(&posted), Some("Failed"), "{posted}");
+            assert!(
+                posted.contains(
+                    "the last worker failed, timed out, or did not produce complete output (exit status 124, director timeout fired)"
+                ),
+                "{posted}"
+            );
+            assert!(!posted.contains("Published review verdict:"), "{posted}");
+            assert!(!posted.contains("Contract violation:"), "{posted}");
+            assert!(!root.join("published-review.json").exists());
+        });
+    }
+    #[test]
+    fn replay_1813_director_owned_unrun_signed_check_never_fails_round() {
+        // Replay #1813#issuecomment-6704778428 (#887 / PR #1799 at f4b65976d):
+        // a director-owned UNRUN check (signed HVF on Linux) is neither a pass
+        // nor a failure. It never fails a pushed code round or verdicted review
+        // round, and never turns an unpushed/failed round into Done.
+        let head = "f4b65976d06a31b7156ef5f47f3400bbf08fb0f4";
+        fn setup_pushed_887<'a>(root: &'a Path, head: &str) -> Server<'a> {
+            let state = crate::agent_runner::state().unwrap();
+            if state.exists() {
+                std::fs::remove_dir_all(&state).unwrap();
+            }
+            std::fs::create_dir_all(state.join("work")).unwrap();
+            let _ = std::fs::remove_file(root.join("posted.md"));
+            current_pr(root);
+            let mut pr: Value =
+                serde_json::from_str(&regular_text(&root.join("pr.json")).unwrap()).unwrap();
+            pr["head"]["sha"] = json!(head);
+            std::fs::write(root.join("pr.json"), pr.to_string()).unwrap();
+            std::fs::write(root.join("prs.json"), json!([pr]).to_string()).unwrap();
+            std::fs::write(root.join("remote-tip"), head).unwrap();
+            std::fs::write(root.join("replay-head"), head).unwrap();
+            std::fs::write(root.join("replay-commits"), "1").unwrap();
+            std::fs::write(root.join("behind"), "9").unwrap();
+            std::fs::write(state.join("published-tip"), head).unwrap();
+            let contract = Contract {
+                status: ContractStatus::Done,
+                summary: "Committed f4b65976d. Wrote ../pr-body.md and ../review.md.".into(),
+                tests: vec![
+                    "PASS: just test-el1-native — 735 passed, 1 ignored".into(),
+                    "PASS: just build-cpl0".into(),
+                    "PASS: just check-linux".into(),
+                    "PASS: cargo test -p carrick-sched-core --lib — 268 passed".into(),
+                    "PASS: just check-contract-change 088180cb26af4c42272bd0951871bfbeaec0c0fc HEAD".into(),
+                    "UNRUN: signed HVF 20× population — unsupported host".into(),
+                ],
+                risks: vec![
+                    "20× signed HVF population unavailable on this Linux runner; director must verify zero carrier fatals.".into(),
+                ],
+                loop_summary: None,
+                review: Review::Published(true),
+            };
+            let package = root.join("dispatch-output");
+            std::fs::create_dir_all(&package).unwrap();
+            std::fs::write(
+                package.join("contract.json"),
+                serde_json::to_vec(&contract).unwrap(),
+            )
+            .unwrap();
+            Applied::record(|a| {
+                a.wip_pushed = Some(head.into());
+                a.wip_exit = Some(LauncherExit::Clean);
+                a.commits = vec![head.into()];
+                a.new_commits = vec![head.into()];
+                a.publication_pr = Some(800);
+                a.review = true;
+                a.review_head = Some(head.into());
+                a.review_url = Some(
+                    "https://github.com/carrick-sh/carrick/pull/800#pullrequestreview-5810308741"
+                        .into(),
+                );
+            })
+            .unwrap();
+            let mut s = server(root);
+            s.used.workers = 1;
+            s.used.publishes = 1;
+            s.history.push(contract.clone());
+            let receipt = super::super::Receipt {
+                head: head.into(),
+                checkpointed: false,
+                base: s.dispatch.base.clone(),
+                branch: s.dispatch.branch.clone(),
+                exit_code: 0,
+                expected_tip: s.dispatch.base.clone(),
+                pr_body: None,
+                review_text: None,
+                worker: s.dispatch.worker.clone(),
+                contract,
+            };
+            std::fs::write(
+                state.join("receipt.json"),
+                serde_json::to_vec(&receipt).unwrap(),
+            )
+            .unwrap();
+            s
+        }
+        shared_fixture(|root| {
+            // 1. Coordinator finishes Blocked over director-owned UNRUN signed check.
+            let mut s = setup_pushed_887(root, head);
+            s.execute(Request::Finish(Outcome {
+                status: FinishStatus::Blocked,
+                summary: "Pushed f4b65976d; UNRUN: signed HVF 20× population — unsupported host (director-owned).".into(),
+                brief: None,
+            }))
+            .expect("director-owned UNRUN Blocked finish must not be refused");
+            let posted = regular_text(&root.join("posted.md")).unwrap();
+            assert_eq!(
+                outcome_status(&posted),
+                Some("Done"),
+                "Blocked case: {posted}"
+            );
+            assert!(!posted.contains("Contract violation:"), "{posted}");
+
+            // 2. Coordinator finishes Failed solely over director-owned UNRUN signed check.
+            let mut s = setup_pushed_887(root, head);
+            s.execute(Request::Finish(Outcome {
+                status: FinishStatus::Failed,
+                summary: "UNRUN: signed HVF 20× population — unsupported host.".into(),
+                brief: None,
+            }))
+            .unwrap();
+            let posted = regular_text(&root.join("posted.md")).unwrap();
+            assert_eq!(
+                outcome_status(&posted),
+                Some("Done"),
+                "Failed case: {posted}"
+            );
+
+            // 3. Recorded #887 07:58 outcome (#issuecomment-6704194137): worker Done,
+            // published, coordinator timed out before calling finish.
+            let mut s = setup_pushed_887(root, head);
+            s.outcome(ContractStatus::Failed, "loop timed out without finish")
+                .unwrap();
+            let posted = regular_text(&root.join("posted.md")).unwrap();
+            assert_eq!(
+                outcome_status(&posted),
+                Some("Done"),
+                "07:58 replay: {posted}"
+            );
+
+            // 4. Negative control: director-owned UNRUN is not a pass either —
+            // a stalled round that pushed nothing stays Failed.
+            let mut s = setup_pushed_887(root, head);
+            let state = crate::agent_runner::state().unwrap();
+            std::fs::remove_file(state.join("published-tip")).unwrap();
+            Applied::record(|a| {
+                a.wip_pushed = None;
+                a.commits.clear();
+                a.new_commits.clear();
+            })
+            .unwrap();
+            std::fs::write(root.join("replay-commits"), "0").unwrap();
+            s.outcome(
+                ContractStatus::Failed,
+                "UNRUN: signed HVF 20× population — unsupported host.",
+            )
+            .unwrap();
+            let posted = regular_text(&root.join("posted.md")).unwrap();
+            assert_eq!(
+                outcome_status(&posted),
+                Some("Failed"),
+                "unpushed round must not pass from director UNRUN: {posted}"
+            );
         });
     }
     #[test]
@@ -9034,8 +9425,10 @@ if test "$1 $2 $3" = 'api -X POST' && test "$4" = repos/carrick-sh/carrick/pulls
 import json,pathlib,sys
 r=pathlib.Path(sys.argv[2]);v=json.loads(pathlib.Path(sys.argv[1]).read_text())
 (r/"published-review.json").write_text(json.dumps(v))
-v.update(state="COMMENTED",html_url="https://github.com/carrick-sh/carrick/pull/800#pullrequestreview-123")
-(r/"stop-reviews.json").write_text(json.dumps([[v]]))
+p=r/"stop-reviews.json"
+existing=json.loads(p.read_text())[0] if p.exists() else []
+v.update(state="COMMENTED",user={"login":"github-actions[bot]","type":"Bot"},submitted_at="2026-11-07T12:30:00Z",html_url=f"https://github.com/carrick-sh/carrick/pull/800#pullrequestreview-{123+len(existing)}")
+p.write_text(json.dumps([existing+[v]]))
 print(json.dumps({"html_url":v["html_url"]}))
 REVIEW
  exit 0
