@@ -67,10 +67,20 @@ formatting, diff whitespace and the contract-change check against admitted
 main passed. The built `carrick-xtask authority-debt --source-only` checker
 and its admitted-base comparison passed with 1266 source counters.
 
-The macOS all-target compile phase passed. At this record's writing its
-Clippy phase, host Clippy, embed unit suites and final test-scope reruns are
-still pending behind runner filesystem-journal I/O stalls; no completed
-result is claimed for them here. Signed and Docker execution are unavailable
-on this Linux runner (Docker executable absent). KVM is accessible, but its
-runtime merge-queue gate was not run. Whole-workspace lint-domains and
-test-kernel were deliberately left to CI.
+The full `just cross-check-macos` (all-target compile and Clippy), host
+`just clippy`, and both `just xtask authority-debt --source-only` invocations
+(with and without the admitted base) subsequently completed successfully.
+Embed unit tests passed 118 regular cases and defined no serial cases.
+After the final test-only proof-lifetime edits, the nine runtime core cases
+and x86 production-entry case passed again. A confirming independent code
+review of `395092309` found no outstanding findings.
+
+Earlier compiler commands were interrupted after sustained runner
+filesystem-journal I/O stalls. Their logs remain separate; success is based
+on the completing sequence, not those interrupted commands. No guest test
+verdict was retried to obtain success.
+
+Signed and Docker execution are unavailable on this Linux runner (Docker
+executable absent). KVM is accessible, but its runtime merge-queue gate was
+not run. Whole-workspace lint-domains and test-kernel were deliberately left
+to CI. The signed acceptance requirements above remain open.
