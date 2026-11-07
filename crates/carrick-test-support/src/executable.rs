@@ -21,6 +21,9 @@ pub fn write_executable(
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new(".")),
     )?;
+    // tempfile creation is subject to the caller's umask, including 0777.
+    // chmod owns the private directory mode without changing process state.
+    std::fs::set_permissions(staging.path(), std::fs::Permissions::from_mode(0o700))?;
     let staged = staging.path().join("executable");
     let mut child = Command::new("/bin/cp")
         .arg("/dev/stdin")
@@ -68,5 +71,12 @@ mod tests {
         write_executable(&path, b"#!/bin/sh\nexit 0\n", 0o700).unwrap();
         assert!(Command::new(&path).status().unwrap().success());
         drop(old_writer);
+        for mask in [0o002, 0o777] {
+            let previous = unsafe { libc::umask(mask) };
+            let written = write_executable(&path, b"#!/bin/sh\nexit 0\n", 0o700);
+            unsafe { libc::umask(previous) };
+            written.unwrap();
+            assert!(Command::new(&path).status().unwrap().success());
+        }
     }
 }
