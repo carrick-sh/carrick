@@ -217,13 +217,25 @@ impl TerminalAccess<'_> {
 
 /// The exact thread identity and personality cursor survive every memory park.
 /// No lane may resume this payload using another thread's execution binding.
-pub struct ThreadCleanup<P> {
+pub struct ThreadCleanup<'a, P> {
     identity: ThreadTerminalIdentity,
     payload: P,
+    admission: Option<crate::lifecycle::ExitAdmission<'a>>,
 }
-impl<P> ThreadCleanup<P> {
+impl<'a, P> ThreadCleanup<'a, P> {
     pub fn new(identity: ThreadTerminalIdentity, payload: P) -> Self {
-        Self { identity, payload }
+        Self {
+            identity,
+            payload,
+            admission: None,
+        }
+    }
+    /// Keep the admitted ABI window alive while the personality cursor parks.
+    pub fn retain_admission(&mut self, admission: crate::lifecycle::ExitAdmission<'a>) {
+        self.admission = Some(admission);
+    }
+    pub fn take_admission(&mut self) -> Option<crate::lifecycle::ExitAdmission<'a>> {
+        self.admission.take()
     }
     pub fn identity(&self) -> ThreadTerminalIdentity {
         self.identity

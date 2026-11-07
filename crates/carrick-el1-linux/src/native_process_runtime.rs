@@ -1224,13 +1224,15 @@ enum PendingKey {
     Member(RecordRef),
     Cleanup(RecordRef),
 }
-type ThreadCleanup =
-    carrick_core::terminal::ThreadCleanup<carrick_personality_linux::thread_cleanup::ThreadCleanup>;
+type ThreadCleanup<'a> = carrick_core::terminal::ThreadCleanup<
+    'a,
+    carrick_personality_linux::thread_cleanup::ThreadCleanup,
+>;
 enum PendingState<'a> {
     Operation(PendingContinuation),
     Exit(Box<PendingExit<'a>>),
     Member(MemberWaitState<'a>),
-    Cleanup(Box<ThreadCleanup>),
+    Cleanup(Box<ThreadCleanup<'a>>),
 }
 #[derive(Default)]
 struct PendingTable<'a> {
@@ -1245,13 +1247,13 @@ impl<'a> PendingTable<'a> {
     fn take_row(&mut self, key: &PendingKey) -> Option<PendingState<'a>> {
         self.rows.remove(key).map(|row| *row)
     }
-    fn take_cleanup(&mut self, record: RecordRef) -> Option<Box<ThreadCleanup>> {
+    fn take_cleanup(&mut self, record: RecordRef) -> Option<Box<ThreadCleanup<'a>>> {
         match self.take_row(&PendingKey::Cleanup(record))? {
             PendingState::Cleanup(owner) => Some(owner),
             _ => unreachable!(),
         }
     }
-    fn put_cleanup(&mut self, record: RecordRef, owner: Box<ThreadCleanup>) {
+    fn put_cleanup(&mut self, record: RecordRef, owner: Box<ThreadCleanup<'a>>) {
         self.insert_row(PendingKey::Cleanup(record), PendingState::Cleanup(owner));
     }
     fn has_cleanup(&self, record: RecordRef) -> bool {
@@ -5696,7 +5698,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
             Err(_) => return Err(NativeProcessError::Quarantined),
         };
-        let mut admission = match page.begin_exit(entry) {
+        let retained_admission = self
+            .runtime
+            .graph
+            .lock()
+            .pending
+            .take_cleanup(self.record)
+            .and_then(|mut cleanup| cleanup.take_admission());
+        let mut admission = match retained_admission
+            .map(Ok)
+            .unwrap_or_else(|| page.begin_exit(entry))
+        {
             Ok(admission) => Some(admission),
             Err(carrick_core::lifecycle::TransitionError::GateClosed(gate))
                 if gate.is_terminal() =>

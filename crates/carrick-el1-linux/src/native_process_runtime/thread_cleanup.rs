@@ -122,14 +122,36 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 let identity =
                     ThreadTerminalIdentity::from_exit(self.binding, self.control.entry(), status)
                         .ok_or(NativeProcessError::Stale)?;
-                Box::new(carrick_core::terminal::ThreadCleanup::new(
+                let mut cleanup = Box::new(carrick_core::terminal::ThreadCleanup::new(
                     identity,
                     carrick_personality_linux::thread_cleanup::ThreadCleanup::new(
                         self.control.robust_list().0,
                         self.calling_tid,
                         self.control.clear_child_tid(),
                     ),
-                ))
+                ));
+                // Process close has its own admitted terminal transaction.
+                // A raw pooled exit must retain its ABI admission before any
+                // memory wait, so a later fork cannot revoke the exit window.
+                let graph = self.runtime.graph.lock();
+                if !graph.pending.has_exit(&self.key)
+                    && let Some(entry) = self.control.entry()
+                {
+                    let page = graph
+                        .owner
+                        .task(self.key)
+                        .map_err(|_| NativeProcessError::Stale)?
+                        .native()
+                        .resources()
+                        .page;
+                    match page.begin_exit(entry) {
+                        Ok(admission) => cleanup.retain_admission(admission),
+                        Err(carrick_core::lifecycle::TransitionError::GateClosed(gate))
+                            if gate.is_terminal() => {}
+                        Err(_) => return Err(NativeProcessError::Quarantined),
+                    }
+                }
+                cleanup
             }
         };
         loop {
