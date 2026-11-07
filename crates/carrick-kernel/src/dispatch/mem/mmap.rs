@@ -1487,12 +1487,13 @@ impl<'a> MemView<'a> {
                     && map_flags.contains(LinuxMmapFlags::ANONYMOUS | LinuxMmapFlags::DROPPABLE))
                     || (map_sharing == MmapSharing::Shared
                         && !map_flags.contains(LinuxMmapFlags::ANONYMOUS)));
-            let address_uses_alias = owner_host_snapshot || mmap_request_uses_alias(
+            let owner_proposal = this.mem().lock().has_owner_proposal();
+            let address_uses_alias = !owner_proposal && (owner_host_snapshot || mmap_request_uses_alias(
                 map_flags.contains(LinuxMmapFlags::FIXED),
                 address_uses_alias_layout,
                 has_identity_backing,
                 in_arena,
-            );
+            ));
             // Move-3 E1: an eligible MAP_PRIVATE file mmap lowers to ONE host
             // file-backed `MAP_PRIVATE|MAP_FIXED` mapping (demand-paged from
             // the unified buffer cache) instead of the eager full-length
@@ -1620,8 +1621,13 @@ impl<'a> MemView<'a> {
                 // is fatal only inside the eager arena (where eager backends
                 // must succeed); an out-of-arena protect_range failure is
                 // benign (KVM/NVMM host-map lazily, HVF maps the arena eagerly).
-                if let Err(error) = memory.protect_range(address, length_usize, 0)
-                    && (in_arena || memory.supports_concurrent_exec_protection())
+                let publication = if owner_proposal {
+                    memory.protect_owner_reserved_range(address, length_usize, 0)
+                } else {
+                    memory.protect_range(address, length_usize, 0)
+                };
+                if let Err(error) = publication
+                    && (owner_proposal || in_arena || memory.supports_concurrent_exec_protection())
                 {
                     mark_range_unmapped(memory, address, length_usize);
                     return Ok(request.refused_by(
@@ -1708,8 +1714,13 @@ impl<'a> MemView<'a> {
                 let initial_prot = if defer_anonymous { 0 } else { prot };
                 // Unconditional (see the PROT_NONE arm above): reserve across
                 // the whole arena for demand-paged backends; fatal only in-arena.
-                if let Err(error) = memory.protect_range(address, length_usize, initial_prot)
-                    && (in_arena || memory.supports_concurrent_exec_protection())
+                let publication = if owner_proposal {
+                    memory.protect_owner_reserved_range(address, length_usize, initial_prot)
+                } else {
+                    memory.protect_range(address, length_usize, initial_prot)
+                };
+                if let Err(error) = publication
+                    && (owner_proposal || in_arena || memory.supports_concurrent_exec_protection())
                 {
                     mark_range_unmapped(memory, address, length_usize);
                     return Ok(request.refused_by(
@@ -2674,8 +2685,9 @@ impl<'a> MemView<'a> {
             // to assert EINVAL) are already rejected by the alignment gate above;
             // addresses outside the guest user VA range stay EINVAL below.
             let layout = this.mem().lock().layout;
-            if this.range_is_alias_vma(address.0, length)
-                || mmap_address_uses_alias(address.0, length, layout, user_ceiling)
+            let owner_proposal = this.mem().lock().has_owner_proposal();
+            if !owner_proposal && (this.range_is_alias_vma(address.0, length)
+                || mmap_address_uses_alias(address.0, length, layout, user_ceiling))
             {
                 let Ok(len_usize) = usize::try_from(aligned_len) else {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
@@ -2698,7 +2710,7 @@ impl<'a> MemView<'a> {
                 }
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
-            if !range_within(address.0, length, layout.mmap_base, layout.mmap_size) {
+            if !owner_proposal && !range_within(address.0, length, layout.mmap_base, layout.mmap_size) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let Ok(len_usize) = usize::try_from(aligned_len) else {
@@ -3972,7 +3984,8 @@ impl<'a> MemView<'a> {
             // post-unmap view even after this mm's stage-1/stage-2 translations
             // were retired. Only a successful host-alias transaction publishes
             // the range, and unmap/replacement trims it with the VMA metadata.
-            let lazy_alias_reservation = (!metadata_says_unmapped
+            let owner_proposal = this.mem().lock().has_owner_proposal();
+            let lazy_alias_reservation = (!owner_proposal && !metadata_says_unmapped
                 && !prot_flags.is_empty()
                 && address_is_alias_vma
                 && !this.range_has_host_alias_backing(address.0, length))
@@ -4199,8 +4212,7 @@ impl<'a> MemView<'a> {
             // Unbacked shared/overlay apertures keep host-side checks only.
             // A committed high-VA alias has a live stage-1 translation, so its
             // protection must be edited just like the mmap arena below.
-            if range_within(address.0, length, layout.mmap_base, layout.mmap_size) {
-                let owner_proposal = this.mem().lock().has_owner_proposal();
+            if owner_proposal || range_within(address.0, length, layout.mmap_base, layout.mmap_size) {
                 let publication = if owner_proposal {
                     cx.memory.protect_owner_reserved_range(address.0, len, prot)
                 } else {
