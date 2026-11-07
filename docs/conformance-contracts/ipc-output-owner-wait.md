@@ -19,6 +19,9 @@ a typed refusal, then crosses the real native service and scheduler Gate wait:
 4096 bytes commit, the second page waits, and release commits only the remaining
 4096 bytes with the original 8184-byte receive result. Metadata witnesses cover
 both wire layouts, Done, Fault, and NotYet once followed by success.
+The unaligned record binding starts six bytes before a page boundary on both
+ISAs, refuses the second page once, then changes the committed prefix before
+resuming. The changed prefix must survive while only the suffix is copied.
 
 These VM-free witnesses do not prove signed guest execution or an end-to-end
 runtime ratio. HVF and Docker promotion remain separate acceptance evidence.

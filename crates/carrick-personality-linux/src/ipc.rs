@@ -908,6 +908,7 @@ mod tests {
         base_va: u64,
         venue: &'v mut TestVenue,
         refuse_output: bool,
+        refuse_output_at: Option<u64>,
         pending_output: Option<IpcOutput>,
         fault_output: bool,
     }
@@ -921,6 +922,7 @@ mod tests {
                 base_va: GUEST_BUF_VA,
                 venue,
                 refuse_output: false,
+                refuse_output_at: None,
                 pending_output: None,
                 fault_output: false,
             }
@@ -947,7 +949,11 @@ mod tests {
             if self.fault_output {
                 return CopyOutcome::Fault;
             }
-            if core::mem::take(&mut self.refuse_output) {
+            let refuse_at = self.refuse_output_at == Some(dst.raw());
+            if refuse_at {
+                self.refuse_output_at = None;
+            }
+            if core::mem::take(&mut self.refuse_output) || refuse_at {
                 return carrick_core::user_copy::CopyOutcome::NotYet(
                     carrick_core::user_copy::GuestCopyRequest {
                         address: dst,
@@ -1050,6 +1056,37 @@ mod tests {
                 native.fault_output = true;
                 assert_eq!(invoke(call, &mut native), ret_errno(LINUX_EFAULT));
             }
+        }
+    }
+
+    #[test]
+    fn ipc_unaligned_record_owner_wait_does_not_replay_committed_prefix() {
+        for isa in [GuestIsa::X86_64, GuestIsa::Aarch64] {
+            let mut venue = TestVenue::new();
+            let id = venue.msgget(0x1234, IPC_CREAT | 0o644).unwrap();
+            let address = GUEST_BUF_VA + 4090;
+            let mut native = TestNative::new(
+                &mut venue,
+                isa,
+                [id as u64, IPC_STAT as u64, address, 0, 0, 0],
+                4090 + 120,
+            );
+            let expected = invoke(IpcCall::MsgCtl, &mut native);
+            let bytes = native.guest_mem.clone();
+            native.guest_mem.fill(0xff);
+            native.refuse_output_at = Some(GUEST_BUF_VA + 4096);
+            assert_eq!(invoke(IpcCall::MsgCtl, &mut native), IpcOutcome::Suspended);
+            let output = native.pending_output.take().expect("retained suffix");
+            assert_eq!(output.offset, 6);
+            assert_eq!(&native.guest_mem[4090..4096], &bytes[4090..4096]);
+            assert!(native.guest_mem[4096..].iter().all(|byte| *byte == 0xff));
+            // User changes to the committed prefix must survive resumption.
+            // Replaying from zero would silently overwrite them.
+            native.guest_mem[4090..4096].fill(0x5a);
+            assert_eq!(finish_output(&mut native, output), expected);
+            assert_eq!(&native.guest_mem[4090..4096], &[0x5a; 6]);
+            assert_eq!(&native.guest_mem[4096..], &bytes[4096..]);
+            assert!(native.pending_output.is_none());
         }
     }
 
