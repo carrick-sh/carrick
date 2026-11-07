@@ -238,8 +238,8 @@ pub fn guest_venue(slot: u32) -> Option<IpcVenue<'static>> {
     if !carrick_el1_abi::ipc_table_map_guest().window_published() {
         return None;
     }
-    let region = carrick_el1_abi::ipc_window_guest()?
-        .attach()
+    // SAFETY: the carrier publishes the map only after retaining both guest ranges.
+    let region = unsafe { carrick_el1_abi::ipc_window_guest()?.attach() }
         .ok()?
         .for_el1_slot(slot)
         .with_ceiling(&carrick_el1_abi::GUEST_DESCRIPTOR_CEILING);

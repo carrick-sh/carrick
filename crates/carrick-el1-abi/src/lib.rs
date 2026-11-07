@@ -3291,69 +3291,63 @@ pub unsafe fn host_aperture_control() -> Option<&'static ApertureControl> {
     unsafe { Some(&*(address as *const ApertureControl)) }
 }
 
-/// The shared IPC memory as one venue addresses it: the directory and the
-/// pool at this venue's addresses (the host authority's allocations, or the
-/// fixed EL1 VAs). Nothing here is persisted in shared memory.
-#[derive(
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::core::fmt::Debug,
-    ::core::cmp::Eq,
-    ::core::cmp::PartialEq,
-)]
-pub struct IpcWindow {
-    directory: usize,
-    directory_len: usize,
-    pool: usize,
-    pool_len: usize,
+/// Host-only addresses of the shared IPC directory and pool.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostIpcWindow {
+    directory: carrick_guest_arch::HostVa,
+    directory_bytes: carrick_guest_arch::GuestLen,
+    pool: carrick_guest_arch::HostVa,
+    pool_bytes: carrick_guest_arch::GuestLen,
 }
 
-impl IpcWindow {
-    /// Describe a venue's mapping. Fails closed on a directory that does not
-    /// fit its span or a pool whose length is not the ABI's.
+impl HostIpcWindow {
+    /// Admit a host mapping of the IPC authority.
     ///
     /// # Safety
-    /// Both ranges are mapped, shared with the other venue, for `'static`.
+    /// Both ranges are mapped, initialized and shared for `'static`.
     pub unsafe fn new(
-        directory: usize,
-        directory_len: usize,
-        pool: usize,
-        pool_len: usize,
+        directory: carrick_guest_arch::HostVa,
+        directory_bytes: carrick_guest_arch::GuestLen,
+        pool: carrick_guest_arch::HostVa,
+        pool_bytes: carrick_guest_arch::GuestLen,
     ) -> Option<Self> {
-        (directory != 0
-            && pool != 0
+        let directory_len = usize::try_from(directory_bytes.raw()).ok()?;
+        let pool_len = usize::try_from(pool_bytes.raw()).ok()?;
+        (directory.raw() != 0
+            && pool.raw() != 0
             && directory_len >= ipc::IPC_DIRECTORY_BYTES
-            && directory_len as u64 <= EL1_IPC_DIRECTORY_SPAN
-            && pool_len as u64 == EL1_IPC_POOL_SPAN)
-            .then_some(Self {
-                directory,
-                directory_len,
-                pool,
-                pool_len,
-            })
+            && directory_bytes.raw() <= EL1_IPC_DIRECTORY_SPAN
+            && pool_bytes.raw() == EL1_IPC_POOL_SPAN
+            && directory.raw().checked_add(directory_len).is_some()
+            && pool.raw().checked_add(pool_len).is_some())
+        .then_some(Self {
+            directory,
+            directory_bytes,
+            pool,
+            pool_bytes,
+        })
     }
-    pub const fn directory_ptr(self) -> usize {
+    pub const fn directory(self) -> carrick_guest_arch::HostVa {
         self.directory
     }
-    pub const fn directory_len(self) -> usize {
-        self.directory_len
+    pub const fn directory_bytes(self) -> carrick_guest_arch::GuestLen {
+        self.directory_bytes
     }
-    pub const fn pool_ptr(self) -> usize {
+    pub const fn pool(self) -> carrick_guest_arch::HostVa {
         self.pool
     }
-    pub const fn pool_len(self) -> usize {
-        self.pool_len
+    pub const fn pool_bytes(self) -> carrick_guest_arch::GuestLen {
+        self.pool_bytes
     }
-    /// Attach to the published directory; fails closed (`BadRegion`) until
-    /// the host authority has published it.
     pub fn attach(self) -> Result<ipc::IpcRegion<'static>, ipc::IpcError> {
-        // SAFETY: `new`'s contract; `attach` authenticates the header.
+        // SAFETY: constructor's retained mapping contract; attach authenticates
+        // the shared header before exposing authority.
         unsafe {
             ipc::IpcRegion::attach(
-                self.directory as *mut ipc::IpcDirectory,
-                self.directory_len,
-                self.pool as *mut u8,
-                self.pool_len,
+                self.directory.raw() as *mut ipc::IpcDirectory,
+                self.directory_bytes.raw() as usize,
+                self.pool.raw() as *mut u8,
+                self.pool_bytes.raw() as usize,
             )
         }
     }
@@ -3374,47 +3368,43 @@ static IPC_WINDOW_HOST_LIVE: AtomicU32 = AtomicU32::new(0);
 
 /// Record the host's view of the window the carrier mapped (`None`: the
 /// carrier retired it). Recorded by the mapping owner only.
-pub fn record_ipc_window_host(window: Option<IpcWindow>) {
+pub fn record_ipc_window_host(window: Option<HostIpcWindow>) {
     IPC_WINDOW_HOST_LIVE.store(0, Ordering::Release);
     if let Some(w) = window {
-        IPC_WINDOW_HOST[0].store(w.directory, Ordering::Relaxed);
-        IPC_WINDOW_HOST[1].store(w.directory_len, Ordering::Relaxed);
-        IPC_WINDOW_HOST[2].store(w.pool, Ordering::Relaxed);
-        IPC_WINDOW_HOST[3].store(w.pool_len, Ordering::Relaxed);
+        IPC_WINDOW_HOST[0].store(w.directory.raw(), Ordering::Relaxed);
+        IPC_WINDOW_HOST[1].store(w.directory_bytes.raw() as usize, Ordering::Relaxed);
+        IPC_WINDOW_HOST[2].store(w.pool.raw(), Ordering::Relaxed);
+        IPC_WINDOW_HOST[3].store(w.pool_bytes.raw() as usize, Ordering::Relaxed);
         IPC_WINDOW_HOST_LIVE.store(1, Ordering::Release);
     }
 }
 
 /// The host's view of the mapped IPC window, if the carrier mapped one.
-pub fn ipc_window_host() -> Option<IpcWindow> {
+pub fn ipc_window_host() -> Option<HostIpcWindow> {
     if IPC_WINDOW_HOST_LIVE.load(Ordering::Acquire) == 0 {
         return None;
     }
     // SAFETY: recorded by the mapping owner, which retains the memory while
     // the record is live.
     unsafe {
-        IpcWindow::new(
-            IPC_WINDOW_HOST[0].load(Ordering::Relaxed),
-            IPC_WINDOW_HOST[1].load(Ordering::Relaxed),
-            IPC_WINDOW_HOST[2].load(Ordering::Relaxed),
-            IPC_WINDOW_HOST[3].load(Ordering::Relaxed),
+        HostIpcWindow::new(
+            carrick_guest_arch::HostVa::new(IPC_WINDOW_HOST[0].load(Ordering::Relaxed)),
+            carrick_guest_arch::GuestLen::new(IPC_WINDOW_HOST[1].load(Ordering::Relaxed) as u64),
+            carrick_guest_arch::HostVa::new(IPC_WINDOW_HOST[2].load(Ordering::Relaxed)),
+            carrick_guest_arch::GuestLen::new(IPC_WINDOW_HOST[3].load(Ordering::Relaxed) as u64),
         )
     }
 }
 
 /// EL1's view of the IPC window (identity mapped kernel-only).
 #[cfg(target_os = "none")]
-pub fn ipc_window_guest() -> Option<IpcWindow> {
-    // SAFETY: the window is mapped in every EL1 translation regime; an
-    // unmapped window never has a published header, so attach fails.
-    unsafe {
-        IpcWindow::new(
-            EL1_IPC_BASE as usize,
-            EL1_IPC_DIRECTORY_SPAN as usize,
-            EL1_IPC_POOL_BASE as usize,
-            EL1_IPC_POOL_SPAN as usize,
-        )
-    }
+pub fn ipc_window_guest() -> Option<GuestIpcWindow> {
+    Some(GuestIpcWindow::from_addresses(
+        carrick_guest_arch::KernelVa::new(EL1_IPC_BASE),
+        carrick_guest_arch::FrameGpa::new(EL1_IPC_BASE),
+        carrick_guest_arch::KernelVa::new(EL1_IPC_POOL_BASE),
+        carrick_guest_arch::FrameGpa::new(EL1_IPC_POOL_BASE),
+    ))
 }
 
 /// The IPC table map in the EL1 region, as the host maps it.

@@ -430,10 +430,40 @@ mod tests {
         let pool = 0x1000_0000_usize; // never dereferenced by these checks
         // SAFETY: only validation and a header read of zeroed memory.
         unsafe {
-            assert!(crate::IpcWindow::new(dir, dir_len, pool, pool_len - 1).is_none());
-            assert!(crate::IpcWindow::new(dir, dir_len - 1, pool, pool_len).is_none());
-            assert!(crate::IpcWindow::new(0, dir_len, pool, pool_len).is_none());
-            let window = crate::IpcWindow::new(dir, dir_len, pool, pool_len).unwrap();
+            assert!(
+                crate::HostIpcWindow::new(
+                    carrick_guest_arch::HostVa::new(dir),
+                    carrick_guest_arch::GuestLen::new((dir_len) as u64),
+                    carrick_guest_arch::HostVa::new(pool),
+                    carrick_guest_arch::GuestLen::new((pool_len - 1) as u64)
+                )
+                .is_none()
+            );
+            assert!(
+                crate::HostIpcWindow::new(
+                    carrick_guest_arch::HostVa::new(dir),
+                    carrick_guest_arch::GuestLen::new((dir_len - 1) as u64),
+                    carrick_guest_arch::HostVa::new(pool),
+                    carrick_guest_arch::GuestLen::new((pool_len) as u64)
+                )
+                .is_none()
+            );
+            assert!(
+                crate::HostIpcWindow::new(
+                    carrick_guest_arch::HostVa::new(0),
+                    carrick_guest_arch::GuestLen::new((dir_len) as u64),
+                    carrick_guest_arch::HostVa::new(pool),
+                    carrick_guest_arch::GuestLen::new((pool_len) as u64)
+                )
+                .is_none()
+            );
+            let window = crate::HostIpcWindow::new(
+                carrick_guest_arch::HostVa::new(dir),
+                carrick_guest_arch::GuestLen::new((dir_len) as u64),
+                carrick_guest_arch::HostVa::new(pool),
+                carrick_guest_arch::GuestLen::new((pool_len) as u64),
+            )
+            .unwrap();
             assert_eq!(
                 window.attach().err(),
                 Some(crate::ipc::IpcError::BadRegion),

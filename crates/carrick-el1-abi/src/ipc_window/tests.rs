@@ -221,3 +221,43 @@ fn ipc_host_window_keeps_host_addresses_typed() {
     );
     assert_eq!(window.pool_bytes(), GuestLen::new(EL1_IPC_POOL_SPAN));
 }
+
+#[test]
+fn ipc_guest_window_keeps_x86_virtual_and_frame_addresses_distinct() {
+    let binding = bind(
+        region(),
+        DIRECTORY,
+        DIRECTORY + 0x1_0000_0000,
+        EL1_IPC_DIRECTORY_SPAN,
+        POOL,
+        POOL + 0x1_0000_0000,
+        EL1_IPC_POOL_SPAN,
+    )
+    .unwrap();
+    let window = crate::GuestIpcWindow::from_binding(binding);
+    assert_eq!(window.directory(), binding.directory());
+    assert_eq!(window.directory_physical(), binding.directory_physical());
+    assert_eq!(window.directory_bytes(), binding.directory_bytes());
+    assert_eq!(window.pool(), binding.pool());
+    assert_eq!(window.pool_physical(), binding.pool_physical());
+    assert_eq!(window.pool_bytes(), binding.pool_bytes());
+}
+
+#[test]
+fn ipc_host_window_refuses_pointer_overflow() {
+    use carrick_guest_arch::HostVa;
+    for (directory, pool) in [(usize::MAX, 0x400_0000), (0x200_0000, usize::MAX)] {
+        // SAFETY: validation only; no attachment or memory access.
+        assert!(
+            unsafe {
+                crate::HostIpcWindow::new(
+                    HostVa::new(directory),
+                    GuestLen::new(EL1_IPC_DIRECTORY_SPAN),
+                    HostVa::new(pool),
+                    GuestLen::new(EL1_IPC_POOL_SPAN),
+                )
+            }
+            .is_none()
+        );
+    }
+}

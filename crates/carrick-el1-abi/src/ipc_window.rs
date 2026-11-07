@@ -144,3 +144,74 @@ impl IpcWindowBinding {
 
 #[cfg(test)]
 mod tests;
+
+/// Supervisor view of IPC storage. Frame addresses describe the mapping;
+/// only supervisor virtual addresses are dereferenced by guest attachment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuestIpcWindow {
+    directory: KernelVa,
+    directory_physical: FrameGpa,
+    pool: KernelVa,
+    pool_physical: FrameGpa,
+}
+
+impl GuestIpcWindow {
+    pub(crate) const fn from_addresses(
+        directory: KernelVa,
+        directory_physical: FrameGpa,
+        pool: KernelVa,
+        pool_physical: FrameGpa,
+    ) -> Self {
+        Self {
+            directory,
+            directory_physical,
+            pool,
+            pool_physical,
+        }
+    }
+    pub const fn from_binding(binding: IpcWindowBinding) -> Self {
+        Self::from_addresses(
+            binding.directory,
+            binding.directory_physical,
+            binding.pool,
+            binding.pool_physical,
+        )
+    }
+    pub const fn directory(self) -> KernelVa {
+        self.directory
+    }
+    pub const fn directory_physical(self) -> FrameGpa {
+        self.directory_physical
+    }
+    pub const fn directory_bytes(self) -> GuestLen {
+        GuestLen::new(EL1_IPC_DIRECTORY_SPAN)
+    }
+    pub const fn pool(self) -> KernelVa {
+        self.pool
+    }
+    pub const fn pool_physical(self) -> FrameGpa {
+        self.pool_physical
+    }
+    pub const fn pool_bytes(self) -> GuestLen {
+        GuestLen::new(EL1_IPC_POOL_SPAN)
+    }
+
+    /// Attach only from the guest which owns this supervisor mapping.
+    ///
+    /// # Safety
+    /// The caller retains initialized, shared supervisor mappings at both
+    /// virtual ranges for `'static`. Host code must
+    /// use HostIpcWindow instead.
+    pub unsafe fn attach(self) -> Result<crate::ipc::IpcRegion<'static>, crate::ipc::IpcError> {
+        // SAFETY: caller supplies mapping custody; the existing region owner
+        // authenticates the directory header and pool geometry.
+        unsafe {
+            crate::ipc::IpcRegion::attach(
+                self.directory.raw() as *mut crate::ipc::IpcDirectory,
+                self.directory_bytes().raw() as usize,
+                self.pool.raw() as *mut u8,
+                self.pool_bytes().raw() as usize,
+            )
+        }
+    }
+}
