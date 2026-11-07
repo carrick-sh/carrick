@@ -3219,7 +3219,10 @@ fn kvm_recipe_without_tests_fails_receipt_and_comparison() {
             .arg(root)
             .args(["accept", "--profile", "kvm", "--receipt"])
             .arg(&path)
-            .env("CARRICK_HOST_LEASE_PATH", lease_dir.path().join("host.lock"))
+            .env(
+                "CARRICK_HOST_LEASE_PATH",
+                lease_dir.path().join("host.lock"),
+            )
             .env_remove("CARRICK_HOST_LEASE_FD")
             .env_remove("CARRICK_HOST_LEASE_MODE")
             .env_remove("CARRICK_HOST_LEASE_SOCKET")
@@ -3543,4 +3546,117 @@ fn refused_host_only_profile_normalizes_phase_for_baseline_diff() {
             );
         }
     }
+}
+
+#[test]
+fn empty_step_and_zero_executed_lane_receipts_fail_without_candidate_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let cases: &[(&str, &str, &[&str])] = &[
+        ("host", "linux-portable", &["host"]),
+        ("host", "el1-native", &["host"]),
+        ("host", "no-docker", &["host"]),
+        ("signed", "no-docker", &["signed-hvf"]),
+        ("all", "no-docker", &["host", "signed-hvf"]),
+        ("signed", "full", &["signed-hvf", "signed-cli"]),
+        ("all", "full", &["host", "signed-hvf", "signed-cli"]),
+    ];
+
+    for &(phase, profile, lanes) in cases {
+        let mut empty = receipt(vec![]);
+        empty.phase = phase.into();
+        empty.profile = profile.into();
+        empty.overall = "FAIL".into();
+        let empty_path = dir.path().join(format!("empty-{phase}-{profile}.json"));
+        let summary_path = dir.path().join(format!("summary-{phase}-{profile}.md"));
+        std::fs::write(&empty_path, serde_json::to_vec(&empty).unwrap()).unwrap();
+
+        let out = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .args(["ci-receipt", "diff", "--baseline"])
+            .arg(&empty_path)
+            .arg("--candidate")
+            .arg(&empty_path)
+            .arg("--fail-on-new")
+            .env("GITHUB_STEP_SUMMARY", &summary_path)
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "{phase}/{profile} empty-step receipt passed tree-less diff:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let summary = std::fs::read_to_string(&summary_path).unwrap();
+        for lane in lanes {
+            let expected = format!("not-run:lane:{lane}:zero executed tests");
+            assert!(
+                stdout.contains(&format!("NEW   {expected}")),
+                "{phase}/{profile} missing {expected} in stdout:\n{stdout}"
+            );
+            assert!(
+                summary.contains(&expected),
+                "{phase}/{profile} missing {expected} in summary:\n{summary}"
+            );
+        }
+
+        let mut census_failed = receipt(vec![step("fmt-check", true, &[])]);
+        census_failed.phase = phase.into();
+        census_failed.profile = profile.into();
+        if profile == "linux-portable" {
+            census_failed.skipped_steps = vec![
+                "host-authority live compiler profiles macos-*, freebsd-*, netbsd-*: require their respective hosts".into(),
+            ];
+        }
+        census_failed.failures = lanes
+            .iter()
+            .map(|lane| format!("not-run: lane '{lane}': zero executed tests"))
+            .collect();
+        let keys = failure_keys(&census_failed);
+        for lane in lanes {
+            let expected = format!("not-run:lane:{lane}:zero executed tests");
+            assert!(
+                keys.contains(&expected),
+                "{phase}/{profile} missing {expected} in failure_keys: {keys:?}"
+            );
+        }
+        let census_path = dir.path().join(format!("census-{phase}-{profile}.json"));
+        std::fs::write(&census_path, serde_json::to_vec(&census_failed).unwrap()).unwrap();
+        let census_out = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .args(["ci-receipt", "diff", "--baseline"])
+            .arg(&census_path)
+            .arg("--candidate")
+            .arg(&census_path)
+            .arg("--fail-on-new")
+            .output()
+            .unwrap();
+        assert!(
+            !census_out.status.success(),
+            "{phase}/{profile} zero-executed-lane receipt passed tree-less self-diff:\n{}",
+            String::from_utf8_lossy(&census_out.stdout)
+        );
+        let census_stdout = String::from_utf8_lossy(&census_out.stdout);
+        for lane in lanes {
+            let expected = format!("not-run:lane:{lane}:zero executed tests");
+            assert!(
+                census_stdout.contains(&format!("NEW   {expected}")),
+                "{phase}/{profile} missing {expected} in census stdout:\n{census_stdout}"
+            );
+        }
+    }
+
+    let mut multiline_refusal = receipt(vec![]);
+    multiline_refusal.clean_tree = false;
+    multiline_refusal.failures = vec![
+        "accept refusal: gate failed: active load processes refused:\n  4242 yes\n  4243 stress-ng"
+            .into(),
+    ];
+    let refusal_keys = failure_keys(&multiline_refusal);
+    let refusal_key = refusal_keys
+        .iter()
+        .find(|key| key.starts_with("not-run:accept-refusal:"))
+        .expect("missing accept-refusal key");
+    assert!(
+        !refusal_key.contains('\n'),
+        "refusal key must stay single-line: {refusal_key:?}"
+    );
+    assert!(refusal_key.contains("4242 yes") && refusal_key.contains("4243 stress-ng"));
 }
