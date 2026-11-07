@@ -1707,6 +1707,38 @@ mod overlay_dispatch_tests {
     }
 
     #[test]
+    fn sendfile_offset_owner_refusal_precedes_transfer() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        for read_refusal in [true, false] {
+            let mut h = Harness::new();
+            let input_path = h.put_str("/sendfile-input");
+            let output_path = h.put_str("/sendfile-output");
+            let input = returned(h.call(56, [(-100i64) as u64, input_path, O_CREAT | 2, 0o600, 0, 0]));
+            let output = returned(h.call(56, [(-100i64) as u64, output_path, O_CREAT | 2, 0o600, 0, 0]));
+            let bytes = h.put_bytes(b"abcdef");
+            assert_eq!(returned(h.call(64, [input as u64, bytes, 6, 0, 0, 0])), 6);
+            let kernel = h.dispatcher.capture_one_task_context().unwrap();
+            let mut memory = OwnerRefusingMemory::new(0x1000, 0x1000, 0);
+            memory.seed(0x1000, &1u64.to_ne_bytes());
+            let wait = if read_refusal { memory.refuse_next_read() } else { memory.refuse_next() };
+            let request = SyscallRequest::new(71, SyscallArgs([output as u64, input as u64, 0x1000, 3, 0, 0]));
+            assert_eq!(h.dispatcher.dispatch(&kernel, request, &mut memory, &h.reporter).unwrap(),
+                DispatchOutcome::OwnerMemoryWait { wait, committed: 0 });
+            assert_eq!(returned(h.call(62, [output as u64, 0, 1, 0, 0, 0])), 0);
+            assert_eq!(memory.read_bytes(0x1000, 8).unwrap(), 1u64.to_ne_bytes());
+            assert_eq!(h.dispatcher.dispatch(&kernel, request, &mut memory, &h.reporter).unwrap(),
+                DispatchOutcome::Returned { value: 3 });
+            assert_eq!(memory.read_bytes(0x1000, 8).unwrap(), 4u64.to_ne_bytes());
+            assert_eq!(returned(h.call(62, [output as u64, 0, 1, 0, 0, 0])), 3);
+            assert_eq!(returned(h.call(62, [input as u64, 0, 1, 0, 0, 0])), 6);
+            assert_eq!(returned(h.call(62, [output as u64, 0, 0, 0, 0, 0])), 0);
+            let result = h.reserve(8);
+            assert_eq!(returned(h.call(63, [output as u64, result, 8, 0, 0, 0])), 3);
+            assert_eq!(h.memory.read_bytes(result, 3).unwrap(), b"bcd");
+        }
+    }
+
+    #[test]
     fn blocked_sendfile_captures_input_and_output_before_input_reuse() {
         let mut h = Harness::new();
         let path = h.put_str("/sendfile-authority");

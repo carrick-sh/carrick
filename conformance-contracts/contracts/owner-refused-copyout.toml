@@ -25,6 +25,7 @@ rationale = "An admitted EL1 owner may refuse a host copyout or length read tran
 
 [bindings]
 vm_free = [
+  "carrick-kernel::dispatch::tests::overlay_dispatch_tests::sendfile_offset_owner_refusal_precedes_transfer: production sendfile dispatch refuses offset input or output once before transfer, then writes bcd once, advances the explicit offset 1 to 4, and leaves the input description offset unchanged",
   "carrick-kernel::dispatch::fs::rw::iovec_owner_wait_tests::readv_iovec_intake_preserves_direct_owner_refusal",
   "carrick-el1-linux::native_process_signals::tests::duplicate_member_projection_must_preserve_pending",
   "carrick-kernel::dispatch::copyout::tests",
