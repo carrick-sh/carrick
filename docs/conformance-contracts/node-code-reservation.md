@@ -104,12 +104,24 @@ production `mprotect` handle the refusal instead of panicking inside the
 fixture. Successful generated-code execution still requires the owner
 callback to publish the actual native permissions.
 
-This is not a red reproduction or evidence that Node starts. The host
-dispatcher selects owner publication only while an authenticated reservation
-proposal is held; an admitted MM alone does not establish that the edited
-range belongs to that owner. The sparse refusal must remain intact for
-unauthenticated publication. A further production correction needs the
-failing signed run's mapping/forwarding history (including whether the
-protection request holds such a proposal), or a red lower-layer witness
-that captures that history. The director's exact-head signed Node check is
-still required.
+The saved occupied-PIE-hint witness does reproduce the failure: after a
+512 MiB cage reservation, an advisory hint into the occupied PIE image
+relocates to `0x6020000000`, but the whole-range `mprotect` returns errno 12.
+The native-pages venue returns the reported sparse-publication refusal.
+The unhinted and free-arena-hint controls miss this placement history.
+
+The root rejects an outside-layout hint with `ForeignMapping`. Previously
+the host then relocated through an opaque host-served placeholder, losing
+the anonymous owner's authority. A root-eligible anonymous mapping now
+retries that rejected advisory hint as `Placement::Anywhere` through the
+same owner. Free validated external hints keep their earlier path; fixed
+placements and genuinely host-served mappings retain theirs. Protection
+publication still requires an authenticated reservation proposal, and the
+sparse refusal remains intact.
+
+`delegated_occupied_pie_hint_relocates_to_owner_code_range` checks both ISA
+call views, zero backing allocation, exact owner publication, and the
+overallocate/trim shape. Its native-pages companion checks actual stores
+and generated x86 code execution. These VM-free checks do not prove VMM
+publication or Node startup. The director's exact-head signed Node check
+is still required.
