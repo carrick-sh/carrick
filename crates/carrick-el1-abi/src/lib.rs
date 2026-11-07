@@ -3402,17 +3402,6 @@ pub fn ipc_window_host() -> Option<HostIpcWindow> {
     }
 }
 
-/// EL1's view of the IPC window (identity mapped kernel-only).
-#[cfg(target_os = "none")]
-pub fn ipc_window_guest() -> Option<GuestIpcWindow> {
-    Some(GuestIpcWindow::from_addresses(
-        carrick_guest_arch::KernelVa::new(EL1_IPC_BASE),
-        carrick_guest_arch::FrameGpa::new(EL1_IPC_BASE),
-        carrick_guest_arch::KernelVa::new(EL1_IPC_POOL_BASE),
-        carrick_guest_arch::FrameGpa::new(EL1_IPC_POOL_BASE),
-    ))
-}
-
 /// The IPC table map in the EL1 region, as the host maps it.
 pub fn ipc_table_map_host() -> Option<&'static ipc_tables::IpcTableMap> {
     let ptr = get_el1_region_host_ptr();
@@ -3422,13 +3411,6 @@ pub fn ipc_table_map_host() -> Option<&'static ipc_tables::IpcTableMap> {
     // SAFETY: the EL1 region mapping outlives the carrier; the map is at an
     // aligned offset inside it and all-zero is an empty map.
     Some(unsafe { &*((ptr + EL1_IPC_TABLE_MAP_OFFSET as usize) as *const ipc_tables::IpcTableMap) })
-}
-
-/// The IPC table map in the EL1 region, as EL1 maps it.
-#[cfg(target_os = "none")]
-pub fn ipc_table_map_guest() -> &'static ipc_tables::IpcTableMap {
-    // SAFETY: the EL1 region is mapped for EL1's lifetime.
-    unsafe { &*((EL1_REGION_BASE + EL1_IPC_TABLE_MAP_OFFSET) as *const ipc_tables::IpcTableMap) }
 }
 
 /// Host view of the shared metadata mailbox, if an EL1 region is installed.

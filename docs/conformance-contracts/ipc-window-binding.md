@@ -47,14 +47,22 @@ did not exist; typed host-view admission was compile-red with E0433, and
 registered-map access was compile-red with E0599. The constructor witnesses
 were compile-red with E0425 before `guest_venue(layout, binding)` existed.
 
-Slice 1 remains incomplete. ARM's existing entry is now named
-`current_guest_venue`; it shares the attachment body and table-map
-implementation with the new constructor, but still obtains its window
-from the fixed aperture. ARM registration ownership migration and removal
-of `IPC_WINDOW_HOST` and `EL1_REGION_HOST_PTR` remain outstanding. Existing
-host delegation and memory-mailbox consumers still use the global region;
-replacing only the IPC accessor does not migrate their lifetimes. No
-Slice 1 completion or x86 runtime pipe-service acceptance is claimed.
+ARM now retains `FileRegionRegistration` in the same backing owner as its
+birth-source mapping. Boot initializes it before stage-2 publication and
+before the host aperture is observable. Mapping retirement clears its live
+identity while any retained issuance handle still owns the backing. ARM
+recovers the binding from its image's typed layout and uses the same
+`guest_namespace` attachment as `guest_venue`; fork/exec namespace access
+uses that entry too. The two old fixed-aperture guest accessors are removed.
+The live/retired layout-lookup assertions were compile-red with E0599.
+The HVF mapping-owner witness also checks that retiring the mapping withdraws
+the registration while a retained backing handle remains alive; execution
+of that macOS-only witness is unavailable on the Linux worker.
+
+Slice 1 remains incomplete: `IPC_WINDOW_HOST` and `EL1_REGION_HOST_PTR`
+remain. Existing host delegation and memory-mailbox consumers still use
+the global region; replacing only IPC lookup cannot migrate their lifetimes.
+No Slice 1 completion or x86 runtime pipe-service acceptance is claimed.
 Slices 2–6 remain outside this continuation's scope.
 
 Host handback, continuation and resume now borrow their operation storage

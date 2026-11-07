@@ -992,16 +992,7 @@ pub trait ForkStockCrossing {
     )> {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
-            let map = carrick_el1_abi::ipc_table_map_guest();
-            if !map.window_published() {
-                return None;
-            }
-            // SAFETY: window publication follows installation of both retained
-            // supervisor mappings, which outlive every guest consumer.
-            let region = unsafe { carrick_el1_abi::ipc_window_guest()?.attach() }
-                .ok()?
-                .with_ceiling(&carrick_el1_abi::GUEST_DESCRIPTOR_CEILING);
-            Some((region, map))
+            crate::ipc::current_guest_namespace()
         }
         #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         {

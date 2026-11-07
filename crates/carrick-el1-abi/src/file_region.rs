@@ -114,6 +114,37 @@ pub struct FileRegionBinding {
 }
 
 impl FileRegionBinding {
+    /// Recover the mapping owner's publication at this image's supervisor layout.
+    /// This supplies geometry, not host mapping custody.
+    ///
+    /// # Safety
+    /// The current carrier retains an initialized, supervisor-only region at
+    /// `layout.region` for the call. Its header is immutable after publication;
+    /// retirement may only clear the atomic identity. Host callers may use this
+    /// only in fixtures that retain storage at the supplied supervisor VA.
+    pub unsafe fn in_guest_layout(
+        layout: carrick_guest_arch::KernelLayout,
+    ) -> Result<Self, FileRegionError> {
+        let base = layout.region.raw();
+        if base == 0 || !base.is_multiple_of(4096) || base.checked_add(EL1_REGION_SIZE).is_none() {
+            return Err(FileRegionError::Layout);
+        }
+        // SAFETY: the caller retains the initialized header in this extent.
+        let header =
+            unsafe { &*((base + EL1_FILE_REGION_HEADER_OFFSET) as *const FileRegionHeader) };
+        let identity = NonZeroU64::new(header.live_identity.load(Ordering::Acquire))
+            .ok_or(FileRegionError::Retired)?;
+        if header.guest != layout.region {
+            return Err(FileRegionError::Foreign);
+        }
+        Self::new(
+            FileRegionId::from_carrier(identity),
+            header.guest,
+            header.physical,
+            header.bytes,
+        )
+    }
+
     pub const UNPUBLISHED: Self = Self {
         identity: FileRegionId(0),
         guest: KernelVa::new(0),
@@ -163,6 +194,7 @@ impl FileRegionBinding {
 
 /// Non-cloning host registration. Its constructor requires retained mapping
 /// custody; a bare process-global region pointer cannot create this authority.
+#[derive(Debug)]
 pub struct FileRegionRegistration {
     mapped: NonNull<u8>,
     binding: FileRegionBinding,
