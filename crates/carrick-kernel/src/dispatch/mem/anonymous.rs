@@ -1941,7 +1941,13 @@ impl MemView<'_> {
                     // through this same anonymous owner, rather than acquire
                     // the opaque placeholder of a host-served mapping.
                     Err(Refusal::ForeignMapping) if matches!(placement, Placement::Hint(_)) => {
-                        model.mmap(Placement::Anywhere, length, reservation_prot)
+                        match model.mmap(Placement::Anywhere, length, reservation_prot) {
+                            // A full allocation layout can still have a host
+                            // alias gap. Preserve the existing fallback rather
+                            // than turning this optional relocation into ENOMEM.
+                            Err(Refusal::Limit) => Err(Refusal::ForeignMapping),
+                            result => result,
+                        }
                     }
                     result => result,
                 }
