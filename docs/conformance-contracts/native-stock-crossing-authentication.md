@@ -29,3 +29,20 @@ settlement was accepted. Restoring the live execution makes that schedule
 refuse deterministically. Separate live-lane checks cover task, thread, MM,
 root and generation changes; the two-process control also refuses a parent's
 attempt to settle its child's descriptor receipt.
+
+To run the generation schedule alone, use:
+
+```sh
+just test-el1-native --only two_live_processes_reauthenticate_birth_settlement_after_parent_generation_moves
+```
+
+Run `just test-el1-native` for the existing native-process suites, including
+the `serial_host` partition, with each test isolated in its own process.
+For the red control, temporarily replace the execution passed to
+`PhysicalStock::commit` at the Commit crossing with
+`physical.owner.pending(execution.cpu).unwrap().execution`. Keep the live
+observation in place: this changes only which authority reaches the production
+stock owner. The unchanged-generation control must still succeed, while the
+moved-generation case fails because stale settlement incorrectly succeeds.
+Restore the live argument and rerun the same schedule before the full suite.
+The mutation is a diagnostic step, never committed fixture behavior.
