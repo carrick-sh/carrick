@@ -40,12 +40,9 @@ pub(crate) fn inject_object_wait_key_out_of_range_once() {
 
 #[cfg(test)]
 pub(crate) fn take_last_object_wait_bind_object() -> Option<carrick_el1_abi::ipc::RawIpcObject> {
-    let Some(raw) = LAST_OBJECT_WAIT_BIND_OBJECT
+    let raw = LAST_OBJECT_WAIT_BIND_OBJECT
         .swap(0, Ordering::AcqRel)
-        .checked_sub(1)
-    else {
-        return None;
-    };
+        .checked_sub(1)?;
     Some(carrick_el1_abi::ipc::RawIpcObject {
         index: raw as u32,
         generation: (raw >> 32) as u32,
