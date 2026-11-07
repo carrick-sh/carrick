@@ -2424,8 +2424,13 @@ mod tests {
         release: Option<Box<dyn FnOnce() + 'a>>,
     }
     impl ThreadCpu for ReleaseDuringSave<'_> {
-        fn save(&mut self, frame: &TrapFrame, ctx: &mut carrick_el1_abi::Aarch64ParkedContext) {
-            self.cpu.save(frame, ctx);
+        fn save(
+            &mut self,
+            frame: &TrapFrame,
+            ctx: &mut carrick_el1_abi::Aarch64ParkedContext,
+            exit: crate::sched::CpuExitCause,
+        ) {
+            self.cpu.save(frame, ctx, exit);
             if let Some(release) = self.release.take() {
                 release();
             }

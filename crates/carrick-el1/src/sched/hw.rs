@@ -222,12 +222,14 @@ pub struct HardwareCpu;
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl ThreadCpu for HardwareCpu {
-    fn save(&mut self, frame: &TrapFrame, ctx: &mut Aarch64ParkedContext) {
+    fn save(
+        &mut self,
+        frame: &TrapFrame,
+        ctx: &mut Aarch64ParkedContext,
+        exit: super::CpuExitCause,
+    ) {
         aarch64_context::save(frame, &mut ctx.native);
-        ctx.replace_saved_pc(
-            ctx.native.pc,
-            carrick_sched_core::SavedSyscallPc::AfterSyscall,
-        );
+        ctx.replace_saved_pc(ctx.native.pc, exit.saved_syscall_pc());
     }
     fn load(&mut self, frame: &mut TrapFrame, ctx: &Aarch64ParkedContext) {
         aarch64_context::load(frame, &ctx.native);
@@ -367,7 +369,12 @@ impl ThreadCpu for HardwareCpu {
     // AArch64 entry. CPL0 switches through ZoneRecord<ParkedContextWords>
     // and an authenticated CR3 in cpl0_lifecycle. Reaching these leaves on
     // x86 is an invalid entry-lane mix, never a successful context switch.
-    fn save(&mut self, _frame: &TrapFrame, _ctx: &mut Aarch64ParkedContext) {
+    fn save(
+        &mut self,
+        _frame: &TrapFrame,
+        _ctx: &mut Aarch64ParkedContext,
+        _exit: super::CpuExitCause,
+    ) {
         crate::isa::x86::fatal_entry_binding()
     }
     fn load(&mut self, _frame: &mut TrapFrame, _ctx: &Aarch64ParkedContext) {

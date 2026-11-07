@@ -695,6 +695,14 @@ fn the_virtual_timer_preempts_a_compute_loop() {
     assert_eq!(frame.x[0], 0, "B's wait returns 0");
     assert_eq!(zone.slot(SLOT).current(), Some(b));
     assert_eq!(task.execution.task.load(Ordering::Relaxed), 202);
+    let a = zone.slot(SLOT).host_record().unwrap();
+    assert_eq!(
+        // SAFETY: timer preemption queued A, so its record owns the saved
+        // context until the production scheduler selects it again below.
+        unsafe { zone.record(a).ctx_mut() }.saved_syscall_pc(),
+        Some(carrick_sched_core::SavedSyscallPc::AtSyscall),
+        "preemption before a resumed SVC executes must preserve its PC"
+    );
     // B computes; the next slice end brings A back, untouched.
     cpu.regs.v[3] ^= 7;
     cpu.now += slice;
@@ -704,6 +712,10 @@ fn the_virtual_timer_preempts_a_compute_loop() {
         "A resumes exactly where it was preempted"
     );
     assert_eq!(cpu.regs, a_running.1);
+    assert_eq!(
+        frame.elr, a_running.0.elr,
+        "Sched::load must not rewind the preempted instruction"
+    );
     assert_eq!(task.execution.task.load(Ordering::Relaxed), 101);
     assert_eq!(zone.slot(SLOT).current(), zone.slot(SLOT).host_record());
     assert_eq!(zone.counters.el1_preemptions.load(Ordering::Relaxed), 2);
@@ -2268,7 +2280,7 @@ fn arm_fake_backend_context_trace_is_unchanged() {
     let (mut frame, mut cpu) = live(0xa, 0x1000, FUTEX_WAIT_PRIVATE, 0);
     frame.x = a.x;
     let mut saved = Aarch64ParkedContext::ZERO;
-    cpu.save(&frame, &mut saved);
+    cpu.save(&frame, &mut saved, CpuExitCause::Svc);
     assert_eq!(saved.native.x, a.x);
     assert_eq!(saved.native.pc, a.pc);
     assert_eq!(saved.native.pstate, a.pstate);
@@ -2283,7 +2295,7 @@ fn arm_fake_backend_context_trace_is_unchanged() {
         &mut frame,
         &Aarch64ParkedContext::from_register(b, TTBR_MM, MM, 1),
     );
-    cpu.save(&frame, &mut saved);
+    cpu.save(&frame, &mut saved, CpuExitCause::Interrupted);
     assert_eq!(saved.native.x, b.x);
     assert_eq!(saved.native.pc, b.pc);
     assert_eq!(saved.native.pstate, b.pstate);

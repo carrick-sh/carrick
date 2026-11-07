@@ -278,7 +278,12 @@ fn retained_signal_copy(input_wait: bool, check_stale: bool) {
             drop(entry);
             let mut peer_service = fixture.process_service();
             let mut peer_context = initial;
-            crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut peer_context);
+            crate::sched::ThreadCpu::save(
+                &mut cpu,
+                &frame,
+                &mut peer_context,
+                crate::sched::CpuExitCause::Svc,
+            );
             let mut checkpoints = 0;
             assert_eq!(
                 crate::dispatch::final_user_return(
@@ -388,7 +393,12 @@ fn retained_signal_copy(input_wait: bool, check_stale: bool) {
                 carrick_el1_abi::Action::Served,
                 |frame| {
                     let mut checkpoint_context = resumed_context;
-                    crate::sched::ThreadCpu::save(&mut cpu, frame, &mut checkpoint_context);
+                    crate::sched::ThreadCpu::save(
+                        &mut cpu,
+                        frame,
+                        &mut checkpoint_context,
+                        crate::sched::CpuExitCause::Svc,
+                    );
                     let mut entry = runtime
                         .enter_registered(
                             registry(),
