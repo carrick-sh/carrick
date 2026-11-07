@@ -2089,6 +2089,161 @@ fn test_fork_child_gets_distinct_root_and_x0_zero() {
     assert_eq!(grant.ttbr0 >> 48, 42);
 }
 
+/// #1808: a fully published native child must reach time argument validation.
+/// Null user pointers deliberately remove clock calibration and MM supply from
+/// this first routing witness. This is not yet the successful-read acceptance
+/// witness: it isolates ENOSYS before any time handler or copy can run.
+fn native_fork_child_time_handler(number: carrick_abi::CanonicalNr) {
+    use super::native_process_runtime::NativeThreadGroupOwner;
+    use carrick_personality_linux::dispatch::CompletionRoute;
+
+    let fixture = Fixture::new(0x10000, asid(1));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let words = fixture.tables.live(&fixture.maintenance);
+    let task = CurrentTask::new();
+    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+        source,
+        &fixture.task,
+        fixture.page,
+        fixture.control,
+        fixture.address,
+        fixture.address,
+        parked,
+    )
+    .unwrap();
+    let crossing = TestStockCrossing::new(&[
+        0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
+    ]);
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &crossing,
+    )
+    .with_words(&words);
+    let LifecycleOutcome::Returned { result, .. } = runtime
+        .enter(source, &fixture.task, parked, &mut service)
+        .unwrap()
+        .fork(ProcessForkChildTid::NONE)
+    else {
+        panic!("native fork must return a child");
+    };
+    assert!(result.raw() > 0);
+    let parent_key = TaskKey {
+        id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
+        serial: TaskSerial::from_raw_u64(11).unwrap(),
+    };
+    let parent = runtime.task_binding(parent_key).unwrap();
+    let child_key = runtime
+        .namespace_child_key(parent_key, result.raw() as u32)
+        .unwrap();
+    let child = runtime.task_binding(child_key).unwrap();
+    assert_ne!(parent.key, child.key);
+    assert_ne!(parent.address.mm, child.address.mm);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, parent.record.id)
+            .is_queued()
+    );
+    activate(source, &task, &child);
+    let mut child_service = Aarch64NativeProcessService::with_crossing(
+        &task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &crossing,
+    )
+    .with_words(&words);
+    let mut entry = runtime
+        .enter(source, &task, child.words, &mut child_service)
+        .unwrap();
+    assert!(!entry.is_root_process());
+    let owner = if entry.is_root_process() {
+        NativeThreadGroupOwner::Root
+    } else {
+        NativeThreadGroupOwner::ForkChild
+    };
+    let counters = Box::new(carrick_el1_abi::Counters::new());
+    let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
+    let mut frame = carrick_el1_abi::TrapFrame {
+        esr: 0x15 << 26,
+        slot: fixture.slot.index() as u64,
+        ..Default::default()
+    };
+    // CLOCK_REALTIME = 0; all user pointers are null. The expected Linux
+    // result for each of these calls is EFAULT (14), never ENOSYS (38).
+    frame.x[8] = number.raw();
+    let route = super::dispatch::dispatch_syscall_with_native(
+        &mut frame,
+        &counters,
+        core::slice::from_ref(&task),
+        &[],
+        &[],
+        &[],
+        &[],
+        &cache,
+        None::<crate::dispatch::Zone<'_, crate::sched::FakeCpu, crate::sched::HardwareUserWord>>,
+        None,
+        Some(&fixture),
+        Some(&mut entry),
+        Some(source),
+        None,
+        |_| core::ptr::null_mut(),
+    );
+    if route == CompletionRoute::Forward {
+        assert_eq!(
+            super::dispatch::native_unstaged_exit(
+                &mut frame,
+                &task.linux,
+                carrick_el1_abi::Action::Forward,
+                || owner,
+                &counters,
+            ),
+            super::dispatch::NativeUnstagedExit::Refused(carrick_el1_abi::Action::Served),
+        );
+    }
+    assert!(runtime.task_binding(parent_key).is_some());
+    assert!(runtime.task_binding(child_key).is_some());
+    assert_eq!(
+        frame.x[0] as i64,
+        -14,
+        "native child time syscall {}",
+        number.raw()
+    );
+    assert_eq!(
+        counters.refused[number.raw() as usize].load(Ordering::Acquire),
+        0
+    );
+}
+
+#[test]
+fn native_fork_child_clock_gettime_reaches_time_handler() {
+    native_fork_child_time_handler(carrick_abi::syscall::nr::CLOCK_GETTIME);
+}
+
+#[test]
+fn native_fork_child_clock_adjtime_reaches_time_handler() {
+    native_fork_child_time_handler(carrick_abi::syscall::nr::CLOCK_ADJTIME);
+}
+
+#[test]
+fn native_fork_child_adjtimex_reaches_time_handler() {
+    native_fork_child_time_handler(carrick_abi::syscall::nr::ADJTIMEX);
+}
+
+#[test]
+fn native_fork_child_nanosleep_reaches_time_handler() {
+    native_fork_child_time_handler(carrick_abi::syscall::nr::NANOSLEEP);
+}
+
 #[test]
 fn plain_fork_owns_an_independent_fd_table() {
     let fixture = Fixture::new(0x10000, asid(1));
