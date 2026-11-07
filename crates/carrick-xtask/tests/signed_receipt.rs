@@ -1448,7 +1448,7 @@ else:
             .to_string(),
         )
         .unwrap();
-        let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
             .env(
                 "PATH",
                 format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
@@ -1731,7 +1731,7 @@ else:
             .to_string(),
         )
         .unwrap();
-        let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
             .env(
                 "PATH",
                 format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
@@ -1761,8 +1761,7 @@ else:
             .arg("--output")
             .arg(&out_dir)
             .output()
-            .unwrap();
-        output
+            .unwrap()
     };
     let run_prepare = |label: &str, head_ref: &str, base_sha: &str, head_sha: &str| {
         let output = run_prepare_output(label, head_ref, base_sha, head_sha);
