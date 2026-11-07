@@ -526,9 +526,14 @@ fn reset_clears_home_acl_and_xattrs_without_replacing_inode() {
     assert!(listing(&home).contains("everyone allow"));
     let outside = root.path().join("outside");
     write_skeleton_entry(&outside, "untouched", 0o600);
+    let outside_dir = root.path().join("outside-dir");
+    mkdir_mode(&outside_dir, 0o700);
+    let outside_child = outside_dir.join("keep");
+    write_skeleton_entry(&outside_child, "untouched child", 0o600);
     write_skeleton_entry(home.join("stale"), "old job", 0o600);
     std::os::unix::fs::symlink(&outside, home.join("outside-link")).unwrap();
     std::os::unix::fs::symlink(&outside, skel.join("outside-link")).unwrap();
+    std::os::unix::fs::symlink(&outside_dir, skel.join("outside-dir-link")).unwrap();
     let xattr = |args: &[&str], path: &std::path::Path| {
         let out = Command::new("/usr/bin/xattr")
             .args(args)
@@ -538,10 +543,23 @@ fn reset_clears_home_acl_and_xattrs_without_replacing_inode() {
         assert!(out.status.success(), "{}: {:?}", path.display(), out);
         out.stdout
     };
-    for path in [&home, &home.join("stale"), &outside] {
+    for path in [
+        &home,
+        &home.join("stale"),
+        &outside,
+        &outside_dir,
+        &outside_child,
+    ] {
         xattr(&["-w", "com.carrick.reset-test", "old job"], path);
         assert!(!xattr(&[], path).is_empty());
     }
+    // Seed the link inode too; resetting must remove it without clearing the
+    // external target's attributes. The skeleton restores a fresh link.
+    xattr(
+        &["-s", "-w", "com.carrick.reset-test", "old link"],
+        &home.join("outside-link"),
+    );
+    assert!(!xattr(&["-s"], &home.join("outside-link")).is_empty());
     let inode = std::fs::metadata(&home).unwrap().ino();
     reset_job_area(&skel, &home, &[], uid, uid, gid).unwrap();
     for path in [
@@ -549,6 +567,7 @@ fn reset_clears_home_acl_and_xattrs_without_replacing_inode() {
         &home.join("config"),
         &home.join("config/clean"),
         &home.join("outside-link"),
+        &home.join("outside-dir-link"),
     ] {
         assert!(
             xattr(&["-s"], path).is_empty(),
@@ -557,11 +576,20 @@ fn reset_clears_home_acl_and_xattrs_without_replacing_inode() {
         );
     }
     assert!(!home.join("stale").exists());
+    for path in [&outside, &outside_dir, &outside_child] {
+        assert_eq!(
+            String::from_utf8(xattr(&["-p", "com.carrick.reset-test"], path))
+                .unwrap()
+                .trim_end(),
+            "old job",
+            "{} lost its external attribute",
+            path.display()
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "untouched");
     assert_eq!(
-        String::from_utf8(xattr(&["-p", "com.carrick.reset-test"], &outside))
-            .unwrap()
-            .trim_end(),
-        "old job"
+        std::fs::read_to_string(&outside_child).unwrap(),
+        "untouched child"
     );
     assert_eq!(std::fs::metadata(&home).unwrap().ino(), inode);
     for path in [&home, &home.join("config"), &home.join("config/clean")] {
