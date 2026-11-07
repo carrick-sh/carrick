@@ -1145,6 +1145,9 @@ fn ipc_wait_keys_end_before_the_metadata_queue_domain() {
     assert_eq!(writable.index(), 2 * IPC_MAX_OBJECTS as u32);
     assert_eq!(readable.generation(), 8);
     assert_eq!(writable.generation(), 8);
+    let metadata = carrick_sched_core::object_wait::ObjectWaitKey::metadata_request(1).unwrap();
+    assert_eq!(crate::METADATA_WAIT_QUEUE_INDEX, metadata.index());
+    assert_eq!(writable.index() + 1, metadata.index());
 
     let outside = IpcObjectHandle::from_raw(RawIpcObject {
         index: last.index() + 1,
