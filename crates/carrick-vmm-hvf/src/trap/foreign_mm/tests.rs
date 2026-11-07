@@ -13730,40 +13730,63 @@ fn owner_fault_rejects_untagged_readonly_image_with_stale_mapping_permission() {
             panic!("denied store must not publish")
         }
     }
-    for retained_arm in [true, false] {
-        if !retained_arm {
-            fixture.task.cow_armed.lock().ranges.clear();
+    let arm_snapshot = fixture.task.cow_armed.lock().snapshot();
+    let walk = tables.with_manager(|m| m.debug_walk(TEST_VA)).unwrap();
+    let leaf_offset =
+        (walk[2] & 0x0000_ffff_ffff_f000) - fixture.root_key.0 + ((TEST_VA >> 12) & 511) * 8;
+    assert!(leaf_offset + 8 <= fixture.root_key.1);
+    for tagged_ceiling in [false, true] {
+        fixture.task.cow_armed.lock().restore(arm_snapshot.clone());
+        if tagged_ceiling {
+            // Model an owner-protected private resident after its COW arm was
+            // consumed: bit 57 is an allocation ceiling, not current intent.
+            // SAFETY: the fixture retains the live primary table owner.
+            unsafe {
+                let word = (fixture.root_host as *mut u8)
+                    .add(leaf_offset as usize)
+                    .cast::<u64>();
+                let leaf = word.read_volatile();
+                word.write_volatile((leaf | (1 << 56) | (1 << 57)) & !(1 << 55));
+            }
         }
-        let before = live_table_words(&fixture);
-        let owners = owner_keys();
-        assert!(
-            fixture
-                .task
-                .mapping_for_range_in(&transport.custody, TEST_VA, 1)
-                .unwrap()
-                .guest_writable
-        );
-        let result = fixture.task.perform_frame_cow(
-            &transport.custody,
-            TEST_VA,
-            carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible,
-            super::super::cow_engine::tests::permission_fault_trigger(TEST_VA, fixture.root_key.0),
-            &mut DeniedPublication,
-        );
-        assert!(
-            matches!(result, Ok(false)),
-            "protected fault must stay NotCow: {result:?}"
-        );
-        assert_eq!(
-            live_table_words(&fixture),
-            before,
-            "including writable neighbor"
-        );
-        assert_eq!(
-            owner_keys(),
-            owners,
-            "no backing allocated for denied store"
-        );
+        for retained_arm in [true, false] {
+            if !retained_arm {
+                fixture.task.cow_armed.lock().ranges.clear();
+            }
+            let before = live_table_words(&fixture);
+            let owners = owner_keys();
+            assert!(
+                fixture
+                    .task
+                    .mapping_for_range_in(&transport.custody, TEST_VA, 1)
+                    .unwrap()
+                    .guest_writable
+            );
+            let result = fixture.task.perform_frame_cow(
+                &transport.custody,
+                TEST_VA,
+                carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible,
+                super::super::cow_engine::tests::permission_fault_trigger(
+                    TEST_VA,
+                    fixture.root_key.0,
+                ),
+                &mut DeniedPublication,
+            );
+            assert!(
+                matches!(result, Ok(false)),
+                "protected fault must stay NotCow: {result:?}"
+            );
+            assert_eq!(
+                live_table_words(&fixture),
+                before,
+                "including writable neighbor"
+            );
+            assert_eq!(
+                owner_keys(),
+                owners,
+                "no backing allocated for denied store"
+            );
+        }
     }
 }
 
