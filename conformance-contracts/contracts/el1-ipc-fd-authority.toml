@@ -25,6 +25,7 @@ structural_budgets = []
 
 [bindings]
 vm_free = [
+  "carrick-el1-linux::aarch64_process_tests::serial_host_native_child_committed_close_never_replays_reused_fd (red acceptance witness: committed cleanup must not resolve a reused numeric fd)",
   "carrick-el1-linux::aarch64_process_tests::native_fd_shell_tests::{serial_host_native_child_redirect_restore_stdout_1410,serial_host_native_subshell_reads_parent_duplicated_heredoc_1399} (in-zone pipe compositions; no host-backed stdout or signed shell claim)",
   "carrick-el1-linux::file_table::tests::range_cloexec_projects_live_incarnation_one_only_after_authority_success",
   "carrick-el1-linux::file_table::tests::setfd_authority_and_projection_share_range_mutation_guard",
