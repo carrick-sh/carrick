@@ -61,6 +61,8 @@ use core::{
 /// a record with retained lifecycle work.
 pub enum NativeResume {
     NoPending,
+    /// The retained checkpoint already records the syscall instruction.
+    RetrySavedSyscall,
     /// Physical supply completed for user memory needed to stage the current
     /// syscall. Re-enter the exact SVC instruction instead of returning to
     /// EL0 after it.
@@ -5762,14 +5764,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             && !record.has_object_operation()
             && matches!(
                 resumed,
-                NativeResume::Returned(_) | NativeResume::RetrySyscall | NativeResume::NoPending
+                NativeResume::Returned(_)
+                    | NativeResume::RetrySavedSyscall
+                    | NativeResume::RetrySyscall
+                    | NativeResume::NoPending
             )
         {
             match resumed {
                 NativeResume::Returned(result) => {
                     self.words.set_syscall_return(result.raw() as u64)
                 }
-                NativeResume::RetrySyscall => self.words.restart_syscall(),
+                NativeResume::RetrySavedSyscall | NativeResume::RetrySyscall => {
+                    self.words.restart_syscall()
+                }
                 _ => {}
             }
             if self.current.linux.has_pending_host_work() {
@@ -5818,6 +5825,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     fn resume_owned_checkpoint(
         &mut self,
     ) -> Result<NativeResume, carrick_core_abi::NativeRunFailureReason> {
+        let syscall_retry = if self
+            .source
+            .zone
+            .record(self.record.id)
+            .take_saved_syscall_resume_pc()
+        {
+            NativeResume::RetrySavedSyscall
+        } else {
+            NativeResume::RetrySyscall
+        };
         if let Some(result) = self.resume_exec_closing() {
             return result.map_err(NativeProcessError::run_failure_reason);
         }
@@ -5827,6 +5844,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .map_err(NativeProcessError::run_failure_reason)?;
             match result {
                 NativeResume::NoPending => {}
+                NativeResume::RetrySavedSyscall => return Ok(NativeResume::RetrySavedSyscall),
                 NativeResume::RetrySyscall => return Ok(NativeResume::RetrySyscall),
                 NativeResume::Left(status) => {
                     if self.take_handoff_receipt().is_none() {
@@ -5897,7 +5915,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         .record(self.record.id)
                         .has_adapter_operation() =>
                 {
-                    Ok(NativeResume::RetrySyscall)
+                    Ok(syscall_retry)
                 }
                 resumed => Ok(resumed),
             },

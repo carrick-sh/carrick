@@ -266,6 +266,9 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
             let ctx = unsafe { zone.record(record).ctx_mut() };
             self.cpu.save(frame, ctx);
             ctx.native.pc = resume.raw();
+            // SAFETY: this slot exclusively owns the record until the park
+            // publication below transfers it.
+            unsafe { zone.record(record).publish_saved_syscall_resume_pc() };
             Ok((record, fresh))
         })
     }

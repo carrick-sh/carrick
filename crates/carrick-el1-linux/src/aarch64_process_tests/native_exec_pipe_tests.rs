@@ -359,8 +359,16 @@ fn serial_host_native_fork_exec_pipe_writer_reaches_its_parent() {
 }
 
 #[test]
-fn serial_host_pipe_adapter_return_allows_unrelated_native_service() {
+fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    fixture
+        .control
+        .initialize_affinity(carrick_core::affinity::CpuAffinity::from_words(&[1]));
+    fixture
+        .zone
+        .record(fixture.zone.slot(fixture.slot).host_record().unwrap())
+        .set_affinity(1);
+    fixture.zone.publish_carrier_cpu_count(1);
     struct RestoreRegion(usize);
     impl Drop for RestoreRegion {
         fn drop(&mut self) {
@@ -557,7 +565,6 @@ fn serial_host_pipe_adapter_return_allows_unrelated_native_service() {
             .is_queued()
     );
     activate_target(source, &fixture.task, &parent_binding);
-    assert_eq!(dispatch!(&mut service, &mut cpu, 64, 4).1, 1);
     assert!(
         fixture
             .zone
@@ -565,10 +572,7 @@ fn serial_host_pipe_adapter_return_allows_unrelated_native_service() {
             .is_queued()
     );
     activate_target(source, &fixture.task, &child_binding);
-    service.prepare_copy_error = Some(NativeProcessError::Busy);
-    crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
     let parked = dispatch!(&mut service, &mut cpu, 63, 3);
-    crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
     assert_eq!(
         parked.0,
         carrick_personality_linux::dispatch::CompletionRoute::Suspended
@@ -579,47 +583,52 @@ fn serial_host_pipe_adapter_return_allows_unrelated_native_service() {
             .record(child_binding.record.id)
             .has_object_operation()
     );
-    let notice = fixture.task.service_notice.take().unwrap().unwrap();
-    let identity = fixture.zone.record(notice.record.id).identity();
-    // SAFETY: production fork retains the exact control for this notice.
-    let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
-    // SAFETY: the fixture consumes this exact published notice once.
-    let ticket =
-        unsafe { ServiceCell::claim_notice(&control.service, notice, NonZeroU64::MIN, identity) }
-            .unwrap();
-    assert!(ticket.complete(true).is_ok());
-    let queue = fixture
-        .zone
-        .object_wait(
-            carrick_sched_core::object_wait::ObjectWaitKey::native_service(notice.record).unwrap(),
-            &ShortLockSpin,
-        )
-        .unwrap();
-    queue
-        .notify_object(fixture.slot, &mut WakeEffects::default())
-        .unwrap();
-    drop(queue);
-    service.prepare_copy_error = None;
-    activate_target(source, &fixture.task, &child_binding);
-    // The scheduler's production checkpoint consumes the service reply before
-    // the saved syscall is retried through the ordinary dispatcher.
-    let binding = unsafe { runtime.record_binding(child_binding.record) }.unwrap();
-    {
-        let mut entry = runtime
-            .enter_registered(
-                registry,
-                source,
-                &fixture.task,
-                binding.address,
-                &binding.words,
-                &mut service,
-            )
-            .unwrap();
-        assert!(matches!(
-            entry.resume_checkpoint(|_| Ok(None)).unwrap(),
-            NativeResume::RetrySyscall
-        ));
-    }
+    // SAFETY: the reader is parked and this fixture owns its record.
+    assert_eq!(
+        unsafe { fixture.zone.record(child_binding.record.id).ctx_mut() }
+            .native
+            .pc,
+        0x400000
+    );
+    let _ = fixture.task.linux.take_host_work_doorbell();
+    activate_target(source, &fixture.task, &parent_binding);
+    assert_eq!(dispatch!(&mut service, &mut cpu, 64, 4).1, 1);
+    fixture.zone.spaces.set_idle_ttbr(0x30000);
+    // Reload through the production scheduler checkpoint. The object park
+    // recorded the SVC itself (0x400000), so adapter completion must not apply
+    // the refused-admission rewind a second time.
+    let mut resume_cpu = ResumeCpu {
+        inner: crate::sched::FakeCpu::default(),
+        runtime: &runtime,
+        registry,
+        source,
+        task: &fixture.task,
+        service: &mut fork_service,
+    };
+    let mut resumed_frame = carrick_el1_abi::TrapFrame::default();
+    assert_eq!(
+        (crate::sched::Sched {
+            handoff: None,
+            zone: fixture.zone,
+            slot: fixture.slot,
+            task: &fixture.task,
+            cpu: &mut resume_cpu,
+            user: &crate::sched::HardwareUserWord,
+            counters: &counters,
+        })
+        .yield_queued(&mut resumed_frame),
+        Some(crate::sched::Served::Returned { switched: true })
+    );
+    assert_eq!(
+        fixture.zone.slot(fixture.slot).current(),
+        Some(child_binding.record.id),
+        "scheduler must reload the parked reader"
+    );
+    assert_eq!(
+        resumed_frame.elr, 0x400000,
+        "resume exactly at the parked SVC"
+    );
+    drop(resume_cpu);
     assert_eq!(dispatch!(&mut service, &mut cpu, 63, 3).1, 1);
     assert!(
         !fixture
