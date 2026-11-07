@@ -21,7 +21,24 @@ fn raw_exit_terminal_supply_refusal_advances_instead_of_retrying() {
     }
 }
 
+#[test]
+fn raw_exit_keeps_admission_when_fork_closes_gate_during_cleanup() {
+    for unadopted in [false, true] {
+        parked_cleanup_with_fork(unadopted, false, false, false, true);
+    }
+}
+
 fn parked_cleanup(unadopted: bool, head_wait: bool, refused: bool, service_refusal: bool) {
+    parked_cleanup_with_fork(unadopted, head_wait, refused, service_refusal, false);
+}
+
+fn parked_cleanup_with_fork(
+    unadopted: bool,
+    head_wait: bool,
+    refused: bool,
+    service_refusal: bool,
+    fork_closing: bool,
+) {
     let fixture = native_exec_fixture();
     let sibling = add_signal_sibling(&fixture, None, false);
     if unadopted {
@@ -163,6 +180,9 @@ fn parked_cleanup(unadopted: bool, head_wait: bool, refused: bool, service_refus
         assert!(entry.take_handoff_receipt().is_some());
     }
     assert!(!sibling.control.host_exit_requested());
+    if fork_closing {
+        fixture.page.close_for_fork().unwrap();
+    }
     assert_eq!(fixture.zone.counters.el1_wakes.load(Ordering::Acquire), 0);
     if !service_refusal {
         service.child_copy_error = refused.then_some(NativeProcessError::Fault);
