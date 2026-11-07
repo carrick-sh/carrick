@@ -379,6 +379,9 @@ struct Pve {
     site: Site,
     token: Token,
     deadline: std::cell::Cell<Option<Instant>>,
+    key_owner_uid: u32,
+    #[cfg(test)]
+    host_sample: Option<HostSample>,
 }
 fn pve_curl(call: &PveCall, resolve: &str, ca: Option<&str>, url: &str) -> Command {
     let mut command = Command::new("curl");
@@ -400,11 +403,28 @@ fn pve_curl(call: &PveCall, resolve: &str, ca: Option<&str>, url: &str) -> Comma
     command
 }
 impl Pve {
+    #[cfg(test)]
+    fn test_fixture(site: Site, host_sample: Option<HostSample>) -> Self {
+        Self {
+            site,
+            token: Token {
+                id: "fixture".into(),
+                secret: "synthetic".into(),
+            },
+            deadline: std::cell::Cell::new(None),
+            key_owner_uid: unsafe { libc::geteuid() },
+            host_sample,
+        }
+    }
+
     fn for_lane(&self, lane: CloneLane) -> Result<Self, ScalerError> {
         Ok(Self {
             site: self.site.for_lane(lane)?,
             token: self.token.clone(),
             deadline: std::cell::Cell::new(None),
+            key_owner_uid: self.key_owner_uid,
+            #[cfg(test)]
+            host_sample: self.host_sample,
         })
     }
 
@@ -431,6 +451,9 @@ impl Pve {
             site,
             token,
             deadline: std::cell::Cell::new(None),
+            key_owner_uid: 0,
+            #[cfg(test)]
+            host_sample: None,
         })
     }
     fn request(&self, call: PveCall, path: &str) -> Result<Value, ScalerError> {
@@ -1156,6 +1179,7 @@ fn nominal(pve: &Pve) -> impl Fn(CloneLane) -> (u32, u64) + '_ {
     }
 }
 /// One host reading: CPU busy fraction, online threads, available bytes.
+#[derive(Copy, Clone)]
 struct HostSample {
     busy: f64,
     threads: u32,
@@ -1181,6 +1205,13 @@ fn admission_verdict(
     ))
 }
 fn resource_admission(pve: &Pve, pending: Pending) -> Result<bool, ScalerError> {
+    #[cfg(test)]
+    if let Some(sample) = pve.host_sample {
+        return Ok(
+            admission_verdict(&sample, (pve.site.cores, pve.site.memory_mib), pending)?
+                && storage_headroom(pve, pending)?,
+        );
+    }
     fn cpu() -> Result<(u64, u64), ScalerError> {
         let stat = std::fs::read_to_string("/proc/stat")?;
         let fields: Vec<u64> = stat
@@ -1496,7 +1527,7 @@ fn boot_and_register(
     let (group, admission) = approval;
     let (key, hosts) = key_paths(dir, row);
     let key_meta = std::fs::symlink_metadata(&key)?;
-    if !key_meta.is_file() || key_meta.uid() != 0 || key_meta.mode() & 0o077 != 0 {
+    if !key_meta.is_file() || key_meta.uid() != pve.key_owner_uid || key_meta.mode() & 0o077 != 0 {
         return Err(ScalerError::Guard(
             "owned clone lacks its root-only transport key",
         ));
@@ -4065,14 +4096,7 @@ printf '{"data":%s}\n200' "$body"
             );
             std::env::set_var("CARRICK_FIXTURE_DIR", dir);
         }
-        let pve = Pve {
-            site: site::WILLOW,
-            token: Token {
-                id: "fixture".into(),
-                secret: "synthetic".into(),
-            },
-            deadline: std::cell::Cell::new(None),
-        };
+        let pve = Pve::test_fixture(site::WILLOW, None);
         let mut ledger = Ledger::default();
         let mut row = row();
         row.state = State::Cloning;
@@ -4362,14 +4386,7 @@ esac
             );
             std::env::set_var("CARRICK_STORAGE_DIR", dir.path());
         }
-        let make_pve = || Pve {
-            site: site::WILLOW,
-            token: Token {
-                id: "fixture".into(),
-                secret: "synthetic".into(),
-            },
-            deadline: std::cell::Cell::new(None),
-        };
+        let make_pve = || Pve::test_fixture(site::WILLOW, None);
         let mut ledger = Ledger::default();
         let mut row = row();
         ledger.rows.push(row.clone());
@@ -4490,14 +4507,7 @@ esac
             );
             std::env::set_var("CARRICK_STORAGE_DIR", dir.path());
         }
-        let pve = Pve {
-            site: site::WILLOW,
-            token: Token {
-                id: "fixture".into(),
-                secret: "synthetic".into(),
-            },
-            deadline: std::cell::Cell::new(None),
-        };
+        let pve = Pve::test_fixture(site::WILLOW, None);
         let mut ledger = Ledger::default();
         let mut row = row();
         ledger.rows.push(row.clone());
@@ -4635,14 +4645,7 @@ printf '{{"data":%s}}\n200' "$body"
             );
             std::env::set_var("CARRICK_DESTROY_DIR", dir.path());
         }
-        let pve = Pve {
-            site: site::WILLOW,
-            token: Token {
-                id: "fixture".into(),
-                secret: "synthetic".into(),
-            },
-            deadline: std::cell::Cell::new(None),
-        };
+        let pve = Pve::test_fixture(site::WILLOW, None);
 
         let mut ledger = Ledger::default();
         ledger.rows.push(target);
@@ -4717,6 +4720,373 @@ printf '{{"data":%s}}\n200' "$body"
             pve.task_state("UPID:willow:destroy308?bad=1"),
             Err(ScalerError::Guard(_))
         ));
+    }
+
+    fn write_provision_fixture_tools(bin_dir: &Path) {
+        let write_exec = |name: &str, script: &str| {
+            let file = bin_dir.join(name);
+            std::fs::write(&file, script).unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        write_exec(
+            "ssh-keygen",
+            r#"#!/bin/sh
+prev=""
+for arg do
+  if [ "$prev" = "-f" ]; then key="$arg"; fi
+  prev="$arg"
+done
+umask 077
+printf 'private\n' > "$key"
+printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixture runner@test\n' > "$key.pub"
+"#,
+        );
+        write_exec("ssh", "#!/bin/sh\ncat >/dev/null\nexit 0\n");
+        write_exec(
+            "lvs",
+            "#!/bin/sh\nprintf '{\"report\":[{\"lv\":[{\"lv_size\":\"536870912000\",\"data_percent\":\"10.0\",\"metadata_percent\":\"5.0\"}]}]}\\n'\n",
+        );
+        write_exec(
+            "pvesh",
+            "#!/bin/sh\necho \"$*\" >> \"$CARRICK_BURST_DIR/pvesh_calls\"\nprintf '[]\\n'\n",
+        );
+        write_exec(
+            "gh",
+            r#"#!/bin/sh
+cat >/dev/null
+sha="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+case "$*" in
+  *actions/jobs/2*) printf '{"id":2,"status":"queued","labels":["self-hosted","Linux","X64","willow-kvm"]}\n' ;;
+  *actions/jobs/3*) printf '{"id":3,"status":"queued","labels":["self-hosted","Linux","X64","willow-kvm"]}\n' ;;
+  *actions/runs/1*) printf '{"id":1,"run_attempt":1,"event":"push","head_branch":"main","head_sha":"%s","path":".github/workflows/kernel-runtime.yml","repository":{"full_name":"carrick-sh/carrick"},"head_repository":{"full_name":"carrick-sh/carrick"}}\n' "$sha" ;;
+  *actions/runs/2*) printf '{"id":2,"run_attempt":1,"event":"push","head_branch":"main","head_sha":"%s","path":".github/workflows/kernel-runtime.yml","repository":{"full_name":"carrick-sh/carrick"},"head_repository":{"full_name":"carrick-sh/carrick"}}\n' "$sha" ;;
+  *generate-jitconfig*) printf '{"runner":{"id":99},"encoded_jit_config":"jit-fixture"}\n' ;;
+  *actions/runners*) printf '[{"runners":[]}]\n' ;;
+  *) exit 94 ;;
+esac
+"#,
+        );
+        write_exec(
+            "curl",
+            r#"#!/bin/sh
+stdin=$(cat)
+method="GET"
+prev=""
+for arg do
+  if [ "$prev" = "--request" ]; then method="$arg"; fi
+  prev="$arg"
+  url="$arg"
+done
+case "$method:$url" in
+  POST:*/qemu/300/clone)
+    case "$stdin" in
+      *'newid\":308'*|*'newid":308'*) vmid=308 ;;
+      *'newid\":309'*|*'newid":309'*) vmid=309 ;;
+      *) exit 95 ;;
+    esac
+    echo "clone:$vmid" >> "$CARRICK_BURST_DIR/clone_calls"
+    if [ -f "$CARRICK_BURST_DIR/busy_always_$vmid" ]; then
+      body="\"UPID:willow:busy$vmid\""
+    elif [ -f "$CARRICK_BURST_DIR/busy_once_$vmid" ]; then
+      rm -f "$CARRICK_BURST_DIR/busy_once_$vmid"
+      body="\"UPID:willow:busy$vmid\""
+    else
+      touch "$CARRICK_BURST_DIR/present_$vmid"
+      body="\"UPID:willow:clone$vmid\""
+    fi ;;
+  GET:*/tasks/UPID:willow:busy*/status)
+    body='{"status":"stopped","exitstatus":"can'\''t lock file '\''/var/lock/pve-manager/pve-storage-local'\'' - got timeout"}' ;;
+  GET:*/tasks/UPID:willow:clone308/status)
+    if [ -f "$CARRICK_BURST_DIR/hold_clone308" ]; then
+      touch "$CARRICK_BURST_DIR/clone308_waiting"
+      n=0
+      while [ ! -f "$CARRICK_BURST_DIR/release_clone308" ]; do
+        n=$((n+1)); [ "$n" -lt 200 ] || exit 91
+        sleep 0.05
+      done
+    fi
+    body='{"status":"stopped","exitstatus":"OK"}' ;;
+  GET:*/tasks/UPID:willow:clone309/status|GET:*/tasks/UPID:willow:start*/status|GET:*/tasks/UPID:willow:destroy*/status)
+    body='{"status":"stopped","exitstatus":"OK"}' ;;
+  GET:*/pools/carrick-ci)
+    members=""
+    for v in 308 309; do
+      if [ -f "$CARRICK_BURST_DIR/present_$v" ]; then
+        [ -z "$members" ] || members="$members,"
+        members="$members{\"type\":\"qemu\",\"node\":\"willow\",\"vmid\":$v,\"template\":0}"
+      fi
+    done
+    body="{\"poolid\":\"carrick-ci\",\"members\":[$members]}" ;;
+  GET:*/qemu/308/config)
+    body="{\"name\":\"$(cat "$CARRICK_BURST_DIR/name_308")\"}" ;;
+  GET:*/qemu/309/config)
+    body="{\"name\":\"$(cat "$CARRICK_BURST_DIR/name_309")\"}" ;;
+  GET:*/qemu/*/status/current)
+    body='{"status":"stopped"}' ;;
+  PUT:*/qemu/*/config)
+    body='null' ;;
+  POST:*/qemu/308/status/start)
+    if [ -f "$CARRICK_BURST_DIR/busy_start_308" ]; then
+      body='"UPID:willow:busy308"'
+    else
+      body='"UPID:willow:start308"'
+    fi ;;
+  POST:*/qemu/309/status/start)
+    body='"UPID:willow:start309"' ;;
+  DELETE:*/qemu/308)
+    rm -f "$CARRICK_BURST_DIR/present_308"
+    body='"UPID:willow:destroy308"' ;;
+  POST:*/qemu/*/agent/exec)
+    case "$stdin" in
+      *cloud-init*) body='{"pid":101}' ;;
+      *ssh_host_ed25519_key.pub*) body='{"pid":102}' ;;
+      *admit-job*--help*) body='{"pid":103}' ;;
+      *) body='{"pid":100}' ;;
+    esac ;;
+  GET:*/qemu/*/agent/exec-status?pid=101)
+    body='{"exited":1,"exitcode":0,"out-data":"{\"status\":\"done\",\"errors\":[],\"recoverable_errors\":{}}"}' ;;
+  GET:*/qemu/*/agent/exec-status?pid=102)
+    body='{"exited":1,"exitcode":0,"out-data":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHostKey host\n"}' ;;
+  GET:*/qemu/*/agent/exec-status?pid=103)
+    body='{"exited":1,"exitcode":0,"out-data":"--controller\n"}' ;;
+  GET:*/qemu/*/agent/exec-status?pid=100)
+    body='{"exited":1,"exitcode":0,"out-data":""}' ;;
+  GET:*/qemu/*/agent/network-get-interfaces)
+    body='{"result":[{"ip-addresses":[{"ip-address-type":"ipv4","ip-address":"10.0.0.8"}]}]}' ;;
+  *) exit 92 ;;
+esac
+printf '{"data":%s}\n200' "$body"
+"#,
+        );
+    }
+
+    #[test]
+    fn serial_host_provisioners_burst_serializes_storage_and_failfast_defers_boot() {
+        const CHILD: &str = "CARRICK_BURST_1821";
+        if std::env::var_os(CHILD).is_none() {
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ci_scaler::live::tests::serial_host_provisioners_burst_serializes_storage_and_failfast_defers_boot",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write_provision_fixture_tools(dir.path());
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    dir.path().display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            );
+            std::env::set_var("CARRICK_BURST_DIR", dir.path());
+        }
+
+        // Part A: A two-clone burst queues the second worker behind the first's
+        // storage token instead of dropping it into 60-second reconcile recovery.
+        let mut ledger = Ledger::default();
+        let two = Concurrency::try_from(2).unwrap();
+        let row308 = ledger
+            .reserve(
+                JobKey {
+                    run: RunId(1),
+                    attempt: 1,
+                    job: JobId(2),
+                },
+                &[],
+                1,
+                two,
+            )
+            .unwrap();
+        let row309 = ledger
+            .reserve(
+                JobKey {
+                    run: RunId(2),
+                    attempt: 1,
+                    job: JobId(3),
+                },
+                &[],
+                1,
+                two,
+            )
+            .unwrap();
+        let path = dir.path().join("ledger.json");
+        ledger.save(&path).unwrap();
+        let publication = assignment::Publication::new(ledger.clone());
+        ledger.publication = Some(publication);
+        std::fs::write(dir.path().join("name_308"), &row308.name).unwrap();
+        std::fs::write(dir.path().join("name_309"), &row309.name).unwrap();
+        std::fs::write(dir.path().join("hold_clone308"), "").unwrap();
+
+        let roomy = HostSample {
+            busy: 0.05,
+            threads: 32,
+            available: 128 << 30,
+        };
+        let provisioners = Provisioners::new();
+        provisioners
+            .start(
+                &ledger,
+                row308.clone(),
+                Pve::test_fixture(site::WILLOW, Some(roomy)),
+                (dir.path(), &path),
+                (1, Admission::Standing),
+            )
+            .unwrap();
+
+        let bound = Instant::now() + Duration::from_secs(10);
+        while !dir.path().join("clone308_waiting").exists() {
+            assert!(Instant::now() < bound, "first clone did not enter wait");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        provisioners
+            .start(
+                &ledger,
+                row309.clone(),
+                Pve::test_fixture(site::WILLOW, Some(roomy)),
+                (dir.path(), &path),
+                (1, Admission::Standing),
+            )
+            .unwrap();
+
+        while Ledger::load(&path)
+            .unwrap()
+            .rows
+            .iter()
+            .find(|r| r.vm == row309.vm)
+            .unwrap()
+            .state
+            == State::Reserved
+        {
+            assert!(
+                Instant::now() < bound,
+                "second clone did not reach WaitingStorage"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("clone_calls")).unwrap(),
+            "clone:308\n",
+            "only one clone may execute on storage while the first holds admission"
+        );
+
+        std::fs::write(dir.path().join("release_clone308"), "").unwrap();
+        let finish_bound = Instant::now() + Duration::from_secs(15);
+        let mut results = Vec::new();
+        while results.len() < 2 {
+            assert!(
+                Instant::now() < finish_bound,
+                "burst provisioners did not finish"
+            );
+            results.extend(provisioners.finished());
+            if results.len() < 2 {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        assert!(
+            results.iter().all(Result::is_ok),
+            "contended burst worker must wait and complete without StorageBusy: {results:?}"
+        );
+        let committed = Ledger::load(&path).unwrap();
+        assert!(
+            committed.rows.iter().all(|r| r.state == State::Running),
+            "both clones must reach Running: {:?}",
+            committed.rows
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("clone_calls")).unwrap(),
+            "clone:308\nclone:309\n"
+        );
+
+        // Part B: PreBoot::FailFast when pending clones saturate the 80% budget
+        // means "not now" and must defer without freezing ledger admission.
+        let dir2 = dir.path().join("reconcile_defer");
+        std::fs::create_dir_all(&dir2).unwrap();
+        let mut ledger2 = Ledger::default();
+        let mut resume308 = ledger2
+            .reserve(
+                JobKey {
+                    run: RunId(1),
+                    attempt: 1,
+                    job: JobId(2),
+                },
+                &[],
+                10,
+                two,
+            )
+            .unwrap();
+        resume308.state = State::Cloning;
+        resume308.task = Some("UPID:willow:clone308".into());
+        ledger2.rows[0] = resume308.clone();
+        let mut pending309 = ledger2
+            .reserve(
+                JobKey {
+                    run: RunId(2),
+                    attempt: 1,
+                    job: JobId(3),
+                },
+                &[],
+                10,
+                two,
+            )
+            .unwrap();
+        pending309.state = State::WaitingStorage;
+        ledger2.rows[1] = pending309.clone();
+        let path2 = dir2.join("ledger.json");
+        ledger2.save(&path2).unwrap();
+        let publication2 = assignment::Publication::new(ledger2.clone());
+        let (_pub_worker, _held_claim) = publication2.provisioner(&pending309.name).unwrap();
+        ledger2.publication = Some(publication2);
+
+        let (key2, _) = key_paths(&dir2, &resume308);
+        std::fs::write(&key2, "private\n").unwrap();
+        std::fs::set_permissions(&key2, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(
+            key2.with_extension("key.pub"),
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixture runner@test\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("name_308"), &resume308.name).unwrap();
+        std::fs::write(dir.path().join("present_308"), "").unwrap();
+        std::fs::remove_file(dir.path().join("hold_clone308")).unwrap();
+
+        let tight = HostSample {
+            busy: 0.45,
+            threads: 8,
+            available: 64 << 30,
+        };
+        let pass = reconcile_all(
+            &Pve::test_fixture(site::WILLOW, Some(tight)),
+            &Github,
+            &mut ledger2,
+            &dir2,
+            &path2,
+            (1, &Admission::Standing),
+        )
+        .unwrap();
+        assert!(
+            pass.frozen.is_none(),
+            "PreBoot::FailFast under pending clone load must defer without freezing: {:?}",
+            pass.frozen
+        );
+        let status: Value =
+            serde_json::from_slice(&std::fs::read(dir2.join("reconcile-status.json")).unwrap())
+                .unwrap();
+        assert_eq!(status["admission_frozen"], false);
     }
 
     fn row() -> Record {
