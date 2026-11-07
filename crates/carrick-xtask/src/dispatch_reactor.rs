@@ -368,8 +368,9 @@ pub(super) fn is_review_brief(text: &str) -> bool {
 }
 
 pub(super) fn is_signed_scoreboard_text(body: &str) -> bool {
-    body.to_ascii_lowercase().contains("signed scoreboard")
-        || body.contains("Signed gate: **PASS**")
+    !body.contains("Signed gate: **FAIL**")
+        && (body.to_ascii_lowercase().contains("signed scoreboard")
+            || body.contains("Signed gate: **PASS**"))
 }
 
 fn mentions_head_sha(body: &str, head: &str) -> bool {
@@ -403,10 +404,28 @@ pub(super) fn has_signed_scoreboard_on_head(comments: &[CommentView<'_>], head: 
         return false;
     }
     comments.iter().any(|c| {
-        !c.body.contains(MARKER)
-            && (trusted_owner(c.user) || outcome_bot(c.user))
-            && is_signed_scoreboard_text(c.body)
-            && mentions_head_sha(c.body, head)
+        if c.body.contains(MARKER) {
+            return false;
+        }
+        let trimmed = c.body.trim_start();
+        let valid_source = if trusted_owner(c.user) {
+            !super::has_agent_command(c.body) && is_signed_scoreboard_text(c.body)
+        } else if outcome_bot(c.user) {
+            !trimmed.starts_with("Dispatch outcome:")
+                && !trimmed.starts_with("Dispatch run:")
+                && c.body.contains("Signed gate: **PASS**")
+        } else {
+            false
+        };
+        if !valid_source {
+            return false;
+        }
+        let sha_scope = if trimmed.starts_with("Signed gate:") {
+            trimmed.split_once('→').map_or(c.body, |(_, rest)| rest)
+        } else {
+            c.body
+        };
+        mentions_head_sha(sha_scope, head)
     })
 }
 
@@ -524,19 +543,57 @@ pub(super) fn ecosystem_wait_reason(
     )))
 }
 
-fn fenced_json_after(body: &str, heading: &str) -> Option<Value> {
+fn fenced_block_after(body: &str, heading: &str) -> Option<String> {
     let rest = body.split_once(heading)?.1;
     let mut lines = rest.lines();
     lines.find(|line| line.trim_start().starts_with("```"))?;
     let mut buf = String::new();
     for line in lines {
         if line.trim_start().starts_with("```") {
-            return serde_json::from_str(&buf).ok();
+            return Some(buf);
         }
         buf.push_str(line);
         buf.push('\n');
     }
     None
+}
+
+fn fenced_json_after(body: &str, heading: &str) -> Option<Value> {
+    fenced_block_after(body, heading).and_then(|buf| serde_json::from_str(&buf).ok())
+}
+
+/// Extracts `"<key>": "<string>"` even when the fenced worker-contract preview
+/// was clipped at 2,000 characters before the closing quote or brace.
+fn extract_json_string_prefix(raw: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let after_key = raw.split_once(&needle)?.1.trim_start();
+    let after_colon = after_key.strip_prefix(':')?.trim_start();
+    let mut chars = after_colon.strip_prefix('"')?.chars();
+    let mut out = String::new();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => break,
+            '\\' => match chars.next()? {
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                '/' => out.push('/'),
+                'u' => {
+                    let hex: String = chars.by_ref().take(4).collect();
+                    if let Some(decoded) =
+                        u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32)
+                    {
+                        out.push(decoded);
+                    }
+                }
+                other => out.push(other),
+            },
+            other => out.push(other),
+        }
+    }
+    Some(out)
 }
 
 fn parse_author_tier(server: &str) -> Option<super::worker_tier::WorkerTier> {
@@ -611,24 +668,95 @@ fn starts_with_verdict_keyword(upper: &str, keyword: &str) -> bool {
         .is_some_and(|rest| rest.chars().next().is_none_or(|c| !c.is_ascii_alphabetic()))
 }
 
+fn parse_verdict_keyword(raw: &str) -> Option<ReviewVerdict> {
+    let upper = raw
+        .trim()
+        .trim_start_matches(['*', '_', '`'])
+        .trim()
+        .to_ascii_uppercase();
+    if [
+        "CHANGES REQUESTED",
+        "CHANGES_REQUESTED",
+        "REQUEST CHANGES",
+        "REQUEST_CHANGES",
+    ]
+    .iter()
+    .any(|kw| starts_with_verdict_keyword(&upper, kw))
+    {
+        Some(ReviewVerdict::ChangesRequested)
+    } else if starts_with_verdict_keyword(&upper, "APPROVED")
+        || starts_with_verdict_keyword(&upper, "APPROVE")
+    {
+        Some(ReviewVerdict::Approved)
+    } else {
+        None
+    }
+}
+
 fn clean_verdict_line(line: &str) -> &str {
     line.trim()
         .trim_start_matches(['#', '*', '_', '`', '>', '-', ' '])
         .trim()
 }
 
+fn explicit_verdict_line(text: &str) -> Option<ReviewVerdict> {
+    for raw in text.lines() {
+        let cleaned = raw
+            .trim()
+            .trim_start_matches(['#', '*', '_', '>', '-', ' '])
+            .trim();
+        if let Some(rest) = cleaned
+            .get(..8)
+            .filter(|p| p.eq_ignore_ascii_case("verdict:"))
+            .and_then(|_| cleaned.get(8..))
+            && let Some(verdict) = parse_verdict_keyword(rest)
+        {
+            return Some(verdict);
+        }
+    }
+    None
+}
+
+fn inline_verdict_tag(text: &str) -> Option<ReviewVerdict> {
+    for raw in text.lines() {
+        let lower = raw.to_ascii_lowercase();
+        let mut offset = 0;
+        while let Some(pos) = lower[offset..].find("verdict:") {
+            let idx = offset + pos;
+            let before_ok = idx == 0
+                || (!raw.as_bytes()[idx - 1].is_ascii_alphanumeric()
+                    && raw.as_bytes()[idx - 1] != b'`'
+                    && raw.as_bytes()[idx - 1] != b'"');
+            if before_ok
+                && let Some(rest) = raw.get(idx + 8..)
+                && let Some(verdict) = parse_verdict_keyword(rest)
+            {
+                return Some(verdict);
+            }
+            offset = idx + 8;
+        }
+    }
+    None
+}
+
+fn is_review_boilerplate_line(cleaned: &str) -> bool {
+    cleaned.is_empty()
+        || cleaned.eq_ignore_ascii_case("worker review")
+        || cleaned.starts_with("Reviewed head:")
+        || cleaned.starts_with(SELF_REVIEW_DISCLAIMER)
+        || cleaned
+            .get(..13)
+            .is_some_and(|p| p.eq_ignore_ascii_case("loop claimed:"))
+}
+
 fn classify_verdict_text(text: &str) -> Option<ReviewVerdict> {
+    if let Some(explicit) = explicit_verdict_line(text) {
+        return Some(explicit);
+    }
     let mut first_content: Option<&str> = None;
     for raw in text.lines() {
         let cleaned = clean_verdict_line(raw);
-        if cleaned.is_empty()
-            || cleaned.eq_ignore_ascii_case("worker review")
-            || cleaned.starts_with("Reviewed head:")
-            || cleaned.starts_with(SELF_REVIEW_DISCLAIMER)
-            || cleaned
-                .get(..13)
-                .is_some_and(|p| p.eq_ignore_ascii_case("loop claimed:"))
-        {
+        if is_review_boilerplate_line(cleaned) {
             continue;
         }
         if first_content.is_none() {
@@ -638,28 +766,9 @@ fn classify_verdict_text(text: &str) -> Option<ReviewVerdict> {
             .get(..8)
             .filter(|p| p.eq_ignore_ascii_case("verdict:"))
             .and_then(|_| cleaned.get(8..))
+            && let Some(verdict) = parse_verdict_keyword(rest)
         {
-            let upper = rest
-                .trim()
-                .trim_start_matches(['*', '_', '`'])
-                .trim()
-                .to_ascii_uppercase();
-            if [
-                "CHANGES REQUESTED",
-                "CHANGES_REQUESTED",
-                "REQUEST CHANGES",
-                "REQUEST_CHANGES",
-            ]
-            .iter()
-            .any(|kw| starts_with_verdict_keyword(&upper, kw))
-            {
-                return Some(ReviewVerdict::ChangesRequested);
-            }
-            if starts_with_verdict_keyword(&upper, "APPROVED")
-                || starts_with_verdict_keyword(&upper, "APPROVE")
-            {
-                return Some(ReviewVerdict::Approved);
-            }
+            return Some(verdict);
         }
         let upper = cleaned.to_ascii_uppercase();
         if ["CHANGES REQUESTED", "CHANGES_REQUESTED", "REQUEST_CHANGES"]
@@ -677,12 +786,14 @@ fn classify_verdict_text(text: &str) -> Option<ReviewVerdict> {
             return Some(ReviewVerdict::Approved);
         }
     }
-    None
+    inline_verdict_tag(text)
 }
 
 fn text_has_review_verdict_marker(text: &str) -> bool {
     classify_verdict_text(text).is_some()
-        || text.to_ascii_lowercase().contains("independent review")
+        || text
+            .to_ascii_lowercase()
+            .contains("completed independent review round")
 }
 
 fn text_requests_changes(text: &str) -> bool {
@@ -691,6 +802,9 @@ fn text_requests_changes(text: &str) -> bool {
 
 fn is_verdict_header_line(line: &str) -> bool {
     let cleaned = clean_verdict_line(line);
+    if is_review_boilerplate_line(cleaned) {
+        return true;
+    }
     let upper = cleaned.to_ascii_uppercase();
     matches!(
         upper.as_str(),
@@ -718,15 +832,23 @@ pub(super) fn parse_outcomes(
             .find_map(|l| l.strip_prefix("Round kind: "))
             .map(str::trim)
             .filter(|s| !s.is_empty());
+        let published_verdict = server
+            .lines()
+            .find_map(|l| l.strip_prefix("Published review verdict: "))
+            .and_then(parse_verdict_keyword);
         let trigger_url = server
             .lines()
             .find_map(|l| l.strip_prefix("Round trigger: "))
             .map(str::trim)
             .filter(|s| !s.is_empty());
         let commits_pushed = parse_commits_pushed(server);
+        let pr_body_not_updated = server.lines().any(|l| l.trim() == "- PR body: not updated.");
         let outcome_contract = fenced_json_after(c.body, "Outcome contract:");
         let pub_receipt = fenced_json_after(c.body, "Publication receipt:");
-        let worker_contract = fenced_json_after(c.body, "Worker contract (claims for review):");
+        let wc_raw = fenced_block_after(c.body, "Worker contract (claims for review):");
+        let worker_contract = wc_raw
+            .as_deref()
+            .and_then(|buf| serde_json::from_str::<Value>(buf).ok());
         let loop_claims = parse_loop_claims(c.body);
         let oc_summary = outcome_contract
             .as_ref()
@@ -738,7 +860,12 @@ pub(super) fn parse_outcomes(
             .unwrap_or_default();
         let wc_summary = worker_contract
             .as_ref()
-            .and_then(|v| v["summary"].as_str())
+            .and_then(|v| v["summary"].as_str().map(str::to_owned))
+            .or_else(|| {
+                wc_raw
+                    .as_deref()
+                    .and_then(|buf| extract_json_string_prefix(buf, "summary"))
+            })
             .unwrap_or_default();
         let wc_verdict = worker_contract
             .as_ref()
@@ -754,6 +881,17 @@ pub(super) fn parse_outcomes(
                     == u
             })
         });
+        let linked_review_body = linked_review
+            .and_then(|r| r["body"].as_str())
+            .unwrap_or_default();
+        let explicit_verdict = [
+            wc_summary.as_str(),
+            oc_loop_summary,
+            loop_claims.as_str(),
+            linked_review_body,
+        ]
+        .into_iter()
+        .find_map(explicit_verdict_line);
 
         let kind = if let Some(rk) = round_kind_line {
             if rk.eq_ignore_ascii_case("review") {
@@ -761,6 +899,8 @@ pub(super) fn parse_outcomes(
             } else {
                 RoundKind::Implementation
             }
+        } else if published_verdict.is_some() {
+            RoundKind::Review
         } else if let Some(trig) = trigger_url.and_then(|u| comments.iter().find(|tc| tc.url == u))
         {
             if is_review_brief(trig.body) {
@@ -768,11 +908,12 @@ pub(super) fn parse_outcomes(
             } else {
                 RoundKind::Implementation
             }
+        } else if (commits_pushed == Some(0) || pr_body_not_updated) && explicit_verdict.is_some() {
+            RoundKind::Review
         } else if commits_pushed == Some(0)
-            && status.eq_ignore_ascii_case("done")
             && (text_has_review_verdict_marker(oc_summary)
                 || text_has_review_verdict_marker(oc_loop_summary)
-                || text_has_review_verdict_marker(wc_summary)
+                || text_has_review_verdict_marker(&wc_summary)
                 || text_has_review_verdict_marker(&loop_claims)
                 || matches!(
                     wc_verdict.to_ascii_lowercase().as_str(),
@@ -780,7 +921,7 @@ pub(super) fn parse_outcomes(
                 )
                 || linked_review.is_some_and(|r| {
                     matches!(r["state"].as_str(), Some("APPROVED" | "CHANGES_REQUESTED"))
-                        || classify_verdict_text(r["body"].as_str().unwrap_or_default()).is_some()
+                        || classify_verdict_text(linked_review_body).is_some()
                 }))
         {
             RoundKind::Review
@@ -790,13 +931,15 @@ pub(super) fn parse_outcomes(
 
         let verdict =
             (kind == RoundKind::Review && status.eq_ignore_ascii_case("done")).then(|| {
+                if let Some(pv) = published_verdict {
+                    return pv;
+                }
                 let review_says_cr = linked_review.is_some_and(|r| {
-                    r["state"] == "CHANGES_REQUESTED"
-                        || text_requests_changes(r["body"].as_str().unwrap_or_default())
+                    r["state"] == "CHANGES_REQUESTED" || text_requests_changes(linked_review_body)
                 });
                 if text_requests_changes(oc_summary)
                     || text_requests_changes(oc_loop_summary)
-                    || text_requests_changes(wc_summary)
+                    || text_requests_changes(&wc_summary)
                     || text_requests_changes(&loop_claims)
                     || matches!(
                         wc_verdict.to_ascii_lowercase().as_str(),
@@ -810,11 +953,18 @@ pub(super) fn parse_outcomes(
                 }
             });
 
+        let non_server_oc_summary = (!oc_summary.starts_with("Server ")
+            && !oc_summary.starts_with("Published:"))
+        .then_some(oc_summary)
+        .unwrap_or_default();
+        let prioritized_review =
+            text_requests_changes(linked_review_body).then_some(linked_review_body);
         let raw_findings = [
+            prioritized_review.unwrap_or_default(),
+            wc_summary.as_str(),
             oc_loop_summary,
-            oc_summary,
             loop_claims.as_str(),
-            wc_summary,
+            non_server_oc_summary,
         ]
         .into_iter()
         .find(|s| !s.trim().is_empty())
