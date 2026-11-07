@@ -70,12 +70,14 @@ The unavailable-head and empty-head raw-exit bindings use the same real
 native-owned records and a second live thread. The empty head is registered
 user storage whose first link points back to itself; the unavailable head is
 registered storage with a guarded-copy refusal injected at the production
-copy boundary. Both require in-zone retirement,
-a consumed live membership, and no host-exit request. These are acceptance
-assertions, not preservation assertions for the existing handback.
+copy boundary. The empty-head rows require in-zone retirement and a consumed live membership.
+Unavailable-copy rows require terminal custody at admission and no host-exit
+request; they do not require retirement before a backing reply is consumed.
+These are acceptance assertions, not preservation assertions for the existing
+handback.
 
-The unavailable-clear-TID raw-exit binding similarly requires retirement and
-consumption of the clear obligation. The exit-group worker binding starts the
+The unavailable-clear-TID raw-exit bindings similarly require terminal custody
+at admission. They do not yet drive backing supply or its refusal. The exit-group worker binding starts the
 leader's actual `exit_group(7)` while the worker lives, then drive that worker
 through production service admission and terminal retirement. Before the close
 owner completes, the worker must have settled its resident

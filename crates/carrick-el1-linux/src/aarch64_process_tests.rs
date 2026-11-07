@@ -6196,6 +6196,12 @@ fn raw_exit_clear_tid(address: u64, unavailable: bool, unadopted: bool) {
         route,
         carrick_personality_linux::dispatch::CompletionRoute::Suspended
     );
+    if unavailable {
+        // This boundary proves terminal admission only. Backing supply and
+        // its refusal must be driven before requiring completed retirement.
+        assert!(!control.host_exit_requested());
+        return;
+    }
     assert_ne!(fixture.zone.slot(fixture.slot).current(), Some(record.id));
     assert_eq!(fixture.page.live(), 1, "unadopted={unadopted}");
     assert_eq!(control.clear_child_tid(), 0);
@@ -6214,13 +6220,13 @@ fn arm_raw_exit_faulting_clear_tid_still_retires_adopted_and_unadopted() {
 }
 
 #[test]
-fn arm_raw_exit_unavailable_clear_tid_retires_adopted_thread() {
+fn arm_raw_exit_unavailable_clear_tid_keeps_adopted_custody() {
     let word = carrick_test_support::GuestUserBuffer::from_value(42_u32);
     raw_exit_clear_tid(word.arg(), true, false);
 }
 
 #[test]
-fn arm_raw_exit_unavailable_clear_tid_retires_unadopted_thread() {
+fn arm_raw_exit_unavailable_clear_tid_keeps_unadopted_custody() {
     let word = carrick_test_support::GuestUserBuffer::from_value(42_u32);
     raw_exit_clear_tid(word.arg(), true, true);
 }
@@ -6277,6 +6283,12 @@ fn raw_exit_robust_head(unadopted: bool, head: u64, unavailable: bool) {
         route,
         carrick_personality_linux::dispatch::CompletionRoute::Suspended
     );
+    if unavailable {
+        // The retained owner may be parked here. This admission witness must
+        // not require retirement before a backing reply has been consumed.
+        assert!(!control.host_exit_requested());
+        return;
+    }
     let current = fixture.zone.slot(fixture.slot).current();
     assert_ne!(current, Some(record.id));
     let live = fixture.page.live();
@@ -6300,14 +6312,14 @@ fn arm_raw_exit_faulting_robust_head_retires_unadopted_thread() {
 }
 
 #[test]
-fn arm_raw_exit_unavailable_robust_head_retires_adopted_thread() {
+fn arm_raw_exit_unavailable_robust_head_keeps_adopted_custody() {
     // The production copy adapter maps the guarded-copy refusal to NotYet.
     let head = carrick_test_support::GuestUserBuffer::from_values(&[0_u64; 3]);
     raw_exit_robust_head(false, head.arg(), true);
 }
 
 #[test]
-fn arm_raw_exit_unavailable_robust_head_retires_unadopted_thread() {
+fn arm_raw_exit_unavailable_robust_head_keeps_unadopted_custody() {
     let head = carrick_test_support::GuestUserBuffer::from_values(&[0_u64; 3]);
     raw_exit_robust_head(true, head.arg(), true);
 }
