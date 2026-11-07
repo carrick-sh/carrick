@@ -62,3 +62,28 @@ never replay a completed wake when a later copy parks.
 VM-free evidence for the terminal-fault slice does not establish actual
 backing supply, signed execution, robust-list semantics or runtime ratios.
 HVF/Docker acceptance and owned-parking/robust witnesses remain outstanding.
+
+## Finishing-round production witnesses
+
+The unavailable-head and empty-head raw-exit bindings use the same real
+`arm_call` dispatch as the terminal-fault controls, with both adopted and
+native-owned records and a second live thread. The empty head is registered
+user storage whose first link points back to itself; the unavailable head is
+registered storage with a guarded-copy refusal injected at the production
+copy boundary. Both require in-zone retirement,
+a consumed live membership, and no host-exit request. These are acceptance
+assertions, not preservation assertions for the existing handback.
+
+The unavailable-clear-TID raw-exit binding similarly requires retirement and
+consumption of the clear obligation. The exit-group worker binding starts the
+leader's actual `exit_group(7)` while the worker lives, then drive that worker
+through production service admission and terminal retirement. Before the close
+owner completes, the worker must have settled its resident
+clear-TID obligation, including the actual user word rather than only the
+slot's bookkeeping. Existing no-clear and retained-IPC rows remain controls.
+
+These witnesses alone do not implement the exact-thread terminal owner,
+exercise a robust entry's atomic owner-death update, prove exactly-once wakeups
+for parked copies, or confer signed acceptance. They must become green through
+the retained owner rather than by accepting HostCustody, returning errno 14,
+or treating NotYet as Fault.

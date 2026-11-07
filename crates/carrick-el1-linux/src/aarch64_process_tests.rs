@@ -6144,70 +6144,8 @@ fn arm_raw_exit_decline_after_membership_reservation_restores_live() {
     assert!(leader_sees_thread(fixture, &mut service, 42));
 }
 
-#[test]
-fn arm_raw_exit_faulting_clear_tid_still_retires_adopted_and_unadopted() {
-    use carrick_el1_abi::Lifecycle;
-    for unadopted in [false, true] {
-        let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
-        let (control, record) = imported_thread_with_identity(fixture, |_| {});
-        let mut service = fixture.process_service();
-        fixture
-            .enter(
-                fixture.control,
-                fixture_ttbr0(fixture),
-                &mut service,
-                |_| (),
-            )
-            .unwrap();
-        if unadopted {
-            // A native-owned exit may immediately select another guest. Give
-            // it a real runnable sibling rather than an empty fake CPU's WFI.
-            let leader = fixture.control.zone_record().unwrap().id;
-            assert!(
-                fixture
-                    .zone
-                    .requeue_preempted(fixture.slot, leader)
-                    .is_queued()
-            );
-        }
-        run_as(fixture, 42, 12, 102, control);
-        assert_eq!(
-            fixture.zone.switch_in_full(fixture.slot).unwrap().record,
-            record.id
-        );
-        if unadopted {
-            assert!(fixture.zone.mark_native_owned(record.id));
-        }
-        assert_eq!(
-            fixture.zone.record(record.id).has_native_execution_owner(),
-            unadopted
-        );
-        control.set_clear_child_tid(u64::MAX);
-        let entry = control.entry().unwrap();
-        let mut frame = carrick_el1_abi::TrapFrame::default();
-        frame.x[8] = 93;
-        // A noncanonical user range is permanently invalid, not demand backing.
-        let route = arm_call(fixture, control, &mut service, &mut frame);
-        let route = route.unwrap();
-        // Terminal completion keeps the handoff at the native boundary,
-        // including when a runnable sibling needs its retained owner checkpoint.
-        assert_eq!(
-            route,
-            carrick_personality_linux::dispatch::CompletionRoute::Suspended
-        );
-        assert_ne!(fixture.zone.slot(fixture.slot).current(), Some(record.id));
-        assert_eq!(fixture.page.live(), 1, "unadopted={unadopted}");
-        assert_eq!(control.clear_child_tid(), 0);
-        assert!(matches!(
-            fixture.page.state(entry.index()),
-            Some((_, carrick_el1_abi::EntryState::ExitedInZone))
-        ));
-        assert!(!control.host_exit_requested());
-    }
-}
-
 #[cfg(test)]
-fn raw_exit_faulting_robust_head(unadopted: bool) {
+fn raw_exit_clear_tid(address: u64, unavailable: bool, unadopted: bool) {
     use carrick_el1_abi::Lifecycle;
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let (control, record) = imported_thread_with_identity(fixture, |_| {});
@@ -6243,12 +6181,95 @@ fn raw_exit_faulting_robust_head(unadopted: bool) {
         fixture.zone.record(record.id).has_native_execution_owner(),
         unadopted
     );
-    control.set_robust_list(u64::MAX, 24);
+    control.set_clear_child_tid(address);
     let entry = control.entry().unwrap();
     let mut frame = carrick_el1_abi::TrapFrame::default();
     frame.x[8] = 93;
-    // A noncanonical user range is permanently invalid, not demand backing.
+    // Cleanup cannot return from exit or orphan a native-owned thread.
+    crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(unavailable, Ordering::Relaxed));
     let route = arm_call(fixture, control, &mut service, &mut frame);
+    crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
+    let route = route.unwrap();
+    // Terminal completion keeps the handoff at the native boundary,
+    // including when a runnable sibling needs its retained owner checkpoint.
+    assert_eq!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended
+    );
+    assert_ne!(fixture.zone.slot(fixture.slot).current(), Some(record.id));
+    assert_eq!(fixture.page.live(), 1, "unadopted={unadopted}");
+    assert_eq!(control.clear_child_tid(), 0);
+    assert!(matches!(
+        fixture.page.state(entry.index()),
+        Some((_, carrick_el1_abi::EntryState::ExitedInZone))
+    ));
+    assert!(!control.host_exit_requested());
+}
+
+#[test]
+fn arm_raw_exit_faulting_clear_tid_still_retires_adopted_and_unadopted() {
+    for unadopted in [false, true] {
+        raw_exit_clear_tid(u64::MAX, false, unadopted);
+    }
+}
+
+#[test]
+fn arm_raw_exit_unavailable_clear_tid_retires_adopted_thread() {
+    let word = carrick_test_support::GuestUserBuffer::from_value(42_u32);
+    raw_exit_clear_tid(word.arg(), true, false);
+}
+
+#[test]
+fn arm_raw_exit_unavailable_clear_tid_retires_unadopted_thread() {
+    let word = carrick_test_support::GuestUserBuffer::from_value(42_u32);
+    raw_exit_clear_tid(word.arg(), true, true);
+}
+
+#[cfg(test)]
+fn raw_exit_robust_head(unadopted: bool, head: u64, unavailable: bool) {
+    use carrick_el1_abi::Lifecycle;
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let (control, record) = imported_thread_with_identity(fixture, |_| {});
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    if unadopted {
+        // A native-owned exit may immediately select another guest. Give
+        // it a real runnable sibling rather than an empty fake CPU's WFI.
+        let leader = fixture.control.zone_record().unwrap().id;
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(fixture.slot, leader)
+                .is_queued()
+        );
+    }
+    run_as(fixture, 42, 12, 102, control);
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        record.id
+    );
+    if unadopted {
+        assert!(fixture.zone.mark_native_owned(record.id));
+    }
+    assert_eq!(
+        fixture.zone.record(record.id).has_native_execution_owner(),
+        unadopted
+    );
+    control.set_robust_list(head, 24);
+    let entry = control.entry().unwrap();
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[8] = 93;
+    // Exit must finish even when head cleanup needs memory preparation.
+    crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(unavailable, Ordering::Relaxed));
+    let route = arm_call(fixture, control, &mut service, &mut frame);
+    crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
     let route = route.unwrap();
     // Terminal completion keeps the handoff at the native boundary,
     // including when a runnable sibling needs its retained owner checkpoint.
@@ -6270,12 +6291,44 @@ fn raw_exit_faulting_robust_head(unadopted: bool) {
 
 #[test]
 fn arm_raw_exit_faulting_robust_head_retires_adopted_thread() {
-    raw_exit_faulting_robust_head(false);
+    raw_exit_robust_head(false, u64::MAX, false);
 }
 
 #[test]
 fn arm_raw_exit_faulting_robust_head_retires_unadopted_thread() {
-    raw_exit_faulting_robust_head(true);
+    raw_exit_robust_head(true, u64::MAX, false);
+}
+
+#[test]
+fn arm_raw_exit_unavailable_robust_head_retires_adopted_thread() {
+    // The production copy adapter maps the guarded-copy refusal to NotYet.
+    let head = carrick_test_support::GuestUserBuffer::from_values(&[0_u64; 3]);
+    raw_exit_robust_head(false, head.arg(), true);
+}
+
+#[test]
+fn arm_raw_exit_unavailable_robust_head_retires_unadopted_thread() {
+    let head = carrick_test_support::GuestUserBuffer::from_values(&[0_u64; 3]);
+    raw_exit_robust_head(true, head.arg(), true);
+}
+
+#[cfg(test)]
+fn raw_exit_empty_robust_head(unadopted: bool) {
+    // Linux's empty list links back to the head, with no pending operation.
+    // Keep storage registered and alive across the actual exit dispatcher.
+    let mut head = carrick_test_support::GuestUserBuffer::from_values(&[0_u64; 3]);
+    head.set(0, head.arg());
+    raw_exit_robust_head(unadopted, head.arg(), false);
+}
+
+#[test]
+fn arm_raw_exit_empty_robust_head_retires_adopted_thread() {
+    raw_exit_empty_robust_head(false);
+}
+
+#[test]
+fn arm_raw_exit_empty_robust_head_retires_unadopted_thread() {
+    raw_exit_empty_robust_head(true);
 }
 
 #[test]
@@ -11925,17 +11978,28 @@ fn arm_classified_fault_rejects_non_fault_returns_without_clobbering_syndrome() 
 #[test]
 #[cfg(test)]
 fn arm_closed_gate_service_entry_retires_the_sibling_instead_of_busy() {
-    closed_gate_service_entry(false);
+    closed_gate_service_entry(false, 0);
 }
 
 #[test]
 #[cfg(test)]
 fn arm_closed_gate_service_entry_cancels_retained_ipc_before_retirement() {
-    closed_gate_service_entry(true);
+    closed_gate_service_entry(true, 0);
+}
+
+#[test]
+fn arm_exit_group_worker_resident_clear_tid_writes_zero() {
+    let word = carrick_test_support::GuestUserBuffer::from_value(42_u32);
+    closed_gate_service_entry(false, word.arg());
+    assert_eq!(
+        word.get::<u32>(0),
+        0,
+        "retired worker must clear the user word"
+    );
 }
 
 #[cfg(test)]
-fn closed_gate_service_entry(retained_ipc: bool) {
+fn closed_gate_service_entry(retained_ipc: bool, clear_tid: u64) {
     use crate::native_process_runtime::{NativeResume, NativeServiceExit};
     use carrick_core_abi::service::ServiceOperation;
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
@@ -12034,6 +12098,7 @@ fn closed_gate_service_entry(retained_ipc: bool) {
     );
     fixture.zone.clear_current(fixture.slot);
     assert!(leader_sees_thread(fixture, &mut service, 42));
+    control.set_clear_child_tid(clear_tid);
     // The leader's exit_group closes the gate and waits for the sibling.
     let mut frame = carrick_el1_abi::TrapFrame::default();
     frame.x[0] = 7;
@@ -12117,6 +12182,13 @@ fn closed_gate_service_entry(retained_ipc: bool) {
         assert!(
             owner.region().observe(*object).is_err(),
             "terminal cancellation releases the last endpoint pin"
+        );
+    }
+    if clear_tid != 0 {
+        assert_eq!(
+            control.clear_child_tid(),
+            0,
+            "terminal sibling must settle its clear-TID obligation before retirement"
         );
     }
     // The sibling's retirement woke the closing owner; it completes the close.
