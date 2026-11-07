@@ -351,6 +351,21 @@ impl Default for ExecutionArgs {
     }
 }
 
+/// Splits a `target` positional of `run`, `create` or `exec` into the image
+/// or container and the guest command after it.
+///
+/// Clap parses the two as one trailing value list, so every token after the
+/// image belongs to the guest even when it is spelled like a carrick option
+/// (`carrick run IMG node -e ...`), as with `docker run` (#1827). Separate
+/// `image` and `command` positionals let clap claim `-e` after the image.
+pub(crate) fn split_target(target: Vec<String>) -> anyhow::Result<(String, Vec<String>)> {
+    let mut parts = target.into_iter();
+    let Some(head) = parts.next() else {
+        anyhow::bail!("missing image or container before the command");
+    };
+    Ok((head, parts.collect()))
+}
+
 #[derive(Debug, ::clap::Subcommand)]
 pub(crate) enum Commands {
     /// Print the source identity embedded by `scripts/build-signed.sh`.
@@ -583,7 +598,14 @@ pub(crate) enum Commands {
         run_args: RunArgs,
         #[clap(flatten)]
         exec_args: ExecutionArgs,
-        image: String,
+        /// The image, then the guest command and its arguments.
+        #[arg(
+            value_name = "IMAGE [COMMAND [ARG...]]",
+            required = true,
+            num_args = 1..,
+            trailing_var_arg = true
+        )]
+        target: Vec<String>,
         /// Emit the JSON compat-report envelope (exit code, traps, report) on
         /// stdout instead of behaving like `docker run`. Opt-in; off by default.
         #[arg(long, display_order = 60)]
@@ -599,17 +621,20 @@ pub(crate) enum Commands {
             display_order = 90
         )]
         detach: bool,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        command: Vec<String>,
     },
     /// Create a container without starting it (like `docker create`). Pulls the
     /// image and persists the config; launch it later with `carrick start`.
     Create {
         #[clap(flatten)]
         run_args: RunArgs,
-        image: String,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        command: Vec<String>,
+        /// The image, then the guest command and its arguments.
+        #[arg(
+            value_name = "IMAGE [COMMAND [ARG...]]",
+            required = true,
+            num_args = 1..,
+            trailing_var_arg = true
+        )]
+        target: Vec<String>,
     },
     /// Start one or more created or stopped containers (like `docker start`).
     Start {
@@ -739,10 +764,14 @@ pub(crate) enum Commands {
         /// Set environment variables for the command (`KEY=VALUE`).
         #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
-        /// Container id or name.
-        container: String,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
-        command: Vec<String>,
+        /// The container id or name, then the command and its arguments.
+        #[arg(
+            value_name = "CONTAINER COMMAND [ARG...]",
+            required = true,
+            num_args = 2..,
+            trailing_var_arg = true
+        )]
+        target: Vec<String>,
     },
     DispatchSyscall {
         number: u64,
@@ -1338,6 +1367,84 @@ mod tests {
     use super::{Cli, Commands, DebugCommand};
     use crate::trace_profile::TraceProfileKind;
     use clap::Parser as _;
+
+    /// #1827: like `docker run`, every token after the image belongs to the
+    /// guest command, even one spelled like a carrick option (`node -e`).
+    #[test]
+    fn run_passes_options_after_the_image_to_the_guest() {
+        let cli = Cli::try_parse_from([
+            "carrick",
+            "run",
+            "-e",
+            "HOST=1",
+            "--entrypoint",
+            "node24",
+            "IMG",
+            "-e",
+            "console.log(process.version)",
+            "--rm",
+        ])
+        .expect("run with guest options after the image should parse");
+        let Commands::Run {
+            run_args, target, ..
+        } = cli.command
+        else {
+            panic!("expected run command");
+        };
+        let (image, command) = super::split_target(target).expect("image");
+        assert_eq!(run_args.env, ["HOST=1"]);
+        assert_eq!(run_args.entrypoint.as_deref(), Some("node24"));
+        assert!(!run_args.rm);
+        assert_eq!(image, "IMG");
+        assert_eq!(command, ["-e", "console.log(process.version)", "--rm"]);
+    }
+
+    /// The rule holds for `create` and `exec`, an image with no command still
+    /// parses, and `exec` still requires a command.
+    #[test]
+    fn create_and_exec_pass_options_after_the_target_to_the_guest() {
+        let cli = Cli::try_parse_from(["carrick", "create", "-e", "A=1", "IMG", "-p", "1+1"])
+            .expect("create should parse");
+        let Commands::Create { run_args, target } = cli.command else {
+            panic!("expected create command");
+        };
+        assert_eq!(run_args.env, ["A=1"]);
+        assert!(run_args.publish.is_empty());
+        assert_eq!(
+            super::split_target(target).expect("image"),
+            ("IMG".to_owned(), vec!["-p".to_owned(), "1+1".to_owned()])
+        );
+
+        let cli = Cli::try_parse_from(["carrick", "exec", "-e", "A=1", "box", "env", "-e", "x"])
+            .expect("exec should parse");
+        let Commands::Exec { env, target, .. } = cli.command else {
+            panic!("expected exec command");
+        };
+        assert_eq!(env, ["A=1"]);
+        assert_eq!(
+            super::split_target(target).expect("container"),
+            (
+                "box".to_owned(),
+                vec!["env".to_owned(), "-e".to_owned(), "x".to_owned()]
+            )
+        );
+
+        let cli = Cli::try_parse_from(["carrick", "run", "--rm", "IMG"]).expect("bare image");
+        let Commands::Run {
+            run_args, target, ..
+        } = cli.command
+        else {
+            panic!("expected run command");
+        };
+        assert!(run_args.rm);
+        assert_eq!(
+            super::split_target(target).expect("image"),
+            ("IMG".to_owned(), Vec::new())
+        );
+
+        assert!(Cli::try_parse_from(["carrick", "exec", "box"]).is_err());
+        assert!(Cli::try_parse_from(["carrick", "run"]).is_err());
+    }
 
     #[test]
     fn authenticated_vm_ledger_requires_external_provenance() {
