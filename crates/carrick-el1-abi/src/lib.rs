@@ -79,7 +79,9 @@ pub use internal_read::*;
 mod kernel_fault_venues;
 pub use kernel_fault_venues::*;
 mod file_region;
+mod ipc_window;
 pub use file_region::*;
+pub use ipc_window::*;
 
 use core::cell::UnsafeCell;
 
