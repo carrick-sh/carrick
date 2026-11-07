@@ -171,14 +171,13 @@ impl<'a> PendingPipePair<'a> {
             Phase::SettledCancelled => return Ok(()),
             _ => return Err(IpcError::Corrupt),
         }
-        if let Some(claim) = self.claim.take() {
-            if let Err(refusal) = self.region.fd(BorrowedWait(wait)).cancel_pair(claim) {
-                if refusal.error() != carrick_fd_core::Error::StaleTable {
-                    let error = refusal.error();
-                    self.claim = Some(refusal.into_reservation());
-                    return Err(IpcError::Fd(error));
-                }
-            }
+        if let Some(claim) = self.claim.take()
+            && let Err(refusal) = self.region.fd(BorrowedWait(wait)).cancel_pair(claim)
+            && refusal.error() != carrick_fd_core::Error::StaleTable
+        {
+            let error = refusal.error();
+            self.claim = Some(refusal.into_reservation());
+            return Err(IpcError::Fd(error));
         }
         self.release(wait, deliver)?;
         self.phase = Phase::SettledCancelled;
@@ -208,17 +207,16 @@ impl<'a> PendingPipePair<'a> {
         mut deliver: impl FnMut(IpcReleased),
     ) -> Result<(), IpcError> {
         for index in 0..2 {
-            if let Some(pin) = self.pins[index].take() {
-                // Invalid pins are broken invariants, never a retryable lock
-                // refusal: unpin is atomic and does not acquire a table lock.
-                if let Some(description) = self
+            // Invalid pins are broken invariants, never a retryable lock
+            // refusal: unpin is atomic and does not acquire a table lock.
+            if let Some(pin) = self.pins[index].take()
+                && let Some(description) = self
                     .region
                     .fd(BorrowedWait(wait))
                     .unpin(pin)
                     .map_err(IpcError::Fd)?
-                {
-                    self.backings[index] = Some(description.backing);
-                }
+            {
+                self.backings[index] = Some(description.backing);
             }
             if let Some(backing) = self.backings[index] {
                 let released = self.region.release_backing(backing, wait)?;
