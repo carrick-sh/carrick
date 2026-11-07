@@ -70,6 +70,8 @@ pub enum TransientFailure {
 
 #[derive(Debug, Error)]
 pub enum ScalerError {
+    #[error("storage busy; retry next reconcile")]
+    StorageBusy,
     #[error("projected clone CPU {projected:.1}% exceeds the 80% admission ceiling")]
     CpuCeiling { projected: f64 },
     #[error("KVM_GET_API_VERSION returned {version}, errno={errno}; expected 12")]
@@ -156,6 +158,7 @@ pub struct JobKey {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum State {
+    WaitingStorage,
     Reserved,
     Cloning,
     Booting,
@@ -396,7 +399,11 @@ impl Ledger {
                 r.name != except
                     && matches!(
                         r.state,
-                        State::Reserved | State::Cloning | State::Booting | State::Registered
+                        State::Reserved
+                            | State::WaitingStorage
+                            | State::Cloning
+                            | State::Booting
+                            | State::Registered
                     )
             })
             .fold(Pending::default(), |total, r| {
@@ -908,6 +915,7 @@ pub enum Reap {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum TaskState {
+    Busy,
     Absent,
     Running,
     Succeeded,
@@ -930,12 +938,15 @@ pub fn recovery_decision(row: &Record, present: bool, task: TaskState, now: u64)
         if row.state == State::Reaping {
             return Recovery::ResumeReaping;
         }
-        if row.state == State::Cloning && task == TaskState::Succeeded {
+        if (row.state == State::Cloning && task == TaskState::Succeeded)
+            || (row.state == State::Booting && task == TaskState::Busy)
+        {
             return Recovery::ResumeClone;
         }
         return Recovery::Inspect;
     }
-    if task == TaskState::Failed
+    if row.state == State::WaitingStorage
+        || matches!(task, TaskState::Failed | TaskState::Busy)
         || row.state == State::Destroyed
         || row.state == State::Reaping
         || (row.state == State::Reserved
@@ -1650,7 +1661,14 @@ pub(crate) fn execute_with_readiness(
     limit: Duration,
     on_ready: impl FnOnce(u32) -> Result<(), ScalerError>,
 ) -> Result<Vec<u8>, ScalerError> {
-    execute_with_failure_internal(command, input, limit, Some(on_ready), |_| None)
+    execute_with_failure_internal(
+        command,
+        input,
+        limit,
+        Some(on_ready),
+        FailureOutput::Stdout,
+        |_| None,
+    )
 }
 
 fn execute_with_failure(
@@ -1664,6 +1682,27 @@ fn execute_with_failure(
         input,
         limit,
         None::<fn(u32) -> Result<(), ScalerError>>,
+        FailureOutput::Stdout,
+        classify,
+    )
+}
+
+enum FailureOutput {
+    Stdout,
+    Stderr,
+}
+fn execute_with_stderr_failure(
+    command: &mut Command,
+    input: &[u8],
+    limit: Duration,
+    classify: impl FnOnce(&[u8]) -> Option<ScalerError>,
+) -> Result<Vec<u8>, ScalerError> {
+    execute_with_failure_internal(
+        command,
+        input,
+        limit,
+        None::<fn(u32) -> Result<(), ScalerError>>,
+        FailureOutput::Stderr,
         classify,
     )
 }
@@ -1673,6 +1712,7 @@ fn execute_with_failure_internal<F>(
     input: &[u8],
     limit: Duration,
     on_ready: Option<F>,
+    failure_output: FailureOutput,
     classify: impl FnOnce(&[u8]) -> Option<ScalerError>,
 ) -> Result<Vec<u8>, ScalerError>
 where
@@ -1863,7 +1903,11 @@ where
     match &status {
         Ok(Ok(s)) if s.success() => {}
         Ok(Ok(s)) => {
-            if let Ok(Ok(bytes)) = &output
+            let failure_bytes = match failure_output {
+                FailureOutput::Stdout => &output,
+                FailureOutput::Stderr => &stderr,
+            };
+            if let Ok(Ok(bytes)) = failure_bytes
                 && let Some(error) = classify(bytes)
             {
                 return Err(error);
