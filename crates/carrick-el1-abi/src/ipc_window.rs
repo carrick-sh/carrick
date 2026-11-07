@@ -200,9 +200,9 @@ impl GuestIpcWindow {
     ///
     /// # Safety
     /// The caller retains initialized, shared supervisor mappings at both
-    /// virtual ranges for `'static`. Host code must
+    /// virtual ranges for `'a`. Host code must
     /// use HostIpcWindow instead.
-    pub unsafe fn attach(self) -> Result<crate::ipc::IpcRegion<'static>, crate::ipc::IpcError> {
+    pub unsafe fn attach<'a>(self) -> Result<crate::ipc::IpcRegion<'a>, crate::ipc::IpcError> {
         // SAFETY: caller supplies mapping custody; the existing region owner
         // authenticates the directory header and pool geometry.
         unsafe {

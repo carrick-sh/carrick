@@ -227,45 +227,80 @@ impl IpcTables for MapTables<'_> {
     }
 }
 
+impl IpcTables for IpcTableMap {
+    fn table_for_file_table(&self, file_table: u64) -> Option<RawTableId> {
+        self.lookup(file_table)
+    }
+    fn owned_table_of(&self, task: &CurrentTask) -> Option<RawTableId> {
+        self.lookup_owned(task.linux.file_table.load(Ordering::Acquire))
+    }
+}
+
+/// Attach a carrier's IPC venue independently of the image ISA.
+/// The table map comes from the authenticated file region named by `layout`,
+/// never from the ARM fixed aperture. An unpublished or retired region and
+/// an unpublished window have no venue and cannot claim descriptor service.
+///
+/// # Safety
+/// The caller retains this carrier's initialized file-region mapping and both
+/// IPC mappings for `'a`, with the virtual-to-physical bindings described by
+/// `binding`. Guest consumers must stop before registration retirement or
+/// mapping removal. Host code may use this only in VM-free fixtures that own
+/// mappings at the supplied supervisor virtual addresses.
+pub unsafe fn guest_venue<'a>(
+    layout: carrick_guest_arch::KernelLayout,
+    binding: carrick_el1_abi::IpcWindowBinding,
+) -> Option<IpcVenue<'a>> {
+    binding.table_map_address(layout).ok()?;
+    // SAFETY: the caller retains the exact guest mapping. Attachment checks
+    // the existing registration's complete identity and address domains.
+    let tables = unsafe { carrick_el1_abi::FileTables::in_guest(binding.region()) }.ok()?;
+    let map = tables.into_ipc_table_map();
+    // SAFETY: the authenticated map and both IPC ranges are retained for 'a.
+    unsafe { attach_venue(map, carrick_el1_abi::GuestIpcWindow::from_binding(binding)) }
+}
+
+unsafe fn attach_venue<'a>(
+    map: &'a IpcTableMap,
+    window: carrick_el1_abi::GuestIpcWindow,
+) -> Option<IpcVenue<'a>> {
+    // This acquire precedes the first directory/pool access. The carrier
+    // publishes only after both mappings and the operation slots are ready.
+    if !map.window_published() {
+        return None;
+    }
+    // SAFETY: both admitted ranges are retained by the caller for 'a.
+    let region = unsafe { window.attach() }
+        .ok()?
+        .with_ceiling(&carrick_el1_abi::GUEST_DESCRIPTOR_CEILING);
+    Some(IpcVenue {
+        region,
+        tables: map,
+    })
+}
+
 /// The shared IPC authority EL1 serves from: the window the runtime maps at
 /// `EL1_IPC_BASE`, once the host authority has published its directory.
 /// Unmapped or unpublished, the attach fails and every call forwards.
 #[cfg(target_os = "none")]
 pub fn current_guest_venue(slot: u32) -> Option<IpcVenue<'static>> {
-    static TABLES: GuestTables = GuestTables;
-    // Unmapped at stage-2 until the carrier installs it: never touch the
-    // window before the host says so.
-    if !carrick_el1_abi::ipc_table_map_guest().window_published() {
-        return None;
-    }
-    // SAFETY: the carrier publishes the map only after retaining both guest ranges.
-    let region = unsafe { carrick_el1_abi::ipc_window_guest()?.attach() }
-        .ok()?
-        .for_el1_slot(slot)
-        .with_ceiling(&carrick_el1_abi::GUEST_DESCRIPTOR_CEILING);
-    Some(IpcVenue {
-        region,
-        tables: &TABLES,
-    })
+    // SAFETY: the existing ARM mapping owner retains the published window.
+    // Registration migration is still required before this entry can use the
+    // authenticated binding constructor above.
+    let mut venue = unsafe {
+        attach_venue(
+            carrick_el1_abi::ipc_table_map_guest(),
+            carrick_el1_abi::ipc_window_guest()?,
+        )
+    }?;
+    venue.region = venue.region.for_el1_slot(slot);
+    Some(venue)
 }
 
 /// Host builds serve no guest: there is no EL1 window to attach.
 #[cfg(not(target_os = "none"))]
 pub fn current_guest_venue(_slot: u32) -> Option<IpcVenue<'static>> {
     None
-}
-
-#[cfg(target_os = "none")]
-struct GuestTables;
-
-#[cfg(target_os = "none")]
-impl IpcTables for GuestTables {
-    fn table_for_file_table(&self, file_table: u64) -> Option<RawTableId> {
-        MapTables(carrick_el1_abi::ipc_table_map_guest()).table_for_file_table(file_table)
-    }
-    fn owned_table_of(&self, task: &CurrentTask) -> Option<RawTableId> {
-        MapTables(carrick_el1_abi::ipc_table_map_guest()).owned_table_of(task)
-    }
 }
 
 const EL1_WAIT: ShortLockSpin = ShortLockSpin;
@@ -5816,7 +5851,7 @@ mod bound_venue_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn x86_layout_attaches_registered_ipc_venue() {
+    fn relocated_x86_layout_attaches_registered_ipc_venue() {
         use carrick_el1_abi::*;
         use carrick_guest_arch::{FrameGpa, GuestLen, KernelVa};
         struct Mapping(*mut u8, usize);
@@ -5845,7 +5880,13 @@ mod bound_venue_tests {
                 assert_eq!(unsafe { libc::munmap(self.0.cast(), self.1) }, 0);
             }
         }
-        let layout = carrick_el1::isa::x86_kernel_layout();
+        // The real x86 region is an upper-canonical supervisor VA, which a
+        // host userspace fixture cannot map. Relocate only the region while
+        // retaining the x86 layout's other venues and all shared ABI offsets.
+        let layout = carrick_guest_arch::KernelLayout {
+            region: KernelVa::new(0x3_0000_0000),
+            ..carrick_el1::isa::x86_kernel_layout()
+        };
         let storage = Mapping::new(layout.region.raw(), EL1_REGION_SIZE);
         let directory = Mapping::new(0x4_0000_0000, EL1_IPC_DIRECTORY_SPAN);
         let pool = Mapping::new(0x5_0000_0000, EL1_IPC_POOL_SPAN);

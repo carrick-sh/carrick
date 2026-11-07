@@ -52,3 +52,26 @@ of both global publications remain outstanding. Existing ARM consumers also
 use the global region for delegation and memory mailboxes; replacing the IPC
 map accessor alone does not migrate those lifetimes. The work still does not
 meet Slice 1 acceptance. Slices 2–6 remain out of this continuation's scope.
+
+The shared unsafe `guest_venue(layout, binding)` constructor now authenticates
+`FileRegionBinding` through `FileTables::in_guest` before borrowing its map.
+The map is derived from the supplied layout's region; no ARM address is used.
+The constructor checks window publication before touching the directory or
+pool, then uses `GuestIpcWindow::attach` and the existing `IpcRegion::attach`.
+Guest attachment now returns the caller's retained mapping lifetime rather
+than inventing a static lifetime. The map view can retain the original
+registration lifetime after consuming the temporary `FileTables` view.
+
+The Linux VM-free witness maps initialized storage at a userspace relocation of
+the x86 region (the actual upper-canonical VA requires KVM), attaches an IPC directory and pool with distinct frame addresses,
+and resolves an owned table publication through the constructed venue. It
+requires refusal before window publication and after registration retirement.
+A second witness requires foreign-layout refusal before memory access. Both
+were compile-red with E0425 before the constructor existed. These witnesses
+prove construction and identity checks, not pipe transfer or vCPU execution.
+
+ARM's existing entry is now named `current_guest_venue`; it shares the
+attachment body and table-map implementation with the new constructor, but
+still obtains its mapping from the fixed aperture. ARM registration ownership
+migration and removal of `IPC_WINDOW_HOST` and `EL1_REGION_HOST_PTR` remain
+unfinished. This is an incomplete draft checkpoint, not Slice 1 acceptance.
