@@ -940,6 +940,15 @@ impl HostFileCrossing {
     pub const FRAME_TAG: u64 = 0x484f_5354_4649_4c45;
 }
 
+/// Synchronous x86 CPL0 transport of one bounded ring-owned clock-resource
+/// record (`carrick_core_abi::clock`). RDI is retained supervisor storage, RSI
+/// its exact `CLOCK_RECORD_BYTES` length. User pointers never cross this port.
+pub struct ClockResourceCrossing;
+impl ClockResourceCrossing {
+    pub const NUMBER: u64 = 0x4341_5252_434c_4b52;
+    pub const FRAME_TAG: u64 = 0x434c_4f43_4b52_4553;
+}
+
 /// Last guest reference to one host object description. RDI carries the
 /// binding, RSI the description handle, RDX its incarnation.
 pub struct HostObjectReleaseCrossing;
