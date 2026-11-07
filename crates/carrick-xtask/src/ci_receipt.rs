@@ -1064,10 +1064,8 @@ pub fn diff_with_retired(
     {
         new.insert("not-run:lane:kvm:zero executed tests".into());
     }
-    if candidate_tree.as_os_str().is_empty()
-        && candidate.steps.is_empty()
-        && candidate.skipped_steps.is_empty()
-    {
+    // Exclusions describe scope, not execution of the required lanes.
+    if candidate_tree.as_os_str().is_empty() && candidate.steps.is_empty() {
         for lane in required_lanes(candidate) {
             new.insert(format!("not-run:lane:{lane}:zero executed tests"));
         }
