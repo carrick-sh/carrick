@@ -3218,12 +3218,17 @@ fn kvm_recipe_without_tests_fails_receipt_and_comparison() {
             .arg(root)
             .args(["accept", "--profile", "kvm", "--receipt"])
             .arg(&path)
+            .env("CARRICK_HOST_LEASE_PATH", root.join("host.lock"))
+            .env_remove("CARRICK_HOST_LEASE_FD")
+            .env_remove("CARRICK_HOST_LEASE_MODE")
+            .env_remove("CARRICK_HOST_LEASE_SOCKET")
             .output()
             .unwrap();
         assert!(!output.status.success(), "accepted exit {code}");
         let receipt: AcceptReceipt =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(receipt.overall, "FAIL");
+        assert_eq!(receipt.phase, "host");
         if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
             assert!(receipt.steps.is_empty());
             assert!(
@@ -3232,32 +3237,36 @@ fn kvm_recipe_without_tests_fails_receipt_and_comparison() {
                     .iter()
                     .any(|reason| reason.contains("KVM requires Linux x86_64"))
             );
-            continue;
+            assert!(failure_keys(&receipt).iter().any(|key| {
+                key.starts_with("not-run:accept-refusal:")
+                    && key.contains("KVM requires Linux x86_64")
+            }));
+        } else {
+            let step = &receipt.steps[0];
+            assert_eq!(step.exit_code, Some(code));
+            assert!(step.started_tests.is_empty());
+            assert!(!step.passed);
+            assert!(matches!(
+                step.outcome,
+                Some(carrick_xtask::accept::StepOutcome::Failed { .. })
+            ));
+            let error = step.error.as_deref().unwrap();
+            assert!(error.contains("no tests executed"), "{error}");
+            assert!(error.contains(&format!("Some({code})")), "{error}");
+            assert!(
+                matches!(
+                    step.execution_outcome(),
+                    carrick_xtask::accept::StepOutcome::Failed { .. }
+                ),
+                "{step:?}"
+            );
+            assert!(
+                receipt
+                    .failures
+                    .iter()
+                    .any(|f| f.contains("no tests executed"))
+            );
         }
-        let step = &receipt.steps[0];
-        assert_eq!(step.exit_code, Some(code));
-        assert!(step.started_tests.is_empty());
-        assert!(!step.passed);
-        assert!(matches!(
-            step.outcome,
-            Some(carrick_xtask::accept::StepOutcome::Failed { .. })
-        ));
-        let error = step.error.as_deref().unwrap();
-        assert!(error.contains("no tests executed"), "{error}");
-        assert!(error.contains(&format!("Some({code})")), "{error}");
-        assert!(
-            matches!(
-                step.execution_outcome(),
-                carrick_xtask::accept::StepOutcome::Failed { .. }
-            ),
-            "{step:?}"
-        );
-        assert!(
-            receipt
-                .failures
-                .iter()
-                .any(|f| f.contains("no tests executed"))
-        );
         let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
             .args(["ci-receipt", "diff", "--baseline"])
             .arg(&path)
@@ -3267,6 +3276,13 @@ fn kvm_recipe_without_tests_fails_receipt_and_comparison() {
             .output()
             .unwrap();
         assert!(!output.status.success(), "zero execution grandfathered");
+        if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("not-run:accept-refusal:"),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
     }
 }
 
@@ -3351,7 +3367,9 @@ fn kvm_workflow_rejects_zero_execution_but_preserves_named_failures() {
 fn refused_profile_writes_failure_receipt() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("nested/receipt.json");
+    let summary_path = dir.path().join("summary.md");
     for profile in ["kvm", "linux-portable", "el1-native"] {
+        let _ = std::fs::remove_file(&summary_path);
         let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
             .args([
                 "accept",
@@ -3362,12 +3380,17 @@ fn refused_profile_writes_failure_receipt() {
                 "--receipt",
             ])
             .arg(&path)
+            .env("CARRICK_HOST_LEASE_PATH", dir.path().join("host.lock"))
+            .env_remove("CARRICK_HOST_LEASE_FD")
+            .env_remove("CARRICK_HOST_LEASE_MODE")
+            .env_remove("CARRICK_HOST_LEASE_SOCKET")
             .output()
             .unwrap();
         assert!(!output.status.success());
         let receipt: AcceptReceipt =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(receipt.overall, "FAIL");
+        assert_eq!(receipt.phase, "signed");
         assert_eq!(receipt.profile, profile);
         assert!(
             receipt
@@ -3375,5 +3398,148 @@ fn refused_profile_writes_failure_receipt() {
                 .iter()
                 .any(|reason| reason.contains("supports the host phase only"))
         );
+        let keys = failure_keys(&receipt);
+        assert!(
+            keys.iter().any(|key| {
+                key.starts_with("not-run:accept-refusal:")
+                    && key.contains("supports the host phase only")
+            }),
+            "{profile}: {keys:?}"
+        );
+        let diff_out = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .args(["ci-receipt", "diff", "--baseline"])
+            .arg(&path)
+            .arg("--candidate")
+            .arg(&path)
+            .arg("--fail-on-new")
+            .env("GITHUB_STEP_SUMMARY", &summary_path)
+            .output()
+            .unwrap();
+        assert!(
+            !diff_out.status.success(),
+            "{profile}: refusal receipt passed self-diff:\n{}\n{}",
+            String::from_utf8_lossy(&diff_out.stdout),
+            String::from_utf8_lossy(&diff_out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&diff_out.stdout);
+        assert!(
+            stdout.contains("not-run:accept-refusal:")
+                && stdout.contains("supports the host phase only"),
+            "{profile}: {stdout}"
+        );
+        let summary = std::fs::read_to_string(&summary_path).unwrap();
+        assert!(
+            summary.contains("not-run:accept-refusal:"),
+            "{profile}: {summary}"
+        );
+    }
+}
+
+#[test]
+fn refused_host_only_profile_normalizes_phase_for_baseline_diff() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let out_dir = dir.path().join("out");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::create_dir_all(&out_dir).unwrap();
+    std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["add", "README.md"],
+        vec![
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+    ] {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    // Untracked input forces verify_clean_checkout refusal after profile_phase
+    // normalizes the default `all` phase (or macOS refuses KVM directly).
+    std::fs::write(repo.join("untracked.txt"), "dirty\n").unwrap();
+
+    for profile in ["kvm", "linux-portable", "el1-native"] {
+        for pre_supervisor_lease_refusal in [false, true] {
+            let receipt_path = out_dir.join("receipt.json");
+            let _ = std::fs::remove_file(&receipt_path);
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"));
+            cmd.current_dir(&out_dir)
+                .arg("--root")
+                .arg(&repo)
+                .args(["accept", "--profile", profile, "--receipt", "receipt.json"])
+                .env("CARRICK_HOST_LEASE_PATH", dir.path().join("host.lock"))
+                .env_remove("CARRICK_HOST_LEASE_MODE")
+                .env_remove("CARRICK_HOST_LEASE_SOCKET");
+            if pre_supervisor_lease_refusal {
+                cmd.env("CARRICK_HOST_LEASE_FD", "1");
+            } else {
+                cmd.env_remove("CARRICK_HOST_LEASE_FD");
+            }
+            let output = cmd.output().unwrap();
+            assert!(!output.status.success(), "{profile} unexpectedly succeeded");
+            let candidate: AcceptReceipt = serde_json::from_slice(
+                &std::fs::read(&receipt_path).unwrap_or_else(|err| {
+                    panic!(
+                        "{profile} (pre_supervisor={pre_supervisor_lease_refusal}) wrote no receipt: {err}\nstderr: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    )
+                }),
+            )
+            .unwrap();
+            assert_eq!(candidate.overall, "FAIL");
+            assert_eq!(
+                candidate.phase, "host",
+                "{profile} refusal wrote unnormalized phase"
+            );
+            assert_eq!(candidate.profile, profile);
+            assert!(
+                failure_keys(&candidate)
+                    .iter()
+                    .any(|key| key.starts_with("not-run:accept-refusal:")),
+                "{profile}: {:?}",
+                failure_keys(&candidate)
+            );
+
+            let mut baseline = receipt(vec![]);
+            baseline.phase = "host".into();
+            baseline.profile = profile.into();
+            baseline.overall = "PASS".into();
+            let baseline_path = out_dir.join("baseline.json");
+            std::fs::write(&baseline_path, serde_json::to_vec(&baseline).unwrap()).unwrap();
+
+            let vs_base = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+                .args(["ci-receipt", "diff", "--baseline"])
+                .arg(&baseline_path)
+                .arg("--candidate")
+                .arg(&receipt_path)
+                .arg("--fail-on-new")
+                .output()
+                .unwrap();
+            assert!(
+                !vs_base.status.success(),
+                "{profile} refusal passed against host baseline"
+            );
+            let stderr = String::from_utf8_lossy(&vs_base.stderr);
+            assert!(
+                !stderr.contains("not comparable"),
+                "{profile} phase mismatch against host baseline: {stderr}"
+            );
+            let stdout = String::from_utf8_lossy(&vs_base.stdout);
+            assert!(
+                stdout.contains("not-run:accept-refusal:"),
+                "{profile}: {stdout}\n{stderr}"
+            );
+        }
     }
 }

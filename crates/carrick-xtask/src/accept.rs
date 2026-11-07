@@ -3042,7 +3042,25 @@ mod refusal_tests {
         assert!(result.is_err());
         let receipt: AcceptReceipt = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert_eq!(receipt.overall, "FAIL");
+        assert_eq!(receipt.phase, "host");
+        assert_eq!(receipt.profile, "kvm");
         assert!(receipt.steps.is_empty());
         assert!(receipt.failures[0].contains("KVM requires Linux x86_64; host is macos-aarch64"));
+        assert!(crate::ci_receipt::failure_keys(&receipt).iter().any(|key| {
+            key.starts_with("not-run:accept-refusal:")
+                && key.contains("KVM requires Linux x86_64; host is macos-aarch64")
+        }));
+        let mut baseline = receipt.clone();
+        baseline.clean_tree = true;
+        baseline.overall = "PASS".into();
+        baseline.failures.clear();
+        let diff = crate::ci_receipt::diff(&baseline, &receipt).unwrap();
+        assert!(
+            diff.new.iter().any(|key| {
+                key.starts_with("not-run:accept-refusal:")
+                    && key.contains("KVM requires Linux x86_64; host is macos-aarch64")
+            }),
+            "{diff:?}"
+        );
     }
 }
