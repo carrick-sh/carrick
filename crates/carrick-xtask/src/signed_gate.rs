@@ -305,17 +305,11 @@ fn prepare(event_path: &Path, output: &Path) -> Result<(), ReceiptError> {
     let comparison_sha = automatic_pair
         .as_ref()
         .map_or(requested_sha.as_str(), |pair| pair.1.as_str());
-    let comparison = api(&format!(
-        "repos/{REPOSITORY}/compare/main...{comparison_sha}"
-    ))?;
-    let mut base = sha(comparison["merge_base_commit"]["sha"]
-        .as_str()
-        .unwrap_or_default())?;
-    fs::create_dir_all(output).map_err(|e| fail(e.to_string()))?;
     let mut baseline_run = None;
-    if event_name == "merge_group" && base != comparison_sha {
+    let base = if event_name == "merge_group" {
         // Authorization checks out trusted main with shallow history. Fetch
-        // graph objects separately; never check out or execute queue code.
+        // real refs/heads/main and candidate graph objects into an isolated
+        // bare repo; never check out queue code or trust all-parents compare.
         let graph = tempfile::tempdir().map_err(|e| fail(e.to_string()))?;
         checked("git", &["init", "--bare", "."], Some(graph.path()))?;
         checked(
@@ -325,7 +319,7 @@ fn prepare(event_path: &Path, output: &Path) -> Result<(), ReceiptError> {
                 "--no-tags",
                 "--filter=blob:none",
                 "https://github.com/carrick-sh/carrick.git",
-                &format!("{base}:refs/heads/main"),
+                "+refs/heads/main:refs/heads/main",
                 &requested_sha,
             ],
             Some(graph.path()),
@@ -335,28 +329,42 @@ fn prepare(event_path: &Path, output: &Path) -> Result<(), ReceiptError> {
             "refs/heads/main",
             &requested_sha,
         )?;
-        // Reuse select-baseline's first-parent validation of the event base.
-        // Only the exact main ancestor is eligible: signed receipts must not
-        // silently fall back to an older baseline.
-        let selected = crate::ci_receipt::select_baseline(
-            graph.path(),
-            crate::ci_receipt::Lane::Hvf,
-            comparison_sha,
-            &requested_sha,
-            |_, candidate| {
-                if candidate == ancestor.before_sha {
-                    let id = download_baseline(candidate, output, true)?;
-                    baseline_run = Some(id);
-                    Ok(crate::ci_receipt::Baseline::Found(id, "base.json".into()))
-                } else {
-                    Ok(crate::ci_receipt::Baseline::Missing)
-                }
-            },
-        )?;
-        base = selected.baseline_sha;
-    } else if pr.is_none() && base != comparison_sha {
-        return Err(fail("main baseline SHA must be on main"));
-    }
+        if comparison_sha == ancestor.before_sha {
+            ancestor.before_sha
+        } else {
+            // Reuse select-baseline's first-parent validation of the event base.
+            // Only the exact main ancestor is eligible: signed receipts must not
+            // silently fall back to an older baseline.
+            let selected = crate::ci_receipt::select_baseline(
+                graph.path(),
+                crate::ci_receipt::Lane::Hvf,
+                comparison_sha,
+                &requested_sha,
+                |_, candidate| {
+                    if candidate == ancestor.before_sha {
+                        fs::create_dir_all(output).map_err(|e| fail(e.to_string()))?;
+                        let id = download_baseline(candidate, output, true)?;
+                        baseline_run = Some(id);
+                        Ok(crate::ci_receipt::Baseline::Found(id, "base.json".into()))
+                    } else {
+                        Ok(crate::ci_receipt::Baseline::Missing)
+                    }
+                },
+            )?;
+            selected.baseline_sha
+        }
+    } else {
+        let comparison = api(&format!(
+            "repos/{REPOSITORY}/compare/main...{comparison_sha}"
+        ))?;
+        let base = sha(comparison["merge_base_commit"]["sha"]
+            .as_str()
+            .unwrap_or_default())?;
+        if pr.is_none() && base != comparison_sha {
+            return Err(fail("main baseline SHA must be on main"));
+        }
+        base
+    };
     let kind = if event_name == "merge_group" {
         RequestKind::MergeGroup
     } else if pr.is_some() {
@@ -397,6 +405,7 @@ fn prepare(event_path: &Path, output: &Path) -> Result<(), ReceiptError> {
         base,
         baseline_run,
     };
+    fs::create_dir_all(output).map_err(|e| fail(e.to_string()))?;
     if request.kind != RequestKind::Main {
         if request.baseline_run.is_none() {
             request.baseline_run = Some(download_baseline(
