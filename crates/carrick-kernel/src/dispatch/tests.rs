@@ -1799,11 +1799,11 @@ mod overlay_dispatch_tests {
         use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
         use crate::dispatch::executable_authority::{ExecSource, ExecutableAuthorityRegistry};
         for nr in [63, 65, 67, 69] {
-            for kind in 0..3 {
+            for kind in 0..5 {
                 for refuse_input in [false, true] {
                     if refuse_input && (kind != 2 || nr == 65 || nr == 69) { continue; }
                     let mut h = Harness::new();
-                    let initial_offset = if kind == 2 { 0x1801 } else { 1 };
+                    let initial_offset = if kind == 2 { 0x1801 } else if kind >= 3 { 0 } else { 1 };
                     let open = if kind == 1 {
                         let source = ExecSource::shared(Arc::from(&b"abcdef"[..]),
                             carrick_vfs::fs_backend::fresh_file_object_id(), "/exe".into(), 0o755,
@@ -1812,6 +1812,11 @@ mod overlay_dispatch_tests {
                             base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
                             executable: source.into_current(&ExecutableAuthorityRegistry::default()),
                             offset: initial_offset,
+                        }
+                    } else if kind >= 3 {
+                        OpenDescription::SyntheticDevice {
+                            base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
+                            kind: if kind == 3 { carrick_vfs::SyntheticDeviceKind::Zero } else { carrick_vfs::SyntheticDeviceKind::Null },
                         }
                     } else {
                         OpenDescription::SyntheticFile {
@@ -1825,21 +1830,28 @@ mod overlay_dispatch_tests {
                     let kernel = h.dispatcher.capture_one_task_context().unwrap();
                     let mut memory = OwnerRefusingMemory::new(0x1000, 0x2000, 0);
                     memory.seed(0x1800, b"abcdef");
+                    memory.seed(0x1100, &[0xa5; 3]);
                     let wait = if refuse_input { memory.refuse_next_read() } else { memory.refuse_next() };
                     let vector = nr == 65 || nr == 69;
                     memory.seed(0x1000, &0x1100u64.to_ne_bytes());
                     memory.seed(0x1008, &3u64.to_ne_bytes());
                     let request = SyscallRequest::new(nr, SyscallArgs([fd as u64,
                         if vector { 0x1000 } else { 0x1100 }, if vector { 1 } else { 3 }, initial_offset as u64, 0, 0]));
-                    assert_eq!(h.dispatcher.dispatch(&kernel, request, &mut memory, &h.reporter).unwrap(),
-                        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }, "nr={nr} kind={kind} input={refuse_input}");
+                    let first = h.dispatcher.dispatch(&kernel, request, &mut memory, &h.reporter).unwrap();
+                    if kind == 4 {
+                        assert_eq!(first, DispatchOutcome::Returned { value: 0 });
+                        assert_eq!(memory.prepares, 0, "null EOF must not prepare output");
+                        assert_eq!(memory.read_bytes(0x1100, 3).unwrap(), [0xa5; 3]);
+                        continue;
+                    }
+                    assert_eq!(first, DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }, "nr={nr} kind={kind} input={refuse_input}");
                     assert_eq!(returned(h.call(62, [fd as u64, 0, 1, 0, 0, 0])), initial_offset as i64);
-                    assert_eq!(memory.read_bytes(0x1100, 3).unwrap(), [0; 3]);
+                    assert_eq!(memory.read_bytes(0x1100, 3).unwrap(), [0xa5; 3]);
                     assert_eq!(h.dispatcher.dispatch(&kernel, request, &mut memory, &h.reporter).unwrap(),
                         DispatchOutcome::Returned { value: 3 });
-                    assert_eq!(memory.read_bytes(0x1100, 3).unwrap(), b"bcd");
+                    assert_eq!(memory.read_bytes(0x1100, 3).unwrap(), if kind == 3 { &[0; 3] } else { b"bcd" });
                     assert_eq!(returned(h.call(62, [fd as u64, 0, 1, 0, 0, 0])),
-                        (initial_offset + if nr == 63 || nr == 65 { 3 } else { 0 }) as i64);
+                        (initial_offset + if kind < 3 && (nr == 63 || nr == 65) { 3 } else { 0 }) as i64);
                 }
             }
         }
