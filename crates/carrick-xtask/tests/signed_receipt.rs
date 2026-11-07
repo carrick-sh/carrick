@@ -343,6 +343,7 @@ fn actions_prepare_download_and_publish_use_exact_baseline_and_fail_closed() {
     git(&["init", "-b", "main"]);
     git(&["config", "user.name", "Replay"]);
     git(&["config", "user.email", "replay@example.invalid"]);
+    git(&["config", "uploadpack.allowAnySHA1InWant", "true"]);
     let commit = |message: &str| {
         git(&["commit", "--allow-empty", "-m", message]);
         git(&["rev-parse", "HEAD"])
@@ -351,6 +352,22 @@ fn actions_prepare_download_and_publish_use_exact_baseline_and_fail_closed() {
     let d = commit("first queued PR");
     let b = commit("second queued PR");
     let c = commit("next group");
+    git(&[
+        "update-ref",
+        "refs/heads/gh-readonly-queue/main/pr-123-a",
+        &d,
+    ]);
+    git(&[
+        "update-ref",
+        "refs/heads/gh-readonly-queue/main/pr-124-d",
+        &b,
+    ]);
+    git(&[
+        "update-ref",
+        "refs/heads/gh-readonly-queue/main/pr-125-b",
+        &c,
+    ]);
+    git(&["checkout", "-B", "main", &a]);
     let tree = git(&["rev-parse", "HEAD^{tree}"]);
     let unrelated = git(&["commit-tree", &tree, "-m", "unrelated root"]);
     let git_shim = bin.join("git");
@@ -742,6 +759,7 @@ else:
     );
     // Next landing: main B seeds its own baseline automatically, and group C
     // uses B rather than A or a PR merge base, without manual dispatch.
+    git(&["checkout", "-B", "main", &b]);
     let next_main = json!({"repository":{"full_name":"carrick-sh/carrick"},"ref":"refs/heads/main","deleted":false,"after":b.clone()});
     std::fs::write(&event, next_main.to_string()).unwrap();
     let next_child = || {
@@ -1084,4 +1102,246 @@ fn historical_fixture_evidence_does_not_invent_hash_work_status() {
         serde_json::to_value(receipt).unwrap()["fixture_validation"]["elf_hash_verification"],
         "not_recorded"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_group_rejects_bases_without_first_parent_main_ancestry() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let repo = dir.path().join("graph");
+    std::fs::create_dir(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.name", "Replay"]);
+    git(&["config", "user.email", "replay@example.invalid"]);
+    git(&["config", "uploadpack.allowAnySHA1InWant", "true"]);
+    git(&["commit", "--allow-empty", "-m", "main root"]);
+    let m0 = git(&["rev-parse", "HEAD"]);
+    let tree = git(&["rev-parse", "HEAD^{tree}"]);
+
+    // Side history merged into main ONLY as a second parent of m1.
+    let side_root = git(&["commit-tree", &tree, "-m", "side root"]);
+    let side_a = git(&["commit-tree", &tree, "-p", &side_root, "-m", "side a"]);
+    let side_b = git(&["commit-tree", &tree, "-p", &side_a, "-m", "side b"]);
+    let side_c = git(&["commit-tree", &tree, "-p", &side_b, "-m", "side c"]);
+    let m1 = git(&[
+        "commit-tree",
+        &tree,
+        "-p",
+        &m0,
+        "-p",
+        &side_a,
+        "-m",
+        "main merge side_a as second parent",
+    ]);
+    git(&["update-ref", "refs/heads/main", &m1]);
+
+    // Unrelated root history, and a candidate that merges main only as a second parent.
+    let orphan_base = git(&["commit-tree", &tree, "-m", "orphan base"]);
+    let orphan_head = git(&[
+        "commit-tree",
+        &tree,
+        "-p",
+        &orphan_base,
+        "-m",
+        "orphan head",
+    ]);
+    let trick_merge = git(&[
+        "commit-tree",
+        &tree,
+        "-p",
+        &orphan_base,
+        "-p",
+        &m1,
+        "-m",
+        "orphan first parent with main second parent",
+    ]);
+    let trick_head = git(&["commit-tree", &tree, "-p", &trick_merge, "-m", "trick head"]);
+
+    // Positive controls descending along first-parent from m1 on main.
+    let valid_g1 = git(&["commit-tree", &tree, "-p", &m1, "-m", "valid group 1"]);
+    let valid_g2 = git(&["commit-tree", &tree, "-p", &valid_g1, "-m", "valid group 2"]);
+    git(&[
+        "update-ref",
+        "refs/heads/gh-readonly-queue/main/pr-901-m1",
+        &valid_g1,
+    ]);
+    git(&[
+        "update-ref",
+        "refs/heads/gh-readonly-queue/main/pr-902-g1",
+        &valid_g2,
+    ]);
+
+    let real_git = String::from_utf8(Command::new("which").arg("git").output().unwrap().stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    let git_shim = bin.join("git");
+    std::fs::write(
+        &git_shim,
+        format!(
+            "#!/usr/bin/env python3\nimport os, sys\nargs = [os.environ['TEST_GRAPH'] if a == 'https://github.com/carrick-sh/carrick.git' else a for a in sys.argv[1:]]\nos.execv({real_git:?}, ['git'] + args)\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let baselines = dir.path().join("baselines");
+    std::fs::create_dir(&baselines).unwrap();
+    for sha in [&m0, &m1, &side_a] {
+        std::fs::write(
+            baselines.join(format!("{sha}.json")),
+            serde_json::to_vec(&admitted(sha)).unwrap(),
+        )
+        .unwrap();
+    }
+
+    let gh = bin.join("gh");
+    std::fs::write(
+        &gh,
+        format!(
+            r#"#!/usr/bin/env python3
+import json, os, pathlib, shutil, subprocess, sys
+args = sys.argv[1:]
+graph = os.environ['TEST_GRAPH']
+baselines = pathlib.Path(os.environ['TEST_BASELINES'])
+git_bin = {real_git:?}
+if args[:2] == ['run', 'download']:
+    name = args[args.index('--name') + 1]
+    sha = name.removeprefix('signed-baseline-').rsplit('-', 1)[0]
+    shutil.copyfile(baselines / (sha + '.json'), pathlib.Path(args[args.index('--dir') + 1]) / 'candidate.json')
+elif args[:2] == ['api', 'graphql']:
+    print(json.dumps({{'data': {{'repository': {{'mergeQueue': {{'entries': {{'nodes': []}}}}}}}}}}))
+elif args[0] == 'api':
+    endpoint = args[-1]
+    if '/compare/' in endpoint and '?per_page=' not in endpoint:
+        spec = endpoint.split('/compare/')[1]
+        left, right = spec.split('...', 1)
+        left_ref = 'refs/heads/main' if left == 'main' else left
+        proc = subprocess.run([git_bin, '-C', graph, 'merge-base', left_ref, right], text=True, capture_output=True)
+        if proc.returncode != 0:
+            sys.stderr.write('gh: No common ancestor\n')
+            raise SystemExit(1)
+        print(json.dumps({{'merge_base_commit': {{'sha': proc.stdout.strip()}}}}))
+    elif '/compare/' in endpoint and '?per_page=' in endpoint:
+        spec = endpoint.split('/compare/')[1].split('?', 1)[0]
+        left, right = spec.split('...', 1)
+        proc = subprocess.run([git_bin, '-C', graph, 'rev-list', '--reverse', f'{{left}}..{{right}}'], text=True, capture_output=True, check=True)
+        commits = [{{'sha': line}} for line in proc.stdout.splitlines() if line]
+        print(json.dumps([{{'commits': commits}}]))
+    elif '/commits/' in endpoint and '/pulls?' in endpoint:
+        print(json.dumps([[{{'number': 901, 'base': {{'ref': 'main', 'repo': {{'full_name': 'carrick-sh/carrick'}}}}}}]]))
+    elif '/workflows/signed-gate.yml/runs' in endpoint:
+        run = {{'id': 100, 'path': '.github/workflows/signed-gate.yml', 'head_branch': 'main', 'event': 'workflow_dispatch', 'status': 'completed', 'repository': {{'full_name': 'carrick-sh/carrick'}}, 'head_repository': {{'full_name': 'carrick-sh/carrick'}}, 'actor': {{'login': 'tjfontaine'}}, 'triggering_actor': {{'login': 'tjfontaine'}}}}
+        print(json.dumps([{{'workflow_runs': [run]}}]))
+    elif '/artifacts?' in endpoint:
+        rows = [{{'name': f'signed-baseline-{{p.stem}}-1', 'expired': False}} for p in baselines.glob('*.json')]
+        print(json.dumps([{{'artifacts': rows}}]))
+    else:
+        raise SystemExit('unexpected API endpoint: ' + endpoint)
+else:
+    raise SystemExit('unexpected gh invocation: ' + repr(args))
+"#
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let run_prepare = |label: &str, base_sha: &str, head_sha: &str, pr_num: u64| {
+        let head_ref = format!("refs/heads/gh-readonly-queue/main/pr-{pr_num}-{label}");
+        let event_path = dir.path().join(format!("event-{label}.json"));
+        let out_dir = dir.path().join(format!("out-{label}"));
+        std::fs::write(
+            &event_path,
+            json!({
+                "repository": { "full_name": "carrick-sh/carrick" },
+                "action": "checks_requested",
+                "merge_group": {
+                    "base_ref": "refs/heads/main",
+                    "head_ref": head_ref,
+                    "head_sha": head_sha,
+                    "base_sha": base_sha,
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("GITHUB_ACTOR", "github-merge-queue[bot]")
+            .env("GITHUB_TRIGGERING_ACTOR", "github-merge-queue[bot]")
+            .env("GITHUB_EVENT_NAME", "merge_group")
+            .env("GITHUB_REF", &head_ref)
+            .env("GITHUB_SHA", head_sha)
+            .env("TEST_GRAPH", &repo)
+            .env("TEST_BASELINES", &baselines)
+            .env_remove("GITHUB_OUTPUT")
+            .args(["signed-gate", "prepare", "--event"])
+            .arg(&event_path)
+            .arg("--output")
+            .arg(&out_dir)
+            .output()
+            .unwrap();
+        (output, out_dir)
+    };
+
+    // Positive controls: first-in-line and second-in-line on m1 both resolve to m1.
+    let (ok1, out1) = run_prepare("valid-1", &m1, &valid_g1, 901);
+    assert!(
+        ok1.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok1.stderr)
+    );
+    let req1: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out1.join("request.json")).unwrap()).unwrap();
+    assert_eq!(req1["base"], m1);
+
+    let (ok2, out2) = run_prepare("valid-2", &valid_g1, &valid_g2, 902);
+    assert!(
+        ok2.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok2.stderr)
+    );
+    let req2: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out2.join("request.json")).unwrap()).unwrap();
+    assert_eq!(req2["base"], m1);
+
+    // Negative controls: none of these bases is on main's first-parent chain or
+    // between the candidate's first-parent main ancestor and the candidate.
+    for (label, bad_base, bad_head) in [
+        ("orphan", orphan_base.as_str(), orphan_head.as_str()),
+        ("second-parent-direct", side_a.as_str(), side_b.as_str()),
+        ("second-parent-queued", side_b.as_str(), side_c.as_str()),
+        (
+            "candidate-second-parent-main",
+            trick_merge.as_str(),
+            trick_head.as_str(),
+        ),
+        ("stale-main-behind-ancestor", m0.as_str(), valid_g2.as_str()),
+        ("self-base", valid_g2.as_str(), valid_g2.as_str()),
+    ] {
+        let (refused, _) = run_prepare(label, bad_base, bad_head, 999);
+        assert!(
+            !refused.status.success(),
+            "accepted non-first-parent or invalid base case '{label}'"
+        );
+    }
 }
