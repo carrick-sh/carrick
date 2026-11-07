@@ -224,6 +224,7 @@ message. The futex word paths and their owner-wait protocol are unchanged.
 `typed_record_write_preserves_every_copy_outcome` checks the typed helper's
 Done, Fault and exact NotYet propagation; the existing two-live-thread futex
 witness remains the production-entry behavioral proof.
+
 ### Fork/exec successor refusal witness (#1721)
 
 `serial_host_native_fork_exec_child_futex_retains_owner_refusal` extends the
@@ -244,3 +245,20 @@ the reported `forkexecpthread` abort, or establish signed GNU/musl parity. The
 exec reply, physical backing and owner refusal are controlled by the native
 harness; the process graph, dispatcher, clone, wait queue and continuation are
 production code. Actual child-futex capture and the signed census remain open.
+
+The lifecycle order here is fork, exec, injected WAIT refusal, then raw clone.
+The existing `conformance-probes/src/bin/forkexecpthread.rs` likewise execs
+before creating its pthread: the fork child calls only execve or _exit, and
+the replacement image calls pthread_create and pthread_join. The native
+witness follows that order but does not execute pthread startup's libc futex
+operations. A pass must not be reported as a `forkexecpthread` pass or as
+red-first evidence for that abort. The typed-copy prerequisites are already
+on the admitted main; this branch adds no further production correction.
+
+To finish #1721, first run the original GNU and musl workload on current main.
+If GNU still aborts, capture the child's actual in-ring futex variant, user
+address, typed copy outcome and producing source location before selecting a
+fix. Keep that capture distinct from the controlled `NotYet` above. Then run
+the original probe through real guest execution and compare the signed census
+on one identified artifact. A Linux x86_64 native fixture can
+check the shared dispatcher protocol, but cannot establish that ARM/HVF result.
