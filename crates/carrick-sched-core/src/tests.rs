@@ -2264,7 +2264,8 @@ fn each_vcpu_covers_a_foreign_cow_publication_for_itself() {
 
     let first = zone.install_space(SLOT, MM).unwrap();
     let published = first.cow_owed.expect("first vCPU owes the publication");
-    zone.spaces.cover_cow(index, published);
+    zone.cover_cow(SLOT, MM, published);
+    assert_eq!(zone.install_space(SLOT, MM).unwrap().cow_owed, None);
 
     let other = SlotId::new(SLOT.raw() + 1);
     let second = zone.install_space(other, MM).unwrap();
@@ -2272,6 +2273,18 @@ fn each_vcpu_covers_a_foreign_cow_publication_for_itself() {
         second.cow_owed,
         Some(published),
         "one vCPU's local invalidation cannot cover another vCPU"
+    );
+
+    zone.cover_cow(other, MM, published);
+    let next = zone.spaces.note_cow(index);
+    assert_eq!(zone.install_space(SLOT, MM).unwrap().cow_owed, Some(next));
+    assert_eq!(zone.install_space(other, MM).unwrap().cow_owed, Some(next));
+    zone.cover_cow(SLOT, MM, next);
+    assert_eq!(zone.install_space(SLOT, MM).unwrap().cow_owed, None);
+    assert_eq!(
+        zone.install_space(other, MM).unwrap().cow_owed,
+        Some(next),
+        "coverage of the previous publication cannot acknowledge a new edit",
     );
 }
 
