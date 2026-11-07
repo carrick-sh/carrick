@@ -1,8 +1,9 @@
 //! Pure identity allocation shared by host and native process consumers.
 //! Consumers provide exclusion and own role-preserving claim lifetimes.
 use alloc::vec::Vec;
+use core::cell::UnsafeCell;
 use core::num::{NonZeroI32, NonZeroU32, NonZeroU64};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Internal collision-domain number; not a visible PID/TID.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -90,6 +91,57 @@ pub struct NamespaceNode {
 pub struct NamespaceView<'a> {
     header: &'a mut NamespaceHeader,
     nodes: &'a mut [NamespaceNode],
+}
+
+/// Shared namespace storage protocol, included in the image ABI fingerprint.
+pub const NAMESPACE_TABLE_PROTOCOL: u64 = 1;
+/// Includes the null-link sentinel; 8191 nodes are available for claims/cursors.
+pub const NAMESPACE_TABLE_NODES: usize = 8192;
+
+/// Carrier-owned, pointer-free namespace authority. Zero bytes denote a fresh
+/// table. Its leaf lock must never enclose allocation, crossing, or wake work.
+#[repr(C)]
+pub struct NamespaceTable {
+    lock: AtomicU32,
+    header: UnsafeCell<NamespaceHeader>,
+    nodes: UnsafeCell<[NamespaceNode; NAMESPACE_TABLE_NODES]>,
+}
+
+// SAFETY: the leaf lock exclusively protects both UnsafeCells across aliases.
+unsafe impl Sync for NamespaceTable {}
+
+impl NamespaceTable {
+    /// The view cannot escape the closure. Callers perform only bounded
+    /// allocator operations here and retain all outer custody until return.
+    pub fn with_view<R>(
+        &self,
+        wait: &impl crate::ShortLockWait,
+        f: impl FnOnce(&mut NamespaceView<'_>) -> R,
+    ) -> R {
+        let mut attempt = 0_u32;
+        while self
+            .lock
+            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            wait.wait_short(attempt);
+            attempt = attempt.saturating_add(1);
+        }
+        struct Unlock<'a>(&'a AtomicU32);
+        impl Drop for Unlock<'_> {
+            fn drop(&mut self) {
+                self.0.store(0, Ordering::Release);
+            }
+        }
+        let _unlock = Unlock(&self.lock);
+        // SAFETY: exclusive leaf-lock custody lasts through the closure and
+        // its unwind. Zero storage is valid for every header and node field.
+        let (header, nodes) = unsafe { (&mut *self.header.get(), &mut *self.nodes.get()) };
+        if header.first == 0 {
+            *header = NamespaceHeader::new(1, i32::MAX, 1);
+        }
+        f(&mut header.view(nodes))
+    }
 }
 
 impl NamespaceHeader {

@@ -1558,6 +1558,8 @@ pub struct ZoneTables<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     mm_issuer: process::identity_allocator::MmIssuerWord,
     /// Installed carrier CPU policy, independent of transient executor slots.
     online_cpus: AtomicU64,
+    /// One namespace allocator shared by host and ring; append-only ABI field.
+    namespace: process::identity_allocator::NamespaceTable,
 }
 
 /// A fallible acquisition policy for callers that retain work on refusal.
@@ -2114,6 +2116,12 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// Borrow the distinct MM source from this exact retained carrier zone.
     pub const fn mm_issuer(&self) -> process::identity_allocator::MmIssuer<'_> {
         self.mm_issuer.issuer()
+    }
+    pub const fn namespace(&self) -> &process::identity_allocator::NamespaceTable {
+        &self.namespace
+    }
+    pub const fn namespace_offset() -> usize {
+        core::mem::offset_of!(Self, namespace)
     }
     pub const fn mm_issuer_offset() -> usize {
         core::mem::offset_of!(Self, mm_issuer)

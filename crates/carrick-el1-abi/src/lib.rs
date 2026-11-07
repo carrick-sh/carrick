@@ -1187,6 +1187,10 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         carrick_personality_linux::abi::entry::HOST_WORK_PROTOCOL,
         carrick_sched_core::TIMER_INDEX_PROTOCOL,
         carrick_sched_core::process::identity_allocator::SERIAL_ISSUER_PROTOCOL,
+        carrick_sched_core::process::identity_allocator::NAMESPACE_TABLE_PROTOCOL,
+        core::mem::size_of::<carrick_sched_core::process::identity_allocator::NamespaceTable>()
+            as u64,
+        ZoneTables::namespace_offset() as u64,
         core::mem::size_of::<carrick_sched_core::process::identity_allocator::SerialIssuerWord>()
             as u64,
         core::mem::align_of::<carrick_sched_core::process::identity_allocator::SerialIssuerWord>()
