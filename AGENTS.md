@@ -517,12 +517,13 @@ In Carrick, guest-visible correctness includes Linux semantics and non-pathologi
 ### Directing workers is reviewing diffs, not reading reports
 
 Workers code in worker VMs; the director owns runtime fixes, live
-verification, the signed gate and landing.
+verification, the signed evidence and landing.
 
-- **The director starts workers as VMs** (owner, 2026-11-07): `conductor
-  worker start` creates one from template 9001 on carrick-hz through the
-  Proxmox API, or a `worker-shepherd` subagent of the `carrick-conductor`
-  Claude plugin runs one (both in carrick-sh/agy-director). Each worker
+- **The director starts workers as VMs** (owner, 2026-11-07): the
+  director's `worker [--host hz|ctb] start` (wrapping `conductor worker
+  start --template 9001`) creates one through the host's Proxmox API, or a
+  `worker-shepherd` subagent of the `carrick-conductor` Claude plugin runs
+  one (both in carrick-sh/agy-director). Each worker
   works one issue from GitHub main and opens a draft PR for it. The GitHub
   Actions dispatch path (`/agent` rounds, the reactor) is retired.
 - **A worker's result is a claim, checked against its PR** (`tests_passing:
@@ -530,8 +531,8 @@ verification, the signed gate and landing.
   reviewer reports (one review cited nonexistent dead files, #368).
   Re-verify key claims from the PR's diff and evidence; land only what you
   read.
-- **Every PR gets a published independent review before landing**, by a
-  strong reviewer for large or shared-kernel work. Gates passed what review
+- **Every large or shared-kernel PR gets a published independent review by
+  a strong reviewer before landing.** Gates passed what review
   caught: two P0s in #338, forged two-task witnesses standing in for
   production operations in #331.
 - **Review findings are triaged by severity, and only P0s and P1s block

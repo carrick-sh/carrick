@@ -104,7 +104,7 @@ lifecycle semantics.
 
 | Crate | Role |
 | --- | --- |
-| `carrick-capture` | Root front for dispatch capture rounds on agent clones (#1621): `sudo carrick-capture <name> [--seconds N]` runs one reviewed bpftrace script from its allowlist under a hard deadline. std only and built by the agent template with `rustc` alone; `tests/capture.rs` enforces the script rules. |
+| `carrick-capture` | Root front for capture rounds on agent clones (#1621): `sudo carrick-capture <name> [--seconds N]` runs one reviewed bpftrace script from its allowlist under a hard deadline. std only and built by the agent template with `rustc` alone; `tests/capture.rs` enforces the script rules. |
 | `carrick-conformance` | Differential conformance harness; shells out to built carrick binaries and Docker oracles, classifies baselines, renders support matrix. |
 | `carrick-conformance-contract` | Typed, fail-closed conformance-contract registry, work/timing observations, structural/affine budget models, and 463-syscall coverage inventory. |
 | `carrick-conformance-next` | In-process conformance framework using `carrick-embed` (Phase J): `TestContainer` + `AuditObserver` `#[test]` ports of LTP/probe cases, semantic probe observers, fuzzing, and golden traces. `carrick-conformance` stays the verdict authority until the new framework reproduces every historical false-green rejection. |
