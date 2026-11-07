@@ -231,7 +231,7 @@ impl IpcTables for MapTables<'_> {
 /// `EL1_IPC_BASE`, once the host authority has published its directory.
 /// Unmapped or unpublished, the attach fails and every call forwards.
 #[cfg(target_os = "none")]
-pub fn guest_venue(slot: u32) -> Option<IpcVenue<'static>> {
+pub fn current_guest_venue(slot: u32) -> Option<IpcVenue<'static>> {
     static TABLES: GuestTables = GuestTables;
     // Unmapped at stage-2 until the carrier installs it: never touch the
     // window before the host says so.
@@ -251,7 +251,7 @@ pub fn guest_venue(slot: u32) -> Option<IpcVenue<'static>> {
 
 /// Host builds serve no guest: there is no EL1 window to attach.
 #[cfg(not(target_os = "none"))]
-pub fn guest_venue(_slot: u32) -> Option<IpcVenue<'static>> {
+pub fn current_guest_venue(_slot: u32) -> Option<IpcVenue<'static>> {
     None
 }
 
@@ -5807,5 +5807,128 @@ mod tests {
         seq.fetch_add(1, Ordering::Release);
         assert_eq!(tables.table_of(&task), Some(raw(2)));
         assert_eq!(native_exec_table(&tables, &task), expected);
+    }
+}
+
+#[cfg(test)]
+mod bound_venue_tests {
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn x86_layout_attaches_registered_ipc_venue() {
+        use carrick_el1_abi::*;
+        use carrick_guest_arch::{FrameGpa, GuestLen, KernelVa};
+        struct Mapping(*mut u8, usize);
+        impl Mapping {
+            fn new(address: u64, bytes: u64) -> Self {
+                // SAFETY: a hint only, never replaces an existing mapping.
+                let pointer = unsafe {
+                    libc::mmap(
+                        address as *mut _,
+                        bytes as usize,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+                assert_ne!(pointer, libc::MAP_FAILED);
+                let mapping = Self(pointer.cast(), bytes as usize);
+                assert_eq!(pointer as u64, address, "fixture VA must be available");
+                mapping
+            }
+        }
+        impl Drop for Mapping {
+            fn drop(&mut self) {
+                // SAFETY: owned mapping, all views have gone out of scope.
+                assert_eq!(unsafe { libc::munmap(self.0.cast(), self.1) }, 0);
+            }
+        }
+        let layout = carrick_el1::isa::x86_kernel_layout();
+        let storage = Mapping::new(layout.region.raw(), EL1_REGION_SIZE);
+        let directory = Mapping::new(0x4_0000_0000, EL1_IPC_DIRECTORY_SPAN);
+        let pool = Mapping::new(0x5_0000_0000, EL1_IPC_POOL_SPAN);
+        let region = FileRegionBinding::new(
+            FileRegionId::from_carrier(core::num::NonZeroU64::MIN),
+            layout.region,
+            FrameGpa::new(0x1_0000_0000),
+            GuestLen::new(EL1_REGION_SIZE),
+        )
+        .unwrap();
+        // SAFETY: exclusive initialized mapping retained through registration drop.
+        let mut registration = unsafe {
+            FileRegionRegistration::initialize(core::ptr::NonNull::new(storage.0).unwrap(), region)
+        }
+        .unwrap();
+        let binding = IpcWindowBinding::new(
+            region,
+            KernelVa::new(directory.0 as u64),
+            FrameGpa::new(0x6_0000_0000),
+            GuestLen::new(EL1_IPC_DIRECTORY_SPAN),
+            KernelVa::new(pool.0 as u64),
+            FrameGpa::new(0x7_0000_0000),
+            GuestLen::new(EL1_IPC_POOL_SPAN),
+        )
+        .unwrap();
+        // SAFETY: all three mappings are retained by this fixture.
+        assert!(
+            unsafe { guest_venue(layout, binding) }.is_none(),
+            "unpublished window"
+        );
+        // SAFETY: exclusive owned storage, exact admitted extents.
+        unsafe { IpcRegion::initialize(directory.0.cast(), directory.1, pool.0, pool.1, 42) }
+            .unwrap();
+        {
+            let tables = registration.tables(region).unwrap();
+            let map = tables.ipc_table_map();
+            let table = RawTableId {
+                authority: 42,
+                index: 3,
+                generation: 7,
+            };
+            map.publish_owned(19, table).unwrap();
+            map.publish_window();
+            // SAFETY: registration and storage outlive the attached venue.
+            let venue = unsafe { guest_venue(layout, binding) }.unwrap();
+            assert_eq!(venue.tables.table_for_file_table(19), Some(table));
+            assert_eq!(venue.tables.table_for_file_table(20), None);
+        }
+        registration.retire();
+        // SAFETY: storage is retained, but the registration is now retired.
+        assert!(
+            unsafe { guest_venue(layout, binding) }.is_none(),
+            "retired identity"
+        );
+    }
+
+    #[test]
+    fn guest_venue_refuses_foreign_layout_before_memory_access() {
+        use carrick_el1_abi::*;
+        use carrick_guest_arch::{FrameGpa, GuestLen, KernelVa};
+        let layout = carrick_el1::isa::x86_kernel_layout();
+        let region = FileRegionBinding::new(
+            FileRegionId::from_carrier(core::num::NonZeroU64::MIN),
+            layout.region,
+            FrameGpa::new(0x1_0000_0000),
+            GuestLen::new(EL1_REGION_SIZE),
+        )
+        .unwrap();
+        let binding = IpcWindowBinding::new(
+            region,
+            KernelVa::new(0x4_0000_0000),
+            FrameGpa::new(0x6_0000_0000),
+            GuestLen::new(EL1_IPC_DIRECTORY_SPAN),
+            KernelVa::new(0x5_0000_0000),
+            FrameGpa::new(0x7_0000_0000),
+            GuestLen::new(EL1_IPC_POOL_SPAN),
+        )
+        .unwrap();
+        let foreign = carrick_guest_arch::KernelLayout {
+            region: KernelVa::new(0),
+            ..layout
+        };
+        // SAFETY: a foreign layout must be rejected before accessing memory.
+        assert!(unsafe { guest_venue(foreign, binding) }.is_none());
     }
 }
