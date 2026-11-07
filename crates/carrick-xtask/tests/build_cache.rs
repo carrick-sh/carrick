@@ -786,12 +786,12 @@ fn acceptance_unusable_override_is_checked_before_tests() {
     // target is deliberately untracked; acceptance rejects dirty input before
     // starting. Ignore it just as an admitted checkout does.
     fs::write(repo.path().join(".git/info/exclude"), b"/target/\n").unwrap();
-    // Stop the host phase at its first real step; scratch must not prevent
+    // Stub host steps; scratch must not prevent
     // reaching that step, even on a case-insensitive home.
     let bin = repo.path().join("target/bin");
     fs::create_dir_all(&bin).unwrap();
     let just = bin.join("just");
-    fs::write(&just, "#!/bin/sh\necho host-step-witness >&2\nexit 1\n").unwrap();
+    fs::write(&just, "#!/bin/sh\n: > \"$WITNESS_HOST_STEP\"\nexit 1\n").unwrap();
     fs::set_permissions(&just, fs::Permissions::from_mode(0o755)).unwrap();
     let host = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
         .args([
@@ -804,6 +804,7 @@ fn acceptance_unusable_override_is_checked_before_tests() {
             "host",
         ])
         .env("CARRICK_HOME", &home)
+        .env("WITNESS_HOST_STEP", repo.path().join("target/host-step"))
         .env(
             "PATH",
             format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
@@ -817,6 +818,10 @@ fn acceptance_unusable_override_is_checked_before_tests() {
     assert!(
         !String::from_utf8_lossy(&host.stderr).contains("scratch preflight"),
         "{host:?}"
+    );
+    assert!(
+        repo.path().join("target/host-step").exists(),
+        "host step must actually execute"
     );
     fs::remove_dir_all(repo.path().join("target/el1-gate")).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
