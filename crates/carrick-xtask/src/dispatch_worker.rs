@@ -9057,6 +9057,7 @@ REFS
  ;;
  */collaborators/tjfontaine/permission) echo '{"permission":"admin","role_name":"admin"}' ;;
  */issues/comments/77) cat "$RUNNER_TEMP/trigger-comment.json" ;;
+ *'/pulls?state=all&per_page=100&page='*) if test -f "$RUNNER_TEMP/earlier-prs.json"; then cat "$RUNNER_TEMP/earlier-prs.json"; else echo '[]'; fi ;;
  */pulls/1778) cat "$RUNNER_TEMP/superseded.json" ;;
  */actions/runs/41) cat "$RUNNER_TEMP/superseded-run.json" ;;
  *'/pulls?state=open&head=carrick-sh:work/dispatch-634-41') cat "$RUNNER_TEMP/superseded-list.json" ;;
@@ -10621,6 +10622,75 @@ fi
                     Some(main.as_str())
                 );
                 assert!(!outer.join("dispatch-output").join(HARVEST_PATCH).exists());
+            }
+            return;
+        }
+        if witness.starts_with("earlier-drop") {
+            let candidate = git(&work, &["rev-parse", "HEAD"])
+                .unwrap()
+                .trim()
+                .to_owned();
+            let mut commits = Vec::new();
+            for i in 0..4 {
+                let path = format!("earlier-{i}");
+                std::fs::write(work.join(&path), format!("work {i}\n")).unwrap();
+                git(&work, &["add", &path]).unwrap();
+                git(
+                    &work,
+                    &["commit", "-m", &format!("fix(core): earlier fix {i}")],
+                )
+                .unwrap();
+                commits.push(
+                    git(&work, &["rev-parse", "HEAD"])
+                        .unwrap()
+                        .trim()
+                        .to_owned(),
+                );
+            }
+            let mut previous = pr.clone();
+            previous["number"] = json!(1749);
+            previous["state"] = json!("closed");
+            previous["head"]["ref"] = json!("work/dispatch-634-41");
+            previous["head"]["sha"] = json!(commits.last().unwrap());
+            std::fs::write(
+                outer.join("earlier-prs.json"),
+                json!([previous]).to_string(),
+            )
+            .unwrap();
+            git(&work, &["reset", "--hard", &candidate]).unwrap();
+            if witness.ends_with("reason") {
+                for commit in &commits {
+                    contract.risks.push(format!(
+                        "Dropped {commit}: replaced by the redesigned authority"
+                    ));
+                }
+            }
+            let result = publish(
+                &work,
+                &dispatch,
+                &receipt,
+                &contract,
+                &report,
+                "fixture-token",
+                &mut agent_loop::RunCache::default(),
+            );
+            if witness.ends_with("reason") {
+                assert_eq!(result.unwrap(), Some(800));
+                let report = Applied::load().unwrap().report();
+                for commit in &commits {
+                    assert!(report.contains(commit), "{report}");
+                }
+                assert!(
+                    report.contains("replaced by the redesigned authority"),
+                    "{report}"
+                );
+            } else {
+                let error = result
+                    .expect_err("silently dropped four earlier fixes")
+                    .to_string();
+                assert!(error.contains("contract violation"), "{error}");
+                assert!(!outer.join("push.args").exists());
+                assert!(!outer.join("created").exists());
             }
             return;
         }
@@ -12829,6 +12899,16 @@ fi
     #[test]
     fn issue_retrigger_resolves_the_published_pr_before_assigning_a_branch() {
         publication_fixture("issue-retrigger");
+    }
+
+    #[test]
+    fn replay_1749_to_1796_refuses_four_unexplained_drops() {
+        publication_fixture("earlier-drop");
+    }
+
+    #[test]
+    fn earlier_drops_with_explicit_reasons_are_reported() {
+        publication_fixture("earlier-drop-reason");
     }
 
     #[test]
