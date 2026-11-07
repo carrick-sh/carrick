@@ -920,10 +920,7 @@ fn ppoll_arrays_need_readable_input_and_writable_output_before_crossing() {
     };
     assert_eq!(
         run(unreadable, &mut user),
-        Some(HostFileStage::Fault {
-            address: BASE - 4096,
-            access: Access::Read,
-        })
+        returned(carrick_syscall_abi::LINUX_EFAULT)
     );
     let (call, mut user) = ppoll(&[(1, 0x4)], None);
     user.writable = false;
@@ -1033,5 +1030,74 @@ fn file_staging_not_yet_input_builds_no_request_before_supply() {
             b"abcdef"
         );
         assert_eq!(user.refused, 1);
+    }
+}
+
+/// Outcome classification at the production staging entry. This does not
+/// establish descriptor retention through native-process/carrier service.
+#[test]
+fn ppoll_input_preserves_fault_and_exact_owner_request() {
+    use carrick_core::user_copy::GuestCopyRequest;
+    use carrick_guest_arch::{GuestLen, UserVa};
+
+    struct RefusedInput {
+        memory: Memory,
+        address: u64,
+        outcome: Option<CopyOutcome>,
+    }
+    impl HostFileUser for RefusedInput {
+        fn copy_in(&mut self, dst: &mut [u8], src: u64) -> CopyOutcome {
+            if src == self.address {
+                if let Some(outcome) = self.outcome.take() {
+                    return outcome;
+                }
+            }
+            self.memory.copy_in(dst, src)
+        }
+        fn writable(&mut self, dst: u64, len: usize) -> usize {
+            self.memory.writable(dst, len)
+        }
+    }
+
+    for timeout_input in [false, true] {
+        let address = BASE
+            + if timeout_input {
+                host_file::POLLFD_BYTES as u64
+            } else {
+                0
+            };
+        let request = GuestCopyRequest {
+            address: UserVa::new(address + 4),
+            len: GuestLen::new(4),
+            access: Access::Read,
+        };
+        for outcome in [CopyOutcome::NotYet(request), CopyOutcome::Fault] {
+            let (call, memory) = ppoll(&[(1, 0x4)], Some((0, 0)));
+            let mut user = RefusedInput {
+                memory,
+                address,
+                outcome: Some(outcome),
+            };
+            let mut resolve = caller;
+            let mut releases = |_: &mut [host_file::MapSourceReply]| 0;
+            let mut namespace = NativeNamespace {
+                table: TABLE,
+                resolve: &mut resolve,
+                releases: &mut releases,
+            };
+            let expected = match outcome {
+                CopyOutcome::Fault => returned(carrick_syscall_abi::LINUX_EFAULT),
+                CopyOutcome::NotYet(request) => Some(HostFileStage::Fault {
+                    address: request.address.raw(),
+                    access: request.access,
+                }),
+                CopyOutcome::Done => unreachable!(),
+            };
+            assert_eq!(stage(call, &mut namespace, &mut user), expected);
+            assert!(matches!(
+                stage(call, &mut namespace, &mut user),
+                Some(HostFileStage::Request { .. })
+            ));
+        }
     }
 }
