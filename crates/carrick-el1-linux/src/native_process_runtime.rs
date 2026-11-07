@@ -3675,6 +3675,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 .pending
                 .exit(&key)
                 .is_some_and(|pending| core::ptr::eq(pending.caller.control(), control));
+        let relative_futex_pending = graph
+            .pending
+            .member(&source.zone.record_ref(record))
+            .is_some_and(|state| state.relative_futex_wait.is_some());
         drop(graph);
         Ok(NativeProcessEntry {
             runtime: self,
@@ -3701,6 +3705,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             calling_tid,
             slot,
             owner_continuation,
+            relative_futex_pending,
             signal_work_deferred: false,
             copyout_ready: None,
             adapter_ready: None,
@@ -3720,8 +3725,15 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         words: &C,
         service: &'r mut S,
     ) -> Result<Box<NativeProcessEntry<'r, 'a, M, C, S>>, NativeProcessError> {
-        let (binding, record, member_control, process, calling_tid, owner_continuation) =
-            self.authenticate_registered(registry, source, current, address, words)?;
+        let AuthenticatedProcessEntry {
+            binding,
+            record,
+            control: member_control,
+            process,
+            calling_tid,
+            owner_continuation,
+            relative_futex_pending,
+        } = self.authenticate_registered(registry, source, current, address, words)?;
         Ok(Box::new(NativeProcessEntry {
             runtime: self,
             source,
@@ -3747,6 +3759,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             calling_tid,
             slot: Some(member_control),
             owner_continuation,
+            relative_futex_pending,
             signal_work_deferred: false,
             copyout_ready: None,
             adapter_ready: None,
@@ -3762,17 +3775,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         current: &'a CurrentTask,
         address: AddressContext<RootGpa>,
         words: &C,
-    ) -> Result<
-        (
-            ExecutionBinding,
-            RecordRef,
-            &'a ThreadControlSlot,
-            TaskKey,
-            u32,
-            bool,
-        ),
-        NativeProcessError,
-    > {
+    ) -> Result<AuthenticatedProcessEntry<'a>, NativeProcessError> {
         if !core::ptr::eq(source.zone, self.zone) {
             return Err(NativeProcessError::Stale);
         }
@@ -3843,15 +3846,20 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .pending
             .exit(&member.process)
             .is_some_and(|pending| core::ptr::eq(pending.caller.control(), member_control));
+        let relative_futex_pending = graph
+            .pending
+            .member(&record_ref)
+            .is_some_and(|state| state.relative_futex_wait.is_some());
         drop(graph);
-        Ok((
+        Ok(AuthenticatedProcessEntry {
             binding,
-            record_ref,
-            member_control,
-            member.process,
+            record: record_ref,
+            control: member_control,
+            process: member.process,
             calling_tid,
             owner_continuation,
-        ))
+            relative_futex_pending,
+        })
     }
     /// The cwd and root of the root's child `visible`, or of the root.
     #[cfg(test)]
@@ -4023,6 +4031,17 @@ impl<'a> NativeServiceCall<'a> {
     }
 }
 
+/// Authenticated admission snapshot; presence hints never own operations.
+struct AuthenticatedProcessEntry<'a> {
+    binding: ExecutionBinding,
+    record: RecordRef,
+    control: &'a ThreadControlSlot,
+    process: TaskKey,
+    calling_tid: u32,
+    owner_continuation: bool,
+    relative_futex_pending: bool,
+}
+
 pub struct NativeProcessEntry<
     'r,
     'a,
@@ -4053,6 +4072,8 @@ pub struct NativeProcessEntry<
     // Captured by native admission under its existing graph guard. Ordinary
     // syscall dispatch does not acquire another graph lock for this checkpoint.
     owner_continuation: bool,
+    // Absence is captured under admission's graph guard; custody stays in the row.
+    relative_futex_pending: bool,
     // A shared return checkpoint observed real work before a concurrent host
     // could drain its doorbell. Keep that refusal with this admitted owner.
     signal_work_deferred: bool,
@@ -5631,6 +5652,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         status: carrick_sched_core::process::TerminationStatus,
     ) -> Result<LifecycleOutcome, NativeProcessError> {
+        let _ = ProcessNative::take_relative_futex_wait(self);
         let page = self
             .runtime
             .graph
@@ -6021,6 +6043,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         operation: PendingCloseOperation<'a>,
     ) -> Result<(&'a ThreadLifecyclePage, Arc<WaitChannel>), NativeProcessError> {
+        let _ = ProcessNative::take_relative_futex_wait(self);
         let incoming_exec = matches!(&operation, PendingCloseOperation::Exec(_));
         let member_status = match &operation {
             PendingCloseOperation::Exit { status, .. } => status.to_termination_status(),
@@ -7547,6 +7570,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     fn take_relative_futex_wait(
         &mut self,
     ) -> Option<carrick_personality_linux::sched::RelativeFutexWait> {
+        if !core::mem::take(&mut self.relative_futex_pending) {
+            return None;
+        }
         self.runtime
             .graph
             .lock()
@@ -7556,6 +7582,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         &mut self,
         operation: carrick_personality_linux::sched::RelativeFutexWait,
     ) {
+        self.relative_futex_pending = true;
         self.runtime
             .graph
             .lock()
@@ -8209,6 +8236,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     }
 
     fn retire_thread_identity(&mut self, tid: u32) {
+        let _ = ProcessNative::take_relative_futex_wait(self);
         let mut graph = self.runtime.graph.lock();
         let mut retired = Vec::new();
         if let Ok(task) = graph.owner.task_mut(self.key) {

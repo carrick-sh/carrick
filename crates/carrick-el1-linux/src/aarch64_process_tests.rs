@@ -12099,11 +12099,14 @@ fn futex_owner_wait_episode(
         .for_entry(source, &fixture.task, fixture.address)
         .unwrap();
     let sibling = host_born_sibling(fixture, 42);
-    let mut gettid = carrick_el1_abi::TrapFrame::default();
-    gettid.x[8] = 178;
-    arm_call(fixture, sibling, &mut native_service, &mut gettid).unwrap();
-    assert_eq!(gettid.x[0], 42);
-    assert!(leader_sees_thread(fixture, &mut native_service, 42));
+    if !caught_signal {
+        let mut gettid = carrick_el1_abi::TrapFrame::default();
+        gettid.x[8] = 178;
+        arm_call(fixture, sibling, &mut native_service, &mut gettid).unwrap();
+        assert_eq!(gettid.x[0], 42);
+        assert!(leader_sees_thread(fixture, &mut native_service, 42));
+    }
+    run_as_leader(fixture);
     assert_eq!(fixture.page.live(), 2);
     let record = process_record_for_call(
         source,
@@ -12151,6 +12154,13 @@ fn futex_owner_wait_episode(
         .unwrap()
         .observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Gate);
     let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
+    if caught_signal {
+        let sender_slot = SlotId::new(1);
+        fixture.zone.drive(sender_slot, 2);
+        fixture.zone.publish_slot(sender_slot, 1, Some(0), 1);
+        fixture.zone.enter_guest(sender_slot);
+        fixture.zone.install_space(sender_slot, 1).unwrap();
+    }
     access.raise(space.index());
     // SAFETY: the fixture retains this exact owner and its observed closed gate.
     let wait = unsafe {
@@ -12197,6 +12207,19 @@ fn futex_owner_wait_episode(
                 &mut service,
             )
             .unwrap();
+        if caught_signal {
+            use carrick_personality_linux::signal::ProcessSignals;
+            use carrick_signal_core::policy::{Action, Disposition, HandlerAddress, Signal};
+            entry
+                .rt_sigaction(
+                    Signal::from_number(10).unwrap(),
+                    Some(Action {
+                        disposition: Disposition::Handler(HandlerAddress(0x700000)),
+                        ..Default::default()
+                    }),
+                )
+                .unwrap();
+        }
         let route = crate::dispatch::dispatch_syscall_with_native(
             &mut frame,
             &counters,
@@ -12246,6 +12269,88 @@ fn futex_owner_wait_episode(
     if cancelled {
         runtime.cancel_futex_owner_wait_for_test(fixture.control.zone_record().unwrap());
     }
+    if caught_signal {
+        use carrick_personality_linux::signal::{
+            ProcessSignals, SignalInfo, SignalRequest, SignalThreadSelector,
+        };
+        use carrick_signal_core::policy::Signal;
+        // A second live guest thread sends through the production signal entry.
+        let sender_task = Box::leak(Box::new(CurrentTask::new()));
+        sender_task.set(
+            El1TaskId::from_linux_tid(42),
+            carrick_el1_abi::SnapshotGeneration::from_raw(12),
+            5,
+        );
+        sender_task.mm.key.store(1, Ordering::Release);
+        sender_task
+            .mm
+            .thread_generation
+            .store(102, Ordering::Release);
+        sender_task.publish_visible_pid(41);
+        sender_task.publish_root_generation(fixture.address.generation);
+        sender_task.publish_lifecycle(fixture.page as *const _ as u64, sibling as *const _ as u64);
+        let sender_slot = SlotId::new(1);
+
+        let sender_record = fixture
+            .zone
+            .current_or_new(
+                sender_slot,
+                ThreadIdentity {
+                    tid: 42,
+                    serial: 102,
+                    mm: 1,
+                    file_table: 5,
+                    generation: 12,
+                    affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                    affinity: 1,
+                    lifecycle_page: fixture.page as *const _ as u64,
+                    control_slot: sibling as *const _ as u64,
+                },
+            )
+            .unwrap();
+        sibling.bind_zone_record(fixture.zone.record_ref(sender_record));
+        let sender_source = BornInZoneSource {
+            zone: fixture.zone,
+            slot: sender_slot,
+        };
+        registry()
+            .register_thread(
+                sender_source,
+                sender_task,
+                fixture.address,
+                fixture.page,
+                sibling,
+            )
+            .unwrap();
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(sender_slot, sender_record)
+                .is_queued()
+        );
+        assert_eq!(
+            fixture.zone.switch_in_full(sender_slot).unwrap().record,
+            sender_record
+        );
+        let mut sender = runtime
+            .enter_registered(
+                registry(),
+                sender_source,
+                sender_task,
+                fixture.address,
+                &parked,
+                &mut service,
+            )
+            .unwrap();
+        sender
+            .tgkill(
+                SignalThreadSelector::from_abi(41),
+                SignalThreadSelector::from_abi(41),
+                SignalRequest::Deliver(Signal::from_number(10).unwrap()),
+                SignalInfo::Generated(None),
+            )
+            .unwrap();
+    }
     word.missing.set(false);
     service.prepare_copy_error = None;
     access.lower(space.index());
@@ -12293,11 +12398,9 @@ fn futex_owner_wait_episode(
     assert_eq!(retained.native.x[2], 0x12345678);
     crate::sched::ThreadCpu::load(&mut cpu, &mut frame, &retained);
     if caught_signal {
-        use carrick_personality_linux::signal::ProcessSignals;
-        use carrick_signal_core::policy::{Action, Disposition, HandlerAddress, Signal};
         use zerocopy::IntoBytes;
 
-        let signal = Signal::from_number(10).unwrap();
+        cpu.now = 101;
         let mut entry = runtime
             .enter_registered(
                 registry(),
@@ -12308,20 +12411,35 @@ fn futex_owner_wait_episode(
                 &mut service,
             )
             .unwrap();
-        entry
-            .rt_sigaction(
-                signal,
-                Some(Action {
-                    disposition: Disposition::Handler(HandlerAddress(0x700000)),
-                    ..Default::default()
-                }),
-            )
-            .unwrap();
-        fixture
-            .control
-            .post_in_zone_standard_signal(signal)
-            .unwrap();
-        entry.import_in_zone_standard_signals().unwrap();
+        crate::dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &cache,
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &word,
+            }),
+            None,
+            Some(fixture),
+            Some(&mut *entry),
+            Some(source),
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        assert_eq!(
+            frame.x[0] as i64, -4,
+            "signal during owner service interrupts the retained wait"
+        );
+        assert_eq!(
+            cpu.now, 101,
+            "interruption must not spend the retained deadline"
+        );
         assert!(entry.signal_checkpoint_needed());
         let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
         assert_eq!(

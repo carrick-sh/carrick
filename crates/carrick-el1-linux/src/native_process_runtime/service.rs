@@ -2543,6 +2543,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .map_err(|_| NativeProcessError::Quarantined)?;
         }
         if exiting {
+            let _ = ProcessNative::take_relative_futex_wait(self);
             if let (ServiceOperation::Exec { .. }, ServiceResult::ExecPrepared(receipt)) =
                 (request.operation, result)
             {
