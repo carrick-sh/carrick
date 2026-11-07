@@ -1752,7 +1752,12 @@ where
                 ))
             })?;
         if let Some(slot) = engine.mailbox_slot() {
-            carrick_kernel::kernel::continuation::ipc::publish_file_table(&kernel_context);
+            let _ = crate::with_carrier_ipc_region(|region| {
+                carrick_kernel::kernel::continuation::ipc::publish_file_table(
+                    &kernel_context,
+                    region,
+                );
+            });
             carrick_kernel::el1_delegation::revalidate_current_task(
                 slot,
                 carrick_kernel::el1_delegation::El1TaskId::from_linux_tid(self.linux_tid.raw()),

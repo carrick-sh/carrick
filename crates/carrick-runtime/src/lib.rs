@@ -232,6 +232,22 @@ pub use carrick_vmm_hvf::{
     read_el1_region_host_ptr, reset_el1_counters, reset_metadata_grant_state,
 };
 
+/// Inspect the IPC region retained by the active carrier installation.
+/// An execution backend without an installed ring IPC venue returns `None`.
+pub fn with_carrier_ipc_region<T>(
+    op: impl FnOnce(&carrick_el1_abi::ipc::IpcRegion<'_>) -> T,
+) -> Option<T> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        carrick_vmm_hvf::with_installed_ipc_region(op)
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        let _ = op;
+        None
+    }
+}
+
 /// Carrier-wide count of vCPU exits to the host (every `hv_vcpu_run` return).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use carrick_vmm_hvf::{

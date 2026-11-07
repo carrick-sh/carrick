@@ -9,7 +9,7 @@ derivation uses `KernelLayout.region` and refuses a foreign layout.
 Admission does constant work independent of descriptor or pipe population.
 
 The host view is `HostIpcWindow`, with `HostVa` addresses and `GuestLen`
-sizes. The guest view is `GuestIpcWindow`, with `KernelVa`, `FrameGpa`
+sizes, borrowed from its backing owner. The guest view is `GuestIpcWindow`, with `KernelVa`, `FrameGpa`
 and `GuestLen`. Both attach through the existing `IpcRegion::attach`.
 The host view refuses pointer overflow. Guest attachment returns the
 caller's retained mapping lifetime rather than manufacturing a static
@@ -59,9 +59,9 @@ The HVF mapping-owner witness also checks that retiring the mapping withdraws
 the registration while a retained backing handle remains alive; execution
 of that macOS-only witness is unavailable on the Linux worker.
 
-Slice 1 remains incomplete: `IPC_WINDOW_HOST` and `EL1_REGION_HOST_PTR`
-remain. Existing host delegation and memory-mailbox consumers still use
-the global region; replacing only IPC lookup cannot migrate their lifetimes.
+Slice 1 remains incomplete: `EL1_REGION_HOST_PTR` remains. Existing host
+delegation and memory-mailbox consumers still use the global region;
+replacing only IPC lookup cannot migrate their lifetimes.
 No Slice 1 completion or x86 runtime pipe-service acceptance is claimed.
 Slices 2–6 remain outside this continuation's scope.
 
@@ -72,9 +72,25 @@ The two-kernel production-service witness drops both dispatchers, contexts
 and external storage owners before looking up and completing an operation;
 the peer service rejects that region and cannot find its operation. The
 witness was compile-red with E0599 before the borrowed region accessor.
-This removes the global window from completion selection, but does not
-remove its publication. Descriptor admission must still compare its kernel
-owner with the carrier's mapped window: a reused carrier can retain the
-first kernel's window while a later kernel presents a different authority.
-Removing that guard before a retained carrier binding replaces it would
-publish foreign descriptor identities into the live map.
+Descriptor admission now receives a scoped region borrow from the existing
+carrier installation. The installation retains its backing while the callback
+runs, including across replacement by a successor. Watchdog IPC census uses
+the same scoped access. Reset withdraws admission while retaining the memory
+needed by the installation's stage-2 records. `IPC_WINDOW_HOST`, its live word
+and both publication accessors are removed rather than renamed. No pointer
+array is reconstructed in another crate.
+
+The host attachment lifetime is bounded by its window borrow. Its compile-fail
+witness was red because the old attachment could escape as `IpcRegion<'static>`.
+Descriptor admission still compares its kernel owner with the supplied mapped
+window: a reused carrier can retain the first kernel's window while a later
+kernel presents a different authority. The production admission witness keeps
+two kernels live with colliding kernel-local file-table IDs, refuses the peer
+and an unpublished map, and publishes the installed owner's table. A peer
+cannot replace that published entry. Admission performs the same constant-work mapping
+comparison before the existing bounded descriptor publication.
+
+The table map still comes from the global EL1 region; migrating that and the
+remaining region consumers onto retained carrier registration is unfinished.
+Neither this scoped IPC access nor the earlier ARM migration proves real KVM
+pipe service or completes Slice 1.

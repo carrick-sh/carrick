@@ -3291,7 +3291,7 @@ pub unsafe fn host_aperture_control() -> Option<&'static ApertureControl> {
     unsafe { Some(&*(address as *const ApertureControl)) }
 }
 
-/// Host-only addresses of the shared IPC directory and pool.
+/// Host-only addresses of the shared IPC directory and pool, borrowing backing.
 #[derive(
     ::core::clone::Clone,
     ::core::marker::Copy,
@@ -3299,24 +3299,25 @@ pub unsafe fn host_aperture_control() -> Option<&'static ApertureControl> {
     ::core::cmp::Eq,
     ::core::cmp::PartialEq,
 )]
-pub struct HostIpcWindow {
+pub struct HostIpcWindow<'a> {
     directory: carrick_guest_arch::HostVa,
     directory_bytes: carrick_guest_arch::GuestLen,
     pool: carrick_guest_arch::HostVa,
     pool_bytes: carrick_guest_arch::GuestLen,
+    backing: core::marker::PhantomData<&'a dyn IpcWindowBacking>,
 }
 
-impl HostIpcWindow {
+impl<'a> HostIpcWindow<'a> {
     /// Admit a host mapping of the IPC authority.
     ///
     /// # Safety
-    /// Both ranges are mapped, initialized and shared for `'static`.
-    pub unsafe fn new(
-        directory: carrick_guest_arch::HostVa,
-        directory_bytes: carrick_guest_arch::GuestLen,
-        pool: carrick_guest_arch::HostVa,
-        pool_bytes: carrick_guest_arch::GuestLen,
-    ) -> Option<Self> {
+    /// The backing exposes initialized shared memory for its entire borrow.
+    /// Its pointers and lengths must remain stable throughout that borrow.
+    pub unsafe fn new(backing: &'a dyn IpcWindowBacking) -> Option<Self> {
+        let directory = carrick_guest_arch::HostVa::from_ptr(backing.directory_ptr());
+        let directory_bytes = carrick_guest_arch::GuestLen::new(backing.directory_len() as u64);
+        let pool = carrick_guest_arch::HostVa::from_ptr(backing.pool_ptr());
+        let pool_bytes = carrick_guest_arch::GuestLen::new(backing.pool_len() as u64);
         let directory_len = usize::try_from(directory_bytes.raw()).ok()?;
         let pool_len = usize::try_from(pool_bytes.raw()).ok()?;
         (directory.raw() != 0
@@ -3331,6 +3332,7 @@ impl HostIpcWindow {
             directory_bytes,
             pool,
             pool_bytes,
+            backing: core::marker::PhantomData,
         })
     }
     pub const fn directory(self) -> carrick_guest_arch::HostVa {
@@ -3345,8 +3347,17 @@ impl HostIpcWindow {
     pub const fn pool_bytes(self) -> carrick_guest_arch::GuestLen {
         self.pool_bytes
     }
-    pub fn attach(self) -> Result<ipc::IpcRegion<'static>, ipc::IpcError> {
-        // SAFETY: constructor's retained mapping contract; attach authenticates
+    /// Borrow the initialized window without escaping its mapping custody.
+    ///
+    /// ```compile_fail
+    /// use carrick_el1_abi::{HostIpcWindow, ipc::IpcRegion};
+    /// fn escape(window: &HostIpcWindow) -> IpcRegion<'static> {
+    ///     window.attach().unwrap()
+    /// }
+    /// ```
+    pub fn attach(&self) -> Result<ipc::IpcRegion<'_>, ipc::IpcError> {
+        // SAFETY: constructor's retained mapping contract; this borrow bounds
+        // the region lifetime. Attach authenticates
         // the shared header before exposing authority.
         unsafe {
             ipc::IpcRegion::attach(
@@ -3367,39 +3378,6 @@ pub trait IpcWindowBacking: Send + Sync {
     fn directory_len(&self) -> usize;
     fn pool_ptr(&self) -> *mut u8;
     fn pool_len(&self) -> usize;
-}
-
-static IPC_WINDOW_HOST: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
-static IPC_WINDOW_HOST_LIVE: AtomicU32 = AtomicU32::new(0);
-
-/// Record the host's view of the window the carrier mapped (`None`: the
-/// carrier retired it). Recorded by the mapping owner only.
-pub fn record_ipc_window_host(window: Option<HostIpcWindow>) {
-    IPC_WINDOW_HOST_LIVE.store(0, Ordering::Release);
-    if let Some(w) = window {
-        IPC_WINDOW_HOST[0].store(w.directory.raw(), Ordering::Relaxed);
-        IPC_WINDOW_HOST[1].store(w.directory_bytes.raw() as usize, Ordering::Relaxed);
-        IPC_WINDOW_HOST[2].store(w.pool.raw(), Ordering::Relaxed);
-        IPC_WINDOW_HOST[3].store(w.pool_bytes.raw() as usize, Ordering::Relaxed);
-        IPC_WINDOW_HOST_LIVE.store(1, Ordering::Release);
-    }
-}
-
-/// The host's view of the mapped IPC window, if the carrier mapped one.
-pub fn ipc_window_host() -> Option<HostIpcWindow> {
-    if IPC_WINDOW_HOST_LIVE.load(Ordering::Acquire) == 0 {
-        return None;
-    }
-    // SAFETY: recorded by the mapping owner, which retains the memory while
-    // the record is live.
-    unsafe {
-        HostIpcWindow::new(
-            carrick_guest_arch::HostVa::new(IPC_WINDOW_HOST[0].load(Ordering::Relaxed)),
-            carrick_guest_arch::GuestLen::new(IPC_WINDOW_HOST[1].load(Ordering::Relaxed) as u64),
-            carrick_guest_arch::HostVa::new(IPC_WINDOW_HOST[2].load(Ordering::Relaxed)),
-            carrick_guest_arch::GuestLen::new(IPC_WINDOW_HOST[3].load(Ordering::Relaxed) as u64),
-        )
-    }
 }
 
 /// The IPC table map in the EL1 region, as the host maps it.

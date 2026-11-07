@@ -17,6 +17,52 @@ const MM: IpcMmKey = IpcMmKey(7);
 const BUF: u64 = 0x10_0000;
 
 #[test]
+fn serial_host_ipc_admission_borrows_the_installed_window_and_rejects_a_peer() {
+    let storage = carrick_test_support::TestEl1Region::zeroed();
+    struct Restore(usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            carrick_el1_abi::record_el1_region_host_ptr(self.0);
+        }
+    }
+    let _restore = Restore(carrick_el1_abi::get_el1_region_host_ptr());
+    carrick_el1_abi::record_el1_region_host_ptr(storage.as_ptr() as usize);
+    let map = carrick_el1_abi::ipc_table_map_host().unwrap();
+    let first = crate::dispatch::SyscallDispatcher::new();
+    let second = crate::dispatch::SyscallDispatcher::new();
+    let first_context = first.capture_one_task_context().unwrap();
+    let second_context = second.capture_one_task_context().unwrap();
+    let backing = host_window_backing(&first).unwrap();
+    let _second_owner = second_context.kernel().ipc().unwrap();
+    // SAFETY: this retained kernel backing owns stable initialized mappings.
+    let window = unsafe { carrick_el1_abi::HostIpcWindow::new(backing.as_ref()) }.unwrap();
+    let installed = window.attach().unwrap();
+    let first_id = first_context.resources().files().id().raw();
+    let second_id = second_context.resources().files().id().raw();
+    assert_eq!(first_id, second_id, "kernel-local IDs deliberately collide");
+    publish_file_table(&first_context, &installed);
+    assert!(
+        map.lookup(first_id).is_none(),
+        "unmapped window must refuse"
+    );
+    map.publish_window();
+    publish_file_table(&second_context, &installed);
+    assert!(map.lookup(second_id).is_none(), "peer kernel must refuse");
+    publish_file_table(&first_context, &installed);
+    assert!(
+        map.lookup(first_id).is_some(),
+        "installed owner must publish"
+    );
+    let admitted = map.lookup(first_id).unwrap();
+    publish_file_table(&second_context, &installed);
+    assert_eq!(
+        map.lookup(first_id),
+        Some(admitted),
+        "peer cannot replace owner"
+    );
+}
+
+#[test]
 fn host_ipc_completion_regions_retain_their_exact_kernel_owner() {
     let first = crate::dispatch::SyscallDispatcher::new();
     let second = crate::dispatch::SyscallDispatcher::new();
