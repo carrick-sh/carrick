@@ -161,6 +161,12 @@ struct EntropyPreparation {
     requested: carrick_guest_arch::GuestLen,
 }
 
+/// A sample and its exact-member output destination remain owned until ACK.
+struct PendingClockSample {
+    record: Box<[u8; carrick_core_abi::clock::CLOCK_RECORD_BYTES]>,
+    output: UserVa,
+}
+
 enum ServicePayload<'a> {
     None,
     Copyin,
@@ -174,6 +180,7 @@ enum ServicePayload<'a> {
         address: UserVa,
         empty_fault: bool,
     },
+    ClockSample(PendingClockSample),
 }
 
 pub(super) struct PendingService<'a> {
@@ -186,6 +193,7 @@ pub(super) struct PendingService<'a> {
     entropy: Option<(Box<[u8]>, UserVa, bool)>,
     entropy_preparation: Option<EntropyPreparation>,
     fault_reply_cancelling: bool,
+    clock_sample: Option<PendingClockSample>,
     copyout: Option<Box<OwnedCopyout<'a>>>,
     copyin: bool,
     adapter: bool,
@@ -202,7 +210,8 @@ impl PendingService<'_> {
     /// A caught signal interrupts a guest wait, not an internal obligation
     /// that must finish before its committed context can return to user code.
     fn signal_interruptible(&self) -> bool {
-        self.copyout.is_none()
+        self.clock_sample.is_none()
+            && self.copyout.is_none()
             && !self.copyin
             && !self.adapter
             && !matches!(self.request.operation, ServiceOperation::CarrierWork { .. })
@@ -1050,6 +1059,36 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         Ok(())
     }
 
+    /// Retain a bounded clock sample and its exact-MM output through transport
+    /// and memory-owner waits. The caller supplies the admitted run capability;
+    /// no task lookup or root-dispatch fallback can grant one here.
+    pub fn begin_clock_sample(
+        &mut self,
+        capability: carrick_core_abi::clock::ClockCapabilityId,
+        clock_id: u64,
+        output: UserVa,
+        ordinal: carrick_guest_arch::NativeOrdinal,
+    ) -> Result<NativeResume, NativeProcessError> {
+        let mut record = Box::new([0; carrick_core_abi::clock::CLOCK_RECORD_BYTES]);
+        carrick_core_abi::clock::encode_sample_request(&mut record, clock_id);
+        let payload = carrick_core_abi::service::ClockPayloadDescriptor::checked(
+            carrick_guest_arch::GuestVa::new(record.as_ptr().addr() as u64),
+            carrick_guest_arch::GuestLen::new(record.len() as u64),
+            ordinal,
+        )
+        .ok_or(NativeProcessError::Stale)?;
+        self.begin_service_inner(
+            ServiceOperation::Clock {
+                capability,
+                payload,
+            },
+            None,
+            None,
+            ServicePayload::ClockSample(PendingClockSample { record, output }),
+            ServiceCompletion::Inline,
+        )
+    }
+
     /// Stage one typed host-file crossing for the carrier venue. Fd-based
     /// calls carry no credential decision: the open description's access
     /// mode, checked by the staging step, is the authority Linux applies. A
@@ -1452,6 +1491,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ServicePayload::Adapter => (ServicePayload::None, None, true),
             payload => (payload, None, false),
         };
+        // Clock admission requires the retained operation and exact reply storage.
+        let (payload, clock_sample) = match (operation, payload) {
+            (ServiceOperation::Clock { payload, .. }, ServicePayload::ClockSample(sample))
+                if payload.address().raw() == sample.record.as_ptr().addr() as u64 =>
+            {
+                (ServicePayload::None, Some(sample))
+            }
+            (ServiceOperation::Clock { .. }, _) | (_, ServicePayload::ClockSample(_)) => {
+                return Err(NativeProcessError::Stale);
+            }
+            (_, payload) => (payload, None),
+        };
         let (exec_payload, host_file, entropy) = match (operation, payload) {
             (ServiceOperation::Exec { .. }, ServicePayload::Exec(payload)) => {
                 (Some(payload), None, None)
@@ -1471,13 +1522,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             {
                 (None, None, Some((record, address, empty_fault)))
             }
-            // Clock requests require a retained ring operation and reply owner.
-            // The generic payload-free entry cannot grant that custody.
+            // A clock request reaches here only with its retained sample above.
             (
                 ServiceOperation::Exec { .. }
                 | ServiceOperation::HostFile { .. }
-                | ServiceOperation::Entropy { .. }
-                | ServiceOperation::Clock { .. },
+                | ServiceOperation::Entropy { .. },
                 _,
             )
             | (
@@ -1494,7 +1543,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 ServicePayload::Copyout(_)
                 | ServicePayload::Copyin
                 | ServicePayload::Adapter
-                | ServicePayload::EntropyPreparation(_),
+                | ServicePayload::EntropyPreparation(_)
+                | ServicePayload::ClockSample(_),
             ) => {
                 return Err(NativeProcessError::Stale);
             }
@@ -1707,6 +1757,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 entropy,
                 entropy_preparation,
                 fault_reply_cancelling: false,
+                clock_sample,
                 copyout,
                 copyin,
                 adapter,
@@ -3087,8 +3138,35 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 };
             }
             match (request.operation, result) {
-                // No payload-free completion may manufacture a clock answer.
-                // Clock admission above refuses before publishing a request.
+                (ServiceOperation::Clock { .. }, ServiceResult::Supplied) => {
+                    let sample = pending
+                        .clock_sample
+                        .take()
+                        .ok_or(NativeProcessError::Stale)?;
+                    match carrick_core_abi::clock::parse_reply(&*sample.record)
+                        .map_err(|_| NativeProcessError::Quarantined)?
+                    {
+                        carrick_core_abi::clock::ClockReply::Sample(Ok((seconds, nanos))) => {
+                            let mut bytes = Vec::with_capacity(16);
+                            bytes.extend_from_slice(&seconds.to_le_bytes());
+                            bytes.extend_from_slice(&u64::from(nanos).to_le_bytes());
+                            output = Some(Box::new(OwnedCopyout {
+                                address: sample.output,
+                                bytes,
+                                offset: 0,
+                                result: SyscallResult::new(0),
+                                prefix_on_fault: false,
+                                effect: None,
+                            }));
+                            Ok(NativeResume::NoPending)
+                        }
+                        carrick_core_abi::clock::ClockReply::Sample(Err(errno)) => Ok(
+                            NativeResume::Returned(SyscallResult::new(-i64::from(errno))),
+                        ),
+                        _ => Err(NativeProcessError::Quarantined),
+                    }
+                }
+                // An admitted resource may not disappear or produce an unrelated reply.
                 (ServiceOperation::Clock { .. }, _) => Err(NativeProcessError::Quarantined),
                 (_, ServiceResult::Wait(_)) => Err(NativeProcessError::Quarantined),
                 (
