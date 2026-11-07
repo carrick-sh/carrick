@@ -2164,14 +2164,6 @@ mod tests {
                     invoke(SYS_MPROTECT, [ARENA + 4096, LENGTH - 8192, 7, 0, 0, 0]),
                     0
                 );
-                assert_eq!(editor.calls.len(), 2, "one backing probe per operation");
-                assert!(
-                    editor
-                        .calls
-                        .iter()
-                        .all(|call| matches!(call, Call::Probe(..))),
-                    "hidden reservations allocate no backing and edit no descriptors"
-                );
                 let mut model = table.lock(index.index(), mm).unwrap();
                 assert!(model.is_admitted());
                 let mut rows = Vec::new();
@@ -2188,6 +2180,16 @@ mod tests {
                     ReservationProtection::READ_WRITE_EXECUTE
                 );
                 assert_eq!(rows[2].protection, ReservationProtection::NONE);
+                drop(model);
+                assert_eq!(invoke(SYS_MUNMAP, [ARENA, LENGTH, 0, 0, 0, 0]), 0);
+                assert_eq!(editor.calls.len(), 3, "one backing probe per operation");
+                assert!(
+                    editor
+                        .calls
+                        .iter()
+                        .all(|call| matches!(call, Call::Probe(..))),
+                    "hidden reservations allocate no backing and edit no descriptors"
+                );
             }
         }
 
