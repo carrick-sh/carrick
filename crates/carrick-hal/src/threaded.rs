@@ -3734,16 +3734,114 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
         Ok(())
     }
 
-    /// Read bytes from a VMA already authenticated as readable by the coherent
-    /// core snapshot. The default preserves ordinary checked guest-memory
-    /// semantics; AArch64 HVPatch bypasses only its syscall-path PROT_NONE
-    /// reservation gate so a live `brk` prefix can be captured from backing.
+    /// Read a range admitted by a coherent core VMA snapshot. An admitted
+    /// owner is read through the caller's exact-MM exclusion, never through
+    /// the user-transfer portal behind the gate held by that same capture.
     fn read_core_bytes(
+        &self,
+        excluded: Option<&carrick_sched_core::ExcludedEditor<'_>>,
+        address: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
+        use carrick_guest_mem::{GuestVa, MemoryError};
+        let (Some(mm), Some(excluded)) = (self.core_memory_mm(), excluded) else {
+            return self.read_legacy_core_bytes(address, length);
+        };
+        let excluded = Some(excluded)
+            .filter(|proof| proof.key() == mm.raw().get())
+            .ok_or_else(|| {
+                MemoryError::HostMap("core owner read lacks exact-MM exclusion".into())
+            })?;
+        address
+            .checked_add(length as u64)
+            .ok_or(MemoryError::OutOfBounds { address, length })?;
+        let mut out = vec![0; length];
+        let mut copied = 0;
+        while copied < length {
+            let va = address + copied as u64;
+            let len = (length - copied).min((4096 - (va & 4095)) as usize);
+            let dst = &mut out[copied..copied + len];
+            match self.core_stage1_output(GuestVa::new(va), len)? {
+                Some(output) => {
+                    match self.read_core_backing(excluded, GuestVa::new(va), output, len) {
+                        Ok(bytes) if bytes.len() == len => dst.copy_from_slice(&bytes),
+                        Ok(_) => return Err(MemoryError::OutOfBounds { address, length }),
+                        Err(error) => {
+                            if let MemoryError::ReadSuspended(suspension) = &error
+                                && let carrick_guest_mem::MemoryReadWait::Owner(wait) =
+                                    &suspension.wait
+                                && wait.handle().mm().raw() == excluded.key()
+                                && wait.cause() == carrick_el1_abi::PortalWaitCause::Gate
+                            {
+                                return Err(MemoryError::HostMap(
+                                    "core owner read waited on capture's own excluded gate".into(),
+                                ));
+                            }
+                            if !self.copy_core_pristine(GuestVa::new(va), dst)? {
+                                return Err(error);
+                            }
+                        }
+                    }
+                }
+                None => {
+                    if !self.copy_core_pristine(GuestVa::new(va), dst)?
+                        && !self.core_untouched_zero(GuestVa::new(va), len)
+                    {
+                        return Err(MemoryError::OutOfBounds { address, length });
+                    }
+                }
+            }
+            copied += len;
+        }
+        Ok(out)
+    }
+
+    /// Legacy memory read when capture holds no published editor exclusion.
+    fn read_legacy_core_bytes(
         &self,
         address: u64,
         length: usize,
     ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
         self.read_bytes(address, length)
+    }
+
+    /// Exact memory incarnation for the excluded snapshot read.
+    fn core_memory_mm(&self) -> Option<carrick_guest_arch::MmGeneration> {
+        None
+    }
+
+    /// ISA stage-1 mechanics only; no owner admission or transfer policy.
+    fn core_stage1_output(
+        &self,
+        _address: carrick_guest_mem::GuestVa,
+        _length: usize,
+    ) -> Result<Option<carrick_guest_mem::Gpa>, carrick_guest_mem::MemoryError> {
+        Err(carrick_guest_mem::MemoryError::Unsupported)
+    }
+
+    /// Copy backing selected by the frozen stage-1 translation.
+    fn read_core_backing(
+        &self,
+        _excluded: &carrick_sched_core::ExcludedEditor<'_>,
+        _address: carrick_guest_mem::GuestVa,
+        _output: carrick_guest_mem::Gpa,
+        _length: usize,
+    ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
+        Err(carrick_guest_mem::MemoryError::Unsupported)
+    }
+
+    /// Copy authoritative, unmaterialized private-file contents if present.
+    fn copy_core_pristine(
+        &self,
+        _address: carrick_guest_mem::GuestVa,
+        _dst: &mut [u8],
+    ) -> Result<bool, carrick_guest_mem::MemoryError> {
+        Ok(false)
+    }
+
+    /// An authoritative untouched anonymous page requires no backing frame.
+    fn core_untouched_zero(&self, _address: carrick_guest_mem::GuestVa, _length: usize) -> bool {
+        false
     }
 
     /// Best-effort fault-time walk of the live stage-1 backing. The returned

@@ -368,9 +368,10 @@ where
             // releases. When the MM is published, retaining this optional
             // guard registers the typed exclusion witness the HVPatch backing
             // reader requires.
-            let _snapshot_exclusion = carrick_kernel::kernel::mm_occupancy::exclude_el1_editor(
+            let snapshot_exclusion = carrick_kernel::kernel::mm_occupancy::exclude_el1_editor(
                 context.shared().mm().id(),
             );
+            let excluded = snapshot_exclusion.as_ref().map(|guard| guard.excluded());
             lifecycle(1, 0);
 
             engine.prepare_core_snapshot().map_err(|error| {
@@ -471,7 +472,8 @@ where
                                 // CopyIn on every blocking park, and for a
                                 // thread EL1 itself parked mid-syscall; see
                                 // `guest_visible_resume_pc`'s doc comment).
-                                let resume_pc = guest_visible_resume_pc(engine, resume_pc);
+                                let resume_pc =
+                                    guest_visible_resume_pc(engine, excluded, resume_pc);
                                 gregs[32] = resume_pc;
                                 gregs[33] = carrick_hal::el0_visible_pstate(resume_pstate);
                                 Ok(carrick_kernel::core_dump::ThreadState {
@@ -727,7 +729,7 @@ where
                         // continue scanning past them to later nonzero data.
                         let to_read = (sub_len - consumed).min(64 * 1024);
                         let address = sub_start + consumed as u64;
-                        let read = engine.read_core_bytes(address, to_read);
+                        let read = engine.read_core_bytes(excluded, address, to_read);
                         let bytes = match read {
                             Ok(bytes) => bytes,
                             Err(carrick_guest_mem::MemoryError::ReadSuspended(suspension)) => {
@@ -743,6 +745,15 @@ where
                                         ),
                                     )));
                                 };
+                                if excluded
+                                    .is_some_and(|proof| proof.key() == wait.handle().mm().raw())
+                                    && wait.cause() == carrick_el1_abi::PortalWaitCause::Gate
+                                {
+                                    return Err(RuntimeError::Configuration(
+                                        "core owner read waited on capture's own excluded gate"
+                                            .into(),
+                                    ));
+                                }
                                 // The pause and exclusion end before waiting. Discard
                                 // this unpublished snapshot, including partial bytes:
                                 // a sibling may change memory while the owner wakes.
@@ -1577,6 +1588,7 @@ mod tests {
         let address = 0x2000;
         let engine = CrashCaptureTestEngine {
             guest_memory: [(address, vec![0x5a; 4096])].into(),
+            capture_owns_gate: true,
             copyout_owner_probe: Some(super::super::tests::CopyoutOwnerProbe {
                 wait,
                 zone: zone as *const _ as usize,
@@ -1590,7 +1602,9 @@ mod tests {
         // The core read must complete without lowering the very gate that
         // authenticates its stable memory snapshot.
         assert_eq!(
-            engine.read_core_bytes(address, 4096).unwrap(),
+            engine
+                .read_core_bytes(Some(&excluded), address, 4096)
+                .unwrap(),
             vec![0x5a; 4096]
         );
         assert!(
@@ -1600,11 +1614,24 @@ mod tests {
                 .is_some()
         );
         drop(excluded);
-        zone.spaces.lower(index);
+        carrick_el1_linux::sched::object_wait::space_access(
+            zone,
+            carrick_sched_core::SlotId::new(1),
+        )
+        .lower(index);
     }
 
     #[test]
     fn capture_core_gate_busy_once_then_reads_after_owner_release() {
+        capture_core_owner_gate(false);
+    }
+
+    #[test]
+    fn capture_core_reads_through_its_own_pause_gate() {
+        capture_core_owner_gate(true);
+    }
+
+    fn capture_core_owner_gate(own_gate: bool) {
         use carrick_el1_abi::PortalWaitCause;
         use carrick_el1_linux::mm_portal::{
             MmPortal,
@@ -1704,10 +1731,10 @@ mod tests {
             );
         }
 
-        let region = Region::new();
+        let region = Box::leak(Box::new(Region::new()));
         let zone = region.zone();
-        let mm = admit_notified(&region, root.shared().mm().id().raw(), ROOT, 1, 0);
-        let view = nodes(&region);
+        let mm = admit_notified(region, root.shared().mm().id().raw(), ROOT, 1, 0);
+        let view = nodes(region);
         let portal = MmPortal::new(
             NonZeroU64::new(1_733).unwrap(),
             region.table(),
@@ -1732,14 +1759,51 @@ mod tests {
             ]
             .into(),
             read_tracker: Some(Arc::clone(&tracker)),
-            read_refusal_tx: Some(tx),
-            owner_read_refusal_at: Some(target_addr),
+            read_refusal_tx: (!own_gate).then_some(tx),
+            capture_owns_gate: own_gate,
+            owner_read_refusal_at: (!own_gate).then_some(target_addr),
             copyout_owner_probe: Some(super::super::tests::CopyoutOwnerProbe {
                 wait,
                 zone: zone as *const _ as usize,
             }),
             ..CrashCaptureTestEngine::default()
         };
+
+        if own_gate {
+            // Release this setup gate. Only capture itself raises the gate
+            // seen by its raw owner read; no independent producer can wake it.
+            carrick_el1_linux::sched::object_wait::space_access(
+                zone,
+                carrick_sched_core::SlotId::new(1),
+            )
+            .lower(index);
+            let prepared = carrick_kernel::el1_zone::with_test_zone(zone, || {
+                state.capture_core_for_publication(
+                    &kernel,
+                    &mut engine,
+                    FatalSignalRecord {
+                        image_generation: kernel.fatal_signal.current_generation(),
+                        tid: worker.thread().key().tid,
+                        signo: 11,
+                        code: 1,
+                        addr: target_addr,
+                    },
+                )
+            })
+            .expect("capture must read through its own exclusion");
+            let Ok(Some(prepared)) = prepared else {
+                panic!("capture's own gate cannot become a retained wait");
+            };
+            assert_eq!(prepared.payload.extents.len(), 2);
+            assert_eq!(prepared.payload.extents[0].bytes, vec![0xa5; target_len]);
+            assert_eq!(prepared.payload.extents[1].bytes, vec![0x5a; target_len]);
+            assert_eq!(zone.spaces.gate(index), 0, "capture releases its gate");
+            assert_eq!(
+                tracker.lock().as_slice(),
+                &[(prefix_addr, target_len), (target_addr, target_len)]
+            );
+            return;
+        }
 
         std::thread::scope(|scope| {
             let release = scope.spawn(move || {
