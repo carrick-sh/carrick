@@ -427,9 +427,9 @@ impl Fixture {
             let digest = hash(&data);
             let name: String = digest.clone().into();
             write(store.path(), &format!("objects/{name}"), &data);
-            fs::set_permissions(
+            carrick_test_support::publish_executable(
                 store.path().join("objects").join(name),
-                fs::Permissions::from_mode(0o755),
+                0o755,
             )
             .unwrap();
             executables.push(Executable {
@@ -1084,7 +1084,7 @@ fn copy_bundle(from: &Path, to: &Path) {
         let entry = entry.unwrap();
         let destination = to.join("objects").join(entry.file_name());
         fs::copy(entry.path(), &destination).unwrap();
-        fs::set_permissions(destination, fs::Permissions::from_mode(0o755)).unwrap();
+        carrick_test_support::publish_executable(destination, 0o755).unwrap();
     }
 }
 
@@ -1305,7 +1305,7 @@ else
 fi
 "#);
         for name in ["cargo", "just"] {
-            fs::set_permissions(bin.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+            carrick_test_support::publish_executable(bin.join(name), 0o755).unwrap();
         }
         Self {
             scratch,
@@ -1647,11 +1647,8 @@ fn trusted_hardware_workflow_prepares_exact_sha_fixtures_before_signed_execution
 printf '%s\n' "$1" > "$FIXTURE_TEST_CLEANED"
 "#,
     );
-    fs::set_permissions(
-        f.repo.path().join("scripts/sudo/kill.sh"),
-        fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
+    carrick_test_support::publish_executable(f.repo.path().join("scripts/sudo/kill.sh"), 0o755)
+        .unwrap();
     git(f.repo.path(), &["add", "scripts/sudo/kill.sh"]);
     git(
         f.repo.path(),
@@ -1690,7 +1687,7 @@ esac
     );
     write(&p.bin, "otool", b"#!/bin/sh\nprintf '__dof_carrick\\n'\n");
     for name in ["just", "codesign", "otool"] {
-        fs::set_permissions(p.bin.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+        carrick_test_support::publish_executable(p.bin.join(name), 0o755).unwrap();
     }
     let executions = p.scratch.path().join("executions");
     let cleaned = p.scratch.path().join("cleaned");
@@ -1961,7 +1958,7 @@ esac
 exec sh -c "$script"
 "#,
     );
-    fs::set_permissions(p.bin.join("ssh"), fs::Permissions::from_mode(0o755)).unwrap();
+    carrick_test_support::publish_executable(p.bin.join("ssh"), 0o755).unwrap();
     let real_rsync = Command::new("sh")
         .args(["-c", "command -v rsync"])
         .output()
@@ -1978,7 +1975,7 @@ fi
 exec "$FIXTURE_TEST_RSYNC" "$@"
 "#,
     );
-    fs::set_permissions(p.bin.join("rsync"), fs::Permissions::from_mode(0o755)).unwrap();
+    carrick_test_support::publish_executable(p.bin.join("rsync"), 0o755).unwrap();
     let mut cli = p.command(env!("CARGO_BIN_EXE_carrick-xtask"));
     cli.env("FIXTURE_TEST_REQUIRE_PROVENANCE", "1");
     cli.env(
@@ -2399,9 +2396,9 @@ fn replacing_shared_archive_after_verification_restores_captured_bytes() {
         &format!("objects/{object_name}"),
         &replacement,
     );
-    fs::set_permissions(
+    carrick_test_support::publish_executable(
         f.store.path().join("objects").join(&object_name),
-        fs::Permissions::from_mode(0o755),
+        0o755,
     )
     .unwrap();
     f.manifest.executables[0].sha256 = digest;

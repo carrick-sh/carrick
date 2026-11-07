@@ -1100,6 +1100,7 @@ dependencies = [
  "flate2",
  "libc",
  "tar",
+ "tempfile",
 ]
 
 [[package]]
@@ -1354,6 +1355,7 @@ dependencies = [
  "carrick-fatal",
  "carrick-guest-arch",
  "carrick-portable",
+ "carrick-test-support",
  "clap",
  "flate2",
  "libc",

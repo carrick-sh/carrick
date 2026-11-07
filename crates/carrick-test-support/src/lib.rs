@@ -88,3 +88,8 @@ pub fn gzip_tar_with_links<const N: usize, const M: usize>(
     encoder.write_all(&tar_bytes).unwrap();
     encoder.finish().unwrap()
 }
+
+#[cfg(unix)]
+mod executable;
+#[cfg(unix)]
+pub use executable::{publish_executable, write_executable};

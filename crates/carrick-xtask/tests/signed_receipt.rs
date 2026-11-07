@@ -320,7 +320,6 @@ fn baseline_admission_requires_every_population_identity_and_scoped_cleanup() {
 #[cfg(unix)]
 #[test]
 fn actions_prepare_download_and_publish_use_exact_baseline_and_fail_closed() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
@@ -375,7 +374,7 @@ elif args[0] == 'api':
 else:
     raise SystemExit('unexpected gh invocation: '+repr(args))
 "#).unwrap();
-    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    carrick_test_support::publish_executable(&gh, 0o755).unwrap();
     let base = admitted(&"a".repeat(40));
     let baseline_path = dir.path().join("source-base.json");
     std::fs::write(&baseline_path, serde_json::to_vec(&base).unwrap()).unwrap();

@@ -153,7 +153,7 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf, u32) {
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     let exe = root.path().join("xtask");
     std::fs::write(&exe, "#!/bin/sh\n").unwrap();
-    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    carrick_test_support::publish_executable(&exe, 0o755).unwrap();
     let state_root = root.path().join("run");
     std::fs::create_dir(&state_root).unwrap();
     std::fs::set_permissions(&state_root, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -263,7 +263,7 @@ fn run_once_refuses_a_job_writable_hook_binary_or_state_root() {
         )
         .is_err()
     );
-    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    carrick_test_support::publish_executable(&exe, 0o755).unwrap();
     std::fs::set_permissions(&state_root, std::fs::Permissions::from_mode(0o777)).unwrap();
     assert!(
         prepare_run_once(
@@ -294,8 +294,7 @@ fn write_skeleton_entry(path: impl AsRef<std::path::Path>, contents: impl AsRef<
     if let Some(parent) = p.parent() {
         mkdir_mode(parent, 0o755);
     }
-    std::fs::write(p, contents).unwrap();
-    std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+    carrick_test_support::write_executable(p, contents, mode).unwrap();
 }
 
 #[test]
@@ -719,7 +718,7 @@ fn runner_fixture(base: &std::path::Path) -> std::path::PathBuf {
         std::fs::set_permissions(dir.join(d), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     for f in ["bin/Runner.Listener", "externals/node"] {
-        std::fs::set_permissions(dir.join(f), std::fs::Permissions::from_mode(0o755)).unwrap();
+        carrick_test_support::publish_executable(dir.join(f), 0o755).unwrap();
     }
     dir
 }

@@ -644,7 +644,7 @@ fn serial_host_hvf_job_started_refuses_env_overrides_and_writable_or_non_root_xt
         );
         assert!(!session.path().join("always-ran").exists());
     }
-    std::fs::set_permissions(&spy_xtask, std::fs::Permissions::from_mode(0o755)).unwrap();
+    carrick_test_support::publish_executable(&spy_xtask, 0o755).unwrap();
 
     let xtask_link = bin.join("xtask-link");
     std::os::unix::fs::symlink(&spy_xtask, &xtask_link).unwrap();

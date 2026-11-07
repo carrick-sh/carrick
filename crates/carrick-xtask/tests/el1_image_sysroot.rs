@@ -8,7 +8,6 @@
 #[allow(dead_code, clippy::panic)]
 mod image_build;
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -26,7 +25,7 @@ fn loaded_image_budget_includes_trailing_bss_and_alignment() {
 
 fn executable(path: &Path, script: &str) {
     std::fs::write(path, script).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    carrick_test_support::publish_executable(path, 0o755).unwrap();
 }
 
 fn fixture() -> (tempfile::TempDir, Command) {

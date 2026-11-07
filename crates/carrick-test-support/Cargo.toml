@@ -17,3 +17,4 @@ carrick-guest-arch = { path = "../carrick-guest-arch" }
 libc.workspace = true
 flate2.workspace = true
 tar.workspace = true
+tempfile.workspace = true

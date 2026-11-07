@@ -3,7 +3,6 @@
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
@@ -11,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 fn publish(path: &std::path::Path) {
     fs::write(path, b"#!/bin/sh\nexit 0\n").unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    carrick_test_support::publish_executable(path, 0o700).unwrap();
 }
 
 #[test]
