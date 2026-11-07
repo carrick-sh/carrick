@@ -4815,6 +4815,180 @@ esac
         submit_clone(&pve, &mut ledger, &mut row, &path, &token).unwrap();
     }
 
+    #[test]
+    fn serial_host_reconcile_destroy_warning_lock_timeout_clears_volumes() {
+        const CHILD: &str = "CARRICK_DESTROY_WARN_1821";
+        if std::env::var_os(CHILD).is_none() {
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ci_scaler::live::tests::serial_host_reconcile_destroy_warning_lock_timeout_clears_volumes",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut target = row();
+        target.state = State::Reaping;
+        let row_name = target.name.clone();
+        let curl = dir.path().join("curl");
+        std::fs::write(
+            &curl,
+            format!(
+                r#"#!/bin/sh
+cat >/dev/null
+method="GET"
+prev=""
+for arg do
+  if [ "$prev" = "--request" ]; then method="$arg"; fi
+  prev="$arg"
+  url="$arg"
+done
+case "$method:$url" in
+ GET:*/pools/carrick-ci)
+   if [ -f "$CARRICK_DESTROY_DIR/unlinked" ]; then
+     body='{{"poolid":"carrick-ci","members":[]}}'
+   else
+     body='{{"poolid":"carrick-ci","members":[{{"type":"qemu","node":"willow","vmid":308,"template":0}}]}}'
+   fi ;;
+ GET:*/qemu/308/config)
+   body='{{"name":"{row_name}"}}' ;;
+ GET:*/qemu/308/status/current)
+   body='{{"status":"stopped"}}' ;;
+ DELETE:*/qemu/308)
+   touch "$CARRICK_DESTROY_DIR/unlinked"
+   body='"UPID:willow:destroy308"' ;;
+ GET:*/tasks/UPID:willow:destroy308/status)
+   body='{{"status":"stopped","exitstatus":"WARNINGS: 2"}}' ;;
+ GET:*/tasks/UPID:willow:destroy308/log?limit=500)
+   body='[{{"n":1,"t":"WARN: Could not remove disk '\''local:308/vm-308-cloudinit.qcow2'\'', check manually: can'\''t lock file '\''/var/lock/pve-manager/pve-storage-local'\'' - got timeout"}},{{"n":2,"t":"WARN: Could not remove disk '\''local:308/vm-308-disk-0.qcow2'\'', check manually: can'\''t lock file '\''/var/lock/pve-manager/pve-storage-local'\'' - got timeout"}},{{"n":3,"t":"TASK WARNINGS: 2"}}]' ;;
+ GET:*/tasks/UPID:willow:mixedwarn/status)
+   body='{{"status":"stopped","exitstatus":"WARNINGS: 2"}}' ;;
+ GET:*/tasks/UPID:willow:mixedwarn/log?limit=500)
+   body='[{{"n":1,"t":"WARN: Could not remove disk '\''local:308/vm-308-disk-0.qcow2'\'', check manually: can'\''t lock file '\''/var/lock/pve-manager/pve-storage-local'\'' - got timeout"}},{{"n":2,"t":"WARN: storage local unavailable"}},{{"n":3,"t":"TASK WARNINGS: 2"}}]' ;;
+ GET:*/tasks/UPID:willow:mismatchwarn/status)
+   body='{{"status":"stopped","exitstatus":"WARNINGS: 2"}}' ;;
+ GET:*/tasks/UPID:willow:mismatchwarn/log?limit=500)
+   body='[{{"n":1,"t":"WARN: Could not remove disk '\''local:308/vm-308-disk-0.qcow2'\'', check manually: can'\''t lock file '\''/var/lock/pve-manager/pve-storage-local'\'' - got timeout"}},{{"n":2,"t":"TASK WARNINGS: 2"}}]' ;;
+ GET:*/tasks/UPID:willow:zero/status)
+   body='{{"status":"stopped","exitstatus":"WARNINGS: 0"}}' ;;
+ *) exit 92 ;;
+esac
+printf '{{"data":%s}}\n200' "$body"
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pvesh = dir.path().join("pvesh");
+        std::fs::write(
+            &pvesh,
+            "#!/bin/sh\necho \"$*\" >> \"$CARRICK_DESTROY_DIR/pvesh_calls\"\nprintf '[]\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&pvesh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let gh = dir.path().join("gh");
+        std::fs::write(&gh, "#!/bin/sh\nprintf '[{\"runners\":[]}]'\n").unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    dir.path().display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            );
+            std::env::set_var("CARRICK_DESTROY_DIR", dir.path());
+        }
+        let pve = Pve {
+            site: site::WILLOW,
+            token: Token {
+                id: "fixture".into(),
+                secret: "synthetic".into(),
+            },
+            deadline: std::cell::Cell::new(None),
+        };
+
+        let mut ledger = Ledger::default();
+        ledger.rows.push(target);
+        let path = dir.path().join("ledger.json");
+        ledger.save(&path).unwrap();
+
+        // Pass 1: qmdestroy unlinks 308.conf and exits with WARNINGS: 2 on storage
+        // lock timeouts. Reconcile must treat it as Busy, keep admission open, and
+        // retain Reaping ownership for volume cleanup.
+        let pass = reconcile_all(
+            &pve,
+            &Github,
+            &mut ledger,
+            dir.path(),
+            &path,
+            (1, &Admission::Standing),
+        )
+        .unwrap();
+        assert!(
+            pass.frozen.is_none(),
+            "qmdestroy storage-lock warnings must not freeze admission"
+        );
+        assert_eq!(pass.finished, 0);
+        let saved = Ledger::load(&path).unwrap();
+        assert_eq!(saved.rows[0].state, State::Reaping);
+        assert_eq!(
+            saved.rows[0].task.as_deref(),
+            Some("UPID:willow:destroy308")
+        );
+        let status: Value = serde_json::from_slice(
+            &std::fs::read(dir.path().join("reconcile-status.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status["admission_frozen"], false);
+
+        // Pass 2: VM 308 is now absent from the pool while its Reaping license
+        // remains active; reconcile runs clear_volumes and finishes teardown.
+        let pass = reconcile_all(
+            &pve,
+            &Github,
+            &mut ledger,
+            dir.path(),
+            &path,
+            (1, &Admission::Standing),
+        )
+        .unwrap();
+        assert!(pass.frozen.is_none());
+        assert_eq!(pass.finished, 1);
+        assert_eq!(Ledger::load(&path).unwrap().rows[0].state, State::Destroyed);
+        let pvesh_calls = std::fs::read_to_string(dir.path().join("pvesh_calls")).unwrap();
+        assert!(pvesh_calls.contains("/nodes/willow/storage/local/content"));
+
+        // Negative controls: non-storage warnings, mismatched counts, zero warnings,
+        // and query characters in task IDs fail closed.
+        assert_eq!(
+            pve.task_state("UPID:willow:mixedwarn").unwrap(),
+            TaskState::Failed
+        );
+        assert_eq!(
+            pve.task_state("UPID:willow:mismatchwarn").unwrap(),
+            TaskState::Failed
+        );
+        assert_eq!(
+            pve.task_state("UPID:willow:zero").unwrap(),
+            TaskState::Failed
+        );
+        assert!(matches!(
+            pve.task_state("UPID:willow:destroy308?bad=1"),
+            Err(ScalerError::Guard(_))
+        ));
+    }
+
     fn row() -> Record {
         Ledger::default()
             .reserve(
