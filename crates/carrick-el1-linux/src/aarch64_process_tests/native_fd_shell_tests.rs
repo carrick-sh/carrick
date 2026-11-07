@@ -216,6 +216,67 @@ fn shell_descriptor_composition(heredoc: bool) {
         );
         value
     };
+    assert_eq!(
+        invoke(
+            &child_bindings[0],
+            nr::CLOSE_RANGE.raw(),
+            [
+                3,
+                u64::from(u32::MAX),
+                u64::from(carrick_abi::LINUX_CLOSE_RANGE_CLOEXEC)
+            ]
+        ),
+        0
+    );
+    assert_eq!(
+        invoke(&child_bindings[0], nr::FCNTL.raw(), [3, LINUX_F_GETFD, 0]),
+        1
+    );
+    assert_eq!(
+        invoke(
+            &child_bindings[0],
+            nr::FCNTL.raw(),
+            [3, carrick_abi::LINUX_F_SETFD, 0]
+        ),
+        0
+    );
+    assert_eq!(
+        invoke(&child_bindings[0], nr::FCNTL.raw(), [3, LINUX_F_GETFD, 0]),
+        0
+    );
+    for args in [[4, 3, 0], [0, 4, 1]] {
+        assert_eq!(invoke(&child_bindings[0], nr::CLOSE_RANGE.raw(), args), -22);
+    }
+    assert_eq!(
+        invoke(
+            &child_bindings[0],
+            nr::CLOSE_RANGE.raw(),
+            [
+                u64::from(u32::MAX),
+                u64::from(u32::MAX),
+                u64::from(carrick_abi::LINUX_CLOSE_RANGE_CLOEXEC)
+            ]
+        ),
+        0
+    );
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, child_bindings[0].record.id)
+            .is_queued()
+    );
+    activate_target(source, &task, &child_bindings[1]);
+    assert_eq!(
+        invoke(&child_bindings[1], nr::FCNTL.raw(), [3, LINUX_F_GETFD, 0]),
+        0
+    );
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, child_bindings[1].record.id)
+            .is_queued()
+    );
+    activate_target(source, &task, &child_bindings[0]);
     let mut grandchild_table = None;
     if heredoc {
         // The shell parent duplicates the heredoc reader before forking its

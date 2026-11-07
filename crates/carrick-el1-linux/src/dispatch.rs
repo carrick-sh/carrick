@@ -2412,6 +2412,7 @@ impl<
                 carrick_personality_linux::crossing::nr::DUP,
                 carrick_personality_linux::crossing::nr::DUP3,
                 carrick_personality_linux::crossing::nr::CLOSE,
+                carrick_personality_linux::crossing::nr::CLOSE_RANGE,
             ]
             .iter()
             .any(|nr| nr.raw() == ordinal)
@@ -3589,6 +3590,44 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                     // idempotent projection and runs its canonical record-lock,
                     // epoll and inotify teardown exactly once.
                     FamilyCompletion::CommitOwed(0)
+                }
+            }
+            nr if nr == carrick_personality_linux::crossing::nr::CLOSE_RANGE.raw() => {
+                let first = self.frame.argument(0).unwrap_or(0) as u32;
+                let last = self.frame.argument(1).unwrap_or(0) as u32;
+                let flags = self.frame.argument(2).unwrap_or(0) as u32;
+                if first > last
+                    || flags
+                        & !(carrick_abi::LINUX_CLOSE_RANGE_UNSHARE
+                            | carrick_abi::LINUX_CLOSE_RANGE_CLOEXEC)
+                        != 0
+                {
+                    return FamilyCompletion::Complete(
+                        carrick_syscall_abi::LINUX_EINVAL.guest_retval(),
+                    );
+                }
+                // Closing requires retained per-description host effects; replaying
+                // the numeric range could close a sibling's reused descriptor.
+                // UNSHARE also needs a process-resource publication transaction.
+                // Decline these operations before touching either authority.
+                if flags != carrick_abi::LINUX_CLOSE_RANGE_CLOEXEC {
+                    return FamilyCompletion::Forward;
+                }
+                let result = super::file_table::with_host_binding_cloexec_range(
+                    self.fd_map,
+                    file_table,
+                    first,
+                    last,
+                    || {
+                        venue
+                            .region
+                            .fd(NativeFdWait)
+                            .close_range(table, first, last, true, |_| {})
+                    },
+                );
+                match result {
+                    Ok(()) => FamilyCompletion::Complete(0),
+                    Err(error) => map_fd_error(error),
                 }
             }
             nr if nr == carrick_personality_linux::crossing::nr::FCNTL.raw() => {

@@ -167,6 +167,34 @@ pub fn close_host_binding_observed(
     })
 }
 
+/// Publish close-on-exec flags in the existing descriptor authority and its
+/// host-binding projection while excluding descriptor replacement. This uses
+/// the same fd-map -> fd-core lock order as `with_host_binding_dup`.
+/// `operation` must mark the range without closing any description.
+pub fn with_host_binding_cloexec_range<E>(
+    fd_map: &[FdMapSlot],
+    file_table: u64,
+    first: u32,
+    last: u32,
+    operation: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E> {
+    let _guard = lock_fd_map(fd_map);
+    operation()?;
+    for slot in fd_map.iter().take(FD_MAP_CAPACITY) {
+        let incarnation = slot.incarnation.load(Ordering::Acquire);
+        let fd = slot.fd.load(Ordering::Relaxed);
+        if incarnation != 0
+            && incarnation != FdMapSlot::CLAIMED
+            && slot.handle.load(Ordering::Relaxed) != 0
+            && slot.file_table.load(Ordering::Relaxed) == file_table
+            && (first..=last).contains(&fd)
+        {
+            slot.fd_flags.fetch_or(GUEST_FD_CLOEXEC, Ordering::Release);
+        }
+    }
+    Ok(())
+}
+
 /// Linux dup2 on an in-ring host-bound description. A live target is replaced
 /// under the descriptor lock, preserving the source description and clearing
 /// the new descriptor's close-on-exec flag.
@@ -1227,6 +1255,30 @@ mod tests {
             None
         );
         assert_eq!(fd_map[child_index].fd_flags.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn range_cloexec_projects_live_incarnation_one_only_after_authority_success() {
+        let (fd_map, open_table, object_table) = setup_tables();
+        admit_stdio(&fd_map, &open_table, &object_table, 10, [true, true, true]);
+        assert!(fork_fd_map(&fd_map, &open_table, 10, 11));
+        let index = fd_map_lookup(&fd_map, 10, 1).unwrap().1;
+        assert_eq!(fd_map[index].incarnation.load(Ordering::Acquire), 1);
+        assert_eq!(
+            with_host_binding_cloexec_range(&fd_map, 10, 1, u32::MAX, || Err(17)),
+            Err(17)
+        );
+        assert_eq!(fd_map[index].fd_flags.load(Ordering::Acquire), 0);
+        with_host_binding_cloexec_range(&fd_map, 10, 1, u32::MAX, || Ok::<_, ()>(())).unwrap();
+        for (table, fd, expected) in [
+            (10, 0, 0),
+            (10, 1, GUEST_FD_CLOEXEC),
+            (10, 2, GUEST_FD_CLOEXEC),
+            (11, 1, 0),
+        ] {
+            let index = fd_map_lookup(&fd_map, table, fd).unwrap().1;
+            assert_eq!(fd_map[index].fd_flags.load(Ordering::Acquire), expected);
+        }
     }
 
     #[test]
