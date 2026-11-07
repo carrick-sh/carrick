@@ -1579,6 +1579,7 @@ fn queued_merge_group_resolves_rebased_prs_and_names_them_in_published_receipt()
     let ref_1762 = format!("refs/heads/gh-readonly-queue/main/pr-1762-{a}");
     let ref_1788 = format!("refs/heads/gh-readonly-queue/main/pr-1788-{d}");
     let ref_1799 = format!("refs/heads/gh-readonly-queue/main/pr-1799-{b}");
+    let ref_gap_head = format!("refs/heads/gh-readonly-queue/main/pr-125-{c}");
     let ref_1700 = format!("refs/heads/gh-readonly-queue/main/pr-1700-{a}");
     let ref_1801 = format!("refs/heads/gh-readonly-queue/main/pr-1801-{a}");
     let ref_1802 = format!("refs/heads/gh-readonly-queue/main/pr-1802-{a}");
@@ -1712,7 +1713,7 @@ else:
     .unwrap();
     std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let run_prepare = |label: &str, head_ref: &str, base_sha: &str, head_sha: &str| {
+    let run_prepare_output = |label: &str, head_ref: &str, base_sha: &str, head_sha: &str| {
         let event_path = dir.path().join(format!("event-{label}.json"));
         let out_dir = dir.path().join(format!("out-{label}"));
         std::fs::write(
@@ -1753,11 +1754,16 @@ else:
             .arg(&out_dir)
             .output()
             .unwrap();
+        output
+    };
+    let run_prepare = |label: &str, head_ref: &str, base_sha: &str, head_sha: &str| {
+        let output = run_prepare_output(label, head_ref, base_sha, head_sha);
         assert!(
             output.status.success(),
             "{label}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        let out_dir = dir.path().join(format!("out-{label}"));
         let req: serde_json::Value =
             serde_json::from_slice(&std::fs::read(out_dir.join("request.json")).unwrap()).unwrap();
         (req, out_dir)
@@ -1778,6 +1784,35 @@ else:
     let (batched_req, _) = run_prepare("batched", &ref_1802, &a, &batched);
     assert_eq!(batched_req["base"], a);
     assert_eq!(batched_req["prs"], json!([1801, 1802]));
+
+    // A missing live queue entry in the middle of the candidate range must be
+    // attributed to a merged main PR, just like a missing prefix entry.
+    let gap_entries = json!([
+        {"baseCommit":{"oid":a},"headCommit":{"oid":d},"pullRequest":{"number":123,"baseRefName":"main","baseRepository":{"nameWithOwner":"carrick-sh/carrick"}}},
+        {"baseCommit":{"oid":b},"headCommit":{"oid":c},"pullRequest":{"number":125,"baseRefName":"main","baseRepository":{"nameWithOwner":"carrick-sh/carrick"}}}
+    ]);
+    std::fs::write(&entries_path, gap_entries.to_string()).unwrap();
+    let gap_unresolved = run_prepare_output("gap-unresolved", &ref_gap_head, &a, &c);
+    assert!(
+        !gap_unresolved.status.success(),
+        "interior unattributed commit was accepted"
+    );
+    assert!(
+        String::from_utf8_lossy(&gap_unresolved.stderr).contains(&b),
+        "{}",
+        String::from_utf8_lossy(&gap_unresolved.stderr)
+    );
+    std::fs::write(&merged_pulls_path, json!({b.clone():[124]}).to_string()).unwrap();
+    let (gap_resolved, _) = run_prepare("gap-resolved", &ref_gap_head, &a, &c);
+    assert_eq!(gap_resolved["prs"], json!([123, 124, 125]));
+    std::fs::write(&merged_pulls_path, "{}").unwrap();
+    std::fs::write(&entries_path, json!([
+        {"baseCommit":{"oid":a},"headCommit":{"oid":d},"pullRequest":{"number":123,"baseRefName":"main","baseRepository":{"nameWithOwner":"carrick-sh/carrick"}}},
+        null,
+        {"baseCommit":{"oid":b},"headCommit":{"oid":c},"pullRequest":{"number":125,"baseRefName":"main","baseRepository":{"nameWithOwner":"carrick-sh/carrick"}}}
+    ]).to_string()).unwrap();
+    let null_node = run_prepare_output("null-node", &ref_gap_head, &a, &c);
+    assert!(!null_node.status.success(), "null queue node was accepted");
 
     // (4) Publish names both PRs in comment.md, GITHUB_STEP_SUMMARY, and PR comments
     // on both PASS and FAIL paths.
