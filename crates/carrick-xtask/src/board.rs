@@ -25,7 +25,7 @@ fn desired(
     if current == Some(Status::Done) {
         return decide(Status::Done, "Done is never reopened");
     }
-    if matches!(node["state"].as_str(), Some("CLOSED" | "MERGED")) {
+    if node["closed"] == true {
         return decide(Status::Done, "repository item is closed or merged");
     }
     let pr = node["__typename"] == "PullRequest";
@@ -200,9 +200,11 @@ struct Snapshot {
 }
 
 const CONTENT: &str = r#"content { ... on Issue { id number repository { nameWithOwner } } ... on PullRequest { id number repository { nameWithOwner } } }"#;
+// IssueState and PullRequestState are different GraphQL enum types. Use
+// Closable.closed (Boolean! on both) so their response fields can merge.
 const DETAILS: &str = r#"
-... on Issue { id __typename number state updatedAt comments(first:100) { pageInfo { hasNextPage endCursor } nodes { author { login } body createdAt } } }
-... on PullRequest { id __typename number state updatedAt isDraft headRefOid
+... on Issue { id __typename number closed updatedAt comments(first:100) { pageInfo { hasNextPage endCursor } nodes { author { login } body createdAt } } }
+... on PullRequest { id __typename number closed updatedAt isDraft headRefOid
  comments(first:100) { pageInfo { hasNextPage endCursor } nodes { author { login } body createdAt } }
  reviews(first:100) { pageInfo { hasNextPage endCursor } nodes { state body submittedAt commit { oid } } }
  closingIssuesReferences(first:100) { pageInfo { hasNextPage endCursor } nodes { id number repository { nameWithOwner } } }
@@ -325,6 +327,9 @@ impl Snapshot {
                 let number = node["number"]
                     .as_u64()
                     .ok_or(ScalerError::Guard("missing repository item number"))?;
+                node["closed"]
+                    .as_bool()
+                    .ok_or(ScalerError::Guard("missing repository closure fact"))?;
                 snapshot.nodes.insert(number, node);
             }
         }
@@ -512,7 +517,7 @@ impl Snapshot {
         let mut open: BTreeSet<_> = self
             .nodes
             .iter()
-            .filter(|(_, n)| n["state"] == "OPEN")
+            .filter(|(_, n)| n["closed"] == false)
             .map(|(n, _)| *n)
             .collect();
         let missing: BTreeSet<_> = self
@@ -523,7 +528,7 @@ impl Snapshot {
             .collect();
         let numbers: Vec<_> = missing.into_iter().collect();
         for batch in numbers.chunks(50) {
-            let fields = batch.iter().map(|n| format!("n{n}:issueOrPullRequest(number:{n}) {{ ... on Issue {{ state }} ... on PullRequest {{ state }} }}")).collect::<Vec<_>>().join(" ");
+            let fields = batch.iter().map(|n| format!("n{n}:issueOrPullRequest(number:{n}) {{ ... on Issue {{ closed }} ... on PullRequest {{ closed }} }}")).collect::<Vec<_>>().join(" ");
             let data = graphql(
                 api,
                 &format!(
@@ -532,11 +537,10 @@ impl Snapshot {
                 json!({}),
             )?;
             for number in batch {
-                let state = &data["repository"][format!("n{number}")]["state"];
-                if state.is_null() {
-                    return Err(ScalerError::Guard("director blocker does not resolve"));
-                }
-                if state == "OPEN" {
+                let closed = data["repository"][format!("n{number}")]["closed"]
+                    .as_bool()
+                    .ok_or(ScalerError::Guard("director blocker does not resolve"))?;
+                if !closed {
                     open.insert(*number);
                 }
             }
@@ -947,7 +951,7 @@ mod tests {
         snapshot.nodes.get_mut(&887).unwrap()["comments"]["nodes"].as_array_mut().unwrap().push(json!({"author":{"login":DISPATCH_OWNER},"createdAt":"2026-11-07T00:00:00Z","body":"waits on #200"}));
         let mut api = Replay {
             steps: std::collections::VecDeque::from([
-                json!({"method":"POST","endpoint":"graphql","contains":"n200:issueOrPullRequest(number:200)","response":{"data":{"repository":{"n200":{"state":"CLOSED"}}}}}),
+                json!({"method":"POST","endpoint":"graphql","contains":"n200:issueOrPullRequest(number:200)","response":{"data":{"repository":{"n200":{"closed":true}}}}}),
             ]),
         };
         let open = snapshot.open_numbers(&mut api).unwrap();

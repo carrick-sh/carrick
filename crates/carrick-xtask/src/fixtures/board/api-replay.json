@@ -241,7 +241,6 @@
             "__typename": "Issue",
             "id": "I_887",
             "number": 887,
-            "state": "OPEN",
             "comments": {
               "nodes": [
                 {
@@ -257,13 +256,13 @@
                 "endCursor": "comments-1"
               }
             },
-            "updatedAt": "2026-11-07T00:00:00Z"
+            "updatedAt": "2026-11-07T00:00:00Z",
+            "closed": false
           },
           {
             "__typename": "Issue",
             "id": "I_closed",
             "number": 999,
-            "state": "CLOSED",
             "updatedAt": "2026-11-07T00:00:00Z",
             "comments": {
               "nodes": [],
@@ -271,13 +270,13 @@
                 "hasNextPage": false,
                 "endCursor": null
               }
-            }
+            },
+            "closed": true
           },
           {
             "__typename": "PullRequest",
             "id": "PR_test",
             "number": 100,
-            "state": "OPEN",
             "updatedAt": "2026-11-05T00:00:00Z",
             "comments": {
               "nodes": [],
@@ -309,7 +308,8 @@
                 "hasNextPage": false,
                 "endCursor": null
               }
-            }
+            },
+            "closed": false
           }
         ]
       }
