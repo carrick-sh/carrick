@@ -5705,8 +5705,33 @@ pub(crate) mod tests {
                         authority: executor::ExecutionLeaseAuthoritySlot::new(Some(lease)),
                         exec_replacement: None,
                     };
+                    // VM-free carrier double: retain the exact ABI backing at
+                    // direct aliases while the real host park owns its record.
+                    struct DirectLifecycleAliases(
+                        carrick_kernel::kernel::objects::ThreadControlLease,
+                    );
+                    impl executor::RetainedLifecycleAliases for DirectLifecycleAliases {
+                        fn aliases(
+                            &self,
+                            control: &carrick_kernel::kernel::objects::ThreadControlLease,
+                        ) -> Option<(carrick_guest_mem::GuestVa, carrick_guest_mem::GuestVa)>
+                        {
+                            (self.0.slot_address() == control.slot_address()).then(|| {
+                                (
+                                    carrick_guest_mem::GuestVa::new(
+                                        self.0.lifecycle().page_address().raw() as u64,
+                                    ),
+                                    carrick_guest_mem::GuestVa::new(
+                                        self.0.slot_address().raw() as u64
+                                    ),
+                                )
+                            })
+                        }
+                    }
+                    let aliases = DirectLifecycleAliases(root.thread().control_lease());
                     let need_resched = std::sync::atomic::AtomicBool::new(false);
                     let mut control = executor::HvpatchQuantumControl {
+                        lifecycle_aliases: Some(&aliases),
                         need_resched: &need_resched,
                         submission: &mut submission,
                         binding: Some(&binding),
@@ -5776,6 +5801,18 @@ pub(crate) mod tests {
                         else {
                             panic!("owner wait did not return its production continuation");
                         };
+                        let wait = continuation
+                            .zone_wait()
+                            .expect("production owner park record");
+                        let identity = zone.record(wait.record.id).identity();
+                        assert_eq!(
+                            (identity.lifecycle_page, identity.control_slot),
+                            (
+                                aliases.0.lifecycle().page_address().raw() as u64,
+                                aliases.0.slot_address().raw() as u64
+                            ),
+                            "host park lost its retained lifecycle aliases before owner release",
+                        );
                         let mut wait_registration =
                             wait_service.prepare_registration(&continuation);
                         wait_service.enroll(&mut wait_registration).unwrap();

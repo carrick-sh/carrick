@@ -359,12 +359,22 @@ pub(crate) struct PendingExecReplacement {
     pub(crate) retired_mm: Option<crate::hvpatch::Stage1MmRetirement>,
 }
 
+/// Carrier-owned aliases, valid until all of its scheduler records are stopped.
+/// Implementations resolve through retained backing, never the current CPU slot.
+pub(crate) trait RetainedLifecycleAliases {
+    fn aliases(
+        &self,
+        control: &carrick_kernel::kernel::objects::ThreadControlLease,
+    ) -> Option<(carrick_guest_mem::GuestVa, carrick_guest_mem::GuestVa)>;
+}
+
 /// Borrowed worker authority passed into one engine-resident logical quantum.
 /// It is deliberately non-owning: neither the job nor a continuation may
 /// retain an executor kick/preemption or descendant-publication capability
 /// after `run_until_boundary` returns.
 pub(crate) struct HvpatchQuantumControl<'a, 'lease> {
     pub(crate) need_resched: &'a AtomicBool,
+    pub(crate) lifecycle_aliases: Option<&'a dyn RetainedLifecycleAliases>,
     pub(crate) submission: &'a mut ExecutorSubmissionContext<'lease>,
     pub(crate) binding: Option<&'a Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>>,
     pub(crate) cow_invalidation_observer: Option<&'a crate::hvpatch::CowInvalidationObserver>,
@@ -387,6 +397,7 @@ impl<'a, 'lease> HvpatchQuantumControl<'a, 'lease> {
     ) -> Self {
         Self {
             need_resched,
+            lifecycle_aliases: None,
             submission,
             binding: None,
             cow_invalidation_observer: None,

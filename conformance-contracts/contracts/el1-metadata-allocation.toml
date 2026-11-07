@@ -68,6 +68,7 @@ rationale = "The fixture admits one 64 KiB extent per scale unit and accounts ev
 [bindings]
 vm_free = [
   "carrick-vmm-hvf::metadata_grant::ownership_tests::serial_host_fork_lifecycle_does_not_leave_a_guest_grant_outstanding",
+  "carrick-runtime::vcpu_loop::tests::serial_host_completion_owner_wait_resumes_through_zone_and_physical (production owner park retains carrier lifecycle aliases before owner release; VM-free retained-alias provider double, no signed mapping or population claim)",
   "carrick-el1::alloc::tests::delayed_grant_consumed_by_last_deallocation_returns_both_extents",
   "carrick-el1::alloc::tests::allocation_uses_fresh_grant_before_return_selection",
   "carrick-el1::alloc::tests::unrelated_deallocation_preserves_grant_for_waiting_allocation",

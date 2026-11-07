@@ -3000,6 +3000,7 @@ pub(crate) mod tests {
             exec_replacement: None,
         };
         let mut control = executor::HvpatchQuantumControl {
+            lifecycle_aliases: None,
             need_resched: &need_resched,
             submission: &mut submission,
             binding: Some(&binding),

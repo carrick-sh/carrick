@@ -1423,6 +1423,7 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 .quantum(),
         );
         let mut control = HvpatchQuantumControl {
+                        lifecycle_aliases: None,
             need_resched,
             submission,
             binding: Some(
