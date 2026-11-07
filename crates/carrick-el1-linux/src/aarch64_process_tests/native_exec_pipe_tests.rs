@@ -336,6 +336,13 @@ fn serial_host_native_fork_exec_pipe_writer_reaches_its_parent() {
     );
     assert_eq!(call(fcntl, 4096, carrick_abi::LINUX_F_GETFD, 0), 1);
     assert_eq!(
+        call(fcntl, 4, carrick_abi::LINUX_F_DUPFD_CLOEXEC, 4096),
+        4097,
+        "exec successor selects the lowest free fd above an occupied minimum"
+    );
+    assert_eq!(call(57, 4097, 0, 0), 0);
+    assert_eq!(call(fcntl, 4, carrick_abi::LINUX_F_GETFD, 0), 0);
+    assert_eq!(
         call(fcntl, 4, carrick_abi::LINUX_F_DUPFD_CLOEXEC, 8192) as i64,
         -22
     );

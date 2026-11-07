@@ -10412,6 +10412,12 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
     );
     assert_eq!(run_in_child(0, sys_fcntl, [4096, LINUX_F_GETFD, 0]).1, 1);
     assert_eq!(
+        run_in_child(0, sys_fcntl, [4, LINUX_F_DUPFD_CLOEXEC, 4096]).1,
+        4097,
+        "the shared selector skips an occupied high minimum"
+    );
+    assert_eq!(run_in_child(0, sys_close, [4097, 0, 0]).1, 0);
+    assert_eq!(
         run_in_child(0, sys_fcntl, [4096, LINUX_F_SETFL, LINUX_O_NONBLOCK]).1,
         0
     );
