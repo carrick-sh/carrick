@@ -233,3 +233,32 @@ Required code and proof remain open: both clock adapters, publication before
 execution, successful child realtime read, retained-copyout refusal, sleep
 completion/interruption, shared timex state, and the original pipeline's live
 syscall census. The four red routing witnesses are not acceptance evidence.
+
+## Checkpoint build and custody repair
+
+The harvested clock service was not a buildable implementation: the native
+service lifecycle omitted the new Clock discriminator in three matches, and
+the host adapter used an unavailable errno accessor. The continuation repairs
+those compile errors. A payload-free `begin_service(Clock, ...)` is rejected
+before any service publication, lifecycle claim or member wait; a future
+clock entry must supply its retained operation and reply owner. It must not
+remove that check merely to admit a wire descriptor.
+
+The host-resource deterministic fixture also needed an untimed participant
+while advancing virtual time explicitly. Without one, enrolling the sole
+sleeper correctly advances to its deadline immediately. The fixture now
+covers both cases: cancellation at 20 ms reports 30 ms remaining from a
+50 ms deadline; removing the untimed participant cannot revive that cancelled
+deadline; a new lone 80 ms sleep advances to 100 ms and wakes once. The
+absolute-realtime fixture still checks wakeup after a shared timex step.
+
+These are prerequisite checks, not native-child time acceptance. The complete
+native suite still has exactly the four original time-routing failures (errno
+38 instead of 14); the new custody check passes. The remaining production
+work is unchanged: bind the run clock capability before native admission,
+implement ARM native-service and x86 exact-context clock transports, retain
+clock/timex output through exact-MM waits, and own sleep input, deadline,
+subscriptions, cancellation and remaining output across scheduler suspension.
+Success-path child clock reads, completed sleeps and timex reads must exercise
+those owners before any time family can be advertised as served. Signed/HVF
+pipeline census, runtime demo and paired populations remain UNRUN (director).
