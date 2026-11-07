@@ -1673,3 +1673,135 @@ fn vector_input_survives_concurrent_descriptor_growth_and_retired_lookup() {
         region.finish_operation(token, || {}).unwrap();
     });
 }
+
+#[test]
+fn pending_pipe_pair_publishes_after_copyout_and_forks_exact_endpoints() {
+    let f = fixture(4 * 1024 * 1024);
+    let table = f.table();
+    let mut pair = PendingPipePair::new(
+        *f.region,
+        table,
+        65536,
+        StatusFlags {
+            nonblock: true,
+            ..StatusFlags::default()
+        },
+        true,
+    );
+    pair.prepare(&mut f.pipe_storage(), &EL1).unwrap();
+    let fds = pair.fds().unwrap();
+    for fd in fds {
+        assert_eq!(f.host().get(table, fd), Err(fd::Error::BadFd));
+    }
+    pair.publish(&EL1).unwrap();
+    pair.finish(&EL1, |_| {}).unwrap();
+    assert!(pair.is_settled());
+    let child = f.host().fork(table, &mut f.descriptors(64)).unwrap();
+    for fd in fds {
+        assert_eq!(f.host().get(table, fd), f.host().get(child, fd));
+        assert_eq!(f.host().getfd(table, fd), Ok(true));
+    }
+    let reader = f.host().get(table, fds[0]).unwrap();
+    let writer = f.host().get(child, fds[1]).unwrap();
+    let Some(IpcBacking::Pipe {
+        object,
+        end: End::Reader,
+    }) = IpcBacking::decode(reader.backing)
+    else {
+        panic!("reader")
+    };
+    assert_eq!(
+        IpcBacking::decode(writer.backing),
+        Some(IpcBacking::Pipe {
+            object,
+            end: End::Writer
+        })
+    );
+    assert_eq!(
+        reader.flags,
+        StatusFlags {
+            nonblock: true,
+            ..StatusFlags::default()
+        }
+    );
+    let mut guard = f.region.lock(object, &EL1).unwrap();
+    assert!(guard.pipe().unwrap().is_backed());
+}
+
+#[test]
+fn pending_pipe_pair_copy_fault_cancels_claims_without_closing_reused_numbers() {
+    let f = fixture(4 * 1024 * 1024);
+    let table = f.table();
+    let mut pair = PendingPipePair::new(*f.region, table, 65536, StatusFlags::default(), false);
+    pair.prepare(&mut f.pipe_storage(), &EL1).unwrap();
+    let fds = pair.fds().unwrap();
+    let child = f.host().fork(table, &mut f.descriptors(64)).unwrap();
+    let unrelated = Description::new(
+        IpcBacking::Host(HostResourceToken::new(7).unwrap()).encode(),
+        AccessMode::ReadOnly,
+        StatusFlags::default(),
+    );
+    assert_eq!(f.host().open(child, Fd(0), unrelated, false), Ok(fds[0]));
+    let lock = f.host().transaction(table).unwrap();
+    assert!(pair.cancel(&BoundedSpin(0), |_| {}).is_err());
+    drop(lock);
+    let mut freed = 0;
+    pair.cancel(&EL1, |release| {
+        if matches!(release, IpcReleased::Object { freed: true, .. }) {
+            freed += 1;
+        }
+    })
+    .unwrap();
+    assert_eq!(freed, 1);
+    assert!(pair.is_settled());
+    assert_eq!(f.host().get(child, fds[0]), Ok(unrelated));
+    assert_eq!(f.host().open(table, Fd(0), unrelated, false), Ok(fds[0]));
+}
+
+#[test]
+fn pending_pipe_pair_publication_busy_once_retains_both_endpoints() {
+    let f = fixture(4 * 1024 * 1024);
+    let table = f.table();
+    let mut pair = PendingPipePair::new(*f.region, table, 65536, StatusFlags::default(), false);
+    pair.prepare(&mut f.pipe_storage(), &EL1).unwrap();
+    let fds = pair.fds().unwrap();
+    let lock = f.host().transaction(table).unwrap();
+    assert!(pair.publish(&BoundedSpin(0)).is_err());
+    drop(lock);
+    assert_eq!(pair.fds(), Some(fds));
+    pair.publish(&EL1).unwrap();
+    pair.finish(&EL1, |_| {}).unwrap();
+    assert!(pair.is_settled());
+    assert!(pair.cancel(&EL1, |_| {}).is_err());
+}
+
+#[test]
+fn pending_pipe_pair_finish_object_busy_keeps_release_custody() {
+    let f = fixture(4 * 1024 * 1024);
+    let table = f.table();
+    let mut pair = PendingPipePair::new(*f.region, table, 65536, StatusFlags::default(), false);
+    pair.prepare(&mut f.pipe_storage(), &EL1).unwrap();
+    let fds = pair.fds().unwrap();
+    pair.publish(&EL1).unwrap();
+    let backing = f.host().get(table, fds[0]).unwrap().backing;
+    let Some(IpcBacking::Pipe { object, .. }) = IpcBacking::decode(backing) else {
+        panic!("pipe")
+    };
+    for fd in fds {
+        assert_eq!(f.host().close(table, fd), Ok(None));
+    }
+    let guard = f.region.lock(object, &EL1).unwrap();
+    assert!(pair.finish(&BoundedSpin(0), |_| {}).is_err());
+    let unrelated = Description::new(
+        IpcBacking::Host(HostResourceToken::new(8).unwrap()).encode(),
+        AccessMode::ReadOnly,
+        StatusFlags::default(),
+    );
+    assert_eq!(f.host().open(table, Fd(0), unrelated, false), Ok(fds[0]));
+    drop(guard);
+    let mut releases = 0;
+    pair.finish(&EL1, |_| releases += 1).unwrap();
+    assert_eq!(releases, 2);
+    assert!(pair.is_settled());
+    assert_eq!(f.host().get(table, fds[0]), Ok(unrelated));
+}
