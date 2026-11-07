@@ -1488,7 +1488,11 @@ impl<'a> MemView<'a> {
                     || (map_sharing == MmapSharing::Shared
                         && !map_flags.contains(LinuxMmapFlags::ANONYMOUS)));
             let owner_proposal = this.mem().lock().has_owner_proposal();
-            let address_uses_alias = !owner_proposal && (owner_host_snapshot || mmap_request_uses_alias(
+            let external_owner_reservation = owner_proposal
+                && root_eligible
+                && !map_flags.contains(LinuxMmapFlags::FIXED)
+                && !in_arena;
+            let address_uses_alias = !external_owner_reservation && (owner_host_snapshot || mmap_request_uses_alias(
                 map_flags.contains(LinuxMmapFlags::FIXED),
                 address_uses_alias_layout,
                 has_identity_backing,
