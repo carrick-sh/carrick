@@ -32,6 +32,13 @@ that region, so it cannot alias the larger scheduler. The shared ARM/CPL0
 layout checks and ABI fingerprint cover this geometry; signed execution of
 this larger artifact remains required.
 
+The CPL0 interrupt/lifecycle fixture derives its sidecars from the complete
+scheduler size and places that backing above the bootstrap allocator in a
+separate physical window. Its second page-table root retains a disjoint low
+RAM reservation accepted by the shared table-alias authority. The fixture's
+supervisor and direct aliases both name the new scheduler backing; production
+initial-extent boot keeps its separate allocation path.
+
 Restoring admitted main's shared constructor while retaining the production
 dispatcher witness reproduces `ipc::admission: object wait generation
 collision` and SIGABRT. This is a queue-domain collision, rather than a missing

@@ -1705,12 +1705,16 @@ impl Cpl0Carrier {
             ram.add_window(PRODUCTION_METADATA_GPA, region_bytes, WindowKind::Private)
                 .map_err(|e| fail(e.to_string()))?;
         } else {
-            ram.add_window(
-                0,
-                if interrupts { 2 * RAM_SIZE } else { RAM_SIZE },
-                WindowKind::Private,
-            )
-            .map_err(|e| fail(e.to_string()))?;
+            ram.add_window(0, RAM_SIZE, WindowKind::Private)
+                .map_err(|e| fail(e.to_string()))?;
+            if interrupts {
+                ram.add_window(
+                    crate::carrier_interrupts::PROGRESS_ZONE_GPA,
+                    crate::carrier_interrupts::SUPERVISOR_BYTES as usize,
+                    WindowKind::Private,
+                )
+                .map_err(|e| fail(e.to_string()))?;
+            }
         }
         ram.add_window(
             ALLOCATOR_GPA,
@@ -1776,8 +1780,6 @@ impl Cpl0Carrier {
                     + size_of::<X86Cpl0Zone>()
                     + 4095)
                     & !4095) as u64
-            } else if interrupts {
-                0x140_0000
             } else {
                 0x40_0000
             },
@@ -1911,6 +1913,14 @@ impl Cpl0Carrier {
             });
         }
         if interrupts {
+            maps.push(Pml4MapSpec {
+                va: DIRECT_VA + crate::carrier_interrupts::PROGRESS_ZONE_GPA,
+                gpa: crate::carrier_interrupts::PROGRESS_ZONE_GPA,
+                len: crate::carrier_interrupts::SUPERVISOR_BYTES,
+                user: false,
+                write: true,
+                exec: false,
+            });
             maps.extend(crate::carrier_interrupts::supervisor_maps());
             maps.push(crate::carrier_interrupts::data_map(0));
         } else if hardware_interrupts {
@@ -3579,7 +3589,10 @@ impl Cpl0Carrier {
             &*carrier
                 .custody
                 .ram()
-                .host_ptr(0x100_0000, size_of::<ZoneTables>())
+                .host_ptr(
+                    crate::carrier_interrupts::PROGRESS_ZONE_GPA,
+                    size_of::<ZoneTables>(),
+                )
                 .ok_or_else(|| fail("lifecycle zone"))?
                 .cast::<ZoneTables>()
         };
@@ -3817,7 +3830,10 @@ impl Cpl0Carrier {
             &*self
                 .custody
                 .ram()
-                .host_ptr(0x100_0000, size_of::<ZoneTables>())
+                .host_ptr(
+                    crate::carrier_interrupts::PROGRESS_ZONE_GPA,
+                    size_of::<ZoneTables>(),
+                )
                 .ok_or_else(|| fail("lifecycle zone"))?
                 .cast::<ZoneTables>()
         };
@@ -3836,7 +3852,10 @@ impl Cpl0Carrier {
             &*self
                 .custody
                 .ram()
-                .host_ptr(0x100_0000, size_of::<ZoneTables>())
+                .host_ptr(
+                    crate::carrier_interrupts::PROGRESS_ZONE_GPA,
+                    size_of::<ZoneTables>(),
+                )
                 .ok_or_else(|| fail("lifecycle zone"))?
                 .cast::<ZoneTables>()
         };
@@ -3887,7 +3906,10 @@ impl Cpl0Carrier {
             &*self
                 .custody
                 .ram()
-                .host_ptr(0x100_0000, size_of::<ZoneTables>())
+                .host_ptr(
+                    crate::carrier_interrupts::PROGRESS_ZONE_GPA,
+                    size_of::<ZoneTables>(),
+                )
                 .ok_or_else(|| fail("lifecycle zone"))?
                 .cast::<ZoneTables>()
         };

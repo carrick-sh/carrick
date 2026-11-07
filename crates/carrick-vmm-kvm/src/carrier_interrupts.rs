@@ -17,7 +17,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 const FIRST_ROOT: u64 = 0x60_0000;
-const PROGRESS_ZONE_GPA: u64 = 0x100_0000;
+pub(crate) const PROGRESS_ZONE_GPA: u64 = (carrick_x86_cpl0_host::cpl0_boot::ALLOCATOR_GPA
+    + carrick_el1_abi::EL1_BOOTSTRAP_METADATA_SIZE)
+    .next_multiple_of(0x20_0000);
 // The guest and host must name the same retained sidecars when the shared
 // lifecycle layout moves. Boot publication and stopped observation use this
 // translation, rather than keeping a second physical placement constant.
@@ -27,18 +29,36 @@ pub(crate) const LIFECYCLE_LANES_GPA: FrameGpa = FrameGpa::new(
             - carrick_x86::cpl0_lifecycle::LIFECYCLE_ZONE),
 );
 // boot_lifecycle shares this mapping, including its two fixed sidecars.
-const SUPERVISOR_BYTES: u64 = 0x100_0000;
+pub(crate) const SUPERVISOR_BYTES: u64 = (carrick_x86::cpl0_lifecycle::LIFECYCLE_LANE
+    - PROGRESS_ZONE
+    + carrick_x86::cpl0_lifecycle::LIFECYCLE_STRIDE
+    + size_of::<carrick_x86::cpl0_lifecycle::LifecycleLane>() as u64)
+    .next_multiple_of(4096);
 const PROGRESS_STATE_GPA: u64 = PROGRESS_ZONE_GPA + (PROGRESS_STATE - PROGRESS_ZONE);
-pub const SECOND_ROOT: u64 = PROGRESS_ZONE_GPA + PROGRESS_SUPERVISOR_BYTES;
+// Table walkers use the shared bootstrap direct-window authority. Keep roots
+// in low RAM even when the scheduler's independent backing grows past it.
+pub const SECOND_ROOT: u64 = (carrick_x86_cpl0_host::cpl0_boot::META_GPA
+    + carrick_x86_cpl0_host::cpl0_boot::META_LEN)
+    .next_multiple_of(4096);
 const _: () = {
     use carrick_x86::cpl0_lifecycle::{LIFECYCLE_STRIDE, LIFECYCLE_ZONE, LifecycleLane};
 
-    assert!(FIRST_ROOT + carrick_x86::X86_PML4_CAPACITY <= PROGRESS_ZONE_GPA);
+    assert!(
+        FIRST_ROOT + carrick_x86::X86_PML4_CAPACITY <= carrick_x86_cpl0_host::cpl0_boot::META_GPA
+    );
+    assert!(
+        SECOND_ROOT + carrick_x86::X86_PML4_CAPACITY
+            <= carrick_x86_cpl0_host::cpl0_boot::RAM_SIZE as u64
+    );
+    assert!(
+        SECOND_ROOT + carrick_x86::X86_PML4_CAPACITY
+            <= carrick_el1_abi::X86_CPL0_DIRECT_WINDOW_BYTES
+    );
     assert!(
         PROGRESS_ZONE_GPA + size_of::<ZoneTables<ParkedContextWords>>() as u64
             <= PROGRESS_STATE_GPA
     );
-    assert!(PROGRESS_STATE_GPA + size_of::<ProgressState>() as u64 <= SECOND_ROOT);
+    assert!(PROGRESS_STATE_GPA + size_of::<ProgressState>() as u64 <= LIFECYCLE_LANES_GPA.raw());
     assert!(SECOND_ROOT.is_multiple_of(4096));
     assert!(LIFECYCLE_ZONE == PROGRESS_ZONE);
     let lanes_gpa = LIFECYCLE_LANES_GPA.raw();
@@ -50,10 +70,11 @@ const _: () = {
         lanes_gpa + LIFECYCLE_STRIDE + size_of::<LifecycleLane>() as u64
             <= PROGRESS_ZONE_GPA + SUPERVISOR_BYTES
     );
-    // boot_inner reserves two RAM_SIZE windows for this interrupt witness.
+    // The interrupt witness has a separate window above allocator backing.
     assert!(
-        PROGRESS_ZONE_GPA + SUPERVISOR_BYTES
-            <= 2 * carrick_x86_cpl0_host::cpl0_boot::RAM_SIZE as u64
+        PROGRESS_ZONE_GPA
+            >= carrick_x86_cpl0_host::cpl0_boot::ALLOCATOR_GPA
+                + carrick_el1_abi::EL1_BOOTSTRAP_METADATA_SIZE
     );
 };
 const SLOT: SlotId = SlotId::new(0);
