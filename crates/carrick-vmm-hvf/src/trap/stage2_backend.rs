@@ -1554,11 +1554,11 @@ pub(crate) fn install_registered_ipc_window(custody: &CarrierVmCustody) -> Resul
     };
     // SAFETY: registered backing has validated geometry and retains the memory.
     let window = unsafe {
-        carrick_el1_abi::IpcWindow::new(
-            backing.directory_ptr() as usize,
-            backing.directory_len(),
-            backing.pool_ptr() as usize,
-            backing.pool_len(),
+        carrick_el1_abi::HostIpcWindow::new(
+            carrick_guest_arch::HostVa::from_ptr(backing.directory_ptr()),
+            carrick_guest_arch::GuestLen::new(backing.directory_len() as u64),
+            carrick_guest_arch::HostVa::from_ptr(backing.pool_ptr()),
+            carrick_guest_arch::GuestLen::new(backing.pool_len() as u64),
         )
     };
     // The zone may have been installed after host backing registration.
