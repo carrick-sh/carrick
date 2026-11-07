@@ -186,6 +186,7 @@ surfaces = [
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs", contract = "kernel.el1.signal-delivery-owner" },
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs", contract = "kernel.el1.thread-lifecycle" },
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs", contract = "kernel.futex.contention" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs", contract = "kernel.native.entropy" },
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs", contract = "kernel.native.namespace-mutation" },
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs", contract = "kernel.wait.child-rusage" },
   { path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs", contract = "kernel.wait.process-group" },

@@ -1,0 +1,22 @@
+schema_version = 1
+id = "kernel.native.entropy"
+title = "Native descendants receive host entropy through their own service custody"
+guest_surfaces = ["syscall:getrandom"]
+semantic_authority = ["man 2 getrandom", "docs/host-facility-boundary.md"]
+fixture = "unit:arm_native_fork_child_getrandom_default_returns_eight_bytes"
+scale_points = [1]
+structural_budgets = []
+rationale = "A fork child and its parent remain live while the child asks for eight random bytes with flags zero or GRND_NONBLOCK. The production Linux dispatcher and final native entry refusal boundary must not answer ENOSYS. These are explicit ignored red witnesses run with --ignored, not passing acceptance bindings. The service implementation must retain exact member/MM custody, bound staging storage, and never replay a committed prefix."
+
+[bindings]
+vm_free = [
+  "carrick-el1-linux::aarch64_process_tests::arm_native_fork_child_getrandom_default_returns_eight_bytes",
+  "carrick-el1-linux::aarch64_process_tests::arm_native_fork_child_getrandom_nonblock_returns_eight_bytes",
+]
+
+[bindings.unresolved]
+semantics = "The two VM-free witnesses are red and ignored pending implementation; errno 38 is a defect, not an accepted result. No native entropy service is implemented by this slice."
+structural = "Bounded staging and exact crossing counts require a typed entropy service and measured witnesses; the refusal tests do not prove them."
+x86 = "The x86 CPL0 carrier needs the same entropy venue; no x86 acceptance binding is registered yet."
+embed = "UNRUN (director): signed fork-child getrandom, node -e and openssl rand on the implementation head."
+docker = "UNRUN: native Linux differential for flags, EFAULT and accessible-prefix short reads."
