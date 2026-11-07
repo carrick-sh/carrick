@@ -723,3 +723,150 @@ fn cli_resource_tests_do_not_probe_shared_storage() {
         "isolated CLI children must not inspect shared storage"
     );
 }
+
+#[test]
+fn scratch_preflight_uses_explicit_case_sensitive_home() {
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .arg("scratch-preflight")
+        .arg(home.path())
+        .env("CARRICK_HOME", "/must-not-be-selected")
+        .output()
+        .unwrap();
+    // macOS temporary storage may be case-insensitive; that is the failure
+    // exercised by acceptance_default_home_is_checked_before_tests below.
+    let lower = home.path().join("lower");
+    fs::write(&lower, b"").unwrap();
+    if !home.path().join("LOWER").exists() {
+        assert!(output.status.success(), "{output:?}");
+        assert!(home.path().join("scratch").is_dir());
+    } else {
+        assert!(!output.status.success());
+    }
+}
+
+#[test]
+fn acceptance_default_home_is_checked_before_tests() {
+    let repo = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["init", "--quiet"],
+        vec![
+            "-c",
+            "user.name=Witness",
+            "-c",
+            "user.email=witness@example.org",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "fixture",
+        ],
+    ] {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let home = repo.path().join("target/carrick-home");
+    // On case-sensitive test hosts, use an unusable default to exercise the
+    // same production refusal. On macOS's usual insensitive temp volume,
+    // leave the directory writable and let the real case probe reject it.
+    let lower = repo.path().join("lower");
+    fs::write(&lower, b"").unwrap();
+    let insensitive = repo.path().join("LOWER").exists();
+    fs::remove_file(lower).unwrap();
+    if !insensitive {
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("scratch"), b"not a directory").unwrap();
+    }
+    // target is deliberately untracked; acceptance rejects dirty input before
+    // starting. Ignore it just as an admitted checkout does.
+    fs::write(repo.path().join(".git/info/exclude"), b"/target/\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .args([
+            "--root",
+            repo.path().to_str().unwrap(),
+            "accept",
+            "--profile",
+            "linux-portable",
+        ])
+        .env_remove("CARRICK_HOME")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(stderr.contains("CARRICK_HOME="), "{stderr}");
+    assert_eq!(
+        stderr.matches("failed scratch preflight").count(),
+        1,
+        "{stderr}"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("phase starting"));
+    assert!(!repo.path().join("target/el1-gate").exists());
+}
+
+#[test]
+fn standalone_signed_runner_rejects_default_before_building_tests() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts");
+    symlink(&source, dir.path().join("scripts")).unwrap();
+    let home = dir.path().join("target/carrick-home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join("scratch"), b"unusable default").unwrap();
+    let bin = dir.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    fs::write(bin.join("uname"), "#!/bin/sh\necho Darwin\n").unwrap();
+    // Execute the real Rust preflight and record that it ran. Only lease
+    // validation is substituted: this is a gate-startup test, not an HVF run.
+    fs::write(
+        bin.join("cargo"),
+        r#"#!/bin/sh
+for arg do
+    case "$arg" in
+        host-lease) exit 0 ;;
+        scratch-preflight)
+            shift
+            printf '%s\n' "$CARRICK_HOME" > "$WITNESS_PROBE"
+            exec "$WITNESS_XTASK" scratch-preflight "$CARRICK_HOME" ;;
+    esac
+    shift
+done
+echo 'unexpected cargo work before scratch admission' >&2
+exit 90
+"#,
+    )
+    .unwrap();
+    for name in ["uname", "cargo"] {
+        fs::set_permissions(bin.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let output = Command::new("bash")
+        .args(["scripts/lib/test-signed-body.sh", "carrick-embed"])
+        .current_dir(dir.path())
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("CARRICK_SCCACHE", "0")
+        .env("CARRICK_HOST_LEASE_SOCKET", "validated-by-fixture")
+        .env("WITNESS_XTASK", env!("CARGO_BIN_EXE_carrick-xtask"))
+        .env("WITNESS_PROBE", dir.path().join("probe"))
+        .env_remove("CARRICK_HOME")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert_eq!(
+        stderr.matches("failed scratch preflight").count(),
+        1,
+        "{stderr}"
+    );
+    assert!(!stderr.contains("unexpected cargo work"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("probe")).unwrap().trim(),
+        home.to_str().unwrap()
+    );
+}
